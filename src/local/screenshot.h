@@ -13,6 +13,11 @@ namespace Libs::Graphics::Screenshot {
 
 // Any thread.
 void Request(const std::string& path);
+// Any thread: the next `count` frames shown, each box-averaged to SeriesWidth pixels wide, appended to one file at
+// `path` ("KSER <w> <h> <count>\n", then each frame's RGB bytes). For a fixed camera, a frame that differs from its
+// neighbours is a wrong frame (tools: the flicker check). A "SCREENSHOTS <path> <frames>" line when written.
+void RequestSeries(const std::string& path, uint32_t count);
+inline constexpr uint32_t SeriesWidth = 320;
 // Present thread: the path asked for, once (empty: none).
 [[nodiscard]] std::string Take();
 

@@ -14,6 +14,14 @@ namespace {
 std::mutex  g_mutex;
 std::string g_requested; // (g_mutex)
 
+// A frame series (RequestSeries): its frames are taken under g_mutex, written on the present thread.
+constexpr const char* SeriesMark = "\x01series";
+std::string g_series_path;     // (g_mutex)
+uint32_t    g_series_left = 0; // frames still to take (g_mutex)
+uint32_t    g_series_total = 0;
+uint32_t    g_series_written = 0; // (present thread)
+FILE*       g_series_file    = nullptr; // (present thread)
+
 float HalfToFloat(uint16_t half) {
 	const uint32_t sign     = (half >> 15) & 1u;
 	const uint32_t exponent = (half >> 10) & 0x1fu;
@@ -68,10 +76,76 @@ void Request(const std::string& path) {
 	g_requested = path;
 }
 
+void RequestSeries(const std::string& path, uint32_t count) {
+	std::lock_guard lock(g_mutex);
+	g_series_path  = path;
+	g_series_left  = count;
+	g_series_total = count;
+}
+
 std::string Take() {
 	std::lock_guard lock(g_mutex);
-	return std::exchange(g_requested, {});
+	if (!g_requested.empty()) return std::exchange(g_requested, {});
+	if (g_series_left == 0) return {};
+	--g_series_left;
+	return SeriesMark;
 }
+
+namespace {
+
+// One frame of the series: box averages (every few texels of each box) appended to the series file.
+void AppendSeries(const Pending& pending, const uint8_t* texels) {
+	const auto     size  = TexelSize(pending.format);
+	const uint32_t box   = std::max(1u, pending.extent.width / SeriesWidth);
+	const uint32_t w     = pending.extent.width / box, h = pending.extent.height / box;
+	const uint32_t step  = std::max(1u, box / 4);
+	std::string    path;
+	uint32_t       total = 0, left = 0;
+	{
+		std::lock_guard lock(g_mutex);
+		path = g_series_path, total = g_series_total, left = g_series_left;
+	}
+	if (g_series_file == nullptr) {
+		g_series_written = 0;
+		g_series_file    = std::fopen(path.c_str(), "wb");
+		if (g_series_file == nullptr) {
+			std::printf("SCREENSHOTS %s failed: cannot write the file\n", path.c_str());
+			std::fflush(stdout);
+			std::lock_guard lock(g_mutex);
+			g_series_left = 0;
+			return;
+		}
+		std::fprintf(g_series_file, "KSER %u %u %u\n", w, h, total);
+	}
+	std::vector<uint8_t> rgb(static_cast<size_t>(w) * h * 3);
+	bool                 converted = texels != nullptr;
+	for (uint32_t y = 0; converted && y < h; ++y) {
+		for (uint32_t x = 0; converted && x < w; ++x) {
+			uint32_t sum[3] {}, count = 0;
+			for (uint32_t dy = 0; dy < box; dy += step) {
+				for (uint32_t dx = 0; dx < box; dx += step) {
+					const auto index = static_cast<size_t>(y * box + dy) * pending.extent.width + (x * box + dx);
+					uint8_t    texel[3] {};
+					converted = converted && Convert(pending.format, texels + index * size, texel);
+					sum[0] += texel[0], sum[1] += texel[1], sum[2] += texel[2], ++count;
+				}
+			}
+			for (int c = 0; c < 3; ++c) rgb[(static_cast<size_t>(y) * w + x) * 3 + c] = static_cast<uint8_t>(sum[c] / count);
+		}
+	}
+	if (converted) {
+		std::fwrite(rgb.data(), 1, rgb.size(), g_series_file);
+		++g_series_written;
+	}
+	if (left == 0) {
+		std::fclose(g_series_file);
+		g_series_file = nullptr;
+		std::printf("SCREENSHOTS %s %u\n", path.c_str(), g_series_written);
+		std::fflush(stdout);
+	}
+}
+
+} // namespace
 
 Pending Record(GraphicContext& graphics, vk::CommandBuffer command, VulkanImage& image, const std::string& path) {
 	Pending pending;
@@ -135,6 +209,12 @@ void Finish(GraphicContext& graphics, Pending& pending) {
 	vmaGetAllocationInfo(graphics.allocator, pending.memory, &info);
 	(void)vmaInvalidateAllocation(graphics.allocator, pending.memory, 0, VK_WHOLE_SIZE);
 	const auto* texels = static_cast<const uint8_t*>(info.pMappedData);
+	if (pending.path == SeriesMark) {
+		AppendSeries(pending, texels);
+		vmaDestroyBuffer(graphics.allocator, pending.buffer, pending.memory);
+		pending = {};
+		return;
+	}
 	const auto  size   = TexelSize(pending.format);
 	std::vector<uint8_t> rgb(static_cast<size_t>(pending.extent.width) * pending.extent.height * 3);
 	bool                 converted = texels != nullptr;
