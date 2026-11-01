@@ -2369,6 +2369,47 @@ void LauncherQuality(Settings& s) {
 	BoxEnd();
 }
 
+// (ds-pc-port37) The emulator launcher's "Ajustes del juego" window, as a drop-down box of the launcher's options.
+bool g_show_game_settings = false;
+void LauncherGameSettings(Settings& s) {
+	BoxBegin("Ajustes del juego");
+	static const Choice levels[] = {{"0", "Predeterminado"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"}};
+	static const Choice onoff[]  = {{"0", "Predeterminado"}, {"1", "No"}, {"2", "Sí"}};
+	{
+		const float y = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y});
+		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
+		ImGui::TextColored(kDimL, "%s", I18n::T("Ajustes del propio juego. Predeterminado = como viene en PS5, sin tocar nada. Pasa el ratón por encima de cada uno para ver qué hace y lo que cuesta. Mandan sobre las opciones de Calidad gráfica."));
+		ImGui::PopTextWrapPos();
+		RowEnd(y, (ImGui::GetCursorScreenPos().y - y) / g_unit + 6);
+	}
+	size_t      n   = 0;
+	const auto* all = GameSettings(&n);
+	const char* sec = "";
+	for (size_t i = 0; i < n; i++) {
+		const GameSetting& g = all[i];
+		if (std::strcmp(sec, g.section) != 0) {
+			sec           = g.section;
+			const float y = RowY();
+			ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(4)});
+			ImGui::TextColored(kGoldL, "%s", I18n::T(sec));
+			RowEnd(y, 30);
+		}
+		std::string v = std::to_string(GameSettingLevel(s, g.id));
+		ImGui::PushID(g.id);
+		if (LChoice(g.name, g.onoff ? onoff : levels, g.onoff ? 3 : 6, v, g.tip, 190, 216)) SetGameSettingLevel(&s, g.id, std::atoi(v.c_str()));
+		ImGui::PopID();
+	}
+	{
+		const float y = RowY() + U(2);
+		if (LButton("Todo predeterminado", {g_lbox.at.x + U(12), y}, {U(396), U(32)}, false, g_font_semi, U(15),
+		            "Pone todos en Predeterminado: el juego como viene, sin tocar nada."))
+			s.game_settings.clear();
+		RowEnd(y - U(2), 40);
+	}
+	BoxEnd();
+}
+
 void LauncherRayTracing(Settings& s) {
 	BoxBegin("Ray tracing");
 	ImGui::BeginDisabled(s.pure_game);
@@ -2476,7 +2517,12 @@ void LauncherDisplay(Settings& s) {
 		if (LChoice("Modo de pantalla", modes, 2, mode, "Pantalla completa o ventana (F11 lo cambia en vivo).", 150, 256)) s.fullscreen = mode == "1";
 	}
 	LCheckRow("Mantener 16:9 (bandas negras)", s.aspect_fit, "Con un monitor panorámico: el juego en 16:9 con bandas negras a los lados en vez de estirarse.");
-	LChoice("Metricas", kMetrics, kMetricsCount, s.metrics, "Panel dentro del juego (F8 lo cambia en vivo): FPS, el modo de frame generation, latencia y el detalle.", 150, 256);
+	{
+		// (ds-pc-port37) A check box, as the emulator launcher's "Metricas" (on: FPS and the detail, as before when chosen).
+		bool on = s.metrics == "1" || s.metrics == "2";
+		if (LCheckRow("Métricas", on, "Panel dentro del juego (F8 lo cambia en vivo): FPS, el modo de frame generation, latencia y el detalle."))
+			s.metrics = on ? (s.metrics == "2" ? "2" : "1") : "0";
+	}
 	BoxEnd();
 }
 
@@ -3228,6 +3274,17 @@ void DrawLauncher(float width, float height) {
 		LauncherImage(s);
 		LauncherFrameGen(s);
 		LauncherQuality(s);
+		{
+			// (ds-pc-port37) "Ajustes del juego": the emulator launcher's window, as a drop-down here.
+			g_lbox.at     = {origin.x + U(8), RowY()};
+			g_lbox.w      = U(420);
+			const float y = RowY();
+			if (LButton(g_show_game_settings ? "Ajustes del juego  ^" : "Ajustes del juego  v", {g_lbox.at.x, y}, {U(420), U(38)}, false,
+			            g_font_semi, U(16), "Los ajustes del propio juego (sombras, niebla, reflejos, distancia...), como en el lanzador del emulador."))
+				g_show_game_settings = !g_show_game_settings;
+			RowEnd(y, 46);
+		}
+		if (g_show_game_settings) LauncherGameSettings(s);
 		LauncherRayTracing(s);
 		LauncherDisplay(s);
 		LauncherConfigurator(s);
