@@ -403,6 +403,118 @@ static bool LoadPlanBytes(const SpilledPlan& in, ShaderRecompiler::IR::ResourceP
 	       ZstdUnpack(packed, bytes.data(), bytes.size()) && ResourcePlanSerial::Load(bytes, plan, &linear);
 }
 
+// (ds-pc-port37) The shader prefetch's translations kept on disk (KYTY_SPIRV_DISK=0: not): every start translated every
+// shader of the game again (the static precompile keeps the driver's pipelines, not the translation that comes before
+// them): minutes of "Preparando shaders" with the work all done before. Each prefetch group (one program and its
+// specializations) is stored by the XXH3 of its input records: its resource plan and, per module, its specialization,
+// compiled info and SPIR-V. The folder is named by an identity of everything the translation depends on: this build,
+// the GPU and driver, the translator's device features and the translator's own switches; another identity is another
+// folder (the old ones removed). Each record carries the XXH3 of its bytes; a record that does not read back is translated.
+class SpirvDiskStore {
+public:
+	bool Open(const std::filesystem::path& root, const std::string& identity, const std::string& game) {
+		const auto id   = fmt::format("{:016x}", XXH3_64bits(identity.data(), identity.size()));
+		const auto dir  = root / id;
+		std::error_code ec;
+		// (Other identities: an older build's or driver's translations, never read again.)
+		for (const auto& entry: std::filesystem::directory_iterator(root, ec))
+			if (entry.is_directory(ec) && entry.path().filename() != id) std::filesystem::remove_all(entry.path(), ec);
+		std::filesystem::create_directories(dir, ec);
+		m_path = dir / (game + ".spv");
+		const std::string header = "KytySpirvDisk1:" + identity + "\n";
+		uint64_t          size   = std::filesystem::exists(m_path, ec) ? std::filesystem::file_size(m_path, ec) : 0;
+		bool              fresh  = true;
+		if (size >= header.size()) {
+			std::ifstream in(m_path, std::ios::binary);
+			std::string   got(header.size(), '\0');
+			if (in.read(got.data(), static_cast<std::streamsize>(got.size())) && got == header) {
+				fresh       = false;
+				uint64_t at = header.size();
+				for (;;) {
+					uint64_t key = 0, hash = 0;
+					uint32_t len = 0;
+					in.seekg(static_cast<std::streamoff>(at));
+					if (!in.read(reinterpret_cast<char*>(&key), 8) || !in.read(reinterpret_cast<char*>(&len), 4) ||
+					    !in.read(reinterpret_cast<char*>(&hash), 8) || at + 20 + len > size)
+						break;
+					m_index[key] = {at + 20, len, hash};
+					at += 20 + len;
+				}
+				m_end = at;
+			}
+		}
+		if (fresh) {
+			std::ofstream out(m_path, std::ios::binary | std::ios::trunc);
+			out.write(header.data(), static_cast<std::streamsize>(header.size()));
+			if (!out) return false;
+			m_end = header.size();
+		} else if (m_end < size) {
+			std::filesystem::resize_file(m_path, m_end, ec); // (a record cut short by a closed or crashed run)
+		}
+		m_file.open(m_path, std::ios::binary | std::ios::in | std::ios::out);
+		return static_cast<bool>(m_file);
+	}
+	[[nodiscard]] size_t Entries() const { return m_index.size(); }
+	bool Find(uint64_t key, std::vector<uint8_t>& out) {
+		std::lock_guard lock(m_mutex);
+		const auto it = m_index.find(key);
+		if (it == m_index.end()) return false;
+		out.resize(it->second.len);
+		m_file.clear();
+		m_file.seekg(static_cast<std::streamoff>(it->second.offset));
+		if (!m_file.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size())) ||
+		    XXH3_64bits(out.data(), out.size()) != it->second.hash) {
+			m_index.erase(it);
+			return false;
+		}
+		return true;
+	}
+	void Add(uint64_t key, const std::vector<uint8_t>& payload) {
+		if (payload.size() > UINT32_MAX) return;
+		std::lock_guard lock(m_mutex);
+		if (m_index.contains(key)) return;
+		const uint32_t len  = static_cast<uint32_t>(payload.size());
+		const uint64_t hash = XXH3_64bits(payload.data(), payload.size());
+		m_file.clear();
+		m_file.seekp(static_cast<std::streamoff>(m_end));
+		m_file.write(reinterpret_cast<const char*>(&key), 8);
+		m_file.write(reinterpret_cast<const char*>(&len), 4);
+		m_file.write(reinterpret_cast<const char*>(&hash), 8);
+		m_file.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+		m_file.flush();
+		if (!m_file) return;
+		m_index[key] = {m_end + 20, len, hash};
+		m_end += 20 + len;
+	}
+
+private:
+	struct Entry {
+		uint64_t offset = 0;
+		uint32_t len    = 0;
+		uint64_t hash   = 0;
+	};
+	std::filesystem::path                 m_path;
+	std::mutex                            m_mutex;
+	std::fstream                          m_file;
+	std::unordered_map<uint64_t, Entry>   m_index;
+	uint64_t                              m_end = 0;
+};
+
+// Everything the translation of a program depends on besides its inputs (SpirvDiskStore's identity).
+static std::string SpirvDiskIdentity(const std::string& prefetch_identity) {
+	std::string id = fmt::format("{}|{}|{}|{:08x}|{}", KYTY_GIT_HASH, KYTY_GIT_REVISION, prefetch_identity,
+	                             ShaderRecompiler::Frontend::TranslatorDeviceFeatures(), ShaderRecompiler::IR::PortableShaders() ? 1 : 0);
+	// (The translator's own switches: graphics/shader reads these.)
+	for (const char* name: {"KYTY_LANE_LOCAL", "KYTY_LANE_LOCAL_COOP_RANGE", "KYTY_LANE_LOCAL_COOP_SKIP", "KYTY_LANE_LOCAL_UNIFORM_LOADS",
+	                        "KYTY_PORTABLE_SHADERS", "KYTY_PS_WAVE_OR", "KYTY_SHADOW_FILTER", "KYTY_SHADOW_FILTER_RADIUS",
+	                        "KYTY_SHADOW_FILTER_SCALE", "KYTY_SHADOW_FILTER_MAX", "KYTY_LANE_LOCAL_COOP", "KYTY_COMPUTE_WAVE64",
+	                        "KYTY_TRACKING_FAIL_IR", "KYTY_IR_VALIDATE"}) {
+		const char* value = std::getenv(name);
+		id += fmt::format("|{}={}", name, value != nullptr ? value : "");
+	}
+	return id;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -795,6 +907,9 @@ struct PipelineCache::ProgramCache {
 			return nullptr;
 		}
 		std::atomic<uint64_t>                                  spill_end {0};
+		// (ds-pc-port37) The translations on disk (SpirvDiskStore) and what it gave.
+		std::unique_ptr<SpirvDiskStore> disk;
+		std::atomic<uint64_t>           disk_hits {0}, disk_stored {0};
 		std::atomic<uint64_t>                                  spirv_bytes {0}; // before compression
 		uint64_t                                               spill = 0;
 		std::atomic<bool>                                      spill_in_store {false};
@@ -981,6 +1096,15 @@ struct PipelineCache::ProgramCache {
 			if (p.spill == 0) {
 				PipelineCacheLog("Shader prefetch: no temporary file for the SPIR-V");
 				return;
+			}
+			if (const char* value = std::getenv("KYTY_SPIRV_DISK"); !(value != nullptr && std::string_view(value) == "0")) {
+				auto disk = std::make_unique<SpirvDiskStore>();
+				if (disk->Open(std::filesystem::path("_PipelineCache") / "spirv", SpirvDiskIdentity(identity), PipelineCacheGameId())) {
+					PipelineCacheLog("Shader prefetch: {} translated programs on disk (_PipelineCache/spirv)", disk->Entries());
+					p.disk = std::move(disk);
+				} else {
+					PipelineCacheLog("Shader prefetch: the disk store of translations could not be opened");
+				}
 			}
 			uint32_t threads = SpareThreads();
 			// The recording's programs (the place played, what the game soon needs) on all of them, the rest (places not
@@ -1189,8 +1313,76 @@ struct PipelineCache::ProgramCache {
 	}
 
 	// What PrepareWarmJob does for a recorded input, for each of the program's.
+	// (ds-pc-port37) The group's key in the disk store: its input records, in order (the code, the specialization, the
+	// options: what TranslateProgram and CompileProgram read).
+	uint64_t DiskKey(const Prefetch& p, const Prefetch::Group& group) const {
+		uint64_t h = 0x6b79747973707631ull; // (chained: each record's words seeded with the hash so far, and its length)
+		for (const auto index: group.records) {
+			const auto& words = p.inputs.records[index];
+			h = XXH3_64bits_withSeed(words.data(), words.size() * sizeof(uint32_t), h ^ (static_cast<uint64_t>(words.size()) << 32u));
+		}
+		return h;
+	}
+
+	// The group from the disk store: its plan and modules (their SPIR-V into the scratch file, as a translation's).
+	bool LoadFromDisk(Prefetch& p, Prefetch::Group& group, uint64_t key) {
+		std::vector<uint8_t> payload;
+		if (!p.disk->Find(key, payload)) return false;
+		size_t     at   = 0;
+		const auto take = [&](void* out, size_t n) {
+			if (at + n > payload.size()) return false;
+			std::memcpy(out, payload.data() + at, n);
+			at += n;
+			return true;
+		};
+		uint32_t plan_packed = 0, plan_raw = 0, count = 0;
+		if (!take(&plan_packed, 4) || !take(&plan_raw, 4) || at + plan_packed > payload.size()) return false;
+		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+		if (plan_raw != 0) {
+			std::vector<uint8_t> raw(plan_raw);
+			if (!ZstdUnpack({reinterpret_cast<const char*>(payload.data() + at), plan_packed}, raw.data(), raw.size())) return false;
+			plan.emplace();
+			if (!ResourcePlanSerial::Load(raw, *plan)) return false;
+		}
+		at += plan_packed;
+		if (!take(&count, 4) || count > 4096) return false;
+		std::vector<PrefetchedModule> modules;
+		modules.reserve(count);
+		for (uint32_t i = 0; i < count; i++) {
+			uint32_t meta = 0, stored = 0;
+			uint64_t words = 0, spirv_hash = 0;
+			uint8_t  compressed = 0;
+			if (!take(&meta, 4) || at + meta > payload.size()) return false;
+			PrefetchedModule m;
+			if (!ResourcePlanSerial::LoadModule({payload.data() + at, meta}, m.specialization, m.program)) return false;
+			at += meta;
+			if (!take(&words, 8) || !take(&stored, 4) || !take(&compressed, 1) || !take(&spirv_hash, 8) || at + stored > payload.size())
+				return false;
+			const auto offset = p.spill_end.fetch_add(stored, std::memory_order_relaxed);
+			if (!LocalPlatform::WriteScratchFile(p.spill, offset, payload.data() + at, stored)) return false;
+			at += stored;
+			p.spirv_bytes.fetch_add(words * sizeof(uint32_t), std::memory_order_relaxed);
+			m.spirv_offset = offset;
+			m.spirv_words  = static_cast<size_t>(words);
+			m.spirv_bytes  = compressed != 0 ? stored : 0;
+			m.spirv_hash   = spirv_hash;
+			modules.push_back(std::move(m));
+		}
+		if (at != payload.size()) return false;
+		group.plan    = std::move(plan);
+		group.modules = std::move(modules);
+		const auto hits = p.disk_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (hits == 1 || hits % 5000 == 0) PipelineCacheLog("Shader prefetch: {} programs taken from the disk store", hits);
+		return true;
+	}
+
 	void PrefetchTranslate(Prefetch::Group& group) {
 		auto& p = *prefetch;
+		const uint64_t disk_key = p.disk != nullptr ? DiskKey(p, group) : 0;
+		if (p.disk != nullptr && LoadFromDisk(p, group, disk_key)) return;
+		// (ds-pc-port37) Each module's stored SPIR-V bytes, for the disk store.
+		std::vector<std::vector<char>> stored_spirv;
+		bool                           storable = p.disk != nullptr;
 		for (const auto index: group.records) {
 			LocalShaderWarmup::Record record;
 			LocalShaderWarmup::Reader reader {p.inputs.records[index]};
@@ -1214,7 +1406,11 @@ struct PipelineCache::ProgramCache {
 				const auto  stored     = compressed ? packed.size() : bytes;
 				const auto  offset      = p.spill_end.fetch_add(stored, std::memory_order_relaxed);
 				p.spirv_bytes.fetch_add(bytes, std::memory_order_relaxed);
-				if (!LocalPlatform::WriteScratchFile(p.spill, offset, data, stored)) continue;
+				if (!LocalPlatform::WriteScratchFile(p.spill, offset, data, stored)) {
+					storable = false;
+					continue;
+				}
+				if (storable) stored_spirv.emplace_back(static_cast<const char*>(data), static_cast<const char*>(data) + stored);
 				group.modules.push_back({std::move(record.specialization), std::move(result.program).TakeCompiledInfo(),
 				                         offset, result.spirv.size(), compressed ? stored : 0,
 				                         XXH3_64bits(result.spirv.data(), bytes)});
@@ -1222,6 +1418,46 @@ struct PipelineCache::ProgramCache {
 			} catch (const Common::RecoverableExit&) {
 			}
 		}
+		if (!storable || stored_spirv.size() != group.modules.size()) return;
+		// The group into the disk store: [plan packed size][plan raw size][plan], [modules], each [meta size][meta]
+		// [SPIR-V words][stored size][compressed][SPIR-V XXH3][stored bytes].
+		std::vector<uint8_t> payload;
+		const auto put = [&](const void* data, size_t n) {
+			const auto* b = static_cast<const uint8_t*>(data);
+			payload.insert(payload.end(), b, b + n);
+		};
+		std::vector<uint8_t> plan_raw;
+		if (group.plan && !ResourcePlanSerial::Save(*group.plan, plan_raw)) return;
+		std::vector<char> plan_packed;
+		if (!plan_raw.empty()) {
+			const auto packed = ZstdPack(plan_raw.data(), plan_raw.size());
+			if (packed.empty()) return;
+			plan_packed.assign(packed.begin(), packed.end());
+		}
+		const uint32_t pp = static_cast<uint32_t>(plan_packed.size()), pr = static_cast<uint32_t>(plan_raw.size());
+		put(&pp, 4);
+		put(&pr, 4);
+		put(plan_packed.data(), plan_packed.size());
+		const uint32_t count = static_cast<uint32_t>(group.modules.size());
+		put(&count, 4);
+		for (size_t i = 0; i < group.modules.size(); i++) {
+			const auto&          m = group.modules[i];
+			std::vector<uint8_t> meta;
+			if (!ResourcePlanSerial::SaveModule(m.specialization, m.program, meta)) return;
+			const uint32_t ml = static_cast<uint32_t>(meta.size());
+			const uint64_t words = m.spirv_words;
+			const uint32_t st = static_cast<uint32_t>(stored_spirv[i].size());
+			const uint8_t  cz = m.spirv_bytes != 0 ? 1 : 0;
+			put(&ml, 4);
+			put(meta.data(), meta.size());
+			put(&words, 8);
+			put(&st, 4);
+			put(&cz, 1);
+			put(&m.spirv_hash, 8);
+			put(stored_spirv[i].data(), stored_spirv[i].size());
+		}
+		p.disk->Add(disk_key, payload);
+		p.disk_stored.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	// The prefetched translation of the program `lookup_key` names, met for the first time: taken over

@@ -2,6 +2,7 @@
 
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/BdaReadPlan.h"
 
 #include <cstring>
 #include <string>
@@ -356,6 +357,84 @@ bool Load(std::span<const uint8_t> bytes, IR::ResourcePlan& plan, bool* defer_li
 	// (As ExtractResourcePlan ends: from the plan alone.)
 	if (linear) IR::BuildLinearSrtPlan(plan);
 	return !linear || plan.linear_srt != nullptr || (plan = {}, false);
+}
+
+// ---- (ds-pc-port37) A translated module: its specialization and compiled info. ----
+namespace {
+constexpr uint32_t ModuleMagic = 0x4d4c5052u; // "RPLM"
+static_assert(std::is_trivially_copyable_v<IR::ResourceSpecialization::Buffer>);
+static_assert(std::is_trivially_copyable_v<IR::ResourceSpecialization::Image>);
+static_assert(std::is_trivially_copyable_v<IR::BdaReadSpan>);
+static_assert(std::is_trivially_copyable_v<IR::TablePlan::Slot>);
+static_assert(std::is_trivially_copyable_v<IR::TablePlan::Descriptor>);
+static_assert(std::is_trivially_copyable_v<IR::TablePlan::IndirectImage>);
+static_assert(std::is_trivially_copyable_v<std::array<IR::TablePlan::Operand, 4>>);
+} // namespace
+
+bool SaveModule(const IR::ResourceSpecialization& spec, const IR::CompiledShaderInfo& info, std::vector<uint8_t>& out) {
+	std::vector<uint8_t> bytes;
+	Writer               w(bytes);
+	w.Put(ModuleMagic);
+	w.PutVector(spec.buffers);
+	w.PutVector(spec.images);
+	w.PutVector(info.bda_read_plan.spans);
+	w.Put(info.bda_read_plan.complete);
+	w.Put(info.stage);
+	w.Put(info.shader_hash);
+	w.Put(info.wave_size);
+	w.Put(info.user_data_base);
+	w.Put(info.user_data_count);
+	w.Put(info.scratch_dwords);
+	w.Put(info.param_export_mask);
+	w.Put(info.table_mode);
+	const auto& t = info.table_plan;
+	w.PutVector(t.slots);
+	w.PutVector(t.buffers);
+	w.PutVector(t.images);
+	w.PutVector(t.samplers);
+	w.PutVector(t.gpu);
+	w.PutVector(t.cpu);
+	w.Put(t.global_memory);
+	w.Put(t.dynamic_reads);
+	w.PutVector(t.indirect);
+	PutInfo(w, info.info);
+	const auto& b = info.bindings;
+	w.Put(b.push_data_start_dword);
+	w.Put(b.memory_offset_dword);
+	w.Put(b.memory_offset_count);
+	w.Put(b.buffer_word_count);
+	w.Put(b.lod_stats_count);
+	w.Put(b.table_block_dwords);
+	w.PutVector(b.user_data_registers);
+	w.Put(static_cast<uint32_t>(b.descriptors.size()));
+	for (const auto& d: b.descriptors) {
+		w.Put(d.kind);
+		w.PutVector(d.resources);
+	}
+	out = std::move(bytes);
+	return true;
+}
+
+bool LoadModule(std::span<const uint8_t> bytes, IR::ResourceSpecialization& spec, IR::CompiledShaderInfo& info) {
+	Reader   r(bytes);
+	uint32_t magic = 0, count = 0;
+	if (!r.Get(magic) || magic != ModuleMagic) return false;
+	auto& t = info.table_plan;
+	auto& b = info.bindings;
+	if (!r.GetVector(spec.buffers) || !r.GetVector(spec.images) || !r.GetVector(info.bda_read_plan.spans) ||
+	    !r.Get(info.bda_read_plan.complete) || !r.Get(info.stage) || !r.Get(info.shader_hash) || !r.Get(info.wave_size) ||
+	    !r.Get(info.user_data_base) || !r.Get(info.user_data_count) || !r.Get(info.scratch_dwords) ||
+	    !r.Get(info.param_export_mask) || !r.Get(info.table_mode) || !r.GetVector(t.slots) || !r.GetVector(t.buffers) ||
+	    !r.GetVector(t.images) || !r.GetVector(t.samplers) || !r.GetVector(t.gpu) || !r.GetVector(t.cpu) ||
+	    !r.Get(t.global_memory) || !r.Get(t.dynamic_reads) || !r.GetVector(t.indirect) || !GetInfo(r, info.info) ||
+	    !r.Get(b.push_data_start_dword) || !r.Get(b.memory_offset_dword) || !r.Get(b.memory_offset_count) ||
+	    !r.Get(b.buffer_word_count) || !r.Get(b.lod_stats_count) || !r.Get(b.table_block_dwords) ||
+	    !r.GetVector(b.user_data_registers) || !r.Get(count) || count > (1u << 16))
+		return false;
+	b.descriptors.resize(count);
+	for (auto& d: b.descriptors)
+		if (!r.Get(d.kind) || !r.GetVector(d.resources)) return false;
+	return r.AtEnd();
 }
 
 } // namespace ResourcePlanSerial
