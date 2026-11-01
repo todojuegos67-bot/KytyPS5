@@ -106,6 +106,14 @@ fs::path PrecompileExe() {
 			if (!entry.is_regular_file(ec)) continue;
 			auto ext = entry.path().extension().wstring();
 			std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+			// (ds-pc-port46) Never NVIDIA's DLSS 5 DLL (the user's own nvngx_dlssnr.dll): the precompile does not use it, and it
+			// is neither linked nor copied (it was hard-linked here with every DLL of the folder).
+			auto name = entry.path().filename().wstring();
+			std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+			if (name.starts_with(L"nvngx")) {
+				fs::remove(dir / entry.path().filename(), ec);
+				continue;
+			}
 			if (ext == L".dll") ok = link(entry.path(), dir / entry.path().filename());
 		}
 		// Without it, the old behavior (the precompile still runs; AMD GPUs compile again in play).

@@ -1102,8 +1102,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (s.shader_turbo) {
 		const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
 		env.Set("KYTY_SHADER_PREFETCH_THREADS", std::to_string(std::min(cpus, 64u)));
-		env.Set("KYTY_SHADER_WARMUP_THREADS", std::to_string(cpus));
-		env.Set("KYTY_SHADER_FOLLOW_THREADS", "4");
+		// (ds-pc-port46) As the emulator launcher's (launch.json: KYTY_SHADER_WARMUP_THREADS=16; no follow helpers set: the
+		// default 2).
+		env.Set("KYTY_SHADER_WARMUP_THREADS", "16");
 	}
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
