@@ -193,6 +193,7 @@ bool Evaluate(const Desc& desc) {
     uint32_t flags = desc.hdr ? XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE : 0u;
     if (desc.depth_inverted) flags |= XESS_INIT_FLAG_INVERTED_DEPTH;
     if (!desc.hdr) flags |= XESS_INIT_FLAG_LDR_INPUT_COLOR;
+    if (desc.has_reactive) flags |= XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK;
     if (g_context == nullptr || g_output != desc.upscale || g_render != desc.render ||
         g_flags != flags) {
         if (g_context != nullptr) {
@@ -234,6 +235,7 @@ bool Evaluate(const Desc& desc) {
     exec.velocityTexture = ViewInfo(desc.motion, false);
     exec.depthTexture = ViewInfo(desc.depth, true);
     exec.outputTexture = ViewInfo(desc.output, false);
+    if (desc.has_reactive) exec.responsivePixelMaskTexture = ViewInfo(desc.reactive, false);
     exec.jitterOffsetX = desc.jitter[0];
     exec.jitterOffsetY = desc.jitter[1];
     exec.exposureScale = 1.0f;

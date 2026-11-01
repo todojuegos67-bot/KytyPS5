@@ -50,6 +50,9 @@ struct BBVk {
     vk::DescriptorSetLayout mv_set_layout{};
     vk::PipelineLayout mv_layout{};
     vk::Pipeline mv_pipeline{};
+    OwnImage reactive{};
+    std::array<OwnImage, 2> lum{};
+    u32 lum_index = 0;
     vk::Sampler nearest{};
     OwnImage mv;
     OwnImage output;
@@ -206,6 +209,30 @@ bool InitOnce(const Instance& instance) {
         },
         vk::DescriptorSetLayoutBinding{
             .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 2,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 3,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 4,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 5,
             .descriptorType = vk::DescriptorType::eStorageImage,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
@@ -709,13 +736,17 @@ void PollLuminance(Scheduler& scheduler) {
         return;
     }
     const double src = v[0] / 65536.0 / n, out = v[1] / 65536.0 / n;
+    const double sat_src = v[4] / 65536.0 / n, sat_out = v[5] / 65536.0 / n;
     const double diff = src > 1e-4 ? std::fabs(out - src) / src : std::fabs(out - src);
+    const double sat_diff =
+        sat_src > 1e-3 ? std::fabs(sat_out - sat_src) / sat_src : std::fabs(sat_out - sat_src);
     const std::string text = fmt::format(
-        "luminance self-check (frame 120, {} grid points of 64x64): game's presented image "
-        "{:.4f}, our presented output {:.4f}, {:+.1f} %{}",
-        n, src, out, src > 1e-4 ? (out - src) / src * 100.0 : 0.0,
+        "colour self-check (frame 120, {} grid points of 64x64): luminance game {:.4f}, ours "
+        "{:.4f} ({:+.1f} %); saturation game {:.4f}, ours {:.4f} ({:+.1f} %){}",
+        n, src, out, src > 1e-4 ? (out - src) / src * 100.0 : 0.0, sat_src, sat_out,
+        sat_src > 1e-3 ? (sat_out - sat_src) / sat_src * 100.0 : 0.0,
         g_bb.present_encoded ? " (upscaler on sRGB-encoded LDR)" : " (upscaler on linear)");
-    if (diff > 0.05) {
+    if (diff > 0.05 || sat_diff > 0.08) {
         LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] WARNING: {} - colour / gamma mismatch", text);
         BB::Upscale::Checkpoint("WARNING: " + text + " - colour / gamma mismatch");
     } else {
@@ -905,7 +936,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     // The luminance self-check buffer (bound every frame, written on frame 120 only).
     if (!g_bb.lum_buffer) {
         const VkBufferCreateInfo ci = vk::BufferCreateInfo{
-            .size = 16,
+            .size = 32,
             .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
         };
         VmaAllocationCreateInfo alloc{};
@@ -925,7 +956,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     ++g_bb.composites;
     const bool measure = g_bb.composites == 120 && !g_bb.lum_pending;
     if (measure) {
-        cmd.fillBuffer(g_bb.lum_buffer, 0, 16, 0);
+        cmd.fillBuffer(g_bb.lum_buffer, 0, 32, 0);
         const vk::MemoryBarrier2 fill{
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
@@ -949,7 +980,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     const vk::DescriptorImageInfo bare_info{g_bb.linear, g_bb.present_in.view,
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
     const vk::DescriptorImageInfo out_info{{}, g_bb.present.view, vk::ImageLayout::eGeneral};
-    const vk::DescriptorBufferInfo lum_info{g_bb.lum_buffer, 0, 16};
+    const vk::DescriptorBufferInfo lum_info{g_bb.lum_buffer, 0, 32};
     const std::array writes{
         vk::WriteDescriptorSet{
             .dstBinding = 0,
@@ -1068,6 +1099,9 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     const vk::Extent2D output{plan.output_w, plan.output_h};
     const auto storage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
     if (!EnsureImage(g_bb.mv, render, vk::Format::eR16G16Sfloat, storage) ||
+        !EnsureImage(g_bb.reactive, render, vk::Format::eR8Unorm, storage) ||
+        !EnsureImage(g_bb.lum[0], render, vk::Format::eR16Sfloat, storage) ||
+        !EnsureImage(g_bb.lum[1], render, vk::Format::eR16Sfloat, storage) ||
         !EnsureImage(g_bb.output, output, vk::Format::eR16G16B16A16Sfloat,
                      storage | vk::ImageUsageFlagBits::eTransferSrc |
                          vk::ImageUsageFlagBits::eTransferDst)) {
@@ -1095,10 +1129,16 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, g_bb.queries, slot * 2);
     }
 
-    // Camera motion vectors.
-    Barrier(cmd, g_bb.mv, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
-            vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader,
-            vk::AccessFlagBits2::eShaderWrite);
+    // Camera motion vectors and the reactive mask.
+    auto& lum_cur = g_bb.lum[g_bb.lum_index];
+    auto& lum_prev = g_bb.lum[g_bb.lum_index ^ 1];
+    const bool lum_prev_valid = !plan.reset && lum_prev.layout == vk::ImageLayout::eGeneral;
+    for (OwnImage* img : {&g_bb.mv, &g_bb.reactive, &lum_cur, &lum_prev}) {
+        Barrier(cmd, *img, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                vk::PipelineStageFlagBits2::eComputeShader,
+                vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead);
+    }
     {
         struct {
             float rows[16];
@@ -1125,7 +1165,38 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         const vk::DescriptorImageInfo depth_info{g_bb.nearest, depth_view,
                                                  vk::ImageLayout::eDepthStencilReadOnlyOptimal};
         const vk::DescriptorImageInfo mv_info{{}, g_bb.mv.view, vk::ImageLayout::eGeneral};
+        push.size[3] = lum_prev_valid ? 1u : 0u;
+        const vk::DescriptorImageInfo color_info{g_bb.nearest, color_view,
+                                                 vk::ImageLayout::eShaderReadOnlyOptimal};
+        const vk::DescriptorImageInfo prev_info{{}, lum_prev.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo cur_info{{}, lum_cur.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo reactive_info{{}, g_bb.reactive.view,
+                                                    vk::ImageLayout::eGeneral};
         const std::array writes{
+            vk::WriteDescriptorSet{
+                .dstBinding = 2,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo = &color_info,
+            },
+            vk::WriteDescriptorSet{
+                .dstBinding = 3,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageImage,
+                .pImageInfo = &prev_info,
+            },
+            vk::WriteDescriptorSet{
+                .dstBinding = 4,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageImage,
+                .pImageInfo = &cur_info,
+            },
+            vk::WriteDescriptorSet{
+                .dstBinding = 5,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageImage,
+                .pImageInfo = &reactive_info,
+            },
             vk::WriteDescriptorSet{
                 .dstBinding = 0,
                 .descriptorCount = 1,
@@ -1148,6 +1219,13 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+    Barrier(cmd, g_bb.reactive, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+    Barrier(cmd, lum_cur, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+            vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader,
+            vk::AccessFlagBits2::eShaderRead);
+    g_bb.lum_index ^= 1;
     Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
             vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader,
             vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead);
@@ -1160,6 +1238,12 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
                   vk::ImageLayout::eDepthStencilReadOnlyOptimal, depth.usage_flags};
     desc.motion = {g_bb.mv.image, g_bb.mv.view, g_bb.mv.format, render,
                    vk::ImageLayout::eShaderReadOnlyOptimal, g_bb.mv.usage};
+    desc.reactive = {g_bb.reactive.image, g_bb.reactive.view, g_bb.reactive.format, render,
+                     vk::ImageLayout::eShaderReadOnlyOptimal, g_bb.reactive.usage};
+    {
+        const char* r = std::getenv("BB_REACTIVE");
+        desc.has_reactive = r == nullptr || r[0] != '0';
+    }
     desc.output = {g_bb.output.image, g_bb.output.view, g_bb.output.format, output,
                    vk::ImageLayout::eGeneral, g_bb.output.usage};
     desc.render = render;
@@ -1173,7 +1257,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     desc.fov_y = plan.fov_y;
     desc.z_near = plan.z_near;
     desc.z_far = plan.z_far;
-    desc.sharpness = BB::Upscale::Cfg().sharpness;
+    desc.sharpness = BB::Upscale::LiveSharpness();
     desc.quality = BB::Upscale::Cfg().quality;
     desc.camera_valid = plan.camera_valid;
     std::copy(std::begin(plan.view_to_clip), std::end(plan.view_to_clip), desc.view_to_clip);

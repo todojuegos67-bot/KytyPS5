@@ -4,7 +4,10 @@
 #include "video_core/bb/bb_fg.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <ctime>
 #include <cmath>
 #include <cstdlib>
@@ -229,9 +232,6 @@ Config ParseConfig() {
     }
     if (c.kind == SR::Kind::Fsr4) {
         _putenv_s("BB_UPSCALER", "fsr4");
-        if (Env("BB_FSR4_SHARPNESS") == nullptr) {
-            _putenv_s("BB_FSR4_SHARPNESS", fmt::format("{}", c.sharpness).c_str());
-        }
     }
 #endif
     return c;
@@ -362,6 +362,7 @@ struct FrameState {
     u64 draws = 0;
     u32 scene_draws = 0;
     u32 scanned = 0;
+    bool camera_ok = false; // a translated view-projection seen in two scene draws
     u64 scanned_draw = ~0ULL;
     u32 flip_draws = 0, hud_draws = 0, hud_other = 0, src_rewrites = 0;
     bool injected = false, inject_failed = false, redirecting = false, hudless = false;
@@ -537,13 +538,16 @@ const Candidate* BestCamera() {
     for (const auto& c : g_frame.camera) {
         if (translated(c) && (best == nullptr || c.count > best->count)) best = &c;
     }
-    if (best == nullptr) {
-        for (const auto& c : g_frame.camera) {
-            if (best == nullptr || c.count > best->count) best = &c;
-        }
+    // The full (translated) view-projection is often only in a few draws' constants (lighting /
+    // fog passes): seen twice in the frame's scene draws is enough. Requiring a third of all
+    // scanned draws rejected it in most gameplay frames ("no camera yet", no jitter, zero MV).
+    if (best != nullptr && best->count >= 2) return best;
+    best = nullptr;
+    for (const auto& c : g_frame.camera) {
+        if (best == nullptr || c.count > best->count) best = &c;
     }
     if (best == nullptr) return nullptr;
-    const u32 need = std::max<u32>(3, g_frame.scanned / 3);
+    const u32 need = std::max<u32>(3, g_frame.scanned / 8);
     return best->count >= need ? best : nullptr;
 }
 
@@ -651,6 +655,52 @@ bool Streamline() {
     return Cfg().kind == SR::Kind::Dlss || BB::FG::StreamlineWanted();
 }
 } // namespace
+
+float LiveSharpness() {
+    static std::atomic<float> value{Cfg().sharpness};
+    static const char* const path = std::getenv("BB_UPSCALE_SHARPNESS_FILE");
+    if (path == nullptr || *path == '\0') {
+        return value.load(std::memory_order_relaxed);
+    }
+    static std::mutex mutex;
+    static std::chrono::steady_clock::time_point next{};
+    static std::filesystem::file_time_type seen{};
+    std::unique_lock lk{mutex, std::try_to_lock};
+    if (!lk.owns_lock()) {
+        return value.load(std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) {
+        return value.load(std::memory_order_relaxed);
+    }
+    next = now + std::chrono::milliseconds(500);
+    std::error_code ec;
+    const auto stamp = std::filesystem::last_write_time(path, ec);
+    if (ec || stamp == seen) {
+        return value.load(std::memory_order_relaxed);
+    }
+    seen = stamp;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto eq = line.find('=');
+        const std::string text = eq == std::string::npos ? line : line.substr(eq + 1);
+        if (text.empty()) {
+            continue;
+        }
+        char* end = nullptr;
+        const float v = std::strtof(text.c_str(), &end);
+        if (end != text.c_str() && std::isfinite(v)) {
+            const float clamped = std::clamp(v, 0.0f, 1.0f);
+            if (clamped != value.load(std::memory_order_relaxed)) {
+                LOG_INFO(Render_Vulkan, "[BB_UPSCALE] sharpness {:.2f} (live, {})", clamped, path);
+            }
+            value.store(clamped, std::memory_order_relaxed);
+            break;
+        }
+    }
+    return value.load(std::memory_order_relaxed);
+}
 
 bool Enabled() {
     return Cfg().kind != SR::Kind::Off;
@@ -1222,7 +1272,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     if (g_draw.targets_flip) {
         ++f.flip_draws;
     }
-    if (g_dump_frame && g_dump_lines < 1500) {
+    if (g_dump_frame && g_dump_lines < 8000) {
         g_draw.analyze_dump = true;
         std::string line = fmt::format("[BB_ANALYZE] frame={} draw {} targets:", g_frame_no, f.draws);
         for (u32 i = 0; i < g_draw.num_colors; ++i) {
@@ -1232,7 +1282,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
         if (g_draw.targets_flip) line += " [FLIP]";
         if (g_draw.scene) line += " [SCENE]";
         const std::string key = line.substr(line.find("targets:"));
-        if (key == g_dump_last && !g_draw.scene) {
+        if (key == g_dump_last) {
             ++g_dump_repeats;
             g_draw.analyze_dump = false;
         } else {
@@ -1257,7 +1307,7 @@ void OnDispatch() {
     g_draw = {};
     g_draw.valid = true;
     g_draw.compute = true;
-    if (g_dump_frame && g_dump_lines < 1500) {
+    if (g_dump_frame && g_dump_lines < 8000) {
         g_draw.analyze_dump = true;
         AnalyzeLog("[BB_ANALYZE] frame={} dispatch {}", g_frame_no, g_frame.draws);
         ++g_dump_lines;
@@ -1275,7 +1325,8 @@ bool WantCameraScan(bool vertex) {
     }
     std::scoped_lock lk{g_mutex};
     const bool want = g_draw.valid && g_draw.scene &&
-                      (g_frame.scanned < 160 || (vertex && Cfg().jitter && !g_draw.vertex_camera));
+                      (g_frame.scanned < 160 || !g_frame.camera_ok ||
+                       (vertex && Cfg().jitter && !g_draw.vertex_camera));
     if (!want) ++g_diag_noscene;
     return want;
 }
@@ -1290,7 +1341,7 @@ void OnVertexConstants(const void* data, size_t size) {
     auto& f = g_frame;
     const u64 draw = f.draws;
     bool counted_draw = f.scanned_draw == draw;
-    if (g_draw.analyze_dump && g_dump_lines < 1500 && g_dump_cbs < 64) {
+    if (g_draw.analyze_dump && g_dump_lines < 8000 && g_dump_cbs < 64) {
         ++g_dump_cbs;
         const float* v = static_cast<const float*>(data);
         std::string text;
@@ -1303,7 +1354,7 @@ void OnVertexConstants(const void* data, size_t size) {
     }
     const size_t n = std::min<size_t>(size, 4096) / 4;
     const float* w = static_cast<const float*>(data);
-    const bool jitter_only = f.scanned >= 160;
+    const bool jitter_only = f.scanned >= 160 && f.camera_ok;
     for (size_t at = 0; at + 16 <= n; at += 4) {
         for (int layout = 0; layout < 2; ++layout) {
             Mat m;
@@ -1331,7 +1382,7 @@ void OnVertexConstants(const void* data, size_t size) {
             if (!hit) {
                 continue;
             }
-            if (g_draw.analyze_dump && g_dump_lines < 1500) {
+            if (g_draw.analyze_dump && g_dump_lines < 8000) {
                 AnalyzeLog(
                          "[BB_ANALYZE]   camera candidate in cb {:#x}+{:#x} ({} layout{}): "
                          "{:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} "
@@ -1358,6 +1409,9 @@ void OnVertexConstants(const void* data, size_t size) {
             } else if (it->last_draw != draw) {
                 ++it->count;
                 it->last_draw = draw;
+                if (it->count >= 2 && std::fabs(m.m[3]) + std::fabs(m.m[7]) + std::fabs(m.m[15]) > 1e-3) {
+                    f.camera_ok = true;
+                }
             }
         }
     }
@@ -1373,7 +1427,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     }
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
-    if (g_draw.analyze_dump && g_dump_lines < 1500) {
+    if (g_draw.analyze_dump && g_dump_lines < 8000) {
         AnalyzeLog("[BB_ANALYZE]   samples {:#x} {}x{} {}{}{}", addr, width, height,
                  vk::to_string(format), addr == f.scene_color ? " [SCENE COLOUR]" : "",
                  addr == f.gb_depth ? " [SCENE DEPTH]" : "");

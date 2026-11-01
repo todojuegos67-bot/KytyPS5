@@ -564,7 +564,8 @@ bool Evaluate(const Desc& desc) {
     auto output = ToResource(desc.output);
     const sl::Extent render{0, 0, desc.render.width, desc.render.height};
     const sl::Extent full{0, 0, desc.upscale.width, desc.upscale.height};
-    sl::ResourceTag tags[4]{
+    auto reactive = ToResource(desc.reactive);
+    sl::ResourceTag tags[5]{
         sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor,
                         sl::ResourceLifecycle::eValidUntilEvaluate, &render),
         sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor,
@@ -573,10 +574,13 @@ bool Evaluate(const Desc& desc) {
                         &render),
         sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors,
                         sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+        sl::ResourceTag(&reactive, sl::kBufferTypeBiasCurrentColorHint,
+                        sl::ResourceLifecycle::eValidUntilEvaluate, &render),
     };
+    const uint32_t tag_count = desc.has_reactive ? 5u : 4u;
     auto* command_buffer =
         reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(desc.cmd));
-    if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, 4, command_buffer);
+    if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, tag_count, command_buffer);
         result != sl::Result::eOk) {
         static uint32_t reports = 0;
         if (reports++ < 8) BBLogf("DLSS: slSetTagForFrame failed (%d)", static_cast<int>(result));

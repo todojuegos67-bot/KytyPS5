@@ -200,6 +200,10 @@ bool Evaluate(const Desc& desc) {
     up.depth = Resource(desc.depth, true);
     up.motionVectors = Resource(desc.motion, false);
     up.output = Resource(desc.output, false);
+    if (desc.has_reactive) {
+        up.reactive = Resource(desc.reactive, false);
+        up.transparencyAndComposition = Resource(desc.reactive, false);
+    }
     up.output.state = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
     up.output.description.usage = FFX_API_RESOURCE_USAGE_UAV;
     up.jitterOffset = {desc.jitter[0], desc.jitter[1]};
