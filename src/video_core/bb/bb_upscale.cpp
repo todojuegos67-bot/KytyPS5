@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_fg.h"
 
 #include <algorithm>
 #include <chrono>
@@ -644,6 +645,13 @@ const Config& Cfg() {
     return config;
 }
 
+namespace {
+// Streamline is loaded for DLSS and for DLSS frame generation (BB_FG=dlss-*, bb_fg.h).
+bool Streamline() {
+    return Cfg().kind == SR::Kind::Dlss || BB::FG::StreamlineWanted();
+}
+} // namespace
+
 bool Enabled() {
     return Cfg().kind != SR::Kind::Off;
 }
@@ -664,7 +672,7 @@ void PreInstance() {
     if (!g_guard_skipped.empty()) {
         Checkpoint(g_guard_skipped);
     }
-    if (c.kind == SR::Kind::Off) {
+    if (c.kind == SR::Kind::Off && !Streamline()) {
         return;
     }
     LOG_INFO(Render_Vulkan,
@@ -678,7 +686,7 @@ void PreInstance() {
     if (c.kind != SR::Kind::Off && c.kind != SR::Kind::Native) {
         GuardBegin(SR::KindName(c.kind), "loading the upscaler and creating the Vulkan device");
     }
-    if (c.kind == SR::Kind::Dlss) {
+    if (Streamline()) {
 #if defined(_WIN32)
         // Implicit Vulkan capture layers that crash inside vkCreateDevice under Streamline (owner's
         // log: OBS's we-graphics-hook64.dll, 0xc0000005): turned off for this process only, before
@@ -743,7 +751,7 @@ void PreInstance() {
 }
 
 const wchar_t* VulkanLoaderOverride() {
-    return Cfg().kind == SR::Kind::Dlss ? SR::Dlss::LoaderPath() : nullptr;
+    return Streamline() ? SR::Dlss::LoaderPath() : nullptr;
 }
 
 void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
@@ -759,7 +767,7 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
         Checkpoint(fmt::format("device extension {} for {}: {}", name, SR::KindName(Cfg().kind),
                                has ? "added" : "NOT available"));
     };
-    if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::Manual()) {
+    if (Streamline() && SR::Dlss::Manual()) {
         // Manual hooking: what Streamline's features asked for (slGetFeatureRequirements).
         for (const auto& name : SR::Dlss::RequiredDeviceExtensions()) {
             // (Not the EXT buffer device address with the core / KHR one: both is invalid.)
@@ -767,7 +775,7 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
             add(name.c_str());
         }
     }
-    if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::LoaderPath() != nullptr) {
+    if (Streamline() && SR::Dlss::LoaderPath() != nullptr) {
         // Streamline enables VK_NV_low_latency2 (Reflex) on the device whatever plugins it loads,
         // without the present-id extension that needs: the driver then refuses (or crashes in)
         // vkCreateDevice. The Demon's Souls fork adds it the same way (vulkanWindow.cpp).
@@ -790,7 +798,7 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
                           vk::PhysicalDeviceVulkan12Features& f12,
                           vk::PhysicalDeviceVulkan13Features& f13, vk::PhysicalDeviceFeatures& f,
                           void* next) {
-    if (Cfg().kind == SR::Kind::Dlss) {
+    if (Streamline()) {
         // The Vulkan 1.2 / 1.3 features Streamline's features ask for, turned on in our own
         // structs where the device has them, so nothing needs to be appended to the chain.
         vk::PhysicalDeviceVulkan13Features s13{};
@@ -842,7 +850,7 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
             }
         }
     }
-    if (Cfg().kind == SR::Kind::Dlss && SR::Dlss::LoaderPath() != nullptr) {
+    if (Streamline() && SR::Dlss::LoaderPath() != nullptr) {
         // VK_KHR_present_id enabled for Streamline's Reflex (VK_NV_low_latency2) needs its feature
         // turned on too.
         const bool has = std::any_of(extensions.begin(), extensions.end(), [](const char* e) {

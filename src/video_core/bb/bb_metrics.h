@@ -16,4 +16,5 @@ void OnInput();                // the game read the pad
 void OnPresent();              // a new guest frame was presented
 void SetUpscaleLine(const std::string& text);
 void SetResLine(const std::string& text); // written each second as "[res] game WxH -> output WxH ..."
+void Line(const char* text); // a line as it is (frame generation: "[dlssg] ... real X fps, shown Y fps")
 } // namespace BB::Metrics

@@ -79,6 +79,16 @@ void SetResLine(const std::string& text) {
     g_res = "[res] " + text;
 }
 
+void Line(const char* text) {
+    std::FILE* file = Open();
+    if (file == nullptr || text == nullptr) {
+        return;
+    }
+    std::scoped_lock lk{g_mutex};
+    std::fprintf(file, "%s\n", text);
+    std::fflush(file);
+}
+
 void OnPresent() {
     std::FILE* file = Open();
     if (file == nullptr) {

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "video_core/bb/bb_fg.h"
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -56,6 +58,11 @@ public:
     static const char* BBPresentWhy();
     // Bloodborne: the end of the presenter's pass, the last per-stage GPU timestamp.
     static void BBStampPresentEnd(vk::CommandBuffer cmd);
+    // Bloodborne frame generation (bb_fg.h): this frame's depth and motion vectors copied into
+    // the slot's own images (the game reuses its own before the frame is presented), the camera
+    // and jitter of its upscale; and the upscaled image before the HUD at the output size (the
+    // composite without the HUD) when the window-size path presented it. False: not a 3D frame.
+    bool BBFrameGenCapture(u32 slot, BB::FG::Inputs& out, vk::ImageView& hudless_view);
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,

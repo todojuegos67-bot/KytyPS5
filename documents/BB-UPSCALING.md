@@ -33,3 +33,29 @@ then the upscaler's output is the window size (game size -> window size).
 
 `shadPS4.exe`, `streamline\*.dll`, `libxess.dll`, `amd_fidelityfx_vk.dll`, `fsr4_shaders\`, and
 `LICENSES\` (GPL-2.0, Streamline MIT, XeSS, FidelityFX MIT, FSR 4 v07).
+
+## Frame generation (BB_FG, branch bb-fg-022)
+
+Ported from the Demon's Souls fork (src/local/frame-gen.cpp, fsr3-fg.cpp, anti-lag.cpp) into
+src/video_core/bb/bb_fg.cpp, bb_fg_fsr3.cpp and bb_antilag.cpp. It needs an upscaler
+(`BB_UPSCALER`): its inputs are the upscaler's (the upscaled image before the HUD, the scene depth,
+the camera motion vectors, the jitter and the camera matrices). Frames without a 3D scene (menus,
+movies, loading screens) are shown as they are; DLSS-G turns off after 30 such presents and on
+again after 10 3D frames.
+
+| Variable | Values | Effect |
+|---|---|---|
+| `BB_FG` | `off` (default), `dlss-x2`, `dlss-x3`, `dlss-x4`, `dlss-x5`, `dlss-x6`, `dlss-dyn` | NVIDIA DLSS Frame Generation through Streamline 2.14.16 (NVIDIA-signed DLLs only, checked before loading). x5 / x6 only where the GPU makes them (RTX 50), else capped to its maximum. `dlss-dyn`: the app-side dynamic multiplier up to x6, target refresh x 14/15. |
+| `BB_FG` | `amd-x2`, `amd-x3`, `amd-x4`, `amd-dyn` | AMD FSR 3 frame generation (FidelityFX frame interpolation swapchain). x3 / x4 / dyn need the patched amd_fidelityfx_vk.dll the workflow builds (AMD's signed one stays x2). `amd-dyn`: x2..x4, target refresh - refresh^2/3600. |
+| `BB_DLSSG_TARGET_FPS`, `BB_FSR3_TARGET_FPS` | fps | The dynamic multiplier's shown-fps target. |
+| `BB_VRR_CAP_FPS` | fps or `auto` | Fixed multipliers: real frames held to cap / multiplier (G-SYNC / FreeSync range). |
+| `BB_FSR3_PACING_FLOOR` | factor (default 1.0, 0 off) | Patched DLL: no FSR 3 present closer than one refresh period x factor. |
+| `BB_REFLEX` | `on` / `low`, `boost`, `off` | NVIDIA Reflex. With DLSS-G: Streamline's Reflex mode (default low latency). Without Streamline: VK_NV_low_latency2 (as `BB_ANTILAG=1`). |
+| `BB_ANTILAG` | `0`, `1`, `2` | 1: AMD Anti-Lag 2 (VK_AMD_anti_lag) or NVIDIA Reflex (VK_NV_low_latency2) when Streamline is not loaded; 2: also the emulator's latency limiter where neither exists. |
+| `BB_LATENCY` | `1` | `[lat] input->present ...` once a second. |
+| `BB_METRICS_OUT` | file | The `[dlssg] ... real X fps, shown Y fps; generation on N of M frames`, `[fsr3] real X fps, shown Y fps; generation on N of M frames`, `[fsr3-mfg] xN ...; real X fps (free F), shown Y fps` and `[dyn] ...` lines go there too (metricas-bb.ps1 reads real / shown). |
+
+Every other `KYTY_*` knob of the Demon's Souls code is read as `BB_*` first (`BB_DLSSG_REFLEX`,
+`BB_DLSSG_SLEEP`, `BB_DLSSG_PACE=reflex`, `BB_DLSSG_REFLEX_LIMIT`, `BB_FRAMEGEN_HUDLESS=0`,
+`BB_FSR3_ASYNC`, `BB_FSR3_DEBUG_VIEW`, `BB_FSR3_MV_SIGN`, `BB_DYN_QUALITY`, ...). nvngx_dlssnr.dll is
+never shipped.

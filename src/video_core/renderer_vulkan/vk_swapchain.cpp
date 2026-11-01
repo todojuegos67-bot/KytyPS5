@@ -9,6 +9,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -70,10 +71,20 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .oldSwapchain = nullptr,
     };
 
-    auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
-    ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
-               vk::to_string(swapchain_result));
-    swapchain = chain;
+    // Frame generation / latency (bb_fg.h): NVIDIA Reflex's latency mode chained in; FSR 3 frame
+    // generation makes its frame interpolation swapchain instead.
+    vk::SwapchainCreateInfoKHR fg_info = swapchain_info;
+    fg_info.pNext = BB::FG::ChainSwapchain(const_cast<void*>(fg_info.pNext));
+    vk::SwapchainKHR fg_chain{};
+    if (BB::FG::CreateSwapchain(fg_info, &fg_chain)) {
+        swapchain = fg_chain;
+    } else {
+        auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(fg_info);
+        ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
+                   vk::to_string(swapchain_result));
+        swapchain = chain;
+    }
+    BB::FG::OnSwapchain(swapchain);
 
     SetupImages();
     RefreshSemaphores();
@@ -105,8 +116,11 @@ void Swapchain::SetHDR(bool hdr) {
 bool Swapchain::AcquireNextImage() {
     vk::Device device = instance.GetDevice();
     vk::Result result =
-        device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
-                                   image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
+        BB::FG::Fsr3Active()
+            ? BB::FG::AcquireNextImage(swapchain, image_acquired[frame_index], &image_index)
+            : device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
+                                         image_acquired[frame_index], VK_NULL_HANDLE,
+                                         &image_index);
 
     switch (result) {
     case vk::Result::eSuccess:
@@ -136,7 +150,9 @@ bool Swapchain::Present() {
         .pImageIndices = &image_index,
     };
 
-    auto result = instance.GetPresentQueue().presentKHR(present_info);
+    auto result = BB::FG::Fsr3Active()
+                      ? BB::FG::QueuePresent(instance.GetPresentQueue(), present_info)
+                      : instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
@@ -267,7 +283,14 @@ void Swapchain::Destroy() {
     images_view.clear();
 
     if (swapchain) {
-        device.destroySwapchainKHR(swapchain);
+        BB::FG::SwapchainChanging();
+        BB::FG::OnSwapchain(vk::SwapchainKHR{});
+        if (BB::FG::Fsr3Active()) {
+            BB::FG::DestroySwapchain(swapchain);
+        } else {
+            device.destroySwapchainKHR(swapchain);
+        }
+        swapchain = vk::SwapchainKHR{};
     }
 
     for (const auto& sem : image_acquired) {
@@ -308,10 +331,23 @@ void Swapchain::RefreshSemaphores() {
 
 void Swapchain::SetupImages() {
     vk::Device device = instance.GetDevice();
-    auto [images_result, imgs] = device.getSwapchainImagesKHR(swapchain);
-    ASSERT_MSG(images_result == vk::Result::eSuccess, "Failed to create swapchain images: {}",
-               vk::to_string(images_result));
-    images = std::move(imgs);
+    if (BB::FG::Fsr3Active()) {
+        u32 count = 0;
+        auto result = BB::FG::GetSwapchainImages(swapchain, &count, nullptr);
+        std::vector<vk::Image> imgs(count);
+        if (result == vk::Result::eSuccess) {
+            result = BB::FG::GetSwapchainImages(swapchain, &count, imgs.data());
+        }
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to get the FSR 3 swapchain images: {}",
+                   vk::to_string(result));
+        imgs.resize(count);
+        images = std::move(imgs);
+    } else {
+        auto [images_result, imgs] = device.getSwapchainImagesKHR(swapchain);
+        ASSERT_MSG(images_result == vk::Result::eSuccess, "Failed to create swapchain images: {}",
+                   vk::to_string(images_result));
+        images = std::move(imgs);
+    }
     image_count = static_cast<u32>(images.size());
     images_view.resize(image_count);
     for (u32 i = 0; i < image_count; ++i) {

@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/bb/bb_metrics.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -594,6 +595,64 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->is_hdr = swapchain.GetHDR();
 }
 
+bool Presenter::EnsureFgHudless(Frame* frame) {
+    const vk::Format format = swapchain.GetSurfaceFormat().format;
+    if (frame->fg_hudless && frame->fg_hudless_width == frame->width &&
+        frame->fg_hudless_height == frame->height && frame->fg_hudless_format == format) {
+        return true;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (frame->fg_hudless) {
+        (void)device.waitIdle();
+        device.destroyImageView(frame->fg_hudless_view);
+        vmaDestroyImage(instance.GetAllocator(), frame->fg_hudless, frame->fg_hudless_allocation);
+        frame->fg_hudless = vk::Image{};
+        frame->fg_hudless_view = vk::ImageView{};
+    }
+    const VkImageCreateInfo image_info = vk::ImageCreateInfo{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {frame->width, frame->height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferSrc,
+    };
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &image,
+                       &frame->fg_hudless_allocation, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    frame->fg_hudless = vk::Image{image};
+    const auto [result, view] = device.createImageView(vk::ImageViewCreateInfo{
+        .image = frame->fg_hudless,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    });
+    if (result != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), frame->fg_hudless, frame->fg_hudless_allocation);
+        frame->fg_hudless = vk::Image{};
+        return false;
+    }
+    frame->fg_hudless_view = view;
+    frame->fg_hudless_width = frame->width;
+    frame->fg_hudless_height = frame->height;
+    frame->fg_hudless_format = format;
+    return true;
+}
+
 Frame* Presenter::PrepareLastFrame() {
     if (last_submit_frame == nullptr) {
         return nullptr;
@@ -810,8 +869,70 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, bb_size, *frame, pp_settings);
+
+    // Bloodborne frame generation (bb_fg.h): this frame's depth, motion vectors and camera, and
+    // its image without the HUD through the same passes (FSR / sharpening and post-processing).
+    frame->fg = {};
+    if (vk::ImageView fg_source{};
+        BB::FG::WantInputs() && rasterizer->BBFrameGenCapture(frame->id, frame->fg, fg_source) &&
+        bb_presented && fg_source && EnsureFgHudless(frame)) {
+        const auto fg_cmd = draw_scheduler.CommandBuffer();
+        const vk::MemoryBarrier2 war{
+            .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                            vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite |
+                             vk::AccessFlagBits2::eColorAttachmentWrite,
+        };
+        const vk::ImageMemoryBarrier2 to_attachment{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = frame->fg_hudless,
+            .subresourceRange{frame_subresources},
+        };
+        fg_cmd.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &war,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &to_attachment,
+        });
+        const auto fg_view =
+            fsr_pass.Render(fg_cmd, fg_source, bb_size, fsr_out, frame_fsr, frame->is_hdr);
+        Frame hudless_frame = *frame;
+        hudless_frame.image = frame->fg_hudless;
+        hudless_frame.image_view = frame->fg_hudless_view;
+        pp_pass.Render(fg_cmd, fg_view, bb_size, hudless_frame, pp_settings);
+        const vk::ImageMemoryBarrier2 to_read{
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                            vk::PipelineStageFlagBits2::eFragmentShader,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = frame->fg_hudless,
+            .subresourceRange{frame_subresources},
+        };
+        fg_cmd.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &to_read,
+        });
+        frame->fg.hudless = {frame->fg_hudless, frame->fg_hudless_view, frame->fg_hudless_format,
+                             vk::Extent2D{frame->fg_hudless_width, frame->fg_hudless_height},
+                             vk::ImageUsageFlagBits::eColorAttachment |
+                                 vk::ImageUsageFlagBits::eSampled |
+                                 vk::ImageUsageFlagBits::eTransferSrc};
+        frame->fg.has_hudless = true;
+    }
     if (BB::Upscale::Enabled()) {
-        Rasterizer::BBStampPresentEnd(cmdbuf);
+        Rasterizer::BBStampPresentEnd(draw_scheduler.CommandBuffer());
     }
 
     DebugState.game_resolution = {image_size.width, image_size.height};
@@ -945,6 +1066,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+    vk::Rect2D fg_region{.offset = {0, 0}, .extent = swapchain.GetExtent()};
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 
@@ -1044,6 +1166,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 };
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
+                {
+                    const ImVec2 at = ImGui::GetCursorScreenPos();
+                    fg_region = vk::Rect2D{
+                        .offset = {static_cast<s32>(at.x), static_cast<s32>(at.y)},
+                        .extent = imgRect.extent,
+                    };
+                }
                 ImGui::Image(game_texture, size);
 
                 if (EmulatorSettings.IsNullGPU()) {
@@ -1138,13 +1267,29 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
 
+    // Frame generation (bb_fg.h): DLSS-G's tags and markers, or FSR 3's configure and prepare,
+    // for this present (the frame's own inputs for a new game frame; none for a repeat).
+    const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
+    BB::FG::BeforePresent(fg_frame ? &frame->fg : nullptr, swapchain.GetHandle(),
+                          swapchain.GetExtent(),
+                          swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                             : swapchain.GetSurfaceFormat().format,
+                          fg_region,
+                          swapchain.GetImageCount());
+
     // Present to swapchain.
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        // (FSR 3's frame interpolation swapchain submits to the game queue itself, under this
+        // lock: not held here.)
+        std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+        if (!BB::FG::Fsr3Active()) {
+            submit_lock.lock();
+        }
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
+    BB::FG::AfterPresent();
 
     free_frame();
     if (!is_reusing_frame && is_game_frame) {

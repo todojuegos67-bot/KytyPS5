@@ -22,8 +22,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
 #undef min
 #undef max
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 #include <sl.h>
 #include <sl_consts.h>
 #include <sl_dlss.h>
@@ -59,6 +64,41 @@ bool g_loaded = false;
 bool g_ready = false;
 std::wstring g_interposer;
 uint32_t g_refusals = 0;
+HMODULE g_module = nullptr;
+
+// The Demon's Souls fork's LocalPlatform::IsNvidiaSigned: a valid Authenticode signature whose
+// signer is "NVIDIA Corporation" (Streamline then checks its plugins' signatures itself).
+bool IsNvidiaSigned(const std::wstring& path) {
+    WINTRUST_FILE_INFO file{};
+    file.cbStruct = sizeof(file);
+    file.pcwszFilePath = path.c_str();
+    WINTRUST_DATA data{};
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &file;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    const LONG status = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+    bool nvidia = false;
+    if (status == ERROR_SUCCESS) {
+        auto* provider = WTHelperProvDataFromStateData(data.hWVTStateData);
+        auto* signer =
+            provider != nullptr ? WTHelperGetProvSignerFromChain(provider, 0, FALSE, 0) : nullptr;
+        auto* cert = signer != nullptr ? WTHelperGetProvCertFromChain(signer, 0) : nullptr;
+        wchar_t name[256]{};
+        if (cert != nullptr && cert->pCert != nullptr &&
+            CertGetNameStringW(cert->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name, 256) >
+                1) {
+            nvidia = std::wstring(name) == L"NVIDIA Corporation";
+        }
+    }
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    (void)WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+    return nvidia;
+}
 
 void LogMessage(sl::LogType type, const char* message) {
     if (message == nullptr) {
@@ -190,6 +230,13 @@ bool Preload() {
             return false;
         }
         const auto interposer = dir / "sl.interposer.dll";
+        // Only NVIDIA's own (as the Demon's Souls fork: IsNvidiaSigned before LoadLibrary).
+        if (!IsNvidiaSigned(interposer.wstring())) {
+            BBLogf("DLSS: %s is not signed by NVIDIA: not loaded (Streamline off)",
+                   interposer.string().c_str());
+            return false;
+        }
+        BBLogf("DLSS: %s: NVIDIA signature verified", interposer.string().c_str());
         BBLogf("DLSS: LoadLibrary %s (vulkan-1.dll already loaded: %d)", interposer.string().c_str(),
                GetModuleHandleA("vulkan-1.dll") != nullptr ? 1 : 0);
         HMODULE module = LoadLibraryW(interposer.c_str());
@@ -197,6 +244,7 @@ bool Preload() {
             BBLogf("DLSS: cannot load %s: DLSS off", interposer.string().c_str());
             return false;
         }
+        g_module = module;
         const auto load = [&](auto& function, const char* name) {
             function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
                 reinterpret_cast<void*>(GetProcAddress(module, name)));
@@ -319,6 +367,39 @@ const wchar_t* LoaderPath() {
 
 bool Manual() {
     return g_loaded && g_manual;
+}
+
+bool Loaded() {
+    return g_loaded;
+}
+
+void* Proc(const char* name) {
+    return g_loaded && g_module != nullptr
+               ? reinterpret_cast<void*>(GetProcAddress(g_module, name))
+               : nullptr;
+}
+
+bool FeatureReady(uint32_t feature, vk::PhysicalDevice physical) {
+    if (!g_loaded) {
+        return false;
+    }
+    sl::AdapterInfo adapter{};
+    adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical);
+    bool loaded = false;
+    return g_api.is_feature_supported(static_cast<sl::Feature>(feature), adapter) ==
+               sl::Result::eOk &&
+           g_api.is_feature_loaded(static_cast<sl::Feature>(feature), loaded) == sl::Result::eOk &&
+           loaded;
+}
+
+void* FeatureProc(uint32_t feature, const char* name) {
+    void* pointer = nullptr;
+    if (!g_loaded ||
+        g_api.get_feature_function(static_cast<sl::Feature>(feature), name, pointer) !=
+            sl::Result::eOk) {
+        return nullptr;
+    }
+    return pointer;
 }
 const std::vector<std::string>& RequiredDeviceExtensions() {
     return g_req_device_ext;
@@ -521,6 +602,18 @@ const wchar_t* LoaderPath() {
 }
 bool Manual() {
     return false;
+}
+bool Loaded() {
+    return false;
+}
+void* Proc(const char*) {
+    return nullptr;
+}
+bool FeatureReady(uint32_t, vk::PhysicalDevice) {
+    return false;
+}
+void* FeatureProc(uint32_t, const char*) {
+    return nullptr;
 }
 const std::vector<std::string>& RequiredDeviceExtensions() {
     static const std::vector<std::string> none;

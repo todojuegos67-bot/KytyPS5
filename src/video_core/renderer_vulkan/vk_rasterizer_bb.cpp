@@ -13,6 +13,7 @@
 #include "common/logging/log.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_alpha_comp.h"
 #include "video_core/host_shaders/bb_hud_comp.h"
@@ -102,6 +103,16 @@ struct BBVk {
     std::array<bool, 4> stage_pending{};
     std::array<u8, 4> stage_written{}; // bit mask of the written stamps
     std::vector<std::pair<u64, vk::ImageView>> transient_views;
+    // Frame generation (bb_fg.h): the last upscale's inputs, the HUD-less composite and the
+    // per-frame copies of depth and motion vectors.
+    bool fg_upscaled = false;
+    BB::Upscale::Plan fg_plan{};
+    OwnImage fg_present; // the composite without the HUD (bb_hud.comp flag 4)
+    bool fg_present_ready = false;
+    struct FgSlot {
+        OwnImage depth, mv;
+    };
+    std::array<FgSlot, 8> fg_slots{};
 };
 BBVk g_bb;
 
@@ -978,6 +989,29 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     Barrier(cmd, g_bb.present, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    // Frame generation's HUD-less image: the same composite with the HUD-less copy in place of
+    // the presented image (no HUD added), so it matches the presented frame but for its HUD.
+    g_bb.fg_present_ready = false;
+    if (BB::FG::WantInputs() &&
+        EnsureImage(g_bb.fg_present, output, vk::Format::eR16G16B16A16Sfloat,
+                    vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled)) {
+        Barrier(cmd, g_bb.fg_present, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
+        auto fg_push = push;
+        fg_push.size[3] = (g_bb.present_encoded ? 1u : 0u) | 4u;
+        const vk::DescriptorImageInfo fg_out{{}, g_bb.fg_present.view, vk::ImageLayout::eGeneral};
+        auto fg_writes = writes;
+        fg_writes[3].pImageInfo = &fg_out;
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.hud_layout, 0, fg_writes);
+        cmd.pushConstants(g_bb.hud_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(fg_push),
+                          &fg_push);
+        cmd.dispatch((output.width + 7) / 8, (output.height + 7) / 8, 1);
+        Barrier(cmd, g_bb.fg_present, vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+        g_bb.fg_present_ready = true;
+    }
     Stamp(cmd, 5);
     if (measure) {
         const vk::MemoryBarrier2 host{
@@ -1164,6 +1198,8 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
     if (ok) {
         ++g_bb.upscales;
+        g_bb.fg_upscaled = true;
+        g_bb.fg_plan = plan;
         // The source's alpha back into the output, non-finite colour cleared (bb_alpha.comp).
         // Not on the window-size path: the presenter reads no alpha (its view maps alpha to
         // one) and the HUD composite clears non-finite colour itself: a 4K read + write saved.
@@ -1239,6 +1275,171 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         g_bb.query_slot = (slot + 1) % g_bb.query_pending.size();
     }
     return ok;
+}
+
+namespace {
+bool EnsureDepthCopy(OwnImage& img, vk::Extent2D extent, vk::Format format) {
+    if (img.image && img.extent == extent && img.format == format) {
+        return true;
+    }
+    if (img.image) {
+        (void)g_bb.device.waitIdle();
+        DestroyImage(img);
+    }
+    const auto usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+    const VkImageCreateInfo ci = vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = usage,
+        .sharingMode = vk::SharingMode::eExclusive,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    VmaAllocationCreateInfo alloc{};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkImage image{};
+    if (vmaCreateImage(g_bb.allocator, &ci, &alloc, &image, &img.allocation, nullptr) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    img.image = image;
+    const auto [result, view] = g_bb.device.createImageView(vk::ImageViewCreateInfo{
+        .image = img.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1},
+    });
+    if (result != vk::Result::eSuccess) {
+        DestroyImage(img);
+        return false;
+    }
+    img.view = view;
+    img.format = format;
+    img.extent = extent;
+    img.usage = usage;
+    img.layout = vk::ImageLayout::eUndefined;
+    return true;
+}
+
+vk::ImageAspectFlags DepthAspects(vk::Format format) {
+    switch (format) {
+    case vk::Format::eD32SfloatS8Uint:
+    case vk::Format::eD24UnormS8Uint:
+    case vk::Format::eD16UnormS8Uint:
+        return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+    default:
+        return vk::ImageAspectFlagBits::eDepth;
+    }
+}
+
+void DepthBarrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout,
+                  vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = src_stage,
+        .srcAccessMask = src_access,
+        .dstStageMask = dst_stage,
+        .dstAccessMask = dst_access,
+        .oldLayout = img.layout,
+        .newLayout = layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img.image,
+        .subresourceRange = {DepthAspects(img.format), 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    });
+    img.layout = layout;
+}
+} // namespace
+
+bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
+                                   vk::ImageView& hudless_view) {
+    out = {};
+    hudless_view = {};
+    const bool hudless_ready = g_bb.fg_present_ready;
+    g_bb.fg_present_ready = false;
+    if (!g_bb.fg_upscaled || !bb_gb_depth_valid || !g_bb.init || !g_bb.mv.image) {
+        return false;
+    }
+    g_bb.fg_upscaled = false;
+    const auto& plan = g_bb.fg_plan;
+    const auto depth_id = texture_cache.FindImage(bb_gb_depth_desc);
+    auto& depth = texture_cache.GetImage(depth_id);
+    const vk::Extent2D render{plan.render_w, plan.render_h};
+    if (depth.info.guest_address != plan.depth_addr || depth.info.size.width != render.width ||
+        depth.info.size.height != render.height || !depth.info.props.is_depth ||
+        g_bb.mv.extent != render) {
+        return false;
+    }
+    auto& slot = g_bb.fg_slots[slot_index % g_bb.fg_slots.size()];
+    if (!EnsureDepthCopy(slot.depth, render, depth.info.pixel_format) ||
+        !EnsureImage(slot.mv, render, g_bb.mv.format,
+                     vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
+        return false;
+    }
+    scheduler.EndRendering();
+    runtime.Transit(&depth, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    const auto cmd = scheduler.CommandBuffer();
+    DepthBarrier(cmd, slot.depth, vk::ImageLayout::eTransferDstOptimal,
+                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    Barrier(cmd, slot.mv, vk::ImageLayout::eTransferDstOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    Barrier(cmd, g_bb.mv, vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    cmd.copyImage(depth.GetImage(), vk::ImageLayout::eTransferSrcOptimal, slot.depth.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+                      .extent = {render.width, render.height, 1},
+                  });
+    cmd.copyImage(g_bb.mv.image, vk::ImageLayout::eTransferSrcOptimal, slot.mv.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {render.width, render.height, 1},
+                  });
+    Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    DepthBarrier(cmd, slot.depth, vk::ImageLayout::eShaderReadOnlyOptimal,
+                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    Barrier(cmd, slot.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    out.valid = plan.camera_valid;
+    out.depth = {slot.depth.image, slot.depth.view, slot.depth.format, render, slot.depth.usage};
+    out.motion = {slot.mv.image, slot.mv.view, slot.mv.format, render, slot.mv.usage};
+    out.render = render;
+    out.jitter[0] = plan.jitter[0];
+    out.jitter[1] = plan.jitter[1];
+    out.reset = plan.reset;
+    out.depth_inverted = plan.depth_inverted;
+    out.fov_y = plan.fov_y;
+    out.z_near = plan.z_near;
+    out.z_far = plan.z_far;
+    out.camera_valid = plan.camera_valid;
+    std::copy(std::begin(plan.view_to_clip), std::end(plan.view_to_clip), out.view_to_clip);
+    std::copy(std::begin(plan.clip_to_prev_clip), std::end(plan.clip_to_prev_clip),
+              out.clip_to_prev_clip);
+    if (hudless_ready && g_bb.fg_present.image) {
+        hudless_view = g_bb.fg_present.view;
+    }
+    return out.valid;
 }
 
 bool Rasterizer::BBUpscaledView(const VideoCore::ImageViewInfo& view_info, vk::ImageView& out_view,

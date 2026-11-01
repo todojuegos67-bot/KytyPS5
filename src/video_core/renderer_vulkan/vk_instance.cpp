@@ -12,9 +12,11 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_upscale.h"
 #include "core/address_space.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include <vk_mem_alloc.h>
 
@@ -379,8 +381,10 @@ bool Instance::CreateDevice() {
     std::vector<const char*> bb_extensions(enabled_extensions.begin(), enabled_extensions.end());
     BB::Upscale::AddDeviceExtensions(*instance, physical_device, available_extensions,
                                      bb_extensions);
+    BB::FG::AddDeviceExtensions(available_extensions, bb_extensions);
     for (std::size_t i = enabled_extensions.size(); i < bb_extensions.size(); ++i) {
-        LOG_INFO(Render_Vulkan, "Enabling extension: {} (upscaler)", bb_extensions[i]);
+        LOG_INFO(Render_Vulkan, "Enabling extension: {} (upscaler / frame generation)",
+                 bb_extensions[i]);
         enabled_extensions.push_back(bb_extensions[i]);
     }
 
@@ -404,20 +408,31 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
-    const vk::DeviceQueueCreateInfo queue_info = {
-        .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
-        .pQueuePriorities = queue_priorities.data(),
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    // FSR 3 frame generation (bb_fg.h): a second graphics queue for its presents and two async
+    // compute queues.
+    const BB::FG::QueuePlan fg_queues = BB::FG::PlanQueues(physical_device, queue_family_index);
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = queue_family_index,
+            .queueCount = std::min<u32>(fg_queues.graphics_count, 2),
+            .pQueuePriorities = queue_priorities.data(),
+        },
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = fg_queues.compute_family,
+            .queueCount = std::min<u32>(fg_queues.compute_count, 2),
+            .pQueuePriorities = queue_priorities.data(),
+        },
     };
+    const u32 queue_info_count = fg_queues.compute_count > 0 ? 2u : 1u;
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = queue_info_count,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -621,6 +636,7 @@ bool Instance::CreateDevice() {
                                                   enabled_extensions.end());
         bb_ci.pNext = BB::Upscale::ChainDeviceFeatures(physical_device, bb_enabled, bb_f12,
                                                        bb_f13, bb_f, const_cast<void*>(bb_ci.pNext));
+        bb_ci.pNext = BB::FG::ChainDeviceFeatures(bb_enabled, const_cast<void*>(bb_ci.pNext));
         bb_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
         bb_ci.ppEnabledExtensionNames = enabled_extensions.data();
     }
@@ -646,7 +662,7 @@ bool Instance::CreateDevice() {
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumeratePhysicalDevices)),
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties)),
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr))));
-        if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss) {
+        if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss || BB::FG::StreamlineWanted()) {
             Core::ReleaseDlssAddressHole();
             BB::Upscale::DryRunDevice(static_cast<VkInstance>(*instance),
                                       static_cast<VkPhysicalDevice>(physical_device),
@@ -655,6 +671,9 @@ bool Instance::CreateDevice() {
         BB::Upscale::Checkpoint(fmt::format("vkCreateDevice with {} extensions: {}",
                                             enabled_extensions.size(),
                                             fmt::join(enabled_extensions, " ")));
+    }
+    if (!BB::Upscale::Enabled() && BB::FG::StreamlineWanted()) {
+        Core::ReleaseDlssAddressHole();
     }
     vk::Result device_result = vk::Result::eErrorInitializationFailed;
     vk::UniqueDevice dev{};
@@ -736,6 +755,8 @@ bool Instance::CreateDevice() {
     CreateAllocator();
     BB::Upscale::OnDevice(*instance, physical_device, *device, allocator, graphics_queue,
                           queue_family_index);
+    BB::FG::OnDevice(*instance, physical_device, *device, queue_family_index, graphics_queue,
+                     fg_queues, &Scheduler::submit_mutex);
     return true;
 }
 

@@ -12,6 +12,8 @@
 // same encoded values: both are decoded here, the flip (final_tex, an sRGB view) is already
 // linear. Non-finite colour from a back end is cleared here (the separate alpha pass is skipped
 // on this path: the presenter never reads alpha).
+// Flag 4: frame generation's HUD-less image (bb_fg.h): the HUD-less copy stands in for the
+// presented image, so the result is the upscaled image alone, in the same colour space.
 // Flag 2: frame self-check, the luminance of a 64x64 grid of the game's image and of ours is
 // summed into lum (16.16 fixed point) for the host to compare.
 #version 450
@@ -51,6 +53,9 @@ void main() {
     if ((p.size.w & 1u) != 0u) {
         up = SrgbToLinear(up);
         bare = SrgbToLinear(bare);
+    }
+    if ((p.size.w & 4u) != 0u) {
+        fin = bare;
     }
     vec3 hud = fin - bare;
     float cover = smoothstep(0.25, 0.5, max(max(abs(hud.r), abs(hud.g)), abs(hud.b)));

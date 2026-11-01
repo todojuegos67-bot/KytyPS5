@@ -7,6 +7,7 @@
 
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -38,6 +39,17 @@ struct Frame {
     u8 id{};
 
     ImTextureID imgui_texture;
+
+    // Bloodborne frame generation (bb_fg.h): the frame's inputs, and its image without the HUD
+    // (the same passes as the frame, on the upscaled image before the HUD).
+    BB::FG::Inputs fg{};
+    vk::Image fg_hudless{};
+    VmaAllocation fg_hudless_allocation{};
+    vk::ImageView fg_hudless_view{};
+    u32 fg_hudless_width{};
+    u32 fg_hudless_height{};
+    vk::Format fg_hudless_format{};
+    u64 lat_index{}; // BB::AntiLag's index of the guest flip this frame shows (0: none)
 };
 
 enum SchedulerType {
@@ -107,6 +119,8 @@ private:
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
     void SetExpectedGameSize(s32 width, s32 height);
+
+    bool EnsureFgHudless(Frame* frame);
 
 private:
     float expected_ratio{1920.0 / 1080.0f};

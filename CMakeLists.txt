@@ -1185,6 +1185,13 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_analyze.h
                src/video_core/bb/bb_audio_check.cpp
                src/video_core/bb/bb_audio_check.h
+               src/video_core/bb/bb_antilag.cpp
+               src/video_core/bb/bb_antilag.h
+               src/video_core/bb/bb_dyn_multiplier.h
+               src/video_core/bb/bb_fg.cpp
+               src/video_core/bb/bb_fg.h
+               src/video_core/bb/bb_fg_fsr3.cpp
+               src/video_core/bb/bb_fg_internal.h
                src/video_core/bb/bb_metrics.cpp
                src/video_core/bb/bb_metrics.h
                src/video_core/bb/bb_kyty_compat.h
@@ -1487,6 +1494,8 @@ set(BB_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" C
 if (WIN32 AND EXISTS "${BB_STREAMLINE_SDK}/include/sl.h")
     set_property(SOURCE src/video_core/bb/bb_sr_dlss.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${BB_STREAMLINE_SDK}/include")
     set_property(SOURCE src/video_core/bb/bb_sr_dlss.cpp APPEND PROPERTY COMPILE_DEFINITIONS BB_STREAMLINE=1)
+    set_property(SOURCE src/video_core/bb/bb_fg.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${BB_STREAMLINE_SDK}/include")
+    set_property(SOURCE src/video_core/bb/bb_fg.cpp APPEND PROPERTY COMPILE_DEFINITIONS BB_STREAMLINE=1)
     message(STATUS "BB upscaling: Streamline SDK ${BB_STREAMLINE_SDK}")
 endif()
 

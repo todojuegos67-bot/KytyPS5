@@ -8,6 +8,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#include "video_core/bb/bb_antilag.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -237,8 +238,13 @@ void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
-    // Present the frame.
+    // Present the frame (BB::AntiLag: its guest flip's present markers around it).
+    const u64 lat_index = req.frame != nullptr ? req.frame->lat_index : 0;
+    BB::AntiLag::OnPresent(lat_index);
     presenter->Present(req.frame);
+    BB::AntiLag::AfterPresent(lat_index);
+    BB::AntiLag::OnFlipReleased(lat_index);
+    BB::AntiLag::OnPresented(lat_index);
 
     // Update flip status.
     auto* port = req.port;
@@ -304,18 +310,22 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
+    // BB::AntiLag: the game's CPU frame ends at its flip.
+    const u64 lat_index = BB::AntiLag::OnFlipReserved();
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, lat_index); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, lat_index);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        u64 lat_index) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -324,6 +334,10 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+    }
+    if (frame != nullptr) {
+        frame->lat_index = lat_index;
+        BB::AntiLag::OnFlipReady(lat_index);
     }
 
     std::scoped_lock lock{mutex};
