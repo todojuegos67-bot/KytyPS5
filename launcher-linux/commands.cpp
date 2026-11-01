@@ -44,8 +44,7 @@ const std::vector<std::string>& GameVariables() {
 	                                             "KYTY_DLSS_PRESET",
 	                                             "KYTY_DLSS_SHARPNESS",
 	                                             "KYTY_FSR_SHARPNESS",
-	                                             "KYTY_AUDIO_OUTPUT",
-	                                             "KYTY_SKIP_LOGOS"};
+	                                             "KYTY_AUDIO_OUTPUT"};
 	return names;
 }
 
@@ -311,8 +310,6 @@ Launch Commands::Play(const GameInfo& game, bool direct) const {
 	// The audio output the game is told (it mixes for it; a TV when none is set, issue #207).
 	if (const auto output = S().Str("audio_output"); output == "headphones" || output == "amplifier" || output == "soundbar")
 		Put(set, "KYTY_AUDIO_OUTPUT", output);
-	// The start-up logos skipped (the game's own switch, issue #263).
-	if (S().Bool("skip_logos")) Put(set, "KYTY_SKIP_LOGOS", "1");
 	Put(set, "MANGO", S().Bool("mangohud") && context_.HasMangoHud() ? "1" : "0");
 	Put(set, "KYTY_GAME", S().Str("game"));
 	if (!context_.emulator.empty()) Put(set, "KYTY_BIN", context_.emulator.string());

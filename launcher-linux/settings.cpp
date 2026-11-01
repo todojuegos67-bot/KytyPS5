@@ -46,7 +46,6 @@ const nlohmann::ordered_json& Defaults() {
 		d["dlss_sharpness"]      = ""; // (Graphics page: KYTY_DLSS_SHARPNESS's value, "" none)
 		d["fsr_sharpness"]       = ""; // (Graphics page: KYTY_FSR_SHARPNESS's value, "" its 0.6)
 		d["audio_output"]        = ""; // (Game page: "" a TV)
-		d["skip_logos"]          = false; // (Game page: the start-up logos skipped, KYTY_SKIP_LOGOS)
 		d["output_auto"]         = true;
 		d["wide_bars"]           = false; // (Display page: 21:9 or 32:9, movies and menus at 16:9)
 		// (Linux.)

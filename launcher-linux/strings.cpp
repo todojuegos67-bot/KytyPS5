@@ -91,7 +91,6 @@ const Table& English() {
 	    {"summary.options", "Options"},
 	    {"summary.presentDirect", "direct presentation"},
 	    {"summary.vrrFlips", "VRR flips"},
-	    {"summary.skipLogos", "no start-up logos"},
 	    {"summary.wideBars", "16:9 movies and menus"},
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "30 fps lock"},
@@ -249,10 +248,6 @@ const Table& English() {
 	    {"audiooutput.soundbar", "Soundbar"},
 	    {"audiooutput.desc", "What the game is told its sound goes to, as on a PS5. The game mixes its sound "
 	                         "for it and shows it in Settings > Sound."},
-	    {"skiplogos", "Skip the start-up logos"},
-	    {"skiplogos.desc", "The game starts without the logos no button skips (Sony Interactive Entertainment "
-	                       "presents, PlayStation Studios, Bluepoint Games): about 16 seconds sooner to the "
-	                       "opening cinematic, which still plays (Options skips it). Off: as on the console."},
 	    {"cheats", "Cheats"},
 	    {"cheats.desc", "_Patches/<title id>.json (GoldHEN style): the emulator applies the cheats "
 	                    "left on in it."},
@@ -465,7 +460,6 @@ const Table& Chinese() {
 	    {"summary.options", "选项"},
 	    {"summary.presentDirect", "直接呈现"},
 	    {"summary.vrrFlips", "VRR 即时翻转"},
-	    {"summary.skipLogos", "跳过启动标志"},
 	    {"summary.wideBars", "过场与菜单 16:9"},
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "锁定 30 帧"},
@@ -597,10 +591,6 @@ const Table& Chinese() {
 	    {"audiooutput.amplifier", "AV 功放"},
 	    {"audiooutput.soundbar", "条形音箱"},
 	    {"audiooutput.desc", "告诉游戏声音输出到哪里（与 PS5 相同）。游戏会按此混音，并显示在“设置 > 声音”中。"},
-	    {"skiplogos", "跳过启动标志"},
-	    {"skiplogos.desc", "游戏启动时不再播放无法用按键跳过的标志画面（Sony Interactive Entertainment presents、"
-	                       "PlayStation Studios、Bluepoint Games）：约提前 16 秒进入开场动画，开场动画仍会播放（按 Options "
-	                       "可跳过）。关闭：与主机上相同。"},
 	    {"cheats", "作弊"},
 	    {"cheats.desc", "_Patches/<title id>.json（GoldHEN 格式）：模拟器会应用其中开启的作弊项。"},
 	    {"cheats.count", "已开启 {0}/{1} 项"},
@@ -792,7 +782,6 @@ const Table& Portuguese() {
 	    {"summary.options", "Opções"},
 	    {"summary.presentDirect", "apresentação direta"},
 	    {"summary.vrrFlips", "trocas VRR"},
-	    {"summary.skipLogos", "sem logos iniciais"},
 	    {"summary.wideBars", "vídeos e menus em 16:9"},
 	    {"summary.antilag", "Anti-Lag"},
 	    {"summary.fps30", "trava em 30 fps"},
@@ -954,10 +943,6 @@ const Table& Portuguese() {
 	    {"audiooutput.soundbar", "Soundbar"},
 	    {"audiooutput.desc", "Para onde o jogo é informado que o som vai, como num PS5. O jogo mixa o som "
 	                         "para isso e mostra em Configurações > Som."},
-	    {"skiplogos", "Pular os logos iniciais"},
-	    {"skiplogos.desc", "O jogo começa sem os logos que nenhum botão pula (Sony Interactive Entertainment "
-	                       "presents, PlayStation Studios, Bluepoint Games): cerca de 16 segundos antes na "
-	                       "cinemática de abertura, que ainda é exibida (Options a pula). Desligado: como no console."},
 	    {"cheats", "Cheats"},
 	    {"cheats.desc", "_Patches/<title id>.json (estilo GoldHEN): o emulador aplica os cheats "
 	                    "deixados ligados nele."},

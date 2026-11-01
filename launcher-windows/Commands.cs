@@ -135,8 +135,6 @@ sealed class Commands {
 		// The audio output the game is told (it mixes for it; a TV when none is set, issue #207).
 		var audioOutput = S.Str("audio_output");
 		if (audioOutput == "headphones" || audioOutput == "amplifier" || audioOutput == "soundbar") sets.Add("KYTY_AUDIO_OUTPUT=" + audioOutput);
-		// The start-up logos skipped (the game's own switch, issue #263).
-		if (S.Bool("skip_logos")) sets.Add("KYTY_SKIP_LOGOS=1");
 		// The DualSense speaker's own volume (0 when the switch above is off; the haptics stay), then what a hit feels
 		// like: the motor drive as a percent of the mainline 2.0x, and the length of one drive report. Each is sent only
 		// when moved off the emulator's own default, so an untouched launcher plays exactly as before.

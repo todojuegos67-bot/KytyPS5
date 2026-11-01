@@ -26,6 +26,8 @@ namespace {
 // target rate each frame, so every frame past 60 fps played it that much faster (whatever started the emulator).
 // KYTY_SKIP_LOGOS=1: the game's own cp11_debug_skipSplashScreens=true, no start-up logos (Sony Interactive Entertainment
 // presents, PlayStation Studios, Bluepoint: ~16 s that no button skips; issue #263). The opening cinematic still plays.
+// A test switch only: the launchers no longer offer it, as a player with it on crashed twice after ~50 minutes and
+// played over two hours without it (issue #266; in the game's code it only keeps the logo movie from starting).
 bool SkipLogos() {
 	const char* value = std::getenv("KYTY_SKIP_LOGOS");
 	return value != nullptr && value[0] == '1';
