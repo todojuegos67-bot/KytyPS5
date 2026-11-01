@@ -164,6 +164,9 @@ private:
 		uint64_t                                   translating = 0; // (under m_mutex: serial, chunk)
 		uint32_t                                   translating_chunk = 0;
 		Result*                                    current     = nullptr;
+		// The GPU thread's request that the translation going on stop (Spec::State::cancel); when it began (under m_mutex).
+		std::atomic<bool>                          cancel {false};
+		uint64_t                                   began_ns = 0;
 		uint64_t                                   since       = 0;
 	};
 	// A chunk of a submission (mode 4), once the state pass passed it: the processor state and position it starts at,
@@ -274,6 +277,7 @@ private:
 	// translations by duration: < 0.5, 1, 2, 4, 8 ms and longer, and the longest.)
 	uint64_t                          m_wait_ns = 0, m_start_delay_ns = 0, m_started = 0, m_longest_ns = 0;
 	std::array<uint64_t, 6>           m_durations {};
+	uint64_t                          m_cancelled = 0; // (the report's: translations the GPU thread stopped, under m_mutex)
 };
 
 } // namespace Libs::Graphics

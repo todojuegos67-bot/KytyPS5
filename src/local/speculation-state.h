@@ -213,6 +213,9 @@ struct State {
 	// JournalIntersects, WrittenIntersects, ChainImage). Null: none. What the speculations before it write, merged
 	// (Inherit: one lookup, the chain walked when it hits).
 	std::atomic<const State*> previous {nullptr}; // (unlinked by the thread that commits)
+	// Set by the GPU thread when it would rather translate the rest itself (Speculation::CommitReady): the translation
+	// stops at its next packet. Null: never.
+	const std::atomic<bool>* cancel = nullptr;
 	RangeSet                  chain_journal, chain_written;
 	// The granules of journal_set, written_set, chain_journal and chain_written (a look before their searches).
 	GranuleFilter pending;

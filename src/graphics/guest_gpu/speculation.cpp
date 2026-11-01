@@ -331,6 +331,8 @@ void Speculation::AheadRun(Translator& translator) {
 		translator.translating       = work->job.serial;
 		translator.translating_chunk = work_chunk;
 		translator.since             = ++m_clock; // (before `previous` can be retired: it is not reused meanwhile)
+		translator.began_ns          = NowNs();
+		translator.cancel.store(false, std::memory_order_relaxed);
 		const auto         job       = work->job;
 		const auto         which     = work->pass;
 		auto               start     = std::move(chunk.start);
@@ -427,6 +429,16 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 				});
 			};
 			if (translating()) {
+				// KYTY_SPECULATE_CANCEL_US (live speculate_cancel_us, 0: never): a translation begun less than that long ago
+				// has more left than this thread takes for the whole chunk (a speculation's thread is several times slower
+				// per draw): it stops at its next packet, what it did is committed, the rest is translated here.
+				static auto& cancel_us = LiveSwitch::Find("speculate_cancel_us", 1000000); // (default 1 s: always)
+				if (const auto us = cancel_us.load(std::memory_order_relaxed); us > 0)
+					for (auto& translator: m_translators)
+						if (translator->translating == job.serial && translator->translating_chunk == chunk &&
+						    NowNs() - translator->began_ns < static_cast<uint64_t>(us) * 1000u &&
+						    !translator->cancel.exchange(true, std::memory_order_relaxed))
+							++m_cancelled;
 				++m_waits_for_ahead;
 				const auto waited = NowNs();
 				m_ahead_wake.wait(lock, [&] { return !translating(); });
@@ -552,6 +564,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	r.state.Clear();
 	r.state.table_upload  = translator.table_upload.get();
 	r.state.shader_upload = translator.shader_upload.get();
+	r.state.cancel        = &translator.cancel;
 	{
 		// (Linked under the lock: one committed or dropped since it was chosen is not; Finish unlinks the others.)
 		std::lock_guard lock(m_mutex);
@@ -1082,6 +1095,10 @@ void Speculation::Report() {
 	}
 	print("stops", m_stop_reasons);
 	print("holes", m_hole_reasons);
+	{
+		std::lock_guard lock(m_mutex);
+		std::printf("; stopped for the GPU thread: %llu", static_cast<unsigned long long>(std::exchange(m_cancelled, 0)));
+	}
 	std::printf("\n");
 	std::fflush(stdout);
 	m_whole = m_partly = m_none = m_segments = m_holes_run = m_waits_blocked = 0;

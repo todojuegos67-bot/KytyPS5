@@ -2018,6 +2018,13 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		if (spec != nullptr) {
 			if (!GuestGpu::IsGpuThread()) Spec::EnterPacket();
 			spec->Mark(LocalVulkanRecording::RecordedWrites());
+			// (Between packets, nothing of this one recorded: what is translated so far is committed, the rest is taken the
+			// normal way.)
+			if (spec->cancel != nullptr && spec->cancel->load(std::memory_order_relaxed)) {
+				Spec::Stop("cancelled: the GPU thread came for it");
+				execution.m_suspended = true;
+				return;
+			}
 			if (!SpeculationTakes(opcode, packet_header)) {
 				// (By opcode in the speculation's report.)
 				static const auto names = [] {
