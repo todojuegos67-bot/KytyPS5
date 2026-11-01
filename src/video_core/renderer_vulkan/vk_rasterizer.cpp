@@ -764,7 +764,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     const bool bb_scan = (stage.sw_stage == Shader::SwStage::Vertex ||
                           stage.sw_stage == Shader::SwStage::Fragment) &&
-                         BB::Upscale::WantCameraScan();
+                         BB::Upscale::WantCameraScan(stage.sw_stage == Shader::SwStage::Vertex);
     if (bb_scan) {
         // Constants the shader reads through user-data pointers (the flattened SRT) and the user
         // data itself, besides the constant buffers below.

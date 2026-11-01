@@ -93,7 +93,8 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
 // Every dispatch.
 void OnDispatch();
 // The current draw is a scene draw whose vertex constant buffers should be scanned for the camera.
-bool WantCameraScan();
+// vertex: the vertex stage (its forward view-projection marks a 3D geometry draw to jitter).
+bool WantCameraScan(bool vertex);
 void OnVertexConstants(const void* data, size_t size);
 // A sampled colour image in the current draw/dispatch.
 enum class Sample { Keep, Inject, Redirect };

@@ -404,6 +404,9 @@ u32 g_output_w = 0, g_output_h = 0;
 u64 g_frame_no = 0;
 u32 g_jitter_index = 0;
 float g_jitter[2]{};
+u64 g_jittered_draws = 0;
+u64 g_jittered_frame_start = 0;
+u64 g_jittered_last_frame = 0;
 std::chrono::steady_clock::time_point g_last_flip{};
 float g_delta_ms = 16.7f;
 std::string g_last_point;
@@ -439,7 +442,9 @@ struct DrawState {
     bool sampled_upscaled = false;
     bool samples_render_size = false; // samples a render-size colour image it does not draw into
     bool analyze_dump = false;
+    bool vertex_camera = false; // a vertex-stage constant holds the forward view-projection
 } g_draw;
+bool g_scan_vertex = false;
 
 bool g_dump_frame = false;
 u32 g_dump_lines = 0;
@@ -1253,14 +1258,16 @@ void OnDispatch() {
 
 u64 g_diag_asked = 0, g_diag_inactive = 0, g_diag_noscene = 0, g_diag_calls = 0, g_diag_small = 0;
 
-bool WantCameraScan() {
+bool WantCameraScan(bool vertex) {
+    g_scan_vertex = vertex;
     ++g_diag_asked;
     if ((!Active() && !AnalyzeOn()) || !Cfg().mv_reconstruct) {
         ++g_diag_inactive;
         return false;
     }
     std::scoped_lock lk{g_mutex};
-    const bool want = g_draw.valid && g_draw.scene && g_frame.scanned < 160;
+    const bool want = g_draw.valid && g_draw.scene &&
+                      (g_frame.scanned < 160 || (vertex && Cfg().jitter && !g_draw.vertex_camera));
     if (!want) ++g_diag_noscene;
     return want;
 }
@@ -1288,6 +1295,7 @@ void OnVertexConstants(const void* data, size_t size) {
     }
     const size_t n = std::min<size_t>(size, 4096) / 4;
     const float* w = static_cast<const float*>(data);
+    const bool jitter_only = f.scanned >= 160;
     for (size_t at = 0; at + 16 <= n; at += 4) {
         for (int layout = 0; layout < 2; ++layout) {
             Mat m;
@@ -1296,6 +1304,13 @@ void OnVertexConstants(const void* data, size_t size) {
                     m.m[i * 4 + j] = layout == 0 ? w[at + i * 4 + j] : w[at + j * 4 + i];
             bool hit = LooksLikeViewProj(m);
             bool inverse = false;
+            if (hit && g_scan_vertex) {
+                g_draw.vertex_camera = true;
+                if (jitter_only) return;
+            }
+            if (jitter_only) {
+                continue;
+            }
             if (!hit && std::fabs(m.m[15]) + std::fabs(m.m[11]) + std::fabs(m.m[14]) > 1e-9) {
                 // The inverse view-projection (deferred lighting's position reconstruction).
                 Mat inv;
@@ -1418,7 +1433,8 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
     FillCamera(p);
-    const bool jitter_on = Cfg().jitter && p.camera_valid;
+    const bool jitter_on =
+        Cfg().jitter && p.camera_valid && g_jittered_draws > g_jittered_frame_start;
     p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
     p.jitter[1] = jitter_on ? g_jitter[1] : 0.0f;
     LogPoint(fmt::format(
@@ -1507,7 +1523,8 @@ void FillPresentPlan(VAddr flip, const char* where) {
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
     FillCamera(p);
-    const bool jitter_on = Cfg().jitter && p.camera_valid;
+    const bool jitter_on =
+        Cfg().jitter && p.camera_valid && g_jittered_draws > g_jittered_frame_start;
     p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
     p.jitter[1] = jitter_on ? g_jitter[1] : 0.0f;
     LogPoint(fmt::format(
@@ -1657,9 +1674,11 @@ bool Jitter(float& x, float& y) {
         return false;
     }
     std::scoped_lock lk{g_mutex};
-    if (!g_draw.valid || !g_draw.scene || !g_learned.have_prev_vp || LearnedSource() == 0) {
+    if (!g_draw.valid || !g_draw.scene || !g_draw.vertex_camera || !g_learned.have_prev_vp ||
+        (!PresentMode() && LearnedSource() == 0)) {
         return false;
     }
+    ++g_jittered_draws;
     x = g_jitter[0];
     y = g_jitter[1];
     return x != 0.0f || y != 0.0f;
@@ -1821,7 +1840,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         LOG_INFO(Render_Vulkan,
                  "[BB_UPSCALE] frame {}: upscaler {} ({}, {}), {} mode, internal {}x{} -> output "
                  "{}x{} (mode wants internal {}x{}), source {:#x}, depth {:#x}, MV {}, jitter {} "
-                 "({:+.3f},{:+.3f}), upscale GPU ms avg {:.3f} max {:.3f} ({} samples), injected "
+                 "({:+.3f},{:+.3f}, {} 3D draws jittered last frame), upscale GPU ms avg {:.3f} max {:.3f} ({} samples), injected "
                  "{}/{} frames, failed {}",
                  g_frame_no, SR::KindName(c.kind), SR::QualityName(c.quality),
                  BackendReady() ? "ready" : "not ready",
@@ -1835,7 +1854,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                  : g_learned.have_prev_vp ? "reconstructed (depth + camera)"
                                           : "zero (camera not found)",
                  Cfg().jitter && g_learned.have_prev_vp ? "on" : "off", g_jitter[0], g_jitter[1],
-                 g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0,
+                 g_jittered_last_frame, g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0,
                  g_stats.gpu_ms_max, g_stats.gpu_samples, g_stats.injected, g_stats.frames,
                  g_stats.failed);
         LOG_INFO(Render_Vulkan,
@@ -1932,6 +1951,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     }
 
     // Jitter for the next frame.
+    g_jittered_last_frame = g_jittered_draws - g_jittered_frame_start;
+    g_jittered_frame_start = g_jittered_draws;
     const double ratio = g_learned.render_w != 0
                              ? static_cast<double>(PresentMode() ? g_present_w : g_output_w) /
                                    g_learned.render_w

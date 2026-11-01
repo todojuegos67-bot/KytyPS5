@@ -399,11 +399,13 @@ $timer.Add_Tick({
 	if ($c.Count -gt 1) {
 		$fsrOn = ($c.fsr -eq 'true'); $rcasOn = ($c.rcas -eq 'true')
 		$esc = if ($fsrOn) { 'FSR 1' + $(if ($rcasOn) { ' + RCAS' + $(if ($c.att) { $a = 0.0; if ([double]::TryParse($c.att, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$a)) { $DOT + ('{0:0} %' -f [Math]::Max(0, 100 - $a / 10)) } }) } else { '' }) } else { 'Nativo (sin FSR)' }
+		$upOn = ($fps -and $fps.up -and $fps.up -ne 'off' -and $fps.up -notmatch 'not running')
+		if ($upOn) { $esc = $fps.up; $fsrOn = $true } elseif ($fps -and $fps.up -and $fps.up -ne 'off') { $esc = $fps.up -replace '\(not running: native\)', '(en espera: nativo)' }
 		$rows.Add(@('Escala', $esc, $(if ($fsrOn) { $cRed } else { $cOrange })))
 		if ($fps -and $fps.resGame) { $rows.Add(@('Resol.', ("{0} $ARROW {1}" -f $fps.resGame, $fps.resOut), $(if ($fsrOn) { $cRed } else { $cOrange }))) }
 		elseif ($c.iw -and $c.ih) { $rows.Add(@('Resol.', ("{0}x{1}{2}" -f $c.iw, $c.ih, $(if ($c.ww -and $c.wh) { " $ARROW $($c.ww)x$($c.wh)" } else { '' })), $(if ($fsrOn) { $cRed } else { $cOrange }))) }
 	}
-	if ($fps -and $fps.up -and $fps.up -ne 'off') { $rows.Add(@('Reesc.', $fps.up, $cRed)) }
+	if ($c.Count -le 1 -and $fps -and $fps.up -and $fps.up -ne 'off') { $rows.Add(@('Escala', $fps.up, $cRed)) }
 	if ("$($ini['safemode'])" -ne '0') { $rows.Add(@('', 'Modo seguro (config de shadPS4 tal cual)', $cKhaki)) }
 	else { $mn = $script:modeNames["$($ini['modo'])"]; if ($mn) { $rows.Add(@('', $mn, $cKhaki)) } }
 	if (-not $src) { $rows.Add(@('', $(if ($script:pmErr) { $script:pmErr } else { 'FPS: shadPS4 no los da fuera de su overlay' }), $colName)) }
