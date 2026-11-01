@@ -24,6 +24,8 @@
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <dxgi.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 
 #include <atomic>
 #include <cctype>
@@ -1362,6 +1364,19 @@ int main(int argc, char* argv[]) {
 	if (mask != system_mask) SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask));
 	SplashStatus("Iniciando...");
 
+	{
+		// (ds-pc-port43) No Windows power throttling (EcoQoS) for the game, normal priority (a relaxed precompile left
+		// nothing behind: it runs in its own processes), 1 ms timers.
+		PROCESS_POWER_THROTTLING_STATE pt {};
+		pt.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+		pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | 0x4 /* IGNORE_TIMER_RESOLUTION */;
+		pt.StateMask   = 0;
+		const BOOL off = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt));
+		SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+		timeBeginPeriod(1);
+		std::printf("[port] CPU: power throttling %s, priority normal, timer 1 ms\n", off ? "off" : "unchanged (not supported)");
+		std::fflush(stdout);
+	}
 	Port::Runtime runtime = make_runtime(plan);
 	Port::InstallMenu(runtime);
 	// (ds-pc-port8) After F1 (save and quit): the title passed by itself and the character back where F1 left.
