@@ -1260,7 +1260,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     if (g_draw.targets_flip) {
         ++f.flip_draws;
     }
-    if (g_dump_frame && g_dump_lines < 1500) {
+    if (g_dump_frame && g_dump_lines < 8000) {
         g_draw.analyze_dump = true;
         std::string line = fmt::format("[BB_ANALYZE] frame={} draw {} targets:", g_frame_no, f.draws);
         for (u32 i = 0; i < g_draw.num_colors; ++i) {
@@ -1270,7 +1270,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
         if (g_draw.targets_flip) line += " [FLIP]";
         if (g_draw.scene) line += " [SCENE]";
         const std::string key = line.substr(line.find("targets:"));
-        if (key == g_dump_last && !g_draw.scene) {
+        if (key == g_dump_last) {
             ++g_dump_repeats;
             g_draw.analyze_dump = false;
         } else {
@@ -1295,7 +1295,7 @@ void OnDispatch() {
     g_draw = {};
     g_draw.valid = true;
     g_draw.compute = true;
-    if (g_dump_frame && g_dump_lines < 1500) {
+    if (g_dump_frame && g_dump_lines < 8000) {
         g_draw.analyze_dump = true;
         AnalyzeLog("[BB_ANALYZE] frame={} dispatch {}", g_frame_no, g_frame.draws);
         ++g_dump_lines;
@@ -1328,7 +1328,7 @@ void OnVertexConstants(const void* data, size_t size) {
     auto& f = g_frame;
     const u64 draw = f.draws;
     bool counted_draw = f.scanned_draw == draw;
-    if (g_draw.analyze_dump && g_dump_lines < 1500 && g_dump_cbs < 64) {
+    if (g_draw.analyze_dump && g_dump_lines < 8000 && g_dump_cbs < 64) {
         ++g_dump_cbs;
         const float* v = static_cast<const float*>(data);
         std::string text;
@@ -1369,7 +1369,7 @@ void OnVertexConstants(const void* data, size_t size) {
             if (!hit) {
                 continue;
             }
-            if (g_draw.analyze_dump && g_dump_lines < 1500) {
+            if (g_draw.analyze_dump && g_dump_lines < 8000) {
                 AnalyzeLog(
                          "[BB_ANALYZE]   camera candidate in cb {:#x}+{:#x} ({} layout{}): "
                          "{:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} {:.4g} {:.4g} {:.4g} / {:.4g} "
@@ -1411,7 +1411,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     }
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
-    if (g_draw.analyze_dump && g_dump_lines < 1500) {
+    if (g_draw.analyze_dump && g_dump_lines < 8000) {
         AnalyzeLog("[BB_ANALYZE]   samples {:#x} {}x{} {}{}{}", addr, width, height,
                  vk::to_string(format), addr == f.scene_color ? " [SCENE COLOUR]" : "",
                  addr == f.gb_depth ? " [SCENE DEPTH]" : "");
