@@ -119,7 +119,7 @@ inline void Flip() {
 		                                     C::ReadbackParts, C::ReadbackRegions, C::GuestCommands, C::TextureUnmaps, C::AsyncPipelines,
 		                                     C::ImageInitUs, C::BufferSyncUs, C::DrawUs, C::TextureUnmapUs, C::BackingReadUs, C::RegionSyncUs, C::AsyncDrawWaitUs, C::AsyncDrawSkips, C::QueueLockUs,
 		                                     C::TranslateUs, C::Translates, C::ComputePipelineUs, C::ComputePipelines,
-		                                     C::GraphicsPipelineUs, C::GraphicsPipelines, C::FlipSlotWaitUs,
+		                                     C::GraphicsPipelineUs, C::GraphicsPipelines, C::FlipSlotWaitUs, C::FlipDoneWaitUs,
 		                                     C::TableDraws, C::TableStores, C::TableStoreVariant, C::TableStoreTargets,
 		                                     C::TableRefusedSets, C::TableNoSet, C::TableDrawNative, C::TableEvaluations,
 		                                     C::TableStoreDeferred};
@@ -187,7 +187,8 @@ inline void Flip() {
 				using G = LiveCounters::Id;
 				static constexpr std::array guest {G::WindowFault, G::WriteFault, G::ReadFault, G::Reprotect, G::Unprotect,
 				                                   G::ProtectCalls, G::SyncReadsGuest, G::SyncDownloads, G::GuestCommands,
-				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs};
+				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs,
+				                                   G::FlipDoneWaitUs, G::FaultWindowNs, G::FaultWriteNs, G::FaultReadNs};
 				static std::array<uint64_t, guest.size()> last_guest {};
 				std::printf("[fps+]");
 				for (size_t i = 0; i < guest.size(); ++i) {
