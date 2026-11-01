@@ -164,7 +164,8 @@ public:
 	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	// Record deferred DCC state while the original guest dispatch writes the metadata.
-	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
+	// True when the fill leaves the surface's DCC cleared (a recognized clear code over a DCC entry).
+	bool               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
@@ -422,11 +423,23 @@ private:
 	};
 	std::unordered_map<uint64_t, PartialPlan> m_partial_plans;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// KYTY_SPEC_PREDICT_DCC: the surfaces a DCC fill has cleared (kept apart from m_surface_metas, whose entries image
+	// registrations rebuild), and those whose pending clear FindTexture left pending when the normal path sampled them.
+	std::unordered_set<uint64_t> m_dcc_filled, m_dcc_sticky;
 	// KYTY_TABLE_SERIALS: the registered images by their metadata address, as their serial slots (MoveMeta).
 	std::multimap<uint64_t, uint32_t> m_meta_slots;
 	// (Each slot's addresses in m_meta_slots: ForgetMetaSlot erases them alone, not a pass over every entry.)
 	std::unordered_map<uint32_t, std::vector<uint64_t>> m_meta_by_slot;
 	std::mutex                        m_meta_slots_lock;
+
+public:
+	// KYTY_SPEC_PREDICT_DCC: the normal path sampled a DCC surface with a pending clear; `sticks`: FindTexture left it
+	// pending. DccClearSticks: with the switch on, whether it was seen to (a speculation does not assume that a hole of
+	// such a use consumes the clear).
+	void               NoteDccClear(uint64_t address, bool sticks);
+	[[nodiscard]] bool DccClearSticks(uint64_t address);
+
+private:
 	std::atomic<uint64_t>                             m_meta_epoch {1};
 	// The m_surface_metas keys as bits of a 1024-bit filter: a clear bit proves an address holds
 	// no metadata without m_lock (IsMeta and ClearMeta run for the buffers of every dispatch).

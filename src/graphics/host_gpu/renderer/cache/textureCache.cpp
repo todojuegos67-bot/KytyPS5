@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "slow-log.h"
+#include "live-switch.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -4953,9 +4954,18 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	if (!MetaFilterMayHold(address)) return not_cleared();
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
+	// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc): a surface DCC fills clear (every frame, in the game) is read by a
+	// speculation as cleared when it finds it not: a fill in work not committed yet, of its command buffer or an earlier
+	// one it is not chained to, may clear it before its commit ("commit: a surface cleared"). The draw that would consume
+	// the clear becomes a hole (the normal path decides at commit); a not-cleared answer would be checked at commit
+	// instead, and a fill meanwhile made the rest of the chunk go in order.
+	static auto& predict_dcc = LiveSwitch::Find("spec_predict_dcc", 0);
+	const auto   dcc_filled  = [&] {
+		return spec != nullptr && slice < 32 && predict_dcc.load(std::memory_order_relaxed) != 0 && m_dcc_filled.contains(address);
+	};
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    slice >= 32) {
-		return not_cleared();
+		return dcc_filled() || not_cleared();
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
@@ -4963,7 +4973,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	if (fill_known != nullptr) {
 		*fill_known = found->second.fill_known;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0 || not_cleared();
+	return (found->second.clear_mask & (1u << slice)) != 0 || dcc_filled() || not_cleared();
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -4997,7 +5007,7 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	return true;
 }
 
-void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value) {
+bool TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid DCC fill range\n");
 	}
@@ -5029,7 +5039,24 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 		found->second.fill_value = fill_value;
 		found->second.fill_size  = size;
 		found->second.fill_known = true;
+		// (Mode 4's predictions read it: KYTY_SPECULATE unset keeps nothing.)
+		if (dcc_clear_mask != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) m_dcc_filled.insert(address);
+		return dcc_clear_mask != 0;
 	}
+	return false;
+}
+
+void TextureCache::NoteDccClear(uint64_t address, bool sticks) {
+	std::scoped_lock lock {m_lock};
+	if (sticks) m_dcc_sticky.insert(address);
+	else m_dcc_sticky.erase(address);
+}
+
+bool TextureCache::DccClearSticks(uint64_t address) {
+	static auto& predict = LiveSwitch::Find("spec_predict_dcc", 0);
+	if (predict.load(std::memory_order_relaxed) == 0) return false;
+	std::scoped_lock lock {m_lock};
+	return m_dcc_sticky.contains(address);
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

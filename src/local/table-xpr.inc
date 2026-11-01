@@ -1904,14 +1904,20 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 				// The normal path's FindTexture clears its layers first. A speculation's packet is a hole that does:
 				// the work after it finds them cleared (speculation-state.h).
 				if (auto* spec = Spec::Current()) {
-					for (uint32_t at = layer; at < std::min(dep.range.base_layer + dep.range.layer_count, 32u); ++at)
-						if (textures.IsMetaCleared(address, at)) spec->ConsumeMeta(address, at);
+					// (KYTY_SPEC_PREDICT_DCC: not where the normal path's FindTexture was seen to leave the clear pending,
+					// TextureCache::DccClearSticks: the work after the hole finds it cleared still, and a "not cleared" fact
+					// would fail at its commit. Its later uses read the cache, and are holes too.)
+					if (!textures.DccClearSticks(address))
+						for (uint32_t at = layer; at < std::min(dep.range.base_layer + dep.range.layer_count, 32u); ++at)
+							if (textures.IsMetaCleared(address, at)) spec->ConsumeMeta(address, at);
 					return Spec::Refuse("table: cleared texture"), false;
 				}
 				// The main executor's: FindTexture, as the normal path's use (it clears what it can, into this command
 				// buffer, before the transitions below; what it leaves pending, the normal path binds as well).
 				if (Role() != 0 || !image->registered || image->depth_id || image->binding.needs_rebind) return false;
 				(void)textures.FindTexture(dep.id, dep.desc);
+				// (DccClearSticks; KYTY_SPECULATE unset or 0 keeps nothing, as the texture cache says.)
+				if (Spec::On()) textures.NoteDccClear(address, textures.IsMetaCleared(address, layer));
 				image = textures.m_slot_images.try_get(dep.id);
 				if (image == nullptr || image->serial != dep.serial ||
 				    m_context.GetCommandScheduler().Current().RawHandle() != vk_buffer)

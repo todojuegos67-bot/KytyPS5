@@ -470,6 +470,15 @@ private:
 	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
 	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)
 	std::unordered_map<uint64_t, uint64_t> m_meta_clears;
+	// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc): the DCC surfaces image-clear dispatches filled with a clear code
+	// (TryConsumeComputeImageClear's TrackDccFill), by their shader and user data: a speculation's hole of such a
+	// dispatch clears them too (Spec::State::PredictClear), as m_meta_clears' do. Without it the draws after the hole
+	// were translated as on an uncleared surface and the commit stopped there ("commit: a surface cleared"). (The
+	// surfaces it filled lately, newest first: one dispatch and user data runs more than once a frame over descriptors
+	// the game rewrites between the runs; all are predicted, a stale one costs a hole.)
+	std::unordered_map<uint64_t, std::array<uint64_t, 4>> m_dcc_fills;
+	uint64_t m_last_dcc_fill     = 0;     // (the dispatch being made: the surface its DCC fill cleared, 0 none)
+	bool     m_last_dcc_fill_set = false; // (it tracked a DCC fill)
 	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
 	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,

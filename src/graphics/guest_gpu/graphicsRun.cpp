@@ -558,8 +558,17 @@ static bool StatePassPredicationReads(const uint32_t* packet) {
 }
 
 bool CommandProcessor::SameState(const CommandProcessor& other) const {
+	// KYTY_SPEC_START_INSTANCE_FREE (live spec_start_instance_free): not the start-instance user SGPR (HW::Shader::
+	// SameButStartInstance): a draw's hole sets it where the state pass, which passes draws over, does not, and a chunk's
+	// commit then stopped at "ahead: another start state" (~0.3 ms a frame of in-order translation with spec_predict_dcc).
+	static auto& start_instance_free = LiveSwitch::Find("spec_start_instance_free", [] {
+		const char* value = std::getenv("KYTY_SPEC_START_INSTANCE_FREE");
+		return value != nullptr ? std::atoll(value) : 0ll;
+	}());
+	const bool same_sh = start_instance_free.load(std::memory_order_relaxed) != 0 ? m_sh_ctx.SameButStartInstance(other.m_sh_ctx)
+	                                                                                : m_sh_ctx == other.m_sh_ctx;
 	return m_draw_run_skip == other.m_draw_run_skip && m_ctx == other.m_ctx && m_saved_ctx == other.m_saved_ctx &&
-	       m_ucfg == other.m_ucfg && m_sh_ctx == other.m_sh_ctx && SameDrawState(other);
+	       m_ucfg == other.m_ucfg && same_sh && SameDrawState(other);
 }
 
 void CommandProcessor::CopyStateFrom(const CommandProcessor& other, bool const_ram) {
