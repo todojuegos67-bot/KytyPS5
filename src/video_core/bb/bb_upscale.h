@@ -153,6 +153,8 @@ void OnPresentUpscaled(bool ok);
 // No HUD point this frame although the scene was drawn: true once (at the flip), and the presenter
 // then runs the window-size upscale on the finished image (CurrentPlan()).
 bool TakeLateUpscale();
+// The frame just flipped went through the upscaler (in place or to the window size).
+bool LastFrameUpscaled();
 void OnPresentFailed(std::string_view why);
 // The presenter's verdict for this frame: the window-size image was (or was not) presented.
 void OnPresentResult(bool presented, std::string_view why);

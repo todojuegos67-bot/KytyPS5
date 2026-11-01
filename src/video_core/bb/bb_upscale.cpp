@@ -1637,6 +1637,11 @@ void PresentFailedLocked(std::string_view why) {
 }
 } // namespace
 
+bool LastFrameUpscaled() {
+    std::scoped_lock lk{g_mutex};
+    return g_learned.last_injected;
+}
+
 bool TakeLateUpscale() {
     std::scoped_lock lk{g_mutex};
     const bool late = g_late_upscale;
