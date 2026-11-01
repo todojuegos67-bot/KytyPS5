@@ -57,6 +57,10 @@
 	    [[maybe_unused]] uint32_t num_dw
 #define KYTY_CP_OP_PARSER(f) uint32_t f(KYTY_CP_OP_PARSER_ARGS)
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace Libs::Graphics {
 
 namespace {
@@ -84,6 +88,11 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 // read before its first download is all zeros (an "unknown register 0" crash at startup).
 // False when a speculative translation refused it (speculation-state.h): the packet applies nothing.
 [[nodiscard]] bool SyncCommandMemory(uint64_t address, uint64_t bytes, const char* what) {
+	// (A state pass syncs nothing off the GPU thread, and reads the table in a guarded copy, GuardTable: ~18% of the pass
+	// went here per table, the counters it shares with the GPU thread among it.)
+	// (KYTY_SPECULATE unset: a plain global, not the two thread-locals, on every indirect table.)
+	const bool speculating = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
+	if (speculating && Spec::Record() != nullptr) return true;
 	LiveCounters::Add(LiveCounters::IndirectTables);
 	LiveCensus::Scope census(LiveCensus::CommandSync, 0, 0);
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(address, bytes)) {
@@ -94,6 +103,7 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 			     what, address, bytes);
 		}
 	}
+	if (!speculating) return true;
 	const auto* spec = Spec::Current();
 	return spec == nullptr || spec->refused == nullptr;
 }

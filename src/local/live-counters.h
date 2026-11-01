@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <cstdlib>
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace LiveCounters {
 
 enum Id : uint32_t {
@@ -345,7 +349,10 @@ inline void AddGranule(uint64_t address, GranuleField field, uint64_t n) {
 // PM4 packets per opcode (render thread; relaxed atomics so the live thread can read).
 inline std::atomic<uint64_t> g_pm4[256];
 inline void AddPm4(uint32_t opcode) {
-	// Only the render thread counts: no locked add.
+	// Only the render thread counts: no locked add. (A speculation's threads and state pass skip it: their unlocked adds
+	// to the render thread's counts moved its cache lines between up to ten threads on every packet.)
+	// (KYTY_SPECULATE unset or 0: only the render thread runs packets; the global first, no thread-local read.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !g_single_writer) return;
 	auto& value = g_pm4[opcode & 0xffu];
 	value.store(value.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
