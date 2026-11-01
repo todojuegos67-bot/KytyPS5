@@ -95,7 +95,19 @@ void SetProcessEnv(const char* name, const char* value) {
 Config ParseConfig() {
     Config c{};
     const char* v = std::getenv("BB_FG");
-    const std::string s = v != nullptr ? v : "off";
+    std::string s = v != nullptr ? v : "off";
+    // Aliases: fsr3-xN / fsr3-dyn / amd-xN / dlssg-xN / dlss-g-xN, "xN" or "N" spelled either way.
+    for (const char* from : {"fsr3-", "fsr-", "dlssg-", "dlss-g-"}) {
+        if (s.starts_with(from)) {
+            s = std::string(std::string_view(from).starts_with("fsr") ? "amd-" : "dlss-") +
+                s.substr(std::strlen(from));
+            break;
+        }
+    }
+    if (const auto dash = s.find('-'); dash != std::string::npos && dash + 1 < s.size() &&
+                                       s[dash + 1] >= '2' && s[dash + 1] <= '6') {
+        s.insert(dash + 1, "x");
+    }
     if (s.starts_with("dlss-")) {
         c.kind = Kind::Dlss;
         const std::string m = s.substr(5);
@@ -136,9 +148,9 @@ Config ParseConfig() {
     if (const char* r = std::getenv("BB_REFLEX"); r != nullptr && *r != '\0') {
         const std::string mode = r;
         if (std::getenv("BB_DLSSG_REFLEX") == nullptr) {
-            SetProcessEnv("BB_DLSSG_REFLEX", mode == "0" || mode == "off" ? "off"
-                                             : mode == "boost"            ? "boost"
-                                                                          : "low");
+            SetProcessEnv("BB_DLSSG_REFLEX", mode == "0" || mode == "off"   ? "off"
+                                             : mode == "boost" || mode == "2" ? "boost"
+                                                                              : "low");
         }
         if (mode != "0" && mode != "off" && std::getenv("BB_ANTILAG") == nullptr) {
             SetProcessEnv("BB_ANTILAG", "1");
