@@ -56,6 +56,7 @@ extern volatile std::atomic_uint32_t kyty_local_table_indirect_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
 extern volatile std::atomic_uint32_t kyty_local_table_set_proofs;
 extern volatile std::atomic_uint32_t kyty_local_table_mru;
+extern volatile std::atomic_uint32_t kyty_local_table_target_read;
 extern volatile std::atomic<uint32_t> kyty_local_table_gather_memo; // KYTY_TABLE_GATHER_MEMO (local/table-xpr.inc TableGather)
 #endif
 extern volatile std::atomic_uint32_t kyty_local_scout_mode;
@@ -178,6 +179,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_SET_PROOFS", &kyty_local_table_set_proofs, 0, 2},
 	    // Table lookups that ask the last answer first (bits: pair cache size, variant, image set).
 	    Switch {"KYTY_TABLE_MRU", &kyty_local_table_mru, 0, 7},
+	    // Table image sets that hold a target the shaders sample (default off; local/native-xpr.inc).
+	    Switch {"KYTY_TABLE_TARGET_READ", &kyty_local_table_target_read},
 #endif
 	    Switch {"KYTY_SPECULATE", &kyty_local_speculate_mode, 0, 4},
 	    Switch {"KYTY_SPECULATE_THREADS", &kyty_local_speculate_threads, 1, 8},

@@ -84,6 +84,8 @@ struct RenderExecutor::TableImageSet {
 		TextureCache::ImageDesc desc;
 		vk::AccessFlags2        access = vk::AccessFlagBits2::eShaderRead;
 		bool                    target  = false; // a target of the draw state the set was made under (its access)
+		// A target the shaders sample (KYTY_TABLE_TARGET_READ): the shader access added to the target's (in `access`).
+		vk::AccessFlags2        target_read {};
 		bool                    storage = false; // the shader writes it: GPU-modified at every use (TableTransit)
 		bool                    whole   = false; // bound both as a texture and as storage: the whole image's state
 		// The main executor's proof of its use (a target, or a texture without DCC found current): the image's validity
@@ -921,16 +923,42 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			}
 			// (A sampled aspect the attachment writes is not shader-readable: the target's access then lacks it. A
 			// linear image the shader writes is enrolled for readback at every acquisition: TrackImageDownload.)
+			// KYTY_TABLE_TARGET_READ: a target sampled in a layout that lets the shader read what it samples (the checks of
+			// the normal path's CommitBindings) is held with the shader access added, as that path transits it.
+			const bool target_read = [&] {
+				if (target == nullptr || (target->access & vk::AccessFlagBits2::eShaderRead) ||
+				    kyty_local_table_target_read.load(std::memory_order_relaxed) == 0)
+					return false;
+				const auto layout = target->layout;
+				// (A colour target bound as storage too, in General: the deferred decals' G-buffer, as CommitBindings.)
+				if (storage) return !image.info.IsDepth() && layout == vk::ImageLayout::eGeneral;
+				if (layout == vk::ImageLayout::eGeneral) return true;
+				const bool pixel_feedback = layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT && stages == 2 && st == 1;
+				if (!image.info.IsDepth()) return pixel_feedback;
+				const auto aspect     = binding.desc.view_info.aspect;
+				const bool depth_read = pixel_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+				                        layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+				                        layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
+				const bool stencil_read = layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
+				                          layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+				                          layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
+				return (!(aspect & vk::ImageAspectFlagBits::eDepth) || depth_read) &&
+				       (!(aspect & vk::ImageAspectFlagBits::eStencil) || stencil_read);
+			}();
 			if (image.info.data.Empty() ||
-			    (target != nullptr && (storage || !(target->access & vk::AccessFlagBits2::eShaderRead))) ||
+			    (target != nullptr && !target_read && (storage || !(target->access & vk::AccessFlagBits2::eShaderRead))) ||
 			    ((storage || (image.binding.force_general && image.binding.shader_write)) && !image.info.IsTiled())) {
 				ok = false;
 				break;
 			}
 			if (target != nullptr) {
-				binding.layout = target->layout;
-				dep.access     = target->access;
-				dep.target     = true;
+				binding.layout  = target->layout;
+				dep.target_read = target_read ? vk::AccessFlagBits2::eShaderRead |
+				                                    (storage || image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+				                                                                           : vk::AccessFlags2 {})
+				                              : vk::AccessFlags2 {};
+				dep.access      = target->access | dep.target_read;
+				dep.target      = true;
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				binding.layout = vk::ImageLayout::eGeneral;
 				dep.access     = vk::AccessFlagBits2::eShaderRead |
@@ -1805,6 +1833,13 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	if (!bounded || !resources.PrepareBdaReadRanges(ranges)) resources.PrepareBda();
 }
 
+vk::AccessFlags2 RenderExecutor::TableTargetRead(const TableImageSet& set, ImageId id) {
+	vk::AccessFlags2 read {};
+	for (const auto& dep: set.images)
+		if (dep.target && dep.id == id) read |= dep.target_read;
+	return read;
+}
+
 // KYTY_TABLE_SERIALS=2: a check the serial sums would have skipped that changed something (the first 32 printed).
 static void TableSerialsUnsafe(const char* what) {
 	static std::atomic<uint32_t> count {0};
@@ -1852,7 +1887,8 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		                        ? decltype(draw_state->targets.end()) {}
 		                        : std::ranges::find(draw_state->targets, dep.id, &NativeXprDrawState::Target::id);
 		const bool is_target = draw_state != nullptr && target != draw_state->targets.end();
-		if (is_target != dep.target || (is_target && (target->layout != dep.layout || target->access != dep.access)))
+		if (is_target != dep.target ||
+		    (is_target && (target->layout != dep.layout || (target->access | dep.target_read) != dep.access)))
 			return false;
 		if (is_target) continue;
 		// An image the shader writes is GPU-modified, CPU-clean and current with buffer writes (as the normal path's
@@ -1892,6 +1928,8 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		if (!dep.target)
 			textures.m_slot_images[dep.id].Transit(dep.layout, dep.access, dep.whole ? std::nullopt : std::optional {dep.range},
 			                                       vk_buffer, draw_state != nullptr && dep.whole && dep.storage);
+		else if (dep.target_read) // (as CommitBindings transits a target the shaders sample: the whole image)
+			textures.m_slot_images[dep.id].Transit(dep.layout, dep.access, std::nullopt, vk_buffer);
 	return true;
 }
 
@@ -2307,7 +2345,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const bool due_targets   = serials == 1 ? sum_targets : epoch_targets;
 		if (serials != 0 && epoch_targets != sum_targets)
 			LiveCounters::Add(sum_targets ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
-		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer)) {
+		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer, set)) {
 			if (serials == 2 && !sum_targets) TableSerialsUnsafe("targets refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: targets"), TableResult::Native;
 		}

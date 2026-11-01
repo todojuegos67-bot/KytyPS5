@@ -117,6 +117,11 @@ static int64_t TableMemoVerifyEvery() {
 	static auto& every = LiveSwitch::Find("table_memo_verify", 0);
 	return every.load(std::memory_order_relaxed);
 }
+// 1: a table image set may hold a target of its draw state that the shaders sample (the scene's depth read in its own
+// pass, the decals' G-buffer), in its attachment layout with shader access added, as the normal path's CommitBindings
+// transits it; 0: such sets are refused, their draws take the normal path (holes in a speculation: ~360 draws a frame at
+// the stone arch, 11-01).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_target_read {0};
 // 1: NativeXprStateKey hashes the context and the user configuration again only after a change of their registers;
 // 0: at every call; 2: as 1, each key checked against the full hash (STATE-KEY MISMATCH lines, counter
 // shortcut_mismatches).
@@ -3133,7 +3138,8 @@ struct RenderExecutor::NativeXprDirect {
 // What the normal path's target acquisition establishes must still hold: the image is registered,
 // GPU-owned (so CPU reads download it) and CPU-clean, and no fast clear is pending in its metadata.
 // Otherwise the normal path acquires. Then the targets in the state's layouts.
-bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer) {
+bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,
+                                          const TableImageSet* reading) {
 	auto&      textures   = m_context.GetTextureCache();
 	const auto meta_epoch = textures.MetaEpoch();
 	auto*      spec       = Spec::Current();
@@ -3160,8 +3166,13 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		// speculation's commit that left a layer elsewhere (rendering to layer 0 of four left the image's layout the
 		// target's, layers 1-3 sampled), the target's own subresources decide; a speculation's always do: it does not
 		// see its holes' transitions.)
-		if (spec != nullptr || image.CurrentState().layout != target.layout || !image.backing.subresource_states.empty())
-			image.Transit(target.layout, target.access, target.range, vk_buffer);
+		if (spec != nullptr || image.CurrentState().layout != target.layout || !image.backing.subresource_states.empty()) {
+			// (A target the table set's shaders sample: with their access, which TableTransit gives it next, the whole
+			// image's; else that transition would follow this one at every draw, a render pass break each.)
+			const auto read = reading != nullptr ? TableTargetRead(*reading, target.id) : vk::AccessFlags2 {};
+			if (read) image.Transit(target.layout, target.access | read, std::nullopt, vk_buffer);
+			else image.Transit(target.layout, target.access, target.range, vk_buffer);
+		}
 	}
 	return true;
 }
