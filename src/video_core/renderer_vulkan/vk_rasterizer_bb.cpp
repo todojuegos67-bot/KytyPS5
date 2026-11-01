@@ -1223,7 +1223,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     desc.fov_y = plan.fov_y;
     desc.z_near = plan.z_near;
     desc.z_far = plan.z_far;
-    desc.sharpness = BB::Upscale::Cfg().sharpness;
+    desc.sharpness = BB::Upscale::LiveSharpness();
     desc.quality = BB::Upscale::Cfg().quality;
     desc.camera_valid = plan.camera_valid;
     std::copy(std::begin(plan.view_to_clip), std::end(plan.view_to_clip), desc.view_to_clip);

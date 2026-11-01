@@ -3,7 +3,10 @@
 #include "video_core/bb/bb_upscale.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <ctime>
 #include <cmath>
 #include <cstdlib>
@@ -228,9 +231,6 @@ Config ParseConfig() {
     }
     if (c.kind == SR::Kind::Fsr4) {
         _putenv_s("BB_UPSCALER", "fsr4");
-        if (Env("BB_FSR4_SHARPNESS") == nullptr) {
-            _putenv_s("BB_FSR4_SHARPNESS", fmt::format("{}", c.sharpness).c_str());
-        }
     }
 #endif
     return c;
@@ -642,6 +642,52 @@ void Checkpoint(std::string_view text) {
 const Config& Cfg() {
     static const Config config = ParseConfig();
     return config;
+}
+
+float LiveSharpness() {
+    static std::atomic<float> value{Cfg().sharpness};
+    static const char* const path = std::getenv("BB_UPSCALE_SHARPNESS_FILE");
+    if (path == nullptr || *path == '\0') {
+        return value.load(std::memory_order_relaxed);
+    }
+    static std::mutex mutex;
+    static std::chrono::steady_clock::time_point next{};
+    static std::filesystem::file_time_type seen{};
+    std::unique_lock lk{mutex, std::try_to_lock};
+    if (!lk.owns_lock()) {
+        return value.load(std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) {
+        return value.load(std::memory_order_relaxed);
+    }
+    next = now + std::chrono::milliseconds(500);
+    std::error_code ec;
+    const auto stamp = std::filesystem::last_write_time(path, ec);
+    if (ec || stamp == seen) {
+        return value.load(std::memory_order_relaxed);
+    }
+    seen = stamp;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto eq = line.find('=');
+        const std::string text = eq == std::string::npos ? line : line.substr(eq + 1);
+        if (text.empty()) {
+            continue;
+        }
+        char* end = nullptr;
+        const float v = std::strtof(text.c_str(), &end);
+        if (end != text.c_str() && std::isfinite(v)) {
+            const float clamped = std::clamp(v, 0.0f, 1.0f);
+            if (clamped != value.load(std::memory_order_relaxed)) {
+                LOG_INFO(Render_Vulkan, "[BB_UPSCALE] sharpness {:.2f} (live, {})", clamped, path);
+            }
+            value.store(clamped, std::memory_order_relaxed);
+            break;
+        }
+    }
+    return value.load(std::memory_order_relaxed);
 }
 
 bool Enabled() {

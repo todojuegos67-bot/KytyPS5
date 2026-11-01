@@ -48,6 +48,8 @@ struct Config {
 };
 const Config& Cfg();
 bool Enabled(); // an upscaler (or native) was asked for
+// Cfg().sharpness, then the value in BB_UPSCALE_SHARPNESS_FILE (re-read every 0.5 s when it changes).
+float LiveSharpness();
 
 // Instance / device creation.
 void PreInstance();

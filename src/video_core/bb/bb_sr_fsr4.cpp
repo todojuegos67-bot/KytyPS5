@@ -6,6 +6,7 @@
 // BB_FSR4_*, KYTY_UPSCALE_SHARPNESS -> BB_UPSCALE_SHARPNESS.
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_fsr4_prep_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 namespace Libs::Graphics::Fsr4 {
@@ -829,10 +830,9 @@ float Sharpness() {
 		};
 		float v = 0.0f;
 		if (read("BB_FSR4_SHARPNESS", v)) return v;
-		if (read("BB_UPSCALE_SHARPNESS", v)) return v;
-		return 0.3f;
+		return -1.0f;
 	}();
-	return amount;
+	return amount >= 0.0f ? amount : BB::Upscale::LiveSharpness();
 }
 
 bool SrPathWanted() {

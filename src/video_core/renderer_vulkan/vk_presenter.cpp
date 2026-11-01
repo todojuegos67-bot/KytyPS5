@@ -796,11 +796,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     if (bb_presented && (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ||
                          BB::Upscale::Cfg().kind == BB::SR::Kind::Xess ||
                          BB::Upscale::Cfg().kind == BB::SR::Kind::Native) &&
-        BB::Upscale::Cfg().sharpness > 0.0f) {
+        BB::Upscale::LiveSharpness() > 0.0f) {
         frame_fsr.enable = true;
         frame_fsr.use_rcas = true;
         frame_fsr.sharpen_only = true;
-        frame_fsr.rcas_attenuation = (1.0f - BB::Upscale::Cfg().sharpness) * 2.0f;
+        frame_fsr.rcas_attenuation = (1.0f - BB::Upscale::LiveSharpness()) * 2.0f;
         fsr_out = bb_size;
     }
     image_view = fsr_pass.Render(cmdbuf, image_view, bb_size, fsr_out, frame_fsr, frame->is_hdr);
