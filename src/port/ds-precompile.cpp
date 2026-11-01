@@ -13,6 +13,8 @@
 #include <map>
 #include <mutex>
 #include <regex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -400,13 +402,36 @@ void Work() {
 		std::fflush(stdout);
 	}
 
-	// 3. The plan (every pipeline once, with the work item that makes it first).
+	// 3. The plan (every pipeline once, with the work item that makes it first). (ds-pc-port37) Kept with the shards done in
+	// _PipelineCache/static/precompile-resume while the inputs are the same (the seed file's and the recorded play's
+	// bytes, the translation switches): a run that stopped at 50 % goes on at 50 %, without planning again.
+	const fs::path resume_dir = root / L"_PipelineCache" / L"static" / L"precompile-resume";
+	const auto     content    = [&](const fs::path& f) {
+		const std::string b = ReadAll(f);
+		uint64_t          h = 1469598103934665603ull;
+		for (const unsigned char c: b) h = (h ^ c) * 1099511628211ull;
+		return std::to_string(b.size()) + ":" + std::to_string(h);
+	};
+	const std::string resume_key = "v1|" + content(seeds) + "|" + (has_recorded ? content(recorded) : std::string("-")) + "|" +
+	                               g_setup.shadow_filter + "|" + std::to_string(cpus > 0);
+	bool resumed_plan = false;
+	{
+		std::error_code e;
+		if (ReadAll(resume_dir / L"key.txt") == resume_key) {
+			resumed_plan = true;
+		} else {
+			fs::remove_all(resume_dir, e);
+			fs::create_directories(resume_dir, e);
+		}
+	}
+	const fs::path plan_logs = resumed_plan ? resume_dir : g_logs;
+	const fs::path plan = resume_dir / L"plan.bin";
+	bool use_plan = true;
+	if (!resumed_plan) {
 	SetText("Preparando shaders: planificando (un minuto o dos)...");
-	const fs::path plan = g_logs / L"plan.bin";
 	// (Not fatal: the first run's plan failed on players' PCs - every CPU thread translating every program at once, short of
 	// memory - and only a second start went on. Tried again on 4 threads; without a plan the shards still make every
 	// pipeline, some of them twice.)
-	bool use_plan = true;
 	const auto plan_step = [&](const std::string& name, const std::wstring& args_no_threads) {
 		if (run(name, args_no_threads + L" --threads " + std::to_wstring(cpus))) return true;
 		if (g_stop) return false;
@@ -430,6 +455,22 @@ void Work() {
 		(void)run("inputs", L"--seeds " + Quote(seeds) + L" --no-pipelines --threads " + std::to_wstring(std::min(cpus, 4)) + L" --static-inputs");
 	}
 
+	{
+		// (Kept for a resumed run: the plan and its counts when there is one, the key either way: without a plan the
+		// shard counts are the defaults, the same next time.)
+		std::error_code e;
+		if (use_plan)
+			for (const wchar_t* f: {L"plan-recorded.out.log", L"plan-seeds.out.log"})
+				if (fs::exists(g_logs / f, e)) fs::copy_file(g_logs / f, resume_dir / f, fs::copy_options::overwrite_existing, e);
+		std::ofstream(resume_dir / L"key.txt", std::ios::binary) << resume_key;
+	}
+	} else {
+		std::error_code e;
+		use_plan = fs::exists(plan, e);
+		std::printf("[port] precompile: resuming (%s and the shards done of the last run)\n", use_plan ? "its plan" : "no plan");
+		std::fflush(stdout);
+	}
+
 	// 4. The shards: ~100 planned pipelines each, the recorded tier first.
 	struct Item {
 		fs::path    file;
@@ -438,20 +479,45 @@ void Work() {
 	};
 	std::deque<Item> first, second;
 	if (has_recorded) {
-		const long long planned = PlannedPipelines(g_logs / L"plan-recorded.out.log");
+		const long long planned = PlannedPipelines(plan_logs / L"plan-recorded.out.log");
 		const int       count   = static_cast<int>(std::max<long long>(1, (std::max<long long>(planned, 100) + 99) / 100));
 		for (int i = 0; i < count; i++) first.push_back({recorded, i, count, true});
 	}
 	{
-		const long long planned = PlannedPipelines(g_logs / L"plan-seeds.out.log");
+		const long long planned = PlannedPipelines(plan_logs / L"plan-seeds.out.log");
 		const int       count   = static_cast<int>(std::max<long long>(512, (planned + 99) / 100));
 		for (int i = 0; i < count; i++) second.push_back({seeds, i, count, false});
 	}
+	// (ds-pc-port37) The shards an earlier run finished (resume_dir/done.txt; a split shard is done when both halves are).
+	std::set<std::string> done_set;
+	{
+		std::istringstream lines(ReadAll(resume_dir / L"done.txt"));
+		for (std::string line; std::getline(lines, line);)
+			if (!line.empty()) done_set.insert(line);
+	}
+	const auto done_name = [](const Item& it) { return std::string(it.first ? "r " : "s ") + std::to_string(it.i) + " " + std::to_string(it.n); };
+	const std::function<bool(const Item&, int)> is_done = [&](const Item& it, int depth) -> bool {
+		if (done_set.contains(done_name(it))) return true;
+		if (depth >= 8 || it.n >= 65536) return false;
+		return is_done({it.file, it.i, 2 * it.n, it.first}, depth + 1) && is_done({it.file, it.i + it.n, 2 * it.n, it.first}, depth + 1);
+	};
 	int total = static_cast<int>(first.size() + second.size()), done = 0;
+	for (auto* q: {&first, &second}) {
+		std::deque<Item> left;
+		for (const auto& it: *q)
+			if (is_done(it, 0)) done++;
+			else left.push_back(it);
+		q->swap(left);
+	}
+	const bool resumed   = done > 0;
+	const int  resumed_p = total > 0 ? done * 100 / total : 0;
+	std::ofstream done_log(resume_dir / L"done.txt", std::ios::binary | std::ios::app);
+	if (resumed) std::printf("[port] precompile: %d of %d shards done before: going on at %d %%\n", done, total, resumed_p);
 	{
 		std::scoped_lock lock(g_mutex);
-		g_view.total = total;
-		g_view.done  = 0;
+		g_view.total       = total;
+		g_view.done        = done;
+		g_view.resumed_pct = resumed_p;
 	}
 	struct Running {
 		Item        item;
@@ -545,6 +611,8 @@ void Work() {
 				return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Lo hecho se guarda. Mira logs\\*-precompile.");
 			}
 			done++;
+			done_log << done_name(r.item) << "\n";
+			done_log.flush();
 		}
 		{
 			std::scoped_lock lock(g_mutex);
@@ -554,22 +622,28 @@ void Work() {
 			const int pct      = total > 0 ? done * 100 / total : 0;
 			std::string eta    = "calculando el tiempo restante";
 			g_view.eta_s       = -1;
-			if (done > 0) {
+			if (done - (total > 0 ? resumed_p * total / 100 : 0) > 0) {
+				const int       here  = done - resumed_p * total / 100;
 				const auto      spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - begin).count();
-				const long long left  = spent * (total - done) / done;
+				const long long left  = spent * (total - done) / here;
 				g_view.eta_s          = left;
 				eta = "quedan unos " + (left >= 3600 ? std::to_string(left / 3600) + " h " + std::to_string(left % 3600 / 60) + " min"
 				                                     : std::to_string(std::max<long long>(1, left / 60)) + " min");
 			}
 			g_view.text = "Ten paciencia: se estan precompilando los shaders del juego (solo la primera vez).\n" + std::to_string(pct) +
 			              " %  (" + std::to_string(done) + " / " + std::to_string(total) + " partes, " + eta + ")" +
+			              (resumed_p > 0 ? "  (retomada desde el " + std::to_string(resumed_p) + " %)" : std::string()) +
 			              (waiting_memory ? "  [esperando memoria libre]" : "");
 		}
 	}
 
 	// 5. The final merge: the store of this run's pipelines, stamped.
 	SetText("Preparando shaders: guardando la cache...");
-	if (!run("merge", L"--merge --stamp --prune", false)) return fail("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile.");
+	// (Resumed: no --prune, which keeps only this run's pipelines: the earlier runs' shards were merged and are not made again.)
+	if (!run("merge", resumed ? L"--merge --stamp" : L"--merge --stamp --prune", false))
+		return fail("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile.");
+	done_log.close();
+	fs::remove_all(resume_dir, ec);
 	fs::remove_all(g_nvidia, ec);
 	RememberHints();
 	RemoveOldWarmedCache();
