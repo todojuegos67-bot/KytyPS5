@@ -798,8 +798,14 @@ static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
 	auto* spec = Spec::Current();
 	if (spec == nullptr) {
 		AsyncUpload::Drain(/*serve=*/true);
+		// (Only what changes, Spec::HostWriteParts: compared where reading it faults nothing back from the GPU.)
+		Spec::HostWriteParts parts;
+		if (!Libs::LibKernel::Memory::ReadFaults(reinterpret_cast<uint64_t>(dst), size))
+			parts.Find(reinterpret_cast<uint64_t>(dst), src, size);
+		else
+			parts.address = reinterpret_cast<uint64_t>(dst), parts.size = size;
 		std::memcpy(dst, src, size);
-		Spec::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size);
+		parts.Note();
 		if (Scout::Running()) Scout::NoteWrite(dst, size);
 		// (The labels a speculation's waits check: none without speculation.)
 		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0)

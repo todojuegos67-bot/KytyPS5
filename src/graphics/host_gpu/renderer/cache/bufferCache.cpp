@@ -3058,6 +3058,9 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		if (run_end == run) return;
 		const auto  address = dst_vaddr + run, bytes = run_end - run;
 		const auto* from    = reinterpret_cast<const void*>(src_vaddr + run);
+		// (Only what changes is a write a speculation may have read: Spec::HostWriteParts. The pages were read above.)
+		Spec::HostWriteParts parts;
+		parts.Find(address, from, bytes);
 		if (!m_memory_tracker.IsRegionFullyCpuModified(address, bytes)) {
 			// (As the write faults would: the images over the pages first.)
 			m_texture_cache.InvalidateMemory(address, bytes);
@@ -3065,7 +3068,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			if (m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
 			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
 			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
-				Spec::NoteHostWrite(address, bytes);
+				parts.Note();
 				if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
 				return;
 			}
@@ -3076,7 +3079,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)
 		m_memory_tracker.NoteHostWrite(address, bytes);
 		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
-		Spec::NoteHostWrite(address, bytes);
+		parts.Note();
 		if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
 	};
 	// Which destination pages differ: compared on helper threads too when the copy is large (the 4 MiB copy the culling

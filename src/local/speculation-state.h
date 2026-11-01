@@ -758,10 +758,50 @@ inline void NoteHostWrite(uint64_t address, uint64_t size) {
 	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::HostWrite, address, size);
 	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::HostWrite, address, size);
 }
+// The parts of a host write that change memory, in 16-byte granules: found before the write, logged after it
+// (NoteHostWrite's order). A speculation that read only the rest reads the same bytes after the write: the game's
+// copies rewrite tables of which a few words change (the culling chain's 720-byte descriptor table every frame), and
+// the whole write logged stopped the commits of every translation that read a descriptor there. (A write over 64 KiB,
+// or one that changes more than 16 parts, is logged whole.)
+struct HostWriteParts {
+	static constexpr uint64_t Granule = 16, MaxBytes = uint64_t {64} << 10u;
+	std::array<std::pair<uint64_t, uint64_t>, 16> parts {};
+	uint32_t count = 0;
+	uint64_t address = 0, size = 0;
+	bool     whole = true;
+	void Find(uint64_t dst, const void* src, uint64_t bytes) {
+		// (KYTY_SPECULATE_WRITE_PARTS, live speculate_write_parts: 0 logs every write whole, as before.)
+		static auto& on = LiveSwitch::Find("speculate_write_parts", 1);
+		address = dst, size = bytes, count = 0;
+		whole   = !On() || (t_effects == nullptr && t_effects_async == nullptr) || bytes > MaxBytes ||
+		        on.load(std::memory_order_relaxed) == 0;
+		if (whole) return;
+		const auto* from = static_cast<const uint8_t*>(src);
+		for (uint64_t at = 0; at < bytes;) {
+			const auto n = std::min(Granule - (dst + at) % Granule, bytes - at);
+			if (std::memcmp(reinterpret_cast<const void*>(dst + at), from + at, n) != 0) {
+				if (count != 0 && parts[count - 1].first + parts[count - 1].second == dst + at) {
+					parts[count - 1].second += n;
+				} else if (count == parts.size()) {
+					whole = true;
+					return;
+				} else {
+					parts[count++] = {dst + at, n};
+				}
+			}
+			at += n;
+		}
+	}
+	void Note() const;
+};
 inline void NoteRetiredSet(uint64_t set) {
 	if (!On()) return;
 	if (t_effects != nullptr) t_effects->Add(EffectsLog::Kind::RetiredSet, set, 0);
 	if (t_effects_async != nullptr) t_effects_async->Add(EffectsLog::Kind::RetiredSet, set, 0);
+}
+inline void HostWriteParts::Note() const {
+	if (whole) return NoteHostWrite(address, size);
+	for (uint32_t i = 0; i < count; ++i) NoteHostWrite(parts[i].first, parts[i].second);
 }
 
 } // namespace Libs::Graphics::Spec
