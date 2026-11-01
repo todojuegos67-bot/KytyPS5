@@ -928,7 +928,13 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			sets.emplace_back("KYTY_DLSS_NR_PRESR", "0");
 			sets.emplace_back("KYTY_FOV_EDGE", edge[level]);
 			sets.emplace_back("KYTY_DLSS_NR_UNSIGNED", s.dlss5_unsigned ? "1" : "0");
-			sets.emplace_back("KYTY_DLSS_NR_STRENGTH", s.dlss5_strength == "baja" ? "0.35" : s.dlss5_strength == "media" ? "0.65" : "1");
+			// (ds-pc-port40) Suave / Medio / Fuerte used to change only the foveated grid's edge density (GPU time): the
+			// model's look stayed the same at every level and "alta" was the default 1. Now the level is the model's own
+			// DLSSNR.Intensity and Intensidad the share of its edit applied (above 1: amplified), so each step is visible.
+			static const char* intensity[] = {"1", "0.75", "1.1", "1.5"};
+			sets.emplace_back("KYTY_DLSS_NR", "1");
+			sets.emplace_back("KYTY_DLSS_NR_INTENSITY", intensity[level]);
+			sets.emplace_back("KYTY_DLSS_NR_STRENGTH", s.dlss5_strength == "baja" ? "0.5" : s.dlss5_strength == "media" ? "1" : "1.5");
 		} else {
 			sets.emplace_back("KYTY_FOVEATED", "0");
 			sets.emplace_back("KYTY_DLSS_NR", "0");

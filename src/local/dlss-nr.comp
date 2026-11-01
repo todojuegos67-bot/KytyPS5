@@ -36,6 +36,9 @@ layout(binding = 8) uniform sampler2D wdepth_tex;  // resolve: the warped depth
 // No format qualifier (shaderStorageImageWriteWithoutFormat): the game's output format, or the rgba16f stand-in.
 layout(binding = 9) uniform writeonly image2D dst_img;
 layout(std430, binding = 10) readonly buffer Exposure { float exposure_values[]; };
+// (ds-pc-port40) The model's edit, measured: every 32nd pixel per axis adds its |NR - proxy| / proxy (x256, 0..1) and
+// a count; the host reads the running totals (wrapping uint deltas) for the "DLSS 5:" line and the overlay.
+layout(std430, binding = 11) buffer EditStats { uint edit_sum; uint edit_count; uint edit_changed; uint pad0; } stats;
 
 layout(push_constant) uniform Push {
 	ivec2 full;     // the output's size
@@ -46,7 +49,7 @@ layout(push_constant) uniform Push {
 	vec4  ax;       // x axis: a (plateau half-width, px), b (fall-off, px), e (edge density), on (1 / 0)
 	vec4  ay;       // y axis
 	vec2  mv_scale; // the game's motion scale (to render px towards the previous frame)
-	float strength; // 0..1: how much of the model's edit
+	float strength; // 0..2: how much of the model's edit (above 1: the edit amplified, the launcher's "alta")
 	float debug;    // 1: the density map (white 1, dark the edge)
 } push;
 
@@ -207,7 +210,14 @@ void ResolveMain(ivec2 p) {
 	// The model's edit as a ratio on the untouched frame (exposed-linear, per channel, held within 1/4..4).
 	vec3 lp    = Decode(P), ln = Decode(N);
 	vec3 ratio = clamp((ln + 0.002) / (lp + 0.002), vec3(0.25), vec3(4.0));
-	vec3 rgb   = orig.rgb * mix(vec3(1.0), ratio, push.strength);
+	vec3 rgb   = orig.rgb * max(mix(vec3(1.0), ratio, push.strength), vec3(0.0));
+	if ((p.x & 31) == 0 && (p.y & 31) == 0) {
+		vec3  rel = abs(ln - lp) / (lp + 0.02);
+		float d   = clamp((rel.r + rel.g + rel.b) * (1.0 / 3.0), 0.0, 1.0);
+		atomicAdd(stats.edit_sum, uint(d * 256.0 + 0.5));
+		atomicAdd(stats.edit_count, 1u);
+		if (d > 0.01) atomicAdd(stats.edit_changed, 1u);
+	}
 	if (any(isnan(rgb)) || any(isinf(rgb))) rgb = orig.rgb;
 	imageStore(dst_img, p, vec4(rgb, orig.a));
 }

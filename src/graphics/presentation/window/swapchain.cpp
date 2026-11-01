@@ -21,6 +21,7 @@
 #endif
 #include "frame-gen.h"
 #include "local/fsr3-fg.h"
+#include "local/dlss-nr.h"
 #include "local/kbm-warp.h"
 #include "local/anti-lag.h"
 #include "local/rt-local-lights.h"
@@ -679,6 +680,9 @@ struct Presenter::Impl {
 			}
 			hud.title  = title.data();
 			hud.detail = detail.data();
+			// (ds-pc-port40) DLSS 5: is the model running and how much does it change (dlss-nr.cpp).
+			if (const auto nr = Libs::Graphics::FrameGen::DlssNrStatusLine(); !nr.empty())
+				hud.detail = hud.detail.empty() ? nr : hud.detail + "  |  " + nr;
 			// The last 10 seconds' frames: their average time, the render thread's busy part, the worst 1% as
 			// fps and the longest.
 			const auto summary = PerfOverlay::Summarize(10.0);

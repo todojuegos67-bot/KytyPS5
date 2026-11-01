@@ -20,7 +20,7 @@
 //   KYTY_FOV_EDGE              the density beyond the fall-off, 0.25..1.0 per axis (default 0.5; corners get edge x edge)
 //   KYTY_FOV_MEASURE=0         skip the start-up A/B (uniform 300 frames, then foveated 300; off when it saves < 5 %)
 //   KYTY_FOV_VIEW=1            the density map over the picture (diagnostic)
-//   KYTY_DLSS_NR_STRENGTH      0..1, how much of the model's edit (default 1)
+//   KYTY_DLSS_NR_STRENGTH      0..2, how much of the model's edit (default 1; above 1 the edit amplified)
 //   KYTY_DLSS_NR_PRESET / _STYLE / _TONE / _STRUCTURE / _SKIN / _AUTOMASK   the model's create-time steering (RenoDX's
 //                              defaults: 0, 0, 1, 1, -1, 0)
 //   KYTY_DLSS_NR_UNSIGNED=1    load a DLL not signed by NVIDIA (a modded one for pre-Blackwell GPUs)
@@ -37,6 +37,8 @@ namespace Libs::Graphics::FrameGen {
 
 // KYTY_DLSS_NR=1 or KYTY_FOVEATED=1 (read once).
 [[nodiscard]] bool DlssNrWanted();
+// (ds-pc-port40) The overlay's line ("DLSS 5 on  |  edit 3.1%  |  N frames OK" or the NGX error); empty: NR never ran.
+[[nodiscard]] std::string DlssNrStatusLine();
 // Before the device: the device extensions the model's Vulkan path needs (VK_NVX_binary_import,
 // VK_NVX_image_view_handle; NGX loads its kernels and addresses its images through them), where available.
 void DlssNrAddDeviceExtensions(const std::vector<vk::ExtensionProperties>& available, std::vector<const char*>& extensions);

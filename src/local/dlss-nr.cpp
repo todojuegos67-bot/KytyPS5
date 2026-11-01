@@ -33,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -331,7 +332,7 @@ struct Retired {
 	Image    images[4];
 	uint64_t frame = 0;
 };
-constexpr uint32_t Bindings = 11, Stamps = 4, TimingEntries = 8;
+constexpr uint32_t Bindings = 12, Stamps = 4, TimingEntries = 8;
 struct Push {
 	int32_t full[2], work[2], render[2];
 	int32_t mode, exposure_index;
@@ -365,6 +366,17 @@ struct State {
 	VkBuffer                one = VK_NULL_HANDLE;
 	VmaAllocation           one_mem = VK_NULL_HANDLE;
 	bool                    one_ready = false;
+	// (ds-pc-port40) The model's edit, measured on the GPU (binding 11, host-visible, running totals) and the
+	// evaluations: the session's "DLSS 5:" line every 10 s and the overlay's line.
+	VkBuffer                stats = VK_NULL_HANDLE;
+	VmaAllocation           stats_mem = VK_NULL_HANDLE;
+	uint32_t*               stats_map = nullptr;
+	bool                    stats_ready = false;
+	uint32_t                stats_last[3] {};
+	uint64_t                eval_ok = 0, eval_ok_logged = 0;
+	uint32_t                last_error = 0;
+	double                  edit_pct = -1.0, changed_pct = 0.0;
+	std::chrono::steady_clock::time_point last_session = std::chrono::steady_clock::now();
 	Image                   keep, out16;             // full res
 	Image                   proxy, nr, wdepth, wmv;  // working grid
 	vk::Extent2D            full {};
@@ -686,7 +698,7 @@ void FreeImage(GraphicContext& graphics, Image& img) {
 }
 
 vk::DescriptorType DescType(uint32_t i) {
-	if (i == 10) return vk::DescriptorType::eStorageBuffer;
+	if (i == 10 || i == 11) return vk::DescriptorType::eStorageBuffer;
 	if (i == 3 || i == 4 || i == 5 || i == 9) return vk::DescriptorType::eStorageImage;
 	return vk::DescriptorType::eCombinedImageSampler;
 }
@@ -747,6 +759,17 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	VmaAllocationCreateInfo info {};
 	info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 	if (vmaCreateBuffer(graphics.allocator, &buffer, &info, &g.one, &g.one_mem, nullptr) != VK_SUCCESS) return false;
+	{
+		VkBufferCreateInfo stats_buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		stats_buffer.size  = 16;
+		stats_buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo stats_info {};
+		stats_info.usage = VMA_MEMORY_USAGE_AUTO;
+		stats_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo mapped {};
+		if (vmaCreateBuffer(graphics.allocator, &stats_buffer, &stats_info, &g.stats, &g.stats_mem, &mapped) != VK_SUCCESS) return false;
+		g.stats_map = static_cast<uint32_t*>(mapped.pMappedData);
+	}
 	vk::QueryPoolCreateInfo query {};
 	query.queryType  = vk::QueryType::eTimestamp;
 	query.queryCount = Stamps * TimingEntries;
@@ -922,6 +945,53 @@ void ReadTiming(GraphicContext& graphics) {
 	}
 }
 
+std::mutex  g_status_mutex;
+std::string g_status;
+void SetStatus(std::string text) {
+	std::lock_guard lock(g_status_mutex);
+	g_status = std::move(text);
+}
+
+// (ds-pc-port40) Every 10 s: "DLSS 5: on, evaluate OK N frames, the model's edit X %" (from the GPU's running totals:
+// a few frames late, never waited for), or the NGX error; the same as the overlay's line.
+void SessionLine(GraphicContext& graphics, float strength) {
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g.last_session < std::chrono::seconds(10)) return;
+	g.last_session = now;
+	uint32_t cur[3] {};
+	if (g.stats_map != nullptr) {
+		(void)vmaInvalidateAllocation(graphics.allocator, g.stats_mem, 0, 16);
+		for (int i = 0; i < 3; ++i) cur[i] = reinterpret_cast<volatile uint32_t*>(g.stats_map)[i];
+	}
+	const uint32_t dsum = cur[0] - g.stats_last[0], dcount = cur[1] - g.stats_last[1], dchanged = cur[2] - g.stats_last[2];
+	for (int i = 0; i < 3; ++i) g.stats_last[i] = cur[i];
+	const uint64_t frames = g.eval_ok - g.eval_ok_logged;
+	g.eval_ok_logged      = g.eval_ok;
+	if (dcount > 0) {
+		g.edit_pct    = 100.0 * static_cast<double>(dsum) / (256.0 * static_cast<double>(dcount));
+		g.changed_pct = 100.0 * static_cast<double>(dchanged) / static_cast<double>(dcount);
+	}
+	char line[384] {};
+	if (frames > 0) {
+		std::snprintf(line, sizeof(line), "DLSS 5: on, evaluate OK %llu frames (%llu in all, %u failed), the model's edit %.2f%% mean, %.0f%% of the pixels changed > 1%%; strength %g, intensity %g, %s",
+		              static_cast<unsigned long long>(frames), static_cast<unsigned long long>(g.eval_ok), g.eval_failures, g.edit_pct < 0 ? 0.0 : g.edit_pct,
+		              g.changed_pct, static_cast<double>(strength), static_cast<double>(Steer().intensity), g_rt.version.c_str());
+		std::printf("%s%s\n", line,
+		            g.edit_pct >= 0 && g.edit_pct < 0.2 ? " -- the model returns its input almost unchanged: the picture cannot look different (an older nvngx_dlssnr.dll? raise Intensidad / DLSS 5 Fuerte)" : "");
+		char hud[160] {};
+		std::snprintf(hud, sizeof(hud), "DLSS 5 on  |  edit %.1f%%  |  %llu frames OK", g.edit_pct < 0 ? 0.0 : g.edit_pct, static_cast<unsigned long long>(g.eval_ok));
+		SetStatus(hud);
+	} else {
+		std::snprintf(line, sizeof(line), "DLSS 5: no evaluate in 10 s (%llu OK in all, %u failed, last NGX result 0x%08x)",
+		              static_cast<unsigned long long>(g.eval_ok), g.eval_failures, g.last_error);
+		std::printf("%s\n", line);
+		char hud[160] {};
+		std::snprintf(hud, sizeof(hud), "DLSS 5: NGX error 0x%08x", g.last_error);
+		SetStatus(g.last_error != 0 ? hud : "DLSS 5: idle");
+	}
+	std::fflush(stdout);
+}
+
 void Log(vk::Extent2D full) {
 	const auto now = std::chrono::steady_clock::now();
 	if (now - g.last_log < std::chrono::seconds(10) || g.n == 0) return;
@@ -1053,7 +1123,7 @@ static void StartupLine(const std::vector<vk::ExtensionProperties>* available) {
 	std::printf("DLSS-NR: start-up: KYTY_FOVEATED=%s KYTY_DLSS_NR=%s KYTY_DLSS_NR_PRESR=%s KYTY_DLSS_NR_STRENGTH=%s (%g) KYTY_DLSS_NR_UNSIGNED=%s KYTY_FOV_EDGE=%s KYTY_FOV_WIDTH=%s KYTY_FOV_HEIGHT=%s KYTY_FOV_FALLOFF=%s -> NR %s; "
 	            "%s; KYTY_UPSCALER=%s: the NR hook (after the upscaler on the PS5 Pro path) is %s; device: %s\n",
 	            env("KYTY_FOVEATED").c_str(), env("KYTY_DLSS_NR").c_str(), env("KYTY_DLSS_NR_PRESR").c_str(), env("KYTY_DLSS_NR_STRENGTH").c_str(),
-	            static_cast<double>(EnvF("KYTY_DLSS_NR_STRENGTH", 1.0f, 0.0f, 1.0f)), env("KYTY_DLSS_NR_UNSIGNED").c_str(), env("KYTY_FOV_EDGE").c_str(), env("KYTY_FOV_WIDTH").c_str(),
+	            static_cast<double>(EnvF("KYTY_DLSS_NR_STRENGTH", 1.0f, 0.0f, 2.0f)), env("KYTY_DLSS_NR_UNSIGNED").c_str(), env("KYTY_FOV_EDGE").c_str(), env("KYTY_FOV_WIDTH").c_str(),
 	            env("KYTY_FOV_HEIGHT").c_str(), env("KYTY_FOV_FALLOFF").c_str(),
 	            DlssNrWanted() ? (PreSr() ? "wanted, PreSR (render-res colour, before the upscaler)" : EnvOn("KYTY_FOVEATED") ? "wanted, foveated, after the upscaler" : "wanted, uniform, after the upscaler") : "off (neither switch is 1)", dll.c_str(),
 	            up.c_str(), reachable ? "reachable (it runs once the game's 3D view reaches the upscaler)"
@@ -1156,6 +1226,10 @@ static bool RunNr(vk::CommandBuffer command, const UpscaleInputs& inputs, const 
 		const float one[4] {1.0f, 1.0f, 1.0f, 1.0f};
 		command.updateBuffer(vk::Buffer(g.one), 0, sizeof(one), one);
 	}
+	if (!g.stats_ready) {
+		g.stats_ready = true;
+		command.fillBuffer(vk::Buffer(g.stats), 0, 16, 0u);
+	}
 	if (!pre) {
 		vk::ImageBlit blit {};
 		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, out.level, out.layer, 1};
@@ -1167,7 +1241,7 @@ static bool RunNr(vk::CommandBuffer command, const UpscaleInputs& inputs, const 
 	Barrier(command, vk::PipelineStageFlagBits2::eAllTransfer, vk::AccessFlagBits2::eTransferWrite,
 	        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 
-	static const float strength = EnvF("KYTY_DLSS_NR_STRENGTH", 1.0f, 0.0f, 1.0f);
+	static const float strength = EnvF("KYTY_DLSS_NR_STRENGTH", 1.0f, 0.0f, 2.0f);
 	static const bool  view     = EnvOn("KYTY_FOV_VIEW");
 	const bool         game_exposure = inputs.exposure_buffer != nullptr && inputs.exposure_range >= sizeof(float);
 	Push               push {};
@@ -1201,12 +1275,14 @@ static bool RunNr(vk::CommandBuffer command, const UpscaleInputs& inputs, const 
         const vk::DescriptorBufferInfo exp_info = game_exposure
                                                       ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
                                                       : vk::DescriptorBufferInfo {vk::Buffer(g.one), 0, 16};
+        const vk::DescriptorBufferInfo stats_info {vk::Buffer(g.stats), 0, 16};
         vk::WriteDescriptorSet writes[Bindings] {};
         for (uint32_t i = 0; i < Bindings; ++i) {
             writes[i].dstBinding      = i;
             writes[i].descriptorCount = 1;
             writes[i].descriptorType  = DescType(i);
             if (i == 10) writes[i].pBufferInfo = &exp_info;
+            else if (i == 11) writes[i].pBufferInfo = &stats_info;
             else writes[i].pImageInfo = &infos[i];
         }
         push.mode = mode;
@@ -1245,13 +1321,18 @@ static bool RunNr(vk::CommandBuffer command, const UpscaleInputs& inputs, const 
 	        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	if (timed) command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * Stamps + 2);
 	const bool evaluated = eval_result == NgxSuccess;
+	if (evaluated) ++g.eval_ok;
 	if (!evaluated) {
+		g.last_error = eval_result;
 		++g.eval_failures;
 		std::printf("DLSS-NR: evaluate returned 0x%08x%s (failure %u of 3)\n", eval_result, eval_result == 0xBAD0FFFFu ? " (it raised an exception)" : "",
 		            g.eval_failures);
 		std::fflush(stdout);
 		if (g.eval_failures >= 3) {
 			Say("DLSS-NR: the model refused 3 evaluations. NR off, the upscaler's picture as usual.");
+			char hud[96] {};
+			std::snprintf(hud, sizeof(hud), "DLSS 5 off: NGX error 0x%08x", eval_result);
+			SetStatus(hud);
 			g.disabled = true;
 		}
 	}
@@ -1272,6 +1353,9 @@ static bool RunNr(vk::CommandBuffer command, const UpscaleInputs& inputs, const 
 	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eAllTransfer,
 	        vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands,
 	        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eHost,
+	        vk::AccessFlagBits2::eHostRead);
+	SessionLine(*graphics, strength);
 	if (timed) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * Stamps + 3);
 		++g.written;
@@ -1311,6 +1395,11 @@ static void FirstReach(const char* where, const UpscaleImage& image) {
 	            DlssNrWanted() ? (g.disabled ? "wanted but off (see above)" : "wanted") : "off (KYTY_FOVEATED / KYTY_DLSS_NR not 1)",
 	            DlssNrWanted() ? (PreSr() ? ", PreSR: before the upscaler, on the render-res colour" : ", after the upscaler") : "");
 	std::fflush(stdout);
+}
+
+std::string DlssNrStatusLine() {
+	std::lock_guard lock(g_status_mutex);
+	return g_status;
 }
 
 bool DlssNrApply(vk::CommandBuffer command, const UpscaleInputs& inputs) {
