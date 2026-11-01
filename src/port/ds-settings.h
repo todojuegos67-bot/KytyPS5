@@ -186,6 +186,7 @@ struct Settings {
 	float       kbm_antidz = 0.15f;  // KYTY_KBM_ANTIDZ
 	std::string kbm_map;             // KYTY_KBM_MAP
 	std::string pad_map;             // KYTY_PAD_MAP
+	std::string game_settings;       // (ds-pc-port37) ajustes_juego: "gs_sun=3;gs_spot=1;..." (the launcher's "Ajustes del juego"; 0 / absent = the game's own)
 	int         kbm_camera = 10;     // (10-28) cp11_Setting_CameraSpeed with keyboard and mouse (5-15; the launcher's kbmcam2)
 	bool        kbm_warp = false;    // (10-28) Camara instantanea (frame warp): KYTY_KBM_WARP
 	bool        kbm_calibrate = false; // (10-28) the next start measures the camera into kbm_curve.txt (KYTY_KBM_CALIBRATE), once
@@ -235,6 +236,20 @@ bool LowRam(const Settings& settings, const PcInfo& pc);
 // "Bordes sombras" (KYTY_SHADOW_FILTER 1-3) changes the SPIR-V of the lighting shaders at translation: each level has a
 // cache of its own (level 0: the one before), so a precompile made at another level is not taken for this one's.
 std::string DriverCacheKey(const Settings& settings);
+// (ds-pc-port37) "Ajustes del juego", the emulator launcher's (Launcher-souls.ps1 $gameSettings): the engine's own convars,
+// each at the game's own value (0) or a level (1-5; on / off ones: 1 No, 2 Si). Their convars go in KYTY_GAME_CONVARS_EXTRA.
+struct GameSetting {
+	const char* id;
+	const char* section;
+	bool        onoff;
+	const char* name;
+	const char* levels[5]; // convars of level 1..5 (on / off: 1 and 2)
+	const char* tip;
+};
+const GameSetting* GameSettings(size_t* count);
+int  GameSettingLevel(const Settings& settings, const char* id);
+void SetGameSettingLevel(Settings* settings, const char* id, int level);
+std::string GameSettingsConvars(const Settings& settings);
 std::string ShadowFilterLevel(const Settings& settings); // "" (0) or "1".."3"
 
 // `title_id` from sce_sys/param.json (empty: unknown, the Demon's Souls engine settings still apply: this is its port).

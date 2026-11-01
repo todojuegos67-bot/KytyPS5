@@ -1584,6 +1584,30 @@ void Draw(float width, float height) {
 					CheckRow("Bloom", true, s.bloom, "Resplandor alrededor de las luces fuertes (Sí = como en PS5).");
 					CheckRow("Adaptación de la vista", true, s.eye_adapt, "La exposición se adapta al pasar de zonas oscuras a claras, como el ojo (Sí = como en PS5).");
 					ImGui::TextColored(kDim, "%s", "Son ajustes internos del juego: los lee al arrancar.");
+					// (ds-pc-port37) The emulator launcher's "Ajustes del juego": the engine's own convars, each at the game's own
+					// value (Predeterminado) or a level; they win over the rows above (KYTY_GAME_CONVARS_EXTRA, after them).
+					ImGui::Spacing();
+					if (ImGui::CollapsingHeader(I18n::T("Ajustes del juego"))) {
+						static const Choice levels[] = {{"0", "Predeterminado"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"}};
+						static const Choice onoff[]  = {{"0", "Predeterminado"}, {"1", "No"}, {"2", "Sí"}};
+						ImGui::TextWrapped("%s", I18n::T("Ajustes del propio juego. Predeterminado = como viene en PS5, sin tocar nada. Pasa el ratón por encima de cada uno para ver qué hace y lo que cuesta. Mandan sobre las filas de arriba."));
+						size_t      n   = 0;
+						const auto* all = GameSettings(&n);
+						const char* sec = "";
+						for (size_t i = 0; i < n; i++) {
+							const GameSetting& g = all[i];
+							if (std::strcmp(sec, g.section) != 0) {
+								sec = g.section;
+								ImGui::Spacing();
+								ImGui::TextColored(kGold, "%s", I18n::T(sec));
+							}
+							std::string v = std::to_string(GameSettingLevel(s, g.id));
+							ImGui::PushID(g.id);
+							if (ChoiceRow(g.name, true, g.onoff ? onoff : levels, g.onoff ? 3 : 6, v, g.tip)) SetGameSettingLevel(&s, g.id, std::atoi(v.c_str()));
+							ImGui::PopID();
+						}
+						if (ImGui::Button(I18n::T("Todo predeterminado"))) s.game_settings.clear();
+					}
 					break;
 				}
 				case 3: { // Ray tracing (ds-torch-1028's launcher rows, in its order; hardware RT only with the experimental switch)

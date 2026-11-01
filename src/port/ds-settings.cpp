@@ -300,6 +300,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	num("raton_antizona", s->kbm_antidz);
 	str("mapa_teclado", s->kbm_map);
 	str("mapa_mando", s->pad_map);
+	str("ajustes_juego", s->game_settings);
 	str("rt_antorchas", s->rt_lamps);
 	num("raton_velocidad_camara", s->kbm_camera);
 	s->kbm_camera = std::clamp(s->kbm_camera, 5, 15);
@@ -510,6 +511,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "mapa_teclado=" << s.kbm_map << "\n"
 	  << "; Mando remapeado: a=Cross;b=Circle;... (boton fisico de SDL = control de PS5; vacio = normal)\n"
 	  << "mapa_mando=" << s.pad_map << "\n"
+	  << "; Ajustes del juego (los del lanzador del emulador): gs_sun=3;gs_spot=1;... (0 o vacio = como viene el juego)\n"
+	  << "ajustes_juego=" << s.game_settings << "\n"
 	  << "; Velocidad de camara con raton (5-15; 10 = el maximo del menu del juego, 11-15 extra)\n"
 	  << "raton_velocidad_camara=" << s.kbm_camera << "\n"
 	  << "; Camara instantanea (frame warp): la imagen gira con el raton antes de que el juego dibuje\n"
@@ -543,6 +546,81 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	return std::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
+
+// (ds-pc-port37) Launcher-souls.ps1's $gameSettings, as it is (names, levels, convars and tips).
+const GameSetting kGameSettings[] = {
+	{"gs_sun", "Sombras", false, "Sombras del sol", {"r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=60;sunShadowCascadeDistance0=60;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=125;sunShadowCascadeDistance0=22;sunShadowCascadeDistance1=125;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;sunShadowCascadeDistance0=40;sunShadowCascadeDistance1=250;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;sunShadowCascadeDistance0=27;sunShadowCascadeDistance1=61;sunShadowCascadeDistance2=131;sunShadowCascadeDistance3=400;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;sunShadowCascadeDistance0=65;sunShadowCascadeDistance1=142;sunShadowCascadeDistance2=300;sunShadowCascadeDistance3=1000;sunShadowLightDistance=1000"},
+	 "Sombras del sol del juego: hasta donde llegan y en cuantas cascadas se reparten. Bajo 60 m (1 cascada), Medio 125 m (2), Alto 250 m (2, el valor de fabrica), Ultra 400 m (4), Extremo 1000 m (4, el maximo del juego). Cuesta GPU y CPU (las sombras son unos 2600 dibujados por frame); Extremo puede costar un 10-15 % de FPS. Manda sobre el desplegable Sombras."},
+	{"gs_spot", "Sombras", true, "Sombras de focos (antorchas)", {"r_enableSpotShadows=false", "r_enableSpotShadows=true", nullptr, nullptr, nullptr},
+	 "Sombras que proyectan antorchas, hogueras y otras luces (unas 7 por escena en 1-1). No: mas FPS, pero sin esas sombras. El juego no tiene ajuste de distancia ni de resolucion para ellas."},
+	{"gs_contact", "Sombras", false, "Sombras de contacto", {"r_contactShadowsEnabled=false", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.03", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.06", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.1", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.3;r_contactShadowsThickness=0.12;r_contactShadowsSoftness=0.2"},
+	 "Sombras de contacto del juego: sombras finas donde los objetos tocan el suelo y las paredes. Bajo: apagadas. Medio, Alto (de fabrica), Ultra y Extremo: alcance 0,03 / 0,06 / 0,10 / 0,30 (Extremo tambien mas gruesas y mas definidas). Cuesta poco; con mucho alcance pueden salir halos."},
+	{"gs_ambient", "Iluminacion", false, "Sombreado ambiental del juego", {"r_enableAmbientShadowing=false", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=50;r_ambientShadowCutoffFadeDistance=10", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=100;r_ambientShadowCutoffFadeDistance=20", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=250;r_ambientShadowCutoffFadeDistance=40", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=1000;r_ambientShadowCutoffFadeDistance=100"},
+	 "Sombreado ambiental del juego: oscurece bajo personajes y objetos con la luz del entorno. Bajo: apagado (mas FPS). Medio 50 m, Alto 100 m (de fabrica), Ultra 250 m, Extremo 1000 m (el maximo): hasta donde se dibuja. Mas distancia = mas GPU en zonas abiertas."},
+	{"gs_gi", "Iluminacion", false, "Iluminacion global", {"GIEnableMultiBounce=false;GIUpdateNumIteraions=1;r_iblResolution=HalfResX", "GIEnableMultiBounce=true;GIUpdateNumIteraions=1;r_iblResolution=HalfResX", "GIEnableMultiBounce=true;GIUpdateNumIteraions=1;r_iblResolution=Full", "GIEnableMultiBounce=true;GIUpdateNumIteraions=2;GILightCutoffIntensity=0.0005;r_iblResolution=Full", "GIEnableMultiBounce=true;GIUpdateNumIteraions=4;GILightCutoffIntensity=0.0001;GILightMinSubtendedAngle=3;r_iblResolution=Full"},
+	 "Iluminacion global del juego (luz que rebota). Bajo: sin rebote multiple y reflejos de entorno a media resolucion. Medio: como el modo rendimiento de PS5. Alto: reflejos de entorno completos (modo cine). Ultra y Extremo: 2 o 4 pasadas de actualizacion por frame y cuentan luces mas debiles y pequenas. Cuesta GPU (Extremo bastante). El modo del juego puede volver a fijar los reflejos de entorno al cargar."},
+	{"gs_dist", "Distancia", false, "Distancia de dibujado", {"r_forceViewportHeightForPixelSizeCalc=480;r_fadeOutInstanceOverDistance=6", "r_forceViewportHeightForPixelSizeCalc=720;r_fadeOutInstanceOverDistance=10", "r_forceViewportHeightForPixelSizeCalc=1080;r_fadeOutInstanceOverDistance=15", "r_forceViewportHeightForPixelSizeCalc=1440;r_fadeOutInstanceOverDistance=35", "r_forceViewportHeightForPixelSizeCalc=2160;r_fadeOutInstanceOverDistance=60"},
+	 "Distancia de dibujado: el detalle de los modelos (LOD) se elige como para una imagen de 480 / 720 / 1080 (de fabrica) / 1440 / 2160 lineas, y el fundido de los objetos lejanos pasa a 6 / 10 / 15 / 35 / 60. No cambia la resolucion. Bajo y Medio ayudan si va justo el procesador; Ultra y Extremo cuestan CPU y GPU. Manda sobre Distancia y Object Fade."},
+	{"gs_ssr", "Efectos", false, "Reflejos del juego (SSR)", {"r_ssrEnableOverrides=true;r_ssrMaxIterations=32;r_ssrMaxRayLength=300;r_ssrCutoffDistance=250", "r_ssrEnableOverrides=true;r_ssrMaxIterations=64;r_ssrMaxRayLength=600;r_ssrCutoffDistance=500", "r_ssrEnableOverrides=true;r_ssrMaxIterations=128;r_ssrMaxRayLength=1000;r_ssrCutoffDistance=1000", "r_ssrEnableOverrides=true;r_ssrMaxIterations=192;r_ssrMaxRayLength=1400;r_ssrCutoffDistance=1500", "r_ssrEnableOverrides=true;r_ssrMaxIterations=256;r_ssrMaxRayLength=1600;r_ssrCutoffDistance=5000"},
+	 "Reflejos en pantalla del juego (agua, charcos, suelos mojados). Pasos / largo del rayo / distancia: Bajo 32 / 300 / 250, Medio 64 / 600 / 500, Alto 128 / 1000 / 1000 (de fabrica), Ultra 192 / 1400 / 1500, Extremo 256 / 1600 / 5000 (el maximo). Cuesta GPU, sobre todo con lluvia. Manda sobre Reflections."},
+	{"gs_tess", "Efectos", false, "Teselado / relieve", {"r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0", "r_tessellationDensity=8.0;r_tessellationSmallestEdgeLength=0.04;r_tessellationFadeOutStart=12.0;r_tessellationFadeOutRange=3.0", "r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0", "r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0", "r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.01;r_tessellationFadeOutStart=40.0;r_tessellationFadeOutRange=8.0"},
+	 "Teselado: relieve de verdad en suelos de piedra, barro y paredes. Bajo: menos relieve y solo de cerca. Medio: modo rendimiento de PS5. Alto: modo cine de PS5. Ultra y Extremo: mas denso y hasta 25 / 40 m. Cuesta GPU. Ojo: el juego vuelve a poner el de su modo al cargar su configuracion; si no ves cambio, es eso."},
+	{"gs_fog", "Efectos", true, "Niebla volumetrica", {"fog_enable=false", "fog_enable=true", nullptr, nullptr, nullptr},
+	 "Niebla volumetrica: la bruma iluminada por el sol y las antorchas. No: unos 4-5 % mas FPS, pero cambia mucho el aspecto del juego."},
+	{"gs_fogden", "Efectos", false, "Densidad de niebla", {"fog_density=0.6", "fog_density=1.0", "fog_density=1.5", "fog_density=2.5", "fog_density=4.0"},
+	 "Cuanta niebla hay en el aire (fog_density del juego, 1.0 = como viene). Bajo 0.6, Medio 1.0, Alto 1.5, Ultra 2.5, Extremo 4.0. Mas niebla = mas ambiente y rayos de luz mas visibles. Casi no cuesta."},
+	{"gs_fogpart", "Efectos", true, "Niebla con particulas", {"fog_enableParticles=false", "fog_enableParticles=true", nullptr, nullptr, nullptr},
+	 "Particulas dentro de la niebla volumetrica (motas y polvo en el aire, sobre todo con luz). Si: mas ambiente, cuesta poco. Necesita la niebla volumetrica activa."},
+	{"gs_decal", "Efectos", true, "Calcomanias (sangre, suciedad)", {"r_projectedDecalEnable=false", "r_projectedDecalEnable=true", nullptr, nullptr, nullptr},
+	 "Calcomanias proyectadas: sangre, manchas, suciedad y marcas en el suelo y las paredes. No: casi la mitad de dibujados menos en 1-1 y bastantes mas FPS, pero se pierde mucho detalle."},
+	{"gs_mblur", "Postprocesado", true, "Desenfoque de movimiento", {"r_motionBlurEnable=false", "r_motionBlurEnable=true", nullptr, nullptr, nullptr},
+	 "Desenfoque de movimiento del juego al girar la camara. No: imagen mas nitida en movimiento. Casi no cuesta. Manda sobre la casilla Motion Blur."},
+	{"gs_dof", "Postprocesado", true, "Profundidad de campo", {"r_dofEnable=false", "r_dofEnable=true", nullptr, nullptr, nullptr},
+	 "Profundidad de campo: desenfoque del fondo en cinematicas y menus. No: todo enfocado; ahorra un poco. Manda sobre la casilla Depth of Field."},
+	{"gs_vignette", "Postprocesado", true, "Vineta (bordes oscuros)", {"r_vignetteEnable=false", "r_vignetteEnable=true", nullptr, nullptr, nullptr},
+	 "Vineta: oscurecimiento de las esquinas de la imagen. No cuesta FPS. Manda sobre la casilla Vignette."},
+	{"gs_bloom", "Postprocesado", true, "Bloom (resplandor)", {"r_bloomEnable=false", "r_bloomEnable=true", nullptr, nullptr, nullptr},
+	 "Bloom: resplandor alrededor de las luces y las zonas brillantes. Cuesta muy poco. Manda sobre la casilla Bloom."},
+	{"gs_eyeadapt", "Postprocesado", true, "Adaptacion de la vista", {"r_exposureEyeAdaptEnable=false", "r_exposureEyeAdaptEnable=true", nullptr, nullptr, nullptr},
+	 "Adaptacion de la vista: la exposicion cambia poco a poco al pasar de zonas oscuras a claras. No: exposicion fija. No cuesta FPS. Manda sobre la casilla Eye Adaptation."},
+	{"gs_aasharp", "Postprocesado", false, "Nitidez del antialiasing", {"r_aaSharpenStrengthStatic=1.2;r_aaSharpenStrengthMotion=1.2;r_aaHistorySharpeningStrength=0.5", "r_aaSharpenStrengthStatic=2.0;r_aaSharpenStrengthMotion=2.0;r_aaHistorySharpeningStrength=0.7", "r_aaSharpenStrengthStatic=2.5;r_aaSharpenStrengthMotion=2.5;r_aaHistorySharpeningStrength=0.8", "r_aaSharpenStrengthStatic=3.5;r_aaSharpenStrengthMotion=3.5;r_aaHistorySharpeningStrength=0.9", "r_aaSharpenStrengthStatic=5.0;r_aaSharpenStrengthMotion=5.0;r_aaHistorySharpeningStrength=1.0"},
+	 "Nitidez del antialiasing temporal del juego: Bajo 1,2, Medio 2,0, Alto 2,5 (de fabrica), Ultra 3,5, Extremo 5,0 (la del historial de 0,5 a 1,0). No cuesta FPS; mucha puede marcar bordes y brillos. Manda sobre AA Sharpness."},
+};
+
+const GameSetting* GameSettings(size_t* count) {
+	*count = std::size(kGameSettings);
+	return kGameSettings;
+}
+
+int GameSettingLevel(const Settings& s, const char* id) {
+	const std::string key = std::string(id) + "=";
+	size_t at = 0;
+	while (at <= s.game_settings.size()) {
+		const size_t end  = std::min(s.game_settings.find(';', at), s.game_settings.size());
+		const auto   item = s.game_settings.substr(at, end - at);
+		at                = end + 1;
+		if (item.rfind(key, 0) == 0) return std::clamp(std::atoi(item.c_str() + key.size()), 0, 5);
+	}
+	return 0;
+}
+
+void SetGameSettingLevel(Settings* s, const char* id, int level) {
+	std::string out;
+	for (const auto& g: kGameSettings) {
+		const int v = std::strcmp(g.id, id) == 0 ? level : GameSettingLevel(*s, g.id);
+		if (v > 0) out += (out.empty() ? "" : ";") + std::string(g.id) + "=" + std::to_string(v);
+	}
+	s->game_settings = out;
+}
+
+std::string GameSettingsConvars(const Settings& s) {
+	std::string out;
+	for (const auto& g: kGameSettings) {
+		const int v = GameSettingLevel(s, g.id);
+		if (v > 0 && v <= 5 && g.levels[v - 1] != nullptr) out += (out.empty() ? "" : ";") + std::string(g.levels[v - 1]);
+	}
+	return out;
+}
 
 std::string ShadowFilterLevel(const Settings& s) {
 	return s.shadow_edges == "1" || s.shadow_edges == "2" || s.shadow_edges == "3" ? s.shadow_edges : std::string();
@@ -969,6 +1047,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			    {"extremo", "r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.01;r_tessellationFadeOutStart=40.0;r_tessellationFadeOutRange=8.0"}};
 			std::string x = std::string("r_iblResolution=") + (ibl == "completa" ? "Full" : "HalfResX");
 			if (auto it = tess_cv.find(tess); it != tess_cv.end()) x += ";" + it->second;
+			// (ds-pc-port37) The "Ajustes del juego" next (the launcher's order: IBL / tessellation, its game settings, the user's).
+			if (const std::string g = GameSettingsConvars(s); !g.empty()) x += ";" + g;
 			if (const std::string old = env.Get("KYTY_GAME_CONVARS_EXTRA"); !old.empty()) x += ";" + old;
 			env.Set("KYTY_GAME_CONVARS_EXTRA", x);
 		}
@@ -1098,7 +1178,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.motes != n.motes || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
 	       l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 || l.texture_sharpness != n.texture_sharpness ||
 	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
-	       l.pad_map != n.pad_map || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
+	       l.pad_map != n.pad_map || l.game_settings != n.game_settings || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.extra != n.extra ||
 	       l.rt_ss_refl != n.rt_ss_refl || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
