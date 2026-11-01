@@ -1089,6 +1089,12 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// the emulator's own defaults, no shader gate, and no SPIR-V disk store (the emulator has none: off). The warmup on 16
 	// threads, launch.json's KYTY_SHADER_WARMUP_THREADS.
 	env.Set("KYTY_SPIRV_DISK", "0");
+	// (ds-pc-port47) Root cause of the port-only hitches: ds-perf-1031's V-Cache pin (not in the emulator, de604751) set
+	// KYTY_RENDER_CPUS to CPUs 2-15 of the 16 the port's process ran on, and every background thread keeps off those
+	// (AvoidCpuList): the shader prefetch, warmup and every async pipeline worker squeezed onto CPUs 0-1 (port logs:
+	// 8 pipelines made of the static store ending together after 2.28 s, "static store hit" 120-2300 ms; the emulator:
+	// none). Off, as the emulator.
+	env.Default("KYTY_VCACHE_PIN", "0");
 	env.Set("KYTY_SHADER_GATE", "");
 	env.Set("KYTY_SCENE_WARMUP", "");
 	env.Set("KYTY_STATIC_WARMUP", "");
