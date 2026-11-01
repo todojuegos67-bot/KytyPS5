@@ -97,6 +97,8 @@ struct Inputs {
     float view_to_clip[16]{};
     float clip_to_prev_clip[16]{};
     uint64_t lat_index = 0; // BB::AntiLag's frame index (0: none)
+    uint32_t sl_frame = 0;  // Streamline frame index of this frame's DLSS evaluate (0: none)
+    const char* hudless_source = "none"; // where the HUD-less image came from (log)
 };
 // FG wants the inputs captured (any method asked and its back end ready).
 bool WantInputs();

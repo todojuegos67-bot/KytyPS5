@@ -112,6 +112,8 @@ struct BBVk {
     BB::Upscale::Plan fg_plan{};
     OwnImage fg_present; // the composite without the HUD (bb_hud.comp flag 4)
     bool fg_present_ready = false;
+    bool fg_raw_hudless_ready = false; // BBHudlessCopy ran this frame (the in-place path)
+    u64 fg_hudless_frames = 0, fg_frames = 0;
     struct FgSlot {
         OwnImage depth, mv;
     };
@@ -1444,11 +1446,13 @@ void DepthBarrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout,
 } // namespace
 
 bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
-                                   vk::ImageView& hudless_view) {
+                                   vk::ImageView& hudless_view, vk::Format view_format) {
     out = {};
     hudless_view = vk::ImageView{};
     const bool hudless_ready = g_bb.fg_present_ready;
+    const bool raw_ready = g_bb.fg_raw_hudless_ready;
     g_bb.fg_present_ready = false;
+    g_bb.fg_raw_hudless_ready = false;
     if (!g_bb.fg_upscaled || !bb_gb_depth_valid || !g_bb.init || !g_bb.mv.image) {
         return false;
     }
@@ -1520,8 +1524,34 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     std::copy(std::begin(plan.view_to_clip), std::end(plan.view_to_clip), out.view_to_clip);
     std::copy(std::begin(plan.clip_to_prev_clip), std::end(plan.clip_to_prev_clip),
               out.clip_to_prev_clip);
+    out.sl_frame =
+        BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ? BB::SR::Dlss::LastFrameIndex() : 0;
     if (hudless_ready && g_bb.fg_present.image) {
+        // The window-size path: the upscaled image with no HUD added (bb_hud.comp flag 4).
         hudless_view = g_bb.fg_present.view;
+        out.hudless_source = "upscaled image before the HUD";
+    } else if (raw_ready && g_bb.hudless.image && g_bb.hudless.format == view_format) {
+        // The in-place path: the presented image copied right before its first HUD draw.
+        hudless_view = g_bb.hudless.view;
+        out.hudless_source = "presented image before its first HUD draw";
+    } else if (raw_ready && g_bb.hudless.image) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            BB::FG::Printf("Frame generation: the HUD-less copy is %s, the presenter reads %s: "
+                           "no HUD-less image",
+                           vk::to_string(g_bb.hudless.format).c_str(),
+                           vk::to_string(view_format).c_str());
+        }
+    }
+    ++g_bb.fg_frames;
+    if (hudless_view) ++g_bb.fg_hudless_frames;
+    if (g_bb.fg_frames % 600 == 1) {
+        BB::FG::Printf("[fg] HUD-less self-check: %llu of %llu 3D frames had an image without "
+                       "the HUD (%s), camera %s",
+                       static_cast<unsigned long long>(g_bb.fg_hudless_frames),
+                       static_cast<unsigned long long>(g_bb.fg_frames), out.hudless_source,
+                       plan.camera_valid ? "valid" : "INVALID");
     }
     return out.valid;
 }
@@ -1572,6 +1602,7 @@ void Rasterizer::BBHudlessCopy(VideoCore::Image& flip) {
     Barrier(cmd, g_bb.hudless, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    g_bb.fg_raw_hudless_ready = true;
     BB::Upscale::OnHudlessCopied();
 }
 

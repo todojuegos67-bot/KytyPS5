@@ -33,7 +33,7 @@ $script:defaults = [ordered]@{
 	game = ''; emu = ''; userdir = ''
 	winres = 'auto'; intres = '1920x1080'; fsmode = '1'; present = '1'; fps = '1'; patches = '1'; useupdate = '1'
 	hdr = '0'; showfps = '0'; metricas = '0'
-	upscaler = '0'; upmode = '1'; sharp = '75'; framegen = '0'
+	upscaler = '0'; upmode = '1'; sharp = '75'; framegen = '0'; bbfg = '0'; antilag = '0'; reflex = '1'
 	q_shadows = '0'; q_ao = '0'; q_fog = '0'; q_aniso = '0'; q_ca = '0'; q_blur = '0'; q_grain = '0'
 	input = '0'; motion = '0'; bginput = '0'
 	ram16 = '0'; experimental = '0'; modo = '4'; safemode = '1'; soundfix = '1'
@@ -444,7 +444,19 @@ foreach ($un in @(@('DLSS', 'dlss'), @('FSR 4', 'fsr4'), @('FSR 3.1', 'fsr3'), @
 }
 $script:upModes = @((T 'Calidad nativa (AA)' 'Native AA'), (T 'Calidad' 'Quality'), (T 'Equilibrado' 'Balanced'), (T 'Rendimiento' 'Performance'), (T 'Ultra rendimiento' 'Ultra performance'))
 $script:upModeKeys = @('native', 'quality', 'balanced', 'performance', 'ultraperf')
-$script:fgList = @((T 'Desactivado' 'Off'), (T 'AMD FSR 3 x2  (próximamente)' 'AMD FSR 3 x2  (coming soon)'))
+# (bb-launcher-022) Frame generation como en Demon's Souls. [1] = BB_FG (el emulador lo hace en bb-fg-022; hasta entonces solo se pasa la variable).
+$script:fgModes = @(
+	@((T 'Desactivado' 'Off'), 'off'),
+	@('AMD FSR 3 x2', 'amd-x2'),
+	@((T 'AMD FSR 3 dinámico' 'AMD FSR 3 dynamic'), 'amd-dyn'),
+	@('NVIDIA DLSS-G x2', 'dlss-x2'),
+	@('NVIDIA DLSS-G x3', 'dlss-x3'),
+	@('NVIDIA DLSS-G x4', 'dlss-x4'),
+	@((T 'NVIDIA DLSS-G dinámico' 'NVIDIA DLSS-G dynamic'), 'dlss-dyn'),
+	@('AMD FSR 3 x3', 'amd-x3'),  # (bb-fg-022) al final: bbfg 0-6 siguen siendo los mismos
+	@('AMD FSR 3 x4', 'amd-x4')
+)
+$script:fgList = @($script:fgModes | ForEach-Object { $_[0] })
 $script:quality = @(
 	# clave ini, texto, opciones, variable BB_*, patron de parche de shadPS4 (si existe, la opcion es real)
 	@('q_shadows', (T 'Sombras' 'Shadows'), @((T 'Como PS4' 'PS4'), (T 'Altas' 'High'), (T 'Ultra' 'Ultra')), 'BB_SHADOWS', ''),
@@ -461,10 +473,10 @@ $script:quality = @(
 # reescalado (indice de $upscalers), modo de reescalado (indice de $upModes), nitidez, calidad (sombras, AO, niebla, aniso).
 # Hoy shadPS4 hace: resolucion (config.toml), 30/60 con el parche. FG y el tope de 45 son del emulador propio (proximamente).
 $script:modes = @(
-	@('ligero',      (T 'Ligero: 30 FPS x2 = 60, 1080p' 'Light: 30 FPS x2 = 60, 1080p'),            '30', 'fsr3-x2', 60,  '1920x1080', 0, 1, 0, 75, @(0, 0, 0, 0)),
-	@('equilibrado', (T 'Equilibrado: 45 FPS x2 = 90, 1440p' 'Balanced: 45 FPS x2 = 90, 1440p'),     '45', 'fsr3-x2', 90,  '2560x1440', 1, 1, 1, 75, @(1, 0, 0, 1)),
-	@('ultra',       (T 'Ultra: 60 FPS x2 = 120, 1440p' 'Ultra: 60 FPS x2 = 120, 1440p'),           '60', 'fsr3-x2', 120, '2560x1440', 1, 1, 1, 75, @(2, 1, 1, 2)),
-	@('extremo',     (T 'Extremo: 60 FPS x2 = 120, 4K nativo' 'Extreme: 60 FPS x2 = 120, native 4K'), '60', 'fsr3-x2', 120, '3840x2160', 1, 0, 0, 50, @(2, 1, 1, 2)),
+	@('ligero',      (T 'Ligero: 30 FPS x2 = 60, 1080p' 'Light: 30 FPS x2 = 60, 1080p'),            '30', 'amd-x2', 60,  '1920x1080', 0, 1, 0, 75, @(0, 0, 0, 0)),
+	@('equilibrado', (T 'Equilibrado: 45 FPS x2 = 90, 1440p' 'Balanced: 45 FPS x2 = 90, 1440p'),     '45', 'amd-x2', 90,  '2560x1440', 1, 1, 1, 75, @(1, 0, 0, 1)),
+	@('ultra',       (T 'Ultra: 60 FPS x2 = 120, 1440p' 'Ultra: 60 FPS x2 = 120, 1440p'),           '60', 'amd-x2', 120, '2560x1440', 1, 1, 1, 75, @(2, 1, 1, 2)),
+	@('extremo',     (T 'Extremo: 60 FPS x2 = 120, 4K nativo' 'Extreme: 60 FPS x2 = 120, native 4K'), '60', 'amd-x2', 120, '3840x2160', 1, 0, 0, 50, @(2, 1, 1, 2)),
 	@('personalizado', (T 'Personalizado (lo que elijas)' 'Custom (your choice)'), '', '', 0, '', -1, -1, -1, -1, $null)
 )
 # Requisitos de cada modo: PENDIENTE (los dara el dueno). Texto vacio = "pendiente".
@@ -479,11 +491,40 @@ function Get-ModeGameSettings {
 	return (($gs.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';')
 }
 function Get-ScreenRes {
+	# (bb-fg-022) El modo fisico del monitor (EnumDisplaySettings), no los limites de WinForms: con la escala
+	# de Windows al 150 % el lanzador (no consciente de DPI) veia 1707x960 en un monitor 2560x1440.
+	try {
+		if (-not ('BbDisp.Native' -as [type])) {
+			Add-Type -Namespace BbDisp -Name Native -MemberDefinition '[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public struct DEVMODE { [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName; public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra; public int dmFields; public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput; public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate; [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName; public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight; public int dmDisplayFlags; public int dmDisplayFrequency; }
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);' -ErrorAction Stop
+		}
+		$dm = New-Object BbDisp.Native+DEVMODE
+		$dm.dmSize = [int16][System.Runtime.InteropServices.Marshal]::SizeOf($dm)
+		if ([BbDisp.Native]::EnumDisplaySettings($null, -1, [ref]$dm) -and $dm.dmPelsWidth -gt 0) { return "$($dm.dmPelsWidth)x$($dm.dmPelsHeight)" }
+	} catch { }
 	try { $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; return "$($b.Width)x$($b.Height)" } catch { return '1920x1080' }
 }
 function Split-Res([string]$r) { if ($r -match '^(\d+)\s*x\s*(\d+)$') { return @([int]$Matches[1], [int]$Matches[2]) }; return @(1920, 1080) }
 
 # ---------------------------------------------------------------- variables para el emulador propio (BB_*)
+# (bb-launcher-022) Frame generation, Anti-Lag / Reflex y nitidez (0-1) para todos los reescaladores.
+function Get-FgKey { $i = 0; [void][int]::TryParse("$($script:S.bbfg)", [ref]$i); return $script:fgModes[[math]::Max(0, [math]::Min($i, $script:fgModes.Count - 1))][1] }
+function Get-SharpText { $v = 0; [void][int]::TryParse("$($script:S.sharp)", [ref]$v); return ([double][math]::Max(0, [math]::Min(100, $v)) / 100).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture) }
+# Nitidez EN VIVO: el emulador lee BB_UPSCALE_SHARPNESS al arrancar y puede releer este archivo (BB_UPSCALE_SHARPNESS_FILE)
+# mientras juegas; el lanzador lo reescribe cada vez que cambias la Nitidez.
+$script:sharpFile = Join-Path $root 'bb-live-sharpness.txt'
+function Write-SharpLive { try { [IO.File]::WriteAllText($script:sharpFile, "BB_UPSCALE_SHARPNESS=$(Get-SharpText)`r`n", $utf8NoBom) } catch { } }
+function Get-FgEnv {
+	$e = [ordered]@{}
+	$fg = Get-FgKey; $e['BB_FG'] = $fg
+	$dl = ($fg -like 'dlss*')
+	$al = 0; [void][int]::TryParse("$($script:S.antilag)", [ref]$al); $rx = 0; [void][int]::TryParse("$($script:S.reflex)", [ref]$rx)
+	$e['BB_ANTILAG'] = $(if (-not $dl -and $al -gt 0) { '1' } else { '0' })
+	$e['BB_REFLEX'] = $(if ($dl) { "$([math]::Max(0, [math]::Min($rx, 2)))" } else { '0' })
+	$e['BB_UPSCALE_SHARPNESS'] = Get-SharpText
+	$e['BB_UPSCALE_SHARPNESS_FILE'] = $script:sharpFile
+	return $e
+}
 function Get-BbEnv {
 	$e = [ordered]@{}
 	$up = $script:upscalers[[math]::Min([int]$script:S.upscaler, $script:upscalers.Count - 1)]
@@ -492,7 +533,8 @@ function Get-BbEnv {
 	$e['BB_UPSCALE_SHARPNESS'] = ([double]$script:S.sharp / 100).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
 	$m = Get-Mode
 	$e['BB_MODE'] = $m[0]
-	$e['BB_FG'] = $(if ($m[3]) { $m[3] } elseif ($script:S.framegen -eq '1') { 'fsr3-x2' } else { 'off' })
+	foreach ($kv in @((Get-FgEnv).GetEnumerator())) { $e[$kv.Key] = $kv.Value }  # (bb-launcher-022) BB_FG, BB_ANTILAG, BB_REFLEX, nitidez
+	Write-SharpLive
 	$e['BB_FPS_LIMIT'] = @('30', '60', 'unlocked')[[math]::Min([int]$script:S.fps, 2)]
 	$e['BB_FPS_CAP'] = $(if ($m[2]) { $m[2] } else { @('30', '60', '0')[[math]::Min([int]$script:S.fps, 2)] })
 	$gs = Get-ModeGameSettings; if ($gs) { $e['BB_GAME_SETTINGS'] = $gs }
@@ -612,6 +654,12 @@ function Start-Game {
 			Set-ResolutionPatch $userDir $upRes
 			Write-Log "Reescalado: $upKey $($env:BB_UPSCALE_MODE) con $upExe (interna $upRes)"
 		}
+		# (bb-launcher-022) Frame generation + Anti-Lag/Reflex + nitidez (todos los reescaladores) como variables BB_*.
+		$fge = Get-FgEnv
+		if ($fge['BB_FG'] -ne 'off' -and $emu -ne $upExe -and (Test-Path -LiteralPath $upExe)) { $emu = $upExe; Write-Log "Frame generation $($fge['BB_FG']): con $upExe" }
+		foreach ($k in $fge.Keys) { Set-Item "Env:$k" $fge[$k] }
+		Write-SharpLive
+		Write-Log "Variables: $(($fge.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')"
 		$fpsLog = Join-Path $root 'logs\bb-fps.log'; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $fpsLog) | Out-Null; $env:BB_METRICS_OUT = $fpsLog
 		$eargs = @('-g', ('"' + $eboot + '"'))
 		Write-Log "Modo seguro: sin cambios. Arranque: `"$emu`" $($eargs -join ' ') (trabajo: $workDir)"
@@ -664,6 +712,7 @@ function Start-Game {
 # Metricas en pantalla (metricas-bb.ps1): solo lee, asi que funciona tambien en modo seguro. Se cierra sola cuando
 # termina ese PID de shadPS4.
 function Start-Metrics($p, [string]$userDir) {
+	if ($p) { $script:gameProc = $p }
 	if ($script:S.metricas -ne '1' -or -not $p) { return }
 	$met = Join-Path $root 'metricas-bb.ps1'
 	if (-not (Test-Path -LiteralPath $met)) { Write-Log 'Metricas: falta metricas-bb.ps1 junto al lanzador'; return }
@@ -917,6 +966,12 @@ if ($script:S['upver'] -ne '2') {
 	$script:S.upscaler = "$uo"; $script:S['upver'] = '2'
 	if (Test-Path -LiteralPath $iniFile) { Save-Settings }
 }
+# (bb-launcher-022) framegen=1 de antes (FSR 3 x2) pasa a bbfg=1 (AMD x2). Una sola vez (fgver=1); framegen se sigue guardando.
+if ($script:S['fgver'] -ne '1') {
+	if ($script:S.framegen -eq '1' -and $script:S.bbfg -eq '0') { $script:S.bbfg = '1' }
+	$script:S['fgver'] = '1'
+	if (Test-Path -LiteralPath $iniFile) { Save-Settings }
+}
 Write-Log "Lanzador abierto (v1, idioma $Lang, PowerShell $($PSVersionTable.PSVersion))"
 if ($NoUi) { return }
 Add-Type -AssemblyName System.Windows.Forms
@@ -951,10 +1006,10 @@ function Set-DoubleBuffer($c) { try { $c.GetType().GetProperty('DoubleBuffered',
 Set-DoubleBuffer $form
 $form.SuspendLayout()
 $form.Text = 'Bloodborne'
-$form.FormBorderStyle = 'None'; $form.StartPosition = 'Manual'; $form.Bounds = $scr
+$form.FormBorderStyle = 'None'; $form.StartPosition = 'Manual'; $form.Bounds = $scr; $form.MaximizeBox = $false
 $form.KeyPreview = $true
 $form.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $form.Close() } })
-$form.BackColor = [System.Drawing.Color]::FromArgb(10, 9, 12)
+$form.BackColor = [System.Drawing.Color]::FromArgb(14, 16, 22)
 $fondo = $null
 foreach ($c in 'fondo-bloodborne2.jpg', 'fondo-bloodborne2.png', 'fondo-bloodborne.jpg', 'fondo-bloodborne.png') { $p = Join-Path $root $c; if (Test-Path -LiteralPath $p) { $fondo = $p; break } }
 if ($fondo) {
@@ -973,19 +1028,27 @@ if ($fondo) {
 } else { Write-Log 'Sin fondo (fondo-bloodborne2.png no esta junto al lanzador)' }
 if ($script:S.emu -and (Test-Path -LiteralPath $script:S.emu)) { try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($script:S.emu) } catch { } }
 
-# Tema como el lanzador de Demon's Souls: paneles oscuros, titulos dorados, texto tinta (Segoe UI, ClearType).
-$bone   = [System.Drawing.Color]::FromArgb(222, 196, 140)
-$ink    = [System.Drawing.Color]::FromArgb(236, 232, 224)
-$dim    = [System.Drawing.Color]::FromArgb(165, 160, 150)
-$blood  = [System.Drawing.Color]::FromArgb(176, 140, 70)
-$field  = [System.Drawing.Color]::FromArgb(24, 26, 34)
+# ---------------------------------------------------------------- tema (bb-launcher-022: igual que el lanzador de Demon's Souls)
+# Panel derecho semitransparente de 880 con dos columnas de apartados (GroupBox, titulo dorado), JUGAR grande arriba a la
+# izquierda y Precompilar / Actualizar / Settings / Salir a su lado; TU EQUIPO llena la columna derecha; Trofeos y la
+# version abajo a la izquierda. Juego, emulador, parches y controles van en la ventana Settings (como en Demon's Souls).
+$gold    = [System.Drawing.Color]::FromArgb(222, 196, 140)
+$bone    = $gold
+$ink     = [System.Drawing.Color]::FromArgb(236, 232, 224)
+$dim     = [System.Drawing.Color]::FromArgb(165, 160, 150)
+$blood   = [System.Drawing.Color]::FromArgb(176, 140, 70)
+$field   = [System.Drawing.Color]::FromArgb(24, 26, 34)
 $grpBack = [System.Drawing.Color]::FromArgb(18, 20, 26)
-$fTitle = New-Object System.Drawing.Font('Segoe UI Semibold', 11, [System.Drawing.FontStyle]::Bold)
-$fText  = New-Object System.Drawing.Font('Segoe UI', 11)
+$panelBack = [System.Drawing.Color]::FromArgb(170, 8, 10, 14)
+$buttonFont = New-Object System.Drawing.Font('Segoe UI Semibold', 15, [System.Drawing.FontStyle]::Bold)
+$smallFont  = New-Object System.Drawing.Font('Segoe UI', 11)
+$boldSmall  = New-Object System.Drawing.Font('Segoe UI Semibold', 11, [System.Drawing.FontStyle]::Bold)
+$tinyFont   = New-Object System.Drawing.Font('Segoe UI', 9)
+$fText  = $smallFont
 $fSmall = New-Object System.Drawing.Font('Segoe UI', 10)
 $fBtn   = New-Object System.Drawing.Font('Segoe UI Semibold', 11, [System.Drawing.FontStyle]::Bold)
-$fBar   = New-Object System.Drawing.Font('Segoe UI Semibold', 15, [System.Drawing.FontStyle]::Bold)
-$tips = New-Object System.Windows.Forms.ToolTip; $tips.AutoPopDelay = 20000
+$fBar   = New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Bold)
+$tips = New-Object System.Windows.Forms.ToolTip; $tips.AutoPopDelay = 20000; $tips.InitialDelay = 400; $tips.ReshowDelay = 100
 
 function New-Label([string]$text, $x, $y, $w, $h = 24, $color = $ink, $font = $fText) {
 	$l = New-Object System.Windows.Forms.Label
@@ -999,7 +1062,7 @@ function New-Btn([string]$text, $x, $y, $w, $h, [bool]$primary = $false) {
 	$b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, $h)
 	if ($primary) {
 		$b.BackColor = [System.Drawing.Color]::FromArgb(230, 176, 140, 70); $b.ForeColor = [System.Drawing.Color]::FromArgb(20, 16, 10)
-		$b.FlatAppearance.BorderColor = $bone
+		$b.FlatAppearance.BorderColor = $gold
 		$b.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(240, 206, 170, 96)
 	} else {
 		$b.BackColor = [System.Drawing.Color]::FromArgb(200, 24, 28, 38); $b.ForeColor = $ink
@@ -1028,7 +1091,7 @@ function New-Check([string]$text, $x, $y, $w, [string]$key) {
 	$c.Add_CheckedChanged({ param($s, $e) Set-Setting $s.Tag $(if ($s.Checked) { '1' } else { '0' }) })
 	return $c
 }
-# Desplegables dibujados a mano como en Demon's Souls (fondo oscuro, texto ClearType, gris si no esta disponible).
+# Desplegables dibujados a mano como en Demon's Souls (fondo oscuro, colores de marca, gris si no esta disponible).
 function Draw-ComboItem($combo, $e) {
 	if ($e.Index -lt 0) { return }
 	$text = [string]$combo.Items[$e.Index]
@@ -1038,9 +1101,8 @@ function Draw-ComboItem($combo, $e) {
 	$color = $ink
 	if (-not $combo.Enabled) { $color = $dim }
 	elseif ($combo -eq $script:cmbUpRef -and $e.Index -lt $script:upscalers.Count -and -not $script:upscalers[$e.Index][2] -and $script:S.experimental -ne '1') { $color = $dim }
-	elseif ($combo -eq $script:cmbUpRef -and -not $selected) {
-		# (ui-1030) Colores de marca como en Demon's Souls.
-		if ($text -match 'DLSS') { $color = [System.Drawing.Color]::FromArgb(118, 185, 0) } elseif ($text -match 'XeSS') { $color = [System.Drawing.Color]::FromArgb(70, 160, 255) } elseif ($text -match 'FSR') { $color = [System.Drawing.Color]::FromArgb(237, 70, 70) }
+	elseif (($combo -eq $script:cmbUpRef -or $combo -eq $script:cmbFgRef) -and -not $selected) {
+		if ($text -match 'DLSS|NVIDIA') { $color = [System.Drawing.Color]::FromArgb(118, 185, 0) } elseif ($text -match 'XeSS') { $color = [System.Drawing.Color]::FromArgb(70, 160, 255) } elseif ($text -match 'FSR|AMD') { $color = [System.Drawing.Color]::FromArgb(237, 70, 70) }
 	}
 	$r = New-Object System.Drawing.Rectangle(($e.Bounds.X + 8), $e.Bounds.Y, ($e.Bounds.Width - 8), $e.Bounds.Height)
 	[System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $combo.Font, $r, $color, ([System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis))
@@ -1050,9 +1112,40 @@ function Set-ComboStyle($c) {
 	$c.Add_DrawItem({ param($s, $e) Draw-ComboItem $s $e })
 	$c.Add_EnabledChanged({ param($s, $e) $s.Invalidate() })
 }
-$script:panelAlpha = [System.Drawing.Color]::FromArgb(170, 8, 10, 14)
-# (ui-1030) Como en Demon's Souls: apartados oscuros redondeados con titulo dorado (serif), etiqueta a la izquierda y
-# desplegable oscuro a la derecha en cada fila. Una sola columna a la derecha que se desplaza; JUGAR queda fijo abajo.
+function New-Group([string]$text, $parent, $x, $y, $w, $h) {
+	$g = New-Object System.Windows.Forms.GroupBox
+	$g.Text = $text; $g.Font = $boldSmall; $g.ForeColor = $gold
+	$g.BackColor = [System.Drawing.Color]::Transparent
+	$g.Location = New-Object System.Drawing.Point($x, $y); $g.Size = New-Object System.Drawing.Size($w, $h)
+	$parent.Controls.Add($g)
+	return $g
+}
+function Put($grp, $ctl, $x, $y, $w) {
+	# Colores y letra propios (si no, los heredaria del grupo).
+	$fc = $ctl.ForeColor; $fn = $ctl.Font
+	$grp.Controls.Add($ctl)
+	$ctl.ForeColor = $fc; $ctl.Font = $fn
+	$ctl.Location = New-Object System.Drawing.Point($x, $y)
+	if ($w) { $ctl.Width = $w }
+	return $ctl
+}
+# Fila como en Demon's Souls: etiqueta a x=10 (112), desplegable a x=124 (282), paso de 32.
+function Add-Row($grp, [string]$label, $ctl, $y, [string]$tip = '') {
+	$lb = New-Label $label 10 ($y + 2) 112 24
+	[void](Put $grp $lb 10 ($y + 2) 112)
+	[void](Put $grp $ctl 124 $y 282)
+	if ($tip) { $tips.SetToolTip($ctl, $tip); $tips.SetToolTip($lb, $tip) }
+	return $lb
+}
+function New-DarkCombo($items, [string]$font = 'text') {
+	$c = New-Object System.Windows.Forms.ComboBox
+	$c.DropDownStyle = 'DropDownList'; $c.FlatStyle = 'Flat'; $c.BackColor = $field; $c.ForeColor = $ink; $c.Font = $(if ($font -eq 'small') { $fSmall } else { $fText })
+	foreach ($i in $items) { [void]$c.Items.Add($i) }
+	return $c
+}
+
+# ---------------------------------------------------------------- ventana Settings (juego, emulador, parches, controles, sistema)
+# Apartados redondeados de antes, en una sola columna que se desplaza. Se abre con el boton Settings.
 $fSec = New-Object System.Drawing.Font('Georgia', 12, [System.Drawing.FontStyle]::Bold)
 $script:secY = 10
 function New-RoundPath($x, $y, $w, $h, $r) {
@@ -1072,7 +1165,7 @@ function New-Section([string]$text, $h) {
 		$gr = $e.Graphics; $gr.SmoothingMode = 'AntiAlias'
 		$p = New-RoundPath 0 0 ($s.Width - 1) ($s.Height - 1) 16
 		$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(110, 222, 196, 140), 1); $gr.DrawPath($pen, $p); $pen.Dispose(); $p.Dispose()
-		[System.Windows.Forms.TextRenderer]::DrawText($gr, $s.Text, $fSec, (New-Object System.Drawing.Point(12, 7)), $bone)
+		[System.Windows.Forms.TextRenderer]::DrawText($gr, $s.Text, $fSec, (New-Object System.Drawing.Point(12, 7)), $gold)
 		$ln = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(70, 222, 196, 140), 1); $gr.DrawLine($ln, 12, 33, ($s.Width - 12), 33); $ln.Dispose()
 	})
 	$scroll.Controls.Add($g)
@@ -1081,28 +1174,25 @@ function New-Section([string]$text, $h) {
 }
 function Add-To($grp, $ctl) {
 	$fc = $ctl.ForeColor; $fn = $ctl.Font; $grp.Controls.Add($ctl); $ctl.ForeColor = $fc; $ctl.Font = $fn
-	# Fondo solido del panel (no transparente sobre la imagen): texto ClearType nitido.
+	# Fondo solido del apartado: texto ClearType nitido.
 	if (($ctl -is [System.Windows.Forms.Label]) -or (($ctl -is [System.Windows.Forms.ButtonBase]) -and -not ($ctl -is [System.Windows.Forms.Button]))) { $ctl.BackColor = $grp.BackColor }
 	return $ctl
 }
-
-# Columna unica pegada a la derecha, a toda altura, como en Demon's Souls. Arriba los apartados (se desplazan con la
-# rueda o la barra); abajo, fija, la barra de JUGAR / Steam / Salir.
-$colW = 460; $barH = 138; $panelW = $colW + 24 + [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth
-$panel = New-Object System.Windows.Forms.Panel
-$panel.Location = New-Object System.Drawing.Point([math]::Max(0, $W - $panelW), 0)
-$panel.Size = New-Object System.Drawing.Size([math]::Min($panelW, $W), $H)
-$panel.BackColor = $script:panelAlpha
-Set-DoubleBuffer $panel
-$form.Controls.Add($panel)
-$bar = New-Object System.Windows.Forms.Panel; $bar.Dock = 'Bottom'; $bar.Height = $barH; $bar.BackColor = [System.Drawing.Color]::Transparent
-$scroll = New-Object System.Windows.Forms.Panel; $scroll.Dock = 'Fill'; $scroll.AutoScroll = $true; $scroll.BackColor = [System.Drawing.Color]::Transparent
-Set-DoubleBuffer $scroll; Set-DoubleBuffer $bar
-$panel.Controls.Add($scroll); $panel.Controls.Add($bar); $scroll.BringToFront()
-# Fondo transparente: al desplazar se repinta entero (si no, la imagen de detras se arrastra).
-$scroll.Add_Scroll({ $scroll.Invalidate($true) }); $scroll.Add_MouseWheel({ $scroll.Invalidate($true) })
+$colW = 460
+$fSet = New-Object System.Windows.Forms.Form
+$fSet.Text = 'Settings - Bloodborne'; $fSet.StartPosition = 'CenterParent'; $fSet.FormBorderStyle = 'FixedDialog'; $fSet.MaximizeBox = $false; $fSet.MinimizeBox = $false; $fSet.ShowInTaskbar = $false
+$fSet.BackColor = [System.Drawing.Color]::FromArgb(14, 16, 22); $fSet.ForeColor = $ink; $fSet.Font = $fText
+$fSet.ClientSize = New-Object System.Drawing.Size(($colW + 24 + [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth), [math]::Min(980, $H - 60))
+$fSet.KeyPreview = $true
+$fSet.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $e.Handled = $true; $fSet.Hide() } })
+Set-DoubleBuffer $fSet
+$setBar = New-Object System.Windows.Forms.Panel; $setBar.Dock = 'Bottom'; $setBar.Height = 60; $setBar.BackColor = $fSet.BackColor
+$scroll = New-Object System.Windows.Forms.Panel; $scroll.Dock = 'Fill'; $scroll.AutoScroll = $true; $scroll.BackColor = $fSet.BackColor
+Set-DoubleBuffer $scroll
+$fSet.Controls.Add($scroll); $fSet.Controls.Add($setBar); $scroll.BringToFront()
+$btnSetOk = New-Btn (T 'Cerrar' 'Close') 12 10 $colW 40 $true
+$btnSetOk.Add_Click({ $fSet.Hide() }); $setBar.Controls.Add($btnSetOk)
 $c1 = 12; $iw = $colW - 24
-# Filas (como Demon's Souls): etiqueta a x=12, desplegable a x=$cx hasta el borde, paso de 32.
 $lw = 180; $cx = 196; $cw = $colW - $cx - 12
 
 # ---- Juego
@@ -1115,101 +1205,31 @@ $lbGame = Add-To $gGame (New-Label '' 12 76 $iw 62 $dim $fSmall); $lbGame.TextAl
 $lbCompat = Add-To $gGame (New-Label '' 12 140 ($iw - 34) 24 $dim $fSmall)
 $btnCompat = Add-To $gGame (New-Btn '?' ($iw - 16) 139 28 26); $btnCompat.Font = $fSmall
 $tips.SetToolTip($btnCompat, (T 'Versiones compatibles' 'Compatible versions'))
+$tips.SetToolTip($cmbGame, (T 'Carpeta del juego (la que tiene eboot.bin). La actualización 1.09 va en <serie>-patch / -UPDATE al lado.' 'Game folder (with eboot.bin). The 1.09 update goes in <serial>-patch / -UPDATE next to it.'))
 $btnCompat.Add_Click({
 	$l = ($script:bbSerials.GetEnumerator() | Sort-Object Name | ForEach-Object { "  $($_.Name)  -  $($_.Value)" }) -join "`n"
 	[void][System.Windows.Forms.MessageBox]::Show((T "Versiones compatibles`n`n$l`n`nVersión del juego: 1.09 (01.09), la última. Con la base 1.00 sola se cierra al arrancar.`nLa actualización va en una carpeta <serie>-patch / -UPDATE junto al juego (o copiada encima).`n`n'Sin confirmar': una sola fuente pública. Japón y otras ediciones asiáticas: serie no comprobada; se pueden usar con aviso." "Compatible versions`n`n$l`n`nGame version: 1.09 (01.09), the latest. The 1.00 base alone crashes on start.`nThe update goes in a <serial>-patch / -UPDATE folder next to the game (or copied over it).`n`n'Unconfirmed': only one public source. Japan and other Asian editions: serial not verified; usable with a warning."), (T 'Versiones compatibles' 'Compatible versions'), 'OK', 'Information')
 })
 
-# ---- Modos
-$gFg = New-Section (T 'Modos' 'Modes') 150
-[void](Add-To $gFg (New-Label (T 'Modo' 'Mode') 12 42 $lw))
-$cmbMode = Add-To $gFg (New-Combo @($script:modes | ForEach-Object { $_[1] }) $cx 40 $cw 'modo'); $cmbMode.DropDownWidth = 340
-[void](Add-To $gFg (New-Label 'Frame generation' 12 74 $lw))
-$cmbFg = Add-To $gFg (New-Combo $script:fgList $cx 72 $cw 'framegen'); $cmbFg.DropDownWidth = 300
-$lbMode = Add-To $gFg (New-Label '' 12 106 $iw 38 $dim $fSmall); $lbMode.TextAlign = 'TopLeft'
-
-# ---- Imagen: resolucion, reescalado (con su calidad) y nitidez
-$gUp = New-Section (T 'Imagen' 'Image') 186
-$resItems = @((T "Monitor ($(Get-ScreenRes))" "Monitor ($(Get-ScreenRes))")) + $script:resList
-[void](Add-To $gUp (New-Label (T 'Resolución' 'Resolution') 12 42 $lw))
-$cmbWin = Add-To $gUp (New-Object System.Windows.Forms.ComboBox)
-$cmbWin.DropDownStyle = 'DropDownList'; $cmbWin.FlatStyle = 'Flat'; $cmbWin.BackColor = $field; $cmbWin.ForeColor = $ink; $cmbWin.Font = $fText
-$cmbWin.Location = New-Object System.Drawing.Point($cx, 40); $cmbWin.Width = $cw
-foreach ($i in $resItems) { [void]$cmbWin.Items.Add($i) }
-$cmbWin.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:resList, $script:S.winres) + 1)
-$cmbWin.Add_SelectedIndexChanged({ Set-Setting 'winres' $(if ($cmbWin.SelectedIndex -le 0) { 'auto' } else { $script:resList[$cmbWin.SelectedIndex - 1] }) })
-$cmbWin.Add_SelectedIndexChanged({ if ($cmbUp) { for ($k = 0; $k -lt $script:upscalers.Count; $k++) { $u = $script:upscalers[$k]; if ($u.Count -gt 3) { $cmbUp.Items[$k] = "$($u[0])  ($(Get-UpRes $u[3]))" } } } })  # (10-29) la interna de cada calidad sigue a la resolucion
-$tips.SetToolTip($cmbWin, (T 'Tamaño de la ventana / pantalla del emulador (screenWidth/Height).' 'Emulator window / screen size (screenWidth/Height).'))
-$lbIntRow = Add-To $gUp (New-Label (T 'Res. interna' 'Internal res.') 12 74 $lw)
-$cmbInt = Add-To $gUp (New-Object System.Windows.Forms.ComboBox)
-$cmbInt.DropDownStyle = 'DropDownList'; $cmbInt.FlatStyle = 'Flat'; $cmbInt.BackColor = $field; $cmbInt.ForeColor = $ink; $cmbInt.Font = $fText
-$cmbInt.Location = New-Object System.Drawing.Point($cx, 72); $cmbInt.Width = $cw
-foreach ($i in $script:resList) { [void]$cmbInt.Items.Add($i) }
-$cmbInt.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:resList, $script:S.intres))
-$cmbInt.Add_SelectedIndexChanged({ Set-Setting 'intres' $script:resList[$cmbInt.SelectedIndex] })
-$lbIntRow.Visible = $false; $cmbInt.Visible = $false  # (10-29) una sola resolucion: la de salida; la interna la pone el reescalado
-$tips.SetToolTip($cmbInt, (T 'Resolución de salida que el emulador da al juego (internalScreenWidth/Height). Bloodborne dibuja a 1080p como en PS4.' 'Video-out resolution the emulator reports to the game (internalScreenWidth/Height).'))
-[void](Add-To $gUp (New-Label (T 'Reescalado' 'Upscaling') 12 74 $lw))
-$cmbUp = Add-To $gUp (New-Object System.Windows.Forms.ComboBox)
-$cmbUp.DropDownStyle = 'DropDownList'; $cmbUp.FlatStyle = 'Flat'; $cmbUp.BackColor = $field; $cmbUp.ForeColor = $ink; $cmbUp.Font = $fText
-$cmbUp.Location = New-Object System.Drawing.Point($cx, 72); $cmbUp.Width = $cw; $cmbUp.DropDownWidth = 360; $cmbUp.MaxDropDownItems = 16
-foreach ($u in $script:upscalers) { $lab = $u[0]; if ($u.Count -gt 3) { $lab = "$lab  ($(Get-UpRes $u[3]))" }; [void]$cmbUp.Items.Add($lab) }
-$cmbUp.SelectedIndex = [math]::Max(0, [math]::Min([int]$script:S.upscaler, $script:upscalers.Count - 1))
-$lbUpModeRow = Add-To $gUp (New-Label (T 'Modo' 'Mode') 12 106 $lw)
-$cmbUpMode = Add-To $gUp (New-Combo $script:upModes $cx 104 $cw 'upmode')
-$lbUpModeRow.Visible = $false; $cmbUpMode.Visible = $false  # (10-29) la calidad va en el desplegable de reescalado
-[void](Add-To $gUp (New-Label (T 'Nitidez' 'Sharpness') 12 108 $lw))
-$trkSharp = Add-To $gUp (New-Object System.Windows.Forms.TrackBar)
-$trkSharp.Minimum = 0; $trkSharp.Maximum = 100; $trkSharp.TickFrequency = 25; $trkSharp.SmallChange = 5; $trkSharp.LargeChange = 25
-$trkSharp.Location = New-Object System.Drawing.Point(($cx - 6), 104); $trkSharp.Width = $cw - 52; $trkSharp.AutoSize = $false; $trkSharp.Height = 32
-$trkSharp.BackColor = $grpBack
-$trkSharp.Value = [math]::Max(0, [math]::Min(100, [int]$script:S.sharp))
-$lbSharp = Add-To $gUp (New-Label "$($trkSharp.Value) %" ($cx + $cw - 50) 108 56)
-$trkSharp.Add_ValueChanged({ $lbSharp.Text = "$($trkSharp.Value) %"; Set-Setting 'sharp' $trkSharp.Value })
-$lbUp = Add-To $gUp (New-Label '' 12 142 $iw 38 $dim $fSmall); $lbUp.TextAlign = 'TopLeft'
-function Update-Up {
-	$i = $cmbUp.SelectedIndex; $u = $script:upscalers[$i]
-	$exp = ($script:S.experimental -eq '1')
-	if (-not $u[2] -and -not $exp) {
-		# Opcion aun no disponible: vuelve a la ultima real.
-		$cmbUp.SelectedIndex = [math]::Max(0, [math]::Min([int]$script:S.upscaler, 1)); return
-	}
-	Set-Setting 'upscaler' $i
-	if ($cmbInt) { $cmbInt.Enabled = -not ($u.Count -gt 3) }  # (10-29) con DLSS / FSR 4 / FSR 3.1 / XeSS la interna la pone la calidad
-	$cmbUpMode.Enabled = ($exp -and -not $u[2])
-	$trkSharp.Enabled = ($u[1] -ne 'native' -and $u[1] -ne 'off')
-	$lbUp.Text = $(if ($u[1] -eq 'fsr1') { T 'FSR 1 + RCAS de shadPS4 (real). Nitidez = RCAS.' 'shadPS4 FSR 1 + RCAS (real). Sharpness = RCAS.' } elseif ($u[1] -eq 'native') { T 'Imagen tal cual, sin filtro.' 'Image as is, no filter.' } else { T 'Reescalado real antes del HUD. Nitidez: RCAS en FSR 3.1/FSR 4, RCAS tras DLSS/XeSS.' 'Real upscaling before the HUD. Sharpness: RCAS in FSR 3.1/FSR 4, RCAS after DLSS/XeSS.' })
-}
-$cmbUp.Add_SelectedIndexChanged({ Update-Up })
-$tips.SetToolTip($cmbUp, (T 'DLSS, FSR 4, FSR 3.1 y XeSS con su calidad (como en Demon''s Souls). DLSS necesita una gráfica NVIDIA RTX.' 'DLSS, FSR 4, FSR 3.1 and XeSS with their quality (as in Demon''s Souls). DLSS needs an NVIDIA RTX GPU.'))
-
-# ---- Pantalla
-$gDsp = New-Section (T 'Pantalla' 'Display') 176
-[void](Add-To $gDsp (New-Label (T 'Modo' 'Mode') 12 42 $lw))
-$cmbFs = Add-To $gDsp (New-Combo @((T 'Pantalla completa' 'Fullscreen'), (T 'Completa sin bordes' 'Borderless'), (T 'Ventana' 'Windowed')) $cx 40 $cw 'fsmode')
-[void](Add-To $gDsp (New-Label 'VSync' 12 74 $lw))
-$cmbPres = Add-To $gDsp (New-Combo @((T 'Activado (Fifo)' 'On (Fifo)'), (T 'Mailbox (por defecto)' 'Mailbox (default)'), (T 'Desactivado (Immediate)' 'Off (Immediate)')) $cx 72 $cw 'present')
-[void](Add-To $gDsp (New-Label (T 'Límite FPS' 'FPS limit') 12 106 $lw))
-$cmbFps = Add-To $gDsp (New-Combo @('30 (PS4)', (T '60 (parche 60 FPS)' '60 (60 FPS patch)'), (T 'Sin límite (próximamente)' 'Uncapped (coming soon)')) $cx 104 $cw 'fps')
-$tips.SetToolTip($cmbFps, (T 'Bloodborne va a 30. Para 60 hace falta el parche de 60 FPS de shadPS4 (user\patches). "Sin límite" llegará con el emulador propio.' 'Bloodborne runs at 30. 60 needs the shadPS4 60 FPS patch (user\patches). Uncapped comes with our own emulator.'))
-$chkHdr = Add-To $gDsp (New-Check 'HDR' 12 140 $lw 'hdr')
-$chkFpsC = Add-To $gDsp (New-Check (T 'Contador de FPS' 'FPS counter') $cx 140 $cw 'showfps')
-
-# ---- Calidad grafica
-$script:qCombos = @()
-$gQ = New-Section (T 'Calidad gráfica' 'Graphics quality') (40 + 32 * $script:quality.Count + 40)
-$qy = 40
-foreach ($q in $script:quality) {
-	[void](Add-To $gQ (New-Label $q[1] 12 ($qy + 2) $lw 24 $ink $fText))
-	$cb = Add-To $gQ (New-Combo $q[2] $cx $qy $cw $q[0]); $cb.Font = $fText
-	$script:qCombos += , @($cb, $q)
-	$qy += 32
-}
-$lbQ = Add-To $gQ (New-Label (T 'Las filas en gris llegarán con el emulador propio (próximamente).' 'Greyed rows come with our own emulator (coming soon).') 12 ($qy + 4) $iw 26 $dim $fSmall); $lbQ.TextAlign = 'TopLeft'
+# ---- Emulador
+$gEmu = New-Section (T 'Emulador (shadPS4)' 'Emulator (shadPS4)') 142
+$cmbEmu = Add-To $gEmu (New-Object System.Windows.Forms.ComboBox)
+$cmbEmu.DropDownStyle = 'DropDownList'; $cmbEmu.FlatStyle = 'Flat'; $cmbEmu.BackColor = $field; $cmbEmu.ForeColor = $ink; $cmbEmu.Font = $fSmall
+$cmbEmu.Location = New-Object System.Drawing.Point(12, 42); $cmbEmu.Width = $iw - 98; $cmbEmu.DropDownWidth = 520
+$btnEmu = Add-To $gEmu (New-Btn (T 'Examinar' 'Browse') ($iw - 78) 40 90 30); $btnEmu.Font = $fSmall
+$lbEmu = Add-To $gEmu (New-Label '' 12 76 ($iw - 104) 46 $dim $fSmall); $lbEmu.TextAlign = 'TopLeft'
+$lnkUser = Add-To $gEmu (New-Object System.Windows.Forms.LinkLabel); $lnkUser.Text = (T 'cambiar user' 'change user'); $lnkUser.Font = $fSmall
+$lnkUser.LinkColor = $gold; $lnkUser.BackColor = $grpBack; $lnkUser.Location = New-Object System.Drawing.Point(($iw - 78), 76); $lnkUser.Size = New-Object System.Drawing.Size(90, 22)
+$tips.SetToolTip($lnkUser, (T 'Carpeta "user" de shadPS4 (config, parches, trofeos). Se detecta sola; cámbiala si usas otra.' 'shadPS4 "user" folder (config, patches, trophies). Auto-detected; change it if you use another.'))
+$lnkUpd = Add-To $gEmu (New-Object System.Windows.Forms.LinkLabel); $lnkUpd.Text = (T 'actualizar' 'update'); $lnkUpd.Font = $fSmall
+$lnkUpd.LinkColor = $gold; $lnkUpd.BackColor = $grpBack; $lnkUpd.Location = New-Object System.Drawing.Point(($iw - 78), 100); $lnkUpd.Size = New-Object System.Drawing.Size(90, 22)
+$updTip = (T 'Actualizar shadPS4: busca la última versión oficial (github.com/shadps4-emu) y la instala en una carpeta nueva. La actual no se toca: para volver, elígela en la lista de Settings.' 'Update shadPS4: finds the latest official release (github.com/shadps4-emu) and installs it to a new folder. The current one is kept: to go back, pick it in the Settings list.')
+$tips.SetToolTip($lnkUpd, $updTip)
 
 # ---- Parches
-$gPat = New-Section (T 'Parches' 'Patches') 142
+$gPat = New-Section (T 'Parches y mods' 'Patches and mods') 142
 $chkUpd = Add-To $gPat (New-Check (T 'Usar actualización (-patch)' 'Use update (-patch)') 12 40 ($iw) 'useupdate')
+$tips.SetToolTip($chkUpd, (T 'Desactivado: arranca sin la carpeta de actualización (-i). Solo fuera del modo seguro.' 'Off: starts without the update folder (-i). Only outside safe mode.'))
 $btnPatches = Add-To $gPat (New-Btn (T 'Abrir parches en shadPS4' 'Open patches in shadPS4') 12 72 $iw 32); $btnPatches.Font = $fSmall
 $tips.SetToolTip($btnPatches, (T 'El lanzador no cambia parches nunca (solo muestra su estado). Abre la carpeta user\patches; cámbialos con shadPS4 / BB_Launcher.' 'The launcher never changes patches (it only shows their state). Opens user\patches; change them with shadPS4 / BB_Launcher.'))
 $btnPatches.Add_Click({ $d = Join-Path (Get-UserDir $script:S.emu) 'patches'; if (-not (Test-Path -LiteralPath $d)) { $d = Get-UserDir $script:S.emu }; if (Test-Path -LiteralPath $d) { Start-Process explorer.exe -ArgumentList ('"' + $d + '"') } })
@@ -1226,101 +1246,254 @@ $chkMotion = Add-To $gCtl (New-Check (T 'Sensor de movimiento' 'Motion sensor') 
 $chkBg = Add-To $gCtl (New-Check (T 'Mando con la ventana en segundo plano' 'Pad input in background') 12 98 ($iw) 'bginput')
 $btnInput = Add-To $gCtl (New-Btn (T 'Configurar controles (teclado / mando)' 'Configure controls (keyboard / pad)') 12 130 $iw 34)
 
-# ---- Sistema / metricas
-$gSys = New-Section (T 'Sistema / Métricas' 'System / Metrics') 244
-$chkSafe = Add-To $gSys (New-Check (T 'Modo seguro: solo cambia la resolución que elijas' 'Safe mode: only changes the resolution you pick') 12 40 ($iw) 'safemode'); $chkSafe.ForeColor = $bone
-$tips.SetToolTip($chkSafe, (T 'Activado: JUGAR arranca shadPS4 con el juego (como BB_Launcher). Solo escribe la resolución, la res. interna, el modo de pantalla y el VSync que hayas cambiado tú en esta sesión, en la config de la versión elegida. Nunca parches, FSR/RCAS, modos ni Optimizar. Partidas: solo el byte del sound fix.' 'On: PLAY starts shadPS4 with the game (like BB_Launcher). Only writes the resolution, internal res., screen mode and VSync you changed this session, in the selected build''s config. Never patches, FSR/RCAS, modes or Optimize. Saves: only the sound-fix byte.'))
-$chk16 = Add-To $gSys (New-Check (T '16 GB de RAM' '16 GB RAM') 12 68 $lw 'ram16')
-$tips.SetToolTip($chk16, (T 'Hoy: aviso de RAM libre antes de jugar. Los límites de memoria para 16 GB llegarán con el emulador propio (BB_LOWRAM).' 'Today: free-RAM warning before playing. 16 GB memory limits come with our own emulator (BB_LOWRAM).'))
-$chkMet = Add-To $gSys (New-Check (T 'Métricas en pantalla' 'On-screen metrics') $cx 68 $cw 'metricas')
-$tips.SetToolTip($chkMet, (T 'Ventana de métricas como en Demon''s Souls (GPU, VRAM, CPU, RAM, FPS). Solo lee: funciona también en modo seguro. Se cierra al cerrar shadPS4.' 'Metrics window like Demon''s Souls (GPU, VRAM, CPU, RAM, FPS). Read-only: works in safe mode too. Closes when shadPS4 exits.'))
-$chkSfx = Add-To $gSys (New-Check (T 'Sound fix (como BB_Launcher)' 'Sound fix (like BB_Launcher)') 12 96 ($iw) 'soundfix')
-$tips.SetToolTip($chkSfx, (T 'Antes de cada JUGAR (también en modo seguro) pone a 1 el byte 0x204E de la partida (userdata0010), como hace BB_Launcher: sin él no suenan los golpes. Copia .bak-sfx-original la primera vez.' 'Before each PLAY (safe mode too) sets save byte 0x204E (userdata0010) to 1, like BB_Launcher: without it hit sounds are silent. Makes a .bak-sfx-original copy the first time.'))
-$btnOpt = Add-To $gSys (New-Btn (T 'Optimizar según tu equipo' 'Optimize for your PC') 12 130 $iw 34)
+# ---- Sistema
+$gSys = New-Section (T 'Sistema' 'System') 132
 $bw3 = [int](($iw - 16) / 3)
-$btnLogs = Add-To $gSys (New-Btn (T 'Logs' 'Logs') 12 172 $bw3 32); $btnLogs.Font = $fSmall
-$btnUserDir = Add-To $gSys (New-Btn (T 'Carpeta user' 'User folder') (20 + $bw3) 172 $bw3 32); $btnUserDir.Font = $fSmall
-$btnSfx = Add-To $gSys (New-Btn 'Sound fix' (28 + 2 * $bw3) 172 $bw3 32); $btnSfx.Font = $fSmall
+$btnLogs = Add-To $gSys (New-Btn (T 'Logs' 'Logs') 12 42 $bw3 32); $btnLogs.Font = $fSmall
+$btnUserDir = Add-To $gSys (New-Btn (T 'Carpeta user' 'User folder') (20 + $bw3) 42 $bw3 32); $btnUserDir.Font = $fSmall
+$btnSfx = Add-To $gSys (New-Btn 'Sound fix' (28 + 2 * $bw3) 42 $bw3 32); $btnSfx.Font = $fSmall
 $tips.SetToolTip($btnSfx, (T 'Estado del sound fix en tus partidas (byte 0x204E de userdata0010). Solo muestra.' 'Sound fix state of your saves (byte 0x204E of userdata0010). View only.'))
 $btnSfx.Add_Click({
 	$files = @(Find-SaveFiles (Get-UserDir $script:S.emu))
 	if (-not $files.Count) { [void][System.Windows.Forms.MessageBox]::Show((T 'No encuentro ninguna partida (SPRJ0005\userdata0010) en home_dir ni en la carpeta user.' 'No save found (SPRJ0005\userdata0010) in home_dir or the user folder.'), 'Sound fix', 'OK', 'Information'); return }
 	$st = foreach ($f in $files) { $b = Get-SfxByte $f; "$f`n   0x204E = $(if ($b -ge 0) { '0x{0:X2}' -f $b } else { T 'ilegible' 'unreadable' })$(if ($b -eq 1) { T '  (ya aplicado)' '  (already applied)' })" }
-	$need = @($files | Where-Object { (Get-SfxByte $_) -eq 0 })
 	$msg = (T "Partidas encontradas:`n`n" "Saves found:`n`n") + ($st -join "`n`n")
 	$msg += "`n`n" + $(if ($script:S.soundfix -eq '0') { T 'Sound fix automático: DESACTIVADO.' 'Automatic sound fix: OFF.' } else { T 'Sound fix automático: activado (se pone a 0x01 antes de cada JUGAR; solo archivos de 262144 bytes).' 'Automatic sound fix: on (set to 0x01 before each PLAY; 262144-byte files only).' })
 	[void][System.Windows.Forms.MessageBox]::Show($msg, 'Sound fix', 'OK', 'Information')
 })
-$lbPc = Add-To $gSys (New-Label '' 12 212 $iw 22 $dim $fSmall); $lbPc.TextAlign = 'MiddleLeft'
-$lbPc.Text = "$(if ($script:pc.Gpu) { $script:pc.Gpu } else { T 'Gráfica no detectada' 'GPU not detected' })  |  $($script:pc.RamGB) GB RAM"
-
-# ---- Emulador
-$gEmu = New-Section (T 'Emulador (shadPS4)' 'Emulator (shadPS4)') 142
-$cmbEmu = Add-To $gEmu (New-Object System.Windows.Forms.ComboBox)
-$cmbEmu.DropDownStyle = 'DropDownList'; $cmbEmu.FlatStyle = 'Flat'; $cmbEmu.BackColor = $field; $cmbEmu.ForeColor = $ink; $cmbEmu.Font = $fSmall
-$cmbEmu.Location = New-Object System.Drawing.Point(12, 42); $cmbEmu.Width = $iw - 98; $cmbEmu.DropDownWidth = 520
-$btnEmu = Add-To $gEmu (New-Btn (T 'Examinar' 'Browse') ($iw - 78) 40 90 30); $btnEmu.Font = $fSmall
-$lbEmu = Add-To $gEmu (New-Label '' 12 76 ($iw - 104) 46 $dim $fSmall); $lbEmu.TextAlign = 'TopLeft'
-$lnkUser = Add-To $gEmu (New-Object System.Windows.Forms.LinkLabel); $lnkUser.Text = (T 'cambiar user' 'change user'); $lnkUser.Font = $fSmall
-$lnkUser.LinkColor = $bone; $lnkUser.BackColor = $grpBack; $lnkUser.Location = New-Object System.Drawing.Point(($iw - 78), 76); $lnkUser.Size = New-Object System.Drawing.Size(90, 22)
-$tips.SetToolTip($lnkUser, (T 'Carpeta "user" de shadPS4 (config, parches, trofeos). Se detecta sola; cámbiala si usas otra.' 'shadPS4 "user" folder (config, patches, trophies). Auto-detected; change it if you use another.'))
-$lnkUpd = Add-To $gEmu (New-Object System.Windows.Forms.LinkLabel); $lnkUpd.Text = (T 'actualizar' 'update'); $lnkUpd.Font = $fSmall
-$lnkUpd.LinkColor = $bone; $lnkUpd.BackColor = $grpBack; $lnkUpd.Location = New-Object System.Drawing.Point(($iw - 78), 100); $lnkUpd.Size = New-Object System.Drawing.Size(90, 22)
-$tips.SetToolTip($lnkUpd, (T 'Actualizar shadPS4: busca la última versión oficial (github.com/shadps4-emu) y la instala en una carpeta nueva. La actual no se toca: para volver, elígela en la lista.' 'Update shadPS4: finds the latest official release (github.com/shadps4-emu) and installs it to a new folder. The current one is kept: to go back, pick it in the list.'))
-$pbUpd = Add-To $gEmu (New-Object System.Windows.Forms.ProgressBar); $pbUpd.Location = New-Object System.Drawing.Point(12, 126); $pbUpd.Size = New-Object System.Drawing.Size($iw, 6); $pbUpd.Maximum = 100; $pbUpd.Visible = $false
-$lnkUpd.Add_LinkClicked({
-	$form.Cursor = 'WaitCursor'
-	try { $rel = Get-ShadRelease } catch { $form.Cursor = 'Default'; Write-Log "GitHub: $_"; [void][System.Windows.Forms.MessageBox]::Show((T "No se pudo consultar GitHub:`n$_" "Could not query GitHub:`n$_"), 'shadPS4', 'OK', 'Warning'); return }
-	$form.Cursor = 'Default'
-	if (-not $rel.Asset) { [void][System.Windows.Forms.MessageBox]::Show((T "La versión $($rel.Version) no tiene zip de Windows oficial." "Release $($rel.Version) has no official Windows zip."), 'shadPS4', 'OK', 'Information'); return }
-	$have = @($script:emuList | Where-Object { (Split-Path -Leaf (Split-Path -Parent $_)) -match ('^v\.?' + [regex]::Escape($rel.Version) + '(-\d+)?$') })
-	$msg = (T "Última versión oficial: $($rel.Version)  ($($rel.Date.Substring(0, [math]::Min(10, $rel.Date.Length))))`n$($rel.Asset.name)  ($([math]::Round($rel.Asset.size / 1MB)) MB)`nCambios: $($rel.Url)" "Latest official release: $($rel.Version)  ($($rel.Date.Substring(0, [math]::Min(10, $rel.Date.Length))))`n$($rel.Asset.name)  ($([math]::Round($rel.Asset.size / 1MB)) MB)`nChangelog: $($rel.Url)")
-	if ($have.Count) { $msg += "`n`n" + (T "Ya la tienes: $($have[0])" "You already have it: $($have[0])") }
-	$msg += "`n`n" + (T "AVISO: las versiones nuevas pueden guardar las partidas en otro sitio (parecerá partida nueva) y usar otro formato de parches. Tu versión actual no se toca y sigue siendo la elegida." "WARNING: newer versions may store saves elsewhere (it will look like a new game) and use a different patch format. Your current build is kept and stays selected.")
-	$msg += "`n`n" + (T "Sí: instalar en una carpeta nueva (la actual no se toca)`nNo: ver los cambios en el navegador`nCancelar: nada" "Yes: install to a new folder (current one is kept)`nNo: open the changelog in the browser`nCancel: nothing")
-	$r = [System.Windows.Forms.MessageBox]::Show($msg, (T 'Actualizar shadPS4' 'Update shadPS4'), 'YesNoCancel', 'Question')
-	if ($r -eq 'No') { if ($rel.Url) { Start-Process $rel.Url }; return }
-	if ($r -ne 'Yes') { return }
-	$pbUpd.Value = 0; $pbUpd.Visible = $true; $lnkUpd.Enabled = $false; $form.Cursor = 'WaitCursor'
-	try { $exe = Install-ShadRelease $rel $pbUpd } catch { $exe = $null; Write-Log "Actualizar shadPS4: $_"; [void][System.Windows.Forms.MessageBox]::Show((T "No se pudo instalar:`n$_" "Could not install:`n$_"), 'shadPS4', 'OK', 'Error') }
-	$pbUpd.Visible = $false; $lnkUpd.Enabled = $true; $form.Cursor = 'Default'
-	if (-not $exe) { return }
-	[void][System.Windows.Forms.MessageBox]::Show((T "Instalada en:`n$exe`n`nSigues con tu versión de siempre. Para probar la nueva, elígela en la lista (y vuelve a la tuya igual)." "Installed to:`n$exe`n`nYou stay on your usual build. To try the new one, pick it in the list (and pick yours to go back)."), 'shadPS4', 'OK', 'Information')
-	Fill-Lists
-})
-$lnkUser.Add_LinkClicked({
-	$d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = (T 'Carpeta user de shadPS4 (la que tiene config.toml)' 'shadPS4 user folder (with config.toml)')
-	$d.SelectedPath = (Get-UserDir $script:S.emu)
-	if ($d.ShowDialog() -eq 'OK') { Set-Setting 'userdir' $d.SelectedPath; Write-Log "Carpeta user elegida: $($d.SelectedPath)"; Update-Emu; Update-Game }
-})
-
-# ---- Trofeos
-$gTr = New-Section (T 'Trofeos' 'Trophies') 204
-$lbTr = Add-To $gTr (New-Label '' 12 38 $iw 22 $bone $fSmall)
-$pbTr = Add-To $gTr (New-Object System.Windows.Forms.ProgressBar); $pbTr.Location = New-Object System.Drawing.Point(12, 62); $pbTr.Size = New-Object System.Drawing.Size($iw, 6); $pbTr.Maximum = 100
-$lvTr = Add-To $gTr (New-Object System.Windows.Forms.ListView)
-$lvTr.View = 'Details'; $lvTr.FullRowSelect = $true; $lvTr.HeaderStyle = 'None'; $lvTr.BorderStyle = 'None'; $lvTr.ShowItemToolTips = $true
-$lvTr.Location = New-Object System.Drawing.Point(12, 74); $lvTr.Size = New-Object System.Drawing.Size($iw, 118)
-$lvTr.BackColor = $field; $lvTr.ForeColor = $ink; $lvTr.Font = $fSmall
-[void]$lvTr.Columns.Add('', 80); [void]$lvTr.Columns.Add('', $iw - 102)
-# margen al final para que el desplazamiento no corte el ultimo apartado
+$btnSteam = Add-To $gSys (New-Btn (T 'Añadir a Steam' 'Add to Steam') 12 84 $iw 34)
+$tips.SetToolTip($btnSteam, (T 'Añade "Bloodborne" a tu biblioteca de Steam con imágenes (arranca con los últimos ajustes).' 'Adds "Bloodborne" to your Steam library with artwork (starts with the last settings).'))
 $padEnd = New-Object System.Windows.Forms.Label; $padEnd.Location = New-Object System.Drawing.Point(0, $script:secY); $padEnd.Size = New-Object System.Drawing.Size(1, 4); $padEnd.BackColor = [System.Drawing.Color]::Transparent; $scroll.Controls.Add($padEnd)
 
+# ---------------------------------------------------------------- panel derecho (como Demon's Souls)
+$panelW = [math]::Min(880, $W)
+$panel = New-Object System.Windows.Forms.Panel
+$panel.Location = New-Object System.Drawing.Point(($W - $panelW), 0)
+$panel.Size = New-Object System.Drawing.Size($panelW, $H)
+$panel.AutoScroll = $true
+$panel.Anchor = 'Top, Bottom, Right'
+$panel.BackColor = $panelBack
+$panel.SuspendLayout(); Set-DoubleBuffer $panel
+$form.Controls.Add($panel)
+
+# Fila de arriba: JUGAR grande; Precompilar / Actualizar / Settings / Salir a su lado.
+$btnPlay = New-Btn (T 'JUGAR' 'PLAY') 10 12 300 74 $true
+$btnPlay.Font = New-Object System.Drawing.Font('Segoe UI Black', 22, [System.Drawing.FontStyle]::Bold)
+$tips.SetToolTip($btnPlay, (T 'Arranca Bloodborne con estos ajustes (Esc cierra el lanzador).' 'Starts Bloodborne with these settings (Esc closes the launcher).'))
+$panel.Controls.Add($btnPlay)
+$tbw = 131; $tbx = 320
+$btnPre = New-Btn (T 'Precompilar' 'Precompile') $tbx 22 $tbw 54; $btnPre.Font = $fBar
+$btnUpd = New-Btn (T 'Actualizar' 'Update') ($tbx + 139) 22 $tbw 54; $btnUpd.Font = $fBar
+$btnSettings = New-Btn 'Settings' ($tbx + 278) 22 $tbw 54; $btnSettings.Font = $fBar
+$btnExit = New-Btn (T 'Salir' 'Exit') ($tbx + 417) 22 $tbw 54; $btnExit.Font = $fBar
+foreach ($b in @($btnPre, $btnUpd, $btnSettings, $btnExit)) { $panel.Controls.Add($b) }
+$tips.SetToolTip($btnPre, (T 'shadPS4 compila los shaders mientras juegas y los guarda en su caché (los tirones solo pasan la primera vez). Aquí ves el estado de la caché.' 'shadPS4 compiles shaders while you play and keeps them in its cache (stutters only happen the first time). Shows the cache state.'))
+$tips.SetToolTip($btnUpd, $updTip)
+$tips.SetToolTip($btnSettings, (T 'Juego, emulador, parches y mods, controles, Steam y carpetas.' 'Game, emulator, patches and mods, controls, Steam and folders.'))
+$tips.SetToolTip($btnExit, (T 'Cerrar el lanzador (Esc).' 'Close the launcher (Esc).'))
+$btnExit.Add_Click({ $form.Close() })
+$btnSettings.Add_Click({ [void]$fSet.ShowDialog($form); try { Update-Emu; Update-Game } catch { } })
+$pbUpd = New-Object System.Windows.Forms.ProgressBar; $pbUpd.Location = New-Object System.Drawing.Point(320, 80); $pbUpd.Size = New-Object System.Drawing.Size(548, 6); $pbUpd.Maximum = 100; $pbUpd.Visible = $false
+$panel.Controls.Add($pbUpd)
+
+# ---- Imagen: Resolución, Reescalado, Preset, Nitidez
+$gImg = New-Group (T 'Imagen' 'Image') $panel 10 100 420 196
+$resItems = @((T "Monitor ($(Get-ScreenRes))" "Monitor ($(Get-ScreenRes))")) + $script:resList
+$cmbWin = New-DarkCombo $resItems
+$cmbWin.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:resList, $script:S.winres) + 1)
+$cmbWin.Add_SelectedIndexChanged({ Set-Setting 'winres' $(if ($cmbWin.SelectedIndex -le 0) { 'auto' } else { $script:resList[$cmbWin.SelectedIndex - 1] }) })
+$cmbWin.Add_SelectedIndexChanged({ if ($cmbUp) { for ($k = 0; $k -lt $script:upscalers.Count; $k++) { $u = $script:upscalers[$k]; if ($u.Count -gt 3) { $cmbUp.Items[$k] = "$($u[0])  ($(Get-UpRes $u[3]))" } } } })  # (10-29) la interna de cada calidad sigue a la resolucion
+[void](Add-Row $gImg (T 'Resolución' 'Resolution') $cmbWin 26 (T 'Resolución de salida (ventana y pantalla completa exclusiva). Puede ser mayor que el monitor (DSR / VSR): el juego se dibuja a esa y la gráfica la reduce. Se escribe en la config de shadPS4 y en custom_configs\<serie>.json.' 'Output resolution (window and exclusive fullscreen). It can be above the monitor (DSR / VSR): the game renders at it and the GPU scales it down. Written to the shadPS4 config and custom_configs\<serial>.json.'))
+# Res. interna y modo de reescalado aparte: ocultos (la interna la pone la calidad del reescalado), se conservan para los modos.
+$cmbInt = New-DarkCombo $script:resList
+$cmbInt.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:resList, $script:S.intres))
+$cmbInt.Add_SelectedIndexChanged({ Set-Setting 'intres' $script:resList[$cmbInt.SelectedIndex] })
+[void](Put $gImg $cmbInt 124 26 282); $cmbInt.Visible = $false
+$cmbUp = New-DarkCombo @(); $cmbUp.DropDownWidth = 360; $cmbUp.MaxDropDownItems = 16
+foreach ($u in $script:upscalers) { $lab = $u[0]; if ($u.Count -gt 3) { $lab = "$lab  ($(Get-UpRes $u[3]))" }; [void]$cmbUp.Items.Add($lab) }
+$cmbUp.SelectedIndex = [math]::Max(0, [math]::Min([int]$script:S.upscaler, $script:upscalers.Count - 1))
+[void](Add-Row $gImg (T 'Reescalado' 'Upscaling') $cmbUp 58 (T 'FSR 1 (shadPS4), DLSS, FSR 4, FSR 3.1 y XeSS con su calidad (entre paréntesis la resolución interna). DLSS necesita una gráfica NVIDIA RTX; FSR 4, una AMD RX 9000.' 'FSR 1 (shadPS4), DLSS, FSR 4, FSR 3.1 and XeSS with their quality (internal resolution in brackets). DLSS needs an NVIDIA RTX GPU; FSR 4, an AMD RX 9000.'))
+$cmbUpMode = New-Combo $script:upModes 124 90 282 'upmode'
+[void](Put $gImg $cmbUpMode 124 90 282); $cmbUpMode.Visible = $false
+$cmbMode = New-Combo @($script:modes | ForEach-Object { $_[1] }) 0 0 282 'modo'; $cmbMode.DropDownWidth = 340
+[void](Add-Row $gImg 'Preset' $cmbMode 90)
+$cmbSharp = New-DarkCombo @(0..20 | ForEach-Object { "$($_ * 5) %" })
+function Set-Sharp([int]$v) { $cmbSharp.SelectedIndex = [math]::Max(0, [math]::Min(20, [int][math]::Round([math]::Max(0, [math]::Min(100, $v)) / 5))) }
+$sv0 = 75; [void][int]::TryParse("$($script:S.sharp)", [ref]$sv0); Set-Sharp $sv0
+$cmbSharp.Add_SelectedIndexChanged({ Set-Setting 'sharp' ($cmbSharp.SelectedIndex * 5); Write-SharpLive })
+[void](Add-Row $gImg (T 'Nitidez' 'Sharpness') $cmbSharp 122 (T 'Nitidez para TODOS los reescaladores (BB_UPSCALE_SHARPNESS 0-1): RCAS en FSR 1 / FSR 3.1 / FSR 4, paso de nitidez tras DLSS y XeSS. Se aplica en vivo: puedes cambiarla con el juego abierto.' 'Sharpness for EVERY upscaler (BB_UPSCALE_SHARPNESS 0-1): RCAS in FSR 1 / FSR 3.1 / FSR 4, a sharpening pass after DLSS and XeSS. Applied live: you can change it while the game runs.'))
+$lbUp = New-Label '' 10 154 400 36 $dim $tinyFont; $lbUp.TextAlign = 'TopLeft'; [void](Put $gImg $lbUp 10 154 400)
+
+# ---- Frame generation + Anti-Lag / Reflex
+$gFg = New-Group 'Frame generation' $panel 450 100 420 124
+$cmbFg = New-Combo $script:fgList 0 0 282 'bbfg'
+[void](Add-Row $gFg (T 'Modo' 'Mode') $cmbFg 26 (T 'Genera fotogramas intermedios (BB_FG): AMD FSR 3 x2 o dinámico; NVIDIA DLSS-G x2 / x3 / x4 o dinámico (RTX 40/50). Dinámico ajusta el multiplicador a tu monitor.' 'Generates in-between frames (BB_FG): AMD FSR 3 x2 or dynamic; NVIDIA DLSS-G x2 / x3 / x4 or dynamic (RTX 40/50). Dynamic matches the multiplier to your monitor.'))
+$cmbAl = New-Combo @((T 'Desactivado' 'Off'), (T 'Activado' 'On')) 0 0 282 'antilag'
+$cmbRx = New-Combo @((T 'Desactivado' 'Off'), (T 'Activado' 'On'), (T 'Activado + Boost' 'On + Boost')) 0 0 282 'reflex'
+$lbLat = Add-Row $gFg 'Anti-Lag' $cmbAl 58 (T 'AMD Anti-Lag (BB_ANTILAG): menos retraso entre el mando y la imagen, sobre todo con frame generation.' 'AMD Anti-Lag (BB_ANTILAG): less delay between input and image, mostly with frame generation.')
+[void](Put $gFg $cmbRx 124 58 282)
+$tips.SetToolTip($cmbRx, (T 'NVIDIA Reflex (BB_REFLEX): menos retraso con DLSS-G. Boost mantiene la gráfica a más reloj.' 'NVIDIA Reflex (BB_REFLEX): less delay with DLSS-G. Boost keeps the GPU clocked higher.'))
+$lbFg = New-Label '' 10 90 400 28 $dim $tinyFont; $lbFg.TextAlign = 'TopLeft'; [void](Put $gFg $lbFg 10 90 400)
+function Update-LatBox {
+	$fg = Get-FgKey; $dl = ($fg -like 'dlss*')
+	$cmbAl.Visible = -not $dl; $cmbRx.Visible = $dl; $lbLat.Text = $(if ($dl) { 'Reflex' } else { 'Anti-Lag' })
+	$lbFg.Text = $(if ($fg -eq 'off') { T 'Sin frame generation: los FPS reales del juego.' 'No frame generation: the real game FPS.' } elseif ($dl) { T "BB_FG=$fg  |  Reflex con DLSS-G (NVIDIA RTX 40/50)." "BB_FG=$fg  |  Reflex with DLSS-G (NVIDIA RTX 40/50)." } else { T "BB_FG=$fg  |  Anti-Lag con FSR 3 (cualquier gráfica)." "BB_FG=$fg  |  Anti-Lag with FSR 3 (any GPU)." })
+}
+$cmbFg.Add_SelectedIndexChanged({ Set-Setting 'framegen' $(if ($cmbFg.SelectedIndex -gt 0) { '1' } else { '0' }); Update-LatBox })
+
+# ---- Pantalla y otros: Monitor, VSync, Límite FPS, HDR, Contador, Métricas
+$gScr = New-Group (T 'Pantalla y otros' 'Display and more') $panel 450 232 420 158
+$cmbFs = New-Combo @((T 'Pantalla completa (exclusiva)' 'Fullscreen (exclusive)'), (T 'Completa sin bordes' 'Borderless'), (T 'Ventana' 'Windowed')) 0 0 282 'fsmode'
+[void](Add-Row $gScr 'Monitor' $cmbFs 26 (T 'Exclusiva: el monitor cambia a la Resolución elegida (útil con DSR / VSR). Sin bordes: ventana a pantalla completa.' 'Exclusive: the monitor switches to the chosen Resolution (useful with DSR / VSR). Borderless: fullscreen window.'))
+$cmbPres = New-Combo @((T 'Activado (Fifo)' 'On (Fifo)'), (T 'Mailbox (por defecto)' 'Mailbox (default)'), (T 'Desactivado (Immediate)' 'Off (Immediate)')) 0 0 282 'present'
+[void](Add-Row $gScr 'VSync' $cmbPres 58 (T 'Fifo: sin cortes, algo más de retraso. Mailbox: sin cortes y poco retraso. Immediate: el menor retraso, puede cortarse la imagen.' 'Fifo: no tearing, a bit more delay. Mailbox: no tearing, low delay. Immediate: lowest delay, may tear.'))
+$cmbFps = New-Combo @('30 (PS4)', (T '60 (parche 60 FPS)' '60 (60 FPS patch)'), (T 'Sin límite (próximamente)' 'Uncapped (coming soon)')) 0 0 282 'fps'
+[void](Add-Row $gScr (T 'Límite FPS' 'FPS limit') $cmbFps 90 (T 'Bloodborne va a 30. Para 60 hace falta el parche de 60 FPS de shadPS4 (user\patches).' 'Bloodborne runs at 30. 60 needs the shadPS4 60 FPS patch (user\patches).'))
+$chkHdr = Put $gScr (New-Check 'HDR' 0 0 80 'hdr') 12 124 80
+$chkFpsC = Put $gScr (New-Check (T 'Contador FPS' 'FPS counter') 0 0 150 'showfps') 96 124 150
+$chkMet = Put $gScr (New-Check (T 'Métricas' 'Metrics') 0 0 150 'metricas') 252 124 150
+$tips.SetToolTip($chkHdr, (T 'HDR de shadPS4 (necesita un monitor HDR con HDR activado en Windows).' 'shadPS4 HDR (needs an HDR monitor with HDR on in Windows).'))
+$tips.SetToolTip($chkFpsC, (T 'Contador de FPS de shadPS4 (--show-fps, fuera del modo seguro).' 'shadPS4 FPS counter (--show-fps, outside safe mode).'))
+$tips.SetToolTip($chkMet, (T "Ventana de métricas como en Demon's Souls (GPU, VRAM, CPU, RAM, FPS) con metricas-bb.ps1. Solo lee: funciona también en modo seguro. Se cierra al cerrar shadPS4." "Metrics window like Demon's Souls (GPU, VRAM, CPU, RAM, FPS) with metricas-bb.ps1. Read-only: works in safe mode too. Closes when shadPS4 exits."))
+
+# ---- Calidad
+$script:qCombos = @()
+$gQ = New-Group (T 'Calidad' 'Quality') $panel 10 304 420 (26 + 32 * $script:quality.Count + 30)
+$qy = 26
+foreach ($q in $script:quality) {
+	$cb = New-Combo $q[2] 0 0 282 $q[0]
+	[void](Add-Row $gQ $q[1] $cb $qy)
+	$script:qCombos += , @($cb, $q)
+	$qy += 32
+}
+$lbQ = New-Label (T 'Las filas en gris llegarán con el emulador propio (próximamente).' 'Greyed rows come with our own emulator (coming soon).') 10 ($qy + 2) 400 22 $dim $tinyFont; [void](Put $gQ $lbQ 10 ($qy + 2) 400)
+
+# ---- Rendimiento / PC
+$gPc = New-Group (T 'Rendimiento / PC' 'Performance / PC') $panel 10 ($gQ.Bottom + 8) 420 132
+$chkSafe = Put $gPc (New-Check (T 'Modo seguro: solo cambia la resolución que elijas' 'Safe mode: only changes the resolution you pick') 0 0 396 'safemode') 12 24 396; $chkSafe.ForeColor = $gold
+$tips.SetToolTip($chkSafe, (T 'Activado: JUGAR arranca shadPS4 con el juego (como BB_Launcher). Solo escribe la resolución, el modo de pantalla y el VSync que hayas cambiado tú en esta sesión, más las variables BB_* (reescalado, nitidez, frame generation). Nunca parches ni mods. Partidas: solo el byte del sound fix.' 'On: PLAY starts shadPS4 with the game (like BB_Launcher). Only writes the resolution, screen mode and VSync you changed this session, plus the BB_* variables (upscaling, sharpness, frame generation). Never patches or mods. Saves: only the sound-fix byte.'))
+$chk16 = Put $gPc (New-Check (T '16 GB de RAM' '16 GB RAM') 0 0 190 'ram16') 12 54 190
+$tips.SetToolTip($chk16, (T 'Hoy: aviso de RAM libre antes de jugar. Los límites de memoria para 16 GB llegarán con el emulador propio (BB_LOWRAM).' 'Today: free-RAM warning before playing. 16 GB memory limits come with our own emulator (BB_LOWRAM).'))
+$chkSfx = Put $gPc (New-Check (T 'Sound fix' 'Sound fix') 0 0 196 'soundfix') 210 54 196
+$tips.SetToolTip($chkSfx, (T 'Antes de cada JUGAR (también en modo seguro) pone a 1 el byte 0x204E de la partida (userdata0010), como BB_Launcher: sin él no suenan los golpes. Copia .bak-sfx-original la primera vez.' 'Before each PLAY (safe mode too) sets save byte 0x204E (userdata0010) to 1, like BB_Launcher: without it hit sounds are silent. Makes a .bak-sfx-original copy the first time.'))
+$btnOpt = Put $gPc (New-Btn (T 'Optimizar según tu equipo' 'Optimize for your PC') 0 0 396 34) 12 86 396
+$tips.SetToolTip($btnOpt, (T 'Elige resolución, reescalado y RAM según tu gráfica (te pregunta antes).' 'Picks resolution, upscaling and RAM for your GPU (asks first).'))
+
+# ---- TU EQUIPO (tarjeta dibujada, llena la columna derecha)
+function New-PcCard([int]$cw, [int]$ch, [double]$fs) {
+	$bmp = New-Object System.Drawing.Bitmap($cw, $ch, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+	$gc = [System.Drawing.Graphics]::FromImage($bmp)
+	$gc.SmoothingMode = 'AntiAlias'; $gc.TextRenderingHint = 'AntiAliasGridFit'; $gc.TextContrast = 0
+	$path = New-RoundPath 0 0 ($cw - 1) ($ch - 1) 28
+	$fill = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point($cw, $ch)), [System.Drawing.Color]::FromArgb(215, 30, 26, 20), [System.Drawing.Color]::FromArgb(215, 12, 13, 18))
+	$gc.FillPath($fill, $path)
+	$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 222, 196, 140), 1.5); $gc.DrawPath($pen, $path)
+	$goldB = New-Object System.Drawing.SolidBrush($gold); $inkB = New-Object System.Drawing.SolidBrush($ink)
+	$dimB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(205, 195, 180))
+	$fHead = New-Object System.Drawing.Font('Segoe UI Black', [float](16 * $fs), [System.Drawing.FontStyle]::Bold)
+	$fCap = New-Object System.Drawing.Font('Segoe UI Semibold', [float](10.5 * $fs)); $fVal = New-Object System.Drawing.Font('Segoe UI Semibold', [float](13 * $fs), [System.Drawing.FontStyle]::Bold)
+	$fTxt = New-Object System.Drawing.Font('Segoe UI', [float](12 * $fs))
+	$tw = $cw - 32; $x = 16; $y = [int](12 * $fs)
+	$gc.DrawString((T 'TU EQUIPO' 'YOUR PC'), $fHead, $goldB, [float]$x, [float]$y); $y += [int](40 * $fs)
+	$put = {
+		param($cap, $val, $font, $brush)
+		$gc.DrawString($cap, $fCap, $dimB, [float]$x, [float]$y)
+		$sz = $gc.MeasureString($val, $font, $tw)
+		$gc.DrawString($val, $font, $brush, (New-Object System.Drawing.RectangleF($x, ($y + [int](21 * $fs)), $tw, ($sz.Height + 2))))
+		return ($y + [int](23 * $fs) + $sz.Height + [int](7 * $fs))
+	}
+	$pc = $script:pc
+	$gpu = $(if ($pc.Gpu) { $pc.Gpu + $(if ($pc.VramGB -gt 0) { "  ($($pc.VramGB) GB)" } else { '' }) } else { T 'no detectada' 'not detected' })
+	if ($pc.Gpu -and $pc.Gpu -notmatch 'NVIDIA|GeForce|RTX') { $gpu += (T '  (sin DLSS: solo NVIDIA)' '  (no DLSS: NVIDIA only)') }
+	$y = & $put (T 'Gráfica' 'Graphics card') $gpu $fVal $inkB
+	$cpuTxt = "$(if ($pc.Cpu) { $pc.Cpu } else { '?' })$(if ($pc.Cores -gt 0) { "  ($($pc.Cores)c / $($pc.Threads)h)" })  |  $($pc.RamGB) GB RAM"
+	$y = & $put (T 'Procesador y RAM' 'CPU and RAM') $cpuTxt $fTxt $inkB
+	$t = Get-Tier $pc
+	if ($t) {
+		$y = & $put (T 'Perfil recomendado' 'Recommended profile') "$($t[1])" $fVal $goldB
+		$y = & $put (T 'Esperado (estimación)' 'Expected (estimate)') "$($t[5])" $fTxt $inkB
+	} else {
+		$y = & $put (T 'Perfil recomendado' 'Recommended profile') (T 'Gráfica sin datos: empieza con 30 FPS y FSR 1, y mira las métricas.' 'No data for this GPU: start with 30 FPS and FSR 1, and watch the metrics.') $fTxt $inkB
+	}
+	$script:pcEndY = $y
+	foreach ($o in $fill, $pen, $goldB, $inkB, $dimB, $fHead, $fCap, $fVal, $fTxt, $path) { $o.Dispose() }
+	$gc.Dispose()
+	return $bmp
+}
+$cardY = $gScr.Bottom + 10; $cardH = [math]::Max(240, $H - $cardY - 12)
+$pcCard = New-Object System.Windows.Forms.PictureBox
+$pcCard.BackColor = [System.Drawing.Color]::Transparent
+$pcCard.Location = New-Object System.Drawing.Point(450, $cardY); $pcCard.Size = New-Object System.Drawing.Size(420, $cardH)
+try {
+	foreach ($fs in 1.0, 0.9, 0.8, 0.7, 0.6) {
+		if ($pcCard.Image) { $pcCard.Image.Dispose() }
+		$pcCard.Image = New-PcCard 420 $cardH $fs
+		if ($script:pcEndY -le $cardH - 6) { break }
+	}
+} catch { Write-Log "Tarjeta TU EQUIPO: $_" }
+$panel.Controls.Add($pcCard)
+
+# ---- Trofeos (abajo a la izquierda, desplegable como en Demon's Souls)
+$trophyW = 420; $trophyListH = 360
+$btnTrophy = New-Btn (T 'Trofeos  v' 'Trophies  v') 24 ($H - 70) $trophyW 46
+$btnTrophy.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Bold)
+$btnTrophy.TextAlign = 'MiddleLeft'
+try {
+	$ti = New-Object System.Drawing.Bitmap 30, 30; $tg = [System.Drawing.Graphics]::FromImage($ti); $tg.SmoothingMode = 'AntiAlias'
+	$tb = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(236, 196, 72)); $tp = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(236, 196, 72)), 2.4
+	$tg.FillPie($tb, 7, -6, 16, 22, 0, 180); $tg.DrawArc($tp, 2, 2, 8, 9, 90, 180); $tg.DrawArc($tp, 20, 2, 8, 9, 270, 180)
+	$tg.FillRectangle($tb, 13, 15, 4, 7); $tg.FillRectangle($tb, 9, 22, 12, 3); $tg.FillRectangle($tb, 7, 25, 16, 3)
+	$tg.Dispose(); $btnTrophy.Image = $ti; $btnTrophy.ImageAlign = 'MiddleLeft'; $btnTrophy.TextImageRelation = 'ImageBeforeText'
+} catch { }
+$tips.SetToolTip($btnTrophy, (T 'Trofeos de shadPS4 para este juego (grado y nombre) y el % completado.' 'shadPS4 trophies for this game (grade and name) and the completion %.'))
+$form.Controls.Add($btnTrophy)
+$gTrophy = New-Object System.Windows.Forms.Panel
+$gTrophy.Location = New-Object System.Drawing.Point(24, ($H - 76 - $trophyListH)); $gTrophy.Size = New-Object System.Drawing.Size($trophyW, $trophyListH)
+$gTrophy.BackColor = [System.Drawing.Color]::FromArgb(14, 16, 22); $gTrophy.Visible = $false
+$form.Controls.Add($gTrophy)
+$lbTr = New-Label '' 10 6 ($trophyW - 20) 26 $gold $smallFont; $lbTr.BackColor = $gTrophy.BackColor; $gTrophy.Controls.Add($lbTr)
+$pbTr = New-Object System.Windows.Forms.ProgressBar; $pbTr.Location = New-Object System.Drawing.Point(10, 34); $pbTr.Size = New-Object System.Drawing.Size(($trophyW - 20), 8); $pbTr.Maximum = 100
+$gTrophy.Controls.Add($pbTr)
+$lvTr = New-Object System.Windows.Forms.ListView
+$lvTr.View = 'Details'; $lvTr.FullRowSelect = $true; $lvTr.HeaderStyle = 'None'; $lvTr.BorderStyle = 'None'; $lvTr.ShowItemToolTips = $true
+$lvTr.Location = New-Object System.Drawing.Point(10, 50); $lvTr.Size = New-Object System.Drawing.Size(($trophyW - 20), ($trophyListH - 60))
+$lvTr.BackColor = [System.Drawing.Color]::FromArgb(22, 25, 33); $lvTr.ForeColor = $ink; $lvTr.Font = $fSmall
+[void]$lvTr.Columns.Add('', 90); [void]$lvTr.Columns.Add('', ($trophyW - 20 - 90 - 22))
+$gTrophy.Controls.Add($lvTr)
+$script:trSummary = ''
+function Update-TrophyButton { $arrow = $(if ($gTrophy.Visible) { '^' } else { 'v' }); $btnTrophy.Text = (T 'Trofeos' 'Trophies') + $(if ($script:trSummary) { '   ' + $script:trSummary } else { '' }) + '  ' + $arrow }
+$btnTrophy.Add_Click({ $gTrophy.Visible = -not $gTrophy.Visible; if ($gTrophy.Visible) { $gTrophy.BringToFront(); $btnTrophy.BringToFront() }; Update-TrophyButton })
+
+# ---- version abajo a la izquierda
+$lblVer = New-Object System.Windows.Forms.Label
+$lblVer.AutoSize = $true; $lblVer.BackColor = [System.Drawing.Color]::Transparent; $lblVer.ForeColor = [System.Drawing.Color]::FromArgb(200, 194, 180)
+$lblVer.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$lblVer.Location = New-Object System.Drawing.Point(8, ($H - 20))
+$form.Controls.Add($lblVer)
+function Update-VerLabel {
+	$ev = ''; try { if ($script:S.emu -and (Test-Path -LiteralPath $script:S.emu)) { $ev = Get-EmuLabel $script:S.emu } } catch { }
+	$lblVer.Text = (T 'Lanzador Bloodborne v2' 'Bloodborne launcher v2') + $(if ($ev) { '  -  shadPS4: ' + $ev } else { '' }) + (T '   |   Esc: salir   |   launcher.log junto al lanzador' '   |   Esc: exit   |   launcher.log next to the launcher')
+}
+
 # Desplegables dibujados a mano (estilo Demon's Souls).
-$script:cmbUpRef = $cmbUp
-foreach ($c in @($cmbGame, $cmbEmu, $cmbWin, $cmbInt, $cmbFs, $cmbPres, $cmbFps, $cmbUp, $cmbUpMode, $cmbMode, $cmbFg)) { Set-ComboStyle $c }
+$script:cmbUpRef = $cmbUp; $script:cmbFgRef = $cmbFg
+foreach ($c in @($cmbGame, $cmbEmu, $cmbWin, $cmbInt, $cmbFs, $cmbPres, $cmbFps, $cmbUp, $cmbUpMode, $cmbMode, $cmbFg, $cmbAl, $cmbRx, $cmbSharp)) { Set-ComboStyle $c }
 foreach ($pair in $script:qCombos) { Set-ComboStyle $pair[0] }
 
-# ---- Barra inferior fija como en Demon's Souls: JUGAR grande; Steam y Salir debajo
-$by = 12
-$btnPlay = New-Btn (T 'JUGAR' 'PLAY') $c1 $by $colW 60 $true
-$btnPlay.Font = New-Object System.Drawing.Font('Segoe UI Black', 22, [System.Drawing.FontStyle]::Bold)
-$bar.Controls.Add($btnPlay)
-$bwh = [int](($colW - 10) / 2)
-$btnSteam = New-Btn (T 'Añadir a Steam' 'Add to Steam') $c1 ($by + 70) $bwh 44; $btnSteam.Font = $fBar
-$bar.Controls.Add($btnSteam)
-$btnExit = New-Btn (T 'Salir' 'Exit') ($c1 + $bwh + 10) ($by + 70) $bwh 44; $btnExit.Font = $fBar
-$btnExit.Add_Click({ $form.Close() }); $bar.Controls.Add($btnExit)
+function Update-Up {
+	$i = $cmbUp.SelectedIndex; $u = $script:upscalers[$i]
+	$exp = ($script:S.experimental -eq '1')
+	if (-not $u[2] -and -not $exp) {
+		# Opcion aun no disponible: vuelve a la ultima real.
+		$cmbUp.SelectedIndex = [math]::Max(0, [math]::Min([int]$script:S.upscaler, 1)); return
+	}
+	Set-Setting 'upscaler' $i
+	if ($cmbInt) { $cmbInt.Enabled = -not ($u.Count -gt 3) }  # (10-29) con DLSS / FSR 4 / FSR 3.1 / XeSS la interna la pone la calidad
+	$cmbUpMode.Enabled = ($exp -and -not $u[2])
+	$cmbSharp.Enabled = $true  # (bb-launcher-022) Nitidez desbloqueada para todos los reescaladores
+	$lbUp.Text = $(if ($u[1] -eq 'fsr1') { T 'FSR 1 + RCAS de shadPS4. Nitidez = RCAS (y BB_UPSCALE_SHARPNESS).' 'shadPS4 FSR 1 + RCAS. Sharpness = RCAS (and BB_UPSCALE_SHARPNESS).' } elseif ($u[1] -eq 'native') { T 'Sin reescalado. La Nitidez se envía igual (BB_UPSCALE_SHARPNESS).' 'No upscaling. Sharpness is still sent (BB_UPSCALE_SHARPNESS).' } else { T 'Reescalado real antes del HUD. Nitidez: RCAS en FSR 3.1/FSR 4, paso de nitidez tras DLSS/XeSS (en vivo).' 'Real upscaling before the HUD. Sharpness: RCAS in FSR 3.1/FSR 4, a pass after DLSS/XeSS (live).' })
+}
+$cmbUp.Add_SelectedIndexChanged({ Update-Up })
 
 # ---- logica de la ventana
 $tierCol = @{ 'P' = [System.Drawing.Color]::FromArgb(170, 200, 235); 'G' = [System.Drawing.Color]::FromArgb(236, 196, 72); 'S' = [System.Drawing.Color]::FromArgb(200, 205, 212); 'B' = [System.Drawing.Color]::FromArgb(205, 127, 70) }
@@ -1341,6 +1514,7 @@ function Update-Trophies($g) {
 		}
 	}
 	$lvTr.EndUpdate()
+	$script:trSummary = $(if ($t.Found) { "$($t.Count) / $($t.Total)   ($($t.Pct) %)" } else { '' }); Update-TrophyButton
 }
 function Update-Quality($g) {
 	$exp = ($script:S.experimental -eq '1')
@@ -1369,7 +1543,6 @@ function Update-Quality($g) {
 	} finally { $script:applying = $false }
 	$has60 = @($patches | Where-Object { $_.Name -match $script:pat60 }).Count -gt 0
 	$lbPatch.Text = $(if (-not $g.Serial) { '' } elseif ($patches.Count -eq 0) { T 'Sin parches en user\patches (descárgalos en shadPS4).' 'No patches in user\patches (download them in shadPS4).' } elseif ($script:fpsPatchActive) { T "Límite FPS: Sin límite (parche activo)" "FPS limit: Uncapped (patch active)" } elseif ($has60) { T "Parches: $($patches.Count) (incluye 60 FPS)" "Patches: $($patches.Count) (60 FPS included)" } else { T "Parches: $($patches.Count) (sin 60 FPS)" "Patches: $($patches.Count) (no 60 FPS)" })
-	$cmbFg.Enabled = $exp
 }
 function Update-Game {
 	$g = Test-GameFolder $script:S.game
@@ -1393,6 +1566,7 @@ function Update-Emu {
 		$cfg = $(if (Test-Path -LiteralPath (Join-Path $u 'config.json')) { 'config.json' } elseif (Test-Path -LiteralPath (Join-Path $u 'config.toml')) { 'config.toml' } else { T 'sin config (primera vez)' 'no config yet (first run)' })
 		$hd = Get-HomeDir $u; $lbEmu.Text = "user: $u`n$cfg$(if ($hd) { (T '  |  partidas: ' '  |  saves: ') + $hd })"; $lbEmu.ForeColor = $dim
 	} else { $lbEmu.Text = (T 'Elige la carpeta donde está shadPS4.exe.' 'Choose the folder with shadPS4.exe.'); $lbEmu.ForeColor = [System.Drawing.Color]::FromArgb(230, 110, 100) }
+	try { Update-VerLabel } catch { }
 }
 $script:filling = $false
 function Fill-Lists {
@@ -1484,7 +1658,7 @@ function Show-ControlsPanel {
 		try { if (Write-InputConfig $f $new) { Write-Log "Controles guardados: $f" }; $d.Close() }
 		catch { [void][System.Windows.Forms.MessageBox]::Show((T "No se pudo guardar:`n$_" "Could not save:`n$_"), 'Bloodborne', 'OK', 'Error') }
 	})
-	[void]$d.ShowDialog($form)
+	[void]$d.ShowDialog($fSet)
 }
 $btnInput.Add_Click({ try { Show-ControlsPanel } catch { Write-Log "Controles: $_"; [void][System.Windows.Forms.MessageBox]::Show("$_", 'Bloodborne', 'OK', 'Error') } })
 $btnLogs.Add_Click({
@@ -1503,7 +1677,7 @@ $btnOpt.Add_Click({
 	$cmbWin.SelectedIndex = 0
 	$cmbInt.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:resList, $t[4]))
 	foreach ($k in @('intres', 'upscaler', 'sharp', 'fsmode')) { Mark-Changed $k -Auto }  # el usuario ha pulsado Sí
-	$cmbUp.SelectedIndex = $t[3]; $trkSharp.Value = 75
+	$cmbUp.SelectedIndex = $t[3]; Set-Sharp 75
 	$cmbFs.SelectedIndex = 1
 	$chk16.Checked = ($script:pc.RamGB -gt 0 -and $script:pc.RamGB -le 20)
 	Write-Log "Optimizar: perfil $($t[1]) fps=$fps"
@@ -1515,6 +1689,43 @@ $btnSteam.Add_Click({
 	$form.Cursor = 'Default'
 	[void][System.Windows.Forms.MessageBox]::Show($r, 'Steam', 'OK', 'Information')
 })
+$script:doUpdate = {
+	$form.Cursor = 'WaitCursor'
+	try { $rel = Get-ShadRelease } catch { $form.Cursor = 'Default'; Write-Log "GitHub: $_"; [void][System.Windows.Forms.MessageBox]::Show((T "No se pudo consultar GitHub:`n$_" "Could not query GitHub:`n$_"), 'shadPS4', 'OK', 'Warning'); return }
+	$form.Cursor = 'Default'
+	if (-not $rel.Asset) { [void][System.Windows.Forms.MessageBox]::Show((T "La versión $($rel.Version) no tiene zip de Windows oficial." "Release $($rel.Version) has no official Windows zip."), 'shadPS4', 'OK', 'Information'); return }
+	$have = @($script:emuList | Where-Object { (Split-Path -Leaf (Split-Path -Parent $_)) -match ('^v\.?' + [regex]::Escape($rel.Version) + '(-\d+)?$') })
+	$msg = (T "Última versión oficial: $($rel.Version)  ($($rel.Date.Substring(0, [math]::Min(10, $rel.Date.Length))))`n$($rel.Asset.name)  ($([math]::Round($rel.Asset.size / 1MB)) MB)`nCambios: $($rel.Url)" "Latest official release: $($rel.Version)  ($($rel.Date.Substring(0, [math]::Min(10, $rel.Date.Length))))`n$($rel.Asset.name)  ($([math]::Round($rel.Asset.size / 1MB)) MB)`nChangelog: $($rel.Url)")
+	if ($have.Count) { $msg += "`n`n" + (T "Ya la tienes: $($have[0])" "You already have it: $($have[0])") }
+	$msg += "`n`n" + (T "AVISO: las versiones nuevas pueden guardar las partidas en otro sitio (parecerá partida nueva) y usar otro formato de parches. Tu versión actual no se toca y sigue siendo la elegida." "WARNING: newer versions may store saves elsewhere (it will look like a new game) and use a different patch format. Your current build is kept and stays selected.")
+	$msg += "`n`n" + (T "Sí: instalar en una carpeta nueva (la actual no se toca)`nNo: ver los cambios en el navegador`nCancelar: nada" "Yes: install to a new folder (current one is kept)`nNo: open the changelog in the browser`nCancel: nothing")
+	$r = [System.Windows.Forms.MessageBox]::Show($msg, (T 'Actualizar shadPS4' 'Update shadPS4'), 'YesNoCancel', 'Question')
+	if ($r -eq 'No') { if ($rel.Url) { Start-Process $rel.Url }; return }
+	if ($r -ne 'Yes') { return }
+	$pbUpd.Value = 0; $pbUpd.Visible = $true; $lnkUpd.Enabled = $false; $btnUpd.Enabled = $false; $form.Cursor = 'WaitCursor'
+	try { $exe = Install-ShadRelease $rel $pbUpd } catch { $exe = $null; Write-Log "Actualizar shadPS4: $_"; [void][System.Windows.Forms.MessageBox]::Show((T "No se pudo instalar:`n$_" "Could not install:`n$_"), 'shadPS4', 'OK', 'Error') }
+	$pbUpd.Visible = $false; $lnkUpd.Enabled = $true; $btnUpd.Enabled = $true; $form.Cursor = 'Default'
+	if (-not $exe) { return }
+	[void][System.Windows.Forms.MessageBox]::Show((T "Instalada en:`n$exe`n`nSigues con tu versión de siempre. Para probar la nueva, elígela en la lista (y vuelve a la tuya igual)." "Installed to:`n$exe`n`nYou stay on your usual build. To try the new one, pick it in the list (and pick yours to go back)."), 'shadPS4', 'OK', 'Information')
+	Fill-Lists
+}
+$lnkUpd.Add_LinkClicked({ & $script:doUpdate })
+$btnUpd.Add_Click({ & $script:doUpdate })
+$lnkUser.Add_LinkClicked({
+	$d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = (T 'Carpeta user de shadPS4 (la que tiene config.toml)' 'shadPS4 user folder (with config.toml)')
+	$d.SelectedPath = (Get-UserDir $script:S.emu)
+	if ($d.ShowDialog() -eq 'OK') { Set-Setting 'userdir' $d.SelectedPath; Write-Log "Carpeta user elegida: $($d.SelectedPath)"; Update-Emu; Update-Game }
+})
+$btnPre.Add_Click({
+	$u = Get-UserDir $script:S.emu; $g = Test-GameFolder $script:S.game
+	$cands = @(); if ($g.Serial) { $cands += (Join-Path $u "cache\$($g.Serial)"); $cands += (Join-Path $u "shader\$($g.Serial)") }; $cands += (Join-Path $u 'cache'); $cands += (Join-Path $u 'shader')
+	$d = @($cands | Where-Object { Test-Path -LiteralPath $_ })[0]
+	$n = 0; if ($d) { try { $n = @(Get-ChildItem -LiteralPath $d -Recurse -File -ErrorAction SilentlyContinue).Count } catch { } }
+	$msg = (T 'shadPS4 no tiene precompilado de shaders: los compila la primera vez que aparecen y los guarda en su caché (los tirones solo pasan esa vez).' 'shadPS4 has no shader precompile: it compiles them the first time they appear and keeps them in its cache (stutters only happen that time).')
+	$msg += "`n`n" + $(if ($d) { (T "Caché: $d`nArchivos: $n" "Cache: $d`nFiles: $n") + "`n`n" + (T 'Sí: abrir la carpeta' 'Yes: open the folder') } else { T 'Aún no hay caché de shaders (se crea al jugar).' 'No shader cache yet (it is created while playing).' })
+	if ($d) { if ([System.Windows.Forms.MessageBox]::Show($msg, (T 'Precompilar shaders' 'Precompile shaders'), 'YesNo', 'Information') -eq 'Yes') { Start-Process explorer.exe -ArgumentList ('"' + $d + '"') } }
+	else { [void][System.Windows.Forms.MessageBox]::Show($msg, (T 'Precompilar shaders' 'Precompile shaders'), 'OK', 'Information') }
+})
 $btnPlay.Add_Click({
 	$btnPlay.Enabled = $false
 	try { if (Start-Game) { $form.WindowState = 'Minimized' } } catch { Write-Log "JUGAR: $_"; [void][System.Windows.Forms.MessageBox]::Show("$_", 'Bloodborne', 'OK', 'Error') }
@@ -1523,24 +1734,23 @@ $btnPlay.Add_Click({
 $form.Add_Activated({ if ($script:shownOnce) { try { Update-Game } catch { } } })
 
 $btnX = New-Object System.Windows.Forms.Button
-$btnX.Text = [string][char]0x2715; $btnX.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 13, [System.Drawing.FontStyle]::Bold)
+$btnX.Text = [string][char]0x2715; $btnX.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 14, [System.Drawing.FontStyle]::Bold)
 $btnX.FlatStyle = 'Flat'; $btnX.FlatAppearance.BorderSize = 0
-$btnX.BackColor = [System.Drawing.Color]::FromArgb(10, 9, 12); $btnX.ForeColor = $bone
-$btnX.FlatAppearance.MouseOverBackColor = $blood
-$btnX.Size = New-Object System.Drawing.Size(44, 38); $btnX.Location = New-Object System.Drawing.Point([math]::Max(8, $W - $panelW - 52), 8)
-$btnX.Add_Click({ $form.Close() }); $form.Controls.Add($btnX)
-$lbVer = New-Label (T 'Esc: salir   |   launcher.log junto al lanzador' 'Esc: exit   |   launcher.log next to the launcher') 16 ($H - 28) 420 20 $dim $fSmall
-$form.Controls.Add($lbVer)
+$btnX.BackColor = [System.Drawing.Color]::FromArgb(14, 16, 22); $btnX.ForeColor = $gold
+$btnX.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(180, 40, 40)
+$btnX.Size = New-Object System.Drawing.Size(48, 40); $btnX.Location = New-Object System.Drawing.Point([math]::Max(8, $W - $panelW - 56), 8)  # a la izquierda del panel: no tapa nada
+$btnX.Add_Click({ $form.Close() }); $form.Controls.Add($btnX); $btnX.BringToFront()
 
-# ---- modos: aplicar y volver a Personalizado si se toca algo a mano
+# ---- modos (Preset): aplicar y volver a Personalizado si se toca algo a mano
 $script:applying = $false
 function Update-ModeInfo {
 	$m = Get-Mode
 	$req = $script:modeReq[$m[0]]; if (-not $req) { $req = (T 'pendiente' 'pending') }
-	if ($m[0] -eq 'personalizado') { $lbMode.Text = (T "Tus ajustes. Requisitos: $req" "Your settings. Requirements: $req") }
-	else { $lbMode.Text = (T "$($m[2]) reales, $($m[4]) con FG (próx.). Requisitos: $req" "$($m[2]) real, $($m[4]) with FG (soon). Requirements: $req") }
-	if ($m[6] -eq 1 -and $cmbFps.SelectedIndex -eq 0) { $lbMode.Text = (T "Necesita el parche de 60 FPS: elige 60 en Límite FPS. Requisitos: $req" "Needs the 60 FPS patch: pick 60 in FPS limit. Requirements: $req") }
-	$tips.SetToolTip($cmbMode, (T 'Hoy shadPS4 aplica la resolución y 30/60 FPS (parche de 60, necesario también para 45). Frame generation y el tope de 45 FPS llegarán con el emulador propio (BB_FG, BB_FPS_CAP).' 'Today shadPS4 applies resolution and 30/60 FPS (60 patch, also needed for 45). Frame generation and the 45 FPS cap come with our own emulator (BB_FG, BB_FPS_CAP).'))
+	$tip = (T 'Preset: fija resolución interna, reescalado, nitidez, frame generation y calidad. Personalizado = lo que elijas. Hoy shadPS4 aplica la resolución y 30/60 FPS (parche de 60, necesario también para 45); el tope de 45 llega con el emulador propio (BB_FPS_CAP).' 'Preset: sets internal resolution, upscaling, sharpness, frame generation and quality. Custom = your choice. Today shadPS4 applies resolution and 30/60 FPS (60 patch, also needed for 45); the 45 cap comes with our own emulator (BB_FPS_CAP).')
+	if ($m[0] -eq 'personalizado') { $tip += "`n" + (T "Requisitos: $req" "Requirements: $req") }
+	else { $tip += "`n" + (T "$($m[2]) reales, $($m[4]) con FG. Requisitos: $req" "$($m[2]) real, $($m[4]) with FG. Requirements: $req") }
+	if ($m[6] -eq 1 -and $cmbFps.SelectedIndex -eq 0) { $tip += "`n" + (T 'Necesita el parche de 60 FPS: elige 60 en Límite FPS.' 'Needs the 60 FPS patch: pick 60 in FPS limit.') }
+	$tips.SetToolTip($cmbMode, $tip)
 }
 function Apply-Mode {
 	$m = Get-Mode
@@ -1551,8 +1761,8 @@ function Apply-Mode {
 		$cmbInt.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:resList, $m[5]))
 		# El modo NO toca parches ni mods: el parche de 60 (necesario para 45/60) solo cambia si el usuario cambia la fila FPS.
 		if ($m[6] -eq 1 -and $cmbFps.SelectedIndex -eq 0) { Write-Log "Modo $($m[0]): necesita el parche de 60 FPS activado (no se activa solo)" }
-		$cmbUp.SelectedIndex = $m[7]; $cmbUpMode.SelectedIndex = $m[8]; $trkSharp.Value = $m[9]
-		$cmbFg.SelectedIndex = $(if ($m[3]) { 1 } else { 0 })
+		$cmbUp.SelectedIndex = $m[7]; $cmbUpMode.SelectedIndex = $m[8]; Set-Sharp $m[9]
+		$cmbFg.SelectedIndex = $(if ($m[3]) { [math]::Max(0, [array]::IndexOf(@($script:fgModes | ForEach-Object { $_[1] }), $m[3])) } else { 0 })
 		$qk = @('q_shadows', 'q_ao', 'q_fog', 'q_aniso')
 		for ($i = 0; $i -lt 4; $i++) { foreach ($pair in $script:qCombos) { if ($pair[1][0] -eq $qk[$i]) { $pair[0].SelectedIndex = [math]::Min($m[10][$i], $pair[0].Items.Count - 1) } } }
 	} finally { $script:applying = $false }
@@ -1561,17 +1771,17 @@ function Apply-Mode {
 $cmbMode.Add_SelectionChangeCommitted({ Apply-Mode; if ((Get-Mode)[0] -ne 'personalizado') { foreach ($k in @('intres', 'upscaler', 'sharp')) { Mark-Changed $k -Auto } } })  # solo al elegirlo a mano
 $cmbMode.Add_SelectedIndexChanged({ Update-ModeInfo })
 $toCustom = { if (-not $script:applying -and $cmbMode.SelectedIndex -ne 4) { $cmbMode.SelectedIndex = 4 } }
-foreach ($ctl in @($cmbInt, $cmbFps, $cmbUp, $cmbUpMode, $cmbFg)) { $ctl.Add_SelectionChangeCommitted($toCustom) }
+foreach ($ctl in @($cmbInt, $cmbFps, $cmbUp, $cmbUpMode, $cmbFg, $cmbSharp)) { $ctl.Add_SelectionChangeCommitted($toCustom) }
 # Marcas de cambio: solo acciones del usuario (no los cambios hechos por el programa).
 $cmbWin.Add_SelectionChangeCommitted({ Mark-Changed 'winres' }); $cmbInt.Add_SelectionChangeCommitted({ Mark-Changed 'intres' })
 $cmbFs.Add_SelectionChangeCommitted({ Mark-Changed 'fsmode' }); $cmbPres.Add_SelectionChangeCommitted({ Mark-Changed 'present' })
-$cmbUp.Add_SelectionChangeCommitted({ Mark-Changed 'upscaler' }); $trkSharp.Add_Scroll({ Mark-Changed 'sharp' })
+$cmbUp.Add_SelectionChangeCommitted({ Mark-Changed 'upscaler' }); $cmbSharp.Add_SelectionChangeCommitted({ Mark-Changed 'sharp' })
 $chkHdr.Add_Click({ Mark-Changed 'hdr' }); $chkMotion.Add_Click({ Mark-Changed 'motion' }); $chkBg.Add_Click({ Mark-Changed 'bginput' })
-$trkSharp.Add_Scroll($toCustom)
 foreach ($pair in $script:qCombos) { $pair[0].Add_SelectionChangeCommitted($toCustom) }
 
-Fill-Lists; Update-Up; Update-ModeInfo
-$form.ResumeLayout($true)
+Fill-Lists; Update-Up; Update-ModeInfo; Update-LatBox; Update-VerLabel; Update-TrophyButton
+Write-SharpLive
+$panel.ResumeLayout($true); $form.ResumeLayout($true)
 $form.Add_Shown({ $form.Refresh(); $form.Opacity = 1; $script:shownOnce = $true })
 [void]$form.ShowDialog()
 Write-Log 'Lanzador cerrado'

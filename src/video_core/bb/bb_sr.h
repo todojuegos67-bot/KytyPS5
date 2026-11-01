@@ -75,6 +75,8 @@ bool Preload();                      // true when Streamline was loaded (BB_UPSC
 const wchar_t* LoaderPath();         // sl.interposer.dll, or null
 bool Manual();                       // BB_SL_NO_INTERPOSER_LOADER=1: slSetVulkanInfo after the device
 bool Loaded();                       // slInit succeeded (DLSS or DLSS-G asked)
+uint32_t NextFrameIndex();           // the one Streamline frame index stream (DLSS and DLSS-G)
+uint32_t LastFrameIndex();           // the index of the last DLSS evaluate
 void* Proc(const char* name);        // an sl.interposer.dll export
 bool FeatureReady(uint32_t feature, vk::PhysicalDevice physical); // supported and loaded
 void* FeatureProc(uint32_t feature, const char* name);            // slGetFeatureFunction
