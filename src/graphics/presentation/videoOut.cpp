@@ -1303,13 +1303,18 @@ void FlipQueue::WaitForSubmitSlot() {
 	}
 }
 
+// The GPU thread's WAIT_FLIP_DONE: until no flip of that buffer is pending. Not the CPU flips (m_cpu_requests): one
+// leaves there only when this thread runs its flip preparation (GuestGpu::SubmitFlipPreparation), which is queued behind
+// the command buffer waiting here (VideoOutSubmitFlip reserves the flip before it enqueues the preparation, and the
+// GPU thread runs behind the game), so waiting for one never ended: the GPU thread waited for itself and the game froze
+// (at the Sony intro of Demon's Souls, about 1 boot in 3 on some builds). On the console a CPU flip is no work of the
+// GPU queue that waits.
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 
 	auto has_request = [this, &cfg, index] {
 		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
-		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+		return std::any_of(m_requests.begin(), m_requests.end(), matches);
 	};
 	while (has_request()) {
 		m_done_cond_var.Wait(&m_mutex);
