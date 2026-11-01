@@ -95,6 +95,8 @@ std::atomic<bool>        g_trophy_page {false};      // (port34) F1 > Ver trofeo
 // (ds-pc-port37) F1 > Mapear mando / Teclado y raton: the page shown (0 none, 1 pad mapper, 2 keyboard and mouse), and a
 // key or mouse button being captured for a binding (the window thread writes its SDL name; Esc cancels).
 std::atomic<int>         g_f1_page {0};
+std::atomic<int>         g_page_scroll {0}; // (ds-pc-port37) L1 (up) / L2 (down) presses for the F1 page's list
+bool                     g_l2_down = false;
 std::atomic<bool>        g_kbm_capture {false};
 std::mutex               g_capture_mutex;
 std::string              g_captured; // "" while waiting; "\x1b" cancelled
@@ -280,6 +282,19 @@ bool OnEvent(const SDL_Event& e) {
 				return true;
 			}
 			if (!open) return false;
+			// (ds-pc-port37) The F1 pages: Circle back to the F1 menu, L1 scrolls up (L2, a trigger, below).
+			if (g_f1_page.load() != 0 && !g_popup.load()) {
+				if (b == SDL_CONTROLLER_BUTTON_B) {
+					g_f1_page = 0;
+					Bump();
+					return true;
+				}
+				if (b == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
+					g_page_scroll--;
+					Bump();
+					return true;
+				}
+			}
 			if (b == SDL_CONTROLLER_BUTTON_B && !g_popup.load()) {
 				if (g_trophy_page.exchange(false)) {
 					g_focus_trophy_btn_request = true;
@@ -310,6 +325,15 @@ bool OnEvent(const SDL_Event& e) {
 			}
 			if (!open) return false;
 			const float v = e.caxis.value / (e.caxis.value < 0 ? 32768.0f : 32767.0f);
+			if (e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT) {
+				// (ds-pc-port37) L2 on an F1 page: scrolls down, once a press.
+				if (v > 0.5f && !g_l2_down && g_f1_page.load() != 0) {
+					g_page_scroll++;
+					Bump();
+				}
+				g_l2_down = v > 0.5f ? true : (v < 0.3f ? false : g_l2_down);
+				return true;
+			}
 			if (e.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY) {
 				Queue({Input::Analog, ImGuiKey_GamepadLStickUp, v < -0.35f, std::max(-v, 0.0f)});
 				Queue({Input::Analog, ImGuiKey_GamepadLStickDown, v > 0.35f, std::max(v, 0.0f)});
@@ -4136,8 +4160,9 @@ void SaveNow() {
 // Both pages: a centred window; false when the page closes.
 bool Begin(const char* title, float width, float height, float unit) {
 	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, 160));
-	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
-	ImGui::SetNextWindowSize({std::min(width * 0.94f, 1500 * unit), std::min(height * 0.92f, 980 * unit)}, ImGuiCond_Always);
+	// (Full screen, as the trophy page.)
+	ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
+	ImGui::SetNextWindowSize({width, height}, ImGuiCond_Always);
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.03f, 0.035f, 0.96f});
 	ImGui::Begin(title, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 	ImGui::TextColored(kGold, "%s", I18n::T(title));
@@ -4156,6 +4181,8 @@ bool Footer(float unit) {
 		ImGui::SameLine();
 	}
 	if (ImGui::Button(I18n::T("Volver"), {220 * unit, 46 * unit})) close = true;
+	ImGui::SameLine();
+	ImGui::TextDisabled("%s", I18n::T("L1 / L2: desplazarse   Círculo / Esc: volver"));
 	if (!g_note.empty()) {
 		ImGui::SameLine();
 		ImGui::TextColored(kDim, "%s", g_note.c_str());
@@ -4168,6 +4195,7 @@ bool Footer(float unit) {
 bool DrawPad(float width, float height, float unit) {
 	Begin("Mapear mando", width, height, unit);
 	ImGui::BeginChild("##padpage", {0, -64 * unit});
+	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	(void)PadMap::Draw(g_edit, unit);
 	ImGui::EndChild();
 	return Footer(unit);
@@ -4190,6 +4218,7 @@ bool DrawKbm(float width, float height, float unit) {
 	LoadMouse();
 	Begin("Teclado y ratón", width, height, unit);
 	ImGui::BeginChild("##kbmpage", {0, -64 * unit});
+	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	ImGui::Checkbox(I18n::T("Jugar con teclado y ratón"), &g_edit.kbm);
 	ImGui::TextWrapped("%s", I18n::T("WASD para moverse, el ratón mueve la cámara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. F7 suelta o captura el ratón. Si juegas con mando, déjalo desactivado."));
 	ImGui::BeginDisabled(!g_edit.kbm);
