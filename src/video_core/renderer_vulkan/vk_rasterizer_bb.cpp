@@ -969,7 +969,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     const vk::DescriptorImageInfo bare_info{g_bb.linear, g_bb.present_in.view,
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
     const vk::DescriptorImageInfo out_info{{}, g_bb.present.view, vk::ImageLayout::eGeneral};
-    const vk::DescriptorBufferInfo lum_info{g_bb.lum_buffer, 0, 16};
+    const vk::DescriptorBufferInfo lum_info{g_bb.lum_buffer, 0, 32};
     const std::array writes{
         vk::WriteDescriptorSet{
             .dstBinding = 0,

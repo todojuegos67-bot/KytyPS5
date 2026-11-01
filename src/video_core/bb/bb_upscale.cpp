@@ -361,6 +361,7 @@ struct FrameState {
     u64 draws = 0;
     u32 scene_draws = 0;
     u32 scanned = 0;
+    bool camera_ok = false; // a translated view-projection seen in two scene draws
     u64 scanned_draw = ~0ULL;
     u32 flip_draws = 0, hud_draws = 0, hud_other = 0, src_rewrites = 0;
     bool injected = false, inject_failed = false, redirecting = false, hudless = false;
@@ -536,13 +537,16 @@ const Candidate* BestCamera() {
     for (const auto& c : g_frame.camera) {
         if (translated(c) && (best == nullptr || c.count > best->count)) best = &c;
     }
-    if (best == nullptr) {
-        for (const auto& c : g_frame.camera) {
-            if (best == nullptr || c.count > best->count) best = &c;
-        }
+    // The full (translated) view-projection is often only in a few draws' constants (lighting /
+    // fog passes): seen twice in the frame's scene draws is enough. Requiring a third of all
+    // scanned draws rejected it in most gameplay frames ("no camera yet", no jitter, zero MV).
+    if (best != nullptr && best->count >= 2) return best;
+    best = nullptr;
+    for (const auto& c : g_frame.camera) {
+        if (best == nullptr || c.count > best->count) best = &c;
     }
     if (best == nullptr) return nullptr;
-    const u32 need = std::max<u32>(3, g_frame.scanned / 3);
+    const u32 need = std::max<u32>(3, g_frame.scanned / 8);
     return best->count >= need ? best : nullptr;
 }
 
@@ -1313,7 +1317,8 @@ bool WantCameraScan(bool vertex) {
     }
     std::scoped_lock lk{g_mutex};
     const bool want = g_draw.valid && g_draw.scene &&
-                      (g_frame.scanned < 160 || (vertex && Cfg().jitter && !g_draw.vertex_camera));
+                      (g_frame.scanned < 160 || !g_frame.camera_ok ||
+                       (vertex && Cfg().jitter && !g_draw.vertex_camera));
     if (!want) ++g_diag_noscene;
     return want;
 }
@@ -1341,7 +1346,7 @@ void OnVertexConstants(const void* data, size_t size) {
     }
     const size_t n = std::min<size_t>(size, 4096) / 4;
     const float* w = static_cast<const float*>(data);
-    const bool jitter_only = f.scanned >= 160;
+    const bool jitter_only = f.scanned >= 160 && f.camera_ok;
     for (size_t at = 0; at + 16 <= n; at += 4) {
         for (int layout = 0; layout < 2; ++layout) {
             Mat m;
@@ -1396,6 +1401,9 @@ void OnVertexConstants(const void* data, size_t size) {
             } else if (it->last_draw != draw) {
                 ++it->count;
                 it->last_draw = draw;
+                if (it->count >= 2 && std::fabs(m.m[3]) + std::fabs(m.m[7]) + std::fabs(m.m[15]) > 1e-3) {
+                    f.camera_ok = true;
+                }
             }
         }
     }
