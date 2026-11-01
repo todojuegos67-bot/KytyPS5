@@ -220,6 +220,14 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 	}
 }
 
+bool Speculation::ChunkInOrder() {
+	static auto& on = LiveSwitch::Find("spec_chunk_in_order", [] {
+		const char* value = std::getenv("KYTY_SPEC_CHUNK_IN_ORDER");
+		return value != nullptr ? std::atoll(value) : 0ll;
+	}());
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 const Spec::State* Speculation::RecordOf(uint64_t serial, uint32_t chunk) {
 	const auto* entry = EntryOf(serial);
 	return entry != nullptr && chunk < entry->chunks.size() ? entry->chunks[chunk].record.get() : nullptr;
@@ -391,7 +399,9 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 		// The normal way: the speculation's threads do not begin it, nor, its end unknown, any chunk of it after it.
 		const auto take = [&] {
 			chunk_end();
-			const auto taken = end ? chunk : UINT32_MAX;
+			// (KYTY_SPEC_CHUNK_IN_ORDER: a chunk the pass has not cut is translated here up to where the pass will end it;
+			// the chunks after it stay the speculation's threads'.)
+			const auto taken = end || ChunkInOrder() ? chunk : UINT32_MAX;
 			if (job.serial > m_taken || (job.serial == m_taken && taken > m_taken_chunk)) {
 				m_taken       = job.serial;
 				m_taken_chunk = taken;
@@ -579,6 +589,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			r.state.previous = nullptr;
 		// (Where its effects begin, as it becomes the translation going on: the log keeps what it may need.)
 		r.effects_from     = m_log.End();
+		r.state.log_end    = &m_log.end;
 		translator.current = &r;
 	}
 	r.state.Inherit();
@@ -771,6 +782,10 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 			const auto& read = state.clean_reads[i];
 			if (resources.UnmappedSince(epochs.mapping, read.begin, read.end - read.begin)) return "commit: memory unmapped";
 		}
+		for (size_t i = from.late_reads; i < segment.end.late_reads; ++i) {
+			const auto& read = state.late_reads[i];
+			if (resources.UnmappedSince(epochs.mapping, read.begin, read.end - read.begin)) return "commit: memory unmapped";
+		}
 		for (const auto& use: segment.images)
 			if (resources.UnmappedSince(epochs.mapping, use.image->info.data.address, use.image->info.data.size))
 				return "commit: memory unmapped";
@@ -829,7 +844,22 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 						if (const auto* write = m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin))
 							return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
 					}
-			} else if (!effects.gpu_writes.Empty() || !effects.host_writes.Empty())
+				// (KYTY_SPEC_LATE_READS: a late read, by the processor's writes logged after it was read, and GPU work's since
+				// the speculation began: a GPU write is logged as its work is recorded, before it reaches memory, and its
+				// page's read protection may be deferred, PageManager::DeferReadProtection.)
+				if (any_since)
+					for (size_t i = from.late_reads; i < to.late_reads; ++i) {
+						const auto& read  = state.late_reads[i];
+						const auto  bytes = read.end - read.begin;
+						if (!m_log.stamps.MaybeSince(read.begin, bytes, result.effects_from)) continue;
+						if (const auto* gpu = m_log.FirstGpuWriteOver(result.effects_from, read.begin, bytes))
+							return ++m_stop_reasons[WroteWhatItRead(gpu)], Progress::Stopped;
+						const auto since = std::max(result.effects_from, read.since);
+						if (m_log.End() <= since || !m_log.stamps.MaybeSince(read.begin, bytes, since)) continue;
+						if (const auto* write = m_log.FirstWriteOver(since, read.begin, bytes))
+							return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
+					}
+			} else if (!effects.gpu_writes.Empty() || !effects.host_writes.Empty()) {
 				for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
 					const auto& read = state.clean_reads[i];
 					if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
@@ -838,6 +868,16 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 						                                                             read.end - read.begin))],
 						       Progress::Stopped;
 				}
+				// (Late reads as clean ones here: every write since it began.)
+				for (size_t i = from.late_reads; i < to.late_reads; ++i) {
+					const auto& read = state.late_reads[i];
+					if (effects.gpu_writes.Intersects(read.begin, read.end - read.begin) ||
+					    effects.host_writes.Intersects(read.begin, read.end - read.begin))
+						return ++m_stop_reasons[WroteWhatItRead(m_log.FirstWriteOver(result.effects_from, read.begin,
+						                                                             read.end - read.begin))],
+						       Progress::Stopped;
+				}
+			}
 			// The descriptor sets it binds: none retired since (one may be reused under it).
 			for (const auto retired: effects.retired_sets)
 				if (std::find(state.sets.begin() + static_cast<ptrdiff_t>(from.sets),

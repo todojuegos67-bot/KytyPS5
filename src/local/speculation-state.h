@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <immintrin.h>
@@ -31,6 +32,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -67,8 +69,23 @@ struct WaitCheck {
 // The notes' counts: a segment's notes are those after the previous segment's counts, up to its own.
 struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
-	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0;
+	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
+	       late_reads = 0;
 };
+
+// A late read (State::late_reads): the range, and the effects log's end before it was read.
+struct LateRead {
+	uint64_t begin = 0, end = 0, since = 0;
+};
+
+// KYTY_SPEC_LATE_READS (live spec_late_reads, default off): State::late_reads.
+inline bool LateReads() {
+	static auto& on = LiveSwitch::Find("spec_late_reads", [] {
+		const char* value = std::getenv("KYTY_SPEC_LATE_READS");
+		return value != nullptr ? std::atoll(value) : 0ll;
+	}());
+	return on.load(std::memory_order_relaxed) != 0;
+}
 
 // An image's barrier state as a segment found it (the commit transitions the image there first if other work moved
 // it since) and as it left it.
@@ -187,6 +204,16 @@ struct State {
 	// - the sources and destinations of the copies it makes on the CPU at its commit (in order: what the guest or the
 	//   processor writes there before is copied, or copied over): no GPU work may have written them since.
 	std::vector<Range> cpu_copies;
+	// - guest memory it read on the CPU where its chain had a pending write when it began, whose speculation or record
+	//   was unlinked since (made, so in memory: KYTY_SPEC_LATE_READS), with the effects log's end before the read: only
+	//   the processor's writes logged after that, or GPU work's since it began, stop the commit. (As a clean read, the
+	//   write it read, logged after the speculation began, stopped it: the graphics queue's linear copy to its
+	//   constants in the submission before, unlinked by its Done while a chunk of the next one translated, a correct
+	//   read stopping the rest of the chunk, ~0.35 ms a frame of in-order translation at the arch, 1 Nov.)
+	std::vector<LateRead>        late_reads;
+	const std::atomic<uint64_t>* log_end    = nullptr; // (the effects log's end: Speculation::m_log)
+	bool                         late       = false;   // (ReadWord: the word it read was such a read; late_since before it)
+	uint64_t                     late_since = 0;
 	std::vector<GuestRange>                  bda;
 	bool                                     bda_all = false; // the open segment's
 	std::vector<MemoryWrite>                 writes;
@@ -228,7 +255,8 @@ struct State {
 	[[nodiscard]] Counts Sizes() const noexcept {
 		return {current.size(),        written.size(),         bda.size(),         invalidated.size(), writes.size(),
 		        touched_images.size(), touched_buffers.size(), clean_reads.size(), feedbacks.size(), buffer_ranges.size(),
-		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size()};
+		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
+		        late_reads.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -273,6 +301,12 @@ struct State {
 	void NoteCleanRead(uint64_t address, uint64_t size) { (void)Note(clean_reads, Sealed().clean_reads, address, size); }
 	void NoteBufferRange(uint64_t address, uint64_t size) { (void)Note(buffer_ranges, Sealed().buffer_ranges, address, size); }
 	void NoteCpuCopy(uint64_t address, uint64_t size) { (void)Note(cpu_copies, Sealed().cpu_copies, address, size); }
+	void NoteLateRead(uint64_t address, uint64_t size, uint64_t since) {
+		if (late_reads.size() > Sealed().late_reads && late_reads.back().end == address && late_reads.back().since == since)
+			late_reads.back().end = address + size;
+		else
+			late_reads.push_back({address, address + size, since});
+	}
 	void NoteSet(uint64_t set) {
 		if (sets.size() == Sealed().sets || sets.back() != set) sets.push_back(set);
 	}
@@ -346,9 +380,13 @@ struct State {
 		}
 		if (bytes != 0 && !journal_set.Intersects(address, bytes) && !written_set.Intersects(address, bytes) &&
 		    !chain_written.Intersects(address, bytes) &&
-		    (previous.load(std::memory_order_relaxed) == nullptr || !chain_journal.Intersects(address, bytes))) {
+		    (previous.load(std::memory_order_acquire) == nullptr || !chain_journal.Intersects(address, bytes))) {
+			// (Its chain unlinked meanwhile, with a pending write over it when it began: a late read.)
+			const bool     read_late = clean && log_end != nullptr && LateReads() && chain_journal.Intersects(address, bytes);
+			const uint64_t since     = read_late ? log_end->load(std::memory_order_acquire) : 0;
 			if (!CopyGuest(out, address, bytes)) return false;
-			if (clean) NoteCleanRead(address, bytes);
+			if (read_late) NoteLateRead(address, bytes, since);
+			else if (clean) NoteCleanRead(address, bytes);
 			return true;
 		}
 		// (KYTY_SPECULATE_COPY_RUNS, live speculate_copy_runs 0: word by word, as before.)
@@ -359,7 +397,8 @@ struct State {
 			const uint64_t at = address + 4ull * i;
 			const State*   by = nullptr;
 			if (!ReadWord(at, out[i], by)) return false;
-			if (by == nullptr && clean) NoteCleanRead(at, 4);
+			if (by == nullptr && clean && std::exchange(late, false)) NoteLateRead(at, 4, late_since);
+			else if (by == nullptr && clean) NoteCleanRead(at, 4);
 			else if (by != nullptr && by != this) chain_reads.push_back({at, out[i]});
 		}
 		return true;
@@ -377,13 +416,18 @@ struct State {
 	}
 	// One word (ReadJournaled): `by` the speculation whose pending write gave it (null: memory).
 	[[nodiscard]] bool ReadWord(uint64_t at, uint32_t& value, const State*& by) {
+		late = false;
 		if (journal_set.Intersects(at, 4)) return Resolve(*this, at, value, by);
 		if (written_set.Intersects(at, 4)) return false;
-		if (chain_journal.Intersects(at, 4))
+		if (chain_journal.Intersects(at, 4)) {
 			for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) {
 				if (state->journal_set.Intersects(at, 4)) return Resolve(*state, at, value, by);
 				if (state->written_set.Intersects(at, 4)) return false;
 			}
+			// (Its speculation or record unlinked since it began: a late read, the log's end taken before it.)
+			if (log_end != nullptr && LateReads() && !chain_written.Intersects(at, 4))
+				late = true, late_since = log_end->load(std::memory_order_acquire);
+		}
 		// (A previous speculation's work's; a write of one finished since is in memory, or will be: a clean read.)
 		if (chain_written.Intersects(at, 4)) return false;
 		return CopyGuest(&value, at, 4);
@@ -461,6 +505,7 @@ struct State {
 		chain_reads.resize(std::min(chain_reads.size(), checkpoint.chain_reads));
 		waits.resize(std::min(waits.size(), checkpoint.waits));
 		cpu_copies.resize(std::min(cpu_copies.size(), checkpoint.cpu_copies));
+		late_reads.resize(std::min(late_reads.size(), checkpoint.late_reads));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -475,6 +520,8 @@ struct State {
 		chain_reads.clear();
 		waits.clear();
 		cpu_copies.clear();
+		late_reads.clear();
+		late = false;
 		bda.clear();
 		bda_all = false;
 		writes.clear();

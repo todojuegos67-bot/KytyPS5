@@ -91,6 +91,11 @@ public:
 	                                  std::optional<Pm4Execution>& end);
 	void                  Done(uint64_t serial, const CommandProcessor& cp);
 	static constexpr uint32_t ChunkWork = 128;
+	// KYTY_SPEC_CHUNK_IN_ORDER (live spec_chunk_in_order, default off): a chunk the state pass has not cut when the GPU
+	// thread comes for it ("not passed yet") is translated in order up to where the pass will end it (ChunkWork draws
+	// and dispatches from its start), not to the command buffer's end; the chunks after it stay the speculation's
+	// threads' (~1.3 ms of in-order translation each, 0.4-0.9 ms a frame at the arch, 1 Nov).
+	[[nodiscard]] static bool ChunkInOrder();
 	// The graphics queue's time in a slice of a command buffer (the report's total).
 	void NoteQueueTime(uint64_t ns) noexcept { m_queue_ns += ns; }
 	// What the normal translation does while a speculation is not committed (Spec::t_effects of the thread that
