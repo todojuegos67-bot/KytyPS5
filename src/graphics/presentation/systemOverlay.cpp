@@ -27,6 +27,11 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
+
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -423,6 +428,110 @@ void CheckVulkanResult(VkResult result) {
 	EXIT_IF(result != VK_SUCCESS);
 }
 
+// A button's width: `minimum`, or its label's with the frame's padding when that is wider.
+float LabelWidth(const char* label, float minimum) {
+	return std::max(minimum, ImGui::CalcTextSize(label).x + 2.0f * ImGui::GetStyle().FramePadding.x);
+}
+
+bool FileExists(const std::string& path) {
+	FILE* file = std::fopen(path.c_str(), "rb");
+	if (file != nullptr) std::fclose(file);
+	return file != nullptr;
+}
+
+#ifndef _WIN32
+// The faces fontconfig picks for Chinese, Japanese and Korean, as `fc-match ":lang=ko"` does, each kept only when it
+// has that script's characters (a match is always some font) and is not a file already kept (Noto Sans CJK's
+// collection holds all three): (file, index in a collection). libfontconfig is opened at run time; without it, none.
+std::vector<std::pair<std::string, int>> FontconfigCjkFaces() {
+	std::vector<std::pair<std::string, int>> faces;
+	void* module = ::dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_LOCAL);
+	if (module == nullptr) {
+		return faces;
+	}
+	// (FcResultMatch and FcMatchPattern are 0, FcBool an int.)
+	const auto init        = reinterpret_cast<int (*)()>(::dlsym(module, "FcInit"));
+	const auto parse       = reinterpret_cast<void* (*)(const unsigned char*)>(::dlsym(module, "FcNameParse"));
+	const auto substitute  = reinterpret_cast<int (*)(void*, void*, int)>(::dlsym(module, "FcConfigSubstitute"));
+	const auto defaults    = reinterpret_cast<void (*)(void*)>(::dlsym(module, "FcDefaultSubstitute"));
+	const auto match       = reinterpret_cast<void* (*)(void*, void*, int*)>(::dlsym(module, "FcFontMatch"));
+	const auto get_string  = reinterpret_cast<int (*)(const void*, const char*, int, unsigned char**)>(
+	    ::dlsym(module, "FcPatternGetString"));
+	const auto get_integer = reinterpret_cast<int (*)(const void*, const char*, int, int*)>(
+	    ::dlsym(module, "FcPatternGetInteger"));
+	const auto get_charset = reinterpret_cast<int (*)(const void*, const char*, int, void**)>(
+	    ::dlsym(module, "FcPatternGetCharSet"));
+	const auto has_char    = reinterpret_cast<int (*)(const void*, uint32_t)>(::dlsym(module, "FcCharSetHasChar"));
+	const auto destroy     = reinterpret_cast<void (*)(void*)>(::dlsym(module, "FcPatternDestroy"));
+	if (init == nullptr || parse == nullptr || substitute == nullptr || defaults == nullptr || match == nullptr ||
+	    get_string == nullptr || get_integer == nullptr || get_charset == nullptr || has_char == nullptr ||
+	    destroy == nullptr || init() == 0) {
+		return faces;
+	}
+	static constexpr std::array<std::pair<const char*, uint32_t>, 3> languages {
+	    {{":lang=zh-cn", 0x4E2D}, {":lang=ja", 0x306E}, {":lang=ko", 0xAC00}}};
+	for (const auto& [language, sample]: languages) {
+		void* pattern = parse(reinterpret_cast<const unsigned char*>(language));
+		if (pattern == nullptr) {
+			continue;
+		}
+		substitute(nullptr, pattern, 0);
+		defaults(pattern);
+		int   result = 0;
+		void* font   = match(nullptr, pattern, &result);
+		destroy(pattern);
+		if (font == nullptr) {
+			continue;
+		}
+		unsigned char* file    = nullptr;
+		void*          charset = nullptr;
+		int            index   = 0;
+		if (get_string(font, "file", 0, &file) == 0 && file != nullptr &&
+		    get_charset(font, "charset", 0, &charset) == 0 && has_char(charset, sample) != 0) {
+			get_integer(font, "index", 0, &index);
+			std::string path(reinterpret_cast<const char*>(file));
+			if (FileExists(path) &&
+			    std::none_of(faces.begin(), faces.end(), [&](const auto& face) { return face.first == path; })) {
+				faces.emplace_back(std::move(path), index);
+			}
+		}
+		destroy(font);
+	}
+	return faces;
+}
+#endif
+
+// The system's CJK faces for the dialogs: the first one theirs, the others merged into it for what it lacks (file,
+// index in a collection).
+std::vector<std::pair<std::string, int>> DialogFontFaces() {
+	std::vector<std::pair<std::string, int>> faces;
+#ifdef _WIN32
+	const char* windows = std::getenv("WINDIR");
+	const auto  fonts   = std::string(windows != nullptr ? windows : "C:\\Windows") + "\\Fonts\\";
+	for (const char* face: {"msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"}) {
+		if (FileExists(fonts + face)) {
+			faces.emplace_back(fonts + face, 0);
+			break;
+		}
+	}
+	// Hangul from Malgun Gothic: the Chinese faces have none.
+	if (FileExists(fonts + "malgun.ttf")) {
+		faces.emplace_back(fonts + "malgun.ttf", 0);
+	}
+#else
+	faces = FontconfigCjkFaces();
+	// Without fontconfig: Noto Sans CJK where the distributions put it (Arch and SteamOS, Debian and Ubuntu, Fedora).
+	for (const char* path: {"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+	                        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+	                        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"}) {
+		if (faces.empty() && FileExists(path)) {
+			faces.emplace_back(path, 0);
+		}
+	}
+#endif
+	return faces;
+}
+
 } // namespace
 
 void InitializeSystemOverlayInput() {
@@ -659,29 +768,31 @@ struct SystemOverlay::Impl {
 #ifdef _WIN32
 		const char* windows = std::getenv("WINDIR");
 		const auto  fonts   = std::string(windows != nullptr ? windows : "C:\\Windows") + "\\Fonts\\";
-		const auto  exists  = [](const std::string& path) {
-			FILE* file = std::fopen(path.c_str(), "rb");
-			if (file != nullptr) std::fclose(file);
-			return file != nullptr;
-		};
-		if (exists(fonts + "segoeuib.ttf")) {
+		if (FileExists(fonts + "segoeuib.ttf")) {
 			hud_font = io.Fonts->AddFontFromFileTTF((fonts + "segoeuib.ttf").c_str(), 32.0f);
 		}
-		// The dialogs draw the game's own texts (save names and their detail, messages), which are not
-		// ASCII: the system's CJK face where Windows has one, with the ranges those texts use. Plain
-		// "?" for every character is what the default font, which only holds ASCII, drew before.
-		for (const char* face: {"msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"}) {
-			if (!exists(fonts + face)) {
+#endif
+		// The dialogs draw the game's own texts (save names and their detail, messages, the keyboard's
+		// title), which are not ASCII: the system's CJK faces, the first one the dialogs' and the others
+		// merged into it for the characters it lacks. Their glyphs load as they are drawn (the atlas is
+		// dynamic), so no ranges. Plain "?" for every character is what the default font, which only
+		// holds ASCII, drew before (on Linux until issue #264, where none was looked for).
+		std::string used;
+		for (const auto& [path, index]: DialogFontFaces()) {
+			ImFontConfig config;
+			config.FontNo    = index;
+			config.MergeMode = dialog_font != nullptr;
+			ImFont* font     = io.Fonts->AddFontFromFileTTF(path.c_str(), 32.0f, &config);
+			if (font == nullptr) {
 				continue;
 			}
-			dialog_font = io.Fonts->AddFontFromFileTTF(
-			    (fonts + face).c_str(), 32.0f, nullptr,
-			    io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
-			if (dialog_font != nullptr) {
-				break;
+			if (dialog_font == nullptr) {
+				dialog_font = font;
 			}
+			used += (used.empty() ? "" : ", ") + path + (index != 0 ? " #" + std::to_string(index) : "");
 		}
-#endif
+		std::printf("System dialogs: %s\n", used.empty() ? "no CJK font found (the game's texts drawn in ASCII only)"
+		                                                 : ("fonts " + used).c_str());
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -884,6 +995,9 @@ struct SystemOverlay::Impl {
 		ImGui::SetNextWindowSize({width, height}, ImGuiCond_Always);
 		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
 		                                   ImGuiWindowFlags_NoSavedSettings;
+		// The text at the keyboard's scale too, 20 px at 1080p (it stayed at 13 px, tiny at 4K: issue #265), in the
+		// dialogs' font (the title is the game's, in its language).
+		ImGui::PushFont(dialog_font, 20.0f * ui_scale);
 		ImGui::Begin("##Ime", nullptr, flags);
 
 		const std::u16string title = snapshot.title.empty() ? u"Enter text" : snapshot.title;
@@ -900,15 +1014,16 @@ struct SystemOverlay::Impl {
 			               : VisibleText(snapshot, visible_units);
 			ImGui::TextUnformatted(compact.c_str());
 			const float compact_height = std::min(button_height, 28.0f * ui_scale);
-			if (ImGui::Button("Cancel", {90.0f * ui_scale, compact_height})) {
+			if (ImGui::Button("Cancel", {LabelWidth("Cancel", 90.0f * ui_scale), compact_height})) {
 				Ime::HostCancel(snapshot.generation);
 			}
 			ImGui::SameLine();
-			if (ImGui::Button(EnterLabel(snapshot.enter_label),
-			                  {90.0f * ui_scale, compact_height})) {
+			const char* enter = EnterLabel(snapshot.enter_label);
+			if (ImGui::Button(enter, {LabelWidth(enter, 90.0f * ui_scale), compact_height})) {
 				Ime::HostAccept(snapshot.generation);
 			}
 			ImGui::End();
+			ImGui::PopFont();
 			return;
 		}
 
@@ -935,23 +1050,34 @@ struct SystemOverlay::Impl {
 
 		const float content_width = ImGui::GetContentRegionAvail().x;
 		DrawKeyRows(snapshot, content_width);
+		const char* enter = EnterLabel(snapshot.enter_label);
+		// The last row's buttons as wide as their labels, the actions at most what the row has left for them.
+		const float spacing = ImGui::GetStyle().ItemSpacing.x;
+		const float actions = (snapshot.option & Ime::OPTION_MULTILINE) != 0 ? 4.0f : 3.0f;
+		float       left    = content_width;
 		if (snapshot.type != Ime::Type::Number) {
-			if (ImGui::Button(shift ? "Lower" : "Shift", {84.0f * ui_scale, button_height})) {
+			const float mode_width  = LabelWidth("Symbols", 84.0f * ui_scale);
+			const float space_width = LabelWidth("Space", 120.0f * ui_scale);
+			left -= 2.0f * mode_width + space_width + 3.0f * spacing;
+			if (ImGui::Button(shift ? "Lower" : "Shift", {mode_width, button_height})) {
 				shift = !shift;
 			}
 			ImGui::SameLine();
-			if (ImGui::Button(symbol_mode ? "ABC" : "Symbols", {84.0f * ui_scale, button_height})) {
+			if (ImGui::Button(symbol_mode ? "ABC" : "Symbols", {mode_width, button_height})) {
 				symbol_mode = !symbol_mode;
 			}
 			ImGui::SameLine();
-			if (ImGui::Button("Space", {120.0f * ui_scale, button_height})) {
+			if (ImGui::Button("Space", {space_width, button_height})) {
 				Ime::HostInsertText(snapshot.generation, u" ");
 			}
 			ImGui::SameLine();
 		}
-		const float action_width = snapshot.type == Ime::Type::Number
-		                               ? std::max((content_width - 16.0f) / 3.0f, 48.0f)
-		                               : 100.0f * ui_scale;
+		const float action_width =
+		    snapshot.type == Ime::Type::Number
+		        ? std::max((content_width - 16.0f) / 3.0f, 48.0f)
+		        : std::max(std::min(LabelWidth(enter, LabelWidth("Backspace", LabelWidth("Newline", 100.0f * ui_scale))),
+		                            (left - (actions - 1.0f) * spacing) / actions),
+		                   48.0f);
 		if (ImGui::Button("Backspace", {action_width, button_height})) {
 			Ime::HostBackspace(snapshot.generation);
 		}
@@ -966,10 +1092,11 @@ struct SystemOverlay::Impl {
 			Ime::HostCancel(snapshot.generation);
 		}
 		ImGui::SameLine();
-		if (ImGui::Button(EnterLabel(snapshot.enter_label), {action_width, button_height})) {
+		if (ImGui::Button(enter, {action_width, button_height})) {
 			Ime::HostAccept(snapshot.generation);
 		}
 		ImGui::End();
+		ImGui::PopFont();
 	}
 
 	void DrawError(const ErrorDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
