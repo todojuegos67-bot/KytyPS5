@@ -27,6 +27,9 @@
 
 #include <atomic>
 #include <cctype>
+#include <csignal>
+#include <cstdlib>
+#include <exception>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -668,11 +671,15 @@ void SetEnv(const std::string& key, const std::string& value) {
 }
 
 std::atomic<bool> g_restart {false};
+std::atomic<bool> g_restart_launcher {false}; // (ds-pc-port38) an update / restore: the new start opens the launcher
 fs::path          g_exe;
 
 void RestartIfAsked() {
 	if (!g_restart.exchange(false)) return;
-	std::wstring        command = L"\"" + g_exe.wstring() + L"\" --restarted";
+	// (ds-pc-port38) After an update or a restore the new version starts at the launcher (--lanzador), never the game by
+	// itself; F1's "Reiniciar ahora" still goes straight back to the game (--restarted alone).
+	std::wstring command = L"\"" + g_exe.wstring() + L"\" --restarted";
+	if (g_restart_launcher.exchange(false)) command += L" --lanzador";
 	STARTUPINFOW        si {};
 	PROCESS_INFORMATION pi {};
 	si.cb = sizeof(si);
@@ -683,36 +690,80 @@ void RestartIfAsked() {
 }
 
 // (ds-pc-port29) A crash leaves logs\crash-<time>.txt: the exception code, the faulting module and its offset.
+// (ds-pc-port38) And always some evidence (the AMD multi frame generation run of 11-01 ended with no crash file: its last
+// line was a title-screen stat, then nothing). Why a crash could leave nothing: a DLL loaded later (Streamline's
+// sl.interposer / sl.common, a driver or overlay) replaced the unhandled-exception filter; a stack overflow, whose filter
+// ran out of stack on the faulting thread; a heap corruption or a C runtime fast fail (invalid parameter, abort,
+// std::terminate, a pure virtual call) that never reaches a filter. So: the writing is done by a thread of its own
+// (its own stack, started at the beginning), fed by (1) the unhandled-exception filter, re-armed every half second
+// (and chained to whatever replaced it), (2) a last vectored handler for the codes no one recovers from (stack overflow,
+// heap corruption, fast fail; never access violations: the emulator's guest memory relies on those), (3) the C runtime's
+// invalid parameter / pure call / abort / terminate handlers. Each writes crash-<time>.txt (code, module + offset,
+// 32 frames) and crash-<time>.dmp (MiniDumpWriteDump, dbghelp.dll loaded by name: no Windows Error Reporting needed).
+// A fast fail the kernel ends the process for (no user-mode code runs) is reported at the next start from Windows Error
+// Reporting's archive (ReportPreviousWerCrash).
 std::wstring g_crash_dir;
-LONG WINAPI PortCrashFilter(EXCEPTION_POINTERS* info) {
-	const DWORD code = info != nullptr && info->ExceptionRecord != nullptr ? info->ExceptionRecord->ExceptionCode : 0;
-	void*       addr = info != nullptr && info->ExceptionRecord != nullptr ? info->ExceptionRecord->ExceptionAddress : nullptr;
-	HMODULE     mod  = nullptr;
-	wchar_t     name[MAX_PATH] = L"?";
-	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(addr), &mod) &&
-	    mod != nullptr)
-		GetModuleFileNameW(mod, name, MAX_PATH);
-	const unsigned long long off = mod != nullptr ? reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod) : 0;
+
+struct CrashJob {
+	EXCEPTION_POINTERS* info      = nullptr;
+	DWORD               thread_id = 0;
+	char                what[160] = {};
+};
+CrashJob          g_crash_job;
+HANDLE            g_crash_go   = nullptr;
+HANDLE            g_crash_done = nullptr;
+std::atomic<bool> g_crash_written {false};
+DWORD             g_crash_thread_id = 0;
+LPTOP_LEVEL_EXCEPTION_FILTER g_chained_filter = nullptr;
+thread_local int  t_in_filter = 0;
+
+std::wstring CrashStamp() {
 	SYSTEMTIME t;
 	GetLocalTime(&t);
-	wchar_t file[MAX_PATH + 64];
-	swprintf(file, MAX_PATH + 64, L"%ls\\crash-%04u%02u%02u-%02u%02u%02u.txt", g_crash_dir.c_str(), t.wYear, t.wMonth, t.wDay, t.wHour,
-	         t.wMinute, t.wSecond);
-	if (FILE* f = _wfopen(file, L"w"); f != nullptr) {
-		std::fwprintf(f, L"exception 0x%08lx at %p\nmodule %ls + 0x%llx\nstack:\n", code, addr, name, off);
+	wchar_t text[64];
+	swprintf(text, 64, L"%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+	return text;
+}
+
+void ModuleOf(uintptr_t addr, wchar_t* name, unsigned long long* off) {
+	HMODULE mod = nullptr;
+	wcscpy_s(name, MAX_PATH, L"?");
+	*off = addr;
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(addr), &mod) &&
+	    mod != nullptr) {
+		GetModuleFileNameW(mod, name, MAX_PATH);
+		*off = addr - reinterpret_cast<uintptr_t>(mod);
+	}
+}
+
+// On the crash thread (its own stack): the text file and the minidump.
+void WriteCrashFiles(const CrashJob& job) {
+	const std::wstring stamp = CrashStamp();
+	const DWORD code = job.info != nullptr && job.info->ExceptionRecord != nullptr ? job.info->ExceptionRecord->ExceptionCode : 0;
+	const uintptr_t addr =
+	    job.info != nullptr && job.info->ExceptionRecord != nullptr ? reinterpret_cast<uintptr_t>(job.info->ExceptionRecord->ExceptionAddress) : 0;
+	wchar_t            name[MAX_PATH];
+	unsigned long long off = 0;
+	ModuleOf(addr, name, &off);
+	const std::wstring txt = g_crash_dir + L"\\crash-" + stamp + L".txt";
+	if (FILE* f = _wfopen(txt.c_str(), L"w"); f != nullptr) {
+		std::fprintf(f, "%s (thread %lu)\n", job.what, job.thread_id);
+		std::fwprintf(f, L"exception 0x%08lx at %p\nmodule %ls + 0x%llx\n", code, reinterpret_cast<void*>(addr), name, off);
+		if (job.info != nullptr && job.info->ExceptionRecord != nullptr && code == EXCEPTION_ACCESS_VIOLATION &&
+		    job.info->ExceptionRecord->NumberParameters >= 2)
+			std::fprintf(f, "access: %s 0x%llx\n", job.info->ExceptionRecord->ExceptionInformation[0] == 0 ? "read" : job.info->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "execute",
+			             static_cast<unsigned long long>(job.info->ExceptionRecord->ExceptionInformation[1]));
+		std::fprintf(f, "stack:\n");
 		// (ds-pc-port32) The faulting thread's stack from its context (x64 unwind data), up to 32 frames.
-		if (info != nullptr && info->ContextRecord != nullptr) {
-			CONTEXT ctx = *info->ContextRecord;
+		if (job.info != nullptr && job.info->ContextRecord != nullptr) {
+			CONTEXT ctx = *job.info->ContextRecord;
 			for (int frame = 0; frame < 32 && ctx.Rip != 0; frame++) {
-				HMODULE fm = nullptr;
-				wchar_t fn[MAX_PATH] = L"?";
-				if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-				                       reinterpret_cast<LPCWSTR>(ctx.Rip), &fm) && fm != nullptr)
-					GetModuleFileNameW(fm, fn, MAX_PATH);
-				std::fwprintf(f, L"  #%02d %ls + 0x%llx\n", frame, fn,
-				              fm != nullptr ? static_cast<unsigned long long>(ctx.Rip - reinterpret_cast<uintptr_t>(fm)) : static_cast<unsigned long long>(ctx.Rip));
-				DWORD64 image = 0;
-				RUNTIME_FUNCTION* fe = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+				wchar_t            fn[MAX_PATH];
+				unsigned long long fo = 0;
+				ModuleOf(static_cast<uintptr_t>(ctx.Rip), fn, &fo);
+				std::fwprintf(f, L"  #%02d %ls + 0x%llx\n", frame, fn, fo);
+				DWORD64           image = 0;
+				RUNTIME_FUNCTION* fe    = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
 				if (fe == nullptr) {
 					// A leaf function: the return address is at Rsp.
 					if (ctx.Rsp == 0 || IsBadReadPtr(reinterpret_cast<void*>(ctx.Rsp), sizeof(DWORD64))) break;
@@ -727,9 +778,214 @@ LONG WINAPI PortCrashFilter(EXCEPTION_POINTERS* info) {
 		}
 		std::fclose(f);
 	}
-	std::printf("[port] crash: exception 0x%08lx in %ls + 0x%llx\n", code, name, off);
+	// The minidump: dbghelp.dll by name (System32's), no link dependency.
+	bool dumped = false;
+	if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll"); dbghelp != nullptr) {
+		struct ExceptionInfo {
+			DWORD               ThreadId;
+			EXCEPTION_POINTERS* ExceptionPointers;
+			BOOL                ClientPointers;
+		};
+		using WriteDump = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, ExceptionInfo*, void*, void*);
+		if (auto* write = reinterpret_cast<WriteDump>(reinterpret_cast<void*>(GetProcAddress(dbghelp, "MiniDumpWriteDump"))); write != nullptr) {
+			const std::wstring dmp = g_crash_dir + L"\\crash-" + stamp + L".dmp";
+			HANDLE file = CreateFileW(dmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (file != INVALID_HANDLE_VALUE) {
+				ExceptionInfo ei {job.thread_id, job.info, FALSE};
+				// MiniDumpWithIndirectlyReferencedMemory | WithDataSegs | WithHandleData | WithUnloadedModules | WithThreadInfo |
+				// WithProcessThreadData: the threads' stacks and what they point to, never the guest's gigabytes.
+				const int type = 0x40 | 0x1 | 0x4 | 0x20 | 0x1000 | 0x100;
+				dumped = write(GetCurrentProcess(), GetCurrentProcessId(), file, type, job.info != nullptr ? &ei : nullptr, nullptr, nullptr) != FALSE;
+				CloseHandle(file);
+				if (!dumped) DeleteFileW(dmp.c_str());
+			}
+		}
+	}
+	std::printf("[port] crash: %s: exception 0x%08lx in %ls + 0x%llx (thread %lu); logs\\crash-%ls.txt%s\n", job.what, code, name, off,
+	            job.thread_id, stamp.c_str(), dumped ? " and .dmp" : " (no minidump)");
 	std::fflush(stdout);
+}
+
+DWORD WINAPI CrashThread(LPVOID) {
+	for (;;) {
+		if (WaitForSingleObject(g_crash_go, INFINITE) != WAIT_OBJECT_0) return 0;
+		WriteCrashFiles(g_crash_job);
+		SetEvent(g_crash_done);
+	}
+}
+
+// From any thread, however little stack it has left: hands the crash to the crash thread and waits for it (once).
+void ReportCrash(EXCEPTION_POINTERS* info, const char* what) {
+	if (g_crash_written.exchange(true)) return;
+	g_crash_job.info      = info;
+	g_crash_job.thread_id = GetCurrentThreadId();
+	strncpy_s(g_crash_job.what, what, _TRUNCATE);
+	if (g_crash_go != nullptr && g_crash_done != nullptr && g_crash_thread_id != 0 && g_crash_thread_id != GetCurrentThreadId()) {
+		SetEvent(g_crash_go);
+		WaitForSingleObject(g_crash_done, 30000);
+	} else {
+		WriteCrashFiles(g_crash_job);
+	}
+}
+
+// No exception to hand on (abort, terminate, an invalid parameter, a pure call): this thread's context now.
+[[noreturn]] void ReportFatalHere(const char* what) {
+	static CONTEXT          context;
+	static EXCEPTION_RECORD record;
+	static EXCEPTION_POINTERS pointers;
+	RtlCaptureContext(&context);
+	record                  = {};
+	record.ExceptionCode    = 0xC0000409; // (STATUS_STACK_BUFFER_OVERRUN: what the C runtime's fast fail reports)
+	record.ExceptionAddress = reinterpret_cast<void*>(context.Rip);
+	pointers                = {&record, &context};
+	ReportCrash(&pointers, what);
+	TerminateProcess(GetCurrentProcess(), 3);
+	for (;;) Sleep(INFINITE);
+}
+
+LONG WINAPI PortCrashFilter(EXCEPTION_POINTERS* info) {
+	if (t_in_filter > 0) return EXCEPTION_CONTINUE_SEARCH; // (a chained filter came back to this one)
+	t_in_filter++;
+	ReportCrash(info, "unhandled exception");
+	LONG result = EXCEPTION_CONTINUE_SEARCH;
+	if (LPTOP_LEVEL_EXCEPTION_FILTER next = g_chained_filter; next != nullptr && next != &PortCrashFilter) result = next(info);
+	t_in_filter--;
+	return result;
+}
+
+// Last in the vectored chain: only what nothing recovers from.
+LONG CALLBACK PortFatalVectored(EXCEPTION_POINTERS* info) {
+	const DWORD code = info != nullptr && info->ExceptionRecord != nullptr ? info->ExceptionRecord->ExceptionCode : 0;
+	if (code == 0xC00000FD /* stack overflow */) ReportCrash(info, "stack overflow");
+	else if (code == 0xC0000374 /* heap corruption */) ReportCrash(info, "heap corruption");
+	else if (code == 0xC0000409 /* fast fail reaching user mode */) ReportCrash(info, "fast fail / stack buffer overrun");
+	else if (code == 0xC0000420 /* assertion failure */) ReportCrash(info, "assertion failure");
 	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void PortInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, uintptr_t) {
+	ReportFatalHere("a C runtime function got an invalid parameter");
+}
+void PortPureCall() {
+	ReportFatalHere("pure virtual function call");
+}
+void PortAbort(int) {
+	ReportFatalHere("abort()");
+}
+void PortTerminate() {
+	ReportFatalHere("std::terminate (an exception nothing caught, or noexcept broken)");
+}
+
+// The filter re-armed every half second: a DLL that set its own (Streamline, a driver, an overlay) is chained after ours.
+// The C runtime's handlers too (the emulator sets its own reporting ones at start-up: they are chained, kept as well).
+DWORD WINAPI CrashRearmThread(LPVOID) {
+	bool told = false;
+	for (;;) {
+		Sleep(500);
+		LPTOP_LEVEL_EXCEPTION_FILTER previous = SetUnhandledExceptionFilter(&PortCrashFilter);
+		if (previous != &PortCrashFilter && previous != nullptr) {
+			g_chained_filter = previous;
+			if (!told) {
+				wchar_t            name[MAX_PATH];
+				unsigned long long off = 0;
+				ModuleOf(reinterpret_cast<uintptr_t>(previous), name, &off);
+				std::printf("[port] crash reports: the unhandled-exception filter was replaced (by %ls): ours re-armed first, that one chained\n",
+				            name);
+				std::fflush(stdout);
+				told = true;
+			}
+		}
+		if (_get_invalid_parameter_handler() != &PortInvalidParameter) _set_invalid_parameter_handler(&PortInvalidParameter);
+		if (_get_purecall_handler() != &PortPureCall) _set_purecall_handler(&PortPureCall);
+	}
+}
+
+void InstallCrashReports() {
+	g_crash_go   = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	g_crash_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	// (Its own 1 MiB stack, committed now: it must run when the process is out of everything else.)
+	if (HANDLE t = CreateThread(nullptr, 1 << 20, &CrashThread, nullptr, 0, &g_crash_thread_id); t != nullptr) CloseHandle(t);
+	g_chained_filter = SetUnhandledExceptionFilter(&PortCrashFilter);
+	AddVectoredExceptionHandler(0, &PortFatalVectored);
+	_set_invalid_parameter_handler(&PortInvalidParameter);
+	_set_purecall_handler(&PortPureCall);
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT); // (abort: our SIGABRT handler, not a silent fast fail)
+	std::signal(SIGABRT, &PortAbort);
+	std::set_terminate(&PortTerminate);
+	ULONG guarantee = 64 * 1024; // (the main thread: room for the filter after a stack overflow)
+	SetThreadStackGuarantee(&guarantee);
+	if (HANDLE t = CreateThread(nullptr, 256 * 1024, &CrashRearmThread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr); t != nullptr) {
+		SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+		CloseHandle(t);
+	}
+}
+
+// A run the kernel ended (a fast fail: no user-mode code ran, nothing above could write) is in Windows Error Reporting's
+// archive or queue: its Report.wer copied to logs\ and its exception code, module and offset in this run's log, once.
+void ReportPreviousWerCrash(const fs::path& logs) {
+	std::error_code ec;
+	const fs::path  seen_file = logs / L"wer-seen.txt";
+	const std::string seen    = [&] {
+		std::ifstream in(seen_file, std::ios::binary);
+		return std::string {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+	}();
+	std::string now_seen = seen;
+	const auto  program_data = [] {
+		wchar_t v[MAX_PATH] = {};
+		return GetEnvironmentVariableW(L"ProgramData", v, MAX_PATH) > 0 ? fs::path(v) : fs::path(L"C:\\ProgramData");
+	}();
+	const auto local = [] {
+		wchar_t v[MAX_PATH] = {};
+		return GetEnvironmentVariableW(L"LOCALAPPDATA", v, MAX_PATH) > 0 ? fs::path(v) : fs::path();
+	}();
+	std::vector<fs::path> roots = {program_data / L"Microsoft\\Windows\\WER\\ReportArchive", program_data / L"Microsoft\\Windows\\WER\\ReportQueue"};
+	if (!local.empty()) {
+		roots.push_back(local / L"Microsoft\\Windows\\WER\\ReportArchive");
+		roots.push_back(local / L"Microsoft\\Windows\\WER\\ReportQueue");
+	}
+	const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(72);
+	int        found  = 0;
+	for (const auto& root: roots) {
+		if (!fs::exists(root, ec)) continue;
+		for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+			const std::wstring dir = it->path().filename().wstring();
+			if (dir.find(L"Demon's Souls") == std::wstring::npos && dir.find(L"Demon") == std::wstring::npos) continue;
+			if (it->last_write_time(ec) < cutoff) continue;
+			const std::string key = Utf8(dir);
+			if (seen.find(key) != std::string::npos) continue;
+			const fs::path report = it->path() / L"Report.wer";
+			if (!fs::exists(report, ec)) continue;
+			// Report.wer is UTF-16: the Sig[n].Name / Sig[n].Value pairs (application, module, offset, exception code).
+			std::ifstream in(report, std::ios::binary);
+			const std::string bytes {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+			std::string text;
+			for (size_t i = (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xFF) ? 2 : 0; i + 1 < bytes.size(); i += 2)
+				if (bytes[i + 1] == 0 && bytes[i] != 0) text += bytes[i];
+			std::string sigs;
+			std::map<std::string, std::string> names;
+			size_t at = 0;
+			while (at < text.size()) {
+				size_t eol = text.find_first_of("\r\n", at);
+				if (eol == std::string::npos) eol = text.size();
+				const std::string line = text.substr(at, eol - at);
+				at                     = eol + 1;
+				if (line.rfind("Sig[", 0) != 0) continue;
+				const size_t close = line.find(']'), eq = line.find('=');
+				if (close == std::string::npos || eq == std::string::npos) continue;
+				const std::string idx = line.substr(4, close - 4), field = line.substr(close + 2, eq - close - 2), value = line.substr(eq + 1);
+				if (field == "Name") names[idx] = value;
+				else if (field == "Value") sigs += (sigs.empty() ? "" : ", ") + (names.count(idx) != 0 ? names[idx] : idx) + " " + value;
+			}
+			fs::copy_file(report, logs / (L"wer-" + dir + L".txt"), fs::copy_options::overwrite_existing, ec);
+			std::printf("[port] previous crash (Windows Error Reporting %s): %s\n", key.c_str(), sigs.empty() ? "(no signature)" : sigs.c_str());
+			now_seen += key + "\n";
+			found++;
+		}
+	}
+	if (found > 0) {
+		std::ofstream(seen_file, std::ios::binary | std::ios::trunc) << now_seen;
+		std::fflush(stdout);
+	}
 }
 
 } // namespace
@@ -740,7 +996,8 @@ void CloseSplash() {
 	if (HWND w = g_splash.window.load(); w != nullptr) PostMessageW(w, WM_CLOSE, 0, 0);
 }
 
-void RequestRestart() {
+void RequestRestart(bool to_launcher) {
+	if (to_launcher) g_restart_launcher = true;
 	g_restart = true;
 	RequestQuit();
 }
@@ -758,7 +1015,7 @@ int main(int argc, char* argv[]) {
 	const int olds = Port::Update::RemoveOldFiles(root);
 	fs::create_directories(root / L"logs", ec);
 	g_crash_dir = (root / L"logs").wstring();
-	SetUnhandledExceptionFilter(PortCrashFilter);
+	InstallCrashReports(); // (ds-pc-port38) filter + re-arm, last vectored handler, C runtime handlers, minidump
 	// (ds-pc-port29) --fg-relaunch: the game in a fresh process after the launcher (DLSS frame generation, see below).
 	bool fg_relaunch = false;
 	for (int i = 1; i < argc; i++)
@@ -805,7 +1062,8 @@ int main(int argc, char* argv[]) {
 	// (ds-pc-port29) Unbuffered: a crash no longer loses the last lines.
 	setvbuf(stdout, nullptr, _IONBF, 0);
 	setvbuf(stderr, nullptr, _IONBF, 0);
-	if (fg_relaunch) std::printf("[port] DLSS frame generation: the game in its own process (no launcher window or D3D before Streamline)\n");
+	if (fg_relaunch) std::printf("[port] DLSS / Streamline: the game in its own process (no launcher window or D3D before Streamline)\n");
+	ReportPreviousWerCrash(root / L"logs"); // (ds-pc-port38) a fast fail of an earlier run, from Windows Error Reporting
 
 	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 	const std::string ini   = Utf8((root / L"settings.ini").wstring());
@@ -837,8 +1095,10 @@ int main(int argc, char* argv[]) {
 	// the Configurador, configurado=0); not after F1's "Reiniciar ahora", nor with --sin-lanzador.
 	// (ds-pc-port8) The launcher always comes first now (the game has no options menu any more: F1 saves and quits);
 	// --sin-lanzador skips it once.
-	(void)force_launcher;
-	const bool start_menu = !skip_launcher && !restarted;
+	// (ds-pc-port38) --lanzador (the restart after an update or a restore) shows it even with --restarted: the new version
+	// opens at the launcher, never the game by itself. --fg-relaunch (DLSS-G's fresh process after JUGAR) never.
+	const bool start_menu = !fg_relaunch && (force_launcher || (!skip_launcher && !restarted));
+	if (force_launcher && restarted && !fg_relaunch) std::printf("[port] restarted after an update / restore: the launcher first\n");
 	while (!start_menu && !IsGame(settings.game)) {
 		if (!settings.game.empty())
 			Message("No hay eboot.bin en:\n" + settings.game + "\n\nElige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys).");
@@ -995,7 +1255,10 @@ int main(int argc, char* argv[]) {
 		// (ds-pc-port8) The launcher's background: fondo-launcher.jpg (the key art with the logo), else the splash's.
 		if (fs::exists(root / L"fondo-launcher.jpg", ec)) menu_rt.image_path = Utf8((root / L"fondo-launcher.jpg").wstring());
 		menu_rt.pick_folder           = [] { return PickFolder(); };
+		std::printf("[port] launcher: shown\n");
 		const bool play = Port::RunStartMenu(menu_rt, &settings);
+		// (ds-pc-port38) How the launcher ended, in the log: a log that stops at the cache line was the launcher closed.
+		std::printf("[port] launcher: %s\n", play ? "JUGAR" : "closed (Salir, Esc, the window's X, an update or a restart)");
 		Port::Precompile::Stop(/*save=*/play); // (closing: out at once, the shards merged at the next start)
 		if (!play || !IsGame(settings.game)) {
 			// (An update or a "Reiniciar ahora" from the launcher: it closed asking for a restart.)
@@ -1011,10 +1274,19 @@ int main(int argc, char* argv[]) {
 		{
 			const Port::LaunchPlan fg_plan = Port::BuildLaunch(settings, param.title_id, pc);
 			bool                   dlssg   = false;
-			for (const auto& [key, value]: fg_plan.env)
-				if (key == "KYTY_FRAMEGEN" && !value.empty() && value != "0") dlssg = true;
+			// (ds-pc-port38) Not only DLSS frame generation: Streamline (sl.interposer, its nvapi redirect and Reflex) also
+			// loads for the DLSS upscaler (KYTY_UPSCALER=dlss, frame-gen.cpp Initialize), and NVIDIA's NGX for DLSS 5 (NR):
+			// after the launcher's D3D renderer in the same process that is the same silent end port29 found (no crash
+			// filter runs, the log just stops), here at the first 3D frame (the DLSS / NR evaluate) with any frame
+			// generation, AMD's included (the 11-01 log: DLSS Rendimiento + AMD MFG dinamico, gone at the title screen).
+			const char* why = nullptr;
+			for (const auto& [key, value]: fg_plan.env) {
+				if (key == "KYTY_FRAMEGEN" && !value.empty() && value != "0") { dlssg = true; why = "DLSS frame generation"; }
+				if (why == nullptr && key == "KYTY_UPSCALER" && value == "dlss") { dlssg = true; why = "DLSS (Streamline)"; }
+				if (why == nullptr && key == "KYTY_FOVEATED" && value == "1") { dlssg = true; why = "DLSS 5 (NGX)"; }
+			}
 			if (dlssg) {
-				std::printf("[port] DLSS frame generation: starting the game in a fresh process\n");
+				std::printf("[port] %s: starting the game in a fresh process\n", why);
 				std::fflush(stdout);
 				ReleaseMutex(single);
 				CloseHandle(single);
@@ -1068,6 +1340,11 @@ int main(int argc, char* argv[]) {
 
 	for (auto& [key, value]: plan.env) {
 		if ((key == "KYTY_RECORDING_CPUS" || key == "KYTY_RENDER_CPUS") && value == "auto") value = PerformanceCpus(mask);
+		// (ds-pc-port38) "Carga de shaders al maximo": the shader prefetch and warmup threads as many as the CPUs the game
+		// may run on (the V-Cache CCD: 16 on a 9950X3D), less the render and game threads, not every CPU of the PC
+		// (hardware_concurrency: 32 threads squeezed onto 16 CPUs next to the render thread, the in-game hitches).
+		if (settings.shader_turbo && mask != system_mask && (key == "KYTY_SHADER_PREFETCH_THREADS" || key == "KYTY_SHADER_WARMUP_THREADS"))
+			value = std::to_string(std::max(2, cpus - 2));
 	}
 	for (const auto& [key, value]: plan.env) SetEnv(key, value);
 	std::printf("[port] switches: %zu, vblank %d Hz\n", plan.env.size(), plan.vblank);

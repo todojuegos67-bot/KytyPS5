@@ -32,8 +32,9 @@ struct Runtime {
 void InstallMenu(const Runtime& runtime);
 // The splash screen (ds-main.cpp): closes it.
 void CloseSplash();
-// Ends the game (as its window's close button) and starts this program again when it has ended.
-void RequestRestart();
+// Ends the game (as its window's close button) and starts this program again when it has ended. to_launcher (an update
+// or a restore, ds-pc-port38): the new start shows the launcher (art, JUGAR, Opciones), never the game by itself.
+void RequestRestart(bool to_launcher = false);
 // Ends the game.
 void RequestQuit();
 // (10-27b) The launcher-style start menu, before the game (its own window, the F1 menu's pages full screen over

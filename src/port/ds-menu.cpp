@@ -130,6 +130,69 @@ void Bump() {
 	g_revision.fetch_add(1, std::memory_order_relaxed);
 }
 
+// ---- (ds-pc-port38) The F1 menu's animations: open / close (fade and scale), page slide, buttons' hover and focus. ----
+// Times on the steady clock (window and present threads); the overlay is redrawn (Bump) while one runs.
+namespace Anim {
+double Now() {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+constexpr double         kOpen = 0.18, kClose = 0.14, kPage = 0.22;
+std::atomic<double>      g_opened_at {0.0}, g_closed_at {0.0}, g_page_at {0.0};
+int                      g_page_seen = 0;
+float EaseOut(float t) {
+	t = std::clamp(t, 0.0f, 1.0f);
+	return 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+}
+// 0..1 of an animation started at `at` lasting `length` (1: done).
+float Progress(double at, double length) {
+	return static_cast<float>(std::clamp((Now() - at) / length, 0.0, 1.0));
+}
+bool Closing() {
+	return !g_open.load(std::memory_order_relaxed) && Now() - g_closed_at.load(std::memory_order_relaxed) < kClose;
+}
+// Per item, a value easing to 1 while hovered or focused and back to 0 (about 90 ms each way).
+std::map<ImGuiID, float> g_hot;
+float Hot(ImGuiID id, bool on) {
+	float&      v  = g_hot[id];
+	const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
+	const float to = on ? 1.0f : 0.0f;
+	v += (to - v) * std::min(1.0f, dt * 14.0f);
+	if (std::fabs(to - v) < 0.002f) v = to;
+	else Bump();
+	return v;
+}
+// The last item's highlight: a gold wash, a border and an accent bar on the left that grow with the hover / focus.
+void Highlight(float unit) {
+	const ImGuiID id = ImGui::GetItemID();
+	const bool    on = ImGui::IsItemHovered() || ImGui::IsItemFocused() || ImGui::IsItemActive();
+	const float   v  = Hot(id, on);
+	if (v <= 0.0f) return;
+	const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+	auto*        dl = ImGui::GetWindowDrawList();
+	const float  r  = ImGui::GetStyle().FrameRounding;
+	const float  al = ImGui::GetStyle().Alpha;
+	dl->AddRectFilled(a, b, IM_COL32(222, 196, 140, static_cast<int>(46 * v * al)), r);
+	dl->AddRect(a, b, IM_COL32(236, 206, 146, static_cast<int>(200 * v * al)), r, 0, std::max(1.0f, 1.5f * unit));
+	dl->AddRectFilled({a.x, a.y + (b.y - a.y) * (0.5f - 0.36f * v)}, {a.x + 4.0f * unit, a.y + (b.y - a.y) * (0.5f + 0.36f * v)},
+	                  IM_COL32(244, 214, 150, static_cast<int>(255 * v * al)), 2.0f * unit);
+}
+bool Button(const char* label, ImVec2 size, float unit) {
+	const bool pressed = ImGui::Button(label, size);
+	Highlight(unit);
+	return pressed;
+}
+// Scales the vertices a window drew (from `first`) around `center`: the open / close zoom without re-rasterizing fonts
+// at every size of the animation (ImGui 1.92 bakes glyphs per size).
+void ScaleVertices(ImDrawList* dl, int first, ImVec2 center, float k) {
+	if (dl == nullptr || k == 1.0f) return;
+	for (int i = first; i < dl->VtxBuffer.Size; i++) {
+		ImVec2& p = dl->VtxBuffer[i].pos;
+		p.x       = center.x + (p.x - center.x) * k;
+		p.y       = center.y + (p.y - center.y) * k;
+	}
+}
+} // namespace Anim
+
 void Queue(const Input& input) {
 	std::scoped_lock lock(g_mutex);
 	g_inputs.push_back(input);
@@ -138,6 +201,7 @@ void Queue(const Input& input) {
 
 void SetOpen(bool open) {
 	if (g_open.exchange(open) == open) return;
+	(open ? Anim::g_opened_at : Anim::g_closed_at).store(Anim::Now(), std::memory_order_relaxed); // (ds-pc-port38)
 	PortLive::menu_open.store(open, std::memory_order_relaxed);
 	if (!open) g_trophy_page = false; // (port34) the game again: the next F1 opens the menu, not the page
 	if (open) {
@@ -955,7 +1019,7 @@ void InstallWork() {
 		SetUpd(UpdateUi::Done, "Actualizacion completada a la version " + r.tag +
 		                           ". Reiniciando con la nueva version... Tus shaders compilados y partidas guardadas se mantienen.");
 		std::this_thread::sleep_for(std::chrono::seconds(3));
-		RequestRestart();
+		RequestRestart(/*to_launcher=*/true); // (ds-pc-port38) the new version opens at the launcher
 	} else SetUpd(UpdateUi::Failed, res.error);
 #endif
 }
@@ -982,7 +1046,7 @@ void RestoreWork() {
 	if (res.ok) {
 		SetUpd(UpdateUi::Done, "Restaurada la version " + b.version + ". Reiniciando...");
 		std::this_thread::sleep_for(std::chrono::seconds(3));
-		RequestRestart();
+		RequestRestart(/*to_launcher=*/true); // (ds-pc-port38) the new version opens at the launcher
 	} else SetUpd(UpdateUi::Failed, res.error);
 #endif
 }
@@ -3077,6 +3141,17 @@ void DrawLauncher(float width, float height) {
 			bg->AddRectFilledMultiColor({0, y0 + h - U(60)}, {width, y0 + h}, IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255));
 		}
 	}
+	if (ImFont* f = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont(); f != nullptr) {
+		// (ds-pc-port38) The fork's credit, small and subtle at the art's top-right corner (left of the column, which the
+		// Opciones panel covers from the top): a soft plate and shadow under light text, readable on light and dark art.
+		const float  size = std::max(12.0f, std::round(U(14)));
+		const char*  text = "Fork: todojuegos67";
+		const ImVec2 ts   = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+		const ImVec2 at   = {std::floor(px - U(18) - ts.x), std::floor(U(14))};
+		bg->AddRectFilled({at.x - U(8), at.y - U(4)}, {at.x + ts.x + U(8), at.y + ts.y + U(4)}, IM_COL32(0, 0, 0, 96), U(4));
+		bg->AddText(f, size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 210), text);
+		bg->AddText(f, size, at, IM_COL32(236, 226, 204, 215), text);
+	}
 
 	auto& io = ImGui::GetIO();
 #if defined(NDEBUG)
@@ -3413,7 +3488,7 @@ void DrawLauncher(float width, float height) {
 }
 
 bool WantsOverlay() {
-	return g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive();
+	return g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive() || Anim::Closing(); // (ds-pc-port38: the fade-out)
 }
 
 // (port34) F1 > Ver trofeos: every trophy of the game, as the PS5's trophy page. Drawn with draw lists in one window of
@@ -4157,44 +4232,96 @@ void SaveNow() {
 	g_saved.kbm_camera = on_disk.kbm_camera, g_saved.kbm_warp = on_disk.kbm_warp, g_saved.kbm_map = on_disk.kbm_map;
 }
 
-// Both pages: a centred window; false when the page closes.
+// Both pages: full screen; false when the page closes.
+// (ds-pc-port38) Their text was ImGui's default 13 px bitmap font (no font pushed: tiny, blurry once scaled): now the
+// menu's Segoe UI at 26 px x the menu's unit (height / 1080) for the body, 46 px for the title, rasterized at exactly
+// that size (ImGui 1.92 dynamic fonts: never an upscaled atlas), near-white text on a darker plate, larger controls,
+// and the page slides in from the right with a fade.
+int g_style_vars = 0, g_style_colors = 0;
 bool Begin(const char* title, float width, float height, float unit) {
-	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, 160));
-	// (Full screen, as the trophy page.)
-	ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
+	if (Anim::g_page_seen != g_f1_page.load()) {
+		Anim::g_page_seen = g_f1_page.load();
+		Anim::g_page_at   = Anim::Now();
+	}
+	const float t = Anim::EaseOut(Anim::Progress(Anim::g_page_at.load(), Anim::kPage));
+	if (t < 1.0f) Bump();
+	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, static_cast<int>(170 * t)));
+	ImFont* font = FindFont("segoeui");
+	ImGui::PushFont(font, std::round(26.0f * unit));
+	const auto var = [&](ImGuiStyleVar v, ImVec2 x) { ImGui::PushStyleVar(v, x), g_style_vars++; };
+	const auto var1 = [&](ImGuiStyleVar v, float x) { ImGui::PushStyleVar(v, x), g_style_vars++; };
+	const auto col = [&](ImGuiCol c, ImVec4 x) { ImGui::PushStyleColor(c, x), g_style_colors++; };
+	var1(ImGuiStyleVar_Alpha, std::max(0.01f, t));
+	var(ImGuiStyleVar_WindowPadding, {std::round(56 * unit), std::round(34 * unit)});
+	var(ImGuiStyleVar_ItemSpacing, {std::round(16 * unit), std::round(14 * unit)});
+	var(ImGuiStyleVar_FramePadding, {std::round(16 * unit), std::round(9 * unit)});
+	var(ImGuiStyleVar_CellPadding, {std::round(14 * unit), std::round(10 * unit)});
+	var1(ImGuiStyleVar_FrameRounding, 6 * unit);
+	var1(ImGuiStyleVar_GrabRounding, 4 * unit);
+	var1(ImGuiStyleVar_GrabMinSize, 24 * unit);
+	var1(ImGuiStyleVar_ScrollbarSize, 20 * unit);
+	var1(ImGuiStyleVar_FrameBorderSize, std::max(1.0f, unit));
+	col(ImGuiCol_Text, ImVec4 {0.97f, 0.96f, 0.93f, 1.0f});
+	col(ImGuiCol_TextDisabled, ImVec4 {0.74f, 0.72f, 0.68f, 1.0f});
+	col(ImGuiCol_WindowBg, ImVec4 {0.025f, 0.025f, 0.03f, 0.97f});
+	col(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.40f});
+	col(ImGuiCol_FrameBg, ImVec4 {0.11f, 0.11f, 0.13f, 1.0f});
+	col(ImGuiCol_FrameBgHovered, ImVec4 {0.17f, 0.16f, 0.15f, 1.0f});
+	col(ImGuiCol_FrameBgActive, ImVec4 {0.22f, 0.20f, 0.17f, 1.0f});
+	col(ImGuiCol_Button, ImVec4 {0.13f, 0.125f, 0.12f, 1.0f});
+	col(ImGuiCol_ButtonHovered, ImVec4 {0.15f, 0.14f, 0.13f, 1.0f}); // (the transition is Anim::Highlight's)
+	col(ImGuiCol_ButtonActive, ImVec4 {0.30f, 0.26f, 0.18f, 1.0f});
+	col(ImGuiCol_CheckMark, kGold);
+	col(ImGuiCol_SliderGrab, kGold);
+	col(ImGuiCol_SliderGrabActive, ImVec4 {1.0f, 0.88f, 0.62f, 1.0f});
+	col(ImGuiCol_Header, ImVec4 {0.30f, 0.26f, 0.18f, 0.85f});
+	col(ImGuiCol_HeaderHovered, ImVec4 {0.42f, 0.35f, 0.22f, 0.85f});
+	col(ImGuiCol_TableRowBg, ImVec4 {0.0f, 0.0f, 0.0f, 0.0f});
+	col(ImGuiCol_TableRowBgAlt, ImVec4 {1.0f, 1.0f, 1.0f, 0.045f});
+	col(ImGuiCol_Separator, ImVec4 {0.87f, 0.77f, 0.55f, 0.35f});
+	col(ImGuiCol_NavCursor, kGold);
+	// (Full screen, as the trophy page; it slides in 64 px from the right.)
+	ImGui::SetNextWindowPos({std::round((1.0f - t) * 64.0f * unit), 0}, ImGuiCond_Always);
 	ImGui::SetNextWindowSize({width, height}, ImGuiCond_Always);
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.03f, 0.035f, 0.96f});
 	ImGui::Begin(title, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::PushFont(nullptr, std::round(46.0f * unit));
 	ImGui::TextColored(kGold, "%s", I18n::T(title));
+	ImGui::PopFont();
 	ImGui::Separator();
+	ImGui::Spacing();
 	return true;
 }
 bool Footer(float unit) {
 	ImGui::Separator();
 	bool close = false;
-	if (ImGui::Button(I18n::T("Guardar"), {220 * unit, 46 * unit})) SaveNow();
+	const ImVec2 bs {std::round(240 * unit), std::round(54 * unit)};
+	if (Anim::Button(I18n::T("Guardar"), bs, unit)) SaveNow();
 	ImGui::SameLine();
 	if (g_saved.pad_map != g_rt.launched.pad_map || g_saved.kbm != g_rt.launched.kbm || g_saved.kbm_map != g_rt.launched.kbm_map ||
 	    g_saved.kbm_sens != g_rt.launched.kbm_sens || g_saved.kbm_antidz != g_rt.launched.kbm_antidz ||
 	    g_saved.kbm_camera != g_rt.launched.kbm_camera || g_saved.kbm_warp != g_rt.launched.kbm_warp) {
-		if (ImGui::Button(I18n::T("Reiniciar ahora"), {220 * unit, 46 * unit})) RequestRestart();
+		if (Anim::Button(I18n::T("Reiniciar ahora"), bs, unit)) RequestRestart();
 		ImGui::SameLine();
 	}
-	if (ImGui::Button(I18n::T("Volver"), {220 * unit, 46 * unit})) close = true;
+	if (Anim::Button(I18n::T("Volver"), bs, unit)) close = true;
 	ImGui::SameLine();
+	ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (bs.y - ImGui::GetTextLineHeight()) * 0.5f);
 	ImGui::TextDisabled("%s", I18n::T("L1 / L2: desplazarse   Círculo / Esc: volver"));
 	if (!g_note.empty()) {
 		ImGui::SameLine();
 		ImGui::TextColored(kDim, "%s", g_note.c_str());
 	}
 	ImGui::End();
-	ImGui::PopStyleColor();
+	ImGui::PopStyleColor(g_style_colors);
+	ImGui::PopStyleVar(g_style_vars);
+	g_style_colors = g_style_vars = 0;
+	ImGui::PopFont();
 	return !close;
 }
 
 bool DrawPad(float width, float height, float unit) {
 	Begin("Mapear mando", width, height, unit);
-	ImGui::BeginChild("##padpage", {0, -64 * unit});
+	ImGui::BeginChild("##padpage", {0, -std::round(84 * unit)});
 	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	(void)PadMap::Draw(g_edit, unit);
 	ImGui::EndChild();
@@ -4217,25 +4344,31 @@ bool DrawKbm(float width, float height, float unit) {
 	}
 	LoadMouse();
 	Begin("Teclado y ratón", width, height, unit);
-	ImGui::BeginChild("##kbmpage", {0, -64 * unit});
+	ImGui::BeginChild("##kbmpage", {0, -std::round(84 * unit)});
 	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	ImGui::Checkbox(I18n::T("Jugar con teclado y ratón"), &g_edit.kbm);
+	Anim::Highlight(unit);
+	// (Wrapped left of the mouse picture.)
+	ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - (g_mouse != nullptr ? 280 * unit : 0.0f));
 	ImGui::TextWrapped("%s", I18n::T("WASD para moverse, el ratón mueve la cámara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. F7 suelta o captura el ratón. Si juegas con mando, déjalo desactivado."));
+	ImGui::PopTextWrapPos();
 	ImGui::BeginDisabled(!g_edit.kbm);
-	ImGui::SetNextItemWidth(420 * unit);
+	ImGui::SetNextItemWidth(520 * unit);
 	ImGui::SliderFloat(I18n::T("Sensibilidad del ratón"), &g_edit.kbm_sens, 0.05f, 4.0f, "%.2f");
-	ImGui::SetNextItemWidth(420 * unit);
+	ImGui::SetNextItemWidth(520 * unit);
 	ImGui::SliderFloat(I18n::T("Antizona muerta"), &g_edit.kbm_antidz, 0.0f, 0.5f, "%.2f");
-	ImGui::SetNextItemWidth(420 * unit);
+	ImGui::SetNextItemWidth(520 * unit);
 	ImGui::SliderInt(I18n::T("Velocidad de cámara (ratón)"), &g_edit.kbm_camera, 5, 15);
 	ImGui::Checkbox(I18n::T("Cámara instantánea (frame warp)"), &g_edit.kbm_warp);
 	if (g_mouse != nullptr) {
-		const float h = 200 * unit, w = h * g_mouse_w / std::max(1, g_mouse_h);
+		const float h = 230 * unit, w = h * g_mouse_w / std::max(1, g_mouse_h);
 		const ImVec2 at = {ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - w - 24 * unit, ImGui::GetWindowPos().y + 8 * unit};
 		ImGui::GetWindowDrawList()->AddImage(g_mouse->GetTexRef(), at, {at.x + w, at.y + h});
 	}
 	ImGui::Spacing();
+	ImGui::PushFont(nullptr, std::round(32.0f * unit));
 	ImGui::TextColored(kGold, "%s", I18n::T("Teclas"));
+	ImGui::PopFont();
 	// A captured key or button for the row waiting.
 	{
 		std::scoped_lock lock(g_capture_mutex);
@@ -4251,28 +4384,34 @@ bool DrawKbm(float width, float height, float unit) {
 		}
 	}
 	if (ImGui::BeginTable("##kbmkeys", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+		ImGui::TableSetupColumn("##c", ImGuiTableColumnFlags_WidthStretch, 1.1f);
+		ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+		ImGui::TableSetupColumn("##b", ImGuiTableColumnFlags_WidthFixed, std::round(316 * unit));
 		for (int i = 0; i < static_cast<int>(g_rows.size()); i++) {
 			ImGui::PushID(i);
-			ImGui::TableNextRow();
+			ImGui::TableNextRow(0, std::round(52 * unit));
 			ImGui::TableSetColumnIndex(0);
+			ImGui::AlignTextToFramePadding();
 			ImGui::TextUnformatted(ControlName(g_rows[i].first));
 			ImGui::TableSetColumnIndex(1);
+			ImGui::AlignTextToFramePadding();
 			if (g_capture_row == i) ImGui::TextColored(kWarn, "%s", I18n::T("Pulsa una tecla o un botón del ratón (Esc: cancelar)"));
 			else ImGui::TextColored(kGold, "%s", KeyText(g_rows[i].second).c_str());
 			ImGui::TableSetColumnIndex(2);
-			if (ImGui::SmallButton(I18n::T("Cambiar")) && g_capture_row < 0) {
+			const ImVec2 rb {std::round(150 * unit), std::round(44 * unit)};
+			if (Anim::Button(I18n::T("Cambiar"), rb, unit) && g_capture_row < 0) {
 				std::scoped_lock lock(g_capture_mutex);
 				g_captured.clear();
 				g_capture_row = i;
 				g_kbm_capture = true;
 			}
 			ImGui::SameLine();
-			if (ImGui::SmallButton(I18n::T("Quitar"))) g_rows[i].second = "None";
+			if (Anim::Button(I18n::T("Quitar"), rb, unit)) g_rows[i].second = "None";
 			ImGui::PopID();
 		}
 		ImGui::EndTable();
 	}
-	if (ImGui::Button(I18n::T("Teclas de serie"))) {
+	if (Anim::Button(I18n::T("Teclas de serie"), {0, std::round(50 * unit)}, unit)) {
 		g_edit.kbm_map.clear();
 		g_loaded = false;
 	}
@@ -4295,14 +4434,17 @@ bool DrawKbm(float width, float height, float unit) {
 } // namespace F1Pages
 
 // (ds-pc-port8) In the game: F1's save and quit, a panel in the middle of the screen until the game closes.
-void DrawInGameMenu(float width, float height) {
-	DrainInputs();
+// (ds-pc-port38) `closing`: the fade-out after F1 / Esc closed it (drawn disabled, no input taken).
+void DrawInGameMenu(float width, float height, bool closing = false) {
+	if (!closing) DrainInputs();
 	const float unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
-	ImGui::GetIO().MouseDrawCursor = true;
+	ImGui::GetIO().MouseDrawCursor = !closing;
+	if (closing && (g_f1_page.load() != 0 || g_trophy_page.load())) return; // (a page closes at once)
 	if (const int page = g_f1_page.load(); page != 0) {
 		const bool open = page == 1 ? F1Pages::DrawPad(width, height, unit) : F1Pages::DrawKbm(width, height, unit);
 		if (!open) {
-			g_f1_page = 0;
+			g_f1_page       = 0;
+			Anim::g_page_at = Anim::Now(); // (ds-pc-port38) the menu fades in again
 			F1Pages::g_note.clear();
 		}
 		return;
@@ -4315,15 +4457,31 @@ void DrawInGameMenu(float width, float height) {
 		Bump(); // (animated: a new picture each frame)
 		return;
 	}
-	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, 140));
+	// (ds-pc-port38) Open: fade in and grow from 94 %; close: fade out and shrink back (Anim, vertex scale: the fonts stay
+	// rasterized at one size). Back from a page: the menu fades in again.
+	const float t = closing ? 1.0f - Anim::EaseOut(Anim::Progress(Anim::g_closed_at.load(), Anim::kClose))
+	                        : Anim::EaseOut(Anim::Progress(std::max(Anim::g_opened_at.load(), Anim::g_page_at.load()), Anim::kOpen));
+	if (t < 1.0f || closing) Bump();
+	Anim::g_page_seen = 0;
+	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, static_cast<int>(140 * t)));
 	ImFont* font = FindFont("segoeui");
-	ImGui::PushFont(font, 26.0f * unit);
+	ImGui::PushFont(font, std::round(26.0f * unit));
+	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.01f, t));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {32 * unit, 24 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12 * unit, 14 * unit});
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10 * unit);
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.03f, 0.035f, 0.94f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.45f});
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.13f, 0.125f, 0.12f, 1.0f});
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.15f, 0.14f, 0.13f, 1.0f}); // (the transition is Anim::Highlight's)
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.30f, 0.26f, 0.18f, 1.0f});
+	ImGui::PushStyleColor(ImGuiCol_NavCursor, kGold);
 	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
 	ImGui::Begin("##f1menu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
-	                                     ImGuiWindowFlags_NoSavedSettings);
+	                                     ImGuiWindowFlags_NoSavedSettings | (closing ? ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav : 0));
+	ImDrawList* menu_dl    = ImGui::GetWindowDrawList();
+	const int   menu_first = 0; // (the window's own list: its background and contents; closing: NoInputs, NoNav)
 	ImGui::TextUnformatted(I18n::T("Demon's Souls PC"));
 	ImGui::Separator();
 	bool show = g_saved.start_menu;
@@ -4336,22 +4494,22 @@ void DrawInGameMenu(float width, float height) {
 		(void)SaveSettings(g_rt.ini_path, on_disk);
 	}
 	const ImVec2 bs {420 * unit, 52 * unit};
-	if (ImGui::Button(I18n::T("Volver al juego"), bs)) SetOpen(false);
+	if (Anim::Button(I18n::T("Volver al juego"), bs, unit)) SetOpen(false);
 	// (port34) The trophy page (Esc, B or F1 there: back here).
 	if (g_focus_trophy_btn_request.exchange(false)) g_focus_trophy_btn = true;
 	if (g_focus_trophy_btn) {
 		ImGui::SetKeyboardFocusHere();
 		g_focus_trophy_btn = false;
 	}
-	if (ImGui::Button(I18n::T("Ver trofeos"), bs)) {
+	if (Anim::Button(I18n::T("Ver trofeos"), bs, unit)) {
 		g_trophy_tab_delta = 0;
 		TrophyPage::Open();
 		g_trophy_page = true;
 		Bump();
 	}
-	if (ImGui::Button(I18n::T("Mapear mando"), bs)) g_f1_page = 1;
-	if (ImGui::Button(I18n::T("Teclado y ratón"), bs)) g_f1_page = 2;
-		if (ImGui::Button(I18n::T("Cerrar el juego"), bs)) {
+	if (Anim::Button(I18n::T("Mapear mando"), bs, unit)) g_f1_page = 1;
+	if (Anim::Button(I18n::T("Teclado y ratón"), bs, unit)) g_f1_page = 2;
+		if (Anim::Button(I18n::T("Cerrar el juego"), bs, unit)) {
 		// Just closes: nothing saved, nothing skipped (the game's own saves are already on disk).
 #if defined(_WIN32)
 		ExitProcess(0);
@@ -4360,15 +4518,24 @@ void DrawInGameMenu(float width, float height) {
 #endif
 	}
 	ImGui::TextDisabled("%s", I18n::T("F1 o Esc: volver al juego"));
+	{
+		// The zoom: 94 % -> 100 % about the window's centre (the vertices it drew).
+		const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+		Anim::ScaleVertices(menu_dl, menu_first, {wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f}, 0.94f + 0.06f * t);
+	}
 	ImGui::End();
-	ImGui::PopStyleColor();
-	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(6);
+	ImGui::PopStyleVar(5);
 	ImGui::PopFont();
 }
 
 void DrawInGame(float width, float height) {
 	if (g_open.load() && !Resume::SaveAndQuitActive()) {
 		DrawInGameMenu(width, height);
+		return;
+	}
+	if (Anim::Closing() && !Resume::SaveAndQuitActive()) { // (ds-pc-port38) the fade-out
+		DrawInGameMenu(width, height, true);
 		return;
 	}
 	ImGui::GetIO().MouseDrawCursor = false;
