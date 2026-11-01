@@ -1083,6 +1083,12 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (~78K pipelines beside the game, the whole multi-GB driver cache saved every 4,000: the game crawled at the
 	// character select with "Preparando ... 8%" and a black screen). What the precompile lacks compiles at first use.
 	env.Default("KYTY_STATIC_WARMUP", "0");
+	// (ds-pc-port42) Correctness first: the shader prefetch's translations on disk (ds-pc-port37, _PipelineCache/spirv) are
+	// keyed by the program's input records alone; a program reused from there with another run's plan is not proven to
+	// be the one this run would translate (11-01 reports after it: odd colours, and DLSS-G never found its G-buffer
+	// camera: "camera valid 0 of 600", no G-buffer draw seen on any path). Off: every program translated as before
+	// ds-pc-port37 (KYTY_SPIRV_DISK=1 in Avanzado > extra turns it back on).
+	env.Default("KYTY_SPIRV_DISK", "0");
 	// (ds-pc-port37) "Carga de shaders al maximo": the translation of the game's shaders at the start (the prefetch: every
 	// shader of the game, then the recorded ones' warmup) on every CPU thread, at background priority (the game stays ahead).
 	// By default the prefetch took CPUs - 12, at most half of them, and half of that after the recorded programs (a 16-thread

@@ -4437,7 +4437,7 @@ void Sample(LogState& L,
 		if (last(part, re_native, mm)) L.native = std::atoi(mm[2].str().c_str());
 	}
 	struct {
-		double mean = 0, max = 0, fps = 0, fg_shown = 0, lat_mean = 0, lat_p95 = 0;
+		double mean = 0, max = 0, fps = 0, fg_shown = 0, fg_real = 0, lat_mean = 0, lat_p95 = 0;
 		int    fg_mult = 0;
 		int64_t key = -1;
 		bool   any = false;
@@ -4468,7 +4468,7 @@ void Sample(LogState& L,
 		for (std::sregex_iterator it(text.begin(), text.end(), re_rs), end; it != end; ++it) mr = *it, hr = true;
 		for (std::sregex_iterator it(text.begin(), text.end(), re_lat), end; it != end; ++it) ml = *it, hl = true;
 		if (hx) f.fg_mult = std::atoi(mx[2].str().c_str());
-		if (hr && mr.position(0) > prev_idx && mr[2].str() != mr[1].str()) f.fg_shown = std::round(Num(mr[2]));
+		if (hr && mr.position(0) > prev_idx && mr[2].str() != mr[1].str()) f.fg_shown = std::round(Num(mr[2])), f.fg_real = std::round(Num(mr[1]));
 		if (hl) {
 			const double add = Num(ml[4]) + Num(ml[5]);
 			f.lat_mean = ml[7].matched ? Num(ml[7]) : Num(ml[1]) + add;
@@ -4559,7 +4559,8 @@ void Sample(LogState& L,
 		shown = 0;
 	std::scoped_lock lock(g_mutex);
 	g_rows     = std::move(rows);
-	g_fps_text = shown > 0 ? Fmt("FPS %.0f", shown) : std::string();
+	// (ds-pc-port42) The shown rate big, and with frame generation the real one beside it (the same [fsr3] / [dlssg] line).
+	g_fps_text = shown > 0 ? (fg_on && f.fg_real > 0 && f.fg_shown > 0 ? Fmt("FPS %.0f  (real %.0f)", shown, f.fg_real) : Fmt("FPS %.0f", shown)) : std::string();
 	g_fps_color = fg_on ? (fg_nv ? kGreen : kRed) : kWhite;
 	g_ft = std::move(ft), g_ft_max = std::move(ftm);
 }

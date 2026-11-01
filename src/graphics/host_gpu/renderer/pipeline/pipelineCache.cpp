@@ -280,6 +280,9 @@ bool DumpWanted(uint64_t hash) {
 	return !list.empty() && list.find(fmt::format("{:016x}", hash)) != std::string::npos;
 }
 
+// (ds-pc-port42) Render-thread pipeline creations slow enough to log (SLOW Create*Pipeline): the session's count, at the end.
+static std::atomic<uint32_t> g_render_pipeline_hitches {0};
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled() && !DumpWanted(shader_hash)) {
@@ -2852,6 +2855,9 @@ void PipelineCache::ReportSession() {
 	                 m_program_cache->render_translations, m_program_cache->render_translate_ms, m_render_pipelines,
 	                 m_render_pipeline_ms);
 	ReportStaticStore();
+	std::printf("Pipeline hitches on the render thread (a frame waited >= %.0f ms for a pipeline made there): %u\n", SlowLog::HitchThreshold(),
+	            g_render_pipeline_hitches.load());
+	std::fflush(stdout);
 	if (m_played != nullptr) m_played->Report();
 	if (const auto kept = g_pipeline_evictions.kept.load(); kept != 0) {
 		PipelineCacheLog("Pipelines out of video memory while idle: {} evicted of {} that could be, {} made again ({:.0f} ms, at "
@@ -4578,6 +4584,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	SlowLog::Scope create_slow([&](double ms) {
 		const auto* vs = vs_input_info.stage.program;
 		const auto* ps = ps_active ? ps_input_info->stage.program : nullptr;
+		g_render_pipeline_hitches.fetch_add(1, std::memory_order_relaxed);
 		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu VS=0x%016llx PS=0x%016llx; %s\n", ms,
 		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id),
 		            static_cast<unsigned long long>(vs != nullptr ? vs->shader_hash : 0),
@@ -4676,6 +4683,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	SlowLog::Scope create_slow([&](double ms) {
 		const auto* cs = input_info.stage.program;
+		g_render_pipeline_hitches.fetch_add(1, std::memory_order_relaxed);
 		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu CS=0x%016llx; %s\n", ms,
 		            static_cast<unsigned long long>(compute_program.id),
 		            static_cast<unsigned long long>(cs != nullptr ? cs->shader_hash : 0), LastPipelineStoreOutcome());
