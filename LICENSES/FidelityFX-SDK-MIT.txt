@@ -1,6 +1,7 @@
-AMD FidelityFX SDK 1.1.4 (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK): the release build compiles
-its API headers (ffx-api/include) for FSR 3.1 frame generation. AMD's runtime (amd_fidelityfx_vk.dll) does not come
-with this package: the user puts AMD's signed DLL next to the emulator.
+AMD FSR SDK 2.4 and FidelityFX SDK 1.1.4 (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK): the release
+build compiles FSR SDK 2.4's API headers for AMD's FSR runtime (frame generation, FSR 4 upscaling) and FidelityFX SDK
+1.1.4's FSR 3 sources (built in). AMD's runtime (its signed DLLs) does not come with this package: the user puts
+AMD's DLLs next to the emulator.
 
 Copyright (C) 2024 Advanced Micro Devices, Inc.
 

@@ -233,6 +233,11 @@ struct UpscaleInputs {
 	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
 	float        near_plane = 0.1f, far_plane = 3000.0f;
 };
+// Windows, AMD's FSR SDK 2 runtime next to the emulator (amd_fidelityfx_loader_vk.dll and its effect DLLs, frame-gen.cpp
+// FsrLoadRuntime): records AMD's upscaling of `inputs` into `command`, as fsr-native.h's Upscale takes them: FSR 4 on
+// the Radeon cards AMD lists for it (RX 7000 and 9000; from FSR 4.1.2 RX 6000 too), FSR 3.1 on the others. False without
+// that runtime, or once it failed (FSR 3 built in then). KYTY_FSR_RUNTIME=0: never.
+[[nodiscard]] bool UpscaleWithAmdRuntime(GraphicContext& graphics, vk::CommandBuffer command, const UpscaleInputs& inputs);
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
 // Streamline's DLSS super resolution without frame generation (Windows): every frame the game rendered goes to the

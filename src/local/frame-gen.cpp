@@ -51,13 +51,20 @@
 #include <windows.h>
 #undef min
 #undef max
-// AMD FidelityFX SDK 1.1.4's API headers (_Build/deps/fidelityfx, see CMakeLists.txt; MIT); its runtime is
-// amd_fidelityfx_vk.dll next to the emulator.
-#include <ffx_api/ffx_api.h>
-#include <ffx_api/ffx_api_loader.h>
-#include <ffx_api/ffx_framegeneration.h>
-#include <ffx_api/vk/ffx_api_vk.h>
+// AMD FSR SDK 2.4's API headers (_Build/deps/fsr-sdk/Kits/FidelityFX, see CMakeLists.txt; MIT); its runtime is AMD's
+// next to the emulator (FsrLoadRuntime). (Their pragmas are MSVC's: clang skips them.)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-pragmas"
+#include <api/include/ffx_api.h>
+#include <api/include/ffx_api_loader.h>
+#include <api/include/vk/ffx_api_vk.h>
+#include <framegeneration/include/ffx_framegeneration.h>
+#include <framegeneration/include/vk/ffx_api_framegeneration_vk.h>
+#include <upscalers/include/ffx_upscale.h>
+#pragma clang diagnostic pop
 
+#include "common/threads.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "gpu_blit_shaders/fsr_hud_mask_spv.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 
@@ -537,6 +544,7 @@ struct FsrState {
 	vk::Extent2D     display {};
 	vk::Format       format = vk::Format::eUndefined;
 	bool             hdr    = false; // HDR10 (PQ) swapchain
+	bool             sdk2   = false; // the runtime is FSR SDK 2's loader, not FidelityFX SDK 1.1.4's DLL (FsrLoadRuntime)
 	vk::Extent2D     max_render {};  // fg_context's
 	uint64_t         frame_id = 0;
 	bool             mode_on  = false;
@@ -567,6 +575,96 @@ void FsrMessage(uint32_t type, const wchar_t* message) {
 		std::printf("FSR %s: %s\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", text);
 		std::fflush(stdout);
 	}
+}
+
+// AMD's runtime next to the emulator, only AMD's own (once): FSR SDK 2's loader, amd_fidelityfx_loader_vk.dll, which
+// takes the effects from amd_fidelityfx_upscaler_vk.dll and amd_fidelityfx_framegeneration_vk.dll beside it (FSR 4 on
+// the Radeon cards AMD lists for it, FSR 3.1 on the others), else FidelityFX SDK 1.1.4's amd_fidelityfx_vk.dll (FSR
+// 3.1). False: none.
+bool FsrLoadRuntime() {
+	static const bool loaded = [] {
+		auto&   s = g_fsr_state;
+		wchar_t exe[MAX_PATH] {};
+		GetModuleFileNameW(nullptr, exe, MAX_PATH);
+		const auto      folder = std::filesystem::path(exe).parent_path();
+		std::error_code error;
+		const auto present = [&](const wchar_t* name) { return std::filesystem::exists(folder / name, error); };
+		const auto amd     = [&](const wchar_t* name) { return LocalPlatform::IsAmdSigned((folder / name).wstring()); };
+		HMODULE    module  = nullptr;
+		if (present(L"amd_fidelityfx_loader_vk.dll")) {
+			// (The loader loads the effects beside it by their names: each must be AMD's too.)
+			bool ok = amd(L"amd_fidelityfx_loader_vk.dll");
+			for (const wchar_t* effect: {L"amd_fidelityfx_upscaler_vk.dll", L"amd_fidelityfx_framegeneration_vk.dll"}) {
+				if (present(effect) && !amd(effect)) ok = false;
+			}
+			if (ok) {
+				module = LoadLibraryW((folder / L"amd_fidelityfx_loader_vk.dll").c_str());
+				s.sdk2 = module != nullptr;
+			} else {
+				std::printf("FSR: amd_fidelityfx_loader_vk.dll or an effect DLL beside it is not signed by AMD, not loaded\n");
+			}
+		}
+		if (module == nullptr && present(L"amd_fidelityfx_vk.dll")) {
+			if (amd(L"amd_fidelityfx_vk.dll")) {
+				module = LoadLibraryW((folder / L"amd_fidelityfx_vk.dll").c_str());
+			} else {
+				std::printf("FSR: amd_fidelityfx_vk.dll is not signed by AMD, not loaded\n");
+			}
+		}
+		if (module == nullptr) {
+			LOGF("FSR: no runtime (amd_fidelityfx_loader_vk.dll or amd_fidelityfx_vk.dll)\n");
+			std::fflush(stdout);
+			return false;
+		}
+		ffxLoadFunctions(&s.api, module);
+		if (s.api.CreateContext == nullptr || s.api.Configure == nullptr || s.api.Dispatch == nullptr ||
+		    s.api.Query == nullptr || s.api.DestroyContext == nullptr) {
+			std::printf("FSR: AMD's runtime lacks an entry point, FSR off\n");
+			std::fflush(stdout);
+			s.sdk2 = false;
+			return false;
+		}
+		ffxConfigureDescGlobalDebug1 debug {};
+		debug.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
+		debug.fpMessage   = FsrMessage;
+		debug.debugLevel  = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr ? FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_VERBOSE
+		                                                                    : FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS;
+		(void)s.api.Configure(nullptr, &debug.header);
+		std::printf("FSR: AMD's runtime %s\n", s.sdk2 ? "amd_fidelityfx_loader_vk.dll (FSR SDK 2)"
+		                                              : "amd_fidelityfx_vk.dll (FidelityFX SDK 1.1.4)");
+		std::fflush(stdout);
+		return true;
+	}();
+	return loaded;
+}
+
+// The Vulkan backend as the loaded runtime takes it: FSR SDK 2's description (a VkDeviceContext), or SDK 1.1.4's
+// older one (which SDK 2 keeps for its FSR 3.1.4 provider only). Made where it is chained (Header points into it).
+struct FsrBackend {
+	ffxCreateBackendVKDesc            current {};
+	ffxCreateBackendVKDesc_DEPRECATED old {};
+
+	explicit FsrBackend(GraphicContext& graphics) {
+		current.header.type                    = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+		current.deviceContext.vkDevice         = static_cast<VkDevice>(graphics.device);
+		current.deviceContext.vkPhysicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
+		current.deviceContext.vkDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+		old.header.type                        = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
+		old.vkDevice                           = current.deviceContext.vkDevice;
+		old.vkPhysicalDevice                   = current.deviceContext.vkPhysicalDevice;
+		old.vkDeviceProcAddr                   = current.deviceContext.vkDeviceProcAddr;
+	}
+	ffxApiHeader* Header() { return g_fsr_state.sdk2 ? &current.header : &old.header; }
+};
+
+// The provider AMD's runtime chose for a context (its version: "4.1.2" is FSR 4, "3.1.x" FSR 3.1); "?" when unsaid.
+std::string FsrProvider(ffxContext* context) {
+	ffxQueryGetProviderVersion version {};
+	version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+	if (g_fsr_state.api.Query(context, &version.header) != FFX_API_RETURN_OK || version.versionName == nullptr) {
+		return "?";
+	}
+	return version.versionName;
 }
 
 FfxApiResource FsrImage(const VulkanImage& image) {
@@ -652,14 +750,15 @@ bool FsrEnsureFrameGeneration(vk::Extent2D render) {
 	auto& s = g_fsr_state;
 	if (s.fg_context != nullptr && render.width <= s.max_render.width && render.height <= s.max_render.height) return true;
 	FsrDestroyFrameGeneration();
-	ffxCreateBackendVKDesc backend {};
-	backend.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
-	backend.vkDevice         = static_cast<VkDevice>(s.graphics->device);
-	backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(s.graphics->physical_device);
-	backend.vkDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	FsrBackend backend(*s.graphics);
+	// (FSR SDK 2 wants the API version the emulator was built against.)
+	ffxCreateContextDescFrameGenerationVersion version {};
+	version.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+	version.header.pNext = backend.Header();
+	version.version      = FFX_FRAMEGENERATION_VERSION;
 	ffxCreateContextDescFrameGeneration create {};
 	create.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
-	create.header.pNext = &backend.header;
+	create.header.pNext = s.sdk2 ? &version.header : backend.Header();
 	// The game's depth: reversed-Z with an infinite far plane (Decompose); its vectors at the render size.
 	create.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
 	if (std::getenv("KYTY_FRAMEGEN_DEBUG") != nullptr) create.flags |= FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING;
@@ -673,10 +772,142 @@ bool FsrEnsureFrameGeneration(vk::Extent2D render) {
 	}
 	LOGF("frame generation: FSR context %ux%u, render up to %ux%u\n", s.display.width, s.display.height,
 	     s.max_render.width, s.max_render.height);
-	std::printf("Frame generation: FSR 3.1 ready (%ux%u, render up to %ux%u)\n", s.display.width, s.display.height,
-	            s.max_render.width, s.max_render.height);
+	std::printf("Frame generation: FSR ready (%ux%u, render up to %ux%u; frame generation %s)\n", s.display.width,
+	            s.display.height, s.max_render.width, s.max_render.height, FsrProvider(&s.fg_context).c_str());
 	std::fflush(stdout);
 	return true;
+}
+
+// An upscaler input or output as AMD's runtime takes it: the image's own format (it makes its views: a depth image's
+// with the depth aspect; the game's depth is a D32S8 image viewed as R32), the state its layout is in.
+FfxApiResource FsrResource(const UpscaleImage& image, bool written) {
+	VkImageCreateInfo info {};
+	info.sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.imageType   = VK_IMAGE_TYPE_2D;
+	info.format      = static_cast<VkFormat>(image.image_format != vk::Format::eUndefined ? image.image_format : image.format);
+	info.extent      = {image.extent.width, image.extent.height, 1};
+	info.mipLevels   = 1;
+	info.arrayLayers = 1;
+	info.samples     = VK_SAMPLE_COUNT_1_BIT;
+	info.usage       = static_cast<VkImageUsageFlags>(image.usage);
+	const uint32_t state = written ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS
+	                       : image.layout == vk::ImageLayout::eGeneral ? FFX_API_RESOURCE_STATE_COMMON
+	                                                                   : FFX_API_RESOURCE_STATE_COMPUTE_READ;
+	return ffxApiGetResourceVK(static_cast<VkImage>(image.image),
+	                           ffxApiGetImageResourceDescriptionVK(static_cast<VkImage>(image.image), info,
+	                                                               written ? FFX_API_RESOURCE_USAGE_UAV : FFX_API_RESOURCE_USAGE_READ_ONLY),
+	                           state);
+}
+
+// AMD's upscaling through FSR SDK 2's runtime (UpscaleWithAmdRuntime), from the inputs FSR 3 built in takes
+// (fsr-native.cpp): the game's linear HDR scene before its tone mapping, reversed-Z with an infinite far plane.
+struct FsrRuntimeUpscaler {
+	std::mutex   mutex;
+	ffxContext   context = nullptr;
+	vk::Extent2D render {}, display {};
+	bool         failed = false, reset = true;
+	std::chrono::steady_clock::time_point last {};
+
+	void Destroy(GraphicContext& graphics) {
+		if (context == nullptr) return;
+		{
+			Common::LockGuard lock(graphics.queue_mutex);
+			(void)graphics.queue.waitIdle();
+		}
+		(void)g_fsr_state.api.DestroyContext(&context, nullptr);
+		context = nullptr;
+	}
+
+	bool Fail(const char* what, ffxReturnCode_t code) {
+		failed = true;
+		std::printf("Super resolution: AMD's FSR %s failed (%u); FSR 3 built in from now on\n", what,
+		            static_cast<uint32_t>(code));
+		std::fflush(stdout);
+		return false;
+	}
+
+	bool Create(GraphicContext& graphics, vk::Extent2D render_size, vk::Extent2D display_size) {
+		render  = render_size;
+		display = display_size;
+		FsrBackend backend(graphics);
+		// (FSR SDK 2 wants the API version the emulator was built against.)
+		ffxCreateContextDescUpscaleVersion version {};
+		version.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+		version.header.pNext = backend.Header();
+		version.version      = FFX_UPSCALER_VERSION;
+		ffxCreateContextDescUpscale create {};
+		create.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+		create.header.pNext = &version.header;
+		create.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
+		               FFX_UPSCALE_ENABLE_DEPTH_INFINITE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+		if (std::getenv("KYTY_FSR_DEBUG") != nullptr) create.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+		create.maxRenderSize  = {render.width, render.height};
+		create.maxUpscaleSize = {display.width, display.height};
+		create.fpMessage      = FsrMessage;
+		if (const auto code = g_fsr_state.api.CreateContext(&context, &create.header, nullptr); code != FFX_API_RETURN_OK) {
+			context = nullptr;
+			return Fail("upscaling context", code);
+		}
+		reset = true;
+		std::printf("Super resolution: AMD FSR %s %ux%u -> %ux%u (AMD's runtime)\n", FsrProvider(&context).c_str(),
+		            render.width, render.height, display.width, display.height);
+		std::fflush(stdout);
+		return true;
+	}
+
+	bool Record(GraphicContext& graphics, vk::CommandBuffer command, const UpscaleInputs& inputs) {
+		std::lock_guard lock(mutex);
+		if (failed) return false;
+		// (The runtime makes its own views of mip level 0 and layer 0.)
+		for (const auto* image: {&inputs.color, &inputs.depth, &inputs.motion, &inputs.output}) {
+			if (image->base_level != 0 || image->base_layer != 0) return false;
+		}
+		if (context != nullptr && (render != inputs.color.extent || display != inputs.output.extent)) Destroy(graphics);
+		if (context == nullptr && !Create(graphics, inputs.color.extent, inputs.output.extent)) return false;
+		static const float sharpness = [] {
+			const char* value = std::getenv("KYTY_FSR_SHARPNESS");
+			return value != nullptr ? std::clamp(std::strtof(value, nullptr), 0.0f, 1.0f) : 0.6f;
+		}();
+		ffxDispatchDescUpscale dispatch {};
+		dispatch.header.type   = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+		dispatch.commandList   = static_cast<VkCommandBuffer>(command);
+		dispatch.color         = FsrResource(inputs.color, false);
+		dispatch.depth         = FsrResource(inputs.depth, false);
+		dispatch.motionVectors = FsrResource(inputs.motion, false);
+		dispatch.output        = FsrResource(inputs.output, true);
+		// (The game's reactive mask: the pixels taken from this frame rather than the history, issue #232.)
+		if (inputs.reactive.image) dispatch.reactive = FsrResource(inputs.reactive, false);
+		// (Render pixels, as DLSS takes them; the game's vectors times their scale: render pixels to the previous position.)
+		dispatch.jitterOffset      = {inputs.jitter_x, inputs.jitter_y};
+		dispatch.motionVectorScale = {inputs.motion_scale_x, inputs.motion_scale_y};
+		dispatch.renderSize        = {render.width, render.height};
+		dispatch.upscaleSize       = {display.width, display.height};
+		dispatch.enableSharpening  = sharpness > 0.0f;
+		dispatch.sharpness         = sharpness;
+		const auto now             = std::chrono::steady_clock::now();
+		dispatch.frameTimeDelta    = last.time_since_epoch().count() == 0
+		                                 ? 16.7f
+		                                 : std::chrono::duration<float, std::milli>(now - last).count();
+		last                       = now;
+		dispatch.preExposure       = 1.0f;
+		dispatch.reset             = reset || inputs.reset;
+		dispatch.cameraNear        = inputs.near_plane > 0.0f ? inputs.near_plane : 0.1f;
+		dispatch.cameraFar         = FLT_MAX;
+		// (Row vectors: the projection's y scale is cot(fov / 2).)
+		const float y_scale              = std::fabs(inputs.view_to_clip[5]);
+		dispatch.cameraFovAngleVertical  = y_scale > 0.0f ? 2.0f * std::atan(1.0f / y_scale) : 1.0f;
+		dispatch.viewSpaceToMetersFactor = 1.0f;
+		if (const auto code = g_fsr_state.api.Dispatch(&context, &dispatch.header); code != FFX_API_RETURN_OK) {
+			return Fail("upscaling", code);
+		}
+		reset = false;
+		return true;
+	}
+};
+
+FsrRuntimeUpscaler& TheRuntimeUpscaler() {
+	static auto* upscaler = new FsrRuntimeUpscaler;
+	return *upscaler;
 }
 
 #endif
@@ -1334,40 +1565,17 @@ void Initialize() {
 	    !g_fsr_native && backend != nullptr && std::string(backend) == "fsr") {
 		[] {
 #ifdef KYTY_FRAMEGEN_FSR
-			// AMD's runtime next to the emulator, only AMD's own; FSR 3.1 makes one frame per frame.
-			wchar_t exe[MAX_PATH] {};
-			GetModuleFileNameW(nullptr, exe, MAX_PATH);
-			const auto runtime = std::filesystem::path(exe).parent_path() / "amd_fidelityfx_vk.dll";
-			HMODULE    module  = nullptr;
-			if (!LocalPlatform::IsAmdSigned(runtime.wstring())) {
-				std::printf("Frame generation: %s is missing or not signed by AMD, FSR off\n", runtime.string().c_str());
-			} else {
-				module = LoadLibraryW(runtime.c_str());
-			}
-			if (module == nullptr) {
-				LOGF("frame generation: no FSR runtime (amd_fidelityfx_vk.dll)\n");
+			// AMD's runtime next to the emulator (FsrLoadRuntime); FSR makes one frame per frame.
+			if (!FsrLoadRuntime()) {
+				std::printf("Frame generation: no AMD runtime next to the emulator (amd_fidelityfx_loader_vk.dll with its "
+				            "effect DLLs, or amd_fidelityfx_vk.dll), FSR off\n");
 				std::fflush(stdout);
 				g_generate = 0;
 				return;
 			}
-			ffxLoadFunctions(&g_fsr_state.api, module);
-			if (g_fsr_state.api.CreateContext == nullptr || g_fsr_state.api.Configure == nullptr ||
-			    g_fsr_state.api.Dispatch == nullptr || g_fsr_state.api.Query == nullptr ||
-			    g_fsr_state.api.DestroyContext == nullptr) {
-				std::printf("Frame generation: amd_fidelityfx_vk.dll lacks an entry point, FSR off\n");
-				g_generate = 0;
-				return;
-			}
-			ffxConfigureDescGlobalDebug1 debug {};
-			debug.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
-			debug.fpMessage   = FsrMessage;
-			debug.debugLevel  = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr ? FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_VERBOSE
-			                                                                    : FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS;
-			(void)g_fsr_state.api.Configure(nullptr, &debug.header);
 			g_generate = 1;
 			g_fsr      = true;
-			LOGF("frame generation: FSR 3.1 runtime loaded from %s\n", runtime.string().c_str());
-			std::printf("Frame generation: AMD FSR 3.1 (2x)\n");
+			std::printf("Frame generation: AMD FSR (2x)\n");
 			std::fflush(stdout);
 #else
 			LOGF("frame generation: this build has no FSR support\n");
@@ -2156,6 +2364,19 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 #endif
 }
 
+bool UpscaleWithAmdRuntime(GraphicContext& graphics, vk::CommandBuffer command, const UpscaleInputs& inputs) {
+#ifdef KYTY_FRAMEGEN_FSR
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_FSR_RUNTIME");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed && FsrLoadRuntime() && g_fsr_state.sdk2 && TheRuntimeUpscaler().Record(graphics, command, inputs);
+#else
+	(void)graphics, (void)command, (void)inputs;
+	return false;
+#endif
+}
+
 bool UpscalerReady() {
 	return g_upscale_ready;
 }
@@ -2674,6 +2895,11 @@ vk::Result CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateIn
 	create.asyncComputeQueue = {static_cast<VkQueue>(graphics.fsr_compute_queue), graphics.fsr_compute_family, nullptr};
 	create.presentQueue      = {static_cast<VkQueue>(graphics.fsr_present_queue), graphics.fsr_present_family, nullptr};
 	create.imageAcquireQueue = {static_cast<VkQueue>(graphics.fsr_acquire_queue), graphics.fsr_compute_family, nullptr};
+	// (FSR SDK 2 wants the API version the emulator was built against.)
+	ffxCreateContextDescFrameGenerationSwapChainVersionVK version {};
+	version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_VK;
+	version.version     = FFX_FRAMEGENERATION_SWAPCHAIN_VK_VERSION;
+	if (s.sdk2) create.header.pNext = &version.header;
 	if (!FsrOk(s.api.CreateContext(&s.swapchain_context, &create.header, nullptr), "swapchain")) {
 		s.swapchain_context = nullptr;
 		return vk::Result::eErrorInitializationFailed;
@@ -2694,7 +2920,13 @@ vk::Result CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateIn
 	s.run_with  = 0;
 	s.run_without = 0;
 	*swapchain  = handle;
-	LOGF("frame generation: FSR swapchain %ux%u\n", s.display.width, s.display.height);
+	LOGF("frame generation: FSR swapchain %ux%u (%s)\n", s.display.width, s.display.height,
+	     FsrProvider(&s.swapchain_context).c_str());
+	// (FSR SDK 2's swapchain does not say its version.)
+	if (static bool reported = false; !std::exchange(reported, true) && FsrProvider(&s.swapchain_context) != "?") {
+		std::printf("Frame generation: FSR swapchain %s\n", FsrProvider(&s.swapchain_context).c_str());
+		std::fflush(stdout);
+	}
 	return vk::Result::eSuccess;
 #else
 	(void)graphics;
@@ -2851,17 +3083,9 @@ void RecordPrepare(GraphicContext& graphics, vk::CommandBuffer command, const Fr
 		const char* mv = std::getenv("KYTY_FRAMEGEN_MV");
 		return mv != nullptr && std::string(mv) == "px";
 	}();
-	ffxDispatchDescFrameGenerationPrepareCameraInfo camera_info {};
-	camera_info.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
-	for (int i = 0; i < 3; ++i) {
-		camera_info.cameraPosition[i] = camera.position[i];
-		camera_info.cameraUp[i]       = camera.up[i];
-		camera_info.cameraRight[i]    = camera.right[i];
-		camera_info.cameraForward[i]  = camera.forward[i];
-	}
-	ffxDispatchDescFrameGenerationPrepare prepare {};
-	prepare.header.type       = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
-	prepare.header.pNext      = camera.valid ? &camera_info.header : nullptr;
+	// FSR SDK 2: the camera's axes in the prepare itself (V2; FSR 4's frame generation requires it), else after it.
+	ffxDispatchDescFrameGenerationPrepareV2 prepare {};
+	prepare.header.type       = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
 	prepare.frameID           = id;
 	prepare.flags             = debug_flags;
 	prepare.commandList       = static_cast<VkCommandBuffer>(command);
@@ -2871,13 +3095,50 @@ void RecordPrepare(GraphicContext& graphics, vk::CommandBuffer command, const Fr
 	prepare.motionVectorScale = pixels_mv ? FfxApiFloatCoords2D {mv_sign, mv_sign}
 	                                      : FfxApiFloatCoords2D {mv_sign * width, mv_sign * height};
 	prepare.frameTimeDelta    = delta;
+	prepare.reset             = s.reset;
 	prepare.cameraNear        = camera.valid ? camera.z_near : 0.1f;
 	prepare.cameraFar         = FLT_MAX;
 	prepare.cameraFovAngleVertical  = camera.valid ? 2.0f * std::atan(1.0f / std::fabs(camera.sy)) : 1.0f;
 	prepare.viewSpaceToMetersFactor = 1.0f;
 	prepare.depth             = FsrImage(inputs->depth);
 	prepare.motionVectors     = FsrImage(inputs->motion);
-	(void)FsrOk(s.api.Dispatch(&s.fg_context, &prepare.header), "prepare");
+	for (int i = 0; i < 3; ++i) {
+		prepare.cameraPosition[i] = camera.position[i];
+		prepare.cameraUp[i]       = camera.up[i];
+		prepare.cameraRight[i]    = camera.right[i];
+		prepare.cameraForward[i]  = camera.forward[i];
+	}
+	if (s.sdk2) {
+		(void)FsrOk(s.api.Dispatch(&s.fg_context, &prepare.header), "prepare");
+		return;
+	}
+	// (FidelityFX SDK 1.1.4's runtime: the prepare and its camera that SDK 2 calls deprecated.)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	ffxDispatchDescFrameGenerationPrepareCameraInfo camera_info {};
+	camera_info.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
+	std::copy_n(prepare.cameraPosition, 3, camera_info.cameraPosition);
+	std::copy_n(prepare.cameraUp, 3, camera_info.cameraUp);
+	std::copy_n(prepare.cameraRight, 3, camera_info.cameraRight);
+	std::copy_n(prepare.cameraForward, 3, camera_info.cameraForward);
+	ffxDispatchDescFrameGenerationPrepare old {};
+	old.header.type             = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+	old.header.pNext            = camera.valid ? &camera_info.header : nullptr;
+	old.frameID                 = prepare.frameID;
+	old.flags                   = prepare.flags;
+	old.commandList             = prepare.commandList;
+	old.renderSize              = prepare.renderSize;
+	old.jitterOffset            = prepare.jitterOffset;
+	old.motionVectorScale       = prepare.motionVectorScale;
+	old.frameTimeDelta          = prepare.frameTimeDelta;
+	old.cameraNear              = prepare.cameraNear;
+	old.cameraFar               = prepare.cameraFar;
+	old.cameraFovAngleVertical  = prepare.cameraFovAngleVertical;
+	old.viewSpaceToMetersFactor = prepare.viewSpaceToMetersFactor;
+	old.depth                   = prepare.depth;
+	old.motionVectors           = prepare.motionVectors;
+	(void)FsrOk(s.api.Dispatch(&s.fg_context, &old.header), "prepare");
+#pragma clang diagnostic pop
 #else
 	(void)command, (void)inputs, (void)region;
 #endif

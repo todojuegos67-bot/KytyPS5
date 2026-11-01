@@ -21,7 +21,7 @@ sealed class LauncherContext {
 	public readonly bool AmdGpu;          // an AMD Radeon graphics card (AMD Anti-Lag)
 	public readonly ulong RamBytes;
 	public readonly int DisplayHeight;    // the primary display's height in pixels (Game output: Automatic), or 0
-	public readonly bool FsrAvailable;    // AMD's signed amd_fidelityfx_vk.dll next to the emulator (FSR 3 frame generation)
+	public readonly bool FsrAvailable;    // AMD's signed FSR runtime next to the emulator (FSR frame generation)
 	public string Streamline { get; private set; } // NVIDIA's signed Streamline runtime folder, or null
 	public bool FrameGenAvailable { get { return Streamline != null && RtxGpu; } }
 
@@ -41,8 +41,12 @@ sealed class LauncherContext {
 		RamBytes = Native.TotalRam();
 		DisplayHeight = Native.DisplayHeight();
 		Streamline = ResolveStreamline();
-		var fsrDll = Path.Combine(Path.GetDirectoryName(EmulatorExe) ?? Root, "amd_fidelityfx_vk.dll");
-		FsrAvailable = Signature.SignedBy(fsrDll, "Advanced Micro Devices");
+		// AMD's runtime next to the emulator, signed by AMD: FSR SDK 2's loader with its frame generation DLL (FSR 4 frame
+		// generation on RX 9000 cards, FSR 3.1 on others), or FidelityFX SDK 1.1.4's amd_fidelityfx_vk.dll (FSR 3.1).
+		var folder = Path.GetDirectoryName(EmulatorExe) ?? Root;
+		Func<string, bool> amd = name => Signature.SignedBy(Path.Combine(folder, name), "Advanced Micro Devices");
+		FsrAvailable = (amd("amd_fidelityfx_loader_vk.dll") && amd("amd_fidelityfx_framegeneration_vk.dll")) ||
+		               amd("amd_fidelityfx_vk.dll");
 	}
 
 	// The launcher sits next to run-windows.ps1 in a package; in the source tree it is built to _Build\launcher.

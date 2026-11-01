@@ -495,7 +495,9 @@ Interpolator& TheInterpolator() {
 } // namespace
 
 bool Upscale(GraphicContext& graphics, vk::CommandBuffer command, const FrameGen::UpscaleInputs& inputs) {
-	return UpscalerRequested() && TheUpscaler().Record(graphics, command, inputs);
+	// AMD's runtime where there is one (Windows, FSR SDK 2: FSR 4 on the Radeon cards AMD lists for it), else built in.
+	return UpscalerRequested() && (FrameGen::UpscaleWithAmdRuntime(graphics, command, inputs) ||
+	                               TheUpscaler().Record(graphics, command, inputs));
 }
 
 bool Interpolate(GraphicContext& graphics, vk::CommandBuffer command, const InterpolationInputs& inputs,

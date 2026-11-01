@@ -944,13 +944,15 @@ if (WIN32)
 		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
 		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
 	endif()
-	# KYTY_FRAMEGEN_BACKEND=fsr: AMD FidelityFX SDK 1.1.4's API headers (ffx-api/include, MIT) when unpacked under
-	# _Build/deps/fidelityfx; its runtime (amd_fidelityfx_vk.dll, signed by AMD) goes next to the emulator.
-	set(KYTY_FIDELITYFX_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/fidelityfx" CACHE PATH
-	    "AMD FidelityFX SDK (ffx-api) for KYTY_FRAMEGEN_BACKEND=fsr")
-	if (EXISTS "${KYTY_FIDELITYFX_SDK}/include/ffx_api/ffx_api.h")
+	# AMD's FSR runtime (KYTY_FRAMEGEN_BACKEND=fsr, and KYTY_UPSCALER=fsr with FSR SDK 2's): AMD FSR SDK 2.4's API
+	# headers (Kits/FidelityFX/api, framegeneration and upscalers include folders, MIT) when unpacked under
+	# _Build/deps/fsr-sdk; the runtime (amd_fidelityfx_loader_vk.dll with its effect DLLs, or FidelityFX SDK 1.1.4's
+	# amd_fidelityfx_vk.dll, signed by AMD) is the user's, next to the emulator.
+	set(KYTY_FSR_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/fsr-sdk" CACHE PATH
+	    "AMD FSR SDK 2 (its Kits/FidelityFX headers) for AMD's FSR runtime")
+	if (EXISTS "${KYTY_FSR_SDK}/Kits/FidelityFX/api/include/ffx_api.h")
 		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
-		             INCLUDE_DIRECTORIES "${KYTY_FIDELITYFX_SDK}/include")
+		             INCLUDE_DIRECTORIES "${KYTY_FSR_SDK}/Kits/FidelityFX")
 		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
 		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_FSR=1)
 	endif()

@@ -19,12 +19,13 @@
 #   .\run-windows.ps1 -Upscaler dlss         DLSS super resolution: Demon's Souls' own PS5 Pro path (its 3D at
 #                                            2688x1512 or -RenderHeight, 1080 and up or 720), DLSS in place of Sony's
 #                                            upscaler making the 3840x2160 image; NVIDIA's Streamline runtime
-#   .\run-windows.ps1 -Upscaler fsr          the same with AMD's FSR 3 built in (any graphics card, nothing to download)
+#   .\run-windows.ps1 -Upscaler fsr          the same with AMD's FSR 3 built in (any graphics card, nothing to download);
+#                                            with AMD's FSR SDK 2.4 DLLs next to the emulator, FSR 4 on Radeon RX 7000/9000
 #   .\run-windows.ps1 -StreamlineDir <dir>   where NVIDIA's Streamline runtime is (the Streamline SDK
 #                                            or its bin\x64; default: a "streamline" folder next to
 #                                            the emulator)
-#   .\run-windows.ps1 -Fsr                   AMD FSR 3.1 frame generation instead (2x, any GPU): AMD's
-#                                            amd_fidelityfx_vk.dll next to the emulator
+#   .\run-windows.ps1 -Fsr                   AMD FSR frame generation instead (2x, any GPU): AMD's FSR SDK 2.4 DLLs
+#                                            (FSR 4 on Radeon RX 9000) or amd_fidelityfx_vk.dll next to the emulator
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
 #                                            virtual vblank; movies, menus and loading screens keep 60)
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)

@@ -254,10 +254,14 @@ package is built that way by [`.github/workflows/build.yml`](.github/workflows/b
 release (pushes build nothing). [`.github/workflows/build-linux.yml`](.github/workflows/build-linux.yml)
 builds the Linux package the same way (a `v*` tag adds it to that tag's release).
 
-AMD FSR 3.1 frame generation (2x, any GPU without DLSS frame generation; `run-windows.ps1 -Fsr`, a launcher
-checkbox) is built in when AMD FidelityFX SDK 1.1.4's API headers (`ffx-api/include`, MIT) are unpacked into
-`_Build\deps\fidelityfx\include` before configuring. At run time it needs AMD's signed `amd_fidelityfx_vk.dll` next
-to the emulator. The release build fetches the headers itself (as Streamline's); the DLL is not in the package.
+AMD's FSR runtime (frame generation, 2x, any GPU without DLSS frame generation: `run-windows.ps1 -Fsr`, a launcher
+checkbox; and with `-Upscaler fsr` FSR 4 upscaling on the Radeon cards AMD lists for it) is built in when AMD FSR SDK
+2.4's API headers (MIT) are unpacked into `_Build\deps\fsr-sdk` before configuring, keeping their layout:
+`Kits\FidelityFX\api\include`, `Kits\FidelityFX\framegeneration\include` and `Kits\FidelityFX\upscalers\include`. At
+run time it needs AMD's signed DLLs next to the emulator: SDK 2.4's `amd_fidelityfx_loader_vk.dll` with
+`amd_fidelityfx_framegeneration_vk.dll` and `amd_fidelityfx_upscaler_vk.dll`, or FidelityFX SDK 1.1.4's
+`amd_fidelityfx_vk.dll` (FSR 3.1 frame generation only). The release build fetches the headers itself (as
+Streamline's); the DLLs are not in the package.
 
 ### Build requirements (Windows)
 
