@@ -346,6 +346,17 @@ bool OnEvent(const SDL_Event& e) {
 				return true;
 			}
 			if (!open) return false;
+			// (ds-pc-port39) Waiting for a key / mouse button to rebind: the pad does not move the nav (that could press
+			// another row); Circle cancels the capture only.
+			if (g_kbm_capture.load()) {
+				if (b == SDL_CONTROLLER_BUTTON_B) {
+					std::scoped_lock lock(g_capture_mutex);
+					g_captured    = "\x1b";
+					g_kbm_capture = false;
+					Bump();
+				}
+				return true;
+			}
 			// (ds-pc-port37) The F1 pages: Circle back to the F1 menu, L1 scrolls up (L2, a trigger, below).
 			if (g_f1_page.load() != 0 && !g_popup.load()) {
 				if (b == SDL_CONTROLLER_BUTTON_B) {
@@ -398,12 +409,17 @@ bool OnEvent(const SDL_Event& e) {
 				g_l2_down = v > 0.5f ? true : (v < 0.3f ? false : g_l2_down);
 				return true;
 			}
+			// (ds-pc-port39) The stick's analog value with a dead zone: ImGui scrolls a window by the left stick's raw magnitude
+			// (its manual nav scroll), so a resting stick's drift (a few %, up) fed as is pulled the F1 pages slowly back up
+			// and away from the row being rebound. Below 0.35: exactly 0; above it, 0..1 from the edge of the dead zone.
+			if (g_kbm_capture.load()) return true; // (ds-pc-port39: no nav while a binding waits)
+			const auto dz = [](float x) { return x <= 0.35f ? 0.0f : std::min(1.0f, (x - 0.35f) / 0.65f); };
 			if (e.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY) {
-				Queue({Input::Analog, ImGuiKey_GamepadLStickUp, v < -0.35f, std::max(-v, 0.0f)});
-				Queue({Input::Analog, ImGuiKey_GamepadLStickDown, v > 0.35f, std::max(v, 0.0f)});
+				Queue({Input::Analog, ImGuiKey_GamepadLStickUp, v < -0.35f, dz(-v)});
+				Queue({Input::Analog, ImGuiKey_GamepadLStickDown, v > 0.35f, dz(v)});
 			} else if (e.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX) {
-				Queue({Input::Analog, ImGuiKey_GamepadLStickLeft, v < -0.35f, std::max(-v, 0.0f)});
-				Queue({Input::Analog, ImGuiKey_GamepadLStickRight, v > 0.35f, std::max(v, 0.0f)});
+				Queue({Input::Analog, ImGuiKey_GamepadLStickLeft, v < -0.35f, dz(-v)});
+				Queue({Input::Analog, ImGuiKey_GamepadLStickRight, v > 0.35f, dz(v)});
 			}
 			return true;
 		}
