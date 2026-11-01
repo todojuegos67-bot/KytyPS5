@@ -1,5 +1,33 @@
 ## New in this build
 
+Your precompiled shaders stay valid: the shaders are the same as in v20261031. The precompile has more shaders to
+offer (last item): the launcher asks you to precompile again, and that run compiles only the new ones.
+
+- **Skip the start-up logos** (#263): a new switch on the launcher's Game page. The game then starts without "Sony
+  Interactive Entertainment presents", PlayStation Studios and Bluepoint Games, about 16 seconds that no button skips
+  (the game's own switch; `-Set KYTY_SKIP_LOGOS=1` with `run.cmd`). The opening cinematic still plays, and Options
+  skips it as before.
+- **Nintendo Switch Pro and other Nintendo-layout pads** (#262): the face buttons now go by position, as the PlayStation
+  buttons the game shows: the bottom one is Cross and the right one Circle (before, they went by label: A, on the right,
+  was Cross). Joy-Cons, 8BitDo pads in Switch mode and GameCube pads too; `-Set SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1`
+  goes back to the labels.
+- **Less work on the render thread** (PR #257, credit @ponhei9502): a buffer description the game hands over unchanged
+  keeps its looked-up entry instead of being hashed again, about 0.5 ms less per frame at Boletaria 1-1 on an RTX 5090
+  (`-Set KYTY_TABLE_GATHER_MEMO=0` turns it off).
+- **FSR 3 frame generation: F11 in menus and during loads** (#174): switching to or from full screen while frame
+  generation was paused (the main menu, loading screens) could freeze the picture or lose the graphics device.
+- **DualSense: an enchanted weapon no longer rumbles all through the buff** (#239): steady effects now fade from the
+  motors in about half a second, while hits still rumble fully (`-Set KYTY_DUALSENSE_VIBRATION_MOTOR_SUSTAIN_MS=<ms>`,
+  0 as before).
+- **Direct presentation with DLSS frame generation** (#236): v20261031 ignored that Experimental switch with any frame
+  generation; now only with FSR 3's, the one it held at half the display's rate.
+- **Precompile: more shaders** for DLSS, frame generation and the 1440p output (#260, credit @2000Arsen, from a full
+  playthrough): 859 programs and 894 pipelines more, fewer first-use stutters with those settings.
+- **Thanks** to @ponhei9502 for PR #257, to @2000Arsen for the shader list, and to @HybOj, @forensicssix-debug, @ft1704,
+  @jrodriguezml and @tao755-maker for their reports and tests.
+
+## New in v20261031
+
 Your precompiled shaders stay valid: the shaders are the same as in v20261030.
 
 - **21:9 and 32:9: movies and menus at 16:9 between black bars** (#250): a new option on the launcher's Display page,
@@ -33,50 +61,30 @@ Your precompiled shaders stay valid: the shaders are the same as in v20261030.
 - **Thanks** to @ponhei9502 for PR #254, and to @H0A0M0mer, @Ayonily, @labs20, @STALKERSK, @thxnk420, @markusdev and
   @2mg for their reports and tests.
 
-## New in v20261030
-
-Your precompiled shaders stay valid: for as long as you keep them, the shaders are translated as before. Your next
-precompile (a new install, or after a graphics driver update) brings two shader fixes (last items); the launcher says
-when that precompile compiles all of them again.
-
-- **FSR 3 upscaling: no more grid of blocks and sparkling edges** (#244, a v20261029 regression): v20261029 handed the
-  game's reactive mask to FSR 3, which took whole areas from the current frame alone. Every FSR 3 upscaler user had it
-  (AMD cards, and RTX 20/30 with FSR frame generation).
-- **DLSS: no more Streamline error lines flooding the log** (#129, #85, a v20261029 regression): Streamline refused the
-  reactive mask's tag every frame (`Cannot have undefined format`, 100+ lines a second). The mask is no longer handed to
-  either upscaler, and a Streamline error that repeats is printed 3 times, then every 1000th with its count.
-- **Loads stuck in the fog** (#249): on some PCs a world load never finished (the fog moving, the game reading nothing
-  more) once the emulator's read-ahead had about 65 thousand of the game's files open, apparently all the drive takes.
-  The read-ahead now stops at 48 thousand, and if an open of the game's fails it gives back the files it opened ahead
-  and tries again (the log says so). `-Set KYTY_FILE_FOLLOW=0`, which worked around it, is no longer needed.
-- **F11 with FSR 3 frame generation** (#174): leaving or entering full screen with F11 could lose the graphics device (a
-  crash), seen on an RTX 2060 SUPER at 165 Hz: the old swapchain's parts were freed while FSR's own presents still used
-  them.
-- **DLSS upscaling with AMD FSR 3 frame generation** (#244): an RTX 20 or 30 card has no DLSS frame generation, so with
-  frame generation on it ran FSR 3's, and FSR 3 upscaling replaced DLSS. Now DLSS upscales and AMD's runtime generates
-  the frames. `-Set KYTY_FSR_FG_DLSS=0` goes back to FSR 3 upscaling.
-- **DualSense: no rumble for the whole of a weapon enchantment** (#239): the enchantment's quiet, continuous haptic
-  effect stays on the haptic actuators, as on a PS5; hits rumble as before (`KYTY_DUALSENSE_VIBRATION_MOTOR_ONSET`, and
-  `KYTY_PAD_RUMBLE_ONSET` for other pads).
-- **Xbox and other non-PlayStation pads** (#236): their sticks get a round dead zone of 12% (the character no longer
-  keeps walking slowly by itself after a run; `-Set KYTY_PAD_DEADZONE=<percent>`, 0 off), and their rumble from the
-  game's vibration is half as strong by default (`KYTY_PAD_RUMBLE_GAIN`, now 1).
-- **The frame rate panel shows shader compiles** (#129): "Compiling shaders: N (X s)" while the game compiles pipelines
-  the precompiled set doesn't have, the stutter of a first use.
-- **NVIDIA Low Latency Mode Ultra** (#129): it makes the emulator's presents wait (uneven frame times, RTSS and the panel
-  disagree, frames lost). The emulator notices it (NVIDIA card, VSync off) and says so in the log and on the game for
-  20 s: set Low Latency Mode to Off or On for `kyty_emulator.exe`.
-- **Launcher: the precompile says when it redoes everything** (#246): "precompile again (this time all of them, once)"
-  for a store made before a translation that changes nearly every shader, instead of "only what is new".
-- **Launcher: DLSS 4.5's presets M and L** in the DLSS model choice (#248); `-Set KYTY_DLSS_PRESET=M` or `L` also works.
-- **With your next precompile**: the loading screen's fog no longer flashes brown patches for a frame (PR #245, credit
-  @DevList1454: four multiply-add instructions rounded as the hardware does; `KYTY_UNFUSED_MAD=0/1`), and pixel shaders'
-  derivatives are right at triangle edges (95 shaders: the debug menu font's lines; PR #243, credit @DevList1454;
-  `KYTY_PIXEL_QUAD_READS=0/1`).
-- **Thanks** to @Fantomas3228, @2mg, @brokeneggg, @jrodriguezml, @zioaster, @markusdev, @dimitrios1977ZXZ, @ft1704,
-  @Ayonily and @DevList1454 for their reports, tests and pull requests.
-
 ## 本版本的变化
+
+已有的预编译着色器继续有效：着色器与 v20261031 相同。预编译可以多编译一些着色器（见最后一项）：启动器会提示再预编译一次，
+这次只编译新增的部分。
+
+- **跳过启动标志**（#263）：启动器「游戏」页新增开关。开启后游戏启动时不再播放「Sony Interactive Entertainment presents」、
+  PlayStation Studios 和 Bluepoint Games 的标志，约 16 秒、任何按键都无法跳过的画面（游戏自带的开关；用 `run.cmd` 时为
+  `-Set KYTY_SKIP_LOGOS=1`）。开场动画仍会播放，和以前一样可以按 Options 跳过。
+- **Nintendo Switch Pro 等任天堂布局手柄**（#262）：正面按键改为按位置对应，与游戏显示的 PlayStation 按键一致：下方为 ×，右方为
+  ○（以前按标签对应：右边的 A 是 ×）。Joy-Con、Switch 模式的 8BitDo 手柄和 GameCube 手柄同样如此；
+  `-Set SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1` 恢复按标签对应。
+- **渲染线程的工作更少**（PR #257，感谢 @ponhei9502）：游戏交来的缓冲区描述没有变化时，沿用已查到的条目，不再重新计算哈希；
+  RTX 5090 在波雷塔利亚 1-1 每帧约少 0.5 ms（`-Set KYTY_TABLE_GATHER_MEMO=0` 关闭）。
+- **FSR 3 插帧：在菜单和加载时按 F11**（#174）：插帧暂停时（主菜单、加载画面）切换全屏，可能导致画面冻结或显卡设备丢失。
+- **DualSense：附魔武器期间不再一直震动**（#239）：持续性的效果现在约半秒内从震动马达上渐弱，受击等仍会完整震动
+  （`-Set KYTY_DUALSENSE_VIBRATION_MOTOR_SUSTAIN_MS=<毫秒>`，0 恢复原样）。
+- **DLSS 插帧 + 直接呈现**（#236）：v20261031 在任何插帧下都会忽略这个「实验性」开关；现在只在 FSR 3 插帧下忽略（只有它会让
+  帧率只剩显示器刷新率的一半）。
+- **预编译：更多着色器**，覆盖 DLSS、插帧和 1440p 输出（#260，感谢 @2000Arsen 提供的完整通关记录）：多 859 个程序、894 条
+  管线，这些设置下首次出现的卡顿更少。
+- **感谢** @ponhei9502 的 PR #257、@2000Arsen 提供的着色器列表，以及 @HybOj、@forensicssix-debug、@ft1704、@jrodriguezml 和
+  @tao755-maker 的反馈与测试。
+
+## v20261031 的变化
 
 已有的预编译着色器继续有效：着色器与 v20261030 相同。
 
@@ -102,38 +110,3 @@ when that precompile compiles all of them again.
 - **Linux：DualSense 通过 USB 的触觉反馈**（可选，PR #254，感谢 @ponhei9502）：`KYTY_DUALSENSE_HAPTICS=1` 让游戏的触觉效果在
   手柄的触觉马达上播放（默认关闭）。
 - **感谢** @ponhei9502 的 PR #254，以及 @H0A0M0mer、@Ayonily、@labs20、@STALKERSK、@thxnk420、@markusdev 和 @2mg 的反馈与测试。
-
-## v20261030 的变化
-
-已有的预编译着色器继续有效：只要保留它们，着色器就按原来的方式翻译。下一次预编译（新安装，或更新显卡驱动之后）会带来两项
-着色器修正（见最后几项）；如果那次预编译要把全部着色器重新编译一遍，启动器会说明。
-
-- **FSR 3 超分：不再出现方格和闪烁的边缘**（#244，v20261029 引入的问题）：v20261029 把游戏的反应遮罩（reactive mask）交给了
-  FSR 3，它因此把大片区域只取自当前帧。所有用 FSR 3 超分的玩家都受影响（AMD 显卡，以及开启 FSR 插帧的 RTX 20/30）。
-- **DLSS：日志不再被 Streamline 错误刷屏**（#129、#85，v20261029 引入的问题）：Streamline 每帧都拒绝反应遮罩的标记
-  （`Cannot have undefined format`，每秒上百行）。现在两种超分都不再拿到这个遮罩；同一条 Streamline 错误重复出现时只打印
-  3 次，之后每 1000 次打印一次并附上次数。
-- **加载时卡在雾气画面**（#249）：在一些电脑上，模拟器的预读打开了游戏的约 6.5 万个文件之后（似乎是那块硬盘能同时打开的
-  上限），切换世界的加载就再也完成不了（雾气在动，游戏却不再读取任何文件）。现在预读最多只打开 4.8 万个；游戏自己打开
-  文件失败时，会先归还预读打开的文件再试一次（日志会写出）。之前用来绕过的 `-Set KYTY_FILE_FOLLOW=0` 不再需要。
-- **开启 FSR 3 插帧时按 F11**（#174）：用 F11 进入或退出全屏可能导致显卡设备丢失（崩溃），在 RTX 2060 SUPER + 165 Hz
-  屏幕上出现：旧交换链的部件在 FSR 自己的呈现还在使用时就被释放了。
-- **DLSS 超分 + AMD FSR 3 插帧**（#244）：RTX 20、30 系显卡没有 DLSS 插帧，开启插帧时用的是 FSR 3 的，之前 FSR 3 超分也会
-  随之顶替 DLSS。现在由 DLSS 负责超分、AMD 的运行库负责插帧。`-Set KYTY_FSR_FG_DLSS=0` 恢复为 FSR 3 超分。
-- **DualSense：附魔武器期间不再一直震动**（#239）：附魔时那种安静、持续的触觉效果只在触觉反馈上播放，和 PS5 上一样；受击等
-  仍像以前一样震动（`KYTY_DUALSENSE_VIBRATION_MOTOR_ONSET`，其他手柄为 `KYTY_PAD_RUMBLE_ONSET`）。
-- **Xbox 等非 PlayStation 手柄**（#236）：摇杆增加 12% 的圆形死区（跑步之后角色不再自己慢慢走动；
-  `-Set KYTY_PAD_DEADZONE=<百分比>`，0 关闭），随游戏震动产生的手柄震动默认减半（`KYTY_PAD_RUMBLE_GAIN`，现在为 1）。
-- **帧率面板显示着色器编译**（#129）：游戏现场编译预编译集合里没有的管线时（首次出现的卡顿），面板下方会显示
-  “Compiling shaders: N (X s)”。
-- **NVIDIA 低延迟模式“超高”**（#129）：它会让模拟器的呈现等待（帧时间不均匀、RTSS 和面板的数值不一致、掉帧）。模拟器会
-  检测到这种情况（NVIDIA 显卡、关闭垂直同步时），在日志里和游戏画面上提示 20 秒：请在 NVIDIA 控制面板里为
-  `kyty_emulator.exe` 把低延迟模式设为“关”或“开”。
-- **启动器：预编译会说明何时要全部重新编译**（#246）：对于在新的着色器翻译方式（几乎会改变所有着色器）之前做的预编译，
-  启动器会显示“着色器需要重新预编译（这次会全部重新编译一遍）”，而不是“只编译新增部分”。
-- **启动器：DLSS 4.5 的预设 M 和 L** 加入“DLSS 模型”选项（#248）；`-Set KYTY_DLSS_PRESET=M` 或 `L` 也可以。
-- **下一次预编译之后**：加载画面的雾气不再闪出一帧的棕色斑块（PR #245，感谢 @DevList1454：四条乘加指令按硬件的方式舍入；
-  `KYTY_UNFUSED_MAD=0/1`），像素着色器在三角形边缘的导数也正确了（95 个着色器：调试菜单文字的线条；PR #243，感谢
-  @DevList1454；`KYTY_PIXEL_QUAD_READS=0/1`）。
-- **感谢** @Fantomas3228、@2mg、@brokeneggg、@jrodriguezml、@zioaster、@markusdev、@dimitrios1977ZXZ、@ft1704、@Ayonily 和
-  @DevList1454 的反馈、测试与贡献。
