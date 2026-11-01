@@ -934,7 +934,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			static const char* intensity[] = {"1", "0.75", "1.1", "1.5"};
 			sets.emplace_back("KYTY_DLSS_NR", "1");
 			sets.emplace_back("KYTY_DLSS_NR_INTENSITY", intensity[level]);
-			sets.emplace_back("KYTY_DLSS_NR_STRENGTH", s.dlss5_strength == "baja" ? "0.5" : s.dlss5_strength == "media" ? "1" : "1.5");
+			// (ds-pc-port43) The share of the model's edit applied stays at most 1 (the model's own picture): above 1 the edit
+			// was extrapolated past what the model made (1.5 at "alta"), the user's "colores raros" with DLSS 5. The model's
+			// own Intensity (the levels above) is what makes it stronger; baja / media / alta 0.5 / 0.75 / 1.
+			sets.emplace_back("KYTY_DLSS_NR_STRENGTH", s.dlss5_strength == "baja" ? "0.5" : s.dlss5_strength == "media" ? "0.75" : "1");
 		} else {
 			sets.emplace_back("KYTY_FOVEATED", "0");
 			sets.emplace_back("KYTY_DLSS_NR", "0");
