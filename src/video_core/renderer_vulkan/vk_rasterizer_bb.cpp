@@ -1362,7 +1362,7 @@ void DepthBarrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout,
 bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                                    vk::ImageView& hudless_view) {
     out = {};
-    hudless_view = {};
+    hudless_view = vk::ImageView{};
     const bool hudless_ready = g_bb.fg_present_ready;
     g_bb.fg_present_ready = false;
     if (!g_bb.fg_upscaled || !bb_gb_depth_valid || !g_bb.init || !g_bb.mv.image) {
