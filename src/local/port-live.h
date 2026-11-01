@@ -39,6 +39,9 @@ struct Hooks {
 	unsigned long long (*revision)();           // changes whenever the menu's picture does
 	void (*draw)(float width, float height);    // present thread, between ImGui::NewFrame and Render (input fed first)
 	const char* (*title)();                     // the window title (null: the emulator's)
+	// (ds-pc-port43) The port's menu itself is shown (not just its Metricas panel): only then may the presenter re-present
+	// the last frame on its own to refresh the overlay. Null: wants_overlay is used.
+	bool (*menu_active)() = nullptr;
 };
 inline const Hooks* g_hooks = nullptr;
 

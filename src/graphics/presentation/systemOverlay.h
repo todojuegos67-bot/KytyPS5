@@ -19,6 +19,10 @@ struct GraphicContext;
 struct SystemOverlayVisualState {
 	bool     active;
 	uint64_t revision;
+	// (ds-pc-port43) Whether an idle vblank may re-present the last frame for it: the port's Metricas panel alone does not
+	// (redrawn with the game's own frames; idle re-presents made AMD frame generation switch off and on every frame).
+	bool     refresh = false;
+	uint64_t refresh_revision = 0;
 };
 
 // KYTY_FPS_HUD's frame-time graph (empty frame_ms: none) and the detailed panel's rows (empty: none).

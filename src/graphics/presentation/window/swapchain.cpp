@@ -456,6 +456,7 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	std::atomic<uint64_t> presented_refresh_revision {0}; // (ds-pc-port43)
 	// KYTY_FPS_HUD: the frame rate panel, its numbers refreshed once a second (the emulator's own frame rate: the
 	// game's flips; with frame generation the frames presented, generated ones too, and the game's rate below), its
 	// frame-time graph with every present; 2: the GPU, processor and memory rows too (PerfOverlay's sampling thread).
@@ -1810,9 +1811,9 @@ bool Presenter::IsHdrSupported() const noexcept {
 }
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
+	// (ds-pc-port43) Only what needs an idle re-present (a dialog, the port's menu), never the Metricas panel alone.
 	const auto visual = GetSystemOverlayVisualState();
-	return visual.active ||
-	       visual.revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire);
+	return visual.refresh || visual.refresh_revision != m_impl->presented_refresh_revision.load(std::memory_order_acquire);
 }
 
 bool Presenter::SystemOverlayChanged() const noexcept {
@@ -1982,6 +1983,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			continue;
 		}
 
+		m_impl->presented_refresh_revision.store(overlay_visual.refresh_revision, std::memory_order_release);
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
 		if (PortLive::g_hooks != nullptr && PortLive::g_hooks->presented != nullptr) PortLive::g_hooks->presented();

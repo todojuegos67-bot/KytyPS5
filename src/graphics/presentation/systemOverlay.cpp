@@ -482,8 +482,10 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto* port        = PortLive::g_hooks;
 	const bool  port_active = port != nullptr && port->wants_overlay != nullptr && port->wants_overlay();
 	const auto  port_rev    = port != nullptr && port->revision != nullptr ? port->revision() : 0ull;
-	return {core.active || dialog.active || error.active || save.active || port_active,
-	        core.revision + dialog.revision + error.revision + save.revision + port_rev};
+	const bool port_menu = port != nullptr && (port->menu_active != nullptr ? port->menu_active() : port_active);
+	const bool others    = core.active || dialog.active || error.active || save.active;
+	const auto others_rev = core.revision + dialog.revision + error.revision + save.revision;
+	return {others || port_active, others_rev + port_rev, others || port_menu, others_rev + (port_menu ? port_rev : 0)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {

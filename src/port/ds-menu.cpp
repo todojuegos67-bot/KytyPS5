@@ -4582,8 +4582,7 @@ void Start() {
 #if defined(_WIN32)
 				       nv, cpu,
 #endif
-				       idle0, total0);
-				Bump();
+				       idle0, total0); // (ds-pc-port43: no Bump: redrawn with the game's own frames)
 			}
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 		}
@@ -5121,7 +5120,11 @@ const char* Title() {
 	return "Demon's Souls";
 }
 
-const PortLive::Hooks kHooks {WindowCreated, OnEvent, Presented, WantsOverlay, Revision, DrawInGame, Title};
+// (ds-pc-port43) The menu (not the Metricas panel alone): what may re-present the last frame on an idle vblank.
+bool MenuActive() {
+	return g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive() || Anim::Closing();
+}
+const PortLive::Hooks kHooks {WindowCreated, OnEvent, Presented, WantsOverlay, Revision, DrawInGame, Title, MenuActive};
 
 } // namespace
 
