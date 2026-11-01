@@ -1093,7 +1093,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Set("KYTY_SCENE_WARMUP", "");
 	env.Set("KYTY_STATIC_WARMUP", "");
 	env.Set("KYTY_SHADER_PREFETCH_THREADS", "");
-	env.Set("KYTY_SHADER_WARMUP_THREADS", "16");
+	env.Set("KYTY_SHADER_WARMUP_THREADS", std::to_string(std::clamp(std::thread::hardware_concurrency(), 1u, 64u))); // (ds-pc-port47: every CPU)
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");

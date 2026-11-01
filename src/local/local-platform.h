@@ -70,6 +70,13 @@ void MakeBackgroundThread(const char* avoid_cpus);
 // The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
 // unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
 void MakeCriticalThread();
+// (ds-pc-port47) Every logical CPU of the PC (all processor groups).
+uint32_t AllCpus();
+// KYTY_GAME_CPUS ("2,3,..."; unset: nothing): the process gets every CPU, its threads the game's CPUs by default (the
+// process's default CPU sets), so that shader workers (MakeShaderWorkerThread) can use all of them. Start-up.
+void ApplyGameCpus();
+// A shader worker (precompile, warmup, prefetch, pipeline compiles): below normal priority, on every CPU of the PC.
+void MakeShaderWorkerThread();
 // (ds-pc-port44) Another thread of the process (ThreadId) at normal priority (`normal`) or below it again: a background
 // worker the render thread waits for (Windows; elsewhere nothing).
 void SetThreadNormalPriority(uint32_t thread_id, bool normal);

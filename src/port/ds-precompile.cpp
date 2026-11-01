@@ -199,7 +199,7 @@ Child Launch(const std::string& name, const std::wstring& args, bool claims) {
 	}();
 	if (job != nullptr) AssignProcessToJobObject(job, pi.hProcess);
 	// (ds-pc-port13: every thread: any CPU)
-	if (g_setup.affinity != 0 && !g_all_threads) SetProcessAffinityMask(pi.hProcess, static_cast<DWORD_PTR>(g_setup.affinity));
+	if (false && g_setup.affinity != 0) SetProcessAffinityMask(pi.hProcess, static_cast<DWORD_PTR>(g_setup.affinity));
 	// (Windows 11: no power throttling for a windowless process, as precompile-windows.ps1's Qos.High.)
 	PROCESS_POWER_THROTTLING_STATE state {PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0};
 	SetProcessInformation(pi.hProcess, ProcessPowerThrottling, &state, sizeof(state));
@@ -375,7 +375,7 @@ void Work() {
 	const fs::path& root  = g_setup.root;
 	const fs::path& seeds = g_setup.seeds;
 	const std::string& id = g_setup.id;
-	const bool all_cpu    = g_all_threads;
+	const bool all_cpu    = true; // (ds-pc-port47) every CPU thread of the PC, always (was the "relajado" choice too)
 	const int  logical    = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
 	// All CPU threads: one process of 3 threads per 3 CPUs (precompile-windows.ps1). Relaxed: the port's own bounds (10-27c,
 	// a 32-thread PC rebooted with 11 processes): one process of 2 threads per 8 CPUs, at most 4; the plan on 4 threads.

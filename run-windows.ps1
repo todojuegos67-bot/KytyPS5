@@ -535,6 +535,8 @@ if ($Precompile) {
 	# unoptimized build at once, the optimized one in the background) and cached from then on.
 	if (!$environment.Contains('KYTY_SHADER_WARMUP_SECONDS')) { $environment['KYTY_SHADER_WARMUP_SECONDS'] = '60' }
 }
+# (ds-pc-port47) The shader warmup on every logical CPU of the PC (the configs' 16 replaced).
+if (!$Precompile) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$([Environment]::ProcessorCount)" }
 if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 # Stutters in the log: frames, shader translations and pipeline creations of 100 ms or more (SLOW lines;
 # what runs per frame or on a cache miss only, so nothing measurable).
@@ -731,7 +733,7 @@ function Invoke-Tool([string[]]$arguments, [string]$output = '') {
 	if ($output) { $parameters['RedirectStandardOutput'] = $output }
 	$process = Start-Process @parameters
 	$null = $process.Handle # keeps the exit code readable
-	if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }
+	# (ds-pc-port47) The precompile program on every CPU of the PC (no V-Cache affinity).
 	$process.WaitForExit()
 	return $process.ExitCode
 }
@@ -840,6 +842,11 @@ if ($shaders -and !$inputsReady) {
 	}
 }
 
+# (ds-pc-port47) The game's threads on the affinity's CPUs by the process's default CPU sets (KYTY_GAME_CPUS, applied
+# by the emulator at start-up), the process itself on every CPU: the shader warmup, prefetch and compiles use them all.
+if ($mask -ne $all -and !$environment.Contains('KYTY_GAME_CPUS')) {
+	$environment['KYTY_GAME_CPUS'] = ((0..63 | Where-Object { ($mask -shr $_) -band 1 }) -join ',')
+}
 foreach ($entry in $environment.GetEnumerator()) { Set-Item "env:$($entry.Key)" $entry.Value }
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $out = "$logDir\$stamp.out.log"
@@ -847,7 +854,7 @@ $out = "$logDir\$stamp.out.log"
 $env:KYTY_RUN_LOG = $out
 $process = Start-Process -FilePath $Exe -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -PassThru `
 	-RedirectStandardOutput $out -RedirectStandardError "$logDir\$stamp.err.log"
-if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }
+# (ds-pc-port47) No process affinity: KYTY_GAME_CPUS above keeps the game's threads on those CPUs.
 $null = $process.Handle # keeps the exit code readable after the process ends
 Write-Host "pid $($process.Id); logs: $($logDir.Substring($PSScriptRoot.Length + 1))\$stamp.*.log"
 if (!$Precompile -and $Follow) {

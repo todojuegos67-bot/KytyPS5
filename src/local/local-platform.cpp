@@ -877,6 +877,57 @@ void MakeCriticalThread() {
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 }
 
+// (ds-pc-port47) The CPU set ids of the CPUs in `mask` (group 0; 0: every CPU of the PC).
+static std::vector<ULONG> CpuSetIds(uint64_t mask) {
+	std::vector<ULONG> ids;
+	ULONG              length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	if (length == 0) return ids;
+	std::vector<uint8_t> buffer(length);
+	if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), length, &length,
+	                                GetCurrentProcess(), 0))
+		return ids;
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+		if (info->Size == 0) break;
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 &&
+		    (mask == 0 || (info->CpuSet.LogicalProcessorIndex < 64 && ((mask >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0)))
+			ids.push_back(info->CpuSet.Id);
+		offset += info->Size;
+	}
+	return ids;
+}
+
+uint32_t AllCpus() {
+	const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+	return n != 0 ? static_cast<uint32_t>(n) : std::max(1u, std::thread::hardware_concurrency());
+}
+
+void ApplyGameCpus() {
+	const char* list = std::getenv("KYTY_GAME_CPUS");
+	if (list == nullptr || *list == '\0') return;
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) return;
+	const uint64_t game = CpuListMask(list) & system;
+	if (game == 0) return;
+	const auto ids = CpuSetIds(game);
+	if (ids.empty()) return;
+	// Every CPU for the process (so the shader workers may use them all), the game's CPUs as the default of its threads.
+	(void)SetProcessAffinityMask(GetCurrentProcess(), system);
+	const bool ok = SetProcessDefaultCpuSets(GetCurrentProcess(), ids.data(), static_cast<ULONG>(ids.size())) != 0;
+	std::printf("CPU sets: game threads on KYTY_GAME_CPUS=%s (%zu CPUs)%s; shader work on all %u CPUs\n", list, ids.size(),
+	            ok ? "" : " (failed: every CPU)", AllCpus());
+	std::fflush(stdout);
+}
+
+void MakeShaderWorkerThread() {
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	static const std::vector<ULONG> all = CpuSetIds(0);
+	if (!all.empty()) (void)SetThreadSelectedCpuSets(GetCurrentThread(), all.data(), static_cast<ULONG>(all.size()));
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0) (void)SetThreadAffinityMask(GetCurrentThread(), process);
+}
+
 void SetThreadNormalPriority(uint32_t thread_id, bool normal) {
 	if (thread_id == 0) return;
 	HANDLE thread = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION, FALSE, thread_id);
@@ -2336,6 +2387,14 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 }
 
 void MakeCriticalThread() {}
+
+uint32_t AllCpus() {
+	return std::max(1u, std::thread::hardware_concurrency());
+}
+void ApplyGameCpus() {}
+void MakeShaderWorkerThread() {
+	MakeBackgroundThread(nullptr);
+}
 
 void SetThreadNormalPriority(uint32_t /*thread_id*/, bool /*normal*/) {}
 

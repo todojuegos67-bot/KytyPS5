@@ -291,7 +291,7 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
 	$process.PriorityClass = if ($Gentle) { [System.Diagnostics.ProcessPriorityClass]::Idle } else { [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
-	$process.ProcessorAffinity = [IntPtr]$mask
+	# (ds-pc-port47) Every CPU of the PC: no affinity (was the launch's -Affinity mask).
 	$null = [KytyPrecompile.Qos]::High($process.Handle) # also keeps the exit code readable after the process ends
 	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru
 }

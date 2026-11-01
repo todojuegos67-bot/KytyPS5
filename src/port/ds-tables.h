@@ -44,7 +44,7 @@ inline constexpr Pair kBaseEnv[] = {
 	{"KYTY_TEXTURE_RESOLVE_PAGES", "1"},
 	{"KYTY_ASYNC_REPROTECT", "1"},
 	{"KYTY_READBACK_NARROW", "1"},
-	{"KYTY_SHADER_WARMUP_THREADS", "16"},
+	{"KYTY_SHADER_WARMUP_THREADS", "0"}, // (ds-pc-port47: replaced by the CPU count, BuildLaunch)
 	{"KYTY_READBACK_QUEUE", "1"},
 	{"KYTY_TABLE_XPR", "2"},
 	{"KYTY_TABLE_DISPATCH", "1"},

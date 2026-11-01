@@ -1065,7 +1065,7 @@ struct PipelineCache::ProgramCache {
 		                                warm = std::move(warm), recorded = std::move(recorded),
 		                                released = std::move(released), host_subgroup_size]() mutable {
 			LocalPlatform::SetThreadName("Kyty.Prefetch");
-			LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+			LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
 			auto&      p     = *prefetch;
 			const auto begin = std::chrono::steady_clock::now();
 			// (ds-pc-port44) A prefetch that ends here without workers (no inputs, no temporary file), or with nothing to
@@ -1190,7 +1190,7 @@ struct PipelineCache::ProgramCache {
 			// Standing at 1-1 on an 8-core laptop, the render thread took 24.2-25.2 ms a frame beside 4 prefetch threads,
 			// 21.6 ms beside 2 and 19.4 ms once the prefetch was done (all of it: 3.5 minutes on 4 threads, 5.5 on 2).
 			// KYTY_SHADER_PREFETCH_THREADS: that many all along.
-			p.gentle_threads = std::max(1u, threads / 2);
+			p.gentle_threads = threads; // (ds-pc-port47: all of them all along, was half after the recorded ones)
 			if (const char* value = std::getenv("KYTY_SHADER_PREFETCH_THREADS"); value != nullptr && *value != '\0')
 				p.gentle_threads = threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
 			// (The release's play orders the work alone: it names most of the game's programs, translated on the gentle
@@ -1218,9 +1218,9 @@ struct PipelineCache::ProgramCache {
 	// half of a core) slow them however low their priority. An 8-core laptop (16 CPUs) with 8 prefetch threads took
 	// 120+ s instead of 20 s to load 1-1 (start-up to the game 264-300 s; with 4: 107 s), and with a 16-thread warmup
 	// showed the intro after 74-100 s instead of 24 s (2 threads); half the CPUs at most (a 32-CPU desktop keeps 16).
+	// (ds-pc-port47) Every logical CPU of the PC (was CPUs - 12, at most half: 16 of 32).
 	static uint32_t SpareThreads() {
-		const uint32_t cpus = std::max(1u, std::thread::hardware_concurrency());
-		return std::clamp(cpus > 12u ? cpus - 12u : 2u, 2u, std::max(2u, cpus / 2u));
+		return std::clamp(LocalPlatform::AllCpus(), 1u, 64u);
 	}
 
 	// A recorded record's place in the prefetch's order: the oldest and the newest alternately (0, n-1, 1, n-2, ...).
@@ -1230,7 +1230,7 @@ struct PipelineCache::ProgramCache {
 
 	void PrefetchWork(uint32_t worker) {
 		LocalPlatform::SetThreadName("Kyty.Prefetch");
-		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+		LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
 		auto& p = *prefetch;
 		while (!p.stop.load(std::memory_order_relaxed)) {
 			// The recorded programs after those the game met first.
@@ -1312,7 +1312,7 @@ struct PipelineCache::ProgramCache {
 	// the workers (each busy with a program of its own, up to ~100 ms) and the render thread meeting them.
 	void FollowWork() {
 		LocalPlatform::SetThreadName("Kyty.Follow");
-		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+		LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
 		auto& p = *prefetch;
 		while (!p.stop.load(std::memory_order_relaxed) && p.finished.load(std::memory_order_relaxed) < p.groups.size()) {
 			uint64_t seen = 0;
@@ -2223,7 +2223,7 @@ struct PipelineCache::ProgramCache {
 		void Run() {
 			if (background) {
 				LocalPlatform::SetThreadName("Kyty.Warmup");
-				LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+				LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
 			}
 			for (;;) {
 				const size_t n = taken.fetch_add(1, std::memory_order_relaxed);
@@ -2323,6 +2323,7 @@ struct PipelineCache::ProgramCache {
 		if (background) warm_phase.store(1, std::memory_order_release);
 		size_t compiled = 0, left = 0;
 		const uint32_t threads = WarmupThreads(background);
+		PipelineCacheLog("Shader warmup: {} threads of {} CPUs", threads, LocalPlatform::AllCpus()); // (ds-pc-port47)
 		std::optional<WarmWorkers> workers;
 		if (threads > 1 || background) workers.emplace(device, warm_records, threads, background);
 		for (size_t n = 0; n < count; ++n) {
@@ -2474,7 +2475,7 @@ public:
 	explicit CompileWorkers(uint32_t count, bool background = false): m_background(background) {
 		for (uint32_t i = 0; i < count; i++)
 			m_threads.emplace_back([this] {
-				if (m_background) LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+				if (m_background) LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
 				Run();
 			});
 	}
@@ -3630,7 +3631,7 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const
 			pool.emplace_back([&] {
 				if (background) {
 					LocalPlatform::SetThreadName("Kyty.Warmup");
-					LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+					LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
 				}
 				work();
 				{
@@ -4037,7 +4038,7 @@ void PipelineCache::InitializeDriverCache() {
 	if (m_table_cache == nullptr) return;
 	m_table_cache_saver = std::jthread([this, store_sized = store](std::stop_token stop) {
 		LocalPlatform::SetThreadName("Kyty.TableCache");
-		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+		LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
 		constexpr int64_t           SmallSaveSeconds = 60;
 		std::mutex                  mutex;
 		std::condition_variable_any wake;

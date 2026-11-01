@@ -1172,7 +1172,9 @@ int main(int argc, char* argv[]) {
 		std::fflush(stdout);
 		phase_at = now;
 	};
-	if (IsGame(settings.game)) PrepareShaders(root, settings.game, param, mask != system_mask ? mask : 0, cpus);
+	// (ds-pc-port47) Shader preparation on every CPU of the PC, without the game's V-Cache affinity.
+	const int all_cpus = std::max(1, static_cast<int>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
+	if (IsGame(settings.game)) PrepareShaders(root, settings.game, param, 0, all_cpus);
 	phase_done("preparar shaders (1/3-3/3)");
 	{
 		Port::Precompile::Setup ps;
@@ -1180,7 +1182,7 @@ int main(int argc, char* argv[]) {
 		ps.game     = settings.game;
 		ps.id       = param.title_id.empty() ? std::string() : param.title_id + "_" + param.version;
 		ps.seeds    = root / Wide(ps.id.empty() ? std::string("seeds.seeds") : "seeds-" + ps.id + ".seeds");
-		ps.affinity = mask != system_mask ? mask : 0;
+		ps.affinity = 0; // (ds-pc-port47: the precompile on every CPU)
 		ps.cpus     = cpus;
 		ps.cache_key     = Port::DriverCacheKey(settings);
 		ps.shadow_filter = Port::ShadowFilterLevel(settings);
@@ -1315,7 +1317,7 @@ int main(int argc, char* argv[]) {
 			param   = ReadParam(settings.game);
 			version = param.title_id + " " + param.version;
 			std::printf("[port] game folder: %s (%s)\n", settings.game.c_str(), version.c_str());
-			PrepareShaders(root, settings.game, param, mask != system_mask ? mask : 0, cpus);
+			PrepareShaders(root, settings.game, param, 0, all_cpus);
 		}
 	}
 
@@ -1358,7 +1360,14 @@ int main(int argc, char* argv[]) {
 	if ((settings.metrics == "1" || settings.metrics == "2") && std::getenv("KYTY_PORT_METRICS_WINDOW") != nullptr &&
 	    std::string(std::getenv("KYTY_PORT_METRICS_WINDOW")) == "1")
 		StartMetricsWindow(root, settings, pc);
-	if (mask != system_mask) SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask));
+	// (ds-pc-port47) The game's threads on its CPUs (the V-Cache CCD) by the process's default CPU sets, the process itself
+	// on every CPU: the shader workers use them all (LocalPlatform::ApplyGameCpus, MakeShaderWorkerThread).
+	if (mask != system_mask) {
+		std::string list;
+		for (int bit = 0; bit < 64; bit++)
+			if ((mask >> bit) & 1u) list += (list.empty() ? "" : ",") + std::to_string(bit);
+		SetEnv("KYTY_GAME_CPUS", list);
+	}
 	SplashStatus("Iniciando...");
 
 	{
