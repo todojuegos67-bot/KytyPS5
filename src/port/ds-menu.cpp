@@ -101,6 +101,7 @@ std::atomic<int>         g_f1_page {0};
 std::atomic<int>         g_page_scroll {0}; // (ds-pc-port37) L1 (up) / L2 (down) presses for the F1 page's list
 bool                     g_l2_down = false;
 std::atomic<bool>        g_kbm_capture {false};
+std::atomic<bool>        g_pages_reset {false}; // (ds-pc-port42) SetOpen: the pages' own state (capture row) cleared at their next frame
 std::mutex               g_capture_mutex;
 std::string              g_captured; // "" while waiting; "\x1b" cancelled
 std::atomic<bool>        g_focus_trophy_btn_request {false}; // (port34) window thread: back from it, focus its button
@@ -209,6 +210,16 @@ void Queue(const Input& input) {
 
 void SetOpen(bool open) {
 	if (g_open.exchange(open) == open) return;
+	// (ds-pc-port42) Open or closed, every page state starts clean: no F1 page, no trophy page, no key capture waiting, no
+	// stale combo (g_popup was set only by the launcher's frames: a value left from there made Circle / B do nothing),
+	// no queued scroll. A page or a capture left behind kept eating Esc / Circle and the menu looked stuck.
+	g_f1_page     = 0;
+	g_kbm_capture = false;
+	g_popup       = false;
+	g_page_scroll = 0;
+	g_pages_reset = true;
+	std::printf("[port] F1 menu: %s\n", open ? "open" : "closed");
+	std::fflush(stdout);
 	(open ? Anim::g_opened_at : Anim::g_closed_at).store(Anim::Now(), std::memory_order_relaxed); // (ds-pc-port38)
 	PortLive::menu_open.store(open, std::memory_order_relaxed);
 	if (!open) g_trophy_page = false; // (port34) the game again: the next F1 opens the menu, not the page
@@ -4829,6 +4840,12 @@ bool DrawPad(float width, float height, float unit) {
 }
 
 bool DrawKbm(float width, float height, float unit) {
+	if (g_pages_reset.exchange(false)) {
+		g_capture_row = -1;
+		g_loaded      = false;
+		std::scoped_lock lock(g_capture_mutex);
+		g_captured.clear();
+	}
 	if (!g_loaded) {
 		g_rows.clear();
 		const std::string map = g_edit.kbm_map.empty() ? std::string(kKbmDefault) : g_edit.kbm_map;
@@ -5030,6 +5047,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 }
 
 void DrawInGame(float width, float height) {
+	if (g_open.load()) g_popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId); // (ds-pc-port42: the game's own frames, last frame's state)
 	MetricsPanel::Draw(width, height); // (ds-pc-port41) under the menu too
 	if (g_open.load() && !Resume::SaveAndQuitActive()) {
 		DrawInGameMenu(width, height);
