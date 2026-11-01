@@ -327,18 +327,19 @@ void Work() {
 	const std::string& id = g_setup.id;
 	const bool all_cpu    = g_all_threads;
 	const int  logical    = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-	const int  threads    = 3; // (precompile-windows.ps1 -Threads)
-	const int  cpus       = all_cpu ? logical : std::max(1, g_setup.cpus);
-	// All of them (the launcher's: one process per 3 CPUs); relaxed: half of that.
-	int jobs = std::max(1, (cpus + threads - 1) / threads);
-	if (!all_cpu) jobs = std::max(1, jobs / 2);
+	// All CPU threads: one process of 3 threads per 3 CPUs (precompile-windows.ps1). Relaxed: the port's own bounds (10-27c,
+	// a 32-thread PC rebooted with 11 processes): one process of 2 threads per 8 CPUs, at most 4; the plan on 4 threads.
+	const int  threads    = all_cpu ? 3 : 2;
+	const int  cpus       = all_cpu ? logical : std::max(1, std::min(g_setup.cpus, 4));
+	int        jobs       = all_cpu ? std::max(1, (logical + threads - 1) / threads) : std::clamp(std::max(1, g_setup.cpus) / 8, 1, 4);
 	std::printf("[port] precompile (as the launcher's): %s, %d processes of %d threads\n", all_cpu ? "all CPU threads" : "relaxed", jobs, threads);
 	std::fflush(stdout);
-	const auto memory_ok = [] {
+	const auto memory_ok = [all_cpu] {
 		MEMORYSTATUSEX m {};
 		m.dwLength = sizeof(m);
 		if (!GlobalMemoryStatusEx(&m)) return true;
-		constexpr DWORDLONG Need = DWORDLONG {3} << 30u;
+		// (A process takes several GB while it compiles: 3 GB let them run the PC out of memory and fail.)
+		const DWORDLONG Need = (all_cpu ? DWORDLONG {6} : DWORDLONG {8}) << 30u;
 		return m.ullAvailPhys >= Need && m.ullAvailPageFile >= Need;
 	};
 	wchar_t temp[MAX_PATH + 1] = {};
@@ -458,6 +459,7 @@ void Work() {
 		std::string name;
 	};
 	std::vector<Running> running;
+	std::map<std::string, int> retries;
 	const auto kill_all = [&] {
 		for (auto& r: running) {
 			TerminateProcess(r.c.process, 1);
@@ -493,7 +495,8 @@ void Work() {
 				waiting_memory = true;
 				break;
 			}
-			if (!running.empty() && std::chrono::steady_clock::now() - last_start < std::chrono::milliseconds(300)) break;
+			// (One starting at a time: each creates its Vulkan device and translates its shaders first.)
+			if (!running.empty() && std::chrono::steady_clock::now() - last_start < std::chrono::milliseconds(all_cpu ? 1000 : 3000)) break;
 			last_start = std::chrono::steady_clock::now();
 			const Item item = pending->front();
 			pending->pop_front();
@@ -525,6 +528,18 @@ void Work() {
 				continue;
 			}
 			if (code != 0) {
+				// (port15, kept) A shard that dies (the driver under many compiling processes at once, a process short of memory)
+				// is tried again with one process fewer each time, instead of failing the whole run; 4 failures of the same
+				// shard stop it.
+				const int tries = ++retries[r.name];
+				std::printf("[port] precompile: %s failed (exit %d, try %d); again with %d processes\n", r.name.c_str(), code, tries,
+				            std::max(1, jobs - 1));
+				std::fflush(stdout);
+				if (tries < 4) {
+					jobs = std::max(1, jobs - 1);
+					(r.item.first ? first : second).push_front(r.item);
+					continue;
+				}
 				kill_all();
 				(void)run("merge-failed", L"--merge", false);
 				return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Lo hecho se guarda. Mira logs\\*-precompile.");
