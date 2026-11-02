@@ -688,11 +688,18 @@ void BufferCache::VerifyReadback(uint64_t address, const uint8_t* fast, const ui
 	}
 }
 
+// The calling thread's GPU wait in CopyGuestReadback ([fps+] rf_gpuwait_ns).
+static thread_local uint64_t t_readback_wait_ns = 0;
+
 void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& request) {
 	if (request->copying.exchange(true, std::memory_order_acq_rel)) {
+		const auto joined = std::chrono::steady_clock::now(); // (another reader copies: its GPU wait and copy, counted as wait)
 		while (!request->copied.load(std::memory_order_acquire)) request->copied.wait(false);
+		t_readback_wait_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - joined).count());
 		return;
 	}
+	const auto wait_start = std::chrono::steady_clock::now();
 	if (request->queue_value != 0) {
 		m_readback_queue->Wait(request->queue_value);
 		m_scheduler.WaitPriorityOperations(request->producer_tick);
@@ -704,6 +711,8 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 		m_scheduler.GetMasterSemaphore().Wait(request->tick);
 		m_scheduler.WaitPriorityOperations(request->tick);
 	}
+	t_readback_wait_ns += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count());
 	uint32_t pending = GuestReadback::Pending;
 	if (request->state.compare_exchange_strong(pending, GuestReadback::Copying, std::memory_order_acq_rel)) {
 		request->download->Invalidate(0, request->packed_size);
@@ -1871,7 +1880,19 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		auto& gpu = m_scheduler.Context().GetGpu();
 		const bool ahead = !is_write && ReadAheadOn();
 		if (ahead) NoteGuestReadForReadAhead(vaddr);
+		// ([fps+] rf_*_ns: where a guest readback's time goes.)
+		using Clock    = std::chrono::steady_clock;
+		const auto ns  = [](Clock::time_point a, Clock::time_point b) {
+			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+		};
+		const auto t0 = Clock::now();
+		Clock::time_point t1 {}, t2 {};
 		gpu.SendCommandSync([&] {
+			t1 = Clock::now();
+			struct End {
+				Clock::time_point& t;
+				~End() { t = Clock::now(); }
+			} end {t2};
 			if (TryGuestReadFromFeedback(vaddr, size, is_write)) return;
 			bool completed = false;
 			// (KYTY_READ_AHEAD: a readback the flip started covers it when one is pending for the window.)
@@ -1883,13 +1904,25 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				ReadMemoryOnGpu(vaddr, size, is_write);
 			}
 		});
+		const auto t3 = Clock::now();
+		LiveCounters::Add(LiveCounters::RfTurnNs, ns(t0, t1));
+		LiveCounters::Add(LiveCounters::RfGpuThreadNs, ns(t1, t2));
 		if (request) {
+			t_readback_wait_ns = 0;
 			CopyGuestReadback(request);
-			gpu.SendCommandSync([this, request, vaddr, size, is_write] {
+			const auto t4 = Clock::now();
+			LiveCounters::Add(LiveCounters::RfGpuWaitNs, t_readback_wait_ns);
+			LiveCounters::Add(LiveCounters::RfCopyNs, ns(t3, t4) > t_readback_wait_ns ? ns(t3, t4) - t_readback_wait_ns : 0);
+			Clock::time_point t5 {}, t6 {};
+			gpu.SendCommandSync([this, request, vaddr, size, is_write, &t5, &t6] {
+				t5 = Clock::now();
 				// An overlapping access may already have retired this request.
 				if (m_guest_readbacks[request->slot] == request) FinishGuestReadback(request->slot);
 				if (is_write) FinishWriteReadback(vaddr, size);
+				t6 = Clock::now();
 			});
+			LiveCounters::Add(LiveCounters::RfTurnNs, ns(t4, t5));
+			LiveCounters::Add(LiveCounters::RfGpuThreadNs, ns(t5, t6));
 		}
 		return;
 	}
