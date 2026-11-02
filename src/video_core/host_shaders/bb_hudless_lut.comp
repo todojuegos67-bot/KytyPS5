@@ -10,7 +10,12 @@
 //          out must equal F: else a mismatch. The counters gate the result (mode 2).
 //  mode 2: when there was a conflict or a mismatch, out = F (a HUD-less image equal to the
 //          presented one: frame generation then treats nothing as HUD, as without one).
-// All values are the raw bytes (UNORM views).
+//  mode 3: resolved[768] = table with its gaps interpolated (768 invocations, once per frame).
+// All values are the raw bytes (UNORM views). Cost (0.23): the per-pixel gap scan and the
+// per-pixel global atomics of 0.22 made this pass take hundreds of ms; mode 0 now only issues an
+// atomic when an entry is new or differs, gaps are resolved once in mode 3, and the counters are
+// summed per workgroup. Modes 0 and 2 and the counting run only on the sampled check frames
+// (p.size.w = 1); other frames run mode 3 + mode 1 on the last checked table.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D t_tex;
@@ -23,25 +28,28 @@ layout(std430, binding = 4) buffer Lut {
     uint gaps;
     uint hud;
     uint table[768];
+    uint resolved[768];
 } lut;
 layout(push_constant) uniform Push {
-    uvec4 size; // width, height, mode, 0
+    uvec4 size; // width, height, mode, check
 } p;
+
+shared uint g_mismatch;
+shared uint g_hud;
 
 uvec3 Bytes(vec4 c) {
     return uvec3(round(clamp(c.rgb, 0.0, 1.0) * 255.0));
 }
 
-uint Lookup(uint c, uint v) {
+uint Resolve(uint c, uint v) {
     uint e = lut.table[c * 256u + v];
     if (e != 0u) {
         return e - 1u;
     }
-    // A value never seen outside the HUD: between its nearest known neighbours.
     int lo = int(v) - 1, hi = int(v) + 1;
     while (lo >= 0 && lut.table[c * 256u + uint(lo)] == 0u) --lo;
     while (hi <= 255 && lut.table[c * 256u + uint(hi)] == 0u) ++hi;
-    atomicAdd(lut.gaps, 1u);
+    if (p.size.w != 0u) atomicAdd(lut.gaps, 1u);
     if (lo < 0 && hi > 255) return v;
     if (lo < 0) return lut.table[c * 256u + uint(hi)] - 1u;
     if (hi > 255) return lut.table[c * 256u + uint(lo)] - 1u;
@@ -51,36 +59,59 @@ uint Lookup(uint c, uint v) {
 }
 
 void main() {
+    if (p.size.z == 3u) {
+        const uint i = gl_GlobalInvocationID.y * 96u + gl_GlobalInvocationID.x;
+        if (i < 768u) {
+            lut.resolved[i] = Resolve(i / 256u, i % 256u);
+        }
+        return;
+    }
+    const bool count = p.size.w != 0u && p.size.z == 1u;
+    if (count) {
+        if (gl_LocalInvocationIndex == 0u) {
+            g_mismatch = 0u;
+            g_hud = 0u;
+        }
+        barrier();
+    }
     ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
-    if (xy.x >= int(p.size.x) || xy.y >= int(p.size.y)) {
-        return;
-    }
-    const vec4 fc = texelFetch(f_tex, xy, 0);
-    const uvec3 t = Bytes(texelFetch(t_tex, xy, 0));
-    const uvec3 f = Bytes(fc);
-    if (p.size.z == 0u) {
-        for (uint c = 0u; c < 3u; ++c) {
-            const uint prev = atomicCompSwap(lut.table[c * 256u + t[c]], 0u, f[c] + 1u);
-            if (prev != 0u && prev != f[c] + 1u) {
-                atomicAdd(lut.conflicts, 1u);
+    const bool inside = xy.x < int(p.size.x) && xy.y < int(p.size.y);
+    if (inside) {
+        const vec4 fc = texelFetch(f_tex, xy, 0);
+        if (p.size.z == 0u) {
+            const uvec3 t = Bytes(texelFetch(t_tex, xy, 0));
+            const uvec3 f = Bytes(fc);
+            for (uint c = 0u; c < 3u; ++c) {
+                const uint idx = c * 256u + t[c];
+                const uint want = f[c] + 1u;
+                if (lut.table[idx] == want) continue; // the common case: no atomic
+                const uint prev = atomicCompSwap(lut.table[idx], 0u, want);
+                if (prev != 0u && prev != want) {
+                    atomicAdd(lut.conflicts, 1u);
+                }
             }
-        }
-        return;
-    }
-    if (p.size.z == 1u) {
-        const uvec3 s = Bytes(texelFetch(s_tex, xy, 0));
-        const uvec3 o = uvec3(Lookup(0u, s.r), Lookup(1u, s.g), Lookup(2u, s.b));
-        if (all(equal(s, t))) {
-            if (any(notEqual(o, f))) {
-                atomicAdd(lut.mismatches, 1u);
+        } else if (p.size.z == 1u) {
+            const uvec3 s = Bytes(texelFetch(s_tex, xy, 0));
+            const uvec3 o = uvec3(lut.resolved[s.r], lut.resolved[256u + s.g],
+                                  lut.resolved[512u + s.b]);
+            if (count) {
+                const uvec3 t = Bytes(texelFetch(t_tex, xy, 0));
+                if (all(equal(s, t))) {
+                    if (any(notEqual(o, Bytes(fc)))) atomicAdd(g_mismatch, 1u);
+                } else {
+                    atomicAdd(g_hud, 1u);
+                }
             }
-        } else {
-            atomicAdd(lut.hud, 1u);
+            imageStore(out_img, xy, vec4(vec3(o) / 255.0, fc.a));
+        } else if (lut.conflicts != 0u || lut.mismatches != 0u) {
+            imageStore(out_img, xy, fc);
         }
-        imageStore(out_img, xy, vec4(vec3(o) / 255.0, fc.a));
-        return;
     }
-    if (lut.conflicts != 0u || lut.mismatches != 0u) {
-        imageStore(out_img, xy, fc);
+    if (count) {
+        barrier();
+        if (gl_LocalInvocationIndex == 0u) {
+            if (g_mismatch != 0u) atomicAdd(lut.mismatches, g_mismatch);
+            if (g_hud != 0u) atomicAdd(lut.hud, g_hud);
+        }
     }
 }
