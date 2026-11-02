@@ -11,6 +11,7 @@
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "libs/audio_internal.h"
+#include "libs/audio_latency.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/controller.h"
 #include "libs/errno.h"
@@ -683,6 +684,56 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 				            static_cast<double>(queued_bytes) * static_cast<double>(buffer_us) / 1000.0 / queue_size);
 			}
 			return true;
+		}
+	}
+
+	// (ds-pc-port50) The latency cap (audio_latency.h): above the target the grain is played 2% shorter, far above it
+	// the queue starts again. The blocking path's own wait (below) keeps the queue under 40 ms + the reserve, so the
+	// target stays at least 60 ms above that: in normal play nothing is touched.
+	static const uint64_t cap_ms = [] {
+		const char* value = std::getenv("KYTY_AUDIO_MAX_LATENCY_MS");
+		return static_cast<uint64_t>(value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 2000) : 100);
+	}();
+	std::vector<uint8_t> shortened;
+	if (cap_ms != 0 && buffer_us != 0 && queue_size != 0 && port->last_output_time != 0) {
+		const uint64_t target_us   = std::max<uint64_t>(cap_ms * 1000u, 100000u + port->reserve_us);
+		const uint64_t queued_us   = static_cast<uint64_t>(queued_bytes) * buffer_us / queue_size;
+		const uint32_t sample_size = SDL_AUDIO_BITSIZE(port->audio_spec.format) / 8u;
+		const uint32_t channels    = port->audio_spec.channels;
+		const uint32_t frames      = sample_size * channels != 0 ? queue_size / (sample_size * channels) : 0;
+		const auto     decision    = Latency::Decide(queued_us, target_us, frames);
+		static std::atomic<uint32_t> cap_clears {0}, cap_shortened {0};
+		if (decision.action == Latency::Action::Clear) {
+			SDL_ClearQueuedAudio(port->audio_device);
+			const auto count = cap_clears.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (count <= 20 || count % 100 == 0) {
+				std::printf("AudioOut: port type %d: %.0f ms queued (cap %.0f ms): queue restarted (#%u)\n", port->type,
+				            static_cast<double>(queued_us) / 1000.0, static_cast<double>(target_us) / 1000.0, count);
+				std::fflush(stdout);
+			}
+		} else if (decision.action == Latency::Action::Shorten) {
+			const bool f32 = port->audio_spec.format == AUDIO_F32SYS;
+			const bool s16 = port->audio_spec.format == AUDIO_S16SYS;
+			if (!f32 && !s16) {
+				return true; // (another device format: the grain left out)
+			}
+			shortened.resize(static_cast<size_t>(decision.keep_frames) * sample_size * channels);
+			if (f32) {
+				Latency::Shorten(static_cast<const float*>(queue_data), frames, channels,
+				                 reinterpret_cast<float*>(shortened.data()), decision.keep_frames);
+			} else {
+				Latency::Shorten(static_cast<const int16_t*>(queue_data), frames, channels,
+				                 reinterpret_cast<int16_t*>(shortened.data()), decision.keep_frames);
+			}
+			queue_data = shortened.data();
+			queue_size = static_cast<uint32_t>(shortened.size());
+			const auto count = cap_shortened.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (count == 1 || count % 1000 == 0) {
+				std::printf("AudioOut: port type %d: %.0f ms queued (cap %.0f ms): grains played 2%% shorter (#%u)\n",
+				            port->type, static_cast<double>(queued_us) / 1000.0, static_cast<double>(target_us) / 1000.0,
+				            count);
+				std::fflush(stdout);
+			}
 		}
 	}
 
