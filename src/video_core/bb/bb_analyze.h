@@ -5,6 +5,7 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -19,7 +20,14 @@ namespace BB::Analyze {
 inline bool Enabled() {
     static const bool on = [] {
         const char* v = std::getenv("BB_ANALYZE");
-        return v && v[0] && v[0] != '0';
+        if (v && v[0] && v[0] != '0') return true;
+        // The launcher clears BB_* variables: a file bb-analyze.txt in the working folder
+        // (C:\EMULADOR PS4) turns the dump on too.
+        if (std::FILE* f = std::fopen("bb-analyze.txt", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return false;
     }();
     return on;
 }

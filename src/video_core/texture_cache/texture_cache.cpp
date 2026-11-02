@@ -276,7 +276,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
         if (image_info.bb_scaled != cache_image.info.bb_scaled) {
-            if (safe_to_delete) {
+            if (safe_to_delete || (cache_image.info.bb_scaled && !cache_image.binding.is_bound)) {
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};

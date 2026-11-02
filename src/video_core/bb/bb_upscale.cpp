@@ -2194,7 +2194,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     }
 
     ++g_frame_no;
-    g_dump_frame = AnalyzeOn() && (g_frame_no % 1800 == 900);
+    g_dump_frame = AnalyzeOn() &&
+                   (g_frame_no % 1800 == 900 ||
+                    (g_ss_frozen.load(std::memory_order_relaxed) &&
+                     !g_ss_off.load(std::memory_order_relaxed) && g_ss_windows == 0 &&
+                     g_ss_frames == 30));
     g_dump_lines = 0;
     g_dump_cbs = 0;
     g_dump_last.clear();
