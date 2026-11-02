@@ -89,6 +89,7 @@ struct Stats {
     std::chrono::steady_clock::time_point start{};
     uint32_t real = 0, generated_on = 0, no_inputs = 0, hudless = 0;
     uint64_t presents_at_start = 0;
+    double pace_n = 0, pace_sum = 0, pace_sq = 0, pace_max = 0; // real present intervals (s)
     double prepare_ms = 0, present_ms = 0, max_present_ms = 0;
 } g_stats;
 
@@ -483,6 +484,14 @@ bool Active() {
     return g_swapchain_context != nullptr;
 }
 
+double PaceInterval() {
+    return Active() && g_generating ? CapInterval() : 0.0;
+}
+
+void NoteSlept(double seconds) {
+    g_mfg.slept += seconds;
+}
+
 int Generated() {
     if (!Active() || !g_generating) return 0;
     return g_mfg.on ? g_mfg.current - 1 : 1;
@@ -632,7 +641,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     // G-SYNC / the dynamic target: real frames wait just enough for real x (1 + generated) to stay
     // under the cap. Only while generating; movies and menus untouched.
     const double interval = CapInterval();
-    if (interval > 0.0 && inputs != nullptr && inputs->valid) {
+    if (interval > 0.0 && inputs != nullptr && inputs->valid && !GuestPacing()) {
         static std::chrono::steady_clock::time_point next{};
         const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(interval));
@@ -665,6 +674,15 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                g_stats.real != 0 ? g_stats.prepare_ms / g_stats.real : 0.0,
                g_stats.real != 0 ? g_stats.present_ms / g_stats.real : 0.0, g_stats.max_present_ms,
                g_stats.hudless);
+        if (g_stats.pace_n >= 10.0) {
+            const double mean = g_stats.pace_sum / g_stats.pace_n;
+            const double sd =
+                std::sqrt(std::max(g_stats.pace_sq / g_stats.pace_n - mean * mean, 0.0));
+            Printf("[fsr3] present interval sd %.2f ms (mean %.2f, max %.1f, %.0f frames); pacer "
+                   "%.2f ms (%s)",
+                   sd * 1e3, mean * 1e3, g_stats.pace_max * 1e3, g_stats.pace_n,
+                   CapInterval() * 1e3, GuestPacing() ? "guest flips" : "present");
+        }
         MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
         g_stats = {};
         g_stats.start = now;
@@ -672,6 +690,19 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     }
     g_stats.real++;
     if (!usable) g_stats.no_inputs++;
+    {
+        static std::chrono::steady_clock::time_point prev{};
+        const double dt = prev == std::chrono::steady_clock::time_point{}
+                              ? 0.0
+                              : std::chrono::duration<double>(now - prev).count();
+        prev = now;
+        if (usable && dt > 0.0 && dt < 0.1) {
+            g_stats.pace_n += 1.0;
+            g_stats.pace_sum += dt;
+            g_stats.pace_sq += dt * dt;
+            g_stats.pace_max = std::max(g_stats.pace_max, dt);
+        }
+    }
 
     const double delta_ms =
         g_last_real == std::chrono::steady_clock::time_point{}
@@ -844,6 +875,10 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
 bool Requested() {
     return false;
 }
+double PaceInterval() {
+    return 0.0;
+}
+void NoteSlept(double) {}
 bool Active() {
     return false;
 }

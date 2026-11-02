@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -30,6 +31,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <intrin.h>
 #undef min
 #undef max
 #endif
@@ -212,9 +214,309 @@ bool Fsr3Active() {
     return Amd::Active();
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// DLSS-G preset (Demon's Souls frame-gen.cpp DlssgPreset, as it is; its launcher's default C).
+// KYTY_DLSSG_PRESET (BB_DLSSG_PRESET) = A | B | C (default) | 0.
+// ---------------------------------------------------------------------------------------------
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+namespace DlssgPreset {
+
+constexpr uint32_t kGetSettingInterface = 0x73BF8338u;
+constexpr uint32_t kSettingId           = 0x10E41DF1u;
+constexpr int32_t  kOk                  = 0;
+constexpr int32_t  kSettingNotFound     = -160;
+
+#pragma pack(push, 4)
+union SettingValue {
+	uint32_t dword;
+	struct {
+		uint32_t length;
+		uint8_t  data[4096];
+	} binary;
+	uint16_t text[2048];
+	uint64_t qword;
+};
+struct Setting { // NVDRS_SETTING_V1
+	uint32_t     version;
+	uint16_t     name[2048];
+	uint32_t     id;
+	uint32_t     type;
+	uint32_t     location;
+	uint32_t     current_predefined;
+	uint32_t     predefined_valid;
+	SettingValue predefined;
+	SettingValue current;
+};
+#pragma pack(pop)
+static_assert(sizeof(Setting) == 12320);
+constexpr uint32_t kSettingVersion = sizeof(Setting) | (1u << 16);
+
+using QueryInterfaceFn = void*(__cdecl*)(uint32_t);
+using GetSettingFn     = int32_t(__cdecl*)(void*, void*, uint32_t, Setting*);
+
+uint32_t                  g_preset = 0; // 0 off, else 1..3
+std::atomic<QueryInterfaceFn> g_query {nullptr};
+std::atomic<GetSettingFn>     g_get_setting {nullptr};
+std::atomic<uint64_t>         g_reads {0};
+std::atomic<uint64_t>         g_applied {0};
+std::atomic<int>              g_provider_c {-1}; // -1 unknown, 0 lacks C, 1 has C
+std::mutex                    g_log_mutex;
+
+// The module's VS_FIXEDFILEINFO (from its own resources: no version.dll).
+bool ModuleVersion(HMODULE module, uint16_t v[4]) {
+	HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));
+	if (resource == nullptr) return false;
+	HGLOBAL     handle = LoadResource(module, resource);
+	const DWORD size   = SizeofResource(module, resource);
+	const auto* bytes  = handle != nullptr ? static_cast<const uint8_t*>(LockResource(handle)) : nullptr;
+	if (bytes == nullptr) return false;
+	for (DWORD i = 0; i + 52 <= size; i += 4) {
+		uint32_t signature = 0;
+		std::memcpy(&signature, bytes + i, 4);
+		if (signature != 0xFEEF04BDu) continue;
+		uint32_t ms = 0, ls = 0;
+		std::memcpy(&ms, bytes + i + 8, 4);
+		std::memcpy(&ls, bytes + i + 12, 4);
+		v[0] = static_cast<uint16_t>(ms >> 16);
+		v[1] = static_cast<uint16_t>(ms);
+		v[2] = static_cast<uint16_t>(ls >> 16);
+		v[3] = static_cast<uint16_t>(ls);
+		return true;
+	}
+	return false;
+}
+
+char Letter(uint32_t preset) { return preset == 0 ? '0' : static_cast<char>('A' + preset - 1); }
+
+// Whether the reading module (nvngx_dlssg.dll) implements Preset C; logs once.
+bool ProviderHasC(const void* caller) {
+	int known = g_provider_c.load(std::memory_order_acquire);
+	if (known >= 0) return known == 1;
+	std::lock_guard lock(g_log_mutex);
+	known = g_provider_c.load(std::memory_order_acquire);
+	if (known >= 0) return known == 1;
+	HMODULE module = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   static_cast<LPCWSTR>(caller), &module);
+	char     name[MAX_PATH] = "?";
+	uint16_t v[4] {};
+	const bool versioned = module != nullptr && ModuleVersion(module, v);
+	if (module != nullptr && GetModuleFileNameA(module, name, MAX_PATH) != 0) {
+		if (const char* slash = std::strrchr(name, '\\'); slash != nullptr) std::memmove(name, slash + 1, std::strlen(slash));
+	}
+	const uint64_t version = versioned ? (uint64_t(v[0]) << 32) | (uint64_t(v[1]) << 16) | v[2] : 0;
+	const bool     has_c   = versioned && version >= ((uint64_t(310) << 32) | (uint64_t(9) << 16) | 16);
+	if (g_preset == 3) {
+		Printf("[dlssg] preset C requested; provider %s %u.%u.%u: %s\n", name, v[0], v[1], v[2],
+		     has_c ? "applied" : "not supported (needs >= 310.9.16), left to the driver");
+		std::printf("[dlssg] preset C requested; provider %s %u.%u.%u: %s\n", name, v[0], v[1], v[2],
+		            has_c ? "applied" : "not supported (needs >= 310.9.16)");
+	} else {
+		Printf("[dlssg] preset %c requested; provider %s %u.%u.%u: applied\n", Letter(g_preset), name, v[0], v[1], v[2]);
+		std::printf("[dlssg] preset %c requested; provider %s %u.%u.%u: applied\n", Letter(g_preset), name, v[0], v[1],
+		            v[2]);
+	}
+	
+	g_provider_c.store(has_c ? 1 : 0, std::memory_order_release);
+	return has_c;
+}
+
+__declspec(noinline) int32_t __cdecl GetSettingHook(void* session, void* profile, uint32_t id, Setting* setting) {
+	const GetSettingFn original = g_get_setting.load(std::memory_order_acquire);
+	const int32_t      result   = original(session, profile, id, setting);
+	if (id != kSettingId || setting == nullptr || setting->version != kSettingVersion) return result;
+	if (!(result == kSettingNotFound || (result == kOk && setting->id == id && setting->type == 0))) return result;
+	// Only nvngx_dlssg*.dll's own reads are answered (as MFG-Unlocker does: its override is limited to the
+	// retained DLSS-G provider); other readers of the key (NGX core, Streamline, the driver) keep the driver's
+	// value. Each distinct reader is logged once, to see who reads the key. KYTY_DLSSG_PRESET_ALL=1: every reader.
+	{
+		HMODULE caller = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                   static_cast<LPCWSTR>(_ReturnAddress()), &caller);
+		char path[MAX_PATH] = "?";
+		if (caller != nullptr) GetModuleFileNameA(caller, path, MAX_PATH);
+		const char* slash = std::strrchr(path, '\\');
+		const char* name  = slash != nullptr ? slash + 1 : path;
+		const bool  provider = _strnicmp(name, "nvngx_dlssg", 11) == 0;
+		static const bool all = [] {
+			const char* v = Env("KYTY_DLSSG_PRESET_ALL");
+			return v != nullptr && *v != '\0' && *v != '0';
+		}();
+		{
+			static HMODULE seen[16] {};
+			std::lock_guard lock(g_log_mutex);
+			bool known = false;
+			for (HMODULE& m: seen) {
+				if (m == caller) { known = true; break; }
+				if (m == nullptr) { m = caller; break; }
+			}
+			if (!known) {
+				Printf("[dlssg] FG preset key read by %s (driver %s %u): %s\n", name, result == kOk ? "value" : "none",
+				     result == kOk ? setting->current.dword : 0u, provider || all ? "overridden" : "left as is");
+				
+			}
+		}
+		if (!provider && !all) return result;
+	}
+	const uint64_t reads = g_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint32_t was   = result == kOk ? setting->current.dword : 0;
+	const bool has_c = ProviderHasC(_ReturnAddress()); // (Also logs the provider once.)
+	if (g_preset == 3 && !has_c) return result;
+	if (result == kSettingNotFound) {
+		std::memset(setting, 0, sizeof(*setting));
+		setting->version = kSettingVersion;
+		setting->id      = id;
+		constexpr char label[] = "Override DLSS-FG preset";
+		for (size_t i = 0; i < sizeof(label); ++i) setting->name[i] = static_cast<uint16_t>(label[i]);
+	}
+	setting->location           = 0;
+	setting->current_predefined = 0;
+	std::memset(&setting->current, 0, sizeof(setting->current));
+	setting->current.dword = g_preset;
+	const uint64_t applied = g_applied.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((reads & (reads - 1)) == 0) {
+		Printf("[dlssg] FG preset read #%llu by the provider (driver %s %u, answered %c, %llu overridden)\n",
+		     static_cast<unsigned long long>(reads), result == kOk ? "value" : "none", was, Letter(g_preset),
+		     static_cast<unsigned long long>(applied));
+	}
+	return kOk;
+}
+
+void* __cdecl QueryInterfaceHook(uint32_t id) {
+	void* function = g_query.load(std::memory_order_acquire)(id);
+	if (id != kGetSettingInterface || function == nullptr) return function;
+	GetSettingFn expected = nullptr;
+	if (!g_get_setting.compare_exchange_strong(expected, reinterpret_cast<GetSettingFn>(function)) &&
+	    expected != reinterpret_cast<GetSettingFn>(function)) {
+		return function; // (A second, different implementation: left alone.)
+	}
+	return reinterpret_cast<void*>(&GetSettingHook);
+}
+
+// Points nvapi64.dll's nvapi_QueryInterface export at QueryInterfaceHook (later GetProcAddress calls and imports
+// resolve to it). Before sl.interposer.dll loads.
+void Install() {
+	const char* value = Env("KYTY_DLSSG_PRESET");
+	if (value == nullptr || *value == '\0') return;
+	switch (*value) {
+		case 'A': case 'a': case '1': g_preset = 1; break;
+		case 'B': case 'b': case '2': g_preset = 2; break;
+		case 'C': case 'c': case '3': g_preset = 3; break;
+		case '0': return; // game / driver
+		default: Printf("[dlssg] KYTY_DLSSG_PRESET=%s: not A, B, C or 0, ignored\n", value); return;
+	}
+	const auto fail = [](const char* why) {
+		Printf("[dlssg] preset %c requested: not applied (%s)\n", Letter(g_preset), why);
+		g_preset = 0;
+	};
+	HMODULE nvapi = LoadLibraryExW(L"nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	if (nvapi == nullptr) return fail("no nvapi64.dll");
+	HMODULE pinned = nullptr; // (Never unloaded: the export now points into our stub.)
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+	                   reinterpret_cast<LPCWSTR>(nvapi), &pinned);
+	auto*       base = reinterpret_cast<uint8_t*>(nvapi);
+	const auto* dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+	const auto* nt   = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+	const auto& dir  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+	if (dir.VirtualAddress == 0) return fail("nvapi64.dll has no exports");
+	const auto* exports   = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+	const auto* names     = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+	const auto* ordinals  = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+	auto*       functions = reinterpret_cast<DWORD*>(base + exports->AddressOfFunctions);
+	DWORD*      slot      = nullptr;
+	for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+		if (std::strcmp(reinterpret_cast<const char*>(base + names[i]), "nvapi_QueryInterface") == 0) {
+			slot = &functions[ordinals[i]];
+			break;
+		}
+	}
+	if (slot == nullptr) return fail("no nvapi_QueryInterface");
+	auto* original = reinterpret_cast<QueryInterfaceFn>(GetProcAddress(nvapi, "nvapi_QueryInterface"));
+	if (original == nullptr || reinterpret_cast<uint8_t*>(original) != base + *slot) return fail("unexpected export");
+	// A jump stub above the image, within the 32-bit export RVA range.
+	const uintptr_t image_end = reinterpret_cast<uintptr_t>(base) + nt->OptionalHeader.SizeOfImage;
+	uint8_t*        stub      = nullptr;
+	for (uintptr_t at = (image_end + 0xFFFF) & ~uintptr_t(0xFFFF);
+	     stub == nullptr && at < reinterpret_cast<uintptr_t>(base) + 0x7FFF0000u; at += 0x10000) {
+		stub = static_cast<uint8_t*>(
+		    VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	}
+	if (stub == nullptr) return fail("no memory near nvapi64.dll");
+	const uint64_t target = reinterpret_cast<uint64_t>(&QueryInterfaceHook);
+	stub[0] = 0xFF; stub[1] = 0x25; std::memset(stub + 2, 0, 4); // jmp [rip+0]
+	std::memcpy(stub + 6, &target, 8);
+	DWORD protection = 0;
+	VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &protection);
+	FlushInstructionCache(GetCurrentProcess(), stub, 14);
+	g_query.store(original, std::memory_order_release);
+	if (!VirtualProtect(slot, sizeof(DWORD), PAGE_READWRITE, &protection)) return fail("export table is read-only");
+	*slot = static_cast<DWORD>(reinterpret_cast<uintptr_t>(stub) - reinterpret_cast<uintptr_t>(base));
+	VirtualProtect(slot, sizeof(DWORD), protection, &protection);
+	Printf("[dlssg] preset %c requested: NVAPI DRS read hook installed (driver profile untouched)\n", Letter(g_preset));
+	if (GetModuleHandleW(L"nvngx_dlssg.dll") != nullptr) Printf("[dlssg] warning: nvngx_dlssg.dll was already loaded\n");
+}
+
+} // namespace DlssgPreset
+#endif
+
+void InstallDlssgPreset() {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    static bool done = false;
+    if (done || Cfg().kind != Kind::Dlss) return;
+    done = true;
+    if (Env("KYTY_DLSSG_PRESET") == nullptr) SetProcessEnv("BB_DLSSG_PRESET", "C");
+    DlssgPreset::Install();
+#endif
+}
+
 // ---------------------------------------------------------------------------------------------
 // DLSS-G
 // ---------------------------------------------------------------------------------------------
+// BB_FG_PACE=guest (default) | present. The real frames' limit (target / multiplier, or the VRR
+// cap) is applied where the game submits its flip, holding the game's own frames to that rate on a
+// fixed grid, as Demon's Souls holds its flips (10-23: VideoOut::SetDynamicFlipFps, "game flips at
+// 56"); the old place, the present thread, beat against the game's 60 (present interval sd 1.9 ms
+// at x4 on 224). present: the old place.
+bool GuestPacing() {
+    static const bool guest = [] {
+        const char* v = std::getenv("BB_FG_PACE");
+        return v == nullptr || std::strcmp(v, "present") != 0;
+    }();
+    return guest;
+}
+
+namespace Dlssg {
+double PaceInterval();
+void NoteSlept(double seconds);
+}
+
+void PaceGuestFlip() {
+    if (!GuestPacing()) return;
+    double interval = Dlssg::PaceInterval();
+    if (interval <= 0.0) interval = Amd::PaceInterval();
+    if (interval <= 0.0 || interval > 0.1) return;
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point next{};
+    static std::mutex mutex;
+    std::unique_lock lock{mutex};
+    const auto step =
+        std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(interval));
+    auto now = Clock::now();
+    if (next > now) {
+        const auto until = next;
+        lock.unlock();
+        std::this_thread::sleep_until(until - std::chrono::milliseconds(1));
+        while (Clock::now() < until) std::this_thread::yield();
+        lock.lock();
+        Amd::NoteSlept(std::chrono::duration<double>(until - now).count());
+        Dlssg::NoteSlept(std::chrono::duration<double>(until - now).count());
+        now = until;
+    }
+    // A late flip resets the grid (no burst to catch up).
+    next = std::max(next, now - step) + step;
+}
+
 namespace Dlssg {
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -277,7 +579,7 @@ Clock::time_point g_stat_start{};
 uint32_t g_stat_real = 0, g_stat_on = 0, g_stat_hudless = 0;
 uint32_t g_last_status = 0;
 double g_stat_present_ms = 0, g_stat_present_max = 0;
-double g_pace_n = 0, g_pace_sum = 0, g_pace_sq = 0;
+double g_pace_n = 0, g_pace_sum = 0, g_pace_sq = 0, g_pace_max = 0;
 
 int PaceMode() { // KYTY_DLSSG_PACE=grid (our pacer, default) | reflex (Reflex's limit only)
     static const int mode = [] {
@@ -548,6 +850,14 @@ bool Ready() {
     return g_ready;
 }
 
+double PaceInterval() {
+    return g_ready && g_mode_set == 1 ? g_real_interval.load() : 0.0;
+}
+
+void NoteSlept(double seconds) {
+    g_slept += seconds;
+}
+
 uint32_t GuestFlip() {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
     if (!g_ready || !GuestMarkers() || g_api.pcl_set_marker == nullptr) return 0;
@@ -603,7 +913,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
     // Menus, movies and loading screens (no 3D scene upscaled) are presented as they are.
     const bool usable = inputs != nullptr && inputs->valid;
     // The pacer: real frames at most every target / m while generating (one limiter, ours).
-    if (const double interval = g_real_interval.load(); interval > 0.0 && usable) {
+    if (const double interval = g_real_interval.load(); interval > 0.0 && usable && !GuestPacing()) {
         static Clock::time_point next{};
         const auto step = std::chrono::duration_cast<Clock::duration>(
             std::chrono::duration<double>(interval));
@@ -631,6 +941,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                 g_pace_n += 1.0;
                 g_pace_sum += dt;
                 g_pace_sq += dt * dt;
+                g_pace_max = std::max(g_pace_max, dt);
             }
         }
         const double window = std::chrono::duration<double>(now - g_stat_start).count();
@@ -639,12 +950,13 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             if (g_pace_n >= 10.0) {
                 const double mean = g_pace_sum / g_pace_n;
                 const double sd = std::sqrt(std::max(g_pace_sq / g_pace_n - mean * mean, 0.0));
-                Printf("[dlssg] present interval sd %.2f ms (mean %.2f, %.0f frames); pacer %.2f "
-                       "ms (%s)",
-                       sd * 1e3, mean * 1e3, g_pace_n, g_real_interval.load() * 1e3,
-                       PaceMode() == 2 ? "reflex" : "grid");
+                Printf("[dlssg] present interval sd %.2f ms (mean %.2f, max %.1f, %.0f frames); "
+                       "pacer %.2f ms (%s)",
+                       sd * 1e3, mean * 1e3, g_pace_max * 1e3, g_pace_n,
+                       g_real_interval.load() * 1e3,
+                       PaceMode() == 2 ? "reflex" : GuestPacing() ? "grid, guest flips" : "grid");
             }
-            g_pace_n = g_pace_sum = g_pace_sq = 0.0;
+            g_pace_n = g_pace_sum = g_pace_sq = g_pace_max = 0.0;
             if (g_dynamic && g_mode_set == 1) {
                 const double real = g_stat_real / window;
                 const double freer = g_stat_real / std::max(window - g_slept, 0.05);
@@ -735,7 +1047,6 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         options.mvecBufferFormat = static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT);
         options.depthBufferFormat = static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT);
         options.hudLessBufferFormat = static_cast<uint32_t>(static_cast<VkFormat>(format));
-        options.uiBufferFormat = static_cast<uint32_t>(static_cast<VkFormat>(format));
         if (usable) {
             options.mvecDepthWidth = inputs->render.width;
             options.mvecDepthHeight = inputs->render.height;
@@ -952,7 +1263,7 @@ void KeepOff(vk::Extent2D backbuffer, vk::Format format, uint32_t image_count) {
     options.numBackBuffers = image_count;
     options.colorWidth = options.mvecDepthWidth = backbuffer.width;
     options.colorHeight = options.mvecDepthHeight = backbuffer.height;
-    options.colorBufferFormat = options.hudLessBufferFormat = options.uiBufferFormat =
+    options.colorBufferFormat = options.hudLessBufferFormat =
         static_cast<uint32_t>(static_cast<VkFormat>(format));
     options.mvecBufferFormat = static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT);
     options.depthBufferFormat = static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT);

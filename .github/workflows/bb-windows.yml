@@ -78,6 +78,20 @@ jobs:
         if (!$header) { throw 'no include\sl.h with bin\x64\sl.interposer.dll' }
         New-Item -ItemType Directory -Force _Build\deps\streamline | Out-Null
         Move-Item $header.Directory.Parent.FullName _Build\deps\streamline\sdk
+        # DLSS-G Preset C (BB_DLSSG_PRESET=C, the default as in Demon's Souls) needs nvngx_dlssg.dll >= 310.9.16:
+        # when Streamline's is older, NVIDIA's from the official DLSS SDK release (as the DS workflow does).
+        $dlssg = '_Build\deps\streamline\sdk\bin\x64\nvngx_dlssg.dll'
+        $have = if (Test-Path $dlssg) { [version](Get-Item $dlssg).VersionInfo.FileVersion.Replace(',', '.').Split(' ')[0] } else { [version]'0.0' }
+        Write-Host "Streamline's nvngx_dlssg.dll: $have"
+        if ($have -lt [version]'310.9.16') {
+          git clone --depth 1 --branch v310.9.16 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS _Build\deps\dlss
+          if ($LASTEXITCODE) { throw 'DLSS SDK clone failed' }
+          git -C _Build\deps\dlss sparse-checkout set --no-cone /lib/Windows_x86_64/rel/nvngx_dlssg.dll /LICENSE.txt
+          $new = '_Build\deps\dlss\lib\Windows_x86_64\rel\nvngx_dlssg.dll'
+          if (!(Test-Path $new)) { throw 'no nvngx_dlssg.dll in the DLSS SDK' }
+          Copy-Item $new $dlssg -Force
+          Write-Host "nvngx_dlssg.dll from DLSS v310.9.16: $((Get-Item $dlssg).VersionInfo.FileVersion)"
+        }
         # Never shipped: nvngx_dlssnr.dll (not used here).
         Remove-Item _Build\deps\streamline\sdk\bin\x64\nvngx_dlssnr.dll -ErrorAction SilentlyContinue
         # Only NVIDIA-signed Streamline files (the emulator checks sl.interposer.dll's signer too).

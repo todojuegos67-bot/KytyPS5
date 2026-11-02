@@ -42,6 +42,8 @@ struct Config {
 const Config& Cfg();
 const char* Name(); // "off", "dlss-x3", ...
 
+// Before sl.interposer.dll loads: the DLSS-G preset hook (BB_DLSSG_PRESET, default C).
+void InstallDlssgPreset();
 bool StreamlineWanted();   // DLSS-G asked: Streamline must load before the Vulkan instance
 bool StreamlineLoaded();   // Streamline is the Vulkan loader (its Reflex is the latency mode)
 bool DlssgEnabled();       // DLSS-G ready on this device
@@ -114,5 +116,9 @@ void AfterPresent();
 uint32_t GuestFlip();
 // Before BeforePresent: the guest frame index of the frame presented (0: a repeat or none).
 void SetPresentIndex(uint32_t index);
+// The game's flip submit (VideoOut): holds the real frames to the frame generation limit there
+// (BB_FG_PACE=guest, default).
+void PaceGuestFlip();
+bool GuestPacing();
 
 } // namespace BB::FG

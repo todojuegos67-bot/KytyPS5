@@ -19,4 +19,6 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info);
 void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2D backbuffer,
                    vk::Format format);
 int Generated();
+double PaceInterval(); // the real-frame limit while generating (0: none)
+void NoteSlept(double seconds);
 } // namespace BB::FG::Amd

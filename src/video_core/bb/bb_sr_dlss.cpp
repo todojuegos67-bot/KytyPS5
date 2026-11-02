@@ -15,6 +15,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
 
@@ -240,6 +241,7 @@ bool Preload() {
             return false;
         }
         BBLogf("DLSS: %s: NVIDIA signature verified", interposer.string().c_str());
+        BB::FG::InstallDlssgPreset(); // (before Streamline loads nvngx_dlssg.dll)
         BBLogf("DLSS: LoadLibrary %s (vulkan-1.dll already loaded: %d)", interposer.string().c_str(),
                GetModuleHandleA("vulkan-1.dll") != nullptr ? 1 : 0);
         HMODULE module = LoadLibraryW(interposer.c_str());

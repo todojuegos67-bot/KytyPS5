@@ -9,6 +9,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "video_core/bb/bb_antilag.h"
+#include "video_core/bb/bb_fg.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -309,6 +310,10 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         }
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
+    }
+    // Frame generation: the real frames held to its limit at the game's own flip (bb_fg.h).
+    if (index != -1) {
+        BB::FG::PaceGuestFlip();
     }
     // BB::AntiLag: the game's CPU frame ends at its flip.
     const u64 lat_index = BB::AntiLag::OnFlipReserved();
