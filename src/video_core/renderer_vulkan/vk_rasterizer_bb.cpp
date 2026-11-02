@@ -888,7 +888,8 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
         const char* v = std::getenv("BB_SR_LDR_ENCODED");
         return v != nullptr && *v == '1';
     }();
-    const bool fsr4_linear = BB::Upscale::Cfg().kind == BB::SR::Kind::Fsr4 && !ldr_encoded;
+    // (Every back end, as the in-place / native AA path, whose colours are right: linear input.)
+    const bool fsr4_linear = !ldr_encoded;
     const bool encoded =
         IsSrgb(flip.info.pixel_format) && !plan.hdr && !ldr_linear && !fsr4_linear;
     const vk::Format in_format =
@@ -1307,6 +1308,12 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     desc.jitter[1] = plan.jitter[1];
     desc.reset = plan.reset;
     desc.hdr = plan.hdr;
+    // 0.23 (colour): the window-size path with linear input gets the HDR flag, as the in-place
+    // (native AA) path's linear RGBA16F input does ("linear HDR, HDR flag" in the log: the runs
+    // whose colours are right). LDR-flagged, the back ends apply their LDR handling to it.
+    if (color_image == g_bb.present_in.image && !g_bb.present_encoded) {
+        desc.hdr = true;
+    }
     desc.depth_inverted = plan.depth_inverted;
     desc.delta_ms = plan.delta_ms;
     desc.fov_y = plan.fov_y;
@@ -1387,7 +1394,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
             vk::to_string(src),
             copy && g_bb.present_encoded ? "sRGB-encoded perceptual values, as LDR upscalers take"
                                          : ColourSpace(src),
-            plan.hdr ? "HDR" : "LDR", vk::to_string(g_bb.output.format),
+            desc.hdr ? "HDR" : "LDR", vk::to_string(g_bb.output.format),
             copy && g_bb.present_encoded ? " (sRGB-encoded, decoded once in the HUD composite)"
                                          : "");
         // The window path gets the same inputs as the in-place path: the game's depth, the
