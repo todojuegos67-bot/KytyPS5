@@ -45,6 +45,7 @@ uint32_t TranslatorFeatureSet() {
 	static const int cooperative  = forced("KYTY_LANE_LOCAL_COOP");
 	static const int slots_at_use = forced("KYTY_TABLE_SLOTS_AT_USE");
 	static const int min_max      = forced("KYTY_NATIVE_FLOAT_MIN_MAX");
+	static const int lane_wide    = forced("KYTY_LANE_LOCAL_WIDE");
 	const auto       stored       = g_translator_features.load(std::memory_order_relaxed);
 	auto             features     = (stored & g_device_features.load(std::memory_order_relaxed)) |
 	                     g_device_required.load(std::memory_order_relaxed);
@@ -54,6 +55,7 @@ uint32_t TranslatorFeatureSet() {
 	apply(cooperative, TranslatorFeatureCooperativeHalves);
 	apply(slots_at_use, TranslatorFeatureTableSlotsAtUse);
 	apply(min_max, TranslatorFeatureNativeFloatMinMax);
+	apply(lane_wide, TranslatorFeatureLaneLocalWide);
 	return features;
 }
 

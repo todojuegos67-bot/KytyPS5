@@ -68,6 +68,12 @@ constexpr uint32_t TranslatorFeatureTableSlotsAtUse   = 2u; // a table mode slot
 // V_MIN/MAX/MIN3/MAX3_F32 as GLSL NMin/NMax, which AMD GPUs execute with the guest GPU's own NaN and signed-zero rules
 // (v_min_f32/v_max_f32), in place of an exact emulation (about a dozen instructions each; upstream PR #1761).
 constexpr uint32_t TranslatorFeatureNativeFloatMinMax = 4u;
+// The lane-local proof's wider rules (LaneLocal.cpp), one bit for all of them. So far: S_GETPC_B64 admitted, the program
+// counter being the same in every lane and both halves (the wave64 programs that read it use it for a table of
+// constants after their code: s_getpc, s_add_u32 of the table's offset, per-lane loads through it); S_SETPC and the
+// subvector loops stay refused. Off unless KYTY_LANE_LOCAL_WIDE=1 (not in TranslatorFeatures until measured: it
+// changes those programs' SPIR-V).
+constexpr uint32_t TranslatorFeatureLaneLocalWide = 128u;
 constexpr uint32_t TranslatorFeatures =
     TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse | TranslatorFeatureNativeFloatMinMax;
 // Those the translation uses (default: all; the emulator sets those its static store was made with before it translates

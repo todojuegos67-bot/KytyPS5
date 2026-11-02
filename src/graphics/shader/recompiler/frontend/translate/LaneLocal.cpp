@@ -256,6 +256,9 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_BITREPLICATE_B64_B32: return "lane-mask layout";
 		case Opcode::S_GETPC_B64:
+			// (TranslatorFeatureLaneLocalWide: a scalar the same in every lane, written as a constant would be.)
+			if ((TranslatorFeatureSet() & TranslatorFeatureLaneLocalWide) != 0) return nullptr;
+			[[fallthrough]];
 		case Opcode::S_SETPC_B64:
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END: return "program counter";

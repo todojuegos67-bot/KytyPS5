@@ -15,6 +15,15 @@
 #include <string_view>
 #include <vector>
 
+// The translator's feature set is defined in Translate.cpp, which this test does not link: the default set here, so
+// the lane-local proof's wider rules (TranslatorFeatureLaneLocalWide, KYTY_LANE_LOCAL_WIDE: off by default) stay off
+// as in a default run.
+namespace Libs::Graphics::ShaderRecompiler::Frontend {
+uint32_t TranslatorFeatureSet() {
+	return 0;
+}
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend
+
 namespace Common {
 
 int DbgExitIfHandler(const char*, const char*, int) {
