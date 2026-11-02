@@ -433,7 +433,24 @@ void Work() {
 	// 1. Recorded play (precompile-windows.ps1: the release's hints and this PC's warmup recordings, together).
 	SetText("Preparando shaders: partidas grabadas...");
 	fs::path recorded;
-	{
+	// (ds-pc-port51) An interrupted run (closed, updated, restarted) goes on with the hinted seeds its plan and shards were
+	// made of, not new ones from play recorded since: made again, their bytes changed the resume key and every shard done
+	// was thrown away (11-02: an update 47 s into a precompile planned it all again).
+	const auto sum_of = [](const fs::path& f) {
+		const std::string b = ReadAll(f);
+		uint64_t          h = 1469598103934665603ull;
+		for (const unsigned char c: b) h = (h ^ c) * 1099511628211ull;
+		return std::to_string(b.size()) + ":" + std::to_string(h);
+	};
+	const fs::path    resume_key_file = root / L"_PipelineCache" / L"static" / L"precompile-resume" / L"key.txt";
+	const fs::path    old_hinted      = root / Wide("hinted-" + id + ".seeds");
+	const std::string old_key         = ReadAll(resume_key_file);
+	if (!old_key.empty() && fs::exists(old_hinted, ec) && old_key.find("|" + sum_of(old_hinted) + "|") != std::string::npos) {
+		recorded = old_hinted;
+		std::printf("[port] precompile: an interrupted run's recorded play kept (its plan and shards go on)\n");
+		std::fflush(stdout);
+	}
+	if (recorded.empty()) {
 		std::vector<fs::path> sources;
 		const fs::path released = root / Wide("released-" + id + ".seeds"); // (made at the splash, ds-main PrepareShaders)
 		if (fs::exists(released, ec)) sources.push_back(released);
@@ -480,14 +497,23 @@ void Work() {
 	const std::string resume_key = "v1|" + content(seeds) + "|" + (has_recorded ? content(recorded) : std::string("-")) + "|" +
 	                               g_setup.shadow_filter + "|" + std::to_string(cpus > 0);
 	bool resumed_plan = false;
+	bool recorded_planned = false; // (ds-pc-port51: the recorded play's plan step done in an interrupted planning)
 	{
 		std::error_code e;
-		if (ReadAll(resume_dir / L"key.txt") == resume_key) {
+		const std::string had = ReadAll(resume_dir / L"key.txt");
+		if (had == resume_key) {
 			resumed_plan = true;
+		} else if (had == resume_key + "|planning" && fs::exists(resume_dir / L"plan-recorded.bin", e)) {
+			recorded_planned = fs::copy_file(resume_dir / L"plan-recorded.bin", resume_dir / L"plan.bin",
+			                                 fs::copy_options::overwrite_existing, e);
+			if (fs::exists(resume_dir / L"plan-recorded.out.log", e))
+				fs::copy_file(resume_dir / L"plan-recorded.out.log", g_logs / L"plan-recorded.out.log", fs::copy_options::overwrite_existing, e);
 		} else {
 			fs::remove_all(resume_dir, e);
 			fs::create_directories(resume_dir, e);
 		}
+		// (Noted before planning: an interrupted plan keeps its key, so the run after it does not start over.)
+		if (!resumed_plan) std::ofstream(resume_dir / L"key.txt", std::ios::binary) << resume_key << "|planning";
 	}
 	const fs::path plan_logs = resumed_plan ? resume_dir : g_logs;
 	const fs::path plan = resume_dir / L"plan.bin";
@@ -508,7 +534,19 @@ void Work() {
 	// misses ("not among the precompiled") were native and table variants while every shard of its precompile saved all it
 	// planned (shards "N created from the store, 0 captured, 0 left out"): what the store lacks the plan never named. Same
 	// flag in the plan and in every shard (a shard makes what the plan gives it).
-	if (has_recorded && !plan_step("plan-recorded", L"--seeds " + Quote(recorded) + L" --dry-run --plan " + Quote(plan) + variants)) use_plan = false;
+	if (recorded_planned) {
+		std::printf("[port] precompile: the recorded play's plan of the interrupted run kept\n");
+		std::fflush(stdout);
+	} else if (has_recorded) {
+		if (!plan_step("plan-recorded", L"--seeds " + Quote(recorded) + L" --dry-run --plan " + Quote(plan) + variants)) {
+			use_plan = false;
+		} else {
+			std::error_code e;
+			fs::copy_file(plan, resume_dir / L"plan-recorded.bin", fs::copy_options::overwrite_existing, e);
+			if (fs::exists(g_logs / L"plan-recorded.out.log", e))
+				fs::copy_file(g_logs / L"plan-recorded.out.log", resume_dir / L"plan-recorded.out.log", fs::copy_options::overwrite_existing, e);
+		}
+	}
 	if (use_plan) {
 		std::wstring args = L"--seeds " + Quote(seeds) + L" --dry-run --plan " + Quote(plan) + L" --static-inputs" + variants;
 		if (has_recorded) args += L" --covered-by " + Quote(recorded);
@@ -581,7 +619,11 @@ void Work() {
 	const bool resumed   = done > 0;
 	const int  resumed_p = total > 0 ? done * 100 / total : 0;
 	std::ofstream done_log(resume_dir / L"done.txt", std::ios::binary | std::ios::app);
-	if (resumed) std::printf("[port] precompile: %d of %d shards done before: going on at %d %%\n", done, total, resumed_p);
+	if (resumed) {
+		std::printf("[port] precompile: %d of %d shards done before: going on at %d %%\n", done, total, resumed_p);
+		std::fflush(stdout);
+		SetText("Preparando shaders: continuando (" + std::to_string(resumed_p) + " % ya hecho)..."); // (ds-pc-port51)
+	}
 	{
 		std::scoped_lock lock(g_mutex);
 		g_view.total       = total;
