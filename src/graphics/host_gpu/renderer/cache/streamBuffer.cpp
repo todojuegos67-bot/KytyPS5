@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/vramStats.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include "common/alignment.h"
@@ -86,6 +87,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
+	m_stat_bytes = allocation_result.size;
+	VramStats::Add(static_cast<VramStats::Category>(VramStats::BufDeviceLocal + static_cast<int>(usage)), m_stat_bytes);
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
@@ -104,6 +107,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
+		VramStats::Remove(static_cast<VramStats::Category>(VramStats::BufDeviceLocal + static_cast<int>(m_usage)),
+		                  m_stat_bytes);
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

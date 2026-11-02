@@ -18,6 +18,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <chrono>
+#include <atomic>
 #include <array>
 #include <bit>
 #include <cinttypes>
@@ -1904,6 +1907,26 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	m_graphics.ReportVram();
+	{
+		static std::atomic<int64_t> next {0};
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch()).count();
+		auto due = next.load(std::memory_order_relaxed);
+		if (now >= due && next.compare_exchange_strong(due, now + 5000)) {
+			size_t images = 0, gpu_modified = 0;
+			m_slot_images.ForEach([&](ImageId, const Image& image) {
+				++images;
+				if (image.IsGpuModified()) ++gpu_modified;
+			});
+			std::printf("TextureCache (5 s): %zu images (%zu GPU-modified), used %.0f MiB, GC trigger %.0f / "
+			            "pressure %.0f / critical %.0f MiB, tick %llu\n",
+			            images, gpu_modified, m_total_used_memory / 1048576.0, m_trigger_gc_memory / 1048576.0,
+			            m_pressure_gc_memory / 1048576.0, m_critical_gc_memory / 1048576.0,
+			            static_cast<unsigned long long>(tick));
+			std::fflush(stdout);
+		}
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

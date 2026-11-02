@@ -92,6 +92,7 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
+	uint64_t                      m_stat_bytes = 0; // VramStats accounting
 };
 
 class StreamBuffer final: public Buffer {

@@ -21,8 +21,14 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include "graphics/host_gpu/vramStats.h"
+
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <string>
+
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -77,6 +83,40 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+}
+
+// VRAM (5 s): driver heap usage/budget plus what the emulator holds per category, so a leak or
+// over-allocation shows which cache grows. Called from the texture cache GC (Thread_Gpu).
+void GraphicContext::ReportVram() const {
+	if (allocator == nullptr) return;
+	static std::atomic<int64_t> next {0};
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch()).count();
+	auto due = next.load(std::memory_order_relaxed);
+	if (now < due || !next.compare_exchange_strong(due, now + 5000)) return;
+	constexpr double MiB = 1024.0 * 1024.0;
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	std::string line = "VRAM (5 s):";
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool local = static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
+		                                     vk::MemoryHeapFlagBits::eDeviceLocal);
+		line += fmt::format(" heap{}{} {:.0f}/{:.0f} MiB (vma {:.0f} MiB in {} allocs)", heap, local ? "[vram]" : "",
+		                    budgets[heap].usage / MiB, budgets[heap].budget / MiB,
+		                    budgets[heap].statistics.allocationBytes / MiB,
+		                    budgets[heap].statistics.allocationCount);
+	}
+	line += " |";
+	for (int c = 0; c < VramStats::Count; c++) {
+		line += fmt::format(" {} {:.0f} MiB/{}", VramStats::kNames[c],
+		                    VramStats::g_bytes[c].load(std::memory_order_relaxed) / MiB,
+		                    VramStats::g_count[c].load(std::memory_order_relaxed));
+	}
+	line += fmt::format(" | images placed outside VRAM so far {}{}",
+	                    VramStats::g_images_outside_vram.load(std::memory_order_relaxed),
+	                    memory_budget_ext_enabled ? "" : " (no VK_EXT_memory_budget: usage is VMA's own)");
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
@@ -181,6 +221,12 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	if (result != vk::Result::eSuccess) {
 		return false;
 	}
+	{
+		VmaAllocationInfo info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &info);
+		VramStats::Add(VramStats::Images, info.size);
+		if (alloc_info.requiredFlags == 0) VramStats::g_images_outside_vram.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -200,6 +246,11 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	{
+		VmaAllocationInfo info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &info);
+		VramStats::Remove(VramStats::Images, info.size);
+	}
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;
