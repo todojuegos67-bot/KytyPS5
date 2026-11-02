@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 // KYTY_READBACK_QUEUE: guest readback copies of GPU data that is already written run on a
 // transfer-only queue (the copy engine). A copy waits on the graphics timeline only for the
 // last GPU write of the bytes it reads, instead of queueing behind everything submitted to the
@@ -100,23 +101,31 @@ public:
 		SubmitPacket submit;
 		VkBuffer     destination;
 		uint32_t     count;
+		int64_t      queued_ns; // ([fps+] rb_worker_queue_us: how long it waited for the worker)
 	};
 	static void ReplayCopy(std::span<const LocalVulkanRecording::Segment> segments,
 	                       const vk::detail::DispatchLoaderDynamic&      dispatch) {
 		const auto& copy = *static_cast<const CopyPacket*>(segments[0].data);
+		{
+			const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			if (now > copy.queued_ns) LiveCounters::Add(LiveCounters::RbWorkerQueueUs, static_cast<uint64_t>((now - copy.queued_ns) / 1000));
+			LiveCounters::Add(LiveCounters::RbWorkerCopies);
+		}
 		Record(dispatch, copy.submit.command, {static_cast<const Region*>(segments[1].data), copy.count}, copy.destination);
 		Submit(copy.submit, dispatch);
 	}
 #endif
 
-	explicit Queue(Libs::Graphics::GraphicContext& graphics)
+	// direct (KYTY_READBACK_FAST): the readback family's second queue, recorded and submitted by the GPU thread itself.
+	explicit Queue(Libs::Graphics::GraphicContext& graphics, bool direct = false)
 	    :
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	      d(LocalVulkanRecording::DirectDispatch()),
 #else
 	      d(VULKAN_HPP_DEFAULT_DISPATCHER),
 #endif
-	      m_device(graphics.device), m_queue(graphics.readback_queue) {
+	      m_device(graphics.device), m_queue(direct ? static_cast<VkQueue>(graphics.readback_fast_queue) : static_cast<VkQueue>(graphics.readback_queue)),
+	      m_direct(direct) {
 		VkCommandPoolCreateInfo pool {};
 		pool.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 		pool.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
@@ -158,8 +167,9 @@ public:
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// With deferred submits the worker records the command buffer too: the driver calls leave the GPU thread
 		// (~1.3% of it at 1-1, ~50 readbacks a frame).
-		if (LocalVulkanRecording::DeferredSubmitEnabled() && regions.size() <= MaxDeferredRegions) {
-			const CopyPacket copy {packet, destination, static_cast<uint32_t>(regions.size())};
+		if (!m_direct && LocalVulkanRecording::DeferredSubmitEnabled() && regions.size() <= MaxDeferredRegions) {
+			const CopyPacket copy {packet, destination, static_cast<uint32_t>(regions.size()),
+			                       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()};
 			const LocalVulkanRecording::Segment segments[] {{&copy, sizeof(copy)},
 			                                                {regions.data(), regions.size_bytes()}};
 			if (LocalVulkanRecording::EnqueueDeferred(ReplayCopy, segments, true)) {
@@ -171,6 +181,11 @@ public:
 		if (std::exchange(m_worker_records, false)) LocalVulkanRecording::Drain();
 #endif
 		Record(d, command, regions, destination);
+		// (KYTY_READBACK_FAST: this queue is the GPU thread's alone and its wait is already reached: submitted now.)
+		if (m_direct) {
+			Submit(packet, d);
+			return value;
+		}
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		const LocalVulkanRecording::Segment segments[] {{&packet, sizeof(packet)}};
 		if (LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) return value;
@@ -247,6 +262,7 @@ private:
 	std::array<std::pair<VkSemaphore, uint64_t>, Buffers> m_waits {}; // each copy's graphics timeline wait (stall reports)
 	uint64_t                                 m_submitted = 0;
 	bool                                     m_worker_records = false; // the worker may record into the pool
+	bool                                     m_direct = false;
 	std::atomic<uint64_t>                    m_known {0};
 };
 

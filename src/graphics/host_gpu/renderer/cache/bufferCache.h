@@ -523,6 +523,10 @@ private:
 
 	// Last member: destroyed (queue idle) before the buffers its copies use.
 	std::unique_ptr<ReadbackQueue::Queue> m_readback_queue;
+	// KYTY_READBACK_FAST: the second copy queue (values tagged FastValue), and a wait on either queue's value.
+	std::unique_ptr<ReadbackQueue::Queue> m_readback_fast;
+	static constexpr uint64_t             FastValue = uint64_t {1} << 62u;
+	void                                  WaitReadbackValue(uint64_t value);
 };
 
 } // namespace Libs::Graphics

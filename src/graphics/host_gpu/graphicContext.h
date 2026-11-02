@@ -87,6 +87,8 @@ struct GraphicContext {
 	// copies (src/local/readback-queue.h); buffers are then shared with its family.
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
 	vk::Queue                          readback_queue  = nullptr;
+	// KYTY_READBACK_FAST=1: a second queue of the readback family, the GPU thread's own (nullptr: none).
+	vk::Queue                          readback_fast_queue = nullptr;
 	// Windows: a second queue of the graphics family used only for vkQueuePresentKHR. The
 	// driver can block a present in the kernel until earlier GPU work on its queue is done;
 	// on the graphics queue that held queue_mutex against the very submissions that work

@@ -382,7 +382,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		    MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, Capacity);
 	// A detached copy-engine request may still write this slot.
 	if (m_download_queue_values[slot] != 0) {
-		m_readback_queue->Wait(m_download_queue_values[slot]);
+		WaitReadbackValue(m_download_queue_values[slot]);
 		m_download_queue_values[slot] = 0;
 	}
 	auto request = std::make_shared<GuestReadback>();
@@ -395,6 +395,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// KYTY_READBACK_QUEUE: bytes whose writers the GPU finished (or, mode 2, has been handed)
 	// need not wait behind the rest of the graphics queue.
 	// ([fps+] rb_prod_*: where the bytes' last GPU writer is when the guest asks for them.)
+	bool producer_done = false;
 	if (m_gpu_writes_on) {
 		auto& master_now = m_scheduler.GetMasterSemaphore();
 		master_now.Refresh();
@@ -404,6 +405,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		for (const auto& [run_begin, run_end]: runs) producer = std::max(producer, InflightWriteTick(run_begin, run_end, done_now, true));
 		LiveCounters::Add(LiveCounters::RbBacklogTicks, current > done_now ? current - done_now : 0);
 		if (producer == 0) {
+			producer_done = done_now >= m_gpu_writes_from && m_gpu_writes_from != UINT64_MAX;
 			LiveCounters::Add(LiveCounters::RbProdDone);
 		} else if (producer >= current) {
 			LiveCounters::Add(LiveCounters::RbProdOpen);
@@ -424,9 +426,27 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		for (const auto& envelope: envelopes)
 			regions.push_back({buffer.Handle(), {envelope.source, envelope.cursor, envelope.size}});
 		request->parts = std::move(parts);
-		request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
-		                                              m_scheduler.GetMasterSemaphore().HandleOf(request->producer_tick),
-		                                              request->producer_tick);
+		// KYTY_READBACK_FAST: the bytes' writers and the slot's last graphics copy all complete (the graphics timeline
+		// past them): the copy goes to the second copy queue at once instead of behind the recording worker. It still
+		// waits on that timeline value (reached: no stall), for the memory dependency on the writes.
+		static const bool fast_on = [] {
+			const char* v = std::getenv("KYTY_READBACK_FAST");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (fast_on && !m_readback_fast && m_graphics.readback_fast_queue)
+			m_readback_fast = std::make_unique<ReadbackQueue::Queue>(m_graphics, true);
+		auto& master_fast = m_scheduler.GetMasterSemaphore();
+		if (fast_on && m_readback_fast && producer_done && kyty_local_readback_queue_mode.load(std::memory_order_relaxed) != 3 &&
+		    master_fast.KnownGpuTick() >= request->producer_tick) {
+			request->queue_value = FastValue | m_readback_fast->Copy(regions, download->Handle(),
+			                                                         master_fast.HandleOf(request->producer_tick),
+			                                                         request->producer_tick);
+			LiveCounters::Add(LiveCounters::RbFastCopies);
+		} else {
+			request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
+			                                              m_scheduler.GetMasterSemaphore().HandleOf(request->producer_tick),
+			                                              request->producer_tick);
+		}
 		LiveTrace::Event(LiveTrace::RbFast, begin, (end - begin) | request->producer_tick << 32u);
 		m_download_queue_values[slot] = request->queue_value;
 		request->tick                 = m_scheduler.CurrentTick();
@@ -713,6 +733,14 @@ void BufferCache::VerifyReadback(uint64_t address, const uint8_t* fast, const ui
 	}
 }
 
+void BufferCache::WaitReadbackValue(uint64_t value) {
+	if ((value & FastValue) != 0) {
+		if (m_readback_fast) m_readback_fast->Wait(value & ~FastValue);
+		return;
+	}
+	m_readback_queue->Wait(value);
+}
+
 // The calling thread's GPU wait in CopyGuestReadback ([fps+] rf_gpuwait_ns).
 static thread_local uint64_t t_readback_wait_ns = 0;
 
@@ -726,7 +754,7 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 	}
 	const auto wait_start = std::chrono::steady_clock::now();
 	if (request->queue_value != 0) {
-		m_readback_queue->Wait(request->queue_value);
+		WaitReadbackValue(request->queue_value);
 		m_scheduler.WaitPriorityOperations(request->producer_tick);
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(request->tick);
@@ -1152,10 +1180,12 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	// passes (it waits on that timeline only for the bytes' last writer). Freed then, its memory was
 	// in use again on GPUs short of VRAM (frequent GC): VK_ERROR_DEVICE_LOST.
 	const uint64_t readback = m_readback_queue ? m_readback_queue->Submitted() : 0;
+	const uint64_t readback_fast = m_readback_fast ? m_readback_fast->Submitted() : 0;
 	// (A speculation's packet may still read it: Spec::PacketNow.)
 	const auto     packet   = Spec::PacketNow();
-	const auto     erase    = [this, id, readback, packet] {
+	const auto     erase    = [this, id, readback, readback_fast, packet] {
 		if (readback != 0 && m_readback_queue) m_readback_queue->Wait(readback);
+		if (readback_fast != 0 && m_readback_fast) m_readback_fast->Wait(readback_fast);
 		m_retired.emplace_back(id, packet);
 		EraseRetired();
 	};
@@ -1584,6 +1614,7 @@ BufferCache::~BufferCache() {
 	LiveCounters::g_sync_report = nullptr;
 	g_sync_cache                = nullptr;
 	DrainGuestReadback();
+	m_readback_fast.reset();
 	m_readback_queue.reset();
     m_graphics.device.destroyPipeline(m_lod_pack_pipeline, nullptr);
     m_graphics.device.destroyPipelineLayout(m_lod_pack_layout, nullptr);

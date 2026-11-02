@@ -71,6 +71,9 @@
 #define KYTY_ENABLE_DEBUG_PRINTF
 #define KYTY_DBG_INPUT
 
+// KYTY_READBACK_FAST: the readback family's second queue index (0: none).
+static uint32_t g_readback_fast_index = 0;
+
 namespace Libs::Graphics {
 
 struct VulkanExtensions {
@@ -674,6 +677,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
 	const float               queue_priorities[3] = {1.0f, 1.0f, 1.0f};
+	g_readback_fast_index                         = 0;
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.sType            = vk::StructureType::eDeviceQueueCreateInfo;
 	queue_create_info.queueFamilyIndex = queue_family;
@@ -720,6 +724,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 				queue_create_infos[1].queueFamilyIndex           = family;
 				queue_create_count                               = 2;
 				LOGF("\treadback queue family %u\n", family);
+				// KYTY_READBACK_FAST=1: a second queue of the family for copies whose bytes the GPU finished writing.
+				if (const char* fast = std::getenv("KYTY_READBACK_FAST"); fast != nullptr && fast[0] == '1') {
+					if (families[family].queueCount >= 2) {
+						queue_create_infos[1].queueCount = 2;
+						g_readback_fast_index            = 1;
+					} else {
+						std::printf("Readbacks: the copy family %u has 1 queue: KYTY_READBACK_FAST off\n", family);
+					}
+				}
 				break;
 			}
 		}
@@ -1691,6 +1704,14 @@ void WindowContext::CreateVulkan() {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
 		EXIT_IF(graphic_ctx.readback_queue == nullptr);
 		DeviceFault::NoteQueue(graphic_ctx.readback_queue, "readback");
+		if (g_readback_fast_index != 0) {
+			graphic_ctx.device.getQueue(graphic_ctx.readback_family, g_readback_fast_index, &graphic_ctx.readback_fast_queue);
+			if (graphic_ctx.readback_fast_queue != nullptr) {
+				DeviceFault::NoteQueue(graphic_ctx.readback_fast_queue, "readback-fast");
+				std::printf("Readbacks: copies of finished GPU writes go straight to queue %u of family %u (KYTY_READBACK_FAST=1)\n",
+				            g_readback_fast_index, graphic_ctx.readback_family);
+			}
+		}
 	}
 	Libs::Graphics::Fsr3::OnDevice(graphic_ctx, g_fsr3_plan);
 	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
@@ -1847,6 +1868,9 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1))
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+	graphic_ctx.readback_fast_queue = nullptr;
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1) && g_readback_fast_index != 0)
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, g_readback_fast_index, &graphic_ctx.readback_fast_queue);
 	return graphic_ctx.queue != nullptr && graphic_ctx.CreateAllocator();
 }
 
@@ -1882,6 +1906,7 @@ WindowContext::~WindowContext() {
 		graphic_ctx.device         = nullptr;
 		graphic_ctx.queue          = nullptr;
 		graphic_ctx.readback_queue = nullptr;
+		graphic_ctx.readback_fast_queue = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
