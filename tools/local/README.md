@@ -12,6 +12,9 @@ Building, running and the developer's workflow are in [docs/CURRENT-PLAYABLE.md]
   `windows/ab-spot.ps1`: a same-process ABBA of a runtime switch; `windows/ab-exe.ps1`: an ABBA of two builds.
 - `windows/prof-spot.ps1` and `windows/profreport.cpp`: render-thread profiles; `prof-callees.py`,
   `prof-dll-callers.py`, `prof-hot-lines.py`, `prof-inline.py`, `prof-slices.py`, `guest-prof.py`: their views.
+- Flicker: the live `screenshots <path> <count>` command takes the next frames small into one file; `flicker.py`
+  scores each against the median of its neighbours and names the wrong ones (a frame with objects missing differs
+  from both neighbours, motion only a little), with a strip of the worst beside a neighbour (numpy; PIL for the strip).
 - Live captures: `live-trace.py`, `live-trace-report.py`, `walk-report.py`, `render-faults.py` (`trace`),
   `live-census-report.py`, `census-compare.py` (`census`), `persec-report.py`, `ab-counters.py`
   (measures and counters), `frame-capture-report.py` (`capture`), `slow-timeline.py` (`KYTY_SLOW_LOG_MS`).
