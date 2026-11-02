@@ -1,5 +1,27 @@
 ## New in this build
 
+Your precompiled shaders stay valid: the shaders are the same as in v20261101.
+
+- **AMD FSR 4 on Radeon cards** (#62): with AMD's FSR SDK 2.4 DLLs next to the emulator (`amd_fidelityfx_loader_vk.dll`,
+  `amd_fidelityfx_upscaler_vk.dll` and `amd_fidelityfx_framegeneration_vk.dll` from `Kits\FidelityFX\signedbin` of the
+  v2.4.0 package; the README says where to get it), the FSR upscaler becomes FSR 4 on Radeon RX 7000 and 9000 cards (RX
+  6000 too), and FSR frame generation FSR 4 on RX 9000 cards. Other cards get FSR 3.1 from the same DLLs. Without them
+  FSR 3 stays built in, and the older `amd_fidelityfx_vk.dll` still works. The log names what AMD's runtime chose
+  ("Super resolution: AMD FSR 4.1.2 ..."). FSR 4 is new here and not yet tested on a Radeon: reports are welcome.
+- **Linux: Korean, Japanese and Chinese text in the emulator's save and message dialogs** (#264): the dialogs found no
+  CJK font there and showed "???"; they now ask fontconfig for one (Noto Sans CJK and the like). On Windows, Korean
+  text is drawn with Malgun Gothic.
+- **The on-screen keyboard's text grows with the screen** (#265): it stayed at 13 pixels at any size, tiny on a 4K TV;
+  now 20 pixels at 1080p and twice that at 4K, with the buttons sized to their labels.
+- **"Skip the start-up logos" removed again** (#266): a player with it on crashed twice after about 50 minutes of play,
+  and played over two hours without it. Until the reason is known, the launchers no longer offer it (`-Set
+  KYTY_SKIP_LOGOS=1` still turns it on, at your own risk). If you turned it on in v20261101, it is off now.
+- **Tip: a 40 fps cap** (#267): on a 120 Hz or VRR display, the 120 fps option plus `-Set KYTY_FLIP_RATE=2` in the
+  command-line options flips the game's 3D frames on every third refresh (40 fps), at the game's normal speed.
+- **Thanks** to @kocher, @dreamerk24m, @ns6000, @HybOj, @HemeSynth and @davide20204 for their reports and tests.
+
+## New in v20261101
+
 Your precompiled shaders stay valid: the shaders are the same as in v20261031. The precompile has more shaders to
 offer (last item): the launcher asks you to precompile again, and that run compiles only the new ones.
 
@@ -29,42 +51,28 @@ offer (last item): the launcher asks you to precompile again, and that run compi
 - **Thanks** to @ponhei9502 for PR #257, to @2000Arsen for the shader list, and to @HybOj, @forensicssix-debug, @ft1704,
   @jrodriguezml, @tao755-maker and @javsp for their reports and tests.
 
-## New in v20261031
-
-Your precompiled shaders stay valid: the shaders are the same as in v20261030.
-
-- **21:9 and 32:9: movies and menus at 16:9 between black bars** (#250): a new option on the launcher's Display page,
-  "Movies and menus at 16:9 (black bars)". With 21:9 or 32:9 the intro, the movies, the title screen, the loading
-  screens and the menus opened in play stay at 16:9 in the middle, with black bars at the sides, instead of being
-  stretched to the width. It works with DLSS or FSR 3 and with the game's own anti-aliasing alike; the 3D view stays
-  wide.
-- **21:9 and 32:9 with FSR 3 frame generation** (#250): the HUD no longer leaves a ghost while you move, and the start-up
-  logos are no longer cut off at the right.
-- **Frame generation with "Direct presentation" on** (#236): the game ran at half the display's rate (30 fps on an RTX
-  4090 at 120 Hz with FSR 3 frame generation), and each frame waited a frame longer to be shown. That Experimental
-  switch is now ignored while frame generation is on.
-- **AMD: smoother menus with FSR 3 frame generation and low latency** (#252): AMD Anti-Lag stays off while frame
-  generation is on. With both, an RX 6650 XT's menus and shops dropped to 5-6 fps.
-- **Fewer exits when video memory runs out** (#252): when the graphics card has no room for an image the game needs (an
-  8 GB card with frame generation at 3840x1200), the emulator now also frees old render targets, saving their contents
-  first, and tries again for up to 10 seconds before it gives up.
-- **Intel Arc: no more full freezes** (#255): an Arc B580 froze completely after a while in 1-2 and 3-1. The data the
-  emulator reads back from the graphics card is now copied on its main queue (`-Set KYTY_READBACK_QUEUE=1` goes back to
-  the copy queue).
-- **Xbox and other non-PlayStation pads** (#236): running no longer breaks off: the stick counts as fully pushed from 90%
-  of its travel (`-Set KYTY_PAD_DEADZONE_OUTER=<percent>`). The long rumble at the title screen, at Continue and at each
-  spawn now fades out in about half a second, while hits still rumble fully (`-Set KYTY_PAD_RUMBLE_SUSTAIN_MS=<ms>`, 0
-  as before). The Steam Deck's rumble too.
-- **Button presses timed in the log** (#236): every 30 seconds with presses, an `Input:` line says how long a press
-  waited before the emulator took it and before the game read it, for reports of input lag.
-- **Launcher: more render heights for DLSS and FSR 3** (#129): Balanced at 4K (58%, 1256 lines) and Ultra Quality (77%:
-  1664 at 4K, 1104 at 1440p, 832 at 1080p).
-- **Linux: DualSense haptics over USB**, as an option (PR #254, credit @ponhei9502): `KYTY_DUALSENSE_HAPTICS=1` plays
-  the game's haptics on the pad's actuators (off by default).
-- **Thanks** to @ponhei9502 for PR #254, and to @H0A0M0mer, @Ayonily, @labs20, @STALKERSK, @thxnk420, @markusdev and
-  @2mg for their reports and tests.
-
 ## 本版本的变化
+
+已有的预编译着色器继续有效：着色器与 v20261101 相同。
+
+- **Radeon 显卡上的 AMD FSR 4**（#62）：把 AMD FSR SDK 2.4 的 DLL（v2.4.0 包中 `Kits\FidelityFX\signedbin` 下的
+  `amd_fidelityfx_loader_vk.dll`、`amd_fidelityfx_upscaler_vk.dll` 和 `amd_fidelityfx_framegeneration_vk.dll`；说明文档写了
+  在哪里下载）放到模拟器旁后，FSR 超分在 Radeon RX 7000 和 9000 显卡（以及 RX 6000）上变为 FSR 4，FSR 插帧在 RX 9000 显卡
+  上变为 FSR 4；其他显卡由同一组 DLL 提供 FSR 3.1。没有这些 DLL 时仍使用内置的 FSR 3，旧的 `amd_fidelityfx_vk.dll` 也照常
+  可用。日志会写出 AMD 运行库选择的版本（"Super resolution: AMD FSR 4.1.2 ..."）。FSR 4 是新加入的，还没有在 Radeon 上测试
+  过，欢迎反馈。
+- **Linux：模拟器的存档和消息对话框能显示韩文、日文和中文**（#264）：之前在 Linux 上找不到 CJK 字体，只显示"???"；现在
+  通过 fontconfig 查找（例如 Noto Sans CJK）。Windows 上韩文改用 Malgun Gothic 显示。
+- **屏幕键盘的文字随画面放大**（#265）：之前在任何分辨率下都是 13 像素，在 4K 电视上很小；现在 1080p 下为 20 像素，4K 下
+  为两倍，按钮也按文字大小调整。
+- **「跳过启动标志」再次移除**（#266）：有玩家开启后两次在玩了约 50 分钟时崩溃，关闭后玩了两个多小时都没有问题。原因查明
+  之前，启动器不再提供这个开关（仍可用 `-Set KYTY_SKIP_LOGOS=1` 自行开启，风险自负）。如果你在 v20261101 中开启过，现在
+  已自动关闭。
+- **小提示：40 帧上限**（#267）：在 120 Hz 或 VRR 显示器上，开启 120 帧选项并在命令行参数中加入 `-Set KYTY_FLIP_RATE=2`，
+  游戏的 3D 画面每三次刷新翻转一次（40 帧），游戏速度正常。
+- **感谢** @kocher、@dreamerk24m、@ns6000、@HybOj、@HemeSynth 和 @davide20204 的反馈与测试。
+
+## v20261101 的变化
 
 已有的预编译着色器继续有效：着色器与 v20261031 相同。预编译可以多编译一些着色器（见最后一项）：启动器会提示再预编译一次，
 这次只编译新增的部分。
@@ -88,30 +96,3 @@ Your precompiled shaders stay valid: the shaders are the same as in v20261030.
   管线，这些设置下首次出现的卡顿更少。
 - **感谢** @ponhei9502 的 PR #257、@2000Arsen 提供的着色器列表，以及 @HybOj、@forensicssix-debug、@ft1704、@jrodriguezml、
   @tao755-maker 和 @javsp 的反馈与测试。
-
-## v20261031 的变化
-
-已有的预编译着色器继续有效：着色器与 v20261030 相同。
-
-- **21:9 和 32:9：过场动画与菜单保持 16:9（黑边）**（#250）：启动器「画面」页新增选项「过场动画与菜单保持 16:9（黑边）」。
-  选 21:9 或 32:9 时，片头、过场动画、标题画面、加载画面以及游戏中打开的菜单都保持 16:9 居中，两侧为黑边，不再拉伸到整个
-  宽度。使用 DLSS、FSR 3 或游戏自带的抗锯齿时都有效；3D 画面仍是宽屏。
-- **21:9 和 32:9 + FSR 3 插帧**（#250）：移动时 HUD 不再留下残影，启动时的标志动画右侧也不再被裁掉。
-- **插帧 + 开启「直接呈现」**（#236）：游戏只能跑到显示器刷新率的一半（RTX 4090、120 Hz、FSR 3 插帧时为 30 fps），每一帧也要多等
-  一帧才显示。现在开启插帧时会忽略这个「实验性」开关。
-- **AMD：FSR 3 插帧 + 低延迟时菜单更流畅**（#252）：开启插帧时 AMD Anti-Lag 保持关闭。两者同时开启时，RX 6650 XT 在菜单和商店
-  里会掉到 5-6 fps。
-- **显存不足时更少退出**（#252）：显卡放不下游戏需要的图像时（例如 8 GB 显卡在 3840x1200 下开启插帧），模拟器现在还会释放旧的
-  渲染目标（先保存其内容），并在放弃之前最多重试 10 秒。
-- **Intel Arc：不再整个卡死**（#255）：Arc B580 在 1-2 和 3-1 玩一段时间后会完全卡死。模拟器从显卡读回的数据现在在主队列上复制
-  （`-Set KYTY_READBACK_QUEUE=1` 恢复为复制队列）。
-- **Xbox 等非 PlayStation 手柄**（#236）：跑步不再中断：摇杆推到 90% 即视为推满（`-Set KYTY_PAD_DEADZONE_OUTER=<百分比>`）。
-  标题画面、「继续」和每次复活时的长时间震动现在约半秒内渐弱，受击等仍会完整震动（`-Set KYTY_PAD_RUMBLE_SUSTAIN_MS=<毫秒>`，
-  0 恢复原样）。Steam Deck 的震动也一样。
-- **日志记录按键耗时**（#236）：有按键时每 30 秒一行 `Input:`，写出按键等了多久才被模拟器接收、又过了多久被游戏读取，便于反馈
-  输入延迟。
-- **启动器：DLSS 和 FSR 3 增加渲染高度**（#129）：4K 下的「平衡」（58%，1256 行）和「超级质量」（77%：4K 为 1664，1440p 为
-  1104，1080p 为 832）。
-- **Linux：DualSense 通过 USB 的触觉反馈**（可选，PR #254，感谢 @ponhei9502）：`KYTY_DUALSENSE_HAPTICS=1` 让游戏的触觉效果在
-  手柄的触觉马达上播放（默认关闭）。
-- **感谢** @ponhei9502 的 PR #254，以及 @H0A0M0mer、@Ayonily、@labs20、@STALKERSK、@thxnk420、@markusdev 和 @2mg 的反馈与测试。
