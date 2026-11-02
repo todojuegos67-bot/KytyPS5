@@ -18,6 +18,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <cstdio>
 #include <chrono>
 #include <atomic>
@@ -1908,7 +1909,6 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	m_graphics.ReportVram();
 	{
 		static std::atomic<int64_t> next {0};
 		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1920,14 +1920,11 @@ void TextureCache::RunGarbageCollector() {
 				++images;
 				if (image.IsGpuModified()) ++gpu_modified;
 			});
-			std::printf("TextureCache (5 s): %zu images (%zu GPU-modified), used %.0f MiB, GC trigger %.0f / "
-			            "pressure %.0f / critical %.0f MiB, tick %llu, evicted %llu, last pass skipped %zu "
-			            "unevictable old images\n",
-			            images, gpu_modified, m_total_used_memory / 1048576.0, m_trigger_gc_memory / 1048576.0,
-			            m_pressure_gc_memory / 1048576.0, m_critical_gc_memory / 1048576.0,
-			            static_cast<unsigned long long>(tick),
-			            static_cast<unsigned long long>(std::exchange(m_gc_evicted, 0)), m_gc_passed_over);
-			std::fflush(stdout);
+			m_graphics.ReportVram(fmt::format(
+			    "textures {} ({} GPU-modified), evicted {}, skipped {} unevictable, GC at {:.1f}/{:.1f}/{:.1f} GiB",
+			    images, gpu_modified, std::exchange(m_gc_evicted, 0), m_gc_passed_over,
+			    m_trigger_gc_memory / 1073741824.0, m_pressure_gc_memory / 1073741824.0,
+			    m_critical_gc_memory / 1073741824.0));
 		}
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
@@ -1994,8 +1991,10 @@ void TextureCache::RunGarbageCollector() {
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	// Budget guard: near the VRAM limit, keep collecting (bounded) instead of one pass per frame.
+	for (int pass = 0; pass < 4 && m_total_used_memory >= m_critical_gc_memory; ++pass) {
 		collect(true);
+		if (m_graphics.CanReportMemoryUsage()) m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 }
 

@@ -87,13 +87,8 @@ void GraphicContext::LogMemoryBudget() const {
 
 // VRAM (5 s): driver heap usage/budget plus what the emulator holds per category, so a leak or
 // over-allocation shows which cache grows. Called from the texture cache GC (Thread_Gpu).
-void GraphicContext::ReportVram() const {
+void GraphicContext::ReportVram(std::string_view extra) const {
 	if (allocator == nullptr) return;
-	static std::atomic<int64_t> next {0};
-	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-	                     std::chrono::steady_clock::now().time_since_epoch()).count();
-	auto due = next.load(std::memory_order_relaxed);
-	if (now < due || !next.compare_exchange_strong(due, now + 5000)) return;
 	constexpr double MiB = 1024.0 * 1024.0;
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
@@ -114,7 +109,7 @@ void GraphicContext::ReportVram() const {
 		                    VramStats::g_created[c].exchange(0, std::memory_order_relaxed),
 		                    VramStats::g_destroyed[c].exchange(0, std::memory_order_relaxed));
 	}
-	line += fmt::format(" | images placed outside VRAM so far {}{}",
+	line += fmt::format(" | {} | images outside VRAM so far {}{}", extra,
 	                    VramStats::g_images_outside_vram.load(std::memory_order_relaxed),
 	                    memory_budget_ext_enabled ? "" : " (no VK_EXT_memory_budget: usage is VMA's own)");
 	std::printf("%s\n", line.c_str());

@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 
+#include <string_view>
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
@@ -97,7 +98,7 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
-	void               ReportVram() const;
+	void               ReportVram(std::string_view extra) const; // one "VRAM (5 s):" line
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
