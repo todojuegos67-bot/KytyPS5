@@ -517,6 +517,7 @@ function Write-SharpLive { try { [IO.File]::WriteAllText($script:sharpFile, "BB_
 function Get-FgEnv {
 	$e = [ordered]@{}
 	$fg = Get-FgKey; $e['BB_FG'] = $fg
+	$e['BB_SCENE_UPSCALE'] = $(if (Get-SceneUp) { '1' } else { '0' })  # (bb-fg-022) aqui: el arranque del emulador de reescalado solo pasa Get-FgEnv
 	$dl = ($fg -like 'dlss*')
 	$al = 0; [void][int]::TryParse("$($script:S.antilag)", [ref]$al); $rx = 0; [void][int]::TryParse("$($script:S.reflex)", [ref]$rx)
 	$e['BB_ANTILAG'] = $(if (-not $dl -and $al -gt 0) { '1' } else { '0' })
@@ -532,7 +533,6 @@ function Get-SceneUp {
 }
 function Get-BbEnv {
 	$e = [ordered]@{}
-	$e['BB_SCENE_UPSCALE'] = $(if (Get-SceneUp) { '1' } else { '0' })
 	$up = $script:upscalers[[math]::Min([int]$script:S.upscaler, $script:upscalers.Count - 1)]
 	$e['BB_UPSCALER'] = $up[1]
 	$e['BB_UPSCALE_MODE'] = $(if ($up.Count -gt 3) { $up[3] } else { $script:upModeKeys[[math]::Min([int]$script:S.upmode, 4)] })
