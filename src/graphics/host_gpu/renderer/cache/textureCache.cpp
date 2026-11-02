@@ -1933,8 +1933,13 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		// Under pressure the old rule asked for OLDER images (80/160 GC ticks) and freed at most
+		// 20/40 per frame: Yotei created ~300 images per second and 7,000 live images were all
+		// younger than 160 ticks, so nothing was evicted while VRAM went past 16 GB. Now pressure
+		// shortens the age and raises the count. Freeing an idle image is safe: CPU-side data is
+		// re-uploaded on next use, and GPU-written ones are downloaded first (or skipped).
+		const uint64_t age       = std::min<uint64_t>(aggressive ? 2 : pressured ? 8 : 16, tick);
+		size_t         deletions = aggressive ? 256 : pressured ? 64 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
