@@ -684,6 +684,8 @@ bool Streamline() {
 
 namespace {
 std::atomic<bool> g_ss_frozen{false};
+std::atomic<bool> g_ss_off{false}; // turned off at run time by the safety net
+u32 g_ss_frames = 0, g_ss_scene = 0, g_ss_good = 0, g_ss_windows = 0;
 std::array<VAddr, 16> g_ss_addrs{};
 u32 g_ss_count = 0;
 u32 g_ss_w = 0, g_ss_h = 0, g_ss_sw = 0, g_ss_sh = 0;
@@ -699,7 +701,8 @@ bool SceneScaleWanted() {
 } // namespace
 
 bool ScaleImage(VAddr addr, u32& w, u32& h) {
-    if (!g_ss_frozen.load(std::memory_order_acquire) || w != g_ss_w || h != g_ss_h) {
+    if (!g_ss_frozen.load(std::memory_order_acquire) || g_ss_off.load(std::memory_order_relaxed) ||
+        w != g_ss_w || h != g_ss_h) {
         return false;
     }
     for (u32 i = 0; i < g_ss_count; ++i) {
@@ -713,7 +716,7 @@ bool ScaleImage(VAddr addr, u32& w, u32& h) {
 }
 
 bool SceneScale(u32& guest_w, u32& guest_h, u32& host_w, u32& host_h) {
-    if (!g_ss_frozen.load(std::memory_order_acquire)) {
+    if (!g_ss_frozen.load(std::memory_order_acquire) || g_ss_off.load(std::memory_order_relaxed)) {
         return false;
     }
     guest_w = g_ss_w;
@@ -1872,6 +1875,34 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     g_flips[g_flip_index++ % g_flips.size()] = addr;
     g_output_w = width;
     g_output_h = height;
+    // Safety net: scene scaling must give a real upscale (composite injection, render size
+    // below the output) in most 3D frames, or it is turned off for the session and the scene
+    // targets go back to the full size (an unplayable image otherwise: white / a corner).
+    if (g_ss_frozen.load(std::memory_order_relaxed) && !g_ss_off.load(std::memory_order_relaxed)) {
+        ++g_ss_frames;
+        if (f.gb_depth != 0) ++g_ss_scene;
+        if (f.injected && !f.inject_failed && g_plan.output_w > g_plan.render_w) ++g_ss_good;
+        if (g_ss_frames >= 300) {
+            const bool first = g_ss_windows++ == 0;
+            const bool bad = first ? g_ss_good < 150
+                                   : g_ss_scene >= 150 && g_ss_good * 2 < g_ss_scene;
+            if (bad) {
+                g_ss_off.store(true, std::memory_order_relaxed);
+                Checkpoint(fmt::format(
+                    "WARNING: scene upscale turned OFF for this session (safety net): in {} frames "
+                    "{} had a 3D scene and only {} were upscaled from the scene size to the "
+                    "output; back to the normal path",
+                    g_ss_frames, g_ss_scene, g_ss_good));
+                LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] scene upscale turned off: {} of {} "
+                            "3D frames upscaled", g_ss_good, g_ss_scene);
+            } else if (first) {
+                Checkpoint(fmt::format("scene upscale check: {} of {} 3D frames upscaled "
+                                       "(scene size -> output) in the first {} frames: kept",
+                                       g_ss_good, g_ss_scene, g_ss_frames));
+            }
+            g_ss_frames = g_ss_scene = g_ss_good = 0;
+        }
+    }
     if (SceneScaleWanted() && !g_ss_frozen.load(std::memory_order_relaxed)) {
         const double ratio = SR::QualityRatio(Cfg().kind, Cfg().quality);
         if (Active() && ratio > 1.01 && f.gb_depth != 0 && f.scene_draws > 0 &&
