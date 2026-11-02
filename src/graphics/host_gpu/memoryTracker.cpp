@@ -121,6 +121,7 @@ bool MemoryTracker::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, 
 	if (manager->IsModified<DirtySource::Gpu>(begin - manager->GetCpuAddr(), size)) return false;
 	// The GPU ownership check and permission change share one region lock.
 	manager->ChangeState<DirtySource::Cpu, true>(begin, size);
+	if (HotPagesOn()) manager->NoteWindowFault(fault & ~(TRACKER_PAGE_SIZE - 1), TRACKER_PAGE_SIZE);
 	LiveCounters::Add(LiveCounters::WindowPages, size / TRACKER_PAGE_SIZE);
 	LiveCounters::AddGranule(begin, LiveCounters::GWindowPages, size / TRACKER_PAGE_SIZE);
 	return true;
