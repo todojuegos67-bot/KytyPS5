@@ -140,6 +140,8 @@ struct Context {
 	bool                                         started = false;
 	bool                                         stop    = false;
 	size_t                                       built   = 0;
+	size_t                                       resident = 0; // kept as VkPipeline objects
+	size_t                                       released = 0; // built into the driver cache, then destroyed
 	size_t                                       failed  = 0;
 	size_t                                       queued_c = 0;
 	size_t                                       queued_g = 0;
@@ -686,6 +688,35 @@ void Worker() {
 			std::fflush(stdout);
 		}
 		InflightMark('E', rec->key);
+		// Every built pipeline used to stay resident until gameplay took it: Yotei, 6,500 pipelines
+		// = ~6.3 GB of VRAM outside VMA right after the warm-up (heap0 1.1 -> 7.4 GB, VMA unchanged),
+		// which left too little for textures. A pipeline the driver cache rebuilds quickly is now
+		// released; its first use recreates it from the (now warm) driver cache. Only slow ones stay
+		// resident, up to a cap. KYTY_PREWARM_KEEP_MS (default 40; 0 = keep all, the old behavior),
+		// KYTY_PREWARM_KEEP_MAX (default 400).
+		bool released = false;
+		if (pipeline != nullptr) {
+			static const double keep_ms = [] {
+				const char* v = std::getenv("KYTY_PREWARM_KEEP_MS");
+				return v != nullptr ? std::strtod(v, nullptr) : 40.0;
+			}();
+			static const size_t keep_max = [] {
+				const char* v = std::getenv("KYTY_PREWARM_KEEP_MAX");
+				return v != nullptr ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : size_t {400};
+			}();
+			const double build_ms = std::chrono::duration<double, std::milli>(Clock::now() - build_start).count();
+			bool keep = keep_ms <= 0.0;
+			if (!keep && build_ms >= keep_ms) {
+				std::lock_guard lock(ctx.mutex);
+				keep = ctx.resident < keep_max;
+				if (keep) ctx.resident++;
+			}
+			if (!keep) {
+				ctx.graphics->device.destroyPipeline(pipeline, nullptr);
+				pipeline = nullptr;
+				released = true;
+			}
+		}
 		rec->desc.clear();
 		rec->desc.shrink_to_fit();
 		{
@@ -695,6 +726,10 @@ void Worker() {
 				e.state    = State::Ready;
 				e.pipeline = pipeline;
 				ctx.built++;
+			} else if (released) {
+				e.state = State::Done; // in the driver cache; created on first use
+				ctx.built++;
+				ctx.released++;
 			} else {
 				e.state = State::Done;
 				ctx.failed++;
@@ -1260,8 +1295,10 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 			            std::chrono::duration<double>(Clock::now() - wait_start).count());
 			std::fflush(stdout);
 		}
-		std::printf("Prewarm: warm-up done, %zu pipelines in %.1f s\n", total,
-		            std::chrono::duration<double>(Clock::now() - wait_start).count());
+		std::printf("Prewarm: warm-up done, %zu pipelines in %.1f s; %zu kept resident, %zu released to the "
+		            "driver cache; device memory in use %.0f MiB\n", total,
+		            std::chrono::duration<double>(Clock::now() - wait_start).count(), ctx.resident, ctx.released,
+		            ctx.graphics != nullptr ? ctx.graphics->GetDeviceMemoryUsage() / 1048576.0 : 0.0);
 		std::fflush(stdout);
 	}
 	return only;
