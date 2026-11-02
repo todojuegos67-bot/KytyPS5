@@ -551,11 +551,13 @@ const Candidate* BestCamera() {
     return best->count >= need ? best : nullptr;
 }
 
+int g_depth_detected = -1; // 1 reversed-Z, 0 forward, -1 not yet known
+
 void FillCamera(Plan& p) {
     p.camera_valid = false;
     const Candidate* cam = Cfg().mv_reconstruct ? BestCamera() : nullptr;
     if (cam == nullptr) {
-        p.depth_inverted = g_frame.depth_greater;
+        p.depth_inverted = g_depth_detected >= 0 ? g_depth_detected == 1 : g_frame.depth_greater;
         return;
     }
     const Mat& vp = cam->m;
@@ -585,6 +587,25 @@ void FillCamera(Plan& p) {
     if (!(z_near > 1e-4)) z_near = 0.1;
     p.z_near = static_cast<float>(z_near);
     p.z_far = z_far > 1e7 ? 0.0f : static_cast<float>(z_far);
+    // The depth convention from the projection: the window depth of a point at infinity
+    // (ndc_z -> alpha) against one at the near plane, through the scene viewport's z mapping.
+    if (g_depth_detected < 0) {
+        const double zs = p.viewport.zscale != 0.0f ? p.viewport.zscale : 1.0;
+        const double zo = p.viewport.zoffset;
+        const double far_d = alpha * zs + zo;
+        const double near_d = (alpha + beta / z_near) * zs + zo;
+        if (std::isfinite(far_d) && std::isfinite(near_d) && std::fabs(far_d - near_d) > 0.1) {
+            g_depth_detected = far_d < near_d ? 1 : 0;
+            Checkpoint(fmt::format(
+                "depth convention: {} (detected from the camera projection: far plane depth "
+                "{:.3f}, near plane depth {:.3f}; the G-buffer depth test says {}), used by "
+                "every upscaler{}",
+                g_depth_detected == 1 ? "reversed (far = 0)" : "forward (far = 1)", far_d,
+                near_d, g_frame.depth_greater ? "greater (reversed)" : "less (forward)",
+                std::getenv("BB_DEPTH_INVERT") ? " (BB_DEPTH_INVERT overrides it)" : ""));
+        }
+    }
+    p.depth_inverted = g_depth_detected >= 0 ? g_depth_detected == 1 : g_frame.depth_greater;
     p.camera_valid = true;
 }
 
