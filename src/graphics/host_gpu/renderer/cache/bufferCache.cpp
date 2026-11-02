@@ -1,3 +1,4 @@
+#include "local/early-submit.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "lane-sync.h"
 #include "slow-log.h"
@@ -393,6 +394,26 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->packed_size = packed_size;
 	// KYTY_READBACK_QUEUE: bytes whose writers the GPU finished (or, mode 2, has been handed)
 	// need not wait behind the rest of the graphics queue.
+	// ([fps+] rb_prod_*: where the bytes' last GPU writer is when the guest asks for them.)
+	if (m_gpu_writes_on) {
+		auto& master_now = m_scheduler.GetMasterSemaphore();
+		master_now.Refresh();
+		const uint64_t done_now = master_now.KnownGpuTick();
+		const uint64_t current  = m_scheduler.CurrentTick();
+		uint64_t       producer = 0;
+		for (const auto& [run_begin, run_end]: runs) producer = std::max(producer, InflightWriteTick(run_begin, run_end, done_now, true));
+		LiveCounters::Add(LiveCounters::RbBacklogTicks, current > done_now ? current - done_now : 0);
+		if (producer == 0) {
+			LiveCounters::Add(LiveCounters::RbProdDone);
+		} else if (producer >= current) {
+			LiveCounters::Add(LiveCounters::RbProdOpen);
+			const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			const int64_t age = now - EarlySubmit::g_open_since_ns.load(std::memory_order_relaxed);
+			if (age > 0) LiveCounters::Add(LiveCounters::RbOpenAgeUs, static_cast<uint64_t>(age / 1000));
+		} else {
+			LiveCounters::Add(LiveCounters::RbProdSubmitted);
+		}
+	}
 	if (ReadbackQueueReady(runs, true, request->producer_tick)) {
 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
 		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
@@ -531,6 +552,10 @@ static void LogGpuWriteWatch(uint64_t vaddr, uint64_t size) {
 // current tick, so its tick is only set at the next point between commands. Every GPU write
 // into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t caller) {
+	if (EarlySubmit::On() && EarlySubmit::Hot(vaddr, size)) {
+		EarlySubmit::g_due.store(true, std::memory_order_relaxed);
+		LiveCounters::Add(LiveCounters::EarlySubmitArmed);
+	}
 	if (caller == 0 && SyncStats::Enabled()) caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 	LogGpuWriteWatch(vaddr, size);
 	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());

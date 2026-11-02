@@ -1,3 +1,4 @@
+#include "local/early-submit.h"
 #include "local/skip-shader.h"
 #include "local/sync-stats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1369,6 +1370,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
 		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
 			g_gpu_state->ProcessCommands();
+			// KYTY_EARLY_SUBMIT: work writing a hot read-back region goes to the driver now (where a guest readback's
+			// Flush happens too: between packets, on the GPU thread, no recorder of its own).
+			if (EarlySubmit::On() && CommandScheduler::ThreadRecorder() == nullptr && m_renderer.GetCommandScheduler().Active() &&
+			    m_renderer.GetCommandScheduler().HasRecordedWork() && EarlySubmit::TakeDue()) {
+				m_renderer.GetCommandScheduler().Flush();
+				LiveCounters::Add(LiveCounters::EarlySubmits);
+			}
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];

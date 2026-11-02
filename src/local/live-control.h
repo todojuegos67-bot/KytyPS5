@@ -191,7 +191,9 @@ inline void Flip() {
 				                                   G::FlipDoneWaitUs, G::FaultWindowNs, G::FaultWriteNs, G::FaultReadNs,
 				                                   G::HotPagesNew, G::HotPagesKept, G::ReadAheadIssued, G::ReadAheadJoined,
 				                                   G::RfTurnNs, G::RfGpuThreadNs, G::RfGpuWaitNs, G::RfCopyNs,
-				                                   G::AsyncReadbacks, G::RbQueueDone, G::RbQueueInflight, G::RbQueueMismatch};
+				                                   G::AsyncReadbacks, G::RbQueueDone, G::RbQueueInflight, G::RbQueueMismatch,
+				                                   G::RbProdDone, G::RbProdSubmitted, G::RbProdOpen, G::RbOpenAgeUs, G::RbBacklogTicks,
+				                                   G::EarlySubmitArmed, G::EarlySubmits};
 				static std::array<uint64_t, guest.size()> last_guest {};
 				std::printf("[fps+]");
 				for (size_t i = 0; i < guest.size(); ++i) {

@@ -1,3 +1,4 @@
+#include "local/early-submit.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
@@ -1015,6 +1016,9 @@ void CommandScheduler::DiscardRecorded(Recorder& recorder) {
 void CommandScheduler::BeginNext() {
 	CheckActive();
 	BeginCommand();
+	EarlySubmit::g_open_since_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                       std::chrono::steady_clock::now().time_since_epoch()).count(),
+	                                   std::memory_order_relaxed);
 	if (m_lanes) LaneSync::g_cur_tick = m_master.CurrentTick();
 }
 

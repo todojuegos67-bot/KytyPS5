@@ -1,3 +1,4 @@
+#include "local/early-submit.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
@@ -248,6 +249,10 @@ void NoteReadFault(uint64_t vaddr, uint64_t ns) {
 		std::printf(" %s/%llu %llu %.1f %.0f %.1f;", ThreadLabel(static_cast<uint32_t>(threads[k].key)).c_str(),
 		            static_cast<unsigned long long>(threads[k].key), static_cast<unsigned long long>(threads[k].faults),
 		            threads[k].ns / 1e6, threads[k].ns / 1e3 / static_cast<double>(threads[k].faults), threads[k].max_ns / 1e6);
+	// KYTY_EARLY_SUBMIT: the regions that cost the most wait (>= 50 ms in 5 s) are the hot ones until the next report.
+	for (size_t k = 0; k < 8; ++k)
+		EarlySubmit::g_hot[k].store(k < regions.size() && regions[k].ns >= 50'000'000ull ? regions[k].key + 1u : 0,
+		                            std::memory_order_relaxed);
 	std::printf("\n[rfaults] 5 s: by 2 MiB region (faults, wait ms):");
 	for (size_t k = 0; k < regions.size() && k < 8; ++k)
 		std::printf(" 0x%010llx %llu %.1f;", static_cast<unsigned long long>(regions[k].key << 21u),

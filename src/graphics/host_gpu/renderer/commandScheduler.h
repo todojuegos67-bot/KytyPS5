@@ -40,6 +40,8 @@ public:
 	// The deferred flush, if one is pending (before the GPU thread waits for work).
 	void           FlushDeferred();
 	[[nodiscard]] bool FlushPending() const noexcept { return m_flush_deferred; }
+	// KYTY_EARLY_SUBMIT: an open command buffer holding draws or dispatches (what a Flush would submit).
+	[[nodiscard]] bool HasRecordedWork() const noexcept { return !m_command.IsInvalid() && (m_recorded_dispatches + m_recorded_draws) != 0; }
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// KYTY_ASYNC_COMPUTE (lane-sync.h): the queue the open command buffer is submitted on (0 graphics, 1 compute); a
