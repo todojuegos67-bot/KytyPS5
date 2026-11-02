@@ -383,6 +383,25 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
+static void ExitTextureLayerOutOfBounds(const char* what,
+                                                     const ShaderRecompiler::IR::ImageResource& resource,
+                                                     const ShaderTextureResource& descriptor,
+                                                     uint32_t image_layers) {
+	// Full T# so the base_array / depth encoding for this type can be decoded from the log.
+	EXIT("%s: base_array=%u image_layers=%u depth_field=%u type=%u shader_dim=%u cube=%d "
+	     "base=%u last=%u max_mip=%u width=%u height=%u format=%u tile=%u "
+	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	     what, static_cast<uint32_t>(descriptor.BaseArray5()), image_layers,
+	     static_cast<uint32_t>(descriptor.Depth()), static_cast<uint32_t>(descriptor.Type()),
+	     static_cast<uint32_t>(resource.dimension), resource.cube ? 1 : 0,
+	     static_cast<uint32_t>(descriptor.BaseLevel()), static_cast<uint32_t>(descriptor.LastLevel()),
+	     static_cast<uint32_t>(descriptor.MaxMip()), static_cast<uint32_t>(descriptor.Width5()) + 1u,
+	     static_cast<uint32_t>(descriptor.Height5()) + 1u, static_cast<uint32_t>(descriptor.Format()),
+	     static_cast<uint32_t>(descriptor.TileMode()), descriptor.fields[0], descriptor.fields[1],
+	     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+	     descriptor.fields[6], descriptor.fields[7]);
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -410,7 +429,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e1D;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				ExitTextureLayerOutOfBounds("texture base layer is out of bounds", resource, descriptor, image_layers);
 			}
 			view.layer_count = 1;
 			break;
@@ -418,7 +437,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e1DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				ExitTextureLayerOutOfBounds("texture array base layer is out of bounds", resource, descriptor, image_layers);
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
@@ -432,7 +451,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				ExitTextureLayerOutOfBounds("texture array base layer is out of bounds", resource, descriptor, image_layers);
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
@@ -441,7 +460,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2D;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				ExitTextureLayerOutOfBounds("texture base layer is out of bounds", resource, descriptor, image_layers);
 			}
 			view.layer_count = 1;
 			break;
