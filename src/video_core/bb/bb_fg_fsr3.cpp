@@ -87,7 +87,7 @@ std::chrono::steady_clock::time_point g_last_real{};
 
 struct Stats {
     std::chrono::steady_clock::time_point start{};
-    uint32_t real = 0, generated_on = 0, no_inputs = 0;
+    uint32_t real = 0, generated_on = 0, no_inputs = 0, hudless = 0;
     uint64_t presents_at_start = 0;
     double prepare_ms = 0, present_ms = 0, max_present_ms = 0;
 } g_stats;
@@ -659,11 +659,12 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         const uint64_t shown =
             presents >= g_stats.presents_at_start ? presents - g_stats.presents_at_start : 0;
         Printf("[fsr3] real %.1f fps, shown %.1f fps; generation on %u of %u frames (no 3D %u); "
-               "prepare %.2f ms, present call %.2f ms (max %.1f)",
+               "prepare %.2f ms, present call %.2f ms (max %.1f); HUD-less %u",
                g_stats.real / window, static_cast<double>(shown) / window, g_stats.generated_on,
                g_stats.real, g_stats.no_inputs,
                g_stats.real != 0 ? g_stats.prepare_ms / g_stats.real : 0.0,
-               g_stats.real != 0 ? g_stats.present_ms / g_stats.real : 0.0, g_stats.max_present_ms);
+               g_stats.real != 0 ? g_stats.present_ms / g_stats.real : 0.0, g_stats.max_present_ms,
+               g_stats.hudless);
         MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
         g_stats = {};
         g_stats.start = now;
@@ -718,6 +719,16 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     config.HUDLessColor = FfxApiResource{};
     if (hudless) {
         config.HUDLessColor = ImageResource(inputs->hudless, false);
+        ++g_stats.hudless;
+    } else if (generate && inputs->has_hudless) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Printf("FSR3 FG: HUD-less image %ux%u %s does not match the backbuffer %ux%u %s: not given",
+                   inputs->hudless.extent.width, inputs->hudless.extent.height,
+                   vk::to_string(inputs->hudless.format).c_str(), backbuffer.width,
+                   backbuffer.height, vk::to_string(format).c_str());
+        }
     }
     config.flags = EnvOn("KYTY_FSR3_DEBUG_VIEW", false)
                        ? static_cast<uint32_t>(FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW)
