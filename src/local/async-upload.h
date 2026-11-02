@@ -55,6 +55,11 @@ namespace AsyncUpload {
 // True on the worker's thread (a fault there cannot wait for the render thread, which may wait for the worker).
 inline thread_local bool t_worker = false;
 
+// KYTY_SERVE_IN_WAITS (GuestGpu::ServeInWaits), set by the GPU thread. Asked with false: whether a Wait here spins to
+// the copies' end, running the guest commands queued for the GPU thread meanwhile (a game thread's readback fault
+// waits for its command there); with true: run them, true when some ran.
+inline bool (*g_serve_hook)(bool serve) = nullptr;
+
 class Worker {
 public:
 	static constexpr uint64_t Capacity = 1u << 16;
@@ -112,6 +117,12 @@ public:
 			LiveCensus::g_upload_wait_ns.fetch_add(ns, std::memory_order_relaxed);
 			LiveCounters::Add(LiveCounters::UploadWaitUs, static_cast<uint64_t>(ns) / 1000u);
 		};
+		if (g_serve_hook != nullptr && g_serve_hook(false)) {
+			Kick();
+			while (m_done.load(std::memory_order_acquire) < sequence)
+				if (!g_serve_hook(true)) _mm_pause();
+			return note();
+		}
 		for (int spin = 0; spin < 4000; ++spin) {
 			if (m_done.load(std::memory_order_acquire) >= sequence) return note();
 			_mm_pause();

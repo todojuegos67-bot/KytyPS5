@@ -27,6 +27,7 @@
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "live-census.h"
+#include "live-switch.h"
 #include "draw-state-observer.h"
 #include "frame-capture.h"
 #include "hud-anchor.h"
@@ -231,6 +232,33 @@ static void PrefetchNextDraw(const uint32_t* packet, uint32_t remaining_dw) {
 			}
 		}
 	}
+}
+
+// A game thread's readback fault sends its command here and waits for it, and the GPU thread took commands only before
+// each packet: a request queued ~0.1 ms, 11-15 ms of the game's threads' time a frame at Demon's Souls' stone arch.
+// Run while the GPU thread waits for the upload worker as well, where it spun anyway (KYTY_SERVE_IN_WAITS).
+bool GuestGpu::ServeInWaits() noexcept {
+	static auto& serve = LiveSwitch::Find("serve_in_waits", [] {
+		const char* value = std::getenv("KYTY_SERVE_IN_WAITS");
+		return value != nullptr ? std::atoll(value) : 1ll;
+	}());
+	return serve.load(std::memory_order_relaxed) != 0;
+}
+
+// (A command may itself wait for the upload worker, before a submit: the commands behind it then wait their turn, as
+// before, instead of running inside it.)
+static thread_local bool t_serving_commands = false;
+
+void GuestGpu::ServePendingCommands() {
+	if (t_serving_commands || g_gpu_state == nullptr || g_gpu_state->m_pending_commands.load(std::memory_order_acquire) == 0)
+		return;
+	t_serving_commands = true;
+	g_gpu_state->ProcessCommands();
+	t_serving_commands = false;
+}
+
+bool GuestGpu::CommandsPending() noexcept {
+	return !t_serving_commands && g_gpu_state != nullptr && g_gpu_state->m_pending_commands.load(std::memory_order_acquire) != 0;
 }
 
 void GuestGpu::ProcessCommands() {
@@ -652,6 +680,12 @@ void GuestGpu::ThreadRun(void* data) {
 	BdaDirtyRegions::g_translating = true;
 	LiveTrace::g_mark_thread = true;
 	InitializePerformanceSwitches();
+	AsyncUpload::g_serve_hook = [](bool serve) {
+		if (!serve) return ServeInWaits() && IsGpuThread();
+		if (!IsGpuThread() || !CommandsPending()) return false;
+		ServePendingCommands();
+		return true;
+	};
 	LiveControl::Start();
 	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
