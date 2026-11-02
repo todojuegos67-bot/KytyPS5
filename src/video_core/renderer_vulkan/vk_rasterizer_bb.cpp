@@ -114,6 +114,14 @@ struct BBVk {
     bool fg_present_ready = false;
     bool fg_raw_hudless_ready = false; // BBHudlessCopy ran this frame (the in-place path)
     OwnImage fg_hudless_view_copy; // that copy in the presenter's view format (raw bytes)
+    // BB_HUD_DIAG: the presented image's address once its HUD-less copy is taken, frames seen.
+    VAddr hud_flip = 0;
+    u64 hud_frames = 0, hud_logged_frame = 0;
+    u32 hud_draws_logged = 0;
+    vk::Buffer diag_buffer{};
+    VmaAllocation diag_allocation{};
+    void* diag_mapped = nullptr;
+    bool diag_pending = false;
     u64 fg_hudless_frames = 0, fg_frames = 0;
     struct FgSlot {
         OwnImage depth, mv;
@@ -1446,6 +1454,171 @@ void DepthBarrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout,
 }
 } // namespace
 
+namespace {
+bool HudDiag() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_HUD_DIAG");
+        return v != nullptr && *v == '1';
+    }();
+    return on;
+}
+float SrgbDecode(u8 v) {
+    const float c = v / 255.0f;
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+} // namespace
+
+void Rasterizer::BBHudBlendLog(VAddr target, u32 enable, u32 csrc, u32 cfunc, u32 cdst,
+                               u32 separate, u32 asrc, u32 afunc, u32 adst, u32 write_mask) {
+    if (!HudDiag() || g_bb.hud_flip == 0 || target != g_bb.hud_flip) {
+        return;
+    }
+    // Frames 300, 900, 1500: every draw into the presented image after its HUD-less copy.
+    const u64 f = g_bb.hud_frames;
+    if (f != 300 && f != 900 && f != 1500) {
+        return;
+    }
+    if (g_bb.hud_logged_frame != f) {
+        g_bb.hud_logged_frame = f;
+        g_bb.hud_draws_logged = 0;
+    }
+    if (g_bb.hud_draws_logged++ >= 64) {
+        return;
+    }
+    BB::FG::Printf("[hud-blend] frame %llu draw %u: blend %u colour src %u func %u dst %u | "
+                   "separate alpha %u alpha src %u func %u dst %u | write mask 0x%x "
+                   "(factors: 0 zero 1 one 4 src_alpha 5 one_minus_src_alpha 6 dst_alpha; "
+                   "func 0 add)",
+                   static_cast<unsigned long long>(f), g_bb.hud_draws_logged, enable, csrc, cfunc,
+                   cdst, separate, asrc, afunc, adst, write_mask);
+}
+
+// The HUD's alpha, measured from the HUD-less copy (alpha before the HUD) and the presented image
+// (after it): with an "over" blend in alpha, A_after = a + (1 - a) A_before, so
+// a = (A_after - A_before) / (1 - A_before). The colours then give the HUD colour
+// U = (C_after - (1 - a) C_before) / a in linear light, which must lie in [0, 1] when that alpha
+// is the one the colours were blended with. Logged for frames 300, 900, 1500.
+void Rasterizer::BBHudAlphaCheck(VideoCore::Image& flip) {
+    if (!HudDiag() || !g_bb.hudless.image || flip.info.guest_address != g_bb.hud_flip ||
+        g_bb.hudless.extent.width != flip.info.size.width ||
+        g_bb.hudless.extent.height != flip.info.size.height) {
+        return;
+    }
+    const u64 f = g_bb.hud_frames;
+    if ((f != 300 && f != 900 && f != 1500) || g_bb.diag_pending) {
+        return;
+    }
+    const vk::Format fmt = flip.info.pixel_format;
+    if (fmt != vk::Format::eR8G8B8A8Srgb && fmt != vk::Format::eB8G8R8A8Srgb &&
+        fmt != vk::Format::eR8G8B8A8Unorm && fmt != vk::Format::eB8G8R8A8Unorm) {
+        BB::FG::Printf("[hud-alpha] presented image format %s: not checked",
+                       vk::to_string(fmt).c_str());
+        return;
+    }
+    const bool srgb = fmt == vk::Format::eR8G8B8A8Srgb || fmt == vk::Format::eB8G8R8A8Srgb;
+    const u32 w = flip.info.size.width, h = flip.info.size.height;
+    const vk::DeviceSize bytes = vk::DeviceSize(w) * h * 4;
+    if (!g_bb.diag_buffer) {
+        const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+            .size = bytes * 2,
+            .usage = vk::BufferUsageFlagBits::eTransferDst,
+        };
+        VmaAllocationCreateInfo alloc{};
+        alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer buffer{};
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(g_bb.allocator, &ci, &alloc, &buffer, &g_bb.diag_allocation, &info) !=
+            VK_SUCCESS) {
+            return;
+        }
+        g_bb.diag_buffer = buffer;
+        g_bb.diag_mapped = info.pMappedData;
+    }
+    scheduler.EndRendering();
+    runtime.Transit(&flip, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    const auto cmd = scheduler.CommandBuffer();
+    Barrier(cmd, g_bb.hudless, vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    const vk::BufferImageCopy region{
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {w, h, 1},
+    };
+    auto r2 = region;
+    r2.bufferOffset = bytes;
+    cmd.copyImageToBuffer(g_bb.hudless.image, vk::ImageLayout::eTransferSrcOptimal,
+                          g_bb.diag_buffer, region);
+    cmd.copyImageToBuffer(flip.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.diag_buffer,
+                          r2);
+    Barrier(cmd, g_bb.hudless, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    const vk::MemoryBarrier2 host{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &host});
+    g_bb.diag_pending = true;
+    const VmaAllocator allocator = g_bb.allocator;
+    const VmaAllocation allocation = g_bb.diag_allocation;
+    const u8* mapped = static_cast<const u8*>(g_bb.diag_mapped);
+    scheduler.DeferOperation([=] {
+        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        const u8* before = mapped;
+        const u8* after = mapped + bytes;
+        u64 hud = 0, alpha_written = 0, alpha_full = 0, in_range = 0, opaque = 0, translucent = 0;
+        double max_out = 0.0;
+        u64 hist[11]{};
+        for (u64 i = 0; i < u64(w) * h; ++i) {
+            const u8* b = before + i * 4;
+            const u8* a = after + i * 4;
+            if (b[0] == a[0] && b[1] == a[1] && b[2] == a[2]) continue;
+            ++hud;
+            if (b[3] == 255) {
+                ++alpha_full;
+                continue;
+            }
+            if (a[3] == b[3]) continue;
+            ++alpha_written;
+            const float ab = b[3] / 255.0f, aa = a[3] / 255.0f;
+            const float al = std::clamp((aa - ab) / (1.0f - ab), 0.0f, 1.0f);
+            hist[std::min(10, int(al * 10.0f))]++;
+            if (al >= 0.999f) ++opaque;
+            else ++translucent;
+            double worst = 0.0;
+            for (int c = 0; c < 3; ++c) {
+                const float cb = srgb ? SrgbDecode(b[c]) : b[c] / 255.0f;
+                const float ca = srgb ? SrgbDecode(a[c]) : a[c] / 255.0f;
+                const float u = al > 0.0f ? (ca - (1.0f - al) * cb) / al : 0.0f;
+                const double out = u < 0.0f ? -u : (u > 1.0f ? u - 1.0f : 0.0f);
+                worst = std::max(worst, out * al); // (in the composite: the error times its alpha)
+            }
+            max_out = std::max(max_out, worst);
+            if (worst <= 2.0 / 255.0) ++in_range;
+        }
+        BB::FG::Printf("[hud-alpha] %ux%u: HUD pixels %llu; alpha written by the HUD %llu "
+                       "(opaque %llu, translucent %llu); scene alpha already 1 there %llu; "
+                       "HUD colour consistent with that alpha %llu (%.1f %%), worst %.4f; "
+                       "alpha histogram %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                       w, h, (unsigned long long)hud, (unsigned long long)alpha_written,
+                       (unsigned long long)opaque, (unsigned long long)translucent,
+                       (unsigned long long)alpha_full, (unsigned long long)in_range,
+                       alpha_written ? 100.0 * in_range / alpha_written : 0.0, max_out,
+                       (unsigned long long)hist[0], (unsigned long long)hist[1],
+                       (unsigned long long)hist[2], (unsigned long long)hist[3],
+                       (unsigned long long)hist[4], (unsigned long long)hist[5],
+                       (unsigned long long)hist[6], (unsigned long long)hist[7],
+                       (unsigned long long)hist[8], (unsigned long long)hist[9],
+                       (unsigned long long)hist[10]);
+        g_bb.diag_pending = false;
+    });
+}
+
 bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                                    vk::ImageView& hudless_view, vk::Format view_format) {
     out = {};
@@ -1623,6 +1796,8 @@ void Rasterizer::BBHudlessCopy(VideoCore::Image& flip) {
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
     g_bb.fg_raw_hudless_ready = true;
+    g_bb.hud_flip = flip.info.guest_address;
+    ++g_bb.hud_frames;
     BB::Upscale::OnHudlessCopied();
 }
 

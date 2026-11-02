@@ -62,6 +62,11 @@ public:
     // the slot's own images (the game reuses its own before the frame is presented), the camera
     // and jitter of its upscale; and the upscaled image before the HUD at the output size (the
     // composite without the HUD) when the window-size path presented it. False: not a 3D frame.
+    // BB_HUD_DIAG=1 (diagnostic only, nothing drawn differently): the blend state of the draws
+    // into the presented image after the HUD-less copy, and the HUD's alpha in that image.
+    void BBHudBlendLog(VAddr target, u32 enable, u32 csrc, u32 cfunc, u32 cdst, u32 separate,
+                       u32 asrc, u32 afunc, u32 adst, u32 write_mask);
+    void BBHudAlphaCheck(VideoCore::Image& flip);
     bool BBFrameGenCapture(u32 slot, BB::FG::Inputs& out, vk::ImageView& hudless_view,
                            vk::Format view_format);
 

@@ -1148,6 +1148,15 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     if (BB::Upscale::Enabled() && BB::Upscale::WantHudlessCopy() && cb_descs[0].image_id) {
         BBHudlessCopy(texture_cache.GetImage(cb_descs[0].image_id));
     }
+    if (BB::Upscale::Enabled() && cb_descs[0].image_id) {
+        const auto& bc = liverpool->regs.blend_control[0];
+        BBHudBlendLog(texture_cache.GetImage(cb_descs[0].image_id).info.guest_address,
+                      static_cast<u32>(bc.enable), static_cast<u32>(bc.color_src_factor),
+                      static_cast<u32>(bc.color_func), static_cast<u32>(bc.color_dst_factor),
+                      static_cast<u32>(bc.separate_alpha_blend), static_cast<u32>(bc.alpha_src_factor),
+                      static_cast<u32>(bc.alpha_func), static_cast<u32>(bc.alpha_dst_factor),
+                      static_cast<u32>(liverpool->regs.color_target_mask.raw & 0xF));
+    }
     std::array<const VideoCore::Image*, 8> bb_cols{};
     const VideoCore::Image* bb_depth = nullptr;
     attachment_feedback_loop = false;

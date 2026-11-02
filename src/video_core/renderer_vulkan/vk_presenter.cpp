@@ -933,6 +933,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                  vk::ImageUsageFlagBits::eTransferSrc};
         frame->fg.has_hudless = true;
     }
+    if (BB::Upscale::Enabled()) {
+        rasterizer->BBHudAlphaCheck(image); // BB_HUD_DIAG=1 only
+    }
     // DLSS-G's Reflex markers at the guest frame boundary (as Demon's Souls).
     frame->fg.reflex_index = BB::FG::GuestFlip();
     if (BB::Upscale::Enabled()) {
