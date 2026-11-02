@@ -9,6 +9,8 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 class Translator {
 public:
+	// A barrier of the whole workgroup with its memory (a lane-local program's LDS accesses: IR::Program::lds_barriers).
+	void WorkgroupBarrier() { S_BARRIER(); }
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit)
 	    : program(program), ir(block), current_vector_limit(vector_limit) {}
 

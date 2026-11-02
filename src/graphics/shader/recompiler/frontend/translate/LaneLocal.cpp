@@ -7,6 +7,7 @@
 #include <bit>
 #include <bitset>
 #include <deque>
+#include <set>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -271,8 +272,9 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::UNSUPPORTED: return "unknown instruction";
 		default: break;
 	}
-	// LDS: a wave's lanes may exchange data there without a barrier (a 64-thread group has none).
-	if (inst.family == Family::DS) return "LDS";
+	// LDS: a wave's lanes may exchange data there without a barrier (a 64-thread group has none); under
+	// TranslatorFeatureLaneLocalWide, plain reads and writes with barriers placed between (LdsBarriers).
+	if (inst.family == Family::DS) return (TranslatorFeatureSet() & TranslatorFeatureLaneLocalWide) != 0 ? nullptr : "LDS";
 	return nullptr;
 }
 
@@ -1253,6 +1255,240 @@ bool UniformLoadsEnabled() {
 	return enabled;
 }
 
+// LDS under TranslatorFeatureLaneLocalWide (the lane batch's (ii)): plain reads and writes of workgroup memory. A wave's
+// lanes may exchange data there with no barrier between (in lockstep on the guest); the halves of a lane-local wave
+// are two subgroups, ordered only by a barrier. So within each stretch of the program between barriers, an LDS access
+// that may meet an earlier one of another lane (a read after a write, a write after a read or a write) gets a
+// workgroup barrier between them, placed where every invocation passes it as often as the program's own barrier:
+// EXEC full, in the same loop as an existing barrier (or outside every loop), not in a per-lane loop, and on every
+// path through that loop's iteration (or through the program). Refused where no such place exists.
+enum LdsAccess : uint8_t { LdsNone = 0, LdsRead = 1, LdsWrite = 2 };
+
+// A plain LDS access (its kinds), or nullptr; `refused`: an LDS operation this rule does not take.
+uint8_t PlainLds(const Instruction& inst, const char** refused) {
+	if (inst.family != Family::DS) return LdsNone;
+	const auto name = magic_enum::enum_name(inst.opcode);
+	if (name.find("ADDTID") != std::string_view::npos) {
+		*refused = "LDS addressed by the lane";
+		return LdsNone;
+	}
+	if (name.starts_with("DS_READ")) return LdsRead;
+	if (name.starts_with("DS_WRITE") && !name.starts_with("DS_WRXCHG")) return LdsWrite;
+	*refused = "an LDS operation other than a plain read or write";
+	return LdsNone;
+}
+
+bool WritesExec(const Instruction& inst) {
+	if (inst.dst.kind == OperandKind::ExecLo || inst.dst.kind == OperandKind::ExecHi) return true;
+	const auto name = magic_enum::enum_name(inst.opcode);
+	return name.starts_with("V_CMPX") || name.find("SAVEEXEC") != std::string_view::npos;
+}
+
+// EXEC all ones after `inst` (EXEC before: `full`).
+bool ExecFullAfter(const Instruction& inst, bool full) {
+	if (!WritesExec(inst)) return full;
+	return (inst.opcode == Opcode::S_MOV_B64 || inst.opcode == Opcode::S_MOV_B32) &&
+	       inst.src0.kind == OperandKind::IntegerInlineConstant && inst.src0.signed_val == -1;
+}
+
+class LdsBarriers {
+public:
+	LdsBarriers(const Decoder::Program& program, const CFG::Graph& cfg): m_program(program), m_cfg(cfg) {
+		for (size_t i = 0; i < cfg.blocks.size(); ++i) m_index_of[cfg.blocks[i].id] = i;
+	}
+
+	// The PCs a barrier goes before; false (with `reason`) when the program is refused.
+	bool Run(std::vector<uint32_t>& before_pcs, std::string* reason) {
+		const auto& blocks = m_cfg.blocks;
+		bool        any    = false;
+		for (const auto& inst: m_program.instructions) {
+			const char* refused = nullptr;
+			if (PlainLds(inst, &refused) != LdsNone) any = true;
+			if (refused != nullptr) return Fail(reason, refused, inst.pc);
+		}
+		if (!any) return true;
+		ExecFacts();
+		for (int round = 0; round < 32; ++round) {
+			Pending();
+			// The first hazard in program order.
+			size_t hazard_block = SIZE_MAX, hazard_index = 0;
+			for (size_t b = 0; b < blocks.size() && hazard_block == SIZE_MAX; ++b) {
+				uint8_t pending = m_pending_in[b];
+				for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) {
+					const auto& inst = m_program.instructions[i];
+					if (m_before.contains(inst.pc) || inst.opcode == Opcode::S_BARRIER) pending = LdsNone;
+					const char* refused = nullptr;
+					const auto  access  = PlainLds(inst, &refused);
+					if (access == LdsNone) continue;
+					if ((access == LdsRead && (pending & LdsWrite) != 0) || (access == LdsWrite && pending != LdsNone)) {
+						hazard_block = b;
+						hazard_index = i;
+						break;
+					}
+					pending |= access;
+				}
+			}
+			if (hazard_block == SIZE_MAX) {
+				before_pcs.assign(m_before.begin(), m_before.end());
+				std::ranges::sort(before_pcs);
+				return true;
+			}
+			const auto pc = Place(hazard_block, hazard_index);
+			if (pc == UINT32_MAX || m_before.contains(pc))
+				return Fail(reason, "no place every invocation passes for a barrier before an LDS access",
+				            m_program.instructions[hazard_index].pc);
+			m_before.insert(pc);
+		}
+		return Fail(reason, "too many LDS barriers", 0);
+	}
+
+private:
+	static bool Fail(std::string* reason, const char* why, uint32_t pc) {
+		if (reason != nullptr) *reason = fmt::format("{} at {:#x}", why, pc);
+		return false;
+	}
+
+	// EXEC all ones at each block's start (every lane: the invocations a lane-local group has).
+	void ExecFacts() {
+		const auto& blocks = m_cfg.blocks;
+		m_exec_in.assign(blocks.size(), true);
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t b = 0; b < blocks.size(); ++b) {
+				bool in = true;
+				if (blocks[b].id != m_cfg.entry_block)
+					for (const auto pred: blocks[b].predecessors) in = in && ExecOut(m_index_of.at(pred));
+				if (in != m_exec_in[b]) {
+					m_exec_in[b] = in;
+					changed      = true;
+				}
+			}
+		}
+	}
+
+	bool ExecOut(size_t b) const {
+		bool full = m_exec_in[b];
+		for (auto i = m_cfg.blocks[b].inst_begin; i < m_cfg.blocks[b].inst_end; ++i)
+			full = ExecFullAfter(m_program.instructions[i], full);
+		return full;
+	}
+
+	// The LDS access kinds since the last barrier on some path, at each block's start.
+	void Pending() {
+		const auto& blocks = m_cfg.blocks;
+		m_pending_in.assign(blocks.size(), LdsNone);
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t b = 0; b < blocks.size(); ++b) {
+				uint8_t in = LdsNone;
+				for (const auto pred: blocks[b].predecessors) in |= PendingOut(m_index_of.at(pred));
+				if (in != m_pending_in[b]) {
+					m_pending_in[b] = in;
+					changed         = true;
+				}
+			}
+		}
+	}
+
+	uint8_t PendingOut(size_t b) const {
+		uint8_t pending = m_pending_in[b];
+		for (auto i = m_cfg.blocks[b].inst_begin; i < m_cfg.blocks[b].inst_end; ++i) {
+			const auto& inst = m_program.instructions[i];
+			if (m_before.contains(inst.pc) || inst.opcode == Opcode::S_BARRIER) pending = LdsNone;
+			const char* refused = nullptr;
+			pending |= PlainLds(inst, &refused);
+		}
+		return pending;
+	}
+
+	// Where a barrier goes for the hazard at instruction `index` of block `b`: the latest valid place after the last LDS
+	// access before it, in its block or up its dominators; UINT32_MAX for none.
+	uint32_t Place(size_t b, size_t index) const {
+		const auto& blocks = m_cfg.blocks;
+		size_t      block  = b;
+		size_t      limit  = index; // (places before instructions [first, limit])
+		for (int depth = 0; depth < 64; ++depth) {
+			// The last LDS access in this block before `limit`: places after it only.
+			size_t first = blocks[block].inst_begin;
+			for (size_t i = blocks[block].inst_begin; i < limit; ++i) {
+				const char* refused = nullptr;
+				if (PlainLds(m_program.instructions[i], &refused) != LdsNone) first = i + 1;
+			}
+			bool full = m_exec_in[block];
+			std::vector<bool> full_before(limit + 1 - blocks[block].inst_begin, false);
+			for (size_t i = blocks[block].inst_begin; i <= limit && i < blocks[block].inst_end; ++i) {
+				full_before[i - blocks[block].inst_begin] = full;
+				full = ExecFullAfter(m_program.instructions[i], full);
+			}
+			if (Uniform(block)) {
+				for (size_t i = std::min<size_t>(limit, blocks[block].inst_end - 1) + 1; i-- > first;)
+					if (full_before[i - blocks[block].inst_begin]) return m_program.instructions[i].pc;
+			}
+			if (first > blocks[block].inst_begin) return UINT32_MAX; // (an LDS access in this block: no place after it)
+			// Up to the immediate dominator.
+			const auto& tree = m_cfg.dominators;
+			const auto  id   = blocks[block].id;
+			if (id >= tree.parent.size() || tree.parent[id] == UINT32_MAX) return UINT32_MAX;
+			block = m_index_of.at(tree.parent[id]);
+			limit = blocks[block].inst_end - 1;
+		}
+		return UINT32_MAX;
+	}
+
+	// Every invocation passes this block as often as the program's own barrier: in the same loop as one (or in none),
+	// that loop not a per-lane one, and the block on every path of its iteration (or of the program).
+	bool Uniform(size_t block) const {
+		const auto&               blocks = m_cfg.blocks;
+		const auto                id     = blocks[block].id;
+		const CFG::NaturalLoop*   inner  = nullptr;
+		for (const auto& loop: m_cfg.natural_loops) {
+			const bool in = loop.header == id || std::ranges::find(loop.body_blocks, id) != loop.body_blocks.end();
+			if (in && (inner == nullptr || loop.body_blocks.size() < inner->body_blocks.size())) inner = &loop;
+		}
+		const auto in_loop = [&](uint32_t b) {
+			return inner == nullptr || inner->header == b ||
+			       std::ranges::find(inner->body_blocks, b) != inner->body_blocks.end();
+		};
+		if (inner != nullptr) {
+			bool barrier = false;
+			for (const auto& candidate: blocks)
+				if (in_loop(candidate.id))
+					for (auto i = candidate.inst_begin; i < candidate.inst_end; ++i)
+						barrier = barrier || m_program.instructions[i].opcode == Opcode::S_BARRIER;
+			if (!barrier) return false;
+			const auto* latch = m_cfg.FindBlock(inner->latch);
+			if (latch == nullptr || latch->inst_end == latch->inst_begin) return false;
+			const auto latch_op = m_program.instructions[latch->inst_end - 1].opcode;
+			if (latch_op == Opcode::S_CBRANCH_EXECZ || latch_op == Opcode::S_CBRANCH_EXECNZ ||
+			    latch_op == Opcode::S_CBRANCH_VCCZ || latch_op == Opcode::S_CBRANCH_VCCNZ)
+				return false;
+		}
+		// On every path: from the header (the entry) to the latch (an end), within the loop, without this block.
+		const uint32_t start = inner != nullptr ? inner->header : m_cfg.entry_block;
+		if (start == id) return true;
+		std::vector<bool>     seen(blocks.size(), false);
+		std::vector<uint32_t> stack {start};
+		while (!stack.empty()) {
+			const auto b = stack.back();
+			stack.pop_back();
+			const auto index = m_index_of.at(b);
+			if (b == id || seen[index]) continue;
+			seen[index] = true;
+			if (inner != nullptr ? b == inner->latch : blocks[index].successors.empty()) return false;
+			for (const auto next: blocks[index].successors)
+				if (in_loop(next) && !(inner != nullptr && next == inner->header)) stack.push_back(next);
+		}
+		return true;
+	}
+
+	const Decoder::Program&              m_program;
+	const CFG::Graph&                    m_cfg;
+	std::unordered_map<uint32_t, size_t> m_index_of;
+	std::vector<bool>                    m_exec_in;
+	std::vector<uint8_t>                 m_pending_in;
+	std::set<uint32_t>                   m_before;
+};
+
 } // namespace
 
 bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason, bool* uniform_loads) {
@@ -1266,10 +1502,15 @@ bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneL
 	// (On the program's own branches: the structured graph routes some through variables, scalar state of its own.)
 	const auto cfg = CFG::BuildGraph(program);
 	proof          = {};
-	if (Analysis(program, cfg).Run(reason)) return true;
+	// (Its LDS accesses: the barriers between them, or no proof.)
+	const auto lds = [&] {
+		if ((TranslatorFeatureSet() & TranslatorFeatureLaneLocalWide) == 0) return true;
+		return LdsBarriers(program, cfg).Run(proof.lds_barriers, reason);
+	};
+	if (Analysis(program, cfg).Run(reason)) return lds();
 	if (UniformLoadsEnabled() && Analysis(program, cfg, true).Run(reason)) {
 		proof.uniform_loads = true;
-		return true;
+		return lds();
 	}
 	if (!cooperative) return false;
 	std::string why;
@@ -1279,7 +1520,7 @@ bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneL
 		return false;
 	}
 	analysis.Exchanges(proof.exchange_reads, proof.wave_branches);
-	return true;
+	return lds();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

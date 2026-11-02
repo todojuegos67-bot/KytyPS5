@@ -55,6 +55,7 @@ struct LaneLocalProof {
 	bool                  uniform_loads = false;
 	std::vector<uint32_t> exchange_reads;
 	std::vector<uint32_t> wave_branches;
+	std::vector<uint32_t> lds_barriers; // (TranslatorFeatureLaneLocalWide) PCs a workgroup barrier goes before
 	[[nodiscard]] bool    Cooperative() const { return !exchange_reads.empty() || !wave_branches.empty(); }
 };
 bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof,
@@ -71,7 +72,9 @@ constexpr uint32_t TranslatorFeatureNativeFloatMinMax = 4u;
 // The lane-local proof's wider rules (LaneLocal.cpp), one bit for all of them. So far: S_GETPC_B64 admitted, the program
 // counter being the same in every lane and both halves (the wave64 programs that read it use it for a table of
 // constants after their code: s_getpc, s_add_u32 of the table's offset, per-lane loads through it); S_SETPC and the
-// subvector loops stay refused. Off unless KYTY_LANE_LOCAL_WIDE=1 (not in TranslatorFeatures until measured: it
+// subvector loops stay refused; LDS plain reads and writes, a workgroup barrier placed between those another lane may
+// meet in one barrier-free stretch (LdsBarriers: the two halves of a lane-local wave are two subgroups, not in lockstep).
+// Off unless KYTY_LANE_LOCAL_WIDE=1 (not in TranslatorFeatures until measured: it
 // changes those programs' SPIR-V).
 constexpr uint32_t TranslatorFeatureLaneLocalWide = 128u;
 constexpr uint32_t TranslatorFeatures =
