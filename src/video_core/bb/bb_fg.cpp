@@ -143,6 +143,18 @@ Config ParseConfig() {
             SetProcessEnv("KYTY_FSR3_MFG", n.c_str());
         }
     }
+    // The Demon's Souls launcher's defaults: KYTY_DLSSG_PACE=grid, KYTY_VRR_CAP_FPS=auto for the
+    // x4 FSR 3 configuration, KYTY_DYN_QUALITY=0.95 for the dynamic ones.
+    if (Env("KYTY_DLSSG_PACE") == nullptr) SetProcessEnv("BB_DLSSG_PACE", "grid");
+    if (c.kind == Kind::Amd && !c.dynamic && c.multiplier == 4 && Env("KYTY_VRR_CAP_FPS") == nullptr) {
+        SetProcessEnv("BB_VRR_CAP_FPS", "auto");
+    }
+    // (bb_dyn_multiplier.h reads KYTY_DYN_QUALITY itself.)
+    if (const char* q = std::getenv("BB_DYN_QUALITY"); q != nullptr) {
+        SetProcessEnv("KYTY_DYN_QUALITY", q);
+    } else if (c.dynamic && std::getenv("KYTY_DYN_QUALITY") == nullptr) {
+        SetProcessEnv("KYTY_DYN_QUALITY", "0.95");
+    }
     // BB_REFLEX=on|boost|off: NVIDIA Reflex. With Streamline (DLSS / DLSS-G) its sl.reflex mode;
     // without, VK_NV_low_latency2 through the latency module (as BB_ANTILAG=1 picks on NVIDIA).
     if (const char* r = std::getenv("BB_REFLEX"); r != nullptr && *r != '\0') {
@@ -220,6 +232,19 @@ std::atomic<double> g_real_interval{0.0}; // the pacer's real-frame interval (0:
 bool g_fixed_cap = false;                 // fixed DLSS-G under BB_VRR_CAP_FPS
 std::atomic<uint32_t> g_presented_frames{1};
 int g_mode_set = -1; // DLSS-G last set on (1) or off (0)
+uint32_t g_rx_open = 0;               // the frame begun at the last guest flip
+std::atomic<uint32_t> g_rx_present{0}; // the index BeforePresent presents next (SetPresentIndex)
+
+// 10-23 (Demon's Souls): KYTY_DLSSG_MARKERS=guest (default) | present. Reflex's sleep and the
+// simulation / render submit markers at the guest flip (it paces the game's frames, not the
+// presents); present start / end at the present with the same frame index.
+bool GuestMarkers() {
+    static const bool guest = [] {
+        const char* v = Env("KYTY_DLSSG_MARKERS");
+        return v == nullptr || std::strcmp(v, "present") != 0;
+    }();
+    return guest;
+}
 
 int CurrentGenerate() {
     return g_dynamic ? g_dyn_gen : g_generate;
@@ -523,6 +548,43 @@ bool Ready() {
     return g_ready;
 }
 
+uint32_t GuestFlip() {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    if (!g_ready || !GuestMarkers() || g_api.pcl_set_marker == nullptr) return 0;
+    uint32_t done = 0;
+    sl::FrameToken* token = nullptr;
+    if (g_rx_open != 0) {
+        uint32_t index = g_rx_open;
+        if (g_api.get_new_frame_token(token, &index) == sl::Result::eOk && token != nullptr) {
+            g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, *token);
+            done = g_rx_open;
+        }
+    }
+    uint32_t next = SR::Dlss::NextFrameIndex();
+    token = nullptr;
+    if (g_api.get_new_frame_token(token, &next) != sl::Result::eOk || token == nullptr) {
+        g_rx_open = 0;
+        return done;
+    }
+    static const bool sleep = [] {
+        const char* value = Env("KYTY_DLSSG_SLEEP");
+        return value == nullptr || *value != '0';
+    }();
+    if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(*token);
+    g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, *token);
+    g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, *token);
+    g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, *token);
+    g_rx_open = next;
+    return done;
+#else
+    return 0;
+#endif
+}
+
+void SetPresentIndex(uint32_t index) {
+    g_rx_present.store(index, std::memory_order_relaxed);
+}
+
 int Generated() {
     return g_ready && g_mode_set == 1 ? CurrentGenerate() : 0;
 }
@@ -700,11 +762,13 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         g_options_format = format;
     }
 
-    // This frame's DLSS evaluate index when it has one (the same token, another viewport), else
-    // the next of the shared stream; never backwards.
+    // 10-23 (Demon's Souls): a frame begun at the guest flip (GuestFlip) keeps its index; others
+    // (menus, a repeated image) take a new one with all markers here, as before.
+    const uint32_t guest_index = g_rx_present.exchange(0, std::memory_order_relaxed);
     {
-        const uint32_t own = usable && inputs->sl_frame > g_frame_index ? inputs->sl_frame
-                                                                        : SR::Dlss::NextFrameIndex();
+        const uint32_t own = guest_index != 0 ? guest_index
+                             : usable && inputs->sl_frame > g_frame_index ? inputs->sl_frame
+                                                                          : SR::Dlss::NextFrameIndex();
         g_frame_index = std::max(own, g_frame_index + 1);
     }
     if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
@@ -716,10 +780,12 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         const char* value = Env("KYTY_DLSSG_SLEEP");
         return value == nullptr || *value != '0';
     }();
-    if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(token);
-    g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
-    g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
-    g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
+    if (guest_index == 0) {
+        if (sleep && g_api.reflex_sleep != nullptr && !GuestMarkers()) g_api.reflex_sleep(token);
+        g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
+        g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
+        g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
+    }
 
     sl::Constants constants = MakeConstants(usable ? inputs : nullptr);
     if (const auto result = g_api.set_constants(constants, token, viewport);
@@ -798,7 +864,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         g_api.set_tag_for_frame(token, viewport, tags, static_cast<uint32_t>(std::size(tags)),
                                 nullptr);
     }
-    g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
+    if (guest_index == 0) g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
     g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
     g_present_begin = Clock::now();
 #else
@@ -947,6 +1013,14 @@ bool DlssgEnabled() {
 
 int DlssgGenerated() {
     return Dlssg::Generated();
+}
+
+uint32_t GuestFlip() {
+    return Dlssg::GuestFlip();
+}
+
+void SetPresentIndex(uint32_t index) {
+    Dlssg::SetPresentIndex(index);
 }
 
 bool WantInputs() {

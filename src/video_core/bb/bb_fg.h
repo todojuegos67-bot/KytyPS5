@@ -97,6 +97,7 @@ struct Inputs {
     float view_to_clip[16]{};
     float clip_to_prev_clip[16]{};
     uint64_t lat_index = 0; // BB::AntiLag's frame index (0: none)
+    uint32_t reflex_index = 0; // GuestFlip's index of this frame (0: none)
     uint32_t sl_frame = 0;  // Streamline frame index of this frame's DLSS evaluate (0: none)
     const char* hudless_source = "none"; // where the HUD-less image came from (log)
 };
@@ -107,5 +108,11 @@ bool WantInputs();
 void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2D backbuffer,
                    vk::Format format, vk::Rect2D region, uint32_t image_count);
 void AfterPresent();
+// DLSS-G's Reflex markers at the guest frame boundary (the presenter's PrepareFrame, Demon's Souls
+// 10-23): render submit end of the frame that ends here (its index returned, for the frame), then
+// Reflex's sleep and the next frame's simulation / render submit start.
+uint32_t GuestFlip();
+// Before BeforePresent: the guest frame index of the frame presented (0: a repeat or none).
+void SetPresentIndex(uint32_t index);
 
 } // namespace BB::FG

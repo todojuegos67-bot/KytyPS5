@@ -933,6 +933,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                  vk::ImageUsageFlagBits::eTransferSrc};
         frame->fg.has_hudless = true;
     }
+    // DLSS-G's Reflex markers at the guest frame boundary (as Demon's Souls).
+    frame->fg.reflex_index = BB::FG::GuestFlip();
     if (BB::Upscale::Enabled()) {
         Rasterizer::BBStampPresentEnd(draw_scheduler.CommandBuffer());
     }
@@ -1272,6 +1274,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Frame generation (bb_fg.h): DLSS-G's tags and markers, or FSR 3's configure and prepare,
     // for this present (the frame's own inputs for a new game frame; none for a repeat).
     const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
+    BB::FG::SetPresentIndex(!is_reusing_frame && is_game_frame ? frame->fg.reflex_index : 0);
     BB::FG::BeforePresent(fg_frame ? &frame->fg : nullptr, swapchain.GetHandle(),
                           swapchain.GetExtent(),
                           swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32

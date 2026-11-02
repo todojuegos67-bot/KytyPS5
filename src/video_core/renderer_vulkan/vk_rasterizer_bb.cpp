@@ -113,6 +113,7 @@ struct BBVk {
     OwnImage fg_present; // the composite without the HUD (bb_hud.comp flag 4)
     bool fg_present_ready = false;
     bool fg_raw_hudless_ready = false; // BBHudlessCopy ran this frame (the in-place path)
+    OwnImage fg_hudless_view_copy; // that copy in the presenter's view format (raw bytes)
     u64 fg_hudless_frames = 0, fg_frames = 0;
     struct FgSlot {
         OwnImage depth, mv;
@@ -1534,15 +1535,34 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
         // The in-place path: the presented image copied right before its first HUD draw.
         hudless_view = g_bb.hudless.view;
         out.hudless_source = "presented image before its first HUD draw";
-    } else if (raw_ready && g_bb.hudless.image) {
-        static bool said = false;
-        if (!said) {
-            said = true;
-            BB::FG::Printf("Frame generation: the HUD-less copy is %s, the presenter reads %s: "
-                           "no HUD-less image",
-                           vk::to_string(g_bb.hudless.format).c_str(),
-                           vk::to_string(view_format).c_str());
-        }
+    } else if (raw_ready && g_bb.hudless.image &&
+               EnsureImage(g_bb.fg_hudless_view_copy, g_bb.hudless.extent, view_format,
+                           vk::ImageUsageFlagBits::eTransferDst |
+                               vk::ImageUsageFlagBits::eSampled)) {
+        // The presenter reads the flip image through a view in another format of the same size
+        // class (R8G8B8A8 bytes read as B8G8R8A8): the copy's raw bytes into an image of that
+        // format, so the HUD-less image is read exactly as the presented one.
+        Barrier(cmd, g_bb.hudless, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        Barrier(cmd, g_bb.fg_hudless_view_copy, vk::ImageLayout::eTransferDstOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+        cmd.copyImage(g_bb.hudless.image, vk::ImageLayout::eTransferSrcOptimal,
+                      g_bb.fg_hudless_view_copy.image, vk::ImageLayout::eTransferDstOptimal,
+                      vk::ImageCopy{
+                          .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                          .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                          .extent = {g_bb.hudless.extent.width, g_bb.hudless.extent.height, 1},
+                      });
+        Barrier(cmd, g_bb.hudless, vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+        Barrier(cmd, g_bb.fg_hudless_view_copy, vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+        hudless_view = g_bb.fg_hudless_view_copy.view;
+        out.hudless_source = "presented image before its first HUD draw (as the presenter reads it)";
     }
     ++g_bb.fg_frames;
     if (hudless_view) ++g_bb.fg_hudless_frames;
