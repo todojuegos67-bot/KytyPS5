@@ -79,6 +79,12 @@ constexpr uint32_t TranslatorFeaturePixelQuadReads = 32u;
 // V_FMA_F32 is fused). Fused, the last bits differ where vectors nearly cancel: Demon's Souls' fog particles on the
 // loading screen picked a wrong colour and flashed brown patches for one frame.
 constexpr uint32_t TranslatorFeatureUnfusedMad = 64u;
+// The lane-local proof's wider rules (LaneLocal.cpp), one bit for all of them. So far: S_GETPC_B64 admitted, the program
+// counter being the same in every lane and both halves (the wave64 programs that read it use it for a table of
+// constants after their code: s_getpc, s_add_u32 of the table's offset, per-lane loads through it); S_SETPC and the
+// subvector loops stay refused. Off unless KYTY_LANE_LOCAL_WIDE=1 (not in TranslatorFeatures until measured: it
+// changes those programs' SPIR-V).
+constexpr uint32_t TranslatorFeatureLaneLocalWide = 128u;
 constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse |
                                         TranslatorFeatureNativeFloatMinMax | TranslatorFeatureExecSelects |
                                         TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad
