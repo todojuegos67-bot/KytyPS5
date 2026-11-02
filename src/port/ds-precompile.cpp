@@ -310,7 +310,7 @@ void RememberPlanOptions() {
 		std::ofstream(fs::path(store.wstring() + L".plan-options"), std::ios::binary) << kPlanOptions;
 }
 
-bool RecordedPlayGrew() {
+[[maybe_unused]] bool RecordedPlayGrew() {
 	const auto f = RecordedSumFile();
 	if (f.empty()) return false;
 	const uint64_t now = RecordedBytes();
@@ -780,7 +780,8 @@ bool CacheCurrent() {
 	const int code = RunOne("precompile-status", L"--seeds " + Quote(g_setup.seeds) + L" --status");
 	const std::string text = ReadAll(g_logs / L"precompile-status.out.log");
 	bool current = code == 0 && text.find("static cache current") != std::string::npos;
-	if (current && RecordedPlayGrew()) current = false; // (ds-pc-port45)
+	// (ds-pc-port48) No automatic precompile when recorded play grows (port45's RecordedPlayGrew re-ran it after every
+	// session): the warmup makes the recorded pipelines at start-up; a precompile the user starts takes the recordings in.
 	if (current && PlanOptionsChanged()) current = false; // (ds-pc-port48)
 	if (current) {
 		RememberHints(); // (for the next update: its hints compared by content)

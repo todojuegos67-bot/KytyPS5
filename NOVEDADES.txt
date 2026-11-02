@@ -4,6 +4,16 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
 Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
+00. NUEVO (02-11, port48) / NEW (02-11, port48)
+-----------------------------------------------
+- Precompilacion: UNA vez mas al actualizar a esta version (anade las variantes nativas que faltaban; lo ya hecho se
+  copia, solo se compila lo nuevo). Despues no se repite: ya no se vuelve a precompilar al arrancar por haber jugado
+  (lo jugado se precarga al iniciar). Solo vuelve si cambian el juego, el driver o los hints de una actualizacion,
+  o si pulsas Precompilar tu mismo.
+  Precompile: ONCE more when updating to this version (adds the missing native variants; what exists is copied).
+  After that it no longer re-runs at start-up because you played; only for a new game version, driver or hints,
+  or when you press Precompile yourself.
+
 00. NUEVO (29-10) / NEW (29-10)
 -------------------------------
 - DLSS 5 (Neural Rendering, foveado): necesita nvngx_dlssnr.dll propio junto a kyty_emulator.exe; no se incluye.
