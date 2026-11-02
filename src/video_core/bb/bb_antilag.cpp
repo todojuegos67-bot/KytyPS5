@@ -220,8 +220,13 @@ void* ChainDeviceFeatures(bool enabled, void* next) {
 	return &g_features;
 }
 
+namespace {
+std::atomic<VkDevice> g_own_dev_from_create {VK_NULL_HANDLE}; // (BB: OnFrameSubmitted without a device)
+} // namespace
+
 void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extension_enabled, bool reflex_enabled) {
 	static bool logged = false;
+	g_own_dev_from_create.store(static_cast<VkDevice>(device), std::memory_order_release);
 	if (Own().on && get_proc != nullptr) // KYTY_LOWLAT: core 1.2 (the emulator's timelines need it)
 		g_own_wait.store(reinterpret_cast<PFN_vkWaitSemaphores>(get_proc(static_cast<VkDevice>(device), "vkWaitSemaphores")),
 		                 std::memory_order_release);
@@ -749,6 +754,7 @@ void OnPresented(uint64_t frame_index) {
 }
 
 void OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint64_t tick) {
+	if (device == VK_NULL_HANDLE) device = g_own_dev_from_create.load(std::memory_order_acquire); // (BB: the presenter's frame)
 	if (!Own().on || device == VK_NULL_HANDLE || timeline == VK_NULL_HANDLE || tick == 0) return;
 	g_own_device.store(device, std::memory_order_release);
 	g_own_timeline.store(timeline, std::memory_order_release);

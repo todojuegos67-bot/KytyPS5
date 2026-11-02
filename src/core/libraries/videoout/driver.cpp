@@ -244,7 +244,18 @@ void VideoOutDriver::Flip(const Request& req) {
     BB::AntiLag::OnPresent(lat_index);
     presenter->Present(req.frame);
     BB::AntiLag::AfterPresent(lat_index);
+    if (BB::AntiLag::PaceOn() || BB::AntiLag::PhaseOn() || BB::AntiLag::PadLateOn()) {
+        // KYTY_LOWLAT pacing / Anti-Lag+ pad late (the DS videoOut rule): the game's own flip
+        // interval (flip rate + 1 vblanks) when it is above one vblank, else 0 (the pacing off).
+        const double vblank_ms = 1000.0 / EmulatorSettings.GetVblankFrequency();
+        const int vblanks = req.port->flip_rate + 1;
+        BB::AntiLag::SetPaceCap(req.frame != nullptr && vblanks > 1 ? vblank_ms * vblanks : 0.0,
+                                vblank_ms);
+    }
     BB::AntiLag::OnFlipReleased(lat_index);
+    if (BB::AntiLag::PhaseOn()) {
+        BB::AntiLag::PhaseRelease(-1.0);
+    }
     BB::AntiLag::OnPresented(lat_index);
 
     // Update flip status.
@@ -343,6 +354,13 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     if (frame != nullptr) {
         frame->lat_index = lat_index;
         BB::AntiLag::OnFlipReady(lat_index);
+        // KYTY_LOWLAT (Anti-Lag / Anti-Lag+): this frame's last host GPU tick (the DS
+        // FlipPreparation hook); the timeline wait at the next controller read uses it.
+        if (BB::AntiLag::OwnLowLatencyOn() && frame->ready_tick > 0) {
+            BB::AntiLag::OnFrameSubmitted(VK_NULL_HANDLE,
+                                          static_cast<VkSemaphore>(frame->ready_semaphore),
+                                          frame->ready_tick);
+        }
     }
 
     std::scoped_lock lock{mutex};

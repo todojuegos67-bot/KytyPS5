@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <cctype>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1338,8 +1339,94 @@ bool WantInputs() {
     return Dlssg::Ready() || Amd::Active();
 }
 
+namespace {
+// BB_ANTILAG=auto|amd2|reflex|normal|ultra|off and BB_ANTILAG_DLSSG=reflex|normal|ultra: the Demon's
+// Souls port's antilag_modo / antilag_dlssg (src/port/ds-settings.cpp, 10-24), resolved here once,
+// before the latency module reads its settings, into the KYTY_ names that module reads (BB_ first):
+//  - DLSS-G: reflex (default) = Streamline's Reflex; normal / ultra = ours with Reflex off
+//    (KYTY_DLSSG_REFLEX=off, KYTY_LOWLAT=1, KYTY_LOWLAT_QUEUE 2 / 1).
+//  - else: amd2 = AMD Anti-Lag 2 (KYTY_ANTILAG=1, VK_AMD_anti_lag); reflex = NVIDIA Reflex
+//    (KYTY_ANTILAG=1, VK_NV_low_latency2); normal = ours, 2 frames queued; ultra (Anti-Lag+) = ours,
+//    1 frame queued (KYTY_LOWLAT=1, KYTY_LOWLAT_QUEUE=2 / 1); off = none.
+//  - auto: Anti-Lag 2 where VK_AMD_anti_lag is (AMD); with AMD FSR 3 frame generation on any other
+//    GPU ours (normal), as the DS rule; without frame generation NVIDIA Reflex where
+//    VK_NV_low_latency2 is, else ours (normal).
+// The launcher's fixed Souls modes (Ligero / Equilibrado) pass ultra and BB_PAD_LATE_MS (Anti-Lag+).
+// Unset BB_ANTILAG (or the old numeric 0 / 1 / 2): unchanged, the earlier behaviour.
+std::string g_antilag_label;
+
+void ResolveAntiLag(const std::vector<std::string>& available) {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+    const auto lower = [](const char* v) {
+        std::string s = v != nullptr ? v : "";
+        for (auto& ch : s) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        return s;
+    };
+    const std::string mode = lower(std::getenv("BB_ANTILAG"));
+    const std::string dlssg = lower(std::getenv("BB_ANTILAG_DLSSG"));
+    const bool has_al2 = Has(available, "VK_AMD_anti_lag");
+    const bool has_reflex = Has(available, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
+                            Has(available, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+    const auto own = [&](bool ultra, bool dlss) {
+        SetProcessEnv("BB_LOWLAT", "1");
+        SetProcessEnv("BB_LOWLAT_QUEUE", ultra ? "1" : "2");
+        if (dlss) {
+            SetProcessEnv("BB_DLSSG_REFLEX", "off");
+        }
+    };
+    const bool dlss_fg = Cfg().kind == Kind::Dlss;
+    const bool amd_fg = Cfg().kind == Kind::Amd;
+    if (dlss_fg) {
+        if (dlssg == "normal" || dlssg == "ultra") {
+            own(dlssg == "ultra", true);
+            SetProcessEnv("BB_ANTILAG", "0");
+            g_antilag_label = dlssg == "ultra" ? "Anti-Lag+ (ultra, ours: 1 frame queued; Reflex off)"
+                                               : "Anti-Lag (normal, ours: 2 frames queued; Reflex off)";
+        } else if (!mode.empty() || !dlssg.empty()) {
+            SetProcessEnv("BB_ANTILAG", "0"); // (Streamline's own Reflex)
+            g_antilag_label = "Reflex (DLSS-G, Streamline)";
+        }
+    } else if (!mode.empty() && mode != "0" && mode != "1" && mode != "2") {
+        std::string m = mode == "no" ? "off" : mode;
+        if (m == "auto") {
+            m = has_al2 ? "amd2" : (amd_fg || !has_reflex) ? "normal" : "reflex";
+        }
+        if (m == "amd2" || m == "reflex") {
+            SetProcessEnv("BB_ANTILAG", "1");
+            g_antilag_label = m == "amd2" ? (has_al2 ? "AMD Anti-Lag 2" : "AMD Anti-Lag 2 (VK_AMD_anti_lag missing)")
+                                          : (has_reflex ? "NVIDIA Reflex" : "NVIDIA Reflex (VK_NV_low_latency2 missing)");
+        } else if (m == "normal" || m == "ultra") {
+            own(m == "ultra", false);
+            SetProcessEnv("BB_ANTILAG", "0");
+            g_antilag_label = m == "ultra" ? "Anti-Lag+ (ultra, ours: 1 frame queued)"
+                                           : "Anti-Lag (normal, ours: 2 frames queued)";
+        } else {
+            SetProcessEnv("BB_ANTILAG", "0");
+            g_antilag_label = "off";
+        }
+        if (mode == "auto") {
+            g_antilag_label = "auto -> " + g_antilag_label;
+        }
+    }
+    if (!g_antilag_label.empty()) {
+        const char* pad = Env("KYTY_PAD_LATE_MS");
+        BBLogf("Anti-Lag mode: %s (BB_ANTILAG=%s, BB_ANTILAG_DLSSG=%s, frame generation %s%s%s)",
+               g_antilag_label.c_str(), mode.empty() ? "-" : mode.c_str(),
+               dlssg.empty() ? "-" : dlssg.c_str(), Name(), pad != nullptr ? ", pad late ms " : "",
+               pad != nullptr ? pad : "");
+    }
+}
+} // namespace
+
 void AddDeviceExtensions(const std::vector<std::string>& available,
                          std::vector<const char*>& extensions) {
+    ResolveAntiLag(available);
     const auto add = [&](const char* name) {
         if (!Has(available, name)) {
             return false;
