@@ -8,6 +8,7 @@
 #include "graphics/presentation/videoOut.h"
 #include <chrono>
 #include "live-census.h"
+#include "live-counters.h"
 
 #include "common/logging/log.h"
 #include "local-platform.h"
@@ -1722,7 +1723,28 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 			}
 			g_pace_n = g_pace_sum = g_pace_sq = 0.0;
 			if (g_dlssg_dynamic && g_mode_set == 1) {
-				const double real = g_stat_real / window;
+				double real = g_stat_real / window;
+				// KYTY_DYN_FLIPWAIT_FREE=1 (A/B, off by default): the render thread's time blocked in the game's WAIT_FLIP_DONE
+				// (the present cadence of the generated frames holding the game, flip_done_wait_us) is not the game's own
+				// frame time: the level is decided on the rate without it. Off, a held 37 fps base looked game-bound and the
+				// multiplier ratcheted up to x6 (logs 1031: real 36.3, free 36.9, pacer 26.8 ms).
+				{
+					static const bool flipwait_free = [] {
+						const char* v = std::getenv("KYTY_DYN_FLIPWAIT_FREE");
+						const bool  on = v != nullptr && v[0] == '1';
+						if (on) std::printf("[dyn] KYTY_DYN_FLIPWAIT_FREE=1: the level decided on the rate without the flip wait\n");
+						return on;
+					}();
+					static uint64_t last_flipwait = 0;
+					const uint64_t  flipwait      = LiveCounters::Value(LiveCounters::FlipDoneWaitUs);
+					const double    waited        = static_cast<double>(flipwait - last_flipwait) * 1e-6;
+					last_flipwait                 = flipwait;
+					if (flipwait_free && waited > 0.0) {
+						const double unheld = g_stat_real / std::max(window - std::min(waited, 0.9 * window), 0.05);
+						std::printf("[dyn] flip wait %.0f ms of %.0f ms: real %.1f fps, without it %.1f\n", waited * 1e3, window * 1e3, real, unheld);
+						real = unheld;
+					}
+				}
 				// Free rate: frames over the time not spent in our limiter (what the game would do unlimited).
 				const double freer = g_stat_real / std::max(window - g_dyn_slept, 0.05);
 				g_dyn_slept       = 0.0;
