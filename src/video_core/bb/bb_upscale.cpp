@@ -607,7 +607,8 @@ void Checkpoint(std::string_view text) {
     static u32 lines = 0;
     std::scoped_lock lk{m};
     if (file == nullptr && lines == 0) {
-        // Appended, the last 3 runs kept: a crashing run survives the native run after it.
+        // Appended, the last 8 runs kept: a crashing run survives the native run after it, and
+        // an A/B of every upscaler in one session stays readable.
         std::string old;
         if (std::FILE* in = std::fopen("bb_upscale_init.log", "rb")) {
             char buf[4096];
@@ -621,8 +622,8 @@ void Checkpoint(std::string_view text) {
              at = old.find(marker, at + 1)) {
             starts.push_back(at);
         }
-        if (starts.size() >= 3) {
-            old = old.substr(starts[starts.size() - 2]);
+        if (starts.size() >= 8) {
+            old = old.substr(starts[starts.size() - 7]);
         }
         file = std::fopen("bb_upscale_init.log", "wb");
         if (file != nullptr) {
@@ -630,8 +631,12 @@ void Checkpoint(std::string_view text) {
             const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
             char when[64]{};
             std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-            std::fprintf(file, "==== run %s (BB_UPSCALER=%s) ====\n", when,
-                         Env("BB_UPSCALER") ? Env("BB_UPSCALER") : "");
+            std::fprintf(file,
+                         "==== run %s (BB_UPSCALER=%s, BB_UPSCALE_MODE=%s, BB_SCENE_UPSCALE=%s) "
+                         "====\n",
+                         when, Env("BB_UPSCALER") ? Env("BB_UPSCALER") : "",
+                         Env("BB_UPSCALE_MODE") ? Env("BB_UPSCALE_MODE") : "",
+                         Env("BB_SCENE_UPSCALE") ? Env("BB_SCENE_UPSCALE") : "");
             std::fflush(file);
         }
     }
@@ -1858,6 +1863,20 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                                    "{}x{}:{}",
                                    g_ss_count, g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, ratio, width,
                                    height, list));
+        }
+        if (!g_ss_frozen.load(std::memory_order_relaxed) && f.gb_depth != 0 &&
+            (f.gb_w != width || f.gb_h != height || ratio <= 1.01)) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                Checkpoint(fmt::format(
+                    "scene upscale (BB_SCENE_UPSCALE=1) not active: {}", ratio <= 1.01
+                        ? std::string("the mode is native (ratio 1), nothing to upscale")
+                        : fmt::format("the game renders its scene at {}x{} but outputs {}x{}; it "
+                                      "needs the resolution patch at the output size (internal "
+                                      "= window), the mode then sets the scene size",
+                                      f.gb_w, f.gb_h, width, height)));
+            }
         }
         g_ss_candidates.clear();
     }
