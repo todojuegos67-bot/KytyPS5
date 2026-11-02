@@ -391,6 +391,7 @@ void Work() {
 	const fs::path& root  = g_setup.root;
 	const fs::path& seeds = g_setup.seeds;
 	const std::string& id = g_setup.id;
+	const std::wstring variants = L" --native-variants"; // (ds-pc-port48: the plan and every shard, below)
 	const bool all_cpu    = true; // (ds-pc-port47) every CPU thread of the PC, always (was the "relajado" choice too)
 	const int  logical    = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
 	// All CPU threads: one process of 3 threads per 3 CPUs (precompile-windows.ps1). Relaxed: the port's own bounds (10-27c,
@@ -507,7 +508,6 @@ void Work() {
 	// misses ("not among the precompiled") were native and table variants while every shard of its precompile saved all it
 	// planned (shards "N created from the store, 0 captured, 0 left out"): what the store lacks the plan never named. Same
 	// flag in the plan and in every shard (a shard makes what the plan gives it).
-	const std::wstring variants = L" --native-variants";
 	if (has_recorded && !plan_step("plan-recorded", L"--seeds " + Quote(recorded) + L" --dry-run --plan " + Quote(plan) + variants)) use_plan = false;
 	if (use_plan) {
 		std::wstring args = L"--seeds " + Quote(seeds) + L" --dry-run --plan " + Quote(plan) + L" --static-inputs" + variants;
