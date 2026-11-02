@@ -727,20 +727,22 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		// SpirvBloat (images): every run is a separate case of a switch at every access.
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
-			uint32_t mipped = 0, dims = 0, formats = 0, slots = 0;
+			uint32_t mipped = 0, dims = 0, formats = 0, swizzles = 0, classes = 0, slots = 0;
 			for (size_t i = 1; i < runs.size(); ++i) {
 				const auto& a = state.program.info.images[runs[i - 1].resource];
 				const auto& b = state.program.info.images[runs[i].resource];
 				if (a.mip_count != 1u || b.mip_count != 1u) ++mipped;
 				else if (a.dimension != b.dimension || a.cube != b.cube) ++dims;
-				else if (a.shader_swizzle != b.shader_swizzle || a.conversion_format != b.conversion_format ||
-				         a.numeric_class != b.numeric_class) ++formats;
+				else if (a.numeric_class != b.numeric_class) ++classes;
+				else if (a.conversion_format != b.conversion_format) ++formats;
+				else if (a.shader_swizzle != b.shader_swizzle) ++swizzles;
 				else ++slots;
 			}
 			std::printf("SpirvBloat: hash=0x%016llx image %u: %zu candidates in %zu runs (breaks: mips %u, dim %u, "
-			            "format/swizzle/class %u, slot/kind %u)\n",
+			            "class %u, format %u, swizzle %u, slot/kind %u)\n",
 			            static_cast<unsigned long long>(state.program.shader_hash), mem.resource,
-			            image.indirect_resources.size(), runs.size(), mipped, dims, formats, slots);
+			            image.indirect_resources.size(), runs.size(), mipped, dims, classes, formats,
+			            swizzles, slots);
 			std::fflush(stdout);
 		}
 	}

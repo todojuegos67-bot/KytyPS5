@@ -621,8 +621,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.UpdateSize();
 	}
 	const auto alignment = desc.info.DataAlignment();
-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+	if (desc.info.data.size == 0 || alignment == 0 ||
+	    (address & (static_cast<uint64_t>(alignment) - 1u)) != 0) {
+		// Name the failing condition and the T# instead of a bare NOT_IMPLEMENTED. For tiled
+		// surfaces the low address bits inside the swizzle block may be a pipe/bank XOR on
+		// RDNA; that is not modelled, so the binding must still stop rather than alias memory.
+		EXIT("texture binding layout rejected (%s): addr=0x%016" PRIx64 " size=0x%" PRIx64
+		     " alignment=0x%x misalign=0x%" PRIx64 " format=%u tile=%u type=%u extent=%ux%ux%u "
+		     "levels=%u/%u layers=%u base=%u last=%u storage=%d dwords=%08x,%08x,%08x,%08x,"
+		     "%08x,%08x,%08x,%08x\n",
+		     desc.info.data.size == 0 ? "size=0" : alignment == 0 ? "alignment=0" : "misaligned",
+		     address, static_cast<uint64_t>(desc.info.data.size), alignment,
+		     alignment != 0 ? (address & (static_cast<uint64_t>(alignment) - 1u)) : 0ull,
+		     static_cast<uint32_t>(format), static_cast<uint32_t>(tile),
+		     static_cast<uint32_t>(type), width, height, depth, levels, physical_levels,
+		     image_layers, base_level, last_level, storage ? 1 : 0, descriptor.fields[0],
+		     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+		     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+		     descriptor.fields[7]);
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
