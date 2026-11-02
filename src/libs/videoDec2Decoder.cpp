@@ -495,6 +495,16 @@ void Trace(const char* site, int32_t result, const Output* output, const char* e
 	Counter*                                          counter = nullptr;
 	{
 		std::scoped_lock lock(mutex);
+		// Counters are global per call site, so a second movie (e.g. cinematic2d after the
+		// splash) only printed every 512th Decode and looked like it never decoded. Restart
+		// the per-site sampling at each CreateDecoder so every movie logs its first frames.
+		if (std::strcmp(site, "Videodec2.CreateDecoder.in") == 0) {
+			for (auto& [name, existing]: counters) {
+				if (existing == nullptr || name == site) continue;
+				existing->calls.store(0, std::memory_order_relaxed);
+				existing->frames.store(0, std::memory_order_relaxed);
+			}
+		}
 		auto&            slot = counters[site];
 		if (slot == nullptr) slot = new Counter;
 		counter = slot;
