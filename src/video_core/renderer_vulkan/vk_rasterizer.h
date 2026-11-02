@@ -51,6 +51,10 @@ public:
     // Bloodborne upscaling to the window size (vk_rasterizer_bb.cpp): when this frame's flip image
     // was upscaled before its HUD, adds the HUD onto the upscaled image (recorded into cmd, the
     // flip image in shader-read layout) and returns that image's view and size to present.
+    // The presenter's view format of the flip (GetFrameViewFormat): A8R8G8B8 display buffers are
+    // viewed as B8G8R8A8 over the R8G8B8A8 flip image, which swaps red and blue natively; the
+    // window-size path reads the flip through the same format (0.24).
+    void BBSetPresentViewFormat(vk::Format view_format);
     bool BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& flip, vk::Format view_format,
                             vk::ImageView& out_view, vk::Extent2D& out_size);
     // Copies the presented image (before its HUD) and records the window-size upscale of it.

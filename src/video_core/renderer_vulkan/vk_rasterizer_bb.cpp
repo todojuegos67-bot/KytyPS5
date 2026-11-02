@@ -90,6 +90,7 @@ struct BBVk {
     u64 upscales = 0;
     std::string check_what;
     vk::Format present_src_format = vk::Format::eUndefined; // the flip image present_in copies
+    vk::Format present_view_format = vk::Format::eUndefined; // the presenter's view of the flip
     // present_in holds sRGB-encoded (perceptual) LDR values: the upscaler is given and returns
     // encoded colour, the HUD composite decodes it (bb_hud.comp flag 1).
     bool present_encoded = false;
@@ -541,6 +542,22 @@ vk::Format SampledFormat(vk::Format image_format, vk::Format view_format) {
                : image_format;
 }
 
+// The format the native presenter reads the flip through when it is the same 8-bit RGBA layout
+// (R8G8B8A8 vs B8G8R8A8, sRGB kept as the flip's): else the flip's own format.
+vk::Format PresentReadFormat(vk::Format flip) {
+    const vk::Format view = g_bb.present_view_format;
+    const auto is8 = [](vk::Format f) {
+        const vk::Format u = Unorm(f);
+        return u == vk::Format::eR8G8B8A8Unorm || u == vk::Format::eB8G8R8A8Unorm;
+    };
+    if (view == vk::Format::eUndefined || !is8(view) || !is8(flip)) {
+        return flip;
+    }
+    return IsSrgb(flip) ? (Unorm(view) == vk::Format::eB8G8R8A8Unorm ? vk::Format::eB8G8R8A8Srgb
+                                                                     : vk::Format::eR8G8B8A8Srgb)
+                        : Unorm(view);
+}
+
 const char* ColourSpace(vk::Format f) {
     switch (f) {
     case vk::Format::eR16G16B16A16Sfloat:
@@ -909,8 +926,14 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
     // real format, while every other read of the flip here (final_view, the 0.22 raw copy, the
     // presenter's view) reinterprets its bytes in flip.info.pixel_format order.
     const bool raw_srgb = !encoded && IsSrgb(flip.info.pixel_format) && !plan.hdr;
-    const vk::Format in_format = encoded    ? Unorm(flip.info.pixel_format)
-                                 : raw_srgb ? flip.info.pixel_format
+    // 0.24: the flip as the native presenter reads it (its view format): the game writes BGRA
+    // bytes into its R8G8B8A8 flip (deadinside28 gpu/render/presenter.cpp notes the same), and the
+    // presenter's B8G8R8A8 view puts red and blue back. Build 73 read the flip as R8G8B8A8 here:
+    // red and blue swapped (blue fire, HUD and icons; the self-check's 'game' blue > red on a
+    // brown street).
+    const vk::Format read_format = PresentReadFormat(flip.info.pixel_format);
+    const vk::Format in_format = encoded    ? Unorm(read_format)
+                                 : raw_srgb ? read_format
                                             : vk::Format::eR16G16B16A16Sfloat;
     if (!EnsureImage(g_bb.present_in, extent, in_format,
                      vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
@@ -972,6 +995,15 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
     return true;
 }
 
+void Rasterizer::BBSetPresentViewFormat(vk::Format view_format) {
+    if (g_bb.present_view_format != view_format) {
+        g_bb.present_view_format = view_format;
+        BB::Upscale::Checkpoint(fmt::format("window-size path: the flip is read as the presenter "
+                                            "views it: {}",
+                                            vk::to_string(view_format)));
+    }
+}
+
 bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& flip,
                                     vk::Format view_format, vk::ImageView& out_view,
                                     vk::Extent2D& out_size) {
@@ -1000,7 +1032,8 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
         BB::Upscale::OnPresentFailed(g_bb.present_why);
         return false;
     }
-    const auto final_view = TransientView(scheduler, flip.GetImage(), flip.info.pixel_format,
+    const auto final_view = TransientView(scheduler, flip.GetImage(),
+                                          PresentReadFormat(flip.info.pixel_format),
                                           vk::ImageAspectFlagBits::eColor);
     if (!final_view) {
         g_bb.present_why = "no view of the presented image";
