@@ -772,16 +772,24 @@ void PollLuminance(Scheduler& scheduler) {
     }
     const double src = v[0] / 65536.0 / n, out = v[1] / 65536.0 / n;
     const double sat_src = v[4] / 65536.0 / n, sat_out = v[5] / 65536.0 / n;
+    // Contrast (0.23): the standard deviation of the grid's luminance, game and ours. A washed-out
+    // image keeps its mean but loses spread.
+    const double sq_src = v[6] / 65536.0 / n, sq_out = v[7] / 65536.0 / n;
+    const double sd_src = std::sqrt(std::max(0.0, sq_src - src * src));
+    const double sd_out = std::sqrt(std::max(0.0, sq_out - out * out));
+    const double sd_diff = sd_src > 1e-4 ? std::fabs(sd_out - sd_src) / sd_src : 0.0;
     const double diff = src > 1e-4 ? std::fabs(out - src) / src : std::fabs(out - src);
     const double sat_diff =
         sat_src > 1e-3 ? std::fabs(sat_out - sat_src) / sat_src : std::fabs(sat_out - sat_src);
     const std::string text = fmt::format(
         "colour self-check (frame 120, {} grid points of 64x64): luminance game {:.4f}, ours "
-        "{:.4f} ({:+.1f} %); saturation game {:.4f}, ours {:.4f} ({:+.1f} %){}",
+        "{:.4f} ({:+.1f} %); saturation game {:.4f}, ours {:.4f} ({:+.1f} %); contrast (luminance "
+        "s.d.) game {:.4f}, ours {:.4f} ({:+.1f} %){}",
         n, src, out, src > 1e-4 ? (out - src) / src * 100.0 : 0.0, sat_src, sat_out,
-        sat_src > 1e-3 ? (sat_out - sat_src) / sat_src * 100.0 : 0.0,
+        sat_src > 1e-3 ? (sat_out - sat_src) / sat_src * 100.0 : 0.0, sd_src, sd_out,
+        sd_src > 1e-4 ? (sd_out - sd_src) / sd_src * 100.0 : 0.0,
         g_bb.present_encoded ? " (upscaler on sRGB-encoded LDR)" : " (upscaler on linear)");
-    if (diff > 0.05 || sat_diff > 0.08) {
+    if (diff > 0.05 || sat_diff > 0.08 || sd_diff > 0.08) {
         LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] WARNING: {} - colour / gamma mismatch", text);
         BB::Upscale::Checkpoint("WARNING: " + text + " - colour / gamma mismatch");
     } else {
@@ -870,7 +878,19 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
         const char* v = std::getenv("BB_SR_LDR_LINEAR");
         return v != nullptr && *v == '1';
     }();
-    const bool encoded = IsSrgb(flip.info.pixel_format) && !plan.hdr && !ldr_linear;
+    // 0.23 (colour): FSR 4 is given linear light, as deadinside28/bloodborne_pc (GPL-2.0)
+    // gpu/upscale/vk_temporal_upscaler.cpp RunScaled does ("FSR 4 treats its colour as linear
+    // light ... An sRGB-format frame is decoded by its view already"): the flip through its sRGB
+    // view into RGBA16F, the result linear, the composite decodes nothing. Fed the sRGB-encoded
+    // bytes, FSR 4 handled perceptual values as light (washed-out image, the colour self-check's
+    // -6.7 % luminance of 11-02). BB_SR_LDR_ENCODED=1: the encoded input again (A/B).
+    static const bool ldr_encoded = [] {
+        const char* v = std::getenv("BB_SR_LDR_ENCODED");
+        return v != nullptr && *v == '1';
+    }();
+    const bool fsr4_linear = BB::Upscale::Cfg().kind == BB::SR::Kind::Fsr4 && !ldr_encoded;
+    const bool encoded =
+        IsSrgb(flip.info.pixel_format) && !plan.hdr && !ldr_linear && !fsr4_linear;
     const vk::Format in_format =
         encoded ? Unorm(flip.info.pixel_format) : vk::Format::eR16G16B16A16Sfloat;
     if (!EnsureImage(g_bb.present_in, extent, in_format,
