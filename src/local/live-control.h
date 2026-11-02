@@ -188,7 +188,8 @@ inline void Flip() {
 				static constexpr std::array guest {G::WindowFault, G::WriteFault, G::ReadFault, G::Reprotect, G::Unprotect,
 				                                   G::ProtectCalls, G::SyncReadsGuest, G::SyncDownloads, G::GuestCommands,
 				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs,
-				                                   G::FlipDoneWaitUs, G::FaultWindowNs, G::FaultWriteNs, G::FaultReadNs};
+				                                   G::FlipDoneWaitUs, G::FaultWindowNs, G::FaultWriteNs, G::FaultReadNs,
+				                                   G::HotPagesNew, G::HotPagesKept};
 				static std::array<uint64_t, guest.size()> last_guest {};
 				std::printf("[fps+]");
 				for (size_t i = 0; i < guest.size(); ++i) {

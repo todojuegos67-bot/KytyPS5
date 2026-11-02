@@ -151,8 +151,10 @@ public:
 			manager->lock.lock();
 			if (last_dirty != nullptr) *last_dirty = std::max(*last_dirty, manager->LastDirtyClock());
 			if (defer) PageManager::SetDeferredWriteProtectSink(&ranges);
+			RegionManager::t_hot_keep = !is_written && HotPagesOn();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
+			RegionManager::t_hot_keep = false;
 			if (defer) {
 				PageManager::SetDeferredWriteProtectSink(nullptr);
 				for (const auto& range: ranges) {

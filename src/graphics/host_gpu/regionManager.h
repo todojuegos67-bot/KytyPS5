@@ -9,6 +9,8 @@
 #include "writeback-verify.h"
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <immintrin.h>
 #include <mutex>
 #include <utility>
@@ -127,6 +129,23 @@ inline std::atomic<uint64_t> g_cpu_dirty_clock {1};
 	return g_cpu_dirty_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
+// KYTY_HOT_PAGES=1 (A/B, off by default): a page the game writes every frame (a write-window fault two game frames
+// running) stays CPU-dirty and writable after its uploads instead of being write-protected again: the re-protect and
+// the next frame's fault are saved, and every use uploads it (dirty: always read from guest memory, as for any page
+// written since its last upload). Correct by construction: the region proves nothing by its epoch while it holds hot
+// pages (CpuModificationEpoch 0), its dirty clock moves at each kept upload (no upload hoisted before an earlier
+// command), and a hot page the GPU writes is made clean first. Hot pages are dropped every 64 game frames (written
+// still, they fault and qualify again).
+[[nodiscard]] inline bool HotPagesOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_HOT_PAGES");
+		const bool  enabled = v != nullptr && v[0] == '1';
+		if (enabled) std::printf("Memory tracking: pages written every frame kept writable (KYTY_HOT_PAGES=1)\n");
+		return enabled;
+	}();
+	return on;
+}
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -148,6 +167,8 @@ public:
 		// Pages marked clean whose write protection is still queued can change unseen:
 		// nothing is provable until the worker applied it (and moved the epoch).
 		if (m_deferred_protects.load(std::memory_order_acquire) != 0) return 0;
+		// (KYTY_HOT_PAGES: writable dirty pages change unseen.)
+		if (m_hot_any.load(std::memory_order_acquire)) return 0;
 		return m_cpu_epoch.load(std::memory_order_acquire);
 	}
 	// KYTY_ASYNC_REPROTECT: a write protection of pages in this region is queued.
@@ -160,6 +181,30 @@ public:
 		m_page_manager.ReapplyProtection(vaddr, size);
 		m_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
 		m_deferred_protects.fetch_sub(1, std::memory_order_acq_rel);
+	}
+
+	// KYTY_HOT_PAGES: a write-window fault on [vaddr, vaddr + size) (under the region lock).
+	void NoteWindowFault(uint64_t vaddr, uint64_t size) {
+		const uint64_t frame = LiveCounters::g_game_frames.load(std::memory_order_relaxed);
+		if (frame != m_fault_frame) {
+			if (frame == m_fault_frame + 1) m_fault_prev = m_fault_cur; else m_fault_prev.Clear();
+			m_fault_cur.Clear();
+			m_fault_frame = frame;
+		}
+		if ((frame >> 6u) != m_hot_epoch) { // (every 64 frames: the hot set learned again)
+			m_hot_epoch = frame >> 6u;
+			m_hot.Clear();
+			m_hot_any.store(false, std::memory_order_release);
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits pages;
+		pages.SetRange(start, end);
+		m_fault_cur |= pages;
+		RegionBits fresh = pages & m_fault_prev & ~m_hot;
+		if (fresh.None()) return;
+		m_hot |= fresh;
+		m_hot_any.store(true, std::memory_order_release);
+		LiveCounters::Add(LiveCounters::HotPagesNew, fresh.Count());
 	}
 
 	template <DirtySource source, bool all = false>
@@ -179,6 +224,19 @@ public:
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
+			// (KYTY_HOT_PAGES: a page the GPU writes is hot no more. One left dirty by an upload holds what was uploaded
+			// unless the game wrote it since, which without hot pages would have faulted it dirty and ended here too:
+			// made clean and watched, as its upload would have.)
+			if (m_hot_any.load(std::memory_order_relaxed) && m_hot.AnyInRange(start, end)) {
+				RegionBits range;
+				range.SetRange(start, end);
+				const RegionBits kept = range & m_hot & m_cpu_dirty;
+				m_hot &= ~range;
+				if (!kept.None()) {
+					m_cpu_dirty &= ~kept;
+					UpdateCpuProtection<true>(start, end);
+				}
+			}
 			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
@@ -234,6 +292,21 @@ public:
 			GetBits<source>().UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu && clear) {
+			// KYTY_HOT_PAGES: hot pages of an upload for reading stay dirty and writable (uploaded again at each use).
+			if (m_hot_any.load(std::memory_order_relaxed) &&
+			    (LiveCounters::g_game_frames.load(std::memory_order_relaxed) >> 6u) != m_hot_epoch) {
+				m_hot.Clear(); // (learned again: a page still written every frame faults and qualifies again)
+				m_hot_any.store(false, std::memory_order_release);
+			}
+			if (t_hot_keep && m_hot_any.load(std::memory_order_relaxed)) {
+				RegionBits keep = mask & m_hot;
+				if (!keep.None()) {
+					m_cpu_dirty |= keep;
+					m_cpu_epoch.fetch_add(1, std::memory_order_release);
+					m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+					LiveCounters::Add(LiveCounters::HotPagesKept, keep.Count());
+				}
+			}
 			UpdateCpuProtection<true>(start, end);
 			ForEachRange(mask, std::forward<Func>(func));
 			return;
@@ -339,6 +412,17 @@ private:
 	RegionBits            m_gpu_dirty;
 	RegionBits            m_writable;
 	RegionBits            m_readable;
+	// KYTY_HOT_PAGES (under the lock but m_hot_any).
+	RegionBits            m_hot;
+	RegionBits            m_fault_cur;
+	RegionBits            m_fault_prev;
+	uint64_t              m_fault_frame = ~0ull;
+	uint64_t              m_hot_epoch   = ~0ull;
+	std::atomic<bool>     m_hot_any {false};
+
+public:
+	// Set by MemoryTracker::ForEachUploadRange: hot pages may stay dirty (an upload for reading only).
+	static inline thread_local bool t_hot_keep = false;
 };
 
 } // namespace Libs::Graphics

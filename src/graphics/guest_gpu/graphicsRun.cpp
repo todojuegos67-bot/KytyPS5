@@ -2358,6 +2358,7 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 
 	// (Time blocked here is neither idle nor work: the flip/present cadence holding the game, e.g. frame generation.)
 	LiveCounters::ScopedUs flip_wait(LiveCounters::FlipDoneWaitUs);
+	LiveCounters::g_game_frames.fetch_add(1, std::memory_order_relaxed);
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
 }
