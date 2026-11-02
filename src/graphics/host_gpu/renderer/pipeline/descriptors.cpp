@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -620,7 +622,31 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		desc.info.UpdateSize();
 	}
-	const auto alignment = desc.info.DataAlignment();
+	// GFX10 SW_256B_S / SW_4KB_S / SW_64KB_S (tile 1/5/9) have no _X variant bits: the T#
+	// base address is a plain 256-byte-granular byte address that the TA adds to the swizzled
+	// offset, so a texture packed at a 256 B (not swizzle-block) boundary is legal and its
+	// bytes are simply shifted. Only XOR modes (kDepth=SW_64KB_Z_X, kRenderTarget=SW_64KB_R_X)
+	// carry pipe/bank XOR in the low base bits, and those keep the block-alignment check.
+	// The compact-mip path keeps its own stricter alignment.
+	const bool plain_swizzle = tile == Prospero::TileMode::kStandard256B ||
+	                           tile == Prospero::TileMode::kStandard4KB ||
+	                           tile == Prospero::TileMode::kStandard64KB;
+	const auto layout_alignment = desc.info.DataAlignment();
+	const auto alignment = plain_swizzle && layout_alignment == desc.info.tiling.block.block_size
+	                           ? std::min<uint32_t>(layout_alignment, 256u)
+	                           : layout_alignment;
+	if (alignment != layout_alignment &&
+	    (address & (static_cast<uint64_t>(layout_alignment) - 1u)) != 0) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+			std::printf("Descriptors: tiled texture at sub-block offset: addr=0x%016" PRIx64
+			            " tile=%u block=0x%x offset=0x%" PRIx64 " format=%u %ux%u levels=%u\n",
+			            address, static_cast<uint32_t>(tile), layout_alignment,
+			            address & (static_cast<uint64_t>(layout_alignment) - 1u),
+			            static_cast<uint32_t>(format), width, height, levels);
+			std::fflush(stdout);
+		}
+	}
 	if (desc.info.data.size == 0 || alignment == 0 ||
 	    (address & (static_cast<uint64_t>(alignment) - 1u)) != 0) {
 		// Name the failing condition and the T# instead of a bare NOT_IMPLEMENTED. For tiled
