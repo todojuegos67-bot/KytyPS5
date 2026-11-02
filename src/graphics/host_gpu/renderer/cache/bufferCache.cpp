@@ -16,6 +16,10 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -297,6 +301,34 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+static uint64_t ReadbackWindowBytes() {
+	static const uint64_t bytes = [] {
+		const char* v = std::getenv("KYTY_READBACK_WINDOW_KB");
+		return (v != nullptr ? std::strtoull(v, nullptr, 10) : 2048ull) * 1024ull;
+	}();
+	return bytes;
+}
+
+// Readback: count of GPU->CPU syncs per 5 s (guest faults vs Thread_Gpu's own reads).
+static void NoteReadback(bool gpu_thread) {
+	static std::atomic<uint64_t> guest {0}, gpu {0};
+	static std::atomic<int64_t>  next {0};
+	(gpu_thread ? gpu : guest).fetch_add(1, std::memory_order_relaxed);
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch()).count();
+	auto due = next.load(std::memory_order_relaxed);
+	if (due == 0) {
+		next.compare_exchange_strong(due, now + 5000);
+		return;
+	}
+	if (now < due || !next.compare_exchange_strong(due, now + 5000)) return;
+	std::printf("Readback (5 s): %llu from guest faults, %llu from Thread_Gpu (window %llu KiB)\n",
+	            static_cast<unsigned long long>(guest.exchange(0)),
+	            static_cast<unsigned long long>(gpu.exchange(0)),
+	            static_cast<unsigned long long>(ReadbackWindowBytes() / 1024));
+	std::fflush(stdout);
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	PhaseStats::Scope phase {PhaseStats::GuestPhase(PhaseStats::RenderFault, PhaseStats::OtherFault)};
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -310,8 +342,31 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// A read needs only the faulting page, but a guest that walks a GPU-written buffer used to
+		// fault (and flush + wait for the GPU) once per page: Yotei cinematic ~8,900 guest faults
+		// and ~19,000 GPU waits per 5 s, ~0.5 ms each. A read fetches every GPU-dirty byte of the
+		// same buffer in a window around the fault in that one wait, so the next pages no longer
+		// fault. Only GPU-modified bytes are copied (DownloadBufferMemory) and they are the
+		// current data as of this point in the command stream, exactly what a later per-page
+		// fault would have downloaded; later GPU writes mark their pages dirty again.
+		// KYTY_READBACK_WINDOW_KB=<n> (default 2048; 0 = only the faulting range).
+		auto       start = vaddr;
+		auto       bytes = size;
+		const auto window = ReadbackWindowBytes();
+		if (!is_write && window != 0) {
+			const auto buffer_begin = buffer.CpuAddress();
+			const auto buffer_end   = buffer_begin + buffer.Size();
+			const auto page         = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+			const auto lo = page - std::min<uint64_t>(page - buffer_begin, window / 4);
+			const auto hi = std::max(vaddr + size, std::min<uint64_t>(buffer_end, page + window));
+			if (lo >= buffer_begin && hi <= buffer_end && lo <= vaddr) {
+				start = lo;
+				bytes = hi - lo;
+			}
+		}
+		NoteReadback(GuestGpu::IsGpuThread());
+		if (DownloadBufferMemory<false>(buffer, start, bytes)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(start, bytes);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
