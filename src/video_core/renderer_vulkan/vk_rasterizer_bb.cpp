@@ -778,6 +778,16 @@ void PollLuminance(Scheduler& scheduler) {
     const double sd_src = std::sqrt(std::max(0.0, sq_src - src * src));
     const double sd_out = std::sqrt(std::max(0.0, sq_out - out * out));
     const double sd_diff = sd_src > 1e-4 ? std::fabs(sd_out - sd_src) / sd_src : 0.0;
+    // Channel order (0.23): mean red and blue of the game's image (as the presenter reads it) and
+    // of ours. Red and blue exchanged between the two is a swapped channel order.
+    const double r_src = v[8] / 65536.0 / n, r_out = v[9] / 65536.0 / n;
+    const double b_src = v[10] / 65536.0 / n, b_out = v[11] / 65536.0 / n;
+    const bool swapped = std::fabs(r_src - b_src) > 0.01 &&
+                         std::fabs(r_out - b_src) + std::fabs(b_out - r_src) <
+                             0.5 * (std::fabs(r_out - r_src) + std::fabs(b_out - b_src));
+    const std::string channels = fmt::format(
+        "; red game {:.4f} ours {:.4f}, blue game {:.4f} ours {:.4f}{}", r_src, r_out, b_src,
+        b_out, swapped ? " - RED AND BLUE SWAPPED" : "");
     const double diff = src > 1e-4 ? std::fabs(out - src) / src : std::fabs(out - src);
     const double sat_diff =
         sat_src > 1e-3 ? std::fabs(sat_out - sat_src) / sat_src : std::fabs(sat_out - sat_src);
@@ -788,8 +798,9 @@ void PollLuminance(Scheduler& scheduler) {
         n, src, out, src > 1e-4 ? (out - src) / src * 100.0 : 0.0, sat_src, sat_out,
         sat_src > 1e-3 ? (sat_out - sat_src) / sat_src * 100.0 : 0.0, sd_src, sd_out,
         sd_src > 1e-4 ? (sd_out - sd_src) / sd_src * 100.0 : 0.0,
-        g_bb.present_encoded ? " (upscaler on sRGB-encoded LDR)" : " (upscaler on linear)");
-    if (diff > 0.05 || sat_diff > 0.08 || sd_diff > 0.08) {
+        g_bb.present_encoded ? " (upscaler on sRGB-encoded LDR)" : " (upscaler on linear)") +
+        channels;
+    if (diff > 0.05 || sat_diff > 0.08 || sd_diff > 0.08 || swapped) {
         LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] WARNING: {} - colour / gamma mismatch", text);
         BB::Upscale::Checkpoint("WARNING: " + text + " - colour / gamma mismatch");
     } else {
@@ -892,8 +903,15 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
     const bool fsr4_linear = !ldr_encoded;
     const bool encoded =
         IsSrgb(flip.info.pixel_format) && !plan.hdr && !ldr_linear && !fsr4_linear;
-    const vk::Format in_format =
-        encoded ? Unorm(flip.info.pixel_format) : vk::Format::eR16G16B16A16Sfloat;
+    // 0.23 (channel order): the linear input is the flip's raw bytes in an image of the flip's own
+    // sRGB format (decoded to linear on read), not a blit. Build 71's blit into RGBA16F swapped red
+    // and blue (blue HUD bar, fire and item icons; purple blood): a blit converts by the image's
+    // real format, while every other read of the flip here (final_view, the 0.22 raw copy, the
+    // presenter's view) reinterprets its bytes in flip.info.pixel_format order.
+    const bool raw_srgb = !encoded && IsSrgb(flip.info.pixel_format) && !plan.hdr;
+    const vk::Format in_format = encoded    ? Unorm(flip.info.pixel_format)
+                                 : raw_srgb ? flip.info.pixel_format
+                                            : vk::Format::eR16G16B16A16Sfloat;
     if (!EnsureImage(g_bb.present_in, extent, in_format,
                      vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
         g_bb.present_why = "the upscaler input image could not be created";
@@ -924,7 +942,7 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .dstOffsets = corners,
     };
-    if (encoded) {
+    if (encoded || raw_srgb) {
         // Same size class (sRGB and its UNORM twin): the raw bytes, no decode.
         const vk::ImageCopy copy{
             .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
@@ -992,7 +1010,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     // The luminance self-check buffer (bound every frame, written on frame 120 only).
     if (!g_bb.lum_buffer) {
         const VkBufferCreateInfo ci = vk::BufferCreateInfo{
-            .size = 32,
+            .size = 48,
             .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
         };
         VmaAllocationCreateInfo alloc{};
@@ -1012,7 +1030,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     ++g_bb.composites;
     const bool measure = g_bb.composites == 120 && !g_bb.lum_pending;
     if (measure) {
-        cmd.fillBuffer(g_bb.lum_buffer, 0, 32, 0);
+        cmd.fillBuffer(g_bb.lum_buffer, 0, 48, 0);
         const vk::MemoryBarrier2 fill{
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
@@ -1036,7 +1054,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     const vk::DescriptorImageInfo bare_info{g_bb.linear, g_bb.present_in.view,
                                             vk::ImageLayout::eShaderReadOnlyOptimal};
     const vk::DescriptorImageInfo out_info{{}, g_bb.present.view, vk::ImageLayout::eGeneral};
-    const vk::DescriptorBufferInfo lum_info{g_bb.lum_buffer, 0, 32};
+    const vk::DescriptorBufferInfo lum_info{g_bb.lum_buffer, 0, 48};
     const std::array writes{
         vk::WriteDescriptorSet{
             .dstBinding = 0,
@@ -1389,8 +1407,9 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         const std::string formats = fmt::format(
             "{}{} ({}, {} flag) -> {}{}",
             !copy                  ? ""
-            : g_bb.present_encoded ? "raw UNORM copy of "
-                                   : "RGBA16F copy of ",
+            : g_bb.present_encoded       ? "raw UNORM copy of "
+            : IsSrgb(g_bb.present_in.format) ? "raw sRGB copy (bytes as they are) of "
+                                             : "RGBA16F copy of ",
             vk::to_string(src),
             copy && g_bb.present_encoded ? "sRGB-encoded perceptual values, as LDR upscalers take"
                                          : ColourSpace(src),
