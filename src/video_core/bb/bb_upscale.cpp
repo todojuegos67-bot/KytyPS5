@@ -373,6 +373,9 @@ struct FrameState {
     u32 scene_draws = 0;
     u32 scanned = 0;
     bool camera_ok = false; // a translated view-projection seen in two scene draws
+    // 0.23: the camera of the game's 864-byte scene constant block (BlockCamera), the largest
+    // pass's (render size area) this frame; 0 = none seen.
+    u64 block_area = 0;
     u64 scanned_draw = ~0ULL;
     u32 flip_draws = 0, hud_draws = 0, hud_other = 0, src_rewrites = 0;
     bool injected = false, inject_failed = false, redirecting = false, hudless = false;
@@ -559,6 +562,56 @@ const Candidate* BestCamera() {
     if (best == nullptr) return nullptr;
     const u32 need = std::max<u32>(3, g_frame.scanned / 8);
     return best->count >= need ? best : nullptr;
+}
+
+// 0.23: Bloodborne's scene constant block (864 bytes; deadinside28's vk_camera_motion.cpp
+// OnConstants): [0] far plane 3000, [1] 1 / far, [4] [5] the render size, floats 8-19 the view
+// (3x4, row-major, translation in the 4th column), 180-191 its inverse, 52-67 the projection
+// (4x4 row-major). Its view-projection is the frame's camera outright (a candidate no scanned
+// constant outranks); the scan keeps running for the jitter's vertex-camera test.
+// BB_CAMERA_BLOCK=0: the 0.22 scan only.
+bool BlockCamera(FrameState& f, const float* d, size_t size) {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_CAMERA_BLOCK");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (!on || size < 864 || d[0] != 3000.0f || std::fabs(d[1] * d[0] - 1.0f) > 1e-3f ||
+        !(d[4] >= 64.0f) || !(d[5] >= 64.0f) || d[4] > 16384.0f || d[5] > 16384.0f) {
+        return false;
+    }
+    const u64 area = static_cast<u64>(d[4]) * static_cast<u64>(d[5]);
+    if (area <= f.block_area) {
+        return false; // (a smaller pass: a reflection's camera; or this one again)
+    }
+    Mat view, proj;
+    for (int i = 0; i < 12; ++i) view.m[i] = d[8 + i];
+    view.m[15] = 1.0;
+    for (int i = 0; i < 16; ++i) proj.m[i] = d[52 + i];
+    const Mat vp = Multiply(proj, view);
+    static u32 rejected = 0;
+    if (!LooksLikeViewProj(vp)) {
+        if (rejected++ < 4) {
+            Checkpoint(fmt::format("camera block: rejected (view-projection not camera-like): "
+                                   "proj {:.4g} {:.4g} {:.4g} {:.4g} / w row {:.4g} {:.4g} {:.4g} "
+                                   "{:.4g}",
+                                   d[52], d[57], d[62], d[63], d[64], d[65], d[66], d[67]));
+        }
+        return false;
+    }
+    f.block_area = area;
+    std::erase_if(f.camera, [](const Candidate& c) { return c.count >= 1000000; });
+    f.camera.push_back({vp, 1000000, f.draws});
+    f.camera_ok = true;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        Checkpoint(fmt::format("camera block: the scene constant block's camera ({}x{} pass): "
+                               "proj x {:.4f} y {:.4f} z {:.6g} {:.6g}, position {:.3f} {:.3f} "
+                               "{:.3f}",
+                               d[4], d[5], d[52], d[57], d[62], d[63], d[180 + 3], d[180 + 7],
+                               d[180 + 11]));
+    }
+    return false; // (the scan still looks at it: vertex-camera / jitter marking)
 }
 
 int g_depth_detected = -1; // 1 reversed-Z, 0 forward, -1 not yet known
@@ -1456,6 +1509,9 @@ void OnVertexConstants(const void* data, size_t size) {
     }
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
+    if (BlockCamera(f, static_cast<const float*>(data), size)) {
+        return;
+    }
     const u64 draw = f.draws;
     bool counted_draw = f.scanned_draw == draw;
     if (g_draw.analyze_dump && g_dump_lines < 8000 && g_dump_cbs < 64) {
