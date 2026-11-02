@@ -424,10 +424,33 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
+	// GFX10 T#: BASE_ARRAY only applies to array resource types (1D/2D/2D-MSAA arrays and
+	// cube, whose slices are faces). For 1D, 2D, 2D-MSAA and 3D T# types the field is not
+	// part of the addressing, so it selects nothing and the view starts at slice 0. (From
+	// memory of the GFX10 SQ_IMG_RSRC_WORD4/5 BASE_ARRAY description; marked as unverified.)
+	const auto t_type      = TextureType(descriptor);
+	const bool array_type  = t_type == Prospero::ImageType::kColor1DArray ||
+	                         t_type == Prospero::ImageType::kColor2DArray ||
+	                         t_type == Prospero::ImageType::kColor2DMsaaArray ||
+	                         t_type == Prospero::ImageType::kCube;
+	const uint32_t base_array = array_type ? static_cast<uint32_t>(descriptor.BaseArray5()) : 0u;
+	if (!array_type && descriptor.BaseArray5() != 0) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+			std::printf("Descriptors: non-array texture type=%u has base_array=%u, ignored "
+			            "(view slice 0): dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			            static_cast<uint32_t>(t_type),
+			            static_cast<uint32_t>(descriptor.BaseArray5()), descriptor.fields[0],
+			            descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			            descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+			            descriptor.fields[7]);
+			std::fflush(stdout);
+		}
+	}
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 			view.type       = vk::ImageViewType::e1D;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = base_array;
 			if (view.base_layer >= image_layers) {
 				ExitTextureLayerOutOfBounds("texture base layer is out of bounds", resource, descriptor, image_layers);
 			}
@@ -435,7 +458,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
 			view.type       = vk::ImageViewType::e1DArray;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = base_array;
 			if (view.base_layer >= image_layers) {
 				ExitTextureLayerOutOfBounds("texture array base layer is out of bounds", resource, descriptor, image_layers);
 			}
@@ -449,7 +472,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
 			view.type       = vk::ImageViewType::e2DArray;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = base_array;
 			if (view.base_layer >= image_layers) {
 				ExitTextureLayerOutOfBounds("texture array base layer is out of bounds", resource, descriptor, image_layers);
 			}
@@ -458,7 +481,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = base_array;
 			if (view.base_layer >= image_layers) {
 				ExitTextureLayerOutOfBounds("texture base layer is out of bounds", resource, descriptor, image_layers);
 			}
@@ -598,6 +621,28 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
+	// GFX10 T#: BASE_ARRAY is the first slice of an array view; slices outside
+	// [BASE_ARRAY, DEPTH] are out of range and the TA returns zero (the same result as an
+	// unbound/null resource) instead of faulting. (From memory of the RDNA/GFX10 ISA
+	// "Image Resource" / out-of-range behaviour; not verified against a document in the repo.)
+	// So an array T# whose base slice is already past the last slice is bound as the null
+	// descriptor of the shader's dimension, which also reads zero. No clamp to a valid layer.
+	if ((layered || type == Prospero::ImageType::kCube) &&
+	    static_cast<uint32_t>(descriptor.BaseArray5()) >= image_layers) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+			std::printf("Descriptors: array texture base_array=%u >= layers=%u, bound as null "
+			            "(reads 0): type=%u shader_dim=%u addr=0x%016" PRIx64
+			            " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			            static_cast<uint32_t>(descriptor.BaseArray5()), image_layers,
+			            static_cast<uint32_t>(type), static_cast<uint32_t>(resource.dimension),
+			            address, descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+			            descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			            descriptor.fields[6], descriptor.fields[7]);
+			std::fflush(stdout);
+		}
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
 	auto          view_base    = static_cast<uint32_t>(base_level);
 	auto pixel_format = surface_format.vk_format;
 	if (resource.depth_compare) {
