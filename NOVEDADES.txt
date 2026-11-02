@@ -4,6 +4,14 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
 Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
+00. NUEVO (02-11, port49) / NEW (02-11, port49)
+-----------------------------------------------
+- Lista de shaders ampliada con partidas grabadas (24914 pipelines, antes 24715: unos 199 mas, entre ellos los compute
+  del herrero). Al actualizar se precompila UNA vez: lo ya hecho se copia y solo se compila lo nuevo. Efecto esperado
+  pequeno: cubre esas variantes concretas, no todas las que aun se crean en juego.
+  Shader list extended from recorded play (24914 pipelines, was 24715: ~199 more, the blacksmith compute shaders
+  among them). Updating precompiles ONCE: what exists is copied, only the new parts compile. Small expected effect.
+
 00. NUEVO (02-11, port48) / NEW (02-11, port48)
 -----------------------------------------------
 - Precompilacion: UNA vez mas al actualizar a esta version (anade las variantes nativas que faltaban; lo ya hecho se
