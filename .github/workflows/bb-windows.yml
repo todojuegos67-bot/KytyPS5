@@ -2,7 +2,7 @@ name: bb-windows
 on:
   workflow_dispatch:
   push:
-    branches: [bb-port, bb-upscale, bb-upscale-0171, bb-upscale-020, bb-upscale-021, bb-fg-022]
+    branches: [bb-port, bb-upscale, bb-upscale-0171, bb-upscale-020, bb-upscale-021, bb-fg-022, bb-respatch-023]
 permissions:
   contents: write
 jobs:
