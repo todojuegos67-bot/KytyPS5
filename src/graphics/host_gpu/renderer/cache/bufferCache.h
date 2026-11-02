@@ -52,6 +52,11 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// KYTY_READ_AHEAD=1 (A/B, off by default; GPU thread, at the game's flip wait): the 512 KiB windows of GPU-written
+	// memory the guest read two frames running get their readback started now, so the guest's read finds it pending or
+	// done instead of starting it and waiting for the GPU (the same request a guest read makes, at an earlier point).
+	void                   ReadAhead();
+	[[nodiscard]] static bool ReadAheadOn();
 	// Before a host write of all of [vaddr, vaddr + size) (any thread): as InvalidateMemory, but the GPU-written bytes the
 	// write replaces are dropped, not read back (only those of its first and last page outside it are).
 	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
@@ -343,6 +348,7 @@ private:
 	void CopyGuestReadback(const std::shared_ptr<GuestReadback>& request);
 	void FinishGuestReadback(size_t slot, bool detach = false);
 	static constexpr size_t GuestReadbackSlots = 32;
+	void NoteGuestReadForReadAhead(uint64_t vaddr);
 	std::array<std::shared_ptr<GuestReadback>, GuestReadbackSlots> m_guest_readbacks {};
 	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_guest_downloads {};
 	uint32_t m_active_guest_readbacks = 0;

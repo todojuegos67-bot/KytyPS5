@@ -14,6 +14,14 @@
 #include <cstdlib>
 #include <atomic>
 #include <utility>
+#include <string>
+#include "local-platform.h"
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <x86intrin.h>
 
 #include "common/assert.h"
@@ -164,6 +172,91 @@ void NoteFault(uint64_t vaddr, int kind) {
 }
 } // namespace
 
+// Read-fault attribution (always, [rfaults] every 5 s): which guest threads wait in read faults, how often and how long,
+// and the 2 MiB regions they read: a polling thread (that would wait anyway) told apart from the game's main thread.
+namespace {
+struct ReadFaultThread {
+	std::atomic<uint32_t> tid {0};
+	std::atomic<uint64_t> faults {0}, ns {0}, max_ns {0};
+};
+struct ReadFaultRegion {
+	std::atomic<uint64_t> region {0};
+	std::atomic<uint64_t> faults {0}, ns {0};
+};
+ReadFaultThread      g_rf_threads[64];
+ReadFaultRegion      g_rf_regions[1024];
+std::atomic<int64_t> g_rf_report_ms {0};
+
+std::string ThreadLabel(uint32_t tid) {
+	std::string name;
+#if defined(_WIN32)
+	if (HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid); thread != nullptr) {
+		PWSTR description = nullptr;
+		if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+			for (const wchar_t* c = description; *c != L'\0'; ++c) name.push_back(*c < 128 ? static_cast<char>(*c) : '?');
+			LocalFree(description);
+		}
+		CloseHandle(thread);
+	}
+#endif
+	return name.empty() ? std::string("?") : name;
+}
+
+void NoteReadFault(uint64_t vaddr, uint64_t ns) {
+	const uint32_t tid = LocalPlatform::ThreadId();
+	for (size_t i = (tid * 2654435761u) % 64, probe = 0; probe < 64; ++probe, i = (i + 1) % 64) {
+		uint32_t cur = g_rf_threads[i].tid.load(std::memory_order_relaxed);
+		if (cur == 0 && g_rf_threads[i].tid.compare_exchange_strong(cur, tid)) cur = tid;
+		if (cur != tid) continue;
+		g_rf_threads[i].faults.fetch_add(1, std::memory_order_relaxed);
+		g_rf_threads[i].ns.fetch_add(ns, std::memory_order_relaxed);
+		uint64_t m = g_rf_threads[i].max_ns.load(std::memory_order_relaxed);
+		while (ns > m && !g_rf_threads[i].max_ns.compare_exchange_weak(m, ns)) {}
+		break;
+	}
+	const uint64_t region = (vaddr >> 21u) + 1u;
+	for (size_t i = ((region * 0x9E3779B97F4A7C15ull) >> 54u) % 1024, probe = 0; probe < 32; ++probe, i = (i + 1) % 1024) {
+		uint64_t cur = g_rf_regions[i].region.load(std::memory_order_relaxed);
+		if (cur == 0 && g_rf_regions[i].region.compare_exchange_strong(cur, region)) cur = region;
+		if (cur != region) continue;
+		g_rf_regions[i].faults.fetch_add(1, std::memory_order_relaxed);
+		g_rf_regions[i].ns.fetch_add(ns, std::memory_order_relaxed);
+		break;
+	}
+	const auto now  = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	auto       last = g_rf_report_ms.load(std::memory_order_relaxed);
+	if (now - last < 5000 || !g_rf_report_ms.compare_exchange_strong(last, now)) return;
+	struct Row { uint64_t key, faults, ns, max_ns; };
+	std::vector<Row> threads, regions;
+	for (auto& t: g_rf_threads) {
+		const uint32_t id = t.tid.load(std::memory_order_relaxed);
+		if (id == 0) continue;
+		Row row {id, t.faults.exchange(0), t.ns.exchange(0), t.max_ns.exchange(0)};
+		if (row.faults != 0) threads.push_back(row);
+	}
+	for (auto& r: g_rf_regions) {
+		const uint64_t key = r.region.load(std::memory_order_relaxed);
+		if (key == 0) continue;
+		Row row {key - 1u, r.faults.exchange(0), r.ns.exchange(0), 0};
+		if (row.faults != 0) regions.push_back(row);
+	}
+	const auto by_ns = [](const Row& a, const Row& b) { return a.ns > b.ns; };
+	std::sort(threads.begin(), threads.end(), by_ns);
+	std::sort(regions.begin(), regions.end(), by_ns);
+	std::printf("[rfaults] 5 s: read faults by thread (faults, wait ms, mean us, max ms):");
+	for (size_t k = 0; k < threads.size() && k < 8; ++k)
+		std::printf(" %s/%llu %llu %.1f %.0f %.1f;", ThreadLabel(static_cast<uint32_t>(threads[k].key)).c_str(),
+		            static_cast<unsigned long long>(threads[k].key), static_cast<unsigned long long>(threads[k].faults),
+		            threads[k].ns / 1e6, threads[k].ns / 1e3 / static_cast<double>(threads[k].faults), threads[k].max_ns / 1e6);
+	std::printf("\n[rfaults] 5 s: by 2 MiB region (faults, wait ms):");
+	for (size_t k = 0; k < regions.size() && k < 8; ++k)
+		std::printf(" 0x%010llx %llu %.1f;", static_cast<unsigned long long>(regions[k].key << 21u),
+		            static_cast<unsigned long long>(regions[k].faults), regions[k].ns / 1e6);
+	std::printf("\n");
+	std::fflush(stdout);
+}
+} // namespace
+
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -175,11 +268,15 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	struct FaultTimer {
 		LiveCounters::Id                      id    = LiveCounters::FaultReadNs;
 		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		uint64_t                              vaddr = 0;
 		~FaultTimer() {
-			LiveCounters::Add(id, static_cast<uint64_t>(
-			                          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+			const auto ns = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+			LiveCounters::Add(id, ns);
+			if (id == LiveCounters::FaultReadNs) NoteReadFault(vaddr, ns);
 		}
 	} fault_timer;
+	fault_timer.vaddr = fault_vaddr;
 	if (access == PageFaultAccess::Write) {
 		fault_timer.id = LiveCounters::FaultWriteNs;
 		// A never-written granule's first write (fresh memory): unwatched, done unless another watcher holds the page.

@@ -1785,6 +1785,63 @@ void BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+namespace {
+// KYTY_READ_AHEAD: the windows guest threads read back, per game frame (racy by design: a hint only).
+struct ReadAheadSlot {
+	std::atomic<uint64_t> window {0}; // window index + 1
+	std::atomic<uint64_t> address {0}; // the last read's address
+	std::atomic<uint64_t> frame {0};
+	std::atomic<uint32_t> streak {0};
+};
+ReadAheadSlot g_read_ahead[256];
+} // namespace
+
+bool BufferCache::ReadAheadOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_READ_AHEAD");
+		const bool  enabled = v != nullptr && v[0] == '1';
+		if (enabled) std::printf("Readbacks: windows the game reads every frame read back at the flip (KYTY_READ_AHEAD=1)\n");
+		return enabled;
+	}();
+	return on;
+}
+
+void BufferCache::NoteGuestReadForReadAhead(uint64_t vaddr) {
+	constexpr uint64_t WindowBits = 19; // (BeginGuestReadback's 512 KiB window)
+	const uint64_t     window     = (vaddr >> WindowBits) + 1;
+	const uint64_t     frame      = LiveCounters::g_game_frames.load(std::memory_order_relaxed);
+	auto&              slot       = g_read_ahead[(window * 0x9E3779B97F4A7C15ull) >> 56u];
+	if (slot.window.load(std::memory_order_relaxed) != window) {
+		if (slot.frame.load(std::memory_order_relaxed) + 4 > frame && slot.window.load(std::memory_order_relaxed) != 0) return;
+		slot.window.store(window, std::memory_order_relaxed);
+		slot.streak.store(0, std::memory_order_relaxed);
+		slot.frame.store(0, std::memory_order_relaxed);
+	}
+	slot.address.store(vaddr, std::memory_order_relaxed);
+	const uint64_t last = slot.frame.exchange(frame, std::memory_order_relaxed);
+	if (last == frame) return;
+	slot.streak.store(last + 1 == frame ? slot.streak.load(std::memory_order_relaxed) + 1 : 1, std::memory_order_relaxed);
+}
+
+void BufferCache::ReadAhead() {
+	const uint64_t frame  = LiveCounters::g_game_frames.load(std::memory_order_relaxed);
+	int            issued = 0;
+	for (auto& slot: g_read_ahead) {
+		if (issued >= 8) break;
+		if (slot.window.load(std::memory_order_relaxed) == 0 || slot.streak.load(std::memory_order_relaxed) < 2 ||
+		    slot.frame.load(std::memory_order_relaxed) + 2 < frame)
+			continue;
+		const uint64_t address = slot.address.load(std::memory_order_relaxed);
+		// (Only memory the GPU wrote and the cache holds: what a guest read of it would read back now.)
+		if (address == 0 || !IsRegionRegistered(address, 1) || !m_memory_tracker.IsRegionGpuModified(address, 1)) continue;
+		bool completed = false;
+		if (BeginGuestReadback(address, 1, &completed) || completed) {
+			LiveCounters::Add(LiveCounters::ReadAheadIssued);
+			++issued;
+		}
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -1812,10 +1869,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if ((!is_write || async_write) && !GuestGpu::IsGpuThread() && GuestReadbacksEnabled()) {
 		std::shared_ptr<GuestReadback> request;
 		auto& gpu = m_scheduler.Context().GetGpu();
+		const bool ahead = !is_write && ReadAheadOn();
+		if (ahead) NoteGuestReadForReadAhead(vaddr);
 		gpu.SendCommandSync([&] {
 			if (TryGuestReadFromFeedback(vaddr, size, is_write)) return;
 			bool completed = false;
+			// (KYTY_READ_AHEAD: a readback the flip started covers it when one is pending for the window.)
+			const uint32_t active_before = m_active_guest_readbacks;
 			request = BeginGuestReadback(vaddr, size, &completed);
+			if (ahead && request && (active_before & (1u << request->slot)) != 0) LiveCounters::Add(LiveCounters::ReadAheadJoined);
 			if (!request && (is_write || !completed)) {
 				LiveCounters::Add(LiveCounters::SyncReadsGuest);
 				ReadMemoryOnGpu(vaddr, size, is_write);

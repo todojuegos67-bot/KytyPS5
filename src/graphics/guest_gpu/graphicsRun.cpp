@@ -58,6 +58,9 @@
 
 namespace Libs::Graphics {
 
+// KYTY_READ_AHEAD: a flip happened; the GPU thread starts the read-ahead at its next turn.
+static std::atomic<bool> g_read_ahead_due {false};
+
 extern "C" {
 // 0: synchronous frame boundary. 1: the guest may prepare the following frame
 // while the renderer consumes the previous one; guest reads of GPU-written
@@ -880,6 +883,8 @@ void GuestGpu::ThreadRun(void* data) {
 
 	for (;;) {
 		PageManager::FlushDeferredProtection(); // (before a guest command, an idle wait, another queue's turn)
+		if (g_read_ahead_due.load(std::memory_order_relaxed) && g_read_ahead_due.exchange(false, std::memory_order_acq_rel))
+			gpu->m_renderer.GetGpuResources().GetBufferCache().ReadAhead();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -2359,6 +2364,9 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	// (Time blocked here is neither idle nor work: the flip/present cadence holding the game, e.g. frame generation.)
 	LiveCounters::ScopedUs flip_wait(LiveCounters::FlipDoneWaitUs);
 	LiveCounters::g_game_frames.fetch_add(1, std::memory_order_relaxed);
+	// KYTY_READ_AHEAD: the windows the game reads back every frame are read back at the GPU thread's next turn between
+	// submissions (where a guest read's readback starts too).
+	if (BufferCache::ReadAheadOn()) g_read_ahead_due.store(true, std::memory_order_release);
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
 }
