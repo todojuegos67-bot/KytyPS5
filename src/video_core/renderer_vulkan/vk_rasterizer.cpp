@@ -147,7 +147,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
     bb_rt_scale_x = bb_rt_scale_y = 1.0f;
     bb_rt_guest_w = bb_rt_guest_h = 0;
-    const auto bb_scaled_target = [&](ImageId id) {
+    const auto bb_scaled_target = [&](VideoCore::ImageId id) {
         if (!id) return false;
         const auto& info = texture_cache.GetImage(id).info;
         if (!info.bb_scaled || info.bb_guest_w == 0 || info.bb_guest_h == 0) return false;
@@ -173,7 +173,7 @@ bool Rasterizer::BBPatchConstants(const void* data, u64 size, std::vector<u32>& 
     const size_t n = size / 4;
     const float w = float(bb_rt_guest_w), h = float(bb_rt_guest_h);
     const float sw = w * bb_rt_scale_x, sh = h * bb_rt_scale_y;
-    const auto near = [](float a, float b) { return std::fabs(a - b) <= std::fabs(b) * 1e-5f; };
+    const auto close_to = [](float a, float b) { return std::fabs(a - b) <= std::fabs(b) * 1e-5f; };
     bool patched = false;
     for (size_t i = 0; i + 1 < n; ++i) {
         const float a = f[i], b = f[i + 1];
@@ -181,7 +181,7 @@ bool Rasterizer::BBPatchConstants(const void* data, u64 size, std::vector<u32>& 
         if (a == w && b == h) {
             na = sw;
             nb = sh;
-        } else if (near(a, 1.0f / w) && near(b, 1.0f / h)) {
+        } else if (close_to(a, 1.0f / w) && close_to(b, 1.0f / h)) {
             na = 1.0f / sw;
             nb = 1.0f / sh;
         } else {
