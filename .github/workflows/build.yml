@@ -28,6 +28,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  bench:
+    # ds-perf-1102: guest fault-path microbenchmark (tools/bench/fault-bench.cpp) at the logged per-frame counts.
+    if: ${{ github.ref_name == 'ds-perf-1102' }}
+    name: Fault-path benchmark (Windows)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools/bench
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build and run
+        shell: cmd
+        run: |
+          cl /nologo /O2 /EHsc /std:c++20 tools\bench\fault-bench.cpp /Fe:fault-bench.exe
+          echo nproc %NUMBER_OF_PROCESSORS%
+          fault-bench.exe 475 300 0 4
+          fault-bench.exe 475 300 3 4
+          fault-bench.exe 1050 300 3 4
+          fault-bench.exe 475 300 3 1
   windows:
     name: Build (Windows x64)
     runs-on: windows-2022
