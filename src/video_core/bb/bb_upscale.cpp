@@ -239,20 +239,29 @@ Config ParseConfig() {
 
 // BB_ANALYZE dumps also go to their own file in the working folder, bb_analyze_<upscaler>.log
 // (rewritten per run of that upscaler, so a later run of another one keeps it).
-template <typename... Args>
-void AnalyzeLog(fmt::format_string<Args...> format, Args&&... args) {
-    const std::string text = fmt::format(format, std::forward<Args>(args)...);
-    LOG_INFO(Render_Vulkan, "{}", text);
+// One file and one lock for every AnalyzeLog instantiation: a function-local static inside the
+// template was a separate FILE* (each opened with "w") per argument list, so the instantiations
+// overwrote each other's lines in the same file (owner's 2026-11-02 dumps: cut lines).
+void AnalyzeWrite(const std::string& text) {
+    static std::mutex m;
     static std::FILE* file = [] {
         const char* up = std::getenv("BB_UPSCALER");
         std::string name = std::string("bb_analyze_") + (up && *up ? up : "off") + ".log";
         return std::fopen(name.c_str(), "w");
     }();
     static u32 lines = 0;
+    std::scoped_lock lk{m};
     if (file != nullptr && lines++ < 200000) {
         std::fprintf(file, "%s\n", text.c_str());
         std::fflush(file);
     }
+}
+
+template <typename... Args>
+void AnalyzeLog(fmt::format_string<Args...> format, Args&&... args) {
+    const std::string text = fmt::format(format, std::forward<Args>(args)...);
+    LOG_INFO(Render_Vulkan, "{}", text);
+    AnalyzeWrite(text);
 }
 
 bool AnalyzeOn() {
