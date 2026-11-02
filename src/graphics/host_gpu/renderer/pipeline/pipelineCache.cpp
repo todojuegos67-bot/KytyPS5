@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/translationCache.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
@@ -25,6 +26,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <optional>
 #include <cinttypes>
 #include <string>
 #include <unordered_map>
@@ -359,29 +361,41 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> function_code) {
+	                               std::span<const uint32_t> function_code,
+	                               std::optional<TranslationCache::Key> disk_key) {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+		auto info = std::move(result.program).TakeCompiledInfo();
+		if (disk_key.has_value()) TranslationCache::Store(*disk_key, result.spirv, info);
+		return MakePermutation(stage_name, options, std::move(result.spirv), std::move(info),
+		                       std::move(specialization), function_code);
+	}
+
+	// Builds a permutation from finished SPIR-V and reflection (translated now or from disk).
+	Permutation MakePermutation(const char* stage_name, const ShaderRecompiler::CompileOptions& options,
+	                            std::vector<uint32_t> spirv, ShaderRecompiler::IR::CompiledShaderInfo info,
+	                            ShaderRecompiler::IR::ResourceSpecialization specialization,
+	                            std::span<const uint32_t> function_code) {
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv,
 		                         options.maintenance8_enabled)) {
-			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+			DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
-		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 
 		// Permutations that differ only in specialization data often emit identical SPIR-V
 		// (Ghost of Yotei: one CS translated 84 times, 400K+ word shaders 4-6 times, ~30 s of
 		// driver compile each). Identical SPIR-V reuses the module and shader id, so the
 		// already-created (or queued) pipeline is reused instead of compiled again.
-		if (options.stage == ShaderType::Compute && result.spirv.size() >= 20000u) {
-			std::printf("SpirvSize: cs hash=0x%016" PRIx64 " words=%zu\n", options.shader_hash, result.spirv.size());
+		if (options.stage == ShaderType::Compute && spirv.size() >= 20000u) {
+			std::printf("SpirvSize: cs hash=0x%016" PRIx64 " words=%zu\n", options.shader_hash, spirv.size());
 			std::fflush(stdout);
 		}
-		const SpirvKey spirv_key = HashSpirv(result.spirv);
+		const SpirvKey spirv_key = HashSpirv(spirv);
 		if (const auto found = spirv_modules.find(spirv_key); found != spirv_modules.end()) {
 			if (options.dump_ir) {
 				LOGF("%s SPIR-V identical to shader id %" PRIu64 ", reused\n", options.dump_label,
@@ -390,31 +404,31 @@ struct PipelineCache::ProgramCache {
 			return {
 			    .function_code  = {function_code.begin(), function_code.end()},
 			    .specialization = std::move(specialization),
-			    .program        = std::move(result.program).TakeCompiledInfo(),
+			    .program        = std::move(info),
 			    .handle         = found->second,
 			    .owns_module    = false,
 			};
 		}
 		const auto module_begin = std::chrono::steady_clock::now();
-		const auto module = CompileSPV(result.spirv, graphics.device);
+		const auto module = CompileSPV(spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (const auto module_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - module_begin).count();
 		    module_ms >= 50.0) {
 			std::printf("ShaderSlow: module %s hash=0x%016" PRIx64 " words=%zu vkCreateShaderModule=%.1f ms\n",
-			            stage_name, options.shader_hash, result.spirv.size(), module_ms);
+			            stage_name, options.shader_hash, spirv.size(), module_ms);
 		}
-		Prewarm::NoteSpirv(module, result.spirv, options.shader_hash);
+		Prewarm::NoteSpirv(module, spirv, options.shader_hash);
 		const ShaderProgram handle {.id = ++next_shader_id, .module = module,
-		                            .spirv_words = static_cast<uint64_t>(result.spirv.size())};
+		                            .spirv_words = static_cast<uint64_t>(spirv.size())};
 		spirv_modules.emplace(spirv_key, handle);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
-			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+			     static_cast<uint64_t>(spirv.size()), options.wave_size);
 		}
 		return {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(info),
 		    .handle         = handle,
 		};
 	}
@@ -494,6 +508,49 @@ struct PipelineCache::ProgramCache {
 		std::printf("ShaderMiss: hash=0x%016" PRIx64 " permutations=%zu:%s\n", hash, entry.permutations.size(),
 		            why.c_str());
 		std::fflush(stdout);
+	}
+
+	// Everything a permutation's SPIR-V and reflection depend on, for the on-disk cache. The guest
+	// code address is included because translation may fold PC-relative data reads.
+	static TranslationCache::Key DiskKey(const ShaderParams& params, const ProgramKey& key,
+	                                     const ShaderRecompiler::IR::ResourceSpecialization& spec,
+	                                     uint32_t push_data_cursor, std::span<const uint32_t> function_code,
+	                                     const ShaderRecompiler::CompileOptions& options) {
+		TranslationCache::KeyBuilder k;
+		k.Value(static_cast<uint32_t>(key.stage));
+		k.Value(key.hash);
+		k.Value(key.user_data_count);
+		k.Value(key.code_size);
+		k.Words(key.static_state);
+		k.Words(params.code);
+		k.Words(params.back_code);
+		k.Value(params.Base());
+		k.Value(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(params.back_code.data())));
+		k.Value(static_cast<uint32_t>(spec.buffers.size()));
+		for (const auto& b: spec.buffers) {
+			k.Value(b.packed_stride); k.Value(b.descriptor_format); k.Value(b.descriptor_swizzle);
+			k.Value(b.zero_stride_oob); k.Value(b.scalar_empty); k.Value(b.indirect_root);
+			k.Value(b.indirect_mapping_offset); k.Value(b.indirect_search_iterations);
+			k.Value(b.runtime_stride_offset);
+		}
+		k.Value(static_cast<uint32_t>(spec.images.size()));
+		for (const auto& m: spec.images) {
+			k.Value(m.numeric_class); k.Value(m.dimension); k.Value(m.mip_count); k.Value(m.conversion_format);
+			k.Value(m.shader_swizzle); k.Value(m.indirect_root); k.Value(m.indirect_mapping_offset);
+			k.Value(m.indirect_search_iterations); k.Value(m.cube); k.Value(m.fmask);
+		}
+		k.Value(static_cast<uint32_t>(spec.samplers.size()));
+		for (const auto& m: spec.samplers) {
+			k.Value(m.indirect_root); k.Value(m.indirect_mapping_offset); k.Value(m.indirect_search_iterations);
+		}
+		k.Value(push_data_cursor);
+		k.Words(function_code);
+		k.Value(static_cast<uint32_t>(options.stage));
+		k.Value(options.wave_size);
+		k.Value(options.user_data_base);
+		k.Value(options.maintenance8_enabled);
+		k.Value(options.emit_debug_info);
+		return k.Finish();
 	}
 
 	template <typename InputInfo>
@@ -590,6 +647,21 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		// Known guest shader, new permutation: its SPIR-V may be on disk from an earlier run, so
+		// no translation is needed (the resource plan is already in the entry).
+		if (entry != programs.end() && !source_changed && TranslationCache::Enabled()) {
+			const auto key = DiskKey(params, lookup_key, entry->second.specialization, push_data_cursor,
+			                         entry->second.FunctionCode(), options);
+			if (auto hit = TranslationCache::Find(key)) {
+				entry->second.permutations.push_back(MakePermutation(
+				    stage_name, options, std::move(hit->spirv), std::move(hit->info),
+				    entry->second.specialization, entry->second.FunctionCode()));
+				const auto& permutation = entry->second.permutations.back();
+				input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+				permutation.program.bindings.AdvancePushData(push_data_cursor);
+				return permutation.handle;
+			}
+		}
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		const auto prepared_at = std::chrono::steady_clock::now();
@@ -636,9 +708,21 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		const auto translated_at = std::chrono::steady_clock::now();
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
-		    entry->second.FunctionCode()));
+		std::optional<TranslationCache::Key> disk_key;
+		if (TranslationCache::Enabled()) {
+			disk_key = DiskKey(params, lookup_key, entry->second.specialization, push_data_cursor,
+			                   entry->second.FunctionCode(), options);
+		}
+		if (auto hit = disk_key ? TranslationCache::Find(*disk_key) : std::nullopt) {
+			// First sight of this guest shader this run: translated only for its resource plan.
+			entry->second.permutations.push_back(MakePermutation(
+			    stage_name, options, std::move(hit->spirv), std::move(hit->info),
+			    entry->second.specialization, entry->second.FunctionCode()));
+		} else {
+			entry->second.permutations.push_back(CompilePermutation(
+			    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+			    entry->second.FunctionCode(), disk_key));
+		}
 		const auto& permutation = entry->second.permutations.back();
 		Prewarm::NoteTranslation(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    std::chrono::steady_clock::now() - translate_start).count()));
@@ -733,6 +817,7 @@ void PipelineCache::InitializeDriverCache() {
 	if (title_id.empty()) {
 		return;
 	}
+	TranslationCache::Open(std::filesystem::path("_PipelineCache") / (title_id + ".xlat"));
 	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
