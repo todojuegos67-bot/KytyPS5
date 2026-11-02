@@ -1,3 +1,4 @@
+#include "local/prio-wait.h"
 #include "local/early-submit.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
@@ -495,13 +496,16 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	operation();
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation, uint8_t cls, uint64_t begin,
+                                              uint64_t end) {
+	LiveCounters::Add(cls == PrioWait::None ? LiveCounters::PrioOpsNone : cls == PrioWait::Range ? LiveCounters::PrioOpsRange
+	                                                                                            : LiveCounters::PrioOpsUnknown);
 	if (t_recorder != nullptr) throw RecorderRefusal {"DeferPriorityOperation"};
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_priority_operations.push({std::move(operation), CurrentTick()});
+		m_priority_operations.push_back({std::move(operation), CurrentTick(), cls, begin, end});
 		lock.unlock();
 		m_operation_available.notify_one();
 		return;
@@ -529,9 +533,12 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
-			m_priority_active      = true;
-			m_priority_active_tick = operation.tick;
+			m_priority_operations.pop_front();
+			m_priority_active       = true;
+			m_priority_active_tick  = operation.tick;
+			m_priority_active_cls   = operation.cls;
+			m_priority_active_begin = operation.begin;
+			m_priority_active_end   = operation.end;
 		}
 		m_master.Wait(operation.tick);
 		LiveTrace::Event(LiveTrace::GpuDone, operation.tick);
@@ -563,6 +570,33 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
 	});
+}
+
+uint32_t CommandScheduler::WaitPriorityOperationsFor(uint64_t tick, uint64_t window_begin, uint64_t window_end,
+                                                    bool range_aware) {
+	EXIT_IF(g_deferred_callback_scheduler == this);
+	struct OpView {
+		const std::deque<PendingOperation>& q;
+		struct It {
+			std::deque<PendingOperation>::const_iterator i;
+			PrioWait::Op operator*() const { return {i->tick, i->cls, i->begin, i->end}; }
+			It& operator++() { ++i; return *this; }
+			bool operator!=(const It& o) const { return i != o.i; }
+		};
+		It begin() const { return {q.begin()}; }
+		It end() const { return {q.end()}; }
+	};
+	std::unique_lock lock(m_operation_mutex);
+	uint32_t backlog = m_priority_active && m_priority_active_tick <= tick ? 1u : 0u;
+	for (const auto& op: m_priority_operations) {
+		if (op.tick > tick) break;
+		++backlog;
+	}
+	m_operation_available.wait(lock, [&] {
+		const PrioWait::Op active {m_priority_active_tick, m_priority_active_cls, m_priority_active_begin, m_priority_active_end};
+		return !PrioWait::Blocks(OpView {m_priority_operations}, m_priority_active, active, tick, window_begin, window_end, range_aware);
+	});
+	return backlog;
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {

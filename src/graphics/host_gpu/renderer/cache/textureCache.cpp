@@ -4469,7 +4469,8 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 			first = last;
 		}
 		m_pending_downloads.erase(done);
-	});
+	}, 2, range.address & ~(TRACKER_PAGE_SIZE - 1), (range.address + range.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1));
+	// (PrioWait::Range: it writes back only bytes of the range and changes watchers of its pages.)
 	return true;
 }
 

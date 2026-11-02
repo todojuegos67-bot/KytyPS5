@@ -754,8 +754,24 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 	}
 	const auto wait_start = std::chrono::steady_clock::now();
 	if (request->queue_value != 0) {
+		const auto q0 = std::chrono::steady_clock::now();
 		WaitReadbackValue(request->queue_value);
-		m_scheduler.WaitPriorityOperations(request->producer_tick);
+		const auto q1 = std::chrono::steady_clock::now();
+		// KYTY_PRIO_RANGE_WAIT=1: only the deferred operations that may write this window (local/prio-wait.h).
+		static const bool range_wait = [] {
+			const char* v = std::getenv("KYTY_PRIO_RANGE_WAIT");
+			const bool  on = v != nullptr && v[0] == '1';
+			if (on) std::printf("Readbacks: wait only for deferred operations that may write the window (KYTY_PRIO_RANGE_WAIT=1)\n");
+			return on;
+		}();
+		const uint32_t backlog = m_scheduler.WaitPriorityOperationsFor(request->producer_tick, request->begin,
+		                                                               request->begin + request->size, range_wait);
+		const auto q2 = std::chrono::steady_clock::now();
+		LiveCounters::Add(LiveCounters::RfRbQueueWaitNs,
+		                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(q1 - q0).count()));
+		LiveCounters::Add(LiveCounters::RfPrioWaitNs,
+		                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(q2 - q1).count()));
+		LiveCounters::Add(LiveCounters::PrioBacklogOps, backlog);
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(request->tick);
 		m_scheduler.WaitPriorityOperations(request->tick);

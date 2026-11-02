@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include <queue>
+#include <deque>
 
 #include <thread>
 #include <vector>
@@ -61,7 +62,13 @@ public:
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// cls / [begin, end): the guest memory the operation writes (local/prio-wait.h; default Unknown: anything).
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation, uint8_t cls = 0, uint64_t begin = 0,
+	                                                 uint64_t end = 0);
+	// KYTY_PRIO_RANGE_WAIT: as WaitPriorityOperations, for a guest readback of [window_begin, window_end): only the
+	// operations that may write the window are waited for (all when range_aware is false). Returns the operations of
+	// a tick <= `tick` queued or running when it began ([fps+] prio_backlog_ops).
+	uint32_t                  WaitPriorityOperationsFor(uint64_t tick, uint64_t window_begin, uint64_t window_end, bool range_aware);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept;
@@ -159,6 +166,8 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		uint8_t                      cls  = 0; // PrioWait::Class
+		uint64_t                     begin = 0, end = 0;
 	};
 
 	void BeginNext();
@@ -207,7 +216,7 @@ private:
 	int                          m_lane  = 0;
 	bool                         m_lanes = false;
 	std::queue<PendingOperation> m_pending_operations;
-	std::queue<PendingOperation> m_priority_operations;
+	std::deque<PendingOperation> m_priority_operations;
 	// Count of live entries in m_pending_operations, updated under
 	// m_operation_mutex and read lock-free as a "nothing to retire" hint.
 	std::atomic<uint32_t> m_pending_operation_count {0};
@@ -220,6 +229,8 @@ private:
 	std::jthread                 m_tick_monitor;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	uint8_t                      m_priority_active_cls  = 0;
+	uint64_t                     m_priority_active_begin = 0, m_priority_active_end = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 };
 
