@@ -1458,7 +1458,8 @@ namespace {
 bool HudDiag() {
     static const bool on = [] {
         const char* v = std::getenv("BB_HUD_DIAG");
-        return v != nullptr && *v == '1';
+        // (The launcher clears BB_* variables: bb-analyze.txt in the working folder turns it on.)
+        return (v != nullptr && *v == '1') || BB::Analyze::Enabled();
     }();
     return on;
 }

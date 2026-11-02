@@ -1853,7 +1853,8 @@ bool WantHudlessCopy() {
         ++g_frame.hud_draws;
     }
     // (Frame generation needs the image before the HUD every frame: bb_fg.h.)
-    if ((!Cfg().hudless_copy && !BB::FG::WantInputs()) || !g_frame.injected || g_frame.hudless ||
+    if ((!Cfg().hudless_copy && !BB::FG::WantInputs() && !BB::Analyze::Enabled()) ||
+        !g_frame.injected || g_frame.hudless ||
         g_draw.sampled_upscaled) {
         return false;
     }
