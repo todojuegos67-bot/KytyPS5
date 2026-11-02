@@ -276,12 +276,14 @@ static void PrefetchNextDraw(const uint32_t* packet, uint32_t remaining_dw) {
 // A game thread's readback fault sends its command here and waits for it, and the GPU thread took commands only before
 // each packet: a request queued ~0.1 ms, 11-15 ms of the game's threads' time a frame at Demon's Souls' stone arch.
 // Run while the GPU thread waits for the upload worker as well, where it spun anyway (KYTY_SERVE_IN_WAITS).
-bool GuestGpu::ServeInWaits() noexcept {
+uint32_t GuestGpu::ServeInWaits() noexcept {
 	static auto& serve = LiveSwitch::Find("serve_in_waits", [] {
 		const char* value = std::getenv("KYTY_SERVE_IN_WAITS");
 		return value != nullptr ? std::atoll(value) : 1ll;
 	}());
-	return serve.load(std::memory_order_relaxed) != 0;
+	// (Any nonzero value serves in the upload waits, as upstream's 1 did: KYTY_SERVE_IN_WAITS=2 or 4 keeps them.)
+	const auto value = static_cast<uint32_t>(serve.load(std::memory_order_relaxed));
+	return value != 0 ? value | 1u : 0u;
 }
 
 // (Only the drains before a guest memory write and at the frame boundary serve (AsyncUpload::Drain(true)): a submit's
@@ -1109,7 +1111,7 @@ void GuestGpu::ThreadRun(void* data) {
 	check_write_guard_uffd();
 #endif
 	AsyncUpload::g_serve_hook = [](bool serve) {
-		if (!serve) return ServeInWaits() && IsGpuThread();
+		if (!serve) return (ServeInWaits() & 1u) != 0 && IsGpuThread();
 		if (!IsGpuThread() || !CommandsPending()) return false;
 		ServePendingCommands();
 		return true;
@@ -1350,6 +1352,7 @@ bool GuestGpu::Process(Submission& submission) {
 						}
 						if (outcome == Speculation::Outcome::Chunk) {
 							++submission.spec_chunk;
+							if ((ServeInWaits() & 4u) != 0) ServePendingCommands();
 							continue;
 						}
 						submission.spec_normal = true;

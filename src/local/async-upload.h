@@ -63,7 +63,7 @@ namespace AsyncUpload {
 // True on the worker's thread (a fault there cannot wait for the render thread, which may wait for the worker).
 inline thread_local bool t_worker = false;
 
-// KYTY_SERVE_IN_WAITS (GuestGpu::ServeInWaits), set by the GPU thread. Asked only by a Wait that was told to serve
+// KYTY_SERVE_IN_WAITS bit 1 (GuestGpu::ServeInWaits), set by the GPU thread. Asked only by a Wait that was told to serve
 // (the drains before a guest memory write of the command processor and at the frame boundary; a submit's or an
 // unmap's drain never serves). With false: whether that Wait spins to the copies' end, running the guest commands
 // queued for the GPU thread meanwhile (a game thread's readback fault waits for its command there); with true: run

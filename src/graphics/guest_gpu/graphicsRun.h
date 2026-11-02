@@ -45,9 +45,11 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
-	// KYTY_SERVE_IN_WAITS (live serve_in_waits, default 1): on, the GPU thread runs the guest commands queued for it (a
-	// game thread's readback fault among them) while it waits for the upload worker too, not only before each packet.
-	[[nodiscard]] static bool ServeInWaits() noexcept;
+	// KYTY_SERVE_IN_WAITS (live serve_in_waits, default 1): where the GPU thread runs the guest commands queued for it (a
+	// game thread's readback fault among them) besides before each packet: 1 while it waits for the upload worker (only
+	// from the drains told to serve, never inside a command), 2 after each segment a speculation commits, 4 while it
+	// waits for a speculation's chunk and between chunks.
+	[[nodiscard]] static uint32_t ServeInWaits() noexcept;
 	// GPU thread: runs the guest commands queued for it, if any (ProcessCommands); not from inside one of them.
 	static void               ServePendingCommands();
 	[[nodiscard]] static bool CommandsPending() noexcept;

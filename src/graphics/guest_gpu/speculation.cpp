@@ -451,7 +451,20 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 							++m_cancelled;
 				++m_waits_for_ahead;
 				const auto waited = NowNs();
-				m_ahead_wake.wait(lock, [&] { return !translating(); });
+				// (KYTY_SERVE_IN_WAITS 4: the guest commands queued for this thread run while it waits.)
+				if ((GuestGpu::ServeInWaits() & 4u) != 0) {
+					while (translating()) {
+						if (GuestGpu::CommandsPending()) {
+							lock.unlock();
+							GuestGpu::ServePendingCommands();
+							lock.lock();
+							continue;
+						}
+						m_ahead_wake.wait_for(lock, std::chrono::microseconds(50));
+					}
+				} else {
+					m_ahead_wake.wait(lock, [&] { return !translating(); });
+				}
 				m_wait_ns += NowNs() - waited;
 				continue;
 			}
@@ -922,6 +935,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			result.last_tick = tick;
 		result.submitted = segment.recorded;
 		After(result, index);
+		if ((GuestGpu::ServeInWaits() & 2u) != 0) GuestGpu::ServePendingCommands(); // (KYTY_SERVE_IN_WAITS 2)
 		result.next = index + 1;
 		if (index < result.holes.size()) {
 			const auto run = RunHole(result, cp, index);
