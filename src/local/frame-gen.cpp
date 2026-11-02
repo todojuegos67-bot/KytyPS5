@@ -545,6 +545,7 @@ struct FsrState {
 	vk::Format       format = vk::Format::eUndefined;
 	bool             hdr    = false; // HDR10 (PQ) swapchain
 	bool             sdk2   = false; // the runtime is FSR SDK 2's loader, not FidelityFX SDK 1.1.4's DLL (FsrLoadRuntime)
+	std::atomic<bool> fsr4 {false};  // fg_context is FSR 4's frame generation (the KYTY_FPS_HUD panel's name: FsrName)
 	vk::Extent2D     max_render {};  // fg_context's
 	uint64_t         frame_id = 0;
 	bool             mode_on  = false;
@@ -772,8 +773,10 @@ bool FsrEnsureFrameGeneration(vk::Extent2D render) {
 	}
 	LOGF("frame generation: FSR context %ux%u, render up to %ux%u\n", s.display.width, s.display.height,
 	     s.max_render.width, s.max_render.height);
+	const auto provider = FsrProvider(&s.fg_context);
+	s.fsr4.store(provider.rfind("4.", 0) == 0, std::memory_order_relaxed);
 	std::printf("Frame generation: FSR ready (%ux%u, render up to %ux%u; frame generation %s)\n", s.display.width,
-	            s.display.height, s.max_render.width, s.max_render.height, FsrProvider(&s.fg_context).c_str());
+	            s.display.height, s.max_render.width, s.max_render.height, provider.c_str());
 	std::fflush(stdout);
 	return true;
 }
@@ -2706,6 +2709,13 @@ bool FsrMarksHud() {
 	return g_fsr || g_fsr_native;
 }
 
+const char* FsrName() {
+#ifdef KYTY_FRAMEGEN_FSR
+	if (g_fsr && g_fsr_state.fsr4.load(std::memory_order_relaxed)) return "FSR 4";
+#endif
+	return "FSR 3";
+}
+
 uint64_t VideoMemoryReserve() {
 	// Frame generation's: FSR's measured with a 2560x1440 swapchain (the driver's share of the video memory 1.33-1.38 GiB
 	// with it, 0.55-0.70 without; and the HUD images), DLSS-G's (NGX's optical flow and interpolation, its swapchain
@@ -2948,8 +2958,21 @@ void DestroySwapchain(GraphicContext& graphics, vk::SwapchainKHR swapchain) {
 	// main menu froze the picture while the game ran on (issue #174).
 	FsrStopFrameGeneration();
 	if (s.swapchain_context != nullptr) {
-		(void)s.api.DestroyContext(&s.swapchain_context, nullptr); // (and its swapchain)
+		// FSR SDK 2's context leaves its swapchain: it goes after the context, through the swapchain's own function (AMD's
+		// order, with its presents waited for first). Left on the window, the next swapchain could not be made there: F11
+		// or a resized window with frame generation on an RX 9070 XT exited "FSR frame generation swapchain failed"
+		// (issue #270). FidelityFX SDK 1.1.4's context destroys its swapchain itself.
+		if (s.sdk2) {
+			ffxDispatchDescFrameGenerationSwapChainWaitForPresentsVK wait {};
+			wait.header.type = FFX_API_DISPATCH_DESC_TYPE_FGSWAPCHAIN_WAIT_FOR_PRESENTS_VK;
+			(void)FsrOk(s.api.Dispatch(&s.swapchain_context, &wait.header), "swapchain presents' wait");
+		}
+		(void)s.api.DestroyContext(&s.swapchain_context, nullptr);
 		s.swapchain_context = nullptr;
+		if (s.sdk2 && s.swapchain != nullptr && s.functions.pOutDestroySwapchainFFXAPI != nullptr) {
+			s.functions.pOutDestroySwapchainFFXAPI(static_cast<VkDevice>(graphics.device),
+			                                       static_cast<VkSwapchainKHR>(s.swapchain), nullptr, nullptr);
+		}
 	}
 	s.swapchain = nullptr;
 	for (const vk::Queue queue: {graphics.fsr_compute_queue, graphics.fsr_present_queue, graphics.fsr_acquire_queue}) {

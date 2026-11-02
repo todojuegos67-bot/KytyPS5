@@ -126,6 +126,9 @@ void SetStaticRect(float x0, float y0, float x1, float y1);
 [[nodiscard]] bool UsesFsr();
 // FSR generates frames, by the Windows backend or built in (Linux): the interface canvas is looked for (NoteUiCanvas).
 [[nodiscard]] bool FsrMarksHud();
+// FSR's frame generation as the KYTY_FPS_HUD panel names it: "FSR 4" once AMD's runtime generates with FSR 4 (FSR SDK 2
+// on a Radeon RX 9000), else "FSR 3".
+[[nodiscard]] const char* FsrName();
 // The video memory frame generation and super resolution take beside the game's (FSR's or NGX's allocations, outside
 // the emulator's allocator, and the HUD images): what the emulator leaves them when it sizes its use of the budget
 // (small_video_memory). After the device: frame generation the device cannot run is not counted.
