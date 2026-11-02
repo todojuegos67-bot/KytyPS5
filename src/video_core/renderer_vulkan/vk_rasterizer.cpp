@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include <bit>
+#include <cmath>
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_upscale.h"
 #include "core/debug_state.h"
@@ -143,7 +145,57 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     } else {
         db_desc.image_id = {};
     }
+    bb_rt_scale_x = bb_rt_scale_y = 1.0f;
+    bb_rt_guest_w = bb_rt_guest_h = 0;
+    const auto bb_scaled_target = [&](ImageId id) {
+        if (!id) return false;
+        const auto& info = texture_cache.GetImage(id).info;
+        if (!info.bb_scaled || info.bb_guest_w == 0 || info.bb_guest_h == 0) return false;
+        bb_rt_scale_x = float(info.size.width) / float(info.bb_guest_w);
+        bb_rt_scale_y = float(info.size.height) / float(info.bb_guest_h);
+        bb_rt_guest_w = info.bb_guest_w;
+        bb_rt_guest_h = info.bb_guest_h;
+        return true;
+    };
+    if (!bb_scaled_target(db_desc.image_id)) {
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (bb_scaled_target(cb_descs[cb].image_id)) break;
+        }
+    }
     BBOnDraw(std::bit_width(key.mrt_mask));
+}
+
+bool Rasterizer::BBPatchConstants(const void* data, u64 size, std::vector<u32>& out) const {
+    if (bb_rt_guest_w == 0 || size < 8 || size > 64_KB) {
+        return false;
+    }
+    const auto* f = static_cast<const float*>(data);
+    const size_t n = size / 4;
+    const float w = float(bb_rt_guest_w), h = float(bb_rt_guest_h);
+    const float sw = w * bb_rt_scale_x, sh = h * bb_rt_scale_y;
+    const auto near = [](float a, float b) { return std::fabs(a - b) <= std::fabs(b) * 1e-5f; };
+    bool patched = false;
+    for (size_t i = 0; i + 1 < n; ++i) {
+        const float a = f[i], b = f[i + 1];
+        float na, nb;
+        if (a == w && b == h) {
+            na = sw;
+            nb = sh;
+        } else if (near(a, 1.0f / w) && near(b, 1.0f / h)) {
+            na = 1.0f / sw;
+            nb = 1.0f / sh;
+        } else {
+            continue;
+        }
+        if (!patched) {
+            out.assign(static_cast<const u32*>(data), static_cast<const u32*>(data) + n);
+            patched = true;
+        }
+        out[i] = std::bit_cast<u32>(na);
+        out[i + 1] = std::bit_cast<u32>(nb);
+        ++i;
+    }
+    return patched;
 }
 
 static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
@@ -321,6 +373,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DispatchDirect() {
     BB::Upscale::OnDispatch();
+    bb_rt_scale_x = bb_rt_scale_y = 1.0f;
+    bb_rt_guest_w = bb_rt_guest_h = 0;
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -357,6 +411,8 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     BB::Upscale::OnDispatch();
+    bb_rt_scale_x = bb_rt_scale_y = 1.0f;
+    bb_rt_guest_w = bb_rt_guest_h = 0;
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -843,6 +899,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
+                }
+                if (std::vector<u32> bb_patched;
+                    bb_rt_guest_w != 0 && !desc.is_written &&
+                    memory->IsValidMapping(vsharp.base_address, size) &&
+                    BBPatchConstants(reinterpret_cast<const void*>(vsharp.base_address), size,
+                                     bb_patched)) {
+                    auto& vk_buffer = buffer_cache.GetStreamBuffer();
+                    const u32 bytes = static_cast<u32>(bb_patched.size() * sizeof(u32));
+                    const u64 offset = vk_buffer.Copy(bb_patched.data(), bytes, alignment);
+                    push_data.AddOffset(binding.buffer, 0);
+                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, bytes);
+                    auto& set_write = set_writes[set_write_index++];
+                    set_write.dstSet = VK_NULL_HANDLE;
+                    set_write.dstBinding = binding.unified++;
+                    set_write.dstArrayElement = 0;
+                    set_write.descriptorCount = 1;
+                    set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+                    set_write.pBufferInfo = &buffer_infos.back();
+                    ++binding.buffer;
+                    continue;
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
@@ -1468,10 +1544,10 @@ void Rasterizer::UpdateViewportScissorState() const {
             const auto yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
             const auto yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
 
-            viewport.x = xoffset - xscale;
-            viewport.y = yoffset - yscale;
-            viewport.width = xscale * 2.0f;
-            viewport.height = yscale * 2.0f;
+            viewport.x = (xoffset - xscale) * bb_rt_scale_x;
+            viewport.y = (yoffset - yscale) * bb_rt_scale_y;
+            viewport.width = xscale * 2.0f * bb_rt_scale_x;
+            viewport.height = yscale * 2.0f * bb_rt_scale_y;
             if (bb_jitter) {
                 viewport.x += bb_jitter_x;
                 viewport.y += bb_jitter_y;
@@ -1491,10 +1567,24 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
                                               regs.viewport_scissors[i].bottom_right_y);
         }
-        scissors.push_back({
-            .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
-            .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
-        });
+        if (bb_rt_guest_w != 0) {
+            const auto sx = [&](s32 v) { return s32(std::floor(float(v) * bb_rt_scale_x)); };
+            const auto sy = [&](s32 v) { return s32(std::floor(float(v) * bb_rt_scale_y)); };
+            const s32 x0 = sx(vp_scsr.top_left_x), y0 = sy(vp_scsr.top_left_y);
+            const s32 x1 = s32(std::ceil(float(vp_scsr.top_left_x + vp_scsr.GetWidth()) *
+                                         bb_rt_scale_x));
+            const s32 y1 = s32(std::ceil(float(vp_scsr.top_left_y + vp_scsr.GetHeight()) *
+                                         bb_rt_scale_y));
+            scissors.push_back({
+                .offset = {x0, y0},
+                .extent = {u32(std::max(x1 - x0, 0)), u32(std::max(y1 - y0, 0))},
+            });
+        } else {
+            scissors.push_back({
+                .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
+                .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
+            });
+        }
     }
 
     if (viewports.empty()) {

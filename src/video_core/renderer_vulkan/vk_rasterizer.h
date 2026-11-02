@@ -130,6 +130,10 @@ private:
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
     void UpdateViewportScissorState() const;
+    // BB_SCENE_UPSCALE: host / guest size of the current draw's scaled targets (1 when none).
+    float bb_rt_scale_x = 1.0f, bb_rt_scale_y = 1.0f;
+    u32 bb_rt_guest_w = 0, bb_rt_guest_h = 0;
+    bool BBPatchConstants(const void* data, u64 size, std::vector<u32>& out) const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
     void UpdateRasterizationState() const;
