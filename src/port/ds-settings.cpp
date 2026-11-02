@@ -701,6 +701,11 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (10-23) No DLSS on a graphics card that is not NVIDIA (the launcher does not offer it).
 	const bool  fixed_fg = FixedFg(s);
 	std::string fg_id    = fixed_fg ? "amd-x2" : s.framegen;
+	// (ds-pc-perf-1102) KYTY_PORT_FG_OVERRIDE=<mode id> (e.g. sin-fg): this start only, settings.ini untouched (A/B tests).
+	if (const char* ov = std::getenv("KYTY_PORT_FG_OVERRIDE"); ov != nullptr && *ov != '\0') {
+		fg_id = ov;
+		plan.notes.emplace_back(std::string("frame generation for this start: ") + ov + " (KYTY_PORT_FG_OVERRIDE)");
+	}
 	if (!pc.nvidia && fg_id.rfind("dlss", 0) == 0) {
 		fg_id = "sin-fg";
 		plan.notes.emplace_back("DLSS frame generation needs NVIDIA: without frame generation");
