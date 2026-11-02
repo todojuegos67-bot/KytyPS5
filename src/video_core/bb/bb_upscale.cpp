@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/bb/bb_upscale.h"
+#include "core/bb_respatch.h"
 #include "video_core/bb/bb_fg.h"
 
 #include <algorithm>
@@ -702,8 +703,9 @@ std::vector<VAddr> g_ss_candidates;
 
 bool SceneScaleWanted() {
     static const bool on = [] {
-        const char* v = std::getenv("BB_SCENE_UPSCALE");
-        return v != nullptr && v[0] == '1';
+        // 0.23: BB_SCENE_UPSCALE=1 is the startup Resolution Patch (core/bb_respatch.cpp); the
+        // 0.22 shrinking of the scene's targets only with BB_SCENE_UPSCALE=shrink.
+        return BB::ResPatch::ShrinkWanted();
     }();
     return on;
 }
