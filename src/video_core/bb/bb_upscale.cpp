@@ -656,6 +656,47 @@ bool Streamline() {
 }
 } // namespace
 
+namespace {
+std::atomic<bool> g_ss_frozen{false};
+std::array<VAddr, 16> g_ss_addrs{};
+u32 g_ss_count = 0;
+u32 g_ss_w = 0, g_ss_h = 0, g_ss_sw = 0, g_ss_sh = 0;
+std::vector<VAddr> g_ss_candidates;
+
+bool SceneScaleWanted() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_SCENE_UPSCALE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+} // namespace
+
+bool ScaleImage(VAddr addr, u32& w, u32& h) {
+    if (!g_ss_frozen.load(std::memory_order_acquire) || w != g_ss_w || h != g_ss_h) {
+        return false;
+    }
+    for (u32 i = 0; i < g_ss_count; ++i) {
+        if (g_ss_addrs[i] == addr) {
+            w = g_ss_sw;
+            h = g_ss_sh;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SceneScale(u32& guest_w, u32& guest_h, u32& host_w, u32& host_h) {
+    if (!g_ss_frozen.load(std::memory_order_acquire)) {
+        return false;
+    }
+    guest_w = g_ss_w;
+    guest_h = g_ss_h;
+    host_w = g_ss_sw;
+    host_h = g_ss_sh;
+    return true;
+}
+
 float LiveSharpness() {
     static std::atomic<float> value{Cfg().sharpness};
     static const char* const path = std::getenv("BB_UPSCALE_SHARPNESS_FILE");
@@ -1249,6 +1290,21 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     }
     const VAddr scene_depth = f.gb_depth != 0 ? f.gb_depth : g_learned.gb_depth;
     g_draw.scene = !f.injected && g_draw.has_depth && depth->addr == scene_depth;
+    if (g_draw.scene && SceneScaleWanted() && !g_ss_frozen.load(std::memory_order_relaxed)) {
+        const auto add = [](VAddr a) {
+            if (a != 0 && g_ss_candidates.size() < g_ss_addrs.size() &&
+                std::find(g_ss_candidates.begin(), g_ss_candidates.end(), a) ==
+                    g_ss_candidates.end()) {
+                g_ss_candidates.push_back(a);
+            }
+        };
+        add(depth->addr);
+        for (u32 i = 0; i < g_draw.num_colors; ++i) {
+            if (colors[i].width == depth->width && colors[i].height == depth->height) {
+                add(colors[i].addr);
+            }
+        }
+    }
     if (g_draw.scene) {
         ++f.scene_draws;
         // The scene colour: the lit image the forward passes draw into (one or two targets).
@@ -1782,6 +1838,29 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     g_flips[g_flip_index++ % g_flips.size()] = addr;
     g_output_w = width;
     g_output_h = height;
+    if (SceneScaleWanted() && !g_ss_frozen.load(std::memory_order_relaxed)) {
+        const double ratio = SR::QualityRatio(Cfg().kind, Cfg().quality);
+        if (Active() && ratio > 1.01 && f.gb_depth != 0 && f.scene_draws > 0 &&
+            !g_ss_candidates.empty() && f.gb_w == width && f.gb_h == height) {
+            g_ss_w = f.gb_w;
+            g_ss_h = f.gb_h;
+            g_ss_sw = std::max<u32>(8, static_cast<u32>(std::lround(f.gb_w / ratio)) & ~1u);
+            g_ss_sh = std::max<u32>(8, static_cast<u32>(std::lround(f.gb_h / ratio)) & ~1u);
+            g_ss_count = static_cast<u32>(g_ss_candidates.size());
+            std::string list;
+            for (u32 i = 0; i < g_ss_count; ++i) {
+                g_ss_addrs[i] = g_ss_candidates[i];
+                list += fmt::format(" {:#x}", g_ss_addrs[i]);
+            }
+            g_ss_frozen.store(true, std::memory_order_release);
+            Checkpoint(fmt::format("scene upscale (BB_SCENE_UPSCALE=1): {} scene targets of {}x{} "
+                                   "rendered at {}x{} (ratio {:.3f}), post-processing and HUD at "
+                                   "{}x{}:{}",
+                                   g_ss_count, g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, ratio, width,
+                                   height, list));
+        }
+        g_ss_candidates.clear();
+    }
     const auto now = std::chrono::steady_clock::now();
     if (g_last_flip.time_since_epoch().count() != 0) {
         g_delta_ms = std::chrono::duration<float, std::milli>(now - g_last_flip).count();

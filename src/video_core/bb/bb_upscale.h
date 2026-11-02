@@ -50,6 +50,13 @@ const Config& Cfg();
 bool Enabled(); // an upscaler (or native) was asked for
 // Cfg().sharpness, then the value in BB_UPSCALE_SHARPNESS_FILE (re-read every 0.5 s when it changes).
 float LiveSharpness();
+// BB_SCENE_UPSCALE=1: the 3D scene's render targets (every colour / depth target of the scene
+// passes, learned from one gameplay frame) are created at the internal size; post-processing and
+// the HUD stay at the output size, and the upscaler runs in place before post-processing.
+// True (and the host size in w, h) when this guest image is one of them at its learned size.
+bool ScaleImage(VAddr addr, u32& w, u32& h);
+// The guest and host sizes of the scaled scene targets (0 until learned).
+bool SceneScale(u32& guest_w, u32& guest_h, u32& host_w, u32& host_h);
 
 // Instance / device creation.
 void PreInstance();

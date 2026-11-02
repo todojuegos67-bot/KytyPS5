@@ -13,6 +13,7 @@ upscaler. The code is in `src/video_core/bb/`. It reuses the Demon's Souls fork'
 | `BB_UPSCALE_SHARPNESS` (alias `BB_SHARPNESS`) | 0..1: FSR 3.1 / FSR 4 RCAS; after DLSS / DLAA / XeSS the presenter runs RCAS (attenuation (1-s)*2) | `0.3` |
 | `BB_UPSCALE_JITTER` | `0` / `1`: sub-pixel viewport jitter on the scene passes (only while a camera is found) | `1` |
 | `BB_REACTIVE` | `0` turns off the reactive mask (luminance change at the reprojected position: particles, fire, fog) sent to FSR 3.1 (reactive + T&C), XeSS (responsive mask) and DLSS (bias-current-colour hint); FSR 4's model has no reactive input | `1` |
+| `BB_SCENE_UPSCALE` | `1` (experimental): the 3D scene targets are created at the internal size (output / mode ratio) with their viewport and scissor and texel-size constants (W,H and 1/W,1/H pairs) scaled; the upscaler runs in place before post-processing, which stays at the output size with the HUD. Needs the game at the output resolution (resolution patch = output) | `0` |
 | `BB_MV` | `reconstruct` (from depth plus camera) / `zero` | `reconstruct` |
 | `BB_UPSCALE_AT` | `auto`, `scene` (HDR before post-processing), `composite` (where render size changes to output size) | `auto` |
 | `BB_UPSCALE_TO_WINDOW` | `1`: when the game's whole frame is smaller than the window, upscale to the window size (before the HUD; the HUD is added on top when presenting); `0`: in place at the game's size (native AA) | `1` |
