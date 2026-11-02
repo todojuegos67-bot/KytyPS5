@@ -1921,10 +1921,12 @@ void TextureCache::RunGarbageCollector() {
 				if (image.IsGpuModified()) ++gpu_modified;
 			});
 			std::printf("TextureCache (5 s): %zu images (%zu GPU-modified), used %.0f MiB, GC trigger %.0f / "
-			            "pressure %.0f / critical %.0f MiB, tick %llu\n",
+			            "pressure %.0f / critical %.0f MiB, tick %llu, evicted %llu, last pass skipped %zu "
+			            "unevictable old images\n",
 			            images, gpu_modified, m_total_used_memory / 1048576.0, m_trigger_gc_memory / 1048576.0,
 			            m_pressure_gc_memory / 1048576.0, m_critical_gc_memory / 1048576.0,
-			            static_cast<unsigned long long>(tick));
+			            static_cast<unsigned long long>(tick),
+			            static_cast<unsigned long long>(std::exchange(m_gc_evicted, 0)), m_gc_passed_over);
 			std::fflush(stdout);
 		}
 	}
@@ -1940,10 +1942,23 @@ void TextureCache::RunGarbageCollector() {
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
+		// Images this pass can never free (GPU-modified tiled targets, or GPU-modified ones while not
+		// pressured) used to be taken as candidates too and used up the pass's budget. They are the
+		// oldest LRU entries once a game keeps a few render targets alive, so the head of the LRU
+		// clogged and nothing was ever evicted: VRAM grew past 16 GB (Yotei menus). They are now
+		// passed over (and counted), so the budget goes to images that can actually be freed.
+		size_t passed_over = 0;
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && image->registered && !image->depth_id && image->IsGpuModified() &&
+			    image->SafeToDownload() && (image->info.IsTiled() || !pressured)) {
+				++passed_over;
+				return false;
+			}
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});
+		m_gc_passed_over = passed_over;
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
@@ -1967,6 +1982,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+			++m_gc_evicted;
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

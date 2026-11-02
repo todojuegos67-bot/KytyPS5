@@ -108,9 +108,11 @@ void GraphicContext::ReportVram() const {
 	}
 	line += " |";
 	for (int c = 0; c < VramStats::Count; c++) {
-		line += fmt::format(" {} {:.0f} MiB/{}", VramStats::kNames[c],
+		line += fmt::format(" {} {:.0f} MiB/{} live (+{} -{})", VramStats::kNames[c],
 		                    VramStats::g_bytes[c].load(std::memory_order_relaxed) / MiB,
-		                    VramStats::g_count[c].load(std::memory_order_relaxed));
+		                    VramStats::g_count[c].load(std::memory_order_relaxed),
+		                    VramStats::g_created[c].exchange(0, std::memory_order_relaxed),
+		                    VramStats::g_destroyed[c].exchange(0, std::memory_order_relaxed));
 	}
 	line += fmt::format(" | images placed outside VRAM so far {}{}",
 	                    VramStats::g_images_outside_vram.load(std::memory_order_relaxed),
