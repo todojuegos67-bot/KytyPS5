@@ -874,6 +874,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Bloodborne frame generation (bb_fg.h): this frame's depth, motion vectors and camera, and
     // its image without the HUD through the same passes (FSR / sharpening and post-processing).
     frame->fg = {};
+    if (BB::FG::WantInputs()) {
+        rasterizer->BBHudlessLut(image); // (the in-place path's HUD-less image, self-checked)
+    }
     if (vk::ImageView fg_source{};
         BB::FG::WantInputs() &&
         rasterizer->BBFrameGenCapture(frame->id, frame->fg, fg_source, view_info.format) &&

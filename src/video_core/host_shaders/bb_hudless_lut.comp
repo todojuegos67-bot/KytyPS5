@@ -1,0 +1,86 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Frame generation's HUD-less image on the in-place path (bb_fg.h). Bloodborne draws its HUD into
+// an intermediate image A and then copies A to the presented image in one full-screen pass through
+// a 1D curve. A was copied just before its first HUD draw (S); after the frame A holds the frame
+// with its HUD (T) and the presented image holds curve(T) (F). Every byte value is mapped
+// per channel:
+//  mode 0: table[c][T.c] = F.c for every pixel; two different F for the same T is a conflict.
+//  mode 1: out = table(S) (gaps between known entries interpolated); where S == T (no HUD there)
+//          out must equal F: else a mismatch. The counters gate the result (mode 2).
+//  mode 2: when there was a conflict or a mismatch, out = F (a HUD-less image equal to the
+//          presented one: frame generation then treats nothing as HUD, as without one).
+// All values are the raw bytes (UNORM views).
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D t_tex;
+layout(binding = 1) uniform sampler2D f_tex;
+layout(binding = 2) uniform sampler2D s_tex;
+layout(binding = 3, rgba8) uniform image2D out_img;
+layout(std430, binding = 4) buffer Lut {
+    uint conflicts;
+    uint mismatches;
+    uint gaps;
+    uint hud;
+    uint table[768];
+} lut;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, mode, 0
+} p;
+
+uvec3 Bytes(vec4 c) {
+    return uvec3(round(clamp(c.rgb, 0.0, 1.0) * 255.0));
+}
+
+uint Lookup(uint c, uint v) {
+    uint e = lut.table[c * 256u + v];
+    if (e != 0u) {
+        return e - 1u;
+    }
+    // A value never seen outside the HUD: between its nearest known neighbours.
+    int lo = int(v) - 1, hi = int(v) + 1;
+    while (lo >= 0 && lut.table[c * 256u + uint(lo)] == 0u) --lo;
+    while (hi <= 255 && lut.table[c * 256u + uint(hi)] == 0u) ++hi;
+    atomicAdd(lut.gaps, 1u);
+    if (lo < 0 && hi > 255) return v;
+    if (lo < 0) return lut.table[c * 256u + uint(hi)] - 1u;
+    if (hi > 255) return lut.table[c * 256u + uint(lo)] - 1u;
+    const float a = float(lut.table[c * 256u + uint(lo)] - 1u);
+    const float b = float(lut.table[c * 256u + uint(hi)] - 1u);
+    return uint(round(mix(a, b, float(int(v) - lo) / float(hi - lo))));
+}
+
+void main() {
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(p.size.x) || xy.y >= int(p.size.y)) {
+        return;
+    }
+    const vec4 fc = texelFetch(f_tex, xy, 0);
+    const uvec3 t = Bytes(texelFetch(t_tex, xy, 0));
+    const uvec3 f = Bytes(fc);
+    if (p.size.z == 0u) {
+        for (uint c = 0u; c < 3u; ++c) {
+            const uint prev = atomicCompSwap(lut.table[c * 256u + t[c]], 0u, f[c] + 1u);
+            if (prev != 0u && prev != f[c] + 1u) {
+                atomicAdd(lut.conflicts, 1u);
+            }
+        }
+        return;
+    }
+    if (p.size.z == 1u) {
+        const uvec3 s = Bytes(texelFetch(s_tex, xy, 0));
+        const uvec3 o = uvec3(Lookup(0u, s.r), Lookup(1u, s.g), Lookup(2u, s.b));
+        if (all(equal(s, t))) {
+            if (any(notEqual(o, f))) {
+                atomicAdd(lut.mismatches, 1u);
+            }
+        } else {
+            atomicAdd(lut.hud, 1u);
+        }
+        imageStore(out_img, xy, vec4(vec3(o) / 255.0, fc.a));
+        return;
+    }
+    if (lut.conflicts != 0u || lut.mismatches != 0u) {
+        imageStore(out_img, xy, fc);
+    }
+}

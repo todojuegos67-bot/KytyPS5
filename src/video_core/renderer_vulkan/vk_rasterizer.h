@@ -67,6 +67,12 @@ public:
     void BBHudBlendLog(VAddr target, u32 enable, u32 csrc, u32 cfunc, u32 cdst, u32 separate,
                        u32 asrc, u32 afunc, u32 adst, u32 write_mask);
     void BBHudAlphaCheck(VideoCore::Image& flip);
+    // Frame generation's HUD-less image on the in-place path: the image the presented image is
+    // copied from (A) is copied before its first HUD draw, and the game's own per-channel curve
+    // from A to the presented image (learned from the frame) is applied to that copy.
+    void BBNoteSample(VAddr address, u32 width, u32 height);
+    void BBHudCapturePoint(VideoCore::ImageId target);
+    void BBHudlessLut(VideoCore::Image& flip);
     bool BBFrameGenCapture(u32 slot, BB::FG::Inputs& out, vk::ImageView& hudless_view,
                            vk::Format view_format);
 

@@ -1078,6 +1078,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             vk::ImageLayout bb_layout = image.backing->state.layout;
             if (!is_storage && !image.info.props.is_depth &&
                 (BB::Upscale::Enabled() || BB::Analyze::Enabled())) {
+                BBNoteSample(image.info.guest_address, image.info.size.width,
+                             image.info.size.height);
                 switch (BB::Upscale::OnSample(image.info.guest_address, image.info.size.width,
                                               image.info.size.height, image.info.pixel_format)) {
                 case BB::Upscale::Sample::Inject: {
@@ -1157,6 +1159,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     }
     if (BB::Upscale::Enabled() && BB::Upscale::WantHudlessCopy() && cb_descs[0].image_id) {
         BBHudlessCopy(texture_cache.GetImage(cb_descs[0].image_id));
+    }
+    if (BB::Upscale::Enabled() && cb_descs[0].image_id) {
+        BBHudCapturePoint(cb_descs[0].image_id);
     }
     if (BB::Upscale::Enabled() && cb_descs[0].image_id) {
         const auto& bc = liverpool->regs.blend_control[0];

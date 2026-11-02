@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <limits>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -17,6 +19,7 @@
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_alpha_comp.h"
 #include "video_core/host_shaders/bb_hud_comp.h"
+#include "video_core/host_shaders/bb_hudless_lut_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -122,6 +125,21 @@ struct BBVk {
     VmaAllocation diag_allocation{};
     void* diag_mapped = nullptr;
     bool diag_pending = false;
+    // The in-place HUD-less image through the game's curve (BBHudlessLut).
+    std::vector<std::tuple<VAddr, u32, u32>> draw_samples; // this draw's sampled images
+    std::unordered_map<VAddr, VAddr> sampled_by;            // target -> same-size image it sampled
+    VAddr lut_a = 0;                    // the image the presented image is copied from
+    bool lut_captured = false;
+    VideoCore::ImageId lut_a_id{};
+    OwnImage lut_s, lut_f, lut_out;
+    vk::Pipeline lut_pipeline{};
+    bool lut_failed_init = false, lut_disabled = false, lut_ready = false;
+    std::array<vk::Buffer, 4> lut_buf{};
+    std::array<VmaAllocation, 4> lut_alloc{};
+    std::array<void*, 4> lut_mapped{};
+    std::array<bool, 4> lut_pending{};
+    u32 lut_slot = 0;
+    u64 lut_frames = 0, lut_ok = 0, lut_conflict = 0, lut_mismatch = 0, lut_bad_streak = 0;
     u64 fg_hudless_frames = 0, fg_frames = 0;
     struct FgSlot {
         OwnImage depth, mv;
@@ -1620,6 +1638,294 @@ void Rasterizer::BBHudAlphaCheck(VideoCore::Image& flip) {
     });
 }
 
+void Rasterizer::BBNoteSample(VAddr address, u32 width, u32 height) {
+    if (g_bb.lut_disabled || !BB::FG::WantInputs()) {
+        return;
+    }
+    if (g_bb.draw_samples.size() < 16) {
+        g_bb.draw_samples.emplace_back(address, width, height);
+    }
+}
+
+void Rasterizer::BBHudCapturePoint(VideoCore::ImageId target_id) {
+    if (g_bb.lut_disabled || !BB::FG::WantInputs()) {
+        g_bb.draw_samples.clear();
+        return;
+    }
+    auto& target = texture_cache.GetImage(target_id);
+    const VAddr addr = target.info.guest_address;
+    bool same_size = false;
+    for (const auto& [a, w, h] : g_bb.draw_samples) {
+        if (w == target.info.size.width && h == target.info.size.height) {
+            if (!same_size) g_bb.sampled_by[addr] = a;
+            same_size = true;
+        }
+    }
+    g_bb.draw_samples.clear();
+    if (g_bb.sampled_by.size() > 256) g_bb.sampled_by.clear();
+    // The first draw into A that samples nothing of A's size: its HUD begins (the post-processing
+    // passes before it all read a full-size image).
+    if (addr != g_bb.lut_a || g_bb.lut_captured || same_size || !InitOnce(instance)) {
+        return;
+    }
+    const vk::Extent2D extent{target.info.size.width, target.info.size.height};
+    if (!EnsureImage(g_bb.lut_s, extent, target.info.pixel_format,
+                     vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
+        return;
+    }
+    scheduler.EndRendering();
+    runtime.Transit(&target, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    const auto cmd = scheduler.CommandBuffer();
+    Barrier(cmd, g_bb.lut_s, vk::ImageLayout::eTransferDstOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    cmd.copyImage(target.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.lut_s.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {extent.width, extent.height, 1},
+                  });
+    Barrier(cmd, g_bb.lut_s, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    g_bb.lut_captured = true;
+    g_bb.lut_a_id = target_id;
+}
+
+namespace {
+bool Rgba8(vk::Format f) {
+    return f == vk::Format::eR8G8B8A8Unorm || f == vk::Format::eR8G8B8A8Srgb;
+}
+} // namespace
+
+void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
+    g_bb.lut_ready = false;
+    const bool captured = g_bb.lut_captured;
+    g_bb.lut_captured = false;
+    // A: the same-size image the presented image's last draw read (learned for the next frame).
+    if (const auto it = g_bb.sampled_by.find(flip.info.guest_address); it != g_bb.sampled_by.end()) {
+        if (g_bb.lut_a != it->second) {
+            g_bb.lut_a = it->second;
+            BB::FG::Printf("[fg-hudless] the presented image %#llx is copied from %#llx: its "
+                           "HUD-less image is taken there, before the HUD",
+                           static_cast<unsigned long long>(flip.info.guest_address),
+                           static_cast<unsigned long long>(g_bb.lut_a));
+        }
+    }
+    if (!captured || g_bb.lut_disabled || !g_bb.init) {
+        return;
+    }
+    auto& a = texture_cache.GetImage(g_bb.lut_a_id);
+    const vk::Extent2D extent{flip.info.size.width, flip.info.size.height};
+    if (a.info.guest_address != g_bb.lut_a || a.info.size.width != extent.width ||
+        a.info.size.height != extent.height || !Rgba8(a.info.pixel_format) ||
+        !Rgba8(flip.info.pixel_format) || g_bb.lut_s.extent != extent) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            BB::FG::Printf("[fg-hudless] A %s %ux%u, presented %s %ux%u: not the expected 8-bit "
+                           "RGBA pair, no HUD-less image",
+                           vk::to_string(a.info.pixel_format).c_str(), a.info.size.width,
+                           a.info.size.height, vk::to_string(flip.info.pixel_format).c_str(),
+                           extent.width, extent.height);
+        }
+        return;
+    }
+    if (!g_bb.lut_pipeline && !g_bb.lut_failed_init) {
+        g_bb.lut_failed_init = true;
+        if (InitHud()) {
+            const auto module = CompileSPV(BB_HUDLESS_LUT_COMP, g_bb.device);
+            if (module) {
+                auto [r, pipe] = g_bb.device.createComputePipeline(
+                    {}, vk::ComputePipelineCreateInfo{
+                            .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                                      .module = module,
+                                      .pName = "main"},
+                            .layout = g_bb.hud_layout,
+                        });
+                g_bb.device.destroyShaderModule(module);
+                if (r == vk::Result::eSuccess) {
+                    g_bb.lut_pipeline = pipe;
+                    g_bb.lut_failed_init = false;
+                }
+            }
+        }
+        for (u32 i = 0; i < g_bb.lut_buf.size() && g_bb.lut_pipeline; ++i) {
+            const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+                .size = 16 + 768 * 4,
+                .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                         vk::BufferUsageFlagBits::eTransferDst,
+            };
+            VmaAllocationCreateInfo alloc{};
+            alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                          VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            VkBuffer buffer{};
+            VmaAllocationInfo info{};
+            if (vmaCreateBuffer(g_bb.allocator, &ci, &alloc, &buffer, &g_bb.lut_alloc[i], &info) !=
+                VK_SUCCESS) {
+                g_bb.lut_pipeline = vk::Pipeline{};
+                g_bb.lut_failed_init = true;
+                break;
+            }
+            g_bb.lut_buf[i] = buffer;
+            g_bb.lut_mapped[i] = info.pMappedData;
+        }
+        if (!g_bb.lut_pipeline) {
+            BB::FG::Printf("[fg-hudless] the curve pass could not be created: no HUD-less image");
+            g_bb.lut_disabled = true;
+            return;
+        }
+    }
+    if (!g_bb.lut_pipeline) {
+        return;
+    }
+    const u32 slot = g_bb.lut_slot;
+    if (g_bb.lut_pending[slot]) {
+        return; // (its counters not read back yet: this frame goes without)
+    }
+    g_bb.lut_slot = (slot + 1) % g_bb.lut_buf.size();
+    if (!EnsureImage(g_bb.lut_f, extent, vk::Format::eR8G8B8A8Unorm,
+                     vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled) ||
+        !EnsureImage(g_bb.lut_out, extent, vk::Format::eR8G8B8A8Unorm,
+                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc |
+                         vk::ImageUsageFlagBits::eSampled)) {
+        return;
+    }
+    scheduler.EndRendering();
+    runtime.Transit(&flip, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.Transit(&a, vk::ImageLayout::eShaderReadOnlyOptimal,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+    runtime.FlushBarriers();
+    const auto cmd = scheduler.CommandBuffer();
+    Barrier(cmd, g_bb.lut_f, vk::ImageLayout::eTransferDstOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    cmd.copyImage(flip.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.lut_f.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {extent.width, extent.height, 1},
+                  });
+    Barrier(cmd, g_bb.lut_f, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+    Barrier(cmd, g_bb.lut_out, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader,
+            vk::AccessFlagBits2::eShaderWrite);
+    const vk::Buffer buf = g_bb.lut_buf[slot];
+    std::memset(g_bb.lut_mapped[slot], 0, 16 + 768 * 4);
+    vmaFlushAllocation(g_bb.allocator, g_bb.lut_alloc[slot], 0, VK_WHOLE_SIZE);
+    // (A raw UNORM view of A when it is the sRGB format: the bytes, as the curve sees them.)
+    const vk::ImageView a_view =
+        TransientView(scheduler, a.GetImage(), vk::Format::eR8G8B8A8Unorm,
+                      vk::ImageAspectFlagBits::eColor);
+    const vk::ImageView s_view = g_bb.lut_s.format == vk::Format::eR8G8B8A8Unorm
+                                     ? g_bb.lut_s.view
+                                     : vk::ImageView{};
+    if (!a_view || !s_view) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            BB::FG::Printf("[fg-hudless] no UNORM view of A (%s): no HUD-less image",
+                           vk::to_string(a.info.pixel_format).c_str());
+        }
+        return;
+    }
+    const vk::DescriptorImageInfo t_info{g_bb.nearest, a_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo f_info{g_bb.nearest, g_bb.lut_f.view,
+                                         vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo s_info{g_bb.nearest, s_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo o_info{{}, g_bb.lut_out.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo b_info{buf, 0, 16 + 768 * 4};
+    const std::array writes{
+        vk::WriteDescriptorSet{.dstBinding = 0, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &t_info},
+        vk::WriteDescriptorSet{.dstBinding = 1, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &f_info},
+        vk::WriteDescriptorSet{.dstBinding = 2, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &s_info},
+        vk::WriteDescriptorSet{.dstBinding = 3, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &o_info},
+        vk::WriteDescriptorSet{.dstBinding = 4, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = &b_info},
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.lut_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.hud_layout, 0, writes);
+    const vk::MemoryBarrier2 step{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+    };
+    for (u32 mode = 0; mode < 3; ++mode) {
+        const u32 push[4]{extent.width, extent.height, mode, 0};
+        cmd.pushConstants(g_bb.hud_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+                          push);
+        cmd.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &step});
+    }
+    const vk::MemoryBarrier2 host{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &host});
+    // The result in the presenter's view format (raw bytes), as the presented image is read.
+    Barrier(cmd, g_bb.lut_out, vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    g_bb.lut_pending[slot] = true;
+    const VmaAllocator allocator = g_bb.allocator;
+    const VmaAllocation allocation = g_bb.lut_alloc[slot];
+    const u32* counters = static_cast<const u32*>(g_bb.lut_mapped[slot]);
+    scheduler.DeferOperation([=] {
+        vmaInvalidateAllocation(allocator, allocation, 0, 16);
+        const u32 conflicts = counters[0], mismatches = counters[1], gaps = counters[2],
+                  hud = counters[3];
+        ++g_bb.lut_frames;
+        const bool bad = conflicts != 0 || mismatches != 0;
+        if (bad) {
+            g_bb.lut_conflict += conflicts != 0;
+            g_bb.lut_mismatch += mismatches != 0;
+            ++g_bb.lut_bad_streak;
+        } else {
+            ++g_bb.lut_ok;
+            g_bb.lut_bad_streak = 0;
+        }
+        if (g_bb.lut_frames % 600 == 1 || (bad && g_bb.lut_conflict + g_bb.lut_mismatch <= 8)) {
+            BB::FG::Printf("[fg-hudless] frame %llu: curve conflicts %u, mismatches outside the "
+                           "HUD %u, gap lookups %u, HUD pixels %u -> %s; totals: %llu good, %llu "
+                           "with conflicts, %llu with mismatches",
+                           static_cast<unsigned long long>(g_bb.lut_frames), conflicts, mismatches,
+                           gaps, hud, bad ? "not used (the presented image given instead)" : "used",
+                           static_cast<unsigned long long>(g_bb.lut_ok),
+                           static_cast<unsigned long long>(g_bb.lut_conflict),
+                           static_cast<unsigned long long>(g_bb.lut_mismatch));
+        }
+        if (g_bb.lut_bad_streak >= 30 && !g_bb.lut_disabled) {
+            g_bb.lut_disabled = true;
+            BB::FG::Printf("[fg-hudless] 30 frames in a row failed the self-check (conflicts "
+                           "%u, mismatches %u): off for this session, frame generation without "
+                           "a HUD-less image on this path",
+                           conflicts, mismatches);
+        }
+        g_bb.lut_pending[slot] = false;
+    });
+    g_bb.lut_ready = true;
+}
+
 bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                                    vk::ImageView& hudless_view, vk::Format view_format) {
     out = {};
@@ -1705,38 +2011,28 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
         // The window-size path: the upscaled image with no HUD added (bb_hud.comp flag 4).
         hudless_view = g_bb.fg_present.view;
         out.hudless_source = "upscaled image before the HUD";
-    } else if (raw_ready && g_bb.hudless.image && g_bb.hudless.format == view_format) {
-        // The in-place path: the presented image copied right before its first HUD draw.
-        hudless_view = g_bb.hudless.view;
-        out.hudless_source = "presented image before its first HUD draw";
-    } else if (raw_ready && g_bb.hudless.image &&
-               EnsureImage(g_bb.fg_hudless_view_copy, g_bb.hudless.extent, view_format,
+    } else if (g_bb.lut_ready &&
+               EnsureImage(g_bb.fg_hudless_view_copy, g_bb.lut_out.extent, view_format,
                            vk::ImageUsageFlagBits::eTransferDst |
                                vk::ImageUsageFlagBits::eSampled)) {
-        // The presenter reads the flip image through a view in another format of the same size
-        // class (R8G8B8A8 bytes read as B8G8R8A8): the copy's raw bytes into an image of that
-        // format, so the HUD-less image is read exactly as the presented one.
-        Barrier(cmd, g_bb.hudless, vk::ImageLayout::eTransferSrcOptimal,
-                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
-                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        // The in-place path: A before its HUD through the game's own curve (BBHudlessLut),
+        // its bytes in the presenter's view format (as the presented image is read).
+        (void)raw_ready;
         Barrier(cmd, g_bb.fg_hudless_view_copy, vk::ImageLayout::eTransferDstOptimal,
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
-        cmd.copyImage(g_bb.hudless.image, vk::ImageLayout::eTransferSrcOptimal,
+        cmd.copyImage(g_bb.lut_out.image, vk::ImageLayout::eTransferSrcOptimal,
                       g_bb.fg_hudless_view_copy.image, vk::ImageLayout::eTransferDstOptimal,
                       vk::ImageCopy{
                           .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                           .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-                          .extent = {g_bb.hudless.extent.width, g_bb.hudless.extent.height, 1},
+                          .extent = {g_bb.lut_out.extent.width, g_bb.lut_out.extent.height, 1},
                       });
-        Barrier(cmd, g_bb.hudless, vk::ImageLayout::eShaderReadOnlyOptimal,
-                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
-                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
         Barrier(cmd, g_bb.fg_hudless_view_copy, vk::ImageLayout::eShaderReadOnlyOptimal,
                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
         hudless_view = g_bb.fg_hudless_view_copy.view;
-        out.hudless_source = "presented image before its first HUD draw (as the presenter reads it)";
+        out.hudless_source = "A before its HUD through the game's curve (self-checked)";
     }
     ++g_bb.fg_frames;
     if (hudless_view) ++g_bb.fg_hudless_frames;
