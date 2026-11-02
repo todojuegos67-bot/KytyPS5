@@ -294,6 +294,22 @@ void RememberRecorded() {
 }
 // New recorded play since the store was made (2 % more and at least 256 KiB, or none noted while some exists): the
 // precompile runs again, with it as hints (what the store holds is copied, not compiled again).
+// (ds-pc-port48) The plan's options the store was made with (<store>.plan-options): a store of an older plan (without the
+// native variants) is outdated once, its pipelines copied, the new ones compiled.
+constexpr const char* kPlanOptions = "native-variants1";
+bool PlanOptionsChanged() {
+	const fs::path store = StoreFile();
+	if (store.empty()) return false;
+	const bool changed = ReadAll(fs::path(store.wstring() + L".plan-options")) != kPlanOptions;
+	if (changed) std::printf("[port] precompile: the store's plan lacks the native variants: they are added\n");
+	std::fflush(stdout);
+	return changed;
+}
+void RememberPlanOptions() {
+	if (const fs::path store = StoreFile(); !store.empty())
+		std::ofstream(fs::path(store.wstring() + L".plan-options"), std::ios::binary) << kPlanOptions;
+}
+
 bool RecordedPlayGrew() {
 	const auto f = RecordedSumFile();
 	if (f.empty()) return false;
@@ -487,9 +503,14 @@ void Work() {
 		fs::remove(plan, e);
 		return run(name + "-retry", args_no_threads + L" --threads " + std::to_wstring(std::min(cpus, 4)));
 	};
-	if (has_recorded && !plan_step("plan-recorded", L"--seeds " + Quote(recorded) + L" --dry-run --plan " + Quote(plan))) use_plan = false;
+	// (ds-pc-port48) The native XPR variants too (--native-variants; none by default): the 11-02 port47 log's runtime
+	// misses ("not among the precompiled") were native and table variants while every shard of its precompile saved all it
+	// planned (shards "N created from the store, 0 captured, 0 left out"): what the store lacks the plan never named. Same
+	// flag in the plan and in every shard (a shard makes what the plan gives it).
+	const std::wstring variants = L" --native-variants";
+	if (has_recorded && !plan_step("plan-recorded", L"--seeds " + Quote(recorded) + L" --dry-run --plan " + Quote(plan) + variants)) use_plan = false;
 	if (use_plan) {
-		std::wstring args = L"--seeds " + Quote(seeds) + L" --dry-run --plan " + Quote(plan) + L" --static-inputs";
+		std::wstring args = L"--seeds " + Quote(seeds) + L" --dry-run --plan " + Quote(plan) + L" --static-inputs" + variants;
 		if (has_recorded) args += L" --covered-by " + Quote(recorded);
 		if (!plan_step("plan-seeds", args)) use_plan = false;
 	}
@@ -616,7 +637,7 @@ void Work() {
 			pending->pop_front();
 			const std::string name = "shard" + std::to_string(item.i) + "of" + std::to_string(item.n) + (item.first ? "-recorded" : "-seeds");
 			Child c = Launch(name, L"--seeds " + Quote(item.file) + L" --shard " + std::to_wstring(item.i) + L"/" + std::to_wstring(item.n) +
-			                           L" --threads " + std::to_wstring(threads) + (use_plan ? L" --plan " + Quote(plan) : std::wstring()),
+			                           L" --threads " + std::to_wstring(threads) + variants + (use_plan ? L" --plan " + Quote(plan) : std::wstring()),
 			                 true);
 			if (c.process == nullptr) {
 				kill_all();
@@ -695,6 +716,7 @@ void Work() {
 	fs::remove_all(g_nvidia, ec);
 	RememberHints();
 	RememberRecorded(); // (ds-pc-port45: the recorded play this store holds)
+	RememberPlanOptions(); // (ds-pc-port48)
 	RemoveOldWarmedCache();
 	std::scoped_lock lock(g_mutex);
 	g_view.running  = false;
@@ -759,6 +781,7 @@ bool CacheCurrent() {
 	const std::string text = ReadAll(g_logs / L"precompile-status.out.log");
 	bool current = code == 0 && text.find("static cache current") != std::string::npos;
 	if (current && RecordedPlayGrew()) current = false; // (ds-pc-port45)
+	if (current && PlanOptionsChanged()) current = false; // (ds-pc-port48)
 	if (current) {
 		RememberHints(); // (for the next update: its hints compared by content)
 		RememberRecorded();
