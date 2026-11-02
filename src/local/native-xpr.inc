@@ -3151,7 +3151,8 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		if (!image->SafeToDownload()) return Spec::Refuse("table: target download"), false;
 		// (A speculation asks each time: its answers are noted.)
 		if (target.metadata != 0 && (spec != nullptr || draw_state.meta_epoch != meta_epoch) &&
-		    textures.IsMetaCleared(target.metadata, target.slice)) {
+		    textures.IsMetaCleared(target.metadata, target.slice, nullptr, nullptr,
+		                           target.requested.metadata.kind == ImageMetadataKind::Dcc)) {
 			// The normal path clears it first. A speculation's draw is a hole that does: the draws after it find it
 			// cleared (speculation-state.h).
 			if (spec != nullptr) spec->ConsumeMeta(target.metadata, target.slice);

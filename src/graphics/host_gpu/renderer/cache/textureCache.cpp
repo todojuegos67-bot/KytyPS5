@@ -4955,11 +4955,11 @@ bool TextureCache::IsMeta(uint64_t address) {
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value,
-                                 bool* fill_known) {
+                                 bool* fill_known, bool dcc_ok) {
 	// A speculation's answer is as after its holes; one it relies on is noted (speculation-state.h).
 	auto* spec = slice < 32 && fill_value == nullptr && fill_known == nullptr ? Spec::Current() : nullptr;
 	if (spec != nullptr)
-		if (const auto known = spec->KnownMeta(address, slice); known >= 0) return known == 1;
+		if (const auto known = spec->KnownMeta(address, slice, dcc_ok); known >= 0) return known == 1;
 	const auto not_cleared = [&] {
 		if (spec != nullptr) spec->NoteMetaRead(address, slice);
 		return false;
@@ -4972,9 +4972,13 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	// one it is not chained to, may clear it before its commit ("commit: a surface cleared"). The draw that would consume
 	// the clear becomes a hole (the normal path decides at commit); a not-cleared answer would be checked at commit
 	// instead, and a fill meanwhile made the rest of the chunk go in order.
+	// (Only for a surface the caller may hold as DCC: m_dcc_filled keeps the addresses fills were tracked at while no
+	// image said what the metadata was, no entry or a pending one, and some are depth targets' HTile, which the normal
+	// path never finds cleared there: ~42 needless holes a frame on depth targets at the arch, 2 Nov.)
 	static auto& predict_dcc = LiveSwitch::Find("spec_predict_dcc", 0);
 	const auto   dcc_filled  = [&] {
-		return spec != nullptr && slice < 32 && predict_dcc.load(std::memory_order_relaxed) != 0 && m_dcc_filled.contains(address);
+		return spec != nullptr && dcc_ok && slice < 32 && predict_dcc.load(std::memory_order_relaxed) != 0 &&
+		       m_dcc_filled.contains(address);
 	};
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    slice >= 32) {

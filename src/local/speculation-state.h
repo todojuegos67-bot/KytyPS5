@@ -325,17 +325,19 @@ struct State {
 		uint32_t slice   = 0;
 		bool     cleared = false;
 		size_t   first = 0, last = 0;
+		bool     dcc   = false; // a predicted DCC fill's clear (spec_predict_dcc): not a fact about other metadata
 	};
 	std::vector<MetaFact> meta_facts;
 
 	// IsMetaCleared's answer for the open segment from the latest fact: 1 cleared, 0 not, -1 none (the cache answers).
 	// Without one of its own, as a speculation before it not committed yet leaves the surface: cleared by a hole of
 	// its (the draw here is a hole that applies the clear), or not (noted: the commit checks it).
-	[[nodiscard]] int KnownMeta(uint64_t address, uint32_t slice) noexcept {
+	// (`dcc_ok` false: a surface the caller knows is not DCC, which predicted DCC clears are not about.)
+	[[nodiscard]] int KnownMeta(uint64_t address, uint32_t slice, bool dcc_ok = true) noexcept {
 		MetaFact* latest = nullptr;
 		for (auto& fact: meta_facts)
 			if (fact.address == address && (fact.slice == slice || fact.slice == UINT32_MAX) && fact.first <= closed.size() &&
-			    (latest == nullptr || fact.first >= latest->first))
+			    (dcc_ok || !fact.dcc) && (latest == nullptr || fact.first >= latest->first))
 				latest = &fact;
 		if (latest != nullptr) {
 			if (latest->cleared) return 1;
@@ -345,7 +347,7 @@ struct State {
 		for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) {
 			const MetaFact* last = nullptr;
 			for (const auto& fact: state->meta_facts)
-				if (fact.address == address && (fact.slice == slice || fact.slice == UINT32_MAX) &&
+				if (fact.address == address && (fact.slice == slice || fact.slice == UINT32_MAX) && (dcc_ok || !fact.dcc) &&
 				    (last == nullptr || fact.first >= last->first))
 					last = &fact;
 			if (last == nullptr) continue;
@@ -362,7 +364,9 @@ struct State {
 	void ConsumeMeta(uint64_t address, uint32_t slice) {
 		meta_facts.push_back({address, slice, false, closed.size() + 1, closed.size() + 1});
 	}
-	void PredictClear(uint64_t address) { meta_facts.push_back({address, UINT32_MAX, true, closed.size() + 1, closed.size() + 1}); }
+	void PredictClear(uint64_t address, bool dcc = false) {
+		meta_facts.push_back({address, UINT32_MAX, true, closed.size() + 1, closed.size() + 1, dcc});
+	}
 	void Journal(uint64_t address, uint64_t value, uint32_t size, bool copy = false) {
 		writes.push_back({address, value, size, copy});
 		journal_set.Add(address, size);

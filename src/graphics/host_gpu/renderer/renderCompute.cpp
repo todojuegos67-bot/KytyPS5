@@ -691,7 +691,7 @@ void RenderExecutor::PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_g
 	if (PredictDccFills())
 		if (const auto found = learned.m_dcc_fills.find(MetaClearKey(cs)); found != learned.m_dcc_fills.end())
 			for (const auto address: found->second)
-				if (address != 0) record.PredictClear(address);
+				if (address != 0) record.PredictClear(address, true);
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -754,7 +754,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			const auto read    = CatalogRead();
 			if (const auto found = learned.m_dcc_fills.find(MetaClearKey(sh_ctx.GetCs())); found != learned.m_dcc_fills.end())
 				for (const auto address: found->second)
-					if (address != 0) spec->PredictClear(address);
+					if (address != 0) spec->PredictClear(address, true);
 		}
 		return;
 	}
@@ -774,7 +774,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			if (PredictDccFills())
 				if (const auto found = learned.m_dcc_fills.find(MetaClearKey(sh_ctx.GetCs())); found != learned.m_dcc_fills.end())
 					for (const auto address: found->second)
-						if (address != 0) Spec::Current()->PredictClear(address);
+						if (address != 0) Spec::Current()->PredictClear(address, true);
 		}
 		return Spec::Refuse(m_dispatch_declined != nullptr ? m_dispatch_declined
 		                    : thread_dimensions            ? "dispatch (thread dimensions)"

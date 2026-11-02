@@ -163,8 +163,10 @@ public:
 	// A use of the metadata at `address` by the image in serial slot `slot` (a table set's texture, a draw state's
 	// target, whose view names it): a change there moves the slot's image serial too (MoveMeta; ImageSerials).
 	void               NoteMetaUse(uint64_t address, uint32_t slot);
+	// (`dcc_ok` false: the caller knows the surface is not DCC, e.g. a depth target's HTile; a speculation's DCC
+	// predictions, KYTY_SPEC_PREDICT_DCC, do not answer for it.)
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
-	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
+	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr, bool dcc_ok = true);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	// Record deferred DCC state while the original guest dispatch writes the metadata.
 	// True when the fill leaves the surface's DCC cleared (a recognized clear code over a DCC entry).
