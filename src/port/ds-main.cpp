@@ -1354,6 +1354,19 @@ int main(int argc, char* argv[]) {
 		// (ds-pc-port47) The prefetch threads left to the emulator's default (no override).
 	}
 	for (const auto& [key, value]: plan.env) SetEnv(key, value);
+	// (ds-pc-perf-1102) KYTY_PORT_ENV_OVERRIDE="KEY=value;KEY=value": this start only, over the plan's switches (A/B tests).
+	if (const char* ov = std::getenv("KYTY_PORT_ENV_OVERRIDE"); ov != nullptr && *ov != '\0') {
+		std::string list = ov;
+		for (size_t at = 0; at < list.size();) {
+			const size_t end = std::min(list.find(';', at), list.size());
+			const std::string item = list.substr(at, end - at);
+			if (const size_t eq = item.find('='); eq != std::string::npos && eq > 0) {
+				SetEnv(item.substr(0, eq), item.substr(eq + 1));
+				std::printf("[port] override for this start: %s\n", item.c_str());
+			}
+			at = end + 1;
+		}
+	}
 	std::printf("[port] switches: %zu, vblank %d Hz\n", plan.env.size(), plan.vblank);
 	std::fflush(stdout);
 
