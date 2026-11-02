@@ -141,6 +141,7 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
+      !startsWith(github.ref_name, 'yotei-') &&
       ((github.event_name == 'push' && github.repository == 'KytyPS5/KytyPS5') ||
        (github.event_name == 'workflow_dispatch' && github.repository != 'KytyPS5/KytyPS5')) &&
       needs.windows.result == 'success'
