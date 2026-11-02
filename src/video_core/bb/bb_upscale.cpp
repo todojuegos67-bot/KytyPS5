@@ -958,7 +958,9 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
             present_id.presentId = VK_TRUE;
             present_id.pNext = next;
             Checkpoint("DLSS: VkPhysicalDevicePresentIdFeaturesKHR{presentId} chained");
-            return &present_id;
+            // Not a return: with DLSS-G / Reflex (Streamline) on, XeSS's and FSR 4's own features
+            // still have to be chained (FSR 4 was off as 'this GPU lacks ...' under DLSS-G).
+            next = &present_id;
         }
     }
     if (Cfg().kind == SR::Kind::Xess) {
@@ -1556,6 +1558,9 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
     FillCamera(p);
+    if (const char* inv = std::getenv("BB_DEPTH_INVERT"); inv != nullptr && *inv != '\0') {
+        p.depth_inverted = inv[0] == '1';
+    }
     const bool jitter_on =
         Cfg().jitter && p.camera_valid && g_jittered_draws > g_jittered_frame_start;
     p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
@@ -1646,6 +1651,9 @@ void FillPresentPlan(VAddr flip, const char* where) {
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
     FillCamera(p);
+    if (const char* inv = std::getenv("BB_DEPTH_INVERT"); inv != nullptr && *inv != '\0') {
+        p.depth_inverted = inv[0] == '1';
+    }
     const bool jitter_on =
         Cfg().jitter && p.camera_valid && g_jittered_draws > g_jittered_frame_start;
     p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
