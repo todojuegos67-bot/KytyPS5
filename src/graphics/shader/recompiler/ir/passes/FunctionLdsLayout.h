@@ -40,7 +40,7 @@ inline FunctionLdsLayout PlanFunctionLdsLayout(const Program& program) {
 			const auto  shift = address->Arg(1).Resolve();
 			const auto* lane  = address->Arg(0).Resolve().TryInstruction();
 			if (!shift.IsImmediate() || shift.GetType() != Type::U32 || shift.U32() != 2u ||
-			    !lane || lane->GetOpcode() != ValueOpcode::LaneId)
+			    !lane || (lane->GetOpcode() != ValueOpcode::LaneId && lane->GetOpcode() != ValueOpcode::WaveLaneId))
 				return {};
 			accesses.emplace(&inst, memory.offset);
 			offsets.push_back(memory.offset);

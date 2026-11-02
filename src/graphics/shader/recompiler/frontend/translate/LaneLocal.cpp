@@ -1214,16 +1214,29 @@ private:
 // workgroup barrier between them, placed where every invocation passes it as often as the program's own barrier:
 // EXEC full, in the same loop as an existing barrier (or outside every loop), not in a per-lane loop, and on every
 // path through that loop's iteration (or through the program). Refused where no such place exists.
-enum LdsAccess : uint8_t { LdsNone = 0, LdsRead = 1, LdsWrite = 2 };
+// DS_*_ADDTID (the lane's dword at (M0 & 0xffff) + offset + 4 x lane, the lane the wave's: WaveLaneId) whose M0 is a
+// constant on every path: its window of the wave's 64 dwords is known. Two such accesses of one window never meet
+// another lane's, nor two of disjoint windows; any other pair (or one whose M0 is not proven) is plain.
+enum LdsAccess : uint8_t { LdsNone = 0, LdsRead = 1, LdsWrite = 2, LdsTidRead = 4, LdsTidWrite = 8 };
+
+// The LDS accesses since the last barrier: plain kinds, and the lane-window reads and writes by window.
+struct LdsPending {
+	uint8_t  plain     = LdsNone;
+	uint64_t tid_read  = 0;
+	uint64_t tid_write = 0;
+	bool     operator==(const LdsPending&) const = default;
+	void     operator|=(const LdsPending& other) {
+		plain |= other.plain;
+		tid_read |= other.tid_read;
+		tid_write |= other.tid_write;
+	}
+};
 
 // A plain LDS access (its kinds), or nullptr; `refused`: an LDS operation this rule does not take.
 uint8_t PlainLds(const Instruction& inst, const char** refused) {
 	if (inst.family != Family::DS) return LdsNone;
 	const auto name = magic_enum::enum_name(inst.opcode);
-	if (name.find("ADDTID") != std::string_view::npos) {
-		*refused = "LDS addressed by the lane";
-		return LdsNone;
-	}
+	if (name.find("ADDTID") != std::string_view::npos) return name.starts_with("DS_READ") ? LdsTidRead : LdsTidWrite;
 	if (name.starts_with("DS_READ")) return LdsRead;
 	if (name.starts_with("DS_WRITE") && !name.starts_with("DS_WRXCHG")) return LdsWrite;
 	*refused = "an LDS operation other than a plain read or write";
@@ -1247,6 +1260,7 @@ class LdsBarriers {
 public:
 	LdsBarriers(const Decoder::Program& program, const CFG::Graph& cfg): m_program(program), m_cfg(cfg) {
 		for (size_t i = 0; i < cfg.blocks.size(); ++i) m_index_of[cfg.blocks[i].id] = i;
+		Windows();
 	}
 
 	// The PCs a barrier goes before; false (with `reason`) when the program is refused.
@@ -1265,14 +1279,13 @@ public:
 			// The first hazard in program order.
 			size_t hazard_block = SIZE_MAX, hazard_index = 0;
 			for (size_t b = 0; b < blocks.size() && hazard_block == SIZE_MAX; ++b) {
-				uint8_t pending = m_pending_in[b];
+				auto pending = m_pending_in[b];
 				for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) {
 					const auto& inst = m_program.instructions[i];
-					if (m_before.contains(inst.pc) || inst.opcode == Opcode::S_BARRIER) pending = LdsNone;
-					const char* refused = nullptr;
-					const auto  access  = PlainLds(inst, &refused);
-					if (access == LdsNone) continue;
-					if ((access == LdsRead && (pending & LdsWrite) != 0) || (access == LdsWrite && pending != LdsNone)) {
+					if (m_before.contains(inst.pc) || inst.opcode == Opcode::S_BARRIER) pending = {};
+					const auto access = Access(i);
+					if (access == LdsPending {}) continue;
+					if (Hazard(i, pending)) {
 						hazard_block = b;
 						hazard_index = i;
 						break;
@@ -1328,11 +1341,11 @@ private:
 	// The LDS access kinds since the last barrier on some path, at each block's start.
 	void Pending() {
 		const auto& blocks = m_cfg.blocks;
-		m_pending_in.assign(blocks.size(), LdsNone);
+		m_pending_in.assign(blocks.size(), LdsPending {});
 		for (bool changed = true; changed;) {
 			changed = false;
 			for (size_t b = 0; b < blocks.size(); ++b) {
-				uint8_t in = LdsNone;
+				LdsPending in;
 				for (const auto pred: blocks[b].predecessors) in |= PendingOut(m_index_of.at(pred));
 				if (in != m_pending_in[b]) {
 					m_pending_in[b] = in;
@@ -1342,15 +1355,107 @@ private:
 		}
 	}
 
-	uint8_t PendingOut(size_t b) const {
-		uint8_t pending = m_pending_in[b];
+	LdsPending PendingOut(size_t b) const {
+		auto pending = m_pending_in[b];
 		for (auto i = m_cfg.blocks[b].inst_begin; i < m_cfg.blocks[b].inst_end; ++i) {
 			const auto& inst = m_program.instructions[i];
-			if (m_before.contains(inst.pc) || inst.opcode == Opcode::S_BARRIER) pending = LdsNone;
-			const char* refused = nullptr;
-			pending |= PlainLds(inst, &refused);
+			if (m_before.contains(inst.pc) || inst.opcode == Opcode::S_BARRIER) pending = {};
+			pending |= Access(i);
 		}
 		return pending;
+	}
+
+	// Instruction `i`'s access: a lane-window one where its window is known, else its plain kind.
+	LdsPending Access(size_t i) const {
+		const char* refused = nullptr;
+		const auto  kind    = PlainLds(m_program.instructions[i], &refused);
+		LdsPending  access;
+		if (kind == LdsTidRead || kind == LdsTidWrite) {
+			if (m_window[i] >= 0) {
+				(kind == LdsTidRead ? access.tid_read : access.tid_write) = uint64_t {1} << m_window[i];
+			} else {
+				access.plain = kind == LdsTidRead ? LdsRead : LdsWrite;
+			}
+			return access;
+		}
+		access.plain = kind;
+		return access;
+	}
+
+	// Whether instruction `i` may meet an earlier access of another lane among `pending`.
+	bool Hazard(size_t i, const LdsPending& pending) const {
+		const auto access = Access(i);
+		if (access.plain == LdsRead) return (pending.plain & LdsWrite) != 0 || pending.tid_write != 0;
+		if (access.plain == LdsWrite) return !(pending == LdsPending {});
+		const auto window = m_window[i];
+		const auto others = m_overlaps[window] & ~(uint64_t {1} << window);
+		if (access.tid_read != 0) return (pending.plain & LdsWrite) != 0 || (pending.tid_write & others) != 0;
+		return pending.plain != LdsNone || ((pending.tid_read | pending.tid_write) & others) != 0;
+	}
+
+	// M0 on every path to each DS_*_ADDTID: a constant gives its window (at most 64 of them; beyond, plain).
+	void Windows() {
+		const auto& blocks = m_cfg.blocks;
+		const auto& code   = m_program.instructions;
+		m_window.assign(code.size(), -1);
+		struct M0 {
+			uint8_t  state = 0; // (0 not reached, 1 a constant, 2 unknown)
+			uint32_t value = 0;
+			bool     operator==(const M0&) const = default;
+		};
+		const auto meet = [](M0 a, M0 b) {
+			if (a.state == 0) return b;
+			if (b.state == 0) return a;
+			return a.state == 1 && b.state == 1 && a.value == b.value ? a : M0 {2, 0};
+		};
+		const auto step = [](const Instruction& inst, M0 m0) {
+			const auto name = magic_enum::enum_name(inst.opcode);
+			if (name.starts_with("S_MOVREL")) return M0 {2, 0};
+			if (inst.dst.kind != OperandKind::M0 && inst.dst2.kind != OperandKind::M0) return m0;
+			const bool constant = inst.src0.kind == OperandKind::IntegerInlineConstant ||
+			                      inst.src0.kind == OperandKind::LiteralConstant;
+			if ((inst.opcode == Opcode::S_MOVK_I32 || inst.opcode == Opcode::S_MOV_B32) && constant)
+				return M0 {1, inst.src0.value};
+			return M0 {2, 0};
+		};
+		std::vector<M0> in(blocks.size());
+		const auto      out = [&](size_t b) {
+			auto m0 = in[b];
+			for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) m0 = step(code[i], m0);
+			return m0;
+		};
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t b = 0; b < blocks.size(); ++b) {
+				M0 m0 = blocks[b].id == m_cfg.entry_block ? M0 {2, 0} : M0 {};
+				for (const auto pred: blocks[b].predecessors) m0 = meet(m0, out(m_index_of.at(pred)));
+				if (!(m0 == in[b])) {
+					in[b]   = m0;
+					changed = true;
+				}
+			}
+		}
+		std::vector<uint32_t> bases;
+		for (size_t b = 0; b < blocks.size(); ++b) {
+			auto m0 = in[b];
+			for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) {
+				const char* refused = nullptr;
+				const auto  kind    = PlainLds(code[i], &refused);
+				if ((kind == LdsTidRead || kind == LdsTidWrite) && m0.state == 1) {
+					const uint32_t base = (m0.value & 0xffffu) + code[i].offset;
+					auto           at   = std::ranges::find(bases, base);
+					if (at == bases.end() && bases.size() < 64) at = bases.insert(bases.end(), base);
+					if (at != bases.end()) m_window[i] = static_cast<int8_t>(at - bases.begin());
+				}
+				m0 = step(code[i], m0);
+			}
+		}
+		// (Windows of 64 dwords meet where their bases are nearer than 256 bytes.)
+		m_overlaps.assign(bases.size(), 0);
+		for (size_t a = 0; a < bases.size(); ++a)
+			for (size_t c = 0; c < bases.size(); ++c)
+				if ((bases[a] > bases[c] ? bases[a] - bases[c] : bases[c] - bases[a]) < 256u)
+					m_overlaps[a] |= uint64_t {1} << c;
 	}
 
 	// Where a barrier goes for the hazard at instruction `index` of block `b`: the latest valid place after the last LDS
@@ -1437,7 +1542,9 @@ private:
 	const CFG::Graph&                    m_cfg;
 	std::unordered_map<uint32_t, size_t> m_index_of;
 	std::vector<bool>                    m_exec_in;
-	std::vector<uint8_t>                 m_pending_in;
+	std::vector<LdsPending>              m_pending_in;
+	std::vector<int8_t>                  m_window;   // (by instruction) a DS_*_ADDTID's window, or -1
+	std::vector<uint64_t>                m_overlaps; // (by window) the windows it meets
 	std::set<uint32_t>                   m_before;
 };
 

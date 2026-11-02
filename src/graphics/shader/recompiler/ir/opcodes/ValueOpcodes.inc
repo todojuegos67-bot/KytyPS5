@@ -185,6 +185,8 @@ VALUE_OPCODE(FPTrunc32, F32, F32)
 VALUE_OPCODE(FPFract32, F32, F32)
 
 VALUE_OPCODE(LaneId, U32)
+// The GCN lane in its wave (0-63; DS_*_ADDTID): LaneId but for a lane-local wave64 program, whose subgroup is half a wave.
+VALUE_OPCODE(WaveLaneId, U32)
 VALUE_OPCODE(Ballot, U32x4, U1)
 VALUE_OPCODE(AnyLane, U1, U1)
 VALUE_OPCODE(ReadFirstLane, U32, U32, U1)
