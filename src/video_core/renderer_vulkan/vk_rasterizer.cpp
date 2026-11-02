@@ -162,6 +162,16 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             if (bb_scaled_target(cb_descs[cb].image_id)) break;
         }
     }
+    if (bb_rt_guest_w != 0) {
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (!cb_descs[cb].image_id) continue;
+            const auto& info = texture_cache.GetImage(cb_descs[cb].image_id).info;
+            if (!info.bb_scaled && info.size.width == bb_rt_guest_w &&
+                info.size.height == bb_rt_guest_h) {
+                BB::Upscale::AddSceneTarget(info.guest_address);
+            }
+        }
+    }
     BBOnDraw(std::bit_width(key.mrt_mask));
 }
 

@@ -57,6 +57,9 @@ float LiveSharpness();
 bool ScaleImage(VAddr addr, u32& w, u32& h);
 // The guest and host sizes of the scaled scene targets (0 until learned).
 bool SceneScale(u32& guest_w, u32& guest_h, u32& host_w, u32& host_h);
+// A target of the scaled targets' guest size bound in the same draw as scaled ones (mixed sizes
+// in one render pass): scaled from its next use.
+void AddSceneTarget(VAddr addr);
 
 // Instance / device creation.
 void PreInstance();

@@ -695,8 +695,8 @@ namespace {
 std::atomic<bool> g_ss_frozen{false};
 std::atomic<bool> g_ss_off{false}; // turned off at run time by the safety net
 u32 g_ss_frames = 0, g_ss_scene = 0, g_ss_good = 0, g_ss_windows = 0;
-std::array<VAddr, 16> g_ss_addrs{};
-u32 g_ss_count = 0;
+std::array<VAddr, 32> g_ss_addrs{};
+std::atomic<u32> g_ss_count{0};
 u32 g_ss_w = 0, g_ss_h = 0, g_ss_sw = 0, g_ss_sh = 0;
 std::vector<VAddr> g_ss_candidates;
 
@@ -714,7 +714,8 @@ bool ScaleImage(VAddr addr, u32& w, u32& h) {
         w != g_ss_w || h != g_ss_h) {
         return false;
     }
-    for (u32 i = 0; i < g_ss_count; ++i) {
+    const u32 n = g_ss_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
         if (g_ss_addrs[i] == addr) {
             w = g_ss_sw;
             h = g_ss_sh;
@@ -722,6 +723,24 @@ bool ScaleImage(VAddr addr, u32& w, u32& h) {
         }
     }
     return false;
+}
+
+void AddSceneTarget(VAddr addr) {
+    if (!g_ss_frozen.load(std::memory_order_acquire) || g_ss_off.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const u32 n = g_ss_count.load(std::memory_order_acquire);
+    if (n >= g_ss_addrs.size()) {
+        return;
+    }
+    for (u32 i = 0; i < n; ++i) {
+        if (g_ss_addrs[i] == addr) return;
+    }
+    g_ss_addrs[n] = addr;
+    g_ss_count.store(n + 1, std::memory_order_release);
+    Checkpoint(fmt::format("scene upscale: {:#x} ({}x{}) bound with scaled targets, scaled too "
+                           "({} scene targets)",
+                           addr, g_ss_w, g_ss_h, n + 1));
 }
 
 bool SceneScale(u32& guest_w, u32& guest_h, u32& host_w, u32& host_h) {
@@ -1332,7 +1351,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     g_draw.scene = !f.injected && g_draw.has_depth && depth->addr == scene_depth;
     if (g_draw.scene && SceneScaleWanted() && !g_ss_frozen.load(std::memory_order_relaxed)) {
         const auto add = [](VAddr a) {
-            if (a != 0 && g_ss_candidates.size() < g_ss_addrs.size() &&
+            if (a != 0 && g_ss_candidates.size() < 16 &&
                 std::find(g_ss_candidates.begin(), g_ss_candidates.end(), a) ==
                     g_ss_candidates.end()) {
                 g_ss_candidates.push_back(a);
@@ -1921,17 +1940,18 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             g_ss_h = f.gb_h;
             g_ss_sw = std::max<u32>(8, static_cast<u32>(std::lround(f.gb_w / ratio)) & ~1u);
             g_ss_sh = std::max<u32>(8, static_cast<u32>(std::lround(f.gb_h / ratio)) & ~1u);
-            g_ss_count = static_cast<u32>(g_ss_candidates.size());
+            const u32 count = static_cast<u32>(g_ss_candidates.size());
             std::string list;
-            for (u32 i = 0; i < g_ss_count; ++i) {
+            for (u32 i = 0; i < count; ++i) {
                 g_ss_addrs[i] = g_ss_candidates[i];
                 list += fmt::format(" {:#x}", g_ss_addrs[i]);
             }
+            g_ss_count.store(count, std::memory_order_release);
             g_ss_frozen.store(true, std::memory_order_release);
             Checkpoint(fmt::format("scene upscale (BB_SCENE_UPSCALE=1): {} scene targets of {}x{} "
                                    "rendered at {}x{} (ratio {:.3f}), post-processing and HUD at "
                                    "{}x{}:{}",
-                                   g_ss_count, g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, ratio, width,
+                                   count, g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, ratio, width,
                                    height, list));
         }
         if (!g_ss_frozen.load(std::memory_order_relaxed) && f.gb_depth != 0 &&
