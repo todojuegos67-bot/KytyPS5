@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_upscale.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -223,6 +224,27 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
     return {vertex_offset, instance_offset};
 }
 
+// BB object motion vectors (bb_objmv.h): the motion parameters of a G-buffer draw.
+static void BBObjMotionDraw(const Instance& instance, Shader::PushData& push,
+                            const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
+                            bool is_indexed, u32 index_offset, bool indirect) {
+    BB::ObjMotion::EnsureInit(instance);
+    const auto& key = pipeline.GetGraphicsKey();
+    const bool motion = BB::ObjMotion::IsMotionKey(
+        key.mrt_mask, key.color_buffers[BB::ObjMotion::Attachment]);
+    if (!motion) {
+        return;
+    }
+    const auto& vs_info = pipeline.GetStage(Shader::SwStage::Vertex);
+    const auto& fetch_shader = pipeline.GetFetchShader();
+    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+    // Indirect draws: no history (their counts are on the GPU), camera motion.
+    static const Shader::Gcn::FetchShaderData no_fetch{};
+    BB::ObjMotion::OnDraw(instance, push, true, vs_info, indirect ? no_fetch : fetch_shader, regs,
+                          is_indexed, index_offset, vertex_offset, instance_offset,
+                          key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)]);
+}
+
 void Rasterizer::EliminateFastClear() {
     auto& col_buf = liverpool->regs.color_buffers[0];
     if (!col_buf || !col_buf.info.fast_clear) {
@@ -276,6 +298,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
+    BBObjMotionDraw(instance, push_data, *pipeline, regs, is_indexed, index_offset, false);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -349,6 +372,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
+    BBObjMotionDraw(instance, push_data, *pipeline, liverpool->regs, is_indexed, 0, true);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1303,6 +1327,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.depth_stencil_attachment = {};
     }
 
+    if (BB::ObjMotion::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMotion::Attachment])) {
+        BB::ObjMotion::Attach(instance, scheduler, state);
+    }
     if (BB::Analyze::Enabled()) {
         BB::Analyze::OnPass(bb_cols, state.num_color_attachments, bb_depth, state.width,
                             state.height);

@@ -72,7 +72,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma) {
+    if (info.uses_dma || VertexMotion()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -709,6 +709,12 @@ void EmitContext::DefineOutputs() {
             output_params[i] =
                 GetAttributeInfo(AmdGpu::NumberFormat::Float, id, num_components, true);
         }
+        if (VertexMotion()) {
+            motion_out_cur = DefineOutput(F32[4], MotionCurLocation);
+            motion_out_prev = DefineOutput(F32[4], MotionPrevLocation);
+            Name(motion_out_cur, "bb_motion_cur");
+            Name(motion_out_prev, "bb_motion_prev");
+        }
         break;
     }
     case SwStage::Fragment: {
@@ -748,6 +754,13 @@ void EmitContext::DefineOutputs() {
         // undefined.
         ASSERT_MSG(!runtime_info.hw.fs.dual_source_blending || num_render_targets <= 2,
                    "Dual source blending enabled, there must be at most two MRT exports");
+        if (FragmentMotion() && !Sirit::ValidId(frag_outputs[MotionOutput].id) &&
+            !runtime_info.hw.fs.dual_source_blending) {
+            motion_frag_out = DefineOutput(U32[2], MotionOutput);
+            motion_in_cur = DefineInput(F32[4], MotionCurLocation);
+            motion_in_prev = DefineInput(F32[4], MotionPrevLocation);
+            Name(motion_frag_out, "bb_motion_vector");
+        }
         break;
     }
     case SwStage::Geometry: {
@@ -769,7 +782,9 @@ void EmitContext::DefineOutputs() {
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]), "AuxData")};
+        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[1], U32[2],
+                        U32[2]),
+             "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
@@ -785,6 +800,13 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
+    MemberName(struct_type, PushData::MotionParamIndex, "bb_motion_param");
+    MemberName(struct_type, PushData::MotionParamsAddrIndex, "bb_motion_params");
+    MemberName(struct_type, PushData::MotionPositionsAddrIndex, "bb_motion_positions");
+    MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset,
+                   PushData::MotionParamOffset);
+    MemberDecorate(struct_type, PushData::MotionParamsAddrIndex, spv::Decoration::Offset, 80U);
+    MemberDecorate(struct_type, PushData::MotionPositionsAddrIndex, spv::Decoration::Offset, 88U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);

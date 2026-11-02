@@ -8,6 +8,7 @@
 #include "video_core/amdgpu/resource.h"
 
 #include <boost/container/static_vector.hpp>
+#include <cstddef>
 
 namespace Shader {
 
@@ -225,18 +226,31 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
+    // BB object motion vectors (bb_objmv.h): this draw's parameter entry (0: none) and the
+    // parameter / position arrays' device addresses (lo, hi).
+    static constexpr u32 MotionParamIndex = 7;
+    static constexpr u32 MotionParamsAddrIndex = 8;
+    static constexpr u32 MotionPositionsAddrIndex = 9;
+    static constexpr u32 MotionParamOffset = 72;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    u32 motion_param;
+    u32 motion_pad;
+    std::array<u32, 2> motion_params_addr;
+    std::array<u32, 2> motion_positions_addr;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
         buf_offsets[binding] = offset;
     }
 };
+static_assert(offsetof(PushData, motion_param) == PushData::MotionParamOffset);
+static_assert(offsetof(PushData, motion_params_addr) == 80);
+static_assert(offsetof(PushData, motion_positions_addr) == 88);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

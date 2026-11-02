@@ -21,6 +21,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_upscale.h"
@@ -738,6 +739,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     if (BB::Upscale::Enabled() || BB::Analyze::Enabled()) {
         const auto& bb_img = texture_cache.GetImage(image_id);
         BB::Upscale::OnFlip(cpu_address, bb_img.info.size.width, bb_img.info.size.height);
+        BB::ObjMotion::OnFlip();
     }
 
     Frame* frame = GetRenderFrame();

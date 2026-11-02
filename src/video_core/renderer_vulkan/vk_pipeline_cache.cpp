@@ -14,6 +14,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/bb/bb_objmv.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -21,6 +22,9 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
+
+// BB object motion vectors (bb_objmv.h): this draw takes the motion pipeline variant.
+static bool g_bb_objmv = false;
 
 using Shader::HwStage;
 using Shader::Output;
@@ -162,6 +166,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
+        info.hw.vs.motion_vectors = g_bb_objmv;
         break;
     }
     case HwStage::Fragment: {
@@ -176,6 +181,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 ? regs.aa_config.NumSamples()
                 : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
+        info.hw.fs.motion_vectors = g_bb_objmv;
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |
@@ -446,8 +452,14 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
+    g_bb_objmv = !skip_cb_binding && BB::ObjMotion::WantPipeline(regs);
     if (!RefreshGraphicsStages()) {
         return false;
+    }
+    if (g_bb_objmv && infos[static_cast<u32>(Shader::SwStage::Fragment)]) {
+        BB::ObjMotion::FillKey(key.mrt_mask, key.num_color_attachments,
+                               key.color_buffers[BB::ObjMotion::Attachment],
+                               key.write_masks[BB::ObjMotion::Attachment]);
     }
 
     // Second pass to mask out render targets not written by shader and fill remaining info

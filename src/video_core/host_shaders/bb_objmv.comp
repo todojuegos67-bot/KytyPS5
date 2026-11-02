@@ -1,0 +1,30 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB object motion vectors (bb_objmv.h): where the G-buffer pass wrote an object vector (skinned
+// characters, weapons, animated props: the vertex shader's own previous / current clip positions),
+// it replaces the camera-only vector bb_mv.comp reconstructed from depth. Same units and sign:
+// render pixels towards the previous position, unjittered (the jitter is a viewport offset that
+// clip positions never see).
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rg32ui) uniform readonly uimage2D obj_mv;
+layout(binding = 1, rg16f) uniform image2D mv_out;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, enabled, 0
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y) || p.size.z == 0u) {
+        return;
+    }
+    uvec2 o = imageLoad(obj_mv, c).xy;
+    if (o.y == 0u) {
+        return;
+    }
+    vec2 v = unpackHalf2x16(o.x);
+    if (any(isnan(v)) || any(isinf(v))) {
+        return;
+    }
+    imageStore(mv_out, c, vec4(v, 0.0, 0.0));
+}

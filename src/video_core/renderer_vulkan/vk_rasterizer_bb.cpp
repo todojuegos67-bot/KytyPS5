@@ -16,6 +16,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_fg.h"
+#include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_alpha_comp.h"
 #include "video_core/host_shaders/bb_hud_comp.h"
@@ -1323,6 +1324,8 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
                           &push);
         cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
     }
+    // Object motion vectors (bb_objmv.h) over the camera ones.
+    BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset);
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);

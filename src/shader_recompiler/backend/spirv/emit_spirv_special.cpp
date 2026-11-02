@@ -66,7 +66,17 @@ void ConvertPositionToClipSpace(EmitContext& ctx) {
     ctx.OpStore(ctx.output_position, vector);
 }
 
+// BB object motion vectors (emit_spirv_bb_objmv.cpp).
+void EmitBBVertexMotion(EmitContext& ctx);
+void EmitBBFragmentMotion(EmitContext& ctx);
+
 void EmitEpilogue(EmitContext& ctx) {
+    if (ctx.VertexMotion()) {
+        EmitBBVertexMotion(ctx);
+    }
+    if (ctx.FragmentMotion()) {
+        EmitBBFragmentMotion(ctx);
+    }
     if (ctx.hw_stage == HwStage::Vertex &&
         ctx.runtime_info.hw.vs.emulate_depth_negative_one_to_one) {
         ConvertDepthMode(ctx);
