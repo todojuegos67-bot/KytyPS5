@@ -4819,6 +4819,19 @@ bool TextureCache::HasGpuWrittenImageOverlap(uint64_t address, uint64_t size) {
 	return false;
 }
 
+bool TextureCache::SpeculationUsesGpuWrittenImage(uint64_t address, uint64_t size) {
+	const auto* spec = Spec::Current();
+	if (spec == nullptr || !GuestRange {address, size}.Valid()) return true;
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		// (Any use of its own, conservatively: its work may write it before the texel read. A speculation before it is
+		// committed before it: what that one writes lands first, as in order.)
+		if ((image.IsGpuModified() || image.IsStencilModified()) && spec->overlay_index.contains(&image)) return true;
+	}
+	return false;
+}
+
 TextureCache::ReadOnlyBufferOverlap TextureCache::ClassifyReadOnlyBufferOverlap(
     uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) return ReadOnlyBufferOverlap::Unsafe;

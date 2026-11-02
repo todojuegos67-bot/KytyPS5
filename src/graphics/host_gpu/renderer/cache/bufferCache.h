@@ -78,12 +78,18 @@ public:
 		return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size) ? *owner : BufferId {};
 	}
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
+	// As EnsureBufferContents, for a texel buffer: an image GPU work wrote over the range is copied in (SynchronizeBuffer).
+	void                   EnsureTexelContents(uint64_t vaddr, uint64_t size);
 	// The start of each range shaders read through pointers held by a buffer with the guest's bytes (see the definition).
 	void                   EnsureBdaReadable(std::span<const GuestRange> ranges);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// ObtainBuffer's speculative-translation form, out of line (bufferCache.cpp).
+	[[gnu::noinline]] [[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferSpec(Spec::State& spec, uint64_t vaddr,
+	                                                                              uint64_t size, bool is_written,
+	                                                                              bool is_texel_buffer);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;

@@ -70,7 +70,7 @@ struct WaitCheck {
 struct Counts {
 	size_t current = 0, written = 0, bda = 0, invalidated = 0, writes = 0, touched_images = 0, touched_buffers = 0,
 	       clean_reads = 0, feedbacks = 0, buffer_ranges = 0, sets = 0, chain_reads = 0, waits = 0, cpu_copies = 0,
-	       late_reads = 0;
+	       late_reads = 0, texel_syncs = 0;
 };
 
 // A late read (State::late_reads): the range, and the effects log's end before it was read.
@@ -210,6 +210,10 @@ struct State {
 	//   write it read, logged after the speculation began, stopped it: the graphics queue's linear copy to its
 	//   constants in the submission before, unlinked by its Done while a chunk of the next one translated, a correct
 	//   read stopping the rest of the chunk, ~0.35 ms a frame of in-order translation at the arch, 1 Nov.)
+	// - the texel buffer ranges it reads over images GPU work wrote that its own work does not use (KYTY_SPECULATE_TEXEL_SYNC):
+	//   the commit synchronizes them from the images before its work, as the normal path does at the draw
+	//   (BufferCache::EnsureTexelContents).
+	std::vector<Range> texel_syncs;
 	std::vector<LateRead>        late_reads;
 	const std::atomic<uint64_t>* log_end    = nullptr; // (the effects log's end: Speculation::m_log)
 	bool                         late       = false;   // (ReadWord: the word it read was such a read; late_since before it)
@@ -256,7 +260,7 @@ struct State {
 		return {current.size(),        written.size(),         bda.size(),         invalidated.size(), writes.size(),
 		        touched_images.size(), touched_buffers.size(), clean_reads.size(), feedbacks.size(), buffer_ranges.size(),
 		        sets.size(),           chain_reads.size(),     waits.size(),       cpu_copies.size(),
-		        late_reads.size()};
+		        late_reads.size(),     texel_syncs.size()};
 	}
 	// Its pending guest memory writes or a previous speculation's over the range; the ranges its work or a previous
 	// one's writes.
@@ -301,6 +305,7 @@ struct State {
 	void NoteCleanRead(uint64_t address, uint64_t size) { (void)Note(clean_reads, Sealed().clean_reads, address, size); }
 	void NoteBufferRange(uint64_t address, uint64_t size) { (void)Note(buffer_ranges, Sealed().buffer_ranges, address, size); }
 	void NoteCpuCopy(uint64_t address, uint64_t size) { (void)Note(cpu_copies, Sealed().cpu_copies, address, size); }
+	void NoteTexelSync(uint64_t address, uint64_t size) { (void)Note(texel_syncs, Sealed().texel_syncs, address, size); }
 	void NoteLateRead(uint64_t address, uint64_t size, uint64_t since) {
 		if (late_reads.size() > Sealed().late_reads && late_reads.back().end == address && late_reads.back().since == since)
 			late_reads.back().end = address + size;
@@ -506,6 +511,7 @@ struct State {
 		waits.resize(std::min(waits.size(), checkpoint.waits));
 		cpu_copies.resize(std::min(cpu_copies.size(), checkpoint.cpu_copies));
 		late_reads.resize(std::min(late_reads.size(), checkpoint.late_reads));
+		texel_syncs.resize(std::min(texel_syncs.size(), checkpoint.texel_syncs));
 		bda_all = checkpoint_bda_all;
 	}
 
@@ -521,6 +527,7 @@ struct State {
 		waits.clear();
 		cpu_copies.clear();
 		late_reads.clear();
+		texel_syncs.clear();
 		late = false;
 		bda.clear();
 		bda_all = false;

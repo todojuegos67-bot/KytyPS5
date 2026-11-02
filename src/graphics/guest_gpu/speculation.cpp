@@ -970,6 +970,13 @@ void Speculation::Before(Result& result, size_t index) {
 				buffers.EnsureBufferContents(written.address, written.size);
 			});
 		}
+	// The texel buffers it reads over images GPU work wrote (KYTY_SPECULATE_TEXEL_SYNC), synchronized from them as the
+	// normal path does at the draw: after the uploads above (the image's bytes win, as there), before the work (what it
+	// writes over them lands after the copy, as in order).
+	for (size_t i = from.texel_syncs; i < to.texel_syncs; ++i) {
+		const auto& range = state.texel_syncs[i];
+		buffers.EnsureTexelContents(range.begin, range.end - range.begin);
+	}
 	if (segment.bda_all) {
 		resources.PrepareBda();
 	} else {

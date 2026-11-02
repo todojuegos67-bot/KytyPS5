@@ -140,6 +140,9 @@ public:
 	// An image over the range holds data the GPU wrote to it (a download of the range must come
 	// from the image, not from the buffer).
 	[[nodiscard]] bool HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
+	// A speculation's (Spec::Current): whether one of those images is one its own work uses (its commit cannot then
+	// synchronize a texel buffer over it before that work: KYTY_SPECULATE_TEXEL_SYNC). True without a speculation.
+	[[nodiscard]] bool SpeculationUsesGpuWrittenImage(uint64_t address, uint64_t size);
 	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
 	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
