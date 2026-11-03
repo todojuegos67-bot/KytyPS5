@@ -179,6 +179,17 @@ void OnPresentFailed(std::string_view why);
 bool MenuUpscaleWanted();
 // A 3D frame in window-size mode that was not upscaled: FSR 1 to the window, not a stretch.
 bool SceneSpatialFallback();
+// 0.48: the flip being presented had no 3D scene (menu, loading screen, movie).
+bool FlipIs2D();
+// 0.48: the RCAS sharpening (attenuation in stops, 0 = sharpest) for a 2D frame scaled to the
+// window by FSR 1: BB_2D_RCAS (default 0.15, text-friendly); negative = the emulator's settings.
+float Menu2DRcas();
+// 0.48: the presenter's outcome for a 2D flip, counted and logged every 60 2D flips as
+// "[2d] last 60 flips: N FSR1, M plain stretch (reasons), K window size".
+// kind: 0 FSR 1 (EASU + RCAS), 1 FSR 1 EASU only, 2 already the window size, 3 plain stretch.
+void Note2DFlip(int kind, const char* reason);
+// Why a 2D flip would not get FSR 1 (for the [2d] line): "" when it would.
+const char* Menu2DWhyNot();
 // The presenter's verdict for this frame: the window-size image was (or was not) presented.
 void OnPresentResult(bool presented, std::string_view why);
 

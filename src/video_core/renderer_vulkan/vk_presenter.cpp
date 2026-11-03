@@ -861,9 +861,19 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto frame_fsr = fsr_settings;
     // Bloodborne: a menu, loading screen or movie (no 3D scene, so no upscaler above) is scaled
     // to the window by the spatial FSR 1 pass instead of a plain (blurry) stretch.
-    if (!bb_presented && BB::Upscale::Enabled() && (BB::Upscale::MenuUpscaleWanted() || BB::Upscale::SceneSpatialFallback()) &&
+    const bool bb_2d = BB::Upscale::Enabled() && !bb_presented && BB::Upscale::FlipIs2D();
+    const bool bb_menu = !bb_presented && BB::Upscale::Enabled() && BB::Upscale::MenuUpscaleWanted();
+    const bool bb_smaller = bb_size.width < frame->width || bb_size.height < frame->height;
+    if (!bb_presented && BB::Upscale::Enabled() && (bb_menu || BB::Upscale::SceneSpatialFallback()) &&
         (bb_size.width != frame->width || bb_size.height != frame->height)) {
         frame_fsr.enable = true;
+        frame_fsr.sharpen_only = false;
+        // 0.48: a 2D frame (menu, loading screen, text) is EASU-upscaled and always sharpened by
+        // RCAS (text-friendly strength, BB_2D_RCAS), whatever the emulator's own RCAS setting.
+        if (bb_menu && BB::Upscale::Menu2DRcas() >= 0.0f) {
+            frame_fsr.use_rcas = true;
+            frame_fsr.rcas_attenuation = BB::Upscale::Menu2DRcas();
+        }
     } else if ((bb_presented || (BB::Upscale::Enabled() && BB::Upscale::LastFrameUpscaled())) &&
         (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ||
                          BB::Upscale::Cfg().kind == BB::SR::Kind::Xess ||
@@ -874,6 +884,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         frame_fsr.sharpen_only = true;
         frame_fsr.rcas_attenuation = (1.0f - BB::Upscale::LiveSharpness()) * 2.0f;
         fsr_out = bb_size;
+    }
+    if (bb_2d) {
+        // 0.48: the [2d] counter: did this 2D flip go through FSR 1 or a plain stretch?
+        const bool fsr1 = frame_fsr.enable && !frame_fsr.sharpen_only && bb_smaller;
+        const char* why = BB::Upscale::Menu2DWhyNot();
+        BB::Upscale::Note2DFlip(fsr1 ? (frame_fsr.use_rcas ? 0 : 1)
+                                : (bb_size.width == frame->width &&
+                                   bb_size.height == frame->height)
+                                    ? 2
+                                    : 3,
+                                fsr1 ? ""
+                                : *why != '\0' ? why
+                                : !bb_smaller   ? "larger than the window (downscale)"
+                                                : "FSR 1 not enabled for this flip");
     }
     image_view = fsr_pass.Render(cmdbuf, image_view, bb_size, fsr_out, frame_fsr, frame->is_hdr);
 

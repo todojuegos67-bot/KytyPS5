@@ -400,6 +400,7 @@ struct FrameState {
     // sample ordering for the learned injection point
     u32 qual_samples = 0;
     u32 last_write_after = 0;
+    bool post_seen = false; // a draw into the presented image sampled a render-size image
     // draws
     u64 draws = 0;
     u32 scene_draws = 0;
@@ -563,6 +564,47 @@ bool PresentMode() {
     }
     return g_present_w >= g_output_w && g_present_h >= g_output_h;
 }
+
+// 0.48 (bb-fix-048): native AA (the game renders at the window size, input == output). The
+// in-place point needs more samples of the scene colour than the learned skip (the largest write
+// count of the last 240 frames): after one busy frame it misses every frame for ~240 flips (the
+// user's 23:10:58 log: whole [3d] windows of "other / no injection point 60", DLSS-G turned off
+// with no inputs). A 3D frame the in-place point missed now goes through the window-size path at
+// the same size (before the HUD, or at present): every 3D frame is anti-aliased and gives frame
+// generation its depth, motion vectors and camera. BB_NATIVE_FALLBACK=0: 0.46's behaviour.
+bool NativeFallbackOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_NATIVE_FALLBACK");
+        return v == nullptr || *v != '0';
+    }();
+    return on;
+}
+bool NativeFallback() {
+    const auto& c = Cfg();
+    if (!NativeFallbackOn() || !c.to_window || g_present_dead || c.force_mode != 0 ||
+        c.force_source != 0 || !Active()) {
+        return false;
+    }
+    return g_present_w != 0 && g_present_h != 0 && g_learned.render_w != 0 &&
+           g_learned.render_w == g_output_w && g_learned.render_h == g_output_h &&
+           g_present_w == g_output_w && g_present_h == g_output_h;
+}
+// The window-size path may run this frame (to the window, or native AA's same-size fallback).
+bool WindowPathOk() {
+    return PresentMode() || NativeFallback();
+}
+bool g_last_window_path = false; // the last upscaled frame went through the window-size path
+// Native fallback hold: after a frame on the window-size path, stay on it this many flips (no
+// history reset ping-pong between the two paths; the in-place miss lasts ~240 flips anyway).
+// BB_NATIVE_HOLD=<flips> (default 240, 0 = back to the in-place point on the next frame).
+u32 NativeHoldFlips() {
+    static const u32 v = [] {
+        const char* e = std::getenv("BB_NATIVE_HOLD");
+        return e == nullptr || *e == '\0' ? 240u : static_cast<u32>(std::max(0, std::atoi(e)));
+    }();
+    return v;
+}
+u32 g_native_hold = 0;
 
 float Halton(u32 index, u32 base) {
     float f = 1.0f, r = 0.0f;
@@ -1686,6 +1728,9 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     if (PresentMode()) {
         return Sample::Keep; // upscaled before the HUD instead (WantPresentUpscale)
     }
+    if (g_native_hold > 0 && NativeFallback()) {
+        return Sample::Keep; // 0.48: native fallback hold (window-size path at the same size)
+    }
     if (index < g_learned.skip || !Active() || f.inject_failed) {
         return Sample::Keep;
     }
@@ -1709,6 +1754,9 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     p.output_h = scene ? height : g_draw.colors[0].height;
     p.hdr = IsHdr(format);
     p.reset = !g_learned.last_injected;
+    if (NativeFallbackOn() && g_last_window_path) {
+        p.reset = true; // (the history was the window-size path's post-processed image)
+    }
     p.delta_ms = g_delta_ms;
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
@@ -1790,7 +1838,11 @@ bool LateSamplesOk(u32 qual_samples) {
 struct Not3D {
     u32 frames = 0, up = 0, no_depth = 0, no_scene = 0, size = 0, samples = 0, failed = 0,
         no_point = 0, max_q = 0, max_skip = 0;
+    // 0.48: how the upscaled ones went (in place, window-size before the HUD, at present), and
+    // the in-place counts of the frames with no point (samples of the source vs the learned skip).
+    u32 inplace = 0, hud = 0, late = 0, np_max_q = 0, np_max_skip = 0, np_src_moved = 0;
 } g_not3d;
+bool g_native_said = false;
 } // namespace
 
 bool WantPresentUpscale(VAddr& flip) {
@@ -1801,12 +1853,19 @@ bool WantPresentUpscale(VAddr& flip) {
     auto& f = g_frame;
     const bool fgn = FgNative();
     if (!g_draw.valid || g_draw.compute || !g_draw.targets_flip || f.injected ||
-        f.inject_failed || f.fg_native_done || !(fgn ? !g_present_dead : PresentMode())) {
+        f.inject_failed || f.fg_native_done || !(fgn ? !g_present_dead : WindowPathOk())) {
         return false;
+    }
+    const bool native = !fgn && !PresentMode(); // (NativeFallback: the in-place point missed)
+    if (g_draw.samples_render_size) {
+        f.post_seen = true; // the game's final post-processing pass into the presented image
     }
     // After the scene and its last read by the post-processing; the draw into the presented image
     // that samples a render-size image is the game's final post-processing pass, not the HUD.
-    if (f.gb_depth == 0 || f.scene_draws == 0 || f.qual_samples <= SkipNeeded() ||
+    // (Native fallback: the source the in-place path learned may not be sampled at all this
+    // frame; a final pass into the presented image seen before this draw is enough.)
+    if (f.gb_depth == 0 || f.scene_draws == 0 ||
+        (f.qual_samples <= SkipNeeded() && !(native && f.post_seen)) ||
         g_draw.samples_render_size || f.gb_w != g_output_w || f.gb_h != g_output_h) {
         return false;
     }
@@ -1839,6 +1898,19 @@ void FillPresentPlan(VAddr flip, const char* where) {
     p.output_h = g_present_h;
     p.hdr = false; // the post-processed (tonemapped) image
     p.reset = !g_learned.last_injected;
+    if (!PresentMode() && !FgNative()) {
+        // 0.48 native fallback: the history was the in-place path's HDR scene colour.
+        p.reset = p.reset || !g_last_window_path;
+        g_native_hold = NativeHoldFlips();
+        if (!g_native_said) {
+            g_native_said = true;
+            Checkpoint(fmt::format("[3d] native AA: a 3D frame the in-place point missed is "
+                                   "processed on the presented image {}x{} ({}), so every 3D "
+                                   "frame is anti-aliased and frame generation keeps its inputs "
+                                   "(BB_NATIVE_FALLBACK=0 turns it off)",
+                                   f.gb_w, f.gb_h, where));
+        }
+    }
     if (FgNative()) {
         // 0.39: frame generation without an upscaler: inputs only, at the game's own size.
         p.output_w = p.render_w;
@@ -1960,6 +2032,57 @@ bool SceneSpatialFallback() {
                    "pass instead of a plain stretch (BB_UPFIX=0 turns it off)");
     }
     return true;
+}
+
+bool FlipIs2D() {
+    std::scoped_lock lk{g_mutex};
+    return !g_flip_scene;
+}
+
+float Menu2DRcas() {
+    static const float v = [] {
+        const char* e = std::getenv("BB_2D_RCAS");
+        if (e == nullptr || *e == '\0') return 0.15f;
+        return static_cast<float>(std::atof(e));
+    }();
+    return v;
+}
+
+const char* Menu2DWhyNot() {
+    if (!Enabled()) return "upscaler off";
+    if (!Cfg().menus) return "BB_UPSCALE_MENUS=0";
+    if (!Active()) return "upscaler not ready / native kind";
+    std::scoped_lock lk{g_mutex};
+    if (g_flip_scene) return "3D flip";
+    return "";
+}
+
+void Note2DFlip(int kind, const char* reason) {
+    static std::mutex m;
+    static u32 n = 0, fsr = 0, easu = 0, same = 0, plain = 0;
+    static std::string reasons;
+    std::scoped_lock lk{m};
+    ++n;
+    switch (kind) {
+    case 0: ++fsr; break;
+    case 1: ++easu; break;
+    case 2: ++same; break;
+    default:
+        ++plain;
+        if (reason != nullptr && *reason != '\0' && reasons.find(reason) == std::string::npos &&
+            reasons.size() < 200) {
+            reasons += reasons.empty() ? reason : std::string(", ") + reason;
+        }
+        break;
+    }
+    if (n >= 60) {
+        Checkpoint(fmt::format("[2d] last {} flips: {} FSR1 (EASU + RCAS {:.2f}), {} FSR1 EASU only, "
+                               "{} plain stretch{}{}{}, {} already the window size",
+                               n, fsr, Menu2DRcas(), easu, plain, plain ? " (" : "",
+                               plain ? reasons : std::string(), plain ? ")" : "", same));
+        n = fsr = easu = same = plain = 0;
+        reasons.clear();
+    }
 }
 
 bool TakeLateUpscale() {
@@ -2227,18 +2350,24 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     }
     const bool prev_injected = g_learned.last_injected;
     g_learned.last_injected = f.injected;
+    if (f.injected) {
+        g_last_window_path = f.present; // (the late path below sets it again)
+    }
+    if (g_native_hold > 0) --g_native_hold;
     const bool prev_fg_native = g_learned.last_fg_native;
     g_learned.last_fg_native = f.fg_native_done;
     // The scene was drawn but no HUD point was found (no HUD this frame, e.g. a cut scene): the
     // presenter upscales the finished image instead (TakeLateUpscale).
     g_late_upscale = false;
-    if (PresentMode() && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
-        f.gb_w == width && f.gb_h == height && LateSamplesOk(f.qual_samples)) {
+    if (WindowPathOk() && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
+        f.gb_w == width && f.gb_h == height && f.scene_draws > 0 &&
+        LateSamplesOk(f.qual_samples)) {
         g_learned.last_injected = prev_injected;
         FillPresentPlan(addr, "at present (no HUD draw found this frame)");
         g_late_upscale = true;
         f.injected = true;
         g_learned.last_injected = true;
+        g_last_window_path = true;
     } else if (FgNative() && !g_present_dead && !f.fg_native_done && !f.injected &&
                !f.inject_failed && f.gb_depth != 0 && f.gb_w == width && f.gb_h == height &&
                f.qual_samples > SkipNeeded()) {
@@ -2254,6 +2383,13 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         ++n.frames;
         if (f.injected) {
             ++n.up;
+            if (g_late_upscale) {
+                ++n.late;
+            } else if (f.present) {
+                ++n.hud;
+            } else {
+                ++n.inplace;
+            }
         } else if (f.inject_failed) {
             ++n.failed;
         } else if (f.gb_depth == 0) {
@@ -2268,17 +2404,31 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             n.max_skip = std::max(n.max_skip, g_learned.skip);
         } else {
             ++n.no_point;
+            n.np_max_q = std::max(n.np_max_q, f.qual_samples);
+            n.np_max_skip = std::max(n.np_max_skip, g_learned.skip);
+            if (f.scene_color != 0 && f.scene_color != LearnedSource()) ++n.np_src_moved;
         }
         if (Enabled() && n.frames >= 60) {
+            const bool any3d = n.up + n.no_scene + n.size + n.samples + n.failed + n.no_point > 0;
             if (n.up != n.frames) {
                 Checkpoint(fmt::format(
-                    "[3d] last {} flips: {} upscaled; not 3D: no G-buffer depth {}, no scene draws "
+                    "[3d] last {} flips: {} upscaled (in place {}, before HUD {}, at present {}); "
+                    "not 3D: no G-buffer depth {}, no scene draws "
                     "{}, scene size != flip {}, source sampled too few times {} (max {} seen, "
                     "needs > {}; learned skip {}, relax {}, upfix {}), dispatch failed {}, other / no "
-                    "injection point {}",
-                    n.frames, n.up, n.no_depth, n.no_scene, n.size, n.samples, n.max_q,
-                    SkipNeeded(), n.max_skip, SkipRelax() ? "on" : "off",
-                    UpfixOn() ? "on" : "off", n.failed, n.no_point));
+                    "injection point {} (in-place samples max {} vs learned skip {}, source moved "
+                    "{}; native fallback {})",
+                    n.frames, n.up, n.inplace, n.hud, n.late, n.no_depth, n.no_scene, n.size,
+                    n.samples, n.max_q, SkipNeeded(), n.max_skip, SkipRelax() ? "on" : "off",
+                    UpfixOn() ? "on" : "off", n.failed, n.no_point, n.np_max_q, n.np_max_skip,
+                    n.np_src_moved,
+                    !NativeFallbackOn() ? "off (BB_NATIVE_FALLBACK=0)"
+                    : NativeFallback()  ? "active"
+                                        : "on (not native)"));
+            } else if (any3d && NativeFallbackOn() && n.hud + n.late > 0) {
+                Checkpoint(fmt::format("[3d] last {} flips: all {} upscaled (in place {}, before "
+                                       "HUD {}, at present {})",
+                                       n.frames, n.up, n.inplace, n.hud, n.late));
             }
             n = {};
         }
