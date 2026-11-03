@@ -894,6 +894,44 @@ void Barrier(vk::CommandBuffer command, vk::PipelineStageFlags2 src_stage, vk::A
 	command.pipelineBarrier2(dependency);
 }
 
+// The model's steering (RenoDX's defaults; the intensity from BB_DLSS5 / BB_DLSS5_INTENSITY).
+struct Steering {
+	uint32_t preset = 0, style = 0;
+	float    intensity = 1.0f, tone = 1.0f, structure = 1.0f, skin = -1.0f;
+	int      auto_mask = 0;
+};
+const Steering& Steer() {
+	static const Steering s = [] {
+		Steering m;
+		m.preset    = static_cast<uint32_t>(EnvF("BB_DLSS5_PRESET", 0.0f, 0.0f, 32.0f));
+		m.style     = static_cast<uint32_t>(EnvF("BB_DLSS5_STYLE", 0.0f, 0.0f, 32.0f));
+		m.intensity = Settings().model_intensity;
+		m.auto_mask = EnvOn("BB_DLSS5_AUTOMASK") ? 1 : 0;
+		return m;
+	}();
+	return s;
+}
+void SetSizes(NgxParameter& p, vk::Extent2D work) {
+	p.Set("Width", work.width), p.Set("Height", work.height), p.Set("OutWidth", work.width), p.Set("OutHeight", work.height);
+	p.Set("DLSSNR.Width", work.width), p.Set("DLSSNR.Height", work.height);
+	p.Set("DLSSNR.InputWidth", work.width), p.Set("DLSSNR.InputHeight", work.height);
+	p.Set("DLSSNR.OutputWidth", work.width), p.Set("DLSSNR.OutputHeight", work.height);
+	p.Set("DLSSNR.Output.Width", work.width), p.Set("DLSSNR.Output.Height", work.height);
+	p.Set("DLSSNR.ScalingRatio", 1.0f), p.Set("DLSSNR.Scale", 1.0f);
+	p.Set("DLSSNRComputeScalingRatioCallback", reinterpret_cast<void*>(&ScalingRatioCallback));
+}
+void SetSteering(NgxParameter& p) {
+	const auto& s = Steer();
+	p.Set("DLSSNR.Intensity", s.intensity);
+	p.Set("DLSSNR.Style", s.style);
+	p.Set("DLSSNR.LocalToneStrength", s.tone);
+	p.Set("DLSSNR.LocalStructureStrength", s.structure);
+	p.Set("DLSSNR.SkinStructureStrength", s.skin);
+	p.Set("DLSSNR.UseAutoMask", s.auto_mask);
+	p.Set("DLSSNR.UICorrection", 0);
+}
+
+
 bool EnsureFeature(GraphicContext& graphics, vk::CommandBuffer command, vk::Extent2D work, bool depth_inverted) {
 	if (g.feature != nullptr && g.feature_extent == work) return true;
 	if (g.feature != nullptr) RetireWorking(graphics);
