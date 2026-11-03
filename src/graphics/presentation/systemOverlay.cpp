@@ -424,8 +424,11 @@ PFN_vkVoidFunction LoadVulkanFunction(const char* name, void* user_data) {
 	return graphics.instance.getProcAddr(name);
 }
 
+// (With the result named: an F11 on an RTX 2060 SUPER ended here without saying what had failed, issue #174.)
 void CheckVulkanResult(VkResult result) {
-	EXIT_IF(result != VK_SUCCESS);
+	if (result != VK_SUCCESS) {
+		EXIT("system overlay: a Vulkan call failed: %s\n", vk::to_string(static_cast<vk::Result>(result)).c_str());
+	}
 }
 
 // A button's width: `minimum`, or its label's with the frame's padding when that is wider.
