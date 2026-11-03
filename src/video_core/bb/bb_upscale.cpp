@@ -133,7 +133,13 @@ bool FgNativeWanted() {
     }
     std::string v = fg;
     for (auto& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    return v.starts_with("amd") || v.starts_with("fsr") || v.starts_with("dlss");
+    if (v.starts_with("amd") || v.starts_with("fsr")) {
+        // 0.41: BB_FG_NATIVE_AMD=0: AMD FSR 3 frame generation keeps the old behaviour (no inputs
+        // without an upscaler); DLSS-G unaffected.
+        const char* amd = std::getenv("BB_FG_NATIVE_AMD");
+        return amd == nullptr || amd[0] != '0';
+    }
+    return v.starts_with("dlss");
 }
 
 void GuardBegin(const char* kind, const char* step) {

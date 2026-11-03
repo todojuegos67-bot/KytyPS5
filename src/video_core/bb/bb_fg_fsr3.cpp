@@ -224,6 +224,48 @@ FfxApiResource ImageResource(const Image& image, bool depth) {
     return resource;
 }
 
+// 0.41: what FSR 3 frame generation needs from the inputs, checked before anything reaches the
+// FidelityFX API (the native path, BB_FG_NATIVE, hands over the game's own frame layout, whatever
+// the quality patches make of it). nullptr: usable; else the reason, logged once per reason.
+const char* InputsProblem(const Inputs& in, vk::Extent2D backbuffer) {
+    if (!in.depth.image || !in.motion.image) return "depth or motion-vector image missing";
+    if (in.render.width == 0 || in.render.height == 0) return "render size 0";
+    if (in.render.width > backbuffer.width || in.render.height > backbuffer.height)
+        return "render size larger than the backbuffer (FSR 3 FG needs render <= display)";
+    if (in.depth.extent.width < in.render.width || in.depth.extent.height < in.render.height ||
+        in.motion.extent.width < in.render.width || in.motion.extent.height < in.render.height)
+        return "depth / motion-vector image smaller than the render size";
+    if (ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(in.depth.format)) ==
+            FFX_API_SURFACE_FORMAT_UNKNOWN ||
+        ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(in.motion.format)) ==
+            FFX_API_SURFACE_FORMAT_UNKNOWN)
+        return "depth or motion-vector format unknown to FidelityFX";
+    if (!(in.motion.usage & vk::ImageUsageFlagBits::eSampled) ||
+        !(in.depth.usage & vk::ImageUsageFlagBits::eSampled))
+        return "depth or motion-vector image not sampled-usable";
+    return nullptr;
+}
+
+void LogInputs(const char* step, const Inputs& in, vk::Extent2D backbuffer, vk::Format format) {
+    Printf("FSR3 FG: %s: backbuffer %ux%u %s; render %ux%u; depth %p %ux%u %s usage 0x%x; motion %p "
+           "%ux%u %s usage 0x%x; HUD-less %s %p %ux%u %s; jitter %.3f %.3f, camera %s, depth %s, "
+           "fov %.4f, near %.4f, reset %d, context %p, swapchain context %p",
+           step, backbuffer.width, backbuffer.height, vk::to_string(format).c_str(),
+           in.render.width, in.render.height,
+           static_cast<void*>(static_cast<VkImage>(in.depth.image)), in.depth.extent.width,
+           in.depth.extent.height, vk::to_string(in.depth.format).c_str(),
+           static_cast<uint32_t>(in.depth.usage),
+           static_cast<void*>(static_cast<VkImage>(in.motion.image)), in.motion.extent.width,
+           in.motion.extent.height, vk::to_string(in.motion.format).c_str(),
+           static_cast<uint32_t>(in.motion.usage), in.has_hudless ? "yes" : "no",
+           static_cast<void*>(static_cast<VkImage>(in.hudless.image)), in.hudless.extent.width,
+           in.hudless.extent.height, vk::to_string(in.hudless.format).c_str(), in.jitter[0],
+           in.jitter[1], in.camera_valid ? "valid" : "invalid",
+           in.depth_inverted ? "inverted" : "forward", in.fov_y, in.z_near, in.reset ? 1 : 0,
+           static_cast<void*>(g_fg_context), static_cast<void*>(g_swapchain_context));
+    std::fflush(stdout);
+}
+
 void DestroyFrameGeneration() {
     if (g_fg_context != nullptr) {
         ffxConfigureDescFrameGeneration off{};
@@ -661,7 +703,21 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     }
     std::lock_guard lock(g_mutex);
     const auto now = std::chrono::steady_clock::now();
-    const bool usable = inputs != nullptr && inputs->valid && !g_fg_failed;
+    bool usable = inputs != nullptr && inputs->valid && !g_fg_failed;
+    static int first_steps = 0; // 0.41: the first 3D frames' steps, logged (a crash shows the last)
+    if (usable) {
+        if (const char* why = InputsProblem(*inputs, backbuffer)) {
+            static std::string said;
+            if (said != why) {
+                said = why;
+                Printf("FSR3 FG: 3D inputs not usable (%s): this frame not generated", why);
+                LogInputs("refused inputs", *inputs, backbuffer, format);
+            }
+            usable = false;
+        } else if (first_steps < 3) {
+            LogInputs("3D inputs received", *inputs, backbuffer, format);
+        }
+    }
 
     if (g_stats.start == std::chrono::steady_clock::time_point{}) g_stats.start = now;
     const double window = std::chrono::duration<double>(now - g_stats.start).count();
@@ -720,6 +776,8 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         const vk::Extent2D render = inputs->render;
         if (g_fg_context == nullptr || g_fg_display != backbuffer || g_fg_format != format ||
             render.width > g_fg_max_render.width || render.height > g_fg_max_render.height) {
+            Printf("FSR3 FG: creating the frame generation context (display %ux%u, render %ux%u)",
+                   backbuffer.width, backbuffer.height, render.width, render.height);
             CreateFrameGeneration(backbuffer,
                                   {std::max(render.width, g_fg_max_render.width),
                                    std::max(render.height, g_fg_max_render.height)},
@@ -774,6 +832,11 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     config.generationRect = {0, 0, static_cast<int32_t>(backbuffer.width),
                              static_cast<int32_t>(backbuffer.height)};
     config.frameID = g_frame_id;
+    if (generate && first_steps < 3) {
+        Printf("FSR3 FG: configure (frame %llu, HUD-less %s, swapchain %p)",
+               static_cast<unsigned long long>(g_frame_id), hudless ? "given" : "not given",
+               static_cast<void*>(static_cast<VkSwapchainKHR>(swapchain)));
+    }
     if (const auto result = g_ffx.Configure(&g_fg_context, &config.header);
         result != FFX_API_RETURN_OK) {
         static std::atomic<uint32_t> logged{0};
@@ -847,7 +910,18 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         prepare.header.pNext = &camera_info.header;
     }
     const auto prepare_begin = std::chrono::steady_clock::now();
+    if (first_steps < 3) {
+        Printf("FSR3 FG: prepare dispatch (render %ux%u, command buffer %p, camera info %s, near %g "
+               "far %g fov %.4f)",
+               prepare.renderSize.width, prepare.renderSize.height,
+               static_cast<void*>(slot.command), camera.valid ? "chained" : "none",
+               prepare.cameraNear, prepare.cameraFar, prepare.cameraFovAngleVertical);
+    }
     const auto result = g_ffx.Dispatch(&g_fg_context, &prepare.header);
+    if (first_steps < 3) {
+        Printf("FSR3 FG: prepare dispatch returned %u", result);
+        ++first_steps;
+    }
     end_cb(slot.command);
     if (result != FFX_API_RETURN_OK) {
         static std::atomic<uint32_t> logged{0};
