@@ -480,30 +480,33 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {graphics_stages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	// A handle rebuilt after TrimLive keeps the layouts it was first created with (same program ids,
+	// so the same bindings); descriptor batches are keyed by the set layout and must stay valid.
+	vk::Result result = vk::Result::eSuccess;
+	if (pipeline.pipeline_layout == nullptr) {
+		CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+		const vk::PushConstantRange push_constants {graphics_stages, 0,
+		                                            ShaderRecompiler::IR::NativePushConstantSize};
 
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
+		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+		pipeline_layout_info.setLayoutCount         = 1;
+		pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+		pipeline_layout_info.pushConstantRangeCount = 1;
+		pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
-	EXIT_IF(pipeline.pipeline_layout != nullptr);
-
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
-		     " set_layouts=1 push_constants=%" PRIu32 "\n",
-		     vertex_program.id, ps_active ? pixel_program.id : 0, 1u);
+		if (graphics_debug_dump_enabled()) {
+			LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
+			     " set_layouts=1 push_constants=%" PRIu32 "\n",
+			     vertex_program.id, ps_active ? pixel_program.id : 0, 1u);
+		}
+		result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+		                                              &pipeline.pipeline_layout);
+		if (graphics_debug_dump_enabled()) {
+			LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
+			     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	}
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                   &pipeline.pipeline_layout);
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
-		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
-	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
@@ -646,6 +649,11 @@ void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeli
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+	// What PipelineCache::RebuildComputeHandle needs after TrimLive. Not the prewarm key: that record is taken once.
+	pipeline.is_compute       = true;
+	pipeline.compute_module   = compute_module;
+	pipeline.compute_subgroup = job.required_subgroup_size;
+	pipeline.compute_words    = spirv_words;
 }
 
 namespace {

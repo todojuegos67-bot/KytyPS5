@@ -142,6 +142,9 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	// Work recorded so far is submitted with ticks below CurrentTick(); +1 keeps a margin.
+	m_pipeline_cache.TrimLive(m_command_scheduler.CurrentTick() + 1,
+	                          [this](uint64_t tick) { return m_command_scheduler.IsFree(tick); });
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

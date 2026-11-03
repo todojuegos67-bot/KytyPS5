@@ -268,6 +268,14 @@ void WriteLayout(Writer& wr, std::span<const vk::DescriptorSetLayoutBinding> bin
 	}
 }
 
+// The layouts a record builds are only needed by vkCreate*Pipelines. Before this, every built record
+// (6,500 on Yotei) kept its set layout and pipeline layout alive for the whole run.
+void DestroyLayout(vk::Device device, Layout& layout) {
+	if (layout.layout != nullptr) device.destroyPipelineLayout(layout.layout, nullptr);
+	if (layout.set != nullptr) device.destroyDescriptorSetLayout(layout.set, nullptr);
+	layout = {};
+}
+
 bool BuildLayout(Reader& rd, vk::Device device, uint32_t push_size, Layout& out) {
 	const uint32_t layout_flags = rd.U();
 	const uint32_t push_stages  = rd.U();
@@ -298,8 +306,11 @@ bool BuildLayout(Reader& rd, vk::Device device, uint32_t push_size, Layout& out)
 	info.pSetLayouts            = &out.set;
 	info.pushConstantRangeCount = push_stages != 0 ? 1 : 0;
 	info.pPushConstantRanges    = &push;
-	return device.createPipelineLayout(&info, nullptr, &out.layout) == vk::Result::eSuccess;
-	// layouts stay alive: the pipeline is used with gameplay's identically defined ones
+	if (device.createPipelineLayout(&info, nullptr, &out.layout) != vk::Result::eSuccess) {
+		DestroyLayout(device, out);
+		return false;
+	}
+	return true;
 }
 
 // Seed modules that passed validation once are listed in <seed>.valid and not validated again
@@ -393,6 +404,7 @@ vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 	}
 	auto module = LoadModule(ctx, f, spirv, ctx.graphics->device);
 	if (module == nullptr) {
+		DestroyLayout(ctx.graphics->device, layout);
 		return nullptr;
 	}
 	vk::PipelineShaderStageCreateInfo                     stage {};
@@ -419,6 +431,7 @@ vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 	vk::Pipeline pipeline  = nullptr;
 	const auto   r = ctx.graphics->device.createComputePipelines(ctx.driver_cache, 1, &info, nullptr, &pipeline);
 	ctx.graphics->device.destroyShaderModule(module, nullptr);
+	DestroyLayout(ctx.graphics->device, layout);
 	return r == vk::Result::eSuccess ? pipeline : nullptr;
 }
 
@@ -603,6 +616,7 @@ vk::Pipeline BuildGraphics(Context& ctx, std::FILE* f, const Pending& p) {
 			device.destroyShaderModule(modules[i], nullptr);
 		}
 	}
+	DestroyLayout(device, layout);
 	return pipeline;
 }
 
