@@ -2648,11 +2648,12 @@ void BufferCache::EnsureTexelContents(uint64_t vaddr, uint64_t size) {
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, true);
 }
 
-// KYTY_SPECULATE_TEXEL_SYNC (live speculate_texel_sync, default off): ObtainBuffer's texel buffers over GPU-written images.
+// KYTY_SPECULATE_TEXEL_SYNC (live speculate_texel_sync, on by default under KYTY_SPECULATE=4): ObtainBuffer's texel
+// buffers over GPU-written images.
 static bool TexelSync() {
 	static auto& on = LiveSwitch::Find("speculate_texel_sync", [] {
 		const char* value = std::getenv("KYTY_SPECULATE_TEXEL_SYNC");
-		return value != nullptr ? std::atoll(value) : 0ll;
+		return value != nullptr ? std::atoll(value) : Spec::ModeDefault();
 	}());
 	return on.load(std::memory_order_relaxed) != 0;
 }

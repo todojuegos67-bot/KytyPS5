@@ -223,7 +223,7 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 bool Speculation::ChunkInOrder() {
 	static auto& on = LiveSwitch::Find("spec_chunk_in_order", [] {
 		const char* value = std::getenv("KYTY_SPEC_CHUNK_IN_ORDER");
-		return value != nullptr ? std::atoll(value) : 0ll;
+		return value != nullptr ? std::atoll(value) : Spec::ModeDefault(); // (on by default under KYTY_SPECULATE=4)
 	}());
 	return on.load(std::memory_order_relaxed) != 0;
 }

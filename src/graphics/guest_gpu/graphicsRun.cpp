@@ -277,7 +277,8 @@ static void PrefetchNextDraw(const uint32_t* packet, uint32_t remaining_dw) {
 uint32_t GuestGpu::ServeInWaits() noexcept {
 	static auto& serve = LiveSwitch::Find("serve_in_waits", [] {
 		const char* value = std::getenv("KYTY_SERVE_IN_WAITS");
-		return value != nullptr ? std::atoll(value) : 1ll;
+		// (Under KYTY_SPECULATE=4, 7: also after each committed segment and in the chunk waits.)
+		return value != nullptr ? std::atoll(value) : 1ll | Spec::ModeDefault(6);
 	}());
 	// (Any nonzero value serves in the upload waits, as upstream's 1 did: KYTY_SERVE_IN_WAITS=2 or 4 keeps them.)
 	const auto value = static_cast<uint32_t>(serve.load(std::memory_order_relaxed));
@@ -558,12 +559,13 @@ static bool StatePassPredicationReads(const uint32_t* packet) {
 }
 
 bool CommandProcessor::SameState(const CommandProcessor& other) const {
-	// KYTY_SPEC_START_INSTANCE_FREE (live spec_start_instance_free): not the start-instance user SGPR (HW::Shader::
+	// KYTY_SPEC_START_INSTANCE_FREE (live spec_start_instance_free, on by default under KYTY_SPECULATE=4): not the
+	// start-instance user SGPR (HW::Shader::
 	// SameButStartInstance): a draw's hole sets it where the state pass, which passes draws over, does not, and a chunk's
 	// commit then stopped at "ahead: another start state" (~0.3 ms a frame of in-order translation with spec_predict_dcc).
 	static auto& start_instance_free = LiveSwitch::Find("spec_start_instance_free", [] {
 		const char* value = std::getenv("KYTY_SPEC_START_INSTANCE_FREE");
-		return value != nullptr ? std::atoll(value) : 0ll;
+		return value != nullptr ? std::atoll(value) : Spec::ModeDefault();
 	}());
 	const bool same_sh = start_instance_free.load(std::memory_order_relaxed) != 0 ? m_sh_ctx.SameButStartInstance(other.m_sh_ctx)
 	                                                                                : m_sh_ctx == other.m_sh_ctx;
@@ -1134,14 +1136,20 @@ void GuestGpu::ThreadRun(void* data) {
 	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
 		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
-		if (const char* async = std::getenv("KYTY_SPECULATE_ASYNC"); async != nullptr && std::atoi(async) > 0 &&
-		                                                              static_cast<uint32_t>(std::atoi(async)) < QueueCount) {
-			const auto  queue   = static_cast<uint32_t>(std::atoi(async));
+		// (The async queue's threads take the packet slots after the graphics queue's: none left, no async speculation.)
+		// KYTY_SPECULATE_ASYNC unset: the compute queue 49 (Demon's Souls' async compute; a queue a game does not use
+		// costs nothing) with 2 threads unless KYTY_SPECULATE_ASYNC_THREADS says otherwise; 0 none.
+		const char* async_value = std::getenv("KYTY_SPECULATE_ASYNC");
+		const int   async       = async_value != nullptr ? std::atoi(async_value) : 49;
+		if (async > 0 && static_cast<uint32_t>(async) < QueueCount &&
+		    kyty_local_speculate_threads.load(std::memory_order_relaxed) < Spec::MaxPacketSlots) {
+			const auto  queue   = static_cast<uint32_t>(async);
 			const char* threads = std::getenv("KYTY_SPECULATE_ASYNC_THREADS");
-			const auto  base    = std::min<uint32_t>(kyty_local_speculate_threads.load(std::memory_order_relaxed), 8u);
+			const auto  base    = kyty_local_speculate_threads.load(std::memory_order_relaxed);
 			gpu->m_speculation_async = std::make_unique<Speculation>(
 			    gpu->m_renderer, static_cast<int>(ComputeQueueBase + queue - 1), base,
-			    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads)) : 4u);
+			    threads != nullptr && std::atoi(threads) > 0 ? static_cast<uint32_t>(std::atoi(threads))
+			                                                 : async_value != nullptr ? 4u : 2u);
 			gpu->m_async_queue = queue;
 			gpu->m_ahead_async.store(gpu->m_speculation_async.get(), std::memory_order_release);
 		}

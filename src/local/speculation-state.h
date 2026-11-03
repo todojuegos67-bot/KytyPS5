@@ -35,6 +35,10 @@
 #include <utility>
 #include <vector>
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (performance-switches.h)
+}
+
 namespace Libs::Graphics {
 class Image;
 class StreamBuffer;
@@ -78,11 +82,17 @@ struct LateRead {
 	uint64_t begin = 0, end = 0, since = 0;
 };
 
-// KYTY_SPEC_LATE_READS (live spec_late_reads, default off): State::late_reads.
+// A speculation switch's default with its variable unset: `on` under KYTY_SPECULATE=4, whose measured set it is (the
+// stone arch, 1-2 Nov: 55-59 fps with the set against 51-53 without), else 0.
+inline long long ModeDefault(long long on = 1) {
+	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? on : 0;
+}
+
+// KYTY_SPEC_LATE_READS (live spec_late_reads, on by default under KYTY_SPECULATE=4): State::late_reads.
 inline bool LateReads() {
 	static auto& on = LiveSwitch::Find("spec_late_reads", [] {
 		const char* value = std::getenv("KYTY_SPEC_LATE_READS");
-		return value != nullptr ? std::atoll(value) : 0ll;
+		return value != nullptr ? std::atoll(value) : ModeDefault();
 	}());
 	return on.load(std::memory_order_relaxed) != 0;
 }
@@ -817,7 +827,7 @@ inline thread_local EffectsLog* t_effects = nullptr;
 // t_packet_slot), 0 between translations. A buffer or image the thread that commits releases (unregistered: no later
 // lookup finds it) is destroyed after the packets it may have been looked up in: PacketNow when it is released,
 // WaitPacketPassed before it is destroyed.
-inline constexpr size_t                                MaxPacketSlots = 12; // (8 graphics queue threads, 4 async)
+inline constexpr size_t                                MaxPacketSlots = 12; // (the graphics queue's threads, then the async queue's)
 inline std::array<std::atomic<uint64_t>, MaxPacketSlots> g_packet {};
 inline thread_local size_t                             t_packet_slot = 0;
 inline thread_local uint64_t                           t_packets     = 0;

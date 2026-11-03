@@ -389,12 +389,10 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
                                       ShaderBufferResource& resolved_descriptor,
                                       uint32_t& resolved_clear, uint64_t& resolved_size);
 
-// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc, default off): RenderExecutor::m_dcc_fills.
+// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc, on by default under KYTY_SPECULATE=4): RenderExecutor::m_dcc_fills.
 static bool PredictDccFills() {
-	static auto& on = LiveSwitch::Find("spec_predict_dcc", [] {
-		const char* value = std::getenv("KYTY_SPEC_PREDICT_DCC");
-		return value != nullptr ? std::atoll(value) : 0ll;
-	}());
+	// (One fallback at every site: LiveSwitch::Find binds the first; the environment's KYTY_SPEC_PREDICT_DCC wins.)
+	static auto& on = LiveSwitch::Find("spec_predict_dcc", Spec::ModeDefault());
 	return on.load(std::memory_order_relaxed) != 0;
 }
 

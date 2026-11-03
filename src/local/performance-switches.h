@@ -182,7 +182,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_TARGET_READ", &kyty_local_table_target_read},
 #endif
 	    Switch {"KYTY_SPECULATE", &kyty_local_speculate_mode, 0, 4},
-	    Switch {"KYTY_SPECULATE_THREADS", &kyty_local_speculate_threads, 1, 8},
+	    Switch {"KYTY_SPECULATE_THREADS", &kyty_local_speculate_threads, 1, 12},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
