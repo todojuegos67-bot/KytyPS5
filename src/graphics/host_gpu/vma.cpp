@@ -185,12 +185,84 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+// True when a device-local allocation of `bytes` keeps the first device-local heap (heap0 on the
+// target) at or below its VK_EXT_memory_budget budget minus a 512 MiB safety margin.
+bool GraphicContext::WithinVramBudget(uint64_t bytes) const {
+	constexpr uint64_t kSafetyMargin = 512ull * 1024 * 1024;
+	if (!CanReportMemoryUsage() || allocator == nullptr) {
+		return true;
+	}
+	const auto& properties = physical_device_memory_properties;
+	uint32_t    heap       = 0;
+	while (heap < properties.memoryHeapCount &&
+	       !static_cast<bool>(properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+		heap++;
+	}
+	if (heap >= properties.memoryHeapCount) {
+		return true;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const uint64_t budget = budgets[heap].budget;
+	const uint64_t margin = budget > kSafetyMargin ? kSafetyMargin : 0;
+	return budgets[heap].usage + bytes + margin <= budget;
+}
+
+// Memory the driver will need for an image, from its create info (no image object needed).
+// Returns 0 when the entry point is unavailable, which disables the gate for that image.
+uint64_t GraphicContext::ImageAllocationSize(const vk::ImageCreateInfo& image_info) const {
+	const auto query = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceImageMemoryRequirements;
+	if (query == nullptr || device == nullptr) {
+		return 0;
+	}
+	VkDeviceImageMemoryRequirements info {};
+	info.sType       = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS;
+	info.pCreateInfo = static_cast<const vk::ImageCreateInfo::NativeType*>(image_info);
+	VkMemoryRequirements2 reqs {};
+	reqs.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+	query(static_cast<VkDevice>(device), &info, &reqs);
+	return reqs.memoryRequirements.size;
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+	// Budget gate, before the driver is asked for device-local memory it does not have. Idle
+	// images are freed first; then the handler waits for submitted GPU work and frees again. If
+	// the image still does not fit, it is placed in a non-device-local memory type (system RAM)
+	// rather than overflowing VRAM, which the driver otherwise answers with device loss.
+	const auto size = ImageAllocationSize(image_info);
+	if (size != 0 && !WithinVramBudget(size)) {
+		if (m_vram_reclaim) m_vram_reclaim(size, false);
+		if (!WithinVramBudget(size) && m_vram_reclaim) m_vram_reclaim(size, true);
+		if (!WithinVramBudget(size)) {
+			uint32_t host_types = 0;
+			for (uint32_t t = 0; t < physical_device_memory_properties.memoryTypeCount; t++) {
+				if (!static_cast<bool>(physical_device_memory_properties.memoryTypes[t].propertyFlags &
+				                       vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+					host_types |= 1u << t;
+				}
+			}
+			if (host_types != 0) {
+				alloc_info.requiredFlags = 0;
+				alloc_info.memoryTypeBits = host_types;
+				static std::atomic<uint32_t> logged_gate {0};
+				if (logged_gate.fetch_add(1, std::memory_order_relaxed) < 4) {
+					VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+					vmaGetHeapBudgets(allocator, budgets);
+					std::printf("VRAM budget: image %ux%u needs %.0f MiB, heap usage %.0f/%.0f MiB "
+					            "after reclaim and wait; placed outside VRAM\n",
+					            image_info.extent.width, image_info.extent.height,
+					            size / 1048576.0, budgets[0].usage / 1048576.0,
+					            budgets[0].budget / 1048576.0);
+				}
+			}
+		}
+	}
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	auto              result       = static_cast<vk::Result>(

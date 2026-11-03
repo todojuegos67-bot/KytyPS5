@@ -138,9 +138,12 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
+	m_graphics.SetVramReclaimHandler(
+	    [this](uint64_t bytes, bool stall) { ReclaimForAllocation(bytes, stall); });
 }
 
 TextureCache::~TextureCache() {
+	m_graphics.SetVramReclaimHandler({});
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
 			UnregisterImage(id);
@@ -1900,6 +1903,50 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			continue;
 		}
 		FreeImage(id);
+	}
+}
+
+void TextureCache::ReclaimForAllocation(uint64_t bytes, bool stall) {
+	// Only images idle for two GC ticks are candidates (the GC's aggressive age), so nothing the
+	// in-progress operation may still reference is freed. GPU-written images are skipped: writing
+	// them back needs their work finished and a command recorded, which the frame-boundary GC does.
+	// The lock covers eviction only, never the wait, so deferred callbacks can still use it.
+	const auto evict_idle = [&](uint64_t wanted) {
+		std::scoped_lock lock {m_lock};
+		if (m_gc_tick < 2) {
+			return;
+		}
+		std::vector<ImageId> candidates;
+		uint64_t             freed = 0;
+		m_lru_cache.ForEachItemBelow(m_gc_tick - 2, [&](ImageId id) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || !image->registered || image->depth_id || image->IsGpuModified()) {
+				return false;
+			}
+			candidates.push_back(id);
+			freed += image->AccountedSize();
+			return freed >= wanted;
+		});
+		for (const auto id: candidates) {
+			const auto* owner = m_slot_images.try_get(id);
+			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			FreeImage(id);
+			++m_gc_evicted;
+		}
+	};
+	evict_idle(bytes);
+	// Not from inside a deferred operation: that would re-enter the pending-operation queue.
+	if (stall && !CommandScheduler::InDeferredOperation()) {
+		// Wait for everything already submitted (the fences of the work that uses these images),
+		// then run the deferred destructions that wait unblocked. The command being recorded is not
+		// submitted here, so this is safe in the middle of a draw.
+		if (m_scheduler.CurrentTick() > 0) {
+			m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
+		}
+		m_scheduler.PopPendingOperations();
+		evict_idle(bytes);
 	}
 }
 

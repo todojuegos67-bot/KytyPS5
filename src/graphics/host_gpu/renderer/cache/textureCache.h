@@ -78,6 +78,10 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// VRAM budget gate hook (GraphicContext::CreateImage): frees idle, non-GPU-written images
+	// least recently used first. stall=true first waits for submitted GPU work and runs the
+	// deferred releases, so the freed memory is really returned before the caller re-checks.
+	void ReclaimForAllocation(uint64_t bytes, bool stall);
 
 private:
 	struct MetaDataInfo {

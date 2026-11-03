@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <span>
@@ -112,6 +113,17 @@ struct GraphicContext {
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+
+	// VRAM budget gate for device-local image allocations (vma.cpp). The handler frees idle,
+	// non-GPU-written images; stall=true also waits for submitted GPU work first so the driver
+	// actually returns that memory. Registered by TextureCache.
+	using VramReclaimHandler = std::function<void(uint64_t bytes, bool stall)>;
+	void                   SetVramReclaimHandler(VramReclaimHandler handler) {
+	    m_vram_reclaim = std::move(handler);
+	}
+	[[nodiscard]] bool     WithinVramBudget(uint64_t bytes) const;
+	[[nodiscard]] uint64_t ImageAllocationSize(const vk::ImageCreateInfo& info) const;
+	VramReclaimHandler     m_vram_reclaim;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
