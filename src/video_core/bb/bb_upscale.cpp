@@ -203,6 +203,9 @@ Config ParseConfig() {
     if (const char* s = Env("BB_UPSCALE_SRC")) {
         c.force_source = std::strtoull(s, nullptr, 0);
     }
+    if (const char* s = Env("BB_UPSCALE_MENUS")) {
+        c.menus = s[0] != '0';
+    }
     if (const char* s = Env("BB_UPSCALE_LOG_EVERY")) {
         c.log_every = std::max(60, std::atoi(s));
     }
@@ -438,6 +441,7 @@ constexpr u32 PresentMaxFails = 3;
 u32 g_present_w = 0, g_present_h = 0;
 bool g_present_dead = false;
 bool g_late_upscale = false; // no HUD point this frame: the presenter upscales the flip image
+bool g_flip_scene = false;   // the flip being presented had a 3D scene (set at OnFlip)
 // The last upscale's formats (SetUpscaleFormats), for the init log.
 std::string g_up_formats = "?";
 bool g_said_presented = false;
@@ -1850,6 +1854,23 @@ bool LastFrameUpscaled() {
     return g_learned.last_injected;
 }
 
+bool MenuUpscaleWanted() {
+    if (!Enabled()) {
+        return false;
+    }
+    std::scoped_lock lk{g_mutex};
+    if (!Cfg().menus || !Active() || g_flip_scene) {
+        return false;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        Checkpoint("2D frames (menus, loading screens, movies): scaled to the window with the "
+                   "spatial FSR 1 pass (BB_UPSCALE_MENUS=0 turns it off)");
+    }
+    return true;
+}
+
 bool TakeLateUpscale() {
     std::scoped_lock lk{g_mutex};
     const bool late = g_late_upscale;
@@ -1980,6 +2001,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     }
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
+    g_flip_scene = f.gb_depth != 0; // (the presenter asks for this flip after this call)
     g_flips[g_flip_index++ % g_flips.size()] = addr;
     g_output_w = width;
     g_output_h = height;

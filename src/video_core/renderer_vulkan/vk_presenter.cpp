@@ -855,7 +855,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     vk::Extent2D fsr_out{frame->width, frame->height};
     auto frame_fsr = fsr_settings;
-    if ((bb_presented || (BB::Upscale::Enabled() && BB::Upscale::LastFrameUpscaled())) &&
+    // Bloodborne: a menu, loading screen or movie (no 3D scene, so no upscaler above) is scaled
+    // to the window by the spatial FSR 1 pass instead of a plain (blurry) stretch.
+    if (!bb_presented && BB::Upscale::Enabled() && BB::Upscale::MenuUpscaleWanted() &&
+        (bb_size.width != frame->width || bb_size.height != frame->height)) {
+        frame_fsr.enable = true;
+    } else if ((bb_presented || (BB::Upscale::Enabled() && BB::Upscale::LastFrameUpscaled())) &&
         (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ||
                          BB::Upscale::Cfg().kind == BB::SR::Kind::Xess ||
                          BB::Upscale::Cfg().kind == BB::SR::Kind::Native) &&
