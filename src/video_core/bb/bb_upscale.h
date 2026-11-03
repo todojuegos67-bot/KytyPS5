@@ -177,6 +177,8 @@ void OnPresentFailed(std::string_view why);
 // a plain stretch, since the upscaler itself needs a 3D scene (depth, motion). BB_UPSCALE_MENUS=0
 // turns it off. Only ever true for a frame the 3D path did not upscale.
 bool MenuUpscaleWanted();
+// A 3D frame in window-size mode that was not upscaled: FSR 1 to the window, not a stretch.
+bool SceneSpatialFallback();
 // The presenter's verdict for this frame: the window-size image was (or was not) presented.
 void OnPresentResult(bool presented, std::string_view why);
 

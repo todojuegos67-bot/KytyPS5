@@ -1771,6 +1771,21 @@ bool SkipRelax() {
 u32 SkipNeeded() {
     return SkipRelax() ? 0u : g_learned.skip;
 }
+// 0.40: BB_UPFIX (default on; BB_UPFIX=0 restores 0.38). The window-size path upscales the
+// finished post-processed image, after every write to the source, so the in-place sample count
+// does not apply to it: at present (the finished flip, no HUD point found) no sample of the
+// source is needed at all, and a 3D frame that still misses the upscaler is scaled to the window
+// with the spatial FSR 1 pass instead of a plain bilinear stretch (SceneSpatialFallback).
+bool UpfixOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_UPFIX");
+        return v == nullptr || *v != '0';
+    }();
+    return on;
+}
+bool LateSamplesOk(u32 qual_samples) {
+    return UpfixOn() || qual_samples > SkipNeeded();
+}
 // Per-reason counts of frames not upscaled (not 3D), printed about once a second.
 struct Not3D {
     u32 frames = 0, up = 0, no_depth = 0, no_scene = 0, size = 0, samples = 0, failed = 0,
@@ -1926,6 +1941,23 @@ bool MenuUpscaleWanted() {
         said = true;
         Checkpoint("2D frames (menus, loading screens, movies): scaled to the window with the "
                    "spatial FSR 1 pass (BB_UPSCALE_MENUS=0 turns it off)");
+    }
+    return true;
+}
+
+bool SceneSpatialFallback() {
+    if (!Enabled() || !UpfixOn()) {
+        return false;
+    }
+    std::scoped_lock lk{g_mutex};
+    if (!Active() || !g_flip_scene || !PresentMode()) {
+        return false;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        Checkpoint("3D frame missed the upscaler: scaled to the window with the spatial FSR 1 "
+                   "pass instead of a plain stretch (BB_UPFIX=0 turns it off)");
     }
     return true;
 }
@@ -2201,7 +2233,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // presenter upscales the finished image instead (TakeLateUpscale).
     g_late_upscale = false;
     if (PresentMode() && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
-        f.gb_w == width && f.gb_h == height && f.qual_samples > SkipNeeded()) {
+        f.gb_w == width && f.gb_h == height && LateSamplesOk(f.qual_samples)) {
         g_learned.last_injected = prev_injected;
         FillPresentPlan(addr, "at present (no HUD draw found this frame)");
         g_late_upscale = true;
@@ -2230,7 +2262,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             ++n.no_scene;
         } else if (f.gb_w != width || f.gb_h != height) {
             ++n.size;
-        } else if (f.qual_samples <= SkipNeeded()) {
+        } else if (!LateSamplesOk(f.qual_samples)) {
             ++n.samples;
             n.max_q = std::max(n.max_q, f.qual_samples);
             n.max_skip = std::max(n.max_skip, g_learned.skip);
@@ -2242,10 +2274,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                 Checkpoint(fmt::format(
                     "[3d] last {} flips: {} upscaled; not 3D: no G-buffer depth {}, no scene draws "
                     "{}, scene size != flip {}, source sampled too few times {} (max {} seen, "
-                    "needs > {}; learned skip {}, relax {}), dispatch failed {}, other / no "
+                    "needs > {}; learned skip {}, relax {}, upfix {}), dispatch failed {}, other / no "
                     "injection point {}",
                     n.frames, n.up, n.no_depth, n.no_scene, n.size, n.samples, n.max_q,
-                    SkipNeeded(), n.max_skip, SkipRelax() ? "on" : "off", n.failed, n.no_point));
+                    SkipNeeded(), n.max_skip, SkipRelax() ? "on" : "off",
+                    UpfixOn() ? "on" : "off", n.failed, n.no_point));
             }
             n = {};
         }
