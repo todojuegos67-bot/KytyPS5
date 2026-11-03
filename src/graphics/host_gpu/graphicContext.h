@@ -183,6 +183,8 @@ struct GraphicContext {
 	void                   LogVideoMemory(const char* label) const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// (CreateImage: a texture made in the host-preferred type, KYTY_TEXTURE_HOST_AT; where it really is, logged.)
+	void                   NoteHostPreferredTexture(VmaAllocation allocation, double host_at);
 	void                   DeleteImage(VulkanImage& image);
 	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
 	void                   TrimImagePool();

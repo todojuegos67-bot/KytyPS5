@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -473,6 +474,40 @@ bool GraphicContext::RetryAllocation(const char* what, uint64_t bytes, const std
 	return false;
 }
 
+// The textures made in the host-preferred type (CreateImage): where they really are, by the heap of the memory type VMA chose (a
+// system-memory heap: every sample crosses PCIe), printed at every further 256 MiB of them (the GPU thread's; not freed counts).
+void GraphicContext::NoteHostPreferredTexture(VmaAllocation allocation, double host_at) {
+	// (The GPU thread makes the textures, the present thread its frame image: both reach here.)
+	static std::mutex mutex;
+	std::scoped_lock  lock(mutex);
+	static uint64_t   images = 0, bytes = 0, system_bytes = 0, next = 0;
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, allocation, &info);
+	const auto& memory = GetPhysicalDeviceMemoryProperties();
+	const bool  system = info.memoryType < memory.memoryTypeCount &&
+	                    !(memory.memoryHeaps[memory.memoryTypes[info.memoryType].heapIndex].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+	images++;
+	bytes += info.size;
+	system_bytes += system ? info.size : 0;
+	if (bytes < next) return;
+	next = bytes + (uint64_t {256} << 20u);
+	// (Each heap's usage against its budget, VK_EXT_memory_budget through VMA: where the no-flags images actually live.)
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	std::string heaps;
+	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+		char part[96];
+		std::snprintf(part, sizeof(part), "%s heap %u (%s) %" PRIu64 " of %" PRIu64 " MiB", heap == 0 ? "" : ",", heap,
+		              (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) ? "video" : "system",
+		              static_cast<uint64_t>(budgets[heap].usage) >> 20u, static_cast<uint64_t>(budgets[heap].budget) >> 20u);
+		heaps += part;
+	}
+	std::printf("Textures in the host-preferred type (from %.2f of the budget, KYTY_TEXTURE_HOST_AT): %" PRIu64 " made, %" PRIu64
+	            " MiB, %" PRIu64 " MiB of them in a system-memory heap (memory type %u now); heaps:%s\n",
+	            host_at, images, bytes >> 20u, system_bytes >> 20u, info.memoryType, heaps.c_str());
+	std::fflush(stdout);
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
@@ -513,8 +548,21 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	// fails device-local allocations past its video memory: what came last went to system memory, 8 GB at 1-1:
 	// 22 fps, textures yielding: ~45). It counts that type under the video memory heap: on 8 GB, half is reached
 	// before the first texture.
+	// KYTY_TEXTURE_HOST_AT=<fraction> (boot env, (0, 1], default 0.5: the half above): the budget use from which textures go to that
+	// type (re-notes agent/tasks/20261103-GPU-PASS-METRICS.md: the 1-1 pixel-heavy table draws read host memory over PCIe, 27-81 %).
+	static const double host_at = [] {
+		const char*  value    = std::getenv("KYTY_TEXTURE_HOST_AT");
+		const double fraction = value != nullptr ? std::strtod(value, nullptr) : 0.0;
+		const double used     = fraction > 0.0 && fraction <= 1.0 ? fraction : 0.5;
+		// (The bench's engage line: read at the first image, early in the boot.)
+		if (value != nullptr) std::printf("Textures: host-preferred from %.2f of the budget (KYTY_TEXTURE_HOST_AT=%s)\n", used, value);
+		return used;
+	}();
 	const bool texture = IsTextureUsage(image_info.usage);
-	if (texture && small_video_memory && GetDeviceMemoryUsage() >= GetTotalMemoryBudget() / 2) {
+	const bool host_preferred =
+	    texture && small_video_memory &&
+	    static_cast<double>(GetDeviceMemoryUsage()) >= static_cast<double>(GetTotalMemoryBudget()) * host_at;
+	if (host_preferred) {
 		alloc_info.requiredFlags = 0;
 		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
@@ -556,6 +604,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		}
 	}
 
+	if (host_preferred) NoteHostPreferredTexture(image.allocation, host_at);
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
 	image.extent     = image_info.extent;
