@@ -359,7 +359,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	};
 	// Collection starts where the video memory use reaches the budget less its headroom (GetTotalMemoryBudget):
 	// below it a kept image costs nothing, a deleted one an upload when the game uses it again.
-	m_trigger_gc_memory = m_graphics.GetTotalMemoryBudget();
+	m_trigger_gc_memory       = m_graphics.GetTotalMemoryBudget();
+	m_start_trigger_gc_memory = m_trigger_gc_memory;
 #if KYTY_TEXTURE_OFFLOAD_SUPPORTED
 	if (TextureOffload::AnyEnabled()) {
 		const bool offload = TextureOffload::GetMode() == TextureOffload::Mode::Offload;
@@ -5104,13 +5105,16 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_graphics.CanReportMemoryUsage() && !m_graphics.small_video_memory) {
+	if (m_graphics.CanReportMemoryUsage()) {
 		// The budget Windows gives now, not the one at start-up: another program's video memory lowers it (a Discord
 		// stream: 15.2 -> 13.9 GB on a 16 GB GPU), and past it Windows moves the game's memory out of video memory
 		// (60 -> 20-30 fps). Its lowest of the last 30 s (KytyGcLiveBudgetValue), less GetTotalMemoryBudget's headroom
-		// as at start-up. (As before below 12 GiB of budget.)
+		// as at start-up. Below 12 GiB of budget it only lowers the start-up trigger (issue #276: an 8 GB RX 6650 XT's
+		// budget went from 7378 to ~5570 MiB in the world; the collector, still at 6455, let the use stay up to 1.2 GiB
+		// over it once frame generation took its share, and frames waited on the memory Windows had moved out).
 		static uint64_t logged  = 0;
-		const uint64_t  trigger = KytyGcLiveBudgetValue(m_graphics);
+		const uint64_t  live    = KytyGcLiveBudgetValue(m_graphics);
+		const uint64_t  trigger = m_graphics.small_video_memory ? std::min(live, m_start_trigger_gc_memory) : live;
 		if ((trigger > logged ? trigger - logged : logged - trigger) >= (uint64_t {256} << 20u)) {
 			logged = trigger;
 			std::printf("Texture collector: collects above %llu MiB (the video memory budget now, less its headroom)\n",

@@ -422,6 +422,7 @@ private:
 	}
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
+	uint64_t                                          m_start_trigger_gc_memory = 0; // (the trigger at start-up)
 	uint64_t                                          m_logged_video_memory = 0; // RunGarbageCollector's log line
 	uint64_t                                          m_logged_shared_memory = 0;
 	uint64_t                                          m_logged_working_set   = 0; // (and its line on the PC's memory)
