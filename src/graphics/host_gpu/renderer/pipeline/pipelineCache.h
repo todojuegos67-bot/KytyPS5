@@ -115,6 +115,10 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 	void StartPrewarm(); // pipelinePrewarm.h
+	// Frame boundary, not during recording: when more than KYTY_PIPELINE_LIVE_MAX runtime VkPipeline
+	// handles are live, the least recently used idle ones are dropped (layouts kept). A dropped handle
+	// is destroyed once is_free(retire_tick) and is rebuilt on its next lookup.
+	void TrimLive(uint64_t retire_tick, const std::function<bool(uint64_t)>& is_free);
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -124,6 +128,14 @@ public:
 		// Compute only: a pipeline first created without driver optimization (huge SPIR-V) gets
 		// an optimized build on a background thread; dispatches use it once it is ready.
 		std::shared_ptr<std::atomic<VkPipeline>> optimized;
+		// TrimLive drops only `pipeline` (and never one with `optimized`). The layouts stay, so the
+		// descriptor batches keyed by the set layout stay valid; the next lookup rebuilds `pipeline`.
+		bool                     evictable        = false; // built synchronously, small enough to rebuild inline
+		bool                     is_compute       = false;
+		uint64_t                 last_used        = 0;     // TrimLive serial of the last lookup
+		vk::ShaderModule         compute_module   = nullptr; // compute rebuild input
+		uint32_t                 compute_subgroup = 0;
+		uint64_t                 compute_words    = 0;
 
 		[[nodiscard]] vk::Pipeline ComputeHandle() const {
 			if (optimized != nullptr) {
@@ -214,7 +226,13 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<AsyncCompute>                            m_async_compute;
+	uint64_t                                                 m_trim_serial = 0;
+	std::vector<std::pair<vk::Pipeline, uint64_t>>           m_retired; // handle, tick it may be destroyed at
+	uint64_t                                                 m_evicted_total = 0;
+	uint64_t                                                 m_rebuilt_total = 0;
+	std::chrono::steady_clock::time_point                    m_next_trim_log {};
 
+	void RebuildComputeHandle(Pipeline& pipeline);
 	void StopAsyncCompute();
 	void EnqueueAsync(std::function<void()> work, const std::function<void()>& mark_pending);
 	Pipeline* GraphicsPipelineImpl(std::span<const RenderColorInfo>       colors,

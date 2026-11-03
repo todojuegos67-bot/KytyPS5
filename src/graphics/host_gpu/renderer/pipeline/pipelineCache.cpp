@@ -808,6 +808,11 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	for (const auto& [handle, tick]: m_retired) {
+		(void)tick;
+		m_graphics.device.destroyPipeline(handle, nullptr);
+	}
+	m_retired.clear();
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -1429,7 +1434,15 @@ PipelineCache::Pipeline* PipelineCache::GraphicsPipelineImpl(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return iter->second.get();
+		Pipeline& hit = *iter->second;
+		if (hit.pipeline == nullptr) {
+			// Dropped by TrimLive: the layouts are still here, so rebuild the handle in place.
+			CreatePipelineInternal(m_graphics, hit, rendering, key.vertex_input, vertex_info,
+			                       ps_input_info, programs, static_params, m_driver_cache);
+			m_rebuilt_total++;
+		}
+		hit.last_used = m_trim_serial;
+		return &hit;
 	}
 
 	uint64_t total_words = programs.pixel.spirv_words;
@@ -1532,6 +1545,9 @@ PipelineCache::Pipeline* PipelineCache::GraphicsPipelineImpl(
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	// Small pipelines are rebuilt inline on their next use; big ones may stall, so they stay.
+	cached->evictable = AsyncComputeWords() == 0 || total_words <= AsyncComputeWords();
+	cached->last_used = m_trim_serial;
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
@@ -1564,7 +1580,10 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
-		return *iter->second;
+		Pipeline& hit = *iter->second;
+		if (hit.pipeline == nullptr) RebuildComputeHandle(hit);
+		hit.last_used = m_trim_serial;
+		return hit;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1582,12 +1601,96 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	cached->evictable = AsyncComputeWords() == 0 || compute_program.spirv_words <= AsyncComputeWords();
+	cached->last_used = m_trim_serial;
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 	CheckpointDriverCache();
 
 	return *iter->second;
+}
+
+void PipelineCache::RebuildComputeHandle(Pipeline& pipeline) {
+	EXIT_IF(!pipeline.is_compute || pipeline.compute_module == nullptr);
+	// prewarm_key stays 0: a rebuild must not consume a prewarm record that was already taken.
+	ComputePipelineJob job;
+	job.module                 = pipeline.compute_module;
+	job.required_subgroup_size = pipeline.compute_subgroup;
+	job.spirv_words            = pipeline.compute_words;
+	CreateComputePipelineObject(m_graphics, pipeline, job, m_driver_cache);
+	m_rebuilt_total++;
+	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+}
+
+namespace {
+size_t PipelineLiveMax() {
+	static const size_t value = [] {
+		const char* v = std::getenv("KYTY_PIPELINE_LIVE_MAX");
+		return v != nullptr ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : size_t {2048};
+	}();
+	return value;
+}
+} // namespace
+
+void PipelineCache::TrimLive(uint64_t retire_tick, const std::function<bool(uint64_t)>& is_free) {
+	++m_trim_serial;
+	for (auto it = m_retired.begin(); it != m_retired.end();) {
+		if (is_free(it->second)) {
+			m_graphics.device.destroyPipeline(it->first, nullptr);
+			it = m_retired.erase(it);
+		} else {
+			++it;
+		}
+	}
+
+	const size_t live_max = PipelineLiveMax();
+	if (live_max == 0) {
+		return;
+	}
+	size_t                 live = 0;
+	std::vector<Pipeline*> idle;
+	const auto             scan = [&](const auto& pipelines) {
+		for (const auto& [key, pipeline]: pipelines) {
+			(void)key;
+			if (pipeline->pipeline == nullptr) {
+				continue;
+			}
+			live++;
+			// Idle for a whole period: not recorded in the command buffer still being built.
+			if (pipeline->evictable && pipeline->optimized == nullptr &&
+			    pipeline->last_used + 1 < m_trim_serial) {
+				idle.push_back(pipeline.get());
+			}
+		}
+	};
+	scan(m_graphics_pipelines);
+	scan(m_compute_pipelines);
+	if (live <= live_max) {
+		return;
+	}
+	const size_t excess = std::min(live - live_max, idle.size());
+	if (excess == 0) {
+		return;
+	}
+	std::partial_sort(idle.begin(), idle.begin() + static_cast<std::ptrdiff_t>(excess), idle.end(),
+	                  [](const Pipeline* a, const Pipeline* b) { return a->last_used < b->last_used; });
+	for (size_t i = 0; i < excess; i++) {
+		Pipeline* pipeline = idle[i];
+		m_retired.emplace_back(pipeline->pipeline, retire_tick);
+		pipeline->pipeline = nullptr;
+	}
+	m_evicted_total += excess;
+
+	const auto now = std::chrono::steady_clock::now();
+	if (now >= m_next_trim_log) {
+		m_next_trim_log = now + std::chrono::seconds(5);
+		std::printf("PipelineLive: %zu live (max %zu), dropped %zu idle (%llu dropped, %llu rebuilt "
+		            "so far), %zu waiting for the GPU\n",
+		            live - excess, live_max, excess, static_cast<unsigned long long>(m_evicted_total),
+		            static_cast<unsigned long long>(m_rebuilt_total), m_retired.size());
+		std::fflush(stdout);
+	}
 }
 
 void PipelineCache::StopAsyncCompute() {
@@ -1662,7 +1765,10 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_IF(!compute_program);
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
-		return iter->second.get();
+		Pipeline& hit = *iter->second;
+		if (hit.pipeline == nullptr) RebuildComputeHandle(hit);
+		hit.last_used = m_trim_serial;
+		return &hit;
 	}
 	const uint64_t threshold = AsyncComputeWords();
 	if (m_async_compute != nullptr) {
