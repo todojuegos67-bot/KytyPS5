@@ -489,21 +489,76 @@ bool GuestPacing() {
 
 namespace Dlssg {
 double PaceInterval();
+bool Generating();
 void NoteSlept(double seconds);
+}
+
+// The adaptive grid (BB_FG_PACE_ADAPT=0: off). With no cap, the real flips are held on a grid at
+// the mean free frame time of the last 16 flips: the game's own time between flips, without our
+// waits. The real presents then come out evenly spaced, and a flip is never held longer than one
+// such frame (added latency at most one frame). A cap (KYTY_VRR_CAP_FPS, dynamic) still applies
+// when its interval is longer.
+namespace Adapt {
+constexpr int kWindow = 16;
+constexpr int kMinSamples = 8;
+double g_ring[kWindow]{};
+int g_count = 0;
+int g_next = 0;
+std::atomic<double> g_last{0.0}; // the interval the last generated flip was held to (log)
+
+bool Enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_FG_PACE_ADAPT");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+void Add(double free_seconds) {
+    g_ring[g_next] = free_seconds;
+    g_next = (g_next + 1) % kWindow;
+    ++g_count;
+}
+
+// Mean free frame time (0: too few samples yet).
+double Mean() {
+    if (g_count < kMinSamples) return 0.0;
+    const int n = std::min(g_count, kWindow);
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) sum += g_ring[i];
+    return sum / n;
+}
+} // namespace Adapt
+
+double PaceEffective() {
+    return Adapt::g_last.load();
 }
 
 void PaceGuestFlip() {
     if (!GuestPacing()) return;
-    double interval = Dlssg::PaceInterval();
-    if (interval <= 0.0) interval = Amd::PaceInterval();
-    if (interval <= 0.0 || interval > 0.1) return;
     using Clock = std::chrono::steady_clock;
     static Clock::time_point next{};
+    static Clock::time_point exited{}; // when the previous flip's wait ended
     static std::mutex mutex;
     std::unique_lock lock{mutex};
+    const auto arrive = Clock::now();
+    const bool generating = Dlssg::Generating() || Amd::Generating();
+    if (generating && Adapt::Enabled() && exited != Clock::time_point{}) {
+        const double frame_s = std::chrono::duration<double>(arrive - exited).count();
+        if (frame_s > 0.0 && frame_s < 0.1) Adapt::Add(frame_s);
+    }
+    double interval = Dlssg::PaceInterval();
+    if (interval <= 0.0) interval = Amd::PaceInterval();
+    if (generating && Adapt::Enabled()) interval = std::max(interval, Adapt::Mean());
+    Adapt::g_last = interval;
+    if (interval <= 0.0 || interval > 0.1) {
+        next = Clock::time_point{};
+        exited = Clock::now();
+        return;
+    }
     const auto step =
         std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(interval));
-    auto now = Clock::now();
+    auto now = arrive;
     if (next > now) {
         const auto until = next;
         lock.unlock();
@@ -516,6 +571,7 @@ void PaceGuestFlip() {
     }
     // A late flip resets the grid (no burst to catch up).
     next = std::max(next, now - step) + step;
+    exited = Clock::now();
 }
 
 namespace Dlssg {
@@ -855,6 +911,10 @@ double PaceInterval() {
     return g_ready && g_mode_set == 1 ? g_real_interval.load() : 0.0;
 }
 
+bool Generating() {
+    return g_ready && g_mode_set == 1;
+}
+
 void NoteSlept(double seconds) {
     g_slept += seconds;
 }
@@ -954,7 +1014,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                 Printf("[dlssg] present interval sd %.2f ms (mean %.2f, max %.1f, %.0f frames); "
                        "pacer %.2f ms (%s)",
                        sd * 1e3, mean * 1e3, g_pace_max * 1e3, g_pace_n,
-                       g_real_interval.load() * 1e3,
+                       PaceEffective() * 1e3,
                        PaceMode() == 2 ? "reflex" : GuestPacing() ? "grid, guest flips" : "grid");
             }
             g_pace_n = g_pace_sum = g_pace_sq = g_pace_max = 0.0;

@@ -488,6 +488,10 @@ double PaceInterval() {
     return Active() && g_generating ? CapInterval() : 0.0;
 }
 
+bool Generating() {
+    return Active() && g_generating;
+}
+
 void NoteSlept(double seconds) {
     g_mfg.slept += seconds;
 }
@@ -681,7 +685,8 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
             Printf("[fsr3] present interval sd %.2f ms (mean %.2f, max %.1f, %.0f frames); pacer "
                    "%.2f ms (%s)",
                    sd * 1e3, mean * 1e3, g_stats.pace_max * 1e3, g_stats.pace_n,
-                   CapInterval() * 1e3, GuestPacing() ? "guest flips" : "present");
+                   (GuestPacing() ? PaceEffective() : CapInterval()) * 1e3,
+                   GuestPacing() ? "guest flips" : "present");
         }
         MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
         g_stats = {};
@@ -877,6 +882,9 @@ bool Requested() {
 }
 double PaceInterval() {
     return 0.0;
+}
+bool Generating() {
+    return false;
 }
 void NoteSlept(double) {}
 bool Active() {

@@ -20,5 +20,11 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    vk::Format format);
 int Generated();
 double PaceInterval(); // the real-frame limit while generating (0: none)
+bool Generating();     // generating frames now
 void NoteSlept(double seconds);
 } // namespace BB::FG::Amd
+
+namespace BB::FG {
+// The interval the game's flips were last held to (bb_fg.cpp PaceGuestFlip; log).
+double PaceEffective();
+} // namespace BB::FG
