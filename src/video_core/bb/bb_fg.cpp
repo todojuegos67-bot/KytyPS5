@@ -1173,8 +1173,9 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         sl::Resource motion = ToResource(inputs->motion);
         sl::Resource hudless = ToResource(inputs->hudless);
         const sl::Extent full{0, 0, inputs->render.width, inputs->render.height};
-        const sl::Extent game{static_cast<uint32_t>(region.offset.y),
-                              static_cast<uint32_t>(region.offset.x), region.extent.width,
+        // sl::Extent is {left, top, width, height}: the game image's offset is x (left), y (top).
+        const sl::Extent game{static_cast<uint32_t>(region.offset.x),
+                              static_cast<uint32_t>(region.offset.y), region.extent.width,
                               region.extent.height};
         const bool partial = region.offset.x != 0 || region.offset.y != 0 ||
                              region.extent.width != backbuffer.width ||
@@ -1195,9 +1196,11 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             const char* value = Env("KYTY_FRAMEGEN_HUDLESS");
             return value == nullptr || *value != '0';
         }();
+        // The HUD-less image is the game's image (the window size, output size), which sits in
+        // the backbuffer at region: it can be smaller than the backbuffer (2556 of 2560 wide).
         const bool tag_hudless = hudless_tag && inputs->has_hudless &&
-                                 inputs->hudless.extent.width == backbuffer.width &&
-                                 inputs->hudless.extent.height == backbuffer.height;
+                                 inputs->hudless.extent.width == region.extent.width &&
+                                 inputs->hudless.extent.height == region.extent.height;
         if (tag_hudless) {
             ++g_stat_hudless;
             tags.emplace_back(&hudless, sl::kBufferTypeHUDLessColor,
