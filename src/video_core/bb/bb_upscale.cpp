@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_dlss5.h"
 #include "core/bb_respatch.h"
 #include "video_core/bb/bb_fg.h"
 
@@ -1033,7 +1034,8 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
         SR::Xess::AddDeviceExtensions(instance, physical, available, extensions);
     } else if (Cfg().kind == SR::Kind::Fsr4) {
         SR::Fsr4::AddDeviceExtensions(available, extensions);
-    }
+    }    // 0.42 DLSS 5 (bb_dlss5.h): NGX's two vendor extensions, only with BB_DLSS5 1..3 on NVIDIA.
+    Dlss5::AddDeviceExtensions(physical, available, extensions);
 }
 
 void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const char*>& extensions,
@@ -1136,6 +1138,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
     default:
         break;
     }
+    Dlss5::OnDevice(instance, physical, device, allocator);
     if (Enabled()) {
         Checkpoint(fmt::format("{} back end {}", SR::KindName(Cfg().kind),
                                BackendReady() ? "ready"

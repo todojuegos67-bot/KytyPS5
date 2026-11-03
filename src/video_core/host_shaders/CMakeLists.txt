@@ -52,6 +52,7 @@ add_host_shader(bb_hud.comp bb_hud_comp)
 add_host_shader(bb_alpha.comp bb_alpha_comp)
 add_host_shader(bb_hudless_lut.comp bb_hudless_lut_comp)
 add_host_shader(bb_fsr4_prep.comp bb_fsr4_prep_comp)
+add_host_shader(bb_dlss5.comp bb_dlss5_comp)
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
