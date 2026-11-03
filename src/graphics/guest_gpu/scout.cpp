@@ -26,15 +26,8 @@
 #include <xxhash.h>
 
 extern "C" {
-// 1 on Windows. 0 elsewhere until measured there: on Linux each guarded copy (a packet, a table range) is a pread of
-// /proc/self/mem (guardedCopy.cpp), and the Steam Deck has four cores.
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_scout_mode {
-#if defined(_WIN32)
-    1
-#else
-    0
-#endif
-};
+// 1 (on). A machine without spare CPUs gets the scout only while the spin gate is open (spin-gate.h).
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_scout_mode {1};
 }
 
 namespace Libs::Graphics::Scout {
@@ -117,7 +110,13 @@ void Note(uint64_t sequence, uint32_t ordinal, Reason reason) {
 }
 
 bool Read(void* out, uint64_t address, uint64_t bytes) {
-	return address != 0 && Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0;
+	if (address == 0) return false;
+#if !defined(_WIN32)
+	// Linux: GuardedCopy is a pread of /proc/self/mem, one system call per read. Direct memory goes through the
+	// backing view first, as the watched ranges already do; what the view cannot serve still takes the guarded copy.
+	if (Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes)) return true;
+#endif
+	return Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0;
 }
 
 // The GS user SGPR at an SH register location, -1 for another register (graphicsRun.cpp's GsUserSgprAt).
@@ -741,8 +740,8 @@ void SkipDraws(uint32_t count) {
 }
 
 void NoteWrite(const void* address, uint32_t size) {
-	const auto first = reinterpret_cast<uint64_t>(address) & ~3ull;
-	const auto end   = std::min(reinterpret_cast<uint64_t>(address) + size, first + 64 * 4ull);
+	const uint64_t first = reinterpret_cast<uint64_t>(address) & ~uint64_t {3};
+	const auto     end   = std::min(reinterpret_cast<uint64_t>(address) + size, first + uint64_t {64 * 4});
 	const bool keep  = Mode() == 2;
 	for (auto word = first; word < end; word += 4) {
 		g_labels[LabelSlot(word)].store(word, std::memory_order_relaxed);
