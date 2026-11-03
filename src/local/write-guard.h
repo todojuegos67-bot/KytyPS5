@@ -1,9 +1,9 @@
 #ifndef KYTY_LOCAL_WRITE_GUARD_H_
 #define KYTY_LOCAL_WRITE_GUARD_H_
 
-// KYTY_WRITE_GUARD (default 0; 1 turns it on): a guest memory write of the command processor (WriteGuestMemory:
-// WRITE_DATA, an end-of-pipe label, the reference clock) made while older upload jobs are pending lands at once and
-// is hidden from the game until those jobs are done, instead of waiting for them (AsyncUpload::Drain, issue #196).
+// KYTY_WRITE_GUARD (default 1): a guest memory write of the command processor (WriteGuestMemory: WRITE_DATA, an
+// end-of-pipe label, the reference clock) made while older upload jobs are pending lands at once and is hidden from
+// the game until those jobs are done, instead of waiting for them (AsyncUpload::Drain, issue #196).
 //
 // The write is a release: the game takes a label as the GPU being done and may then rewrite the buffers the pending
 // copies still read. So the game must not see it before every job queued ahead of it ran; the render thread need not

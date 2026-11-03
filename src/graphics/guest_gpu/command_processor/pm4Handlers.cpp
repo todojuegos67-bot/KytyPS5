@@ -131,7 +131,13 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 }
 
 [[nodiscard]] bool GuardTable(uint32_t*& table, uint32_t pairs, uint32_t bank) {
-	if (GuestGpu::IsGpuThread()) return true;
+	if (GuestGpu::IsGpuThread()) {
+		// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
+		// thread wrote, local/write-guard.h.)
+		if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u))
+			table = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
+		return true;
+	}
 	thread_local std::vector<uint32_t> copy;
 	copy.resize(size_t {pairs} * 2u);
 	if (Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {

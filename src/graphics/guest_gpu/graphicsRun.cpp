@@ -29,8 +29,8 @@
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "live-census.h"
-#include "write-guard.h"
 #include "live-switch.h"
+#include "write-guard.h"
 #include "draw-state-observer.h"
 #include "frame-capture.h"
 #include "hud-anchor.h"
@@ -67,10 +67,8 @@ extern "C" {
 // 1: a full barrier with no recorded work since the previous one is skipped.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe {1};
 // 1: a guest memory write of the command processor made while older upload jobs are pending lands at once and is hidden
-// from the game until they are done (local/write-guard.h); 0 (the default): it waits for them. Off by default because
-// each guarded write protects pages of a mapped view and back, and per-page protection churn on the views is behind
-// MEMORY_MANAGEMENT blue screens on small-memory Windows PCs under memory pressure (#5, #50).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_guard_mode {0};
+// from the game until they are done (local/write-guard.h); 0: it waits for them.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_guard_mode {1};
 }
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
@@ -723,9 +721,10 @@ static void TouchForWrite(uint64_t address) {
 // now are done. False: the caller drains them and writes, as without it (no older job is pending, so there is nothing
 // to hide the write behind; or the form does not apply).
 static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
-	// (The GPU thread's writes only.)
+	// (Not under a speculation's translation, whose writes are journaled, nor in mode 4, whose threads read the
+	// processor's writes: KYTY_SPECULATE=0, the default, only.)
 	if (!WriteGuard::Enabled() || size == 0 || !AsyncUpload::g_used.load(std::memory_order_relaxed) ||
-	    !GuestGpu::IsGpuThread())
+	    !GuestGpu::IsGpuThread() || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0)
 		return false;
 	auto&          worker  = AsyncUpload::Get();
 	const uint64_t address = reinterpret_cast<uint64_t>(dst);
@@ -808,16 +807,23 @@ static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
 	}
 	auto* spec = Spec::Current();
 	if (spec == nullptr) {
-		AsyncUpload::Drain(/*serve=*/true);
-		// (Only what changes, Spec::HostWriteParts: compared where reading it faults nothing back from the GPU.)
-		Spec::HostWriteParts parts;
-		if (!Libs::LibKernel::Memory::ReadFaults(reinterpret_cast<uint64_t>(dst), size))
-			parts.Find(reinterpret_cast<uint64_t>(dst), src, size);
-		else
+		if (GuardedWrite(dst, src, size)) {
+			// (Spec::HostWriteParts: the whole write, as without a speculation's effects.)
+			Spec::HostWriteParts parts;
 			parts.address = reinterpret_cast<uint64_t>(dst), parts.size = size;
-		std::memcpy(dst, src, size);
-		parts.Note();
-		if (Scout::Running()) Scout::NoteWrite(dst, size);
+			parts.Note();
+		} else {
+			AsyncUpload::Drain(/*serve=*/true);
+			// (Only what changes, Spec::HostWriteParts: compared where reading it faults nothing back from the GPU.)
+			Spec::HostWriteParts parts;
+			if (!Libs::LibKernel::Memory::ReadFaults(reinterpret_cast<uint64_t>(dst), size))
+				parts.Find(reinterpret_cast<uint64_t>(dst), src, size);
+			else
+				parts.address = reinterpret_cast<uint64_t>(dst), parts.size = size;
+			std::memcpy(dst, src, size);
+			parts.Note();
+			if (Scout::Running()) Scout::NoteWrite(dst, size); // (as upstream: the unguarded write)
+		}
 		// (The labels a speculation's waits check: none without speculation.)
 		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0)
 			for (uint32_t offset = 0; offset < size; offset += 4) Spec::NoteLabel(reinterpret_cast<uint64_t>(dst) + offset);
@@ -838,7 +844,16 @@ static T ReadGuestMemory(const T* address) {
 	    Libs::LibKernel::Memory::ReadFaults(reinterpret_cast<uint64_t>(address), sizeof(T)))
 		return Spec::Refuse("GPU-written guest memory"), T {};
 	auto* spec = Spec::Current();
-	if (spec == nullptr) return *address;
+	if (spec == nullptr) {
+		// (KYTY_WRITE_GUARD: a page a pending guest write guards read through the backing view, the bytes this thread
+		// wrote: WAIT_REG_MEM's label, local/write-guard.h.)
+		if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(address), sizeof(T))) {
+			T value;
+			std::memcpy(&value, backing, sizeof(T));
+			return value;
+		}
+		return *address;
+	}
 	static_assert(sizeof(T) % 4 == 0);
 	std::array<uint32_t, sizeof(T) / 4> words {};
 	if (reinterpret_cast<uint64_t>(address) % 4 != 0 ||
