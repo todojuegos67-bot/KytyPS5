@@ -4,6 +4,18 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
 Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
+00. NUEVO (03-11, port52) / NEW (03-11, port52)
+-----------------------------------------------
+- Launcher: F1 cambia entre pantalla completa sin bordes y una ventana normal (barra de titulo, mover, minimizar,
+  redimensionar); F1 otra vez vuelve. En el juego F1 sigue abriendo el menu como antes.
+  Launcher: F1 switches between borderless full screen and a normal window; F1 again goes back. In game F1 is as before.
+- Mejoras del emulador original: lista de shaders de una partida completa con DLSS y generacion de fotogramas
+  (26165 pipelines; al actualizar se precompila una vez lo nuevo), texturas con poca VRAM (8 GB) sin salir del juego,
+  WAIT_FLIP_DONE sin bloqueo en el arranque, pipelines sin pixel shader con uno vacio (KYTY_EMPTY_FS=0 lo quita),
+  memo de tablas (KYTY_TABLE_GATHER_MEMO=0 lo quita).
+  Upstream fixes: full-playthrough shader hints (26165 pipelines; one precompile of the new ones on update), low-VRAM
+  texture handling, a boot freeze fix (WAIT_FLIP_DONE), empty fragment shader, table gather memo.
+
 00. NUEVO (02-11, port49) / NEW (02-11, port49)
 -----------------------------------------------
 - Lista de shaders ampliada con partidas grabadas (24914 pipelines, antes 24715: unos 199 mas, entre ellos los compute
