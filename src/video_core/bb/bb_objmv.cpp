@@ -133,7 +133,7 @@ bool Init(const Vulkan::Instance& instance) {
     g.allocator = instance.GetAllocator();
     // 4 Mi positions a half (128 MiB of device memory with both halves). Build 77 at 2 Mi dropped
     // 59256 of the 99109 draws that needed positions in 1800 frames (60 %) over the budget.
-    u32 mi = 4;
+    u32 mi = 8;  // 8 Mi: the character's large skinned draws overflowed 4 Mi and lost their vectors (ghosting)
     if (const char* s = std::getenv("BB_OBJMV_VERTICES_MI")) mi = std::clamp(std::atoi(s), 1, 16);
     g.per_half = mi << 20;
     void* mapped = nullptr;
