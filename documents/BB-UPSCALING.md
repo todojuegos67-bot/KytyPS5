@@ -13,7 +13,7 @@ upscaler. The code is in `src/video_core/bb/`. It reuses the Demon's Souls fork'
 | `BB_UPSCALE_SHARPNESS` (alias `BB_SHARPNESS`) | 0..1: FSR 3.1 / FSR 4 RCAS; after DLSS / DLAA / XeSS the presenter runs RCAS (attenuation (1-s)*2) | `0.3` |
 | `BB_UPSCALE_JITTER` | `0` / `1`: sub-pixel viewport jitter on the scene passes (only while a camera is found) | `1` |
 | `BB_REACTIVE` | `0` turns off the reactive mask (luminance change at the reprojected position: particles, fire, fog) sent to FSR 3.1 (reactive + T&C), XeSS (responsive mask) and DLSS (bias-current-colour hint); FSR 4's model has no reactive input | `1` |
-| `BB_SCENE_UPSCALE` | `1` (experimental): the 3D scene targets are created at the internal size (output / mode ratio) with their viewport and scissor and texel-size constants (W,H and 1/W,1/H pairs) scaled; the upscaler runs in place before post-processing, which stays at the output size with the HUD. Needs the game at the output resolution (resolution patch = output) | `0` |
+| `BB_SCENE_UPSCALE` | `1`: the startup resolution patch (`core/bb_respatch.cpp`, 1.09 eboot only): the scene and UI sizes are set to the mode's internal size, output / ratio (`QualityRatio`: quality 1.5, balanced 1.724, performance 2.0, ultraperf 3.0; XeSS 1.7 / 2.0 / 2.3), rounded to multiples of 8. The output is `BB_RES_PATCH_OUTPUT` (the launcher sends the window) or the game's size when the XML patch set one. The window-size path upscales it to the window and the HUD goes back on at window size. `shrink`: the 0.22 target shrinking (experimental). If the eboot is not 1.09 the game keeps its own size | `0` (the launcher sets `1` by default) |
 | `BB_DEPTH_INVERT` | `1` / `0`: forces the depth convention given to every upscaler (default: the G-buffer pass's depth test) | auto |
 | `BB_MV` | `reconstruct` (from depth plus camera) / `zero` | `reconstruct` |
 | `BB_UPSCALE_AT` | `auto`, `scene` (HDR before post-processing), `composite` (where render size changes to output size) | `auto` |
@@ -23,7 +23,8 @@ upscaler. The code is in `src/video_core/bb/`. It reuses the Demon's Souls fork'
 | `BB_UPSCALE_LOG_EVERY` | frames between `[BB_UPSCALE]` status lines | `600` |
 | `BB_ANALYZE` | `1`: also dumps every draw's targets and sampled textures for one frame every 1800 | off |
 | `BB_STREAMLINE_DIR` | folder with `sl.interposer.dll` and its plugins | `streamline\` next to the exe |
-| `BB_DLSS_PRESET` | `A`..`O`: force a DLSS model | driver default |
+| `BB_DLSS_PRESET` | `A`..`O`: force a DLSS model for every quality (the launcher offers K, M, L; unset = the driver's choice) | driver default |
+| `BB_RES_PATCH_OUTPUT` | `WxH`: the output size of the resolution patch with `BB_SCENE_UPSCALE=1` | the patch's own size |
 | `BB_FSR4_PRESET`, `BB_FSR4_DIR`, `BB_FSR4_SHARPNESS`, `BB_FSR4_DEPTH_INVERT`, `BB_FSR4_OPT` | the same as the Demon's Souls `KYTY_FSR4_*` variables | from mode |
 | `BB_XESS_MV_SIGN`, `BB_FSR3_MV_SIGN`, `BB_JITTER_SIGN` | `-1` flips the sign convention (for testing) | `1` |
 

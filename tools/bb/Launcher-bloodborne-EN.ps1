@@ -34,7 +34,7 @@ $script:defaults = [ordered]@{
 	game = ''; emu = ''; userdir = ''
 	winres = 'auto'; intres = '1920x1080'; fsmode = '1'; present = '1'; fps = '1'; patches = '1'; useupdate = '1'
 	hdr = '0'; showfps = '0'; metricas = '0'
-	upscaler = '0'; upmode = '1'; sharp = '75'; framegen = '0'; sceneup = '0'; bbfg = '0'; antilag = '0'; reflex = '1'
+	upscaler = '0'; upmode = '1'; sharp = '75'; framegen = '0'; sceneup = '1'; dlsspreset = 'auto'; bbfg = '0'; antilag = '0'; reflex = '1'
 	q_shadows = '0'; q_ao = '0'; q_fog = '0'; q_aniso = '0'; q_ca = '0'; q_blur = '0'; q_grain = '0'
 	input = '0'; motion = '0'; bginput = '0'
 	ram16 = '0'; experimental = '0'; modo = '4'; safemode = '1'; soundfix = '1'
@@ -525,6 +525,11 @@ function Get-FgEnv {
 	$e['BB_REFLEX'] = $(if ($dl) { "$([math]::Max(0, [math]::Min($rx, 2)))" } else { '0' })
 	$e['BB_UPSCALE_SHARPNESS'] = Get-SharpText
 	$e['BB_UPSCALE_SHARPNESS_FILE'] = $script:sharpFile
+	# (scver) Escena a la interna del modo: la salida es la ventana, no el tamano que tenga el juego (BB_RES_PATCH_OUTPUT).
+	if (Get-SceneUp) { $wo = $script:S.winres; if (-not $wo -or $wo -eq 'auto') { $wo = Get-ScreenRes }; $e['BB_RES_PATCH_OUTPUT'] = $wo }
+	# DLSS: modelo fijo (BB_DLSS_PRESET = K, M o L). auto = el del driver (no se pasa).
+	$upD = $script:upscalers[[math]::Min([int]$script:S.upscaler, $script:upscalers.Count - 1)]
+	if ($upD[1] -eq 'dlss' -and @('K', 'M', 'L') -contains "$($script:S.dlsspreset)") { $e['BB_DLSS_PRESET'] = "$($script:S.dlsspreset)" }
 	return $e
 }
 function Get-SceneUp {
@@ -560,7 +565,20 @@ function Get-BbEnv {
 # (winres) y el juego renderiza a la del "Resolution Patch" 16:9 mas alta que cabe en salida / factor.
 # (10-30) La salida nunca pasa de la pantalla real: 4K en un monitor de 1440p = 1440p (si no, no habia nada que reescalar).
 function Limit-ToScreen([string]$res) { try { if (-not $script:realScreen) { $vc = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.CurrentVerticalResolution } | Sort-Object CurrentVerticalResolution -Descending)[0]; $script:realScreen = $(if ($vc) { "$($vc.CurrentHorizontalResolution)x$($vc.CurrentVerticalResolution)" } else { Get-ScreenRes }) }; $s = Split-Res $script:realScreen; $r = Split-Res $res; if ([int]$r[1] -gt [int]$s[1]) { return $script:realScreen } } catch { }; return $res }
-function Get-UpRes([string]$mode) {
+function Get-UpRes([string]$mode, [string]$kind = '') {
+	# (scver) Con reescalado de escena, la interna EXACTA del modo: salida / ratio del emulador (bb_upscale.cpp QualityRatio),
+	# redondeada a multiplos de 8 como bb_respatch.cpp. Sin escena: la tabla de resoluciones del parche (Get-UpResPatch).
+	if ($script:S.sceneup -eq '1' -and $mode) {
+		$out = $script:S.winres; if (-not $out -or $out -eq 'auto') { $out = Get-ScreenRes }
+		$o = Split-Res $out; $x = ($kind -eq 'xess')
+		$f = switch ($mode) { 'native' { 1.0 } 'quality' { $(if ($x) { 1.7 } else { 1.5 }) } 'balanced' { $(if ($x) { 2.0 } else { 1.724 }) } 'performance' { $(if ($x) { 2.3 } else { 2.0 }) } 'ultraperf' { 3.0 } default { 1.5 } }
+		$w = [math]::Max(8, [int]([math]::Round($o[0] / $f / 8, [MidpointRounding]::AwayFromZero) * 8))
+		$h = [math]::Max(8, [int]([math]::Round($o[1] / $f / 8, [MidpointRounding]::AwayFromZero) * 8))
+		return "${w}x${h}"
+	}
+	return (Get-UpResPatch $mode)
+}
+function Get-UpResPatch([string]$mode) {
 	$out = $script:S.winres; if (-not $out -or $out -eq 'auto') { $out = Get-ScreenRes }
 	$o = Split-Res $out
 	$f = switch ($mode) { 'native' { 1.0 } 'quality' { 1.5 } 'balanced' { 1.7 } 'performance' { 2.0 } 'ultraperf' { 3.0 } default { 1.5 } }
@@ -657,9 +675,9 @@ function Start-Game {
 			$upE = $script:upscalers[[math]::Min([int]$script:S.upscaler, $script:upscalers.Count - 1)]
 			$env:BB_UPSCALE_MODE = $(if ($upE.Count -gt 3) { $upE[3] } else { 'quality' })
 			$env:BB_UPSCALE_SHARPNESS = ([double]$script:S.sharp / 100).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
-			$upRes = Get-UpRes $env:BB_UPSCALE_MODE
-			if (Get-SceneUp) { $upRes = $outRes; Write-Log "Reescalado de escena (BB_SCENE_UPSCALE=1): el juego a la resolucion de salida $outRes" }  # (bb-fg-022) intres = winres
-			Set-ResolutionPatch $userDir $upRes
+			$upRes = Get-UpRes $env:BB_UPSCALE_MODE $upKey
+			if (Get-SceneUp) { Write-Log "Reescalado de escena (BB_SCENE_UPSCALE=1): escena a $upRes (interna del modo), salida $outRes; si el emulador no aplica el parche, queda el parche de tabla" }  # (bb-fg-022) intres = winres
+			Set-ResolutionPatch $userDir (Get-UpResPatch $env:BB_UPSCALE_MODE)
 			Write-Log "Reescalado: $upKey $($env:BB_UPSCALE_MODE) con $upExe (interna $upRes)"
 		}
 		# (bb-launcher-022) Frame generation + Anti-Lag/Reflex + nitidez (todos los reescaladores) como variables BB_*.
@@ -972,6 +990,11 @@ if ($script:S['upver'] -ne '2') {
 	$uo = 0; [void][int]::TryParse("$($script:S.upscaler)", [ref]$uo)
 	if ($uo -ge 3) { $uo += 4 } elseif ($uo -eq 2) { $uo = 3 }
 	$script:S.upscaler = "$uo"; $script:S['upver'] = '2'
+	if (Test-Path -LiteralPath $iniFile) { Save-Settings }
+}
+# (scver) Reescalado de escena de serie: la interna de cada modo (BB_SCENE_UPSCALE=1). Una sola vez (scver=1); luego manda el checkbox.
+if ($script:S['scver'] -ne '1') {
+	$script:S.sceneup = '1'; $script:S['scver'] = '1'
 	if (Test-Path -LiteralPath $iniFile) { Save-Settings }
 }
 # (bb-launcher-022) framegen=1 de antes (FSR 3 x2) pasa a bbfg=1 (AMD x2). Una sola vez (fgver=1); framegen se sigue guardando.
@@ -1305,12 +1328,12 @@ $pbUpd = New-Object System.Windows.Forms.ProgressBar; $pbUpd.Location = New-Obje
 $panel.Controls.Add($pbUpd)
 
 # ---- Imagen: Resolución, Reescalado, Preset, Nitidez
-$gImg = New-Group (T 'Imagen' 'Image') $panel 10 100 420 222
+$gImg = New-Group (T 'Imagen' 'Image') $panel 10 100 420 256
 $resItems = @((T "Monitor ($(Get-ScreenRes))" "Monitor ($(Get-ScreenRes))")) + $script:resList
 $cmbWin = New-DarkCombo $resItems
 $cmbWin.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:resList, $script:S.winres) + 1)
 $cmbWin.Add_SelectedIndexChanged({ Set-Setting 'winres' $(if ($cmbWin.SelectedIndex -le 0) { 'auto' } else { $script:resList[$cmbWin.SelectedIndex - 1] }) })
-$cmbWin.Add_SelectedIndexChanged({ if ($cmbUp) { for ($k = 0; $k -lt $script:upscalers.Count; $k++) { $u = $script:upscalers[$k]; if ($u.Count -gt 3) { $cmbUp.Items[$k] = "$($u[0])  ($(Get-UpRes $u[3]))" } } } })  # (10-29) la interna de cada calidad sigue a la resolucion
+$cmbWin.Add_SelectedIndexChanged({ if ($cmbUp) { for ($k = 0; $k -lt $script:upscalers.Count; $k++) { $u = $script:upscalers[$k]; if ($u.Count -gt 3) { $cmbUp.Items[$k] = "$($u[0])  ($(Get-UpRes $u[3] $u[1]))" } } } })  # (10-29) la interna de cada calidad sigue a la resolucion
 [void](Add-Row $gImg (T 'Resolución' 'Resolution') $cmbWin 26 (T 'Resolución de salida (ventana y pantalla completa exclusiva). Puede ser mayor que el monitor (DSR / VSR): el juego se dibuja a esa y la gráfica la reduce. Se escribe en la config de shadPS4 y en custom_configs\<serie>.json.' 'Output resolution (window and exclusive fullscreen). It can be above the monitor (DSR / VSR): the game renders at it and the GPU scales it down. Written to the shadPS4 config and custom_configs\<serial>.json.'))
 # Res. interna y modo de reescalado aparte: ocultos (la interna la pone la calidad del reescalado), se conservan para los modos.
 $cmbInt = New-DarkCombo $script:resList
@@ -1318,7 +1341,7 @@ $cmbInt.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:resList, $script
 $cmbInt.Add_SelectedIndexChanged({ Set-Setting 'intres' $script:resList[$cmbInt.SelectedIndex] })
 [void](Put $gImg $cmbInt 124 26 282); $cmbInt.Visible = $false
 $cmbUp = New-DarkCombo @(); $cmbUp.DropDownWidth = 360; $cmbUp.MaxDropDownItems = 16
-foreach ($u in $script:upscalers) { $lab = $u[0]; if ($u.Count -gt 3) { $lab = "$lab  ($(Get-UpRes $u[3]))" }; [void]$cmbUp.Items.Add($lab) }
+foreach ($u in $script:upscalers) { $lab = $u[0]; if ($u.Count -gt 3) { $lab = "$lab  ($(Get-UpRes $u[3] $u[1]))" }; [void]$cmbUp.Items.Add($lab) }
 $cmbUp.SelectedIndex = [math]::Max(0, [math]::Min([int]$script:S.upscaler, $script:upscalers.Count - 1))
 [void](Add-Row $gImg (T 'Reescalado' 'Upscaling') $cmbUp 58 (T 'FSR 1 (shadPS4), DLSS, FSR 4, FSR 3.1 y XeSS con su calidad (entre paréntesis la resolución interna). DLSS necesita una gráfica NVIDIA RTX; FSR 4, una AMD RX 9000.' 'FSR 1 (shadPS4), DLSS, FSR 4, FSR 3.1 and XeSS with their quality (internal resolution in brackets). DLSS needs an NVIDIA RTX GPU; FSR 4, an AMD RX 9000.'))
 $cmbUpMode = New-Combo $script:upModes 124 90 282 'upmode'
@@ -1330,11 +1353,17 @@ function Set-Sharp([int]$v) { $cmbSharp.SelectedIndex = [math]::Max(0, [math]::M
 $sv0 = 75; [void][int]::TryParse("$($script:S.sharp)", [ref]$sv0); Set-Sharp $sv0
 $cmbSharp.Add_SelectedIndexChanged({ Set-Setting 'sharp' ($cmbSharp.SelectedIndex * 5); Write-SharpLive })
 [void](Add-Row $gImg (T 'Nitidez' 'Sharpness') $cmbSharp 122 (T 'Nitidez para TODOS los reescaladores (BB_UPSCALE_SHARPNESS 0-1): RCAS en FSR 1 / FSR 3.1 / FSR 4, paso de nitidez tras DLSS y XeSS. Se aplica en vivo: puedes cambiarla con el juego abierto.' 'Sharpness for EVERY upscaler (BB_UPSCALE_SHARPNESS 0-1): RCAS in FSR 1 / FSR 3.1 / FSR 4, a sharpening pass after DLSS and XeSS. Applied live: you can change it while the game runs.'))
-$lbUp = New-Label '' 10 182 400 36 $dim $tinyFont; $lbUp.TextAlign = 'TopLeft'; [void](Put $gImg $lbUp 10 182 400)
-# (bb-fg-022) Reescalado de escena experimental (BB_SCENE_UPSCALE): solo la escena 3D a la interna; el parche de
-# resolucion se queda en la Resolucion de salida mientras esta marcado (el emulador reduce la escena el mismo).
-$chkScene = Put $gImg (New-Check (T 'Reescalado de escena (experimental)' 'Scene upscale (experimental)') 0 0 396 'sceneup') 12 154 396
-$tips.SetToolTip($chkScene, (T 'BB_SCENE_UPSCALE=1: solo la escena 3D se dibuja a la resolución interna del reescalado y el reescalador actúa antes del postprocesado; postprocesado y HUD a la Resolución de salida. Solo con DLSS / FSR 4 / FSR 3.1 / XeSS en un modo reducido (no Nativo). Mientras está marcado, la resolución del juego (parche) se queda en la Resolución de salida. Experimental.' 'BB_SCENE_UPSCALE=1: only the 3D scene renders at the upscaler''s internal resolution and the upscaler runs before post-processing; post-processing and HUD at the output Resolution. Only with DLSS / FSR 4 / FSR 3.1 / XeSS in a reduced mode (not Native). While checked, the game resolution (patch) stays at the output Resolution. Experimental.'))
+# (scver) Modelo de DLSS (BB_DLSS_PRESET): solo con DLSS. Automatico = el que elige el driver.
+$script:dlssPresets = @('auto', 'K', 'M', 'L')
+$cmbDlss = New-DarkCombo @((T 'Automático (driver)' 'Automatic (driver)'), 'K', 'M', 'L')
+$cmbDlss.SelectedIndex = [math]::Max(0, [array]::IndexOf($script:dlssPresets, "$($script:S.dlsspreset)"))
+$cmbDlss.Add_SelectedIndexChanged({ Set-Setting 'dlsspreset' $script:dlssPresets[$cmbDlss.SelectedIndex] })
+[void](Add-Row $gImg (T 'Modelo DLSS' 'DLSS model') $cmbDlss 154 (T 'Solo con DLSS: BB_DLSS_PRESET = K, M o L (modelo de reconstrucción fijo). Automático = el que elige el driver de NVIDIA.' 'DLSS only: BB_DLSS_PRESET = K, M or L (fixed reconstruction model). Automatic = the NVIDIA driver picks it.'))
+$lbUp = New-Label '' 10 212 400 36 $dim $tinyFont; $lbUp.TextAlign = 'TopLeft'; [void](Put $gImg $lbUp 10 212 400)
+# (bb-fg-022 / scver) Reescalado de escena (BB_SCENE_UPSCALE): la escena 3D a la interna exacta del modo; la salida
+# es la ventana (BB_RES_PATCH_OUTPUT). De serie marcado; el emulador aplica el parche solo a un eboot 1.09.
+$chkScene = Put $gImg (New-Check (T 'Reescalado de escena (experimental)' 'Scene upscale (experimental)') 0 0 396 'sceneup') 12 184 396
+$tips.SetToolTip($chkScene, (T 'BB_SCENE_UPSCALE=1: solo la escena 3D se dibuja a la resolución interna del reescalado y el reescalador actúa antes del postprocesado; postprocesado y HUD a la Resolución de salida. Solo con DLSS / FSR 4 / FSR 3.1 / XeSS en un modo reducido (no Nativo). Cada modo renderiza la escena a su interna exacta (Calidad, Equilibrado...) y la salida es la ventana. Si el emulador no aplica el parche, queda la resolución de tabla del modo.' 'BB_SCENE_UPSCALE=1: only the 3D scene renders at the upscaler''s internal resolution and the upscaler runs before post-processing; post-processing and HUD at the output Resolution. Only with DLSS / FSR 4 / FSR 3.1 / XeSS in a reduced mode (not Native). Each mode renders the scene at its exact internal size (Quality, Balanced...) and the output is the window. If the emulator does not apply the patch, the table resolution of the mode stays.'))
 
 # ---- Frame generation + Anti-Lag / Reflex
 $gFg = New-Group 'Frame generation' $panel 450 100 420 124
@@ -1489,7 +1518,7 @@ function Update-VerLabel {
 
 # Desplegables dibujados a mano (estilo Demon's Souls).
 $script:cmbUpRef = $cmbUp; $script:cmbFgRef = $cmbFg
-foreach ($c in @($cmbGame, $cmbEmu, $cmbWin, $cmbInt, $cmbFs, $cmbPres, $cmbFps, $cmbUp, $cmbUpMode, $cmbMode, $cmbFg, $cmbAl, $cmbRx, $cmbSharp)) { Set-ComboStyle $c }
+foreach ($c in @($cmbGame, $cmbEmu, $cmbWin, $cmbInt, $cmbFs, $cmbPres, $cmbFps, $cmbUp, $cmbUpMode, $cmbMode, $cmbFg, $cmbAl, $cmbRx, $cmbSharp, $cmbDlss)) { Set-ComboStyle $c }
 foreach ($pair in $script:qCombos) { Set-ComboStyle $pair[0] }
 
 function Update-Up {
@@ -1503,6 +1532,7 @@ function Update-Up {
 	if ($cmbInt) { $cmbInt.Enabled = -not ($u.Count -gt 3) }  # (10-29) con DLSS / FSR 4 / FSR 3.1 / XeSS la interna la pone la calidad
 	$cmbUpMode.Enabled = ($exp -and -not $u[2])
 	$cmbSharp.Enabled = $true  # (bb-launcher-022) Nitidez desbloqueada para todos los reescaladores
+	$cmbDlss.Enabled = ($u[1] -eq 'dlss')  # (scver) modelo DLSS solo con DLSS
 	$lbUp.Text = $(if ($u[1] -eq 'fsr1') { T 'FSR 1 + RCAS de shadPS4. Nitidez = RCAS (y BB_UPSCALE_SHARPNESS).' 'shadPS4 FSR 1 + RCAS. Sharpness = RCAS (and BB_UPSCALE_SHARPNESS).' } elseif ($u[1] -eq 'native') { T 'Sin reescalado. La Nitidez se envía igual (BB_UPSCALE_SHARPNESS).' 'No upscaling. Sharpness is still sent (BB_UPSCALE_SHARPNESS).' } else { T 'Reescalado real antes del HUD. Nitidez: RCAS en FSR 3.1/FSR 4, paso de nitidez tras DLSS/XeSS (en vivo).' 'Real upscaling before the HUD. Sharpness: RCAS in FSR 3.1/FSR 4, a pass after DLSS/XeSS (live).' })
 }
 $cmbUp.Add_SelectedIndexChanged({ Update-Up })
