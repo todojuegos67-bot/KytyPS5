@@ -28,6 +28,7 @@
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
 #include "sdl_window.h"
+#include "video_core/bb/bb_metrics.h"
 #include "video_core/renderdoc.h"
 
 #ifdef __APPLE__
@@ -229,6 +230,20 @@ void WindowSDL::WaitEvent() {
     SDL_Event event;
 
     if (!SDL_WaitEvent(&event)) {
+        return;
+    }
+
+    // (bb-metrics-043) F8: the metrics panel, as the Demon's Souls port's (shadPS4's "reload
+    // inputs" moves off F8 while it is on; BB_METRICS_KEY=0 / BB_METRICS_OVERLAY=0 give it back).
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 &&
+        BB::Metrics::PanelKeyEnabled()) {
+        if (!event.key.repeat) {
+            BB::Metrics::TogglePanel();
+        }
+        return;
+    }
+    if (event.type == SDL_EVENT_KEY_UP && event.key.key == SDLK_F8 &&
+        BB::Metrics::PanelKeyEnabled()) {
         return;
     }
 

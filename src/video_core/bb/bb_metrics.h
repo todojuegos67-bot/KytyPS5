@@ -8,6 +8,7 @@
 // Appended and flushed per line; the previous run's file is kept as <file>.1.
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace BB::Metrics {
@@ -17,4 +18,50 @@ void OnPresent();              // a new guest frame was presented
 void SetUpscaleLine(const std::string& text);
 void SetResLine(const std::string& text); // written each second as "[res] game WxH -> output WxH ..."
 void Line(const char* text); // a line as it is (frame generation: "[dlssg] ... real X fps, shown Y fps")
+
+// ---- (bb-metrics-043) The in-game metrics panel (bb_metrics_panel.cpp): the Demon's Souls port's F8
+// panel (ds-menu.cpp MetricsPanel, metricas.ps1's look), top-centre of the game image. F8 shows /
+// hides it; BB_METRICS=1 (the launcher's "Metricas") starts it shown. BB_METRICS_OVERLAY=0: no
+// panel at all (F8 then stays shadPS4's "reload inputs"); BB_METRICS_KEY=0: F8 not taken.
+// Hidden it costs one relaxed atomic load per present / pad read / FG line.
+bool PanelShown();
+bool PanelKeyEnabled(); // F8 is the panel's (not shadPS4's reload inputs)
+void TogglePanel();     // SDL thread (F8)
+void SetPanelShown(bool shown);
+void InitPanel();       // after ImGui's init: the Consolas Bold face, BB_METRICS=1 shows it
+
+// The upscaler now (bb_upscale.cpp, every frame while the panel or the metrics file is on).
+struct Upscale {
+    int kind = 0;    // BB::SR::Kind
+    int quality = 0; // BB::SR::Quality
+    bool running = false; // upscaled this frame
+    bool scene = false;   // a 3D scene seen (render size learned)
+    unsigned render_w = 0, render_h = 0, output_w = 0, output_h = 0;
+};
+void SetUpscale(const Upscale& up);
+
+// DLSS 5 (the bb-dlss5 branch, BB_DLSS5): its code calls this with its state; until it does the
+// panel reads BB_DLSS5 itself and shows "no disponible" when it is asked for (this engine has no
+// DLSS 5 yet). state: 0 off, 1 active, 2 asked but not running; detail: shown after it (may be null).
+void SetDlss5State(int state, const char* detail);
+
+struct Snapshot {
+    // The game's frames, last 1 s window (as the [fps] line); key moves with each new window.
+    double mean_ms = 0, max_ms = 0;
+    uint64_t key = 0;
+    double window_age_s = 1e9; // seconds since the last window closed
+    // Frame generation's last real / shown line ([dlssg] / [fsr3] / [fsr3-mfg]) and multiplier.
+    double fg_real = 0, fg_shown = 0, fg_age_s = 1e9;
+    int fg_mult = 0;
+    // [lat] (BB_LATENCY=1, bb_antilag.cpp): total (input->present + scanout + fg hold) mean / p95.
+    double lat_mean = 0, lat_p95 = 0, lat_age_s = 1e9;
+    std::string lat_mode; // "reflex-sl", "antilag2", "reflex", "limiter", "lowlat", "off"
+    // Our own input (scePadRead) -> present, the last window (when [lat] is off).
+    double own_lat_mean = 0, own_lat_p95 = 0;
+    Upscale up;
+    bool has_up = false;
+    int dlss5_state = -1; // -1: never set by a DLSS 5 back end
+    std::string dlss5_detail;
+};
+Snapshot Get();
 } // namespace BB::Metrics

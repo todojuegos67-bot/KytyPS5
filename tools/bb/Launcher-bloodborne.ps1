@@ -548,7 +548,8 @@ function Get-BbEnv {
 	foreach ($q in $script:quality) { $e[$q[3]] = "$($script:S[$q[0]])" }
 	$e['BB_INPUT'] = $(if ($script:S.input -eq '1') { 'kbm' } else { 'pad' })
 	if ($script:S.ram16 -eq '1') { $e['BB_LOWRAM'] = '1' }
-	if ($script:S.metricas -eq '1') { $e['BB_METRICS'] = '1'; $e['BB_METRICS_OUT'] = (Join-Path $root 'logs\bb-fps.log') }  # el emulador propio escribira ahi [fps]/[lat]
+	if ($script:S.metricas -eq '1') { $e['BB_METRICS'] = '1'; $e['BB_LATENCY'] = '1'; $e['BB_METRICS_OUT'] = (Join-Path $root 'logs\bb-fps.log') }  # (bb-metrics-043) panel F8 dentro del juego, como Demon's Souls; BB_LATENCY: su fila Latencia
+	  # el emulador propio escribira ahi [fps]/[lat]
 	# (medir) Gancho de medicion como en Demon's Souls: con medir.on junto al lanzador, el emulador propio leera
 	# ordenes de BB_LIVE_FILE y muestreara a BB_PROF_HZ.
 	if (Test-Path -LiteralPath (Join-Path $root 'medir.on')) { $e['BB_LIVE_FILE'] = (Join-Path $root 'medir-cmd.txt'); $e['BB_PROF_HZ'] = '1000' }
@@ -722,6 +723,8 @@ function Start-Game {
 function Start-Metrics($p, [string]$userDir) {
 	if ($p) { $script:gameProc = $p }
 	if ($script:S.metricas -ne '1' -or -not $p) { return }
+	# (bb-metrics-043) Fuera del modo seguro las metricas van dentro del juego (F8, el panel de Demon's Souls): sin ventana aparte.
+	if ($script:S.safemode -eq '0') { Write-Log 'Metricas: panel dentro del juego (F8)'; return }
 	$met = Join-Path $root 'metricas-bb.ps1'
 	if (-not (Test-Path -LiteralPath $met)) { Write-Log 'Metricas: falta metricas-bb.ps1 junto al lanzador'; return }
 	$a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $met + '"'), '-ProcessId', "$($p.Id)", '-UserDir', ('"' + $userDir + '"'), '-LauncherIni', ('"' + $iniFile + '"'), '-FpsFile', ('"' + (Join-Path $root 'logs\bb-fps.log') + '"'))

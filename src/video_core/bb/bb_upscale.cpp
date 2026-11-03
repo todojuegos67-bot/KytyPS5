@@ -2432,6 +2432,20 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_stats = {};
     }
 
+    if (BB::Metrics::PanelShown()) { // (bb-metrics-043) the in-game panel's Escala / Resol.
+        const auto& mc = Cfg();
+        const bool up = Active() && f.injected;
+        BB::Metrics::Upscale u;
+        u.kind = static_cast<int>(mc.kind);
+        u.quality = static_cast<int>(mc.quality);
+        u.running = up;
+        u.scene = g_learned.render_w != 0;
+        u.render_w = up ? g_plan.render_w : (g_learned.render_w != 0 ? g_learned.render_w : g_output_w);
+        u.render_h = up ? g_plan.render_h : (g_learned.render_h != 0 ? g_learned.render_h : g_output_h);
+        u.output_w = up ? g_plan.output_w : g_output_w;
+        u.output_h = up ? g_plan.output_h : g_output_h;
+        BB::Metrics::SetUpscale(u);
+    }
     if (BB::Metrics::Enabled()) {
         const auto& mc = Cfg();
         if (Active() && f.injected) {
