@@ -903,6 +903,16 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	return create(nullptr, info);
 }
 
+// Graphics pipelines without the guest's pixel shader get an empty fragment shader (CreatePipelineInternal); off with
+// KYTY_EMPTY_FS=0.
+static bool EmptyFragmentShaderEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EMPTY_FS");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return enabled;
+}
+
 // KYTY_PS_WAVE64=1 (a test for issue #24: AMD's 26.9.2 driver runs pixel shaders on 32-lane subgroups, 26.9.1 on 64, and
 // the mosaics on see-through effects came back with it): pixel shaders on 64-lane subgroups, where the GPU lets a
 // pipeline require that; the log says which.
@@ -1010,8 +1020,34 @@ void CreatePipelineInternal(
 		shader_stages[shader_stage_count++] = tess_control_shader_stage_info;
 		shader_stages[shader_stage_count++] = tess_eval_shader_stage_info;
 	}
+	vk::PipelineShaderStageCreateInfo empty_frag_stage_info {};
 	if (ps_active) {
 		shader_stages[shader_stage_count++] = frag_shader_stage_info;
+	} else if (EmptyFragmentShaderEnabled()) {
+		// A pipeline without the guest's pixel shader gets an empty one: NVIDIA drains the pipe between consecutive draws
+		// whose pipelines differ in having a fragment stage, as a depth-only draw beside a shaded one does (a
+		// stencil-volume or alpha-tested depth pass: ~0.6 ms a frame at the 1-1 stone arch). An empty main with no
+		// inputs, no outputs and early fragment tests changes no output and keeps the depth and stencil work ahead of its
+		// invocations, as a pipeline without a fragment stage has it. (The create info's stages key the pipeline: the
+		// pipelines it changes are made again once, nothing else.)
+		static const vk::ShaderModule empty = [&] {
+			static const uint32_t code[] = {
+			    0x07230203, 0x00010000, 0x00070000, 0x00000005, 0x00000000, 0x00020011, 0x00000001, 0x0003000e,
+			    0x00000000, 0x00000001, 0x0005000f, 0x00000004, 0x00000001, 0x6e69616d, 0x00000000, 0x00030010,
+			    0x00000001, 0x00000007, 0x00030010, 0x00000001, 0x00000009, 0x00020013, 0x00000002, 0x00030021,
+			    0x00000003, 0x00000002, 0x00050036, 0x00000002, 0x00000001, 0x00000000, 0x00000003, 0x000200f8,
+			    0x00000004, 0x000100fd, 0x00010038};
+			vk::ShaderModuleCreateInfo info {};
+			info.codeSize = sizeof(code);
+			info.pCode    = code;
+			vk::ShaderModule module;
+			EXIT_IF(graphics.device.createShaderModule(&info, nullptr, &module) != vk::Result::eSuccess);
+			return module;
+		}();
+		empty_frag_stage_info.stage         = vk::ShaderStageFlagBits::eFragment;
+		empty_frag_stage_info.module        = empty;
+		empty_frag_stage_info.pName         = "main";
+		shader_stages[shader_stage_count++] = empty_frag_stage_info;
 	}
 
 	vk::VertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX] {};
