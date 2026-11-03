@@ -43,12 +43,13 @@ bool Scan(uint vec) {
         return true;
     }
     for (uint component = 0u; component < 4u; ++component) {
-        uint word = words[component];
-        if (word == 0u) {
+        if (words[component] == 0u) {
             continue;
         }
         const uint index = vec * 4u + component;
-        fault_buffer[index] = 0u;
+        // Taken and cleared in one step: a bit a shader sets after the read above (on another queue, or a submission
+        // not ordered before this one) stays set for the next processing instead of being cleared unreported.
+        uint word = atomicExchange(fault_buffer[index], 0u);
         const uint base_bit = index * 32u;
         while (word != 0u) {
             const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
