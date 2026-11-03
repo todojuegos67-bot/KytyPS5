@@ -144,7 +144,7 @@ at the render height and stretching to 4K. The launcher keeps a render height fo
 at 1080, DLSS's Performance (on an RTX 5090 about the frame rate of the game's own TAA at 1440, with a
 sharper picture); 1440 is its Quality, 1512 the PS5 Pro's own 2688x1512, 2160 DLAA. NVIDIA RTX only, with
 NVIDIA's Streamline runtime as for frame generation below: on a PC without an NVIDIA RTX graphics card (AMD,
-Intel, GeForce GTX) the launcher offers no DLSS. "FSR 3 (PS5 Pro path)" does the same with AMD's FSR 3 in place of
+Intel, GeForce GTX) the launcher offers no DLSS. "AMD FSR (PS5 Pro path)" does the same with AMD's FSR 3 in place of
 DLSS, on any graphics card, AMD and Intel included: it is built into the emulator, nothing to download
 (`run.cmd -Upscaler fsr`; on an RTX 5090 at Boletaria's start 75.8 fps from 1080 to 4K, a picture close to DLSS's).
 The render heights show their mode as with DLSS (FSR's "Native AA" at the output's own size). The in-game
