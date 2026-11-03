@@ -4,6 +4,7 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1404,6 +1405,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
+		if (Scout::Running()) Scout::NoteHostWrite(reinterpret_cast<uint64_t>(dst), buffer_size); // (KYTY_SCOUT: every emulator write)
 	}
 
 	return 4;

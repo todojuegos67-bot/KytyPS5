@@ -374,6 +374,8 @@ void RenderExecutor::TableSweepPairs() {
 			auto& pair = item.second;
 			// (A translation or compile it waits for keeps it.)
 			if (pair.used_frame + TableXpr::PairKeepFrames >= frame || pair.waiting) return false;
+			// (KYTY_SCOUT: its view retired too, as TableReset does: else it stays in the directory, its slot lost to others.)
+			if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
 			for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
 			return true;
 		});

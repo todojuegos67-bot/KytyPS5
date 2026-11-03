@@ -1339,6 +1339,7 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	std::memset(dst, 0, size);
 	const uint32_t ready = 1;
 	std::memcpy(dst, &ready, sizeof(ready));
+	if (Scout::Running()) Scout::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size); // (KYTY_SCOUT: every emulator write)
 	for (uint32_t i = 0; i < 256; ++i) {
 		const uint64_t entry = (uint64_t(words[i * 4] & 15u) << 56u) |
 		    (uint64_t(std::min(words[i * 4 + 1], 0xffffffu)) << 32u) | words[i * 4 + 1];
