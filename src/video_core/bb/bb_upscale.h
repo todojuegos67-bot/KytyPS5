@@ -161,6 +161,11 @@ void SetPresentSize(u32 width, u32 height); // the presenter's frame size, every
 // CurrentPlan() then describes it and `flip` is the presented image's address.
 bool WantPresentUpscale(VAddr& flip);
 void OnPresentUpscaled(bool ok);
+// 0.39 (BB_FG_NATIVE, default on): frame generation asked with no upscaler. The module runs its
+// native mode: the window-size path's plan (render size = output size) only feeds frame
+// generation its depth, motion vectors and camera; no upscaler, the presented image untouched.
+bool FgNative();
+void OnFgNativeAnalyzed(bool ok); // instead of OnPresentUpscaled in that mode
 // No HUD point this frame although the scene was drawn: true once (at the flip), and the presenter
 // then runs the window-size upscale on the finished image (CurrentPlan()).
 bool TakeLateUpscale();

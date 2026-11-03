@@ -117,6 +117,24 @@ const char* Env(const char* name) {
 // evaluation) run with this file present; a crash leaves it behind and the next start runs native.
 constexpr const char* GuardFile = "bb_upscale_guard.txt";
 std::string g_guard_skipped;
+// 0.39: BB_FG_NATIVE (default 1): frame generation asked (BB_FG=amd-* / dlss-*) with no upscaler
+// (BB_UPSCALER empty, off or native): the module runs in its native mode, with the scene analysis
+// (G-buffer depth, camera, motion vectors incl. object vectors, the HUD-less copy) feeding frame
+// generation only. No upscaler is loaded or dispatched and the presented image is not touched.
+bool g_fg_native = false;
+bool FgNativeWanted() {
+    const char* sw = std::getenv("BB_FG_NATIVE");
+    if (sw != nullptr && sw[0] == '0') {
+        return false;
+    }
+    const char* fg = std::getenv("BB_FG");
+    if (fg == nullptr) {
+        return false;
+    }
+    std::string v = fg;
+    for (auto& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return v.starts_with("amd") || v.starts_with("fsr") || v.starts_with("dlss");
+}
 
 void GuardBegin(const char* kind, const char* step) {
     if (std::FILE* f = std::fopen(GuardFile, "w")) {
@@ -144,6 +162,10 @@ Config ParseConfig() {
         c.kind = SR::Kind::Fsr4;
     } else if (up == "native") {
         c.kind = SR::Kind::Native;
+    }
+    if ((c.kind == SR::Kind::Off || c.kind == SR::Kind::Native) && FgNativeWanted()) {
+        c.kind = SR::Kind::Native; // analysis only, for frame generation (g_fg_native)
+        g_fg_native = true;
     }
     if (c.kind != SR::Kind::Off && c.kind != SR::Kind::Native) {
         if (std::FILE* f = std::fopen(GuardFile, "r")) {
@@ -359,6 +381,7 @@ struct Candidate {
 
 // ---- State ----
 struct FrameState {
+    bool fg_native_done = false; // 0.39: the FG-only analysis ran (or was tried) this frame
     // G-buffer
     VAddr gb_depth = 0;
     u32 gb_w = 0, gb_h = 0, gb_mrt = 0;
@@ -397,6 +420,7 @@ struct Learned {
     bool have_prev_vp = false;
     Mat prev_vp;
     bool last_injected = false;
+    bool last_fg_native = false; // 0.39: the previous frame had FG-only (native) inputs
 };
 
 struct Stats {
@@ -863,6 +887,10 @@ bool Enabled() {
     return Cfg().kind != SR::Kind::Off;
 }
 
+bool FgNative() {
+    return Cfg().kind == SR::Kind::Native && g_fg_native;
+}
+
 void PreInstance() {
     static bool done = false;
     if (done) {
@@ -890,6 +918,13 @@ void PreInstance() {
              c.mv_reconstruct ? "reconstructed from depth + camera" : "zero",
              c.force_mode == 1 ? "scene" : c.force_mode == 2 ? "composite" : "auto",
              c.hudless_copy ? "on" : "off");
+    if (FgNative()) {
+        Checkpoint(fmt::format(
+            "frame generation runs WITHOUT an upscaler (BB_FG={}, BB_UPSCALER={}, BB_FG_NATIVE "
+            "on): native image, depth + camera + motion vectors built for frame generation only "
+            "(BB_FG_NATIVE=0: the old behaviour, no inputs without an upscaler)",
+            Env("BB_FG") ? Env("BB_FG") : "", Env("BB_UPSCALER") ? Env("BB_UPSCALER") : "none"));
+    }
     if (c.kind != SR::Kind::Off && c.kind != SR::Kind::Native) {
         GuardBegin(SR::KindName(c.kind), "loading the upscaler and creating the Vulkan device");
     }
@@ -1493,7 +1528,7 @@ u64 g_diag_asked = 0, g_diag_inactive = 0, g_diag_noscene = 0, g_diag_calls = 0,
 bool WantCameraScan(bool vertex) {
     g_scan_vertex = vertex;
     ++g_diag_asked;
-    if ((!Active() && !AnalyzeOn()) || !Cfg().mv_reconstruct) {
+    if ((!Active() && !AnalyzeOn() && !FgNative()) || !Cfg().mv_reconstruct) {
         ++g_diag_inactive;
         return false;
     }
@@ -1743,8 +1778,9 @@ bool WantPresentUpscale(VAddr& flip) {
     }
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
+    const bool fgn = FgNative();
     if (!g_draw.valid || g_draw.compute || !g_draw.targets_flip || f.injected ||
-        f.inject_failed || !PresentMode()) {
+        f.inject_failed || f.fg_native_done || !(fgn ? !g_present_dead : PresentMode())) {
         return false;
     }
     // After the scene and its last read by the post-processing; the draw into the presented image
@@ -1782,6 +1818,12 @@ void FillPresentPlan(VAddr flip, const char* where) {
     p.output_h = g_present_h;
     p.hdr = false; // the post-processed (tonemapped) image
     p.reset = !g_learned.last_injected;
+    if (FgNative()) {
+        // 0.39: frame generation without an upscaler: inputs only, at the game's own size.
+        p.output_w = p.render_w;
+        p.output_h = p.render_h;
+        p.reset = !g_learned.last_fg_native;
+    }
     p.delta_ms = g_delta_ms;
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
@@ -1799,6 +1841,17 @@ void FillPresentPlan(VAddr flip, const char* where) {
         where, flip, p.render_w, p.render_h, p.depth_addr, p.output_w, p.output_h,
         p.camera_valid ? "reconstructed (camera found)" : "zero (no camera)",
         p.depth_inverted ? "inverted" : "forward"));
+    if (FgNative()) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Checkpoint(fmt::format("frame generation WITHOUT an upscaler (BB_FG_NATIVE): first "
+                                   "3D inputs {}x{} {}, camera {}, nothing upscaled or resampled",
+                                   p.render_w, p.render_h, where,
+                                   p.camera_valid ? "found" : "not found"));
+        }
+        return;
+    }
     static bool first = true;
     if (first) {
         first = false;
@@ -1889,6 +1942,21 @@ void OnPresentUpscaled(bool ok) {
     }
     g_frame.inject_failed = true;
     PresentFailedLocked("the window-size upscale before the HUD failed");
+}
+
+void OnFgNativeAnalyzed(bool ok) {
+    std::scoped_lock lk{g_mutex};
+    g_frame.fg_native_done = true; // once per frame either way; nothing else changes
+    if (ok) {
+        return;
+    }
+    static u32 fails = 0;
+    if (fails++ % 600 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "[BB_UPSCALE] frame generation without an upscaler: no inputs this frame "
+                    "({} so far)",
+                    fails);
+    }
 }
 
 void OnPresentFailed(std::string_view why) {
@@ -2121,6 +2189,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     }
     const bool prev_injected = g_learned.last_injected;
     g_learned.last_injected = f.injected;
+    const bool prev_fg_native = g_learned.last_fg_native;
+    g_learned.last_fg_native = f.fg_native_done;
     // The scene was drawn but no HUD point was found (no HUD this frame, e.g. a cut scene): the
     // presenter upscales the finished image instead (TakeLateUpscale).
     g_late_upscale = false;
@@ -2131,6 +2201,15 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_late_upscale = true;
         f.injected = true;
         g_learned.last_injected = true;
+    } else if (FgNative() && !g_present_dead && !f.fg_native_done && !f.injected &&
+               !f.inject_failed && f.gb_depth != 0 && f.gb_w == width && f.gb_h == height &&
+               f.qual_samples > SkipNeeded()) {
+        // 0.39: no HUD point this frame: the FG-only analysis on the finished image at present.
+        g_learned.last_fg_native = prev_fg_native;
+        FillPresentPlan(addr, "at present (no HUD draw found this frame)");
+        g_late_upscale = true;
+        f.fg_native_done = true;
+        g_learned.last_fg_native = true;
     }
     {
         auto& n = g_not3d;

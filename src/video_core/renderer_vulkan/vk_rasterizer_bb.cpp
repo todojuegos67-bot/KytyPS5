@@ -119,6 +119,10 @@ struct BBVk {
     bool fg_present_ready = false;
     bool fg_raw_hudless_ready = false; // BBHudlessCopy ran this frame (the in-place path)
     OwnImage fg_hudless_view_copy; // that copy in the presenter's view format (raw bytes)
+    // 0.39 (BB_FG_NATIVE): frame generation with no upscaler: the presented image before its HUD
+    // (raw copy, its own format): the motion-vector pass's colour input and FG's HUD-less image.
+    OwnImage fgn_src;
+    bool fgn_ready = false;
     // BB_HUD_DIAG: the presented image's address once its HUD-less copy is taken, frames seen.
     VAddr hud_flip = 0;
     u64 hud_frames = 0, hud_logged_frame = 0;
@@ -1183,7 +1187,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
 
 bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view,
                                  vk::Format color_format, vk::ImageUsageFlags color_usage,
-                                 bool late) {
+                                 bool late, bool mv_only) {
     const auto& plan = BB::Upscale::CurrentPlan();
     PollCheck(scheduler);
     if (!bb_gb_depth_valid) {
@@ -1211,9 +1215,9 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         !EnsureImage(g_bb.reactive, render, vk::Format::eR8Unorm, storage) ||
         !EnsureImage(g_bb.lum[0], render, vk::Format::eR16Sfloat, storage) ||
         !EnsureImage(g_bb.lum[1], render, vk::Format::eR16Sfloat, storage) ||
-        !EnsureImage(g_bb.output, output, vk::Format::eR16G16B16A16Sfloat,
+        (!mv_only && !EnsureImage(g_bb.output, output, vk::Format::eR16G16B16A16Sfloat,
                      storage | vk::ImageUsageFlagBits::eTransferSrc |
-                         vk::ImageUsageFlagBits::eTransferDst)) {
+                         vk::ImageUsageFlagBits::eTransferDst))) {
         LOG_ERROR(Render_Vulkan, "[BB_UPSCALE] the upscaler's images were not created");
         return false;
     }
@@ -1232,7 +1236,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     }
 
     const u32 slot = g_bb.query_slot;
-    const bool timed = g_bb.queries && !g_bb.query_pending[slot];
+    const bool timed = !mv_only && g_bb.queries && !g_bb.query_pending[slot];
     if (timed) {
         cmd.resetQueryPool(g_bb.queries, slot * 2, 2);
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, g_bb.queries, slot * 2);
@@ -1337,6 +1341,12 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
             vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader,
             vk::AccessFlagBits2::eShaderRead);
     g_bb.lum_index ^= 1;
+    if (mv_only) {
+        // 0.39 (BB_FG_NATIVE): frame generation's inputs only; no upscaler, no output written.
+        g_bb.fg_upscaled = true;
+        g_bb.fg_plan = plan;
+        return true;
+    }
     Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
             vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader,
             vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead);
@@ -2057,12 +2067,60 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
     g_bb.lut_ready = true;
 }
 
+// 0.39 (BB_FG_NATIVE): frame generation with no upscaler. At the window-size path's point (before
+// the first HUD draw, or at present when no HUD was drawn), with render size = output size: the
+// presented image copied raw (it is not changed), then the motion-vector pass (camera + object
+// vectors) over the G-buffer depth, as BBRecordUpscale does, but no upscaler and no output.
+bool Rasterizer::BBFgNativeAnalyze(VideoCore::Image& flip, bool late) {
+    const auto& plan = BB::Upscale::CurrentPlan();
+    g_bb.fgn_ready = false;
+    if (!InitOnce(instance)) {
+        return false;
+    }
+    if (flip.info.size.width != plan.render_w || flip.info.size.height != plan.render_h) {
+        return false;
+    }
+    const vk::Extent2D extent{flip.info.size.width, flip.info.size.height};
+    if (!EnsureImage(g_bb.fgn_src, extent, flip.info.pixel_format,
+                     vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
+                         vk::ImageUsageFlagBits::eSampled)) {
+        return false;
+    }
+    scheduler.EndRendering();
+    runtime.Transit(&flip, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    const auto cmd = scheduler.CommandBuffer();
+    Barrier(cmd, g_bb.fgn_src, vk::ImageLayout::eTransferDstOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    cmd.copyImage(flip.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.fgn_src.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {extent.width, extent.height, 1},
+                  });
+    Barrier(cmd, g_bb.fgn_src, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    if (!BBRecordUpscale(g_bb.fgn_src.image, g_bb.fgn_src.view, g_bb.fgn_src.format,
+                         g_bb.fgn_src.usage, late, true)) {
+        return false;
+    }
+    g_bb.fgn_ready = true;
+    return true;
+}
+
 bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                                    vk::ImageView& hudless_view, vk::Format view_format) {
     out = {};
     hudless_view = vk::ImageView{};
     const bool hudless_ready = g_bb.fg_present_ready;
     const bool raw_ready = g_bb.fg_raw_hudless_ready;
+    const bool fgn_ready = g_bb.fgn_ready;
+    g_bb.fgn_ready = false;
     g_bb.fg_present_ready = false;
     g_bb.fg_raw_hudless_ready = false;
     // 0.36: per-reason counts of flips with no frame-generation inputs, about once a second.
@@ -2158,6 +2216,30 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
         // The window-size path: the upscaled image with no HUD added (bb_hud.comp flag 4).
         hudless_view = g_bb.fg_present.view;
         out.hudless_source = "upscaled image before the HUD";
+    } else if (fgn_ready && g_bb.fgn_src.image &&
+               EnsureImage(g_bb.fg_hudless_view_copy, g_bb.fgn_src.extent, view_format,
+                           vk::ImageUsageFlagBits::eTransferDst |
+                               vk::ImageUsageFlagBits::eSampled)) {
+        // 0.39 (BB_FG_NATIVE): no upscaler: the presented image before its HUD, its raw bytes in
+        // the presenter's view format (as the presented image itself is read).
+        Barrier(cmd, g_bb.fgn_src, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        Barrier(cmd, g_bb.fg_hudless_view_copy, vk::ImageLayout::eTransferDstOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+        cmd.copyImage(g_bb.fgn_src.image, vk::ImageLayout::eTransferSrcOptimal,
+                      g_bb.fg_hudless_view_copy.image, vk::ImageLayout::eTransferDstOptimal,
+                      vk::ImageCopy{
+                          .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                          .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                          .extent = {g_bb.fgn_src.extent.width, g_bb.fgn_src.extent.height, 1},
+                      });
+        Barrier(cmd, g_bb.fg_hudless_view_copy, vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+        hudless_view = g_bb.fg_hudless_view_copy.view;
+        out.hudless_source = "presented image before its HUD (no upscaler)";
     } else if (g_bb.lut_ready &&
                EnsureImage(g_bb.fg_hudless_view_copy, g_bb.lut_out.extent, view_format,
                            vk::ImageUsageFlagBits::eTransferDst |

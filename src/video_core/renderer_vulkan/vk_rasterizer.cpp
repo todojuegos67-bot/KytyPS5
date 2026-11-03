@@ -1175,11 +1175,17 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         for (u32 cb = 0; cb < bb_num_cb && cb < cb_descs.size(); ++cb) {
             if (cb_descs[cb].image_id &&
                 texture_cache.GetImage(cb_descs[cb].image_id).info.guest_address == bb_flip) {
-                ok = BBPresentUpscale(texture_cache.GetImage(cb_descs[cb].image_id));
+                ok = BB::Upscale::FgNative()
+                         ? BBFgNativeAnalyze(texture_cache.GetImage(cb_descs[cb].image_id))
+                         : BBPresentUpscale(texture_cache.GetImage(cb_descs[cb].image_id));
                 break;
             }
         }
-        BB::Upscale::OnPresentUpscaled(ok);
+        if (BB::Upscale::FgNative()) {
+            BB::Upscale::OnFgNativeAnalyzed(ok);
+        } else {
+            BB::Upscale::OnPresentUpscaled(ok);
+        }
     }
     if (BB::Upscale::Enabled() && BB::Upscale::WantHudlessCopy() && cb_descs[0].image_id) {
         BBHudlessCopy(texture_cache.GetImage(cb_descs[0].image_id));
