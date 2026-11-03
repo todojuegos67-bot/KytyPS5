@@ -3193,6 +3193,15 @@ void DrawLauncher(float width, float height) {
 		fg->AddText(f, size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 170), text);
 		fg->AddText(f, size, {at.x + 1.5f, at.y + 1.5f}, IM_COL32(0, 0, 0, 90), text);
 		fg->AddText(f, size, at, IM_COL32(236, 226, 204, 200), text);
+		// (ds-pc-port52) The F1 hint just below it, same style, a little smaller: F1 switches the launcher between full
+		// screen borderless and a normal window (RunStartMenu).
+		const float  hsize = std::max(11.0f, std::round(U(12)));
+		const char*  hint  = I18n::T("F1 modo ventana");
+		const ImVec2 hs    = f->CalcTextSizeA(hsize, FLT_MAX, 0.0f, hint);
+		const ImVec2 hat   = {std::floor(width - margin - hs.x), std::floor(at.y + ts.y + U(2))};
+		fg->AddText(f, hsize, {hat.x + 1, hat.y + 1}, IM_COL32(0, 0, 0, 170), hint);
+		fg->AddText(f, hsize, {hat.x + 1.5f, hat.y + 1.5f}, IM_COL32(0, 0, 0, 90), hint);
+		fg->AddText(f, hsize, hat, IM_COL32(236, 226, 204, 200), hint);
 	}
 
 	auto& io = ImGui::GetIO();
@@ -5266,6 +5275,38 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		while (SDL_PollEvent(&e) == 1) {
 			ImGui_ImplSDL2_ProcessEvent(&e);
 			if (e.type == SDL_QUIT) g_start_result = -1;
+			// (ds-pc-port52) F1 in the launcher (not the Configurador, not while a key binding waits): full screen borderless
+			// <-> a normal window with a title bar (moved, minimized and resized as any). The game's F1 menu is OnEvent's.
+			if (!g_config_mode && e.type == SDL_KEYDOWN && e.key.repeat == 0 && e.key.keysym.sym == SDLK_F1 && !g_kbm_capture.load()) {
+				static bool windowed = false;
+				windowed             = !windowed;
+				SDL_Rect desk {}, usable {};
+				const bool has_desk = SDL_GetDisplayBounds(0, &desk) == 0 && desk.w > 0 && desk.h > 0;
+				if (windowed) {
+					int w = 1600, h = 900;
+					if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.w > 0 && usable.h > 0) {
+						const float k = std::min({1.0f, usable.w * 0.85f / w, usable.h * 0.85f / h});
+						w             = static_cast<int>(w * k);
+						h             = static_cast<int>(h * k);
+					}
+					SDL_SetWindowBordered(window, SDL_TRUE);
+					SDL_SetWindowResizable(window, SDL_TRUE);
+					SDL_SetWindowSize(window, w, h);
+					SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+				} else {
+					SDL_RestoreWindow(window); // (from maximized or minimized)
+					SDL_SetWindowResizable(window, SDL_FALSE);
+					SDL_SetWindowBordered(window, SDL_FALSE);
+					if (has_desk) {
+						SDL_SetWindowPosition(window, desk.x, desk.y);
+						SDL_SetWindowSize(window, desk.w, desk.h);
+					}
+				}
+				SDL_RaiseWindow(window);
+				std::printf("[port] launcher: F1 -> %s\n", windowed ? "windowed" : "full screen borderless");
+				std::fflush(stdout);
+				continue;
+			}
 			if (g_config_mode && e.type == SDL_KEYDOWN && e.key.repeat == 0) {
 				if (e.key.keysym.sym == SDLK_q || e.key.keysym.sym == SDLK_PAGEUP) Queue({Input::Tab, -1});
 				if (e.key.keysym.sym == SDLK_e || e.key.keysym.sym == SDLK_PAGEDOWN) Queue({Input::Tab, +1});

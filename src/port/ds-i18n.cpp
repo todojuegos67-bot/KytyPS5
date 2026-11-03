@@ -374,6 +374,7 @@ const Row kRows[] = {
 	{{"Trofeo oculto", "Hidden trophy", "Trof\xC3\xA9u oculto", "Troph\xC3\xA9" "e cach\xC3\xA9", "Trofeo nascosto", "Versteckte Troph\xC3\xA4" "e"}},
 	{{"Continuar donde lo dej\xC3\xA9 (F1)", "Continue where I left off (F1)", "Continuar de onde parei (F1)", "Reprendre l\xC3\xA0 o\xC3\xB9 je me suis arr\xC3\xAAt\xC3\xA9 (F1)", "Continua da dove ho lasciato (F1)", "Dort weiterspielen, wo ich aufgeh\xC3\xB6rt habe (F1)"}},
 	{{"Partida guardada con F1 el %s: JUGAR contin\xC3\xBA" "a all\xC3\xAD.", "Game saved with F1 on %s: PLAY continues there.", "Jogo salvo com F1 em %s: JOGAR continua l\xC3\xA1.", "Partie sauvegard\xC3\xA9" "e avec F1 le %s : JOUER reprend l\xC3\xA0.", "Partita salvata con F1 il %s: GIOCA riprende da l\xC3\xAC.", "Mit F1 gespeichert am %s: SPIELEN macht dort weiter."}},
+	{{"F1 modo ventana", "F1 windowed mode", "F1 modo janela", "F1 mode fen\xC3\xAAtr\xC3\xA9", "F1 modalit\xC3\xA0 finestra", "F1 Fenstermodus"}},
 	{{"Ajustes", "Settings", "Configura\xC3\xA7\xC3\xB5" "es", "R\xC3\xA9glages", "Impostazioni", "Einstellungen"}},
 	{{"Controles  v", "Controls  v", "Controles  v", "Commandes  v", "Controlli  v", "Steuerung  v"}},
 	{{"Controles  ^", "Controls  ^", "Controles  ^", "Commandes  ^", "Controlli  ^", "Steuerung  ^"}},
