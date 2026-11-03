@@ -54,6 +54,7 @@ extern volatile std::atomic_uint32_t kyty_local_table_set_proofs;
 extern volatile std::atomic_uint32_t kyty_local_table_mru;
 extern volatile std::atomic<uint32_t> kyty_local_table_gather_memo; // KYTY_TABLE_GATHER_MEMO (local/table-xpr.inc TableGather)
 #endif
+extern volatile std::atomic_uint32_t kyty_local_scout_mode;
 }
 
 inline void InitializePerformanceSwitches() {
@@ -140,6 +141,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_NATIVE_XPR_INSTANCES", &kyty_local_native_xpr_instance_mode},
 	    // Table draws (src/local/table-xpr.inc), with native XPR draws; 2 also continues clean runs.
 	    Switch {"KYTY_TABLE_XPR", &kyty_local_table_xpr_mode, 0, 2},
+	    // The scout thread (graphics/guest_gpu/scout.h, default 1): 0 off, 1 tickets used, 2 verifier (tickets compared).
+	    Switch {"KYTY_SCOUT", &kyty_local_scout_mode, 0, 2},
 	    // Table dispatches (src/local/table-xpr.inc).
 	    Switch {"KYTY_TABLE_DISPATCH", &kyty_local_table_dispatch_mode},
 	    // The table path's gather: a V# unchanged at its index since the last draw keeps its resolved entry (no hash;

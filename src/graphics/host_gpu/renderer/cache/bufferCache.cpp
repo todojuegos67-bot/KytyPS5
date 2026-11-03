@@ -53,6 +53,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -1136,6 +1137,7 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 void BufferCache::WriteBackGpuOwned(uint64_t address, const uint8_t* data, uint64_t size, const char* source) {
 	if (m_memory_tracker.IsRegionFullyGpuModified(address, size)) {
 		LibKernel::Memory::WriteBacking(address, data, size, source);
+		if (Scout::Running()) Scout::NoteHostWrite(address, size, true);
 		return;
 	}
 	uint64_t skipped = 0;
@@ -1148,6 +1150,7 @@ void BufferCache::WriteBackGpuOwned(uint64_t address, const uint8_t* data, uint6
 		}
 		at = next;
 	}
+	if (Scout::Running()) Scout::NoteHostWrite(address, size, true);
 	LiveCounters::Add(LiveCounters::WriteBackSkips, skipped);
 	static std::atomic<uint32_t> logged {0};
 	if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -2691,6 +2694,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		if (Scout::Running()) Scout::NoteHostWrite(vaddr, size);
 		return;
 	}
 
@@ -2760,6 +2764,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			if (m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
 			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
 			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
+				if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
 				return;
 			}
 			// (Memory the backing view does not hold: written through the guest's view, unprotected first.)
@@ -2769,6 +2774,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)
 		m_memory_tracker.NoteHostWrite(address, bytes);
 		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
+		if (Scout::Running()) Scout::NoteHostWrite(address, bytes);
 	};
 	// Which destination pages differ: compared on helper threads too when the copy is large (the 4 MiB copy the culling
 	// chain makes every frame, on the frame's critical path: 0.39 ms on this thread alone, 0.24 ms shared at Latria).
