@@ -19,6 +19,7 @@
 #include "libs/libs.h"
 #include "native-resource-state.h"
 #include "texture-offload.h"
+#include "write-guard.h"
 
 #include <algorithm>
 #include <array>

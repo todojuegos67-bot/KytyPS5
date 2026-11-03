@@ -27,6 +27,7 @@
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "live-census.h"
+#include "write-guard.h"
 #include "live-switch.h"
 #include "draw-state-observer.h"
 #include "frame-capture.h"
@@ -61,6 +62,11 @@ extern "C" {
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode {1};
 // 1: a full barrier with no recorded work since the previous one is skipped.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe {1};
+// 1: a guest memory write of the command processor made while older upload jobs are pending lands at once and is hidden
+// from the game until they are done (local/write-guard.h); 0 (the default): it waits for them. Off by default because
+// each guarded write protects pages of a mapped view and back, and per-page protection churn on the views is behind
+// MEMORY_MANAGEMENT blue screens on small-memory Windows PCs under memory pressure (#5, #50).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_guard_mode {0};
 }
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
@@ -510,11 +516,110 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
+// KYTY_WRITE_GUARD (local/write-guard.h): an execution's command buffers over a guarded page read through the backing
+// view, the same bytes (GNM allocates labels in its command buffers). ProcessPm4 takes each packet from its buffer's
+// span anew, so the switch takes effect between packets.
+static void RebaseGuardedCommands(Pm4Execution* execution) {
+	if (execution == nullptr || WriteGuard::g_count.load(std::memory_order_acquire) == 0) return;
+	execution->RebaseCommands([](std::span<const uint32_t> commands) {
+		const auto* backing = commands.empty() ? nullptr
+		                                       : WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(commands.data()),
+		                                                                    commands.size_bytes());
+		if (backing == nullptr) return commands;
+		return std::span<const uint32_t>(static_cast<const uint32_t*>(backing), commands.size());
+	});
+}
+
+// (KYTY_WRITE_GUARD.) The upload worker, behind the jobs pending at the write: the page's guard lifted.
+static void LiftGuardCall(void* /*context*/, uint64_t page, uint64_t token) {
+	WriteGuard::Lift(page, token);
+}
+
+// (KYTY_WRITE_GUARD.) Today's write-fault path for the page of `address`, on this thread, the guest's value unchanged:
+// a locked add of 0 (an idempotent atomic RMW is compiled to a fenced load, which does not fault on a write-protected
+// page).
+static void TouchForWrite(uint64_t address) {
+	auto* word = reinterpret_cast<uint32_t*>(address & ~uint64_t {3});
+	asm volatile("lock addl $0, %0" : "+m"(*word) : : "memory");
+}
+
+// KYTY_WRITE_GUARD (local/write-guard.h): the write made at once and hidden from the game until the upload jobs pending
+// now are done. False: the caller drains them and writes, as without it (no older job is pending, so there is nothing
+// to hide the write behind; or the form does not apply).
+static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
+	// (The GPU thread's writes only.)
+	if (!WriteGuard::Enabled() || size == 0 || !AsyncUpload::g_used.load(std::memory_order_relaxed) ||
+	    !GuestGpu::IsGpuThread())
+		return false;
+	auto&          worker  = AsyncUpload::Get();
+	const uint64_t address = reinterpret_cast<uint64_t>(dst);
+	if (worker.Pushed() <= worker.Done()) return false;
+	if (Libs::LibKernel::Memory::TryGetBackingPointer(address, size) == nullptr) return false;
+	// The bytes first (the packet's, in guest memory: a fault reading them is served here, not inside the backing
+	// write below, whose mutation the fault's read-back protection would wait for: the first builds hung there at boot).
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(size);
+	std::memcpy(bytes.data(), src, size);
+	if (WriteGuard::g_upload_done == nullptr) WriteGuard::g_upload_done = [] { return AsyncUpload::Get().Done(); };
+	// A pending copy of these bytes takes their old value, as it did with the queue drained before the write.
+	AsyncUpload::DrainRange(address, size);
+	if (worker.Pushed() <= worker.Done()) return false;
+	const uint64_t first = address & ~(WriteGuard::Page - 1), end = address + size;
+	// A page already guarded whose own protection is not writable needs today's write-fault path, which runs the
+	// trackers under their locks and may write the guest view: not under a guard (it would wait for a lift behind
+	// jobs that need those locks). The drain then, as without the guard.
+	{
+		std::shared_lock lock(WriteGuard::g_lock);
+		for (uint64_t page = first; page < end; page += WriteGuard::Page)
+			if (const auto it = WriteGuard::g_pages.find(page); it != WriteGuard::g_pages.end() &&
+			                                                    it->second.saved != Common::VirtualMemory::Mode::ReadWrite &&
+			                                                    it->second.saved != Common::VirtualMemory::Mode::ExecuteReadWrite)
+				return false;
+	}
+	// Today's write-fault path for each page not guarded (the caches' dirty marks, the GPU's bytes read back first, a
+	// fresh granule's first write), as a write through the guest mapping would take it on this thread.
+	for (uint64_t page = first; page < end; page += WriteGuard::Page) {
+		const uint64_t              at      = std::max(page, address);
+		bool                        guarded = false;
+		Common::VirtualMemory::Mode saved   = Common::VirtualMemory::Mode::NoAccess;
+		{
+			std::shared_lock lock(WriteGuard::g_lock);
+			if (const auto it = WriteGuard::g_pages.find(page); it != WriteGuard::g_pages.end()) {
+				guarded = true;
+				saved   = it->second.saved;
+			}
+		}
+		(void)saved;
+		if (!guarded) TouchForWrite(at);
+	}
+	// The guards, the lift jobs behind the pending ones (their guest range [0, 1): over no written byte, so no DrainRange
+	// waits for them), then the bytes through the backing view (the guest mapping of the pages has no access now; a
+	// fault in the write itself waits for a lift already queued).
+	uint64_t token = 0;
+	bool     armed = true;
+	{
+		std::unique_lock lock(WriteGuard::g_lock);
+		token = WriteGuard::NextToken();
+		for (uint64_t page = first; page < end; page += WriteGuard::Page) {
+			armed = WriteGuard::Arm(page, token) && armed;
+		}
+	}
+	for (uint64_t page = first; page < end; page += WriteGuard::Page)
+		(void)worker.PushCall(LiftGuardCall, nullptr, page, token, 0, 1);
+	worker.Kick();
+	const bool written = armed && Libs::LibKernel::Memory::TryWriteBacking(address, bytes.data(), size);
+	// (Not written: the caller's drain waits for the lifts too, then writes through the guest mapping.)
+	if (!written) return false;
+	RebaseGuardedCommands(g_current_execution);
+	return true;
+}
+
 // A guest memory write of the command processor: a label, or data the game or later work reads. The buffer copies
 // recorded before it are made first (KYTY_ASYNC_UPLOAD): the game takes a label as the GPU being done and may rewrite
 // the buffers those copies read at once, and a copy made after that took the new bytes for the earlier draws (issue
 // #196: lit ground and water flickered white; the frame boundary's wait, 5c6f80fa, came after the labels).
 static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
+	if (GuardedWrite(dst, src, size)) return;
 	AsyncUpload::Drain(/*serve=*/true);
 	std::memcpy(dst, src, size);
 }
@@ -544,7 +649,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	BreakComputeChain();
-	const T value = *addr;
+	// (KYTY_WRITE_GUARD: a page a pending guest write guards read through the backing view, the bytes this thread
+	// wrote: a cross-queue label, local/write-guard.h.)
+	const auto* guarded = static_cast<const T*>(WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(addr), sizeof(T)));
+	const T     value   = guarded != nullptr ? *guarded : *addr;
 	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		LiveTrace::Event(LiveTrace::FrontSuspend, reinterpret_cast<uint64_t>(addr),
 		                 (static_cast<uint64_t>(value) << 32u) | static_cast<uint32_t>(ref));
@@ -955,6 +1063,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		execution.m_buffer_stack.push_back({commands});
 	}
+	RebaseGuardedCommands(&execution); // (KYTY_WRITE_GUARD: a resumed execution's too)
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
 
@@ -992,6 +1101,7 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands)
 	auto&      execution  = *g_current_execution;
 	const auto stop_depth = execution.m_buffer_stack.size();
 	execution.m_buffer_stack.push_back({commands});
+	RebaseGuardedCommands(&execution); // (KYTY_WRITE_GUARD: a buffer over a guarded page through the backing view)
 	ProcessPm4(execution, stop_depth);
 }
 

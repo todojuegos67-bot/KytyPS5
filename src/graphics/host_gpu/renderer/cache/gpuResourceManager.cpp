@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
+#include "write-guard.h"
 #include "live-counters.h"
 #include "async-upload.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
@@ -233,6 +234,9 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		// Pending upload jobs on the range read its backing (or change its protection): they finish before
 		// it changes owner. Jobs elsewhere keep running.
 		AsyncUpload::DrainRange(vaddr, size);
+		// Guards of pending guest writes on the range (KYTY_WRITE_GUARD) dropped: a lift after the unmap would protect
+		// whatever is mapped there next (its lift job then finds none).
+		WriteGuard::Drop(vaddr, size);
 		// The GPU only works on the caches' own buffers and images, which are freed after the
 		// work in flight completes (deferred operations), so the unmap need not wait for the GPU
 		// (it used to finish all of it: up to a frame of GPU work, for every guest unmap). What

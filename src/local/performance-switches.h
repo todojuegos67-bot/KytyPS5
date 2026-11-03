@@ -26,6 +26,7 @@ extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
+extern volatile std::atomic_uint32_t kyty_local_write_guard_mode;
 extern volatile std::atomic_uint32_t kyty_local_flush_defer;
 extern volatile std::atomic_uint32_t kyty_local_framegen_sleep;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
@@ -113,6 +114,10 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
+	    // 1: a guest write of the command processor lands at once, hidden from the game until the older upload jobs are
+	    // done (local/write-guard.h); 0, the default: it waits for them (per-page protection churn on the mapped views is
+	    // behind MEMORY_MANAGEMENT blue screens on small-memory Windows PCs, #5, #50).
+	    Switch {"KYTY_WRITE_GUARD", &kyty_local_write_guard_mode},
 	    // Submissions the GPU has still to run for a flush nothing waits on to be deferred (0: never).
 	    Switch {"KYTY_FLUSH_DEFER", &kyty_local_flush_defer, 0, 64},
 	    // DLSS-G frames' Reflex sleep (0: none).

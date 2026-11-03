@@ -11,6 +11,7 @@
 // HS 0x10c-0x12b) and the compute space (0x200+) never dirty it; dispatches,
 // synchronisation, index state and indirect bases never do either.
 #include "graphics/guest_gpu/pm4.h"
+#include "write-guard.h"
 
 #include <array>
 #include <cstdint>
@@ -71,6 +72,10 @@ inline void WriteIndirectBlock(uint32_t space, const uint32_t* packet) {
 	                                                      (uint64_t(packet[2]) << 32u));
 	const uint32_t pairs = packet[4] & 0x3fffu;
 	if (block == nullptr) return;
+	// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view, as the handler
+	// reads it: local/write-guard.h.)
+	if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(block), uint64_t {pairs} * 8u))
+		block = static_cast<const uint32_t*>(backing);
 	for (uint32_t i = 0; i < pairs; ++i) {
 		if (block[2 * i] == 0xffffffffu) continue;
 		WriteRegister(space, block[2 * i], block[2 * i + 1]);
