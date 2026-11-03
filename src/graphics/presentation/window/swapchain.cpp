@@ -1721,7 +1721,7 @@ static bool PresentDirect() {
 		return value != nullptr && value[0] == '1';
 	}();
 	if (!requested) return false;
-	if (FrameGen::UsesFsr() || FsrNative::InterpolationRequested()) {
+	if (Fsr3::Requested()) { // (port: the AMD frame generation of fsr3-fg.cpp)
 		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
 		if (!reported.test_and_set()) {
 			std::printf("Presentation: KYTY_PRESENT_DIRECT off with FSR 3 frame generation (it held the game at half the "
