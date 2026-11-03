@@ -7,19 +7,23 @@
 #include <bit>
 #include <cstdint>
 #include <cstdlib>
+#include "common/logging/log.h"
 
 namespace BB::Texture {
 
 // Texture quality settings for colour samplers. Every value comes from the environment and is
 // read once per process, so a sampler created in this run always matches the others.
 //
-// BB_TEX_QUALITY (launcher "Calidad de texturas"): 0 Bajo, 1 Normal, 2 Alto, 3 Ultra.
+// BB_TEX_QUALITY (launcher "Calidad de texturas"): 0 Bajo, 1 Normal, 2 Alto, 3 Ultra, 4 Ultra bajo.
 //   Sets the mip LOD bias offset and the anisotropy ratio together:
-//     Bajo   LOD +1.0  aniso 1
-//     Normal  0.0      aniso 4
-//     Alto   -0.5      aniso 8
-//     Ultra  -1.0      aniso 16
-//   Unset (or a value other than 0..3): LOD unchanged and aniso left to the game.
+//     Bajo        LOD +1.0  aniso 1
+//     Normal       0.0      aniso 4
+//     Alto        -0.5      aniso 8
+//     Ultra      -1.0      aniso 16
+//     Ultra bajo  +2.0      aniso 1   (one more step below Bajo, same step size as Normal->Bajo;
+//                                      anisotropy is already off at Bajo)
+//   Unset (or a value other than 0..4): LOD unchanged and aniso left to the game.
+//   Values 0..3 keep their meaning, so existing launcher.ini files are unaffected.
 // BB_ANISO: 1, 4, 8 or 16. Explicit anisotropy; wins over the value implied by BB_TEX_QUALITY.
 //   Any other value is ignored.
 //
@@ -32,12 +36,15 @@ struct Settings {
 
 inline const Settings& Get() {
     static const Settings settings = [] {
-        static constexpr std::array<float, 4> lod_bias{1.0f, 0.0f, -0.5f, -1.0f};
-        static constexpr std::array<float, 4> aniso{1.0f, 4.0f, 8.0f, 16.0f};
+        static constexpr std::array<float, 5> lod_bias{1.0f, 0.0f, -0.5f, -1.0f, 2.0f};
+        static constexpr std::array<float, 5> aniso{1.0f, 4.0f, 8.0f, 16.0f, 1.0f};
+        static constexpr std::array<const char*, 5> names{"Bajo", "Normal", "Alto", "Ultra",
+                                                          "Ultra bajo"};
 
         const char* quality_env = std::getenv("BB_TEX_QUALITY");
         const bool quality_set =
-            quality_env != nullptr && quality_env[0] >= '0' && quality_env[0] <= '3';
+            quality_env != nullptr && quality_env[0] >= '0' && quality_env[0] <= '4';
+        // Rows 0..4 map to the table index; the table starts at Bajo (0) and ends at Ultra bajo (4).
         const int row = quality_set ? quality_env[0] - '0' : 1; // Normal
 
         float ratio = quality_set ? aniso[row] : 0.0f;
@@ -48,10 +55,17 @@ inline const Settings& Get() {
             }
         }
 
-        return Settings{
+        const Settings result{
             .lod_bias_offset = quality_set ? lod_bias[row] : 0.0f,
             .aniso = ratio,
         };
+        if (quality_set) {
+            LOG_INFO(Render_Vulkan, "[BB_TEX] Calidad de texturas: {} (BB_TEX_QUALITY={}, LOD bias {:+.1f}, aniso {:.0f}x)",
+                     names[row], row, result.lod_bias_offset, ratio);
+        } else {
+            LOG_INFO(Render_Vulkan, "[BB_TEX] Calidad de texturas: sin BB_TEX_QUALITY (juego por defecto)");
+        }
+        return result;
     }();
     return settings;
 }
