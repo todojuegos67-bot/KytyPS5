@@ -78,7 +78,8 @@ struct State {
     std::unordered_map<u64, u64> palettes; // small skeletons: last palette hash
     // Stats (since the last report).
     u64 st_motion_draws = 0, st_tracked = 0, st_loaded = 0, st_overflow = 0, st_gated = 0,
-        st_frames = 0, st_composed = 0, st_composed_late = 0;
+        st_frames = 0, st_composed = 0, st_composed_late = 0, st_overflow_large = 0;
+    u32 st_overflow_max = 0; // largest dropped draw (positions)
 };
 State g;
 
@@ -130,7 +131,9 @@ bool Init(const Vulkan::Instance& instance) {
     }
     g.device = instance.GetDevice();
     g.allocator = instance.GetAllocator();
-    u32 mi = 2;
+    // 4 Mi positions a half (128 MiB of device memory with both halves). Build 77 at 2 Mi dropped
+    // 59256 of the 99109 draws that needed positions in 1800 frames (60 %) over the budget.
+    u32 mi = 4;
     if (const char* s = std::getenv("BB_OBJMV_VERTICES_MI")) mi = std::clamp(std::atoi(s), 1, 16);
     g.per_half = mi << 20;
     void* mapped = nullptr;
@@ -408,7 +411,11 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
 
     const u32 half = static_cast<u32>(g.frame & 1);
     if (g.cursor + count > g.per_half || g.params_used + 1 >= kParamsPerFrame) {
+        // Dropped draws keep camera motion. Split by palette class, with the largest one, so the
+        // next log shows whether character skeletons are among them.
         ++g.st_overflow;
+        if (palette == Palette::Large) ++g.st_overflow_large;
+        g.st_overflow_max = std::max(g.st_overflow_max, count);
         return;
     }
     const u32 store_base = half * g.per_half + g.cursor;
@@ -492,11 +499,15 @@ void OnFlip() {
         Log(fmt::format("last {} frames: {} G-buffer draws with the motion pipeline, {} tracked "
                         "(skinned / moving), {} with last frame's positions (object vectors), {} "
                         "small skeletons unchanged (camera motion), {} over the budget, composed "
-                        "into the motion vectors {} times ({} after the flip)",
+                        "into the motion vectors {} times ({} after the flip); budget {} positions "
+                        "a half: {} of the over-budget draws were large skeletons, the largest "
+                        "{} positions",
                         g.st_frames, g.st_motion_draws, g.st_tracked, g.st_loaded, g.st_gated,
-                        g.st_overflow, g.st_composed, g.st_composed_late));
+                        g.st_overflow, g.st_composed, g.st_composed_late, g.per_half,
+                        g.st_overflow_large, g.st_overflow_max));
         g.st_frames = g.st_motion_draws = g.st_tracked = g.st_loaded = g.st_gated =
-            g.st_overflow = g.st_composed = g.st_composed_late = 0;
+            g.st_overflow = g.st_composed = g.st_composed_late = g.st_overflow_large = 0;
+        g.st_overflow_max = 0;
     }
 }
 
