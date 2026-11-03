@@ -502,13 +502,14 @@ void GraphicContext::NoteHostPreferredTexture(VmaAllocation allocation, double h
 		              static_cast<uint64_t>(budgets[heap].usage) >> 20u, static_cast<uint64_t>(budgets[heap].budget) >> 20u);
 		heaps += part;
 	}
-	std::printf("Textures in the host-preferred type (from %.2f of the budget, KYTY_TEXTURE_HOST_AT): %" PRIu64 " made, %" PRIu64
+	std::printf("Textures placed past the threshold (from %.2f of the budget, KYTY_TEXTURE_HOST_AT; mode %s): %" PRIu64 " made, %" PRIu64
 	            " MiB, %" PRIu64 " MiB of them in a system-memory heap (memory type %u now); heaps:%s\n",
-	            host_at, images, bytes >> 20u, system_bytes >> 20u, info.memoryType, heaps.c_str());
+	            host_at, std::getenv("KYTY_TEXTURE_HOST_MODE") != nullptr ? std::getenv("KYTY_TEXTURE_HOST_MODE") : "host", images,
+	            bytes >> 20u, system_bytes >> 20u, info.memoryType, heaps.c_str());
 	std::fflush(stdout);
 }
 
-bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image, bool guest_texture) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
@@ -558,13 +559,26 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		if (value != nullptr) std::printf("Textures: host-preferred from %.2f of the budget (KYTY_TEXTURE_HOST_AT=%s)\n", used, value);
 		return used;
 	}();
-	const bool texture = IsTextureUsage(image_info.usage);
+	// KYTY_TEXTURE_HOST_MODE (boot env; default: the above): pd = past the threshold a guest texture may go anywhere but prefers video
+	// memory (requiredFlags 0, preferredFlags DEVICE_LOCAL, no AUTO_PREFER_HOST: VMA, given AUTO_PREFER_HOST and no host access, marks
+	// DEVICE_LOCAL not preferred, vk_mem_alloc.h ~4347, so those textures asked for a type outside video memory up front, the driver never
+	// choosing): system memory only when video memory fails; and the emulator's own images (the presenter's frame, frame generation's
+	// inputs, the HUD source) always video memory, as render targets are.
+	static const bool prefer_device = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_HOST_MODE");
+		const bool  pd    = value != nullptr && std::strcmp(value, "pd") == 0;
+		if (pd) std::printf("Textures: host mode pd (KYTY_TEXTURE_HOST_MODE=pd: guest textures prefer video memory past the threshold, "
+		                    "the emulator's images always video memory)\n");
+		return pd;
+	}();
+	const bool texture = IsTextureUsage(image_info.usage) && (!prefer_device || guest_texture);
 	const bool host_preferred =
 	    texture && small_video_memory &&
 	    static_cast<double>(GetDeviceMemoryUsage()) >= static_cast<double>(GetTotalMemoryBudget()) * host_at;
 	if (host_preferred) {
 		alloc_info.requiredFlags = 0;
-		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		if (prefer_device) alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		else alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
 	vk::Result result = vk::Result::eSuccess;
 	const auto create = [&] {
