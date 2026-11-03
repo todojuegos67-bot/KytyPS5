@@ -5,6 +5,7 @@
 
 #include "native-buffer-residency.h"
 #include "local-platform.h"
+#include "spin-gate.h"
 #include "native-resource-state.h"
 
 #include <array>
@@ -34,6 +35,7 @@ extern volatile std::atomic_uint32_t kyty_local_async_lod_stats_mode;
 extern volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode;
 extern volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode;
 extern volatile std::atomic<uint32_t> kyty_local_pm4_regfile;
+extern volatile std::atomic<uint32_t> kyty_local_upload_lanes;
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
 extern volatile std::atomic_uint32_t kyty_local_deferred_submit_mode;
@@ -94,11 +96,17 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_READBACK_SLOTS", &kyty_local_readback_slots_mode},
 	    // 1: buffer upload copies on the upload worker; 2: image staging copies as well.
 	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode, 0, 2},
+	    // The upload worker spins for new work only while this process's CPUs keep three idle (spin-gate.h);
+	    // 0 always (the DeS port's default), 1 gated (upstream's default), 2 never.
+	    Switch {"KYTY_SPIN_GATE", &kyty_local_spin_gate, 0, 2},
 	    Switch {"KYTY_BUFFER_RECLAIM", &kyty_local_buffer_reclaim_mode},
 	    Switch {"KYTY_UNMAP_PROTECT_SKIP", &kyty_local_unmap_protect_skip_mode},
 	    // The indirect register tables' plain stores without their calls (pm4Handlers.cpp Pm4Regfile; 2 = verify). Read
 	    // once a packet; the descriptors are proven once, at the first packet with it on, whatever the value.
 	    Switch {"KYTY_PM4_REGFILE", &kyty_local_pm4_regfile, 0, 2},
+	    // The upload worker's write protections over two lanes (async-upload.h; 1 one, 2 two, 3 two with the order checks).
+	    // Read once a batch; the second thread, made at the first split, sleeps whatever the value.
+	    Switch {"KYTY_UPLOAD_LANES", &kyty_local_upload_lanes, 1, 3},
 	    Switch {"KYTY_BDA_DIRTY_REGIONS", &kyty_local_bda_dirty_regions_mode},
 	    Switch {"KYTY_GLOBAL_BARRIER_DEDUPE", &kyty_local_global_barrier_dedupe},
 	    Switch {"KYTY_RANGE_SET_FAST", &kyty_local_range_set_fast_mode},
