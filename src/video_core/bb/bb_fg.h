@@ -125,5 +125,11 @@ void SetPresentIndex(uint32_t index);
 // (BB_FG_PACE=guest, default).
 void PaceGuestFlip();
 bool GuestPacing();
+// bb-pace-049 (BB_PACE_FIX, default on; 0: the bb-cap-044 pacer): a late flip released at once
+// and the grid re-phased from it, a high-resolution wait, the [pace] line, BB_FPS_CAP=auto.
+bool PaceFix();
+// The VideoOut present thread presents a flip as it arrives instead of at the next emulated vblank
+// (under the real fps cap with BB_PACE_FIX on; BB_PACE_ARRIVAL=0: at the vblank as before).
+bool PresentOnArrival();
 
 } // namespace BB::FG

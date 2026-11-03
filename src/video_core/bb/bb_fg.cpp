@@ -205,13 +205,20 @@ Config ParseConfig() {
 // every generated frame lands halfway between two evenly spaced real ones. 0: off. Unset: 60 with
 // frame generation on (BB_FG not off), off without. Read once in Cfg().
 static std::atomic<int> g_fps_cap{0};
+// BB_FPS_CAP=auto (bb-pace-049, with BB_PACE_FIX on): starts at 60 and picks the highest of
+// 60 / 50 / 45 / 40 that the game's own frame time holds on >= 97% of the flips (PaceGuestFlip).
+static std::atomic<bool> g_fps_auto{false};
 
 static void InitFpsCap(const Config& c) {
     const char* v = std::getenv("BB_FPS_CAP");
     const bool fg = c.kind != Kind::Off;
     int cap = 0;
     const char* why = "";
-    if (v != nullptr && *v != '\0') {
+    if (v != nullptr && (std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0)) {
+        cap = 60;
+        why = "auto: the highest of 60 / 50 / 45 / 40 held on >= 97% of the flips, from 60";
+        g_fps_auto = true;
+    } else if (v != nullptr && *v != '\0') {
         cap = std::atoi(v);
         if (cap < 0) cap = 0;
         if (cap > 0 && cap < 10) cap = 10;
@@ -232,6 +239,15 @@ static void InitFpsCap(const Config& c) {
     } else {
         BBLogf("real fps cap off (BB_FPS_CAP=%s%s)", v != nullptr ? v : "",
                v == nullptr ? ", unset without frame generation" : "");
+    }
+    if (cap > 0) {
+        BBLogf("[pace] %s", PaceFix()
+                                ? "BB_PACE_FIX on: a late flip released at once and the grid re-phased "
+                                  "from it, high-resolution wait (never past the slot), 1 ms timer "
+                                  "resolution, flips presented as they arrive (not at the emulated "
+                                  "vblank; BB_PACE_ARRIVAL=0: at the vblank), a [pace] line a second"
+                                : "BB_PACE_FIX=0: the bb-cap-044 pacer (a flip late by under a step "
+                                  "keeps its slot, sleep_until, flips taken at the vblank)");
     }
 }
 
@@ -594,6 +610,210 @@ double PaceEffective() {
     return Adapt::g_last.load();
 }
 
+// ---------------------------------------------------------------------------------------------
+// bb-pace-049: the cap's wait and the late-flip rule (BB_PACE_FIX=0: the bb-cap-044 behaviour).
+//
+// The 11-03 run (BB_FG=dlss-x2, BB_FPS_CAP=60, 240 Hz VRR, vblank 240): seconds at real 50-58 fps
+// with present interval sd 1.9-4.0 ms and max 21-46 ms between perfect ones (sd 0.3, max 17.3).
+// The bb-cap-044 grid kept the slot of a flip late by less than a step, so the frame after it got
+// step - late to be ready (16.67 + d, then 16.67 - d: a short frame after a long one, which frame
+// generation shows twice), and a game whose frame took just over 16.67 ms stayed late frame after
+// frame until the lateness passed a whole step; the presents then came out at the game's own pace
+// with the grid's catch-up in it. The wait (sleep_until(deadline - 1 ms), Sleep on Windows, at the
+// timer resolution nothing in the process raised) could also overshoot the deadline. And the
+// present thread takes a flip only at the emulated vblank (240 Hz: every 4.17 ms on its own
+// drifting phase), so a flip released just after a tick waited for the next one: 16.67 + 4.17 =
+// 20.8 ms, the max of most of the bad seconds (20.2-21.7), while seconds with a stable phase show
+// 17.3. Now: a late flip is released at once and the grid re-phased from it (the next one gets a
+// full step); the wait is a high-resolution waitable timer to 1 ms before the deadline, then a
+// spin (never past it); the process timer resolution is 1 ms (timeBeginPeriod, so the vblank
+// timer and the game's own sleeps are not 15.6 ms coarse); the present thread presents a flip as
+// it arrives under the cap (PresentOnArrival); a per-second [pace] line and BB_FPS_CAP=auto.
+// ---------------------------------------------------------------------------------------------
+bool PaceFix() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_PACE_FIX");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+bool PresentOnArrival() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_PACE_ARRIVAL"); // 0: flips taken at the vblank as before
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    (void)Cfg();
+    return on && PaceFix() && GuestPacing() && g_fps_cap.load(std::memory_order_relaxed) > 0;
+}
+
+namespace Pace {
+using Clock = std::chrono::steady_clock;
+
+#if defined(_WIN32)
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+void RaiseTimerResolution() {
+    static const bool done = [] {
+        using Fn = unsigned(__stdcall*)(unsigned);
+        HMODULE winmm = LoadLibraryA("winmm.dll");
+        Fn begin = winmm != nullptr
+                       ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")))
+                       : nullptr;
+        const unsigned r = begin != nullptr ? begin(1) : 1u;
+        Printf("[pace] timer resolution 1 ms for the process (timeBeginPeriod %s)",
+               begin == nullptr ? "not found" : r == 0 ? "ok" : "failed");
+        return true;
+    }();
+    (void)done;
+}
+
+struct Timer {
+    HANDLE handle = nullptr;
+    bool high = false;
+    Timer() {
+        handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                        TIMER_ALL_ACCESS);
+        high = handle != nullptr;
+        if (handle == nullptr) handle = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+    }
+    ~Timer() {
+        if (handle != nullptr) CloseHandle(handle);
+    }
+};
+#endif
+
+std::atomic<int> g_timer_kind{0}; // 1 high-resolution timer, 2 plain timer, 3 sleep_until (log)
+
+// Waits until `deadline`, never past it by our own choice: a high-resolution waitable timer to
+// 1 ms before it (a plain timer or sleep_until: 1.5 ms before), then a spin. Returns how far the
+// timer itself woke past the deadline (0 when it woke in time; the spin cannot undo that).
+double WaitUntil(Clock::time_point deadline) {
+    auto now = Clock::now();
+    if (deadline <= now) return 0.0;
+#if defined(_WIN32)
+    thread_local Timer timer;
+    const auto margin = timer.high ? std::chrono::microseconds(1000) : std::chrono::microseconds(1500);
+    g_timer_kind.store(timer.handle == nullptr ? 3 : timer.high ? 1 : 2, std::memory_order_relaxed);
+    if (deadline - now > margin) {
+        if (timer.handle != nullptr) {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - margin - now).count();
+            LARGE_INTEGER due{};
+            due.QuadPart = -static_cast<LONGLONG>(std::max<long long>(ns / 100, 1));
+            if (SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, FALSE) != 0) {
+                WaitForSingleObject(timer.handle, INFINITE);
+            }
+        } else {
+            std::this_thread::sleep_until(deadline - margin);
+        }
+    }
+#else
+    g_timer_kind.store(3, std::memory_order_relaxed);
+    const auto margin = std::chrono::microseconds(1000);
+    if (deadline - now > margin) std::this_thread::sleep_until(deadline - margin);
+#endif
+    now = Clock::now();
+    const double over = now > deadline ? std::chrono::duration<double, std::milli>(now - deadline).count() : 0.0;
+    while (Clock::now() < deadline) {
+#if defined(_WIN32)
+        YieldProcessor();
+#endif
+        std::this_thread::yield();
+    }
+    return over;
+}
+
+// The per-second line and the auto cap's window (under PaceGuestFlip's mutex).
+struct Stats {
+    Clock::time_point start{};
+    uint32_t flips = 0, missed = 0;
+    double late_sum = 0, late_max = 0, wait_sum = 0, over_max = 0;
+} g_stats;
+
+constexpr int kAutoCaps[] = {60, 50, 45, 40};
+constexpr int kAutoN = 4;
+constexpr int kWindowS = 5; // seconds per decision / recommendation
+struct Window {
+    uint32_t flips = 0;
+    uint32_t held[kAutoN]{}; // flips whose free frame time fits each cap (+0.5 ms)
+    int seconds = 0;
+    Clock::time_point last_tip{};
+} g_window;
+
+void NoteFree(double free_ms) {
+    ++g_window.flips;
+    for (int i = 0; i < kAutoN; ++i) {
+        if (free_ms <= 1000.0 / kAutoCaps[i] + 0.5) ++g_window.held[i];
+    }
+}
+
+void Second(Clock::time_point now, int cap);
+} // namespace Pace
+
+namespace Dlssg {
+void ReflexSleepStats(double* avg_ms, double* max_ms);
+}
+
+void Pace::Second(Clock::time_point now, int cap) {
+    auto& s = g_stats;
+    double rx_avg = 0.0, rx_max = 0.0;
+    Dlssg::ReflexSleepStats(&rx_avg, &rx_max);
+    if (s.flips > 0) {
+        Printf("[pace] missed %u of %u (late by avg %.2f ms, max %.2f), waits avg %.2f ms, "
+               "oversleep max %.2f ms; cap %d (%.3f ms, %s), Reflex sleep avg %.2f ms (max %.1f), "
+               "%s, timer %s",
+               s.missed, s.flips, s.missed ? s.late_sum / s.missed : 0.0, s.late_max,
+               s.wait_sum / s.flips, s.over_max, cap, cap > 0 ? 1000.0 / cap : 0.0,
+               PaceFix() ? (g_fps_auto.load() ? "fix, auto" : "fix") : "bb-cap-044",
+               rx_avg, rx_max, PresentOnArrival() ? "present on arrival" : "present at vblank",
+               !PaceFix() ? "sleep_until"
+               : g_timer_kind.load() == 1 ? "high-res"
+               : g_timer_kind.load() == 2 ? "plain"
+                                          : "sleep_until");
+    }
+    s = Stats{};
+    s.start = now;
+    auto& w = g_window;
+    if (++w.seconds < kWindowS) return;
+    if (w.flips >= 30 && cap > 0) {
+        int cur = -1;
+        for (int i = 0; i < kAutoN; ++i) {
+            if (kAutoCaps[i] == cap) cur = i;
+        }
+        const auto pct = [&](int i) { return 100.0 * w.held[i] / w.flips; };
+        int best = kAutoN - 1;
+        for (int i = 0; i < kAutoN; ++i) {
+            // Up (a higher cap than now) only at >= 99%, so it does not flap; down / stay at 97%.
+            const double need = cur >= 0 && i < cur ? 99.0 : 97.0;
+            if (pct(i) >= need) {
+                best = i;
+                break;
+            }
+        }
+        const double cur_pct = cur >= 0 ? pct(cur) : 100.0; // a cap outside the list: no tip
+        if (g_fps_auto.load() && PaceFix()) {
+            if (kAutoCaps[best] != cap) {
+                Printf("[pace] auto: cap %d -> %d (last %d s: %u flips; the game's own frame held "
+                       "60 %.1f%%, 50 %.1f%%, 45 %.1f%%, 40 %.1f%%)",
+                       cap, kAutoCaps[best], kWindowS, w.flips, pct(0), pct(1), pct(2), pct(3));
+                g_fps_cap = kAutoCaps[best];
+            }
+        } else if (cur >= 0 && cur_pct < 95.0 &&
+                   (w.last_tip == Clock::time_point{} || now - w.last_tip > std::chrono::seconds(30))) {
+            w.last_tip = now;
+            Printf("[pace] recommendation: %.1f%% of the last %d s of flips missed %.2f ms (cap %d); "
+                   "the game's own frame held 60 %.1f%%, 50 %.1f%%, 45 %.1f%%, 40 %.1f%%: "
+                   "BB_FPS_CAP=%d (or BB_FPS_CAP=auto) would keep it even",
+                   100.0 - cur_pct, kWindowS, 1000.0 / cap, cap, pct(0), pct(1), pct(2), pct(3),
+                   kAutoCaps[best]);
+        }
+    }
+    w.flips = 0;
+    w.seconds = 0;
+    for (auto& h : w.held) h = 0;
+}
+
 void PaceGuestFlip() {
     if (!GuestPacing()) return;
     using Clock = std::chrono::steady_clock;
@@ -602,6 +822,10 @@ void PaceGuestFlip() {
     static std::mutex mutex;
     std::unique_lock lock{mutex};
     const auto arrive = Clock::now();
+    const bool fix = PaceFix();
+#if defined(_WIN32)
+    if (fix) Pace::RaiseTimerResolution();
+#endif
     const bool generating = Dlssg::Generating() || Amd::Generating();
     if (generating && Adapt::Enabled() && exited != Clock::time_point{}) {
         const double frame_s = std::chrono::duration<double>(arrive - exited).count();
@@ -619,6 +843,10 @@ void PaceGuestFlip() {
         interval = std::max(interval, Adapt::Mean());
     }
     Adapt::g_last = interval;
+    // The per-second [pace] line (and the auto cap's window).
+    auto& st = Pace::g_stats;
+    if (st.start == Clock::time_point{}) st.start = arrive;
+    if (arrive - st.start >= std::chrono::seconds(1)) Pace::Second(arrive, cap);
     if (interval <= 0.0 || interval > 0.1) {
         next = Clock::time_point{};
         exited = Clock::now();
@@ -626,19 +854,77 @@ void PaceGuestFlip() {
     }
     const auto step =
         std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(interval));
+    // The game's own frame: from the last release to this flip (no wait of ours in it). A pause
+    // (> 100 ms: loading, a menu) is not a frame.
+    const bool timed = exited != Clock::time_point{} && arrive - exited < std::chrono::milliseconds(100);
+    if (timed && (generating || Cfg().kind == Kind::Off)) {
+        Pace::NoteFree(std::chrono::duration<double, std::milli>(arrive - exited).count());
+    }
+    ++st.flips;
     auto now = arrive;
+    if (!fix) {
+        // bb-cap-044.
+        if (next > now) {
+            const auto until = next;
+            lock.unlock();
+            std::this_thread::sleep_until(until - std::chrono::milliseconds(1));
+            const auto woke = Clock::now();
+            while (Clock::now() < until) std::this_thread::yield();
+            lock.lock();
+            st.wait_sum += std::chrono::duration<double, std::milli>(until - now).count();
+            if (woke > until) {
+                st.over_max = std::max(st.over_max, std::chrono::duration<double, std::milli>(woke - until).count());
+            }
+            Amd::NoteSlept(std::chrono::duration<double>(until - now).count());
+            Dlssg::NoteSlept(std::chrono::duration<double>(until - now).count());
+            now = until;
+        } else if (timed && next != Clock::time_point{}) {
+            const double late = std::chrono::duration<double, std::milli>(now - next).count();
+            if (late > 0.5) {
+                ++st.missed;
+                st.late_sum += late;
+                st.late_max = std::max(st.late_max, late);
+            }
+        }
+        // A late flip resets the grid (no burst to catch up).
+        next = std::max(next, now - step) + step;
+        exited = Clock::now();
+        return;
+    }
+    // A flip that reaches its slot waits for it (never longer than the step from the last
+    // release: the slot is at most last release + step). A late one is released at once and the
+    // grid re-phased from it, so the next frame gets a whole step; a flip late by under 0.5 ms
+    // (the spin's and the scheduler's jitter) keeps the grid, so it does not drift.
+    constexpr auto kKeep = std::chrono::microseconds(500);
+    if (next != Clock::time_point{} && exited != Clock::time_point{} && next > exited + step) {
+        next = exited + step; // never a wait longer than target - elapsed
+    }
     if (next > now) {
         const auto until = next;
         lock.unlock();
-        std::this_thread::sleep_until(until - std::chrono::milliseconds(1));
-        while (Clock::now() < until) std::this_thread::yield();
+        const double over = Pace::WaitUntil(until);
         lock.lock();
-        Amd::NoteSlept(std::chrono::duration<double>(until - now).count());
-        Dlssg::NoteSlept(std::chrono::duration<double>(until - now).count());
-        now = until;
+        const double waited = std::chrono::duration<double>(until - now).count();
+        st.wait_sum += waited * 1e3;
+        st.over_max = std::max(st.over_max, over);
+        Amd::NoteSlept(waited);
+        Dlssg::NoteSlept(waited);
+        now = Clock::now();
+        next = until + step;
+    } else if (next != Clock::time_point{} && timed) {
+        const auto late = now - next;
+        const double late_ms = std::chrono::duration<double, std::milli>(late).count();
+        if (late <= kKeep) {
+            next += step;
+        } else {
+            ++st.missed;
+            st.late_sum += late_ms;
+            st.late_max = std::max(st.late_max, late_ms);
+            next = now + step;
+        }
+    } else {
+        next = now + step; // the first flip, or after a pause
     }
-    // A late flip resets the grid (no burst to catch up).
-    next = std::max(next, now - step) + step;
     exited = Clock::now();
 }
 
@@ -987,6 +1273,27 @@ void NoteSlept(double seconds) {
     g_slept += seconds;
 }
 
+// Reflex's sleep at the guest frame boundary (the [pace] line: it runs after our wait, on the
+// thread that submits the flip, so it is part of the next frame's time).
+std::mutex g_rx_sleep_mutex;
+double g_rx_sleep_sum = 0.0, g_rx_sleep_max = 0.0;
+uint32_t g_rx_sleep_n = 0;
+
+void NoteReflexSleep(double ms) {
+    std::lock_guard lock{g_rx_sleep_mutex};
+    g_rx_sleep_sum += ms;
+    g_rx_sleep_max = std::max(g_rx_sleep_max, ms);
+    ++g_rx_sleep_n;
+}
+
+void ReflexSleepStats(double* avg_ms, double* max_ms) {
+    std::lock_guard lock{g_rx_sleep_mutex};
+    *avg_ms = g_rx_sleep_n ? g_rx_sleep_sum / g_rx_sleep_n : 0.0;
+    *max_ms = g_rx_sleep_max;
+    g_rx_sleep_sum = g_rx_sleep_max = 0.0;
+    g_rx_sleep_n = 0;
+}
+
 uint32_t GuestFlip() {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
     if (!g_ready || !GuestMarkers() || g_api.pcl_set_marker == nullptr) return 0;
@@ -1009,7 +1316,11 @@ uint32_t GuestFlip() {
         const char* value = Env("KYTY_DLSSG_SLEEP");
         return value == nullptr || *value != '0';
     }();
-    if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(*token);
+    if (sleep && g_api.reflex_sleep != nullptr) {
+        const auto t0 = Clock::now();
+        g_api.reflex_sleep(*token);
+        NoteReflexSleep(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    }
     g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, *token);
     g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, *token);
     g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, *token);
