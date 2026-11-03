@@ -1,5 +1,34 @@
 ## New in this build
 
+Your precompiled shaders stay valid: the shaders are the same as in v20261102.
+
+- **FSR 4 frame generation: F11 and window resizes no longer close the game** (#270): with AMD's FSR SDK 2.4 DLLs,
+  switching to or from full screen, or changing the window's size, while frame generation was on ended with "FSR frame
+  generation swapchain failed". AMD's newer runtime leaves the old swapchain for the program to destroy, and the
+  emulator didn't. The performance overlay now also says "FSR 4 Frame Generation" when AMD's runtime generates with
+  FSR 4. One case is left: with AMD's runtime doing both the upscaling and the frame generation, about 1 F11 in 25 still
+  lost the graphics device on our RTX 5090 (AMD's FSR 3.1 there; FSR 4 on a Radeon is untested). If that happens to
+  you, `-Set KYTY_FSR_RUNTIME=0` keeps the frame generation and upscales with the built-in FSR 3, which never did here.
+- **The launchers call the FSR upscaler "AMD FSR"**: with the SDK 2.4 DLLs it is FSR 4 on Radeon RX 7000 and 9000
+  cards and FSR 3.1 on others; without them the built-in FSR 3. The log line `Super resolution: AMD FSR ...` says which
+  one runs.
+- **A rare freeze at start-up** (PR #269, credit @CarpetHead): the GPU thread could wait for a flip that only it could
+  prepare. It showed most with the start-up logos skipped.
+- **The game's threads wait less for the GPU's data** (PR #273, credit @CarpetHead): their requests are now also served
+  while the render thread waits for its uploads. Up to 2-4% where the game reads a lot back (the Boletarian Palace's
+  Inner Ward on an RX 9070 XT, measured by @DevList1454), the same elsewhere; `-Set KYTY_SERVE_IN_WAITS=0` turns it off.
+- **For reports about AMD FSR** (#271, #276): the log now says how much video memory AMD's runtime takes for frame
+  generation, its swapchain and the upscaler, and what the FSR upscaler is given.
+- **Tip for 8 GB Radeon RX 6000 cards with frame generation** (#276): the SDK 2.4 frame generation took about 1 GB more
+  video memory there than the older `amd_fidelityfx_vk.dll`, too much at 1080p with FSR 4. Until that is settled, use
+  the older DLL alone for frame generation, or add `-Set KYTY_FSR_RUNTIME=0` (the built-in FSR 3 upscales, lighter on
+  those cards).
+- **Thanks** to @CarpetHead for PRs #269, #273 and #274 (a flicker check for testers), to @DevList1454 for the review
+  and measurements, and to @kocher, @dimitrios1977ZXZ, @yura1234, @STALKERSK, @davide20204 and @Vyncas for their
+  reports and tests.
+
+## New in v20261102
+
 Your precompiled shaders stay valid: the shaders are the same as in v20261101.
 
 - **AMD FSR 4 on Radeon cards** (#62): with AMD's FSR SDK 2.4 DLLs next to the emulator (`amd_fidelityfx_loader_vk.dll`,
@@ -20,38 +49,30 @@ Your precompiled shaders stay valid: the shaders are the same as in v20261101.
   command-line options flips the game's 3D frames on every third refresh (40 fps), at the game's normal speed.
 - **Thanks** to @kocher, @dreamerk24m, @ns6000, @HybOj, @HemeSynth and @davide20204 for their reports and tests.
 
-## New in v20261101
-
-Your precompiled shaders stay valid: the shaders are the same as in v20261031. The precompile has more shaders to
-offer (last item): the launcher asks you to precompile again, and that run compiles only the new ones.
-
-- **Skip the start-up logos** (#263): a new switch on the launcher's Game page. The game then starts without "Sony
-  Interactive Entertainment presents", PlayStation Studios and Bluepoint Games, about 16 seconds that no button skips
-  (the game's own switch; `-Set KYTY_SKIP_LOGOS=1` with `run.cmd`). The opening cinematic still plays, and Options
-  skips it as before.
-- **Nintendo Switch Pro and other Nintendo-layout pads** (#262): the face buttons now go by position, as the PlayStation
-  buttons the game shows: the bottom one is Cross and the right one Circle (before, they went by label: A, on the right,
-  was Cross). Joy-Cons, 8BitDo pads in Switch mode and GameCube pads too; `-Set SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1`
-  goes back to the labels.
-- **Steam Big Picture: the controller works right after you quit the game** (#217): after a game started from Big
-  Picture ended, Big Picture stayed without focus until a click or Alt+Tab. The launcher now gives it the focus back
-  once Steam has seen the game end.
-- **Less work on the render thread** (PR #257, credit @ponhei9502): a buffer description the game hands over unchanged
-  keeps its looked-up entry instead of being hashed again, about 0.5 ms less per frame at Boletaria 1-1 on an RTX 5090
-  (`-Set KYTY_TABLE_GATHER_MEMO=0` turns it off).
-- **FSR 3 frame generation: F11 in menus and during loads** (#174): switching to or from full screen while frame
-  generation was paused (the main menu, loading screens) could freeze the picture or lose the graphics device.
-- **DualSense: an enchanted weapon no longer rumbles all through the buff** (#239): steady effects now fade from the
-  motors in about half a second, while hits still rumble fully (`-Set KYTY_DUALSENSE_VIBRATION_MOTOR_SUSTAIN_MS=<ms>`,
-  0 as before).
-- **Direct presentation with DLSS frame generation** (#236): v20261031 ignored that Experimental switch with any frame
-  generation; now only with FSR 3's, the one it held at half the display's rate.
-- **Precompile: more shaders** for DLSS, frame generation and the 1440p output (#260, credit @2000Arsen, from a full
-  playthrough): 859 programs and 894 pipelines more, fewer first-use stutters with those settings.
-- **Thanks** to @ponhei9502 for PR #257, to @2000Arsen for the shader list, and to @HybOj, @forensicssix-debug, @ft1704,
-  @jrodriguezml, @tao755-maker and @javsp for their reports and tests.
-
 ## 本版本的变化
+
+已有的预编译着色器继续有效：着色器与 v20261102 相同。
+
+- **FSR 4 插帧：按 F11 或改变窗口大小不再导致游戏退出**（#270）：使用 AMD FSR SDK 2.4 的 DLL 时，在插帧开启的状态下切换全屏、
+  或改变窗口大小，会以 "FSR frame generation swapchain failed" 退出。AMD 的新运行库把旧交换链留给程序自己销毁，而模拟器之前
+  没有这样做。另外，AMD 运行库用 FSR 4 插帧时，性能浮层现在显示 "FSR 4 Frame Generation"。还剩一种情况：超分和插帧都由 AMD
+  运行库完成时，在我们的 RTX 5090 上（那里是 AMD 的 FSR 3.1；Radeon 上的 FSR 4 尚未测试）大约每 25 次 F11 仍有一次丢失显卡
+  设备。如果你遇到，加上 `-Set KYTY_FSR_RUNTIME=0`：插帧照旧，超分改用内置 FSR 3，这样在我们这里从未出现过。
+- **启动器把 FSR 超分改称「AMD FSR」**：放有 SDK 2.4 的 DLL 时，Radeon RX 7000 和 9000 显卡上是 FSR 4，其他显卡上是
+  FSR 3.1；没有这些 DLL 时是内置的 FSR 3。日志中的 `Super resolution: AMD FSR ...` 一行会写出实际使用的版本。
+- **偶发的启动卡死**（PR #269，感谢 @CarpetHead）：GPU 线程可能在等待一次只有它自己才能准备的翻转。跳过启动标志时最容易出现。
+- **游戏线程等待 GPU 数据的时间更短**（PR #273，感谢 @CarpetHead）：渲染线程等待上传期间，也会处理游戏线程的请求。在游戏大量
+  读回数据的地方最多快 2-4%（@DevList1454 在 RX 9070 XT 上于波雷塔利亚王城内城测得），其他地方不变；
+  `-Set KYTY_SERVE_IN_WAITS=0` 关闭。
+- **便于反馈 AMD FSR 的问题**（#271、#276）：日志现在会写出 AMD 运行库在插帧、插帧交换链和超分上各占用多少显存，以及 FSR 超分
+  收到的输入。
+- **小提示：8 GB 的 Radeon RX 6000 显卡开插帧**（#276）：在这类显卡上，SDK 2.4 的插帧比旧的 `amd_fidelityfx_vk.dll` 多占约
+  1 GB 显存，1080p 加 FSR 4 时显存不够。在问题解决之前，插帧请单独使用旧 DLL，或者加上 `-Set KYTY_FSR_RUNTIME=0`（改由内置
+  FSR 3 超分，在这类显卡上负担更轻）。
+- **感谢** @CarpetHead 的 PR #269、#273 和 #274（供测试者使用的闪烁检查工具），@DevList1454 的审阅与测量，以及 @kocher、
+  @dimitrios1977ZXZ、@yura1234、@STALKERSK、@davide20204 和 @Vyncas 的反馈与测试。
+
+## v20261102 的变化
 
 已有的预编译着色器继续有效：着色器与 v20261101 相同。
 
@@ -71,28 +92,3 @@ offer (last item): the launcher asks you to precompile again, and that run compi
 - **小提示：40 帧上限**（#267）：在 120 Hz 或 VRR 显示器上，开启 120 帧选项并在命令行参数中加入 `-Set KYTY_FLIP_RATE=2`，
   游戏的 3D 画面每三次刷新翻转一次（40 帧），游戏速度正常。
 - **感谢** @kocher、@dreamerk24m、@ns6000、@HybOj、@HemeSynth 和 @davide20204 的反馈与测试。
-
-## v20261101 的变化
-
-已有的预编译着色器继续有效：着色器与 v20261031 相同。预编译可以多编译一些着色器（见最后一项）：启动器会提示再预编译一次，
-这次只编译新增的部分。
-
-- **跳过启动标志**（#263）：启动器「游戏」页新增开关。开启后游戏启动时不再播放「Sony Interactive Entertainment presents」、
-  PlayStation Studios 和 Bluepoint Games 的标志，约 16 秒、任何按键都无法跳过的画面（游戏自带的开关；用 `run.cmd` 时为
-  `-Set KYTY_SKIP_LOGOS=1`）。开场动画仍会播放，和以前一样可以按 Options 跳过。
-- **Nintendo Switch Pro 等任天堂布局手柄**（#262）：正面按键改为按位置对应，与游戏显示的 PlayStation 按键一致：下方为 ×，右方为
-  ○（以前按标签对应：右边的 A 是 ×）。Joy-Con、Switch 模式的 8BitDo 手柄和 GameCube 手柄同样如此；
-  `-Set SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1` 恢复按标签对应。
-- **Steam Big Picture：退出游戏后手柄立即可用**（#217）：从 Big Picture 启动的游戏结束后，Big Picture 一直没有焦点，需要点一下或
-  按 Alt+Tab。现在 Steam 确认游戏结束后，启动器会把焦点交还给它。
-- **渲染线程的工作更少**（PR #257，感谢 @ponhei9502）：游戏交来的缓冲区描述没有变化时，沿用已查到的条目，不再重新计算哈希；
-  RTX 5090 在波雷塔利亚 1-1 每帧约少 0.5 ms（`-Set KYTY_TABLE_GATHER_MEMO=0` 关闭）。
-- **FSR 3 插帧：在菜单和加载时按 F11**（#174）：插帧暂停时（主菜单、加载画面）切换全屏，可能导致画面冻结或显卡设备丢失。
-- **DualSense：附魔武器期间不再一直震动**（#239）：持续性的效果现在约半秒内从震动马达上渐弱，受击等仍会完整震动
-  （`-Set KYTY_DUALSENSE_VIBRATION_MOTOR_SUSTAIN_MS=<毫秒>`，0 恢复原样）。
-- **DLSS 插帧 + 直接呈现**（#236）：v20261031 在任何插帧下都会忽略这个「实验性」开关；现在只在 FSR 3 插帧下忽略（只有它会让
-  帧率只剩显示器刷新率的一半）。
-- **预编译：更多着色器**，覆盖 DLSS、插帧和 1440p 输出（#260，感谢 @2000Arsen 提供的完整通关记录）：多 859 个程序、894 条
-  管线，这些设置下首次出现的卡顿更少。
-- **感谢** @ponhei9502 的 PR #257、@2000Arsen 提供的着色器列表，以及 @HybOj、@forensicssix-debug、@ft1704、@jrodriguezml、
-  @tao755-maker 和 @javsp 的反馈与测试。
