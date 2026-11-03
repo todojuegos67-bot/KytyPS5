@@ -200,6 +200,41 @@ Config ParseConfig() {
 
 } // namespace
 
+// BB_FPS_CAP=N: the game's real frames (before frame generation, DLSS-G or FSR 3) held to N fps
+// on a fixed grid at the guest flip (1/N s: 16.667 ms at 60, 22.222 at 45, 33.333 at 30), so
+// every generated frame lands halfway between two evenly spaced real ones. 0: off. Unset: 60 with
+// frame generation on (BB_FG not off), off without. Read once in Cfg().
+static std::atomic<int> g_fps_cap{0};
+
+static void InitFpsCap(const Config& c) {
+    const char* v = std::getenv("BB_FPS_CAP");
+    const bool fg = c.kind != Kind::Off;
+    int cap = 0;
+    const char* why = "";
+    if (v != nullptr && *v != '\0') {
+        cap = std::atoi(v);
+        if (cap < 0) cap = 0;
+        if (cap > 0 && cap < 10) cap = 10;
+        if (cap > 360) cap = 360;
+        why = v;
+    } else if (fg) {
+        cap = 60;
+        why = "unset, default 60 with frame generation";
+    }
+    g_fps_cap = cap;
+    if (cap > 0) {
+        BBLogf("real fps cap %d (BB_FPS_CAP=%s; %.3f ms grid at the guest flip, before frame generation%s)",
+               cap, why, 1000.0 / cap,
+               fg ? (", " + std::to_string(cap * c.multiplier) + " fps shown at x" +
+                     std::to_string(c.multiplier))
+                        .c_str()
+                  : "");
+    } else {
+        BBLogf("real fps cap off (BB_FPS_CAP=%s%s)", v != nullptr ? v : "",
+               v == nullptr ? ", unset without frame generation" : "");
+    }
+}
+
 const Config& Cfg() {
     static const Config config = [] {
         Config c = ParseConfig();
@@ -208,6 +243,7 @@ const Config& Cfg() {
                    c.kind == Kind::Dlss ? "NVIDIA DLSS-G" : "AMD FSR 3",
                    c.dynamic ? "dynamic up to" : "fixed", c.multiplier);
         }
+        InitFpsCap(c);
         return c;
     }();
     return config;
@@ -573,7 +609,15 @@ void PaceGuestFlip() {
     }
     double interval = Dlssg::PaceInterval();
     if (interval <= 0.0) interval = Amd::PaceInterval();
-    if (generating && Adapt::Enabled()) interval = std::max(interval, Adapt::Mean());
+    // The real fps cap (BB_FPS_CAP) is the grid: a fixed step, not the adaptive mean (which
+    // follows the game's own wandering frame time, 14-17 ms, and spaces the presents unevenly).
+    (void)Cfg();
+    const int cap = g_fps_cap.load();
+    if (cap > 0) {
+        interval = std::max(interval, 1.0 / cap);
+    } else if (generating && Adapt::Enabled()) {
+        interval = std::max(interval, Adapt::Mean());
+    }
     Adapt::g_last = interval;
     if (interval <= 0.0 || interval > 0.1) {
         next = Clock::time_point{};
