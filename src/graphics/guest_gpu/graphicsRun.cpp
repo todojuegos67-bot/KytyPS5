@@ -27,6 +27,7 @@
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "live-census.h"
+#include "live-switch.h"
 #include "draw-state-observer.h"
 #include "frame-capture.h"
 #include "hud-anchor.h"
@@ -146,9 +147,20 @@ bool GuestGpu::IsStopping() {
 	return m_stopping;
 }
 
+// Every run of a guest command on the GPU thread, whichever path ran it (KYTY_SERVE_IN_WAITS: no command is served
+// from inside another; the unmap command drains the upload worker over its range before the range goes).
+static thread_local uint32_t t_command_depth = 0;
+struct CommandScope {
+	CommandScope() { ++t_command_depth; }
+	~CommandScope() { --t_command_depth; }
+	CommandScope(const CommandScope&)            = delete;
+	CommandScope& operator=(const CommandScope&) = delete;
+};
+
 void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
+		CommandScope scope;
 		command();
 		return;
 	}
@@ -233,6 +245,33 @@ static void PrefetchNextDraw(const uint32_t* packet, uint32_t remaining_dw) {
 	}
 }
 
+// A game thread's readback fault sends its command here and waits for it, and the GPU thread took commands only before
+// each packet: a request queued ~0.1 ms, 11-15 ms of the game's threads' time a frame at Demon's Souls' stone arch.
+// Run while the GPU thread waits for the upload worker as well, where it spun anyway (KYTY_SERVE_IN_WAITS).
+bool GuestGpu::ServeInWaits() noexcept {
+	static auto& serve = LiveSwitch::Find("serve_in_waits", [] {
+		const char* value = std::getenv("KYTY_SERVE_IN_WAITS");
+		return value != nullptr ? std::atoll(value) : 1ll;
+	}());
+	return serve.load(std::memory_order_relaxed) != 0;
+}
+
+// (Only the drains before a guest memory write and at the frame boundary serve (AsyncUpload::Drain(true)): a submit's
+// drain has a command buffer ended and its tick not yet taken, and a command's own wait (the unmap's drain over its
+// range) must not run the commands behind it inside itself, so inside any command (t_command_depth) nothing is
+// served; those commands wait their turn, as before.)
+void GuestGpu::ServePendingCommands() {
+	if (t_command_depth != 0 || g_gpu_state == nullptr ||
+	    g_gpu_state->m_pending_commands.load(std::memory_order_acquire) == 0)
+		return;
+	g_gpu_state->ProcessCommands();
+}
+
+bool GuestGpu::CommandsPending() noexcept {
+	return t_command_depth == 0 && g_gpu_state != nullptr &&
+	       g_gpu_state->m_pending_commands.load(std::memory_order_acquire) != 0;
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -248,7 +287,10 @@ void GuestGpu::ProcessCommands() {
 		PageManager::FlushDeferredProtection();
 		LiveCounters::Add(LiveCounters::GuestCommands);
 		LiveTrace::Event(LiveTrace::GuestCommand, 1, 0);
-		command();
+		{
+			CommandScope scope;
+			command();
+		}
 		LiveTrace::Event(LiveTrace::GuestCommand, 0, 0);
 	}
 }
@@ -256,6 +298,7 @@ void GuestGpu::ProcessCommands() {
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
+		CommandScope scope;
 		command();
 		return;
 	}
@@ -472,7 +515,7 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 // the buffers those copies read at once, and a copy made after that took the new bytes for the earlier draws (issue
 // #196: lit ground and water flickered white; the frame boundary's wait, 5c6f80fa, came after the labels).
 static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
-	AsyncUpload::Drain();
+	AsyncUpload::Drain(/*serve=*/true);
 	std::memcpy(dst, src, size);
 }
 
@@ -652,6 +695,12 @@ void GuestGpu::ThreadRun(void* data) {
 	BdaDirtyRegions::g_translating = true;
 	LiveTrace::g_mark_thread = true;
 	InitializePerformanceSwitches();
+	AsyncUpload::g_serve_hook = [](bool serve) {
+		if (!serve) return ServeInWaits() && IsGpuThread();
+		if (!IsGpuThread() || !CommandsPending()) return false;
+		ServePendingCommands();
+		return true;
+	};
 	LiveControl::Start();
 	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -744,7 +793,10 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			LiveCounters::Add(LiveCounters::GuestCommands);
-			command();
+			{
+				CommandScope scope;
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -794,7 +846,7 @@ bool GuestGpu::Process(Submission& submission) {
 		// but one, double buffered), and a copy still pending took those bytes - lit ground and water flickered white
 		// for a frame on a fast PC with the game's async compute (issue #196). Without deferred submits each submission
 		// drained them; the boundary waits here only for the copies recorded since the last one.
-		AsyncUpload::Drain();
+		AsyncUpload::Drain(/*serve=*/true);
 		Common::LockGuard lock(m_queue_mutex);
 		EXIT_IF(submission.frame_epoch != m_consumed_frame);
 		++m_done_num;

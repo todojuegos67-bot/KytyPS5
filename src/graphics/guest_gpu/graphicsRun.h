@@ -40,6 +40,12 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// KYTY_SERVE_IN_WAITS (live serve_in_waits, default 1): on, the GPU thread runs the guest commands queued for it (a
+	// game thread's readback fault among them) while it waits for the upload worker too, not only before each packet.
+	[[nodiscard]] static bool ServeInWaits() noexcept;
+	// GPU thread: runs the guest commands queued for it, if any (ProcessCommands); not from inside one of them.
+	static void               ServePendingCommands();
+	[[nodiscard]] static bool CommandsPending() noexcept;
 
 	// Offline tools (xpr_replay_tests) run the renderer on their own thread.
 	static void SetOfflineGpuThread(bool gpu_thread) noexcept;
