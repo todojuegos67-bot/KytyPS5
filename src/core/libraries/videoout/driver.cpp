@@ -363,14 +363,17 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         }
     }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-    });
+    {
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+        });
+    }
+    request_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -392,8 +395,49 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    // BB::FG::PresentOnArrival (bb-pace-049): under the real fps cap the game's flips are already
+    // held to their grid at the submit (PaceGuestFlip), so a flip is presented as it arrives
+    // instead of at the next emulated vblank (240 Hz: up to 4.17 ms later on the vblank timer's own
+    // phase, 16.67 + 4.17 = 20.8 ms intervals); the vblanks keep their own timer.
+    const auto wait_tick_or_flip = [&](std::chrono::nanoseconds wait) {
+        const auto deadline = std::chrono::steady_clock::now() + wait;
+        while (!token.stop_requested()) {
+            Request request{};
+            bool got = false;
+            {
+                std::unique_lock lk{mutex};
+                request_cv.wait_until(lk, deadline, [&] {
+                    return !requests.empty() || token.stop_requested();
+                });
+                if (!requests.empty()) {
+                    request = requests.front();
+                    requests.pop();
+                    got = true;
+                }
+            }
+            if (!got) {
+                break;
+            }
+            if (request) {
+                Flip(request);
+                FRAME_END;
+            }
+        }
+        // The condition variable's timeout is as coarse as the system timer: the rest accurately.
+        const auto left = deadline - std::chrono::steady_clock::now();
+        if (left > std::chrono::nanoseconds{0} && !token.stop_requested()) {
+            Common::AccurateSleep(std::chrono::duration_cast<std::chrono::nanoseconds>(left),
+                                  nullptr, false);
+        }
+    };
+
     while (!token.stop_requested()) {
-        timer.Start();
+        if (BB::FG::PresentOnArrival() && main_port.flip_rate == 0 && main_port.is_open &&
+            !DebugState.IsGuestThreadsPaused()) {
+            timer.Start(wait_tick_or_flip);
+        } else {
+            timer.Start();
+        }
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

@@ -40,6 +40,19 @@ public:
 
     void Start();
 
+    // Start() with `wait(duration)` doing the sleep (it returns at the end of the duration; it may
+    // do other work meanwhile, as the VideoOut present thread presenting a flip as it arrives).
+    template <typename Wait>
+    void Start(Wait&& wait) {
+        const auto begin_sleep = std::chrono::high_resolution_clock::now();
+        if (total_wait.count() > 0) {
+            wait(total_wait);
+        }
+        start_time = std::chrono::high_resolution_clock::now();
+        total_wait -=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(start_time - begin_sleep);
+    }
+
     void End();
 
     std::chrono::nanoseconds GetTotalWait() const {
