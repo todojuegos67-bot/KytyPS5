@@ -43,6 +43,7 @@ struct Config {
     bool hudless_copy = false;
     int force_mode = 0; // 0 auto, 1 scene, 2 composite
     bool to_window = true; // BB_UPSCALE_TO_WINDOW=0: never upscale past the game's own output size
+    bool menus = true;     // BB_UPSCALE_MENUS=0: 2D frames (menus, loading, movies) not scaled
     VAddr force_source = 0;
     u32 log_every = 600;
 };
@@ -166,6 +167,11 @@ bool TakeLateUpscale();
 // The frame just flipped went through the upscaler (in place or to the window size).
 bool LastFrameUpscaled();
 void OnPresentFailed(std::string_view why);
+// The flip being presented had no 3D scene (a menu, loading screen or movie) and an upscaler is
+// active: the presenter then scales it to the window with the spatial FSR 1 pass (EASU) instead of
+// a plain stretch, since the upscaler itself needs a 3D scene (depth, motion). BB_UPSCALE_MENUS=0
+// turns it off. Only ever true for a frame the 3D path did not upscale.
+bool MenuUpscaleWanted();
 // The presenter's verdict for this frame: the window-size image was (or was not) presented.
 void OnPresentResult(bool presented, std::string_view why);
 
