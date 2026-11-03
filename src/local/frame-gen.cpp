@@ -668,6 +668,21 @@ std::string FsrProvider(ffxContext* context) {
 	return version.versionName;
 }
 
+// The video memory AMD's runtime says a context holds, as ", N MiB of video memory" for its log line ("" when unsaid):
+// its own allocations, which the emulator sees only as the driver's share (issue #276: on an 8 GB RX 6650 XT, FSR SDK
+// 2's frame generation took about 1.1 GB more of it than SDK 1.1.4's).
+template <typename Query>
+std::string FsrMemory(ffxContext* context, uint64_t type, FfxApiEffectMemoryUsage* Query::* output) {
+	FfxApiEffectMemoryUsage usage {};
+	Query                   query {};
+	query.header.type = type;
+	query.*output     = &usage;
+	if (*context == nullptr || g_fsr_state.api.Query(context, &query.header) != FFX_API_RETURN_OK || usage.totalUsageInBytes == 0) {
+		return "";
+	}
+	return ", " + std::to_string((usage.totalUsageInBytes + (1u << 19u)) >> 20u) + " MiB of video memory";
+}
+
 FfxApiResource FsrImage(const VulkanImage& image) {
 	VkImageCreateInfo info {};
 	info.sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -775,8 +790,13 @@ bool FsrEnsureFrameGeneration(vk::Extent2D render) {
 	     s.max_render.width, s.max_render.height);
 	const auto provider = FsrProvider(&s.fg_context);
 	s.fsr4.store(provider.rfind("4.", 0) == 0, std::memory_order_relaxed);
-	std::printf("Frame generation: FSR ready (%ux%u, render up to %ux%u; frame generation %s)\n", s.display.width,
-	            s.display.height, s.max_render.width, s.max_render.height, provider.c_str());
+	const auto memory    = FsrMemory(&s.fg_context, FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE,
+	                                 &ffxQueryDescFrameGenerationGetGPUMemoryUsage::gpuMemoryUsageFrameGeneration);
+	const auto swapchain = FsrMemory(&s.swapchain_context, FFX_API_QUERY_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_GPU_MEMORY_USAGE_VK,
+	                                 &ffxQueryFrameGenerationSwapChainGetGPUMemoryUsageVK::gpuMemoryUsageFrameGenerationSwapchain);
+	std::printf("Frame generation: FSR ready (%ux%u, render up to %ux%u; frame generation %s%s%s)\n", s.display.width,
+	            s.display.height, s.max_render.width, s.max_render.height, provider.c_str(), memory.c_str(),
+	            swapchain.empty() ? "" : ("; its swapchain" + swapchain).c_str());
 	std::fflush(stdout);
 	return true;
 }
@@ -852,8 +872,11 @@ struct FsrRuntimeUpscaler {
 			return Fail("upscaling context", code);
 		}
 		reset = true;
-		std::printf("Super resolution: AMD FSR %s %ux%u -> %ux%u (AMD's runtime)\n", FsrProvider(&context).c_str(),
-		            render.width, render.height, display.width, display.height);
+		std::printf("Super resolution: AMD FSR %s %ux%u -> %ux%u (AMD's runtime%s)\n", FsrProvider(&context).c_str(),
+		            render.width, render.height, display.width, display.height,
+		            FsrMemory(&context, FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE,
+		                      &ffxQueryDescUpscaleGetGPUMemoryUsage::gpuMemoryUsageUpscaler)
+		                .c_str());
 		std::fflush(stdout);
 		return true;
 	}
@@ -900,6 +923,19 @@ struct FsrRuntimeUpscaler {
 		const float y_scale              = std::fabs(inputs.view_to_clip[5]);
 		dispatch.cameraFovAngleVertical  = y_scale > 0.0f ? 2.0f * std::atan(1.0f / y_scale) : 1.0f;
 		dispatch.viewSpaceToMetersFactor = 1.0f;
+		// (What it was given, as the built-in FSR 3 says it: issue #271, FSR 4's picture black under the HUD.)
+		if (static uint32_t reports = 0; reports < 2) {
+			++reports;
+			std::printf("Super resolution: AMD FSR inputs: color %s, depth %s, motion %s, output %s %ux%u; jitter %g %g, motion "
+			            "scale %g %g, near %g, vertical field of view %g, frame time %.1f ms, sharpness %g, reset %d\n",
+			            vk::to_string(inputs.color.format).c_str(), vk::to_string(inputs.depth.format).c_str(),
+			            vk::to_string(inputs.motion.format).c_str(), vk::to_string(inputs.output.format).c_str(),
+			            display.width, display.height, dispatch.jitterOffset.x, dispatch.jitterOffset.y,
+			            dispatch.motionVectorScale.x, dispatch.motionVectorScale.y, dispatch.cameraNear,
+			            dispatch.cameraFovAngleVertical, dispatch.frameTimeDelta, dispatch.enableSharpening ? sharpness : 0.0f,
+			            dispatch.reset ? 1 : 0);
+			std::fflush(stdout);
+		}
 		if (const auto code = g_fsr_state.api.Dispatch(&context, &dispatch.header); code != FFX_API_RETURN_OK) {
 			return Fail("upscaling", code);
 		}
@@ -2957,26 +2993,29 @@ void DestroySwapchain(GraphicContext& graphics, vk::SwapchainKHR swapchain) {
 	// 5090 an F11 back to the window, frame generation on at 5120x2160 since a load, lost the device, and an F11 in the
 	// main menu froze the picture while the game ran on (issue #174).
 	FsrStopFrameGeneration();
+	vk::SwapchainKHR left = nullptr; // FSR SDK 2's swapchain, which its context leaves
 	if (s.swapchain_context != nullptr) {
-		// FSR SDK 2's context leaves its swapchain: it goes after the context, through the swapchain's own function (AMD's
-		// order, with its presents waited for first). Left on the window, the next swapchain could not be made there: F11
-		// or a resized window with frame generation on an RX 9070 XT exited "FSR frame generation swapchain failed"
-		// (issue #270). FidelityFX SDK 1.1.4's context destroys its swapchain itself.
+		// FSR SDK 2's context leaves its swapchain to the program, to go after the context through the swapchain's own
+		// function (AMD's order, its presents waited for first). Left on the window, the next swapchain could not be made
+		// there: F11 or a resized window with frame generation on an RX 9070 XT exited "FSR frame generation swapchain
+		// failed" (issue #270). FidelityFX SDK 1.1.4's context destroys its swapchain itself.
 		if (s.sdk2) {
 			ffxDispatchDescFrameGenerationSwapChainWaitForPresentsVK wait {};
 			wait.header.type = FFX_API_DISPATCH_DESC_TYPE_FGSWAPCHAIN_WAIT_FOR_PRESENTS_VK;
 			(void)FsrOk(s.api.Dispatch(&s.swapchain_context, &wait.header), "swapchain presents' wait");
+			left = s.swapchain;
 		}
 		(void)s.api.DestroyContext(&s.swapchain_context, nullptr);
 		s.swapchain_context = nullptr;
-		if (s.sdk2 && s.swapchain != nullptr && s.functions.pOutDestroySwapchainFFXAPI != nullptr) {
-			s.functions.pOutDestroySwapchainFFXAPI(static_cast<VkDevice>(graphics.device),
-			                                       static_cast<VkSwapchainKHR>(s.swapchain), nullptr, nullptr);
-		}
 	}
 	s.swapchain = nullptr;
 	for (const vk::Queue queue: {graphics.fsr_compute_queue, graphics.fsr_present_queue, graphics.fsr_acquire_queue}) {
 		if (queue != nullptr) (void)queue.waitIdle();
+	}
+	// (Only with FSR's queues idle: its last presents' copies may still read the swapchain's images.)
+	if (left != nullptr && s.functions.pOutDestroySwapchainFFXAPI != nullptr) {
+		s.functions.pOutDestroySwapchainFFXAPI(static_cast<VkDevice>(graphics.device), static_cast<VkSwapchainKHR>(left),
+		                                       nullptr, nullptr);
 	}
 	// (The frame generation context is made for the display size: again with the next swapchain. Its swapchain gone,
 	// FsrDestroyFrameGeneration configures nothing.)
