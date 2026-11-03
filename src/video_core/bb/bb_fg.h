@@ -29,6 +29,11 @@ namespace BB::FG {
 
 // "KYTY_X": BB_X when set, else KYTY_X.
 const char* Env(const char* kyty_name);
+// (bb-fgdyn-034) The dynamic multiplier's ceiling for a base (real) frame rate: few real frames
+// leave long gaps the generated frames must bridge, and the character smears. Below 50 real fps
+// at most x2, below 70 at most x3, else no ceiling (64); 5 fps of hysteresis on the way up, kept
+// in `state` (0 at first). BB_FG_DYN_CAP=0: no ceiling (the old behaviour).
+int DynBaseCap(double base_fps, int& state);
 // The Demon's Souls lines ([dlssg], [fsr3], [fsr3-mfg], [dyn], [lat] ...): to the log and to the
 // metrics file (BB_METRICS_OUT, read by metricas-bb.ps1).
 void Printf(const char* format, ...);

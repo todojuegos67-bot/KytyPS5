@@ -171,8 +171,9 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
     g_mfg.slept = 0.0;
     if (g_mfg.dynamic && frames > 0) {
         const double T = g_mfg.target;
-        const int maxm = g_mfg.max;
-        g_mfg.smooth = g_mfg.smooth <= 0.0 ? real : 0.5 * g_mfg.smooth + 0.5 * real;
+        g_mfg.smooth = g_mfg.smooth <= 0.0 ? free : 0.5 * g_mfg.smooth + 0.5 * free;
+        static int cap_state = 0;
+        const int maxm = std::min(g_mfg.max, std::max(DynBaseCap(g_mfg.smooth, cap_state), 2));
         const int next =
             std::clamp(g_mfg.dm.Window(g_mfg.current, real, T, maxm, false, free), 2, std::max(maxm, 2));
         if (next != g_mfg.current) {

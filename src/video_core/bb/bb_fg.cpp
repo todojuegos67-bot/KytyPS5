@@ -68,6 +68,30 @@ const char* Env(const char* kyty_name) {
     return std::getenv(kyty_name);
 }
 
+int DynBaseCap(double base_fps, int& state) {
+    static const bool on = [] {
+        const char* v = Env("KYTY_FG_DYN_CAP");
+        return v == nullptr || *v != '0';
+    }();
+    if (!on || !(base_fps > 0.0)) {
+        return 64;
+    }
+    const auto cap_for = [](double fps) { return fps < 50.0 ? 2 : fps < 70.0 ? 3 : 64; };
+    const int down = cap_for(base_fps);      // lowered at once
+    const int up = cap_for(base_fps - 5.0);  // raised only 5 fps past the line
+    const int before = state;
+    if (state == 0 || down < state) {
+        state = down;
+    } else if (up > state) {
+        state = up;
+    }
+    if (state != before) {
+        Printf("[dyn] ceiling %s for a base of %.1f real fps (BB_FG_DYN_CAP=0: none)",
+               state >= 64 ? "none" : state == 3 ? "x3" : "x2", base_fps);
+    }
+    return state;
+}
+
 void Printf(const char* format, ...) {
     char text[2048];
     va_list args;
@@ -1024,7 +1048,9 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                 g_slept = 0.0;
                 g_dyn_real_fps = g_dyn_real_fps <= 0.0 ? freer : 0.5 * g_dyn_real_fps + 0.5 * freer;
                 const double T = static_cast<double>(g_target_fps);
-                const int maxgen = g_dyn_max;
+                static int cap_state = 0;
+                const int maxgen =
+                    std::min(g_dyn_max, std::max(DynBaseCap(g_dyn_real_fps, cap_state) - 1, 1));
                 const int next = std::clamp(g_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1, false) - 1,
                                             1, std::max(maxgen, 1));
                 if (next != g_dyn_gen) {
