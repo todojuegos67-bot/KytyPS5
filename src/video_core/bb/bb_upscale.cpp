@@ -1712,6 +1712,27 @@ void SetPresentSize(u32 width, u32 height) {
     g_present_h = height;
 }
 
+namespace {
+// 0.36: BB_3D_SKIP_RELAX=1: the window-size path needs one sample of the source, not more than the
+// learned in-place skip (the largest write count of the last 240 frames, which stays high for 240
+// frames after one busy frame and then rejects ordinary gameplay frames).
+bool SkipRelax() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_3D_SKIP_RELAX");
+        return v != nullptr && *v == '1';
+    }();
+    return on;
+}
+u32 SkipNeeded() {
+    return SkipRelax() ? 0u : g_learned.skip;
+}
+// Per-reason counts of frames not upscaled (not 3D), printed about once a second.
+struct Not3D {
+    u32 frames = 0, up = 0, no_depth = 0, no_scene = 0, size = 0, samples = 0, failed = 0,
+        no_point = 0, max_q = 0, max_skip = 0;
+} g_not3d;
+} // namespace
+
 bool WantPresentUpscale(VAddr& flip) {
     if (!Enabled()) {
         return false;
@@ -1724,7 +1745,7 @@ bool WantPresentUpscale(VAddr& flip) {
     }
     // After the scene and its last read by the post-processing; the draw into the presented image
     // that samples a render-size image is the game's final post-processing pass, not the HUD.
-    if (f.gb_depth == 0 || f.scene_draws == 0 || f.qual_samples <= g_learned.skip ||
+    if (f.gb_depth == 0 || f.scene_draws == 0 || f.qual_samples <= SkipNeeded() ||
         g_draw.samples_render_size || f.gb_w != g_output_w || f.gb_h != g_output_h) {
         return false;
     }
@@ -2082,12 +2103,45 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // presenter upscales the finished image instead (TakeLateUpscale).
     g_late_upscale = false;
     if (PresentMode() && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
-        f.gb_w == width && f.gb_h == height && f.qual_samples > g_learned.skip) {
+        f.gb_w == width && f.gb_h == height && f.qual_samples > SkipNeeded()) {
         g_learned.last_injected = prev_injected;
         FillPresentPlan(addr, "at present (no HUD draw found this frame)");
         g_late_upscale = true;
         f.injected = true;
         g_learned.last_injected = true;
+    }
+    {
+        auto& n = g_not3d;
+        ++n.frames;
+        if (f.injected) {
+            ++n.up;
+        } else if (f.inject_failed) {
+            ++n.failed;
+        } else if (f.gb_depth == 0) {
+            ++n.no_depth;
+        } else if (f.scene_draws == 0) {
+            ++n.no_scene;
+        } else if (f.gb_w != width || f.gb_h != height) {
+            ++n.size;
+        } else if (f.qual_samples <= SkipNeeded()) {
+            ++n.samples;
+            n.max_q = std::max(n.max_q, f.qual_samples);
+            n.max_skip = std::max(n.max_skip, g_learned.skip);
+        } else {
+            ++n.no_point;
+        }
+        if (Enabled() && n.frames >= 60) {
+            if (n.up != n.frames) {
+                Checkpoint(fmt::format(
+                    "[3d] last {} flips: {} upscaled; not 3D: no G-buffer depth {}, no scene draws "
+                    "{}, scene size != flip {}, source sampled too few times {} (max {} seen, "
+                    "needs > {}; learned skip {}, relax {}), dispatch failed {}, other / no "
+                    "injection point {}",
+                    n.frames, n.up, n.no_depth, n.no_scene, n.size, n.samples, n.max_q,
+                    SkipNeeded(), n.max_skip, SkipRelax() ? "on" : "off", n.failed, n.no_point));
+            }
+            n = {};
+        }
     }
     // The first-frame verdict, after this frame's late (at present) decision: before, a frame
     // upscaled at present still read as not injected here and was reported FAILED.

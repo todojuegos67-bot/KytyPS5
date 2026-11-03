@@ -2065,7 +2065,21 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     const bool raw_ready = g_bb.fg_raw_hudless_ready;
     g_bb.fg_present_ready = false;
     g_bb.fg_raw_hudless_ready = false;
+    // 0.36: per-reason counts of flips with no frame-generation inputs, about once a second.
+    static u32 n_flips = 0, n_ok = 0, n_not_up = 0, n_no_depth = 0, n_mismatch = 0, n_alloc = 0,
+               n_cam = 0;
+    ++n_flips;
+    if (n_flips >= 60) {
+        if (n_ok != n_flips) {
+            BB::FG::Printf("[fg-why] last %u flips: %u with 3D inputs; without: not upscaled this "
+                           "flip %u, no G-buffer depth %u, depth/MV size or address mismatch %u, "
+                           "copy images %u, camera invalid %u",
+                           n_flips, n_ok, n_not_up, n_no_depth, n_mismatch, n_alloc, n_cam);
+        }
+        n_flips = n_ok = n_not_up = n_no_depth = n_mismatch = n_alloc = n_cam = 0;
+    }
     if (!g_bb.fg_upscaled || !bb_gb_depth_valid || !g_bb.init || !g_bb.mv.image) {
+        ++(!g_bb.fg_upscaled ? n_not_up : n_no_depth);
         return false;
     }
     g_bb.fg_upscaled = false;
@@ -2076,12 +2090,14 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     if (depth.info.guest_address != plan.depth_addr || depth.info.size.width != render.width ||
         depth.info.size.height != render.height || !depth.info.props.is_depth ||
         g_bb.mv.extent != render) {
+        ++n_mismatch;
         return false;
     }
     auto& slot = g_bb.fg_slots[slot_index % g_bb.fg_slots.size()];
     if (!EnsureDepthCopy(slot.depth, render, depth.info.pixel_format) ||
         !EnsureImage(slot.mv, render, g_bb.mv.format,
                      vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
+        ++n_alloc;
         return false;
     }
     scheduler.EndRendering();
@@ -2174,6 +2190,7 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                        static_cast<unsigned long long>(g_bb.fg_frames), out.hudless_source,
                        plan.camera_valid ? "valid" : "INVALID");
     }
+    ++(out.valid ? n_ok : n_cam);
     return out.valid;
 }
 
