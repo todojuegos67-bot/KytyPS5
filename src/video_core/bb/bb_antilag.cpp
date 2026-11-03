@@ -658,6 +658,11 @@ double LatRefreshMs() {
 }
 } // namespace
 
+// (bb-metrics-043) The latency mode now, for the in-game metrics panel.
+const char* CurrentModeName() {
+	return LatModeName(g_mode.load(std::memory_order_relaxed));
+}
+
 bool LatencyOn() {
 	static const bool on = [] {
 		const char* v       = BB::FG::Env("KYTY_LATENCY");

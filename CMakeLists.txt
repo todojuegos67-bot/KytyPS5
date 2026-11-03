@@ -1196,6 +1196,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_fg_fsr3.cpp
                src/video_core/bb/bb_fg_internal.h
                src/video_core/bb/bb_metrics.cpp
+               src/video_core/bb/bb_metrics_panel.cpp
                src/video_core/bb/bb_objmv.cpp
                src/video_core/bb/bb_objmv.h
                src/video_core/bb/bb_metrics.h

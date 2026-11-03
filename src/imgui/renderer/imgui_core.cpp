@@ -21,6 +21,7 @@
 #include "imgui_internal.h"
 #include "sdl_window.h"
 #include "texture_manager.h"
+#include "video_core/bb/bb_metrics.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 static void CheckVkResult(const vk::Result err) {
@@ -112,6 +113,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     io.Fonts->TexMaxHeight = atlas_max;
 
     io.FontGlobalScale = 0.5f;
+    BB::Metrics::InitPanel(); // (bb-metrics-043) the F8 metrics panel's face; BB_METRICS=1 shows it
 
     StyleColorsDark();
 

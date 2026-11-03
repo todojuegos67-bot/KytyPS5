@@ -96,6 +96,8 @@ void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint6
 // Off: one cached flag test per controller read / flip / present.
 [[nodiscard]] bool LatencyOn();
 void               OnPresented(uint64_t frame_index);
+// (bb-metrics-043) "reflex-sl" (Streamline's), "antilag2", "reflex", "limiter", "lowlat" or "off".
+[[nodiscard]] const char* CurrentModeName();
 
 } // namespace BB::AntiLag
 
