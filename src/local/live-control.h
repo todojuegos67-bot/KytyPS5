@@ -17,6 +17,7 @@
 //   glide <x> <y> <z> <speed>     Demon's Souls 01.007.000: the player walks there (warp requests, no input)
 //   pad <lx> <ly> <rx> <ry> <buttons> <seconds>   scripted pad input (sticks 0..255, -1 the host's; buttons hex)
 //   screenshot <path>             the next frame shown, read back from the GPU, as a PPM file (screenshot.h)
+//   screenshots <path> <count>    the next <count> frames shown, 320 pixels wide, in one file (the flicker check)
 //   set <name> <value>            a live switch (live-switch.h), e.g. fsr_jitter_mode 1
 //   sleep <seconds>
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
@@ -665,6 +666,10 @@ inline void Run(uint64_t id, const std::string& line) {
 		// screenshot <path>: the next frame shown, as a PPM file (screenshot.h; "SCREENSHOT <path>" once written).
 		Libs::Graphics::Screenshot::Request(arg1);
 		std::printf("LIVE_SCREENSHOT id=%" PRIu64 " path=%s\n", id, arg1);
+	} else if (cmd == "screenshots" && n >= 3) {
+		// screenshots <path> <count>: the next frames shown, small, in one file (screenshot.h, the flicker check).
+		Libs::Graphics::Screenshot::RequestSeries(arg1, static_cast<uint32_t>(std::strtoul(arg2, nullptr, 10)));
+		std::printf("LIVE_SCREENSHOTS id=%" PRIu64 " path=%s count=%s\n", id, arg1, arg2);
 	} else if (cmd == "set" && n >= 3) {
 		// set <name> <value>: a live switch (live-switch.h).
 		const bool ok = LiveSwitch::Set(arg1, std::strtoll(arg2, nullptr, 10));
