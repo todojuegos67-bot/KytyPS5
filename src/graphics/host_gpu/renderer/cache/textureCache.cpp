@@ -797,6 +797,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	// A clean image (no GPU-only contents, not a bound target) holds nothing that is not in guest
+	// memory, so a superseded copy can be dropped at once. Waiting 32 frames kept every
+	// recently used overlapping image alive while each new key created another one.
+	const bool free_superseded =
+	    safe_to_delete || (!cached.IsGpuModified() && !cached.binding.is_target);
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -817,7 +822,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
 			                        left.surface_z == right.surface_z;
 		                 }))) {
-			if (safe_to_delete) {
+			if (free_superseded) {
+				cached.binding.needs_rebind |= cached.binding.is_bound;
 				FreeImage(cached_id);
 			}
 			return {merged_id};
@@ -902,7 +908,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
-	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
+	if (requested.data.address >= cached.info.data.address && free_superseded) {
+		cached.binding.needs_rebind |= cached.binding.is_bound;
 		FreeImage(cached_id);
 	}
 	return {merged_id};
