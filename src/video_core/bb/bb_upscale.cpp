@@ -1723,7 +1723,7 @@ namespace {
 bool SkipRelax() {
     static const bool on = [] {
         const char* v = std::getenv("BB_3D_SKIP_RELAX");
-        return v != nullptr && *v == '1';
+        return v == nullptr || *v != '0'; // 0.38: on by default (the user log proved it)
     }();
     return on;
 }
