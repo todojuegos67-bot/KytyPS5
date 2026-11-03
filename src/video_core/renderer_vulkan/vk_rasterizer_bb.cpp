@@ -855,6 +855,9 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, const VideoCore::ImageVie
         !BBRecordUpscale(color.GetImage(), color_view, in_format, color.usage_flags)) {
         return false;
     }
+    if (BB::Upscale::Cfg().kind == BB::SR::Kind::Native) {
+        return false;
+    }
     return BBUpscaledView(view_info, out_view, out_layout);
 }
 
@@ -1386,7 +1389,8 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         _putenv_s("BB_FSR4_DEPTH_INVERT", plan.depth_inverted ? "1" : "0");
     }
 #endif
-    const bool ok = BB::Upscale::RunBackend(desc);
+    const bool native_inputs = BB::Upscale::Cfg().kind == BB::SR::Kind::Native;
+    const bool ok = native_inputs || BB::Upscale::RunBackend(desc);
     const bool present_path = color_image == g_bb.present_in.image;
     if (present_path) {
         Stamp(cmd, 2);
@@ -1397,13 +1401,13 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
             vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
     if (ok) {
-        ++g_bb.upscales;
+        if (!native_inputs) ++g_bb.upscales;
         g_bb.fg_upscaled = true;
         g_bb.fg_plan = plan;
         // The source's alpha back into the output, non-finite colour cleared (bb_alpha.comp).
         // Not on the window-size path: the presenter reads no alpha (its view maps alpha to
         // one) and the HUD composite clears non-finite colour itself: a 4K read + write saved.
-        if (!present_path && InitAlpha()) {
+        if (!native_inputs && !present_path && InitAlpha()) {
             Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral,
                     vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
                     vk::PipelineStageFlagBits2::eComputeShader,

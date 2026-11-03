@@ -379,6 +379,7 @@ struct FrameState {
     u64 scanned_draw = ~0ULL;
     u32 flip_draws = 0, hud_draws = 0, hud_other = 0, src_rewrites = 0;
     bool injected = false, inject_failed = false, redirecting = false, hudless = false;
+    bool native_inputs = false;
     bool present = false; // upscaled to the window size this frame
     std::vector<Candidate> camera;
 };
@@ -511,6 +512,10 @@ void PresentFailedLocked(std::string_view why);
 
 bool Active() {
     return Cfg().kind != SR::Kind::Off && Cfg().kind != SR::Kind::Native && BackendReady();
+}
+
+bool NativeFg() {
+    return Cfg().kind == SR::Kind::Native && BB::FG::WantInputs();
 }
 
 // The game renders its whole frame at the presented image's size (scene mode), and the window is
@@ -1636,12 +1641,15 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         }
         return Sample::Keep;
     }
+    if (f.native_inputs) {
+        return Sample::Keep;
+    }
     // A qualifying sample of the source: the injection is at the one after its last write.
     const u32 index = f.qual_samples++;
     if (PresentMode()) {
         return Sample::Keep; // upscaled before the HUD instead (WantPresentUpscale)
     }
-    if (index < g_learned.skip || !Active() || f.inject_failed) {
+    if (index < g_learned.skip || (!Active() && !NativeFg()) || f.inject_failed) {
         return Sample::Keep;
     }
     if (width != (f.gb_w ? f.gb_w : g_learned.render_w) ||
@@ -1663,7 +1671,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     p.output_w = scene ? width : g_draw.colors[0].width;
     p.output_h = scene ? height : g_draw.colors[0].height;
     p.hdr = IsHdr(format);
-    p.reset = !g_learned.last_injected;
+    p.reset = !g_learned.last_injected && !NativeFg();
     p.delta_ms = g_delta_ms;
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
@@ -1683,7 +1691,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         g_learned.skip, p.camera_valid ? "reconstructed (camera found)" : "zero (no camera)",
         p.depth_inverted ? "inverted" : "forward"));
     static bool first = true;
-    if (first) {
+    if (first && Cfg().kind != SR::Kind::Native) {
         first = false;
         GuardBegin(SR::KindName(Cfg().kind), "the first upscale");
         Checkpoint(fmt::format("{}: first upscale {}x{} -> {}x{}", SR::KindName(Cfg().kind),
@@ -1897,6 +1905,8 @@ void OnInjected(bool ok, float) {
         g_frame.injected = true;
         g_frame.redirecting = true;
         g_draw.sampled_upscaled = true;
+    } else if (Cfg().kind == SR::Kind::Native) {
+        g_frame.native_inputs = true;
     } else {
         g_frame.inject_failed = true;
     }
