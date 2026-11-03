@@ -216,15 +216,15 @@ static void InitFpsCap(const Config& c) {
         if (cap < 0) cap = 0;
         if (cap > 0 && cap < 10) cap = 10;
         if (cap > 360) cap = 360;
-        why = "BB_FPS_CAP set";
+        why = v;
     } else if (fg) {
         cap = 60;
-        why = "BB_FPS_CAP unset: default 60 with frame generation";
+        why = "unset, default 60 with frame generation";
     }
     g_fps_cap = cap;
     if (cap > 0) {
-        BBLogf("real fps cap %d (%s=%s; %.3f ms grid at the guest flip, before frame generation%s)",
-               cap, why, v != nullptr ? v : "", 1000.0 / cap,
+        BBLogf("real fps cap %d (BB_FPS_CAP=%s; %.3f ms grid at the guest flip, before frame generation%s)",
+               cap, why, 1000.0 / cap,
                fg ? (", " + std::to_string(cap * c.multiplier) + " fps shown at x" +
                      std::to_string(c.multiplier))
                         .c_str()
