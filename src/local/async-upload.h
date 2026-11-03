@@ -14,6 +14,7 @@
 #include "local-platform.h"
 #include "parallel-pages.h"
 #include "spin-gate.h"
+#include "write-guard.h"
 
 #include <algorithm>
 #include <atomic>
@@ -99,6 +100,8 @@ public:
 	}
 	// Render thread only: the sequence number of the last pushed copy.
 	[[nodiscard]] uint64_t Pushed() const { return m_head.load(std::memory_order_relaxed); }
+	// Render thread only: the sequence number of the last finished job (KYTY_WRITE_GUARD: whether any is pending).
+	[[nodiscard]] uint64_t Done() const { return m_done.load(std::memory_order_acquire); }
 	// Render thread only: the sequence number of the last pending job on guest [vaddr, vaddr + size), or 0.
 	[[nodiscard]] uint64_t PendingOn(uint64_t vaddr, uint64_t size) const {
 		const uint64_t head = m_head.load(std::memory_order_relaxed);
@@ -198,6 +201,7 @@ private:
 	void Run() {
 		LocalPlatform::SetThreadName("Kyty.Upload");
 		t_worker = true;
+		WriteGuard::t_no_wait = true; // (KYTY_WRITE_GUARD: the lifts are this thread's jobs)
 		// Created by the render thread: do not inherit its dedicated CPU.
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
 		// Pause iterations the worker polls for new copies before it sleeps (while its CPUs idle: spin-gate.h).

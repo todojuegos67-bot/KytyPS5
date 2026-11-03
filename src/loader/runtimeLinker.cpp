@@ -36,6 +36,7 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 #include "live-trace.h"
+#include "write-guard.h"
 
 #include <algorithm>
 #include <atomic>
@@ -862,6 +863,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// A page a pending guest write of the command processor guards (KYTY_WRITE_GUARD): waits for its lift.
+		if (WriteGuard::OnFault(info->access_violation_vaddr, info->exception_address)) return true;
 		// Live trace: which guest code touches tracked pages (a readback or an invalidation follows).
 		LiveTrace::Event(LiveTrace::FaultSite, info->exception_address,
 		                 info->access_violation_vaddr | (access == GpuAccess::Write ? uint64_t {1} << 63u : 0));

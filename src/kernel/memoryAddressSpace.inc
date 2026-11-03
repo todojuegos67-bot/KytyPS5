@@ -2307,6 +2307,13 @@ private:
 
 	// `trackers`: the GPU trackers' protection (VirtualMemory::ProtectWriteWatch), not the guest's.
 	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, bool trackers = false) {
+		// (KYTY_WRITE_GUARD: a page a pending guest write of the command processor guards keeps no access and takes
+		// `mode` for when its guard lifts, local/write-guard.h.)
+		return WriteGuard::Honour(vaddr, size, mode,
+		                          [&](uint64_t at, uint64_t bytes) { return ProtectMappedPages(at, bytes, mode, trackers); });
+	}
+
+	bool ProtectMappedPages(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, bool trackers) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {

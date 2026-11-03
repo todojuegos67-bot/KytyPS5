@@ -15,6 +15,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "live-census.h"
+#include "write-guard.h"
 #include "live-counters.h"
 
 #include <algorithm>
@@ -2033,6 +2034,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs");
+	// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
+	// thread wrote, local/write-guard.h.)
+	if (const auto* backing = WriteGuard::GuardedBacking(indirect_address, uint64_t {indirect_num_dw} * 8u))
+		indirect_buffer = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2098,6 +2103,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs");
+	// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
+	// thread wrote, local/write-guard.h.)
+	if (const auto* backing = WriteGuard::GuardedBacking(indirect_address, uint64_t {indirect_num_dw} * 8u))
+		indirect_buffer = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2139,6 +2148,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs");
+	// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
+	// thread wrote, local/write-guard.h.)
+	if (const auto* backing = WriteGuard::GuardedBacking(indirect_address, uint64_t {indirect_num_dw} * 8u))
+		indirect_buffer = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);

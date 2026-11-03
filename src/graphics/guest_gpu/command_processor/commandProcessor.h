@@ -26,6 +26,11 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// Each buffer's commands through `rebase`, which gives another view of the same bytes back (KYTY_WRITE_GUARD).
+	template <typename F>
+	void RebaseCommands(F&& rebase) {
+		for (auto& cursor: m_buffer_stack) cursor.commands = rebase(cursor.commands);
+	}
 
 private:
 	friend class CommandProcessor;
