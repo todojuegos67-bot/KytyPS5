@@ -12,13 +12,20 @@ namespace VideoCore {
 Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
                  const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth) {
     using namespace Vulkan;
-    const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
-                                   (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
-                                    AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
+    // Colour samplers take the BB anisotropy override when one is set; depth and compare
+    // samplers always keep the game's own filter and ratio.
+    const auto& bb_tex = BB::Texture::Get();
+    const bool bb_aniso = !is_depth && bb_tex.aniso > 0.0f;
+    const bool game_aniso = AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
+                            AmdGpu::IsAnisoFilter(sampler.xy_min_filter);
+    const float requested_aniso =
+        bb_aniso ? bb_tex.aniso : (game_aniso ? sampler.MaxAniso() : 1.0f);
+    const bool anisotropy_enable =
+        instance.IsAnisotropicFilteringSupported() && (bb_aniso ? bb_tex.aniso > 1.0f : game_aniso);
     const float max_anisotropy =
-        anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f, instance.MaxSamplerAnisotropy())
+        anisotropy_enable ? std::clamp(requested_aniso, 1.0f, instance.MaxSamplerAnisotropy())
                           : 1.0f;
-    const float lod_bias = sampler.LodBias() + (is_depth ? 0.0f : BB::Texture::LodBiasOffset());
+    const float lod_bias = sampler.LodBias() + (is_depth ? 0.0f : bb_tex.lod_bias_offset);
     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);
     if (border_color == vk::BorderColor::eFloatCustomEXT &&
         !instance.IsCustomBorderColorSupported()) {

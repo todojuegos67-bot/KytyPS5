@@ -10,6 +10,7 @@
 #include "common/hash.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/bb/bb_texture.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -844,8 +845,10 @@ void TextureCache::RefreshImage(Image& image) {
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth) {
-    // Compare and plain uses of one S# need separate samplers.
-    const u64 hash = HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth);
+    // Compare and plain uses of one S# need separate samplers. BB texture settings are part of
+    // the key so samplers built with different anisotropy or LOD bias are never shared.
+    const u64 hash = HashCombine(HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth),
+                                 BB::Texture::SettingsKey());
     const auto [it, new_sampler] = samplers.try_emplace(hash);
     if (new_sampler) {
         it->second = slot_samplers.Insert(instance, sharp, border_color_base, is_depth);
