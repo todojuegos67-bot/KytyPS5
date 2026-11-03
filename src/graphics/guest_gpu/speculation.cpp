@@ -1030,8 +1030,15 @@ void Speculation::After(Result& result, size_t index) {
 		use.image->transit_group              = use.left_group;
 	}
 	if (!state.closed[index].images.empty()) MoveImageStateEpoch();
-	for (size_t i = from.touched_images; i < to.touched_images; ++i)
-		textures.TouchSpeculated(*state.touched_images[i].first, state.touched_images[i].second);
+	// KYTY_SPEC_TOUCH_BATCH (live spec_touch_batch, default on): one lock for the segment's images (~0.4 ms a frame of
+	// LRU touches at 1-1 were taken image by image); 0: one by one, as before.
+	static auto& touch_batch = LiveSwitch::Find("spec_touch_batch", 1);
+	if (touch_batch.load(std::memory_order_relaxed) == 0) {
+		for (size_t i = from.touched_images; i < to.touched_images; ++i)
+			textures.TouchSpeculated(*state.touched_images[i].first, state.touched_images[i].second);
+	} else if (to.touched_images > from.touched_images) {
+		textures.TouchSpeculated(std::span(state.touched_images).subspan(from.touched_images, to.touched_images - from.touched_images));
+	}
 	for (size_t i = from.touched_buffers; i < to.touched_buffers; ++i) buffers.TouchSpeculated(state.touched_buffers[i]);
 	// The work before the processor's guest memory writes is on the GPU before them, as in order (BufferFlush): the
 	// segments' buffers held for one submission go first. (Labels written while that work was held made ~1.5 frames

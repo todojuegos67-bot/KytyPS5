@@ -4757,6 +4757,20 @@ void TextureCache::TouchSpeculated(Image& image, uint64_t serial) {
 	TouchImage(image);
 }
 
+void TextureCache::TouchSpeculated(std::span<const std::pair<Image*, uint64_t>> images) {
+	if (images.empty()) return;
+	std::scoped_lock lock {m_lock};
+	const auto   frame = m_frame.load(std::memory_order_relaxed);
+	const Image* last  = nullptr;
+	for (const auto& [image, serial]: images) {
+		if (image == last) continue;
+		last = image;
+		if (image->serial != serial || !image->registered) continue;
+		image->frame_accessed_last = frame;
+		TouchImage(*image);
+	}
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source, const uint32_t* fill) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;

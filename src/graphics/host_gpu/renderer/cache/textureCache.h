@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "speculation-state.h"
 
+#include <span>
 #include <array>
 #include <atomic>
 #include <map>
@@ -128,6 +129,8 @@ public:
 	void MarkGpuWritten(ImageId id);
 	// A speculative translation's use of the image, when it is committed (`serial`: the image it used).
 	void TouchSpeculated(Image& image, uint64_t serial);
+	// A committed segment's images (each with its serial at the touch) under one lock, repeats in a row once.
+	void TouchSpeculated(std::span<const std::pair<Image*, uint64_t>> images);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
