@@ -276,7 +276,7 @@ struct RenderExecutor::TableXpr {
 		uint64_t                address = 0, size = 0, cpu_epoch = 0, registration = 0;
 	};
 	static constexpr uint64_t RingCopyMark = uint64_t {1} << 63u;
-	static constexpr size_t           ResolvedEntries = 65536;
+	static constexpr size_t           ResolvedEntries = Scout::ResolvedEntries; // (the scout's tickets index it)
 	std::unique_ptr<ResolvedBuffer[]> resolved = std::make_unique<ResolvedBuffer[]>(ResolvedEntries);
 	// A copy in the table upload ring of a small range the guest wrote (TableBlocks reads such a range from a copy,
 	// none held: the guest writes its pages unseen), direct-mapped by the range: the later uses share it

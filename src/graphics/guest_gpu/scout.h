@@ -9,8 +9,10 @@
 // checked against its own registers, the pair, the mapping epoch and the tables' pages (no read watchers), instead of
 // evaluating. Not checked at use: the game's tables themselves, read by the scout before the render thread reaches the
 // draw (a CPU write the GPU reads sits behind a wait the scout stops at; the verifier, 2, counts any difference).
-// 0: off (no thread, nothing fed). 1 (the default): tickets used. 2: verifier: the render thread evaluates as without
-// the scout and compares every ticket with its own result.
+// 0: off (no thread, nothing fed; the default on Linux). 1 (the default on Windows): tickets used. 2: verifier: the
+// render thread evaluates as without the scout and compares every ticket with its own result.
+// The scout spins while it waits for the render thread only while the spin gate is open (spin-gate.h,
+// KYTY_SPIN_GATE): while it is shut the scout stands down, leaving its submissions unwalked, and sleeps between feeds.
 // A run on a page with read watchers is read from the backing instead of being refused, and its range goes into the
 // ticket; at use the render thread proves each such range clean (TryReadGpuCleanBackingToHost, as its own read of the
 // page would take it) and equal to the ticket's words.
@@ -21,6 +23,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -111,6 +114,11 @@ struct View {
 void Publish(View* view, uint64_t key_hash);
 // Render thread: the pair's view leaves the directory (its pair was reset).
 void Retire(uint64_t key_hash, uint64_t version);
+
+// TableXpr's resolved entries (TableXpr::ResolvedEntries is this): a ticket's entry index is below it, and the apply
+// takes &table.resolved[index] without a check.
+inline constexpr uint32_t ResolvedEntries = 65536;
+static_assert(std::has_single_bit(ResolvedEntries));
 
 // A draw's evaluation (the render thread's data: TableXpr's blocks, words, lod_stats and entries).
 struct alignas(64) Ticket {

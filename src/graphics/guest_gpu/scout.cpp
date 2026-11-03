@@ -11,6 +11,7 @@
 #include "kernel/memory.h"
 
 #include "live-counters.h"
+#include "spin-gate.h"
 
 #include <algorithm>
 #include <array>
@@ -25,7 +26,15 @@
 #include <xxhash.h>
 
 extern "C" {
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_scout_mode {1};
+// 1 on Windows. 0 elsewhere until measured there: on Linux each guarded copy (a packet, a table range) is a pread of
+// /proc/self/mem (guardedCopy.cpp), and the Steam Deck has four cores.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_scout_mode {
+#if defined(_WIN32)
+    1
+#else
+    0
+#endif
+};
 }
 
 namespace Libs::Graphics::Scout {
@@ -219,9 +228,13 @@ bool Passed(uint64_t sequence, uint32_t ordinal) {
 	return (render >> 24u) > sequence || ((render >> 24u) == sequence && (render & 0xffffffu) > ordinal);
 }
 
-void Pause(uint32_t& spin) {
+// A wait for the render thread: pause, then yield. False while the spin gate is shut (spin-gate.h: fewer than three of
+// the process's CPUs idle): the scout stands down instead of holding a core the game's threads want.
+bool Pause(uint32_t& spin) {
+	if (!SpinGate::Open(false)) return false;
 	if (++spin < 64) _mm_pause();
 	else std::this_thread::yield();
+	return true;
 }
 
 enum class Loss { None, Refused, Short, TooBig };
@@ -339,7 +352,7 @@ Loss Evaluate(State& state, const View& view, Ticket& ticket) {
 		for (uint32_t i = 0; i < stage.buffers; ++i) {
 			auto& [words4, index] = entries[i];
 			for (uint32_t w = 0; w < 4; ++w) words4[w] = get(stage.buffer_words[4 * i + w]);
-			index = static_cast<uint32_t>(XXH3_64bits(words4.data(), sizeof(words4)) & 0xffffu);
+			index = static_cast<uint32_t>(XXH3_64bits(words4.data(), sizeof(words4)) & (ResolvedEntries - 1));
 		}
 	}
 	// The pages read, each once, in order (a page is the backing's when no range on it was read as a guest page).
@@ -439,6 +452,13 @@ bool Walk(State& state, const FeedEntry& entry) {
 		LiveCounters::Add(LiveCounters::ScoutAbandoned);
 		return true;
 	};
+	// A wait it didn't finish: stopped (false), or the spin gate shut (the submission left, its later draws without
+	// tickets: true).
+	const auto leave = [&] {
+		if (g_stop.load(std::memory_order_relaxed)) return false;
+		LiveCounters::Add(LiveCounters::ScoutStoodDown);
+		return true;
+	};
 	std::array<uint32_t, 64> packet {};
 	while (depth != 0) {
 		if (g_stop.load(std::memory_order_relaxed)) return false;
@@ -463,13 +483,12 @@ bool Walk(State& state, const FeedEntry& entry) {
 		level.offset += length;
 		const auto body = [&](uint32_t dwords) { return dwords <= packet.size() && dwords <= length && Read(packet.data(), at, dwords * 4ull); };
 		// Waits on words the stream wrote are passed (the GPU's queues syncing); at any other, and at a rewind (the game
-		// may still be writing the commands after it), the scout waits until the render thread is past it.
+		// may still be writing the commands after it), the scout waits until the render thread is past it (false: it
+		// didn't).
 		const auto stop_here = [&] {
 			LiveCounters::Add(LiveCounters::ScoutWaitsStopped);
-			for (uint32_t spin = 0; !Passed(sequence, draws);) {
-				if (g_stop.load(std::memory_order_relaxed)) return false;
-				Pause(spin);
-			}
+			for (uint32_t spin = 0; !Passed(sequence, draws);)
+				if (g_stop.load(std::memory_order_relaxed) || !Pause(spin)) return false;
 			return true;
 		};
 		if (opcode == Pm4::IT_SET_SH_REG) {
@@ -539,11 +558,11 @@ bool Walk(State& state, const FeedEntry& entry) {
 			if (written) {
 				LiveCounters::Add(LiveCounters::ScoutWaitsPassed);
 			} else if (!stop_here()) {
-				return false;
+				return leave();
 			}
 		} else if (opcode == Pm4::IT_REWIND) {
 			LiveCounters::Add(LiveCounters::ScoutRewinds);
-			if (!stop_here()) return false;
+			if (!stop_here()) return leave();
 		} else if (opcode == Pm4::IT_NOP && header == 0xC0001024u) {
 			state.registers = {}; // (DISPATCH_RESET: the command processor's Reset)
 		} else if (IsDraw(opcode)) {
@@ -592,9 +611,8 @@ bool Walk(State& state, const FeedEntry& entry) {
 				if (lead < 0) break;
 				if (lead <= Lead && g_ring_tail.load(std::memory_order_relaxed) - g_ring_head.load(std::memory_order_acquire) < RingSlots)
 					break;
-				if (g_stop.load(std::memory_order_relaxed)) return false;
 				stalled = true;
-				Pause(spin);
+				if (g_stop.load(std::memory_order_relaxed) || !Pause(spin)) return leave();
 			}
 			if (stalled) LiveCounters::Add(LiveCounters::ScoutLeadStalls);
 			if (LeadOf(state, sequence, ordinal) < 0) {
@@ -643,10 +661,7 @@ void Main() {
 		if (g_stop.load(std::memory_order_acquire)) return;
 		const auto head = g_feed_head.load(std::memory_order_relaxed);
 		if (head == g_feed_tail.load(std::memory_order_acquire)) {
-			if (++spin < 2048) {
-				Pause(spin);
-				continue;
-			}
+			if (++spin < 2048 && Pause(spin)) continue;
 			g_wake.wait(wake, std::memory_order_acquire);
 			spin = 0;
 			continue;
@@ -654,11 +669,13 @@ void Main() {
 		spin             = 0;
 		const auto entry = g_feed[head % FeedEntries];
 		g_feed_head.store(head + 1, std::memory_order_release);
-		// (A submission the render thread is past: its commands may be the game's again; its registers are lost.)
-		if ((g_render.load(std::memory_order_acquire) >> 24u) > entry.sequence) {
+		// (A submission the render thread is past: its commands may be the game's again; its registers are lost. While
+		// the spin gate is shut, every submission: the scout stands down, its thread asleep between feeds.)
+		const bool shut = !SpinGate::Open(false);
+		if (shut || (g_render.load(std::memory_order_acquire) >> 24u) > entry.sequence) {
 			if (entry.reset) state->registers = {};
 			if (entry.constant) state->constant = entry.sequence;
-			LiveCounters::Add(LiveCounters::ScoutAbandoned);
+			LiveCounters::Add(shut ? LiveCounters::ScoutStoodDown : LiveCounters::ScoutAbandoned);
 			continue;
 		}
 		if (!Walk(*state, entry)) return;
