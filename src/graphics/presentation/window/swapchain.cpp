@@ -920,8 +920,9 @@ struct Presenter::Impl {
 			const auto shot      = Screenshot::Take();
 			auto       capture   = Screenshot::Record(window.graphic_ctx, command.Handle(), composed, shot);
 			auto       generated_capture =
-			    count > 0 && !shot.empty() ? Screenshot::Record(window.graphic_ctx, command.Handle(), generated[0], shot + ".gen.ppm")
-			                               : Screenshot::Pending {};
+			    count > 0 && !shot.empty() && !Screenshot::IsSeriesFrame(shot)
+			        ? Screenshot::Record(window.graphic_ctx, command.Handle(), generated[0], shot + ".gen.ppm")
+			        : Screenshot::Pending {};
 			frame.present_tick = present_scheduler.Submit();
 			if (capture.buffer != VK_NULL_HANDLE || generated_capture.buffer != VK_NULL_HANDLE) {
 				present_scheduler.Wait(frame.present_tick);

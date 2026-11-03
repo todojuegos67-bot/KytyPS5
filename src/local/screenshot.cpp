@@ -91,6 +91,10 @@ std::string Take() {
 	return SeriesMark;
 }
 
+bool IsSeriesFrame(const std::string& path) {
+	return path == SeriesMark;
+}
+
 namespace {
 
 // One frame of the series: box averages (every few texels of each box) appended to the series file.

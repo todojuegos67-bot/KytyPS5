@@ -20,6 +20,8 @@ void RequestSeries(const std::string& path, uint32_t count);
 inline constexpr uint32_t SeriesWidth = 320;
 // Present thread: the path asked for, once (empty: none).
 [[nodiscard]] std::string Take();
+// Take()'s path is a frame of a series (RequestSeries): one frame shown, not a file of its own (no ".gen.ppm" beside it).
+[[nodiscard]] bool IsSeriesFrame(const std::string& path);
 
 struct Pending {
 	VkBuffer      buffer = VK_NULL_HANDLE;
