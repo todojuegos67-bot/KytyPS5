@@ -559,6 +559,31 @@ int CurrentThreadPriority() {
 	return GetThreadPriority(GetCurrentThread());
 }
 
+bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus) {
+	// NtQuerySystemInformation's SystemProcessorPerformanceInformation (8): each processor of the calling thread's group.
+	struct ProcessorTimes {
+		LARGE_INTEGER idle, kernel, user, dpc, interrupt;
+		ULONG         interrupts;
+	};
+	using Query             = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+	static const auto query = reinterpret_cast<Query>(
+	    reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation")));
+	DWORD_PTR process = 0, system = 0;
+	if (query == nullptr || GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) return false;
+	ProcessorTimes times[64];
+	ULONG          returned = 0;
+	if (query(8, times, sizeof(times), &returned) < 0) return false;
+	uint64_t idle = 0, mask = 0;
+	for (size_t i = 0; i < std::min<size_t>(returned / sizeof(ProcessorTimes), 64); ++i) {
+		if (((process >> i) & 1u) == 0) continue;
+		idle += static_cast<uint64_t>(times[i].idle.QuadPart);
+		mask |= uint64_t {1} << i;
+	}
+	*idle_100ns = idle;
+	*cpus       = mask;
+	return mask != 0;
+}
+
 namespace {
 struct KeptFile {
 	HANDLE   handle     = INVALID_HANDLE_VALUE;
@@ -2287,6 +2312,38 @@ uint64_t CurrentThreadCycles() {
 
 int CurrentThreadPriority() {
 	return 0;
+}
+
+bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus) {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) return false;
+	FILE* stat = std::fopen("/proc/stat", "r");
+	if (stat == nullptr) return false;
+	static const long ticks = sysconf(_SC_CLK_TCK);
+	uint64_t          idle = 0, mask = 0;
+	char              line[512];
+	while (std::fgets(line, sizeof(line), stat) != nullptr) {
+		// "cpuN user nice system idle iowait ...": the processors' lines (not the "cpu " total).
+		unsigned           cpu = 0;
+		unsigned long long user = 0, nice = 0, system = 0, idle_ticks = 0, iowait = 0;
+		if (std::strncmp(line, "cpu", 3) != 0 || line[3] < '0' || line[3] > '9' ||
+		    std::sscanf(line, "cpu%u %llu %llu %llu %llu %llu", &cpu, &user, &nice, &system, &idle_ticks, &iowait) != 6 ||
+		    cpu >= 64 || !CPU_ISSET(cpu, &set))
+			continue;
+		idle += (idle_ticks + iowait) * 10'000'000ull / static_cast<uint64_t>(ticks > 0 ? ticks : 100);
+		mask |= uint64_t {1} << cpu;
+	}
+	std::fclose(stat);
+	*idle_100ns = idle;
+	*cpus       = mask;
+	return mask != 0;
+#else
+	(void)idle_100ns;
+	(void)cpus;
+	return false;
+#endif
 }
 
 uint64_t OpenKeptReadFile(const std::string& /*path*/, uint64_t* /*size*/) {
