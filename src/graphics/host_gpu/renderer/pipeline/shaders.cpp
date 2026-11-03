@@ -805,7 +805,7 @@ void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeli
 	}
 
 	vk::ComputePipelineCreateInfo info {};
-	// KYTY_FAST_COMPILE_WORDS=<n> (default 300000, 0 = off): compute shaders whose SPIR-V has more words
+	// KYTY_FAST_COMPILE_WORDS=<n> (default 100000, 0 = off): compute shaders whose SPIR-V has more words
 	// than that are created with DISABLE_OPTIMIZATION. Ghost of Yotei's packed-FP16 shaders translate to
 	// 1-2 MB of SPIR-V and the NVIDIA driver spent minutes optimizing each, freezing the game.
 	static const uint64_t fast_compile_words = [] {
