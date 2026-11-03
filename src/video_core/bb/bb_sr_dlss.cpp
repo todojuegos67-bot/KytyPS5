@@ -596,6 +596,17 @@ bool Evaluate(const Desc& desc) {
     const uint32_t tag_count = desc.has_reactive ? 5u : 4u;
     static const char* const tag_names[5]{"input colour", "output", "depth", "motion vectors",
                                           "reactive (bias current colour)"};
+    static bool tags_logged = false;
+    if (!tags_logged) {
+        // Once per run: each tag's format and whether its image and view exist.
+        tags_logged = true;
+        for (uint32_t i = 0; i < tag_count; ++i) {
+            BBLogf("DLSS: tag %u (%s): format %u, %ux%u, image %s, view %s", i, tag_names[i],
+                   tags[i].resource->nativeFormat, tags[i].resource->width,
+                   tags[i].resource->height, tags[i].resource->native != nullptr ? "yes" : "NULL",
+                   tags[i].resource->view != nullptr ? "yes" : "NULL");
+        }
+    }
     for (uint32_t i = 0; i < tag_count; ++i) {
         if (tags[i].resource->nativeFormat == 0) {
             static uint32_t reports = 0;

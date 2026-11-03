@@ -1150,6 +1150,25 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             Printf("[dlssg] slSetTagForFrame failed (%d), %u time(s)", static_cast<int>(tag_result),
                    tag_failures);
         }
+        static bool tags_dumped = false;
+        if (!tags_dumped) {
+            // Once per run: the format and view of each tag as Streamline gets it.
+            tags_dumped = true;
+            const auto show = [](const char* name, const Image& img) {
+                Printf("[dlssg] tag %s: format %u, image %s, view %s, %ux%u", name,
+                       static_cast<uint32_t>(static_cast<VkFormat>(img.format)),
+                       static_cast<VkImage>(img.image) != VK_NULL_HANDLE ? "yes" : "NULL",
+                       static_cast<VkImageView>(img.view) != VK_NULL_HANDLE ? "yes" : "NULL",
+                       img.extent.width, img.extent.height);
+            };
+            show("depth", inputs->depth);
+            show("motion", inputs->motion);
+            show("hudless", inputs->hudless);
+            Printf("[dlssg] tag hudless: tagged %s, options hudless format %u, backbuffer format %u",
+                   tag_hudless ? "yes" : "no",
+                   static_cast<uint32_t>(static_cast<VkFormat>(inputs->hudless.format)),
+                   static_cast<uint32_t>(static_cast<VkFormat>(format)));
+        }
         static bool dumped = false;
         if (!dumped) {
             dumped = true;
@@ -1168,13 +1187,14 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                    static_cast<int>(tag_result));
         }
     } else {
-        sl::ResourceTag tags[]{
-            sl::ResourceTag(nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent),
-            sl::ResourceTag(nullptr, sl::kBufferTypeMotionVectors,
-                            sl::ResourceLifecycle::eValidUntilPresent),
-        };
-        g_api.set_tag_for_frame(token, viewport, tags, static_cast<uint32_t>(std::size(tags)),
-                                nullptr);
+        // No 3D frame: no tags at all. The former null depth and motion tags had no format
+        // (Streamline: "Cannot have undefined format", about 2 a frame on menus and loads).
+        static uint32_t empty_failures = 0;
+        const auto empty_result =
+            g_api.set_tag_for_frame(token, viewport, nullptr, 0, nullptr);
+        if (empty_result != sl::Result::eOk && empty_failures++ < 4) {
+            Printf("[dlssg] empty tag set refused (%d)", static_cast<int>(empty_result));
+        }
     }
     if (guest_index == 0) g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
     g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
