@@ -32,6 +32,15 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+// Guest-address granule for new buffers. Lookups that miss used to create a buffer covering only
+// the requested 16 KiB page, so neighbouring misses each made their own buffer. A 64 KiB granule
+// lets nearby requests share one buffer. It divides both the low and extended guest regions, so
+// rounding never crosses LOWER_ADDRESS_SIZE or kExtendedMemoryBase.
+constexpr uint64_t CreateGranule = 64 * 1024;
+// Registered-buffer count above which idle clean buffers are evicted even without device-memory
+// pressure. Buffers are otherwise only freed by the memory-based GC, so the live count grew
+// without bound (3616 live in the 139ea49 log) while VRAM was still below the trigger.
+constexpr size_t MaxRegisteredBuffers = 1024;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -457,8 +466,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
-	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
-	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end = Common::AlignUp(vaddr + size, CreateGranule);
+	vaddr = Common::AlignDown(vaddr, CreateGranule);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
@@ -693,13 +702,17 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const bool memory_pressure = m_total_used_memory >= m_trigger_gc_memory;
+	// Count pressure evicts only clean buffers (dirty ones still need a download), so it does
+	// not add GPU waits. Clean buffers are recreated and re-uploaded on next use.
+	const bool count_pressure = m_buffers.size() > MaxRegisteredBuffers;
+	if (!memory_pressure && !count_pressure) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
-	const size_t   limit      = aggressive ? 64 : 32;
+	const uint64_t age        = std::min<uint64_t>(aggressive || count_pressure ? 80 : 160, tick);
+	const size_t   limit      = aggressive || count_pressure ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
