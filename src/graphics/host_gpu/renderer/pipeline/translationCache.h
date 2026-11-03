@@ -12,8 +12,7 @@
 namespace Libs::Graphics::TranslationCache {
 
 // Persistent guest->SPIR-V translation cache (_PipelineCache/<title>.xlat).
-// Key: 128-bit hash of everything a permutation's SPIR-V depends on (guest code bytes and
-// address, stage static key, resource specialization, push-data cursor, called function code,
+// Key: 128-bit hash of everything a permutation's SPIR-V depends on (guest code bytes, stage static key, resource specialization, push-data cursor, called function code,
 // device features and the recompiler's environment switches), salted with the build's git
 // revision, so any change to the translator invalidates the whole file. Value: SPIR-V plus the
 // CompiledShaderInfo (reflection/bindings) that CompileProgram would have produced.

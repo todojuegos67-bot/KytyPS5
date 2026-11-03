@@ -510,8 +510,8 @@ struct PipelineCache::ProgramCache {
 		std::fflush(stdout);
 	}
 
-	// Everything a permutation's SPIR-V and reflection depend on, for the on-disk cache. The guest
-	// code address is included because translation may fold PC-relative data reads.
+	// Everything a permutation's SPIR-V and reflection depend on, for the on-disk cache. Code words
+	// are hashed by content; the blob's address is not part of the key (see below).
 	static TranslationCache::Key DiskKey(const ShaderParams& params, const ProgramKey& key,
 	                                     const ShaderRecompiler::IR::ResourceSpecialization& spec,
 	                                     uint32_t push_data_cursor, std::span<const uint32_t> function_code,
@@ -524,9 +524,11 @@ struct PipelineCache::ProgramCache {
 		k.Words(key.static_state);
 		k.Words(params.code);
 		k.Words(params.back_code);
-		k.Value(params.Base());
-		// The fused back-shader words are hashed above. Their host pointer changes on every run
-		// (ASLR), so including it made every translation-cache lookup miss.
+		// params.Base() (the shader blob's address) is not hashed: PC-relative table reads are
+		// resolved inside the blob's own words (ShaderCFG ResolvePcRelativeBase, bounds-checked
+		// against program.code), so the address never reaches the SPIR-V. The address is allocator
+		// dependent and can differ between runs, so including it made lookups miss across runs.
+		// The fused back-shader words are hashed above for the same reason.
 		k.Value(static_cast<uint32_t>(spec.buffers.size()));
 		for (const auto& b: spec.buffers) {
 			k.Value(b.packed_stride); k.Value(b.descriptor_format); k.Value(b.descriptor_swizzle);

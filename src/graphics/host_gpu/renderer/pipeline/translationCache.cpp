@@ -416,6 +416,13 @@ std::optional<Entry> Find(const Key& key) {
 	const auto found = c.index.find(key);
 	if (found == c.index.end()) {
 		c.misses.fetch_add(1, std::memory_order_relaxed);
+		static std::atomic<uint32_t> logged_miss {0};
+		if (logged_miss.fetch_add(1) < 3) {
+			std::printf("TranslationCache: lookup miss key=%016llx%016llx (index has %zu)\n",
+			            static_cast<unsigned long long>(key.a), static_cast<unsigned long long>(key.b),
+			            c.index.size());
+			std::fflush(stdout);
+		}
 		return std::nullopt;
 	}
 	const auto loc = found->second;
@@ -469,6 +476,15 @@ void Store(const Key& key, std::span<const uint32_t> spirv, const CompiledShader
 			}
 			c.rejects.fetch_add(1, std::memory_order_relaxed);
 			return;
+		}
+	}
+	{
+		static std::atomic<uint32_t> logged_store {0};
+		if (logged_store.fetch_add(1) < 3) {
+			std::printf("TranslationCache: store key=%016llx%016llx spirv=%zu words\n",
+			            static_cast<unsigned long long>(key.a), static_cast<unsigned long long>(key.b),
+			            spirv.size());
+			std::fflush(stdout);
 		}
 	}
 	std::vector<uint8_t> record;
