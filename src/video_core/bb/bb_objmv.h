@@ -65,9 +65,9 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
             const AmdGpu::Regs& regs, bool indexed, u32 index_offset, u32 vertex_offset,
             u32 instance_offset, u64 vs_hash);
 // After the camera motion pass (bb_mv.comp; `mv` in General layout, written): the object vectors
-// over the camera ones.
+// over the camera ones. `late`: the upscale runs after the guest flip (the presenter's late path).
 void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, vk::Extent2D render,
-             bool reset);
+             bool reset, bool late);
 // The guest flip (end of a frame).
 void OnFlip();
 

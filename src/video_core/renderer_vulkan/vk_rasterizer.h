@@ -58,7 +58,7 @@ public:
     bool BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& flip, vk::Format view_format,
                             vk::ImageView& out_view, vk::Extent2D& out_size);
     // Copies the presented image (before its HUD) and records the window-size upscale of it.
-    bool BBPresentUpscale(VideoCore::Image& flip);
+    bool BBPresentUpscale(VideoCore::Image& flip, bool late = false);
     static const char* BBPresentWhy();
     // Bloodborne: the end of the presenter's pass, the last per-stage GPU timestamp.
     static void BBStampPresentEnd(vk::CommandBuffer cmd);
@@ -221,7 +221,7 @@ private:
                         vk::ImageLayout& out_layout);
     void BBHudlessCopy(VideoCore::Image& flip);
     bool BBRecordUpscale(vk::Image image, vk::ImageView view, vk::Format format,
-                         vk::ImageUsageFlags usage);
+                         vk::ImageUsageFlags usage, bool late = false);
     void BBOnDraw(u32 num_cb);
     bool attachment_feedback_loop{};
     bool needs_barrier{};

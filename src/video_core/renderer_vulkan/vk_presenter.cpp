@@ -823,7 +823,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     rasterizer->BBSetPresentViewFormat(view_info.format);
     // Bloodborne: no HUD point this frame (no HUD drawn): the window-size upscale runs here.
     if (BB::Upscale::Enabled() && BB::Upscale::TakeLateUpscale() &&
-        !rasterizer->BBPresentUpscale(image)) {
+        !rasterizer->BBPresentUpscale(image, true)) {
         BB::Upscale::OnPresentFailed(rasterizer->BBPresentWhy());
     }
 

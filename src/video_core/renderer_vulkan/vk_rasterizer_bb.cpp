@@ -872,7 +872,7 @@ const char* Rasterizer::BBPresentWhy() {
     return g_bb.present_why;
 }
 
-bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
+bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip, bool late) {
     const auto& plan = BB::Upscale::CurrentPlan();
     g_bb.present_ready = false;
     if (!InitOnce(instance) || !InitHud()) {
@@ -986,7 +986,7 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip) {
     Stamp(cmd, 1);
     g_bb.present_src_format = flip.info.pixel_format;
     if (!BBRecordUpscale(g_bb.present_in.image, g_bb.present_in.view, g_bb.present_in.format,
-                         g_bb.present_in.usage)) {
+                         g_bb.present_in.usage, late)) {
         g_bb.present_why = "the upscaler dispatch was not recorded (depth / back end)";
         return false;
     }
@@ -1182,7 +1182,8 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
 }
 
 bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view,
-                                 vk::Format color_format, vk::ImageUsageFlags color_usage) {
+                                 vk::Format color_format, vk::ImageUsageFlags color_usage,
+                                 bool late) {
     const auto& plan = BB::Upscale::CurrentPlan();
     PollCheck(scheduler);
     if (!bb_gb_depth_valid) {
@@ -1325,7 +1326,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
     }
     // Object motion vectors (bb_objmv.h) over the camera ones.
-    BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset);
+    BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset, late);
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);

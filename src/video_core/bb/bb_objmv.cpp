@@ -63,6 +63,7 @@ struct State {
     vk::ImageView view{};
     u32 width = 0, height = 0;
     bool written = false;   // this frame's G-buffer pass wrote it
+    bool latched = false;   // the same, for the frame that the guest flip has just ended
     bool cleared = false;   // this frame's first motion pass cleared it
     // The compose pass.
     vk::DescriptorSetLayout set_layout{};
@@ -77,7 +78,7 @@ struct State {
     std::unordered_map<u64, u64> palettes; // small skeletons: last palette hash
     // Stats (since the last report).
     u64 st_motion_draws = 0, st_tracked = 0, st_loaded = 0, st_overflow = 0, st_gated = 0,
-        st_frames = 0, st_composed = 0;
+        st_frames = 0, st_composed = 0, st_composed_late = 0;
 };
 State g;
 
@@ -437,8 +438,12 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
 }
 
 void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, vk::Extent2D render,
-             bool reset) {
-    if (!g.ready || !g.written || reset || g.width != render.width || g.height != render.height) {
+             bool reset, bool late) {
+    // In the frame's own command stream (before the flip) the G-buffer pass of this frame is
+    // `written`. The presenter's late upscale runs after the flip (OnFlip has already cleared
+    // `written`), so it reads the flag that OnFlip latched for the frame it presents.
+    const bool wrote = late ? g.latched : g.written;
+    if (!g.ready || !wrote || reset || g.width != render.width || g.height != render.height) {
         return;
     }
     ImageBarrier(cmd, g.image, vk::ImageLayout::eGeneral,
@@ -467,6 +472,7 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
     ++g.st_composed;
+    if (late) ++g.st_composed_late;
 }
 
 void OnFlip() {
@@ -479,17 +485,18 @@ void OnFlip() {
     g.cursor = 0;
     g.params_used = 0;
     g.cleared = false;
+    g.latched = g.written;
     g.written = false;
     if (g.palettes.size() > 65536) g.palettes.clear();
     if (g.st_frames >= 1800) {
         Log(fmt::format("last {} frames: {} G-buffer draws with the motion pipeline, {} tracked "
                         "(skinned / moving), {} with last frame's positions (object vectors), {} "
                         "small skeletons unchanged (camera motion), {} over the budget, composed "
-                        "into the motion vectors {} times",
+                        "into the motion vectors {} times ({} after the flip)",
                         g.st_frames, g.st_motion_draws, g.st_tracked, g.st_loaded, g.st_gated,
-                        g.st_overflow, g.st_composed));
+                        g.st_overflow, g.st_composed, g.st_composed_late));
         g.st_frames = g.st_motion_draws = g.st_tracked = g.st_loaded = g.st_gated =
-            g.st_overflow = g.st_composed = 0;
+            g.st_overflow = g.st_composed = g.st_composed_late = 0;
     }
 }
 
