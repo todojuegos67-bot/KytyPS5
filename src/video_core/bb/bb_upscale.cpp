@@ -206,6 +206,10 @@ Config ParseConfig() {
     if (const char* s = Env("BB_UPSCALE_LOG_EVERY")) {
         c.log_every = std::max(60, std::atoi(s));
     }
+    if (c.kind == SR::Kind::Off && BB::FG::Cfg().kind != BB::FG::Kind::Off) {
+        c.kind = SR::Kind::Native;
+        c.quality = SR::Quality::Native;
+    }
 #if defined(_WIN32)
     // FSR 4's ported runtime picks its model from BB_FSR4_PRESET: from the mode unless given.
     if (c.kind == SR::Kind::Fsr4 && Env("BB_FSR4_PRESET") == nullptr) {
