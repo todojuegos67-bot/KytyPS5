@@ -34,7 +34,7 @@ $script:defaults = [ordered]@{
 	winres = 'auto'; intres = '1920x1080'; fsmode = '1'; present = '1'; fps = '1'; patches = '1'; useupdate = '1'
 	hdr = '0'; showfps = '0'; metricas = '0'
 	upscaler = '0'; upmode = '1'; sharp = '75'; framegen = '0'; sceneup = '0'; bbfg = '0'; antilag = '0'; reflex = '1'
-	q_shadows = '0'; q_ao = '0'; q_fog = '0'; q_aniso = '0'; q_ca = '0'; q_blur = '0'; q_grain = '0'
+	tex = '1'; q_shadows = '0'; q_ao = '0'; q_fog = '0'; q_aniso = '0'; q_ca = '0'; q_blur = '0'; q_grain = '0'
 	input = '0'; motion = '0'; bginput = '0'
 	ram16 = '0'; experimental = '0'; modo = '4'; safemode = '1'; soundfix = '1'
 }
@@ -459,6 +459,7 @@ $script:fgModes = @(
 $script:fgList = @($script:fgModes | ForEach-Object { $_[0] })
 $script:quality = @(
 	# clave ini, texto, opciones, variable BB_*, patron de parche de shadPS4 (si existe, la opcion es real)
+	@('tex',       (T 'Calidad de texturas' 'Texture quality'), @((T 'Bajo' 'Low'), (T 'Normal' 'Normal'), (T 'Alto' 'High'), (T 'Ultra' 'Ultra')), 'BB_TEX_QUALITY', ''),
 	@('q_shadows', (T 'Sombras' 'Shadows'), @((T 'Como PS4' 'PS4'), (T 'Altas' 'High'), (T 'Ultra' 'Ultra')), 'BB_SHADOWS', ''),
 	@('q_ao',      (T 'Oclusión ambiental' 'Ambient occlusion'), @((T 'Como PS4' 'PS4'), (T 'Mejorada' 'Improved')), 'BB_AO', ''),
 	@('q_fog',     (T 'Niebla volumétrica' 'Volumetric fog'), @((T 'Como PS4' 'PS4'), (T 'Alta' 'High')), 'BB_FOG', ''),
