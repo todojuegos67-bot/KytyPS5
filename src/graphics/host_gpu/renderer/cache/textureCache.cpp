@@ -1930,6 +1930,9 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	// Per-run budget for detiling GPU-written tiled images back to guest memory before eviction.
+	constexpr uint64_t kGcWriteBackBudget = 256ull * 1024 * 1024;
+	m_gc_written_back_bytes               = 0;
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
@@ -1949,11 +1952,14 @@ void TextureCache::RunGarbageCollector() {
 		// oldest LRU entries once a game keeps a few render targets alive, so the head of the LRU
 		// clogged and nothing was ever evicted: VRAM grew past 16 GB (Yotei menus). They are now
 		// passed over (and counted), so the budget goes to images that can actually be freed.
+		// Tiled GPU-written images are candidates under pressure too: they are written back
+		// (budgeted below) and freed. Never freeing them kept every render target alive, so
+		// creation outran eviction and VRAM went past its budget.
 		size_t passed_over = 0;
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
 			const auto* image = m_slot_images.try_get(id);
 			if (image != nullptr && image->registered && !image->depth_id && image->IsGpuModified() &&
-			    image->SafeToDownload() && (image->info.IsTiled() || !pressured)) {
+			    image->SafeToDownload() && !pressured) {
 				++passed_over;
 				return false;
 			}
@@ -1971,15 +1977,25 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
-				const bool safe = owner->SafeToDownload();
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
+				const bool     safe  = owner->SafeToDownload();
+				const bool     tiled = owner->info.IsTiled();
+				const uint64_t bytes = owner->info.data.size;
 				if (safe && !pressured) {
 					continue;
 				}
-				if (safe && !DownloadImageMemory(id)) {
-					continue;
+				if (safe) {
+					// Detiling a write-back costs GPU work, so it is budgeted per run. The first
+					// write-back is always allowed so one large image cannot stall the frame.
+					if (tiled && m_gc_written_back_bytes != 0 &&
+					    m_gc_written_back_bytes + bytes > kGcWriteBackBudget) {
+						continue;
+					}
+					if (!DownloadImageMemory(id)) {
+						continue;
+					}
+					if (tiled) {
+						m_gc_written_back_bytes += bytes;
+					}
 				}
 			}
 			FreeImage(id);

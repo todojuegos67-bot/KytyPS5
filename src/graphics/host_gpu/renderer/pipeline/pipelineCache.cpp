@@ -525,7 +525,8 @@ struct PipelineCache::ProgramCache {
 		k.Words(params.code);
 		k.Words(params.back_code);
 		k.Value(params.Base());
-		k.Value(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(params.back_code.data())));
+		// The fused back-shader words are hashed above. Their host pointer changes on every run
+		// (ASLR), so including it made every translation-cache lookup miss.
 		k.Value(static_cast<uint32_t>(spec.buffers.size()));
 		for (const auto& b: spec.buffers) {
 			k.Value(b.packed_stride); k.Value(b.descriptor_format); k.Value(b.descriptor_swizzle);

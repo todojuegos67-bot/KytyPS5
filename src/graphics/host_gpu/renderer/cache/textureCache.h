@@ -176,6 +176,7 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_gc_evicted     = 0; // 5 s report
 	size_t   m_gc_passed_over = 0;
+	uint64_t m_gc_written_back_bytes = 0; // tiled write-back bytes this GC run
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
