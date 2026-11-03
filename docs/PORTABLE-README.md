@@ -360,6 +360,17 @@ There are two levels of preparation, both specific to the graphics card and driv
 
 ## Controls
 
+The Windows launcher also offers **Game → Keyboard and mouse prompts**, off by default.
+For an extracted PPSA01341 v1.07 game folder, it applies 22 English key/mouse icons and matching
+keyboard/mouse bindings on Play. **Game → Keyboard controls → Edit controls…** lets you change
+keys, mouse buttons, wheel directions and sensitivity; the prompts follow the saved layout.
+Press **F7** to capture/release the mouse for camera control. Disabling the option restores
+backed-up original icons on the next Play and stops applying these bindings; `launch.json`
+is not rewritten. The keyboard labels remain visible when using a controller.
+Other game versions and ZArchive files are not supported by this option. See the
+[prompt pack and label mapping](https://github.com/chenxiao07/KytyPS5/tree/experiment/perf-40fps-20260926/tools/keyboard-prompts)
+for installation, restoration and customization details.
+
 A gamepad is recommended (DualSense, DualShock 4 and Xbox controllers work; just plug them in). An Xbox pad's View
 button is the touchpad. Holding the PS button (an Xbox pad's Guide button) for two seconds quits the game, as closing
 the window does (in Steam Big Picture, Steam keeps that button for its overlay unless set to pass it to the game).

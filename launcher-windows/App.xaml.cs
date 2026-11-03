@@ -63,7 +63,7 @@ public partial class App : Application {
 				Environment.SetEnvironmentVariable("KYTY_RETURN_FOCUS", focus);
 				Environment.SetEnvironmentVariable("KYTY_RETURN_FOCUS_PID", parent);
 				try {
-					var process = commands.Start(commands.PlayArguments(game, true), true);
+					var process = commands.StartPlay(true);
 					// Steam counts the game as running while this process lasts (its controller layout, play time).
 					new Thread(() => {
 						process.WaitForExit();
@@ -92,6 +92,7 @@ public partial class App : Application {
 		base.MainWindow = window;
 		if (screenshots != null) {
 			window.SaveScreenshots(screenshots);
+			new KeyboardControlsWindow(context.Settings).SaveScreenshot(Path.Combine(screenshots, "8-keyboard-controls.png"));
 			Shutdown(0);
 			return;
 		}

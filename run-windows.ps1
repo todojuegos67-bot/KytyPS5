@@ -81,6 +81,8 @@ param(
 	[int]$Vblank = 0,
 	[switch]$Fps120,
 	[switch]$LowLatency,
+	[switch]$KeyboardMouseControls,
+	[string]$KeyboardMouseBindings = '',
 	[int]$RenderHeight = 0,
 	[switch]$HdOutput,
 	[int]$OutputHeight = 0,
@@ -223,6 +225,42 @@ for ($i = $start; $i -lt $command.Count; $i++) {
 function Set-Option([string]$name, [string]$value) {
 	$at = $options.IndexOf($name)
 	if ($at -ge 0) { $options[$at + 1] = $value } else { $options.Add($name); $options.Add($value) }
+}
+# The launcher's keyboard prompt artwork matches the requested layout. Append its bindings only
+# for this launch: the emulator resolves conflicts in favour of the last mapping.
+# Existing sensitivity and non-conflicting mouse-wheel bindings remain intact.
+# launch.json is never rewritten; switching off restores the user's normal bindings.
+if ($KeyboardMouseControls) {
+	$bindings = @(
+		'Cross=E', 'Circle=Space', 'Square=R', 'Triangle=F',
+		'L1=Left Shift', 'L2=Left Ctrl', 'L3=X',
+		'R1=Mouse:Left', 'R2=Mouse:Right', 'R3=Mouse:Middle', 'Options=Escape',
+		'Up=Up', 'Down=Down', 'Left=Left', 'Right=Right',
+		'TouchPad=Tab', 'TouchPadRight=Backspace',
+		'LeftStickUp=W', 'LeftStickDown=S', 'LeftStickLeft=A', 'LeftStickRight=D'
+    )
+    if ($KeyboardMouseBindings) {
+        $custom = ConvertFrom-Json -InputObject ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($KeyboardMouseBindings)))
+        if ($custom -isnot [array]) { throw 'Invalid keyboard layout' }
+        $controls = @($bindings | ForEach-Object { ($_ -split '=',2)[0] })
+        $seen = @{}; $inputs = @{}
+        foreach ($binding in $custom) {
+            if ($binding -isnot [string] -or $binding -notmatch '^([A-Za-z][A-Za-z0-9]*)=([A-Za-z0-9: .+*/=\\;,\[\]''`-]+)$') { throw 'Invalid keyboard binding' }
+            $control,$inputName = $binding -split '=',2
+            if ($seen.ContainsKey($control)) { throw "Duplicate keyboard control: $control" }
+            $seen[$control] = $true
+            if ($control -eq 'MouseSensitivity') {
+                $number = 0.0
+                if (![double]::TryParse($inputName,[Globalization.NumberStyles]::AllowDecimalPoint,[Globalization.CultureInfo]::InvariantCulture,[ref]$number) -or $number -lt 0.1 -or $number -gt 5) { throw 'Invalid mouse sensitivity' }
+            } else {
+                if ($control -cnotin $controls -or $inputs.ContainsKey($inputName) -or $inputName -in @('F7','F8','F11','Pause')) { throw 'Invalid or conflicting keyboard binding' }
+                $inputs[$inputName] = $true
+            }
+        }
+        if (@($controls | Where-Object { !$seen.ContainsKey($_) }).Count) { throw 'Incomplete keyboard layout' }
+        $bindings = $custom
+    }
+    foreach ($binding in $bindings) { $options.Add('--keymap'); $options.Add($binding) }
 }
 if ($Width -gt 0) { Set-Option '--screen-width' "$Width" }
 if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }

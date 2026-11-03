@@ -169,6 +169,9 @@ sealed class Commands {
 		if (FsrUpscaler && (fsrSharpness == "0" || fsrSharpness == "0.3" || fsrSharpness == "0.9")) sets.Add("KYTY_FSR_SHARPNESS=" + fsrSharpness);
 		// The Advanced page's extra options: their -Set pairs join (or replace) the launcher's own.
 		var extra = ExtraOptions();
+		if (S.Bool("keyboard_prompts"))
+			extra.RemoveAll(option => string.Equals(option.Key, "-KeyboardMouseControls", StringComparison.OrdinalIgnoreCase) ||
+					string.Equals(option.Key, "-KeyboardMouseBindings", StringComparison.OrdinalIgnoreCase));
 		foreach (var option in extra) {
 			if (!IsSet(option.Key) || option.Value == null) continue;
 			foreach (var pair in Regex.Split(option.Value, ",(?=[A-Za-z_][A-Za-z0-9_]*=)")) {
@@ -188,6 +191,9 @@ sealed class Commands {
 			arguments.Add(option.Key);
 			if (option.Value != null) arguments.Add(option.Value.IndexOf(' ') >= 0 ? Quote(option.Value) : option.Value);
 		}
+		// Applied after Advanced options so artwork and edited bindings agree for this launch.
+		// Both GUI Play and --play use this command; no persistent input config is changed.
+		if (S.Bool("keyboard_prompts")) arguments.AddRange(new[] { "-KeyboardMouseControls", "-KeyboardMouseBindings", KeyboardLayout.Read(S).Encoded() });
 		// The console stays for the live log; after a crash it waits for a key (not when direct).
 		return PowerShell() + " " + string.Join(" ", arguments) + (direct ? "" : " & if !errorlevel! neq 0 pause");
 	}
@@ -238,6 +244,12 @@ sealed class Commands {
 			options.Add(new KeyValuePair<string, string>(name, value));
 		}
 		return options;
+	}
+
+	public Process StartPlay(bool direct = false) {
+		var game = GameInfo.Read(S.Str("game"), context.PrecompileTool, context.Root);
+		KeyboardPrompts.Apply(game, S.Bool("keyboard_prompts"), S.Bool("keyboard_prompts") ? KeyboardLayout.Read(S) : null);
+		return Start(PlayArguments(game.Found ? game : null, direct), direct);
 	}
 
 	public string PlayArguments(GameInfo game = null, bool direct = false) {

@@ -70,7 +70,7 @@ partial class MainWindow : Window {
 	// The Sharpening row's value for each upscaler ("0" to "0.9"), and the upscaler whose value it shows.
 	string dlssSharpness = "0", fsrSharpness = "0.6", sharpnessShown = "";
 	CheckBox fullscreen, aspect, wideBars, hdr, fps120, vsync, lowLatency, fsr, cheats, redzone, safeGpu, ecores, presentDirect, vrrFlips,
-		antiLag, keepResident, fps30, padSpeaker, reopenLauncher;
+		antiLag, keepResident, fps30, padSpeaker, reopenLauncher, keyboardPrompts;
 	TextBlock renderNote, outputNote, upscalerNote, frameGenNote, streamlineText, cheatState, bannerTitle, bannerLine, storeLine;
 	Image banner;
 	Border bannerFallback;
@@ -788,11 +788,17 @@ partial class MainWindow : Window {
 		choose.Margin = new Thickness(16, 0, 0, 0);
 		cheatState = new TextBlock { Foreground = Res<Brush>("TextDimBrush"), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 0, 0) };
 		padSpeaker = Switch(S.Bool("pad_speaker"));
+		keyboardPrompts = Switch(S.Bool("keyboard_prompts"));
 		return Page("game.title",
 			Section("game.console"),
 			Row("language", language, Desc(T("language.desc"))),
 			Row("audiooutput", audioOutput, Desc(T("audiooutput.desc"))),
 			Section("game.controller"),
+			Row("keyboardprompts", keyboardPrompts, Desc(T("keyboardprompts.desc"))),
+			Row("keyboardcontrols", FlatButton("keyboardcontrols.edit", (s, e) => {
+				try { new KeyboardControlsWindow(S) { Owner = this }.ShowDialog(); }
+				catch (Exception error) { MessageBox.Show(this, error.Message, T("keyboardcontrols")); }
+			}), Desc(T("keyboardcontrols.desc"))),
 			Row("padspeaker", padSpeaker, Desc(T("padspeaker.desc"))),
 			Row("padvolume", SliderRow(0, 100, 5, S.Int("pad_speaker_volume"),
 				v => ((int)v).ToString(CultureInfo.InvariantCulture), v => S.Set("pad_speaker_volume", (int)v)), Desc(T("padvolume.desc"))),
@@ -972,6 +978,7 @@ partial class MainWindow : Window {
 		S.Set("hdr", hdr.IsChecked == true);
 		S.Set("cheats", cheats.IsChecked == true);
 		S.Set("pad_speaker", padSpeaker.IsChecked == true);
+		S.Set("keyboard_prompts", keyboardPrompts.IsChecked == true);
 		if (reopenLauncher != null) S.Set("reopen_launcher", reopenLauncher.IsChecked == true);
 		S.Set("safegpu", safeGpu.IsChecked == true);
 		S.Set("hud", Math.Max(0, hud.SelectedIndex));
@@ -1068,7 +1075,7 @@ partial class MainWindow : Window {
 		ReadForm();
 		Process process;
 		try {
-			process = commands.Start(commands.PlayArguments(game.Found ? game : null));
+			process = commands.StartPlay();
 		} catch (Exception e) {
 			MessageBox.Show(this, F("error.start", e.Message), T("error.title"), MessageBoxButton.OK, MessageBoxImage.Error);
 			return;
