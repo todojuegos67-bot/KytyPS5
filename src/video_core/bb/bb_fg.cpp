@@ -581,6 +581,8 @@ double PaceInterval();
 bool Generating();
 void NoteSlept(double seconds);
 bool ReflexInGame();
+// The Reflex frame limit now in force (us; 0: none). Written where slReflexSetOptions is called.
+inline std::atomic<uint32_t> g_reflex_limit_us{0};
 }
 
 // The adaptive grid (BB_FG_PACE_ADAPT=0: off). With no cap, the real flips are held on a grid at
@@ -852,7 +854,11 @@ void PaceGuestFlip() {
     // follows the game's own wandering frame time, 14-17 ms, and spaces the presents unevenly).
     (void)Cfg();
     const int cap = g_fps_cap.load();
+    // Reflex in the game only paces the presents when it has a frame limit. With no cap and no
+    // Reflex limit (BB_FPS_CAP=0, default KYTY_DLSSG_PACE) nobody spaced them (sd 2.3 ms, peaks
+    // 63 ms): keep the grid pacer on then.
     const bool reflex_paced = Dlssg::ReflexInGame() && Dlssg::Generating() &&
+                              Dlssg::g_reflex_limit_us.load(std::memory_order_relaxed) != 0 &&
                               (cap == 0 || g_fps_auto.load(std::memory_order_relaxed));
     if (reflex_paced) {
         interval = 0.0;
@@ -1044,6 +1050,7 @@ void ApplyLimit(int gen) {
         return;
     }
     g_reflex_opts.frameLimitUs = us;
+    Dlssg::g_reflex_limit_us = us;
     if (const auto result = g_api.reflex_set_options(g_reflex_opts); result != sl::Result::eOk) {
         Printf("frame generation: slReflexSetOptions (limit) failed (%d)", static_cast<int>(result));
     }
@@ -1225,7 +1232,9 @@ void OnDevice(vk::PhysicalDevice physical) {
     sl::ReflexOptions& reflex = g_reflex_opts;
     reflex = {};
     reflex.mode = sl::ReflexMode::eLowLatency;
-    if (const char* mode = Env("KYTY_DLSSG_REFLEX"); mode != nullptr) {
+    const char* mode = Env("KYTY_DLSSG_REFLEX");
+    if (mode == nullptr) mode = Env("BB_DLSSG_REFLEX"); // the launcher's choice (off/low/boost)
+    if (mode != nullptr) {
         if (std::string(mode) == "off") reflex.mode = sl::ReflexMode::eOff;
         if (std::string(mode) == "boost") reflex.mode = sl::ReflexMode::eLowLatencyWithBoost;
     }
@@ -1262,6 +1271,7 @@ void OnDevice(vk::PhysicalDevice physical) {
                    cap, static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
         }
     }
+    Dlssg::g_reflex_limit_us = reflex.frameLimitUs;
     Printf("Frame generation: Reflex mode %d", static_cast<int>(reflex.mode));
     if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
         Printf("frame generation: slReflexSetOptions failed (%d)", static_cast<int>(result));
