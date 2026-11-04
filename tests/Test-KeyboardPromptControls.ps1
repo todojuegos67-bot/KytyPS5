@@ -40,8 +40,8 @@ $root = $FixtureRoot
     $settings.Set('extra_args', '-KeyboardMouseControls')
     Check (([regex]::Matches($commands.PlayCommand($null,$true), '-KeyboardMouseControls')).Count -eq 1) 'Duplicate control switch'
     $script = Join-Path $root 'run-windows.ps1'
-    $off = & $script -Game $game -DryRun 6>&1 | Out-String
-    $on = & $script -Game $game -KeyboardMouseControls -DryRun 6>&1 | Out-String
+    $off = & $script -Game $game -DryRun 6>&1 | Out-String -Width 10000
+    $on = & $script -Game $game -KeyboardMouseControls -DryRun 6>&1 | Out-String -Width 10000
     foreach ($binding in @('Cross=E','Circle=Space','Square=R','Triangle=F','L1=Left Shift','L2=Left Ctrl','L3=X','R1=Mouse:Left','R2=Mouse:Right','R3=Mouse:Middle','Options=Escape','Up=Up','Down=Down','Left=Left','Right=Right','TouchPad=Tab','TouchPadRight=Backspace','LeftStickUp=W','LeftStickDown=S','LeftStickLeft=A','LeftStickRight=D')) {
         Check ($on.Contains($binding)) ('Missing binding: ' + $binding)
         Check (!$off.Contains($binding)) ('Disabled option added binding: ' + $binding)
@@ -53,7 +53,7 @@ $root = $FixtureRoot
     $line = $commands.PlayCommand($null,$true)
     Check ($line -match '-KeyboardMouseBindings ([A-Za-z0-9+/=]+)') 'Custom layout was not serialized'
     $encoded = $Matches[1]
-    $custom = & $script -Game $game -KeyboardMouseControls -KeyboardMouseBindings $encoded -DryRun 6>&1 | Out-String
+    $custom = & $script -Game $game -KeyboardMouseControls -KeyboardMouseBindings $encoded -DryRun 6>&1 | Out-String -Width 10000
     Check ($custom.Contains('Cross=Q') -and !$custom.Contains('Cross=E')) 'Custom action did not reach emulator command'
     Check ($custom.Contains('MouseSensitivity=2.4')) 'Custom sensitivity missing'
     Check ($custom.Contains('Up=Mouse:WheelUp')) 'Existing wheel alias was lost'
@@ -61,7 +61,7 @@ $root = $FixtureRoot
         $settings.Set('keyboard_binding_Cross',$inputName)
         $line=$commands.PlayCommand($null,$true)
         Check ($line -match '-KeyboardMouseBindings ([A-Za-z0-9+/=]+)') 'Missing encoded layout'
-        $special = & $script -Game $game -KeyboardMouseControls -KeyboardMouseBindings $Matches[1] -DryRun 6>&1 | Out-String
+        $special = & $script -Game $game -KeyboardMouseControls -KeyboardMouseBindings $Matches[1] -DryRun 6>&1 | Out-String -Width 10000
         Check ($special.Contains('Cross='+$inputName)) ('Special key failed: '+$inputName)
     }
     $settings.Set('keyboard_binding_Cross','R')
