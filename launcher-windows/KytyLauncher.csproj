@@ -28,6 +28,7 @@
   <ItemGroup>
     <Reference Include="System" />
     <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
     <Reference Include="System.Management" />
     <Reference Include="System.Xaml" />
     <Reference Include="System.Xml" />
@@ -64,6 +65,14 @@
       <DependentUpon>CheatsWindow.xaml</DependentUpon>
     </Compile>
     <Compile Include="Settings.cs" />
+    <Compile Include="KeyboardPrompts.cs" />
+    <Compile Include="KeyboardLayout.cs" />
+    <Compile Include="PromptTexture.cs" />
+    <Compile Include="KeyboardControlsWindow.cs" />
+    <EmbeddedResource Include="KeyboardPrompts\*">
+      <WithCulture>false</WithCulture>
+      <LogicalName>KytyLauncher.KeyboardPrompts.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
     <Compile Include="Platform.cs" />
     <Compile Include="Game.cs" />
     <Compile Include="Commands.cs" />

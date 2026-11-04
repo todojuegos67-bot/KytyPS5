@@ -38,6 +38,11 @@ static class Strings {
 	public static string[] ConsoleLanguages { get { return Language == UiLanguage.Chinese ? ConsoleLanguagesChinese : ConsoleLanguagesEnglish; } }
 
 	static readonly Dictionary<string, string> English = new Dictionary<string, string> {
+		{"keyboardprompts", "Keyboard and mouse prompts"},
+		{"keyboardcontrols", "Keyboard controls"},
+		{"keyboardcontrols.edit", "Edit controls…"},
+		{"keyboardcontrols.desc", "Remap keys and mouse buttons, preview matching labels and adjust mouse sensitivity. Changes apply on Play when keyboard prompts are enabled."},
+		{"keyboardprompts.desc", "Optional English key icons, applied on Play. Turning this off restores the original icons on the next Play. Uses your edited controls for this launch and generates matching icons. Defaults: E interact, Space dodge/back, R item, F two-hand, Shift/Ctrl left actions, left/right mouse attacks, middle mouse lock-on, X left-stick press, WASD move, arrows D-pad, Esc menu, Tab/Backspace touchpad. Press F7 to capture/release the mouse for camera control. Turning this off also stops applying these bindings; your saved controls are unchanged. Static labels also appear with a controller. Requires an extracted PPSA01341 v1.07 game folder."},
 		{"app.subtitle", "PS5 emulator for Windows"},
 		{"nav.play", "Play"}, {"nav.display", "Display"}, {"nav.graphics", "Graphics"}, {"nav.game", "Game"},
 		{"nav.shaders", "Shaders"}, {"nav.advanced", "Advanced"},
@@ -205,6 +210,11 @@ static class Strings {
 	};
 
 	static readonly Dictionary<string, string> Chinese = new Dictionary<string, string> {
+		{"keyboardprompts", "键盘和鼠标按键提示"},
+		{"keyboardcontrols", "键盘控制"},
+		{"keyboardcontrols.edit", "编辑键位…"},
+		{"keyboardcontrols.desc", "修改键盘和鼠标键位、预览对应图标并调整鼠标灵敏度。启用按键提示后，下次游玩时生效。"},
+		{"keyboardprompts.desc", "可选英文按键图标，点击游玩时应用。关闭后将在下次游玩时恢复原始图标。本次启动应用编辑后的键位并生成对应图标。默认键位：E 互动、空格翻滚/返回、R 道具、F 双持、Shift/Ctrl 左手动作、鼠标左右键攻击、中键锁定、X 对应 L3、WASD 移动、方向键对应十字键、Esc 菜单、Tab/退格对应触摸板。按 F7 捕获/释放鼠标以控制镜头。关闭此选项也会停止应用这些键位；不会修改已保存的键位。使用手柄时也显示这些静态提示。仅支持已解压的 PPSA01341 v1.07。"},
 		{"app.subtitle", "Windows 版 PS5 模拟器"},
 		{"nav.play", "开始游戏"}, {"nav.display", "画面"}, {"nav.graphics", "画质"}, {"nav.game", "游戏"},
 		{"nav.shaders", "着色器"}, {"nav.advanced", "高级"},
