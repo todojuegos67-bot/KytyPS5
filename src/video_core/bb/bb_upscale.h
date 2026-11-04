@@ -102,7 +102,9 @@ struct Viewport {
 };
 // Every draw, once its targets are known.
 void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_greater,
-            const Viewport& viewport);
+            const Viewport& viewport, u64 vs_hash = 0, u64 ps_hash = 0);
+// BB_RT_REFLECT=1: the G-buffer pass's targets and shaders logged.
+bool RtReflect();
 // Every dispatch.
 void OnDispatch();
 // The current draw is a scene draw whose vertex constant buffers should be scanned for the camera.

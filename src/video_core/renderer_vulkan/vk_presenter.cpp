@@ -736,7 +736,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         BB::Analyze::OnPresent(bb_img.info.size.width, bb_img.info.size.height,
                                bb_img.info.pixel_format, cpu_address);
     }
-    if (BB::Upscale::Enabled() || BB::Analyze::Enabled()) {
+    if (BB::Upscale::Enabled() || BB::Analyze::Enabled() || BB::Upscale::RtReflect()) {
         const auto& bb_img = texture_cache.GetImage(image_id);
         BB::Upscale::OnFlip(cpu_address, bb_img.info.size.width, bb_img.info.size.height);
         BB::ObjMotion::OnFlip();
