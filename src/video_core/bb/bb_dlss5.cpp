@@ -9,6 +9,7 @@
 // the PS5 Pro path's FrameGen::Upscale. Credit and licences: LICENSES/FoveatedDLSS5-RenoDX-MIT.txt.
 
 #include "video_core/bb/bb_dlss5.h"
+#include "video_core/bb/bb_metrics.h"
 
 #include <algorithm>
 #include <cctype>
@@ -1172,6 +1173,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
 	if (!Wanted()) return;
 	if (!g_off_reason.empty()) {
 		BBLogf("DLSS 5: off: %s. The game runs as usual.", g_off_reason.c_str());
+		BB::Metrics::SetDlss5State(2, "Pedido, no activo");
 		return;
 	}
 	g_ctx.instance        = instance;
@@ -1377,6 +1379,7 @@ bool Apply(const SR::Desc& desc) {
 	}
 	{
 		static bool said = false;
+		if (evaluated) BB::Metrics::SetDlss5State(1, "");
 		if (!said && evaluated) {
 			said = true;
 			BBLogf("DLSS 5: on (after %s): %ux%u output written in place, NR grid %ux%u, guides from %ux%u (%s input), model intensity %g, edit share %g%s",
