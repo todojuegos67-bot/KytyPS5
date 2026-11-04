@@ -930,6 +930,9 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// the recorded work leaves it reading a destroyed one. The work after it is translated in order.)
 		if (CurrentEpochs() != prepared && Changed(result, index) != nullptr)
 			return ++m_stop_reasons["commit: preparation registered buffers"], Progress::Stopped;
+		// KYTY_SPEC_DRAW_INDIRECT_VERIFY: its sampled DRAW_INDIRECT table draws, here where their arguments are current.
+		for (const auto& entry: state.draw_verifies)
+			if (entry.segment == index) VerifyDrawIndirect(m_renderer, entry);
 		const auto& segment = state.closed[index];
 		if (const auto tick = scheduler.SubmitRecorded(*result.recorder, segment.recorded - result.submitted); tick != 0)
 			result.last_tick = tick;

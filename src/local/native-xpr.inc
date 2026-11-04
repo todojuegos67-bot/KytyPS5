@@ -3449,8 +3449,11 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	// A changed state leaves no key behind, even when this try stops before computing it.
 	if (!clean) cache.state_key_valid = false;
 	const bool indexed = direct == nullptr || direct->indexed;
-	if (buffer.IsInvalid() || (direct == nullptr ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
-	    (indexed && (index_base == 0 || index_bytes == 0)))
+	// (A draw of vertices of arguments the GPU reads: its one argument address, as a run's.)
+	const bool with_arguments = direct == nullptr || direct->indirect;
+	if (buffer.IsInvalid() || (with_arguments ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
+	    (indexed && (index_base == 0 || index_bytes == 0)) ||
+	    (direct != nullptr && direct->indirect && (direct->indexed || commands.size() != 1)))
 		return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	// (The GPU thread's: a speculation's thread does not take it.)

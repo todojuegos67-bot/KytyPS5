@@ -33,6 +33,10 @@ namespace Libs::Graphics {
 
 class StreamBuffer;
 
+// KYTY_SPEC_DRAW_INDIRECT_VERIFY: a sampled DRAW_INDIRECT table draw against what the normal path would draw there (on
+// the GPU thread, where its arguments are current; graphicsRun.cpp).
+void VerifyDrawIndirect(RenderContext& renderer, const Spec::DrawIndirectVerify& entry);
+
 // Speculative translation of graphics command buffers (KYTY_SPECULATE, docs/PARALLEL-TRANSLATION.md): a command
 // buffer is translated into command buffers of its own, by its own processor and executors, without changing what
 // other translations see (src/local/speculation-state.h), then committed in guest order: the uploads, page-table

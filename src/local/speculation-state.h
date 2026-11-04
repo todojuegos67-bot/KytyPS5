@@ -175,6 +175,24 @@ struct Segment {
 	size_t                recorded = 0; // the recorder's recorded command buffers up to this count
 };
 
+// KYTY_SPEC_DRAW_INDIRECT_VERIFY (live spec_draw_indirect_verify, N: every Nth DRAW_INDIRECT taken as a table draw, 0
+// off): what such a draw was translated from and emitted, checked on the GPU thread where its arguments are current
+// (Libs::Graphics::VerifyDrawIndirect: at once on the GPU thread, after the segment's Before() at a commit).
+struct DrawIndirectVerify {
+	uint64_t                packet = 0;   // the packet as translated (its guest address, or a backing view of it)
+	std::array<uint32_t, 5> words {};     // its dwords then
+	uint64_t                base = 0, args = 0; // the arguments' base register then, and the address drawn from
+	uint32_t                primitive = 0;
+	const void*             buffer = nullptr; // the buffer the drawIndirect reads (its identity only: never dereferenced)
+	uint64_t                offset = 0;
+	uint32_t                stride = 0, count = 0;
+	bool                    copy   = false; // drawn from a copy of the bytes in a host-visible ring, `copied` its bytes
+	std::array<uint32_t, 4> copied {};
+	bool                    read   = false; // `taken`: the guest bytes of the arguments when translated
+	std::array<uint32_t, 4> taken {};
+	size_t                  segment = 0;    // (a speculation's: the segment it is in)
+};
+
 // An image's barrier state as the speculation's work leaves it so far (Image::GetBarriers uses it), and as the open
 // segment found it (`used`: the open segment transitioned it).
 struct ImageEntry {
@@ -238,6 +256,8 @@ struct State {
 	// (read after its work: its work cannot write them).
 	RangeSet current_set, written_set, journal_set, open_journal_set, open_copy_sources;
 	std::vector<Segment>                     closed;
+	// KYTY_SPEC_DRAW_INDIRECT_VERIFY: its sampled DRAW_INDIRECT table draws, by segment (DrawIndirectVerify::segment).
+	std::vector<DrawIndirectVerify>          draw_verifies;
 	std::vector<ImageEntry>                  overlay;
 	std::unordered_map<const Image*, size_t> overlay_index;
 	std::vector<size_t>                      used; // overlay entries the open segment transitioned
@@ -542,6 +562,7 @@ struct State {
 		cpu_copies.clear();
 		late_reads.clear();
 		texel_syncs.clear();
+		draw_verifies.clear();
 		late = false;
 		bda.clear();
 		bda_all = false;

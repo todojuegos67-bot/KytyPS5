@@ -1643,6 +1643,103 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// KYTY_SPEC_DRAW_INDIRECT (live spec_draw_indirect, on by default under KYTY_SPECULATE=4): a DRAW_INDIRECT
+// (non-indexed) as a table draw, its arguments read on the GPU as a DRAW_INDEX_INDIRECT table draw reads its own
+// (CommandProcessor::TryNativeIndirectAutoDraw), on the GPU thread and in a speculative translation. Off: the packet
+// is a speculation's hole, drawn the normal way.
+static bool SpecDrawIndirect() {
+	static auto& on = LiveSwitch::Find("spec_draw_indirect", Spec::ModeDefault());
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_SPEC_DRAW_INDIRECT_VERIFY (live spec_draw_indirect_verify, default 0): every Nth of those table draws (on any
+// thread) checked against the normal path's draw on the GPU thread (VerifyDrawIndirect); 0 none.
+static int64_t SpecDrawIndirectVerifyEvery() {
+	static auto& every = LiveSwitch::Find("spec_draw_indirect_verify", 0);
+	return every.load(std::memory_order_relaxed);
+}
+
+// KYTY_SPEC_DRAW_INDIRECT_VERIFY: a DRAW_INDIRECT table draw (`entry`, noted where it was translated) against what the
+// normal path (CpOpDrawIndirect -> DrawIndirect -> TryGpuIndirectDraw / its CPU read) would draw here, on the GPU
+// thread where the arguments are current (a speculation's: after its segment's Before()). What differs sets a bit:
+//   0x1   the packet's dwords in memory now are not those translated;
+//   0x2   the arguments' address from them now (the base register then + data offset now) is not the one drawn from;
+//   0x4   the draw is not one draw of a 16-byte stride (VkDrawIndirectCommand);
+//   0x8   the primitive type is not one TryGpuIndirectDraw draws from GPU arguments;
+//   0x10  drawn from a game buffer that is not the one registered over the arguments now, or at another offset;
+//   0x20  an image GPU work wrote is over the arguments now (the normal path reads the image's bytes: SyncGpuCleanBacking);
+//   0x40  the arguments' range is still CPU-written and not GPU-written (the buffer the GPU reads does not hold them);
+//   0x80  drawn from a ring's copy whose bytes are not the guest's now, or the GPU wrote the range since (the normal
+//         path would draw from the GPU's bytes);
+//   0x100 the arguments are not mapped now (the normal path's read has nothing).
+// (Neither the GPU buffer's bytes of a game buffer (device-local) nor the base register now (a speculation's packet is
+// past on the GPU thread) can be read here: the buffer cache's dirty state stands for the first, the value then for
+// the second.)
+void VerifyDrawIndirect(RenderContext& renderer, const Spec::DrawIndirectVerify& entry) {
+	using Prospero::PrimitiveType;
+	constexpr uint64_t size = sizeof(DrawIndirectArgs);
+	RenderLockGuard    lock(renderer.GetMutex());
+	auto&              buffers   = renderer.GetBufferCache();
+	auto&              textures  = renderer.GetTextureCache();
+	auto&              resources = renderer.GetGpuResources();
+	// (Memory as the commit's own checks read it: through the backing view of a page a pending guest write guards.)
+	const auto read = [](uint64_t address, void* out, uint64_t bytes) {
+		if (Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes)) return;
+		const void* from = reinterpret_cast<const void*>(address);
+		if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
+			if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) from = backing;
+		std::memcpy(out, from, bytes);
+	};
+	uint32_t                mismatch = 0;
+	std::array<uint32_t, 5> words {};
+	read(entry.packet, words.data(), sizeof(words));
+	if (words != entry.words) mismatch |= 0x1u;
+	const uint64_t args = entry.base + words[1];
+	if (args != entry.args) mismatch |= 0x2u;
+	if (entry.stride != size || entry.count != 1) mismatch |= 0x4u;
+	const auto primitive = static_cast<PrimitiveType>(entry.primitive);
+	if (primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip && primitive != PrimitiveType::kTriFan &&
+	    primitive != PrimitiveType::kLineList && primitive != PrimitiveType::kLineStrip && primitive != PrimitiveType::kPointList)
+		mismatch |= 0x8u;
+	const bool mapped = resources.IsMapped(entry.args, size);
+	if (!mapped) mismatch |= 0x100u;
+	const bool image       = mapped && textures.IsRegionGpuModified(entry.args, size);
+	const bool gpu_written = mapped && buffers.IsRegionGpuModified(entry.args, size);
+	const bool cpu_written = mapped && buffers.IsRegionCpuModified(entry.args, size);
+	if (image) mismatch |= 0x20u;
+	// (The normal path's choice: GPU arguments (TryGpuIndirectDraw) or its CPU read; reported, either draws the bytes.)
+	const bool gpu_arguments = mapped && !image && buffers.HasGpuDirtyBytes(entry.args, size);
+	std::array<uint32_t, 4> guest {};
+	const bool guest_read = mapped && Libs::LibKernel::Memory::TryReadBackingToHost(entry.args, guest.data(), sizeof(guest));
+	uint64_t   owner_offset = UINT64_MAX;
+	if (entry.copy) {
+		if (gpu_written || (guest_read && guest != entry.copied)) mismatch |= 0x80u;
+	} else {
+		const auto  id    = buffers.RegisteredBuffer(entry.args, size);
+		const auto* owner = id ? buffers.GetBufferIfLive(id) : nullptr;
+		if (owner != nullptr) owner_offset = owner->Offset(entry.args);
+		if (owner == nullptr || static_cast<const void*>(owner) != entry.buffer || owner_offset != entry.offset)
+			mismatch |= 0x10u;
+		if (cpu_written && !gpu_written) mismatch |= 0x40u;
+	}
+	LiveCounters::Add(LiveCounters::DrawIndirectVerified);
+	if (mismatch == 0) return;
+	LiveCounters::Add(LiveCounters::DrawIndirectMismatch);
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+	std::printf("DRAW_INDIRECT_VERIFY mismatch=0x%x packet=0x%llx words=%08x,%08x,%08x,%08x,%08x now=%08x,%08x,%08x,%08x,%08x "
+	            "base=0x%llx args=0x%llx derived=0x%llx prim=%u stride=%u count=%u copy=%d offset=0x%llx owner_offset=0x%llx "
+	            "image=%d gpu_written=%d cpu_written=%d gpu_arguments=%d taken=%s%08x,%08x,%08x,%08x guest=%s%08x,%08x,%08x,%08x "
+	            "copied=%08x,%08x,%08x,%08x segment=%zu\n",
+	            mismatch, static_cast<unsigned long long>(entry.packet), entry.words[0], entry.words[1], entry.words[2],
+	            entry.words[3], entry.words[4], words[0], words[1], words[2], words[3], words[4],
+	            static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.args),
+	            static_cast<unsigned long long>(args), entry.primitive, entry.stride, entry.count, entry.copy ? 1 : 0,
+	            static_cast<unsigned long long>(entry.offset), static_cast<unsigned long long>(owner_offset), image ? 1 : 0,
+	            gpu_written ? 1 : 0, cpu_written ? 1 : 0, gpu_arguments ? 1 : 0, entry.read ? "" : "(unread)", entry.taken[0],
+	            entry.taken[1], entry.taken[2], entry.taken[3], guest_read ? "" : "(unread)", guest[0], guest[1], guest[2], guest[3], entry.copied[0],
+	            entry.copied[1], entry.copied[2], entry.copied[3], entry.segment);
+}
+
 // The packets a speculative translation (speculation-state.h) takes: those whose work it records and whose effects
 // it notes. At any other it stops, and the command buffer is translated as before.
 static bool SpeculationTakes(uint32_t opcode, uint32_t header) {
@@ -1677,8 +1774,9 @@ static bool SpeculationTakes(uint32_t opcode, uint32_t header) {
 			       r == Pm4::R_CONTEXT_STATE || r == Pm4::R_DISPATCH_RESET || r == Pm4::R_PUSH_MARKER ||
 			       r == Pm4::R_POP_MARKER;
 		}
-		// Draws only as table draws (TryNativeXprDraws, TryNativeDirectDraw, TryNativeAutoDraw).
+		// Draws only as table draws (TryNativeXprDraws, TryNativeDirectDraw, TryNativeAutoDraw, TryNativeIndirectAutoDraw).
 		case Pm4::IT_DRAW_INDEX_AUTO: return header == 0xc0012d00u;
+		case Pm4::IT_DRAW_INDIRECT: return header == 0xc0032400u && SpecDrawIndirect();
 		case Pm4::IT_DRAW_INDEX_INDIRECT: return header == 0xc0032500u;
 		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return header == 0xc0083800u;
 		case Pm4::IT_DRAW_INDEX_2: return header == 0xc0042700u;
@@ -2193,6 +2291,17 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 					continue;
 				}
 				if (spec != nullptr) return refuse("draw");
+			} else if (packet_header == 0xc0032400u && !GraphicsRunDebugDumpEnabled() && SpecDrawIndirect()) {
+				// A draw of vertices of GPU-read arguments as a table draw (the normal path stores the pair's state).
+				const auto consumed = TryNativeIndirectAutoDraw({packet, remaining_dw});
+				if (consumed) {
+					m_draw_run_skip = 0;
+					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
+					execution.m_made_progress = true;
+					GetScheduler().CompleteDraws(1);
+					continue;
+				}
+				if (spec != nullptr) return refuse("draw");
 			} else if ((packet_header == 0xc0042700u || packet_header == 0xc0033500u) &&
 			           !GraphicsRunDebugDumpEnabled()) {
 				// Direct indexed draws from the same records (the normal path stores them).
@@ -2249,7 +2358,8 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		}
 
 		if (spec != nullptr && (opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_2 ||
-		                        opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO))
+		                        opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
+		                        opcode == Pm4::IT_DRAW_INDIRECT))
 			return refuse("draw"); // (no table draw took it)
 		uint32_t packet_dw = 0;
 		// (Off the GPU thread a handler's exit, a packet that cannot be, is a worker reading command memory the game
@@ -2610,6 +2720,86 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	return m_renderer.GetRenderExecutor().NativeXprTry(CurrentBuffer(), false, {}, 0, 0, vk::IndexType::eUint16, &draw)
 	           ? 3u
 	           : 0u;
+#else
+	(void)packet;
+	return 0;
+#endif
+}
+
+uint32_t CommandProcessor::TryNativeIndirectAutoDraw(std::span<const uint32_t> packet) {
+	LiveCensus::Scope census(LiveCensus::NativeXpr, 3);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	using Prospero::PrimitiveType;
+	// What CpOpDrawIndirect / DrawIndirect accept (anything else exits there), drawn as TryGpuIndirectDraw draws a draw of
+	// vertices from arguments the GPU reads (one, DrawIndirectArgs): a type drawn as it is, the arguments aligned, mapped
+	// and over no image GPU work wrote. (Not its GPU-dirty rule: that picks the normal path's CPU read of arguments the GPU
+	// did not write; the table draw reads them on the GPU whatever wrote them, as DRAW_INDEX_INDIRECT's table draws do.)
+	const auto primitive = m_ucfg.GetPrimType();
+	if (packet.size() < 5 || packet[0] != 0xc0032400u || (packet[4] & ~0x20u) != 2u || m_draw_indirect_args_base_addr == 0 ||
+	    FrameCapture::Active() || XprCapture::Enabled() ||
+	    (primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip &&
+	     primitive != PrimitiveType::kTriFan && primitive != PrimitiveType::kLineList &&
+	     primitive != PrimitiveType::kLineStrip && primitive != PrimitiveType::kPointList))
+		return 0;
+	const uint64_t     args      = m_draw_indirect_args_base_addr + packet[1];
+	constexpr uint64_t size      = sizeof(DrawIndirectArgs);
+	auto&              resources = GetGpuResources();
+	if ((args & 3u) != 0 || !resources.IsMapped(args, size) || resources.GetTextureCache().IsRegionGpuModified(args, size))
+		return 0;
+	CheckBuffer();
+	// The HUD as DrawIndexAuto places a draw of GPU-read arguments (a count of 1: TryGpuIndirectDraw's); a draw over
+	// several of its areas goes the normal way, drawn once for each.
+	HudAnchor::NoteMenuDraw(m_sh_ctx.GetVs(), m_sh_ctx.GetPs());
+	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), 1, primitive));
+	if (hud.Several()) return 0u;
+	std::optional<HudAnchor::Scope>        anchor;
+	std::optional<HudAnchor::StretchScope> widen;
+	std::optional<HudAnchor::ScaleScope>   scaled;
+	if (hud.Single()) {
+		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
+	} else if (hud.marker) {
+		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), HudAnchor::MarkerArea, false);
+	} else {
+		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
+		if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
+		else if (HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs())) scaled.emplace(m_ctx, m_sh_ctx.GetPs());
+	}
+	// The arguments as a DRAW_INDEX_INDIRECT table draw's: obtained as a buffer range (a speculation notes it: its commit
+	// checks nothing registered over it since and makes it current first), read on the GPU.
+	const std::array<uint64_t, 1>             commands {args};
+	const RenderExecutor::NativeXprDirectDraw draw {0, 0, 1, false, true};
+	auto&                                     executor = m_renderer.GetRenderExecutor();
+	executor.m_table_args_emit                         = {};
+	if (!executor.NativeXprTry(CurrentBuffer(), false, commands, 0, 0, vk::IndexType::eUint16, &draw)) return 0u;
+	LiveCounters::Add(LiveCounters::DrawIndirectTables);
+	// KYTY_SPEC_DRAW_INDIRECT_VERIFY: every Nth, what it was translated from and drew, checked on the GPU thread (at
+	// once here, a speculation's at its segment's commit).
+	if (const auto every = SpecDrawIndirectVerifyEvery(); every > 0) {
+		static std::atomic<uint64_t> taken {0};
+		if (taken.fetch_add(1, std::memory_order_relaxed) % static_cast<uint64_t>(every) == 0) {
+			const auto&             emitted = executor.m_table_args_emit;
+			Spec::DrawIndirectVerify entry;
+			entry.packet = reinterpret_cast<uint64_t>(packet.data());
+			std::memcpy(entry.words.data(), packet.data(), sizeof(entry.words));
+			entry.base      = m_draw_indirect_args_base_addr;
+			entry.args      = args;
+			entry.primitive = static_cast<uint32_t>(primitive);
+			entry.buffer    = emitted.buffer;
+			entry.offset    = emitted.offset;
+			entry.stride    = emitted.stride;
+			entry.count     = emitted.count;
+			entry.copy      = emitted.copy;
+			entry.copied    = emitted.copied;
+			entry.read      = Libs::LibKernel::Memory::TryReadBackingToHost(args, entry.taken.data(), sizeof(entry.taken));
+			if (auto* spec = Spec::Current(); spec != nullptr) {
+				entry.segment = spec->closed.size(); // (the open segment)
+				spec->draw_verifies.push_back(entry);
+			} else {
+				VerifyDrawIndirect(m_renderer, entry);
+			}
+		}
+	}
+	return 5u;
 #else
 	(void)packet;
 	return 0;

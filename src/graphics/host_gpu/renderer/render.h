@@ -385,14 +385,27 @@ private:
 public:
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
 	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances; or a direct draw
-	// of vertices (DRAW_INDEX_AUTO, not `indexed`: the count is of vertices; table draws only).
+	// of vertices (DRAW_INDEX_AUTO, not `indexed`: the count is of vertices; table draws only). `indirect` (not
+	// `indexed`; KYTY_SPEC_DRAW_INDIRECT): a draw of vertices whose arguments the GPU reads, one VkDrawIndirectCommand at
+	// `commands[0]` (DRAW_INDIRECT; table draws only; the counts here unused).
 	struct NativeXprDirectDraw {
 		uint64_t index_address  = 0;
 		uint32_t index_count    = 0;
 		uint32_t instance_count = 1;
 		bool     indexed        = true;
+		bool     indirect       = false;
 	};
-	// `direct`: that draw instead of the DRAW_INDEX_INDIRECT run `commands`.
+	// KYTY_SPEC_DRAW_INDIRECT_VERIFY: the arguments the last `indirect` table draw read (TableDraw): its buffer (identity
+	// only), offset, stride and count; `copy`: a host-visible ring's copy of the bytes, `copied` them.
+	struct TableArgsEmit {
+		const void*             buffer = nullptr;
+		uint64_t                offset = 0;
+		uint32_t                stride = 0, count = 0;
+		bool                    copy   = false;
+		std::array<uint32_t, 4> copied {};
+	};
+	TableArgsEmit m_table_args_emit;
+	// `direct`: that draw instead of the DRAW_INDEX_INDIRECT run `commands` (an `indirect` one: with its arguments).
 	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,
 	                                uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
 	                                const NativeXprDirectDraw* direct = nullptr);
