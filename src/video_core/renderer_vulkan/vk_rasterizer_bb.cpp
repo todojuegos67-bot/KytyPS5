@@ -2553,7 +2553,8 @@ bool Rasterizer::BBFgNativeAnalyze(VideoCore::Image& flip, bool late) {
 }
 
 bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
-                                   vk::ImageView& hudless_view, vk::Format view_format) {
+                                   vk::ImageView& hudless_view, vk::Format view_format,
+                                   vk::Extent2D display) {
     out = {};
     hudless_view = vk::ImageView{};
     const bool hudless_ready = g_bb.fg_present_ready;
@@ -2590,9 +2591,38 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
         ++n_mismatch;
         return false;
     }
+    // 0.65 (bb-hires-065): internal resolution above the window (e.g. the Resolution Patch at
+    // 3840x2160, window 2560x1440): FSR 3 frame generation refuses a render size larger than the
+    // display ("FSR 3 FG needs render <= display"), so every 3D frame went without generation.
+    // The depth and the vectors are then taken at the display size (nearest blit) and the
+    // vectors' scale, the jitter and the render size given in display pixels. Internal <= window:
+    // unchanged (a plain copy at the render size). DLSS-G keeps the render-size inputs.
+    const auto blittable = [&](vk::Format f) {
+        const auto ft = instance.GetPhysicalDevice().getFormatProperties(f).optimalTilingFeatures;
+        return (ft & vk::FormatFeatureFlagBits::eBlitSrc) &&
+               (ft & vk::FormatFeatureFlagBits::eBlitDst);
+    };
+    const bool fg_down = BB::FG::Cfg().kind == BB::FG::Kind::Amd && display.width != 0 &&
+                         display.height != 0 &&
+                         (render.width > display.width || render.height > display.height) &&
+                         blittable(depth.info.pixel_format) && blittable(g_bb.mv.format);
+    const vk::Extent2D fg_size =
+        fg_down ? vk::Extent2D{std::min(render.width, display.width),
+                               std::min(render.height, display.height)}
+                : render;
+    {
+        static bool said = false;
+        if (fg_down && !said) {
+            said = true;
+            BB::FG::Printf("[fg-hires] render %ux%u larger than the window %ux%u: depth and "
+                           "motion vectors downscaled to %ux%u for FSR 3 frame generation",
+                           render.width, render.height, display.width, display.height,
+                           fg_size.width, fg_size.height);
+        }
+    }
     auto& slot = g_bb.fg_slots[slot_index % g_bb.fg_slots.size()];
-    if (!EnsureDepthCopy(slot.depth, render, depth.info.pixel_format) ||
-        !EnsureImage(slot.mv, render, g_bb.mv.format,
+    if (!EnsureDepthCopy(slot.depth, fg_size, depth.info.pixel_format) ||
+        !EnsureImage(slot.mv, fg_size, g_bb.mv.format,
                      vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
         ++n_alloc;
         return false;
@@ -2611,6 +2641,24 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eTransferSrcOptimal,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    if (fg_down) {
+        const auto blit = [&](vk::Image src, vk::Image dst, vk::ImageAspectFlags aspect) {
+            const vk::ImageBlit region{
+                .srcSubresource = {aspect, 0, 0, 1},
+                .srcOffsets = std::array<vk::Offset3D, 2>{
+                    vk::Offset3D{0, 0, 0},
+                    vk::Offset3D{s32(render.width), s32(render.height), 1}},
+                .dstSubresource = {aspect, 0, 0, 1},
+                .dstOffsets = std::array<vk::Offset3D, 2>{
+                    vk::Offset3D{0, 0, 0},
+                    vk::Offset3D{s32(fg_size.width), s32(fg_size.height), 1}},
+            };
+            cmd.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
+                          vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+        };
+        blit(depth.GetImage(), slot.depth.image, vk::ImageAspectFlagBits::eDepth);
+        blit(g_bb.mv.image, slot.mv.image, vk::ImageAspectFlagBits::eColor);
+    } else {
     cmd.copyImage(depth.GetImage(), vk::ImageLayout::eTransferSrcOptimal, slot.depth.image,
                   vk::ImageLayout::eTransferDstOptimal,
                   vk::ImageCopy{
@@ -2625,6 +2673,7 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                       .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                       .extent = {render.width, render.height, 1},
                   });
+    }
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
@@ -2635,11 +2684,15 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
     out.valid = plan.camera_valid;
-    out.depth = {slot.depth.image, slot.depth.view, slot.depth.format, render, slot.depth.usage};
-    out.motion = {slot.mv.image, slot.mv.view, slot.mv.format, render, slot.mv.usage};
-    out.render = render;
-    out.jitter[0] = plan.jitter[0];
-    out.jitter[1] = plan.jitter[1];
+    out.depth = {slot.depth.image, slot.depth.view, slot.depth.format, fg_size, slot.depth.usage};
+    out.motion = {slot.mv.image, slot.mv.view, slot.mv.format, fg_size, slot.mv.usage};
+    out.render = fg_size;
+    const float sx = float(fg_size.width) / float(render.width);
+    const float sy = float(fg_size.height) / float(render.height);
+    out.motion_scale[0] = sx;
+    out.motion_scale[1] = sy;
+    out.jitter[0] = plan.jitter[0] * sx;
+    out.jitter[1] = plan.jitter[1] * sy;
     out.reset = plan.reset;
     out.depth_inverted = plan.depth_inverted;
     out.fov_y = plan.fov_y;

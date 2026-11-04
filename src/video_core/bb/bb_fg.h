@@ -97,6 +97,9 @@ struct Inputs {
     bool has_hudless = false;
     vk::Extent2D render{};
     float jitter[2]{};
+    // 0.65: render pixels -> the given vectors' pixels (1 unless the inputs were downscaled to
+    // the display for FSR 3 FG, internal resolution above the window).
+    float motion_scale[2]{1.0f, 1.0f};
     bool reset = false;
     bool depth_inverted = true;
     float fov_y = 1.0f, z_near = 0.1f, z_far = 1000.0f;

@@ -884,7 +884,8 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     prepare.commandList = slot.command;
     prepare.renderSize = {inputs->render.width, inputs->render.height};
     prepare.jitterOffset = {inputs->jitter[0], inputs->jitter[1]};
-    prepare.motionVectorScale = {mv_sign, mv_sign};
+    prepare.motionVectorScale = {mv_sign * inputs->motion_scale[0],
+                                 mv_sign * inputs->motion_scale[1]};
     prepare.frameTimeDelta = static_cast<float>(std::clamp(delta_ms, 1.0, 100.0));
     prepare.unused_reset = inputs->reset;
     const float z_near = EnvFloat("KYTY_FSR3_NEAR", std::max(inputs->z_near, 0.001f));

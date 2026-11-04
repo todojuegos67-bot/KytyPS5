@@ -915,7 +915,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
     if (vk::ImageView fg_source{};
         BB::FG::WantInputs() &&
-        rasterizer->BBFrameGenCapture(frame->id, frame->fg, fg_source, view_info.format) &&
+        rasterizer->BBFrameGenCapture(frame->id, frame->fg, fg_source, view_info.format,
+                                      vk::Extent2D{frame->width, frame->height}) &&
         fg_source && EnsureFgHudless(frame)) {
         const auto fg_cmd = draw_scheduler.CommandBuffer();
         const vk::MemoryBarrier2 war{
