@@ -173,7 +173,9 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             }
         }
     }
-    BBOnDraw(std::bit_width(key.mrt_mask));
+    BBOnDraw(std::bit_width(key.mrt_mask),
+             key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)],
+             key.stage_hashes[static_cast<u32>(Shader::SwStage::Fragment)]);
 }
 
 bool Rasterizer::BBPatchConstants(const void* data, u64 size, std::vector<u32>& out) const {

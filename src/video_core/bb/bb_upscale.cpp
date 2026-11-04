@@ -392,6 +392,11 @@ struct FrameState {
     // G-buffer
     VAddr gb_depth = 0;
     u32 gb_w = 0, gb_h = 0, gb_mrt = 0;
+    std::array<Target, 8> gb_colors{};
+    u32 gb_num_colors = 0;
+    Target gb_depth_target;
+    u64 gb_vs_hash = 0, gb_ps_hash = 0;
+    u32 gb_draws = 0;
     bool depth_greater = true;
     Viewport viewport;
     // the scene colour and the composite source this frame
@@ -1454,9 +1459,34 @@ bool BackendReady() {
     }
 }
 
+bool RtReflect() {
+    static const bool on = [] {
+        const char* s = Env("BB_RT_REFLECT");
+        return s != nullptr && std::atoi(s) >= 1;
+    }();
+    return on;
+}
+
+void LogGbuffer(const FrameState& f) {
+    static u64 flips = 0;
+    if (!RtReflect() || f.gb_depth == 0 || flips++ % 600 != 0) {
+        return;
+    }
+    Checkpoint(fmt::format("rt-reflect: G-buffer pass {}x{}, {} targets, {} draws, depth {}, "
+                           "last draw vs {:#018x} ps {:#018x}",
+                           f.gb_w, f.gb_h, f.gb_mrt, f.gb_draws, Describe(f.gb_depth_target),
+                           f.gb_vs_hash, f.gb_ps_hash));
+    for (u32 i = 0; i < f.gb_num_colors; ++i) {
+        if (f.gb_colors[i].addr == 0)
+            continue;
+        Checkpoint(fmt::format("rt-reflect:   RT{} {} (ps {:#018x})", i, Describe(f.gb_colors[i]),
+                               f.gb_ps_hash));
+    }
+}
+
 void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_greater,
-            const Viewport& viewport) {
-    if (!Enabled() && !AnalyzeOn()) {
+            const Viewport& viewport, u64 vs_hash, u64 ps_hash) {
+    if (!Enabled() && !AnalyzeOn() && !RtReflect()) {
         return;
     }
     std::scoped_lock lk{g_mutex};
@@ -1491,6 +1521,12 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
         f.gb_mrt = mrt;
         f.depth_greater = depth_greater;
         f.viewport = viewport;
+        f.gb_colors = g_draw.colors;
+        f.gb_num_colors = g_draw.num_colors;
+        f.gb_depth_target = *depth;
+        f.gb_vs_hash = vs_hash;
+        f.gb_ps_hash = ps_hash;
+        ++f.gb_draws;
     }
     const VAddr scene_depth = f.gb_depth != 0 ? f.gb_depth : g_learned.gb_depth;
     g_draw.scene = !f.injected && g_draw.has_depth && depth->addr == scene_depth;
@@ -2231,6 +2267,11 @@ void OnHudlessCopied() {
 
 void OnFlip(VAddr addr, u32 width, u32 height) {
     if (!Enabled() && !AnalyzeOn()) {
+        if (RtReflect()) {
+            std::scoped_lock lk{g_mutex};
+            LogGbuffer(g_frame);
+            g_frame = {};
+        }
         return;
     }
     std::scoped_lock lk{g_mutex};
@@ -2310,6 +2351,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_delta_ms = std::chrono::duration<float, std::milli>(now - g_last_flip).count();
     }
     g_last_flip = now;
+
+    LogGbuffer(f);
 
     // Learn this frame's layout for the next.
     const VAddr src_before = LearnedSource();

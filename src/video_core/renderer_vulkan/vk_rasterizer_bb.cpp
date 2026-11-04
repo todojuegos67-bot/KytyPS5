@@ -2334,8 +2334,8 @@ void Rasterizer::BBHudlessCopy(VideoCore::Image& flip) {
     BB::Upscale::OnHudlessCopied();
 }
 
-void Rasterizer::BBOnDraw(u32 num_cb) {
-    if (!BB::Upscale::Enabled() && !BB::Analyze::Enabled()) {
+void Rasterizer::BBOnDraw(u32 num_cb, u64 vs_hash, u64 ps_hash) {
+    if (!BB::Upscale::Enabled() && !BB::Analyze::Enabled() && !BB::Upscale::RtReflect()) {
         return;
     }
     if (g_bb.check_pending) {
@@ -2380,8 +2380,8 @@ void Rasterizer::BBOnDraw(u32 num_cb) {
     const auto func = regs.depth_control.depth_func;
     const bool greater =
         func == AmdGpu::CompareFunc::Greater || func == AmdGpu::CompareFunc::GreaterEqual;
-    BB::Upscale::OnDraw(std::span(colors.data(), num_colors), has_depth ? &depth : nullptr,
-                        greater, viewport);
+    BB::Upscale::OnDraw(std::span(colors.data(), num_colors), has_depth ? &depth : nullptr, greater,
+                        viewport, vs_hash, ps_hash);
 }
 
 } // namespace Vulkan

@@ -224,7 +224,7 @@ private:
     void BBHudlessCopy(VideoCore::Image& flip);
     bool BBRecordUpscale(vk::Image image, vk::ImageView view, vk::Format format,
                          vk::ImageUsageFlags usage, bool late = false, bool mv_only = false);
-    void BBOnDraw(u32 num_cb);
+    void BBOnDraw(u32 num_cb, u64 vs_hash, u64 ps_hash);
     bool attachment_feedback_loop{};
     bool needs_barrier{};
 };
