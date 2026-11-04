@@ -626,7 +626,7 @@ struct LatWindow {
 } g_lat;
 
 const char* LatModeName(Mode mode) {
-	if (BB::FG::StreamlineLoaded()) return "reflex-sl"; // (Streamline's Reflex with DLSS / DLSS-G)
+	if (BB::FG::DlssgEnabled()) return "reflex-sl"; // (Streamline's Reflex, only with DLSS-G)
 	switch (mode) {
 		case Mode::Amd: return "antilag2";
 		case Mode::Reflex: return "reflex";
