@@ -701,7 +701,12 @@ int g_depth_detected = -1; // 1 reversed-Z, 0 forward, -1 not yet known
 int RtShadowLevel() {
     static const int level = [] {
         const char* v = std::getenv("BB_RT_SHADOW");
-        return v != nullptr && *v >= '1' && *v <= '9' ? *v - '0' : 0;
+        if (v != nullptr && *v >= '1' && *v <= '9') {
+            return *v - '0';
+        }
+        // BB_RT_REFLECT=1 (the launcher's checkbox) also logs the camera.
+        const char* r = std::getenv("BB_RT_REFLECT");
+        return r != nullptr && std::atoi(r) >= 1 ? 1 : 0;
     }();
     return level;
 }
