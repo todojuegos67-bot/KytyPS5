@@ -72,6 +72,6 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | **Compute** | | | | |
 | fill_buffer_clears | an image-clear dispatch over plain buffer memory made as a transfer fill | 0 | 1 | |
 | **The table path** | | | | |
-| KYTY_TABLE_TARGET_READ | a table image set may hold a target its shaders sample (our runs: 1) | 0 | 0 | |
+| KYTY_TABLE_TARGET_READ (changed) | a table image set may hold a target its shaders sample | 0 | 1 | |
 | table_serials (upstream, #302) | a table draw's target and set checks skipped while the images' serial sums hold | 1 | 1 | table_serials 2 |
 | table_memo (upstream, #303) | a table draw reuses its pair's last variant, state and set while nothing they depend on moved | 1 | 1 | table_memo_verify N |
