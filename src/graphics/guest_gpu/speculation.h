@@ -263,6 +263,7 @@ private:
 	// Time (ns) translating the segments committed and the others, committing (holes apart), in holes, in the graphics
 	// queue; the frame of the last report.
 	uint64_t m_kept_ns = 0, m_lost_ns = 0, m_commit_ns = 0, m_hole_ns = 0, m_queue_ns = 0, m_report_frame = 0;
+	uint32_t m_held_commits = 0; // commits since the last flush (KYTY_SPECULATE_FLUSH_EVERY; this instance's)
 	std::mutex m_mutex;
 	bool       m_quit  = false;
 	uint64_t   m_clock = 0; // (under m_mutex) orders translations beginning and results retired

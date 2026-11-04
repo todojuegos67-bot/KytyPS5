@@ -31,6 +31,15 @@ namespace Libs::Graphics {
 
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: KYTY_WRITE_GUARD_SPEC)
 
+// KYTY_SPECULATE_FLUSH_EVERY (live speculate_flush_every N; 8 by default under KYTY_SPECULATE=4, else 0; 0 and 1:
+// every commit): a commit's held segment buffers go to the GPU at its end only every Nth commit; the rest wait for the
+// next flush (a label's, a guest submission's end, a readback's, a chunk wait's). The GPU thread flushes them before
+// it waits for a speculation's thread (which may wait for their tick), and when a commit blocks at a wait hole.
+static uint32_t FlushEvery() {
+	static auto& every = LiveSwitch::Find("speculate_flush_every", Spec::ModeDefault(8));
+	return static_cast<uint32_t>(std::max<int64_t>(every.load(std::memory_order_relaxed), 0));
+}
+
 uint64_t Speculation::NowNs() noexcept {
 	return static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -454,6 +463,12 @@ Speculation::Outcome Speculation::CommitReady(CommandProcessor& cp, const Job& j
 							++m_cancelled;
 				++m_waits_for_ahead;
 				const auto waited = NowNs();
+				// (KYTY_SPECULATE_FLUSH_EVERY: the commits held go before waiting on a speculation's thread.)
+				if (FlushEvery() > 1) {
+					lock.unlock();
+					m_renderer.GetCommandScheduler().FlushRecorded();
+					lock.lock();
+				}
 				// (KYTY_SERVE_IN_WAITS 4: the guest commands queued for this thread run while it waits.)
 				if ((GuestGpu::ServeInWaits() & 4u) != 0) {
 					while (translating()) {
@@ -729,8 +744,12 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 	auto&      r        = *result;
 	const auto start    = NowNs();
 	const auto progress = r.failed ? Progress::Stopped : CommitSegments(r, cp);
-	// (Its segments' buffers held for one submission go now: a speculation thread may wait for their tick.)
-	m_renderer.GetCommandScheduler().FlushRecorded();
+	// (Its segments' buffers held for one submission go now: a speculation thread may wait for their tick.
+	// KYTY_SPECULATE_FLUSH_EVERY: every Nth commit, and one that blocks at a wait hole.)
+	if (FlushEvery() <= 1 || progress == Progress::Blocked || ++m_held_commits >= FlushEvery()) {
+		m_held_commits = 0;
+		m_renderer.GetCommandScheduler().FlushRecorded();
+	}
 	m_commit_ns += NowNs() - start;
 	if (progress == Progress::Blocked) {
 		m_blocked = std::move(result);
