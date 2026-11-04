@@ -1857,6 +1857,8 @@ bool WantPresentUpscale(VAddr& flip) {
         return false;
     }
     const bool native = !fgn && !PresentMode(); // (NativeFallback: the in-place point missed)
+    // 0.51: frame generation without an upscaler takes the same escape (a final pass into the
+    // presented image seen before this draw), so its inputs come before the HUD as with native AA.
     if (g_draw.samples_render_size) {
         f.post_seen = true; // the game's final post-processing pass into the presented image
     }
@@ -1865,7 +1867,7 @@ bool WantPresentUpscale(VAddr& flip) {
     // (Native fallback: the source the in-place path learned may not be sampled at all this
     // frame; a final pass into the presented image seen before this draw is enough.)
     if (f.gb_depth == 0 || f.scene_draws == 0 ||
-        (f.qual_samples <= SkipNeeded() && !(native && f.post_seen)) ||
+        (f.qual_samples <= SkipNeeded() && !((native || (fgn && UpfixOn())) && f.post_seen)) ||
         g_draw.samples_render_size || f.gb_w != g_output_w || f.gb_h != g_output_h) {
         return false;
     }
@@ -2370,8 +2372,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_last_window_path = true;
     } else if (FgNative() && !g_present_dead && !f.fg_native_done && !f.injected &&
                !f.inject_failed && f.gb_depth != 0 && f.gb_w == width && f.gb_h == height &&
-               f.qual_samples > SkipNeeded()) {
+               LateSamplesOk(f.qual_samples)) {
         // 0.39: no HUD point this frame: the FG-only analysis on the finished image at present.
+        // 0.51 (bb-fgnfix-051): the same sample rule as the upscalers' late path (0.40 upfix): the
+        // finished flip needs no sample of the source. With qual_samples > SkipNeeded() almost every
+        // 3D frame had no point ("other / no injection point 60") and frame generation no inputs.
         g_learned.last_fg_native = prev_fg_native;
         FillPresentPlan(addr, "at present (no HUD draw found this frame)");
         g_late_upscale = true;
