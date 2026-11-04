@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -95,6 +96,18 @@ inline bool LateReads() {
 		return value != nullptr ? std::atoll(value) : ModeDefault();
 	}());
 	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_SPEC_READ_ONE_SET (live spec_read_one_set, on by default under KYTY_SPECULATE=4): State::pending_set, taken
+// when a speculation begins (Inherit) or its state is cleared.
+inline bool ReadOneSetOn() {
+	static auto& on = LiveSwitch::Find("spec_read_one_set", ModeDefault());
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_SPEC_READ_ONE_SET_VERIFY (live spec_read_one_set_verify N, default 0): every Nth read pending_set clears also put
+// through the four searches, a disagreement counted (spec_one_set_mismatch; State::VerifyOneSet).
+inline int64_t ReadOneSetVerifyEvery() {
+	static auto& every = LiveSwitch::Find("spec_read_one_set_verify", 0);
+	return every.load(std::memory_order_relaxed);
 }
 
 // An image's barrier state as a segment found it (the commit transitions the image there first if other work moved
@@ -280,6 +293,13 @@ struct State {
 	RangeSet                  chain_journal, chain_written;
 	// The granules of journal_set, written_set, chain_journal and chain_written (a look before their searches).
 	GranuleFilter pending;
+	// KYTY_SPEC_READ_ONE_SET: those four sets in one, kept as they grow (they only grow until Inherit or Clear), so a
+	// read the granules let through and nothing pending covers costs one search, not four or five (T4, 4 Nov: two
+	// thirds to three quarters of those reads). Only this state's thread reads it. `one_set`: kept for this
+	// speculation (the switch as it began).
+	RangeSet pending_set;
+	bool     one_set = false;
+	uint32_t one_set_verify_n = 0, one_set_verified = 0; // (KYTY_SPEC_READ_ONE_SET_VERIFY; added 64 at a time)
 	// The notes as the packet being translated found them (Mark): a refused packet leaves none (Rollback). (Its image
 	// transitions stay: they are recorded, the overlay holds where they leave the images.)
 	Counts   checkpoint;
@@ -312,6 +332,11 @@ struct State {
 			state->written_set.ForEach([&](uint64_t begin, uint64_t end) { chain_written.Add(begin, end - begin); });
 			pending.Merge(state->pending);
 		}
+		one_set = ReadOneSetOn();
+		pending_set.Clear();
+		if (one_set)
+			for (const RangeSet* set: {&journal_set, &written_set, &chain_journal, &chain_written})
+				set->ForEach([&](uint64_t begin, uint64_t end) { pending_set.Add(begin, end - begin); });
 	}
 	// An image as the latest speculation before it leaves it (null: none used it).
 	[[nodiscard]] const ImageEntry* ChainImage(const Image* image, uint64_t serial) const {
@@ -329,6 +354,7 @@ struct State {
 		if (Note(written, Sealed().written, address, size)) {
 			written_set.Add(address, size);
 			pending.Add(address, size);
+			if (one_set) pending_set.Add(address, size);
 		}
 	}
 	void NoteInvalidated(uint64_t address, uint64_t size) { (void)Note(invalidated, Sealed().invalidated, address, size); }
@@ -401,6 +427,7 @@ struct State {
 		writes.push_back({address, value, size, copy});
 		journal_set.Add(address, size);
 		pending.Add(address, size);
+		if (one_set) pending_set.Add(address, size);
 		open_journal_set.Add(address, size);
 		if (copy) open_copy_sources.Add(value, size);
 	}
@@ -417,12 +444,20 @@ struct State {
 			if (clean) NoteCleanRead(address, bytes);
 			return true;
 		}
-		if (bytes != 0 && !journal_set.Intersects(address, bytes) && !written_set.Intersects(address, bytes) &&
-		    !chain_written.Intersects(address, bytes) &&
-		    (previous.load(std::memory_order_acquire) == nullptr || !chain_journal.Intersects(address, bytes))) {
+		// (KYTY_SPEC_READ_ONE_SET: none of the four sets over it, one search; one of them over it, the chain unlinked
+		// meanwhile: the three without the chain's journal, as before.)
+		const bool none  = one_set && bytes != 0 && !pending_set.Intersects(address, bytes);
+		if (none) VerifyOneSet(address, bytes);
+		const bool clear = none || (bytes != 0 && (!one_set || previous.load(std::memory_order_acquire) == nullptr) &&
+		                            !journal_set.Intersects(address, bytes) && !written_set.Intersects(address, bytes) &&
+		                            !chain_written.Intersects(address, bytes) &&
+		                            (previous.load(std::memory_order_acquire) == nullptr ||
+		                             !chain_journal.Intersects(address, bytes)));
+		if (clear) {
 			// (Its chain unlinked meanwhile, with a pending write over it when it began: a late read.)
-			const bool     read_late = clean && log_end != nullptr && LateReads() && chain_journal.Intersects(address, bytes);
-			const uint64_t since     = read_late ? log_end->load(std::memory_order_acquire) : 0;
+			const bool read_late =
+			    !none && clean && log_end != nullptr && LateReads() && chain_journal.Intersects(address, bytes);
+			const uint64_t since = read_late ? log_end->load(std::memory_order_acquire) : 0;
 			if (!CopyGuest(out, address, bytes)) return false;
 			if (read_late) NoteLateRead(address, bytes, since);
 			else if (clean) NoteCleanRead(address, bytes);
@@ -454,6 +489,30 @@ struct State {
 		return false;
 	}
 	// One word (ReadJournaled): `by` the speculation whose pending write gave it (null: memory).
+	// KYTY_SPEC_READ_ONE_SET_VERIFY: a read pending_set cleared, every Nth through the four searches as well.
+	void VerifyOneSet(uint64_t address, uint64_t bytes) {
+		const auto every = ReadOneSetVerifyEvery();
+		if (every <= 0 || ++one_set_verify_n < every) return;
+		one_set_verify_n = 0;
+		const auto* chain = previous.load(std::memory_order_acquire);
+		const bool  clear = !journal_set.Intersects(address, bytes) && !written_set.Intersects(address, bytes) &&
+		                   !chain_written.Intersects(address, bytes) &&
+		                   (chain == nullptr || !chain_journal.Intersects(address, bytes));
+		if (++one_set_verified == 64) {
+			LiveCounters::Add(LiveCounters::SpecOneSetVerified, 64);
+			one_set_verified = 0;
+		}
+		if (clear) return;
+		LiveCounters::Add(LiveCounters::SpecOneSetMismatch);
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("SPEC_ONE_SET_MISMATCH address=0x%llx bytes=%llu journal=%d written=%d chain_written=%d chain_journal=%d "
+			            "chained=%d\n",
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes),
+			            journal_set.Intersects(address, bytes) ? 1 : 0, written_set.Intersects(address, bytes) ? 1 : 0,
+			            chain_written.Intersects(address, bytes) ? 1 : 0, chain_journal.Intersects(address, bytes) ? 1 : 0,
+			            chain != nullptr ? 1 : 0);
+	}
 	[[nodiscard]] bool ReadWord(uint64_t at, uint32_t& value, const State*& by) {
 		late = false;
 		if (journal_set.Intersects(at, 4)) return Resolve(*this, at, value, by);
@@ -585,6 +644,10 @@ struct State {
 		chain_journal.Clear();
 		chain_written.Clear();
 		pending.Clear();
+		pending_set.Clear();
+		one_set = ReadOneSetOn();
+		if (one_set_verified != 0)
+			LiveCounters::Add(LiveCounters::SpecOneSetVerified, std::exchange(one_set_verified, 0));
 	}
 	// The open segment ends (its command buffers: the recorder's first `recorded_count`): its image uses taken from
 	// the overlay.
