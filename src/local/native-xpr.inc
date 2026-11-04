@@ -35,6 +35,8 @@
 // emission pixel by pixel against the normal path.
 
 extern "C" {
+// (speculation.cpp) Speculative translations going on and results unfinished: the catalog sweeps wait for none.
+extern volatile std::atomic_uint32_t kyty_local_speculations_live;
 // 0 off, 1 native XPR draws, 2 verification.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_mode {1};
 // Negative controls for the offline replay only: bit 0 zeroes the vertex
@@ -1096,18 +1098,20 @@ void RenderExecutor::ResolvePendingTicks(uint64_t pending, uint64_t tick) {
 }
 
 // The draw states no draw used for StateKeepFrames leave. What holds one by its address forgets it: this executor's
-// emission and lookup, its table's last draw and its image sets' transits (TableXpr::epoch moves). Not while another
-// executor reads this catalog (a speculation's): it holds them across draws too.
-void RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame) {
-	if (Role() != 0 || m_catalog_readers.load(std::memory_order_relaxed) != 0 ||
-	    cache.states.size() <= NativeXprCache::StatesKept)
-		return;
-	const auto   write  = CatalogWrite();
+// emission and lookup, its table's last draw and its image sets' transits (TableXpr::epoch moves). Not while a
+// speculation translates or has a result unfinished (kyty_local_speculations_live): it holds them across draws too; the
+// next translation drops what it held (ForgetStaleCatalog). False: put off for that, tried again at the next call.
+bool RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame) {
+	if (Role() != 0 || cache.states.size() <= NativeXprCache::StatesKept) return true;
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return false;
+	const auto write = CatalogWrite();
+	// (Under the lock: a translation counted after this reads the catalog after the sweep, and sees its epoch.)
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return false;
 	const size_t before = cache.states.size();
 	std::erase_if(cache.states, [&](const auto& item) {
 		return item.second->UsedFrame() + NativeXprCache::StateKeepFrames < frame;
 	});
-	if (cache.states.size() == before) return;
+	if (cache.states.size() == before) return true;
 	cache.emit           = {};
 	cache.last_state     = nullptr;
 	cache.last_state_key = 0;
@@ -1116,6 +1120,7 @@ void RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame)
 	if (SlowLog::HitchThreshold() > 0.0)
 		std::printf("[tsc %llu] XPR draw states %zu -> %zu\n", static_cast<unsigned long long>(__rdtsc()), before,
 		            cache.states.size());
+	return true;
 }
 
 // Once per frame: the retired sets the GPU is done with are kept for reuse or freed, one call per
@@ -1152,10 +1157,9 @@ void RenderExecutor::NativeXprCollect() {
 			it = cache.records.erase(it);
 		}
 	}
-	if (frame - cache.states_swept_frame >= NativeXprCache::StateSweepFrames) {
+	// (Put off while a speculation holds the states: tried at every call until done.)
+	if (frame - cache.states_swept_frame >= NativeXprCache::StateSweepFrames && NativeXprSweepStates(cache, frame))
 		cache.states_swept_frame = frame;
-		NativeXprSweepStates(cache, frame);
-	}
 	if (cache.collected_frame == frame || cache.retired.empty()) return;
 	cache.collected_frame = frame;
 	auto& scheduler       = m_context.GetCommandScheduler();

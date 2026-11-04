@@ -360,7 +360,7 @@ private:
 	                                        std::span<const std::pair<uint32_t, uint32_t>> images,
 	                                        std::span<const std::pair<uint32_t, uint32_t>> buffers);
 	void NativeXprCollect();
-	void NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
+	bool NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
 	// A draw state's dynamic state, only what differs from what the emissions recorded in the command buffer.
 	static void NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuffer vk_buffer, const NativeXprDrawState& draw_state,
 	                                 bool same_command);
@@ -434,12 +434,15 @@ public:
 	void ResolvePendingTicks(uint64_t pending, uint64_t tick);
 	// A speculation's executor draws with what `owner` (the graphics queue's) learned: its table pairs and dispatches,
 	// draw states, linear copy shader and compute clears (RenderExecutor::Catalog); `role` its own proofs' (1..Roles-1:
-	// one per speculation thread).
+	// one per speculation thread). The owner sweeps its catalog only while no translation is going on and no result is
+	// left unfinished (kyty_local_speculations_live).
 	void ReadCatalogOf(RenderExecutor& owner, uint32_t role) noexcept {
 		m_catalog = &owner;
 		m_role    = role;
-		owner.m_catalog_readers.fetch_add(1, std::memory_order_relaxed);
 	}
+	// At the start of a translation: what this executor kept of the catalog from its last one, dropped when the owner
+	// changed it since (TableXpr::epoch; table-xpr.inc).
+	void ForgetStaleCatalog();
 	static constexpr uint32_t Roles = 13; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
 
 private:
@@ -459,8 +462,6 @@ private:
 	// it across draws is dropped when the owner changed it (TableXpr::epoch).
 	RenderExecutor* m_catalog = nullptr;
 	uint32_t        m_role    = 0;
-	// Executors that read this one's catalog (ReadCatalogOf): its draw states stay while there are any.
-	std::atomic<uint32_t> m_catalog_readers {0};
 	[[nodiscard]] RenderExecutor& Catalog() noexcept { return m_catalog != nullptr ? *m_catalog : *this; }
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).

@@ -510,6 +510,8 @@ private:
 	std::array<int64_t, 32768> m_flip_times {};
 	bool                      m_evict_pressure = false;
 	bool                      m_idle_evict_off = false;
+	// (EvictIdlePipelines) A check came due and a speculation was live: tried again at every flip until none is.
+	bool                      m_evict_due = false;
 	// (EvictIdlePipelines) The world the game is in: its SceneTags generation, the flip and time it began (and the flip
 	// the world before it began), and whether the pipelines of the worlds before those two went.
 	uint64_t                              m_scene_generation = 0;

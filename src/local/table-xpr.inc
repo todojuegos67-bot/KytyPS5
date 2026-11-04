@@ -472,18 +472,24 @@ void RenderExecutor::TableForgetStates() {
 
 // The pairs and dispatches no draw or dispatch looked up for PairKeepFrames leave, their image sets retired. Every
 // pointer to a pair goes too: the lookups' (pair_cache, found_*), the last draw's and dispatch's, the store request,
-// the gather and the prefetch chain (next). Only the catalog's owner, with no executor reading its catalog, and only at
+// the gather and the prefetch chain (next). Only the catalog's owner, while no speculation translates or has a result
+// unfinished (kyty_local_speculations_live; its next translation drops what it held, ForgetStaleCatalog), and only at
 // the start of a table draw or dispatch (no pair is held then).
 void RenderExecutor::TableSweepPairs() {
 	auto* table = m_table_xpr.get();
 	if (table == nullptr || Role() != 0) return;
 	const auto frame = m_context.FrameNumber();
 	if (frame - table->pairs_swept < TableXpr::PairSweepFrames) return;
+	// (Put off while a speculation translates or has a result unfinished: tried at every call until done. Checked again
+	// under the lock: a translation counted after it reads the catalog after the sweep, and sees its epoch.)
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return;
 	table->pairs_swept = frame;
-	if (m_catalog_readers.load(std::memory_order_relaxed) != 0 ||
-	    table->pairs.size() + table->dispatches.size() <= TableXpr::PairsKept)
+	if (table->pairs.size() + table->dispatches.size() <= TableXpr::PairsKept) return;
+	const auto write = CatalogWrite();
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) {
+		table->pairs_swept = frame - TableXpr::PairSweepFrames;
 		return;
-	const auto   write  = CatalogWrite();
+	}
 	const size_t before = table->pairs.size() + table->dispatches.size();
 	for (auto* pairs: {&table->pairs, &table->dispatches})
 		std::erase_if(*pairs, [&](auto& item) {
@@ -531,6 +537,40 @@ void RenderExecutor::DropStaleCatalog() {
 	table.last_pair  = nullptr;
 	table.last_state = nullptr;
 	table.last_set   = nullptr;
+	// (Its memo holds the owner's sets and states too: the owner's retirements move only the owner's memo_epoch.)
+	++table.memo_epoch;
+	table.memo_set = nullptr;
+}
+
+// A speculation's executor, before its translation reads the catalog (Speculation::Translate): the catalog's sweeps
+// (TableSweepPairs, NativeXprSweepStates) run only between translations, so what it kept from the last one of the
+// owner's pairs, draw states and sets is dropped here when the owner's epoch moved since: its table's lookups, last
+// draw and memo, and its native emission's last state.
+void RenderExecutor::ForgetStaleCatalog() {
+	if (Role() == 0) return;
+	const auto read    = CatalogRead();
+	auto*      catalog = CatalogTable();
+	if (catalog == nullptr || m_table_xpr == nullptr || catalog->epoch == m_table_xpr->seen_epoch) return;
+	auto& table              = *m_table_xpr;
+	table.seen_epoch         = catalog->epoch;
+	table.pair_cache         = {};
+	table.found_key          = {};
+	table.found_pair         = nullptr;
+	table.found_dispatch_key = {};
+	table.found_dispatch     = nullptr;
+	table.previous_dispatch  = nullptr;
+	table.store              = nullptr;
+	table.gathered           = nullptr;
+	table.last_pair          = nullptr;
+	table.last_state         = nullptr;
+	table.last_set           = nullptr;
+	table.memo_set           = nullptr;
+	++table.memo_epoch;
+	if (m_native_xpr) {
+		m_native_xpr->emit           = {};
+		m_native_xpr->last_state     = nullptr;
+		m_native_xpr->last_state_key = 0;
+	}
 }
 
 // A table draw's or dispatch's pair: each draw's pair is another, cold, object and its evaluation

@@ -20,11 +20,18 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" {
 volatile std::atomic_uint32_t kyty_local_speculate_mode {0};
 volatile std::atomic_uint32_t kyty_local_speculate_threads {2};
+// Translations going on and results not finished (Translate to Finish). While there are any, a speculation's executor
+// may hold what it read of the owners' catalogs (pairs, draw states, image sets) and a result's commands their
+// pipelines: the catalog sweeps (NativeXprSweepStates, TableSweepPairs) and EvictIdlePipelines wait for none.
+volatile std::atomic_uint32_t kyty_local_speculations_live {0};
+// EvictIdlePipelines is destroying pipeline handles: no translation begins until it is done.
+volatile std::atomic_uint32_t kyty_local_pipelines_evicting {0};
 }
 
 namespace Libs::Graphics {
@@ -610,6 +617,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		// (Linked under the lock: one committed or dropped since it was chosen is not; Finish unlinks the others.)
 		std::lock_guard lock(m_mutex);
 		r.retired = 0;
+		kyty_local_speculations_live.fetch_add(1, std::memory_order_seq_cst); // (Finish takes it back)
 		if (previous != nullptr && previous->retired == 0)
 			r.state.previous = &previous->state;
 		else if (record != nullptr && std::ranges::any_of(m_jobs, [&](const Entry& entry) {
@@ -644,7 +652,13 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	// (What it translates is not done: nothing it does is an effect.)
 	auto* const effects = std::exchange(Spec::t_effects, nullptr);
 	auto* const effects_async = std::exchange(Spec::t_effects_async, nullptr);
+	// (Counted above: EvictIdlePipelines either saw it and evicts none, or set its flag first and this waits for it
+	// before any pipeline is bound.)
+	while (kyty_local_pipelines_evicting.load(std::memory_order_seq_cst) != 0) std::this_thread::yield();
 	RenderContext::SetThreadExecutors(&translator.executors);
+	// (What it kept of the catalogs from its last translation, dropped when a sweep or reset happened since.)
+	translator.draw->ForgetStaleCatalog();
+	translator.compute->ForgetStaleCatalog();
 	{
 	Spec::t_state = &r.state;
 	CommandScheduler::SetThreadRecorder(r.recorder.get());
@@ -1184,6 +1198,8 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	// (Its pending writes are made or dropped: what was translated after it reads through its command buffer's record
 	// while that is not done, else memory.)
 	Unlink(&r.state, RecordOf(r.serial, r.chunk));
+	// (Its commands are submitted or discarded: none of them binds a pipeline later.)
+	kyty_local_speculations_live.fetch_sub(1, std::memory_order_seq_cst);
 	r.retired = ++m_clock;
 	owner.free.push_back(std::move(result));
 }
