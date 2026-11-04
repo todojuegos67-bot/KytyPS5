@@ -54,6 +54,7 @@ jobs:
         $ffxText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes('_Build\deps\ffx\amd_fidelityfx_vk.dll'))
         if (!$ffxText.Contains('command lists of queue family')) { throw 'amd_fidelityfx_vk.dll lacks the command list pool fix' }
         if (!$ffxText.Contains('KYTY_FSR3_FG_ACTIVE')) { throw 'amd_fidelityfx_vk.dll lacks the dynamic multiplier' }
+        if (!$ffxText.Contains('kytyFfxSetPaceSlot') -or !$ffxText.Contains('kytyFfxTakePaceStats')) { throw 'amd_fidelityfx_vk.dll lacks the midpoint pacing' }
         Get-ChildItem _Build\deps\ffx | ForEach-Object { '{0,12:N0}  {1}  md5 {2}' -f $_.Length, $_.Name, (Get-FileHash -Algorithm MD5 $_.FullName).Hash.ToLower() }
     - name: Streamline SDK (DLSS)
       shell: pwsh

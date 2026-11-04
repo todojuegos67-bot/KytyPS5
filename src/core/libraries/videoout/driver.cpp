@@ -242,7 +242,9 @@ void VideoOutDriver::Flip(const Request& req) {
     // Present the frame (BB::AntiLag: its guest flip's present markers around it).
     const u64 lat_index = req.frame != nullptr ? req.frame->lat_index : 0;
     BB::AntiLag::OnPresent(lat_index);
+    BB::FG::SetPresentSlot({req.pace_qpc, req.pace_interval});
     presenter->Present(req.frame);
+    BB::FG::SetPresentSlot({});
     BB::AntiLag::AfterPresent(lat_index);
     if (BB::AntiLag::PaceOn() || BB::AntiLag::PhaseOn() || BB::AntiLag::PadLateOn()) {
         // KYTY_LOWLAT pacing / Anti-Lag+ pad late (the DS videoOut rule): the game's own flip
@@ -322,9 +324,11 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
-    // Frame generation: the real frames held to its limit at the game's own flip (bb_fg.h).
+    // Frame generation: the real frames held to its limit at the game's own flip (bb_fg.h); the
+    // flip's grid slot goes with its request (the frame generation presents).
+    BB::FG::PresentSlot pace{};
     if (index != -1) {
-        BB::FG::PaceGuestFlip();
+        pace = BB::FG::PaceGuestFlip();
         BB::FG::GameFlipReserved();
     }
     // BB::AntiLag: the game's CPU frame ends at its flip.
@@ -332,17 +336,18 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand(
-            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, lat_index); });
+        liverpool->SendCommand([=, this]() {
+            SubmitFlipInternal(port, index, flip_arg, is_eop, lat_index, pace.qpc, pace.interval);
+        });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop, lat_index);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, lat_index, pace.qpc, pace.interval);
     }
 
     return true;
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                                        u64 lat_index) {
+                                        u64 lat_index, s64 pace_qpc, s64 pace_interval) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -372,6 +377,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
+            .pace_qpc = pace_qpc,
+            .pace_interval = pace_interval,
         });
     }
     request_cv.notify_one();

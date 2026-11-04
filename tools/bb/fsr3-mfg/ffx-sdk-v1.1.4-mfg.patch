@@ -222,7 +222,7 @@ index 2340d04..b5fdf33 100644
  
  FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext* context, const FfxFrameInterpolationDispatchDescription* params);
 diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
-index 5c47b25..85a5762 100644
+index 5c47b25..5731830 100644
 --- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
 +++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
 @@ -22,6 +22,7 @@
@@ -233,7 +233,7 @@ index 5c47b25..85a5762 100644
  #include "FrameInterpolationSwapchainVK.h"
  #include "FrameInterpolationSwapchainVK_UiComposition.h"
  #include "FrameInterpolationSwapchainVK_DebugPacing.h"
-@@ -760,11 +761,77 @@ FfxErrorCode ffxFrameInterpolationSwapchainGetGpuMemoryUsageVK(FfxSwapchain game
+@@ -760,11 +761,164 @@ FfxErrorCode ffxFrameInterpolationSwapchainGetGpuMemoryUsageVK(FfxSwapchain game
  //////////////////////////////////////////////
  /// Present
  //////////////////////////////////////////////
@@ -296,6 +296,93 @@ index 5c47b25..85a5762 100644
 +    return pSwapChainVK != nullptr ? pSwapChainVK->kytyRealSwapchain() : VK_NULL_HANDLE;
 +}
 +
++namespace
++{
++int64_t kytyPaceSlotQpc     = 0; // Kyty midpoint pacing: the real frame's grid slot (QPC; 0: none)
++int64_t kytyPaceIntervalQpc = 0; // the real frame interval (QPC)
++SRWLOCK kytyPaceLock        = SRWLOCK_INIT;
++int64_t kytyPaceLastQpc     = 0;
++int64_t kytyPaceStats[8]    = {}; // presents, intervals, sum, sum of squares, min, max (ns); late presents, max late (ns)
++
++int64_t kytyQpcFrequency()
++{
++    int64_t frequency = 0;
++    QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(&frequency));
++    return frequency;
++}
++
++void kytyNotePresent()
++{
++    int64_t now = 0;
++    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&now));
++    AcquireSRWLockExclusive(&kytyPaceLock);
++    ++kytyPaceStats[0];
++    if (kytyPaceLastQpc != 0 && now > kytyPaceLastQpc)
++    {
++        const int64_t ns = (now - kytyPaceLastQpc) * 1000000000 / kytyQpcFrequency();
++        if (ns < 100000000)
++        {
++            if (kytyPaceStats[1] == 0 || ns < kytyPaceStats[4])
++                kytyPaceStats[4] = ns;
++            if (ns > kytyPaceStats[5])
++                kytyPaceStats[5] = ns;
++            ++kytyPaceStats[1];
++            kytyPaceStats[2] += ns;
++            kytyPaceStats[3] += ns * ns;
++        }
++    }
++    kytyPaceLastQpc = now;
++    ReleaseSRWLockExclusive(&kytyPaceLock);
++}
++
++void kytyNotePaceLate(int64_t nowQpc, int64_t targetQpc)
++{
++    const int64_t frequency = kytyQpcFrequency();
++    AcquireSRWLockExclusive(&kytyPaceLock);
++    if (nowQpc > targetQpc + frequency / 2000)
++    {
++        const int64_t late = (nowQpc - targetQpc) * 1000000000 / frequency;
++        ++kytyPaceStats[6];
++        if (late > kytyPaceStats[7])
++            kytyPaceStats[7] = late;
++    }
++    ReleaseSRWLockExclusive(&kytyPaceLock);
++}
++
++// A present with an absolute target (Kyty midpoint pacing) waits until the target, never past it by
++// its own choice (the spin); without one, the stock wait after the previous present.
++void kytyWaitForPresent(const PacingData::FrameInfo& frameInfo, int64_t previousPresentQpc)
++{
++    if (frameInfo.presentQpcTarget == 0)
++    {
++        waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
++        return;
++    }
++    int64_t now = 0;
++    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&now));
++    kytyNotePaceLate(now, frameInfo.presentQpcTarget);
++    waitForPerformanceCount(frameInfo.presentQpcTarget);
++}
++}  // namespace
++
++extern "C" __declspec(dllexport) void kytyFfxSetPaceSlot(int64_t slotQpc, int64_t intervalQpc)
++{
++    kytyPaceSlotQpc     = slotQpc;
++    kytyPaceIntervalQpc = intervalQpc;
++}
++
++// out[8]: presents, intervals, sum, sum of squares, min, max (ns); late presents, max late (ns). Read and cleared.
++extern "C" __declspec(dllexport) void kytyFfxTakePaceStats(int64_t* out)
++{
++    AcquireSRWLockExclusive(&kytyPaceLock);
++    for (int i = 0; i < 8; ++i)
++    {
++        out[i]          = kytyPaceStats[i];
++        kytyPaceStats[i] = 0;
++    }
++    ReleaseSRWLockExclusive(&kytyPaceLock);
++}
++
 +VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t imageIndex, uint32_t semaphoreIndex = 0, uint64_t kytyPresentId = 0)
  {
      VkPresentInfoKHR presentInfoKHR   = {};
@@ -312,19 +399,20 @@ index 5c47b25..85a5762 100644
      presentInfoKHR.waitSemaphoreCount = 1;
      presentInfoKHR.pWaitSemaphores    = &pPresenter->frameRenderedSemaphores[semaphoreIndex];
      presentInfoKHR.swapchainCount     = 1;
-@@ -773,7 +840,11 @@ VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t
+@@ -773,7 +927,12 @@ VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t
      presentInfoKHR.pResults           = nullptr;  // Optional
  
      EnterCriticalSection(&pPresenter->swapchainCriticalSection);
 +    if (kytyPresentId != 0)
 +        kytyLatencyMarker(pPresenter, kytyPresentId, 4);  // VK_LATENCY_MARKER_PRESENT_START_NV
++    kytyNotePresent();
      VkResult res = vkQueuePresentKHR(pPresenter->presentQueue.queue, &presentInfoKHR);
 +    if (kytyPresentId != 0)
 +        kytyLatencyMarker(pPresenter, kytyPresentId, 5);  // VK_LATENCY_MARKER_PRESENT_END_NV
      LeaveCriticalSection(&pPresenter->swapchainCriticalSection);
  
      ++(pPresenter->realPresentCount);
-@@ -847,7 +918,7 @@ VkResult compositeSwapChainFrame(FrameinterpolationPresentInfo* pPresenter,
+@@ -847,7 +1006,7 @@ VkResult compositeSwapChainFrame(FrameinterpolationPresentInfo* pPresenter,
          ImageBarrierHelper preCallbackBarriers;
          if (pPresenter->interpolationQueue.familyIndex != compositionQueue.familyIndex)
          {
@@ -333,8 +421,12 @@ index 5c47b25..85a5762 100644
              {
                  // this is the interpolation buffer
                  preCallbackBarriers.add(static_cast<VkImage>(frameInfo.resource.resource),
-@@ -1051,7 +1122,7 @@ DWORD WINAPI copyAndPresent_presenterThread(LPVOID pParam)
-                                 waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
+@@ -1048,10 +1207,10 @@ DWORD WINAPI copyAndPresent_presenterThread(LPVOID pParam)
+ 
+                                 res = presentCommandList->execute(toWait, toSignal);
+ 
+-                                waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
++                                kytyWaitForPresent(frameInfo, previousPresentQpc);
                                  QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
  
 -                                res = presentToSwapChain(presenter, imageIndex, imageIndex);
@@ -342,8 +434,12 @@ index 5c47b25..85a5762 100644
                                  // VK_SUBOPTIMAL_KHR & VK_ERROR_OUT_OF_DATE_KHR: the swapchain has been recreated
                                  FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR,
                                                            "presentToSwapChain failed with error %d",
-@@ -1163,7 +1234,7 @@ DWORD WINAPI composeAndPresent_presenterThread(LPVOID pParam)
-                                 waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
+@@ -1160,10 +1319,10 @@ DWORD WINAPI composeAndPresent_presenterThread(LPVOID pParam)
+                                                               uiSurfaceTransfered);
+                                 FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS, "compositeSwapChainFrame failed with error %d", res);
+ 
+-                                waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
++                                kytyWaitForPresent(frameInfo, previousPresentQpc);
                                  QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
  
 -                                res = presentToSwapChain(presenter, realSwapchainImageIndex);
@@ -351,7 +447,7 @@ index 5c47b25..85a5762 100644
                                  // VK_SUBOPTIMAL_KHR & VK_ERROR_OUT_OF_DATE_KHR: the swapchain has been recreated
                                  FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR,
                                                            "presentToSwapChain failed with error %d",
-@@ -1224,6 +1295,23 @@ DWORD WINAPI interpolationThread(LPVOID param)
+@@ -1224,6 +1383,23 @@ DWORD WINAPI interpolationThread(LPVOID param)
              SimpleMovingAverage<10, double> frameTime{};
              int64_t previousQpc = 0;
  
@@ -375,7 +471,7 @@ index 5c47b25..85a5762 100644
              while (!presenter->shutdown)
              {
                  WaitForSingleObject(presenter->presentEvent, INFINITE);
-@@ -1264,9 +1352,15 @@ DWORD WINAPI interpolationThread(LPVOID param)
+@@ -1264,9 +1440,15 @@ DWORD WINAPI interpolationThread(LPVOID param)
  
                      // set presentation time: reduce based on variance and subract safety margin so we don't lock on a framerate lower than necessary
                      int64_t qpcSafetyMargin         = int64_t(qpcFrequency * presenter->safetyMarginInSec);
@@ -393,7 +489,7 @@ index 5c47b25..85a5762 100644
                      entry.frames[PacingData::FrameType::Real].presentQpcDelta           = deltaToUse;
  
                      // schedule presents
-@@ -1362,6 +1456,7 @@ struct SwapchainCreationInfo
+@@ -1362,6 +1544,7 @@ struct SwapchainCreationInfo
      VkSwapchainCounterCreateInfoEXT          swapchainCounter;
      VkSwapchainDisplayNativeHdrCreateInfoAMD swapchainDisplayNativeHdr;
      VkSwapchainPresentModesCreateInfoEXT     swapchainPresentModes;
@@ -401,7 +497,7 @@ index 5c47b25..85a5762 100644
  };
  
  #define FFX_USE_PNEXT_AS_IS(name, type) \
-@@ -1409,6 +1504,11 @@ VkResult getRealSwapchainCreateInfo(const VkSwapchainCreateInfoKHR* pCreateInfo,
+@@ -1409,6 +1592,11 @@ VkResult getRealSwapchainCreateInfo(const VkSwapchainCreateInfoKHR* pCreateInfo,
          case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT:
              FFX_USE_PNEXT_AS_IS(swapchainPresentModes, VkSwapchainPresentModesCreateInfoEXT);
              break;
@@ -413,7 +509,7 @@ index 5c47b25..85a5762 100644
          default:
              FFX_ASSERT_MESSAGE_FORMAT(false, "Swapchain creation structure extension %d not supported", pCurrent->sType);
              return VK_ERROR_INITIALIZATION_FAILED;
-@@ -1688,8 +1788,18 @@ VkResult FrameInterpolationSwapChainVK::init(const VkSwapchainCreateInfoKHR* pCr
+@@ -1688,8 +1876,18 @@ VkResult FrameInterpolationSwapChainVK::init(const VkSwapchainCreateInfoKHR* pCr
      }
      // No need to set the layout of the images as vulkan API states that a presentable image starts out at an undefined layout.
  
@@ -432,7 +528,7 @@ index 5c47b25..85a5762 100644
          res = createImage(interpolationOutputs[i],
                            info,
                            presentInfo.realSwapchainImageDescription.format,
-@@ -1942,18 +2052,19 @@ bool FrameInterpolationSwapChainVK::waitForPresents()
+@@ -1942,18 +2140,19 @@ bool FrameInterpolationSwapChainVK::waitForPresents()
  
  FfxResource FrameInterpolationSwapChainVK::interpolationOutput(int index)
  {
@@ -455,7 +551,7 @@ index 5c47b25..85a5762 100644
      FFX_ASSERT(pRealFrame);
  
      VkImage                currentBackBuffer      = replacementSwapBuffers[currentBackBufferIndex].image;
-@@ -1962,16 +2073,27 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+@@ -1962,16 +2161,27 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
  
      *pRealFrame = backbuffer;
  
@@ -485,7 +581,7 @@ index 5c47b25..85a5762 100644
      }
  
      // check necessary transitions
-@@ -1988,8 +2110,11 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+@@ -1988,8 +2198,11 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
      }
  
      // interpolation texture previous content doesn't matter here so we can use an undefined source layout
@@ -499,7 +595,7 @@ index 5c47b25..85a5762 100644
      
      auto pRegisteredCommandList = registeredInterpolationCommandLists[currentBackBufferIndex];
      if (pRegisteredCommandList != nullptr)
-@@ -2026,14 +2151,18 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+@@ -2026,14 +2239,18 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
          FfxResource interpolatedResource = interpolationOutput();
          VkImage     interpolatedImage    = static_cast<VkImage>(interpolatedResource.resource);
  
@@ -520,7 +616,7 @@ index 5c47b25..85a5762 100644
          desc.backBufferTransferFunction = static_cast<FfxBackbufferTransferFunction>(backBufferTransferFunction);
          desc.minMaxLuminance[0]         = minLuminance;
          desc.minMaxLuminance[1]         = maxLuminance;
-@@ -2062,13 +2191,16 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+@@ -2062,13 +2279,16 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
              if (presentInfo.interpolationQueue.familyIndex != compositionQueueFamily)
              {
                  // interpolation output queue family ownership transfer
@@ -544,7 +640,7 @@ index 5c47b25..85a5762 100644
  
                  // backbuffer queue family ownership transfer
                  if (!presentInterpolatedOnly)
-@@ -2099,6 +2231,10 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+@@ -2099,6 +2319,10 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
          {
              frameInterpolationResetCondition = false;
              *pInterpolatedFrame              = interpolationOutput();
@@ -555,7 +651,7 @@ index 5c47b25..85a5762 100644
          }
      }
  }
-@@ -2174,9 +2310,10 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+@@ -2174,9 +2398,10 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
      SubmissionSemaphores ToWaitInterpolationQueue;
      ToWaitInterpolationQueue.add(presentInfo.gameSemaphore, gameSemaphoreValue);
  
@@ -568,7 +664,7 @@ index 5c47b25..85a5762 100644
  
      EnterCriticalSection(&presentInfo.scheduledFrameCriticalSection);
  
-@@ -2197,6 +2334,7 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+@@ -2197,6 +2422,7 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
      entry.gameSemaphoreValue               = gameSemaphoreValue;
      entry.usePremulAlphaComposite          = (presentInfo.uiCompositionFlags & FFX_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA) != 0;
      entry.currentFrameID                   = currentFrameID;
@@ -576,7 +672,7 @@ index 5c47b25..85a5762 100644
  
      // interpolated
      PacingData::FrameInfo& fiInterpolated = entry.frames[PacingData::FrameType::Interpolated_1];
-@@ -2208,6 +2346,26 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+@@ -2208,6 +2434,26 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
          fiInterpolated.presentIndex                         = ++framesSentForPresentation;
      }
  
@@ -603,11 +699,21 @@ index 5c47b25..85a5762 100644
      // real
      if (!presentInterpolatedOnly)
      {
-@@ -2224,7 +2382,15 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+@@ -2224,7 +2470,25 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
      entry.replacementBufferSemaphoreSignal = framesSentForPresentation;
      entry.numFramesToPresent               = static_cast<uint32_t>(framesSentForPresentation - entry.numFramesSentForPresentationBase);
  
 -    interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue = entry.numFramesSentForPresentationBase + fiInterpolated.doPresent;
++    if (kytyPaceSlotQpc != 0 && kytyPaceIntervalQpc > 0)
++    {
++        // Kyty midpoint pacing: the N generated frames at 1 / (N + 1), 2 / (N + 1) ... of the real interval after
++        // the real frame's grid slot, the real frame one interval after its slot (the grid of its own flip).
++        const uint32_t generated = fiInterpolated3.doPresent ? 3 : fiInterpolated2.doPresent ? 2 : fiInterpolated.doPresent ? 1 : 0;
++        PacingData::FrameInfo* const generatedFrames[3] = {&fiInterpolated, &fiInterpolated2, &fiInterpolated3};
++        for (uint32_t i = 0; i < generated; ++i)
++            generatedFrames[i]->presentQpcTarget = kytyPaceSlotQpc + (i + 1) * kytyPaceIntervalQpc / (generated + 1);
++        entry.frames[PacingData::FrameType::Real].presentQpcTarget = kytyPaceSlotQpc + kytyPaceIntervalQpc;
++    }
 +    interpolationOutputs[interpolationBufferIndex * 3].availabilitySemaphoreValue = entry.numFramesSentForPresentationBase + fiInterpolated.doPresent;
 +    if (fiInterpolated2.doPresent)
 +    {
@@ -620,7 +726,7 @@ index 5c47b25..85a5762 100644
  
      if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
      {
-@@ -2283,7 +2449,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresentNonInterpolated(VkCommands*
+@@ -2283,7 +2547,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresentNonInterpolated(VkCommands*
  
      pCommands->execute(semaphoresToWait, semaphoresToSignal);
  
@@ -629,7 +735,7 @@ index 5c47b25..85a5762 100644
      FFX_ASSERT_MESSAGE_FORMAT(presentRes == VK_SUCCESS || presentRes == VK_SUBOPTIMAL_KHR || presentRes == VK_ERROR_OUT_OF_DATE_KHR,
                                "[queuePresentNonInterpolated] present failed with error %d",
                                presentRes);
-@@ -2552,7 +2718,7 @@ VkResult FrameInterpolationSwapChainVK::presentNonInterpolatedWithUiCompositionO
+@@ -2552,7 +2816,7 @@ VkResult FrameInterpolationSwapChainVK::presentNonInterpolatedWithUiCompositionO
          FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS, "[queuePresentNonInterpolated] queue family ownership transfer to present queue failed with error %d", res);
      }
  
@@ -638,7 +744,7 @@ index 5c47b25..85a5762 100644
      FFX_ASSERT_MESSAGE_FORMAT(presentRes == VK_SUCCESS || presentRes == VK_SUBOPTIMAL_KHR || presentRes == VK_ERROR_OUT_OF_DATE_KHR,
                                "[queuePresentNonInterpolated] present failed with error %d",
                                presentRes);
-@@ -2594,6 +2760,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
+@@ -2594,6 +2858,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
  
      VkResult res = VK_SUCCESS;
  
@@ -646,7 +752,7 @@ index 5c47b25..85a5762 100644
      setFrameGenerationConfig(&nextFrameGenerationConfig);
  
      EnterCriticalSection(&criticalSection);
-@@ -2645,7 +2812,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
+@@ -2645,7 +2910,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
          presentQueueWait.add(presentInfo.gameSemaphore, gameSemaphoreValue);
  
          // fails 
@@ -655,7 +761,7 @@ index 5c47b25..85a5762 100644
  
          uint32_t imageIndex = 0;
          VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
-@@ -2695,7 +2862,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
+@@ -2695,7 +2960,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
      // Unregister any potential command list
      registeredInterpolationCommandLists[currentBackBufferIndex] = nullptr;
      presentCount++;
@@ -665,7 +771,7 @@ index 5c47b25..85a5762 100644
      // update active backbuffer and block when no buffer is available
      replacementSwapBufferIndex = presentCount % gameBufferCount;
 diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
-index 0218ade..f488532 100644
+index 0218ade..1faaf96 100644
 --- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
 +++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
 @@ -113,10 +113,13 @@ typedef struct PacingData
@@ -682,7 +788,15 @@ index 0218ade..f488532 100644
          Real,
          Count
      } FrameType;
-@@ -157,7 +160,7 @@ enum class FGSwapchainCompositionMode
+@@ -129,6 +132,7 @@ typedef struct PacingData
+         uint64_t    interpolationCompletedSemaphoreValue;
+         uint64_t    presentIndex;
+         uint64_t    presentQpcDelta;
++        int64_t     presentQpcTarget; // Kyty midpoint pacing: the absolute present time (QPC; 0: presentQpcDelta)
+     };
+ 
+     FrameInfo frames[FrameType::Count];
+@@ -157,7 +161,7 @@ enum class FGSwapchainCompositionMode
  
  struct FrameinterpolationPresentInfo
  {
@@ -691,7 +805,7 @@ index 0218ade..f488532 100644
  
      PacingData scheduledInterpolations;
      PacingData scheduledPresents;
-@@ -244,6 +247,9 @@ public:  // vulkan functions reimplementation
+@@ -244,6 +248,9 @@ public:  // vulkan functions reimplementation
  
      uint64_t getLastPresentCount();
  
@@ -701,7 +815,7 @@ index 0218ade..f488532 100644
  public:
      void            setFrameGenerationConfig(FfxFrameGenerationConfig const* config);
      void            setFramePacingTuning(const FfxSwapchainFramePacingTuning* framePacingTuning);
-@@ -276,7 +282,7 @@ private:
+@@ -276,7 +283,7 @@ private:
      VkResult queuePresentNonInterpolated(VkCommands* pCommands, uint32_t imageIndex, SubmissionSemaphores& semaphoresToWait);
  
      void     dispatchInterpolationCommands(uint32_t              currentBackBufferIndex,
@@ -710,7 +824,7 @@ index 0218ade..f488532 100644
                                             FfxResource*          pRealFrame,
                                             SubmissionSemaphores& semaphoresToWait);
      void     discardOutstandingInterpolationCommandLists();
-@@ -316,7 +322,8 @@ private:
+@@ -316,7 +323,8 @@ private:
      
      uint32_t            gameBufferCount                                                             = 0;
      ReplacementResource replacementSwapBuffers[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT] = {};
@@ -720,7 +834,7 @@ index 0218ade..f488532 100644
      ReplacementResource uiReplacementBuffer                                                         = {};
      uint32_t            replacementSwapBufferIndex                                                  = 0;
      uint32_t            interpolationBufferIndex                                                    = 0;
-@@ -335,6 +342,7 @@ private:
+@@ -335,6 +343,7 @@ private:
      bool drawDebugPacingLines           = false;
  
      UINT64        currentFrameID = 0;

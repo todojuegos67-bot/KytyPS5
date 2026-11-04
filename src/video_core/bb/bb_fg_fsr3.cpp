@@ -64,6 +64,9 @@ PFN_vkQueueSubmit g_queue_submit = nullptr;
 
 ffxContext g_swapchain_context = nullptr;
 ffxQueryDescSwapchainReplacementFunctionsVK g_functions{};
+// Patched DLL: the grid slot of the next present; the presents' intervals (read and cleared).
+void (*g_set_pace_slot)(int64_t, int64_t) = nullptr;
+void (*g_take_pace_stats)(int64_t*) = nullptr;
 
 ffxContext g_fg_context = nullptr;
 vk::Extent2D g_fg_display{};
@@ -87,7 +90,7 @@ std::chrono::steady_clock::time_point g_last_real{};
 
 struct Stats {
     std::chrono::steady_clock::time_point start{};
-    uint32_t real = 0, generated_on = 0, no_inputs = 0, hudless = 0;
+    uint32_t real = 0, generated_on = 0, no_inputs = 0, hudless = 0, slotted = 0;
     uint64_t presents_at_start = 0;
     double pace_n = 0, pace_sum = 0, pace_sq = 0, pace_max = 0; // real present intervals (s)
     double prepare_ms = 0, present_ms = 0, max_present_ms = 0;
@@ -397,6 +400,23 @@ void LogState(int state, const char* text) {
     Printf("FSR3 FG: %s", text);
 }
 
+void LogPresentIntervals(double window) {
+    int64_t pace[8]{};
+    g_take_pace_stats(pace);
+    const double n = static_cast<double>(pace[1]);
+    const double mean_ms = n > 0.0 ? static_cast<double>(pace[2]) / n / 1e6 : 0.0;
+    const double var_ms2 =
+        n > 0.0 ? static_cast<double>(pace[3]) / n / 1e12 - mean_ms * mean_ms : 0.0;
+    Printf("[midpoint] real %.1f fps, shown %.1f fps (%lld presents); interval over all presents: "
+           "mean %.2f ms, sd %.2f ms (min %.2f, max %.2f, %lld intervals); placed %u of %u real "
+           "flips; late %lld (max %.2f ms)",
+           g_stats.real / window, static_cast<double>(pace[0]) / window,
+           static_cast<long long>(pace[0]), mean_ms, std::sqrt(std::max(var_ms2, 0.0)),
+           static_cast<double>(pace[4]) / 1e6, static_cast<double>(pace[5]) / 1e6,
+           static_cast<long long>(pace[1]), g_stats.slotted, g_stats.real,
+           static_cast<long long>(pace[6]), static_cast<double>(pace[7]) / 1e6);
+}
+
 bool LoadApi() {
     static const bool loaded = [] {
         wchar_t exe[MAX_PATH]{};
@@ -418,6 +438,10 @@ bool LoadApi() {
             return false;
         }
         const bool patched = GetProcAddress(g_dll, "kytyFfxGetRealSwapchainVK") != nullptr;
+        g_set_pace_slot = reinterpret_cast<void (*)(int64_t, int64_t)>(
+            GetProcAddress(g_dll, "kytyFfxSetPaceSlot"));
+        g_take_pace_stats =
+            reinterpret_cast<void (*)(int64_t*)>(GetProcAddress(g_dll, "kytyFfxTakePaceStats"));
         Printf("FSR3 FG: amd_fidelityfx_vk.dll loaded (%s)",
                patched ? "patched: multi frame generation x2-x4, dynamic"
                        : "AMD's signed DLL: x2 only");
@@ -658,6 +682,11 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
     const auto begin = std::chrono::steady_clock::now();
     VkPresentInfoKHR present = static_cast<VkPresentInfoKHR>(info);
     present.pNext = nullptr;
+    const auto slot = BB::FG::PresentSlotNow();
+    if (g_set_pace_slot != nullptr) {
+        g_set_pace_slot(slot.qpc, slot.interval);
+    }
+    g_stats.slotted += slot.qpc != 0 ? 1 : 0;
     auto result = g_functions.pOutQueuePresentKHR(static_cast<VkQueue>(queue), &present);
     const double ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
@@ -744,6 +773,9 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    sd * 1e3, mean * 1e3, g_stats.pace_max * 1e3, g_stats.pace_n,
                    (GuestPacing() ? PaceEffective() : CapInterval()) * 1e3,
                    GuestPacing() ? "guest flips" : "present");
+        }
+        if (g_take_pace_stats != nullptr) {
+            LogPresentIntervals(window);
         }
         MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
         g_stats = {};

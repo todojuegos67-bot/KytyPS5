@@ -126,8 +126,16 @@ void GameFlipReserved();
 // Before BeforePresent: the guest frame index of the frame presented (0: a repeat or none).
 void SetPresentIndex(uint32_t index);
 // The game's flip submit (VideoOut): holds the real frames to the frame generation limit there
-// (BB_FG_PACE=guest, default).
-void PaceGuestFlip();
+// (BB_FG_PACE=guest, default). Returns the grid slot the flip was released at for FSR 3's frame
+// generation presents (none unless a fixed cap is generating).
+struct PresentSlot {
+    int64_t qpc = 0;      // the release, QPC ticks (0: none)
+    int64_t interval = 0; // the real frame interval, QPC ticks
+};
+PresentSlot PaceGuestFlip();
+// The present thread's slot for the present it makes now (set around Presenter::Present).
+void SetPresentSlot(PresentSlot slot);
+PresentSlot PresentSlotNow();
 bool GuestPacing();
 // bb-pace-049 (BB_PACE_FIX, default on; 0: the bb-cap-044 pacer): a late flip released at once
 // and the grid re-phased from it, a high-resolution wait, the [pace] line, BB_FPS_CAP=auto.

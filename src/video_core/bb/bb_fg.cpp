@@ -741,6 +741,29 @@ double WaitUntil(Clock::time_point deadline) {
     return over;
 }
 
+// QPC ticks for `seconds`, and the QPC tick of a steady clock time (0 off Windows).
+int64_t QpcTicks(double seconds) {
+#if defined(_WIN32)
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    return static_cast<int64_t>(seconds * static_cast<double>(frequency.QuadPart));
+#else
+    (void)seconds;
+    return 0;
+#endif
+}
+
+int64_t QpcAt(Clock::time_point when) {
+#if defined(_WIN32)
+    LARGE_INTEGER counter{};
+    QueryPerformanceCounter(&counter);
+    return counter.QuadPart + QpcTicks(std::chrono::duration<double>(when - Clock::now()).count());
+#else
+    (void)when;
+    return 0;
+#endif
+}
+
 // The per-second line and the auto cap's window (under PaceGuestFlip's mutex).
 struct Stats {
     Clock::time_point start{};
@@ -831,8 +854,20 @@ void Pace::Second(Clock::time_point now, int cap) {
     for (auto& h : w.held) h = 0;
 }
 
-void PaceGuestFlip() {
-    if (!GuestPacing()) return;
+namespace {
+PresentSlot g_present_slot{};
+} // namespace
+
+void SetPresentSlot(PresentSlot slot) {
+    g_present_slot = slot;
+}
+
+PresentSlot PresentSlotNow() {
+    return g_present_slot;
+}
+
+PresentSlot PaceGuestFlip() {
+    if (!GuestPacing()) return {};
     using Clock = std::chrono::steady_clock;
     static Clock::time_point next{};
     static Clock::time_point exited{}; // when the previous flip's wait ended
@@ -875,7 +910,7 @@ void PaceGuestFlip() {
     if (interval <= 0.0 || interval > 0.1) {
         next = Clock::time_point{};
         exited = Clock::now();
-        return;
+        return {};
     }
     const auto step =
         std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(interval));
@@ -887,6 +922,7 @@ void PaceGuestFlip() {
     }
     ++st.flips;
     auto now = arrive;
+    auto released = arrive;
     if (!fix) {
         // bb-cap-044.
         if (next > now) {
@@ -914,7 +950,7 @@ void PaceGuestFlip() {
         // A late flip resets the grid (no burst to catch up).
         next = std::max(next, now - step) + step;
         exited = Clock::now();
-        return;
+        return {};
     }
     // A flip that reaches its slot waits for it (never longer than the step from the last
     // release: the slot is at most last release + step). A late one is released at once and the
@@ -934,6 +970,7 @@ void PaceGuestFlip() {
         st.over_max = std::max(st.over_max, over);
         Amd::NoteSlept(waited);
         Dlssg::NoteSlept(waited);
+        released = until;
         now = Clock::now();
         next = until + step;
     } else if (next != Clock::time_point{} && timed) {
@@ -951,6 +988,10 @@ void PaceGuestFlip() {
         next = now + step; // the first flip, or after a pause
     }
     exited = Clock::now();
+    if (cap > 0 && PresentOnArrival() && Amd::Generating()) {
+        return {Pace::QpcAt(released), Pace::QpcTicks(interval)};
+    }
+    return {};
 }
 
 namespace Dlssg {
