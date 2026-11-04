@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -55,8 +56,15 @@ inline const Settings& Get() {
             }
         }
 
+        // BB_TEX_LOD_EXTRA (0.53): extra colour LOD bias for upscaling, log2(internal / output
+        // height) as DLSS / FSR ask, so the mips match the output resolution, not the internal
+        // one. The launcher sets it only with an upscaler; clamped to [-3, 0].
+        float extra = 0.0f;
+        if (const char* extra_env = std::getenv("BB_TEX_LOD_EXTRA"); extra_env != nullptr) {
+            extra = std::clamp(static_cast<float>(std::strtod(extra_env, nullptr)), -3.0f, 0.0f);
+        }
         const Settings result{
-            .lod_bias_offset = quality_set ? lod_bias[row] : 0.0f,
+            .lod_bias_offset = (quality_set ? lod_bias[row] : 0.0f) + extra,
             .aniso = ratio,
         };
         if (quality_set) {
@@ -64,6 +72,9 @@ inline const Settings& Get() {
                      names[row], row, result.lod_bias_offset, ratio);
         } else {
             LOG_INFO(Render_Vulkan, "[BB_TEX] Calidad de texturas: sin BB_TEX_QUALITY (juego por defecto)");
+        }
+        if (extra != 0.0f) {
+            LOG_INFO(Render_Vulkan, "[BB_TEX] LOD extra de reescalado {:+.2f} (BB_TEX_LOD_EXTRA)", extra);
         }
         return result;
     }();
