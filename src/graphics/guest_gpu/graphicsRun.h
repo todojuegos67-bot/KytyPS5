@@ -73,6 +73,7 @@ private:
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  frame_epoch       = 0;
+		uint64_t                  scout_sequence    = 0; // queue 0's graphics submissions, numbered (scout.h)
 	};
 
 	void              Enqueue(Submission submission);
@@ -102,6 +103,9 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
+	// Under m_queue_mutex: the last graphics submission's number, and a reset a flip preparation carried (the next one's).
+	uint64_t                                       m_scout_sequence    = 0;
+	bool                                           m_scout_reset       = false;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

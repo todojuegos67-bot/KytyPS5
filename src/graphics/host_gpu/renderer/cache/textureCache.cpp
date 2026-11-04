@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -4110,6 +4111,7 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 			const auto begin     = std::max(run_begin, range.address);
 			const auto end       = std::min(run_end, range.address + range.size);
 			LibKernel::Memory::WriteBacking(begin, mapped + (begin - range.address), end - begin, "image");
+			if (Scout::Running()) Scout::NoteHostWrite(begin, end - begin, true);
 			m_page_manager.UpdatePageWatchers<false>(run_begin, run_end - run_begin);
 			first = last;
 		}
@@ -4564,6 +4566,8 @@ void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch
 						source += piece.size;
 					}
 				}
+				if (Scout::Running())
+					for (const auto& range: raw->ranges) Scout::NoteHostWrite(range.begin, range.end - range.begin, true);
 				for (const auto& range: raw->ranges) m_page_manager.UpdateReadWatchers<false>(range.begin, range.end - range.begin);
 				const auto us = static_cast<uint64_t>(
 				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - raw->start).count());
@@ -4585,6 +4589,8 @@ void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch
 			bytes += range.end - range.begin;
 		}
 	}
+	if (Scout::Running())
+		for (const auto& range: ranges) Scout::NoteHostWrite(range.begin, range.end - range.begin, true);
 	for (const auto& range: ranges) m_page_manager.UpdateReadWatchers<false>(range.begin, range.end - range.begin);
 	const auto us = static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());

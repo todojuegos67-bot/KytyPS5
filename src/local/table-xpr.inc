@@ -206,6 +206,8 @@ struct RenderExecutor::TablePair {
 	TablePair* next = nullptr;
 	// The frame it was last looked up (TableSweepPairs lets one go that none used for a while).
 	uint64_t used_frame = 0;
+	// The version of the view the scout evaluates its draws from (Scout::View, TableScoutPublish; 0: none).
+	uint64_t scout_version = 0;
 };
 
 struct RenderExecutor::TableXpr {
@@ -274,7 +276,7 @@ struct RenderExecutor::TableXpr {
 		uint64_t                address = 0, size = 0, cpu_epoch = 0, registration = 0;
 	};
 	static constexpr uint64_t RingCopyMark = uint64_t {1} << 63u;
-	static constexpr size_t           ResolvedEntries = 65536;
+	static constexpr size_t           ResolvedEntries = Scout::ResolvedEntries; // (the scout's tickets index it)
 	std::unique_ptr<ResolvedBuffer[]> resolved = std::make_unique<ResolvedBuffer[]>(ResolvedEntries);
 	// A copy in the table upload ring of a small range the guest wrote (TableBlocks reads such a range from a copy,
 	// none held: the guest writes its pages unseen), direct-mapped by the range: the later uses share it
@@ -319,9 +321,17 @@ struct RenderExecutor::TableXpr {
 	ShaderRecompiler::IR::AddressProbeCandidates                      probe;
 };
 
+// A draw pair's key as TableTry hashes it (the scout's view directory too).
+template <typename Pair>
+static uint64_t TableScoutHash(const Pair& pair) {
+	const std::array<uint64_t, 3> key {pair.vs, pair.ps, static_cast<uint32_t>(pair.start_instance)};
+	return XXH3_64bits(key.data(), sizeof(key));
+}
+
 // The pair's programs and what was made for them leave (its shaders changed, or a V#'s format did:
 // TablePair::portable); the next draw or dispatch compiles them again.
 void RenderExecutor::TableReset(TablePair& pair) {
+	if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
 	auto& table = *m_table_xpr;
 	for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
 	if (table.store == &pair) table.store = nullptr;
@@ -1581,6 +1591,258 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 	return true;
 }
 
+// KYTY_SCOUT (scout.h): the draw pair's view for the scout, when its stages take TableEvaluate's and TableGather's flat
+// paths with no indirect image; none otherwise.
+template <typename Pair>
+static void TableScoutPublish(Pair& pair) {
+	if (!Scout::Running() || pair.programs[0] == nullptr) return;
+	auto view    = std::make_unique<Scout::View>();
+	view->key    = {pair.vs, pair.ps, static_cast<uint32_t>(pair.start_instance)};
+	view->stages = pair.programs[1] != nullptr ? 2u : 1u;
+	for (uint32_t st = 0; st < view->stages; ++st) {
+		const auto& program = *pair.programs[st];
+		const auto& plan    = program.table_plan;
+		const auto& form    = pair.packed[st];
+		if (!form.valid || form.runs.size() != pair.runs[st].size() || form.user_words > 32 || !plan.indirect.empty() ||
+		    form.buffer_words.size() != 4 * plan.buffers.size())
+			return;
+		auto& stage = view->stage[st];
+		for (const auto& run: form.runs) {
+			stage.runs.push_back({run.address, run.records, run.immediate, run.first, run.count});
+			stage.slot_words += run.count;
+		}
+		if (stage.slot_words > 0xffff) return;
+		// Block order: the runs by first slot, side by side ones one segment.
+		std::vector<uint16_t> order(stage.runs.size());
+		for (size_t i = 0; i < order.size(); ++i) order[i] = static_cast<uint16_t>(i);
+		std::ranges::sort(order, {}, [&](uint16_t i) { return stage.runs[i].first; });
+		uint16_t at = 0;
+		for (const auto i: order) {
+			auto& run = stage.runs[i];
+			run.at    = at;
+			at        = static_cast<uint16_t>(at + run.count);
+			if (!stage.segments.empty() && stage.segments.back().first + stage.segments.back().count == run.first)
+				stage.segments.back().count = static_cast<uint16_t>(stage.segments.back().count + run.count);
+			else
+				stage.segments.push_back({run.first, run.count});
+		}
+		stage.level_ends.assign(form.level_ends.begin(), form.level_ends.end());
+		stage.image_words.assign(form.image_words.begin(), form.image_words.end());
+		stage.buffer_words.assign(form.buffer_words.begin(), form.buffer_words.end());
+		stage.image_counts.assign(form.image_counts.begin(), form.image_counts.end());
+		stage.constants.assign(form.constants.begin(), form.constants.end());
+		stage.user_words      = form.user_words;
+		stage.block_dwords    = static_cast<uint32_t>(plan.BlockDwords());
+		stage.lod_stats_count = static_cast<uint32_t>(program.bindings.lod_stats_count);
+		stage.buffers         = static_cast<uint32_t>(plan.buffers.size());
+	}
+	view->version = pair.scout_version = Scout::NextVersion();
+	Scout::Publish(view.release(), TableScoutHash(pair));
+}
+
+// The scout's ticket for the draw TableDraw makes (Scout::Current), when it holds: made for this packet from this
+// pair's view, with the user data the render thread has, under the mapping epoch of now, and no page of its tables with
+// read watchers now (GPU work recorded after the scout read them writes it). Null otherwise, counted by reason.
+template <typename Pair>
+static const Scout::Ticket* TableScoutTicket(const Pair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+                                             uint32_t stages, GpuResourceManager& resources) {
+	LiveCounters::Add(LiveCounters::ScoutChecks);
+	if (pair.scout_version == 0) return LiveCounters::Add(LiveCounters::ScoutLostNoView), nullptr;
+	const auto* ticket = Scout::Current();
+	if (ticket == nullptr) {
+		LiveCounters::Add(LiveCounters::ScoutLostMissing);
+		LiveCounters::Add(static_cast<LiveCounters::Id>(LiveCounters::ScoutMissUnwalked + static_cast<uint32_t>(Scout::CurrentReason())));
+		return nullptr;
+	}
+	if (ticket->packet != Scout::CurrentPacket()) return LiveCounters::Add(LiveCounters::ScoutLostIdentity), nullptr;
+	if (ticket->version != pair.scout_version || ticket->stages != stages)
+		return LiveCounters::Add(LiveCounters::ScoutLostPair), nullptr;
+	for (uint32_t st = 0; st < stages; ++st)
+		if (ticket->user_words[st] > user_data[st].size() ||
+		    std::memcmp(ticket->user_data[st].data(), user_data[st].data(), ticket->user_words[st] * sizeof(uint32_t)) != 0)
+			return LiveCounters::Add(LiveCounters::ScoutLostRegisters), nullptr;
+	if (ticket->mapping_epoch != resources.MappingEpoch()) return LiveCounters::Add(LiveCounters::ScoutLostEpoch), nullptr;
+	if (bool write_back = false; Scout::WrittenSince(*ticket, write_back)) {
+		if (write_back) LiveCounters::Add(LiveCounters::ScoutLostWriteBack);
+		return LiveCounters::Add(LiveCounters::ScoutLostWritten), nullptr;
+	}
+	// Each page once (in order), its granule's bit once a granule.
+	const auto* pages    = Scout::Pages(*ticket);
+	const auto* granules = resources.ReadGranules();
+	uint64_t    clear    = UINT64_MAX; // a granule whose bit is clear
+	for (uint32_t i = 0; i < ticket->pages; ++i) {
+		if ((pages[2 * i + 1] & Scout::Ticket::PageBacking) != 0) continue; // (its ranges are proven below)
+		const auto page    = Scout::PageAt(pages, i);
+		const auto granule = page >> (PageManager::READ_GRANULE_BITS - 12u);
+		if (granule == clear) continue;
+		if ((page << 12u) < TRACKER_ADDRESS_SIZE &&
+		    ((granules[granule / 64u].load(std::memory_order_acquire) >> (granule % 64u)) & 1u) == 0) {
+			clear = granule;
+			continue;
+		}
+		if (resources.HasReadWatchers(page << 12u, 4096)) return LiveCounters::Add(LiveCounters::ScoutLostWatched), nullptr;
+	}
+	// Each range the scout read from the backing, as this thread's own read takes it (clean bytes
+	// from the backing; otherwise the GPU's, read back) and the same as the ticket's.
+	const auto* ranges = pages + 2u * ticket->pages;
+	for (uint32_t i = 0; i < ticket->backing; ++i) {
+		const auto               address = ranges[3 * i] | uint64_t {ranges[3 * i + 1]} << 32u;
+		const auto*              held    = ticket->data + (ranges[3 * i + 2] & 0xffffu);
+		const uint32_t           count   = ranges[3 * i + 2] >> 16u;
+		std::array<uint32_t, 64> fresh;
+		for (uint32_t done = 0; done < count; done += static_cast<uint32_t>(fresh.size())) {
+			const auto chunk = std::min<uint32_t>(count - done, static_cast<uint32_t>(fresh.size()));
+			if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address + 4ull * done, fresh.data(), chunk * 4ull))
+				return LiveCounters::Add(LiveCounters::ScoutLostDirty), nullptr;
+			if (std::memcmp(fresh.data(), held + done, chunk * 4ull) != 0)
+				return LiveCounters::Add(LiveCounters::ScoutLostChanged), nullptr;
+		}
+	}
+	LiveCounters::Add(LiveCounters::ScoutUsed);
+	if (ticket->backing != 0) LiveCounters::Add(LiveCounters::ScoutUsedBacking);
+	return ticket;
+}
+
+// Words copied without a library call: a ticket's segments are a few words each, and a memcpy call a run cost more
+// than its copy.
+static inline void TableCopyWords(uint32_t* to, const uint32_t* from, uint32_t count) {
+	for (; count >= 8; count -= 8, to += 8, from += 8) __builtin_memcpy_inline(to, from, 32);
+	if ((count & 4u) != 0) {
+		__builtin_memcpy_inline(to, from, 16);
+		to += 4;
+		from += 4;
+	}
+	if ((count & 2u) != 0) {
+		__builtin_memcpy_inline(to, from, 8);
+		to += 2;
+		from += 2;
+	}
+	if ((count & 1u) != 0) *to = *from;
+}
+
+// A ticket's slot words of one stage (`in`) into its block `slots`, by segment (`segments`, `count` of them).
+static void TableScoutSlots(uint32_t* slots, const uint32_t* in, const uint32_t* segments, uint32_t count) {
+	for (uint32_t i = 0; i < count; ++i) {
+		const uint32_t words = segments[i] >> 16u;
+		TableCopyWords(slots + (segments[i] & 0xffffu), in, words);
+		in += words;
+	}
+}
+
+// A ticket's evaluation where TableEvaluate and TableGather leave theirs: each stage's runs' slots in its block (the
+// other slots as they were), its T#/S# and LOD statistics words, and its V#s with their entries.
+template <typename Table, typename Pair>
+static void TableScoutApply(Table& table, const Pair& pair, const Scout::Ticket& ticket, uint32_t stages) {
+	const uint32_t* in       = ticket.data;
+	const uint32_t* segments = ticket.data + ticket.slot_words[0] + ticket.slot_words[1];
+	for (uint32_t st = 0; st < stages; ++st) {
+		auto& slots = table.blocks[st];
+		slots.resize(pair.programs[st]->table_plan.BlockDwords());
+		TableScoutSlots(slots.data(), in, segments, ticket.segments[st]);
+		in += ticket.slot_words[st];
+		segments += ticket.segments[st];
+		table.indirect[st].clear();
+	}
+	in = segments;
+	table.words.assign(in, in + ticket.image_words);
+	in += ticket.image_words;
+	table.lod_stats.assign(in, in + ticket.lod_stats);
+	in += ticket.lod_stats;
+	for (uint32_t st = 0; st < stages; ++st) {
+		auto& entries = table.entries[st];
+		entries.resize(ticket.buffers[st]);
+		for (auto& [words4, entry]: entries) {
+			std::copy_n(in, 4, words4.begin());
+			entry = &table.resolved[in[4]];
+			__builtin_prefetch(entry);
+			in += 5;
+		}
+	}
+	table.gathered = &pair;
+}
+
+// KYTY_SCOUT=2: the ticket against the render thread's own evaluation (`evaluated`: TableEvaluate's result, then
+// TableGather's), field by field; a difference is counted and the first ones reported, the first slot that differs with
+// both values.
+template <typename Table, typename Pair>
+static void TableScoutVerify(const Table& table, const Pair& pair, const Scout::Ticket& ticket, uint32_t stages,
+                             bool evaluated) {
+	// slots, T#/S# words, LOD statistics words, V#s and entries, and the apply (its slots right, the block it copies
+	// them into wrong)
+	std::array<bool, 5> differ {};
+	char                detail[160] = "";
+	if (evaluated) {
+		const uint32_t* in       = ticket.data;
+		const uint32_t* segments = ticket.data + ticket.slot_words[0] + ticket.slot_words[1];
+		thread_local std::vector<uint32_t> scratch;
+		for (uint32_t st = 0; st < stages; ++st) {
+			const auto& runs   = pair.packed[st].runs;
+			const bool  before = differ[0];
+			for (size_t r = 0; r < runs.size(); ++r) {
+				const auto& run  = runs[r];
+				const auto* mine = table.blocks[st].data() + run.first;
+				// The run's words, in block order: its segment's, then its own.
+				uint32_t at = 0;
+				for (uint32_t k = 0; k < ticket.segments[st]; ++k) {
+					const uint32_t first = segments[k] & 0xffffu, count = segments[k] >> 16u;
+					if (run.first >= first && run.first < first + count) {
+						at += run.first - first;
+						break;
+					}
+					at += count;
+				}
+				for (uint32_t w = 0; w < run.count && !differ[0]; ++w) {
+					if (mine[w] == in[at + w]) continue;
+					differ[0] = true;
+					std::snprintf(detail, sizeof(detail), " (stage %u run %zu/%zu slot %u: ticket 0x%08x, render 0x%08x)", st, r,
+					              runs.size(), run.first + w, in[at + w], mine[w]);
+				}
+			}
+			// The ticket applied as TableScoutApply does, into a copy of the render thread's block.
+			scratch.assign(table.blocks[st].begin(), table.blocks[st].end());
+			TableScoutSlots(scratch.data(), in, segments, ticket.segments[st]);
+			if (differ[0] == before && scratch != table.blocks[st]) {
+				differ[4] = true;
+				std::snprintf(detail, sizeof(detail), " (stage %u: the apply's block differs)", st);
+			}
+			LiveCounters::Add(LiveCounters::ScoutApplyRuns, runs.size());
+			LiveCounters::Add(LiveCounters::ScoutApplySegments, ticket.segments[st]);
+			segments += ticket.segments[st];
+			in += ticket.slot_words[st];
+		}
+		in = segments;
+		differ[1] = table.words.size() != ticket.image_words || !std::equal(table.words.begin(), table.words.end(), in);
+		in += ticket.image_words;
+		differ[2] = table.lod_stats.size() != ticket.lod_stats || !std::equal(table.lod_stats.begin(), table.lod_stats.end(), in);
+		in += ticket.lod_stats;
+		for (uint32_t st = 0; st < stages; ++st) {
+			if (table.entries[st].size() != ticket.buffers[st]) {
+				differ[3] = true;
+				break;
+			}
+			for (const auto& [words4, entry]: table.entries[st]) {
+				differ[3] = differ[3] || !std::equal(words4.begin(), words4.end(), in) || entry != &table.resolved[in[4]];
+				in += 5;
+			}
+		}
+		if (differ == std::array<bool, 5> {}) return;
+	}
+	LiveCounters::Add(LiveCounters::ScoutMismatches);
+	if (!evaluated) LiveCounters::Add(LiveCounters::ScoutMismatchRefused);
+	if (differ[0]) LiveCounters::Add(LiveCounters::ScoutMismatchSlots);
+	if (differ[1]) LiveCounters::Add(LiveCounters::ScoutMismatchWords);
+	if (differ[2]) LiveCounters::Add(LiveCounters::ScoutMismatchLod);
+	if (differ[3]) LiveCounters::Add(LiveCounters::ScoutMismatchEntries);
+	if (differ[4]) LiveCounters::Add(LiveCounters::ScoutMismatchApply);
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
+		std::printf("Scout: mismatch VS 0x%llx PS 0x%llx submission %llu draw %u:%s%s%s%s%s%s%s\n",
+		            static_cast<unsigned long long>(pair.vs), static_cast<unsigned long long>(pair.ps),
+		            static_cast<unsigned long long>(ticket.sequence), ticket.ordinal, evaluated ? "" : " refused",
+		            differ[0] ? " slots" : "", differ[1] ? " words" : "", differ[2] ? " lod" : "", differ[3] ? " entries" : "",
+		            differ[4] ? " apply" : "", detail);
+}
+
 RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
                                                       const NativeXprDrawState& draw_state,
                                                       std::span<const uint64_t> commands, uint64_t index_base,
@@ -1600,9 +1862,16 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	std::optional<LiveCensus::Scope> phase;
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 1);
-	if (!TableEvaluate(pair, user_data))
-		return LiveCounters::Add(LiveCounters::TableDrawNative), TableResult::Native;
-	TableGather(pair, user_data);
+	// KYTY_SCOUT: the scout's evaluation when its ticket holds (2: compared with the render thread's own).
+	const auto* scout = Scout::Running() ? TableScoutTicket(pair, user_data, stages, m_context.GetGpuResources()) : nullptr;
+	if (scout != nullptr && Scout::Mode() == 1) {
+		TableScoutApply(table, pair, *scout, stages);
+	} else {
+		const bool evaluated = TableEvaluate(pair, user_data);
+		if (evaluated) TableGather(pair, user_data);
+		if (scout != nullptr) TableScoutVerify(table, pair, *scout, stages, evaluated);
+		if (!evaluated) return LiveCounters::Add(LiveCounters::TableDrawNative), TableResult::Native;
+	}
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	auto* set = TableSet(buffer, pair, &variant, &draw_state);
@@ -2002,6 +2271,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	if (pair->programs[0] == nullptr) {
 		pair->programs = programs;
 		TableRuns(*pair);
+		TableScoutPublish(*pair);
 		const auto count = [](const ShaderRecompiler::IR::CompiledShaderInfo* program, bool cpu) -> size_t {
 			if (program == nullptr) return 0;
 			const auto& plan = program->table_plan;
