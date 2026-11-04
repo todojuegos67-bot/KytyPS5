@@ -662,6 +662,15 @@ bool Instance::CreateDevice() {
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumeratePhysicalDevices)),
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties)),
             BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr))));
+        if (BB::Upscale::Cfg().kind != BB::SR::Kind::Dlss && !BB::FG::StreamlineWanted() &&
+            std::find_if(enabled_extensions.begin(), enabled_extensions.end(), [](const char* e) {
+                return std::strcmp(e, "VK_NVX_binary_import") == 0;
+            }) != enabled_extensions.end()) {
+            // DLSS 5 after XeSS / FSR 3.1 / FSR 4: NGX's extension needs the address hole too.
+            Core::ReleaseDlssAddressHole();
+            BB::Upscale::Checkpoint("vkCreateDevice: VK_NVX_binary_import (DLSS 5) without DLSS: "
+                                    "address hole released");
+        }
         if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss || BB::FG::StreamlineWanted()) {
             Core::ReleaseDlssAddressHole();
             BB::Upscale::DryRunDevice(static_cast<VkInstance>(*instance),

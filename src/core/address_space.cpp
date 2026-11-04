@@ -177,10 +177,18 @@ struct AddressSpace::Impl {
         // for the guest made the driver fail vkCreateDevice (Kyty, RTX 5080, issues #32/#45).
         // The guest stops at 512 GiB as in Kyty, and a 64 GiB hole above it is held until right
         // before vkCreateDevice (ReleaseDlssAddressHole).
+        // 0.63: DLSS 5 (BB_DLSS5 1..3) also enables VK_NVX_binary_import after XeSS / FSR 3.1 /
+        // FSR 4, so it needs the same hole: without it vkCreateDevice crashed in the loader /
+        // overlay layers or failed (RTX 5080, BB_UPSCALER=fsr4 / fsr3 with BB_DLSS5=3).
         const char* bb_fg = std::getenv("BB_FG");
+        const char* bb_dlss5 = std::getenv("BB_DLSS5");
+        const bool bb_dlss5_on = bb_dlss5 != nullptr && std::atof(bb_dlss5) >= 1.0;
         if (const char* up = std::getenv("BB_UPSCALER");
             (up != nullptr && (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa")) ||
-            (bb_fg != nullptr && std::string_view(bb_fg).starts_with("dlss"))) {
+            (bb_fg != nullptr && std::string_view(bb_fg).starts_with("dlss")) ||
+            (bb_dlss5_on && up != nullptr &&
+             (std::string_view(up) == "xess" || std::string_view(up) == "fsr3" ||
+              std::string_view(up) == "fsr4"))) {
             constexpr u64 DlssUserMax = 0x8000000000ULL;
             if (supported_user_max > DlssUserMax) {
                 supported_user_max = DlssUserMax;
