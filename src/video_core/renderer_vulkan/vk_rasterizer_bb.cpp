@@ -23,6 +23,7 @@
 #include "video_core/host_shaders/bb_hud_comp.h"
 #include "video_core/host_shaders/bb_hudless_lut_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
+#include "video_core/host_shaders/bb_rtrefl_comp.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -83,6 +84,15 @@ struct BBVk {
     vk::DescriptorSetLayout alpha_set_layout{};
     vk::PipelineLayout alpha_layout{};
     vk::Pipeline alpha_pipeline{};
+    // BB_RT_REFLECT=2: the reflection pass (bb_rtrefl.comp) and its image, which the upscaler reads
+    // in place of the scene colour.
+    bool refl_init = false, refl_failed = false;
+    vk::DescriptorSetLayout refl_set_layout{};
+    vk::PipelineLayout refl_layout{};
+    vk::Pipeline refl_pipeline{};
+    OwnImage refl_out{};
+    u64 refl_frames = 0;
+    bool refl_skip_logged = false;
     // The output self-check: a few texels read back from the first upscales.
     vk::Buffer check_buffer{};
     VmaAllocation check_allocation{};
@@ -660,6 +670,146 @@ bool InitAlpha() {
     }
     g_bb.alpha_failed = false;
     g_bb.alpha_init = true;
+    return true;
+}
+
+bool InitReflect() {
+    if (g_bb.refl_init || g_bb.refl_failed) {
+        return g_bb.refl_init;
+    }
+    g_bb.refl_failed = true;
+    const auto device = g_bb.device;
+    const std::array bindings{
+        vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 2,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    auto [set_result, set_layout] =
+        device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+    if (set_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.refl_set_layout = set_layout;
+    const vk::PushConstantRange push{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = 128,
+    };
+    auto [layout_result, layout] = device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
+        .setLayoutCount = 1,
+        .pSetLayouts = &g_bb.refl_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    });
+    if (layout_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.refl_layout = layout;
+    const auto module = CompileSPV(BB_RTREFL_COMP, device);
+    if (!module) {
+        return false;
+    }
+    auto [pipe_result, pipeline] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage =
+                    vk::PipelineShaderStageCreateInfo{
+                        .stage = vk::ShaderStageFlagBits::eCompute,
+                        .module = module,
+                        .pName = "main",
+                    },
+                .layout = g_bb.refl_layout,
+            });
+    device.destroyShaderModule(module);
+    if (pipe_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.refl_pipeline = pipeline;
+    g_bb.refl_failed = false;
+    g_bb.refl_init = true;
+    BB::Upscale::Checkpoint("rt-reflect: pass mode 2 created (bb_rtrefl.comp: screen-space "
+                            "reflections on the scene colour before the upscaler, 48 steps, F0 0.04)");
+    return true;
+}
+
+// BB_RT_REFLECT=2: the scene colour (linear, render size) with the reflections added, in the
+// reflection pass's own image; the depth and camera are the upscaler's.
+bool RecordReflect(vk::CommandBuffer cmd, vk::ImageView color_view, vk::ImageView depth_view,
+                   vk::Extent2D render) {
+    if (!InitReflect() ||
+        !EnsureImage(g_bb.refl_out, render, vk::Format::eR16G16B16A16Sfloat,
+                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled)) {
+        return false;
+    }
+    Barrier(cmd, g_bb.refl_out, vk::ImageLayout::eGeneral,
+            vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eComputeShader,
+            vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead);
+    struct {
+        float rows[16];
+        float inv_rows[16];
+    } push{};
+    static_assert(sizeof(push) == 128);
+    const auto& plan = BB::Upscale::CurrentPlan();
+    std::copy(std::begin(plan.world_to_pix), std::end(plan.world_to_pix), push.rows);
+    std::copy(std::begin(plan.pix_to_world), std::end(plan.pix_to_world), push.inv_rows);
+    const vk::DescriptorImageInfo depth_info{g_bb.nearest, depth_view,
+                                             vk::ImageLayout::eDepthStencilReadOnlyOptimal};
+    const vk::DescriptorImageInfo color_info{g_bb.nearest, color_view,
+                                             vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo out_info{{}, g_bb.refl_out.view, vk::ImageLayout::eGeneral};
+    const std::array writes{
+        vk::WriteDescriptorSet{
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &depth_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &color_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 2,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .pImageInfo = &out_info,
+        },
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.refl_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.refl_layout, 0, writes);
+    cmd.pushConstants(g_bb.refl_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+                      &push);
+    cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
+    Barrier(cmd, g_bb.refl_out, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    if (++g_bb.refl_frames % 600 == 1) {
+        BB::Upscale::Checkpoint(fmt::format("rt-reflect: pass mode 2 ran on {} upscaled frames "
+                                            "({}x{})",
+                                            g_bb.refl_frames, render.width, render.height));
+    }
     return true;
 }
 
@@ -1369,10 +1519,34 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
     }
+
+    // BB_RT_REFLECT=2: the reflections go into the colour the upscaler reads (linear HDR only).
+    vk::Image upscale_image = color_image;
+    vk::ImageView upscale_view = color_view;
+    vk::Format upscale_format = color_format;
+    vk::ImageUsageFlags upscale_usage = color_usage;
+    if (BB::Upscale::RtReflectLevel() >= 2) {
+        const bool linear_hdr = color_format == vk::Format::eR16G16B16A16Sfloat ||
+                                color_format == vk::Format::eB10G11R11UfloatPack32;
+        if (plan.reflect_valid && linear_hdr && !g_bb.present_encoded &&
+            RecordReflect(cmd, color_view, depth_view, render)) {
+            upscale_image = g_bb.refl_out.image;
+            upscale_view = g_bb.refl_out.view;
+            upscale_format = g_bb.refl_out.format;
+            upscale_usage = g_bb.refl_out.usage;
+        } else if (!g_bb.refl_skip_logged) {
+            g_bb.refl_skip_logged = true;
+            BB::Upscale::Checkpoint(fmt::format(
+                "rt-reflect: pass mode 2 not run on this upscale: colour {}, camera {} (needs "
+                "linear RGBA16F or B10G11R11, a valid camera and the pass created)",
+                vk::to_string(color_format), plan.reflect_valid ? "valid" : "invalid"));
+        }
+    }
+
     BB::SR::Desc desc{};
     desc.cmd = cmd;
-    desc.color = {color_image, color_view, color_format, render,
-                  vk::ImageLayout::eShaderReadOnlyOptimal, color_usage};
+    desc.color = {upscale_image, upscale_view, upscale_format, render,
+                  vk::ImageLayout::eShaderReadOnlyOptimal, upscale_usage};
     desc.depth = {depth.GetImage(), depth_view, depth.info.pixel_format, render,
                   vk::ImageLayout::eDepthStencilReadOnlyOptimal, depth.usage_flags};
     desc.motion = {upscale_mv.image,
