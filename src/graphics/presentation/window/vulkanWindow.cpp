@@ -596,9 +596,13 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	out_queue_family = best_queue_family;
 	if (best_device != nullptr) {
 		out_capabilities = std::move(best_capabilities);
-		vk::PhysicalDeviceProperties properties {};
-		best_device.getProperties(&properties);
-		std::printf("Vulkan GPU in use: %s\n", properties.deviceName.data());
+		// (With the driver and its version: issue reports rarely name them, and some faults are one driver's.)
+		vk::PhysicalDeviceDriverProperties driver {};
+		vk::PhysicalDeviceProperties2      properties {};
+		properties.pNext = &driver;
+		best_device.getProperties2(&properties);
+		std::printf("Vulkan GPU in use: %s (driver: %s %s)\n", properties.properties.deviceName.data(), driver.driverName.data(),
+		            driver.driverInfo.data());
 	}
 }
 
