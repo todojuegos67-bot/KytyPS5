@@ -649,6 +649,20 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 				return true;
 			}
 		}
+		// KYTY_FILL_BUFFER_CLEARS (live fill_buffer_clears, on by default under KYTY_SPECULATE=4): the same fill over
+		// memory no tracked image holds (the system image-clear shader's ~24 a frame at 1-1, 4 KiB to 288 KiB of one
+		// value: plain buffer memory) as a transfer fill in the dispatch's place, the buffer's barriers around it
+		// (Buffer::Fill), not the shader.
+		static auto& fill_buffer = LiveSwitch::Find("fill_buffer_clears", Spec::ModeDefault());
+		if (fill_buffer.load(std::memory_order_relaxed) != 0 && Spec::Current() == nullptr && ((base | size) & 3u) == 0 &&
+		    !cache.HasTrackedDataOverlap(base, size)) {
+			const auto [buffer, offset] = m_context.GetBufferCache().ObtainBuffer(base, size, true, true);
+			if (buffer != nullptr && (offset & 3u) == 0) {
+				buffer->Fill(offset, size, packed_clear);
+				LiveCounters::Add(LiveCounters::FillBufferClears);
+				return true;
+			}
+		}
 		return false;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
