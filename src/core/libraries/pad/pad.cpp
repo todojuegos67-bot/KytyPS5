@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/bb/bb_antilag.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_metrics.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -435,6 +436,7 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     LOG_TRACE(Lib_Pad, "called");
     BB::Metrics::OnInput();
     BB::AntiLag::OnInput("scePadRead");
+    BB::FG::GameInput();
     if (pData == nullptr || num < 1 || num > ORBIS_PAD_MAX_DATA_NUM) {
         return ORBIS_PAD_ERROR_INVALID_ARG;
     }

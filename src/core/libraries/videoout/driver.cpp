@@ -325,6 +325,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     // Frame generation: the real frames held to its limit at the game's own flip (bb_fg.h).
     if (index != -1) {
         BB::FG::PaceGuestFlip();
+        BB::FG::GameFlipReserved();
     }
     // BB::AntiLag: the game's CPU frame ends at its flip.
     const u64 lat_index = BB::AntiLag::OnFlipReserved();

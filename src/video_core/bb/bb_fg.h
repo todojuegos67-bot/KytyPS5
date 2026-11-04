@@ -119,6 +119,10 @@ void AfterPresent();
 // 10-23): render submit end of the frame that ends here (its index returned, for the frame), then
 // Reflex's sleep and the next frame's simulation / render submit start.
 uint32_t GuestFlip();
+// The game's first controller read after a flip (Reflex's sleep and simulation start there) and its
+// flip submit (simulation end, render submit start), with KYTY_DLSSG_REFLEX_GAME (default on).
+void GameInput();
+void GameFlipReserved();
 // Before BeforePresent: the guest frame index of the frame presented (0: a repeat or none).
 void SetPresentIndex(uint32_t index);
 // The game's flip submit (VideoOut): holds the real frames to the frame generation limit there

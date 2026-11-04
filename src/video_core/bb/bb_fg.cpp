@@ -580,6 +580,7 @@ namespace Dlssg {
 double PaceInterval();
 bool Generating();
 void NoteSlept(double seconds);
+bool ReflexInGame();
 }
 
 // The adaptive grid (BB_FG_PACE_ADAPT=0: off). With no cap, the real flips are held on a grid at
@@ -851,7 +852,11 @@ void PaceGuestFlip() {
     // follows the game's own wandering frame time, 14-17 ms, and spaces the presents unevenly).
     (void)Cfg();
     const int cap = g_fps_cap.load();
-    if (cap > 0) {
+    const bool reflex_paced = Dlssg::ReflexInGame() && Dlssg::Generating() &&
+                              (cap == 0 || g_fps_auto.load(std::memory_order_relaxed));
+    if (reflex_paced) {
+        interval = 0.0;
+    } else if (cap > 0) {
         interval = std::max(interval, 1.0 / cap);
     } else if (generating && Adapt::Enabled()) {
         interval = std::max(interval, Adapt::Mean());
@@ -1308,8 +1313,92 @@ void ReflexSleepStats(double* avg_ms, double* max_ms) {
     g_rx_sleep_n = 0;
 }
 
+// ds-reflex-1029 (Demon's Souls, d3561c46f): KYTY_DLSSG_REFLEX_GAME (default on). Reflex's sleep
+// and SIMULATION_START on the game's thread at its first controller read after a flip, SIMULATION_END
+// and RENDERSUBMIT_START at its flip submit, RENDERSUBMIT_END in the presenter: Reflex is the only
+// DLSS-G pacer (no flip grid without an explicit cap) and nothing sleeps on the presenter's thread.
+bool ReflexInGame() {
+    static const bool on = [] {
+        const char* v = Env("KYTY_DLSSG_REFLEX_GAME");
+        return v == nullptr || *v != '0';
+    }();
+    return on && GuestMarkers();
+}
+
+std::atomic<uint32_t> g_rxg_sim{0};
+std::mutex g_rxg_mutex;
+uint32_t g_rxg_queue[8]{};
+uint32_t g_rxg_head = 0, g_rxg_count = 0;
+
+bool RxMarker(uint32_t index, sl::PCLMarker marker) {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    sl::FrameToken* token = nullptr;
+    uint32_t i = index;
+    if (index == 0 || g_api.get_new_frame_token(token, &i) != sl::Result::eOk || token == nullptr) {
+        return false;
+    }
+    g_api.pcl_set_marker(marker, *token);
+    return true;
+#else
+    (void)index;
+    (void)marker;
+    return false;
+#endif
+}
+
+void GameInput() {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    if (!g_ready || !ReflexInGame() || g_api.pcl_set_marker == nullptr) return;
+    if (g_rxg_sim.load(std::memory_order_acquire) != 0) return;
+    uint32_t index = SR::Dlss::NextFrameIndex();
+    sl::FrameToken* token = nullptr;
+    if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk || token == nullptr) return;
+    static const bool sleep = [] {
+        const char* value = Env("KYTY_DLSSG_SLEEP");
+        return value == nullptr || *value != '0';
+    }();
+    if (sleep && g_api.reflex_sleep != nullptr) {
+        const auto t0 = Clock::now();
+        g_api.reflex_sleep(*token);
+        NoteReflexSleep(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    }
+    g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, *token);
+    g_api.pcl_set_marker(sl::PCLMarker::eControllerInputSample, *token);
+    g_rxg_sim.store(index, std::memory_order_release);
+#endif
+}
+
+void GameFlipReserved() {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    if (!g_ready || !ReflexInGame() || g_api.pcl_set_marker == nullptr) return;
+    const uint32_t index = g_rxg_sim.exchange(0, std::memory_order_acq_rel);
+    if (index == 0) return;
+    RxMarker(index, sl::PCLMarker::eSimulationEnd);
+    RxMarker(index, sl::PCLMarker::eRenderSubmitStart);
+    std::lock_guard lock{g_rxg_mutex};
+    if (g_rxg_count == std::size(g_rxg_queue)) {
+        g_rxg_head = (g_rxg_head + 1) % std::size(g_rxg_queue);
+        --g_rxg_count;
+    }
+    g_rxg_queue[(g_rxg_head + g_rxg_count) % std::size(g_rxg_queue)] = index;
+    ++g_rxg_count;
+#endif
+}
+
 uint32_t GuestFlip() {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
+    if (ReflexInGame()) {
+        if (!g_ready || g_api.pcl_set_marker == nullptr) return 0;
+        uint32_t index = 0;
+        {
+            std::lock_guard lock{g_rxg_mutex};
+            if (g_rxg_count == 0) return 0;
+            index = g_rxg_queue[g_rxg_head];
+            g_rxg_head = (g_rxg_head + 1) % std::size(g_rxg_queue);
+            --g_rxg_count;
+        }
+        return RxMarker(index, sl::PCLMarker::eRenderSubmitEnd) ? index : 0;
+    }
     if (!g_ready || !GuestMarkers() || g_api.pcl_set_marker == nullptr) return 0;
     uint32_t done = 0;
     sl::FrameToken* token = nullptr;
@@ -1408,7 +1497,9 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                        "pacer %.2f ms (%s)",
                        sd * 1e3, mean * 1e3, g_pace_max * 1e3, g_pace_n,
                        PaceEffective() * 1e3,
-                       PaceMode() == 2 ? "reflex" : GuestPacing() ? "grid, guest flips" : "grid");
+                       PaceMode() == 2 || (ReflexInGame() && PaceEffective() <= 0.0)
+                           ? "reflex"
+                           : GuestPacing() ? "grid, guest flips" : "grid");
             }
             g_pace_n = g_pace_sum = g_pace_sq = g_pace_max = 0.0;
             if (g_dynamic && g_mode_set == 1) {
@@ -1807,6 +1898,14 @@ int DlssgGenerated() {
 
 uint32_t GuestFlip() {
     return Dlssg::GuestFlip();
+}
+
+void GameInput() {
+    Dlssg::GameInput();
+}
+
+void GameFlipReserved() {
+    Dlssg::GameFlipReserved();
 }
 
 void SetPresentIndex(uint32_t index) {
