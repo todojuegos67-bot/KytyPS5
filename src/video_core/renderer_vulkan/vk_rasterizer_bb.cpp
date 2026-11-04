@@ -24,6 +24,7 @@
 #include "video_core/host_shaders/bb_hudless_lut_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/host_shaders/bb_rtrefl_comp.h"
+#include "video_core/host_shaders/bb_vol_comp.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -62,6 +63,15 @@ struct BBVk {
     vk::Sampler nearest{};
     OwnImage mv;
     OwnImage mv_zero; // BB_MV_UPSCALE=zero: the upscalers' motion vectors (cleared each frame)
+    bool vol_init = false, vol_failed = false;
+    vk::DescriptorSetLayout vol_set_layout{};
+    vk::PipelineLayout vol_layout{};
+    vk::Pipeline vol_pipeline{};
+    OwnImage vol; // BB_VOL=1: the scene colour after the volumetric pass, the upscalers' input
+    std::array<vk::Buffer, 2> vol_red{}; // the sky / sun reduction, ping-pong
+    std::array<VmaAllocation, 2> vol_red_alloc{};
+    u32 vol_index = 0;
+    u64 vol_passes = 0;
     OwnImage output;
     OwnImage hudless;
     // Upscaling to the window size: the presented image (upscale + HUD) and its pass.
@@ -670,6 +680,225 @@ bool InitAlpha() {
     }
     g_bb.alpha_failed = false;
     g_bb.alpha_init = true;
+    return true;
+}
+
+constexpr float kVolHazeDensity = 1.5f;
+constexpr float kVolShaftGain = 0.5f;
+
+bool VolEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_VOL");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+bool InitVol() {
+    if (g_bb.vol_init || g_bb.vol_failed) {
+        return g_bb.vol_init;
+    }
+    g_bb.vol_failed = true;
+    const auto device = g_bb.device;
+    const std::array bindings{
+        vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 2,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 3,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 4,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    auto [set_result, set_layout] =
+        device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+    if (set_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.vol_set_layout = set_layout;
+    const vk::PushConstantRange push{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = 32,
+    };
+    auto [layout_result, layout] = device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
+        .setLayoutCount = 1,
+        .pSetLayouts = &g_bb.vol_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    });
+    if (layout_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.vol_layout = layout;
+    const auto module = CompileSPV(BB_VOL_COMP, device);
+    if (!module) {
+        return false;
+    }
+    auto [pipe_result, pipeline] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage =
+                    vk::PipelineShaderStageCreateInfo{
+                        .stage = vk::ShaderStageFlagBits::eCompute,
+                        .module = module,
+                        .pName = "main",
+                    },
+                .layout = g_bb.vol_layout,
+            });
+    device.destroyShaderModule(module);
+    if (pipe_result != vk::Result::eSuccess) {
+        return false;
+    }
+    g_bb.vol_pipeline = pipeline;
+    g_bb.vol_failed = false;
+    g_bb.vol_init = true;
+    LOG_INFO(Render_Vulkan, "BB_VOL=1: volumetric pass (god rays / fog) active");
+    return true;
+}
+
+bool EnsureVolBuffers() {
+    if (g_bb.vol_red[0]) {
+        return true;
+    }
+    for (u32 i = 0; i < g_bb.vol_red.size(); ++i) {
+        const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+            .size = 32,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                     vk::BufferUsageFlagBits::eTransferDst,
+        };
+        VmaAllocationCreateInfo alloc{};
+        alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        VkBuffer buffer{};
+        if (vmaCreateBuffer(g_bb.allocator, &ci, &alloc, &buffer, &g_bb.vol_red_alloc[i],
+                            nullptr) != VK_SUCCESS) {
+            return false;
+        }
+        g_bb.vol_red[i] = buffer;
+    }
+    return true;
+}
+
+// The volumetric pass over the render-size scene colour (bb_vol.comp), before the upscaler reads
+// it. Returns false, recording nothing, when the pass is not available this frame.
+bool RecordVol(vk::CommandBuffer cmd, vk::ImageView depth_view, vk::ImageView color_view,
+               vk::Extent2D render, const BB::Upscale::Plan& plan) {
+    if (!InitVol() ||
+        !EnsureImage(g_bb.vol, render, vk::Format::eR16G16B16A16Sfloat,
+                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled)) {
+        return false;
+    }
+    const bool fresh = !g_bb.vol_red[0];
+    if (!EnsureVolBuffers()) {
+        return false;
+    }
+    Barrier(cmd, g_bb.vol, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eComputeShader,
+            vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead);
+    const vk::Buffer cur = g_bb.vol_red[g_bb.vol_index];
+    const vk::Buffer prev = g_bb.vol_red[g_bb.vol_index ^ 1];
+    const vk::MemoryBarrier2 sync{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &sync});
+    if (fresh) {
+        cmd.fillBuffer(prev, 0, 32, 0);
+    }
+    cmd.fillBuffer(cur, 0, 32, 0);
+    const vk::MemoryBarrier2 fill{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                         vk::AccessFlagBits2::eShaderStorageWrite,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &fill});
+
+    struct {
+        u32 size[4];
+        float planes[4];
+    } push{{render.width, render.height, plan.depth_inverted ? 1u : 0u, 0u},
+           {plan.z_near, plan.z_far, kVolHazeDensity, kVolShaftGain}};
+    static_assert(sizeof(push) == 32);
+    const vk::DescriptorImageInfo depth_info{g_bb.nearest, depth_view,
+                                             vk::ImageLayout::eDepthStencilReadOnlyOptimal};
+    const vk::DescriptorImageInfo color_info{g_bb.nearest, color_view,
+                                             vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo out_info{{}, g_bb.vol.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo prev_info{prev, 0, 32};
+    const vk::DescriptorBufferInfo cur_info{cur, 0, 32};
+    const std::array writes{
+        vk::WriteDescriptorSet{
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &depth_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &color_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 2,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .pImageInfo = &out_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 3,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &prev_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 4,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &cur_info,
+        },
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.vol_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.vol_layout, 0, writes);
+    cmd.pushConstants(g_bb.vol_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
+    Barrier(cmd, g_bb.vol, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    g_bb.vol_index ^= 1;
+    if (++g_bb.vol_passes % 600 == 0) {
+        LOG_INFO(Render_Vulkan, "[BB_VOL] {} volumetric passes recorded", g_bb.vol_passes);
+    }
     return true;
 }
 
@@ -1525,11 +1754,20 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     vk::ImageView upscale_view = color_view;
     vk::Format upscale_format = color_format;
     vk::ImageUsageFlags upscale_usage = color_usage;
+    // Chain: mv_zero (above), then the volumetric pass on the scene colour, then the reflection
+    // pass on whatever the volumetric pass produced. Each writes its own image.
+    if (VolEnabled() && RecordVol(cmd, depth_view, upscale_view, render, plan)) {
+        upscale_image = g_bb.vol.image;
+        upscale_view = g_bb.vol.view;
+        upscale_format = g_bb.vol.format;
+        upscale_usage = g_bb.vol.usage;
+    }
+    // BB_RT_REFLECT=2: the reflections go into the colour the upscaler reads (linear HDR only).
     if (BB::Upscale::RtReflectLevel() >= 2) {
-        const bool linear_hdr = color_format == vk::Format::eR16G16B16A16Sfloat ||
-                                color_format == vk::Format::eB10G11R11UfloatPack32;
+        const bool linear_hdr = upscale_format == vk::Format::eR16G16B16A16Sfloat ||
+                                upscale_format == vk::Format::eB10G11R11UfloatPack32;
         if (plan.reflect_valid && linear_hdr && !g_bb.present_encoded &&
-            RecordReflect(cmd, color_view, depth_view, render)) {
+            RecordReflect(cmd, upscale_view, depth_view, render)) {
             upscale_image = g_bb.refl_out.image;
             upscale_view = g_bb.refl_out.view;
             upscale_format = g_bb.refl_out.format;
