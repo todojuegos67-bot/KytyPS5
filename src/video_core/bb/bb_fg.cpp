@@ -236,9 +236,9 @@ static void InitFpsCap(const Config& c) {
     if (fg && cap == 0) {
         const char* v2 = std::getenv("BB_FGPACE_V2");
         if (v2 == nullptr || std::strcmp(v2, "0") != 0) {
-            cap = 60;
+            cap = 90;
             g_fps_auto = true;
-            why = "0 with frame generation -> auto (bb-fgpace-054; BB_FGPACE_V2=0: no cap)";
+            why = "0 with frame generation -> auto 120..40, from 90 (bb-fgpace-055; BB_FGPACE_V2=0: no cap)";
         }
     }
     g_fps_cap = cap;
@@ -744,8 +744,8 @@ struct Stats {
     double late_sum = 0, late_max = 0, wait_sum = 0, over_max = 0;
 } g_stats;
 
-constexpr int kAutoCaps[] = {60, 50, 45, 40};
-constexpr int kAutoN = 4;
+constexpr int kAutoCaps[] = {120, 100, 90, 75, 60, 50, 45, 40};
+constexpr int kAutoN = 8;
 constexpr int kWindowS = 5; // seconds per decision / recommendation
 struct Window {
     uint32_t flips = 0;
@@ -808,17 +808,17 @@ void Pace::Second(Clock::time_point now, int cap) {
         if (g_fps_auto.load() && PaceFix()) {
             if (kAutoCaps[best] != cap) {
                 Printf("[pace] auto: cap %d -> %d (last %d s: %u flips; the game's own frame held "
-                       "60 %.1f%%, 50 %.1f%%, 45 %.1f%%, 40 %.1f%%)",
-                       cap, kAutoCaps[best], kWindowS, w.flips, pct(0), pct(1), pct(2), pct(3));
+                       "120 %.1f%%, 90 %.1f%%, 60 %.1f%%, 45 %.1f%%)",
+                       cap, kAutoCaps[best], kWindowS, w.flips, pct(0), pct(2), pct(4), pct(6));
                 g_fps_cap = kAutoCaps[best];
             }
         } else if (cur >= 0 && cur_pct < 95.0 &&
                    (w.last_tip == Clock::time_point{} || now - w.last_tip > std::chrono::seconds(30))) {
             w.last_tip = now;
             Printf("[pace] recommendation: %.1f%% of the last %d s of flips missed %.2f ms (cap %d); "
-                   "the game's own frame held 60 %.1f%%, 50 %.1f%%, 45 %.1f%%, 40 %.1f%%: "
+                   "the game's own frame held 120 %.1f%%, 90 %.1f%%, 60 %.1f%%, 45 %.1f%%: "
                    "BB_FPS_CAP=%d (or BB_FPS_CAP=auto) would keep it even",
-                   100.0 - cur_pct, kWindowS, 1000.0 / cap, cap, pct(0), pct(1), pct(2), pct(3),
+                   100.0 - cur_pct, kWindowS, 1000.0 / cap, cap, pct(0), pct(2), pct(4), pct(6),
                    kAutoCaps[best]);
         }
     }
