@@ -137,6 +137,8 @@ public:
 	void ResumeRendering(const RenderState& state) const;
 	// The render pass in progress is `state`'s, as BeginRendering compares them.
 	[[nodiscard]] bool RenderingWith(const RenderState& state) const;
+	// A render pass is in progress.
+	[[nodiscard]] bool Rendering() const noexcept { return m_rendering; }
 	// Raw internal graphics operations must invalidate the values recorded by
 	// the ordinary draw path. Compute and transfer commands do not alter them.
 	void InvalidateGraphicsState() const noexcept;
@@ -215,6 +217,7 @@ private:
 	mutable RenderState m_render_state;
 	mutable uint64_t    m_barrier_work = UINT64_MAX;
 	mutable bool        m_rendering   = false;
+	mutable uint32_t    m_handle_requests = 0; // Handle and the like since Begin (none: nothing recorded)
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

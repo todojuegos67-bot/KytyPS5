@@ -97,6 +97,7 @@ public:
 			size_t   index          = 0;     // in buffers
 			bool     ended          = false; // else the submission ends it (recorded through a recording stream)
 			uint32_t timestamp_slot = UINT32_MAX;
+			bool     empty          = false; // nothing recorded into it after its begin (KYTY_SPECULATE_KEEP_PASS)
 		};
 		vk::CommandPool                pool = nullptr;
 		std::unique_ptr<CommandBuffer> command;
@@ -109,6 +110,7 @@ public:
 		bool own_thread = false;
 		// What its translation fences (CurrentTick): PendingTick and up, one value per translation in flight.
 		uint64_t pending_tick = PendingTick;
+		uint64_t begin_work   = 0; // this thread's recorded work when the open buffer began (empty buffers)
 	};
 	[[nodiscard]] std::unique_ptr<Recorder> CreateRecorder();
 	void                                    DestroyRecorder(std::unique_ptr<Recorder> recorder);
@@ -118,7 +120,7 @@ public:
 	void BeginRecording(Recorder& recorder, HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void EndRecording(Recorder& recorder);
 	// The first `count` recorded buffers, in order, after this scheduler's open one (submitted first): the tick of
-	// the last.
+	// the last (0: none submitted, KYTY_SPECULATE_KEEP_PASS's empty ones).
 	uint64_t SubmitRecorded(Recorder& recorder, size_t count);
 	// SubmitRecorded's buffers held for one submission with what follows (KYTY_SPECULATE_BATCH_SUBMITS: a speculation's
 	// segments of one commit, ~100 submissions a frame otherwise): submitted now, or with the next Submit.
@@ -126,6 +128,8 @@ public:
 	static constexpr size_t MaxSubmitEntries = 24; // command buffers in one submission
 	// Drops what was recorded (never submitted): the buffers are free again.
 	void DiscardRecorded(Recorder& recorder);
+	// One recorded buffer dropped (DiscardRecorded's, and an empty one's: KYTY_SPECULATE_KEEP_PASS).
+	void DiscardOne(Recorder& recorder, const Recorder::Recorded& recorded);
 
 private:
 	class CommandPool {

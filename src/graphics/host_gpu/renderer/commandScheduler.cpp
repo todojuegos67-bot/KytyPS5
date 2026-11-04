@@ -917,14 +917,24 @@ void CommandScheduler::BeginRecording(Recorder& recorder, HW::Context& registers
 	recorder.open                  = index;
 	command.m_buffer               = recorder.buffers[index].first;
 	command.Begin();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	recorder.begin_work = LocalVulkanRecording::RecordedWork(); // (after its begin: what it records is counted from here)
+#endif
 }
 
 void CommandScheduler::EndRecording(Recorder& recorder) {
 	auto& command = *recorder.command;
 	if (command.IsInvalid()) return;
+	// (Empty: nothing asked for its handle, so nothing recorded into it, nor through the recording stream.)
+	const bool empty = command.m_handle_requests == 0 && !command.m_rendering && !command.m_compute_access_pending;
 	command.EndRendering();
 	(void)command.Handle(); // (a pending compute chain barrier)
 	Recorder::Recorded recorded {.index = recorder.open, .timestamp_slot = command.m_timestamp_slot};
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	recorded.empty = empty && LocalVulkanRecording::RecordedWork() == recorder.begin_work;
+#else
+	(void)empty;
+#endif
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	// Through a recording stream the commands are replayed later: the submission ends the buffer, in order.
 	const bool streamed = LocalVulkanRecording::DeferredSubmitEnabled() && !recorder.own_thread;
@@ -946,6 +956,20 @@ uint64_t CommandScheduler::SubmitRecorded(Recorder& recorder, size_t count) {
 	// what is recorded into a buffer is fenced with the tick the buffer is submitted with (CurrentTick).
 	CheckActive();
 	const bool open = !m_command.IsInvalid();
+	// KYTY_SPECULATE_KEEP_PASS (live speculate_keep_pass, on by default under KYTY_SPECULATE=4): a segment that
+	// recorded nothing (its buffers empty: two holes with only state between them) does not close the open buffer: its
+	// buffers are dropped and the open buffer, with its render pass, goes on into the next hole. Nothing is submitted:
+	// no tick (the dropped buffers read none of the translation's rings; its earlier segments' ticks cover those).
+	static auto& keep_pass = LiveSwitch::Find(
+	    "speculate_keep_pass", ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0);
+	if (keep_pass.load(std::memory_order_relaxed) != 0 && open && m_command.Rendering() && count > 0 &&
+	    std::all_of(recorder.recorded.begin(), recorder.recorded.begin() + static_cast<ptrdiff_t>(count),
+	                [](const Recorder::Recorded& recorded) { return recorded.empty; })) {
+		for (size_t i = 0; i < count; ++i) DiscardOne(recorder, recorder.recorded[i]);
+		recorder.recorded.erase(recorder.recorded.begin(), recorder.recorded.begin() + static_cast<ptrdiff_t>(count));
+		LiveCounters::Add(LiveCounters::KeptPasses);
+		return 0;
+	}
 	// (One submission for the open buffer and the recorded ones after it.)
 	std::array<SubmitEntry, MaxSubmitEntries> entries {};
 	size_t                                    n = 0;
@@ -1011,25 +1035,27 @@ void CommandScheduler::FlushRecorded() {
 	Flush(submit); // (with the open buffer: SubmitRecorded)
 }
 
+void CommandScheduler::DiscardOne(Recorder& recorder, const Recorder::Recorded& recorded) {
+	const VkCommandBuffer command = recorder.buffers[recorded.index].first;
+	if (recorder.own_thread) { // (ended: begun again, the pool resets it)
+		recorder.buffers[recorded.index].second = 0;
+		return;
+	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	const LocalVulkanRecording::Segment segments[] {{&command, sizeof(command)}};
+	if (!recorded.ended && LocalVulkanRecording::EnqueueDeferred(ReplayDiscard, segments, false)) {
+		recorder.buffers[recorded.index].second = 0; // (reset by the stream, before any later use of it there)
+		return;
+	}
+	if (!recorded.ended) LocalVulkanRecording::Drain();
+#endif
+	EXIT_NOT_IMPLEMENTED(vk::CommandBuffer {command}.reset() != vk::Result::eSuccess);
+	recorder.buffers[recorded.index].second = 0;
+}
+
 void CommandScheduler::DiscardRecorded(Recorder& recorder) {
 	EndRecording(recorder);
-	for (const auto& recorded: recorder.recorded) {
-		const VkCommandBuffer command = recorder.buffers[recorded.index].first;
-		if (recorder.own_thread) { // (ended: begun again, the pool resets it)
-			recorder.buffers[recorded.index].second = 0;
-			continue;
-		}
-#ifdef KYTY_LOCAL_VULKAN_RECORDING
-		const LocalVulkanRecording::Segment segments[] {{&command, sizeof(command)}};
-		if (!recorded.ended && LocalVulkanRecording::EnqueueDeferred(ReplayDiscard, segments, false)) {
-			recorder.buffers[recorded.index].second = 0; // (reset by the stream, before any later use of it there)
-			continue;
-		}
-		if (!recorded.ended) LocalVulkanRecording::Drain();
-#endif
-		EXIT_NOT_IMPLEMENTED(vk::CommandBuffer {command}.reset() != vk::Result::eSuccess);
-		recorder.buffers[recorded.index].second = 0;
-	}
+	for (const auto& recorded: recorder.recorded) DiscardOne(recorder, recorded);
 	recorder.recorded.clear();
 }
 
