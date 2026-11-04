@@ -228,6 +228,19 @@ static void InitFpsCap(const Config& c) {
         cap = 60;
         why = "unset, default 60 with frame generation";
     }
+    // bb-fgpace-054: frame generation with no cap (BB_FPS_CAP=0, the launcher's uncapped FPS) had
+    // no grid: the real frames followed the game's wandering frame time (Adapt::Mean) and were
+    // taken at the emulated vblank (PresentOnArrival needs a cap), so DLSS-G got unevenly spaced
+    // real frames ([pace] missed 20-35%). With frame generation on, cap 0 now means the auto cap
+    // (the highest of 60 / 50 / 45 / 40 the game holds). BB_FGPACE_V2=0: the old behaviour.
+    if (fg && cap == 0) {
+        const char* v2 = std::getenv("BB_FGPACE_V2");
+        if (v2 == nullptr || std::strcmp(v2, "0") != 0) {
+            cap = 60;
+            g_fps_auto = true;
+            why = "0 with frame generation -> auto (bb-fgpace-054; BB_FGPACE_V2=0: no cap)";
+        }
+    }
     g_fps_cap = cap;
     if (cap > 0) {
         BBLogf("real fps cap %d (BB_FPS_CAP=%s; %.3f ms grid at the guest flip, before frame generation%s)",
