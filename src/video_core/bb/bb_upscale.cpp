@@ -698,6 +698,42 @@ bool BlockCamera(FrameState& f, const float* d, size_t size) {
 
 int g_depth_detected = -1; // 1 reversed-Z, 0 forward, -1 not yet known
 
+int RtShadowLevel() {
+    static const int level = [] {
+        const char* v = std::getenv("BB_RT_SHADOW");
+        return v != nullptr && *v >= '1' && *v <= '9' ? *v - '0' : 0;
+    }();
+    return level;
+}
+
+struct RtShadowStats {
+    u64 calls = 0;
+    u64 valid = 0;
+    u64 prev = 0;
+};
+RtShadowStats g_rts;
+
+void LogRtShadowCamera(const Plan& p) {
+    if (RtShadowLevel() == 0) return;
+    ++g_rts.calls;
+    g_rts.valid += p.camera_valid;
+    g_rts.prev += p.camera_valid && g_learned.have_prev_vp;
+    if (g_rts.calls % 600 != 1) return;
+    const auto row = [](const float* m) {
+        return fmt::format("[{:+.4f} {:+.4f} {:+.4f} {:+.4f}]", m[0], m[1], m[2], m[3]);
+    };
+    const float* v = p.view_to_clip;
+    const float* c = p.clip_to_prev_clip;
+    Checkpoint(fmt::format(
+        "BB_RT_SHADOW camera: {} (valid {}/{} plans, with prev {}), view_proj {}{}{}{}, "
+        "clip_to_prev {}{}{}{}, jitter ({:+.4f},{:+.4f}), fov_y {:.3f}, near {:.3f}, far {:.1f}, "
+        "depth {}",
+        p.camera_valid ? "valid" : "invalid", g_rts.valid, g_rts.calls, g_rts.prev, row(v),
+        row(v + 4), row(v + 8), row(v + 12), row(c), row(c + 4), row(c + 8), row(c + 12),
+        p.jitter[0], p.jitter[1], p.fov_y, p.z_near, p.z_far,
+        p.depth_inverted ? "inverted" : "forward"));
+}
+
 void FillCamera(Plan& p) {
     p.camera_valid = false;
     const Candidate* cam = Cfg().mv_reconstruct ? BestCamera() : nullptr;
@@ -1807,6 +1843,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         Cfg().jitter && p.camera_valid && g_jittered_draws > g_jittered_frame_start;
     p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
     p.jitter[1] = jitter_on ? g_jitter[1] : 0.0f;
+    LogRtShadowCamera(p);
     LogPoint(fmt::format(
         "injection point: {} mode, source {:#x} {}x{} {} ({}), depth {:#x}, output {}x{}, "
         "after {} earlier sample(s) of it, motion vectors {}, depth {}",
@@ -1969,6 +2006,7 @@ void FillPresentPlan(VAddr flip, const char* where) {
         Cfg().jitter && p.camera_valid && g_jittered_draws > g_jittered_frame_start;
     p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
     p.jitter[1] = jitter_on ? g_jitter[1] : 0.0f;
+    LogRtShadowCamera(p);
     LogPoint(fmt::format(
         "injection point: window-size upscale {}, source {:#x} (presented image, LDR) {}x{}, "
         "depth {:#x}, output {}x{} (window), motion vectors {}, depth {}",
