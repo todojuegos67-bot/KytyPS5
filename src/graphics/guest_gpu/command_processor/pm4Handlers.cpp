@@ -140,7 +140,10 @@ void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
 	}
 	thread_local std::vector<uint32_t> copy;
 	copy.resize(size_t {pairs} * 2u);
-	if (Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {
+	// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page, through the backing view: the bytes the GPU thread wrote.)
+	if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u)) {
+		std::memcpy(copy.data(), backing, uint64_t {pairs} * 8u);
+	} else if (Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {
 		if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
 		return false;
 	}

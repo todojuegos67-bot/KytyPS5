@@ -11,6 +11,7 @@
 #include "draw-state-observer.h"
 #include "local-platform.h"
 #include "vulkan-recording.h"
+#include "write-guard.h"
 
 #include <algorithm>
 #include <array>
@@ -27,6 +28,8 @@ volatile std::atomic_uint32_t kyty_local_speculate_threads {2};
 }
 
 namespace Libs::Graphics {
+
+bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphicsRun.cpp: KYTY_WRITE_GUARD_SPEC)
 
 uint64_t Speculation::NowNs() noexcept {
 	return static_cast<uint64_t>(
@@ -913,13 +916,21 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 				}
 			for (size_t i = from.chain_reads; i < to.chain_reads; ++i) {
 				const auto& read = state.chain_reads[i];
-				if (*reinterpret_cast<const uint32_t*>(read.address) != read.value)
+				// (KYTY_WRITE_GUARD_SPEC: a page a pending guest write guards, through the backing view: wg2's census had this
+				// read fault ~1 a frame.)
+				const void* word = reinterpret_cast<const void*>(read.address);
+				if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
+					if (const auto* backing = WriteGuard::GuardedBacking(read.address, 4u)) word = backing;
+				if (*static_cast<const uint32_t*>(word) != read.value)
 					return ++m_stop_reasons["commit: a command buffer before wrote otherwise"], Progress::Stopped;
 			}
 			for (size_t i = from.waits; i < to.waits; ++i) {
 				const auto& wait  = state.waits[i];
 				uint64_t    value = 0;
-				std::memcpy(&value, reinterpret_cast<const void*>(wait.address), wait.bytes);
+				const void* from  = reinterpret_cast<const void*>(wait.address);
+				if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0)
+					if (const auto* backing = WriteGuard::GuardedBacking(wait.address, wait.bytes)) from = backing;
+				std::memcpy(&value, from, wait.bytes);
 				if (!TestWaitRegMemValue(value, wait.reference, wait.mask, wait.function))
 					return ++m_stop_reasons["commit: a wait not satisfied"], Progress::Stopped;
 			}
@@ -1047,16 +1058,29 @@ void Speculation::After(Result& result, size_t index) {
 	// segments' buffers held for one submission go first. (Labels written while that work was held made ~1.5 frames
 	// in 1,000 lose whole passes at the stone arch: speculate_batch_submits.) The buffer copies recorded before a label
 	// are made first, as WriteGuestMemory does: issue #196.
+	// (KYTY_WRITE_GUARD_SPEC: a label lands at once, guarded until the copies pushed before it are made, as on the normal
+	// path; a copy, or a write the guard does not take, drains first as before.)
+	const bool guard   = WriteGuard::InSpeculation();
+	bool       drained = false;
+	const auto drain   = [&] {
+		if (drained) return;
+		drained = true;
+		AsyncUpload::Drain();
+	};
 	if (from.writes != to.writes) {
 		m_renderer.GetCommandScheduler().FlushRecorded();
-		AsyncUpload::Drain();
+		if (!guard) drain();
 	}
 	for (size_t i = from.writes; i < to.writes; ++i) {
 		const auto& write = state.writes[i];
 		if (write.copy) {
+			drain();
 			buffers.CopyGuestMemory(write.address, write.value, write.size);
 		} else {
-			std::memcpy(reinterpret_cast<void*>(write.address), &write.value, write.size);
+			if (!guard || !CommitGuardedWrite(reinterpret_cast<void*>(write.address), &write.value, write.size)) {
+				drain();
+				std::memcpy(reinterpret_cast<void*>(write.address), &write.value, write.size);
+			}
 			// (A speculation translated after it that read memory there before: Spec::EffectsLog.)
 			Spec::NoteHostWrite(write.address, write.size);
 			Spec::NoteLabel(write.address);

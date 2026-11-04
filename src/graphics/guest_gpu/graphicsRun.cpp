@@ -67,8 +67,11 @@ extern "C" {
 // 1: a full barrier with no recorded work since the previous one is skipped.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe {1};
 // 1: a guest memory write of the command processor made while older upload jobs are pending lands at once and is hidden
-// from the game until they are done (local/write-guard.h); 0: it waits for them.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_guard_mode {1};
+// from the game until they are done (local/write-guard.h); 0: it waits for them. Off by default because each guarded
+// write protects pages of a mapped view and back, and per-page protection churn on the views is behind
+// MEMORY_MANAGEMENT blue screens on small-memory Windows PCs under memory pressure (#5, #50). Not set (2,
+// KYTY_WRITE_GUARD unset): on under KYTY_SPECULATE=4 only, where a commit's writes need it (WriteGuard::Enabled).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_guard_mode {2};
 }
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
@@ -467,7 +470,7 @@ bool CommandProcessor::SamePosition(const Pm4Execution& a, const Pm4Execution& b
 	// execution was suspended inside the buffer it called.)
 	if (a.m_buffer_stack.size() != b.m_buffer_stack.size()) return false;
 	for (size_t i = a.m_buffer_stack.size(); i-- > 0;)
-		if (a.m_buffer_stack[i].commands.data() != b.m_buffer_stack[i].commands.data() ||
+		if (a.m_buffer_stack[i].Position() != b.m_buffer_stack[i].Position() ||
 		    a.m_buffer_stack[i].offset_dw != b.m_buffer_stack[i].offset_dw)
 			return false;
 	return true;
@@ -726,7 +729,8 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	// (Not under a speculation's translation, whose writes are journaled, nor in mode 4, whose threads read the
 	// processor's writes: KYTY_SPECULATE=0, the default, only.)
 	if (!WriteGuard::Enabled() || size == 0 || !AsyncUpload::g_used.load(std::memory_order_relaxed) ||
-	    !GuestGpu::IsGpuThread() || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0)
+	    !GuestGpu::IsGpuThread() ||
+	    (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !WriteGuard::InSpeculation()))
 		return false;
 	auto&          worker  = AsyncUpload::Get();
 	const uint64_t address = reinterpret_cast<uint64_t>(dst);
@@ -742,33 +746,68 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	AsyncUpload::DrainRange(address, size);
 	if (worker.Pushed() <= worker.Done()) return false;
 	const uint64_t first = address & ~(WriteGuard::Page - 1), end = address + size;
-	// A page already guarded whose own protection is not writable needs today's write-fault path, which runs the
-	// trackers under their locks and may write the guest view: not under a guard (it would wait for a lift behind
-	// jobs that need those locks). The drain then, as without the guard.
-	{
-		std::shared_lock lock(WriteGuard::g_lock);
-		for (uint64_t page = first; page < end; page += WriteGuard::Page)
-			if (const auto it = WriteGuard::g_pages.find(page); it != WriteGuard::g_pages.end() &&
-			                                                    it->second.saved != Common::VirtualMemory::Mode::ReadWrite &&
-			                                                    it->second.saved != Common::VirtualMemory::Mode::ExecuteReadWrite)
-				return false;
-	}
-	// Today's write-fault path for each page not guarded (the caches' dirty marks, the GPU's bytes read back first, a
-	// fresh granule's first write), as a write through the guest mapping would take it on this thread.
-	for (uint64_t page = first; page < end; page += WriteGuard::Page) {
-		const uint64_t              at      = std::max(page, address);
-		bool                        guarded = false;
-		Common::VirtualMemory::Mode saved   = Common::VirtualMemory::Mode::NoAccess;
-		{
+	// KYTY_WRITE_GUARD_FAST (local/write-guard.h): the lookups below without g_lock when the filter says no page of the
+	// write is guarded, else under one shared take; the same answers: only this thread arms, so a page not guarded at
+	// the probe stays so until the arm below (a lift meanwhile is the race the separate takes had too). Up to 64 pages.
+	constexpr uint64_t FastPages = 64;
+	const uint64_t     pages     = (end - first + WriteGuard::Page - 1) / WriteGuard::Page;
+	const bool         fast      = pages <= FastPages && WriteGuard::Fast();
+	if (fast) {
+		uint64_t guarded = 0; // (bit i: the page first + i pages)
+		if (WriteGuard::g_count.load(std::memory_order_acquire) != 0 && WriteGuard::MayBeGuarded(address, size)) {
 			std::shared_lock lock(WriteGuard::g_lock);
-			if (const auto it = WriteGuard::g_pages.find(page); it != WriteGuard::g_pages.end()) {
-				guarded = true;
-				saved   = it->second.saved;
+			for (uint64_t i = 0; i < pages; ++i) {
+				const auto it = WriteGuard::g_pages.find(first + i * WriteGuard::Page);
+				if (it == WriteGuard::g_pages.end()) continue;
+				// (A page already guarded whose own protection is not writable: the drain, as below.)
+				if (it->second.saved != Common::VirtualMemory::Mode::ReadWrite &&
+				    it->second.saved != Common::VirtualMemory::Mode::ExecuteReadWrite)
+					return false;
+				guarded |= uint64_t {1} << i;
 			}
 		}
-		(void)saved;
-		if (!guarded) TouchForWrite(at);
+		// (Today's write-fault path for each page not guarded, as below.)
+		for (uint64_t i = 0; i < pages; ++i)
+			if (((guarded >> i) & 1u) == 0) TouchForWrite(std::max(first + i * WriteGuard::Page, address));
+	} else {
+		// A page already guarded whose own protection is not writable needs today's write-fault path, which runs the
+		// trackers under their locks and may write the guest view: not under a guard (it would wait for a lift behind
+		// jobs that need those locks). The drain then, as without the guard.
+		{
+			std::shared_lock lock(WriteGuard::g_lock);
+			for (uint64_t page = first; page < end; page += WriteGuard::Page)
+				if (const auto it = WriteGuard::g_pages.find(page); it != WriteGuard::g_pages.end() &&
+				                                                    it->second.saved != Common::VirtualMemory::Mode::ReadWrite &&
+				                                                    it->second.saved != Common::VirtualMemory::Mode::ExecuteReadWrite)
+					return false;
+		}
+		// Today's write-fault path for each page not guarded (the caches' dirty marks, the GPU's bytes read back first, a
+		// fresh granule's first write), as a write through the guest mapping would take it on this thread.
+		for (uint64_t page = first; page < end; page += WriteGuard::Page) {
+			const uint64_t              at      = std::max(page, address);
+			bool                        guarded = false;
+			Common::VirtualMemory::Mode saved   = Common::VirtualMemory::Mode::NoAccess;
+			{
+				std::shared_lock lock(WriteGuard::g_lock);
+				if (const auto it = WriteGuard::g_pages.find(page); it != WriteGuard::g_pages.end()) {
+					guarded = true;
+					saved   = it->second.saved;
+				}
+			}
+			(void)saved;
+			if (!guarded) TouchForWrite(at);
+		}
 	}
+	// (KYTY_WRITE_GUARD_FAST: each page's backing view for this thread's own table, WriteGuard::OwnBacking: its entry's
+	// while it holds, else looked up here, outside g_lock, which the address space's lock must not be taken under. No
+	// unmap runs meanwhile: its Drop runs on this thread, GpuResourceManager::UnmapMemory.)
+	std::array<const uint8_t*, FastPages> backings {};
+	if (fast)
+		for (uint64_t i = 0; i < pages; ++i) {
+			const uint64_t page = first + i * WriteGuard::Page;
+			backings[i]         = WriteGuard::OwnPage(page);
+			if (backings[i] == nullptr) backings[i] = Libs::LibKernel::Memory::TryGetBackingPointer(page, WriteGuard::Page);
+		}
 	// The guards, the lift jobs behind the pending ones (their guest range [0, 1): over no written byte, so no DrainRange
 	// waits for them), then the bytes through the backing view (the guest mapping of the pages has no access now; a
 	// fault in the write itself waits for a lift already queued).
@@ -777,8 +816,10 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	{
 		std::unique_lock lock(WriteGuard::g_lock);
 		token = WriteGuard::NextToken();
-		for (uint64_t page = first; page < end; page += WriteGuard::Page) {
-			armed = WriteGuard::Arm(page, token) && armed;
+		for (uint64_t page = first, i = 0; page < end; page += WriteGuard::Page, ++i) {
+			const bool ok = WriteGuard::Arm(page, token);
+			armed         = ok && armed;
+			if (fast && ok) WriteGuard::OwnNote(page, backings[i]);
 		}
 	}
 	for (uint64_t page = first; page < end; page += WriteGuard::Page)
@@ -789,6 +830,12 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 	if (!written) return false;
 	RebaseGuardedCommands(g_current_execution);
 	return true;
+}
+
+// KYTY_WRITE_GUARD_SPEC: a commit's guest memory write (Speculation::After) guarded as the normal path's are; false: the
+// caller drains and writes, as before.
+bool CommitGuardedWrite(void* dst, const void* src, uint32_t size) {
+	return GuardedWrite(dst, src, size);
 }
 
 // A guest memory write of the command processor: a label, or data the game or later work reads. The buffer copies
@@ -2053,6 +2100,24 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 			g_gpu_state->ProcessCommands();
 			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
 			g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
+		}
+		// (KYTY_WRITE_GUARD_SPEC: a page the GPU thread guarded since this thread's buffers were rebased: rebased again,
+		// before the next packet is read through a mapping that has no access now. KYTY_WRITE_GUARD_LOCKFREE: only when a
+		// page armed since lies in one of its buffers, or the ring of armed pages no longer holds them all.)
+		if (spec != nullptr) {
+			static thread_local uint64_t seen_arms = 0;
+			if (const auto arms = WriteGuard::g_arms.load(std::memory_order_acquire); arms != seen_arms) {
+				const uint64_t since = std::exchange(seen_arms, arms);
+				if (!WriteGuard::LockFree() || WriteGuard::ArmedSinceIn(since, arms, [&](uint64_t page) {
+					    for (const auto& buffer: execution.m_buffer_stack) {
+						    const auto at = reinterpret_cast<uint64_t>(buffer.commands.data());
+						    if (!buffer.commands.empty() && page < at + buffer.commands.size_bytes() && at < page + WriteGuard::Page)
+							    return true;
+					    }
+					    return false;
+				    }))
+					RebaseGuardedCommands(&execution);
+			}
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];

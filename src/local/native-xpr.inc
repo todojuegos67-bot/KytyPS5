@@ -2649,6 +2649,13 @@ public:
 					if (!spec->ReadJournaled(address, count, out)) return Spec::Refuse("memory the processor writes");
 					return;
 				}
+				// (KYTY_WRITE_GUARD: a page a pending guest write guards, through the backing view: the bytes written.)
+				if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0) {
+					if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) {
+						std::memcpy(out, backing, bytes);
+						return;
+					}
+				}
 				if (count <= 16) {
 					// (A run of a few words: a CRT call each, ~10-15 per evaluation, was ~2% of the render thread on a
 					// laptop's Ryzen 9 5900HX; inline, its render time 33.6 -> 33.0 ms a frame, same process.)

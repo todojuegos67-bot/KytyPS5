@@ -131,8 +131,9 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_DRAW_READ_AFTER_WRITE", &kyty_local_draw_read_after_write},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
-	    // A guest write of the command processor lands at once, hidden from the game until the older upload jobs are
-	    // done (0: it waits for them; local/write-guard.h).
+	    // 1: a guest write of the command processor lands at once, hidden from the game until the older upload jobs are
+	    // done (local/write-guard.h); 0: it waits for them (per-page protection churn on the mapped views is behind
+	    // MEMORY_MANAGEMENT blue screens on small-memory Windows PCs, #5, #50). Unset: on under KYTY_SPECULATE=4 only.
 	    Switch {"KYTY_WRITE_GUARD", &kyty_local_write_guard_mode},
 	    // Submissions the GPU has still to run for a flush nothing waits on to be deferred (0: never).
 	    Switch {"KYTY_FLUSH_DEFER", &kyty_local_flush_defer, 0, 64},

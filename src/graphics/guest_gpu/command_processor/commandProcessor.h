@@ -26,10 +26,15 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
-	// Each buffer's commands through `rebase`, which gives another view of the same bytes back (KYTY_WRITE_GUARD).
+	// Each buffer's commands through `rebase`, which gives another view of the same bytes back (KYTY_WRITE_GUARD). The
+	// guest view's address is kept: a position is the buffer's guest address and offset, whichever view reads it
+	// (SamePosition; 4 Nov wg6: compared by the view's pointer, a rebased in-order run missed its chunk's end).
 	template <typename F>
 	void RebaseCommands(F&& rebase) {
-		for (auto& cursor: m_buffer_stack) cursor.commands = rebase(cursor.commands);
+		for (auto& cursor: m_buffer_stack) {
+			if (cursor.guest == nullptr) cursor.guest = cursor.commands.data();
+			cursor.commands = rebase(cursor.commands);
+		}
 	}
 
 private:
@@ -39,6 +44,8 @@ private:
 		std::span<const uint32_t> commands;
 		uint32_t                  offset_dw           = 0;
 		uint32_t                  deferred_advance_dw = 0;
+		const uint32_t*           guest               = nullptr; // the guest view's commands once rebased, else null
+		[[nodiscard]] const uint32_t* Position() const noexcept { return guest != nullptr ? guest : commands.data(); }
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;

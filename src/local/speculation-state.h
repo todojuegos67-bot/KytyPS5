@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "live-switch.h"
+#include "write-guard.h"
 
 #include <algorithm>
 #include <array>
@@ -484,6 +485,11 @@ struct State {
 	// holding the catalog's shared lock while the GPU thread waited for it exclusively (10-31). The callers' page
 	// checks race with watchers added meanwhile.
 	[[nodiscard]] bool CopyGuest(void* out, uint64_t address, uint64_t bytes) noexcept {
+		// (KYTY_WRITE_GUARD_SPEC: a page a guest write of the GPU thread guards, through the backing view: its bytes.)
+		if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) {
+			std::memcpy(out, backing, bytes);
+			return true;
+		}
 		if (Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0) return true;
 		if (refused == nullptr) refused = "GPU-written guest memory (read fault)";
 		return false;
