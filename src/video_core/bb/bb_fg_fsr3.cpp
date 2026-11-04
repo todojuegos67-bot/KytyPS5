@@ -745,6 +745,59 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    (GuestPacing() ? PaceEffective() : CapInterval()) * 1e3,
                    GuestPacing() ? "guest flips" : "present");
         }
+        {
+            // bb-amdfg-067: the spacing of ALL presents to the driver swapchain (real and
+            // generated, timed in the patched DLL around its vkQueuePresentKHR calls). At a fixed
+            // cap of 30 with x2 the target is mean 16.67 ms, sd < 1 ms, real->gen ~= gen->real.
+            using TakeStats = int (*)(double*, int);
+            static const auto take =
+                g_dll != nullptr
+                    ? reinterpret_cast<TakeStats>(GetProcAddress(g_dll, "kytyFfxTakePresentStatsVK"))
+                    : nullptr;
+            double s[15]{};
+            if (take != nullptr && take(s, 15) == 15 && s[1] >= 4.0) {
+                Printf("[fsr3] all presents %.0f: interval mean %.2f ms, sd %.2f (min %.1f, max "
+                       "%.1f); real->gen %.2f (sd %.2f), gen->real %.2f (sd %.2f); call %.2f ms "
+                       "(max %.1f); pacing step %.2f ms (fixed %.0f of %.0f)",
+                       s[0], s[2], s[3], s[4], s[5], s[6], s[8], s[7], s[9], s[10], s[11], s[12],
+                       s[13], s[14]);
+            } else if (take == nullptr) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    Printf("[fsr3] all presents: not measured (this amd_fidelityfx_vk.dll has no "
+                           "kytyFfxTakePresentStatsVK)");
+                }
+            }
+            // A fixed cap (the guest-flip pacer holding the real frames to one interval, e.g. an
+            // FPS patch at 30): the DLL spaces the presents on that exact interval / (1 + N)
+            // instead of its moving average minus the variance. Only while the last second's
+            // real frames were steady (sd < 1 ms) on the pacer's grid; BB_FSR3_FIXED_PACING=0 off.
+            static const bool fixed_on = EnvOn("KYTY_FSR3_FIXED_PACING", true);
+            const double grid = GuestPacing() ? PaceEffective() : CapInterval();
+            bool fixed = false;
+            if (fixed_on && g_stats.pace_n >= 10.0 && grid > 0.0) {
+                const double mean = g_stats.pace_sum / g_stats.pace_n;
+                const double sd =
+                    std::sqrt(std::max(g_stats.pace_sq / g_stats.pace_n - mean * mean, 0.0));
+                fixed = sd < 0.001 && std::fabs(mean - grid) < grid * 0.03;
+            }
+            static int fixed_logged = -1;
+            if (fixed) {
+                SetEnvironmentVariableA("KYTY_FSR3_FIXED_INTERVAL_US",
+                                        std::to_string(grid * 1e6).c_str());
+            } else {
+                SetEnvironmentVariableA("KYTY_FSR3_FIXED_INTERVAL_US", nullptr);
+            }
+            if (fixed_logged != static_cast<int>(fixed)) {
+                fixed_logged = static_cast<int>(fixed);
+                Printf(fixed ? "FSR3 FG: fixed pacing on: presents spaced on the real interval "
+                               "%.3f ms / (1 + generated)"
+                             : "FSR3 FG: fixed pacing off (no steady capped interval: moving "
+                               "average pacing; %.3f ms)",
+                       grid * 1e3);
+            }
+        }
         MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
         g_stats = {};
         g_stats.start = now;
