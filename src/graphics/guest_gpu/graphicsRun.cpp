@@ -1177,7 +1177,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		}
 
 		// KYTY_SCOUT: queue 0's draws, numbered as the scout numbers them (skipped ones too).
-		if (Scout::Running() && Scout::IsDraw(opcode) && !IsAsyncComputeQueue()) Scout::NoteDraw(packet);
+		if (Scout::IsDraw(opcode) && !IsAsyncComputeQueue() && Scout::Running()) Scout::NoteDraw(packet);
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);

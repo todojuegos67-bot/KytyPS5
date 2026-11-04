@@ -1339,7 +1339,6 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	std::memset(dst, 0, size);
 	const uint32_t ready = 1;
 	std::memcpy(dst, &ready, sizeof(ready));
-	if (Scout::Running()) Scout::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size); // (KYTY_SCOUT: every emulator write)
 	for (uint32_t i = 0; i < 256; ++i) {
 		const uint64_t entry = (uint64_t(words[i * 4] & 15u) << 56u) |
 		    (uint64_t(std::min(words[i * 4 + 1], 0xffffffu)) << 32u) | words[i * 4 + 1];
@@ -1349,6 +1348,8 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 			words[i * 4 + 1] = words[i * 4 + 2] = words[i * 4 + 3] = 0;
 		}
 	}
+	// (After the 256 counters: the whole report is written.)
+	if (Scout::Running()) Scout::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size); // (KYTY_SCOUT: every emulator write)
 	if (reset) m_lod_stats_buffer.Flush(0, 256 * 16);
 }
 

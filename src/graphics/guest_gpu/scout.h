@@ -178,6 +178,7 @@ enum class Reason : uint8_t {
 	Refused,      // unmapped, or out of a bounded run's range
 	Short,        // a guarded copy stopped short
 	TooBig,       // the ticket would not fit
+	Fenced,       // a submission before it was not walked whole (State::fence)
 	Count
 };
 [[nodiscard]] Reason CurrentReason();

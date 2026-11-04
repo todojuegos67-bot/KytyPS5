@@ -99,20 +99,13 @@ std::vector<View*>                               g_retired;
 uint64_t                                         g_version = 0;
 
 std::atomic<bool>   g_running {false}, g_stop {false};
-std::thread*        g_thread = nullptr; // (never destroyed: a game-initiated exit() must not find it joinable)
+std::thread*        g_thread = nullptr; // (on the heap: a game-initiated exit() must not find a static one joinable; Stop() deletes it)
 GpuResourceManager* g_resources = nullptr;
 
 constexpr std::array<uint32_t, 8> LodStatsMask {0, 0, 0, 0, 0, (0xfffu << 8u) | (1u << 25u), 0xffu, 0};
 
 uint64_t LabelSlot(uint64_t address) {
 	return ((address >> 2u) * 0x9e3779b97f4a7c15ull) >> 50u;
-}
-
-// A word of [address, address + bytes) the command processor wrote (WriteGuestMemory -> NoteWrite): the label set.
-bool IsLabel(uint64_t address, uint32_t bytes) {
-	for (uint64_t word = address & ~3ull; word < address + bytes; word += 4)
-		if (g_labels[LabelSlot(word)].load(std::memory_order_relaxed) == word) return true;
-	return false;
 }
 
 void Note(uint64_t sequence, uint32_t ordinal, Reason reason) {
@@ -553,10 +546,6 @@ bool Walk(State& state, const FeedEntry& entry) {
 				if (!body(14)) return abandon();
 				const auto compare = (uint64_t {packet[2]} & 0xfffffff8u) | uint64_t {packet[3]} << 32u;
 				uint64_t   value   = 0;
-				// (A word the command processor writes may change later in the stream, before the render thread gets here: the
-				// draws the scout counts after it could then differ from the render thread's, and a wait matched by that count
-				// pass too early.)
-				if (IsLabel(compare, 8)) return abandon();
 				if (g_resources->HasReadWatchers(compare, 8) || !Read(&value, compare, 8)) return abandon();
 				const auto mask = packet[4] | uint64_t {packet[5]} << 32u, reference = packet[6] | uint64_t {packet[7]} << 32u;
 				const auto mode = packet[1] & 0x3u;
@@ -573,7 +562,6 @@ bool Walk(State& state, const FeedEntry& entry) {
 			if (!body(5)) return abandon();
 			const auto address = uint64_t {packet[2]} << 32u | (packet[1] & 0xfffffffcu);
 			uint32_t   value   = 0;
-			if (IsLabel(address, 4)) return abandon(); // (as the conditional indirect buffer's word above)
 			if (g_resources->HasReadWatchers(address, 4) || !Read(&value, address, 4)) return abandon();
 			if (value == 0) level.offset = std::min(level.size, level.offset + (packet[4] & 0x3fffu));
 		} else if (opcode == Pm4::IT_WAIT_REG_MEM || opcode == Pm4::IT_WAIT_REG_MEM_64) {
@@ -634,7 +622,7 @@ bool Walk(State& state, const FeedEntry& entry) {
 			// (Nor while a submission before it was not walked whole: State::fence.)
 			if (state.fence != 0 && state.fence < sequence && !((g_render.load(std::memory_order_acquire) >> 24u) > state.fence)) {
 				LiveCounters::Add(LiveCounters::ScoutFenced);
-				Note(sequence, ordinal, Reason::Constant);
+				Note(sequence, ordinal, Reason::Fenced);
 				continue;
 			}
 			// At most Lead draws ahead; none for a draw the render thread reached.

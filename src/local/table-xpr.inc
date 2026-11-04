@@ -1653,6 +1653,7 @@ static const Scout::Ticket* TableScoutTicket(const Pair& pair, std::array<std::s
 	const auto* ticket = Scout::Current();
 	if (ticket == nullptr) {
 		LiveCounters::Add(LiveCounters::ScoutLostMissing);
+		static_assert(LiveCounters::ScoutMissFenced - LiveCounters::ScoutMissUnwalked == static_cast<uint32_t>(Scout::Reason::Fenced)); // (the miss counters follow Reason)
 		LiveCounters::Add(static_cast<LiveCounters::Id>(LiveCounters::ScoutMissUnwalked + static_cast<uint32_t>(Scout::CurrentReason())));
 		return nullptr;
 	}
