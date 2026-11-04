@@ -103,8 +103,10 @@ struct Viewport {
 // Every draw, once its targets are known.
 void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_greater,
             const Viewport& viewport, u64 vs_hash = 0, u64 ps_hash = 0);
-// BB_RT_REFLECT=1: the G-buffer pass's targets and shaders logged.
+// BB_RT_REFLECT=1: the G-buffer pass's targets and shaders logged. BB_RT_REFLECT=2 also adds the
+// screen-space reflection pass (bb_rtrefl.comp) to the scene colour before the upscaler.
 bool RtReflect();
+int RtReflectLevel();
 // Every dispatch.
 void OnDispatch();
 // The current draw is a scene draw whose vertex constant buffers should be scanned for the camera.
@@ -137,6 +139,9 @@ struct Plan {
     bool camera_valid = false;
     float view_to_clip[16]{};
     float clip_to_prev_clip[16]{};
+    bool reflect_valid = false;
+    float world_to_pix[16]{}; // the view-projection with the scene viewport and depth mapping
+    float pix_to_world[16]{}; // its inverse, from (pixel x, pixel y, buffer depth, 1)
     float fov_y = 1.0f, z_near = 0.1f, z_far = 1000.0f;
     Viewport viewport;
 };

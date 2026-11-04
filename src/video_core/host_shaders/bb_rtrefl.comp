@@ -1,0 +1,149 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB_RT_REFLECT=2 (BB upscaling, vk_rasterizer_bb.cpp): a first approximation of reflections on the
+// scene colour, before the upscaler reads it. Per pixel the surface point is unprojected from the
+// scene depth and its normal comes from the depth of the neighbouring pixels (the nearer side of each
+// axis). The view ray is mirrored about the normal and marched in screen space against the depth
+// buffer: the homogeneous projection of the ray is linear in the march parameter, so the samples are
+// taken on the 3D ray itself. The first surface just behind the ray gives the colour, mixed in by
+// Schlick's Fresnel term (F0 0.04). No roughness and no material: every surface gets the same
+// reflection, and rays that leave the screen or meet no surface add nothing.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1) uniform sampler2D color_tex;
+layout(binding = 2, rgba16f) uniform writeonly image2D out_img;
+layout(push_constant) uniform Push {
+    vec4 world_to_pix[4]; // rows of the view-projection with the scene viewport and depth mapping
+    vec4 pix_to_world[4]; // rows of its inverse, from (pixel x, pixel y, buffer depth, 1)
+} p;
+
+const float kF0 = 0.04;
+const int kSteps = 48;
+const float kRayLength = 0.5;   // of the distance from the camera to the surface
+const float kThickness = 0.05;  // the surface may be this far (relative view depth) behind the ray
+const int kRefine = 4;
+
+ivec2 gSize;
+
+vec4 ToPix(vec3 x) {
+    vec4 h = vec4(x, 1.0);
+    return vec4(dot(p.world_to_pix[0], h), dot(p.world_to_pix[1], h), dot(p.world_to_pix[2], h),
+                dot(p.world_to_pix[3], h));
+}
+
+vec3 ToWorld(vec2 px, float d) {
+    vec4 h = vec4(px, d, 1.0);
+    vec4 w = vec4(dot(p.pix_to_world[0], h), dot(p.pix_to_world[1], h), dot(p.pix_to_world[2], h),
+                  dot(p.pix_to_world[3], h));
+    return w.xyz / w.w;
+}
+
+float Depth(ivec2 s) {
+    return texelFetch(depth_tex, clamp(s, ivec2(0), gSize - 1), 0).r;
+}
+
+bool HasSurface(float d) {
+    return d > 0.0 && d < 1.0;
+}
+
+// The surface point of pixel c (clamped to the image).
+vec3 Surface(ivec2 c) {
+    c = clamp(c, ivec2(0), gSize - 1);
+    return ToWorld(vec2(c) + 0.5, Depth(c));
+}
+
+// The view depth of the surface at pixel s; 0 where there is none (sky, background).
+float SurfaceViewDepth(ivec2 s) {
+    float d = Depth(s);
+    return HasSurface(d) ? ToPix(ToWorld(vec2(s) + 0.5, d)).w : 0.0;
+}
+
+// The surface point of the neighbour at offset o, or x itself where that pixel has no surface.
+vec3 Neighbour(ivec2 c, ivec2 o, vec3 x) {
+    float d = Depth(clamp(c + o, ivec2(0), gSize - 1));
+    return HasSurface(d) ? Surface(c + o) : x;
+}
+
+vec3 Normal(ivec2 c, vec3 x, vec3 cam) {
+    vec3 right = Neighbour(c, ivec2(1, 0), x) - x;
+    vec3 left = x - Neighbour(c, ivec2(-1, 0), x);
+    vec3 up = Neighbour(c, ivec2(0, -1), x) - x;
+    vec3 down = x - Neighbour(c, ivec2(0, 1), x);
+    vec3 dx = length(right) < length(left) ? right : -left;
+    vec3 dy = length(up) < length(down) ? up : -down;
+    vec3 n = cross(dx, dy);
+    if (dot(n, n) < 1e-20) {
+        return vec3(0.0);
+    }
+    n = normalize(n);
+    return dot(n, cam - x) < 0.0 ? -n : n;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    gSize = textureSize(depth_tex, 0);
+    if (any(greaterThanEqual(c, gSize))) {
+        return;
+    }
+    vec4 base = texelFetch(color_tex, c, 0);
+    vec3 result = base.rgb;
+
+    vec4 cam_h = vec4(p.pix_to_world[0].z, p.pix_to_world[1].z, p.pix_to_world[2].z, p.pix_to_world[3].z);
+    vec3 cam = cam_h.xyz / cam_h.w;
+
+    float d = Depth(c);
+    if (HasSurface(d)) {
+        vec3 x = ToWorld(vec2(c) + 0.5, d);
+        vec3 n = Normal(c, x, cam);
+        vec3 v = normalize(x - cam);
+        if (dot(n, n) > 0.0 && dot(v, n) < 0.0) {
+            float cos_t = -dot(v, n);
+            float fresnel = kF0 + (1.0 - kF0) * pow(1.0 - cos_t, 5.0);
+            vec3 r = reflect(v, n);
+            vec4 h0 = ToPix(x);
+            vec4 h1 = ToPix(x + r * (kRayLength * length(x - cam)));
+            float ta = 0.0;
+            bool found = false;
+            ivec2 hit = ivec2(0);
+            for (int i = 1; i <= kSteps && h0.w > 0.0; ++i) {
+                float tb = float(i) / float(kSteps);
+                vec4 hb = mix(h0, h1, tb);
+                if (hb.w <= 1e-4) {
+                    break;
+                }
+                ivec2 s = ivec2(floor(hb.xy / hb.w));
+                if (any(lessThan(s, ivec2(0))) || any(greaterThanEqual(s, gSize))) {
+                    break;
+                }
+                float ws = SurfaceViewDepth(s);
+                if (ws > 0.0 && hb.w > ws && hb.w < ws * (1.0 + kThickness)) {
+                    float lo = ta, hi = tb;
+                    for (int k = 0; k < kRefine; ++k) {
+                        float m = 0.5 * (lo + hi);
+                        vec4 hm = mix(h0, h1, m);
+                        ivec2 sm = ivec2(floor(hm.xy / hm.w));
+                        float wm = SurfaceViewDepth(sm);
+                        if (wm > 0.0 && hm.w > wm) {
+                            hi = m;
+                        } else {
+                            lo = m;
+                        }
+                    }
+                    vec4 hf = mix(h0, h1, hi);
+                    hit = clamp(ivec2(floor(hf.xy / hf.w)), ivec2(0), gSize - 1);
+                    found = true;
+                    break;
+                }
+                ta = tb;
+            }
+            if (found) {
+                vec3 reflected = texelFetch(color_tex, hit, 0).rgb;
+                if (!any(isnan(reflected)) && !any(isinf(reflected))) {
+                    result = mix(base.rgb, reflected, fresnel);
+                }
+            }
+        }
+    }
+    imageStore(out_img, c, vec4(result, base.a));
+}

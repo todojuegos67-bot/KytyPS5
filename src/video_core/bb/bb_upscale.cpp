@@ -739,6 +739,31 @@ void LogRtShadowCamera(const Plan& p) {
         p.depth_inverted ? "inverted" : "forward"));
 }
 
+// The view-projection with the scene viewport (pixels) and depth buffer mapping, and its inverse,
+// for the reflection pass (bb_rtrefl.comp): the same mapping bb_mv.comp unprojects with.
+void FillPixelMatrices(const Mat& vp, Plan& p) {
+    p.reflect_valid = false;
+    const Viewport& v = p.viewport;
+    Mat viewport{};
+    viewport.m[0] = v.xscale;
+    viewport.m[3] = v.xoffset;
+    viewport.m[5] = v.yscale;
+    viewport.m[7] = v.yoffset;
+    viewport.m[10] = v.zscale != 0.0f ? v.zscale : 1.0f;
+    viewport.m[11] = v.zoffset;
+    viewport.m[15] = 1.0;
+    const Mat to_pix = Multiply(viewport, vp);
+    Mat inv{};
+    if (!Invert(to_pix, inv) || std::fabs(inv.m[14]) < 1e-12) {
+        return;
+    }
+    for (int i = 0; i < 16; ++i) {
+        p.world_to_pix[i] = static_cast<float>(to_pix.m[i]);
+        p.pix_to_world[i] = static_cast<float>(inv.m[i]);
+    }
+    p.reflect_valid = true;
+}
+
 void FillCamera(Plan& p) {
     p.camera_valid = false;
     const Candidate* cam = Cfg().mv_reconstruct ? BestCamera() : nullptr;
@@ -793,6 +818,7 @@ void FillCamera(Plan& p) {
     }
     p.depth_inverted = g_depth_detected >= 0 ? g_depth_detected == 1 : g_frame.depth_greater;
     p.camera_valid = true;
+    FillPixelMatrices(vp, p);
 }
 
 void LogPoint(const std::string& text) {
@@ -1500,12 +1526,16 @@ bool BackendReady() {
     }
 }
 
-bool RtReflect() {
-    static const bool on = [] {
+int RtReflectLevel() {
+    static const int level = [] {
         const char* s = Env("BB_RT_REFLECT");
-        return s != nullptr && std::atoi(s) >= 1;
+        return s != nullptr ? std::atoi(s) : 0;
     }();
-    return on;
+    return level;
+}
+
+bool RtReflect() {
+    return RtReflectLevel() >= 1;
 }
 
 void LogGbuffer(const FrameState& f) {
