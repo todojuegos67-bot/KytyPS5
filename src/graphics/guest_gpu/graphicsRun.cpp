@@ -835,7 +835,9 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 // KYTY_WRITE_GUARD_SPEC: a commit's guest memory write (Speculation::After) guarded as the normal path's are; false: the
 // caller drains and writes, as before.
 bool CommitGuardedWrite(void* dst, const void* src, uint32_t size) {
-	return GuardedWrite(dst, src, size);
+	if (!GuardedWrite(dst, src, size)) return false;
+	if (Scout::Running()) Scout::NoteWrite(dst, size, src); // (the scout sees a guarded write as an unguarded one)
+	return true;
 }
 
 // A guest memory write of the command processor: a label, or data the game or later work reads. The buffer copies
@@ -861,6 +863,8 @@ static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
 			Spec::HostWriteParts parts;
 			parts.address = reinterpret_cast<uint64_t>(dst), parts.size = size;
 			parts.Note();
+			// (The scout sees a guarded write as an unguarded one: its bytes from `src`, guest memory may not show them yet.)
+			if (Scout::Running()) Scout::NoteWrite(dst, size, src);
 		} else {
 			AsyncUpload::Drain(/*serve=*/true);
 			// (Only what changes, Spec::HostWriteParts: compared where reading it faults nothing back from the GPU.)
