@@ -60,6 +60,7 @@ struct BBVk {
     u32 lum_index = 0;
     vk::Sampler nearest{};
     OwnImage mv;
+    OwnImage mv_zero; // BB_MV_UPSCALE=zero: the upscalers' motion vectors (cleared each frame)
     OwnImage output;
     OwnImage hudless;
     // Upscaling to the window size: the presented image (upscale + HUD) and its pass.
@@ -1212,7 +1213,10 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     const vk::Extent2D render{plan.render_w, plan.render_h};
     const vk::Extent2D output{plan.output_w, plan.output_h};
     const auto storage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+    const bool mv_zero = BB::Upscale::Cfg().mv_upscale_zero;
     if (!EnsureImage(g_bb.mv, render, vk::Format::eR16G16Sfloat, storage) ||
+        (mv_zero && !EnsureImage(g_bb.mv_zero, render, vk::Format::eR16G16Sfloat,
+                                 storage | vk::ImageUsageFlagBits::eTransferDst)) ||
         !EnsureImage(g_bb.reactive, render, vk::Format::eR8Unorm, storage) ||
         !EnsureImage(g_bb.lum[0], render, vk::Format::eR16Sfloat, storage) ||
         !EnsureImage(g_bb.lum[1], render, vk::Format::eR16Sfloat, storage) ||
@@ -1352,14 +1356,31 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
             vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader,
             vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead);
 
+    OwnImage& upscale_mv = mv_zero ? g_bb.mv_zero : g_bb.mv;
+    if (mv_zero) {
+        Barrier(cmd, g_bb.mv_zero, vk::ImageLayout::eTransferDstOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+        cmd.clearColorImage(g_bb.mv_zero.image, vk::ImageLayout::eTransferDstOptimal,
+                            vk::ClearColorValue{std::array<float, 4>{}},
+                            vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+        Barrier(cmd, g_bb.mv_zero, vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    }
     BB::SR::Desc desc{};
     desc.cmd = cmd;
     desc.color = {color_image, color_view, color_format, render,
                   vk::ImageLayout::eShaderReadOnlyOptimal, color_usage};
     desc.depth = {depth.GetImage(), depth_view, depth.info.pixel_format, render,
                   vk::ImageLayout::eDepthStencilReadOnlyOptimal, depth.usage_flags};
-    desc.motion = {g_bb.mv.image, g_bb.mv.view, g_bb.mv.format, render,
-                   vk::ImageLayout::eShaderReadOnlyOptimal, g_bb.mv.usage};
+    desc.motion = {upscale_mv.image,
+                   upscale_mv.view,
+                   upscale_mv.format,
+                   render,
+                   vk::ImageLayout::eShaderReadOnlyOptimal,
+                   upscale_mv.usage};
     desc.reactive = {g_bb.reactive.image, g_bb.reactive.view, g_bb.reactive.format, render,
                      vk::ImageLayout::eShaderReadOnlyOptimal, g_bb.reactive.usage};
     {

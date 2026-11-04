@@ -221,6 +221,7 @@ Config ParseConfig() {
         c.jitter = s[0] != '0';
     }
     c.mv_reconstruct = Lower(Env("BB_MV")) != "zero";
+    c.mv_upscale_zero = Lower(Env("BB_MV_UPSCALE")) == "zero";
     if (const char* s = Env("BB_HUDLESS_COPY")) {
         c.hudless_copy = s[0] != '0';
     }
@@ -1013,6 +1014,11 @@ void PreInstance() {
              c.mv_reconstruct ? "reconstructed from depth + camera" : "zero",
              c.force_mode == 1 ? "scene" : c.force_mode == 2 ? "composite" : "auto",
              c.hudless_copy ? "on" : "off");
+    if (c.mv_upscale_zero) {
+        LOG_INFO(Render_Vulkan,
+                 "BB_MV_UPSCALE=zero: upscaler motion vectors zeroed, frame generation keeps the "
+                 "camera vectors");
+    }
     if (FgNative()) {
         Checkpoint(fmt::format(
             "frame generation runs WITHOUT an upscaler (BB_FG={}, BB_UPSCALER={}, BB_FG_NATIVE "
@@ -2604,6 +2610,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                  g_learned.render_w, g_learned.render_h, out_w, out_h, rec_w, rec_h,
                  LearnedSource(), g_learned.gb_depth,
                  !c.mv_reconstruct ? "zero (BB_MV=zero)"
+                 : c.mv_upscale_zero      ? "zero for the upscalers (BB_MV_UPSCALE=zero)"
                  : g_learned.have_prev_vp ? "reconstructed (depth + camera)"
                                           : "zero (camera not found)",
                  Cfg().jitter && g_learned.have_prev_vp ? "on" : "off", g_jitter[0], g_jitter[1],

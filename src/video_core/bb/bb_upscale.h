@@ -18,7 +18,8 @@
 //    through the upscaler.
 //  - motion vectors: Bloodborne has no TAA and no motion vectors; camera motion vectors are made
 //    from the scene depth and the view-projection found in the G-buffer draws' vertex constant
-//    buffers (this frame's and the previous one's), BB_MV=zero turns them off.
+//    buffers (this frame's and the previous one's), BB_MV=zero turns them off, BB_MV_UPSCALE=zero
+//    zeroes them for the upscalers only (frame generation keeps them).
 //  - jitter: the scene passes' viewport is offset by a Halton(2,3) sub-pixel sequence while an
 //    upscaler runs with reconstructed vectors (BB_UPSCALE_JITTER=0 turns it off).
 #pragma once
@@ -40,6 +41,7 @@ struct Config {
     float sharpness = 0.3f;
     bool jitter = true;
     bool mv_reconstruct = true;
+    bool mv_upscale_zero = false; // BB_MV_UPSCALE=zero: the upscalers' vectors are zero
     bool hudless_copy = false;
     int force_mode = 0; // 0 auto, 1 scene, 2 composite
     bool to_window = true; // BB_UPSCALE_TO_WINDOW=0: never upscale past the game's own output size
