@@ -656,8 +656,9 @@ bool PresentOnArrival() {
         const char* v = std::getenv("BB_PACE_ARRIVAL"); // 0: flips taken at the vblank as before
         return v == nullptr || std::strcmp(v, "0") != 0;
     }();
-    (void)Cfg();
-    return on && PaceFix() && GuestPacing() && g_fps_cap.load(std::memory_order_relaxed) > 0;
+    const bool uncapped_dlssg = Cfg().kind == Kind::Dlss;
+    return on && PaceFix() && GuestPacing() &&
+           (g_fps_cap.load(std::memory_order_relaxed) > 0 || uncapped_dlssg);
 }
 
 namespace Pace {
