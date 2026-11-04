@@ -146,7 +146,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_NATIVE_XPR_INSTANCES", &kyty_local_native_xpr_instance_mode},
 	    // Table draws (src/local/table-xpr.inc), with native XPR draws; 2 also continues clean runs.
 	    Switch {"KYTY_TABLE_XPR", &kyty_local_table_xpr_mode, 0, 2},
-	    // The scout thread (graphics/guest_gpu/scout.h; default 1): 0 off, 1 tickets used, 2
+	    // The scout thread (graphics/guest_gpu/scout.h; default 1, Steam Deck builds 0): 0 off, 1 tickets used, 2
 	    // verifier (tickets compared). It stands down while the spin gate is shut (KYTY_SPIN_GATE).
 	    Switch {"KYTY_SCOUT", &kyty_local_scout_mode, 0, 2},
 	    // Table dispatches (src/local/table-xpr.inc).

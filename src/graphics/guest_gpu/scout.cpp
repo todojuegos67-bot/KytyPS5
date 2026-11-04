@@ -26,8 +26,13 @@
 #include <xxhash.h>
 
 extern "C" {
-// 1 (on). A machine without spare CPUs gets the scout only while the spin gate is open (spin-gate.h).
+// 1 (on). A machine without spare CPUs gets the scout only while the spin gate is open (spin-gate.h). Steam Deck builds:
+// 0 until it has been measured on the Deck's four cores (KYTY_SCOUT=1 turns it on).
+#if defined(KYTY_STEAM_DECK)
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_scout_mode {0};
+#else
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_scout_mode {1};
+#endif
 }
 
 namespace Libs::Graphics::Scout {

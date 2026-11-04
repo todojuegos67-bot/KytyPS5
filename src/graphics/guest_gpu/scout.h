@@ -9,7 +9,7 @@
 // checked against its own registers, the pair, the mapping epoch and the tables' pages (no read watchers), instead of
 // evaluating. Not checked at use: the game's tables themselves, read by the scout before the render thread reaches the
 // draw (a CPU write the GPU reads sits behind a wait the scout stops at; the verifier, 2, counts any difference).
-// 0: off (no thread, nothing fed). 1 (the default): tickets used. 2: verifier: the
+// 0: off (no thread, nothing fed; the Steam Deck builds' default). 1 (the default): tickets used. 2: verifier: the
 // render thread evaluates as without the scout and compares every ticket with its own result.
 // The scout spins while it waits for the render thread only while the spin gate is open (spin-gate.h,
 // KYTY_SPIN_GATE): while it is shut the scout stands down, leaving its submissions unwalked, and sleeps between feeds.
