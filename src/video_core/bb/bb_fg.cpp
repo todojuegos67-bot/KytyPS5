@@ -581,6 +581,7 @@ double PaceInterval();
 bool Generating();
 void NoteSlept(double seconds);
 bool ReflexInGame();
+bool CapByReflex(int cap, bool automatic);
 // The Reflex frame limit now in force (us; 0: none). Written where slReflexSetOptions is called.
 inline std::atomic<uint32_t> g_reflex_limit_us{0};
 }
@@ -857,9 +858,16 @@ void PaceGuestFlip() {
     // Reflex in the game only paces the presents when it has a frame limit. With no cap and no
     // Reflex limit (BB_FPS_CAP=0, default KYTY_DLSSG_PACE) nobody spaced them (sd 2.3 ms, peaks
     // 63 ms): keep the grid pacer on then.
-    const bool reflex_paced = Dlssg::ReflexInGame() && Dlssg::Generating() &&
-                              Dlssg::g_reflex_limit_us.load(std::memory_order_relaxed) != 0 &&
-                              (cap == 0 || g_fps_auto.load(std::memory_order_relaxed));
+    // bb-dlssg-066: a fixed cap with DLSS-G generating is Reflex's frame limit (1/cap), not our
+    // grid sleep: DLSS-G spaces the generated frame from Reflex's frame times, and with our sleep
+    // before the flip (Reflex sleep 0.02 ms, present call 0.05 ms) it had none and queued the
+    // generated and the real frame back to back (30x2 shown as 30).
+    const bool cap_by_reflex =
+        Dlssg::CapByReflex(cap, g_fps_auto.load(std::memory_order_relaxed));
+    const bool reflex_paced = cap_by_reflex ||
+                              (Dlssg::ReflexInGame() && Dlssg::Generating() &&
+                               Dlssg::g_reflex_limit_us.load(std::memory_order_relaxed) != 0 &&
+                               (cap == 0 || g_fps_auto.load(std::memory_order_relaxed)));
     if (reflex_paced) {
         interval = 0.0;
     } else if (cap > 0) {
@@ -1298,6 +1306,48 @@ bool Generating() {
     return g_ready && g_mode_set == 1;
 }
 
+// bb-dlssg-066 (BB_DLSSG_CAP_REFLEX=0: off). Called at every guest flip: while DLSS-G generates
+// under a fixed BB_FPS_CAP, Reflex's frameLimitUs = 1e6 / cap (the sleep in GameInput /
+// GuestFlip then holds the real frames and DLSS-G knows the frame time to space the generated
+// ones); otherwise the limit set at init. Returns whether Reflex now holds the cap (the grid off).
+bool CapByReflex(int cap, bool automatic) {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    static bool on = [] {
+        const char* v = Env("BB_DLSSG_CAP_REFLEX");
+        return v == nullptr || *v != '0';
+    }();
+    static uint32_t base = 0;
+    static bool have_base = false;
+    if (!on || !g_ready || g_api.reflex_set_options == nullptr || !ReflexInGame() || g_dynamic ||
+        g_fixed_cap) {
+        return false;
+    }
+    if (!have_base) {
+        base = g_reflex_opts.frameLimitUs;
+        have_base = true;
+    }
+    const bool use = Generating() && cap > 0 && !automatic;
+    const uint32_t want = use ? static_cast<uint32_t>(1000000.0 / cap) : base;
+    if (g_reflex_opts.frameLimitUs != want) {
+        g_reflex_opts.frameLimitUs = want;
+        g_reflex_limit_us = want;
+        const auto result = g_api.reflex_set_options(g_reflex_opts);
+        Printf("[dlssg] cap %d: Reflex frame limit %u us (%s)%s", cap, want,
+               use ? "Reflex holds the cap, grid off" : "grid holds the cap",
+               result == sl::Result::eOk ? "" : " - slReflexSetOptions failed");
+        if (result != sl::Result::eOk) {
+            on = false; // the grid from now on
+            return false;
+        }
+    }
+    return use;
+#else
+    (void)cap;
+    (void)automatic;
+    return false;
+#endif
+}
+
 void NoteSlept(double seconds) {
     g_slept += seconds;
 }
@@ -1503,13 +1553,16 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             if (g_pace_n >= 10.0) {
                 const double mean = g_pace_sum / g_pace_n;
                 const double sd = std::sqrt(std::max(g_pace_sq / g_pace_n - mean * mean, 0.0));
-                Printf("[dlssg] present interval sd %.2f ms (mean %.2f, max %.1f, %.0f frames); "
-                       "pacer %.2f ms (%s)",
+                // The interval between our calls into Streamline's present (the REAL frames
+                // only; the generated ones are presented inside Streamline and not seen here).
+                Printf("[dlssg] real present interval sd %.2f ms (mean %.2f, max %.1f, %.0f frames); "
+                       "pacer %.2f ms (%s), Reflex limit %u us",
                        sd * 1e3, mean * 1e3, g_pace_max * 1e3, g_pace_n,
                        PaceEffective() * 1e3,
                        PaceMode() == 2 || (ReflexInGame() && PaceEffective() <= 0.0)
                            ? "reflex"
-                           : GuestPacing() ? "grid, guest flips" : "grid");
+                           : GuestPacing() ? "grid, guest flips" : "grid",
+                       g_reflex_limit_us.load(std::memory_order_relaxed));
             }
             g_pace_n = g_pace_sum = g_pace_sq = g_pace_max = 0.0;
             if (g_dynamic && g_mode_set == 1) {
