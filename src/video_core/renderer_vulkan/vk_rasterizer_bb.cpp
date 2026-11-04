@@ -18,6 +18,7 @@
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_dlss5.h"
 #include "video_core/host_shaders/bb_alpha_comp.h"
 #include "video_core/host_shaders/bb_hud_comp.h"
 #include "video_core/host_shaders/bb_hudless_lut_comp.h"
@@ -1398,6 +1399,11 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     }
 #endif
     const bool ok = BB::Upscale::RunBackend(desc);
+    if (ok && BB::Dlss5::Wanted()) {
+        // 0.42 DLSS 5 (bb_dlss5.h): NVIDIA's Neural Rendering on the upscaled output, in place,
+        // before frame generation / the HUD read it. BB_DLSS5=0 (default): not called.
+        (void)BB::Dlss5::Apply(desc);
+    }
     const bool present_path = color_image == g_bb.present_in.image;
     if (present_path) {
         Stamp(cmd, 2);
