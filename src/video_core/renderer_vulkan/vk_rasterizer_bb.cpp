@@ -779,7 +779,8 @@ bool EnsureVolBuffers() {
     for (u32 i = 0; i < g_bb.vol_red.size(); ++i) {
         const VkBufferCreateInfo ci = vk::BufferCreateInfo{
             .size = 32,
-            .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                     vk::BufferUsageFlagBits::eTransferDst,
         };
         VmaAllocationCreateInfo alloc{};
         alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -1279,8 +1280,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     if (!g_bb.lum_buffer) {
         const VkBufferCreateInfo ci = vk::BufferCreateInfo{
             .size = 48,
-            .usage = vk::BufferUsageFlagBits::eStorageBuffer |
-                     vk::BufferUsageFlagBits::eTransferDst,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
         };
         VmaAllocationCreateInfo alloc{};
         alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
