@@ -621,7 +621,11 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 // the buffers those copies read at once, and a copy made after that took the new bytes for the earlier draws (issue
 // #196: lit ground and water flickered white; the frame boundary's wait, 5c6f80fa, came after the labels).
 static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
-	if (GuardedWrite(dst, src, size)) return;
+	if (GuardedWrite(dst, src, size)) {
+		// (The scout sees a guarded write as an unguarded one: its bytes from `src`, guest memory may not show them yet.)
+		if (Scout::Running()) Scout::NoteWrite(dst, size, src);
+		return;
+	}
 	AsyncUpload::Drain(/*serve=*/true);
 	std::memcpy(dst, src, size);
 	if (Scout::Running()) Scout::NoteWrite(dst, size);

@@ -66,7 +66,9 @@ void BeginSubmission(uint64_t sequence);
 void NoteDraw(const uint32_t* packet);
 void SkipDraws(uint32_t count);
 // A command processor write to guest memory (WriteGuestMemory): a wait on one of these words is the stream's own.
-void NoteWrite(const void* address, uint32_t size);
+// `values`: the written bytes, when guest memory does not show them yet (a guarded write: KYTY_WRITE_GUARD); null: read
+// at `address`.
+void NoteWrite(const void* address, uint32_t size, const void* values = nullptr);
 // KYTY_SCOUT=2, the verifier: a met WAIT_REG_MEM of queue 0 on `size` bytes at `address`. When the
 // scout's rule passes it (every word noted by NoteWrite), any word that holds another value than the command
 // processor's last is counted and reported: another writer (the game's CPU) changed a word the scout doesn't wait on.
