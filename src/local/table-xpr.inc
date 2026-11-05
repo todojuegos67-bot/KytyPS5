@@ -374,6 +374,8 @@ void RenderExecutor::TableSweepPairs() {
 			auto& pair = item.second;
 			// (A translation or compile it waits for keeps it.)
 			if (pair.used_frame + TableXpr::PairKeepFrames >= frame || pair.waiting) return false;
+			// (KYTY_SCOUT: its view retired too, as TableReset does: else it stays in the directory, its slot lost to others.)
+			if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
 			for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
 			return true;
 		});
@@ -1651,6 +1653,7 @@ static const Scout::Ticket* TableScoutTicket(const Pair& pair, std::array<std::s
 	const auto* ticket = Scout::Current();
 	if (ticket == nullptr) {
 		LiveCounters::Add(LiveCounters::ScoutLostMissing);
+		static_assert(LiveCounters::ScoutMissFenced - LiveCounters::ScoutMissUnwalked == static_cast<uint32_t>(Scout::Reason::Fenced)); // (the miss counters follow Reason)
 		LiveCounters::Add(static_cast<LiveCounters::Id>(LiveCounters::ScoutMissUnwalked + static_cast<uint32_t>(Scout::CurrentReason())));
 		return nullptr;
 	}

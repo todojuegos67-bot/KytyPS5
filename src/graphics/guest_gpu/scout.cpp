@@ -99,7 +99,7 @@ std::vector<View*>                               g_retired;
 uint64_t                                         g_version = 0;
 
 std::atomic<bool>   g_running {false}, g_stop {false};
-std::thread         g_thread;
+std::thread*        g_thread = nullptr; // (on the heap: a game-initiated exit() must not find a static one joinable; Stop() deletes it)
 GpuResourceManager* g_resources = nullptr;
 
 constexpr std::array<uint32_t, 8> LodStatsMask {0, 0, 0, 0, 0, (0xfffu << 8u) | (1u << 25u), 0xffu, 0};
@@ -199,6 +199,10 @@ struct State {
 	std::array<uint64_t, 256> mapped {};
 	uint64_t                  mapping_epoch = UINT64_MAX;
 	uint64_t                  constant      = 0; // the last submission with constant engine commands
+	// The last submission the scout did not walk whole while the render thread was not past it (left at a wait, abandoned,
+	// skipped while standing down, or never fed): a wait in its unwalked part, on a word the game's CPU writes, was never
+	// seen, so no ticket is made for a later draw until the render thread is past it (re-notes review of the PR #280 port).
+	uint64_t                  fence         = 0;
 	std::array<std::pair<uint64_t, uint32_t>, 256> draws {};     // (sequence, draw packets) of the ones walked whole
 	std::array<std::vector<uint32_t>, 2>           blocks;
 	std::vector<uint32_t>                          words, lod_stats;
@@ -454,6 +458,12 @@ bool Walk(State& state, const FeedEntry& entry) {
 	uint64_t                run_next = 0;
 	const auto abandon = [&] {
 		LiveCounters::Add(LiveCounters::ScoutAbandoned);
+		state.fence = std::max(state.fence, sequence);
+		return true;
+	};
+	// (The render thread past the submission: nothing of it is left to see.)
+	const auto render_past = [&] {
+		LiveCounters::Add(LiveCounters::ScoutAbandoned);
 		return true;
 	};
 	// A wait it didn't finish: stopped (false), or the spin gate shut (the submission left, its later draws without
@@ -461,6 +471,7 @@ bool Walk(State& state, const FeedEntry& entry) {
 	const auto leave = [&] {
 		if (g_stop.load(std::memory_order_relaxed)) return false;
 		LiveCounters::Add(LiveCounters::ScoutStoodDown);
+		state.fence = std::max(state.fence, sequence);
 		return true;
 	};
 	std::array<uint32_t, 64> packet {};
@@ -472,7 +483,7 @@ bool Walk(State& state, const FeedEntry& entry) {
 			continue;
 		}
 		// (Its memory may be the game's again once the render thread is past it.)
-		if ((g_render.load(std::memory_order_acquire) >> 24u) > sequence) return abandon();
+		if ((g_render.load(std::memory_order_acquire) >> 24u) > sequence) return render_past();
 		const auto at = level.base + uint64_t {level.offset} * 4u;
 		if (!Read(packet.data(), at, 4)) return abandon();
 		const auto header = packet[0];
@@ -608,6 +619,12 @@ bool Walk(State& state, const FeedEntry& entry) {
 				Note(sequence, ordinal, Reason::Constant);
 				continue;
 			}
+			// (Nor while a submission before it was not walked whole: State::fence.)
+			if (state.fence != 0 && state.fence < sequence && !((g_render.load(std::memory_order_acquire) >> 24u) > state.fence)) {
+				LiveCounters::Add(LiveCounters::ScoutFenced);
+				Note(sequence, ordinal, Reason::Fenced);
+				continue;
+			}
 			// At most Lead draws ahead; none for a draw the render thread reached.
 			bool stalled = false;
 			for (uint32_t spin = 0;;) {
@@ -658,7 +675,8 @@ bool Walk(State& state, const FeedEntry& entry) {
 
 void Main() {
 	KYTY_PROFILER_THREAD("Thread_Scout");
-	auto state = std::make_unique<State>();
+	auto     state = std::make_unique<State>();
+	uint64_t last  = 0; // the last submission fed (a gap: Feed dropped one on a full ring)
 	for (uint32_t spin = 0;;) {
 		Quiesce();
 		const auto wake = g_wake.load(std::memory_order_acquire);
@@ -673,10 +691,13 @@ void Main() {
 		spin             = 0;
 		const auto entry = g_feed[head % FeedEntries];
 		g_feed_head.store(head + 1, std::memory_order_release);
+		if (last != 0 && entry.sequence > last + 1) state->fence = std::max(state->fence, entry.sequence - 1);
+		last = entry.sequence;
 		// (A submission the render thread is past: its commands may be the game's again; its registers are lost. While
 		// the spin gate is shut, every submission: the scout stands down, its thread asleep between feeds.)
 		const bool shut = !SpinGate::Open(false);
 		if (shut || (g_render.load(std::memory_order_acquire) >> 24u) > entry.sequence) {
+			if (!((g_render.load(std::memory_order_acquire) >> 24u) > entry.sequence)) state->fence = std::max(state->fence, entry.sequence);
 			if (entry.reset) state->registers = {};
 			if (entry.constant) state->constant = entry.sequence;
 			LiveCounters::Add(shut ? LiveCounters::ScoutStoodDown : LiveCounters::ScoutAbandoned);
@@ -697,7 +718,7 @@ void Start(GpuResourceManager& resources) {
 	g_resources = &resources;
 	g_stop.store(false);
 	g_running.store(true);
-	g_thread = std::thread(Main);
+	g_thread = new std::thread(Main);
 	std::printf("Scout: on (KYTY_SCOUT=%u)\n", Mode());
 }
 
@@ -706,7 +727,9 @@ void Stop() {
 	g_stop.store(true, std::memory_order_seq_cst);
 	g_wake.fetch_add(1, std::memory_order_seq_cst);
 	g_wake.notify_all();
-	if (g_thread.joinable()) g_thread.join();
+	if (g_thread != nullptr && g_thread->joinable()) g_thread->join();
+	delete g_thread;
+	g_thread = nullptr;
 	g_running.store(false);
 	for (auto& entry: g_directory) delete entry.exchange(nullptr);
 	for (auto* view: g_retired) delete view;

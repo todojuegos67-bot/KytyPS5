@@ -1348,6 +1348,8 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 			words[i * 4 + 1] = words[i * 4 + 2] = words[i * 4 + 3] = 0;
 		}
 	}
+	// (After the 256 counters: the whole report is written.)
+	if (Scout::Running()) Scout::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size); // (KYTY_SCOUT: every emulator write)
 	if (reset) m_lod_stats_buffer.Flush(0, 256 * 16);
 }
 
