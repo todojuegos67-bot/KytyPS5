@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstdint>
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
@@ -523,6 +524,37 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 	return true;
 }
 
+// KYTY_STABLE_INDIRECT=0 restores the old data-dependent layout. Default on: a bindless table
+// whose number of distinct candidates changes per dispatch (Yotei cinematic CS 0x8457901d80b91921:
+// 5..20 buffer candidates, "SpirvBloat N candidates as one indexed access" with N = 8/11/17/19/106)
+// otherwise made every dispatch a new permutation, i.e. a new 90K-word module and a ~1.25 s
+// blocking vkCreateComputePipelines (544 SPIR-V variants of that one shader in the prewarm seed).
+static bool StableIndirectLayout() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_STABLE_INDIRECT");
+		return v == nullptr || v[0] != '0';
+	}();
+	return enabled;
+}
+constexpr uint64_t MaxStableMappingWords = 4096u;
+
+// Pads the candidates appended for one indirect resource up to a power of two (from 4 on) with
+// copies of the last candidate. Padded ordinals are never written to the mapping, so they are
+// never selected; they only keep the resource count (and so the SPIR-V) the same while the
+// number of distinct candidates moves inside one bucket.
+template <typename Specialization>
+void PadIndirectCandidates(std::vector<DescriptorValue>& descriptors, std::vector<Specialization>& specializations,
+                           size_t children_begin, size_t maximum_resources) {
+	if (!StableIndirectLayout() || descriptors.size() != specializations.size()) return;
+	const auto children = descriptors.size() - children_begin;
+	if (children < 4u) return;
+	const auto target = std::min<size_t>(std::bit_ceil(children), maximum_resources);
+	while (descriptors.size() - children_begin < target) {
+		descriptors.push_back(descriptors.back());
+		specializations.push_back(specializations.back());
+	}
+}
+
 template <typename Specialization, typename Normalize>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    uint32_t source_index,
@@ -655,6 +687,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			descriptors[resource_index] = {.dword_count = dword_count};
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+			// Stable layout: the mapping is sized by the table geometry, not by the last row that
+			// happens to hold a distinct candidate, so the flattened-SRT offsets of later resources
+			// (part of the specialization) no longer move with the table contents.
+			if (StableIndirectLayout()) {
+				const uint64_t words = image_heap ? table_size / 4u : count * child_count;
+				if (words != 0u && words <= MaxStableMappingWords)
+					snapshot.flattened_srt.resize(mapping_offset + 1u + words, 0u);
+			}
 			for (uint32_t word = 0; word < count; ++word) {
 				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
 				uint64_t pointer_base = 0u;
@@ -688,7 +728,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					if (!intern_candidate(candidate, ordinal)) return false;
 					if (ordinal == 0u) continue;
 					const auto mapping_word = image_heap ? table_offset / 4u : word * child_count + child;
-					snapshot.flattened_srt.resize(mapping_offset + 2u + mapping_word, 0u);
+					if (snapshot.flattened_srt.size() < mapping_offset + 2u + mapping_word)
+						snapshot.flattened_srt.resize(mapping_offset + 2u + mapping_word, 0u);
 					snapshot.flattened_srt[mapping_offset + 1u + mapping_word] = ordinal;
 				}
 			}
@@ -1643,6 +1684,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
+					const auto children_begin = snapshot.buffers.size();
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers, UINT32_MAX,
@@ -1651,6 +1693,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 						            value, source->indirect_descriptor->indexed, base);
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size(), UINT32_MAX);
+					PadIndirectCandidates(snapshot.buffers, specialization.buffers, children_begin, SIZE_MAX);
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
 				return false;
