@@ -97,6 +97,107 @@ double QualityRatio(Kind kind, Quality quality) {
     return 1.0;
 }
 
+// ---- 0.86 [sdk-inputs] ----
+float JitterSign(Kind kind) {
+    const char* env = kind == Kind::Dlss   ? "BB_JITTER_SIGN_DLSS"
+                      : kind == Kind::Fsr3 ? "BB_JITTER_SIGN_FSR3"
+                      : kind == Kind::Fsr4 ? "BB_JITTER_SIGN_FSR4"
+                                           : "BB_JITTER_SIGN_XESS";
+    const char* v = std::getenv(env);
+    return v != nullptr && std::atof(v) < 0 ? -1.0f : 1.0f;
+}
+
+float MvSign(Kind kind) {
+    const char* env = kind == Kind::Xess ? "BB_XESS_MV_SIGN" : "BB_FSR3_MV_SIGN";
+    const char* v = std::getenv(env);
+    if (v == nullptr || *v == '\0' || std::atof(v) >= 0) {
+        return 1.0f;
+    }
+    const char* force = std::getenv("BB_MV_SIGN_FORCE");
+    const bool forced = force != nullptr && force[0] == '1';
+    static bool said[2]{};
+    bool& once = said[kind == Kind::Xess ? 0 : 1];
+    if (!once) {
+        once = true;
+        BB::Upscale::Checkpoint(fmt::format(
+            "[sdk-inputs] {}: {}=-1 {}: the vectors are render pixels towards the previous frame "
+            "(bb_mv.comp), which is the convention of {} (screen-space pixels from the current "
+            "frame to the previous one), so the sign is +1; a -1 drags the history the wrong way "
+            "(trails and doubled edges when the camera turns, a clean image when still). "
+            "BB_MV_SIGN_FORCE=1 applies the environment value for a test",
+            KindName(kind), env, forced ? "FORCED by BB_MV_SIGN_FORCE=1" : "IGNORED (kept +1)",
+            kind == Kind::Xess ? "Intel's XeSS-SR developer guide (Velocity / Motion Vectors)"
+                               : "AMD's FSR 3 upscaler manual (Providing motion vectors)"));
+    }
+    return forced ? -1.0f : 1.0f;
+}
+
+namespace {
+bool IsSrgbFormat(vk::Format f) {
+    return f == vk::Format::eR8G8B8A8Srgb || f == vk::Format::eB8G8R8A8Srgb;
+}
+} // namespace
+
+void LogSdkInputs(Kind kind, const Desc& desc, const SdkInputs& in) {
+    struct Key {
+        Kind kind;
+        vk::Format color;
+        bool hdr, encoded, inverted, reactive, camera;
+        float scale[2];
+        float sign[2];
+        float jitter_sign;
+        uint32_t flags, rw, rh, uw, uh;
+        const char* depth_note;
+        bool operator==(const Key&) const = default;
+    };
+    static Key last[8]{};
+    static bool have[8]{};
+    static uint32_t lines[8]{};
+    const uint32_t slot = static_cast<uint32_t>(kind) & 7u;
+    Key key{kind,
+            desc.color.format,
+            desc.hdr,
+            desc.encoded,
+            desc.depth_inverted,
+            desc.has_reactive,
+            desc.camera_valid,
+            {in.mv_scale[0], in.mv_scale[1]},
+            {in.mv_sign[0], in.mv_sign[1]},
+            JitterSign(kind),
+            in.flags,
+            desc.render.width,
+            desc.render.height,
+            desc.upscale.width,
+            desc.upscale.height,
+            in.depth_note};
+    if (have[slot] && last[slot] == key) {
+        return;
+    }
+    if (lines[slot] >= 16) {
+        return;
+    }
+    last[slot] = key;
+    have[slot] = true;
+    ++lines[slot];
+    const char* space = desc.encoded            ? "sRGB-encoded perceptual values"
+                        : IsSrgbFormat(desc.color.format) ? "8-bit sRGB decoded to linear on read"
+                                                          : "linear light";
+    Upscale::Checkpoint(fmt::format(
+        "[sdk-inputs] {}: mv scale {:+.7g},{:+.7g} sign {:+.0f},{:+.0f} ({}), jitter sign {:+.0f} "
+        "(render pixels, the offset the scene was rasterised with: image shifted +x right / +y "
+        "down; now {:+.4f},{:+.4f}; Intel XeSS-SR guide P[2][0] += Jx*2/W, P[2][1] -= Jy*2/H), "
+        "depth inverted {} ({}), input {} {} ({}) exposure {}, flags {}, reactive mask {}, "
+        "render {}x{} -> {}x{}, camera {}, far plane {}",
+        KindName(kind), in.mv_scale[0], in.mv_scale[1], in.mv_sign[0], in.mv_sign[1], in.mv_units,
+        key.jitter_sign, desc.jitter[0], desc.jitter[1], desc.depth_inverted ? "yes" : "no",
+        desc.depth_inverted ? "near = 1, far = 0" : "near = 0, far = 1", vk::to_string(desc.color.format),
+        desc.hdr ? "hdr" : "ldr", space, in.exposure,
+        in.flags_text != nullptr ? in.flags_text(in.flags) : fmt::format("{:#x}", in.flags),
+        desc.has_reactive ? "yes" : "no", desc.render.width, desc.render.height,
+        desc.upscale.width, desc.upscale.height, desc.camera_valid ? "valid" : "invalid",
+        in.depth_note));
+}
+
 } // namespace BB::SR
 
 namespace BB::Upscale {
@@ -2735,15 +2836,11 @@ bool Jitter(float& x, float& y) {
 // scene passes were rasterised with, render pixels, +x right, +y down). All four SDKs take the
 // offset as applied to the projection in pixels (FSR 3.1: NDC x += 2*jx/w, y -= 2*jy/h, i.e. a
 // shift of the picture by (+jx,+jy) screen pixels; DLSS / XeSS the same pixel offset): sign +1
-// each. BB_JITTER_SIGN_<DLSS|FSR3|FSR4|XESS>=-1 flips only what that SDK receives (diagnosis).
+// each. 0.86: Intel's XeSS-SR developer guide (Jitter) says the same in code: ProjectionMatrix[2][0]
+// += Jx * 2 / InputWidth; ProjectionMatrix[2][1] -= Jy * 2 / InputHeight, offsets in [-0.5, 0.5]. BB_JITTER_SIGN_<DLSS|FSR3|FSR4|XESS>=-1 flips only what that SDK receives (diagnosis).
 void TaaPass(const float (&applied)[2], bool camera_valid, float (&passed)[2]) {
     const auto kind = Cfg().kind;
-    const char* env = kind == SR::Kind::Dlss   ? "BB_JITTER_SIGN_DLSS"
-                      : kind == SR::Kind::Fsr3 ? "BB_JITTER_SIGN_FSR3"
-                      : kind == SR::Kind::Fsr4 ? "BB_JITTER_SIGN_FSR4"
-                                               : "BB_JITTER_SIGN_XESS";
-    const char* v = std::getenv(env);
-    const float sign = v != nullptr && std::atof(v) < 0 ? -1.0f : 1.0f;
+    const float sign = SR::JitterSign(kind);
     passed[0] = applied[0] * sign;
     passed[1] = applied[1] * sign;
     std::scoped_lock lk{g_mutex};

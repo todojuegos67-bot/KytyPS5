@@ -1828,6 +1828,9 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     if (color_image == g_bb.present_in.image && !g_bb.present_encoded) {
         desc.hdr = true;
     }
+    // 0.86 [sdk-inputs]: the window path's colour holds sRGB-encoded values only when the raw
+    // UNORM copy was made (BB_SR_LDR_ENCODED=1); every other input is linear light.
+    desc.encoded = color_image == g_bb.present_in.image && g_bb.present_encoded;
     desc.depth_inverted = plan.depth_inverted;
     desc.delta_ms = plan.delta_ms;
     desc.fov_y = plan.fov_y;

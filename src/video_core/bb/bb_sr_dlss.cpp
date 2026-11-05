@@ -595,6 +595,26 @@ bool Evaluate(const Desc& desc) {
         if (reports++ < 8) BBLogf("DLSS: slSetConstants failed (%d)", static_cast<int>(result));
         return false;
     }
+    {
+        // 0.86 [sdk-inputs]: logging only, nothing DLSS receives changes.
+        SdkInputs inputs;
+        inputs.mv_scale[0] = constants.mvecScale.x;
+        inputs.mv_scale[1] = constants.mvecScale.y;
+        inputs.mv_sign[0] = inputs.mv_sign[1] = 1.0f;
+        inputs.mv_units = "UV of the render size: render pixels / render size, towards the previous "
+                          "frame, jitter excluded";
+        inputs.flags = (desc.hdr ? 1u : 0u) | (desc.hdr ? 2u : 0u) | (desc.depth_inverted ? 4u : 0u);
+        inputs.flags_text = [](uint32_t f) {
+            return std::string("colorBuffersHDR=") + ((f & 1) ? "true" : "false") +
+                   " useAutoExposure=" + ((f & 2) ? "true" : "false") +
+                   " depthInverted=" + ((f & 4) ? "true" : "false") +
+                   " cameraMotionIncluded=true motionVectors3D=false motionVectorsDilated=false "
+                   "motionVectorsJittered=false";
+        };
+        inputs.exposure = desc.hdr ? "auto (useAutoExposure)" : "none (LDR input)";
+        inputs.depth_note = "cameraNear/cameraFar from the camera block";
+        LogSdkInputs(Kind::Dlss, desc, inputs);
+    }
     auto color = ToResource(desc.color);
     auto depth = ToResource(desc.depth);
     auto motion = ToResource(desc.motion);

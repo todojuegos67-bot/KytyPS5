@@ -1338,6 +1338,26 @@ bool Evaluate(const Desc& desc) {
     d.jitter[1] = desc.jitter[1];
     d.mv_scale[0] = 1.0f;
     d.mv_scale[1] = 1.0f;
+    {
+        // 0.86 [sdk-inputs]: logging only. The model's constants are mv_scale (BB_SR_MV_SIGN *
+        // 1 / render size), see Upscale().
+        const char* v = std::getenv("BB_SR_MV_SIGN");
+        const float sign = v != nullptr && *v != '\0' && std::atof(v) < 0 ? -1.0f : 1.0f;
+        SdkInputs inputs;
+        inputs.mv_scale[0] = sign / static_cast<float>(desc.render.width);
+        inputs.mv_scale[1] = sign / static_cast<float>(desc.render.height);
+        inputs.mv_sign[0] = inputs.mv_sign[1] = sign;
+        inputs.mv_units = "UV of the render size: render pixels / render size, towards the previous "
+                          "frame, jitter excluded";
+        inputs.flags = 0;
+        inputs.flags_text = [](uint32_t) {
+            return std::string("none (INT8 model; depth direction BB_FSR4_DEPTH_INVERT set from the "
+                               "camera, no reactive input)");
+        };
+        inputs.exposure = "1.0 (pre-exposure 1.0; BB_FSR4_EXPOSURE selects the game's)";
+        inputs.depth_note = "model takes a depth copy";
+        LogSdkInputs(Kind::Fsr4, desc, inputs);
+    }
     return Libs::Graphics::Fsr4::Upscale(g_ctx, d);
 }
 } // namespace BB::SR::Fsr4

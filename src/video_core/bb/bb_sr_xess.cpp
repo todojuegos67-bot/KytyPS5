@@ -47,6 +47,31 @@ bool g_failed = false;
 uint32_t g_errors = 0;
 VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT g_mutable{};
 
+float g_mv_sign = 1.0f;
+
+std::string FlagsText(uint32_t flags) {
+    std::string text;
+    const auto add = [&](uint32_t bit, const char* name) {
+        if (flags & bit) {
+            text += text.empty() ? name : std::string("|") + name;
+        }
+    };
+    add(XESS_INIT_FLAG_HIGH_RES_MV, "HIGH_RES_MV");
+    add(XESS_INIT_FLAG_INVERTED_DEPTH, "INVERTED_DEPTH");
+    add(XESS_INIT_FLAG_EXPOSURE_SCALE_TEXTURE, "EXPOSURE_SCALE_TEXTURE");
+    add(XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK, "RESPONSIVE_PIXEL_MASK");
+    add(XESS_INIT_FLAG_USE_NDC_VELOCITY, "USE_NDC_VELOCITY");
+    add(XESS_INIT_FLAG_LDR_INPUT_COLOR, "LDR_INPUT_COLOR");
+    add(XESS_INIT_FLAG_JITTERED_MV, "JITTERED_MV");
+    add(XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE, "ENABLE_AUTOEXPOSURE");
+    if (text.empty()) {
+        text = "none (vectors in input-resolution pixels, not NDC, jitter removed; depth forward)";
+    } else {
+        text += " (no HIGH_RES_MV / USE_NDC_VELOCITY / JITTERED_MV: vectors in input pixels, jitter removed)";
+    }
+    return text;
+}
+
 xess_quality_settings_t QualityFor(Quality quality, double ratio) {
     switch (quality) {
     case Quality::Native:
@@ -219,16 +244,31 @@ bool Evaluate(const Desc& desc) {
             g_failed = true;
             return false;
         }
-        // Our vectors are in render pixels towards the previous frame (BB_XESS_MV_SIGN=-1 flips).
-        const char* sign_env = std::getenv("BB_XESS_MV_SIGN");
-        const float sign = sign_env != nullptr && std::atof(sign_env) < 0 ? -1.0f : 1.0f;
-        g_api.set_velocity_scale(g_context, sign, sign);
+        // Our vectors are in render pixels towards the previous frame. Intel's XeSS-SR developer
+        // guide (Velocity / Motion Vectors): "screen-space motion in pixels from the current frame
+        // to the previous frame", jitter not included; default units are pixels (NDC needs
+        // XESS_INIT_FLAG_USE_NDC_VELOCITY), so the scale is +1,+1 (0.86: a BB_XESS_MV_SIGN=-1 of
+        // an old launcher is ignored, see SR::MvSign).
+        g_mv_sign = MvSign(Kind::Xess);
+        g_api.set_velocity_scale(g_context, g_mv_sign, g_mv_sign);
         g_output = desc.upscale;
         g_render = desc.render;
         g_flags = flags;
         BBLogf("XeSS: %ux%u -> %ux%u, quality setting %d, %s input", desc.render.width,
                desc.render.height, desc.upscale.width, desc.upscale.height,
                static_cast<int>(init.qualitySetting), desc.hdr ? "HDR" : "LDR");
+    }
+    {
+        SdkInputs inputs;
+        inputs.mv_scale[0] = inputs.mv_scale[1] = g_mv_sign;
+        inputs.mv_sign[0] = inputs.mv_sign[1] = g_mv_sign;
+        inputs.mv_units = "render pixels from the current frame to the previous one, jitter excluded";
+        inputs.flags = flags;
+        inputs.flags_text = &FlagsText;
+        inputs.exposure = desc.hdr ? "auto (XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE), exposureScale 1.0"
+                                   : "none, exposureScale 1.0 (LDR input, no auto-exposure, as the guide advises)";
+        inputs.depth_note = "not given to XeSS (it only needs the depth direction)";
+        LogSdkInputs(Kind::Xess, desc, inputs);
     }
     xess_vk_execute_params_t exec{};
     exec.colorTexture = ViewInfo(desc.color, false);

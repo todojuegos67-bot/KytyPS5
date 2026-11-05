@@ -5,6 +5,7 @@
 // src/local/fsr3-fg.cpp ("FSR 3.1 upscaling" section). Headers: externals/ffx_api (MIT).
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -66,9 +67,26 @@ uint32_t g_flags = 0;
 bool g_failed = false;
 uint32_t g_errors = 0;
 
-float EnvFloat(const char* name, float fallback) {
-    const char* value = std::getenv(name);
-    return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value)) : fallback;
+std::string FlagsText(uint32_t flags) {
+    std::string text;
+    const auto add = [&](uint32_t bit, const char* name) {
+        if (flags & bit) {
+            text += text.empty() ? name : std::string("|") + name;
+        }
+    };
+    add(FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE, "HIGH_DYNAMIC_RANGE");
+    add(FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS, "DISPLAY_RESOLUTION_MOTION_VECTORS");
+    add(FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION, "MOTION_VECTORS_JITTER_CANCELLATION");
+    add(FFX_UPSCALE_ENABLE_DEPTH_INVERTED, "DEPTH_INVERTED");
+    add(FFX_UPSCALE_ENABLE_DEPTH_INFINITE, "DEPTH_INFINITE");
+    add(FFX_UPSCALE_ENABLE_AUTO_EXPOSURE, "AUTO_EXPOSURE");
+    add(FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE, "NON_LINEAR_COLORSPACE");
+    if (text.empty()) {
+        text = "none";
+    }
+    text += " (vectors at render size, jitter removed: no DISPLAY_RESOLUTION_MOTION_VECTORS / "
+            "JITTER_CANCELLATION)";
+    return text;
 }
 
 void Message(uint32_t type, const wchar_t* message) {
@@ -149,9 +167,27 @@ bool Evaluate(const Desc& desc) {
     uint32_t flags = desc.hdr ? FFX_UPSCALE_ENABLE_AUTO_EXPOSURE : 0u;
     if (desc.hdr) flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
     if (desc.depth_inverted) flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-    // Infinite far always (the camera's far plane, when found, varies; a flag change recreates
-    // the context and stalls the GPU).
-    flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
+    // 0.86: the AMD manual (Depth buffer configurations): the infinite flag says the depth buffer
+    // uses an infinite far plane. Bloodborne's does not: its camera block has far = 3000
+    // ("[dlssg] constants ... far 3000", z = 1.00002 in the projection), so with a camera found
+    // the real far plane is given and DEPTH_INFINITE is left off (DLSS is told the same far).
+    // Without a camera (zero vectors anyway) or with BB_FSR3_DEPTH_INFINITE=1 it stays infinite,
+    // as before 0.86. Once a camera was found the flag stays off (one context re-creation at most).
+    static const bool infinite_forced = [] {
+        const char* v = std::getenv("BB_FSR3_DEPTH_INFINITE");
+        return v != nullptr && v[0] == '1';
+    }();
+    static bool finite_seen = false;
+    const bool far_ok = desc.camera_valid && std::isfinite(desc.z_far) &&
+                        desc.z_far > 2.0f * std::max(desc.z_near, 0.001f) && desc.z_far < 1.0e7f;
+    finite_seen = finite_seen || far_ok; // (sticky: a camera lost for a frame does not recreate)
+    const bool finite_far = !infinite_forced && finite_seen;
+    if (!finite_far) {
+        flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
+    }
+    // The AMD manual: FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE when the colour holds perceptual
+    // (gamma-corrected) values, i.e. the sRGB-encoded LDR input of BB_SR_LDR_ENCODED=1.
+    if (desc.encoded) flags |= FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
     if (g_context == nullptr || desc.render.width > g_render.width ||
         desc.render.height > g_render.height || desc.upscale != g_output || flags != g_flags) {
         static uint32_t creations = 0;
@@ -191,8 +227,27 @@ bool Evaluate(const Desc& desc) {
                desc.render.height, desc.upscale.width, desc.upscale.height,
                desc.hdr ? "HDR" : "LDR", desc.depth_inverted ? "inverted" : "forward");
     }
-    // Our vectors: render pixels towards the previous frame (BB_FSR3_MV_SIGN=-1 flips).
-    static const float mv_sign = EnvFloat("BB_FSR3_MV_SIGN", 1.0f) >= 0 ? 1.0f : -1.0f;
+    // Our vectors: render pixels towards the previous frame. AMD's FSR 3 upscaler manual
+    // (Providing motion vectors): the application provides them in the screen-space range
+    // [<-width, -height> .. <width, height>] and they "encode the motion from a pixel in the
+    // current frame to the position of that same pixel in the previous frame"; motionVectorScale
+    // only adapts other spaces (NDC), so +1,+1. 0.86: a BB_FSR3_MV_SIGN=-1 of an old launcher is
+    // ignored (SR::MvSign), BB_MV_SIGN_FORCE=1 applies it.
+    static const float mv_sign = MvSign(Kind::Fsr3);
+    {
+        SdkInputs inputs;
+        inputs.mv_scale[0] = inputs.mv_scale[1] = mv_sign;
+        inputs.mv_sign[0] = inputs.mv_sign[1] = mv_sign;
+        inputs.mv_units = "render pixels from the current frame to the previous one, jitter excluded";
+        inputs.flags = flags;
+        inputs.flags_text = &FlagsText;
+        inputs.exposure = desc.hdr ? "auto (FFX_UPSCALE_ENABLE_AUTO_EXPOSURE), preExposure 1.0"
+                                   : "none given, preExposure 1.0 (LDR input)";
+        inputs.depth_note = (flags & FFX_UPSCALE_ENABLE_DEPTH_INFINITE)
+                                ? "infinite (cameraFar FLT_MAX; no camera found or BB_FSR3_DEPTH_INFINITE=1)"
+                                : "finite, cameraFar = the camera's far plane";
+        LogSdkInputs(Kind::Fsr3, desc, inputs);
+    }
     ffxDispatchDescUpscale up{};
     up.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     up.commandList = static_cast<VkCommandBuffer>(desc.cmd);
@@ -216,7 +271,7 @@ bool Evaluate(const Desc& desc) {
     up.preExposure = 1.0f;
     up.reset = desc.reset;
     const float z_near = std::max(desc.z_near, 0.001f);
-    const float z_far = FLT_MAX;
+    const float z_far = (flags & FFX_UPSCALE_ENABLE_DEPTH_INFINITE) ? FLT_MAX : desc.z_far;
     // The SDK's convention: with inverted depth, near and far are given swapped.
     up.cameraNear = desc.depth_inverted ? z_far : z_near;
     up.cameraFar = desc.depth_inverted ? z_near : z_far;

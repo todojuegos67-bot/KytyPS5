@@ -56,6 +56,9 @@ struct Desc {
     bool reset = false;
     bool hdr = true;            // linear HDR input (scene mode) or tonemapped LDR (composite mode)
     bool depth_inverted = true; // greater-is-closer
+    // 0.86: the colour holds sRGB-encoded (perceptual) LDR values, not linear light (the window
+    // path with BB_SR_LDR_ENCODED=1). False for every linear input (the default).
+    bool encoded = false;
     float delta_ms = 16.7f;
     float fov_y = 1.0f;
     float z_near = 0.1f;
@@ -68,6 +71,29 @@ struct Desc {
     float clip_to_prev_clip[16]{};
     bool camera_valid = false;
 };
+
+// ---- 0.86 [sdk-inputs]: what each SDK is told, in one comparable line ----
+// The sign (+1 / -1) of the jitter handed to an SDK (BB_JITTER_SIGN_<DLSS|FSR3|FSR4|XESS>=-1
+// flips only that SDK; default +1: all four take the offset the scene was rasterised with).
+float JitterSign(Kind kind);
+// The sign of the motion vectors handed to XeSS (BB_XESS_MV_SIGN) or FSR 3.1 (BB_FSR3_MV_SIGN).
+// Intel's XeSS-SR guide and AMD's FSR 3 upscaler manual both define the vectors as screen-space
+// pixels from the current frame to the previous one, which is what bb_mv.comp writes, so the
+// correct sign is +1. A -1 in the environment (an old launcher setting) is ignored unless
+// BB_MV_SIGN_FORCE=1 is also set (it is logged either way).
+float MvSign(Kind kind);
+struct SdkInputs {
+    float mv_scale[2]{1.0f, 1.0f}; // the value given to the SDK's own vector scale parameter
+    float mv_sign[2]{1.0f, 1.0f};  // the sign part of mv_scale
+    const char* mv_units = "";     // what a vector means to the SDK once scaled
+    uint32_t flags = 0;            // the SDK's flag word (or our own bits for DLSS)
+    std::string (*flags_text)(uint32_t) = nullptr;
+    const char* exposure = "";
+    const char* depth_note = "";   // far plane handling
+};
+// Logs "[sdk-inputs] <SDK>: ..." at the first dispatch and again whenever one of its fields (not
+// the per-frame jitter value) changes. Cheap to call every dispatch.
+void LogSdkInputs(Kind kind, const Desc& desc, const SdkInputs& in);
 
 // Before the Vulkan instance: DLSS loads Streamline, whose interposer is then the Vulkan loader.
 namespace Dlss {

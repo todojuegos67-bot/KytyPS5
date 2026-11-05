@@ -25,7 +25,10 @@ upscaler. The code is in `src/video_core/bb/`. It reuses the Demon's Souls fork'
 | `BB_STREAMLINE_DIR` | folder with `sl.interposer.dll` and its plugins | `streamline\` next to the exe |
 | `BB_DLSS_PRESET` | `A`..`O`: force a DLSS model | driver default |
 | `BB_FSR4_PRESET`, `BB_FSR4_DIR`, `BB_FSR4_SHARPNESS`, `BB_FSR4_DEPTH_INVERT`, `BB_FSR4_OPT` | the same as the Demon's Souls `KYTY_FSR4_*` variables | from mode |
-| `BB_XESS_MV_SIGN`, `BB_FSR3_MV_SIGN`, `BB_JITTER_SIGN` | `-1` flips the sign convention (for testing) | `1` |
+| `BB_XESS_MV_SIGN`, `BB_FSR3_MV_SIGN` | `-1` flips the vector sign. 0.86: ignored unless `BB_MV_SIGN_FORCE=1` (the correct sign for both SDKs is `+1`) | `1` |
+| `BB_JITTER_SIGN`, `BB_JITTER_SIGN_DLSS` (`_FSR3`, `_FSR4`, `_XESS`) | `-1` flips the jitter handed to all / that SDK (for testing) | `1` |
+| `BB_MV_SIGN_FORCE` | `1`: apply a `-1` in `BB_XESS_MV_SIGN` / `BB_FSR3_MV_SIGN` (a test) | off |
+| `BB_FSR3_DEPTH_INFINITE` | `1`: FSR 3.1 is told the far plane is infinite (before 0.86 always) | off: the camera's far plane |
 
 The internal resolution is the resolution the game renders at, which the game's resolution patch
 sets. The log prints the internal size that the selected mode needs (output / ratio). When the 3D
@@ -62,3 +65,20 @@ Every other `KYTY_*` knob of the Demon's Souls code is read as `BB_*` first (`BB
 `BB_DLSSG_SLEEP`, `BB_DLSSG_PACE=reflex`, `BB_DLSSG_REFLEX_LIMIT`, `BB_FRAMEGEN_HUDLESS=0`,
 `BB_FSR3_ASYNC`, `BB_FSR3_DEBUG_VIEW`, `BB_FSR3_MV_SIGN`, `BB_DYN_QUALITY`, ...). nvngx_dlssnr.dll is
 never shipped.
+
+## What each SDK is told (0.86, `[sdk-inputs]`)
+
+Each SDK logs one `[sdk-inputs] <SDK>: ...` line at its first dispatch (and again if a field changes).
+The vectors are written by `bb_mv.comp` in render pixels, from the current frame to the previous one,
+with the jitter removed. The jitter is the offset the scene was rasterised with (image shifted by
+(+x right, +y down) pixels).
+
+| | DLSS (Streamline) | XeSS 2 (`libxess.dll`) | FSR 3.1 (FidelityFX API) | FSR 4 (INT8 model) |
+|---|---|---|---|---|
+| vectors | `mvecScale` = +1/render size (UV) | `xessSetVelocityScale` +1,+1 (pixels; Intel XeSS-SR guide: "screen-space motion in pixels from the current frame to the previous frame") | `motionVectorScale` +1,+1 (pixels; AMD manual: range [-w,-h]..[w,h], current pixel to the same pixel in the previous frame) | `mv_scale` +1/render size (UV) |
+| jitter | `jitterOffset` +1 | `jitterOffsetX/Y` +1 (guide: `P[2][0] += Jx*2/W`, `P[2][1] -= Jy*2/H`, [-0.5, 0.5]) | `jitterOffset` +1 (same projection shear) | `jitter` +1 |
+| vectors include jitter | no (`motionVectorsJittered` false) | no (no `JITTERED_MV`) | no (no `MOTION_VECTORS_JITTER_CANCELLATION`) | no |
+| depth | `depthInverted` from the camera, near/far from the camera block | `INVERTED_DEPTH` only if inverted (guide: default smaller = closer) | `DEPTH_INVERTED` only if inverted; real far plane (0.86; infinite only without a camera) | copy of the depth, direction from the camera |
+| input | linear HDR scene colour, `colorBuffersHDR` | linear HDR + `ENABLE_AUTOEXPOSURE`; LDR flag and no auto-exposure only for LDR | linear HDR + `HIGH_DYNAMIC_RANGE` + `AUTO_EXPOSURE`; `NON_LINEAR_COLORSPACE` only for sRGB-encoded input | linear |
+| exposure | auto | auto, `exposureScale` 1 | auto, `preExposure` 1 | 1.0 |
+| reset | `constants.reset` | `resetHistory` | `reset` | `reset` |
