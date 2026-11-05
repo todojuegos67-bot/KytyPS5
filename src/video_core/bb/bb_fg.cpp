@@ -185,6 +185,16 @@ Config ParseConfig() {
     if (c.kind == Kind::Amd && !c.dynamic && c.multiplier == 4 && Env("KYTY_VRR_CAP_FPS") == nullptr) {
         SetProcessEnv("BB_VRR_CAP_FPS", "auto");
     }
+    // bb-dlssg-085: with no fps cap of the user's (BB_FPS_CAP=0) the shown frames are held under
+    // the G-SYNC / VRR range, Reflex's own cap (the 18:44 DLSS-G x3 run showed 239-251 fps on a
+    // 240 Hz G-SYNC monitor: above its range, 155 and 247 ms intervals). BB_FG_VRR_CAP=0: off.
+    if (c.kind != Kind::Off && !c.dynamic && Env("KYTY_VRR_CAP_FPS") == nullptr) {
+        const char* off = std::getenv("BB_FG_VRR_CAP");
+        const char* user = std::getenv("BB_FPS_CAP");
+        if ((off == nullptr || *off != '0') && user != nullptr && std::strcmp(user, "0") == 0) {
+            SetProcessEnv("BB_VRR_CAP_FPS", "auto");
+        }
+    }
     // (bb_dyn_multiplier.h reads KYTY_DYN_QUALITY itself.)
     if (const char* q = std::getenv("BB_DYN_QUALITY"); q != nullptr) {
         SetProcessEnv("KYTY_DYN_QUALITY", q);
@@ -208,6 +218,57 @@ Config ParseConfig() {
 }
 
 } // namespace
+
+// bb-dlssg-085: the refresh rate of the monitor the game's window is on (0: unknown).
+static double MonitorRefreshHz() {
+#if defined(_WIN32)
+    HWND window = GetForegroundWindow();
+    DWORD pid = 0;
+    if (window != nullptr) GetWindowThreadProcessId(window, &pid);
+    if (window == nullptr || pid != GetCurrentProcessId()) window = GetActiveWindow();
+    MONITORINFOEXA info{};
+    info.cbSize = sizeof(info);
+    const char* device = nullptr;
+    if (const HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+        monitor != nullptr && GetMonitorInfoA(monitor, &info)) {
+        device = info.szDevice;
+    }
+    DEVMODEA mode{};
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsA(device, ENUM_CURRENT_SETTINGS, &mode) != 0 &&
+        mode.dmDisplayFrequency > 30) {
+        return static_cast<double>(mode.dmDisplayFrequency);
+    }
+#endif
+    return 0.0;
+}
+
+// bb-dlssg-085: the shown rate G-SYNC / VRR frame generation is held under (KYTY_VRR_CAP_FPS:
+// a number, or auto = NVIDIA's Reflex / G-SYNC cap, refresh - refresh^2 / 3600: 240 Hz -> 224,
+// 165 -> 157, 144 -> 138, 120 -> 116). 0: no cap. The real cap is this / the multiplier.
+static double VrrShownCap() {
+    const char* text = Env("KYTY_VRR_CAP_FPS");
+    if (text == nullptr || *text == '\0') return 0.0;
+    if (std::string(text) == "auto") {
+        const double hz = MonitorRefreshHz();
+        return hz > 0.0 ? std::floor(hz - hz * hz / 3600.0 + 0.01) : 0.0;
+    }
+    return std::max(std::strtod(text, nullptr), 0.0);
+}
+
+// The real-frame interval of the image frame generation under that cap (0: none).
+static double ImageVrrInterval() {
+    static const double interval = [] {
+        const double shown = VrrShownCap();
+        if (shown <= 0.0 || Cfg().kind != Kind::Image) return 0.0;
+        const int multiplier = std::max(Cfg().multiplier, 2);
+        const double real = std::floor(shown / multiplier);
+        Printf("[fg] G-SYNC/VRR cap: refresh %.0f Hz, x%d -> real cap %.0f fps, shown <= %.0f fps",
+               MonitorRefreshHz(), multiplier, real, real * multiplier);
+        return 1.0 / real;
+    }();
+    return interval;
+}
 
 // BB_FPS_CAP=N: the game's real frames (before frame generation, DLSS-G or FSR 3) held to N fps
 // on a fixed grid at the guest flip (1/N s: 16.667 ms at 60, 22.222 at 45, 33.333 at 30), so
@@ -936,6 +997,7 @@ PresentSlot PaceGuestFlip() {
     }
     double interval = Dlssg::PaceInterval();
     if (interval <= 0.0) interval = Amd::PaceInterval();
+    if (interval <= 0.0 && BB::ImgFg::Generating()) interval = ImageVrrInterval();
     // The real fps cap (BB_FPS_CAP) is the grid: a fixed step, not the adaptive mean (which
     // follows the game's own wandering frame time, 14-17 ms, and spaces the presents unevenly).
     (void)Cfg();
@@ -1343,18 +1405,7 @@ void OnDevice(vk::PhysicalDevice physical) {
     // G-SYNC: the frames shown (rendered x (1 + generated)) held under the refresh
     // (KYTY_VRR_CAP_FPS=<shown fps> or auto = refresh x 14 / 15; unset: off).
     {
-        uint32_t cap = 0;
-        const char* text = Env("KYTY_VRR_CAP_FPS");
-        if (text != nullptr && *text != '\0' && std::string(text) != "auto") {
-            cap = static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
-        } else if (text != nullptr && std::string(text) == "auto") {
-            DEVMODEA mode{};
-            mode.dmSize = sizeof(mode);
-            if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 &&
-                mode.dmDisplayFrequency > 30) {
-                cap = static_cast<uint32_t>(std::floor(mode.dmDisplayFrequency * 14.0 / 15.0 + 0.01));
-            }
-        }
+        uint32_t cap = static_cast<uint32_t>(VrrShownCap());
         if (g_dynamic) {
             cap = 0;
             g_real_interval =
@@ -1371,6 +1422,12 @@ void OnDevice(vk::PhysicalDevice physical) {
             Printf("Frame generation: shown frames held under %u fps (rendered at most %.1f, "
                    "Reflex limit %u us)",
                    cap, static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
+            Printf("[fg] G-SYNC/VRR cap: refresh %.0f Hz, x%d -> real cap %.0f fps, shown <= %.0f "
+                   "fps (Reflex frame limiter, %u us)",
+                   MonitorRefreshHz(), g_generate + 1,
+                   std::floor(static_cast<double>(cap) / (g_generate + 1)),
+                   std::floor(static_cast<double>(cap) / (g_generate + 1)) * (g_generate + 1),
+                   reflex.frameLimitUs);
         }
     }
     Dlssg::g_reflex_limit_us = reflex.frameLimitUs;
@@ -2302,7 +2359,10 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
             }
         }
 #endif
-        const bool high_refresh = refresh_hz >= 120;
+        // (Immediate is only free of tearing inside the VRR range: with the shown rate held
+        // under it, KYTY_VRR_CAP_FPS; uncapped the rate can pass the refresh, and mailbox, which
+        // never tears, is used.)
+        const bool high_refresh = refresh_hz >= 120 && Env("KYTY_VRR_CAP_FPS") != nullptr;
         wanted = high_refresh && supported(vk::PresentModeKHR::eImmediate)
                      ? vk::PresentModeKHR::eImmediate
                  : supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
