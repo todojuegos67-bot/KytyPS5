@@ -313,6 +313,13 @@ private:
 	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write);
 	std::unique_ptr<CopyFeedback> m_copy_feedback;
+	// KYTY_FEEDBACK_BATCH: the open buffer's copy-feedback snapshots, recorded together as it closes (FlushFeedbackBatch).
+	struct FeedbackCopy {
+		vk::Buffer source;
+		uint64_t   source_offset, destination_offset, size;
+	};
+	std::vector<FeedbackCopy> m_feedback_batch;
+	void                      FlushFeedbackBatch(CommandBuffer& command);
 	bool TryReportLodStatsOnGpu(uint64_t address, bool reset);
 	vk::Pipeline m_lod_pack_pipeline = nullptr;
 	vk::PipelineLayout m_lod_pack_layout = nullptr;

@@ -695,6 +695,7 @@ CommandScheduler::SubmitEntry CommandScheduler::ClosePrologue() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	m_command.EndRendering();
+	if (m_epilogue_hook) m_epilogue_hook(m_command); // (KYTY_FEEDBACK_BATCH)
 	// A compute chain's pending barrier closes this buffer (left pending, the next Begin recorded it into a buffer
 	// that had not begun).
 	(void)m_command.Handle();
