@@ -975,6 +975,7 @@ uint64_t CommandScheduler::SubmitRecorded(Recorder& recorder, size_t count) {
 	size_t                                    n = 0;
 	if (open) {
 		m_command.EndRendering();
+		if (m_epilogue_hook) m_epilogue_hook(m_command); // (KYTY_FEEDBACK_BATCH)
 		(void)m_command.Handle(); // (a pending compute chain barrier closes it, as Submit's)
 		if (!m_prologue.IsInvalid()) entries[n++] = ClosePrologue();
 		entries[n++]          = {m_command.m_buffer, false, m_command.m_timestamp_slot};

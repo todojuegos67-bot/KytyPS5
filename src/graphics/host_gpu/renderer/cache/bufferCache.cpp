@@ -896,8 +896,10 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 		feedback.download.written_serial = m_scheduler.CommandSerial();
 		command.CopyAfterRun(owner->Handle(), owner->Offset(vaddr), feedback.download.Handle(),
 		                     selected * CopyFeedback::SlotSize, size);
-	} else if (static auto& batch = LiveSwitch::Find("feedback_batch", 0); batch.load(std::memory_order_relaxed) != 0) {
-		// KYTY_FEEDBACK_BATCH (live feedback_batch, default off): the snapshot is copied
+	} else if (static auto& batch = LiveSwitch::Find("feedback_batch", 0);
+	           batch.load(std::memory_order_relaxed) != 0 && CommandScheduler::ThreadRecorder() == nullptr) {
+		// KYTY_FEEDBACK_BATCH (live feedback_batch, default off; not on a recorder's thread: a speculation's buffers
+		// keep the snapshot in place): the snapshot is copied
 		// as the open buffer closes, with the others there behind one barrier each side, not behind two of its own
 		// here. Later work in the buffer that writes the range invalidates the slot (InvalidateCopyFeedback), so what
 		// the copy reads then is what it would read here whenever the slot is still used. (The source outlives the
