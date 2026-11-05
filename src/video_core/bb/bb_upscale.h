@@ -202,4 +202,18 @@ const char* Menu2DWhyNot();
 // The presenter's verdict for this frame: the window-size image was (or was not) presented.
 void OnPresentResult(bool presented, std::string_view why);
 
+// 0.69 full-frame scaling. The window-size path's HUD layer (the difference between the game's
+// final image and its HUD-less copy, both at the render size) is reconstructed at the window
+// size with an EASU-like deringed 4x4 kernel instead of a bilinear stretch, when the window is
+// larger than the render size (BB_HUD_SCALE=bilinear restores 0.64).
+bool HudSharpScale(u32 render_w, u32 render_h, u32 out_w, u32 out_h);
+// 0.69: one entry per presented frame, from the presenter, whatever the upscaler (also with the
+// BB upscaler off: the emulator's own FSR 1). path: what the 3D went through; hud: how the 2D
+// layer (HUD, menus, text) reached the window size. A "[frame]" line is written to
+// bb_upscale_init.log once a second for the first 2 minutes, then every 30 s, and at once
+// whenever the combination changes.
+enum class Hud2D { Upscaled, Spatial, Native, Stretched, Downscaled };
+void NoteFullFrame(const char* path, u32 in_w, u32 in_h, u32 out_w, u32 out_h, Hud2D hud,
+                   bool is_3d);
+
 } // namespace BB::Upscale

@@ -1466,7 +1466,11 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
         u32 size[4];
     } push{{output.width, output.height,
             IsSrgb(view_format) && !IsSrgb(flip.info.pixel_format) ? 1u : 0u,
-            (g_bb.present_encoded ? 1u : 0u) | (measure ? 2u : 0u)}};
+            (g_bb.present_encoded ? 1u : 0u) | (measure ? 2u : 0u) |
+                (BB::Upscale::HudSharpScale(render.width, render.height, output.width,
+                                            output.height)
+                     ? 8u
+                     : 0u)}};
     const vk::DescriptorImageInfo up_info{g_bb.linear, g_bb.output.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo final_info{g_bb.linear, final_view,
                                              vk::ImageLayout::eShaderReadOnlyOptimal};
@@ -1523,7 +1527,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
                 vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
         auto fg_push = push;
-        fg_push.size[3] = (g_bb.present_encoded ? 1u : 0u) | 4u;
+        fg_push.size[3] = (g_bb.present_encoded ? 1u : 0u) | 4u | (push.size[3] & 8u);
         const vk::DescriptorImageInfo fg_out{{}, g_bb.fg_present.view, vk::ImageLayout::eGeneral};
         auto fg_writes = writes;
         fg_writes[3].pImageInfo = &fg_out;

@@ -899,6 +899,42 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                 : !bb_smaller   ? "larger than the window (downscale)"
                                                 : "FSR 1 not enabled for this flip");
     }
+    {
+        // 0.69: the per-second [frame] line (bb_upscale_init.log): upscaler, internal and window
+        // size, and whether the 2D layer (HUD, menus, text) reached the window size scaled.
+        using BB::Upscale::Hud2D;
+        const bool up3d = BB::Upscale::Enabled() && (bb_presented || BB::Upscale::LastFrameUpscaled());
+        const bool is2d = BB::Upscale::Enabled() ? BB::Upscale::FlipIs2D() : false;
+        const bool same = image_size.width == frame->width && image_size.height == frame->height;
+        const bool bigger = image_size.width > frame->width || image_size.height > frame->height;
+        const bool spatial = frame_fsr.enable && !frame_fsr.sharpen_only &&
+                             (bb_size.width < frame->width || bb_size.height < frame->height);
+        u32 in_w = image_size.width, in_h = image_size.height;
+        const char* path = "no upscaler";
+        Hud2D hud = same ? Hud2D::Native : bigger ? Hud2D::Downscaled
+                                         : spatial ? Hud2D::Spatial : Hud2D::Stretched;
+        if (bb_presented) {
+            path = "window path (3D upscaled, HUD layer added at the window size)";
+            hud = BB::Upscale::HudSharpScale(image_size.width, image_size.height, bb_size.width,
+                                             bb_size.height)
+                      ? Hud2D::Upscaled
+                      : Hud2D::Stretched;
+        } else if (up3d) {
+            const auto& plan = BB::Upscale::CurrentPlan();
+            if (plan.render_w != 0) {
+                in_w = plan.render_w;
+                in_h = plan.render_h;
+            }
+            path = plan.scene_mode ? "in-game (before post-processing)"
+                                   : "in-game (at the game's scene-to-UI composite)";
+        } else if (is2d) {
+            path = "2D frame (no 3D scene: spatial only)";
+        } else if (BB::Upscale::Enabled()) {
+            path = "3D frame not upscaled (temporal not ready)";
+        }
+        BB::Upscale::NoteFullFrame(path, in_w, in_h, frame->width, frame->height, hud,
+                                   BB::Upscale::Enabled() && !is2d);
+    }
     image_view = fsr_pass.Render(cmdbuf, image_view, bb_size, fsr_out, frame_fsr, frame->is_hdr);
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches

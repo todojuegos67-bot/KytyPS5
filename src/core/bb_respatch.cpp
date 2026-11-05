@@ -193,16 +193,24 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     const u32 align = 8;
     const u32 rw = std::max<u32>(align, static_cast<u32>(std::lround(ow / ratio / align)) * align);
     const u32 rh = std::max<u32>(align, static_cast<u32>(std::lround(oh / ratio / align)) * align);
+    // 0.69 native scaling: BB_RES_PATCH_UI=output (default) keeps the game's UI size at the
+    // output size, so only the 3D scene chain (the SceneW/H immediates: G-buffer, lighting and the
+    // game's own scene-size post-processing) renders at the internal size; the game itself then
+    // samples the scene into its output-size UI image, the upscaler is injected at that sample
+    // (composite mode, bb_upscale.h) and the HUD, menus and text are drawn by the game at the
+    // output size: nothing is laid on top afterwards. BB_RES_PATCH_UI=internal restores 0.64
+    // (UI at the internal size, the HUD taken off and put back by bb_hud.comp).
+    const char* ui_env = std::getenv("BB_RES_PATCH_UI");
+    const bool ui_internal = ui_env != nullptr && std::string(ui_env) == "internal";
+    const u32 uw = ui_internal ? rw : ow, uh = ui_internal ? rh : oh;
     for (const Line& l : Template) {
         u8 b[4];
         std::memcpy(b, l.bytes, 4);
         u32 value = 0;
-        // Scene and UI both at the internal size: the game draws its HUD into the scene's image,
-        // and the port's window-size path (bb_hud.comp) takes the HUD off and puts it back at the
-        // window size. (Keeping the UI at the output size, as deadinside28's port does, needs its
-        // UI-target redirection, not ported.)
-        if (l.addr == SceneW || l.addr == UiW) value = rw;
-        if (l.addr == SceneH || l.addr == UiH) value = rh;
+        if (l.addr == SceneW) value = rw;
+        if (l.addr == SceneH) value = rh;
+        if (l.addr == UiW) value = uw;
+        if (l.addr == UiH) value = uh;
         if (value) {
             b[1] = value & 0xFF;
             b[2] = (value >> 8) & 0xFF;
@@ -216,8 +224,11 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     g_ow = ow;
     g_oh = oh;
     BB::Upscale::Checkpoint(fmt::format(
-        "resolution patch (BB_SCENE_UPSCALE=1): the game renders {}x{} (output {}x{} / {:.3f}); "
-        "the upscaler takes it to the window. Target shrinking off.",
-        rw, rh, ow, oh, ratio));
+        "resolution patch (BB_SCENE_UPSCALE=1): the game renders its 3D scene at {}x{} (output "
+        "{}x{} / {:.3f}), its UI at {}x{} ({}); the upscaler runs inside the game's frame where "
+        "it samples the scene. Target shrinking off.",
+        rw, rh, ow, oh, ratio, uw, uh,
+        ui_internal ? "BB_RES_PATCH_UI=internal: HUD composited on top at the window size"
+                    : "native: the game draws its HUD at the output size"));
 }
 } // namespace BB::ResPatch

@@ -2126,7 +2126,10 @@ bool MenuUpscaleWanted() {
         return false;
     }
     std::scoped_lock lk{g_mutex};
-    if (!Cfg().menus || !Active() || g_flip_scene) {
+    // 0.69: from the first frame. FSR 1 is the presenter's own pass and needs no upscaler back
+    // end, so the menus and loading screens before the back end is ready (or with the native
+    // kind, or after a back-end failure) are no longer a plain stretch.
+    if (!Cfg().menus || g_flip_scene) {
         return false;
     }
     static bool said = false;
@@ -2143,7 +2146,9 @@ bool SceneSpatialFallback() {
         return false;
     }
     std::scoped_lock lk{g_mutex};
-    if (!Active() || !g_flip_scene || !PresentMode()) {
+    // 0.69: also a 3D frame while no temporal upscaler can run (back end not ready yet, native
+    // kind, or turned off by a failure): the whole frame (3D + HUD) gets FSR 1, not a stretch.
+    if (!g_flip_scene || (Active() && !PresentMode())) {
         return false;
     }
     static bool said = false;
@@ -2172,7 +2177,6 @@ float Menu2DRcas() {
 const char* Menu2DWhyNot() {
     if (!Enabled()) return "upscaler off";
     if (!Cfg().menus) return "BB_UPSCALE_MENUS=0";
-    if (!Active()) return "upscaler not ready / native kind";
     std::scoped_lock lk{g_mutex};
     if (g_flip_scene) return "3D flip";
     return "";
@@ -2783,6 +2787,53 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     g_dump_repeats = 0;
     g_frame = {};
     g_draw = {};
+}
+
+bool HudSharpScale(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
+    static const bool off = [] {
+        const char* v = std::getenv("BB_HUD_SCALE");
+        return v != nullptr && (std::string_view{v} == "bilinear" || std::string_view{v} == "0");
+    }();
+    return !off && out_w >= render_w && out_h >= render_h &&
+           (out_w > render_w || out_h > render_h);
+}
+
+void NoteFullFrame(const char* path, u32 in_w, u32 in_h, u32 out_w, u32 out_h, Hud2D hud,
+                   bool is_3d) {
+    static std::mutex m;
+    static auto start = std::chrono::steady_clock::now();
+    static auto last = start;
+    static std::string last_key;
+    static u32 frames = 0, d3 = 0, hud_up = 0;
+    std::scoped_lock lk{m};
+    ++frames;
+    d3 += is_3d ? 1 : 0;
+    const bool scaled2d = hud == Hud2D::Upscaled || hud == Hud2D::Spatial;
+    hud_up += scaled2d ? 1 : 0;
+    const char* hud_s = hud == Hud2D::Upscaled    ? "YES (window path: HUD layer EASU-like)"
+                        : hud == Hud2D::Spatial    ? "YES (whole frame FSR 1 EASU)"
+                        : hud == Hud2D::Native     ? "native (drawn by the game at the window size)"
+                        : hud == Hud2D::Downscaled ? "NO (internal > window: downscaled)"
+                                                   : "NO (plain stretch)";
+    const SR::Kind kind = Cfg().kind;
+    const std::string up = kind == SR::Kind::Off ? std::string("off (emulator FSR 1 setting)")
+                                                 : std::string(SR::KindName(kind));
+    const std::string key = fmt::format("{}|{}|{}x{}|{}x{}|{}", up, path, in_w, in_h, out_w,
+                                        out_h, hud_s);
+    const auto now = std::chrono::steady_clock::now();
+    const double since = std::chrono::duration<double>(now - start).count();
+    const double gap = std::chrono::duration<double>(now - last).count();
+    const bool changed = key != last_key;
+    if (!changed && gap < (since < 120.0 ? 1.0 : 30.0)) {
+        return;
+    }
+    Checkpoint(fmt::format("[frame] t={:.0f}s upscaler={} path={} internal={}x{} window={}x{} "
+                           "2D layer scaled={} | last {} flips: {} 3D, {} with 2D scaled{}",
+                           since, up, path, in_w, in_h, out_w, out_h, hud_s, frames, d3, hud_up,
+                           changed ? " (changed)" : ""));
+    last = now;
+    last_key = key;
+    frames = d3 = hud_up = 0;
 }
 
 } // namespace BB::Upscale
