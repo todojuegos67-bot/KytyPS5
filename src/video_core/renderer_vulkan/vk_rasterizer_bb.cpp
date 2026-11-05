@@ -166,6 +166,7 @@ struct BBVk {
     OwnImage lut_s, lut_f, lut_out;
     vk::Pipeline lut_pipeline{};
     bool lut_failed_init = false, lut_disabled = false, lut_ready = false;
+    u32 lut_off_calls = 0; // bb-dlssg-085: presents since the self-check switched the curve off
     std::array<vk::Buffer, 4> lut_buf{};
     std::array<VmaAllocation, 4> lut_alloc{};
     std::array<void*, 4> lut_mapped{};
@@ -2267,6 +2268,17 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
                            static_cast<unsigned long long>(g_bb.lut_a));
         }
     }
+    // bb-dlssg-085: the curve pass was switched off for the whole session after 5 failed checks
+    // in a row (11-05 18:29 run: conflicts 65-488 of 11 million samples, so no HUD-less image on
+    // 83 of 83 frames a second). It is tried again after ~1500 presents (~20 s).
+    if (g_bb.lut_disabled && g_bb.lut_pipeline && ++g_bb.lut_off_calls >= 1500) {
+        g_bb.lut_off_calls = 0;
+        g_bb.lut_disabled = false;
+        g_bb.lut_bad_streak = 0;
+        g_bb.lut_table_slot = ~0u;
+        g_bb.lut_verdict_ok = false;
+        BB::FG::Printf("[fg-hudless] trying the curve pass again");
+    }
     if (!captured || g_bb.lut_disabled || !g_bb.init) {
         return;
     }
@@ -2487,7 +2499,11 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
         const u32 conflicts = counters[0], mismatches = counters[1], gaps = counters[2],
                   hud = counters[3];
         ++g_bb.lut_frames;
-        const bool bad = conflicts != 0 || mismatches != 0;
+        // bb-dlssg-085: a few hundred stray samples (65-488 in the 18:29 run, against 189089 when
+        // the curve really is not one) do not make the table wrong: one code value in ten
+        // thousand off by a level. kHudlessTolerance is the same constant in bb_hudless_lut.comp.
+        constexpr u32 kHudlessTolerance = 3000;
+        const bool bad = conflicts > kHudlessTolerance || mismatches > kHudlessTolerance;
         if (bad) {
             g_bb.lut_conflict += conflicts != 0;
             g_bb.lut_mismatch += mismatches != 0;
