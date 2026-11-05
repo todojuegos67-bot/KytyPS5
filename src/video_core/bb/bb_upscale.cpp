@@ -673,8 +673,8 @@ const Candidate* BestCamera() {
 bool BlockCamera(FrameState& f, const float* d, size_t size) {
     static const bool on = [] {
         const char* v = std::getenv("BB_CAMERA_BLOCK");
-        return v == nullptr || v[0] != '0';
-    }();
+        (void)v;
+    }
     if (!on || size < 864 || d[0] != 3000.0f || std::fabs(d[1] * d[0] - 1.0f) > 1e-3f ||
         !(d[4] >= 64.0f) || !(d[5] >= 64.0f) || d[4] > 16384.0f || d[5] > 16384.0f) {
         return false;
@@ -2393,7 +2393,14 @@ void FillPresentPlan(VAddr flip, const char* where) {
     if (!PresentMode() && !FgNative()) {
         // 0.48 native fallback: the history was the in-place path's HDR scene colour.
         p.reset = p.reset || !g_last_window_path;
-        g_native_hold = NativeHoldFlips();
+        // 0.80: the hold (in-place off for BB_NATIVE_HOLD flips) only after an in-place upscale
+        // really failed. 0.48-0.79 set it on every present-time frame, so the frames it held were
+        // processed at present and renewed it: after the first missed frame (temporal not ready)
+        // the in-place point was never tried again (07:54 run: "in place 0, at present 60" in
+        // every window), and DLAA ran on the post-processed sRGB image instead of the HDR scene.
+        if (f.inject_failed) {
+            g_native_hold = NativeHoldFlips();
+        }
         if (!g_native_said) {
             g_native_said = true;
             Checkpoint(fmt::format("[3d] native AA: a 3D frame the in-place point missed is "
@@ -2689,6 +2696,18 @@ void OnStageTimes(const double (&ms)[kStages]) {
     ++g_stats.stage_samples;
 }
 
+static bool all_scene_on() {
+    // 0.80: BB_TAA_ALL on by default (=0 turns it off). The 07:54 run jittered 227 of 578 scene
+    // draws (351 without a camera found) while the upscaler was told the whole frame was
+    // jittered. Only draws with the scene depth before the upscaler are scene draws, so shadows,
+    // post-processing and the HUD are never jittered.
+    static const bool on = [] {
+        const char* v = std::getenv("BB_TAA_ALL");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 bool Jitter(float& x, float& y) {
     if (!Active() || !Cfg().jitter) {
         return false;
@@ -2696,10 +2715,7 @@ bool Jitter(float& x, float& y) {
     std::scoped_lock lk{g_mutex};
     // 0.79: BB_TAA_ALL=1 jitters every draw of the scene pass (a real TAA engine jitters all of
     // its projections), not only those whose vertex constants hold a recognised view-projection.
-    static const bool all_scene = [] {
-        const char* v = std::getenv("BB_TAA_ALL");
-        return v != nullptr && v[0] == '1';
-    }();
+    const bool all_scene = all_scene_on();
     if (g_draw.valid && g_draw.scene) {
         ++g_taa_scene_draws;
         if (!g_draw.vertex_camera) ++g_taa_nocam_draws;
@@ -2747,7 +2763,7 @@ void TaaPass(const float (&applied)[2], bool camera_valid, float (&passed)[2]) {
         yes ? "yes" : "no", g_jitter_phases, g_jitter_index, applied[0], applied[1],
         SR::KindName(kind), passed[0], passed[1], sign < 0 ? " (sign flipped by env)" : "",
         camera_valid ? "yes" : "n/a (zero vectors, no camera yet)", g_jittered_last_frame,
-        g_taa_last_scene, g_taa_last_nocam, std::getenv("BB_TAA_ALL") ? ", BB_TAA_ALL set" : "");
+        g_taa_last_scene, g_taa_last_nocam, all_scene_on() ? ", all scene draws (BB_TAA_ALL default on)" : ", BB_TAA_ALL=0");
     LOG_INFO(Render_Vulkan, "{}", line);
     Checkpoint(line);
 }
