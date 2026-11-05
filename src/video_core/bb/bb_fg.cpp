@@ -1514,6 +1514,7 @@ void OnDevice(vk::PhysicalDevice physical) {
     }
     if (Cfg().dynamic) {
         g_dynamic = true;
+        g_generate = 5; // bb-dyn-096: up to x6; trimmed to the GPU's numFramesToGenerateMax
         if (const char* t = Env("KYTY_DLSSG_TARGET_FPS"); t != nullptr && std::atof(t) > 0) {
             g_target_fps = static_cast<float>(std::atof(t));
             Printf("[dlssg] dynamic target %.0f fps (BB_DLSSG_TARGET_FPS)",
@@ -1915,7 +1916,8 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                         const char* v = std::getenv("BB_DLSSG_DYN_LOWEST");
                         return v != nullptr && *v == '1';
                     }();
-                    const int hi = std::max(maxgen, 1);
+                    // up to the GPU's numFramesToGenerateMax (x6 on RTX 50), no base-rate ceiling
+                    const int hi = lowest ? std::max(maxgen, 1) : std::max(g_dyn_max, 1);
                     if (lowest && g_dyn_real_fps > 1.0) {
                         const int need = static_cast<int>(std::ceil(0.9 * T / g_dyn_real_fps)) - 1;
                         next = std::min(next, std::clamp(need, 1, hi));
@@ -2475,7 +2477,7 @@ void AfterPresent() {
     if (g_dynamic && state.numFramesToGenerateMax != 0) {
         const int max = std::min(g_generate, static_cast<int>(state.numFramesToGenerateMax));
         if (max != g_dyn_max) {
-            Printf("[dyn] up to x%d (GPU makes up to %u generated)", max + 1,
+            Printf("[dyn] up to x%d (GPU makes up to %u generated, numFramesToGenerateMax)", max + 1,
                    state.numFramesToGenerateMax);
             g_dyn_max = max;
             if (g_dyn_gen > max) {
