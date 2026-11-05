@@ -102,6 +102,66 @@ struct Stats {
 
 std::mutex g_mutex; // the contexts are not thread safe (presents, prepare, destruction)
 
+// 0.92 (bb-amdfg-092): held-step present slots for the patched DLL. With no real fps cap
+// (BB_FPS_CAP=0, the default) the guest pacer gave the DLL no slot, and the DLL placed each
+// generated frame at its own estimate (moving average x 1/(N+1) minus the variance and a safety
+// margin), so generated and real frames alternated short / long: 0.85 AMD x2 run, shown 224 fps
+// but interval sd 0.75-1.37 ms, p99 7-9 ms, max 10-14 ms against a 4.46 ms mean. Now each real
+// present gets a slot on a held grid (the guest pacer's step, or a held mean of the real present
+// intervals when it has none), corrected by 1/8 of the phase error a frame and re-phased only when
+// a frame is off by more than 40% of the step; the DLL then puts the N generated frames at
+// slot + i * step / (N + 1) and the real one at slot + step. BB_FSR3_PACE_HOLD=0: the old way.
+bool HoldPace() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_FSR3_PACE_HOLD");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+struct Hold {
+    double step = 0.0;       // s, the held step (0: none yet)
+    double last_slot = 0.0;  // s (steady clock), the previous real frame's slot
+    double last_arrive = 0.0;
+    double ring[32]{};
+    int count = 0, next = 0;
+    double planned_last = 0.0; // s, the last planned present (the real frame at slot + step)
+} g_hold;
+
+// Per-second samples for [fsr3-ft] (under g_mutex).
+struct FrameTimes {
+    std::vector<double> real;  // ms between real presents reaching the frame generation swapchain
+    std::vector<double> shown; // ms between the presents planned on the slots (all frames)
+    uint32_t rephase = 0, own_slots = 0;
+} g_ft;
+
+double SteadyNow() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void FtLine(const char* what, std::vector<double>& v, std::string& out) {
+    char buf[160];
+    if (v.size() < 2) {
+        std::snprintf(buf, sizeof(buf), "%s n/a", what);
+    } else {
+        double sum = 0, sq = 0, mx = 0;
+        for (double x : v) {
+            sum += x;
+            sq += x * x;
+            mx = std::max(mx, x);
+        }
+        const double n = static_cast<double>(v.size());
+        const double mean = sum / n;
+        std::sort(v.begin(), v.end());
+        const size_t i99 = std::min(v.size() - 1, static_cast<size_t>(std::ceil(0.99 * n)) - 1);
+        std::snprintf(buf, sizeof(buf), "%s mean %.2f sd %.2f p99 %.2f max %.2f ms (%zu)", what,
+                      mean, std::sqrt(std::max(sq / n - mean * mean, 0.0)), v[i99], mx, v.size());
+    }
+    out += buf;
+    v.clear();
+}
+
 bool EnvOn(const char* name, bool fallback) {
     const char* value = Env(name);
     if (value == nullptr || *value == '\0') return fallback;
@@ -718,7 +778,71 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
             present.pNext = &present_id;
         }
     }
-    const auto slot = BB::FG::PresentSlotNow();
+    auto slot = BB::FG::PresentSlotNow();
+    {
+        const double now_s = SteadyNow();
+        auto& h = g_hold;
+        if (h.last_arrive > 0.0) {
+            const double dt = now_s - h.last_arrive;
+            if (dt > 0.0 && dt < 0.1) {
+                g_ft.real.push_back(dt * 1e3);
+                h.ring[h.next] = dt;
+                h.next = (h.next + 1) % 32;
+                ++h.count;
+            } else {
+                h.last_slot = 0.0; // a pause: start a new grid
+            }
+        }
+        h.last_arrive = now_s;
+        if (slot.qpc == 0 && g_set_pace_slot != nullptr && g_generating && HoldPace()) {
+            // The step: the guest pacer's (the real flips are held on it), else a held mean of
+            // the real present intervals (moves only when the mean leaves it by 0.5 ms).
+            double step = GuestPacing() ? PaceEffective() : CapInterval();
+            if (!(step > 0.0 && step < 0.1) && h.count >= 16) {
+                const int n = std::min(h.count, 32);
+                double sum = 0.0;
+                for (int i = 0; i < n; ++i) sum += h.ring[i];
+                const double mean = sum / n;
+                step = (h.step <= 0.0 || std::fabs(mean - h.step) > 0.0005) ? mean : h.step;
+            }
+            if (step > 0.0 && step < 0.1) {
+                if (std::fabs(step - h.step) > 1e-6) h.step = step;
+                double s = now_s;
+                const double expected = h.last_slot + step;
+                if (h.last_slot > 0.0 && std::fabs(now_s - expected) <= 0.4 * step) {
+                    s = expected + (now_s - expected) * 0.125;
+                } else {
+                    ++g_ft.rephase;
+                }
+                h.last_slot = s;
+                LARGE_INTEGER qpc{}, freq{};
+                QueryPerformanceCounter(&qpc);
+                QueryPerformanceFrequency(&freq);
+                const double f = static_cast<double>(freq.QuadPart);
+                slot.qpc = qpc.QuadPart + static_cast<int64_t>((s - now_s) * f);
+                slot.interval = static_cast<int64_t>(step * f);
+                ++g_ft.own_slots;
+                // The planned presents: N generated at slot + i * step / (N + 1), the real at
+                // slot + step.
+                const int gen = std::max(Generated(), 1);
+                double prev = h.planned_last;
+                for (int i = 1; i <= gen + 1; ++i) {
+                    const double t = s + step * i / (gen + 1);
+                    if (prev > 0.0 && t - prev > 0.0 && t - prev < 0.1) {
+                        g_ft.shown.push_back((t - prev) * 1e3);
+                    }
+                    prev = t;
+                }
+                h.planned_last = prev;
+            } else {
+                h.last_slot = 0.0;
+                h.planned_last = 0.0;
+            }
+        } else if (slot.qpc == 0) {
+            h.last_slot = 0.0;
+            h.planned_last = 0.0;
+        }
+    }
     if (g_set_pace_slot != nullptr) {
         g_set_pace_slot(slot.qpc, slot.interval);
     }
@@ -813,6 +937,23 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         }
         if (g_take_pace_stats != nullptr) {
             LogPresentIntervals(window);
+        }
+        {
+            // 0.92: real / planned-shown frame times (ms) of the last second.
+            std::string line = "[fsr3-ft] ";
+            FtLine("real", g_ft.real, line);
+            line += "; shown (planned slots)";
+            FtLine("", g_ft.shown, line);
+            char tail[200];
+            std::snprintf(tail, sizeof(tail),
+                          "; step %.2f ms, own slots %u, re-phased %u, hold %s; DLL measured: "
+                          "the [midpoint] line",
+                          g_hold.step * 1e3, g_ft.own_slots, g_ft.rephase,
+                          HoldPace() ? "on" : "off (BB_FSR3_PACE_HOLD=0)");
+            line += tail;
+            Printf("%s", line.c_str());
+            g_ft.rephase = 0;
+            g_ft.own_slots = 0;
         }
         MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
         g_stats = {};
@@ -957,12 +1098,19 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     prepare.frameTimeDelta = static_cast<float>(std::clamp(delta_ms, 1.0, 100.0));
     prepare.unused_reset = inputs->reset;
     const float z_near = EnvFloat("KYTY_FSR3_NEAR", std::max(inputs->z_near, 0.001f));
+    // 0.92: the game's own far plane when known (as the FSR 3.1 upscaler gets it); Bloodborne's
+    // projection is not infinite, and an infinite far linearised FG's depth wrongly
+    // (KYTY_FSR3_FAR_INF=1: the old infinite far).
+    static const bool far_inf = EnvOn("KYTY_FSR3_FAR_INF", false);
+    const float z_far = !far_inf && std::isfinite(inputs->z_far) && inputs->z_far > z_near * 2.0f
+                            ? inputs->z_far
+                            : FLT_MAX;
     if (inputs->depth_inverted) {
-        prepare.cameraNear = FLT_MAX;
+        prepare.cameraNear = z_far;
         prepare.cameraFar = z_near;
     } else {
         prepare.cameraNear = z_near;
-        prepare.cameraFar = FLT_MAX;
+        prepare.cameraFar = z_far;
     }
     prepare.cameraFovAngleVertical =
         EnvFloat("KYTY_FSR3_FOV", inputs->fov_y > 0.0f ? inputs->fov_y : camera.fov);
