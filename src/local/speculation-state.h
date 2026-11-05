@@ -110,6 +110,18 @@ inline int64_t ReadOneSetVerifyEvery() {
 	static auto& every = LiveSwitch::Find("spec_read_one_set_verify", 0);
 	return every.load(std::memory_order_relaxed);
 }
+// KYTY_SPEC_WALK_FROM_STAMP (live spec_walk_from_stamp, on by default): the clean-read check's log walk tries first
+// the entry the read's latest stamp names (EffectsLog::WriteOverFromStamp), the walk from the speculation's start after.
+inline bool WalkFromStampOn() {
+	static auto& on = LiveSwitch::Find("spec_walk_from_stamp", 1);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_SPEC_COMMIT_VERIFY (live spec_commit_verify N, default 0): every Nth stamp-led walk checked by the walk from the
+// speculation's start as well (spec_commit_verified / spec_commit_mismatch).
+inline int64_t CommitVerifyEvery() {
+	static auto& every = LiveSwitch::Find("spec_commit_verify", 0);
+	return every.load(std::memory_order_relaxed);
+}
 
 // An image's barrier state as a segment found it (the commit transitions the image there first if other work moved
 // it since) and as it left it.
@@ -818,6 +830,29 @@ struct WriteStamps {
 		}
 		return false;
 	}
+	// The latest stamp over [address, address + size) later than `from` (0: none). (KYTY_SPEC_WALK_FROM_STAMP)
+	[[nodiscard]] uint64_t LatestSince(uint64_t address, uint64_t size, uint64_t from) const {
+		if (size == 0 || address >= AddressLimit || address + size > AddressLimit) return 0;
+		uint64_t   latest = 0;
+		const auto last   = (address + size - 1) >> UnitBits;
+		for (auto unit = address >> UnitBits; unit <= last;) {
+			const auto& granule = granules[unit >> LeafBits];
+			if (granule.latest <= from) {
+				unit = ((unit >> LeafBits) + 1) << LeafBits;
+				continue;
+			}
+			if (granule.coarse > from) latest = std::max(latest, granule.coarse);
+			if (granule.leaf) {
+				const auto& leaf  = *granule.leaf;
+				const auto  stamp = leaf.units[unit & ((uint64_t {1} << LeafBits) - 1)];
+				const auto  block = leaf.blocks[((unit << UnitBits) >> BlockBits) & ((uint64_t {1} << (GranuleBits - BlockBits)) - 1)];
+				if (stamp > from) latest = std::max(latest, stamp);
+				if (block > from) latest = std::max(latest, block);
+			}
+			++unit;
+		}
+		return latest;
+	}
 };
 
 // What the translation of the thread that commits does (the normal translation, holes) that a speculation translated
@@ -851,6 +886,23 @@ struct EffectsLog {
 				return &entry;
 		}
 		return nullptr;
+	}
+	// KYTY_SPEC_WALK_FROM_STAMP: a write logged from `from` on over the range: the one its latest stamp names when that
+	// one is over it (the GPU and host stamps', `stamps`), else the first (FirstWriteOver). Null: none. `direct`: the
+	// stamp's entry answered.
+	[[nodiscard]] const Entry* WriteOverFromStamp(uint64_t from, uint64_t address, uint64_t size, bool& direct) const {
+		direct = false;
+		if (const auto latest = stamps.LatestSince(address, size, from); latest != 0) {
+			const auto i = latest - 1;
+			if (i >= std::max(from, base) && i < base + entries.size()) {
+				const auto& entry = entries[i - base];
+				if (entry.kind != Kind::RetiredSet && entry.address < address + size && address < entry.address + entry.size) {
+					direct = true;
+					return &entry;
+				}
+			}
+		}
+		return FirstWriteOver(from, address, size);
 	}
 	// The first GPU write logged from `from` on over the range (null: none).
 	[[nodiscard]] const Entry* FirstGpuWriteOver(uint64_t from, uint64_t address, uint64_t size) const {

@@ -1487,6 +1487,8 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	m_scheduler.Finish();
 	m_lod_stats_buffer.Invalidate(0, 256 * 16);
 	auto* words = reinterpret_cast<uint32_t*>(m_lod_stats_buffer.Mapped().data());
+	// (The report is a guest memory write of the emulator's: logged for the speculations that read it, upstream #288 F4.)
+	Spec::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size);
 	std::memset(dst, 0, size);
 	const uint32_t ready = 1;
 	std::memcpy(dst, &ready, sizeof(ready));

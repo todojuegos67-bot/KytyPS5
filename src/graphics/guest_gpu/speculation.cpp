@@ -834,6 +834,13 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 	return nullptr;
 }
 
+// KYTY_SPEC_COMMIT_VERIFY: whether this one is the Nth (the thread that commits).
+static bool CommitVerifyDue() {
+	static uint64_t count = 0;
+	const auto      every = Spec::CommitVerifyEvery();
+	return every > 0 && ++count % static_cast<uint64_t>(every) == 0;
+}
+
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
 	auto&       scheduler = m_renderer.GetCommandScheduler();
 	const auto& state     = result.state;
@@ -872,13 +879,30 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			// (Stamped: a page written since is a candidate, the log's entries since over the read decide.)
 			const bool any_since = m_log.End() > result.effects_from;
 			if (effects.stamped) {
-				if (any_since)
+				// (KYTY_SPEC_WALK_FROM_STAMP: the walk tries the entry the read's latest stamp names first;
+				// KYTY_SPEC_COMMIT_VERIFY: every Nth such walk, the walk from the speculation's start as well.)
+				if (any_since) {
+					const bool from_stamp = Spec::WalkFromStampOn();
 					for (size_t i = from.clean_reads; i < to.clean_reads; ++i) {
 						const auto& read = state.clean_reads[i];
-						if (!m_log.stamps.MaybeSince(read.begin, read.end - read.begin, result.effects_from)) continue;
-						if (const auto* write = m_log.FirstWriteOver(result.effects_from, read.begin, read.end - read.begin))
-							return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
+						const auto  size = read.end - read.begin;
+						if (!m_log.stamps.MaybeSince(read.begin, size, result.effects_from)) continue;
+						const Spec::EffectsLog::Entry* write = nullptr;
+						if (from_stamp) {
+							bool direct = false;
+							write       = m_log.WriteOverFromStamp(result.effects_from, read.begin, size, direct);
+							if (direct) LiveCounters::Add(LiveCounters::SpecWalkDirect);
+							if (CommitVerifyDue()) {
+								const bool first = m_log.FirstWriteOver(result.effects_from, read.begin, size) != nullptr;
+								LiveCounters::Add(LiveCounters::SpecCommitVerified);
+								if (first != (write != nullptr)) LiveCounters::Add(LiveCounters::SpecCommitMismatch);
+							}
+						} else {
+							write = m_log.FirstWriteOver(result.effects_from, read.begin, size);
+						}
+						if (write != nullptr) return ++m_stop_reasons[WroteWhatItRead(write)], Progress::Stopped;
 					}
+				}
 				// (KYTY_SPEC_LATE_READS: a late read, by the processor's writes logged after it was read, and GPU work's since
 				// the speculation began: a GPU write is logged as its work is recorded, before it reaches memory, and its
 				// page's read protection may be deferred, PageManager::DeferReadProtection.)
@@ -1062,8 +1086,8 @@ void Speculation::After(Result& result, size_t index) {
 		use.image->backing.state              = use.left;
 		use.image->backing.subresource_states = std::move(use.left_subresources);
 		use.image->transit_group              = use.left_group;
+		MoveImageStateEpoch(use.image); // (KYTY_TABLE_SERIALS: the image's serial moves, and the epoch)
 	}
-	if (!state.closed[index].images.empty()) MoveImageStateEpoch();
 	// KYTY_SPEC_TOUCH_BATCH (live spec_touch_batch, default on): one lock for the segment's images (~0.4 ms a frame of
 	// LRU touches at 1-1 were taken image by image); 0: one by one, as before.
 	static auto& touch_batch = LiveSwitch::Find("spec_touch_batch", 1);
