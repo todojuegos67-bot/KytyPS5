@@ -326,14 +326,14 @@ bool Runtime::BBBlitScaled(VideoCore::Image* src, VideoCore::Image* dst) {
         dst->info.num_samples != 1) {
         return false;
     }
-    const auto features = instance.GetFormatFeatureFlags(src->info.pixel_format);
-    if (!(features & vk::FormatFeatureFlagBits2::eBlitSrc) ||
-        !(features & vk::FormatFeatureFlagBits2::eBlitDst)) {
+    const vk::Format fmt = src->info.pixel_format;
+    if (!instance.IsFormatSupported(fmt, vk::FormatFeatureFlagBits2::eBlitSrc |
+                                             vk::FormatFeatureFlagBits2::eBlitDst)) {
         return false;
     }
     const bool depth = src->info.props.is_depth;
     const bool linear =
-        !depth && (features & vk::FormatFeatureFlagBits2::eSampledImageFilterLinear);
+        !depth && instance.IsFormatSupported(fmt, vk::FormatFeatureFlagBits2::eSampledImageFilterLinear);
     const vk::ImageAspectFlags aspect = src->aspect_mask & dst->aspect_mask;
     const u32 layers = std::min(src->info.resources.layers, dst->info.resources.layers);
     vk::ImageBlit region{};
