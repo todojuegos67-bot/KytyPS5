@@ -942,11 +942,51 @@ void AddSceneTarget(VAddr addr) {
     for (u32 i = 0; i < n; ++i) {
         if (g_ss_addrs[i] == addr) return;
     }
+    bool after_upscale = false, flip = false;
+    {
+        std::scoped_lock lk{g_mutex};
+        after_upscale = g_frame.injected;
+        flip = IsFlip(addr);
+    }
+    // 0.72 native chain guard. With BB_SCENE_UPSCALE=native everything after the upscaler is at
+    // the output size by design. An output-size target bound together with a scaled scene target
+    // (the scene depth) after the upscaler ran in the frame, or a flip buffer, is part of that
+    // output chain: scaling it (0.71) put the game's final image at the internal size, which the
+    // game then read at output-size pixel positions (11-05 03:19 run: the frame in the top-left
+    // 1/1.5 of the window, the 3D a flat colour, while the 300-frame check still saw the upscaler
+    // run and kept it). The scene scaling is turned off for the session instead (the targets come
+    // back at the full size and the upscaler runs at the output size, as with the safety net).
+    // BB_SCENE_NATIVE_MIXED=scale: the 0.71 behaviour (scaled too), for diagnosis.
+    static const bool mixed_scale = [] {
+        const char* v = std::getenv("BB_SCENE_NATIVE_MIXED");
+        return v != nullptr && std::string_view{v} == "scale";
+    }();
+    if (BB::ResPatch::NativeChain() && (after_upscale || flip) && !mixed_scale) {
+        g_ss_off.store(true, std::memory_order_relaxed);
+        Checkpoint(fmt::format(
+            "WARNING: native chain: {:#x} ({}x{}, {}) bound with the internal-size scene targets "
+            "{}: it belongs to the output-size chain, so it is not scaled; scene upscale turned "
+            "OFF for this session (the scene targets back at the full size, the upscaler at the "
+            "output size). BB_SCENE_NATIVE_MIXED=scale keeps the 0.71 behaviour",
+            addr, g_ss_w, g_ss_h, flip ? "a flip buffer" : "output-size target",
+            after_upscale ? "after the upscaler ran this frame" : "(flip buffer)"));
+        LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] native chain: output target {:#x} bound with "
+                    "scaled scene targets; scene upscale turned off", addr);
+        return;
+    }
     g_ss_addrs[n] = addr;
     g_ss_count.store(n + 1, std::memory_order_release);
     Checkpoint(fmt::format("scene upscale: {:#x} ({}x{}) bound with scaled targets, scaled too "
                            "({} scene targets)",
                            addr, g_ss_w, g_ss_h, n + 1));
+    if (BB::ResPatch::NativeChain()) {
+        Checkpoint(fmt::format("native chain: {:#x} {}", addr,
+                               after_upscale || flip
+                                   ? "bound after the upscaler ran / a flip buffer: scaled anyway "
+                                     "(BB_SCENE_NATIVE_MIXED=scale)"
+                                   : "bound before the upscaler ran this frame (scene chain): "
+                                     "scaled"));
+    }
 }
 
 bool SceneScale(u32& guest_w, u32& guest_h, u32& host_w, u32& host_h) {
@@ -1886,10 +1926,17 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
     p.jitter[1] = jitter_on ? g_jitter[1] : 0.0f;
     LogRtShadowCamera(p);
+    const bool chain = !scene && g_ss_frozen.load(std::memory_order_relaxed) &&
+                       !g_ss_off.load(std::memory_order_relaxed) && width == g_ss_sw &&
+                       height == g_ss_sh;
     LogPoint(fmt::format(
         "injection point: {} mode, source {:#x} {}x{} {} ({}), depth {:#x}, output {}x{}, "
         "after {} earlier sample(s) of it, motion vectors {}, depth {}",
-        scene ? "scene (pre-post HDR)" : "composite (post-tonemap)", addr, width, height,
+        scene   ? "scene (pre-post HDR)"
+        : chain ? "native chain (scene targets at the internal size, upscaled where "
+                  "post-processing first reads the scene colour)"
+                : "composite (post-tonemap)",
+        addr, width, height,
         vk::to_string(format), p.hdr ? "HDR" : "LDR", p.depth_addr, p.output_w, p.output_h,
         g_learned.skip, p.camera_valid ? "reconstructed (camera found)" : "zero (no camera)",
         p.depth_inverted ? "inverted" : "forward"));
@@ -2408,10 +2455,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             }
             g_ss_count.store(count, std::memory_order_release);
             g_ss_frozen.store(true, std::memory_order_release);
-            Checkpoint(fmt::format("scene upscale (BB_SCENE_UPSCALE=1): {} scene targets of {}x{} "
+            Checkpoint(fmt::format("scene upscale (BB_SCENE_UPSCALE={}): {} scene targets of {}x{} "
                                    "rendered at {}x{} (ratio {:.3f}), post-processing and HUD at "
                                    "{}x{}:{}",
-                                   count, g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, ratio, width,
+                                   BB::ResPatch::NativeChain() ? "native" : "shrink", count,
+                                   g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, ratio, width,
                                    height, list));
         }
         if (!g_ss_frozen.load(std::memory_order_relaxed) && f.gb_depth != 0 &&

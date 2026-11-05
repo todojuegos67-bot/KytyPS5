@@ -229,7 +229,8 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
 // BB object motion vectors (bb_objmv.h): the motion parameters of a G-buffer draw.
 static void BBObjMotionDraw(const Instance& instance, Shader::PushData& push,
                             const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
-                            bool is_indexed, u32 index_offset, bool indirect) {
+                            bool is_indexed, u32 index_offset, bool indirect, float scale_x,
+                            float scale_y) {
     BB::ObjMotion::EnsureInit(instance);
     const auto& key = pipeline.GetGraphicsKey();
     const bool motion = BB::ObjMotion::IsMotionKey(
@@ -237,6 +238,10 @@ static void BBObjMotionDraw(const Instance& instance, Shader::PushData& push,
     if (!motion) {
         return;
     }
+    // Object vectors in the pixels the G-buffer is really drawn at (internal size when the scene
+    // targets are scaled); motion draws never take the clip-disabled path that reads these too.
+    push.xscale *= scale_x;
+    push.yscale *= scale_y;
     const auto& vs_info = pipeline.GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline.GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
@@ -300,7 +305,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
-    BBObjMotionDraw(instance, push_data, *pipeline, regs, is_indexed, index_offset, false);
+    BBObjMotionDraw(instance, push_data, *pipeline, regs, is_indexed, index_offset, false,
+                    bb_rt_scale_x, bb_rt_scale_y);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -374,7 +380,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
-    BBObjMotionDraw(instance, push_data, *pipeline, liverpool->regs, is_indexed, 0, true);
+    BBObjMotionDraw(instance, push_data, *pipeline, liverpool->regs, is_indexed, 0, true,
+                    bb_rt_scale_x, bb_rt_scale_y);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);

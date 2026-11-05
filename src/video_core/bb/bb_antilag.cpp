@@ -94,6 +94,15 @@ UpdateFn              g_update = nullptr;
 FeaturesAmd           g_features {};
 std::atomic<uint64_t> g_input_index {0};   // the last frame index marked INPUT
 std::atomic<uint64_t> g_tagged_index {0};  // the last index a flip took
+std::atomic<uint64_t> g_render_index {0};  // the last index whose render submission was marked
+// Claims frame `index`'s SIMULATION_END / RENDERSUBMIT_START (the first of the game's GPU submit and its flip).
+bool ClaimRenderStart(uint64_t index) {
+	uint64_t seen = g_render_index.load(std::memory_order_acquire);
+	while (seen < index) {
+		if (g_render_index.compare_exchange_weak(seen, index, std::memory_order_acq_rel)) return true;
+	}
+	return false;
+}
 std::atomic<uint64_t> g_flips {0};         // flips reserved
 std::atomic<uint64_t> g_flips_at_input {~uint64_t {0}};
 std::atomic<uint64_t> g_presented {0};     // the last index presented
@@ -324,6 +333,7 @@ double  LatTicksPerMs();
 struct StageStamp {
 	std::atomic<uint64_t> index {0};
 	std::atomic<int64_t>  input {0}, reserve {0}, ready {0}, release {0};
+	std::atomic<int64_t>  render {0}; // 0.71: the game's first GPU submit of the frame (0: none before its flip)
 	std::atomic<int64_t>  slot {0};      // KYTY_PAD_LATE_MS: the flip slot the read was placed against (0: not paced)
 	std::atomic<double>   slept {0.0};   // KYTY_PAD_LATE_MS: ms slept before the read
 };
@@ -621,6 +631,8 @@ struct LatWindow {
 	std::vector<double> ms;
 	double              st_sum[4] {};
 	uint32_t            st_n = 0;
+	double              loop_sum[2] {}; // 0.71: input -> first GPU submit, first GPU submit -> flip
+	uint32_t            loop_n = 0;
 	int64_t             start = 0, first_present = 0, last_present = 0;
 	uint32_t            presents = 0;
 } g_lat;
@@ -699,6 +711,12 @@ void OnPresented(uint64_t frame_index) {
 			g_lat.st_sum[2] += static_cast<double>(rl - rd) / per_ms;
 			g_lat.st_sum[3] += static_cast<double>(now - rl) / per_ms;
 			g_lat.st_n++;
+			const int64_t rn = st->render.load();
+			if (rn >= in && rn <= rs) {
+				g_lat.loop_sum[0] += static_cast<double>(rn - in) / per_ms;
+				g_lat.loop_sum[1] += static_cast<double>(rs - rn) / per_ms;
+				g_lat.loop_n++;
+			}
 		}
 	}
 	if (g_lat.presents == 0) g_lat.first_present = now;
@@ -751,6 +769,16 @@ void OnPresented(uint64_t frame_index) {
 			std::fflush(stdout);
 		}
 	}
+	if (g_lat.loop_n > 0) {
+		const double d = static_cast<double>(g_lat.loop_n);
+		BB::FG::Printf("[reflex] game loop: simulation (input -> first GPU submit) %.1f ms, render submit (-> flip) %.1f ms, "
+		               "markers at those points in %u of %u frames; mode %s\n",
+		               g_lat.loop_sum[0] / d, g_lat.loop_sum[1] / d, g_lat.loop_n, g_lat.st_n,
+		               LatModeName(g_mode.load(std::memory_order_relaxed)));
+		std::fflush(stdout);
+	}
+	for (double& x : g_lat.loop_sum) x = 0.0;
+	g_lat.loop_n = 0;
 	for (double& x : g_lat.st_sum) x = 0.0;
 	g_lat.st_n = 0;
 	v.clear();
@@ -998,6 +1026,7 @@ void OnInput(const char* site) {
 		st.slot.store(pad_slot, std::memory_order_relaxed);
 		st.slept.store(pad_slept, std::memory_order_relaxed);
 		st.reserve.store(0, std::memory_order_relaxed);
+		st.render.store(0, std::memory_order_relaxed);
 		st.ready.store(0, std::memory_order_relaxed);
 		st.release.store(0, std::memory_order_relaxed);
 		st.input.store(LatNow(), std::memory_order_relaxed);
@@ -1020,12 +1049,25 @@ uint64_t OnFlipReserved() {
 	if (index == 0 || tagged >= index) return 0;
 	if (!g_tagged_index.compare_exchange_strong(tagged, index, std::memory_order_acq_rel)) return 0;
 	if (auto* st = StageFor(index)) st->reserve.store(LatNow(), std::memory_order_relaxed);
-	if (g_mode.load(std::memory_order_relaxed) == Mode::Reflex) {
-		// The game's CPU frame ends at its flip; the emulator's translation and submission of it follow.
+	if (ClaimRenderStart(index) && g_mode.load(std::memory_order_relaxed) == Mode::Reflex) {
+		// No GPU submit seen between the frame's controller read and its flip: its simulation ends here.
 		ReflexMarker(VK_LATENCY_MARKER_SIMULATION_END_NV, index);
 		ReflexMarker(VK_LATENCY_MARKER_RENDERSUBMIT_START_NV, index);
 	}
 	return index;
+}
+
+void OnRenderSubmit() {
+	const Mode mode = g_mode.load(std::memory_order_relaxed);
+	if (mode == Mode::Off && !LatencyOn()) return;
+	const uint64_t index = g_input_index.load(std::memory_order_acquire);
+	if (index == 0 || g_tagged_index.load(std::memory_order_acquire) >= index) return;
+	if (!ClaimRenderStart(index)) return;
+	if (auto* st = StageFor(index)) st->render.store(LatNow(), std::memory_order_relaxed);
+	if (mode == Mode::Reflex) {
+		ReflexMarker(VK_LATENCY_MARKER_SIMULATION_END_NV, index);
+		ReflexMarker(VK_LATENCY_MARKER_RENDERSUBMIT_START_NV, index);
+	}
 }
 
 void OnPresent(uint64_t frame_index) {
@@ -1098,6 +1140,31 @@ void OnSwapchain(VkSwapchainKHR swapchain, bool fsr3) {
 		BB::FG::Printf("Anti-Lag: vkSetLatencySleepModeNV failed (%d): Reflex off for this swapchain\n", static_cast<int>(result));
 		std::fflush(stdout);
 	}
+}
+
+void SetGameInterval(double interval_ms) {
+	if (!ReflexActive()) return;
+	static const bool on = [] {
+		const char* v = BB::FG::Env("KYTY_REFLEX_GAME_LIMIT");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!on) return;
+	const uint32_t us = interval_ms > 0.0 && interval_ms < 200.0 ? static_cast<uint32_t>(interval_ms * 1000.0 * 0.995) : 0u;
+	static uint32_t applied = 0;
+	static VkSwapchainKHR applied_swapchain = VK_NULL_HANDLE;
+	std::lock_guard lock(g_reflex_mutex);
+	if (g_swapchain == VK_NULL_HANDLE || (us == applied && g_swapchain == applied_swapchain)) return;
+	VkLatencySleepModeInfoNV info {};
+	info.sType             = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
+	info.lowLatencyMode    = VK_TRUE;
+	info.lowLatencyBoost   = VK_FALSE;
+	info.minimumIntervalUs = us;
+	const VkResult result  = g_sleep_mode(g_device, g_swapchain, &info);
+	applied                = us;
+	applied_swapchain      = g_swapchain;
+	BB::FG::Printf("[reflex] frame limit from the game's flip interval: %.2f ms -> minimumIntervalUs %u (%s)\n", interval_ms, us,
+	               result == VK_SUCCESS ? "set" : "vkSetLatencySleepModeNV failed");
+	std::fflush(stdout);
 }
 
 void AfterPresent(uint64_t frame_index) {

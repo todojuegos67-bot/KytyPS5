@@ -17,6 +17,20 @@
 // pass (bb_objmv.comp) puts the object vectors over the camera ones in the shared MV image, so
 // DLSS / FSR / XeSS and FSR 3 FG / DLSS-G all get them.
 //
+// 0.71: rigid objects without a bone palette (doors, lifts, carriages, thrown props) are tracked
+// the same way when their own vertex constants (16..1024 bytes, not the scene block: their object
+// transform) changed since the previous frame; static objects keep the exact camera motion. When
+// most draws change every frame (the camera is inside the per-draw constants) rigid tracking
+// pauses, since the camera motion is exact for those. BB_OBJMV_RIGID=0 turns this part off.
+//
+// Where the vectors come from (nothing is estimated from the final image):
+//  - camera: current and previous view-projection from the game's 864-byte scene constant block
+//    (bb_upscale.cpp BlockCamera, read from the G-buffer draws' vertex constants), turned into
+//    clip_to_prev_clip (FillCamera) and applied per pixel to the G-buffer depth (bb_mv.comp).
+//  - objects: the vertex shader's own clip position this frame and last frame for the same draw
+//    and vertex (emit_spirv_bb_objmv.cpp), written per pixel by the G-buffer pass itself
+//    (attachment 7) and put over the camera vectors (bb_objmv.comp, Compose).
+//
 // BB_OBJMV=0 turns it off (camera-only motion, as up to 0.24).
 
 #pragma once

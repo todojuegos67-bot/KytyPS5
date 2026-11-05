@@ -246,6 +246,29 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->Present(req.frame);
     BB::FG::SetPresentSlot({});
     BB::AntiLag::AfterPresent(lat_index);
+    if (BB::AntiLag::ReflexActive() && req.frame != nullptr) {
+        const int vblanks = req.port->flip_rate + 1;
+        double game_ms =
+            vblanks > 1 ? 1000.0 / EmulatorSettings.GetVblankFrequency() * vblanks : 0.0;
+        // 0.72 one limiter: when the frame generation pacer (PaceGuestFlip, BB_FG_PACE=guest)
+        // already holds the flips to an interval at least as long as the game's own, it stays the
+        // only limit (0.70 pacing and the FSR 3 midpoint slots unchanged) and Reflex gets no
+        // minimum interval; otherwise the pacer never waits and Reflex holds the game's cadence.
+        const double pace_ms = BB::FG::PacerIntervalMs();
+        const bool pacer_holds = pace_ms > 0.0 && game_ms > 0.0 && pace_ms >= game_ms * 0.995;
+        static int said = -1;
+        if (game_ms > 0.0 && static_cast<int>(pacer_holds) != said) {
+            said = pacer_holds ? 1 : 0;
+            BB::FG::Printf("[reflex] one limiter: %s (game flip interval %.2f ms, pacer grid %.2f ms)",
+                           pacer_holds ? "the frame generation pacer holds the flips; Reflex game limit off"
+                                       : "Reflex holds the game's flip interval; the pacer grid is shorter",
+                           game_ms, pace_ms);
+        }
+        if (pacer_holds) {
+            game_ms = 0.0;
+        }
+        BB::AntiLag::SetGameInterval(game_ms);
+    }
     if (BB::AntiLag::PaceOn() || BB::AntiLag::PhaseOn() || BB::AntiLag::PadLateOn()) {
         // KYTY_LOWLAT pacing / Anti-Lag+ pad late (the DS videoOut rule): the game's own flip
         // interval (flip rate + 1 vblanks) when it is above one vblank, else 0 (the pacing off).

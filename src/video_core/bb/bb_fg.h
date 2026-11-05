@@ -123,6 +123,9 @@ uint32_t GuestFlip();
 // flip submit (simulation end, render submit start), with KYTY_DLSSG_REFLEX_GAME (default on).
 void GameInput();
 void GameFlipReserved();
+// 0.71: the game submits GPU work (gnmdriver): the first submit after its controller read marks
+// SIMULATION_END / RENDERSUBMIT_START (the flip only when no submit came first).
+void GameRenderSubmit();
 // Before BeforePresent: the guest frame index of the frame presented (0: a repeat or none).
 void SetPresentIndex(uint32_t index);
 // The game's flip submit (VideoOut): holds the real frames to the frame generation limit there
@@ -137,6 +140,8 @@ PresentSlot PaceGuestFlip();
 void SetPresentSlot(PresentSlot slot);
 PresentSlot PresentSlotNow();
 bool GuestPacing();
+// 0.72: the interval PaceGuestFlip holds the game's flips to now (ms; 0: not pacing).
+double PacerIntervalMs();
 // bb-pace-049 (BB_PACE_FIX, default on; 0: the bb-cap-044 pacer): a late flip released at once
 // and the grid re-phased from it, a high-resolution wait, the [pace] line, BB_FPS_CAP=auto.
 bool PaceFix();
