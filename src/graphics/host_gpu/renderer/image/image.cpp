@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
+#include "live-counters.h"
 #include "live-trace.h"
 
 #include <vulkan/vulkan_format_traits.hpp>
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <xxhash.h>
 
 extern "C" {
@@ -178,7 +180,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 		if (all) return barriers;
 	}
 	const StateLock lock(*this);
-	MoveImageStateEpoch();
+	MoveImageStateEpoch(this);
 	auto&      state                  = backing.state;
 	auto&      subresource_states     = backing.subresource_states;
 	auto&      group                  = transit_group;
@@ -260,7 +262,7 @@ const VulkanImageState& Image::CurrentState() const {
 void Image::RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
                          vk::CommandBuffer command_buffer) {
 	const StateLock       lock(*this);
-	MoveImageStateEpoch();
+	MoveImageStateEpoch(this);
 	thread_local Barriers barriers;
 	barriers.clear();
 	const auto add = [&](const VulkanImageState& from, const VulkanImageState& to, uint32_t level, uint32_t levels,
@@ -304,8 +306,30 @@ uint64_t ImageStateEpoch() noexcept {
 	return g_image_state_epoch.load(std::memory_order_acquire);
 }
 
-void MoveImageStateEpoch() noexcept {
+namespace ImageSerials {
+std::atomic<std::atomic<uint64_t>*> g_chunks[Chunks] {};
+std::atomic<uint64_t>               g_unattributed {0};
+std::atomic<bool>                   g_on {false};
+std::atomic<uint64_t>               g_beyond {0};
+
+void Ensure(uint32_t slot) {
+	static std::mutex lock;
+	if ((slot >> ChunkBits) >= Chunks) return; // (beyond the table: no chunk; Read gives a new value each time, Move nothing)
+	auto& chunk = g_chunks[slot >> ChunkBits];
+	if (chunk.load(std::memory_order_acquire) != nullptr) return;
+	const std::lock_guard guard(lock);
+	if (chunk.load(std::memory_order_acquire) == nullptr) chunk.store(new std::atomic<uint64_t>[ChunkSize] {}, std::memory_order_release);
+}
+} // namespace ImageSerials
+
+void MoveImageStateEpoch(const Image* image) noexcept {
 	g_image_state_epoch.fetch_add(1, std::memory_order_acq_rel);
+	// (An image not inserted yet is in no state or set: its slot's entry moves as it is inserted.)
+	if (image != nullptr) ImageSerials::Move(image->serial_slot);
+	else {
+		ImageSerials::g_unattributed.fetch_add(1, std::memory_order_acq_rel);
+		LiveCounters::Add(LiveCounters::SerialsUnattributed);
+	}
 }
 
 void BeginTransitGroup() noexcept {
