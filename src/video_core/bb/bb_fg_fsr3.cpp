@@ -632,6 +632,13 @@ bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* o
         }
         logged = true;
     }
+    if (info.imageExtent.width == 0 || info.imageExtent.height == 0) {
+        // (bb-dlssg-085: Swapchain::Create waits for a size; a 0x0 context never recovered.)
+        Printf("FSR3 FG: swapchain %ux%u refused: no frame generation swapchain at a zero size",
+               info.imageExtent.width, info.imageExtent.height);
+        g_swapchain_context = nullptr;
+        return false;
+    }
     const auto result = g_ffx.CreateContext(&g_swapchain_context, &create.header, nullptr);
     if (result != FFX_API_RETURN_OK || swapchain == VK_NULL_HANDLE) {
         Printf("FSR3 FG: frame generation swapchain not created (%u): frame generation off", result);
@@ -657,6 +664,14 @@ bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* o
     }
     Printf("FSR3 FG: frame generation swapchain %ux%u (present mode %d)", info.imageExtent.width,
            info.imageExtent.height, static_cast<int>(info.presentMode));
+    {
+        static bool had_one = false;
+        if (had_one) {
+            Printf("FSR3 FG: resumed after swapchain recreate %ux%u (generation context made "
+                   "again with the first 3D frame)", info.imageExtent.width, info.imageExtent.height);
+        }
+        had_one = true;
+    }
     *out = swapchain;
     return true;
 }

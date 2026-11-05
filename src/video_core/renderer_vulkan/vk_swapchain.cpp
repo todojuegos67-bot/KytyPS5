@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
+#include <thread>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -43,6 +45,24 @@ void Swapchain::Create(u32 width_, u32 height_) {
     Destroy();
 
     SetSurfaceProperties();
+    // bb-dlssg-085: a minimized window reports a 0x0 surface. A swapchain (and FSR 3's frame
+    // interpolation swapchain and generation context built on it) made at 0x0 stays 0x0 after the
+    // window is restored: the window's size had not changed, so nothing recreated it, and
+    // "render size larger than the backbuffer" every frame (18:39 run: generation on 0 of 83 from
+    // then on). Wait until the surface has a size.
+    if (extent.width == 0 || extent.height == 0) {
+        LOG_WARNING(Render_Vulkan, "swapchain: the surface is {}x{} (window minimized): waiting for a size",
+                    extent.width, extent.height);
+        BB::FG::Printf("swapchain: the surface is %ux%u (window minimized): not created until it has "
+                       "a size", extent.width, extent.height);
+        for (int i = 0; i < 2400 && (extent.width == 0 || extent.height == 0); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            SetSurfaceProperties();
+        }
+        BB::FG::Printf("swapchain: the surface is %ux%u again", extent.width, extent.height);
+        extent.width = std::max(extent.width, 1u);
+        extent.height = std::max(extent.height, 1u);
+    }
 
     const std::array queue_family_indices = {
         instance.GetGraphicsQueueFamilyIndex(),
