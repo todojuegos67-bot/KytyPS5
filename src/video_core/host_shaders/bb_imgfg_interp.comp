@@ -26,7 +26,7 @@ layout(binding = 5) uniform sampler2D bfinal_tex; // the current real backbuffer
 layout(binding = 6) uniform sampler2D lum_a;      // half resolution luma, previous (texelFetch)
 layout(binding = 7) uniform sampler2D lum_b;
 layout(binding = 8, rgba8) uniform writeonly image2D mid_img;
-layout(std430, binding = 12) buffer Stats { uint stats[4]; };
+layout(std430, binding = 12) buffer Stats { uint stats[8]; };
 
 layout(push_constant) uniform Push {
     ivec4 size;   // width, height, half width, half height
@@ -37,6 +37,8 @@ layout(push_constant) uniform Push {
 shared uint s_incons;
 shared uint s_hud;
 shared uint s_total;
+shared uint s_lum_out;
+shared uint s_lum_real;
 
 vec3 Tap(sampler2D t, vec2 pos, vec2 isz) {
     return textureLod(t, pos * isz, 0.0).rgb;
@@ -47,6 +49,8 @@ void main() {
         s_incons = 0u;
         s_hud = 0u;
         s_total = 0u;
+        s_lum_out = 0u;
+        s_lum_real = 0u;
     }
     barrier();
     ivec2 x = ivec2(gl_GlobalInvocationID.xy);
@@ -107,7 +111,8 @@ void main() {
         vec3 col_b = mix(a_b, b_b, t);
         vec3 fused = (kf * col_f + kb * col_b) / max(kf + kb, 1e-4);
         float conf = clamp(max(kf, kb) * p.p0.w, 0.0, 1.0);
-        vec3 fallback = Tap(b_tex, pc, isz);
+        vec3 fallback0 = Tap(b_tex, pc, isz);
+        vec3 fallback = fallback0;
         if (p.p1.y > 0.5) {
             fallback = t >= 0.5 ? b_b : a_f;
         }
@@ -120,6 +125,8 @@ void main() {
 
         if (p.p1.z > 0.5) {
             atomicAdd(s_total, 1u);
+            atomicAdd(s_lum_out, uint(dot(clamp(outc, 0.0, 1.0), vec3(0.299, 0.587, 0.114)) * 255.0));
+            atomicAdd(s_lum_real, uint(dot(fallback0, vec3(0.299, 0.587, 0.114)) * 255.0));
             if (conf < 0.5) {
                 atomicAdd(s_incons, 1u);
             }
@@ -133,5 +140,7 @@ void main() {
         atomicAdd(stats[0], s_incons);
         atomicAdd(stats[1], s_hud);
         atomicAdd(stats[2], s_total);
+        atomicAdd(stats[3], s_lum_out);
+        atomicAdd(stats[4], s_lum_real);
     }
 }

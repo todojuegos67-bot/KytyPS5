@@ -149,6 +149,8 @@ struct G {
     std::atomic<bool> generating{false};
     Stats stats{};
     int acquire_fail = 0;
+    int selftest_left = 3;
+    bool zero_logged = false;
 };
 
 G g;
@@ -508,7 +510,7 @@ void Dispatch(vk::CommandBuffer cmd, vk::Pipeline pipe, std::initializer_list<Bi
     }
     vk::DescriptorBufferInfo bi{};
     if (slot != UINT32_MAX) {
-        bi = vk::DescriptorBufferInfo{g.stats_buffer, static_cast<vk::DeviceSize>(slot) * kStatsStride, 16};
+        bi = vk::DescriptorBufferInfo{g.stats_buffer, static_cast<vk::DeviceSize>(slot) * kStatsStride, 32};
         writes[n] = vk::WriteDescriptorSet{
             .dstBinding = 12,
             .descriptorCount = 1,
@@ -585,6 +587,21 @@ void Collect(uint32_t slot) {
     g.stats.incons += c[0];
     g.stats.hud += c[1];
     g.stats.total += c[2];
+    // Self-test of the first generated frames: size and a checksum (the summed luma of the output
+    // and of the real frame, 0-255 per pixel); a black or empty output turns the mode off.
+    if (g.selftest_left > 0 && c[2] > 0) {
+        --g.selftest_left;
+        const double out_mean = static_cast<double>(c[3]) / c[2];
+        const double real_mean = static_cast<double>(c[4]) / c[2];
+        BBLogf("[imgfg] self-test: generated frame %ux%u, %u pixels, checksum %u, mean luma %.2f (real frame %.2f)",
+               g.w, g.h, c[2], c[3], out_mean, real_mean);
+        if (c[2] != g.w * g.h || (real_mean > 4.0 && out_mean < 0.3 * real_mean)) {
+            BBLogf("[imgfg] self-test failed: the generated frame is empty or the wrong size: image frame "
+                   "generation off, plain present");
+            g.failed = true;
+            g.generating = false;
+        }
+    }
     // The HUD-less image is only trusted while the backbuffer and it agree: a mask over most of the
     // picture means they are not the same encoding (or the frame is not what it claims to be).
     if (g.last_used_hudless && c[2] > 0) {
@@ -699,6 +716,17 @@ void NoteFrame(bool new_game_frame, const BB::FG::Inputs* inputs, vk::Extent2D b
 
 bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
     if (!Parse() || !g.ready_device || g.failed || !g.note.new_frame) return false;
+    if (in.extent.width < 64 || in.extent.height < 64 || !in.swapchain || !in.image) {
+        if (!g.zero_logged) {
+            g.zero_logged = true;
+            BBLogf("[imgfg] the swapchain is %ux%u (not ready): plain present until it has a size",
+                   in.extent.width, in.extent.height);
+        }
+        g.have_prev = false;
+        g.grid_valid = false;
+        g.generating = false;
+        return false;
+    }
     const auto entry = Clock::now();
     if (in.format != vk::Format::eR8G8B8A8Unorm && in.format != vk::Format::eB8G8R8A8Unorm) {
         BBLogf("[imgfg] the swapchain format %s is not 8-bit RGBA / BGRA: image frame generation off",
@@ -719,6 +747,7 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
             g.failed = true;
             return false;
         }
+        g.selftest_left = 3;
         BBLogf("[imgfg] resources %ux%u (flow at %ux%u, vectors %ux%u, 4 levels), swapchain format %s",
                g.w, g.h, g.lw[0], g.lh[0], g.gw[0], g.gh[0], vk::to_string(in.format).c_str());
     }
@@ -771,7 +800,10 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
                     BBLogf("[imgfg] acquiring a swapchain image for a generated frame returned %s",
                            vk::to_string(r).c_str());
                 }
-                // (a semaphore signalled by a successful acquire must still be waited on)
+                if (r == vk::Result::eErrorOutOfDateKHR || r == vk::Result::eErrorSurfaceLostKHR) {
+                    g.have_prev = false;
+                    g.grid_valid = false;
+                }
                 break;
             }
             out_index[n_out++] = index;
@@ -787,7 +819,7 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
     (void)cmd.begin(&bi);
     cmd.resetQueryPool(g.queries, slot * kStamps, kStamps);
     cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, g.queries, slot * kStamps + 0);
-    cmd.fillBuffer(g.stats_buffer, static_cast<vk::DeviceSize>(slot) * kStatsStride, 16, 0);
+    cmd.fillBuffer(g.stats_buffer, static_cast<vk::DeviceSize>(slot) * kStatsStride, 32, 0);
     {
         const vk::MemoryBarrier mb{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                                    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
@@ -1083,6 +1115,9 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
         (void)g.device.waitForFences(1, &g.fence[slot], VK_TRUE, 50'000'000ull);
         const double lag = std::chrono::duration<double>(Clock::now() - submitted).count();
         g.lag_s = g.lag_s <= 0.0 ? lag : g.lag_s + 0.1 * (lag - g.lag_s);
+        if (g.selftest_left > 0) {
+            Collect(slot);
+        }
         const auto base = entry + std::chrono::duration_cast<Clock::duration>(
                                       std::chrono::duration<double>(g.lag_s + 0.0005));
         const auto step = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(g.interval_s));
@@ -1114,7 +1149,11 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
             };
             {
                 std::lock_guard lock{Vulkan::Scheduler::submit_mutex};
-                (void)g.queue.presentKHR(&pi);
+                const auto pr = g.queue.presentKHR(&pi);
+                if (pr == vk::Result::eErrorOutOfDateKHR) {
+                    g.have_prev = false;
+                    g.grid_valid = false;
+                }
             }
             ++g.stats.generated;
         }

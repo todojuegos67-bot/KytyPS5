@@ -137,9 +137,9 @@ bool Active(u32* scene_w, u32* scene_h, u32* out_w, u32* out_h) {
 void OnEbootLoaded(uintptr_t base, u64 image_size) {
     const std::string mode = Mode();
     {
-        // 0.78: which lines of work this build carries (bb-imgfg-078 = bb-merge-075 + image frame generation).
+        // 0.81: which lines of work this build carries (bb-imgfg-078 = bb-merge-075 + image frame generation).
         const std::string features =
-            "build 0.78 (bb-imgfg-078): 0.75 + image-only frame generation (BB_FG=image-x2 / image-x3, [imgfg]). 0.75 = 0.73 native chain + 0.74 display meter/FG present. Carries: frame generation pacing of 0.70 (PaceGuestFlip grid, "
+            "build 0.81 (bb-imgfg-081): 0.78 image-only frame generation (BB_FG=image-x2 / image-x3, [imgfg]). 0.75 = 0.73 native chain + 0.74 display meter/FG present. Carries: frame generation pacing of 0.70 (PaceGuestFlip grid, "
             "FSR 3 midpoint slots kytyFfxSetPaceSlot / kytyFfxTakePaceStats, full-frame and "
             "high-res fixes) + 0.71 native chain (BB_SCENE_UPSCALE=native, viewport / MV pixels "
             "of scaled targets, BB_OBJMV_RIGID, Reflex markers at the first sceGnmSubmit, "
