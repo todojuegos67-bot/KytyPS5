@@ -817,6 +817,23 @@ void GuestGpu::ThreadRun(void* data) {
 	BdaDirtyRegions::g_translating = true;
 	LiveTrace::g_mark_thread = true;
 	InitializePerformanceSwitches();
+#if defined(__linux__)
+	// KYTY_WRITE_GUARD with the userfaultfd write watch (KYTY_UFFD_WP=1, the Steam Deck build's default unless 0;
+	// sysLinuxVirtual.cpp WriteWatchInit): the GPU thread faulted forever on a WAIT_REG_MEM label read before the menu
+	// (issue #289, the cause not found yet). The guard stays off with it.
+	if (WriteGuard::Enabled()) {
+		const char* uffd = std::getenv("KYTY_UFFD_WP");
+#if defined(KYTY_STEAM_DECK)
+		const bool watch = uffd == nullptr || uffd[0] == '\0' || uffd[0] == '1';
+#else
+		const bool watch = uffd != nullptr && uffd[0] == '1';
+#endif
+		if (watch) {
+			kyty_local_write_guard_mode.store(0, std::memory_order_relaxed);
+			std::printf("Write guard: off with the userfaultfd write watch (KYTY_UFFD_WP, issue #289)\n");
+		}
+	}
+#endif
 	AsyncUpload::g_serve_hook = [](bool serve) {
 		if (!serve) return ServeInWaits() && IsGpuThread();
 		if (!IsGpuThread() || !CommandsPending()) return false;
