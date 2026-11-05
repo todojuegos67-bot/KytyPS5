@@ -1125,6 +1125,15 @@ std::atomic<double> g_real_interval{0.0}; // the pacer's real-frame interval (0:
 bool g_fixed_cap = false;                 // fixed DLSS-G under BB_VRR_CAP_FPS
 std::atomic<uint32_t> g_presented_frames{1};
 int g_mode_set = -1; // DLSS-G last set on (1) or off (0)
+// bb-dlssg-085: recovery after the swapchain was lost (focus loss): DLSS-G is turned off and its
+// resources freed before the swapchain is destroyed, not enabled with a 0x0 backbuffer, and
+// when it keeps being on without generating (its NGX feature cannot be created: 19:07 run,
+// "NGX create feature failed 0xbad0000a" 1112 times, shown 60 / generated 0 from then on) it is
+// turned off for a second, freed, and enabled again.
+bool g_resume_pending = false;
+uint64_t g_mode_on_at = 0;
+uint32_t g_nogen_run = 0, g_reset_count = 0;
+Clock::time_point g_backoff_until{};
 uint32_t g_rx_open = 0;               // the frame begun at the last guest flip
 std::atomic<uint32_t> g_rx_present{0}; // the index BeforePresent presents next (SetPresentIndex)
 
@@ -1658,7 +1667,11 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
     }
     const sl::ViewportHandle viewport{0};
     // Menus, movies and loading screens (no 3D scene upscaled) are presented as they are.
-    const bool usable = inputs != nullptr && inputs->valid;
+    // (bb-dlssg-085: never with a 0x0 backbuffer, nor while backing off after a failed create.)
+    const bool blocked = backbuffer.width == 0 || backbuffer.height == 0 ||
+                         region.extent.width == 0 || region.extent.height == 0 ||
+                         Clock::now() < g_backoff_until;
+    const bool usable = inputs != nullptr && inputs->valid && !blocked;
     // bb-merge-082: the HUD-less image DLSS-G is given: the one at the game image's size when the
     // presenter made it (the frame is scaled into the window), else the frame's own.
     const Image& hl_image =
@@ -1791,6 +1804,10 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             Printf("DLSS-G: %s", mode_on ? "on (3D frame: depth, motion vectors, camera)"
                                          : "off (no 3D frame: menu, loading or movie)");
         }
+        if (mode_on && g_mode_set != 1) {
+            g_mode_on_at = g_presents;
+            g_nogen_run = 0;
+        }
         g_mode_set = mode_on ? 1 : 0;
         options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
         static const bool parallel = [] {
@@ -1835,7 +1852,8 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             Printf("frame generation: slDLSSGSetOptions failed (%d)", static_cast<int>(result));
         }
         g_options_set = true;
-        if (g_options_backbuffer.width != 0 && g_options_backbuffer != backbuffer) {
+        if (g_resume_pending && g_mode_set == 1) {
+            g_resume_pending = false;
             Printf("DLSS-G: resumed after swapchain recreate %ux%u (was %ux%u)", backbuffer.width,
                    backbuffer.height, g_options_backbuffer.width, g_options_backbuffer.height);
         }
@@ -2062,6 +2080,39 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
 #endif
 }
 
+// bb-dlssg-085: DLSS-G off without retaining its resources, then its viewport's resources freed
+// (slFreeResources): its NGX feature is made again when it is turned on. For a swapchain that is
+// going away (SwapchainChanging) and for the retry after a feature that was not created.
+void ReleaseForRetry() {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    if (!g_ready || g_api.dlssg_set_options == nullptr) return;
+    sl::DLSSGOptions options{};
+    options.mode = sl::DLSSGMode::eOff;
+    options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
+    options.colorWidth = options.mvecDepthWidth = g_options_backbuffer.width;
+    options.colorHeight = options.mvecDepthHeight = g_options_backbuffer.height;
+    if (g_options_format != vk::Format::eUndefined) {
+        options.colorBufferFormat = options.hudLessBufferFormat =
+            static_cast<uint32_t>(static_cast<VkFormat>(g_options_format));
+    }
+    options.mvecBufferFormat = static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT);
+    options.depthBufferFormat = static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT);
+    if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle{0}, options);
+        result != sl::Result::eOk) {
+        Printf("frame generation: slDLSSGSetOptions (off) failed (%d)", static_cast<int>(result));
+    }
+    if (auto* free_resources =
+            reinterpret_cast<PFun_slFreeResources*>(SR::Dlss::Proc("slFreeResources"))) {
+        if (const auto result = free_resources(sl::kFeatureDLSS_G, sl::ViewportHandle{0});
+            result != sl::Result::eOk) {
+            Printf("frame generation: slFreeResources (DLSS-G) failed (%d)", static_cast<int>(result));
+        }
+    }
+    g_mode_set = 0;
+    g_options_set = false;
+#endif
+}
+
 void AfterPresent() {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
     if (g_present_begin != Clock::time_point{}) {
@@ -2098,6 +2149,28 @@ void AfterPresent() {
     if (state_result == sl::Result::eOk) {
         Display::NoteStreamline(state.numFramesActuallyPresented,
                                 static_cast<uint32_t>(state.status), state.numFramesToGenerateMax);
+        // bb-dlssg-085: on and asked to generate, but nothing generated for 90 presents (after
+        // 60 settling ones): its feature was not created (a swapchain lost and made again). Off,
+        // resources freed, on again after a second; one line a second with the count.
+        if (g_mode_set == 1 && CurrentGenerate() > 0 && presents > g_mode_on_at + 60) {
+            g_nogen_run = state.numFramesActuallyPresented <= 1 ? g_nogen_run + 1 : 0;
+            if (g_nogen_run >= 90) {
+                g_nogen_run = 0;
+                ++g_reset_count;
+                static Clock::time_point last_log{};
+                const auto now_reset = Clock::now();
+                if (now_reset - last_log >= std::chrono::seconds(1)) {
+                    last_log = now_reset;
+                    Printf("DLSS-G: not generating (Streamline status 0x%x): resources freed and "
+                           "retried in 1 s (%u time(s) so far)",
+                           static_cast<uint32_t>(state.status), g_reset_count);
+                }
+                ReleaseForRetry();
+                g_backoff_until = now_reset + std::chrono::seconds(1);
+            }
+        } else if (g_mode_set != 1) {
+            g_nogen_run = 0;
+        }
     }
     // bb-dlssg-077: the Reflex latency report, a clock Streamline keeps for the real frames that is
     // not ours (see Display::NoteGpuEnds); polled every 40 presents from this thread only.
@@ -2242,19 +2315,14 @@ void KeepOff(vk::Extent2D backbuffer, vk::Format format, uint32_t image_count) {
 void SwapchainChanging() {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
     g_off_backbuffer = {};
-    if (!g_ready || g_mode_set != 1) {
+    if (!g_ready || (g_mode_set != 1 && !g_options_set)) {
         return;
     }
-    sl::DLSSGOptions options{};
-    options.mode = sl::DLSSGMode::eOff;
-    options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
-    options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
-    if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle{0}, options);
-        result != sl::Result::eOk) {
-        Printf("frame generation: slDLSSGSetOptions (off) failed (%d)", static_cast<int>(result));
-    }
-    g_mode_set = 0;
-    g_options_set = false;
+    // bb-dlssg-085: off WITHOUT eRetainResourcesWhenOff, and the viewport's resources freed (the
+    // device is idle: Swapchain::Destroy waited): the NGX feature of the old swapchain must not
+    // outlive it. It is made again by the first options set on the new one.
+    ReleaseForRetry();
+    g_resume_pending = true;
 #endif
 }
 
