@@ -3582,7 +3582,14 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                              : 1.0;
     // 0.79: the length FSR 3's ffxFsr3UpscalerGetJitterPhaseCount gives (8 * ratio^2, truncated),
     // the cycle every back end is told about; Halton(2,3) index (phase + 1), minus 0.5.
-    const u32 phases = std::clamp<u32>(static_cast<u32>(8.0 * ratio * ratio + 1e-6), 8, 64);
+    // 0.91: at ratio 1 (DLAA / native AA) an 8-phase cycle repeats every 8 frames and shows as a
+    // visible on/off shimmer (grass, foliage). Use at least 32 phases; BB_JITTER_PHASES overrides.
+    static const u32 min_phases = [] {
+        const char* v = std::getenv("BB_JITTER_PHASES");
+        const int n = v != nullptr ? std::atoi(v) : 32;
+        return static_cast<u32>(std::clamp(n, 8, 128));
+    }();
+    const u32 phases = std::clamp<u32>(static_cast<u32>(8.0 * ratio * ratio + 1e-6), min_phases, 128);
     g_jitter_phases = phases;
     g_taa_last_scene = g_taa_scene_draws;
     g_taa_last_nocam = g_taa_nocam_draws;
