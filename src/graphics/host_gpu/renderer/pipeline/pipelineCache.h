@@ -279,6 +279,9 @@ void CreateComputeLayoutInternal(GraphicContext& graphics, PipelineCache::Pipeli
                                  ComputePipelineJob& job);
 void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  const ComputePipelineJob& job, vk::PipelineCache driver_cache);
+// A pipeline creation just cost seconds: have the driver cache written to disk soon (rate limited),
+// so a run that is killed during the next long stall keeps the expensive compiles it already paid.
+void RequestDriverCacheCheckpoint();
 // Waits for the background optimized compute builds (before the device or caches are destroyed).
 void StopOptimizedComputeBuilds();
 

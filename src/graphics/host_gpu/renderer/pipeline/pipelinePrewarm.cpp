@@ -403,6 +403,37 @@ constexpr uint32_t PushSize = 128; // ShaderRecompiler::IR::NativePushConstantSi
 
 uint32_t FastCompileFlags(uint64_t words);
 
+// At most KYTY_PREWARM_BIG_THREADS (default 2) replay threads compile a module of more than
+// KYTY_FAST_COMPILE_WORDS (100,000) words at the same time.
+struct BigBuildSlot {
+	bool held = false;
+	explicit BigBuildSlot(uint32_t words) {
+		if (words <= 100000u) return;
+		static const int limit = [] {
+			const char* v = std::getenv("KYTY_PREWARM_BIG_THREADS");
+			const int   n = v != nullptr ? std::atoi(v) : 2;
+			return n > 0 ? n : 1 << 20;
+		}();
+		std::unique_lock lock(Mutex());
+		Cv().wait(lock, [&] { return Active() < limit; });
+		++Active();
+		held = true;
+	}
+	~BigBuildSlot() {
+		if (!held) return;
+		{
+			std::lock_guard lock(Mutex());
+			--Active();
+		}
+		Cv().notify_one();
+	}
+	BigBuildSlot(const BigBuildSlot&)            = delete;
+	BigBuildSlot& operator=(const BigBuildSlot&) = delete;
+	static std::mutex& Mutex() { static std::mutex m; return m; }
+	static std::condition_variable& Cv() { static std::condition_variable c; return c; }
+	static int& Active() { static int a = 0; return a; }
+};
+
 vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 	Reader         rd {p.desc};
 	const uint64_t spirv          = rd.U64();
@@ -440,6 +471,9 @@ vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 	info.layout            = layout.layout;
 	info.basePipelineIndex = -1;
 	vk::Pipeline pipeline  = nullptr;
+	// Huge modules hold hundreds of MiB of driver memory while they compile and the driver does not
+	// give it back; ten of them in flight at once were part of the 4 GiB overshoot of the VRAM guard.
+	const BigBuildSlot big_slot(module_words);
 	const auto   r = ctx.graphics->device.createComputePipelines(ctx.driver_cache, 1, &info, nullptr, &pipeline);
 	ctx.graphics->device.destroyShaderModule(module, nullptr);
 	DestroyLayout(ctx.graphics->device, layout);
@@ -693,15 +727,14 @@ bool MemoryCapReached(Context& ctx) {
 	static const uint64_t growth_cap = EnvMiB("KYTY_PREWARM_DRIVER_MB", 2048) * 1048576ull; // 0 = off
 	static const uint64_t reserve    = EnvMiB("KYTY_PREWARM_RESERVE_MB", 6144) * 1048576ull;
 	if (growth_cap == 0) return false;
-	// One heap query per 20 ms is plenty; the 10 workers share the answer.
-	static std::atomic<int64_t> last_ns {0};
-	static std::atomic<bool>    last_result {false};
-	const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                     std::chrono::steady_clock::now().time_since_epoch()).count();
-	if (now - last_ns.load(std::memory_order_relaxed) < 20'000'000) {
-		return last_result.load(std::memory_order_relaxed);
-	}
-	last_ns.store(now, std::memory_order_relaxed);
+	// The replay of a warm driver cache runs ~10,000 pipelines per second, so a 20 ms throttle meant
+	// ~10 heap queries in the whole replay and the heap overshot the cap by 2-4 GiB (second Yotei run:
+	// guard at +4.1 GiB, 8.3 GiB driver-side at the end). Query every 4th pipeline instead; the
+	// workers share the last answer in between. Once capped, it stays capped.
+	static std::atomic<uint32_t> calls {0};
+	static std::atomic<bool>     last_result {false};
+	if (last_result.load(std::memory_order_relaxed)) return true;
+	if ((calls.fetch_add(1, std::memory_order_relaxed) & 3u) != 0u) return false;
 	const auto s = ctx.graphics->SampleVram();
 	if (!s.valid) return false;
 	std::lock_guard lock(ctx.mutex);
@@ -1494,6 +1527,10 @@ thread_local bool t_async_thread = false;
 
 void MarkAsyncThread() {
 	t_async_thread = true;
+}
+
+bool OnAsyncThread() {
+	return t_async_thread;
 }
 
 void NoteRuntimeCompile(bool graphics, uint64_t ns) {

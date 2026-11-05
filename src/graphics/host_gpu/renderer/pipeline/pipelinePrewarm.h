@@ -63,6 +63,7 @@ vk::Pipeline Take(uint64_t key, bool graphics);
 void NoteRuntimeCompile(bool graphics, uint64_t ns);
 // The calling thread is a background compile thread (its compiles do not block a frame).
 void MarkAsyncThread();
+bool OnAsyncThread();
 // A shader translation (guest code -> SPIR-V) at runtime, for the stats line.
 void NoteTranslation(uint64_t ns);
 

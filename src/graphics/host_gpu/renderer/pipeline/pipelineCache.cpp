@@ -34,6 +34,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <filesystem>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -58,6 +59,11 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+
+// RequestDriverCacheCheckpoint: set by a compile that took seconds, consumed by CheckpointDriverCache.
+std::atomic<bool>    g_checkpoint_requested {false};
+std::atomic<int64_t> g_next_forced_checkpoint_ns {0};
+constexpr int64_t    ForcedCheckpointIntervalNs = 60'000'000'000ll;
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -129,6 +135,61 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+// SpirvHist: where a huge module's words go (opcode -> instructions/words, 14 largest), plus the
+// numbers that decide the driver's compile time (blocks, phis, switch targets, functions). Once per
+// permutation size, at most 96 lines; the module of the first 24 guest shaders also goes to
+// _shaderdump/ for offline analysis. Opcodes: 124 Bitcast, 169 Select, 245 Phi, 248 Label,
+// 251 Switch, 12 ExtInst, 81 CompositeExtract, 61 Load, 65 AccessChain, 87/88 ImageSample*, 54 Function.
+void LogSpirvHistogram(const char* stage_name, uint64_t shader_hash, const std::vector<uint32_t>& spirv) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen_sizes;
+	static std::unordered_set<uint64_t> dumped;
+	bool                                dump = false;
+	{
+		std::lock_guard lock(mutex);
+		if (seen_sizes.size() >= 96u || !seen_sizes.insert(shader_hash ^ (uint64_t {spirv.size()} * 0x9e3779b97f4a7c15ull)).second) return;
+		dump = dumped.size() < 24u && dumped.insert(shader_hash).second;
+	}
+	std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> by_op; // opcode -> (count, words)
+	uint64_t switch_targets = 0, functions = 0, instructions = 0;
+	for (size_t i = 5; i < spirv.size();) {
+		const uint32_t n = spirv[i] >> 16u, op = spirv[i] & 0xffffu;
+		if (n == 0u) break;
+		auto& e = by_op[op];
+		e.first++;
+		e.second += n;
+		instructions++;
+		if (op == 251u && n > 3u) switch_targets += (n - 3u) / 2u;
+		if (op == 54u) functions++;
+		i += n;
+	}
+	std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> top(by_op.begin(), by_op.end());
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+	std::string text;
+	for (size_t i = 0; i < std::min<size_t>(14, top.size()); ++i) {
+		char buf[64];
+		std::snprintf(buf, sizeof(buf), " op%u=%llu/%lluw", top[i].first,
+		              static_cast<unsigned long long>(top[i].second.first),
+		              static_cast<unsigned long long>(top[i].second.second));
+		text += buf;
+	}
+	const auto count = [&](uint32_t op) { const auto it = by_op.find(op); return it == by_op.end() ? 0ull : static_cast<unsigned long long>(it->second.first); };
+	std::printf("SpirvHist: %s hash=0x%016" PRIx64 " words=%zu instructions=%llu blocks=%llu phis=%llu functions=%llu switch_targets=%llu:%s\n",
+	            stage_name, shader_hash, spirv.size(), static_cast<unsigned long long>(instructions), count(248), count(245),
+	            static_cast<unsigned long long>(functions), static_cast<unsigned long long>(switch_targets), text.c_str());
+	std::fflush(stdout);
+	if (dump) {
+		std::error_code ec;
+		std::filesystem::create_directories("_shaderdump", ec);
+		char name[96];
+		std::snprintf(name, sizeof(name), "_shaderdump/%s_%016" PRIx64 "_%zu.spv", stage_name, shader_hash, spirv.size());
+		if (FILE* f = std::fopen(name, "wb")) {
+			std::fwrite(spirv.data(), 4, spirv.size(), f);
+			std::fclose(f);
+		}
+	}
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -401,6 +462,7 @@ struct PipelineCache::ProgramCache {
 			std::printf("SpirvSize: cs hash=0x%016" PRIx64 " words=%zu\n", options.shader_hash, spirv.size());
 			std::fflush(stdout);
 		}
+		if (spirv.size() >= 150000u) LogSpirvHistogram(stage_name, options.shader_hash, spirv);
 		const SpirvKey spirv_key = HashSpirv(spirv);
 		if (const auto found = spirv_modules.find(spirv_key); found != spirv_modules.end()) {
 			if (options.dump_ir) {
@@ -905,13 +967,27 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+void RequestDriverCacheCheckpoint() {
+	g_checkpoint_requested.store(true, std::memory_order_relaxed);
+}
+
 void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
 	MergeAsyncJobCaches();
 	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
+	const auto now    = std::chrono::steady_clock::now();
+	const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+	bool       forced = false;
+	if (g_checkpoint_requested.load(std::memory_order_relaxed) &&
+	    now_ns >= g_next_forced_checkpoint_ns.load(std::memory_order_relaxed)) {
+		g_checkpoint_requested.store(false, std::memory_order_relaxed);
+		g_next_forced_checkpoint_ns.store(now_ns + ForcedCheckpointIntervalNs, std::memory_order_relaxed);
+		forced = true;
+		PipelineCacheLog("Vulkan pipeline cache: checkpoint after an expensive compile");
+	}
+	if (forced || now >= m_next_driver_cache_save) {
 		SaveInternal(true);
 	}
 }

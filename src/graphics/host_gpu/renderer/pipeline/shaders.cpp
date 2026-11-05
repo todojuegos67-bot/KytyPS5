@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
+#include "graphics/host_gpu/renderer/pipeline/compileLog.h"
 
 #include <chrono>
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -591,6 +592,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                                 &pipeline.pipeline);
 		Prewarm::NoteRuntimeCompile(true, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                                      std::chrono::steady_clock::now() - compile_start).count()));
+		CompileLog::Note({.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count(),
+		                  .id = prewarm_key, .graphics = true, .async = Prewarm::OnAsyncThread()});
 	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
@@ -825,9 +828,31 @@ void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeli
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	// VK_EXT_pipeline_creation_feedback (core in 1.3): was this a driver-cache hit, and what did the driver spend.
+	vk::PipelineCreationFeedback feedback {};
+	vk::PipelineCreationFeedback stage_feedback {};
+	vk::PipelineCreationFeedbackCreateInfo feedback_info {};
+	feedback_info.pPipelineCreationFeedback          = &feedback;
+	feedback_info.pipelineStageCreationFeedbackCount = 1;
+	feedback_info.pPipelineStageCreationFeedbacks    = &stage_feedback;
+	info.pNext                                       = &feedback_info;
 	const auto compile_start = std::chrono::steady_clock::now();
 	const auto result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                           &pipeline.pipeline);
+	info.pNext = nullptr;
+	{
+		const auto feedback_bits = static_cast<uint32_t>(VkPipelineCreationFeedbackFlags(feedback.flags));
+		const bool valid         = (feedback_bits & 1u) != 0u; // VALID
+		const bool hit           = (feedback_bits & 2u) != 0u; // APPLICATION_PIPELINE_CACHE_HIT
+		CompileLog::Note({.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count(),
+		                  .id = job.prewarm_key, .words = job.spirv_words,
+		                  .flags = static_cast<uint32_t>(VkPipelineCreateFlags(info.flags)),
+		                  .hit = valid ? (hit ? 1 : 0) : -1, .graphics = false, .async = Prewarm::OnAsyncThread()});
+	}
+	if (const auto spent_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count();
+	    spent_ms >= 1500.0) {
+		RequestDriverCacheCheckpoint(); // a killed run must not lose this
+	}
 	Prewarm::NoteRuntimeCompile(false, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                       std::chrono::steady_clock::now() - compile_start).count()));
 	if (const auto compile_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count();
