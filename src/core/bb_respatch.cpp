@@ -123,7 +123,13 @@ bool ShrinkWanted() {
 }
 
 bool NativeChain() {
-    return Mode() == "native";
+    // 0.93: the native render chain is the default (BB_SCENE_UPSCALE unset or "auto"). It is
+    // generic: the scene's depth target, its lit HDR colour and the first pass that samples it
+    // (post-processing) are found from the GPU command stream, nothing of the game is patched. It
+    // only engages when an upscaler runs with a ratio > 1 and the game's 3D renders at its output
+    // size (bb_upscale.cpp); otherwise nothing changes. BB_SCENE_UPSCALE=0 turns it off.
+    const std::string m = Mode();
+    return m == "native" || m.empty() || m == "auto";
 }
 
 bool Active(u32* scene_w, u32* scene_h, u32* out_w, u32* out_h) {
@@ -152,9 +158,9 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
         BB::Upscale::Checkpoint(features);
         LOG_INFO(Loader, "[BB] {}", features);
     }
-    if (mode == "native") {
+    if (mode == "native" || mode.empty() || mode == "auto") {
         BB::Upscale::Checkpoint(
-            "native render chain (BB_SCENE_UPSCALE=native): the game keeps its own output size "
+            "native render chain (BB_SCENE_UPSCALE=native/auto, 0.93 default): the game keeps its own output size "
             "(the launcher's resolution patch at the window size); only its 3D scene targets are "
             "rendered at the upscaler's internal size, and the upscaler runs where post-processing "
             "first reads the scene colour, into an image at the output size");
