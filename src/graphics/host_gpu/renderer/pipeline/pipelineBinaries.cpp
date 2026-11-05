@@ -4,6 +4,7 @@
 #include "local-platform.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -50,6 +51,60 @@ PipelineBinaries::Key KeyOf(const VkPipelineBinaryKeyKHR& key) {
 	return out;
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+// KYTY_PIPELINE_KEY_THUNK=1 (default 0): vkGetPipelineKeyKHR through a thunk that keeps the callee-saved registers in its
+// own frame. NVIDIA 620.70.06 builds the global key (no create info) from 27 words in a stack buffer with room for 26:
+// the 27th, a 0/1 flag, lands on its own saved rbx, so the caller's rbx came back with its low 32 bits replaced
+// (Signature kept its result there: a SIGSEGV ~1 s into every boot, this = 0x7ffd00000000; core of 11-06, the driver's
+// global-key path and its word list read from it). The thunk restores rbx, rbp and r12-r15 from its own slots, out of
+// the driver's reach, whichever of them a driver build's overflow lands on. (Entry rsp is 8 mod 16: six pushes and 8
+// bytes make the call's alignment. Direct calls only; endbr64 for an indirect one under CET.)
+[[gnu::naked]] VkResult CallPipelineKeySaving(PFN_vkGetPipelineKeyKHR /*fn*/, VkDevice /*device*/,
+                                              const VkPipelineCreateInfoKHR* /*info*/, VkPipelineBinaryKeyKHR* /*key*/) {
+	asm("endbr64\n\t"
+	    "push %rbx\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %rbx, 0\n\t"
+	    "push %rbp\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %rbp, 0\n\t"
+	    "push %r12\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %r12, 0\n\t"
+	    "push %r13\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %r13, 0\n\t"
+	    "push %r14\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %r14, 0\n\t"
+	    "push %r15\n\t.cfi_adjust_cfa_offset 8\n\t.cfi_rel_offset %r15, 0\n\t"
+	    "sub $8, %rsp\n\t.cfi_adjust_cfa_offset 8\n\t"
+	    "mov %rdi, %rax\n\t"
+	    "mov %rsi, %rdi\n\t"
+	    "mov %rdx, %rsi\n\t"
+	    "mov %rcx, %rdx\n\t"
+	    "call *%rax\n\t"
+	    "add $8, %rsp\n\t.cfi_adjust_cfa_offset -8\n\t"
+	    "pop %r15\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %r15\n\t"
+	    "pop %r14\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %r14\n\t"
+	    "pop %r13\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %r13\n\t"
+	    "pop %r12\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %r12\n\t"
+	    "pop %rbp\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %rbp\n\t"
+	    "pop %rbx\n\t.cfi_adjust_cfa_offset -8\n\t.cfi_restore %rbx\n\t"
+	    "ret");
+}
+
+bool UseKeyThunk() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_KEY_THUNK");
+		const bool  set   = value != nullptr && value[0] == '1';
+		if (set) std::printf("Pipeline binaries: pipeline keys through the register-keeping thunk (KYTY_PIPELINE_KEY_THUNK=1)\n");
+		return set;
+	}();
+	return on;
+}
+#endif
+
+// vkGetPipelineKeyKHR (`info` null: the global key); not loaded: VK_ERROR_FEATURE_NOT_PRESENT.
+VkResult GetPipelineKey(vk::Device device, const VkPipelineCreateInfoKHR* info, VkPipelineBinaryKeyKHR* key) {
+	const auto get_key = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineKeyKHR;
+	if (get_key == nullptr) return VK_ERROR_FEATURE_NOT_PRESENT;
+#if defined(__linux__) && defined(__x86_64__)
+	if (UseKeyThunk()) return CallPipelineKeySaving(get_key, static_cast<VkDevice>(device), info, key);
+#endif
+	return get_key(device, info, key);
+}
+
 } // namespace
 
 size_t PipelineBinaries::KeyHash::operator()(const Key& key) const {
@@ -64,8 +119,7 @@ PipelineBinaries::Handles::~Handles() {
 
 std::string PipelineBinaries::Signature(vk::Device device, const std::string& device_signature) {
 	VkPipelineBinaryKeyKHR key {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineKeyKHR == nullptr ||
-	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineKeyKHR(device, nullptr, &key) != VK_SUCCESS || key.keySize == 0) {
+	if (GetPipelineKey(device, nullptr, &key) != VK_SUCCESS || key.keySize == 0) {
 		return {};
 	}
 	std::string out = "KytyPipelineBinaries1" + device_signature + ":";
@@ -79,7 +133,7 @@ bool PipelineBinaries::PipelineKey(vk::Device device, const void* create_info, K
 	VkPipelineCreateInfoKHR info {VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR};
 	info.pNext = const_cast<void*>(create_info);
 	VkPipelineBinaryKeyKHR out {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineKeyKHR(device, &info, &out) != VK_SUCCESS || out.keySize == 0) {
+	if (GetPipelineKey(device, &info, &out) != VK_SUCCESS || out.keySize == 0) {
 		return false;
 	}
 	key = KeyOf(out);
