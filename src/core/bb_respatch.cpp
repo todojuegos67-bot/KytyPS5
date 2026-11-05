@@ -103,8 +103,16 @@ bool g_active = false;
 u32 g_sw = 0, g_sh = 0, g_ow = 0, g_oh = 0;
 
 std::string Mode() {
+    // 0.93b: unset / "auto" = "1", the DCport placement: the game renders its whole scene
+    // chain (scene passes and its own scene-size post effects) at the internal size through its
+    // own resolution values, its UI at the output size, and the upscaler runs where the game
+    // composites the scene into the output-size image, before the HUD. The generic per-target
+    // chain ("native") stays opt-in: in the 0.93 run its later consumers (image copies, depth
+    // reads) still saw internal-size images with output-size coordinates.
     const char* v = std::getenv("BB_SCENE_UPSCALE");
-    return v ? std::string(v) : std::string();
+    std::string m = v ? std::string(v) : std::string();
+    if (m.empty() || m == "auto") m = "1";
+    return m;
 }
 
 // "mov r32, imm32" with the template's encoding (B8/B9 + imm32): the immediate, or 0.
@@ -128,8 +136,7 @@ bool NativeChain() {
     // (post-processing) are found from the GPU command stream, nothing of the game is patched. It
     // only engages when an upscaler runs with a ratio > 1 and the game's 3D renders at its output
     // size (bb_upscale.cpp); otherwise nothing changes. BB_SCENE_UPSCALE=0 turns it off.
-    const std::string m = Mode();
-    return m == "native" || m.empty() || m == "auto";
+    return Mode() == "native";
 }
 
 bool Active(u32* scene_w, u32* scene_h, u32* out_w, u32* out_h) {
@@ -145,7 +152,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     {
         // 0.81: which lines of work this build carries (bb-imgfg-078 = bb-merge-075 + image frame generation).
         const std::string features =
-            "build 0.93 (bb-scene-093): 0.93 internal-resolution scene upscale locks for ratios > 1 (generic scene detection from the command stream) + 0.90 camera motion vectors at present fixed + 0.91 (bb-aa-091): 0.91 DLAA jitter cycle >= 32 phases (BB_JITTER_PHASES) + 0.89: DLSS-G even pacing (held pacer step BB_DLSSG_PACE_HOLD, dynamic: lowest multiplier reaching the cap BB_DLSSG_DYN_LOWEST, immediate present for dynamic on 120 Hz+, camera cut threshold 3.0 NDC (BB_SR_CUT_NDC, BB_DLSSG_CUT_NDC), [dlssg-ft] per-second real/shown frame times) + bb-dlssg-085 DLSS-G fixes (reset only on camera cuts, swapchain-loss recovery, G-SYNC/VRR auto cap 224 -> real 112 for DLSS-G, immediate present under the cap, [hitch] lines) on 0.85 (bb-native-085): 0.85 session path lock ([path] locked=..., BB_PATH_LOCK) + 0.84: 0.84 in-place stability (writes after the upscaler no longer move its point, native chain never in scene mode, dump on the first failed native chain check, kept source and sample index, no present-time switch while in place works, history reset only after 30 frames without it, in-place misses by reason) on 0.83: 0.83 native chain (image copies between one size, history images kept at the output size, stale reads by address, bb_dump_frame.txt trigger) on 0.82: 0.80 native+TAA + 0.77 DLSS-G + 0.81 image FG. 0.80 native: 0.80 native chain (the lit scene colour is the only image upscaled across sizes, lighting / compute of the scene at the internal size, content check, BB_DUMP_FRAME) + 0.79 [taa] jitter log, per-SDK jitter sign, BB_TAA_ALL + 0.76 native chain fixes (twin copies for every stale use, no fallback hold, phase per G-buffer, clean-up when off) + 0.73 native chain + 0.74 display meter/FG present. 0.77 DLSS-G: DLSS-G pacing (grid at the 95th percentile of the free frame time), mailbox present mode, no empty tag set, Reflex-report interval in [display], [dlssg] constants / inputs last second, [fsr3] inputs. 0.81 image FG: 0.78 image-only frame generation (BB_FG=image-x2 / image-x3, [imgfg]), self-test. Carries: frame generation pacing of 0.70 (PaceGuestFlip grid, "
+            "build 0.93b (bb-scene-093): 0.93b DCport placement by default (scene chain incl. its post effects at the internal size, upscale at the composite before the HUD, BB_SCENE_UPSCALE=1; generic per-target chain opt-in with =native) + 0.93 path lock in place when no window path exists + 0.90 camera motion vectors at present fixed + 0.91 (bb-aa-091): 0.91 DLAA jitter cycle >= 32 phases (BB_JITTER_PHASES) + 0.89: DLSS-G even pacing (held pacer step BB_DLSSG_PACE_HOLD, dynamic: lowest multiplier reaching the cap BB_DLSSG_DYN_LOWEST, immediate present for dynamic on 120 Hz+, camera cut threshold 3.0 NDC (BB_SR_CUT_NDC, BB_DLSSG_CUT_NDC), [dlssg-ft] per-second real/shown frame times) + bb-dlssg-085 DLSS-G fixes (reset only on camera cuts, swapchain-loss recovery, G-SYNC/VRR auto cap 224 -> real 112 for DLSS-G, immediate present under the cap, [hitch] lines) on 0.85 (bb-native-085): 0.85 session path lock ([path] locked=..., BB_PATH_LOCK) + 0.84: 0.84 in-place stability (writes after the upscaler no longer move its point, native chain never in scene mode, dump on the first failed native chain check, kept source and sample index, no present-time switch while in place works, history reset only after 30 frames without it, in-place misses by reason) on 0.83: 0.83 native chain (image copies between one size, history images kept at the output size, stale reads by address, bb_dump_frame.txt trigger) on 0.82: 0.80 native+TAA + 0.77 DLSS-G + 0.81 image FG. 0.80 native: 0.80 native chain (the lit scene colour is the only image upscaled across sizes, lighting / compute of the scene at the internal size, content check, BB_DUMP_FRAME) + 0.79 [taa] jitter log, per-SDK jitter sign, BB_TAA_ALL + 0.76 native chain fixes (twin copies for every stale use, no fallback hold, phase per G-buffer, clean-up when off) + 0.73 native chain + 0.74 display meter/FG present. 0.77 DLSS-G: DLSS-G pacing (grid at the 95th percentile of the free frame time), mailbox present mode, no empty tag set, Reflex-report interval in [display], [dlssg] constants / inputs last second, [fsr3] inputs. 0.81 image FG: 0.78 image-only frame generation (BB_FG=image-x2 / image-x3, [imgfg]), self-test. Carries: frame generation pacing of 0.70 (PaceGuestFlip grid, "
             "FSR 3 midpoint slots kytyFfxSetPaceSlot / kytyFfxTakePaceStats, full-frame and "
             "high-res fixes) + 0.71 native chain (BB_SCENE_UPSCALE=native, viewport / MV pixels "
             "of scaled targets, BB_OBJMV_RIGID, Reflex markers at the first sceGnmSubmit, "
@@ -158,7 +165,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
         BB::Upscale::Checkpoint(features);
         LOG_INFO(Loader, "[BB] {}", features);
     }
-    if (mode == "native" || mode.empty() || mode == "auto") {
+    if (mode == "native") {
         BB::Upscale::Checkpoint(
             "native render chain (BB_SCENE_UPSCALE=native/auto, 0.93 default): the game keeps its own output size "
             "(the launcher's resolution patch at the window size); only its 3D scene targets are "
