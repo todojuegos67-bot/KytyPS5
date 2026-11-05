@@ -973,6 +973,20 @@ std::array<std::atomic<u32>, RfCount> g_ss_refuse{};
 // 0.84 in-place stability: the source and sample index of the last in-place upscale are kept
 // (a frame whose scene-colour guess or sample count differs does not move the point), the frame
 // it last worked, and per-reason counts of the 3D frames that missed it.
+// 0.85 session path lock (BB_PATH_LOCK, default on): 0 undecided, 1 in place, 2 window /
+// present-time path. Decided from the first 300 3D frames (in place in >= 95% of them, else the
+// window path); after that the other path is never used, so the upscaler's input and history never
+// switch. Resets of the upscaler history, and frames per second on the locked path.
+int g_lock = 0;
+u32 g_lock_frames = 0, g_lock_inplace = 0;
+u32 g_sec_frames = 0, g_sec_locked = 0, g_sec_resets = 0;
+bool PathLockOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_PATH_LOCK");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
 VAddr g_good_src = 0;
 u32 g_good_index = 0;
 u64 g_good_frame = 0, g_good_src_seen = 0;
@@ -2284,6 +2298,9 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         }
         return Sample::Keep;
     };
+    if (PathLockOn() && g_lock == 2) {
+        return Sample::Keep; // 0.85: the session is locked to the window path
+    }
     if (PresentMode()) {
         return refuse(RfPresent); // upscaled before the HUD instead (WantPresentUpscale)
     }
@@ -2329,9 +2346,10 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     // 0.84: the history is reset only when the in-place point has not run for 30 frames (or the
     // last upscale was the present-time path's post-processed image), not after one missed frame.
     p.reset = g_good_frame == 0 || g_frame_no > g_good_frame + 30;
-    if (NativeFallbackOn() && g_last_window_path) {
+    if (NativeFallbackOn() && g_last_window_path && !(PathLockOn() && g_lock == 1)) {
         p.reset = true; // (the history was the window-size path's post-processed image)
     }
+    if (p.reset) ++g_sec_resets;
     p.delta_ms = g_delta_ms;
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
@@ -2486,6 +2504,9 @@ void FillPresentPlan(VAddr flip, const char* where) {
     if (!PresentMode() && !FgNative()) {
         // 0.48 native fallback: the history was the in-place path's HDR scene colour.
         p.reset = p.reset || !g_last_window_path;
+        if (PathLockOn() && g_lock == 2 && g_last_window_path) {
+            p.reset = false; // 0.85: locked to this path, one missed frame is not a camera cut
+        }
         // 0.80: the hold (in-place off for BB_NATIVE_HOLD flips) only after an in-place upscale
         // really failed. 0.48-0.79 set it on every present-time frame, so the frames it held were
         // processed at present and renewed it: after the first missed frame (temporal not ready)
@@ -2509,6 +2530,7 @@ void FillPresentPlan(VAddr flip, const char* where) {
         p.output_h = p.render_h;
         p.reset = !g_learned.last_fg_native;
     }
+    if (p.reset) ++g_sec_resets;
     p.delta_ms = g_delta_ms;
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
@@ -3175,7 +3197,44 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // the background blurred and cleared in pulses). The frame keeps the game's own image.
     // (the whole session once the in-place point has worked: never mix the two paths, 19:24 run:
     // consecutive frames alternated sharper / softer and the HUD changed brightness)
-    const bool keep_inplace = !PresentMode() && g_good_frame != 0;
+    bool keep_inplace = !PresentMode() && g_good_frame != 0;
+    // 0.85 session path lock.
+    const bool scene3d = f.gb_depth != 0 && f.scene_draws > 0;
+    if (PathLockOn()) {
+        if (g_lock == 0 && scene3d) {
+            ++g_lock_frames;
+            if (f.injected) ++g_lock_inplace;
+            if (g_lock_frames >= 300) {
+                g_lock = g_lock_inplace * 100 >= g_lock_frames * 95 ? 1 : 2;
+                Checkpoint(fmt::format(
+                    "[path] locked={} for the session: {} of the first {} 3D frames were upscaled "
+                    "in place{} (BB_PATH_LOCK=0: per-frame choice)",
+                    g_lock == 1 ? "in-place" : "window", g_lock_inplace, g_lock_frames,
+                    g_lock == 1 ? ""
+                                : " (< 95%: the in-place point is not reliable here, every 3D "
+                                  "frame goes through the window / present-time path)"));
+            }
+        }
+        if (g_lock == 1) keep_inplace = true;
+        if (g_lock == 2) keep_inplace = false;
+        if (scene3d) {
+            ++g_sec_frames;
+            if ((g_lock == 1 && f.injected) || g_lock == 2) ++g_sec_locked;
+        }
+        static auto last = std::chrono::steady_clock::now();
+        const auto now_t = std::chrono::steady_clock::now();
+        if (now_t - last >= std::chrono::seconds(1)) {
+            last = now_t;
+            if (g_sec_frames > 0) {
+                Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
+                                       "resets {}",
+                                       g_lock == 1 ? "in-place" : g_lock == 2 ? "window"
+                                                                              : "undecided",
+                                       g_sec_locked, g_sec_frames, g_sec_resets));
+            }
+            g_sec_frames = g_sec_locked = g_sec_resets = 0;
+        }
+    }
     {
         static u32 n_frames = 0;
         ++n_frames;
