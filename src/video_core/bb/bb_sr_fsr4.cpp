@@ -882,7 +882,8 @@ void AddDeviceExtensions(const std::vector<vk::ExtensionProperties>& available, 
 	}
 	// (Core in Vulkan 1.3; the extension too where listed, for older loaders' validation.)
 	if (has(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) && !added(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME))
-		extensions.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
+		extensions.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
 	if (has(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME) && !added(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME))
 		extensions.push_back(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
 #endif
@@ -1402,10 +1403,19 @@ void ToGeneral(vk::CommandBuffer cmd, const Image& img, vk::ImageAspectFlags asp
     const vk::ImageLayout from = back ? vk::ImageLayout::eGeneral : img.layout;
     const vk::ImageLayout to = back ? img.layout : vk::ImageLayout::eGeneral;
     if (from == to || img.image == vk::Image{}) return;
-    const vk::ImageMemoryBarrier b{vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eMemoryRead,
-                                   vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eMemoryRead,
-                                   from, to, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img.image,
-                                   vk::ImageSubresourceRange{aspect, 0, 1, 0, 1}};
+    const auto rw = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eMemoryRead;
+    const vk::ImageMemoryBarrier b{.srcAccessMask = rw,
+                                   .dstAccessMask = rw,
+                                   .oldLayout = from,
+                                   .newLayout = to,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .image = img.image,
+                                   .subresourceRange = {.aspectMask = aspect,
+                                                        .baseMipLevel = 0,
+                                                        .levelCount = 1,
+                                                        .baseArrayLayer = 0,
+                                                        .layerCount = 1}};
     cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
                         {}, {}, {}, b);
 }
