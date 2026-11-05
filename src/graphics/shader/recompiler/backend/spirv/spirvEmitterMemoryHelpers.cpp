@@ -195,6 +195,21 @@ void EmitMemoryOffsets(EmitterState& state) {
 			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
 		}
 	}
+	// Direct raw buffers with a runtime stride: one load at function entry, used by every access.
+	const auto& buffers = state.program.info.buffers;
+	state.direct_runtime_strides.assign(buffers.size(), 0u);
+	for (uint32_t resource = 0; resource < buffers.size(); ++resource) {
+		const auto& buffer = buffers[resource];
+		if (buffer.runtime_stride_offset == UINT32_MAX ||
+		    buffer.indirect_root != IR::BufferResource::NoIndirectBuffer) continue;
+		if (state.flattened_srt_variable == 0) {
+			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::FlattenedSrt, resource,
+			                             "runtime buffer stride without a flattened SRT binding");
+		}
+		state.direct_runtime_strides[resource] = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		    EmitFlattenedSrtLoad(state, ConstantU32(state, buffer.runtime_stride_offset)),
+		    ConstantU32(state, 0x3fffu));
+	}
 	// Static offsets are emitted for every descriptor, also those of shared bindless tables:
 	// paths that bypass EmitBufferAccess (64-bit loads/atomics, ByteAddress without a prefix)
 	// read memory_byte_offsets directly, and a skipped entry was emitted as id 0 (Yotei CS

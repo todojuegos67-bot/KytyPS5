@@ -21,6 +21,10 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+// Stride kept in the specialization of a direct raw buffer whose real stride is read at run time
+// (any nonzero value: the emitter treats a zero stride as "no swizzle").
+constexpr uint32_t DirectRuntimeStrideCanonical = 4u;
+
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
 bool SpecializationFail(std::string_view message) {
@@ -1604,6 +1608,28 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={} capacity={}",
 		    kind, resource, source, candidates, capacity));
 	};
+	// Direct raw buffers (not formatted, not a bindless table, not an image alias): the packed
+	// stride is published in the flattened SRT and read by the shader at run time, and the
+	// specialization keeps only a canonical stride. A stride change (Yotei: "ShaderMiss ...
+	// buf2(stride 8/40)", the same 300K-845K-word CS translated up to 21 times per session) then
+	// reuses the permutation instead of translating the shader again. The words are reserved
+	// here, right after the SRT words, so their offsets depend on the shader alone (offsets are
+	// part of the specialization). KYTY_DIRECT_RUNTIME_STRIDE=0 restores the specialized stride.
+	static const bool direct_runtime_stride = [] {
+		const char* v = std::getenv("KYTY_DIRECT_RUNTIME_STRIDE");
+		return v == nullptr || v[0] != '0';
+	}();
+	std::vector<uint32_t> direct_stride_slot(program.info.buffers.size(), UINT32_MAX);
+	if (direct_runtime_stride) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+			const auto& base   = program.info.buffers[i];
+			const auto* source = Source(program, base.source);
+			if (source == nullptr || source->indirect_descriptor.has_value() || base.formatted ||
+			    base.image_alias != BufferResource::NoImageAlias) continue;
+			direct_stride_slot[i] = static_cast<uint32_t>(snapshot.flattened_srt.size());
+			snapshot.flattened_srt.push_back(0u);
+		}
+	}
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1654,6 +1680,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
+		if (i < direct_stride_slot.size() && direct_stride_slot[i] != UINT32_MAX &&
+		    buffer.indirect_root == BufferResource::NoIndirectBuffer) {
+			// The real stride (with its flags) goes to the shader; the key keeps the flags and a
+			// canonical nonzero stride. Stride 0 has its swizzle/index-stride flags cleared above,
+			// so it shares the permutation of an unswizzled nonzero stride (index * 0 at run time).
+			// zero_stride_oob (bounds mode 0 with stride 0) stays in the key.
+			snapshot.flattened_srt[direct_stride_slot[i]] = packed_stride;
+			buffer.packed_stride         = (packed_stride & ~0x3fffu) | DirectRuntimeStrideCanonical;
+			buffer.runtime_stride_offset = direct_stride_slot[i];
+		}
 	}
 	// Raw bindless buffer tables: the per-ordinal packed strides are also published in the
 	// flattened SRT, so the emitter can index one descriptor array with a runtime stride instead
@@ -1667,6 +1703,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}();
 	for (uint32_t root = 0; root < program.info.buffers.size() && root < specialization.buffers.size(); ++root) {
 		auto& root_spec = specialization.buffers[root];
+		if (root_spec.indirect_root != root) continue; // direct buffers: set above
 		root_spec.runtime_stride_offset = UINT32_MAX;
 		if (!runtime_stride_enabled) continue;
 		if (root_spec.indirect_root != root || program.info.buffers[root].formatted) continue;

@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/shaderSessionStats.h"
 
 #include <chrono>
 #include <cinttypes>
@@ -33,6 +34,7 @@ void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) ShaderSessionStats::NoteDeviceLost();
 		EXIT("MasterSemaphore: vkGetSemaphoreCounterValue returned %s (%d), gpu_tick=%" PRIu64 "\n",
 		     vk::to_string(result).c_str(), static_cast<int>(result),
 		     m_gpu_tick.load(std::memory_order_relaxed));
@@ -76,6 +78,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		const auto waited_ms =
 		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
 		if (result == vk::Result::eTimeout) {
+			ShaderSessionStats::g_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
 			std::printf("GpuWaitTimeout: tick=%" PRIu64 " gpu_counter=%" PRIu64 " waited=%.0f ms (still waiting)\n",
 			            tick, counter, waited_ms);
 			std::fflush(stdout);
@@ -85,6 +88,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		            " waited=%.0f ms timeouts=%u\n",
 		            vk::to_string(result).c_str(), static_cast<int>(result), tick, counter, waited_ms, slices);
 		std::fflush(stdout);
+		if (result == vk::Result::eErrorDeviceLost) ShaderSessionStats::NoteDeviceLost();
 		EXIT("MasterSemaphore: vkWaitSemaphores returned %s (%d) waiting for tick %" PRIu64
 		     " (GPU at %" PRIu64 ")\n",
 		     vk::to_string(result).c_str(), static_cast<int>(result), tick, counter);

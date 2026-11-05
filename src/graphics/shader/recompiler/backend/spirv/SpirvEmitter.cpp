@@ -26,7 +26,10 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		return resource.indirect_root != UINT32_MAX;
 	};
 	bool uses_flattened_srt = std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	                          std::ranges::any_of(program.info.images, uses_mapping);
+	                          std::ranges::any_of(program.info.images, uses_mapping) ||
+	                          std::ranges::any_of(program.info.buffers, [](const IR::BufferResource& buffer) {
+		                          return buffer.runtime_stride_offset != UINT32_MAX;
+	                          });
 	const auto planning_only_handle = [&](const IR::Inst& handle) {
 		return !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {

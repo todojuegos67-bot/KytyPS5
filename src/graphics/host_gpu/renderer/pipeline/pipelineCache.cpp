@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/translationCache.h"
+#include "graphics/shaderSessionStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
@@ -369,6 +370,11 @@ struct PipelineCache::ProgramCache {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		auto info = std::move(result.program).TakeCompiledInfo();
+		ShaderSessionStats::g_runtime_stride_buffers.fetch_add(
+		    static_cast<uint64_t>(std::ranges::count_if(info.info.buffers, [](const auto& buffer) {
+			    return buffer.runtime_stride_offset != UINT32_MAX &&
+			           buffer.indirect_root == ShaderRecompiler::IR::BufferResource::NoIndirectBuffer;
+		    })), std::memory_order_relaxed);
 		if (disk_key.has_value()) TranslationCache::Store(*disk_key, result.spirv, info);
 		return MakePermutation(stage_name, options, std::move(result.spirv), std::move(info),
 		                       std::move(specialization), function_code);
@@ -607,6 +613,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto translate_start = std::chrono::steady_clock::now();
+		const bool first_sight     = entry == programs.end();
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -732,6 +739,8 @@ struct PipelineCache::ProgramCache {
 		{
 			const auto done_at = std::chrono::steady_clock::now();
 			const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+			ShaderSessionStats::NoteTranslation(stage == ShaderType::Compute, first_sight,
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(done_at - translate_start).count()));
 			if (ms(translate_start, done_at) >= 50.0) {
 				std::printf("ShaderSlow: shader %s hash=0x%016" PRIx64 " total=%.1f ms: prepare=%.1f translate=%.1f "
 				            "compile=%.1f (Thread_Gpu=%d)\n",

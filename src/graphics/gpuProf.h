@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "graphics/shaderSessionStats.h"
+
 namespace GpuProf {
 
 enum Phase : int { CsProgram, CsPipeline, CsRecord, DrawPrograms, DrawPipeline, DrawRecord, Count };
@@ -55,6 +57,7 @@ inline void Report() {
 	}
 	std::printf("\n");
 	std::fflush(stdout);
+	ShaderSessionStats::MaybePrint();
 }
 
 struct Scope {

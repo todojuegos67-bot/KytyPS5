@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/translationCache.h"
 
+#include "graphics/shaderSessionStats.h"
 #include "kytyGitVersion.h"
 
 #include <xxhash.h>
@@ -330,6 +331,7 @@ void Run(Cache& c) {
 		c.loaded = true;
 	}
 	c.cv.notify_all();
+	ShaderSessionStats::g_xlat_loaded.store(records, std::memory_order_relaxed);
 	std::printf("TranslationCache: %s, %zu translations loaded in %.0f ms%s\n",
 	            c.path.string().c_str(), records,
 	            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(),
@@ -370,7 +372,7 @@ KeyBuilder::KeyBuilder() {
 	Add(revision.data(), revision.size());
 	// Recompiler switches read from the environment change its output.
 	for (const char* name: {"KYTY_FATAL_UNSUPPORTED_SHADERS", "KYTY_ROUND_SEARCH", "KYTY_RUNTIME_STRIDE",
-	                        "KYTY_STRICT_INDIRECT_IMAGES"}) {
+	                        "KYTY_STRICT_INDIRECT_IMAGES", "KYTY_DIRECT_RUNTIME_STRIDE"}) {
 		const char* v = std::getenv(name);
 		const std::string value = v != nullptr ? std::string("=") + v : std::string("-");
 		Add(value.data(), value.size());
@@ -454,6 +456,7 @@ std::optional<Entry> Find(const Key& key) {
 		return std::nullopt;
 	}
 	c.hits.fetch_add(1, std::memory_order_relaxed);
+	ShaderSessionStats::g_xlat_hits.fetch_add(1, std::memory_order_relaxed);
 	Report();
 	return entry;
 }

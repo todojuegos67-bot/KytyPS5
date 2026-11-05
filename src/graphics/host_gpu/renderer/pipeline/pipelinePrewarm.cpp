@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
+#include "graphics/shaderSessionStats.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1252,6 +1253,7 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 			threads = std::clamp(static_cast<unsigned>(std::strtoul(v, nullptr, 10)), 1u, 64u);
 		}
 		threads = std::min<unsigned>(threads, static_cast<unsigned>(std::max<size_t>(1, ctx.queue.size())));
+		ShaderSessionStats::g_prewarm_compute.store(ctx.queued_c, std::memory_order_relaxed);
 		std::printf("Prewarm: %s: %zu recorded pipelines (%zu compute, %zu graphics, %zu SPIR-V modules), "
 		            "building them on %u threads\n",
 		            ctx.path.string().c_str(), ctx.queue.size(), ctx.queued_c, ctx.queued_g,

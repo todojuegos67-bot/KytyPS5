@@ -591,8 +591,13 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
+	// A direct raw buffer with a runtime stride reads it from the flattened SRT.
+	const auto runtime_stride = [](const BufferResource& buffer) {
+		return buffer.runtime_stride_offset != UINT32_MAX;
+	};
 	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
-	                           std::ranges::any_of(info.images, uses_mapping);
+	                           std::ranges::any_of(info.images, uses_mapping) ||
+	                           std::ranges::any_of(info.buffers, runtime_stride);
 	switch (program.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Local: CollectVertexInputs(input_info.vertex, info, inputs.components); break;

@@ -93,9 +93,12 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
 	// A runtime-strided bindless candidate shares every packed flag with the representative.
+	const auto direct_stride = mem.resource < state.direct_runtime_strides.size()
+	    ? state.direct_runtime_strides[mem.resource] : 0u;
 	const auto stride_id = state.runtime_packed_stride != 0u
 	    ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.runtime_packed_stride, ConstantU32(state, 0x3fffu))
-	    : ConstantU32(state, stride);
+	    : direct_stride != 0u ? direct_stride
+	                          : ConstantU32(state, stride);
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
 	                              stride_id,
 	                              swizzle ? ConstantBool(state, true) : 0u,
