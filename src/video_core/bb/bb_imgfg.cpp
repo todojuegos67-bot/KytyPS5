@@ -150,6 +150,13 @@ struct G {
     Stats stats{};
     int acquire_fail = 0;
     int selftest_left = 3;
+    int calls = 0;
+    int trace = 0;
+    int acquire_streak = 0;
+    int fence_streak = 0;
+    uint64_t generated_total = 0;
+    Clock::time_point gen_started{};
+    double prev_fps = 0.0;
     bool zero_logged = false;
 };
 
@@ -243,7 +250,9 @@ bool MakePipeline(vk::Pipeline& out, const A& code) {
 
 void Teardown() {
     if (!g.device) return;
-    (void)g.device.waitIdle();
+    if (g.built) {
+        (void)g.device.waitIdle();
+    }
     for (auto& [k, v] : g.swap_views) g.device.destroyImageView(v);
     g.swap_views.clear();
     for (auto& s : g.sets) {
@@ -426,7 +435,10 @@ bool Build(vk::Extent2D extent, vk::Format format) {
             std::lock_guard lock{Vulkan::Scheduler::submit_mutex};
             if (g.queue.submit(1, &si, g.fence[0]) != vk::Result::eSuccess) return false;
         }
-        if (g.device.waitForFences(1, &g.fence[0], VK_TRUE, UINT64_MAX) != vk::Result::eSuccess) return false;
+        if (g.device.waitForFences(1, &g.fence[0], VK_TRUE, 2'000'000'000ull) != vk::Result::eSuccess) {
+            BBLogf("[imgfg] the first GPU submission did not finish in 2 s");
+            return false;
+        }
         (void)g.device.resetFences(1, &g.fence[0]);
     }
     g.built = true;
@@ -567,10 +579,22 @@ double Ms(Clock::duration d) {
     return std::chrono::duration<double, std::milli>(d).count();
 }
 
+void Disable(const std::string& why) {
+    if (!g.failed) {
+        BBLogf("[imgfg] watchdog: %s: image frame generation off, plain present from now on", why.c_str());
+    }
+    g.failed = true;
+    g.generating = false;
+}
+
 // Reads a finished slot's counters and timestamps into the second's statistics.
 void Collect(uint32_t slot) {
     if (!g.in_flight[slot]) return;
-    (void)g.device.waitForFences(1, &g.fence[slot], VK_TRUE, UINT64_MAX);
+    const auto waited = g.device.waitForFences(1, &g.fence[slot], VK_TRUE, 200'000'000ull);
+    if (waited != vk::Result::eSuccess) {
+        Disable(std::string("a GPU submission did not finish in 200 ms (") + vk::to_string(waited) + ")");
+        return;
+    }
     (void)g.device.resetFences(1, &g.fence[slot]);
     g.in_flight[slot] = false;
     if (!g.slot_generated[slot]) return;
@@ -624,12 +648,18 @@ void Report(Clock::time_point now) {
     if (win < 1.0) return;
     const double flow = s.gpu_samples ? s.flow_ms / s.gpu_samples : 0.0;
     const double interp = s.gpu_samples ? s.interp_ms / s.gpu_samples : 0.0;
-    BB::FG::Printf("[imgfg] real %.1f fps, generated %.1f, flow ms %.2f (gpu), interp ms %.2f, inconsistent "
+    const double fps_now = s.real / win;
+    BBLogf("[imgfg] real %.1f fps, generated %.1f, flow ms %.2f (gpu), interp ms %.2f, inconsistent "
                    "pixels %.2f %%, hud-protected %.2f %%",
                    s.real / win, s.generated / win, flow, interp,
                    s.total ? 100.0 * s.incons / s.total : 0.0, s.total ? 100.0 * s.hud / s.total : 0.0);
     s = {};
     s.start = now;
+    if (g.prev_fps >= 20.0 && fps_now < 0.5 * g.prev_fps) {
+        Disable("the real frame rate fell below half of the previous second (" + std::to_string(g.prev_fps) +
+                " -> " + std::to_string(fps_now) + " fps)");
+    }
+    g.prev_fps = fps_now;
 }
 
 } // namespace
@@ -665,7 +695,7 @@ vk::ImageUsageFlags SwapchainUsage(vk::PhysicalDevice physical, vk::SurfaceKHR s
 }
 
 uint32_t SwapchainExtraImages() {
-    return Parse() ? 1u : 0u;
+    return Parse() ? static_cast<uint32_t>(g.mult) : 0u;
 }
 
 void OnDevice(vk::PhysicalDevice physical, vk::Device device, uint32_t family, vk::Queue queue) {
@@ -728,6 +758,11 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
         return false;
     }
     const auto entry = Clock::now();
+    ++g.calls;
+    if (g.gen_started != Clock::time_point{} && g.generated_total == 0 && entry - g.gen_started > std::chrono::seconds(2)) {
+        Disable("no generated frame was presented within 2 s of starting");
+        return false;
+    }
     if (in.format != vk::Format::eR8G8B8A8Unorm && in.format != vk::Format::eB8G8R8A8Unorm) {
         BBLogf("[imgfg] the swapchain format %s is not 8-bit RGBA / BGRA: image frame generation off",
                vk::to_string(in.format).c_str());
@@ -779,6 +814,9 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
     const uint32_t slot = g.slot;
     g.slot = (g.slot + 1) % kSlots;
     Collect(slot);
+    if (g.failed) {
+        return false;
+    }
 
     if (g.sc_handle != in.swapchain || g.sc_images.empty()) {
         g.sc_handle = in.swapchain;
@@ -793,8 +831,21 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
     if (generate) {
         for (int j = 0; j < mult - 1; ++j) {
             uint32_t index = 0;
-            const auto r = g.device.acquireNextImageKHR(in.swapchain, 100'000'000ull, g.acquired[slot][j], vk::Fence{},
+            const auto t_acq = Clock::now();
+            const auto r = g.device.acquireNextImageKHR(in.swapchain, 8'000'000ull, g.acquired[slot][j], vk::Fence{},
                                                         &index);
+            const double acq_ms = Ms(Clock::now() - t_acq);
+            if (g.calls <= 12 || acq_ms > 20.0) {
+                if (++g.trace <= 40) {
+                    BBLogf("[imgfg] call %d: acquire for generated frame %d returned %s after %.2f ms", g.calls, j,
+                           vk::to_string(r).c_str(), acq_ms);
+                }
+            }
+            if (r == vk::Result::eSuccess || r == vk::Result::eSuboptimalKHR) {
+                g.acquire_streak = 0;
+            } else if (++g.acquire_streak >= 120) {
+                Disable("no swapchain image could be acquired for a generated frame in 120 frames in a row");
+            }
             if (r != vk::Result::eSuccess && r != vk::Result::eSuboptimalKHR) {
                 if (++g.acquire_fail <= 3) {
                     BBLogf("[imgfg] acquiring a swapchain image for a generated frame returned %s",
@@ -1112,8 +1163,19 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
         // shown late and the intervals alternate short / long): the wait is timed, and the grid
         // starts that much after the frame's arrival.
         const auto submitted = Clock::now();
-        (void)g.device.waitForFences(1, &g.fence[slot], VK_TRUE, 50'000'000ull);
+        const auto fw = g.device.waitForFences(1, &g.fence[slot], VK_TRUE, 30'000'000ull);
         const double lag = std::chrono::duration<double>(Clock::now() - submitted).count();
+        if (g.calls <= 12 || fw != vk::Result::eSuccess) {
+            if (++g.trace <= 40) {
+                BBLogf("[imgfg] call %d: GPU work of the generated frame finished: %s after %.2f ms", g.calls,
+                       vk::to_string(fw).c_str(), lag * 1000.0);
+            }
+        }
+        if (fw == vk::Result::eSuccess) {
+            g.fence_streak = 0;
+        } else if (++g.fence_streak >= 5) {
+            Disable("the GPU work of the generated frames did not finish in 30 ms five times in a row");
+        }
         g.lag_s = g.lag_s <= 0.0 ? lag : g.lag_s + 0.1 * (lag - g.lag_s);
         if (g.selftest_left > 0) {
             Collect(slot);
@@ -1149,17 +1211,25 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
             };
             {
                 std::lock_guard lock{Vulkan::Scheduler::submit_mutex};
+                const auto t_pr = Clock::now();
                 const auto pr = g.queue.presentKHR(&pi);
+                const double pr_ms = Ms(Clock::now() - t_pr);
+                if ((g.calls <= 12 || pr_ms > 20.0) && ++g.trace <= 40) {
+                    BBLogf("[imgfg] call %d: present of generated frame %d returned %s after %.2f ms", g.calls, j,
+                           vk::to_string(pr).c_str(), pr_ms);
+                }
                 if (pr == vk::Result::eErrorOutOfDateKHR) {
                     g.have_prev = false;
                     g.grid_valid = false;
                 }
             }
             ++g.stats.generated;
+            ++g.generated_total;
         }
         // the real frame at the last step of the interval
         WaitUntil(first + sub * (mult - 1));
         g.generating = true;
+        if (g.gen_started == Clock::time_point{}) g.gen_started = entry;
     } else {
         g.generating = false;
     }
