@@ -670,6 +670,10 @@ bool Instance::CreateDevice() {
             Core::ReleaseDlssAddressHole();
             BB::Upscale::Checkpoint("vkCreateDevice: VK_NVX_binary_import (DLSS 5) without DLSS: "
                                     "address hole released");
+            // 0.91: the same order as the DLSS path (hole released, then the dry run).
+            BB::Upscale::DryRunDevice(static_cast<VkInstance>(*instance),
+                                      static_cast<VkPhysicalDevice>(physical_device),
+                                      reinterpret_cast<const VkDeviceCreateInfo*>(&device_chain.get()));
         }
         if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss || BB::FG::StreamlineWanted()) {
             Core::ReleaseDlssAddressHole();
