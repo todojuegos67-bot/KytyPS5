@@ -78,6 +78,9 @@ public:
 	// Called with the upload prologue's buffer as it closes, before its closing barrier (BufferCache: the prologue's
 	// copies gathered as one indirect copy).
 	void SetPrologueHook(std::function<void(vk::CommandBuffer)> hook) { m_prologue_hook = std::move(hook); }
+	// Called as the open buffer closes for submission, outside a render pass: commands batched for its end
+	// (KYTY_FEEDBACK_BATCH: BufferCache's copy-feedback snapshots).
+	void SetEpilogueHook(std::function<void(CommandBuffer&)> hook) { m_epilogue_hook = std::move(hook); }
 	// Advances with every command buffer this scheduler begins.
 	[[nodiscard]] uint64_t CommandSerial() const noexcept { return m_command_serial; }
 	// A speculative translation's (src/graphics/guest_gpu/speculation.cpp): its recorder's pending tick (from
@@ -184,6 +187,7 @@ private:
 	// The submissions the GPU has still to finish is at least `count` (the recording worker's not handed yet included).
 	[[nodiscard]] bool BacklogAtLeast(uint64_t count);
 	std::function<void(vk::CommandBuffer)> m_prologue_hook;
+	std::function<void(CommandBuffer&)>    m_epilogue_hook;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

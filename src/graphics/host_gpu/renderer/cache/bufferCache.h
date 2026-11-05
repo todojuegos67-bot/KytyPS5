@@ -364,6 +364,13 @@ private:
 	std::deque<EagerFeedback> m_eager_feedback;
 	uint64_t                  m_eager_verify_count = 0;
 	[[nodiscard]] bool        VerifyEagerFeedback(const EagerFeedback& entry);
+	// KYTY_FEEDBACK_BATCH: the open buffer's copy-feedback snapshots, recorded together as it closes (FlushFeedbackBatch).
+	struct FeedbackCopy {
+		vk::Buffer source;
+		uint64_t   source_offset, destination_offset, size;
+	};
+	std::vector<FeedbackCopy> m_feedback_batch;
+	void                      FlushFeedbackBatch(CommandBuffer& command);
 	bool TryReportLodStatsOnGpu(uint64_t address, bool reset);
 	vk::Pipeline m_lod_pack_pipeline = nullptr;
 	vk::PipelineLayout m_lod_pack_layout = nullptr;
