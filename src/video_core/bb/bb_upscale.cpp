@@ -1002,25 +1002,8 @@ void SrReset(Plan& p) {
         return e != nullptr && *e != '\0' ? std::atof(e) : 1.0;
     }();
     static bool first = true;
-    double delta = 0.0;
-    if (p.camera_valid) {
-        const float* m = p.clip_to_prev_clip;
-        const double pts[4][2] = {{-0.5, -0.5}, {0.5, -0.5}, {-0.5, 0.5}, {0.5, 0.5}};
-        double sum = 0.0;
-        for (const auto& pt : pts) {
-            const double v[4] = {pt[0], pt[1], 0.5, 1.0};
-            double o[4]{};
-            for (int i = 0; i < 4; ++i)
-                for (int j = 0; j < 4; ++j) o[i] += m[i * 4 + j] * v[j];
-            if (std::fabs(o[3]) < 1e-9) {
-                sum = 1e9;
-                break;
-            }
-            const double dx = o[0] / o[3] - pt[0], dy = o[1] / o[3] - pt[1];
-            sum += std::sqrt(dx * dx + dy * dy);
-        }
-        delta = sum >= 1e9 ? 1e9 : sum / 4.0;
-    }
+    // 0.88: the same measure as DLSS-G's reset (BB::FG::CameraDeltaNdc); a point at w = 0 is 1e9.
+    const double delta = BB::FG::CameraDeltaNdc(p.camera_valid, p.clip_to_prev_clip);
     g_sec_cam_max = std::max(g_sec_cam_max, std::min(delta, 99.0));
     p.reset = first || delta > cut;
     first = false;

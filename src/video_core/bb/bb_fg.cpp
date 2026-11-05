@@ -185,6 +185,16 @@ Config ParseConfig() {
     if (c.kind == Kind::Amd && !c.dynamic && c.multiplier == 4 && Env("KYTY_VRR_CAP_FPS") == nullptr) {
         SetProcessEnv("BB_VRR_CAP_FPS", "auto");
     }
+    // bb-dlssg-085: with no fps cap of the user's (BB_FPS_CAP=0) the shown frames are held under
+    // the G-SYNC / VRR range, Reflex's own cap (the 18:44 DLSS-G x3 run showed 239-251 fps on a
+    // 240 Hz G-SYNC monitor: above its range, 155 and 247 ms intervals). BB_FG_VRR_CAP=0: off.
+    if (c.kind != Kind::Off && !c.dynamic && Env("KYTY_VRR_CAP_FPS") == nullptr) {
+        const char* off = std::getenv("BB_FG_VRR_CAP");
+        const char* user = std::getenv("BB_FPS_CAP");
+        if ((off == nullptr || *off != '0') && user != nullptr && std::strcmp(user, "0") == 0) {
+            SetProcessEnv("BB_VRR_CAP_FPS", "auto");
+        }
+    }
     // (bb_dyn_multiplier.h reads KYTY_DYN_QUALITY itself.)
     if (const char* q = std::getenv("BB_DYN_QUALITY"); q != nullptr) {
         SetProcessEnv("KYTY_DYN_QUALITY", q);
@@ -208,6 +218,57 @@ Config ParseConfig() {
 }
 
 } // namespace
+
+// bb-dlssg-085: the refresh rate of the monitor the game's window is on (0: unknown).
+static double MonitorRefreshHz() {
+#if defined(_WIN32)
+    HWND window = GetForegroundWindow();
+    DWORD pid = 0;
+    if (window != nullptr) GetWindowThreadProcessId(window, &pid);
+    if (window == nullptr || pid != GetCurrentProcessId()) window = GetActiveWindow();
+    MONITORINFOEXA info{};
+    info.cbSize = sizeof(info);
+    const char* device = nullptr;
+    if (const HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+        monitor != nullptr && GetMonitorInfoA(monitor, &info)) {
+        device = info.szDevice;
+    }
+    DEVMODEA mode{};
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsA(device, ENUM_CURRENT_SETTINGS, &mode) != 0 &&
+        mode.dmDisplayFrequency > 30) {
+        return static_cast<double>(mode.dmDisplayFrequency);
+    }
+#endif
+    return 0.0;
+}
+
+// bb-dlssg-085: the shown rate G-SYNC / VRR frame generation is held under (KYTY_VRR_CAP_FPS:
+// a number, or auto = NVIDIA's Reflex / G-SYNC cap, refresh - refresh^2 / 3600: 240 Hz -> 224,
+// 165 -> 157, 144 -> 138, 120 -> 116). 0: no cap. The real cap is this / the multiplier.
+static double VrrShownCap() {
+    const char* text = Env("KYTY_VRR_CAP_FPS");
+    if (text == nullptr || *text == '\0') return 0.0;
+    if (std::string(text) == "auto") {
+        const double hz = MonitorRefreshHz();
+        return hz > 0.0 ? std::floor(hz - hz * hz / 3600.0 + 0.01) : 0.0;
+    }
+    return std::max(std::strtod(text, nullptr), 0.0);
+}
+
+// The real-frame interval of the image frame generation under that cap (0: none).
+static double ImageVrrInterval() {
+    static const double interval = [] {
+        const double shown = VrrShownCap();
+        if (shown <= 0.0 || Cfg().kind != Kind::Image) return 0.0;
+        const int multiplier = std::max(Cfg().multiplier, 2);
+        const double real = std::floor(shown / multiplier);
+        Printf("[fg] G-SYNC/VRR cap: refresh %.0f Hz, x%d -> real cap %.0f fps, shown <= %.0f fps",
+               MonitorRefreshHz(), multiplier, real, real * multiplier);
+        return 1.0 / real;
+    }();
+    return interval;
+}
 
 // BB_FPS_CAP=N: the game's real frames (before frame generation, DLSS-G or FSR 3) held to N fps
 // on a fixed grid at the guest flip (1/N s: 16.667 ms at 60, 22.222 at 45, 33.333 at 30), so
@@ -936,6 +997,7 @@ PresentSlot PaceGuestFlip() {
     }
     double interval = Dlssg::PaceInterval();
     if (interval <= 0.0) interval = Amd::PaceInterval();
+    if (interval <= 0.0 && BB::ImgFg::Generating()) interval = ImageVrrInterval();
     // The real fps cap (BB_FPS_CAP) is the grid: a fixed step, not the adaptive mean (which
     // follows the game's own wandering frame time, 14-17 ms, and spaces the presents unevenly).
     (void)Cfg();
@@ -1063,6 +1125,15 @@ std::atomic<double> g_real_interval{0.0}; // the pacer's real-frame interval (0:
 bool g_fixed_cap = false;                 // fixed DLSS-G under BB_VRR_CAP_FPS
 std::atomic<uint32_t> g_presented_frames{1};
 int g_mode_set = -1; // DLSS-G last set on (1) or off (0)
+// bb-dlssg-085: recovery after the swapchain was lost (focus loss): DLSS-G is turned off and its
+// resources freed before the swapchain is destroyed, not enabled with a 0x0 backbuffer, and
+// when it keeps being on without generating (its NGX feature cannot be created: 19:07 run,
+// "NGX create feature failed 0xbad0000a" 1112 times, shown 60 / generated 0 from then on) it is
+// turned off for a second, freed, and enabled again.
+bool g_resume_pending = false;
+uint64_t g_mode_on_at = 0;
+uint32_t g_nogen_run = 0, g_reset_count = 0;
+Clock::time_point g_backoff_until{};
 uint32_t g_rx_open = 0;               // the frame begun at the last guest flip
 std::atomic<uint32_t> g_rx_present{0}; // the index BeforePresent presents next (SetPresentIndex)
 
@@ -1110,6 +1181,12 @@ uint32_t g_stat_real = 0, g_stat_on = 0, g_stat_hudless = 0;
 // bb-dlssg-077: what DLSS-G was given, a second at a time ([dlssg] inputs last second).
 uint32_t g_stat_untagged = 0, g_stat_nohudless = 0, g_stat_hudless_size = 0, g_stat_reset = 0,
          g_stat_nocamera = 0, g_stat_inputs = 0;
+// bb-dlssg-085: reset handling. The upscaler's reset flag also flips whenever its in-place / present
+// path alternates (that is not a camera cut) and cleared DLSS-G's history on every turn (blur).
+uint32_t g_stat_reset_given = 0;       // resets DLSS-G was really given (cuts, first frame)
+double g_stat_cam_sum = 0, g_stat_cam_max = 0; // mean displacement of the camera (NDC) this second
+uint32_t g_stat_cam_n = 0;
+bool g_prev_inputs_ok = false;
 uint32_t g_last_status = 0;
 // bb-merge-082: the last HUD-less image given and the game image it was matched with (for the log).
 uint32_t g_last_hl_w = 0, g_last_hl_h = 0, g_last_hl_fmt = 0, g_last_gi_w = 0, g_last_gi_h = 0,
@@ -1192,6 +1269,31 @@ bool Inverted(const float* m, float* out) {
     return true;
 }
 
+// How far the camera moved since the previous frame (bb-merge-088: the measure is the shared
+// CameraDeltaNdc, also used by the upscaler's history reset).
+double CameraDelta(const Inputs* in) {
+    if (in == nullptr) return 0.0;
+    return CameraDeltaNdc(in->camera_valid, in->clip_to_prev_clip);
+}
+
+// DLSS-G's reset: only the first frame after it was off / without inputs, and a real camera cut.
+// The upscaler's own reset (path changes) is not forwarded unless BB_DLSSG_RESET=inputs.
+bool DlssgReset(const Inputs* in, double delta) {
+    static const bool legacy = [] {
+        const char* e = std::getenv("BB_DLSSG_RESET");
+        return e != nullptr && std::string_view(e) == "inputs";
+    }();
+    static const double cut = [] {
+        const char* e = std::getenv("BB_DLSSG_CUT_NDC");
+        return e != nullptr && *e != '\0' ? std::atof(e) : 1.0;
+    }();
+    const bool first = !g_prev_inputs_ok;
+    g_prev_inputs_ok = in != nullptr && in->camera_valid;
+    if (in == nullptr) return true;
+    if (legacy) return in->reset;
+    return first || delta > cut;
+}
+
 // The same constants the super resolution path gives Streamline (bb_sr_dlss.cpp): our matrices
 // are row major for column vectors, Streamline's row-vector, so each is given transposed.
 sl::Constants MakeConstants(const Inputs* in) {
@@ -1231,7 +1333,15 @@ sl::Constants MakeConstants(const Inputs* in) {
     c.depthInverted = in == nullptr || in->depth_inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.cameraMotionIncluded = sl::Boolean::eTrue;
     c.motionVectors3D = sl::Boolean::eFalse;
-    c.reset = in == nullptr || in->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    const double cam_delta = CameraDelta(in);
+    const bool do_reset = DlssgReset(in, cam_delta);
+    if (in != nullptr) {
+        g_stat_cam_sum += cam_delta;
+        g_stat_cam_max = std::max(g_stat_cam_max, cam_delta);
+        ++g_stat_cam_n;
+        if (do_reset) ++g_stat_reset_given;
+    }
+    c.reset = do_reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.orthographicProjection = sl::Boolean::eFalse;
     c.motionVectorsDilated = sl::Boolean::eFalse;
     c.motionVectorsJittered = sl::Boolean::eFalse;
@@ -1343,18 +1453,7 @@ void OnDevice(vk::PhysicalDevice physical) {
     // G-SYNC: the frames shown (rendered x (1 + generated)) held under the refresh
     // (KYTY_VRR_CAP_FPS=<shown fps> or auto = refresh x 14 / 15; unset: off).
     {
-        uint32_t cap = 0;
-        const char* text = Env("KYTY_VRR_CAP_FPS");
-        if (text != nullptr && *text != '\0' && std::string(text) != "auto") {
-            cap = static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
-        } else if (text != nullptr && std::string(text) == "auto") {
-            DEVMODEA mode{};
-            mode.dmSize = sizeof(mode);
-            if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 &&
-                mode.dmDisplayFrequency > 30) {
-                cap = static_cast<uint32_t>(std::floor(mode.dmDisplayFrequency * 14.0 / 15.0 + 0.01));
-            }
-        }
+        uint32_t cap = static_cast<uint32_t>(VrrShownCap());
         if (g_dynamic) {
             cap = 0;
             g_real_interval =
@@ -1371,6 +1470,12 @@ void OnDevice(vk::PhysicalDevice physical) {
             Printf("Frame generation: shown frames held under %u fps (rendered at most %.1f, "
                    "Reflex limit %u us)",
                    cap, static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
+            Printf("[fg] G-SYNC/VRR cap: refresh %.0f Hz, x%d -> real cap %.0f fps, shown <= %.0f "
+                   "fps (Reflex frame limiter, %u us)",
+                   MonitorRefreshHz(), g_generate + 1,
+                   std::floor(static_cast<double>(cap) / (g_generate + 1)),
+                   std::floor(static_cast<double>(cap) / (g_generate + 1)) * (g_generate + 1),
+                   reflex.frameLimitUs);
         }
     }
     Dlssg::g_reflex_limit_us = reflex.frameLimitUs;
@@ -1601,7 +1706,11 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
     }
     const sl::ViewportHandle viewport{0};
     // Menus, movies and loading screens (no 3D scene upscaled) are presented as they are.
-    const bool usable = inputs != nullptr && inputs->valid;
+    // (bb-dlssg-085: never with a 0x0 backbuffer, nor while backing off after a failed create.)
+    const bool blocked = backbuffer.width == 0 || backbuffer.height == 0 ||
+                         region.extent.width == 0 || region.extent.height == 0 ||
+                         Clock::now() < g_backoff_until;
+    const bool usable = inputs != nullptr && inputs->valid && !blocked;
     // bb-merge-082: the HUD-less image DLSS-G is given: the one at the game image's size when the
     // presenter made it (the frame is scaled into the window), else the frame's own.
     const Image& hl_image =
@@ -1685,13 +1794,15 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                    g_stat_present_ms / n, g_stat_present_max, g_stat_hudless, g_last_status);
             Printf("[dlssg] inputs last second: %u frames with inputs (no tags on %u without), HUD-less "
                    "tagged %u, without a HUD-less image %u, HUD-less size != game image %u, "
-                   "camera invalid %u, reset %u | last HUD-less %ux%u fmt %u%s, game image %ux%u fmt %u",
+                   "camera invalid %u, upscaler reset %u (given to DLSS-G %u, camera delta mean %.4f max %.3f NDC) | last HUD-less %ux%u fmt %u%s, game image %ux%u fmt %u",
                    g_stat_inputs, g_stat_untagged, g_stat_hudless, g_stat_nohudless,
-                   g_stat_hudless_size, g_stat_nocamera, g_stat_reset, g_last_hl_w, g_last_hl_h,
+                   g_stat_hudless_size, g_stat_nocamera, g_stat_reset, g_stat_reset_given,
+                   g_stat_cam_n ? g_stat_cam_sum / g_stat_cam_n : 0.0, g_stat_cam_max, g_last_hl_w, g_last_hl_h,
                    g_last_hl_fmt, g_last_hl_scaled ? " (scaled to the game image)" : "", g_last_gi_w,
                    g_last_gi_h, g_last_gi_fmt);
             g_stat_untagged = g_stat_nohudless = g_stat_hudless_size = g_stat_reset =
-                g_stat_nocamera = g_stat_inputs = 0;
+                g_stat_nocamera = g_stat_inputs = g_stat_reset_given = g_stat_cam_n = 0;
+            g_stat_cam_sum = g_stat_cam_max = 0;
             g_stat_hudless = 0;
             g_stat_start = now;
             g_stat_real = 0;
@@ -1733,6 +1844,10 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         if (g_mode_set != (mode_on ? 1 : 0)) {
             Printf("DLSS-G: %s", mode_on ? "on (3D frame: depth, motion vectors, camera)"
                                          : "off (no 3D frame: menu, loading or movie)");
+        }
+        if (mode_on && g_mode_set != 1) {
+            g_mode_on_at = g_presents;
+            g_nogen_run = 0;
         }
         g_mode_set = mode_on ? 1 : 0;
         options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
@@ -1778,6 +1893,11 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             Printf("frame generation: slDLSSGSetOptions failed (%d)", static_cast<int>(result));
         }
         g_options_set = true;
+        if (g_resume_pending && g_mode_set == 1) {
+            g_resume_pending = false;
+            Printf("DLSS-G: resumed after swapchain recreate %ux%u (was %ux%u)", backbuffer.width,
+                   backbuffer.height, g_options_backbuffer.width, g_options_backbuffer.height);
+        }
         g_options_backbuffer = backbuffer;
         g_options_format = format;
     }
@@ -2001,6 +2121,39 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
 #endif
 }
 
+// bb-dlssg-085: DLSS-G off without retaining its resources, then its viewport's resources freed
+// (slFreeResources): its NGX feature is made again when it is turned on. For a swapchain that is
+// going away (SwapchainChanging) and for the retry after a feature that was not created.
+void ReleaseForRetry() {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    if (!g_ready || g_api.dlssg_set_options == nullptr) return;
+    sl::DLSSGOptions options{};
+    options.mode = sl::DLSSGMode::eOff;
+    options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
+    options.colorWidth = options.mvecDepthWidth = g_options_backbuffer.width;
+    options.colorHeight = options.mvecDepthHeight = g_options_backbuffer.height;
+    if (g_options_format != vk::Format::eUndefined) {
+        options.colorBufferFormat = options.hudLessBufferFormat =
+            static_cast<uint32_t>(static_cast<VkFormat>(g_options_format));
+    }
+    options.mvecBufferFormat = static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT);
+    options.depthBufferFormat = static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT);
+    if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle{0}, options);
+        result != sl::Result::eOk) {
+        Printf("frame generation: slDLSSGSetOptions (off) failed (%d)", static_cast<int>(result));
+    }
+    if (auto* free_resources =
+            reinterpret_cast<PFun_slFreeResources*>(SR::Dlss::Proc("slFreeResources"))) {
+        if (const auto result = free_resources(sl::kFeatureDLSS_G, sl::ViewportHandle{0});
+            result != sl::Result::eOk) {
+            Printf("frame generation: slFreeResources (DLSS-G) failed (%d)", static_cast<int>(result));
+        }
+    }
+    g_mode_set = 0;
+    g_options_set = false;
+#endif
+}
+
 void AfterPresent() {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
     if (g_present_begin != Clock::time_point{}) {
@@ -2009,6 +2162,21 @@ void AfterPresent() {
         g_stat_present_ms += ms;
         g_stat_present_max = std::max(g_stat_present_max, ms);
         g_present_begin = {};
+        // bb-dlssg-085: the present call held the presenter (and so the next flip) for > 8 ms.
+        if (ms > 8.0) {
+            static Clock::time_point window{};
+            static int lines = 0;
+            const auto now_block = Clock::now();
+            if (now_block - window > std::chrono::seconds(10)) {
+                window = now_block;
+                lines = 0;
+            }
+            if (lines < 6) {
+                ++lines;
+                Printf("[hitch] the present call blocked %.1f ms (frame %u, Streamline status 0x%x)",
+                       ms, g_frame_index, g_last_status);
+            }
+        }
     }
     if (!g_ready || g_token == nullptr) {
         return;
@@ -2022,6 +2190,28 @@ void AfterPresent() {
     if (state_result == sl::Result::eOk) {
         Display::NoteStreamline(state.numFramesActuallyPresented,
                                 static_cast<uint32_t>(state.status), state.numFramesToGenerateMax);
+        // bb-dlssg-085: on and asked to generate, but nothing generated for 90 presents (after
+        // 60 settling ones): its feature was not created (a swapchain lost and made again). Off,
+        // resources freed, on again after a second; one line a second with the count.
+        if (g_mode_set == 1 && CurrentGenerate() > 0 && presents > g_mode_on_at + 60) {
+            g_nogen_run = state.numFramesActuallyPresented <= 1 ? g_nogen_run + 1 : 0;
+            if (g_nogen_run >= 90) {
+                g_nogen_run = 0;
+                ++g_reset_count;
+                static Clock::time_point last_log{};
+                const auto now_reset = Clock::now();
+                if (now_reset - last_log >= std::chrono::seconds(1)) {
+                    last_log = now_reset;
+                    Printf("DLSS-G: not generating (Streamline status 0x%x): resources freed and "
+                           "retried in 1 s (%u time(s) so far)",
+                           static_cast<uint32_t>(state.status), g_reset_count);
+                }
+                ReleaseForRetry();
+                g_backoff_until = now_reset + std::chrono::seconds(1);
+            }
+        } else if (g_mode_set != 1) {
+            g_nogen_run = 0;
+        }
     }
     // bb-dlssg-077: the Reflex latency report, a clock Streamline keeps for the real frames that is
     // not ours (see Display::NoteGpuEnds); polled every 40 presents from this thread only.
@@ -2038,6 +2228,51 @@ void AfterPresent() {
                 }
             }
             Display::NoteGpuEnds(ids, ends, n);
+            // bb-dlssg-085: a real frame that took > 25 ms (the hitches) with where its time went,
+            // from the same report (driver clock, microseconds; -1: not stamped).
+            std::vector<const sl::ReflexReport*> order;
+            for (const auto& f : report->frameReport) {
+                if (f.frameID != 0 && f.gpuRenderEndTime != 0) order.push_back(&f);
+            }
+            std::sort(order.begin(), order.end(),
+                      [](const sl::ReflexReport* a, const sl::ReflexReport* b) {
+                          return a->frameID < b->frameID;
+                      });
+            static uint64_t hitch_last_id = 0, hitch_last_end = 0;
+            static Clock::time_point hitch_window{};
+            static int hitch_lines = 0;
+            const auto now_hitch = Clock::now();
+            if (now_hitch - hitch_window > std::chrono::seconds(10)) {
+                hitch_window = now_hitch;
+                hitch_lines = 0;
+            }
+            const auto span = [](uint64_t a, uint64_t b) {
+                return a != 0 && b >= a ? static_cast<double>(b - a) / 1000.0 : -1.0;
+            };
+            for (const auto* f : order) {
+                if (f->frameID <= hitch_last_id) continue;
+                const double gap = hitch_last_end != 0 && f->gpuRenderEndTime > hitch_last_end
+                                       ? static_cast<double>(f->gpuRenderEndTime - hitch_last_end) / 1000.0
+                                       : 0.0;
+                hitch_last_id = f->frameID;
+                hitch_last_end = f->gpuRenderEndTime;
+                if (gap > 25.0 && gap < 500.0 && hitch_lines < 12) {
+                    ++hitch_lines;
+                    Printf("[hitch] frame %llu: %.1f ms after the previous real frame at the GPU | "
+                           "game %.1f ms (simulation start to render submit end), submit end to "
+                           "present start %.1f, present call %.1f, driver %.1f, OS queue %.1f, "
+                           "queue to GPU start %.1f, GPU %.1f ms (active %.1f)",
+                           static_cast<unsigned long long>(f->frameID), gap,
+                           span(f->simStartTime, f->renderSubmitEndTime),
+                           span(f->renderSubmitEndTime, f->presentStartTime),
+                           span(f->presentStartTime, f->presentEndTime),
+                           span(f->driverStartTime, f->driverEndTime),
+                           span(f->osRenderQueueStartTime, f->osRenderQueueEndTime),
+                           span(f->osRenderQueueEndTime, f->gpuRenderStartTime),
+                           span(f->gpuRenderStartTime, f->gpuRenderEndTime),
+                           static_cast<double>(f->gpuActiveRenderTimeUs) / 1000.0);
+                }
+            }
         }
     }
     if (presents % 30 != 1) {
@@ -2121,19 +2356,14 @@ void KeepOff(vk::Extent2D backbuffer, vk::Format format, uint32_t image_count) {
 void SwapchainChanging() {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
     g_off_backbuffer = {};
-    if (!g_ready || g_mode_set != 1) {
+    if (!g_ready || (g_mode_set != 1 && !g_options_set)) {
         return;
     }
-    sl::DLSSGOptions options{};
-    options.mode = sl::DLSSGMode::eOff;
-    options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
-    options.numFramesToGenerate = static_cast<uint32_t>(CurrentGenerate());
-    if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle{0}, options);
-        result != sl::Result::eOk) {
-        Printf("frame generation: slDLSSGSetOptions (off) failed (%d)", static_cast<int>(result));
-    }
-    g_mode_set = 0;
-    g_options_set = false;
+    // bb-dlssg-085: off WITHOUT eRetainResourcesWhenOff, and the viewport's resources freed (the
+    // device is idle: Swapchain::Destroy waited): the NGX feature of the old swapchain must not
+    // outlive it. It is made again by the first options set on the new one.
+    ReleaseForRetry();
+    g_resume_pending = true;
 #endif
 }
 
@@ -2222,12 +2452,38 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
         // defeats on Vulkan), does not tear, and on a VRR display the images are shown as they
         // arrive. Its cost: with more images than refreshes the older one is replaced (dropped),
         // visible in [display] dropped. Immediate only where mailbox is not offered.
-        wanted = supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
+        // bb-dlssg-085: the 18:29 run (mailbox) had the present call blocking 2.7-10 ms on average,
+        // up to 17-19 ms, in most seconds of x2 (a real frame's flip waits behind it: the 35-40 ms
+        // hitches); the 0.75 run in immediate had 0.7-1.1 ms (max 1.9) for the same call. So the
+        // default is immediate on a monitor of 120 Hz or more (shown 150-160 fps stays under its
+        // refresh: nothing to tear with VRR, and 1 frame in 2 at most would be torn without),
+        // mailbox below that, where immediate would tear. BB_FG_PRESENT=mailbox keeps 0.77's.
+        int refresh_hz = 0;
+#if defined(_WIN32)
+        {
+            DEVMODEA display_mode{};
+            display_mode.dmSize = sizeof(display_mode);
+            if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &display_mode) != 0) {
+                refresh_hz = static_cast<int>(display_mode.dmDisplayFrequency);
+            }
+        }
+#endif
+        // (Immediate is only free of tearing inside the VRR range: with the shown rate held
+        // under it, KYTY_VRR_CAP_FPS; uncapped the rate can pass the refresh, and mailbox, which
+        // never tears, is used.)
+        const bool high_refresh = refresh_hz >= 120 && Env("KYTY_VRR_CAP_FPS") != nullptr;
+        wanted = high_refresh && supported(vk::PresentModeKHR::eImmediate)
+                     ? vk::PresentModeKHR::eImmediate
+                 : supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
                  : supported(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
                                                              : current;
-        why = "DLSS-G on Vulkan has no vsync support (Streamline guide 22.5): mailbox does not "
-              "block Streamline's pacer and does not tear; BB_FG_PRESENT=fifo|immediate|user "
-              "overrides";
+        static char text[240];
+        std::snprintf(text, sizeof(text),
+                      "DLSS-G on Vulkan has no vsync support (Streamline guide 22.5); display %d Hz: "
+                      "%s; BB_FG_PRESENT=fifo|mailbox|immediate|user overrides", refresh_hz,
+                      high_refresh ? "immediate, mailbox made the present call block 3-17 ms"
+                                   : "mailbox (immediate would tear below 120 Hz)");
+        why = text;
     }
     if (wanted != current && !supported(wanted)) {
         wanted = current;
@@ -2444,6 +2700,23 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
 
 void AfterPresent() {
     Dlssg::AfterPresent();
+}
+
+double CameraDeltaNdc(bool camera_valid, const float* clip_to_prev_clip) {
+    if (!camera_valid || clip_to_prev_clip == nullptr) return 0.0;
+    const float* m = clip_to_prev_clip;
+    double sum = 0;
+    const double pts[4][2] = {{-0.5, -0.5}, {0.5, -0.5}, {-0.5, 0.5}, {0.5, 0.5}};
+    for (const auto& pt : pts) {
+        const double v[4] = {pt[0], pt[1], 0.5, 1.0};
+        double o[4]{};
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) o[i] += m[i * 4 + j] * v[j];
+        if (std::fabs(o[3]) < 1e-9) return 1e9;
+        const double dx = o[0] / o[3] - pt[0], dy = o[1] / o[3] - pt[1];
+        sum += std::sqrt(dx * dx + dy * dy);
+    }
+    return sum / 4.0;
 }
 
 } // namespace BB::FG

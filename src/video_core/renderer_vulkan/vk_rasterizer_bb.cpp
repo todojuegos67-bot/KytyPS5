@@ -27,6 +27,7 @@
 #include "video_core/host_shaders/bb_alpha_comp.h"
 #include "video_core/host_shaders/bb_hud_comp.h"
 #include "video_core/host_shaders/bb_hudless_lut_comp.h"
+#include "video_core/host_shaders/bb_mvcheck_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/host_shaders/bb_rtrefl_comp.h"
 #include "video_core/host_shaders/bb_vol_comp.h"
@@ -167,6 +168,7 @@ struct BBVk {
     OwnImage lut_s, lut_f, lut_out;
     vk::Pipeline lut_pipeline{};
     bool lut_failed_init = false, lut_disabled = false, lut_ready = false;
+    u32 lut_off_calls = 0; // bb-dlssg-085: presents since the self-check switched the curve off
     std::array<vk::Buffer, 4> lut_buf{};
     std::array<VmaAllocation, 4> lut_alloc{};
     std::array<void*, 4> lut_mapped{};
@@ -180,6 +182,14 @@ struct BBVk {
     bool lut_verdict_ok = false;
     u64 lut_frames = 0, lut_ok = 0, lut_conflict = 0, lut_mismatch = 0, lut_bad_streak = 0;
     u64 fg_hudless_frames = 0, fg_frames = 0;
+    // bb-dlssg-087: [mv-check] (bb_mvcheck.comp): the real frame stored, the next one compared.
+    OwnImage mvc_small;
+    vk::Pipeline mvc_pipeline{};
+    vk::Buffer mvc_buf{};
+    VmaAllocation mvc_alloc{};
+    void* mvc_mapped = nullptr;
+    bool mvc_failed = false, mvc_has_prev = false, mvc_pending = false;
+    u64 mvc_stored_frame = 0;
     struct FgSlot {
         OwnImage depth, mv;
     };
@@ -2268,6 +2278,17 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
                            static_cast<unsigned long long>(g_bb.lut_a));
         }
     }
+    // bb-dlssg-085: the curve pass was switched off for the whole session after 5 failed checks
+    // in a row (11-05 18:29 run: conflicts 65-488 of 11 million samples, so no HUD-less image on
+    // 83 of 83 frames a second). It is tried again after ~1500 presents (~20 s).
+    if (g_bb.lut_disabled && g_bb.lut_pipeline && ++g_bb.lut_off_calls >= 1500) {
+        g_bb.lut_off_calls = 0;
+        g_bb.lut_disabled = false;
+        g_bb.lut_bad_streak = 0;
+        g_bb.lut_table_slot = ~0u;
+        g_bb.lut_verdict_ok = false;
+        BB::FG::Printf("[fg-hudless] trying the curve pass again");
+    }
     if (!captured || g_bb.lut_disabled || !g_bb.init) {
         return;
     }
@@ -2488,7 +2509,11 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
         const u32 conflicts = counters[0], mismatches = counters[1], gaps = counters[2],
                   hud = counters[3];
         ++g_bb.lut_frames;
-        const bool bad = conflicts != 0 || mismatches != 0;
+        // bb-dlssg-085: a few hundred stray samples (65-488 in the 18:29 run, against 189089 when
+        // the curve really is not one) do not make the table wrong: one code value in ten
+        // thousand off by a level. kHudlessTolerance is the same constant in bb_hudless_lut.comp.
+        constexpr u32 kHudlessTolerance = 3000;
+        const bool bad = conflicts > kHudlessTolerance || mismatches > kHudlessTolerance;
         if (bad) {
             g_bb.lut_conflict += conflicts != 0;
             g_bb.lut_mismatch += mismatches != 0;
@@ -2565,6 +2590,151 @@ bool Rasterizer::BBFgNativeAnalyze(VideoCore::Image& flip, bool late) {
     }
     g_bb.fgn_ready = true;
     return true;
+}
+
+// bb-dlssg-087: [mv-check]. Every ~60 real frames the HUD-less image is stored at 256x144; on the
+// next real frame it is warped with the vectors given to DLSS-G and compared (given, zero,
+// negated), and the depth is sampled. The result is read after the GPU finished.
+static void MvCheck(Scheduler& scheduler, vk::CommandBuffer cmd, vk::ImageView color,
+             const OwnImage& mv, const OwnImage& depth, bool depth_inverted, bool jitter_zero) {
+    static const bool off = [] {
+        const char* e = std::getenv("BB_MV_CHECK");
+        return e != nullptr && e[0] == '0';
+    }();
+    if (off || g_bb.mvc_failed || !color || !InitHud()) {
+        return;
+    }
+    const bool compare = g_bb.mvc_has_prev && g_bb.mvc_stored_frame + 1 == g_bb.fg_frames;
+    if (!compare && (g_bb.fg_frames % 60 != 0 || g_bb.mvc_pending)) {
+        return;
+    }
+    if (!g_bb.mvc_pipeline) {
+        g_bb.mvc_failed = true;
+        const auto module = CompileSPV(BB_MVCHECK_COMP, g_bb.device);
+        if (!module) {
+            return;
+        }
+        auto [r, pipe] = g_bb.device.createComputePipeline(
+            {}, vk::ComputePipelineCreateInfo{
+                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                              .module = module,
+                              .pName = "main"},
+                    .layout = g_bb.hud_layout,
+                });
+        g_bb.device.destroyShaderModule(module);
+        if (r != vk::Result::eSuccess) {
+            return;
+        }
+        const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+            .size = 64,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                     vk::BufferUsageFlagBits::eTransferDst,
+        };
+        VmaAllocationCreateInfo alloc{};
+        alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer buffer{};
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(g_bb.allocator, &ci, &alloc, &buffer, &g_bb.mvc_alloc, &info) !=
+            VK_SUCCESS) {
+            return;
+        }
+        g_bb.mvc_buf = buffer;
+        g_bb.mvc_mapped = info.pMappedData;
+        g_bb.mvc_pipeline = pipe;
+        g_bb.mvc_failed = false;
+    }
+    if (!EnsureImage(g_bb.mvc_small, vk::Extent2D{256, 144}, vk::Format::eR16G16B16A16Sfloat,
+                     vk::ImageUsageFlagBits::eStorage)) {
+        g_bb.mvc_failed = true;
+        return;
+    }
+    Barrier(cmd, g_bb.mvc_small, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eComputeShader,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+    cmd.fillBuffer(g_bb.mvc_buf, 0, 64, 0);
+    const vk::MemoryBarrier2 fill{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &fill});
+    const vk::DescriptorImageInfo c_info{g_bb.nearest, color, vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo m_info{g_bb.nearest, mv.view, vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo d_info{g_bb.nearest, depth.view,
+                                         vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo s_info{{}, g_bb.mvc_small.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo b_info{g_bb.mvc_buf, 0, 64};
+    const std::array writes{
+        vk::WriteDescriptorSet{.dstBinding = 0, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &c_info},
+        vk::WriteDescriptorSet{.dstBinding = 1, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &m_info},
+        vk::WriteDescriptorSet{.dstBinding = 2, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &d_info},
+        vk::WriteDescriptorSet{.dstBinding = 3, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &s_info},
+        vk::WriteDescriptorSet{.dstBinding = 4, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = &b_info},
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.mvc_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.hud_layout, 0, writes);
+    const u32 push[4]{256, 144, compare ? 1u : 0u, 0u};
+    cmd.pushConstants(g_bb.hud_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
+    cmd.dispatch(32, 18, 1);
+    if (!compare) {
+        g_bb.mvc_has_prev = true;
+        g_bb.mvc_stored_frame = g_bb.fg_frames;
+        return;
+    }
+    g_bb.mvc_has_prev = false;
+    g_bb.mvc_pending = true;
+    const vk::MemoryBarrier2 host{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &host});
+    const VmaAllocator allocator = g_bb.allocator;
+    const VmaAllocation allocation = g_bb.mvc_alloc;
+    const u32* v = static_cast<const u32*>(g_bb.mvc_mapped);
+    scheduler.DeferOperation([=] {
+        vmaInvalidateAllocation(allocator, allocation, 0, 64);
+        const double n = std::max<double>(v[3], 1.0);
+        const auto psnr = [&](u32 e) {
+            const double mse = std::max(static_cast<double>(e) / 65536.0 / n, 1e-9);
+            return 10.0 * std::log10(1.0 / mse);
+        };
+        float centre = 0;
+        std::memcpy(&centre, &v[12], 4);
+        float dmax = 0, dmin = 0;
+        std::memcpy(&dmax, &v[5], 4);
+        const u32 dmin_bits = ~v[4];
+        std::memcpy(&dmin, &dmin_bits, 4);
+        const double top = v[7] ? v[6] / 65536.0 / v[7] : 0.0;
+        const double bot = v[9] ? v[8] / 65536.0 / v[9] : 0.0;
+        const bool inverted_seen = top < bot; // sky (top) far, ground (bottom) near
+        const u32 ge = v[0], ze = v[1], ne = v[2];
+        const char* best = ge <= ze && ge <= ne ? "given" : ne < ze ? "NEGATED" : "ZERO";
+        BB::FG::Printf("[mv-check] warp PSNR given %.2f dB, zero %.2f dB, negated %.2f dB (%s best; "
+                       "%.0f samples, mean |mv| %.2f px); depth near/far samples min %.5f max %.5f "
+                       "centre %.5f, top strip mean %.4f, bottom strip mean %.4f, <0.001: %u, "
+                       ">0.999: %u (inverted by the samples? %s; given to DLSS-G: %s); jitter %s",
+                       psnr(ge), psnr(ze), psnr(ne), best, n, v[13] / 16.0 / n,
+                       static_cast<double>(dmin), static_cast<double>(dmax),
+                       static_cast<double>(centre), top, bot, v[10], v[11],
+                       inverted_seen ? "yes" : "no", depth_inverted ? "yes" : "no",
+                       jitter_zero ? "0 0" : "non-zero");
+        g_bb.mvc_pending = false;
+    });
 }
 
 bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
@@ -2718,6 +2888,10 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
         out.hudless_source = "A before its HUD through the game's curve (self-checked)";
     }
     ++g_bb.fg_frames;
+    if (hudless_view) {
+        MvCheck(scheduler, cmd, hudless_view, slot.mv, slot.depth, plan.depth_inverted,
+                plan.jitter[0] == 0.0f && plan.jitter[1] == 0.0f);
+    }
     if (hudless_view) ++g_bb.fg_hudless_frames;
     if (g_bb.fg_frames % 600 == 1) {
         BB::FG::Printf("[fg] HUD-less self-check: %llu of %llu 3D frames had an image without "

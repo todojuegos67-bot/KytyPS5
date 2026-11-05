@@ -1,0 +1,95 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-dlssg-087: an objective check of what frame generation is given ([mv-check] in the log).
+//  mode 0: store a 256x144 average of the real frame (the HUD-less image) in prev_img.
+//  mode 1 (the next real frame): warp that stored image with the motion vectors given to DLSS-G
+//          (pixels towards the previous frame: previous position = pixel + vector) and compare
+//          it with the current frame; the same with zero vectors and with negated vectors; and
+//          sample the depth (min / max, top strip against bottom strip: where the sky is).
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D cur_tex;
+layout(binding = 1) uniform sampler2D mv_tex;
+layout(binding = 2) uniform sampler2D depth_tex;
+layout(binding = 3, rgba16f) uniform image2D prev_img;
+layout(std430, binding = 4) buffer Out {
+    uint e_given, e_zero, e_neg, n;
+    uint dmin_inv, dmax, top_sum, top_n;
+    uint bot_sum, bot_n, c_low, c_high;
+    uint centre, mv_len, pad0, pad1;
+} o;
+layout(push_constant) uniform Push {
+    uvec4 size; // 256, 144, mode, 0
+} p;
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+vec3 Prev(vec2 pos) {
+    // bilinear fetch of the stored image at a position in small pixels (0.5 = a centre)
+    const vec2 q = pos - 0.5;
+    const ivec2 i0 = ivec2(floor(q));
+    const vec2 f = q - vec2(i0);
+    const ivec2 hi = ivec2(p.size.xy) - 1;
+    const vec3 a = imageLoad(prev_img, clamp(i0, ivec2(0), hi)).rgb;
+    const vec3 b = imageLoad(prev_img, clamp(i0 + ivec2(1, 0), ivec2(0), hi)).rgb;
+    const vec3 c = imageLoad(prev_img, clamp(i0 + ivec2(0, 1), ivec2(0), hi)).rgb;
+    const vec3 d = imageLoad(prev_img, clamp(i0 + ivec2(1, 1), ivec2(0), hi)).rgb;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+vec3 Cell(ivec2 c) {
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            const vec2 uv = (vec2(c) + (vec2(x, y) + 0.5) / 4.0) / vec2(p.size.xy);
+            sum += textureLod(cur_tex, uv, 0.0).rgb;
+        }
+    }
+    return sum / 16.0;
+}
+
+void main() {
+    const ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    const vec3 cur = Cell(c);
+    if (p.size.z == 0u) {
+        imageStore(prev_img, c, vec4(cur, 1.0));
+        return;
+    }
+    const vec2 uv = (vec2(c) + 0.5) / vec2(p.size.xy);
+    const vec2 mv = textureLod(mv_tex, uv, 0.0).rg; // render pixels
+    const vec2 mvs = mv * vec2(p.size.xy) / vec2(textureSize(mv_tex, 0));
+    const vec2 centre = vec2(c) + 0.5;
+    const vec2 pg = centre + mvs, pn = centre - mvs;
+    const vec2 lo = vec2(0.5), hi = vec2(p.size.xy) - 0.5;
+    const float d = textureLod(depth_tex, uv, 0.0).r;
+    atomicMax(o.dmin_inv, ~floatBitsToUint(max(d, 0.0)));
+    atomicMax(o.dmax, floatBitsToUint(max(d, 0.0)));
+    if (c.y < 14) {
+        atomicAdd(o.top_sum, uint(clamp(d, 0.0, 1.0) * 65536.0));
+        atomicAdd(o.top_n, 1u);
+    } else if (c.y >= int(p.size.y) - 29) {
+        atomicAdd(o.bot_sum, uint(clamp(d, 0.0, 1.0) * 65536.0));
+        atomicAdd(o.bot_n, 1u);
+    }
+    if (d < 0.001) atomicAdd(o.c_low, 1u);
+    if (d > 0.999) atomicAdd(o.c_high, 1u);
+    if (c == ivec2(p.size.xy) / 2) o.centre = floatBitsToUint(d);
+    if (any(isnan(mvs)) || any(lessThan(pg, lo)) || any(greaterThan(pg, hi)) ||
+        any(lessThan(pn, lo)) || any(greaterThan(pn, hi))) {
+        return;
+    }
+    const float l = Luma(cur);
+    const float eg = Luma(Prev(pg)) - l;
+    const float ez = Luma(Prev(centre)) - l;
+    const float en = Luma(Prev(pn)) - l;
+    atomicAdd(o.e_given, uint(min(eg * eg, 1.0) * 65536.0));
+    atomicAdd(o.e_zero, uint(min(ez * ez, 1.0) * 65536.0));
+    atomicAdd(o.e_neg, uint(min(en * en, 1.0) * 65536.0));
+    atomicAdd(o.n, 1u);
+    atomicAdd(o.mv_len, uint(min(length(mv), 4000.0) * 16.0));
+}

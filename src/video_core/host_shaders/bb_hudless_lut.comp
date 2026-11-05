@@ -34,6 +34,9 @@ layout(push_constant) uniform Push {
     uvec4 size; // width, height, mode, check
 } p;
 
+// bb-dlssg-085: strays tolerated (kHudlessTolerance in vk_rasterizer_bb.cpp).
+const uint kTolerance = 3000u;
+
 shared uint g_mismatch;
 shared uint g_hud;
 
@@ -103,7 +106,7 @@ void main() {
                 }
             }
             imageStore(out_img, xy, vec4(vec3(o) / 255.0, fc.a));
-        } else if (lut.conflicts != 0u || lut.mismatches != 0u) {
+        } else if (lut.conflicts > kTolerance || lut.mismatches > kTolerance) {
             imageStore(out_img, xy, fc);
         }
     }

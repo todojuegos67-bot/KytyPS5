@@ -115,6 +115,11 @@ struct Inputs {
     uint32_t sl_frame = 0;  // Streamline frame index of this frame's DLSS evaluate (0: none)
     const char* hudless_source = "none"; // where the HUD-less image came from (log)
 };
+// bb-merge-088: the one camera-cut measure of the build, used by DLSS-G's reset (bb_fg.cpp) and the
+// upscaler's history reset (bb_upscale.cpp, BB_SR_CUT_NDC): the mean displacement (NDC, the screen
+// is 2 wide) of four clip points through clip_to_prev_clip. A turn is 0.01-0.3; a cut is above 1.
+// 0 without a valid camera, 1e9 when a point goes through w = 0.
+double CameraDeltaNdc(bool camera_valid, const float* clip_to_prev_clip);
 // FG wants the inputs captured (any method asked and its back end ready).
 bool WantInputs();
 // bb-merge-082: DLSS-G is the method in use (its HUD-less image is made at the game image's size).
