@@ -10,6 +10,10 @@
 #include <limits>
 #include <string>
 #include <tuple>
+#include <cstring>
+#include <filesystem>
+#include <span>
+#include <stb_image_write.h>
 #include <unordered_map>
 #include <fmt/format.h>
 #include "common/logging/log.h"
@@ -2822,6 +2826,417 @@ void Rasterizer::BBOnDraw(u32 num_cb, u64 vs_hash, u64 ps_hash) {
         func == AmdGpu::CompareFunc::Greater || func == AmdGpu::CompareFunc::GreaterEqual;
     BB::Upscale::OnDraw(std::span(colors.data(), num_colors), has_depth ? &depth : nullptr, greater,
                         viewport, vs_hash, ps_hash);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// BB 0.80 native chain: the upscaled image as the source address's output-size image, the
+// content check, and the BB_DUMP_FRAME frame dump.
+namespace {
+struct HostBuf {
+    vk::Buffer buffer{};
+    VmaAllocation allocation{};
+    void* mapped = nullptr;
+    u64 size = 0;
+};
+bool MakeHostBuf(HostBuf& b, u64 size) {
+    const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+        .size = size,
+        .usage = vk::BufferUsageFlagBits::eTransferDst,
+    };
+    VmaAllocationCreateInfo alloc{};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer buffer{};
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(g_bb.allocator, &ci, &alloc, &buffer, &b.allocation, &info) != VK_SUCCESS) {
+        return false;
+    }
+    b.buffer = buffer;
+    b.mapped = info.pMappedData;
+    b.size = size;
+    return true;
+}
+void FreeHostBuf(HostBuf& b) {
+    if (b.buffer) vmaDestroyBuffer(g_bb.allocator, b.buffer, b.allocation);
+    b = {};
+}
+
+// Content check: both images downscaled to 64x36 and compared on the CPU a few frames later.
+struct ContentCheck {
+    OwnImage a, b; // the internal lit colour, the source's output-size image (both 64x36)
+    HostBuf host;
+    u64 tick = 0;
+    bool pending = false;
+    u32 count = 0;
+} g_cc;
+constexpr u32 kCcW = 64, kCcH = 36;
+
+void PollContent(Scheduler& scheduler) {
+    if (!g_cc.pending || !scheduler.IsFree(g_cc.tick)) return;
+    g_cc.pending = false;
+    vmaInvalidateAllocation(g_bb.allocator, g_cc.host.allocation, 0, VK_WHOLE_SIZE);
+    const auto* h = static_cast<const u16*>(g_cc.host.mapped);
+    const u32 n = kCcW * kCcH;
+    double se = 0.0;
+    for (u32 i = 0; i < n; ++i) {
+        for (u32 c = 0; c < 3; ++c) {
+            float x = HalfToFloat(h[i * 4 + c]), y = HalfToFloat(h[(n + i) * 4 + c]);
+            if (!std::isfinite(x)) x = 0.0f;
+            if (!std::isfinite(y)) y = 0.0f;
+            x = std::max(x, 0.0f) / (1.0f + std::max(x, 0.0f)); // tone-mapped so HDR compares
+            y = std::max(y, 0.0f) / (1.0f + std::max(y, 0.0f));
+            se += double(x - y) * double(x - y);
+        }
+    }
+    const double mse = se / double(n * 3);
+    BB::Upscale::OnContentCheck(mse <= 1e-12 ? 99.0 : 10.0 * std::log10(1.0 / mse));
+}
+
+// BB_DUMP_FRAME=N: every render target of frame N, after each pass (a pass ends when the bound
+// targets change), plus the upscaled output, as PNG in BB_DUMP_DIR (default bb_dump).
+struct DumpEntry {
+    HostBuf host;
+    std::string name;
+    u32 w = 0, h = 0;
+    vk::Format format{};
+    bool depth = false;
+};
+struct DumpState {
+    s64 frame = -2; // -2 not read yet, -1 off
+    std::string dir;
+    std::vector<DumpEntry> entries;
+    u64 bytes = 0;
+    u32 lines = 0;
+    bool done = false;
+    std::vector<VideoCore::ImageId> last_targets;
+    u32 pass = 0;
+} g_dump;
+
+u32 DumpBpp(vk::Format f) {
+    switch (f) {
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eB8G8R8A8Unorm:
+    case vk::Format::eB8G8R8A8Srgb:
+    case vk::Format::eA2B10G10R10UnormPack32:
+    case vk::Format::eB10G11R11UfloatPack32:
+    case vk::Format::eR16G16Sfloat:
+    case vk::Format::eR32Sfloat:
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD32SfloatS8Uint:
+        return 4;
+    case vk::Format::eR16G16B16A16Sfloat:
+        return 8;
+    case vk::Format::eR8G8Unorm:
+        return 2;
+    case vk::Format::eR8Unorm:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+float Unpack11(u32 v, u32 mbits) {
+    const u32 e = v >> mbits, m = v & ((1u << mbits) - 1);
+    if (e == 0) return std::ldexp(float(m), -14 - int(mbits));
+    if (e == 31) return 65504.0f;
+    return std::ldexp(1.0f + float(m) / float(1u << mbits), int(e) - 15);
+}
+
+u8 ToByte(float v, bool hdr) {
+    if (!std::isfinite(v)) v = 0.0f;
+    if (hdr) v = std::pow(std::max(v, 0.0f) / (1.0f + std::max(v, 0.0f)), 1.0f / 2.2f);
+    return u8(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
+void WriteDump(DumpEntry& e) {
+    std::vector<u8> rgba(size_t(e.w) * e.h * 4, 255);
+    const u8* src = static_cast<const u8*>(e.host.mapped);
+    const size_t n = size_t(e.w) * e.h;
+    for (size_t i = 0; i < n; ++i) {
+        u8* o = &rgba[i * 4];
+        switch (e.format) {
+        case vk::Format::eR8G8B8A8Unorm:
+        case vk::Format::eR8G8B8A8Srgb:
+            std::memcpy(o, src + i * 4, 4);
+            break;
+        case vk::Format::eB8G8R8A8Unorm:
+        case vk::Format::eB8G8R8A8Srgb:
+            o[0] = src[i * 4 + 2]; o[1] = src[i * 4 + 1]; o[2] = src[i * 4]; o[3] = src[i * 4 + 3];
+            break;
+        case vk::Format::eA2B10G10R10UnormPack32: {
+            u32 v; std::memcpy(&v, src + i * 4, 4);
+            o[0] = u8((v & 1023) >> 2); o[1] = u8(((v >> 10) & 1023) >> 2);
+            o[2] = u8(((v >> 20) & 1023) >> 2); o[3] = u8((v >> 30) * 85);
+            break;
+        }
+        case vk::Format::eB10G11R11UfloatPack32: {
+            u32 v; std::memcpy(&v, src + i * 4, 4);
+            o[0] = ToByte(Unpack11(v & 2047, 6), true);
+            o[1] = ToByte(Unpack11((v >> 11) & 2047, 6), true);
+            o[2] = ToByte(Unpack11((v >> 22) & 1023, 5), true);
+            break;
+        }
+        case vk::Format::eR16G16B16A16Sfloat: {
+            const auto* hh = reinterpret_cast<const u16*>(src + i * 8);
+            for (u32 c = 0; c < 3; ++c) o[c] = ToByte(HalfToFloat(hh[c]), true);
+            o[3] = ToByte(HalfToFloat(hh[3]), false);
+            break;
+        }
+        case vk::Format::eR16G16Sfloat: {
+            const auto* hh = reinterpret_cast<const u16*>(src + i * 4);
+            o[0] = ToByte(HalfToFloat(hh[0]) * 0.5f + 0.5f, false);
+            o[1] = ToByte(HalfToFloat(hh[1]) * 0.5f + 0.5f, false);
+            o[2] = 0;
+            break;
+        }
+        case vk::Format::eR32Sfloat:
+        case vk::Format::eD32Sfloat:
+        case vk::Format::eD32SfloatS8Uint: {
+            float d; std::memcpy(&d, src + i * 4, 4);
+            o[0] = o[1] = o[2] = ToByte(d, false);
+            break;
+        }
+        case vk::Format::eR8G8Unorm:
+            o[0] = src[i * 2]; o[1] = src[i * 2 + 1]; o[2] = 0;
+            break;
+        case vk::Format::eR8Unorm:
+            o[0] = o[1] = o[2] = src[i];
+            break;
+        default:
+            break;
+        }
+    }
+    const std::string path = g_dump.dir + "/" + e.name + ".png";
+    stbi_write_png(path.c_str(), int(e.w), int(e.h), 4, rgba.data(), int(e.w * 4));
+}
+
+bool DumpActive() {
+    if (g_dump.frame == -2) {
+        const char* v = std::getenv("BB_DUMP_FRAME");
+        g_dump.frame = (v != nullptr && *v != '\0') ? std::max<s64>(0, std::atoll(v)) : -1;
+        const char* d = std::getenv("BB_DUMP_DIR");
+        g_dump.dir = (d != nullptr && *d != '\0') ? d : "bb_dump";
+        if (g_dump.frame >= 0) {
+            std::error_code ec;
+            std::filesystem::create_directories(g_dump.dir, ec);
+            BB::Upscale::Checkpoint(fmt::format(
+                "BB_DUMP_FRAME={}: every render target of that frame after each pass, and the "
+                "upscaled output, go to {} as PNG ({})",
+                g_dump.frame, std::filesystem::absolute(g_dump.dir, ec).string(),
+                ec ? "the folder could not be created" : "folder ready"));
+        }
+    }
+    return g_dump.frame >= 0 && !g_dump.done &&
+           BB::Upscale::FrameNumber() == static_cast<u64>(g_dump.frame);
+}
+} // namespace
+
+bool Rasterizer::BBDumpOn() {
+    return DumpActive();
+}
+
+void Rasterizer::BBDumpLog(const std::string& line) {
+    if (!DumpActive() || g_dump.lines >= 4000) return;
+    ++g_dump.lines;
+    BB::Upscale::Checkpoint("[dump] " + line);
+}
+
+void Rasterizer::BBDumpImage(VideoCore::Image& image, const std::string& what) {
+    if (!InitOnce(instance) || g_dump.entries.size() >= 160 || g_dump.bytes > (1500ull << 20)) {
+        return;
+    }
+    const vk::Format f = image.info.pixel_format;
+    const u32 bpp = DumpBpp(f);
+    if (bpp == 0 || image.info.num_samples != 1) {
+        BBDumpLog(fmt::format("{} {:#x} {}x{} {}: format not dumped", what, image.info.guest_address,
+                              image.info.size.width, image.info.size.height, vk::to_string(f)));
+        return;
+    }
+    DumpEntry e{};
+    e.w = image.info.size.width;
+    e.h = image.info.size.height;
+    e.format = f;
+    e.depth = image.info.props.is_depth;
+    if (!MakeHostBuf(e.host, u64(e.w) * e.h * bpp)) return;
+    const VAddr a = image.info.guest_address;
+    u32 gw = 0, gh = 0, hw = 0, hh = 0;
+    const bool chain = BB::Upscale::SceneScale(gw, gh, hw, hh);
+    const char* version = image.info.bb_scaled ? "internal"
+                          : (chain && e.w == gw && e.h == gh && BB::Upscale::PreferVersion(a) >= 0)
+                              ? "twin"
+                              : "full";
+    e.name = fmt::format("{:04d}_{}_{:x}_{}x{}_{}_{}", g_dump.pass, what, a, e.w, e.h,
+                         vk::to_string(f), version);
+    scheduler.EndRendering();
+    if (runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead)) {
+        runtime.FlushBarriers();
+    }
+    const vk::BufferImageCopy region{
+        .bufferOffset = 0,
+        .imageSubresource = {e.depth ? vk::ImageAspectFlagBits::eDepth
+                                     : vk::ImageAspectFlagBits::eColor,
+                             0, 0, 1},
+        .imageExtent = {e.w, e.h, 1},
+    };
+    scheduler.CommandBuffer().copyImageToBuffer(image.GetImage(),
+                                                vk::ImageLayout::eTransferSrcOptimal,
+                                                e.host.buffer, region);
+    g_dump.bytes += e.host.size;
+    BBDumpLog(fmt::format("pass {} {} {:#x} {}x{} {} ({}) -> {}.png", g_dump.pass, what, a, e.w,
+                          e.h, vk::to_string(f), version, e.name));
+    g_dump.entries.push_back(std::move(e));
+}
+
+void Rasterizer::BBDumpPass(std::span<const VideoCore::ImageId> targets, const std::string& desc) {
+    if (g_dump.frame == -1) return;
+    if (!DumpActive()) {
+        if (g_dump.frame >= 0 && !g_dump.done && !g_dump.entries.empty() &&
+            BB::Upscale::FrameNumber() > static_cast<u64>(g_dump.frame)) {
+            // The frame is over: the targets of its last pass, then wait and write the files.
+            g_dump.done = true;
+            scheduler.Finish();
+            for (auto& e : g_dump.entries) {
+                vmaInvalidateAllocation(g_bb.allocator, e.host.allocation, 0, VK_WHOLE_SIZE);
+                WriteDump(e);
+                FreeHostBuf(e.host);
+            }
+            BB::Upscale::Checkpoint(fmt::format("BB_DUMP_FRAME: {} images of frame {} written to "
+                                                "{} ({} passes)",
+                                                g_dump.entries.size(), g_dump.frame, g_dump.dir,
+                                                g_dump.pass));
+            g_dump.entries.clear();
+        }
+        return;
+    }
+    std::vector<VideoCore::ImageId> now(targets.begin(), targets.end());
+    if (now != g_dump.last_targets) {
+        for (const auto id : g_dump.last_targets) {
+            if (id) BBDumpImage(texture_cache.GetImage(id), "rt");
+        }
+        g_dump.last_targets = now;
+        ++g_dump.pass;
+    }
+    BBDumpLog(desc);
+}
+
+void Rasterizer::BBNativeFillSource(VideoCore::ImageId scaled_id,
+                                    VideoCore::TextureCache::ImageDesc desc) {
+    PollContent(scheduler);
+    auto& scaled = texture_cache.GetImage(scaled_id);
+    if (!scaled.info.bb_scaled || !g_bb.output.image || scaled.info.bb_guest_w == 0) {
+        return;
+    }
+    const VAddr addr = scaled.info.guest_address;
+    const u32 gw = scaled.info.bb_guest_w, gh = scaled.info.bb_guest_h;
+    desc.info.size.width = gw;
+    desc.info.size.height = gh;
+    desc.info.bb_scaled = false;
+    desc.info.bb_guest_w = desc.info.bb_guest_h = 0;
+    const auto twin_id = texture_cache.FindImage(desc);
+    auto& twin = texture_cache.GetImage(twin_id);
+    auto& src = texture_cache.GetImage(scaled_id); // (FindImage may have moved the slot storage)
+    if (twin.info.bb_scaled || twin.info.size.width != gw || twin.info.size.height != gh ||
+        g_bb.output.extent.width != gw || g_bb.output.extent.height != gh) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            BB::Upscale::Checkpoint(fmt::format(
+                "WARNING: native chain: no output-size image for the source {:#x} ({}x{}, "
+                "upscaled {}x{}): later reads use the redirect only",
+                addr, twin.info.size.width, twin.info.size.height, g_bb.output.extent.width,
+                g_bb.output.extent.height));
+        }
+        return;
+    }
+    scheduler.EndRendering();
+    if (runtime.Transit(&twin, vk::ImageLayout::eTransferDstOptimal,
+                        vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite)) {
+        runtime.FlushBarriers();
+    }
+    const auto cmd = scheduler.CommandBuffer();
+    Barrier(cmd, g_bb.output, vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
+    vk::ImageBlit full{};
+    full.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    full.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    full.srcOffsets[1] = vk::Offset3D{s32(gw), s32(gh), 1};
+    full.dstOffsets[1] = vk::Offset3D{s32(gw), s32(gh), 1};
+    cmd.blitImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, twin.GetImage(),
+                  vk::ImageLayout::eTransferDstOptimal, full, vk::Filter::eNearest);
+    twin.flags |= VideoCore::ImageFlagBits::GpuModified;
+    twin.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    BB::Upscale::TwinDone(addr, false, true, true);
+    static bool said = false;
+    if (!said) {
+        said = true;
+        BB::Upscale::Checkpoint(fmt::format(
+            "native chain: the upscaled image ({}x{}) is the output-size image of the lit scene "
+            "colour {:#x} ({}): every pass after the upscaler reads it there",
+            gw, gh, addr, vk::to_string(twin.info.pixel_format)));
+    }
+    if (DumpActive()) {
+        BBDumpImage(src, "upscaler-input");
+        BBDumpImage(twin, "upscaled");
+    }
+    // Content check every 120 upscales.
+    if (!g_cc.pending && (g_cc.count++ % 120) == 60) {
+        const auto usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
+        if (EnsureImage(g_cc.a, {kCcW, kCcH}, vk::Format::eR16G16B16A16Sfloat, usage) &&
+            EnsureImage(g_cc.b, {kCcW, kCcH}, vk::Format::eR16G16B16A16Sfloat, usage) &&
+            (g_cc.host.buffer || MakeHostBuf(g_cc.host, u64(kCcW) * kCcH * 8 * 2))) {
+            if (runtime.Transit(&src, vk::ImageLayout::eTransferSrcOptimal,
+                                vk::PipelineStageFlagBits2::eBlit,
+                                vk::AccessFlagBits2::eTransferRead)) {
+                runtime.FlushBarriers();
+            }
+            if (runtime.Transit(&twin, vk::ImageLayout::eTransferSrcOptimal,
+                                vk::PipelineStageFlagBits2::eBlit,
+                                vk::AccessFlagBits2::eTransferRead)) {
+                runtime.FlushBarriers();
+            }
+            const auto c2 = scheduler.CommandBuffer();
+            for (OwnImage* o : {&g_cc.a, &g_cc.b}) {
+                Barrier(c2, *o, vk::ImageLayout::eTransferDstOptimal,
+                        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eNone,
+                        vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite);
+            }
+            vk::ImageBlit down{};
+            down.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            down.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            down.dstOffsets[1] = vk::Offset3D{s32(kCcW), s32(kCcH), 1};
+            down.srcOffsets[1] = vk::Offset3D{s32(src.info.size.width), s32(src.info.size.height), 1};
+            c2.blitImage(src.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_cc.a.image,
+                         vk::ImageLayout::eTransferDstOptimal, down, vk::Filter::eLinear);
+            down.srcOffsets[1] = vk::Offset3D{s32(gw), s32(gh), 1};
+            c2.blitImage(twin.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_cc.b.image,
+                         vk::ImageLayout::eTransferDstOptimal, down, vk::Filter::eLinear);
+            for (OwnImage* o : {&g_cc.a, &g_cc.b}) {
+                Barrier(c2, *o, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+            }
+            const vk::BufferImageCopy ra{
+                .bufferOffset = 0,
+                .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .imageExtent = {kCcW, kCcH, 1},
+            };
+            vk::BufferImageCopy rb = ra;
+            rb.bufferOffset = u64(kCcW) * kCcH * 8;
+            c2.copyImageToBuffer(g_cc.a.image, vk::ImageLayout::eTransferSrcOptimal,
+                                 g_cc.host.buffer, ra);
+            c2.copyImageToBuffer(g_cc.b.image, vk::ImageLayout::eTransferSrcOptimal,
+                                 g_cc.host.buffer, rb);
+            g_cc.tick = scheduler.CurrentTick();
+            g_cc.pending = true;
+        }
+    }
+    Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eBlit,
+            vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead);
 }
 
 } // namespace Vulkan

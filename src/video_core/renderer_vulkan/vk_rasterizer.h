@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <span>
+#include <string>
+#include <unordered_set>
+
 #include "video_core/bb/bb_fg.h"
 
 #include "common/recursive_lock.h"
@@ -221,6 +225,14 @@ private:
                   vk::ImageView& out_view, vk::ImageLayout& out_layout);
     bool BBUpscaledView(const VideoCore::ImageViewInfo& view_info, vk::ImageView& out_view,
                         vk::ImageLayout& out_layout);
+    // BB 0.80 native chain: the upscaled image into the source's output-size image (+ content
+    // check); BB_DUMP_FRAME frame dump.
+    void BBNativeFillSource(VideoCore::ImageId scaled_id, VideoCore::TextureCache::ImageDesc desc);
+    void BBDumpLog(const std::string& line);
+    bool BBDumpOn();
+    void BBDumpImage(VideoCore::Image& image, const std::string& what);
+    void BBDumpPass(std::span<const VideoCore::ImageId> targets, const std::string& desc);
+    std::unordered_set<const void*> bb_scene_cs; // compute pipelines of the scene passes
     void BBHudlessCopy(VideoCore::Image& flip);
     bool BBRecordUpscale(vk::Image image, vk::ImageView view, vk::Format format,
                          vk::ImageUsageFlags usage, bool late = false, bool mv_only = false);

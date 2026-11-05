@@ -79,6 +79,14 @@ bool SceneScaleLive();
 int PreferVersion(VAddr addr);
 bool TakeOffPurge(std::vector<std::pair<VAddr, bool>>& addrs);
 void OnOffPurged(u32 copied, u32 freed);
+// 0.80: in the scene passes of the native chain; SetComputeScaled before a dispatch's resources
+// are bound (a scene compute pipeline: internal-size images), TakeComputeTouched after (it looked
+// up a scene target); the content check result; the frame counter (BB_DUMP_FRAME).
+bool NativeScenePhase();
+void SetComputeScaled(bool on);
+bool TakeComputeTouched();
+void OnContentCheck(double psnr_db);
+u64 FrameNumber();
 void TwinDone(VAddr addr, bool scaled, bool write, bool copied);
 void TwinFailed(VAddr addr, std::string_view why);
 bool NativePostPhase();              // after the upscaler in this frame (native chain)
