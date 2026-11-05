@@ -17,7 +17,7 @@
 
 namespace BB::FG::Display {
 
-enum class Path : uint32_t { Plain, Amd, Dlss };
+enum class Path : uint32_t { Plain, Amd, Dlss, Image };
 
 bool Wanted();
 
@@ -41,6 +41,9 @@ void SetExpected(int generated);
 // One game present: its VkPresentIdKHR (0: none). preferred: the id to use when it is above the
 // last one (DLSS-G: Streamline's frame index, the one its Reflex markers carry).
 uint64_t Issue(uint64_t preferred);
+// bb-imgfg-078 (Path::Image): one present of the image frame generation, a generated frame or a
+// real one (each present carries its own id; the generated ones are counted apart).
+uint64_t IssueImage(bool generated);
 // slDLSSGGetState after a present: the frames shown for it.
 void NoteStreamline(uint32_t presented, uint32_t status, uint32_t generate_max);
 

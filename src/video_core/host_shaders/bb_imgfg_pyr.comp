@@ -1,0 +1,51 @@
+#version 450
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB_FG=image-x2 / image-x3 (bb_imgfg.cpp): the luma pyramid and the local contrast normalisation.
+//   mode 0: the next pyramid level, the 2x2 mean of the level above.
+//   mode 1: local contrast normalisation (7x7): (L - mean) / (deviation + eps), clamped to +-3. The
+//           flow matches this, not the luma: Bloodborne's dark foggy scenes have a tiny luma range
+//           (the captured runs: mean 34/255, 5th percentile 16, 95th 60) and a SAD on the raw luma
+//           is dominated by whatever is brightest; the normalised picture has the same edge
+//           strength everywhere (eps keeps the noise of flat dark areas from being amplified).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src_tex;
+layout(binding = 8, r32f) uniform writeonly image2D dst_img;
+
+layout(push_constant) uniform Push {
+    ivec4 size;  // source width, height, destination width, height
+    ivec4 flags; // x: mode
+    vec4 params; // x: eps
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= p.size.z || c.y >= p.size.w) {
+        return;
+    }
+    ivec2 smax = p.size.xy - 1;
+    if (p.flags.x == 0) {
+        ivec2 s = c * 2;
+        float v = texelFetch(src_tex, min(s, smax), 0).r +
+                  texelFetch(src_tex, min(s + ivec2(1, 0), smax), 0).r +
+                  texelFetch(src_tex, min(s + ivec2(0, 1), smax), 0).r +
+                  texelFetch(src_tex, min(s + ivec2(1, 1), smax), 0).r;
+        imageStore(dst_img, c, vec4(v * 0.25));
+        return;
+    }
+    float sum = 0.0;
+    float sum2 = 0.0;
+    for (int j = -3; j <= 3; ++j) {
+        for (int i = -3; i <= 3; ++i) {
+            float v = texelFetch(src_tex, clamp(c + ivec2(i, j), ivec2(0), smax), 0).r;
+            sum += v;
+            sum2 += v * v;
+        }
+    }
+    float mean = sum / 49.0;
+    float var = max(sum2 / 49.0 - mean * mean, 0.0);
+    float v = texelFetch(src_tex, c, 0).r;
+    float n = (v - mean) / (sqrt(var) + p.params.x);
+    imageStore(dst_img, c, vec4(clamp(n, -3.0, 3.0)));
+}

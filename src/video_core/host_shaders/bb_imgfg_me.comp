@@ -1,0 +1,111 @@
+#version 450
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB_FG=image-x2 / image-x3 (bb_imgfg.cpp): one level of the hierarchical block flow. One thread
+// per vector; blocks are 8x8 with a stride of 4 (overlapping), matched by SAD on the locally
+// normalised luma (bb_imgfg_pyr.comp). Candidates: the parent level's flow at the block and at its
+// four neighbours (the coarse flow is the search's start), zero, and the game's own camera motion
+// when it is given (an initial guess only: the match decides). The coarsest level also searches a
+// full +-6 window; every level then refines +-2 twice around the best and fits a parabola to the
+// costs for the sub-pixel position. Run for both directions (source and target swapped).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D fa_tex;     // source features, this level
+layout(binding = 1) uniform sampler2D fb_tex;     // target features, this level
+layout(binding = 2) uniform sampler2D parent_tex; // the parent level's flow (linear sampler)
+layout(binding = 3) uniform sampler2D mv_tex;     // the game's motion, render px to the previous frame
+layout(binding = 8, rgba16f) uniform writeonly image2D flow_img;
+
+layout(push_constant) uniform Push {
+    ivec4 size;  // level width, height, grid width, height
+    ivec4 info;  // parent grid width, height, flags (1 parent, 2 camera motion, 4 coarsest), unused
+    vec4 prior;  // x: sign of the camera motion (+1 B->A, -1 A->B)
+} p;
+
+float a_blk[64];
+ivec2 g_best;
+float g_cost;
+ivec2 g_org;
+
+float Cost(ivec2 v) {
+    float s = 0.0;
+    ivec2 lim = p.size.xy - 1;
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            float b = texelFetch(fb_tex, clamp(g_org + ivec2(x, y) + v, ivec2(0), lim), 0).r;
+            s += abs(a_blk[y * 8 + x] - b);
+        }
+    }
+    return s * (1.0 / 64.0);
+}
+
+void Consider(ivec2 v) {
+    v = clamp(v, ivec2(-96), ivec2(96));
+    float c = Cost(v);
+    if (c < g_cost) {
+        g_cost = c;
+        g_best = v;
+    }
+}
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= p.size.z || g.y >= p.size.w) {
+        return;
+    }
+    g_org = g * 4 - 2;
+    ivec2 lim = p.size.xy - 1;
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            a_blk[y * 8 + x] = texelFetch(fa_tex, clamp(g_org + ivec2(x, y), ivec2(0), lim), 0).r;
+        }
+    }
+    g_best = ivec2(0);
+    g_cost = Cost(ivec2(0));
+    if ((p.info.z & 1) != 0) {
+        ivec2 pg = p.info.xy;
+        vec2 pf = (vec2(g) + 0.5) * 0.5 - 0.5;
+        vec2 pv = textureLod(parent_tex, (pf + 0.5) / vec2(pg), 0.0).xy * 2.0;
+        Consider(ivec2(floor(pv + 0.5)));
+        ivec2 pc = ivec2(floor(pf + 0.5));
+        Consider(ivec2(floor(texelFetch(parent_tex, clamp(pc + ivec2(1, 0), ivec2(0), pg - 1), 0).xy * 2.0 + 0.5)));
+        Consider(ivec2(floor(texelFetch(parent_tex, clamp(pc + ivec2(-1, 0), ivec2(0), pg - 1), 0).xy * 2.0 + 0.5)));
+        Consider(ivec2(floor(texelFetch(parent_tex, clamp(pc + ivec2(0, 1), ivec2(0), pg - 1), 0).xy * 2.0 + 0.5)));
+        Consider(ivec2(floor(texelFetch(parent_tex, clamp(pc + ivec2(0, -1), ivec2(0), pg - 1), 0).xy * 2.0 + 0.5)));
+    }
+    if ((p.info.z & 2) != 0) {
+        vec2 uv = (vec2(g) * 4.0 + 2.0) / vec2(p.size.xy);
+        vec2 mv = textureLod(mv_tex, uv, 0.0).rg;
+        vec2 lv = mv * vec2(p.size.xy) / vec2(textureSize(mv_tex, 0)) * p.prior.x;
+        if (!any(isnan(lv)) && !any(isinf(lv))) {
+            Consider(ivec2(floor(lv + 0.5)));
+        }
+    }
+    if ((p.info.z & 4) != 0) {
+        for (int dy = -6; dy <= 6; ++dy) {
+            for (int dx = -6; dx <= 6; ++dx) {
+                Consider(ivec2(dx, dy));
+            }
+        }
+    }
+    for (int it = 0; it < 2; ++it) {
+        ivec2 ctr = g_best;
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int dx = -2; dx <= 2; ++dx) {
+                if (dx != 0 || dy != 0) {
+                    Consider(ctr + ivec2(dx, dy));
+                }
+            }
+        }
+    }
+    float c0 = g_cost;
+    float cxm = Cost(g_best + ivec2(-1, 0));
+    float cxp = Cost(g_best + ivec2(1, 0));
+    float cym = Cost(g_best + ivec2(0, -1));
+    float cyp = Cost(g_best + ivec2(0, 1));
+    float dx2 = cxm - 2.0 * c0 + cxp;
+    float dy2 = cym - 2.0 * c0 + cyp;
+    float ox = dx2 > 1e-6 ? clamp(0.5 * (cxm - cxp) / dx2, -0.5, 0.5) : 0.0;
+    float oy = dy2 > 1e-6 ? clamp(0.5 * (cym - cyp) / dy2, -0.5, 0.5) : 0.0;
+    imageStore(flow_img, g, vec4(vec2(g_best) + vec2(ox, oy), c0, 0.0));
+}
