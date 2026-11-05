@@ -137,14 +137,16 @@ bool Active(u32* scene_w, u32* scene_h, u32* out_w, u32* out_h) {
 void OnEbootLoaded(uintptr_t base, u64 image_size) {
     const std::string mode = Mode();
     {
-        // 0.72: which lines of work this build carries (bb-merge-072 = bb-merge-070 + bb-native-071).
+        // 0.73: which lines of work this build carries (bb-native-073 = bb-merge-072 + per-pass
+        // native chain).
         const std::string features =
-            "build 0.72 (bb-merge-072): frame generation pacing of 0.70 (PaceGuestFlip grid, "
+            "build 0.73 (bb-native-073): frame generation pacing of 0.70 (PaceGuestFlip grid, "
             "FSR 3 midpoint slots kytyFfxSetPaceSlot / kytyFfxTakePaceStats, full-frame and "
             "high-res fixes) + 0.71 native chain (BB_SCENE_UPSCALE=native, viewport / MV pixels "
             "of scaled targets, BB_OBJMV_RIGID, Reflex markers at the first sceGnmSubmit, "
             "BB_REFLEX_GAME_LIMIT) + 0.72 one frame limiter (the Reflex game limit yields to the "
-            "pacer grid) and the native-chain output-target guard (BB_SCENE_NATIVE_MIXED)";
+            "pacer grid) + 0.73 per-pass native chain (scene passes at the internal size, the output "
+            "chain and compute on output-size twins, native chain check, [mv-source] / [mv-probe])";
         BB::Upscale::Checkpoint(features);
         LOG_INFO(Loader, "[BB] {}", features);
     }

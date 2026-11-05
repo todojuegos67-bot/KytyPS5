@@ -321,6 +321,51 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+bool Runtime::BBBlitScaled(VideoCore::Image* src, VideoCore::Image* dst) {
+    if (src->info.pixel_format != dst->info.pixel_format || src->info.num_samples != 1 ||
+        dst->info.num_samples != 1) {
+        return false;
+    }
+    const auto features = instance.GetFormatFeatureFlags(src->info.pixel_format);
+    if (!(features & vk::FormatFeatureFlagBits2::eBlitSrc) ||
+        !(features & vk::FormatFeatureFlagBits2::eBlitDst)) {
+        return false;
+    }
+    const bool depth = src->info.props.is_depth;
+    const bool linear =
+        !depth && (features & vk::FormatFeatureFlagBits2::eSampledImageFilterLinear);
+    const vk::ImageAspectFlags aspect = src->aspect_mask & dst->aspect_mask;
+    const u32 layers = std::min(src->info.resources.layers, dst->info.resources.layers);
+    vk::ImageBlit region{};
+    region.srcSubresource.aspectMask = aspect;
+    region.srcSubresource.mipLevel = 0;
+    region.srcSubresource.baseArrayLayer = 0;
+    region.srcSubresource.layerCount = layers;
+    region.dstSubresource = region.srcSubresource;
+    region.srcOffsets[0] = vk::Offset3D{0, 0, 0};
+    region.srcOffsets[1] =
+        vk::Offset3D{s32(src->info.size.width), s32(src->info.size.height), 1};
+    region.dstOffsets[0] = vk::Offset3D{0, 0, 0};
+    region.dstOffsets[1] =
+        vk::Offset3D{s32(dst->info.size.width), s32(dst->info.size.height), 1};
+    scheduler.EndRendering();
+    bool needs_flush =
+        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eBlit,
+                vk::AccessFlagBits2::eTransferRead);
+    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
+                           vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+    auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.blitImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
+                     vk::ImageLayout::eTransferDstOptimal, region,
+                     linear ? vk::Filter::eLinear : vk::Filter::eNearest);
+    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    return true;
+}
+
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);

@@ -118,6 +118,12 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
 
     const bool skip_cb_binding =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+    // BB 0.73 native chain: the scene passes begin at the first draw with the scene depth; the
+    // pass decides which version (internal / output size) of a scene target it gets.
+    BB::Upscale::BeginDraw(((regs.depth_control.depth_enable || regs.depth_control.stencil_enable) &&
+                            regs.depth_buffer.DepthValid())
+                               ? regs.depth_buffer.DepthAddress()
+                               : 0);
     for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         const auto& col_buf = regs.color_buffers[cb];
@@ -162,6 +168,12 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
             if (bb_scaled_target(cb_descs[cb].image_id)) break;
         }
+    }
+    if (bb_rt_guest_w != 0 && BB::Upscale::NativePostPhase()) {
+        BB::Upscale::OnPostScaledTarget(
+            db_desc.image_id && texture_cache.GetImage(db_desc.image_id).info.bb_scaled
+                ? texture_cache.GetImage(db_desc.image_id).info.guest_address
+                : 0);
     }
     if (bb_rt_guest_w != 0) {
         for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {

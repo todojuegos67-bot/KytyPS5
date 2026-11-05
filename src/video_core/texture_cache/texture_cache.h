@@ -148,6 +148,10 @@ public:
         RefreshImage(image);
     }
 
+    /// BB 0.73 native chain: copies the other version (internal size / output size) of a scene
+    /// target into this one when that version holds the current content (bb_upscale TwinAccess).
+    void BBTwinSync(ImageId image_id, bool write);
+
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
                                                                BindingType binding,

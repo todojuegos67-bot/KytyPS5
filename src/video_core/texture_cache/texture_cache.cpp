@@ -11,6 +11,8 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/bb/bb_texture.h"
+#include "core/bb_respatch.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -277,7 +279,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
         if (image_info.bb_scaled != cache_image.info.bb_scaled) {
-            if (safe_to_delete || (cache_image.info.bb_scaled && !cache_image.binding.is_bound)) {
+            // 0.73: with the native chain both versions of a scene target live side by side (the
+            // scene passes use the internal-size one, the output chain the output-size twin).
+            if (safe_to_delete || (!BB::ResPatch::NativeChain() && cache_image.info.bb_scaled &&
+                                   !cache_image.binding.is_bound)) {
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
@@ -643,7 +648,41 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    BBTwinSync(image_id, desc.type == BindingType::Storage);
     return image.FindView(desc.view_info);
+}
+
+void TextureCache::BBTwinSync(ImageId image_id, bool write) {
+    Image& image = slot_images[image_id];
+    const ImageInfo& info = image.info;
+    if (info.guest_address == 0 || info.num_samples != 1 || info.size.depth != 1) {
+        return;
+    }
+    const bool scaled = info.bb_scaled;
+    if (!BB::Upscale::TwinAccess(info.guest_address, info.size.width, info.size.height, scaled,
+                                 write)) {
+        return;
+    }
+    ImageId other_id{};
+    ForEachImageWithAddress(info.guest_address, [&](ImageId id, Image& other) {
+        if (id != image_id && other.info.guest_address == info.guest_address &&
+            other.info.bb_scaled != scaled && other.info.num_samples == 1 &&
+            other.info.props.is_depth == info.props.is_depth &&
+            other.info.pixel_format == info.pixel_format) {
+            other_id = id;
+        }
+    });
+    bool copied = false;
+    if (!other_id) {
+        BB::Upscale::TwinFailed(info.guest_address, "the other version is not in the cache");
+    } else if (!runtime.BBBlitScaled(&slot_images[other_id], &image)) {
+        BB::Upscale::TwinFailed(info.guest_address,
+                                fmt::format("{} cannot be blitted",
+                                            vk::to_string(info.pixel_format)));
+    } else {
+        copied = true;
+    }
+    BB::Upscale::TwinDone(info.guest_address, scaled, write, copied);
 }
 
 void TextureCache::RegisterMeta(VAddr address, MetaDataInfo info) {
@@ -680,6 +719,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
+    BBTwinSync(image_id, true);
 
     // Register meta data for this color buffer
     const VAddr cmask_addr = desc.info.meta_info.cmask_addr;
@@ -718,6 +758,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
+    BBTwinSync(image_id, true);
 
     // Register meta data for this depth buffer
     const VAddr htile_addr = desc.info.meta_info.htile_addr;

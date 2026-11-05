@@ -63,6 +63,18 @@ bool SceneScale(u32& guest_w, u32& guest_h, u32& host_w, u32& host_h);
 // A target of the scaled targets' guest size bound in the same draw as scaled ones (mixed sizes
 // in one render pass): scaled from its next use.
 void AddSceneTarget(VAddr addr);
+// 0.73 native chain (BB_SCENE_UPSCALE=native): per-pass versions of the scene targets. BeginDraw
+// at every draw before its targets are looked up (the scene passes start at the first draw with
+// the scene depth; dispatches mark themselves in OnDispatch). TwinAccess, from the texture cache
+// after an image is made current: true when the other version of this address (internal size /
+// output size) holds the content and must be copied into this one first; then TwinDone (also
+// called by TwinAccess itself when no copy is needed). TwinFailed when the copy cannot be made.
+void BeginDraw(VAddr depth_addr);
+bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write);
+void TwinDone(VAddr addr, bool scaled, bool write, bool copied);
+void TwinFailed(VAddr addr, std::string_view why);
+bool NativePostPhase();              // after the upscaler in this frame (native chain)
+void OnPostScaledTarget(VAddr addr); // an internal-size target bound after the upscaler
 
 // Instance / device creation.
 void PreInstance();

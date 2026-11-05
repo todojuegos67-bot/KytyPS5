@@ -419,6 +419,8 @@ struct FrameState {
     u64 scanned_draw = ~0ULL;
     u32 flip_draws = 0, hud_draws = 0, hud_other = 0, src_rewrites = 0;
     bool injected = false, inject_failed = false, redirecting = false, hudless = false;
+    u32 native_post = 0;      // 0.73: the upscaler ended the scene passes (native chain)
+    u32 native_redirects = 0; // later samples of the source given the upscaled output
     bool present = false; // upscaled to the window size this frame
     std::vector<Candidate> camera;
 };
@@ -900,7 +902,29 @@ namespace {
 std::atomic<bool> g_ss_frozen{false};
 std::atomic<bool> g_ss_off{false}; // turned off at run time by the safety net
 u32 g_ss_frames = 0, g_ss_scene = 0, g_ss_good = 0, g_ss_windows = 0;
-std::array<VAddr, 32> g_ss_addrs{};
+std::array<VAddr, 64> g_ss_addrs{};
+// 0.73 native chain (BB_SCENE_UPSCALE=native): which version of a scene target a pass gets is
+// decided per pass, not per address. Bloodborne reuses the same guest addresses across the frame
+// (the G-buffer's colour 0 0x27a3c8000 of the 11-04 analysis shows up again in the 11-05 03:19
+// run, bound with the scaled targets after the upscaler, and two more addresses joined the same
+// way), and 0.71 scaled an address for the whole frame: once an output-size pass shared an address
+// (or was bound with one) it was shrunk too, the shrink spread through every pass bound with it,
+// and the game's output chain ended at 1706x960 inside the 2560x1440 flip (the top-left 1/1.5)
+// while post-processing read internal-size images at output-size pixel positions (the flat 3D).
+//   phase 0: before this frame's scene passes, phase 1: the scene passes (from the first draw
+//   with the scene depth until the upscaler runs), phase 2: after the upscaler (post-processing,
+//   HUD, flip). Only phase-1 draws use the internal-size images; phase 0 / 2 and every compute
+//   dispatch use an output-size twin at the same address, filled from the internal-size image
+//   (bilinear colour, nearest depth) the first time it is used after the scene wrote it
+//   (TwinAccess, texture_cache BBTwinSync). The upscaler's source keeps its internal-size image
+//   after the upscaler (the samples of it are redirected to the upscaled output).
+std::atomic<int> g_ss_phase{0};
+std::atomic<bool> g_ss_compute{false};
+std::atomic<VAddr> g_ss_depth{0};
+std::atomic<VAddr> g_ss_source{0};
+std::array<std::atomic<u8>, 64> g_ss_valid{};  // bit 0: internal-size image current, bit 1: output
+std::array<std::atomic<u8>, 64> g_ss_class{};  // classification logged: 1 scene, 2 output, 4 compute
+std::atomic<u32> g_ss_twin_copies{0}, g_ss_twin_fail{0}, g_ss_post_scaled{0}, g_ss_post_refused{0};
 std::atomic<u32> g_ss_count{0};
 u32 g_ss_w = 0, g_ss_h = 0, g_ss_sw = 0, g_ss_sh = 0;
 std::vector<VAddr> g_ss_candidates;
@@ -915,20 +939,143 @@ bool SceneScaleWanted() {
 }
 } // namespace
 
+namespace {
+// BB_SCENE_NATIVE_MIXED=scale: the 0.71 per-address behaviour (an address is scaled for the whole
+// frame, a target bound with scaled ones is scaled too), for comparison only.
+bool NativeLegacy() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_SCENE_NATIVE_MIXED");
+        return v != nullptr && std::string_view{v} == "scale";
+    }();
+    return on;
+}
+bool NativePerPass() {
+    return BB::ResPatch::NativeChain() && !NativeLegacy();
+}
+int SceneIndex(VAddr addr) {
+    const u32 n = g_ss_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
+        if (g_ss_addrs[i] == addr) return static_cast<int>(i);
+    }
+    return -1;
+}
+// One line per address and class: how the passes of the frame use it.
+void Classify(int idx, u8 bit, VAddr addr) {
+    if (idx < 0 || (g_ss_class[idx].fetch_or(bit, std::memory_order_relaxed) & bit) != 0) {
+        return;
+    }
+    Checkpoint(fmt::format(
+        "native chain: {:#x} {}", addr,
+        bit == 1 ? fmt::format("used by the scene passes: internal size {}x{}", g_ss_sw, g_ss_sh)
+        : bit == 2
+            ? fmt::format("used after the upscaler / outside the scene passes (output chain): "
+                          "output-size twin {}x{}, filled from the internal-size image",
+                          g_ss_w, g_ss_h)
+            : fmt::format("used by a compute dispatch (dispatch grids are in guest pixels): "
+                          "output-size twin {}x{}",
+                          g_ss_w, g_ss_h)));
+}
+} // namespace
+
 bool ScaleImage(VAddr addr, u32& w, u32& h) {
     if (!g_ss_frozen.load(std::memory_order_acquire) || g_ss_off.load(std::memory_order_relaxed) ||
         w != g_ss_w || h != g_ss_h) {
         return false;
     }
-    const u32 n = g_ss_count.load(std::memory_order_acquire);
-    for (u32 i = 0; i < n; ++i) {
-        if (g_ss_addrs[i] == addr) {
-            w = g_ss_sw;
-            h = g_ss_sh;
-            return true;
+    const int idx = SceneIndex(addr);
+    if (idx < 0) {
+        return false;
+    }
+    if (NativePerPass()) {
+        const int phase = g_ss_phase.load(std::memory_order_relaxed);
+        const bool compute = g_ss_compute.load(std::memory_order_relaxed);
+        const bool source = addr == g_ss_source.load(std::memory_order_relaxed);
+        const bool scaled = (phase == 1 && !compute) || (phase == 2 && source);
+        Classify(idx, scaled ? 1 : compute ? 4 : 2, addr);
+        if (!scaled) {
+            return false;
         }
     }
-    return false;
+    w = g_ss_sw;
+    h = g_ss_sh;
+    return true;
+}
+
+bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write) {
+    if (!NativePerPass() || !g_ss_frozen.load(std::memory_order_acquire) ||
+        g_ss_off.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if ((scaled && (w != g_ss_sw || h != g_ss_sh)) || (!scaled && (w != g_ss_w || h != g_ss_h))) {
+        return false;
+    }
+    const int idx = SceneIndex(addr);
+    if (idx < 0) {
+        return false;
+    }
+    const u8 mine = scaled ? 1 : 2, other = scaled ? 2 : 1;
+    const u8 valid = g_ss_valid[idx].load(std::memory_order_relaxed);
+    // A scene-pass write to the internal-size image rebuilds it (the scene is drawn every frame):
+    // no copy. Any other use of a version that is not current copies the current one first.
+    const bool scene_write = write && scaled && g_ss_phase.load(std::memory_order_relaxed) == 1;
+    const bool copy = (valid & mine) == 0 && (valid & other) != 0 && !scene_write;
+    if (!copy) {
+        TwinDone(addr, scaled, write, false);
+    }
+    return copy;
+}
+
+void TwinDone(VAddr addr, bool scaled, bool write, bool copied) {
+    const int idx = SceneIndex(addr);
+    if (idx < 0) {
+        return;
+    }
+    const u8 mine = scaled ? 1 : 2;
+    if (write) {
+        g_ss_valid[idx].store(mine, std::memory_order_relaxed);
+    } else {
+        g_ss_valid[idx].fetch_or(mine, std::memory_order_relaxed);
+    }
+    if (copied) {
+        const u32 n = g_ss_twin_copies.fetch_add(1, std::memory_order_relaxed);
+        if (n == 0) {
+            Checkpoint(fmt::format("native chain: first twin copy {:#x}: {} -> {} ({})", addr,
+                                   scaled ? "output size" : "internal size",
+                                   scaled ? "internal size" : "output size",
+                                   write ? "bound as a target" : "read"));
+        }
+    }
+}
+
+void TwinFailed(VAddr addr, std::string_view why) {
+    if (g_ss_twin_fail.fetch_add(1, std::memory_order_relaxed) < 4) {
+        Checkpoint(fmt::format("WARNING: native chain: twin copy of {:#x} not possible: {}", addr,
+                               why));
+    }
+}
+
+void BeginDraw(VAddr depth_addr) {
+    g_ss_compute.store(false, std::memory_order_relaxed);
+    if (depth_addr != 0 && depth_addr == g_ss_depth.load(std::memory_order_relaxed) &&
+        g_ss_phase.load(std::memory_order_relaxed) == 0) {
+        g_ss_phase.store(1, std::memory_order_relaxed);
+    }
+}
+
+bool NativePostPhase() {
+    return NativePerPass() && g_ss_frozen.load(std::memory_order_relaxed) &&
+           !g_ss_off.load(std::memory_order_relaxed) &&
+           g_ss_phase.load(std::memory_order_relaxed) == 2;
+}
+
+void OnPostScaledTarget(VAddr addr) {
+    const u32 n = g_ss_post_scaled.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0) {
+        Checkpoint(fmt::format("native chain: {:#x} bound as an internal-size target after the "
+                               "upscaler (the upscaler's source written again by post-processing; "
+                               "counted by the native chain check)",
+                               addr));
+    }
 }
 
 void AddSceneTarget(VAddr addr) {
@@ -948,32 +1095,22 @@ void AddSceneTarget(VAddr addr) {
         after_upscale = g_frame.injected;
         flip = IsFlip(addr);
     }
-    // 0.72 native chain guard. With BB_SCENE_UPSCALE=native everything after the upscaler is at
-    // the output size by design. An output-size target bound together with a scaled scene target
-    // (the scene depth) after the upscaler ran in the frame, or a flip buffer, is part of that
-    // output chain: scaling it (0.71) put the game's final image at the internal size, which the
-    // game then read at output-size pixel positions (11-05 03:19 run: the frame in the top-left
-    // 1/1.5 of the window, the 3D a flat colour, while the 300-frame check still saw the upscaler
-    // run and kept it). The scene scaling is turned off for the session instead (the targets come
-    // back at the full size and the upscaler runs at the output size, as with the safety net).
-    // BB_SCENE_NATIVE_MIXED=scale: the 0.71 behaviour (scaled too), for diagnosis.
-    static const bool mixed_scale = [] {
-        const char* v = std::getenv("BB_SCENE_NATIVE_MIXED");
-        return v != nullptr && std::string_view{v} == "scale";
-    }();
-    if (BB::ResPatch::NativeChain() && (after_upscale || flip) && !mixed_scale) {
-        g_ss_off.store(true, std::memory_order_relaxed);
-        Checkpoint(fmt::format(
-            "WARNING: native chain: {:#x} ({}x{}, {}) bound with the internal-size scene targets "
-            "{}: it belongs to the output-size chain, so it is not scaled; scene upscale turned "
-            "OFF for this session (the scene targets back at the full size, the upscaler at the "
-            "output size). BB_SCENE_NATIVE_MIXED=scale keeps the 0.71 behaviour",
-            addr, g_ss_w, g_ss_h, flip ? "a flip buffer" : "output-size target",
-            after_upscale ? "after the upscaler ran this frame" : "(flip buffer)"));
-        LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] native chain: output target {:#x} bound with "
-                    "scaled scene targets; scene upscale turned off", addr);
+    // 0.73: with per-pass versions only a scene pass (phase 1) adds a target: a scene target of
+    // the guest scene size bound with the internal-size ones (a ring of G-buffer images, an
+    // address the learning frame did not use). After the upscaler, or a flip buffer, it is part of
+    // the output chain and stays at the output size; scene scaling stays on (0.72 turned it off).
+    if (NativePerPass() &&
+        (after_upscale || flip || g_ss_phase.load(std::memory_order_relaxed) != 1)) {
+        if (g_ss_post_refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+            Checkpoint(fmt::format(
+                "native chain: {:#x} ({}x{}, {}) bound with internal-size targets outside the "
+                "scene passes: output chain, kept at the output size (scene upscale stays on)",
+                addr, g_ss_w, g_ss_h, flip ? "a flip buffer" : "output-size target"));
+        }
         return;
     }
+    g_ss_valid[n].store(2, std::memory_order_relaxed);
+    g_ss_class[n].store(0, std::memory_order_relaxed);
     g_ss_addrs[n] = addr;
     g_ss_count.store(n + 1, std::memory_order_release);
     Checkpoint(fmt::format("scene upscale: {:#x} ({}x{}) bound with scaled targets, scaled too "
@@ -984,8 +1121,8 @@ void AddSceneTarget(VAddr addr) {
                                after_upscale || flip
                                    ? "bound after the upscaler ran / a flip buffer: scaled anyway "
                                      "(BB_SCENE_NATIVE_MIXED=scale)"
-                                   : "bound before the upscaler ran this frame (scene chain): "
-                                     "scaled"));
+                                   : "bound in the scene passes (before the upscaler): scaled "
+                                     "there, output-size twin after it"));
     }
 }
 
@@ -1663,6 +1800,35 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
             }
         }
     }
+    // 0.73 motion-vector probe: a game-made velocity buffer would be a two-channel target of the
+    // scene size (R16G16 / R8G8). Every such target drawn is logged once with the pass it is in;
+    // the vectors stay the in-emulator ones unless the game is shown to make its own.
+    for (u32 i = 0; i < g_draw.num_colors; ++i) {
+        const Target& c = colors[i];
+        const bool two = c.format == vk::Format::eR16G16Sfloat ||
+                         c.format == vk::Format::eR16G16Snorm ||
+                         c.format == vk::Format::eR16G16Unorm ||
+                         c.format == vk::Format::eR8G8Snorm || c.format == vk::Format::eR8G8Unorm ||
+                         c.format == vk::Format::eR32G32Sfloat;
+        if (!two || c.addr == 0 || f.gb_w == 0) continue;
+        static std::array<VAddr, 16> seen{};
+        static u32 n_seen = 0;
+        if (n_seen >= seen.size() ||
+            std::find(seen.begin(), seen.begin() + n_seen, c.addr) != seen.begin() + n_seen) {
+            continue;
+        }
+        seen[n_seen++] = c.addr;
+        Checkpoint(fmt::format(
+            "[mv-probe] two-channel target {} (c{}) drawn {}, {} the upscaler, draw {} (vs {:#x} "
+            "ps {:#x}); scene size {}x{}: {}",
+            Describe(c), i,
+            g_draw.has_depth && depth->addr == scene_depth ? "with the scene depth"
+            : g_draw.has_depth                              ? "with another depth"
+                                                            : "without depth",
+            f.injected ? "after" : "before", f.draws, vs_hash, ps_hash, f.gb_w, f.gb_h,
+            c.width == f.gb_w && c.height == f.gb_h ? "a velocity buffer candidate"
+                                                    : "not the scene size"));
+    }
     if (g_draw.scene) {
         ++f.scene_draws;
         // The scene colour: the lit image the forward passes draw into (one or two targets).
@@ -1713,6 +1879,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
 }
 
 void OnDispatch() {
+    g_ss_compute.store(true, std::memory_order_relaxed); // 0.73: dispatches use output-size twins
     if (!Enabled() && !AnalyzeOn()) {
         return;
     }
@@ -1876,6 +2043,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     if (f.injected) {
         if (f.redirecting) {
             g_draw.sampled_upscaled = true;
+            ++f.native_redirects;
             return Sample::Redirect;
         }
         return Sample::Keep;
@@ -2340,6 +2508,12 @@ void OnInjected(bool ok, float) {
         g_frame.injected = true;
         g_frame.redirecting = true;
         g_draw.sampled_upscaled = true;
+        // 0.73: the scene passes end here; post-processing gets the output-size versions.
+        g_ss_source.store(g_plan.color_addr, std::memory_order_relaxed);
+        if (g_ss_phase.load(std::memory_order_relaxed) == 1) {
+            g_ss_phase.store(2, std::memory_order_relaxed);
+            ++g_frame.native_post;
+        }
     } else {
         g_frame.inject_failed = true;
     }
@@ -2414,6 +2588,71 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // Safety net: scene scaling must give a real upscale (composite injection, render size
     // below the output) in most 3D frames, or it is turned off for the session and the scene
     // targets go back to the full size (an unplayable image otherwise: white / a corner).
+    g_ss_phase.store(0, std::memory_order_relaxed); // 0.73: the next frame starts outside the scene
+    {
+        // 0.73 motion-vector source, once: the G-buffer's targets (a game velocity output would be
+        // one of them or a two-channel target logged by [mv-probe]).
+        static bool said = false;
+        if (!said && f.gb_depth != 0 && f.gb_num_colors > 0 && f.gb_draws > 8) {
+            said = true;
+            std::string list;
+            bool two = false;
+            for (u32 i = 0; i < f.gb_num_colors; ++i) {
+                const Target& c = f.gb_colors[i];
+                if (c.addr == 0) continue;
+                list += fmt::format(" c{}={}", i, Describe(c));
+                const auto cf = c.format;
+                two |= cf == vk::Format::eR16G16Sfloat || cf == vk::Format::eR16G16Snorm ||
+                       cf == vk::Format::eR16G16Unorm || cf == vk::Format::eR8G8Snorm ||
+                       cf == vk::Format::eR8G8Unorm || cf == vk::Format::eR32G32Sfloat;
+            }
+            Checkpoint(fmt::format(
+                "[mv-source] G-buffer targets:{} d={}; {}; motion vectors used: camera from depth + "
+                "the game's view-projection (scene block), objects from their G-buffer vertex "
+                "shaders' clip positions this / last frame (bb_objmv)",
+                list, Describe(f.gb_depth_target),
+                two ? "a two-channel target IS in the G-buffer (see [mv-probe])"
+                    : "no two-channel (velocity) target in the G-buffer"));
+        }
+    }
+    // 0.73 native chain check: the upscaled image must reach the game's output chain, not only be
+    // produced. A frame counts when the upscaler ended the scene passes (post-processing then used
+    // the output-size versions) and no internal-size target was bound after it.
+    static u32 nc_frames = 0, nc_scene = 0, nc_reach = 0, nc_redirect = 0, nc_scaled = 0,
+               nc_windows = 0, nc_last_scaled = 0;
+    if (NativePerPass() && g_ss_frozen.load(std::memory_order_relaxed) &&
+        !g_ss_off.load(std::memory_order_relaxed)) {
+        const u32 ps = g_ss_post_scaled.load(std::memory_order_relaxed);
+        const bool scaled_after = ps != nc_last_scaled;
+        nc_last_scaled = ps;
+        ++nc_frames;
+        if (f.gb_depth != 0) ++nc_scene;
+        if (scaled_after) ++nc_scaled;
+        if (f.native_redirects > 0) ++nc_redirect;
+        if (f.injected && !f.inject_failed && f.native_post > 0 && !scaled_after) ++nc_reach;
+        if (nc_frames >= 300) {
+            const bool first = nc_windows++ == 0;
+            const bool bad = nc_scene >= 150 && nc_reach * 2 < nc_scene;
+            if (first || bad) {
+                Checkpoint(fmt::format(
+                    "native chain check: {} of {} 3D frames ({} frames) gave post-processing the "
+                    "upscaled image at the output size ({} with later samples redirected to it, "
+                    "{} with an internal-size target after the upscaler); twin copies {} ({} not "
+                    "possible): {}",
+                    nc_reach, nc_scene, nc_frames, nc_redirect, nc_scaled,
+                    g_ss_twin_copies.load(std::memory_order_relaxed),
+                    g_ss_twin_fail.load(std::memory_order_relaxed), bad ? "FAILED" : "ok"));
+            }
+            if (bad) {
+                g_ss_off.store(true, std::memory_order_relaxed);
+                Checkpoint("WARNING: scene upscale turned OFF for this session (native chain "
+                           "check): the upscaled image did not reach the output chain");
+                LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] native chain check failed: {} of {}",
+                            nc_reach, nc_scene);
+            }
+            nc_frames = nc_scene = nc_reach = nc_redirect = nc_scaled = 0;
+        }
+    }
     if (g_ss_frozen.load(std::memory_order_relaxed) && !g_ss_off.load(std::memory_order_relaxed)) {
         ++g_ss_frames;
         if (f.gb_depth != 0) ++g_ss_scene;
@@ -2451,8 +2690,12 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             std::string list;
             for (u32 i = 0; i < count; ++i) {
                 g_ss_addrs[i] = g_ss_candidates[i];
+                g_ss_valid[i].store(2, std::memory_order_relaxed); // the full-size images hold it
+                g_ss_class[i].store(0, std::memory_order_relaxed);
                 list += fmt::format(" {:#x}", g_ss_addrs[i]);
             }
+            g_ss_depth.store(f.gb_depth, std::memory_order_relaxed);
+            g_ss_phase.store(0, std::memory_order_relaxed);
             g_ss_count.store(count, std::memory_order_release);
             g_ss_frozen.store(true, std::memory_order_release);
             Checkpoint(fmt::format("scene upscale (BB_SCENE_UPSCALE={}): {} scene targets of {}x{} "
