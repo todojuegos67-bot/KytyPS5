@@ -3173,8 +3173,9 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // frames) is not sent to the present-time path: switching the upscaler's input between the
     // HDR scene colour and the post-processed image reset its history every switch (19:07 run:
     // the background blurred and cleared in pulses). The frame keeps the game's own image.
-    const bool keep_inplace =
-        !PresentMode() && g_good_frame != 0 && g_frame_no <= g_good_frame + 120;
+    // (the whole session once the in-place point has worked: never mix the two paths, 19:24 run:
+    // consecutive frames alternated sharper / softer and the HUD changed brightness)
+    const bool keep_inplace = !PresentMode() && g_good_frame != 0;
     {
         static u32 n_frames = 0;
         ++n_frames;
