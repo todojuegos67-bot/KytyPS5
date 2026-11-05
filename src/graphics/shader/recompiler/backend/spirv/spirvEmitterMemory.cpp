@@ -1,3 +1,6 @@
+#include "graphics/shader/recompiler/backend/spirv/HelperInlinePolicy.h"
+#include <cinttypes>
+#include <cstdio>
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -11,13 +14,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
-
-// Memory helpers are called from hundreds of sites in large compute shaders (Ghost of Yotei:
-// 576 load_indirect_buffer_32x4 calls, 609 get_bda_pointer calls). Inlined at every site the
-// module the driver optimizes grows 4-5x (435K -> 2.0M words), which made NVIDIA's compiler take
-// up to 141 s per pipeline. DontInline is a hint; NVIDIA's Windows driver honours it (also used by
-// the Vulkan GPU-AV layer for the same reason) and then compiles each helper once.
-constexpr auto kHelperFunctionControl = spv::FunctionControlDontInlineMask;
 
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
@@ -1354,6 +1350,39 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 	return result;
 }
 
+uint32_t HelperFunctionControl(ValueEmitContext& ctx) {
+	auto&          state     = ctx.state;
+	const uint64_t threshold = HelperInlinePolicy::ThresholdWords();
+	if (threshold == 0u) return spv::FunctionControlMaskNone;
+	// Words each call site adds once the driver inlines the helper, measured on Yotei dumps
+	// (load_indirect_buffer_32x4 + 4 get_bda_pointer = 1434, 32x3 = 1134, 32x1 = 530,
+	// geometry + convert + get_bda_pointer = 8209 before this branch shrank them).
+	uint64_t expansion = 0;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto components = IR::BufferComponentCount(inst.GetOpcode());
+			if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) continue;
+			const auto& memory = ctx.Memory(inst);
+			if (memory.kind != IR::ResourceKind::IndirectBuffer) continue;
+			if (memory.formatted) {
+				if (inst.GetOpcode() == IR::ValueOpcode::LoadBufferU32) expansion += 6000u;
+			} else if (memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+				expansion += 230u + 300u * components;
+			}
+		}
+	}
+	expansion *= state.lane_count;
+	const bool blacklisted = HelperInlinePolicy::GuestBlacklisted(state.program.shader_hash);
+	const bool dont_inline = expansion >= threshold && !blacklisted;
+	if (expansion >= threshold) {
+		std::printf("HelperInline: shader %016" PRIx64 " helpers %s (estimated inlined expansion %" PRIu64
+		            " words, threshold %" PRIu64 "%s)\n",
+		            state.program.shader_hash, dont_inline ? "DontInline" : "inlined", expansion,
+		            threshold, blacklisted ? ", blacklisted after a driver fault" : "");
+	}
+	return dont_inline ? spv::FunctionControlDontInlineMask : spv::FunctionControlMaskNone;
+}
+
 void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
 	for (const auto* block: state.program.blocks) {
@@ -1375,7 +1404,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			                  std::to_string(components) + (memory.coherent ? "_coherent" : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
-			                          kHelperFunctionControl, signature);
+			                          static_cast<spv::FunctionControlMask>(state.helper_function_control), signature);
 			std::array<uint32_t, 8> args;
 			for (auto& arg: args) {
 				arg = state.builder.AllocateId();
@@ -1413,7 +1442,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		                      "indirect_buffer_format_geometry");
 		state.builder.AddFunction(spv::OpFunction, result_type,
 		                          state.indirect_format_geometry_function,
-		                          kHelperFunctionControl, function_type);
+		                          static_cast<spv::FunctionControlMask>(state.helper_function_control), function_type);
 		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 		EmitLabel(state, state.builder.AllocateId());
 		const auto geometry = [&](uint32_t format) {
@@ -1439,7 +1468,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	const auto raw = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
-	                          kHelperFunctionControl, function_type);
+	                          static_cast<spv::FunctionControlMask>(state.helper_function_control), function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
@@ -1517,7 +1546,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto entry_label     = state.builder.AllocateId();
 	state.builder.AddName(state.bda_pointer_function, "get_bda_pointer");
 	state.builder.AddFunction(spv::OpFunction, type, state.bda_pointer_function,
-	                          kHelperFunctionControl, function_type);
+	                          static_cast<spv::FunctionControlMask>(state.helper_function_control), function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 

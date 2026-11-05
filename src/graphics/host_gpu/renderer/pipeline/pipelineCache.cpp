@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/compileGuard.h"
+#include "graphics/shader/recompiler/backend/spirv/HelperInlinePolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/translationCache.h"
 #include "graphics/shaderSessionStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -486,6 +488,7 @@ struct PipelineCache::ProgramCache {
 			            stage_name, options.shader_hash, spirv.size(), module_ms);
 		}
 		Prewarm::NoteSpirv(module, spirv, options.shader_hash);
+		CompileGuard::NoteModule(static_cast<VkShaderModule>(module), options.shader_hash, spirv.size());
 		const ShaderProgram handle {.id = ++next_shader_id, .module = module,
 		                            .spirv_words = static_cast<uint64_t>(spirv.size())};
 		spirv_modules.emplace(spirv_key, handle);
@@ -621,6 +624,7 @@ struct PipelineCache::ProgramCache {
 		k.Value(options.user_data_base);
 		k.Value(options.maintenance8_enabled);
 		k.Value(options.emit_debug_info);
+		k.Value(ShaderRecompiler::HelperInlinePolicy::CacheKey(key.hash));
 		return k.Finish();
 	}
 

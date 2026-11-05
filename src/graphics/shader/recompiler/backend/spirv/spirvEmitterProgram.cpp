@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/HelperInlinePolicy.h"
 
 #include <algorithm>
 #include <bit>
@@ -676,6 +677,7 @@ void EmitProgram(EmitterState& state) {
 			high.dispatcher_spills = &dispatch.spills[1];
 		}
 	}
+	state.helper_function_control = HelperFunctionControl(ctx);
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
 	DefineIndirectBufferFormats(ctx);

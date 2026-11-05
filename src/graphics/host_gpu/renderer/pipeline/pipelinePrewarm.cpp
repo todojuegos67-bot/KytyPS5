@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
+#include "graphics/host_gpu/renderer/pipeline/compileGuard.h"
+#include "graphics/shader/recompiler/backend/spirv/HelperInlinePolicy.h"
 #include "graphics/shaderSessionStats.h"
 
 #include <algorithm>
@@ -12,6 +14,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <tuple>
@@ -444,6 +447,21 @@ vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 	if (!rd.ok || !BuildLayout(rd, ctx.graphics->device, push_size, layout)) {
 		return nullptr;
 	}
+	{
+		// A guest shader whose driver compile faulted (DontInline blacklist): its seed SPIR-V is
+		// the variant that crashed, so do not replay it; the game retranslates it with inlined helpers.
+		uint64_t seed_guest = 0;
+		{
+			std::lock_guard lock(ctx.mutex);
+			if (const auto it = ctx.guest_of_spirv.find(spirv); it != ctx.guest_of_spirv.end()) seed_guest = it->second;
+		}
+		if (seed_guest != 0 && ShaderRecompiler::HelperInlinePolicy::GuestBlacklisted(seed_guest)) {
+			std::printf("Prewarm: skipped SPIR-V %016llx of blacklisted guest %016llx\n",
+			            static_cast<unsigned long long>(spirv), static_cast<unsigned long long>(seed_guest));
+			DestroyLayout(ctx.graphics->device, layout);
+			return nullptr;
+		}
+	}
 	auto module = LoadModule(ctx, f, spirv, ctx.graphics->device);
 	if (module == nullptr) {
 		DestroyLayout(ctx.graphics->device, layout);
@@ -474,7 +492,15 @@ vk::Pipeline BuildCompute(Context& ctx, std::FILE* f, const Pending& p) {
 	// Huge modules hold hundreds of MiB of driver memory while they compile and the driver does not
 	// give it back; ten of them in flight at once were part of the 4 GiB overshoot of the VRAM guard.
 	const BigBuildSlot big_slot(module_words);
+	uint64_t guest = 0;
+	{
+		std::lock_guard lock(ctx.mutex);
+		if (const auto it = ctx.guest_of_spirv.find(spirv); it != ctx.guest_of_spirv.end()) guest = it->second;
+	}
+	std::optional<CompileGuard::Scope> guard;
+	guard.emplace("compute (prewarm)", spirv, nullptr, guest, module_words);
 	const auto   r = ctx.graphics->device.createComputePipelines(ctx.driver_cache, 1, &info, nullptr, &pipeline);
+	guard.reset();
 	ctx.graphics->device.destroyShaderModule(module, nullptr);
 	DestroyLayout(ctx.graphics->device, layout);
 	return r == vk::Result::eSuccess ? pipeline : nullptr;
@@ -650,6 +676,7 @@ vk::Pipeline BuildGraphics(Context& ctx, std::FILE* f, const Pending& p) {
 	if (ok) {
 		info.layout             = layout.layout;
 		info.basePipelineIndex  = -1;
+		const CompileGuard::Scope guard("graphics (prewarm)", 0, nullptr, 0, 0);
 		const auto r = device.createGraphicsPipelines(
 		    ctx.driver_cache, 1, reinterpret_cast<const vk::GraphicsPipelineCreateInfo*>(&info), nullptr, &pipeline);
 		if (r != vk::Result::eSuccess) {

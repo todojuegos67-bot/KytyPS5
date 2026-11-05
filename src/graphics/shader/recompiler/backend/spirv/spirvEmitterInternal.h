@@ -109,6 +109,9 @@ struct EmitterState {
 	uint32_t                                         tess_patch_base     = 0;
 
 	uint32_t                                         lane_count              = 1;
+	// Function control for the memory helpers (get_bda_pointer, load_indirect_buffer_*, ...):
+	// DontInline only when inlining them would blow the module up (see HelperInlinePolicy).
+	uint32_t                                         helper_function_control = 0;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
@@ -543,6 +546,8 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
+// spv::FunctionControlMask for the memory helpers of this module (HelperInlinePolicy).
+uint32_t HelperFunctionControl(ValueEmitContext& ctx);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineIndirectBufferFormats(ValueEmitContext& ctx);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);

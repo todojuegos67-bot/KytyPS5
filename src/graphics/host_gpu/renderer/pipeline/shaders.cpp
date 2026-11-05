@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
 #include "graphics/host_gpu/renderer/pipeline/compileLog.h"
+#include "graphics/host_gpu/renderer/pipeline/compileGuard.h"
 
 #include <chrono>
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -29,6 +30,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <array>
 #include <bit>
@@ -588,6 +590,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		result            = vk::Result::eSuccess;
 	} else {
 		const auto compile_start = std::chrono::steady_clock::now();
+		const CompileGuard::Scope guard("graphics", prewarm_key, nullptr, 0, 0);
 		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 		                                                 &pipeline.pipeline);
 		Prewarm::NoteRuntimeCompile(true, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -692,6 +695,8 @@ struct OptimizedBuilds {
 			if (job.has_subgroup) job.info.stage.pNext = &job.subgroup;
 			const auto begin = std::chrono::steady_clock::now();
 			vk::Pipeline result = nullptr;
+			const CompileGuard::Scope guard("compute (optimized rebuild)", 0,
+			                                static_cast<VkShaderModule>(job.info.stage.module), 0, job.words);
 			const auto r = job.graphics->device.createComputePipelines(job.cache, 1, &job.info, nullptr, &result);
 			const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
 			if (r == vk::Result::eSuccess && result != nullptr) {
@@ -837,8 +842,11 @@ void CreateComputePipelineObject(GraphicContext& graphics, PipelineCache::Pipeli
 	feedback_info.pPipelineStageCreationFeedbacks    = &stage_feedback;
 	info.pNext                                       = &feedback_info;
 	const auto compile_start = std::chrono::steady_clock::now();
+	std::optional<CompileGuard::Scope> guard;
+	guard.emplace("compute", job.prewarm_key, static_cast<VkShaderModule>(job.module), 0, job.spirv_words);
 	const auto result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                           &pipeline.pipeline);
+	guard.reset();
 	info.pNext = nullptr;
 	{
 		const auto feedback_bits = static_cast<uint32_t>(VkPipelineCreationFeedbackFlags(feedback.flags));

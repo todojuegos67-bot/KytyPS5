@@ -14,6 +14,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/renderer/pipeline/compileGuard.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -706,7 +707,22 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			std::printf("\n");
+			// Stack words that point into a loaded host module (return addresses, mostly).
+			for (int i = 0; i < 32; i++) {
+				char where[300];
+				Libs::Graphics::CompileGuard::DescribeAddress(stack[i], where, sizeof(where));
+				if (where[0] != '\0') {
+					std::printf("stack[%d] %016" PRIx64 " = %s\n", i, stack[i], where);
+				}
+			}
 		}
+		{
+			char where[300];
+			Libs::Graphics::CompileGuard::DescribeAddress(info->exception_address, where, sizeof(where));
+			std::printf("fault pc %016" PRIx64 " = %s\n", info->exception_address,
+			            where[0] != '\0' ? where : "(not in a loaded module: guest or JIT code)");
+		}
+		Libs::Graphics::CompileGuard::ReportAndBlacklist();
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
