@@ -2098,8 +2098,10 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
 		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
 			g_gpu_state->ProcessCommands();
-			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
-			g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
+			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets; its verify's
+			// synchronous download only outside a recorder.)
+			g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(CommandScheduler::ThreadRecorder() ==
+			                                                                    nullptr);
 		}
 		// (KYTY_WRITE_GUARD_SPEC: a page the GPU thread guarded since this thread's buffers were rebased: rebased again,
 		// before the next packet is read through a mapping that has no access now. KYTY_WRITE_GUARD_LOCKFREE: only when a

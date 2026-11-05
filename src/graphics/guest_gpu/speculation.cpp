@@ -969,6 +969,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		result.submitted = segment.recorded;
 		After(result, index);
 		if ((GuestGpu::ServeInWaits() & 2u) != 0) GuestGpu::ServePendingCommands(); // (KYTY_SERVE_IN_WAITS 2)
+		m_renderer.GetBufferCache().WriteBackCompletedFeedback(false); // (KYTY_EAGER_FEEDBACK)
 		result.next = index + 1;
 		if (index < result.holes.size()) {
 			const auto run = RunHole(result, cp, index);

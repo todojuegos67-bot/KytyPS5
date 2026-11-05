@@ -966,7 +966,7 @@ bool BufferCache::VerifyEagerFeedback(const EagerFeedback& entry) {
 	auto&      feedback = *m_copy_feedback;
 	const auto begin    = entry.address & ~(TRACKER_PAGE_SIZE - 1);
 	const auto end      = (entry.address + entry.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-	if (m_scheduler.Current().InCopyRun()) return false;
+	if (m_scheduler.Current().InCopyRun() || Spec::Current() != nullptr) return false;
 	for (const auto& pending: m_guest_readbacks)
 		if (pending && pending->begin < end && begin < pending->begin + pending->size) return false;
 	auto& buffer = m_slot_buffers[FindBuffer(entry.address, entry.size)];
