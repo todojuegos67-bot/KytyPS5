@@ -40,6 +40,7 @@ bool Ready();
 float Sharpness();
 const char* Name();
 bool MixedDotReady(); // bb-dcideas-094: what FSR 4.1.1's INT8 passes need is on
+bool MixedDotExt();   // VK_VALVE_shader_mixed_float_dot_product on (non-portable asset sets)
 } // namespace Libs::Graphics::Fsr4
 // AMD FSR 4 (source-v07 INT8 / DOT4 model) on the PS5 Pro path: see fsr4-sr.h. The runtime is ours (KytyPS5, GPL-2.0);
 // the model's SPIR-V and weights are AMD's (MIT, fsr4_shaders/LICENSE-FSR4-v07.txt). The dispatch sizes, the constant
@@ -854,7 +855,11 @@ bool SrPathWanted() {
 	return wanted;
 }
 
-bool MixedDotReady() { return g_dev.mixed_dot && g_dev.dot && g_dev.int8 && g_dev.float16; }
+// (Not the mixed float dot extension: Windows drivers lack it, and DCport's Windows asset sets are
+// built without it, FSR411_PORTABLE=1 in extract.py. Sets that need it fail at pipeline creation,
+// which falls back to FSR 4.0 with the reason logged.)
+bool MixedDotReady() { return g_dev.dot && g_dev.int8 && g_dev.float16 && g_dev.int16; }
+bool MixedDotExt() { return g_dev.mixed_dot; }
 
 const char* Name() {
 	const int preset = RequestedPreset();
@@ -1374,8 +1379,7 @@ bool Check411() {
     const char* env = std::getenv("BB_FSR411_DIR");
     g411.dir = env != nullptr && *env != '\0' ? env : "fsr4_411";
     if (!Libs::Graphics::Fsr4::MixedDotReady()) {
-        Fallback411("this GPU / driver lacks VK_VALVE_shader_mixed_float_dot_product (or INT8 dot "
-                    "products, shaderInt8, shaderFloat16)");
+        Fallback411("this GPU lacks INT8 dot products, shaderInt8, shaderInt16 or shaderFloat16");
         return false;
     }
     Fsr411::Features f{};
@@ -1388,7 +1392,10 @@ bool Check411() {
         static_cast<VkPhysicalDevice>(g_ctx.physical_device), static_cast<VkDevice>(g_ctx.device),
         g411.dir, f);
     g411.usable = true;
-    BBLogf("FSR 4.1.1: asset sets found in '%s': the fsr4 upscaler runs FSR 4.1.1\n", g411.dir.c_str());
+    BBLogf("FSR 4.1.1: asset sets found in '%s': the fsr4 upscaler runs FSR 4.1.1 "
+           "(VK_VALVE_shader_mixed_float_dot_product %s: %s)\n", g411.dir.c_str(),
+           Libs::Graphics::Fsr4::MixedDotExt() ? "on" : "off",
+           Libs::Graphics::Fsr4::MixedDotExt() ? "any asset set" : "portable asset sets only (FSR411_PORTABLE=1)");
     return true;
 }
 void ToGeneral(vk::CommandBuffer cmd, const Image& img, vk::ImageAspectFlags aspect, bool back) {
