@@ -49,8 +49,29 @@ bool GuestBlacklisted(uint64_t guest_hash) {
 	return s.blacklist.contains(guest_hash);
 }
 
+namespace {
+bool EnvOn(const char* name) {
+	const char* v = std::getenv(name);
+	return v != nullptr && v[0] == '1';
+}
+} // namespace
+
+bool SwitchGroup() {
+	static const bool on = EnvOn("KYTY_SPIRV_HELPER_SWITCHGROUP");
+	return on;
+}
+bool GeomGroup() {
+	static const bool on = EnvOn("KYTY_SPIRV_HELPER_GEOMGROUP");
+	return on;
+}
+bool BoundsHoist() {
+	static const bool on = EnvOn("KYTY_SPIRV_HELPER_BOUNDSHOIST");
+	return on;
+}
+
 uint64_t CacheKey(uint64_t guest_hash) {
-	return (ThresholdWords() << 1u) | (GuestBlacklisted(guest_hash) ? 1u : 0u);
+	return (ThresholdWords() << 4u) | (SwitchGroup() ? 8u : 0u) | (GeomGroup() ? 4u : 0u) |
+	       (BoundsHoist() ? 2u : 0u) | (GuestBlacklisted(guest_hash) ? 1u : 0u);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::HelperInlinePolicy
