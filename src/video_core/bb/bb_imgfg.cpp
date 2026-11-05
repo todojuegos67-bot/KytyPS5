@@ -267,21 +267,21 @@ void Teardown() {
             if (g.acquired[s][j]) g.device.destroySemaphore(g.acquired[s][j]);
             if (g.done[s][j]) g.device.destroySemaphore(g.done[s][j]);
         }
-        g.fence[s] = {};
-        g.real_wait[s] = {};
+        g.fence[s] = vk::Fence{};
+        g.real_wait[s] = vk::Semaphore{};
         g.acquired[s] = {};
         g.done[s] = {};
     }
     if (g.pool) g.device.destroyCommandPool(g.pool);
-    g.pool = {};
+    g.pool = vk::CommandPool{};
     if (g.queries) g.device.destroyQueryPool(g.queries);
-    g.queries = {};
+    g.queries = vk::QueryPool{};
     if (g.stats_map) g.device.unmapMemory(g.stats_memory);
     g.stats_map = nullptr;
     if (g.stats_buffer) g.device.destroyBuffer(g.stats_buffer);
     if (g.stats_memory) g.device.freeMemory(g.stats_memory);
-    g.stats_buffer = {};
-    g.stats_memory = {};
+    g.stats_buffer = vk::Buffer{};
+    g.stats_memory = vk::DeviceMemory{};
     g.built = false;
     g.have_prev = false;
     g.hud_valid = false;
@@ -1099,7 +1099,7 @@ bool BeforeRealPresent(const PresentIn& in, vk::Semaphore* wait) {
         const auto sub = step / mult;
         for (int j = 0; j < n_out; ++j) {
             WaitUntil(first + sub * j);
-            uint64_t id = Display::IssueImage(true);
+            uint64_t id = BB::FG::Display::IssueImage(true);
             VkPresentIdKHR present_id{};
             present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
             present_id.swapchainCount = 1;
