@@ -990,7 +990,7 @@ bool PathLockOn() {
 double g_sec_cam_max = 0.0;
 // 0.85: with the path lock the upscaler's history is reset only on its first frame and on a real
 // camera cut, by the same test as DLSS-G (bb-dlssg-085): the mean displacement (NDC, the screen
-// 2 wide) of four clip points through clip_to_prev_clip above 1.0 (BB_SR_CUT_NDC). The path-state
+// 2 wide) of four clip points through clip_to_prev_clip above 3.0 (BB_SR_CUT_NDC; 0.89: 1.0 cut on fast turns, 1.03-1.04). The path-state
 // resets (last frame not in place, window path before) are not used. BB_PATH_LOCK=0: as before.
 void SrReset(Plan& p) {
     if (!PathLockOn()) {
@@ -999,7 +999,7 @@ void SrReset(Plan& p) {
     }
     static const double cut = [] {
         const char* e = std::getenv("BB_SR_CUT_NDC");
-        return e != nullptr && *e != '\0' ? std::atof(e) : 1.0;
+        return e != nullptr && *e != '\0' ? std::atof(e) : 3.0;
     }();
     static bool first = true;
     double delta = 0.0;
@@ -3267,7 +3267,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             if (g_sec_frames > 0) {
                 Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
                                        "resets {} (camera delta max {:.3f} NDC; a reset only "
-                                       "above BB_SR_CUT_NDC, default 1.0)",
+                                       "above BB_SR_CUT_NDC, default 3.0)",
                                        g_lock == 1 ? "in-place" : g_lock == 2 ? "window"
                                                                               : "undecided",
                                        g_sec_locked, g_sec_frames, g_sec_resets, g_sec_cam_max));
