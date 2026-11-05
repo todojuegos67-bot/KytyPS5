@@ -182,7 +182,11 @@ struct GraphicContext {
 	// A log line on where the video memory goes (Windows' and VMA's figures): diagnostics.
 	void                   LogVideoMemory(const char* label) const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// `guest_texture`: an image of the guest's (Image, image.cpp), not one of the emulator's own (presenter, frame generation, super
+	// resolution): KYTY_TEXTURE_HOST_MODE=pd places only those flexibly.
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image, bool guest_texture = false);
+	// (CreateImage: a texture made in the host-preferred type, KYTY_TEXTURE_HOST_AT; where it really is, logged.)
+	void                   NoteHostPreferredTexture(VmaAllocation allocation, double host_at);
 	void                   DeleteImage(VulkanImage& image);
 	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
 	void                   TrimImagePool();
