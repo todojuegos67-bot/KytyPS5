@@ -1111,6 +1111,10 @@ uint32_t g_stat_real = 0, g_stat_on = 0, g_stat_hudless = 0;
 uint32_t g_stat_untagged = 0, g_stat_nohudless = 0, g_stat_hudless_size = 0, g_stat_reset = 0,
          g_stat_nocamera = 0, g_stat_inputs = 0;
 uint32_t g_last_status = 0;
+// bb-merge-082: the last HUD-less image given and the game image it was matched with (for the log).
+uint32_t g_last_hl_w = 0, g_last_hl_h = 0, g_last_hl_fmt = 0, g_last_gi_w = 0, g_last_gi_h = 0,
+         g_last_gi_fmt = 0;
+bool g_last_hl_scaled = false;
 double g_stat_present_ms = 0, g_stat_present_max = 0;
 double g_pace_n = 0, g_pace_sum = 0, g_pace_sq = 0, g_pace_max = 0;
 
@@ -1598,6 +1602,11 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
     const sl::ViewportHandle viewport{0};
     // Menus, movies and loading screens (no 3D scene upscaled) are presented as they are.
     const bool usable = inputs != nullptr && inputs->valid;
+    // bb-merge-082: the HUD-less image DLSS-G is given: the one at the game image's size when the
+    // presenter made it (the frame is scaled into the window), else the frame's own.
+    const Image& hl_image =
+        usable && inputs->has_hudless_game ? inputs->hudless_game : (usable ? inputs->hudless : Image{});
+    const bool hl_present = usable && inputs->has_hudless;
     // The pacer: real frames at most every target / m while generating (one limiter, ours).
     if (const double interval = g_real_interval.load(); interval > 0.0 && usable && !GuestPacing()) {
         static Clock::time_point next{};
@@ -1676,9 +1685,11 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                    g_stat_present_ms / n, g_stat_present_max, g_stat_hudless, g_last_status);
             Printf("[dlssg] inputs last second: %u frames with inputs (no tags on %u without), HUD-less "
                    "tagged %u, without a HUD-less image %u, HUD-less size != game image %u, "
-                   "camera invalid %u, reset %u",
+                   "camera invalid %u, reset %u | last HUD-less %ux%u fmt %u%s, game image %ux%u fmt %u",
                    g_stat_inputs, g_stat_untagged, g_stat_hudless, g_stat_nohudless,
-                   g_stat_hudless_size, g_stat_nocamera, g_stat_reset);
+                   g_stat_hudless_size, g_stat_nocamera, g_stat_reset, g_last_hl_w, g_last_hl_h,
+                   g_last_hl_fmt, g_last_hl_scaled ? " (scaled to the game image)" : "", g_last_gi_w,
+                   g_last_gi_h, g_last_gi_fmt);
             g_stat_untagged = g_stat_nohudless = g_stat_hudless_size = g_stat_reset =
                 g_stat_nocamera = g_stat_inputs = 0;
             g_stat_hudless = 0;
@@ -1756,9 +1767,9 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                 options.depthBufferFormat =
                     static_cast<uint32_t>(static_cast<VkFormat>(inputs->depth.format));
             }
-            if (inputs->has_hudless && inputs->hudless.format != vk::Format::eUndefined) {
+            if (hl_present && hl_image.format != vk::Format::eUndefined) {
                 options.hudLessBufferFormat =
-                    static_cast<uint32_t>(static_cast<VkFormat>(inputs->hudless.format));
+                    static_cast<uint32_t>(static_cast<VkFormat>(hl_image.format));
             }
             g_options_render = inputs->render;
         }
@@ -1808,7 +1819,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
     if (usable) {
         sl::Resource depth = ToResource(inputs->depth);
         sl::Resource motion = ToResource(inputs->motion);
-        sl::Resource hudless = ToResource(inputs->hudless);
+        sl::Resource hudless = ToResource(hl_image);
         const sl::Extent full{0, 0, inputs->render.width, inputs->render.height};
         // sl::Extent is {top, left, width, height} (sl_consts.h): the game image's offset is y
         // (top) then x (left). (bb-dlssg-077: it was given x first; only a subrect shows it.)
@@ -1818,8 +1829,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         const bool partial = region.offset.x != 0 || region.offset.y != 0 ||
                              region.extent.width != backbuffer.width ||
                              region.extent.height != backbuffer.height;
-        const sl::Extent hudless_extent{0, 0, inputs->hudless.extent.width,
-                                        inputs->hudless.extent.height};
+        const sl::Extent hudless_extent{0, 0, hl_image.extent.width, hl_image.extent.height};
         std::vector<sl::ResourceTag> tags{
             sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent,
                             &full),
@@ -1836,16 +1846,26 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         }();
         // The HUD-less image is the game's image (the window size, output size), which sits in
         // the backbuffer at region: it can be smaller than the backbuffer (2556 of 2560 wide).
-        const bool tag_hudless = hudless_tag && inputs->has_hudless &&
-                                 inputs->hudless.extent.width == region.extent.width &&
-                                 inputs->hudless.extent.height == region.extent.height;
+        // bb-merge-082: size and format both as the game image's (Streamline: the HUD-less
+        // image has the back buffer's format and the size of the colour it goes with).
+        const bool size_ok = hl_present && hl_image.extent.width == region.extent.width &&
+                             hl_image.extent.height == region.extent.height;
+        const bool format_ok = hl_present && hl_image.format == format;
+        const bool tag_hudless = hudless_tag && size_ok && format_ok;
+        g_last_hl_w = hl_present ? hl_image.extent.width : 0;
+        g_last_hl_h = hl_present ? hl_image.extent.height : 0;
+        g_last_hl_fmt = hl_present ? static_cast<uint32_t>(static_cast<VkFormat>(hl_image.format)) : 0;
+        g_last_gi_w = region.extent.width;
+        g_last_gi_h = region.extent.height;
+        g_last_gi_fmt = static_cast<uint32_t>(static_cast<VkFormat>(format));
+        g_last_hl_scaled = hl_present && inputs->has_hudless_game;
         ++g_stat_inputs;
         if (!inputs->camera_valid) ++g_stat_nocamera;
         if (inputs->reset) ++g_stat_reset;
-        if (!inputs->has_hudless) {
+        if (!hl_present) {
             ++g_stat_nohudless;
         } else if (!tag_hudless && hudless_tag) {
-            ++g_stat_hudless_size;
+            ++g_stat_hudless_size; // (size or format)
         }
         if (tag_hudless) {
             ++g_stat_hudless;
@@ -1872,7 +1892,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             };
             show("depth", inputs->depth);
             show("motion", inputs->motion);
-            show("hudless", inputs->hudless);
+            show("hudless", hl_image);
             {
                 const auto label = [](const char* name, const Image& img, bool tagged) {
                     bool known = false;
@@ -1893,18 +1913,18 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                        "HUD-less %u",
                        label("depth", inputs->depth, true).c_str(),
                        label("motion vectors", inputs->motion, true).c_str(),
-                       label("HUD-less", inputs->hudless, tag_hudless).c_str(), color_name, color,
+                       label("HUD-less", hl_image, tag_hudless).c_str(), color_name, color,
                        backbuffer.width, backbuffer.height, color_known ? "" : " [not in Streamline's table]",
                        region.offset.x, region.offset.y, region.extent.width, region.extent.height,
                        partial ? "(tagged as a subrect)" : "(whole backbuffer, not tagged)",
                        color, static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT),
                        static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT),
-                       tag_hudless ? static_cast<uint32_t>(static_cast<VkFormat>(inputs->hudless.format))
+                       tag_hudless ? static_cast<uint32_t>(static_cast<VkFormat>(hl_image.format))
                                    : color);
             }
             Printf("[dlssg] tag hudless: tagged %s, options hudless format %u, backbuffer format %u",
                    tag_hudless ? "yes" : "no",
-                   static_cast<uint32_t>(static_cast<VkFormat>(inputs->hudless.format)),
+                   static_cast<uint32_t>(static_cast<VkFormat>(hl_image.format)),
                    static_cast<uint32_t>(static_cast<VkFormat>(format)));
         }
         static bool constants_dumped = false;
@@ -2217,6 +2237,10 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
                vk::to_string(wanted).c_str(), why);
     }
     return wanted;
+}
+
+bool WantsGameSizedHudless() {
+    return Dlssg::Ready();
 }
 
 bool WantInputs() {

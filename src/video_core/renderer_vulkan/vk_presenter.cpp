@@ -655,6 +655,66 @@ bool Presenter::EnsureFgHudless(Frame* frame) {
     return true;
 }
 
+bool Presenter::EnsureFgHudlessGame(Frame* frame, vk::Extent2D extent) {
+    const vk::Format format = frame->fg_hudless_format;
+    if (frame->fg_hudless_game && frame->fg_hudless_game_width == extent.width &&
+        frame->fg_hudless_game_height == extent.height && frame->fg_hudless_game_format == format) {
+        return true;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (frame->fg_hudless_game) {
+        (void)device.waitIdle();
+        device.destroyImageView(frame->fg_hudless_game_view);
+        vmaDestroyImage(instance.GetAllocator(), frame->fg_hudless_game,
+                        frame->fg_hudless_game_allocation);
+        frame->fg_hudless_game = vk::Image{};
+        frame->fg_hudless_game_view = vk::ImageView{};
+    }
+    const VkImageCreateInfo image_info = vk::ImageCreateInfo{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+    };
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &image,
+                       &frame->fg_hudless_game_allocation, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    frame->fg_hudless_game = vk::Image{image};
+    const auto [result, view] = device.createImageView(vk::ImageViewCreateInfo{
+        .image = frame->fg_hudless_game,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    });
+    if (result != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), frame->fg_hudless_game,
+                        frame->fg_hudless_game_allocation);
+        frame->fg_hudless_game = vk::Image{};
+        return false;
+    }
+    frame->fg_hudless_game_view = view;
+    frame->fg_hudless_game_width = extent.width;
+    frame->fg_hudless_game_height = extent.height;
+    frame->fg_hudless_game_format = format;
+    return true;
+}
+
 Frame* Presenter::PrepareLastFrame() {
     if (last_submit_frame == nullptr) {
         return nullptr;
@@ -1265,6 +1325,102 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             ImGui::End();
             ImGui::PopStyleVar(3);
             ImGui::PopStyleColor();
+        }
+        // bb-merge-082: DLSS-G's HUD-less image must be as large as the game image it is tagged
+        // with (fg_region), which is not the frame's size when the frame is scaled into the window
+        // (Streamline would refuse a HUD-less image of another size; before this the tag was
+        // dropped: "HUD-less 0"). A linear blit of the frame's HUD-less image to that size.
+        frame->fg.has_hudless_game = false;
+        if (!is_reusing_frame && is_game_frame && frame->fg.valid && frame->fg.has_hudless &&
+            frame->fg_hudless && !swapchain.GetHDR() && BB::FG::WantsGameSizedHudless() &&
+            fg_region.extent.width != 0 && fg_region.extent.height != 0 &&
+            (fg_region.extent.width != frame->fg_hudless_width ||
+             fg_region.extent.height != frame->fg_hudless_height) &&
+            EnsureFgHudlessGame(frame, fg_region.extent)) {
+            const vk::ImageSubresourceRange color_range{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            };
+            const std::array<vk::ImageMemoryBarrier2, 2> to_blit{
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = frame->fg_hudless,
+                    .subresourceRange = color_range,
+                },
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .oldLayout = vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = frame->fg_hudless_game,
+                    .subresourceRange = color_range,
+                },
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = static_cast<u32>(to_blit.size()),
+                .pImageMemoryBarriers = to_blit.data(),
+            });
+            vk::ImageBlit blit{};
+            blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            blit.srcOffsets[1] = vk::Offset3D{static_cast<s32>(frame->fg_hudless_width),
+                                              static_cast<s32>(frame->fg_hudless_height), 1};
+            blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            blit.dstOffsets[1] = vk::Offset3D{static_cast<s32>(fg_region.extent.width),
+                                              static_cast<s32>(fg_region.extent.height), 1};
+            cmdbuf.blitImage(frame->fg_hudless, vk::ImageLayout::eTransferSrcOptimal,
+                             frame->fg_hudless_game, vk::ImageLayout::eTransferDstOptimal, blit,
+                             vk::Filter::eLinear);
+            const std::array<vk::ImageMemoryBarrier2, 2> from_blit{
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                    .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = frame->fg_hudless,
+                    .subresourceRange = color_range,
+                },
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = frame->fg_hudless_game,
+                    .subresourceRange = color_range,
+                },
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = static_cast<u32>(from_blit.size()),
+                .pImageMemoryBarriers = from_blit.data(),
+            });
+            frame->fg.hudless_game = {frame->fg_hudless_game, frame->fg_hudless_game_view,
+                                      frame->fg_hudless_game_format, fg_region.extent,
+                                      vk::ImageUsageFlagBits::eColorAttachment |
+                                          vk::ImageUsageFlagBits::eSampled |
+                                          vk::ImageUsageFlagBits::eTransferSrc |
+                                          vk::ImageUsageFlagBits::eTransferDst};
+            frame->fg.has_hudless_game = true;
         }
         ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
 

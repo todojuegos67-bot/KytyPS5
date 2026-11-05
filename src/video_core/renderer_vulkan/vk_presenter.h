@@ -49,6 +49,13 @@ struct Frame {
     u32 fg_hudless_width{};
     u32 fg_hudless_height{};
     vk::Format fg_hudless_format{};
+    // bb-merge-082: that image scaled to the game image's size in the backbuffer (DLSS-G).
+    vk::Image fg_hudless_game{};
+    VmaAllocation fg_hudless_game_allocation{};
+    vk::ImageView fg_hudless_game_view{};
+    u32 fg_hudless_game_width{};
+    u32 fg_hudless_game_height{};
+    vk::Format fg_hudless_game_format{};
     u64 lat_index{}; // BB::AntiLag's index of the guest flip this frame shows (0: none)
 };
 
@@ -121,6 +128,7 @@ private:
     void SetExpectedGameSize(s32 width, s32 height);
 
     bool EnsureFgHudless(Frame* frame);
+    bool EnsureFgHudlessGame(Frame* frame, vk::Extent2D extent);
 
 private:
     float expected_ratio{1920.0 / 1080.0f};

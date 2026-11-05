@@ -97,6 +97,11 @@ struct Inputs {
     Image motion;       // render size, RG16F pixels towards the previous frame, SHADER_READ_ONLY
     Image hudless;      // output size, the frame image's format, SHADER_READ_ONLY_OPTIMAL
     bool has_hudless = false;
+    // bb-merge-082: the same image scaled to the size of the game image inside the backbuffer
+    // (the presenter's fg_region), only when that differs from the frame's size: DLSS-G wants its
+    // HUD-less image as large as the game image it is tagged with.
+    Image hudless_game;
+    bool has_hudless_game = false;
     vk::Extent2D render{};
     float jitter[2]{};
     bool reset = false;
@@ -112,6 +117,8 @@ struct Inputs {
 };
 // FG wants the inputs captured (any method asked and its back end ready).
 bool WantInputs();
+// bb-merge-082: DLSS-G is the method in use (its HUD-less image is made at the game image's size).
+bool WantsGameSizedHudless();
 // Before the swapchain present (the present thread, the frame's commands submitted). region: the
 // game image inside the backbuffer.
 void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2D backbuffer,
