@@ -149,6 +149,7 @@ struct BBVk {
     // 0.39 (BB_FG_NATIVE): frame generation with no upscaler: the presented image before its HUD
     // (raw copy, its own format): the motion-vector pass's colour input and FG's HUD-less image.
     OwnImage fgn_src;
+    OwnImage d5_work; // 0.90: DLSS 5 without an upscaler (RGBA16F copy of the native image)
     bool fgn_ready = false;
     // BB_HUD_DIAG: the presented image's address once its HUD-less copy is taken, frames seen.
     VAddr hud_flip = 0;
@@ -2564,6 +2565,113 @@ bool Rasterizer::BBFgNativeAnalyze(VideoCore::Image& flip, bool late) {
         return false;
     }
     g_bb.fgn_ready = true;
+    // 0.90: DLSS 5 with no upscaler (Reescalado off / native). The same point and inputs as frame
+    // generation: the game's image at its own size (before the HUD when a HUD draw was found),
+    // the G-buffer depth and the motion vectors just built. NR runs on an RGBA16F copy; the result
+    // goes back into the game's image (what is presented) and into the copy frame generation
+    // reads, so the generated frames are made from the same picture that is shown.
+    if (BB::Dlss5::Wanted() && bb_gb_depth_valid &&
+        EnsureImage(g_bb.d5_work, extent, vk::Format::eR16G16B16A16Sfloat,
+                    vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+                        vk::ImageUsageFlagBits::eTransferSrc |
+                        vk::ImageUsageFlagBits::eTransferDst)) {
+        auto& depth = texture_cache.GetImage(texture_cache.FindImage(bb_gb_depth_desc));
+        scheduler.EndRendering();
+        runtime.Transit(&depth, vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
+        const auto dcmd = scheduler.CommandBuffer();
+        const auto depth_view = TransientView(scheduler, depth.GetImage(), depth.info.pixel_format,
+                                              vk::ImageAspectFlagBits::eDepth);
+        if (depth_view && g_bb.mv.image && g_bb.mv.extent == extent &&
+            depth.info.size.width == extent.width && depth.info.size.height == extent.height) {
+            const std::array<vk::Offset3D, 2> d5_corners{
+                vk::Offset3D{0, 0, 0},
+                vk::Offset3D{static_cast<s32>(extent.width), static_cast<s32>(extent.height), 1}};
+            const vk::ImageBlit whole{
+                .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .srcOffsets = d5_corners,
+                .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .dstOffsets = d5_corners,
+            };
+            Barrier(dcmd, g_bb.fgn_src, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+            Barrier(dcmd, g_bb.d5_work, vk::ImageLayout::eTransferDstOptimal,
+                    vk::PipelineStageFlagBits2::eAllCommands,
+                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                        vk::AccessFlagBits2::eTransferRead,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+            dcmd.blitImage(g_bb.fgn_src.image, vk::ImageLayout::eTransferSrcOptimal,
+                           g_bb.d5_work.image, vk::ImageLayout::eTransferDstOptimal, whole,
+                           vk::Filter::eNearest);
+            Barrier(dcmd, g_bb.d5_work, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                    vk::PipelineStageFlagBits2::eAllCommands,
+                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+            Barrier(dcmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
+                    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite,
+                    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+            BB::SR::Desc d{};
+            d.cmd = dcmd;
+            d.output = {g_bb.d5_work.image, g_bb.d5_work.view, g_bb.d5_work.format, extent,
+                        vk::ImageLayout::eGeneral, g_bb.d5_work.usage};
+            d.color = d.output;
+            d.depth = {depth.GetImage(), depth_view, depth.info.pixel_format, extent,
+                       vk::ImageLayout::eDepthStencilReadOnlyOptimal, depth.usage_flags};
+            d.motion = {g_bb.mv.image, g_bb.mv.view, g_bb.mv.format, extent,
+                        vk::ImageLayout::eShaderReadOnlyOptimal, g_bb.mv.usage};
+            d.render = extent;
+            d.upscale = extent;
+            d.jitter[0] = plan.jitter[0];
+            d.jitter[1] = plan.jitter[1];
+            d.reset = plan.reset;
+            d.depth_inverted = plan.depth_inverted;
+            d.delta_ms = plan.delta_ms;
+            d.fov_y = plan.fov_y;
+            d.z_near = plan.z_near;
+            d.z_far = plan.z_far;
+            d.camera_valid = plan.camera_valid;
+            std::copy(std::begin(plan.view_to_clip), std::end(plan.view_to_clip), d.view_to_clip);
+            std::copy(std::begin(plan.clip_to_prev_clip), std::end(plan.clip_to_prev_clip),
+                      d.clip_to_prev_clip);
+            if (BB::Dlss5::Apply(d)) {
+                runtime.Transit(&flip, vk::ImageLayout::eTransferDstOptimal,
+                                vk::PipelineStageFlagBits2::eTransfer,
+                                vk::AccessFlagBits2::eTransferWrite);
+                runtime.FlushBarriers();
+                const auto bcmd = scheduler.CommandBuffer();
+                Barrier(bcmd, g_bb.d5_work, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+                Barrier(bcmd, g_bb.fgn_src, vk::ImageLayout::eTransferDstOptimal,
+                        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eNone,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+                bcmd.blitImage(g_bb.d5_work.image, vk::ImageLayout::eTransferSrcOptimal,
+                               flip.GetImage(), vk::ImageLayout::eTransferDstOptimal, whole,
+                               vk::Filter::eNearest);
+                bcmd.blitImage(g_bb.d5_work.image, vk::ImageLayout::eTransferSrcOptimal,
+                               g_bb.fgn_src.image, vk::ImageLayout::eTransferDstOptimal, whole,
+                               vk::Filter::eNearest);
+                Barrier(bcmd, g_bb.fgn_src, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+                static u64 n_d5 = 0;
+                if (n_d5++ % 600 == 0) {
+                    BB::Upscale::Checkpoint(fmt::format(
+                        "[dlss5] native (no upscaler): frame {} {}x{}, {} (same image and vectors "
+                        "as frame generation)",
+                        n_d5, extent.width, extent.height,
+                        late ? "at present (no HUD draw found)" : "before the HUD"));
+                }
+            } else {
+                Barrier(dcmd, g_bb.fgn_src, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+                        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+            }
+        }
+    }
     return true;
 }
 

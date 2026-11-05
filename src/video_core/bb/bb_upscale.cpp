@@ -170,7 +170,15 @@ Config ParseConfig() {
     } else if (up == "native") {
         c.kind = SR::Kind::Native;
     }
-    if ((c.kind == SR::Kind::Off || c.kind == SR::Kind::Native) && FgNativeWanted()) {
+    // 0.90: DLSS 5 with no upscaler (Reescalado off / native): the same native analysis as frame
+    // generation (G-buffer depth, camera + object motion vectors at the game's size), with
+    // DLSS 5 on the native image at that point (BBFgNativeAnalyze). FG may be off.
+    const bool dlss5_native = [] {
+        const char* d5 = std::getenv("BB_DLSS5");
+        return d5 != nullptr && std::atof(d5) > 0.0;
+    }();
+    if ((c.kind == SR::Kind::Off || c.kind == SR::Kind::Native) &&
+        (FgNativeWanted() || dlss5_native)) {
         c.kind = SR::Kind::Native; // analysis only, for frame generation (g_fg_native)
         g_fg_native = true;
     }
@@ -629,6 +637,8 @@ bool NativeFallback() {
 }
 // The window-size path may run this frame (to the window, or native AA's same-size fallback).
 bool WindowPathOk() {
+    // 0.93: never while the native chain scales the scene (its frames upscale only in place).
+    if (NativeChainLive()) return false;
     return PresentMode() || NativeFallback();
 }
 bool g_last_window_path = false; // the last upscaled frame went through the window-size path
@@ -1074,6 +1084,15 @@ bool NativeChainLive() {
 }
 bool NativePerPass() {
     return BB::ResPatch::NativeChain() && !NativeLegacy();
+}
+// 0.93: BB_NATIVE_CHECK_OFF=1: a failed native chain check / safety net turns scene scaling off
+// (0.84). Default: it only logs (and dumps one frame); the internal-resolution path stays.
+bool NativeCheckOff() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_NATIVE_CHECK_OFF");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
 }
 // 0.84: the frame the native chain check asks to be dumped (BB_DUMP_FRAME) before it turns
 // scene scaling off, and the frame from which it turns off.
@@ -3080,7 +3099,20 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                         return k;
                     }()));
             }
-            if (bad && g_off_at == 0) {
+            // 0.93: a failed check no longer turns the chain off by default (that sent every
+            // later frame to the window path); it dumps one frame for diagnosis and keeps the
+            // internal-resolution path. BB_NATIVE_CHECK_OFF=1: 0.84's behaviour (turn off).
+            const bool check_off = NativeCheckOff();
+            static bool dumped = false;
+            if (bad && !check_off && !dumped) {
+                dumped = true;
+                g_dump_request.store(g_frame_no + 1, std::memory_order_relaxed);
+                Checkpoint(fmt::format("native chain check below target: frame {} is dumped "
+                                       "(bb_dump); the native chain stays on (BB_NATIVE_CHECK_OFF=1 "
+                                       "turns it off instead)",
+                                       g_frame_no + 1));
+            }
+            if (bad && check_off && g_off_at == 0) {
                 // 0.84: the next frame is dumped with the chain still active (BB_DUMP_FRAME,
                 // into bb_dump), then scaling turns off two frames later.
                 g_dump_request.store(g_frame_no + 1, std::memory_order_relaxed);
@@ -3108,7 +3140,12 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             const bool first = g_ss_windows++ == 0;
             const bool bad = first ? g_ss_good < 150
                                    : g_ss_scene >= 150 && g_ss_good * 2 < g_ss_scene;
-            if (bad) {
+            if (bad && NativePerPass() && !NativeCheckOff()) {
+                Checkpoint(fmt::format("scene upscale check: {} of {} 3D frames upscaled (scene "
+                                       "size -> output) in {} frames, below target; the native "
+                                       "chain stays on (BB_NATIVE_CHECK_OFF=1 turns it off)",
+                                       g_ss_good, g_ss_scene, g_ss_frames));
+            } else if (bad) {
                 TurnOff();
                 Checkpoint(fmt::format(
                     "WARNING: scene upscale turned OFF for this session (safety net): in {} frames "
@@ -3255,6 +3292,30 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // 0.85 session path lock.
     const bool scene3d = f.gb_depth != 0 && f.scene_draws > 0;
     if (PathLockOn()) {
+        // 0.93: the native chain (internal-resolution scene, upscaler in place before
+        // post-processing) is the in-place path by construction: it locks in place as soon as the
+        // scene targets are scaled, and the window / present-time path is never chosen for it
+        // (0.85-0.91: the first 300 3D frames decided, < 95% in place locked=window, and with
+        // g_lock == 2 every source sample was skipped before the chain could end its scene
+        // passes, so the native chain check then saw almost no frame reach post-processing and
+        // turned the chain off: "path=window" for every ratio > 1).
+        static bool chain_locked = false;
+        if (NativeChainLive()) {
+            if (g_lock != 1) {
+                Checkpoint(fmt::format(
+                    "[path] locked=in-place for the session: native chain (scene {}x{} -> {}x{}, "
+                    "upscaler on the lit scene colour before post-processing and HUD){}",
+                    g_ss_sw, g_ss_sh, g_ss_w, g_ss_h,
+                    g_lock == 2 ? " (was window: overridden)" : ""));
+                g_lock = 1;
+                chain_locked = true;
+            }
+        } else if (chain_locked && g_ss_off.load(std::memory_order_relaxed)) {
+            chain_locked = false;
+            g_lock = 0; // the chain was turned off: decide again from the next 300 3D frames
+            g_lock_frames = g_lock_inplace = 0;
+            Checkpoint("[path] native chain off: the path is decided again");
+        }
         if (g_lock == 0 && scene3d) {
             ++g_lock_frames;
             if (f.injected) ++g_lock_inplace;
