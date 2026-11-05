@@ -416,6 +416,15 @@ struct FrameState {
     u32 qual_samples = 0;
     u32 last_write_after = 0;
     bool post_seen = false; // a draw into the presented image sampled a render-size image
+    // 0.97 shared injection point (DCport placement): the composite target (the output-size
+    // image the game's last post-processing pass draws into, flip or not), the HUD start found
+    // this frame (draw index, target) and how it was found.
+    VAddr post_target = 0;
+    u64 post_draw = 0;
+    VAddr hud_target = 0;
+    u64 hud_draw = 0;
+    const char* hud_how = "";
+    std::string trace; // the output-size draws after the scene (first frames, for the log)
     // draws
     u64 draws = 0;
     u32 scene_draws = 0;
@@ -455,6 +464,9 @@ struct Learned {
     bool rolled = false; // set between the roll and the end of OnFlip
     bool last_injected = false;
     bool last_fg_native = false; // 0.39: the previous frame had FG-only (native) inputs
+    // 0.97: the last HUD start found (draw index, target): a frame that misses the point uses it.
+    VAddr hud_target = 0;
+    u64 hud_draw = 0;
 };
 
 struct Stats {
@@ -634,6 +646,18 @@ bool NativeFallback() {
     return g_present_w != 0 && g_present_h != 0 && g_learned.render_w != 0 &&
            g_learned.render_w == g_output_w && g_learned.render_h == g_output_h &&
            g_present_w == g_output_w && g_present_h == g_output_h;
+}
+// 0.97: the shared injection point (after post-processing, before the HUD) is the default for
+// every frame the game renders at its output size: upscaler / DLAA, DLSS 5 and frame generation
+// inputs all run there. BB_INJECT=inplace: the in-place scene-colour point first (0.96). The
+// scene-upscale modes (internal-size scene: native chain, resolution patch) keep their own point.
+bool HudPointOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_INJECT");
+        return v == nullptr || std::string_view{v} != "inplace";
+    }();
+    return on && !NativeChainLive() && g_learned.render_w != 0 &&
+           g_learned.render_w == g_output_w && g_learned.render_h == g_output_h;
 }
 // The window-size path may run this frame (to the window, or native AA's same-size fallback).
 bool WindowPathOk() {
@@ -2371,7 +2395,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     if (PathLockOn() && g_lock == 2) {
         return Sample::Keep; // 0.85: the session is locked to the window path
     }
-    if (PresentMode()) {
+    if (PresentMode() || (HudPointOn() && WindowPathOk())) {
         return refuse(RfPresent); // upscaled before the HUD instead (WantPresentUpscale)
     }
     // 0.76: no native-fallback hold in the native chain: the in-place point is the only place
@@ -2523,36 +2547,72 @@ bool WantPresentUpscale(VAddr& flip) {
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
     const bool fgn = FgNative();
-    if (!g_draw.valid || g_draw.compute || !g_draw.targets_flip || f.injected ||
-        f.inject_failed || f.fg_native_done || !(fgn ? !g_present_dead : WindowPathOk())) {
+    if (!g_draw.valid || g_draw.compute) {
         return false;
     }
-    const bool native = !fgn && !PresentMode(); // (NativeFallback: the in-place point missed)
-    // 0.51: frame generation without an upscaler takes the same escape (a final pass into the
-    // presented image seen before this draw), so its inputs come before the HUD as with native AA.
-    if (g_draw.samples_render_size) {
-        f.post_seen = true; // the game's final post-processing pass into the presented image
-    }
-    // After the scene and its last read by the post-processing; the draw into the presented image
-    // that samples a render-size image is the game's final post-processing pass, not the HUD.
-    // (Native fallback: the source the in-place path learned may not be sampled at all this
-    // frame; a final pass into the presented image seen before this draw is enough.)
-    if (f.gb_depth == 0 || f.scene_draws == 0 ||
-        (f.qual_samples <= SkipNeeded() && !((native || (fgn && UpfixOn())) && f.post_seen)) ||
-        g_draw.samples_render_size || f.gb_w != g_output_w || f.gb_h != g_output_h) {
-        return false;
-    }
-    flip = 0;
-    for (u32 i = 0; i < g_draw.num_colors; ++i) {
-        const auto& t = g_draw.colors[i];
-        if (IsFlip(t.addr) && t.width == f.gb_w && t.height == f.gb_h) {
-            flip = t.addr;
+    // 0.97 shared injection point (the DCport placement: scene -> the game's post-processing ->
+    // upscaler / DLAA / DLSS 5 / frame generation inputs -> HUD). Generic, from the command stream:
+    // after the scene (G-buffer depth and scene draws), the post-processing passes are the
+    // output-size draws without depth that sample a render-size image; the last one's target is
+    // the composite target (the flip, or the game's UI image). The HUD starts at the first later
+    // draw into that target that samples no render-size image (2D, no depth). A frame where that
+    // draw is not seen uses the last known HUD start (its draw index and target).
+    VAddr cand = 0;
+    const bool after_scene = f.gb_depth != 0 && f.scene_draws > 0;
+    if (after_scene && !g_draw.has_depth) {
+        for (u32 i = 0; i < g_draw.num_colors; ++i) {
+            const auto& t = g_draw.colors[i];
+            if (t.addr == 0 || t.width != f.gb_w || t.height != f.gb_h) continue;
+            if (g_draw.samples_render_size) {
+                f.post_target = t.addr;
+                f.post_draw = f.draws;
+                f.post_seen = true;
+            } else if (cand == 0 && (t.addr == f.post_target || IsFlip(t.addr))) {
+                cand = t.addr;
+                f.hud_how = t.addr == f.post_target ? "first 2D draw into the composite target"
+                                                    : "first 2D draw into the presented image";
+            }
+            if (g_frame_no < 2400 && f.trace.size() < 1500) {
+                f.trace += fmt::format(" #{}:{:#x}{}{}", f.draws, t.addr,
+                                       g_draw.samples_render_size ? "/post" : "/2d",
+                                       IsFlip(t.addr) ? "/flip" : "");
+            }
             break;
         }
+        // The last known HUD start: this draw index (or later) into the same target.
+        if (cand == 0 && g_learned.hud_draw != 0 && f.draws >= g_learned.hud_draw &&
+            f.post_seen) {
+            for (u32 i = 0; i < g_draw.num_colors; ++i) {
+                if (g_draw.colors[i].addr == g_learned.hud_target &&
+                    g_draw.colors[i].width == f.gb_w && g_draw.colors[i].height == f.gb_h) {
+                    cand = g_learned.hud_target;
+                    f.hud_how = "last known HUD start (draw index and target)";
+                    break;
+                }
+            }
+        }
     }
-    if (flip == 0) {
+    if (cand == 0 || f.injected || f.inject_failed || f.fg_native_done ||
+        !(fgn ? !g_present_dead : (WindowPathOk() || HudPointOn()))) {
         return false;
     }
+    if (f.gb_w != g_output_w || f.gb_h != g_output_h || !f.post_seen) {
+        return false;
+    }
+    // The upscaler path composites the HUD at present as (presented image - this copy): only the
+    // presented image itself is a valid point for it. DLSS 5 and the frame generation inputs
+    // (written back in place) take the composite target too. BB_INJECT_COMPOSITE=1: both.
+    static const bool any_target = [] {
+        const char* v = std::getenv("BB_INJECT_COMPOSITE");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!fgn && !any_target && !IsFlip(cand)) {
+        f.hud_how = "composite target is not the presented image (upscaler waits for the flip)";
+        return false;
+    }
+    flip = cand;
+    f.hud_target = cand;
+    f.hud_draw = f.draws;
     FillPresentPlan(flip, "before the first HUD draw");
     return true;
 }
@@ -3379,6 +3439,64 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             g_miss_counts = {};
             g_miss_kept = 0;
             n_frames = 0;
+        }
+    }
+    // 0.97 [inject]: the HUD start found this frame is kept as the last known one; a 3D frame
+    // that reaches the flip without it is logged with the reason (it then goes to the present-
+    // time path below, the only fallback).
+    {
+        const bool scene3d_i = f.gb_depth != 0 && f.scene_draws > 0;
+        static u32 miss_logged = 0, miss_sec = 0, hit_sec = 0;
+        static auto miss_t = std::chrono::steady_clock::now();
+        if (f.hud_draw != 0) {
+            ++hit_sec;
+            if (f.hud_target != g_learned.hud_target ||
+                (f.hud_draw != g_learned.hud_draw && g_frame_no % 600 == 0)) {
+                Checkpoint(fmt::format("[inject] HUD point: draw {} into {:#x} ({}), composite "
+                                       "target {:#x} (last post-processing draw {}); upscaler / "
+                                       "DLAA, DLSS 5 and frame generation inputs run there",
+                                       f.hud_draw, f.hud_target, f.hud_how, f.post_target,
+                                       f.post_draw));
+            }
+            g_learned.hud_target = f.hud_target;
+            g_learned.hud_draw = f.hud_draw;
+        } else if (scene3d_i && (HudPointOn() || FgNative()) && !f.injected &&
+                   !f.fg_native_done) {
+            ++miss_sec;
+            const std::string why =
+                f.gb_w != g_output_w || f.gb_h != g_output_h
+                    ? fmt::format("scene {}x{} is not the output size {}x{}", f.gb_w, f.gb_h,
+                                  g_output_w, g_output_h)
+                : !f.post_seen ? std::string("no post-processing draw (output size, no depth, "
+                                             "sampling a render-size image) after the scene")
+                : f.inject_failed ? std::string("the dispatch at the HUD point failed")
+                : fmt::format("no 2D draw into the composite target {:#x} after its last "
+                              "post-processing draw {} (last known HUD start: draw {} into "
+                              "{:#x}, {} draws this frame)",
+                              f.post_target, f.post_draw, g_learned.hud_draw,
+                              g_learned.hud_target, f.draws);
+            if (miss_logged < 20) {
+                ++miss_logged;
+                Checkpoint(fmt::format("[inject] miss reason (frame {}): {}; present-time path",
+                                       g_frame_no, why));
+            }
+        }
+        if (g_frame_no < 2400 && scene3d_i && !f.trace.empty()) {
+            static u32 traced = 0;
+            if (traced < 6 && (g_frame_no % 97) == 0) {
+                ++traced;
+                Checkpoint(fmt::format("[inject] output-size draws after the scene, frame {}:{}",
+                                       g_frame_no, f.trace));
+            }
+        }
+        const auto now_i = std::chrono::steady_clock::now();
+        if (now_i - miss_t >= std::chrono::seconds(1)) {
+            miss_t = now_i;
+            if (hit_sec + miss_sec > 0 && (miss_sec > 0 || g_frame_no % 600 < 120)) {
+                Checkpoint(fmt::format("[inject] last second: HUD point {} frames, missed {}",
+                                       hit_sec, miss_sec));
+            }
+            hit_sec = miss_sec = 0;
         }
     }
     if (WindowPathOk() && !keep_inplace && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
