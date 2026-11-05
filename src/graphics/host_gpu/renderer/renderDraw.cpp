@@ -36,6 +36,7 @@
 #include "libs/errno.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "live-switch.h"
 #include "device-fault.h"
 #include "frame-capture.h"
 #include "frame-gen.h"

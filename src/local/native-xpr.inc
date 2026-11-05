@@ -86,6 +86,22 @@ extern "C" {
 // Table lookups that ask the last answer first (bits): 1 the pair cache's 4096 entries (else 256), 2 the pair's variant
 // found last, 4 the pair's image set before the last (TableTry, TableSet).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_mru {7};
+// KYTY_TABLE_MEMO (live table_memo, on by default): a table draw takes the variant, the draw
+// state and the image set its pair and state key drew with last (TableXpr::memo), not the variant find, the states find
+// and the set lookup; the set's validation still runs. (Live: an entry holds only while memo_epoch does, which moves on
+// or off.)
+static bool TableMemoOn() {
+	static auto& on = LiveSwitch::Find("table_memo", 1);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_TABLE_MEMO_VERIFY (live table_memo_verify N, default 0): every Nth memo hit (TableTry), the variant and the draw
+// state the full path finds, and the image set the words' lookup finds (TableSet), looked up beside the memo's, read
+// only; a difference counted (table_memo_mismatch, a TABLE_MEMO_MISMATCH line each, the first 8) and the full path's
+// answer taken, the memo's entry dropped.
+static int64_t TableMemoVerifyEvery() {
+	static auto& every = LiveSwitch::Find("table_memo_verify", 0);
+	return every.load(std::memory_order_relaxed);
+}
 // 1: NativeXprStateKey hashes the context and the user configuration again only after a change of their registers;
 // 0: at every call; 2: as 1, each key checked against the full hash (STATE-KEY MISMATCH lines, counter
 // shortcut_mismatches).
@@ -1008,6 +1024,7 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
 // A descriptor set leaves service; it may be in flight until the current tick.
 void RenderExecutor::NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set) {
 	if (!set) return;
+	TableMemoRetired(); // (a memo entry may hold it)
 	NativeXprState().retired.push_back({pool, set, m_context.GetCommandScheduler().CurrentTick()});
 }
 

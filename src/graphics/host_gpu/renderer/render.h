@@ -401,6 +401,7 @@ private:
 	// Table draws (src/local/table-xpr.inc).
 	struct TableXpr;
 	struct TablePair;
+	void TableMemoRetired(); // KYTY_TABLE_MEMO: a set left service (memo_epoch moves; table-xpr.inc)
 	struct TableFlatStage;
 	struct TableVariant;
 	void TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat);

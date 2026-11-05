@@ -249,6 +249,27 @@ struct RenderExecutor::TableXpr {
 	size_t                    last_variant = 0;
 	const NativeXprDrawState* last_state   = nullptr;
 	const TableImageSet*      last_set     = nullptr; // the set the last emission bound
+	// KYTY_TABLE_MEMO: by pair and state key (direct-mapped), what a table draw of them drew with last: the variant's
+	// index, the draw state and the image set. Entries hold while memo_epoch does not move: every set retirement
+	// (NativeXprRetireSet), state sweep (TableForgetStates), pair sweep and reset moves it.
+	struct Memo {
+		const Pair*               pair    = nullptr;
+		uint64_t                  key     = 0;
+		uint64_t                  epoch   = 0;
+		const NativeXprDrawState* state   = nullptr;
+		TableImageSet*            set     = nullptr;
+		uint32_t                  variant = 0;
+	};
+	static constexpr size_t     MemoEntries = 4096;
+	std::array<Memo, MemoEntries> memo {};
+	uint64_t                    memo_epoch  = 1;
+	TableImageSet*              memo_set    = nullptr; // TableSet's first try for the draw being made
+	// KYTY_TABLE_MEMO_VERIFY: memo hits counted (every Nth checked), and whether TableSet checks the memo's set.
+	uint64_t                    memo_verify_count = 0;
+	bool                        memo_verify       = false;
+	[[nodiscard]] Memo& MemoAt(const Pair* pair, uint64_t key) {
+		return memo[((reinterpret_cast<uintptr_t>(pair) * 0x9e3779b97f4a7c15ull) ^ (key * 0xc2b2ae3d27d4eb4full)) >> 52u];
+	}
 	uint64_t                  images_epoch = 0;       // TextureCache::ImagesEpoch after it
 	// The game buffer the last arguments came from, and the indices' by their address (each mesh has its own): used
 	// again while no registration changed and the guest wrote none of its region (ObtainBuffer then returns the same
@@ -320,6 +341,22 @@ struct RenderExecutor::TableXpr {
 	std::array<std::vector<ShaderRecompiler::IR::DescriptorValue>, 2> indirect;
 	ShaderRecompiler::IR::AddressProbeCandidates                      probe;
 };
+// KYTY_TABLE_MEMO: a descriptor set left service (NativeXprRetireSet): a memo entry may hold it.
+void RenderExecutor::TableMemoRetired() {
+	if (m_table_xpr) ++m_table_xpr->memo_epoch;
+}
+// KYTY_TABLE_MEMO_VERIFY: a memo hit checked; `differ`: 1 the variant, 2 the draw state, 4 the image set the full path
+// found were not the memo's.
+static void TableMemoChecked(uint32_t differ, uint64_t vs, uint64_t ps, uint64_t key) {
+	if (differ == 0) return;
+	LiveCounters::Add(LiveCounters::TableMemoMismatch);
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+		std::printf("TABLE_MEMO_MISMATCH vs=0x%llx ps=0x%llx key=0x%llx variant=%d state=%d set=%d\n",
+		            static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps),
+		            static_cast<unsigned long long>(key), (differ & 1u) != 0 ? 1 : 0, (differ & 2u) != 0 ? 1 : 0,
+		            (differ & 4u) != 0 ? 1 : 0);
+}
 
 // A draw pair's key as TableTry hashes it (the scout's view directory too).
 template <typename Pair>
@@ -333,6 +370,7 @@ static uint64_t TableScoutHash(const Pair& pair) {
 void RenderExecutor::TableReset(TablePair& pair) {
 	if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
 	auto& table = *m_table_xpr;
+	++table.memo_epoch;
 	for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
 	if (table.store == &pair) table.store = nullptr;
 	if (table.last_pair == &pair) table.last_pair = nullptr;
@@ -346,6 +384,7 @@ void RenderExecutor::TableReset(TablePair& pair) {
 void RenderExecutor::TableForgetStates() {
 	auto* table = m_table_xpr.get();
 	if (table == nullptr) return;
+	++table->memo_epoch;
 	table->last_pair  = nullptr;
 	table->last_state = nullptr;
 	table->last_set   = nullptr;
@@ -381,6 +420,7 @@ void RenderExecutor::TableSweepPairs() {
 		});
 	const size_t after = table->pairs.size() + table->dispatches.size();
 	if (after == before) return;
+	++table->memo_epoch;
 	table->pair_cache         = {};
 	table->found_key          = {};
 	table->found_pair         = nullptr;
@@ -536,6 +576,62 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		table.store_state = cache.state_key;
 		return TableResult::Store;
 	};
+	// KYTY_TABLE_MEMO: what this pair and state key drew with last (the main executor's), its variant still that key's.
+	const bool memo = TableMemoOn();
+	if (memo) {
+		auto& entry = table.MemoAt(&pair, cache.state_key);
+		if (entry.pair == &pair && entry.key == cache.state_key && entry.epoch == table.memo_epoch &&
+		    entry.variant < pair.variants.size() && pair.programs[0] != nullptr) {
+			auto& memo_variant = pair.variants[entry.variant];
+			// KYTY_TABLE_MEMO_VERIFY: every Nth hit, what the full path below finds (the variant by its hint or the
+			// find, the draw state by the cache or the states' find; read only) against the entry's. A difference
+			// drops the entry and the draw takes the full path.
+			bool verify = false, differs = false;
+			if (const auto every = TableMemoVerifyEvery();
+			    every > 0 && memo_variant.state == cache.state_key && memo_variant.pipeline != nullptr &&
+			    !memo_variant.refused && ++table.memo_verify_count % static_cast<uint64_t>(every) == 0) {
+				verify           = true;
+				const bool hinted = (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
+				                    pair.variant_hint < pair.variants.size() &&
+				                    pair.variants[pair.variant_hint].state == cache.state_key;
+				const auto full_variant =
+				    hinted ? pair.variant_hint
+				           : static_cast<uint32_t>(std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state) -
+				                                   pair.variants.begin());
+				const NativeXprDrawState* full_state = nullptr;
+				if (cache.last_state != nullptr && cache.last_state_key == cache.state_key) {
+					full_state = cache.last_state;
+				} else {
+					const auto& states   = NativeXprState().states;
+					const auto  state_it = states.find(cache.state_key);
+					if (state_it != states.end()) full_state = state_it->second.get();
+				}
+				LiveCounters::Add(LiveCounters::TableMemoVerified);
+				const uint32_t differ = (full_variant != entry.variant ? 1u : 0u) | (full_state != entry.state ? 2u : 0u);
+				TableMemoChecked(differ, pair.vs, pair.ps, cache.state_key);
+				if (differ != 0) {
+					differs     = true;
+					entry.epoch = 0;
+				}
+			}
+			if (!differs && memo_variant.state == cache.state_key && memo_variant.pipeline != nullptr &&
+			    !memo_variant.refused) {
+				const auto& memo_state = *entry.state;
+				pair.variant_hint      = entry.variant;
+				TablePrefetchArrays(pair, pair.last_set);
+				if (!NativeXprTargetsCurrent(memo_state))
+					return LiveCounters::Add(LiveCounters::TableStoreTargets), request_store();
+				LiveCounters::Add(LiveCounters::TableMemoHits);
+				table.memo_set     = entry.set;
+				table.memo_verify  = verify;
+				const auto result  = TableDraw(buffer, pair, memo_variant, memo_state, commands, index_base, index_bytes,
+				                               index_type, direct);
+				table.memo_set     = nullptr;
+				table.memo_verify  = false;
+				return result;
+			}
+		}
+	}
 	// (The variant found last first: a pair's variants are a cold line each, its draws mostly keep their state.)
 	const bool hint    = (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
 	                  pair.variant_hint < pair.variants.size() && pair.variants[pair.variant_hint].state == cache.state_key;
@@ -556,7 +652,12 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	const auto& draw_state = *cache.last_state;
 	TablePrefetchArrays(pair, pair.last_set);
 	if (!NativeXprTargetsCurrent(draw_state)) return LiveCounters::Add(LiveCounters::TableStoreTargets), request_store();
-	return TableDraw(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
+	const auto result = TableDraw(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
+	if (memo && result == TableResult::Drawn)
+		table.MemoAt(&pair, cache.state_key) = {&pair, cache.state_key, table.memo_epoch, &draw_state,
+		                                        const_cast<TableImageSet*>(table.last_set),
+		                                        static_cast<uint32_t>(variant - pair.variants.begin())};
+	return result;
 }
 
 bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
@@ -1149,8 +1250,24 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	if (set == nullptr || set->words != words) {
 		auto* const last     = set;
 		auto* const previous = pair.previous_set;
+		auto* const memo     = std::exchange(table.memo_set, nullptr); // (KYTY_TABLE_MEMO: the set the pair and key drew with)
+		const bool  verify   = std::exchange(table.memo_verify, false);
+		if (memo != nullptr && memo != last && !memo->refused && memo->words == words) {
+			set = memo;
+			// (KYTY_TABLE_MEMO_VERIFY: the set the words' lookup finds, read only; another one is taken as the full
+			// path would take it.)
+			if (verify) {
+				const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
+				auto* const full = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
+				if (full != memo) {
+					TableMemoChecked(4u, pair.vs, pair.ps, 0);
+					set = full;
+					if (set == nullptr || (set->refused && frame >= set->validated_frame + TableImageSet::RetryFrames))
+						set = TableResolveSet(buffer, pair, variant, draw_state, words);
+				}
+			}
 		// (The set before the last next, without the words' hash or the map's cold bucket and node.)
-		if ((kyty_local_table_mru.load(std::memory_order_relaxed) & 4u) != 0 && previous != nullptr && previous != last &&
+		} else if ((kyty_local_table_mru.load(std::memory_order_relaxed) & 4u) != 0 && previous != nullptr && previous != last &&
 		    !previous->refused && previous->words == words) {
 			set = previous;
 		} else {
