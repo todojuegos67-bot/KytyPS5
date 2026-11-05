@@ -787,6 +787,9 @@ private:
 		for (uint32_t s = 0; s < 4; ++s) {
 			const auto& source = *Source(inst, s);
 			if (source.dpp && !LaneLocalDpp(source.dpp_ctrl)) return "cross-row DPP";
+			// (The write condition takes the row from the half's lane: rows 2-3 of the wave read as 0-1 in the second.)
+			if (source.dpp && (source.dpp_row_mask & 3u) != ((source.dpp_row_mask >> 2u) & 3u))
+				return "a DPP row mask that treats the halves apart";
 			if (source.kind == OperandKind::VccZ || source.kind == OperandKind::ExecZ) return "VCCZ/EXECZ as data";
 			if (source.kind == OperandKind::Scc && state.scc_mask) return "SCC made from a lane mask";
 		}
