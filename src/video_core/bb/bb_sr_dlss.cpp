@@ -9,12 +9,14 @@
 // phase 2 (frame generation) needs them.
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "video_core/bb/bb_display.h"
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
@@ -69,6 +71,13 @@ uint32_t g_refusals = 0;
 HMODULE g_module = nullptr;
 std::atomic<uint32_t> g_frame_counter{0};
 std::atomic<uint32_t> g_last_frame{0};
+// bb-fg-074: tags whose format Streamline's own format table (sl.chi vulkan.cpp getFormat) lacks.
+// Streamline looks each tagged resource up in it (getResourceDescription: four isFormatSupported
+// calls) and logs "Cannot have undefined format" for one it does not know, which the reactive
+// mask's R8_UNORM is: 4 lines per evaluate, 12000 a game. The tag itself is right (NGX gets the
+// resource's real format), so those lines are counted, not logged, while such a tag is set.
+std::atomic<uint32_t> g_tags_outside_table{0};
+std::atomic<uint32_t> g_format_lookups_counted{0};
 
 // The Demon's Souls fork's LocalPlatform::IsNvidiaSigned: a valid Authenticode signature whose
 // signer is "NVIDIA Corporation" (Streamline then checks its plugins' signatures itself).
@@ -113,6 +122,18 @@ void LogMessage(sl::LogType type, const char* message) {
         ++g_refusals;
     }
     static const bool verbose = std::getenv("BB_DLSS_VERBOSE") != nullptr;
+    if (type == sl::LogType::eError && !verbose && g_tags_outside_table.load() > 0 &&
+        std::strstr(message, "isFormatSupported") != nullptr &&
+        std::strstr(message, "undefined format") != nullptr) {
+        const uint32_t n = ++g_format_lookups_counted;
+        if (n == 1 || n % 7200 == 0) {
+            BBLogf("[streamline] %u format-table lookups so far came back empty for a resource "
+                   "tagged in a format Streamline's table lacks (see the tagged resources line); "
+                   "counted here, not logged each (BB_DLSS_VERBOSE=1 logs them)",
+                   n);
+        }
+        return;
+    }
     if (type == sl::LogType::eError || verbose) {
         BBLogf("Streamline %s: %s", type == sl::LogType::eError ? "error" : "log", message);
     }
@@ -605,6 +626,36 @@ bool Evaluate(const Desc& desc) {
                    tags[i].resource->nativeFormat, tags[i].resource->width,
                    tags[i].resource->height, tags[i].resource->native != nullptr ? "yes" : "NULL",
                    tags[i].resource->view != nullptr ? "yes" : "NULL");
+        }
+    }
+    {
+        uint32_t outside = 0;
+        for (uint32_t i = 0; i < tag_count; ++i) {
+            bool known = false;
+            BB::FG::Display::FormatLabel(tags[i].resource->nativeFormat, &known);
+            if (!known) ++outside;
+        }
+        g_tags_outside_table.store(outside);
+        static bool listed = false;
+        if (!listed) {
+            listed = true;
+            std::string line;
+            for (uint32_t i = 0; i < tag_count; ++i) {
+                bool known = false;
+                const uint32_t format = tags[i].resource->nativeFormat;
+                const char* name = BB::FG::Display::FormatLabel(format, &known);
+                char item[220];
+                std::snprintf(item, sizeof(item), "%s%s %s (%u) %ux%u%s", i ? " | " : "",
+                              tag_names[i], name, format, tags[i].resource->width,
+                              tags[i].resource->height,
+                              known ? ""
+                                    : " [not in Streamline's format table: its lookups are "
+                                      "counted, not logged]");
+                line += item;
+            }
+            BBLogf("[streamline] tagged resources: DLSS super resolution | %s | UI: not a DLSS "
+                   "input (the HUD is added after the upscale)",
+                   line.c_str());
         }
     }
     for (uint32_t i = 0; i < tag_count; ++i) {

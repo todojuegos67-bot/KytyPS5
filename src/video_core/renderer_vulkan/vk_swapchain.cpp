@@ -142,7 +142,14 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
+    // bb-fg-074: the present's id, for VK_KHR_present_wait (bb_display.h).
+    u64 present_id_value = BB::FG::NextPresentId();
+    VkPresentIdKHR present_id{};
+    present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+    present_id.swapchainCount = 1;
+    present_id.pPresentIds = &present_id_value;
     const vk::PresentInfoKHR present_info = {
+        .pNext = present_id_value != 0 ? &present_id : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -234,6 +241,7 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+    present_mode = BB::FG::PreferredPresentMode(present_mode, modes);
 }
 
 void Swapchain::SetSurfaceProperties() {
