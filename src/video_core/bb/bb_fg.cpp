@@ -1401,7 +1401,7 @@ bool DlssgReset(const Inputs* in, double delta) {
     }();
     static const double cut = [] {
         const char* e = std::getenv("BB_DLSSG_CUT_NDC");
-        return e != nullptr && *e != '\0' ? std::atof(e) : 1.0;
+        return e != nullptr && *e != '\0' ? std::atof(e) : 3.0; // bb-dlssgpace-089: as BB_SR_CUT_NDC
     }();
     const bool first = !g_prev_inputs_ok;
     g_prev_inputs_ok = in != nullptr && in->camera_valid;

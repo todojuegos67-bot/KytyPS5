@@ -999,7 +999,7 @@ void SrReset(Plan& p) {
     }
     static const double cut = [] {
         const char* e = std::getenv("BB_SR_CUT_NDC");
-        return e != nullptr && *e != '\0' ? std::atof(e) : 1.0;
+        return e != nullptr && *e != '\0' ? std::atof(e) : 3.0; // bb-dlssgpace-089: 1.0 cut on turns (1.03-1.04 NDC)
     }();
     static bool first = true;
     double delta = 0.0;
@@ -3267,7 +3267,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             if (g_sec_frames > 0) {
                 Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
                                        "resets {} (camera delta max {:.3f} NDC; a reset only "
-                                       "above BB_SR_CUT_NDC, default 1.0)",
+                                       "above BB_SR_CUT_NDC, default 3.0)",
                                        g_lock == 1 ? "in-place" : g_lock == 2 ? "window"
                                                                               : "undecided",
                                        g_sec_locked, g_sec_frames, g_sec_resets, g_sec_cam_max));
