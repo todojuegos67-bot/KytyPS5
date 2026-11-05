@@ -1902,19 +1902,43 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                     std::min(g_dyn_max, std::max(DynBaseCap(g_dyn_real_fps, cap_state) - 1, 1));
                 int next = std::clamp(g_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1, false) - 1,
                                       1, std::max(maxgen, 1));
-                // bb-dlssgpace-089 (BB_DLSSG_DYN_LOWEST=0: off): the lowest multiplier whose
-                // shown rate reaches 90% of the target at the game's own (free) real rate. The
-                // 20:48 run picked x4 at a free 90-109 fps: the pacer then held the real frames at
-                // 224 / 4 = 56 fps (17.86 ms), where x2 at 112 reaches the cap with twice the real
-                // frames. Higher multipliers only when the game cannot make the cap with fewer.
+                // bb-dyn-096: highest useful multiplier under the cap. 0.89 clamped to the
+                // lowest multiplier reaching 90% of the cap at the smoothed "free" rate, which
+                // the pacer's sleep accounting inflated (log095: real 46 fps read as 70 free,
+                // so x3 at 138 shown instead of x4 at 184). Now: the measured real rate picks the
+                // largest N in 2..max with real * N <= cap (2% margin); x2 when even x2 is over
+                // the cap (the cap then holds real at cap / 2). When the current multiplier is
+                // already held at the cap, keep it. A change needs 2 windows (~2 s) in a row.
+                // BB_DLSSG_DYN_LOWEST=1 restores the 0.89 rule.
                 {
                     static const bool lowest = [] {
                         const char* v = std::getenv("BB_DLSSG_DYN_LOWEST");
-                        return v == nullptr || *v != '0';
+                        return v != nullptr && *v == '1';
                     }();
+                    const int hi = std::max(maxgen, 1);
                     if (lowest && g_dyn_real_fps > 1.0) {
                         const int need = static_cast<int>(std::ceil(0.9 * T / g_dyn_real_fps)) - 1;
-                        next = std::min(next, std::clamp(need, 1, std::max(maxgen, 1)));
+                        next = std::min(next, std::clamp(need, 1, hi));
+                    } else if (real > 1.0 && T > 1.0) {
+                        const int cur_m = g_dyn_gen + 1;
+                        int want = cur_m;
+                        if (real * cur_m < 0.95 * T || real * cur_m > 1.02 * T) {
+                            want = 2;
+                            for (int m = hi + 1; m >= 2; --m) {
+                                if (real * m <= 1.02 * T) { want = m; break; }
+                            }
+                        }
+                        want = std::clamp(want - 1, 1, hi);
+                        static int pend = -1, pend_n = 0;
+                        if (want == g_dyn_gen) {
+                            pend = -1; pend_n = 0;
+                            next = g_dyn_gen;
+                        } else {
+                            pend_n = want == pend ? pend_n + 1 : 1;
+                            pend = want;
+                            next = pend_n >= 2 ? want : g_dyn_gen;
+                            if (next == want) { pend = -1; pend_n = 0; }
+                        }
                     }
                 }
                 if (next != g_dyn_gen) {
