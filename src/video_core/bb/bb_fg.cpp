@@ -1181,6 +1181,12 @@ uint32_t g_stat_real = 0, g_stat_on = 0, g_stat_hudless = 0;
 // bb-dlssg-077: what DLSS-G was given, a second at a time ([dlssg] inputs last second).
 uint32_t g_stat_untagged = 0, g_stat_nohudless = 0, g_stat_hudless_size = 0, g_stat_reset = 0,
          g_stat_nocamera = 0, g_stat_inputs = 0;
+// bb-dlssg-085: reset handling. The upscaler's reset flag also flips whenever its in-place / present
+// path alternates (that is not a camera cut) and cleared DLSS-G's history on every turn (blur).
+uint32_t g_stat_reset_given = 0;       // resets DLSS-G was really given (cuts, first frame)
+double g_stat_cam_sum = 0, g_stat_cam_max = 0; // mean displacement of the camera (NDC) this second
+uint32_t g_stat_cam_n = 0;
+bool g_prev_inputs_ok = false;
 uint32_t g_last_status = 0;
 // bb-merge-082: the last HUD-less image given and the game image it was matched with (for the log).
 uint32_t g_last_hl_w = 0, g_last_hl_h = 0, g_last_hl_fmt = 0, g_last_gi_w = 0, g_last_gi_h = 0,
@@ -1263,6 +1269,43 @@ bool Inverted(const float* m, float* out) {
     return true;
 }
 
+// How far the camera moved since the previous frame: the mean displacement (NDC, the screen is 2
+// wide) of four clip points through clip_to_prev_clip. A turn is 0.01-0.3; a cut is above 1.
+double CameraDelta(const Inputs* in) {
+    if (in == nullptr || !in->camera_valid) return 0.0;
+    const float* m = in->clip_to_prev_clip;
+    double sum = 0;
+    const double pts[4][2] = {{-0.5, -0.5}, {0.5, -0.5}, {-0.5, 0.5}, {0.5, 0.5}};
+    for (const auto& pt : pts) {
+        const double v[4] = {pt[0], pt[1], 0.5, 1.0};
+        double o[4]{};
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) o[i] += m[i * 4 + j] * v[j];
+        if (std::fabs(o[3]) < 1e-9) return 1e9;
+        const double dx = o[0] / o[3] - pt[0], dy = o[1] / o[3] - pt[1];
+        sum += std::sqrt(dx * dx + dy * dy);
+    }
+    return sum / 4.0;
+}
+
+// DLSS-G's reset: only the first frame after it was off / without inputs, and a real camera cut.
+// The upscaler's own reset (path changes) is not forwarded unless BB_DLSSG_RESET=inputs.
+bool DlssgReset(const Inputs* in, double delta) {
+    static const bool legacy = [] {
+        const char* e = std::getenv("BB_DLSSG_RESET");
+        return e != nullptr && std::string_view(e) == "inputs";
+    }();
+    static const double cut = [] {
+        const char* e = std::getenv("BB_DLSSG_CUT_NDC");
+        return e != nullptr && *e != '\0' ? std::atof(e) : 1.0;
+    }();
+    const bool first = !g_prev_inputs_ok;
+    g_prev_inputs_ok = in != nullptr && in->camera_valid;
+    if (in == nullptr) return true;
+    if (legacy) return in->reset;
+    return first || delta > cut;
+}
+
 // The same constants the super resolution path gives Streamline (bb_sr_dlss.cpp): our matrices
 // are row major for column vectors, Streamline's row-vector, so each is given transposed.
 sl::Constants MakeConstants(const Inputs* in) {
@@ -1302,7 +1345,15 @@ sl::Constants MakeConstants(const Inputs* in) {
     c.depthInverted = in == nullptr || in->depth_inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.cameraMotionIncluded = sl::Boolean::eTrue;
     c.motionVectors3D = sl::Boolean::eFalse;
-    c.reset = in == nullptr || in->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    const double cam_delta = CameraDelta(in);
+    const bool do_reset = DlssgReset(in, cam_delta);
+    if (in != nullptr) {
+        g_stat_cam_sum += cam_delta;
+        g_stat_cam_max = std::max(g_stat_cam_max, cam_delta);
+        ++g_stat_cam_n;
+        if (do_reset) ++g_stat_reset_given;
+    }
+    c.reset = do_reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.orthographicProjection = sl::Boolean::eFalse;
     c.motionVectorsDilated = sl::Boolean::eFalse;
     c.motionVectorsJittered = sl::Boolean::eFalse;
@@ -1755,13 +1806,15 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                    g_stat_present_ms / n, g_stat_present_max, g_stat_hudless, g_last_status);
             Printf("[dlssg] inputs last second: %u frames with inputs (no tags on %u without), HUD-less "
                    "tagged %u, without a HUD-less image %u, HUD-less size != game image %u, "
-                   "camera invalid %u, reset %u | last HUD-less %ux%u fmt %u%s, game image %ux%u fmt %u",
+                   "camera invalid %u, upscaler reset %u (given to DLSS-G %u, camera delta mean %.4f max %.3f NDC) | last HUD-less %ux%u fmt %u%s, game image %ux%u fmt %u",
                    g_stat_inputs, g_stat_untagged, g_stat_hudless, g_stat_nohudless,
-                   g_stat_hudless_size, g_stat_nocamera, g_stat_reset, g_last_hl_w, g_last_hl_h,
+                   g_stat_hudless_size, g_stat_nocamera, g_stat_reset, g_stat_reset_given,
+                   g_stat_cam_n ? g_stat_cam_sum / g_stat_cam_n : 0.0, g_stat_cam_max, g_last_hl_w, g_last_hl_h,
                    g_last_hl_fmt, g_last_hl_scaled ? " (scaled to the game image)" : "", g_last_gi_w,
                    g_last_gi_h, g_last_gi_fmt);
             g_stat_untagged = g_stat_nohudless = g_stat_hudless_size = g_stat_reset =
-                g_stat_nocamera = g_stat_inputs = 0;
+                g_stat_nocamera = g_stat_inputs = g_stat_reset_given = g_stat_cam_n = 0;
+            g_stat_cam_sum = g_stat_cam_max = 0;
             g_stat_hudless = 0;
             g_stat_start = now;
             g_stat_real = 0;
