@@ -987,6 +987,45 @@ bool PathLockOn() {
     }();
     return on;
 }
+double g_sec_cam_max = 0.0;
+// 0.85: with the path lock the upscaler's history is reset only on its first frame and on a real
+// camera cut, by the same test as DLSS-G (bb-dlssg-085): the mean displacement (NDC, the screen
+// 2 wide) of four clip points through clip_to_prev_clip above 1.0 (BB_SR_CUT_NDC). The path-state
+// resets (last frame not in place, window path before) are not used. BB_PATH_LOCK=0: as before.
+void SrReset(Plan& p) {
+    if (!PathLockOn()) {
+        if (p.reset) ++g_sec_resets;
+        return;
+    }
+    static const double cut = [] {
+        const char* e = std::getenv("BB_SR_CUT_NDC");
+        return e != nullptr && *e != '\0' ? std::atof(e) : 1.0;
+    }();
+    static bool first = true;
+    double delta = 0.0;
+    if (p.camera_valid) {
+        const float* m = p.clip_to_prev_clip;
+        const double pts[4][2] = {{-0.5, -0.5}, {0.5, -0.5}, {-0.5, 0.5}, {0.5, 0.5}};
+        double sum = 0.0;
+        for (const auto& pt : pts) {
+            const double v[4] = {pt[0], pt[1], 0.5, 1.0};
+            double o[4]{};
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) o[i] += m[i * 4 + j] * v[j];
+            if (std::fabs(o[3]) < 1e-9) {
+                sum = 1e9;
+                break;
+            }
+            const double dx = o[0] / o[3] - pt[0], dy = o[1] / o[3] - pt[1];
+            sum += std::sqrt(dx * dx + dy * dy);
+        }
+        delta = sum >= 1e9 ? 1e9 : sum / 4.0;
+    }
+    g_sec_cam_max = std::max(g_sec_cam_max, std::min(delta, 99.0));
+    p.reset = first || delta > cut;
+    first = false;
+    if (p.reset) ++g_sec_resets;
+}
 VAddr g_good_src = 0;
 u32 g_good_index = 0;
 u64 g_good_frame = 0, g_good_src_seen = 0;
@@ -2349,11 +2388,11 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     if (NativeFallbackOn() && g_last_window_path && !(PathLockOn() && g_lock == 1)) {
         p.reset = true; // (the history was the window-size path's post-processed image)
     }
-    if (p.reset) ++g_sec_resets;
     p.delta_ms = g_delta_ms;
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
     FillCamera(p);
+    SrReset(p);
     if (const char* inv = std::getenv("BB_DEPTH_INVERT"); inv != nullptr && *inv != '\0') {
         p.depth_inverted = inv[0] == '1';
     }
@@ -2530,11 +2569,11 @@ void FillPresentPlan(VAddr flip, const char* where) {
         p.output_h = p.render_h;
         p.reset = !g_learned.last_fg_native;
     }
-    if (p.reset) ++g_sec_resets;
     p.delta_ms = g_delta_ms;
     p.viewport = f.viewport;
     p.depth_inverted = f.depth_greater;
     FillCamera(p);
+    SrReset(p);
     if (const char* inv = std::getenv("BB_DEPTH_INVERT"); inv != nullptr && *inv != '\0') {
         p.depth_inverted = inv[0] == '1';
     }
@@ -3227,12 +3266,14 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             last = now_t;
             if (g_sec_frames > 0) {
                 Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
-                                       "resets {}",
+                                       "resets {} (camera delta max {:.3f} NDC; a reset only "
+                                       "above BB_SR_CUT_NDC, default 1.0)",
                                        g_lock == 1 ? "in-place" : g_lock == 2 ? "window"
                                                                               : "undecided",
-                                       g_sec_locked, g_sec_frames, g_sec_resets));
+                                       g_sec_locked, g_sec_frames, g_sec_resets, g_sec_cam_max));
             }
             g_sec_frames = g_sec_locked = g_sec_resets = 0;
+            g_sec_cam_max = 0.0;
         }
     }
     {
