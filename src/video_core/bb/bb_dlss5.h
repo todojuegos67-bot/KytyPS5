@@ -34,7 +34,8 @@ void AddDeviceExtensions(vk::PhysicalDevice physical, const std::vector<std::str
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device,
               VmaAllocator allocator);
 // After the upscaler wrote desc.output (RGBA16F, GENERAL): NR in place. False: the frame unchanged.
-bool Apply(const SR::Desc& desc);
+// applied_jitter: the sub-pixel offset the scene passes were rasterised with (render px), to realign the game's depth / motion.
+bool Apply(const SR::Desc& desc, const float (&applied_jitter)[2]);
 std::string StatusLine();
 
 } // namespace BB::Dlss5

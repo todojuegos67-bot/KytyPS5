@@ -53,6 +53,7 @@ layout(push_constant) uniform Push {
 	vec2  mv_scale; // the game's motion scale (to render px towards the previous frame)
 	float strength; // 0..2: how much of the model's edit (above 1: the edit amplified, the launcher's "alta")
 	float debug;    // 1: the density map (white 1, dark the edge)
+	vec2  jitter;   // (bb-dlss5-087) the sub-pixel offset the scene was rasterised with, render px (+x right, +y down)
 } push;
 
 // ---- the warp (FoveatedDLSS5 foveation.hlsli, in pixels) ----
@@ -154,7 +155,11 @@ void EncodeMain(ivec2 j) {
 	// The guides: nearest (never blend depth across a silhouette), the motion through the warp.
 	vec2  n_now = x / full;
 	vec2  rsize = vec2(push.render);
-	ivec2 rt    = clamp(ivec2(floor(n_now * rsize)), ivec2(0), push.render - 1);
+	// (bb-dlss5-087) The game's depth and motion were rasterised with the TAA jitter (the picture shifted by +jitter render
+	// pixels: texel c holds the surface at c + 0.5 - jitter, bb_mv.comp), the upscaler's output is on the unjittered grid:
+	// the guide for the unjittered position q is the texel floor(q + jitter). Without it the guides wobble by up to half a
+	// render pixel against the colour from one jitter phase to the next.
+	ivec2 rt    = clamp(ivec2(floor(n_now * rsize + push.jitter)), ivec2(0), push.render - 1);
 	float depth = texelFetch(depth_tex, rt, 0).r;
 	vec2  mv    = texelFetch(motion_tex, rt, 0).rg * push.mv_scale; // render px to the previous position
 	vec2  x_prev = (n_now + mv / rsize) * full;
@@ -184,7 +189,7 @@ void ResolveMain(ivec2 p) {
 	} else {
 		// Depth-aware bilinear (the edge-aware stretch): the 4 nearest working texels, bilinear x depth similarity to
 		// this pixel's own depth (render res, nearest); none similar: plain bilinear.
-		ivec2 rt   = clamp(ivec2(floor(x / full * vec2(push.render))), ivec2(0), push.render - 1);
+		ivec2 rt   = clamp(ivec2(floor(x / full * vec2(push.render) + push.jitter)), ivec2(0), push.render - 1);
 		float z    = texelFetch(depth_tex, rt, 0).r;
 		vec2  base = u - 0.5;
 		ivec2 i0   = ivec2(floor(base));

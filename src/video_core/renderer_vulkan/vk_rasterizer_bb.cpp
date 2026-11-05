@@ -1850,7 +1850,8 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     if (ok && BB::Dlss5::Wanted()) {
         // 0.42 DLSS 5 (bb_dlss5.h): NVIDIA's Neural Rendering on the upscaled output, in place,
         // before frame generation / the HUD read it. BB_DLSS5=0 (default): not called.
-        (void)BB::Dlss5::Apply(desc);
+        const float applied_jitter[2]{plan.jitter[0], plan.jitter[1]};
+        (void)BB::Dlss5::Apply(desc, applied_jitter);
     }
     const bool present_path = color_image == g_bb.present_in.image;
     if (present_path) {

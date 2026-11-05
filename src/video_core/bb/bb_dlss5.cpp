@@ -388,8 +388,9 @@ struct Push {
 	float   ax[4], ay[4];
 	float   mv_scale[2];
 	float   strength, debug;
+	float   jitter[2];
 };
-static_assert(sizeof(Push) == 80);
+static_assert(sizeof(Push) == 88);
 
 struct Runtime {
 	bool       tried = false, ready = false;
@@ -1127,6 +1128,43 @@ void UpdateGrid(vk::Extent2D full) {
 	}
 }
 
+const char* LevelName(int level) {
+	return level <= 0 ? "No" : level == 1 ? "Suave" : level == 2 ? "Medio" : "Fuerte";
+}
+// (bb-dlss5-087) One line, at start-up (jitter n/a yet) and every 600th pass: where DLSS 5 acts, what it reads and the
+// jitter it was given. Also in shadPS4's log, like [taa].
+uint64_t g_line_passes = 0;
+void StateLine(const char* when, const SR::Desc* desc, const float* applied) {
+	const auto& s = Settings();
+	char        where[1100] {};
+	if (desc == nullptr) {
+		std::snprintf(where, sizeof(where),
+		              "acts after the %s upscaler (BB_UPSCALER) on its RGBA16F output, in place, before the HUD, post-processing and frame generation read it; "
+		              "inputs (once running): colour = the upscaler's jitter-free output, depth = the game's G-buffer depth, motion = bb_mv render px towards the "
+		              "previous frame x1 (DLSS convention, no sign flip), no exposure buffer (1.0); jitter: the game's depth / motion are realigned to the "
+		              "unjittered grid with the jitter the scene was drawn with, NGX feature 18 has no jitter input",
+		              BB::Upscale::Cfg().kind == SR::Kind::Dlss ? "DLSS" : BB::Upscale::Cfg().kind == SR::Kind::Xess ? "XeSS" : BB::Upscale::Cfg().kind == SR::Kind::Fsr3 ? "FSR 3.1" : BB::Upscale::Cfg().kind == SR::Kind::Fsr4 ? "FSR 4" : "(none: DLSS 5 stays off)");
+	} else {
+		std::snprintf(where, sizeof(where),
+		              "acts after %s (%s) in place on the %ux%u RGBA16F %s output, NR grid %ux%u (%s), before the HUD, post-processing and frame generation read it; "
+		              "inputs: colour = the upscaler's output (jitter-free, %s), depth = game depth %ux%u (%s, read at q + jitter), motion = %s, render px towards "
+		              "the previous frame, MVecScale 1, sign +1 (DLSS convention; the foveated warp carried through), no history of the upscaler's is shared; "
+		              "jitter applied to the scene %+.4f,%+.4f px (render), passed to %s as %+.4f,%+.4f, used by DLSS 5 only to realign depth / motion "
+		              "(NGX feature 18 takes none), reset %d",
+		              SR::KindName(BB::Upscale::Cfg().kind), BB::Upscale::Cfg().mv_upscale_zero ? "BB_MV_UPSCALE=zero" : "upscale on", desc->output.extent.width,
+		              desc->output.extent.height, desc->hdr ? "linear HDR" : "LDR", g.grid.x.work, g.grid.y.work, g.foveated_now ? "foveated" : "uniform",
+		              desc->hdr ? "linear HDR" : "LDR", desc->depth.extent.width, desc->depth.extent.height, desc->depth_inverted ? "reverse Z" : "forward Z",
+		              BB::Upscale::Cfg().mv_upscale_zero ? "ZERO (BB_MV_UPSCALE=zero: the model sees a static camera)" : "bb_mv.comp camera + object vectors",
+		              static_cast<double>(applied[0]), static_cast<double>(applied[1]), SR::KindName(BB::Upscale::Cfg().kind),
+		              static_cast<double>(desc->jitter[0]), static_cast<double>(desc->jitter[1]), desc->reset ? 1 : 0);
+	}
+	char line[1700] {};
+	std::snprintf(line, sizeof(line), "[dlss5] mode %d (%s) intensity %s (model %g, edit share %g)%s: %s%s", s.level, LevelName(s.level), s.intensity_name.c_str(),
+	              static_cast<double>(s.model_intensity), static_cast<double>(s.strength), s.unofficial ? " unofficial DLL allowed" : "", where, when);
+	BB::Upscale::Checkpoint(line);
+	LOG_INFO(Render_Vulkan, "{}", line);
+}
+
 bool HasExtension(const std::vector<std::string>& available, const char* name) {
 	return std::find(available.begin(), available.end(), name) != available.end();
 }
@@ -1143,8 +1181,17 @@ bool Wanted() {
 
 void AddDeviceExtensions(vk::PhysicalDevice physical, const std::vector<std::string>& available,
                          std::vector<const char*>& extensions) {
-	if (!Wanted()) return; // BB_DLSS5=0: nothing at all (no line, no extension, no pass)
+	if (!Wanted()) {
+		// BB_DLSS5=0: no extension and no pass; (bb-dlss5-087) one line so the log says why DLSS 5 is not there.
+		const char* raw = std::getenv("BB_DLSS5");
+		char        line[320] {};
+		std::snprintf(line, sizeof(line), "[dlss5] mode 0 (No): off, BB_DLSS5=%s received (the launcher's DLSS 5 row is No, or the launcher sent 0 / nothing); nothing loaded, no pass",
+		              raw != nullptr ? raw : "(unset)");
+		BB::Upscale::Checkpoint(line);
+		return;
+	}
 	const auto& s = Settings();
+	StateLine(" [start-up]", nullptr, nullptr);
 	BBLogf("DLSS 5: start-up: BB_DLSS5=%d (%s) BB_DLSS5_INTENSITY=%s BB_DLSS5_UNOFFICIAL=%d -> model intensity %g, edit share %g, %s grid "
 	       "(edge %g); BB_UPSCALER=%s",
 	       s.level, s.level == 0 ? "off" : s.level == 1 ? "Suave" : s.level == 2 ? "Medio" : "Fuerte", s.intensity_name.c_str(), s.unofficial ? 1 : 0,
@@ -1196,7 +1243,7 @@ std::string StatusLine() {
 
 // The NR pass on desc.output (RGBA16F, GENERAL, storage + transfer): the upscaler's picture copied
 // to `keep`, encoded onto the working grid, evaluated, resolved back in place.
-bool Apply(const SR::Desc& desc) {
+bool Apply(const SR::Desc& desc, const float (&applied_jitter)[2]) {
 	if (!Wanted() || !g_device_ok || g.disabled) return false;
 	const auto skip = [](const char* why) {
 		static std::string last;
@@ -1291,6 +1338,8 @@ bool Apply(const SR::Desc& desc) {
 	push.mv_scale[0] = 1.0f, push.mv_scale[1] = 1.0f;
 	push.strength = strength;
 	push.debug    = view && g.foveated_now ? 1.0f : 0.0f;
+	// (bb-dlss5-087) The jitter the scene was rasterised with (not the per-SDK sign-flipped copy): the guides are read at q + jitter.
+	push.jitter[0] = applied_jitter[0], push.jitter[1] = applied_jitter[1];
 
 	const auto run = [&](int mode, vk::Extent2D size) {
 		const auto              gen = vk::ImageLayout::eGeneral;
@@ -1389,6 +1438,12 @@ bool Apply(const SR::Desc& desc) {
 		}
 	}
 	Log(full);
+	if (++g_line_passes == 1 || g_line_passes % 600 == 0) {
+		char when[64] {};
+		std::snprintf(when, sizeof(when), " [pass %llu, evaluate OK %llu, failed %u]", static_cast<unsigned long long>(g_line_passes),
+		              static_cast<unsigned long long>(g.eval_ok), g.eval_failures);
+		StateLine(when, &desc, applied_jitter);
+	}
 	return evaluated;
 }
 
