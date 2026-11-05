@@ -769,7 +769,8 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     }
     std::lock_guard lock(g_mutex);
     const auto now = std::chrono::steady_clock::now();
-    bool usable = inputs != nullptr && inputs->valid && !g_fg_failed;
+    // bb-dcideas-094: never for movies or 2D flips (menus, loading screens).
+    bool usable = inputs != nullptr && inputs->valid && !g_fg_failed && !FgBlocked(nullptr);
     static int first_steps = 0; // 0.41: the first 3D frames' steps, logged (a crash shows the last)
     if (usable) {
         if (const char* why = InputsProblem(*inputs, backbuffer)) {

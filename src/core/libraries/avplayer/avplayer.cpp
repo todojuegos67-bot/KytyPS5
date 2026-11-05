@@ -9,6 +9,11 @@
 
 #include <string_view>
 
+namespace BB::FG {
+// bb-dcideas-094: a movie frame was handed to the game (frame generation stays off for movies).
+void NoteMovieFrame();
+}
+
 namespace Libraries::AvPlayer {
 
 s32 PS4_SYSV_ABI sceAvPlayerAddSource(AvPlayerHandle handle, const char* filename) {
@@ -89,7 +94,9 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoData(AvPlayerHandle handle, AvPlayerFrameIn
     if (handle == nullptr || video_info == nullptr) {
         return false;
     }
-    return handle->GetVideoData(*video_info);
+    const bool got = handle->GetVideoData(*video_info);
+    if (got) BB::FG::NoteMovieFrame();
+    return got;
 }
 
 bool PS4_SYSV_ABI sceAvPlayerGetVideoDataEx(AvPlayerHandle handle,
@@ -98,7 +105,9 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoDataEx(AvPlayerHandle handle,
     if (handle == nullptr || video_info == nullptr) {
         return false;
     }
-    return handle->GetVideoData(*video_info);
+    const bool got = handle->GetVideoData(*video_info);
+    if (got) BB::FG::NoteMovieFrame();
+    return got;
 }
 
 AvPlayerHandle PS4_SYSV_ABI sceAvPlayerInit(AvPlayerInitData* data) {
