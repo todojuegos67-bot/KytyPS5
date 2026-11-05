@@ -2009,6 +2009,21 @@ void AfterPresent() {
         g_stat_present_ms += ms;
         g_stat_present_max = std::max(g_stat_present_max, ms);
         g_present_begin = {};
+        // bb-dlssg-085: the present call held the presenter (and so the next flip) for > 8 ms.
+        if (ms > 8.0) {
+            static Clock::time_point window{};
+            static int lines = 0;
+            const auto now_block = Clock::now();
+            if (now_block - window > std::chrono::seconds(10)) {
+                window = now_block;
+                lines = 0;
+            }
+            if (lines < 6) {
+                ++lines;
+                Printf("[hitch] the present call blocked %.1f ms (frame %u, Streamline status 0x%x)",
+                       ms, g_frame_index, g_last_status);
+            }
+        }
     }
     if (!g_ready || g_token == nullptr) {
         return;
@@ -2038,6 +2053,51 @@ void AfterPresent() {
                 }
             }
             Display::NoteGpuEnds(ids, ends, n);
+            // bb-dlssg-085: a real frame that took > 25 ms (the hitches) with where its time went,
+            // from the same report (driver clock, microseconds; -1: not stamped).
+            std::vector<const sl::ReflexReport*> order;
+            for (const auto& f : report->frameReport) {
+                if (f.frameID != 0 && f.gpuRenderEndTime != 0) order.push_back(&f);
+            }
+            std::sort(order.begin(), order.end(),
+                      [](const sl::ReflexReport* a, const sl::ReflexReport* b) {
+                          return a->frameID < b->frameID;
+                      });
+            static uint64_t hitch_last_id = 0, hitch_last_end = 0;
+            static Clock::time_point hitch_window{};
+            static int hitch_lines = 0;
+            const auto now_hitch = Clock::now();
+            if (now_hitch - hitch_window > std::chrono::seconds(10)) {
+                hitch_window = now_hitch;
+                hitch_lines = 0;
+            }
+            const auto span = [](uint64_t a, uint64_t b) {
+                return a != 0 && b >= a ? static_cast<double>(b - a) / 1000.0 : -1.0;
+            };
+            for (const auto* f : order) {
+                if (f->frameID <= hitch_last_id) continue;
+                const double gap = hitch_last_end != 0 && f->gpuRenderEndTime > hitch_last_end
+                                       ? static_cast<double>(f->gpuRenderEndTime - hitch_last_end) / 1000.0
+                                       : 0.0;
+                hitch_last_id = f->frameID;
+                hitch_last_end = f->gpuRenderEndTime;
+                if (gap > 25.0 && gap < 500.0 && hitch_lines < 12) {
+                    ++hitch_lines;
+                    Printf("[hitch] frame %llu: %.1f ms after the previous real frame at the GPU | "
+                           "game %.1f ms (simulation start to render submit end), submit end to "
+                           "present start %.1f, present call %.1f, driver %.1f, OS queue %.1f, "
+                           "queue to GPU start %.1f, GPU %.1f ms (active %.1f)",
+                           static_cast<unsigned long long>(f->frameID), gap,
+                           span(f->simStartTime, f->renderSubmitEndTime),
+                           span(f->renderSubmitEndTime, f->presentStartTime),
+                           span(f->presentStartTime, f->presentEndTime),
+                           span(f->driverStartTime, f->driverEndTime),
+                           span(f->osRenderQueueStartTime, f->osRenderQueueEndTime),
+                           span(f->osRenderQueueEndTime, f->gpuRenderStartTime),
+                           span(f->gpuRenderStartTime, f->gpuRenderEndTime),
+                           static_cast<double>(f->gpuActiveRenderTimeUs) / 1000.0);
+                }
+            }
         }
     }
     if (presents % 30 != 1) {
@@ -2222,12 +2282,35 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
         // defeats on Vulkan), does not tear, and on a VRR display the images are shown as they
         // arrive. Its cost: with more images than refreshes the older one is replaced (dropped),
         // visible in [display] dropped. Immediate only where mailbox is not offered.
-        wanted = supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
+        // bb-dlssg-085: the 18:29 run (mailbox) had the present call blocking 2.7-10 ms on average,
+        // up to 17-19 ms, in most seconds of x2 (a real frame's flip waits behind it: the 35-40 ms
+        // hitches); the 0.75 run in immediate had 0.7-1.1 ms (max 1.9) for the same call. So the
+        // default is immediate on a monitor of 120 Hz or more (shown 150-160 fps stays under its
+        // refresh: nothing to tear with VRR, and 1 frame in 2 at most would be torn without),
+        // mailbox below that, where immediate would tear. BB_FG_PRESENT=mailbox keeps 0.77's.
+        int refresh_hz = 0;
+#if defined(_WIN32)
+        {
+            DEVMODEA display_mode{};
+            display_mode.dmSize = sizeof(display_mode);
+            if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &display_mode) != 0) {
+                refresh_hz = static_cast<int>(display_mode.dmDisplayFrequency);
+            }
+        }
+#endif
+        const bool high_refresh = refresh_hz >= 120;
+        wanted = high_refresh && supported(vk::PresentModeKHR::eImmediate)
+                     ? vk::PresentModeKHR::eImmediate
+                 : supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
                  : supported(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
                                                              : current;
-        why = "DLSS-G on Vulkan has no vsync support (Streamline guide 22.5): mailbox does not "
-              "block Streamline's pacer and does not tear; BB_FG_PRESENT=fifo|immediate|user "
-              "overrides";
+        static char text[240];
+        std::snprintf(text, sizeof(text),
+                      "DLSS-G on Vulkan has no vsync support (Streamline guide 22.5); display %d Hz: "
+                      "%s; BB_FG_PRESENT=fifo|mailbox|immediate|user overrides", refresh_hz,
+                      high_refresh ? "immediate, mailbox made the present call block 3-17 ms"
+                                   : "mailbox (immediate would tear below 120 Hz)");
+        why = text;
     }
     if (wanted != current && !supported(wanted)) {
         wanted = current;
