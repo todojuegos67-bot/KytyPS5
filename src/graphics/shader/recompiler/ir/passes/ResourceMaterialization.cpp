@@ -823,6 +823,55 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	return true;
 }
 
+
+// KYTY_MAPPING_DIRECTORY=0 restores baked mapping offsets. Default on: the flattened-SRT offset of
+// each indirect mapping table depends on the size of the tables before it, i.e. on the table
+// contents of the dispatch, and was baked into the SPIR-V as an OpConstant (Yotei CS
+// 0xb629e5773956d33c: 6 seed variants of 299157 words that differ only in the constants
+// 0xe11/0xe12 vs 0xe36/0xe37 and 0x1b3f/0x1b40 vs 0x1b89/0x1b8a, i.e. mapping_offset and
+// mapping_offset + 1 of two tables; each variant a 1-8 s vkCreateComputePipelines). A directory of
+// one word per table is inserted right after the shader-stable words, so its position depends on
+// the shader alone; the specialization (and the SPIR-V) name the directory word, and the shader
+// reads the real offset from it at run time.
+static bool MappingDirectoryEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_MAPPING_DIRECTORY");
+		return v == nullptr || v[0] != '0';
+	}();
+	return enabled;
+}
+
+void RelocateMappingOffsets(ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                            uint32_t stable_words) {
+	if (!MappingDirectoryEnabled() || stable_words > snapshot.flattened_srt.size()) return;
+	std::vector<uint32_t*> mappings;
+	const auto collect = [&](auto& resources) {
+		for (uint32_t i = 0; i < resources.size(); ++i) {
+			auto& r = resources[i];
+			if (r.indirect_root != i || (r.indirect_mapping_offset & IndirectMappingDirectoryFlag) != 0u ||
+			    r.indirect_mapping_offset < stable_words) continue;
+			mappings.push_back(&r.indirect_mapping_offset);
+		}
+	};
+	collect(specialization.buffers);
+	collect(specialization.images);
+	collect(specialization.samplers);
+	if (mappings.empty()) return;
+	const auto count = static_cast<uint32_t>(mappings.size());
+	auto& flat = snapshot.flattened_srt;
+	if (uint64_t {flat.size()} + count >= IndirectMappingDirectoryFlag) return;
+	flat.insert(flat.begin() + stable_words, count, 0u);
+	// Every offset past the stable words moves by the directory size.
+	for (auto& b: specialization.buffers) {
+		if (b.runtime_stride_offset != UINT32_MAX && b.runtime_stride_offset >= stable_words)
+			b.runtime_stride_offset += count;
+	}
+	for (uint32_t k = 0; k < count; ++k) {
+		const auto real = *mappings[k] + count;
+		flat[stable_words + k] = real;
+		*mappings[k] = IndirectMappingDirectoryFlag | (stable_words + k);
+	}
+}
 } // namespace
 
 struct SamplerPlan {
@@ -1671,6 +1720,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			snapshot.flattened_srt.push_back(0u);
 		}
 	}
+	// Words before this offset depend on the shader alone; the mapping tables after it do not.
+	const auto stable_flat_words = static_cast<uint32_t>(snapshot.flattened_srt.size());
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1859,7 +1910,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	if (!BuildResourceSpecialization(program, snapshot, specialization)) return false;
+	RelocateMappingOffsets(snapshot, specialization, stable_flat_words);
+	return true;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

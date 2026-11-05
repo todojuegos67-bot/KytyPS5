@@ -117,6 +117,10 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// An indirect_mapping_offset with this bit set names a flattened-SRT word (the low bits) that
+// holds the real mapping offset at run time, so the offset is not baked into the SPIR-V.
+constexpr uint32_t IndirectMappingDirectoryFlag = 0x80000000u;
+
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;

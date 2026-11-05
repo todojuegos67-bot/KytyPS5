@@ -54,7 +54,12 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	};
-	const auto mapping = ConstantU32(state, mapping_offset);
+	// Directory form: the mapping offset is a runtime value read from the flattened SRT, so the
+	// same guest shader emits one module whatever the size of earlier mapping tables.
+	const bool directory = (mapping_offset & IR::IndirectMappingDirectoryFlag) != 0u;
+	const auto mapping = directory
+	    ? LoadMapping(ConstantU32(state, mapping_offset & ~IR::IndirectMappingDirectoryFlag))
+	    : ConstantU32(state, mapping_offset);
 	const auto count = LoadMapping(mapping);
 	if (search_iterations == 0u) {
 		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
@@ -62,7 +67,9 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
 		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
 		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
-		                          ConstantU32(state, mapping_offset + 1u));
+		                          directory ? Binary(state, spv::OpIAdd, TypeU32(state), mapping,
+		                                             ConstantU32(state, 1u))
+		                                    : ConstantU32(state, mapping_offset + 1u));
 		return Select(state, TypeU32(state), valid, LoadMapping(entry),
 		              ConstantU32(state, default_resource));
 	}
