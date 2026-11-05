@@ -27,6 +27,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "frame-capture.h"
+#include "mode-toggle.h"
 #include "frame-gen.h"
 #include "native-preparation-state.h"
 #include "live-counters.h"
@@ -392,7 +393,7 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
 // KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc, on by default under KYTY_SPECULATE=4): RenderExecutor::m_dcc_fills.
 static bool PredictDccFills() {
 	// (One fallback at every site: LiveSwitch::Find binds the first; the environment's KYTY_SPEC_PREDICT_DCC wins.)
-	static auto& on = LiveSwitch::Find("spec_predict_dcc", Spec::ModeDefault());
+	static auto& on = LiveSwitch::Find("spec_predict_dcc", ModeToggle::Default("spec_predict_dcc"));
 	return on.load(std::memory_order_relaxed) != 0;
 }
 
@@ -653,7 +654,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		// memory no tracked image holds (the system image-clear shader's ~24 a frame at 1-1, 4 KiB to 288 KiB of one
 		// value: plain buffer memory) as a transfer fill in the dispatch's place, the buffer's barriers around it
 		// (Buffer::Fill), not the shader.
-		static auto& fill_buffer = LiveSwitch::Find("fill_buffer_clears", Spec::ModeDefault());
+		static auto& fill_buffer = LiveSwitch::Find("fill_buffer_clears", ModeToggle::Default("fill_buffer_clears"));
 		if (fill_buffer.load(std::memory_order_relaxed) != 0 && Spec::Current() == nullptr && ((base | size) & 3u) == 0 &&
 		    !cache.HasTrackedDataOverlap(base, size)) {
 			const auto [buffer, offset] = m_context.GetBufferCache().ObtainBuffer(base, size, true, true);

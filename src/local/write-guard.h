@@ -25,6 +25,7 @@
 
 #include "common/virtualMemory.h"
 #include "live-switch.h"
+#include "mode-toggle.h"
 
 #include <algorithm>
 #include <atomic>
@@ -82,7 +83,7 @@ inline uint64_t (*g_upload_done)() = nullptr;
 	static auto& on = LiveSwitch::Find("write_guard_spec", [] {
 		const char* value = std::getenv("KYTY_WRITE_GUARD_SPEC");
 		if (value != nullptr) return std::atoll(value);
-		return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1ll : 0ll;
+		return ModeToggle::Default("write_guard_spec");
 	}());
 	return on.load(std::memory_order_relaxed) != 0;
 }

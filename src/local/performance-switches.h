@@ -5,6 +5,7 @@
 
 #include "native-buffer-residency.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "native-resource-state.h"
 #include "spin-gate.h"
 
@@ -212,7 +213,7 @@ inline void InitializePerformanceSwitches() {
 	// neutral, 1 Nov).
 	if (const char* text = std::getenv("KYTY_TABLE_TARGET_READ");
 	    (text == nullptr || *text == '\0') && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4)
-		kyty_local_table_target_read.store(1, std::memory_order_relaxed);
+		kyty_local_table_target_read.store(ModeToggle::TableTargetRead4, std::memory_order_relaxed);
 #endif
 	// External tools find the render thread by this name (for example to pin it).
 	LocalPlatform::SetThreadName("Kyty.Gpu");

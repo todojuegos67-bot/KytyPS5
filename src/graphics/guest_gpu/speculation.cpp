@@ -10,6 +10,7 @@
 #include "async-upload.h"
 #include "draw-state-observer.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "vulkan-recording.h"
 #include "write-guard.h"
 
@@ -43,7 +44,7 @@ bool CommitGuardedWrite(void* dst, const void* src, uint32_t size); // (graphics
 // next flush (a label's, a guest submission's end, a readback's, a chunk wait's). The GPU thread flushes them before
 // it waits for a speculation's thread (which may wait for their tick), and when a commit blocks at a wait hole.
 static uint32_t FlushEvery() {
-	static auto& every = LiveSwitch::Find("speculate_flush_every", Spec::ModeDefault(8));
+	static auto& every = LiveSwitch::Find("speculate_flush_every", ModeToggle::Default("speculate_flush_every"));
 	return static_cast<uint32_t>(std::max<int64_t>(every.load(std::memory_order_relaxed), 0));
 }
 
@@ -117,6 +118,27 @@ Speculation::Speculation(RenderContext& renderer, int interrupt_id, uint32_t bas
 	// (Packet slots and executor roles: Spec::MaxPacketSlots, RenderExecutor::Roles less the GPU thread's.)
 	threads = std::clamp<uint32_t>(threads, 1u, static_cast<uint32_t>(Spec::MaxPacketSlots) - std::min<uint32_t>(base, Spec::MaxPacketSlots - 1));
 	for (uint32_t i = 0; i < threads; ++i) m_translators.push_back(std::make_unique<Translator>(renderer, base + i, interrupt_id));
+}
+
+void Speculation::Stop() {
+	{
+		std::lock_guard lock(m_mutex);
+		m_quit = true;
+	}
+	m_ahead_wake.notify_all();
+	for (auto& translator: m_translators)
+		if (translator->thread.joinable()) translator->thread.join();
+	if (m_blocked) Finish(std::move(m_blocked), 0);
+	for (;;) {
+		std::unique_ptr<Result> result;
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_ahead.empty()) break;
+			result = std::move(m_ahead.front());
+			m_ahead.pop_front();
+		}
+		Finish(std::move(result), 0);
+	}
 }
 
 Speculation::~Speculation() {
@@ -242,7 +264,7 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 bool Speculation::ChunkInOrder() {
 	static auto& on = LiveSwitch::Find("spec_chunk_in_order", [] {
 		const char* value = std::getenv("KYTY_SPEC_CHUNK_IN_ORDER");
-		return value != nullptr ? std::atoll(value) : Spec::ModeDefault(); // (on by default under KYTY_SPECULATE=4)
+		return value != nullptr ? std::atoll(value) : ModeToggle::Default("spec_chunk_in_order");
 	}());
 	return on.load(std::memory_order_relaxed) != 0;
 }

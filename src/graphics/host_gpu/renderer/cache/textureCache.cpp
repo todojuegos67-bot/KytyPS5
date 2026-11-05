@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "slow-log.h"
 #include "live-switch.h"
+#include "mode-toggle.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -4989,7 +4990,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	// (Only for a surface the caller may hold as DCC: m_dcc_filled keeps the addresses fills were tracked at while no
 	// image said what the metadata was, no entry or a pending one, and some are depth targets' HTile, which the normal
 	// path never finds cleared there: ~42 needless holes a frame on depth targets at the arch, 2 Nov.)
-	static auto& predict_dcc = LiveSwitch::Find("spec_predict_dcc", Spec::ModeDefault());
+	static auto& predict_dcc = LiveSwitch::Find("spec_predict_dcc", ModeToggle::Default("spec_predict_dcc"));
 	const auto   dcc_filled  = [&] {
 		return spec != nullptr && dcc_ok && slice < 32 && predict_dcc.load(std::memory_order_relaxed) != 0 &&
 		       m_dcc_filled.contains(address);
@@ -5084,7 +5085,7 @@ void TextureCache::NoteDccClear(uint64_t address, bool sticks) {
 }
 
 bool TextureCache::DccClearSticks(uint64_t address) {
-	static auto& predict = LiveSwitch::Find("spec_predict_dcc", Spec::ModeDefault());
+	static auto& predict = LiveSwitch::Find("spec_predict_dcc", ModeToggle::Default("spec_predict_dcc"));
 	if (predict.load(std::memory_order_relaxed) == 0) return false;
 	std::scoped_lock lock {m_lock};
 	return m_dcc_sticky.contains(address);

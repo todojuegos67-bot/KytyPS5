@@ -54,6 +54,10 @@ public:
 	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0);
 	~Speculation();
 	KYTY_CLASS_NO_COPY(Speculation);
+	// (Tooling, the live mode toggle: on the GPU thread, between submissions.) The threads stopped and every result not
+	// committed finished as a lost one (Finish: its recorded command buffers discarded, their ticks given up, its
+	// pending writes dropped, the live count down), so the destructor waits for no tick that will never be submitted.
+	void Stop();
 
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
 	// committed up to the end of its chunk (mode 4: the execution is where the next begins).

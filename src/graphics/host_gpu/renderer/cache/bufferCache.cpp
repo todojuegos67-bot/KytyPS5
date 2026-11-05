@@ -5,6 +5,7 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-switch.h"
+#include "mode-toggle.h"
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "native-resource-state.h"
@@ -2657,7 +2658,7 @@ void BufferCache::EnsureTexelContents(uint64_t vaddr, uint64_t size) {
 static bool TexelSync() {
 	static auto& on = LiveSwitch::Find("speculate_texel_sync", [] {
 		const char* value = std::getenv("KYTY_SPECULATE_TEXEL_SYNC");
-		return value != nullptr ? std::atoll(value) : Spec::ModeDefault();
+		return value != nullptr ? std::atoll(value) : ModeToggle::Default("speculate_texel_sync");
 	}());
 	return on.load(std::memory_order_relaxed) != 0;
 }

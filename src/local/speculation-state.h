@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "live-switch.h"
+#include "mode-toggle.h"
 #include "write-guard.h"
 
 #include <algorithm>
@@ -84,24 +85,18 @@ struct LateRead {
 	uint64_t begin = 0, end = 0, since = 0;
 };
 
-// A speculation switch's default with its variable unset: `on` under KYTY_SPECULATE=4, whose measured set it is (the
-// stone arch, 1-2 Nov: 55-59 fps with the set against 51-53 without), else 0.
-inline long long ModeDefault(long long on = 1) {
-	return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? on : 0;
-}
-
 // KYTY_SPEC_LATE_READS (live spec_late_reads, on by default under KYTY_SPECULATE=4): State::late_reads.
 inline bool LateReads() {
 	static auto& on = LiveSwitch::Find("spec_late_reads", [] {
 		const char* value = std::getenv("KYTY_SPEC_LATE_READS");
-		return value != nullptr ? std::atoll(value) : ModeDefault();
+		return value != nullptr ? std::atoll(value) : ModeToggle::Default("spec_late_reads");
 	}());
 	return on.load(std::memory_order_relaxed) != 0;
 }
 // KYTY_SPEC_READ_ONE_SET (live spec_read_one_set, on by default under KYTY_SPECULATE=4): State::pending_set, taken
 // when a speculation begins (Inherit) or its state is cleared.
 inline bool ReadOneSetOn() {
-	static auto& on = LiveSwitch::Find("spec_read_one_set", ModeDefault());
+	static auto& on = LiveSwitch::Find("spec_read_one_set", ModeToggle::Default("spec_read_one_set"));
 	return on.load(std::memory_order_relaxed) != 0;
 }
 // KYTY_SPEC_READ_ONE_SET_VERIFY (live spec_read_one_set_verify N, default 0): every Nth read pending_set clears also put

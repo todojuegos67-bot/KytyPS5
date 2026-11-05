@@ -31,6 +31,7 @@
 #include "libs/controller.h"
 #include "loader/demonsSoulsWarp.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "perf-overlay.h"
 #include "screenshot.h"
 #include "live-switch.h"
@@ -643,6 +644,11 @@ inline void Run(uint64_t id, const std::string& line) {
 		                     : n == 3 && Loader::DemonsSoulsWarp::Arm(arg1, arg2);
 		std::printf("LIVE_WARP id=%" PRIu64 " map=%s spawn=%s ok=%d spawns=%zu\n", id, arg1, n == 3 ? arg2 : "-",
 		            ok ? 1 : 0, Loader::DemonsSoulsWarp::Spawns().size());
+	} else if (cmd == "mode" && n >= 2) {
+		// mode 0|4: KYTY_SPECULATE's mode changed live, between submissions (mode-toggle.h); the reply comes when it is
+		// asked for, the log's "Mode: KYTY_SPECULATE=N (live)" when it is applied.
+		ModeToggle::Request(std::atoi(arg1) == 4 ? 4 : 0);
+		std::printf("LIVE_MODE id=%" PRIu64 " requested=%d\n", id, std::atoi(arg1) == 4 ? 4 : 0);
 	} else if (cmd == "glide") {
 		// glide X Y Z SPEED: the player walked there in a straight line (loader/demonsSoulsWarp.h), at once; seconds = the
 		// time it takes (-1: no player).

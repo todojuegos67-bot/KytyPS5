@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "live-switch.h"
+#include "mode-toggle.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -961,7 +962,7 @@ uint64_t CommandScheduler::SubmitRecorded(Recorder& recorder, size_t count) {
 	// buffers are dropped and the open buffer, with its render pass, goes on into the next hole. Nothing is submitted:
 	// no tick (the dropped buffers read none of the translation's rings; its earlier segments' ticks cover those).
 	static auto& keep_pass = LiveSwitch::Find(
-	    "speculate_keep_pass", ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? 1 : 0);
+	    "speculate_keep_pass", ModeToggle::Default("speculate_keep_pass"));
 	if (keep_pass.load(std::memory_order_relaxed) != 0 && open && m_command.Rendering() && count > 0 &&
 	    std::all_of(recorder.recorded.begin(), recorder.recorded.begin() + static_cast<ptrdiff_t>(count),
 	                [](const Recorder::Recorded& recorded) { return recorded.empty; })) {

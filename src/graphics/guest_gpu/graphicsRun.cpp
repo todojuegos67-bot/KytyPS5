@@ -35,6 +35,7 @@
 #include "frame-capture.h"
 #include "hud-anchor.h"
 #include "live-control.h"
+#include "mode-toggle.h"
 #include "performance-switches.h"
 #include "speculation-state.h"
 #include "xpr-capture.h"
@@ -281,7 +282,7 @@ uint32_t GuestGpu::ServeInWaits() noexcept {
 	static auto& serve = LiveSwitch::Find("serve_in_waits", [] {
 		const char* value = std::getenv("KYTY_SERVE_IN_WAITS");
 		// (Under KYTY_SPECULATE=4, 7: also after each committed segment and in the chunk waits.)
-		return value != nullptr ? std::atoll(value) : 1ll | Spec::ModeDefault(6);
+		return value != nullptr ? std::atoll(value) : ModeToggle::Default("serve_in_waits");
 	}());
 	// (Any nonzero value serves in the upload waits, as upstream's 1 did: KYTY_SERVE_IN_WAITS=2 or 4 keeps them.)
 	const auto value = static_cast<uint32_t>(serve.load(std::memory_order_relaxed));
@@ -568,7 +569,7 @@ bool CommandProcessor::SameState(const CommandProcessor& other) const {
 	// commit then stopped at "ahead: another start state" (~0.3 ms a frame of in-order translation with spec_predict_dcc).
 	static auto& start_instance_free = LiveSwitch::Find("spec_start_instance_free", [] {
 		const char* value = std::getenv("KYTY_SPEC_START_INSTANCE_FREE");
-		return value != nullptr ? std::atoll(value) : Spec::ModeDefault();
+		return value != nullptr ? std::atoll(value) : ModeToggle::Default("spec_start_instance_free");
 	}());
 	const bool same_sh = start_instance_free.load(std::memory_order_relaxed) != 0 ? m_sh_ctx.SameButStartInstance(other.m_sh_ctx)
 	                                                                                : m_sh_ctx == other.m_sh_ctx;
@@ -1184,7 +1185,8 @@ void GuestGpu::ThreadRun(void* data) {
 		ServePendingCommands();
 		return true;
 	};
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	// (Mode 4's machinery: at the start, and again on a live `mode 4` (mode-toggle.h, below).)
+	const auto start_speculation = [gpu] {
 		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 		// (The async queue's threads take the packet slots after the graphics queue's: none left, no async speculation.)
@@ -1204,7 +1206,69 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_async_queue = queue;
 			gpu->m_ahead_async.store(gpu->m_speculation_async.get(), std::memory_order_release);
 		}
+	};
+	// (A KYTY_SPECULATE=4 boot: the mode table's values set before the first packet, as a live `mode 4` sets them; the
+	// switches whose Find keeps main's default, the four levers, take mode 4's here.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		ModeToggle::ApplyTable(4);
+		start_speculation();
 	}
+	// (Tooling: the live mode toggle (mode-toggle.h), applied between submissions when no speculated queue has one started
+	// and not done: a speculation's results and blocked commits belong to the submission they began. Under m_queue_mutex,
+	// so Enqueue pushes to the old speculation or to the new one, never to one being destroyed.)
+	const auto apply_mode = [gpu, &start_speculation] {
+		const int want = ModeToggle::g_request.load(std::memory_order_acquire);
+		if (want < 0) return;
+		std::unique_ptr<Speculation> old, old_async;
+		{
+			Common::LockGuard lock(gpu->m_queue_mutex);
+			const auto started = [&](uint32_t id) {
+				return id < QueueCount && !gpu->m_queues[id].empty() && gpu->m_queues[id].front().started;
+			};
+			if (started(0) || (gpu->m_speculation_async && started(gpu->m_async_queue))) return;
+			ModeToggle::g_request.store(-1, std::memory_order_release);
+			if (static_cast<int>(kyty_local_speculate_mode.load(std::memory_order_relaxed)) == want) return;
+			ModeToggle::ApplyTable(want);
+			if (want == 0) {
+				gpu->m_ahead.store(nullptr, std::memory_order_release);
+				gpu->m_ahead_async.store(nullptr, std::memory_order_release);
+				old       = std::move(gpu->m_speculation);
+				old_async = std::move(gpu->m_speculation_async);
+			} else {
+				kyty_local_speculate_mode.store(4, std::memory_order_relaxed);
+#if defined(__linux__)
+				check_write_guard_uffd(); // (the guard turns on with mode 4: #289's check, as at boot)
+#endif
+				start_speculation();
+				// (The command buffers queued already, handed over as Enqueue hands them.)
+				for (const auto& s: gpu->m_queues[0])
+					gpu->m_speculation->Push(
+					    {s.serial, s.commands, s.reset_processor,
+					     s.type == SubmissionType::FlipPreparation || s.type == SubmissionType::FrameBoundary ? Speculation::Job::Kind::Flip
+					     : s.type == SubmissionType::Graphics && s.constant_commands.empty()               ? Speculation::Job::Kind::Graphics
+					                                                                                         : Speculation::Job::Kind::Other});
+				if (gpu->m_speculation_async && gpu->m_async_queue != 0)
+					for (const auto& s: gpu->m_queues[gpu->m_async_queue])
+						gpu->m_speculation_async->Push({s.serial, s.commands, s.reset_processor,
+						                                s.type == SubmissionType::Compute && s.constant_commands.empty()
+						                                    ? Speculation::Job::Kind::Graphics
+						                                    : Speculation::Job::Kind::Other});
+			}
+		}
+		// (To 0: the threads joined and the unfinished results finished as lost ones (Speculation::Stop: a destroyed
+		// result's recorder waited for ticks never submitted, a hang at the 5th flip), outside the lock.)
+		if (old) old->Stop();
+		if (old_async) old_async->Stop();
+		old.reset();
+		old_async.reset();
+		// (Mode 0 once no speculation thread is left: Spec::Current(), the recorder and executor accessors read the global
+		// first, so a thread still translating would otherwise take the normal path. No packet runs in between: this is
+		// the GPU thread between submissions.)
+		if (want == 0) kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+		std::printf("Mode: KYTY_SPECULATE=%d (live)\n", want);
+		std::fflush(stdout);
+		Loader::DemonsSoulsWarp::ShowNotice(want == 4 ? "Mode 4 (speculation on)" : "Mode 0 (speculation off)", 3);
+	};
 	LiveControl::Start();
 	XprCapture::Initialize();
 	// KYTY_SCOUT: not while a capture sees every draw on the normal path.
@@ -1214,6 +1278,7 @@ void GuestGpu::ThreadRun(void* data) {
 #endif
 
 	for (;;) {
+		if (ModeToggle::g_request.load(std::memory_order_relaxed) >= 0) apply_mode();
 		PageManager::FlushDeferredProtection(); // (before a guest command, an idle wait, another queue's turn)
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -1699,7 +1764,7 @@ void CommandProcessor::SuspendPm4() {
 // (CommandProcessor::TryNativeIndirectAutoDraw), on the GPU thread and in a speculative translation. Off: the packet
 // is a speculation's hole, drawn the normal way.
 static bool SpecDrawIndirect() {
-	static auto& on = LiveSwitch::Find("spec_draw_indirect", Spec::ModeDefault());
+	static auto& on = LiveSwitch::Find("spec_draw_indirect", ModeToggle::Default("spec_draw_indirect"));
 	return on.load(std::memory_order_relaxed) != 0;
 }
 // KYTY_SPEC_DRAW_INDIRECT_VERIFY (live spec_draw_indirect_verify, default 0): every Nth of those table draws (on any
