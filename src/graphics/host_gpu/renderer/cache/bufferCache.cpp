@@ -905,6 +905,14 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 		feedback.download.written_serial = m_scheduler.CommandSerial();
 		command.CopyAfterRun(owner->Handle(), owner->Offset(vaddr), feedback.download.Handle(),
 		                     selected * CopyFeedback::SlotSize, size);
+	} else if (static auto& batch = LiveSwitch::Find("feedback_batch", 1); batch.load(std::memory_order_relaxed) != 0) {
+		// KYTY_FEEDBACK_BATCH (live feedback_batch, on by default): the snapshot is copied
+		// as the open buffer closes, with the others there behind one barrier each side, not behind two of its own
+		// here. Later work in the buffer that writes the range invalidates the slot (InvalidateCopyFeedback), so what
+		// the copy reads then is what it would read here whenever the slot is still used. (The source outlives the
+		// buffer: DeleteBuffer defers.)
+		feedback.download.written_serial = m_scheduler.CommandSerial();
+		m_feedback_batch.push_back({owner->Handle(), owner->Offset(vaddr), selected * CopyFeedback::SlotSize, size});
 	} else {
 		feedback.download.CopyFrom(command, *owner, owner->Offset(vaddr), selected * CopyFeedback::SlotSize, size,
 		                           vk::AccessFlagBits::eMemoryWrite,
@@ -1017,6 +1025,33 @@ bool BufferCache::VerifyEagerFeedback(const EagerFeedback& entry) {
 			            static_cast<unsigned long long>(mismatched), static_cast<unsigned long long>(entry.tick));
 	}
 	return true;
+}
+
+void BufferCache::FlushFeedbackBatch(CommandBuffer& command) {
+	if (m_feedback_batch.empty()) return;
+	const auto native = command.Handle();
+	// As Buffer::CopyFrom's barriers, once for the batch: what wrote the sources (and the host's reads of the slots)
+	// before the copies, the copies before what reads the slots after (the host).
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 1, &before, 0, nullptr,
+	                       0, nullptr);
+	const vk::Buffer destination = m_copy_feedback->download.Handle();
+	for (const auto& copy: m_feedback_batch) {
+		const vk::BufferCopy region {copy.source_offset, copy.destination_offset, copy.size};
+		native.copyBuffer(copy.source, destination, 1, &region);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask =
+	    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
+	LiveCounters::Add(LiveCounters::FeedbackBatches);
+	m_feedback_batch.clear();
 }
 
 bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -1612,6 +1647,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_bda_table.store(m_bda_tables.back().get(), std::memory_order_release);
 	}
 	m_scheduler.SetPrologueHook([this](vk::CommandBuffer command) { FlushPrologueCopies(command); });
+	m_scheduler.SetEpilogueHook([this](CommandBuffer& command) { FlushFeedbackBatch(command); });
 	m_gpu_modified_ranges.AllowFastPath();
 	g_sync_cache = this;
 	LiveCounters::g_sync_report = [] {
