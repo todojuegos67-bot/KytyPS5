@@ -594,50 +594,6 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
 	}
 }
 
-// Like EmitIndexSwitch with a result, but items whose key(item) matches share one case block
-// (emit runs once per distinct key, with the first item of that key). Out-of-range indices
-// take item 0's block, as in EmitIndexSwitch. Drivers inline helper functions at every call
-// site, so collapsing identical cases keeps their per-call cost down.
-template <typename KeyFn, typename Fn>
-uint32_t EmitGroupedIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
-                                uint32_t result_type, KeyFn&& key, Fn&& emit) {
-	EXIT_IF(count == 0u);
-	const auto            merge_label = state.builder.AllocateId();
-	std::vector<uint64_t> keys;
-	std::vector<uint32_t> group_items;
-	std::vector<uint32_t> group_labels;
-	std::vector<uint32_t> item_labels(count);
-	for (uint32_t item = 0; item < count; item++) {
-		const uint64_t k     = key(item);
-		size_t         group = 0;
-		while (group < keys.size() && keys[group] != k) group++;
-		if (group == keys.size()) {
-			keys.push_back(k);
-			group_items.push_back(item);
-			group_labels.push_back(state.builder.AllocateId());
-		}
-		item_labels[item] = group_labels[group];
-	}
-	std::vector<uint32_t> words {spv::OpSwitch, index, item_labels.front()};
-	for (uint32_t item = 0; item < count; item++) {
-		if (item_labels[item] == item_labels.front()) continue;
-		words.push_back(item);
-		words.push_back(item_labels[item]);
-	}
-	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(words);
-	std::vector<uint32_t> phi {spv::OpPhi, result_type, state.builder.AllocateId()};
-	for (size_t group = 0; group < keys.size(); group++) {
-		EmitLabel(state, group_labels[group]);
-		phi.push_back(emit(group_items[group]));
-		phi.push_back(state.current_label);
-		state.builder.AddFunction(spv::OpBranch, merge_label);
-	}
-	EmitLabel(state, merge_label);
-	state.builder.AddFunction(phi);
-	return phi[2];
-}
-
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	const auto then_label  = state.builder.AllocateId();

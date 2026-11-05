@@ -4,6 +4,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include <cstdint>
+#include <span>
 
 // Per-thread "what is the driver compiling right now" markers, read by the crash handler.
 // A Scope is opened right before vkCreate*Pipelines and closed after it returns. When a host
@@ -12,8 +13,10 @@
 // (HelperInlinePolicy) so the next run translates it with inlined helpers.
 namespace Libs::Graphics::CompileGuard {
 
-// Remembers which guest shader a runtime shader module was translated from.
-void NoteModule(VkShaderModule module, uint64_t guest_hash, uint64_t words);
+// Remembers which guest shader a runtime shader module was translated from, logs how many of its
+// functions are DontInline ("HelperInline: module ..."), and with KYTY_DUMP_INFLIGHT=1 writes its
+// SPIR-V to _shaderdump/mod_<guest>_<words>.spv so the module of a crashing compile is on disk.
+void NoteModule(VkShaderModule module, uint64_t guest_hash, std::span<const uint32_t> spirv);
 
 class Scope {
 public:

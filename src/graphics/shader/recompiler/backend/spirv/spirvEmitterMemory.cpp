@@ -1049,61 +1049,6 @@ uint32_t IndirectBufferInBounds(EmitterState& state, const IndirectBufferAccess&
 	return in_bounds;
 }
 
-// The parts of IndirectBufferInBounds(formatted = false) that do not depend on the component
-// displacement. LoadIndirectBuffer computes them once per load instead of once per DWORD.
-struct IndirectRawBounds {
-	uint32_t stride_fits;
-	uint32_t stride_limit;
-	uint32_t records_fit;
-	uint32_t records_limit;
-	uint32_t mode_zero;
-	uint32_t mode_below_two;
-	uint32_t mode_two;
-	uint32_t records_nonzero;
-};
-
-IndirectRawBounds PrepareIndirectRawBounds(EmitterState& state, const IndirectBufferAccess& buffer,
-                                           uint32_t bytes) {
-	return {
-	    .stride_fits = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.stride, bytes),
-	    .stride_limit = Binary(state, spv::OpISub, TypeU32(state), buffer.stride, bytes),
-	    .records_fit =
-	        Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.raw_records, bytes),
-	    .records_limit = Binary(state, spv::OpISub, TypeU32(state), buffer.raw_records, bytes),
-	    .mode_zero =
-	        Binary(state, spv::OpIEqual, TypeBool(state), buffer.mode, ConstantU32(state, 0)),
-	    .mode_below_two =
-	        Binary(state, spv::OpULessThan, TypeBool(state), buffer.mode, ConstantU32(state, 2)),
-	    .mode_two = Binary(state, spv::OpIEqual, TypeBool(state), buffer.mode, ConstantU32(state, 2)),
-	    .records_nonzero =
-	        Binary(state, spv::OpINotEqual, TypeBool(state), buffer.records, ConstantU32(state, 0)),
-	};
-}
-
-// Same result as IndirectBufferInBounds(state, buffer, displacement, bytes, false).
-uint32_t IndirectRawInBounds(EmitterState& state, const IndirectBufferAccess& buffer,
-                             const IndirectRawBounds& bounds, uint32_t displacement) {
-	const auto offset = displacement == 0u ? buffer.offset : Binary(
-	    state, spv::OpIAdd, TypeU32(state), buffer.offset, ConstantU32(state, displacement));
-	const auto has_stride = AndCondition(
-	    state, bounds.stride_fits,
-	    Binary(state, spv::OpULessThanEqual, TypeBool(state), offset, bounds.stride_limit));
-	const auto has_records = AndCondition(
-	    state, bounds.records_fit,
-	    Binary(state, spv::OpULessThanEqual, TypeBool(state), offset, bounds.records_limit));
-	const auto structured =
-	    AndCondition(state, buffer.index_in_bounds,
-	                 Binary(state, spv::OpULessThan, TypeBool(state), offset, buffer.stride));
-	const auto raw = AndCondition(
-	    state, buffer.scalar_in_bounds,
-	    Select(state, TypeBool(state), buffer.swizzle,
-	           AndCondition(state, buffer.raw_index_in_bounds, has_stride), has_records));
-	const auto low = Select(state, TypeBool(state), bounds.mode_zero, structured,
-	                        buffer.index_in_bounds);
-	return Select(state, TypeBool(state), bounds.mode_below_two, low,
-	              Select(state, TypeBool(state), bounds.mode_two, bounds.records_nonzero, raw));
-}
-
 uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
                             uint32_t bits, uint32_t components, bool coherent) {
 	auto& state = ctx.state;
@@ -1111,7 +1056,6 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	                                  ConstantU32(state, 0));
 	const auto base         = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
 	                                 ConstantU64(state, ~uint64_t {3}));
-	const auto bounds = PrepareIndirectRawBounds(state, buffer, ConstantU32(state, bits / 8u));
 	std::array<uint32_t, 4> values {};
 	for (uint32_t component = 0; component < components; ++component) {
 		const auto address = component == 0u ? base
@@ -1119,7 +1063,8 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 		                                              ConstantU64(state, component * 4u));
 		values[component] = EmitValueOrZeroIfCondition(
 		    state, AndCondition(state, valid_format,
-		                        IndirectRawInBounds(state, buffer, bounds, component * 4u)),
+		                        IndirectBufferInBounds(state, buffer, component * 4u,
+		                                               ConstantU32(state, bits / 8u), false)),
 		    [&]() {
 			    const auto value = LoadBdaDword(ctx, address, coherent);
 			    if (bits == 32u) return value;
@@ -1353,7 +1298,6 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 uint32_t HelperFunctionControl(ValueEmitContext& ctx) {
 	auto&          state     = ctx.state;
 	const uint64_t threshold = HelperInlinePolicy::ThresholdWords();
-	if (threshold == 0u) return spv::FunctionControlMaskNone;
 	// Words each call site adds once the driver inlines the helper, measured on Yotei dumps
 	// (load_indirect_buffer_32x4 + 4 get_bda_pointer = 1434, 32x3 = 1134, 32x1 = 530,
 	// geometry + convert + get_bda_pointer = 8209 before this branch shrank them).
@@ -1373,8 +1317,9 @@ uint32_t HelperFunctionControl(ValueEmitContext& ctx) {
 	}
 	expansion *= state.lane_count;
 	const bool blacklisted = HelperInlinePolicy::GuestBlacklisted(state.program.shader_hash);
-	const bool dont_inline = expansion >= threshold && !blacklisted;
-	if (expansion >= threshold) {
+	const bool dont_inline = threshold != 0u && expansion >= threshold && !blacklisted;
+	// One line per translated module (cache hits do not re-run the emitter).
+	{
 		std::printf("HelperInline: shader %016" PRIx64 " helpers %s (estimated inlined expansion %" PRIu64
 		            " words, threshold %" PRIu64 "%s)\n",
 		            state.program.shader_hash, dont_inline ? "DontInline" : "inlined", expansion,
@@ -1445,18 +1390,15 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		                          static_cast<spv::FunctionControlMask>(state.helper_function_control), function_type);
 		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 		EmitLabel(state, state.builder.AllocateId());
-		const auto geometry = [&](uint32_t format) {
-			const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-			return state.builder.Constant(
-			    spv::OpConstantComposite, result_type, ConstantU32(state, info.byte_size),
-			    ConstantU32(state, std::max(1u, info.component_count)),
-			    ConstantU32(state, info.packed_bitfield ? 0u : info.component_bits[0] / 8u),
-			    ConstantU32(state, info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u));
-		};
-		// Formats with the same geometry share one case.
-		const auto result = EmitGroupedIndexSwitch(
-		    state, format, format_count, result_type,
-		    [&](uint32_t format) { return uint64_t {geometry(format)}; }, geometry);
+		const auto result = EmitIndexSwitch(
+		    state, format, format_count, result_type, [&](uint32_t format) {
+			    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
+			    return state.builder.Constant(
+			        spv::OpConstantComposite, result_type, ConstantU32(state, info.byte_size),
+			        ConstantU32(state, std::max(1u, info.component_count)),
+			        ConstantU32(state, info.packed_bitfield ? 0u : info.component_bits[0] / 8u),
+			        ConstantU32(state, info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u));
+		    });
 		state.builder.AddFunction(spv::OpReturnValue, result);
 		state.builder.AddFunction(spv::OpFunctionEnd);
 	}
@@ -1474,63 +1416,32 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, raw);
 	EmitLabel(state, state.builder.AllocateId());
-	// The selector test is the same for every format, so it is hoisted out of the format switch:
-	// selector >= 4 converts the raw memory value, otherwise the result is the format's ONE for
-	// selector 1 and 0 for anything else. Unknown formats give 0 either way. Identical cases are
-	// merged, which keeps this helper small at each of the call sites the driver inlines it into.
-	const auto known = [](uint32_t format) {
-		return Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format)).type !=
-		       Format::ComponentType::Unknown;
-	};
-	const auto memory_label   = state.builder.AllocateId();
-	const auto constant_label = state.builder.AllocateId();
-	const auto result_label   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpSelectionMerge, result_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional,
-	                          Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
-	                                 ConstantU32(state, 4)),
-	                          memory_label, constant_label);
-	EmitLabel(state, memory_label);
-	const auto converted = EmitGroupedIndexSwitch(
-	    state, format, format_count, TypeU32(state),
-	    [&](uint32_t format) { return known(format) ? uint64_t {format} + 1u : 0u; },
-	    [&](uint32_t format) {
-		    if (!known(format)) return ConstantU32(state, 0);
+	const auto result = EmitIndexSwitch(
+	    state, format, format_count, TypeU32(state), [&](uint32_t format) {
 		    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-		    const auto emit_component = [&](uint32_t component) {
-			    return LoadFormattedComponent(
-			        ctx, info, {FormattedSourceKind::Memory, component}, [&](uint32_t) { return raw; },
-			        [&](uint32_t, uint32_t bits) {
-				        return Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
-				                      ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
-			        });
-		    };
-		    if (!info.packed_bitfield) return emit_component(0u);
-		    return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
-		                           emit_component);
+		    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
+		    const auto constant = Select(
+		        state, TypeU32(state),
+		        Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)),
+		        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
+		    return EmitValueOrDefaultIfCondition(
+		        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
+		                      ConstantU32(state, 4)),
+		        TypeU32(state), constant, [&]() {
+			        const auto emit_component = [&](uint32_t component) {
+				        return LoadFormattedComponent(
+				            ctx, info, {FormattedSourceKind::Memory, component},
+				            [&](uint32_t) { return raw; },
+				            [&](uint32_t, uint32_t bits) {
+					            return Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
+					                          ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+				            });
+			        };
+			        if (!info.packed_bitfield) return emit_component(0u);
+			        return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
+			                               emit_component);
+		        });
 	    });
-	const auto memory_exit = state.current_label;
-	state.builder.AddFunction(spv::OpBranch, result_label);
-	EmitLabel(state, constant_label);
-	const auto one_value = [&](uint32_t format) {
-		if (!known(format)) return ConstantU32(state, 0);
-		return FormattedConstant(
-		    ctx, Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format)),
-		    FormattedSourceKind::One);
-	};
-	const auto one = EmitGroupedIndexSwitch(
-	    state, format, format_count, TypeU32(state),
-	    [&](uint32_t format) { return uint64_t {one_value(format)}; }, one_value);
-	const auto constant =
-	    Select(state, TypeU32(state),
-	           Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)), one,
-	           ConstantU32(state, 0));
-	const auto constant_exit = state.current_label;
-	state.builder.AddFunction(spv::OpBranch, result_label);
-	EmitLabel(state, result_label);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpPhi, TypeU32(state), result, converted, memory_exit, constant,
-	                          constant_exit);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }

@@ -7,7 +7,10 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -29,6 +32,8 @@ struct Slot {
 	std::atomic<uint64_t>    words {0};
 	std::atomic<int64_t>     start_ms {0};
 	std::atomic<const char*> what {nullptr};
+	std::atomic<int32_t>     dont_inline {-1}; // -1 = unknown (module not noted)
+	std::atomic<uint32_t>    dumped {0};
 };
 
 Slot g_slots[kSlots];
@@ -50,6 +55,8 @@ int64_t NowMs() {
 struct ModuleInfo {
 	uint64_t guest;
 	uint64_t words;
+	uint32_t dont_inline;
+	bool     dumped;
 };
 
 std::mutex& ModulesMutex() {
@@ -63,18 +70,52 @@ std::unordered_map<uint64_t, ModuleInfo>& Modules() {
 
 } // namespace
 
-void NoteModule(VkShaderModule module, uint64_t guest_hash, uint64_t words) {
+void NoteModule(VkShaderModule module, uint64_t guest_hash, std::span<const uint32_t> spirv) {
 	if (module == VK_NULL_HANDLE) return;
+	// OpFunction (opcode 54): word 3 is the function control; bit 1 = DontInline.
+	uint32_t functions = 0, dont_inline = 0;
+	for (size_t i = 5; i < spirv.size();) {
+		const uint32_t count = spirv[i] >> 16u;
+		if (count == 0u) break;
+		if ((spirv[i] & 0xffffu) == 54u && i + 3 < spirv.size()) {
+			functions++;
+			if ((spirv[i + 3] & 2u) != 0u) dont_inline++;
+		}
+		i += count;
+	}
+	if (functions > 1) {
+		std::printf("HelperInline: module guest=%016" PRIx64 " words=%zu functions=%u DontInline=%u\n",
+		            guest_hash, spirv.size(), functions, dont_inline);
+	}
+	static const bool dump = [] {
+		const char* v = std::getenv("KYTY_DUMP_INFLIGHT");
+		return v != nullptr && v[0] == '1';
+	}();
+	bool dumped = false;
+	if (dump) {
+		std::error_code ec;
+		std::filesystem::create_directories("_shaderdump", ec);
+		char name[96];
+		std::snprintf(name, sizeof(name), "_shaderdump/mod_%016" PRIx64 "_%zu.spv", guest_hash, spirv.size());
+		if (std::FILE* f = std::fopen(name, "wb"); f != nullptr) {
+			dumped = std::fwrite(spirv.data(), 4, spirv.size(), f) == spirv.size();
+			std::fclose(f);
+		}
+	}
 	std::lock_guard lock(ModulesMutex());
-	Modules()[reinterpret_cast<uint64_t>(module)] = {guest_hash, words};
+	Modules()[reinterpret_cast<uint64_t>(module)] = {guest_hash, spirv.size(), dont_inline, dumped};
 }
 
 Scope::Scope(const char* what, uint64_t key, VkShaderModule module, uint64_t guest_hash, uint64_t words) {
-	if (module != VK_NULL_HANDLE && (guest_hash == 0 || words == 0)) {
+	int32_t  dont_inline = -1;
+	uint32_t dumped      = 0;
+	if (module != VK_NULL_HANDLE) {
 		std::lock_guard lock(ModulesMutex());
 		if (const auto it = Modules().find(reinterpret_cast<uint64_t>(module)); it != Modules().end()) {
 			if (guest_hash == 0) guest_hash = it->second.guest;
 			if (words == 0) words = it->second.words;
+			dont_inline = static_cast<int32_t>(it->second.dont_inline);
+			dumped      = it->second.dumped ? 1u : 0u;
 		}
 	}
 	for (int i = 0; i < kSlots; i++) {
@@ -86,6 +127,8 @@ Scope::Scope(const char* what, uint64_t key, VkShaderModule module, uint64_t gue
 			g_slots[i].words.store(words);
 			g_slots[i].start_ms.store(NowMs());
 			g_slots[i].what.store(what);
+			g_slots[i].dont_inline.store(dont_inline);
+			g_slots[i].dumped.store(dumped);
 			g_slots[i].busy.store(1u, std::memory_order_release);
 			m_slot = i;
 			return;
@@ -110,9 +153,11 @@ int ReportAndBlacklist() {
 		const uint64_t guest = slot.guest.load();
 		const char*    what  = slot.what.load();
 		std::printf("compile in flight: thread %" PRIu64 "%s %s key=%016" PRIx64 " guest=%016" PRIx64
-		            " words=%" PRIu64 " for %" PRId64 " ms\n",
+		            " words=%" PRIu64 " DontInline functions=%d for %" PRId64 " ms%s\n",
 		            tid, tid == self ? " (faulting thread)" : "", what != nullptr ? what : "?",
-		            slot.key.load(), guest, slot.words.load(), now - slot.start_ms.load());
+		            slot.key.load(), guest, slot.words.load(), slot.dont_inline.load(),
+		            now - slot.start_ms.load(),
+		            slot.dumped.load() != 0u ? " (SPIR-V in _shaderdump/mod_<guest>_<words>.spv)" : "");
 		count++;
 		if (tid == self) self_open = true;
 		if (guest != 0) guests[nguests++] = guest;

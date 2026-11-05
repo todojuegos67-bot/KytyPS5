@@ -488,7 +488,7 @@ struct PipelineCache::ProgramCache {
 			            stage_name, options.shader_hash, spirv.size(), module_ms);
 		}
 		Prewarm::NoteSpirv(module, spirv, options.shader_hash);
-		CompileGuard::NoteModule(static_cast<VkShaderModule>(module), options.shader_hash, spirv.size());
+		CompileGuard::NoteModule(static_cast<VkShaderModule>(module), options.shader_hash, spirv);
 		const ShaderProgram handle {.id = ++next_shader_id, .module = module,
 		                            .spirv_words = static_cast<uint64_t>(spirv.size())};
 		spirv_modules.emplace(spirv_key, handle);
