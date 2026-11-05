@@ -102,6 +102,15 @@ inline uint64_t (*g_upload_done)() = nullptr;
 	}
 	Entry entry {token};
 	if (!Common::VirtualMemory::Protect(page, Page, Common::VirtualMemory::Mode::NoAccess, &entry.saved)) return false;
+	if (entry.saved == Common::VirtualMemory::Mode::NoAccess) {
+		// Mostly a view page whose protection was never recorded (issue #289, KYTY_WRITE_GUARD_UFFD): the lift leaves it
+		// no-access with no guard and no tracker holding it. (Also right after a lift to a tracker's no access.)
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("Write guard: page 0x%016llx armed with no access as its saved protection "
+			            "(issue #289 if it repeats)\n",
+			            static_cast<unsigned long long>(page));
+	}
 	g_pages.emplace(page, entry);
 	g_count.fetch_add(1, std::memory_order_release);
 	return true;
