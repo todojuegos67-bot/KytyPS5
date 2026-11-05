@@ -1016,6 +1016,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		}
 		g.size  = size;
 		g.first = true;
+		::BB::SR::NoteBackendReset("FSR 4 history images re-created (output size)");
 	}
 	if (g.render != desc.render) {
 		(void)graphics.device.waitIdle();

@@ -15,6 +15,10 @@
 
 namespace BB::SR {
 
+// bb-dcideas-094: a back end dropped its history on its own (context or history images
+// re-created, first frame after a model build); counted in the per-second [sr-hist] line.
+void NoteBackendReset(const char* why);
+
 enum class Kind : uint32_t { Off, Native, Dlss, Xess, Fsr3, Fsr4 };
 
 // The Demon's Souls ratios (output / render, per axis).
