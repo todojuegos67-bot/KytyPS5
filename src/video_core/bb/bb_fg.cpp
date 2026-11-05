@@ -188,7 +188,8 @@ Config ParseConfig() {
     // bb-dlssg-085: with no fps cap of the user's (BB_FPS_CAP=0) the shown frames are held under
     // the G-SYNC / VRR range, Reflex's own cap (the 18:44 DLSS-G x3 run showed 239-251 fps on a
     // 240 Hz G-SYNC monitor: above its range, 155 and 247 ms intervals). BB_FG_VRR_CAP=0: off.
-    if (c.kind != Kind::Off && !c.dynamic && Env("KYTY_VRR_CAP_FPS") == nullptr) {
+    if (c.kind != Kind::Off && c.kind != Kind::Amd && !c.dynamic &&
+        Env("KYTY_VRR_CAP_FPS") == nullptr) { // (bb-dlssgpace-089: AMD FG untouched)
         const char* off = std::getenv("BB_FG_VRR_CAP");
         const char* user = std::getenv("BB_FPS_CAP");
         if ((off == nullptr || *off != '0') && user != nullptr && std::strcmp(user, "0") == 0) {
@@ -651,6 +652,8 @@ double PaceInterval();
 bool Generating();
 void NoteSlept(double seconds);
 bool ReflexInGame();
+// bb-dlssgpace-089: a guest flip released by the pacer (the [dlssg-ft] line).
+void NoteGuestRelease(std::chrono::steady_clock::time_point at, double step_s);
 // The Reflex frame limit now in force (us; 0: none). Written where slReflexSetOptions is called.
 inline std::atomic<uint32_t> g_reflex_limit_us{0};
 }
@@ -723,6 +726,48 @@ double LongQuantile() {
     std::sort(sorted, sorted + n);
     const int idx = std::min(n - 1, static_cast<int>(std::ceil(q * n)) - 1);
     return sorted[std::max(idx, 0)] + 0.0005;
+}
+
+// bb-dlssgpace-089 (BB_DLSSG_PACE_HOLD=0: off, 0.85's step). The step above was the quantile of
+// the last 128 frames, recomputed on every flip: each slow frame entering or leaving the window
+// moved it by a fraction of a ms, so the real frames DLSS-G interpolates between were spaced
+// 0.2-1 ms apart from flip to flip, and every rise came one frame too late (a miss: re-phase, a
+// long gap, the "picos"). Now the step is held: it rises at once to the quantile rounded up to
+// 0.25 ms (plus one 0.25 ms of margin), and falls only after the quantile stayed 0.75 ms or more
+// under it for a whole second of flips, and then to the 0.25 ms above it. Real frames come out
+// on one fixed step for seconds at a time.
+bool HoldEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_DLSSG_PACE_HOLD");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+double g_held = 0.0; // seconds (0: none yet)
+int g_under = 0;     // flips in a row with the quantile well under the held step
+std::atomic<uint32_t> g_step_changes{0};
+
+double HeldStep(double quantile) {
+    if (!HoldEnabled() || quantile <= 0.0) return quantile;
+    constexpr double kQuant = 0.00025;
+    const double up = std::ceil(quantile / kQuant) * kQuant + kQuant;
+    if (g_held <= 0.0 || quantile > g_held) {
+        if (g_held != up) g_step_changes.fetch_add(1, std::memory_order_relaxed);
+        g_held = up;
+        g_under = 0;
+        return g_held;
+    }
+    if (quantile < g_held - 0.00075) {
+        if (++g_under >= std::max(static_cast<int>(1.0 / g_held), 30)) {
+            g_held = up;
+            g_under = 0;
+            g_step_changes.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        g_under = 0;
+    }
+    return g_held;
 }
 } // namespace Adapt
 
@@ -1013,7 +1058,7 @@ PresentSlot PaceGuestFlip() {
     } else if (cap > 0) {
         interval = std::max(interval, 1.0 / cap);
     } else if (generating && Adapt::Enabled()) {
-        const double target = Dlssg::Generating() ? Adapt::LongQuantile() : 0.0;
+        const double target = Dlssg::Generating() ? Adapt::HeldStep(Adapt::LongQuantile()) : 0.0;
         interval = std::max(interval, target > 0.0 ? target : Adapt::Mean());
     }
     Adapt::g_last = interval;
@@ -1102,6 +1147,7 @@ PresentSlot PaceGuestFlip() {
         next = now + step; // the first flip, or after a pause
     }
     exited = Clock::now();
+    if (Dlssg::Generating()) Dlssg::NoteGuestRelease(released, interval);
     if (cap > 0 && PresentOnArrival() && Amd::Generating()) {
         return {Pace::QpcAt(released), Pace::QpcTicks(interval)};
     }
@@ -1194,6 +1240,64 @@ uint32_t g_last_hl_w = 0, g_last_hl_h = 0, g_last_hl_fmt = 0, g_last_gi_w = 0, g
 bool g_last_hl_scaled = false;
 double g_stat_present_ms = 0, g_stat_present_max = 0;
 double g_pace_n = 0, g_pace_sum = 0, g_pace_sq = 0, g_pace_max = 0;
+
+// bb-dlssgpace-089: one line a second of DLSS-G frame times, "[dlssg-ft]": the real frames'
+// intervals at the present to Streamline and at the guest flip release (mean, sd, p99, max), the
+// shown intervals (est.: DLSS-G spaces its generated frames evenly inside each real interval, so a
+// shown interval is real / multiplier; the display's own clock is in [display] when it completes),
+// how many real intervals were over 1.5x the pacer step, and the step's changes.
+std::vector<double> g_ft_real; // ms, present to present of usable real frames
+std::mutex g_ft_mutex;
+std::vector<double> g_ft_guest; // ms, guest flip release to release
+std::chrono::steady_clock::time_point g_ft_prev_release{};
+double g_ft_step_ms = 0.0;
+
+struct FtStats {
+    double mean = 0, sd = 0, p99 = 0, max = 0;
+    size_t n = 0;
+};
+
+FtStats Ft(std::vector<double> v) {
+    FtStats r;
+    r.n = v.size();
+    if (v.empty()) return r;
+    std::sort(v.begin(), v.end());
+    double sum = 0, sq = 0;
+    for (double x : v) {
+        sum += x;
+        sq += x * x;
+    }
+    const double n = static_cast<double>(v.size());
+    r.mean = sum / n;
+    r.sd = std::sqrt(std::max(sq / n - r.mean * r.mean, 0.0));
+    r.p99 = v[std::min(v.size() - 1, static_cast<size_t>(std::ceil(0.99 * n)) - 1)];
+    r.max = v.back();
+    return r;
+}
+
+void FrameTimeLine(uint32_t multiplier) {
+    std::vector<double> guest;
+    double step_ms;
+    {
+        std::lock_guard lock{g_ft_mutex};
+        guest.swap(g_ft_guest);
+        step_ms = g_ft_step_ms;
+    }
+    std::vector<double> real;
+    real.swap(g_ft_real);
+    if (real.size() < 5 && guest.size() < 5) return;
+    const FtStats r = Ft(real), g = Ft(guest);
+    const double m = std::max<double>(multiplier, 1.0);
+    uint32_t spikes = 0;
+    for (double x : real) {
+        if (step_ms > 0.0 && x > 1.5 * step_ms) ++spikes;
+    }
+    Printf("[dlssg-ft] real (present) mean %.2f sd %.2f p99 %.2f max %.1f ms (%zu); real (guest "
+           "release) mean %.2f sd %.2f p99 %.2f max %.1f ms (%zu); shown est. x%u mean %.2f sd %.2f "
+           "p99 %.2f ms; pacer step %.2f ms (%u changes), real > 1.5 step: %u",
+           r.mean, r.sd, r.p99, r.max, r.n, g.mean, g.sd, g.p99, g.max, g.n, multiplier, r.mean / m,
+           r.sd / m, r.p99 / m, step_ms, Adapt::g_step_changes.exchange(0), spikes);
+}
 
 int PaceMode() { // KYTY_DLSSG_PACE=grid (our pacer, default) | reflex (Reflex's limit only)
     static const int mode = [] {
@@ -1521,6 +1625,16 @@ void NoteSlept(double seconds) {
     g_slept += seconds;
 }
 
+void NoteGuestRelease(std::chrono::steady_clock::time_point at, double step_s) {
+    std::lock_guard lock{g_ft_mutex};
+    if (g_ft_prev_release != std::chrono::steady_clock::time_point{}) {
+        const double ms = std::chrono::duration<double, std::milli>(at - g_ft_prev_release).count();
+        if (ms > 0.0 && ms < 100.0 && g_ft_guest.size() < 2000) g_ft_guest.push_back(ms);
+    }
+    g_ft_prev_release = at;
+    g_ft_step_ms = step_s * 1e3;
+}
+
 // Reflex's sleep at the guest frame boundary (the [pace] line: it runs after our wait, on the
 // thread that submits the flip, so it is part of the next frame's time).
 std::mutex g_rx_sleep_mutex;
@@ -1754,6 +1868,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                                   : std::chrono::duration<double>(now - prev).count();
             prev = now;
             if (usable && dt > 0.0 && dt < 0.1) {
+                g_ft_real.push_back(dt * 1e3);
                 g_pace_n += 1.0;
                 g_pace_sum += dt;
                 g_pace_sq += dt * dt;
@@ -1775,6 +1890,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                            : GuestPacing() ? "grid, guest flips" : "grid");
             }
             g_pace_n = g_pace_sum = g_pace_sq = g_pace_max = 0.0;
+            FrameTimeLine(g_mode_set == 1 ? PresentedFrames() : 1u);
             if (g_dynamic && g_mode_set == 1) {
                 const double real = g_stat_real / window;
                 const double freer = g_stat_real / std::max(window - g_slept, 0.05);

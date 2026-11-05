@@ -102,16 +102,6 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     if (!SDL_SetHint(SDL_HINT_APP_NAME, "shadPS4")) {
         UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
     }
-    // bb-dlssg-085: an exclusive fullscreen window is minimized by SDL when it loses focus (an
-    // overlay's toast, a recording notice): the swapchain goes to 0x0 and frame generation had to
-    // be rebuilt (the 18:39 AMD run never resumed). The window stays; BB_MINIMIZE_ON_FOCUS_LOSS=1
-    // restores SDL's behaviour.
-    {
-        const char* keep = std::getenv("BB_MINIMIZE_ON_FOCUS_LOSS");
-        if (keep == nullptr || *keep != '1') {
-            SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
-        }
-    }
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         UNREACHABLE_MSG("Failed to initialize SDL video subsystem: {}", SDL_GetError());
     }
