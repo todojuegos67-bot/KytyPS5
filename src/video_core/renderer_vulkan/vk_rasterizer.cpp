@@ -895,9 +895,54 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     }
 
     // Perform image copy
-    VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
-    VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
+    VideoCore::ImageId src_id = desc0.is_written ? image1_id : image0_id;
+    VideoCore::ImageId dst_id = desc0.is_written ? image0_id : image1_id;
+    // BB 0.83 native chain: the two images may be different versions (internal / output size) of
+    // scene targets; a plain copy then fills only the top-left 1706x960 of an output-size image
+    // and leaves the rest of it as it was (18:24 run: the top-left rectangle, and the game's
+    // history images keeping old frames outside it). Copy between images of one size.
+    {
+        auto& s0 = texture_cache.GetImage(src_id);
+        auto& d0 = texture_cache.GetImage(dst_id);
+        if (s0.info.size.width != d0.info.size.width ||
+            s0.info.size.height != d0.info.size.height) {
+            const u32 dw = d0.info.size.width, dh = d0.info.size.height;
+            const u32 sw = s0.info.size.width, sh = s0.info.size.height;
+            const char* how = "blit (scaled copy)";
+            if (const auto alt = texture_cache.BBVersionAt(src_id, dw, dh)) {
+                src_id = alt;
+                how = "source's other version";
+            } else if (const auto alt2 = texture_cache.BBVersionAt(dst_id, sw, sh)) {
+                dst_id = alt2;
+                how = "destination's other version";
+            } else if (runtime.BBBlitScaled(&texture_cache.GetImage(src_id),
+                                            &texture_cache.GetImage(dst_id))) {
+                auto& d1 = texture_cache.GetImage(dst_id);
+                BB::Upscale::TwinDone(d1.info.guest_address, d1.info.bb_scaled, true, false);
+                static u32 said = 0;
+                if (said++ < 4) {
+                    BB::Upscale::Checkpoint(fmt::format(
+                        "native chain: image copy {:#x} {}x{} -> {:#x} {}x{}: {}",
+                        s0.info.guest_address, sw, sh, d1.info.guest_address, dw, dh, how));
+                }
+                return true;
+            } else {
+                how = "NOT resolved (plain copy)";
+            }
+            static u32 said = 0;
+            if (said++ < 4) {
+                BB::Upscale::Checkpoint(fmt::format(
+                    "native chain: image copy {:#x} {}x{} -> {:#x} {}x{}: {}",
+                    texture_cache.GetImage(src_id).info.guest_address, sw, sh,
+                    texture_cache.GetImage(dst_id).info.guest_address, dw, dh, how));
+            }
+        }
+    }
+    VideoCore::Image& src_image = texture_cache.GetImage(src_id);
+    VideoCore::Image& dst_image = texture_cache.GetImage(dst_id);
     runtime.CopyColorAndDepth(&src_image, &dst_image);
+    // (the copy is a write of the destination: its other version is no longer current)
+    BB::Upscale::TwinDone(dst_image.info.guest_address, dst_image.info.bb_scaled, true, false);
     return true;
 }
 
@@ -960,6 +1005,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         .extent = image1.info.resources,
     };
     runtime.ClearImage(&image1, range, clear);
+    BB::Upscale::TwinDone(image1.info.guest_address, image1.info.bb_scaled, true, false);
     return true;
 }
 

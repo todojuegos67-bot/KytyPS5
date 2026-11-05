@@ -692,6 +692,23 @@ void TextureCache::BBNativeOff() {
     BB::Upscale::OnOffPurged(copied, freed);
 }
 
+ImageId TextureCache::BBVersionAt(ImageId image_id, u32 width, u32 height) {
+    const ImageInfo info = slot_images[image_id].info;
+    ImageId found{};
+    ForEachImageWithAddress(info.guest_address, [&](ImageId id, Image& other) {
+        if (id != image_id && other.info.guest_address == info.guest_address &&
+            other.info.size.width == width && other.info.size.height == height &&
+            other.info.pixel_format == info.pixel_format && other.info.num_samples == 1) {
+            found = id;
+        }
+    });
+    if (found) {
+        UpdateImage(found);
+        BBTwinSync(found, false);
+    }
+    return found;
+}
+
 void TextureCache::BBTwinSync(ImageId image_id, bool write) {
     Image& image = slot_images[image_id];
     const ImageInfo& info = image.info;

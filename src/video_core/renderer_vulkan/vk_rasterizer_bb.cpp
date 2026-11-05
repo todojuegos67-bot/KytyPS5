@@ -10,6 +10,7 @@
 #include <limits>
 #include <string>
 #include <tuple>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <span>
@@ -3024,6 +3025,33 @@ bool DumpActive() {
         g_dump.frame = (v != nullptr && *v != '\0') ? std::max<s64>(0, std::atoll(v)) : -1;
         const char* d = std::getenv("BB_DUMP_DIR");
         g_dump.dir = (d != nullptr && *d != '\0') ? d : "bb_dump";
+        // 0.83: the launcher cannot pass variables: a trigger file bb_dump_frame.txt in the
+        // working folder (or C:\EMULADOR PS4) holds the frame number (600 when empty); it is
+        // renamed to bb_dump_frame.used.txt so the next run does not dump again.
+        if (g_dump.frame < 0) {
+            std::error_code ec;
+            for (const std::filesystem::path dir :
+                 {std::filesystem::current_path(ec), std::filesystem::path("C:/EMULADOR PS4")}) {
+                const auto trigger = dir / "bb_dump_frame.txt";
+                if (dir.empty() || !std::filesystem::exists(trigger, ec)) continue;
+                s64 n = 600;
+                if (FILE* fp = std::fopen(trigger.string().c_str(), "rb")) {
+                    char buf[32] = {};
+                    const size_t got = std::fread(buf, 1, sizeof(buf) - 1, fp);
+                    std::fclose(fp);
+                    buf[got] = 0;
+                    const long long parsed = std::atoll(buf);
+                    if (parsed > 0) n = parsed;
+                }
+                g_dump.frame = n;
+                if (d == nullptr || *d == '\0') g_dump.dir = (dir / "bb_dump").string();
+                std::filesystem::rename(trigger, dir / "bb_dump_frame.used.txt", ec);
+                BB::Upscale::Checkpoint(fmt::format("BB_DUMP_FRAME: trigger file {} -> frame {}{}",
+                                                    trigger.string(), n,
+                                                    ec ? " (could not rename it)" : ""));
+                break;
+            }
+        }
         if (g_dump.frame >= 0) {
             std::error_code ec;
             std::filesystem::create_directories(g_dump.dir, ec);

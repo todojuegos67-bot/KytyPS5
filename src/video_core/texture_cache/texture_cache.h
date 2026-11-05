@@ -128,6 +128,9 @@ public:
     /// BB 0.76: once the native chain turned off, every scene target address back to one
     /// output-size image (its current content copied up, the internal-size image freed).
     void BBNativeOff();
+    /// BB 0.83: the image at the same address as image_id with the given size (the other version
+    /// of a scene target), made current; null when there is none.
+    ImageId BBVersionAt(ImageId image_id, u32 width, u32 height);
 
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);

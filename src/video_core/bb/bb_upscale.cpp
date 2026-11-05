@@ -947,6 +947,13 @@ std::atomic<u32> g_ss_twin_copies{0}, g_ss_twin_fail{0}, g_ss_post_scaled{0}, g_
 std::atomic<u32> g_ss_frame{1}, g_ss_stale_reads{0};
 std::array<std::array<std::atomic<u32>, 2>, 64> g_ss_age{};
 std::atomic<bool> g_ss_purge{false};
+// 0.83: per address: stale output-size reads (count, by a dispatch / draw), the frame of its first
+// use and whether that first use was a read (a history image: read before it is written in the
+// frame), and the pin: a history address keeps one size (the output size) in every pass, so the
+// game's history is never resampled between sizes (BB_NATIVE_HISTORY=copy: 0.80 behaviour).
+std::array<std::atomic<u32>, 64> g_ss_stale_by{}, g_ss_seen{}, g_ss_hist{};
+std::array<std::atomic<bool>, 64> g_ss_pinned{};
+std::array<std::atomic<u8>, 64> g_ss_stale_kind{};
 // 0.80: compute pipelines of the scene passes run at the internal size (their grid scaled, the
 // game's size constants patched) once they were seen touching a scene target; g_ss_compute_scaled
 // for the dispatch being bound, g_ss_compute_touched: it looked up a scene target.
@@ -1031,6 +1038,9 @@ bool ScaleImage(VAddr addr, u32& w, u32& h) {
     if (idx < 0) {
         return false;
     }
+    if (NativePerPass() && g_ss_pinned[idx].load(std::memory_order_relaxed)) {
+        return false; // 0.83: a history address, one size (output) everywhere
+    }
     if (NativePerPass()) {
         const int phase = g_ss_phase.load(std::memory_order_relaxed);
         const bool compute = g_ss_compute.load(std::memory_order_relaxed);
@@ -1064,8 +1074,38 @@ bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write, bool depth) {
     if (idx < 0) {
         return false;
     }
+    if (g_ss_pinned[idx].load(std::memory_order_relaxed) && !scaled) {
+        // A pinned history address: its output-size image is the only one in use. One last copy
+        // if the internal-size image still holds the current content.
+        const u8 v = g_ss_valid[idx].load(std::memory_order_relaxed);
+        if ((v & 2) == 0 && (v & 1) != 0) return true;
+        g_ss_valid[idx].store(2, std::memory_order_relaxed);
+        return false;
+    }
     const u8 mine = scaled ? 1 : 2, other = scaled ? 2 : 1;
     const u8 valid = g_ss_valid[idx].load(std::memory_order_relaxed);
+    {
+        // 0.83 history detection: the first use of the address in this frame is a read.
+        static const bool history_copy = [] {
+            const char* v = std::getenv("BB_NATIVE_HISTORY");
+            return v != nullptr && std::string_view{v} == "copy";
+        }();
+        const u32 frame = g_ss_frame.load(std::memory_order_relaxed);
+        if (g_ss_seen[idx].exchange(frame, std::memory_order_relaxed) != frame && !write &&
+            g_ss_phase.load(std::memory_order_relaxed) != 2 && !history_copy &&
+            !g_ss_pinned[idx].load(std::memory_order_relaxed) &&
+            addr != g_ss_depth.load(std::memory_order_relaxed) &&
+            addr != g_ss_source.load(std::memory_order_relaxed) &&
+            g_ss_hist[idx].fetch_add(1, std::memory_order_relaxed) + 1 == 3) {
+            g_ss_pinned[idx].store(true, std::memory_order_relaxed);
+            Checkpoint(fmt::format(
+                "native chain: {:#x} is a history image (read before it is written in 3 frames, "
+                "first by a {}): kept at the output size {}x{} in every pass from now on "
+                "(BB_NATIVE_HISTORY=copy: resampled per pass as 0.80)",
+                addr, g_ss_compute.load(std::memory_order_relaxed) ? "dispatch" : "draw", g_ss_w,
+                g_ss_h));
+        }
+    }
     // 0.76: every use of a version that is not current copies the current one first, scene-pass
     // writes included. 0.73 skipped the copy for a scene-pass target ("the scene rebuilds it"),
     // but a target bound by the scene passes is often only blended onto: after a compute dispatch
@@ -1078,6 +1118,14 @@ bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write, bool depth) {
         const u32 age = g_ss_age[idx][scaled ? 0 : 1].load(std::memory_order_relaxed);
         if (age + 1 < g_ss_frame.load(std::memory_order_relaxed)) {
             g_ss_stale_reads.fetch_add(1, std::memory_order_relaxed);
+            if (g_ss_stale_by[idx].fetch_add(1, std::memory_order_relaxed) == 0) {
+                Checkpoint(fmt::format(
+                    "native chain: stale read of {:#x} ({} image, content from frame {}, now {}) by "
+                    "a {} after the upscaler",
+                    addr, scaled ? "internal-size" : "output-size", age,
+                    g_ss_frame.load(std::memory_order_relaxed),
+                    g_ss_compute.load(std::memory_order_relaxed) ? "dispatch" : "draw"));
+            }
         }
     }
     if (!copy) {
@@ -1220,7 +1268,17 @@ void AddSceneTarget(VAddr addr) {
         return;
     }
     for (u32 i = 0; i < n; ++i) {
-        if (g_ss_addrs[i] == addr) return;
+        if (g_ss_addrs[i] == addr) {
+            // 0.83: a pinned history image drawn together with internal-size targets: it must be
+            // the same size as them, so it goes back to the per-pass versions for good.
+            if (g_ss_pinned[i].exchange(false, std::memory_order_relaxed)) {
+                g_ss_hist[i].store(1u << 30, std::memory_order_relaxed);
+                Checkpoint(fmt::format("native chain: history image {:#x} drawn with internal-size "
+                                       "targets: back to per-pass sizes",
+                                       addr));
+            }
+            return;
+        }
     }
     bool after_upscale = false, flip = false;
     {
@@ -2876,7 +2934,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                     "possible): {}; 0.76: twin copies {:.1f} per frame, stale twins read {} "
                     "(content older than the last frame), source samples refused: before-HUD "
                     "mode {}, learned skip {}, inactive {}, failed {}, size {}, target {}; 0.80 content: "
-                    "{} samples, {} below 20 dB, last PSNR {:.1f} dB",
+                    "{} samples, {} below 20 dB, last PSNR {:.1f} dB; 0.83 stale by address:{}; history "
+                    "images kept at the output size: {}",
                     nc_reach, nc_scene, nc_frames, nc_redirect, nc_scaled,
                     g_ss_twin_copies.load(std::memory_order_relaxed),
                     g_ss_twin_fail.load(std::memory_order_relaxed), bad ? "FAILED" : "ok",
@@ -2886,7 +2945,20 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                     g_ss_refuse[RfPresent].exchange(0), g_ss_refuse[RfSkip].exchange(0),
                     g_ss_refuse[RfInactive].exchange(0), g_ss_refuse[RfFailed].exchange(0),
                     g_ss_refuse[RfSize].exchange(0), g_ss_refuse[RfTarget].exchange(0), pn, plow,
-                    g_ss_psnr_last.load(std::memory_order_relaxed) / 100.0));
+                    g_ss_psnr_last.load(std::memory_order_relaxed) / 100.0, [] {
+                        std::string list;
+                        const u32 n = g_ss_count.load(std::memory_order_relaxed);
+                        for (u32 i = 0; i < n; ++i) {
+                            const u32 c = g_ss_stale_by[i].exchange(0, std::memory_order_relaxed);
+                            if (c != 0) list += fmt::format(" {:#x} x{}", g_ss_addrs[i], c);
+                        }
+                        return list.empty() ? std::string(" none") : list;
+                    }(), [] {
+                        u32 k = 0;
+                        const u32 n = g_ss_count.load(std::memory_order_relaxed);
+                        for (u32 i = 0; i < n; ++i) k += g_ss_pinned[i].load() ? 1 : 0;
+                        return k;
+                    }()));
             }
             if (bad) {
                 TurnOff();
