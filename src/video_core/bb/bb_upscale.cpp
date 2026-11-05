@@ -421,6 +421,8 @@ struct FrameState {
     bool injected = false, inject_failed = false, redirecting = false, hudless = false;
     u32 native_post = 0;      // 0.73: the upscaler ended the scene passes (native chain)
     u32 native_redirects = 0; // later samples of the source given the upscaled output
+    int miss = -1;            // 0.84: the last reason a qualifying sample was refused (Refuse)
+    bool good_src_drawn = false; // 0.84: the kept in-place source was drawn this frame
     bool present = false; // upscaled to the window size this frame
     std::vector<Candidate> camera;
 };
@@ -964,6 +966,14 @@ std::atomic<u32> g_ss_psnr_n{0}, g_ss_psnr_low{0};
 // 0.76: why a qualifying sample of the upscaler's source was not the injection point.
 enum Refuse : u32 { RfPresent, RfHold, RfSkip, RfInactive, RfFailed, RfSize, RfTarget, RfCount };
 std::array<std::atomic<u32>, RfCount> g_ss_refuse{};
+// 0.84 in-place stability: the source and sample index of the last in-place upscale are kept
+// (a frame whose scene-colour guess or sample count differs does not move the point), the frame
+// it last worked, and per-reason counts of the 3D frames that missed it.
+VAddr g_good_src = 0;
+u32 g_good_index = 0;
+u64 g_good_frame = 0, g_good_src_seen = 0;
+std::array<u32, RfCount + 2> g_miss_counts{};
+u32 g_miss_kept = 0;
 std::atomic<u32> g_ss_count{0};
 u32 g_ss_w = 0, g_ss_h = 0, g_ss_sw = 0, g_ss_sh = 0;
 std::vector<VAddr> g_ss_candidates;
@@ -2026,6 +2036,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
         if (mrt <= 2 && colors.size() > 0 && IsHdr(colors[0].format) &&
             colors[0].width == depth->width && colors[0].height == depth->height) {
             f.scene_color = colors[0].addr;
+            if (colors[0].addr == g_good_src) f.good_src_drawn = true;
         }
     }
     // Writes to the injection source.
@@ -2247,6 +2258,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     const bool chain_live = NativePerPass() && g_ss_frozen.load(std::memory_order_relaxed) &&
                             !g_ss_off.load(std::memory_order_relaxed);
     const auto refuse = [&](Refuse why) {
+        f.miss = static_cast<int>(why);
         if (chain_live) {
             g_ss_refuse[why].fetch_add(1, std::memory_order_relaxed);
             if (why != RfSkip && g_ss_phase.load(std::memory_order_relaxed) == 1) {
@@ -2264,7 +2276,12 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     if (g_native_hold > 0 && NativeFallback() && !chain_live) {
         return Sample::Keep; // 0.48: native fallback hold (window-size path at the same size)
     }
-    if (index < g_learned.skip) {
+    // 0.84: once the in-place point worked, its sample index is kept (the learned skip is the
+    // largest over 240 frames, so frames with fewer samples of the source missed it and fell back
+    // to the present-time path: the 19:07 run switched between the two paths every few frames).
+    const u32 need = (g_good_src != 0 && addr == g_good_src) ? std::min(g_learned.skip, g_good_index)
+                                                            : g_learned.skip;
+    if (index < need) {
         return refuse(RfSkip);
     }
     if (!Active() || f.inject_failed) {
@@ -2293,7 +2310,9 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     p.output_w = scene ? width : chain_point ? g_ss_w : g_draw.colors[0].width;
     p.output_h = scene ? height : chain_point ? g_ss_h : g_draw.colors[0].height;
     p.hdr = IsHdr(format);
-    p.reset = !g_learned.last_injected;
+    // 0.84: the history is reset only when the in-place point has not run for 30 frames (or the
+    // last upscale was the present-time path's post-processed image), not after one missed frame.
+    p.reset = g_good_frame == 0 || g_frame_no > g_good_frame + 30;
     if (NativeFallbackOn() && g_last_window_path) {
         p.reset = true; // (the history was the window-size path's post-processed image)
     }
@@ -2730,6 +2749,11 @@ void OnInjected(bool ok, float) {
         g_frame.injected = true;
         g_frame.redirecting = true;
         g_draw.sampled_upscaled = true;
+        // 0.84: the in-place decision that worked, kept for the next frames.
+        g_good_src = g_plan.color_addr;
+        g_good_index = g_frame.qual_samples > 0 ? g_frame.qual_samples - 1 : 0;
+        g_good_frame = g_frame_no;
+        g_good_src_seen = g_frame_no;
         // 0.73: the scene passes end here; post-processing gets the output-size versions.
         g_ss_source.store(g_plan.color_addr, std::memory_order_relaxed);
         if (g_ss_phase.load(std::memory_order_relaxed) == 1) {
@@ -3058,6 +3082,19 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_learned.render_w = f.gb_w;
         g_learned.render_h = f.gb_h;
         g_learned.scene_color = f.scene_color;
+        // 0.84: the source the in-place point last worked with stays the source while the scene
+        // still draws it (seen in the last 120 frames), whatever target this frame drew last.
+        if (g_good_src != 0) {
+            if (f.good_src_drawn) g_good_src_seen = g_frame_no;
+            if (g_frame_no <= g_good_src_seen + 120) {
+                g_learned.scene_color = g_good_src;
+            } else {
+                Checkpoint(fmt::format("[3d] in-place source {:#x} not drawn for 120 frames: "
+                                       "learning the source again",
+                                       g_good_src));
+                g_good_src = 0;
+            }
+        }
         if (f.comp_src != 0) g_learned.comp_src = f.comp_src;
         if (src_before == LearnedSource()) {
             // The largest over the last 240 frames: a frame with one more write than usual must
@@ -3101,7 +3138,42 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // The scene was drawn but no HUD point was found (no HUD this frame, e.g. a cut scene): the
     // presenter upscales the finished image instead (TakeLateUpscale).
     g_late_upscale = false;
-    if (WindowPathOk() && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
+    // 0.84: a 3D frame that missed the in-place point while it works (it ran in the last 120
+    // frames) is not sent to the present-time path: switching the upscaler's input between the
+    // HDR scene colour and the post-processed image reset its history every switch (19:07 run:
+    // the background blurred and cleared in pulses). The frame keeps the game's own image.
+    const bool keep_inplace =
+        !PresentMode() && g_good_frame != 0 && g_frame_no <= g_good_frame + 120;
+    {
+        static u32 n_frames = 0;
+        ++n_frames;
+        if (f.gb_depth != 0 && f.scene_draws > 0 && !f.injected) {
+            const u32 why = f.miss >= 0                 ? static_cast<u32>(f.miss)
+                            : f.qual_samples == 0      ? u32(RfCount)
+                                                       : u32(RfCount + 1);
+            ++g_miss_counts[why];
+            if (keep_inplace) ++g_miss_kept;
+        }
+        if (n_frames >= 60) {
+            u32 total = 0;
+            for (const u32 c : g_miss_counts) total += c;
+            if (total > 0) {
+                Checkpoint(fmt::format(
+                    "[3d] in-place misses, last {} flips: {} (before-HUD mode {}, waiting for a "
+                    "later sample {}, inactive {}, failed {}, size {}, target {}, source not "
+                    "sampled {}, other {}); {} kept on the in-place decision (no present-time "
+                    "switch, history kept); in-place source {:#x} index {}",
+                    n_frames, total, g_miss_counts[RfPresent], g_miss_counts[RfSkip],
+                    g_miss_counts[RfInactive], g_miss_counts[RfFailed], g_miss_counts[RfSize],
+                    g_miss_counts[RfTarget], g_miss_counts[RfCount], g_miss_counts[RfCount + 1],
+                    g_miss_kept, g_good_src, g_good_index));
+            }
+            g_miss_counts = {};
+            g_miss_kept = 0;
+            n_frames = 0;
+        }
+    }
+    if (WindowPathOk() && !keep_inplace && !f.injected && !f.inject_failed && f.gb_depth != 0 &&
         f.gb_w == width && f.gb_h == height && f.scene_draws > 0 &&
         LateSamplesOk(f.qual_samples)) {
         g_learned.last_injected = prev_injected;
