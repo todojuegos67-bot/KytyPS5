@@ -123,6 +123,9 @@ uint32_t GuestFlip();
 // flip submit (simulation end, render submit start), with KYTY_DLSSG_REFLEX_GAME (default on).
 void GameInput();
 void GameFlipReserved();
+// 0.71: the game submits GPU work (gnmdriver): the first submit after its controller read marks
+// SIMULATION_END / RENDERSUBMIT_START (the flip only when no submit came first).
+void GameRenderSubmit();
 // Before BeforePresent: the guest frame index of the frame presented (0: a repeat or none).
 void SetPresentIndex(uint32_t index);
 // The game's flip submit (VideoOut): holds the real frames to the frame generation limit there

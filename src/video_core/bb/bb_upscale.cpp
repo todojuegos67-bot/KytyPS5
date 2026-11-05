@@ -1886,10 +1886,17 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     p.jitter[0] = jitter_on ? g_jitter[0] : 0.0f;
     p.jitter[1] = jitter_on ? g_jitter[1] : 0.0f;
     LogRtShadowCamera(p);
+    const bool chain = !scene && g_ss_frozen.load(std::memory_order_relaxed) &&
+                       !g_ss_off.load(std::memory_order_relaxed) && width == g_ss_sw &&
+                       height == g_ss_sh;
     LogPoint(fmt::format(
         "injection point: {} mode, source {:#x} {}x{} {} ({}), depth {:#x}, output {}x{}, "
         "after {} earlier sample(s) of it, motion vectors {}, depth {}",
-        scene ? "scene (pre-post HDR)" : "composite (post-tonemap)", addr, width, height,
+        scene   ? "scene (pre-post HDR)"
+        : chain ? "native chain (scene targets at the internal size, upscaled where "
+                  "post-processing first reads the scene colour)"
+                : "composite (post-tonemap)",
+        addr, width, height,
         vk::to_string(format), p.hdr ? "HDR" : "LDR", p.depth_addr, p.output_w, p.output_h,
         g_learned.skip, p.camera_valid ? "reconstructed (camera found)" : "zero (no camera)",
         p.depth_inverted ? "inverted" : "forward"));
@@ -2404,10 +2411,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             }
             g_ss_count.store(count, std::memory_order_release);
             g_ss_frozen.store(true, std::memory_order_release);
-            Checkpoint(fmt::format("scene upscale (BB_SCENE_UPSCALE=1): {} scene targets of {}x{} "
+            Checkpoint(fmt::format("scene upscale (BB_SCENE_UPSCALE={}): {} scene targets of {}x{} "
                                    "rendered at {}x{} (ratio {:.3f}), post-processing and HUD at "
                                    "{}x{}:{}",
-                                   count, g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, ratio, width,
+                                   BB::ResPatch::NativeChain() ? "native" : "shrink", count,
+                                   g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, ratio, width,
                                    height, list));
         }
         if (!g_ss_frozen.load(std::memory_order_relaxed) && f.gb_depth != 0 &&

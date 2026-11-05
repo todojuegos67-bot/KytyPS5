@@ -41,6 +41,11 @@ void                   AfterPresent(uint64_t frame_index);
 
 // The game reads its controller (scePadRead / scePadReadState): once per flip, the frame's INPUT mark (or the limiter).
 void OnInput(const char* site = "scePadRead");
+// 0.71: the game submits GPU work (sceGnmSubmitCommandBuffers / SubmitAndFlip): the first submit
+// after a frame's controller read ends its simulation and starts its render submission (Reflex
+// SIMULATION_END + RENDERSUBMIT_START there instead of at the flip; the flip then only closes
+// it), stamped for the [reflex] game loop line.
+void OnRenderSubmit();
 // A guest flip reserved: the frame's index (0: none).
 [[nodiscard]] uint64_t OnFlipReserved();
 // The flip's GPU work done (FlipQueue::Complete) / the flip released to the presenter (FlipQueue::Flip): stage stamps
@@ -52,6 +57,11 @@ void OnFlipReleased(uint64_t frame_index);
 // Before OnFlipReleased: the configured release interval of that frame (the cap: KYTY_FLIP_FPS / the vblank floor, ms)
 // when it is a game-view frame under a cap, else 0 (movie, menu, cinematic, loading, no cap: the pacing is off).
 void SetPaceCap(double cap_ms, double vblank_ms);
+// 0.71 NVIDIA Reflex (VK_NV_low_latency2): every flip, the game's own flip interval (its flip rate x
+// the vblank, ms; 0 = uncapped / not a game-view frame) becomes Reflex's minimum interval, so the
+// driver's sleep at the controller read paces the game to its real cadence instead of the frames
+// queueing behind the flip limit. KYTY_REFLEX_GAME_LIMIT=0 (BB_REFLEX_GAME_LIMIT=0): no limit, as before.
+void SetGameInterval(double interval_ms);
 // Right before the frame's present (a new frame, not a repeat): its PRESENT mark.
 void OnPresent(uint64_t frame_index);
 

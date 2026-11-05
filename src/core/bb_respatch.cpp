@@ -118,7 +118,12 @@ u32 ReadImm(uintptr_t base, u32 addr, u8 opcode) {
 } // namespace
 
 bool ShrinkWanted() {
-    return Mode() == "shrink";
+    const std::string mode = Mode();
+    return mode == "shrink" || NativeChain();
+}
+
+bool NativeChain() {
+    return Mode() == "native";
 }
 
 bool Active(u32* scene_w, u32* scene_h, u32* out_w, u32* out_h) {
@@ -131,6 +136,14 @@ bool Active(u32* scene_w, u32* scene_h, u32* out_w, u32* out_h) {
 
 void OnEbootLoaded(uintptr_t base, u64 image_size) {
     const std::string mode = Mode();
+    if (mode == "native") {
+        BB::Upscale::Checkpoint(
+            "native render chain (BB_SCENE_UPSCALE=native): the game keeps its own output size "
+            "(the launcher's resolution patch at the window size); only its 3D scene targets are "
+            "rendered at the upscaler's internal size, and the upscaler runs where post-processing "
+            "first reads the scene colour, into an image at the output size");
+        return;
+    }
     if (mode.empty() || mode[0] != '1') {
         return;
     }

@@ -244,6 +244,11 @@ void VideoOutDriver::Flip(const Request& req) {
     BB::AntiLag::OnPresent(lat_index);
     presenter->Present(req.frame);
     BB::AntiLag::AfterPresent(lat_index);
+    if (BB::AntiLag::ReflexActive() && req.frame != nullptr) {
+        const int vblanks = req.port->flip_rate + 1;
+        BB::AntiLag::SetGameInterval(
+            vblanks > 1 ? 1000.0 / EmulatorSettings.GetVblankFrequency() * vblanks : 0.0);
+    }
     if (BB::AntiLag::PaceOn() || BB::AntiLag::PhaseOn() || BB::AntiLag::PadLateOn()) {
         // KYTY_LOWLAT pacing / Anti-Lag+ pad late (the DS videoOut rule): the game's own flip
         // interval (flip rate + 1 vblanks) when it is above one vblank, else 0 (the pacing off).

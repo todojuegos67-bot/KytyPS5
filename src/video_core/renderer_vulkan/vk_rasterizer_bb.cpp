@@ -2802,11 +2802,14 @@ void Rasterizer::BBOnDraw(u32 num_cb, u64 vs_hash, u64 ps_hash) {
     }
     const auto& vp = regs.viewports[0];
     const auto& vp_ctl = regs.viewport_control;
+    // 0.71: in host pixels of the bound targets (a scene target rendered at the internal size has
+    // the guest viewport scaled by bb_rt_scale), so the camera vectors unproject the depth the
+    // scene was really drawn at.
     BB::Upscale::Viewport viewport{
-        .xscale = vp_ctl.xscale_enable ? vp.xscale : 1.0f,
-        .xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.0f,
-        .yscale = vp_ctl.yscale_enable ? vp.yscale : 1.0f,
-        .yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.0f,
+        .xscale = (vp_ctl.xscale_enable ? vp.xscale : 1.0f) * bb_rt_scale_x,
+        .xoffset = (vp_ctl.xoffset_enable ? vp.xoffset : 0.0f) * bb_rt_scale_x,
+        .yscale = (vp_ctl.yscale_enable ? vp.yscale : 1.0f) * bb_rt_scale_y,
+        .yoffset = (vp_ctl.yoffset_enable ? vp.yoffset : 0.0f) * bb_rt_scale_y,
         .zscale = vp_ctl.zscale_enable ? vp.zscale : 1.0f,
         .zoffset = vp_ctl.zoffset_enable ? vp.zoffset : 0.0f,
     };

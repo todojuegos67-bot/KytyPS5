@@ -22,6 +22,8 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/bb/bb_antilag.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern Frontend::WindowSDL* g_window;
@@ -2375,6 +2377,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+    BB::AntiLag::OnRenderSubmit();
+    BB::FG::GameRenderSubmit();
 
     if (count != 0) {
         if (!dcb_gpu_addrs) {
@@ -2454,6 +2458,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         }
     }
 
+    BB::AntiLag::OnRenderSubmit();
+    BB::FG::GameRenderSubmit();
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
 

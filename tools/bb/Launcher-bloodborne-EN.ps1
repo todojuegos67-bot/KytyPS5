@@ -34,7 +34,7 @@ $script:defaults = [ordered]@{
 	game = ''; emu = ''; userdir = ''
 	winres = 'auto'; intres = '1920x1080'; fsmode = '1'; present = '1'; fps = '1'; patches = '1'; useupdate = '1'
 	hdr = '0'; showfps = '0'; metricas = '0'
-	upscaler = '0'; upmode = '1'; sharp = '75'; framegen = '0'; sceneup = '0'; bbfg = '0'; antilag = '0'; reflex = '1'
+	upscaler = '0'; upmode = '1'; sharp = '75'; framegen = '0'; sceneup = '1'; bbfg = '0'; antilag = '0'; reflex = '1'
 	tex = '1'; q_shadows = '0'; q_ao = '0'; q_fog = '0'; q_aniso = '0'; q_ca = '0'; q_blur = '0'; q_grain = '0'
 	input = '0'; motion = '0'; bginput = '0'
 	ram16 = '0'; experimental = '0'; modo = '4'; safemode = '1'; soundfix = '1'
@@ -519,7 +519,7 @@ function Write-SharpLive { try { [IO.File]::WriteAllText($script:sharpFile, "BB_
 function Get-FgEnv {
 	$e = [ordered]@{}
 	$fg = Get-FgKey; $e['BB_FG'] = $fg
-	$e['BB_SCENE_UPSCALE'] = $(if (Get-SceneUp) { '1' } else { '0' })  # (bb-fg-022) aqui: el arranque del emulador de reescalado solo pasa Get-FgEnv
+	$e['BB_SCENE_UPSCALE'] = $(if (Get-SceneUp) { 'native' } else { '0' })  # (bb-native-071) el reescalador dentro de la cadena de render del juego  # (bb-fg-022) aqui: el arranque del emulador de reescalado solo pasa Get-FgEnv
 	$dl = ($fg -like 'dlss*')
 	$al = 0; [void][int]::TryParse("$($script:S.antilag)", [ref]$al); $rx = 0; [void][int]::TryParse("$($script:S.reflex)", [ref]$rx)
 	$e['BB_ANTILAG'] = $(if (-not $dl -and $al -gt 0) { '1' } else { '0' })
@@ -660,7 +660,7 @@ function Start-Game {
 			$env:BB_UPSCALE_MODE = $(if ($upE.Count -gt 3) { $upE[3] } else { 'quality' })
 			$env:BB_UPSCALE_SHARPNESS = ([double]$script:S.sharp / 100).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
 			$upRes = Get-UpRes $env:BB_UPSCALE_MODE
-			if (Get-SceneUp) { $upRes = $outRes; Write-Log "Reescalado de escena (BB_SCENE_UPSCALE=1): el juego a la resolucion de salida $outRes" }  # (bb-fg-022) intres = winres
+			if (Get-SceneUp) { $upRes = $outRes; Write-Log "Reescalado de escena (BB_SCENE_UPSCALE=native): el juego a la resolucion de salida $outRes, la escena 3D a la interna" }  # (bb-fg-022) intres = winres
 			Set-ResolutionPatch $userDir $upRes
 			Write-Log "Reescalado: $upKey $($env:BB_UPSCALE_MODE) con $upExe (interna $upRes)"
 		}

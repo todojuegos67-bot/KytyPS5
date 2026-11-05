@@ -1336,6 +1336,7 @@ bool ReflexInGame() {
 }
 
 std::atomic<uint32_t> g_rxg_sim{0};
+std::atomic<uint32_t> g_rxg_render{0}; // 0.71: the index whose SIMULATION_END / RENDERSUBMIT_START was set
 std::mutex g_rxg_mutex;
 uint32_t g_rxg_queue[8]{};
 uint32_t g_rxg_head = 0, g_rxg_count = 0;
@@ -1383,8 +1384,11 @@ void GameFlipReserved() {
     if (!g_ready || !ReflexInGame() || g_api.pcl_set_marker == nullptr) return;
     const uint32_t index = g_rxg_sim.exchange(0, std::memory_order_acq_rel);
     if (index == 0) return;
-    RxMarker(index, sl::PCLMarker::eSimulationEnd);
-    RxMarker(index, sl::PCLMarker::eRenderSubmitStart);
+    if (g_rxg_render.exchange(index, std::memory_order_acq_rel) != index) {
+        // (no GPU submit between the controller read and the flip)
+        RxMarker(index, sl::PCLMarker::eSimulationEnd);
+        RxMarker(index, sl::PCLMarker::eRenderSubmitStart);
+    }
     std::lock_guard lock{g_rxg_mutex};
     if (g_rxg_count == std::size(g_rxg_queue)) {
         g_rxg_head = (g_rxg_head + 1) % std::size(g_rxg_queue);
@@ -1392,6 +1396,28 @@ void GameFlipReserved() {
     }
     g_rxg_queue[(g_rxg_head + g_rxg_count) % std::size(g_rxg_queue)] = index;
     ++g_rxg_count;
+#endif
+}
+
+// 0.71: the game's first GPU submit after its controller read: its simulation ends and its render
+// submission starts there (not at the flip).
+void GameRenderSubmit() {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    if (!g_ready || !ReflexInGame() || g_api.pcl_set_marker == nullptr) return;
+    const uint32_t index = g_rxg_sim.load(std::memory_order_acquire);
+    if (index == 0) return;
+    uint32_t seen = g_rxg_render.load(std::memory_order_acquire);
+    if (seen == index ||
+        !g_rxg_render.compare_exchange_strong(seen, index, std::memory_order_acq_rel)) {
+        return;
+    }
+    RxMarker(index, sl::PCLMarker::eSimulationEnd);
+    RxMarker(index, sl::PCLMarker::eRenderSubmitStart);
+    static std::atomic<uint32_t> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) == 0) {
+        Printf("Reflex (Streamline PCL): SIMULATION_END / RENDERSUBMIT_START at the game's first GPU "
+               "submit after its controller read (frame %u)", index);
+    }
 #endif
 }
 
@@ -1916,6 +1942,10 @@ void GameInput() {
 
 void GameFlipReserved() {
     Dlssg::GameFlipReserved();
+}
+
+void GameRenderSubmit() {
+    Dlssg::GameRenderSubmit();
 }
 
 void SetPresentIndex(uint32_t index) {
