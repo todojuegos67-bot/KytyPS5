@@ -82,6 +82,9 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
 // over the camera ones. `late`: the upscale runs after the guest flip (the presenter's late path).
 void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, vk::Extent2D render,
              bool reset, bool late);
+// 0.89: whether the last Compose call put object vectors into the motion vectors (false: the
+// frame's vectors are camera-only, e.g. no motion pass written or a reset), for the FG inputs log.
+bool ComposedLast();
 // The guest flip (end of a frame).
 void OnFlip();
 

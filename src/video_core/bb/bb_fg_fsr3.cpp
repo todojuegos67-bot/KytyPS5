@@ -95,6 +95,7 @@ std::chrono::steady_clock::time_point g_last_real{};
 struct Stats {
     std::chrono::steady_clock::time_point start{};
     uint32_t real = 0, generated_on = 0, no_inputs = 0, hudless = 0, slotted = 0;
+    uint32_t object_vectors = 0; // 0.89: generated-on frames whose vectors had object motion
     uint64_t presents_at_start = 0;
     double pace_n = 0, pace_sum = 0, pace_sq = 0, pace_max = 0; // real present intervals (s)
     double prepare_ms = 0, present_ms = 0, max_present_ms = 0;
@@ -795,12 +796,12 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         const uint64_t shown =
             presents >= g_stats.presents_at_start ? presents - g_stats.presents_at_start : 0;
         Printf("[fsr3] real %.1f fps, shown %.1f fps; generation on %u of %u frames (no 3D %u); "
-               "prepare %.2f ms, present call %.2f ms (max %.1f); HUD-less %u",
+               "prepare %.2f ms, present call %.2f ms (max %.1f); HUD-less %u; object vectors %u",
                g_stats.real / window, static_cast<double>(shown) / window, g_stats.generated_on,
                g_stats.real, g_stats.no_inputs,
                g_stats.real != 0 ? g_stats.prepare_ms / g_stats.real : 0.0,
                g_stats.real != 0 ? g_stats.present_ms / g_stats.real : 0.0, g_stats.max_present_ms,
-               g_stats.hudless);
+               g_stats.hudless, g_stats.object_vectors);
         if (g_stats.pace_n >= 10.0) {
             const double mean = g_stats.pace_sum / g_stats.pace_n;
             const double sd =
@@ -961,8 +962,12 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         prepare.cameraNear = FLT_MAX;
         prepare.cameraFar = z_near;
     } else {
+        // 0.89: normal depth is created without FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE, so FSR 3
+        // reads cameraFar: give the game's real far plane (Bloodborne 3000) instead of FLT_MAX.
         prepare.cameraNear = z_near;
-        prepare.cameraFar = FLT_MAX;
+        prepare.cameraFar = inputs->z_far > z_near * 2.0f && std::isfinite(inputs->z_far)
+                                ? inputs->z_far
+                                : FLT_MAX;
     }
     prepare.cameraFovAngleVertical =
         EnvFloat("KYTY_FSR3_FOV", inputs->fov_y > 0.0f ? inputs->fov_y : camera.fov);
@@ -1025,6 +1030,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prepare_begin)
             .count();
     g_stats.generated_on++;
+    if (inputs->object_vectors) g_stats.object_vectors++;
     if (!g_generating) {
         Printf("FSR3 FG: on (3D frame: %ux%u depth and motion vectors, camera %s, HUD-less image %s)",
                inputs->render.width, inputs->render.height, camera.valid ? "found" : "default",

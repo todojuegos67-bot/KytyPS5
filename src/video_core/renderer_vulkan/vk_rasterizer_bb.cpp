@@ -150,6 +150,7 @@ struct BBVk {
     // (raw copy, its own format): the motion-vector pass's colour input and FG's HUD-less image.
     OwnImage fgn_src;
     bool fgn_ready = false;
+    bool fg_object_vectors = false; // 0.89: the last motion pass had object vectors composed
     // BB_HUD_DIAG: the presented image's address once its HUD-less copy is taken, frames seen.
     VAddr hud_flip = 0;
     u64 hud_frames = 0, hud_logged_frame = 0;
@@ -1724,6 +1725,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     }
     // Object motion vectors (bb_objmv.h) over the camera ones.
     BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset, late);
+    g_bb.fg_object_vectors = BB::ObjMotion::ComposedLast();
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
@@ -2661,6 +2663,7 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     out.z_near = plan.z_near;
     out.z_far = plan.z_far;
     out.camera_valid = plan.camera_valid;
+    out.object_vectors = g_bb.fg_object_vectors;
     std::copy(std::begin(plan.view_to_clip), std::end(plan.view_to_clip), out.view_to_clip);
     std::copy(std::begin(plan.clip_to_prev_clip), std::end(plan.clip_to_prev_clip),
               out.clip_to_prev_clip);

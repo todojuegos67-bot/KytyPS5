@@ -108,6 +108,7 @@ struct Inputs {
     bool depth_inverted = true;
     float fov_y = 1.0f, z_near = 0.1f, z_far = 1000.0f;
     bool camera_valid = false;
+    bool object_vectors = false; // 0.89: object vectors were composed into `motion` (log)
     float view_to_clip[16]{};
     float clip_to_prev_clip[16]{};
     uint64_t lat_index = 0; // BB::AntiLag's frame index (0: none)

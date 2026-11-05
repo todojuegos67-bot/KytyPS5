@@ -89,6 +89,7 @@ struct State {
     u64 st_rigid_tracked = 0, st_rigid_static = 0, st_rigid_budget = 0, st_rigid_camera = 0;
 };
 State g;
+bool g_composed_last = false;
 
 bool RigidOn() {
     static const bool on = [] {
@@ -503,9 +504,11 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     // `written`. The presenter's late upscale runs after the flip (OnFlip has already cleared
     // `written`), so it reads the flag that OnFlip latched for the frame it presents.
     const bool wrote = late ? g.latched : g.written;
+    g_composed_last = false;
     if (!g.ready || !wrote || reset || g.width != render.width || g.height != render.height) {
         return;
     }
+    g_composed_last = true;
     ImageBarrier(cmd, g.image, vk::ImageLayout::eGeneral,
                  vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                  vk::AccessFlagBits2::eColorAttachmentWrite,
@@ -533,6 +536,10 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
     ++g.st_composed;
     if (late) ++g.st_composed_late;
+}
+
+bool ComposedLast() {
+    return g_composed_last;
 }
 
 void OnFlip() {
