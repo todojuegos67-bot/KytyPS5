@@ -673,8 +673,8 @@ const Candidate* BestCamera() {
 bool BlockCamera(FrameState& f, const float* d, size_t size) {
     static const bool on = [] {
         const char* v = std::getenv("BB_CAMERA_BLOCK");
-        (void)v;
-    }
+        return v == nullptr || v[0] != '0';
+    }();
     if (!on || size < 864 || d[0] != 3000.0f || std::fabs(d[1] * d[0] - 1.0f) > 1e-3f ||
         !(d[4] >= 64.0f) || !(d[5] >= 64.0f) || d[4] > 16384.0f || d[5] > 16384.0f) {
         return false;
