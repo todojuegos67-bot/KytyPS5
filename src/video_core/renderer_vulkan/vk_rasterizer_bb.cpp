@@ -3062,6 +3062,22 @@ bool DumpActive() {
                 ec ? "the folder could not be created" : "folder ready"));
         }
     }
+    // 0.84: a frame the native chain check asks for (its first failure, chain still active)
+    // replaces the requested one when that has not been dumped yet.
+    if (const u64 req = BB::Upscale::DumpRequest(); req != 0 && g_dump.entries.empty() &&
+        static_cast<s64>(req) != g_dump.frame) {
+        g_dump.frame = static_cast<s64>(req);
+        g_dump.done = false;
+        g_dump.pass = 0;
+        g_dump.lines = 0;
+        g_dump.bytes = 0;
+        g_dump.last_targets.clear();
+        BB::Upscale::Checkpoint(fmt::format("BB_DUMP_FRAME: the native chain check asked for "
+                                            "frame {} (dumped to {})",
+                                            req, g_dump.dir));
+        std::error_code ec;
+        std::filesystem::create_directories(g_dump.dir, ec);
+    }
     return g_dump.frame >= 0 && !g_dump.done &&
            BB::Upscale::FrameNumber() == static_cast<u64>(g_dump.frame);
 }
@@ -3125,7 +3141,7 @@ void Rasterizer::BBDumpImage(VideoCore::Image& image, const std::string& what) {
 }
 
 void Rasterizer::BBDumpPass(std::span<const VideoCore::ImageId> targets, const std::string& desc) {
-    if (g_dump.frame == -1) return;
+    if (g_dump.frame == -1 && BB::Upscale::DumpRequest() == 0) return;
     if (!DumpActive()) {
         if (g_dump.frame >= 0 && !g_dump.done && !g_dump.entries.empty() &&
             BB::Upscale::FrameNumber() > static_cast<u64>(g_dump.frame)) {

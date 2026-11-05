@@ -87,6 +87,7 @@ void SetComputeScaled(bool on);
 bool TakeComputeTouched();
 void OnContentCheck(double psnr_db);
 u64 FrameNumber();
+u64 DumpRequest(); // 0.84: a frame the native chain check wants dumped (0 none)
 void TwinDone(VAddr addr, bool scaled, bool write, bool copied);
 void TwinFailed(VAddr addr, std::string_view why);
 bool NativePostPhase();              // after the upscaler in this frame (native chain)

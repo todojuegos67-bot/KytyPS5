@@ -545,10 +545,14 @@ bool IsColorSampleable(vk::Format f) {
     }
 }
 
+bool NativeChainLive();
 bool SceneMode() {
     const auto& c = Cfg();
     if (c.force_mode == 1) return true;
     if (c.force_mode == 2) return false;
+    // 0.84: the native chain always upscales to the output size (19:13 run: its first upscale
+    // ran 1706x960 -> 1706x960 in scene mode, learned from the frame before the scaling).
+    if (NativeChainLive()) return false;
     return g_learned.render_w == g_output_w && g_learned.render_h == g_output_h;
 }
 
@@ -1006,6 +1010,10 @@ bool NativeChainLive() {
 bool NativePerPass() {
     return BB::ResPatch::NativeChain() && !NativeLegacy();
 }
+// 0.84: the frame the native chain check asks to be dumped (BB_DUMP_FRAME) before it turns
+// scene scaling off, and the frame from which it turns off.
+std::atomic<u64> g_dump_request{0};
+u64 g_off_at = 0;
 // Every way scene scaling turns off goes through here: the texture cache then copies each
 // address's current content to its output-size image and frees the internal-size one.
 void TurnOff() {
@@ -1219,6 +1227,10 @@ void OnContentCheck(double psnr_db) {
 
 u64 FrameNumber() {
     return g_frame_no;
+}
+
+u64 DumpRequest() {
+    return g_dump_request.load(std::memory_order_relaxed);
 }
 
 bool SceneScaleLive() {
@@ -2043,7 +2055,11 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     const VAddr src = LearnedSource();
     for (u32 i = 0; i < g_draw.num_colors; ++i) {
         if (src != 0 && colors[i].addr == src) {
-            f.last_write_after = f.qual_samples;
+            // 0.84: only writes before the upscaler move the injection point. Post-processing
+            // reusing the scene colour's memory after it (19:13 run: 'learned skip 298', 93 of
+            // 300 frames, '0 with later samples redirected') raised the learned skip past the
+            // real point, so the next frames waited for a sample that never came.
+            if (!f.injected) f.last_write_after = f.qual_samples;
             if (f.injected && f.redirecting) {
                 ++f.src_rewrites;
                 f.redirecting = false;
@@ -2930,6 +2946,13 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // 0.73 native chain check: the upscaled image must reach the game's output chain, not only be
     // produced. A frame counts when the upscaler ended the scene passes (post-processing then used
     // the output-size versions) and no internal-size target was bound after it.
+    if (g_off_at != 0 && g_frame_no >= g_off_at) {
+        g_off_at = 0;
+        TurnOff();
+        Checkpoint("WARNING: scene upscale turned OFF for this session (native chain check): the "
+                   "upscaled image did not reach the output chain");
+        LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] native chain check failed: scene upscale off");
+    }
     static u32 nc_frames = 0, nc_scene = 0, nc_reach = 0, nc_redirect = 0, nc_scaled = 0,
                nc_windows = 0, nc_last_scaled = 0, nc_copies0 = 0, nc_stale0 = 0;
     if (NativePerPass() && g_ss_frozen.load(std::memory_order_relaxed) &&
@@ -2984,8 +3007,16 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                         return k;
                     }()));
             }
-            if (bad) {
-                TurnOff();
+            if (bad && g_off_at == 0) {
+                // 0.84: the next frame is dumped with the chain still active (BB_DUMP_FRAME,
+                // into bb_dump), then scaling turns off two frames later.
+                g_dump_request.store(g_frame_no + 1, std::memory_order_relaxed);
+                g_off_at = g_frame_no + 3;
+                Checkpoint(fmt::format("native chain check FAILED: frame {} is dumped with the "
+                                       "chain active (bb_dump), scene upscale turns off at frame {}",
+                                       g_frame_no + 1, g_off_at));
+            }
+            if (false) {
                 Checkpoint("WARNING: scene upscale turned OFF for this session (native chain "
                            "check): the upscaled image did not reach the output chain");
                 LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] native chain check failed: {} of {}",
