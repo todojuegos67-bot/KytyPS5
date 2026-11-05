@@ -10,6 +10,8 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/bb/bb_fg.h"
+#include <array>
+#include "video_core/bb/bb_imgfg.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -60,7 +62,8 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .imageExtent = extent,
         .imageArrayLayers = 1,
         .imageUsage = vk::ImageUsageFlagBits::eColorAttachment |
-                      vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+                      vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+                      BB::ImgFg::SwapchainUsage(instance.GetPhysicalDevice(), surface),
         .imageSharingMode = sharing_mode,
         .queueFamilyIndexCount = queue_family_indices_count,
         .pQueueFamilyIndices = queue_family_indices.data(),
@@ -143,6 +146,11 @@ bool Swapchain::AcquireNextImage() {
 
 bool Swapchain::Present() {
     // bb-fg-074: the present's id, for VK_KHR_present_wait (bb_display.h).
+    // bb-imgfg-078: the real frame also waits for the work that read its image (the presenter ran
+    // BB::ImgFg::BeforeRealPresent, which presented the generated frames ahead of it).
+    const bool imgfg = static_cast<bool>(extra_present_wait);
+    const std::array<vk::Semaphore, 2> present_waits = {present_ready[image_index], extra_present_wait};
+    extra_present_wait = vk::Semaphore{};
     u64 present_id_value = BB::FG::NextPresentId();
     VkPresentIdKHR present_id{};
     present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
@@ -150,8 +158,8 @@ bool Swapchain::Present() {
     present_id.pPresentIds = &present_id_value;
     const vk::PresentInfoKHR present_info = {
         .pNext = present_id_value != 0 ? &present_id : nullptr,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &present_ready[image_index],
+        .waitSemaphoreCount = imgfg ? 2u : 1u,
+        .pWaitSemaphores = present_waits.data(),
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
         .pImageIndices = &image_index,
@@ -259,7 +267,7 @@ void Swapchain::SetSurfaceProperties() {
     }
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
-    image_count = capabilities.minImageCount + 1;
+    image_count = capabilities.minImageCount + 1 + BB::ImgFg::SwapchainExtraImages();
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

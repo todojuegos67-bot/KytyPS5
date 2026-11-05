@@ -88,6 +88,11 @@ public:
 
     void SetHDR(bool hdr);
 
+    // bb-imgfg-078: a semaphore the next Present also waits for (cleared by it).
+    void SetExtraPresentWait(vk::Semaphore semaphore) {
+        extra_present_wait = semaphore;
+    }
+
     bool GetHDR() const {
         return needs_hdr;
     }
@@ -131,6 +136,7 @@ private:
     u32 image_count = 0;
     u32 image_index = 0;
     u32 frame_index = 0;
+    vk::Semaphore extra_present_wait{};
     bool needs_recreation = true;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output

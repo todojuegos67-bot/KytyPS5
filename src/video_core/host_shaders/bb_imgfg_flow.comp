@@ -1,0 +1,75 @@
+#version 450
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB_FG=image-x2 / image-x3 (bb_imgfg.cpp): the finest level's two flows made one consistent pair.
+// Per vector: the 3x3 component-wise median (blended half and half with the raw vector) removes
+// the match's outliers without rounding the motion boundaries; the forward / backward consistency
+// (|F(x) + B(x + F(x))| against 0.75 + 0.15 |F| level pixels; below 1 is consistent, above is an
+// occlusion or a failed match); and the block's mean luma (for the edge-aware upsampling).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D f_tex;   // forward flow, raw (linear sampler)
+layout(binding = 1) uniform sampler2D b_tex;   // backward flow, raw (linear sampler)
+layout(binding = 2) uniform sampler2D lum_a;   // half resolution luma of the previous frame
+layout(binding = 3) uniform sampler2D lum_b;   // ... of the current one
+layout(binding = 8, rgba16f) uniform writeonly image2D ff_img; // x y: flow, z: consistency, w: guide
+layout(binding = 9, rgba16f) uniform writeonly image2D bf_img;
+
+layout(push_constant) uniform Push {
+    ivec4 size; // grid width, height, half width, half height
+} p;
+
+float Median9(float v[9]) {
+    for (int i = 1; i < 9; ++i) {
+        float k = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > k) {
+            v[j + 1] = v[j];
+            --j;
+        }
+        v[j + 1] = k;
+    }
+    return v[4];
+}
+
+vec2 Smoothed(sampler2D t, ivec2 g) {
+    float xs[9];
+    float ys[9];
+    int n = 0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            vec2 f = texelFetch(t, clamp(g + ivec2(i, j), ivec2(0), p.size.xy - 1), 0).xy;
+            xs[n] = f.x;
+            ys[n] = f.y;
+            ++n;
+        }
+    }
+    vec2 raw = texelFetch(t, g, 0).xy;
+    return 0.5 * raw + 0.5 * vec2(Median9(xs), Median9(ys));
+}
+
+float Consistency(vec2 v, sampler2D other, ivec2 g) {
+    vec2 gp = vec2(g) + v * 0.25;
+    vec2 o = textureLod(other, (gp + 0.5) / vec2(p.size.xy), 0.0).xy;
+    return length(v + o) / (0.75 + 0.15 * length(v));
+}
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= p.size.x || g.y >= p.size.y) {
+        return;
+    }
+    vec2 fs = Smoothed(f_tex, g);
+    vec2 bs = Smoothed(b_tex, g);
+    float cf = Consistency(fs, b_tex, g);
+    float cb = Consistency(bs, f_tex, g);
+    ivec2 hl = p.size.zw - 1;
+    ivec2 c0 = clamp(g * 4 + 1, ivec2(0), hl);
+    ivec2 c1 = clamp(g * 4 + 2, ivec2(0), hl);
+    float guide = 0.125 * (texelFetch(lum_a, c0, 0).r + texelFetch(lum_a, c1, 0).r +
+                           texelFetch(lum_a, ivec2(c0.x, c1.y), 0).r + texelFetch(lum_a, ivec2(c1.x, c0.y), 0).r +
+                           texelFetch(lum_b, c0, 0).r + texelFetch(lum_b, c1, 0).r +
+                           texelFetch(lum_b, ivec2(c0.x, c1.y), 0).r + texelFetch(lum_b, ivec2(c1.x, c0.y), 0).r);
+    imageStore(ff_img, g, vec4(fs, min(cf, 30.0), guide));
+    imageStore(bf_img, g, vec4(bs, min(cb, 30.0), guide));
+}

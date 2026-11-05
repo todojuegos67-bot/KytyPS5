@@ -1,0 +1,146 @@
+#version 450
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB_FG=image-x2 / image-x3 (bb_imgfg.cpp): the intermediate frame at time t (0: the previous real
+// frame, 1: the current one), pulled per pixel, no holes.
+//   1. The motion at this pixel at time t: the forward flow (previous -> current) is a field on
+//      the previous frame, so it is looked up where the pixel was, p - t v, twice (the projection
+//      of a flow to the middle by fixed-point iteration); the backward flow (current -> previous)
+//      the same from the current frame's side, p - (1 - t) w.
+//   2. Two hypotheses, each a warp of both frames: forward (previous at p - t v, current at
+//      p + (1 - t) v) and backward. Each is trusted by how well its two samples agree (a 5-tap
+//      window, in units of the local contrast: the dark fog has little) and by the flow's forward /
+//      backward consistency.
+//   3. The trusted hypotheses are mixed by their trust; the confidence that neither hypothesis is
+//      right (an occlusion, a failed match, new content) takes the pixel to the nearest real frame
+//      (never a mix of two frames at different positions: no ghost, no double image).
+//   4. The HUD, from the mask: the backbuffer's own pixel, unwarped, unmixed.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D a_tex;      // previous real frame (HUD-less image, or the backbuffer)
+layout(binding = 1) uniform sampler2D b_tex;      // current real frame
+layout(binding = 2) uniform sampler2D fp_tex;     // forward flow per pixel: xy full res pixels, z consistency
+layout(binding = 3) uniform sampler2D bp_tex;     // backward flow per pixel
+layout(binding = 4) uniform sampler2D hud_tex;    // HUD mask, half resolution
+layout(binding = 5) uniform sampler2D bfinal_tex; // the current real backbuffer (the HUD comes from here)
+layout(binding = 6) uniform sampler2D lum_a;      // half resolution luma, previous (texelFetch)
+layout(binding = 7) uniform sampler2D lum_b;
+layout(binding = 8, rgba8) uniform writeonly image2D mid_img;
+layout(std430, binding = 12) buffer Stats { uint stats[8]; };
+
+layout(push_constant) uniform Push {
+    ivec4 size;   // width, height, half width, half height
+    vec4 p0;      // t, sc0, sck, cg
+    vec4 p1;      // kcons, fallback (0: current frame, 1: warped nearest), count stats, unused
+} p;
+
+shared uint s_incons;
+shared uint s_hud;
+shared uint s_total;
+shared uint s_lum_out;
+shared uint s_lum_real;
+
+vec3 Tap(sampler2D t, vec2 pos, vec2 isz) {
+    return textureLod(t, pos * isz, 0.0).rgb;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        s_incons = 0u;
+        s_hud = 0u;
+        s_total = 0u;
+        s_lum_out = 0u;
+        s_lum_real = 0u;
+    }
+    barrier();
+    ivec2 x = ivec2(gl_GlobalInvocationID.xy);
+    if (x.x < p.size.x && x.y < p.size.y) {
+        float t = p.p0.x;
+        vec2 isz = 1.0 / vec2(p.size.xy);
+        vec2 pc = vec2(x) + 0.5;
+
+        // 1. the motion at this pixel at time t
+        vec4 f = textureLod(fp_tex, pc * isz, 0.0);
+        vec2 vf = f.xy;
+        for (int i = 0; i < 2; ++i) {
+            f = textureLod(fp_tex, (pc - t * vf) * isz, 0.0);
+            vf = f.xy;
+        }
+        float cf = f.z;
+        vec4 b = textureLod(bp_tex, pc * isz, 0.0);
+        vec2 vb = b.xy;
+        for (int i = 0; i < 2; ++i) {
+            b = textureLod(bp_tex, (pc - (1.0 - t) * vb) * isz, 0.0);
+            vb = b.xy;
+        }
+        float cb = b.z;
+
+        // 2. the two hypotheses
+        vec3 a_f = Tap(a_tex, pc - t * vf, isz);
+        vec3 b_f = Tap(b_tex, pc + (1.0 - t) * vf, isz);
+        vec3 b_b = Tap(b_tex, pc - (1.0 - t) * vb, isz);
+        vec3 a_b = Tap(a_tex, pc + t * vb, isz);
+        vec3 d = abs(a_f - b_f);
+        float ef = (d.r + d.g + d.b) * (1.0 / 3.0);
+        d = abs(a_b - b_b);
+        float eb = (d.r + d.g + d.b) * (1.0 / 3.0);
+        const vec2 taps[4] = vec2[4](vec2(2.0, 0.0), vec2(-2.0, 0.0), vec2(0.0, 2.0), vec2(0.0, -2.0));
+        for (int i = 0; i < 4; ++i) {
+            d = abs(Tap(a_tex, pc + taps[i] - t * vf, isz) - Tap(b_tex, pc + taps[i] + (1.0 - t) * vf, isz));
+            ef += (d.r + d.g + d.b) * (1.0 / 3.0);
+            d = abs(Tap(a_tex, pc + taps[i] + t * vb, isz) - Tap(b_tex, pc + taps[i] - (1.0 - t) * vb, isz));
+            eb += (d.r + d.g + d.b) * (1.0 / 3.0);
+        }
+        ef *= 0.2;
+        eb *= 0.2;
+
+        // local contrast scale: a flat dark area's tiny differences count for more
+        ivec2 h = min(x / 2, p.size.zw - 1);
+        ivec2 hl = p.size.zw - 1;
+        float l0 = 0.5 * (texelFetch(lum_a, h, 0).r + texelFetch(lum_b, h, 0).r);
+        float l1 = 0.5 * (texelFetch(lum_a, clamp(h + ivec2(1, 0), ivec2(0), hl), 0).r + texelFetch(lum_b, clamp(h + ivec2(1, 0), ivec2(0), hl), 0).r);
+        float l2 = 0.5 * (texelFetch(lum_a, clamp(h - ivec2(1, 0), ivec2(0), hl), 0).r + texelFetch(lum_b, clamp(h - ivec2(1, 0), ivec2(0), hl), 0).r);
+        float l3 = 0.5 * (texelFetch(lum_a, clamp(h + ivec2(0, 1), ivec2(0), hl), 0).r + texelFetch(lum_b, clamp(h + ivec2(0, 1), ivec2(0), hl), 0).r);
+        float l4 = 0.5 * (texelFetch(lum_a, clamp(h - ivec2(0, 1), ivec2(0), hl), 0).r + texelFetch(lum_b, clamp(h - ivec2(0, 1), ivec2(0), hl), 0).r);
+        float sc = p.p0.y + p.p0.z * abs(l1 + l2 + l3 + l4 - 4.0 * l0);
+
+        // 3. trust, mix, fallback
+        float kf = exp(-0.5 * (ef / sc) * (ef / sc)) * exp(-max(cf - 1.0, 0.0) * p.p1.x);
+        float kb = exp(-0.5 * (eb / sc) * (eb / sc)) * exp(-max(cb - 1.0, 0.0) * p.p1.x);
+        vec3 col_f = mix(a_f, b_f, t);
+        vec3 col_b = mix(a_b, b_b, t);
+        vec3 fused = (kf * col_f + kb * col_b) / max(kf + kb, 1e-4);
+        float conf = clamp(max(kf, kb) * p.p0.w, 0.0, 1.0);
+        vec3 fallback0 = Tap(b_tex, pc, isz);
+        vec3 fallback = fallback0;
+        if (p.p1.y > 0.5) {
+            fallback = t >= 0.5 ? b_b : a_f;
+        }
+        vec3 outc = mix(fallback, fused, conf);
+
+        // 4. the HUD
+        float m = clamp(textureLod(hud_tex, pc * isz, 0.0).r * 8.0 - 2.0, 0.0, 1.0);
+        outc = mix(outc, Tap(bfinal_tex, pc, isz), m);
+        imageStore(mid_img, x, vec4(clamp(outc, 0.0, 1.0), 1.0));
+
+        if (p.p1.z > 0.5) {
+            atomicAdd(s_total, 1u);
+            atomicAdd(s_lum_out, uint(dot(clamp(outc, 0.0, 1.0), vec3(0.299, 0.587, 0.114)) * 255.0));
+            atomicAdd(s_lum_real, uint(dot(fallback0, vec3(0.299, 0.587, 0.114)) * 255.0));
+            if (conf < 0.5) {
+                atomicAdd(s_incons, 1u);
+            }
+            if (m > 0.5) {
+                atomicAdd(s_hud, 1u);
+            }
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && p.p1.z > 0.5) {
+        atomicAdd(stats[0], s_incons);
+        atomicAdd(stats[1], s_hud);
+        atomicAdd(stats[2], s_total);
+        atomicAdd(stats[3], s_lum_out);
+        atomicAdd(stats[4], s_lum_real);
+    }
+}

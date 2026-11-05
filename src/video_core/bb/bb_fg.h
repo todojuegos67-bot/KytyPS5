@@ -14,7 +14,9 @@
 // without them (menus, movies, loading screens: no 3D scene upscaled) are shown as they are.
 //
 // BB_FG=off | amd-x2 | amd-x3 | amd-x4 | amd-dyn | dlss-x2 | dlss-x3 | dlss-x4 | dlss-x5 | dlss-x6 |
-//       dlss-dyn
+//       dlss-dyn | image-x2 | image-x3
+// image-xN (bb-imgfg-078, bb_imgfg.h): frame generation from the finished images alone (optical
+// flow on a luma pyramid), no vectors or HUD-less image needed.
 // Every KYTY_* knob of the Demon's Souls code is read as BB_* first (BB_FSR3_TARGET_FPS,
 // BB_DLSSG_TARGET_FPS, BB_VRR_CAP_FPS, BB_DLSSG_REFLEX, BB_ANTILAG, BB_LATENCY, ...).
 #pragma once
@@ -38,7 +40,7 @@ int DynBaseCap(double base_fps, int& state);
 // metrics file (BB_METRICS_OUT, read by metricas-bb.ps1).
 void Printf(const char* format, ...);
 
-enum class Kind : uint32_t { Off, Amd, Dlss };
+enum class Kind : uint32_t { Off, Amd, Dlss, Image };
 struct Config {
     Kind kind = Kind::Off;
     int multiplier = 2; // the fixed multiplier, or the dynamic one's maximum

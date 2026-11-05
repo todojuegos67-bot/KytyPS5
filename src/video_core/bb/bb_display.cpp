@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include "video_core/bb/bb_display.h"
 #include "video_core/bb/bb_fg.h"
@@ -60,6 +61,7 @@ struct State {
     uint32_t epoch = 0;
     int present_mode = -1;
     std::deque<uint64_t> queue;
+    std::unordered_set<uint64_t> gen_ids; // Path::Image: the ids of generated frames
     uint64_t last_id = 0;
     int next_expected = 0;
     int issued_expected = 0;
@@ -182,7 +184,7 @@ void Report(State& s, Window& w, Clock::time_point now) {
     double shown = -1.0, real = -1.0, generated = -1.0;
     const char* source = "none";
     const char* interval_of = "none";
-    if (path == Path::Amd) {
+    if (path == Path::Amd || path == Path::Image) {
         if (waited) {
             shown = w.done_all / win;
             real = w.done_real / win;
@@ -314,6 +316,15 @@ void Record(State& s, Window& w, uint64_t id, Path path, Clock::time_point at) {
     w.prev = at;
     w.have_prev = true;
     ++w.done_all;
+    if (path == Path::Image) {
+        std::lock_guard lock{s.mutex};
+        if (s.gen_ids.erase(id) != 0) {
+            ++w.done_gen;
+        } else {
+            ++w.done_real;
+        }
+        return;
+    }
     if (path != Path::Amd) {
         ++w.done_real;
         return;
@@ -524,6 +535,7 @@ void OnSwapchain(vk::SwapchainKHR swapchain, Path path) {
         ++s.epoch;
         s.queue.clear();
         s.groups.clear();
+        s.gen_ids.clear();
     }
     if (swapchain && !s.started) {
         s.started = true;
@@ -582,6 +594,24 @@ void NoteGpuEnds(const uint64_t* frame_ids, const uint64_t* end_us, uint32_t n) 
         s.gpu_last_end = f.second;
     }
     if (s.gpu_intervals.size() > 4096) s.gpu_intervals.erase(s.gpu_intervals.begin(), s.gpu_intervals.begin() + 2048);
+}
+
+uint64_t IssueImage(bool generated) {
+    if (!Wanted()) return 0;
+    State& s = S();
+    std::lock_guard lock{s.mutex};
+    if (s.swapchain == VK_NULL_HANDLE) return 0;
+    if (!generated) ++s.win_real;
+    if (!(s.chained && s.wait != nullptr)) return 0;
+    const uint64_t id = s.last_id + 1;
+    s.last_id = id;
+    if (generated) {
+        s.gen_ids.insert(id);
+        if (s.gen_ids.size() > 512) s.gen_ids.erase(s.gen_ids.begin());
+    }
+    s.queue.push_back(id);
+    if (s.queue.size() > 256) s.queue.pop_front();
+    return id;
 }
 
 void NoteStreamline(uint32_t presented, uint32_t status, uint32_t generate_max) {

@@ -1,0 +1,53 @@
+#version 450
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB_FG=image-x2 / image-x3 (bb_imgfg.cpp): capture of the frame that is about to be presented. One
+// thread per 2x2 block of pixels: the picture (the HUD-less image when the game gave one, else the
+// backbuffer) into the history image, the backbuffer itself into the "final" image (the HUD is
+// taken from there), the half resolution luma the flow works on, and where the backbuffer differs
+// from the HUD-less image (the HUD, when the game's 3D image is used). Values are the encoded
+// (perceptual) ones the display gets: nothing is linearised, the luma and the mixes are done in
+// that space.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D final_tex;   // the backbuffer (swapchain image)
+layout(binding = 1) uniform sampler2D hudless_tex; // the HUD-less image (same size), or the backbuffer
+layout(binding = 8, rgba8) uniform writeonly image2D main_img;
+layout(binding = 9, rgba8) uniform writeonly image2D final_img;
+layout(binding = 10, r32f) uniform writeonly image2D lum_img;
+layout(binding = 11, r32f) uniform writeonly image2D hdiff_img;
+
+layout(push_constant) uniform Push {
+    ivec4 size;  // width, height, half width, half height
+    ivec4 flags; // x: the HUD-less image is the picture
+} p;
+
+void main() {
+    ivec2 h = ivec2(gl_GlobalInvocationID.xy);
+    if (h.x >= p.size.z || h.y >= p.size.w) {
+        return;
+    }
+    float lum = 0.0;
+    float diff = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            ivec2 c = h * 2 + ivec2(i, j);
+            ivec2 s = min(c, p.size.xy - 1);
+            vec2 uv = (vec2(s) + 0.5) / vec2(p.size.xy);
+            vec3 f = textureLod(final_tex, uv, 0.0).rgb;
+            vec3 m = f;
+            if (p.flags.x != 0) {
+                m = textureLod(hudless_tex, uv, 0.0).rgb;
+                vec3 d = abs(f - m);
+                diff = max(diff, max(d.r, max(d.g, d.b)));
+            }
+            lum += dot(m, vec3(0.299, 0.587, 0.114));
+            if (c.x < p.size.x && c.y < p.size.y) {
+                imageStore(main_img, c, vec4(m, 1.0));
+                imageStore(final_img, c, vec4(f, 1.0));
+            }
+        }
+    }
+    imageStore(lum_img, h, vec4(lum * 0.25));
+    imageStore(hdiff_img, h, vec4(diff));
+}

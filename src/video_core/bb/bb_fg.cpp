@@ -24,6 +24,7 @@
 #include "video_core/bb/bb_dyn_multiplier.h"
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_fg_internal.h"
+#include "video_core/bb/bb_imgfg.h"
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_metrics.h"
 #include "video_core/bb/bb_sr.h"
@@ -136,7 +137,14 @@ Config ParseConfig() {
                                        s[dash + 1] >= '2' && s[dash + 1] <= '6') {
         s.insert(dash + 1, "x");
     }
-    if (s.starts_with("dlss-")) {
+    if (s.starts_with("image-") || s.starts_with("img-") || s.starts_with("imgfg-")) {
+        // bb-imgfg-078: image-only frame generation (bb_imgfg.h), x2 or x3.
+        const std::string m = s.substr(s.find('-') + 1);
+        if (m == "x2" || m == "x3" || m == "2" || m == "3") {
+            c.kind = Kind::Image;
+            c.multiplier = m.back() - '0';
+        }
+    } else if (s.starts_with("dlss-")) {
         c.kind = Kind::Dlss;
         const std::string m = s.substr(5);
         if (m == "dyn") {
@@ -270,7 +278,7 @@ const Config& Cfg() {
         Config c = ParseConfig();
         if (c.kind != Kind::Off) {
             BBLogf("Frame generation: BB_FG=%s (%s, %s x%d)", std::getenv("BB_FG"),
-                   c.kind == Kind::Dlss ? "NVIDIA DLSS-G" : "AMD FSR 3",
+                   c.kind == Kind::Dlss ? "NVIDIA DLSS-G" : c.kind == Kind::Image ? "image-only (bb-imgfg-078)" : "AMD FSR 3",
                    c.dynamic ? "dynamic up to" : "fixed", c.multiplier);
         }
         InitFpsCap(c);
@@ -283,7 +291,7 @@ const char* Name() {
     static const std::string name = [] {
         const auto& c = Cfg();
         if (c.kind == Kind::Off) return std::string("off");
-        return std::string(c.kind == Kind::Dlss ? "dlss-" : "amd-") +
+        return std::string(c.kind == Kind::Dlss ? "dlss-" : c.kind == Kind::Image ? "image-" : "amd-") +
                (c.dynamic ? std::string("dyn") : "x" + std::to_string(c.multiplier));
     }();
     return name.c_str();
@@ -918,7 +926,7 @@ PresentSlot PaceGuestFlip() {
 #if defined(_WIN32)
     if (fix) Pace::RaiseTimerResolution();
 #endif
-    const bool generating = Dlssg::Generating() || Amd::Generating();
+    const bool generating = Dlssg::Generating() || Amd::Generating() || BB::ImgFg::Generating();
     if (generating && Adapt::Enabled() && exited != Clock::time_point{}) {
         const double frame_s = std::chrono::duration<double>(arrive - exited).count();
         if (frame_s > 0.0 && frame_s < 0.1) {
@@ -2158,6 +2166,7 @@ void SetPresentIndex(uint32_t index) {
 }
 
 uint64_t NextPresentId() {
+    if (BB::ImgFg::Requested()) return Display::IssueImage(false);
     return Display::Issue(Dlssg::Ready() ? Dlssg::FrameIndexNow() : 0u);
 }
 
@@ -2211,7 +2220,7 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
 }
 
 bool WantInputs() {
-    return Dlssg::Ready() || Amd::Active();
+    return Dlssg::Ready() || Amd::Active() || BB::ImgFg::WantInputs();
 }
 
 namespace {
@@ -2354,6 +2363,7 @@ void OnDevice(vk::Instance, vk::PhysicalDevice physical, vk::Device device,
     Amd::OnDevice(physical, device, graphics_family, graphics_queue, plan, submit_mutex);
     Display::OnDevice(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
     Dlssg::OnDevice(physical);
+    BB::ImgFg::OnDevice(physical, device, graphics_family, graphics_queue);
     BB::AntiLag::OnDevice(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
                           g_antilag_ext, g_reflex_ext);
 }
@@ -2389,7 +2399,9 @@ void* ChainSwapchain(void* next) {
 
 void OnSwapchain(vk::SwapchainKHR swapchain) {
     BB::AntiLag::OnSwapchain(static_cast<VkSwapchainKHR>(swapchain), Amd::Active());
-    Display::OnSwapchain(swapchain, Amd::Active() ? Display::Path::Amd
+    BB::ImgFg::OnSwapchain(swapchain);
+    Display::OnSwapchain(swapchain, BB::ImgFg::Requested() ? Display::Path::Image
+                                    : Amd::Active() ? Display::Path::Amd
                                     : Dlssg::Ready() ? Display::Path::Dlss
                                                      : Display::Path::Plain);
 }

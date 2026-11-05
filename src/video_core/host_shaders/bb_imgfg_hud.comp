@@ -1,0 +1,64 @@
+#version 450
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB_FG=image-x2 / image-x3 (bb_imgfg.cpp): the HUD mask, half resolution, one value per pixel: a
+// count of consecutive real frames the pixel was a HUD pixel (r8: n / 8, up to 8).
+//   image only (mode 0): a HUD pixel is static (its luma did not change between the two real
+//     frames: the HUD does not move while the camera does) and lies in high local contrast (the 5x5
+//     range of the current luma is above rng: a HUD is bright strokes on a dark ground; a flat
+//     dark area is not). One frame of that is a coincidence in a moving picture (the offline test:
+//     2-3 dB lost to false positives); the count makes it a HUD only after three in a row, and any
+//     change resets it. Where the picture is still the interpolation equals the real frame anyway,
+//     so a static scene costs nothing.
+//   with the HUD-less image (mode 1): the pixels where the backbuffer differs from it (a few
+//     frames of persistence while the pixel stays still, so a fading HUD does not flicker).
+// The interpolation reads clamp(count * 8 - 2, 0, 1): protected from the third frame on.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D lum_a;
+layout(binding = 1) uniform sampler2D lum_b;
+layout(binding = 2) uniform sampler2D hdiff_tex;
+layout(binding = 3) uniform sampler2D prev_tex;
+layout(binding = 8, r8) uniform writeonly image2D hud_img;
+
+layout(push_constant) uniform Push {
+    ivec4 size;   // half width, half height, mode, previous mask valid
+    vec4 params;  // x: thr, y: rng, z: hudless difference threshold, w: persistence
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= p.size.x || c.y >= p.size.y) {
+        return;
+    }
+    ivec2 lim = p.size.xy - 1;
+    float prev = p.size.w != 0 ? texelFetch(prev_tex, c, 0).r : 0.0;
+    bool still = abs(texelFetch(lum_a, c, 0).r - texelFetch(lum_b, c, 0).r) < p.params.x;
+    float m = 0.0;
+    if (p.size.z == 0) {
+        float lo = 1e9;
+        float hi = -1e9;
+        for (int j = -2; j <= 2; ++j) {
+            for (int i = -2; i <= 2; ++i) {
+                float l = texelFetch(lum_b, clamp(c + ivec2(i, j), ivec2(0), lim), 0).r;
+                lo = min(lo, l);
+                hi = max(hi, l);
+            }
+        }
+        if (still && hi - lo > p.params.y) {
+            m = min(prev + 0.125, 1.0);
+        }
+    } else {
+        float d = 0.0;
+        for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+                d = max(d, texelFetch(hdiff_tex, clamp(c + ivec2(i, j), ivec2(0), lim), 0).r);
+            }
+        }
+        m = d > p.params.z ? 1.0 : 0.0;
+        if (still) {
+            m = max(m, prev * p.params.w);
+        }
+    }
+    imageStore(hud_img, c, vec4(m));
+}

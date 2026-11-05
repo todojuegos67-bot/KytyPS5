@@ -24,6 +24,7 @@
 #include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_fg.h"
+#include "video_core/bb/bb_imgfg.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/bb/bb_metrics.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -1353,12 +1354,30 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // for this present (the frame's own inputs for a new game frame; none for a repeat).
     const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
     BB::FG::SetPresentIndex(!is_reusing_frame && is_game_frame ? frame->fg.reflex_index : 0);
+    BB::ImgFg::NoteFrame(!is_reusing_frame && is_game_frame, fg_frame ? &frame->fg : nullptr,
+                         swapchain.GetExtent(), fg_region);
     BB::FG::BeforePresent(fg_frame ? &frame->fg : nullptr, swapchain.GetHandle(),
                           swapchain.GetExtent(),
                           swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
                                              : swapchain.GetSurfaceFormat().format,
                           fg_region,
                           swapchain.GetImageCount());
+
+    // bb-imgfg-078: image-only frame generation presents its generated frames now (before the real
+    // one, which then also waits for the work that read its image).
+    {
+        BB::ImgFg::PresentIn imgfg_in{
+            .swapchain = swapchain.GetHandle(),
+            .image = swapchain.Image(),
+            .extent = swapchain.GetExtent(),
+            .format = swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                         : swapchain.GetSurfaceFormat().format,
+        };
+        vk::Semaphore imgfg_wait{};
+        if (BB::ImgFg::BeforeRealPresent(imgfg_in, &imgfg_wait)) {
+            swapchain.SetExtraPresentWait(imgfg_wait);
+        }
+    }
 
     // Present to swapchain.
     {
