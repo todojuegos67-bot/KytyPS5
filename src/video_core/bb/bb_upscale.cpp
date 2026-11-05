@@ -550,8 +550,17 @@ bool SceneMode() {
     return g_learned.render_w == g_output_w && g_learned.render_h == g_output_h;
 }
 
+bool NativeChainLive();
 VAddr LearnedSource() {
     if (Cfg().force_source != 0) return Cfg().force_source;
+    // 0.80 native chain: the upscaler's source is the lit scene colour (the HDR target the
+    // scene's forward / transparent / fog passes draw with the scene depth), at its first read
+    // after its last write: lighting, transparencies and fog stay before the upscaler, bloom,
+    // tonemap and the HUD after it. (0.76 took the first output-size draw's internal-size input,
+    // which became a G-buffer target: self-check 3 of the 07:27 run read R8G8B8A8Unorm data.)
+    if (NativeChainLive() && g_learned.scene_color != 0) {
+        return g_learned.scene_color;
+    }
     return SceneMode() ? g_learned.scene_color : g_learned.comp_src;
 }
 
@@ -938,6 +947,13 @@ std::atomic<u32> g_ss_twin_copies{0}, g_ss_twin_fail{0}, g_ss_post_scaled{0}, g_
 std::atomic<u32> g_ss_frame{1}, g_ss_stale_reads{0};
 std::array<std::array<std::atomic<u32>, 2>, 64> g_ss_age{};
 std::atomic<bool> g_ss_purge{false};
+// 0.80: compute pipelines of the scene passes run at the internal size (their grid scaled, the
+// game's size constants patched) once they were seen touching a scene target; g_ss_compute_scaled
+// for the dispatch being bound, g_ss_compute_touched: it looked up a scene target.
+std::atomic<bool> g_ss_compute_scaled{false}, g_ss_compute_touched{false};
+// 0.80 content check: PSNR (dB, x100) of the downscaled output against the internal lit colour.
+std::atomic<int> g_ss_psnr_last{-1};
+std::atomic<u32> g_ss_psnr_n{0}, g_ss_psnr_low{0};
 // 0.76: why a qualifying sample of the upscaler's source was not the injection point.
 enum Refuse : u32 { RfPresent, RfHold, RfSkip, RfInactive, RfFailed, RfSize, RfTarget, RfCount };
 std::array<std::atomic<u32>, RfCount> g_ss_refuse{};
@@ -964,6 +980,11 @@ bool NativeLegacy() {
         return v != nullptr && std::string_view{v} == "scale";
     }();
     return on;
+}
+bool NativePerPass();
+bool NativeChainLive() {
+    return NativePerPass() && g_ss_frozen.load(std::memory_order_relaxed) &&
+           !g_ss_off.load(std::memory_order_relaxed);
 }
 bool NativePerPass() {
     return BB::ResPatch::NativeChain() && !NativeLegacy();
@@ -1013,8 +1034,14 @@ bool ScaleImage(VAddr addr, u32& w, u32& h) {
     if (NativePerPass()) {
         const int phase = g_ss_phase.load(std::memory_order_relaxed);
         const bool compute = g_ss_compute.load(std::memory_order_relaxed);
-        const bool source = addr == g_ss_source.load(std::memory_order_relaxed);
-        const bool scaled = (phase == 1 && !compute) || (phase == 2 && source);
+        // 0.80: the scene passes (draws, and the compute pipelines learned as scene compute) use
+        // the internal-size image; after the upscaler every pass, the source included, uses the
+        // output-size image, which for the source holds the upscaled image (BBNativeFillSource).
+        if (compute && phase == 1) {
+            g_ss_compute_touched.store(true, std::memory_order_relaxed);
+        }
+        const bool scaled =
+            phase == 1 && (!compute || g_ss_compute_scaled.load(std::memory_order_relaxed));
         Classify(idx, scaled ? 1 : compute ? 4 : 2, addr);
         if (!scaled) {
             return false;
@@ -1103,6 +1130,37 @@ void BeginDraw(VAddr depth_addr, u32 colors) {
         g_ss_phase.store(1, std::memory_order_relaxed);
         g_ss_frame.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+bool NativeScenePhase() {
+    return NativePerPass() && g_ss_frozen.load(std::memory_order_relaxed) &&
+           !g_ss_off.load(std::memory_order_relaxed) &&
+           g_ss_phase.load(std::memory_order_relaxed) == 1;
+}
+
+void SetComputeScaled(bool on) {
+    g_ss_compute_scaled.store(on, std::memory_order_relaxed);
+    g_ss_compute_touched.store(false, std::memory_order_relaxed);
+}
+
+bool TakeComputeTouched() {
+    return g_ss_compute_touched.exchange(false, std::memory_order_relaxed);
+}
+
+void OnContentCheck(double psnr_db) {
+    g_ss_psnr_last.store(static_cast<int>(psnr_db * 100.0), std::memory_order_relaxed);
+    g_ss_psnr_n.fetch_add(1, std::memory_order_relaxed);
+    if (psnr_db < 20.0) g_ss_psnr_low.fetch_add(1, std::memory_order_relaxed);
+    static u32 said = 0;
+    if (said++ < 3) {
+        Checkpoint(fmt::format("native chain content: PSNR {:.1f} dB (the output-size image of the "
+                               "source, downscaled, against the internal lit colour; >= 20 ok): {}",
+                               psnr_db, psnr_db >= 20.0 ? "ok" : "LOW"));
+    }
+}
+
+u64 FrameNumber() {
+    return g_frame_no;
 }
 
 bool SceneScaleLive() {
@@ -2788,7 +2846,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         if (f.injected && !f.inject_failed && f.native_post > 0 && !scaled_after) ++nc_reach;
         if (nc_frames >= 300) {
             const bool first = nc_windows++ == 0;
-            const bool bad = nc_scene >= 150 && nc_reach * 2 < nc_scene;
+            // 0.80: the content check too: most sampled frames must give an output whose
+            // downscale matches the internal lit colour (PSNR >= 20 dB).
+            const u32 pn = g_ss_psnr_n.exchange(0), plow = g_ss_psnr_low.exchange(0);
+            const bool bad = (nc_scene >= 150 && nc_reach * 2 < nc_scene) ||
+                             (pn >= 3 && plow * 2 > pn);
             (void)first;
             {
                 Checkpoint(fmt::format(
@@ -2797,7 +2859,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                     "{} with an internal-size target after the upscaler); twin copies {} ({} not "
                     "possible): {}; 0.76: twin copies {:.1f} per frame, stale twins read {} "
                     "(content older than the last frame), source samples refused: before-HUD "
-                    "mode {}, learned skip {}, inactive {}, failed {}, size {}, target {}",
+                    "mode {}, learned skip {}, inactive {}, failed {}, size {}, target {}; 0.80 content: "
+                    "{} samples, {} below 20 dB, last PSNR {:.1f} dB",
                     nc_reach, nc_scene, nc_frames, nc_redirect, nc_scaled,
                     g_ss_twin_copies.load(std::memory_order_relaxed),
                     g_ss_twin_fail.load(std::memory_order_relaxed), bad ? "FAILED" : "ok",
@@ -2806,7 +2869,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                     g_ss_stale_reads.load(std::memory_order_relaxed) - nc_stale0,
                     g_ss_refuse[RfPresent].exchange(0), g_ss_refuse[RfSkip].exchange(0),
                     g_ss_refuse[RfInactive].exchange(0), g_ss_refuse[RfFailed].exchange(0),
-                    g_ss_refuse[RfSize].exchange(0), g_ss_refuse[RfTarget].exchange(0)));
+                    g_ss_refuse[RfSize].exchange(0), g_ss_refuse[RfTarget].exchange(0), pn, plow,
+                    g_ss_psnr_last.load(std::memory_order_relaxed) / 100.0));
             }
             if (bad) {
                 TurnOff();

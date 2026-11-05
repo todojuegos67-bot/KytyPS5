@@ -196,6 +196,50 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             }
         }
     }
+    // BB 0.80 native chain: a target of the guest scene size drawn in the scene passes without an
+    // internal-size target bound (deferred lighting, fog, composition passes without the scene
+    // depth) is a scene target too: from its next use it is drawn at the internal size, so it
+    // never reads the internal-size G-buffer at output-size pixel positions (07:27 run: the
+    // top-left 1706x960 of the frame blended with the rest).
+    if (bb_rt_guest_w == 0 && BB::Upscale::NativeScenePhase()) {
+        u32 gw = 0, gh = 0, hw = 0, hh = 0;
+        if (BB::Upscale::SceneScale(gw, gh, hw, hh)) {
+            for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+                if (!cb_descs[cb].image_id) continue;
+                const auto& info = texture_cache.GetImage(cb_descs[cb].image_id).info;
+                if (!info.bb_scaled && info.size.width == gw && info.size.height == gh) {
+                    BB::Upscale::AddSceneTarget(info.guest_address);
+                }
+            }
+        }
+    }
+    if (BBDumpOn()) {
+        std::vector<VideoCore::ImageId> ids;
+        std::string line = fmt::format("draw: viewport scale {:.3f}x{:.3f} (guest {}x{}), targets:",
+                                       bb_rt_scale_x, bb_rt_scale_y, bb_rt_guest_w, bb_rt_guest_h);
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (!cb_descs[cb].image_id) continue;
+            ids.push_back(cb_descs[cb].image_id);
+            const auto& info = texture_cache.GetImage(cb_descs[cb].image_id).info;
+            line += fmt::format(" c{} {:#x} {}x{}{}", cb, info.guest_address, info.size.width,
+                                info.size.height, info.bb_scaled ? " internal" : "");
+        }
+        if (db_desc.image_id) {
+            ids.push_back(db_desc.image_id);
+            const auto& info = texture_cache.GetImage(db_desc.image_id).info;
+            line += fmt::format(" d {:#x} {}x{}{}", info.guest_address, info.size.width,
+                                info.size.height, info.bb_scaled ? " internal" : "");
+        }
+        const auto& vp = regs.viewports[0];
+        const auto& sc = regs.screen_scissor;
+        line += fmt::format("; guest viewport {:.0f}x{:.0f} at {:.0f},{:.0f}, screen scissor "
+                            "{}x{}",
+                            vp.xscale * 2.0f, vp.yscale * 2.0f, vp.xoffset - vp.xscale,
+                            vp.yoffset - vp.yscale, sc.GetWidth(), sc.GetHeight());
+        BBDumpPass(ids, line);
+    } else {
+        BBDumpPass({}, {});
+    }
     BBOnDraw(std::bit_width(key.mrt_mask),
              key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)],
              key.stage_hashes[static_cast<u32>(Shader::SwStage::Fragment)]);
@@ -457,8 +501,43 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    // BB 0.80 native chain: a compute pipeline of the scene passes seen touching a scene target
+    // runs at the internal size: its images internal-size, the game's size constants patched,
+    // its grid scaled. (0.76 ran it on output-size twins blitted up from the G-buffer.)
+    const bool bb_scene_phase = BB::Upscale::NativeScenePhase();
+    const bool bb_cs_scaled = bb_scene_phase && bb_scene_cs.contains(pipeline);
+    BB::Upscale::SetComputeScaled(bb_cs_scaled);
+    u32 bb_gw = 0, bb_gh = 0, bb_hw = 0, bb_hh = 0;
+    if (bb_cs_scaled && BB::Upscale::SceneScale(bb_gw, bb_gh, bb_hw, bb_hh) && bb_gw && bb_gh) {
+        bb_rt_guest_w = bb_gw;
+        bb_rt_guest_h = bb_gh;
+        bb_rt_scale_x = float(bb_hw) / float(bb_gw);
+        bb_rt_scale_y = float(bb_hh) / float(bb_gh);
+    }
+
     if (!BindResources(pipeline)) {
+        BB::Upscale::SetComputeScaled(false);
         return;
+    }
+    if (bb_scene_phase && !bb_cs_scaled && BB::Upscale::TakeComputeTouched()) {
+        if (bb_scene_cs.insert(pipeline).second && bb_scene_cs.size() <= 16) {
+            BB::Upscale::Checkpoint(fmt::format(
+                "native chain: compute pipeline {} (grid {}x{}x{}) uses scene targets in the scene "
+                "passes: internal size from its next dispatch ({} scene compute pipelines)",
+                static_cast<const void*>(pipeline), cs_program.dim_x, cs_program.dim_y,
+                cs_program.dim_z, bb_scene_cs.size()));
+        }
+    }
+    u32 bb_dx = cs_program.dim_x, bb_dy = cs_program.dim_y;
+    if (bb_rt_guest_w != 0) {
+        bb_dx = std::max<u32>(1, u32(std::ceil(float(bb_dx) * bb_rt_scale_x)));
+        bb_dy = std::max<u32>(1, u32(std::ceil(float(bb_dy) * bb_rt_scale_y)));
+    }
+    BB::Upscale::SetComputeScaled(false);
+    if (BBDumpOn()) {
+        BBDumpLog(fmt::format("dispatch {}x{}x{} (run {}x{}){}", cs_program.dim_x,
+                              cs_program.dim_y, cs_program.dim_z, bb_dx, bb_dy,
+                              bb_rt_guest_w != 0 ? " at the internal size" : ""));
     }
 
     if (needs_barrier) {
@@ -470,7 +549,7 @@ void Rasterizer::DispatchDirect() {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-    cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    cmdbuf.dispatch(bb_dx, bb_dy, cs_program.dim_z);
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -1134,6 +1213,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             vk::ImageView bb_view = *image_view.image_view;
             vk::ImageLayout bb_layout = image.backing->state.layout;
+            if (BBDumpOn()) {
+                BBDumpLog(fmt::format("  {} {:#x} {}x{} {}{}", is_storage ? "storage" : "samples",
+                                      image.info.guest_address, image.info.size.width,
+                                      image.info.size.height,
+                                      vk::to_string(image.info.pixel_format),
+                                      image.info.bb_scaled ? " internal" : ""));
+            }
             if (!is_storage && !image.info.props.is_depth &&
                 (BB::Upscale::Enabled() || BB::Analyze::Enabled())) {
                 BBNoteSample(image.info.guest_address, image.info.size.width,
@@ -1143,6 +1229,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 case BB::Upscale::Sample::Inject: {
                     const bool ok = BBInject(image_id, desc.view_info, bb_view, bb_layout);
                     BB::Upscale::OnInjected(ok, 0.0f);
+                    if (ok && BB::Upscale::NativePostPhase()) {
+                        BBNativeFillSource(image_id, desc); // 0.80
+                    }
                     break;
                 }
                 case BB::Upscale::Sample::Redirect:

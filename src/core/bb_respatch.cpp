@@ -139,7 +139,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     {
         // 0.75: which lines of work this build carries (bb-merge-075 = bb-native-073 + bb-fg-074).
         const std::string features =
-            "build 0.79 (bb-taa-079): 0.79 [taa] jitter log + per-SDK jitter sign + FSR phase count + BB_TAA_ALL; 0.76 native chain fixes (twin copies for every stale use, no fallback hold, phase per G-buffer, clean-up when off) + 0.73 native chain + 0.74 display meter/FG present. Carries: frame generation pacing of 0.70 (PaceGuestFlip grid, "
+            "build 0.80 (bb-native-080): 0.80 native chain (the lit scene colour is the only image upscaled across sizes, lighting / compute of the scene at the internal size, content check, BB_DUMP_FRAME) + 0.79 [taa] jitter log, per-SDK jitter sign, BB_TAA_ALL + 0.76 native chain fixes (twin copies for every stale use, no fallback hold, phase per G-buffer, clean-up when off) + 0.73 native chain + 0.74 display meter/FG present. Carries: frame generation pacing of 0.70 (PaceGuestFlip grid, "
             "FSR 3 midpoint slots kytyFfxSetPaceSlot / kytyFfxTakePaceStats, full-frame and "
             "high-res fixes) + 0.71 native chain (BB_SCENE_UPSCALE=native, viewport / MV pixels "
             "of scaled targets, BB_OBJMV_RIGID, Reflex markers at the first sceGnmSubmit, "
