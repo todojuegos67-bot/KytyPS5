@@ -190,7 +190,9 @@ https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/tag/v2.4.0) 
 `amd_fidelityfx_framegeneration_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from its `Kits\FidelityFX\signedbin` next
 to `kyty_emulator.exe` (only DLLs signed by AMD are loaded); the launcher's FSR checkbox is enabled then. It takes the
 place of DLSS frame generation. With these DLLs a Radeon RX 9000 card gets FSR 4 frame generation, and with the
-upscaler set to FSR, RX 7000 and 9000 cards (RX 6000 too) get FSR 4 upscaling; other cards get FSR 3.1. The older
+upscaler set to FSR, RX 7000 and 9000 cards (RX 6000 too) get FSR 4 upscaling; other cards get FSR 3.1. FSR 4 needs a
+current AMD driver: with Adrenalin 26.9.2 an RX 9070 showed a black 3D image with FSR 4 upscaling and black generated
+frames with FSR 4 frame generation, and a driver update fixed both (issue #271; AMD's SDK 2.4 names 26.10.1). The older
 `amd_fidelityfx_vk.dll` of the FidelityFX SDK 1.1.4 (FSR 3.1 frame generation) still works as well.
 "Overlay" (Off by default) shows the emulator's own panel at the top right of the game image: "Frame rate"
 the frames per second and a graph of the last frames' times (60 and 30 fps lines, hitches in red, the 1% low
