@@ -284,7 +284,9 @@ void Sample(
         std::string rk, mode, res, model;
         ImU32 col = kOrange;
         if (snap.has_up && up.running) {
-            rk = kind == Kind::Dlss ? "DLSS" : kind == Kind::Xess ? "XeSS" : kind == Kind::Fsr4 ? "FSR 4" : "FSR";
+            // bb-dcideas-094: what really runs: FSR 4.1.1 (bbport's replay) or FSR 4.0 for fsr4.
+            const bool v411 = kind == Kind::Fsr4 && BB::SR::Fsr4::Active411();
+            rk = kind == Kind::Dlss ? "DLSS" : kind == Kind::Xess ? "XeSS" : kind == Kind::Fsr4 ? (v411 ? "FSR 4.1.1" : "FSR 4.0") : "FSR 3.1";
             mode = ModeName(up.kind, up.quality);
             col = kind == Kind::Dlss ? kGreen : kind == Kind::Xess ? kBlue : kRed;
             const double ratio = up.render_h != 0 ? static_cast<double>(up.output_h) / up.render_h : 0.0;
@@ -301,7 +303,8 @@ void Sample(
             } else if (kind == Kind::Xess) {
                 model = "XeSS";
             } else if (kind == Kind::Fsr4) {
-                model = "FSR 4 (IA, modelo v07)";
+                model = BB::SR::Fsr4::Active411() ? std::string("FSR 4.1.1 (IA, ") + BB::SR::Fsr4::ModelName411() + ")"
+                                                  : "FSR 4.0 (IA, modelo v07)";
             } else {
                 model = "FSR 3.1";
             }
