@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 #include "video_core/bb/bb_antilag.h"
+#include "video_core/bb/bb_display.h"
 #include "video_core/bb/bb_dyn_multiplier.h"
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_fg_internal.h"
@@ -1528,6 +1529,15 @@ uint32_t PresentedFrames() {
     return g_presented_frames.load(std::memory_order_relaxed);
 }
 
+// The Streamline frame index of the present BeforePresent just began (0: none).
+uint32_t FrameIndexNow() {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    return g_token != nullptr ? g_frame_index : 0u;
+#else
+    return 0u;
+#endif
+}
+
 void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count) {
 #if defined(_WIN32) && defined(BB_STREAMLINE)
@@ -1627,6 +1637,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
     run_with = usable ? run_with + 1 : 0;
     run_without = usable ? 0 : run_without + 1;
     const bool mode_on = g_mode_set == 1 ? run_without < 30 : run_with >= 10;
+    Display::SetExpected(mode_on && usable ? CurrentGenerate() : 0);
     if (g_dynamic) {
         ApplyLimit(mode_on ? g_dyn_gen : -1);
     } else if (g_fixed_cap) {
@@ -1795,6 +1806,35 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             show("depth", inputs->depth);
             show("motion", inputs->motion);
             show("hudless", inputs->hudless);
+            {
+                const auto label = [](const char* name, const Image& img, bool tagged) {
+                    bool known = false;
+                    const uint32_t f = static_cast<uint32_t>(static_cast<VkFormat>(img.format));
+                    const char* format = Display::FormatLabel(f, &known);
+                    char text[200];
+                    std::snprintf(text, sizeof(text), "%s %s%s (%u) %ux%u%s", name,
+                                  tagged ? "" : "NOT TAGGED, ", format, f, img.extent.width,
+                                  img.extent.height, known ? "" : " [not in Streamline's table]");
+                    return std::string(text);
+                };
+                const uint32_t color = static_cast<uint32_t>(static_cast<VkFormat>(format));
+                bool color_known = false;
+                const char* color_name = Display::FormatLabel(color, &color_known);
+                Printf("[streamline] tagged resources: DLSS-G | %s | %s | %s | backbuffer %s (%u) "
+                       "%ux%u%s, region %d,%d %ux%u %s | UI: not tagged (the HUD-less image carries "
+                       "the HUD-less scene) | options formats: color %u, mvec %u, depth %u, "
+                       "HUD-less %u",
+                       label("depth", inputs->depth, true).c_str(),
+                       label("motion vectors", inputs->motion, true).c_str(),
+                       label("HUD-less", inputs->hudless, tag_hudless).c_str(), color_name, color,
+                       backbuffer.width, backbuffer.height, color_known ? "" : " [not in Streamline's table]",
+                       region.offset.x, region.offset.y, region.extent.width, region.extent.height,
+                       partial ? "(tagged as a subrect)" : "(whole backbuffer, not tagged)",
+                       color, static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT),
+                       static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT),
+                       tag_hudless ? static_cast<uint32_t>(static_cast<VkFormat>(inputs->hudless.format))
+                                   : color);
+            }
             Printf("[dlssg] tag hudless: tagged %s, options hudless format %u, backbuffer format %u",
                    tag_hudless ? "yes" : "no",
                    static_cast<uint32_t>(static_cast<VkFormat>(inputs->hudless.format)),
@@ -1853,13 +1893,21 @@ void AfterPresent() {
     }
     g_api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *g_token);
     const auto presents = ++g_presents;
+    // bb-fg-074: after every present (numFramesActuallyPresented is the frames shown for the
+    // present just made; polled every 30th present it was read as if it were one present's).
+    sl::DLSSGState state{};
+    const auto state_result = g_api.dlssg_get_state(sl::ViewportHandle{0}, state, nullptr);
+    if (state_result == sl::Result::eOk) {
+        Display::NoteStreamline(state.numFramesActuallyPresented,
+                                static_cast<uint32_t>(state.status), state.numFramesToGenerateMax);
+    }
     if (presents % 30 != 1) {
         return;
     }
-    sl::DLSSGState state{};
-    if (const auto result = g_api.dlssg_get_state(sl::ViewportHandle{0}, state, nullptr);
-        result != sl::Result::eOk) {
-        if (presents < 300) Printf("[dlssg] slDLSSGGetState failed (%d)", static_cast<int>(result));
+    if (state_result != sl::Result::eOk) {
+        if (presents < 300) {
+            Printf("[dlssg] slDLSSGGetState failed (%d)", static_cast<int>(state_result));
+        }
         return;
     }
     {
@@ -1998,6 +2046,52 @@ void SetPresentIndex(uint32_t index) {
     Dlssg::SetPresentIndex(index);
 }
 
+uint64_t NextPresentId() {
+    return Display::Issue(Dlssg::Ready() ? Dlssg::FrameIndexNow() : 0u);
+}
+
+vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
+                                        const std::vector<vk::PresentModeKHR>& available) {
+    std::string mode = "auto";
+    if (const char* v = std::getenv("BB_FG_PRESENT"); v != nullptr && *v != '\0') {
+        mode = v;
+        for (auto& ch : mode) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    const auto supported = [&](vk::PresentModeKHR m) {
+        return std::find(available.begin(), available.end(), m) != available.end();
+    };
+    vk::PresentModeKHR wanted = current;
+    const char* why = "";
+    if (mode == "fifo") {
+        wanted = vk::PresentModeKHR::eFifo;
+        why = "BB_FG_PRESENT=fifo";
+    } else if (mode == "mailbox") {
+        wanted = vk::PresentModeKHR::eMailbox;
+        why = "BB_FG_PRESENT=mailbox";
+    } else if (mode == "immediate") {
+        wanted = vk::PresentModeKHR::eImmediate;
+        why = "BB_FG_PRESENT=immediate";
+    } else if (mode == "auto" && Dlssg::Ready() &&
+               (current == vk::PresentModeKHR::eFifo || current == vk::PresentModeKHR::eFifoRelaxed)) {
+        // Streamline's guide (ProgrammingGuideDLSS_G.md 22.5): "VSync with Frame Generation is
+        // only supported on D3D12". Its pacer meters the presents itself; a vsynced swapchain
+        // under it holds or drops the generated frames.
+        wanted = supported(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
+                 : supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
+                                                           : current;
+        why = "DLSS-G on Vulkan has no vsync support (Streamline guide 22.5); BB_FG_PRESENT=fifo "
+              "keeps the emulator's mode";
+    }
+    if (wanted != current && !supported(wanted)) {
+        wanted = current;
+    }
+    if (wanted != current) {
+        Printf("[display] present mode %s -> %s (%s)", vk::to_string(current).c_str(),
+               vk::to_string(wanted).c_str(), why);
+    }
+    return wanted;
+}
+
 bool WantInputs() {
     return Dlssg::Ready() || Amd::Active();
 }
@@ -2090,6 +2184,7 @@ void ResolveAntiLag(const std::vector<std::string>& available) {
 void AddDeviceExtensions(const std::vector<std::string>& available,
                          std::vector<const char*>& extensions) {
     ResolveAntiLag(available);
+    Display::AddDeviceExtensions(available, extensions);
     const auto add = [&](const char* name) {
         if (!Has(available, name)) {
             return false;
@@ -2127,10 +2222,11 @@ void* ChainDeviceFeatures(const std::vector<const char*>& extensions, void* next
         g_present_id.pNext = next;
         next = &g_present_id;
     }
-    return next;
+    return Display::ChainDeviceFeatures(extensions, next);
 }
 
 QueuePlan PlanQueues(vk::PhysicalDevice physical, uint32_t graphics_family) {
+    Display::QueryFeatures(physical);
     return Amd::PlanQueues(physical, graphics_family);
 }
 
@@ -2138,12 +2234,14 @@ void OnDevice(vk::Instance, vk::PhysicalDevice physical, vk::Device device,
               uint32_t graphics_family, vk::Queue graphics_queue, const QueuePlan& plan,
               std::mutex* submit_mutex) {
     Amd::OnDevice(physical, device, graphics_family, graphics_queue, plan, submit_mutex);
+    Display::OnDevice(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
     Dlssg::OnDevice(physical);
     BB::AntiLag::OnDevice(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
                           g_antilag_ext, g_reflex_ext);
 }
 
 bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* out) {
+    Display::NotePresentMode(static_cast<int>(info.presentMode));
     return Amd::CreateSwapchain(info, out);
 }
 
@@ -2173,6 +2271,9 @@ void* ChainSwapchain(void* next) {
 
 void OnSwapchain(vk::SwapchainKHR swapchain) {
     BB::AntiLag::OnSwapchain(static_cast<VkSwapchainKHR>(swapchain), Amd::Active());
+    Display::OnSwapchain(swapchain, Amd::Active() ? Display::Path::Amd
+                                    : Dlssg::Ready() ? Display::Path::Dlss
+                                                     : Display::Path::Plain);
 }
 
 void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2D backbuffer,

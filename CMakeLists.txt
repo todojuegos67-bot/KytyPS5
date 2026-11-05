@@ -1193,6 +1193,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_dyn_multiplier.h
                src/video_core/bb/bb_dlss5.cpp
                src/video_core/bb/bb_dlss5.h
+               src/video_core/bb/bb_display.cpp
+               src/video_core/bb/bb_display.h
                src/video_core/bb/bb_fg.cpp
                src/video_core/bb/bb_fg.h
                src/video_core/bb/bb_fg_fsr3.cpp

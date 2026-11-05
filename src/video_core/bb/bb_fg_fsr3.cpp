@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "video_core/bb/bb_display.h"
 #include "video_core/bb/bb_dyn_multiplier.h"
 #include "video_core/bb/bb_fg_internal.h"
 #include "video_core/bb/bb_kyty_compat.h"
@@ -67,6 +68,9 @@ ffxQueryDescSwapchainReplacementFunctionsVK g_functions{};
 // Patched DLL: the grid slot of the next present; the presents' intervals (read and cleared).
 void (*g_set_pace_slot)(int64_t, int64_t) = nullptr;
 void (*g_take_pace_stats)(int64_t*) = nullptr;
+// bb-fg-074 (the display patch): the ids of the presents the DLL made, so each can be waited for.
+uint32_t (*g_take_display_ids)(uint64_t*, uint32_t) = nullptr;
+bool g_display_ids = false; // the game's presents carry ids and the DLL numbers every present
 
 ffxContext g_fg_context = nullptr;
 vk::Extent2D g_fg_display{};
@@ -442,6 +446,11 @@ bool LoadApi() {
             GetProcAddress(g_dll, "kytyFfxSetPaceSlot"));
         g_take_pace_stats =
             reinterpret_cast<void (*)(int64_t*)>(GetProcAddress(g_dll, "kytyFfxTakePaceStats"));
+        g_take_display_ids = reinterpret_cast<uint32_t (*)(uint64_t*, uint32_t)>(
+            GetProcAddress(g_dll, "kytyFfxTakeDisplayIds"));
+        Display::SetAmdHooks(reinterpret_cast<VkSwapchainKHR (*)(VkSwapchainKHR)>(
+                                 GetProcAddress(g_dll, "kytyFfxGetRealSwapchainVK")),
+                             g_take_display_ids);
         Printf("FSR3 FG: amd_fidelityfx_vk.dll loaded (%s)",
                patched ? "patched: multi frame generation x2-x4, dynamic"
                        : "AMD's signed DLL: x2 only");
@@ -584,6 +593,15 @@ bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* o
     create.presentQueue = {g_present_queue, g_game_family, nullptr};
     create.imageAcquireQueue = {g_acquire_queue, g_compute_family, nullptr};
     MfgInit();
+    g_display_ids = g_take_display_ids != nullptr && Display::IdsAvailable();
+    SetEnvironmentVariableA("KYTY_FSR3_DISPLAY_IDS", g_display_ids ? "1" : nullptr);
+    Printf("[display] FSR 3 presents: %s", g_display_ids
+               ? "every present to the driver (the generated frames too) carries its own id; the "
+                 "display clock waits for each (VK_KHR_present_wait)"
+               : g_take_display_ids == nullptr
+                     ? "AMD's / an older FidelityFX DLL: no ids for the generated frames, the "
+                       "display clock cannot time them (source=none)"
+                     : "present ids / VK_KHR_present_wait not available on this device (source=none)");
     {
         // Pacing floor (the patched DLL; AMD's ignores it): no present of the frame interpolation
         // swapchain closer than the display's refresh period x KYTY_FSR3_PACING_FLOOR (default 1.0,
@@ -682,6 +700,24 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
     const auto begin = std::chrono::steady_clock::now();
     VkPresentInfoKHR present = static_cast<VkPresentInfoKHR>(info);
     present.pNext = nullptr;
+    VkPresentIdKHR present_id{};
+    uint64_t game_id = 0;
+    if (g_display_ids) {
+        for (auto* node = static_cast<const VkBaseInStructure*>(info.pNext); node != nullptr;
+             node = node->pNext) {
+            if (node->sType == VK_STRUCTURE_TYPE_PRESENT_ID_KHR) {
+                const auto* id = reinterpret_cast<const VkPresentIdKHR*>(node);
+                if (id->swapchainCount > 0 && id->pPresentIds != nullptr) game_id = id->pPresentIds[0];
+                break;
+            }
+        }
+        if (game_id != 0) {
+            present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+            present_id.swapchainCount = 1;
+            present_id.pPresentIds = &game_id;
+            present.pNext = &present_id;
+        }
+    }
     const auto slot = BB::FG::PresentSlotNow();
     if (g_set_pace_slot != nullptr) {
         g_set_pace_slot(slot.qpc, slot.interval);
@@ -713,6 +749,7 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
 void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2D backbuffer,
                    vk::Format format) {
     if (!Active()) return;
+    Display::SetExpected(0);
     MfgInit();
     // G-SYNC / the dynamic target: real frames wait just enough for real x (1 + generated) to stay
     // under the cap. Only while generating; movies and menus untouched.
@@ -980,6 +1017,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         g_state_logged = 2;
     }
     g_generating = true;
+    Display::SetExpected(g_mfg.on ? g_mfg.current - 1 : 1);
 }
 
 #else // !_WIN32

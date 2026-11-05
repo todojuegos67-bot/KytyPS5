@@ -128,6 +128,14 @@ void GameFlipReserved();
 void GameRenderSubmit();
 // Before BeforePresent: the guest frame index of the frame presented (0: a repeat or none).
 void SetPresentIndex(uint32_t index);
+// bb-fg-074: the VkPresentIdKHR for the swapchain present about to be made (bb_display.h; 0: none).
+// Call once per Swapchain::Present, after BeforePresent.
+uint64_t NextPresentId();
+// The swapchain's present mode with frame generation on: DLSS-G on Vulkan has no vsync support
+// (Streamline's guide 22.5), so a FIFO mode becomes immediate / mailbox there. BB_FG_PRESENT=
+// auto (default) | user (the emulator's mode as is) | fifo | mailbox | immediate.
+vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
+                                        const std::vector<vk::PresentModeKHR>& available);
 // The game's flip submit (VideoOut): holds the real frames to the frame generation limit there
 // (BB_FG_PACE=guest, default). Returns the grid slot the flip was released at for FSR 3's frame
 // generation presents (none unless a fixed cap is generating).
