@@ -621,6 +621,40 @@ double Mean() {
     for (int i = 0; i < n; ++i) sum += g_ring[i];
     return sum / n;
 }
+
+// bb-dlssg-077: DLSS-G with no fps cap. The grid used to be the MEAN of the last 16 free frame
+// times: by construction about 40% of the flips take longer than the mean and miss their slot
+// ([pace] missed 20-30% of ~78, late 3-7 ms in the 11-05 run), and a missed flip re-phases the
+// grid, so the real frames DLSS-G interpolates between are unevenly spaced. DLSS-G needs even
+// real frames: the step is now a high quantile (default the 95th, BB_DLSSG_PACE_Q) of the last
+// 128 free frame times plus 0.5 ms, so the game's slow frames fit their slot and the rate is
+// what the game sustains 19 frames in 20. The cost is a real rate a little under the mean.
+constexpr int kLongWindow = 128;
+double g_long[kLongWindow]{};
+int g_long_count = 0;
+int g_long_next = 0;
+
+void AddLong(double free_seconds) {
+    g_long[g_long_next] = free_seconds;
+    g_long_next = (g_long_next + 1) % kLongWindow;
+    ++g_long_count;
+}
+
+// Seconds (0: too few samples yet).
+double LongQuantile() {
+    if (g_long_count < 48) return 0.0;
+    static const double q = [] {
+        const char* v = std::getenv("BB_DLSSG_PACE_Q");
+        const double x = v != nullptr && *v != '\0' ? std::atof(v) : 95.0;
+        return std::clamp(x, 50.0, 99.5) / 100.0;
+    }();
+    const int n = std::min(g_long_count, kLongWindow);
+    double sorted[kLongWindow];
+    std::copy(g_long, g_long + n, sorted);
+    std::sort(sorted, sorted + n);
+    const int idx = std::min(n - 1, static_cast<int>(std::ceil(q * n)) - 1);
+    return sorted[std::max(idx, 0)] + 0.0005;
+}
 } // namespace Adapt
 
 double PaceEffective() {
@@ -887,7 +921,10 @@ PresentSlot PaceGuestFlip() {
     const bool generating = Dlssg::Generating() || Amd::Generating();
     if (generating && Adapt::Enabled() && exited != Clock::time_point{}) {
         const double frame_s = std::chrono::duration<double>(arrive - exited).count();
-        if (frame_s > 0.0 && frame_s < 0.1) Adapt::Add(frame_s);
+        if (frame_s > 0.0 && frame_s < 0.1) {
+            Adapt::Add(frame_s);
+            if (Dlssg::Generating()) Adapt::AddLong(frame_s);
+        }
     }
     double interval = Dlssg::PaceInterval();
     if (interval <= 0.0) interval = Amd::PaceInterval();
@@ -906,7 +943,8 @@ PresentSlot PaceGuestFlip() {
     } else if (cap > 0) {
         interval = std::max(interval, 1.0 / cap);
     } else if (generating && Adapt::Enabled()) {
-        interval = std::max(interval, Adapt::Mean());
+        const double target = Dlssg::Generating() ? Adapt::LongQuantile() : 0.0;
+        interval = std::max(interval, target > 0.0 ? target : Adapt::Mean());
     }
     Adapt::g_last = interval;
     // The per-second [pace] line (and the auto cap's window).
@@ -1044,6 +1082,7 @@ struct Api {
     PFun_slDLSSGGetState* dlssg_get_state = nullptr;
     PFun_slReflexSetOptions* reflex_set_options = nullptr;
     PFun_slReflexSleep* reflex_sleep = nullptr;
+    PFun_slReflexGetState* reflex_get_state = nullptr; // bb-dlssg-077: the latency report
     PFun_slPCLSetMarker* pcl_set_marker = nullptr;
 } g_api;
 sl::ReflexOptions g_reflex_opts{};
@@ -1060,6 +1099,9 @@ Clock::time_point g_present_begin{};
 // The per-second line.
 Clock::time_point g_stat_start{};
 uint32_t g_stat_real = 0, g_stat_on = 0, g_stat_hudless = 0;
+// bb-dlssg-077: what DLSS-G was given, a second at a time ([dlssg] inputs last second).
+uint32_t g_stat_untagged = 0, g_stat_nohudless = 0, g_stat_hudless_size = 0, g_stat_reset = 0,
+         g_stat_nocamera = 0, g_stat_inputs = 0;
 uint32_t g_last_status = 0;
 double g_stat_present_ms = 0, g_stat_present_max = 0;
 double g_pace_n = 0, g_pace_sum = 0, g_pace_sq = 0, g_pace_max = 0;
@@ -1276,6 +1318,7 @@ void OnDevice(vk::PhysicalDevice physical) {
     }
     // slReflexSleep each frame (KYTY_DLSSG_SLEEP=0: not): DLSS-G requires Reflex active.
     Feature(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
+    Feature(sl::kFeatureReflex, "slReflexGetState", g_api.reflex_get_state);
     sl::ReflexOptions& reflex = g_reflex_opts;
     reflex = {};
     reflex.mode = sl::ReflexMode::eLowLatency;
@@ -1623,6 +1666,13 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                    g_dynamic ? "dynamic" : "fixed", shown_per, g_stat_real / window,
                    g_stat_real / window * static_cast<double>(shown_per), g_stat_on, g_stat_real,
                    g_stat_present_ms / n, g_stat_present_max, g_stat_hudless, g_last_status);
+            Printf("[dlssg] inputs last second: %u frames with inputs (no tags on %u without), HUD-less "
+                   "tagged %u, without a HUD-less image %u, HUD-less size != game image %u, "
+                   "camera invalid %u, reset %u",
+                   g_stat_inputs, g_stat_untagged, g_stat_hudless, g_stat_nohudless,
+                   g_stat_hudless_size, g_stat_nocamera, g_stat_reset);
+            g_stat_untagged = g_stat_nohudless = g_stat_hudless_size = g_stat_reset =
+                g_stat_nocamera = g_stat_inputs = 0;
             g_stat_hudless = 0;
             g_stat_start = now;
             g_stat_real = 0;
@@ -1752,9 +1802,10 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         sl::Resource motion = ToResource(inputs->motion);
         sl::Resource hudless = ToResource(inputs->hudless);
         const sl::Extent full{0, 0, inputs->render.width, inputs->render.height};
-        // sl::Extent is {left, top, width, height}: the game image's offset is x (left), y (top).
-        const sl::Extent game{static_cast<uint32_t>(region.offset.x),
-                              static_cast<uint32_t>(region.offset.y), region.extent.width,
+        // sl::Extent is {top, left, width, height} (sl_consts.h): the game image's offset is y
+        // (top) then x (left). (bb-dlssg-077: it was given x first; only a subrect shows it.)
+        const sl::Extent game{static_cast<uint32_t>(region.offset.y),
+                              static_cast<uint32_t>(region.offset.x), region.extent.width,
                               region.extent.height};
         const bool partial = region.offset.x != 0 || region.offset.y != 0 ||
                              region.extent.width != backbuffer.width ||
@@ -1780,6 +1831,14 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
         const bool tag_hudless = hudless_tag && inputs->has_hudless &&
                                  inputs->hudless.extent.width == region.extent.width &&
                                  inputs->hudless.extent.height == region.extent.height;
+        ++g_stat_inputs;
+        if (!inputs->camera_valid) ++g_stat_nocamera;
+        if (inputs->reset) ++g_stat_reset;
+        if (!inputs->has_hudless) {
+            ++g_stat_nohudless;
+        } else if (!tag_hudless && hudless_tag) {
+            ++g_stat_hudless_size;
+        }
         if (tag_hudless) {
             ++g_stat_hudless;
             tags.emplace_back(&hudless, sl::kBufferTypeHUDLessColor,
@@ -1840,6 +1899,43 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                    static_cast<uint32_t>(static_cast<VkFormat>(inputs->hudless.format)),
                    static_cast<uint32_t>(static_cast<VkFormat>(format)));
         }
+        static bool constants_dumped = false;
+        if (!constants_dumped && inputs->camera_valid) {
+            // Once per run, the first frame with a camera: every value DLSS-G is given (the
+            // matrices as Streamline gets them, row-vector, i.e. transposed), to compare with
+            // what FSR 3 gets ([fsr3] inputs).
+            constants_dumped = true;
+            const auto m = [](const sl::float4x4& x) {
+                char text[260];
+                std::snprintf(text, sizeof(text), "[%.5g %.5g %.5g %.5g | %.5g %.5g %.5g %.5g | "
+                              "%.5g %.5g %.5g %.5g | %.5g %.5g %.5g %.5g]", x.row[0].x, x.row[0].y,
+                              x.row[0].z, x.row[0].w, x.row[1].x, x.row[1].y, x.row[1].z,
+                              x.row[1].w, x.row[2].x, x.row[2].y, x.row[2].z, x.row[2].w,
+                              x.row[3].x, x.row[3].y, x.row[3].z, x.row[3].w);
+                return std::string(text);
+            };
+            Printf("[dlssg] constants: frame %u mvecScale %.7g %.7g (vectors in render pixels towards "
+                   "the previous frame, x scale = UV) jitter %.4f %.4f near %.6g far %.6g fov %.5g "
+                   "aspect %.5g depthInverted %d cameraMotionIncluded %d motionVectors3D %d "
+                   "orthographic %d dilated %d jittered %d reset %d invalid-mv %g | render %ux%u, "
+                   "depth %ux%u, motion %ux%u, HUD-less %ux%u, backbuffer %ux%u",
+                   g_frame_index, constants.mvecScale.x, constants.mvecScale.y,
+                   constants.jitterOffset.x, constants.jitterOffset.y, constants.cameraNear,
+                   constants.cameraFar, constants.cameraFOV, constants.cameraAspectRatio,
+                   static_cast<int>(constants.depthInverted),
+                   static_cast<int>(constants.cameraMotionIncluded),
+                   static_cast<int>(constants.motionVectors3D),
+                   static_cast<int>(constants.orthographicProjection),
+                   static_cast<int>(constants.motionVectorsDilated),
+                   static_cast<int>(constants.motionVectorsJittered),
+                   static_cast<int>(constants.reset), static_cast<double>(constants.motionVectorsInvalidValue),
+                   inputs->render.width, inputs->render.height, depth.width, depth.height,
+                   motion.width, motion.height, hudless.width, hudless.height, backbuffer.width,
+                   backbuffer.height);
+            Printf("[dlssg] constants cameraViewToClip %s", m(constants.cameraViewToClip).c_str());
+            Printf("[dlssg] constants clipToPrevClip %s", m(constants.clipToPrevClip).c_str());
+            Printf("[dlssg] constants clipToCameraView %s", m(constants.clipToCameraView).c_str());
+        }
         static bool dumped = false;
         if (!dumped) {
             dumped = true;
@@ -1858,14 +1954,12 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                    static_cast<int>(tag_result));
         }
     } else {
-        // No 3D frame: no tags at all. The former null depth and motion tags had no format
-        // (Streamline: "Cannot have undefined format", about 2 a frame on menus and loads).
-        static uint32_t empty_failures = 0;
-        const auto empty_result =
-            g_api.set_tag_for_frame(token, viewport, nullptr, 0, nullptr);
-        if (empty_result != sl::Result::eOk && empty_failures++ < 4) {
-            Printf("[dlssg] empty tag set refused (%d)", static_cast<int>(empty_result));
-        }
+        // No 3D frame: no tags at all. bb-dlssg-077: slSetTagForFrame with no resources is not a
+        // valid call (Streamline answers eErrorInvalidParameter, 25, "empty tag set refused" on
+        // every menu / loading frame); the tags of a frame are valid until its present only, so
+        // there is nothing to clear: the call is not made. (The former null depth and motion tags
+        // had no format: "Cannot have undefined format", about 2 a frame.)
+        ++g_stat_untagged;
     }
     if (guest_index == 0) g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
     g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
@@ -1900,6 +1994,23 @@ void AfterPresent() {
     if (state_result == sl::Result::eOk) {
         Display::NoteStreamline(state.numFramesActuallyPresented,
                                 static_cast<uint32_t>(state.status), state.numFramesToGenerateMax);
+    }
+    // bb-dlssg-077: the Reflex latency report, a clock Streamline keeps for the real frames that is
+    // not ours (see Display::NoteGpuEnds); polled every 40 presents from this thread only.
+    if (presents % 40 == 7 && g_api.reflex_get_state != nullptr) {
+        static sl::ReflexState* report = new sl::ReflexState{};
+        if (g_api.reflex_get_state(*report) == sl::Result::eOk && report->latencyReportAvailable) {
+            uint64_t ids[sl::kReflexFrameReportCount], ends[sl::kReflexFrameReportCount];
+            uint32_t n = 0;
+            for (const auto& f : report->frameReport) {
+                if (f.frameID != 0 && f.gpuRenderEndTime != 0) {
+                    ids[n] = f.frameID;
+                    ends[n] = f.gpuRenderEndTime;
+                    ++n;
+                }
+            }
+            Display::NoteGpuEnds(ids, ends, n);
+        }
     }
     if (presents % 30 != 1) {
         return;
@@ -2076,11 +2187,18 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
         // Streamline's guide (ProgrammingGuideDLSS_G.md 22.5): "VSync with Frame Generation is
         // only supported on D3D12". Its pacer meters the presents itself; a vsynced swapchain
         // under it holds or drops the generated frames.
-        wanted = supported(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
-                 : supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
-                                                           : current;
-        why = "DLSS-G on Vulkan has no vsync support (Streamline guide 22.5); BB_FG_PRESENT=fifo "
-              "keeps the emulator's mode";
+        // bb-dlssg-077: mailbox first. Immediate (the 0.74 choice) tears on a fixed-rate monitor
+        // and shows nothing the mailbox does not: mailbox never blocks the presenting thread (so
+        // Streamline's own pacing decides when an image goes out, which a blocking FIFO present
+        // defeats on Vulkan), does not tear, and on a VRR display the images are shown as they
+        // arrive. Its cost: with more images than refreshes the older one is replaced (dropped),
+        // visible in [display] dropped. Immediate only where mailbox is not offered.
+        wanted = supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
+                 : supported(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
+                                                             : current;
+        why = "DLSS-G on Vulkan has no vsync support (Streamline guide 22.5): mailbox does not "
+              "block Streamline's pacer and does not tear; BB_FG_PRESENT=fifo|immediate|user "
+              "overrides";
     }
     if (wanted != current && !supported(wanted)) {
         wanted = current;

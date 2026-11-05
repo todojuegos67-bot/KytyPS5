@@ -44,6 +44,10 @@ uint64_t Issue(uint64_t preferred);
 // slDLSSGGetState after a present: the frames shown for it.
 void NoteStreamline(uint32_t presented, uint32_t status, uint32_t generate_max);
 
+// bb-dlssg-077: the Reflex latency report's GPU completion times (microseconds, driver clock) of
+// the real frames, by Streamline frame index: DLSS-G's interval when the present ids do not complete.
+void NoteGpuEnds(const uint64_t* frame_ids, const uint64_t* end_us, uint32_t n);
+
 // VK_FORMAT label and whether Streamline's format table (sl.chi vulkan.cpp getFormat) has it.
 const char* FormatLabel(uint32_t vk_format, bool* known_to_streamline);
 

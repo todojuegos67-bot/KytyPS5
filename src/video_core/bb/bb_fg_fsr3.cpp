@@ -967,6 +967,21 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     prepare.cameraFovAngleVertical =
         EnvFloat("KYTY_FSR3_FOV", inputs->fov_y > 0.0f ? inputs->fov_y : camera.fov);
     prepare.viewSpaceToMetersFactor = 1.0f;
+    {
+        // bb-dlssg-077: once, what FSR 3 is given, to set beside "[dlssg] constants" (DLSS-G).
+        static bool said = false;
+        if (!said && inputs->camera_valid) {
+            said = true;
+            Printf("[fsr3] inputs: frame %llu motionVectorScale %.3f %.3f (vectors in render pixels "
+                   "towards the previous frame) jitter %.4f %.4f near %.6g far %.6g fov %.5g "
+                   "depthInverted %d reset %d render %ux%u",
+                   static_cast<unsigned long long>(g_frame_id), prepare.motionVectorScale.x,
+                   prepare.motionVectorScale.y, prepare.jitterOffset.x, prepare.jitterOffset.y,
+                   prepare.cameraNear, prepare.cameraFar, prepare.cameraFovAngleVertical,
+                   inputs->depth_inverted ? 1 : 0, inputs->reset ? 1 : 0, inputs->render.width,
+                   inputs->render.height);
+        }
+    }
     prepare.depth = ImageResource(inputs->depth, true);
     prepare.motionVectors = ImageResource(inputs->motion, false);
     ffxDispatchDescFrameGenerationPrepareCameraInfo camera_info{};

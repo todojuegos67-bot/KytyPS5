@@ -76,6 +76,10 @@ struct State {
     int64_t sl_balance = 0;
     int64_t sl_reported = 0;
     std::unordered_map<uint64_t, Group> groups;
+    // bb-dlssg-077: the Reflex latency report's GPU completion times of the real frames (Streamline
+    // keeps them with the driver's clock, not ours): the ms between consecutive ones.
+    std::vector<double> gpu_intervals;
+    uint64_t gpu_last_id = 0, gpu_last_end = 0;
     bool started = false;
     std::thread thread;
 };
@@ -170,6 +174,11 @@ void Report(State& s, Window& w, Clock::time_point now) {
     }
     ids = IdsAvailable();
     const bool waited = w.done_all > 0;
+    std::vector<double> gpu_iv;
+    {
+        std::lock_guard lock{s.mutex};
+        gpu_iv.swap(s.gpu_intervals);
+    }
     double shown = -1.0, real = -1.0, generated = -1.0;
     const char* source = "none";
     const char* interval_of = "none";
@@ -207,6 +216,23 @@ void Report(State& s, Window& w, Clock::time_point now) {
             interval_of = "real images only";
         }
     }
+    // DLSS-G: Streamline presents the images itself and the present ids do not complete through
+    // it (waits 0 ok): the interval then comes from the Reflex report, the real frames' GPU
+    // completion on the driver's clock, only if it matches the real frame rate (else not used).
+    const std::vector<double>* iv = &w.intervals;
+    const char* gpu_note = "";
+    if (path == Path::Dlss && !waited && gpu_iv.size() >= 5) {
+        double sum = 0.0;
+        for (double v : gpu_iv) sum += v;
+        const double mean = sum / static_cast<double>(gpu_iv.size());
+        const double expect = real_issued > 0 ? 1000.0 * win / real_issued : 0.0;
+        if (expect > 0.0 && mean > 0.7 * expect && mean < 1.4 * expect) {
+            iv = &gpu_iv;
+            interval_of = "real frames' GPU completion, Reflex report; not the display";
+        } else {
+            gpu_note = " [Reflex report clock did not match the real frame rate: not used]";
+        }
+    }
     if (real_issued == 0 && !waited && sl_calls == 0) {
         w.intervals.clear();
         w.done_all = w.done_real = w.done_gen = 0;
@@ -221,9 +247,9 @@ void Report(State& s, Window& w, Clock::time_point now) {
     } else {
         std::snprintf(fps, sizeof(fps), "shown n/a (real %.1f, generated n/a)", real_issued / win);
     }
-    char interval[160];
-    if (w.intervals.size() >= 5) {
-        std::vector<double> sorted = w.intervals;
+    char interval[200];
+    if ((*iv).size() >= 5) {
+        std::vector<double> sorted = (*iv);
         std::sort(sorted.begin(), sorted.end());
         double sum = 0.0, sq = 0.0;
         for (double v : sorted) {
@@ -239,7 +265,7 @@ void Report(State& s, Window& w, Clock::time_point now) {
                       "interval mean %.2f ms, sd %.2f ms, p99 %.2f ms, max %.1f ms (%zu, %s)", mean,
                       sd, sorted[idx], sorted.back(), sorted.size(), interval_of);
     } else {
-        std::snprintf(interval, sizeof(interval), "interval n/a (%zu measured)", w.intervals.size());
+        std::snprintf(interval, sizeof(interval), "interval n/a (%zu measured)", (*iv).size());
     }
     char why[160]{};
     if (std::strcmp(source, "none") == 0) {
@@ -254,6 +280,17 @@ void Report(State& s, Window& w, Clock::time_point now) {
         std::snprintf(sl, sizeof(sl), ", Streamline status 0x%x, up to %u generated", sl_status,
                       sl_max);
     }
+    if (path == Path::Dlss && !waited && w.waits_timeout > 0 && w.waits_ok == 0) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Printf("[display] DLSS-G: none of the present ids chained to the game's presents completed "
+                   "(%u timeouts, 0 ok): Streamline presents through its own swapchain and the id does "
+                   "not reach the driver, so there is no display clock here; shown/real/generated come "
+                   "from sl::DLSSGState, the interval from the Reflex report when it matches",
+                   w.waits_timeout);
+        }
+    }
     Printf("[display] %s, %s, dropped %llu (%.2f%% of %llu expected), source=%s%s, present mode %s, "
            "waits %u ok / %u timeout%s",
            fps, interval, static_cast<unsigned long long>(acct_dropped),
@@ -262,6 +299,7 @@ void Report(State& s, Window& w, Clock::time_point now) {
                               : 0.0,
            static_cast<unsigned long long>(acct_expected), source, why, PresentModeName(mode),
            w.waits_ok, w.waits_timeout, sl);
+    if (gpu_note[0] != '\0') Printf("[display]%s", gpu_note);
     w.intervals.clear();
     w.done_all = w.done_real = w.done_gen = 0;
     w.waits_ok = w.waits_timeout = 0;
@@ -523,6 +561,27 @@ uint64_t Issue(uint64_t preferred) {
         if (s.queue.size() > 256) s.queue.pop_front();
     }
     return id;
+}
+
+void NoteGpuEnds(const uint64_t* frame_ids, const uint64_t* end_us, uint32_t n) {
+    if (!Wanted() || n == 0) return;
+    // (ordered by frame id; the report is a ring of 64 frames, polled every ~40 presents)
+    std::vector<std::pair<uint64_t, uint64_t>> frames;
+    frames.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) frames.emplace_back(frame_ids[i], end_us[i]);
+    std::sort(frames.begin(), frames.end());
+    State& s = S();
+    std::lock_guard lock{s.mutex};
+    for (const auto& f : frames) {
+        if (f.first <= s.gpu_last_id) continue;
+        if (s.gpu_last_end != 0 && f.second > s.gpu_last_end) {
+            const double ms = static_cast<double>(f.second - s.gpu_last_end) / 1000.0;
+            if (ms < 250.0) s.gpu_intervals.push_back(ms);
+        }
+        s.gpu_last_id = f.first;
+        s.gpu_last_end = f.second;
+    }
+    if (s.gpu_intervals.size() > 4096) s.gpu_intervals.erase(s.gpu_intervals.begin(), s.gpu_intervals.begin() + 2048);
 }
 
 void NoteStreamline(uint32_t presented, uint32_t status, uint32_t generate_max) {
