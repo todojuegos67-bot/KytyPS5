@@ -76,12 +76,27 @@ struct State {
     std::unordered_map<u64, Entry> prev, cur;
     std::unordered_map<u64, u32> ordinals;
     std::unordered_map<u64, u64> palettes; // small skeletons: last palette hash
+    // 0.71 rigid objects (no bone palette): last hash of the draw's own vertex constants (its
+    // object transform); a draw whose constants changed since the previous frame moved by itself.
+    std::unordered_map<u64, u64> rigid;
+    u32 rigid_used = 0;                     // positions stored for rigid draws this frame
+    u32 rigid_seen = 0, rigid_changed = 0;  // this frame
+    bool rigid_camera_bound = false;        // last frame: most rigid draws changed (camera in them)
     // Stats (since the last report).
     u64 st_motion_draws = 0, st_tracked = 0, st_loaded = 0, st_overflow = 0, st_gated = 0,
         st_frames = 0, st_composed = 0, st_composed_late = 0, st_overflow_large = 0;
     u32 st_overflow_max = 0; // largest dropped draw (positions)
+    u64 st_rigid_tracked = 0, st_rigid_static = 0, st_rigid_budget = 0, st_rigid_camera = 0;
 };
 State g;
+
+bool RigidOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("BB_OBJMV_RIGID");
+        return s == nullptr || s[0] != '0';
+    }();
+    return on;
+}
 
 bool EnvOff() {
     const char* s = std::getenv("BB_OBJMV");
@@ -273,13 +288,21 @@ u64 Hash(const void* data, size_t size, u64 seed = 0) {
 // The draw's bone palette among its vertex shader's constant buffers (deadinside28's
 // Motion::ClassifyBuffer): 864 bytes is the scene block; 640..16384 a character skeleton; 96..639
 // in 48-byte (3x4) matrices a small skeleton (weapons, props: most of them static).
-enum class Palette { None, Small, Large };
-Palette Classify(const Shader::Info& vs, VAddr& small_address, u32& small_size) {
+// 0.71: no palette but per-draw constants (a rigid object's transform, 16..1024 bytes, not the
+// scene block): Rigid, with their hash in rigid_hash.
+enum class Palette { None, Small, Large, Rigid };
+Palette Classify(const Shader::Info& vs, VAddr& small_address, u32& small_size, u64& rigid_hash) {
     Palette found = Palette::None;
+    u64 h = 0;
+    bool any = false;
     for (const auto& desc : vs.buffers) {
         if (desc.IsSpecial() || desc.is_written) continue;
         const auto sharp = desc.GetSharp(vs);
         const u32 size = sharp.GetSize();
+        if (size != 864 && size >= 16 && size <= 1024 && sharp.base_address != 0) {
+            h = XXH3_64bits_withSeed(reinterpret_cast<const void*>(sharp.base_address), size, h);
+            any = true;
+        }
         if (size == 864 || size < 96 || size > 16384) continue;
         if (size >= 640 && size % 16 == 0) return Palette::Large;
         if (size < 640 && size % 48 == 0 && found == Palette::None) {
@@ -287,6 +310,10 @@ Palette Classify(const Shader::Info& vs, VAddr& small_address, u32& small_size) 
             small_address = sharp.base_address;
             small_size = size;
         }
+    }
+    if (found == Palette::None && any && RigidOn()) {
+        rigid_hash = h;
+        return Palette::Rigid;
     }
     return found;
 }
@@ -370,7 +397,8 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
 
     VAddr palette_address = 0;
     u32 palette_size = 0;
-    const Palette palette = Classify(vs, palette_address, palette_size);
+    u64 rigid_hash = 0;
+    const Palette palette = Classify(vs, palette_address, palette_size, rigid_hash);
     if (palette == Palette::None || fetch.Empty() || fetch.attributes.empty()) return;
     const auto vb = fetch.attributes[0].GetSharp(vs);
     if (vb.GetStride() == 0) return;
@@ -407,6 +435,31 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
             ++g.st_gated;
             return;
         }
+    }
+    if (palette == Palette::Rigid) {
+        // A static object's constants do not change and the camera motion is exact for it. When
+        // most of them change every frame the constants hold the camera (a per-draw
+        // view-projection): the camera motion is exact for those too, and storing every draw would
+        // take the budget from the skinned ones, so rigid tracking waits for a frame without that.
+        ++g.rigid_seen;
+        auto [it, inserted] = g.rigid.try_emplace(key, rigid_hash);
+        const bool changed = !inserted && it->second != rigid_hash;
+        it->second = rigid_hash;
+        if (!changed) {
+            ++g.st_rigid_static;
+            return;
+        }
+        ++g.rigid_changed;
+        if (g.rigid_camera_bound) {
+            ++g.st_rigid_camera;
+            return;
+        }
+        if (count > 65536 || g.rigid_used + count > g.per_half / 4) {
+            ++g.st_rigid_budget;
+            return;
+        }
+        g.rigid_used += count;
+        ++g.st_rigid_tracked;
     }
 
     const u32 half = static_cast<u32>(g.frame & 1);
@@ -495,6 +548,9 @@ void OnFlip() {
     g.latched = g.written;
     g.written = false;
     if (g.palettes.size() > 65536) g.palettes.clear();
+    if (g.rigid.size() > 65536) g.rigid.clear();
+    g.rigid_camera_bound = g.rigid_seen >= 64 && g.rigid_changed * 2 > g.rigid_seen;
+    g.rigid_seen = g.rigid_changed = g.rigid_used = 0;
     if (g.st_frames >= 1800) {
         Log(fmt::format("last {} frames: {} G-buffer draws with the motion pipeline, {} tracked "
                         "(skinned / moving), {} with last frame's positions (object vectors), {} "
@@ -505,6 +561,12 @@ void OnFlip() {
                         g.st_frames, g.st_motion_draws, g.st_tracked, g.st_loaded, g.st_gated,
                         g.st_overflow, g.st_composed, g.st_composed_late, g.per_half,
                         g.st_overflow_large, g.st_overflow_max));
+        Log(fmt::format("rigid objects (BB_OBJMV_RIGID): last {} frames {} draws moved by their "
+                        "own constants and got object vectors, {} unchanged (camera motion), {} "
+                        "skipped (camera in the constants), {} over the rigid budget",
+                        g.st_frames, g.st_rigid_tracked, g.st_rigid_static, g.st_rigid_camera,
+                        g.st_rigid_budget));
+        g.st_rigid_tracked = g.st_rigid_static = g.st_rigid_budget = g.st_rigid_camera = 0;
         g.st_frames = g.st_motion_draws = g.st_tracked = g.st_loaded = g.st_gated =
             g.st_overflow = g.st_composed = g.st_composed_late = g.st_overflow_large = 0;
         g.st_overflow_max = 0;
