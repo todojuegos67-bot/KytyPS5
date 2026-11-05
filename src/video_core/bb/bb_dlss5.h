@@ -35,6 +35,9 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
               VmaAllocator allocator);
 // After the upscaler wrote desc.output (RGBA16F, GENERAL): NR in place. False: the frame unchanged.
 bool Apply(const SR::Desc& desc);
+// 0.89: one call per upscaler run (before Apply): ok = the back end wrote the output, window =
+// the window / present-time path (post-processed input), for the "[dlss5] last second" line.
+void NoteUpscale(bool ok, bool window);
 std::string StatusLine();
 
 } // namespace BB::Dlss5

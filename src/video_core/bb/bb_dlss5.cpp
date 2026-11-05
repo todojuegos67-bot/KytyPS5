@@ -1196,8 +1196,42 @@ std::string StatusLine() {
 
 // The NR pass on desc.output (RGBA16F, GENERAL, storage + transfer): the upscaler's picture copied
 // to `keep`, encoded onto the working grid, evaluated, resolved back in place.
+// 0.89: "[dlss5] last second" counters.
+struct SecondStats {
+	uint32_t upscales = 0, failed_upscales = 0, window = 0, calls = 0, evaluated = 0, reset = 0, reset_cut = 0, reset_feature = 0,
+	         no_camera = 0, not_evaluated = 0;
+};
+SecondStats g_sec;
+void SecondLine() {
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(1)) return;
+	last = now;
+	const SecondStats s = g_sec;
+	g_sec               = {};
+	if (s.upscales == 0 && s.calls == 0) return;
+	// "output overwritten": upscaled frames whose presented image does not carry this frame's DLSS 5 result (the
+	// upscaler failed, DLSS 5 was skipped / not evaluated, or it ran on the window path's post-processed image).
+	const uint32_t overwritten = s.failed_upscales + s.window + (s.calls - s.evaluated);
+	LOG_INFO(Render_Vulkan,
+	         "[BB_UPSCALE] [dlss5] last second: evaluated {}, reset {} (camera cut / first frame {}, feature created {}), output overwritten {} "
+	         "(upscaler failed {}, window path {}, not evaluated {}); upscales {}, frames without a camera (zero camera motion) {}",
+	         s.evaluated, s.reset, s.reset_cut, s.reset_feature, overwritten, s.failed_upscales, s.window, s.calls - s.evaluated, s.upscales,
+	         s.no_camera);
+}
+
+void NoteUpscale(bool ok, bool window) {
+	if (!Wanted()) return;
+	++g_sec.upscales;
+	if (!ok) ++g_sec.failed_upscales;
+	if (ok && window) ++g_sec.window;
+	SecondLine();
+}
+
 bool Apply(const SR::Desc& desc) {
 	if (!Wanted() || !g_device_ok || g.disabled) return false;
+	++g_sec.calls;
+	if (!desc.camera_valid) ++g_sec.no_camera;
 	const auto skip = [](const char* why) {
 		static std::string last;
 		if (last != why) {
@@ -1344,6 +1378,9 @@ bool Apply(const SR::Desc& desc) {
 	p.Set("DLSSNR.Enabled", 1);
 	const bool reset = g.pending_reset || desc.reset;
 	p.Set("DLSSNR.Reset", reset ? 1 : 0);
+	if (reset) ++g_sec.reset;
+	if (desc.reset) ++g_sec.reset_cut;
+	if (g.pending_reset) ++g_sec.reset_feature;
 	g.pending_reset = false;
 	SetSteering(p);
 	const uint32_t eval_result = CallEvaluate(g_rt.evaluate, static_cast<VkCommandBuffer>(command), g.feature, &p);
@@ -1351,7 +1388,7 @@ bool Apply(const SR::Desc& desc) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	if (timed) command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * Stamps + 2);
 	const bool evaluated = eval_result == NgxSuccess;
-	if (evaluated) ++g.eval_ok;
+	if (evaluated) ++g.eval_ok, ++g_sec.evaluated;
 	if (!evaluated) {
 		g.last_error = eval_result;
 		++g.eval_failures;

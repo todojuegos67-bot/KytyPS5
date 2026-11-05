@@ -381,6 +381,7 @@ bool LooksLikeViewProj(const Mat& v) {
     return true;
 }
 
+u32 g_sec_cam_switch = 0; // 0.89: frames whose camera came from another source than the last
 struct Candidate {
     Mat m;
     u32 count = 0;
@@ -436,6 +437,7 @@ struct Learned {
     u32 skip_age = 0;
     u32 stable = 0;
     bool have_prev_vp = false;
+    bool prev_vp_block = false; // 0.89: prev_vp came from the scene constant block's camera
     Mat prev_vp;
     bool last_injected = false;
     bool last_fg_native = false; // 0.39: the previous frame had FG-only (native) inputs
@@ -799,7 +801,16 @@ void FillCamera(Plan& p) {
     const Mat& vp = cam->m;
     Mat inv;
     if (!Invert(vp, inv)) return;
-    const Mat prev = g_learned.have_prev_vp ? g_learned.prev_vp : vp;
+    // 0.89: the previous camera only from the same source. Bloodborne's scene constant block
+    // camera (count 1000000) is missing on some frames and a scanned candidate wins instead (or
+    // the other way): clip_to_prev_clip then maps between two different matrices, the motion
+    // vectors of that frame and the next are garbage (camera delta spikes of 0.2..5.5 NDC with the
+    // camera still), and every temporal consumer of the in-place output (DLSS 5's history, DLSS-G
+    // / FSR 3 FG) rejects its history and re-converges. Such a frame now gets zero camera motion.
+    const bool block_now = cam->count >= 1000000;
+    const bool same_src = g_learned.have_prev_vp && g_learned.prev_vp_block == block_now;
+    if (g_learned.have_prev_vp && !same_src) ++g_sec_cam_switch;
+    const Mat prev = same_src ? g_learned.prev_vp : vp;
     const Mat to_prev = Multiply(prev, inv);
     for (int i = 0; i < 16; ++i) {
         p.view_to_clip[i] = static_cast<float>(vp.m[i]);
@@ -999,7 +1010,7 @@ void SrReset(Plan& p) {
     }
     static const double cut = [] {
         const char* e = std::getenv("BB_SR_CUT_NDC");
-        return e != nullptr && *e != '\0' ? std::atof(e) : 1.0;
+        return e != nullptr && *e != '\0' ? std::atof(e) : 3.0; // 0.89: default 3.0
     }();
     static bool first = true;
     double delta = 0.0;
@@ -3214,6 +3225,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     }
     if (cam != nullptr) {
         g_learned.prev_vp = cam->m;
+        g_learned.prev_vp_block = cam->count >= 1000000;
         g_learned.have_prev_vp = true;
         ++g_stats.camera_frames;
     } else {
@@ -3267,13 +3279,15 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             if (g_sec_frames > 0) {
                 Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
                                        "resets {} (camera delta max {:.3f} NDC; a reset only "
-                                       "above BB_SR_CUT_NDC, default 1.0)",
+                                       "above BB_SR_CUT_NDC, default 3.0), camera source switches {} (zero camera motion on those)",
                                        g_lock == 1 ? "in-place" : g_lock == 2 ? "window"
                                                                               : "undecided",
-                                       g_sec_locked, g_sec_frames, g_sec_resets, g_sec_cam_max));
+                                       g_sec_locked, g_sec_frames, g_sec_resets, g_sec_cam_max,
+                                       g_sec_cam_switch));
             }
             g_sec_frames = g_sec_locked = g_sec_resets = 0;
             g_sec_cam_max = 0.0;
+            g_sec_cam_switch = 0;
         }
     }
     {
