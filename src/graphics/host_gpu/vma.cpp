@@ -474,8 +474,9 @@ bool GraphicContext::RetryAllocation(const char* what, uint64_t bytes, const std
 	return false;
 }
 
-// The textures made in the host-preferred type (CreateImage): where they really are, by the heap of the memory type VMA chose (a
-// system-memory heap: every sample crosses PCIe), printed at every further 256 MiB of them (the GPU thread's; not freed counts).
+// The textures made in the host-preferred type (CreateImage): the memory type VMA chose and its heap (a heap Vulkan lists as system
+// memory: every sample over PCIe, unless the driver keeps the type in video memory, as NVIDIA's Windows driver does while there is
+// room: the Video memory lines' plain type), printed at every further 256 MiB of them (the GPU thread's; not freed counts).
 void GraphicContext::NoteHostPreferredTexture(VmaAllocation allocation, double host_at) {
 	// (The GPU thread makes the textures, the present thread its frame image: both reach here.)
 	static std::mutex mutex;
@@ -503,7 +504,8 @@ void GraphicContext::NoteHostPreferredTexture(VmaAllocation allocation, double h
 		heaps += part;
 	}
 	std::printf("Textures placed past the threshold (from %.2f of the budget, KYTY_TEXTURE_HOST_AT; mode %s): %" PRIu64 " made, %" PRIu64
-	            " MiB, %" PRIu64 " MiB of them in a system-memory heap (memory type %u now); heaps:%s\n",
+	            " MiB, %" PRIu64 " MiB of them in a heap listed as system memory (memory type %u now; where the driver keeps them: the Video memory "
+	            "lines' plain type); heaps:%s\n",
 	            host_at, std::getenv("KYTY_TEXTURE_HOST_MODE") != nullptr ? std::getenv("KYTY_TEXTURE_HOST_MODE") : "host", images,
 	            bytes >> 20u, system_bytes >> 20u, info.memoryType, heaps.c_str());
 	std::fflush(stdout);
@@ -550,7 +552,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	// 22 fps, textures yielding: ~45). It counts that type under the video memory heap: on 8 GB, half is reached
 	// before the first texture.
 	// KYTY_TEXTURE_HOST_AT=<fraction> (boot env, (0, 1], default 0.5: the half above): the budget use from which textures go to that
-	// type (re-notes agent/tasks/20261103-GPU-PASS-METRICS.md: the 1-1 pixel-heavy table draws read host memory over PCIe, 27-81 %).
+	// type (PR #284: on Linux, where that type is system memory, the 1-1 pixel-heavy table draws read such textures over PCIe).
 	static const double host_at = [] {
 		const char*  value    = std::getenv("KYTY_TEXTURE_HOST_AT");
 		const double fraction = value != nullptr ? std::strtod(value, nullptr) : 0.0;

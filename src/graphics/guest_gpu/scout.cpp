@@ -201,7 +201,7 @@ struct State {
 	uint64_t                  constant      = 0; // the last submission with constant engine commands
 	// The last submission the scout did not walk whole while the render thread was not past it (left at a wait, abandoned,
 	// skipped while standing down, or never fed): a wait in its unwalked part, on a word the game's CPU writes, was never
-	// seen, so no ticket is made for a later draw until the render thread is past it (re-notes review of the PR #280 port).
+	// seen, so no ticket is made for a later draw until the render thread is past it (PR #288).
 	uint64_t                  fence         = 0;
 	std::array<std::pair<uint64_t, uint32_t>, 256> draws {};     // (sequence, draw packets) of the ones walked whole
 	std::array<std::vector<uint32_t>, 2>           blocks;
