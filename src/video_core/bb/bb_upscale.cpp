@@ -381,6 +381,7 @@ bool LooksLikeViewProj(const Mat& v) {
     return true;
 }
 
+u32 g_sec_cam_held = 0, g_cam_missing = 0; // 0.89: frames on the kept camera; frames since one
 u32 g_sec_cam_switch = 0; // 0.89: frames whose camera came from another source than the last
 struct Candidate {
     Mat m;
@@ -794,11 +795,18 @@ void FillCamera(Plan& p) {
     p.camera_valid = false;
     p.reflect_valid = false; // g_plan persists: no stale reflection matrices without a camera
     const Candidate* cam = Cfg().mv_reconstruct ? BestCamera() : nullptr;
-    if (cam == nullptr) {
+    // 0.89: a frame where no camera was found (the block and the scan both missed) keeps the last
+    // camera, static (zero camera motion), for up to 30 frames: before, it got zero motion vectors,
+    // no jitter (Jitter() needs have_prev_vp) on it AND on the next frame, and a clip_to_prev from
+    // that gap: the temporal consumers (DLSS AA, DLSS 5, FG) saw a periodic jolt.
+    const bool held = cam == nullptr && Cfg().mv_reconstruct && g_learned.have_prev_vp &&
+                      g_cam_missing <= 30;
+    if (cam == nullptr && !held) {
         p.depth_inverted = g_depth_detected >= 0 ? g_depth_detected == 1 : g_frame.depth_greater;
         return;
     }
-    const Mat& vp = cam->m;
+    if (held) ++g_sec_cam_held;
+    const Mat& vp = held ? g_learned.prev_vp : cam->m;
     Mat inv;
     if (!Invert(vp, inv)) return;
     // 0.89: the previous camera only from the same source. Bloodborne's scene constant block
@@ -807,7 +815,7 @@ void FillCamera(Plan& p) {
     // vectors of that frame and the next are garbage (camera delta spikes of 0.2..5.5 NDC with the
     // camera still), and every temporal consumer of the in-place output (DLSS 5's history, DLSS-G
     // / FSR 3 FG) rejects its history and re-converges. Such a frame now gets zero camera motion.
-    const bool block_now = cam->count >= 1000000;
+    const bool block_now = held ? g_learned.prev_vp_block : cam->count >= 1000000;
     const bool same_src = g_learned.have_prev_vp && g_learned.prev_vp_block == block_now;
     if (g_learned.have_prev_vp && !same_src) ++g_sec_cam_switch;
     const Mat prev = same_src ? g_learned.prev_vp : vp;
@@ -3228,6 +3236,9 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         g_learned.prev_vp_block = cam->count >= 1000000;
         g_learned.have_prev_vp = true;
         ++g_stats.camera_frames;
+        g_cam_missing = 0;
+    } else if (g_learned.have_prev_vp && ++g_cam_missing <= 30) {
+        // 0.89: kept (static camera) across a frame without one, see FillCamera.
     } else {
         g_learned.have_prev_vp = false;
     }
@@ -3279,15 +3290,15 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             if (g_sec_frames > 0) {
                 Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
                                        "resets {} (camera delta max {:.3f} NDC; a reset only "
-                                       "above BB_SR_CUT_NDC, default 3.0), camera source switches {} (zero camera motion on those)",
+                                       "above BB_SR_CUT_NDC, default 3.0), camera source switches {}, frames without a camera on the kept one {} (zero camera motion on those)",
                                        g_lock == 1 ? "in-place" : g_lock == 2 ? "window"
                                                                               : "undecided",
                                        g_sec_locked, g_sec_frames, g_sec_resets, g_sec_cam_max,
-                                       g_sec_cam_switch));
+                                       g_sec_cam_switch, g_sec_cam_held));
             }
             g_sec_frames = g_sec_locked = g_sec_resets = 0;
             g_sec_cam_max = 0.0;
-            g_sec_cam_switch = 0;
+            g_sec_cam_switch = g_sec_cam_held = 0;
         }
     }
     {
