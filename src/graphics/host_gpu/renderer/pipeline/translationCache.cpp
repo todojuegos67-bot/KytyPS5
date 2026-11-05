@@ -28,7 +28,16 @@ using ShaderRecompiler::IR::CompiledShaderInfo;
 using ShaderRecompiler::IR::ShaderInfo;
 
 constexpr char     FileMagic[8]  = {'K', 'Y', 'X', 'L', 'A', 'T', '0', '1'};
-constexpr uint32_t FormatVersion = 1;
+constexpr uint32_t FormatVersion = 2;
+
+// What the cache is valid for: the translator sources (KYTY_TRANSLATOR_HASH, see
+// generate_version.cmake) rather than the git revision, so builds that leave the translator alone
+// keep their translations. KYTY_XLAT_BY_REVISION=1 restores the old per-revision behaviour.
+std::string CacheIdentity() {
+	const char* v = std::getenv("KYTY_XLAT_BY_REVISION");
+	if (v != nullptr && v[0] == '1') return std::string("rev:") + KYTY_GIT_REVISION;
+	return std::string("xlat:") + KYTY_TRANSLATOR_HASH;
+}
 constexpr uint32_t RecordMagic   = 0x43455258u; // "XREC"
 
 // ---- serialization -------------------------------------------------------------------------
@@ -272,7 +281,7 @@ Cache& Instance() {
 
 std::string Header() {
 	std::string h(FileMagic, sizeof(FileMagic));
-	const std::string revision = KYTY_GIT_REVISION;
+	const std::string revision = CacheIdentity();
 	h.append(reinterpret_cast<const char*>(&FormatVersion), sizeof(FormatVersion));
 	const auto len = static_cast<uint32_t>(revision.size());
 	h.append(reinterpret_cast<const char*>(&len), sizeof(len));
@@ -368,7 +377,7 @@ KeyBuilder::KeyBuilder() {
 	auto* s = XXH3_createState();
 	XXH3_128bits_reset_withSeed(s, 0x4b595459584c4154ull);
 	m_state = s;
-	const std::string revision = KYTY_GIT_REVISION;
+	const std::string revision = CacheIdentity();
 	Add(revision.data(), revision.size());
 	// Recompiler switches read from the environment change its output.
 	for (const char* name: {"KYTY_FATAL_UNSUPPORTED_SHADERS", "KYTY_ROUND_SEARCH", "KYTY_RUNTIME_STRIDE",
@@ -457,6 +466,7 @@ std::optional<Entry> Find(const Key& key) {
 	}
 	c.hits.fetch_add(1, std::memory_order_relaxed);
 	ShaderSessionStats::g_xlat_hits.fetch_add(1, std::memory_order_relaxed);
+	ShaderSessionStats::NoteDiskHit();
 	Report();
 	return entry;
 }

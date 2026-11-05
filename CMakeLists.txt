@@ -173,6 +173,7 @@ add_custom_target(KytyGitVersion
 		-D OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyGitVersion.h
 		-D GIT_EXECUTABLE=${GIT_EXECUTABLE}
 		-D GIT_WORKING_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}
+		-D KYTY_SOURCE_ROOT=${KYTY_SOURCE_DIR}
 		-P ${KYTY_SOURCE_DIR}/generate_version.cmake
 	BYPRODUCTS ${PROJECT_BINARY_DIR}/kytyGitVersion.h
 	COMMENT "Generate kytyGitVersion.h"

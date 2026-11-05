@@ -85,6 +85,63 @@ void GraphicContext::LogMemoryBudget() const {
 	}
 }
 
+GraphicContext::VramSample GraphicContext::SampleVram() const {
+	VramSample sample {};
+	if (!memory_budget_ext_enabled || allocator == nullptr || physical_device == nullptr) {
+		return sample;
+	}
+	const auto& properties = physical_device_memory_properties;
+	uint32_t    heap       = 0;
+	while (heap < properties.memoryHeapCount &&
+	       !static_cast<bool>(properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+		heap++;
+	}
+	if (heap >= properties.memoryHeapCount) {
+		return sample;
+	}
+	auto query = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties2;
+	if (query == nullptr) {
+		query = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties2KHR;
+	}
+	if (query == nullptr) {
+		return sample;
+	}
+	VkPhysicalDeviceMemoryBudgetPropertiesEXT budget {};
+	budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+	VkPhysicalDeviceMemoryProperties2 props2 {};
+	props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+	props2.pNext = &budget;
+	query(static_cast<VkPhysicalDevice>(physical_device), &props2);
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	sample.valid       = budget.heapBudget[heap] != 0;
+	sample.usage       = budget.heapUsage[heap];
+	sample.budget      = budget.heapBudget[heap];
+	sample.vma_alloc   = budgets[heap].statistics.allocationBytes;
+	sample.vma_blocks  = budgets[heap].statistics.blockBytes;
+	sample.driver_side = sample.usage > sample.vma_blocks ? sample.usage - sample.vma_blocks : 0;
+	return sample;
+}
+
+bool GraphicContext::EnsureVramHeadroom(uint64_t bytes, const char* what) {
+	if (!memory_budget_ext_enabled) return true;
+	if (WithinVramBudget(bytes)) return true;
+	if (m_vram_reclaim) m_vram_reclaim(bytes, false);
+	if (WithinVramBudget(bytes)) return true;
+	if (m_vram_reclaim) m_vram_reclaim(bytes, true);
+	const bool ok = WithinVramBudget(bytes);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+		const auto s = SampleVram();
+		std::printf("VRAM headroom: %s needs ~%.0f MiB, heap usage %.0f/%.0f MiB (driver-side %.0f MiB, vma blocks %.0f MiB) "
+		            "after reclaim: %s\n",
+		            what, bytes / 1048576.0, s.usage / 1048576.0, s.budget / 1048576.0, s.driver_side / 1048576.0,
+		            s.vma_blocks / 1048576.0, ok ? "fits" : "still over the budget");
+		std::fflush(stdout);
+	}
+	return ok;
+}
+
 // VRAM (5 s): driver heap usage/budget plus what the emulator holds per category, so a leak or
 // over-allocation shows which cache grows. Called from the texture cache GC (Thread_Gpu).
 void GraphicContext::ReportVram(std::string_view extra) const {
@@ -93,6 +150,11 @@ void GraphicContext::ReportVram(std::string_view extra) const {
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
 	std::string line = "VRAM (5 s):";
+	if (const auto fresh = SampleVram(); fresh.valid) {
+		line += fmt::format(" fresh heap0 {:.0f}/{:.0f} MiB = vma blocks {:.0f} (used {:.0f}) + driver-side {:.0f} |",
+		                    fresh.usage / MiB, fresh.budget / MiB, fresh.vma_blocks / MiB, fresh.vma_alloc / MiB,
+		                    fresh.driver_side / MiB);
+	}
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
 		const bool local = static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
 		                                     vk::MemoryHeapFlagBits::eDeviceLocal);
@@ -119,6 +181,9 @@ void GraphicContext::ReportVram(std::string_view extra) const {
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	if (!CanReportMemoryUsage() || allocator == nullptr) {
 		return 0;
+	}
+	if (const auto fresh = SampleVram(); fresh.valid) {
+		return fresh.usage;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
@@ -200,6 +265,12 @@ bool GraphicContext::WithinVramBudget(uint64_t bytes) const {
 	}
 	if (heap >= properties.memoryHeapCount) {
 		return true;
+	}
+	// Fresh reading: the VMA cache can be ~30 allocation operations behind, and the driver's own
+	// allocations (pipelines) never pass through VMA at all.
+	if (const auto fresh = SampleVram(); fresh.valid) {
+		const uint64_t margin = fresh.budget > kSafetyMargin ? kSafetyMargin : 0;
+		return fresh.usage + bytes + margin <= fresh.budget;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);

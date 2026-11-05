@@ -161,6 +161,16 @@ struct Context {
 	uint64_t                                     not_in_seed[2] = {};
 	GraphicContext*                              graphics     = nullptr;
 	vk::PipelineCache                            driver_cache = nullptr;
+	// VRAM guard for the replay (see MemoryCapReached) and the "fast" list (see LoadFastList).
+	std::unordered_set<uint64_t>                 fast_keys;     // rebuilt from the driver cache in < keep_ms last time
+	bool                                         fast_honored = false;
+	std::FILE*                                   fast_out     = nullptr;
+	size_t                                       skipped_fast = 0;
+	size_t                                       skipped_mem  = 0;
+	uint64_t                                     baseline_usage  = 0; // heap usage when the replay started
+	uint64_t                                     baseline_driver = 0;
+	uint64_t                                     peak_usage      = 0;
+	bool                                         mem_cap_logged  = false;
 };
 
 Context& Ctx() {
@@ -665,6 +675,102 @@ bool CrashedBefore(uint64_t key) {
 	return g_crashed.contains(key);
 }
 
+// ---- VRAM guard ---------------------------------------------------------------------------------
+// Yotei, RTX 5080 (VK_EXT_memory_budget, 15 GiB heap): heap usage went 0.1 GiB -> 6.4 GiB (all 6,500
+// replayed pipelines kept) or 8.7 GiB (fast ones destroyed again) during the warm-up while VMA held
+// 1.0 GiB, and never came back. That left ~5 GiB for textures, so the texture cache thrashed (600
+// images created and destroyed per 5 s) and finally the device was lost. The replay therefore stops
+// building new pipelines when the heap grew by more than KYTY_PREWARM_DRIVER_MB (default 2048) since
+// it started, or when less than KYTY_PREWARM_RESERVE_MB (default 6144) of the budget would be left;
+// the rest are created on first use from the driver cache (the same path the released ones take).
+uint64_t EnvMiB(const char* name, uint64_t fallback) {
+	const char* v = std::getenv(name);
+	return v != nullptr && *v != '\0' ? static_cast<uint64_t>(std::strtoull(v, nullptr, 10)) : fallback;
+}
+
+bool MemoryCapReached(Context& ctx) {
+	if (ctx.graphics == nullptr) return false;
+	static const uint64_t growth_cap = EnvMiB("KYTY_PREWARM_DRIVER_MB", 2048) * 1048576ull; // 0 = off
+	static const uint64_t reserve    = EnvMiB("KYTY_PREWARM_RESERVE_MB", 6144) * 1048576ull;
+	if (growth_cap == 0) return false;
+	// One heap query per 20 ms is plenty; the 10 workers share the answer.
+	static std::atomic<int64_t> last_ns {0};
+	static std::atomic<bool>    last_result {false};
+	const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch()).count();
+	if (now - last_ns.load(std::memory_order_relaxed) < 20'000'000) {
+		return last_result.load(std::memory_order_relaxed);
+	}
+	last_ns.store(now, std::memory_order_relaxed);
+	const auto s = ctx.graphics->SampleVram();
+	if (!s.valid) return false;
+	std::lock_guard lock(ctx.mutex);
+	ctx.peak_usage = std::max(ctx.peak_usage, s.usage);
+	const bool over_growth  = s.usage > ctx.baseline_usage + growth_cap;
+	const bool over_reserve = s.usage + reserve > s.budget;
+	const bool capped       = over_growth || over_reserve;
+	if (capped && !ctx.mem_cap_logged) {
+		ctx.mem_cap_logged = true;
+		std::printf("Prewarm: VRAM guard: heap usage %.0f MiB (started at %.0f, +%.0f; driver-side %.0f MiB, vma blocks %.0f MiB, "
+		            "budget %.0f MiB) is over the %s limit after %zu built; the remaining pipelines are created on first use\n",
+		            s.usage / 1048576.0, ctx.baseline_usage / 1048576.0,
+		            (s.usage > ctx.baseline_usage ? s.usage - ctx.baseline_usage : 0) / 1048576.0,
+		            s.driver_side / 1048576.0, s.vma_blocks / 1048576.0, s.budget / 1048576.0,
+		            over_growth ? "KYTY_PREWARM_DRIVER_MB growth" : "KYTY_PREWARM_RESERVE_MB reserve", ctx.built);
+		std::fflush(stdout);
+	}
+	last_result.store(capped, std::memory_order_relaxed);
+	return capped;
+}
+
+// <prewarm>.fast: keys of pipelines that rebuilt from the driver cache in under KYTY_PREWARM_KEEP_MS.
+// Such a pipeline is destroyed right after the replay builds it, so the replay only pays driver
+// memory for nothing; on later runs they are skipped and created on first use. The list is trusted
+// only while the driver cache file is at least as large as when it was written (a deleted or
+// rejected cache means the "fast" builds were cache hits that no longer exist).
+constexpr char FastMagic[] = "KYTYFAST1";
+
+uint64_t DriverCacheFileSize(const std::filesystem::path& prewarm_path) {
+	std::error_code ec;
+	auto bin = prewarm_path;
+	bin.replace_extension(".bin");
+	return std::filesystem::exists(bin, ec) ? static_cast<uint64_t>(std::filesystem::file_size(bin, ec)) : 0;
+}
+
+void LoadFastList(Context& ctx, bool honor) {
+	const auto path = ctx.path.string() + ".fast";
+	const uint64_t bin_now = DriverCacheFileSize(ctx.path);
+	unsigned long long bin_then = 0;
+	if (honor) {
+		if (std::FILE* in = std::fopen(path.c_str(), "r"); in != nullptr) {
+			char magic[16] = {};
+			if (std::fscanf(in, "%15s %llu", magic, &bin_then) == 2 && std::strcmp(magic, FastMagic) == 0 &&
+			    bin_then != 0 && bin_now >= bin_then / 10 * 9) {
+				char what = 0;
+				unsigned long long key = 0;
+				while (std::fscanf(in, " %c %llx", &what, &key) == 2) {
+					if (what == 'F') ctx.fast_keys.insert(key);
+				}
+				ctx.fast_honored = true;
+			} else {
+				std::printf("Prewarm: ignoring %s (driver cache %.0f MB now, %.0f MB when it was written)\n", path.c_str(),
+				            bin_now / 1e6, static_cast<double>(bin_then) / 1e6);
+			}
+			std::fclose(in);
+		}
+	}
+	// Rewrite: header with the current cache size, then the keys still trusted.
+	ctx.fast_out = std::fopen(path.c_str(), "w");
+	if (ctx.fast_out != nullptr) {
+		std::fprintf(ctx.fast_out, "%s %llu\n", FastMagic, static_cast<unsigned long long>(bin_now));
+		for (const auto key: ctx.fast_keys) std::fprintf(ctx.fast_out, "F %016llx\n", static_cast<unsigned long long>(key));
+		std::fflush(ctx.fast_out);
+	}
+	std::printf("Prewarm: fast list %s: %zu pipelines %s\n", path.c_str(), ctx.fast_keys.size(),
+	            ctx.fast_honored ? "will be created on first use instead of in the replay" : "(none trusted yet; all are replayed, then listed)");
+	std::fflush(stdout);
+}
+
 void Worker() {
 	auto&      ctx = Ctx();
 	std::FILE* f   = std::fopen(ctx.path.string().c_str(), "rb");
@@ -690,10 +796,20 @@ void Worker() {
 		}
 		vk::Pipeline pipeline = nullptr;
 		const bool   crashed_before = CrashedBefore(rec->key);
+		bool         skipped_fast = false;
+		bool         skipped_mem  = false;
+		if (!crashed_before) {
+			{
+				std::lock_guard lock(ctx.mutex);
+				skipped_fast = ctx.fast_honored && ctx.fast_keys.contains(rec->key);
+			}
+			skipped_mem = !skipped_fast && MemoryCapReached(ctx);
+		}
+		const bool   skipped = skipped_fast || skipped_mem;
 		InflightMark('B', rec->key);
 		const auto   build_start = Clock::now();
 		const size_t desc_words  = rec->desc.size();
-		if (f != nullptr && !crashed_before) {
+		if (f != nullptr && !crashed_before && !skipped) {
 			pipeline = rec->kind == KindCompute ? BuildCompute(ctx, f, *rec) : BuildGraphics(ctx, f, *rec);
 		}
 		if (const auto ms = std::chrono::duration<double, std::milli>(Clock::now() - build_start).count(); ms >= 2000.0) {
@@ -726,11 +842,23 @@ void Worker() {
 				keep = ctx.resident < keep_max;
 				if (keep) ctx.resident++;
 			}
+			if (build_ms < keep_ms) { // fast list entry (see LoadFastList)
+				std::lock_guard lock(ctx.mutex);
+				if (ctx.fast_out != nullptr && ctx.fast_keys.insert(rec->key).second) {
+					std::fprintf(ctx.fast_out, "F %016llx\n", static_cast<unsigned long long>(rec->key));
+					std::fflush(ctx.fast_out);
+				}
+			}
 			if (!keep) {
 				ctx.graphics->device.destroyPipeline(pipeline, nullptr);
 				pipeline = nullptr;
 				released = true;
 			}
+		}
+		if (skipped) {
+			released = true; // nothing built: the first use creates it from the driver cache
+			std::lock_guard lock(ctx.mutex);
+			(skipped_fast ? ctx.skipped_fast : ctx.skipped_mem)++;
 		}
 		rec->desc.clear();
 		rec->desc.shrink_to_fit();
@@ -755,7 +883,10 @@ void Worker() {
 			if (n % step == 0 || n == total) {
 				const auto s =
 				    std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - ctx.start_time).count();
-				std::printf("Prewarm: %zu/%zu pipelines (%lld s)\n", n, total, static_cast<long long>(s));
+				const auto vs = ctx.graphics != nullptr ? ctx.graphics->SampleVram() : GraphicContext::VramSample {};
+				std::printf("Prewarm: %zu/%zu pipelines (%lld s) | heap %.0f MiB, driver-side %.0f MiB | skipped: %zu fast-listed, %zu by the VRAM guard\n",
+				            n, total, static_cast<long long>(s), vs.usage / 1048576.0, vs.driver_side / 1048576.0,
+				            ctx.skipped_fast, ctx.skipped_mem);
 				std::fflush(stdout);
 				if (n == total) {
 					ReportLocked(ctx, "prewarm finished");
@@ -1259,6 +1390,15 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 		            ctx.path.string().c_str(), ctx.queue.size(), ctx.queued_c, ctx.queued_g,
 		            ctx.spirv_offset.size(), ctx.queue.empty() ? 0u : threads);
 		std::fflush(stdout);
+		if (const auto base = graphics.SampleVram(); base.valid) {
+			ctx.baseline_usage  = base.usage;
+			ctx.baseline_driver = base.driver_side;
+			ctx.peak_usage      = base.usage;
+			std::printf("Prewarm: VRAM before the replay: heap %.0f/%.0f MiB (vma blocks %.0f MiB, driver-side %.0f MiB)\n",
+			            base.usage / 1048576.0, base.budget / 1048576.0, base.vma_blocks / 1048576.0,
+			            base.driver_side / 1048576.0);
+		}
+		LoadFastList(ctx, !only);
 		if (!ctx.queue.empty()) {
 			OpenInflight(ctx.path);
 			OpenValidated(ctx.path);
@@ -1311,10 +1451,13 @@ bool EnsureStarted(GraphicContext& graphics, const std::string& title_id, vk::Pi
 			            std::chrono::duration<double>(Clock::now() - wait_start).count());
 			std::fflush(stdout);
 		}
+		const auto vs = ctx.graphics != nullptr ? ctx.graphics->SampleVram() : GraphicContext::VramSample {};
 		std::printf("Prewarm: warm-up done, %zu pipelines in %.1f s; %zu kept resident, %zu released to the "
-		            "driver cache; device memory in use %.0f MiB\n", total,
+		            "driver cache (%zu skipped as fast-listed, %zu skipped by the VRAM guard); device memory in use "
+		            "%.0f MiB (fresh query; started at %.0f MiB, peak %.0f MiB; driver-side %.0f MiB, vma blocks %.0f MiB)\n", total,
 		            std::chrono::duration<double>(Clock::now() - wait_start).count(), ctx.resident, ctx.released,
-		            ctx.graphics != nullptr ? ctx.graphics->GetDeviceMemoryUsage() / 1048576.0 : 0.0);
+		            ctx.skipped_fast, ctx.skipped_mem, vs.usage / 1048576.0, ctx.baseline_usage / 1048576.0,
+		            std::max(ctx.peak_usage, vs.usage) / 1048576.0, vs.driver_side / 1048576.0, vs.vma_blocks / 1048576.0);
 		std::fflush(stdout);
 	}
 	return only;
@@ -1388,6 +1531,10 @@ void Shutdown() {
 	if (ctx.out != nullptr) {
 		std::fclose(ctx.out);
 		ctx.out = nullptr;
+	}
+	if (ctx.fast_out != nullptr) {
+		std::fclose(ctx.fast_out);
+		ctx.fast_out = nullptr;
 	}
 }
 

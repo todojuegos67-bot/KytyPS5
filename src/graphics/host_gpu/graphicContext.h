@@ -102,6 +102,24 @@ struct GraphicContext {
 	void               ReportVram(std::string_view extra) const; // one "VRAM (5 s):" line
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+
+	// A fresh VK_EXT_memory_budget reading of the first device-local heap. VMA's own
+	// vmaGetHeapBudgets() caches the driver value and refreshes it only every 30 VMA allocation
+	// operations, so memory the driver takes for itself (pipelines, shader compiles) is invisible to
+	// every budget decision for a long time. `driver_side` = heap usage minus the VkDeviceMemory
+	// blocks VMA holds, i.e. what the emulator did not allocate through VMA.
+	struct VramSample {
+		bool     valid      = false;
+		uint64_t usage      = 0;
+		uint64_t budget     = 0;
+		uint64_t vma_alloc  = 0; // bytes handed out to buffers/images
+		uint64_t vma_blocks = 0; // VkDeviceMemory VMA holds (allocations plus free space in blocks)
+		uint64_t driver_side = 0;
+	};
+	[[nodiscard]] VramSample SampleVram() const;
+	// Makes room for `bytes` of driver-side allocation (pipeline compile): idle images are freed,
+	// then submitted GPU work is waited for and they are freed again. Render thread only.
+	bool                   EnsureVramHeadroom(uint64_t bytes, const char* what);
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 
 	struct HeapUsage {

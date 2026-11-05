@@ -31,7 +31,55 @@ inline uint64_t NowNs() {
 	    std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// "Translate (5 s)": what translating guest shaders cost per 5 s window, printed from the translation
+// itself (the gpuprof line stops when the game stalls at 0.1 fps, which is when it matters).
+//   n/ms/max = shaders translated in the window; hits = translations served from the disk cache
+//   instead (no translation); share = translate ms / window ms (>100% = several threads).
+inline std::atomic<uint64_t> g_win_n {0}, g_win_ns {0}, g_win_max_ns {0}, g_win_hits {0}, g_win_cs {0};
+inline std::atomic<uint64_t> g_win_next {0};
+inline std::atomic<uint64_t> g_win_start {0};
+inline std::atomic<uint64_t> g_total_windows {0};
+
+inline void MaybePrintWindow() {
+	const auto now = NowNs();
+	auto due = g_win_next.load(std::memory_order_relaxed);
+	if (due == 0) {
+		if (g_win_next.compare_exchange_strong(due, now + 5'000'000'000ull)) g_win_start.store(now);
+		return;
+	}
+	if (now < due || !g_win_next.compare_exchange_strong(due, now + 5'000'000'000ull)) return;
+	const auto start  = g_win_start.exchange(now);
+	const auto n      = g_win_n.exchange(0);
+	const auto ns     = g_win_ns.exchange(0);
+	const auto max_ns = g_win_max_ns.exchange(0);
+	const auto hits   = g_win_hits.exchange(0);
+	const auto cs     = g_win_cs.exchange(0);
+	if (n == 0 && hits == 0) return;
+	const double wall_ms = static_cast<double>(now - start) / 1e6;
+	std::printf("Translate (5 s): %llu shaders translated (%llu compute) in %.0f ms (worst %.0f ms, %.0f%% of %.0f ms wall), "
+	            "%llu served from the disk cache | total: %llu translated, %llu disk hits\n",
+	            static_cast<unsigned long long>(n), static_cast<unsigned long long>(cs), ns / 1e6, max_ns / 1e6,
+	            wall_ms > 0 ? 100.0 * (ns / 1e6) / wall_ms : 0.0, wall_ms, static_cast<unsigned long long>(hits),
+	            static_cast<unsigned long long>(g_cs_first.load() + g_cs_perm.load() + g_gfx_translations.load()),
+	            static_cast<unsigned long long>(g_xlat_hits.load()));
+	std::fflush(stdout);
+}
+
+inline void NoteDiskHit() {
+	g_win_hits.fetch_add(1, std::memory_order_relaxed);
+	MaybePrintWindow();
+}
+
 inline void NoteTranslation(bool compute, bool first_sight, uint64_t ns) {
+	g_win_n.fetch_add(1, std::memory_order_relaxed);
+	g_win_ns.fetch_add(ns, std::memory_order_relaxed);
+	if (compute) g_win_cs.fetch_add(1, std::memory_order_relaxed);
+	{
+		auto max = g_win_max_ns.load(std::memory_order_relaxed);
+		while (ns > max && !g_win_max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+		}
+	}
+	MaybePrintWindow();
 	if (compute) {
 		(first_sight ? g_cs_first : g_cs_perm).fetch_add(1, std::memory_order_relaxed);
 		g_cs_ns.fetch_add(ns, std::memory_order_relaxed);

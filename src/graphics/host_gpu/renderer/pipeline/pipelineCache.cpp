@@ -1601,6 +1601,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
+	// A big compute pipeline needs driver memory of its own while it compiles (the b2ebf35 run lost the
+	// device at 12.2/14.4 GiB heap usage during a 102K-word compile). Make room first; the budget
+	// check uses a fresh VK_EXT_memory_budget reading.
+	if (compute_program.spirv_words >= 30000) {
+		m_graphics.EnsureVramHeadroom(compute_program.spirv_words >= 150000 ? (512ull << 20) : (128ull << 20),
+		                              "compute pipeline compile");
+	}
 	auto cached = std::make_unique<Pipeline>();
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,

@@ -5,6 +5,8 @@
 #define KYTY_GIT_HASH "@KYTY_GIT_HASH@"
 // Full commit identity used for compatibility checks.
 #define KYTY_GIT_REVISION "@KYTY_GIT_REVISION@"
+// Hash of src/graphics/shader/** (the guest->SPIR-V translator); keys the translation cache.
+#define KYTY_TRANSLATOR_HASH "@KYTY_TRANSLATOR_HASH@"
 
 /* Build provenance, shown in the window title and in crash reports. */
 #if defined(KYTY_OFFICIAL_BUILD)
