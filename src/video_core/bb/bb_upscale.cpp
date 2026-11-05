@@ -925,6 +925,16 @@ std::atomic<VAddr> g_ss_source{0};
 std::array<std::atomic<u8>, 64> g_ss_valid{};  // bit 0: internal-size image current, bit 1: output
 std::array<std::atomic<u8>, 64> g_ss_class{};  // classification logged: 1 scene, 2 output, 4 compute
 std::atomic<u32> g_ss_twin_copies{0}, g_ss_twin_fail{0}, g_ss_post_scaled{0}, g_ss_post_refused{0};
+// 0.76: the frame number of the scene passes (counted at their start) and, per address and
+// version, the frame its content was last made; reads of content older than the last frame are
+// counted as stale (twins filled once and read for many frames). g_ss_purge: the chain turned off,
+// the texture cache brings every address back to one output-size image (BBNativeOff).
+std::atomic<u32> g_ss_frame{1}, g_ss_stale_reads{0};
+std::array<std::array<std::atomic<u32>, 2>, 64> g_ss_age{};
+std::atomic<bool> g_ss_purge{false};
+// 0.76: why a qualifying sample of the upscaler's source was not the injection point.
+enum Refuse : u32 { RfPresent, RfHold, RfSkip, RfInactive, RfFailed, RfSize, RfTarget, RfCount };
+std::array<std::atomic<u32>, RfCount> g_ss_refuse{};
 std::atomic<u32> g_ss_count{0};
 u32 g_ss_w = 0, g_ss_h = 0, g_ss_sw = 0, g_ss_sh = 0;
 std::vector<VAddr> g_ss_candidates;
@@ -951,6 +961,14 @@ bool NativeLegacy() {
 }
 bool NativePerPass() {
     return BB::ResPatch::NativeChain() && !NativeLegacy();
+}
+// Every way scene scaling turns off goes through here: the texture cache then copies each
+// address's current content to its output-size image and frees the internal-size one.
+void TurnOff() {
+    if (!g_ss_off.exchange(true, std::memory_order_relaxed) &&
+        g_ss_frozen.load(std::memory_order_relaxed) && BB::ResPatch::NativeChain()) {
+        g_ss_purge.store(true, std::memory_order_release);
+    }
 }
 int SceneIndex(VAddr addr) {
     const u32 n = g_ss_count.load(std::memory_order_acquire);
@@ -1001,7 +1019,7 @@ bool ScaleImage(VAddr addr, u32& w, u32& h) {
     return true;
 }
 
-bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write) {
+bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write, bool depth) {
     if (!NativePerPass() || !g_ss_frozen.load(std::memory_order_acquire) ||
         g_ss_off.load(std::memory_order_relaxed)) {
         return false;
@@ -1015,10 +1033,20 @@ bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write) {
     }
     const u8 mine = scaled ? 1 : 2, other = scaled ? 2 : 1;
     const u8 valid = g_ss_valid[idx].load(std::memory_order_relaxed);
-    // A scene-pass write to the internal-size image rebuilds it (the scene is drawn every frame):
-    // no copy. Any other use of a version that is not current copies the current one first.
-    const bool scene_write = write && scaled && g_ss_phase.load(std::memory_order_relaxed) == 1;
-    const bool copy = (valid & mine) == 0 && (valid & other) != 0 && !scene_write;
+    // 0.76: every use of a version that is not current copies the current one first, scene-pass
+    // writes included. 0.73 skipped the copy for a scene-pass target ("the scene rebuilds it"),
+    // but a target bound by the scene passes is often only blended onto: after a compute dispatch
+    // (which uses the output-size twin) wrote it, the scene draws blended onto an internal-size
+    // image that still held the first frame's picture (06:24 run: the spawn view fixed on screen).
+    (void)depth;
+    const bool copy = (valid & mine) == 0 && (valid & other) != 0;
+    if (!copy && !write && (valid & mine) != 0 &&
+        g_ss_phase.load(std::memory_order_relaxed) == 2) {
+        const u32 age = g_ss_age[idx][scaled ? 0 : 1].load(std::memory_order_relaxed);
+        if (age + 1 < g_ss_frame.load(std::memory_order_relaxed)) {
+            g_ss_stale_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (!copy) {
         TwinDone(addr, scaled, write, false);
     }
@@ -1031,6 +1059,10 @@ void TwinDone(VAddr addr, bool scaled, bool write, bool copied) {
         return;
     }
     const u8 mine = scaled ? 1 : 2;
+    if (write || copied) {
+        g_ss_age[idx][scaled ? 0 : 1].store(g_ss_frame.load(std::memory_order_relaxed),
+                                            std::memory_order_relaxed);
+    }
     if (write) {
         g_ss_valid[idx].store(mine, std::memory_order_relaxed);
     } else {
@@ -1054,12 +1086,49 @@ void TwinFailed(VAddr addr, std::string_view why) {
     }
 }
 
-void BeginDraw(VAddr depth_addr) {
+void BeginDraw(VAddr depth_addr, u32 colors) {
     g_ss_compute.store(false, std::memory_order_relaxed);
+    // The scene passes start at the first draw with the scene depth; a G-buffer draw (3 or more
+    // colour targets with the scene depth) also starts them after the upscaler, so the phases do
+    // not depend on when the flip is seen (0.76).
+    const int phase = g_ss_phase.load(std::memory_order_relaxed);
     if (depth_addr != 0 && depth_addr == g_ss_depth.load(std::memory_order_relaxed) &&
-        g_ss_phase.load(std::memory_order_relaxed) == 0) {
+        (phase == 0 || (phase == 2 && colors >= 3))) {
         g_ss_phase.store(1, std::memory_order_relaxed);
+        g_ss_frame.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+bool SceneScaleLive() {
+    return g_ss_frozen.load(std::memory_order_acquire) && !g_ss_off.load(std::memory_order_relaxed);
+}
+
+int PreferVersion(VAddr addr) {
+    if (!g_ss_frozen.load(std::memory_order_acquire)) return -1;
+    if (g_ss_off.load(std::memory_order_relaxed) || !NativePerPass()) return 0;
+    const int idx = SceneIndex(addr);
+    if (idx < 0) return -1;
+    return (g_ss_valid[idx].load(std::memory_order_relaxed) & 2) != 0 ? 0 : 1;
+}
+
+bool TakeOffPurge(std::vector<std::pair<VAddr, bool>>& addrs) {
+    if (!g_ss_purge.exchange(false, std::memory_order_acquire)) {
+        return false;
+    }
+    const u32 n = g_ss_count.load(std::memory_order_acquire);
+    addrs.clear();
+    for (u32 i = 0; i < n; ++i) {
+        // (address, the internal-size image holds the only current content)
+        addrs.emplace_back(g_ss_addrs[i], g_ss_valid[i].load(std::memory_order_relaxed) == 1);
+    }
+    return true;
+}
+
+void OnOffPurged(u32 copied, u32 freed) {
+    Checkpoint(fmt::format("native chain off: {} addresses back to one output-size image ({} "
+                           "internal-size images copied up first, {} freed); no twin, redirect "
+                           "or internal-size target is used from here",
+                           g_ss_count.load(std::memory_order_relaxed), copied, freed));
 }
 
 bool NativePostPhase() {
@@ -2050,22 +2119,46 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     }
     // A qualifying sample of the source: the injection is at the one after its last write.
     const u32 index = f.qual_samples++;
+    // 0.76 native chain: a refused qualifying sample is counted by reason (native chain check
+    // line), and, unless it waits for a later sample (learned skip), it still ends the scene
+    // passes: post-processing then works on output-size images instead of scaled ones.
+    const bool chain_live = NativePerPass() && g_ss_frozen.load(std::memory_order_relaxed) &&
+                            !g_ss_off.load(std::memory_order_relaxed);
+    const auto refuse = [&](Refuse why) {
+        if (chain_live) {
+            g_ss_refuse[why].fetch_add(1, std::memory_order_relaxed);
+            if (why != RfSkip && g_ss_phase.load(std::memory_order_relaxed) == 1) {
+                g_ss_source.store(addr, std::memory_order_relaxed);
+                g_ss_phase.store(2, std::memory_order_relaxed);
+            }
+        }
+        return Sample::Keep;
+    };
     if (PresentMode()) {
-        return Sample::Keep; // upscaled before the HUD instead (WantPresentUpscale)
+        return refuse(RfPresent); // upscaled before the HUD instead (WantPresentUpscale)
     }
-    if (g_native_hold > 0 && NativeFallback()) {
+    // 0.76: no native-fallback hold in the native chain: the in-place point is the only place
+    // the internal-size scene is upscaled, a hold would leave it unscaled for 240 flips.
+    if (g_native_hold > 0 && NativeFallback() && !chain_live) {
         return Sample::Keep; // 0.48: native fallback hold (window-size path at the same size)
     }
-    if (index < g_learned.skip || !Active() || f.inject_failed) {
-        return Sample::Keep;
+    if (index < g_learned.skip) {
+        return refuse(RfSkip);
+    }
+    if (!Active() || f.inject_failed) {
+        return refuse(!Active() ? RfInactive : RfFailed);
     }
     if (width != (f.gb_w ? f.gb_w : g_learned.render_w) ||
         height != (f.gb_h ? f.gb_h : g_learned.render_h)) {
-        return Sample::Keep;
+        return refuse(RfSize);
     }
     const bool scene = SceneMode();
-    if (!scene && !out_size) {
-        return Sample::Keep;
+    // 0.76: in the native chain the draw that first reads the scene colour may draw into an
+    // address shared with a scene target (looked up before the upscaler ran, so internal size);
+    // the upscale still goes to the output size (the game's guest size).
+    const bool chain_point = chain_live && !scene && width == g_ss_sw && height == g_ss_sh;
+    if (!scene && !out_size && !chain_point) {
+        return refuse(RfTarget);
     }
     // The plan.
     Plan& p = g_plan;
@@ -2075,8 +2168,8 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     p.depth_addr = f.gb_depth != 0 ? f.gb_depth : g_learned.gb_depth;
     p.render_w = width;
     p.render_h = height;
-    p.output_w = scene ? width : g_draw.colors[0].width;
-    p.output_h = scene ? height : g_draw.colors[0].height;
+    p.output_w = scene ? width : chain_point ? g_ss_w : g_draw.colors[0].width;
+    p.output_h = scene ? height : chain_point ? g_ss_h : g_draw.colors[0].height;
     p.hdr = IsHdr(format);
     p.reset = !g_learned.last_injected;
     if (NativeFallbackOn() && g_last_window_path) {
@@ -2588,7 +2681,16 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // Safety net: scene scaling must give a real upscale (composite injection, render size
     // below the output) in most 3D frames, or it is turned off for the session and the scene
     // targets go back to the full size (an unplayable image otherwise: white / a corner).
-    g_ss_phase.store(0, std::memory_order_relaxed); // 0.73: the next frame starts outside the scene
+    {
+        // 0.73: the next frame starts outside the scene. 0.76: only from the post-processing phase
+        // (or a frame whose scene colour was never sampled), so a flip seen while the next frame's
+        // scene passes already run does not end them half-way.
+        int post = 2;
+        if (!g_ss_phase.compare_exchange_strong(post, 0, std::memory_order_relaxed) &&
+            post == 1 && f.qual_samples == 0) {
+            g_ss_phase.store(0, std::memory_order_relaxed);
+        }
+    }
     {
         // 0.73 motion-vector source, once: the G-buffer's targets (a game velocity output would be
         // one of them or a two-channel target logged by [mv-probe]).
@@ -2619,7 +2721,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // produced. A frame counts when the upscaler ended the scene passes (post-processing then used
     // the output-size versions) and no internal-size target was bound after it.
     static u32 nc_frames = 0, nc_scene = 0, nc_reach = 0, nc_redirect = 0, nc_scaled = 0,
-               nc_windows = 0, nc_last_scaled = 0;
+               nc_windows = 0, nc_last_scaled = 0, nc_copies0 = 0, nc_stale0 = 0;
     if (NativePerPass() && g_ss_frozen.load(std::memory_order_relaxed) &&
         !g_ss_off.load(std::memory_order_relaxed)) {
         const u32 ps = g_ss_post_scaled.load(std::memory_order_relaxed);
@@ -2633,24 +2735,35 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         if (nc_frames >= 300) {
             const bool first = nc_windows++ == 0;
             const bool bad = nc_scene >= 150 && nc_reach * 2 < nc_scene;
-            if (first || bad) {
+            (void)first;
+            {
                 Checkpoint(fmt::format(
                     "native chain check: {} of {} 3D frames ({} frames) gave post-processing the "
                     "upscaled image at the output size ({} with later samples redirected to it, "
                     "{} with an internal-size target after the upscaler); twin copies {} ({} not "
-                    "possible): {}",
+                    "possible): {}; 0.76: twin copies {:.1f} per frame, stale twins read {} "
+                    "(content older than the last frame), source samples refused: before-HUD "
+                    "mode {}, learned skip {}, inactive {}, failed {}, size {}, target {}",
                     nc_reach, nc_scene, nc_frames, nc_redirect, nc_scaled,
                     g_ss_twin_copies.load(std::memory_order_relaxed),
-                    g_ss_twin_fail.load(std::memory_order_relaxed), bad ? "FAILED" : "ok"));
+                    g_ss_twin_fail.load(std::memory_order_relaxed), bad ? "FAILED" : "ok",
+                    double(g_ss_twin_copies.load(std::memory_order_relaxed) - nc_copies0) /
+                        double(std::max<u32>(1, nc_frames)),
+                    g_ss_stale_reads.load(std::memory_order_relaxed) - nc_stale0,
+                    g_ss_refuse[RfPresent].exchange(0), g_ss_refuse[RfSkip].exchange(0),
+                    g_ss_refuse[RfInactive].exchange(0), g_ss_refuse[RfFailed].exchange(0),
+                    g_ss_refuse[RfSize].exchange(0), g_ss_refuse[RfTarget].exchange(0)));
             }
             if (bad) {
-                g_ss_off.store(true, std::memory_order_relaxed);
+                TurnOff();
                 Checkpoint("WARNING: scene upscale turned OFF for this session (native chain "
                            "check): the upscaled image did not reach the output chain");
                 LOG_WARNING(Render_Vulkan, "[BB_UPSCALE] native chain check failed: {} of {}",
                             nc_reach, nc_scene);
             }
             nc_frames = nc_scene = nc_reach = nc_redirect = nc_scaled = 0;
+            nc_copies0 = g_ss_twin_copies.load(std::memory_order_relaxed);
+            nc_stale0 = g_ss_stale_reads.load(std::memory_order_relaxed);
         }
     }
     if (g_ss_frozen.load(std::memory_order_relaxed) && !g_ss_off.load(std::memory_order_relaxed)) {
@@ -2662,7 +2775,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             const bool bad = first ? g_ss_good < 150
                                    : g_ss_scene >= 150 && g_ss_good * 2 < g_ss_scene;
             if (bad) {
-                g_ss_off.store(true, std::memory_order_relaxed);
+                TurnOff();
                 Checkpoint(fmt::format(
                     "WARNING: scene upscale turned OFF for this session (safety net): in {} frames "
                     "{} had a 3D scene and only {} were upscaled from the scene size to the "

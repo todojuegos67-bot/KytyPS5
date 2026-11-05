@@ -69,8 +69,16 @@ void AddSceneTarget(VAddr addr);
 // after an image is made current: true when the other version of this address (internal size /
 // output size) holds the content and must be copied into this one first; then TwinDone (also
 // called by TwinAccess itself when no copy is needed). TwinFailed when the copy cannot be made.
-void BeginDraw(VAddr depth_addr);
-bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write);
+void BeginDraw(VAddr depth_addr, u32 colors);
+bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write, bool depth);
+// 0.76: scene scaling learned and on; which version of an address holds current content for an
+// address-only lookup (-1 not a scene target, 0 output size, 1 internal size); the addresses to
+// bring back to one output-size image once the chain turned off (pair: the internal-size image
+// holds the only current content), once; and the result of that clean-up.
+bool SceneScaleLive();
+int PreferVersion(VAddr addr);
+bool TakeOffPurge(std::vector<std::pair<VAddr, bool>>& addrs);
+void OnOffPurged(u32 copied, u32 freed);
 void TwinDone(VAddr addr, bool scaled, bool write, bool copied);
 void TwinFailed(VAddr addr, std::string_view why);
 bool NativePostPhase();              // after the upscaler in this frame (native chain)

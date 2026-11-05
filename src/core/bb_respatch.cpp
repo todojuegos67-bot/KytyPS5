@@ -139,7 +139,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     {
         // 0.75: which lines of work this build carries (bb-merge-075 = bb-native-073 + bb-fg-074).
         const std::string features =
-            "build 0.75 (bb-merge-075): 0.73 native chain + 0.74 display meter/FG present. Carries: frame generation pacing of 0.70 (PaceGuestFlip grid, "
+            "build 0.76 (bb-native-076): 0.76 native chain fixes (twin copies for every stale use, no fallback hold, phase per G-buffer, clean-up when off) + 0.73 native chain + 0.74 display meter/FG present. Carries: frame generation pacing of 0.70 (PaceGuestFlip grid, "
             "FSR 3 midpoint slots kytyFfxSetPaceSlot / kytyFfxTakePaceStats, full-frame and "
             "high-res fixes) + 0.71 native chain (BB_SCENE_UPSCALE=native, viewport / MV pixels "
             "of scaled targets, BB_OBJMV_RIGID, Reflex markers at the first sceGnmSubmit, "

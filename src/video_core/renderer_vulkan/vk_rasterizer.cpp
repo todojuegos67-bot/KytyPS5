@@ -120,10 +120,21 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
     // BB 0.73 native chain: the scene passes begin at the first draw with the scene depth; the
     // pass decides which version (internal / output size) of a scene target it gets.
-    BB::Upscale::BeginDraw(((regs.depth_control.depth_enable || regs.depth_control.stencil_enable) &&
-                            regs.depth_buffer.DepthValid())
-                               ? regs.depth_buffer.DepthAddress()
-                               : 0);
+    texture_cache.BBNativeOff(); // 0.76: clean-up once the native chain turned off
+    {
+        u32 bb_colors = 0;
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (!skip_cb_binding && regs.color_buffers[cb] && (key.mrt_mask & (1 << cb)) != 0) {
+                ++bb_colors;
+            }
+        }
+        BB::Upscale::BeginDraw(
+            ((regs.depth_control.depth_enable || regs.depth_control.stencil_enable) &&
+             regs.depth_buffer.DepthValid())
+                ? regs.depth_buffer.DepthAddress()
+                : 0,
+            bb_colors);
+    }
     for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         const auto& col_buf = regs.color_buffers[cb];
@@ -427,6 +438,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 }
 
 void Rasterizer::DispatchDirect() {
+    texture_cache.BBNativeOff();
     BB::Upscale::OnDispatch();
     bb_rt_scale_x = bb_rt_scale_y = 1.0f;
     bb_rt_guest_w = bb_rt_guest_h = 0;
@@ -465,6 +477,7 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    texture_cache.BBNativeOff();
     BB::Upscale::OnDispatch();
     bb_rt_scale_x = bb_rt_scale_y = 1.0f;
     bb_rt_guest_w = bb_rt_guest_h = 0;

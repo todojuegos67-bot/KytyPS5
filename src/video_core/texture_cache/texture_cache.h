@@ -125,6 +125,10 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// BB 0.76: once the native chain turned off, every scene target address back to one
+    /// output-size image (its current content copied up, the internal-size image freed).
+    void BBNativeOff();
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 

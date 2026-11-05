@@ -281,7 +281,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (image_info.bb_scaled != cache_image.info.bb_scaled) {
             // 0.73: with the native chain both versions of a scene target live side by side (the
             // scene passes use the internal-size one, the output chain the output-size twin).
-            if (safe_to_delete || (!BB::ResPatch::NativeChain() && cache_image.info.bb_scaled &&
+            if (safe_to_delete || (!BB::Upscale::SceneScaleLive() && cache_image.info.bb_scaled &&
                                    !cache_image.binding.is_bound)) {
                 FreeImage(cache_image_id);
             }
@@ -612,8 +612,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     SmallVector<ImageId, 4> image_ids;
+    // BB 0.76: an address with an internal-size and an output-size image (native chain): an
+    // address-only lookup (copies, buffer reads) takes the one holding the current content, and
+    // only the output-size one once the chain is off.
+    const int prefer = BB::Upscale::PreferVersion(address);
     ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
         if (ensure_valid && !image.SafeToDownload()) {
+            return;
+        }
+        if (prefer >= 0 && image.info.guest_address == address &&
+            image.info.bb_scaled != (prefer == 1)) {
             return;
         }
         image_ids.push_back(image_id);
@@ -652,6 +660,38 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     return image.FindView(desc.view_info);
 }
 
+void TextureCache::BBNativeOff() {
+    std::vector<std::pair<VAddr, bool>> addrs;
+    if (!BB::Upscale::TakeOffPurge(addrs)) {
+        return;
+    }
+    u32 copied = 0, freed = 0;
+    for (const auto& [addr, scaled_current] : addrs) {
+        SmallVector<ImageId, 4> scaled_ids;
+        ImageId full_id{};
+        ForEachImageWithAddress(addr, [&](ImageId id, Image& image) {
+            if (image.info.guest_address != addr) return;
+            if (image.info.bb_scaled) {
+                scaled_ids.push_back(id);
+            } else if (!full_id) {
+                full_id = id;
+            }
+        });
+        for (const ImageId id : scaled_ids) {
+            Image& scaled = slot_images[id];
+            if (scaled_current && full_id &&
+                runtime.BBBlitScaled(&scaled, &slot_images[full_id])) {
+                ++copied;
+            }
+            if (!scaled.binding.is_bound) {
+                FreeImage(id);
+                ++freed;
+            }
+        }
+    }
+    BB::Upscale::OnOffPurged(copied, freed);
+}
+
 void TextureCache::BBTwinSync(ImageId image_id, bool write) {
     Image& image = slot_images[image_id];
     const ImageInfo& info = image.info;
@@ -660,7 +700,7 @@ void TextureCache::BBTwinSync(ImageId image_id, bool write) {
     }
     const bool scaled = info.bb_scaled;
     if (!BB::Upscale::TwinAccess(info.guest_address, info.size.width, info.size.height, scaled,
-                                 write)) {
+                                 write, info.props.is_depth)) {
         return;
     }
     ImageId other_id{};
