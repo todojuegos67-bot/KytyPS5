@@ -126,12 +126,13 @@ struct Mfg {
     Kyty::Local::DynMultiplier dm;
 } g_mfg;
 
-double RefreshTarget() {
+double RefreshTarget(double* refresh_hz = nullptr) {
     DEVMODEA mode{};
     mode.dmSize = sizeof(mode);
     if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 &&
         mode.dmDisplayFrequency > 30) {
         const double hz = mode.dmDisplayFrequency;
+        if (refresh_hz != nullptr) *refresh_hz = hz;
         return hz - hz * hz / 3600.0;
     }
     return 0.0;
@@ -213,6 +214,178 @@ void Message(uint32_t type, const wchar_t* message) {
 VkResult GameQueueSubmit(uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
     std::scoped_lock lock{*g_submit_mutex};
     return g_queue_submit(g_game_queue, count, submits, fence);
+}
+
+// bb-dlssg-085: "[fg] generated/real luma": the generated frames looked darker than their
+// neighbours in the user's 18:39 video. In the frame generation callback, after FidelityFX's
+// dispatch, the centre 192x108 pixels of the real frame (presentColor) and of the first generated
+// one (outputs[0]) are copied to a host buffer (one sample in 24 callbacks; the buffer is read 24
+// callbacks later, long after the GPU is done) and their mean luma is compared, once a second.
+// Both images are read in the layout FidelityFX leaves them in as far as it is known (general).
+// BB_FG_LUMA=0: off. 8-bit BGRA / RGBA backbuffers only.
+namespace Luma {
+constexpr uint32_t kW = 192, kH = 108, kEvery = 24;
+struct Slot {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint8_t* mapped = nullptr;
+    bool pending = false, bgra = true;
+    uint32_t recorded_at = 0;
+};
+Slot g_slot[2];
+bool g_ready = false, g_failed = false;
+uint32_t g_calls = 0, g_next = 0;
+double g_real_sum = 0.0, g_gen_sum = 0.0;
+uint32_t g_samples = 0;
+std::chrono::steady_clock::time_point g_report{};
+PFN_vkCmdCopyImageToBuffer g_copy = nullptr;
+PFN_vkCmdPipelineBarrier g_barrier = nullptr;
+
+bool Init() {
+    if (g_ready || g_failed) return g_ready;
+    g_failed = true;
+    const char* off = std::getenv("BB_FG_LUMA");
+    if (off != nullptr && *off == '0') return false;
+    auto proc = [](const char* name) { return g_get_device_proc(g_device, name); };
+    auto* create_buffer = reinterpret_cast<PFN_vkCreateBuffer>(proc("vkCreateBuffer"));
+    auto* get_reqs = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(proc("vkGetBufferMemoryRequirements"));
+    auto* allocate = reinterpret_cast<PFN_vkAllocateMemory>(proc("vkAllocateMemory"));
+    auto* bind = reinterpret_cast<PFN_vkBindBufferMemory>(proc("vkBindBufferMemory"));
+    auto* map = reinterpret_cast<PFN_vkMapMemory>(proc("vkMapMemory"));
+    g_copy = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(proc("vkCmdCopyImageToBuffer"));
+    g_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(proc("vkCmdPipelineBarrier"));
+    if (!create_buffer || !get_reqs || !allocate || !bind || !map || !g_copy || !g_barrier) return false;
+    VkPhysicalDeviceMemoryProperties props{};
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties(g_physical, &props);
+    for (auto& slot : g_slot) {
+        VkBufferCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        info.size = 2ull * kW * kH * 4;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (create_buffer(g_device, &info, nullptr, &slot.buffer) != VK_SUCCESS) return false;
+        VkMemoryRequirements reqs{};
+        get_reqs(g_device, slot.buffer, &reqs);
+        uint32_t type = UINT32_MAX;
+        for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+            const auto flags = props.memoryTypes[i].propertyFlags;
+            if ((reqs.memoryTypeBits & (1u << i)) &&
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                type = i;
+                break;
+            }
+        }
+        if (type == UINT32_MAX) return false;
+        VkMemoryAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc.allocationSize = reqs.size;
+        alloc.memoryTypeIndex = type;
+        void* mapped = nullptr;
+        if (allocate(g_device, &alloc, nullptr, &slot.memory) != VK_SUCCESS ||
+            bind(g_device, slot.buffer, slot.memory, 0) != VK_SUCCESS ||
+            map(g_device, slot.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+            return false;
+        }
+        slot.mapped = static_cast<uint8_t*>(mapped);
+    }
+    g_failed = false;
+    g_ready = true;
+    return true;
+}
+
+double MeanLuma(const uint8_t* px, bool bgra) {
+    double sum = 0.0;
+    for (uint32_t i = 0; i < kW * kH; ++i) {
+        const double r = px[i * 4 + (bgra ? 2 : 0)], g = px[i * 4 + 1], b = px[i * 4 + (bgra ? 0 : 2)];
+        sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+    return sum / (kW * kH);
+}
+
+void Sample(void* command_list, const FfxApiResource& real, const FfxApiResource& generated) {
+    if (g_failed || command_list == nullptr || real.resource == nullptr || generated.resource == nullptr) return;
+    ++g_calls;
+    if (!Init()) return;
+    // the slot written kEvery callbacks ago is done: read it
+    for (auto& slot : g_slot) {
+        if (slot.pending && g_calls - slot.recorded_at >= kEvery) {
+            slot.pending = false;
+            const double r = MeanLuma(slot.mapped, slot.bgra);
+            const double g = MeanLuma(slot.mapped + kW * kH * 4, slot.bgra);
+            g_real_sum += r;
+            g_gen_sum += g;
+            ++g_samples;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (g_report == std::chrono::steady_clock::time_point{}) g_report = now;
+    if (now - g_report >= std::chrono::seconds(1) && g_samples > 0) {
+        const double r = g_real_sum / g_samples, g = g_gen_sum / g_samples;
+        const double ratio = r > 0.0 ? g / r : 0.0;
+        Printf("[fg] generated/real luma: real %.2f, generated %.2f (generated/real %.3f%s; %u "
+               "samples, centre %ux%u pixels, encoded 8-bit values)",
+               r, g, ratio, ratio < 0.97 || ratio > 1.03 ? ", DIFFERS by more than 3%" : "",
+               g_samples, kW, kH);
+        g_real_sum = g_gen_sum = 0.0;
+        g_samples = 0;
+        g_report = now;
+    }
+    if (g_calls % kEvery != 0) return;
+    const uint32_t fmt = real.description.format;
+    const bool bgra = fmt == FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM || fmt == FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB ||
+                      fmt == FFX_API_SURFACE_FORMAT_B8G8R8A8_TYPELESS;
+    const bool rgba = fmt == FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM || fmt == FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB ||
+                      fmt == FFX_API_SURFACE_FORMAT_R8G8B8A8_TYPELESS;
+    if ((!bgra && !rgba) || real.description.width < kW || real.description.height < kH ||
+        generated.description.width < kW || generated.description.height < kH) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Printf("[fg] generated/real luma: not measured (format %u, %ux%u: 8-bit BGRA / RGBA only)",
+                   fmt, real.description.width, real.description.height);
+        }
+        return;
+    }
+    auto& slot = g_slot[g_next];
+    g_next ^= 1u;
+    if (slot.pending) return;
+    VkCommandBuffer cmd = static_cast<VkCommandBuffer>(command_list);
+    const VkImage images[2] = {static_cast<VkImage>(real.resource), static_cast<VkImage>(generated.resource)};
+    const FfxApiResource* res[2] = {&real, &generated};
+    VkMemoryBarrier before{};
+    before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    g_barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0,
+              nullptr, 0, nullptr);
+    for (int i = 0; i < 2; ++i) {
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = static_cast<VkDeviceSize>(i) * kW * kH * 4;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageOffset = {static_cast<int32_t>((res[i]->description.width - kW) / 2),
+                            static_cast<int32_t>((res[i]->description.height - kH) / 2), 0};
+        copy.imageExtent = {kW, kH, 1};
+        g_copy(cmd, images[i], VK_IMAGE_LAYOUT_GENERAL, slot.buffer, 1, &copy);
+    }
+    VkMemoryBarrier after{};
+    after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    g_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+              &after, 0, nullptr, 0, nullptr);
+    slot.pending = true;
+    slot.bgra = bgra;
+    slot.recorded_at = g_calls;
+}
+} // namespace Luma
+
+ffxReturnCode_t FrameGenerationCallback(ffxDispatchDescFrameGeneration* params, void* context) {
+    const ffxReturnCode_t result = g_ffx.Dispatch(reinterpret_cast<ffxContext*>(context), &params->header);
+    if (result == FFX_API_RETURN_OK && params->numGeneratedFrames > 0) {
+        Luma::Sample(params->commandList, params->presentColor, params->outputs[0]);
+    }
+    return result;
 }
 
 FfxApiResource ImageResource(const Image& image, bool depth) {
@@ -464,8 +637,9 @@ double CapInterval() {
         const char* text = Env("KYTY_VRR_CAP_FPS");
         if (text == nullptr || *text == '\0') return 0.0;
         double cap = std::strtod(text, nullptr);
+        double refresh = 0.0;
         if (std::string(text) == "auto") {
-            cap = RefreshTarget();
+            cap = RefreshTarget(&refresh);
         }
         const char* frames = Env("KYTY_FSR3_FG_FRAMES");
         const int value = frames != nullptr ? std::atoi(frames) : 1;
@@ -473,6 +647,9 @@ double CapInterval() {
         if (cap <= 0.0) return 0.0;
         Printf("FSR3 FG: shown frames held under %.0f fps (real at most %.1f)", cap,
                cap / (1 + generated));
+        Printf("[fg] G-SYNC/VRR cap: refresh %.0f Hz, x%d -> real cap %.0f fps, shown <= %.0f fps",
+               refresh, 1 + generated, std::floor(cap / (1 + generated)),
+               std::floor(cap / (1 + generated)) * (1 + generated));
         return (1 + generated) / cap;
     }();
     if (g_mfg.on && g_mfg.dynamic) {
@@ -880,10 +1057,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     config.swapChain = static_cast<void*>(static_cast<VkSwapchainKHR>(swapchain));
     config.presentCallback = nullptr;
     config.presentCallbackUserContext = nullptr;
-    config.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params,
-                                        void* context) -> ffxReturnCode_t {
-        return g_ffx.Dispatch(reinterpret_cast<ffxContext*>(context), &params->header);
-    };
+    config.frameGenerationCallback = &FrameGenerationCallback;
     config.frameGenerationCallbackUserContext = &g_fg_context;
     config.frameGenerationEnabled = generate;
     config.allowAsyncWorkloads = EnvOn("KYTY_FSR3_ASYNC", false);
