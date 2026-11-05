@@ -1156,8 +1156,11 @@ void AddDeviceExtensions(vk::PhysicalDevice physical, const std::vector<std::str
 		return;
 	}
 	const auto kind = BB::Upscale::Cfg().kind;
-	if (kind != SR::Kind::Dlss && kind != SR::Kind::Xess && kind != SR::Kind::Fsr3 && kind != SR::Kind::Fsr4) {
-		g_off_reason = "no upscaler (DLSS 5 runs after DLSS, XeSS, FSR 3.1 or FSR 4: choose one in Reescalado)";
+	// 0.90: Kind::Native too (Reescalado off): DLSS 5 on the game's own image at the native
+	// analysis point, the same image and vectors frame generation reads (BBFgNativeAnalyze).
+	if (kind != SR::Kind::Dlss && kind != SR::Kind::Xess && kind != SR::Kind::Fsr3 && kind != SR::Kind::Fsr4 &&
+	    kind != SR::Kind::Native) {
+		g_off_reason = "Reescalado off without the native analysis (DLSS 5 runs after DLSS, XeSS, FSR 3.1, FSR 4 or on the native image)";
 		return;
 	}
 	for (const char* name: {"VK_NVX_binary_import", "VK_NVX_image_view_handle", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME}) {

@@ -170,7 +170,15 @@ Config ParseConfig() {
     } else if (up == "native") {
         c.kind = SR::Kind::Native;
     }
-    if ((c.kind == SR::Kind::Off || c.kind == SR::Kind::Native) && FgNativeWanted()) {
+    // 0.90: DLSS 5 with no upscaler (Reescalado off / native): the same native analysis as frame
+    // generation (G-buffer depth, camera + object motion vectors at the game's size), with
+    // DLSS 5 on the native image at that point (BBFgNativeAnalyze). FG may be off.
+    const bool dlss5_native = [] {
+        const char* d5 = std::getenv("BB_DLSS5");
+        return d5 != nullptr && std::atof(d5) > 0.0;
+    }();
+    if ((c.kind == SR::Kind::Off || c.kind == SR::Kind::Native) &&
+        (FgNativeWanted() || dlss5_native)) {
         c.kind = SR::Kind::Native; // analysis only, for frame generation (g_fg_native)
         g_fg_native = true;
     }
@@ -437,6 +445,14 @@ struct Learned {
     u32 stable = 0;
     bool have_prev_vp = false;
     Mat prev_vp;
+    // 0.90: OnFlip rolls prev_vp to this frame's camera before its present-time plan
+    // (FillPresentPlan "at present"): that plan's clip_to_prev_clip was vp * inv(vp) = identity,
+    // zero camera motion on every present-time frame (0.89 log: "camera delta max 0.000 NDC" in
+    // all 111 seconds, generated frames smeared on every camera turn, DLSS-G and FSR 3 alike).
+    // The camera of the frame before, kept for the rest of OnFlip.
+    bool have_vp_before_roll = false;
+    Mat vp_before_roll;
+    bool rolled = false; // set between the roll and the end of OnFlip
     bool last_injected = false;
     bool last_fg_native = false; // 0.39: the previous frame had FG-only (native) inputs
 };
@@ -799,7 +815,11 @@ void FillCamera(Plan& p) {
     const Mat& vp = cam->m;
     Mat inv;
     if (!Invert(vp, inv)) return;
-    const Mat prev = g_learned.have_prev_vp ? g_learned.prev_vp : vp;
+    const bool have_prev =
+        g_learned.rolled ? g_learned.have_vp_before_roll : g_learned.have_prev_vp;
+    const Mat prev = !have_prev            ? vp
+                     : g_learned.rolled ? g_learned.vp_before_roll
+                                        : g_learned.prev_vp;
     const Mat to_prev = Multiply(prev, inv);
     for (int i = 0; i < 16; ++i) {
         p.view_to_clip[i] = static_cast<float>(vp.m[i]);
@@ -3212,6 +3232,9 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                  g_frame_no, cam->count, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9],
                  m[10], m[11], m[12], m[13], m[14], m[15]);
     }
+    g_learned.vp_before_roll = g_learned.prev_vp;
+    g_learned.have_vp_before_roll = g_learned.have_prev_vp;
+    g_learned.rolled = true;
     if (cam != nullptr) {
         g_learned.prev_vp = cam->m;
         g_learned.have_prev_vp = true;
@@ -3607,6 +3630,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     g_dump_repeats = 0;
     g_frame = {};
     g_draw = {};
+    g_learned.rolled = false;
 }
 
 bool HudSharpScale(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
