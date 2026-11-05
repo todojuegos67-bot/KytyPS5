@@ -1900,8 +1900,23 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
                 static int cap_state = 0;
                 const int maxgen =
                     std::min(g_dyn_max, std::max(DynBaseCap(g_dyn_real_fps, cap_state) - 1, 1));
-                const int next = std::clamp(g_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1, false) - 1,
-                                            1, std::max(maxgen, 1));
+                int next = std::clamp(g_dm.Window(g_dyn_gen + 1, real, T, maxgen + 1, false) - 1,
+                                      1, std::max(maxgen, 1));
+                // bb-dlssgpace-089 (BB_DLSSG_DYN_LOWEST=0: off): the lowest multiplier whose
+                // shown rate reaches 90% of the target at the game's own (free) real rate. The
+                // 20:48 run picked x4 at a free 90-109 fps: the pacer then held the real frames at
+                // 224 / 4 = 56 fps (17.86 ms), where x2 at 112 reaches the cap with twice the real
+                // frames. Higher multipliers only when the game cannot make the cap with fewer.
+                {
+                    static const bool lowest = [] {
+                        const char* v = std::getenv("BB_DLSSG_DYN_LOWEST");
+                        return v == nullptr || *v != '0';
+                    }();
+                    if (lowest && g_dyn_real_fps > 1.0) {
+                        const int need = static_cast<int>(std::ceil(0.9 * T / g_dyn_real_fps)) - 1;
+                        next = std::min(next, std::clamp(need, 1, std::max(maxgen, 1)));
+                    }
+                }
                 if (next != g_dyn_gen) {
                     const int from_m = g_dyn_gen + 1;
                     g_dyn_gen = next;
@@ -2599,7 +2614,12 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
         // (Immediate is only free of tearing inside the VRR range: with the shown rate held
         // under it, KYTY_VRR_CAP_FPS; uncapped the rate can pass the refresh, and mailbox, which
         // never tears, is used.)
-        const bool high_refresh = refresh_hz >= 120 && Env("KYTY_VRR_CAP_FPS") != nullptr;
+        // bb-dlssgpace-089: the dynamic multiplier holds the shown rate under its target (224
+        // on 240 Hz) too. The 20:48 dlss-dyn run in mailbox: present call 1.35 -> 8.29 -> 16.41 ms
+        // in 3 s at x4 (Streamline's 4 images per real frame queued behind a blocking mailbox
+        // present), then VK_ERROR_OUT_OF_DATE_KHR and the NGX feature lost.
+        const bool high_refresh =
+            refresh_hz >= 120 && (Env("KYTY_VRR_CAP_FPS") != nullptr || Dlssg::g_dynamic);
         wanted = high_refresh && supported(vk::PresentModeKHR::eImmediate)
                      ? vk::PresentModeKHR::eImmediate
                  : supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
