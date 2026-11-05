@@ -1778,6 +1778,10 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             Printf("frame generation: slDLSSGSetOptions failed (%d)", static_cast<int>(result));
         }
         g_options_set = true;
+        if (g_options_backbuffer.width != 0 && g_options_backbuffer != backbuffer) {
+            Printf("DLSS-G: resumed after swapchain recreate %ux%u (was %ux%u)", backbuffer.width,
+                   backbuffer.height, g_options_backbuffer.width, g_options_backbuffer.height);
+        }
         g_options_backbuffer = backbuffer;
         g_options_format = format;
     }
