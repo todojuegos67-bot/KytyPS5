@@ -1364,6 +1364,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
 		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
 			g_gpu_state->ProcessCommands();
+			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
+			g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];
