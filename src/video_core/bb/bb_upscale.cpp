@@ -465,6 +465,12 @@ float g_jitter[2]{};
 u64 g_jittered_draws = 0;
 u64 g_jittered_frame_start = 0;
 u64 g_jittered_last_frame = 0;
+// 0.79 [taa]: the length of the Halton cycle in use and the scene draws seen per frame (with and
+// without a camera found in their vertex constants: those are not jittered unless BB_TAA_ALL=1).
+u32 g_jitter_phases = 8;
+u64 g_taa_scene_draws = 0, g_taa_nocam_draws = 0;
+u64 g_taa_last_scene = 0, g_taa_last_nocam = 0;
+u64 g_taa_dispatches = 0;
 std::chrono::steady_clock::time_point g_last_flip{};
 float g_delta_ms = 16.7f;
 std::string g_last_point;
@@ -2630,14 +2636,62 @@ bool Jitter(float& x, float& y) {
         return false;
     }
     std::scoped_lock lk{g_mutex};
-    if (!g_draw.valid || !g_draw.scene || !g_draw.vertex_camera || !g_learned.have_prev_vp ||
-        (!PresentMode() && LearnedSource() == 0)) {
+    // 0.79: BB_TAA_ALL=1 jitters every draw of the scene pass (a real TAA engine jitters all of
+    // its projections), not only those whose vertex constants hold a recognised view-projection.
+    static const bool all_scene = [] {
+        const char* v = std::getenv("BB_TAA_ALL");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (g_draw.valid && g_draw.scene) {
+        ++g_taa_scene_draws;
+        if (!g_draw.vertex_camera) ++g_taa_nocam_draws;
+    }
+    if (!g_draw.valid || !g_draw.scene || (!g_draw.vertex_camera && !all_scene) ||
+        !g_learned.have_prev_vp || (!PresentMode() && LearnedSource() == 0)) {
         return false;
     }
     ++g_jittered_draws;
     x = g_jitter[0];
     y = g_jitter[1];
     return x != 0.0f || y != 0.0f;
+}
+
+// 0.79 [taa]: the jitter handed to the upscaler, with each SDK's sign convention applied, and the
+// log line. Called once per upscaler dispatch with the jitter the plan carries (the offset the
+// scene passes were rasterised with, render pixels, +x right, +y down). All four SDKs take the
+// offset as applied to the projection in pixels (FSR 3.1: NDC x += 2*jx/w, y -= 2*jy/h, i.e. a
+// shift of the picture by (+jx,+jy) screen pixels; DLSS / XeSS the same pixel offset): sign +1
+// each. BB_JITTER_SIGN_<DLSS|FSR3|FSR4|XESS>=-1 flips only what that SDK receives (diagnosis).
+void TaaPass(const float (&applied)[2], bool camera_valid, float (&passed)[2]) {
+    const auto kind = Cfg().kind;
+    const char* env = kind == SR::Kind::Dlss   ? "BB_JITTER_SIGN_DLSS"
+                      : kind == SR::Kind::Fsr3 ? "BB_JITTER_SIGN_FSR3"
+                      : kind == SR::Kind::Fsr4 ? "BB_JITTER_SIGN_FSR4"
+                                               : "BB_JITTER_SIGN_XESS";
+    const char* v = std::getenv(env);
+    const float sign = v != nullptr && std::atof(v) < 0 ? -1.0f : 1.0f;
+    passed[0] = applied[0] * sign;
+    passed[1] = applied[1] * sign;
+    std::scoped_lock lk{g_mutex};
+    const u64 n = ++g_taa_dispatches;
+    if (n != 1 && n % 600 != 0) {
+        return;
+    }
+    const bool yes = applied[0] != 0.0f || applied[1] != 0.0f;
+    const std::string line = fmt::format(
+        "[taa] jitter applied to game projection: {}, sequence Halton(2,3)-0.5 over {} phases "
+        "(FSR 3 phase count, 8*ratio^2), phase {}, offset {:+.4f},{:+.4f} px (render), passed to "
+        "{} as {:+.4f},{:+.4f}{}, mv excludes jitter: {} (bb_mv.comp samples at pixel - jitter; "
+        "no jitter-cancellation / motionVectorsJittered), scene draws jittered last frame {}/{} "
+        "({} without a camera found{}), how: viewport offset of the G-buffer-depth passes "
+        "(equivalent to translating the projection by the same pixels; HUD, post-processing and "
+        "other-size passes untouched)",
+        yes ? "yes" : "no", g_jitter_phases, g_jitter_index, applied[0], applied[1],
+        SR::KindName(kind), passed[0], passed[1], sign < 0 ? " (sign flipped by env)" : "",
+        camera_valid ? "yes" : "n/a (zero vectors, no camera yet)", g_jittered_last_frame,
+        g_taa_last_scene, g_taa_last_nocam, std::getenv("BB_TAA_ALL") ? ", BB_TAA_ALL set" : "");
+    LOG_INFO(Render_Vulkan, "{}", line);
+    Checkpoint(line);
 }
 
 bool WantHudlessCopy() {
@@ -3170,7 +3224,13 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                              ? static_cast<double>(PresentMode() ? g_present_w : g_output_w) /
                                    g_learned.render_w
                              : 1.0;
-    const u32 phases = std::clamp<u32>(static_cast<u32>(std::ceil(8.0 * ratio * ratio)), 8, 64);
+    // 0.79: the length FSR 3's ffxFsr3UpscalerGetJitterPhaseCount gives (8 * ratio^2, truncated),
+    // the cycle every back end is told about; Halton(2,3) index (phase + 1), minus 0.5.
+    const u32 phases = std::clamp<u32>(static_cast<u32>(8.0 * ratio * ratio + 1e-6), 8, 64);
+    g_jitter_phases = phases;
+    g_taa_last_scene = g_taa_scene_draws;
+    g_taa_last_nocam = g_taa_nocam_draws;
+    g_taa_scene_draws = g_taa_nocam_draws = 0;
     g_jitter_index = (g_jitter_index + 1) % phases;
     g_jitter[0] = Halton(g_jitter_index + 1, 2) - 0.5f;
     g_jitter[1] = Halton(g_jitter_index + 1, 3) - 0.5f;

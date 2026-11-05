@@ -140,6 +140,9 @@ enum class Sample { Keep, Inject, Redirect };
 Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format);
 // The current draw is a scene draw to jitter: the offset in pixels.
 bool Jitter(float& x, float& y);
+// 0.79 [taa]: what the upscaler is told (per-SDK sign), and the "[taa] jitter applied ..." line at the
+// first dispatch and every 600th.
+void TaaPass(const float (&applied)[2], bool camera_valid, float (&passed)[2]);
 // The guest flip (end of the frame).
 void OnFlip(VAddr addr, u32 width, u32 height);
 // The current draw renders into the presented image (HUD stage): true once per frame, before its

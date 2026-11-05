@@ -1807,8 +1807,14 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
                    vk::ImageLayout::eGeneral, g_bb.output.usage};
     desc.render = render;
     desc.upscale = output;
-    desc.jitter[0] = plan.jitter[0];
-    desc.jitter[1] = plan.jitter[1];
+    {
+        // 0.79 [taa]: exactly the offset the scene passes were drawn with (plan.jitter), per-SDK sign.
+        const float applied[2]{plan.jitter[0], plan.jitter[1]};
+        float passed[2]{};
+        BB::Upscale::TaaPass(applied, plan.camera_valid, passed);
+        desc.jitter[0] = passed[0];
+        desc.jitter[1] = passed[1];
+    }
     desc.reset = plan.reset;
     desc.hdr = plan.hdr;
     // 0.23 (colour): the window-size path with linear input gets the HDR flag, as the in-place
