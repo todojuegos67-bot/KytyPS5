@@ -3321,6 +3321,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             if (f.injected) ++g_lock_inplace;
             if (g_lock_frames >= 300) {
                 g_lock = g_lock_inplace * 100 >= g_lock_frames * 95 ? 1 : 2;
+                // 0.93b: the window path only when it can run at all (the game's whole frame
+                // smaller than the window, or native AA). When the scene renders below the
+                // game's output size (resolution patch / composite point) there is no window
+                // path: locking to it skipped every in-place sample and nothing was upscaled.
+                if (g_lock == 2 && !WindowPathOk()) g_lock = 1;
                 Checkpoint(fmt::format(
                     "[path] locked={} for the session: {} of the first {} 3D frames were upscaled "
                     "in place{} (BB_PATH_LOCK=0: per-frame choice)",

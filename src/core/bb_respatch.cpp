@@ -103,8 +103,16 @@ bool g_active = false;
 u32 g_sw = 0, g_sh = 0, g_ow = 0, g_oh = 0;
 
 std::string Mode() {
+    // 0.93b: unset / "auto" = "1", the DCport placement: the game renders its whole scene
+    // chain (scene passes and its own scene-size post effects) at the internal size through its
+    // own resolution values, its UI at the output size, and the upscaler runs where the game
+    // composites the scene into the output-size image, before the HUD. The generic per-target
+    // chain ("native") stays opt-in: in the 0.93 run its later consumers (image copies, depth
+    // reads) still saw internal-size images with output-size coordinates.
     const char* v = std::getenv("BB_SCENE_UPSCALE");
-    return v ? std::string(v) : std::string();
+    std::string m = v ? std::string(v) : std::string();
+    if (m.empty() || m == "auto") m = "1";
+    return m;
 }
 
 // "mov r32, imm32" with the template's encoding (B8/B9 + imm32): the immediate, or 0.
@@ -128,8 +136,7 @@ bool NativeChain() {
     // (post-processing) are found from the GPU command stream, nothing of the game is patched. It
     // only engages when an upscaler runs with a ratio > 1 and the game's 3D renders at its output
     // size (bb_upscale.cpp); otherwise nothing changes. BB_SCENE_UPSCALE=0 turns it off.
-    const std::string m = Mode();
-    return m == "native" || m.empty() || m == "auto";
+    return Mode() == "native";
 }
 
 bool Active(u32* scene_w, u32* scene_h, u32* out_w, u32* out_h) {
@@ -158,7 +165,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
         BB::Upscale::Checkpoint(features);
         LOG_INFO(Loader, "[BB] {}", features);
     }
-    if (mode == "native" || mode.empty() || mode == "auto") {
+    if (mode == "native") {
         BB::Upscale::Checkpoint(
             "native render chain (BB_SCENE_UPSCALE=native/auto, 0.93 default): the game keeps its own output size "
             "(the launcher's resolution patch at the window size); only its 3D scene targets are "
