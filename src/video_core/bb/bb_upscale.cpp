@@ -658,12 +658,37 @@ bool NativeFallback() {
 // every frame the game renders at its output size: upscaler / DLAA, DLSS 5 and frame generation
 // inputs all run there. BB_INJECT=inplace: the in-place scene-colour point first (0.96). The
 // scene-upscale modes (internal-size scene: native chain, resolution patch) keep their own point.
+// 1.02 (bb-native-102): native AA with an upscaler (DLAA / FSR 4 native / ratio 1). The 0.97 HUD
+// point only takes the presented image for the upscaler, but Bloodborne composites its scene into
+// its UI image, so at ratio 1 every frame missed it and went to the present-time path (the
+// finished image, HUD included: AA and DLSS 5 on the HUD, and the frames where the HUD point did
+// land on the flip switched paths: overlays off and on). At ratio 1 the resolution patch is a
+// no-op (scene == output), so the scene-upscale composite point does not exist either. Native AA
+// therefore uses the in-place point on the HDR scene colour (pre-0.97 / pre-0.93b DLAA), DLSS 5
+// right after the upscaler there, the HUD drawn by the game afterwards. BB_INJECT=hud: 0.97.
+bool NativeAaUpscaler() {
+    if (Cfg().kind == SR::Kind::Off || Cfg().kind == SR::Kind::Native || FgNative()) return false;
+    return SR::QualityRatio(Cfg().kind, Cfg().quality) <= 1.01 &&
+           Cfg().quality != SR::Quality::Dynamic;
+}
 bool HudPointOn() {
-    static const bool on = [] {
+    static const int on = [] {
         const char* v = std::getenv("BB_INJECT");
-        return v == nullptr || std::string_view{v} != "inplace";
+        if (v != nullptr && std::string_view{v} == "inplace") return 0;
+        if (v != nullptr && std::string_view{v} == "hud") return 2;
+        return 1;
     }();
-    return on && !NativeChainLive() && g_learned.render_w != 0 &&
+    if (on == 0 || (on == 1 && NativeAaUpscaler())) {
+        static bool said = false;
+        if (!said && on == 1) {
+            said = true;
+            Checkpoint("[inject] 1.02 native AA (ratio 1): in-place point on the HDR scene colour "
+                       "for the upscaler / DLAA, DLSS 5 after it, HUD untouched; the HUD point "
+                       "(present-time) is not used (BB_INJECT=hud: 0.97 behaviour)");
+        }
+        return false;
+    }
+    return !NativeChainLive() && g_learned.render_w != 0 &&
            g_learned.render_w == g_output_w && g_learned.render_h == g_output_h;
 }
 // The window-size path may run this frame (to the window, or native AA's same-size fallback).
@@ -3409,6 +3434,21 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             if (f.injected) ++g_lock_inplace;
             if (g_lock_frames >= 300) {
                 g_lock = g_lock_inplace * 100 >= g_lock_frames * 95 ? 1 : 2;
+                // 1.02: native AA locks in place when the in-place point carried most frames
+                // (the present-time path there runs on the image with the HUD); window only when
+                // the in-place point really does not work, for the whole session.
+                if (NativeAaUpscaler() && g_lock == 2 && g_lock_inplace * 2 >= g_lock_frames) {
+                    g_lock = 1;
+                }
+                if (NativeAaUpscaler()) {
+                    Checkpoint(fmt::format(
+                        "[path] 1.02 native AA (ratio 1, {}): {} of {} 3D frames in place -> "
+                        "locked={} for the session{}",
+                        SR::KindName(Cfg().kind), g_lock_inplace, g_lock_frames,
+                        g_lock == 1 ? "in-place" : "window",
+                        g_lock == 1 ? "; DLSS 5 runs after the upscaler on the scene colour"
+                                    : " (fallback: same-size present-time AA, DLSS 5 after it)"));
+                }
                 // 0.93b: the window path only when it can run at all (the game's whole frame
                 // smaller than the window, or native AA). When the scene renders below the
                 // game's output size (resolution patch / composite point) there is no window
