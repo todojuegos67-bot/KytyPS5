@@ -848,7 +848,27 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 	const ImU32 gold  = ImGui::GetColorU32(disabled ? ImVec4 {0.5f, 0.45f, 0.35f, 1.0f} : kGold);
 	const float pad   = 16.0f * g_unit;
 	const float ty    = at.y + (h - ImGui::GetFontSize()) * 0.5f;
-	if (focused) dl->AddRectFilled({at.x, at.y + h - 3 * g_unit}, {at.x + w, at.y + h}, gold);
+	// (perfopts-1107) The focus underline grows from the centre (eased), a soul-lit point at its middle; a changed value
+	// slides in from the side it came from and fades in (180 ms).
+	const ImGuiID row_id = ImGui::GetID("##row");
+	const float   fv     = Anim::Hot(row_id, focused);
+	if (fv > 0.0f) {
+		const float cx = at.x + w * 0.5f, hw = w * 0.5f * fv;
+		const ImU32 g0 = ImGui::GetColorU32(ImVec4 {kGold.x, kGold.y, kGold.z, 0.0f});
+		dl->AddRectFilledMultiColor({cx - hw, at.y + h - 2 * g_unit}, {cx, at.y + h}, g0, gold, gold, g0);
+		dl->AddRectFilledMultiColor({cx, at.y + h - 2 * g_unit}, {cx + hw, at.y + h}, gold, g0, g0, gold);
+		dl->AddCircleFilled({cx, at.y + h - 1 * g_unit}, 2.5f * g_unit * fv, IM_COL32(206, 228, 255, static_cast<int>(220 * fv)), 8);
+	}
+	static std::map<ImGuiID, std::pair<int, double>> changes; // the last value, when it changed (sign: the direction)
+	auto& seen = changes.try_emplace(row_id, current, -1.0).first->second;
+	static std::map<ImGuiID, int> dirs;
+	if (seen.first != current) {
+		dirs[row_id] = current > seen.first ? 1 : -1;
+		seen = {current, Anim::Now()};
+	}
+	const float vchange = seen.second < 0 ? 1.0f : Anim::EaseOut(Anim::Progress(seen.second, 0.18));
+	if (vchange < 1.0f) Bump();
+	const float vshift = (1.0f - vchange) * 18.0f * g_unit * static_cast<float>(dirs[row_id]);
 	std::string text = I18n::T(label);
 	dl->AddText({at.x + pad, ty}, ink, text.c_str());
 	if (restart && !g_start_mode) { // (10-28b) the launcher applies everything at start: no "(requiere reinicio)" there
@@ -862,7 +882,11 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 	const ImVec2 vs    = ImGui::CalcTextSize(shown);
 	const float  right = at.x + w - pad;
 	const float  mid   = right - std::max(vs.x, 220.0f * g_unit) * 0.5f - 30.0f * g_unit;
-	dl->AddText({mid - vs.x * 0.5f, ty}, gold, shown);
+	{
+		ImVec4 gc = ImGui::ColorConvertU32ToFloat4(gold);
+		gc.w *= 0.25f + 0.75f * vchange;
+		dl->AddText({mid - vs.x * 0.5f + vshift, ty}, ImGui::GetColorU32(gc), shown);
+	}
 	if (count > 1) {
 		const float half = std::max(vs.x, 220.0f * g_unit) * 0.5f + 18.0f * g_unit;
 		const float cy   = at.y + h * 0.5f, s2 = 7.0f * g_unit;
@@ -1052,6 +1076,224 @@ int ForSection(const char* title) {
 }
 } // namespace Icons
 
+// ---- (perfopts-1107) The F1 menu in the Demon's Souls look, all procedural (no game art, no logos): cold grey-blue
+// carved stone (the Nexus), tarnished brass filigree (Boletaria's gothic ironwork and gilding), pale blue-white soul
+// light (the archstones and the souls the player carries), a warm candle flicker (the Nexus' candles), drifting fog and
+// floating soul motes. Drawn only while the menu is open or animating. ----
+ImFont* DisplayFont(); // (Cinzel, below)
+namespace Souls {
+// Palette.
+constexpr int kStoneT[3] = {38, 42, 50}, kStoneB[3] = {13, 15, 19};      // Nexus stone, lit from above
+constexpr int kBrass[3] = {178, 152, 102}, kBrassDim[3] = {112, 96, 68}; // tarnished brass / gold
+constexpr int kBrassHi[3] = {222, 200, 150};
+constexpr int kSoul[3] = {206, 228, 255};                                 // soul light
+constexpr int kCandle[3] = {255, 186, 104};                               // candle flame
+inline ImU32 C(const int (&c)[3], float a) {
+	return IM_COL32(c[0], c[1], c[2], static_cast<int>(std::clamp(a, 0.0f, 1.0f) * 255.0f));
+}
+inline float Time() {
+	return static_cast<float>(std::fmod(Anim::Now(), 3600.0));
+}
+// A candle's flicker, 0.75..1.
+inline float Flicker(float seed = 0.0f) {
+	const float t = Time() + seed;
+	return 0.87f + 0.06f * std::sin(t * 7.3f) + 0.04f * std::sin(t * 13.1f + 1.7f) + 0.03f * std::sin(t * 23.7f + 0.4f);
+}
+inline float Hash(int i) {
+	const uint32_t x = static_cast<uint32_t>(i) * 2654435761u ^ 0x9E3779B9u;
+	return static_cast<float>((x >> 8) & 0xFFFF) / 65535.0f;
+}
+// Fog: slow drifting soft banks behind the panel [a, b] (stacked translucent discs, grey-blue).
+void Fog(ImDrawList* dl, ImVec2 a, ImVec2 b, float alpha) {
+	const float t = Time(), w = b.x - a.x, h = b.y - a.y;
+	for (int i = 0; i < 9; i++) {
+		const float sx = Hash(i * 3 + 1), sy = Hash(i * 3 + 2), sr = Hash(i * 3 + 3);
+		const float x  = a.x - w * 0.25f + std::fmod(sx * w * 1.5f + t * (6.0f + 8.0f * sr), w * 1.5f);
+		const float y  = a.y + h * (0.15f + 0.8f * sy) + std::sin(t * 0.21f + i) * h * 0.03f;
+		const float r  = h * (0.22f + 0.22f * sr);
+		for (int k = 4; k >= 1; k--)
+			dl->AddCircleFilled({x, y}, r * (0.45f + 0.18f * k), IM_COL32(150, 162, 178, static_cast<int>(alpha * 7.0f)), 32);
+	}
+}
+// Soul motes: pale points rising slowly with a sway, fading in and out; `count` of them over [a, b].
+void Motes(ImDrawList* dl, ImVec2 a, ImVec2 b, float alpha, int count, float scale) {
+	const float t = Time(), w = b.x - a.x, h = b.y - a.y;
+	for (int i = 0; i < count; i++) {
+		const float speed = 0.05f + 0.07f * Hash(i * 7 + 11);
+		const float life  = std::fmod(t * speed + Hash(i * 7 + 12), 1.0f);
+		const float x     = a.x + w * Hash(i * 7 + 13) + std::sin(t * (0.6f + Hash(i) * 0.8f) + i) * 10.0f * scale;
+		const float y     = b.y - h * life;
+		const float fade  = std::sin(life * 3.14159f);
+		const float r     = (1.1f + 1.6f * Hash(i * 7 + 14)) * scale;
+		const bool  warm  = (i % 6) == 0; // a few candle embers among the souls
+		const auto& col   = warm ? kCandle : kSoul;
+		dl->AddCircleFilled({x, y}, r * 3.2f, C(col, alpha * fade * 0.10f), 12);
+		dl->AddCircleFilled({x, y}, r, C(col, alpha * fade * 0.85f), 8);
+	}
+}
+// A small filigree flourish: a diamond and two curls either side of `c`, `s` wide.
+void Flourish(ImDrawList* dl, ImVec2 c, float s, ImU32 col, float wgt) {
+	dl->AddQuadFilled({c.x, c.y - s * 0.16f}, {c.x + s * 0.12f, c.y}, {c.x, c.y + s * 0.16f}, {c.x - s * 0.12f, c.y}, col);
+	for (int side = -1; side <= 1; side += 2) {
+		const float d = static_cast<float>(side);
+		dl->PathLineTo({c.x + d * s * 0.16f, c.y});
+		dl->PathBezierCubicCurveTo({c.x + d * s * 0.32f, c.y - s * 0.22f}, {c.x + d * s * 0.52f, c.y - s * 0.12f}, {c.x + d * s * 0.44f, c.y}, 10);
+		dl->PathBezierCubicCurveTo({c.x + d * s * 0.38f, c.y + s * 0.08f}, {c.x + d * s * 0.30f, c.y + s * 0.02f}, {c.x + d * s * 0.33f, c.y - s * 0.03f}, 6);
+		dl->PathStroke(col, 0, wgt);
+		dl->AddCircleFilled({c.x + d * s * 0.5f, c.y}, wgt * 0.9f, col, 6);
+	}
+}
+// A divider: a hairline fading to both ends, a flourish in the middle.
+void Divider(ImDrawList* dl, float x0, float x1, float y, float unit, float alpha) {
+	const float mid = (x0 + x1) * 0.5f, gap = 30.0f * unit;
+	const ImU32 on = C(kBrass, 0.75f * alpha), off = C(kBrass, 0.0f);
+	const float hw = std::max(1.0f, unit);
+	dl->AddRectFilledMultiColor({x0, y}, {mid - gap, y + hw}, off, on, on, off);
+	dl->AddRectFilledMultiColor({mid + gap, y}, {x1, y + hw}, on, off, off, on);
+	Flourish(dl, {mid, y + hw * 0.5f}, 52.0f * unit, C(kBrass, 0.85f * alpha), 1.2f * unit);
+}
+// The panel: carved stone (a cold vertical gradient, faint etched courses), a double brass frame with corner ornaments.
+void Panel(ImDrawList* dl, ImVec2 a, ImVec2 b, float unit, float alpha, float r) {
+	dl->AddRectFilledMultiColor(a, b, C(kStoneT, 0.95f * alpha), C(kStoneT, 0.95f * alpha), C(kStoneB, 0.97f * alpha), C(kStoneB, 0.97f * alpha));
+	// Etched courses of masonry: faint dark lines with a lighter lip under them.
+	const float course = 46.0f * unit;
+	for (float y = a.y + course; y < b.y - course * 0.5f; y += course) {
+		dl->AddLine({a.x + 10 * unit, y}, {b.x - 10 * unit, y}, IM_COL32(0, 0, 0, static_cast<int>(36 * alpha)), 1.0f);
+		dl->AddLine({a.x + 10 * unit, y + 1}, {b.x - 10 * unit, y + 1}, IM_COL32(170, 184, 204, static_cast<int>(8 * alpha)), 1.0f);
+	}
+	// The soft light from above (the Nexus' high windows) and a dark vignette at the foot.
+	dl->AddRectFilledMultiColor(a, {b.x, a.y + (b.y - a.y) * 0.35f}, IM_COL32(180, 196, 220, static_cast<int>(16 * alpha)),
+	                            IM_COL32(180, 196, 220, static_cast<int>(16 * alpha)), IM_COL32(180, 196, 220, 0), IM_COL32(180, 196, 220, 0));
+	// The frame: an outer brass line, an inner hairline.
+	const float hw = std::max(1.0f, unit);
+	dl->AddRect(a, b, C(kBrassDim, 0.9f * alpha), r, 0, 1.6f * hw);
+	const float in = 6.0f * unit;
+	dl->AddRect({a.x + in, a.y + in}, {b.x - in, b.y - in}, C(kBrass, 0.45f * alpha), std::max(0.0f, r - in * 0.5f), 0, hw);
+	// Corner ornaments: an L of brass with a small diamond and a curl.
+	const float k = 22.0f * unit;
+	const ImU32 bc = C(kBrass, 0.9f * alpha);
+	const ImVec2 corners[4] = {a, {b.x, a.y}, b, {a.x, b.y}};
+	for (int i = 0; i < 4; i++) {
+		const float sx = (i == 0 || i == 3) ? 1.0f : -1.0f, sy = i < 2 ? 1.0f : -1.0f;
+		const ImVec2 c {corners[i].x + sx * in, corners[i].y + sy * in};
+		dl->AddLine(c, {c.x + sx * k, c.y}, bc, 2.0f * hw);
+		dl->AddLine(c, {c.x, c.y + sy * k}, bc, 2.0f * hw);
+		const ImVec2 d {c.x + sx * k * 0.42f, c.y + sy * k * 0.42f};
+		dl->AddQuadFilled({d.x, d.y - 4 * unit}, {d.x + 4 * unit, d.y}, {d.x, d.y + 4 * unit}, {d.x - 4 * unit, d.y}, bc);
+		dl->PathArcTo({c.x + sx * k, c.y + sy * 5 * unit}, 5 * unit, sx > 0 ? -1.5708f : -1.5708f, sx > 0 ? 1.5708f : -4.712f, 8);
+		dl->PathStroke(bc, 0, hw);
+	}
+}
+// The header's sigil: a carved monolith (an archstone-like slab, our own drawing) with an etched rune and a soul glow
+// that breathes; `s`: its height.
+void Monolith(ImDrawList* dl, ImVec2 c, float s, float unit, float alpha) {
+	const float t = Time(), breathe = 0.65f + 0.35f * std::sin(t * 1.6f);
+	const float hw = s * 0.26f, top = c.y - s * 0.5f, foot = c.y + s * 0.5f;
+	// The glow behind it.
+	for (int k = 5; k >= 1; k--) dl->AddCircleFilled({c.x, c.y - s * 0.05f}, s * (0.28f + 0.11f * k), C(kSoul, alpha * breathe * 0.035f), 32);
+	// The slab: a pointed top, slightly tapering sides; darker on the right (lit from the left).
+	const ImVec2 p[5] = {{c.x, top}, {c.x + hw, top + s * 0.22f}, {c.x + hw * 0.86f, foot}, {c.x - hw * 0.86f, foot}, {c.x - hw, top + s * 0.22f}};
+	dl->AddConvexPolyFilled(p, 5, IM_COL32(58, 64, 74, static_cast<int>(240 * alpha)));
+	dl->AddTriangleFilled(p[0], p[1], {c.x, foot}, IM_COL32(20, 22, 28, static_cast<int>(110 * alpha)));
+	dl->AddQuadFilled(p[1], p[2], {c.x, foot}, p[0], IM_COL32(20, 22, 28, static_cast<int>(110 * alpha)));
+	dl->AddPolyline(p, 5, C(kBrassDim, 0.9f * alpha), ImDrawFlags_Closed, std::max(1.0f, unit * 1.2f));
+	// The plinth.
+	dl->AddRectFilled({c.x - hw * 1.2f, foot}, {c.x + hw * 1.2f, foot + s * 0.07f}, IM_COL32(42, 46, 54, static_cast<int>(240 * alpha)));
+	dl->AddRect({c.x - hw * 1.2f, foot}, {c.x + hw * 1.2f, foot + s * 0.07f}, C(kBrassDim, 0.8f * alpha), 0, 0, std::max(1.0f, unit));
+	// The etched rune: a vertical stroke, a ring, two short bars, glowing soul-white.
+	const ImU32 rune = C(kSoul, alpha * (0.55f + 0.45f * breathe));
+	const float rw = std::max(1.0f, s * 0.035f);
+	dl->AddLine({c.x, top + s * 0.2f}, {c.x, foot - s * 0.12f}, rune, rw);
+	dl->AddCircle({c.x, c.y - s * 0.02f}, s * 0.11f, rune, 16, rw);
+	dl->AddLine({c.x - s * 0.12f, top + s * 0.3f}, {c.x + s * 0.12f, top + s * 0.3f}, rune, rw);
+	dl->AddLine({c.x - s * 0.08f, foot - s * 0.2f}, {c.x + s * 0.08f, foot - s * 0.2f}, rune, rw);
+	// Souls rising from it.
+	Motes(dl, {c.x - s * 0.4f, top - s * 0.4f}, {c.x + s * 0.4f, foot}, alpha * 0.9f, 7, unit);
+}
+// Engraved text: a dark cut above-left, a faint light lip below-right, the face in tarnished gold.
+void Etched(ImDrawList* dl, ImFont* f, float size, ImVec2 at, const char* text, float alpha) {
+	const float o = std::max(1.0f, size * 0.04f);
+	dl->AddText(f, size, {at.x - o, at.y - o}, IM_COL32(0, 0, 0, static_cast<int>(200 * alpha)), text);
+	dl->AddText(f, size, {at.x + o, at.y + o}, IM_COL32(255, 236, 196, static_cast<int>(40 * alpha)), text);
+	dl->AddText(f, size, at, C(kBrassHi, alpha), text);
+}
+// A sigil medallion for an entry's icon: an engraved ring with tick marks (turning slowly while focused), the icon
+// inside in brass, a soul halo when focused.
+void Medallion(ImDrawList* dl, ImVec2 c, float r, float v, float alpha, bool danger) {
+	const float t = Time();
+	if (v > 0.0f)
+		for (int k = 4; k >= 1; k--) dl->AddCircleFilled(c, r * (1.0f + 0.16f * k), C(danger ? kCandle : kSoul, alpha * v * 0.05f), 32);
+	dl->AddCircleFilled(c, r, IM_COL32(24, 27, 33, static_cast<int>(235 * alpha)), 32);
+	// A bevel: dark rim above, light below (engraved).
+	dl->PathArcTo(c, r * 0.94f, 3.4f, 6.0f, 16);
+	dl->PathStroke(IM_COL32(0, 0, 0, static_cast<int>(160 * alpha)), 0, std::max(1.0f, r * 0.06f));
+	dl->PathArcTo(c, r * 0.94f, 0.3f, 2.8f, 16);
+	dl->PathStroke(IM_COL32(200, 210, 230, static_cast<int>(30 * alpha)), 0, std::max(1.0f, r * 0.05f));
+	dl->AddCircle(c, r, C(kBrass, (0.55f + 0.4f * v) * alpha), 32, std::max(1.0f, r * 0.06f));
+	const float spin = t * 0.5f * v;
+	for (int i = 0; i < 12; i++) {
+		const float a = spin + i * 0.5236f, k0 = i % 3 == 0 ? 0.70f : 0.78f;
+		dl->AddLine({c.x + std::cos(a) * r * k0, c.y + std::sin(a) * r * k0}, {c.x + std::cos(a) * r * 0.86f, c.y + std::sin(a) * r * 0.86f},
+		            C(kBrassDim, (0.5f + 0.5f * v) * alpha), std::max(1.0f, r * 0.04f));
+	}
+}
+} // namespace Souls
+
+// (perfopts-1107) The selection highlight that glides between the F1 menu's entries: each frame the focused (else
+// hovered) entry gives its rectangle; the highlight eases towards it and is drawn under the entries (DrawInGameMenu).
+namespace Glide {
+ImVec2 g_a {0, 0}, g_b {0, 0}, g_ta {0, 0}, g_tb {0, 0};
+bool   g_have = false, g_shown = false, g_focused = false, g_danger = false;
+float  g_alpha = 0.0f;
+void   Begin() {
+    g_have    = false;
+    g_focused = false;
+}
+// Whether the entry being drawn should be the target (a focused one wins over a hovered one).
+bool Want(bool on, bool danger) {
+	if (!on) return false;
+	const bool focused = ImGui::IsItemFocused();
+	if (g_have && g_focused && !focused) return false;
+	g_focused = focused;
+	g_danger  = danger;
+	return true;
+}
+void Target(ImVec2 a, ImVec2 b) {
+	g_ta   = a;
+	g_tb   = b;
+	g_have = true;
+}
+// Eases and draws (call with the entries' channel below the current one).
+void Draw(ImDrawList* dl, float unit, float alpha) {
+	const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
+	const float k  = std::min(1.0f, dt * 16.0f);
+	if (g_have && !g_shown) g_a = g_ta, g_b = g_tb, g_shown = true;
+	if (g_have) {
+		g_a.x += (g_ta.x - g_a.x) * k, g_a.y += (g_ta.y - g_a.y) * k;
+		g_b.x += (g_tb.x - g_b.x) * k, g_b.y += (g_tb.y - g_b.y) * k;
+	}
+	g_alpha += ((g_have ? 1.0f : 0.0f) - g_alpha) * k;
+	if (g_alpha < 0.01f) {
+		g_shown = g_have;
+		return;
+	}
+	if (std::fabs(g_ta.y - g_a.y) > 0.5f || std::fabs(g_alpha - (g_have ? 1.0f : 0.0f)) > 0.01f) Bump();
+	const float al = alpha * g_alpha, g = 4.0f * unit, r = 8.0f * unit;
+	const auto& c  = g_danger ? Souls::kCandle : Souls::kSoul;
+	const float fl = Souls::Flicker(0.3f);
+	for (int i = 3; i >= 1; i--) {
+		const float e = g * static_cast<float>(i);
+		dl->AddRectFilled({g_a.x - e, g_a.y - e}, {g_b.x + e, g_b.y + e}, Souls::C(c, al * 0.035f * fl), r + e);
+	}
+	dl->AddRect({g_a.x - 2 * unit, g_a.y - 2 * unit}, {g_b.x + 2 * unit, g_b.y + 2 * unit}, Souls::C(c, al * 0.35f * fl), r + 2 * unit, 0,
+	            std::max(1.0f, unit));
+	// The accent: a brass bar on the left with a soul-lit tip.
+	const float my = (g_a.y + g_b.y) * 0.5f, hh = (g_b.y - g_a.y) * 0.36f;
+	dl->AddRectFilled({g_a.x - 7 * unit, my - hh}, {g_a.x - 4 * unit, my + hh}, Souls::C(Souls::kBrass, al), 2 * unit);
+	dl->AddCircleFilled({g_a.x - 5.5f * unit, my}, 3.0f * unit, Souls::C(c, al), 10);
+}
+} // namespace Glide
+
 // (des-upstream-1106) The F1 menu's entries: a dark plate, its icon in a gold disc, the label, a chevron; on hover / focus
 // a glow, the accent bar, the icon a little larger and brighter, the label and icon sliding right (Anim::Hot, eased);
 // on open each entry slides in after the one above (`index` x 40 ms). An ImGui button underneath: mouse, keyboard and
@@ -1076,37 +1318,44 @@ bool IconButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, in
 	const float r  = 8.0f * unit;
 	const int   tr = danger ? 230 : 236, tg = danger ? 120 : 206, tb = danger ? 100 : 146; // accent
 	const auto  A  = [&](float x) { return static_cast<int>(std::clamp(x, 0.0f, 255.0f) * al); };
-	// Plate: dark, a lighter top half for depth, a hairline border that warms with the hover.
-	dl->AddRectFilled(a, b, IM_COL32(18, 17, 16, A(225.0f + 20.0f * v)), r);
-	dl->AddRectFilled({a.x + 1, a.y + 1}, {b.x - 1, (a.y + b.y) * 0.5f}, IM_COL32(255, 245, 225, A(10.0f + 10.0f * v)), r, ImDrawFlags_RoundCornersTop);
-	if (v > 0.0f) {
-		for (int k = 1; k <= 3; k++) {
-			const float g = static_cast<float>(k) * 2.5f * unit;
-			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(tr, tg, tb, A(40.0f / k * v)), r + g, 0, 2.0f * unit);
-		}
-		dl->AddRectFilled(a, b, IM_COL32(tr, tg, tb, A((down ? 60.0f : 30.0f) * v)), r);
-		dl->AddRectFilled({a.x, a.y + (b.y - a.y) * (0.5f - 0.34f * v)}, {a.x + 4.0f * unit, a.y + (b.y - a.y) * (0.5f + 0.34f * v)},
-		                  IM_COL32(tr, tg, tb, A(255.0f * v)), 2.0f * unit);
-	}
-	dl->AddRect(a, b, IM_COL32(tr, tg, tb, A(60.0f + 150.0f * v)), r, 0, std::max(1.0f, 1.2f * unit));
-	// The icon in its disc.
+	// (perfopts-1107) An engraved iron plate (darker at the foot, a light lip on top, a dark cut below), a tarnished
+	// brass border that warms with the focus, the icon in a sigil medallion, the label etched; the gliding highlight
+	// (Glide, drawn under the entries) marks the focused one.
+	const auto Al = [&](float x) { return std::clamp(x, 0.0f, 1.0f) * al; };
+	dl->AddRectFilledMultiColor(a, b, IM_COL32(30, 33, 39, A(232.0f)), IM_COL32(30, 33, 39, A(232.0f)), IM_COL32(16, 18, 22, A(240.0f)),
+	                            IM_COL32(16, 18, 22, A(240.0f)));
+	dl->AddLine({a.x + r, a.y + 1}, {b.x - r, a.y + 1}, IM_COL32(190, 200, 220, A(22.0f + 18.0f * v)), 1.0f);
+	dl->AddLine({a.x + r, b.y - 1}, {b.x - r, b.y - 1}, IM_COL32(0, 0, 0, A(170.0f)), 1.0f);
+	if (danger && v > 0.0f) dl->AddRectFilled(a, b, IM_COL32(120, 40, 30, A(50.0f * v)), r);
+	if (down) dl->AddRectFilled(a, b, IM_COL32(tr, tg, tb, A(40.0f)), r);
+	const ImU32 border = danger ? IM_COL32(tr, tg, tb, A(60.0f + 140.0f * v))
+	                            : IM_COL32(Souls::kBrass[0], Souls::kBrass[1], Souls::kBrass[2], A(70.0f + 150.0f * v));
+	dl->AddRect(a, b, border, r, 0, std::max(1.0f, 1.2f * unit));
+	if (Glide::Want(on, danger)) Glide::Target(a, b);
+	// The icon in its medallion (breathing a little while focused).
 	const float  hgt = b.y - a.y;
 	const float  dx  = 5.0f * unit * v;
 	const ImVec2 ic {a.x + hgt * 0.62f + dx, (a.y + b.y) * 0.5f};
-	dl->AddCircleFilled(ic, hgt * 0.34f, IM_COL32(tr, tg, tb, A(26.0f + 44.0f * v)), 28);
-	dl->AddCircle(ic, hgt * 0.34f, IM_COL32(tr, tg, tb, A(70.0f + 120.0f * v)), 28, std::max(1.0f, unit));
-	const int lift = static_cast<int>(40.0f * v);
-	Icons::Draw(dl, icon, ic, hgt * 0.38f * (1.0f + 0.08f * v), IM_COL32(std::min(255, tr - 20 + lift), std::min(255, tg - 20 + lift), std::min(255, tb - 20 + lift), A(255.0f)));
-	// The label, then a chevron that appears with the hover.
+	const float  breathe = 1.0f + 0.05f * v * std::sin(Souls::Time() * 3.0f);
+	Souls::Medallion(dl, ic, hgt * 0.36f, v, Al(1.0f), danger);
+	const int lift = static_cast<int>(50.0f * v);
+	const ImU32 ink = danger ? IM_COL32(std::min(255, tr + lift / 3), std::min(255, tg + lift), std::min(255, tb + lift), A(255.0f))
+	                         : IM_COL32(std::min(255, Souls::kBrass[0] + lift), std::min(255, Souls::kBrass[1] + lift),
+	                                    std::min(255, Souls::kBrass[2] + lift), A(255.0f));
+	Icons::Draw(dl, icon, {ic.x + 1, ic.y + 1}, hgt * 0.36f * breathe, IM_COL32(0, 0, 0, A(150.0f)));
+	Icons::Draw(dl, icon, ic, hgt * 0.36f * breathe, ink);
+	// The label (etched), then a small brass chevron that comes with the focus.
 	ImFont*      f  = ImGui::GetFont();
 	const float  fs = ImGui::GetFontSize();
-	const ImVec2 at {ic.x + hgt * 0.34f + 16.0f * unit + dx, (a.y + b.y - fs) * 0.5f};
-	dl->AddText(f, fs, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, A(150.0f)), label);
-	dl->AddText(f, fs, at, IM_COL32(248, 244, 236, A(225.0f + 30.0f * v)), label);
+	const ImVec2 at {ic.x + hgt * 0.36f + 16.0f * unit + dx, (a.y + b.y - fs) * 0.5f};
+	dl->AddText(f, fs, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, A(170.0f)), label);
+	dl->AddText(f, fs, at, IM_COL32(232 + static_cast<int>(16 * v), 226 + static_cast<int>(18 * v), 214 + static_cast<int>(26 * v), A(235.0f + 20.0f * v)),
+	            label);
 	if (v > 0.01f) {
 		const float cx = b.x - 22.0f * unit + 6.0f * unit * v, cy = (a.y + b.y) * 0.5f, k = 7.0f * unit;
-		dl->AddLine({cx - k * 0.5f, cy - k}, {cx + k * 0.5f, cy}, IM_COL32(tr, tg, tb, A(255.0f * v)), 2.0f * unit);
-		dl->AddLine({cx + k * 0.5f, cy}, {cx - k * 0.5f, cy + k}, IM_COL32(tr, tg, tb, A(255.0f * v)), 2.0f * unit);
+		const ImU32 cc = IM_COL32(Souls::kBrassHi[0], Souls::kBrassHi[1], Souls::kBrassHi[2], A(230.0f * v));
+		dl->AddLine({cx - k * 0.5f, cy - k}, {cx + k * 0.5f, cy}, cc, 2.0f * unit);
+		dl->AddLine({cx + k * 0.5f, cy}, {cx - k * 0.5f, cy + k}, cc, 2.0f * unit);
 	}
 	ImGui::PopID();
 	return pressed;
@@ -1114,7 +1363,7 @@ bool IconButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, in
 
 void Section(const char* title) {
 	ImGui::Spacing();
-	ImGui::PushFont(nullptr, 30.0f * g_unit);
+	ImGui::PushFont(DisplayFont(), 30.0f * g_unit); // (perfopts-1107) Cinzel, as the header (nullptr: the current font)
 	// (des-upstream-1106) The section's icon in a soft gold disc before its title; the rule under it fades out to the right.
 	if (const int icon = Icons::ForSection(title); icon >= 0) {
 		const float  side = ImGui::GetFontSize();
@@ -1133,6 +1382,9 @@ void Section(const char* title) {
 	const float  rw = ImGui::GetContentRegionAvail().x;
 	const ImU32  r0 = ImGui::GetColorU32(ImVec4 {0.87f, 0.77f, 0.55f, 0.55f}), r1 = ImGui::GetColorU32(ImVec4 {0.87f, 0.77f, 0.55f, 0.0f});
 	ImGui::GetWindowDrawList()->AddRectFilledMultiColor(p, {p.x + rw, p.y + std::max(1.0f, g_unit)}, r0, r1, r1, r0);
+	// (perfopts-1107) A small brass diamond at the rule's start (the filigree of the menu's dividers).
+	const float d = 4.0f * g_unit;
+	ImGui::GetWindowDrawList()->AddQuadFilled({p.x, p.y - d}, {p.x + d, p.y}, {p.x, p.y + d}, {p.x - d, p.y}, r0);
 	ImGui::Spacing();
 }
 
@@ -2372,6 +2624,9 @@ ImFont*        g_font_body  = nullptr; // Segoe UI
 ImFont*        g_font_semi  = nullptr; // Segoe UI Semibold
 ImFont*        g_font_serif = nullptr; // Palatino Linotype / Georgia / Times
 ImFont*        g_font_display = nullptr; // (ds-pc-port12) Cinzel, bundled (JUGAR and the section titles)
+ImFont* DisplayFont() {
+	return g_font_display;
+}
 ImTextureData* g_knight     = nullptr; // caballero-espada.png (TU EQUIPO)
 int            g_knight_w = 0, g_knight_h = 0;
 bool           g_knight_tried   = false;
@@ -5517,6 +5772,7 @@ bool DrawKbm(float width, float height, float unit) {
 
 // (ds-pc-port8) In the game: F1's save and quit, a panel in the middle of the screen until the game closes.
 // (ds-pc-port38) `closing`: the fade-out after F1 / Esc closed it (drawn disabled, no input taken).
+void (*g_menu_rect_hook)(ImVec2, ImVec2) = nullptr; // (perfopts-1107) the F1 window's rectangle, for next frame's fog
 void DrawInGameMenu(float width, float height, bool closing = false) {
 	if (!closing) DrainInputs();
 	const float unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
@@ -5543,9 +5799,24 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	// rasterized at one size). Back from a page: the menu fades in again.
 	const float t = closing ? 1.0f - Anim::EaseOut(Anim::Progress(Anim::g_closed_at.load(), Anim::kClose))
 	                        : Anim::EaseOut(Anim::Progress(std::max(Anim::g_opened_at.load(), Anim::g_page_at.load()), Anim::kOpen));
-	if (t < 1.0f || closing) Bump();
+	// (perfopts-1107) The idle animations (soul motes, fog, the breathing sigil, the candle flicker) redraw while open.
+	Bump();
 	Anim::g_page_seen = 0;
 	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, static_cast<int>(140 * t)));
+	{
+		// A dark vignette and drifting fog behind the panel (last frame's window rectangle), soul motes in the dark.
+		static ImVec2 last_p {0, 0}, last_s {0, 0};
+		auto*         bg = ImGui::GetBackgroundDrawList();
+		const ImU32   v0 = IM_COL32(0, 0, 0, 0), v1 = IM_COL32(4, 5, 8, static_cast<int>(120 * t));
+		bg->AddRectFilledMultiColor({0, 0}, {width, height * 0.5f}, v1, v1, v0, v0);
+		bg->AddRectFilledMultiColor({0, height * 0.5f}, {width, height}, v0, v0, v1, v1);
+		if (last_s.x > 0) {
+			const ImVec2 a {last_p.x - 260 * unit, last_p.y - 120 * unit}, b {last_p.x + last_s.x + 260 * unit, last_p.y + last_s.y + 120 * unit};
+			Souls::Fog(bg, a, b, t);
+			Souls::Motes(bg, a, b, t * 0.8f, 26, unit);
+		}
+		g_menu_rect_hook = [](ImVec2 p, ImVec2 sz) { last_p = p, last_s = sz; };
+	}
 	ImFont* font = FindFont("segoeui");
 	ImGui::PushFont(font, std::round(26.0f * unit));
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.01f, t));
@@ -5553,8 +5824,8 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12 * unit, 14 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * unit);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10 * unit);
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.03f, 0.035f, 0.94f});
-	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.45f});
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0, 0, 0, 0}); // (perfopts-1107: the carved stone panel, Souls::Panel)
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0, 0, 0, 0});
 	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.13f, 0.125f, 0.12f, 1.0f});
 	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.15f, 0.14f, 0.13f, 1.0f}); // (the transition is Anim::Highlight's)
 	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.30f, 0.26f, 0.18f, 1.0f});
@@ -5565,25 +5836,33 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	ImDrawList* menu_dl    = ImGui::GetWindowDrawList();
 	const int   menu_first = 0; // (the window's own list: its background and contents; closing: NoInputs, NoNav)
 	{
-		// (des-upstream-1106) The header: a flame in a gold disc, the title in gold, a rule fading out to the right.
-		const float  side = ImGui::GetFontSize() * 1.35f;
+		// (perfopts-1107) The header: a carved monolith sigil with its soul glow, the title engraved in Cinzel (tarnished
+		// gold), a candle-lit filigree divider under it.
+		menu_dl->ChannelsSplit(2);
+		menu_dl->ChannelsSetCurrent(1);
+		Glide::Begin();
+		const float  side = ImGui::GetFontSize() * 1.7f;
 		const ImVec2 at   = ImGui::GetCursorScreenPos();
-		const ImVec2 c {at.x + side * 0.5f, at.y + side * 0.5f};
-		const float  al = ImGui::GetStyle().Alpha;
-		const float  pulse = 0.5f + 0.5f * std::sin(static_cast<float>(Anim::Now()) * 2.2f);
-		menu_dl->AddCircleFilled(c, side * 0.62f, IM_COL32(222, 170, 90, static_cast<int>((26 + 14 * pulse) * al)), 28);
-		Icons::Draw(menu_dl, Icons::Flame, c, side * 0.72f, ImGui::GetColorU32(kGold));
-		ImGui::Dummy({side * 1.2f, side});
+		const float  al   = ImGui::GetStyle().Alpha;
+		Souls::Monolith(menu_dl, {at.x + side * 0.4f, at.y + side * 0.5f}, side, unit, al);
+		ImGui::Dummy({side * 0.95f, side});
 		ImGui::SameLine();
-		ImGui::SetCursorScreenPos({ImGui::GetCursorScreenPos().x, at.y + (side - ImGui::GetFontSize() * 1.25f) * 0.5f});
-		ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.25f);
-		ImGui::TextColored(kGold, "%s", I18n::T("Demon's Souls PC"));
-		ImGui::PopFont();
-		const ImVec2 p  = {at.x, at.y + side + 8 * unit};
-		const ImU32  r0 = IM_COL32(222, 196, 140, static_cast<int>(150 * al)), r1 = IM_COL32(222, 196, 140, 0);
-		menu_dl->AddRectFilledMultiColor(p, {p.x + 420 * unit, p.y + std::max(1.0f, unit)}, r0, r1, r1, r0);
+		ImFont*      title_font = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+		const float  title_size = std::round(ImGui::GetFontSize() * 1.3f);
+		const char*  title      = I18n::T("Demon's Souls PC");
+		const ImVec2 tsz        = title_font->CalcTextSizeA(title_size, FLT_MAX, 0.0f, title);
+		const ImVec2 tp {ImGui::GetCursorScreenPos().x, at.y + (side - tsz.y) * 0.5f};
+		// A warm candle glow behind the title, flickering.
+		const float fl = Souls::Flicker();
+		for (int k = 3; k >= 1; k--)
+			menu_dl->AddRectFilled({tp.x - 10 * unit * k, tp.y + tsz.y * 0.2f - 4 * unit * k}, {tp.x + tsz.x + 10 * unit * k, tp.y + tsz.y * 0.8f + 4 * unit * k},
+			                       Souls::C(Souls::kCandle, al * 0.022f * fl), 20 * unit);
+		Souls::Etched(menu_dl, title_font, title_size, tp, title, al * (0.9f + 0.1f * fl));
+		ImGui::Dummy({tsz.x, side});
+		const float dy = at.y + side + 10 * unit;
+		Souls::Divider(menu_dl, at.x, at.x + 420 * unit, dy, unit, al);
+		ImGui::SetCursorScreenPos({at.x, dy + 4 * unit});
 		ImGui::Dummy({420 * unit, 12 * unit});
-		// (Redrawn only while open: the pulse asks for no frames of its own; it moves with the menu's other redraws.)
 	}
 	bool show = g_saved.start_menu;
 	if (ImGui::Checkbox(I18n::T("Mostrar el lanzador la pr\xC3\xB3xima vez que abras el juego"), &show)) {
@@ -5620,8 +5899,23 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	}
 	ImGui::TextDisabled("%s", I18n::T("F1 o Esc: volver al juego"));
 	{
-		// The zoom: 94 % -> 100 % about the window's centre (the vertices it drew).
+		// (perfopts-1107) Under the contents: the carved stone panel and the gliding highlight; while opening or closing,
+		// a pale soul-light bloom around the panel that fades as it settles.
 		const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+		const float  al = ImGui::GetStyle().Alpha;
+		menu_dl->ChannelsSetCurrent(0);
+		menu_dl->PushClipRectFullScreen();
+		if (t < 1.0f)
+			for (int k = 4; k >= 1; k--) {
+				const float e = static_cast<float>(k) * 9.0f * unit;
+				menu_dl->AddRectFilled({wp.x - e, wp.y - e}, {wp.x + ws.x + e, wp.y + ws.y + e}, Souls::C(Souls::kSoul, (1.0f - t) * 0.06f), 10 * unit + e);
+			}
+		Souls::Panel(menu_dl, wp, {wp.x + ws.x, wp.y + ws.y}, unit, al, 10 * unit);
+		Glide::Draw(menu_dl, unit, al);
+		menu_dl->PopClipRect();
+		menu_dl->ChannelsMerge();
+		if (g_menu_rect_hook != nullptr) g_menu_rect_hook(wp, ws);
+		// The zoom: 94 % -> 100 % about the window's centre (the vertices it drew).
 		Anim::ScaleVertices(menu_dl, menu_first, {wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f}, 0.94f + 0.06f * t);
 	}
 	ImGui::End();
