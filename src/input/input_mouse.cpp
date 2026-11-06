@@ -22,6 +22,7 @@ extern std::list<std::pair<InputEvent, bool>> pressed_keys;
 int mouse_joystick_binding = 0;
 float mouse_deadzone_offset = 0.5, mouse_speed = 1, mouse_speed_offset = 0.1250;
 bool mouse_gyro_roll_mode = false;
+bool mouse_invert_y = false;
 Uint32 mouse_polling_id = 0;
 MouseMode mouse_mode = MouseMode::Off;
 
@@ -50,6 +51,10 @@ void SetMouseParams(float mdo, float ms, float mso) {
     mouse_speed_offset = mso;
 }
 
+void SetMouseInvertY(bool invert) {
+    mouse_invert_y = invert;
+}
+
 void SetMouseGyroRollMode(bool mode) {
     mouse_gyro_roll_mode = mode;
 }
@@ -72,6 +77,9 @@ void EmulateJoystick(GameController* controller, u32 interval) {
 
     float d_x = 0, d_y = 0;
     SDL_GetRelativeMouseState(&d_x, &d_y);
+    if (mouse_invert_y) {
+        d_y = -d_y;
+    }
 
     float output_speed =
         SDL_clamp(sqrt(d_x * d_x + d_y * d_y) * mouse_speed + mouse_speed_offset * 128,

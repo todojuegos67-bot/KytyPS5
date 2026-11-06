@@ -20,6 +20,7 @@ MouseMode GetMouseMode(); // (bb-menu-104)
 void SetMouseToJoystick(int joystick);
 void SetMouseParams(float mouse_deadzone_offset, float mouse_speed, float mouse_speed_offset);
 void SetMouseGyroRollMode(bool mode);
+void SetMouseInvertY(bool invert); // (bb-menu-133) mouse-look: mouse up = stick down
 
 void EmulateJoystick(GameController* controller, u32 interval);
 void EmulateGyro(GameController* controller, u32 interval);
