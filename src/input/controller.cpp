@@ -170,6 +170,27 @@ void GameController::ConnectController(SDL_Gamepad* pad) {
     m_state.connected = true;
     m_last_orientation_update = 0;
     PushStateLocked();
+    if (pad != nullptr) {
+        // (bb-rumble-143) what pad SDL really opened (an 8BitDo / DS4 behind XInput, Steam, DS4Windows)
+        const SDL_PropertiesID props = SDL_GetGamepadProperties(pad);
+        const char* name = SDL_GetGamepadName(pad);
+        const char* path = SDL_GetGamepadPath(pad);
+        LOG_INFO(Input,
+                 "[pad] device: name '{}', vendor {:04x}, product {:04x}, version {:04x}, type {} "
+                 "(real {}), connection {}, path '{}', rumble cap {}, "
+                 "player index {}",
+                 name ? name : "?", SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad),
+                 SDL_GetGamepadProductVersion(pad),
+                 SDL_GetGamepadStringForType(SDL_GetGamepadType(pad))
+                     ? SDL_GetGamepadStringForType(SDL_GetGamepadType(pad))
+                     : "?",
+                 SDL_GetGamepadStringForType(SDL_GetRealGamepadType(pad))
+                     ? SDL_GetGamepadStringForType(SDL_GetRealGamepadType(pad))
+                     : "?",
+                 static_cast<int>(SDL_GetGamepadConnectionState(pad)), path ? path : "?",
+                 SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false),
+                 SDL_GetGamepadPlayerIndex(pad));
+    }
     if (pad != nullptr && (m_vib_small || m_vib_large)) {
         ApplyVibration(); // (bb-input-137) a rumble sent before the gamepad was opened
     }
@@ -305,6 +326,17 @@ bool GameController::ApplyVibration() {
         return static_cast<Uint16>(std::clamp(v / 255.0f * k, 0.0f, 1.0f) * 0xFFFF);
     };
     const Uint16 lo = scale(m_vib_large), hi = scale(m_vib_small);
+    // (bb-rumble-143) the game streams stop (0/0) commands: re-sending a stop every frame to SDL
+    // cut any rumble started elsewhere (the F1 test lasted < 1 frame: "felt nothing"). A stop is
+    // sent once, after a non-zero command only.
+    if (lo == 0 && hi == 0) {
+        if (m_vib_sent_zero) {
+            return true;
+        }
+        m_vib_sent_zero = true;
+    } else {
+        m_vib_sent_zero = false;
+    }
     // SDL: low_frequency = the large motor. SDL caps the duration at 0xFFFF ms; 0/0 stops.
     const bool ok = SDL_RumbleGamepad(pad, lo, hi, (lo || hi) ? 0xFFFFu : 0u);
     static std::atomic<bool> fail_logged{false};
