@@ -1254,6 +1254,61 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, const VideoCore::ImageVie
         !BBRecordUpscale(color.GetImage(), color_view, in_format, color.usage_flags)) {
         return false;
     }
+    // 1.27 (bb-dlaa-127): native AA (render == output) writes the DLAA result back into the
+    // scene colour itself. Before, only later *sampled* reads of the source were redirected to
+    // the upscaler's output; storage-image reads (compute post-processing: bloom / DoF / tone
+    // map passes), copies and the game's own reads of last frame's colour still got the raw,
+    // jittered image: no anti-aliasing visible and a sub-pixel tremble, fine only on the
+    // phases near zero. With the copy every reader sees the resolved image.
+    // BB_INPLACE_WRITEBACK=0: the old redirect-only behaviour.
+    static const bool writeback = [] {
+        const char* v = std::getenv("BB_INPLACE_WRITEBACK");
+        return v == nullptr || v[0] != '0';
+    }();
+    static u64 wb_done = 0, wb_skipped = 0;
+    const bool same = plan.render_w == plan.output_w && plan.render_h == plan.output_h &&
+                      g_bb.output.image && g_bb.output.extent.width == plan.output_w &&
+                      g_bb.output.extent.height == plan.output_h &&
+                      color.info.pixel_format == g_bb.output.format &&
+                      (color.usage_flags & vk::ImageUsageFlagBits::eTransferDst);
+    if (writeback && same) {
+        scheduler.EndRendering();
+        runtime.Transit(&color, vk::ImageLayout::eTransferDstOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer,
+                        vk::AccessFlagBits2::eTransferWrite);
+        runtime.FlushBarriers();
+        const auto cmd = scheduler.CommandBuffer();
+        Barrier(cmd, g_bb.output, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        const vk::ImageCopy region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .extent = {plan.output_w, plan.output_h, 1},
+        };
+        cmd.copyImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, color.GetImage(),
+                      vk::ImageLayout::eTransferDstOptimal, region);
+        Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+                vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eShaderRead);
+        runtime.Transit(&color, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
+        ++wb_done;
+    } else if (plan.render_w == plan.output_w && plan.render_h == plan.output_h) {
+        ++wb_skipped;
+    }
+    if ((wb_done + wb_skipped) % 600 == 1) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "[taa-stab] 1.27 in-place write-back of the DLAA result into the scene colour {:#x} "
+            "{}x{} {}: {} done, {} skipped (writeback {}, format {} vs output {}, transfer-dst {})",
+            color.info.guest_address, color.info.size.width, color.info.size.height,
+            vk::to_string(color.info.pixel_format), wb_done, wb_skipped,
+            writeback ? "on" : "off (BB_INPLACE_WRITEBACK=0)",
+            vk::to_string(color.info.pixel_format), vk::to_string(g_bb.output.format),
+            (color.usage_flags & vk::ImageUsageFlagBits::eTransferDst) ? "yes" : "no"));
+    }
     return BBUpscaledView(view_info, out_view, out_layout);
 }
 
