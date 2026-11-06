@@ -1779,7 +1779,7 @@ public:
     // frames with no inputs (real 225 fps -> dynamic x1, no guest-release samples, FSR 3 FG
     // stalls). Redraw on our own only while the menu or a trophy toast is on screen.
     bool ShouldKeepDrawing() override {
-        if (g_open) return true;
+        if (g_open || anim > 0.0f) return true;
         std::scoped_lock lk{g_toast_mtx};
         return !g_toasts.empty();
     }
