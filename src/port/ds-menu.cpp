@@ -180,6 +180,12 @@ void Highlight(float unit) {
 	auto*        dl = ImGui::GetWindowDrawList();
 	const float  r  = ImGui::GetStyle().FrameRounding;
 	const float  al = ImGui::GetStyle().Alpha;
+	// (des-upstream-1106) A soft glow around it: three wider, fainter outlines.
+	for (int k = 1; k <= 3; k++) {
+		const float g = static_cast<float>(k) * 2.0f * unit;
+		dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(240, 200, 120, static_cast<int>(34.0f / k * v * al)), r + g, 0,
+		            2.0f * unit);
+	}
 	dl->AddRectFilled(a, b, IM_COL32(222, 196, 140, static_cast<int>(46 * v * al)), r);
 	dl->AddRect(a, b, IM_COL32(236, 206, 146, static_cast<int>(200 * v * al)), r, 0, std::max(1.0f, 1.5f * unit));
 	dl->AddRectFilled({a.x, a.y + (b.y - a.y) * (0.5f - 0.36f * v)}, {a.x + 4.0f * unit, a.y + (b.y - a.y) * (0.5f + 0.36f * v)},
@@ -911,13 +917,222 @@ bool SliderRow(const char* label, float& v, float lo, float hi, const char* form
 	return changed;
 }
 
+// ---- (des-upstream-1106) Procedural icons for the menus (no images, no game art): drawn with the draw list at any size,
+// a line weight that follows the size, in one colour. `c`: the centre, `s`: the box's side. ----
+namespace Icons {
+enum Kind { Back, Trophy, Pad, Keyboard, Power, Monitor, Layers, Sliders, Sun, Gauge, Chip, Gear, Speaker, Flame, Eye };
+
+void Draw(ImDrawList* dl, Kind kind, ImVec2 c, float s, ImU32 col) {
+	const float h = s * 0.5f, w = std::max(1.0f, s * 0.085f);
+	const auto  P = [&](float x, float y) { return ImVec2 {c.x + x * h, c.y + y * h}; };
+	switch (kind) {
+		case Back: // a curved return arrow
+			dl->PathArcTo(P(0.05f, 0.1f), h * 0.55f, -1.5708f, 1.5708f, 16);
+			dl->PathLineTo(P(-0.6f, 0.65f));
+			dl->PathStroke(col, 0, w);
+			dl->AddLine(P(-0.6f, -0.45f), P(0.05f, -0.45f), col, w);
+			dl->AddTriangleFilled(P(-0.85f, -0.45f), P(-0.45f, -0.75f), P(-0.45f, -0.15f), col);
+			break;
+		case Trophy:
+			dl->PathLineTo(P(-0.5f, -0.75f));
+			dl->PathLineTo(P(0.5f, -0.75f));
+			dl->PathArcTo(P(0, -0.25f), h * 0.5f, 0.0f, 3.14159f, 14);
+			dl->PathFillConvex(col);
+			dl->PathArcTo(P(-0.5f, -0.4f), h * 0.28f, 1.5708f, 4.712f, 10);
+			dl->PathStroke(col, 0, w);
+			dl->PathArcTo(P(0.5f, -0.4f), h * 0.28f, -1.5708f, 1.5708f, 10);
+			dl->PathStroke(col, 0, w);
+			dl->AddRectFilled(P(-0.08f, 0.2f), P(0.08f, 0.55f), col);
+			dl->AddRectFilled(P(-0.42f, 0.55f), P(0.42f, 0.78f), col, w);
+			break;
+		case Pad:
+			dl->AddRect(P(-0.85f, -0.45f), P(0.85f, 0.5f), col, h * 0.4f, 0, w);
+			dl->AddLine(P(-0.55f, 0.0f), P(-0.15f, 0.0f), col, w);
+			dl->AddLine(P(-0.35f, -0.2f), P(-0.35f, 0.2f), col, w);
+			dl->AddCircleFilled(P(0.35f, -0.12f), w * 1.1f, col);
+			dl->AddCircleFilled(P(0.55f, 0.1f), w * 1.1f, col);
+			break;
+		case Keyboard:
+			dl->AddRect(P(-0.9f, -0.5f), P(0.9f, 0.5f), col, w * 1.5f, 0, w);
+			for (int r = 0; r < 2; r++)
+				for (int k = 0; k < 5; k++) dl->AddRectFilled(P(-0.68f + k * 0.3f, -0.28f + r * 0.27f), P(-0.52f + k * 0.3f, -0.14f + r * 0.27f), col);
+			dl->AddRectFilled(P(-0.45f, 0.22f), P(0.45f, 0.32f), col);
+			break;
+		case Power:
+			dl->PathArcTo(P(0, 0.08f), h * 0.68f, -1.5708f + 0.75f, -1.5708f + 6.2832f - 0.75f, 24);
+			dl->PathStroke(col, 0, w);
+			dl->AddLine(P(0, -0.85f), P(0, -0.05f), col, w);
+			break;
+		case Monitor:
+			dl->AddRect(P(-0.85f, -0.65f), P(0.85f, 0.4f), col, w, 0, w);
+			dl->AddLine(P(0, 0.4f), P(0, 0.7f), col, w);
+			dl->AddLine(P(-0.4f, 0.75f), P(0.4f, 0.75f), col, w);
+			break;
+		case Layers:
+			for (int i = 0; i < 3; i++) {
+				const float y = -0.45f + i * 0.38f;
+				dl->AddQuad(P(0, y - 0.35f), P(0.8f, y), P(0, y + 0.35f), P(-0.8f, y), col, w);
+			}
+			break;
+		case Sliders:
+			for (int i = 0; i < 3; i++) {
+				const float y = -0.55f + i * 0.55f, k = i == 1 ? 0.35f : i == 0 ? -0.3f : 0.0f;
+				dl->AddLine(P(-0.8f, y), P(0.8f, y), col, w);
+				dl->AddCircleFilled(P(k, y), w * 2.0f, col);
+			}
+			break;
+		case Sun:
+			dl->AddCircleFilled(c, h * 0.32f, col);
+			for (int i = 0; i < 8; i++) {
+				const float a = i * 0.7854f;
+				dl->AddLine(P(std::cos(a) * 0.5f, std::sin(a) * 0.5f), P(std::cos(a) * 0.85f, std::sin(a) * 0.85f), col, w);
+			}
+			break;
+		case Gauge:
+			dl->PathArcTo(P(0, 0.25f), h * 0.75f, 3.14159f, 6.2832f, 20);
+			dl->PathStroke(col, 0, w);
+			dl->AddLine(P(0, 0.25f), P(0.45f, -0.25f), col, w);
+			dl->AddCircleFilled(P(0, 0.25f), w * 1.6f, col);
+			break;
+		case Chip:
+			dl->AddRect(P(-0.5f, -0.5f), P(0.5f, 0.5f), col, w, 0, w);
+			dl->AddRectFilled(P(-0.2f, -0.2f), P(0.2f, 0.2f), col);
+			for (int i = -1; i <= 1; i++) {
+				const float k = i * 0.3f;
+				dl->AddLine(P(k, -0.5f), P(k, -0.8f), col, w);
+				dl->AddLine(P(k, 0.5f), P(k, 0.8f), col, w);
+				dl->AddLine(P(-0.5f, k), P(-0.8f, k), col, w);
+				dl->AddLine(P(0.5f, k), P(0.8f, k), col, w);
+			}
+			break;
+		case Gear:
+			dl->AddCircle(c, h * 0.5f, col, 20, w * 1.6f);
+			dl->AddCircle(c, h * 0.18f, col, 12, w);
+			for (int i = 0; i < 8; i++) {
+				const float a = i * 0.7854f;
+				dl->AddLine(P(std::cos(a) * 0.55f, std::sin(a) * 0.55f), P(std::cos(a) * 0.82f, std::sin(a) * 0.82f), col, w * 2.0f);
+			}
+			break;
+		case Speaker:
+			dl->AddQuadFilled(P(-0.8f, -0.25f), P(-0.4f, -0.25f), P(-0.4f, 0.25f), P(-0.8f, 0.25f), col);
+			dl->AddTriangleFilled(P(-0.45f, -0.25f), P(0.05f, -0.7f), P(0.05f, 0.7f), col);
+			dl->AddTriangleFilled(P(-0.45f, -0.25f), P(0.05f, 0.7f), P(-0.45f, 0.25f), col);
+			for (int i = 1; i <= 2; i++) {
+				dl->PathArcTo(P(0.05f, 0), h * (0.28f * i), -0.8f, 0.8f, 10);
+				dl->PathStroke(col, 0, w);
+			}
+			break;
+		case Flame:
+			dl->PathLineTo(P(0, -0.85f));
+			dl->PathBezierCubicCurveTo(P(0.75f, -0.2f), P(0.65f, 0.75f), P(0, 0.8f), 14);
+			dl->PathBezierCubicCurveTo(P(-0.65f, 0.75f), P(-0.75f, -0.05f), P(-0.2f, -0.35f), 14);
+			dl->PathBezierCubicCurveTo(P(-0.1f, -0.1f), P(0.1f, -0.4f), P(0, -0.85f), 8);
+			dl->PathStroke(col, ImDrawFlags_Closed, w);
+			dl->AddCircleFilled(P(0, 0.35f), h * 0.2f, col);
+			break;
+		case Eye:
+			dl->PathArcTo(P(0, 0.9f), h * 1.25f, -2.3f, -0.84f, 16);
+			dl->PathArcTo(P(0, -0.9f), h * 1.25f, 0.84f, 2.3f, 16);
+			dl->PathStroke(col, ImDrawFlags_Closed, w);
+			dl->AddCircleFilled(c, h * 0.25f, col);
+			break;
+	}
+}
+
+// The icon of a section by its (Spanish) title; -1 when it has none.
+int ForSection(const char* title) {
+	static const std::pair<const char*, Kind> map[] = {
+	    {"Imagen", Monitor},        {"Frame generation", Layers}, {"Calidad gráfica", Sliders}, {"Ray tracing", Sun},
+	    {"Modos Souls", Flame},     {"Pantalla", Monitor},        {"Rendimiento", Gauge},       {"Controles", Pad},
+	    {"Tu equipo", Chip},        {"Configurador", Gear},       {"Ajustes del juego", Gear},  {"Sonido", Speaker},
+	    {"Trofeos", Trophy},        {"Gráficos", Eye},            {"Sistema", Chip}};
+	for (const auto& [name, kind]: map)
+		if (std::strcmp(name, title) == 0) return kind;
+	return -1;
+}
+} // namespace Icons
+
+// (des-upstream-1106) The F1 menu's entries: a dark plate, its icon in a gold disc, the label, a chevron; on hover / focus
+// a glow, the accent bar, the icon a little larger and brighter, the label and icon sliding right (Anim::Hot, eased);
+// on open each entry slides in after the one above (`index` x 40 ms). An ImGui button underneath: mouse, keyboard and
+// pad navigation as before. `danger`: a red tint (Cerrar el juego).
+bool IconButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, int index, bool danger = false) {
+	const float st = Anim::EaseOut(Anim::Progress(Anim::g_opened_at.load() + 0.04 * index, 0.26));
+	if (st < 1.0f) Bump();
+	ImGui::PushID(label);
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0, 0, 0, 0});
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0, 0, 0, 0});
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0, 0, 0, 0});
+	const bool pressed = ImGui::Button("##entry", size);
+	ImGui::PopStyleColor(3);
+	const bool  on = ImGui::IsItemHovered() || ImGui::IsItemFocused() || ImGui::IsItemActive();
+	const float v  = Anim::Hot(ImGui::GetItemID(), on);
+	const bool  down = ImGui::IsItemActive();
+	ImVec2      a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+	const float slide = (1.0f - st) * 28.0f * unit;
+	a.x += slide, b.x += slide;
+	auto*       dl = ImGui::GetWindowDrawList();
+	const float al = ImGui::GetStyle().Alpha * st;
+	const float r  = 8.0f * unit;
+	const int   tr = danger ? 230 : 236, tg = danger ? 120 : 206, tb = danger ? 100 : 146; // accent
+	const auto  A  = [&](float x) { return static_cast<int>(std::clamp(x, 0.0f, 255.0f) * al); };
+	// Plate: dark, a lighter top half for depth, a hairline border that warms with the hover.
+	dl->AddRectFilled(a, b, IM_COL32(18, 17, 16, A(225.0f + 20.0f * v)), r);
+	dl->AddRectFilled({a.x + 1, a.y + 1}, {b.x - 1, (a.y + b.y) * 0.5f}, IM_COL32(255, 245, 225, A(10.0f + 10.0f * v)), r, ImDrawFlags_RoundCornersTop);
+	if (v > 0.0f) {
+		for (int k = 1; k <= 3; k++) {
+			const float g = static_cast<float>(k) * 2.5f * unit;
+			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(tr, tg, tb, A(40.0f / k * v)), r + g, 0, 2.0f * unit);
+		}
+		dl->AddRectFilled(a, b, IM_COL32(tr, tg, tb, A((down ? 60.0f : 30.0f) * v)), r);
+		dl->AddRectFilled({a.x, a.y + (b.y - a.y) * (0.5f - 0.34f * v)}, {a.x + 4.0f * unit, a.y + (b.y - a.y) * (0.5f + 0.34f * v)},
+		                  IM_COL32(tr, tg, tb, A(255.0f * v)), 2.0f * unit);
+	}
+	dl->AddRect(a, b, IM_COL32(tr, tg, tb, A(60.0f + 150.0f * v)), r, 0, std::max(1.0f, 1.2f * unit));
+	// The icon in its disc.
+	const float  hgt = b.y - a.y;
+	const float  dx  = 5.0f * unit * v;
+	const ImVec2 ic {a.x + hgt * 0.62f + dx, (a.y + b.y) * 0.5f};
+	dl->AddCircleFilled(ic, hgt * 0.34f, IM_COL32(tr, tg, tb, A(26.0f + 44.0f * v)), 28);
+	dl->AddCircle(ic, hgt * 0.34f, IM_COL32(tr, tg, tb, A(70.0f + 120.0f * v)), 28, std::max(1.0f, unit));
+	const int lift = static_cast<int>(40.0f * v);
+	Icons::Draw(dl, icon, ic, hgt * 0.38f * (1.0f + 0.08f * v), IM_COL32(std::min(255, tr - 20 + lift), std::min(255, tg - 20 + lift), std::min(255, tb - 20 + lift), A(255.0f)));
+	// The label, then a chevron that appears with the hover.
+	ImFont*      f  = ImGui::GetFont();
+	const float  fs = ImGui::GetFontSize();
+	const ImVec2 at {ic.x + hgt * 0.34f + 16.0f * unit + dx, (a.y + b.y - fs) * 0.5f};
+	dl->AddText(f, fs, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, A(150.0f)), label);
+	dl->AddText(f, fs, at, IM_COL32(248, 244, 236, A(225.0f + 30.0f * v)), label);
+	if (v > 0.01f) {
+		const float cx = b.x - 22.0f * unit + 6.0f * unit * v, cy = (a.y + b.y) * 0.5f, k = 7.0f * unit;
+		dl->AddLine({cx - k * 0.5f, cy - k}, {cx + k * 0.5f, cy}, IM_COL32(tr, tg, tb, A(255.0f * v)), 2.0f * unit);
+		dl->AddLine({cx + k * 0.5f, cy}, {cx - k * 0.5f, cy + k}, IM_COL32(tr, tg, tb, A(255.0f * v)), 2.0f * unit);
+	}
+	ImGui::PopID();
+	return pressed;
+}
+
 void Section(const char* title) {
 	ImGui::Spacing();
 	ImGui::PushFont(nullptr, 30.0f * g_unit);
-	ImGui::TextColored(kGold, "%s", title);
+	// (des-upstream-1106) The section's icon in a soft gold disc before its title; the rule under it fades out to the right.
+	if (const int icon = Icons::ForSection(title); icon >= 0) {
+		const float  side = ImGui::GetFontSize();
+		const ImVec2 at   = ImGui::GetCursorScreenPos();
+		const ImVec2 c {at.x + side * 0.5f, at.y + side * 0.55f};
+		auto*        dl = ImGui::GetWindowDrawList();
+		const float  al = ImGui::GetStyle().Alpha;
+		dl->AddCircleFilled(c, side * 0.62f, IM_COL32(222, 190, 120, static_cast<int>(34 * al)), 24);
+		Icons::Draw(dl, static_cast<Icons::Kind>(icon), c, side * 0.66f, ImGui::GetColorU32(kGold));
+		ImGui::Dummy({side * 1.15f, side});
+		ImGui::SameLine();
+	}
+	ImGui::TextColored(kGold, "%s", I18n::T(title));
 	ImGui::PopFont();
 	const ImVec2 p = ImGui::GetCursorScreenPos();
-	ImGui::GetWindowDrawList()->AddLine(p, {p.x + ImGui::GetContentRegionAvail().x, p.y}, ImGui::GetColorU32(ImVec4 {0.87f, 0.77f, 0.55f, 0.35f}));
+	const float  rw = ImGui::GetContentRegionAvail().x;
+	const ImU32  r0 = ImGui::GetColorU32(ImVec4 {0.87f, 0.77f, 0.55f, 0.55f}), r1 = ImGui::GetColorU32(ImVec4 {0.87f, 0.77f, 0.55f, 0.0f});
+	ImGui::GetWindowDrawList()->AddRectFilledMultiColor(p, {p.x + rw, p.y + std::max(1.0f, g_unit)}, r0, r1, r1, r0);
 	ImGui::Spacing();
 }
 
@@ -5221,8 +5436,27 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	                                     ImGuiWindowFlags_NoSavedSettings | (closing ? ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav : 0));
 	ImDrawList* menu_dl    = ImGui::GetWindowDrawList();
 	const int   menu_first = 0; // (the window's own list: its background and contents; closing: NoInputs, NoNav)
-	ImGui::TextUnformatted(I18n::T("Demon's Souls PC"));
-	ImGui::Separator();
+	{
+		// (des-upstream-1106) The header: a flame in a gold disc, the title in gold, a rule fading out to the right.
+		const float  side = ImGui::GetFontSize() * 1.35f;
+		const ImVec2 at   = ImGui::GetCursorScreenPos();
+		const ImVec2 c {at.x + side * 0.5f, at.y + side * 0.5f};
+		const float  al = ImGui::GetStyle().Alpha;
+		const float  pulse = 0.5f + 0.5f * std::sin(static_cast<float>(Anim::Now()) * 2.2f);
+		menu_dl->AddCircleFilled(c, side * 0.62f, IM_COL32(222, 170, 90, static_cast<int>((26 + 14 * pulse) * al)), 28);
+		Icons::Draw(menu_dl, Icons::Flame, c, side * 0.72f, ImGui::GetColorU32(kGold));
+		ImGui::Dummy({side * 1.2f, side});
+		ImGui::SameLine();
+		ImGui::SetCursorScreenPos({ImGui::GetCursorScreenPos().x, at.y + (side - ImGui::GetFontSize() * 1.25f) * 0.5f});
+		ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.25f);
+		ImGui::TextColored(kGold, "%s", I18n::T("Demon's Souls PC"));
+		ImGui::PopFont();
+		const ImVec2 p  = {at.x, at.y + side + 8 * unit};
+		const ImU32  r0 = IM_COL32(222, 196, 140, static_cast<int>(150 * al)), r1 = IM_COL32(222, 196, 140, 0);
+		menu_dl->AddRectFilledMultiColor(p, {p.x + 420 * unit, p.y + std::max(1.0f, unit)}, r0, r1, r1, r0);
+		ImGui::Dummy({420 * unit, 12 * unit});
+		// (Redrawn only while open: the pulse asks for no frames of its own; it moves with the menu's other redraws.)
+	}
 	bool show = g_saved.start_menu;
 	if (ImGui::Checkbox(I18n::T("Mostrar el lanzador la pr\xC3\xB3xima vez que abras el juego"), &show)) {
 		Settings on_disk;
@@ -5232,23 +5466,23 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		g_edit.start_menu   = show;
 		(void)SaveSettings(g_rt.ini_path, on_disk);
 	}
-	const ImVec2 bs {420 * unit, 52 * unit};
-	if (Anim::Button(I18n::T("Volver al juego"), bs, unit)) SetOpen(false);
+	const ImVec2 bs {420 * unit, 60 * unit};
+	if (IconButton(I18n::T("Volver al juego"), Icons::Back, bs, unit, 0)) SetOpen(false);
 	// (port34) The trophy page (Esc, B or F1 there: back here).
 	if (g_focus_trophy_btn_request.exchange(false)) g_focus_trophy_btn = true;
 	if (g_focus_trophy_btn) {
 		ImGui::SetKeyboardFocusHere();
 		g_focus_trophy_btn = false;
 	}
-	if (Anim::Button(I18n::T("Ver trofeos"), bs, unit)) {
+	if (IconButton(I18n::T("Ver trofeos"), Icons::Trophy, bs, unit, 1)) {
 		g_trophy_tab_delta = 0;
 		TrophyPage::Open();
 		g_trophy_page = true;
 		Bump();
 	}
-	if (Anim::Button(I18n::T("Mapear mando"), bs, unit)) g_f1_page = 1;
-	if (Anim::Button(I18n::T("Teclado y ratón"), bs, unit)) g_f1_page = 2;
-		if (Anim::Button(I18n::T("Cerrar el juego"), bs, unit)) {
+	if (IconButton(I18n::T("Mapear mando"), Icons::Pad, bs, unit, 2)) g_f1_page = 1;
+	if (IconButton(I18n::T("Teclado y ratón"), Icons::Keyboard, bs, unit, 3)) g_f1_page = 2;
+		if (IconButton(I18n::T("Cerrar el juego"), Icons::Power, bs, unit, 4, true)) {
 		// Just closes: nothing saved, nothing skipped (the game's own saves are already on disk).
 #if defined(_WIN32)
 		ExitProcess(0);
