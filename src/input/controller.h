@@ -104,6 +104,8 @@ public:
     Colour GetLightBarRGB();
     void PollLightColour();
     bool SetVibration(u8 smallMotor, u8 largeMotor);
+    bool ApplyVibration(); // (bb-input-137)
+    u8 m_vib_small = 0, m_vib_large = 0;
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
 
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
