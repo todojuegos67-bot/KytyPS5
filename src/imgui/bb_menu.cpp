@@ -1930,6 +1930,10 @@ void DrawToast(float u) {
 //  - Despertar en Yharnam: kYharnamSeconds of time spent in m24_01 after the new game (map load
 //    alone cannot tell the clinic from the street); old 7-minute rule if no map load is ever seen.
 //  - El primer sueño: first m21_00 load after the new game (exact).
+// (bb-trophy-134b) New game = a character slot /savedata0/userdata000N written before any map
+// load and before that slot was read (since boot or the last system-data userdata0010 read).
+// Every new game re-arms the trophies not yet unlocked; progress counts only while that slot
+// is the active character.
 //  - Ni la bestia, ni el miedo: HEURISTIC: the first m21_00 load comes after at least
 //    BB_BEAST_HEUR_SECONDS (default 0 = off and hidden from the grid; e.g. 240 to enable) in m24_01; dying to the beast is quick,
 //    killing it unarmed is not.
@@ -1958,6 +1962,7 @@ struct CustomState {
     int seconds = 0;          // since armed
     int yharnam_seconds = 0;  // in m24_01 since armed
     bool yharnam_seen = false, dream_seen = false;
+    int slot = -1; // character slot of this run (userdataNNNN), -1 = unknown
 };
 std::mutex g_custom_mtx;
 std::filesystem::path CustomJson() {
@@ -2008,6 +2013,8 @@ CustomState ReadCustom() {
     s.yharnam_seconds = static_cast<int>(num(pr, "\"yharnam_seconds\""));
     s.yharnam_seen = flag(pr, "\"yharnam_seen\"");
     s.dream_seen = flag(pr, "\"dream_seen\"");
+    s.slot = pr.find("\"slot\"") == std::string::npos ? -1
+                                                     : static_cast<int>(num(pr, "\"slot\"")) - 1;
     return s;
 }
 void WriteCustom(const CustomState& s) {
@@ -2039,9 +2046,10 @@ void WriteCustom(const CustomState& s) {
     }
     j += fmt::format("  \"progress\": {{\n    \"armed\": {},\n    \"play_seconds\": {},\n"
                      "    \"yharnam_seconds\": {},\n    \"yharnam_seen\": {},\n"
-                     "    \"dream_seen\": {}\n  }}\n}}\n",
+                     "    \"dream_seen\": {},\n    \"slot\": {}\n  }}\n}}\n",
                      s.armed ? "true" : "false", s.seconds, s.yharnam_seconds,
-                     s.yharnam_seen ? "true" : "false", s.dream_seen ? "true" : "false");
+                     s.yharnam_seen ? "true" : "false", s.dream_seen ? "true" : "false",
+                     s.slot + 1); // stored +1 (0 = unknown)
     const auto tmp = std::filesystem::path(p).concat(".tmp");
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -2069,6 +2077,7 @@ std::atomic<int> g_newgame_slot{-1};
 std::atomic<bool> g_any_map_session{false};
 std::atomic<unsigned> g_slot_read_mask{0};
 std::atomic<int> g_slot_logged{0};
+std::atomic<int> g_active_slot{-1}; // last character slot read or written
 
 // every file under the save data folders (home/<user>/savedata/...), without sce_sys
 std::vector<std::string> ScanSaves() {
@@ -2126,6 +2135,12 @@ void CustomWatcher() {
         }
         return;
     }
+    if (s.armed && s.slot < 0) {
+        // a 1.17-1.34 run armed by the old file rule: no slot, cannot be trusted
+        LOG_INFO(Frontend, "[bbtrophy] old run without a character slot dropped; next new game re-arms");
+        s.armed = false;
+        WriteCustom(s);
+    }
     const int beast_heur = BeastHeurSeconds();
     auto known = ScanSaves();
     LOG_INFO(Frontend,
@@ -2177,41 +2192,44 @@ void CustomWatcher() {
             std::scoped_lock lk{g_map_mtx};
             loads.swap(g_map_loads);
         }
-        if (!s.armed) {
-            const auto now = ScanSaves();
-            std::vector<std::string> added;
-            std::set_difference(now.begin(), now.end(), known.begin(), known.end(),
-                                std::back_inserter(added));
-            known = now;
-            for (const auto& m : loads) {
+        // a new game re-arms every not-yet-unlocked trophy, whatever earlier runs left
+        // (the 1.17 "new save file" rule is gone: Bloodborne rewrites slots/backups in one
+        // container, so new files are not new games; the slot-write rule replaces it)
+        std::vector<std::string> added;
+        const int ng_slot = g_newgame_slot.exchange(-1);
+        if (ng_slot >= 0) {
+            added.insert(added.begin(),
+                         fmt::format("/savedata0/userdata{:04d} (new character slot write)", ng_slot));
+        }
+        if (!added.empty()) {
+            CustomState fresh;
+            for (int i = 0; i < 3; i++) {
+                fresh.unlocked[i] = s.unlocked[i];
+                fresh.stamp[i] = s.stamp[i];
+            }
+            s = fresh;
+            s.armed = true;
+            s.slot = ng_slot;
+            LOG_INFO(Frontend,
+                     "[bbtrophy] new game ({}): armed, per-run progress reset (slot {}, current "
+                     "map '{}', unlocked: {} {} {})",
+                     added[0], ng_slot, cur_map, s.unlocked[0], s.unlocked[1], s.unlocked[2]);
+            cur_map.clear();
+            WriteCustom(s);
+        }
+        // progress counts only while the run's own character is the active one
+        const int active = g_active_slot.load();
+        const bool own = s.slot >= 0 && active == s.slot;
+        for (const auto& m : loads) {
+            if (s.armed && own) {
+                on_map(m.id);
+            } else {
                 cur_map = m.id;
                 any_map = true;
             }
-            const int ng_slot = g_newgame_slot.exchange(-1);
-            if (ng_slot >= 0 && added.empty()) {
-                added.push_back(fmt::format("/savedata0/userdata{:04d} (new character slot write)",
-                                            ng_slot));
-            }
-            if (!added.empty()) {
-                CustomState fresh;
-                for (int i = 0; i < 3; i++) {
-                    fresh.unlocked[i] = s.unlocked[i];
-                    fresh.stamp[i] = s.stamp[i];
-                }
-                s = fresh;
-                s.armed = true;
-                LOG_INFO(Frontend, "[bbtrophy] new save data ({}): new game, armed (current map '{}')",
-                         added[0], cur_map);
-                // the clinic map may have loaded just before the save file appeared
-                if (!cur_map.empty()) {
-                    on_map(cur_map);
-                }
-                WriteCustom(s);
-            }
-            continue;
         }
-        for (const auto& m : loads) {
-            on_map(m.id);
+        if (!s.armed || !own) {
+            continue;
         }
         s.seconds += 5;
         if (cur_map == kMapYharnam) {
@@ -2225,9 +2243,9 @@ void CustomWatcher() {
                 UnlockCustom(s, 0, "fallback: no map load seen, 7 min after new save data");
             }
         }
-        if (s.unlocked[0] && s.dream_seen) {
+        if (AllUnlocked(s)) {
             WriteCustom(s);
-            LOG_INFO(Frontend, "[bbtrophy] watcher done");
+            LOG_INFO(Frontend, "[bbtrophy] all custom trophies unlocked, watcher done");
             return;
         }
         if (since_write >= 30) {
@@ -3795,7 +3813,13 @@ void OnGuestFileOpen(const char* path, int flags) {
             LOG_INFO(Frontend, "[bbtrophy] save slot userdata{:04d} {} (map loaded this session: {})",
                      slot, write ? "write" : "read", g_any_map_session.load());
         }
+        if (slot == 10 && !write) {
+            // system data read: boot / title menu. A new game from here is a fresh session.
+            g_any_map_session = false;
+            g_slot_read_mask = 0;
+        }
         if (slot >= 0 && slot <= 9) {
+            g_active_slot = slot;
             const unsigned bit = 1u << slot;
             if (!write) {
                 g_slot_read_mask.fetch_or(bit);
