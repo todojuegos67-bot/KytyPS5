@@ -29,6 +29,15 @@
 
 namespace BB::FG {
 
+// bb-dcideas-094 (DCport: "menus and videos are not generated"): libSceAvPlayer handed the game a
+// movie frame (NoteMovieFrame), and whether one came in the last 500 ms. FgBlocked: this present
+// must not be generated (a movie plays, or the flip is a 2D frame: menu, loading screen), so
+// DLSS-G and FSR 3 FG pass it through unchanged at once instead of after their hysteresis.
+// BB_FG_MOVIE_OFF=0 turns the movie test off.
+void NoteMovieFrame();
+bool MoviePlaying();
+bool FgBlocked(const char** why);
+
 // "KYTY_X": BB_X when set, else KYTY_X.
 const char* Env(const char* kyty_name);
 // (bb-fgdyn-034) The dynamic multiplier's ceiling for a base (real) frame rate: few real frames

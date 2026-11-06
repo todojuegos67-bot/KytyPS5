@@ -28,6 +28,7 @@
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_metrics.h"
 #include "video_core/bb/bb_sr.h"
+#include "video_core/bb/bb_upscale.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -53,6 +54,44 @@
 #pragma clang diagnostic pop
 #pragma pop_macro("__cplusplus")
 #endif
+
+namespace BB::FG {
+namespace {
+std::atomic<int64_t> g_movie_frame_ns{0};
+}
+void NoteMovieFrame() {
+    g_movie_frame_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                           std::memory_order_relaxed);
+}
+bool MoviePlaying() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_FG_MOVIE_OFF");
+        return v == nullptr || v[0] != '0';
+    }();
+    const int64_t t = g_movie_frame_ns.load(std::memory_order_relaxed);
+    if (!on || t == 0) return false;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               now - std::chrono::steady_clock::duration(t))
+               .count() < 500;
+}
+bool FgBlocked(const char** why) {
+    const char* w = nullptr;
+    if (MoviePlaying()) {
+        w = "movie (libSceAvPlayer)";
+    } else if (BB::Upscale::Enabled() && BB::Upscale::FlipIs2D()) {
+        w = "2D frame (menu / loading screen, no 3D scene)";
+    }
+    if (why != nullptr) *why = w;
+    static const char* said = nullptr;
+    if (w != said) {
+        said = w;
+        Printf("[fg-gate] frame generation %s", w != nullptr ? w : "allowed (3D frame)");
+        if (w != nullptr) Printf("[fg-gate] passing frames through unchanged: %s", w);
+    }
+    return w != nullptr;
+}
+} // namespace BB::FG
 
 namespace BB::FG {
 
@@ -1837,7 +1876,8 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
     const bool blocked = backbuffer.width == 0 || backbuffer.height == 0 ||
                          region.extent.width == 0 || region.extent.height == 0 ||
                          Clock::now() < g_backoff_until;
-    const bool usable = inputs != nullptr && inputs->valid && !blocked;
+    const bool gate_off = FgBlocked(nullptr);
+    const bool usable = inputs != nullptr && inputs->valid && !blocked && !gate_off;
     // bb-merge-082: the HUD-less image DLSS-G is given: the one at the game image's size when the
     // presenter made it (the frame is scaled into the window), else the frame's own.
     const Image& hl_image =
@@ -1985,7 +2025,8 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
     static uint32_t run_with = 0, run_without = 0;
     run_with = usable ? run_with + 1 : 0;
     run_without = usable ? 0 : run_without + 1;
-    const bool mode_on = g_mode_set == 1 ? run_without < 30 : run_with >= 10;
+    // bb-dcideas-094: a movie or a 2D flip turns it off at once (no 30-present hysteresis).
+    const bool mode_on = gate_off ? false : g_mode_set == 1 ? run_without < 30 : run_with >= 10;
     Display::SetExpected(mode_on && usable ? CurrentGenerate() : 0);
     if (g_dynamic) {
         ApplyLimit(mode_on ? g_dyn_gen : -1);

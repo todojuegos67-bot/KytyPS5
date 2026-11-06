@@ -97,6 +97,13 @@ double QualityRatio(Kind kind, Quality quality) {
     return 1.0;
 }
 
+std::atomic<uint32_t> g_backend_resets{0};
+std::atomic<const char*> g_backend_reset_why{""};
+void NoteBackendReset(const char* why) {
+    g_backend_resets.fetch_add(1, std::memory_order_relaxed);
+    g_backend_reset_why.store(why, std::memory_order_relaxed);
+}
+
 } // namespace BB::SR
 
 namespace BB::Upscale {
@@ -1026,6 +1033,9 @@ std::array<std::atomic<u32>, RfCount> g_ss_refuse{};
 int g_lock = 0;
 u32 g_lock_frames = 0, g_lock_inplace = 0;
 u32 g_sec_frames = 0, g_sec_locked = 0, g_sec_resets = 0;
+// bb-dcideas-094 (DCport 0.5.3 lesson: the HUD reset FSR's history every frame): resets per
+// second by reason, printed as [sr-hist] whether the path lock is on or not.
+u32 g_sec_upscales = 0, g_rs_first = 0, g_rs_cut = 0, g_rs_size = 0, g_rs_path = 0;
 bool PathLockOn() {
     static const bool on = [] {
         const char* v = std::getenv("BB_PATH_LOCK");
@@ -1039,8 +1049,22 @@ double g_sec_cam_max = 0.0;
 // 2 wide) of four clip points through clip_to_prev_clip above 1.0 (BB_SR_CUT_NDC). The path-state
 // resets (last frame not in place, window path before) are not used. BB_PATH_LOCK=0: as before.
 void SrReset(Plan& p) {
+    ++g_sec_upscales;
+    // A render or output size change always resets (the history no longer matches); nothing
+    // else that changes per frame (HUD draws, render-target switches) does.
+    static u32 last_rw = 0, last_rh = 0, last_ow = 0, last_oh = 0;
+    const bool size_changed = last_rw != 0 && (p.render_w != last_rw || p.render_h != last_rh ||
+                                               p.output_w != last_ow || p.output_h != last_oh);
+    last_rw = p.render_w;
+    last_rh = p.render_h;
+    last_ow = p.output_w;
+    last_oh = p.output_h;
     if (!PathLockOn()) {
-        if (p.reset) ++g_sec_resets;
+        if (size_changed) p.reset = true;
+        if (p.reset) {
+            ++g_sec_resets;
+            ++(size_changed ? g_rs_size : g_rs_path);
+        }
         return;
     }
     static const double cut = [] {
@@ -1068,9 +1092,13 @@ void SrReset(Plan& p) {
         delta = sum >= 1e9 ? 1e9 : sum / 4.0;
     }
     g_sec_cam_max = std::max(g_sec_cam_max, std::min(delta, 99.0));
-    p.reset = first || delta > cut;
+    const bool is_cut = delta > cut;
+    p.reset = first || is_cut || size_changed;
+    if (p.reset) {
+        ++g_sec_resets;
+        ++(first ? g_rs_first : size_changed ? g_rs_size : g_rs_cut);
+    }
     first = false;
-    if (p.reset) ++g_sec_resets;
 }
 VAddr g_good_src = 0;
 u32 g_good_index = 0;
@@ -3415,6 +3443,25 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             }
             g_sec_frames = g_sec_locked = g_sec_resets = 0;
             g_sec_cam_max = 0.0;
+        }
+    }
+    {
+        static auto last = std::chrono::steady_clock::now();
+        const auto now_t = std::chrono::steady_clock::now();
+        if (now_t - last >= std::chrono::seconds(1)) {
+            last = now_t;
+            const u32 be = SR::g_backend_resets.exchange(0, std::memory_order_relaxed);
+            const u32 total = g_rs_first + g_rs_cut + g_rs_size + g_rs_path;
+            if (g_sec_upscales > 0 || be > 0) {
+                Checkpoint(fmt::format(
+                    "[sr-hist] history resets this second: {} of {} upscales (first {}, camera "
+                    "cut {}, size change {}, path switch {}); back end re-creates {}{}{}; HUD "
+                    "draws and target changes never reset",
+                    total, g_sec_upscales, g_rs_first, g_rs_cut, g_rs_size, g_rs_path, be,
+                    be > 0 ? ", last: " : "",
+                    be > 0 ? SR::g_backend_reset_why.load(std::memory_order_relaxed) : ""));
+            }
+            g_sec_upscales = g_rs_first = g_rs_cut = g_rs_size = g_rs_path = 0;
         }
     }
     {

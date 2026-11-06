@@ -7,6 +7,8 @@
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/fsr411/fsr411.h"
+#include <memory>
 #include "video_core/host_shaders/bb_fsr4_prep_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 namespace Libs::Graphics::Fsr4 {
@@ -37,6 +39,8 @@ bool SrPathWanted();
 bool Ready();
 float Sharpness();
 const char* Name();
+bool MixedDotReady(); // bb-dcideas-094: what FSR 4.1.1's INT8 passes need is on
+bool MixedDotExt();   // VK_VALVE_shader_mixed_float_dot_product on (non-portable asset sets)
 } // namespace Libs::Graphics::Fsr4
 // AMD FSR 4 (source-v07 INT8 / DOT4 model) on the PS5 Pro path: see fsr4-sr.h. The runtime is ours (KytyPS5, GPL-2.0);
 // the model's SPIR-V and weights are AMD's (MIT, fsr4_shaders/LICENSE-FSR4-v07.txt). The dispatch sizes, the constant
@@ -354,11 +358,19 @@ bool LoadReflected(const std::filesystem::path& path, Module& out, std::string& 
 }
 
 // ---- Device support (device creation) ----
+inline void vkGetPhysicalDeviceFeatures2_dispatch(vk::PhysicalDevice physical, VkPhysicalDeviceFeatures2* f) {
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2(static_cast<VkPhysicalDevice>(physical), f);
+}
 struct DeviceSupport {
 	bool checked = false;
 	bool dot = false, int8 = false, int16 = false, float16 = false, derivatives = false, accelerated = false;
 	bool derivatives_ext = false;
 	VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives_features {};
+	// bb-dcideas-094: FSR 4.1.1 (bbport's replay) needs VK_VALVE_shader_mixed_float_dot_product.
+	bool mixed_dot_ext = false, mixed_dot = false;
+#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
+	VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE mixed_dot_features {};
+#endif
 } g_dev;
 
 // ---- Runtime state ----
@@ -843,6 +855,12 @@ bool SrPathWanted() {
 	return wanted;
 }
 
+// (Not the mixed float dot extension: Windows drivers lack it, and DCport's Windows asset sets are
+// built without it, FSR411_PORTABLE=1 in extract.py. Sets that need it fail at pipeline creation,
+// which falls back to FSR 4.0 with the reason logged.)
+bool MixedDotReady() { return g_dev.dot && g_dev.int8 && g_dev.float16 && g_dev.int16; }
+bool MixedDotExt() { return g_dev.mixed_dot; }
+
 const char* Name() {
 	const int preset = RequestedPreset();
 	return preset == PresetAuto ? (g.built ? PresetTitles[g.preset] : "FSR 4 (auto preset)") : PresetTitles[preset];
@@ -865,6 +883,10 @@ void AddDeviceExtensions(const std::vector<vk::ExtensionProperties>& available, 
 	// (Core in Vulkan 1.3; the extension too where listed, for older loaders' validation.)
 	if (has(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) && !added(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME))
 		extensions.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
+	if (has(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME) && !added(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME))
+		extensions.push_back(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
+#endif
 }
 
 void* ChainDeviceFeatures(vk::PhysicalDevice physical_device, const std::vector<const char*>& extensions,
@@ -905,6 +927,28 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical_device, const std::vector<
 	            g_dev.int16 ? "yes" : "NO", g_dev.float16 ? "yes" : "NO",
 	            g_dev.derivatives ? "yes" : g_dev.derivatives_ext ? "NO" : "NO (no compute shader derivatives extension)");
 	
+	// bb-dcideas-094: FSR 4.1.1's INT8 passes (mixed float dot products, subgroup size 32).
+#ifdef VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME
+	g_dev.mixed_dot_ext = added(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
+	if (g_dev.mixed_dot_ext) {
+		VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE q {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+		VkPhysicalDeviceFeatures2 q2 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+		q2.pNext = &q;
+		vkGetPhysicalDeviceFeatures2_dispatch(physical_device, &q2);
+		g_dev.mixed_dot = q.shaderMixedFloatDotProductFloat16AccFloat32 == VK_TRUE;
+		if (g_dev.mixed_dot) {
+			g_dev.mixed_dot_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+			g_dev.mixed_dot_features.shaderMixedFloatDotProductFloat16AccFloat32 = VK_TRUE;
+			g_dev.mixed_dot_features.pNext = next;
+			next = &g_dev.mixed_dot_features;
+		}
+	}
+#endif
+	if (s13.subgroupSizeControl) features13.subgroupSizeControl = VK_TRUE;
+	if (s13.computeFullSubgroups) features13.computeFullSubgroups = VK_TRUE;
+	BBLogf("FSR 4.1.1 device: VK_VALVE_shader_mixed_float_dot_product %s, subgroupSizeControl %s\n",
+	       g_dev.mixed_dot ? "yes" : g_dev.mixed_dot_ext ? "extension without the feature" : "NO (not offered, or headers too old)",
+	       s13.subgroupSizeControl ? "yes" : "NO");
 	if (!g_dev.derivatives) return next;
 	g_dev.derivatives_features                              = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
 	g_dev.derivatives_features.computeDerivativeGroupLinear = VK_TRUE;
@@ -1016,6 +1060,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		}
 		g.size  = size;
 		g.first = true;
+		::BB::SR::NoteBackendReset("FSR 4 history images re-created (output size)");
 	}
 	if (g.render != desc.render) {
 		(void)graphics.device.waitIdle();
@@ -1306,16 +1351,170 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
     g_on_device = true;
 }
 
+// bb-dcideas-094: the "fsr4" upscaler runs FSR 4.1.1 (bbport's replay of AMD's 4.1.1 model,
+// gpu/upscale/fsr411) when its asset sets exist (made on the player's PC from their own
+// amd_fidelityfx_upscaler_dx12.dll 4.1.x by the DCport / bbport tools: fsr4cap, dxil-spirv,
+// extract.py) and the GPU has what it needs; else FSR 4.0 (the v07 INT8 model), as before.
+// BB_FSR411=0: always FSR 4.0. BB_FSR411_DIR: the asset folder (default fsr4_411 next to the
+// game, as bbport). Every fallback is logged with its reason.
+namespace {
+struct State411 {
+    bool checked = false, usable = false, failed = false, active = false;
+    std::string dir, why, described;
+    std::unique_ptr<Fsr411::Upscaler> up;
+} g411;
+void Fallback411(const std::string& why) {
+    g411.failed = true;
+    g411.active = false;
+    g411.why = why;
+    BBLogf("FSR 4.1.1: not used, FSR 4.0 instead: %s\n", why.c_str());
+}
+bool Check411() {
+    if (g411.checked) return g411.usable;
+    g411.checked = true;
+    const char* off = std::getenv("BB_FSR411");
+    if (off != nullptr && off[0] == '0') {
+        Fallback411("BB_FSR411=0");
+        return false;
+    }
+    const char* env = std::getenv("BB_FSR411_DIR");
+    g411.dir = env != nullptr && *env != '\0' ? env : "fsr4_411";
+    if (!Libs::Graphics::Fsr4::MixedDotReady()) {
+        Fallback411("this GPU lacks INT8 dot products, shaderInt8, shaderInt16 or shaderFloat16");
+        return false;
+    }
+    Fsr411::Features f{};
+    if (Fsr411::AvailableModels(g411.dir, f) == 0) {
+        Fallback411("no FSR 4.1.1 asset sets in '" + g411.dir +
+                    "' (made from your own amd_fidelityfx_upscaler_dx12.dll 4.1.x; BB_FSR411_DIR)");
+        return false;
+    }
+    g411.up = std::make_unique<Fsr411::Upscaler>(
+        static_cast<VkPhysicalDevice>(g_ctx.physical_device), static_cast<VkDevice>(g_ctx.device),
+        g411.dir, f);
+    g411.usable = true;
+    BBLogf("FSR 4.1.1: asset sets found in '%s': the fsr4 upscaler runs FSR 4.1.1 "
+           "(VK_VALVE_shader_mixed_float_dot_product %s: %s)\n", g411.dir.c_str(),
+           Libs::Graphics::Fsr4::MixedDotExt() ? "on" : "off",
+           Libs::Graphics::Fsr4::MixedDotExt() ? "any asset set" : "portable asset sets only (FSR411_PORTABLE=1)");
+    return true;
+}
+void ToGeneral(vk::CommandBuffer cmd, const Image& img, vk::ImageAspectFlags aspect, bool back) {
+    const vk::ImageLayout from = back ? vk::ImageLayout::eGeneral : img.layout;
+    const vk::ImageLayout to = back ? img.layout : vk::ImageLayout::eGeneral;
+    if (from == to || img.image == vk::Image{}) return;
+    const auto rw = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eMemoryRead;
+    const vk::ImageMemoryBarrier b{.srcAccessMask = rw,
+                                   .dstAccessMask = rw,
+                                   .oldLayout = from,
+                                   .newLayout = to,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .image = img.image,
+                                   .subresourceRange = {.aspectMask = aspect,
+                                                        .baseMipLevel = 0,
+                                                        .levelCount = 1,
+                                                        .baseArrayLayer = 0,
+                                                        .layerCount = 1}};
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
+                        {}, {}, {}, b);
+}
+vk::ImageAspectFlags DepthAspect(vk::Format f) {
+    switch (f) {
+    case vk::Format::eD32SfloatS8Uint:
+    case vk::Format::eD24UnormS8Uint:
+    case vk::Format::eD16UnormS8Uint:
+        return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+    default:
+        return vk::ImageAspectFlagBits::eDepth;
+    }
+}
+bool Evaluate411(const Desc& desc) {
+    if (desc.output.format != vk::Format::eR16G16B16A16Sfloat ||
+        !(desc.output.usage & vk::ImageUsageFlagBits::eStorage) || desc.color.image == vk::Image{} ||
+        desc.depth.image == vk::Image{} || desc.motion.image == vk::Image{}) {
+        Fallback411("the output is not an RGBA16F storage image, or an input has no image");
+        return false;
+    }
+    const auto cmd = desc.cmd;
+    const auto color = vk::ImageAspectFlagBits::eColor;
+    ToGeneral(cmd, desc.color, color, false);
+    ToGeneral(cmd, desc.depth, DepthAspect(desc.depth.format), false);
+    ToGeneral(cmd, desc.motion, color, false);
+    ToGeneral(cmd, desc.output, color, false);
+    Fsr411::Frame g;
+    g.cmdbuf = static_cast<VkCommandBuffer>(cmd);
+    const auto img = [](const Image& i) {
+        return Fsr411::Image{static_cast<VkImage>(i.image), static_cast<VkImageView>(i.view),
+                             i.extent.width, i.extent.height};
+    };
+    g.color = img(desc.color);
+    g.depth = img(desc.depth);
+    g.motion = img(desc.motion);
+    g.output = img(desc.output);
+    g.render_width = desc.render.width;
+    g.render_height = desc.render.height;
+    const double ratio = desc.render.height != 0
+                             ? static_cast<double>(desc.upscale.height) / desc.render.height
+                             : 1.0;
+    g.ultra_performance = ratio >= 2.9; // the model's second network, as bbport (preset >= 4)
+    g.jitter[0] = desc.jitter[0];
+    g.jitter[1] = desc.jitter[1];
+    const float sharp = Libs::Graphics::Fsr4::Sharpness();
+    g.sharpness = sharp;
+    g.sharpen = sharp > 0.0f;
+    g.reset = desc.reset || !g411.active;
+    g.auto_exposure = true;
+    const bool ok = g411.up->Record(g);
+    ToGeneral(cmd, desc.output, color, true);
+    ToGeneral(cmd, desc.motion, color, true);
+    ToGeneral(cmd, desc.depth, DepthAspect(desc.depth.format), true);
+    ToGeneral(cmd, desc.color, color, true);
+    if (!ok) {
+        Fallback411("the replay failed: " + g411.up->Error());
+        return false;
+    }
+    g411.active = true;
+    if (const std::string d = g411.up->Describe(); d != g411.described) {
+        g411.described = d;
+        BBLogf("FSR 4.1.1: running, %s (%ux%u -> %ux%u)\n", d.c_str(), desc.render.width,
+               desc.render.height, desc.upscale.width, desc.upscale.height);
+    }
+    return true;
+}
+} // namespace
+
+bool Active411() {
+    return g411.active && !g411.failed;
+}
+const char* ModelName411() {
+    return Active411() && g411.up ? g411.up->ModelName() : "";
+}
+
 bool Ready() {
-    return g_on_device && Libs::Graphics::Fsr4::Ready();
+    if (!g_on_device) return false;
+    const bool v40 = Libs::Graphics::Fsr4::Ready();
+    return v40 || Check411();
 }
 
 const char* Name() {
-    return Libs::Graphics::Fsr4::Name();
+    return Active411() ? "FSR 4.1.1" : Libs::Graphics::Fsr4::Name();
 }
 
 bool Evaluate(const Desc& desc) {
     if (!Ready()) {
+        return false;
+    }
+    if (!g411.failed && Check411()) {
+        if (Evaluate411(desc)) return true;
+        // (failed this frame: FSR 4.0 takes over with a fresh history)
+        if (!Libs::Graphics::Fsr4::Ready()) return false;
+        BB::SR::NoteBackendReset("FSR 4.1.1 -> FSR 4.0 fallback");
+        Desc d40 = desc;
+        d40.reset = true;
+        return Evaluate(d40);
+    }
+    if (!Libs::Graphics::Fsr4::Ready()) {
         return false;
     }
     Libs::Graphics::Fsr4::UpscaleDesc d{};

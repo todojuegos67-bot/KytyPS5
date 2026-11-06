@@ -161,6 +161,7 @@ bool Evaluate(const Desc& desc) {
                    flags);
         }
         if (g_context != nullptr) {
+            NoteBackendReset("FSR 3.1 context re-created");
             (void)vk::Device(g_device).waitIdle();
             g_ffx.DestroyContext(&g_context, nullptr);
             g_context = nullptr;

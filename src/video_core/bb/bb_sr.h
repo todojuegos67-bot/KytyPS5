@@ -15,6 +15,10 @@
 
 namespace BB::SR {
 
+// bb-dcideas-094: a back end dropped its history on its own (context or history images
+// re-created, first frame after a model build); counted in the per-second [sr-hist] line.
+void NoteBackendReset(const char* why);
+
 enum class Kind : uint32_t { Off, Native, Dlss, Xess, Fsr3, Fsr4 };
 
 // The Demon's Souls ratios (output / render, per axis).
@@ -118,8 +122,10 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device,
               VmaAllocator allocator, vk::Queue queue, uint32_t family);
 bool Ready();
-const char* Name();
+const char* Name(); // "FSR 4.1.1" while the 4.1.1 replay runs, else FSR 4.0's preset title
 bool Evaluate(const Desc& desc);
+bool Active411();           // bb-dcideas-094: FSR 4.1.1 upscaled the last frame
+const char* ModelName411(); // its model ("INT8", "INT8 (RDNA2)" ...), "" when not running
 } // namespace Fsr4
 
 } // namespace BB::SR
