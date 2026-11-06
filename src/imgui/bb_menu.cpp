@@ -115,6 +115,14 @@ std::atomic<bool> g_want_reload{false};
 Input::MouseMode g_saved_mouse = Input::MouseMode::Off;
 bool g_saved_relative = false;
 bool g_restore_mouse_look = false; // the Teclado y ratón checkbox: mouse-look on when closing
+// (bb-menu-133) "Jugar con teclado y ratón": mouse-look (mouse -> stick, cursor captured and
+// hidden) from the start and whenever the menu closes; persisted in <user>/bb_menu.ini.
+bool g_kbm_play = false;
+bool g_invert_y = false;
+// (bb-menu-133) Mando > "Probar y mapear": the pad never moves the menu, presses are shown live
+std::atomic<bool> g_test_mode{false};
+std::atomic<int> g_axis[4]{}; // SDL LEFTX, LEFTY, RIGHTX, RIGHTY
+std::atomic<bool> g_touch{false};
 
 // capture of a physical input (main thread writes, render thread reads)
 enum class Capture { None, Pad, PadStick, Kbm };
@@ -141,6 +149,28 @@ std::string Serial() {
     return std::string(Common::ElfInfo::Instance().GameSerial());
 }
 
+// ---------------------------------------------------------------- bb_menu.ini (bb-menu-133)
+std::filesystem::path MenuIni() {
+    return Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "bb_menu.ini";
+}
+void LoadMenuSettings() {
+    std::ifstream in(MenuIni());
+    std::string l;
+    while (std::getline(in, l)) {
+        if (l.rfind("kbm_play=", 0) == 0) g_kbm_play = l.size() > 9 && l[9] == '1';
+        if (l.rfind("invert_y=", 0) == 0) g_invert_y = l.size() > 9 && l[9] == '1';
+    }
+    Input::SetMouseInvertY(g_invert_y);
+}
+void SaveMenuSettings() {
+    std::ofstream out(MenuIni(), std::ios::trunc);
+    out << "# Bloodborne F1 menu (bb-menu-133)\n"
+        << "kbm_play=" << (g_kbm_play ? 1 : 0) << "\n"
+        << "invert_y=" << (g_invert_y ? 1 : 0) << "\n";
+    Input::SetMouseInvertY(g_invert_y);
+    LOG_INFO(Frontend, "[bb-menu] bb_menu.ini: kbm_play={} invert_y={}", g_kbm_play, g_invert_y);
+}
+
 // ---------------------------------------------------------------- open / close (main thread)
 void SetOpen(bool open) {
     if (open == g_open.load()) {
@@ -163,6 +193,7 @@ void SetOpen(bool open) {
         LOG_INFO(Frontend, "[bb-menu] F1 menu open: game input paused");
     } else {
         g_open = false;
+        g_test_mode = false;
         {
             std::scoped_lock lk{g_cap_mtx};
             g_capture = Capture::None;
@@ -764,18 +795,19 @@ struct Spot {
     float x, y, d, h;   // centre and size in the photo's pixels
 };
 
-// mando-ps4.png (1536 x 1024): the game's pad. L2 / R2 drawn over the bumpers' top.
+// mando-ps4.png (1536 x 1024, bb-menu-133 photo): the game's pad. L2 / R2 drawn over the
+// bumpers' top.
 const Spot kPs4Spots[] = {
-    {"l2", 360, 52, 150, 36},         {"r2", 1176, 52, 150, 36},
-    {"l1", 360, 102, 170, 40},        {"r1", 1176, 102, 170, 40},
-    {"pad_up", 350, 240, 64, 64},     {"pad_down", 350, 380, 64, 64},
-    {"pad_left", 282, 310, 64, 64},   {"pad_right", 418, 310, 64, 64},
-    {"triangle", 1194, 213, 88, 88},  {"circle", 1286, 311, 88, 88},
-    {"cross", 1194, 410, 88, 88},     {"square", 1100, 311, 88, 88},
-    {"l3", 555, 492, 150, 150},       {"r3", 985, 492, 150, 150},
-    {"stick_left", 555, 492, 200, 200}, {"stick_right", 985, 492, 200, 200},
-    {"options", 1040, 182, 40, 74},   {"back", 497, 182, 40, 74},
-    {"touchpad_center", 768, 245, 420, 220},
+    {"l2", 353, 52, 150, 36},         {"r2", 1173, 52, 150, 36},
+    {"l1", 353, 100, 170, 40},        {"r1", 1173, 100, 170, 40},
+    {"pad_up", 353, 240, 72, 72},     {"pad_down", 353, 387, 72, 72},
+    {"pad_left", 287, 316, 72, 72},   {"pad_right", 420, 316, 72, 72},
+    {"triangle", 1187, 220, 92, 92},  {"circle", 1291, 316, 92, 92},
+    {"cross", 1191, 413, 92, 92},     {"square", 1093, 316, 92, 92},
+    {"l3", 549, 500, 150, 150},       {"r3", 981, 500, 150, 150},
+    {"stick_left", 549, 500, 220, 220}, {"stick_right", 981, 500, 220, 220},
+    {"options", 1040, 183, 40, 74},   {"back", 497, 183, 40, 74},
+    {"touchpad_center", 769, 240, 433, 227},
 };
 // your pad, physical inputs (the input config's words); triggers above the photo
 const Spot kPs5Phys[] = {
@@ -795,12 +827,12 @@ const Spot k8bdPhys[] = {
     {"r2", 437, -18, 60, 16},
 };
 const Spot kPs4Phys[] = {
-    {"l2", 360, 52, 150, 36},        {"r2", 1176, 52, 150, 36},       {"l1", 360, 102, 170, 40},
-    {"r1", 1176, 102, 170, 40},      {"pad_up", 350, 240, 64, 64},    {"pad_down", 350, 380, 64, 64},
-    {"pad_left", 282, 310, 64, 64},  {"pad_right", 418, 310, 64, 64}, {"triangle", 1194, 213, 88, 88},
-    {"circle", 1286, 311, 88, 88},   {"cross", 1194, 410, 88, 88},    {"square", 1100, 311, 88, 88},
-    {"l3", 555, 492, 150, 150},      {"r3", 985, 492, 150, 150},      {"options", 1040, 182, 40, 74},
-    {"back", 497, 182, 40, 74},
+    {"l2", 353, 52, 150, 36},        {"r2", 1173, 52, 150, 36},       {"l1", 353, 100, 170, 40},
+    {"r1", 1173, 100, 170, 40},      {"pad_up", 353, 240, 72, 72},    {"pad_down", 353, 387, 72, 72},
+    {"pad_left", 287, 316, 72, 72},  {"pad_right", 420, 316, 72, 72}, {"triangle", 1187, 220, 92, 92},
+    {"circle", 1291, 316, 92, 92},   {"cross", 1191, 413, 92, 92},    {"square", 1093, 316, 92, 92},
+    {"l3", 549, 500, 150, 150},      {"r3", 981, 500, 150, 150},      {"options", 1040, 183, 40, 74},
+    {"back", 497, 183, 40, 74},
 };
 
 struct Row {
@@ -973,7 +1005,8 @@ bool PhysHeld(const std::string& token) {
             }
         }
     }
-    return (token == "l2" && g_trig_l > 12000) || (token == "r2" && g_trig_r > 12000);
+    return (token == "l2" && g_trig_l > 12000) || (token == "r2" && g_trig_r > 12000) ||
+           (token.starts_with("touchpad") && g_touch);
 }
 // a PS4 output whose pad binding is held now (the live highlight)
 bool PhysicallyHeld(const std::string& output) {
@@ -1024,7 +1057,24 @@ std::string Ps4Panel(ImVec2 a, ImVec2 b, float u, const std::string& focus, std:
         anchors[o] = c;
         if (o == "back") continue;
         const bool on = focus == o || hover == o;
-        const bool held = PhysicallyHeld(o);
+        bool held = PhysicallyHeld(o);
+        if (g_test_mode && o.starts_with("stick_")) {
+            // (bb-menu-133) live stick: a gold bead where the stick bound to it points
+            const auto src = PhysOf(o);
+            const bool lsrc = !src.empty() && src[0] == "l3";
+            const bool rsrc = !src.empty() && src[0] == "r3";
+            if (lsrc || rsrc) {
+                const float ax = g_axis[lsrc ? 0 : 2] / 32767.0f, ay = g_axis[lsrc ? 1 : 3] / 32767.0f;
+                const float rr = sp.d * s * 0.32f;
+                const ImVec2 q{c.x + std::clamp(ax, -1.0f, 1.0f) * rr,
+                               c.y + std::clamp(ay, -1.0f, 1.0f) * rr};
+                const float mag = std::sqrt(ax * ax + ay * ay);
+                dl->AddCircle(c, rr, Gold(0.35f), 0, std::max(1.0f, u));
+                dl->AddLine(c, q, Gold(0.6f), 2.0f * u);
+                dl->AddCircleFilled(q, 9 * u, Gold(0.5f + 0.5f * std::min(mag, 1.0f)));
+                held = held || mag > 0.3f;
+            }
+        }
         const float pulse = 0.6f + 0.4f * std::sin(t * 5.0f);
         const ImVec2 half{sp.d * s * 0.5f, sp.h * s * 0.5f};
         const bool rect = sp.d != sp.h;
@@ -2395,7 +2445,8 @@ public:
     float kbm_scroll = -1.0f;
     bool kbm_scroll_to = false;
     int exit_focus = 0;
-    float tog_direct = 0, tog_stick = 0, tog_look = 0;
+    float tog_direct = 0, tog_stick = 0, tog_look = 0, tog_inv = 0;
+    double test_hold_since = -1; // PS / OPTIONS held in the test mode
     float s_sp = 1.0f, s_dz = 0.5f;
     double dpad_since[4] = {-1, -1, -1, -1}, dpad_rep[4] = {};
 
@@ -2426,6 +2477,7 @@ public:
         }
         screen = s;
         scr_t = ImGui::GetTime();
+        g_test_mode = false;
         std::scoped_lock lk{g_cap_mtx};
         g_capture = Capture::None;
     }
@@ -2459,6 +2511,10 @@ public:
     void HandleNav(const std::vector<Nav>& nav) {
         for (const Nav n : nav) {
             if (n == Nav::Back) {
+                if (screen == Screen::Pad && g_test_mode) {
+                    g_test_mode = false; // Esc leaves the test first
+                    continue;
+                }
                 if (screen == Screen::Hub) {
                     Close();
                 } else {
@@ -2493,7 +2549,7 @@ public:
             }
             case Screen::Kbm: {
                 const int rows = static_cast<int>(std::size(kKbmRows));
-                const int cnt = rows + 4;
+                const int cnt = rows + 5;
                 if (n == Nav::Up) kbm_focus = (kbm_focus + cnt - 1) % cnt, kbm_scroll_to = true;
                 if (n == Nav::Down) kbm_focus = (kbm_focus + 1) % cnt, kbm_scroll_to = true;
                 if (n == Nav::Left || n == Nav::Right) {
@@ -2514,7 +2570,12 @@ public:
                     } else if (kbm_focus == rows + 2) {
                         g_cfg.SetMouseStick(g_cfg.MouseStick() != "left" ? "left" : "right");
                     } else if (kbm_focus == rows + 3) {
-                        g_restore_mouse_look = !g_restore_mouse_look;
+                        g_kbm_play = !g_kbm_play;
+                        g_restore_mouse_look = g_kbm_play;
+                        SaveMenuSettings();
+                    } else if (kbm_focus == rows + 4) {
+                        g_invert_y = !g_invert_y;
+                        SaveMenuSettings();
                     }
                 }
                 if (n == Nav::Clear && kbm_focus < rows) {
@@ -2649,6 +2710,11 @@ public:
             hints = {{"cross", "Entrar"}, {"circle", "Volver al juego"}, {"F1", "Cerrar"}};
             break;
         case Screen::Pad:
+            if (g_test_mode) {
+                hints = {{"options", "Mantén PS u OPTIONS 2 s: salir"},
+                         {"Esc", "Salir del modo prueba"}};
+                break;
+            }
             hints = {{"pad", "Elegir"}, {"cross", "Reasignar"}, {"triangle", "Quitar"},
                      {"l1", "Cambiar foto"}, {"circle", "Volver"}};
             break;
@@ -2673,9 +2739,9 @@ public:
         OrnLine(dl, disp.x * 0.5f, y - 26 * u, std::min(disp.x * 0.35f, 700 * u), 0.45f, u);
         for (const auto& h : hints) {
             const std::string g = h.first;
-            if (g == "F1") {
-                KeyCap(dl, {x - 4 * u, y - 17 * u}, "F1", u, 1.0f, false);
-                x += KeyCapW("F1", u) - 2 * r - 4 * u;
+            if (g == "F1" || g == "Esc") {
+                KeyCap(dl, {x - 4 * u, y - 17 * u}, g, u, 1.0f, false);
+                x += KeyCapW(g, u) - 2 * r - 4 * u;
             } else if (g == "pad") {
                 Glyph(dl, "pad_up", {x + r, y}, r);
             } else {
@@ -2726,7 +2792,7 @@ public:
         }
         std::vector<Nav> nav = TakeNav();
         if (!capturing && !closing) {
-            DpadRepeat(nav);
+            if (!g_test_mode) DpadRepeat(nav);
             HandleNav(nav);
         }
         Backdrop(disp, e, u);
@@ -2901,8 +2967,42 @@ public:
         }
         // detail bar
         const ImVec2 d0{a.x, pb + 18 * u}, d1{b.x, b.y};
-        Panel(dl, d0, d1, u, 0.3f);
+        Panel(dl, d0, d1, u, g_test_mode ? 0.6f + 0.3f * std::sin(Now() * 3.0f) : 0.3f);
         const float cy = (d0.y + d1.y) * 0.5f;
+        const float bw = 230 * u, bh = 58 * u;
+        if (g_test_mode) {
+            // (bb-menu-133) hold PS or OPTIONS 2 s to leave
+            const u32 bits = g_pad_buttons.load();
+            const bool hold = (bits & ((1u << SDL_GAMEPAD_BUTTON_GUIDE) |
+                                       (1u << SDL_GAMEPAD_BUTTON_START))) != 0;
+            const double now = ImGui::GetTime();
+            if (!hold) {
+                test_hold_since = -1;
+            } else if (test_hold_since < 0) {
+                test_hold_since = now;
+            }
+            const float hk = test_hold_since < 0
+                                 ? 0.0f
+                                 : std::clamp(static_cast<float>(now - test_hold_since) / 2.0f,
+                                              0.0f, 1.0f);
+            Txt(dl, g_ft_title, 28 * u, {d0.x + 40 * u, cy - 40 * u}, Gold(), "MODO PRUEBA");
+            Txt(dl, g_ft_italic, 21 * u, {d0.x + 40 * u, cy - 2 * u}, Parch(0.9f),
+                "Pulsa botones y sticks: se iluminan en la foto. Haz clic en un botón de la "
+                "foto y pulsa el de tu mando para reasignarlo.");
+            Txt(dl, g_ft_ui, 18 * u, {d0.x + 40 * u, cy + 30 * u}, Muted(),
+                "Salir: mantén PS u OPTIONS 2 s, pulsa Esc o el botón de la derecha");
+            const float bx = d1.x - 30 * u - bw * 1.35f;
+            const ImVec2 q0{bx, cy - bh * 0.5f}, q1{d1.x - 30 * u, cy + bh * 0.5f};
+            if (hk > 0.0f) {
+                dl->AddRectFilled({q0.x, q1.y + 6 * u}, {q0.x + (q1.x - q0.x) * hk, q1.y + 10 * u},
+                                  Gold());
+            }
+            if (CardButton("##tstx", q0, q1, "SALIR DE LA PRUEBA", u, true) || hk >= 1.0f) {
+                g_test_mode = false;
+                test_hold_since = -1;
+            }
+            return;
+        }
         if (!key.empty()) {
             Glyph(dl, key, {d0.x + 56 * u, cy}, 30 * u, 1.0f, true);
             Txt(dl, g_ft_title, 28 * u, {d0.x + 104 * u, cy - 36 * u}, Gold(), RowLabel(key));
@@ -2915,7 +3015,6 @@ public:
             Txt(dl, g_ft_title, 28 * u, {d0.x + 40 * u, cy - 18 * u}, Gold(),
                 "Restablecer todo el mando de serie");
         }
-        const float bw = 230 * u, bh = 58 * u;
         float x = d1.x - 30 * u - bw;
         if (CardButton("##rst", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "RESTABLECER", u,
                        pad_focus == rows)) {
@@ -2931,12 +3030,18 @@ public:
             CardButton("##rb", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "REASIGNAR", u, false)) {
             StartCaptureFor(key, Cat::Pad);
         }
+        x -= bw + 16 * u;
+        if (CardButton("##tst", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "PROBAR Y MAPEAR", u,
+                       false)) {
+            g_test_mode = true;
+            test_hold_since = -1;
+        }
     }
 
     // ------------------------------------------------------------ Teclado y ratón
     void KbmScreen(ImVec2 a, ImVec2 b, float u) {
         const int rows = static_cast<int>(std::size(kKbmRows));
-        kbm_focus = std::clamp(kbm_focus, 0, rows + 3);
+        kbm_focus = std::clamp(kbm_focus, 0, rows + 4);
         const std::string focus = kbm_focus < rows ? kKbmRows[kbm_focus].output : "";
         const float mid = a.x + (b.x - a.x) * 0.48f;
         std::string hover;
@@ -2958,7 +3063,7 @@ public:
         Txt(dl, g_ft_title, 30 * u, {pa.x + 30 * u, pa.y + 22 * u}, Gold(), "TECLADO Y RATÓN");
         Txt(dl, g_ft_italic, 24 * u, {pa.x + 30 * u, pa.y + 58 * u}, Muted(),
             "la tecla o el botón que da cada botón de PS4");
-        const float set_h = 250 * u;
+        const float set_h = 300 * u;
         const ImVec2 l0{pa.x + 20 * u, pa.y + 104 * u};
         const float lw = pbr.x - pa.x - 40 * u, lh = pbr.y - l0.y - set_h - 20 * u;
         // the list
@@ -3099,12 +3204,23 @@ public:
                 g_cfg.SetMouseStick(right ? "left" : "right");
             }
             Txt(dl, g_ft_text, 22 * u, {sx + 80 * u, sy + 4 * u}, Parch(0.9f), "Ratón = cámara");
-            if (Toggle("##mlook", {sx + half, sy}, g_restore_mouse_look, tog_look, u,
+            // (bb-menu-133) persisted: mouse-look + hidden, captured cursor while playing
+            if (Toggle("##mlook", {sx + half, sy}, g_kbm_play, tog_look, u,
                        kbm_focus == rows + 3)) {
-                g_restore_mouse_look = !g_restore_mouse_look;
+                g_kbm_play = !g_kbm_play;
+                g_restore_mouse_look = g_kbm_play;
+                SaveMenuSettings();
             }
             Txt(dl, g_ft_text, 22 * u, {sx + half + 80 * u, sy + 4 * u}, Parch(0.9f),
-                "Cámara con ratón al volver (F7)");
+                "Jugar con teclado y ratón");
+            sy += 50 * u;
+            if (Toggle("##minv", {sx, sy}, g_invert_y, tog_inv, u, kbm_focus == rows + 4)) {
+                g_invert_y = !g_invert_y;
+                SaveMenuSettings();
+            }
+            Txt(dl, g_ft_text, 22 * u, {sx + 80 * u, sy + 4 * u}, Parch(0.9f), "Invertir eje Y");
+            Txt(dl, g_ft_italic, 20 * u, {sx + half, sy + 6 * u}, Muted(),
+                "Cursor oculto al jugar; F1 lo libera (F7 alterna)");
         }
     }
 
@@ -3241,6 +3357,15 @@ void Init(SDL_Window* window) {
     g_inited = true;
     g_window = window;
     g_wake_event = SDL_RegisterEvents(1);
+    LoadMenuSettings();
+    if (g_kbm_play) {
+        // (bb-menu-133) "Jugar con teclado y ratón": mouse-look and a captured cursor from start
+        if (Input::GetMouseMode() != Input::MouseMode::Joystick) {
+            Input::ToggleMouseModeTo(Input::MouseMode::Joystick);
+        }
+        SDL_SetWindowRelativeMouseMode(window, true);
+        LOG_INFO(Frontend, "[bb-menu] keyboard + mouse play on: mouse-look, cursor captured");
+    }
     ImGui::Layer::AddLayer(&g_layer);
     std::thread(CustomWatcher).detach();
 }
@@ -3338,7 +3463,16 @@ bool OnSdlEvent(SDL_Event& event) {
             g_trig_l = event.gaxis.value;
         } else if (event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
             g_trig_r = event.gaxis.value;
+        } else if (static_cast<int>(event.gaxis.axis) <= static_cast<int>(SDL_GAMEPAD_AXIS_RIGHTY)) {
+            g_axis[event.gaxis.axis] = event.gaxis.value;
         }
+    } else if (event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN) {
+        g_touch = true;
+    } else if (event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) {
+        g_touch = false;
+    } else if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED && !g_open && g_kbm_play &&
+               g_window != nullptr && Input::GetMouseMode() == Input::MouseMode::Joystick) {
+        SDL_SetWindowRelativeMouseMode(g_window, true); // re-capture after Alt+Tab
     }
     if (!g_open) {
         return false;
@@ -3406,6 +3540,9 @@ bool OnSdlEvent(SDL_Event& event) {
     }
     // the menu's own navigation: d-pad, face buttons, L1 / R1, arrows, Enter, Esc. The sticks
     // never move it; nothing used here reaches the game.
+    if (type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && g_test_mode) {
+        return false; // (bb-menu-133) test mode: shown live, never navigates
+    }
     if (type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
         switch (event.gbutton.button) {
         case SDL_GAMEPAD_BUTTON_DPAD_UP: PushNav(Nav::Up); break;
