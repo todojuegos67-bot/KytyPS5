@@ -119,6 +119,10 @@ void MasterSemaphore::Refresh() {
 		const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore[lane], &counter);
 		// (A lost device's timeline reads UINT64_MAX: the first sign of the loss, often.)
 		if (result == vk::Result::eErrorDeviceLost || counter == UINT64_MAX) DeviceFault::Report();
+		if (result != vk::Result::eSuccess) {
+			std::printf("Timeline read failed: %s (%d)\n", vk::to_string(result).c_str(), static_cast<int>(result));
+			std::fflush(stdout);
+		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 		Publish(lane, counter);
 	}
@@ -169,6 +173,11 @@ void MasterSemaphore::Wait(uint64_t tick) {
 				dump(now);
 			}
 			DeviceFault::Report();
+		}
+		if (result != vk::Result::eTimeout) {
+			std::printf("Timeline wait failed: %s (%d), tick %llu\n", vk::to_string(result).c_str(), static_cast<int>(result),
+			            static_cast<unsigned long long>(tick));
+			std::fflush(stdout);
 		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eTimeout);
 		uint64_t now = 0;

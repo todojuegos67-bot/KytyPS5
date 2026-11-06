@@ -1369,7 +1369,17 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 		return;
 	}
 
-	const bool generate = usable && g_fg_context != nullptr;
+	// (des-upstream-1106b) No flapping: after the F1 menu, a load or a frame without the TAA pass, generation comes back
+	// only after KYTY_FSR3_FG_ON_AFTER (30) usable frames in a row. Each turn on or off is a Configure in which AMD's
+	// runtime waits for the whole device; on and off every other frame after the F1 menu closed preceded both device
+	// losses of 06-11 (interpolation command lists all in flight, then VK_ERROR_DEVICE_LOST).
+	static const int on_after = [] {
+		const char* v = std::getenv("KYTY_FSR3_FG_ON_AFTER");
+		return v != nullptr && *v != '\0' ? std::max(0, std::atoi(v)) : 30;
+	}();
+	static int usable_run = 0;
+	usable_run            = usable ? std::min(usable_run + 1, 1 << 20) : 0;
+	const bool generate   = usable && g_fg_context != nullptr && (g_generating || usable_run >= on_after);
 	++g_frame_id;
 	ffxConfigureDescFrameGeneration config {};
 	config.header.type             = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
