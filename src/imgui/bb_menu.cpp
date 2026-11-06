@@ -2824,10 +2824,10 @@ public:
                 if (n == Nav::Accept && opt_focus == 0 && g_direct.exists) {
                     if (WriteDirect(!g_direct.on)) g_direct.on = !g_direct.on;
                 }
-                if (n == Nav::Accept && opt_focus == 1) g_vib_on = !g_vib_on, SaveMenuSettings();
+                if (n == Nav::Accept && opt_focus == 1) g_vib_on = !g_vib_on, SaveMenuSettings(), Input::TestRumble();
                 if (opt_focus == 2 && (n == Nav::Left || n == Nav::Right)) {
                     g_vib_pct = std::clamp(g_vib_pct + (n == Nav::Left ? -10.0f : 10.0f), 0.0f, 200.0f);
-                    SaveMenuSettings();
+                    SaveMenuSettings(), Input::TestRumble();
                 }
                 break;
             case Screen::Exit:
@@ -3666,14 +3666,14 @@ public:
         const ImVec2 vt{tg.x, p0.y + 370 * u};
         if (Toggle("##vib", vt, g_vib_on, tog_vib, u, opt_focus == 1)) {
             g_vib_on = !g_vib_on;
-            SaveMenuSettings();
+            SaveMenuSettings(), Input::TestRumble();
         }
         Txt(dl, g_ft_text, 28 * u, {vt.x + 90 * u, vt.y}, Parch(), "Vibración");
         Txt(dl, g_ft_text, 24 * u, {vt.x + 90 * u, vt.y + 56 * u}, Parch(0.9f),
             fmt::format("Intensidad {:.0f} %", g_vib_pct).c_str());
         if (Slider("##vibpct", {vt.x + 90 * u, vt.y + 92 * u}, 500 * u, g_vib_pct, 0.0f, 200.0f, u,
                    opt_focus == 2)) {
-            SaveMenuSettings();
+            SaveMenuSettings(), Input::TestRumble();
         }
     }
 

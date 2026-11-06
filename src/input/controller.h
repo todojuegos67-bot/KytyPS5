@@ -159,5 +159,6 @@ public:
 };
 
 void SetVibrationSettings(bool on, int percent); // (bb-input-135)
+void TestRumble(); // (bb-input-137) 0.5 s rumble on every opened pad, F1 Opciones
 
 } // namespace Input

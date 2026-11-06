@@ -16,6 +16,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/system/userservice.h"
 #include "core/user_settings.h"
+#include "common/singleton.h"
 #include "input/controller.h"
 
 namespace Input {
@@ -311,6 +312,31 @@ bool GameController::ApplyVibration() {
         LOG_WARNING(Input, "[pad] SDL_RumbleGamepad failed: {}", SDL_GetError());
     }
     return ok;
+}
+
+void TestRumble() {
+    static Uint64 last = 0;
+    const Uint64 now = SDL_GetTicks();
+    if (last != 0 && now - last < 600) {
+        return; // a dragged slider: one test per 0.6 s
+    }
+    last = now;
+    auto& cs = *Common::Singleton<GameControllers>::Instance();
+    const float k = g_vib_on ? g_vib_pct / 100.0f : 0.0f;
+    const Uint16 v = static_cast<Uint16>(std::clamp(0.6f * k, 0.0f, 1.0f) * 0xFFFF);
+    bool any = false;
+    for (int i = 0; i < 4; i++) {
+        SDL_Gamepad* pad = cs[i]->m_sdl_gamepad;
+        if (pad == nullptr) continue;
+        any = true;
+        const bool ok = SDL_RumbleGamepad(pad, v, v, 500);
+        LOG_INFO(Input, "[pad] test rumble: pad yes (slot {}, {}), strength {}, SDL result {}{}",
+                 i, SDL_GetGamepadName(pad) ? SDL_GetGamepadName(pad) : "?", v,
+                 ok ? "ok" : "fail: ", ok ? "" : SDL_GetError());
+    }
+    if (!any) {
+        LOG_INFO(Input, "[pad] test rumble: pad no (no SDL gamepad opened)");
+    }
 }
 
 static bool is_first_check = true;
