@@ -920,6 +920,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     vk::Extent2D bb_size = image_size;
     bool bb_presented = false;
     if (vk::ImageView bb_view{}; BB::Upscale::Enabled() &&
+                                 rasterizer->BBHudSharpPresent(cmdbuf, image, view_info.format,
+                                                               bb_view, bb_size)) {
+        // 1.07 sharp HUD: the output-size canvas (upscaled scene + the HUD drawn at that size).
+        image_view = bb_view;
+        bb_presented = true;
+        BB::Upscale::OnPresentResult(true, "");
+    } else if (vk::ImageView bb_view{}; BB::Upscale::Enabled() &&
                                  rasterizer->BBPresentComposite(cmdbuf, image, view_info.format,
                                                                 bb_view, bb_size)) {
         image_view = bb_view;
@@ -986,7 +993,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         const char* path = "no upscaler";
         Hud2D hud = same ? Hud2D::Native : bigger ? Hud2D::Downscaled
                                          : spatial ? Hud2D::Spatial : Hud2D::Stretched;
-        if (bb_presented) {
+        if (bb_presented && Rasterizer::BBHudSharpPresented()) {
+            // 1.16: the scene upscaled before the HUD, the HUD drawn by the game at this size.
+            path = "before-HUD path (3D upscaled before the HUD, HUD rasterised at the output "
+                   "size)";
+            hud = Hud2D::Native;
+        } else if (bb_presented) {
             path = "window path (3D upscaled, HUD layer added at the window size)";
             hud = BB::Upscale::HudSharpScale(image_size.width, image_size.height, bb_size.width,
                                              bb_size.height)

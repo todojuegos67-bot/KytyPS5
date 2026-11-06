@@ -22,4 +22,9 @@ bool ShrinkWanted();
 // upscaler runs at the first output-size pass that samples the scene colour (before
 // post-processing and the HUD), writing an output-size image that pass reads instead.
 bool NativeChain();
+// 1.07 (bb-hudsharp-107): the scene patch is active with the UI at the internal size and a ratio
+// > 1: the game's HUD / menu draws after the upscale point are re-rasterised into an output-size
+// canvas (viewport / scissor scaled by output / internal), so the 2D layer is sharp at the window
+// size. BB_HUD_SHARP=0 turns it off (1.01 behaviour: HUD at the internal size, composited).
+bool HudSharp();
 } // namespace BB::ResPatch

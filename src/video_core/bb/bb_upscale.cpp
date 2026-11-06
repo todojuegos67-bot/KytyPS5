@@ -2623,6 +2623,7 @@ bool g_native_said = false;
 // so no frame is without inputs), 2 = at present for every frame (the HUD point is not used).
 // BB_FGN_LOCK=hud / present forces one, BB_FGN_LOCK=0 the old per-frame choice.
 int g_fgn_lock = 0;
+u32 g_inject_traced = 0; // 1.16: [inject] traces logged
 u32 g_fgn_lock_frames = 0, g_fgn_lock_hud = 0;
 int FgnLockForced() {
     static const int v = [] {
@@ -2643,6 +2644,18 @@ struct FgnSec {
     u32 ints = 0;
 } g_fgn_sec;
 } // namespace
+
+namespace {
+std::atomic<bool> g_hud_canvas_ok{true};
+}
+bool HudCanvasOk() {
+    return g_hud_canvas_ok.load(std::memory_order_relaxed);
+}
+void SetHudCanvasOk(bool ok, std::string_view why) {
+    if (g_hud_canvas_ok.exchange(ok) != ok) {
+        Checkpoint(fmt::format("[hud] HUD canvas {} for the session: {}", ok ? "on" : "OFF", why));
+    }
+}
 
 bool WantPresentUpscale(VAddr& flip) {
     if (!Enabled()) {
@@ -2676,7 +2689,7 @@ bool WantPresentUpscale(VAddr& flip) {
                 f.hud_how = t.addr == f.post_target ? "first 2D draw into the composite target"
                                                     : "first 2D draw into the presented image";
             }
-            if (g_frame_no < 2400 && f.trace.size() < 1500) {
+            if (g_inject_traced < 6 && f.trace.size() < 1500) {
                 f.trace += fmt::format(" #{}:{:#x}{}{}", f.draws, t.addr,
                                        g_draw.samples_render_size ? "/post" : "/2d",
                                        IsFlip(t.addr) ? "/flip" : "");
@@ -2711,7 +2724,10 @@ bool WantPresentUpscale(VAddr& flip) {
         const char* v = std::getenv("BB_INJECT_COMPOSITE");
         return v != nullptr && v[0] == '1';
     }();
-    if (!fgn && !any_target && !IsFlip(cand)) {
+    // 1.16: in scaled modes the HUD canvas takes the UI image too (the scene is upscaled there,
+    // the HUD drawn at the output size, the game's final pass re-run on the canvas).
+    const bool canvas_target = !fgn && BB::ResPatch::HudSharp() && HudCanvasOk();
+    if (!fgn && !any_target && !canvas_target && !IsFlip(cand)) {
         f.hud_how = "composite target is not the presented image (upscaler waits for the flip)";
         return false;
     }
@@ -3719,10 +3735,10 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                                        g_frame_no, why));
             }
         }
-        if (g_frame_no < 2400 && scene3d_i && !f.trace.empty()) {
-            static u32 traced = 0;
-            if (traced < 6 && (g_frame_no % 97) == 0) {
-                ++traced;
+        if (scene3d_i && !f.trace.empty()) {
+            // 1.16: traced in any part of the session (the 1.14 log reached 3D after frame 2400).
+            if (g_inject_traced < 6 && (g_frame_no % 97) == 0) {
+                ++g_inject_traced;
                 Checkpoint(fmt::format("[inject] output-size draws after the scene, frame {}:{}",
                                        g_frame_no, f.trace));
             }

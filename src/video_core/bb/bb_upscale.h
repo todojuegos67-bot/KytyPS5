@@ -201,6 +201,11 @@ void SetPresentSize(u32 width, u32 height); // the presenter's frame size, every
 // (it samples no render-size image), when the upscale to the window size should run before it;
 // CurrentPlan() then describes it and `flip` is the presented image's address.
 bool WantPresentUpscale(VAddr& flip);
+// 1.16 (bb-hud-116): the HUD canvas (vk_rasterizer_bb.cpp) can take a HUD point on the game's UI
+// image (the composite target before its final pass into the flip) in scaled modes. Turned off
+// for the session after the canvas could not be used (then 1.14: the HUD composite at present).
+bool HudCanvasOk();
+void SetHudCanvasOk(bool ok, std::string_view why);
 void OnPresentUpscaled(bool ok);
 // 0.39 (BB_FG_NATIVE, default on): frame generation asked with no upscaler. The module runs its
 // native mode: the window-size path's plan (render size = output size) only feeds frame
