@@ -154,6 +154,12 @@ struct BBVk {
     // (raw copy, its own format): the motion-vector pass's colour input and FG's HUD-less image.
     OwnImage fgn_src;
     OwnImage d5_work; // 0.90: DLSS 5 without an upscaler (RGBA16F copy of the native image)
+    // 1.31 (bb-dlss5flk-131): DLSS 5 on the native image this frame (fgn_src holds its result)
+    // and at which point (1 before the HUD, 2 at present), for the HUD-less choice and [dlss5-fg].
+    bool d5_applied = false;
+    int d5_path = 0, d5_prev_path = 0;
+    u32 d5s_hud = 0, d5s_late = 0, d5s_off = 0, d5s_rs_switch = 0, d5s_rs_plan = 0;
+    u32 d5s_fg_post = 0, d5s_fg_pre = 0, d5s_fg_nod5 = 0, d5s_fg_none = 0;
     bool fgn_ready = false;
     // BB_HUD_DIAG: the presented image's address once its HUD-less copy is taken, frames seen.
     VAddr hud_flip = 0;
@@ -268,6 +274,15 @@ void Barrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout,
         .pImageMemoryBarriers = &barrier,
     });
     img.layout = layout;
+}
+
+// 1.31 (bb-dlss5flk-131): BB_DLSS5_FLK_FIX=0 restores 1.29's DLSS 5 native / DLSS-G behaviour.
+bool Dlss5FlkFix() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_DLSS5_FLK_FIX");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
 }
 
 bool InitOnce(const Instance& instance) {
@@ -2593,6 +2608,7 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
 bool Rasterizer::BBFgNativeAnalyze(VideoCore::Image& flip, bool late) {
     const auto& plan = BB::Upscale::CurrentPlan();
     g_bb.fgn_ready = false;
+    g_bb.d5_applied = false;
     if (!InitOnce(instance)) {
         return false;
     }
@@ -2691,6 +2707,19 @@ bool Rasterizer::BBFgNativeAnalyze(VideoCore::Image& flip, bool late) {
             d.jitter[0] = plan.jitter[0];
             d.jitter[1] = plan.jitter[1];
             d.reset = plan.reset;
+            // 1.31: the before-HUD point gives DLSS 5 the game's UI image before its final pass
+            // (no brightness curve, no HUD); a frame that missed it gives the finished flip at
+            // present (curve and HUD in). The model's history must not mix the two: a switch of
+            // point resets it (BB_DLSS5_FLK_FIX=0: the old behaviour, never reset).
+            const int d5_path = late ? 2 : 1;
+            const bool d5_switch = Dlss5FlkFix() && g_bb.d5_prev_path != 0 &&
+                                   g_bb.d5_prev_path != d5_path;
+            if (d5_switch) {
+                d.reset = true;
+                ++g_bb.d5s_rs_switch;
+            } else if (plan.reset) {
+                ++g_bb.d5s_rs_plan;
+            }
             d.depth_inverted = plan.depth_inverted;
             d.delta_ms = plan.delta_ms;
             d.fov_y = plan.fov_y;
@@ -2700,7 +2729,16 @@ bool Rasterizer::BBFgNativeAnalyze(VideoCore::Image& flip, bool late) {
             std::copy(std::begin(plan.view_to_clip), std::end(plan.view_to_clip), d.view_to_clip);
             std::copy(std::begin(plan.clip_to_prev_clip), std::end(plan.clip_to_prev_clip),
                       d.clip_to_prev_clip);
-            if (BB::Dlss5::Apply(d)) {
+            const bool d5_ok = BB::Dlss5::Apply(d);
+            if (d5_ok) {
+                g_bb.d5_applied = true;
+                g_bb.d5_path = d5_path;
+                g_bb.d5_prev_path = d5_path;
+                ++(late ? g_bb.d5s_late : g_bb.d5s_hud);
+            } else {
+                ++g_bb.d5s_off;
+            }
+            if (d5_ok) {
                 runtime.Transit(&flip, vk::ImageLayout::eTransferDstOptimal,
                                 vk::PipelineStageFlagBits2::eTransfer,
                                 vk::AccessFlagBits2::eTransferWrite);
@@ -2750,6 +2788,17 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     const bool raw_ready = g_bb.fg_raw_hudless_ready;
     const bool fgn_ready = g_bb.fgn_ready;
     g_bb.fgn_ready = false;
+    // 1.31 (bb-dlss5flk-131): DLSS 5 ran at present on the finished flip (a frame that missed
+    // the HUD point, or the FG-only path locked at present). The in-place HUD-less image (A,
+    // copied at the HUD start, through the game's curve) was taken BEFORE DLSS 5 ran: DLSS-G got
+    // a pre-DLSS 5 picture as HUD-less colour while the back buffer was post-DLSS 5, so every
+    // generated frame had the other look (brightness / contrast / detail) and the whole screen
+    // read as "HUD" to it (a doubled silhouette). Now the post-DLSS 5 image (fgn_src, the same
+    // picture as the presented one) is given. BB_DLSS5_FLK_FIX=0: the old choice.
+    const bool d5_applied = fgn_ready && g_bb.d5_applied;
+    const bool d5_late_fix = Dlss5FlkFix() && d5_applied && g_bb.fgn_late;
+    g_bb.d5_applied = false;
+    bool fgn_used = false;
     g_bb.fg_present_ready = false;
     g_bb.fg_raw_hudless_ready = false;
     // 0.36: per-reason counts of flips with no frame-generation inputs, about once a second.
@@ -2850,7 +2899,8 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
         // The window-size path: the upscaled image with no HUD added (bb_hud.comp flag 4).
         hudless_view = g_bb.fg_present.view;
         out.hudless_source = "upscaled image before the HUD";
-    } else if (fgn_ready && g_bb.fgn_src.image && !(g_bb.fgn_late && g_bb.lut_ready) &&
+    } else if (fgn_ready && g_bb.fgn_src.image &&
+               !(g_bb.fgn_late && g_bb.lut_ready && !d5_late_fix) &&
                EnsureImage(g_bb.fg_hudless_view_copy, g_bb.fgn_src.extent, view_format,
                            vk::ImageUsageFlagBits::eTransferDst |
                                vk::ImageUsageFlagBits::eSampled)) {
@@ -2874,6 +2924,10 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
         hudless_view = g_bb.fg_hudless_view_copy.view;
         out.hudless_source = "presented image before its HUD (no upscaler)";
+        fgn_used = true;
+        if (d5_late_fix) {
+            out.hudless_source = "finished flip after DLSS 5 at present (1.31: post-DLSS 5)";
+        }
     } else if (g_bb.lut_ready &&
                EnsureImage(g_bb.fg_hudless_view_copy, g_bb.lut_out.extent, view_format,
                            vk::ImageUsageFlagBits::eTransferDst |
@@ -2900,7 +2954,36 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     // 1.03: the late analysis copies the finished flip image, HUD included; given as the HUD-less
     // image, FSR 3 FG / DLSS-G took the HUD for scene and warped it (ghosted bars, icons, text).
     // The in-place HUD-less image (taken before the first HUD draw) is used instead when ready.
-    if (fgn_ready && g_bb.fgn_late && g_bb.lut_ready) g_bb.fg_hudless_late_skipped = true;
+    if (fgn_ready && g_bb.fgn_late && g_bb.lut_ready && !d5_late_fix) {
+        g_bb.fg_hudless_late_skipped = true;
+    }
+    if (BB::Dlss5::Wanted()) {
+        // 1.31: per second, which picture DLSS-G got as HUD-less colour with DLSS 5 on.
+        if (!hudless_view) {
+            ++g_bb.d5s_fg_none;
+        } else if (!d5_applied) {
+            ++g_bb.d5s_fg_nod5;
+        } else if (fgn_used) {
+            ++g_bb.d5s_fg_post;
+        } else {
+            ++g_bb.d5s_fg_pre;
+        }
+        static auto d5s_last = std::chrono::steady_clock::now();
+        const auto d5s_now = std::chrono::steady_clock::now();
+        if (d5s_now - d5s_last >= std::chrono::seconds(1)) {
+            d5s_last = d5s_now;
+            BB::Upscale::Checkpoint(fmt::format(
+                "[dlss5-fg] last second: DLSS 5 native before-HUD {} / at-present {} / not run {}; "
+                "history resets: point switch {}, plan {}; DLSS-G HUD-less: post-DLSS5 {}, "
+                "PRE-DLSS5 {}, frame without DLSS 5 {}, none {} (fix {})",
+                g_bb.d5s_hud, g_bb.d5s_late, g_bb.d5s_off, g_bb.d5s_rs_switch, g_bb.d5s_rs_plan,
+                g_bb.d5s_fg_post, g_bb.d5s_fg_pre, g_bb.d5s_fg_nod5, g_bb.d5s_fg_none,
+                Dlss5FlkFix() ? "on" : "off (BB_DLSS5_FLK_FIX=0)"));
+            g_bb.d5s_hud = g_bb.d5s_late = g_bb.d5s_off = g_bb.d5s_rs_switch = g_bb.d5s_rs_plan =
+                0;
+            g_bb.d5s_fg_post = g_bb.d5s_fg_pre = g_bb.d5s_fg_nod5 = g_bb.d5s_fg_none = 0;
+        }
+    }
     ++g_bb.fg_frames;
     if (hudless_view) ++g_bb.fg_hudless_frames;
     if (g_bb.fg_frames % 600 == 1) {
