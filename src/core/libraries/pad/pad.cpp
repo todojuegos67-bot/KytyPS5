@@ -9,6 +9,7 @@
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/pad/pad_errors.h"
 #include "core/user_settings.h"
 #include "imgui/renderer/imgui_core.h"
@@ -16,10 +17,22 @@
 #include "pad.h"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <array>
 #include <optional>
 
 namespace Libraries::Pad {
+
+// (bb-rumble-143) one info line the first time the game calls each pad function, so a log shows
+// the game's whole pad API use (several are debug / trace only).
+#define PAD_FIRST_CALL()                                                                         \
+    do {                                                                                         \
+        static std::atomic<bool> first_call_logged_{false};                                      \
+        if (!first_call_logged_.exchange(true)) {                                                \
+            LOG_INFO(Lib_Pad, "[pad-api] first call: {}", __func__);                             \
+        }                                                                                        \
+    } while (0)
 
 using Input::GameController;
 using Input::GameControllers;
@@ -47,6 +60,7 @@ static std::unordered_map<HandleKey, s32, HandleKeyHash> pad_handle_map{};
 static std::unordered_map<s32, GameController*> handle_to_controller_map{};
 
 int PS4_SYSV_ABI scePadClose(s32 handle) {
+    PAD_FIRST_CALL();
     LOG_WARNING(Lib_Pad, "called, handle: {}", handle);
     if (handle_to_controller_map.erase(handle) == 0) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
@@ -61,12 +75,14 @@ int PS4_SYSV_ABI scePadClose(s32 handle) {
 }
 
 int PS4_SYSV_ABI scePadConnectPort() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadDeviceClassGetExtendedInformation(
     s32 handle, OrbisPadDeviceClassExtendedInformation* pExtInfo) {
+    PAD_FIRST_CALL();
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
@@ -81,61 +97,73 @@ int PS4_SYSV_ABI scePadDeviceClassGetExtendedInformation(
 
 int PS4_SYSV_ABI scePadDeviceClassParseData(s32 handle, const OrbisPadData* pData,
                                             OrbisPadDeviceClassData* pDeviceClassData) {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadDeviceOpen() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadDisableVibration() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadDisconnectDevice() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadDisconnectPort() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadEnableAutoDetect() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadEnableExtensionPort() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadEnableSpecificDeviceClass() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadEnableUsbConnection() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetBluetoothAddress() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetCapability() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetControllerInformation(s32 handle, OrbisPadControllerInformation* pInfo) {
+    PAD_FIRST_CALL();
     LOG_DEBUG(Lib_Pad, "called handle = {}", handle);
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
@@ -160,43 +188,56 @@ int PS4_SYSV_ABI scePadGetControllerInformation(s32 handle, OrbisPadControllerIn
     }
     LOG_DEBUG(Lib_Pad, "c: {} cc: {}, ct: {}, dc: {}", pInfo->connected, pInfo->connectedCount,
               pInfo->connectionType, std::to_underlying(pInfo->deviceClass));
+    static std::atomic<int> info_logged{0}; // (bb-rumble-143) what the game is told
+    if (info_logged.fetch_add(1) < 3) {
+        LOG_INFO(Lib_Pad, "[pad] controller info handle {}: connected {} count {} type {} class {}",
+                 handle, pInfo->connected, pInfo->connectedCount, pInfo->connectionType,
+                 std::to_underlying(pInfo->deviceClass));
+    }
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetDataInternal() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetDeviceId() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetDeviceInfo() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetExtControllerInformation(s32 handle,
                                                    OrbisPadExtendedControllerInformation* pInfo) {
+    PAD_FIRST_CALL();
     LOG_INFO(Lib_Pad, "called handle = {}", handle);
     std::memset(pInfo, 0, sizeof(OrbisPadExtendedControllerInformation));
     return scePadGetControllerInformation(handle, &pInfo->base);
 }
 
 int PS4_SYSV_ABI scePadGetExtensionUnitInfo() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetFeatureReport() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetHandle(Libraries::UserService::OrbisUserServiceUserId userId, s32 type,
                                  s32 index) {
+    PAD_FIRST_CALL();
     if (!g_initialized) {
         return ORBIS_PAD_ERROR_NOT_INITIALIZED;
     }
@@ -213,11 +254,13 @@ int PS4_SYSV_ABI scePadGetHandle(Libraries::UserService::OrbisUserServiceUserId 
 }
 
 int PS4_SYSV_ABI scePadGetIdleCount() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetInfo(OrbisPadInfo* data) {
+    PAD_FIRST_CALL();
     LOG_WARNING(Lib_Pad, "(DUMMY) called");
     if (!data) {
         return ORBIS_PAD_ERROR_INVALID_ARG;
@@ -233,83 +276,99 @@ int PS4_SYSV_ABI scePadGetInfo(OrbisPadInfo* data) {
 }
 
 int PS4_SYSV_ABI scePadGetInfoByPortType() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetLicenseControllerInformation() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetMotionSensorPosition() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetMotionTimerUnit() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetSphereRadius() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadGetVersionInfo() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadInit() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     g_initialized = true;
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadIsBlasterConnected() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadIsDS4Connected() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadIsLightBarBaseBrightnessControllable() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadIsMoveConnected() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadIsMoveReproductionModel() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadIsValidHandle() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadMbusInit() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadMbusTerm() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadOpen(Libraries::UserService::OrbisUserServiceUserId userId, s32 type,
                             s32 index, const OrbisPadOpenParam* pParam) {
+    PAD_FIRST_CALL();
     if (!g_initialized) {
         return ORBIS_PAD_ERROR_NOT_INITIALIZED;
     }
@@ -354,16 +413,19 @@ int PS4_SYSV_ABI scePadOpen(Libraries::UserService::OrbisUserServiceUserId userI
 
 int PS4_SYSV_ABI scePadOpenExt(Libraries::UserService::OrbisUserServiceUserId userId, s32 type,
                                s32 index, const OrbisPadOpenExtParam* pParam) {
+    PAD_FIRST_CALL();
     LOG_WARNING(Lib_Pad, "Redirect to scePadOpen");
     return scePadOpen(userId, type, index, nullptr);
 }
 
 int PS4_SYSV_ABI scePadOpenExt2() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadOutputReport() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -433,6 +495,7 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
 }
 
 int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
+    PAD_FIRST_CALL();
     LOG_TRACE(Lib_Pad, "called");
     BB::Metrics::OnInput();
     BB::AntiLag::OnInput("scePadRead");
@@ -451,37 +514,44 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadReadExt() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadReadForTracker() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadReadHistory() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
+    PAD_FIRST_CALL();
     LOG_TRACE(Lib_Pad, "handle: {}", handle);
     const int result = scePadRead(handle, pData, 1);
     return result < 0 ? result : ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadReadStateExt() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadResetLightBar(s32 handle) {
+    PAD_FIRST_CALL();
     LOG_DEBUG(Lib_Pad, "called, handle: {}", handle);
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
@@ -502,16 +572,19 @@ int PS4_SYSV_ABI scePadResetLightBar(s32 handle) {
 }
 
 int PS4_SYSV_ABI scePadResetLightBarAll() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadResetLightBarAllByPortType() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadResetOrientation(s32 handle) {
+    PAD_FIRST_CALL();
     LOG_INFO(Lib_Pad, "scePadResetOrientation called handle = {}", handle);
 
     auto it = handle_to_controller_map.find(handle);
@@ -525,51 +598,61 @@ int PS4_SYSV_ABI scePadResetOrientation(s32 handle) {
 }
 
 int PS4_SYSV_ABI scePadResetOrientationForTracker() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetAngularVelocityBiasCorrectionState() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetAngularVelocityDeadbandState(s32 handle, bool bEnable) {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetAutoPowerOffCount() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetButtonRemappingInfo() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetConnection() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetExtensionReport() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetFeatureReport() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetForceIntercepted() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetLightBar(s32 handle, const OrbisPadLightBarParam* pParam) {
+    PAD_FIRST_CALL();
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
@@ -592,16 +675,19 @@ int PS4_SYSV_ABI scePadSetLightBar(s32 handle, const OrbisPadLightBarParam* pPar
 }
 
 int PS4_SYSV_ABI scePadSetLightBarBaseBrightness() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetLightBarBlinking() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetLightBarForTracker(s32 handle, const OrbisPadLightBarParam* pParam) {
+    PAD_FIRST_CALL();
     LOG_INFO(Lib_Pad, "called, r: {} g: {} b: {}", pParam->r, pParam->g, pParam->b);
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
@@ -613,11 +699,13 @@ int PS4_SYSV_ABI scePadSetLightBarForTracker(s32 handle, const OrbisPadLightBarP
 }
 
 int PS4_SYSV_ABI scePadSetLoginUserNumber() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetMotionSensorState(s32 handle, bool bEnable) {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
     // it's already handled by the SDL backend and will be on no matter what
@@ -625,44 +713,79 @@ int PS4_SYSV_ABI scePadSetMotionSensorState(s32 handle, bool bEnable) {
 }
 
 int PS4_SYSV_ABI scePadSetProcessFocus() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetProcessPrivilege() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetProcessPrivilegeOfButtonRemapping() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetShareButtonMaskForRemotePlay() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetTiltCorrectionState(s32 handle, bool bEnable) {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetUserColor() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetVibration(s32 handle, const OrbisPadVibrationParam* pParam) {
+    PAD_FIRST_CALL();
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
+        static std::atomic<int> bad_logged{0};
+        if (bad_logged.fetch_add(1) < 5) {
+            LOG_WARNING(Lib_Pad, "[pad] scePadSetVibration on unknown handle {}", handle);
+        }
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
     auto& controller = *it->second;
     if (pParam != nullptr) {
         LOG_DEBUG(Lib_Pad, "scePadSetVibration called handle = {} data = {} , {}", handle,
                   pParam->smallMotor, pParam->largeMotor);
+        // (bb-rumble-143) per-second rumble stats: calls, non-zero calls, peak values
+        {
+            static std::mutex vib_m;
+            static u64 vib_t0 = 0, vib_sec = 0;
+            static u32 vib_calls = 0, vib_nz = 0;
+            static u8 vib_max_l = 0, vib_max_s = 0;
+            std::lock_guard lk{vib_m};
+            const u64 now = Libraries::Kernel::sceKernelGetProcessTime() / 1000000;
+            if (vib_t0 == 0) vib_t0 = now + 1;
+            if (now != vib_sec) {
+                // every second with a non-zero command, plus the first 10 s of the stream
+                if (vib_calls && (vib_nz || now - vib_t0 < 10)) {
+                    LOG_INFO(Lib_Pad,
+                             "[pad] scePadSetVibration last second: {} calls, {} non-zero, peak "
+                             "large {} small {}, handle {}",
+                             vib_calls, vib_nz, vib_max_l, vib_max_s, handle);
+                }
+                vib_sec = now, vib_calls = vib_nz = 0, vib_max_l = vib_max_s = 0;
+            }
+            ++vib_calls;
+            if (pParam->largeMotor || pParam->smallMotor) ++vib_nz;
+            vib_max_l = std::max(vib_max_l, pParam->largeMotor);
+            vib_max_s = std::max(vib_max_s, pParam->smallMotor);
+        }
         controller.SetVibration(pParam->smallMotor, pParam->largeMotor);
         return ORBIS_OK;
     }
@@ -670,61 +793,73 @@ int PS4_SYSV_ABI scePadSetVibration(s32 handle, const OrbisPadVibrationParam* pP
 }
 
 int PS4_SYSV_ABI scePadSetVibrationForce() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSetVrTrackingMode() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadShareOutputData() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadStartRecording() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadStopRecording() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadSwitchConnection() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadVertualDeviceAddDevice() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadVirtualDeviceAddDevice() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadVirtualDeviceDeleteDevice() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadVirtualDeviceDisableButtonRemapping() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadVirtualDeviceGetRemoteSetting() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadVirtualDeviceInsertData() {
+    PAD_FIRST_CALL();
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
     return ORBIS_OK;
 }
