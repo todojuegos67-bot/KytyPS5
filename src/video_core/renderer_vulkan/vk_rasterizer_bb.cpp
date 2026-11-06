@@ -1254,6 +1254,61 @@ bool Rasterizer::BBInject(VideoCore::ImageId color_id, const VideoCore::ImageVie
         !BBRecordUpscale(color.GetImage(), color_view, in_format, color.usage_flags)) {
         return false;
     }
+    // 1.27 (bb-dlaa-127): native AA (render == output) writes the DLAA result back into the
+    // scene colour itself. Before, only later *sampled* reads of the source were redirected to
+    // the upscaler's output; storage-image reads (compute post-processing: bloom / DoF / tone
+    // map passes), copies and the game's own reads of last frame's colour still got the raw,
+    // jittered image: no anti-aliasing visible and a sub-pixel tremble, fine only on the
+    // phases near zero. With the copy every reader sees the resolved image.
+    // BB_INPLACE_WRITEBACK=0: the old redirect-only behaviour.
+    static const bool writeback = [] {
+        const char* v = std::getenv("BB_INPLACE_WRITEBACK");
+        return v == nullptr || v[0] != '0';
+    }();
+    static u64 wb_done = 0, wb_skipped = 0;
+    const bool same = plan.render_w == plan.output_w && plan.render_h == plan.output_h &&
+                      g_bb.output.image && g_bb.output.extent.width == plan.output_w &&
+                      g_bb.output.extent.height == plan.output_h &&
+                      color.info.pixel_format == g_bb.output.format &&
+                      (color.usage_flags & vk::ImageUsageFlagBits::eTransferDst);
+    if (writeback && same) {
+        scheduler.EndRendering();
+        runtime.Transit(&color, vk::ImageLayout::eTransferDstOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer,
+                        vk::AccessFlagBits2::eTransferWrite);
+        runtime.FlushBarriers();
+        const auto cmd = scheduler.CommandBuffer();
+        Barrier(cmd, g_bb.output, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        const vk::ImageCopy region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .extent = {plan.output_w, plan.output_h, 1},
+        };
+        cmd.copyImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, color.GetImage(),
+                      vk::ImageLayout::eTransferDstOptimal, region);
+        Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+                vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eShaderRead);
+        runtime.Transit(&color, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
+        ++wb_done;
+    } else if (plan.render_w == plan.output_w && plan.render_h == plan.output_h) {
+        ++wb_skipped;
+    }
+    if ((wb_done + wb_skipped) % 600 == 1) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "[taa-stab] 1.27 in-place write-back of the DLAA result into the scene colour {:#x} "
+            "{}x{} {}: {} done, {} skipped (writeback {}, format {} vs output {}, transfer-dst {})",
+            color.info.guest_address, color.info.size.width, color.info.size.height,
+            vk::to_string(color.info.pixel_format), wb_done, wb_skipped,
+            writeback ? "on" : "off (BB_INPLACE_WRITEBACK=0)",
+            vk::to_string(color.info.pixel_format), vk::to_string(g_bb.output.format),
+            (color.usage_flags & vk::ImageUsageFlagBits::eTransferDst) ? "yes" : "no"));
+    }
     return BBUpscaledView(view_info, out_view, out_layout);
 }
 
@@ -3077,6 +3132,11 @@ struct DumpState {
     bool done = false;
     std::vector<VideoCore::ImageId> last_targets;
     u32 pass = 0;
+    // 1.29 (bb-aacap-129) AA-pass capture: the draw / dispatch list (shader hashes, targets,
+    // sampled images) of 8 gameplay frames, no images. bb_aa_capture.txt or BB_AA_CAPTURE=1.
+    bool cap = false;
+    u32 cap_done = 0;
+    u64 cap_frame = 0;
 } g_dump;
 
 u32 DumpBpp(vk::Format f) {
@@ -3180,6 +3240,24 @@ void WriteDump(DumpEntry& e) {
 
 bool DumpActive() {
     if (g_dump.frame == -2) {
+        const char* cv = std::getenv("BB_AA_CAPTURE");
+        g_dump.cap = cv != nullptr && *cv == '1';
+        if (!g_dump.cap) {
+            std::error_code ec;
+            for (const std::filesystem::path dir :
+                 {std::filesystem::current_path(ec), std::filesystem::path("C:/EMULADOR PS4")}) {
+                const auto trigger = dir / "bb_aa_capture.txt";
+                if (dir.empty() || !std::filesystem::exists(trigger, ec)) continue;
+                g_dump.cap = true;
+                std::filesystem::rename(trigger, dir / "bb_aa_capture.used.txt", ec);
+                break;
+            }
+        }
+        if (g_dump.cap) {
+            BB::Upscale::Checkpoint(
+                "[aacap] AA-pass capture on: every draw / dispatch (shader hashes, targets, "
+                "sampled images) of 8 3D frames, about 15 s apart from 30 s in, no images");
+        }
         const char* v = std::getenv("BB_DUMP_FRAME");
         g_dump.frame = (v != nullptr && *v != '\0') ? std::max<s64>(0, std::atoll(v)) : -1;
         const char* d = std::getenv("BB_DUMP_DIR");
@@ -3237,6 +3315,26 @@ bool DumpActive() {
         std::error_code ec;
         std::filesystem::create_directories(g_dump.dir, ec);
     }
+    if (g_dump.cap && g_dump.cap_done < 8) {
+        const u64 fno = BB::Upscale::FrameNumber();
+        if (g_dump.cap_frame != 0 && fno == g_dump.cap_frame) return true;
+        if (g_dump.cap_frame != 0 && fno > g_dump.cap_frame) {
+            BB::Upscale::Checkpoint(fmt::format("[aacap] frame {} captured ({} of 8, {} lines)",
+                                                g_dump.cap_frame, g_dump.cap_done + 1,
+                                                g_dump.lines));
+            ++g_dump.cap_done;
+            g_dump.cap_frame = 0;
+        }
+        // A 3D gameplay frame (the last flip was upscaled), from 30 s in, every ~15 s.
+        if (g_dump.cap_frame == 0 && g_dump.cap_done < 8 && fno >= 1800 && fno % 900 == 0 &&
+            BB::Upscale::LastFrameUpscaled()) {
+            g_dump.cap_frame = fno;
+            g_dump.lines = 0;
+            BB::Upscale::Checkpoint(fmt::format("[aacap] capturing frame {}", fno));
+            return true;
+        }
+        return false;
+    }
     return g_dump.frame >= 0 && !g_dump.done &&
            BB::Upscale::FrameNumber() == static_cast<u64>(g_dump.frame);
 }
@@ -3249,11 +3347,11 @@ bool Rasterizer::BBDumpOn() {
 void Rasterizer::BBDumpLog(const std::string& line) {
     if (!DumpActive() || g_dump.lines >= 4000) return;
     ++g_dump.lines;
-    BB::Upscale::Checkpoint("[dump] " + line);
+    BB::Upscale::Checkpoint((g_dump.cap ? "[aacap] " : "[dump] ") + line);
 }
 
 void Rasterizer::BBDumpImage(VideoCore::Image& image, const std::string& what) {
-    if (!InitOnce(instance) || g_dump.entries.size() >= 160 || g_dump.bytes > (1500ull << 20)) {
+    if (g_dump.cap || !InitOnce(instance) || g_dump.entries.size() >= 160 || g_dump.bytes > (1500ull << 20)) {
         return;
     }
     const vk::Format f = image.info.pixel_format;
@@ -3300,7 +3398,7 @@ void Rasterizer::BBDumpImage(VideoCore::Image& image, const std::string& what) {
 }
 
 void Rasterizer::BBDumpPass(std::span<const VideoCore::ImageId> targets, const std::string& desc) {
-    if (g_dump.frame == -1 && BB::Upscale::DumpRequest() == 0) return;
+    if (g_dump.frame == -1 && !g_dump.cap && BB::Upscale::DumpRequest() == 0) return;
     if (!DumpActive()) {
         if (g_dump.frame >= 0 && !g_dump.done && !g_dump.entries.empty() &&
             BB::Upscale::FrameNumber() > static_cast<u64>(g_dump.frame)) {

@@ -148,7 +148,8 @@ void OnVertexConstants(const void* data, size_t size);
 enum class Sample { Keep, Inject, Redirect };
 Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format);
 // The current draw is a scene draw to jitter: the offset in pixels.
-bool Jitter(float& x, float& y);
+// 1.27: fullscreen = a full-screen pass (no depth write, <= 6 vertices): never jittered.
+bool Jitter(float& x, float& y, bool fullscreen = false);
 // 0.79 [taa]: what the upscaler is told (per-SDK sign), and the "[taa] jitter applied ..." line at the
 // first dispatch and every 600th.
 void TaaPass(const float (&applied)[2], bool camera_valid, float (&passed)[2]);
