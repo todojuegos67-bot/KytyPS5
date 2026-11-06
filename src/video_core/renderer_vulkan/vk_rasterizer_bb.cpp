@@ -26,6 +26,7 @@
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/host_shaders/bb_alpha_comp.h"
+#include "video_core/host_shaders/bb_flatcheck_comp.h"
 #include "video_core/host_shaders/bb_hud_comp.h"
 #include "video_core/host_shaders/bb_hudless_lut_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
@@ -3659,6 +3660,7 @@ struct HsCanvas {
     vk::Extent2D extent{};
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     bool depth = false;
+    bool storage = false;
     std::vector<std::pair<u64, vk::ImageView>> views;
 };
 struct HsState {
@@ -3695,6 +3697,23 @@ struct HsState {
     // Per second: guarded presents by reason, repeats / black, unguardable, FG pairs skipped.
     std::array<u32, 4> f_reason{};
     u32 f_repeat = 0, f_black = 0, f_fail = 0, f_fg_skip = 0;
+    // 1.42: the GPU content check of every presented canvas (bb_flatcheck.comp): the image
+    // actually presented (pres = canvas, or the last presented frame when the canvas' scene
+    // region is flat), its counters in a host-visible buffer (read for the per-second line).
+    HsCanvas pres;
+    bool fc_init = false, fc_failed = false;
+    vk::DescriptorSetLayout fc_set_layout{};
+    vk::PipelineLayout fc_layout{};
+    vk::Pipeline fc_pipeline{};
+    vk::Sampler fc_sampler{};
+    vk::Buffer fc_buffer{};
+    VmaAllocation fc_alloc{};
+    u32* fc_mapped = nullptr;
+    std::array<u32, 4> fc_prev{}; // checked, rejected (last), rejected (black), accepted flat
+    u32 fc_unchecked = 0;          // per second: canvases presented without the check
+    // 1.42 diagnostics: "other image" presents (canvas live, the flip has no recent canvas).
+    u32 d_other_logged = 0;
+    u64 begin_pcount = 0;
 };
 HsState g_hs;
 constexpr std::array<const char*, 4> kGuardReason{
@@ -3722,8 +3741,11 @@ void HsDestroy(HsCanvas& c) {
     c.layout = vk::ImageLayout::eUndefined;
 }
 
-bool HsEnsure(HsCanvas& c, vk::Extent2D extent, vk::Format format, bool depth) {
-    if (c.image && c.extent == extent && c.format == format && c.depth == depth) return true;
+bool HsEnsure(HsCanvas& c, vk::Extent2D extent, vk::Format format, bool depth,
+              bool storage = false) {
+    if (c.image && c.extent == extent && c.format == format && c.depth == depth &&
+        c.storage == storage)
+        return true;
     if (c.image) {
         (void)g_bb.device.waitIdle();
         HsDestroy(c);
@@ -3731,9 +3753,13 @@ bool HsEnsure(HsCanvas& c, vk::Extent2D extent, vk::Format format, bool depth) {
     const vk::ImageUsageFlags usage =
         (depth ? vk::ImageUsageFlagBits::eDepthStencilAttachment
                : vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled) |
-        vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
+        vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
+        (storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags{});
     const VkImageCreateInfo ci = vk::ImageCreateInfo{
-        .flags = depth ? vk::ImageCreateFlags{} : vk::ImageCreateFlagBits::eMutableFormat,
+        .flags = depth     ? vk::ImageCreateFlags{}
+                 : storage ? vk::ImageCreateFlagBits::eMutableFormat |
+                                 vk::ImageCreateFlagBits::eExtendedUsage
+                           : vk::ImageCreateFlagBits::eMutableFormat,
         .imageType = vk::ImageType::e2D,
         .format = format,
         .extent = {extent.width, extent.height, 1},
@@ -3756,6 +3782,7 @@ bool HsEnsure(HsCanvas& c, vk::Extent2D extent, vk::Format format, bool depth) {
     c.format = format;
     c.extent = extent;
     c.depth = depth;
+    c.storage = storage;
     c.layout = vk::ImageLayout::eUndefined;
     return true;
 }
@@ -3770,6 +3797,7 @@ vk::ImageView HsView(HsCanvas& c, vk::Format format, u32 kind) {
     const vk::ImageViewUsageCreateInfo use{
         .usage = c.depth       ? vk::ImageUsageFlagBits::eDepthStencilAttachment
                  : kind == 0 ? vk::ImageUsageFlagBits::eColorAttachment
+                 : kind == 3 ? vk::ImageUsageFlagBits::eStorage
                              : vk::ImageUsageFlagBits::eSampled};
     vk::ComponentMapping components{};
     if (kind == 1) components.a = vk::ComponentSwizzle::eOne;
@@ -3928,6 +3956,7 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
     }
     HsBarrier(cmd, g_hs.a, vk::ImageLayout::eColorAttachmentOptimal);
     g_hs.live = true;
+    g_hs.begin_pcount = g_hs.pcount;
     g_hs.want_fg = want_fg;
     g_hs.target = flip.info.guest_address;
     g_hs.render = render;
@@ -4184,6 +4213,201 @@ bool HsGuard(vk::CommandBuffer cmd, VideoCore::Image& flip, vk::Format view_form
     return true;
 }
 
+// 1.42: the content check pipeline (bb_flatcheck.comp).
+bool HsFcInit() {
+    if (g_hs.fc_init || g_hs.fc_failed) return g_hs.fc_init;
+    g_hs.fc_failed = true;
+    const auto device = g_bb.device;
+    const std::array bindings{
+        vk::DescriptorSetLayoutBinding{.binding = 0,
+                                       .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                       .descriptorCount = 1,
+                                       .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 1,
+                                       .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                       .descriptorCount = 1,
+                                       .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 2,
+                                       .descriptorType = vk::DescriptorType::eStorageImage,
+                                       .descriptorCount = 1,
+                                       .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 3,
+                                       .descriptorType = vk::DescriptorType::eStorageBuffer,
+                                       .descriptorCount = 1,
+                                       .stageFlags = vk::ShaderStageFlagBits::eCompute},
+    };
+    auto [sr, sl] = device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    });
+    if (sr != vk::Result::eSuccess) return false;
+    g_hs.fc_set_layout = sl;
+    const vk::PushConstantRange push{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = 16};
+    auto [lr, layout] = device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
+        .setLayoutCount = 1,
+        .pSetLayouts = &g_hs.fc_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    });
+    if (lr != vk::Result::eSuccess) return false;
+    g_hs.fc_layout = layout;
+    const auto module = CompileSPV(BB_FLATCHECK_COMP, device);
+    if (!module) return false;
+    auto [pr, pipeline] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage = vk::PipelineShaderStageCreateInfo{.stage = vk::ShaderStageFlagBits::eCompute,
+                                                           .module = module,
+                                                           .pName = "main"},
+                .layout = g_hs.fc_layout,
+            });
+    device.destroyShaderModule(module);
+    if (pr != vk::Result::eSuccess) return false;
+    g_hs.fc_pipeline = pipeline;
+    auto [smr, sampler] = device.createSampler(vk::SamplerCreateInfo{
+        .magFilter = vk::Filter::eNearest,
+        .minFilter = vk::Filter::eNearest,
+        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+    });
+    if (smr != vk::Result::eSuccess) return false;
+    g_hs.fc_sampler = sampler;
+    const VkBufferCreateInfo bci = vk::BufferCreateInfo{
+        .size = 64, .usage = vk::BufferUsageFlagBits::eStorageBuffer};
+    VmaAllocationCreateInfo alloc{};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    alloc.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    alloc.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkBuffer buffer{};
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(g_bb.allocator, &bci, &alloc, &buffer, &g_hs.fc_alloc, &info) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    g_hs.fc_buffer = buffer;
+    g_hs.fc_mapped = static_cast<u32*>(info.pMappedData);
+    std::memset(g_hs.fc_mapped, 0, 64);
+    g_hs.fc_failed = false;
+    g_hs.fc_init = true;
+    return true;
+}
+
+bool HsFcFormat(vk::Format f) {
+    return f == vk::Format::eR8G8B8A8Unorm || f == vk::Format::eR8G8B8A8Srgb ||
+           f == vk::Format::eB8G8R8A8Unorm || f == vk::Format::eB8G8R8A8Srgb;
+}
+
+// 1.42: the canvas about to be presented goes through bb_flatcheck.comp into g_hs.pres (the
+// canvas itself, or the last presented frame / black when its scene region is flat grey), and
+// pres is copied as the new last-presented frame. Returns the image to present, or nullptr when
+// the check cannot run (the canvas is then presented as in 1.40).
+HsCanvas* HsContentCheck(vk::CommandBuffer cmd, HsCanvas& c) {
+    if (!HsFcFormat(c.format) || !HsFcInit() ||
+        !HsEnsure(g_hs.pres, c.extent, c.format, false, true)) {
+        ++g_hs.fc_unchecked;
+        return nullptr;
+    }
+    const bool lg_new = !g_hs.lg.image || g_hs.lg.extent != c.extent || g_hs.lg.format != c.format;
+    if (!HsEnsure(g_hs.lg, c.extent, c.format, false)) {
+        ++g_hs.fc_unchecked;
+        return nullptr;
+    }
+    if (lg_new) {
+        g_hs.lg_ok = false;
+        g_hs.fc_mapped[2] = 0; // no valid last frame on the GPU side either (read next dispatch)
+    }
+    constexpr vk::Format kRaw = vk::Format::eR8G8B8A8Unorm;
+    const vk::ImageView cur = HsView(c, kRaw, 2);
+    const vk::ImageView last = HsView(g_hs.lg, kRaw, 2);
+    const vk::ImageView out = HsView(g_hs.pres, kRaw, 3);
+    if (!cur || !last || !out) {
+        ++g_hs.fc_unchecked;
+        return nullptr;
+    }
+    HsBarrier(cmd, c, vk::ImageLayout::eShaderReadOnlyOptimal);
+    if (g_hs.lg.layout == vk::ImageLayout::eUndefined) {
+        HsBarrier(cmd, g_hs.lg, vk::ImageLayout::eTransferDstOptimal);
+        cmd.clearColorImage(g_hs.lg.image, vk::ImageLayout::eTransferDstOptimal,
+                            vk::ClearColorValue{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}},
+                            vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+    }
+    HsBarrier(cmd, g_hs.lg, vk::ImageLayout::eShaderReadOnlyOptimal);
+    g_hs.pres.layout = vk::ImageLayout::eUndefined; // overwritten whole
+    HsBarrier(cmd, g_hs.pres, vk::ImageLayout::eGeneral);
+    const vk::DescriptorImageInfo cur_info{g_hs.fc_sampler, cur,
+                                           vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo last_info{g_hs.fc_sampler, last,
+                                            vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo out_info{{}, out, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo buf_info{g_hs.fc_buffer, 0, 64};
+    const std::array writes{
+        vk::WriteDescriptorSet{.dstBinding = 0,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &cur_info},
+        vk::WriteDescriptorSet{.dstBinding = 1,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &last_info},
+        vk::WriteDescriptorSet{.dstBinding = 2,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &out_info},
+        vk::WriteDescriptorSet{.dstBinding = 3,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = &buf_info},
+    };
+    const vk::MemoryBarrier2 buf_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_hs.fc_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_hs.fc_layout, 0, writes);
+    struct {
+        u32 size[4];
+    } push{{c.extent.width, c.extent.height, 0u, 0u}};
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &buf_barrier});
+    cmd.pushConstants(g_hs.fc_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch(1, 1, 1);
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &buf_barrier});
+    push.size[2] = 1u;
+    cmd.pushConstants(g_hs.fc_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((c.extent.width + 15) / 16, (c.extent.height + 15) / 16, 1);
+    // pres -> the last presented frame, then pres sampled by the presenter.
+    const vk::ImageMemoryBarrier2 to_src{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .oldLayout = vk::ImageLayout::eGeneral,
+        .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = g_hs.pres.image,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                            .pImageMemoryBarriers = &to_src});
+    g_hs.pres.layout = vk::ImageLayout::eTransferSrcOptimal;
+    HsBarrier(cmd, g_hs.lg, vk::ImageLayout::eTransferDstOptimal);
+    cmd.copyImage(g_hs.pres.image, vk::ImageLayout::eTransferSrcOptimal, g_hs.lg.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {c.extent.width, c.extent.height, 1},
+                  });
+    g_hs.lg_ok = true;
+    return &g_hs.pres;
+}
+
 // 1.40: the copy of a canvas that is presented (the image a guarded frame repeats).
 void HsKeepGood(vk::CommandBuffer cmd, HsCanvas& c) {
     if (!HsEnsure(g_hs.lg, c.extent, c.format, false)) {
@@ -4245,11 +4469,25 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
                                        g_hs.f_reason[i]);
                 }
             }
+            std::array<u32, 4> fc{};
+            u32 fc_min = 0, fc_max = 0;
+            if (g_hs.fc_mapped) {
+                const std::array<u32, 4> now_fc{g_hs.fc_mapped[3], g_hs.fc_mapped[4],
+                                                g_hs.fc_mapped[5], g_hs.fc_mapped[6]};
+                for (int i = 0; i < 4; ++i) fc[i] = now_fc[i] - g_hs.fc_prev[i];
+                g_hs.fc_prev = now_fc;
+                fc_min = g_hs.fc_mapped[7];
+                fc_max = g_hs.fc_mapped[8];
+            }
             BB::Upscale::Checkpoint(fmt::format(
                 "[flash-guard] presents {}, guarded {} ({}; repeated last good {}, black {}, "
-                "UNGUARDED {}), FG pairs skipped {}",
+                "UNGUARDED {}), FG pairs skipped {} | content check (GPU): canvases checked {}, "
+                "REJECTED flat scene {} (last frame shown {}, black {}), flat accepted after 30 "
+                "{}, unchecked {}, last scene range rgb {:06x}..{:06x}",
                 g_hs.s_calls, guarded, why.empty() ? std::string("none") : why, g_hs.f_repeat,
-                g_hs.f_black, g_hs.f_fail, g_hs.f_fg_skip));
+                g_hs.f_black, g_hs.f_fail, g_hs.f_fg_skip, fc[0], fc[1] + fc[2], fc[1], fc[2],
+                fc[3], g_hs.fc_unchecked, fc_min, fc_max));
+            g_hs.fc_unchecked = 0;
             g_hs.f_reason = {};
             g_hs.f_repeat = g_hs.f_black = g_hs.f_fail = g_hs.f_fg_skip = 0;
         }
@@ -4328,6 +4566,19 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         if (!redirected_flip && g_hs.consecutive_fail > 30) {
             return false;
         }
+        // 1.42: this frame's HUD point already ran but its final pass has not: the canvas stays
+        // armed for it (1.40 dropped it here, so the rest of the frame went to the guest images).
+        if (g_hs.pcount - g_hs.begin_pcount <= 2) g_hs.live = true;
+        if (g_hs.d_other_logged < 40) {
+            ++g_hs.d_other_logged;
+            LOG_INFO(Render_Vulkan,
+                     "[flash-guard] other image #{}: flip {:#x} (any slot {}), HUD target {:#x}, "
+                     "bi {}, pcount {}, slots {:#x}/{} ok {} | {:#x}/{} ok {} | {:#x}/{} ok {}",
+                     g_hs.d_other_logged, addr, any_slot, g_hs.target, g_hs.bi, g_hs.pcount,
+                     g_hs.bp_addr[0], g_hs.bp_gen[0], g_hs.bp_ok[0], g_hs.bp_addr[1],
+                     g_hs.bp_gen[1], g_hs.bp_ok[1], g_hs.bp_addr[2], g_hs.bp_gen[2],
+                     g_hs.bp_ok[2]);
+        }
         return HsGuard(cmd, flip, view_format, 0, out_view, out_size);
     }
     g_hs.consecutive_fail = 0;
@@ -4336,7 +4587,19 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         HsOff(fmt::format("no {} view of the canvas", vk::to_string(view_format)));
         return HsGuard(cmd, flip, view_format, 3, out_view, out_size);
     }
-    HsKeepGood(cmd, *c);
+    if (HsCanvas* checked = HsContentCheck(cmd, *c)) {
+        // 1.42: the checked image (the canvas, or the last frame when its scene was flat).
+        const vk::ImageView pv = HsView(*checked, view_format, 1);
+        if (pv) {
+            HsBarrier(cmd, *checked, vk::ImageLayout::eShaderReadOnlyOptimal);
+            out_view = pv;
+            c = checked;
+        } else {
+            HsKeepGood(cmd, *c);
+        }
+    } else {
+        HsKeepGood(cmd, *c);
+    }
     HsBarrier(cmd, *c, vk::ImageLayout::eShaderReadOnlyOptimal);
     out_size = c->extent;
     // The upscale was used: the HUD composite does not run this frame.
