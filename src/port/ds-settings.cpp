@@ -1139,6 +1139,17 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			env.Set(Trim(pair.substr(0, eq)), Trim(pair.substr(eq + 1)));
 		}
 	}
+	// (upstream 0c2f4f6b5, issue #294) The game's own stereo mix by default: sound_enableAmbisonics=false (left alone the
+	// game renders a fifth-order ambisonics scene of which the emulator plays the first order: music close to mono). A value
+	// the user gave (settings.ini extra / Ajustes del juego, or the environment's KYTY_GAME_CONVARS[_EXTRA]) is kept.
+	if (demons) {
+		const char* user_extra = std::getenv("KYTY_GAME_CONVARS_EXTRA");
+		const char* user_cv    = std::getenv("KYTY_GAME_CONVARS");
+		const auto  named      = [](const std::string& v) { return v.find("sound_enableAmbisonics") != std::string::npos; };
+		if (!named(env.Get("KYTY_GAME_CONVARS")) && !named(env.Get("KYTY_GAME_CONVARS_EXTRA")) &&
+		    !(user_extra != nullptr && named(user_extra)) && !(user_cv != nullptr && named(user_cv)))
+			env.AppendConvars("sound_enableAmbisonics=false");
+	}
 	// (10-21) KYTY_DS_VARIABLE_STEP=1: the game's physics at each frame's real time (run-windows.ps1).
 	if (demons && env.Get("KYTY_DS_VARIABLE_STEP") == "1" && env.Get("KYTY_GAME_CONVARS").find("physicsUseFixedTimestep") == std::string::npos)
 		env.AppendConvars("physicsUseFixedTimestep=false;gameDeltaTimeCorrectionTolorance=0.01");
