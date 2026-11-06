@@ -3629,7 +3629,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 
 bool UpscalerReady() {
 	if (g_sr_kind == 2) return Xess::Ready();
-	if (g_sr_kind == 3) return Fsr3::SrReady();
+	if (g_sr_kind == 3) return Fsr3::SrReady() || Fsr4::Ready(); // (FSR 4.1 / 3.1, or our FSR 4.0 as the fallback)
 	if (g_sr_kind == 4) return Fsr4::Ready();
 	return g_upscale_ready;
 }
@@ -3672,7 +3672,8 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		x.mv_scale[1] = inputs.motion_scale_y;
 		if (have_reactive) x.mask = &reactive, x.mask_view = inputs.reactive.view;
 		done          = Xess::Upscale(x);
-	} else if (g_sr_kind == 4 && g_graphics_ctx != nullptr) {
+	}
+	const auto fsr4 = [&] {
 		// AMD FSR 4 (fsr4-sr.cpp): our runtime of the v07 INT8 model, its RCAS included.
 		Fsr4::UpscaleDesc f;
 		f.graphics       = g_graphics_ctx;
@@ -3700,8 +3701,9 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		f.exposure_base   = inputs.exposure_base;
 		f.exposure_range  = inputs.exposure_range;
 		f.exposure_index  = inputs.exposure_index;
-		done             = Fsr4::Upscale(*g_graphics_ctx, f);
-	} else if (g_graphics_ctx != nullptr) {
+		return Fsr4::Upscale(*g_graphics_ctx, f);
+	};
+	const auto fsr3 = [&] {
 		static auto last = std::chrono::steady_clock::now();
 		const auto  now  = std::chrono::steady_clock::now();
 		const float delta = std::chrono::duration<float, std::milli>(now - last).count();
@@ -3722,13 +3724,70 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		desc.mv_scale[1] = inputs.motion_scale_y;
 		desc.fov         = fov;
 		desc.z_near      = inputs.near_plane;
-		done             = Fsr3::Upscale(*g_graphics_ctx, desc);
+		return Fsr3::Upscale(*g_graphics_ctx, desc);
+	};
+	if (g_sr_kind == 4 && g_graphics_ctx != nullptr) {
+		done = fsr4();
+	} else if (g_sr_kind == 3 && g_graphics_ctx != nullptr) {
+		// (des-upstream-1106b) FSR: AMD's FSR 4.1 (SDK 2.4 runtime, Radeon) -> our FSR 4.0 (fsr4_shaders, any GPU with
+		// INT8 / DOT4) -> FSR 3.1 only when our FSR 4.0 does not start either. KYTY_FSR41=0: no 4.1;
+		// KYTY_FSR40_FALLBACK=0: no 4.0 (Fsr4::SrPathWanted false).
+		enum Route { Undecided, Amd, Ours, Fsr31 };
+		static Route route = Undecided;
+		const auto   to_31 = [&](const char* why) {
+            route = Fsr31;
+            Fsr3::AllowFsr31(true);
+            Fsr3::SetUpscalerName("FSR 3.1");
+            std::printf("FSR: FSR 3.1 chosen (%s)\n", why);
+            std::fflush(stdout);
+		};
+		if (route == Undecided) {
+			if (!Fsr4::SrPathWanted()) {
+				Fsr3::AllowFsr31(true); // (KYTY_FSR40_FALLBACK=0: AMD's runtime alone, 4.1 or 3.1)
+				route = Amd;
+			} else {
+				Fsr3::AllowFsr31(false);
+				done = Fsr3::SrReady() && fsr3();
+				if (done) {
+					route = Amd;
+					std::printf("FSR: %s chosen (AMD's FSR SDK 2.4 runtime on this GPU)\n", Fsr3::UpscalerName());
+					std::fflush(stdout);
+				} else if (!Fsr3::SrReady() || Fsr3::Fsr41Unavailable()) {
+					const char* why = !Fsr3::SrReady() ? "AMD's FidelityFX runtime not loaded" : std::getenv("KYTY_FSR41") != nullptr &&
+					                                                                             std::string(std::getenv("KYTY_FSR41")) == "0"
+					                                                                         ? "KYTY_FSR41=0"
+					                                                                         : "AMD's FSR 4.1 runtime not available on this GPU";
+					if (Fsr4::Ready()) {
+						route = Ours;
+						Fsr3::SetUpscalerName("FSR 4.0");
+						std::printf("FSR: FSR 4.0 chosen (ours, fsr4_shaders: %s)\n", why);
+						std::fflush(stdout);
+					} else {
+						to_31("no FSR 4.1 here and our FSR 4.0 did not start: see the FSR 4 lines above");
+					}
+				} else {
+					route = Amd; // (4.1 made, its dispatch failed this frame)
+				}
+			}
+			if (route == Ours) {
+				done = fsr4();
+				if (!done) to_31("our FSR 4.0 failed its first frame");
+			}
+			if (route == Fsr31 || (route == Amd && !done && !Fsr4::SrPathWanted())) done = fsr3();
+		} else if (route == Amd) {
+			done = fsr3();
+			if (!done && Fsr3::Fsr41Unavailable()) route = Undecided; // (a new size and no 4.1 for it: chosen again)
+		} else if (route == Ours) {
+			done = fsr4();
+		} else {
+			done = fsr3();
+		}
 	}
 	static bool said = false;
 	if (!said) {
 		said = true;
 		std::printf("Super resolution (PS5 Pro path): %s %ux%u -> %ux%u%s\n",
-		            g_sr_kind == 2 ? "XeSS" : g_sr_kind == 4 ? Fsr4::Name() : Fsr3::UpscalerName(),
+		            g_sr_kind == 2 ? "XeSS" : g_sr_kind == 4 ? Fsr4::Name() : std::string(Fsr3::UpscalerName()) == "FSR 4.0" ? "FSR 4.0 (ours, fsr4_shaders)" : Fsr3::UpscalerName(),
 		            inputs.color.extent.width, inputs.color.extent.height, inputs.output.extent.width,
 		            inputs.output.extent.height, done ? "" : " (failed: stretched)");
 		std::fflush(stdout);
@@ -9782,7 +9841,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	}
 	// The sharpening on the display-size image where there is one (else the game's output), measured (SharpenProbeDue).
 	const auto& target = mid_image != nullptr ? up.output : inputs.output;
-	const char* name   = g_sr_kind == 1 ? "DLSS" : g_sr_kind == 2 ? "XeSS" : g_sr_kind == 3 ? "FSR 3.1" : "FSR 4";
+	const char* name   = g_sr_kind == 1 ? "DLSS" : g_sr_kind == 2 ? "XeSS" : g_sr_kind == 3 ? Fsr3::UpscalerName() : "FSR 4";
 	char where[128];
 	std::snprintf(where, sizeof(where), "at %ux%u (%s)", target.extent.width, target.extent.height,
 	              mid_image != nullptr ? "the display's size" : "the game's output");

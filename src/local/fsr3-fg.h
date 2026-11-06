@@ -53,6 +53,11 @@ void OnDevice(GraphicContext& graphics, const QueuePlan& plan);
 // (amd_fidelityfx_loader_vk.dll + amd_fidelityfx_upscaler_vk.dll next to the emulator) created it with its 4.1.x
 // provider; else "FSR 3.1" (the patched amd_fidelityfx_vk.dll, or SDK 2.4's 3.1 provider). KYTY_FSR41=0: never 4.1.
 [[nodiscard]] const char* UpscalerName();
+// (des-upstream-1106b) The FSR choice FSR 4.1 -> our FSR 4.0 (fsr4-sr.cpp) -> FSR 3.1 (frame-gen.cpp): with
+// AllowFsr31(false) Upscale makes no FSR 3.1 context and Fsr41Unavailable() turns true when 4.1 is not there.
+void                      AllowFsr31(bool allowed);
+[[nodiscard]] bool        Fsr41Unavailable();
+void                      SetUpscalerName(const char* name); // (the one running, for the metrics: "FSR 4.0")
 struct UpscaleDesc {
 	VkCommandBuffer          command = VK_NULL_HANDLE;
 	const VulkanImage*       color   = nullptr;

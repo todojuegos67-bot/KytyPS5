@@ -801,7 +801,11 @@ float Sharpness() {
 bool SrPathWanted() {
 	static const bool wanted = [] {
 		const char* value = std::getenv("KYTY_UPSCALER");
-		return value != nullptr && std::string(value) == "fsr4";
+		if (value != nullptr && std::string(value) == "fsr4") return true;
+		// (des-upstream-1106b) KYTY_UPSCALER=fsr: our FSR 4.0 is the fallback when AMD's FSR 4.1 is not there (its device
+		// features chained too); KYTY_FSR40_FALLBACK=0: FSR 3.1 instead.
+		const char* fallback = std::getenv("KYTY_FSR40_FALLBACK");
+		return value != nullptr && std::string(value) == "fsr" && !(fallback != nullptr && std::string(fallback) == "0");
 	}();
 	return wanted;
 }

@@ -991,6 +991,10 @@ ffxFunctions g_ffx24 {};
 ffxFunctions* g_up_ffx = &g_ffx; // the module the upscaling context belongs to
 std::string  g_up_name = "FSR 3.1";
 std::mutex   g_up_name_mutex;
+// (des-upstream-1106b) FSR 4.1 -> our FSR 4.0 -> FSR 3.1: frame-gen.cpp makes 3.1 wait (AllowFsr31(false)) while it
+// finds out whether 4.1 is there; Upscale then sets g_41_unavailable instead of making a 3.1 context.
+std::atomic<bool> g_31_allowed {true};
+std::atomic<bool> g_41_unavailable {false};
 
 bool LoadApi24() {
 	static const bool loaded = [] {
@@ -1019,6 +1023,17 @@ bool LoadApi24() {
 	return loaded;
 }
 } // namespace
+
+void AllowFsr31(bool allowed) {
+	g_31_allowed.store(allowed);
+}
+bool Fsr41Unavailable() {
+	return g_41_unavailable.load();
+}
+void SetUpscalerName(const char* name) {
+	std::scoped_lock lock(g_up_name_mutex);
+	g_up_name = name;
+}
 
 const char* UpscalerName() {
 	static thread_local std::string copy;
@@ -1124,7 +1139,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 					{
 						std::scoped_lock lock(g_up_name_mutex);
 						// Only a 4.1 provider is called FSR 4.1 (a 4.0 one says FSR 4.0).
-						g_up_name = used.rfind("4.1", 0) == 0 ? "FSR 4.1" : "FSR " + used.substr(0, 3);
+						g_up_name = (used.rfind("4.1", 0) == 0 ? std::string("FSR 4.1") : "FSR " + used.substr(0, 3)) + " (AMD SDK 2.4)";
 					}
 					g_up_ffx    = &g_ffx24;
 					g_up_render = desc.render;
@@ -1134,14 +1149,27 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 					std::fflush(stdout);
 				} else {
 					g_up_context = nullptr;
-					std::printf("FSR 4.1: context %s not created (%u): FSR 3.1\n", names[best], result);
+					std::printf("FSR 4.1: context %s not created (%u): no FSR 4.1\n", names[best], result);
 					std::fflush(stdout);
 				}
 			} else {
-				std::printf("FSR 4.1: SDK 2.4 runtime offers no 4.x upscaler on this GPU: FSR 3.1\n");
+				std::printf("FSR 4.1: SDK 2.4 runtime offers no 4.x upscaler on this GPU: no FSR 4.1\n");
 				std::fflush(stdout);
 			}
 		}
+	}
+	if ((g_up_context == nullptr || desc.render.width > g_up_render.width || desc.render.height > g_up_render.height ||
+	     desc.upscale.width != g_up_output.width || desc.upscale.height != g_up_output.height) &&
+	    !g_31_allowed.load()) {
+		// (des-upstream-1106b) No FSR 4.1 here: frame-gen.cpp tries our FSR 4.0 before FSR 3.1.
+		if (g_up_context != nullptr) {
+			DeviceQueuesGuard queues(graphics);
+			graphics.device.waitIdle();
+			g_up_ffx->DestroyContext(&g_up_context, nullptr);
+			g_up_context = nullptr;
+		}
+		g_41_unavailable.store(true);
+		return false;
 	}
 	if (g_up_context == nullptr || desc.render.width > g_up_render.width || desc.render.height > g_up_render.height ||
 	    desc.upscale.width != g_up_output.width || desc.upscale.height != g_up_output.height) {
@@ -1526,6 +1554,11 @@ bool SrReady() {
 bool Upscale(GraphicContext&, const UpscaleDesc&) {
 	return false;
 }
+void AllowFsr31(bool) {}
+bool Fsr41Unavailable() {
+	return true;
+}
+void SetUpscalerName(const char*) {}
 const char* UpscalerName() {
 	return "FSR 3.1";
 }

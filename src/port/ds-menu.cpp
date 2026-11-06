@@ -4734,6 +4734,7 @@ struct LogState {
 	std::string path;
 	uint64_t    pos = 0;
 	std::string kind, ratio, xess_ver, preset, fsr_ver;
+	bool        fsr_own = false; // (des-upstream-1106b) our FSR 4.0 (fsr4_shaders), the fallback of FSR 4.1
 	int         in_h = 0, out_h = 0, native = 0;
 	bool        dlss_ready = false, force4k = false;
 	int64_t     last_key = -1;
@@ -4859,7 +4860,7 @@ void Sample(LogState& L,
 				if (h >= 600) {
 					L.kind = (*it)[1].str() == "FSR 3.1" ? "FSR" : (*it)[1].str();
 					// (des-upstream-1106) "FSR 4.1": AMD's SDK 2.4 runtime really created the context (Fsr3::UpscalerName).
-					if (L.kind.rfind("FSR 4.", 0) == 0) L.fsr_ver = L.kind, L.kind = "FSR";
+					if (L.kind.rfind("FSR 4.", 0) == 0) L.fsr_own = (*it)[0].str().find("(ours") != std::string::npos, L.fsr_ver = L.kind, L.kind = "FSR";
 					else if (L.kind == "FSR") L.fsr_ver.clear();
 					L.in_h = h;
 					if (L.out_h == 0) L.out_h = std::atoi((*it)[5].str().c_str());
@@ -4963,7 +4964,7 @@ void Sample(LogState& L,
 				model = pk == "K" ? "K (Transformer, DLSS 4)" : pk == "L" ? "L (Transformer, DLSS 4.5)" : pk == "M" ? "M (Transformer, DLSS 4.5)" : pk.empty() ? "auto (NVIDIA)" : pk;
 				if (!L.dlss_ready && L.in_h == 0) model += " ...";
 			} else if (kind == "XeSS") model = L.xess_ver == "2.0.2" ? "XeSS 3.0.2" : !L.xess_ver.empty() ? "XeSS " + L.xess_ver : "XeSS";
-			else if (kind == "FSR") model = L.fsr_ver.empty() ? "FSR 3.1" : L.fsr_ver + " (AMD SDK 2.4)";
+			else if (kind == "FSR") model = L.fsr_ver.empty() ? "FSR 3.1" : L.fsr_own ? L.fsr_ver : L.fsr_ver + " (AMD SDK 2.4)";
 		} else if (L.force4k) rk = "Nativo", res = "2160p (4K)";
 		else if (scale_label.find("juego") != std::string::npos) rk = "Juego", res = Fmt("%sp %s %dp", scale_label.substr(0, scale_label.find('p')).c_str(), arrow, out_h), model = "reescalado del juego";
 		else if (L.native != 0) rk = "Nativo", res = Fmt("%dp %s %dp", L.native, arrow, out_h);
