@@ -767,13 +767,21 @@ void SkipDraws(uint32_t count) {
 	g_render.store(g_render_sequence << 24u | g_render_count, std::memory_order_release);
 }
 
-void NoteWrite(const void* address, uint32_t size) {
+void NoteWrite(const void* address, uint32_t size, const void* values) {
 	const uint64_t first = reinterpret_cast<uint64_t>(address) & ~uint64_t {3};
 	const auto     end   = std::min(reinterpret_cast<uint64_t>(address) + size, first + uint64_t {64 * 4});
 	const bool keep  = Mode() == 2;
 	for (auto word = first; word < end; word += 4) {
 		g_labels[LabelSlot(word)].store(word, std::memory_order_relaxed);
-		if (keep) g_label_values[LabelSlot(word)] = *reinterpret_cast<const uint32_t*>(word);
+		if (keep) {
+			uint32_t value = 0;
+			const auto  begin  = reinterpret_cast<uint64_t>(address);
+			const bool  inside = values != nullptr && word >= begin && word + 4 <= begin + size;
+			const auto* from   = inside ? static_cast<const uint8_t*>(values) + (word - begin)
+			                            : reinterpret_cast<const uint8_t*>(word);
+			std::memcpy(&value, from, sizeof(value));
+			g_label_values[LabelSlot(word)] = value;
+		}
 	}
 	NoteHostWrite(reinterpret_cast<uint64_t>(address), size);
 }
