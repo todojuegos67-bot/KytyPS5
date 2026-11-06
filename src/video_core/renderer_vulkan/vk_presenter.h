@@ -151,6 +151,7 @@ private:
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
+    int present_frames_total = 0;
     std::queue<Frame*> free_queue;
     Frame* last_submit_frame;
     std::mutex free_mutex;

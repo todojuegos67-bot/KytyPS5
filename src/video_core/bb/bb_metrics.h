@@ -17,7 +17,12 @@ void OnInput();                // the game read the pad
 void OnPresent();              // a new guest frame was presented
 void SetUpscaleLine(const std::string& text);
 void SetResLine(const std::string& text); // written each second as "[res] game WxH -> output WxH ..."
-void Line(const char* text); // a line as it is (frame generation: "[dlssg] ... real X fps, shown Y fps")
+void Line(const char* text);
+// bb-dlss5perf-106: counters for the per-second "[perf]" line (vk_presenter.cpp). Lock-free.
+void PerfDlss5(double cpu_ms);              // one DLSS 5 Apply: CPU time to record it
+void PerfDlss5Gpu(double gpu_ms);           // a DLSS 5 GPU time read back (async, frames late)
+void PerfPresentWait(double ms);            // the presenter waited for a free frame / its fence
+void PerfLine(int frames_in_flight, int frames_total); // once per presented game frame // a line as it is (frame generation: "[dlssg] ... real X fps, shown Y fps")
 
 // ---- (bb-metrics-043) The in-game metrics panel (bb_metrics_panel.cpp): the Demon's Souls port's F8
 // panel (ds-menu.cpp MetricsPanel, metricas.ps1's look), top-centre of the game image. F8 shows /

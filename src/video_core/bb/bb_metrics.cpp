@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/bb/bb_metrics.h"
+#include "common/logging/log.h"
+#include "common/thread.h"
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <atomic>
@@ -228,4 +231,78 @@ Snapshot Get() {
     return s;
 }
 
+} // namespace BB::Metrics
+
+// ---- bb-dlss5perf-106: "[perf]" once a second ----
+namespace BB::Metrics {
+namespace {
+std::atomic<uint64_t> g_p_d5_n{0}, g_p_d5_cpu_us{0}, g_p_d5_gpu_n{0}, g_p_d5_gpu_us{0};
+std::atomic<uint64_t> g_p_wait_n{0}, g_p_wait_us{0};
+} // namespace
+void PerfDlss5(double cpu_ms) {
+    g_p_d5_n.fetch_add(1, std::memory_order_relaxed);
+    g_p_d5_cpu_us.fetch_add(static_cast<uint64_t>(cpu_ms * 1000.0), std::memory_order_relaxed);
+}
+void PerfDlss5Gpu(double gpu_ms) {
+    g_p_d5_gpu_n.fetch_add(1, std::memory_order_relaxed);
+    g_p_d5_gpu_us.fetch_add(static_cast<uint64_t>(gpu_ms * 1000.0), std::memory_order_relaxed);
+}
+void PerfPresentWait(double ms) {
+    if (ms < 0.05) return;
+    g_p_wait_n.fetch_add(1, std::memory_order_relaxed);
+    g_p_wait_us.fetch_add(static_cast<uint64_t>(ms * 1000.0), std::memory_order_relaxed);
+}
+} // namespace BB::Metrics
+
+namespace AmdGpu { // liverpool.cpp
+extern std::atomic<uint64_t> g_bb_cp_backoffs;
+extern std::atomic<uint64_t> g_bb_cp_wait_yields;
+} // namespace AmdGpu
+
+namespace BB::Metrics {
+void PerfLine(int frames_in_flight, int frames_total) {
+    static const bool off = [] {
+        const char* v = std::getenv("BB_PERF");
+        return v != nullptr && v[0] == '0';
+    }();
+    if (off) return;
+    using C = std::chrono::steady_clock;
+    static C::time_point last{};
+    static uint64_t frames = 0, last_backoffs = 0, last_yields = 0;
+    static int max_inflight = 0;
+    ++frames;
+    max_inflight = std::max(max_inflight, frames_in_flight);
+    const auto now = C::now();
+    if (last.time_since_epoch().count() == 0) {
+        last = now;
+        (void)Common::BBThreadBusyReport(1.0);
+        return;
+    }
+    const double wall = std::chrono::duration<double>(now - last).count();
+    if (wall < 1.0) return;
+    last = now;
+    const uint64_t d5n = g_p_d5_n.exchange(0), d5cpu = g_p_d5_cpu_us.exchange(0);
+    const uint64_t d5gn = g_p_d5_gpu_n.exchange(0), d5gpu = g_p_d5_gpu_us.exchange(0);
+    const uint64_t wn = g_p_wait_n.exchange(0), wus = g_p_wait_us.exchange(0);
+    const uint64_t bo = AmdGpu::g_bb_cp_backoffs.load(std::memory_order_relaxed);
+    const uint64_t yi = AmdGpu::g_bb_cp_wait_yields.load(std::memory_order_relaxed);
+    const std::string threads = Common::BBThreadBusyReport(wall, 6);
+    char d5[160] = "dlss5 off";
+    if (d5n > 0) {
+        std::snprintf(d5, sizeof(d5), "dlss5 %llu evals, CPU %.2f ms/eval, GPU %s, CPU waits 0",
+                      static_cast<unsigned long long>(d5n), d5cpu / 1000.0 / d5n,
+                      d5gn ? fmt::format("{:.2f} ms ({:.0f}% of the second)", d5gpu / 1000.0 / d5gn,
+                                         d5gpu / 1000.0 / d5gn * d5n / (wall * 10.0)).c_str()
+                           : "n/a (sampled 1 in 16)");
+    }
+    LOG_INFO(Render_Vulkan,
+             "[perf] {:.0f} fps | threads: {} | GPU cmd processor: {} wait polls, {} sleeps | "
+             "present waits {} ({:.1f} ms) | frames in flight {} (max {} of {}) | {}",
+             frames / wall, threads.empty() ? "n/a" : threads, yi - last_yields, bo - last_backoffs,
+             wn, wus / 1000.0, frames_in_flight, max_inflight, frames_total, d5);
+    frames = 0;
+    max_inflight = 0;
+    last_backoffs = bo;
+    last_yields = yi;
+}
 } // namespace BB::Metrics
