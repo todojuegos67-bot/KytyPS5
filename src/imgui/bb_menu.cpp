@@ -36,6 +36,7 @@
 #include "imgui/imgui_std.h"
 #include "imgui/imgui_texture.h"
 #include "imgui/renderer/imgui_core.h"
+#include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
 
@@ -118,6 +119,8 @@ bool g_restore_mouse_look = false; // the Teclado y ratón checkbox: mouse-look 
 // (bb-menu-133) "Jugar con teclado y ratón": mouse-look (mouse -> stick, cursor captured and
 // hidden) from the start and whenever the menu closes; persisted in <user>/bb_menu.ini.
 bool g_kbm_play = false;
+bool g_vib_on = true;   // (bb-input-135) rumble
+float g_vib_pct = 100; // (bb-input-135) rumble intensity, %
 bool g_invert_y = false;
 // (bb-menu-133) Mando > "Probar y mapear": the pad never moves the menu, presses are shown live
 std::atomic<bool> g_test_mode{false};
@@ -159,15 +162,21 @@ void LoadMenuSettings() {
     while (std::getline(in, l)) {
         if (l.rfind("kbm_play=", 0) == 0) g_kbm_play = l.size() > 9 && l[9] == '1';
         if (l.rfind("invert_y=", 0) == 0) g_invert_y = l.size() > 9 && l[9] == '1';
+        if (l.rfind("vibration=", 0) == 0) g_vib_on = !(l.size() > 10 && l[10] == '0');
+        if (l.rfind("vibration_pct=", 0) == 0) g_vib_pct = std::clamp(std::atof(l.c_str() + 14), 0.0, 200.0);
     }
     Input::SetMouseInvertY(g_invert_y);
+    Input::SetVibrationSettings(g_vib_on, static_cast<int>(g_vib_pct));
 }
 void SaveMenuSettings() {
     std::ofstream out(MenuIni(), std::ios::trunc);
     out << "# Bloodborne F1 menu (bb-menu-133)\n"
         << "kbm_play=" << (g_kbm_play ? 1 : 0) << "\n"
-        << "invert_y=" << (g_invert_y ? 1 : 0) << "\n";
+        << "invert_y=" << (g_invert_y ? 1 : 0) << "\n"
+        << "vibration=" << (g_vib_on ? 1 : 0) << "\n"
+        << "vibration_pct=" << static_cast<int>(g_vib_pct) << "\n";
     Input::SetMouseInvertY(g_invert_y);
+    Input::SetVibrationSettings(g_vib_on, static_cast<int>(g_vib_pct));
     LOG_INFO(Frontend, "[bb-menu] bb_menu.ini: kbm_play={} invert_y={}", g_kbm_play, g_invert_y);
 }
 
@@ -2445,7 +2454,8 @@ public:
     float kbm_scroll = -1.0f;
     bool kbm_scroll_to = false;
     int exit_focus = 0;
-    float tog_direct = 0, tog_stick = 0, tog_look = 0, tog_inv = 0;
+    float tog_direct = 0, tog_stick = 0, tog_look = 0, tog_inv = 0, tog_vib = 0;
+    int opt_focus = 0; // (bb-input-135) 0 direct start, 1 vibration, 2 intensity
     double test_hold_since = -1; // PS / OPTIONS held in the test mode
     float s_sp = 1.0f, s_dz = 0.5f;
     double dpad_since[4] = {-1, -1, -1, -1}, dpad_rep[4] = {};
@@ -2601,8 +2611,15 @@ public:
                 break;
             }
             case Screen::Options:
-                if (n == Nav::Accept && g_direct.exists) {
+                if (n == Nav::Up) opt_focus = (opt_focus + 2) % 3;
+                if (n == Nav::Down) opt_focus = (opt_focus + 1) % 3;
+                if (n == Nav::Accept && opt_focus == 0 && g_direct.exists) {
                     if (WriteDirect(!g_direct.on)) g_direct.on = !g_direct.on;
+                }
+                if (n == Nav::Accept && opt_focus == 1) g_vib_on = !g_vib_on, SaveMenuSettings();
+                if (opt_focus == 2 && (n == Nav::Left || n == Nav::Right)) {
+                    g_vib_pct = std::clamp(g_vib_pct + (n == Nav::Left ? -10.0f : 10.0f), 0.0f, 200.0f);
+                    SaveMenuSettings();
                 }
                 break;
             case Screen::Exit:
@@ -3228,13 +3245,13 @@ public:
     void OptionsScreen(ImVec2 a, ImVec2 b, float u) {
         auto* dl = ImGui::GetWindowDrawList();
         const float w = std::min(1300 * u, b.x - a.x);
-        const ImVec2 p0{(a.x + b.x - w) * 0.5f, a.y + 30 * u}, p1{p0.x + w, p0.y + 330 * u};
+        const ImVec2 p0{(a.x + b.x - w) * 0.5f, a.y + 30 * u}, p1{p0.x + w, p0.y + 560 * u};
         Panel(dl, p0, p1, u, 0.2f);
         Txt(dl, g_ft_title, 30 * u, {p0.x + 40 * u, p0.y + 30 * u}, Gold(), "INICIO");
         OrnLine(dl, p0.x + 40 * u + 160 * u, p0.y + 88 * u, 160 * u, 0.5f, u);
         const ImVec2 tg{p0.x + 40 * u, p0.y + 116 * u};
         ImGui::BeginDisabled(!g_direct.exists);
-        if (Toggle("##direct", tg, g_direct.on, tog_direct, u, true) && g_direct.exists) {
+        if (Toggle("##direct", tg, g_direct.on, tog_direct, u, opt_focus == 0) && g_direct.exists) {
             if (WriteDirect(!g_direct.on)) g_direct.on = !g_direct.on;
         }
         ImGui::EndDisabled();
@@ -3258,6 +3275,20 @@ public:
         if (!g_direct.error.empty()) {
             Txt(dl, g_ft_ui, 19 * u, {tg.x + 90 * u, y + 34 * u}, Col(232, 120, 100),
                 g_direct.error.c_str());
+        }
+        }
+        // (bb-input-135) rumble (scePadSetVibration -> SDL), saved in bb_menu.ini
+        const ImVec2 vt{tg.x, p0.y + 370 * u};
+        if (Toggle("##vib", vt, g_vib_on, tog_vib, u, opt_focus == 1)) {
+            g_vib_on = !g_vib_on;
+            SaveMenuSettings();
+        }
+        Txt(dl, g_ft_text, 28 * u, {vt.x + 90 * u, vt.y}, Parch(), "Vibración");
+        Txt(dl, g_ft_text, 24 * u, {vt.x + 90 * u, vt.y + 56 * u}, Parch(0.9f),
+            fmt::format("Intensidad {:.0f} %", g_vib_pct).c_str());
+        if (Slider("##vibpct", {vt.x + 90 * u, vt.y + 92 * u}, 500 * u, g_vib_pct, 0.0f, 200.0f, u,
+                   opt_focus == 2)) {
+            SaveMenuSettings();
         }
     }
 
