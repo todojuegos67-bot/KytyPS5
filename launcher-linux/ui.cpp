@@ -43,7 +43,7 @@ constexpr float BodySize = 15.0f, SmallSize = 13.5f, SectionSize = 16.0f, PageTi
                 BannerSize = 36.0f, GameTitleSize = 22.0f;
 
 const char* const PageNames[] {"play",    "display",  "graphics",    "game",
-                               "shaders", "advanced", "experimental"};
+                               "shaders", "advanced", "experimental", "keyboard-controls"};
 const char* const PageKeys[] {"nav.play",    "nav.display",  "nav.graphics",    "nav.game",
                               "nav.shaders", "nav.advanced", "nav.experimental"};
 
@@ -227,7 +227,7 @@ void DrawMark(Mark mark, float size) {
 // ------------------------------------------------------------ window
 
 LauncherWindow::LauncherWindow(LauncherContext& context, SDL_Renderer* renderer)
-    : context_(context), commands_(context), renderer_(renderer) {
+    : context_(context), commands_(context), renderer_(renderer), keyboard_editor_(renderer) {
 	game_text_      = S().Str("game");
 	extra_text_     = S().Str("extra_args");
 	wanted_taa_     = S().Int("render") > 0 ? S().Int("render") : 1440;
@@ -242,7 +242,17 @@ LauncherWindow::~LauncherWindow() {
 }
 
 const char* LauncherWindow::PageName(int index) {
-	return PageNames[std::clamp(index, 0, PageCount() - 1)];
+	return PageNames[std::clamp(index, 0, ScreenshotCount() - 1)];
+}
+
+void LauncherWindow::ShowPage(int index) {
+	if (index >= PageCount()) {
+		// (--screenshot's last picture: the keyboard controls editor over the Game page.)
+		page_ = 3;
+		keyboard_editor_.Open(S());
+		return;
+	}
+	page_ = index;
 }
 
 void LauncherWindow::Wake() {
@@ -1258,6 +1268,17 @@ void LauncherWindow::GamePage() {
 		    }
 	    },
 	    T("audiooutput.desc"));
+	// Demon's Souls' button icons as key caps and the matching bindings (PPSA01341 01.007.000, an
+	// extracted game folder): Play puts them in or, off, the originals back. Off by default.
+	Section("game.controller");
+	Row("keyboardprompts", [&] { SettingSwitch("##keyboardprompts", "keyboard_prompts"); },
+	    T("keyboardprompts.desc"));
+	Row(
+	    "keyboardcontrols",
+	    [&] {
+		    if (FlatButton(T("keyboardcontrols.edit"))) keyboard_editor_.Open(S());
+	    },
+	    T("keyboardcontrols.desc"));
 	Section("game.cheats");
 	Row(
 	    "cheats",
@@ -1616,6 +1637,12 @@ void LauncherWindow::StartInTerminal(const Launch& launch) {
 void LauncherWindow::Play() {
 	S().Set("game", Trim(game_text_));
 	S().Save();
+	// The keyboard prompts' icons (or the originals back) before the emulator starts; a refusal says
+	// why and nothing starts (launcher-windows' StartPlay).
+	if (const auto problem = commands_.ApplyKeyboardPrompts(); !problem.empty()) {
+		Message(F("error.start", {problem}));
+		return;
+	}
 	const auto  launch = commands_.Play(game_, false);
 	std::string error;
 	// The game's log in a terminal window (as run.cmd's console on Windows); without a terminal
@@ -1889,6 +1916,9 @@ void LauncherWindow::Modals() {
 			ImGui::CloseCurrentPopup();
 		ImGui::EndPopup();
 	}
+
+	// The keyboard controls of the Game page.
+	keyboard_editor_.Frame(scale_, serif_);
 
 	// The built-in folder browser (no zenity, qarma or kdialog on this PC).
 	if (browser_open_) {

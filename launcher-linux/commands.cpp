@@ -1,5 +1,8 @@
 #include "commands.h"
 
+#include "keyboard_layout.h"
+#include "keyboard_prompts.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
@@ -7,9 +10,11 @@
 #include <ctime>
 #include <fcntl.h>
 #include <fstream>
+#include <optional>
 #include <regex>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <system_error>
 #include <unistd.h>
 
 namespace {
@@ -331,6 +336,19 @@ Launch Commands::Play(const GameInfo& game, bool direct) const {
 		              options.end());
 	options.insert(options.end(), extra.options.begin(), extra.options.end());
 
+	// The keyboard prompts' layout: its --keymap pairs come last (the emulator lets the last mapping
+	// of a control or an input win), so the artwork and the bindings of this start agree. The
+	// Advanced page's own --keymap options stay for what the layout leaves alone (the mouse wheel,
+	// a sensitivity left blank). launch.json is not rewritten; with the option off none is added.
+	if (S().Bool("keyboard_prompts")) {
+		try {
+			for (const auto& pair: KeyboardLayout::Read(S()).Pairs())
+				options.push_back({"--keymap", pair});
+		} catch (const PromptError&) {
+			// (A start through ApplyKeyboardPrompts has already reported it; here there is nothing to add.)
+		}
+	}
+
 	launch.argv = {context_.run_script.string()};
 	for (const auto& option: options)
 		launch.argv.insert(launch.argv.end(), option.begin(), option.end());
@@ -339,6 +357,37 @@ Launch Commands::Play(const GameInfo& game, bool direct) const {
 		                 [&](const auto& pair) { return pair.first == name; }))
 			launch.unset.push_back(name);
 	return launch;
+}
+
+std::string Commands::ApplyKeyboardPrompts() const {
+	const bool enabled = S().Bool("keyboard_prompts");
+	try {
+		std::optional<KeyboardLayout> layout;
+		if (enabled) layout = KeyboardLayout::Read(S());
+		KeyboardPrompts::Game game;
+		game.path = S().Str("game");
+		// (A game folder's param.json is a local read; a ZArchive is not read at all: it is refused.)
+		std::error_code error;
+		if (!game.path.empty() && fs::is_directory(game.path, error)) {
+			const auto info = GameInfo::Read(game.path, {}, context_.root);
+			game.title_id   = info.title_id;
+			game.version    = info.version;
+		}
+		KeyboardPrompts::Apply(game, enabled, layout ? &*layout : nullptr);
+	} catch (const std::exception& error) {
+		return error.what();
+	}
+	return {};
+}
+
+std::string Commands::KeyboardPromptsReport() const {
+	if (!S().Bool("keyboard_prompts")) return "off";
+	try {
+		(void)KeyboardLayout::Read(S());
+		return "on";
+	} catch (const PromptError& error) {
+		return std::string("on, but the layout cannot be used: ") + error.what();
+	}
 }
 
 Launch Commands::Precompile(const std::string& mode) const {

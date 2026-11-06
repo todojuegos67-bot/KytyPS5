@@ -22,8 +22,9 @@ public:
 	void Set(const std::string& key, bool value);
 	void Set(const std::string& key, int value);
 
-	// Written when something changed since the last save (or the read).
-	void Save();
+	// Written when something changed since the last save (or the read); false when the file could
+	// not be written (a read-only folder: the choices last until the window closes).
+	bool Save();
 
 	[[nodiscard]] const std::filesystem::path& Path() const { return path_; }
 

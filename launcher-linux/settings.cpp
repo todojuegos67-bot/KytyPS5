@@ -46,6 +46,7 @@ const nlohmann::ordered_json& Defaults() {
 		d["dlss_sharpness"]      = ""; // (Graphics page: KYTY_DLSS_SHARPNESS's value, "" none)
 		d["fsr_sharpness"]       = ""; // (Graphics page: KYTY_FSR_SHARPNESS's value, "" its 0.6)
 		d["audio_output"]        = ""; // (Game page: "" a TV)
+		d["keyboard_prompts"]    = false; // (Game page: key and mouse icons and bindings)
 		d["output_auto"]         = true;
 		d["wide_bars"]           = false; // (Display page: 21:9 or 32:9, movies and menus at 16:9)
 		// (Linux.)
@@ -143,10 +144,10 @@ void Settings::Set(const std::string& key, int value) {
 	values_[key] = value;
 }
 
-void Settings::Save() {
-	if (read_only) return;
+bool Settings::Save() {
+	if (read_only) return true;
 	const std::string text = values_.dump(4);
-	if (text == saved_) return;
+	if (text == saved_) return true;
 	// A new file next to the old one, then renamed over it: a crash mid-write leaves the old file
 	// whole.
 	std::error_code error;
@@ -154,10 +155,12 @@ void Settings::Save() {
 	const auto temporary = std::filesystem::path(path_.string() + ".tmp");
 	{
 		std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-		if (!file) return; // a read-only folder: the choices last until the window closes
+		if (!file) return false; // a read-only folder: the choices last until the window closes
 		file << text << "\n";
-		if (!file) return;
+		if (!file) return false;
 	}
 	std::filesystem::rename(temporary, path_, error);
-	if (!error) saved_ = text;
+	if (error) return false;
+	saved_ = text;
+	return true;
 }
