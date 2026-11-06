@@ -145,6 +145,8 @@ jobs:
         Copy-Item documents\BB-UPSCALING.md "$out\BB-UPSCALING.md"
         Copy-Item tools\bb\*.cmd, tools\bb\*.ps1 $out
         Copy-Item tools\bb\menu_assets "$out\menu_assets" -Recurse
+        foreach ($f in 'mando-ps4.png','mando-ps5.png','mando-8bitdo.png','raton.png','fonts\Cinzel-SemiBold.ttf','fonts\CormorantGaramond-Medium.ttf','fonts\CormorantGaramond-MediumItalic.ttf','fonts\Inter-Medium.ttf') { if (!(Test-Path "$out\menu_assets\$f")) { throw "menu asset missing: $f" } }
+        Copy-Item tools\bb\menu_assets\fonts\OFL-*.txt "$out\LICENSES"
         7z a bb-port-win64.zip ".\$out\*" | Out-Null
         $h = (Get-FileHash -Algorithm MD5 "$out\shadPS4.exe").Hash.ToLower()
         $z = (Get-FileHash -Algorithm MD5 bb-port-win64.zip).Hash.ToLower()
