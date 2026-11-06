@@ -156,4 +156,6 @@ public:
     void ResetLightbarColors();
 };
 
+void SetVibrationSettings(bool on, int percent); // (bb-input-135)
+
 } // namespace Input

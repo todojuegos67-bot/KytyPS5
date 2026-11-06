@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
@@ -19,7 +20,7 @@ namespace Input {
 
 extern std::list<std::pair<InputEvent, bool>> pressed_keys;
 
-int mouse_joystick_binding = 0;
+int mouse_joystick_binding = 2; // (bb-input-135) right stick unless the config says otherwise
 float mouse_deadzone_offset = 0.5, mouse_speed = 1, mouse_speed_offset = 0.1250;
 bool mouse_gyro_roll_mode = false;
 bool mouse_invert_y = false;
@@ -88,12 +89,39 @@ void EmulateJoystick(GameController* controller, u32 interval) {
     float angle = atan2(d_y, d_x);
     float a_x = cos(angle) * output_speed, a_y = sin(angle) * output_speed;
 
-    if (d_x != 0 || d_y != 0) {
-        controller->Axis(axis_x, GetAxis(-0x80, 0x7f, a_x), false);
-        controller->Axis(axis_y, GetAxis(-0x80, 0x7f, a_y), false);
-    } else {
+    // (bb-input-135) mouse wins while it moves; at rest the stick is centred only once, so a
+    // physical pad's right stick is not overwritten with "centre" every 33 ms.
+    static bool was_moving = false;
+    const bool moving = d_x != 0 || d_y != 0;
+    int out_x = 0, out_y = 0;
+    if (moving) {
+        out_x = GetAxis(-0x80, 0x7f, a_x);
+        out_y = GetAxis(-0x80, 0x7f, a_y);
+        controller->Axis(axis_x, out_x, false);
+        controller->Axis(axis_y, out_y, false);
+    } else if (was_moving) {
         controller->Axis(axis_x, GetAxis(-0x80, 0x7f, 0), false);
         controller->Axis(axis_y, GetAxis(-0x80, 0x7f, 0), false);
+    }
+    was_moving = moving;
+
+    // once a second: what the mouse did and what went to the stick
+    static float sum_x = 0, sum_y = 0;
+    static int last_x = 0, last_y = 0, frames = 0;
+    static Uint64 last_log = 0;
+    sum_x += d_x, sum_y += d_y;
+    if (moving) last_x = out_x, last_y = out_y;
+    frames++;
+    const Uint64 now = SDL_GetTicks();
+    if (now - last_log >= 1000) {
+        const bool captured = g_window != nullptr &&
+                              SDL_GetWindowRelativeMouseMode(g_window->GetSDLWindow());
+        LOG_INFO(Input,
+                 "[kbm] mouse dx/dy {:.0f}/{:.0f} ({} polls), stick out {}/{} ({} stick), "
+                 "captured {}",
+                 sum_x, sum_y, frames, last_x, last_y, axis_x == Axis::RightX ? "right" : "left",
+                 captured ? "yes" : "no");
+        sum_x = sum_y = 0, frames = 0, last_x = last_y = 0, last_log = now;
     }
 }
 

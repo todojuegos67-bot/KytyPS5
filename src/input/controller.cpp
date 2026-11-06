@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -259,10 +260,30 @@ void GameControllers::ResetLightbarColors() {
     }
 }
 
+// (bb-input-135) rumble: F1 menu "Vibración" on/off + intensity (bb_menu.ini)
+static std::atomic<bool> g_vib_on{true};
+static std::atomic<int> g_vib_pct{100};
+static std::atomic<bool> g_vib_logged{false};
+
+void SetVibrationSettings(bool on, int percent) {
+    g_vib_on = on;
+    g_vib_pct = std::clamp(percent, 0, 200);
+}
+
 bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
+    if (!g_vib_logged.exchange(true)) {
+        LOG_INFO(Input, "[pad] vibration: large {} small {} (pad {}, on {}, {}%)", largeMotor,
+                 smallMotor, m_sdl_gamepad != nullptr ? "yes" : "no", g_vib_on.load(),
+                 g_vib_pct.load());
+    }
     if (m_sdl_gamepad != nullptr) {
-        return SDL_RumbleGamepad(m_sdl_gamepad, (smallMotor / 255.0f) * 0xFFFF,
-                                 (largeMotor / 255.0f) * 0xFFFF, -1);
+        const float k = g_vib_on ? g_vib_pct / 100.0f : 0.0f;
+        const auto scale = [k](u8 v) {
+            return static_cast<Uint16>(std::clamp(v / 255.0f * k, 0.0f, 1.0f) * 0xFFFF);
+        };
+        // SDL: low_frequency = the large (left, heavy) motor, high_frequency = the small one.
+        // Kept until the game sends the next state (0/0 stops it), as upstream (-1).
+        return SDL_RumbleGamepad(m_sdl_gamepad, scale(largeMotor), scale(smallMotor), 0xFFFFFFFFu);
     }
     return true;
 }

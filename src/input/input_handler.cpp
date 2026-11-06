@@ -368,6 +368,7 @@ void ParseInputConfig(const std::string game_id = "") {
     float mouse_deadzone_offset = 0.5;
     float mouse_speed = 1;
     float mouse_speed_offset = 0.125;
+    SetMouseToJoystick(2); // (bb-input-135) default mouse-look = right stick (was 0 = off)
 
     // me when I'm in a type deduction tournament and my opponent is clang
     constexpr std::array<std::pair<int, int>, 4> default_deadzone = {
@@ -742,15 +743,27 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     if (button != SDL_GAMEPAD_BUTTON_INVALID) {
         switch (button) {
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT:
-            controller->SetTouchpadState(0, new_button_state, 0.25f, 0.5f);
+            // (bb-input-135) the touchpad CLICK only: no phantom finger. A bound key (default
+            // space) used to also inject a touch point; real fingers still come from the pad's
+            // touch sensor events. Bloodborne crashed (0xc0000005) on the injected touch.
+            LOG_INFO(Input, "[kbm] touchpad click {} (button only, no injected touch)",
+                     new_button_state ? "down" : "up");
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER:
-            controller->SetTouchpadState(0, new_button_state, 0.50f, 0.5f);
+            // (bb-input-135) the touchpad CLICK only: no phantom finger. A bound key (default
+            // space) used to also inject a touch point; real fingers still come from the pad's
+            // touch sensor events. Bloodborne crashed (0xc0000005) on the injected touch.
+            LOG_INFO(Input, "[kbm] touchpad click {} (button only, no injected touch)",
+                     new_button_state ? "down" : "up");
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT:
-            controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
+            // (bb-input-135) the touchpad CLICK only: no phantom finger. A bound key (default
+            // space) used to also inject a touch point; real fingers still come from the pad's
+            // touch sensor events. Bloodborne crashed (0xc0000005) on the injected touch.
+            LOG_INFO(Input, "[kbm] touchpad click {} (button only, no injected touch)",
+                     new_button_state ? "down" : "up");
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case LEFTJOYSTICK_HALFMODE:
