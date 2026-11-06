@@ -195,6 +195,14 @@ struct Settings {
 	// [Configurador] (10-28)
 	bool        configured = false;  // the first-start dialog has been shown
 	bool        ram16_boost = false; // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
+	// (perfopts-1107) Opciones de rendimiento: upstream's opt-in switches (all off = the behaviour before them).
+	bool        perf_pm4_regfile = false;   // KYTY_PM4_REGFILE=1
+	bool        perf_upload_lanes = false;  // KYTY_UPLOAD_LANES=2
+	bool        perf_upload_help = false;   // KYTY_UPLOAD_HELP=2
+	bool        perf_spin_gate = false;     // KYTY_SPIN_GATE=1
+	bool        perf_eager_feedback = false; // KYTY_EAGER_FEEDBACK=1
+	bool        perf_feedback_batch = false; // KYTY_FEEDBACK_BATCH=1
+	bool        perf_lane_wide = false;     // KYTY_LANE_LOCAL_WIDE=1
 	// [Interfaz]
 	std::string metrics = "0"; // KYTY_FPS_HUD 0/1/2
 	bool        start_menu = true; // (10-27b) menu_inicio: the launcher-style menu before the game

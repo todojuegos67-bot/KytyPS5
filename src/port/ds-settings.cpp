@@ -311,6 +311,13 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("raton_calibrar", s->kbm_calibrate);
 	boo("configurado", s->configured);
 	boo("mejoras_16gb_v2", s->ram16_boost); // (port28) new key: the old one was on by default
+	boo("rend_registros_pm4", s->perf_pm4_regfile);
+	boo("rend_subidas_dos_hilos", s->perf_upload_lanes);
+	boo("rend_ayuda_subidas", s->perf_upload_help);
+	boo("rend_espera_hilos", s->perf_spin_gate);
+	boo("rend_feedback_anticipado", s->perf_eager_feedback);
+	boo("rend_feedback_agrupado", s->perf_feedback_batch);
+	boo("rend_shaders_lane_local", s->perf_lane_wide);
 	str("reflejos_rt", s->rt_ss_refl);
 	str("nitidez_reflejos_rt", s->rt_refl_sharp);
 	str("ondas_agua_reflejos", s->rt_refl_waves);
@@ -530,7 +537,22 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; 0: el configurador de hardware se muestra al arrancar\n"
 	  << "configurado=" << b(s.configured) << "\n"
 	  << "; Mejoras para equipos de 16 GB de RAM: perfil de 16 GB (solo en PCs de 20 GB de RAM o menos)\n"
-	  << "mejoras_16gb_v2=" << b(s.ram16_boost) << "\n\n"
+	  << "mejoras_16gb_v2=" << b(s.ram16_boost) << "\n"
+	  << "; Opciones de rendimiento (0 = como siempre; 1 = la mejora experimental de KytyPS5 upstream)\n"
+	  << "; Registros PM4 directos (KYTY_PM4_REGFILE)\n"
+	  << "rend_registros_pm4=" << b(s.perf_pm4_regfile) << "\n"
+	  << "; Subidas a la GPU en dos hilos (KYTY_UPLOAD_LANES=2)\n"
+	  << "rend_subidas_dos_hilos=" << b(s.perf_upload_lanes) << "\n"
+	  << "; El hilo de render ayuda con las subidas si la CPU va cargada (KYTY_UPLOAD_HELP=2)\n"
+	  << "rend_ayuda_subidas=" << b(s.perf_upload_help) << "\n"
+	  << "; Los hilos de ayuda dejan de esperar activos si la CPU va cargada (KYTY_SPIN_GATE=1)\n"
+	  << "rend_espera_hilos=" << b(s.perf_spin_gate) << "\n"
+	  << "; Copias de la GPU devueltas antes de que el juego las pida (KYTY_EAGER_FEEDBACK)\n"
+	  << "rend_feedback_anticipado=" << b(s.perf_eager_feedback) << "\n"
+	  << "; Copias de la GPU agrupadas (KYTY_FEEDBACK_BATCH)\n"
+	  << "rend_feedback_agrupado=" << b(s.perf_feedback_batch) << "\n"
+	  << "; Shaders lane-local ampliados (KYTY_LANE_LOCAL_WIDE; recompila parte de los shaders)\n"
+	  << "rend_shaders_lane_local=" << b(s.perf_lane_wide) << "\n\n"
 	  << "[Interfaz]\n"
 	  << "; Metricas en pantalla: 0 no, 1 FPS, 2 FPS + detalle\n"
 	  << "metricas=" << s.metrics << "\n"
@@ -773,6 +795,14 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	                     "KYTY_RAM_FLUSH_MB", "KYTY_RAM_FLUSH_LEVEL"})
 		sets.emplace_back(k, "");
 	if (s.safe_gpu) sets.emplace_back("KYTY_COMPUTE_CHAIN", "0");
+	// (perfopts-1107) Opciones de rendimiento: only set when chosen (off leaves the environment as it was).
+	if (s.perf_pm4_regfile) sets.emplace_back("KYTY_PM4_REGFILE", "1");
+	if (s.perf_upload_lanes) sets.emplace_back("KYTY_UPLOAD_LANES", "2");
+	if (s.perf_upload_help) sets.emplace_back("KYTY_UPLOAD_HELP", "2");
+	if (s.perf_spin_gate) sets.emplace_back("KYTY_SPIN_GATE", "1");
+	if (s.perf_eager_feedback) sets.emplace_back("KYTY_EAGER_FEEDBACK", "1");
+	if (s.perf_feedback_batch) sets.emplace_back("KYTY_FEEDBACK_BATCH", "1");
+	if (s.perf_lane_wide) sets.emplace_back("KYTY_LANE_LOCAL_WIDE", "1");
 	// Anti-Lag (10-24): with the AMD frame generation, AMD's Anti-Lag 2 on an AMD card (default) or ours (2 frames queued, Ultra 1);
 	// the fixed Souls modes always ours in Ultra. With NVIDIA's frame generation, Reflex (default) or ours with Reflex off.
 	std::string al = s.antilag_mode.empty() || s.antilag_mode == "auto" ? (pc.amd ? "amd2" : "normal") : s.antilag_mode;
@@ -1225,7 +1255,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.motes != n.motes || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
 	       l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 || l.texture_sharpness != n.texture_sharpness ||
 	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
-	       l.pad_map != n.pad_map || l.game_settings != n.game_settings || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
+	       l.pad_map != n.pad_map || l.game_settings != n.game_settings || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.perf_pm4_regfile != n.perf_pm4_regfile || l.perf_upload_lanes != n.perf_upload_lanes || l.perf_upload_help != n.perf_upload_help || l.perf_spin_gate != n.perf_spin_gate || l.perf_eager_feedback != n.perf_eager_feedback || l.perf_feedback_batch != n.perf_feedback_batch || l.perf_lane_wide != n.perf_lane_wide || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.shader_turbo != n.shader_turbo || l.extra != n.extra ||
 	       l.rt_ss_refl != n.rt_ss_refl || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
