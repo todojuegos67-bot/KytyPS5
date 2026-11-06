@@ -104,6 +104,7 @@ struct Settings {
 	bool        game_language_set = false; // (idioma_juego / idioma in settings.ini)
 	std::string menu_language;    // (10-27b) idioma_menu: es, en, pt, fr, it, de (empty: the Windows UI language at start)
 	bool        backup_saves = true;
+	bool        launcher_fog = true; // (des-upstream-1106) lanzador_niebla: the launcher's fog and embers
 	bool        continue_f1 = false; // (ds-pc-port8) continuar_f1: JUGAR after F1 (save and quit) continues by itself where F1 left
 	// [Pantalla]
 	bool        fullscreen = true;

@@ -226,6 +226,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("idioma_interfaz", s->menu_language);
 	if (s->menu_language == "auto") s->menu_language.clear();
 	boo("copia_partidas", s->backup_saves);
+	boo("lanzador_niebla", s->launcher_fog);
 	boo("continuar_f1", s->continue_f1);
 	boo("pantalla_completa", s->fullscreen);
 	num("ancho", s->width);
@@ -372,6 +373,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "idioma_interfaz=" << s.menu_language << "\n"
 	  << "; Copia de seguridad de _SaveData en _SaveData-copias antes de jugar\n"
 	  << "copia_partidas=" << b(s.backup_saves) << "\n"
+	  << "; Niebla animada y brasas en la ilustracion del lanzador (0 = imagen quieta)\n"
+	  << "lanzador_niebla=" << b(s.launcher_fog) << "\n"
 	  << "\n"
 	  << "[Pantalla]\n"
 	  << "; Iluminacion IBL: mitad, completa; Teselado: bajo, medio, alto, ultra, extremo (vacio: segun la salida, 4K completa + alto, si no mitad + medio)\n"

@@ -2949,6 +2949,7 @@ void LauncherAjustes(Settings& s) {
 		}
 	}
 	LCheckRow("Copia de las partidas al arrancar", s.backup_saves, "Copia _SaveData en _SaveData-copias cada vez que pulsas JUGAR.");
+	LCheckRow("Niebla y brasas en el lanzador", s.launcher_fog, "Niebla animada y brasas, ceniza y luces de alma flotando sobre la ilustración de este lanzador. Desactívalo si prefieres la imagen quieta.");
 	// (ds-pc-port37) "Continuar donde lo dejé (F1)" removed (the owner asked).
 	{
 		const float y = RowY();
@@ -3157,6 +3158,210 @@ void DrawHourglass(ImDrawList* dl, ImVec2 c, float h, double t) {
 	dl->AddLine(P(-hw * 1.4f, hh), P(hw * 1.4f, hh), frame, std::max(2.0f, h * 0.10f));
 }
 
+// ---- (des-upstream-1106) The launcher's "living illustration": volumetric fog drifting in parallax layers over the
+// ground of fondo-launcher.jpg, and embers, ash and soul lights rising from it with a soft glow. All on the background
+// draw list, under every window (the menus are never covered); nothing above the ground line, where the logo is (the
+// logo's corner of the art is also left out explicitly). Two small textures made once on the CPU (a horizontally
+// tileable fog of value noise, a round glow); about 90 quads a frame. It fades in over two seconds and stops with
+// settings.ini lanzador_niebla=0 (Ajustes > "Niebla y brasas en el lanzador"). ----
+namespace Ambience {
+
+ImTextureData* g_fog  = nullptr; // 512 x 128, white, alpha = fog density (tileable along x)
+ImTextureData* g_glow = nullptr; // 64 x 64, white, a soft round falloff
+double         g_start = -1.0;
+
+struct Particle {
+	float x, y;   // in the art's 0..1 coordinates
+	float vx, vy; // per second
+	float size;   // in units of the art's height
+	float life, age;
+	float phase;
+	int   kind;   // 0 ember, 1 ash, 2 soul light
+};
+std::vector<Particle> g_particles;
+uint32_t              g_rng = 0x9E3779B9u;
+
+float Rand() {
+	g_rng ^= g_rng << 13;
+	g_rng ^= g_rng >> 17;
+	g_rng ^= g_rng << 5;
+	return static_cast<float>(g_rng & 0xFFFFFF) / static_cast<float>(0x1000000);
+}
+
+float Hash(int x, int y, int period) {
+	x = ((x % period) + period) % period;
+	uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u;
+	h          = (h ^ (h >> 13)) * 1274126177u;
+	return static_cast<float>((h ^ (h >> 16)) & 0xFFFF) / 65535.0f;
+}
+
+float Noise(float x, float y, int period) {
+	const int   xi = static_cast<int>(std::floor(x)), yi = static_cast<int>(std::floor(y));
+	const float fx = x - xi, fy = y - yi;
+	const float sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+	const float a = Hash(xi, yi, period), b = Hash(xi + 1, yi, period);
+	const float c = Hash(xi, yi + 1, period), d = Hash(xi + 1, yi + 1, period);
+	return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+}
+
+ImTextureData* MakeTexture(int w, int h, const std::function<uint8_t(int, int)>& alpha) {
+	auto* t = IM_NEW(ImTextureData)();
+	t->Create(ImTextureFormat_RGBA32, w, h);
+	auto* p = static_cast<uint8_t*>(t->GetPixels());
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++, p += 4) {
+			p[0] = p[1] = p[2] = 255;
+			p[3]               = alpha(x, y);
+		}
+	t->UseColors = true;
+	ImGui::RegisterUserTexture(t);
+	return t;
+}
+
+void Ensure() {
+	if (g_fog == nullptr) {
+		constexpr int W = 512, H = 128;
+		g_fog = MakeTexture(W, H, [](int x, int y) {
+			// Four octaves of value noise, periodic along x (the cells per width a whole number at every octave).
+			float v = 0, amp = 0.55f, sum = 0;
+			int   cells = 6;
+			for (int o = 0; o < 4; o++, cells *= 2, amp *= 0.5f) {
+				const float k = static_cast<float>(cells) / W;
+				v += amp * Noise(x * k, y * k * 1.6f + o * 17.0f, cells);
+				sum += amp;
+			}
+			v /= sum;
+			float d = std::clamp((v - 0.32f) / 0.5f, 0.0f, 1.0f);
+			d       = d * d * (3 - 2 * d);
+			// Soft at the top and bottom of the strip, a little denser toward its bottom.
+			const float fy   = (y + 0.5f) / H;
+			const float edge = std::sin(fy * 3.14159265f);
+			return static_cast<uint8_t>(std::clamp(d * edge * edge * (0.6f + 0.4f * fy) * 255.0f, 0.0f, 255.0f));
+		});
+	}
+	if (g_glow == nullptr) {
+		constexpr int S = 64;
+		g_glow = MakeTexture(S, S, [](int x, int y) {
+			const float dx = (x + 0.5f) / S * 2 - 1, dy = (y + 0.5f) / S * 2 - 1;
+			const float r = std::sqrt(dx * dx + dy * dy);
+			const float a = std::exp(-r * r * 4.5f) * std::clamp(1.0f - r, 0.0f, 1.0f);
+			return static_cast<uint8_t>(a * 255.0f);
+		});
+	}
+}
+
+void Free() {
+	FreeTexture(g_fog);
+	FreeTexture(g_glow);
+	g_particles.clear();
+	g_start = -1.0;
+}
+
+void Spawn(Particle& p, bool anywhere) {
+	const float r = Rand();
+	p.kind        = r < 0.55f ? 0 : r < 0.85f ? 1 : 2;
+	p.x           = Rand();
+	p.y           = anywhere ? 0.45f + Rand() * 0.55f : 0.92f + Rand() * 0.1f;
+	p.vx          = (Rand() - 0.5f) * 0.012f + 0.006f;
+	p.vy          = p.kind == 1 ? -(0.008f + Rand() * 0.012f) : -(0.015f + Rand() * 0.03f);
+	p.size        = p.kind == 2 ? 0.0035f + Rand() * 0.003f : p.kind == 1 ? 0.0018f + Rand() * 0.0018f : 0.0015f + Rand() * 0.002f;
+	p.life        = 8.0f + Rand() * 10.0f;
+	p.age         = anywhere ? Rand() * p.life * 0.7f : 0.0f;
+	p.phase       = Rand() * 6.2831853f;
+}
+
+// `x0, y0, w, h`: where the art is on the screen.
+void Draw(ImDrawList* dl, float x0, float y0, float w, float h, float width, float height) {
+	if (!g_edit.launcher_fog || w <= 0 || h <= 0) return;
+	Ensure();
+	const double now = ImGui::GetTime();
+	if (g_start < 0) g_start = now;
+	const float fade_in = std::clamp(static_cast<float>(now - g_start) / 2.0f, 0.0f, 1.0f);
+	const float fade    = fade_in * fade_in * (3 - 2 * fade_in);
+	const float t       = static_cast<float>(now - g_start);
+	const float dt      = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
+	// The ground of the art's visible part (a wider screen cuts its bottom).
+	const float bottom = std::min(y0 + h, height);
+	dl->PushClipRect({0, 0}, {width, height}, false);
+
+	// Fog: far layers higher, slower, fainter and bluer; near ones lower, faster and denser.
+	struct Layer {
+		float center, thick, speed, alpha, tile;
+		ImU32 rgb;
+	};
+	static const Layer layers[] = {
+	    {0.60f, 0.22f, 0.006f, 0.16f, 1.6f, IM_COL32(150, 162, 182, 0)},
+	    {0.72f, 0.24f, 0.011f, 0.20f, 1.3f, IM_COL32(165, 172, 188, 0)},
+	    {0.84f, 0.26f, 0.019f, 0.26f, 1.1f, IM_COL32(178, 180, 190, 0)},
+	    {0.95f, 0.24f, 0.032f, 0.30f, 0.9f, IM_COL32(190, 186, 184, 0)},
+	};
+	for (size_t i = 0; i < std::size(layers); i++) {
+		const auto& L      = layers[i];
+		const float band_h = L.thick * h;
+		const float top    = y0 + L.center * h - band_h * 0.5f;
+		if (top >= bottom) continue;
+		const float tile_w = w * L.tile;
+		// A slow breathing of each layer's density; alternate layers drift the other way.
+		const float breath = 0.85f + 0.15f * std::sin(t * 0.21f + static_cast<float>(i) * 1.7f);
+		const float dir    = (i % 2 == 0) ? 1.0f : -0.6f;
+		float       off    = std::fmod(t * L.speed * w * dir, tile_w);
+		if (off > 0) off -= tile_w;
+		const int   a   = static_cast<int>(std::clamp(L.alpha * breath * fade, 0.0f, 1.0f) * 255.0f);
+		const ImU32 col = (L.rgb & ~IM_COL32_A_MASK) | (static_cast<ImU32>(a) << IM_COL32_A_SHIFT);
+		// A gentle vertical sway, so the layers do not slide as rigid sheets.
+		const float sway = std::sin(t * 0.13f + static_cast<float>(i)) * h * 0.006f;
+		for (float x = x0 + off; x < width; x += tile_w)
+			dl->AddImage(g_fog->GetTexRef(), {x, top + sway}, {x + tile_w, top + sway + band_h}, {0, 0}, {1, 1}, col);
+	}
+
+	// Particles: ~90 at 1080 lines, fewer on small windows.
+	const size_t count = static_cast<size_t>(std::clamp(height / 12.0f, 40.0f, 110.0f));
+	if (g_particles.size() != count) {
+		g_particles.resize(count);
+		for (auto& p: g_particles) Spawn(p, true);
+	}
+	// The logo's corner of the art (its top-left 31 % x 32 %) gets none.
+	const float logo_r = x0 + 0.31f * w, logo_b = y0 + 0.32f * h;
+	for (auto& p: g_particles) {
+		p.age += dt;
+		if (p.age >= p.life || p.y < 0.25f) {
+			Spawn(p, false);
+			continue;
+		}
+		const float wob = std::sin(t * (p.kind == 1 ? 0.9f : 1.6f) + p.phase);
+		p.x += (p.vx + wob * 0.004f) * dt;
+		p.y += p.vy * dt;
+		if (p.x > 1.02f) p.x -= 1.04f;
+		if (p.x < -0.02f) p.x += 1.04f;
+		const float sx = x0 + p.x * w, sy = y0 + p.y * h;
+		if (sy > bottom || (sx < logo_r && sy < logo_b)) continue;
+		// In over the first second, out over the last third; fainter as they climb.
+		const float life_a = std::min(p.age / 1.0f, 1.0f) * std::clamp((p.life - p.age) / (p.life * 0.33f), 0.0f, 1.0f);
+		const float climb  = std::clamp((p.y - 0.25f) / 0.35f, 0.0f, 1.0f);
+		const float flick  = p.kind == 0 ? 0.75f + 0.25f * std::sin(t * 7.0f + p.phase * 3.0f) : 1.0f;
+		const float alpha  = life_a * climb * flick * fade;
+		if (alpha <= 0.01f) continue;
+		const float r = p.size * h;
+		int         cr, cg, cb;
+		float       core, glow;
+		switch (p.kind) {
+			case 0: cr = 255, cg = 140, cb = 60, core = 0.95f, glow = 0.30f; break;   // ember
+			case 1: cr = 170, cg = 165, cb = 160, core = 0.40f, glow = 0.0f; break;  // ash
+			default: cr = 205, cg = 225, cb = 255, core = 0.80f, glow = 0.22f; break; // soul light
+		}
+		if (glow > 0) {
+			const float g = r * (p.kind == 2 ? 7.0f : 5.0f);
+			dl->AddImage(g_glow->GetTexRef(), {sx - g, sy - g}, {sx + g, sy + g}, {0, 0}, {1, 1},
+			             IM_COL32(cr, cg, cb, static_cast<int>(glow * alpha * 255.0f)));
+		}
+		dl->AddImage(g_glow->GetTexRef(), {sx - r * 1.6f, sy - r * 1.6f}, {sx + r * 1.6f, sy + r * 1.6f}, {0, 0}, {1, 1},
+		             IM_COL32(std::min(255, cr + 30), std::min(255, cg + 50), std::min(255, cb + 40), static_cast<int>(core * alpha * 255.0f)));
+	}
+	dl->PopClipRect();
+}
+
+} // namespace Ambience
+
 void DrawLauncher(float width, float height) {
 	DrainInputs();
 	EnsureBackground();
@@ -3176,6 +3381,7 @@ void DrawLauncher(float width, float height) {
 		const float w = g_bg_w * scale, h = g_bg_h * scale;
 		const float y0 = h >= height ? 0.0f : (height - h) * 0.5f;
 		bg->AddImage(g_background->GetTexRef(), {0, y0}, {w, y0 + h});
+		Ambience::Draw(bg, 0, y0, w, h, width, height);
 		if (h < height) {
 			bg->AddRectFilledMultiColor({0, y0}, {width, y0 + U(60)}, IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0));
 			bg->AddRectFilledMultiColor({0, y0 + h - U(60)}, {width, y0 + h}, IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255));
@@ -5335,6 +5541,7 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	}
 	FreeTexture(g_knight);
 	g_knight_tried = false;
+	Ambience::Free();
 	g_font_body = g_font_semi = g_font_serif = nullptr;
 	ImGui::DestroyContext(context);
 	ImGui::SetCurrentContext(previous);
