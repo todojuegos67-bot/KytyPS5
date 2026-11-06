@@ -27,6 +27,7 @@
 #include "video_core/bb/bb_dyn_multiplier.h"
 #include "video_core/bb/bb_fg_internal.h"
 #include "video_core/bb/bb_kyty_compat.h"
+#include "video_core/bb/bb_objmv.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -100,6 +101,27 @@ struct Stats {
     double pace_n = 0, pace_sum = 0, pace_sq = 0, pace_max = 0; // real present intervals (s)
     double prepare_ms = 0, present_ms = 0, max_present_ms = 0;
 } g_stats;
+
+// 1.40 (bb-fgamd-140): the per-second [fg-amd] line: what FSR 3 frame interpolation got and did.
+struct AmdSecond {
+    uint32_t prepared = 0;         // prepare dispatches (real frames given to FG)
+    uint32_t input_resets = 0;     // inputs with our (upscaler history) reset flag
+    uint32_t restarts = 0;         // generation turned on again after a present without it
+    uint32_t gaps = 0;             // presents without inputs while generating (repeat / no 3D)
+    float mv_scale[2]{};
+    float near_v = 0, far_v = 0, fov = 0, jitter[2]{};
+    bool depth_inverted = false;
+    // 1.41 (bb-fg30-141): frame pairing of each prepared frame (guest frame numbers stamped by
+    // the rasterizer: colour, depth copy, camera motion pass, object-vector compose, HUD-less).
+    uint32_t paired = 0, off_depth = 0, off_mv = 0, off_obj = 0, off_hudless = 0;
+    uint64_t last_ids[5]{~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+    uint64_t last_ffx_frame = 0;
+    double dt_sum = 0, dt_max = 0;
+    uint32_t hudless_given = 0;
+} g_amd;
+// The frame-generation dispatches the swapchain made (frames interpolated) and how many of them
+// came with FSR's own history reset (its frameID chain broken, or the first after a gap).
+std::atomic<uint32_t> g_amd_dispatches{0}, g_amd_ffx_resets{0};
 
 std::mutex g_mutex; // the contexts are not thread safe (presents, prepare, destruction)
 
@@ -963,6 +985,69 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
             g_ft.rephase = 0;
             g_ft.own_slots = 0;
         }
+        {
+            // 1.40: what FSR 3 frame interpolation got (bb-fgamd-140), beside [fg-objmv].
+            const auto cov = BB::ObjMotion::TakeCoverage();
+            const uint32_t dispatches = g_amd_dispatches.exchange(0, std::memory_order_relaxed);
+            const uint32_t ffx_resets = g_amd_ffx_resets.exchange(0, std::memory_order_relaxed);
+            const double all = static_cast<double>(std::max<uint64_t>(cov.all_px, 1));
+            {
+                // 1.41: one line proving which frame each input came from, and what FSR 3 was
+                // told for it. "paired" = colour == depth == camera MVs == object MVs == HUD-less.
+                const uint32_t n = std::max<uint32_t>(g_amd.prepared, 1);
+                const auto id = [](uint64_t v) {
+                    return v == ~0ull ? -1ll : static_cast<long long>(v);
+                };
+                const double chr = static_cast<double>(std::max<uint64_t>(cov.character_px, 1));
+                Printf("[fg-amd] 1.41 pairing: %u of %u prepared frames paired (colour == depth "
+                       "== camera MV == object MV == HUD-less frame); off: depth %u, camera MV %u, "
+                       "object MV %u (no G-buffer motion pass that frame = camera-only), HUD-less "
+                       "%u | last ids colour %lld depth %lld mv %lld obj %lld hudless %lld, FSR "
+                       "frameID %llu | told FSR: frameTimeDelta mean %.2f ms max %.2f, HUD-less "
+                       "colour %u/%u, UI texture none, flags 0x%x, viewSpaceToMeters 1, reset 0 "
+                       "unless camera cut | character vectors: %.1f %% of character pixels near "
+                       "zero (< 0.25 px), %.1f %% with own motion (> 1 px off camera)",
+                       g_amd.paired, g_amd.prepared, g_amd.off_depth, g_amd.off_mv, g_amd.off_obj,
+                       g_amd.off_hudless, id(g_amd.last_ids[0]), id(g_amd.last_ids[1]),
+                       id(g_amd.last_ids[2]), id(g_amd.last_ids[3]), id(g_amd.last_ids[4]),
+                       static_cast<unsigned long long>(g_amd.last_ffx_frame), g_amd.dt_sum / n,
+                       g_amd.dt_max, g_amd.hudless_given, g_amd.prepared,
+                       EnvOn("KYTY_FSR3_DEBUG_VIEW", false)
+                           ? static_cast<uint32_t>(FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW)
+                           : 0u,
+                       cov.character_px ? 100.0 * static_cast<double>(cov.character_still_px) / chr
+                                        : 0.0,
+                       cov.character_px ? 100.0 * static_cast<double>(cov.character_own_px) / chr
+                                        : 0.0);
+            }
+            Printf("[fg-amd] 1.40 %.1f s: frames interpolated %u (%.1f/s; real %u, prepared %u, "
+                   "FSR history resets %u, restarts after a gap %u, presents without inputs "
+                   "while generating %u, input resets %u) | object-MV pixel coverage %.2f %% "
+                   "(characters %.2f %%; %u of %u composes read; %u composes on a reset frame%s, "
+                   "%u without a G-buffer motion pass)%s | MV scale %.3f %.3f (render px towards "
+                   "the previous frame, /render size in FSR), jitter %.3f %.3f | camera near %.6g "
+                   "far %.6g fov %.4f rad (%.1f deg), depth %s",
+                   window, dispatches, dispatches / window, g_stats.real, g_amd.prepared,
+                   ffx_resets, g_amd.restarts, g_amd.gaps, g_amd.input_resets,
+                   100.0 * static_cast<double>(cov.object_px) / all,
+                   100.0 * static_cast<double>(cov.character_px) / all, cov.frames_read,
+                   cov.composes, cov.reset_frames,
+                   cov.reset_skip_rule ? ", object vectors DROPPED there (BB_OBJMV_RESET_SKIP=1)"
+                                       : ", object vectors kept",
+                   cov.not_written, cov.enabled ? "" : " [coverage off]", g_amd.mv_scale[0],
+                   g_amd.mv_scale[1], g_amd.jitter[0], g_amd.jitter[1], g_amd.near_v,
+                   g_amd.far_v, g_amd.fov, g_amd.fov * 57.29578f,
+                   g_amd.depth_inverted ? "inverted (near > far given, infinite flag)"
+                                        : "forward");
+            const AmdSecond keep = g_amd;
+            g_amd = {};
+            std::copy_n(keep.mv_scale, 2, g_amd.mv_scale);
+            std::copy_n(keep.jitter, 2, g_amd.jitter);
+            g_amd.near_v = keep.near_v;
+            g_amd.far_v = keep.far_v;
+            g_amd.fov = keep.fov;
+            g_amd.depth_inverted = keep.depth_inverted;
+        }
         MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
         g_stats = {};
         g_stats.start = now;
@@ -970,6 +1055,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     }
     g_stats.real++;
     if (!usable) g_stats.no_inputs++;
+    if (!usable && g_generating) g_amd.gaps++;
     {
         static std::chrono::steady_clock::time_point prev{};
         const double dt = prev == std::chrono::steady_clock::time_point{}
@@ -1016,6 +1102,8 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     config.presentCallbackUserContext = nullptr;
     config.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params,
                                         void* context) -> ffxReturnCode_t {
+        g_amd_dispatches.fetch_add(1, std::memory_order_relaxed);
+        if (params->reset) g_amd_ffx_resets.fetch_add(1, std::memory_order_relaxed);
         return g_ffx.Dispatch(reinterpret_cast<ffxContext*>(context), &params->header);
     };
     config.frameGenerationCallbackUserContext = &g_fg_context;
@@ -1027,7 +1115,11 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         ui.header.type = FFX_API_CONFIGURE_DESC_TYPE_FGSWAPCHAIN_REGISTERUIRESOURCE_VK;
         g_ffx.Configure(&g_swapchain_context, &ui.header);
     }
-    const bool hudless = generate && inputs->has_hudless && inputs->hudless.image &&
+    // 1.40: KYTY_FSR3_HUDLESS=0 gives FSR 3 no HUD-less image (A/B: FSR then interpolates the
+    // whole back buffer, HUD included; with it, wherever the back buffer and the HUD-less image
+    // differ FSR takes the real frame's pixels as UI, which on characters would look 30 fps).
+    static const bool give_hudless = EnvOn("KYTY_FSR3_HUDLESS", true);
+    const bool hudless = give_hudless && generate && inputs->has_hudless && inputs->hudless.image &&
                          inputs->hudless.extent == backbuffer && inputs->hudless.format == format;
     config.HUDLessColor = FfxApiResource{};
     if (hudless) {
@@ -1143,6 +1235,38 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     }
     prepare.depth = ImageResource(inputs->depth, true);
     prepare.motionVectors = ImageResource(inputs->motion, false);
+    ++g_amd.prepared;
+    if (inputs->reset) ++g_amd.input_resets;
+    {
+        // 1.41: frame pairing of this prepare's inputs (bb_fg.h Inputs, guest frame numbers).
+        const uint64_t c = inputs->color_frame;
+        const bool d_ok = inputs->depth_frame == c, m_ok = inputs->mv_frame == c,
+                   o_ok = inputs->obj_frame == c,
+                   h_ok = !hudless || inputs->hudless_frame == c;
+        if (!d_ok) ++g_amd.off_depth;
+        if (!m_ok) ++g_amd.off_mv;
+        if (!o_ok) ++g_amd.off_obj;
+        if (!h_ok) ++g_amd.off_hudless;
+        if (c != ~0ull && d_ok && m_ok && o_ok && h_ok) ++g_amd.paired;
+        g_amd.last_ids[0] = c;
+        g_amd.last_ids[1] = inputs->depth_frame;
+        g_amd.last_ids[2] = inputs->mv_frame;
+        g_amd.last_ids[3] = inputs->obj_frame;
+        g_amd.last_ids[4] = hudless ? inputs->hudless_frame : ~0ull;
+        g_amd.last_ffx_frame = g_frame_id;
+        g_amd.dt_sum += prepare.frameTimeDelta;
+        g_amd.dt_max = std::max<double>(g_amd.dt_max, prepare.frameTimeDelta);
+        if (hudless) ++g_amd.hudless_given;
+    }
+    if (!g_generating) ++g_amd.restarts;
+    g_amd.mv_scale[0] = prepare.motionVectorScale.x;
+    g_amd.mv_scale[1] = prepare.motionVectorScale.y;
+    g_amd.jitter[0] = prepare.jitterOffset.x;
+    g_amd.jitter[1] = prepare.jitterOffset.y;
+    g_amd.near_v = prepare.cameraNear;
+    g_amd.far_v = prepare.cameraFar;
+    g_amd.fov = prepare.cameraFovAngleVertical;
+    g_amd.depth_inverted = inputs->depth_inverted;
     ffxDispatchDescFrameGenerationPrepareCameraInfo camera_info{};
     camera_info.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
     if (camera.valid) {

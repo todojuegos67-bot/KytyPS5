@@ -123,6 +123,11 @@ struct Inputs {
     uint32_t reflex_index = 0; // GuestFlip's index of this frame (0: none)
     uint32_t sl_frame = 0;  // Streamline frame index of this frame's DLSS evaluate (0: none)
     const char* hudless_source = "none"; // where the HUD-less image came from (log)
+    // 1.41 (bb-fg30-141): guest frame numbers of what these inputs hold (~0: unknown), for the
+    // [fg-amd] pairing check: colour (the flip), depth / vectors copied, camera motion pass,
+    // object-vector compose, HUD-less image. All equal when the inputs belong to one frame.
+    uint64_t color_frame = ~0ull, depth_frame = ~0ull, mv_frame = ~0ull, obj_frame = ~0ull,
+             hudless_frame = ~0ull;
 };
 // FG wants the inputs captured (any method asked and its back end ready).
 bool WantInputs();

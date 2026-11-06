@@ -98,4 +98,23 @@ void OnFlip();
 // motion vectors (0: none composed, camera-only motion).
 u32 ComposedDraws();
 
+// 1.40 (bb-fgamd-140): what the compose pass put into the motion image since the last call (the
+// [fg-amd] line): pixels with an object vector / of characters (large skeletons) / all, composes,
+// frames read back, frames whose upscaler history was reset, frames left camera-only by the
+// old reset rule (BB_OBJMV_RESET_SKIP=1), composes without a G-buffer motion pass this frame.
+struct CoverageStats {
+    u64 object_px = 0, character_px = 0, all_px = 0;
+    u32 composes = 0, frames_read = 0, reset_frames = 0, reset_skipped = 0, not_written = 0;
+    bool enabled = false, reset_skip_rule = false;
+    // 1.41 (bb-fg30-141): character pixels whose object vector is near zero (< 0.25 px) and
+    // whose object vector differs from the camera one by more than 1 px (own motion seen).
+    u64 character_still_px = 0, character_own_px = 0;
+};
+CoverageStats TakeCoverage();
+// 1.41: guest frame numbers for the [fg-amd] pairing check. FrameNo(): flips seen so far (OnFlip
+// advances it; the frame being built is FrameNo()). ComposedFrame(): the guest frame whose
+// G-buffer object vectors the last compose put into the motion image (~0: none).
+u64 FrameNo();
+u64 ComposedFrame();
+
 } // namespace BB::ObjMotion

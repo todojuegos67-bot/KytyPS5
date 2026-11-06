@@ -6,7 +6,10 @@
 // render pixels towards the previous position, unjittered (the jitter is a viewport offset that
 // clip positions never see).
 // 1.20: o.y is the class (1: small skeleton / rigid, 2: large skeleton = characters).
-// p.size.w bit 0: BB_OBJMV_DEBUG statistics (stats buffer); bit 1: BB_MV_VIEW colour (viz).
+// p.size.w bit 0: BB_OBJMV_DEBUG statistics (stats buffer); bit 1: BB_MV_VIEW colour (viz);
+// bit 2 (1.40): coverage (stats words 11: object-vector pixels, 12: character pixels, 13: all
+// pixels), one global add per group (the [fg-amd] line); 1.41: words 14 / 15, character pixels
+// with a near-zero vector / with a vector > 1 px off the camera one.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, rg32ui) uniform readonly uimage2D obj_mv;
@@ -23,11 +26,48 @@ void Count(uint i, float v) {
     atomicAdd(st.s[i], uint(clamp(v, 0.0, 4096.0) * 16.0 + 0.5));
 }
 
+void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool own);
+
+shared uint cov_obj, cov_char, cov_all, cov_still, cov_own;
+
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    if (c.x >= int(p.size.x) || c.y >= int(p.size.y) || p.size.z == 0u) {
-        return;
+    bool cov = (p.size.w & 4u) != 0u;
+    if (cov) {
+        if (gl_LocalInvocationIndex == 0u) {
+            cov_obj = 0u;
+            cov_char = 0u;
+            cov_all = 0u;
+            cov_still = 0u;
+            cov_own = 0u;
+        }
+        barrier();
     }
+    bool inside = c.x < int(p.size.x) && c.y < int(p.size.y) && p.size.z != 0u;
+    bool cov_is_obj = false, cov_is_char = false, cov_is_still = false, cov_is_own = false;
+    if (inside) {
+        Body(c, cov_is_obj, cov_is_char, cov_is_still, cov_is_own);
+    }
+    if (cov) {
+        if (inside) {
+            atomicAdd(cov_all, 1u);
+            if (cov_is_obj) atomicAdd(cov_obj, 1u);
+            if (cov_is_char) atomicAdd(cov_char, 1u);
+            if (cov_is_still) atomicAdd(cov_still, 1u);
+            if (cov_is_own) atomicAdd(cov_own, 1u);
+        }
+        barrier();
+        if (gl_LocalInvocationIndex == 0u) {
+            if (cov_obj != 0u) atomicAdd(st.s[11], cov_obj);
+            if (cov_char != 0u) atomicAdd(st.s[12], cov_char);
+            atomicAdd(st.s[13], cov_all);
+            if (cov_still != 0u) atomicAdd(st.s[14], cov_still);
+            if (cov_own != 0u) atomicAdd(st.s[15], cov_own);
+        }
+    }
+}
+
+void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool own) {
     vec2 cam = imageLoad(mv_out, c).xy;
     uvec2 o = imageLoad(obj_mv, c).xy;
     vec2 v = cam;
@@ -40,6 +80,11 @@ void main() {
             imageStore(mv_out, c, vec4(v, 0.0, 0.0));
         }
     }
+    is_obj = obj;
+    is_char = obj && o.y >= 2u;
+    // 1.41: character pixels with a near-zero vector / with motion of their own.
+    still = is_char && length(v) < 0.25;
+    own = is_char && length(v - cam) > 1.0;
     if ((p.size.w & 1u) != 0u) {
         if (obj && o.y >= 2u) {
             // Character (large skeleton) pixels: object vs camera magnitude here.

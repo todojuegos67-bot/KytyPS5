@@ -8,6 +8,7 @@
 #include "video_core/bb/bb_objmv.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -115,6 +116,7 @@ struct State {
     u64 st_compacted = 0;    // 1.03: indexed draws stored for their index range only
     // 1.03: per second, what reached the frame-generation input (NoteFgInput).
     u64 fg_frames = 0, fg_with_objects = 0, fg_object_draws = 0;
+    u64 composed_frame = ~0ull; // 1.41: guest frame of the last compose's object vectors
     u32 composed_draws = 0;  // draws with last frame's positions in the frame just composed
     u32 loaded_frame = 0, loaded_last = 0; // the same, this frame / the frame the flip ended
     std::unordered_map<u64, std::pair<u32, u32>> index_ranges; // cached [min, max] by index block
@@ -171,6 +173,34 @@ bool LooseOn() {
     }();
     return on;
 }
+
+// 1.40 (bb-fgamd-140): object-vector pixel coverage of the composed motion image, always counted
+// (one global add per 8x8 group; BB_OBJMV_COVERAGE=0 off), read by the [fg-amd] line.
+bool CoverageOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("BB_OBJMV_COVERAGE");
+        return s == nullptr || s[0] != '0';
+    }();
+    return on;
+}
+
+// 1.40: an upscaler history reset (path switch, first frame of the FG-only path, camera cut) no
+// longer drops the object vectors of that frame: the per-vertex previous positions are the
+// draw's own and stay valid (a draw without them keeps the camera motion anyway). Up to 1.39
+// every reset frame gave frame generation camera-only motion: characters and enemies were
+// interpolated as if they stood still on those frames. BB_OBJMV_RESET_SKIP=1: the old rule.
+bool ResetSkip() {
+    static const bool on = [] {
+        const char* s = std::getenv("BB_OBJMV_RESET_SKIP");
+        return s != nullptr && s[0] == '1';
+    }();
+    return on;
+}
+
+struct Coverage {
+    std::atomic<u64> obj{0}, chr{0}, all{0}, chr_still{0}, chr_own{0};
+    std::atomic<u32> composes{0}, read{0}, reset_frames{0}, reset_skipped{0}, not_written{0};
+} g_cov;
 
 constexpr u32 kStatSlots = 4; // frames in flight: a slot is read back 3 composes later
 constexpr u32 kStatWords = 16;
@@ -778,19 +808,36 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     const bool wrote = late ? g.latched : g.written;
     g.composed_draws = 0;
     g.viz_valid = false;
-    if (!g.ready || !wrote || reset || g.width != render.width || g.height != render.height) {
+    if (g.ready) {
+        if (reset) g_cov.reset_frames.fetch_add(1, std::memory_order_relaxed);
+        if (!wrote) g_cov.not_written.fetch_add(1, std::memory_order_relaxed);
+        if (reset && wrote && ResetSkip()) g_cov.reset_skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!g.ready || !wrote || (reset && ResetSkip()) || g.width != render.width ||
+        g.height != render.height) {
         return;
     }
     // 1.20: the motion image of the frame being composed (late: the one the flip just ended,
     // OnFlip has already advanced g.frame).
     const u32 index = static_cast<u32>((late ? g.frame - 1 : g.frame) & 1);
+    g.composed_frame = late ? g.frame - 1 : g.frame;
     const bool debug = DebugOn() && g.stats_mapped != nullptr;
+    const bool coverage = CoverageOn() && g.stats_mapped != nullptr;
+    const bool stats = debug || coverage;
     const bool view = ViewOn();
     const u32 stat_slot = static_cast<u32>(g.compose_no % kStatSlots);
-    if (debug) {
+    if (stats) {
         // The slot's last use was kStatSlots composes ago (finished on the GPU by now).
         u32* words = g.stats_mapped + size_t(stat_slot) * kStatWords;
-        if (g.compose_no >= kStatSlots) {
+        if (coverage && g.compose_no >= kStatSlots && words[13] != 0) {
+            g_cov.obj.fetch_add(words[11], std::memory_order_relaxed);
+            g_cov.chr.fetch_add(words[12], std::memory_order_relaxed);
+            g_cov.all.fetch_add(words[13], std::memory_order_relaxed);
+            g_cov.chr_still.fetch_add(words[14], std::memory_order_relaxed);
+            g_cov.chr_own.fetch_add(words[15], std::memory_order_relaxed);
+            g_cov.read.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (debug && g.compose_no >= kStatSlots) {
             for (u32 k = 0; k < kStatWords; ++k) {
                 if (k == 4) {
                     g.dbg[4] = std::max<u64>(g.dbg[4], words[k]);
@@ -840,14 +887,15 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
         vk::WriteDescriptorSet{.dstBinding = 2,
                                .descriptorCount = 1,
                                .descriptorType = vk::DescriptorType::eStorageBuffer,
-                               .pBufferInfo = debug ? &stats_slot_info : &stats_info},
+                               .pBufferInfo = stats ? &stats_slot_info : &stats_info},
         vk::WriteDescriptorSet{.dstBinding = 3,
                                .descriptorCount = 1,
                                .descriptorType = vk::DescriptorType::eStorageImage,
                                .pImageInfo = &viz_info},
     };
     const std::array<u32, 4> push{render.width, render.height, 1u,
-                                  (debug ? 1u : 0u) | (view ? 2u : 0u)};
+                                  (debug ? 1u : 0u) | (view ? 2u : 0u) | (coverage ? 4u : 0u)};
+    g_cov.composes.fetch_add(1, std::memory_order_relaxed);
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
@@ -997,8 +1045,33 @@ void OnFlip() {
     }
 }
 
+u64 FrameNo() {
+    return g.frame;
+}
+
+u64 ComposedFrame() {
+    return g.composed_frame;
+}
+
 u32 ComposedDraws() {
     return g.ready ? g.composed_draws : 0;
+}
+
+CoverageStats TakeCoverage() {
+    CoverageStats c;
+    c.object_px = g_cov.obj.exchange(0, std::memory_order_relaxed);
+    c.character_px = g_cov.chr.exchange(0, std::memory_order_relaxed);
+    c.all_px = g_cov.all.exchange(0, std::memory_order_relaxed);
+    c.composes = g_cov.composes.exchange(0, std::memory_order_relaxed);
+    c.frames_read = g_cov.read.exchange(0, std::memory_order_relaxed);
+    c.reset_frames = g_cov.reset_frames.exchange(0, std::memory_order_relaxed);
+    c.reset_skipped = g_cov.reset_skipped.exchange(0, std::memory_order_relaxed);
+    c.not_written = g_cov.not_written.exchange(0, std::memory_order_relaxed);
+    c.character_still_px = g_cov.chr_still.exchange(0, std::memory_order_relaxed);
+    c.character_own_px = g_cov.chr_own.exchange(0, std::memory_order_relaxed);
+    c.enabled = g.ready && CoverageOn();
+    c.reset_skip_rule = ResetSkip();
+    return c;
 }
 
 } // namespace BB::ObjMotion
