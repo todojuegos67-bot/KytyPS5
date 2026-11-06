@@ -119,6 +119,16 @@ struct State {
     u32 loaded_frame = 0, loaded_last = 0; // the same, this frame / the frame the flip ended
     std::unordered_map<u64, std::pair<u32, u32>> index_ranges; // cached [min, max] by index block
     u64 st_rigid_tracked = 0, st_rigid_static = 0, st_rigid_budget = 0, st_rigid_camera = 0;
+    // 1.29: identity of a skinned draw by its bone palette's guest address (one per character /
+    // enemy instance when the game keeps it there), tried before the shader / stream identity:
+    // several enemies of one model share shader, vertex and index streams and were told apart
+    // only by draw order, which changes with sorting (an enemy given another one's positions).
+    std::unordered_map<u64, Entry> prev_pal, cur_pal;
+    std::unordered_map<u64, u32> pal_ordinals;
+    // 1.29 [fg-skinmv] per second (draws).
+    u64 sk_pal = 0, sk_exact = 0, sk_loose = 0, sk_none = 0, sk_overflow = 0, sk_frames = 0;
+    u64 ot_prev = 0, ot_none = 0;
+    std::chrono::steady_clock::time_point sk_since = std::chrono::steady_clock::now();
 };
 State g;
 
@@ -142,6 +152,14 @@ bool ViewOn() {
     static const bool on = [] {
         const char* s = std::getenv("BB_MV_VIEW");
         return s != nullptr && s[0] != '0';
+    }();
+    return on;
+}
+
+bool PaletteIdOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("BB_OBJMV_PALETTE_ID");
+        return s == nullptr || s[0] != '0';
     }();
     return on;
 }
@@ -411,7 +429,8 @@ u64 Hash(const void* data, size_t size, u64 seed = 0) {
 // 0.71: no palette but per-draw constants (a rigid object's transform, 16..1024 bytes, not the
 // scene block): Rigid, with their hash in rigid_hash.
 enum class Palette { None, Small, Large, Rigid };
-Palette Classify(const Shader::Info& vs, VAddr& small_address, u32& small_size, u64& rigid_hash) {
+Palette Classify(const Shader::Info& vs, VAddr& small_address, u32& small_size, u64& rigid_hash,
+                 VAddr& large_address) {
     Palette found = Palette::None;
     u64 h = 0;
     bool any = false;
@@ -424,7 +443,10 @@ Palette Classify(const Shader::Info& vs, VAddr& small_address, u32& small_size, 
             any = true;
         }
         if (size == 864 || size < 96 || size > 16384) continue;
-        if (size >= 640 && size % 16 == 0) return Palette::Large;
+        if (size >= 640 && size % 16 == 0) {
+            large_address = sharp.base_address;
+            return Palette::Large;
+        }
         if (size < 640 && size % 48 == 0 && found == Palette::None) {
             found = Palette::Small;
             small_address = sharp.base_address;
@@ -568,7 +590,8 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
     VAddr palette_address = 0;
     u32 palette_size = 0;
     u64 rigid_hash = 0;
-    const Palette palette = Classify(vs, palette_address, palette_size, rigid_hash);
+    VAddr large_address = 0;
+    const Palette palette = Classify(vs, palette_address, palette_size, rigid_hash, large_address);
     if (palette == Palette::None || fetch.Empty() || fetch.attributes.empty()) return;
     const auto vb = fetch.attributes[0].GetSharp(vs);
     if (vb.GetStride() == 0) return;
@@ -662,7 +685,10 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         // Dropped draws keep camera motion. Split by palette class, with the largest one, so the
         // next log shows whether character skeletons are among them.
         ++g.st_overflow;
-        if (palette == Palette::Large) ++g.st_overflow_large;
+        if (palette == Palette::Large) {
+            ++g.st_overflow_large;
+            ++g.sk_overflow;
+        }
         g.st_overflow_max = std::max(g.st_overflow_max, count);
         return;
     }
@@ -676,11 +702,29 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         ++g.dbg_large;
     }
     bool found = false;
-    if (const auto it = g.prev.find(key); it != g.prev.end()) {
+    u64 pal_key = 0;
+    if (large && large_address != 0 && PaletteIdOn()) {
+        std::array<u64, 4> pid{vs_hash, large_address, regs.num_indices, count};
+        const u64 pal_base = Hash(pid.data(), sizeof(pid), 0x736b696e6d76ull);
+        const u32 pal_ordinal = g.pal_ordinals[pal_base]++;
+        pal_key = Hash(&pal_ordinal, sizeof(pal_ordinal), pal_base);
+        if (const auto it = g.prev_pal.find(pal_key);
+            it != g.prev_pal.end() && it->second.count == count && it->second.base != store_base) {
+            load_base = it->second.base;
+            found = true;
+            ++g.sk_pal;
+        }
+    }
+    if (found) {
+        // palette identity
+    } else if (const auto it = g.prev.find(key); it != g.prev.end()) {
         if (it->second.count == count) {
             load_base = it->second.base;
             found = true;
-            if (large) ++g.dbg_exact;
+            if (large) {
+                ++g.dbg_exact;
+                ++g.sk_exact;
+            }
         } else if (large) {
             ++g.dbg_count_changed;
         }
@@ -690,7 +734,10 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
             it != g.prev_loose.end() && it->second.count == count) {
             load_base = it->second.base;
             found = true;
-            if (large) ++g.dbg_loose;
+            if (large) {
+                ++g.dbg_loose;
+                ++g.sk_loose;
+            }
         }
     }
     if (found) {
@@ -699,7 +746,12 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         ++g.loaded_frame;
     } else if (large) {
         ++g.dbg_new;
+        ++g.sk_none;
     }
+    if (!large) {
+        if (found) ++g.ot_prev; else ++g.ot_none;
+    }
+    if (pal_key != 0) g.cur_pal[pal_key] = {store_base, count};
     g.cur[key] = {store_base, count};
     g.cur_loose[loose_key] = {store_base, count};
     ++g.st_tracked;
@@ -859,6 +911,28 @@ void OnFlip() {
     g.prev_loose = std::move(g.cur_loose);
     g.cur_loose.clear();
     g.loose_ordinals.clear();
+    g.prev_pal = std::move(g.cur_pal);
+    g.cur_pal.clear();
+    g.pal_ordinals.clear();
+    ++g.sk_frames;
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g.sk_since >= std::chrono::seconds(1)) {
+            const u64 with = g.sk_pal + g.sk_exact + g.sk_loose;
+            const u64 all = with + g.sk_none;
+            Log(fmt::format(
+                "[fg-skinmv] 1.29 {} frames: skinned (bone palette) draws {} with true per-vertex "
+                "previous positions ({:.1f} %: {} by palette identity, {} exact, {} loose), {} "
+                "without (camera only), {} over the budget | rigid / small-skeleton draws {} with "
+                "previous positions, {} without | palette identity {}",
+                g.sk_frames, with, all ? 100.0 * double(with) / double(all) : 0.0, g.sk_pal,
+                g.sk_exact, g.sk_loose, g.sk_none, g.sk_overflow, g.ot_prev, g.ot_none,
+                PaletteIdOn() ? "on" : "off (BB_OBJMV_PALETTE_ID=0)"));
+            g.sk_pal = g.sk_exact = g.sk_loose = g.sk_none = g.sk_overflow = g.sk_frames = 0;
+            g.ot_prev = g.ot_none = 0;
+            g.sk_since = now;
+        }
+    }
     if (DebugOn()) {
         const auto now = std::chrono::steady_clock::now();
         if (now - g.dbg_since >= std::chrono::seconds(1)) {
