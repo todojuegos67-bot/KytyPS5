@@ -36,6 +36,18 @@ uint64_t CurrentThreadCycles();
 int CurrentThreadPriority();
 // The idle time (100 ns units) of the CPUs this process may run on, and their mask (spin-gate.h).
 bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus);
+// While it lives, the calling thread at the normal priority if it was above it, then back (AsyncUpload's Help).
+class NormalPriority {
+public:
+	NormalPriority();
+	~NormalPriority();
+	NormalPriority(const NormalPriority&)            = delete;
+	NormalPriority& operator=(const NormalPriority&) = delete;
+
+private:
+	int  m_saved   = 0;
+	bool m_changed = false;
+};
 
 // Total CPU seconds of the threads with this name (0 where the OS cannot enumerate them).
 double NamedThreadsCpuSeconds(const char* name);

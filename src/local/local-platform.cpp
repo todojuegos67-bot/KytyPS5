@@ -559,6 +559,16 @@ int CurrentThreadPriority() {
 	return GetThreadPriority(GetCurrentThread());
 }
 
+NormalPriority::NormalPriority() {
+	m_saved   = GetThreadPriority(GetCurrentThread());
+	m_changed = m_saved != THREAD_PRIORITY_ERROR_RETURN && m_saved > THREAD_PRIORITY_NORMAL &&
+	          SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) != 0;
+}
+
+NormalPriority::~NormalPriority() {
+	if (m_changed) (void)SetThreadPriority(GetCurrentThread(), m_saved);
+}
+
 bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus) {
 	// NtQuerySystemInformation's SystemProcessorPerformanceInformation (8): each processor of the calling thread's group.
 	struct ProcessorTimes {
@@ -2312,6 +2322,17 @@ uint64_t CurrentThreadCycles() {
 
 int CurrentThreadPriority() {
 	return 0;
+}
+
+NormalPriority::NormalPriority() {
+	errno           = 0;
+	const int value = getpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)));
+	m_saved         = value;
+	m_changed = errno == 0 && value < 0 && setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 0) == 0;
+}
+
+NormalPriority::~NormalPriority() {
+	if (m_changed) (void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), m_saved);
 }
 
 bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus) {
