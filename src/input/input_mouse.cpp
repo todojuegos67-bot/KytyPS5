@@ -11,6 +11,7 @@
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input_mouse.h"
+#include "core/bb_kbmcam.h"
 
 #include <common/singleton.h>
 #include <emulator.h>
@@ -71,6 +72,9 @@ static float EnvF(const char* n, float d) {
 void SetMouseInvertY(bool invert) {
     mouse_invert_y = invert;
 }
+bool MouseInvertY() {
+    return mouse_invert_y;
+}
 
 void SetMouseGyroRollMode(bool mode) {
     mouse_gyro_roll_mode = mode;
@@ -93,10 +97,15 @@ void EmulateJoystick(GameController* controller, u32 interval) {
     }
 
     float d_x = 0, d_y = 0;
-    SDL_GetRelativeMouseState(&d_x, &d_y);
+    // (bb-kbmcam-142) shared with the camera hook (core/bb_kbmcam.cpp), which turns the camera by
+    // the mouse itself once installed: then the mouse no longer drives the stick (no double turn).
+    BB::KbmCam::PumpMouse(&d_x, &d_y);
     if (mouse_invert_y) {
         d_y = -d_y;
     }
+    const bool cam_direct = BB::KbmCam::Direct();
+    const float log_dx = d_x, log_dy = d_y;
+    if (cam_direct) d_x = d_y = 0;
 
     // (bb-input-137) linear mouse -> stick: no jump to half tilt on the first count (the old
     // deadzone offset 0.5 of 128), counts/s * sensitivity map to stick tilt, the tilt is
@@ -107,7 +116,7 @@ void EmulateJoystick(GameController* controller, u32 interval) {
     static const bool legacy = EnvF("BB_KBM_LEGACY", 0) != 0;
     static const float gamma = std::clamp(EnvF("BB_KBM_GAMMA", 2.0f), 1.0f, 4.0f);
     static const float game_dz = std::clamp(EnvF("BB_KBM_DZ", 0.10f), 0.0f, 0.5f);
-    static const float carry_ms = std::clamp(EnvF("BB_KBM_CARRY_MS", 120.0f), 0.0f, 1000.0f);
+    static const float carry_ms = std::clamp(EnvF("BB_KBM_CARRY_MS", 0.0f), 0.0f, 1000.0f);
     static const float full_cps = std::max(EnvF("BB_KBM_FULL_CPS", 1200.0f), 50.0f);
     static float carry_x = 0, carry_y = 0;
     static float carried_sum = 0;
@@ -158,12 +167,13 @@ void EmulateJoystick(GameController* controller, u32 interval) {
         controller->Axis(axis_y, GetAxis(-0x80, 0x7f, 0), false);
     }
     was_moving = moving;
+    BB::KbmCam::NoteStickOut(out_x, out_y);
 
     // once a second: what the mouse did and what went to the stick
     static float sum_x = 0, sum_y = 0;
     static int last_x = 0, last_y = 0, frames = 0;
     static Uint64 last_log = 0;
-    sum_x += d_x, sum_y += d_y;
+    sum_x += log_dx, sum_y += log_dy;
     if (moving) last_x = out_x, last_y = out_y;
     frames++;
     const Uint64 now = SDL_GetTicks();
@@ -176,7 +186,7 @@ void EmulateJoystick(GameController* controller, u32 interval) {
                  sum_x, sum_y, frames, last_x, last_y, axis_x == Axis::RightX ? "right" : "left",
                  captured ? "yes" : "no", GetMouseSensitivity(), carried_sum,
                  std::sqrt(carry_x * carry_x + carry_y * carry_y),
-                 legacy ? "legacy" : "linear+carry");
+                 legacy ? "legacy" : (cam_direct ? "direct camera" : "linear"));
         carried_sum = 0;
         sum_x = sum_y = 0, frames = 0, last_x = last_y = 0, last_log = now;
     }

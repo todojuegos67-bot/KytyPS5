@@ -3797,6 +3797,10 @@ bool g_inited = false;
 
 } // namespace
 
+bool KbmPlay() {
+    return g_kbm_play;
+}
+
 void Init(SDL_Window* window) {
     if (g_inited) {
         return;
