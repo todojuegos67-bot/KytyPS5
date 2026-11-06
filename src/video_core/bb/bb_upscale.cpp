@@ -581,7 +581,7 @@ bool AaPassSwitch() {
     return on;
 }
 struct AaSec {
-    u32 hits = 0, injected = 0, frames3d = 0;
+    u32 hits = 0, injected = 0, frames3d = 0, injected_first_read = 0;
     VAddr src = 0;
     u32 w = 0, h = 0;
     vk::Format fmt{};
@@ -2499,8 +2499,19 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         g_aa.fmt = format;
         g_aa.last_hit_frame = g_frame_no;
     }
+    // 1.34: not in the native chain (ratio > 1). There the scene's first reader is the game's
+    // exposure / luminance compute (cs 0x200820a1 / 0x9a9cf8a9, before ps 0xccc53f28aa5): held
+    // back to the post entry (1.33), the scene phase ran on through those dispatches and the
+    // exposure source 0x25bc10000 was scaled to the internal size (very dark scene, doubled
+    // characters). The chain upscales at that first read again (before exposure, bloom, tonemap
+    // and the HUD); the hash still names the source. BB_AAPASS_CHAIN_HOLD=1: 1.33 behaviour.
+    static const bool chain_hold = [] {
+        const char* e = std::getenv("BB_AAPASS_CHAIN_HOLD");
+        return e != nullptr && *e == '1';
+    }();
     const bool aa_wait = aa_mode && !aa_hit && g_aa.last_hit_frame != 0 &&
-                         g_frame_no < g_aa.last_hit_frame + 120;
+                         g_frame_no < g_aa.last_hit_frame + 120 &&
+                         (chain_hold || !NativeChainLive());
     const VAddr src = LearnedSource();
     if (src == 0 || addr != src || targets_it || g_draw.scene || aa_wait) {
         return Sample::Keep;
@@ -2550,7 +2561,11 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     if (index < need && !aa_hit) {
         return refuse(RfSkip);
     }
-    if (aa_hit) ++g_aa.injected;
+    if (aa_hit) {
+        ++g_aa.injected;
+    } else if (aa_mode && addr == g_aa.src) {
+        ++g_aa.injected_first_read; // 1.34 native chain: at the scene colour's first read
+    }
     if (!Active() || f.inject_failed) {
         return refuse(!Active() ? RfInactive : RfFailed);
     }
@@ -3751,15 +3766,17 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             if (AaPassSwitch() && (g_aa.hits > 0 || BB::ResPatch::AaPass())) {
                 Checkpoint(fmt::format(
                     "[aapass] last second: {} 3D frames, game post entry hit {} (ps {:#018x}), "
-                    "upscaled there {}; source {:#x} {}x{} {} -> {}x{} ({}), HUD drawn by the "
-                    "game after it at {}x{}; {} GPU {:.2f} ms",
-                    g_sec_frames, g_aa.hits, AaPs(), g_aa.injected, g_aa.src, g_aa.w, g_aa.h,
+                    "upscaled there {}, at the scene colour's first read (native chain, before "
+                    "exposure / bloom / tonemap) {}; source {:#x} {}x{} {} -> {}x{} ({}), HUD "
+                    "drawn by the game after it at {}x{}; {} GPU {:.2f} ms",
+                    g_sec_frames, g_aa.hits, AaPs(), g_aa.injected, g_aa.injected_first_read,
+                    g_aa.src, g_aa.w, g_aa.h,
                     vk::to_string(g_aa.fmt), g_plan.output_w, g_plan.output_h,
                     g_plan.render_w == g_plan.output_w ? "DLAA / native AA in place"
                                                        : "upscale, post chain at the output size",
                     g_output_w, g_output_h, SR::KindName(Cfg().kind),
                     g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0));
-                g_aa.hits = g_aa.injected = 0;
+                g_aa.hits = g_aa.injected = g_aa.injected_first_read = 0;
             }
             if (g_sec_frames > 0) {
                 Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
