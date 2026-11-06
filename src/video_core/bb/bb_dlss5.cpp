@@ -98,7 +98,7 @@ struct Mapped {
 	int         level = 0;
 	std::string intensity_name = "alta";
 	bool        unofficial = false;
-	bool        foveated = true;
+	bool        foveated = false; // bb-dlss5fix-115: off by default (BB_DLSS5_FOVEATED=1 opt-in)
 	float       edge = 0.5f;
 	float       model_intensity = 1.0f;
 	float       strength = 1.15f;
@@ -121,7 +121,7 @@ const Mapped& Settings() {
 		s.model_intensity = EnvF("BB_DLSS5_MODEL_INTENSITY", model, 0.0f, 2.0f);
 		s.strength = EnvF("BB_DLSS5_STRENGTH", s.intensity_name == "baja" ? 0.5f : s.intensity_name == "media" ? 1.0f : 1.15f, 0.0f, 2.0f);
 		const char* f = std::getenv("BB_DLSS5_FOVEATED");
-		s.foveated = f == nullptr || *f != '0';
+		s.foveated = f != nullptr && *f != '\0' && *f != '0';
 		return s;
 	}();
 	return m;
@@ -1076,8 +1076,9 @@ void Log(vk::Extent2D full) {
 void UpdateGrid(vk::Extent2D full) {
 	static const bool foveated = Settings().foveated;
 	static const bool measure  = [] {
-		const char* v = std::getenv("BB_DLSS5_MEASURE");
-		return v == nullptr || *v != '0';
+		// bb-dlss5fix-115: the A/B swaps the grid (and recreates the feature + resets the model's
+		// history) mid-game: off by default; BB_DLSS5_AB=1 (or BB_DLSS5_MEASURE=1) runs it once.
+		return EnvOn("BB_DLSS5_AB") || EnvOn("BB_DLSS5_MEASURE");
 	}();
 	if (g.full != full) {
 		g.full = full;
@@ -1088,7 +1089,9 @@ void UpdateGrid(vk::Extent2D full) {
 		g.foveated_now = fov.active();
 		g.ab_stage     = 2;
 		g.ab_done      = false;
-		if (g.foveated_now && measure && g.pool != nullptr) {
+		static bool ab_ran = false; // bb-dlss5fix-115: the A/B at most once per session
+		if (g.foveated_now && measure && g.pool != nullptr && !ab_ran) {
+			ab_ran = true;
 			// Uniform first: its GPU time is the reference.
 			g.ab_stage = 0;
 			g.ab_sum[0] = g.ab_sum[1] = 0.0;
