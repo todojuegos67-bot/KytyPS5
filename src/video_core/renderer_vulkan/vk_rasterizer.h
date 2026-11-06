@@ -63,6 +63,23 @@ public:
                             vk::ImageView& out_view, vk::Extent2D& out_size);
     // Copies the presented image (before its HUD) and records the window-size upscale of it.
     bool BBPresentUpscale(VideoCore::Image& flip, bool late = false);
+    // 1.07 (BB_HUD_SHARP, bb_respatch.h): after the HUD-point upscale, the output-size canvas is
+    // filled with the upscaled scene; the frame's later draws into the flip are drawn into it.
+    void BBHudSharpBegin(VideoCore::Image& flip);
+    bool BBHudSharpTarget(const VideoCore::Image& image, vk::Format view_format,
+                          vk::ImageView& view, vk::ImageLayout& layout, u32& width, u32& height);
+    bool BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip, vk::Format view_format,
+                           vk::ImageView& out_view, vk::Extent2D& out_size);
+    // 1.16 (bb-hud-116): a draw that samples the HUD target (the game's final UI-to-flip pass)
+    // after the HUD point reads the canvas instead (twin_view: the HUD-less canvas, for the
+    // frame generation twin draw); a depth-tested HUD draw uses an output-size depth twin.
+    bool BBHudSharpSampled(const VideoCore::Image& image, const VideoCore::ImageViewInfo& view_info,
+                           bool draws_into_it, vk::ImageView& view, vk::ImageLayout& layout,
+                           vk::ImageView& twin_view);
+    bool BBHudSharpDepth(VideoCore::Image& depth, vk::ImageView& view, vk::ImageLayout& layout);
+    void BBHudSharpTwinDone();
+    // The last present went through the HUD canvas (the presenter's [frame] line).
+    static bool BBHudSharpPresented();
     // 0.39 (BB_FG_NATIVE): frame generation's inputs with no upscaler; the image is not changed.
     bool BBFgNativeAnalyze(VideoCore::Image& flip, bool late = false);
     static const char* BBPresentWhy();
@@ -154,6 +171,15 @@ private:
     // BB_SCENE_UPSCALE: host / guest size of the current draw's scaled targets (1 when none).
     float bb_rt_scale_x = 1.0f, bb_rt_scale_y = 1.0f;
     u32 bb_rt_guest_w = 0, bb_rt_guest_h = 0;
+    // 1.07 sharp HUD: this draw goes into the output-size HUD canvas instead of the flip.
+    bool bb_hud_redirect = false;
+    // 1.16: this draw samples the HUD target (bound to the canvas), its twin bindings
+    // (image_infos index, HUD-less view) and the twin draw's target (the HUD-less canvas).
+    bool bb_hs_sampled = false;
+    std::vector<std::pair<size_t, vk::ImageView>> bb_hs_twin;
+    vk::ImageView bb_hs_twin_dst{};
+    vk::ImageLayout bb_hs_twin_layout{};
+    u32 bb_num_cbs = 0;
     bool BBPatchConstants(const void* data, u64 size, std::vector<u32>& out) const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;

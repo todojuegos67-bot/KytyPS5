@@ -167,6 +167,11 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
     bb_rt_scale_x = bb_rt_scale_y = 1.0f;
     bb_rt_guest_w = bb_rt_guest_h = 0;
+    bb_hud_redirect = false;
+    bb_hs_sampled = false;
+    bb_hs_twin.clear();
+    bb_hs_twin_dst = vk::ImageView{};
+    bb_num_cbs = static_cast<u32>(std::bit_width(key.mrt_mask));
     const auto bb_scaled_target = [&](VideoCore::ImageId id) {
         if (!id) return false;
         const auto& info = texture_cache.GetImage(id).info;
@@ -404,6 +409,29 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
+    }
+    if (!bb_hs_twin.empty() && bb_hs_twin_dst) {
+        // 1.16 (frame generation): the game's final pass once more, from the HUD-less canvas into
+        // its HUD-less twin: the presented frame without its HUD, through the game's own pass.
+        for (const auto& [index, view] : bb_hs_twin) {
+            image_infos[index].imageView = view;
+        }
+        RenderState twin = state;
+        twin.color_attachments[0].image_view = bb_hs_twin_dst;
+        twin.color_attachments[0].image_layout = bb_hs_twin_layout;
+        scheduler.EndRendering();
+        pipeline->BindResources(set_writes, push_data);
+        scheduler.BeginRendering(twin);
+        const auto twin_cmd = scheduler.CommandBuffer();
+        twin_cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        if (is_indexed) {
+            twin_cmd.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                                 s32(vertex_offset), instance_offset);
+        } else {
+            twin_cmd.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
+                          instance_offset);
+        }
+        BBHudSharpTwinDone();
     }
     DebugState.IncDrawCall();
 
@@ -1326,6 +1354,23 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     break;
                 }
             }
+            if (!is_storage && !image.info.props.is_depth && BB::Upscale::Enabled()) {
+                // 1.16: the game's final pass reading the HUD target reads the HUD canvas.
+                bool into_it = false;
+                for (u32 cb = 0; cb < bb_num_cbs && cb < cb_descs.size(); ++cb) {
+                    if (cb_descs[cb].image_id &&
+                        texture_cache.GetImage(cb_descs[cb].image_id).info.guest_address ==
+                            image.info.guest_address) {
+                        into_it = true;
+                    }
+                }
+                vk::ImageView bb_twin{};
+                if (BBHudSharpSampled(image, desc.view_info, into_it, bb_view, bb_layout,
+                                      bb_twin) &&
+                    bb_twin) {
+                    bb_hs_twin.emplace_back(image_infos.size(), bb_twin);
+                }
+            }
             image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
         }
     }
@@ -1379,13 +1424,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     if (VAddr bb_flip = 0; BB::Upscale::Enabled() && BB::Upscale::WantPresentUpscale(bb_flip)) {
         bool ok = false;
+        VideoCore::Image* bb_flip_image = nullptr;
         const u32 bb_num_cb = static_cast<u32>(std::bit_width(pipeline->GetGraphicsKey().mrt_mask));
         for (u32 cb = 0; cb < bb_num_cb && cb < cb_descs.size(); ++cb) {
             if (cb_descs[cb].image_id &&
                 texture_cache.GetImage(cb_descs[cb].image_id).info.guest_address == bb_flip) {
-                ok = BB::Upscale::FgNative()
-                         ? BBFgNativeAnalyze(texture_cache.GetImage(cb_descs[cb].image_id))
-                         : BBPresentUpscale(texture_cache.GetImage(cb_descs[cb].image_id));
+                bb_flip_image = &texture_cache.GetImage(cb_descs[cb].image_id);
+                ok = BB::Upscale::FgNative() ? BBFgNativeAnalyze(*bb_flip_image)
+                                             : BBPresentUpscale(*bb_flip_image);
                 break;
             }
         }
@@ -1393,6 +1439,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             BB::Upscale::OnFgNativeAnalyzed(ok);
         } else {
             BB::Upscale::OnPresentUpscaled(ok);
+            if (ok && bb_flip_image != nullptr) {
+                BBHudSharpBegin(*bb_flip_image);
+            }
         }
     }
     if (BB::Upscale::Enabled() && BB::Upscale::WantHudlessCopy() && cb_descs[0].image_id) {
@@ -1473,6 +1522,34 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.image_layout = image->backing->state.layout;
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
+        // 1.07 sharp HUD: a draw into the flip after the HUD-point upscale (one target, no depth,
+        // the flip not sampled) is drawn into the output-size canvas, viewport / scissor scaled.
+        // 1.16: a depth-tested HUD draw (health / stamina bars) too, with an output-size depth twin.
+        const bool bb_depth_ok =
+            !db_desc.image_id ||
+            (texture_cache.GetImage(db_desc.image_id).info.size.width == image->info.size.width &&
+             texture_cache.GetImage(db_desc.image_id).info.size.height ==
+                 image->info.size.height);
+        if (cb == 0 && state.num_color_attachments == 1 && bb_depth_ok &&
+            !image->binding.is_bound && BB::Upscale::Enabled()) {
+            vk::ImageView bb_view{};
+            vk::ImageLayout bb_layout{};
+            u32 bb_w = 0, bb_h = 0;
+            if (BBHudSharpTarget(*image, image_view.info.format, bb_view, bb_layout, bb_w, bb_h) &&
+                (!regs.IsClipDisabled() ||
+                 (float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB)) * bb_w <=
+                      float(instance.GetMaxViewportWidth()) * image->info.size.width &&
+                  float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB)) * bb_h <=
+                      float(instance.GetMaxViewportHeight()) * image->info.size.height))) {
+                attachment.image_view = bb_view;
+                attachment.image_layout = bb_layout;
+                bb_rt_scale_x = float(bb_w) / float(image->info.size.width);
+                bb_rt_scale_y = float(bb_h) / float(image->info.size.height);
+                state.width = bb_w;
+                state.height = bb_h;
+                bb_hud_redirect = true;
+            }
+        }
 
         image->usage.render_target = 1u;
         bb_cols[cb] = image;
@@ -1481,6 +1558,22 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.color_attachments[cb] = {};
     }
 
+    vk::ImageView bb_hs_depth_view{};
+    vk::ImageLayout bb_hs_depth_layout{};
+    if (bb_hud_redirect && db_desc.image_id &&
+        !BBHudSharpDepth(texture_cache.GetImage(db_desc.image_id), bb_hs_depth_view,
+                         bb_hs_depth_layout)) {
+        // No depth twin: the draw stays on the game's image (counted in the [hud] line).
+        bb_hud_redirect = false;
+        bb_hs_twin_dst = vk::ImageView{};
+        bb_rt_scale_x = bb_rt_scale_y = 1.0f;
+        state.color_attachments[0].image_view =
+            *texture_cache.FindRenderTarget(cb_descs[0].image_id, cb_descs[0].desc).image_view;
+        state.color_attachments[0].image_layout =
+            texture_cache.GetImage(cb_descs[0].image_id).backing->state.layout;
+        state.width = texture_cache.GetImage(cb_descs[0].image_id).info.size.width;
+        state.height = texture_cache.GetImage(cb_descs[0].image_id).info.size.height;
+    }
     if (auto image_id = db_desc.image_id; image_id) {
         auto& desc = db_desc.desc;
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
@@ -1514,13 +1607,20 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                              vk::AccessFlagBits2::eDepthStencilAttachmentRead,
                                          desc.view_info.range);
 
-        state.width = std::min<u32>(state.width, image.info.size.width);
-        state.height = std::min<u32>(state.height, image.info.size.height);
+        if (!bb_hs_depth_view) {
+            state.width = std::min<u32>(state.width, image.info.size.width);
+            state.height = std::min<u32>(state.height, image.info.size.height);
+        }
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
         auto& attachment = state.depth_stencil_attachment;
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image.backing->state.layout;
+        if (bb_hs_depth_view) {
+            // 1.16: the HUD canvas' output-size depth twin (the game's depth, scaled, this frame).
+            attachment.image_view = bb_hs_depth_view;
+            attachment.image_layout = bb_hs_depth_layout;
+        }
         attachment.clear_value = {};
         attachment.is_clear = 0;
 
@@ -1803,6 +1903,13 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.y = 0.f;
             viewport.width = float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB));
             viewport.height = float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB));
+            if (bb_hud_redirect) {
+                // Screen-space positions (clip disabled): the render space scaled with the canvas.
+                viewport.width = std::min(viewport.width * bb_rt_scale_x,
+                                          float(instance.GetMaxViewportWidth()));
+                viewport.height = std::min(viewport.height * bb_rt_scale_y,
+                                           float(instance.GetMaxViewportHeight()));
+            }
         } else {
             const auto xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
             const auto xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
@@ -1832,7 +1939,7 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
                                               regs.viewport_scissors[i].bottom_right_y);
         }
-        if (bb_rt_guest_w != 0) {
+        if (bb_rt_guest_w != 0 || bb_hud_redirect) {
             const auto sx = [&](s32 v) { return s32(std::floor(float(v) * bb_rt_scale_x)); };
             const auto sy = [&](s32 v) { return s32(std::floor(float(v) * bb_rt_scale_y)); };
             const s32 x0 = sx(vp_scsr.top_left_x), y0 = sy(vp_scsr.top_left_y);

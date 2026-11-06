@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "core/bb_respatch.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -188,6 +189,10 @@ struct BBVk {
         OwnImage depth, mv;
     };
     std::array<FgSlot, 8> fg_slots{};
+    // 1.16: the HUD canvas' HUD-less image for frame generation this frame (presenter view).
+    bool hs_hudless_ready = false;
+    vk::ImageView hs_hudless_view{};
+    const char* hs_hudless_source = "";
 };
 BBVk g_bb;
 
@@ -2683,6 +2688,8 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                                    vk::ImageView& hudless_view, vk::Format view_format) {
     out = {};
     hudless_view = vk::ImageView{};
+    const bool hs_ready = g_bb.hs_hudless_ready;
+    g_bb.hs_hudless_ready = false;
     const bool hudless_ready = g_bb.fg_present_ready;
     const bool raw_ready = g_bb.fg_raw_hudless_ready;
     const bool fgn_ready = g_bb.fgn_ready;
@@ -2778,7 +2785,12 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
               out.clip_to_prev_clip);
     out.sl_frame =
         BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ? BB::SR::Dlss::LastFrameIndex() : 0;
-    if (hudless_ready && g_bb.fg_present.image) {
+    if (hs_ready && g_bb.hs_hudless_view) {
+        // 1.16: the HUD canvas: the presented frame without its HUD (the scene upscaled before
+        // the HUD, through the game's own final pass), so generated frames get the real HUD.
+        hudless_view = g_bb.hs_hudless_view;
+        out.hudless_source = g_bb.hs_hudless_source;
+    } else if (hudless_ready && g_bb.fg_present.image) {
         // The window-size path: the upscaled image with no HUD added (bb_hud.comp flag 4).
         hudless_view = g_bb.fg_present.view;
         out.hudless_source = "upscaled image before the HUD";
@@ -3433,6 +3445,526 @@ void Rasterizer::BBNativeFillSource(VideoCore::ImageId scaled_id,
     Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eBlit,
             vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eAllCommands,
             vk::AccessFlagBits2::eShaderRead);
+}
+
+// 1.16 (bb-hud-116): the HUD out of the temporal upscaler in scaled modes (from 1.07's sharp HUD).
+// The HUD point (WantPresentUpscale: the first 2D draw into the composite target after the
+// scene's post-processing) upscales the scene alone (upscaler, then DLSS 5), at the output size.
+// An output-size canvas of the HUD target (Bloodborne: its UI image; or the flip itself) is
+// filled with that image, and the frame's later draws into the HUD target are drawn into it with
+// viewport / scissor scaled by output / internal (a depth-tested HUD draw uses an output-size
+// twin of the game's depth). The game's final pass (the UI image into the flip, with its
+// brightness curve) samples the canvas instead and draws into an output-size canvas of the flip,
+// which is presented: the HUD is rasterised at the output size, never seen by the upscaler.
+// Frame generation: the canvas is also copied before any HUD draw, and the final pass is drawn a
+// second time from that copy into a HUD-less twin of the flip canvas: DLSS-G / FSR 3 FG get the
+// presented frame without its HUD (HUD-less colour), so generated frames carry the real HUD.
+namespace {
+struct HsCanvas {
+    vk::Image image{};
+    VmaAllocation alloc{};
+    vk::Format format = vk::Format::eUndefined;
+    vk::Extent2D extent{};
+    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+    bool depth = false;
+    std::vector<std::pair<u64, vk::ImageView>> views;
+};
+struct HsState {
+    HsCanvas a, a0, b, b0, depth;
+    OwnImage temp;
+    bool live = false, b_live = false, depth_filled = false, want_fg = false;
+    bool presented = false;
+    VAddr target = 0, b_addr = 0;
+    vk::Extent2D render{}, output{};
+    u32 twin_need = 0, twin_done = 0, consecutive_fail = 0;
+    // Per second.
+    u32 s_calls = 0, s_presents = 0, s_no_canvas = 0, s_other = 0, s_draws = 0, s_depth = 0,
+        s_depth_fail = 0, s_final = 0, s_hudless = 0, s_twin_miss = 0, s_flip_direct = 0;
+    std::chrono::steady_clock::time_point last{};
+    std::string said;
+};
+HsState g_hs;
+
+vk::ImageAspectFlags HsAspects(const HsCanvas& c) {
+    if (!c.depth) return vk::ImageAspectFlagBits::eColor;
+    switch (c.format) {
+    case vk::Format::eD32SfloatS8Uint:
+    case vk::Format::eD24UnormS8Uint:
+    case vk::Format::eD16UnormS8Uint:
+        return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+    default:
+        return vk::ImageAspectFlagBits::eDepth;
+    }
+}
+
+void HsDestroy(HsCanvas& c) {
+    for (auto& [k, v] : c.views) g_bb.device.destroyImageView(v);
+    c.views.clear();
+    if (c.image) vmaDestroyImage(g_bb.allocator, static_cast<VkImage>(c.image), c.alloc);
+    c.image = vk::Image{};
+    c.alloc = {};
+    c.layout = vk::ImageLayout::eUndefined;
+}
+
+bool HsEnsure(HsCanvas& c, vk::Extent2D extent, vk::Format format, bool depth) {
+    if (c.image && c.extent == extent && c.format == format && c.depth == depth) return true;
+    if (c.image) {
+        (void)g_bb.device.waitIdle();
+        HsDestroy(c);
+    }
+    const vk::ImageUsageFlags usage =
+        (depth ? vk::ImageUsageFlagBits::eDepthStencilAttachment
+               : vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled) |
+        vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
+    const VkImageCreateInfo ci = vk::ImageCreateInfo{
+        .flags = depth ? vk::ImageCreateFlags{} : vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = usage,
+        .sharingMode = vk::SharingMode::eExclusive,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    VmaAllocationCreateInfo alloc{};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkImage image{};
+    if (vmaCreateImage(g_bb.allocator, &ci, &alloc, &image, &c.alloc, nullptr) != VK_SUCCESS) {
+        c.alloc = {};
+        return false;
+    }
+    c.image = image;
+    c.format = format;
+    c.extent = extent;
+    c.depth = depth;
+    c.layout = vk::ImageLayout::eUndefined;
+    return true;
+}
+
+// kind 0: colour attachment / depth attachment, 1: sampled by the presenter (alpha read as one,
+// as its view of the flip), 2: sampled by the game (its own swizzle).
+vk::ImageView HsView(HsCanvas& c, vk::Format format, u32 kind) {
+    const u64 key = (u64(static_cast<u32>(format)) << 2) | kind;
+    for (const auto& [k, v] : c.views) {
+        if (k == key) return v;
+    }
+    const vk::ImageViewUsageCreateInfo use{
+        .usage = c.depth       ? vk::ImageUsageFlagBits::eDepthStencilAttachment
+                 : kind == 0 ? vk::ImageUsageFlagBits::eColorAttachment
+                             : vk::ImageUsageFlagBits::eSampled};
+    vk::ComponentMapping components{};
+    if (kind == 1) components.a = vk::ComponentSwizzle::eOne;
+    const auto [result, view] = g_bb.device.createImageView(vk::ImageViewCreateInfo{
+        .pNext = &use,
+        .image = c.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .components = components,
+        .subresourceRange = {HsAspects(c), 0, 1, 0, 1},
+    });
+    if (result != vk::Result::eSuccess) return {};
+    c.views.emplace_back(key, view);
+    return view;
+}
+
+void HsBarrier(vk::CommandBuffer cmd, HsCanvas& c, vk::ImageLayout layout) {
+    if (c.layout == layout) {
+        return;
+    }
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .oldLayout = c.layout,
+        .newLayout = layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = c.image,
+        .subresourceRange = {HsAspects(c), 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    });
+    c.layout = layout;
+}
+
+void HsSay(const std::string& what) {
+    if (what != g_hs.said) {
+        g_hs.said = what;
+        LOG_INFO(Render_Vulkan, "[hud] {}", what);
+        BB::Upscale::Checkpoint("[hud] " + what);
+    }
+}
+
+void HsOff(const std::string& why) {
+    HsSay("off: " + why);
+    BB::Upscale::SetHudCanvasOk(false, why + " (1.14 behaviour: HUD composite at present)");
+}
+} // namespace
+
+void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
+    g_hs.live = false;
+    g_hs.b_live = false;
+    if (!BB::ResPatch::HudSharp() || !BB::Upscale::HudCanvasOk()) {
+        return;
+    }
+    if (!g_bb.present_ready || !g_bb.output.image || !g_bb.present_in.image) {
+        return;
+    }
+    const vk::Extent2D render{flip.info.size.width, flip.info.size.height};
+    const vk::Extent2D output = g_bb.output.extent;
+    if (output.width <= render.width && output.height <= render.height) {
+        HsSay(fmt::format("not needed: the output {}x{} is not above the render size {}x{}",
+                          output.width, output.height, render.width, render.height));
+        return;
+    }
+    // The upscaled scene goes back to the HUD target's own byte layout: through the format the
+    // upscaler's input read it with (its sRGB decode / channel order), then raw bytes.
+    const vk::Format in_fmt = g_bb.present_in.format;
+    const vk::Format temp_fmt =
+        in_fmt == vk::Format::eR16G16B16A16Sfloat ? flip.info.pixel_format : in_fmt;
+    const auto& pd = instance.GetPhysicalDevice();
+    const auto feat = [&](vk::Format f) { return pd.getFormatProperties(f).optimalTilingFeatures; };
+    if (!(feat(temp_fmt) & vk::FormatFeatureFlagBits::eBlitDst) ||
+        !(feat(flip.info.pixel_format) & vk::FormatFeatureFlagBits::eColorAttachment)) {
+        HsOff(fmt::format("the HUD target format {} cannot be the canvas (blit / attachment)",
+                          vk::to_string(flip.info.pixel_format)));
+        return;
+    }
+    const bool want_fg = BB::FG::WantInputs();
+    if (!HsEnsure(g_hs.a, output, flip.info.pixel_format, false) ||
+        (want_fg && !HsEnsure(g_hs.a0, output, flip.info.pixel_format, false))) {
+        HsOff("the output-size canvas could not be created");
+        return;
+    }
+    const bool direct = temp_fmt == flip.info.pixel_format;
+    if (!direct && !EnsureImage(g_hs.temp, output, temp_fmt,
+                                vk::ImageUsageFlagBits::eTransferDst |
+                                    vk::ImageUsageFlagBits::eTransferSrc)) {
+        HsOff("the canvas conversion image could not be created");
+        return;
+    }
+    scheduler.EndRendering();
+    const auto cmd = scheduler.CommandBuffer();
+    Barrier(cmd, g_bb.output, vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    g_hs.a.layout = vk::ImageLayout::eUndefined; // (overwritten whole)
+    HsBarrier(cmd, g_hs.a, vk::ImageLayout::eTransferDstOptimal);
+    const std::array<vk::Offset3D, 2> corners{
+        vk::Offset3D{0, 0, 0},
+        vk::Offset3D{static_cast<s32>(output.width), static_cast<s32>(output.height), 1}};
+    const vk::ImageBlit blit{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffsets = corners,
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffsets = corners,
+    };
+    const vk::ImageCopy whole{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .extent = {output.width, output.height, 1},
+    };
+    if (direct) {
+        cmd.blitImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, g_hs.a.image,
+                      vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+    } else {
+        Barrier(cmd, g_hs.temp, vk::ImageLayout::eTransferDstOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eTransferRead,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+        cmd.blitImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, g_hs.temp.image,
+                      vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+        Barrier(cmd, g_hs.temp, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        cmd.copyImage(g_hs.temp.image, vk::ImageLayout::eTransferSrcOptimal, g_hs.a.image,
+                      vk::ImageLayout::eTransferDstOptimal, whole);
+    }
+    Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+            vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+    if (want_fg) {
+        // The HUD target before any HUD draw: frame generation's HUD-less source.
+        HsBarrier(cmd, g_hs.a, vk::ImageLayout::eTransferSrcOptimal);
+        g_hs.a0.layout = vk::ImageLayout::eUndefined;
+        HsBarrier(cmd, g_hs.a0, vk::ImageLayout::eTransferDstOptimal);
+        cmd.copyImage(g_hs.a.image, vk::ImageLayout::eTransferSrcOptimal, g_hs.a0.image,
+                      vk::ImageLayout::eTransferDstOptimal, whole);
+        HsBarrier(cmd, g_hs.a0, vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+    HsBarrier(cmd, g_hs.a, vk::ImageLayout::eColorAttachmentOptimal);
+    g_hs.live = true;
+    g_hs.want_fg = want_fg;
+    g_hs.target = flip.info.guest_address;
+    g_hs.render = render;
+    g_hs.output = output;
+    g_hs.depth_filled = false;
+    g_hs.twin_need = g_hs.twin_done = 0;
+    HsSay(fmt::format("on: scene upscaled at the HUD point (draw into {:#x}), HUD / menus "
+                      "rasterised at {}x{} (x{:.3f} of the game's {}x{} UI), canvas {}{}{}",
+                      flip.info.guest_address, output.width, output.height,
+                      double(output.width) / render.width, render.width, render.height,
+                      vk::to_string(flip.info.pixel_format),
+                      direct ? "" : fmt::format(" via {}", vk::to_string(temp_fmt)),
+                      want_fg ? ", frame generation: HUD-less twin" : ""));
+}
+
+bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view_format,
+                                  vk::ImageView& view, vk::ImageLayout& layout, u32& width,
+                                  u32& height) {
+    if (!g_hs.live || image.info.size.width != g_hs.render.width ||
+        image.info.size.height != g_hs.render.height || image.info.bb_scaled) {
+        return false;
+    }
+    const VAddr addr = image.info.guest_address;
+    HsCanvas* c = nullptr;
+    if (addr == g_hs.target) {
+        c = &g_hs.a;
+    } else if (g_hs.b_live && addr == g_hs.b_addr) {
+        c = &g_hs.b;
+    } else if (bb_hs_sampled && !g_hs.b_live) {
+        // The game's final pass (it samples the HUD target): its target gets a canvas too.
+        if (!HsEnsure(g_hs.b, g_hs.output, image.info.pixel_format, false) ||
+            (g_hs.want_fg && !HsEnsure(g_hs.b0, g_hs.output, image.info.pixel_format, false))) {
+            HsOff("the final-pass canvas could not be created");
+            g_hs.live = false;
+            return false;
+        }
+        scheduler.EndRendering();
+        const auto cmd = scheduler.CommandBuffer();
+        const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        g_hs.b.layout = vk::ImageLayout::eUndefined;
+        HsBarrier(cmd, g_hs.b, vk::ImageLayout::eTransferDstOptimal);
+        cmd.clearColorImage(g_hs.b.image, vk::ImageLayout::eTransferDstOptimal, black, range);
+        if (g_hs.want_fg) {
+            g_hs.b0.layout = vk::ImageLayout::eUndefined;
+            HsBarrier(cmd, g_hs.b0, vk::ImageLayout::eTransferDstOptimal);
+            cmd.clearColorImage(g_hs.b0.image, vk::ImageLayout::eTransferDstOptimal, black, range);
+        }
+        g_hs.b_live = true;
+        g_hs.b_addr = addr;
+        c = &g_hs.b;
+    } else {
+        return false;
+    }
+    if (c->layout != vk::ImageLayout::eColorAttachmentOptimal) {
+        scheduler.EndRendering();
+        HsBarrier(scheduler.CommandBuffer(), *c, vk::ImageLayout::eColorAttachmentOptimal);
+    }
+    view = HsView(*c, view_format, 0);
+    if (!view) return false;
+    layout = c->layout;
+    width = c->extent.width;
+    height = c->extent.height;
+    if (bb_hs_sampled) {
+        ++g_hs.s_final;
+        if (c == &g_hs.b && g_hs.want_fg && !bb_hs_twin.empty()) {
+            if (g_hs.b0.layout != vk::ImageLayout::eColorAttachmentOptimal) {
+                scheduler.EndRendering();
+                HsBarrier(scheduler.CommandBuffer(), g_hs.b0,
+                          vk::ImageLayout::eColorAttachmentOptimal);
+            }
+            bb_hs_twin_dst = HsView(g_hs.b0, view_format, 0);
+            bb_hs_twin_layout = vk::ImageLayout::eColorAttachmentOptimal;
+            if (bb_hs_twin_dst) ++g_hs.twin_need;
+        }
+    } else {
+        ++g_hs.s_draws;
+    }
+    return true;
+}
+
+bool Rasterizer::BBHudSharpSampled(const VideoCore::Image& image,
+                                   const VideoCore::ImageViewInfo& view_info, bool draws_into_it,
+                                   vk::ImageView& view, vk::ImageLayout& layout,
+                                   vk::ImageView& twin_view) {
+    if (!g_hs.live || image.info.guest_address != g_hs.target || draws_into_it ||
+        image.info.size.width != g_hs.render.width ||
+        image.info.size.height != g_hs.render.height) {
+        return false;
+    }
+    if (g_hs.a.layout != vk::ImageLayout::eShaderReadOnlyOptimal) {
+        scheduler.EndRendering();
+        HsBarrier(scheduler.CommandBuffer(), g_hs.a, vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+    // The game's own view of it (format, swizzle) on the canvas.
+    const bool swizzled = view_info.mapping != AmdGpu::IdentityMapping;
+    const auto game_view = [&](HsCanvas& c) {
+        return swizzled ? TransientView(scheduler, c.image, view_info.format,
+                                        vk::ImageAspectFlagBits::eColor,
+                                        LiverpoolToVK::ComponentMapping(view_info.mapping))
+                        : HsView(c, view_info.format, 2);
+    };
+    const auto v = game_view(g_hs.a);
+    if (!v) return false;
+    view = v;
+    layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    twin_view = vk::ImageView{};
+    if (g_hs.want_fg && g_hs.a0.image) {
+        twin_view = game_view(g_hs.a0);
+    }
+    bb_hs_sampled = true;
+    return true;
+}
+
+bool Rasterizer::BBHudSharpDepth(VideoCore::Image& depth, vk::ImageView& view,
+                                 vk::ImageLayout& layout) {
+    if (!g_hs.live || depth.info.size.width != g_hs.render.width ||
+        depth.info.size.height != g_hs.render.height || depth.info.bb_scaled) {
+        ++g_hs.s_depth_fail;
+        return false;
+    }
+    const vk::Format fmt = depth.info.pixel_format;
+    const auto feats =
+        instance.GetPhysicalDevice().getFormatProperties(fmt).optimalTilingFeatures;
+    if (!(feats & vk::FormatFeatureFlagBits::eBlitSrc) ||
+        !(feats & vk::FormatFeatureFlagBits::eBlitDst) ||
+        !(feats & vk::FormatFeatureFlagBits::eDepthStencilAttachment) ||
+        !HsEnsure(g_hs.depth, g_hs.output, fmt, true)) {
+        ++g_hs.s_depth_fail;
+        return false;
+    }
+    if (!g_hs.depth_filled) {
+        // The game's depth this frame, scaled (nearest) to the canvas size, once per frame.
+        scheduler.EndRendering();
+        runtime.Transit(&depth, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        const auto cmd = scheduler.CommandBuffer();
+        g_hs.depth.layout = vk::ImageLayout::eUndefined;
+        HsBarrier(cmd, g_hs.depth, vk::ImageLayout::eTransferDstOptimal);
+        const auto aspects = HsAspects(g_hs.depth);
+        const vk::ImageBlit blit{
+            .srcSubresource = {aspects, 0, 0, 1},
+            .srcOffsets = std::array<vk::Offset3D, 2>{
+                vk::Offset3D{0, 0, 0}, vk::Offset3D{static_cast<s32>(g_hs.render.width),
+                                                    static_cast<s32>(g_hs.render.height), 1}},
+            .dstSubresource = {aspects, 0, 0, 1},
+            .dstOffsets = std::array<vk::Offset3D, 2>{
+                vk::Offset3D{0, 0, 0}, vk::Offset3D{static_cast<s32>(g_hs.output.width),
+                                                    static_cast<s32>(g_hs.output.height), 1}},
+        };
+        cmd.blitImage(depth.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_hs.depth.image,
+                      vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+        g_hs.depth_filled = true;
+    }
+    if (g_hs.depth.layout != vk::ImageLayout::eDepthStencilAttachmentOptimal) {
+        scheduler.EndRendering();
+        HsBarrier(scheduler.CommandBuffer(), g_hs.depth,
+                  vk::ImageLayout::eDepthStencilAttachmentOptimal);
+    }
+    view = HsView(g_hs.depth, fmt, 0);
+    if (!view) {
+        ++g_hs.s_depth_fail;
+        return false;
+    }
+    layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+    ++g_hs.s_depth;
+    return true;
+}
+
+void Rasterizer::BBHudSharpTwinDone() {
+    ++g_hs.twin_done;
+}
+
+bool Rasterizer::BBHudSharpPresented() {
+    return g_hs.presented;
+}
+
+bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip,
+                                   vk::Format view_format, vk::ImageView& out_view,
+                                   vk::Extent2D& out_size) {
+    g_hs.presented = false;
+    ++g_hs.s_calls;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_hs.last.time_since_epoch().count() == 0) g_hs.last = now;
+    if (now - g_hs.last >= std::chrono::seconds(1)) {
+        g_hs.last = now;
+        if (BB::ResPatch::HudSharp()) {
+            const bool fg = BB::FG::WantInputs();
+            BB::Upscale::Checkpoint(fmt::format(
+                "[hud] last second: path={} ({} of {} presents via the HUD canvas: {} on the flip "
+                "directly, {} through the game's final pass; no canvas {}, other image {}), HUD "
+                "raster {}x{} (game UI {}x{}), HUD draws {} (depth-tested {}, without depth twin "
+                "{}), final-pass draws {}, FG HUD mode: {}",
+                !BB::Upscale::HudCanvasOk() ? "1.14 HUD composite at present (canvas off)"
+                : g_hs.s_presents > 0       ? "before-HUD upscale + output-size HUD canvas"
+                                            : "before-HUD canvas idle (no 3D frame / HUD point)",
+                g_hs.s_presents, g_hs.s_calls, g_hs.s_flip_direct,
+                g_hs.s_presents - g_hs.s_flip_direct, g_hs.s_no_canvas, g_hs.s_other,
+                g_hs.output.width, g_hs.output.height, g_hs.render.width, g_hs.render.height,
+                g_hs.s_draws, g_hs.s_depth, g_hs.s_depth_fail, g_hs.s_final,
+                !fg ? std::string("off (no frame generation)")
+                    : fmt::format("HUD-less frame given {}/{} (DLSS-G hudless tag / FSR 3 FG "
+                                  "HUDLessColor: generated frames get the real HUD), twin missing "
+                                  "{}",
+                                  g_hs.s_hudless, g_hs.s_presents, g_hs.s_twin_miss)));
+        }
+        g_hs.s_calls = g_hs.s_presents = g_hs.s_no_canvas = g_hs.s_other = g_hs.s_draws =
+            g_hs.s_depth = g_hs.s_depth_fail = g_hs.s_final = g_hs.s_hudless = g_hs.s_twin_miss =
+                g_hs.s_flip_direct = 0;
+    }
+    if (!g_hs.live) {
+        ++g_hs.s_no_canvas;
+        return false;
+    }
+    g_hs.live = false;
+    HsCanvas* c = nullptr;
+    HsCanvas* h = nullptr;
+    const VAddr addr = flip.info.guest_address;
+    if (addr == g_hs.target) {
+        c = &g_hs.a;
+        h = g_hs.want_fg ? &g_hs.a0 : nullptr;
+        ++g_hs.s_flip_direct;
+    } else if (g_hs.b_live && addr == g_hs.b_addr) {
+        c = &g_hs.b;
+        if (g_hs.want_fg) {
+            if (g_hs.twin_need > 0 && g_hs.twin_need == g_hs.twin_done) {
+                h = &g_hs.b0;
+            } else {
+                ++g_hs.s_twin_miss;
+            }
+        }
+    } else {
+        ++g_hs.s_other;
+        if (++g_hs.consecutive_fail >= 30) {
+            HsOff(fmt::format("30 frames in a row presented {:#x}, neither the HUD target {:#x} "
+                              "nor its final pass' target {:#x}",
+                              addr, g_hs.target, g_hs.b_live ? g_hs.b_addr : 0));
+        }
+        return false;
+    }
+    g_hs.consecutive_fail = 0;
+    out_view = HsView(*c, view_format, 1);
+    if (!out_view) {
+        HsOff(fmt::format("no {} view of the canvas", vk::to_string(view_format)));
+        return false;
+    }
+    HsBarrier(cmd, *c, vk::ImageLayout::eShaderReadOnlyOptimal);
+    if (h != nullptr && h->image) {
+        HsBarrier(cmd, *h, vk::ImageLayout::eShaderReadOnlyOptimal);
+        g_bb.hs_hudless_view = HsView(*h, view_format, 1);
+        g_bb.hs_hudless_ready = static_cast<bool>(g_bb.hs_hudless_view);
+        g_bb.hs_hudless_source = h == &g_hs.a0
+                                     ? "HUD canvas before its HUD (scene upscaled before the HUD)"
+                                     : "HUD-less twin of the game's final pass (scene upscaled "
+                                       "before the HUD)";
+        if (g_bb.hs_hudless_ready) ++g_hs.s_hudless;
+    }
+    out_size = c->extent;
+    // The upscale was used: the HUD composite does not run this frame.
+    g_bb.present_ready = false;
+    g_bb.fg_present_ready = false;
+    g_hs.presented = true;
+    ++g_hs.s_presents;
+    return true;
 }
 
 } // namespace Vulkan
