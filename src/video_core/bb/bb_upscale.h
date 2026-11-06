@@ -206,6 +206,7 @@ bool WantPresentUpscale(VAddr& flip);
 // image (the composite target before its final pass into the flip) in scaled modes. Turned off
 // for the session after the canvas could not be used (then 1.14: the HUD composite at present).
 bool HudCanvasOk();
+bool HudCanvasWanted();
 void SetHudCanvasOk(bool ok, std::string_view why);
 void OnPresentUpscaled(bool ok);
 // 0.39 (BB_FG_NATIVE, default on): frame generation asked with no upscaler. The module runs its

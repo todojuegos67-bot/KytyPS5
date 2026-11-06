@@ -2729,6 +2729,15 @@ struct FgnSec {
 namespace {
 std::atomic<bool> g_hud_canvas_ok{true};
 }
+// 1.35: the HUD canvas in every scaled frame: our resolution patch (sceneup) or the game's
+// whole frame below the window (the launcher's resolution patch, plain DLSS / FSR / XeSS).
+bool HudCanvasWanted() {
+    static const bool off = [] {
+        const char* v = std::getenv("BB_HUD_SHARP");
+        return v != nullptr && *v == '0';
+    }();
+    return !off && HudCanvasOk() && (BB::ResPatch::HudSharp() || PresentMode());
+}
 bool HudCanvasOk() {
     return g_hud_canvas_ok.load(std::memory_order_relaxed);
 }
@@ -2817,7 +2826,7 @@ bool WantPresentUpscale(VAddr& flip) {
     }();
     // 1.16: in scaled modes the HUD canvas takes the UI image too (the scene is upscaled there,
     // the HUD drawn at the output size, the game's final pass re-run on the canvas).
-    const bool canvas_target = !fgn && BB::ResPatch::HudSharp() && HudCanvasOk();
+    const bool canvas_target = !fgn && HudCanvasWanted();
     if (!fgn && !any_target && !canvas_target && !IsFlip(cand)) {
         f.hud_how = "composite target is not the presented image (upscaler waits for the flip)";
         return false;

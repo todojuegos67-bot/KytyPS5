@@ -3799,7 +3799,7 @@ void HsOff(const std::string& why) {
 void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
     g_hs.live = false;
     g_hs.b_live = false;
-    if (!BB::ResPatch::HudSharp() || !BB::Upscale::HudCanvasOk()) {
+    if (!BB::Upscale::HudCanvasWanted()) {
         return;
     }
     if (!g_bb.present_ready || !g_bb.output.image || !g_bb.present_in.image) {
@@ -4076,7 +4076,7 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
     if (g_hs.last.time_since_epoch().count() == 0) g_hs.last = now;
     if (now - g_hs.last >= std::chrono::seconds(1)) {
         g_hs.last = now;
-        if (BB::ResPatch::HudSharp()) {
+        if (BB::ResPatch::HudSharp() || BB::Upscale::HudCanvasWanted()) {
             const bool fg = BB::FG::WantInputs();
             BB::Upscale::Checkpoint(fmt::format(
                 "[hud] last second: path={} ({} of {} presents via the HUD canvas: {} on the flip "
