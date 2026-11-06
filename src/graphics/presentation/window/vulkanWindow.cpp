@@ -949,14 +949,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	// (With maintenance5, with or without the binaries, pipelines take SPIR-V inline.)
 	ModuleStore::Enable(graphics.maintenance5_enabled);
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
-	// No fragment shader barycentrics on this GPU (Polaris, RDNA 1, older drivers): continue without them.
-	// Pixel shaders needing them fail at pipeline creation instead of blocking startup (issue #149).
+	// No fragment shader barycentrics on this GPU (NVIDIA before Turing, Polaris and RDNA 1 on RADV, older drivers): continue without
+	// them, and pixel shaders needing them fail at pipeline creation (issue #149). That is 4,550 of Demon's Souls' 4,583: the
+	// PS5 compiler's shaders read each vertex's packed raw values and interpolate by themselves, so plain interpolated inputs
+	// cannot stand in for them (tried: colourless characters and textures in blocks; issue #305).
 	const bool barycentric_supported =
 	    barycentric_extension && fragment_barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
-		LOGF("WARNING: GPU has no fragment shader barycentrics "
-		     "(VK_KHR_fragment_shader_barycentric); pixel shaders needing them fail at pipeline "
-		     "creation\n");
+		std::printf("Vulkan: this GPU has no fragment shader barycentrics (VK_KHR_fragment_shader_barycentric): nearly every "
+		            "pixel shader of Demon's Souls needs them, and their pipelines will fail\n");
 	}
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&

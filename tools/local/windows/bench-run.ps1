@@ -2,7 +2,7 @@ param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [string[]]$Ex
       [switch]$KeepRunning, [string]$PresentMode = '', [int]$Vblank = 0, [string[]]$Set = @(),
       [string]$Patch = '', [switch]$Fullscreen, [switch]$Hdr, [switch]$ShotOnly, [switch]$NoWalk,
       [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '',
-      [string]$Game = '', [switch]$LoadGame)
+      [string]$Game = '', [switch]$LoadGame, [switch]$KeepCinematics)
 # End to end: fresh baseline save, launch, skip to the game, walk the fixed path once the HUD
 # is really up, measure. Screen states are told apart by pixel statistics.
 $S = $PSScriptRoot
@@ -211,7 +211,8 @@ while (((Get-Date) - $start).TotalSeconds -lt $StartupSeconds) {
 	if ($state -eq 'fog') { $fogSeen = $true }
 	$early = $answered -and $fogSeen -and $state -eq 'mono' -and $earlySkips -lt 3 -and
 	         ((Get-Date) - $lastSkip).TotalSeconds -ge 4
-	if ($state -eq 'cinematic' -or (($state -eq 'other' -or $state -eq 'mono') -and !$answered) -or $early) {
+	# -KeepCinematics: what follows the offline prompt plays (a save that starts in a cutscene).
+	if (!($KeepCinematics -and $answered) -and ($state -eq 'cinematic' -or (($state -eq 'other' -or $state -eq 'mono') -and !$answered) -or $early)) {
 		if ($early) { $earlySkips++ }
 		Press enter; Start-Sleep -Milliseconds 700; Press j 1500; Start-Sleep -Milliseconds 800
 		$lastSkip = Get-Date
