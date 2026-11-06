@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
 #include <system_error>
+#include <fmt/format.h>
 
 #include "common/aes.h"
 #include "common/key_manager.h"
@@ -22,6 +25,62 @@ static void DecryptEFSM(std::span<const u8, 16> trophyKey, std::span<const u8, 1
     // Step 2: Decrypt EFSM
     aes::decrypt_cbc(ciphertext.data(), ciphertext.size(), trpKey.data(), trpKey.size(),
                      const_cast<u8*>(efsmIv.data()), decrypted.data(), decrypted.size(), nullptr);
+}
+
+std::string TRP::FindNpCommId(std::span<const u8> trp) {
+    const auto& key = KeyManager::GetInstance()->GetAllKeys().TrophyKeySet.ReleaseTrophyKey;
+    if (key.size() != 16) {
+        LOG_ERROR(Common_Filesystem,
+                  "[trophy] no trophy key (TrophyKeySet.ReleaseTrophyKey in keys.json): the "
+                  "NP communication ID of a game without npbind.dat cannot be found");
+        return {};
+    }
+    if (trp.size() < sizeof(TrpHeader)) {
+        return {};
+    }
+    TrpHeader header;
+    std::memcpy(&header, trp.data(), sizeof(header));
+    if (header.magic != TRP_MAGIC) {
+        return {};
+    }
+    for (u32 i = 0; i < header.entry_num; i++) {
+        const size_t at = sizeof(TrpHeader) + size_t(i) * header.entry_size;
+        if (at + sizeof(TrpEntry) > trp.size()) {
+            break;
+        }
+        TrpEntry entry;
+        std::memcpy(&entry, trp.data() + at, sizeof(entry));
+        if (entry.flag != ENTRY_FLAG_ENCRYPTED_XML || entry.entry_len < 48 ||
+            entry.entry_pos + 32 > trp.size()) {
+            continue;
+        }
+        const u8* iv = trp.data() + entry.entry_pos;
+        const u8* block = iv + 16;
+        for (int n = 0; n <= 99999; n++) {
+            std::array<u8, 16> id{};
+            const auto text = fmt::format("NPWR{:05d}_00", n);
+            std::memcpy(id.data(), text.data(), text.size());
+            std::array<u8, 16> zero_iv{};
+            std::array<u8, 16> trp_key;
+            aes::encrypt_cbc(id.data(), id.size(), key.data(), key.size(), zero_iv.data(),
+                             trp_key.data(), trp_key.size(), false);
+            std::array<u8, 16> out;
+            std::array<u8, 16> iv_copy;
+            std::memcpy(iv_copy.data(), iv, 16);
+            aes::decrypt_cbc(block, 16, trp_key.data(), trp_key.size(), iv_copy.data(),
+                             out.data(), out.size(), nullptr);
+            if (out[0] == '<' && (out[1] == '!' || out[1] == '?') &&
+                std::all_of(out.begin(), out.end(), [](u8 c) { return c >= 9 && c < 127; })) {
+                LOG_INFO(Common_Filesystem, "[trophy] TRP decrypts with NP communication ID {}",
+                         text);
+                return text;
+            }
+        }
+        LOG_ERROR(Common_Filesystem,
+                  "[trophy] no NPWRxxxxx_00 ID decrypts the TRP (wrong trophy key?)");
+        return {};
+    }
+    return {};
 }
 
 TRP::TRP() = default;

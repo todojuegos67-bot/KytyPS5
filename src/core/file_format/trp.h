@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <span>
+#include <string>
 #include <vector>
 #include "common/endian.h"
 #include "common/io_file.h"
@@ -38,6 +40,10 @@ public:
     ~TRP();
     bool Extract(const std::filesystem::path& trophyPath, std::string npCommId,
                  const std::filesystem::path& outputPath);
+    // (bb-menu-104) A game without npbind.dat: finds the NP communication ID (NPWRxxxxx_00) a
+    // TRP file is encrypted with, by trying each one on the first block of its first ESFM entry
+    // (needs the trophy key). "" when there is no key or no ID decrypts it.
+    static std::string FindNpCommId(std::span<const u8> trp_bytes);
 
 private:
     bool ProcessPngEntry(Common::FS::IOFile& file, const TrpEntry& entry,

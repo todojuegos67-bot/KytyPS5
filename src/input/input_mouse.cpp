@@ -27,6 +27,10 @@ MouseMode mouse_mode = MouseMode::Off;
 
 // Switches mouse to a set mode or turns mouse emulation off if it was already in that mode.
 // Returns whether the mode is turned on.
+MouseMode GetMouseMode() {
+    return mouse_mode;
+}
+
 bool ToggleMouseModeTo(MouseMode m) {
     if (mouse_mode == m) {
         mouse_mode = MouseMode::Off;
