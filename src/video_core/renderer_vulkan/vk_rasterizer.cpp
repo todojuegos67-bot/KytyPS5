@@ -222,8 +222,11 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
     if (BBDumpOn()) {
         std::vector<VideoCore::ImageId> ids;
-        std::string line = fmt::format("draw: viewport scale {:.3f}x{:.3f} (guest {}x{}), targets:",
-                                       bb_rt_scale_x, bb_rt_scale_y, bb_rt_guest_w, bb_rt_guest_h);
+        std::string line = fmt::format(
+            "draw vs {:#018x} ps {:#018x}: viewport scale {:.3f}x{:.3f} (guest {}x{}), targets:",
+            key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)],
+            key.stage_hashes[static_cast<u32>(Shader::SwStage::Fragment)], bb_rt_scale_x,
+            bb_rt_scale_y, bb_rt_guest_w, bb_rt_guest_h);
         for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
             if (!cb_descs[cb].image_id) continue;
             ids.push_back(cb_descs[cb].image_id);
@@ -586,7 +589,8 @@ void Rasterizer::DispatchDirect() {
     }
     BB::Upscale::SetComputeScaled(false);
     if (BBDumpOn()) {
-        BBDumpLog(fmt::format("dispatch {}x{}x{} (run {}x{}){}", cs_program.dim_x,
+        BBDumpLog(fmt::format("dispatch cs {:#018x} {}x{}x{} (run {}x{}){}", cs.pgm_hash,
+                              cs_program.dim_x,
                               cs_program.dim_y, cs_program.dim_z, bb_dx, bb_dy,
                               bb_rt_guest_w != 0 ? " at the internal size" : ""));
     }

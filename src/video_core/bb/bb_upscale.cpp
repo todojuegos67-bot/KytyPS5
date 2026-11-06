@@ -429,6 +429,11 @@ struct FrameState {
     // image the game's last post-processing pass draws into, flip or not), the HUD start found
     // this frame (draw index, target) and how it was found.
     VAddr post_target = 0;
+    // 1.28: every post-processing target of this frame (the composite / UI image is not always
+    // the last one: Bloodborne's later post passes into 0x24ffb0000 moved post_target off its UI
+    // image 0x24e7c0000, so its HUD draws never matched and the HUD point missed).
+    std::array<VAddr, 16> post_targets{};
+    u32 num_post_targets = 0;
     u64 post_draw = 0;
     VAddr hud_target = 0;
     u64 hud_draw = 0;
@@ -2688,9 +2693,19 @@ bool WantPresentUpscale(VAddr& flip) {
             if (t.addr == 0 || t.width != f.gb_w || t.height != f.gb_h) continue;
             if (g_draw.samples_render_size) {
                 f.post_target = t.addr;
+                if (std::find(f.post_targets.begin(),
+                              f.post_targets.begin() + f.num_post_targets,
+                              t.addr) == f.post_targets.begin() + f.num_post_targets &&
+                    f.num_post_targets < f.post_targets.size()) {
+                    f.post_targets[f.num_post_targets++] = t.addr;
+                }
                 f.post_draw = f.draws;
                 f.post_seen = true;
-            } else if (cand == 0 && (t.addr == f.post_target || IsFlip(t.addr))) {
+            } else if (cand == 0 &&
+                       (t.addr == f.post_target || IsFlip(t.addr) ||
+                        std::find(f.post_targets.begin(),
+                                  f.post_targets.begin() + f.num_post_targets,
+                                  t.addr) != f.post_targets.begin() + f.num_post_targets)) {
                 cand = t.addr;
                 f.hud_how = t.addr == f.post_target ? "first 2D draw into the composite target"
                                                     : "first 2D draw into the presented image";
@@ -3653,6 +3668,15 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                                 : " (< 95%: the in-place point is not reliable here, every 3D "
                                   "frame goes through the window / present-time path)"));
             }
+        }
+        // 1.29: a scaled frame (the game's whole frame below the window: resolution patch) has no
+        // in-place point (refused as before-HUD mode): its path is the window / HUD point. 1.27's
+        // log locked in-place from 299/300 early frames (before the window size was known), then
+        // every scaled frame was refused in place and kept off the present path: 0 upscaled.
+        if (g_lock == 1 && PresentMode() && !NativeChainLive()) {
+            g_lock = 2;
+            Checkpoint("[path] locked=window for the session: the frame is scaled (game "
+                       "output below the window), the in-place point does not apply (1.29)");
         }
         if (g_lock == 1) keep_inplace = true;
         if (g_lock == 2) keep_inplace = false;

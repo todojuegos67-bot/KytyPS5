@@ -3215,6 +3215,11 @@ struct DumpState {
     bool done = false;
     std::vector<VideoCore::ImageId> last_targets;
     u32 pass = 0;
+    // 1.29 (bb-aacap-129) AA-pass capture: the draw / dispatch list (shader hashes, targets,
+    // sampled images) of 8 gameplay frames, no images. bb_aa_capture.txt or BB_AA_CAPTURE=1.
+    bool cap = false;
+    u32 cap_done = 0;
+    u64 cap_frame = 0;
 } g_dump;
 
 u32 DumpBpp(vk::Format f) {
@@ -3318,6 +3323,24 @@ void WriteDump(DumpEntry& e) {
 
 bool DumpActive() {
     if (g_dump.frame == -2) {
+        const char* cv = std::getenv("BB_AA_CAPTURE");
+        g_dump.cap = cv != nullptr && *cv == '1';
+        if (!g_dump.cap) {
+            std::error_code ec;
+            for (const std::filesystem::path dir :
+                 {std::filesystem::current_path(ec), std::filesystem::path("C:/EMULADOR PS4")}) {
+                const auto trigger = dir / "bb_aa_capture.txt";
+                if (dir.empty() || !std::filesystem::exists(trigger, ec)) continue;
+                g_dump.cap = true;
+                std::filesystem::rename(trigger, dir / "bb_aa_capture.used.txt", ec);
+                break;
+            }
+        }
+        if (g_dump.cap) {
+            BB::Upscale::Checkpoint(
+                "[aacap] AA-pass capture on: every draw / dispatch (shader hashes, targets, "
+                "sampled images) of 8 3D frames, about 15 s apart from 30 s in, no images");
+        }
         const char* v = std::getenv("BB_DUMP_FRAME");
         g_dump.frame = (v != nullptr && *v != '\0') ? std::max<s64>(0, std::atoll(v)) : -1;
         const char* d = std::getenv("BB_DUMP_DIR");
@@ -3375,6 +3398,26 @@ bool DumpActive() {
         std::error_code ec;
         std::filesystem::create_directories(g_dump.dir, ec);
     }
+    if (g_dump.cap && g_dump.cap_done < 8) {
+        const u64 fno = BB::Upscale::FrameNumber();
+        if (g_dump.cap_frame != 0 && fno == g_dump.cap_frame) return true;
+        if (g_dump.cap_frame != 0 && fno > g_dump.cap_frame) {
+            BB::Upscale::Checkpoint(fmt::format("[aacap] frame {} captured ({} of 8, {} lines)",
+                                                g_dump.cap_frame, g_dump.cap_done + 1,
+                                                g_dump.lines));
+            ++g_dump.cap_done;
+            g_dump.cap_frame = 0;
+        }
+        // A 3D gameplay frame (the last flip was upscaled), from 30 s in, every ~15 s.
+        if (g_dump.cap_frame == 0 && g_dump.cap_done < 8 && fno >= 1800 && fno % 900 == 0 &&
+            BB::Upscale::LastFrameUpscaled()) {
+            g_dump.cap_frame = fno;
+            g_dump.lines = 0;
+            BB::Upscale::Checkpoint(fmt::format("[aacap] capturing frame {}", fno));
+            return true;
+        }
+        return false;
+    }
     return g_dump.frame >= 0 && !g_dump.done &&
            BB::Upscale::FrameNumber() == static_cast<u64>(g_dump.frame);
 }
@@ -3385,13 +3428,20 @@ bool Rasterizer::BBDumpOn() {
 }
 
 void Rasterizer::BBDumpLog(const std::string& line) {
-    if (!DumpActive() || g_dump.lines >= 4000) return;
+    if (!DumpActive() || g_dump.lines >= (g_dump.cap ? 20000u : 4000u)) return;
+    // 1.32: the capture skips material textures (block-compressed / tiny): 1.29's 4000-line cap
+    // ended every captured frame in the lighting passes, before the post chain and the AA pass.
+    if (g_dump.cap && line.rfind("  samples", 0) == 0 &&
+        (line.find("Block") != std::string::npos || line.find(" 1x1 ") != std::string::npos ||
+         line.find(" 4x4 ") != std::string::npos)) {
+        return;
+    }
     ++g_dump.lines;
-    BB::Upscale::Checkpoint("[dump] " + line);
+    BB::Upscale::Checkpoint((g_dump.cap ? "[aacap] " : "[dump] ") + line);
 }
 
 void Rasterizer::BBDumpImage(VideoCore::Image& image, const std::string& what) {
-    if (!InitOnce(instance) || g_dump.entries.size() >= 160 || g_dump.bytes > (1500ull << 20)) {
+    if (g_dump.cap || !InitOnce(instance) || g_dump.entries.size() >= 160 || g_dump.bytes > (1500ull << 20)) {
         return;
     }
     const vk::Format f = image.info.pixel_format;
@@ -3438,7 +3488,7 @@ void Rasterizer::BBDumpImage(VideoCore::Image& image, const std::string& what) {
 }
 
 void Rasterizer::BBDumpPass(std::span<const VideoCore::ImageId> targets, const std::string& desc) {
-    if (g_dump.frame == -1 && BB::Upscale::DumpRequest() == 0) return;
+    if (g_dump.frame == -1 && !g_dump.cap && BB::Upscale::DumpRequest() == 0) return;
     if (!DumpActive()) {
         if (g_dump.frame >= 0 && !g_dump.done && !g_dump.entries.empty() &&
             BB::Upscale::FrameNumber() > static_cast<u64>(g_dump.frame)) {
