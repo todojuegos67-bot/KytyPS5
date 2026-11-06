@@ -3068,6 +3068,24 @@ bool Jitter(float& x, float& y) {
         !g_learned.have_prev_vp || (!PresentMode() && LearnedSource() == 0)) {
         return false;
     }
+    // 1.11: never after the in-place point ran this frame. The upscaler / DLAA has already
+    // resolved the jittered scene there, so a later draw still flagged as a scene draw (the HUD
+    // health / stamina bars drawn with the G-buffer depth bound; BB_TAA_ALL jitters every such
+    // draw) kept a sub-pixel wobble nothing removed: the bars shimmered / haloed while the
+    // camera moved. BB_JITTER_AFTER_POINT=1: the old behaviour.
+    static const bool after_point = [] {
+        const char* v = std::getenv("BB_JITTER_AFTER_POINT");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!after_point && g_frame.injected && !g_frame.present) {
+        static u64 skipped = 0;
+        if (skipped++ % 6000 == 0) {
+            Checkpoint(fmt::format("[taa] 1.11: scene-flagged draw after the in-place point not "
+                                   "jittered (HUD bars), {} so far",
+                                   skipped));
+        }
+        return false;
+    }
     ++g_jittered_draws;
     x = g_jitter[0];
     y = g_jitter[1];
