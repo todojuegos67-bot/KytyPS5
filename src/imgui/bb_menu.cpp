@@ -1202,6 +1202,17 @@ public:
     bool was_open = false;
     bool confirm_exit = false;
 
+    // 1.11 (bb-fgfix-111): the default (true) made ImGui::Core::MustKeepDrawing() always true,
+    // so the video-out thread re-presented the last frame (DrawLastFrame) on every vblank tick
+    // with no guest flip: ~170 extra presents a second that DLSS-G / FSR 3 FG took as real
+    // frames with no inputs (real 225 fps -> dynamic x1, no guest-release samples, FSR 3 FG
+    // stalls). Redraw on our own only while the menu or a trophy toast is on screen.
+    bool ShouldKeepDrawing() override {
+        if (g_open) return true;
+        std::scoped_lock lk{g_toast_mtx};
+        return !g_toasts.empty();
+    }
+
     void Draw() override {
         const ImVec2 disp = ImGui::GetIO().DisplaySize;
         const float unit = std::max(disp.y / 1440.0f, 0.5f);
