@@ -28,6 +28,7 @@
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
 #include "sdl_window.h"
+#include "imgui/bb_menu.h"
 #include "video_core/bb/bb_metrics.h"
 #include "video_core/renderdoc.h"
 
@@ -208,6 +209,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
+    BbMenu::Init(window);
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -230,6 +232,12 @@ void WindowSDL::WaitEvent() {
     SDL_Event event;
 
     if (!SDL_WaitEvent(&event)) {
+        return;
+    }
+
+    // (bb-menu-104) F1: the menu (Mando, Teclado y raton, Trofeos, Salir); while it is open
+    // the game gets no input.
+    if (BbMenu::OnSdlEvent(event)) {
         return;
     }
 
