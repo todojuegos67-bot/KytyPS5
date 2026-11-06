@@ -27,6 +27,15 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <cstdlib>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <xmmintrin.h>
+#define KYTY_GUEST_MXCSR_GET() _mm_getcsr()
+#define KYTY_GUEST_MXCSR_SET(v) _mm_setcsr(v)
+#else
+#define KYTY_GUEST_MXCSR_GET() 0x1f80u
+#define KYTY_GUEST_MXCSR_SET(v) ((void)(v))
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -406,6 +415,7 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	PthreadCondPrivate*   waiting_cond  = nullptr;
 	std::atomic<uint64_t> pending_signal_mask {0};
+	uint32_t              creator_mxcsr = 0; // the creating thread's MXCSR (KYTY_INHERIT_MXCSR)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -3622,6 +3632,52 @@ static bool GuestThreadLog() {
 	return log;
 }
 
+// KYTY_INHERIT_MXCSR (default 1): a guest thread starts with the SSE control/status word (MXCSR: rounding,
+// flush-to-zero, denormals-are-zero, exception masks) of the thread that created it, as a FreeBSD/Orbis thread inherits
+// its creator's FPU state (thr_new copies it). A Windows (or glibc) host thread starts with the host default 0x1f80
+// instead, so an engine that sets FTZ/DAZ on its main thread and relies on its workers inheriting it ran those workers
+// (job system, physics, hit tests) with denormals honoured. KYTY_INHERIT_MXCSR=0: the host default, as before.
+// KYTY_GUEST_MXCSR=0x....: every created guest thread starts with that value instead (experiments).
+// A line counts the threads whose inherited word differed from the host default.
+static int InheritMxcsrMode() {
+	static const int mode = [] {
+		const char* forced = std::getenv("KYTY_GUEST_MXCSR");
+		if (forced != nullptr && *forced != 0) return 2;
+		const char* value = std::getenv("KYTY_INHERIT_MXCSR");
+		return (value != nullptr && std::strcmp(value, "0") == 0) ? 0 : 1;
+	}();
+	return mode;
+}
+static uint32_t ForcedMxcsr() {
+	static const uint32_t forced = [] {
+		const char* value = std::getenv("KYTY_GUEST_MXCSR");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0) & 0xffffu) : 0x1f80u;
+	}();
+	return forced;
+}
+static std::atomic<uint32_t> g_mxcsr_threads {0};
+static std::atomic<uint32_t> g_mxcsr_differed {0};
+
+static void ApplyGuestMxcsr(Pthread thread) {
+	const auto mode = InheritMxcsrMode();
+	if (mode == 0) return;
+	const uint32_t host  = KYTY_GUEST_MXCSR_GET();
+	const uint32_t value = (mode == 2 ? ForcedMxcsr() : thread->creator_mxcsr) & 0xffc0u; // (status flags cleared)
+	const auto     n     = g_mxcsr_threads.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((value & 0xffc0u) != (host & 0xffc0u)) {
+		const auto d = g_mxcsr_differed.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (d <= 8 || (d & (d - 1)) == 0)
+			std::printf("Guest MXCSR: thread '%s' starts with 0x%04x from %s (host default 0x%04x; FTZ %d DAZ %d RC %u); "
+			            "%u of %u guest threads so far differ (KYTY_INHERIT_MXCSR=0: host default)\n",
+			            thread->name.c_str(), value, mode == 2 ? "KYTY_GUEST_MXCSR" : "its creator", host,
+			            (value >> 15) & 1u, (value >> 6) & 1u, (value >> 13) & 3u, d, n);
+	} else if (n == 1 || n == 64) {
+		std::printf("Guest MXCSR: %u guest threads started, %u with an MXCSR other than the host's 0x%04x (KYTY_INHERIT_MXCSR=%d)\n",
+		            n, g_mxcsr_differed.load(std::memory_order_relaxed), host, mode);
+	}
+	KYTY_GUEST_MXCSR_SET(value);
+}
+
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -3665,6 +3721,7 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	ApplyGuestMxcsr(thread);
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
@@ -3721,6 +3778,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->almost_done     = false;
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
+		created_thread->creator_mxcsr   = KYTY_GUEST_MXCSR_GET();
 
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);
