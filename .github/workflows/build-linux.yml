@@ -149,6 +149,7 @@ jobs:
           upscales the game's 3D on its PS5 Pro path in place of Sony's upscaler (sharpness `KYTY_FSR_SHARPNESS`, 0.0-1.0,
           default 0.6), and `KYTY_FRAMEGEN_BACKEND=fsr` turns on FSR 3 frame generation (2x), for example
           `KYTY_UPSCALER=fsr KYTY_FRAMEGEN_BACKEND=fsr ./run_ds.sh`.
+          AMD's FSR SDK DLLs are Windows files: there is nothing to add here, and FSR 4 is not available on Linux.
 
           Sizeable parts of this program are under the third-party licenses in `LICENSES/` and
           `LICENSE`.
