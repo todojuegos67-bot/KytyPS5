@@ -81,6 +81,11 @@ public:
     bool BBHudSharpDepthOnly(const VideoCore::Image& depth, u32& width, u32& height);
     // The last present went through the HUD canvas (the presenter's [frame] line).
     static bool BBHudSharpPresented();
+    // 1.40 flash guard: the last BBHudSharpPresent replaced the frame by the last fully written
+    // canvas (or black) instead of an image not written with this frame's scene.
+    static bool BBFlashGuarded();
+    // 1.40 flash guard: the presenter skipped frame generation for one real frame (counted).
+    static void BBFlashGuardFgSkip();
     // 0.39 (BB_FG_NATIVE): frame generation's inputs with no upscaler; the image is not changed.
     bool BBFgNativeAnalyze(VideoCore::Image& flip, bool late = false);
     static const char* BBPresentWhy();

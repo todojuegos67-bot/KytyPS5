@@ -56,6 +56,9 @@ struct Frame {
     u32 fg_hudless_game_width{};
     u32 fg_hudless_game_height{};
     vk::Format fg_hudless_game_format{};
+    // 1.40 flash guard: this real frame must not be a frame generation pair end (guarded or a
+    // present-path switch).
+    bool bb_fg_skip = false;
     u64 lat_index{}; // BB::AntiLag's index of the guest flip this frame shows (0: none)
 };
 

@@ -1095,6 +1095,26 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                  vk::ImageUsageFlagBits::eTransferSrc};
         frame->fg.has_hudless = true;
     }
+    {
+        // 1.40 flash guard: frame generation never pairs a real frame with one from another
+        // present path (canvas / 1.14 composite / the game's own flip / a guarded repeat), nor
+        // uses a guarded (repeated) frame as a pair end: no interpolation for this real frame.
+        static int last_path = -1;
+        const bool guarded = BB::Upscale::Enabled() && Rasterizer::BBFlashGuarded();
+        const int path = !BB::Upscale::Enabled()                              ? 0
+                         : guarded                                            ? 3
+                         : bb_presented && Rasterizer::BBHudSharpPresented() ? 1
+                         : bb_presented                                       ? 2
+                                                                              : 0;
+        frame->bb_fg_skip = guarded || (last_path >= 0 && path != last_path);
+        last_path = path;
+        if (frame->bb_fg_skip) {
+            if (frame->fg.valid && BB::FG::WantInputs()) Rasterizer::BBFlashGuardFgSkip();
+            frame->fg.valid = false;
+            frame->fg.has_hudless = false;
+            frame->fg.reset = true;
+        }
+    }
     if (BB::Upscale::Enabled()) {
         rasterizer->BBHudAlphaCheck(image); // BB_HUD_DIAG=1 only
     }
@@ -1536,7 +1556,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // for this present (the frame's own inputs for a new game frame; none for a repeat).
     const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
     BB::FG::SetPresentIndex(!is_reusing_frame && is_game_frame ? frame->fg.reflex_index : 0);
-    BB::ImgFg::NoteFrame(!is_reusing_frame && is_game_frame, fg_frame ? &frame->fg : nullptr,
+    BB::ImgFg::NoteFrame(!is_reusing_frame && is_game_frame && !frame->bb_fg_skip, fg_frame ? &frame->fg : nullptr,
                          swapchain.GetExtent(), fg_region);
     BB::FG::BeforePresent(fg_frame ? &frame->fg : nullptr, swapchain.GetHandle(),
                           swapchain.GetExtent(),

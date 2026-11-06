@@ -3683,8 +3683,23 @@ struct HsState {
         s_depth_fail = 0, s_final = 0, s_hudless = 0, s_twin_miss = 0, s_flip_direct = 0;
     std::chrono::steady_clock::time_point last{};
     std::string said;
+    // 1.40 flash guard. bp_ok: the slot's canvas was completed (its own flip presented at the end
+    // of the frame that drew it); cleared when the slot is (re)assigned and cleared to black.
+    std::array<bool, 3> bp_ok{};
+    // The last canvas actually presented, copied (the frame repeated instead of an unwritten one).
+    HsCanvas lg;
+    bool lg_ok = false;
+    // The present count of the last frame whose draws went into a canvas (guest image stale).
+    u64 last_live_pcount = 0;
+    bool guarded = false;
+    // Per second: guarded presents by reason, repeats / black, unguardable, FG pairs skipped.
+    std::array<u32, 4> f_reason{};
+    u32 f_repeat = 0, f_black = 0, f_fail = 0, f_fg_skip = 0;
 };
 HsState g_hs;
+constexpr std::array<const char*, 4> kGuardReason{
+    "other image (canvas live, no canvas for this flip)", "flip canvas not completely written",
+    "raw flip of a canvas-redirected image", "no presenter view of the canvas"};
 
 vk::ImageAspectFlags HsAspects(const HsCanvas& c) {
     if (!c.depth) return vk::ImageAspectFlagBits::eColor;
@@ -3979,6 +3994,7 @@ bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view
         }
         g_hs.bp_addr[slot] = addr;
         g_hs.bp_gen[slot] = g_hs.pcount + 1;
+        g_hs.bp_ok[slot] = false; // 1.40: only cleared so far: never presented until completed
         c = &g_hs.bp[slot];
     } else {
         return false;
@@ -4118,6 +4134,76 @@ bool Rasterizer::BBHudSharpPresented() {
     return g_hs.presented;
 }
 
+bool Rasterizer::BBFlashGuarded() {
+    return g_hs.guarded;
+}
+
+void Rasterizer::BBFlashGuardFgSkip() {
+    ++g_hs.f_fg_skip;
+}
+
+namespace {
+// 1.40 flash guard: the frame shows the last completely written canvas again (else black), never
+// an image this frame's scene was not written into (a flip whose draws went into a canvas, a
+// canvas only cleared). Returns false only when not even a black image could be made.
+bool HsGuard(vk::CommandBuffer cmd, VideoCore::Image& flip, vk::Format view_format, int reason,
+             vk::ImageView& out_view, vk::Extent2D& out_size) {
+    ++g_hs.f_reason[reason];
+    g_hs.guarded = true;
+    g_bb.hs_hudless_ready = false;
+    if (!g_hs.lg_ok || !g_hs.lg.image) {
+        const vk::Extent2D ext = g_hs.output.width != 0
+                                     ? g_hs.output
+                                     : vk::Extent2D{flip.info.size.width, flip.info.size.height};
+        const vk::Format fmt = g_hs.lg.image ? g_hs.lg.format : flip.info.pixel_format;
+        if (!HsEnsure(g_hs.lg, g_hs.lg.image ? g_hs.lg.extent : ext, fmt, false)) {
+            ++g_hs.f_fail;
+            return false;
+        }
+        g_hs.lg.layout = vk::ImageLayout::eUndefined;
+        HsBarrier(cmd, g_hs.lg, vk::ImageLayout::eTransferDstOptimal);
+        const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
+        cmd.clearColorImage(g_hs.lg.image, vk::ImageLayout::eTransferDstOptimal, black,
+                            vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+        ++g_hs.f_black;
+    } else {
+        ++g_hs.f_repeat;
+    }
+    const vk::ImageView v = HsView(g_hs.lg, view_format, 1);
+    if (!v) {
+        ++g_hs.f_fail;
+        return false;
+    }
+    HsBarrier(cmd, g_hs.lg, vk::ImageLayout::eShaderReadOnlyOptimal);
+    out_view = v;
+    out_size = g_hs.lg.extent;
+    // Neither the 1.14 composite nor frame generation's HUD-less image for this frame.
+    g_bb.present_ready = false;
+    g_bb.fg_present_ready = false;
+    g_hs.presented = true;
+    return true;
+}
+
+// 1.40: the copy of a canvas that is presented (the image a guarded frame repeats).
+void HsKeepGood(vk::CommandBuffer cmd, HsCanvas& c) {
+    if (!HsEnsure(g_hs.lg, c.extent, c.format, false)) {
+        g_hs.lg_ok = false;
+        return;
+    }
+    HsBarrier(cmd, c, vk::ImageLayout::eTransferSrcOptimal);
+    g_hs.lg.layout = vk::ImageLayout::eUndefined;
+    HsBarrier(cmd, g_hs.lg, vk::ImageLayout::eTransferDstOptimal);
+    cmd.copyImage(c.image, vk::ImageLayout::eTransferSrcOptimal, g_hs.lg.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {c.extent.width, c.extent.height, 1},
+                  });
+    g_hs.lg_ok = true;
+}
+} // namespace
+
 bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip,
                                    vk::Format view_format, vk::ImageView& out_view,
                                    vk::Extent2D& out_size) {
@@ -4149,6 +4235,24 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
                                   "{}",
                                   g_hs.s_hudless, g_hs.s_presents, g_hs.s_twin_miss)));
         }
+        {
+            u32 guarded = 0;
+            std::string why;
+            for (int i = 0; i < 4; ++i) {
+                guarded += g_hs.f_reason[i];
+                if (g_hs.f_reason[i] != 0) {
+                    why += fmt::format("{}{} {}", why.empty() ? "" : ", ", kGuardReason[i],
+                                       g_hs.f_reason[i]);
+                }
+            }
+            BB::Upscale::Checkpoint(fmt::format(
+                "[flash-guard] presents {}, guarded {} ({}; repeated last good {}, black {}, "
+                "UNGUARDED {}), FG pairs skipped {}",
+                g_hs.s_calls, guarded, why.empty() ? std::string("none") : why, g_hs.f_repeat,
+                g_hs.f_black, g_hs.f_fail, g_hs.f_fg_skip));
+            g_hs.f_reason = {};
+            g_hs.f_repeat = g_hs.f_black = g_hs.f_fail = g_hs.f_fg_skip = 0;
+        }
         g_hs.s_calls = g_hs.s_presents = g_hs.s_no_canvas = g_hs.s_other = g_hs.s_draws =
             g_hs.s_depth = g_hs.s_depth_fail = g_hs.s_final = g_hs.s_hudless = g_hs.s_twin_miss =
                 g_hs.s_flip_direct = g_hs.s_depth_only = g_hs.s_represent = 0;
@@ -4156,22 +4260,38 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
     const VAddr addr = flip.info.guest_address;
     HsCanvas* c = nullptr;
     HsCanvas* h = nullptr;
+    g_hs.guarded = false;
     // 1.37: a flip's canvas from this or the last two HUD-point frames (re-present / order).
     int slot = -1;
+    int any_slot = -1; // 1.40: the flip had a canvas at some point (its own draws went there)
     for (int i = 0; i < 3; ++i) {
-        if (g_hs.bp_addr[i] == addr && g_hs.bp[i].image && g_hs.bp_gen[i] != 0 &&
-            g_hs.pcount + 1 - g_hs.bp_gen[i] <= 3) {
-            slot = i;
+        if (g_hs.bp_addr[i] == addr && g_hs.bp[i].image && g_hs.bp_gen[i] != 0) {
+            any_slot = i;
+            if (g_hs.pcount + 1 - g_hs.bp_gen[i] <= 3) slot = i;
         }
     }
     const bool was_live = g_hs.live;
     g_hs.live = false;
     ++g_hs.pcount;
+    // 1.40: the frame's final pass drew its flip's canvas completely (the flip is presented).
+    if (was_live && slot >= 0 && slot == g_hs.bi) g_hs.bp_ok[slot] = true;
+    // A flip whose draws recently went into a canvas: its guest image is not this frame's.
+    const bool redirected_flip =
+        addr == g_hs.target || any_slot >= 0;
+    const bool recent_canvas =
+        g_hs.last_live_pcount != 0 && g_hs.pcount - g_hs.last_live_pcount <= 8;
+    if (was_live) g_hs.last_live_pcount = g_hs.pcount;
     if (was_live && addr == g_hs.target) {
-        c = &g_hs.a;
+        c = &g_hs.a; // filled whole by BBHudSharpBegin this frame (the upscaled scene)
         h = g_hs.want_fg ? &g_hs.a0 : nullptr;
         ++g_hs.s_flip_direct;
     } else if (slot >= 0 && BB::Upscale::HudCanvasOk()) {
+        if (!g_hs.bp_ok[slot]) {
+            // 1.40: cleared but its final pass not complete: never shown.
+            if (was_live && slot != g_hs.bi) g_hs.live = true;
+            ++g_hs.s_other;
+            return HsGuard(cmd, flip, view_format, 1, out_view, out_size);
+        }
         c = &g_hs.bp[slot];
         if (slot != g_hs.bi || !was_live) {
             ++g_hs.s_represent;
@@ -4185,37 +4305,39 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         if (was_live && slot != g_hs.bi) g_hs.live = true; // this frame's canvas still to come
     } else if (!was_live) {
         ++g_hs.s_no_canvas;
-        return false;
+        if (redirected_flip && recent_canvas) {
+            // 1.40: the guest image of a flip whose draws went into a canvas a moment ago.
+            return HsGuard(cmd, flip, view_format, 2, out_view, out_size);
+        }
+        return false; // the game's own flip, written by the game this frame
     } else {
-        // 1.38: never off for the session (1.37 turned it off after 30 such frames and kept the
-        // HUD composite for the rest of the session). A frame whose final pass did not read the
-        // HUD target (pause / menu transitions) keeps the game's own flip for that frame.
+        // 1.38: never off for the session. 1.40: such a frame's flip was not written with this
+        // frame's scene (its final pass went to a canvas, or never ran): the 1.39 fallback showed
+        // that guest image (grey + a mis-scaled HUD, the white flashes). It repeats the last
+        // completely written canvas instead.
         ++g_hs.s_other;
         if (++g_hs.consecutive_fail % 300 == 30) {
             HsSay(fmt::format("{} frames in a row presented {:#x} without a final pass from the "
-                              "HUD target {:#x}: those frames use the HUD composite (canvas "
+                              "HUD target {:#x}: those frames repeat the last canvas (canvas "
                               "stays armed)",
                               g_hs.consecutive_fail, addr, g_hs.target));
         }
-        return false;
+        // A flip that never had a canvas (its draws were never redirected: the game wrote it
+        // itself), shown more than a second in a row (pause / menu screens): the game's own
+        // image, written this frame, so that a menu is not frozen on the last canvas.
+        if (!redirected_flip && g_hs.consecutive_fail > 30) {
+            return false;
+        }
+        return HsGuard(cmd, flip, view_format, 0, out_view, out_size);
     }
     g_hs.consecutive_fail = 0;
     out_view = HsView(*c, view_format, 1);
     if (!out_view) {
         HsOff(fmt::format("no {} view of the canvas", vk::to_string(view_format)));
-        return false;
+        return HsGuard(cmd, flip, view_format, 3, out_view, out_size);
     }
+    HsKeepGood(cmd, *c);
     HsBarrier(cmd, *c, vk::ImageLayout::eShaderReadOnlyOptimal);
-    if (h != nullptr && h->image) {
-        HsBarrier(cmd, *h, vk::ImageLayout::eShaderReadOnlyOptimal);
-        g_bb.hs_hudless_view = HsView(*h, view_format, 1);
-        g_bb.hs_hudless_ready = static_cast<bool>(g_bb.hs_hudless_view);
-        g_bb.hs_hudless_source = h == &g_hs.a0
-                                     ? "HUD canvas before its HUD (scene upscaled before the HUD)"
-                                     : "HUD-less twin of the game's final pass (scene upscaled "
-                                       "before the HUD)";
-        if (g_bb.hs_hudless_ready) ++g_hs.s_hudless;
-    }
     out_size = c->extent;
     // The upscale was used: the HUD composite does not run this frame.
     g_bb.present_ready = false;
