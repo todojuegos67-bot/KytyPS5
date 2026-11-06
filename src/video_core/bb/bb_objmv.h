@@ -98,4 +98,15 @@ void OnFlip();
 // motion vectors (0: none composed, camera-only motion).
 u32 ComposedDraws();
 
+// 1.40 (bb-fgamd-140): what the compose pass put into the motion image since the last call (the
+// [fg-amd] line): pixels with an object vector / of characters (large skeletons) / all, composes,
+// frames read back, frames whose upscaler history was reset, frames left camera-only by the
+// old reset rule (BB_OBJMV_RESET_SKIP=1), composes without a G-buffer motion pass this frame.
+struct CoverageStats {
+    u64 object_px = 0, character_px = 0, all_px = 0;
+    u32 composes = 0, frames_read = 0, reset_frames = 0, reset_skipped = 0, not_written = 0;
+    bool enabled = false, reset_skip_rule = false;
+};
+CoverageStats TakeCoverage();
+
 } // namespace BB::ObjMotion
