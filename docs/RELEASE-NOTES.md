@@ -1,5 +1,45 @@
 ## New in this build
 
+Your precompiled shaders stay valid: the shader translation is the same as in v20261105.
+
+- **The game's own stereo sound** (#294, credit @robbely): music and ambience no longer sound nearly mono, and speech is
+  clearer. The emulator used to fold the game's 3D sound down to its first order, which made left and right almost the
+  same. Now the game mixes for stereo itself. Left and right differ far more (correlation at the Nexus 0.74 -> 0.27, in
+  Latria 0.93 -> 0.42), and speech stands out about 7 dB more from the ambience. `-Set
+  KYTY_GAME_CONVARS=sound_enableAmbisonics=true` brings back the old sound.
+- **F11 with AMD FSR frame generation no longer loses the graphics device** (#174, credit @ft1704): when AMD's runtime
+  made or destroyed its swapchain, or turned frame generation on or off, it waited for the whole GPU while the emulator
+  kept submitting work, which Vulkan does not allow. The emulator now holds its queues during that wait. With AMD's
+  runtime doing both the upscaling and the frame generation, F11 lost the device about 1 time in 25 on our RTX 5090 (AMD's
+  FSR 3.1 there); now 135 presses went through without one, and 30 with DLSS and DLSS frame generation. `-Set
+  KYTY_FSR_RUNTIME=0` is no longer needed for this. FSR 4 on a Radeon is untested, so please tell us if it still happens.
+- **A draw that could run without its index buffer**: in rare cases a draw after a non-indexed draw in a new command
+  buffer skipped binding its indices, which is undefined on any GPU. It went unnoticed since v20261007; Vulkan's
+  validation layer found it on a tour of the worlds.
+- **Optimized again after the merged pull requests**: the profile-guided optimization was trained again. 1-1 on our RTX
+  5090: 6% more frames at the 120 Hz cap (render thread 14.7 -> 13.7 ms a frame); Latria about the same.
+- **AMD FSR frame generation set-up corrected**: Vulkan's validation layer found four more mistakes in how the emulator
+  prepared FSR's images and its HUD pass (image usage, a depth barrier, an access mask, a shader feature that was not
+  enabled). The picture is the same here; other drivers may be less forgiving.
+- **Linux: no more crash at boot with NVIDIA 620.70.06** (PR #308, credit @ponhei9502): the driver's pipeline key call
+  overwrote registers it should keep. `KYTY_PIPELINE_KEY_THUNK=0` turns the workaround off.
+- **When a driver refuses a shader** (#305, credit @FKF-GR): a precompile leaves that pipeline out, goes on and says how
+  many it left out, instead of splitting into hundreds of retries. The log names the driver's answer and the shaders,
+  and says when a GPU has no fragment shader barycentrics, which nearly all of the game's pixel shaders need. PR #281's
+  empty fragment shader is now NVIDIA only, the one place it was measured to help (`-Set KYTY_EMPTY_FS=1` for any GPU).
+- **Fixes from pull requests** (credit @CarpetHead, @ponhei9502): the GPU's fault buffer is read and cleared word by word
+  in one step (PR #297), guarded writes reach the scout thread as such (PR #298), the lane-local proof refuses a DPP row
+  mask that treats the wave's halves apart (PR #299), and the write guard works with the Linux userfaultfd write watch
+  (PR #309, `KYTY_WRITE_GUARD_UFFD=1`).
+- **For testers, off by default** (credit @CarpetHead, @ponhei9502): `KYTY_PM4_REGFILE` (PR #285), `KYTY_UPLOAD_LANES`
+  (PR #287), `KYTY_EAGER_FEEDBACK`, `KYTY_FEEDBACK_BATCH`, `KYTY_TABLE_SERIALS`, `KYTY_TABLE_MEMO` (PRs #300-#303) and
+  `KYTY_LANE_LOCAL_WIDE` (PR #304). They made no difference to the frame rate on our PCs, or moved it both ways.
+- **Linux package README**: AMD's FSR SDK DLLs are Windows files, so FSR 4 is not available on Linux (#307).
+- **Thanks** to @CarpetHead and @ponhei9502 for their pull requests, and to @robbely, @ft1704, @FKF-GR and
+  @blubberbozz-wq for their reports and tests.
+
+## New in v20261105
+
 Your precompiled shaders stay valid: the shader translation is the same as in v20261103.
 
 - **Faster on most PCs: a scout thread** (PR #280, credit @DevList1454 and @opcod3; fixes in PR #288 by @ponhei9502):
@@ -36,36 +76,38 @@ Your precompiled shaders stay valid: the shader translation is the same as in v2
 - **Thanks** to @DevList1454, @opcod3, @CarpetHead, @ponhei9502 and @miroslavdanutalexandru-alt for their pull requests,
   reviews and measurements, and to @STALKERSK, @yura1234 and @robbely for their reports and tests.
 
-## New in v20261103
-
-Your precompiled shaders stay valid: the shaders are the same as in v20261102.
-
-- **FSR 4 frame generation: F11 and window resizes no longer close the game** (#270): with AMD's FSR SDK 2.4 DLLs,
-  switching to or from full screen, or changing the window's size, while frame generation was on ended with "FSR frame
-  generation swapchain failed". AMD's newer runtime leaves the old swapchain for the program to destroy, and the
-  emulator didn't. The performance overlay now also says "FSR 4 Frame Generation" when AMD's runtime generates with
-  FSR 4. One case is left: with AMD's runtime doing both the upscaling and the frame generation, about 1 F11 in 25 still
-  lost the graphics device on our RTX 5090 (AMD's FSR 3.1 there; FSR 4 on a Radeon is untested). If that happens to
-  you, `-Set KYTY_FSR_RUNTIME=0` keeps the frame generation and upscales with the built-in FSR 3, which never did here.
-- **The launchers call the FSR upscaler "AMD FSR"**: with the SDK 2.4 DLLs it is FSR 4 on Radeon RX 7000 and 9000
-  cards and FSR 3.1 on others; without them the built-in FSR 3. The log line `Super resolution: AMD FSR ...` says which
-  one runs.
-- **A rare freeze at start-up** (PR #269, credit @CarpetHead): the GPU thread could wait for a flip that only it could
-  prepare. It showed most with the start-up logos skipped.
-- **The game's threads wait less for the GPU's data** (PR #273, credit @CarpetHead): their requests are now also served
-  while the render thread waits for its uploads. Up to 2-4% where the game reads a lot back (the Boletarian Palace's
-  Inner Ward on an RX 9070 XT, measured by @DevList1454), the same elsewhere; `-Set KYTY_SERVE_IN_WAITS=0` turns it off.
-- **For reports about AMD FSR** (#271, #276): the log now says how much video memory AMD's runtime takes for frame
-  generation, its swapchain and the upscaler, and what the FSR upscaler is given.
-- **Tip for 8 GB Radeon RX 6000 cards with frame generation** (#276): the SDK 2.4 frame generation took about 1 GB more
-  video memory there than the older `amd_fidelityfx_vk.dll`, too much at 1080p with FSR 4. Until that is settled, use
-  the older DLL alone for frame generation, or add `-Set KYTY_FSR_RUNTIME=0` (the built-in FSR 3 upscales, lighter on
-  those cards).
-- **Thanks** to @CarpetHead for PRs #269, #273 and #274 (a flicker check for testers), to @DevList1454 for the review
-  and measurements, and to @kocher, @dimitrios1977ZXZ, @yura1234, @STALKERSK, @davide20204 and @Vyncas for their
-  reports and tests.
-
 ## 本版本的变化
+
+已有的预编译着色器继续有效：着色器的翻译与 v20261105 相同。
+
+- **改用游戏自己的立体声**（#294，感谢 @robbely）：音乐和环境音不再接近单声道，人声也更清楚。模拟器之前把游戏的 3D 声音只解到
+  一阶，左右声道几乎一样；现在由游戏自己混成立体声。左右声道的差别大了很多（相关度：Nexus 0.74 -> 0.27，Latria 0.93 -> 0.42），
+  人声比环境音突出约 7 dB。`-Set KYTY_GAME_CONVARS=sound_enableAmbisonics=true` 可恢复原来的声音。
+- **AMD FSR 插帧时按 F11 不再丢失显卡设备**（#174，感谢 @ft1704）：AMD 运行库创建或销毁交换链、开关插帧时，会等待整个 GPU，
+  而模拟器还在继续提交工作，这是 Vulkan 不允许的。现在等待期间模拟器会让出所有队列。超分和插帧都由 AMD 运行库完成时，
+  我们的 RTX 5090 上（那里是 AMD 的 FSR 3.1）大约每 25 次 F11 丢失一次设备；现在按了 135 次都没有发生，DLSS 加 DLSS 插帧也按了
+  30 次没有问题。不再需要为此加 `-Set KYTY_FSR_RUNTIME=0`。Radeon 上的 FSR 4 尚未测试，如果还会发生请告诉我们。
+- **绘制可能缺少索引缓冲**：少数情况下，新命令缓冲里紧跟在非索引绘制之后的绘制会跳过索引绑定，这在任何 GPU 上都是未定义行为。
+  这个问题从 v20261007 起就存在，这次由 Vulkan 的校验层在各世界巡游时发现。
+- **合并 PR 后重新做了编译优化**：程序的 profile 引导优化（PGO）重新训练。我们的 RTX 5090 在 1-1、120 Hz 上限下多 6% 帧数
+  （渲染线程每帧 14.7 -> 13.7 ms），Latria 基本持平。
+- **修正 AMD FSR 插帧的设置**：Vulkan 校验层还发现模拟器准备 FSR 图像和 HUD 处理时的四处错误（图像用途、一处深度屏障、一处访问掩码、
+  一项没有启用的着色器功能）。我们这里画面没有变化，其他驱动可能没这么宽容。
+- **Linux：NVIDIA 620.70.06 不再启动时崩溃**（PR #308，感谢 @ponhei9502）：驱动的管线密钥调用会改写本应保留的寄存器。
+  `KYTY_PIPELINE_KEY_THUNK=0` 可关闭这项规避。
+- **驱动拒绝某个着色器时**（#305，感谢 @FKF-GR）：预编译会跳过这条管线继续进行，并报告跳过了多少条，不再拆分成几百次重试。
+  日志会写出驱动的返回结果和对应的着色器；如果显卡不支持 fragment shader barycentrics（游戏几乎所有像素着色器都需要），日志也会写明。
+  PR #281 的空像素着色器现在只用于 NVIDIA，这是唯一测到收益的地方（`-Set KYTY_EMPTY_FS=1` 可用于任何显卡）。
+- **来自 PR 的修复**（感谢 @CarpetHead、@ponhei9502）：GPU 故障缓冲的每个字一步完成读取和清除（PR #297）；受保护的写入如实告知
+  scout 线程（PR #298）；lane-local 证明拒绝把 wave 两半分开处理的 DPP 行掩码（PR #299）；写保护可与 Linux 的 userfaultfd 写监视
+  一起使用（PR #309，`KYTY_WRITE_GUARD_UFFD=1`）。
+- **供测试用，默认关闭**（感谢 @CarpetHead、@ponhei9502）：`KYTY_PM4_REGFILE`（PR #285）、`KYTY_UPLOAD_LANES`（PR #287）、
+  `KYTY_EAGER_FEEDBACK`、`KYTY_FEEDBACK_BATCH`、`KYTY_TABLE_SERIALS`、`KYTY_TABLE_MEMO`（PR #300-#303）和
+  `KYTY_LANE_LOCAL_WIDE`（PR #304）。它们在我们的电脑上对帧率没有影响，或者有升有降。
+- **Linux 包的 README**：AMD FSR SDK 的 DLL 是 Windows 文件，Linux 上没有 FSR 4（#307）。
+- **感谢** @CarpetHead 和 @ponhei9502 的 PR，以及 @robbely、@ft1704、@FKF-GR 和 @blubberbozz-wq 的反馈与测试。
+
+## v20261105 的变化
 
 已有的预编译着色器继续有效：着色器的翻译与 v20261103 相同。
 
@@ -96,26 +138,3 @@ Your precompiled shaders stay valid: the shaders are the same as in v20261102.
 - **便于反馈问题**：日志会在所用显卡旁写出显卡驱动及其版本。
 - **感谢** @DevList1454、@opcod3、@CarpetHead、@ponhei9502 和 @miroslavdanutalexandru-alt 的 PR、审阅与测量，以及
   @STALKERSK、@yura1234 和 @robbely 的反馈与测试。
-
-## v20261103 的变化
-
-已有的预编译着色器继续有效：着色器与 v20261102 相同。
-
-- **FSR 4 插帧：按 F11 或改变窗口大小不再导致游戏退出**（#270）：使用 AMD FSR SDK 2.4 的 DLL 时，在插帧开启的状态下切换全屏、
-  或改变窗口大小，会以 "FSR frame generation swapchain failed" 退出。AMD 的新运行库把旧交换链留给程序自己销毁，而模拟器之前
-  没有这样做。另外，AMD 运行库用 FSR 4 插帧时，性能浮层现在显示 "FSR 4 Frame Generation"。还剩一种情况：超分和插帧都由 AMD
-  运行库完成时，在我们的 RTX 5090 上（那里是 AMD 的 FSR 3.1；Radeon 上的 FSR 4 尚未测试）大约每 25 次 F11 仍有一次丢失显卡
-  设备。如果你遇到，加上 `-Set KYTY_FSR_RUNTIME=0`：插帧照旧，超分改用内置 FSR 3，这样在我们这里从未出现过。
-- **启动器把 FSR 超分改称「AMD FSR」**：放有 SDK 2.4 的 DLL 时，Radeon RX 7000 和 9000 显卡上是 FSR 4，其他显卡上是
-  FSR 3.1；没有这些 DLL 时是内置的 FSR 3。日志中的 `Super resolution: AMD FSR ...` 一行会写出实际使用的版本。
-- **偶发的启动卡死**（PR #269，感谢 @CarpetHead）：GPU 线程可能在等待一次只有它自己才能准备的翻转。跳过启动标志时最容易出现。
-- **游戏线程等待 GPU 数据的时间更短**（PR #273，感谢 @CarpetHead）：渲染线程等待上传期间，也会处理游戏线程的请求。在游戏大量
-  读回数据的地方最多快 2-4%（@DevList1454 在 RX 9070 XT 上于波雷塔利亚王城内城测得），其他地方不变；
-  `-Set KYTY_SERVE_IN_WAITS=0` 关闭。
-- **便于反馈 AMD FSR 的问题**（#271、#276）：日志现在会写出 AMD 运行库在插帧、插帧交换链和超分上各占用多少显存，以及 FSR 超分
-  收到的输入。
-- **小提示：8 GB 的 Radeon RX 6000 显卡开插帧**（#276）：在这类显卡上，SDK 2.4 的插帧比旧的 `amd_fidelityfx_vk.dll` 多占约
-  1 GB 显存，1080p 加 FSR 4 时显存不够。在问题解决之前，插帧请单独使用旧 DLL，或者加上 `-Set KYTY_FSR_RUNTIME=0`（改由内置
-  FSR 3 超分，在这类显卡上负担更轻）。
-- **感谢** @CarpetHead 的 PR #269、#273 和 #274（供测试者使用的闪烁检查工具），@DevList1454 的审阅与测量，以及 @kocher、
-  @dimitrios1977ZXZ、@yura1234、@STALKERSK、@davide20204 和 @Vyncas 的反馈与测试。
