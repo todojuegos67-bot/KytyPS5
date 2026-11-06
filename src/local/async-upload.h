@@ -17,6 +17,7 @@
 #include "write-guard.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -32,6 +33,12 @@
 
 extern "C" {
 extern volatile std::atomic<uint32_t> kyty_local_async_upload_mode;
+// KYTY_UPLOAD_LANES (live 1..3, default 1; re-notes agent/tasks/20261103-UPLOAD-WORKERS-2.md): 2 = a run's write protections split by
+// guest region (4 MiB, the trackers' and the page manager's region: their per-region locks) over the worker and a second thread
+// (Kyty.Upload2), which sleeps on a futex between runs and never spins; the run's copies still start only after both lanes are done,
+// and one region's protections stay in queue order in its one lane. 3 = 2 with the order checks (upload_lane_mismatch must stay 0).
+// (A census at 1-1, usc 1103-1817: the waited batches' protections all single-region with no call among them, the lanes 45-57 / 43-55 %.)
+extern volatile std::atomic<uint32_t> kyty_local_upload_lanes;
 // KYTY_UPLOAD_HELP (live kyty_local_upload_help): whether the render thread's Drain runs the jobs the upload worker is not
 // at itself (Worker::Help): 1 always (the Steam Deck build's default), 0 never, 2 (the default elsewhere) while the
 // process's CPUs are busy, the spin gate shut (fewer than three of them idle, spin-gate.h). On the Deck's four cores the
@@ -66,6 +73,9 @@ inline bool (*g_serve_hook)(bool serve) = nullptr;
 class Worker {
 public:
 	static constexpr uint64_t Capacity = 1u << 16;
+	// KYTY_UPLOAD_LANES: the guest region a lane is chosen by: the trackers' region managers' and the page manager's region,
+	// whose locks protections take (bufferCache.cpp asserts it is TRACKER_REGION_SIZE).
+	static constexpr uint64_t LaneRegion = uint64_t {4} << 20u;
 
 	Worker(): m_jobs(std::make_unique<Job[]>(Capacity)), m_thread([this] { Run(); }) {}
 	~Worker() {
@@ -73,6 +83,9 @@ public:
 		m_head.fetch_add(0, std::memory_order_seq_cst);
 		m_head.notify_all();
 		m_thread.join();
+		m_lane_posted.fetch_add(1, std::memory_order_seq_cst);
+		m_lane_posted.notify_all();
+		if (m_lane_thread.joinable()) m_lane_thread.join();
 	}
 	Worker(const Worker&)            = delete;
 	Worker& operator=(const Worker&) = delete;
@@ -241,9 +254,10 @@ private:
 		const auto since = [](std::chrono::steady_clock::time_point from) {
 			return static_cast<uint64_t>((std::chrono::steady_clock::now() - from).count()) / 1000u;
 		};
-		const auto call = [](const Job& job) {
-			job.call(job.context, reinterpret_cast<uint64_t>(job.destination), job.size);
-		};
+		const auto     call  = [](const Job& job) { CallJob(job); };
+		// (KYTY_UPLOAD_LANES, read once a batch. Only the worker splits: a helping render thread would wait on the second
+		// thread, the stall Help exists to avoid, and the second thread takes its creator's priority and CPUs.)
+		const uint32_t lanes = helper ? 1u : kyty_local_upload_lanes.load(std::memory_order_relaxed);
 		while (done < head) {
 			if (const Job& job = m_jobs[done % Capacity]; job.call != nullptr && !job.protection) {
 				if (helper) break;
@@ -265,8 +279,7 @@ private:
 				else if (!next.protection) break;
 			}
 			const auto protecting = std::chrono::steady_clock::now();
-			for (uint64_t i = done; i < end; ++i)
-				if (const Job& next = m_jobs[i % Capacity]; next.call != nullptr) call(next);
+			Protections(done, end, lanes);
 			LiveCounters::Add(LiveCounters::UploadCallUs, since(protecting));
 			CopyRun(done, end, bytes);
 			done = end;
@@ -275,6 +288,126 @@ private:
 		m_done.store(done, std::memory_order_seq_cst);
 		if (m_waiters.load(std::memory_order_seq_cst) != 0) m_done.notify_all();
 		return done;
+	}
+
+	static void CallJob(const Job& job) { job.call(job.context, reinterpret_cast<uint64_t>(job.destination), job.size); }
+
+	// KYTY_UPLOAD_LANES: the jobs each lane needs at least for a run to be split: the second thread's wake-up (~3-4 us, protwait)
+	// plus the waker's FUTEX_WAKE (~2-3 us) against ~3 us a protection; lane 1 runs late by the wake-up, so it needs more.
+	static constexpr size_t LaneMinJobs0 = 2;
+	static constexpr size_t LaneMinJobs1 = 4;
+
+	// The write protections among jobs [first, last), in queue order (lanes 1), or split by region over two lanes (2, 3 =
+	// with the order checks) when no job spans regions and both lanes get LaneMinJobs. (The caller holds m_process.)
+	void Protections(uint64_t first, uint64_t last, uint32_t lanes) {
+		if (lanes >= 2) {
+			m_lane_jobs[0].clear();
+			m_lane_jobs[1].clear();
+			bool serial = false;
+			for (uint64_t i = first; i < last && !serial; ++i) {
+				const Job& job = m_jobs[i % Capacity];
+				if (job.call == nullptr) continue;
+				const uint64_t region = job.guest / LaneRegion;
+				if (region != (job.guest + std::max<uint64_t>(job.guest_size, 1) - 1) / LaneRegion) serial = true;
+				else m_lane_jobs[region & 1u].push_back(i);
+			}
+			// (Only while the process's CPUs keep idle ones, the spin gate open: else the second thread waits for a CPU.)
+			if (!serial && m_lane_jobs[0].size() >= LaneMinJobs0 && m_lane_jobs[1].size() >= LaneMinJobs1 &&
+			    SpinGate::g_open.load(std::memory_order_relaxed)) {
+				RunLanes(lanes == 3, first, last);
+				return;
+			}
+		}
+		for (uint64_t i = first; i < last; ++i)
+			if (const Job& next = m_jobs[i % Capacity]; next.call != nullptr) CallJob(next);
+	}
+
+	// Lane 1's jobs to the second thread, lane 0's here, then waits for the second (a short spin: the lanes are about even;
+	// then a futex), so the run's copies start after both. (The caller holds m_process: one run in lanes at a time.)
+	void RunLanes(bool verify, uint64_t first, uint64_t last) {
+		if (!m_lane_thread.joinable()) {
+			m_lane_thread = std::thread([this] { LaneRun(); });
+			std::printf("Upload lanes: on (KYTY_UPLOAD_LANES=%u: a second upload thread runs the odd 4 MiB regions' write protections; "
+			            "it sleeps between runs)\n",
+			            verify ? 3u : 2u);
+			std::fflush(stdout);
+		}
+		m_lane_verify.store(verify, std::memory_order_relaxed);
+		const uint32_t generation = m_lane_posted.load(std::memory_order_relaxed) + 1;
+		m_lane_posted.store(generation, std::memory_order_seq_cst);
+		m_lane_posted.notify_one();
+		for (const uint64_t i: m_lane_jobs[0]) CallJob(m_jobs[i % Capacity]);
+		// (The join, after this lane's own jobs: its wait is the split's cost, upload_lane_join_us.)
+		const auto joining = std::chrono::steady_clock::now();
+		for (int spin = 0; spin < 2000 && m_lane_finished.load(std::memory_order_acquire) != generation; ++spin) _mm_pause();
+		if (m_lane_finished.load(std::memory_order_seq_cst) != generation) {
+			LiveCounters::Add(LiveCounters::UploadLaneFutexJoins);
+			m_lane_main_waiting.store(true, std::memory_order_seq_cst);
+			for (uint32_t finished; (finished = m_lane_finished.load(std::memory_order_seq_cst)) != generation;)
+				m_lane_finished.wait(finished, std::memory_order_seq_cst);
+			m_lane_main_waiting.store(false, std::memory_order_relaxed);
+		}
+		LiveCounters::Add(LiveCounters::UploadLaneJoinUs,
+		                  static_cast<uint64_t>((std::chrono::steady_clock::now() - joining).count()) / 1000u);
+		LiveCounters::Add(LiveCounters::UploadLaneRuns);
+		LiveCounters::Add(LiveCounters::UploadLaneJobs, m_lane_jobs[1].size());
+		if (verify) LiveCounters::Add(LiveCounters::UploadLaneMismatch, CheckLanes(first, last));
+	}
+
+	// The second lane's thread: each posted run's lane-1 jobs in their order, then sleeps again (never spins: a spinning
+	// thread in the process makes every protection's TLB flush reach one more CPU, ~0.27 us each).
+	void LaneRun() {
+		LocalPlatform::SetThreadName("Kyty.Upload2");
+		t_worker = true;
+		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
+		uint32_t seen = 0;
+		for (;;) {
+			uint32_t posted = 0;
+			while ((posted = m_lane_posted.load(std::memory_order_acquire)) == seen) {
+				if (m_stop.load(std::memory_order_seq_cst)) return;
+				m_lane_posted.wait(seen, std::memory_order_acquire);
+			}
+			seen = posted;
+			// (A post runs and finishes even when stopping: its poster waits for it; the destructor's wake carries no jobs
+			// of its own: the worker has stopped by then.)
+			const bool verify = m_lane_verify.load(std::memory_order_relaxed);
+			if (verify) m_lane_ran.clear();
+			for (const uint64_t i: m_lane_jobs[1]) {
+				if (verify) m_lane_ran.push_back(i);
+				CallJob(m_jobs[i % Capacity]);
+			}
+			m_lane_finished.store(seen, std::memory_order_seq_cst);
+			if (m_lane_main_waiting.load(std::memory_order_seq_cst)) m_lane_finished.notify_one();
+			if (m_stop.load(std::memory_order_seq_cst)) return;
+		}
+	}
+
+	// KYTY_UPLOAD_LANES=3, after both lanes are done: the order rules a split must keep, the violations counted. Each lane holds
+	// only its regions (one region never in both: its protections keep their queue order), in queue order; the second thread
+	// ran exactly lane 1's jobs, in that order.
+	[[nodiscard]] uint64_t CheckLanes(uint64_t first, uint64_t last) const {
+		uint64_t mismatches = 0;
+		// (Every protection job of the run in one of the lanes, each single-region.)
+		size_t protections = 0;
+		for (uint64_t i = first; i < last; ++i) {
+			const Job& job = m_jobs[i % Capacity];
+			if (job.call == nullptr) continue;
+			protections++;
+			if (job.guest / LaneRegion != (job.guest + std::max<uint64_t>(job.guest_size, 1) - 1) / LaneRegion) mismatches++;
+		}
+		if (protections != m_lane_jobs[0].size() + m_lane_jobs[1].size()) mismatches++;
+		for (uint32_t lane = 0; lane < 2; ++lane) {
+			for (size_t k = 0; k < m_lane_jobs[lane].size(); ++k) {
+				const Job& job = m_jobs[m_lane_jobs[lane][k] % Capacity];
+				if (((job.guest / LaneRegion) & 1u) != lane) mismatches++;
+				if (k != 0 && m_lane_jobs[lane][k] <= m_lane_jobs[lane][k - 1]) mismatches++;
+			}
+		}
+		for (const uint64_t a: m_lane_jobs[0])
+			for (const uint64_t b: m_lane_jobs[1])
+				if (m_jobs[a % Capacity].guest / LaneRegion == m_jobs[b % Capacity].guest / LaneRegion) mismatches++;
+		if (m_lane_ran != m_lane_jobs[1]) mismatches++;
+		return mismatches;
 	}
 
 	// The copies among jobs [first, last) (calls skipped), `bytes` in all. Copies of 1 MiB or more together are
@@ -342,6 +475,15 @@ private:
 		uint64_t       guest;
 	};
 	std::vector<RunCopy>               m_run; // (the worker's)
+	// KYTY_UPLOAD_LANES: the run's jobs per lane (written under m_process before a post, read by the second thread until it
+	// finishes that post), the second thread, its post / finish generations, and whether the poster sleeps on the finish.
+	std::vector<uint64_t>              m_lane_jobs[2];
+	std::vector<uint64_t>              m_lane_ran; // (=3: the second thread's)
+	std::thread                        m_lane_thread;
+	alignas(64) std::atomic<uint32_t>  m_lane_posted {0};
+	alignas(64) std::atomic<uint32_t>  m_lane_finished {0};
+	std::atomic<bool>                  m_lane_main_waiting {false};
+	std::atomic<bool>                  m_lane_verify {false};
 	std::unique_ptr<Job[]>             m_jobs;
 	alignas(64) std::atomic<uint64_t>  m_head {0};
 	alignas(64) std::atomic<uint64_t>  m_done {0};

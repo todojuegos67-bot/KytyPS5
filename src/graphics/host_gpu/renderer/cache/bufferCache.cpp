@@ -46,6 +46,8 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {1};
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {1};
 // 1: shader constants stream through a host-visible upload ring.
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_stream_upload_mode {1};
+// KYTY_UPLOAD_LANES (local/async-upload.h): 1 = one upload lane (default), 2 = two, 3 = two with the order checks.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_upload_lanes {1};
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
@@ -1168,6 +1170,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 	// Region requests prove their state against the registration epoch of their own region: only the
 	// requests of these regions need to be synchronized again.
+	// (The upload lanes split protections by this region: its region managers' and the page manager's locks.)
+	static_assert(AsyncUpload::Worker::LaneRegion == TRACKER_REGION_SIZE);
 	for (auto region = m_slot_buffers[id].CpuAddress() / TRACKER_REGION_SIZE,
 	          last   = (m_slot_buffers[id].CpuAddress() + m_slot_buffers[id].Size() - 1) / TRACKER_REGION_SIZE;
 	     region <= last && region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE; ++region) {
