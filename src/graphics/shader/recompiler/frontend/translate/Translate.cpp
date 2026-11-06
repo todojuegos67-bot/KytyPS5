@@ -50,6 +50,7 @@ uint32_t TranslatorFeatureSet() {
 	static const int group_walks  = forced("KYTY_BDA_GROUP_WALKS");
 	static const int quad_reads   = forced("KYTY_PIXEL_QUAD_READS");
 	static const int unfused_mad  = forced("KYTY_UNFUSED_MAD");
+	static const int lane_wide    = forced("KYTY_LANE_LOCAL_WIDE");
 	const auto       stored       = g_translator_features.load(std::memory_order_relaxed);
 	auto             features     = (stored & g_device_features.load(std::memory_order_relaxed)) |
 	                     g_device_required.load(std::memory_order_relaxed);
@@ -63,6 +64,7 @@ uint32_t TranslatorFeatureSet() {
 	apply(group_walks, TranslatorFeatureBdaGroupWalks);
 	apply(quad_reads, TranslatorFeaturePixelQuadReads);
 	apply(unfused_mad, TranslatorFeatureUnfusedMad);
+	apply(lane_wide, TranslatorFeatureLaneLocalWide);
 	return features;
 }
 
@@ -1024,6 +1026,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		LaneLocalProof proof;
 		result.lane_local =
 		    enabled && ProveWaveLaneLocal(decoded, cooperative_enabled && one_wave, proof, log ? &reason : nullptr);
+		if (result.lane_local) result.lds_barriers = std::move(proof.lds_barriers);
 		if (result.lane_local && proof.Cooperative()) {
 			result.lane_cooperative     = true;
 			result.cooperative_reads    = std::move(proof.exchange_reads);
@@ -1036,7 +1039,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                     : result.lane_cooperative ? fmt::format("yes (cooperative: {} lane reads, {} branches)",
 			                                                             result.cooperative_reads.size(),
 			                                                             result.cooperative_branches.size())
-			                                               : std::string("yes");
+			                     : !result.lds_barriers.empty() ? fmt::format("yes ({} LDS barriers)", result.lds_barriers.size())
+			                                                    : std::string("yes");
 			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash), verdict.c_str());
 		}
 	}
@@ -1323,6 +1327,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		Translator translator(result, result.blocks[typed_index], vector_limit);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
+			if (!result.lds_barriers.empty() &&
+			    std::binary_search(result.lds_barriers.begin(), result.lds_barriers.end(), instruction.pc))
+				translator.WorkgroupBarrier();
 			if (result.lane_cooperative && (instruction.opcode == Decoder::Opcode::V_READLANE_B32 ||
 			                                instruction.opcode == Decoder::Opcode::V_READFIRSTLANE_B32))
 				cooperative_reached.push_back(instruction.pc);

@@ -288,6 +288,7 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 					break;
 				}
 				case IR::ValueOpcode::LaneId:
+				case IR::ValueOpcode::WaveLaneId:
 					requirements.subgroup_local_invocation_id = true;
 					break;
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;

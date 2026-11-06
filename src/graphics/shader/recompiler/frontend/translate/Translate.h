@@ -53,6 +53,7 @@ bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = null
 struct LaneLocalProof {
 	std::vector<uint32_t> exchange_reads;
 	std::vector<uint32_t> wave_branches;
+	std::vector<uint32_t> lds_barriers; // (TranslatorFeatureLaneLocalWide) PCs a workgroup barrier goes before
 	[[nodiscard]] bool    Cooperative() const { return !exchange_reads.empty() || !wave_branches.empty(); }
 };
 bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof,
@@ -79,6 +80,16 @@ constexpr uint32_t TranslatorFeaturePixelQuadReads = 32u;
 // V_FMA_F32 is fused). Fused, the last bits differ where vectors nearly cancel: Demon's Souls' fog particles on the
 // loading screen picked a wrong colour and flashed brown patches for one frame.
 constexpr uint32_t TranslatorFeatureUnfusedMad = 64u;
+// The lane-local proof's wider rules (LaneLocal.cpp), one bit for all of them. So far: S_GETPC_B64 admitted, the program
+// counter being the same in every lane and both halves (the wave64 programs that read it use it for a table of
+// constants after their code: s_getpc, s_add_u32 of the table's offset, per-lane loads through it); S_SETPC and the
+// subvector loops stay refused; LDS plain reads and writes, a workgroup barrier placed between those another lane may
+// meet in one barrier-free stretch (LdsBarriers: the two halves of a lane-local wave are two subgroups, not in lockstep);
+// DS_*_ADDTID through the wave's lane (IR WaveLaneId), a lane's own slot of a 64-dword window whose base (M0 a constant
+// on every path) the proof knows, so two of one window or of disjoint windows need no barrier; DPP whose row mask treats
+// the halves apart refused. Off unless KYTY_LANE_LOCAL_WIDE=1 (not in TranslatorFeatures until measured: it
+// changes those programs' SPIR-V).
+constexpr uint32_t TranslatorFeatureLaneLocalWide = 128u;
 constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse |
                                         TranslatorFeatureNativeFloatMinMax | TranslatorFeatureExecSelects |
                                         TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad

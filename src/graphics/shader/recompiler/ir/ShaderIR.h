@@ -705,6 +705,8 @@ struct Program: ResourcePlan {
 	bool                          lane_cooperative = false;
 	std::vector<uint32_t>         cooperative_reads;
 	std::vector<uint32_t>         cooperative_branches;
+	// A lane-local program's LDS accesses: the PCs a workgroup barrier goes before (Frontend::LdsBarriers).
+	std::vector<uint32_t>         lds_barriers;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;

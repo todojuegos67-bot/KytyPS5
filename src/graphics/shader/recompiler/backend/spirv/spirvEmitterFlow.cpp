@@ -750,6 +750,13 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::LaneId:
 			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
 			return true;
+		case IR::ValueOpcode::WaveLaneId:
+			// (A lane-local wave64 program: its index in the group, as BufferByteAddress takes ADD_TID; otherwise LaneId's.)
+			ctx.Define(inst, state.lane_count == 1 && state.program.lane_local
+			                     ? Binary(state, OpBitwiseAnd, TypeU32(state), EmitLocalInvocationIndex(state),
+			                              ConstantU32(state, 63))
+			                     : EmitSubgroupLocalInvocationId(state));
+			return true;
 		case IR::ValueOpcode::Ballot: ctx.Define(inst, ctx.Ballot(inst.Arg(0))); return true;
 		case IR::ValueOpcode::AnyLane: {
 			const auto ballot = ctx.Ballot(inst.Arg(0));
