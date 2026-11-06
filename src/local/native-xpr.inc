@@ -86,6 +86,21 @@ extern "C" {
 // Table lookups that ask the last answer first (bits): 1 the pair cache's 4096 entries (else 256), 2 the pair's variant
 // found last, 4 the pair's image set before the last (TableTry, TableSet).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_mru {7};
+// KYTY_TABLE_SERIALS (live table_serials, on by default): 1: a table draw's targets and set images are checked
+// (NativeXprEmitTargets, TableTransit) only when the sum of their image serials (ImageSerials) moved since the state's or
+// set's last emission, not whenever any image changed; 2: checked as before, the checks the sums would have skipped that
+// changed something counted (serials_unsafe: the verify). A change of the switch moves the unattributed serial, so no
+// sum kept before it holds after.
+static uint32_t TableSerialsMode() {
+	static auto&                 mode = LiveSwitch::Find("table_serials", 1);
+	static std::atomic<int64_t>  seen {0};
+	const auto                   now  = mode.load(std::memory_order_relaxed);
+	if (seen.exchange(now, std::memory_order_relaxed) != now) {
+		ImageSerials::g_on.store(now != 0, std::memory_order_relaxed);
+		MoveImageStateEpoch();
+	}
+	return static_cast<uint32_t>(now);
+}
 // 1: NativeXprStateKey hashes the context and the user configuration again only after a change of their registers;
 // 0: at every call; 2: as 1, each key checked against the full hash (STATE-KEY MISMATCH lines, counter
 // shortcut_mismatches).
@@ -236,6 +251,12 @@ struct RenderExecutor::NativeXprDrawState {
 	// TextureCache::ImagesEpoch after the last table draw emitted the targets (UINT64_MAX: none): they stay in place
 	// while it does not move (RenderExecutor::TableDraw).
 	mutable uint64_t                 emitted_epoch = UINT64_MAX;
+	// The sum of its targets' image serials then (KYTY_TABLE_SERIALS; UINT64_MAX: none).
+	mutable uint64_t                 emitted_serials = UINT64_MAX;
+	// Unique per capture: a state captured again at its address is another (a set's transit under it does not hold).
+	uint64_t                         capture_id      = 0;
+	// The targets' ids alone, in a line or two: what the serial sums read (a Target holds an ImageInfo, lines of it).
+	std::vector<ImageId>             target_ids;
 	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
 	mutable uint64_t                 used_frame = 0;
 	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
@@ -1774,6 +1795,12 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
 	}
 	draw_state.meta_epoch = 0;
+	static std::atomic<uint64_t> captures {0};
+	draw_state.capture_id = captures.fetch_add(1, std::memory_order_relaxed) + 1;
+	for (const auto& target: draw_state.targets) {
+		textures.NoteMetaUse(target.metadata, target.id.index); // (KYTY_TABLE_SERIALS)
+		draw_state.target_ids.push_back(target.id);
+	}
 	draw_state.dynamic = LocalDrawRecording::Capture(
 	    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
 	    m_context.GetGraphics().attachment_feedback_loop_enabled,

@@ -89,6 +89,13 @@ struct RenderExecutor::TableImageSet {
 	// (null: a dispatch): they stay in place while it does not move (UINT64_MAX: not yet).
 	uint64_t                  transit_epoch = UINT64_MAX;
 	const NativeXprDrawState* transit_state = nullptr;
+	// The sum of its images' serials then (KYTY_TABLE_SERIALS; UINT64_MAX: none), and transit_state's capture then.
+	uint64_t                  transit_serials  = UINT64_MAX;
+	uint64_t                  transit_capture  = 0;
+	// The images' ids alone, and whether one is a target of the state it was made under: what the serial sums and
+	// TableSetApart read (an Image holds an ImageDesc, lines of it).
+	std::vector<ImageId>      image_ids;
+	bool                      holds_target = false;
 	// The words select another specialization, or an image no set can hold: the draws take the native path
 	// (TableResolveSet tries again after TableImageSet::RetryFrames).
 	bool                  refused = false;
@@ -353,8 +360,9 @@ void RenderExecutor::TableForgetStates() {
 		for (auto& [key, pair]: *pairs)
 			for (auto& [words, set]: pair.sets)
 				if (set->transit_state != nullptr) {
-					set->transit_state = nullptr;
-					set->transit_epoch = UINT64_MAX;
+					set->transit_state   = nullptr;
+					set->transit_epoch   = UINT64_MAX;
+					set->transit_serials = UINT64_MAX;
 				}
 }
 
@@ -776,7 +784,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		}
 		if (st == 0) set->images.reserve(deps[0].size() + deps[1].size());
 		for (const auto& dep: deps[st])
-			if (dep.layout != vk::ImageLayout::eUndefined) set->images.push_back(dep);
+			if (dep.layout != vk::ImageLayout::eUndefined) {
+				set->images.push_back(dep);
+				set->image_ids.push_back(dep.id);
+				set->holds_target |= dep.target;
+				// (Its view's metadata, which may not be the image's own: KYTY_TABLE_SERIALS.)
+				if (dep.desc.info.metadata.kind != ImageMetadataKind::None)
+					m_context.GetTextureCache().NoteMetaUse(dep.desc.info.metadata.range.address, dep.id.index);
+			}
 	}
 	set->set = NativeXprAllocateSet((variant != nullptr      ? variant->pipeline
 	                                 : set->pipeline != nullptr ? set->pipeline
@@ -1543,6 +1558,37 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	if (!bounded || !resources.PrepareBdaReadRanges(ranges)) resources.PrepareBda();
 }
 
+// KYTY_TABLE_SERIALS=2: a check the serial sums would have skipped that changed something (the first 32 printed).
+static void TableSerialsUnsafe(const char* what) {
+	static std::atomic<uint32_t> count {0};
+	LiveCounters::Add(LiveCounters::SerialsUnsafe);
+	if (const auto n = count.fetch_add(1, std::memory_order_relaxed); n < 32)
+		std::printf("TABLE-SERIALS UNSAFE: %s (%u)\n", what, n + 1);
+}
+
+// The image serial sums (ImageSerials) of a draw state's targets and of a set's images, with the unattributed serial.
+template<typename State> // (RenderExecutor::NativeXprDrawState)
+static uint64_t TableTargetSerials(const State& draw_state) {
+	uint64_t sum = ImageSerials::Unattributed();
+	for (const auto id: draw_state.target_ids) sum += ImageSerials::Read(id.index);
+	return sum;
+}
+template<typename Set> // (RenderExecutor::TableImageSet)
+static uint64_t TableSetSerials(const Set& set) {
+	uint64_t sum = ImageSerials::Unattributed();
+	for (const auto id: set.image_ids) sum += ImageSerials::Read(id.index);
+	return sum;
+}
+// A set transited under another draw state is in place under this one when it holds no target of either: TableTransit
+// asks the state only which of the set's images it targets.
+template<typename Set, typename State>
+static bool TableSetApart(const Set& set, const State& draw_state) {
+	if (set.holds_target) return false;
+	for (const auto id: set.image_ids)
+		if (std::ranges::find(draw_state.target_ids, id) != draw_state.target_ids.end()) return false;
+	return true;
+}
+
 // A set's images in their layouts (other work may have moved them since the set was last bound), a DCC image's
 // pending fast clear applied first, as the normal path's FindTexture does, unless the draw's targets are not those the
 // set was made for (an image held as a texture became a target, or the reverse).
@@ -1979,18 +2025,46 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const auto images_epoch  = texture_cache.ImagesEpoch();
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch;
+	// KYTY_TABLE_SERIALS: the checks again only when a serial sum moved (1), or as before with the sums counted (2).
+	const auto serials = TableSerialsMode();
 	if (!in_place) {
 		// The same for the targets apart, as this draw state's last emission left them, and the set's images, as its
 		// last transit under this state did (the passes alternate materials: another set or state in between).
-		if (draw_state.emitted_epoch != images_epoch && !NativeXprEmitTargets(draw_state, vk_buffer))
+		const bool epoch_targets = draw_state.emitted_epoch != images_epoch;
+		const auto targets_sum   = serials != 0 ? TableTargetSerials(draw_state) : 0;
+		const bool sum_targets   = draw_state.emitted_serials != targets_sum;
+		const bool due_targets   = serials == 1 ? sum_targets : epoch_targets;
+		if (serials != 0 && epoch_targets != sum_targets)
+			LiveCounters::Add(sum_targets ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
+		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer)) {
+			if (serials == 2 && !sum_targets) TableSerialsUnsafe("targets refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), TableResult::Native;
+		}
+		if (serials == 2 && due_targets && !sum_targets && TableTargetSerials(draw_state) != targets_sum)
+			TableSerialsUnsafe("targets moved");
 		// The set's images in their layouts (a DCC image's pending fast clear applied first).
-		if ((set->transit_epoch != images_epoch || set->transit_state != &draw_state) &&
-		    !TableTransit(*set, vk_buffer, &draw_state))
+		const bool epoch_transit = set->transit_epoch != images_epoch || set->transit_state != &draw_state;
+		const auto set_sum       = serials != 0 ? TableSetSerials(*set) : 0;
+		const bool sum_transit   = set->transit_serials != set_sum ||
+		                         ((set->transit_state != &draw_state || set->transit_capture != draw_state.capture_id) &&
+		                          !TableSetApart(*set, draw_state));
+		const bool due_transit   = serials == 1 ? sum_transit : epoch_transit;
+		if (serials != 0 && epoch_transit != sum_transit)
+			LiveCounters::Add(sum_transit ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
+		if (due_transit && !TableTransit(*set, vk_buffer, &draw_state)) {
+			if (serials == 2 && !sum_transit) TableSerialsUnsafe("transit refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), TableResult::Native;
+		}
+		if (serials == 2 && due_transit && !sum_transit && TableSetSerials(*set) != set_sum)
+			TableSerialsUnsafe("transit moved");
 		// (Neither moves what the other placed: a target is no image the set holds as a texture.)
 		draw_state.emitted_epoch = set->transit_epoch = texture_cache.ImagesEpoch();
 		set->transit_state       = &draw_state;
+		set->transit_capture     = draw_state.capture_id;
+		if (serials != 0) {
+			draw_state.emitted_serials = due_targets || due_transit ? TableTargetSerials(draw_state) : targets_sum;
+			set->transit_serials       = due_targets || due_transit ? TableSetSerials(*set) : set_sum;
+		}
 	}
 	m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&

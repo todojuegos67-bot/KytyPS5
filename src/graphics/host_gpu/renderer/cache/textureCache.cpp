@@ -587,6 +587,10 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
 		m_failed_tick = m_gc_tick + 1;
 		return {};
 	}
+	// (A slot reused goes on counting: what held the one before sees its sum move.)
+	m_slot_images[id].serial_slot = id.index;
+	ImageSerials::Ensure(id.index);
+	ImageSerials::Move(id.index);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -690,12 +694,68 @@ bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t 
 	return false;
 }
 
+void TextureCache::MoveRegistrationSerials(const Image& image) {
+	ImageSerials::Move(image.serial_slot);
+	for (const auto other: FindImagesInRegion(image.info.data.address, image.info.data.size, true))
+		if (const auto* found = m_slot_images.try_get(other)) ImageSerials::Move(found->serial_slot);
+}
+
+void TextureCache::MoveMeta(uint64_t begin, uint64_t end) {
+	{
+		const std::lock_guard lock(m_meta_slots_lock);
+		for (auto it = m_meta_slots.lower_bound(begin); it != m_meta_slots.end() && it->first < end; ++it)
+			ImageSerials::Move(it->second);
+	}
+	m_meta_epoch.fetch_add(1, std::memory_order_release);
+}
+
+void TextureCache::NoteMetaUse(uint64_t address, uint32_t slot) {
+	if (address == 0 || slot == UINT32_MAX) return;
+	const std::lock_guard lock(m_meta_slots_lock);
+	for (auto [it, end] = m_meta_slots.equal_range(address); it != end; ++it)
+		if (it->second == slot) return;
+	m_meta_slots.emplace(address, slot);
+	m_meta_by_slot[slot].push_back(address);
+}
+
+void TextureCache::NoteMetaSlot(const Image& image, bool add) {
+	const auto address = image.info.metadata.range.address;
+	if (image.info.metadata.kind == ImageMetadataKind::None || address == 0) return;
+	const std::lock_guard lock(m_meta_slots_lock);
+	if (add) {
+		m_meta_slots.emplace(address, image.serial_slot);
+		m_meta_by_slot[image.serial_slot].push_back(address);
+		return;
+	}
+	for (auto [it, end] = m_meta_slots.equal_range(address); it != end; ++it)
+		if (it->second == image.serial_slot) {
+			m_meta_slots.erase(it);
+			if (const auto found = m_meta_by_slot.find(image.serial_slot); found != m_meta_by_slot.end()) {
+				if (const auto at = std::ranges::find(found->second, address); at != found->second.end()) found->second.erase(at);
+			}
+			return;
+		}
+}
+
+// KYTY_TABLE_SERIALS: every metadata entry of a slot whose image leaves (its own, NoteMetaSlot, and each view's a table
+// draw noted, NoteMetaUse): none would move the serial of an image there, and a new image in the slot notes its own.
+void TextureCache::ForgetMetaSlot(uint32_t slot) {
+	const std::lock_guard lock(m_meta_slots_lock);
+	const auto            found = m_meta_by_slot.find(slot);
+	if (found == m_meta_by_slot.end()) return;
+	for (const auto address: found->second)
+		for (auto [it, end] = m_meta_slots.equal_range(address); it != end;) it = it->second == slot ? m_meta_slots.erase(it) : std::next(it);
+	m_meta_by_slot.erase(found);
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
 	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
+	MoveRegistrationSerials(image); // (KYTY_TABLE_SERIALS)
+	NoteMetaSlot(image, true);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
@@ -731,6 +791,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 		                 true);
 	}
 	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
+	MoveRegistrationSerials(image); // (KYTY_TABLE_SERIALS)
+	ForgetMetaSlot(image.serial_slot);
 	++m_image_granule_releases;
 	UntrackImage(id, "unregister");
 	ImagePageTable::PageRange pages {};
@@ -800,8 +862,9 @@ bool TextureCache::DetachImage(ImageId id) {
 		     (image->info.metadata.kind == ImageMetadataKind::Htile &&
 		      metadata->second.type == MetaDataInfo::Type::HTile))) {
 			// A later binding may have reused this address for another metadata type.
+			const auto meta_address = metadata->first;
 			m_surface_metas.erase(metadata);
-			m_meta_epoch.fetch_add(1, std::memory_order_release);
+			MoveMeta(meta_address);
 		}
 	}
 	UnregisterImage(id);
@@ -2822,7 +2885,10 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	auto&      image       = m_slot_images[id];
 	bool       changed     = !(image.info.metadata == desc.info.metadata);
 	if (changed) ++image.validity;
+	if (changed && image.registered) NoteMetaSlot(image, false);
 	image.info.metadata    = desc.info.metadata;
+	if (changed && image.registered) NoteMetaSlot(image, true);
+	if (changed) ImageSerials::Move(image.serial_slot);
 	auto [entry, inserted] = m_surface_metas.try_emplace(
 	    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::Dcc});
 	MetaFilterAdd(desc.info.metadata.range.address);
@@ -2835,7 +2901,7 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: image reuses non-DCC metadata\n");
 	}
 	// (Only when the record changed: every DCC target acquisition passes here.)
-	if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
+	if (changed) MoveMeta(desc.info.metadata.range.address);
 	if (metadata.clear_mask == 0 || image.info.resources.levels != 1 ||
 	    desc.info.metadata.range.size == 0 || metadata.fill_size < desc.info.metadata.range.size) {
 		return;
@@ -3684,7 +3750,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		// acquisition passes here.
 		bool changed        = !(image.info.metadata == desc.info.metadata);
 		if (changed) ++image.validity;
+		if (changed && image.registered) NoteMetaSlot(image, false);
 		image.info.metadata = desc.info.metadata;
+		if (changed && image.registered) NoteMetaSlot(image, true);
+		if (changed) ImageSerials::Move(image.serial_slot);
 		auto [metadata, inserted] =
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address,
 		                                MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
@@ -3698,7 +3767,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 			                    .clear_mask = image.info.htile_clear_mask};
 			changed          = true;
 		}
-		if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
+		if (changed) MoveMeta(desc.info.metadata.range.address);
 	}
 	CommitGpuWrite(image, scoped);
 	if (desc.info.HasStencil()) {
@@ -4849,7 +4918,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask = UINT32_MAX;
 	found->second.fill_known = false;
-	m_meta_epoch.fetch_add(1, std::memory_order_release); // (a clear pending: cached answers ask again)
+	MoveMeta(address); // (a clear pending: cached answers ask again)
 	return true;
 }
 
@@ -4864,7 +4933,7 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	found->second.clear_mask = UINT32_MAX;
 	found->second.fill_value = fill_value;
 	found->second.fill_known = true;
-	m_meta_epoch.fetch_add(1, std::memory_order_release);
+	MoveMeta(address);
 	return true;
 }
 
@@ -4893,7 +4962,7 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 	// image descriptor confirms its role; never reinterpret CMask/FMask/HTile as DCC.
 	const auto found = m_surface_metas.try_emplace(address).first;
 	MetaFilterAdd(address);
-	m_meta_epoch.fetch_add(1, std::memory_order_release);
+	MoveMeta(address);
 	if (found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    found->second.type == MetaDataInfo::Type::Dcc) {
 		found->second.clear_mask = dcc_clear_mask;
@@ -4913,7 +4982,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	}
 	if (is_clear) {
 		found->second.clear_mask |= 1u << slice;
-		m_meta_epoch.fetch_add(1, std::memory_order_release);
+		MoveMeta(address);
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
 	}
@@ -4983,7 +5052,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		}
 		for (size_t i = 0; i < bits.size(); ++i) m_meta_filter[i].store(bits[i], std::memory_order_release);
 	}
-	m_meta_epoch.fetch_add(1, std::memory_order_release);
+	MoveMeta(address, address + size);
 	auto images = FindImagesInRegion(address, size, false);
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);
@@ -5016,6 +5085,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::EraseSlot(ImageId id) {
+	ImageSerials::Move(m_slot_images[id].serial_slot);
 	m_slot_images.erase(id);
 	m_erase_epoch.fetch_add(1, std::memory_order_release);
 }
