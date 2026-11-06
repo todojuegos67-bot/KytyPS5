@@ -2282,6 +2282,8 @@ void OnDispatch() {
     }
 }
 
+static bool all_scene_on();
+
 u64 g_diag_asked = 0, g_diag_inactive = 0, g_diag_noscene = 0, g_diag_calls = 0, g_diag_small = 0;
 
 bool WantCameraScan(bool vertex) {
@@ -2292,9 +2294,13 @@ bool WantCameraScan(bool vertex) {
         return false;
     }
     std::scoped_lock lk{g_mutex};
+    // 1.12 (bb-cpcpu-112): with BB_TAA_ALL (the default) Jitter() never reads vertex_camera, so
+    // the jitter term no longer rescans every scene draw's vertex constants (up to 4 KB, 2000
+    // matrix tests each) once the frame's camera is known.
     const bool want = g_draw.valid && g_draw.scene &&
                       (g_frame.scanned < 160 || !g_frame.camera_ok ||
-                       (vertex && Cfg().jitter && !g_draw.vertex_camera));
+                       (vertex && Cfg().jitter && !g_draw.vertex_camera &&
+                        (!all_scene_on() || g_draw.analyze_dump)));
     if (!want) ++g_diag_noscene;
     return want;
 }
@@ -2308,6 +2314,14 @@ void OnVertexConstants(const void* data, size_t size) {
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
     if (BlockCamera(f, static_cast<const float*>(data), size)) {
+        return;
+    }
+    // 1.12 (bb-cpcpu-112): once the scene constant block gave the frame's camera (a candidate of
+    // count 1000000 no scanned one can outrank, BestCamera), the matrix scan only still matters
+    // for the vertex-camera mark, which only Jitter() without BB_TAA_ALL reads. The block test
+    // above keeps running, so a larger pass's block still replaces it.
+    if (f.block_area > 0 && f.camera_ok && !g_draw.analyze_dump &&
+        (all_scene_on() || !g_scan_vertex || g_draw.vertex_camera)) {
         return;
     }
     const u64 draw = f.draws;

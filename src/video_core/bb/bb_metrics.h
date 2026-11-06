@@ -8,6 +8,8 @@
 // Appended and flushed per line; the previous run's file is kept as <file>.1.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -22,7 +24,25 @@ void Line(const char* text);
 void PerfDlss5(double cpu_ms);              // one DLSS 5 Apply: CPU time to record it
 void PerfDlss5Gpu(double gpu_ms);           // a DLSS 5 GPU time read back (async, frames late)
 void PerfPresentWait(double ms);            // the presenter waited for a free frame / its fence
-void PerfLine(int frames_in_flight, int frames_total); // once per presented game frame // a line as it is (frame generation: "[dlssg] ... real X fps, shown Y fps")
+void PerfLine(int frames_in_flight, int frames_total);
+// bb-cpcpu-112: GPU command processor time by category (ns, summed; read and cleared by PerfLine).
+// Draw/Dispatch total; nested parts: pipeline lookup, BindResources (buffers + textures inside),
+// buffer cache ObtainBuffer, texture cache FindImage/FindTexture, BB camera scan, object motion,
+// render setup + command recording (BeginRendering, vertex/index, barriers, dynamic state, cmds).
+enum CpCat : int { CpDraw, CpPipe, CpBind, CpBuf, CpTex, CpScan, CpObjMv, CpRec, CpCount };
+extern std::atomic<uint64_t> g_cp_ns[CpCount];
+extern std::atomic<uint64_t> g_cp_draws, g_cp_dispatches;
+struct CpTimer {
+    using C = std::chrono::steady_clock;
+    int cat;
+    C::time_point t0;
+    explicit CpTimer(int c) : cat(c), t0(C::now()) {}
+    ~CpTimer() {
+        g_cp_ns[cat].fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(C::now() - t0).count()),
+            std::memory_order_relaxed);
+    }
+}; // once per presented game frame // a line as it is (frame generation: "[dlssg] ... real X fps, shown Y fps")
 
 // ---- (bb-metrics-043) The in-game metrics panel (bb_metrics_panel.cpp): the Demon's Souls port's F8
 // panel (ds-menu.cpp MetricsPanel, metricas.ps1's look), top-centre of the game image. F8 shows /

@@ -4,7 +4,9 @@
 #include "common/debug.h"
 #include <bit>
 #include <cmath>
+#include <optional>
 #include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_metrics.h"
 #include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_upscale.h"
 #include "core/debug_state.h"
@@ -344,6 +346,8 @@ void Rasterizer::EliminateFastClear() {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    BB::Metrics::CpTimer bb_cp_t{BB::Metrics::CpDraw};
+    BB::Metrics::g_cp_draws.fetch_add(1, std::memory_order_relaxed);
 
     scheduler.PopPendingOperations();
 
@@ -352,7 +356,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const auto& regs = liverpool->regs;
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    const GraphicsPipeline* pipeline = [&] {
+        BB::Metrics::CpTimer t{BB::Metrics::CpPipe};
+        return pipeline_cache.GetGraphicsPipeline();
+    }();
     if (!pipeline) {
         return;
     }
@@ -361,6 +368,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!BindResources(pipeline)) {
         return;
     }
+    std::optional<BB::Metrics::CpTimer> bb_rec_t{std::in_place, BB::Metrics::CpRec};
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
@@ -372,8 +380,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
-    BBObjMotionDraw(instance, push_data, *pipeline, regs, is_indexed, index_offset, false,
-                    bb_rt_scale_x, bb_rt_scale_y);
+    bb_rec_t.reset();
+    {
+        BB::Metrics::CpTimer t{BB::Metrics::CpObjMv};
+        BBObjMotionDraw(instance, push_data, *pipeline, regs, is_indexed, index_offset, false,
+                        bb_rt_scale_x, bb_rt_scale_y);
+    }
+    bb_rec_t.emplace(BB::Metrics::CpRec);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -401,6 +414,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    BB::Metrics::CpTimer bb_cp_t{BB::Metrics::CpDraw};
+    BB::Metrics::g_cp_draws.fetch_add(1, std::memory_order_relaxed);
 
     scheduler.PopPendingOperations();
 
@@ -413,7 +428,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .instance_sgpr_offset = instance_sgpr_offset,
         .is_indirect = true,
     };
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
+    const GraphicsPipeline* pipeline = [&] {
+        BB::Metrics::CpTimer t{BB::Metrics::CpPipe};
+        return pipeline_cache.GetGraphicsPipeline(params);
+    }();
     if (!pipeline) {
         return;
     }
@@ -482,6 +500,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 }
 
 void Rasterizer::DispatchDirect() {
+    BB::Metrics::CpTimer bb_cp_t{BB::Metrics::CpDraw};
+    BB::Metrics::g_cp_dispatches.fetch_add(1, std::memory_order_relaxed);
     texture_cache.BBNativeOff();
     BB::Upscale::OnDispatch();
     bb_rt_scale_x = bb_rt_scale_y = 1.0f;
@@ -491,7 +511,10 @@ void Rasterizer::DispatchDirect() {
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline = [&] {
+        BB::Metrics::CpTimer t{BB::Metrics::CpPipe};
+        return pipeline_cache.GetComputePipeline();
+    }();
     if (!pipeline) {
         return;
     }
@@ -556,6 +579,8 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    BB::Metrics::CpTimer bb_cp_t{BB::Metrics::CpDraw};
+    BB::Metrics::g_cp_dispatches.fetch_add(1, std::memory_order_relaxed);
     texture_cache.BBNativeOff();
     BB::Upscale::OnDispatch();
     bb_rt_scale_x = bb_rt_scale_y = 1.0f;
@@ -565,7 +590,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline = [&] {
+        BB::Metrics::CpTimer t{BB::Metrics::CpPipe};
+        return pipeline_cache.GetComputePipeline();
+    }();
     if (!pipeline) {
         return;
     }
@@ -616,6 +644,7 @@ void Rasterizer::OnFence() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    BB::Metrics::CpTimer bb_cp_t{BB::Metrics::CpBind};
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -1011,6 +1040,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    std::optional<BB::Metrics::CpTimer> bb_scan_t{std::in_place, BB::Metrics::CpScan};
     const bool bb_scan = (stage.sw_stage == Shader::SwStage::Vertex ||
                           stage.sw_stage == Shader::SwStage::Fragment) &&
                          BB::Upscale::WantCameraScan(stage.sw_stage == Shader::SwStage::Vertex);
@@ -1024,6 +1054,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         BB::Upscale::OnVertexConstants(stage.user_data.data(),
                                        stage.user_data.size() * sizeof(u32));
     }
+    bb_scan_t.reset();
     const u64 alignment = instance.StorageMinAlignment();
     for (const auto& desc : stage.buffers) {
         const auto src_access =
@@ -1086,6 +1117,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 if (bb_scan && !desc.is_written &&
                     memory->IsValidMapping(vsharp.base_address, size)) {
+                    BB::Metrics::CpTimer t{BB::Metrics::CpScan};
                     BB::Upscale::OnVertexConstants(
                         reinterpret_cast<const void*>(vsharp.base_address), size);
                 }
@@ -1113,8 +1145,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     ++binding.buffer;
                     continue;
                 }
+                std::optional<BB::Metrics::CpTimer> bb_buf_t{std::in_place, BB::Metrics::CpBuf};
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                bb_buf_t.reset();
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -1187,7 +1221,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImage(desc);
+            {
+                BB::Metrics::CpTimer t{BB::Metrics::CpTex};
+                image_id = texture_cache.FindImage(desc);
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -1222,7 +1259,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             bound_images.emplace_back(image_id);
 
             auto& image = texture_cache.GetImage(image_id);
+            std::optional<BB::Metrics::CpTimer> bb_tex_t{std::in_place, BB::Metrics::CpTex};
             auto& image_view = texture_cache.FindTexture(image_id, desc);
+            bb_tex_t.reset();
             const auto binding = image.binding;
 
             // The image is either bound as storage in a separate descriptor or bound as render

@@ -239,6 +239,8 @@ namespace {
 std::atomic<uint64_t> g_p_d5_n{0}, g_p_d5_cpu_us{0}, g_p_d5_gpu_n{0}, g_p_d5_gpu_us{0};
 std::atomic<uint64_t> g_p_wait_n{0}, g_p_wait_us{0};
 } // namespace
+std::atomic<uint64_t> g_cp_ns[CpCount]{};
+std::atomic<uint64_t> g_cp_draws{0}, g_cp_dispatches{0};
 void PerfDlss5(double cpu_ms) {
     g_p_d5_n.fetch_add(1, std::memory_order_relaxed);
     g_p_d5_cpu_us.fetch_add(static_cast<uint64_t>(cpu_ms * 1000.0), std::memory_order_relaxed);
@@ -295,6 +297,18 @@ void PerfLine(int frames_in_flight, int frames_total) {
                                          d5gpu / 1000.0 / d5gn * d5n / (wall * 10.0)).c_str()
                            : "n/a (sampled 1 in 16)");
     }
+    double cp[CpCount];
+    for (int i = 0; i < CpCount; ++i) cp[i] = g_cp_ns[i].exchange(0) / 1e6 / wall; // ms per second
+    const uint64_t cdr = g_cp_draws.exchange(0), cdi = g_cp_dispatches.exchange(0);
+    const double nd = static_cast<double>(std::max<uint64_t>(1, cdr + cdi));
+    const std::string cpline = fmt::format(
+        "cp ms/s: draw+dispatch {:.0f} ({:.0f} draws, {:.0f} dispatches, {:.1f} us each) = pipeline {:.0f}, "
+        "bind {:.0f} (buffer cache {:.0f}, texture cache {:.0f}, camera scan {:.0f}), obj motion {:.0f}, "
+        "record {:.0f}, other {:.0f}",
+        cp[CpDraw], cdr / wall, cdi / wall, cp[CpDraw] * 1000.0 * wall / nd, cp[CpPipe], cp[CpBind],
+        cp[CpBuf], cp[CpTex], cp[CpScan], cp[CpObjMv], cp[CpRec],
+        std::max(0.0, cp[CpDraw] - cp[CpPipe] - cp[CpBind] - cp[CpObjMv] - cp[CpRec]));
+    LOG_INFO(Render_Vulkan, "[perf] {}", cpline);
     LOG_INFO(Render_Vulkan,
              "[perf] {:.0f} fps | threads: {} | GPU cmd processor: {} wait polls, {} sleeps | "
              "present waits {} ({:.1f} ms) | frames in flight {} (max {} of {}) | {}",
