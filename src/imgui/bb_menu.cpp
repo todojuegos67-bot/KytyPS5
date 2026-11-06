@@ -121,6 +121,7 @@ bool g_restore_mouse_look = false; // the Teclado y ratón checkbox: mouse-look 
 bool g_kbm_play = false;
 bool g_vib_on = true;   // (bb-input-135) rumble
 float g_vib_pct = 100; // (bb-input-135) rumble intensity, %
+float g_mouse_sens = 0; // (bb-input-137) mouse camera sensitivity, 0 = the config's
 bool g_invert_y = false;
 // (bb-menu-133) Mando > "Probar y mapear": the pad never moves the menu, presses are shown live
 std::atomic<bool> g_test_mode{false};
@@ -169,7 +170,9 @@ void LoadMenuSettings() {
         if (l.rfind("invert_y=", 0) == 0) g_invert_y = l.size() > 9 && l[9] == '1';
         if (l.rfind("vibration=", 0) == 0) g_vib_on = !(l.size() > 10 && l[10] == '0');
         if (l.rfind("vibration_pct=", 0) == 0) g_vib_pct = std::clamp(std::atof(l.c_str() + 14), 0.0, 200.0);
+        if (l.rfind("mouse_sens=", 0) == 0) g_mouse_sens = std::clamp(std::atof(l.c_str() + 11), 0.0, 10.0);
     }
+    Input::SetMouseSensitivity(g_mouse_sens);
     Input::SetMouseInvertY(g_invert_y);
     Input::SetVibrationSettings(g_vib_on, static_cast<int>(g_vib_pct));
 }
@@ -179,7 +182,9 @@ void SaveMenuSettings() {
         << "kbm_play=" << (g_kbm_play ? 1 : 0) << "\n"
         << "invert_y=" << (g_invert_y ? 1 : 0) << "\n"
         << "vibration=" << (g_vib_on ? 1 : 0) << "\n"
-        << "vibration_pct=" << static_cast<int>(g_vib_pct) << "\n";
+        << "vibration_pct=" << static_cast<int>(g_vib_pct) << "\n"
+        << "mouse_sens=" << fmt::format("{:.2f}", g_mouse_sens) << "\n";
+    Input::SetMouseSensitivity(g_mouse_sens);
     Input::SetMouseInvertY(g_invert_y);
     Input::SetVibrationSettings(g_vib_on, static_cast<int>(g_vib_pct));
     LOG_INFO(Frontend, "[bb-menu] bb_menu.ini: kbm_play={} invert_y={}", g_kbm_play, g_invert_y);
@@ -2769,8 +2774,9 @@ public:
                     float dz, sp, off;
                     g_cfg.MouseParams(dz, sp, off);
                     if (kbm_focus == rows) {
-                        s_sp = std::clamp(s_sp + d * 0.05f, 0.1f, 5.0f);
+                        s_sp = std::clamp(s_sp + d * 0.1f, 0.1f, 10.0f);
                         g_cfg.SetMouseParams(s_dz, s_sp, off);
+                        g_mouse_sens = s_sp, SaveMenuSettings();
                     } else if (kbm_focus == rows + 1) {
                         s_dz = std::clamp(s_dz + d * 0.02f, 0.0f, 1.0f);
                         g_cfg.SetMouseParams(s_dz, s_sp, off);
@@ -2818,10 +2824,10 @@ public:
                 if (n == Nav::Accept && opt_focus == 0 && g_direct.exists) {
                     if (WriteDirect(!g_direct.on)) g_direct.on = !g_direct.on;
                 }
-                if (n == Nav::Accept && opt_focus == 1) g_vib_on = !g_vib_on, SaveMenuSettings();
+                if (n == Nav::Accept && opt_focus == 1) g_vib_on = !g_vib_on, SaveMenuSettings(), Input::TestRumble();
                 if (opt_focus == 2 && (n == Nav::Left || n == Nav::Right)) {
                     g_vib_pct = std::clamp(g_vib_pct + (n == Nav::Left ? -10.0f : 10.0f), 0.0f, 200.0f);
-                    SaveMenuSettings();
+                    SaveMenuSettings(), Input::TestRumble();
                 }
                 break;
             case Screen::Exit:
@@ -2994,6 +3000,7 @@ public:
             ReadDirect();
             float off;
             g_cfg.MouseParams(s_dz, s_sp, off);
+            if (g_mouse_sens > 0) s_sp = g_mouse_sens;
             screen = Screen::Hub;
             WizEnd();
             hub_t = ImGui::GetTime();
@@ -3583,8 +3590,9 @@ public:
             if (!val.empty()) TxtR(dl, g_ft_ui, 19 * u, sx + sw, sy + 3 * u, Gold(), val.c_str());
         };
         label(rows, "Sensibilidad de la cámara", fmt::format("{:.2f}", s_sp));
-        if (Slider("##sens", {sx, sy + 26 * u}, sw, s_sp, 0.1f, 5.0f, u, kbm_focus == rows)) {
+        if (Slider("##sens", {sx, sy + 26 * u}, sw, s_sp, 0.1f, 10.0f, u, kbm_focus == rows)) {
             g_cfg.SetMouseParams(s_dz, s_sp, off);
+            g_mouse_sens = s_sp, SaveMenuSettings();
         }
         sy += 72 * u;
         label(rows + 1, "Zona muerta", fmt::format("{:.2f}", s_dz));
@@ -3658,14 +3666,14 @@ public:
         const ImVec2 vt{tg.x, p0.y + 370 * u};
         if (Toggle("##vib", vt, g_vib_on, tog_vib, u, opt_focus == 1)) {
             g_vib_on = !g_vib_on;
-            SaveMenuSettings();
+            SaveMenuSettings(), Input::TestRumble();
         }
         Txt(dl, g_ft_text, 28 * u, {vt.x + 90 * u, vt.y}, Parch(), "Vibración");
         Txt(dl, g_ft_text, 24 * u, {vt.x + 90 * u, vt.y + 56 * u}, Parch(0.9f),
             fmt::format("Intensidad {:.0f} %", g_vib_pct).c_str());
         if (Slider("##vibpct", {vt.x + 90 * u, vt.y + 92 * u}, 500 * u, g_vib_pct, 0.0f, 200.0f, u,
                    opt_focus == 2)) {
-            SaveMenuSettings();
+            SaveMenuSettings(), Input::TestRumble();
         }
     }
 

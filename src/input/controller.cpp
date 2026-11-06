@@ -16,6 +16,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/system/userservice.h"
 #include "core/user_settings.h"
+#include "common/singleton.h"
 #include "input/controller.h"
 
 namespace Input {
@@ -169,6 +170,9 @@ void GameController::ConnectController(SDL_Gamepad* pad) {
     m_state.connected = true;
     m_last_orientation_update = 0;
     PushStateLocked();
+    if (pad != nullptr && (m_vib_small || m_vib_large)) {
+        ApplyVibration(); // (bb-input-137) a rumble sent before the gamepad was opened
+    }
 }
 
 void GameController::DisconnectController() {
@@ -270,22 +274,69 @@ void SetVibrationSettings(bool on, int percent) {
     g_vib_pct = std::clamp(percent, 0, 200);
 }
 
+// (bb-input-137) the game opens its pad and sends its first (0/0) rumble before SDL has the
+// gamepad (log 1.36: scePadSetVibration at line 1098, "Gamepad registered" at 2098), and the
+// once-only log was spent on that call. The last state is kept and re-sent when the gamepad
+// connects; the log reports the first non-zero command.
+static std::atomic<bool> g_vib_nz_logged{false};
+
 bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
+    m_vib_small = smallMotor, m_vib_large = largeMotor;
     if (!g_vib_logged.exchange(true)) {
-        LOG_INFO(Input, "[pad] vibration: large {} small {} (pad {}, on {}, {}%)", largeMotor,
-                 smallMotor, m_sdl_gamepad != nullptr ? "yes" : "no", g_vib_on.load(),
-                 g_vib_pct.load());
+        LOG_INFO(Input, "[pad] vibration first call: large {} small {} (pad {}, on {}, {}%)",
+                 largeMotor, smallMotor, m_sdl_gamepad != nullptr ? "yes" : "no",
+                 g_vib_on.load(), g_vib_pct.load());
     }
-    if (m_sdl_gamepad != nullptr) {
-        const float k = g_vib_on ? g_vib_pct / 100.0f : 0.0f;
-        const auto scale = [k](u8 v) {
-            return static_cast<Uint16>(std::clamp(v / 255.0f * k, 0.0f, 1.0f) * 0xFFFF);
-        };
-        // SDL: low_frequency = the large (left, heavy) motor, high_frequency = the small one.
-        // Kept until the game sends the next state (0/0 stops it), as upstream (-1).
-        return SDL_RumbleGamepad(m_sdl_gamepad, scale(largeMotor), scale(smallMotor), 0xFFFFFFFFu);
+    if ((smallMotor || largeMotor) && !g_vib_nz_logged.exchange(true)) {
+        LOG_INFO(Input, "[pad] vibration first non-zero: large {} small {} (pad {}, on {}, {}%)",
+                 largeMotor, smallMotor, m_sdl_gamepad != nullptr ? "yes" : "no",
+                 g_vib_on.load(), g_vib_pct.load());
     }
-    return true;
+    return ApplyVibration();
+}
+
+bool GameController::ApplyVibration() {
+    SDL_Gamepad* pad = m_sdl_gamepad;
+    if (pad == nullptr) {
+        return true;
+    }
+    const float k = g_vib_on ? g_vib_pct / 100.0f : 0.0f;
+    const auto scale = [k](u8 v) {
+        return static_cast<Uint16>(std::clamp(v / 255.0f * k, 0.0f, 1.0f) * 0xFFFF);
+    };
+    const Uint16 lo = scale(m_vib_large), hi = scale(m_vib_small);
+    // SDL: low_frequency = the large motor. SDL caps the duration at 0xFFFF ms; 0/0 stops.
+    const bool ok = SDL_RumbleGamepad(pad, lo, hi, (lo || hi) ? 0xFFFFu : 0u);
+    static std::atomic<bool> fail_logged{false};
+    if (!ok && !fail_logged.exchange(true)) {
+        LOG_WARNING(Input, "[pad] SDL_RumbleGamepad failed: {}", SDL_GetError());
+    }
+    return ok;
+}
+
+void TestRumble() {
+    static Uint64 last = 0;
+    const Uint64 now = SDL_GetTicks();
+    if (last != 0 && now - last < 600) {
+        return; // a dragged slider: one test per 0.6 s
+    }
+    last = now;
+    auto& cs = *Common::Singleton<GameControllers>::Instance();
+    const float k = g_vib_on ? g_vib_pct / 100.0f : 0.0f;
+    const Uint16 v = static_cast<Uint16>(std::clamp(0.6f * k, 0.0f, 1.0f) * 0xFFFF);
+    bool any = false;
+    for (int i = 0; i < 4; i++) {
+        SDL_Gamepad* pad = cs[i]->m_sdl_gamepad;
+        if (pad == nullptr) continue;
+        any = true;
+        const bool ok = SDL_RumbleGamepad(pad, v, v, 500);
+        LOG_INFO(Input, "[pad] test rumble: pad yes (slot {}, {}), strength {}, SDL result {}{}",
+                 i, SDL_GetGamepadName(pad) ? SDL_GetGamepadName(pad) : "?", v,
+                 ok ? "ok" : "fail: ", ok ? "" : SDL_GetError());
+    }
+    if (!any) {
+        LOG_INFO(Input, "[pad] test rumble: pad no (no SDL gamepad opened)");
+    }
 }
 
 static bool is_first_check = true;

@@ -103,6 +103,17 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     if (!SDL_SetHint(SDL_HINT_APP_NAME, "shadPS4")) {
         UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
     }
+    // (bb-input-137) DualShock 4 / DualSense rumble over SDL's HIDAPI drivers (SDL2 hint names;
+    // SDL3 replaced them with ENHANCED_REPORTS, which rumble needs over Bluetooth).
+#ifdef SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+#endif
+#ifdef SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+#endif
+#ifdef SDL_HINT_JOYSTICK_ENHANCED_REPORTS
+    SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         UNREACHABLE_MSG("Failed to initialize SDL video subsystem: {}", SDL_GetError());
     }
