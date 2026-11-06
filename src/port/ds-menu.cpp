@@ -2361,6 +2361,25 @@ void Draw(float width, float height) {
 					if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
 					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.");
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.");
+					// (perfopts-1107) Opciones de rendimiento (upstream's opt-in switches; at the next start).
+					ImGui::Spacing();
+					ImGui::Dummy({16.0f * g_unit, 0});
+					ImGui::SameLine();
+					ImGui::TextColored(kGold, "%s", I18n::T("Opciones de rendimiento"));
+					CheckRow("Registros PM4 directos", s.perf_pm4_regfile != g_rt.launched.perf_pm4_regfile, s.perf_pm4_regfile,
+					         "Guarda directamente los registros de la GPU que no necesitan procesarse (comprobado al empezar). Menos trabajo de CPU por dibujo. Experimental (KYTY_PM4_REGFILE).");
+					CheckRow("Subidas a la GPU en dos hilos", s.perf_upload_lanes != g_rt.launched.perf_upload_lanes, s.perf_upload_lanes,
+					         "Reparte la protección de memoria de las subidas a la GPU entre dos hilos. Ayuda en zonas con mucha carga de texturas en CPUs de 8 núcleos o más. Experimental (KYTY_UPLOAD_LANES).");
+					CheckRow("El render ayuda con las subidas", s.perf_upload_help != g_rt.launched.perf_upload_help, s.perf_upload_help,
+					         "Si la CPU va cargada, el hilo de render hace él mismo las subidas pendientes en vez de esperar. Bueno en CPUs de 4-6 núcleos y portátiles (KYTY_UPLOAD_HELP).");
+					CheckRow("Hilos sin espera activa con CPU cargada", s.perf_spin_gate != g_rt.launched.perf_spin_gate, s.perf_spin_gate,
+					         "Los hilos de ayuda dejan de girar en vacío cuando quedan menos de 3 núcleos libres, dejando la CPU al juego. Para CPUs justas (KYTY_SPIN_GATE).");
+					CheckRow("Copias de la GPU anticipadas", s.perf_eager_feedback != g_rt.launched.perf_eager_feedback, s.perf_eager_feedback,
+					         "Devuelve a la memoria del juego las copias ya terminadas de la GPU antes de que las pida, evitando esperas. Puede quitar tirones. Experimental (KYTY_EAGER_FEEDBACK).");
+					CheckRow("Copias de la GPU agrupadas", s.perf_feedback_batch != g_rt.launched.perf_feedback_batch, s.perf_feedback_batch,
+					         "Graba juntas las copias de la GPU de cada bloque de comandos en vez de una a una. Experimental (KYTY_FEEDBACK_BATCH).");
+					CheckRow("Shaders lane-local ampliados", s.perf_lane_wide != g_rt.launched.perf_lane_wide, s.perf_lane_wide,
+					         "Más shaders de cálculo se traducen en su forma rápida. Cambia esos shaders: la primera vez se vuelven a compilar (algo de carga al empezar). Experimental (KYTY_LANE_LOCAL_WIDE).");
 					CheckRow("Carga de shaders al máximo", true, s.shader_turbo,
 					         "La preparación de shaders al empezar la partida con todos los hilos de la CPU (en prioridad baja: el juego va primero). Mucho más rápida; mientras dura pueden bajar algo los FPS. No = pocos hilos, como antes (para portátiles o CPUs justas).");
 					{
@@ -3204,6 +3223,30 @@ void LauncherPerformance(Settings& s) {
 		LCheck(y, "Todos los CCD (Ryzen)", s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.", 216);
 		RowEnd(y);
 	}
+	{
+		// (perfopts-1107) Opciones de rendimiento: upstream KytyPS5's opt-in switches, off = as before.
+		const float y = RowY() + U(4);
+		auto*       dl = ImGui::GetWindowDrawList();
+		dl->AddLine({g_lbox.at.x + U(12), y}, {g_lbox.at.x + g_lbox.w - U(12), y}, IM_COL32(222, 196, 140, 60), 1.0f);
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(6)});
+		ImGui::TextColored(kGoldL, "%s", I18n::T("Opciones de rendimiento"));
+		Tip("Mejoras experimentales de KytyPS5 (upstream). Todas desactivadas = como siempre. Se aplican al iniciar el juego.");
+		RowEnd(y, 30);
+	}
+	LCheckRow("Registros PM4 directos", s.perf_pm4_regfile,
+	          "Guarda directamente los registros de la GPU que no necesitan procesarse (comprobado al empezar). Menos trabajo de CPU por dibujo. Experimental (KYTY_PM4_REGFILE).");
+	LCheckRow("Subidas a la GPU en dos hilos", s.perf_upload_lanes,
+	          "Reparte la protección de memoria de las subidas a la GPU entre dos hilos. Ayuda en zonas con mucha carga de texturas en CPUs de 8 núcleos o más. Experimental (KYTY_UPLOAD_LANES).");
+	LCheckRow("El render ayuda con las subidas", s.perf_upload_help,
+	          "Si la CPU va cargada, el hilo de render hace él mismo las subidas pendientes en vez de esperar. Bueno en CPUs de 4-6 núcleos y portátiles (KYTY_UPLOAD_HELP).");
+	LCheckRow("Hilos sin espera activa con CPU cargada", s.perf_spin_gate,
+	          "Los hilos de ayuda dejan de girar en vacío cuando quedan menos de 3 núcleos libres, dejando la CPU al juego. Para CPUs justas (KYTY_SPIN_GATE).");
+	LCheckRow("Copias de la GPU anticipadas", s.perf_eager_feedback,
+	          "Devuelve a la memoria del juego las copias ya terminadas de la GPU antes de que las pida, evitando esperas. Puede quitar tirones. Experimental (KYTY_EAGER_FEEDBACK).");
+	LCheckRow("Copias de la GPU agrupadas", s.perf_feedback_batch,
+	          "Graba juntas las copias de la GPU de cada bloque de comandos en vez de una a una. Experimental (KYTY_FEEDBACK_BATCH).");
+	LCheckRow("Shaders lane-local ampliados", s.perf_lane_wide,
+	          "Más shaders de cálculo se traducen en su forma rápida. Cambia esos shaders: la primera vez se vuelven a compilar (algo de carga al empezar). Experimental (KYTY_LANE_LOCAL_WIDE).");
 	BoxEnd();
 }
 
