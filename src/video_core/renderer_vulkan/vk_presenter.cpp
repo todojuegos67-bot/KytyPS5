@@ -908,6 +908,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     vk::Extent2D bb_size = image_size;
     bool bb_presented = false;
     if (vk::ImageView bb_view{}; BB::Upscale::Enabled() &&
+                                 rasterizer->BBHudSharpPresent(cmdbuf, image, view_info.format,
+                                                               bb_view, bb_size)) {
+        // 1.07 sharp HUD: the output-size canvas (upscaled scene + the HUD drawn at that size).
+        image_view = bb_view;
+        bb_presented = true;
+        BB::Upscale::OnPresentResult(true, "");
+    } else if (vk::ImageView bb_view{}; BB::Upscale::Enabled() &&
                                  rasterizer->BBPresentComposite(cmdbuf, image, view_info.format,
                                                                 bb_view, bb_size)) {
         image_view = bb_view;

@@ -165,6 +165,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
     bb_rt_scale_x = bb_rt_scale_y = 1.0f;
     bb_rt_guest_w = bb_rt_guest_h = 0;
+    bb_hud_redirect = false;
     const auto bb_scaled_target = [&](VideoCore::ImageId id) {
         if (!id) return false;
         const auto& info = texture_cache.GetImage(id).info;
@@ -1340,13 +1341,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     if (VAddr bb_flip = 0; BB::Upscale::Enabled() && BB::Upscale::WantPresentUpscale(bb_flip)) {
         bool ok = false;
+        VideoCore::Image* bb_flip_image = nullptr;
         const u32 bb_num_cb = static_cast<u32>(std::bit_width(pipeline->GetGraphicsKey().mrt_mask));
         for (u32 cb = 0; cb < bb_num_cb && cb < cb_descs.size(); ++cb) {
             if (cb_descs[cb].image_id &&
                 texture_cache.GetImage(cb_descs[cb].image_id).info.guest_address == bb_flip) {
-                ok = BB::Upscale::FgNative()
-                         ? BBFgNativeAnalyze(texture_cache.GetImage(cb_descs[cb].image_id))
-                         : BBPresentUpscale(texture_cache.GetImage(cb_descs[cb].image_id));
+                bb_flip_image = &texture_cache.GetImage(cb_descs[cb].image_id);
+                ok = BB::Upscale::FgNative() ? BBFgNativeAnalyze(*bb_flip_image)
+                                             : BBPresentUpscale(*bb_flip_image);
                 break;
             }
         }
@@ -1354,6 +1356,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             BB::Upscale::OnFgNativeAnalyzed(ok);
         } else {
             BB::Upscale::OnPresentUpscaled(ok);
+            if (ok && bb_flip_image != nullptr) {
+                BBHudSharpBegin(*bb_flip_image);
+            }
         }
     }
     if (BB::Upscale::Enabled() && BB::Upscale::WantHudlessCopy() && cb_descs[0].image_id) {
@@ -1434,6 +1439,28 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.image_layout = image->backing->state.layout;
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
+        // 1.07 sharp HUD: a draw into the flip after the HUD-point upscale (one target, no depth,
+        // the flip not sampled) is drawn into the output-size canvas, viewport / scissor scaled.
+        if (cb == 0 && state.num_color_attachments == 1 && !db_desc.image_id &&
+            !image->binding.is_bound && BB::Upscale::Enabled()) {
+            vk::ImageView bb_view{};
+            vk::ImageLayout bb_layout{};
+            u32 bb_w = 0, bb_h = 0;
+            if (BBHudSharpTarget(*image, image_view.info.format, bb_view, bb_layout, bb_w, bb_h) &&
+                (!regs.IsClipDisabled() ||
+                 (float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB)) * bb_w <=
+                      float(instance.GetMaxViewportWidth()) * image->info.size.width &&
+                  float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB)) * bb_h <=
+                      float(instance.GetMaxViewportHeight()) * image->info.size.height))) {
+                attachment.image_view = bb_view;
+                attachment.image_layout = bb_layout;
+                bb_rt_scale_x = float(bb_w) / float(image->info.size.width);
+                bb_rt_scale_y = float(bb_h) / float(image->info.size.height);
+                state.width = bb_w;
+                state.height = bb_h;
+                bb_hud_redirect = true;
+            }
+        }
 
         image->usage.render_target = 1u;
         bb_cols[cb] = image;
@@ -1764,6 +1791,13 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.y = 0.f;
             viewport.width = float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB));
             viewport.height = float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB));
+            if (bb_hud_redirect) {
+                // Screen-space positions (clip disabled): the render space scaled with the canvas.
+                viewport.width = std::min(viewport.width * bb_rt_scale_x,
+                                          float(instance.GetMaxViewportWidth()));
+                viewport.height = std::min(viewport.height * bb_rt_scale_y,
+                                           float(instance.GetMaxViewportHeight()));
+            }
         } else {
             const auto xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
             const auto xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
@@ -1793,7 +1827,7 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
                                               regs.viewport_scissors[i].bottom_right_y);
         }
-        if (bb_rt_guest_w != 0) {
+        if (bb_rt_guest_w != 0 || bb_hud_redirect) {
             const auto sx = [&](s32 v) { return s32(std::floor(float(v) * bb_rt_scale_x)); };
             const auto sy = [&](s32 v) { return s32(std::floor(float(v) * bb_rt_scale_y)); };
             const s32 x0 = sx(vp_scsr.top_left_x), y0 = sy(vp_scsr.top_left_y);

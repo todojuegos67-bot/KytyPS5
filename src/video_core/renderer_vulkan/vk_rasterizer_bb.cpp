@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "core/bb_respatch.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -185,6 +186,21 @@ struct BBVk {
         OwnImage depth, mv;
     };
     std::array<FgSlot, 8> fg_slots{};
+    // 1.07 sharp HUD (BB_HUD_SHARP): the output-size canvas (the flip's format, mutable for the
+    // game's view formats), the blit target when its format differs, its views by format, and
+    // the state of this frame.
+    vk::Image hud_canvas{};
+    VmaAllocation hud_canvas_alloc{};
+    vk::Format hud_canvas_format = vk::Format::eUndefined;
+    vk::Extent2D hud_canvas_extent{};
+    vk::ImageLayout hud_canvas_layout = vk::ImageLayout::eUndefined;
+    std::vector<std::pair<u64, vk::ImageView>> hud_canvas_views;
+    OwnImage hud_temp;
+    bool hud_live = false;
+    VAddr hud_flip = 0;
+    vk::Extent2D hud_render{};
+    u32 hud_draws = 0, hud_frames = 0, hud_presented = 0;
+    std::string hud_said;
 };
 BBVk g_bb;
 
@@ -1384,6 +1400,268 @@ bool Rasterizer::BBPresentUpscale(VideoCore::Image& flip, bool late) {
     g_bb.present_ready = true;
     g_bb.present_why = "";
     g_bb.present_flip = flip.info.guest_address;
+    return true;
+}
+
+namespace {
+void DestroyHudCanvas() {
+    for (auto& [f, v] : g_bb.hud_canvas_views) g_bb.device.destroyImageView(v);
+    g_bb.hud_canvas_views.clear();
+    if (g_bb.hud_canvas) {
+        vmaDestroyImage(g_bb.allocator, static_cast<VkImage>(g_bb.hud_canvas), g_bb.hud_canvas_alloc);
+    }
+    g_bb.hud_canvas = vk::Image{};
+    g_bb.hud_canvas_alloc = {};
+    g_bb.hud_canvas_layout = vk::ImageLayout::eUndefined;
+}
+
+bool EnsureHudCanvas(vk::Extent2D extent, vk::Format format) {
+    if (g_bb.hud_canvas && g_bb.hud_canvas_extent == extent && g_bb.hud_canvas_format == format) {
+        return true;
+    }
+    if (g_bb.hud_canvas) {
+        (void)g_bb.device.waitIdle();
+        DestroyHudCanvas();
+    }
+    const VkImageCreateInfo ci = vk::ImageCreateInfo{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst |
+                 vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled,
+        .sharingMode = vk::SharingMode::eExclusive,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    VmaAllocationCreateInfo alloc{};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkImage image{};
+    if (vmaCreateImage(g_bb.allocator, &ci, &alloc, &image, &g_bb.hud_canvas_alloc, nullptr) !=
+        VK_SUCCESS) {
+        g_bb.hud_canvas_alloc = {};
+        return false;
+    }
+    g_bb.hud_canvas = image;
+    g_bb.hud_canvas_format = format;
+    g_bb.hud_canvas_extent = extent;
+    g_bb.hud_canvas_layout = vk::ImageLayout::eUndefined;
+    return true;
+}
+
+// A view of the canvas in a format of the same size class (cached until the canvas changes).
+vk::ImageView HudCanvasView(vk::Format format, vk::ImageUsageFlags usage) {
+    const bool sampled = (usage & vk::ImageUsageFlagBits::eSampled) != vk::ImageUsageFlags{};
+    const u64 key = (u64(static_cast<u32>(format)) << 1) | (sampled ? 1u : 0u);
+    for (const auto& [k, v] : g_bb.hud_canvas_views) {
+        if (k == key) return v;
+    }
+    const vk::ImageViewUsageCreateInfo use{.usage = usage};
+    // The presenter's view of the flip reads alpha as one; so does the canvas' sampled view.
+    vk::ComponentMapping components{};
+    if (sampled) components.a = vk::ComponentSwizzle::eOne;
+    const auto [result, view] = g_bb.device.createImageView(vk::ImageViewCreateInfo{
+        .pNext = &use,
+        .image = g_bb.hud_canvas,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .components = components,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (result != vk::Result::eSuccess) return {};
+    g_bb.hud_canvas_views.emplace_back(key, view);
+    return view;
+}
+
+void HudCanvasBarrier(vk::CommandBuffer cmd, vk::ImageLayout layout,
+                      vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                      vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = src_stage,
+        .srcAccessMask = src_access,
+        .dstStageMask = dst_stage,
+        .dstAccessMask = dst_access,
+        .oldLayout = g_bb.hud_canvas_layout,
+        .newLayout = layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = g_bb.hud_canvas,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    });
+    g_bb.hud_canvas_layout = layout;
+}
+
+void HudSay(const std::string& what) {
+    if (what != g_bb.hud_said) {
+        g_bb.hud_said = what;
+        LOG_INFO(Render_Vulkan, "[hud-sharp] {}", what);
+        BB::Upscale::Checkpoint("[hud-sharp] " + what);
+    }
+}
+} // namespace
+
+void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
+    g_bb.hud_live = false;
+    if (!BB::ResPatch::HudSharp()) {
+        return;
+    }
+    if (BB::FG::WantInputs()) {
+        // Frame generation takes its HUD-less image from the HUD composite (bb_hud.comp).
+        HudSay("off this session while frame generation needs the HUD composite's inputs: HUD at "
+               "the internal size");
+        return;
+    }
+    if (!g_bb.present_ready || !g_bb.output.image || !g_bb.present_in.image) {
+        return;
+    }
+    const vk::Extent2D render{flip.info.size.width, flip.info.size.height};
+    const vk::Extent2D output = g_bb.output.extent;
+    if (output.width <= render.width && output.height <= render.height) {
+        HudSay(fmt::format("not needed: the output {}x{} is not above the render size {}x{}",
+                           output.width, output.height, render.width, render.height));
+        return;
+    }
+    // The upscaled scene goes back to the flip's own byte layout: through the format the
+    // upscaler's input read the flip with (its sRGB decode / channel order), then raw bytes.
+    const vk::Format in_fmt = g_bb.present_in.format;
+    const vk::Format temp_fmt = in_fmt == vk::Format::eR16G16B16A16Sfloat ? flip.info.pixel_format
+                                                                          : in_fmt;
+    const auto& pd = instance.GetPhysicalDevice();
+    const auto feat = [&](vk::Format f) { return pd.getFormatProperties(f).optimalTilingFeatures; };
+    if (!(feat(temp_fmt) & vk::FormatFeatureFlagBits::eBlitDst) ||
+        !(feat(flip.info.pixel_format) & vk::FormatFeatureFlagBits::eColorAttachment)) {
+        HudSay(fmt::format("off: the flip format {} cannot be the canvas (blit / attachment)",
+                           vk::to_string(flip.info.pixel_format)));
+        return;
+    }
+    if (!EnsureHudCanvas(output, flip.info.pixel_format)) {
+        HudSay("off: the output-size canvas could not be created");
+        return;
+    }
+    const bool direct = temp_fmt == flip.info.pixel_format;
+    if (!direct && !EnsureImage(g_bb.hud_temp, output, temp_fmt,
+                                vk::ImageUsageFlagBits::eTransferDst |
+                                    vk::ImageUsageFlagBits::eTransferSrc)) {
+        HudSay("off: the canvas conversion image could not be created");
+        return;
+    }
+    scheduler.EndRendering();
+    const auto cmd = scheduler.CommandBuffer();
+    Barrier(cmd, g_bb.output, vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    HudCanvasBarrier(cmd, vk::ImageLayout::eTransferDstOptimal,
+                     vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead |
+                                                                   vk::AccessFlagBits2::eMemoryWrite,
+                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    const std::array<vk::Offset3D, 2> corners{
+        vk::Offset3D{0, 0, 0},
+        vk::Offset3D{static_cast<s32>(output.width), static_cast<s32>(output.height), 1}};
+    const vk::ImageBlit blit{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffsets = corners,
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffsets = corners,
+    };
+    if (direct) {
+        cmd.blitImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, g_bb.hud_canvas,
+                      vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+    } else {
+        Barrier(cmd, g_bb.hud_temp, vk::ImageLayout::eTransferDstOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eTransferRead,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+        cmd.blitImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, g_bb.hud_temp.image,
+                      vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+        Barrier(cmd, g_bb.hud_temp, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        const vk::ImageCopy copy{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .extent = {output.width, output.height, 1},
+        };
+        cmd.copyImage(g_bb.hud_temp.image, vk::ImageLayout::eTransferSrcOptimal, g_bb.hud_canvas,
+                      vk::ImageLayout::eTransferDstOptimal, copy);
+    }
+    Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+            vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+    HudCanvasBarrier(cmd, vk::ImageLayout::eColorAttachmentOptimal,
+                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                     vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                     vk::AccessFlagBits2::eColorAttachmentRead |
+                         vk::AccessFlagBits2::eColorAttachmentWrite);
+    g_bb.hud_live = true;
+    g_bb.hud_flip = flip.info.guest_address;
+    g_bb.hud_render = render;
+    ++g_bb.hud_frames;
+    HudSay(fmt::format("on: HUD / menus rasterised at {}x{} (x{:.3f} of the game's {}x{} UI "
+                       "canvas) over the upscaled scene, canvas {}{}",
+                       output.width, output.height, double(output.width) / render.width,
+                       render.width, render.height, vk::to_string(flip.info.pixel_format),
+                       direct ? "" : fmt::format(" via {}", vk::to_string(temp_fmt))));
+}
+
+bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view_format,
+                                  vk::ImageView& view, vk::ImageLayout& layout, u32& width,
+                                  u32& height) {
+    if (!g_bb.hud_live || image.info.guest_address != g_bb.hud_flip ||
+        image.info.size.width != g_bb.hud_render.width ||
+        image.info.size.height != g_bb.hud_render.height || image.info.bb_scaled) {
+        return false;
+    }
+    view = HudCanvasView(view_format, vk::ImageUsageFlagBits::eColorAttachment);
+    if (!view) return false;
+    layout = g_bb.hud_canvas_layout;
+    width = g_bb.hud_canvas_extent.width;
+    height = g_bb.hud_canvas_extent.height;
+    ++g_bb.hud_draws;
+    return true;
+}
+
+bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip,
+                                   vk::Format view_format, vk::ImageView& out_view,
+                                   vk::Extent2D& out_size) {
+    if (!g_bb.hud_live) {
+        return false;
+    }
+    g_bb.hud_live = false;
+    if (g_bb.hud_flip != flip.info.guest_address) {
+        HudSay("a frame presented another image than the canvas' flip: HUD composite used");
+        return false;
+    }
+    out_view = HudCanvasView(view_format, vk::ImageUsageFlagBits::eSampled);
+    if (!out_view) {
+        HudSay(fmt::format("no {} view of the canvas: HUD composite used",
+                           vk::to_string(view_format)));
+        return false;
+    }
+    HudCanvasBarrier(cmd, vk::ImageLayout::eShaderReadOnlyOptimal,
+                     vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                         vk::PipelineStageFlagBits2::eTransfer,
+                     vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eTransferWrite,
+                     vk::PipelineStageFlagBits2::eFragmentShader |
+                         vk::PipelineStageFlagBits2::eComputeShader,
+                     vk::AccessFlagBits2::eShaderRead);
+    out_size = g_bb.hud_canvas_extent;
+    // The upscale was used: the HUD composite does not run this frame.
+    g_bb.present_ready = false;
+    g_bb.fg_present_ready = false;
+    if ((++g_bb.hud_presented % 600) == 1) {
+        LOG_INFO(Render_Vulkan,
+                 "[hud-sharp] presented {} frames with the HUD at {}x{} (render {}x{}), {} HUD "
+                 "draws redirected in total",
+                 g_bb.hud_presented, out_size.width, out_size.height, g_bb.hud_render.width,
+                 g_bb.hud_render.height, g_bb.hud_draws);
+    }
     return true;
 }
 
