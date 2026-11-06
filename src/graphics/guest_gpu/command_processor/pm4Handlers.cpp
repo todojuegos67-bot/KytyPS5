@@ -2019,14 +2019,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
-// KYTY_PM4_REGFILE (live 0..2, default 0; re-notes agent/tasks/20261103-PM4-REGFILE.md; the studio's census and plan,
-// docs/kyty-facts/PM4-REGFILE-PLAN.md): the indirect register tables (SET_*_REG_INDIRECT, ~252,100 values a frame at 1-1)
+// KYTY_PM4_REGFILE (live 0..2, default 0; PR #285: faster on a Ryzen 5 7600, flat on an i9-14900K, slower on a Ryzen 7
+// 9700X): the indirect register tables (SET_*_REG_INDIRECT, ~252,100 values a frame at 1-1)
 // call a handler per value; 70 % of the values go to handlers that store the value into one context field (raw) or do
 // nothing (ign). The register file is the HW context already (no dirty bits), so 1 replaces those calls by the store
 // itself (or nothing), through a per-offset descriptor; the other handlers (dec, rmw, side, sgpr) are still called.
 // 2 = verify: the calls run, and each raw value's field must hold the value after its call (pm4_regfile_mismatch: 0).
-// Which handler is which is proved, not trusted: the candidates are the studio's ign / raw classes (its classifier,
-// pm4-regfile-classifier-20261103), and at the first packet with the switch on each candidate's own handler runs on the
+// Which handler is which is proved, not trusted: the candidates are the ign / raw lists below, and at the first packet
+// with the switch on each candidate's own handler runs on the
 // command processor's contexts from four base states (the live one, all zeros, all ones, a non-uniform fill) with two
 // complementary values: a raw one must change exactly the one aligned dword it
 // stores, to the value, in every run, an ign one nothing, and neither any byte of the command processor outside the
@@ -2053,7 +2053,7 @@ bool g_ready = false; // (the GPU thread's: the descriptors are built once, at t
 static_assert(std::is_trivially_copyable_v<HW::Context> && std::is_trivially_copyable_v<HW::Shader> &&
               std::is_trivially_copyable_v<HW::UserConfig>);
 
-// The candidates: the studio's classifier's ign and raw rows (the rest stays a call whatever the probe says).
+// The candidates: the handlers read as ign or raw (the rest stays a call whatever the probe says).
 void MarkCandidates() {
 	auto set = [](Desc* table, uint32_t size, uint32_t first, uint32_t last, uint32_t step, uint8_t kind) {
 		for (uint32_t off = first; off <= last && off < size; off += step) table[off].kind = kind;
@@ -2098,7 +2098,7 @@ void MarkCandidates() {
 	sh(Ign, {Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS, Pm4::SPI_SHADER_PACE_ID_GS,
 	         Pm4::SPI_SHADER_PGM_RSRC4_GS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS, Pm4::SPI_SHADER_PGM_CHKSUM_HS,
 	         Pm4::SPI_SHADER_PGM_RSRC4_HS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS});
-	// (Not empty here, unlike the classifier's table: SetHsUserDataAddress merges one 32-bit half of the 64-bit address, one
+	// (SetHsUserDataAddress merges one 32-bit half of the 64-bit address, one
 	// dword: a raw candidate, which the proof accepts or keeps as a call.)
 	sh(Raw, {Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS, Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS});
 	uc(Raw, {Pm4::VGT_OBJECT_ID, Pm4::GE_INDX_OFFSET, Pm4::GE_MULTI_PRIM_IB_RESET_EN});
