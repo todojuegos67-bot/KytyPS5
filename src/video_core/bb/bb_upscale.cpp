@@ -510,6 +510,12 @@ u32 g_jitter_phases = 8;
 u64 g_taa_scene_draws = 0, g_taa_nocam_draws = 0;
 u64 g_taa_last_scene = 0, g_taa_last_nocam = 0;
 u64 g_taa_dispatches = 0;
+// 1.27 [taa-stab]: per-second jitter stability counters.
+struct TaaStab {
+    u64 frames = 0, frames_jittered = 0, frames_cam = 0, frames_nocam = 0, draws = 0,
+        fullscreen_skipped = 0, nowrite_skipped = 0, post_point_skipped = 0, mismatch = 0,
+        zero_passed = 0, nonzero_passed = 0;
+} g_stab;
 std::chrono::steady_clock::time_point g_last_flip{};
 float g_delta_ms = 16.7f;
 std::string g_last_point;
@@ -3082,7 +3088,7 @@ static bool all_scene_on() {
     return on;
 }
 
-bool Jitter(float& x, float& y) {
+bool Jitter(float& x, float& y, bool fullscreen) {
     if (!Active() || !Cfg().jitter) {
         return false;
     }
@@ -3108,6 +3114,7 @@ bool Jitter(float& x, float& y) {
         return v != nullptr && v[0] == '1';
     }();
     if (!after_point && g_frame.injected && !g_frame.present) {
+        ++g_stab.post_point_skipped;
         static u64 skipped = 0;
         if (skipped++ % 6000 == 0) {
             Checkpoint(fmt::format("[taa] 1.11: scene-flagged draw after the in-place point not "
@@ -3116,7 +3123,25 @@ bool Jitter(float& x, float& y) {
         }
         return false;
     }
+    // 1.27 (bb-dlaa-127): full-screen passes before the in-place point are never jittered. With
+    // native AA the point is the first read of the HDR scene colour, so the deferred lighting /
+    // composite passes that write it (full-screen triangles with the G-buffer depth bound for a
+    // stencil / depth-bounds test) were jittered too: their UVs come from the shifted vertices,
+    // so they re-sampled the already-jittered G-buffer at pixel - jitter a second time (double
+    // offset, a phase-dependent bilinear blur) while DLAA was told one offset: the lit image
+    // trembled, and looked right only on phases near zero. Geometry is jittered, screen passes
+    // are not. BB_JITTER_FULLSCREEN=1: the old behaviour. BB_JITTER_NOWRITE=1 (diagnosis): also
+    // skip every draw without depth writes.
+    static const bool fs_old = [] {
+        const char* v = std::getenv("BB_JITTER_FULLSCREEN");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (fullscreen && !fs_old) {
+        ++g_stab.fullscreen_skipped;
+        return false;
+    }
     ++g_jittered_draws;
+    ++g_stab.draws;
     x = g_jitter[0];
     y = g_jitter[1];
     return x != 0.0f || y != 0.0f;
@@ -3139,6 +3164,10 @@ void TaaPass(const float (&applied)[2], bool camera_valid, float (&passed)[2]) {
     passed[0] = applied[0] * sign;
     passed[1] = applied[1] * sign;
     std::scoped_lock lk{g_mutex};
+    if (applied[0] != 0.0f || applied[1] != 0.0f) ++g_stab.nonzero_passed; else ++g_stab.zero_passed;
+    // Scene draws were jittered this frame but the upscaler is told zero (or the reverse).
+    const bool drew_jit = g_jittered_draws != g_jittered_frame_start;
+    if (drew_jit != (applied[0] != 0.0f || applied[1] != 0.0f)) ++g_stab.mismatch;
     const u64 n = ++g_taa_dispatches;
     if (n != 1 && n % 600 != 0) {
         return;
@@ -4027,6 +4056,31 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     // Jitter for the next frame.
     g_jittered_last_frame = g_jittered_draws - g_jittered_frame_start;
     g_jittered_frame_start = g_jittered_draws;
+    if (g_taa_scene_draws > 0) {
+        ++g_stab.frames;
+        if (g_jittered_last_frame > 0) ++g_stab.frames_jittered;
+        if (g_taa_nocam_draws < g_taa_scene_draws) ++g_stab.frames_cam; else ++g_stab.frames_nocam;
+    }
+    {
+        static auto stab_last = std::chrono::steady_clock::now();
+        const auto stab_now = std::chrono::steady_clock::now();
+        if (stab_now - stab_last >= std::chrono::seconds(1)) {
+            stab_last = stab_now;
+            const auto& t = g_stab;
+            if (t.frames > 0) {
+                Checkpoint(fmt::format(
+                    "[taa-stab] frames {} jittered {} (camera in vertex constants {}, none {}; "
+                    "block camera {}), jittered draws {}, full-screen passes not jittered {}, "
+                    "post-point draws not jittered {}, upscaler told jitter {} / zero {}, "
+                    "applied-vs-passed mismatches {} (should stay 0), phases {}",
+                    t.frames, t.frames_jittered, t.frames_cam, t.frames_nocam,
+                    g_learned.have_prev_vp ? "yes" : "no", t.draws, t.fullscreen_skipped,
+                    t.post_point_skipped, t.nonzero_passed, t.zero_passed, t.mismatch,
+                    g_jitter_phases));
+            }
+            g_stab = {};
+        }
+    }
     const double ratio = g_learned.render_w != 0
                              ? static_cast<double>(PresentMode() ? g_present_w : g_output_w) /
                                    g_learned.render_w

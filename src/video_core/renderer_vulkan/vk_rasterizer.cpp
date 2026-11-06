@@ -1864,7 +1864,9 @@ void Rasterizer::UpdateViewportScissorState() const {
 
     const auto& vp_ctl = regs.viewport_control;
     float bb_jitter_x = 0.0f, bb_jitter_y = 0.0f;
-    const bool bb_jitter = BB::Upscale::Jitter(bb_jitter_x, bb_jitter_y);
+    const bool bb_jitter = BB::Upscale::Jitter(
+        bb_jitter_x, bb_jitter_y,
+        !regs.depth_control.depth_write_enable && regs.num_indices <= 6);
     for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
         const auto& vp = regs.viewports[i];
         const auto& vp_d = regs.viewport_depths[i];
