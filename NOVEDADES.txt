@@ -4,6 +4,19 @@ DEMON'S SOULS (PS5) EN PC - NOVEDADES / WHAT'S NEW
 Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 
 
+00. NUEVO (06-11, des-upstream) / NEW (06-11, des-upstream)
+-------------------------------------------------------------
+- Launcher con ilustracion viva: niebla animada en varias capas sobre el suelo y brasas, ceniza y luces de alma
+  flotando (nunca sobre el logo ni los menus). Se quita en Ajustes > "Niebla y brasas en el lanzador".
+  Living launcher artwork: layered drifting fog plus embers, ash and soul lights; off in Settings.
+- FSR 4.1 de AMD (SDK 2.4, DLLs oficiales firmadas): con Reescalado "FSR" y una Radeon RX 7000 / 9000 se usa FSR 4.1
+  si el driver lo ofrece; si no, FSR 3.1 como antes. Las metricas dicen "FSR 4.1" solo si de verdad esta cargado.
+  AMD FSR 4.1 (SDK 2.4 signed runtime) for the "FSR" upscaler on Radeon RX 7000 / 9000 when offered, else FSR 3.1.
+- Mejoras del emulador original (06-11): perfil PGO nuevo (hilo de render -7 % en sus pruebas), un pipeline que el
+  driver rechaza ya no corta la precompilacion de shaders, el pixel shader vacio solo en NVIDIA, pipeline key de
+  NVIDIA 620.70.06 (opcional en Windows: KYTY_PIPELINE_KEY_THUNK=1).
+  Upstream: retrained PGO profile, precompile survives a refused pipeline, empty fragment shader on NVIDIA only.
+
 00. NUEVO (03-11, port52) / NEW (03-11, port52)
 -----------------------------------------------
 - Launcher: F1 cambia entre pantalla completa sin bordes y una ventana normal (barra de titulo, mover, minimizar,
