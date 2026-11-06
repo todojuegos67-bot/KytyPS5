@@ -3666,6 +3666,7 @@ struct HsState {
     std::array<VAddr, 3> bp_addr{};
     std::array<u64, 3> bp_gen{};
     u64 gen = 0, pcount = 0;
+    u32 warm = 0;
     int bi = -1;
     OwnImage temp;
     bool live = false, depth_filled = false, want_fg = false;
@@ -3810,6 +3811,17 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
     ++g_hs.gen;
     if (!BB::Upscale::HudCanvasWanted()) {
         return;
+    }
+    // 1.38: not on the first HUD-point frames after the upscaler's history was reset (session
+    // start, loading): its first output can be blank / white, and the 1.37 start flash showed
+    // that canvas (white background, HUD on top). Those frames keep the game's own image.
+    {
+        const auto& plan = BB::Upscale::CurrentPlan();
+        if (plan.reset) g_hs.warm = 0;
+        if (g_hs.warm < 3) {
+            ++g_hs.warm;
+            return;
+        }
     }
     if (!g_bb.present_ready || !g_bb.output.image || !g_bb.present_in.image) {
         return;
