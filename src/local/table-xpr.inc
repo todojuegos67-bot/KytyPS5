@@ -2455,8 +2455,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader);
 	}
-	emit.command     = vk_buffer;
-	emit.generation  = buffer.GraphicsGeneration();
+	emit.MovedTo(vk_buffer, buffer.GraphicsGeneration());
 	emit.state       = &draw_state;
 	emit.pipeline    = bound_pipeline;
 	draw_state.Use(m_context.FrameNumber());
