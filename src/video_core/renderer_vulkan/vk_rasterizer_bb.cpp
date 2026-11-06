@@ -195,12 +195,12 @@ struct BBVk {
     vk::Extent2D hud_canvas_extent{};
     vk::ImageLayout hud_canvas_layout = vk::ImageLayout::eUndefined;
     std::vector<std::pair<u64, vk::ImageView>> hud_canvas_views;
-    OwnImage hud_temp;
-    bool hud_live = false;
-    VAddr hud_flip = 0;
-    vk::Extent2D hud_render{};
-    u32 hud_draws = 0, hud_frames = 0, hud_presented = 0;
-    std::string hud_said;
+    OwnImage hs_temp;
+    bool hs_live = false;
+    VAddr hs_flip = 0;
+    vk::Extent2D hs_render{};
+    u32 hs_draws = 0, hs_frames = 0, hs_presented = 0;
+    std::string hs_said;
 };
 BBVk g_bb;
 
@@ -1499,8 +1499,8 @@ void HudCanvasBarrier(vk::CommandBuffer cmd, vk::ImageLayout layout,
 }
 
 void HudSay(const std::string& what) {
-    if (what != g_bb.hud_said) {
-        g_bb.hud_said = what;
+    if (what != g_bb.hs_said) {
+        g_bb.hs_said = what;
         LOG_INFO(Render_Vulkan, "[hud-sharp] {}", what);
         BB::Upscale::Checkpoint("[hud-sharp] " + what);
     }
@@ -1508,7 +1508,7 @@ void HudSay(const std::string& what) {
 } // namespace
 
 void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
-    g_bb.hud_live = false;
+    g_bb.hs_live = false;
     if (!BB::ResPatch::HudSharp()) {
         return;
     }
@@ -1546,7 +1546,7 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
         return;
     }
     const bool direct = temp_fmt == flip.info.pixel_format;
-    if (!direct && !EnsureImage(g_bb.hud_temp, output, temp_fmt,
+    if (!direct && !EnsureImage(g_bb.hs_temp, output, temp_fmt,
                                 vk::ImageUsageFlagBits::eTransferDst |
                                     vk::ImageUsageFlagBits::eTransferSrc)) {
         HudSay("off: the canvas conversion image could not be created");
@@ -1575,12 +1575,12 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
         cmd.blitImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, g_bb.hud_canvas,
                       vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
     } else {
-        Barrier(cmd, g_bb.hud_temp, vk::ImageLayout::eTransferDstOptimal,
+        Barrier(cmd, g_bb.hs_temp, vk::ImageLayout::eTransferDstOptimal,
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eTransferRead,
                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
-        cmd.blitImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, g_bb.hud_temp.image,
+        cmd.blitImage(g_bb.output.image, vk::ImageLayout::eTransferSrcOptimal, g_bb.hs_temp.image,
                       vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
-        Barrier(cmd, g_bb.hud_temp, vk::ImageLayout::eTransferSrcOptimal,
+        Barrier(cmd, g_bb.hs_temp, vk::ImageLayout::eTransferSrcOptimal,
                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         const vk::ImageCopy copy{
@@ -1588,7 +1588,7 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
             .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
             .extent = {output.width, output.height, 1},
         };
-        cmd.copyImage(g_bb.hud_temp.image, vk::ImageLayout::eTransferSrcOptimal, g_bb.hud_canvas,
+        cmd.copyImage(g_bb.hs_temp.image, vk::ImageLayout::eTransferSrcOptimal, g_bb.hud_canvas,
                       vk::ImageLayout::eTransferDstOptimal, copy);
     }
     Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
@@ -1599,10 +1599,10 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
                      vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                      vk::AccessFlagBits2::eColorAttachmentRead |
                          vk::AccessFlagBits2::eColorAttachmentWrite);
-    g_bb.hud_live = true;
-    g_bb.hud_flip = flip.info.guest_address;
-    g_bb.hud_render = render;
-    ++g_bb.hud_frames;
+    g_bb.hs_live = true;
+    g_bb.hs_flip = flip.info.guest_address;
+    g_bb.hs_render = render;
+    ++g_bb.hs_frames;
     HudSay(fmt::format("on: HUD / menus rasterised at {}x{} (x{:.3f} of the game's {}x{} UI "
                        "canvas) over the upscaled scene, canvas {}{}",
                        output.width, output.height, double(output.width) / render.width,
@@ -1613,9 +1613,9 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
 bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view_format,
                                   vk::ImageView& view, vk::ImageLayout& layout, u32& width,
                                   u32& height) {
-    if (!g_bb.hud_live || image.info.guest_address != g_bb.hud_flip ||
-        image.info.size.width != g_bb.hud_render.width ||
-        image.info.size.height != g_bb.hud_render.height || image.info.bb_scaled) {
+    if (!g_bb.hs_live || image.info.guest_address != g_bb.hs_flip ||
+        image.info.size.width != g_bb.hs_render.width ||
+        image.info.size.height != g_bb.hs_render.height || image.info.bb_scaled) {
         return false;
     }
     view = HudCanvasView(view_format, vk::ImageUsageFlagBits::eColorAttachment);
@@ -1623,18 +1623,18 @@ bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view
     layout = g_bb.hud_canvas_layout;
     width = g_bb.hud_canvas_extent.width;
     height = g_bb.hud_canvas_extent.height;
-    ++g_bb.hud_draws;
+    ++g_bb.hs_draws;
     return true;
 }
 
 bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip,
                                    vk::Format view_format, vk::ImageView& out_view,
                                    vk::Extent2D& out_size) {
-    if (!g_bb.hud_live) {
+    if (!g_bb.hs_live) {
         return false;
     }
-    g_bb.hud_live = false;
-    if (g_bb.hud_flip != flip.info.guest_address) {
+    g_bb.hs_live = false;
+    if (g_bb.hs_flip != flip.info.guest_address) {
         HudSay("a frame presented another image than the canvas' flip: HUD composite used");
         return false;
     }
@@ -1655,12 +1655,12 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
     // The upscale was used: the HUD composite does not run this frame.
     g_bb.present_ready = false;
     g_bb.fg_present_ready = false;
-    if ((++g_bb.hud_presented % 600) == 1) {
+    if ((++g_bb.hs_presented % 600) == 1) {
         LOG_INFO(Render_Vulkan,
                  "[hud-sharp] presented {} frames with the HUD at {}x{} (render {}x{}), {} HUD "
                  "draws redirected in total",
-                 g_bb.hud_presented, out_size.width, out_size.height, g_bb.hud_render.width,
-                 g_bb.hud_render.height, g_bb.hud_draws);
+                 g_bb.hs_presented, out_size.width, out_size.height, g_bb.hs_render.width,
+                 g_bb.hs_render.height, g_bb.hs_draws);
     }
     return true;
 }
