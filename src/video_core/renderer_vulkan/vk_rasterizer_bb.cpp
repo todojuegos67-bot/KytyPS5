@@ -1907,6 +1907,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
                     vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
                     vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
         }
+        BB::ObjMotion::DebugView(cmd, g_bb.output.image, vk::ImageLayout::eGeneral, output);
         const bool copy = color_image == g_bb.present_in.image;
         const vk::Format src = copy ? g_bb.present_src_format : color_format;
         const std::string formats = fmt::format(

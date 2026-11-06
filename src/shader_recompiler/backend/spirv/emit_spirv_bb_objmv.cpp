@@ -129,8 +129,15 @@ void EmitBBVertexMotion(EmitContext& ctx) {
     ctx.AddLabel(load_merge);
     Id previous = ctx.OpPhi(ctx.F32[4], position, store_merge, loaded, load_label);
     // The previous position's z carries "valid" (z itself is not needed for screen motion).
-    const Id valid = ctx.OpSelect(ctx.F32[1], do_load, ctx.Constant(ctx.F32[1], 1.0f),
-                                  ctx.Constant(ctx.F32[1], 0.0f));
+    // 1.20: 2.0 for large skeletons (characters, flag 4), 1.0 for the rest: the class reaches the
+    // motion image (o.y) for BB_OBJMV_DEBUG / BB_MV_VIEW.
+    const Id large = ctx.OpINotEqual(bool_type, ctx.OpBitwiseAnd(u32_type, flags, ctx.ConstU32(4u)),
+                                     ctx.u32_zero_value);
+    const Id valid = ctx.OpSelect(
+        ctx.F32[1], do_load,
+        ctx.OpSelect(ctx.F32[1], large, ctx.Constant(ctx.F32[1], 2.0f),
+                     ctx.Constant(ctx.F32[1], 1.0f)),
+        ctx.Constant(ctx.F32[1], 0.0f));
     previous = ctx.OpCompositeInsert(ctx.F32[4], valid, previous, 2u);
     ctx.OpStore(ctx.motion_out_cur, position);
     ctx.OpStore(ctx.motion_out_prev, previous);
@@ -177,7 +184,14 @@ void EmitBBFragmentMotion(EmitContext& ctx) {
     ctx.OpStore(ctx.motion_frag_out,
                 ctx.OpCompositeConstruct(
                     ctx.U32[2], ctx.OpPackHalf2x16(u32_type, vector),
-                    ctx.OpSelect(u32_type, written, ctx.ConstU32(1u), ctx.u32_zero_value)));
+                    ctx.OpSelect(u32_type, written,
+                                 ctx.OpSelect(u32_type,
+                                              ctx.OpFOrdGreaterThan(
+                                                  bool_type,
+                                                  ctx.OpCompositeExtract(f32_type, previous, 2u),
+                                                  ctx.Constant(f32_type, 1.5f)),
+                                              ctx.ConstU32(2u), ctx.ConstU32(1u)),
+                                 ctx.u32_zero_value)));
 }
 
 } // namespace Shader::Backend::SPIRV

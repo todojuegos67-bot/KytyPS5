@@ -32,6 +32,11 @@
 //    (attachment 7) and put over the camera vectors (bb_objmv.comp, Compose).
 //
 // BB_OBJMV=0 turns it off (camera-only motion, as up to 0.24).
+//
+// 1.20: BB_OBJMV_DEBUG=1 logs per second the character (large skeleton) pixels' object vs camera
+// vector magnitudes and how its draws found last frame's positions; BB_MV_VIEW=1 shows the motion
+// vectors as colour in place of the upscaled image; BB_OBJMV_LOOSE=0 turns off the identity
+// without buffer addresses.
 
 #pragma once
 
@@ -82,6 +87,11 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
 // over the camera ones. `late`: the upscale runs after the guest flip (the presenter's late path).
 void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, vk::Extent2D render,
              bool reset, bool late);
+// 1.20 BB_MV_VIEW=1: the motion vectors last composed, as colour (hue: direction, brightness:
+// magnitude, 8 px full; blue tint: characters, magenta: other objects), blitted over `output`
+// (left in `output_layout`). Nothing without BB_MV_VIEW.
+void DebugView(vk::CommandBuffer cmd, vk::Image output, vk::ImageLayout output_layout,
+               vk::Extent2D output_size);
 // The guest flip (end of a frame).
 void OnFlip();
 // 1.03: draws with object vectors (last frame's positions) in the frame last composed into the

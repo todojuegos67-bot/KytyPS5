@@ -8,6 +8,7 @@
 #include "video_core/bb/bb_objmv.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -57,10 +58,29 @@ struct State {
     VmaAllocation positions_alloc{};
     u64 positions_address = 0;
     u32 per_half = 0; // positions per frame
-    // The motion image (render-target size, R32G32_UINT: half2 vector, valid).
-    vk::Image image{};
-    VmaAllocation image_alloc{};
-    vk::ImageView view{};
+    // The motion images (render-target size, R32G32_UINT: half2 vector + class). 1.20: two, by
+    // frame parity: the presenter's late compose (after the guest flip) reads the frame it
+    // presents while the next frame's G-buffer pass already clears / writes the other one. With a
+    // single image the late compose could read the next frame's character vectors (or a cleared
+    // image) over this frame's depth: the character's vectors one frame off its pixels.
+    std::array<vk::Image, 2> images{};
+    std::array<VmaAllocation, 2> image_allocs{};
+    std::array<vk::ImageView, 2> views{};
+    // 1.20 BB_MV_VIEW: the composed motion as colour (render size, RGBA8).
+    vk::Image viz{};
+    VmaAllocation viz_alloc{};
+    vk::ImageView viz_view{};
+    bool viz_valid = false; // composed this frame (late or not)
+    // 1.20 BB_OBJMV_DEBUG: per-frame statistics of the compose pass (host visible ring).
+    vk::Buffer stats{};
+    VmaAllocation stats_alloc{};
+    u32* stats_mapped = nullptr;
+    u64 stats_address = 0;
+    u64 compose_no = 0;
+    std::array<u64, 16> dbg{};
+    u64 dbg_frames = 0;
+    u64 dbg_exact = 0, dbg_loose = 0, dbg_new = 0, dbg_count_changed = 0, dbg_large = 0;
+    std::chrono::steady_clock::time_point dbg_since = std::chrono::steady_clock::now();
     u32 width = 0, height = 0;
     bool written = false;   // this frame's G-buffer pass wrote it
     bool latched = false;   // the same, for the frame that the guest flip has just ended
@@ -75,6 +95,12 @@ struct State {
     u32 params_used = 0;
     std::unordered_map<u64, Entry> prev, cur;
     std::unordered_map<u64, u32> ordinals;
+    // 1.20: the same draw by a looser identity (shader, index count, vertex count, instances,
+    // palette size and order; no buffer addresses): a character whose vertex / index streams or
+    // second stream live in a per-frame ring changes address every frame and never found its
+    // previous positions by the exact identity: camera-only motion, cross-faded by FG.
+    std::unordered_map<u64, Entry> prev_loose, cur_loose;
+    std::unordered_map<u64, u32> loose_ordinals;
     std::unordered_map<u64, u64> palettes; // small skeletons: last palette hash
     // 0.71 rigid objects (no bone palette): last hash of the draw's own vertex constants (its
     // object transform); a draw whose constants changed since the previous frame moved by itself.
@@ -103,6 +129,33 @@ bool RigidOn() {
     }();
     return on;
 }
+
+bool DebugOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("BB_OBJMV_DEBUG");
+        return s != nullptr && s[0] != '0';
+    }();
+    return on;
+}
+
+bool ViewOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("BB_MV_VIEW");
+        return s != nullptr && s[0] != '0';
+    }();
+    return on;
+}
+
+bool LooseOn() {
+    static const bool on = [] {
+        const char* s = std::getenv("BB_OBJMV_LOOSE");
+        return s == nullptr || s[0] != '0';
+    }();
+    return on;
+}
+
+constexpr u32 kStatSlots = 4; // frames in flight: a slot is read back 3 composes later
+constexpr u32 kStatWords = 16;
 
 bool EnvOff() {
     const char* s = std::getenv("BB_OBJMV");
@@ -166,7 +219,17 @@ bool Init(const Vulkan::Instance& instance) {
         Log("buffers not created: off");
         return false;
     }
+    void* stats_mapped = nullptr;
+    if (!CreateBuffer(vk::DeviceSize(kStatSlots) * kStatWords * 4,
+                      vk::BufferUsageFlagBits::eStorageBuffer |
+                          vk::BufferUsageFlagBits::eTransferDst,
+                      true, g.stats, g.stats_alloc, &stats_mapped, g.stats_address)) {
+        Log("buffers not created: off");
+        return false;
+    }
     g.params_mapped = static_cast<u32*>(mapped);
+    g.stats_mapped = static_cast<u32*>(stats_mapped);
+    std::memset(g.stats_mapped, 0, size_t(kStatSlots) * kStatWords * 4);
     std::memset(g.params_mapped, 0, size_t(kFrameSlots) * kParamsPerFrame * 32);
 
     const std::array bindings{
@@ -175,6 +238,14 @@ bool Init(const Vulkan::Instance& instance) {
                                        .descriptorCount = 1,
                                        .stageFlags = vk::ShaderStageFlagBits::eCompute},
         vk::DescriptorSetLayoutBinding{.binding = 1,
+                                       .descriptorType = vk::DescriptorType::eStorageImage,
+                                       .descriptorCount = 1,
+                                       .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 2,
+                                       .descriptorType = vk::DescriptorType::eStorageBuffer,
+                                       .descriptorCount = 1,
+                                       .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 3,
                                        .descriptorType = vk::DescriptorType::eStorageImage,
                                        .descriptorCount = 1,
                                        .stageFlags = vk::ShaderStageFlagBits::eCompute},
@@ -213,66 +284,107 @@ bool Init(const Vulkan::Instance& instance) {
     g.pipeline = pipeline;
     g.ready = true;
     Log(fmt::format("on: skinned / animated G-buffer draws get their own motion vectors "
-                    "({} Mi positions a frame, {} MiB)",
-                    mi, (u64(g.per_half) * 2 * 16) >> 20));
+                    "({} Mi positions a frame, {} MiB); 1.20: motion image per frame parity, "
+                    "loose identity {}, BB_OBJMV_DEBUG {}, BB_MV_VIEW {}",
+                    mi, (u64(g.per_half) * 2 * 16) >> 20,
+                    LooseOn() ? "on" : "off (BB_OBJMV_LOOSE=0)", DebugOn() ? "on" : "off",
+                    ViewOn() ? "on" : "off"));
     return true;
 }
 
 void DestroyImage() {
-    if (g.view) g.device.destroyImageView(g.view);
-    if (g.image) vmaDestroyImage(g.allocator, static_cast<VkImage>(g.image), g.image_alloc);
-    g.view = vk::ImageView{};
-    g.image = vk::Image{};
-    g.image_alloc = {};
+    for (u32 i = 0; i < 2; ++i) {
+        if (g.views[i]) g.device.destroyImageView(g.views[i]);
+        if (g.images[i]) {
+            vmaDestroyImage(g.allocator, static_cast<VkImage>(g.images[i]), g.image_allocs[i]);
+        }
+        g.views[i] = vk::ImageView{};
+        g.images[i] = vk::Image{};
+        g.image_allocs[i] = {};
+    }
+    if (g.viz_view) g.device.destroyImageView(g.viz_view);
+    if (g.viz) vmaDestroyImage(g.allocator, static_cast<VkImage>(g.viz), g.viz_alloc);
+    g.viz_view = vk::ImageView{};
+    g.viz = vk::Image{};
+    g.viz_alloc = {};
+    g.viz_valid = false;
     g.width = g.height = 0;
 }
 
-bool EnsureImage(u32 width, u32 height) {
-    if (g.image && g.width == width && g.height == height) return true;
-    if (g.image) {
-        (void)g.device.waitIdle();
-        DestroyImage();
-    }
+bool CreateImage(u32 width, u32 height, vk::Format format, vk::ImageUsageFlags usage,
+                 vk::Image& image, VmaAllocation& alloc, vk::ImageView& view) {
     const VkImageCreateInfo ci = vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
-        .format = vk::Format::eR32G32Uint,
+        .format = format,
         .extent = {width, height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
-        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eStorage,
+        .usage = usage,
         .sharingMode = vk::SharingMode::eExclusive,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
     VmaAllocationCreateInfo aci{};
     aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     VkImage raw{};
-    if (vmaCreateImage(g.allocator, &ci, &aci, &raw, &g.image_alloc, nullptr) != VK_SUCCESS) {
+    if (vmaCreateImage(g.allocator, &ci, &aci, &raw, &alloc, nullptr) != VK_SUCCESS) {
         return false;
     }
-    g.image = raw;
-    auto [result, view] = g.device.createImageView(vk::ImageViewCreateInfo{
-        .image = g.image,
+    image = raw;
+    auto [result, v] = g.device.createImageView(vk::ImageViewCreateInfo{
+        .image = image,
         .viewType = vk::ImageViewType::e2D,
-        .format = vk::Format::eR32G32Uint,
+        .format = format,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     });
-    if (result != vk::Result::eSuccess) {
+    if (result != vk::Result::eSuccess) return false;
+    view = v;
+    return true;
+}
+
+bool EnsureImage(u32 width, u32 height) {
+    if (g.images[0] && g.width == width && g.height == height) return true;
+    if (g.images[0]) {
+        (void)g.device.waitIdle();
+        DestroyImage();
+    }
+    for (u32 i = 0; i < 2; ++i) {
+        if (!CreateImage(width, height, vk::Format::eR32G32Uint,
+                         vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eStorage,
+                         g.images[i], g.image_allocs[i], g.views[i])) {
+            DestroyImage();
+            return false;
+        }
+    }
+    if (!CreateImage(width, height, vk::Format::eR8G8B8A8Unorm,
+                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+                     g.viz, g.viz_alloc, g.viz_view)) {
         DestroyImage();
         return false;
     }
-    g.view = view;
     g.width = width;
     g.height = height;
-    g.cleared = false; // new image: undefined layout, cleared by the next motion pass
-    Log(fmt::format("motion image {}x{}", width, height));
+    g.cleared = false; // new images: undefined layout, cleared by the next motion pass
+    Log(fmt::format("motion images 2x {}x{}", width, height));
     return true;
 }
 
 void ImageBarrier(vk::CommandBuffer cmd, vk::Image image, vk::ImageLayout old_layout,
                   vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
-                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
+                  bool positions = false) {
+    // 1.20 `positions`: also make last frame's stored clip positions (vertex shader atomics,
+    // device memory) visible to this frame's vertex shader loads. Without it nothing ordered the
+    // two frames' accesses to the position buffer beyond submission order.
+    const vk::MemoryBarrier2 memory{
+        .srcStageMask = vk::PipelineStageFlagBits2::eVertexShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite |
+                         vk::AccessFlagBits2::eShaderStorageRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eVertexShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                         vk::AccessFlagBits2::eShaderStorageWrite,
+    };
     const vk::ImageMemoryBarrier2 barrier{
         .srcStageMask = src_stage,
         .srcAccessMask = src_access,
@@ -283,7 +395,9 @@ void ImageBarrier(vk::CommandBuffer cmd, vk::Image image, vk::ImageLayout old_la
         .image = image,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
-    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = positions ? 1u : 0u,
+                                            .pMemoryBarriers = &memory,
+                                            .imageMemoryBarrierCount = 1,
                                             .pImageMemoryBarriers = &barrier});
 }
 
@@ -369,18 +483,20 @@ void Attach(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
     // The G-buffer targets' size (attachments 0..6 already limited state.width / height).
     if (!EnsureImage(state.width, state.height)) return;
     auto& attachment = state.color_attachments[Attachment];
-    attachment.image_view = g.view;
+    const u32 cur = static_cast<u32>(g.frame & 1);
+    attachment.image_view = g.views[cur];
     attachment.image_layout = vk::ImageLayout::eGeneral;
     attachment.clear_value = {0u, 0u, 0u, 0u};
     attachment.is_clear = 0;
     if (!g.cleared) {
         // First motion pass of the frame: last frame's compose read it (compute).
         scheduler.EndRendering();
-        ImageBarrier(scheduler.CommandBuffer(), g.image, vk::ImageLayout::eUndefined,
+        ImageBarrier(scheduler.CommandBuffer(), g.images[cur], vk::ImageLayout::eUndefined,
                      vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
                      vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                      vk::AccessFlagBits2::eColorAttachmentWrite |
-                         vk::AccessFlagBits2::eColorAttachmentRead);
+                         vk::AccessFlagBits2::eColorAttachmentRead,
+                     true);
         attachment.is_clear = 1;
         g.cleared = true;
         g.written = true;
@@ -492,6 +608,16 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
     const u64 base_key = Hash(id.data(), sizeof(id));
     const u32 ordinal = g.ordinals[base_key]++;
     const u64 key = Hash(&ordinal, sizeof(ordinal), base_key);
+    // 1.20 loose identity (see State::prev_loose).
+    std::array<u64, 5> lid{};
+    lid[0] = vs_hash;
+    lid[1] = regs.num_indices;
+    lid[2] = (u64(vertices) << 32) | instances;
+    lid[3] = (u64(static_cast<u32>(palette)) << 32) | palette_size;
+    lid[4] = indexed ? 1 : 0;
+    const u64 loose_base = Hash(lid.data(), sizeof(lid), 0x6f626a6d76ull);
+    const u32 loose_ordinal = g.loose_ordinals[loose_base]++;
+    const u64 loose_key = Hash(&loose_ordinal, sizeof(loose_ordinal), loose_base);
 
     if (palette == Palette::Small) {
         // Most small skeletons are static map pieces: while the palette does not change the
@@ -544,13 +670,38 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
     g.cursor += count;
     u32 flags = 1; // store
     u32 load_base = 0;
-    if (const auto it = g.prev.find(key); it != g.prev.end() && it->second.count == count) {
-        load_base = it->second.base;
+    const bool large = palette == Palette::Large;
+    if (large) {
+        flags |= 4; // class for the compose pass's statistics / view
+        ++g.dbg_large;
+    }
+    bool found = false;
+    if (const auto it = g.prev.find(key); it != g.prev.end()) {
+        if (it->second.count == count) {
+            load_base = it->second.base;
+            found = true;
+            if (large) ++g.dbg_exact;
+        } else if (large) {
+            ++g.dbg_count_changed;
+        }
+    }
+    if (!found && LooseOn()) {
+        if (const auto it = g.prev_loose.find(loose_key);
+            it != g.prev_loose.end() && it->second.count == count) {
+            load_base = it->second.base;
+            found = true;
+            if (large) ++g.dbg_loose;
+        }
+    }
+    if (found) {
         flags |= 2;
         ++g.st_loaded;
         ++g.loaded_frame;
+    } else if (large) {
+        ++g.dbg_new;
     }
     g.cur[key] = {store_base, count};
+    g.cur_loose[loose_key] = {store_base, count};
     ++g.st_tracked;
 
     const u32 slot = static_cast<u32>(g.frame % kFrameSlots);
@@ -574,10 +725,41 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     // `written`), so it reads the flag that OnFlip latched for the frame it presents.
     const bool wrote = late ? g.latched : g.written;
     g.composed_draws = 0;
+    g.viz_valid = false;
     if (!g.ready || !wrote || reset || g.width != render.width || g.height != render.height) {
         return;
     }
-    ImageBarrier(cmd, g.image, vk::ImageLayout::eGeneral,
+    // 1.20: the motion image of the frame being composed (late: the one the flip just ended,
+    // OnFlip has already advanced g.frame).
+    const u32 index = static_cast<u32>((late ? g.frame - 1 : g.frame) & 1);
+    const bool debug = DebugOn() && g.stats_mapped != nullptr;
+    const bool view = ViewOn();
+    const u32 stat_slot = static_cast<u32>(g.compose_no % kStatSlots);
+    if (debug) {
+        // The slot's last use was kStatSlots composes ago (finished on the GPU by now).
+        u32* words = g.stats_mapped + size_t(stat_slot) * kStatWords;
+        if (g.compose_no >= kStatSlots) {
+            for (u32 k = 0; k < kStatWords; ++k) {
+                if (k == 4) {
+                    g.dbg[4] = std::max<u64>(g.dbg[4], words[k]);
+                } else {
+                    g.dbg[k] += words[k];
+                }
+            }
+            ++g.dbg_frames;
+        }
+        cmd.fillBuffer(g.stats, vk::DeviceSize(stat_slot) * kStatWords * 4, kStatWords * 4, 0u);
+        const vk::MemoryBarrier2 fill{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &fill});
+    }
+    ++g.compose_no;
+    ImageBarrier(cmd, g.images[index], vk::ImageLayout::eGeneral,
                  vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                  vk::AccessFlagBits2::eColorAttachmentWrite,
                  vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
@@ -585,8 +767,15 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
                  vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
                  vk::PipelineStageFlagBits2::eComputeShader,
                  vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
-    const vk::DescriptorImageInfo obj_info{{}, g.view, vk::ImageLayout::eGeneral};
+    ImageBarrier(cmd, g.viz, vk::ImageLayout::eUndefined, vk::PipelineStageFlagBits2::eAllCommands,
+                 vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eComputeShader,
+                 vk::AccessFlagBits2::eShaderWrite);
+    const vk::DescriptorImageInfo obj_info{{}, g.views[index], vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo mv_info{{}, mv_view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo stats_info{g.stats, 0, vk::DeviceSize(kStatSlots) * kStatWords * 4};
+    const vk::DescriptorBufferInfo stats_slot_info{g.stats, vk::DeviceSize(stat_slot) * kStatWords * 4,
+                                                   kStatWords * 4};
+    const vk::DescriptorImageInfo viz_info{{}, g.viz_view, vk::ImageLayout::eGeneral};
     const std::array writes{
         vk::WriteDescriptorSet{.dstBinding = 0,
                                .descriptorCount = 1,
@@ -596,15 +785,68 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
                                .descriptorCount = 1,
                                .descriptorType = vk::DescriptorType::eStorageImage,
                                .pImageInfo = &mv_info},
+        vk::WriteDescriptorSet{.dstBinding = 2,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = debug ? &stats_slot_info : &stats_info},
+        vk::WriteDescriptorSet{.dstBinding = 3,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &viz_info},
     };
-    const std::array<u32, 4> push{render.width, render.height, 1u, 0u};
+    const std::array<u32, 4> push{render.width, render.height, 1u,
+                                  (debug ? 1u : 0u) | (view ? 2u : 0u)};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
+    g.viz_valid = view;
     ++g.st_composed;
     if (late) ++g.st_composed_late;
     g.composed_draws = late ? g.loaded_last : g.loaded_frame;
+}
+
+void DebugView(vk::CommandBuffer cmd, vk::Image output, vk::ImageLayout output_layout,
+               vk::Extent2D output_size) {
+    if (!g.ready || !ViewOn() || !g.viz_valid || !g.viz || !output) return;
+    g.viz_valid = false;
+    ImageBarrier(cmd, g.viz, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                 vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eBlit,
+                 vk::AccessFlagBits2::eTransferRead);
+    const auto to = [&](vk::ImageLayout from, vk::ImageLayout layout, vk::PipelineStageFlags2 src,
+                        vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst,
+                        vk::AccessFlags2 dst_access) {
+        const vk::ImageMemoryBarrier2 b{
+            .srcStageMask = src,
+            .srcAccessMask = src_access,
+            .dstStageMask = dst,
+            .dstAccessMask = dst_access,
+            .oldLayout = from,
+            .newLayout = layout,
+            .image = output,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                .pImageMemoryBarriers = &b});
+    };
+    to(output_layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands,
+       vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+       vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite);
+    const vk::ImageBlit region{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                 vk::Offset3D{s32(g.width), s32(g.height), 1}},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                 vk::Offset3D{s32(output_size.width), s32(output_size.height), 1}},
+    };
+    // The viz image is in General (blit sources may be General).
+    cmd.blitImage(g.viz, vk::ImageLayout::eGeneral, output, vk::ImageLayout::eTransferDstOptimal,
+                  region, vk::Filter::eNearest);
+    to(vk::ImageLayout::eTransferDstOptimal, output_layout, vk::PipelineStageFlagBits2::eBlit,
+       vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands,
+       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+           vk::AccessFlagBits2::eTransferRead);
 }
 
 void OnFlip() {
@@ -614,6 +856,35 @@ void OnFlip() {
     g.prev = std::move(g.cur);
     g.cur.clear();
     g.ordinals.clear();
+    g.prev_loose = std::move(g.cur_loose);
+    g.cur_loose.clear();
+    g.loose_ordinals.clear();
+    if (DebugOn()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g.dbg_since >= std::chrono::seconds(1)) {
+            const auto avg = [](u64 sum16, u64 n) { return n ? double(sum16) / 16.0 / double(n) : 0.0; };
+            const u64 frames = std::max<u64>(g.dbg_frames, 1);
+            Log(fmt::format(
+                "[objmv-debug] {:.1f} s, {} composes read back: CHARACTER (large skeleton) {:.0f} px "
+                "a frame, |object mv| avg {:.2f} px (max {:.1f}), |camera mv| there avg {:.2f} px, "
+                "{:.1f} % differ from camera by > 1 px, {:.1f} % near zero (< 0.25 px) | other "
+                "objects {:.0f} px a frame, |object| {:.2f} vs |camera| {:.2f} | camera-only {:.0f} "
+                "px a frame, |camera| {:.2f} | large-skeleton draws: {} found by exact identity, "
+                "{} by loose identity, {} without last frame (camera only), {} vertex count "
+                "changed",
+                std::chrono::duration<double>(now - g.dbg_since).count(), g.dbg_frames,
+                double(g.dbg[0]) / frames, avg(g.dbg[1], g.dbg[0]), double(g.dbg[4]) / 16.0,
+                avg(g.dbg[2], g.dbg[0]), g.dbg[0] ? 100.0 * g.dbg[3] / g.dbg[0] : 0.0,
+                g.dbg[0] ? 100.0 * g.dbg[5] / g.dbg[0] : 0.0, double(g.dbg[6]) / frames,
+                avg(g.dbg[7], g.dbg[6]), avg(g.dbg[8], g.dbg[6]), double(g.dbg[9]) / frames,
+                avg(g.dbg[10], g.dbg[9]), g.dbg_exact, g.dbg_loose, g.dbg_new,
+                g.dbg_count_changed));
+            g.dbg.fill(0);
+            g.dbg_frames = g.dbg_exact = g.dbg_loose = g.dbg_new = g.dbg_count_changed =
+                g.dbg_large = 0;
+            g.dbg_since = now;
+        }
+    }
     g.cursor = 0;
     g.params_used = 0;
     g.cleared = false;
