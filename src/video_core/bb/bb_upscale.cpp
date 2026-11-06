@@ -405,6 +405,8 @@ struct Candidate {
 // ---- State ----
 struct FrameState {
     bool fg_native_done = false; // 0.39: the FG-only analysis ran (or was tried) this frame
+    bool fgn_late = false;       // 1.05: this frame's FG-only inputs were taken at present
+    bool fgn_fail = false;       // 1.05: the FG-only analysis ran but gave no inputs
     // G-buffer
     VAddr gb_depth = 0;
     u32 gb_w = 0, gb_h = 0, gb_mrt = 0;
@@ -1103,7 +1105,9 @@ void SrReset(Plan& p) {
         const double pts[4][2] = {{-0.5, -0.5}, {0.5, -0.5}, {-0.5, 0.5}, {0.5, 0.5}};
         double sum = 0.0;
         for (const auto& pt : pts) {
-            const double v[4] = {pt[0], pt[1], 0.5, 1.0};
+            // 1.05: far-plane points (z 0.5 sat at the lens with forward depth: 3.9-4.7 NDC on
+            // ordinary turns, 5-14 history resets per second).
+            const double v[4] = {pt[0], pt[1], p.depth_inverted ? 1e-4 : 0.9999, 1.0};
             double o[4]{};
             for (int i = 0; i < 4; ++i)
                 for (int j = 0; j < 4; ++j) o[i] += m[i * 4 + j] * v[j];
@@ -1117,7 +1121,11 @@ void SrReset(Plan& p) {
         delta = sum >= 1e9 ? 1e9 : sum / 4.0;
     }
     g_sec_cam_max = std::max(g_sec_cam_max, std::min(delta, 99.0));
-    const bool is_cut = delta > cut;
+    // 1.05: a real discontinuity only: above the threshold and 4x the recent average.
+    static double avg = 0.0;
+    const double dclamp = std::min(delta, 99.0);
+    const bool is_cut = delta > cut && dclamp > 4.0 * std::max(avg, 0.05);
+    avg = avg * 0.8 + dclamp * 0.2;
     p.reset = first || is_cut || size_changed;
     if (p.reset) {
         ++g_sec_resets;
@@ -2591,6 +2599,35 @@ struct Not3D {
     u32 inplace = 0, hud = 0, late = 0, np_max_q = 0, np_max_skip = 0, np_src_moved = 0;
 } g_not3d;
 bool g_native_said = false;
+// 1.05 (bb-fgpure-105): frame generation with no upscaler (FgNative) had no path lock: the 0.85
+// lock counts f.injected, which the FG-only analysis never sets, so every 3D frame chose again
+// between the HUD point (mid-frame, HUD-less image) and the finished flip at present (HUD
+// included, vectors composed late), and a frame with neither gave frame generation no inputs
+// (DLSS-G / FSR 3 FG: no generated frame, then a history reset on the next one). The FG-only
+// path is now locked for the session from the first 300 3D frames like the upscaler's:
+// 1 = before the HUD (>= 95% of frames had the point; a miss still takes the present-time inputs
+// so no frame is without inputs), 2 = at present for every frame (the HUD point is not used).
+// BB_FGN_LOCK=hud / present forces one, BB_FGN_LOCK=0 the old per-frame choice.
+int g_fgn_lock = 0;
+u32 g_fgn_lock_frames = 0, g_fgn_lock_hud = 0;
+int FgnLockForced() {
+    static const int v = [] {
+        const char* e = std::getenv("BB_FGN_LOCK");
+        if (e == nullptr || *e == '\0') return -1;
+        const std::string_view s{e};
+        if (s == "hud") return 1;
+        if (s == "present") return 2;
+        if (s == "0") return 0;
+        return -1;
+    }();
+    return v;
+}
+struct FgnSec {
+    u32 frames = 0, hud = 0, late = 0, none = 0, fail = 0, resets = 0, switches = 0, cam = 0;
+    int last = 0;
+    double int_sum = 0, int_sq = 0, int_min = 1e9, int_max = 0;
+    u32 ints = 0;
+} g_fgn_sec;
 } // namespace
 
 bool WantPresentUpscale(VAddr& flip) {
@@ -2646,6 +2683,7 @@ bool WantPresentUpscale(VAddr& flip) {
         }
     }
     if (cand == 0 || f.injected || f.inject_failed || f.fg_native_done ||
+        (fgn && g_fgn_lock == 2) ||
         !(fgn ? !g_present_dead : (WindowPathOk() || HudPointOn()))) {
         return false;
     }
@@ -2733,6 +2771,8 @@ void FillPresentPlan(VAddr flip, const char* where) {
         p.camera_valid ? "reconstructed (camera found)" : "zero (no camera)",
         p.depth_inverted ? "inverted" : "forward"));
     if (FgNative()) {
+        if (p.reset) ++g_fgn_sec.resets;
+        if (p.camera_valid) ++g_fgn_sec.cam;
         static bool said = false;
         if (!said) {
             said = true;
@@ -2910,6 +2950,7 @@ void OnPresentUpscaled(bool ok) {
 void OnFgNativeAnalyzed(bool ok) {
     std::scoped_lock lk{g_mutex};
     g_frame.fg_native_done = true; // once per frame either way; nothing else changes
+    g_frame.fgn_fail = !ok;
     if (ok) {
         return;
     }
@@ -3093,6 +3134,79 @@ void OnHudlessCopied() {
     std::scoped_lock lk{g_mutex};
     ++g_stats.hudless;
 }
+
+namespace {
+// 1.05: the FG-only path lock and the per-second [fg-pure] line (under g_mutex, from OnFlip).
+void FgnNoteFrame(const FrameState& f) {
+    auto& s = g_fgn_sec;
+    const bool scene3d = f.gb_depth != 0 && f.scene_draws > 0;
+    const auto now = std::chrono::steady_clock::now();
+    static auto prev_flip = now;
+    static bool have_prev = false;
+    if (scene3d) {
+        const int path = !f.fg_native_done || f.fgn_fail ? 0 : f.fgn_late ? 2 : 1;
+        ++s.frames;
+        if (path == 1) ++s.hud;
+        if (path == 2) ++s.late;
+        if (!f.fg_native_done) ++s.none;
+        if (f.fgn_fail) ++s.fail;
+        if (path != 0 && s.last != 0 && path != s.last) ++s.switches;
+        if (path != 0) s.last = path;
+        if (have_prev) {
+            const double ms = std::chrono::duration<double, std::milli>(now - prev_flip).count();
+            if (ms < 200.0) {
+                s.int_sum += ms;
+                s.int_sq += ms * ms;
+                s.int_min = std::min(s.int_min, ms);
+                s.int_max = std::max(s.int_max, ms);
+                ++s.ints;
+            }
+        }
+        if (g_fgn_lock == 0 && path != 0) {
+            const int forced = FgnLockForced();
+            if (forced > 0) {
+                g_fgn_lock = forced;
+            } else if (forced < 0) {
+                ++g_fgn_lock_frames;
+                if (path == 1) ++g_fgn_lock_hud;
+                if (g_fgn_lock_frames >= 300) {
+                    g_fgn_lock = g_fgn_lock_hud * 100 >= g_fgn_lock_frames * 95 ? 1 : 2;
+                }
+            }
+            if (g_fgn_lock != 0) {
+                Checkpoint(fmt::format(
+                    "[fg-pure] FG without an upscaler: path locked={} for the session ({} of the "
+                    "first {} 3D frames had the HUD point{}; BB_FGN_LOCK=hud/present/0)",
+                    g_fgn_lock == 1 ? "before-HUD" : "at-present", g_fgn_lock_hud,
+                    g_fgn_lock_frames, forced > 0 ? ", forced" : ""));
+            }
+        }
+    }
+    prev_flip = now;
+    have_prev = scene3d;
+    static auto last = now;
+    if (now - last >= std::chrono::seconds(1)) {
+        last = now;
+        if (s.frames > 0) {
+            const double mean = s.ints ? s.int_sum / s.ints : 0.0;
+            const double sd =
+                s.ints ? std::sqrt(std::max(0.0, s.int_sq / s.ints - mean * mean)) : 0.0;
+            Checkpoint(fmt::format(
+                "[fg-pure] last second: {} 3D frames, inputs before-HUD {} / at-present {} / none "
+                "{} (failed {}), camera MVs {}, depth G-buffer, object MVs composed, HUD-less {}, "
+                "path={} switches {}, resets {}, guest flip interval mean {:.2f} ms sd {:.2f} "
+                "min {:.2f} max {:.2f}",
+                s.frames, s.hud, s.late, s.none, s.fail, s.cam, s.hud,
+                g_fgn_lock == 1 ? "locked before-HUD" : g_fgn_lock == 2 ? "locked at-present"
+                                                                        : "undecided",
+                s.switches, s.resets, mean, sd, s.ints ? s.int_min : 0.0, s.int_max));
+        }
+        const int keep = s.last;
+        s = {};
+        s.last = keep;
+    }
+}
+} // namespace
 
 void OnFlip(VAddr addr, u32 width, u32 height) {
     if (!Enabled() && !AnalyzeOn()) {
@@ -3552,8 +3666,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             }
             g_learned.hud_target = f.hud_target;
             g_learned.hud_draw = f.hud_draw;
-        } else if (scene3d_i && (HudPointOn() || FgNative()) && !f.injected &&
-                   !f.fg_native_done) {
+        } else if (scene3d_i && (HudPointOn() || (FgNative() && g_fgn_lock != 2)) &&
+                   !f.injected && !f.fg_native_done) {
             ++miss_sec;
             const std::string why =
                 f.gb_w != g_output_w || f.gb_h != g_output_h
@@ -3608,11 +3722,14 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         // finished flip needs no sample of the source. With qual_samples > SkipNeeded() almost every
         // 3D frame had no point ("other / no injection point 60") and frame generation no inputs.
         g_learned.last_fg_native = prev_fg_native;
-        FillPresentPlan(addr, "at present (no HUD draw found this frame)");
+        FillPresentPlan(addr, g_fgn_lock == 2 ? "at present (FG-only path locked at present)"
+                                              : "at present (no HUD draw found this frame)");
         g_late_upscale = true;
         f.fg_native_done = true;
+        f.fgn_late = true;
         g_learned.last_fg_native = true;
     }
+    if (FgNative()) FgnNoteFrame(f);
     {
         auto& n = g_not3d;
         ++n.frames;
