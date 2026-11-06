@@ -111,6 +111,13 @@ struct AmdSecond {
     float mv_scale[2]{};
     float near_v = 0, far_v = 0, fov = 0, jitter[2]{};
     bool depth_inverted = false;
+    // 1.41 (bb-fg30-141): frame pairing of each prepared frame (guest frame numbers stamped by
+    // the rasterizer: colour, depth copy, camera motion pass, object-vector compose, HUD-less).
+    uint32_t paired = 0, off_depth = 0, off_mv = 0, off_obj = 0, off_hudless = 0;
+    uint64_t last_ids[5]{~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+    uint64_t last_ffx_frame = 0;
+    double dt_sum = 0, dt_max = 0;
+    uint32_t hudless_given = 0;
 } g_amd;
 // The frame-generation dispatches the swapchain made (frames interpolated) and how many of them
 // came with FSR's own history reset (its frameID chain broken, or the first after a gap).
@@ -984,6 +991,35 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
             const uint32_t dispatches = g_amd_dispatches.exchange(0, std::memory_order_relaxed);
             const uint32_t ffx_resets = g_amd_ffx_resets.exchange(0, std::memory_order_relaxed);
             const double all = static_cast<double>(std::max<uint64_t>(cov.all_px, 1));
+            {
+                // 1.41: one line proving which frame each input came from, and what FSR 3 was
+                // told for it. "paired" = colour == depth == camera MVs == object MVs == HUD-less.
+                const uint32_t n = std::max<uint32_t>(g_amd.prepared, 1);
+                const auto id = [](uint64_t v) {
+                    return v == ~0ull ? -1ll : static_cast<long long>(v);
+                };
+                const double chr = static_cast<double>(std::max<uint64_t>(cov.character_px, 1));
+                Printf("[fg-amd] 1.41 pairing: %u of %u prepared frames paired (colour == depth "
+                       "== camera MV == object MV == HUD-less frame); off: depth %u, camera MV %u, "
+                       "object MV %u (no G-buffer motion pass that frame = camera-only), HUD-less "
+                       "%u | last ids colour %lld depth %lld mv %lld obj %lld hudless %lld, FSR "
+                       "frameID %llu | told FSR: frameTimeDelta mean %.2f ms max %.2f, HUD-less "
+                       "colour %u/%u, UI texture none, flags 0x%x, viewSpaceToMeters 1, reset 0 "
+                       "unless camera cut | character vectors: %.1f %% of character pixels near "
+                       "zero (< 0.25 px), %.1f %% with own motion (> 1 px off camera)",
+                       g_amd.paired, g_amd.prepared, g_amd.off_depth, g_amd.off_mv, g_amd.off_obj,
+                       g_amd.off_hudless, id(g_amd.last_ids[0]), id(g_amd.last_ids[1]),
+                       id(g_amd.last_ids[2]), id(g_amd.last_ids[3]), id(g_amd.last_ids[4]),
+                       static_cast<unsigned long long>(g_amd.last_ffx_frame), g_amd.dt_sum / n,
+                       g_amd.dt_max, g_amd.hudless_given, g_amd.prepared,
+                       EnvOn("KYTY_FSR3_DEBUG_VIEW", false)
+                           ? static_cast<uint32_t>(FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW)
+                           : 0u,
+                       cov.character_px ? 100.0 * static_cast<double>(cov.character_still_px) / chr
+                                        : 0.0,
+                       cov.character_px ? 100.0 * static_cast<double>(cov.character_own_px) / chr
+                                        : 0.0);
+            }
             Printf("[fg-amd] 1.40 %.1f s: frames interpolated %u (%.1f/s; real %u, prepared %u, "
                    "FSR history resets %u, restarts after a gap %u, presents without inputs "
                    "while generating %u, input resets %u) | object-MV pixel coverage %.2f %% "
@@ -1201,6 +1237,27 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     prepare.motionVectors = ImageResource(inputs->motion, false);
     ++g_amd.prepared;
     if (inputs->reset) ++g_amd.input_resets;
+    {
+        // 1.41: frame pairing of this prepare's inputs (bb_fg.h Inputs, guest frame numbers).
+        const uint64_t c = inputs->color_frame;
+        const bool d_ok = inputs->depth_frame == c, m_ok = inputs->mv_frame == c,
+                   o_ok = inputs->obj_frame == c,
+                   h_ok = !hudless || inputs->hudless_frame == c;
+        if (!d_ok) ++g_amd.off_depth;
+        if (!m_ok) ++g_amd.off_mv;
+        if (!o_ok) ++g_amd.off_obj;
+        if (!h_ok) ++g_amd.off_hudless;
+        if (c != ~0ull && d_ok && m_ok && o_ok && h_ok) ++g_amd.paired;
+        g_amd.last_ids[0] = c;
+        g_amd.last_ids[1] = inputs->depth_frame;
+        g_amd.last_ids[2] = inputs->mv_frame;
+        g_amd.last_ids[3] = inputs->obj_frame;
+        g_amd.last_ids[4] = hudless ? inputs->hudless_frame : ~0ull;
+        g_amd.last_ffx_frame = g_frame_id;
+        g_amd.dt_sum += prepare.frameTimeDelta;
+        g_amd.dt_max = std::max<double>(g_amd.dt_max, prepare.frameTimeDelta);
+        if (hudless) ++g_amd.hudless_given;
+    }
     if (!g_generating) ++g_amd.restarts;
     g_amd.mv_scale[0] = prepare.motionVectorScale.x;
     g_amd.mv_scale[1] = prepare.motionVectorScale.y;

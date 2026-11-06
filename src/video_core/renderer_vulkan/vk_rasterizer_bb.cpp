@@ -195,6 +195,9 @@ struct BBVk {
         OwnImage depth, mv;
     };
     std::array<FgSlot, 8> fg_slots{};
+    // 1.41 (bb-fg30-141): guest frame numbers (BB::ObjMotion::FrameNo) of the camera motion pass
+    // and of the in-place HUD-less image, for the [fg-amd] pairing check.
+    u64 mv_frame = ~0ull, lut_frame = ~0ull;
     // 1.16: the HUD canvas' HUD-less image for frame generation this frame (presenter view).
     bool hs_hudless_ready = false;
     vk::ImageView hs_hudless_view{};
@@ -1802,6 +1805,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
     }
     // Object motion vectors (bb_objmv.h) over the camera ones.
+    g_bb.mv_frame = late ? BB::ObjMotion::FrameNo() - 1 : BB::ObjMotion::FrameNo();
     BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset, late);
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
@@ -2560,6 +2564,7 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
     if (!check) {
         g_bb.lut_ready = true;
+        g_bb.lut_frame = BB::ObjMotion::FrameNo();
         return;
     }
     g_bb.lut_pending[slot] = true;
@@ -2602,6 +2607,7 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
         g_bb.lut_pending[slot] = false;
     });
     g_bb.lut_ready = true;
+    g_bb.lut_frame = BB::ObjMotion::FrameNo();
 }
 
 // 0.39 (BB_FG_NATIVE): frame generation with no upscaler. At the window-size path's point (before
@@ -2891,6 +2897,14 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     std::copy(std::begin(plan.view_to_clip), std::end(plan.view_to_clip), out.view_to_clip);
     std::copy(std::begin(plan.clip_to_prev_clip), std::end(plan.clip_to_prev_clip),
               out.clip_to_prev_clip);
+    // 1.41: pairing ids (guest frame numbers). The flip just ended (OnFlip ran before this):
+    // the colour is frame FrameNo() - 1; depth and vectors are copied here from the images that
+    // frame's passes wrote; the camera pass / object compose / HUD-less image stamp their own.
+    out.color_frame = BB::ObjMotion::FrameNo() - 1;
+    out.depth_frame = out.color_frame;
+    out.mv_frame = g_bb.mv_frame;
+    out.obj_frame = BB::ObjMotion::ComposedFrame();
+    out.hudless_frame = out.color_frame;
     out.sl_frame =
         BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ? BB::SR::Dlss::LastFrameIndex() : 0;
     if (hs_ready && g_bb.hs_hudless_view) {
@@ -2953,6 +2967,7 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
         hudless_view = g_bb.fg_hudless_view_copy.view;
         out.hudless_source = "A before its HUD through the game's curve (self-checked)";
+        out.hudless_frame = g_bb.lut_frame;
     }
     // 1.03: the late analysis copies the finished flip image, HUD included; given as the HUD-less
     // image, FSR 3 FG / DLSS-G took the HUD for scene and warped it (ghosted bars, icons, text).
