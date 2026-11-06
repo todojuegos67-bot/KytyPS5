@@ -121,6 +121,11 @@ bool g_kbm_play = false;
 bool g_invert_y = false;
 // (bb-menu-133) Mando > "Probar y mapear": the pad never moves the menu, presses are shown live
 std::atomic<bool> g_test_mode{false};
+// (bb-mapwiz-136) Mando > "Mapear controles": the wizard listens for one physical pad input
+// (event thread writes g_wiz_got under g_cap_mtx, render thread takes it)
+std::atomic<bool> g_wiz_listen{false};
+std::string g_wiz_got;
+Uint64 g_wiz_start_down = 0; // OPTIONS: a short press is an input, a long hold leaves
 std::atomic<int> g_axis[4]{}; // SDL LEFTX, LEFTY, RIGHTX, RIGHTY
 std::atomic<bool> g_touch{false};
 
@@ -194,6 +199,7 @@ void SetOpen(bool open) {
     } else {
         g_open = false;
         g_test_mode = false;
+        g_wiz_listen = false;
         {
             std::scoped_lock lk{g_cap_mtx};
             g_capture = Capture::None;
@@ -865,6 +871,37 @@ const Row kKbmRows[] = {
     {"axis_right_x_minus", "Stick der. izquierda"}, {"axis_right_x_plus", "Stick der. derecha"},
 };
 
+// (bb-mapwiz-136) the wizard's order: one PS4 button at a time. Sticks are left as they are
+// (noisy, rarely remapped); the physical touchpad always gives the touchpad by itself, the
+// "Panel táctil" step adds a button for it (Share / Create / Back by default).
+const Row kWizSteps[] = {
+    {"cross", "Cruz"},           {"circle", "Círculo"},        {"square", "Cuadrado"},
+    {"triangle", "Triángulo"},   {"l1", "L1"},                 {"r1", "R1"},
+    {"l2", "L2"},                {"r2", "R2"},                 {"l3", "L3"},
+    {"r3", "R3"},                {"options", "Options"},       {"touchpad_center", "Panel táctil (Share / Create)"},
+    {"pad_up", "D-pad arriba"},  {"pad_down", "D-pad abajo"},  {"pad_left", "D-pad izquierda"},
+    {"pad_right", "D-pad derecha"},
+};
+constexpr int kWizN = static_cast<int>(std::size(kWizSteps));
+std::vector<std::string> Tokens(const std::string& s);
+std::string PhysLabel(const std::string& tok) {
+    static const std::map<std::string, const char*> m = {
+        {"cross", "Cruz"}, {"circle", "Círculo"}, {"square", "Cuadrado"},
+        {"triangle", "Triángulo"}, {"l1", "L1"}, {"r1", "R1"}, {"l2", "L2"}, {"r2", "R2"},
+        {"l3", "L3"}, {"r3", "R3"}, {"options", "Options / Start"}, {"back", "Share / Back"},
+        {"pad_up", "D-pad arriba"}, {"pad_down", "D-pad abajo"}, {"pad_left", "D-pad izq."},
+        {"pad_right", "D-pad der."}, {"lpaddle_high", "Pala izq. 1"},
+        {"lpaddle_low", "Pala izq. 2"}, {"rpaddle_high", "Pala der. 1"},
+        {"rpaddle_low", "Pala der. 2"},
+    };
+    std::string out;
+    for (const auto& t : Tokens(tok)) {
+        auto it = m.find(t);
+        out += (out.empty() ? "" : " + ") + (it != m.end() ? std::string(it->second) : t);
+    }
+    return out.empty() ? "(sin asignar)" : out;
+}
+
 // Bloodborne's own (PS4) controls
 const char* DefaultFn(const std::string& out) {
     static const std::map<std::string, const char*> m = {
@@ -1219,7 +1256,7 @@ PhysPhoto CurrentPhys() {
 
 // Draws your pad with, next to each physical button, the PS4 button(s) it gives now
 // (remapped ones lit). `phys` gets the physical spots' screen centres.
-void PhysPanel(ImVec2 a, ImVec2 b, float u, const std::string& focus,
+[[maybe_unused]] void PhysPanel(ImVec2 a, ImVec2 b, float u, const std::string& focus,
                std::map<std::string, ImVec2>& phys, std::string& hover) {
     auto* dl = ImGui::GetWindowDrawList();
     Panel(dl, a, b, u);
@@ -2446,7 +2483,15 @@ public:
     bool kbm_scroll_to = false;
     int exit_focus = 0;
     float tog_direct = 0, tog_stick = 0, tog_look = 0, tog_inv = 0;
-    double test_hold_since = -1; // PS / OPTIONS held in the test mode
+    double test_hold_since = -1; // (bb-mapwiz-136) OPTIONS held in the wizard
+    // (bb-mapwiz-136) Mando > "Mapear controles": countdown -> one PS4 button at a time ->
+    // summary. Nothing is written until GUARDAR, so leaving keeps the mapping as it was.
+    enum class Wiz { Off, Count, Seq, Summary };
+    Wiz wiz = Wiz::Off;
+    double wiz_t = 0, wiz_step_t = 0, wiz_warn_t = -1;
+    int wiz_step = 0, wiz_focus = 0;
+    std::string wiz_warn;
+    std::vector<std::string> wiz_new; // per step: the physical input pressed ("" = kept)
     float s_sp = 1.0f, s_dz = 0.5f;
     double dpad_since[4] = {-1, -1, -1, -1}, dpad_rep[4] = {};
 
@@ -2477,7 +2522,7 @@ public:
         }
         screen = s;
         scr_t = ImGui::GetTime();
-        g_test_mode = false;
+        WizEnd();
         std::scoped_lock lk{g_cap_mtx};
         g_capture = Capture::None;
     }
@@ -2511,8 +2556,8 @@ public:
     void HandleNav(const std::vector<Nav>& nav) {
         for (const Nav n : nav) {
             if (n == Nav::Back) {
-                if (screen == Screen::Pad && g_test_mode) {
-                    g_test_mode = false; // Esc leaves the test first
+                if (screen == Screen::Pad && wiz != Wiz::Off) {
+                    WizEnd(); // Esc / Círculo: leave the wizard without saving
                     continue;
                 }
                 if (screen == Screen::Hub) {
@@ -2529,21 +2574,21 @@ public:
                 if (n == Nav::Accept) Go(static_cast<Screen>(hub_focus));
                 break;
             case Screen::Pad: {
-                const int cnt = static_cast<int>(std::size(kPadRows)) + 1;
-                if (n == Nav::Up || n == Nav::Left) pad_focus = (pad_focus + cnt - 1) % cnt;
-                if (n == Nav::Down || n == Nav::Right) pad_focus = (pad_focus + 1) % cnt;
-                if (n == Nav::Prev) g_pad_photo = (g_pad_photo + 2) % 3;
-                if (n == Nav::Next) g_pad_photo = (g_pad_photo + 1) % 3;
-                if (n == Nav::Accept) {
-                    if (pad_focus < static_cast<int>(std::size(kPadRows))) {
-                        StartCaptureFor(kPadRows[pad_focus].output, Cat::Pad);
-                    } else {
-                        ResetPad();
+                if (wiz == Wiz::Count || wiz == Wiz::Seq) break; // only Esc / OPTIONS hold
+                if (wiz == Wiz::Summary) {
+                    if (n == Nav::Left || n == Nav::Right || n == Nav::Up || n == Nav::Down)
+                        wiz_focus ^= 1;
+                    if (n == Nav::Accept) {
+                        if (wiz_focus == 0) WizSave();
+                        WizEnd();
                     }
+                    break;
                 }
-                if (n == Nav::Clear && pad_focus < static_cast<int>(std::size(kPadRows))) {
-                    const std::string o = kPadRows[pad_focus].output;
-                    if (!o.starts_with("stick_")) g_cfg.Set(o, Cat::Pad, "", {});
+                if (n == Nav::Left || n == Nav::Right || n == Nav::Up || n == Nav::Down)
+                    pad_focus = pad_focus == 0 ? 1 : 0;
+                if (n == Nav::Accept) {
+                    if (pad_focus == 0) WizStart();
+                    else ResetPad();
                 }
                 break;
             }
@@ -2710,13 +2755,16 @@ public:
             hints = {{"cross", "Entrar"}, {"circle", "Volver al juego"}, {"F1", "Cerrar"}};
             break;
         case Screen::Pad:
-            if (g_test_mode) {
-                hints = {{"options", "Mantén PS u OPTIONS 2 s: salir"},
-                         {"Esc", "Salir del modo prueba"}};
+            if (wiz == Wiz::Count || wiz == Wiz::Seq) {
+                hints = {{"options", "Mantén OPTIONS 3 s: salir sin guardar"},
+                         {"Esc", "Salir sin guardar"}};
                 break;
             }
-            hints = {{"pad", "Elegir"}, {"cross", "Reasignar"}, {"triangle", "Quitar"},
-                     {"l1", "Cambiar foto"}, {"circle", "Volver"}};
+            if (wiz == Wiz::Summary) {
+                hints = {{"pad", "Elegir"}, {"cross", "Aceptar"}, {"circle", "Descartar"}};
+                break;
+            }
+            hints = {{"pad", "Elegir"}, {"cross", "Aceptar"}, {"circle", "Volver"}};
             break;
         case Screen::Kbm:
             hints = {{"pad", "Elegir"}, {"cross", "Asignar tecla"}, {"triangle", "Quitar"},
@@ -2773,6 +2821,7 @@ public:
             float off;
             g_cfg.MouseParams(s_dz, s_sp, off);
             screen = Screen::Hub;
+            WizEnd();
             hub_t = ImGui::GetTime();
             scr_t = hub_t;
             for (auto& h : card_hov) h = 0.0f;
@@ -2934,107 +2983,279 @@ public:
     }
 
     // ------------------------------------------------------------ Mando
-    void PadScreen(ImVec2 a, ImVec2 b, float u) {
-        const int rows = static_cast<int>(std::size(kPadRows));
-        pad_focus = std::clamp(pad_focus, 0, rows);
-        const std::string focus = pad_focus < rows ? kPadRows[pad_focus].output : "";
-        const float mid = (a.x + b.x) * 0.5f;
-        const float pb = b.y - 132 * u;
-        std::string hover;
-        std::map<std::string, ImVec2> anchors, phys;
-        const std::string clicked =
-            Ps4Panel(a, {mid - 14 * u, pb}, u, focus, hover, anchors, "los controles del juego");
-        PhysPanel({mid + 14 * u, a.y}, {b.x, pb}, u, focus, phys, hover);
-        if (!clicked.empty()) {
-            for (int i = 0; i < rows; i++) {
-                if (clicked == kPadRows[i].output) pad_focus = i;
+    // (bb-mapwiz-136) the mapping wizard
+    void WizStart() {
+        wiz = Wiz::Count;
+        wiz_t = ImGui::GetTime();
+        wiz_step = 0;
+        wiz_focus = 0;
+        wiz_warn.clear();
+        wiz_warn_t = -1;
+        wiz_new.assign(kWizN, "");
+        test_hold_since = -1;
+        g_test_mode = true; // the pad never navigates while it runs
+        g_wiz_listen = false;
+        std::scoped_lock lk{g_cap_mtx};
+        g_wiz_got.clear();
+    }
+    void WizEnd() {
+        wiz = Wiz::Off;
+        g_test_mode = false;
+        g_wiz_listen = false;
+        test_hold_since = -1;
+    }
+    // the final pad binding of every step: the button pressed, or the current one; a kept
+    // binding that a pressed one took gets that step's old binding (a swap) or none
+    std::vector<std::string> WizResolve() const {
+        std::vector<std::string> cur(kWizN), fin(kWizN);
+        for (int i = 0; i < kWizN; i++) cur[i] = g_cfg.GetRaw(kWizSteps[i].output, Cat::Pad);
+        auto claimed = [&](const std::string& t) {
+            for (int k = 0; k < kWizN; k++) {
+                if (!wiz_new[k].empty() && wiz_new[k] == t) return k;
             }
-            StartCaptureFor(clicked, Cat::Pad);
-        } else if (!hover.empty() && MouseMoved()) {
-            for (int i = 0; i < rows; i++) {
-                if (hover == kPadRows[i].output) pad_focus = i;
+            return -1;
+        };
+        for (int i = 0; i < kWizN; i++) {
+            if (!wiz_new[i].empty()) {
+                fin[i] = wiz_new[i];
+                continue;
             }
-        }
-        const std::string key = pad_focus < rows ? std::string(kPadRows[pad_focus].output) : "";
-        // links: the game's button -> the physical one(s) giving it
-        auto* dl = ImGui::GetWindowDrawList();
-        if (!key.empty() && anchors.contains(key)) {
-            for (const auto& p : PhysOf(key)) {
-                if (auto it = phys.find(p); it != phys.end()) {
-                    Link(dl, anchors[key], it->second, u);
+            std::string out;
+            for (const auto& t : Tokens(cur[i])) {
+                std::string use = t;
+                if (const int j = claimed(t); j >= 0 && j != i) {
+                    use.clear();
+                    for (const auto& c : Tokens(cur[j])) {
+                        if (claimed(c) < 0) use = c;
+                    }
+                }
+                if (!use.empty() && out.find(use) == std::string::npos) {
+                    out += (out.empty() ? "" : ",") + use;
                 }
             }
+            fin[i] = out;
         }
-        // detail bar
+        return fin;
+    }
+    void WizSave() {
+        const auto fin = WizResolve();
+        for (int i = 0; i < kWizN; i++) {
+            const std::string o = kWizSteps[i].output;
+            std::erase_if(g_cfg.lines,
+                          [&](const Line& l) { return l.out == o && Classify(l.in) == Cat::Pad; });
+            if (!fin[i].empty()) {
+                g_cfg.lines.push_back({o + " = " + fin[i] + "  # F1 menu (mapear)", o, fin[i]});
+            }
+        }
+        g_cfg.Save(); // one write, one reload
+        LOG_INFO(Frontend, "[bb-menu] mapping wizard: saved");
+    }
+    void WizNext() {
+        wiz_step++;
+        wiz_step_t = ImGui::GetTime();
+        wiz_warn_t = -1;
+        g_wiz_listen = false; // wait for every button to be released first
+        if (wiz_step >= kWizN) {
+            wiz = Wiz::Summary;
+            wiz_focus = 0;
+            g_test_mode = false; // the summary is a normal menu
+        }
+    }
+    // runs every frame while the wizard is on; true when it was left
+    bool WizTick() {
+        const double now = ImGui::GetTime();
+        // OPTIONS held 3 s: leave without saving
+        const bool hold = (g_pad_buttons.load() & (1u << SDL_GAMEPAD_BUTTON_START)) != 0;
+        if (!hold) {
+            test_hold_since = -1;
+        } else if (test_hold_since < 0) {
+            test_hold_since = now;
+        } else if (now - test_hold_since >= 3.0) {
+            LOG_INFO(Frontend, "[bb-menu] mapping wizard: left (OPTIONS held), nothing saved");
+            WizEnd();
+            return true;
+        }
+        if (wiz == Wiz::Count && now - wiz_t >= 3.0) {
+            wiz = Wiz::Seq;
+            wiz_step = -1;
+            WizNext();
+        }
+        if (wiz != Wiz::Seq) return false;
+        if (!g_wiz_listen) {
+            const bool idle = g_pad_buttons.load() == 0 && g_trig_l < 8000 && g_trig_r < 8000;
+            if (idle) {
+                std::scoped_lock lk{g_cap_mtx};
+                g_wiz_got.clear();
+                g_wiz_start_down = 0;
+                g_wiz_listen = true;
+            }
+            if (now - wiz_step_t > 5.0) WizNext(); // timer runs anyway
+            return false;
+        }
+        std::string got;
+        {
+            std::scoped_lock lk{g_cap_mtx};
+            got.swap(g_wiz_got);
+        }
+        if (!got.empty()) {
+            for (int j = 0; j < wiz_step; j++) {
+                if (wiz_new[j] == got) {
+                    wiz_warn = PhysLabel(got) + " ya está asignado a " + kWizSteps[j].label +
+                               ". Pulsa otro botón.";
+                    wiz_warn_t = now;
+                    wiz_step_t = now; // a fresh 5 s
+                    g_wiz_listen = false;
+                    return false;
+                }
+            }
+            wiz_new[wiz_step] = got;
+            WizNext();
+        } else if (now - wiz_step_t > 5.0) {
+            WizNext(); // nothing pressed: keeps its mapping
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------ Mando
+    // (bb-mapwiz-136) only the DS4 photo and the mapping wizard
+    void PadScreen(ImVec2 a, ImVec2 b, float u) {
+        if (wiz != Wiz::Off && WizTick()) {
+            // left: fall through to the idle view
+        }
+        pad_focus = std::clamp(pad_focus, 0, 1);
+        const double now = ImGui::GetTime();
+        const float pb = b.y - 210 * u;
+        const std::string focus =
+            wiz == Wiz::Seq && wiz_step < kWizN ? kWizSteps[wiz_step].output : "";
+        std::string hover;
+        std::map<std::string, ImVec2> anchors;
+        const char* sub = wiz == Wiz::Off ? "los controles del juego"
+                          : wiz == Wiz::Summary ? "resumen del mapeo"
+                                                : "mapeando: pulsa en tu mando el botón indicado";
+        Ps4Panel(a, {b.x, pb}, u, focus, hover, anchors, sub);
+        auto* dl = ImGui::GetWindowDrawList();
+        // the step's button: an extra glow on the photo
+        if (!focus.empty() && anchors.contains(focus)) {
+            const ImVec2 c = anchors[focus];
+            const float ph = static_cast<float>(std::fmod(now, 1.0));
+            for (int i = 0; i < 2; i++) {
+                const float k = std::fmod(ph + i * 0.5f, 1.0f);
+                dl->AddCircle(c, (30 + 70 * k) * u, Gold(0.8f * (1.0f - k)), 0, 3.0f * u);
+            }
+        }
         const ImVec2 d0{a.x, pb + 18 * u}, d1{b.x, b.y};
-        Panel(dl, d0, d1, u, g_test_mode ? 0.6f + 0.3f * std::sin(Now() * 3.0f) : 0.3f);
         const float cy = (d0.y + d1.y) * 0.5f;
-        const float bw = 230 * u, bh = 58 * u;
-        if (g_test_mode) {
-            // (bb-menu-133) hold PS or OPTIONS 2 s to leave
-            const u32 bits = g_pad_buttons.load();
-            const bool hold = (bits & ((1u << SDL_GAMEPAD_BUTTON_GUIDE) |
-                                       (1u << SDL_GAMEPAD_BUTTON_START))) != 0;
-            const double now = ImGui::GetTime();
-            if (!hold) {
-                test_hold_since = -1;
-            } else if (test_hold_since < 0) {
-                test_hold_since = now;
+        // OPTIONS hold ring (any wizard phase)
+        auto hold_ring = [&](ImVec2 c) {
+            const float k = test_hold_since < 0
+                                ? 0.0f
+                                : std::clamp(static_cast<float>(now - test_hold_since) / 3.0f,
+                                             0.0f, 1.0f);
+            const float r = 26 * u;
+            dl->AddCircle(c, r, Bronze(0.5f), 48, 4 * u);
+            if (k > 0.0f) {
+                dl->PathArcTo(c, r, -IM_PI * 0.5f, -IM_PI * 0.5f + k * 2.0f * IM_PI, 48);
+                dl->PathStroke(Gold(), 0, 5 * u);
             }
-            const float hk = test_hold_since < 0
-                                 ? 0.0f
-                                 : std::clamp(static_cast<float>(now - test_hold_since) / 2.0f,
-                                              0.0f, 1.0f);
-            Txt(dl, g_ft_title, 28 * u, {d0.x + 40 * u, cy - 40 * u}, Gold(), "MODO PRUEBA");
-            Txt(dl, g_ft_italic, 21 * u, {d0.x + 40 * u, cy - 2 * u}, Parch(0.9f),
-                "Pulsa botones y sticks: se iluminan en la foto. Haz clic en un botón de la "
-                "foto y pulsa el de tu mando para reasignarlo.");
-            Txt(dl, g_ft_ui, 18 * u, {d0.x + 40 * u, cy + 30 * u}, Muted(),
-                "Salir: mantén PS u OPTIONS 2 s, pulsa Esc o el botón de la derecha");
-            const float bx = d1.x - 30 * u - bw * 1.35f;
-            const ImVec2 q0{bx, cy - bh * 0.5f}, q1{d1.x - 30 * u, cy + bh * 0.5f};
-            if (hk > 0.0f) {
-                dl->AddRectFilled({q0.x, q1.y + 6 * u}, {q0.x + (q1.x - q0.x) * hk, q1.y + 10 * u},
-                                  Gold());
+            Glyph(dl, "options", c, 14 * u, 1.0f, k > 0.0f);
+            TxtR(dl, g_ft_ui, 17 * u, c.x - r - 12 * u, c.y - 10 * u, Muted(),
+                 "Mantén OPTIONS 3 s o Esc: salir sin guardar");
+        };
+        if (wiz == Wiz::Off) {
+            Panel(dl, d0, d1, u, 0.3f);
+            Txt(dl, g_ft_title, 28 * u, {d0.x + 40 * u, cy - 40 * u}, Gold(), "MAPEAR TU MANDO");
+            Txt(dl, g_ft_italic, 22 * u, {d0.x + 40 * u, cy + 2 * u}, Parch(0.9f),
+                "Te iremos pidiendo cada botón de PS4: pulsa el de tu mando que quieras usar.");
+            const float bw = 460 * u, bh = 88 * u, rw = 240 * u;
+            float x = d1.x - 30 * u - rw;
+            if (CardButton("##rst", {x, cy - 29 * u}, {x + rw, cy + 29 * u}, "RESTABLECER", u,
+                           pad_focus == 1)) {
+                ResetPad();
             }
-            if (CardButton("##tstx", q0, q1, "SALIR DE LA PRUEBA", u, true) || hk >= 1.0f) {
-                g_test_mode = false;
-                test_hold_since = -1;
+            x -= bw + 20 * u;
+            if (CardButton("##wiz", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f},
+                           "MAPEAR CONTROLES", u, pad_focus == 0)) {
+                WizStart();
             }
             return;
         }
-        if (!key.empty()) {
-            Glyph(dl, key, {d0.x + 56 * u, cy}, 30 * u, 1.0f, true);
-            Txt(dl, g_ft_title, 28 * u, {d0.x + 104 * u, cy - 36 * u}, Gold(), RowLabel(key));
-            const std::string def = std::string("En Bloodborne: ") + DefaultFn(key);
-            Txt(dl, g_ft_italic, 24 * u, {d0.x + 104 * u, cy + 2 * u}, Muted(), def.c_str());
-            const float bx = d0.x + (d1.x - d0.x) * 0.40f;
-            Txt(dl, g_ft_ui, 17 * u, {bx, cy - 32 * u}, Muted(0.8f), "EN TU MANDO");
-            Txt(dl, g_ft_text, 30 * u, {bx, cy - 8 * u}, Parch(), BindingText(key, Cat::Pad).c_str());
-        } else {
-            Txt(dl, g_ft_title, 28 * u, {d0.x + 40 * u, cy - 18 * u}, Gold(),
-                "Restablecer todo el mando de serie");
+        if (wiz == Wiz::Count) {
+            Panel(dl, d0, d1, u, 0.6f + 0.3f * std::sin(Now() * 3.0f));
+            const int n = 3 - static_cast<int>(now - wiz_t);
+            const std::string big = fmt::format("Preparado...  {}", std::clamp(n, 1, 3));
+            Txt(dl, g_ft_title, 54 * u, {d0.x + 40 * u, cy - 48 * u}, Gold(), big.c_str());
+            Txt(dl, g_ft_italic, 22 * u, {d0.x + 40 * u, cy + 20 * u}, Parch(0.9f),
+                "Pulsa en tu mando el botón que se ilumine. Si no pulsas nada en 5 s, se queda "
+                "como está.");
+            const float bw = 240 * u;
+            const ImVec2 q0{d1.x - 30 * u - bw, cy - 29 * u}, q1{d1.x - 30 * u, cy + 29 * u};
+            if (CardButton("##wzc", q0, q1, "CANCELAR", u, false)) {
+                WizEnd();
+                return;
+            }
+            hold_ring({q0.x - 50 * u, cy + 56 * u});
+            return;
         }
-        float x = d1.x - 30 * u - bw;
-        if (CardButton("##rst", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "RESTABLECER", u,
-                       pad_focus == rows)) {
-            ResetPad();
+        if (wiz == Wiz::Seq && wiz_step < kWizN) {
+            Panel(dl, d0, d1, u, 0.6f + 0.3f * std::sin(Now() * 3.0f));
+            const std::string& o = kWizSteps[wiz_step].output;
+            Glyph(dl, o, {d0.x + 70 * u, cy - 14 * u}, 38 * u, 1.0f, true);
+            const std::string p = std::string("Pulsa el botón para: ") + kWizSteps[wiz_step].label;
+            Txt(dl, g_ft_title, 40 * u, {d0.x + 130 * u, cy - 62 * u}, Gold(), p.c_str());
+            const std::string fn = std::string("En Bloodborne: ") + DefaultFn(o) +
+                                   "   ·   ahora: " + PhysLabel(g_cfg.GetRaw(o, Cat::Pad));
+            Txt(dl, g_ft_italic, 22 * u, {d0.x + 130 * u, cy - 12 * u}, Muted(), fn.c_str());
+            // timeout bar
+            const float k = std::clamp(1.0f - static_cast<float>(now - wiz_step_t) / 5.0f, 0.0f, 1.0f);
+            const float bx0 = d0.x + 130 * u, bx1 = d0.x + (d1.x - d0.x) * 0.55f, by = cy + 30 * u;
+            dl->AddRectFilled({bx0, by}, {bx1, by + 8 * u}, Col(30, 26, 22), 4 * u);
+            dl->AddRectFilled({bx0, by}, {bx0 + (bx1 - bx0) * k, by + 8 * u}, Gold(), 4 * u);
+            const std::string prog = fmt::format("{} / {}", wiz_step + 1, kWizN);
+            Txt(dl, g_ft_title, 30 * u, {bx1 + 20 * u, by - 14 * u}, Parch(), prog.c_str());
+            if (wiz_warn_t >= 0 && now - wiz_warn_t < 3.0) {
+                Txt(dl, g_ft_ui, 20 * u, {bx0, by + 20 * u}, Col(230, 120, 90), wiz_warn.c_str());
+            }
+            hold_ring({d1.x - 60 * u, cy});
+            return;
         }
-        x -= bw + 16 * u;
-        if (!key.empty() && !key.starts_with("stick_") &&
-            CardButton("##clr", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "QUITAR", u, false)) {
-            g_cfg.Set(key, Cat::Pad, "", {});
-        }
-        x -= bw + 16 * u;
-        if (!key.empty() &&
-            CardButton("##rb", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "REASIGNAR", u, false)) {
-            StartCaptureFor(key, Cat::Pad);
-        }
-        x -= bw + 16 * u;
-        if (CardButton("##tst", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "PROBAR Y MAPEAR", u,
-                       false)) {
-            g_test_mode = true;
-            test_hold_since = -1;
+        if (wiz == Wiz::Summary) {
+            // the list over the photo
+            const auto fin = WizResolve();
+            const ImVec2 s0{a.x + 60 * u, a.y + 96 * u}, s1{b.x - 60 * u, pb - 10 * u};
+            dl->AddRectFilled(s0, s1, Col(14, 12, 11, 0.94f), 10 * u);
+            Panel(dl, s0, s1, u, 0.4f);
+            const int per = (kWizN + 1) / 2;
+            const float colw = (s1.x - s0.x - 80 * u) * 0.5f;
+            const float rh = std::min(46 * u, (s1.y - s0.y - 40 * u) / per);
+            for (int i = 0; i < kWizN; i++) {
+                const float x = s0.x + 40 * u + (i / per) * (colw + 20 * u);
+                const float y = s0.y + 20 * u + (i % per) * rh;
+                const std::string o = kWizSteps[i].output;
+                Glyph(dl, o, {x + 18 * u, y + rh * 0.5f}, 15 * u, 1.0f, !wiz_new[i].empty());
+                Txt(dl, g_ft_text, 24 * u, {x + 46 * u, y + rh * 0.5f - 14 * u}, Parch(),
+                    kWizSteps[i].label);
+                const std::string v =
+                    "->  " + PhysLabel(fin[i]) + (wiz_new[i].empty() ? "  (sin cambios)" : "");
+                Txt(dl, g_ft_ui, 20 * u, {x + colw * 0.48f, y + rh * 0.5f - 11 * u},
+                    wiz_new[i].empty() ? Muted() : Gold(), v.c_str());
+            }
+            Panel(dl, d0, d1, u, 0.3f);
+            Txt(dl, g_ft_title, 30 * u, {d0.x + 40 * u, cy - 36 * u}, Gold(), "¿GUARDAR EL MAPEO?");
+            Txt(dl, g_ft_italic, 22 * u, {d0.x + 40 * u, cy + 4 * u}, Parch(0.9f),
+                "Descartar deja el mando exactamente como estaba.");
+            const float bw = 260 * u, bh = 66 * u;
+            float x = d1.x - 30 * u - bw;
+            if (CardButton("##wzd", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "DESCARTAR", u,
+                           wiz_focus == 1)) {
+                WizEnd();
+                return;
+            }
+            x -= bw + 20 * u;
+            if (CardButton("##wzs", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "GUARDAR", u,
+                           wiz_focus == 0)) {
+                WizSave();
+                WizEnd();
+            }
         }
     }
 
@@ -3540,8 +3761,31 @@ bool OnSdlEvent(SDL_Event& event) {
     }
     // the menu's own navigation: d-pad, face buttons, L1 / R1, arrows, Enter, Esc. The sticks
     // never move it; nothing used here reaches the game.
+    // (bb-mapwiz-136) the wizard: a pad press is an answer, never navigation
+    if (g_wiz_listen && IsPadInput(type)) {
+        std::string got;
+        if (type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+            if (event.gbutton.button == SDL_GAMEPAD_BUTTON_START) {
+                g_wiz_start_down = SDL_GetTicks(); // answered on release (a hold leaves)
+            } else if (const char* n = PadName(event.gbutton.button)) {
+                got = n;
+            }
+        } else if (type == SDL_EVENT_GAMEPAD_BUTTON_UP &&
+                   event.gbutton.button == SDL_GAMEPAD_BUTTON_START && g_wiz_start_down != 0) {
+            if (SDL_GetTicks() - g_wiz_start_down < 700) got = "options";
+            g_wiz_start_down = 0;
+        } else if (type == SDL_EVENT_GAMEPAD_AXIS_MOTION && event.gaxis.value > 16000) {
+            if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) got = "l2";
+            if (event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) got = "r2";
+        }
+        if (!got.empty()) {
+            std::scoped_lock lk{g_cap_mtx};
+            if (g_wiz_got.empty()) g_wiz_got = got;
+        }
+        return false;
+    }
     if (type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && g_test_mode) {
-        return false; // (bb-menu-133) test mode: shown live, never navigates
+        return false; // (bb-mapwiz-136) wizard on: the pad never navigates
     }
     if (type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
         switch (event.gbutton.button) {
