@@ -410,10 +410,19 @@ void RecordPad(VkCommandBuffer command, const PadImage& pad, const Image& hudles
                         vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, pre);
     const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
     cmd.clearColorImage(dst, vk::ImageLayout::eTransferDstOptimal, black, range);
-    const vk::MemoryBarrier clear_done{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-                                       .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+    // (an image barrier: windows.h defines MemoryBarrier)
+    const vk::ImageMemoryBarrier clear_done{
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = dst,
+        .subresourceRange = range,
+    };
     cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
-                        {}, clear_done, {}, {});
+                        {}, {}, {}, clear_done);
     const uint32_t w = std::min(hudless.extent.width, pad.extent.width);
     const uint32_t h = std::min(hudless.extent.height, pad.extent.height);
     const vk::ImageCopy copy{
