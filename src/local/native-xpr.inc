@@ -693,6 +693,14 @@ struct RenderExecutor::NativeXprCache {
 		ResolvedDynamicState           dynamic {};
 		vk::ImageAspectFlags           feedback {};
 		bool                           dynamic_held = false, feedback_held = false;
+		// The command buffer a draw just went into. The indices of another one (or of this one before a direct draw) are not
+		// bound there: a table draw of vertices binds none and leaves them, and the indexed draw after it, the same indices
+		// as in the last command buffer, drew with none bound (the validation layer, at 5-1).
+		void MovedTo(vk::CommandBuffer next, uint64_t next_generation) {
+			if (next != command || next_generation != generation) index_base = index_bytes = 0;
+			command    = next;
+			generation = next_generation;
+		}
 	} emit;
 	// Programs the SRT trace cannot cover (no single linear plan): never retried.
 	std::unordered_set<const ShaderRecompiler::IR::CompiledShaderInfo*> untraceable;
