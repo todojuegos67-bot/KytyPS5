@@ -892,8 +892,8 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 		feedback.download.written_serial = m_scheduler.CommandSerial();
 		command.CopyAfterRun(owner->Handle(), owner->Offset(vaddr), feedback.download.Handle(),
 		                     selected * CopyFeedback::SlotSize, size);
-	} else if (static auto& batch = LiveSwitch::Find("feedback_batch", 1); batch.load(std::memory_order_relaxed) != 0) {
-		// KYTY_FEEDBACK_BATCH (live feedback_batch, on by default): the snapshot is copied
+	} else if (static auto& batch = LiveSwitch::Find("feedback_batch", 0); batch.load(std::memory_order_relaxed) != 0) {
+		// KYTY_FEEDBACK_BATCH (live feedback_batch, default off): the snapshot is copied
 		// as the open buffer closes, with the others there behind one barrier each side, not behind two of its own
 		// here. Later work in the buffer that writes the range invalidates the slot (InvalidateCopyFeedback), so what
 		// the copy reads then is what it would read here whenever the slot is still used. (The source outlives the
@@ -910,7 +910,7 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	slot = {vaddr, size, m_scheduler.CurrentTick(), mapping_epoch, owner->Handle()};
 	if (feedback.Insert(vaddr, selected)) feedback.Count(slot, 1);
 	feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
-	if (static auto& eager = LiveSwitch::Find("eager_feedback", 1);
+	if (static auto& eager = LiveSwitch::Find("eager_feedback", 0);
 	    eager.load(std::memory_order_relaxed) != 0) {
 		if (m_eager_feedback.size() >= CopyFeedback::SlotCount) m_eager_feedback.pop_front();
 		m_eager_feedback.push_back({selected, vaddr, size, slot.tick});
@@ -923,7 +923,7 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 void BufferCache::WriteBackCompletedFeedback(bool may_wait) {
 	// (Called between guest packets: nothing to do until the oldest snapshot's tick completes.)
 	if (m_eager_feedback.empty() || m_eager_feedback.front().tick > m_scheduler.GetMasterSemaphore().KnownGpuTick()) return;
-	static auto& eager  = LiveSwitch::Find("eager_feedback", 1);
+	static auto& eager  = LiveSwitch::Find("eager_feedback", 0);
 	static auto& verify = LiveSwitch::Find("eager_feedback_verify", 0);
 	if (eager.load(std::memory_order_relaxed) == 0 || !m_copy_feedback) {
 		m_eager_feedback.clear();

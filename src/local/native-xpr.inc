@@ -86,27 +86,27 @@ extern "C" {
 // Table lookups that ask the last answer first (bits): 1 the pair cache's 4096 entries (else 256), 2 the pair's variant
 // found last, 4 the pair's image set before the last (TableTry, TableSet).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_mru {7};
-// KYTY_TABLE_SERIALS (live table_serials, on by default): 1: a table draw's targets and set images are checked
+// KYTY_TABLE_SERIALS (live table_serials, default 0): 1: a table draw's targets and set images are checked
 // (NativeXprEmitTargets, TableTransit) only when the sum of their image serials (ImageSerials) moved since the state's or
 // set's last emission, not whenever any image changed; 2: checked as before, the checks the sums would have skipped that
 // changed something counted (serials_unsafe: the verify). A change of the switch moves the unattributed serial, so no
 // sum kept before it holds after.
 static uint32_t TableSerialsMode() {
-	static auto&                 mode = LiveSwitch::Find("table_serials", 1);
+	static auto&                 mode = LiveSwitch::Find("table_serials", 0);
 	static std::atomic<int64_t>  seen {0};
 	const auto                   now  = mode.load(std::memory_order_relaxed);
-	if (seen.exchange(now, std::memory_order_relaxed) != now) {
+	if (seen.load(std::memory_order_relaxed) != now && seen.exchange(now, std::memory_order_relaxed) != now) {
 		ImageSerials::g_on.store(now != 0, std::memory_order_relaxed);
 		MoveImageStateEpoch();
 	}
 	return static_cast<uint32_t>(now);
 }
-// KYTY_TABLE_MEMO (live table_memo, on by default): a table draw takes the variant, the draw
+// KYTY_TABLE_MEMO (live table_memo, default off): a table draw takes the variant, the draw
 // state and the image set its pair and state key drew with last (TableXpr::memo), not the variant find, the states find
 // and the set lookup; the set's validation still runs. (Live: an entry holds only while memo_epoch does, which moves on
 // or off.)
 static bool TableMemoOn() {
-	static auto& on = LiveSwitch::Find("table_memo", 1);
+	static auto& on = LiveSwitch::Find("table_memo", 0);
 	return on.load(std::memory_order_relaxed) != 0;
 }
 // KYTY_TABLE_MEMO_VERIFY (live table_memo_verify N, default 0): every Nth memo hit (TableTry), the variant and the draw

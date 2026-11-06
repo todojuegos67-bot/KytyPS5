@@ -695,13 +695,14 @@ bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t 
 }
 
 void TextureCache::MoveRegistrationSerials(const Image& image) {
+	if (!ImageSerials::g_on.load(std::memory_order_relaxed)) return; // (KYTY_TABLE_SERIALS off: no serial moves)
 	ImageSerials::Move(image.serial_slot);
 	for (const auto other: FindImagesInRegion(image.info.data.address, image.info.data.size, true))
 		if (const auto* found = m_slot_images.try_get(other)) ImageSerials::Move(found->serial_slot);
 }
 
 void TextureCache::MoveMeta(uint64_t begin, uint64_t end) {
-	{
+	if (ImageSerials::g_on.load(std::memory_order_relaxed)) {
 		const std::lock_guard lock(m_meta_slots_lock);
 		for (auto it = m_meta_slots.lower_bound(begin); it != m_meta_slots.end() && it->first < end; ++it)
 			ImageSerials::Move(it->second);

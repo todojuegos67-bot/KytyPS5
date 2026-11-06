@@ -135,7 +135,7 @@ public:
 	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
-	// KYTY_EAGER_FEEDBACK (live eager_feedback, on by default): GPU thread, the copy-feedback
+	// KYTY_EAGER_FEEDBACK (live eager_feedback, default off: fps flat in PR #300): GPU thread, the copy-feedback
 	// snapshots whose tick has completed are written back to guest memory now (TryGuestReadFromFeedback, as a fault's
 	// read would), before a guest read faults on them. `may_wait`: between guest packets, where a synchronous download
 	// may run (the verify's).
