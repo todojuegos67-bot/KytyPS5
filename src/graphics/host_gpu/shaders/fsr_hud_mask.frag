@@ -40,7 +40,11 @@ const vec2 Directions[8] = vec2[8](vec2(1.0, 0.0), vec2(0.7071, 0.7071), vec2(0.
 
 void main() {
 	vec2 pixel = gl_FragCoord.xy;
-	if (!Hud(pixel)) discard; // (the copy as it is)
+	// (The copy as it is, written rather than discarded: at Vulkan 1.3 a discard is a demote, a device feature.)
+	if (!Hud(pixel)) {
+		color = vec4(texture(source, pixel / p.extent).rgb, 1.0);
+		return;
+	}
 	vec3  sum    = vec3(0.0);
 	float weight = 0.0;
 	for (float radius = 4.0; radius <= 512.0 && weight < 3.0; radius *= 2.0) {

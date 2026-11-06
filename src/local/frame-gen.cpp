@@ -149,6 +149,11 @@ float AsFloat(uint32_t word) {
 	return value;
 }
 
+bool HasStencil(vk::Format format) {
+	return format == vk::Format::eD16UnormS8Uint || format == vk::Format::eD24UnormS8Uint ||
+	       format == vk::Format::eD32SfloatS8Uint;
+}
+
 bool IsDepthFormat(vk::Format format) {
 	switch (format) {
 		case vk::Format::eD16Unorm:
@@ -261,9 +266,12 @@ void BlitInto(vk::CommandBuffer command, Image& source, VulkanImage& target) {
 void CopyInto(vk::CommandBuffer command, Image& source, VulkanImage& target) {
 	const auto aspect = IsDepthFormat(source.backing.format) ? vk::ImageAspectFlagBits::eDepth
 	                                                         : vk::ImageAspectFlagBits::eColor;
+	// (Copied is the depth; a barrier on an image with stencil too takes both.)
+	const vk::ImageAspectFlags whole = HasStencil(target.format) ? vk::ImageAspectFlags(aspect) | vk::ImageAspectFlagBits::eStencil
+	                                                             : vk::ImageAspectFlags(aspect);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
-	Transition(command, target, aspect, vk::ImageLayout::eTransferDstOptimal,
+	Transition(command, target, whole, vk::ImageLayout::eTransferDstOptimal,
 	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
 	vk::ImageCopy copy {};
 	copy.srcSubresource = {aspect, 0, 0, 1};
@@ -271,7 +279,7 @@ void CopyInto(vk::CommandBuffer command, Image& source, VulkanImage& target) {
 	copy.extent         = target.extent;
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, target.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
-	Transition(command, target, aspect, vk::ImageLayout::eShaderReadOnlyOptimal,
+	Transition(command, target, whole, vk::ImageLayout::eShaderReadOnlyOptimal,
 	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
 }
 
@@ -295,7 +303,8 @@ void ZeroStaticRect(vk::CommandBuffer command, VulkanImage& motion, vk::ImageVie
 		return;
 	}
 	Transition(command, motion, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eColorAttachmentOptimal,
-	           vk::AccessFlagBits2::eColorAttachmentWrite, vk::PipelineStageFlagBits2::eColorAttachmentOutput);
+	           vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
+	           vk::PipelineStageFlagBits2::eColorAttachmentOutput);
 	vk::RenderingAttachmentInfo color {};
 	color.imageView   = view;
 	color.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
@@ -749,6 +758,7 @@ void FsrStopFrameGeneration() {
 	config.swapChain              = static_cast<VkSwapchainKHR>(s.swapchain);
 	config.frameGenerationEnabled = false;
 	config.frameID                = ++s.frame_id;
+	DeviceQueuesGuard queues(*s.graphics);
 	(void)s.api.Configure(&s.fg_context, &config.header);
 }
 
@@ -756,7 +766,10 @@ void FsrDestroyFrameGeneration() {
 	auto& s = g_fsr_state;
 	if (s.fg_context == nullptr) return;
 	FsrStopFrameGeneration();
-	(void)s.api.DestroyContext(&s.fg_context, nullptr);
+	{
+		DeviceQueuesGuard queues(*s.graphics);
+		(void)s.api.DestroyContext(&s.fg_context, nullptr);
+	}
 	s.fg_context = nullptr;
 	s.mode_on    = false;
 }
@@ -782,9 +795,12 @@ bool FsrEnsureFrameGeneration(vk::Extent2D render) {
 	s.max_render            = {std::max(render.width, s.display.width), std::max(render.height, s.display.height)};
 	create.maxRenderSize    = {s.max_render.width, s.max_render.height};
 	create.backBufferFormat = ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(s.format));
-	if (!FsrOk(s.api.CreateContext(&s.fg_context, &create.header, nullptr), "frame generation context")) {
-		s.fg_context = nullptr;
-		return false;
+	{
+		DeviceQueuesGuard queues(*s.graphics);
+		if (!FsrOk(s.api.CreateContext(&s.fg_context, &create.header, nullptr), "frame generation context")) {
+			s.fg_context = nullptr;
+			return false;
+		}
 	}
 	LOGF("frame generation: FSR context %ux%u, render up to %ux%u\n", s.display.width, s.display.height,
 	     s.max_render.width, s.max_render.height);
@@ -833,10 +849,8 @@ struct FsrRuntimeUpscaler {
 
 	void Destroy(GraphicContext& graphics) {
 		if (context == nullptr) return;
-		{
-			Common::LockGuard lock(graphics.queue_mutex);
-			(void)graphics.queue.waitIdle();
-		}
+		DeviceQueuesGuard queues(graphics);
+		(void)graphics.queue.waitIdle();
 		(void)g_fsr_state.api.DestroyContext(&context, nullptr);
 		context = nullptr;
 	}
@@ -867,9 +881,12 @@ struct FsrRuntimeUpscaler {
 		create.maxRenderSize  = {render.width, render.height};
 		create.maxUpscaleSize = {display.width, display.height};
 		create.fpMessage      = FsrMessage;
-		if (const auto code = g_fsr_state.api.CreateContext(&context, &create.header, nullptr); code != FFX_API_RETURN_OK) {
-			context = nullptr;
-			return Fail("upscaling context", code);
+		{
+			DeviceQueuesGuard queues(graphics);
+			if (const auto code = g_fsr_state.api.CreateContext(&context, &create.header, nullptr); code != FFX_API_RETURN_OK) {
+				context = nullptr;
+				return Fail("upscaling context", code);
+			}
 		}
 		reset = true;
 		std::printf("Super resolution: AMD FSR %s %ux%u -> %ux%u (AMD's runtime%s)\n", FsrProvider(&context).c_str(),
@@ -1115,8 +1132,9 @@ bool FsrHudSetup(GraphicContext& graphics, vk::Format format, vk::Extent2D exten
 			create.format        = format;
 			create.tiling        = vk::ImageTiling::eOptimal;
 			create.initialLayout = vk::ImageLayout::eUndefined;
-			create.usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eColorAttachment |
-			               vk::ImageUsageFlagBits::eSampled;
+			// (The source of a copy too: FSR's frame generation copies the HUD-less image it is given.)
+			create.usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
+			               vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled;
 			create.sharingMode = vk::SharingMode::eExclusive;
 			create.samples     = vk::SampleCountFlagBits::e1;
 			if (!graphics.CreateImage(create, h.images[i])) {
@@ -1276,11 +1294,6 @@ bool LoadBridge() {
 	            KYTY_DLSS_BRIDGE_LIBRARY);
 	std::fflush(stdout);
 	return false;
-}
-
-bool HasStencil(vk::Format format) {
-	return format == vk::Format::eD16UnormS8Uint || format == vk::Format::eD24UnormS8Uint ||
-	       format == vk::Format::eD32SfloatS8Uint;
 }
 
 KytyDlssImage BridgeImage(const UpscaleImage& image, vk::ImageAspectFlags aspect) {
@@ -2946,9 +2959,12 @@ vk::Result CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateIn
 	version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_VK;
 	version.version     = FFX_FRAMEGENERATION_SWAPCHAIN_VK_VERSION;
 	if (s.sdk2) create.header.pNext = &version.header;
-	if (!FsrOk(s.api.CreateContext(&s.swapchain_context, &create.header, nullptr), "swapchain")) {
-		s.swapchain_context = nullptr;
-		return vk::Result::eErrorInitializationFailed;
+	{
+		DeviceQueuesGuard queues(graphics);
+		if (!FsrOk(s.api.CreateContext(&s.swapchain_context, &create.header, nullptr), "swapchain")) {
+			s.swapchain_context = nullptr;
+			return vk::Result::eErrorInitializationFailed;
+		}
 	}
 	s.functions             = {};
 	s.functions.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
@@ -2992,6 +3008,8 @@ void DestroySwapchain(GraphicContext& graphics, vk::SwapchainKHR swapchain) {
 	// and the HUD-less images its interpolation reads. Freed before the swapchain, they could still be in use: on an RTX
 	// 5090 an F11 back to the window, frame generation on at 5120x2160 since a load, lost the device, and an F11 in the
 	// main menu froze the picture while the game ran on (issue #174).
+	// All of it with the device's queues held: FSR's runtime waits for the whole device in here (DeviceQueuesGuard).
+	DeviceQueuesGuard queues(graphics);
 	FsrStopFrameGeneration();
 	vk::SwapchainKHR left = nullptr; // FSR SDK 2's swapchain, which its context leaves
 	if (s.swapchain_context != nullptr) {
@@ -3090,7 +3108,8 @@ void RecordPrepare(GraphicContext& graphics, vk::CommandBuffer command, const Fr
 	bool mode_on      = s.mode_on ? s.run_without < FsrTurnOffAfter : s.run_with >= FsrTurnOnAfter;
 	if (mode_on && usable && !FsrEnsureFrameGeneration(inputs->render_extent)) mode_on = false;
 	if (s.fg_context == nullptr) return; // (no frame with inputs yet: the swapchain presents as it is)
-	if (mode_on != s.mode_on) {
+	const bool toggled = mode_on != s.mode_on;
+	if (toggled) {
 		if (mode_on) std::printf("Frame generation: FSR on\n");
 		else std::printf("Frame generation: FSR off: frames without inputs (%s)\n", MissingInputs());
 		std::fflush(stdout);
@@ -3130,7 +3149,12 @@ void RecordPrepare(GraphicContext& graphics, vk::CommandBuffer command, const Fr
 	config.generationRect                     = {region.offset.x, region.offset.y, static_cast<int32_t>(region.extent.width),
 	                                             static_cast<int32_t>(region.extent.height)};
 	config.frameID                            = id;
-	if (!FsrOk(s.api.Configure(&s.fg_context, &config.header), "configure") || !mode_on) return;
+	{
+		// (Generation turned on or off, FSR's runtime waits for the whole device: DeviceQueuesGuard.)
+		std::optional<DeviceQueuesGuard> queues;
+		if (toggled) queues.emplace(graphics);
+		if (!FsrOk(s.api.Configure(&s.fg_context, &config.header), "configure") || !mode_on) return;
+	}
 
 	const auto camera = FsrDecompose(inputs->camera.view_proj);
 	const float width  = static_cast<float>(inputs->render_extent.width);

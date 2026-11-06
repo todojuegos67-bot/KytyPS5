@@ -49,6 +49,7 @@ public:
 		VkSemaphore            signal;
 		uint64_t               signal_value;
 		std::atomic<uint64_t>* handed; // (the queue's: the last value its submissions handed to the driver)
+		Common::Mutex*         mutex;  // (GraphicContext::readback_queue_mutex)
 	};
 	template <typename Dispatch>
 	static void Submit(const SubmitPacket& packet, const Dispatch& dispatch) {
@@ -69,8 +70,11 @@ public:
 		submit.pCommandBuffers      = &packet.command;
 		submit.signalSemaphoreCount = 1;
 		submit.pSignalSemaphores    = &packet.signal;
-		Check(Libs::Graphics::AntiLag::QueueSubmit(packet.queue, submit, dispatch.vkQueueSubmit, dispatch.vkQueueSubmit2),
-		      "submit readback copy");
+		{
+			Common::LockGuard lock(*packet.mutex);
+			Check(Libs::Graphics::AntiLag::QueueSubmit(packet.queue, submit, dispatch.vkQueueSubmit, dispatch.vkQueueSubmit2),
+			      "submit readback copy");
+		}
 		packet.handed->store(packet.signal_value, std::memory_order_release);
 		LiveTrace::Event(LiveTrace::RbSubmit, packet.signal_value, 0);
 	}
@@ -131,7 +135,8 @@ public:
 #else
 	      d(VULKAN_HPP_DEFAULT_DISPATCHER),
 #endif
-	      m_device(graphics.device), m_queue(graphics.readback_queue), m_direct_copies(DirectCopies(graphics)) {
+	      m_device(graphics.device), m_queue(graphics.readback_queue), m_queue_mutex(&graphics.readback_queue_mutex),
+	      m_direct_copies(DirectCopies(graphics)) {
 		VkCommandPoolCreateInfo pool {};
 		pool.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 		pool.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
@@ -174,7 +179,7 @@ public:
 		m_used[index]  = value;
 		m_waits[index] = {timeline, wait_value};
 		LiveTrace::Event(LiveTrace::RbEnqueue, value, wait_value);
-		const SubmitPacket packet {m_queue, command, timeline, wait_value, m_semaphore, value, &m_handed};
+		const SubmitPacket packet {m_queue, command, timeline, wait_value, m_semaphore, value, &m_handed, m_queue_mutex};
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		const bool direct = wait_done && m_direct_copies && m_handed.load(std::memory_order_acquire) == value - 1;
 		if (direct) m_worker_records = false;
@@ -262,6 +267,7 @@ private:
 	const vk::detail::DispatchLoaderDynamic& d;
 	VkDevice                                 m_device;
 	VkQueue                                  m_queue;
+	Common::Mutex*                           m_queue_mutex;
 	VkCommandPool                            m_pool      = VK_NULL_HANDLE;
 	VkSemaphore                              m_semaphore = VK_NULL_HANDLE;
 	std::array<VkCommandBuffer, Buffers>     m_commands {};
