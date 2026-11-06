@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -284,6 +285,9 @@ void DestroyFrameGeneration() {
 		ffxConfigureDescFrameGeneration off {};
 		off.header.type            = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
 		off.frameGenerationEnabled = false;
+		// (upstream 50f1f4f65, issue #174) The device's queues held: AMD's runtime waits for the whole device here.
+		std::optional<DeviceQueuesGuard> queues;
+		if (g_graphics != nullptr) queues.emplace(*g_graphics);
 		g_ffx.Configure(&g_fg_context, &off.header);
 		g_ffx.DestroyContext(&g_fg_context, nullptr);
 		g_fg_context = nullptr;
@@ -313,7 +317,11 @@ bool CreateFrameGeneration(GraphicContext& graphics, vk::Extent2D display, vk::E
 	create.displaySize      = {display.width, display.height};
 	create.maxRenderSize    = {render.width, render.height};
 	create.backBufferFormat = ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(format));
-	const auto result       = g_ffx.CreateContext(&g_fg_context, &create.header, nullptr);
+	ffxReturnCode_t result = 0;
+	{
+		DeviceQueuesGuard queues(graphics); // (upstream 50f1f4f65: AMD's runtime waits for the whole device here)
+		result = g_ffx.CreateContext(&g_fg_context, &create.header, nullptr);
+	}
 	if (result != FFX_API_RETURN_OK) {
 		std::printf("FSR3 FG: frame generation context not created (%u): generation stays off\n", result);
 		std::fflush(stdout);
@@ -344,7 +352,8 @@ bool EnsurePresentHudless(GraphicContext& graphics, vk::Extent2D extent, vk::For
 	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+	// (upstream 50f1f4f65) The source of a copy too: FSR's frame generation copies the HUD-less image it is given.
+	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, g_present_hudless)) {
@@ -756,7 +765,11 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 		logged = true;
 		std::fflush(stdout);
 	}
-	const auto result        = g_ffx.CreateContext(&g_swapchain_context, &create.header, nullptr);
+	ffxReturnCode_t result = 0;
+	{
+		DeviceQueuesGuard queues(graphics); // (upstream 50f1f4f65: AMD's runtime waits for the whole device here)
+		result = g_ffx.CreateContext(&g_swapchain_context, &create.header, nullptr);
+	}
 	if (result != FFX_API_RETURN_OK || swapchain == VK_NULL_HANDLE) {
 		std::printf("FSR3 FG: frame generation swapchain not created (%u): frame generation off\n", result);
 		std::fflush(stdout);
@@ -781,7 +794,10 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 	    g_functions.pOutGetSwapchainImagesKHR == nullptr) {
 		std::printf("FSR3 FG: no replacement swapchain functions: frame generation off\n");
 		std::fflush(stdout);
-		g_ffx.DestroyContext(&g_swapchain_context, nullptr);
+		{
+			DeviceQueuesGuard queues(graphics);
+			g_ffx.DestroyContext(&g_swapchain_context, nullptr);
+		}
 		g_swapchain_context = nullptr;
 		g_requested         = false;
 		return false;
@@ -793,9 +809,11 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 	return true;
 }
 
-void DestroySwapchain(GraphicContext& /*graphics*/, vk::SwapchainKHR /*swapchain*/) {
+void DestroySwapchain(GraphicContext& graphics, vk::SwapchainKHR /*swapchain*/) {
 	std::lock_guard lock(g_mutex);
 	if (g_swapchain_context == nullptr) return;
+	// (upstream 50f1f4f65, issue #174) All of it with the device's queues held: AMD's runtime waits for the whole device.
+	DeviceQueuesGuard queues(graphics);
 	// The frame generation context first (the swapchain calls it while presenting); destroying the swapchain's
 	// context destroys its swapchain. The next CreateSwapchain makes both again.
 	DestroyFrameGeneration();
@@ -1044,6 +1062,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	if (g_up_context == nullptr || desc.render.width > g_up_render.width || desc.render.height > g_up_render.height ||
 	    desc.upscale.width != g_up_output.width || desc.upscale.height != g_up_output.height) {
 		if (g_up_context != nullptr) {
+			DeviceQueuesGuard queues(graphics); // (upstream 50f1f4f65)
 			graphics.device.waitIdle(); // (a size change: the context's resources are released)
 			g_up_ffx->DestroyContext(&g_up_context, nullptr);
 			g_up_context = nullptr;
@@ -1092,7 +1111,11 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 				create.maxRenderSize  = {desc.render.width, desc.render.height};
 				create.maxUpscaleSize = {desc.upscale.width, desc.upscale.height};
 				create.fpMessage      = &Message;
-				const auto result     = g_ffx24.CreateContext(&g_up_context, &create.header, nullptr);
+				ffxReturnCode_t result = 0;
+				{
+					DeviceQueuesGuard queues(graphics); // (upstream 50f1f4f65)
+					result = g_ffx24.CreateContext(&g_up_context, &create.header, nullptr);
+				}
 				if (result == FFX_API_RETURN_OK && g_up_context != nullptr) {
 					ffxQueryGetProviderVersion provider {};
 					provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
@@ -1142,7 +1165,11 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		create.maxRenderSize  = {desc.render.width, desc.render.height};
 		create.maxUpscaleSize = {desc.upscale.width, desc.upscale.height};
 		create.fpMessage      = &Message;
-		const auto result     = g_ffx.CreateContext(&g_up_context, &create.header, nullptr);
+		ffxReturnCode_t result = 0;
+		{
+			DeviceQueuesGuard queues(graphics); // (upstream 50f1f4f65)
+			result = g_ffx.CreateContext(&g_up_context, &create.header, nullptr);
+		}
 		if (result != FFX_API_RETURN_OK) {
 			std::printf("FSR3 upscaling: context not created (%u): upscaling off\n", result);
 			std::fflush(stdout);
@@ -1369,7 +1396,14 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	config.onlyPresentGenerated = false;
 	config.generationRect       = {0, 0, static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height)};
 	config.frameID              = g_frame_id;
-	if (const auto result = g_ffx.Configure(&g_fg_context, &config.header); result != FFX_API_RETURN_OK) {
+	ffxReturnCode_t configured = 0;
+	{
+		// (upstream 50f1f4f65) Generation turned on or off: AMD's runtime waits for the whole device.
+		std::optional<DeviceQueuesGuard> queues;
+		if (generate != g_generating) queues.emplace(graphics);
+		configured = g_ffx.Configure(&g_fg_context, &config.header);
+	}
+	if (const auto result = configured; result != FFX_API_RETURN_OK) {
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1) < 8) {
 			std::printf("FSR3 FG: configure failed (%u)\n", result);

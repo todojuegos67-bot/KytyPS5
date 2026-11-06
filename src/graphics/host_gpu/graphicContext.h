@@ -89,6 +89,7 @@ struct GraphicContext {
 	// copies (src/local/readback-queue.h); buffers are then shared with its family.
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
 	vk::Queue                          readback_queue  = nullptr;
+	Common::Mutex                      readback_queue_mutex; // (DeviceQueuesGuard; one thread submits at a time)
 	// Windows: a second queue of the graphics family used only for vkQueuePresentKHR. The
 	// driver can block a present in the kernel until earlier GPU work on its queue is done;
 	// on the graphics queue that held queue_mutex against the very submissions that work
@@ -212,6 +213,19 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+};
+
+// (upstream 50f1f4f65) Every queue the emulator submits to, held: a call that waits for the whole device (vkDeviceWaitIdle,
+// as AMD's FSR runtime does making and destroying its contexts) wants them left alone (issue #174: a device lost at F11).
+class DeviceQueuesGuard {
+public:
+	// NOLINTNEXTLINE(google-runtime-references)
+	explicit DeviceQueuesGuard(GraphicContext& graphics)
+	    : m_queue(graphics.queue_mutex), m_readback(graphics.readback_queue_mutex), m_present(graphics.present_queue_mutex) {}
+	KYTY_CLASS_NO_COPY(DeviceQueuesGuard);
+
+private:
+	Common::LockGuard m_queue, m_readback, m_present;
 };
 
 struct VulkanImageState {

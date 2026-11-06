@@ -45,6 +45,7 @@ public:
 		uint64_t        wait_value;
 		VkSemaphore     signal;
 		uint64_t        signal_value;
+		Common::Mutex*  mutex; // (GraphicContext::readback_queue_mutex: DeviceQueuesGuard; one thread submits at a time)
 	};
 	template <typename Dispatch>
 	static void Submit(const SubmitPacket& packet, const Dispatch& dispatch) {
@@ -65,6 +66,7 @@ public:
 		submit.pCommandBuffers      = &packet.command;
 		submit.signalSemaphoreCount = 1;
 		submit.pSignalSemaphores    = &packet.signal;
+		Common::LockGuard lock(*packet.mutex);
 		Check(dispatch.vkQueueSubmit(packet.queue, 1, &submit, VK_NULL_HANDLE), "submit readback copy");
 	}
 	// The copy's commands: an earlier copy on this queue may target the same download slot (a detached request).
@@ -116,7 +118,7 @@ public:
 #else
 	      d(VULKAN_HPP_DEFAULT_DISPATCHER),
 #endif
-	      m_device(graphics.device), m_queue(graphics.readback_queue) {
+	      m_device(graphics.device), m_queue(graphics.readback_queue), m_queue_mutex(&graphics.readback_queue_mutex) {
 		VkCommandPoolCreateInfo pool {};
 		pool.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 		pool.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
@@ -154,7 +156,7 @@ public:
 		if (m_used[index] != 0) Wait(m_used[index]);
 		m_used[index]  = value;
 		m_waits[index] = {timeline, wait_value};
-		const SubmitPacket packet {m_queue, command, timeline, wait_value, m_semaphore, value};
+		const SubmitPacket packet {m_queue, command, timeline, wait_value, m_semaphore, value, m_queue_mutex};
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// With deferred submits the worker records the command buffer too: the driver calls leave the GPU thread
 		// (~1.3% of it at 1-1, ~50 readbacks a frame).
@@ -240,6 +242,7 @@ private:
 	const vk::detail::DispatchLoaderDynamic& d;
 	VkDevice                                 m_device;
 	VkQueue                                  m_queue;
+	Common::Mutex*                           m_queue_mutex;
 	VkCommandPool                            m_pool      = VK_NULL_HANDLE;
 	VkSemaphore                              m_semaphore = VK_NULL_HANDLE;
 	std::array<VkCommandBuffer, Buffers>     m_commands {};
