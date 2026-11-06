@@ -21,6 +21,7 @@ void SetMouseToJoystick(int joystick);
 void SetMouseParams(float mouse_deadzone_offset, float mouse_speed, float mouse_speed_offset);
 void SetMouseGyroRollMode(bool mode);
 void SetMouseInvertY(bool invert);
+bool MouseInvertY(); // (bb-kbmcam-142)
 void SetMouseSensitivity(float s); // (bb-input-137) 0: the config's mouse speed
 float GetMouseSensitivity(); // (bb-menu-133) mouse-look: mouse up = stick down
 

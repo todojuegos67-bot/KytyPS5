@@ -27,6 +27,9 @@ bool OnSdlEvent(SDL_Event& event);
 
 bool IsOpen();
 
+// (bb-kbmcam-142) "Jugar con teclado y ratón" (bb_menu.ini kbm_play) is on.
+bool KbmPlay();
+
 // (bb-menu-121) Adds the menu's fonts (menu_assets\fonts) to the ImGui atlas. Called once from
 // ImGui::Core::Initialize, after the default fonts.
 void LoadFonts();
