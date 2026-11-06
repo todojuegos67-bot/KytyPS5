@@ -52,13 +52,13 @@ PipelineBinaries::Key KeyOf(const VkPipelineBinaryKeyKHR& key) {
 }
 
 #if defined(__linux__) && defined(__x86_64__)
-// KYTY_PIPELINE_KEY_THUNK=1 (default 0): vkGetPipelineKeyKHR through a thunk that keeps the callee-saved registers in its
-// own frame. NVIDIA 620.70.06 builds the global key (no create info) from 27 words in a stack buffer with room for 26:
-// the 27th, a 0/1 flag, lands on its own saved rbx, so the caller's rbx came back with its low 32 bits replaced
-// (Signature kept its result there: a SIGSEGV ~1 s into every boot, this = 0x7ffd00000000; core of 11-06, the driver's
-// global-key path and its word list read from it). The thunk restores rbx, rbp and r12-r15 from its own slots, out of
-// the driver's reach, whichever of them a driver build's overflow lands on. (Entry rsp is 8 mod 16: six pushes and 8
-// bytes make the call's alignment. Direct calls only; endbr64 for an indirect one under CET.)
+// KYTY_PIPELINE_KEY_THUNK (default 1, 0: a direct call): vkGetPipelineKeyKHR through a thunk that keeps the callee-saved
+// registers in its own frame. NVIDIA 620.70.06 builds the global key (no create info) from 27 words in a stack buffer with
+// room for 26: the 27th, a 0/1 flag, lands on its own saved rbx, so the caller's rbx came back with its low 32 bits replaced
+// (Signature kept its result there: a SIGSEGV ~1 s into every boot, this = 0x7ffd00000000; PR #308). The thunk restores
+// rbx, rbp and r12-r15 from its own slots, out of the driver's reach, whichever of them a driver build's overflow lands on;
+// a driver without the fault sees the same call. (Entry rsp is 8 mod 16: six pushes and 8 bytes make the call's alignment.
+// Direct calls only; endbr64 for an indirect one under CET.)
 [[gnu::naked]] VkResult CallPipelineKeySaving(PFN_vkGetPipelineKeyKHR /*fn*/, VkDevice /*device*/,
                                               const VkPipelineCreateInfoKHR* /*info*/, VkPipelineBinaryKeyKHR* /*key*/) {
 	asm("endbr64\n\t"
@@ -87,9 +87,7 @@ PipelineBinaries::Key KeyOf(const VkPipelineBinaryKeyKHR& key) {
 bool UseKeyThunk() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_PIPELINE_KEY_THUNK");
-		const bool  set   = value != nullptr && value[0] == '1';
-		if (set) std::printf("Pipeline binaries: pipeline keys through the register-keeping thunk (KYTY_PIPELINE_KEY_THUNK=1)\n");
-		return set;
+		return value == nullptr || value[0] != '0';
 	}();
 	return on;
 }
