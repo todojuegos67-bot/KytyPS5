@@ -356,6 +356,9 @@ int main(int argc, char* argv[]) {
 	const bool done     = merge ? PipelineCache::MergePrecompileShards(graphics, prune, keep, stamp)
 	                            : PipelineCache::Precompile(graphics, options, left_out);
 	std::printf("Shader precompile: %s\n", !done ? "failed" : left_out != 0 ? "partial" : "complete");
+	// (Not in left_out: its exit 3 runs a shard again as two, and the driver would refuse them there too. Issue #305.)
+	if (const auto refused = Libs::Graphics::PipelinesRefused(); refused != 0)
+		std::printf("Shader precompile: the driver refused %zu pipelines of this run: the game stops at the first it needs\n", refused);
 	std::fflush(nullptr);
 	// 3: pipelines' binaries were left out (PipelineBinaryWriter), or the shard stopped at its capture cap: run it as two.
 	std::_Exit(!done ? 1 : left_out != 0 ? 3 : 0);

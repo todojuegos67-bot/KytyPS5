@@ -256,7 +256,7 @@ private:
 	void                      MoveMeta(uint64_t address) { MoveMeta(address, address + 1); }
 	// A registered image's metadata address in m_meta_slots (`add` false: out of it).
 	void                      NoteMetaSlot(const Image& image, bool add);
-	// Every m_meta_slots entry of `slot` out (its image unregistered: NoteMetaUse's entries too).
+	// Every m_meta_slots entry of `slot` out (its image gone: NoteMetaUse's entries too).
 	void                      ForgetMetaSlot(uint32_t slot);
 	void                      DeleteImage(ImageId id);
 	// DeleteImage's halves: out of every index (false: it was not registered), then destroyed once no recorded work

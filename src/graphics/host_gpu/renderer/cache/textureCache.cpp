@@ -722,12 +722,8 @@ void TextureCache::NoteMetaUse(uint64_t address, uint32_t slot) {
 void TextureCache::NoteMetaSlot(const Image& image, bool add) {
 	const auto address = image.info.metadata.range.address;
 	if (image.info.metadata.kind == ImageMetadataKind::None || address == 0) return;
+	if (add) return NoteMetaUse(address, image.serial_slot); // (A parked image taken back holds its entry already.)
 	const std::lock_guard lock(m_meta_slots_lock);
-	if (add) {
-		m_meta_slots.emplace(address, image.serial_slot);
-		m_meta_by_slot[image.serial_slot].push_back(address);
-		return;
-	}
 	for (auto [it, end] = m_meta_slots.equal_range(address); it != end; ++it)
 		if (it->second == image.serial_slot) {
 			m_meta_slots.erase(it);
@@ -738,8 +734,9 @@ void TextureCache::NoteMetaSlot(const Image& image, bool add) {
 		}
 }
 
-// KYTY_TABLE_SERIALS: every metadata entry of a slot whose image leaves (its own, NoteMetaSlot, and each view's a table
-// draw noted, NoteMetaUse): none would move the serial of an image there, and a new image in the slot notes its own.
+// KYTY_TABLE_SERIALS: every metadata entry of a slot whose image is gone (its own, NoteMetaSlot, and each view's a table
+// draw noted, NoteMetaUse): none would move the serial of an image there, and a new image in the slot notes its own. Not
+// at an unregistration: a parked image comes back (TakeParkedImage) to the sets that hold it, which note no view again.
 void TextureCache::ForgetMetaSlot(uint32_t slot) {
 	const std::lock_guard lock(m_meta_slots_lock);
 	const auto            found = m_meta_by_slot.find(slot);
@@ -793,7 +790,6 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
 	MoveRegistrationSerials(image); // (KYTY_TABLE_SERIALS)
-	ForgetMetaSlot(image.serial_slot);
 	++m_image_granule_releases;
 	UntrackImage(id, "unregister");
 	ImagePageTable::PageRange pages {};
@@ -5087,6 +5083,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 
 void TextureCache::EraseSlot(ImageId id) {
 	ImageSerials::Move(m_slot_images[id].serial_slot);
+	ForgetMetaSlot(m_slot_images[id].serial_slot);
 	m_slot_images.erase(id);
 	m_erase_epoch.fetch_add(1, std::memory_order_release);
 }

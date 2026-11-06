@@ -83,6 +83,8 @@ public:
 		m_head.fetch_add(0, std::memory_order_seq_cst);
 		m_head.notify_all();
 		m_thread.join();
+		// (The wake below reads as a post: no jobs in it. The worker is gone and the second thread idle.)
+		m_lane_jobs[1].clear();
 		m_lane_posted.fetch_add(1, std::memory_order_seq_cst);
 		m_lane_posted.notify_all();
 		if (m_lane_thread.joinable()) m_lane_thread.join();
