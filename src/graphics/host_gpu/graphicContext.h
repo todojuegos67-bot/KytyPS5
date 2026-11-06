@@ -78,6 +78,8 @@ struct GraphicContext {
 	// its identity (pipelineCacheBlobs.h); in the precompile, its output.
 	const PipelineCacheBlobs*          pipeline_blobs                        = nullptr;
 	PipelineCacheBlobWriter*           pipeline_blob_writer                  = nullptr;
+	// A precompile is making pipelines: one the driver refuses is left out (shaders.cpp PipelineRefused).
+	bool                               precompiling                          = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

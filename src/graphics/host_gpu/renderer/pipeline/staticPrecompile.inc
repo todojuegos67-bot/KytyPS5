@@ -637,6 +637,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	// pipeline cache data goes to the shard file (pipelineCacheBlobs.h), copied from the store's blobs or made.
 	const bool binaries = create_pipelines && m_graphics.pipeline_binaries_enabled;
 	const bool blobs    = create_pipelines && !binaries && StaticBlobsMode(m_graphics);
+	m_graphics.precompiling = create_pipelines;
 	std::unique_ptr<PipelineBinaryWriter>    writer;
 	std::unique_ptr<PipelineCacheBlobWriter> blob_writer;
 	if (binaries) {
@@ -1077,6 +1078,9 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		                 stuck_out);
 	left_out = (writer != nullptr ? writer->LeftOut() : 0) + (blob_writer != nullptr ? blob_writer->LeftOut() : 0) +
 	           capped.load();
+	if (const auto refused = PipelinesRefused(); refused != 0)
+		PipelineCacheLog("Shader seeds: {} pipelines left out: the driver refused them (the lines above name them)", refused);
+	m_graphics.precompiling           = false;
 	m_graphics.pipeline_binary_writer = nullptr;
 	m_graphics.pipeline_blob_writer   = nullptr;
 	if (!args.timings.empty()) {

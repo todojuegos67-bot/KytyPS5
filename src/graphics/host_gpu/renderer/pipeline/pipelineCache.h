@@ -539,6 +539,8 @@ void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pi
 // unoptimized (Fast: Pipeline::unoptimized); Optimize compiles the optimized build of a Fast one (its
 // layouts given, `pipeline` null).
 enum class PipelineBuild { Full, Fast, Optimize };
+// The pipelines a precompile left out so far: the driver refused them (shaders.cpp).
+size_t PipelinesRefused();
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
