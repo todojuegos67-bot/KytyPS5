@@ -29,9 +29,21 @@ void PerfLine(int frames_in_flight, int frames_total);
 // Draw/Dispatch total; nested parts: pipeline lookup, BindResources (buffers + textures inside),
 // buffer cache ObtainBuffer, texture cache FindImage/FindTexture, BB camera scan, object motion,
 // render setup + command recording (BeginRendering, vertex/index, barriers, dynamic state, cmds).
-enum CpCat : int { CpDraw, CpPipe, CpBind, CpBuf, CpTex, CpScan, CpObjMv, CpRec, CpCount };
+// bb-perf-132: + render-target lookup (PrepareRenderState), BB constant patch scan (inside bind),
+// BB sample hooks (upscale / HUD per sampled image, inside bind), samplers (inside bind).
+enum CpCat : int {
+    CpDraw, CpPipe, CpBind, CpBuf, CpTex, CpScan, CpObjMv, CpRec,
+    CpPrep, CpPatch, CpHook, CpSamp, CpCount
+};
 extern std::atomic<uint64_t> g_cp_ns[CpCount];
 extern std::atomic<uint64_t> g_cp_draws, g_cp_dispatches;
+// bb-perf-132: constant-patch scans (buffers looked at), bytes scanned, buffers rejected by the
+// fast pre-filter, buffers patched.
+extern std::atomic<uint64_t> g_cp_patch_scans, g_cp_patch_bytes, g_cp_patch_fast, g_cp_patch_hits;
+// BB_CP_FASTPATCH=0: the 1.31 constant-patch scan (exact float loop over every buffer).
+bool CpFastPatch();
+// BB_CP_DETAIL=0: no sub-timers for the bb-perf-132 categories (prep/patch/hook/samplers).
+bool CpDetail();
 struct CpTimer {
     using C = std::chrono::steady_clock;
     int cat;

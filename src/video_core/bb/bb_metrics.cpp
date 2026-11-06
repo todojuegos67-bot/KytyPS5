@@ -241,6 +241,21 @@ std::atomic<uint64_t> g_p_wait_n{0}, g_p_wait_us{0};
 } // namespace
 std::atomic<uint64_t> g_cp_ns[CpCount]{};
 std::atomic<uint64_t> g_cp_draws{0}, g_cp_dispatches{0};
+std::atomic<uint64_t> g_cp_patch_scans{0}, g_cp_patch_bytes{0}, g_cp_patch_fast{0},
+    g_cp_patch_hits{0};
+static bool EnvOn(const char* name, bool def) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return def;
+    return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
+}
+bool CpFastPatch() {
+    static const bool on = EnvOn("BB_CP_FASTPATCH", true);
+    return on;
+}
+bool CpDetail() {
+    static const bool on = EnvOn("BB_CP_DETAIL", true);
+    return on;
+}
 void PerfDlss5(double cpu_ms) {
     g_p_d5_n.fetch_add(1, std::memory_order_relaxed);
     g_p_d5_cpu_us.fetch_add(static_cast<uint64_t>(cpu_ms * 1000.0), std::memory_order_relaxed);
@@ -309,6 +324,26 @@ void PerfLine(int frames_in_flight, int frames_total) {
         cp[CpBuf], cp[CpTex], cp[CpScan], cp[CpObjMv], cp[CpRec],
         std::max(0.0, cp[CpDraw] - cp[CpPipe] - cp[CpBind] - cp[CpObjMv] - cp[CpRec]));
     LOG_INFO(Render_Vulkan, "[perf] {}", cpline);
+    {
+        // bb-perf-132: where "other" and the unattributed part of "bind" go.
+        const uint64_t ps = g_cp_patch_scans.exchange(0), pb = g_cp_patch_bytes.exchange(0);
+        const uint64_t pf = g_cp_patch_fast.exchange(0), ph = g_cp_patch_hits.exchange(0);
+        static bool said = false;
+        if (!said) {
+            said = true;
+            LOG_INFO(Render_Vulkan,
+                     "[perf] bb-perf-132 CP options: BB_CP_FASTPATCH={} BB_CP_DETAIL={}",
+                     CpFastPatch() ? 1 : 0, CpDetail() ? 1 : 0);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[perf] cp2 ms/s: render targets {:.0f}, const patch {:.0f} ({:.0f} buffers, "
+                 "{:.1f} MB, {:.0f} fast-rejected, {:.0f} patched, fast {}), bb sample hooks {:.0f}, "
+                 "samplers {:.0f}, bind rest {:.0f}",
+                 cp[CpPrep], cp[CpPatch], ps / wall, pb / wall / 1e6, pf / wall, ph / wall,
+                 CpFastPatch() ? "on" : "off", cp[CpHook], cp[CpSamp],
+                 std::max(0.0, cp[CpBind] - cp[CpBuf] - cp[CpTex] - cp[CpScan] - cp[CpPatch] -
+                                   cp[CpHook] - cp[CpSamp]));
+    }
     LOG_INFO(Render_Vulkan,
              "[perf] {:.0f} fps | threads: {} | GPU cmd processor: {} wait polls, {} sleeps | "
              "present waits {} ({:.1f} ms) | frames in flight {} (max {} of {}) | {}",

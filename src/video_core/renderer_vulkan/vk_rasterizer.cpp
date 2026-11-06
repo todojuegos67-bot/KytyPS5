@@ -261,6 +261,28 @@ bool Rasterizer::BBPatchConstants(const void* data, u64 size, std::vector<u32>& 
     const float w = float(bb_rt_guest_w), h = float(bb_rt_guest_h);
     const float sw = w * bb_rt_scale_x, sh = h * bb_rt_scale_y;
     const auto close_to = [](float a, float b) { return std::fabs(a - b) <= std::fabs(b) * 1e-5f; };
+    BB::Metrics::g_cp_patch_scans.fetch_add(1, std::memory_order_relaxed);
+    BB::Metrics::g_cp_patch_bytes.fetch_add(size, std::memory_order_relaxed);
+    if (BB::Metrics::CpFastPatch()) {
+        // bb-perf-132: integer pre-filter (vectorises): a pair can only start where the first
+        // float is exactly w or near 1/w. The window is twice the exact tolerance, so every index
+        // the exact loop below could patch is a candidate; buffers without one (nearly all) are
+        // rejected here and the exact loop runs unchanged on the rest.
+        const float r = 1.0f / w;
+        const u32 wb = std::bit_cast<u32>(w);
+        const u32 lob = std::bit_cast<u32>(r * (1.0f - 2e-5f));
+        const u32 span = std::bit_cast<u32>(r * (1.0f + 2e-5f)) - lob;
+        const u32* u = static_cast<const u32*>(data);
+        u32 any = 0;
+        for (size_t i = 0; i + 1 < n; ++i) {
+            const u32 x = u[i];
+            any |= static_cast<u32>(x == wb) | static_cast<u32>((x - lob) <= span);
+        }
+        if (!any) {
+            BB::Metrics::g_cp_patch_fast.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
     bool patched = false;
     for (size_t i = 0; i + 1 < n; ++i) {
         const float a = f[i], b = f[i + 1];
@@ -281,6 +303,9 @@ bool Rasterizer::BBPatchConstants(const void* data, u64 size, std::vector<u32>& 
         out[i] = std::bit_cast<u32>(na);
         out[i + 1] = std::bit_cast<u32>(nb);
         ++i;
+    }
+    if (patched) {
+        BB::Metrics::g_cp_patch_hits.fetch_add(1, std::memory_order_relaxed);
     }
     return patched;
 }
@@ -369,7 +394,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
-    PrepareRenderState(pipeline);
+    {
+        std::optional<BB::Metrics::CpTimer> bb_prep_t;
+        if (BB::Metrics::CpDetail()) bb_prep_t.emplace(BB::Metrics::CpPrep);
+        PrepareRenderState(pipeline);
+    }
     if (!BindResources(pipeline)) {
         return;
     }
@@ -1153,11 +1182,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
-                if (std::vector<u32> bb_patched;
-                    bb_rt_guest_w != 0 && !desc.is_written &&
-                    memory->IsValidMapping(vsharp.base_address, size) &&
-                    BBPatchConstants(reinterpret_cast<const void*>(vsharp.base_address), size,
-                                     bb_patched)) {
+                std::vector<u32> bb_patched;
+                bool bb_did_patch = false;
+                if (bb_rt_guest_w != 0 && !desc.is_written) {
+                    std::optional<BB::Metrics::CpTimer> bb_patch_t;
+                    if (BB::Metrics::CpDetail()) bb_patch_t.emplace(BB::Metrics::CpPatch);
+                    bb_did_patch = memory->IsValidMapping(vsharp.base_address, size) &&
+                                   BBPatchConstants(reinterpret_cast<const void*>(vsharp.base_address),
+                                                    size, bb_patched);
+                }
+                if (bb_did_patch) {
                     auto& vk_buffer = buffer_cache.GetStreamBuffer();
                     const u32 bytes = static_cast<u32>(bb_patched.size() * sizeof(u32));
                     const u64 offset = vk_buffer.Copy(bb_patched.data(), bytes, alignment);
@@ -1333,6 +1367,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                       vk::to_string(image.info.pixel_format),
                                       image.info.bb_scaled ? " internal" : ""));
             }
+            std::optional<BB::Metrics::CpTimer> bb_hook_t;
+            if (!is_storage && !image.info.props.is_depth && BB::Metrics::CpDetail() &&
+                (BB::Upscale::Enabled() || BB::Analyze::Enabled())) {
+                bb_hook_t.emplace(BB::Metrics::CpHook);
+            }
             if (!is_storage && !image.info.props.is_depth &&
                 (BB::Upscale::Enabled() || BB::Analyze::Enabled())) {
                 BBNoteSample(image.info.guest_address, image.info.size.width,
@@ -1371,6 +1410,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     bb_hs_twin.emplace_back(image_infos.size(), bb_twin);
                 }
             }
+            bb_hook_t.reset();
             image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
         }
     }
@@ -1394,6 +1434,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    std::optional<BB::Metrics::CpTimer> bb_samp_t;
+    if (!stage.samplers.empty() && BB::Metrics::CpDetail()) bb_samp_t.emplace(BB::Metrics::CpSamp);
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
