@@ -3669,6 +3669,15 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                                   "frame goes through the window / present-time path)"));
             }
         }
+        // 1.29: a scaled frame (the game's whole frame below the window: resolution patch) has no
+        // in-place point (refused as before-HUD mode): its path is the window / HUD point. 1.27's
+        // log locked in-place from 299/300 early frames (before the window size was known), then
+        // every scaled frame was refused in place and kept off the present path: 0 upscaled.
+        if (g_lock == 1 && PresentMode() && !NativeChainLive()) {
+            g_lock = 2;
+            Checkpoint("[path] locked=window for the session: the frame is scaled (game "
+                       "output below the window), the in-place point does not apply (1.29)");
+        }
         if (g_lock == 1) keep_inplace = true;
         if (g_lock == 2) keep_inplace = false;
         if (scene3d) {
