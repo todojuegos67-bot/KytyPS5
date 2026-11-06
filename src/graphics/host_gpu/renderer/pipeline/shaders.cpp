@@ -718,7 +718,7 @@ static double MicrosecondsSince(std::chrono::steady_clock::time_point start) {
 
 // A pipeline the driver refused: the log names its result and the programs. True in a precompile, which leaves it out and
 // goes on (the caller destroys a null one): issue #305, one pipeline an RX Vega 56's driver refused ended its shard, and
-// the retries split the shard 561 ways. The game cannot draw without it and exits.
+// the precompile never finished. The game cannot draw without it and exits.
 static std::atomic<size_t> g_pipelines_refused {0};
 static bool PipelineRefused(const GraphicContext& graphics, vk::Result result, const char* kind, uint64_t hash,
                             uint64_t pixel_hash) {
