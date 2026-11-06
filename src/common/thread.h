@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <string>
+
 #include <chrono>
 #include "common/types.h"
 
@@ -25,6 +27,11 @@ void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
 
 void SetThreadName(void* thread, const char* name);
+
+// bb-dlss5perf-106: named threads are registered (Windows) so a "[perf]" line can report each
+// one's CPU busy % per second. Returns e.g. "GpuCommandProcessor 92%, PresentThread 12%, ..."
+// (the busiest few since the previous call); empty off Windows.
+std::string BBThreadBusyReport(double wall_seconds, int top = 5);
 
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    bool interruptible);

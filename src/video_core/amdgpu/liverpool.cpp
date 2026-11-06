@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -39,6 +42,19 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 #define YIELD_CE() YIELD(ccb_task_name)
 #define YIELD_GFX() YIELD(dcb_task_name)
 #define YIELD_ASC(id) YIELD(acb_task_name[id])
+
+// bb-dlss5perf-106: yields from a wait loop (WaitRegMem / Rewind not yet satisfied). Counted so the
+// command processor can tell a round of queues that only re-polled waits from one that did work,
+// and back off instead of spinning a core at 100% (only touched on the GPU command thread).
+static thread_local u64 bb_wait_yields = 0;
+std::atomic<u64> g_bb_cp_backoffs{0};
+std::atomic<u64> g_bb_cp_wait_yields{0};
+#define YIELD_WAIT_GFX()                                                                           \
+    ++bb_wait_yields;                                                                              \
+    YIELD_GFX()
+#define YIELD_WAIT_ASC(id)                                                                         \
+    ++bb_wait_yields;                                                                              \
+    YIELD_ASC(id)
 
 #define RESUME(task, name)                                                                         \
     FIBER_EXIT;                                                                                    \
@@ -109,11 +125,30 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
+        // bb-dlss5perf-106: rounds over all queues in which every resume only re-polled a wait.
+        u32 idle_rounds = 0;
+        bool round_progress = false;
 
         while (num_submits || num_commands) {
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
+            if (curr_qid == 0) {
+                // A whole round without work: the queues wait on labels the host GPU / present
+                // writes. Spin briefly (lowest latency), then yield the core, then sleep in short
+                // slices on submit_cv (new submits / commands wake it at once). Same order of
+                // execution, only less CPU burnt and no SMT sibling starved.
+                idle_rounds = round_progress ? 0 : idle_rounds + 1;
+                round_progress = false;
+                if (idle_rounds > 4096) {
+                    g_bb_cp_backoffs.fetch_add(1, std::memory_order_relaxed);
+                    std::unique_lock lk{submit_mutex};
+                    submit_cv.wait_for(lk, std::chrono::microseconds(100),
+                                       [this, &stoken] { return num_commands != 0 || stoken.stop_requested(); });
+                } else if (idle_rounds > 64) {
+                    std::this_thread::yield();
+                }
+            }
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -125,7 +160,13 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
+            const u64 waits_before = bb_wait_yields;
             task.resume();
+            if (task.done() || bb_wait_yields == waits_before) {
+                round_progress = true;
+            } else {
+                g_bb_cp_wait_yields.fetch_add(1, std::memory_order_relaxed);
+            }
 
             if (task.done()) {
                 task.destroy();
@@ -794,7 +835,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
                 while (!rewind->Valid()) {
-                    YIELD_GFX();
+                    YIELD_WAIT_GFX();
                 }
                 break;
             }
@@ -812,7 +853,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                    YIELD_WAIT_GFX();
                 }
                 break;
             }
@@ -1019,7 +1060,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             while (!rewind->Valid()) {
-                YIELD_ASC(vqid);
+                YIELD_WAIT_ASC(vqid);
             }
             break;
         }
@@ -1120,7 +1161,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+                YIELD_WAIT_ASC(vqid);
             }
             break;
         }

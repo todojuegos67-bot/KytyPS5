@@ -476,7 +476,19 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
-    const u32 num_images = swapchain.GetImageCount();
+    // bb-dlss5perf-106: the presentation frames were as many as the swapchain images (3 on most
+    // NVIDIA drivers), so GetRenderFrame waited on the GPU fence of the frame before last and the
+    // flip thread stalled on the GPU whenever a frame ran long: CPU and GPU in lock step. At
+    // least 4 now (BB_PRESENT_FRAMES=2..8; frame generation keeps 8 capture slots), so the
+    // CPU records the next flip while the GPU still finishes the previous two.
+    const u32 num_images = [&] {
+        u32 n = std::max<u32>(swapchain.GetImageCount(), 4u);
+        if (const char* v = std::getenv("BB_PRESENT_FRAMES"); v != nullptr && *v != '\0') {
+            n = static_cast<u32>(std::clamp(std::atoi(v), 2, 8));
+        }
+        return n;
+    }();
+    present_frames_total = static_cast<int>(num_images);
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
@@ -1552,6 +1564,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         BB::Metrics::OnPresent();
+        {
+            int in_flight = 0;
+            {
+                std::scoped_lock lk{free_mutex};
+                in_flight = present_frames_total - static_cast<int>(free_queue.size());
+            }
+            BB::Metrics::PerfLine(in_flight, present_frames_total);
+        }
         DebugState.IncFlipFrameNum();
     }
 }
@@ -1561,7 +1581,11 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
+        const auto wait_start = std::chrono::steady_clock::now();
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        BB::Metrics::PerfPresentWait(std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - wait_start)
+                                         .count());
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1578,6 +1602,15 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
+    const auto fence_start = std::chrono::steady_clock::now();
+    const struct FenceTimer {
+        std::chrono::steady_clock::time_point t;
+        ~FenceTimer() {
+            BB::Metrics::PerfPresentWait(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t)
+                    .count());
+        }
+    } fence_timer{fence_start};
     while (wait() != vk::Result::eSuccess) {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");

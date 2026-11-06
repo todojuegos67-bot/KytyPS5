@@ -993,6 +993,7 @@ void ReadTiming(GraphicContext& graphics) {
 		double ms[3];
 		for (int i = 0; i < 3; ++i) ms[i] = static_cast<double>(stamps[i + 1] - stamps[i]) * g.period_ns / 1e6;
 		for (int i = 0; i < 3; ++i) g.sum[i] += ms[i];
+		BB::Metrics::PerfDlss5Gpu(ms[0] + ms[1] + ms[2]);
 		++g.n;
 		const double total = ms[0] + ms[1] + ms[2];
 		if (g.ab_stage < 2) {
@@ -1224,6 +1225,13 @@ bool Apply(const SR::Desc& desc) {
 		Say("DLSS 5: off for this session (see the lines above); the upscaler's picture as usual");
 		return false;
 	}
+	// bb-dlss5perf-106: the CPU cost of recording this pass, for "[perf]". This path makes no CPU
+	// wait: timestamps are read without the WAIT bit, 4 entries behind, stats 10 s late.
+	const auto cpu_start = std::chrono::steady_clock::now();
+	const struct CpuTimer {
+		std::chrono::steady_clock::time_point t;
+		~CpuTimer() { BB::Metrics::PerfDlss5(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count()); }
+	} cpu_timer {cpu_start};
 	++g.frame;
 	FreeRetired(graphics);
 	ReadTiming(graphics);
@@ -1339,10 +1347,18 @@ bool Apply(const SR::Desc& desc) {
 	p.Set("DLSSNR.MVec", static_cast<void*>(&g.wmv.ngx));
 	p.Set("DLSSNR.Depth", static_cast<void*>(&g.wdepth.ngx));
 	SetSizes(p, work);
-	for (const char* prefix: {"DLSSNR.Color", "DLSSNR.Output", "DLSSNR.Depth", "DLSSNR.MVec"}) {
-		const std::string base(prefix);
-		p.Set((base + "SubrectBaseX").c_str(), 0u), p.Set((base + "SubrectBaseY").c_str(), 0u);
-		p.Set((base + "SubrectWidth").c_str(), work.width), p.Set((base + "SubrectHeight").c_str(), work.height);
+	// bb-dlss5perf-106: the 16 subrect names built once (were 16 string concatenations a frame).
+	static const auto subrect_names = [] {
+		std::array<std::array<std::string, 4>, 4> n;
+		const char* prefixes[4] {"DLSSNR.Color", "DLSSNR.Output", "DLSSNR.Depth", "DLSSNR.MVec"};
+		const char* fields[4] {"SubrectBaseX", "SubrectBaseY", "SubrectWidth", "SubrectHeight"};
+		for (int i = 0; i < 4; ++i)
+			for (int j = 0; j < 4; ++j) n[i][j] = std::string(prefixes[i]) + fields[j];
+		return n;
+	}();
+	for (const auto& n: subrect_names) {
+		p.Set(n[0].c_str(), 0u), p.Set(n[1].c_str(), 0u);
+		p.Set(n[2].c_str(), work.width), p.Set(n[3].c_str(), work.height);
 	}
 	p.Set("DLSSNR.MVecScaleX", 1.0f), p.Set("DLSSNR.MVecScaleY", 1.0f);
 	p.Set("DLSSNR.DepthInverted", desc.depth_inverted ? 1 : 0);
