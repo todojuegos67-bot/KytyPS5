@@ -558,7 +558,35 @@ struct DrawState {
     bool samples_render_size = false; // samples a render-size colour image it does not draw into
     bool analyze_dump = false;
     bool vertex_camera = false; // a vertex-stage constant holds the forward view-projection
+    u64 ps_hash = 0;            // 1.33: the draw's pixel shader (aapass point)
 } g_draw;
+// 1.33 (bb-aapass-133): the upscaler / DLAA point at Bloodborne's own post-processing entry:
+// the scene-colour sample of its first post pass (ps 0x00000ccc53f28aa5 in the 1.32 captures:
+// it samples the lit HDR scene, RGBA16F at the render size, and writes the bloom / exposure
+// source; the game's "Disable AA" patch only switches G-buffer shader variants, it removes no
+// pass). Native DLAA (ratio 1) and BB_SCENE_UPSCALE=aapass (native chain at a ratio > 1) use it.
+// BB_AAPASS=0: the old learned in-place point; BB_AAPASS_PS=<hex>: another pixel shader hash.
+u64 AaPs() {
+    static const u64 v = [] {
+        const char* e = std::getenv("BB_AAPASS_PS");
+        return e != nullptr && *e != '\0' ? std::strtoull(e, nullptr, 16) : 0x00000ccc53f28aa5ull;
+    }();
+    return v;
+}
+bool AaPassSwitch() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_AAPASS");
+        return e == nullptr || *e != '0';
+    }();
+    return on;
+}
+struct AaSec {
+    u32 hits = 0, injected = 0, frames3d = 0;
+    VAddr src = 0;
+    u32 w = 0, h = 0;
+    vk::Format fmt{};
+    u64 last_hit_frame = 0;
+} g_aa;
 bool g_scan_vertex = false;
 
 bool g_dump_frame = false;
@@ -2142,6 +2170,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     ++f.draws;
     g_draw = {};
     g_draw.valid = true;
+    g_draw.ps_hash = ps_hash;
     g_draw.num_colors = static_cast<u32>(std::min<size_t>(colors.size(), 8));
     u32 mrt = 0;
     for (u32 i = 0; i < g_draw.num_colors; ++i) {
@@ -2448,8 +2477,32 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         f.comp_w = width;
         f.comp_h = height;
     }
+    // 1.33 aapass: the hash-matched post entry; once seen, the only place the upscaler runs.
+    bool aa_hit = false;
+    bool aa_mode = false;
+    aa_mode = AaPassSwitch() && (NativeAaUpscaler() || NativeChainLive() ||
+                                 BB::ResPatch::AaPass());
+    if (aa_mode && !g_draw.compute && g_draw.ps_hash == AaPs() && !targets_it && IsHdr(format) &&
+        f.gb_w != 0 && width == f.gb_w && height == f.gb_h && !f.injected) {
+        aa_hit = true;
+        if (g_learned.scene_color != addr) {
+            Checkpoint(fmt::format("[aapass] point: ps {:#018x} samples the scene colour {:#x} "
+                                   "{}x{} {} (was {:#x}): upscaler / DLAA input",
+                                   AaPs(), addr, width, height, vk::to_string(format),
+                                   g_learned.scene_color));
+        }
+        g_learned.scene_color = addr;
+        ++g_aa.hits;
+        g_aa.src = addr;
+        g_aa.w = width;
+        g_aa.h = height;
+        g_aa.fmt = format;
+        g_aa.last_hit_frame = g_frame_no;
+    }
+    const bool aa_wait = aa_mode && !aa_hit && g_aa.last_hit_frame != 0 &&
+                         g_frame_no < g_aa.last_hit_frame + 120;
     const VAddr src = LearnedSource();
-    if (src == 0 || addr != src || targets_it || g_draw.scene) {
+    if (src == 0 || addr != src || targets_it || g_draw.scene || aa_wait) {
         return Sample::Keep;
     }
     if (f.injected) {
@@ -2478,10 +2531,10 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
         }
         return Sample::Keep;
     };
-    if (PathLockOn() && g_lock == 2) {
+    if (PathLockOn() && g_lock == 2 && !aa_hit) {
         return Sample::Keep; // 0.85: the session is locked to the window path
     }
-    if (PresentMode() || (HudPointOn() && WindowPathOk())) {
+    if (!aa_hit && (PresentMode() || (HudPointOn() && WindowPathOk()))) {
         return refuse(RfPresent); // upscaled before the HUD instead (WantPresentUpscale)
     }
     // 0.76: no native-fallback hold in the native chain: the in-place point is the only place
@@ -2494,9 +2547,10 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     // to the present-time path: the 19:07 run switched between the two paths every few frames).
     const u32 need = (g_good_src != 0 && addr == g_good_src) ? std::min(g_learned.skip, g_good_index)
                                                             : g_learned.skip;
-    if (index < need) {
+    if (index < need && !aa_hit) {
         return refuse(RfSkip);
     }
+    if (aa_hit) ++g_aa.injected;
     if (!Active() || f.inject_failed) {
         return refuse(!Active() ? RfInactive : RfFailed);
     }
@@ -3673,7 +3727,13 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         // in-place point (refused as before-HUD mode): its path is the window / HUD point. 1.27's
         // log locked in-place from 299/300 early frames (before the window size was known), then
         // every scaled frame was refused in place and kept off the present path: 0 upscaled.
-        if (g_lock == 1 && PresentMode() && !NativeChainLive()) {
+        if (g_lock == 2 && g_aa.last_hit_frame != 0 && g_frame_no < g_aa.last_hit_frame + 2 &&
+            f.injected) {
+            g_lock = 1;
+            Checkpoint("[path] locked=in-place for the session: the aapass point (game post "
+                       "entry, shader hash) carries the upscaler (1.33)");
+        }
+        if (g_lock == 1 && PresentMode() && !NativeChainLive() && g_aa.last_hit_frame == 0) {
             g_lock = 2;
             Checkpoint("[path] locked=window for the session: the frame is scaled (game "
                        "output below the window), the in-place point does not apply (1.29)");
@@ -3688,6 +3748,19 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         const auto now_t = std::chrono::steady_clock::now();
         if (now_t - last >= std::chrono::seconds(1)) {
             last = now_t;
+            if (AaPassSwitch() && (g_aa.hits > 0 || BB::ResPatch::AaPass())) {
+                Checkpoint(fmt::format(
+                    "[aapass] last second: {} 3D frames, game post entry hit {} (ps {:#018x}), "
+                    "upscaled there {}; source {:#x} {}x{} {} -> {}x{} ({}), HUD drawn by the "
+                    "game after it at {}x{}; {} GPU {:.2f} ms",
+                    g_sec_frames, g_aa.hits, AaPs(), g_aa.injected, g_aa.src, g_aa.w, g_aa.h,
+                    vk::to_string(g_aa.fmt), g_plan.output_w, g_plan.output_h,
+                    g_plan.render_w == g_plan.output_w ? "DLAA / native AA in place"
+                                                       : "upscale, post chain at the output size",
+                    g_output_w, g_output_h, SR::KindName(Cfg().kind),
+                    g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0));
+                g_aa.hits = g_aa.injected = 0;
+            }
             if (g_sec_frames > 0) {
                 Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
                                        "resets {} (camera delta max {:.3f} NDC; a reset only "
