@@ -1166,6 +1166,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
+			g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];
