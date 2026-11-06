@@ -2480,8 +2480,9 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     // 1.33 aapass: the hash-matched post entry; once seen, the only place the upscaler runs.
     bool aa_hit = false;
     bool aa_mode = false;
-    aa_mode = AaPassSwitch() && (NativeAaUpscaler() || NativeChainLive() ||
-                                 BB::ResPatch::AaPass());
+    // 1.35: the post-entry point is native DLAA only (ratio 1); scaled aapass runs through the
+    // resolution patch and the HUD point.
+    aa_mode = AaPassSwitch() && NativeAaUpscaler();
     if (aa_mode && !g_draw.compute && g_draw.ps_hash == AaPs() && !targets_it && IsHdr(format) &&
         f.gb_w != 0 && width == f.gb_w && height == f.gb_h && !f.injected) {
         aa_hit = true;
@@ -3763,7 +3764,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         const auto now_t = std::chrono::steady_clock::now();
         if (now_t - last >= std::chrono::seconds(1)) {
             last = now_t;
-            if (AaPassSwitch() && (g_aa.hits > 0 || BB::ResPatch::AaPass())) {
+            if (AaPassSwitch() && g_aa.hits > 0) {
                 Checkpoint(fmt::format(
                     "[aapass] last second: {} 3D frames, game post entry hit {} (ps {:#018x}), "
                     "upscaled there {}, at the scene colour's first read (native chain, before "
