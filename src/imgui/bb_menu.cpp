@@ -1931,7 +1931,7 @@ void DrawToast(float u) {
 //    alone cannot tell the clinic from the street); old 7-minute rule if no map load is ever seen.
 //  - El primer sueño: first m21_00 load after the new game (exact).
 //  - Ni la bestia, ni el miedo: HEURISTIC: the first m21_00 load comes after at least
-//    BB_BEAST_HEUR_SECONDS (default 240, 0 = never) in m24_01; dying to the beast is quick,
+//    BB_BEAST_HEUR_SECONDS (default 0 = off and hidden from the grid; e.g. 240 to enable) in m24_01; dying to the beast is quick,
 //    killing it unarmed is not.
 struct CustomDef {
     const char* key;
@@ -2090,14 +2090,15 @@ std::vector<std::string> ScanSaves() {
     return out;
 }
 void UnlockCustom(CustomState& s, int i, const char* reason);
+int BeastHeurSeconds();
 bool AllUnlocked(const CustomState& s) {
-    return s.unlocked[0] && s.unlocked[1] && s.unlocked[2];
+    return s.unlocked[0] && s.unlocked[1] && (s.unlocked[2] || BeastHeurSeconds() == 0);
 }
 int BeastHeurSeconds() {
     if (const char* v = std::getenv("BB_BEAST_HEUR_SECONDS"); v != nullptr && v[0] != 0) {
         return std::max(0, std::atoi(v));
     }
-    return 240;
+    return 0; // off by default (heuristic); hidden from the grid while off
 }
 void CustomWatcher() {
     CustomState s = ReadCustom();
@@ -2107,6 +2108,9 @@ void CustomWatcher() {
     }
     if (const char* v = std::getenv("BB_CUSTOM_TROPHY_TEST"); v != nullptr && v[0] == '1') {
         for (int i = 0; i < 3; i++) {
+            if (i == 2 && BeastHeurSeconds() == 0) {
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::seconds(i == 0 ? 20 : 8));
             if (!s.unlocked[i]) {
                 UnlockCustom(s, i, "BB_CUSTOM_TROPHY_TEST=1");
@@ -2143,7 +2147,7 @@ void CustomWatcher() {
             if (!s.unlocked[1]) {
                 UnlockCustom(s, 1, "first Hunter's Dream load after a new game");
             }
-            if (!s.unlocked[2]) {
+            if (!s.unlocked[2] && beast_heur > 0) {
                 if (beast_heur > 0 && s.yharnam_seconds >= beast_heur) {
                     UnlockCustom(s, 2,
                                  "HEURISTIC: first Hunter's Dream reached after >= "
@@ -2240,7 +2244,8 @@ void UnlockCustom(CustomState& s, int i, const char* reason) {
 }
 void AddCustomTrophy() {
     const CustomState s = ReadCustom();
-    for (int i = 0; i < 3; i++) {
+    const int n = BeastHeurSeconds() > 0 ? 3 : 2; // heuristic trophy only when enabled
+    for (int i = 0; i < n; i++) {
         Trophy t;
         t.id = -100 - i;
         t.grade = kCustom[i].grade;
