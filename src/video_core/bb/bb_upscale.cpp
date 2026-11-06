@@ -1080,7 +1080,9 @@ void SrReset(Plan& p) {
         const double pts[4][2] = {{-0.5, -0.5}, {0.5, -0.5}, {-0.5, 0.5}, {0.5, 0.5}};
         double sum = 0.0;
         for (const auto& pt : pts) {
-            const double v[4] = {pt[0], pt[1], 0.5, 1.0};
+            // 1.05: far-plane points (z 0.5 sat at the lens with forward depth: 3.9-4.7 NDC on
+            // ordinary turns, 5-14 history resets per second).
+            const double v[4] = {pt[0], pt[1], p.depth_inverted ? 1e-4 : 0.9999, 1.0};
             double o[4]{};
             for (int i = 0; i < 4; ++i)
                 for (int j = 0; j < 4; ++j) o[i] += m[i * 4 + j] * v[j];
@@ -1094,7 +1096,11 @@ void SrReset(Plan& p) {
         delta = sum >= 1e9 ? 1e9 : sum / 4.0;
     }
     g_sec_cam_max = std::max(g_sec_cam_max, std::min(delta, 99.0));
-    const bool is_cut = delta > cut;
+    // 1.05: a real discontinuity only: above the threshold and 4x the recent average.
+    static double avg = 0.0;
+    const double dclamp = std::min(delta, 99.0);
+    const bool is_cut = delta > cut && dclamp > 4.0 * std::max(avg, 0.05);
+    avg = avg * 0.8 + dclamp * 0.2;
     p.reset = first || is_cut || size_changed;
     if (p.reset) {
         ++g_sec_resets;

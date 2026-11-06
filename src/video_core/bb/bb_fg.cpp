@@ -1424,7 +1424,9 @@ double CameraDelta(const Inputs* in) {
     double sum = 0;
     const double pts[4][2] = {{-0.5, -0.5}, {0.5, -0.5}, {-0.5, 0.5}, {0.5, 0.5}};
     for (const auto& pt : pts) {
-        const double v[4] = {pt[0], pt[1], 0.5, 1.0};
+        // 1.05: points near the far plane (z 0.5 is right in front of the lens with forward
+        // depth: walking / turning moved them > 3 NDC and read as cuts every few frames).
+        const double v[4] = {pt[0], pt[1], in->depth_inverted ? 1e-4 : 0.9999, 1.0};
         double o[4]{};
         for (int i = 0; i < 4; ++i)
             for (int j = 0; j < 4; ++j) o[i] += m[i * 4 + j] * v[j];
@@ -1450,7 +1452,13 @@ bool DlssgReset(const Inputs* in, double delta) {
     g_prev_inputs_ok = in != nullptr && in->camera_valid;
     if (in == nullptr) return true;
     if (legacy) return in->reset;
-    return first || delta > cut;
+    // 1.05: a cut is a discontinuity: above the threshold AND 4x the recent average (a fast turn
+    // is sustained, so its average rises with it; a teleport / cut scene jumps alone).
+    static double avg = 0.0;
+    const double d = std::min(delta, 99.0);
+    const bool is_cut = delta > cut && d > 4.0 * std::max(avg, 0.05);
+    avg = avg * 0.8 + d * 0.2;
+    return first || is_cut;
 }
 
 // The same constants the super resolution path gives Streamline (bb_sr_dlss.cpp): our matrices
