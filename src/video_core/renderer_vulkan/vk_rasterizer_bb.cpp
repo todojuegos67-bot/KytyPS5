@@ -4172,11 +4172,15 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         ++g_hs.s_no_canvas;
         return false;
     } else {
+        // 1.38: never off for the session (1.37 turned it off after 30 such frames and kept the
+        // HUD composite for the rest of the session). A frame whose final pass did not read the
+        // HUD target (pause / menu transitions) keeps the game's own flip for that frame.
         ++g_hs.s_other;
-        if (++g_hs.consecutive_fail >= 30) {
-            HsOff(fmt::format("30 frames in a row presented {:#x}, neither the HUD target {:#x} "
-                              "nor a final-pass canvas",
-                              addr, g_hs.target));
+        if (++g_hs.consecutive_fail % 300 == 30) {
+            HsSay(fmt::format("{} frames in a row presented {:#x} without a final pass from the "
+                              "HUD target {:#x}: those frames use the HUD composite (canvas "
+                              "stays armed)",
+                              g_hs.consecutive_fail, addr, g_hs.target));
         }
         return false;
     }
