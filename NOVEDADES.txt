@@ -12,6 +12,18 @@ Abre "Jugar (Espanol).cmd"  -  Open "Play (English).cmd"
 - FSR 4.1 de AMD (SDK 2.4, DLLs oficiales firmadas): con Reescalado "FSR" y una Radeon RX 7000 / 9000 se usa FSR 4.1
   si el driver lo ofrece; si no, FSR 3.1 como antes. Las metricas dicen "FSR 4.1" solo si de verdad esta cargado.
   AMD FSR 4.1 (SDK 2.4 signed runtime) for the "FSR" upscaler on Radeon RX 7000 / 9000 when offered, else FSR 3.1.
+- "Sombras de focos" (antorchas) desactivadas por defecto (gs_spot=1); si ya elegiste otra cosa se respeta.
+  Spotlight (torch) shadows off by default; an explicit choice in ajustes_juego is kept.
+- Reescalado "FSR": FSR 4.1 de AMD si esta disponible (Radeon); si no, nuestro FSR 4.0 (cualquier grafica compatible);
+  FSR 3.1 solo si FSR 4.0 tampoco arranca. Las metricas muestran el que de verdad funciona.
+  FSR: AMD FSR 4.1 -> our FSR 4.0 -> FSR 3.1; the metrics show the one running.
+- Musica y sonido en estereo con la mezcla propia del juego (sound_enableAmbisonics=false; antes sonaba casi mono).
+  Stereo music again: the game's own mix (sound_enableAmbisonics=false); an explicit value is kept.
+- Niebla del lanzador mucho mas visible: bancos densos, rayos de luz, particulas con desenfoque y polvo flotando.
+  Launcher fog clearly visible: dense banks, light shafts, softer particles and dust motes.
+- Arreglos del emulador original: posible bloqueo/perdida de dispositivo al cambiar F11 con FSR FG (issue #174) y un
+  dibujo indexado sin indices tras un dibujo de vertices.
+  Upstream fixes: FSR FG F11 device-lost guard (issue #174), table indexed draw index binding.
 - Mejoras del emulador original (06-11): perfil PGO nuevo (hilo de render -7 % en sus pruebas), un pipeline que el
   driver rechaza ya no corta la precompilacion de shaders, el pixel shader vacio solo en NVIDIA, pipeline key de
   NVIDIA 620.70.06 (opcional en Windows: KYTY_PIPELINE_KEY_THUNK=1).

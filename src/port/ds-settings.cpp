@@ -599,6 +599,10 @@ const GameSetting* GameSettings(size_t* count) {
 	return kGameSettings;
 }
 
+int DefaultGameSettingLevel(const char* id) {
+	return std::strcmp(id, "gs_spot") == 0 ? 1 : 0;
+}
+
 int GameSettingLevel(const Settings& s, const char* id) {
 	const std::string key = std::string(id) + "=";
 	size_t at = 0;
@@ -608,14 +612,16 @@ int GameSettingLevel(const Settings& s, const char* id) {
 		at                = end + 1;
 		if (item.rfind(key, 0) == 0) return std::clamp(std::atoi(item.c_str() + key.size()), 0, 5);
 	}
-	return 0;
+	// (des-upstream-1106b) "Sombras de focos" off unless the user chose (gs_spot=1: r_enableSpotShadows=false).
+	return DefaultGameSettingLevel(id);
 }
 
 void SetGameSettingLevel(Settings* s, const char* id, int level) {
 	std::string out;
 	for (const auto& g: kGameSettings) {
 		const int v = std::strcmp(g.id, id) == 0 ? level : GameSettingLevel(*s, g.id);
-		if (v > 0) out += (out.empty() ? "" : ";") + std::string(g.id) + "=" + std::to_string(v);
+		// (A level other than the default kept explicitly: gs_spot=0 is the game's own spot shadows, on.)
+		if (v > 0 || v != DefaultGameSettingLevel(g.id)) out += (out.empty() ? "" : ";") + std::string(g.id) + "=" + std::to_string(v);
 	}
 	s->game_settings = out;
 }
