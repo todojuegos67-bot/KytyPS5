@@ -1920,20 +1920,44 @@ void DrawToast(float u) {
     g_a = saved;
 }
 
-// ---------------------------------------------------------------- custom trophy (not PSN)
-// "Despertar en Yharnam": leaving Iosefka's Clinic for the first time. No verified guest
-// memory map/event-flag offsets for CUSA03173 are available here, so the trigger uses the
-// save data: a new save file/slot appearing (a new character is created in the clinic), then
-// kCustomPlaySeconds of play time (persisted across runs) — about the time it takes to wake
-// up, go through the clinic and walk out into Central Yharnam.
-constexpr const char* kCustomName = "Despertar en Yharnam";
-constexpr const char* kCustomDetail =
-    "Sal de la Clínica de Iosefka por primera vez y comienza la cacería.";
-constexpr int kCustomPlaySeconds = 420;
+// ---------------------------------------------------------------- custom trophies (not PSN)
+// (bb-trophy-134) Three port trophies driven by guest map loads. Kernel open() calls
+// BbMenu::OnGuestFileOpen; a map load is the open of /app0/dvdroot_ps4/event/mAA_BB_CC_DD.emevd.dcx
+// (one per load in shad_log.txt, seen for m27_00_00_00 / m32_00_00_00). Map ids (public
+// FromSoft modding lists): m24_01_00_00 = Central Yharnam (Iosefka's Clinic is inside this
+// map, not a separate one), m21_00_00_00 = Hunter's Dream. "New game" = a new save file appears
+// (as 1.17). No verified event-flag offsets for CUSA03173 1.09 here, so:
+//  - Despertar en Yharnam: kYharnamSeconds of time spent in m24_01 after the new game (map load
+//    alone cannot tell the clinic from the street); old 7-minute rule if no map load is ever seen.
+//  - El primer sueño: first m21_00 load after the new game (exact).
+//  - Ni la bestia, ni el miedo: HEURISTIC: the first m21_00 load comes after at least
+//    BB_BEAST_HEUR_SECONDS (default 240, 0 = never) in m24_01; dying to the beast is quick,
+//    killing it unarmed is not.
+struct CustomDef {
+    const char* key;
+    const char* name;
+    const char* detail;
+    char grade;
+};
+constexpr CustomDef kCustom[3] = {
+    {"despertar_en_yharnam", "Despertar en Yharnam",
+     "Sal de la Clínica de Iosefka por primera vez y comienza la cacería.", 'B'},
+    {"el_primer_sueno", "El primer sueño",
+     "Muere ante la bestia de la clínica y despierta en el Sueño del Cazador.", 'B'},
+    {"ni_la_bestia_ni_el_miedo", "Ni la bestia, ni el miedo",
+     "Derrota a la bestia de la clínica antes de despertar en el Sueño del Cazador.", 'S'},
+};
+constexpr int kCustomPlaySeconds = 420; // fallback, no map load seen
+constexpr int kYharnamSeconds = 420;
+constexpr const char* kMapYharnam = "m24_01_00_00";
+constexpr const char* kMapDream = "m21_00_00_00";
 struct CustomState {
-    bool armed = false, unlocked = false;
-    int seconds = 0;
-    u64 stamp = 0;
+    bool armed = false;
+    bool unlocked[3]{};
+    u64 stamp[3]{};
+    int seconds = 0;          // since armed
+    int yharnam_seconds = 0;  // in m24_01 since armed
+    bool yharnam_seen = false, dream_seen = false;
 };
 std::mutex g_custom_mtx;
 std::filesystem::path CustomJson() {
@@ -1945,8 +1969,16 @@ CustomState ReadCustom() {
     if (!f) {
         return s;
     }
-    std::string j((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    const auto num = [&](const char* k) -> u64 {
+    std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const auto section = [&](const char* sec) -> std::string {
+        const auto p = all.find(fmt::format("\"{}\"", sec));
+        if (p == std::string::npos) {
+            return {};
+        }
+        const auto e = all.find('}', p);
+        return all.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    };
+    const auto num = [](const std::string& j, const char* k) -> u64 {
         const auto p = j.find(k);
         if (p == std::string::npos) {
             return 0;
@@ -1954,7 +1986,7 @@ CustomState ReadCustom() {
         const auto c = j.find(':', p);
         return c == std::string::npos ? 0 : std::strtoull(j.c_str() + c + 1, nullptr, 10);
     };
-    const auto flag = [&](const char* k) {
+    const auto flag = [](const std::string& j, const char* k) {
         const auto p = j.find(k);
         if (p == std::string::npos) {
             return false;
@@ -1962,10 +1994,20 @@ CustomState ReadCustom() {
         const auto c = j.find(':', p);
         return c != std::string::npos && j.find("true", c) == j.find_first_not_of(" \t", c + 1);
     };
-    s.unlocked = flag("\"unlocked\"");
-    s.armed = flag("\"armed\"");
-    s.seconds = static_cast<int>(num("\"play_seconds\""));
-    s.stamp = num("\"timestamp\"");
+    for (int i = 0; i < 3; i++) {
+        const std::string j = section(kCustom[i].key);
+        s.unlocked[i] = flag(j, "\"unlocked\"");
+        s.stamp[i] = num(j, "\"timestamp\"");
+    }
+    std::string pr = section("progress");
+    if (pr.empty()) {
+        pr = section(kCustom[0].key); // 1.17-1.33 file: armed / play_seconds lived there
+    }
+    s.armed = flag(pr, "\"armed\"");
+    s.seconds = static_cast<int>(num(pr, "\"play_seconds\""));
+    s.yharnam_seconds = static_cast<int>(num(pr, "\"yharnam_seconds\""));
+    s.yharnam_seen = flag(pr, "\"yharnam_seen\"");
+    s.dream_seen = flag(pr, "\"dream_seen\"");
     return s;
 }
 void WriteCustom(const CustomState& s) {
@@ -1973,9 +2015,11 @@ void WriteCustom(const CustomState& s) {
     std::error_code ec;
     const auto p = CustomJson();
     std::filesystem::create_directories(p.parent_path(), ec);
-    std::string date;
-    if (s.stamp != 0) {
-        std::time_t t = static_cast<std::time_t>(s.stamp);
+    const auto date = [](u64 st) -> std::string {
+        if (st == 0) {
+            return {};
+        }
+        std::time_t t = static_cast<std::time_t>(st);
         std::tm tm{};
 #ifdef _WIN32
         localtime_s(&tm, &t);
@@ -1984,14 +2028,20 @@ void WriteCustom(const CustomState& s) {
 #endif
         char buf[64];
         std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-        date = buf;
+        return buf;
+    };
+    std::string j = "{\n";
+    for (int i = 0; i < 3; i++) {
+        j += fmt::format("  \"{}\": {{\n    \"name\": \"{}\",\n    \"grade\": \"{}\",\n"
+                         "    \"unlocked\": {},\n    \"timestamp\": {},\n    \"date\": \"{}\"\n  }},\n",
+                         kCustom[i].key, kCustom[i].name, kCustom[i].grade,
+                         s.unlocked[i] ? "true" : "false", s.stamp[i], date(s.stamp[i]));
     }
-    const std::string j = fmt::format(
-        "{{\n  \"despertar_en_yharnam\": {{\n    \"name\": \"{}\",\n    \"grade\": \"B\",\n"
-        "    \"unlocked\": {},\n    \"timestamp\": {},\n    \"date\": \"{}\",\n"
-        "    \"armed\": {},\n    \"play_seconds\": {}\n  }}\n}}\n",
-        kCustomName, s.unlocked ? "true" : "false", s.stamp, date, s.armed ? "true" : "false",
-        s.seconds);
+    j += fmt::format("  \"progress\": {{\n    \"armed\": {},\n    \"play_seconds\": {},\n"
+                     "    \"yharnam_seconds\": {},\n    \"yharnam_seen\": {},\n"
+                     "    \"dream_seen\": {}\n  }}\n}}\n",
+                     s.armed ? "true" : "false", s.seconds, s.yharnam_seconds,
+                     s.yharnam_seen ? "true" : "false", s.dream_seen ? "true" : "false");
     const auto tmp = std::filesystem::path(p).concat(".tmp");
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -2000,6 +2050,18 @@ void WriteCustom(const CustomState& s) {
     std::filesystem::rename(tmp, p, ec);
 }
 std::atomic<bool> g_custom_changed{false};
+
+// map loads from the guest open() hook, consumed by CustomWatcher
+struct MapLoad {
+    std::string id;
+    std::chrono::steady_clock::time_point at;
+};
+std::mutex g_map_mtx;
+std::deque<MapLoad> g_map_loads;
+std::string g_last_map; // last map loaded this session (any time)
+std::chrono::steady_clock::time_point g_last_map_at{};
+std::atomic<int> g_map_parts_logged{0};
+
 // every file under the save data folders (home/<user>/savedata/...), without sce_sys
 std::vector<std::string> ScanSaves() {
     std::vector<std::string> out;
@@ -2027,41 +2089,128 @@ std::vector<std::string> ScanSaves() {
     std::sort(out.begin(), out.end());
     return out;
 }
-void UnlockCustom(CustomState& s);
+void UnlockCustom(CustomState& s, int i, const char* reason);
+bool AllUnlocked(const CustomState& s) {
+    return s.unlocked[0] && s.unlocked[1] && s.unlocked[2];
+}
+int BeastHeurSeconds() {
+    if (const char* v = std::getenv("BB_BEAST_HEUR_SECONDS"); v != nullptr && v[0] != 0) {
+        return std::max(0, std::atoi(v));
+    }
+    return 240;
+}
 void CustomWatcher() {
     CustomState s = ReadCustom();
-    if (s.unlocked) {
+    if (AllUnlocked(s)) {
+        LOG_INFO(Frontend, "[bbtrophy] all custom trophies already unlocked");
         return;
     }
     if (const char* v = std::getenv("BB_CUSTOM_TROPHY_TEST"); v != nullptr && v[0] == '1') {
-        std::this_thread::sleep_for(std::chrono::seconds(20));
-        UnlockCustom(s);
+        for (int i = 0; i < 3; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(i == 0 ? 20 : 8));
+            if (!s.unlocked[i]) {
+                UnlockCustom(s, i, "BB_CUSTOM_TROPHY_TEST=1");
+            }
+        }
         return;
     }
+    const int beast_heur = BeastHeurSeconds();
     auto known = ScanSaves();
-    LOG_INFO(Frontend, "[bb-trophy] custom '{}': watching {} save files (armed {}, {} s)",
-             kCustomName, known.size(), s.armed, s.seconds);
+    LOG_INFO(Frontend,
+             "[bbtrophy] watching {} save files (armed {}, {} s, {} s in {}, yharnam_seen {}, "
+             "dream_seen {}, beast heuristic {} s)",
+             known.size(), s.armed, s.seconds, s.yharnam_seconds, kMapYharnam, s.yharnam_seen,
+             s.dream_seen, beast_heur);
+    std::string cur_map;
+    bool any_map = s.yharnam_seen || s.dream_seen;
     int since_write = 0;
+    const auto on_map = [&](const std::string& id) {
+        cur_map = id;
+        any_map = true;
+        if (!s.armed) {
+            return;
+        }
+        if (id == kMapYharnam && !s.yharnam_seen) {
+            s.yharnam_seen = true;
+            LOG_INFO(Frontend, "[bbtrophy] new game: first {} (Central Yharnam) load", id);
+            WriteCustom(s);
+        }
+        if (id == kMapDream && !s.dream_seen) {
+            s.dream_seen = true;
+            LOG_INFO(Frontend,
+                     "[bbtrophy] new game: first {} (Hunter's Dream) load after {} s in {}", id,
+                     s.yharnam_seconds, kMapYharnam);
+            if (!s.unlocked[1]) {
+                UnlockCustom(s, 1, "first Hunter's Dream load after a new game");
+            }
+            if (!s.unlocked[2]) {
+                if (beast_heur > 0 && s.yharnam_seconds >= beast_heur) {
+                    UnlockCustom(s, 2,
+                                 "HEURISTIC: first Hunter's Dream reached after >= "
+                                 "BB_BEAST_HEUR_SECONDS in Central Yharnam");
+                } else {
+                    LOG_INFO(Frontend,
+                             "[bbtrophy] 'Ni la bestia, ni el miedo' not given: {} s < {} s "
+                             "(heuristic, beast assumed not killed)",
+                             s.yharnam_seconds, beast_heur);
+                }
+            }
+            WriteCustom(s);
+        }
+    };
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::deque<MapLoad> loads;
+        {
+            std::scoped_lock lk{g_map_mtx};
+            loads.swap(g_map_loads);
+        }
         if (!s.armed) {
             const auto now = ScanSaves();
             std::vector<std::string> added;
             std::set_difference(now.begin(), now.end(), known.begin(), known.end(),
                                 std::back_inserter(added));
-            if (!added.empty()) {
-                s.armed = true;
-                s.seconds = 0;
-                WriteCustom(s);
-                LOG_INFO(Frontend, "[bb-trophy] custom: new save data ({}): armed", added[0]);
-            }
             known = now;
+            for (const auto& m : loads) {
+                cur_map = m.id;
+                any_map = true;
+            }
+            if (!added.empty()) {
+                CustomState fresh;
+                for (int i = 0; i < 3; i++) {
+                    fresh.unlocked[i] = s.unlocked[i];
+                    fresh.stamp[i] = s.stamp[i];
+                }
+                s = fresh;
+                s.armed = true;
+                LOG_INFO(Frontend, "[bbtrophy] new save data ({}): new game, armed (current map '{}')",
+                         added[0], cur_map);
+                // the clinic map may have loaded just before the save file appeared
+                if (!cur_map.empty()) {
+                    on_map(cur_map);
+                }
+                WriteCustom(s);
+            }
             continue;
         }
+        for (const auto& m : loads) {
+            on_map(m.id);
+        }
         s.seconds += 5;
+        if (cur_map == kMapYharnam) {
+            s.yharnam_seconds += 5;
+        }
         since_write += 5;
-        if (s.seconds >= kCustomPlaySeconds) {
-            UnlockCustom(s);
+        if (!s.unlocked[0]) {
+            if (s.yharnam_seen && s.yharnam_seconds >= kYharnamSeconds) {
+                UnlockCustom(s, 0, "time in Central Yharnam (m24_01) after a new game");
+            } else if (!any_map && s.seconds >= kCustomPlaySeconds) {
+                UnlockCustom(s, 0, "fallback: no map load seen, 7 min after new save data");
+            }
+        }
+        if (s.unlocked[0] && s.dream_seen) {
+            WriteCustom(s);
+            LOG_INFO(Frontend, "[bbtrophy] watcher done");
             return;
         }
         if (since_write >= 30) {
@@ -2071,34 +2220,37 @@ void CustomWatcher() {
     }
 }
 
-void UnlockCustom(CustomState& s) {
-    s.unlocked = true;
-    s.stamp = static_cast<u64>(std::time(nullptr));
+void UnlockCustom(CustomState& s, int i, const char* reason) {
+    s.unlocked[i] = true;
+    s.stamp[i] = static_cast<u64>(std::time(nullptr));
     WriteCustom(s);
-    LOG_INFO(Frontend, "[bb-trophy] custom trophy unlocked: {}", kCustomName);
+    LOG_INFO(Frontend, "[bbtrophy] unlocked '{}' ({}): {}", kCustom[i].name,
+             GradeName(kCustom[i].grade), reason);
     g_custom_changed = true;
     if (const char* v = std::getenv("BB_TROPHY_POPUP"); v != nullptr && v[0] == '0') {
         return;
     }
     std::scoped_lock lk{g_toast_mtx};
     Toast t;
-    t.name = kCustomName;
-    t.grade = 'B';
-    t.detail = kCustomDetail;
+    t.name = kCustom[i].name;
+    t.grade = kCustom[i].grade;
+    t.detail = kCustom[i].detail;
     t.custom = true;
     g_toasts.push_back(std::move(t));
 }
 void AddCustomTrophy() {
     const CustomState s = ReadCustom();
-    Trophy t;
-    t.id = -100;
-    t.grade = 'B';
-    t.custom = true;
-    t.earned = s.unlocked;
-    t.stamp = s.stamp;
-    t.name = kCustomName;
-    t.detail = kCustomDetail;
-    g_trophies.push_back(std::move(t));
+    for (int i = 0; i < 3; i++) {
+        Trophy t;
+        t.id = -100 - i;
+        t.grade = kCustom[i].grade;
+        t.custom = true;
+        t.earned = s.unlocked[i];
+        t.stamp = s.stamp[i];
+        t.name = kCustom[i].name;
+        t.detail = kCustom[i].detail;
+        g_trophies.push_back(std::move(t));
+    }
 }
 
 // ---------------------------------------------------------------- Opciones: launcher.ini
@@ -3609,6 +3761,37 @@ bool OnSdlEvent(SDL_Event& event) {
         return false; // also to the game's input state, so nothing stays held
     }
     return false;
+}
+
+
+// (bb-trophy-134) guest open() hook: map loads for the custom trophies. Any thread, cheap.
+void OnGuestFileOpen(const char* path) {
+    if (path == nullptr) {
+        return;
+    }
+    const std::string_view p{path};
+    const auto ev = p.find("/event/m");
+    if (ev != std::string_view::npos && p.ends_with(".emevd.dcx") && p.size() >= ev + 7 + 12) {
+        const std::string id{p.substr(ev + 7, 12)}; // mAA_BB_CC_DD
+        if (id[3] != '_' || id[6] != '_' || id[9] != '_') {
+            return;
+        }
+        const char* what = id == kMapYharnam ? " (Central Yharnam)"
+                           : id == kMapDream ? " (Hunter's Dream)"
+                                             : "";
+        LOG_INFO(Frontend, "[bbtrophy] map load {}{}", id, what);
+        std::scoped_lock lk{g_map_mtx};
+        g_map_loads.push_back({id, std::chrono::steady_clock::now()});
+        g_last_map = id;
+        g_last_map_at = std::chrono::steady_clock::now();
+        return;
+    }
+    // evidence for a later exact "left the clinic" rule: first opens of Central Yharnam parts
+    const auto mp = p.find("/map/m24_01_00_00/");
+    if (mp != std::string_view::npos && p.ends_with(".flver.dcx") &&
+        g_map_parts_logged.fetch_add(1) < 400) {
+        LOG_INFO(Frontend, "[bbtrophy] m24_01 part {}", p.substr(mp + 18));
+    }
 }
 
 } // namespace BbMenu
