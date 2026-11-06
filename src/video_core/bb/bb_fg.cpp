@@ -2695,6 +2695,27 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
     } else if (mode == "immediate") {
         wanted = vk::PresentModeKHR::eImmediate;
         why = "BB_FG_PRESENT=immediate";
+    } else if (mode == "auto" && !Dlssg::Ready() && Amd::Requested() &&
+               (current == vk::PresentModeKHR::eFifo || current == vk::PresentModeKHR::eFifoRelaxed)) {
+        // bb-fsr3fix-118: FSR 3's frame interpolation swapchain paces its own presents (the
+        // patched DLL's slots, the pacing floor); a FIFO swapchain under it made every present
+        // call block ~10 ms (the 1.14 run: "present call 9.76 ms, present mode fifo") and the
+        // generated frames came out late (judder). As for DLSS-G: immediate on 120 Hz+ (shown
+        // rate under the VRR cap), mailbox below that.
+        int refresh_hz = 0;
+#if defined(_WIN32)
+        DEVMODEA display_mode{};
+        display_mode.dmSize = sizeof(display_mode);
+        if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &display_mode) != 0) {
+            refresh_hz = static_cast<int>(display_mode.dmDisplayFrequency);
+        }
+#endif
+        wanted = refresh_hz >= 120 && supported(vk::PresentModeKHR::eImmediate)
+                     ? vk::PresentModeKHR::eImmediate
+                 : supported(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
+                                                           : current;
+        why = "FSR 3 FG paces its own presents; a FIFO present blocked ~10 ms; "
+              "BB_FG_PRESENT=fifo|mailbox|immediate overrides";
     } else if (mode == "auto" && Dlssg::Ready() &&
                (current == vk::PresentModeKHR::eFifo || current == vk::PresentModeKHR::eFifoRelaxed)) {
         // Streamline's guide (ProgrammingGuideDLSS_G.md 22.5): "VSync with Frame Generation is

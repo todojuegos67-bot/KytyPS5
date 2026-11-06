@@ -78,11 +78,25 @@ vk::Extent2D g_fg_max_render{};
 vk::Format g_fg_format = vk::Format::eUndefined;
 bool g_fg_failed = false;
 
+struct PadImage { // bb-fsr3fix-118: the HUD-less image centred in a backbuffer-sized image
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    vk::Extent2D extent{};
+    vk::Format format = vk::Format::eUndefined;
+};
 struct Slot {
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool pending = false;
+    PadImage pad;
 };
+// bb-fsr3fix-118: the frame interpolation swapchain was made at 0x0 (window minimized / in a
+// transition when the old one went out of date). The presenter only re-makes it when the window
+// size changes, so it stayed 0x0: every later frame "no 3D" (render > backbuffer 0x0), no
+// generation, and finally no present completing at all (the hang). Presents now report
+// VK_ERROR_OUT_OF_DATE_KHR (at most every 200 ms) until it is made at a real size.
+bool g_swap_zero = false;
+std::chrono::steady_clock::time_point g_swap_zero_retry{};
 VkCommandPool g_pool = VK_NULL_HANDLE;
 std::array<Slot, 4> g_slots{};
 uint32_t g_slot = 0;
@@ -292,6 +306,152 @@ FfxApiResource ImageResource(const Image& image, bool depth) {
     return resource;
 }
 
+VkResult vkCreateImageHelper(vk::Device device, const vk::ImageCreateInfo& info, VkImage& out) {
+    const VkImageCreateInfo raw = static_cast<VkImageCreateInfo>(info);
+    return VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateImage(static_cast<VkDevice>(device), &raw,
+                                                       nullptr, &out);
+}
+
+VkResult vkAllocateHelper(vk::Device device, VkDeviceSize size, uint32_t type,
+                          VkDeviceMemory& out) {
+    VkMemoryAllocateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    info.allocationSize = size;
+    info.memoryTypeIndex = type;
+    return VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(device), &info,
+                                                          nullptr, &out);
+}
+
+void DestroyPad(PadImage& pad) {
+    const vk::Device device{g_device};
+    if (pad.image != VK_NULL_HANDLE) device.destroyImage(vk::Image{pad.image});
+    if (pad.memory != VK_NULL_HANDLE) device.freeMemory(vk::DeviceMemory{pad.memory});
+    pad = {};
+}
+
+bool EnsurePad(PadImage& pad, vk::Extent2D extent, vk::Format format) {
+    if (pad.image != VK_NULL_HANDLE && pad.extent == extent && pad.format == format) return true;
+    if (pad.image != VK_NULL_HANDLE) vk::Device{g_device}.waitIdle(); // a size change: rare
+    DestroyPad(pad);
+    const vk::Device device{g_device};
+    const vk::ImageCreateInfo info{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+        .sharingMode = vk::SharingMode::eExclusive,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    VkImage image = VK_NULL_HANDLE;
+    if (vkCreateImageHelper(device, info, image) != VK_SUCCESS) return false;
+    pad.image = image;
+    const auto req = device.getImageMemoryRequirements(vk::Image{image});
+    const auto props = vk::PhysicalDevice{g_physical}.getMemoryProperties();
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+        if ((req.memoryTypeBits & (1u << i)) &&
+            (props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            type = i;
+            break;
+        }
+    }
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (type == UINT32_MAX ||
+        vkAllocateHelper(device, req.size, type, memory) != VK_SUCCESS) {
+        DestroyPad(pad);
+        return false;
+    }
+    pad.memory = memory;
+    if (device.bindImageMemory(vk::Image{image}, vk::DeviceMemory{memory}, 0) !=
+        vk::Result::eSuccess) {
+        DestroyPad(pad);
+        return false;
+    }
+    pad.extent = extent;
+    pad.format = format;
+    return true;
+}
+
+// The HUD-less image (window size, e.g. 2556x1440) copied into the centre of the pad (backbuffer
+// size, 2560x1440), the border black as the presenter draws it. Recorded before the prepare.
+void RecordPad(VkCommandBuffer command, const PadImage& pad, const Image& hudless) {
+    const vk::CommandBuffer cmd{command};
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    const vk::Image dst{pad.image};
+    std::array<vk::ImageMemoryBarrier, 2> pre{
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eShaderRead,
+            .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = dst,
+            .subresourceRange = range,
+        },
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+                             vk::AccessFlagBits::eColorAttachmentWrite |
+                             vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+            .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = hudless.image,
+            .subresourceRange = range,
+        },
+    };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                        vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, pre);
+    const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
+    cmd.clearColorImage(dst, vk::ImageLayout::eTransferDstOptimal, black, range);
+    const vk::MemoryBarrier clear_done{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                       .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+                        {}, clear_done, {}, {});
+    const uint32_t w = std::min(hudless.extent.width, pad.extent.width);
+    const uint32_t h = std::min(hudless.extent.height, pad.extent.height);
+    const vk::ImageCopy copy{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffset = {0, 0, 0},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffset = {static_cast<int32_t>((pad.extent.width - w) / 2),
+                      static_cast<int32_t>((pad.extent.height - h) / 2), 0},
+        .extent = {w, h, 1},
+    };
+    cmd.copyImage(hudless.image, vk::ImageLayout::eTransferSrcOptimal, dst,
+                  vk::ImageLayout::eTransferDstOptimal, copy);
+    std::array<vk::ImageMemoryBarrier, 2> post{
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = dst,
+            .subresourceRange = range,
+        },
+        vk::ImageMemoryBarrier{
+            .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+            .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = hudless.image,
+            .subresourceRange = range,
+        },
+    };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                        vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, post);
+}
+
 // 0.41: what FSR 3 frame generation needs from the inputs, checked before anything reaches the
 // FidelityFX API (the native path, BB_FG_NATIVE, hands over the game's own frame layout, whatever
 // the quality patches make of it). nullptr: usable; else the reason, logged once per reason.
@@ -342,6 +502,17 @@ void DestroyFrameGeneration() {
         g_ffx.Configure(&g_fg_context, &off.header);
         g_ffx.DestroyContext(&g_fg_context, nullptr);
         g_fg_context = nullptr;
+    }
+    if (g_device != VK_NULL_HANDLE) {
+        bool waited = false;
+        for (auto& slot : g_slots) {
+            if (slot.pad.image == VK_NULL_HANDLE) continue;
+            if (!waited) {
+                vk::Device{g_device}.waitIdle();
+                waited = true;
+            }
+            DestroyPad(slot.pad);
+        }
     }
 }
 
@@ -718,6 +889,12 @@ bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* o
     }
     Printf("FSR3 FG: frame generation swapchain %ux%u (present mode %d)", info.imageExtent.width,
            info.imageExtent.height, static_cast<int>(info.presentMode));
+    g_swap_zero = info.imageExtent.width == 0 || info.imageExtent.height == 0;
+    if (g_swap_zero) {
+        g_swap_zero_retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        Printf("FSR3 FG: swapchain made at 0x0 (window minimized or changing): made again at the "
+               "window's size as soon as it has one");
+    }
     *out = swapchain;
     return true;
 }
@@ -757,6 +934,13 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
                    "again");
         }
         return vk::Result::eErrorOutOfDateKHR;
+    }
+    if (g_swap_zero) {
+        const auto t = std::chrono::steady_clock::now();
+        if (t >= g_swap_zero_retry) {
+            g_swap_zero_retry = t + std::chrono::milliseconds(200);
+            return vk::Result::eErrorOutOfDateKHR; // the presenter makes it again
+        }
     }
     const auto begin = std::chrono::steady_clock::now();
     VkPresentInfoKHR present = static_cast<VkPresentInfoKHR>(info);
@@ -1027,12 +1211,37 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         ui.header.type = FFX_API_CONFIGURE_DESC_TYPE_FGSWAPCHAIN_REGISTERUIRESOURCE_VK;
         g_ffx.Configure(&g_swapchain_context, &ui.header);
     }
-    const bool hudless = generate && inputs->has_hudless && inputs->hudless.image &&
-                         inputs->hudless.extent == backbuffer && inputs->hudless.format == format;
+    const bool hudless_exact = generate && inputs->has_hudless && inputs->hudless.image &&
+                               inputs->hudless.extent == backbuffer &&
+                               inputs->hudless.format == format;
+    // bb-fsr3fix-118: on the window path the HUD-less image is the game image's size (2556x1440)
+    // inside a larger backbuffer (2560x1440): FSR 3 wants the backbuffer's size, so it is centred
+    // in a backbuffer-sized copy (DLSS-G gets its own game-sized one, hudless_game).
+    static const bool pad_on = EnvOn("KYTY_FSR3_HUDLESS_PAD", true);
+    const bool hudless_pad = pad_on && generate && !hudless_exact && inputs->has_hudless &&
+                             inputs->hudless.image && inputs->hudless.format == format &&
+                             inputs->hudless.extent.width <= backbuffer.width &&
+                             inputs->hudless.extent.height <= backbuffer.height &&
+                             EnsurePad(g_slots[g_slot].pad, backbuffer, format);
+    const bool hudless = hudless_exact || hudless_pad;
     config.HUDLessColor = FfxApiResource{};
-    if (hudless) {
+    if (hudless_exact) {
         config.HUDLessColor = ImageResource(inputs->hudless, false);
         ++g_stats.hudless;
+    } else if (hudless_pad) {
+        const auto& pad = g_slots[g_slot].pad;
+        config.HUDLessColor = ImageResource(
+            Image{vk::Image{pad.image}, vk::ImageView{}, pad.format, pad.extent,
+                  vk::ImageUsageFlagBits::eSampled},
+            false);
+        ++g_stats.hudless;
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Printf("FSR3 FG: HUD-less image %ux%u centred in a %ux%u copy (the backbuffer's size)",
+                   inputs->hudless.extent.width, inputs->hudless.extent.height, backbuffer.width,
+                   backbuffer.height);
+        }
     } else if (generate && !inputs->has_hudless) {
         ++g_stats.hudless_none;
     } else if (generate && inputs->has_hudless) {
@@ -1093,6 +1302,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     begin_cb(slot.command, &begin);
+    if (hudless_pad) RecordPad(slot.command, slot.pad, inputs->hudless);
 
     const auto camera = FromCamera(inputs->view_to_clip, inputs->camera_valid);
     // Our vectors are render pixels towards the previous frame, as FSR 3.1 takes them
