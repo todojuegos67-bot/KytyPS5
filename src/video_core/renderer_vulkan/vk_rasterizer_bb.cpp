@@ -1947,7 +1947,10 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
         // The source's alpha back into the output, non-finite colour cleared (bb_alpha.comp).
         // Not on the window-size path: the presenter reads no alpha (its view maps alpha to
         // one) and the HUD composite clears non-finite colour itself: a 4K read + write saved.
-        if (!present_path && InitAlpha()) {
+        // 1.39: also on the window path when the HUD canvas takes the output: the canvas is the
+        // game's UI image at the output size, so it needs the UI image's own alpha (the blood
+        // echoes widget / final pass read destination alpha: faint counter, green box in 1.37).
+        if ((!present_path || BB::Upscale::HudCanvasWanted()) && InitAlpha()) {
             Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral,
                     vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
                     vk::PipelineStageFlagBits2::eComputeShader,
