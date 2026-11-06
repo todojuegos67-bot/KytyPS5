@@ -35,7 +35,8 @@ void LoadFonts();
 bool PushTrophyToast(const std::filesystem::path& icon, const std::string& name,
                      std::string_view grade);
 
-// (bb-trophy-134) Every guest open() path (Kernel.Fs). Map loads drive the custom trophies.
-void OnGuestFileOpen(const char* path);
+// (bb-trophy-134) Every guest open() path + flags (Kernel.Fs). Map loads and character-slot
+// writes (new game) drive the custom trophies.
+void OnGuestFileOpen(const char* path, int flags);
 
 } // namespace BbMenu

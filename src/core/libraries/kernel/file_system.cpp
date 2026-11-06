@@ -90,7 +90,7 @@ namespace Libraries::Kernel {
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
-    BbMenu::OnGuestFileOpen(raw_path);
+    BbMenu::OnGuestFileOpen(raw_path, flags);
 
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();

@@ -2061,6 +2061,14 @@ std::deque<MapLoad> g_map_loads;
 std::string g_last_map; // last map loaded this session (any time)
 std::chrono::steady_clock::time_point g_last_map_at{};
 std::atomic<int> g_map_parts_logged{0};
+// (bb-trophy-134b) new game from the save container: Bloodborne keeps one container
+// (/savedata0 = .../savedata/<title>/SPRJ0005) with character slots userdata0000..0009
+// (0010 = system data). A new game writes a slot before any map load and without reading
+// that slot first; loading an existing character reads its slot (flags 0) first.
+std::atomic<int> g_newgame_slot{-1};
+std::atomic<bool> g_any_map_session{false};
+std::atomic<unsigned> g_slot_read_mask{0};
+std::atomic<int> g_slot_logged{0};
 
 // every file under the save data folders (home/<user>/savedata/...), without sce_sys
 std::vector<std::string> ScanSaves() {
@@ -2178,6 +2186,11 @@ void CustomWatcher() {
             for (const auto& m : loads) {
                 cur_map = m.id;
                 any_map = true;
+            }
+            const int ng_slot = g_newgame_slot.exchange(-1);
+            if (ng_slot >= 0 && added.empty()) {
+                added.push_back(fmt::format("/savedata0/userdata{:04d} (new character slot write)",
+                                            ng_slot));
             }
             if (!added.empty()) {
                 CustomState fresh;
@@ -3770,11 +3783,33 @@ bool OnSdlEvent(SDL_Event& event) {
 
 
 // (bb-trophy-134) guest open() hook: map loads for the custom trophies. Any thread, cheap.
-void OnGuestFileOpen(const char* path) {
+void OnGuestFileOpen(const char* path, int flags) {
     if (path == nullptr) {
         return;
     }
     const std::string_view p{path};
+    if (p.starts_with("/savedata0/userdata") && p.size() == 23) {
+        const int slot = (p[19] - '0') * 1000 + (p[20] - '0') * 100 + (p[21] - '0') * 10 + (p[22] - '0');
+        const bool write = (flags & 3) != 0;
+        if (g_slot_logged.fetch_add(1) < 60) {
+            LOG_INFO(Frontend, "[bbtrophy] save slot userdata{:04d} {} (map loaded this session: {})",
+                     slot, write ? "write" : "read", g_any_map_session.load());
+        }
+        if (slot >= 0 && slot <= 9) {
+            const unsigned bit = 1u << slot;
+            if (!write) {
+                g_slot_read_mask.fetch_or(bit);
+            } else if (!g_any_map_session.load() && (g_slot_read_mask.load() & bit) == 0) {
+                g_slot_read_mask.fetch_or(bit); // once per slot and session
+                LOG_INFO(Frontend,
+                         "[bbtrophy] new game: character slot userdata{:04d} written before any "
+                         "map load, without being read first",
+                         slot);
+                g_newgame_slot = slot;
+            }
+        }
+        return;
+    }
     const auto ev = p.find("/event/m");
     if (ev != std::string_view::npos && p.ends_with(".emevd.dcx") && p.size() >= ev + 7 + 12) {
         const std::string id{p.substr(ev + 7, 12)}; // mAA_BB_CC_DD
@@ -3785,6 +3820,7 @@ void OnGuestFileOpen(const char* path) {
                            : id == kMapDream ? " (Hunter's Dream)"
                                              : "";
         LOG_INFO(Frontend, "[bbtrophy] map load {}{}", id, what);
+        g_any_map_session = true;
         std::scoped_lock lk{g_map_mtx};
         g_map_loads.push_back({id, std::chrono::steady_clock::now()});
         g_last_map = id;
