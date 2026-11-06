@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "font_data.h"
 #include "font_stack.h"
+#include "imgui/bb_menu.h"
 #include "imgui/imgui_layer.h"
 #include "imgui_core.h"
 #include "imgui_impl_sdl3.h"
@@ -113,6 +114,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     io.Fonts->TexMaxHeight = atlas_max;
 
     io.FontGlobalScale = 0.5f;
+    BbMenu::LoadFonts(); // (bb-menu-121) the F1 menu's fonts (menu_assets\fonts)
     BB::Metrics::InitPanel(); // (bb-metrics-043) the F8 metrics panel's face; BB_METRICS=1 shows it
 
     StyleColorsDark();

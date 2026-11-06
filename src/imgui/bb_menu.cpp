@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// (bb-menu-121) Reworked: full-screen hub + one screen per section, see the 1.21 notes below.
 // (bb-menu-104) The Bloodborne F1 menu. Look and layout from the Demon's Souls port's F1 menu
 // (ds-menu.cpp: dark panel, gold titles, the launcher's pad photo mando-ps5.png / mando-8bitdo.png
 // and raton.png with clickable spots; trophy page; trophy popup card and chime of trophy.cpp).
@@ -225,8 +226,8 @@ std::string KeyName(u32 code, bool mouse) {
 
 std::string Pretty(const std::string& token) {
     static const std::map<std::string, std::string> names = {
-        {"cross", "✕ Cruz"}, {"circle", "○ Círculo"}, {"square", "□ Cuadrado"},
-        {"triangle", "△ Triángulo"}, {"l1", "L1"}, {"r1", "R1"}, {"l2", "L2"}, {"r2", "R2"},
+        {"cross", "Cruz"}, {"circle", "Círculo"}, {"square", "Cuadrado"},
+        {"triangle", "Triángulo"}, {"l1", "L1"}, {"r1", "R1"}, {"l2", "L2"}, {"r2", "R2"},
         {"l3", "L3"}, {"r3", "R3"}, {"options", "OPTIONS"}, {"back", "SHARE"},
         {"share", "SHARE"}, {"pad_up", "Cruceta arriba"}, {"pad_down", "Cruceta abajo"},
         {"pad_left", "Cruceta izquierda"}, {"pad_right", "Cruceta derecha"},
@@ -504,41 +505,302 @@ void DrawSymbol(ImDrawList* dl, const std::string& out, ImVec2 c, float r, ImU32
     }
 }
 
-// ---------------------------------------------------------------- the mapper pages
+// ---------------------------------------------------------------- 1.21 look: fonts, palette, helpers
+// (bb-menu-121) Fonts (SIL OFL 1.1, menu_assets\fonts, licences next to them): Cinzel for titles,
+// Cormorant Garamond for text, Inter for small UI. Dynamic ImGui fonts: baked at the pixel size
+// each call asks for (sharp at 1440p), Spanish accents included. Missing files: default font.
+ImFont* g_ft_title = nullptr;
+ImFont* g_ft_text = nullptr;
+ImFont* g_ft_italic = nullptr;
+ImFont* g_ft_ui = nullptr;
+
+ImFont* FT(ImFont* f) {
+    return f != nullptr ? f : ImGui::GetFont();
+}
+float FontK() {
+    const ImGuiStyle& s = ImGui::GetStyle();
+    float k = s.FontScaleMain * s.FontScaleDpi;
+#ifndef IMGUI_DISABLE_OBSOLETE_FUNCTIONS
+    k *= ImGui::GetIO().FontGlobalScale; // shadPS4 sets the legacy 0.5
+#endif
+    return k > 0.01f ? k : 1.0f;
+}
+void PushF(ImFont* f, float px) {
+    ImGui::PushFont(f, std::max(1.0f, px / FontK()));
+}
+
+// global alpha of what is drawn now (menu open/close x screen transition)
+float g_a = 1.0f;
+ImU32 Col(int r, int g, int b, float a = 1.0f) {
+    return IM_COL32(r, g, b, static_cast<int>(255.0f * std::clamp(a * g_a, 0.0f, 1.0f)));
+}
+ImU32 Gold(float a = 1.0f) {
+    return Col(228, 192, 122, a);
+}
+ImU32 Bronze(float a = 1.0f) {
+    return Col(158, 112, 62, a);
+}
+ImU32 Parch(float a = 1.0f) {
+    return Col(236, 228, 212, a);
+}
+ImU32 Muted(float a = 1.0f) {
+    return Col(158, 148, 134, a);
+}
+
+float EaseOutBack(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    const float c1 = 1.70158f, c3 = c1 + 1.0f;
+    return 1.0f + c3 * std::pow(x - 1.0f, 3.0f) + c1 * std::pow(x - 1.0f, 2.0f);
+}
+float Approach(float cur, float target, float dt, float speed) {
+    return cur + (target - cur) * std::min(1.0f, dt * speed);
+}
+float Now() {
+    return static_cast<float>(ImGui::GetTime());
+}
+
+int Utf8Len(unsigned char c) {
+    return c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4;
+}
+ImVec2 TextSize(ImFont* f, float px, const char* s, const char* e = nullptr) {
+    return FT(f)->CalcTextSizeA(px, FLT_MAX, 0.0f, s, e);
+}
+void Txt(ImDrawList* dl, ImFont* f, float px, ImVec2 p, ImU32 c, const char* s,
+         const char* e = nullptr) {
+    dl->AddText(FT(f), px, {std::floor(p.x), std::floor(p.y)}, c, s, e);
+}
+void TxtC(ImDrawList* dl, ImFont* f, float px, float cx, float y, ImU32 c, const char* s) {
+    Txt(dl, f, px, {cx - TextSize(f, px, s).x * 0.5f, y}, c, s);
+}
+void TxtR(ImDrawList* dl, ImFont* f, float px, float rx, float y, ImU32 c, const char* s) {
+    Txt(dl, f, px, {rx - TextSize(f, px, s).x, y}, c, s);
+}
+// letter-spaced caps (titles)
+float SpacedW(ImFont* f, float px, const char* s, float sp) {
+    float w = 0;
+    for (const char* p = s; *p;) {
+        const int n = Utf8Len(static_cast<unsigned char>(*p));
+        w += TextSize(f, px, p, p + n).x + sp;
+        p += n;
+    }
+    return std::max(0.0f, w - sp);
+}
+void TxtSpaced(ImDrawList* dl, ImFont* f, float px, ImVec2 p, ImU32 c, const char* s, float sp,
+               bool center) {
+    float x = center ? p.x - SpacedW(f, px, s, sp) * 0.5f : p.x;
+    for (const char* q = s; *q;) {
+        const int n = Utf8Len(static_cast<unsigned char>(*q));
+        Txt(dl, f, px, {x, p.y}, c, q, q + n);
+        x += TextSize(f, px, q, q + n).x + sp;
+        q += n;
+    }
+}
+std::vector<std::string> Wrap(ImFont* f, float px, const std::string& s, float w) {
+    std::vector<std::string> lines;
+    std::string cur, word;
+    std::stringstream ss(s);
+    while (ss >> word) {
+        const std::string t = cur.empty() ? word : cur + " " + word;
+        if (!cur.empty() && TextSize(f, px, t.c_str()).x > w) {
+            lines.push_back(cur);
+            cur = word;
+        } else {
+            cur = t;
+        }
+    }
+    if (!cur.empty()) {
+        lines.push_back(cur);
+    }
+    return lines;
+}
+
+// thin gold rule with a diamond in the middle, fading at both ends
+void OrnLine(ImDrawList* dl, float cx, float y, float half, float a, float u) {
+    const ImU32 c = Gold(a), z = Gold(0.0f);
+    const float gap = 16 * u, th = std::max(1.0f, 1.3f * u), d = 5.5f * u;
+    dl->AddRectFilledMultiColor({cx - half, y - th * 0.5f}, {cx - gap, y + th * 0.5f}, z, c, c, z);
+    dl->AddRectFilledMultiColor({cx + gap, y - th * 0.5f}, {cx + half, y + th * 0.5f}, c, z, z, c);
+    dl->AddQuadFilled({cx, y - d}, {cx + d, y}, {cx, y + d}, {cx - d, y}, c);
+    dl->AddQuad({cx, y - d * 2.0f}, {cx + d * 2.0f, y}, {cx, y + d * 2.0f}, {cx - d * 2.0f, y},
+                Gold(a * 0.55f), th);
+    dl->AddCircleFilled({cx - gap - 6 * u, y}, 1.8f * u, c);
+    dl->AddCircleFilled({cx + gap + 6 * u, y}, 1.8f * u, c);
+}
+
+// a dark gothic panel: soft shadow, vertical gradient, bronze frame, inner hairline,
+// corner filigree. glow 0..1 lights the frame.
+void Panel(ImDrawList* dl, ImVec2 a, ImVec2 b, float u, float glow = 0.0f, float fill = 1.0f) {
+    const float r = 6 * u;
+    for (int i = 3; i >= 1; i--) {
+        const float g = i * 7.0f * u;
+        dl->AddRectFilled({a.x - g * 0.5f, a.y - g * 0.2f + 8 * u}, {b.x + g * 0.5f, b.y + g + 8 * u},
+                          Col(0, 0, 0, 0.10f * fill), r + g);
+    }
+    if (glow > 0.01f) {
+        for (int i = 4; i >= 1; i--) {
+            const float g = i * 3.0f * u;
+            dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, Gold(0.10f * glow / i * 2.0f),
+                        r + g, 0, 2.0f * u);
+        }
+    }
+    dl->AddRectFilledMultiColor(a, b, Col(30, 25, 22, 0.94f * fill), Col(30, 25, 22, 0.94f * fill),
+                                Col(11, 10, 11, 0.96f * fill), Col(11, 10, 11, 0.96f * fill));
+    dl->AddRect(a, b, Bronze(0.55f + 0.45f * glow), r, 0, std::max(1.0f, 1.2f * u));
+    const float in = 7 * u;
+    dl->AddRect({a.x + in, a.y + in}, {b.x - in, b.y - in}, Gold(0.08f + 0.12f * glow), r * 0.5f, 0,
+                1.0f);
+    const float c = 22 * u;
+    const ImVec2 cs[4] = {{a.x + in, a.y + in}, {b.x - in, a.y + in}, {a.x + in, b.y - in},
+                          {b.x - in, b.y - in}};
+    for (int k = 0; k < 4; k++) {
+        const float sx = (k & 1) ? -1.0f : 1.0f, sy = (k & 2) ? -1.0f : 1.0f;
+        const ImU32 gc = Gold(0.55f + 0.4f * glow);
+        dl->AddLine(cs[k], {cs[k].x + sx * c, cs[k].y}, gc, std::max(1.0f, 1.4f * u));
+        dl->AddLine(cs[k], {cs[k].x, cs[k].y + sy * c}, gc, std::max(1.0f, 1.4f * u));
+        const ImVec2 q{cs[k].x + sx * 6 * u, cs[k].y + sy * 6 * u};
+        const float d = 2.6f * u;
+        dl->AddQuadFilled({q.x, q.y - d}, {q.x + d, q.y}, {q.x, q.y + d}, {q.x - d, q.y}, gc);
+    }
+}
+
+// an invisible hit area; the cursor is always followed by an item (no boundary asserts)
+bool Hit(const char* id, ImVec2 a, ImVec2 b, bool* hovered = nullptr) {
+    ImGui::SetCursorScreenPos(a);
+    const bool r =
+        ImGui::InvisibleButton(id, {std::max(1.0f, b.x - a.x), std::max(1.0f, b.y - a.y)});
+    if (hovered != nullptr) {
+        *hovered = ImGui::IsItemHovered();
+    }
+    return r;
+}
+bool MouseMoved() {
+    const ImVec2 d = ImGui::GetIO().MouseDelta;
+    return d.x != 0.0f || d.y != 0.0f;
+}
+
+// ---------------------------------------------------------------- menu navigation
+// Pad / keyboard navigation goes through this queue (main thread pushes, render thread takes):
+// only the d-pad, the face buttons and L1 / R1 move the menu; the sticks never do.
+enum class Nav { Up, Down, Left, Right, Accept, Back, Clear, Prev, Next };
+std::mutex g_nav_mtx;
+std::vector<Nav> g_nav;
+void PushNav(Nav n) {
+    std::scoped_lock lk{g_nav_mtx};
+    if (g_nav.size() < 16) {
+        g_nav.push_back(n);
+    }
+}
+std::vector<Nav> TakeNav() {
+    std::scoped_lock lk{g_nav_mtx};
+    std::vector<Nav> v;
+    v.swap(g_nav);
+    return v;
+}
+
+// ---------------------------------------------------------------- PS4 glyphs
+ImU32 FaceColor(const std::string& out, float a) {
+    if (out == "triangle") return Col(112, 196, 182, a);
+    if (out == "circle") return Col(222, 112, 108, a);
+    if (out == "cross") return Col(132, 158, 226, a);
+    if (out == "square") return Col(214, 142, 196, a);
+    return Gold(a);
+}
+std::string FocusKey(const std::string& out) {
+    if (out.starts_with("axis_left")) return "stick_left";
+    if (out.starts_with("axis_right")) return "stick_right";
+    return out;
+}
+std::string Short(const std::string& out) {
+    static const std::map<std::string, std::string> m = {
+        {"l1", "L1"}, {"r1", "R1"}, {"l2", "L2"}, {"r2", "R2"}, {"l3", "L3"}, {"r3", "R3"},
+        {"options", "OPT"}, {"touchpad_center", "TP"}, {"back", "SH"},
+        {"pad_up", "\xe2\x86\x91"}, {"pad_down", "\xe2\x86\x93"}, {"pad_left", "\xe2\x86\x90"},
+        {"pad_right", "\xe2\x86\x92"}, {"stick_left", "LS"}, {"stick_right", "RS"},
+        {"axis_left_y_minus", "LS\xe2\x86\x91"}, {"axis_left_y_plus", "LS\xe2\x86\x93"},
+        {"axis_left_x_minus", "LS\xe2\x86\x90"}, {"axis_left_x_plus", "LS\xe2\x86\x92"},
+        {"axis_right_y_minus", "RS\xe2\x86\x91"}, {"axis_right_y_plus", "RS\xe2\x86\x93"},
+        {"axis_right_x_minus", "RS\xe2\x86\x90"}, {"axis_right_x_plus", "RS\xe2\x86\x92"}};
+    if (auto it = m.find(out); it != m.end()) return it->second;
+    return "?";
+}
+// a round PS4 button badge: face symbols drawn, the rest as short text
+void Glyph(ImDrawList* dl, const std::string& out, ImVec2 c, float r, float a = 1.0f,
+           bool lit = false) {
+    if (lit) {
+        for (int i = 3; i >= 1; i--) {
+            dl->AddCircleFilled(c, r + i * r * 0.18f, Gold(0.10f * a));
+        }
+    }
+    dl->AddCircleFilled(c, r, Col(18, 15, 14, 0.96f * a));
+    dl->AddCircle(c, r, lit ? Gold(a) : Bronze(0.9f * a), 0, std::max(1.0f, r * 0.08f));
+    if (out == "cross" || out == "circle" || out == "square" || out == "triangle") {
+        DrawSymbol(dl, out, c, r * 0.62f, FaceColor(out, a));
+        return;
+    }
+    const std::string s = Short(out);
+    const float px = s.size() <= 2 || s.starts_with("\xe2") ? r * 0.95f : r * 0.72f;
+    const ImVec2 ts = TextSize(g_ft_ui, px, s.c_str());
+    Txt(dl, g_ft_ui, px, {c.x - ts.x * 0.5f, c.y - ts.y * 0.5f}, Parch(a), s.c_str());
+}
+// a keyboard key cap
+float KeyCapW(const std::string& label, float u) {
+    return TextSize(g_ft_ui, 19 * u, label.c_str()).x + 22 * u;
+}
+void KeyCap(ImDrawList* dl, ImVec2 p, const std::string& label, float u, float a, bool lit) {
+    const float w = KeyCapW(label, u), h = 34 * u;
+    dl->AddRectFilled({p.x, p.y + 3 * u}, {p.x + w, p.y + h + 3 * u}, Col(0, 0, 0, 0.5f * a),
+                      6 * u);
+    dl->AddRectFilledMultiColor(p, {p.x + w, p.y + h}, Col(48, 42, 36, a), Col(48, 42, 36, a),
+                                Col(26, 23, 21, a), Col(26, 23, 21, a));
+    dl->AddRect(p, {p.x + w, p.y + h}, lit ? Gold(a) : Bronze(0.8f * a), 6 * u, 0,
+                std::max(1.0f, 1.2f * u));
+    Txt(dl, g_ft_ui, 19 * u, {p.x + 11 * u, p.y + (h - 19 * u) * 0.5f - 1 * u},
+        lit ? Gold(a) : Parch(a), label.c_str());
+}
+
+// ---------------------------------------------------------------- the pads: spots and rows
 struct Spot {
-    const char* output; // input-config output ("stick_left" = both axes)
-    const char* label;
-    float x, y, d, h; // centre and size on the 350 px high photo
+    const char* output; // PS4 output (game photo) or physical input (your pad)
+    float x, y, d, h;   // centre and size in the photo's pixels
 };
 
-// mando-ps5.png (532 x 350): the DS port's measured spots + the shoulders, SHARE and PS.
-const Spot kPadSpots[] = {
-    {"pad_up", "Cruceta arriba", 96, 62, 29, 29},
-    {"pad_down", "Cruceta abajo", 96, 126, 29, 29},
-    {"pad_left", "Cruceta izquierda", 65, 93, 29, 29},
-    {"pad_right", "Cruceta derecha", 128, 93, 29, 29},
-    {"triangle", "△ Triángulo", 435, 60, 38, 38},
-    {"circle", "○ Círculo", 472, 94, 38, 38},
-    {"cross", "✕ Cruz", 435, 131, 38, 38},
-    {"square", "□ Cuadrado", 398, 94, 38, 38},
-    {"l3", "L3 (pulsar stick izq.)", 178, 160, 67, 67},
-    {"r3", "R3 (pulsar stick der.)", 346, 160, 67, 67},
-    {"options", "OPTIONS", 389, 32, 20, 20},
-    {"touchpad_center", "Panel táctil", 265, 52, 150, 80},
-    {"l1", "L1", 95, 9, 56, 16},
-    {"r1", "R1", 432, 9, 56, 16},
+// mando-ps4.png (1536 x 1024): the game's pad. L2 / R2 drawn over the bumpers' top.
+const Spot kPs4Spots[] = {
+    {"l2", 360, 52, 150, 36},         {"r2", 1176, 52, 150, 36},
+    {"l1", 360, 102, 170, 40},        {"r1", 1176, 102, 170, 40},
+    {"pad_up", 350, 240, 64, 64},     {"pad_down", 350, 380, 64, 64},
+    {"pad_left", 282, 310, 64, 64},   {"pad_right", 418, 310, 64, 64},
+    {"triangle", 1194, 213, 88, 88},  {"circle", 1286, 311, 88, 88},
+    {"cross", 1194, 410, 88, 88},     {"square", 1100, 311, 88, 88},
+    {"l3", 555, 492, 150, 150},       {"r3", 985, 492, 150, 150},
+    {"stick_left", 555, 492, 200, 200}, {"stick_right", 985, 492, 200, 200},
+    {"options", 1040, 182, 40, 74},   {"back", 497, 182, 40, 74},
+    {"touchpad_center", 768, 245, 420, 220},
 };
-// mando-8bitdo.png (537 x 350), the DS port's spots, PS4 meaning.
-const Spot kAltSpots[] = {
-    {"triangle", "△ Triángulo", 416, 58, 38, 38}, {"square", "□ Cuadrado", 377, 95, 38, 38},
-    {"circle", "○ Círculo", 456, 95, 38, 38},     {"cross", "✕ Cruz", 416, 132, 38, 38},
-    {"l3", "L3", 125, 86, 72, 72},                {"r3", "R3", 339, 156, 72, 72},
-    {"pad_up", "Cruceta arriba", 193, 140, 25, 25},
-    {"pad_down", "Cruceta abajo", 193, 192, 25, 25},
-    {"pad_left", "Cruceta izquierda", 167, 166, 25, 25},
-    {"pad_right", "Cruceta derecha", 219, 166, 25, 25},
-    {"touchpad_center", "Panel táctil (SHARE)", 226, 89, 22, 22},
-    {"options", "OPTIONS", 312, 89, 22, 22},
+// your pad, physical inputs (the input config's words); triggers above the photo
+const Spot kPs5Phys[] = {
+    {"pad_up", 96, 62, 29, 29},    {"pad_down", 96, 126, 29, 29}, {"pad_left", 65, 93, 29, 29},
+    {"pad_right", 128, 93, 29, 29}, {"triangle", 435, 60, 38, 38}, {"circle", 472, 94, 38, 38},
+    {"cross", 435, 131, 38, 38},   {"square", 398, 94, 38, 38},   {"l3", 178, 160, 67, 67},
+    {"r3", 346, 160, 67, 67},      {"options", 389, 32, 20, 20},  {"back", 142, 32, 20, 20},
+    {"l1", 95, 9, 56, 16},         {"r1", 432, 9, 56, 16},        {"l2", 95, -16, 56, 16},
+    {"r2", 432, -16, 56, 16},
+};
+const Spot k8bdPhys[] = {
+    {"triangle", 416, 58, 38, 38}, {"square", 377, 95, 38, 38},   {"circle", 456, 95, 38, 38},
+    {"cross", 416, 132, 38, 38},   {"l3", 125, 86, 72, 72},       {"r3", 339, 156, 72, 72},
+    {"pad_up", 193, 140, 25, 25},  {"pad_down", 193, 192, 25, 25}, {"pad_left", 167, 166, 25, 25},
+    {"pad_right", 219, 166, 25, 25}, {"back", 226, 89, 22, 22},   {"options", 312, 89, 22, 22},
+    {"l1", 100, 6, 60, 16},        {"r1", 437, 6, 60, 16},        {"l2", 100, -18, 60, 16},
+    {"r2", 437, -18, 60, 16},
+};
+const Spot kPs4Phys[] = {
+    {"l2", 360, 52, 150, 36},        {"r2", 1176, 52, 150, 36},       {"l1", 360, 102, 170, 40},
+    {"r1", 1176, 102, 170, 40},      {"pad_up", 350, 240, 64, 64},    {"pad_down", 350, 380, 64, 64},
+    {"pad_left", 282, 310, 64, 64},  {"pad_right", 418, 310, 64, 64}, {"triangle", 1194, 213, 88, 88},
+    {"circle", 1286, 311, 88, 88},   {"cross", 1194, 410, 88, 88},    {"square", 1100, 311, 88, 88},
+    {"l3", 555, 492, 150, 150},      {"r3", 985, 492, 150, 150},      {"options", 1040, 182, 40, 74},
+    {"back", 497, 182, 40, 74},
 };
 
 struct Row {
@@ -546,23 +808,23 @@ struct Row {
     const char* label;
 };
 const Row kPadRows[] = {
-    {"cross", "✕ Cruz"},          {"circle", "○ Círculo"},
-    {"square", "□ Cuadrado"},     {"triangle", "△ Triángulo"},
-    {"l1", "L1"},                 {"r1", "R1"},
-    {"l2", "L2"},                 {"r2", "R2"},
-    {"l3", "L3"},                 {"r3", "R3"},
-    {"options", "OPTIONS"},       {"touchpad_center", "Panel táctil"},
+    {"cross", "Cruz"},          {"circle", "Círculo"},
+    {"square", "Cuadrado"},     {"triangle", "Triángulo"},
+    {"l1", "L1"},               {"r1", "R1"},
+    {"l2", "L2"},               {"r2", "R2"},
+    {"l3", "L3"},               {"r3", "R3"},
+    {"options", "OPTIONS"},     {"touchpad_center", "Panel táctil"},
     {"pad_up", "Cruceta arriba"}, {"pad_down", "Cruceta abajo"},
     {"pad_left", "Cruceta izquierda"}, {"pad_right", "Cruceta derecha"},
-    {"stick_left", "Stick izquierdo (mover)"}, {"stick_right", "Stick derecho (cámara)"},
+    {"stick_left", "Stick izquierdo"}, {"stick_right", "Stick derecho"},
 };
 const Row kKbmRows[] = {
-    {"cross", "✕ Cruz"},          {"circle", "○ Círculo"},
-    {"square", "□ Cuadrado"},     {"triangle", "△ Triángulo"},
-    {"l1", "L1"},                 {"r1", "R1"},
-    {"l2", "L2"},                 {"r2", "R2"},
-    {"l3", "L3"},                 {"r3", "R3"},
-    {"options", "OPTIONS"},       {"touchpad_center", "Panel táctil"},
+    {"cross", "Cruz"},          {"circle", "Círculo"},
+    {"square", "Cuadrado"},     {"triangle", "Triángulo"},
+    {"l1", "L1"},               {"r1", "R1"},
+    {"l2", "L2"},               {"r2", "R2"},
+    {"l3", "L3"},               {"r3", "R3"},
+    {"options", "OPTIONS"},     {"touchpad_center", "Panel táctil"},
     {"pad_up", "Cruceta arriba"}, {"pad_down", "Cruceta abajo"},
     {"pad_left", "Cruceta izquierda"}, {"pad_right", "Cruceta derecha"},
     {"axis_left_y_minus", "Stick izq. arriba"}, {"axis_left_y_plus", "Stick izq. abajo"},
@@ -571,12 +833,57 @@ const Row kKbmRows[] = {
     {"axis_right_x_minus", "Stick der. izquierda"}, {"axis_right_x_plus", "Stick der. derecha"},
 };
 
+// Bloodborne's own (PS4) controls
+const char* DefaultFn(const std::string& out) {
+    static const std::map<std::string, const char*> m = {
+        {"r1", "Ataque ligero"},
+        {"r2", "Ataque fuerte / cargado"},
+        {"l1", "Transformar arma"},
+        {"l2", "Arma de fuego / mano izq."},
+        {"triangle", "Vial de sangre"},
+        {"square", "Usar objeto rápido"},
+        {"circle", "Esquivar / correr"},
+        {"cross", "Acción / interactuar"},
+        {"l3", "Saltar (corriendo)"},
+        {"r3", "Fijar objetivo"},
+        {"options", "Menú"},
+        {"touchpad_center", "Gestos"},
+        {"pad_up", "Cambiar objeto"},
+        {"pad_down", "Cambiar objeto rápido"},
+        {"pad_left", "Arma de mano izquierda"},
+        {"pad_right", "Arma de mano derecha"},
+        {"stick_left", "Moverse"},
+        {"stick_right", "Cámara"},
+        {"back", "Compartir"},
+    };
+    if (auto it = m.find(FocusKey(out)); it != m.end()) return it->second;
+    return "";
+}
+const char* RowLabel(const std::string& out) {
+    for (const auto& r : kKbmRows) {
+        if (out == r.output) return r.label;
+    }
+    for (const auto& r : kPadRows) {
+        if (out == r.output) return r.label;
+    }
+    return "";
+}
+
 std::vector<std::string> Group(const Row* rows, size_t n) {
     std::vector<std::string> g;
     for (size_t i = 0; i < n; i++) {
         g.emplace_back(rows[i].output);
     }
     return g;
+}
+std::vector<std::string> Tokens(const std::string& s) {
+    std::vector<std::string> v;
+    std::stringstream ss(s);
+    std::string t;
+    while (std::getline(ss, t, ',')) {
+        if (!t.empty()) v.push_back(t);
+    }
+    return v;
 }
 
 std::string BindingText(const std::string& output, Cat cat) {
@@ -585,6 +892,16 @@ std::string BindingText(const std::string& output, Cat cat) {
         return x.empty() ? "(sin asignar)" : Pretty(x);
     }
     return g_cfg.Get(output, cat);
+}
+// the physical inputs (your pad) bound to a PS4 output
+std::vector<std::string> PhysOf(const std::string& output) {
+    if (output == "stick_left" || output == "stick_right") {
+        const auto x = g_cfg.GetRaw(output == "stick_left" ? "axis_left_x" : "axis_right_x", Cat::Pad);
+        if (x.starts_with("axis_left")) return {"l3"};
+        if (x.starts_with("axis_right")) return {"r3"};
+        return {};
+    }
+    return Tokens(g_cfg.GetRaw(output, Cat::Pad));
 }
 
 void StartCapture(Capture c, const std::string& target) {
@@ -595,6 +912,12 @@ void StartCapture(Capture c, const std::string& target) {
     g_captured.clear();
     g_cap_cancel = false;
 }
+void StartCaptureFor(const std::string& out, Cat cat) {
+    StartCapture(cat == Cat::Kbm ? Capture::Kbm
+                 : out.starts_with("stick_") ? Capture::PadStick
+                                             : Capture::Pad,
+                 out);
+}
 
 // The capture's result, applied on the render thread.
 void ApplyCapture() {
@@ -603,7 +926,14 @@ void ApplyCapture() {
     Capture kind;
     {
         std::scoped_lock lk{g_cap_mtx};
-        if (g_capture == Capture::None || (g_captured.empty() && !g_cap_cancel)) {
+        if (g_capture == Capture::None) {
+            return;
+        }
+        // 5 s without an input: cancelled
+        if (g_captured.empty() && !g_cap_cancel && SDL_GetTicks() - g_capture_since > 5250) {
+            g_cap_cancel = true;
+        }
+        if (g_captured.empty() && !g_cap_cancel) {
             return;
         }
         got = g_captured;
@@ -633,300 +963,332 @@ void ApplyCapture() {
     }
 }
 
-bool PhysicallyHeld(const std::string& output) {
-    // the outputs whose pad binding is a button held now (the live highlight)
+// a physical input held now
+bool PhysHeld(const std::string& token) {
     const u32 bits = g_pad_buttons.load();
     for (u8 b = 0; b < 32; b++) {
         if ((bits & (1u << b)) != 0) {
-            if (const char* n = PadName(b); n != nullptr && g_cfg.Uses(output, Cat::Pad, n)) {
+            if (const char* n = PadName(b); n != nullptr && token == n) {
                 return true;
             }
         }
     }
-    if (g_trig_l > 12000 && g_cfg.Uses(output, Cat::Pad, "l2")) {
-        return true;
-    }
-    if (g_trig_r > 12000 && g_cfg.Uses(output, Cat::Pad, "r2")) {
-        return true;
+    return (token == "l2" && g_trig_l > 12000) || (token == "r2" && g_trig_r > 12000);
+}
+// a PS4 output whose pad binding is held now (the live highlight)
+bool PhysicallyHeld(const std::string& output) {
+    for (const auto& t : PhysOf(output)) {
+        if (PhysHeld(t)) return true;
     }
     return false;
 }
 
-std::string g_selected;
-
-// One photo with its spots; returns the output clicked ("" none).
-std::string Photo(const char* id, ImTextureID tex, float tw, float th, const Spot* spots,
-                  size_t n, ImVec2 at, float scale) {
-    auto* dl = ImGui::GetWindowDrawList();
-    const float w = tw * scale, h = th * scale;
-    if (tex) {
-        dl->AddImage(tex, at, {at.x + w, at.y + h});
-    } else {
-        dl->AddRectFilled(at, {at.x + w, at.y + h}, IM_COL32(40, 44, 54, 255), 12 * scale);
-        dl->AddText({at.x + 12, at.y + 12}, IM_COL32(220, 200, 150, 255),
-                    "(imagen no encontrada: menu_assets)");
-    }
-    std::string clicked;
+Tex g_ps4_tex;
+const Spot* FindSpot(const Spot* s, size_t n, const std::string& out) {
     for (size_t i = 0; i < n; i++) {
-        const Spot& sp = spots[i];
-        const ImVec2 c{at.x + sp.x * scale, at.y + sp.y * scale};
-        const ImVec2 half{sp.d * scale * 0.5f, sp.h * scale * 0.5f};
-        ImGui::SetCursorScreenPos({c.x - half.x, c.y - half.y});
-        ImGui::PushID(id);
-        ImGui::PushID(static_cast<int>(i));
-        const bool pressed = ImGui::InvisibleButton(
-            "##spot", {std::max(1.0f, half.x * 2), std::max(1.0f, half.y * 2)});
-        const bool over = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-        ImGui::PopID();
-        ImGui::PopID();
-        const bool on = g_selected == sp.output || PhysicallyHeld(sp.output);
-        const ImU32 ring = on     ? kRing
-                           : over ? IM_COL32(236, 200, 120, 200)
-                                  : IM_COL32(236, 200, 120, 90);
+        if (out == s[i].output) return &s[i];
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------- the game's pad (left panel)
+// The DS4 photo with a callout per PS4 button: its glyph and Bloodborne's default function,
+// joined to the button by a thin gold leader. Returns the output clicked; `hover` gets the
+// output under the mouse; `anchors` the spots' screen centres (for the links).
+std::string Ps4Panel(ImVec2 a, ImVec2 b, float u, const std::string& focus, std::string& hover,
+                     std::map<std::string, ImVec2>& anchors, const char* subtitle) {
+    auto* dl = ImGui::GetWindowDrawList();
+    Panel(dl, a, b, u);
+    Txt(dl, g_ft_title, 30 * u, {a.x + 30 * u, a.y + 22 * u}, Gold(), "MANDO DE PS4");
+    Txt(dl, g_ft_italic, 24 * u, {a.x + 30 * u, a.y + 58 * u}, Muted(), subtitle);
+    const ImTextureID tex = Get(g_ps4_tex, AssetDir() / "mando-ps4.png", 1536.0f, 1024.0f);
+    const float pw = b.x - a.x, top = a.y + 100 * u, bottom = b.y - 18 * u;
+    const float photo_w = std::min(pw * 0.50f, (bottom - top) * 1.5f);
+    const float s = photo_w / 1536.0f, photo_h = 1024.0f * s;
+    const ImVec2 p0{a.x + (pw - photo_w) * 0.5f, top + (bottom - top - photo_h) * 0.5f};
+    // a soft pool of light under the pad
+    for (int i = 5; i >= 1; i--) {
+        const float rr = photo_w * (0.30f + i * 0.05f);
+        dl->AddCircleFilled({p0.x + photo_w * 0.5f, p0.y + photo_h * 0.52f}, rr,
+                            Col(120, 90, 50, 0.025f), 48);
+    }
+    if (tex) {
+        dl->AddImage(tex, p0, {p0.x + photo_w, p0.y + photo_h}, {0, 0}, {1, 1}, Col(255, 255, 255));
+    }
+    const float t = Now();
+    const auto at = [&](const Spot& sp) { return ImVec2{p0.x + sp.x * s, p0.y + sp.y * s}; };
+    // spots
+    for (const auto& sp : kPs4Spots) {
+        const std::string o = sp.output;
+        const ImVec2 c = at(sp);
+        anchors[o] = c;
+        if (o == "back") continue;
+        const bool on = focus == o || hover == o;
+        const bool held = PhysicallyHeld(o);
+        const float pulse = 0.6f + 0.4f * std::sin(t * 5.0f);
+        const ImVec2 half{sp.d * s * 0.5f, sp.h * s * 0.5f};
         const bool rect = sp.d != sp.h;
-        if (on || over) {
-            if (rect) {
-                dl->AddRectFilled({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y},
-                                  IM_COL32(236, 200, 120, 90), 8 * scale);
-            } else {
-                dl->AddCircleFilled(c, half.x, IM_COL32(236, 200, 120, 90));
-            }
+        if (o == "l2" || o == "r2") {
+            // trigger ghost over the bumper
+            dl->AddRectFilled({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y},
+                              Col(24, 21, 20, 0.85f), half.y);
+            dl->AddRect({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y},
+                        on || held ? Gold() : Bronze(0.7f), half.y, 0, std::max(1.0f, 1.2f * u));
+            const char* l = o == "l2" ? "L2" : "R2";
+            const ImVec2 ts = TextSize(g_ft_ui, 17 * u, l);
+            Txt(dl, g_ft_ui, 17 * u, {c.x - ts.x * 0.5f, c.y - ts.y * 0.5f}, Parch(0.9f), l);
         }
+        if (!on && !held) {
+            continue;
+        }
+        const float al = held ? 1.0f : pulse;
         if (rect) {
-            dl->AddRect({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, ring,
-                        8 * scale, 0, on ? 3.0f : 1.5f);
+            dl->AddRectFilled({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y},
+                              Gold(0.22f * al), 10 * s);
+            dl->AddRect({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, Gold(al),
+                        10 * s, 0, 2.0f * u);
         } else {
-            dl->AddCircle(c, half.x, ring, 0, on ? 3.0f : 1.5f);
-        }
-        if (over) {
-            ImGui::SetTooltip("%s", sp.label);
-        }
-        if (pressed) {
-            clicked = sp.output;
+            for (int i = 3; i >= 1; i--) {
+                dl->AddCircle(c, half.x + i * 4 * u, Gold(0.12f * al), 0, 3.0f * u);
+            }
+            dl->AddCircleFilled(c, half.x, Gold(0.20f * al));
+            dl->AddCircle(c, half.x, Gold(al), 0, 2.0f * u);
         }
     }
-    ImGui::SetCursorScreenPos({at.x, at.y + h});
-    return clicked;
-}
-
-// L2 / R2 (not on the photo): chips over its corners.
-std::string TriggerChips(ImVec2 at, float w, float unit) {
+    // callout columns
+    static const char* kLeft[] = {"l2", "l1", "pad_up", "pad_left", "pad_right",
+                                  "pad_down", "l3", "stick_left"};
+    static const char* kRight[] = {"r2", "r1", "touchpad_center", "options", "triangle",
+                                   "square", "circle", "cross", "r3", "stick_right"};
     std::string clicked;
-    const char* names[] = {"l2", "r2"};
-    for (int i = 0; i < 2; i++) {
-        const float x = i == 0 ? at.x + 40 * unit : at.x + w - 140 * unit;
-        ImGui::SetCursorScreenPos({x, at.y});
-        const bool held = g_selected == names[i] || PhysicallyHeld(names[i]);
-        if (held) {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.45f, 0.25f, 1.0f));
+    const float row_h = std::min(52 * u, (bottom - top) / 10.5f);
+    for (int side = 0; side < 2; side++) {
+        const bool left = side == 0;
+        const char** list = left ? kLeft : kRight;
+        const int n = left ? 8 : 10;
+        std::vector<std::pair<float, const char*>> v;
+        for (int i = 0; i < n; i++) {
+            v.push_back({anchors[list[i]].y, list[i]});
         }
-        if (FancyButton(i == 0 ? "L2##chip" : "R2##chip", {100 * unit, 0})) {
-            clicked = names[i];
+        std::stable_sort(v.begin(), v.end(),
+                         [](const auto& x, const auto& y) { return x.first < y.first; });
+        // keep near the spot's height, at least a row apart, inside the panel
+        std::vector<float> ys(v.size());
+        float prev = top - row_h;
+        for (size_t i = 0; i < v.size(); i++) {
+            ys[i] = std::max(v[i].first - row_h * 0.5f, prev + row_h);
+            prev = ys[i];
         }
-        if (held) {
-            ImGui::PopStyleColor();
+        const float over = prev + row_h - bottom;
+        for (size_t i = 0; i < v.size() && over > 0; i++) {
+            ys[i] -= over;
         }
-    }
-    return clicked;
-}
-
-void CaptureBanner(float unit) {
-    std::scoped_lock lk{g_cap_mtx};
-    if (g_capture == Capture::None) {
-        return;
-    }
-    const char* what = g_capture == Capture::Kbm
-                           ? "Pulsa la tecla o el botón del ratón (Esc: cancelar)"
-                       : g_capture == Capture::PadStick
-                           ? "Mueve el stick del mando que quieres usar (Esc: cancelar)"
-                           : "Pulsa el botón del mando (Esc: cancelar)";
-    ImGui::TextColored(kWarn, "Asignando %s:  %s", Pretty(g_capture_target).c_str(), what);
-}
-
-void ListTable(const char* id, const Row* rows, size_t n, Cat cat, float unit) {
-    if (ImGui::BeginTable(id, 3,
-                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-                              ImGuiTableFlags_ScrollY,
-                          {0, ImGui::GetContentRegionAvail().y - 4 * unit})) {
-        ImGui::TableSetupColumn("Botón PS4", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Asignado a", ImGuiTableColumnFlags_WidthStretch, 1.3f);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 120 * unit);
-        ImGui::TableHeadersRow();
-        for (size_t i = 0; i < n; i++) {
-            const std::string out = rows[i].output;
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::PushID(rows[i].output);
-            const bool held = cat == Cat::Pad && PhysicallyHeld(out);
-            if (ImGui::Selectable(rows[i].label, g_selected == out || held,
-                                  ImGuiSelectableFlags_SpanAllColumns |
-                                      ImGuiSelectableFlags_AllowOverlap)) {
-                g_selected = out;
-                StartCapture(cat == Cat::Kbm               ? Capture::Kbm
-                             : out.starts_with("stick_") ? Capture::PadStick
-                                                         : Capture::Pad,
-                             out);
+        for (size_t i = 1; i < v.size(); i++) {
+            ys[i] = std::max(ys[i], ys[i - 1] + row_h);
+        }
+        const float x0 = left ? a.x + 22 * u : p0.x + photo_w - 6 * u;
+        const float x1 = left ? p0.x + 6 * u : b.x - 22 * u;
+        for (size_t i = 0; i < v.size(); i++) {
+            const std::string o = v[i].second;
+            const float y = ys[i], cy = y + row_h * 0.5f;
+            const float r = row_h * 0.34f;
+            const ImVec2 gc{left ? x1 - r - 4 * u : x0 + r + 4 * u, cy};
+            bool hov = false;
+            const std::string id = "##co_" + o;
+            if (Hit(id.c_str(), {x0, y + 2 * u}, {x1, y + row_h - 2 * u}, &hov)) {
+                clicked = o;
             }
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(BindingText(out, cat).c_str());
-            ImGui::TableSetColumnIndex(2);
-            if (!out.starts_with("stick_") && ImGui::SmallButton("Quitar")) {
-                g_cfg.Set(out, cat, "", {});
-            }
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-}
-
-void PadPage(float unit) {
-    ImGui::TextWrapped("Haz clic en un botón del mando (en la foto o en la lista) y pulsa el "
-                       "botón físico que quieras usar. Se guarda y se aplica al momento. Los "
-                       "botones que pulses se iluminan.");
-    if (ImGui::RadioButton("Mando PS", g_pad_photo == 0)) {
-        g_pad_photo = 0;
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Mando genérico", g_pad_photo == 1)) {
-        g_pad_photo = 1;
-    }
-    CaptureBanner(unit);
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const float photo_w = avail * 0.52f;
-    const ImVec2 at = ImGui::GetCursorScreenPos();
-    Tex& t = g_pad_photo == 0 ? g_pad_tex : g_pad_alt_tex;
-    const ImTextureID tex =
-        Get(t, AssetDir() / (g_pad_photo == 0 ? "mando-ps5.png" : "mando-8bitdo.png"),
-            g_pad_photo == 0 ? 532.0f : 537.0f, 350.0f);
-    const float scale = photo_w / t.w;
-    const std::string chip = TriggerChips(at, photo_w, unit);
-    const float top = at.y + ImGui::GetFrameHeightWithSpacing() + 4 * unit;
-    std::string hit = g_pad_photo == 0
-                          ? Photo("pad", tex, t.w, t.h, kPadSpots, std::size(kPadSpots),
-                                  {at.x, top}, scale)
-                          : Photo("alt", tex, t.w, t.h, kAltSpots, std::size(kAltSpots),
-                                  {at.x, top}, scale);
-    if (hit.empty()) {
-        hit = chip;
-    }
-    // the sticks' "move" entries under the photo
-    ImGui::SetCursorScreenPos({at.x, top + t.h * scale + 8 * unit});
-    if (FancyButton("Stick izquierdo (mover)")) {
-        hit = "stick_left";
-    }
-    ImGui::SameLine();
-    if (FancyButton("Stick derecho (cámara)")) {
-        hit = "stick_right";
-    }
-    if (FancyButton("Restablecer el mando de serie")) {
-        for (const auto& r : kPadRows) {
-            const std::string o = r.output;
-            if (o.starts_with("stick_")) {
-                continue;
-            }
-            g_cfg.Set(o, Cat::Pad, o, {});
-        }
-        for (const char* a : {"axis_left_x", "axis_left_y", "axis_right_x", "axis_right_y"}) {
-            g_cfg.Set(a, Cat::Pad, a, {});
-        }
-    }
-    if (!hit.empty()) {
-        g_selected = hit;
-        StartCapture(hit.starts_with("stick_") ? Capture::PadStick : Capture::Pad, hit);
-    }
-    ImGui::SetCursorScreenPos({at.x + photo_w + 24 * unit, at.y});
-    ImGui::BeginChild("##padlist", {0, ImGui::GetContentRegionAvail().y});
-    ListTable("##padtab", kPadRows, std::size(kPadRows), Cat::Pad, unit);
-    ImGui::EndChild();
-}
-
-const Spot kMouseSpots[] = {
-    {"leftbutton", "Clic izquierdo", 72, 72, 40, 40},
-    {"rightbutton", "Clic derecho", 140, 52, 40, 40},
-    {"middlebutton", "Rueda / clic central", 103, 60, 18, 18},
-    {"sidebuttonforward", "Botón lateral adelante", 40, 103, 16, 16},
-    {"sidebuttonback", "Botón lateral atrás", 48, 128, 16, 16},
-};
-
-void KbmPage(float unit) {
-    ImGui::TextWrapped("Haz clic en un botón del mando PS4 (en la foto o en la lista) y pulsa la "
-                       "tecla o el botón del ratón que quieras. Se guarda al momento.");
-    CaptureBanner(unit);
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const float photo_w = avail * 0.46f;
-    const ImVec2 at = ImGui::GetCursorScreenPos();
-    const ImTextureID tex = Get(g_pad_tex, AssetDir() / "mando-ps5.png", 532.0f, 350.0f);
-    const float scale = photo_w / g_pad_tex.w;
-    std::string hit = TriggerChips(at, photo_w, unit);
-    const float top = at.y + ImGui::GetFrameHeightWithSpacing() + 4 * unit;
-    // what the spot is bound to, under the label
-    const std::string spot = Photo("kbmpad", tex, g_pad_tex.w, g_pad_tex.h, kPadSpots,
-                                   std::size(kPadSpots), {at.x, top}, scale);
-    if (!spot.empty()) {
-        hit = spot;
-    }
-    float y = top + g_pad_tex.h * scale + 10 * unit;
-    // the mouse: its photo, the buttons it binds and mouse-look
-    const ImTextureID mtex = Get(g_mouse_tex, AssetDir() / "raton.png", 212.0f, 220.0f);
-    const float ms = (180 * unit) / g_mouse_tex.h;
-    std::string mclick = Photo("mouse", mtex, g_mouse_tex.w, g_mouse_tex.h, kMouseSpots,
-                               std::size(kMouseSpots), {at.x, y}, ms);
-    // a mouse button clicked on the photo: pick the PS4 button it does
-    static std::string s_mouse;
-    if (!mclick.empty()) {
-        s_mouse = mclick;
-        ImGui::OpenPopup("##mousebind");
-    }
-    if (ImGui::BeginPopup("##mousebind")) {
-        ImGui::TextColored(kGold, "%s hace:", Pretty(s_mouse).c_str());
-        for (const auto& r : kKbmRows) {
-            if (ImGui::Selectable(r.label, g_cfg.Uses(r.output, Cat::Kbm, s_mouse))) {
-                g_cfg.Set(r.output, Cat::Kbm, s_mouse, Group(kKbmRows, std::size(kKbmRows)));
-            }
-        }
-        if (ImGui::Selectable("(nada)")) {
-            for (const auto& r : kKbmRows) {
-                if (g_cfg.GetRaw(r.output, Cat::Kbm) == s_mouse) {
-                    g_cfg.Set(r.output, Cat::Kbm, "", {});
+            if (hov) hover = o;
+            const bool on = focus == o || hover == o;
+            if (on) {
+                const ImU32 g0 = Gold(0.16f), g1 = Gold(0.0f);
+                if (left) {
+                    dl->AddRectFilledMultiColor({x0, y + 3 * u}, {x1, y + row_h - 3 * u}, g1, g0,
+                                                g0, g1);
+                } else {
+                    dl->AddRectFilledMultiColor({x0, y + 3 * u}, {x1, y + row_h - 3 * u}, g0, g1,
+                                                g1, g0);
                 }
             }
+            // leader: glyph -> photo edge -> spot
+            const ImVec2 sc = anchors[o];
+            const ImVec2 e0{left ? gc.x + r : gc.x - r, cy};
+            const ImVec2 e1{left ? std::min(sc.x, std::max(e0.x, p0.x + photo_w * 0.05f))
+                                 : std::max(sc.x, std::min(e0.x, p0.x + photo_w * 0.95f)),
+                            cy};
+            const ImU32 lc = on ? Gold(0.95f) : Gold(0.28f);
+            const float lt = std::max(1.0f, (on ? 1.8f : 1.0f) * u);
+            dl->AddLine(e0, e1, lc, lt);
+            dl->AddLine(e1, sc, lc, lt);
+            dl->AddCircleFilled(sc, (on ? 4.0f : 2.6f) * u, lc);
+            Glyph(dl, o, gc, r, 1.0f, on || PhysicallyHeld(o));
+            const char* fn = DefaultFn(o);
+            const float px = 24 * u;
+            const float ty = cy - px * 0.62f;
+            const ImU32 tc = on ? Parch() : Col(206, 196, 180, 0.92f);
+            if (left) {
+                TxtR(dl, g_ft_text, px, gc.x - r - 10 * u, ty, tc, fn);
+            } else {
+                Txt(dl, g_ft_text, px, {gc.x + r + 10 * u, ty}, tc, fn);
+            }
         }
-        ImGui::EndPopup();
     }
-    ImGui::SetCursorScreenPos({at.x + g_mouse_tex.w * ms + 20 * unit, y});
-    ImGui::BeginGroup();
-    ImGui::TextColored(kGold, "Ratón");
-    float dz, sp, off;
-    g_cfg.MouseParams(dz, sp, off);
-    ImGui::SetNextItemWidth(260 * unit);
-    static float s_sp = 1.0f, s_dz = 0.5f;
-    static bool s_init = false;
-    if (!s_init) {
-        s_sp = sp, s_dz = dz, s_init = true;
+    // the spots are clickable too
+    for (const auto& sp : kPs4Spots) {
+        const std::string o = sp.output;
+        if (o == "back" || o.starts_with("stick_")) continue;
+        const ImVec2 c = at(sp);
+        const ImVec2 half{std::max(8 * u, sp.d * s * 0.5f), std::max(8 * u, sp.h * s * 0.5f)};
+        bool hov = false;
+        const std::string id = "##sp_" + o;
+        if (Hit(id.c_str(), {c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, &hov)) {
+            clicked = o;
+        }
+        if (hov) hover = o;
     }
-    ImGui::SliderFloat("Sensibilidad de la cámara", &s_sp, 0.1f, 5.0f, "%.2f");
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        g_cfg.SetMouseParams(s_dz, s_sp, off);
+    return clicked;
+}
+
+// ---------------------------------------------------------------- your pad (right panel)
+// g_pad_photo: 0 DualSense (mando-ps5.png), 1 8BitDo, 2 DualShock 4
+
+struct PhysPhoto {
+    Tex* tex;
+    const char* file;
+    float w, h;
+    const Spot* spots;
+    size_t n;
+};
+PhysPhoto CurrentPhys() {
+    switch (g_pad_photo) {
+    case 1: return {&g_pad_alt_tex, "mando-8bitdo.png", 537, 350, k8bdPhys, std::size(k8bdPhys)};
+    case 2: return {&g_ps4_tex, "mando-ps4.png", 1536, 1024, kPs4Phys, std::size(kPs4Phys)};
+    default: return {&g_pad_tex, "mando-ps5.png", 532, 350, kPs5Phys, std::size(kPs5Phys)};
     }
-    ImGui::SetNextItemWidth(260 * unit);
-    ImGui::SliderFloat("Antizona muerta", &s_dz, 0.0f, 1.0f, "%.2f");
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        g_cfg.SetMouseParams(s_dz, s_sp, off);
+}
+
+// Draws your pad with, next to each physical button, the PS4 button(s) it gives now
+// (remapped ones lit). `phys` gets the physical spots' screen centres.
+void PhysPanel(ImVec2 a, ImVec2 b, float u, const std::string& focus,
+               std::map<std::string, ImVec2>& phys, std::string& hover) {
+    auto* dl = ImGui::GetWindowDrawList();
+    Panel(dl, a, b, u);
+    Txt(dl, g_ft_title, 30 * u, {a.x + 30 * u, a.y + 22 * u}, Gold(), "TU MANDO");
+    Txt(dl, g_ft_italic, 24 * u, {a.x + 30 * u, a.y + 58 * u}, Muted(),
+        "qué hace ahora cada botón");
+    // photo chooser chips
+    const char* names[] = {"DualSense", "8BitDo", "DualShock 4"};
+    float cx = b.x - 26 * u;
+    for (int i = 2; i >= 0; i--) {
+        const float w = TextSize(g_ft_ui, 18 * u, names[i]).x + 28 * u;
+        const ImVec2 c0{cx - w, a.y + 26 * u}, c1{cx, a.y + 60 * u};
+        bool hov = false;
+        const std::string id = std::string("##ph") + names[i];
+        if (Hit(id.c_str(), c0, c1, &hov)) {
+            g_pad_photo = i;
+        }
+        const bool sel = g_pad_photo == i;
+        dl->AddRectFilled(c0, c1, sel ? Col(70, 54, 32, 0.95f) : Col(22, 19, 18, 0.9f), 17 * u);
+        dl->AddRect(c0, c1, sel || hov ? Gold() : Bronze(0.6f), 17 * u, 0, std::max(1.0f, u));
+        Txt(dl, g_ft_ui, 18 * u, {c0.x + 14 * u, c0.y + 7 * u}, sel ? Gold() : Parch(0.8f),
+            names[i]);
+        cx = c0.x - 10 * u;
     }
-    bool right = g_cfg.MouseStick() != "left";
-    if (ImGui::Checkbox("El ratón mueve el stick derecho (cámara)", &right)) {
-        g_cfg.SetMouseStick(right ? "right" : "left");
+    TxtR(dl, g_ft_ui, 16 * u, b.x - 26 * u, a.y + 66 * u, Muted(0.8f), "L1 / R1: cambiar foto");
+    const PhysPhoto ph = CurrentPhys();
+    const ImTextureID tex = Get(*ph.tex, AssetDir() / ph.file, ph.w, ph.h);
+    const float pw = b.x - a.x, top = a.y + 130 * u, bottom = b.y - 40 * u;
+    const float photo_w = std::min(pw * 0.78f, (bottom - top) * ph.w / ph.h);
+    const float s = photo_w / ph.w, photo_h = ph.h * s;
+    const ImVec2 p0{a.x + (pw - photo_w) * 0.5f, top + (bottom - top - photo_h) * 0.5f};
+    for (int i = 5; i >= 1; i--) {
+        dl->AddCircleFilled({p0.x + photo_w * 0.5f, p0.y + photo_h * 0.52f},
+                            photo_w * (0.30f + i * 0.05f), Col(120, 90, 50, 0.025f), 48);
     }
-    ImGui::Checkbox("Cámara con ratón activa al volver al juego (F7)", &g_restore_mouse_look);
-    ImGui::EndGroup();
-    if (!hit.empty()) {
-        g_selected = hit;
-        StartCapture(Capture::Kbm, hit);
+    if (tex) {
+        dl->AddImage(tex, p0, {p0.x + photo_w, p0.y + photo_h}, {0, 0}, {1, 1}, Col(255, 255, 255));
+    } else {
+        TxtC(dl, g_ft_ui, 18 * u, p0.x + photo_w * 0.5f, p0.y + photo_h * 0.5f, Muted(),
+             "(imagen no encontrada en menu_assets)");
     }
-    ImGui::SetCursorScreenPos({at.x + photo_w + 24 * unit, at.y});
-    ImGui::BeginChild("##kbmlist", {0, ImGui::GetContentRegionAvail().y});
-    ListTable("##kbmtab", kKbmRows, std::size(kKbmRows), Cat::Kbm, unit);
-    ImGui::EndChild();
+    const std::vector<std::string> focus_phys = PhysOf(FocusKey(focus));
+    const float t = Now();
+    for (size_t i = 0; i < ph.n; i++) {
+        const Spot& sp = ph.spots[i];
+        const std::string p = sp.output;
+        const ImVec2 c{p0.x + sp.x * s, p0.y + sp.y * s};
+        phys[p] = c;
+        const ImVec2 half{std::max(7 * u, sp.d * s * 0.5f), std::max(7 * u, sp.h * s * 0.5f)};
+        const bool rect = sp.d != sp.h;
+        const bool linked = std::find(focus_phys.begin(), focus_phys.end(), p) != focus_phys.end();
+        const bool held = PhysHeld(p);
+        bool hov = false;
+        const std::string id = "##pp_" + p;
+        Hit(id.c_str(), {c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, &hov);
+        if ((p == "l2" || p == "r2") && sp.y < 0) {
+            dl->AddRectFilled({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y},
+                              Col(24, 21, 20, 0.9f), half.y);
+            dl->AddRect({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, Bronze(0.8f),
+                        half.y, 0, std::max(1.0f, u));
+            const char* l = p == "l2" ? "L2" : "R2";
+            const ImVec2 ts = TextSize(g_ft_ui, 15 * u, l);
+            Txt(dl, g_ft_ui, 15 * u, {c.x - ts.x * 0.5f, c.y - ts.y * 0.5f}, Parch(0.9f), l);
+        }
+        const float al = held ? 1.0f : linked ? 0.65f + 0.35f * std::sin(t * 5.0f) : hov ? 0.7f : 0.0f;
+        if (al > 0.0f) {
+            if (rect) {
+                dl->AddRectFilled({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y},
+                                  Gold(0.25f * al), 6 * u);
+                dl->AddRect({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, Gold(al),
+                            6 * u, 0, 2.0f * u);
+            } else {
+                for (int k = 3; k >= 1; k--) {
+                    dl->AddCircle(c, half.x + k * 4 * u, Gold(0.12f * al), 0, 3.0f * u);
+                }
+                dl->AddCircleFilled(c, half.x, Gold(0.22f * al));
+                dl->AddCircle(c, half.x, Gold(al), 0, 2.0f * u);
+            }
+        }
+        // which PS4 buttons this physical one gives
+        std::vector<std::string> gives;
+        for (const auto& r : kPadRows) {
+            const std::string o = r.output;
+            const auto ph_of = PhysOf(o);
+            if (std::find(ph_of.begin(), ph_of.end(), p) != ph_of.end()) {
+                if (o.starts_with("stick_") && p != "l3" && p != "r3") continue;
+                gives.push_back(o);
+            }
+        }
+        if (hov && !gives.empty()) {
+            hover = gives[0];
+        }
+        float gx = c.x + half.x * 0.75f + 4 * u, gy = c.y - half.y * 0.75f - 4 * u;
+        for (const auto& o : gives) {
+            const bool same = o == p || (o == "stick_left" && p == "l3") ||
+                              (o == "stick_right" && p == "r3");
+            Glyph(dl, o, {gx, gy}, 14 * u, same ? 0.75f : 1.0f, !same || FocusKey(focus) == o);
+            gx += 30 * u;
+        }
+    }
+}
+
+// a glowing link from the game's button to the physical one(s), with a travelling bead
+void Link(ImDrawList* dl, ImVec2 p, ImVec2 q, float u) {
+    const float dx = std::max(80 * u, std::fabs(q.x - p.x) * 0.45f);
+    const ImVec2 c1{p.x + dx, p.y}, c2{q.x - dx, q.y};
+    dl->AddBezierCubic(p, c1, c2, q, Gold(0.10f), 9 * u);
+    dl->AddBezierCubic(p, c1, c2, q, Gold(0.22f), 4 * u);
+    dl->AddBezierCubic(p, c1, c2, q, Gold(0.95f), std::max(1.0f, 1.6f * u));
+    for (int k = 0; k < 2; k++) {
+        const float tt = std::fmod(Now() * 0.6f + k * 0.5f, 1.0f);
+        const float m = 1.0f - tt;
+        const ImVec2 bp{m * m * m * p.x + 3 * m * m * tt * c1.x + 3 * m * tt * tt * c2.x + tt * tt * tt * q.x,
+                        m * m * m * p.y + 3 * m * m * tt * c1.y + 3 * m * tt * tt * c2.y + tt * tt * tt * q.y};
+        dl->AddCircleFilled(bp, 6 * u, Gold(0.18f));
+        dl->AddCircleFilled(bp, 3 * u, Col(255, 236, 190, 0.95f));
+    }
+    dl->AddCircleFilled(p, 5 * u, Gold());
+    dl->AddCircleFilled(q, 5 * u, Gold());
 }
 
 // ---------------------------------------------------------------- trophies
@@ -1076,156 +1438,238 @@ void DrawCustomIcon(ImDrawList* dl, float x, float y, float s, float alpha) {
     dl->AddRect({x, y}, {x + s, y + s}, A(236, 200, 120, 120), s * 0.1f, 0, 1.0f);
 }
 
-void TrophyPage(float unit) {
-    if (!g_trophy_error.empty()) {
-        ImGui::TextColored(kWarn, "%s", g_trophy_error.c_str());
-        if (FancyButton("Reintentar")) {
-            LoadTrophies();
-        }
-    }
+// a small padlock (locked trophies)
+void DrawLock(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const float w = s * 0.62f, h = s * 0.48f;
+    dl->PathArcTo({c.x, c.y - h * 0.15f}, w * 0.32f, 3.14159f, 2.0f * 3.14159f, 16);
+    dl->PathStroke(col, 0, std::max(1.5f, s * 0.09f));
+    dl->AddLine({c.x - w * 0.32f, c.y - h * 0.15f}, {c.x - w * 0.32f, c.y + h * 0.05f}, col,
+                std::max(1.5f, s * 0.09f));
+    dl->AddLine({c.x + w * 0.32f, c.y - h * 0.15f}, {c.x + w * 0.32f, c.y + h * 0.05f}, col,
+                std::max(1.5f, s * 0.09f));
+    dl->AddRectFilled({c.x - w * 0.5f, c.y}, {c.x + w * 0.5f, c.y + h}, col, s * 0.06f);
+    dl->AddCircleFilled({c.x, c.y + h * 0.42f}, s * 0.06f, Col(10, 9, 10, 0.9f));
+}
+
+// Trofeos: progress header (animated bar, per-grade counts), filter chips, a grid of cards
+// (large icon, grade badge, name, description, date; locked ones dimmed with a padlock).
+int g_trophy_focus = 0;
+bool g_trophy_scroll_to = false;
+void TrophyScreen(ImVec2 a, ImVec2 b, float u) {
+    auto* dl = ImGui::GetWindowDrawList();
+    const float t = Now();
     int earned = 0;
-    for (const auto& t : g_trophies) {
-        earned += t.earned;
+    int by_grade[4][2] = {}; // P G S B: earned, total
+    for (const auto& tr : g_trophies) {
+        earned += tr.earned;
+        const int gi = tr.grade == 'P' ? 0 : tr.grade == 'G' ? 1 : tr.grade == 'S' ? 2 : 3;
+        by_grade[gi][1]++;
+        by_grade[gi][0] += tr.earned;
     }
     const int total = static_cast<int>(g_trophies.size());
+    // header card
+    const ImVec2 h0 = a, h1{b.x, a.y + 150 * u};
+    Panel(dl, h0, h1, u);
+    const std::string big = fmt::format("{} / {}", earned, total);
+    Txt(dl, g_ft_title, 54 * u, {h0.x + 36 * u, h0.y + 26 * u}, Gold(), big.c_str());
+    const float bw0 = TextSize(g_ft_title, 54 * u, big.c_str()).x;
+    Txt(dl, g_ft_italic, 26 * u, {h0.x + 36 * u + bw0 + 18 * u, h0.y + 50 * u}, Muted(),
+        "trofeos conseguidos");
     const float pct = total > 0 ? 100.0f * earned / total : 0.0f;
-    ImGui::TextColored(kGold, "%d de %d conseguidos", earned, total);
-    ImGui::SameLine();
-    ImGui::TextColored(kDim, "(%.0f%%)", pct);
+    const std::string ps = fmt::format("{:.0f}%", pct * std::min(1.0f, static_cast<float>(t - g_trophy_page_t) / 0.9f));
+    TxtR(dl, g_ft_title, 40 * u, h1.x - 36 * u, h0.y + 34 * u, Parch(), ps.c_str());
     {
-        // eased fill, gold gradient with a moving sheen
         const float goal = total > 0 ? static_cast<float>(earned) / total : 0.0f;
-        g_trophy_bar += (goal - g_trophy_bar) * std::min(1.0f, ImGui::GetIO().DeltaTime * 4.0f);
-        const ImVec2 a = ImGui::GetCursorScreenPos();
-        const float bw = ImGui::GetContentRegionAvail().x, bh = 12 * unit;
-        ImGui::Dummy({bw, bh});
-        auto* dl = ImGui::GetWindowDrawList();
-        const float al = ImGui::GetStyle().Alpha;
-        dl->AddRectFilled(a, {a.x + bw, a.y + bh}, IM_COL32(20, 18, 16, static_cast<int>(230 * al)),
-                          bh * 0.5f);
+        g_trophy_bar = Approach(g_trophy_bar, goal, ImGui::GetIO().DeltaTime, 3.0f);
+        const ImVec2 ba{h0.x + 36 * u, h0.y + 100 * u};
+        const float bw = (h1.x - h0.x) * 0.55f, bh = 10 * u;
+        dl->AddRectFilled(ba, {ba.x + bw, ba.y + bh}, Col(8, 7, 8, 0.95f), bh * 0.5f);
+        dl->AddRect(ba, {ba.x + bw, ba.y + bh}, Bronze(0.6f), bh * 0.5f);
         const float fw = bw * g_trophy_bar;
-        if (fw > 1.0f) {
-            dl->AddRectFilledMultiColor(a, {a.x + fw, a.y + bh},
-                                        IM_COL32(140, 86, 40, static_cast<int>(255 * al)),
-                                        IM_COL32(236, 196, 110, static_cast<int>(255 * al)),
-                                        IM_COL32(236, 196, 110, static_cast<int>(255 * al)),
-                                        IM_COL32(140, 86, 40, static_cast<int>(255 * al)));
-            const float sx = a.x + std::fmod(static_cast<float>(ImGui::GetTime()) * 0.35f, 1.4f) * bw - 0.2f * bw;
-            dl->PushClipRect(a, {a.x + fw, a.y + bh}, true);
-            dl->AddRectFilledMultiColor({sx, a.y}, {sx + 0.1f * bw, a.y + bh}, 0,
-                                        IM_COL32(255, 255, 255, static_cast<int>(70 * al)),
-                                        IM_COL32(255, 255, 255, static_cast<int>(70 * al)), 0);
+        if (fw > 2.0f) {
+            dl->AddRectFilledMultiColor(ba, {ba.x + fw, ba.y + bh}, Col(120, 70, 34),
+                                        Col(236, 198, 112), Col(236, 198, 112), Col(120, 70, 34));
+            const float sx = ba.x + std::fmod(t * 0.4f, 1.6f) * bw - 0.3f * bw;
+            dl->PushClipRect(ba, {ba.x + fw, ba.y + bh}, true);
+            dl->AddRectFilledMultiColor({sx, ba.y}, {sx + 0.08f * bw, ba.y + bh}, Col(255, 255, 255, 0),
+                                        Col(255, 250, 230, 0.55f), Col(255, 250, 230, 0.55f),
+                                        Col(255, 255, 255, 0));
             dl->PopClipRect();
+            dl->AddCircleFilled({ba.x + fw, ba.y + bh * 0.5f}, bh * 0.9f, Gold(0.35f));
         }
-        dl->AddRect(a, {a.x + bw, a.y + bh}, IM_COL32(236, 200, 120, static_cast<int>(90 * al)),
-                    bh * 0.5f);
+        // per grade
+        float gx = ba.x + bw + 40 * u;
+        const char grades[4] = {'P', 'G', 'S', 'B'};
+        for (int i = 0; i < 4; i++) {
+            if (by_grade[i][1] == 0) continue;
+            DrawCup(dl, gx, h0.y + 86 * u, 34 * u, GradeColor(grades[i], g_a), g_a);
+            const std::string c = fmt::format("{}/{}", by_grade[i][0], by_grade[i][1]);
+            Txt(dl, g_ft_ui, 20 * u, {gx + 40 * u, h0.y + 92 * u}, Parch(0.9f), c.c_str());
+            gx += 40 * u + TextSize(g_ft_ui, 20 * u, c.c_str()).x + 30 * u;
+        }
     }
-    const char* filters[] = {"Todos", "Conseguidos", "Por conseguir"};
+    // filter chips
+    const char* fl[] = {"Todos", "Conseguidos", "Por conseguir"};
+    float fx = a.x;
+    const float fy = h1.y + 18 * u;
     for (int i = 0; i < 3; i++) {
-        if (i > 0) {
-            ImGui::SameLine();
-        }
-        if (ImGui::RadioButton(filters[i], g_trophy_filter == i)) {
+        const float w = TextSize(g_ft_ui, 19 * u, fl[i]).x + 34 * u;
+        const ImVec2 c0{fx, fy}, c1{fx + w, fy + 38 * u};
+        bool hov = false;
+        const std::string id = std::string("##tf") + fl[i];
+        if (Hit(id.c_str(), c0, c1, &hov)) {
             g_trophy_filter = i;
+            g_trophy_focus = 0;
+            g_trophy_page_t = t;
         }
+        const bool sel = g_trophy_filter == i;
+        dl->AddRectFilled(c0, c1, sel ? Col(70, 54, 32, 0.95f) : Col(22, 19, 18, 0.9f), 19 * u);
+        dl->AddRect(c0, c1, sel || hov ? Gold() : Bronze(0.6f), 19 * u, 0, std::max(1.0f, u));
+        Txt(dl, g_ft_ui, 19 * u, {c0.x + 17 * u, c0.y + 8 * u}, sel ? Gold() : Parch(0.8f), fl[i]);
+        fx = c1.x + 12 * u;
     }
-    ImGui::SameLine();
-    if (FancyButton("Actualizar")) {
-        LoadTrophies();
+    Txt(dl, g_ft_ui, 17 * u, {fx + 14 * u, fy + 10 * u}, Muted(0.8f), "L1 / R1: filtro");
+    if (!g_trophy_error.empty()) {
+        Txt(dl, g_ft_text, 24 * u, {a.x, fy + 56 * u}, Col(232, 170, 90), g_trophy_error.c_str());
+        return;
     }
-    ImGui::BeginChild("##trophies", {0, 0}, ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollWithMouse);
-    SmoothScroll(g_trophy_scroll, unit);
-    const float icon = 72 * unit;
-    int row = 0;
-    const float base_alpha = ImGui::GetStyle().Alpha;
-    for (auto& t : g_trophies) {
-        if ((g_trophy_filter == 1 && !t.earned) || (g_trophy_filter == 2 && t.earned)) {
-            continue;
+    // the grid (scrolls; d-pad moves the focus card by card)
+    std::vector<Trophy*> list;
+    for (auto& tr : g_trophies) {
+        if ((g_trophy_filter == 1 && !tr.earned) || (g_trophy_filter == 2 && tr.earned)) continue;
+        list.push_back(&tr);
+    }
+    g_trophy_focus = std::clamp(g_trophy_focus, 0, std::max(0, static_cast<int>(list.size()) - 1));
+    const ImVec2 g0{a.x, fy + 56 * u};
+    const float gw = b.x - a.x, gh = b.y - g0.y;
+    const int cols = gw > 1700 * u ? 3 : 2;
+    const float gap = 18 * u;
+    const float cw = (gw - gap * (cols - 1) - 14 * u) / cols, ch = 150 * u;
+    ImGui::SetCursorScreenPos(g0);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, ImVec4(0.55f, 0.42f, 0.24f, 0.6f * g_a));
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 8 * u);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 0});
+    ImGui::BeginChild("##tgrid", {gw, gh}, 0,
+                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollWithMouse);
+    SmoothScroll(g_trophy_scroll, u);
+    auto* cd = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const int rows = (static_cast<int>(list.size()) + cols - 1) / cols;
+    const float icon = ch - 28 * u;
+    for (int i = 0; i < static_cast<int>(list.size()); i++) {
+        Trophy& tr = *list[i];
+        const int r = i / cols, c = i % cols;
+        const float ra = EaseOut((t - g_trophy_page_t - std::min(i, 18) * 0.03f) / 0.35f);
+        const ImVec2 p{origin.x + c * (cw + gap), origin.y + r * (ch + gap) + (1.0f - ra) * 30 * u};
+        const ImVec2 q{p.x + cw, p.y + ch};
+        bool hov = false;
+        ImGui::PushID(i);
+        Hit("##tc", p, q, &hov);
+        ImGui::PopID();
+        if (hov && MouseMoved()) g_trophy_focus = i;
+        const bool on = g_trophy_focus == i;
+        if (!ImGui::IsRectVisible(p, q)) continue;
+        const float sg = g_a;
+        g_a = sg * ra;
+        // card
+        dl = cd;
+        dl->AddRectFilled({p.x + 4 * u, p.y + 6 * u}, {q.x + 4 * u, q.y + 6 * u}, Col(0, 0, 0, 0.35f),
+                          8 * u);
+        dl->AddRectFilledMultiColor(p, q, tr.earned ? Col(40, 33, 26, 0.95f) : Col(22, 20, 21, 0.92f),
+                                    tr.earned ? Col(40, 33, 26, 0.95f) : Col(22, 20, 21, 0.92f),
+                                    Col(14, 13, 13, 0.95f), Col(14, 13, 13, 0.95f));
+        if (on) {
+            for (int k = 3; k >= 1; k--) {
+                dl->AddRect({p.x - k * 3 * u, p.y - k * 3 * u}, {q.x + k * 3 * u, q.y + k * 3 * u},
+                            Gold(0.10f / k * 2), 8 * u + k * 3 * u, 0, 2 * u);
+            }
         }
-        // staggered fade/slide in
-        const float ra = EaseOut(static_cast<float>(ImGui::GetTime() - g_trophy_page_t -
-                                                    std::min(row, 16) * 0.035) / 0.28f);
-        row++;
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, base_alpha * ra);
-        ImGui::PushID(t.id);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (1.0f - ra) * 40 * unit);
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        const float w = ImGui::GetContentRegionAvail().x;
-        const float h = icon + 16 * unit;
-        // a focusable row (gamepad scroll)
-        ImGui::Selectable("##row", false, 0, {w, h});
-        const bool hov = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-        auto* dl0 = ImGui::GetWindowDrawList();
-        // the rows' colours fade with ra (draw-list colours ignore the style alpha)
-        struct FadeDl {
-            ImDrawList* d;
-            float a;
-            void AddRectFilled(ImVec2 x, ImVec2 y, ImU32 c, float r = 0, ImDrawFlags f = 0) {
-                d->AddRectFilled(x, y, Fade(c, a), r, f);
-            }
-            void AddRect(ImVec2 x, ImVec2 y, ImU32 c, float r = 0, ImDrawFlags f = 0, float th = 1) {
-                d->AddRect(x, y, Fade(c, a), r, f, th);
-            }
-            void AddImage(ImTextureID t, ImVec2 x, ImVec2 y, ImVec2 u0, ImVec2 u1, ImU32 c) {
-                d->AddImage(t, x, y, u0, u1, Fade(c, a));
-            }
-            void AddText(ImVec2 x, ImU32 c, const char* s) { d->AddText(x, Fade(c, a), s); }
-            void AddText(ImFont* f, float fs, ImVec2 x, ImU32 c, const char* s, const char* e,
-                         float ww) {
-                d->AddText(f, fs, x, Fade(c, a), s, e, ww);
-            }
-        } dlf{dl0, ra};
-        auto* dl = &dlf;
-        dl->AddRectFilled({p.x + 2 * unit, p.y + 4 * unit}, {p.x + w + 2 * unit, p.y + h + 4 * unit},
-                          IM_COL32(0, 0, 0, 90), 10 * unit);
-        dl->AddRectFilled(p, {p.x + w, p.y + h},
-                          t.earned ? IM_COL32(46, 40, 30, 225) : IM_COL32(26, 25, 28, 225),
-                          10 * unit);
-        if (t.earned) {
-            dl->AddRectFilled(p, {p.x + 4 * unit, p.y + h}, GradeColor(t.grade), 10 * unit,
+        dl->AddRect(p, q, on ? Gold(0.95f) : tr.earned ? Bronze(0.7f) : Bronze(0.3f), 8 * u, 0,
+                    std::max(1.0f, (on ? 1.8f : 1.0f) * u));
+        if (tr.earned) {
+            dl->AddRectFilled(p, {p.x + 4 * u, q.y}, GradeColor(tr.grade, g_a), 8 * u,
                               ImDrawFlags_RoundCornersLeft);
         }
-        dl->AddRect(p, {p.x + w, p.y + h},
-                    hov ? IM_COL32(236, 200, 120, 170) : IM_COL32(236, 200, 120, 28), 10 * unit, 0,
-                    hov ? 2.0f : 1.0f);
-        const ImVec2 ip{p.x + 8 * unit, p.y + 8 * unit};
+        // icon in a grade-coloured frame
+        const ImVec2 ip{p.x + 16 * u, p.y + 14 * u};
         ImTextureID tex{};
-        if (!t.custom && ImGui::IsRectVisible(p, {p.x + w, p.y + h})) {
-            tex = Get(t.icon, g_icons_dir / fmt::format("TROP{:03d}.PNG", t.id), 240, 240);
+        if (!tr.custom) {
+            tex = Get(tr.icon, g_icons_dir / fmt::format("TROP{:03d}.PNG", tr.id), 240, 240);
         }
+        dl->AddRectFilled({ip.x - 3 * u, ip.y - 3 * u}, {ip.x + icon + 3 * u, ip.y + icon + 3 * u},
+                          tr.earned ? GradeColor(tr.grade, 0.8f * g_a) : Col(60, 56, 54, 0.8f), 6 * u);
         if (tex) {
             dl->AddImage(tex, ip, {ip.x + icon, ip.y + icon}, {0, 0}, {1, 1},
-                         t.earned ? IM_COL32_WHITE : IM_COL32(110, 110, 110, 255));
-        } else if (t.custom) {
-            DrawCustomIcon(dl0, ip.x, ip.y, icon, (t.earned ? 1.0f : 0.45f) * ra);
+                         tr.earned ? Col(255, 255, 255) : Col(90, 88, 92, 0.9f));
+        } else if (tr.custom) {
+            DrawCustomIcon(dl, ip.x, ip.y, icon, (tr.earned ? 1.0f : 0.35f) * g_a);
         } else {
-            dl->AddRectFilled(ip, {ip.x + icon, ip.y + icon}, IM_COL32(44, 46, 54, 255),
-                              8 * unit);
-            DrawCup(dl0, ip.x + icon * 0.1f, ip.y + icon * 0.08f, icon * 0.8f,
-                    GradeColor(t.grade, (t.earned ? 1.0f : 0.4f) * ra), ra);
+            dl->AddRectFilled(ip, {ip.x + icon, ip.y + icon}, Col(30, 28, 30), 4 * u);
+            DrawCup(dl, ip.x + icon * 0.15f, ip.y + icon * 0.12f, icon * 0.7f,
+                    GradeColor(tr.grade, (tr.earned ? 1.0f : 0.35f) * g_a), g_a);
         }
-        const float tx = ip.x + icon + 14 * unit;
-        const float fs = ImGui::GetFontSize();
-        DrawCup(dl0, tx, p.y + 8 * unit, fs, GradeColor(t.grade, ra), ra);
-        dl->AddText({tx + fs * 1.2f, p.y + 8 * unit}, GradeColor(t.grade), GradeName(t.grade));
-        const std::string nm = t.custom ? t.name + "  (del port)"
-                               : t.hidden && !t.earned ? t.name + "  (oculto)"
-                                                       : t.name;
-        dl->AddText({tx + fs * 6.0f, p.y + 8 * unit}, IM_COL32(245, 245, 247, 255), nm.c_str());
-        dl->AddText(nullptr, fs, ImVec2{tx, p.y + 8 * unit + fs * 1.3f}, IM_COL32(190, 192, 200, 255),
-                    t.detail.c_str(), nullptr, w - (tx - p.x) - 300 * unit);
-        const std::string state =
-            t.earned ? "Conseguido · " + DateText(t.stamp) : std::string("Por conseguir");
-        const float sw = ImGui::CalcTextSize(state.c_str()).x;
-        dl->AddText({p.x + w - sw - 14 * unit, p.y + 8 * unit},
-                    t.earned ? IM_COL32(150, 220, 140, 255) : IM_COL32(160, 160, 165, 255),
-                    state.c_str());
-        ImGui::Dummy({0, 6 * unit});
-        ImGui::PopID();
-        ImGui::PopStyleVar();
+        if (!tr.earned) {
+            dl->AddRectFilled(ip, {ip.x + icon, ip.y + icon}, Col(0, 0, 0, 0.35f), 4 * u);
+            dl->AddCircleFilled({ip.x + icon * 0.5f, ip.y + icon * 0.5f}, icon * 0.22f,
+                                Col(10, 9, 10, 0.75f));
+            DrawLock(dl, {ip.x + icon * 0.5f, ip.y + icon * 0.46f}, icon * 0.3f, Parch(0.85f));
+        } else if (on) {
+            // shine sweep over the focused, earned icon
+            const float st = std::fmod(t * 0.5f, 1.6f);
+            if (st < 1.0f) {
+                const float sx = ip.x - icon * 0.4f + st * icon * 1.8f;
+                dl->PushClipRect(ip, {ip.x + icon, ip.y + icon}, true);
+                dl->AddQuadFilled({sx, ip.y}, {sx + icon * 0.22f, ip.y},
+                                  {sx - icon * 0.18f, ip.y + icon}, {sx - icon * 0.4f, ip.y + icon},
+                                  Col(255, 248, 225, 0.35f));
+                dl->PopClipRect();
+            }
+        }
+        // text
+        const float tx = ip.x + icon + 20 * u, tw = q.x - tx - 16 * u;
+        DrawCup(dl, tx, p.y + 14 * u, 22 * u, GradeColor(tr.grade, (tr.earned ? 1.0f : 0.6f) * g_a), g_a);
+        Txt(dl, g_ft_ui, 17 * u, {tx + 28 * u, p.y + 16 * u},
+            GradeColor(tr.grade, (tr.earned ? 1.0f : 0.6f) * g_a), GradeName(tr.grade));
+        const std::string st = tr.earned ? DateText(tr.stamp) : std::string("Bloqueado");
+        TxtR(dl, g_ft_ui, 16 * u, q.x - 16 * u, p.y + 17 * u,
+             tr.earned ? Col(170, 206, 150) : Muted(0.8f), st.c_str());
+        const bool secret = tr.hidden && !tr.earned;
+        const std::string nm = secret ? std::string("Trofeo oculto") : tr.name;
+        const ImVec4 clip{tx, p.y, q.x - 12 * u, q.y};
+        dl->AddText(FT(g_ft_title), 25 * u, {tx, p.y + 44 * u}, tr.earned ? Parch() : Col(200, 192, 180, 0.8f),
+                    nm.c_str(), nullptr, 0.0f, &clip);
+        const std::string det = secret ? std::string("Sigue jugando para descubrirlo.")
+                                       : tr.custom ? tr.detail + " (del port)" : tr.detail;
+        const auto lines = Wrap(g_ft_text, 22 * u, det, tw);
+        for (size_t k = 0; k < lines.size() && k < 2; k++) {
+            std::string l = lines[k];
+            if (k == 1 && lines.size() > 2) l += "\xe2\x80\xa6";
+            Txt(dl, g_ft_text, 22 * u, {tx, p.y + 80 * u + k * 25 * u}, Muted(tr.earned ? 1.0f : 0.75f),
+                l.c_str());
+        }
+        g_a = sg;
+    }
+    // scroll extents
+    ImGui::SetCursorScreenPos({origin.x, origin.y + rows * (ch + gap)});
+    ImGui::Dummy({1, 1});
+    if (g_trophy_scroll_to && !list.empty()) {
+        g_trophy_scroll_to = false;
+        const float y0 = (g_trophy_focus / cols) * (ch + gap);
+        const float cur = ImGui::GetScrollY();
+        if (y0 < cur) {
+            g_trophy_scroll = y0;
+        } else if (y0 + ch > cur + gh) {
+            g_trophy_scroll = std::min(ImGui::GetScrollMaxY(), y0 + ch - gh + gap);
+        }
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(3);
+}
+int TrophyCols(float gw, float u) {
+    return gw > 1700 * u ? 3 : 2;
 }
 
 // ---------------------------------------------------------------- toast (DS popup)
@@ -1286,7 +1730,10 @@ void PlayChime() {
     SDL_PutAudioStreamData(stream, buf.data(), static_cast<int>(buf.size() * sizeof(float)));
 }
 
-void DrawToast(float unit) {
+// (bb-menu-121) The trophy card: slides in from the top right with a soft overshoot, a frame
+// glowing in the grade's colour, the icon pops in with a burst of sparks and a shine sweep,
+// "TROFEO OBTENIDO" in Cinzel, the name in Cormorant Garamond. Slides back out after 6 s.
+void DrawToast(float u) {
     std::scoped_lock lk{g_toast_mtx};
     if (g_toasts.empty()) {
         return;
@@ -1302,90 +1749,125 @@ void DrawToast(float unit) {
         g_toasts.pop_front();
         return;
     }
-    const float slide = 0.35f, fade = 0.6f;
-    const float in = std::clamp(t / slide, 0.0f, 1.0f);
-    const float ease = 1.0f - (1.0f - in) * (1.0f - in) * (1.0f - in);
-    const float alpha = std::clamp((kToastSeconds - t) / fade, 0.0f, 1.0f) * std::min(1.0f, in * 2.0f);
-    if (alpha <= 0.0f) {
+    const float saved = g_a;
+    const float in = EaseOutBack(t / 0.55f);
+    const float out = EaseInOut(std::clamp((t - (kToastSeconds - 0.5f)) / 0.5f, 0.0f, 1.0f));
+    g_a = std::clamp(t / 0.25f, 0.0f, 1.0f) * (1.0f - out);
+    if (g_a <= 0.0f) {
+        g_a = saved;
         return;
     }
-    auto* draw = ImGui::GetForegroundDrawList();
-    ImFont* font = ImGui::GetFont();
-    const float big = 26.0f * unit, small = 19.0f * unit;
-    const float icon = 76.0f * unit, pad = 14.0f * unit;
-    const std::string label = "Has obtenido un trofeo";
-    const std::string grade_text = GradeName(toast.grade);
-    const std::string top = grade_text + "  \xc2\xb7  " + label;
-    const float text_w =
-        std::max(font->CalcTextSizeA(big, FLT_MAX, 0.0f, toast.name.c_str()).x,
-                 font->CalcTextSizeA(small, FLT_MAX, 0.0f, top.c_str()).x + 18.0f * unit);
+    auto* dl = ImGui::GetForegroundDrawList();
     const ImVec2 disp = ImGui::GetIO().DisplaySize;
-    const float w = std::min(pad * 3.0f + icon + text_w + 8.0f * unit, disp.x * 0.45f);
-    const float h = icon + pad * 2.0f + (toast.detail.empty() ? 0.0f : small + 4.0f * unit);
-    const float margin = 28.0f * unit;
-    const float x1_end = disp.x - margin;
-    const float x0 = x1_end - w + (1.0f - ease) * (w + margin + 4.0f);
-    const float y0 = 20.0f * unit;
-    const auto a = [&](int v) { return static_cast<int>(static_cast<float>(v) * alpha); };
-    const float round = 12.0f * unit;
-    draw->AddRectFilled({x0 + 3.0f * unit, y0 + 4.0f * unit},
-                        {x0 + w + 3.0f * unit, y0 + h + 4.0f * unit}, IM_COL32(0, 0, 0, a(70)),
-                        round);
-    draw->AddRectFilled({x0, y0}, {x0 + w, y0 + h}, IM_COL32(28, 29, 33, a(235)), round);
-    draw->AddRect({x0, y0}, {x0 + w, y0 + h}, IM_COL32(255, 255, 255, a(22)), round, 0, unit);
-    const float ix = x0 + pad, iy = y0 + pad;
-    const ImU32 grade = GradeColor(toast.grade, alpha);
-    // the icon's animation: a scale pop with overshoot as the card lands, a glow pulse in
-    // the grade's colour, then a shine sweep across it
-    const float pt = std::clamp((t - 0.20f) / 0.45f, 0.0f, 1.0f);
-    const float c1 = 1.70158f, c3 = c1 + 1.0f;
-    const float pop = t < 0.20f ? 0.6f
-                                : 0.6f + 0.4f * (1.0f + c3 * std::pow(pt - 1.0f, 3.0f) +
-                                                 c1 * std::pow(pt - 1.0f, 2.0f));
-    const float cx = ix + icon * 0.5f, cy = iy + icon * 0.5f;
-    const float gl = t > 0.3f && t < 3.0f
-                         ? (0.5f + 0.5f * std::sin((t - 0.3f) * 6.0f)) *
-                               std::clamp((3.0f - t) / 0.8f, 0.0f, 1.0f)
-                         : 0.0f;
+    const ImU32 gc = GradeColor(toast.grade, g_a);
+    const auto GC = [&](float a) { return GradeColor(toast.grade, std::clamp(a * g_a, 0.0f, 1.0f)); };
+    const float icon = 104 * u, pad = 20 * u;
+    const float name_px = 34 * u, head_px = 21 * u, small_px = 19 * u;
+    const float text_w = std::max({TextSize(g_ft_text, name_px, toast.name.c_str()).x,
+                                   SpacedW(g_ft_title, head_px, "TROFEO OBTENIDO", 3 * u) + 0,
+                                   toast.detail.empty() ? 0.0f
+                                                        : TextSize(g_ft_text, small_px + 3 * u,
+                                                                   toast.detail.c_str()).x});
+    const float w = std::clamp(pad * 3 + icon + text_w + 10 * u, 520 * u, disp.x * 0.42f);
+    const float h = icon + pad * 2;
+    const float margin = 36 * u;
+    const float x0 = disp.x - margin - w + (1.0f - in) * (w + margin) + out * (w + margin) * 0.6f;
+    const float y0 = 36 * u - (1.0f - std::min(1.0f, t / 0.4f)) * 14 * u;
+    const ImVec2 a{x0, y0}, b{x0 + w, y0 + h};
+    const float r = 8 * u;
+    // shadow + grade glow (pulses a few times, then rests)
     for (int i = 4; i >= 1; i--) {
-        const float g = icon * 0.5f + static_cast<float>(i) * 4.0f * unit;
-        draw->AddRectFilled({cx - g, cy - g}, {cx + g, cy + g},
-                            GradeColor(toast.grade, alpha * gl * 0.10f), 12.0f * unit + i * 4.0f * unit);
+        const float g = i * 8.0f * u;
+        dl->AddRectFilled({a.x - g * 0.4f, a.y + g * 0.3f}, {b.x + g * 0.4f, b.y + g}, Col(0, 0, 0, 0.09f),
+                          r + g);
     }
-    const float hs = icon * 0.5f * pop;
-    const ImVec2 q0{cx - hs, cy - hs}, q1{cx + hs, cy + hs};
-    const ImTextureID tex = toast.custom ? ImTextureID{} : Get(toast.icon, toast.icon_path, 240, 240);
-    if (toast.custom) {
-        DrawCustomIcon(draw, q0.x, q0.y, hs * 2.0f, alpha);
-    } else if (tex) {
-        draw->AddImage(tex, q0, q1, {0, 0}, {1, 1}, IM_COL32(255, 255, 255, a(255)));
-    } else {
-        draw->AddRectFilled(q0, q1, IM_COL32(44, 46, 54, a(255)), 10.0f * unit);
-        DrawCup(draw, q0.x + hs * 0.2f, q0.y + hs * 0.16f, hs * 1.6f, grade, alpha);
+    const float pulse = t < 3.2f ? 0.55f + 0.45f * std::sin(t * 4.0f) : 0.45f;
+    for (int i = 5; i >= 1; i--) {
+        const float g = i * 3.5f * u;
+        dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, GC(0.09f * pulse * 6.0f / (i + 1)),
+                    r + g, 0, 3.0f * u);
     }
-    if (t > 0.65f && t < 1.45f) {
-        const float st = (t - 0.65f) / 0.8f;
-        const float sx = q0.x - hs + st * hs * 4.0f;
-        draw->PushClipRect(q0, q1, true);
-        const ImU32 cw = IM_COL32(255, 248, 225, a(150));
-        draw->AddQuadFilled({sx, q0.y}, {sx + hs * 0.35f, q0.y}, {sx - hs * 0.25f, q1.y},
-                            {sx - hs * 0.6f, q1.y}, cw);
-        draw->PopClipRect();
+    dl->AddRectFilledMultiColor(a, b, Col(34, 28, 24, 0.97f), Col(24, 20, 19, 0.97f),
+                                Col(12, 11, 12, 0.97f), Col(16, 14, 14, 0.97f));
+    dl->AddRect(a, b, gc, r, 0, std::max(1.0f, 1.6f * u));
+    dl->AddRect({a.x + 6 * u, a.y + 6 * u}, {b.x - 6 * u, b.y - 6 * u}, Gold(0.16f), r * 0.6f, 0, 1.0f);
+    // a light sweeping over the whole card once it lands
+    if (t > 0.45f && t < 1.35f) {
+        const float st = (t - 0.45f) / 0.9f;
+        const float sx = a.x - w * 0.3f + st * w * 1.6f;
+        dl->PushClipRect(a, b, true);
+        dl->AddRectFilledMultiColor({sx - w * 0.12f, a.y}, {sx, b.y}, Col(255, 240, 200, 0.0f),
+                                    Col(255, 240, 200, 0.10f), Col(255, 240, 200, 0.10f),
+                                    Col(255, 240, 200, 0.0f));
+        dl->AddRectFilledMultiColor({sx, a.y}, {sx + w * 0.12f, b.y}, Col(255, 240, 200, 0.10f),
+                                    Col(255, 240, 200, 0.0f), Col(255, 240, 200, 0.0f),
+                                    Col(255, 240, 200, 0.10f));
+        dl->PopClipRect();
     }
-    const float tx = ix + icon + pad, ty = iy + 6.0f * unit;
-    float lx = tx;
-    draw->AddText(font, small, {lx, ty}, grade, grade_text.c_str());
-    lx += font->CalcTextSizeA(small, FLT_MAX, 0.0f, grade_text.c_str()).x;
-    draw->AddText(font, small, {lx, ty}, IM_COL32(170, 172, 180, a(255)), "  \xc2\xb7  ");
-    lx += font->CalcTextSizeA(small, FLT_MAX, 0.0f, "  \xc2\xb7  ").x;
-    draw->AddText(font, small, {lx, ty}, IM_COL32(170, 172, 180, a(255)), label.c_str());
-    const ImVec4 clip{x0, y0, x0 + w - pad, y0 + h};
-    draw->AddText(font, big, {tx, ty + small + 10.0f * unit}, IM_COL32(245, 245, 247, a(255)),
-                  toast.name.c_str(), nullptr, 0.0f, &clip);
-    if (!toast.detail.empty()) {
-        draw->AddText(font, small, {tx, ty + small + big + 16.0f * unit},
-                      IM_COL32(190, 192, 200, a(255)), toast.detail.c_str(), nullptr, 0.0f, &clip);
+    // icon: pop with overshoot, frame in the grade's colour, sparks, shine
+    const float cx = a.x + pad + icon * 0.5f, cy = a.y + pad + icon * 0.5f;
+    const float pt = std::clamp((t - 0.18f) / 0.5f, 0.0f, 1.0f);
+    const float pop = t < 0.18f ? 0.0f : EaseOutBack(pt);
+    if (pop > 0.01f) {
+        const float hs = icon * 0.5f * pop;
+        const ImVec2 q0{cx - hs, cy - hs}, q1{cx + hs, cy + hs};
+        for (int i = 4; i >= 1; i--) {
+            const float g = hs + i * 4.0f * u;
+            dl->AddRectFilled({cx - g, cy - g}, {cx + g, cy + g}, GC(0.07f * pulse), 6 * u + i * 3 * u);
+        }
+        dl->AddRectFilled({q0.x - 3 * u, q0.y - 3 * u}, {q1.x + 3 * u, q1.y + 3 * u}, GC(0.9f), 5 * u);
+        const ImTextureID tex =
+            toast.custom ? ImTextureID{} : Get(toast.icon, toast.icon_path, 240, 240);
+        if (toast.custom) {
+            DrawCustomIcon(dl, q0.x, q0.y, hs * 2.0f, g_a);
+        } else if (tex) {
+            dl->AddImage(tex, q0, q1, {0, 0}, {1, 1}, Col(255, 255, 255));
+        } else {
+            dl->AddRectFilled(q0, q1, Col(30, 28, 30), 4 * u);
+            DrawCup(dl, q0.x + hs * 0.25f, q0.y + hs * 0.2f, hs * 1.5f, gc, g_a);
+        }
+        if (t > 0.7f && t < 1.5f) {
+            const float st = (t - 0.7f) / 0.8f;
+            const float sx = q0.x - hs + st * hs * 4.0f;
+            dl->PushClipRect(q0, q1, true);
+            dl->AddQuadFilled({sx, q0.y}, {sx + hs * 0.35f, q0.y}, {sx - hs * 0.25f, q1.y},
+                              {sx - hs * 0.6f, q1.y}, Col(255, 248, 225, 0.55f));
+            dl->PopClipRect();
+        }
+        // sparks
+        if (t > 0.2f && t < 1.4f) {
+            const float st = (t - 0.2f) / 1.2f;
+            for (int k = 0; k < 14; k++) {
+                const float ang = k * 0.4488f + 0.3f;
+                const float dist = icon * (0.45f + 0.55f * EaseOut(st)) * (0.8f + 0.25f * ((k * 7) % 5) / 4.0f);
+                const ImVec2 sp{cx + std::cos(ang) * dist, cy + std::sin(ang) * dist};
+                dl->AddCircleFilled(sp, (2.6f - 1.6f * st) * u, GC(1.0f - st));
+            }
+        }
     }
+    // text
+    const float tx = a.x + pad * 2 + icon, ty = a.y + pad + 4 * u;
+    const float ha = std::clamp((t - 0.25f) / 0.35f, 0.0f, 1.0f);
+    const float slide = (1.0f - EaseOut(ha)) * 16 * u;
+    TxtSpaced(dl, g_ft_title, head_px, {tx + slide, ty}, GC(ha), "TROFEO OBTENIDO", 3 * u, false);
+    {
+        const float lw = std::min(w - (tx - a.x) - pad, 260 * u) * EaseOut(ha);
+        dl->AddRectFilledMultiColor({tx, ty + head_px + 8 * u}, {tx + lw, ty + head_px + 9.5f * u},
+                                    GC(0.8f), GC(0.0f), GC(0.0f), GC(0.8f));
+    }
+    const float na = std::clamp((t - 0.35f) / 0.35f, 0.0f, 1.0f);
+    const ImVec4 clip{a.x, a.y, b.x - pad, b.y};
+    dl->AddText(FT(g_ft_text), name_px, {tx + (1.0f - EaseOut(na)) * 20 * u, ty + head_px + 16 * u},
+                Parch(na), toast.name.c_str(), nullptr, 0.0f, &clip);
+    const std::string sub = toast.detail.empty() ? std::string(GradeName(toast.grade))
+                                                 : std::string(GradeName(toast.grade)) + "  \xc2\xb7  " + toast.detail;
+    dl->AddText(FT(g_ft_ui), small_px, {tx, ty + head_px + 20 * u + name_px}, Muted(na),
+                sub.c_str(), nullptr, 0.0f, &clip);
+    // progress line along the bottom
+    const float life = std::clamp(t / kToastSeconds, 0.0f, 1.0f);
+    dl->AddRectFilled({a.x + r, b.y - 3 * u}, {a.x + r + (w - 2 * r) * (1.0f - life), b.y - 1.5f * u},
+                      GC(0.55f));
+    g_a = saved;
 }
 
 // ---------------------------------------------------------------- custom trophy (not PSN)
@@ -1761,17 +2243,161 @@ bool WriteDirect(bool on) {
 
 
 // ---------------------------------------------------------------- the layer
-constexpr int kTabs = 5;
+// (bb-menu-121) F1 opens a full-screen hub (Mando, Teclado y ratón, Trofeos, Opciones, Salir
+// del juego); a card opens only its own screen, Volver (Circle / Esc) goes back to the hub.
+enum class Screen { Hub = -1, Pad = 0, Kbm = 1, Trophies = 2, Options = 3, Exit = 4 };
+constexpr int kCards = 5;
+
+// hub icons, gold line art
+void IconPad(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const float th = std::max(1.5f, s * 0.035f);
+    dl->AddRect({c.x - 0.40f * s, c.y - 0.20f * s}, {c.x + 0.40f * s, c.y + 0.10f * s}, col,
+                0.14f * s, 0, th);
+    dl->AddCircle({c.x - 0.30f * s, c.y + 0.12f * s}, 0.15f * s, col, 24, th);
+    dl->AddCircle({c.x + 0.30f * s, c.y + 0.12f * s}, 0.15f * s, col, 24, th);
+    dl->AddRectFilled({c.x - 0.36f * s, c.y - 0.08f * s}, {c.x - 0.20f * s, c.y - 0.04f * s}, col);
+    dl->AddRectFilled({c.x - 0.30f * s, c.y - 0.14f * s}, {c.x - 0.26f * s, c.y + 0.02f * s}, col);
+    for (int i = 0; i < 4; i++) {
+        const float ang = i * 1.5708f;
+        dl->AddCircleFilled({c.x + 0.28f * s + std::cos(ang) * 0.065f * s,
+                             c.y - 0.06f * s + std::sin(ang) * 0.065f * s},
+                            0.025f * s, col);
+    }
+    dl->AddCircle({c.x - 0.11f * s, c.y + 0.03f * s}, 0.06f * s, col, 16, th);
+    dl->AddCircle({c.x + 0.11f * s, c.y + 0.03f * s}, 0.06f * s, col, 16, th);
+}
+void IconKbm(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const float th = std::max(1.5f, s * 0.035f);
+    const ImVec2 k0{c.x - 0.46f * s, c.y - 0.12f * s}, k1{c.x + 0.16f * s, c.y + 0.20f * s};
+    dl->AddRect(k0, k1, col, 0.04f * s, 0, th);
+    for (int r = 0; r < 3; r++) {
+        for (int i = 0; i < 6; i++) {
+            const float x = k0.x + 0.05f * s + i * 0.095f * s, y = k0.y + 0.05f * s + r * 0.075f * s;
+            dl->AddRectFilled({x, y}, {x + 0.06f * s, y + 0.045f * s}, col, 0.01f * s);
+        }
+    }
+    dl->AddRect({c.x + 0.24f * s, c.y - 0.14f * s}, {c.x + 0.46f * s, c.y + 0.22f * s}, col,
+                0.11f * s, 0, th);
+    dl->AddLine({c.x + 0.35f * s, c.y - 0.14f * s}, {c.x + 0.35f * s, c.y - 0.02f * s}, col, th);
+}
+void IconGear(ImDrawList* dl, ImVec2 c, float s, ImU32 col, float rot) {
+    const float th = std::max(1.5f, s * 0.035f);
+    dl->AddCircle(c, 0.24f * s, col, 32, th);
+    dl->AddCircle(c, 0.10f * s, col, 24, th);
+    for (int i = 0; i < 8; i++) {
+        const float a = rot + i * 0.7854f;
+        const float ca = std::cos(a), sa = std::sin(a), w = 0.05f * s;
+        const ImVec2 p0{c.x + ca * 0.24f * s, c.y + sa * 0.24f * s};
+        const ImVec2 p1{c.x + ca * 0.34f * s, c.y + sa * 0.34f * s};
+        dl->AddQuadFilled({p0.x - sa * w, p0.y + ca * w}, {p1.x - sa * w * 0.8f, p1.y + ca * w * 0.8f},
+                          {p1.x + sa * w * 0.8f, p1.y - ca * w * 0.8f}, {p0.x + sa * w, p0.y - ca * w},
+                          col);
+    }
+}
+void IconDoor(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const float th = std::max(1.5f, s * 0.035f);
+    const float w = 0.20f * s, top = c.y - 0.10f * s, bot = c.y + 0.30f * s, x = c.x - 0.08f * s;
+    dl->PathArcTo({x, top}, w, 3.14159f, 2 * 3.14159f, 24);
+    dl->PathLineTo({x + w, bot});
+    dl->PathLineTo({x - w, bot});
+    dl->PathStroke(col, ImDrawFlags_Closed, th);
+    dl->AddLine({x, top - w}, {x, bot}, col, th * 0.7f);
+    dl->AddCircleFilled({x + w * 0.5f, c.y + 0.10f * s}, 0.025f * s, col);
+    // the way out
+    dl->AddLine({c.x + 0.10f * s, c.y + 0.08f * s}, {c.x + 0.40f * s, c.y + 0.08f * s}, col, th);
+    dl->AddTriangleFilled({c.x + 0.44f * s, c.y + 0.08f * s}, {c.x + 0.34f * s, c.y + 0.01f * s},
+                          {c.x + 0.34f * s, c.y + 0.15f * s}, col);
+}
+
+// custom drawn controls
+bool Toggle(const char* id, ImVec2 p, bool on, float& anim, float u, bool focus) {
+    const ImVec2 q{p.x + 68 * u, p.y + 34 * u};
+    bool hov = false;
+    const bool r = Hit(id, p, q, &hov);
+    anim = Approach(anim, on ? 1.0f : 0.0f, ImGui::GetIO().DeltaTime, 12.0f);
+    auto* dl = ImGui::GetWindowDrawList();
+    if (focus || hov) {
+        dl->AddRect({p.x - 4 * u, p.y - 4 * u}, {q.x + 4 * u, q.y + 4 * u}, Gold(0.5f), 21 * u, 0,
+                    2 * u);
+    }
+    dl->AddRectFilled(p, q, anim > 0.5f ? Col(96, 72, 38, 0.95f) : Col(30, 27, 26, 0.95f), 17 * u);
+    dl->AddRect(p, q, Bronze(0.9f), 17 * u, 0, std::max(1.0f, u));
+    const float kx = p.x + 17 * u + anim * 34 * u;
+    dl->AddCircleFilled({kx, p.y + 17 * u}, 12 * u, anim > 0.5f ? Gold() : Col(150, 140, 128));
+    return r;
+}
+// returns true when the value was committed (mouse released or a step)
+bool Slider(const char* id, ImVec2 p, float w, float& v, float mn, float mx, float u, bool focus) {
+    const float h = 34 * u;
+    ImGui::SetCursorScreenPos(p);
+    ImGui::InvisibleButton(id, {w, h});
+    const bool active = ImGui::IsItemActive(), hov = ImGui::IsItemHovered();
+    if (active) {
+        const float k = std::clamp((ImGui::GetIO().MousePos.x - p.x) / w, 0.0f, 1.0f);
+        v = mn + (mx - mn) * k;
+    }
+    const bool commit = ImGui::IsItemDeactivated();
+    auto* dl = ImGui::GetWindowDrawList();
+    const float k = std::clamp((v - mn) / (mx - mn), 0.0f, 1.0f);
+    const float cy = p.y + h * 0.5f;
+    dl->AddRectFilled({p.x, cy - 3 * u}, {p.x + w, cy + 3 * u}, Col(8, 7, 8, 0.95f), 3 * u);
+    dl->AddRectFilledMultiColor({p.x, cy - 3 * u}, {p.x + w * k, cy + 3 * u}, Col(120, 70, 34),
+                                Col(236, 198, 112), Col(236, 198, 112), Col(120, 70, 34));
+    if (focus || hov || active) {
+        dl->AddCircleFilled({p.x + w * k, cy}, 18 * u, Gold(0.18f));
+    }
+    dl->AddCircleFilled({p.x + w * k, cy}, 11 * u, focus || active ? Gold() : Col(200, 186, 160));
+    dl->AddCircle({p.x + w * k, cy}, 11 * u, Col(40, 30, 20), 0, std::max(1.0f, u));
+    return commit;
+}
+// a framed text button; returns clicked
+bool CardButton(const char* id, ImVec2 a, ImVec2 b, const char* label, float u, bool focus,
+                bool danger = false) {
+    bool hov = false;
+    const bool r = Hit(id, a, b, &hov);
+    auto* dl = ImGui::GetWindowDrawList();
+    const bool on = focus || hov;
+    const float t = Now();
+    if (on) {
+        const float pulse = 0.7f + 0.3f * std::sin(t * 5.0f);
+        for (int i = 3; i >= 1; i--) {
+            const float g = i * 3.0f * u;
+            dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g},
+                        danger ? Col(200, 60, 50, 0.12f * pulse) : Gold(0.12f * pulse), 6 * u + g, 0,
+                        2 * u);
+        }
+    }
+    const ImU32 top = danger ? Col(92, 24, 22, 0.95f) : Col(54, 44, 32, 0.95f);
+    const ImU32 bot = danger ? Col(40, 12, 12, 0.95f) : Col(22, 19, 17, 0.95f);
+    dl->AddRectFilledMultiColor(a, b, top, top, bot, bot);
+    dl->AddRect(a, b, on ? (danger ? Col(236, 120, 100) : Gold()) : Bronze(0.8f), 6 * u, 0,
+                std::max(1.0f, 1.4f * u));
+    const float px = 26 * u;
+    const ImVec2 ts = TextSize(g_ft_title, px, label);
+    Txt(dl, g_ft_title, px, {(a.x + b.x - ts.x) * 0.5f, (a.y + b.y - ts.y) * 0.5f},
+        on ? Parch() : Col(220, 210, 194), label);
+    return r;
+}
+
 class MenuLayer final : public ImGui::Layer {
 public:
-    int tab = 0;
-    int want_tab = -1;
+    Screen screen = Screen::Hub;
     bool was_open = false;
-    bool confirm_exit = false;
-    float anim = 0.0f;       // open/close 0..1
-    double tab_t = 0;        // tab switch time (content cross-fade)
-    float ul_x0 = 0, ul_x1 = 0; // sliding tab underline
-    bool ul_init = false;
+    float anim = 0.0f;   // open/close 0..1
+    double scr_t = 0;    // screen switch time
+    float scr_dir = 1.0f;
+    double hub_t = 0;    // hub entrance (staggered cards)
+    int hub_focus = 0;
+    float card_hov[kCards] = {};
+    double card_focus_t[kCards] = {};
+    int pad_focus = 0;   // kPadRows index, 18 = reset
+    int kbm_focus = 0;   // kKbmRows index, 24.. settings
+    float kbm_scroll = -1.0f;
+    bool kbm_scroll_to = false;
+    int exit_focus = 0;
+    float tog_direct = 0, tog_stick = 0, tog_look = 0;
+    float s_sp = 1.0f, s_dz = 0.5f;
+    double dpad_since[4] = {-1, -1, -1, -1}, dpad_rep[4] = {};
 
     // 1.11 (bb-fgfix-111): the default (true) made ImGui::Core::MustKeepDrawing() always true,
     // so the video-out thread re-presented the last frame (DrawLastFrame) on every vblank tick
@@ -1784,14 +2410,292 @@ public:
         return !g_toasts.empty();
     }
 
+    void Go(Screen s) {
+        scr_dir = s == Screen::Hub ? -1.0f : 1.0f;
+        if (s == Screen::Hub) {
+            hub_t = ImGui::GetTime() - 0.25; // a shorter stagger when coming back
+        }
+        if (s == Screen::Trophies) {
+            g_trophy_page_t = ImGui::GetTime();
+            g_trophy_bar = 0.0f;
+            g_trophy_focus = 0;
+            g_trophy_scroll = -1.0f;
+        }
+        if (s == Screen::Exit) {
+            exit_focus = 0;
+        }
+        screen = s;
+        scr_t = ImGui::GetTime();
+        std::scoped_lock lk{g_cap_mtx};
+        g_capture = Capture::None;
+    }
+    void Close() {
+        g_want_close = true;
+        Wake();
+    }
+
+    // d-pad auto-repeat (held > 0.4 s)
+    void DpadRepeat(std::vector<Nav>& nav) {
+        const u32 bits = g_pad_buttons.load();
+        const int btn[4] = {SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+                           SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT};
+        const Nav dir[4] = {Nav::Up, Nav::Down, Nav::Left, Nav::Right};
+        const double now = ImGui::GetTime();
+        for (int i = 0; i < 4; i++) {
+            if ((bits & (1u << btn[i])) == 0) {
+                dpad_since[i] = -1;
+                continue;
+            }
+            if (dpad_since[i] < 0) {
+                dpad_since[i] = now;
+                dpad_rep[i] = now;
+            } else if (now - dpad_since[i] > 0.4 && now - dpad_rep[i] > 0.075) {
+                dpad_rep[i] = now;
+                nav.push_back(dir[i]);
+            }
+        }
+    }
+
+    void HandleNav(const std::vector<Nav>& nav) {
+        for (const Nav n : nav) {
+            if (n == Nav::Back) {
+                if (screen == Screen::Hub) {
+                    Close();
+                } else {
+                    Go(Screen::Hub);
+                }
+                continue;
+            }
+            switch (screen) {
+            case Screen::Hub:
+                if (n == Nav::Left || n == Nav::Up) hub_focus = (hub_focus + kCards - 1) % kCards;
+                if (n == Nav::Right || n == Nav::Down) hub_focus = (hub_focus + 1) % kCards;
+                if (n == Nav::Accept) Go(static_cast<Screen>(hub_focus));
+                break;
+            case Screen::Pad: {
+                const int cnt = static_cast<int>(std::size(kPadRows)) + 1;
+                if (n == Nav::Up || n == Nav::Left) pad_focus = (pad_focus + cnt - 1) % cnt;
+                if (n == Nav::Down || n == Nav::Right) pad_focus = (pad_focus + 1) % cnt;
+                if (n == Nav::Prev) g_pad_photo = (g_pad_photo + 2) % 3;
+                if (n == Nav::Next) g_pad_photo = (g_pad_photo + 1) % 3;
+                if (n == Nav::Accept) {
+                    if (pad_focus < static_cast<int>(std::size(kPadRows))) {
+                        StartCaptureFor(kPadRows[pad_focus].output, Cat::Pad);
+                    } else {
+                        ResetPad();
+                    }
+                }
+                if (n == Nav::Clear && pad_focus < static_cast<int>(std::size(kPadRows))) {
+                    const std::string o = kPadRows[pad_focus].output;
+                    if (!o.starts_with("stick_")) g_cfg.Set(o, Cat::Pad, "", {});
+                }
+                break;
+            }
+            case Screen::Kbm: {
+                const int rows = static_cast<int>(std::size(kKbmRows));
+                const int cnt = rows + 4;
+                if (n == Nav::Up) kbm_focus = (kbm_focus + cnt - 1) % cnt, kbm_scroll_to = true;
+                if (n == Nav::Down) kbm_focus = (kbm_focus + 1) % cnt, kbm_scroll_to = true;
+                if (n == Nav::Left || n == Nav::Right) {
+                    const float d = n == Nav::Left ? -1.0f : 1.0f;
+                    float dz, sp, off;
+                    g_cfg.MouseParams(dz, sp, off);
+                    if (kbm_focus == rows) {
+                        s_sp = std::clamp(s_sp + d * 0.05f, 0.1f, 5.0f);
+                        g_cfg.SetMouseParams(s_dz, s_sp, off);
+                    } else if (kbm_focus == rows + 1) {
+                        s_dz = std::clamp(s_dz + d * 0.02f, 0.0f, 1.0f);
+                        g_cfg.SetMouseParams(s_dz, s_sp, off);
+                    }
+                }
+                if (n == Nav::Accept) {
+                    if (kbm_focus < rows) {
+                        StartCaptureFor(kKbmRows[kbm_focus].output, Cat::Kbm);
+                    } else if (kbm_focus == rows + 2) {
+                        g_cfg.SetMouseStick(g_cfg.MouseStick() != "left" ? "left" : "right");
+                    } else if (kbm_focus == rows + 3) {
+                        g_restore_mouse_look = !g_restore_mouse_look;
+                    }
+                }
+                if (n == Nav::Clear && kbm_focus < rows) {
+                    g_cfg.Set(kKbmRows[kbm_focus].output, Cat::Kbm, "", {});
+                }
+                break;
+            }
+            case Screen::Trophies: {
+                const float u = std::max(ImGui::GetIO().DisplaySize.y / 1440.0f, 0.5f);
+                const int cols = TrophyCols(ImGui::GetIO().DisplaySize.x - 2 * 110 * u, u);
+                if (n == Nav::Left) g_trophy_focus--;
+                if (n == Nav::Right) g_trophy_focus++;
+                if (n == Nav::Up) g_trophy_focus -= cols;
+                if (n == Nav::Down) g_trophy_focus += cols;
+                g_trophy_focus = std::max(0, g_trophy_focus); // upper clamp when drawn
+                if (n == Nav::Prev || n == Nav::Next) {
+                    g_trophy_filter = (g_trophy_filter + (n == Nav::Next ? 1 : 2)) % 3;
+                    g_trophy_focus = 0;
+                    g_trophy_page_t = ImGui::GetTime();
+                    g_trophy_scroll = 0.0f;
+                }
+                g_trophy_scroll_to = true;
+                break;
+            }
+            case Screen::Options:
+                if (n == Nav::Accept && g_direct.exists) {
+                    if (WriteDirect(!g_direct.on)) g_direct.on = !g_direct.on;
+                }
+                break;
+            case Screen::Exit:
+                if (n == Nav::Left || n == Nav::Right || n == Nav::Up || n == Nav::Down) {
+                    exit_focus ^= 1;
+                }
+                if (n == Nav::Accept) {
+                    if (exit_focus == 1) Quit();
+                    else Go(Screen::Hub);
+                }
+                break;
+            }
+        }
+    }
+
+    static void Quit() {
+        LOG_INFO(Frontend, "[bb-menu] Salir del juego: closing the emulator");
+        SDL_Event e{};
+        e.type = SDL_EVENT_QUIT;
+        SDL_PushEvent(&e);
+    }
+    static void ResetPad() {
+        for (const auto& r : kPadRows) {
+            const std::string o = r.output;
+            if (o.starts_with("stick_")) continue;
+            g_cfg.Set(o, Cat::Pad, o, {});
+        }
+        for (const char* a : {"axis_left_x", "axis_left_y", "axis_right_x", "axis_right_y"}) {
+            g_cfg.Set(a, Cat::Pad, a, {});
+        }
+    }
+
+    // dimmed game, vignette, warm haze and slow embers (only while open)
+    void Backdrop(ImVec2 disp, float e, float u) {
+        auto* bg = ImGui::GetBackgroundDrawList();
+        const float t = Now();
+        const float sa = g_a;
+        g_a = e;
+        bg->AddRectFilled({0, 0}, disp, Col(5, 4, 6, 0.80f));
+        const ImU32 v = Col(0, 0, 0, 0.75f), z = Col(0, 0, 0, 0.0f);
+        bg->AddRectFilledMultiColor({0, 0}, {disp.x, disp.y * 0.30f}, v, v, z, z);
+        bg->AddRectFilledMultiColor({0, disp.y * 0.70f}, disp, z, z, v, v);
+        bg->AddRectFilledMultiColor({0, 0}, {disp.x * 0.22f, disp.y}, v, z, z, v);
+        bg->AddRectFilledMultiColor({disp.x * 0.78f, 0}, disp, z, v, v, z);
+        // warm haze breathing in the middle
+        const float br = 0.75f + 0.25f * std::sin(t * 0.6f);
+        for (int i = 6; i >= 1; i--) {
+            bg->AddCircleFilled({disp.x * 0.5f, disp.y * 0.45f}, disp.x * 0.07f * i,
+                                Col(120, 74, 36, 0.018f * br), 64);
+        }
+        // embers rising
+        for (int i = 0; i < 46; i++) {
+            const float h1 = std::fmod(std::sin(i * 12.9898f) * 43758.5453f, 1.0f);
+            const float h2 = std::fmod(std::sin(i * 78.233f) * 12345.678f, 1.0f);
+            const float rx = std::fabs(h1), rs = std::fabs(h2);
+            const float speed = 0.025f + 0.04f * rs;
+            const float life = std::fmod(t * speed + rx * 7.0f, 1.0f);
+            const float y = disp.y * (1.05f - life * 1.1f);
+            const float x = disp.x * rx + std::sin(t * (0.3f + rs) + i) * 30 * u;
+            const float al = std::sin(life * 3.14159f) * (0.25f + 0.45f * rs);
+            const float r = (1.2f + 2.2f * rs) * u;
+            bg->AddCircleFilled({x, y}, r * 2.6f, Col(230, 140, 60, al * 0.12f));
+            bg->AddCircleFilled({x, y}, r, Col(250, 190, 110, al));
+        }
+        g_a = sa;
+    }
+
+    void Header(ImVec2 disp, float u, float ha) {
+        auto* dl = ImGui::GetWindowDrawList();
+        const float sa = g_a;
+        g_a = sa * ha;
+        if (screen == Screen::Hub) {
+            TxtSpaced(dl, g_ft_title, 70 * u, {disp.x * 0.5f, 92 * u}, Gold(), "BLOODBORNE", 14 * u,
+                      true);
+            TxtC(dl, g_ft_italic, 28 * u, disp.x * 0.5f, 180 * u, Muted(), "El Sueño del Cazador");
+            OrnLine(dl, disp.x * 0.5f, 228 * u, 420 * u, 0.9f, u);
+        } else {
+            static const char* titles[] = {"MANDO", "TECLADO Y RATÓN", "TROFEOS", "OPCIONES",
+                                           "SALIR DEL JUEGO"};
+            TxtSpaced(dl, g_ft_title, 22 * u, {disp.x * 0.5f, 38 * u}, Bronze(), "BLOODBORNE", 6 * u,
+                      true);
+            TxtSpaced(dl, g_ft_title, 50 * u, {disp.x * 0.5f, 66 * u}, Gold(),
+                      titles[static_cast<int>(screen)], 6 * u, true);
+            OrnLine(dl, disp.x * 0.5f, 140 * u, 520 * u, 0.9f, u);
+            // a back button top-left
+            bool hov = false;
+            const ImVec2 b0{60 * u, 56 * u}, b1{250 * u, 104 * u};
+            if (Hit("##back", b0, b1, &hov)) {
+                Go(Screen::Hub);
+            }
+            dl->AddRectFilled(b0, b1, hov ? Col(60, 48, 32, 0.9f) : Col(20, 18, 17, 0.8f), 24 * u);
+            dl->AddRect(b0, b1, hov ? Gold() : Bronze(0.7f), 24 * u, 0, std::max(1.0f, 1.2f * u));
+            Glyph(dl, "circle", {b0.x + 24 * u, (b0.y + b1.y) * 0.5f}, 14 * u);
+            Txt(dl, g_ft_title, 22 * u, {b0.x + 48 * u, b0.y + 11 * u}, hov ? Parch() : Parch(0.85f),
+                "VOLVER");
+        }
+        g_a = sa;
+    }
+
+    void Footer(ImVec2 disp, float u) {
+        auto* dl = ImGui::GetWindowDrawList();
+        std::vector<std::pair<const char*, const char*>> hints;
+        switch (screen) {
+        case Screen::Hub:
+            hints = {{"cross", "Entrar"}, {"circle", "Volver al juego"}, {"F1", "Cerrar"}};
+            break;
+        case Screen::Pad:
+            hints = {{"pad", "Elegir"}, {"cross", "Reasignar"}, {"triangle", "Quitar"},
+                     {"l1", "Cambiar foto"}, {"circle", "Volver"}};
+            break;
+        case Screen::Kbm:
+            hints = {{"pad", "Elegir"}, {"cross", "Asignar tecla"}, {"triangle", "Quitar"},
+                     {"circle", "Volver"}};
+            break;
+        case Screen::Trophies:
+            hints = {{"pad", "Moverse"}, {"l1", "Filtro"}, {"circle", "Volver"}};
+            break;
+        default:
+            hints = {{"cross", "Aceptar"}, {"circle", "Volver"}};
+            break;
+        }
+        const float px = 21 * u, r = 15 * u, gap = 36 * u;
+        float total = 0;
+        for (const auto& h : hints) {
+            total += 2 * r + 10 * u + TextSize(g_ft_ui, px, h.second).x + gap;
+        }
+        float x = (disp.x - total + gap) * 0.5f;
+        const float y = disp.y - 52 * u;
+        OrnLine(dl, disp.x * 0.5f, y - 26 * u, std::min(disp.x * 0.35f, 700 * u), 0.45f, u);
+        for (const auto& h : hints) {
+            const std::string g = h.first;
+            if (g == "F1") {
+                KeyCap(dl, {x - 4 * u, y - 17 * u}, "F1", u, 1.0f, false);
+                x += KeyCapW("F1", u) - 2 * r - 4 * u;
+            } else if (g == "pad") {
+                Glyph(dl, "pad_up", {x + r, y}, r);
+            } else {
+                Glyph(dl, g, {x + r, y}, r);
+            }
+            Txt(dl, g_ft_ui, px, {x + 2 * r + 10 * u, y - px * 0.6f}, Parch(0.85f), h.second);
+            x += 2 * r + 10 * u + TextSize(g_ft_ui, px, h.second).x + gap;
+        }
+    }
+
     void Draw() override {
         const ImVec2 disp = ImGui::GetIO().DisplaySize;
-        const float unit = std::max(disp.y / 1440.0f, 0.5f);
-        DrawToast(std::max(disp.y / 1080.0f, 0.5f));
+        const float u = std::max(disp.y / 1440.0f, 0.5f);
+        g_a = 1.0f;
+        DrawToast(u);
         const float dt = ImGui::GetIO().DeltaTime;
-        anim = std::clamp(anim + (g_open ? dt : -dt) / 0.20f, 0.0f, 1.0f);
+        anim = std::clamp(anim + (g_open ? dt : -dt) / 0.25f, 0.0f, 1.0f);
         if (!g_open && anim <= 0.0f) {
             was_open = false;
+            TakeNav();
             return;
         }
         const bool closing = !g_open;
@@ -1800,12 +2704,13 @@ public:
             g_cfg.Load();
             LoadTrophies();
             ReadDirect();
-            confirm_exit = false;
-            tab_t = ImGui::GetTime();
-            g_trophy_page_t = tab_t;
-            g_trophy_bar = 0.0f;
-            ul_init = false;
-            ImGui::SetNextWindowFocus();
+            float off;
+            g_cfg.MouseParams(s_dz, s_sp, off);
+            screen = Screen::Hub;
+            hub_t = ImGui::GetTime();
+            scr_t = hub_t;
+            for (auto& h : card_hov) h = 0.0f;
+            TakeNav();
         }
         if (g_custom_changed.exchange(false)) {
             LoadTrophies();
@@ -1819,191 +2724,509 @@ public:
             std::scoped_lock lk{g_cap_mtx};
             capturing = g_capture != Capture::None;
         }
-        // dim the game (fades with the menu) and a vignette in place of a blur
-        auto* bg = ImGui::GetBackgroundDrawList();
-        bg->AddRectFilled({0, 0}, disp, IM_COL32(4, 3, 6, static_cast<int>(165 * e)));
-        const ImU32 vin = IM_COL32(0, 0, 0, static_cast<int>(120 * e)), clr = IM_COL32(0, 0, 0, 0);
-        bg->AddRectFilledMultiColor({0, 0}, {disp.x, disp.y * 0.25f}, vin, vin, clr, clr);
-        bg->AddRectFilledMultiColor({0, disp.y * 0.75f}, disp, clr, clr, vin, vin);
-        const float sc = 0.94f + 0.06f * e;
-        const ImVec2 size{disp.x * 0.86f * sc, disp.y * 0.86f * sc};
-        const ImVec2 center{disp.x * 0.5f, disp.y * 0.5f + (1.0f - e) * 40.0f * unit};
-        // soft shadow under the panel
-        for (int i = 1; i <= 4; i++) {
-            const float g = static_cast<float>(i) * 10.0f * unit;
-            bg->AddRectFilled({center.x - size.x * 0.5f - g, center.y - size.y * 0.5f - g + 12 * unit},
-                              {center.x + size.x * 0.5f + g, center.y + size.y * 0.5f + g + 12 * unit},
-                              IM_COL32(0, 0, 0, static_cast<int>(28 * e)), 14 * unit + g);
+        std::vector<Nav> nav = TakeNav();
+        if (!capturing && !closing) {
+            DpadRepeat(nav);
+            HandleNav(nav);
         }
-        ImGui::SetNextWindowPos(center, ImGuiCond_Always, {0.5f, 0.5f});
-        ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+        Backdrop(disp, e, u);
+
+        ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(disp, ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, e);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14 * unit);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {28 * unit, 22 * unit});
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {14 * unit, 8 * unit});
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {14 * unit, 10 * unit});
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8 * unit);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.05f, 0.06f, 0.97f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.93f, 0.78f, 0.47f, 0.35f));
-        ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.16f, 0.15f, 0.14f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_TabSelected, ImVec4(0.45f, 0.36f, 0.20f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.60f, 0.48f, 0.27f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.20f, 0.17f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.50f, 0.40f, 0.22f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.45f, 0.36f, 0.20f, 0.8f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.55f, 0.44f, 0.24f, 0.8f));
-        ImGui::PushStyleColor(ImGuiCol_NavCursor, kGold);
-        if (ImGui::Begin("Menú (F1)##bbmenu", nullptr,
-                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                             ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
-                             (closing ? ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav : 0))) {
-            {
-                // gothic trim: a gold rule under the title and corner filigree
-                auto* wd = ImGui::GetWindowDrawList();
-                const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-                const ImU32 gold = IM_COL32(236, 200, 120, static_cast<int>(150 * e));
-                const float c = 26 * unit, o = 8 * unit;
-                const ImVec2 cs[4] = {{wp.x + o, wp.y + o}, {wp.x + ws.x - o, wp.y + o},
-                                      {wp.x + o, wp.y + ws.y - o}, {wp.x + ws.x - o, wp.y + ws.y - o}};
-                for (int k = 0; k < 4; k++) {
-                    const float sx = (k & 1) ? -1.0f : 1.0f, sy = (k & 2) ? -1.0f : 1.0f;
-                    wd->AddLine(cs[k], {cs[k].x + sx * c, cs[k].y}, gold, 1.5f);
-                    wd->AddLine(cs[k], {cs[k].x, cs[k].y + sy * c}, gold, 1.5f);
-                    wd->AddCircleFilled({cs[k].x + sx * 5 * unit, cs[k].y + sy * 5 * unit}, 2.0f * unit, gold);
-                }
+        const ImGuiWindowFlags flags =
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoScrollWithMouse |
+            (closing || capturing ? ImGuiWindowFlags_NoInputs : 0);
+        if (ImGui::Begin("##bbmenu121", nullptr, flags)) {
+            PushF(g_ft_ui, 20 * u);
+            const float st = static_cast<float>(ImGui::GetTime() - scr_t);
+            const float ca = EaseOut(st / 0.32f);
+            g_a = e;
+            Header(disp, u, std::clamp(st / 0.25f, 0.0f, 1.0f));
+            g_a = e * ca;
+            const float slide = (1.0f - ca) * 70 * u * scr_dir;
+            const ImVec2 a{110 * u + slide, 180 * u}, b{disp.x - 110 * u + slide, disp.y - 100 * u};
+            switch (screen) {
+            case Screen::Hub: HubScreen(disp, u); break;
+            case Screen::Pad: PadScreen(a, b, u); break;
+            case Screen::Kbm: KbmScreen(a, b, u); break;
+            case Screen::Trophies: TrophyScreen(a, b, u); break;
+            case Screen::Options: OptionsScreen(a, b, u); break;
+            case Screen::Exit: ExitScreen(disp, u); break;
             }
-            ImGui::SetWindowFontScale(std::max(1.0f, disp.y / 1440.0f * 1.6f));
-            ImGui::TextColored(kGold, "BLOODBORNE  ·  MENÚ");
-            ImGui::SameLine();
-            ImGui::TextColored(kDim,
-                               "   F1 / ○: volver al juego    L1 / R1: cambiar de pestaña");
-            // L1 / R1 change tabs (not while rebinding)
-            if (!capturing && !confirm_exit && !closing) {
-                if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) {
-                    want_tab = (tab + kTabs - 1) % kTabs;
-                }
-                if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) {
-                    want_tab = (tab + 1) % kTabs;
-                }
-                if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
-                    ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-                    g_want_close = true;
-                    Wake();
-                }
+            g_a = e;
+            Footer(disp, u);
+            if (capturing) {
+                CaptureOverlay(disp, u);
             }
-            if (ImGui::BeginTabBar("##tabs")) {
-                const char* names[kTabs] = {"Mando", "Teclado y ratón", "Trofeos", "Opciones",
-                                            "Salir del juego"};
-                float sel_x0 = ul_x0, sel_x1 = ul_x1, sel_y = 0;
-                for (int i = 0; i < kTabs; i++) {
-                    ImGuiTabItemFlags f = want_tab == i ? ImGuiTabItemFlags_SetSelected : 0;
-                    const bool open_tab = ImGui::BeginTabItem(names[i], nullptr, f);
-                    if (open_tab) {
-                        sel_x0 = ImGui::GetItemRectMin().x;
-                        sel_x1 = ImGui::GetItemRectMax().x;
-                        sel_y = ImGui::GetItemRectMax().y;
-                        if (tab != i) {
-                            g_selected.clear();
-                            std::scoped_lock lk{g_cap_mtx};
-                            g_capture = Capture::None;
-                            tab_t = ImGui::GetTime();
-                            if (i == 2) {
-                                g_trophy_page_t = tab_t;
-                                g_trophy_bar = 0.0f;
-                            }
-                        }
-                        tab = i;
-                        // sliding gold underline
-                        if (!ul_init) {
-                            ul_x0 = sel_x0, ul_x1 = sel_x1, ul_init = true;
-                        }
-                        const float k = std::min(1.0f, dt * 14.0f);
-                        ul_x0 += (sel_x0 - ul_x0) * k;
-                        ul_x1 += (sel_x1 - ul_x1) * k;
-                        auto* wd = ImGui::GetWindowDrawList();
-                        wd->AddRectFilled({ul_x0 - 4 * unit, sel_y - 3 * unit}, {ul_x1 + 4 * unit, sel_y + 5 * unit},
-                                          IM_COL32(236, 196, 110, static_cast<int>(40 * e)), 4 * unit);
-                        wd->AddRectFilled({ul_x0, sel_y - 1 * unit}, {ul_x1, sel_y + 3 * unit},
-                                          IM_COL32(236, 200, 120, static_cast<int>(255 * e)), 2 * unit);
-                        // content cross-fade + slight rise
-                        const float ce = EaseOut(static_cast<float>(ImGui::GetTime() - tab_t) / 0.22f);
-                        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, e * (0.0f + ce));
-                        ImGui::Dummy({0, (1.0f - ce) * 14 * unit});
-                        ImGui::Spacing();
-                        switch (i) {
-                        case 0: PadPage(unit); break;
-                        case 1: KbmPage(unit); break;
-                        case 2: TrophyPage(unit); break;
-                        case 3: OptionsPage(unit); break;
-                        default: ExitPage(unit); break;
-                        }
-                        ImGui::PopStyleVar();
-                        ImGui::EndTabItem();
-                    }
-                    ItemGlow(4 * unit);
-                }
-                want_tab = -1;
-                ImGui::EndTabBar();
-            }
+            ImGui::PopFont();
         }
         ImGui::End();
-        ImGui::PopStyleColor(10);
-        ImGui::PopStyleVar(7);
+        ImGui::PopStyleVar(3);
+        g_a = 1.0f;
     }
 
-    void OptionsPage(float unit) {
-        ImGui::TextColored(kGold, "Inicio");
-        ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::BeginDisabled(!g_direct.exists);
-        bool on = g_direct.on;
-        if (ImGui::Checkbox("Iniciar directamente (sin pasar por el launcher)", &on)) {
-            if (WriteDirect(on)) {
-                g_direct.on = on;
+    // ------------------------------------------------------------ hub
+    void HubScreen(ImVec2 disp, float u) {
+        static const char* titles[kCards] = {"MANDO", "TECLADO Y RATÓN", "TROFEOS", "OPCIONES",
+                                             "SALIR"};
+        int earned = 0;
+        for (const auto& tr : g_trophies) earned += tr.earned;
+        const std::string tsub = fmt::format("{} de {} conseguidos", earned, g_trophies.size());
+        const char* subs[kCards] = {"Reasigna los botones de tu mando",
+                                    "Teclas, ratón y cámara", tsub.c_str(),
+                                    "Inicio directo y ajustes", "Cierra el juego con seguridad"};
+        const float gap = 30 * u;
+        const float cw = std::min(330 * u, (disp.x - 240 * u - gap * (kCards - 1)) / kCards);
+        const float ch = std::min(cw * 1.6f, disp.y * 0.50f);
+        const float x0 = (disp.x - (cw * kCards + gap * (kCards - 1))) * 0.5f;
+        const float cy = disp.y * 0.56f;
+        const float t = Now();
+        const float dt = ImGui::GetIO().DeltaTime;
+        auto* dl = ImGui::GetWindowDrawList();
+        const float base = g_a;
+        for (int i = 0; i < kCards; i++) {
+            const float k = std::clamp(static_cast<float>(ImGui::GetTime() - hub_t - i * 0.07) / 0.5f,
+                                       0.0f, 1.0f);
+            const float ent = EaseOutBack(k);
+            const ImVec2 ra{x0 + i * (cw + gap), cy - ch * 0.5f};
+            const ImVec2 rb{ra.x + cw, ra.y + ch};
+            bool hov = false;
+            const std::string id = "##card" + std::to_string(i);
+            if (Hit(id.c_str(), ra, rb, &hov)) {
+                hub_focus = i;
+                g_a = base;
+                Go(static_cast<Screen>(i));
+                return;
+            }
+            if (hov && MouseMoved()) hub_focus = i;
+            const bool on = hub_focus == i;
+            if (on && card_hov[i] < 0.05f) card_focus_t[i] = ImGui::GetTime();
+            card_hov[i] = Approach(card_hov[i], on ? 1.0f : 0.0f, dt, 10.0f);
+            const float h = card_hov[i];
+            const float lift = -16 * u * h + (1.0f - ent) * 80 * u;
+            const float sc = 1.0f + 0.04f * h;
+            const ImVec2 c{(ra.x + rb.x) * 0.5f, (ra.y + rb.y) * 0.5f + lift};
+            const ImVec2 a{c.x - cw * 0.5f * sc, c.y - ch * 0.5f * sc};
+            const ImVec2 b{c.x + cw * 0.5f * sc, c.y + ch * 0.5f * sc};
+            g_a = base * std::clamp(k * 1.6f, 0.0f, 1.0f);
+            Panel(dl, a, b, u, h);
+            // a warm light from above when focused
+            if (h > 0.01f) {
+                dl->AddRectFilledMultiColor({a.x + 8 * u, a.y + 8 * u}, {b.x - 8 * u, a.y + ch * 0.45f},
+                                            Gold(0.10f * h), Gold(0.10f * h), Gold(0.0f), Gold(0.0f));
+            }
+            // medallion
+            const ImVec2 m{c.x, a.y + (b.y - a.y) * 0.34f};
+            const float mr = cw * 0.30f * sc;
+            for (int g = 4; g >= 1; g--) {
+                dl->AddCircleFilled(m, mr + g * 6 * u, Gold(0.025f * (0.3f + h)), 48);
+            }
+            dl->AddCircleFilled(m, mr, Col(14, 12, 12, 0.95f), 64);
+            dl->AddCircle(m, mr, Bronze(0.9f), 64, std::max(1.0f, 1.6f * u));
+            dl->AddCircle(m, mr - 7 * u, Gold(0.35f + 0.5f * h), 64, std::max(1.0f, u));
+            for (int d = 0; d < 24; d++) {
+                const float ang = d * 0.2618f + t * 0.25f * (0.3f + h);
+                dl->AddCircleFilled({m.x + std::cos(ang) * (mr + 10 * u), m.y + std::sin(ang) * (mr + 10 * u)},
+                                    1.4f * u, Gold(0.25f + 0.6f * h));
+            }
+            const ImU32 ic = Col(228, 192, 122, 0.75f + 0.25f * h);
+            const float is = mr * 1.7f;
+            switch (i) {
+            case 0: IconPad(dl, m, is, ic); break;
+            case 1: IconKbm(dl, m, is, ic); break;
+            case 2: DrawCup(dl, m.x - is * 0.32f, m.y - is * 0.34f, is * 0.64f, ic, g_a); break;
+            case 3: IconGear(dl, m, is, ic, t * 0.4f * h); break;
+            default: IconDoor(dl, m, is, ic); break;
+            }
+            // title, rule, subtitle
+            const float ty = a.y + (b.y - a.y) * 0.64f;
+            const float tpx = std::min(30 * u, cw * 0.095f);
+            TxtSpaced(dl, g_ft_title, tpx, {c.x, ty}, h > 0.5f ? Parch() : Gold(), titles[i], 2 * u,
+                      true);
+            OrnLine(dl, c.x, ty + tpx + 18 * u, cw * 0.32f, 0.5f + 0.5f * h, u);
+            const auto lines = Wrap(g_ft_italic, 24 * u, subs[i], cw - 50 * u);
+            for (size_t l = 0; l < lines.size() && l < 3; l++) {
+                TxtC(dl, g_ft_italic, 24 * u, c.x, ty + tpx + 38 * u + l * 27 * u, Muted(0.9f + 0.1f * h),
+                     lines[l].c_str());
+            }
+            // shine sweep once on focus
+            const float fs = static_cast<float>(ImGui::GetTime() - card_focus_t[i]);
+            if (on && fs < 0.9f) {
+                const float sx = a.x - cw * 0.5f + (fs / 0.9f) * cw * 2.0f;
+                dl->PushClipRect(a, b, true);
+                dl->AddQuadFilled({sx, a.y}, {sx + cw * 0.18f, a.y}, {sx - cw * 0.22f, b.y},
+                                  {sx - cw * 0.40f, b.y}, Col(255, 240, 200, 0.07f));
+                dl->PopClipRect();
             }
         }
-        ItemGlow(4 * unit);
+        g_a = base;
+    }
+
+    // ------------------------------------------------------------ Mando
+    void PadScreen(ImVec2 a, ImVec2 b, float u) {
+        const int rows = static_cast<int>(std::size(kPadRows));
+        pad_focus = std::clamp(pad_focus, 0, rows);
+        const std::string focus = pad_focus < rows ? kPadRows[pad_focus].output : "";
+        const float mid = (a.x + b.x) * 0.5f;
+        const float pb = b.y - 132 * u;
+        std::string hover;
+        std::map<std::string, ImVec2> anchors, phys;
+        const std::string clicked =
+            Ps4Panel(a, {mid - 14 * u, pb}, u, focus, hover, anchors, "los controles del juego");
+        PhysPanel({mid + 14 * u, a.y}, {b.x, pb}, u, focus, phys, hover);
+        if (!clicked.empty()) {
+            for (int i = 0; i < rows; i++) {
+                if (clicked == kPadRows[i].output) pad_focus = i;
+            }
+            StartCaptureFor(clicked, Cat::Pad);
+        } else if (!hover.empty() && MouseMoved()) {
+            for (int i = 0; i < rows; i++) {
+                if (hover == kPadRows[i].output) pad_focus = i;
+            }
+        }
+        const std::string key = pad_focus < rows ? std::string(kPadRows[pad_focus].output) : "";
+        // links: the game's button -> the physical one(s) giving it
+        auto* dl = ImGui::GetWindowDrawList();
+        if (!key.empty() && anchors.contains(key)) {
+            for (const auto& p : PhysOf(key)) {
+                if (auto it = phys.find(p); it != phys.end()) {
+                    Link(dl, anchors[key], it->second, u);
+                }
+            }
+        }
+        // detail bar
+        const ImVec2 d0{a.x, pb + 18 * u}, d1{b.x, b.y};
+        Panel(dl, d0, d1, u, 0.3f);
+        const float cy = (d0.y + d1.y) * 0.5f;
+        if (!key.empty()) {
+            Glyph(dl, key, {d0.x + 56 * u, cy}, 30 * u, 1.0f, true);
+            Txt(dl, g_ft_title, 28 * u, {d0.x + 104 * u, cy - 36 * u}, Gold(), RowLabel(key));
+            const std::string def = std::string("En Bloodborne: ") + DefaultFn(key);
+            Txt(dl, g_ft_italic, 24 * u, {d0.x + 104 * u, cy + 2 * u}, Muted(), def.c_str());
+            const float bx = d0.x + (d1.x - d0.x) * 0.40f;
+            Txt(dl, g_ft_ui, 17 * u, {bx, cy - 32 * u}, Muted(0.8f), "EN TU MANDO");
+            Txt(dl, g_ft_text, 30 * u, {bx, cy - 8 * u}, Parch(), BindingText(key, Cat::Pad).c_str());
+        } else {
+            Txt(dl, g_ft_title, 28 * u, {d0.x + 40 * u, cy - 18 * u}, Gold(),
+                "Restablecer todo el mando de serie");
+        }
+        const float bw = 230 * u, bh = 58 * u;
+        float x = d1.x - 30 * u - bw;
+        if (CardButton("##rst", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "RESTABLECER", u,
+                       pad_focus == rows)) {
+            ResetPad();
+        }
+        x -= bw + 16 * u;
+        if (!key.empty() && !key.starts_with("stick_") &&
+            CardButton("##clr", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "QUITAR", u, false)) {
+            g_cfg.Set(key, Cat::Pad, "", {});
+        }
+        x -= bw + 16 * u;
+        if (!key.empty() &&
+            CardButton("##rb", {x, cy - bh * 0.5f}, {x + bw, cy + bh * 0.5f}, "REASIGNAR", u, false)) {
+            StartCaptureFor(key, Cat::Pad);
+        }
+    }
+
+    // ------------------------------------------------------------ Teclado y ratón
+    void KbmScreen(ImVec2 a, ImVec2 b, float u) {
+        const int rows = static_cast<int>(std::size(kKbmRows));
+        kbm_focus = std::clamp(kbm_focus, 0, rows + 3);
+        const std::string focus = kbm_focus < rows ? kKbmRows[kbm_focus].output : "";
+        const float mid = a.x + (b.x - a.x) * 0.48f;
+        std::string hover;
+        std::map<std::string, ImVec2> anchors;
+        const std::string clicked = Ps4Panel(a, {mid - 14 * u, b.y}, u, FocusKey(focus), hover,
+                                             anchors, "elige un botón y pulsa una tecla");
+        if (!clicked.empty()) {
+            const std::string want = clicked == "stick_left"    ? "axis_left_y_minus"
+                                     : clicked == "stick_right" ? "axis_right_y_minus"
+                                                                : clicked;
+            for (int i = 0; i < rows; i++) {
+                if (want == kKbmRows[i].output) kbm_focus = i, kbm_scroll_to = true;
+            }
+            if (!clicked.starts_with("stick_")) StartCaptureFor(want, Cat::Kbm);
+        }
+        auto* dl = ImGui::GetWindowDrawList();
+        const ImVec2 pa{mid + 14 * u, a.y}, pbr{b.x, b.y};
+        Panel(dl, pa, pbr, u);
+        Txt(dl, g_ft_title, 30 * u, {pa.x + 30 * u, pa.y + 22 * u}, Gold(), "TECLADO Y RATÓN");
+        Txt(dl, g_ft_italic, 24 * u, {pa.x + 30 * u, pa.y + 58 * u}, Muted(),
+            "la tecla o el botón que da cada botón de PS4");
+        const float set_h = 250 * u;
+        const ImVec2 l0{pa.x + 20 * u, pa.y + 104 * u};
+        const float lw = pbr.x - pa.x - 40 * u, lh = pbr.y - l0.y - set_h - 20 * u;
+        // the list
+        ImGui::SetCursorScreenPos(l0);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, ImVec4(0.55f, 0.42f, 0.24f, 0.6f * g_a));
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 8 * u);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 0});
+        ImGui::BeginChild("##kbml", {lw, lh}, 0,
+                          ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollWithMouse);
+        SmoothScroll(kbm_scroll, u);
+        auto* cd = ImGui::GetWindowDrawList();
+        const float rh = 54 * u;
+        const float rw = lw - 14 * u;
+        for (int i = 0; i < rows; i++) {
+            const std::string o = kKbmRows[i].output;
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::PushID(i);
+            const bool click = ImGui::InvisibleButton("##r", {rw, rh});
+            const bool hov = ImGui::IsItemHovered();
+            ImGui::PopID();
+            if (hov && MouseMoved()) kbm_focus = i;
+            if (click) {
+                kbm_focus = i;
+                StartCaptureFor(o, Cat::Kbm);
+            }
+            const bool on = kbm_focus == i;
+            if (on || hov) {
+                cd->AddRectFilledMultiColor(p, {p.x + rw, p.y + rh}, Gold(on ? 0.16f : 0.08f),
+                                            Gold(0.0f), Gold(0.0f), Gold(on ? 0.16f : 0.08f));
+                if (on) cd->AddRectFilled(p, {p.x + 3 * u, p.y + rh}, Gold());
+            }
+            cd->AddLine({p.x, p.y + rh - 0.5f}, {p.x + rw, p.y + rh - 0.5f}, Bronze(0.18f));
+            Glyph(cd, o, {p.x + 30 * u, p.y + rh * 0.5f}, 17 * u, 1.0f, on);
+            Txt(cd, g_ft_text, 25 * u, {p.x + 60 * u, p.y + rh * 0.5f - 15 * u},
+                on ? Parch() : Col(214, 204, 188), RowLabel(o));
+            const auto toks = Tokens(g_cfg.GetRaw(o, Cat::Kbm));
+            float kx = p.x + rw - 10 * u;
+            if (toks.empty()) {
+                TxtR(cd, g_ft_italic, 22 * u, kx, p.y + rh * 0.5f - 13 * u, Muted(0.7f), "sin asignar");
+            }
+            for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
+                const std::string l = Pretty(*it);
+                kx -= KeyCapW(l, u);
+                KeyCap(cd, {kx, p.y + (rh - 34 * u) * 0.5f}, l, u, 1.0f, on);
+                kx -= 8 * u;
+            }
+        }
+        if (kbm_scroll_to && kbm_focus < rows) {
+            kbm_scroll_to = false;
+            const float y0 = kbm_focus * rh, cur = ImGui::GetScrollY();
+            if (y0 < cur) kbm_scroll = y0;
+            else if (y0 + rh > cur + lh) kbm_scroll = std::min(ImGui::GetScrollMaxY(), y0 + rh - lh);
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(3);
+        // mouse settings
+        const ImVec2 s0{pa.x + 30 * u, pbr.y - set_h};
+        OrnLine(dl, (pa.x + pbr.x) * 0.5f, s0.y - 6 * u, (pbr.x - pa.x) * 0.4f, 0.5f, u);
+        const ImTextureID mtex = Get(g_mouse_tex, AssetDir() / "raton.png", 212.0f, 220.0f);
+        const float mh = set_h - 40 * u, ms = mh / g_mouse_tex.h;
+        const ImVec2 m0{s0.x, s0.y + 20 * u};
+        if (mtex) {
+            dl->AddImage(mtex, m0, {m0.x + g_mouse_tex.w * ms, m0.y + mh}, {0, 0}, {1, 1},
+                         Col(255, 255, 255));
+        }
+        static const struct {
+            const char* in;
+            float x, y, d;
+        } kMouse[] = {{"leftbutton", 72, 72, 40},     {"rightbutton", 140, 52, 40},
+                      {"middlebutton", 103, 60, 18},  {"sidebuttonforward", 40, 103, 16},
+                      {"sidebuttonback", 48, 128, 16}};
+        static std::string s_mouse;
+        for (const auto& mb : kMouse) {
+            const ImVec2 c{m0.x + mb.x * ms, m0.y + mb.y * ms};
+            const float r = std::max(8 * u, mb.d * ms * 0.5f);
+            bool hov = false;
+            const std::string id = std::string("##m") + mb.in;
+            if (Hit(id.c_str(), {c.x - r, c.y - r}, {c.x + r, c.y + r}, &hov)) {
+                s_mouse = mb.in;
+                ImGui::OpenPopup("##mousebind");
+            }
+            if (hov) {
+                dl->AddCircleFilled(c, r, Gold(0.25f));
+                dl->AddCircle(c, r, Gold(), 0, 2 * u);
+            }
+        }
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.07f, 0.06f, 0.06f, 0.97f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.62f, 0.44f, 0.24f, 0.8f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.45f, 0.34f, 0.18f, 0.8f));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.35f, 0.27f, 0.15f, 0.8f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16 * u, 12 * u});
+        if (ImGui::BeginPopup("##mousebind", ImGuiWindowFlags_NoNav)) {
+            ImGui::TextColored(ImVec4(0.89f, 0.75f, 0.48f, 1.0f), "%s hace:", Pretty(s_mouse).c_str());
+            for (const auto& r : kKbmRows) {
+                if (ImGui::Selectable(r.label, g_cfg.Uses(r.output, Cat::Kbm, s_mouse))) {
+                    g_cfg.Set(r.output, Cat::Kbm, s_mouse, Group(kKbmRows, std::size(kKbmRows)));
+                }
+            }
+            if (ImGui::Selectable("(nada)")) {
+                for (const auto& r : kKbmRows) {
+                    if (g_cfg.GetRaw(r.output, Cat::Kbm) == s_mouse) {
+                        g_cfg.Set(r.output, Cat::Kbm, "", {});
+                    }
+                }
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(4);
+        // sliders and toggles
+        const float sx = m0.x + g_mouse_tex.w * ms + 40 * u, sw = pbr.x - sx - 60 * u;
+        float sy = s0.y + 14 * u;
+        float dz, sp, off;
+        g_cfg.MouseParams(dz, sp, off);
+        const auto label = [&](int idx, const std::string& l, const std::string& val) {
+            const bool on = kbm_focus == idx;
+            if (on) dl->AddRectFilled({sx - 14 * u, sy + 2 * u}, {sx - 10 * u, sy + 24 * u}, Gold());
+            Txt(dl, g_ft_text, 23 * u, {sx, sy}, on ? Parch() : Col(214, 204, 188), l.c_str());
+            if (!val.empty()) TxtR(dl, g_ft_ui, 19 * u, sx + sw, sy + 3 * u, Gold(), val.c_str());
+        };
+        label(rows, "Sensibilidad de la cámara", fmt::format("{:.2f}", s_sp));
+        if (Slider("##sens", {sx, sy + 26 * u}, sw, s_sp, 0.1f, 5.0f, u, kbm_focus == rows)) {
+            g_cfg.SetMouseParams(s_dz, s_sp, off);
+        }
+        sy += 72 * u;
+        label(rows + 1, "Zona muerta", fmt::format("{:.2f}", s_dz));
+        if (Slider("##dz", {sx, sy + 26 * u}, sw, s_dz, 0.0f, 1.0f, u, kbm_focus == rows + 1)) {
+            g_cfg.SetMouseParams(s_dz, s_sp, off);
+        }
+        sy += 76 * u;
+        const float half = sw * 0.5f;
+        {
+            const bool right = g_cfg.MouseStick() != "left";
+            if (Toggle("##mstick", {sx, sy}, right, tog_stick, u, kbm_focus == rows + 2)) {
+                g_cfg.SetMouseStick(right ? "left" : "right");
+            }
+            Txt(dl, g_ft_text, 22 * u, {sx + 80 * u, sy + 4 * u}, Parch(0.9f), "Ratón = cámara");
+            if (Toggle("##mlook", {sx + half, sy}, g_restore_mouse_look, tog_look, u,
+                       kbm_focus == rows + 3)) {
+                g_restore_mouse_look = !g_restore_mouse_look;
+            }
+            Txt(dl, g_ft_text, 22 * u, {sx + half + 80 * u, sy + 4 * u}, Parch(0.9f),
+                "Cámara con ratón al volver (F7)");
+        }
+    }
+
+    // ------------------------------------------------------------ Opciones
+    void OptionsScreen(ImVec2 a, ImVec2 b, float u) {
+        auto* dl = ImGui::GetWindowDrawList();
+        const float w = std::min(1300 * u, b.x - a.x);
+        const ImVec2 p0{(a.x + b.x - w) * 0.5f, a.y + 30 * u}, p1{p0.x + w, p0.y + 330 * u};
+        Panel(dl, p0, p1, u, 0.2f);
+        Txt(dl, g_ft_title, 30 * u, {p0.x + 40 * u, p0.y + 30 * u}, Gold(), "INICIO");
+        OrnLine(dl, p0.x + 40 * u + 160 * u, p0.y + 88 * u, 160 * u, 0.5f, u);
+        const ImVec2 tg{p0.x + 40 * u, p0.y + 116 * u};
+        ImGui::BeginDisabled(!g_direct.exists);
+        if (Toggle("##direct", tg, g_direct.on, tog_direct, u, true) && g_direct.exists) {
+            if (WriteDirect(!g_direct.on)) g_direct.on = !g_direct.on;
+        }
         ImGui::EndDisabled();
-        ImGui::Indent(40 * unit);
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 1500 * unit);
-        ImGui::TextColored(kDim, "Si está activado, la próxima vez que abras el launcher el juego "
-                                 "se inicia directamente con los ajustes guardados actuales. "
-                                 "Mantén pulsada la tecla Mayús (Shift) al abrir el launcher para "
-                                 "volver a verlo.");
+        Txt(dl, g_ft_text, 28 * u, {tg.x + 90 * u, tg.y}, Parch(),
+            "Iniciar directamente (sin pasar por el launcher)");
+        const auto lines = Wrap(g_ft_italic, 24 * u,
+                                "Si está activado, la próxima vez que abras el launcher el juego se "
+                                "inicia directamente con los ajustes guardados. Mantén pulsada la "
+                                "tecla Mayús (Shift) al abrir el launcher para volver a verlo.",
+                                w - 170 * u);
+        float y = tg.y + 50 * u;
+        for (const auto& l : lines) {
+            Txt(dl, g_ft_italic, 24 * u, {tg.x + 90 * u, y}, Muted(), l.c_str());
+            y += 28 * u;
+        }
         if (!g_direct.exists) {
-            ImGui::TextColored(kWarn, "No se encontró launcher.ini junto a shadPS4.exe (%s). Abre "
-                                      "el juego una vez desde el launcher para crearlo.",
-                               LauncherIni().string().c_str());
+            const std::string m = "No se encontró launcher.ini junto a shadPS4.exe. Abre el juego "
+                                  "una vez desde el launcher para crearlo.";
+            Txt(dl, g_ft_ui, 19 * u, {tg.x + 90 * u, y + 8 * u}, Col(232, 170, 90), m.c_str());
         }
         if (!g_direct.error.empty()) {
-            ImGui::TextColored(kWarn, "%s", g_direct.error.c_str());
+            Txt(dl, g_ft_ui, 19 * u, {tg.x + 90 * u, y + 34 * u}, Col(232, 120, 100),
+                g_direct.error.c_str());
         }
-        ImGui::PopTextWrapPos();
-        ImGui::Unindent(40 * unit);
     }
 
-    void ExitPage(float unit) {
-        ImGui::TextWrapped("Cierra el emulador de forma ordenada. Guarda antes en el juego: "
-                           "Bloodborne guarda solo, espera a que no se vea el icono de guardado.");
-        ImGui::Spacing();
-        if (!confirm_exit) {
-            if (FancyButton("Salir del juego", {360 * unit, 70 * unit})) {
-                confirm_exit = true;
-            }
-            return;
+    // ------------------------------------------------------------ Salir
+    void ExitScreen(ImVec2 disp, float u) {
+        auto* dl = ImGui::GetWindowDrawList();
+        const float w = 1000 * u, h = 420 * u;
+        const float slide = (1.0f - std::clamp(g_a, 0.0f, 1.0f)) * 30 * u;
+        const ImVec2 p0{(disp.x - w) * 0.5f, disp.y * 0.5f - h * 0.5f + slide}, p1{p0.x + w, p0.y + h};
+        Panel(dl, p0, p1, u, 0.35f);
+        const float cx = disp.x * 0.5f;
+        TxtSpaced(dl, g_ft_title, 42 * u, {cx, p0.y + 50 * u}, Gold(), "¿SALIR DEL JUEGO?", 4 * u, true);
+        OrnLine(dl, cx, p0.y + 120 * u, 300 * u, 0.7f, u);
+        const auto lines = Wrap(g_ft_text, 27 * u,
+                                "Bloodborne guarda solo: espera a que no se vea el icono de "
+                                "guardado antes de salir.",
+                                w - 160 * u);
+        float y = p0.y + 150 * u;
+        for (const auto& l : lines) {
+            TxtC(dl, g_ft_text, 27 * u, cx, y, Parch(0.9f), l.c_str());
+            y += 33 * u;
         }
-        ImGui::TextColored(kWarn, "¿Seguro que quieres salir del juego?");
-        if (FancyButton("Sí, salir", {300 * unit, 70 * unit})) {
-            LOG_INFO(Frontend, "[bb-menu] Salir del juego: closing the emulator");
-            SDL_Event e{};
-            e.type = SDL_EVENT_QUIT;
-            SDL_PushEvent(&e);
+        const float bw = 300 * u, bh = 70 * u, by = p1.y - 50 * u - bh;
+        if (CardButton("##no", {cx - bw - 20 * u, by}, {cx - 20 * u, by + bh}, "VOLVER", u,
+                       exit_focus == 0)) {
+            Go(Screen::Hub);
         }
-        ImGui::SameLine();
-        if (FancyButton("No, volver", {300 * unit, 70 * unit})) {
-            confirm_exit = false;
+        if (CardButton("##yes", {cx + 20 * u, by}, {cx + 20 * u + bw, by + bh}, "SALIR", u,
+                       exit_focus == 1, true)) {
+            Quit();
         }
+    }
+
+    // ------------------------------------------------------------ capture
+    void CaptureOverlay(ImVec2 disp, float u) {
+        Capture kind;
+        std::string target;
+        Uint64 since;
+        {
+            std::scoped_lock lk{g_cap_mtx};
+            kind = g_capture;
+            target = g_capture_target;
+            since = g_capture_since;
+        }
+        if (kind == Capture::None) return;
+        auto* dl = ImGui::GetForegroundDrawList();
+        const float el = static_cast<float>(SDL_GetTicks() - since) / 1000.0f;
+        const float fa = EaseOut(el / 0.2f);
+        const float sa = g_a;
+        g_a = sa * fa;
+        dl->AddRectFilled({0, 0}, disp, Col(0, 0, 0, 0.62f));
+        const float w = 860 * u, h = 360 * u;
+        const float sc = 0.94f + 0.06f * EaseOutBack(el / 0.3f);
+        const ImVec2 c{disp.x * 0.5f, disp.y * 0.5f};
+        const ImVec2 p0{c.x - w * 0.5f * sc, c.y - h * 0.5f * sc}, p1{c.x + w * 0.5f * sc, c.y + h * 0.5f * sc};
+        Panel(dl, p0, p1, u, 0.6f + 0.4f * std::sin(el * 4.0f));
+        const char* head = kind == Capture::Kbm        ? "PULSA UNA TECLA"
+                           : kind == Capture::PadStick ? "MUEVE UN STICK"
+                                                       : "PULSA UN BOTÓN";
+        const char* sub = kind == Capture::Kbm ? "o un botón del ratón para"
+                          : kind == Capture::PadStick ? "del mando (el que quieras usar) para"
+                                                      : "de tu mando para";
+        TxtSpaced(dl, g_ft_title, 38 * u, {c.x, p0.y + 46 * u}, Gold(), head, 4 * u, true);
+        OrnLine(dl, c.x, p0.y + 108 * u, 240 * u, 0.7f, u);
+        TxtC(dl, g_ft_italic, 25 * u, c.x, p0.y + 128 * u, Muted(), sub);
+        // the target: glyph + name + default function
+        const std::string nm = std::string(RowLabel(target));
+        const float gw = 34 * u * 2 + 16 * u + TextSize(g_ft_title, 30 * u, nm.c_str()).x;
+        Glyph(dl, target, {c.x - gw * 0.5f + 34 * u, p0.y + 200 * u}, 30 * u, 1.0f, true);
+        Txt(dl, g_ft_title, 30 * u, {c.x - gw * 0.5f + 84 * u, p0.y + 182 * u}, Parch(), nm.c_str());
+        TxtC(dl, g_ft_text, 24 * u, c.x, p0.y + 240 * u, Muted(0.9f), DefaultFn(target));
+        // countdown ring (5 s)
+        const float left = std::clamp(1.0f - (el - 0.25f) / 5.0f, 0.0f, 1.0f);
+        const ImVec2 rc{p1.x - 60 * u, p1.y - 56 * u};
+        dl->AddCircle(rc, 22 * u, Bronze(0.4f), 48, 3 * u);
+        if (left > 0.0f) {
+            dl->PathArcTo(rc, 22 * u, -1.5708f, -1.5708f + left * 6.2832f, 48);
+            dl->PathStroke(Gold(), 0, 3 * u);
+        }
+        const std::string secs = fmt::format("{}", static_cast<int>(std::ceil(left * 5.0f)));
+        const ImVec2 ts = TextSize(g_ft_ui, 18 * u, secs.c_str());
+        Txt(dl, g_ft_ui, 18 * u, {rc.x - ts.x * 0.5f, rc.y - ts.y * 0.5f}, Parch(), secs.c_str());
+        Txt(dl, g_ft_ui, 19 * u, {p0.x + 40 * u, p1.y - 68 * u}, Muted(0.85f),
+            "Esc: cancelar  ·  se cancela sola en 5 s");
+        g_a = sa;
     }
 };
 MenuLayer g_layer;
@@ -2020,6 +3243,33 @@ void Init(SDL_Window* window) {
     g_wake_event = SDL_RegisterEvents(1);
     ImGui::Layer::AddLayer(&g_layer);
     std::thread(CustomWatcher).detach();
+}
+
+void LoadFonts() {
+    // (bb-menu-121) the menu's fonts (SIL OFL 1.1), from menu_assets\fonts next to the exe
+    ImGuiIO& io = ImGui::GetIO();
+    const auto dir = AssetDir() / "fonts";
+    const auto load = [&](const char* file) -> ImFont* {
+        const auto p = dir / file;
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(p, ec)) {
+            LOG_WARNING(Frontend, "[bb-menu] missing font {}", p.string());
+            return nullptr;
+        }
+        ImFontConfig cfg{};
+        cfg.OversampleH = 2;
+        cfg.OversampleV = 2;
+        cfg.PixelSnapH = false;
+        const auto u8 = p.u8string();
+        return io.Fonts->AddFontFromFileTTF(reinterpret_cast<const char*>(u8.c_str()), 32.0f, &cfg);
+    };
+    g_ft_title = load("Cinzel-SemiBold.ttf");
+    g_ft_text = load("CormorantGaramond-Medium.ttf");
+    g_ft_italic = load("CormorantGaramond-MediumItalic.ttf");
+    g_ft_ui = load("Inter-Medium.ttf");
+    if (g_ft_italic == nullptr) g_ft_italic = g_ft_text;
+    LOG_INFO(Frontend, "[bb-menu] fonts: title {} text {} ui {}", g_ft_title != nullptr,
+             g_ft_text != nullptr, g_ft_ui != nullptr);
 }
 
 bool IsOpen() {
@@ -2039,6 +3289,18 @@ bool PushTrophyToast(const std::filesystem::path& icon, const std::string& name,
     g_toasts.push_back(std::move(t));
     // the F1 list: refresh on the next open
     return true;
+}
+
+bool IsPadInput(Uint32 t) {
+    return t == SDL_EVENT_GAMEPAD_BUTTON_DOWN || t == SDL_EVENT_GAMEPAD_BUTTON_UP ||
+           t == SDL_EVENT_GAMEPAD_AXIS_MOTION || t == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN ||
+           t == SDL_EVENT_GAMEPAD_TOUCHPAD_UP || t == SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION ||
+           t == SDL_EVENT_GAMEPAD_SENSOR_UPDATE;
+}
+bool IsKbmInput(Uint32 t) {
+    return t == SDL_EVENT_KEY_DOWN || t == SDL_EVENT_KEY_UP || t == SDL_EVENT_TEXT_INPUT ||
+           t == SDL_EVENT_MOUSE_BUTTON_DOWN || t == SDL_EVENT_MOUSE_BUTTON_UP ||
+           t == SDL_EVENT_MOUSE_WHEEL || t == SDL_EVENT_MOUSE_MOTION;
 }
 
 bool OnSdlEvent(SDL_Event& event) {
@@ -2081,92 +3343,135 @@ bool OnSdlEvent(SDL_Event& event) {
     if (!g_open) {
         return false;
     }
-    // a rebind waiting for its input
+    const Uint32 type = event.type;
+    // (bb-menu-121) a rebind owns every input until it gets one, is cancelled (Esc) or times
+    // out (5 s): nothing reaches the menu (no navigation, no clicks) and stick noise is ignored.
     {
         std::scoped_lock lk{g_cap_mtx};
-        if (g_capture != Capture::None && g_captured.empty() && !g_cap_cancel &&
-            SDL_GetTicks() - g_capture_since > 250) {
-            std::string got;
-            bool consumed = false;
-            if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE) {
-                g_cap_cancel = true;
-                consumed = true;
-            } else if (g_capture == Capture::Kbm) {
-                if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-                    got = KeyName(event.key.key, false);
-                    consumed = true;
-                } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
-                    got = KeyName(event.button.button, true);
-                    consumed = true;
-                } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
-                    got = event.wheel.y > 0   ? "mousewheelup"
-                          : event.wheel.y < 0 ? "mousewheeldown"
-                          : event.wheel.x > 0 ? "mousewheelright"
-                                              : "mousewheelleft";
-                    consumed = true;
+        if (g_capture != Capture::None) {
+            if (g_captured.empty() && !g_cap_cancel && SDL_GetTicks() - g_capture_since > 250) {
+                std::string got;
+                if (type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE) {
+                    g_cap_cancel = true;
+                } else if (g_capture == Capture::Kbm) {
+                    if (type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+                        got = KeyName(event.key.key, false);
+                        if (got.empty()) g_cap_cancel = true; // a key that cannot be bound
+                    } else if (type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                        got = KeyName(event.button.button, true);
+                        if (got.empty()) g_cap_cancel = true;
+                    } else if (type == SDL_EVENT_MOUSE_WHEEL &&
+                               (std::fabs(event.wheel.y) >= 0.5f || std::fabs(event.wheel.x) >= 0.5f)) {
+                        got = event.wheel.y > 0   ? "mousewheelup"
+                              : event.wheel.y < 0 ? "mousewheeldown"
+                              : event.wheel.x > 0 ? "mousewheelright"
+                                                  : "mousewheelleft";
+                    }
+                } else if (g_capture == Capture::Pad) {
+                    if (type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+                        if (const char* n = PadName(event.gbutton.button)) {
+                            got = n;
+                        }
+                    } else if (type == SDL_EVENT_GAMEPAD_AXIS_MOTION && event.gaxis.value > 16000) {
+                        if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
+                            got = "l2";
+                        } else if (event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+                            got = "r2";
+                        }
+                    }
+                } else if (g_capture == Capture::PadStick) {
+                    if (type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+                        std::abs(int(event.gaxis.value)) > 22000) {
+                        const auto ax = event.gaxis.axis;
+                        if (ax == SDL_GAMEPAD_AXIS_LEFTX || ax == SDL_GAMEPAD_AXIS_LEFTY) {
+                            got = "left";
+                        } else if (ax == SDL_GAMEPAD_AXIS_RIGHTX || ax == SDL_GAMEPAD_AXIS_RIGHTY) {
+                            got = "right";
+                        }
+                    }
                 }
-            } else if (g_capture == Capture::Pad) {
-                if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-                    if (const char* n = PadName(event.gbutton.button)) {
-                        got = n;
-                    }
-                    consumed = true;
-                } else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
-                           event.gaxis.value > 16000) {
-                    if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
-                        got = "l2";
-                    } else if (event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
-                        got = "r2";
-                    }
-                    consumed = !got.empty();
-                }
-            } else if (g_capture == Capture::PadStick) {
-                if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
-                    std::abs(int(event.gaxis.value)) > 20000) {
-                    const auto ax = event.gaxis.axis;
-                    if (ax == SDL_GAMEPAD_AXIS_LEFTX || ax == SDL_GAMEPAD_AXIS_LEFTY) {
-                        got = "left";
-                    } else if (ax == SDL_GAMEPAD_AXIS_RIGHTX || ax == SDL_GAMEPAD_AXIS_RIGHTY) {
-                        got = "right";
-                    }
-                    consumed = !got.empty();
+                if (!got.empty()) {
+                    g_captured = got;
                 }
             }
-            if (!got.empty()) {
-                g_captured = got;
+            if (IsPadInput(type)) {
+                // the pad state still updates (the game reads it neutral: input captured)
+                return false;
             }
-            if (consumed) {
-                if (got.empty() && !g_cap_cancel) {
-                    g_cap_cancel = true; // an input that cannot be bound: cancel
-                }
-                return true; // not to ImGui (no click / Cross on the menu)
+            if (IsKbmInput(type)) {
+                // releases go on so nothing stays held in the game; nothing reaches ImGui
+                return !(type == SDL_EVENT_KEY_UP || type == SDL_EVENT_MOUSE_BUTTON_UP);
             }
         }
     }
-    ImGui::Core::ProcessEvent(&event);
-    switch (event.type) {
-    // releases go on to the game's input state so nothing stays held after the menu
-    case SDL_EVENT_KEY_UP:
-    case SDL_EVENT_MOUSE_BUTTON_UP:
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-    case SDL_EVENT_GAMEPAD_BUTTON_UP:
-    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
-    case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
-    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
-    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
-        // (pad events update the controller state; the game reads it neutral while the
-        // capture is held: libScePad "Intercepted")
-        return false;
-    case SDL_EVENT_KEY_DOWN:
-    case SDL_EVENT_TEXT_INPUT:
-    case SDL_EVENT_MOUSE_BUTTON_DOWN:
-    case SDL_EVENT_MOUSE_WHEEL:
-    case SDL_EVENT_MOUSE_MOTION:
-        return true;
-    default:
+    // the menu's own navigation: d-pad, face buttons, L1 / R1, arrows, Enter, Esc. The sticks
+    // never move it; nothing used here reaches the game.
+    if (type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        switch (event.gbutton.button) {
+        case SDL_GAMEPAD_BUTTON_DPAD_UP: PushNav(Nav::Up); break;
+        case SDL_GAMEPAD_BUTTON_DPAD_DOWN: PushNav(Nav::Down); break;
+        case SDL_GAMEPAD_BUTTON_DPAD_LEFT: PushNav(Nav::Left); break;
+        case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: PushNav(Nav::Right); break;
+        case SDL_GAMEPAD_BUTTON_SOUTH: PushNav(Nav::Accept); break;
+        case SDL_GAMEPAD_BUTTON_EAST: PushNav(Nav::Back); break;
+        case SDL_GAMEPAD_BUTTON_NORTH: PushNav(Nav::Clear); break;
+        case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: PushNav(Nav::Prev); break;
+        case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: PushNav(Nav::Next); break;
+        default: break;
+        }
+        return false; // pad state only (game input captured while open)
+    }
+    if (IsPadInput(type)) {
         return false;
     }
+    if (type == SDL_EVENT_KEY_DOWN) {
+        const bool rep = event.key.repeat;
+        switch (event.key.key) {
+        case SDLK_UP: PushNav(Nav::Up); break;
+        case SDLK_DOWN: PushNav(Nav::Down); break;
+        case SDLK_LEFT: PushNav(Nav::Left); break;
+        case SDLK_RIGHT: PushNav(Nav::Right); break;
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:
+        case SDLK_SPACE:
+            if (!rep) PushNav(Nav::Accept);
+            break;
+        case SDLK_ESCAPE:
+        case SDLK_BACKSPACE:
+            if (!rep) PushNav(Nav::Back);
+            break;
+        case SDLK_DELETE:
+            if (!rep) PushNav(Nav::Clear);
+            break;
+        case SDLK_Q:
+        case SDLK_PAGEUP:
+            if (!rep) PushNav(Nav::Prev);
+            break;
+        case SDLK_E:
+        case SDLK_PAGEDOWN:
+        case SDLK_TAB:
+            if (!rep) PushNav(Nav::Next);
+            break;
+        default: break;
+        }
+        return true;
+    }
+    if (type == SDL_EVENT_KEY_UP) {
+        return false;
+    }
+    if (type == SDL_EVENT_TEXT_INPUT) {
+        return true;
+    }
+    if (type == SDL_EVENT_MOUSE_BUTTON_DOWN || type == SDL_EVENT_MOUSE_WHEEL ||
+        type == SDL_EVENT_MOUSE_MOTION) {
+        ImGui::Core::ProcessEvent(&event);
+        return true;
+    }
+    if (type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        ImGui::Core::ProcessEvent(&event);
+        return false; // also to the game's input state, so nothing stays held
+    }
+    return false;
 }
 
 } // namespace BbMenu
