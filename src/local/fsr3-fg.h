@@ -49,6 +49,10 @@ void OnDevice(GraphicContext& graphics, const QueuePlan& plan);
 [[nodiscard]] bool SrPathWanted();
 // The FidelityFX API loaded and the device known (after OnDevice).
 [[nodiscard]] bool SrReady();
+// The upscaler AMD's runtime actually gave the context: "FSR 4.1" only when AMD FSR SDK 2.4's signed Vulkan runtime
+// (amd_fidelityfx_loader_vk.dll + amd_fidelityfx_upscaler_vk.dll next to the emulator) created it with its 4.1.x
+// provider; else "FSR 3.1" (the patched amd_fidelityfx_vk.dll, or SDK 2.4's 3.1 provider). KYTY_FSR41=0: never 4.1.
+[[nodiscard]] const char* UpscalerName();
 struct UpscaleDesc {
 	VkCommandBuffer          command = VK_NULL_HANDLE;
 	const VulkanImage*       color   = nullptr;

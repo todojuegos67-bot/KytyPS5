@@ -4518,7 +4518,7 @@ struct CpuPerf {
 struct LogState {
 	std::string path;
 	uint64_t    pos = 0;
-	std::string kind, ratio, xess_ver, preset;
+	std::string kind, ratio, xess_ver, preset, fsr_ver;
 	int         in_h = 0, out_h = 0, native = 0;
 	bool        dlss_ready = false, force4k = false;
 	int64_t     last_key = -1;
@@ -4621,7 +4621,7 @@ void Sample(LogState& L,
 		static const std::regex re_ratio(R"(KYTY_UPSCALE_RATIO=([0-9.]+) on a (\d{3,4}) high display: (\d{3,4}))");
 		static const std::regex re_disp(R"(on a (\d{3,4}) high display)");
 		static const std::regex re_preset(R"(DLSS[^\r\n]*?(?:preset|model[o]?)[ =:]+([A-Z])\b)");
-		static const std::regex re_sr(R"((DLSS|XeSS|FSR 3\.1)[^\r\n]*?(\d{3,4})x(\d{3,4}) -> (\d{3,4})x(\d{3,4}))");
+		static const std::regex re_sr(R"((DLSS|XeSS|FSR 3\.1|FSR 4\.\d)[^\r\n]*?(\d{3,4})x(\d{3,4}) -> (\d{3,4})x(\d{3,4}))");
 		static const std::regex re_native(R"(performance mode renders (\d{3,4})x(\d{3,4}))");
 		static const std::regex re_xess(R"(XeSS: libxess\.dll ([0-9.]+) loaded)");
 		if (last(part, re_ratio, mm)) L.ratio = mm[1], L.out_h = std::atoi(mm[2].str().c_str()), L.in_h = std::atoi(mm[3].str().c_str());
@@ -4643,6 +4643,9 @@ void Sample(LogState& L,
 				const int h = std::atoi((*it)[3].str().c_str());
 				if (h >= 600) {
 					L.kind = (*it)[1].str() == "FSR 3.1" ? "FSR" : (*it)[1].str();
+					// (des-upstream-1106) "FSR 4.1": AMD's SDK 2.4 runtime really created the context (Fsr3::UpscalerName).
+					if (L.kind.rfind("FSR 4.", 0) == 0) L.fsr_ver = L.kind, L.kind = "FSR";
+					else if (L.kind == "FSR") L.fsr_ver.clear();
 					L.in_h = h;
 					if (L.out_h == 0) L.out_h = std::atoi((*it)[5].str().c_str());
 					break;
@@ -4745,7 +4748,7 @@ void Sample(LogState& L,
 				model = pk == "K" ? "K (Transformer, DLSS 4)" : pk == "L" ? "L (Transformer, DLSS 4.5)" : pk == "M" ? "M (Transformer, DLSS 4.5)" : pk.empty() ? "auto (NVIDIA)" : pk;
 				if (!L.dlss_ready && L.in_h == 0) model += " ...";
 			} else if (kind == "XeSS") model = L.xess_ver == "2.0.2" ? "XeSS 3.0.2" : !L.xess_ver.empty() ? "XeSS " + L.xess_ver : "XeSS";
-			else if (kind == "FSR") model = "FSR 3.1";
+			else if (kind == "FSR") model = L.fsr_ver.empty() ? "FSR 3.1" : L.fsr_ver + " (AMD SDK 2.4)";
 		} else if (L.force4k) rk = "Nativo", res = "2160p (4K)";
 		else if (scale_label.find("juego") != std::string::npos) rk = "Juego", res = Fmt("%sp %s %dp", scale_label.substr(0, scale_label.find('p')).c_str(), arrow, out_h), model = "reescalado del juego";
 		else if (L.native != 0) rk = "Nativo", res = Fmt("%dp %s %dp", L.native, arrow, out_h);

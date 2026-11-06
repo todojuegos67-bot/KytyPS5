@@ -3728,7 +3728,7 @@ bool UpscaleOurs(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 	if (!said) {
 		said = true;
 		std::printf("Super resolution (PS5 Pro path): %s %ux%u -> %ux%u%s\n",
-		            g_sr_kind == 2 ? "XeSS" : g_sr_kind == 4 ? Fsr4::Name() : "FSR 3.1",
+		            g_sr_kind == 2 ? "XeSS" : g_sr_kind == 4 ? Fsr4::Name() : Fsr3::UpscalerName(),
 		            inputs.color.extent.width, inputs.color.extent.height, inputs.output.extent.width,
 		            inputs.output.extent.height, done ? "" : " (failed: stretched)");
 		std::fflush(stdout);
@@ -9740,7 +9740,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 		++frames;
 		const bool ok = !composited || written || done; // (done without write-back: the upscaler read the composite itself)
 		reached += ok ? 1u : 0u;
-		const char* upscaler = g_sr_kind == 1 ? "DLSS" : g_sr_kind == 2 ? "XeSS" : g_sr_kind == 3 ? "FSR 3.1" : g_sr_kind == 4 ? "FSR 4" : "none";
+		const char* upscaler = g_sr_kind == 1 ? "DLSS" : g_sr_kind == 2 ? "XeSS" : g_sr_kind == 3 ? Fsr3::UpscalerName() : g_sr_kind == 4 ? "FSR 4" : "none";
 		const char* fg       = fsr3_fg ? "AMD FSR3 FG" : Enabled() ? "NVIDIA DLSS-G" : "no FG";
 		if (!said || frames % 3600 == 0) {
 			said = true;

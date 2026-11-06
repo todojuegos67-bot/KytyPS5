@@ -942,7 +942,73 @@ void RecordHudLayer(GraphicContext& graphics, vk::CommandBuffer command, vk::Ima
 	}
 }
 
-// ---- FSR 3.1 upscaling ----
+// ---- FSR 3.1 / FSR 4.1 upscaling ----
+// (des-upstream-1106) AMD FSR SDK 2.4's signed Vulkan runtime, when it is next to the emulator: its loader
+// (amd_fidelityfx_loader_vk.dll) in a module of its own, used for the upscaling context only (frame generation stays on
+// the patched amd_fidelityfx_vk.dll). Its versions are asked for this device; the newest 4.x one is chosen with
+// ffxOverrideVersion. A failure there (no 4.x for this GPU: AMD lists FSR 4 for Radeon 7000 / 9000; the driver; the
+// device's features) falls back to the old DLL's FSR 3.1. The API's structures are the same as SDK 1.1.4's (header
+// types, ffxDispatchDescUpscale, FfxApiResource); only the Vulkan backend's type id is new in 2.x.
+namespace {
+constexpr uint64_t kBackendVk24       = 0x01000003u; // FFX_API_MAKE_BACKEND_SUB_ID(FFX_API_BACKEND_ID_VK, 0x03)
+constexpr uint64_t kUpscaleVersion24  = 0x0001000bu; // FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION
+constexpr uint32_t kUpscalerApi412    = (4u << 22) | (1u << 12) | 2u; // FFX_UPSCALER_VERSION of SDK 2.4.0
+struct VkDeviceContext_FFX24 { // SDK 2.4's VkDeviceContext (ffxQueryDescGetVersions.device on Vulkan)
+	VkDevice                device;
+	VkPhysicalDevice        physical_device;
+	PFN_vkGetDeviceProcAddr get_device_proc;
+};
+struct BackendVk24 {
+	ffxCreateContextDescHeader header;
+	VkDevice                   device;
+	VkPhysicalDevice           physical_device;
+	PFN_vkGetDeviceProcAddr    get_device_proc;
+};
+struct UpscaleVersion24 {
+	ffxCreateContextDescHeader header;
+	uint32_t                   version;
+};
+HMODULE      g_dll24 = nullptr;
+ffxFunctions g_ffx24 {};
+ffxFunctions* g_up_ffx = &g_ffx; // the module the upscaling context belongs to
+std::string  g_up_name = "FSR 3.1";
+std::mutex   g_up_name_mutex;
+
+bool LoadApi24() {
+	static const bool loaded = [] {
+		const char* off = std::getenv("KYTY_FSR41");
+		if (off != nullptr && std::string(off) == "0") return false;
+		wchar_t exe[MAX_PATH] {};
+		GetModuleFileNameW(nullptr, exe, MAX_PATH);
+		std::wstring dir(exe);
+		dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
+		if (GetFileAttributesW((dir + L"amd_fidelityfx_upscaler_vk.dll").c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+		g_dll24 = LoadLibraryW((dir + L"amd_fidelityfx_loader_vk.dll").c_str());
+		if (g_dll24 == nullptr) {
+			std::printf("FSR 4.1: amd_fidelityfx_loader_vk.dll not loaded (%lu)\n", GetLastError());
+			std::fflush(stdout);
+			return false;
+		}
+		ffxLoadFunctions(&g_ffx24, g_dll24);
+		if (g_ffx24.CreateContext == nullptr || g_ffx24.Dispatch == nullptr || g_ffx24.Query == nullptr ||
+		    g_ffx24.DestroyContext == nullptr) {
+			std::printf("FSR 4.1: amd_fidelityfx_loader_vk.dll has no FidelityFX API\n");
+			std::fflush(stdout);
+			return false;
+		}
+		return true;
+	}();
+	return loaded;
+}
+} // namespace
+
+const char* UpscalerName() {
+	static thread_local std::string copy;
+	std::scoped_lock lock(g_up_name_mutex);
+	copy = g_up_name;
+	return copy.c_str();
+}
+
 namespace {
 ffxContext   g_up_context = nullptr;
 vk::Extent2D g_up_render {};
@@ -979,8 +1045,87 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	    desc.upscale.width != g_up_output.width || desc.upscale.height != g_up_output.height) {
 		if (g_up_context != nullptr) {
 			graphics.device.waitIdle(); // (a size change: the context's resources are released)
-			g_ffx.DestroyContext(&g_up_context, nullptr);
+			g_up_ffx->DestroyContext(&g_up_context, nullptr);
 			g_up_context = nullptr;
+		}
+		// (des-upstream-1106) FSR 4.1 through SDK 2.4's runtime first, when it is there and offers a 4.x version here.
+		if (LoadApi24()) {
+			const VkDeviceContext_FFX24 dc {static_cast<VkDevice>(graphics.device), static_cast<VkPhysicalDevice>(graphics.physical_device),
+			                                g_get_device_proc};
+			ffxQueryDescGetVersions versions {};
+			versions.header.type    = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+			versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+			versions.device         = const_cast<VkDeviceContext_FFX24*>(&dc);
+			uint64_t count          = 0;
+			versions.outputCount    = &count;
+			g_ffx24.Query(nullptr, &versions.header);
+			std::vector<uint64_t>    ids(count);
+			std::vector<const char*> names(count, nullptr);
+			versions.versionIds   = ids.data();
+			versions.versionNames = names.data();
+			if (count > 0) g_ffx24.Query(nullptr, &versions.header);
+			int best = -1;
+			for (uint64_t i = 0; i < count; i++) {
+				std::printf("FSR 4.1: SDK 2.4 upscaler version offered: %s\n", names[i] != nullptr ? names[i] : "?");
+				if (names[i] != nullptr && names[i][0] == '4' && (best < 0 || std::strcmp(names[i], names[best]) > 0)) best = static_cast<int>(i);
+			}
+			std::fflush(stdout);
+			if (best >= 0) {
+				BackendVk24 backend {};
+				backend.header.type     = kBackendVk24;
+				backend.device          = dc.device;
+				backend.physical_device = dc.physical_device;
+				backend.get_device_proc = dc.get_device_proc;
+				ffxOverrideVersion override_version {};
+				override_version.header.type  = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+				override_version.header.pNext = &backend.header;
+				override_version.versionId    = ids[best];
+				UpscaleVersion24 api_version {};
+				api_version.header.type  = kUpscaleVersion24;
+				api_version.header.pNext = &override_version.header;
+				api_version.version      = kUpscalerApi412;
+				ffxCreateContextDescUpscale create {};
+				create.header.type    = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+				create.header.pNext   = &api_version.header;
+				create.flags          = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
+				                        FFX_UPSCALE_ENABLE_DEPTH_INFINITE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+				create.maxRenderSize  = {desc.render.width, desc.render.height};
+				create.maxUpscaleSize = {desc.upscale.width, desc.upscale.height};
+				create.fpMessage      = &Message;
+				const auto result     = g_ffx24.CreateContext(&g_up_context, &create.header, nullptr);
+				if (result == FFX_API_RETURN_OK && g_up_context != nullptr) {
+					ffxQueryGetProviderVersion provider {};
+					provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+					g_ffx24.Query(&g_up_context, &provider.header);
+					const std::string used = provider.versionName != nullptr ? provider.versionName : names[best];
+					{
+						std::scoped_lock lock(g_up_name_mutex);
+						// Only a 4.1 provider is called FSR 4.1 (a 4.0 one says FSR 4.0).
+						g_up_name = used.rfind("4.1", 0) == 0 ? "FSR 4.1" : "FSR " + used.substr(0, 3);
+					}
+					g_up_ffx    = &g_ffx24;
+					g_up_render = desc.render;
+					g_up_output = desc.upscale;
+					std::printf("FSR 4.1: AMD FSR SDK 2.4 runtime, upscaler %s %ux%u -> %ux%u\n", used.c_str(), desc.render.width,
+					            desc.render.height, desc.upscale.width, desc.upscale.height);
+					std::fflush(stdout);
+				} else {
+					g_up_context = nullptr;
+					std::printf("FSR 4.1: context %s not created (%u): FSR 3.1\n", names[best], result);
+					std::fflush(stdout);
+				}
+			} else {
+				std::printf("FSR 4.1: SDK 2.4 runtime offers no 4.x upscaler on this GPU: FSR 3.1\n");
+				std::fflush(stdout);
+			}
+		}
+	}
+	if (g_up_context == nullptr || desc.render.width > g_up_render.width || desc.render.height > g_up_render.height ||
+	    desc.upscale.width != g_up_output.width || desc.upscale.height != g_up_output.height) {
+		g_up_ffx = &g_ffx;
+		{
+			std::scoped_lock lock(g_up_name_mutex);
+			g_up_name = "FSR 3.1";
 		}
 		ffxCreateBackendVKDesc backend {};
 		backend.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
@@ -1045,7 +1190,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	up.cameraFovAngleVertical  = EnvFloat("KYTY_FSR3_FOV", desc.fov > 0.0f ? desc.fov : camera.valid ? camera.fov : 1.0f);
 	up.viewSpaceToMetersFactor = 1.0f;
 	up.flags                   = 0;
-	const auto result = g_ffx.Dispatch(&g_up_context, &up.header);
+	const auto result = g_up_ffx->Dispatch(&g_up_context, &up.header);
 	if (result != FFX_API_RETURN_OK) {
 		if (g_up_errors++ < 4) {
 			std::printf("FSR3 upscaling: dispatch failed (%u)\n", result);
@@ -1346,6 +1491,9 @@ bool SrReady() {
 }
 bool Upscale(GraphicContext&, const UpscaleDesc&) {
 	return false;
+}
+const char* UpscalerName() {
+	return "FSR 3.1";
 }
 bool Active() {
 	return false;

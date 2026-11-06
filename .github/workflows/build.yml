@@ -294,6 +294,29 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'fsr4_shaders: the assets do not match their manifests' }
             Copy-Item fsr4_shaders "$out\fsr4_shaders" -Recurse
             Copy-Item fsr4_shaders\LICENSE-FSR4-v07.txt "$out\LICENSES\FSR4-v07-LICENSE.txt"
+            # (des-upstream-1106) FSR 4.1: AMD FSR SDK 2.4.0's signed Vulkan runtime (MIT; the loader and the upscaler,
+            # plain files in the SDK's repository, not LFS) next to the exe. The emulator uses it for the "FSR" upscaler
+            # when it offers a 4.x version on the GPU (Radeon 7000 / 9000), else FSR 3.1 as before (Fsr3::UpscalerName).
+            # Frame generation stays on the patched amd_fidelityfx_vk.dll above. A failed download only leaves 4.1 out.
+            $sdk24 = '_Build\deps\ffx-sdk-2.4'
+            git clone --quiet --depth 1 --filter=blob:none --no-checkout --branch v2.4.0 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git $sdk24
+            if ($LASTEXITCODE -eq 0) {
+              git -C $sdk24 sparse-checkout set --no-cone /Kits/FidelityFX/signedbin/amd_fidelityfx_loader_vk.dll /Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll /Kits/FidelityFX/docs/license.md
+              git -C $sdk24 checkout --quiet
+            }
+            $bin24 = "$sdk24\Kits\FidelityFX\signedbin"
+            $dlls24 = @("$bin24\amd_fidelityfx_loader_vk.dll", "$bin24\amd_fidelityfx_upscaler_vk.dll")
+            if (($dlls24 | Where-Object { !(Test-Path $_) }).Count -eq 0) {
+              foreach ($d in $dlls24) {
+                $sig = Get-AuthenticodeSignature $d
+                Write-Host "$(Split-Path $d -Leaf): $((Get-Item $d).Length) bytes, signature $($sig.Status) ($($sig.SignerCertificate.Subject))"
+                if ($sig.Status -ne 'Valid') { throw "$d is not validly signed" }
+              }
+              Copy-Item $dlls24 $out
+              Copy-Item "$sdk24\Kits\FidelityFX\docs\license.md" "$out\LICENSES\FidelityFX-SDK-2.4-LICENSE.md"
+            } else {
+              Write-Host '::warning::AMD FSR SDK 2.4 runtime not downloaded: the package has no FSR 4.1'
+            }
             $states = "$out\tools\local\static-precompile"
             New-Item -ItemType Directory -Force $states | Out-Null
             # (10-27b) The whole folder, as the launcher's: pass-states.json (the seed file's render-pass states), the
