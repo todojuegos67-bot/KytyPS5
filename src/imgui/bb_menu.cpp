@@ -3276,7 +3276,6 @@ public:
             Txt(dl, g_ft_ui, 19 * u, {tg.x + 90 * u, y + 34 * u}, Col(232, 120, 100),
                 g_direct.error.c_str());
         }
-        }
         // (bb-input-135) rumble (scePadSetVibration -> SDL), saved in bb_menu.ini
         const ImVec2 vt{tg.x, p0.y + 370 * u};
         if (Toggle("##vib", vt, g_vib_on, tog_vib, u, opt_focus == 1)) {
