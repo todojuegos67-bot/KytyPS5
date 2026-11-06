@@ -121,7 +121,8 @@ function State($source) {
 	} finally { if ($source -isnot [System.Drawing.Bitmap]) { $bmp.Dispose() } }
 }
 
-function Live { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 } }
+# (Only this checkout's emulators: another checkout's session may be running one.)
+function Live { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 -and $_.Path -like "$root*" } }
 for ($i = 0; $i -lt 60 -and (Live); $i++) {
 	Live | Stop-Process -Force -ErrorAction SilentlyContinue
 	Start-Sleep 1
@@ -227,7 +228,7 @@ if ($state -ne 'hud') { "no HUD in $StartupAttempts start-ups"; exit 1 }
 Start-Sleep 10
 if (!$NoWalk) { Key w 10000; Start-Sleep 10 }
 Shot 'scene.png' | Out-Null
-if ($ShotOnly) { powershell -NoProfile -File "$S\screen.ps1" -Out "$out\scene-$Label.png" -Scale 0.25 | Out-Null; "screenshot: $out\scene-$Label.png"; if (!$KeepRunning) { Stop-Process -Name kyty_emulator -Force -ErrorAction SilentlyContinue }; return }
+if ($ShotOnly) { powershell -NoProfile -File "$S\screen.ps1" -Out "$out\scene-$Label.png" -Scale 0.25 | Out-Null; "screenshot: $out\scene-$Label.png"; if (!$KeepRunning) { Live | Stop-Process -Force -ErrorAction SilentlyContinue }; return }
 $commands = (1..$Rounds | ForEach-Object { "measure 20 $Label-$_" }) -join ' ; '
 python tools\local\bench-windows.py live $commands | Select-String 'LIVE_MEASURE' | ForEach-Object { $_.Line }
-if (!$KeepRunning) { Stop-Process -Name kyty_emulator -Force -ErrorAction SilentlyContinue }
+if (!$KeepRunning) { Live | Stop-Process -Force -ErrorAction SilentlyContinue }

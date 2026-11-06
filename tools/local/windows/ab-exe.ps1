@@ -15,7 +15,7 @@ $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
 Set-Location $root
 $out = "$root\_Build\ab\$Label"
 New-Item -ItemType Directory -Force $out | Out-Null
-function Emulator { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 } }
+function Emulator { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 -and $_.Path -like "$root*" } }
 $sums = @{}
 $order = @()
 for ($round = 1; $round -le $Rounds; $round++) { $order += if ($round % 2) { @('A', 'B') } else { @('B', 'A') } }

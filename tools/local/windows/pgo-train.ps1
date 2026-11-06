@@ -8,6 +8,9 @@ param([string]$Out = '', [string[]]$Set = @(), [switch]$NoPrecompile)
 $S = $PSScriptRoot
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
 Set-Location $root
+# (Only this checkout's emulators: another checkout's session may be running one.)
+function Ours { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 -and $_.Path -like "$root*" } }
+New-Item -ItemType Directory -Force "$root\_Build\pgo\windows" | Out-Null
 if (!$Out) { $Out = "$root\_Build\pgo\windows\kyty-$(Get-Date -Format yyyyMMdd)" }
 $env:KYTY_BUILD_DIR   = "$root\_Build\windows-pgogen"
 $env:KYTY_CMAKE_ARGS  = '-DKYTY_PGO_GENERATE=ON'
@@ -26,7 +29,7 @@ $started = & "$S\bench-run.ps1" @params | Select-Object -Last 1
 $started
 # A start-up that never reached the HUD would train the title screen: no profile then.
 if ("$started" -match 'no HUD') {
-	Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 } | Stop-Process -Force
+	Ours | Stop-Process -Force
 	'no profile: the game did not reach the HUD'
 	exit 1
 }
@@ -46,6 +49,6 @@ Plan 'd:down:0,d:up:2000,w:down:2000,w:up:8000,a:down:8000,a:up:10000'
 Start-Sleep 15
 $raw = "$Out.profraw" -replace '\\', '/'
 python tools\local\bench-windows.py live "pgo $raw" | Select-String 'LIVE_PGO|LIVE_ERROR'
-Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 } | Stop-Process -Force
+Ours | Stop-Process -Force
 & 'C:\Program Files\LLVM\bin\llvm-profdata.exe' merge -o "$Out.profdata" "$Out.profraw"
 "profile: $Out.profdata"

@@ -57,3 +57,22 @@ profile 为 A）：渲染线程 10.30 → 10.23 ms/帧，但四轮里 B 的 fps 
 - 1-1 加 `KYTY_SCOUT=0`，两次 ABBA 合计：14.32 / 14.55 ms，fps 69.1 / 68.1（这个位置单次启动之间相差 ±5%，在噪声内）。
 @DevList1454 在 Ryzen 7 9700X + RX 9070 XT 上按同样的方法重新训练（scout 开），王城内城 +5-6%。新 profile 提交为
 `tools\pgo\kyty.profdata`，旧的另存为 `_Build\pgo\windows\kyty-before-20261105.profdata`。
+
+2026-11-06（台式机）：合并 PR #285、#287、#297-#304、#308、#309 之后，扫描 10 个 TU 里 65 个函数失配（pm4Handlers 30、redZonePatcher 17、
+bufferCache 7、renderDraw 3 等）。旧的场景存档已随 `_Build` 删除，所以这次的存档全部由 1-1 竞技场的
+`rec-m02_00_00_00-c0000_0006` 派生（`tools\local\demons-souls-save.py set-map`；游戏只有 `.zar` 时，先把
+`cp11demonssouls/dvdroot/map/mapstudio/m0*.msb` 取到一个文件夹，用 `--game` 指过去）。`tools\local\windows\pgo-multi.ps1`
+现在默认跑这五次：
+- `world-prologue`（m08_00_00_00 c0000_0000，教程的隧道）；
+- `rec-m02_00_00_00-c0000_0001`（1-1 城门广场，代替 `user-20261001`）；
+- `world-latria`（m04_00_00_00 c0000_0000）；
+- `rec-m02_00_00_00-c0000_0006`；
+- `rec-m02_00_00_00-c0000_0001` 配 `KYTY_SCOUT=0`。
+
+ab-exe ABBA，120 Hz 上限，源码相同（11-05 的 profile 为 A）：
+- 1-1：渲染线程 14.68 → 13.65 ms/帧，fps 65.95 → 70.03（4 个窗口）；
+- 1-1 加 `KYTY_SCOUT=0`：14.50 → 14.36 ms，fps 68.35 → 69.33（8 个窗口）；
+- Latria：12.69 → 12.48 ms，fps 76.91 → 75.98（8 个窗口；这里帧率不只取决于渲染线程）。
+
+重扫只剩 redZonePatcher.cpp（加载器）的 17 个。新 profile 提交为 `tools\pgo\kyty.profdata`，旧的另存为
+`_Build\pgo\windows\kyty-before-20261106.profdata`。
