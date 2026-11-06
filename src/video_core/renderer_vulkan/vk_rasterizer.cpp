@@ -1604,6 +1604,24 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.color_attachments[cb] = {};
     }
 
+    // 1.37: a depth-only HUD draw (the bars' depth / stencil mask) goes into the depth twin too.
+    bool bb_depth_only = false;
+    if (!bb_hud_redirect && db_desc.image_id && BB::Upscale::Enabled()) {
+        bool any_color = false;
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            if (cb_descs[cb].image_id) any_color = true;
+        }
+        u32 bb_w = 0, bb_h = 0;
+        auto& bb_d = texture_cache.GetImage(db_desc.image_id);
+        if (!any_color && BBHudSharpDepthOnly(bb_d, bb_w, bb_h)) {
+            bb_rt_scale_x = float(bb_w) / float(bb_d.info.size.width);
+            bb_rt_scale_y = float(bb_h) / float(bb_d.info.size.height);
+            state.width = bb_w;
+            state.height = bb_h;
+            bb_hud_redirect = true;
+            bb_depth_only = true;
+        }
+    }
     vk::ImageView bb_hs_depth_view{};
     vk::ImageLayout bb_hs_depth_layout{};
     if (bb_hud_redirect && db_desc.image_id &&
@@ -1613,12 +1631,17 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         bb_hud_redirect = false;
         bb_hs_twin_dst = vk::ImageView{};
         bb_rt_scale_x = bb_rt_scale_y = 1.0f;
+        if (bb_depth_only) {
+            state.width = instance.GetMaxFramebufferWidth();
+            state.height = instance.GetMaxFramebufferHeight();
+        } else {
         state.color_attachments[0].image_view =
             *texture_cache.FindRenderTarget(cb_descs[0].image_id, cb_descs[0].desc).image_view;
         state.color_attachments[0].image_layout =
             texture_cache.GetImage(cb_descs[0].image_id).backing->state.layout;
         state.width = texture_cache.GetImage(cb_descs[0].image_id).info.size.width;
         state.height = texture_cache.GetImage(cb_descs[0].image_id).info.size.height;
+        }
     }
     if (auto image_id = db_desc.image_id; image_id) {
         auto& desc = db_desc.desc;

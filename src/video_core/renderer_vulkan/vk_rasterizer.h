@@ -78,6 +78,7 @@ public:
                            vk::ImageView& twin_view);
     bool BBHudSharpDepth(VideoCore::Image& depth, vk::ImageView& view, vk::ImageLayout& layout);
     void BBHudSharpTwinDone();
+    bool BBHudSharpDepthOnly(const VideoCore::Image& depth, u32& width, u32& height);
     // The last present went through the HUD canvas (the presenter's [frame] line).
     static bool BBHudSharpPresented();
     // 0.39 (BB_FG_NATIVE): frame generation's inputs with no upscaler; the image is not changed.

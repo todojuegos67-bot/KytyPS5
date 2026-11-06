@@ -824,8 +824,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         u32 bb_w = frame->width, bb_h = frame->height;
         const vk::Extent2D bb_ext = swapchain.GetExtent();
         if (bb_ext.width > 0 && bb_ext.height > 0) {
-            bb_w = std::min(bb_w, bb_ext.width);
-            bb_h = std::min(bb_h, bb_ext.height);
+            // 1.37: the swapchain extent itself. The render frame follows the last presented
+            // size, so 1704 x 1.5 = 2556 fed back into the next frame's output (window 2560).
+            bb_w = bb_ext.width;
+            bb_h = bb_ext.height;
         }
         BB::Upscale::SetPresentSize(bb_w, bb_h);
     }

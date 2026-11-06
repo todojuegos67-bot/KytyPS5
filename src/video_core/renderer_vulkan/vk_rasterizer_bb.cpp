@@ -3659,11 +3659,19 @@ struct HsCanvas {
     std::vector<std::pair<u64, vk::ImageView>> views;
 };
 struct HsState {
-    HsCanvas a, a0, b, b0, depth;
+    HsCanvas a, a0, depth;
+    // 1.37: one final-pass canvas per flip image (the game presents its flips in turn and can
+    // present one again): the presented flip shows its own canvas, never an unwritten image.
+    std::array<HsCanvas, 3> bp, b0p;
+    std::array<VAddr, 3> bp_addr{};
+    std::array<u64, 3> bp_gen{};
+    u64 gen = 0, pcount = 0;
+    int bi = -1;
     OwnImage temp;
-    bool live = false, b_live = false, depth_filled = false, want_fg = false;
+    bool live = false, depth_filled = false, want_fg = false;
     bool presented = false;
-    VAddr target = 0, b_addr = 0;
+    VAddr target = 0;
+    u32 s_depth_only = 0, s_represent = 0;
     vk::Extent2D render{}, output{};
     u32 twin_need = 0, twin_done = 0, consecutive_fail = 0;
     // Per second.
@@ -3798,7 +3806,8 @@ void HsOff(const std::string& why) {
 
 void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
     g_hs.live = false;
-    g_hs.b_live = false;
+    g_hs.bi = -1;
+    ++g_hs.gen;
     if (!BB::Upscale::HudCanvasWanted()) {
         return;
     }
@@ -3915,12 +3924,26 @@ bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view
     HsCanvas* c = nullptr;
     if (addr == g_hs.target) {
         c = &g_hs.a;
-    } else if (g_hs.b_live && addr == g_hs.b_addr) {
-        c = &g_hs.b;
-    } else if (bb_hs_sampled && !g_hs.b_live) {
+    } else if (g_hs.bi >= 0 && addr == g_hs.bp_addr[g_hs.bi]) {
+        c = &g_hs.bp[g_hs.bi];
+    } else if (bb_hs_sampled && g_hs.bi < 0) {
+        // The flip's own slot, else the oldest.
+        int slot = -1;
+        for (int i = 0; i < 3; ++i) {
+            if (g_hs.bp_addr[i] == addr) slot = i;
+        }
+        if (slot < 0) {
+            slot = 0;
+            for (int i = 1; i < 3; ++i) {
+                if (g_hs.bp_gen[i] < g_hs.bp_gen[slot]) slot = i;
+            }
+        }
+        g_hs.bi = slot;
         // The game's final pass (it samples the HUD target): its target gets a canvas too.
-        if (!HsEnsure(g_hs.b, g_hs.output, image.info.pixel_format, false) ||
-            (g_hs.want_fg && !HsEnsure(g_hs.b0, g_hs.output, image.info.pixel_format, false))) {
+        if (!HsEnsure(g_hs.bp[slot], g_hs.output, image.info.pixel_format, false) ||
+            (g_hs.want_fg &&
+             !HsEnsure(g_hs.b0p[slot], g_hs.output, image.info.pixel_format, false))) {
+            g_hs.bi = -1;
             HsOff("the final-pass canvas could not be created");
             g_hs.live = false;
             return false;
@@ -3929,17 +3952,19 @@ bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view
         const auto cmd = scheduler.CommandBuffer();
         const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
         const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        g_hs.b.layout = vk::ImageLayout::eUndefined;
-        HsBarrier(cmd, g_hs.b, vk::ImageLayout::eTransferDstOptimal);
-        cmd.clearColorImage(g_hs.b.image, vk::ImageLayout::eTransferDstOptimal, black, range);
+        g_hs.bp[slot].layout = vk::ImageLayout::eUndefined;
+        HsBarrier(cmd, g_hs.bp[slot], vk::ImageLayout::eTransferDstOptimal);
+        cmd.clearColorImage(g_hs.bp[slot].image, vk::ImageLayout::eTransferDstOptimal, black,
+                            range);
         if (g_hs.want_fg) {
-            g_hs.b0.layout = vk::ImageLayout::eUndefined;
-            HsBarrier(cmd, g_hs.b0, vk::ImageLayout::eTransferDstOptimal);
-            cmd.clearColorImage(g_hs.b0.image, vk::ImageLayout::eTransferDstOptimal, black, range);
+            g_hs.b0p[slot].layout = vk::ImageLayout::eUndefined;
+            HsBarrier(cmd, g_hs.b0p[slot], vk::ImageLayout::eTransferDstOptimal);
+            cmd.clearColorImage(g_hs.b0p[slot].image, vk::ImageLayout::eTransferDstOptimal, black,
+                                range);
         }
-        g_hs.b_live = true;
-        g_hs.b_addr = addr;
-        c = &g_hs.b;
+        g_hs.bp_addr[slot] = addr;
+        g_hs.bp_gen[slot] = g_hs.pcount + 1;
+        c = &g_hs.bp[slot];
     } else {
         return false;
     }
@@ -3954,13 +3979,13 @@ bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view
     height = c->extent.height;
     if (bb_hs_sampled) {
         ++g_hs.s_final;
-        if (c == &g_hs.b && g_hs.want_fg && !bb_hs_twin.empty()) {
-            if (g_hs.b0.layout != vk::ImageLayout::eColorAttachmentOptimal) {
+        if (g_hs.bi >= 0 && c == &g_hs.bp[g_hs.bi] && g_hs.want_fg && !bb_hs_twin.empty()) {
+            if (g_hs.b0p[g_hs.bi].layout != vk::ImageLayout::eColorAttachmentOptimal) {
                 scheduler.EndRendering();
-                HsBarrier(scheduler.CommandBuffer(), g_hs.b0,
+                HsBarrier(scheduler.CommandBuffer(), g_hs.b0p[g_hs.bi],
                           vk::ImageLayout::eColorAttachmentOptimal);
             }
-            bb_hs_twin_dst = HsView(g_hs.b0, view_format, 0);
+            bb_hs_twin_dst = HsView(g_hs.b0p[g_hs.bi], view_format, 0);
             bb_hs_twin_layout = vk::ImageLayout::eColorAttachmentOptimal;
             if (bb_hs_twin_dst) ++g_hs.twin_need;
         }
@@ -4059,6 +4084,17 @@ bool Rasterizer::BBHudSharpDepth(VideoCore::Image& depth, vk::ImageView& view,
     return true;
 }
 
+bool Rasterizer::BBHudSharpDepthOnly(const VideoCore::Image& depth, u32& width, u32& height) {
+    if (!g_hs.live || depth.info.size.width != g_hs.render.width ||
+        depth.info.size.height != g_hs.render.height || depth.info.bb_scaled) {
+        return false;
+    }
+    width = g_hs.output.width;
+    height = g_hs.output.height;
+    ++g_hs.s_depth_only;
+    return true;
+}
+
 void Rasterizer::BBHudSharpTwinDone() {
     ++g_hs.twin_done;
 }
@@ -4082,14 +4118,16 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
                 "[hud] last second: path={} ({} of {} presents via the HUD canvas: {} on the flip "
                 "directly, {} through the game's final pass; no canvas {}, other image {}), HUD "
                 "raster {}x{} (game UI {}x{}), HUD draws {} (depth-tested {}, without depth twin "
-                "{}), final-pass draws {}, FG HUD mode: {}",
+                "{}), depth-only HUD draws (bar masks) {}, re-presented flip canvases {}, "
+                "final-pass draws {}, FG HUD mode: {}",
                 !BB::Upscale::HudCanvasOk() ? "1.14 HUD composite at present (canvas off)"
                 : g_hs.s_presents > 0       ? "before-HUD upscale + output-size HUD canvas"
                                             : "before-HUD canvas idle (no 3D frame / HUD point)",
                 g_hs.s_presents, g_hs.s_calls, g_hs.s_flip_direct,
                 g_hs.s_presents - g_hs.s_flip_direct, g_hs.s_no_canvas, g_hs.s_other,
                 g_hs.output.width, g_hs.output.height, g_hs.render.width, g_hs.render.height,
-                g_hs.s_draws, g_hs.s_depth, g_hs.s_depth_fail, g_hs.s_final,
+                g_hs.s_draws, g_hs.s_depth, g_hs.s_depth_fail, g_hs.s_depth_only,
+                g_hs.s_represent, g_hs.s_final,
                 !fg ? std::string("off (no frame generation)")
                     : fmt::format("HUD-less frame given {}/{} (DLSS-G hudless tag / FSR 3 FG "
                                   "HUDLessColor: generated frames get the real HUD), twin missing "
@@ -4098,35 +4136,47 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         }
         g_hs.s_calls = g_hs.s_presents = g_hs.s_no_canvas = g_hs.s_other = g_hs.s_draws =
             g_hs.s_depth = g_hs.s_depth_fail = g_hs.s_final = g_hs.s_hudless = g_hs.s_twin_miss =
-                g_hs.s_flip_direct = 0;
+                g_hs.s_flip_direct = g_hs.s_depth_only = g_hs.s_represent = 0;
     }
-    if (!g_hs.live) {
-        ++g_hs.s_no_canvas;
-        return false;
-    }
-    g_hs.live = false;
+    const VAddr addr = flip.info.guest_address;
     HsCanvas* c = nullptr;
     HsCanvas* h = nullptr;
-    const VAddr addr = flip.info.guest_address;
-    if (addr == g_hs.target) {
+    // 1.37: a flip's canvas from this or the last two HUD-point frames (re-present / order).
+    int slot = -1;
+    for (int i = 0; i < 3; ++i) {
+        if (g_hs.bp_addr[i] == addr && g_hs.bp[i].image && g_hs.bp_gen[i] != 0 &&
+            g_hs.pcount + 1 - g_hs.bp_gen[i] <= 3) {
+            slot = i;
+        }
+    }
+    const bool was_live = g_hs.live;
+    g_hs.live = false;
+    ++g_hs.pcount;
+    if (was_live && addr == g_hs.target) {
         c = &g_hs.a;
         h = g_hs.want_fg ? &g_hs.a0 : nullptr;
         ++g_hs.s_flip_direct;
-    } else if (g_hs.b_live && addr == g_hs.b_addr) {
-        c = &g_hs.b;
-        if (g_hs.want_fg) {
+    } else if (slot >= 0 && BB::Upscale::HudCanvasOk()) {
+        c = &g_hs.bp[slot];
+        if (slot != g_hs.bi || !was_live) {
+            ++g_hs.s_represent;
+        } else if (g_hs.want_fg) {
             if (g_hs.twin_need > 0 && g_hs.twin_need == g_hs.twin_done) {
-                h = &g_hs.b0;
+                h = &g_hs.b0p[slot];
             } else {
                 ++g_hs.s_twin_miss;
             }
         }
+        if (was_live && slot != g_hs.bi) g_hs.live = true; // this frame's canvas still to come
+    } else if (!was_live) {
+        ++g_hs.s_no_canvas;
+        return false;
     } else {
         ++g_hs.s_other;
         if (++g_hs.consecutive_fail >= 30) {
             HsOff(fmt::format("30 frames in a row presented {:#x}, neither the HUD target {:#x} "
-                              "nor its final pass' target {:#x}",
-                              addr, g_hs.target, g_hs.b_live ? g_hs.b_addr : 0));
+                              "nor a final-pass canvas",
+                              addr, g_hs.target));
         }
         return false;
     }
