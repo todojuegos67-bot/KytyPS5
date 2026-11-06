@@ -6,6 +6,7 @@
 #include "video_core/bb/bb_fg.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -1216,7 +1217,69 @@ void Classify(int idx, u8 bit, VAddr addr) {
 }
 } // namespace
 
+namespace {
+constexpr u32 PreviewGuest = 784;
+constexpr u32 PreviewMax = 16;
+std::array<VAddr, PreviewMax> g_pv_addrs{};
+std::atomic<u32> g_pv_count{0};
+std::mutex g_pv_mutex;
+u32 PreviewScale() {
+    static const u32 s = [] {
+        const char* v = std::getenv("BB_PREVIEW_SCALE");
+        const int x = (v != nullptr && *v != '\0') ? std::atoi(v) : 2;
+        const u32 r = static_cast<u32>(std::clamp(x, 1, 3));
+        Checkpoint(fmt::format("[preview] 1.25: character preview targets ({0}x{0} colour + depth "
+                               "drawn by 3D passes) {1}",
+                               PreviewGuest,
+                               r > 1 && !BB::ResPatch::ShrinkWanted()
+                                   ? fmt::format("supersampled x{} ({}x{}), BB_PREVIEW_SCALE", r,
+                                                 PreviewGuest * r, PreviewGuest * r)
+                                   : std::string("not scaled (BB_PREVIEW_SCALE=1 or native/shrink "
+                                                 "scene mode)")));
+        return r;
+    }();
+    return s;
+}
+} // namespace
+
+bool PreviewWanted() {
+    static const bool on = PreviewScale() > 1 && !BB::ResPatch::ShrinkWanted();
+    return on;
+}
+bool PreviewSize(u32 w, u32 h) {
+    return w == PreviewGuest && h == PreviewGuest;
+}
+bool HasPreviewTargets() {
+    return g_pv_count.load(std::memory_order_acquire) != 0;
+}
+bool IsPreviewTarget(VAddr addr) {
+    const u32 n = g_pv_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
+        if (g_pv_addrs[i] == addr) return true;
+    }
+    return false;
+}
+void AddPreviewTarget(VAddr addr, bool depth, const char* why) {
+    if (!PreviewWanted() || addr == 0) return;
+    std::scoped_lock lk{g_pv_mutex};
+    if (IsPreviewTarget(addr)) return;
+    const u32 n = g_pv_count.load(std::memory_order_relaxed);
+    if (n >= PreviewMax) return;
+    g_pv_addrs[n] = addr;
+    g_pv_count.store(n + 1, std::memory_order_release);
+    Checkpoint(fmt::format("[preview] {:#x} {} {}x{} scaled to {}x{} from its next use ({}; {} "
+                           "preview targets)",
+                           addr, depth ? "depth" : "colour", PreviewGuest, PreviewGuest,
+                           PreviewGuest * PreviewScale(), PreviewGuest * PreviewScale(), why,
+                           n + 1));
+}
+
 bool ScaleImage(VAddr addr, u32& w, u32& h) {
+    if (PreviewSize(w, h) && PreviewWanted() && IsPreviewTarget(addr)) {
+        w *= PreviewScale();
+        h *= PreviewScale();
+        return true;
+    }
     if (!g_ss_frozen.load(std::memory_order_acquire) || g_ss_off.load(std::memory_order_relaxed) ||
         w != g_ss_w || h != g_ss_h) {
         return false;

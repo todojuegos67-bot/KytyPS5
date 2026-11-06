@@ -58,6 +58,14 @@ float LiveSharpness();
 // the HUD stay at the output size, and the upscaler runs in place before post-processing.
 // True (and the host size in w, h) when this guest image is one of them at its learned size.
 bool ScaleImage(VAddr addr, u32& w, u32& h);
+// 1.25 (bb-preview-125): the character-creation preview (a square 784x784 colour + depth target
+// pair drawn with 3D passes) is supersampled at BB_PREVIEW_SCALE (1..3, default 2; 1 = off). Off
+// with BB_SCENE_UPSCALE=native/shrink. PreviewSize: w x h is the preview's guest size.
+bool PreviewWanted();
+bool PreviewSize(u32 w, u32 h);
+bool IsPreviewTarget(VAddr addr);
+bool HasPreviewTargets();
+void AddPreviewTarget(VAddr addr, bool depth, const char* why);
 // The guest and host sizes of the scaled scene targets (0 until learned).
 bool SceneScale(u32& guest_w, u32& guest_h, u32& host_w, u32& host_h);
 // A target of the scaled targets' guest size bound in the same draw as scaled ones (mixed sizes

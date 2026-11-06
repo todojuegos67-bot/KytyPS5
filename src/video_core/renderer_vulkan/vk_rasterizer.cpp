@@ -187,6 +187,41 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             if (bb_scaled_target(cb_descs[cb].image_id)) break;
         }
     }
+    // BB 1.25: the character preview (784x784 colour + depth, 3D passes) is learned here and
+    // created at BB_PREVIEW_SCALE from its next use; the viewport / scissor / size constants of
+    // its draws scale through the bb_scaled path above. Depth-only (shadow) passes never match.
+    if (BB::Upscale::PreviewWanted()) {
+        const auto pv_unscaled = [&](VideoCore::ImageId id) {
+            if (!id) return false;
+            const auto& info = texture_cache.GetImage(id).info;
+            return !info.bb_scaled && info.num_samples == 1 &&
+                   BB::Upscale::PreviewSize(info.size.width, info.size.height);
+        };
+        u32 pv_cols = 0;
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (pv_unscaled(cb_descs[cb].image_id)) ++pv_cols;
+        }
+        const bool pv_depth = pv_unscaled(db_desc.image_id);
+        const bool pv_bound = BB::Upscale::PreviewSize(bb_rt_guest_w, bb_rt_guest_h);
+        const char* why = pv_bound ? "bound with scaled preview targets"
+                          : (pv_depth && pv_cols > 0) ? "colour + depth 3D pass"
+                          : (pv_cols > 0 && BB::Upscale::HasPreviewTargets())
+                              ? "colour pass of the preview size after the preview's 3D pass"
+                              : nullptr;
+        if (why != nullptr) {
+            for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+                if (pv_unscaled(cb_descs[cb].image_id)) {
+                    BB::Upscale::AddPreviewTarget(
+                        texture_cache.GetImage(cb_descs[cb].image_id).info.guest_address, false,
+                        why);
+                }
+            }
+            if (pv_depth && (pv_cols > 0 || pv_bound)) {
+                BB::Upscale::AddPreviewTarget(
+                    texture_cache.GetImage(db_desc.image_id).info.guest_address, true, why);
+            }
+        }
+    }
     if (bb_rt_guest_w != 0 && BB::Upscale::NativePostPhase()) {
         BB::Upscale::OnPostScaledTarget(
             db_desc.image_id && texture_cache.GetImage(db_desc.image_id).info.bb_scaled
