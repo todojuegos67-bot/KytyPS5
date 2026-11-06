@@ -1,0 +1,87 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// 1.42 flash guard, GPU side (vk_rasterizer_bb.cpp HsContentCheck): the HUD canvas about to be
+// presented is checked for a flat scene region (the grey full-screen flashes of 1.37-1.40: an
+// output-size canvas whose scene part is one mid-grey colour, the HUD drawn on top).
+// mode 0 (one 16x16 group): 256 samples of the scene region (the HUD corners and bottom items
+//   left out); flat (every channel within 3/255) and not near black / white (fades stay) =>
+//   decision 1 (the last presented frame) or 2 (black when there is none yet), at most 30 frames
+//   in a row (a real flat image is then shown). Counters for the per-second log line.
+// mode 1 (whole image): out = decision 0 ? canvas : 1 ? last : black. Raw bytes (UNORM views).
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D cur_tex;
+layout(binding = 1) uniform sampler2D last_tex;
+layout(binding = 2, rgba8) uniform writeonly image2D out_img;
+layout(std430, binding = 3) buffer State {
+    uint decision;
+    uint consecutive;
+    uint last_valid;
+    uint checked;
+    uint rejected_last;
+    uint rejected_black;
+    uint accepted_flat;
+    uint last_min;
+    uint last_max;
+} st;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, mode
+} p;
+
+shared uvec3 s_min[256];
+shared uvec3 s_max[256];
+shared uint s_sum[256];
+
+void main() {
+    if (p.size.z == 0u) {
+        uint i = gl_LocalInvocationIndex;
+        vec2 f = (vec2(gl_LocalInvocationID.xy) + 0.5) / 16.0;
+        vec2 uv = vec2(0.20 + 0.60 * f.x, 0.22 + 0.58 * f.y);
+        ivec2 c = clamp(ivec2(uv * vec2(p.size.xy)), ivec2(0), ivec2(p.size.xy) - 1);
+        uvec3 v = uvec3(round(clamp(texelFetch(cur_tex, c, 0).rgb, 0.0, 1.0) * 255.0));
+        s_min[i] = v;
+        s_max[i] = v;
+        s_sum[i] = v.r + v.g + v.b;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (i < s) {
+                s_min[i] = min(s_min[i], s_min[i + s]);
+                s_max[i] = max(s_max[i], s_max[i + s]);
+                s_sum[i] += s_sum[i + s];
+            }
+            barrier();
+        }
+        if (i == 0u) {
+            uvec3 r = s_max[0] - s_min[0];
+            uint mean = s_sum[0] / 768u;
+            bool flat_ = max(r.r, max(r.g, r.b)) <= 3u && mean >= 24u && mean <= 232u;
+            st.checked += 1u;
+            st.last_min = s_min[0].r | (s_min[0].g << 8) | (s_min[0].b << 16);
+            st.last_max = s_max[0].r | (s_max[0].g << 8) | (s_max[0].b << 16);
+            if (flat_ && st.consecutive < 30u) {
+                st.consecutive += 1u;
+                if (st.last_valid != 0u) {
+                    st.decision = 1u;
+                    st.rejected_last += 1u;
+                } else {
+                    st.decision = 2u;
+                    st.rejected_black += 1u;
+                }
+            } else {
+                if (flat_) st.accepted_flat += 1u; else st.consecutive = 0u;
+                st.decision = 0u;
+                st.last_valid = 1u;
+            }
+        }
+        return;
+    }
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    uint d = st.decision;
+    vec4 o = d == 0u ? texelFetch(cur_tex, c, 0)
+           : d == 1u ? texelFetch(last_tex, c, 0)
+                     : vec4(0.0, 0.0, 0.0, 1.0);
+    imageStore(out_img, c, o);
+}
