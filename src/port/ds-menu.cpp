@@ -3504,8 +3504,8 @@ void Spawn(Particle& p, bool anywhere) {
 	p.phase       = Rand() * 6.2831853f;
 	p.depth       = Rand() * Rand(); // (most far, a few near)
 	p.bright      = 0.6f + Rand() * 0.6f;
-	const float near = 1.0f + p.depth * 2.2f;
-	p.size *= near;
+	const float nearer = 1.0f + p.depth * 2.2f;
+	p.size *= nearer;
 	p.vx *= 0.7f + p.depth;
 	p.vy *= 0.7f + p.depth;
 }
