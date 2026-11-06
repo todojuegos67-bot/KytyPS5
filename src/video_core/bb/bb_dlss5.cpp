@@ -1251,7 +1251,9 @@ bool Apply(const SR::Desc& desc) {
 	for (auto* img: {&g.keep, &g.proxy, &g.nr, &g.wdepth, &g.wmv})
 		if (img->image != VK_NULL_HANDLE) ToGeneral(command, *img);
 
-	const bool timed = g.pool != nullptr;
+	// bb-hitch-098: the four eAllCommands timestamps drain the GPU queue around the NR pass; they ran on
+	// every frame for a 10 s mean. Now one frame in 16 (every frame only while the A/B measures).
+	const bool timed = g.pool != nullptr && (g.ab_stage < 2 || (g.frame & 15u) == 0);
 	const auto entry = static_cast<uint32_t>(g.written % TimingEntries);
 	if (timed) {
 		command.resetQueryPool(g.pool, entry * Stamps, Stamps);
