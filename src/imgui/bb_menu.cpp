@@ -7,6 +7,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <iterator>
 #include <cmath>
 #include <ctime>
 #include <deque>
@@ -42,6 +46,64 @@ const ImVec4 kGold{0.93f, 0.78f, 0.47f, 1.0f};
 const ImVec4 kDim{0.72f, 0.70f, 0.66f, 1.0f};
 const ImVec4 kWarn{1.0f, 0.78f, 0.30f, 1.0f};
 const ImU32 kRing = IM_COL32(236, 200, 120, 255);
+
+// ---------------------------------------------------------------- motion helpers
+float EaseOut(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    return 1.0f - (1.0f - x) * (1.0f - x) * (1.0f - x);
+}
+float EaseInOut(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    return x < 0.5f ? 4 * x * x * x : 1.0f - std::pow(-2.0f * x + 2.0f, 3.0f) * 0.5f;
+}
+ImU32 Fade(ImU32 c, float a) {
+    const u32 al = static_cast<u32>(((c >> IM_COL32_A_SHIFT) & 0xFF) * std::clamp(a, 0.0f, 1.0f));
+    return (c & ~IM_COL32_A_MASK) | (al << IM_COL32_A_SHIFT);
+}
+// hover glow (pulsing gold rim) and press feedback over the last item
+void ItemGlow(float rounding) {
+    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    auto* dl = ImGui::GetWindowDrawList();
+    const float al = ImGui::GetStyle().Alpha;
+    if (ImGui::IsItemActive()) {
+        dl->AddRectFilled(a, b, IM_COL32(0, 0, 0, static_cast<int>(70 * al)), rounding);
+        dl->AddRect(a, b, IM_COL32(255, 220, 150, static_cast<int>(230 * al)), rounding, 0, 2.0f);
+    } else if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
+        const float pulse = 0.65f + 0.35f * std::sin(static_cast<float>(ImGui::GetTime()) * 5.0f);
+        for (int i = 3; i >= 1; i--) {
+            const float g = static_cast<float>(i) * 2.0f;
+            dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g},
+                        IM_COL32(236, 196, 110, static_cast<int>(40 * pulse * al / i)),
+                        rounding + g, 0, 2.0f);
+        }
+        dl->AddRect(a, b, IM_COL32(236, 200, 120, static_cast<int>(200 * pulse * al)), rounding,
+                    0, 1.5f);
+    }
+}
+bool FancyButton(const char* label, const ImVec2& size = {0, 0}) {
+    const bool r = ImGui::Button(label, size);
+    ItemGlow(ImGui::GetStyle().FrameRounding);
+    return r;
+}
+// eased wheel scrolling for the current child window
+void SmoothScroll(float& target, float unit) {
+    const ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f) {
+        if (target < 0) {
+            target = ImGui::GetScrollY();
+        }
+        target = std::clamp(target - io.MouseWheel * 160.0f * unit, 0.0f, ImGui::GetScrollMaxY());
+    }
+    if (target >= 0) {
+        const float cur = ImGui::GetScrollY();
+        float n = cur + (target - cur) * std::min(1.0f, io.DeltaTime * 14.0f);
+        if (std::fabs(target - n) < 0.5f) {
+            n = target;
+            target = -1;
+        }
+        ImGui::SetScrollY(n);
+    }
+}
 
 // ---------------------------------------------------------------- shared state
 SDL_Window* g_window = nullptr;
@@ -658,7 +720,7 @@ std::string TriggerChips(ImVec2 at, float w, float unit) {
         if (held) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.45f, 0.25f, 1.0f));
         }
-        if (ImGui::Button(i == 0 ? "L2##chip" : "R2##chip", {100 * unit, 0})) {
+        if (FancyButton(i == 0 ? "L2##chip" : "R2##chip", {100 * unit, 0})) {
             clicked = names[i];
         }
         if (held) {
@@ -749,14 +811,14 @@ void PadPage(float unit) {
     }
     // the sticks' "move" entries under the photo
     ImGui::SetCursorScreenPos({at.x, top + t.h * scale + 8 * unit});
-    if (ImGui::Button("Stick izquierdo (mover)")) {
+    if (FancyButton("Stick izquierdo (mover)")) {
         hit = "stick_left";
     }
     ImGui::SameLine();
-    if (ImGui::Button("Stick derecho (cámara)")) {
+    if (FancyButton("Stick derecho (cámara)")) {
         hit = "stick_right";
     }
-    if (ImGui::Button("Restablecer el mando de serie")) {
+    if (FancyButton("Restablecer el mando de serie")) {
         for (const auto& r : kPadRows) {
             const std::string o = r.output;
             if (o.starts_with("stick_")) {
@@ -871,7 +933,7 @@ void KbmPage(float unit) {
 struct Trophy {
     int id = -1;
     char grade = 'B';
-    bool hidden = false, earned = false;
+    bool hidden = false, earned = false, custom = false;
     u64 stamp = 0;
     std::string name, detail;
     Tex icon;
@@ -880,10 +942,17 @@ std::vector<Trophy> g_trophies;
 std::string g_trophy_error;
 std::filesystem::path g_icons_dir;
 int g_trophy_filter = 0;
+double g_trophy_page_t = 0; // when the list was shown (row stagger, bar fill)
+float g_trophy_bar = 0.0f;
+float g_trophy_scroll = -1.0f;
 
+struct CustomState;
+CustomState ReadCustom();
+void AddCustomTrophy();
 void LoadTrophies() {
     g_trophies.clear();
     g_trophy_error.clear();
+    AddCustomTrophy();
     const auto& map = Common::ElfInfo::Instance().GetTrophyIndexMap();
     if (map.empty()) {
         g_trophy_error = "No se encontraron los trofeos del juego (falta npbind.dat o la clave "
@@ -986,13 +1055,33 @@ std::string DateText(u64 stamp) {
     return buf;
 }
 
+// the custom trophy's own icon: a pale moon over Yharnam's spires, a bronze cup in front
+void DrawCustomIcon(ImDrawList* dl, float x, float y, float s, float alpha) {
+    const auto A = [&](int r, int g, int b, int a) {
+        return IM_COL32(r, g, b, static_cast<int>(a * std::clamp(alpha, 0.0f, 1.0f)));
+    };
+    dl->AddRectFilledMultiColor({x, y}, {x + s, y + s}, A(40, 22, 26, 255), A(40, 22, 26, 255),
+                                A(14, 12, 16, 255), A(14, 12, 16, 255));
+    dl->AddCircleFilled({x + s * 0.68f, y + s * 0.30f}, s * 0.17f, A(236, 226, 196, 235), 28);
+    dl->AddCircleFilled({x + s * 0.75f, y + s * 0.26f}, s * 0.15f, A(40, 22, 26, 255), 28);
+    const float bx[] = {0.08f, 0.20f, 0.30f, 0.80f, 0.90f};
+    const float bh[] = {0.42f, 0.30f, 0.50f, 0.38f, 0.46f};
+    for (int i = 0; i < 5; i++) {
+        const float cx = x + s * bx[i], top = y + s * bh[i];
+        dl->AddTriangleFilled({cx - s * 0.05f, top + s * 0.12f}, {cx + s * 0.05f, top + s * 0.12f},
+                              {cx, top}, A(8, 8, 10, 255));
+        dl->AddRectFilled({cx - s * 0.05f, top + s * 0.12f}, {cx + s * 0.05f, y + s}, A(8, 8, 10, 255));
+    }
+    DrawCup(dl, x + s * 0.27f, y + s * 0.40f, s * 0.48f, A(205, 127, 70, 255), alpha);
+    dl->AddRect({x, y}, {x + s, y + s}, A(236, 200, 120, 120), s * 0.1f, 0, 1.0f);
+}
+
 void TrophyPage(float unit) {
     if (!g_trophy_error.empty()) {
         ImGui::TextColored(kWarn, "%s", g_trophy_error.c_str());
-        if (ImGui::Button("Reintentar")) {
+        if (FancyButton("Reintentar")) {
             LoadTrophies();
         }
-        return;
     }
     int earned = 0;
     for (const auto& t : g_trophies) {
@@ -1003,8 +1092,34 @@ void TrophyPage(float unit) {
     ImGui::TextColored(kGold, "%d de %d conseguidos", earned, total);
     ImGui::SameLine();
     ImGui::TextColored(kDim, "(%.0f%%)", pct);
-    ImGui::ProgressBar(total > 0 ? static_cast<float>(earned) / total : 0.0f,
-                       {-1, 10 * unit}, "");
+    {
+        // eased fill, gold gradient with a moving sheen
+        const float goal = total > 0 ? static_cast<float>(earned) / total : 0.0f;
+        g_trophy_bar += (goal - g_trophy_bar) * std::min(1.0f, ImGui::GetIO().DeltaTime * 4.0f);
+        const ImVec2 a = ImGui::GetCursorScreenPos();
+        const float bw = ImGui::GetContentRegionAvail().x, bh = 12 * unit;
+        ImGui::Dummy({bw, bh});
+        auto* dl = ImGui::GetWindowDrawList();
+        const float al = ImGui::GetStyle().Alpha;
+        dl->AddRectFilled(a, {a.x + bw, a.y + bh}, IM_COL32(20, 18, 16, static_cast<int>(230 * al)),
+                          bh * 0.5f);
+        const float fw = bw * g_trophy_bar;
+        if (fw > 1.0f) {
+            dl->AddRectFilledMultiColor(a, {a.x + fw, a.y + bh},
+                                        IM_COL32(140, 86, 40, static_cast<int>(255 * al)),
+                                        IM_COL32(236, 196, 110, static_cast<int>(255 * al)),
+                                        IM_COL32(236, 196, 110, static_cast<int>(255 * al)),
+                                        IM_COL32(140, 86, 40, static_cast<int>(255 * al)));
+            const float sx = a.x + std::fmod(static_cast<float>(ImGui::GetTime()) * 0.35f, 1.4f) * bw - 0.2f * bw;
+            dl->PushClipRect(a, {a.x + fw, a.y + bh}, true);
+            dl->AddRectFilledMultiColor({sx, a.y}, {sx + 0.1f * bw, a.y + bh}, 0,
+                                        IM_COL32(255, 255, 255, static_cast<int>(70 * al)),
+                                        IM_COL32(255, 255, 255, static_cast<int>(70 * al)), 0);
+            dl->PopClipRect();
+        }
+        dl->AddRect(a, {a.x + bw, a.y + bh}, IM_COL32(236, 200, 120, static_cast<int>(90 * al)),
+                    bh * 0.5f);
+    }
     const char* filters[] = {"Todos", "Conseguidos", "Por conseguir"};
     for (int i = 0; i < 3; i++) {
         if (i > 0) {
@@ -1015,46 +1130,90 @@ void TrophyPage(float unit) {
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Actualizar")) {
+    if (FancyButton("Actualizar")) {
         LoadTrophies();
     }
-    ImGui::BeginChild("##trophies", {0, 0}, ImGuiChildFlags_None);
+    ImGui::BeginChild("##trophies", {0, 0}, ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollWithMouse);
+    SmoothScroll(g_trophy_scroll, unit);
     const float icon = 72 * unit;
+    int row = 0;
+    const float base_alpha = ImGui::GetStyle().Alpha;
     for (auto& t : g_trophies) {
         if ((g_trophy_filter == 1 && !t.earned) || (g_trophy_filter == 2 && t.earned)) {
             continue;
         }
+        // staggered fade/slide in
+        const float ra = EaseOut(static_cast<float>(ImGui::GetTime() - g_trophy_page_t -
+                                                    std::min(row, 16) * 0.035) / 0.28f);
+        row++;
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, base_alpha * ra);
         ImGui::PushID(t.id);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (1.0f - ra) * 40 * unit);
         const ImVec2 p = ImGui::GetCursorScreenPos();
         const float w = ImGui::GetContentRegionAvail().x;
         const float h = icon + 16 * unit;
         // a focusable row (gamepad scroll)
         ImGui::Selectable("##row", false, 0, {w, h});
-        auto* dl = ImGui::GetWindowDrawList();
+        const bool hov = ImGui::IsItemHovered() || ImGui::IsItemFocused();
+        auto* dl0 = ImGui::GetWindowDrawList();
+        // the rows' colours fade with ra (draw-list colours ignore the style alpha)
+        struct FadeDl {
+            ImDrawList* d;
+            float a;
+            void AddRectFilled(ImVec2 x, ImVec2 y, ImU32 c, float r = 0, ImDrawFlags f = 0) {
+                d->AddRectFilled(x, y, Fade(c, a), r, f);
+            }
+            void AddRect(ImVec2 x, ImVec2 y, ImU32 c, float r = 0, ImDrawFlags f = 0, float th = 1) {
+                d->AddRect(x, y, Fade(c, a), r, f, th);
+            }
+            void AddImage(ImTextureID t, ImVec2 x, ImVec2 y, ImVec2 u0, ImVec2 u1, ImU32 c) {
+                d->AddImage(t, x, y, u0, u1, Fade(c, a));
+            }
+            void AddText(ImVec2 x, ImU32 c, const char* s) { d->AddText(x, Fade(c, a), s); }
+            void AddText(ImFont* f, float fs, ImVec2 x, ImU32 c, const char* s, const char* e,
+                         float ww) {
+                d->AddText(f, fs, x, Fade(c, a), s, e, ww);
+            }
+        } dlf{dl0, ra};
+        auto* dl = &dlf;
+        dl->AddRectFilled({p.x + 2 * unit, p.y + 4 * unit}, {p.x + w + 2 * unit, p.y + h + 4 * unit},
+                          IM_COL32(0, 0, 0, 90), 10 * unit);
         dl->AddRectFilled(p, {p.x + w, p.y + h},
-                          t.earned ? IM_COL32(44, 42, 36, 200) : IM_COL32(30, 30, 34, 200),
-                          8 * unit);
+                          t.earned ? IM_COL32(46, 40, 30, 225) : IM_COL32(26, 25, 28, 225),
+                          10 * unit);
+        if (t.earned) {
+            dl->AddRectFilled(p, {p.x + 4 * unit, p.y + h}, GradeColor(t.grade), 10 * unit,
+                              ImDrawFlags_RoundCornersLeft);
+        }
+        dl->AddRect(p, {p.x + w, p.y + h},
+                    hov ? IM_COL32(236, 200, 120, 170) : IM_COL32(236, 200, 120, 28), 10 * unit, 0,
+                    hov ? 2.0f : 1.0f);
         const ImVec2 ip{p.x + 8 * unit, p.y + 8 * unit};
         ImTextureID tex{};
-        if (ImGui::IsRectVisible(p, {p.x + w, p.y + h})) {
+        if (!t.custom && ImGui::IsRectVisible(p, {p.x + w, p.y + h})) {
             tex = Get(t.icon, g_icons_dir / fmt::format("TROP{:03d}.PNG", t.id), 240, 240);
         }
         if (tex) {
             dl->AddImage(tex, ip, {ip.x + icon, ip.y + icon}, {0, 0}, {1, 1},
                          t.earned ? IM_COL32_WHITE : IM_COL32(110, 110, 110, 255));
+        } else if (t.custom) {
+            DrawCustomIcon(dl0, ip.x, ip.y, icon, (t.earned ? 1.0f : 0.45f) * ra);
         } else {
             dl->AddRectFilled(ip, {ip.x + icon, ip.y + icon}, IM_COL32(44, 46, 54, 255),
                               8 * unit);
-            DrawCup(dl, ip.x + icon * 0.1f, ip.y + icon * 0.08f, icon * 0.8f,
-                    GradeColor(t.grade, t.earned ? 1.0f : 0.4f));
+            DrawCup(dl0, ip.x + icon * 0.1f, ip.y + icon * 0.08f, icon * 0.8f,
+                    GradeColor(t.grade, (t.earned ? 1.0f : 0.4f) * ra), ra);
         }
         const float tx = ip.x + icon + 14 * unit;
         const float fs = ImGui::GetFontSize();
-        DrawCup(dl, tx, p.y + 8 * unit, fs, GradeColor(t.grade));
+        DrawCup(dl0, tx, p.y + 8 * unit, fs, GradeColor(t.grade, ra), ra);
         dl->AddText({tx + fs * 1.2f, p.y + 8 * unit}, GradeColor(t.grade), GradeName(t.grade));
-        const std::string nm = t.hidden && !t.earned ? t.name + "  (oculto)" : t.name;
+        const std::string nm = t.custom ? t.name + "  (del port)"
+                               : t.hidden && !t.earned ? t.name + "  (oculto)"
+                                                       : t.name;
         dl->AddText({tx + fs * 6.0f, p.y + 8 * unit}, IM_COL32(245, 245, 247, 255), nm.c_str());
-        dl->AddText(nullptr, fs, {tx, p.y + 8 * unit + fs * 1.3f}, IM_COL32(190, 192, 200, 255),
+        dl->AddText(nullptr, fs, ImVec2{tx, p.y + 8 * unit + fs * 1.3f}, IM_COL32(190, 192, 200, 255),
                     t.detail.c_str(), nullptr, w - (tx - p.x) - 300 * unit);
         const std::string state =
             t.earned ? "Conseguido · " + DateText(t.stamp) : std::string("Por conseguir");
@@ -1064,6 +1223,7 @@ void TrophyPage(float unit) {
                     state.c_str());
         ImGui::Dummy({0, 6 * unit});
         ImGui::PopID();
+        ImGui::PopStyleVar();
     }
     ImGui::EndChild();
 }
@@ -1075,6 +1235,8 @@ struct Toast {
     char grade = 'B';
     double start = -1;
     Tex icon;
+    std::string detail;
+    bool custom = false;
 };
 std::mutex g_toast_mtx;
 std::deque<Toast> g_toasts;
@@ -1159,7 +1321,7 @@ void DrawToast(float unit) {
                  font->CalcTextSizeA(small, FLT_MAX, 0.0f, top.c_str()).x + 18.0f * unit);
     const ImVec2 disp = ImGui::GetIO().DisplaySize;
     const float w = std::min(pad * 3.0f + icon + text_w + 8.0f * unit, disp.x * 0.45f);
-    const float h = icon + pad * 2.0f;
+    const float h = icon + pad * 2.0f + (toast.detail.empty() ? 0.0f : small + 4.0f * unit);
     const float margin = 28.0f * unit;
     const float x1_end = disp.x - margin;
     const float x0 = x1_end - w + (1.0f - ease) * (w + margin + 4.0f);
@@ -1173,14 +1335,42 @@ void DrawToast(float unit) {
     draw->AddRect({x0, y0}, {x0 + w, y0 + h}, IM_COL32(255, 255, 255, a(22)), round, 0, unit);
     const float ix = x0 + pad, iy = y0 + pad;
     const ImU32 grade = GradeColor(toast.grade, alpha);
-    const ImTextureID tex = Get(toast.icon, toast.icon_path, 240, 240);
-    if (tex) {
-        draw->AddImage(tex, {ix, iy}, {ix + icon, iy + icon}, {0, 0}, {1, 1},
-                       IM_COL32(255, 255, 255, a(255)));
+    // the icon's animation: a scale pop with overshoot as the card lands, a glow pulse in
+    // the grade's colour, then a shine sweep across it
+    const float pt = std::clamp((t - 0.20f) / 0.45f, 0.0f, 1.0f);
+    const float c1 = 1.70158f, c3 = c1 + 1.0f;
+    const float pop = t < 0.20f ? 0.6f
+                                : 0.6f + 0.4f * (1.0f + c3 * std::pow(pt - 1.0f, 3.0f) +
+                                                 c1 * std::pow(pt - 1.0f, 2.0f));
+    const float cx = ix + icon * 0.5f, cy = iy + icon * 0.5f;
+    const float gl = t > 0.3f && t < 3.0f
+                         ? (0.5f + 0.5f * std::sin((t - 0.3f) * 6.0f)) *
+                               std::clamp((3.0f - t) / 0.8f, 0.0f, 1.0f)
+                         : 0.0f;
+    for (int i = 4; i >= 1; i--) {
+        const float g = icon * 0.5f + static_cast<float>(i) * 4.0f * unit;
+        draw->AddRectFilled({cx - g, cy - g}, {cx + g, cy + g},
+                            GradeColor(toast.grade, alpha * gl * 0.10f), 12.0f * unit + i * 4.0f * unit);
+    }
+    const float hs = icon * 0.5f * pop;
+    const ImVec2 q0{cx - hs, cy - hs}, q1{cx + hs, cy + hs};
+    const ImTextureID tex = toast.custom ? ImTextureID{} : Get(toast.icon, toast.icon_path, 240, 240);
+    if (toast.custom) {
+        DrawCustomIcon(draw, q0.x, q0.y, hs * 2.0f, alpha);
+    } else if (tex) {
+        draw->AddImage(tex, q0, q1, {0, 0}, {1, 1}, IM_COL32(255, 255, 255, a(255)));
     } else {
-        draw->AddRectFilled({ix, iy}, {ix + icon, iy + icon}, IM_COL32(44, 46, 54, a(255)),
-                            10.0f * unit);
-        DrawCup(draw, ix + icon * 0.1f, iy + icon * 0.08f, icon * 0.8f, grade, alpha);
+        draw->AddRectFilled(q0, q1, IM_COL32(44, 46, 54, a(255)), 10.0f * unit);
+        DrawCup(draw, q0.x + hs * 0.2f, q0.y + hs * 0.16f, hs * 1.6f, grade, alpha);
+    }
+    if (t > 0.65f && t < 1.45f) {
+        const float st = (t - 0.65f) / 0.8f;
+        const float sx = q0.x - hs + st * hs * 4.0f;
+        draw->PushClipRect(q0, q1, true);
+        const ImU32 cw = IM_COL32(255, 248, 225, a(150));
+        draw->AddQuadFilled({sx, q0.y}, {sx + hs * 0.35f, q0.y}, {sx - hs * 0.25f, q1.y},
+                            {sx - hs * 0.6f, q1.y}, cw);
+        draw->PopClipRect();
     }
     const float tx = ix + icon + pad, ty = iy + 6.0f * unit;
     float lx = tx;
@@ -1192,15 +1382,396 @@ void DrawToast(float unit) {
     const ImVec4 clip{x0, y0, x0 + w - pad, y0 + h};
     draw->AddText(font, big, {tx, ty + small + 10.0f * unit}, IM_COL32(245, 245, 247, a(255)),
                   toast.name.c_str(), nullptr, 0.0f, &clip);
+    if (!toast.detail.empty()) {
+        draw->AddText(font, small, {tx, ty + small + big + 16.0f * unit},
+                      IM_COL32(190, 192, 200, a(255)), toast.detail.c_str(), nullptr, 0.0f, &clip);
+    }
 }
 
+// ---------------------------------------------------------------- custom trophy (not PSN)
+// "Despertar en Yharnam": leaving Iosefka's Clinic for the first time. No verified guest
+// memory map/event-flag offsets for CUSA03173 are available here, so the trigger uses the
+// save data: a new save file/slot appearing (a new character is created in the clinic), then
+// kCustomPlaySeconds of play time (persisted across runs) — about the time it takes to wake
+// up, go through the clinic and walk out into Central Yharnam.
+constexpr const char* kCustomName = "Despertar en Yharnam";
+constexpr const char* kCustomDetail =
+    "Sal de la Clínica de Iosefka por primera vez y comienza la cacería.";
+constexpr int kCustomPlaySeconds = 420;
+struct CustomState {
+    bool armed = false, unlocked = false;
+    int seconds = 0;
+    u64 stamp = 0;
+};
+std::mutex g_custom_mtx;
+std::filesystem::path CustomJson() {
+    return Common::FS::GetUserPath(Common::FS::PathType::TrophyDir) / "custom_trophies.json";
+}
+CustomState ReadCustom() {
+    CustomState s;
+    std::ifstream f(CustomJson(), std::ios::binary);
+    if (!f) {
+        return s;
+    }
+    std::string j((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const auto num = [&](const char* k) -> u64 {
+        const auto p = j.find(k);
+        if (p == std::string::npos) {
+            return 0;
+        }
+        const auto c = j.find(':', p);
+        return c == std::string::npos ? 0 : std::strtoull(j.c_str() + c + 1, nullptr, 10);
+    };
+    const auto flag = [&](const char* k) {
+        const auto p = j.find(k);
+        if (p == std::string::npos) {
+            return false;
+        }
+        const auto c = j.find(':', p);
+        return c != std::string::npos && j.find("true", c) == j.find_first_not_of(" \t", c + 1);
+    };
+    s.unlocked = flag("\"unlocked\"");
+    s.armed = flag("\"armed\"");
+    s.seconds = static_cast<int>(num("\"play_seconds\""));
+    s.stamp = num("\"timestamp\"");
+    return s;
+}
+void WriteCustom(const CustomState& s) {
+    std::scoped_lock lk{g_custom_mtx};
+    std::error_code ec;
+    const auto p = CustomJson();
+    std::filesystem::create_directories(p.parent_path(), ec);
+    std::string date;
+    if (s.stamp != 0) {
+        std::time_t t = static_cast<std::time_t>(s.stamp);
+        std::tm tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
+        char buf[64];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+        date = buf;
+    }
+    const std::string j = fmt::format(
+        "{{\n  \"despertar_en_yharnam\": {{\n    \"name\": \"{}\",\n    \"grade\": \"B\",\n"
+        "    \"unlocked\": {},\n    \"timestamp\": {},\n    \"date\": \"{}\",\n"
+        "    \"armed\": {},\n    \"play_seconds\": {}\n  }}\n}}\n",
+        kCustomName, s.unlocked ? "true" : "false", s.stamp, date, s.armed ? "true" : "false",
+        s.seconds);
+    const auto tmp = std::filesystem::path(p).concat(".tmp");
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f << j;
+    }
+    std::filesystem::rename(tmp, p, ec);
+}
+std::atomic<bool> g_custom_changed{false};
+// every file under the save data folders (home/<user>/savedata/...), without sce_sys
+std::vector<std::string> ScanSaves() {
+    std::vector<std::string> out;
+    std::error_code ec;
+    const auto home = EmulatorSettings.GetHomeDir();
+    for (auto it = std::filesystem::recursive_directory_iterator(
+             home, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (it.depth() > 6) {
+            it.disable_recursion_pending();
+            continue;
+        }
+        const auto name = it->path().filename().string();
+        if (it->is_directory(ec)) {
+            if (name == "sce_sys" || name == "trophy") {
+                it.disable_recursion_pending();
+            }
+            continue;
+        }
+        const std::string s = it->path().generic_string();
+        if (s.find("/savedata/") != std::string::npos) {
+            out.push_back(s);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+void UnlockCustom(CustomState& s);
+void CustomWatcher() {
+    CustomState s = ReadCustom();
+    if (s.unlocked) {
+        return;
+    }
+    if (const char* v = std::getenv("BB_CUSTOM_TROPHY_TEST"); v != nullptr && v[0] == '1') {
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+        UnlockCustom(s);
+        return;
+    }
+    auto known = ScanSaves();
+    LOG_INFO(Frontend, "[bb-trophy] custom '{}': watching {} save files (armed {}, {} s)",
+             kCustomName, known.size(), s.armed, s.seconds);
+    int since_write = 0;
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (!s.armed) {
+            const auto now = ScanSaves();
+            std::vector<std::string> added;
+            std::set_difference(now.begin(), now.end(), known.begin(), known.end(),
+                                std::back_inserter(added));
+            if (!added.empty()) {
+                s.armed = true;
+                s.seconds = 0;
+                WriteCustom(s);
+                LOG_INFO(Frontend, "[bb-trophy] custom: new save data ({}): armed", added[0]);
+            }
+            known = now;
+            continue;
+        }
+        s.seconds += 5;
+        since_write += 5;
+        if (s.seconds >= kCustomPlaySeconds) {
+            UnlockCustom(s);
+            return;
+        }
+        if (since_write >= 30) {
+            since_write = 0;
+            WriteCustom(s);
+        }
+    }
+}
+
+void UnlockCustom(CustomState& s) {
+    s.unlocked = true;
+    s.stamp = static_cast<u64>(std::time(nullptr));
+    WriteCustom(s);
+    LOG_INFO(Frontend, "[bb-trophy] custom trophy unlocked: {}", kCustomName);
+    g_custom_changed = true;
+    if (const char* v = std::getenv("BB_TROPHY_POPUP"); v != nullptr && v[0] == '0') {
+        return;
+    }
+    std::scoped_lock lk{g_toast_mtx};
+    Toast t;
+    t.name = kCustomName;
+    t.grade = 'B';
+    t.detail = kCustomDetail;
+    t.custom = true;
+    g_toasts.push_back(std::move(t));
+}
+void AddCustomTrophy() {
+    const CustomState s = ReadCustom();
+    Trophy t;
+    t.id = -100;
+    t.grade = 'B';
+    t.custom = true;
+    t.earned = s.unlocked;
+    t.stamp = s.stamp;
+    t.name = kCustomName;
+    t.detail = kCustomDetail;
+    g_trophies.push_back(std::move(t));
+}
+
+// ---------------------------------------------------------------- Opciones: launcher.ini
+// <exe dir>/launcher.ini, plain key=value lines; we only touch inicio_directo=0|1 and keep
+// every other byte (encoding, BOM, line endings) as it was. Written atomically.
+std::filesystem::path LauncherIni() {
+    const char* base = SDL_GetBasePath();
+    std::filesystem::path p = base != nullptr ? std::filesystem::path(base) : ".";
+    return p / "launcher.ini";
+}
+struct IniText {
+    int unit = 1;          // 1 = UTF-8/ANSI bytes, 2 = UTF-16LE, 3 = UTF-16BE
+    std::string bom;       // raw BOM bytes, kept as they were
+    std::vector<u32> cu;   // code units after the BOM
+};
+bool ReadIni(const std::filesystem::path& p, IniText& out) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto at = [&](size_t i) { return static_cast<unsigned char>(b[i]); };
+    size_t s = 0;
+    if (b.size() >= 2 && at(0) == 0xFF && at(1) == 0xFE) {
+        out.unit = 2, s = 2;
+    } else if (b.size() >= 2 && at(0) == 0xFE && at(1) == 0xFF) {
+        out.unit = 3, s = 2;
+    } else if (b.size() >= 3 && at(0) == 0xEF && at(1) == 0xBB && at(2) == 0xBF) {
+        s = 3;
+    }
+    out.bom = b.substr(0, s);
+    out.cu.clear();
+    if (out.unit == 1) {
+        for (size_t i = s; i < b.size(); i++) {
+            out.cu.push_back(at(i));
+        }
+    } else {
+        for (size_t i = s; i + 1 < b.size(); i += 2) {
+            out.cu.push_back(out.unit == 2 ? (at(i) | (at(i + 1) << 8)) : ((at(i) << 8) | at(i + 1)));
+        }
+        if ((b.size() - s) % 2 != 0) {
+            out.cu.push_back(0x10000u | at(b.size() - 1)); // stray byte: kept raw
+        }
+    }
+    return true;
+}
+std::string IniBytes(const IniText& t) {
+    std::string b = t.bom;
+    for (u32 c : t.cu) {
+        if (c & 0x10000u) {
+            b.push_back(static_cast<char>(c & 0xFF));
+        } else if (t.unit == 1) {
+            b.push_back(static_cast<char>(c));
+        } else if (t.unit == 2) {
+            b.push_back(static_cast<char>(c & 0xFF)), b.push_back(static_cast<char>(c >> 8));
+        } else {
+            b.push_back(static_cast<char>(c >> 8)), b.push_back(static_cast<char>(c & 0xFF));
+        }
+    }
+    return b;
+}
+// the line [begin, end) (end before its terminator) of the key, or false
+bool FindIniKey(const IniText& t, const char* key, size_t& lb, size_t& le) {
+    const size_t n = t.cu.size();
+    size_t i = 0;
+    while (i <= n) {
+        size_t e = i;
+        while (e < n && t.cu[e] != '\n' && t.cu[e] != '\r') {
+            e++;
+        }
+        size_t k = i;
+        while (k < e && (t.cu[k] == ' ' || t.cu[k] == '\t')) {
+            k++;
+        }
+        size_t q = k;
+        bool ok = true;
+        for (const char* c = key; *c; c++, q++) {
+            if (q >= e || std::tolower(static_cast<int>(t.cu[q] & 0x7F)) != *c || t.cu[q] > 0x7F) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            while (q < e && (t.cu[q] == ' ' || t.cu[q] == '\t')) {
+                q++;
+            }
+            if (q < e && t.cu[q] == '=') {
+                lb = i, le = e;
+                return true;
+            }
+        }
+        if (e >= n) {
+            break;
+        }
+        i = e + ((t.cu[e] == '\r' && e + 1 < n && t.cu[e + 1] == '\n') ? 2 : 1);
+    }
+    return false;
+}
+struct DirectState {
+    bool exists = false;
+    bool on = false;
+    std::string error;
+} g_direct;
+void ReadDirect() {
+    g_direct = {};
+    IniText t;
+    const auto p = LauncherIni();
+    if (!std::filesystem::exists(p) || !ReadIni(p, t)) {
+        return;
+    }
+    g_direct.exists = true;
+    size_t lb, le;
+    if (FindIniKey(t, "inicio_directo", lb, le)) {
+        size_t q = lb;
+        while (q < le && t.cu[q] != '=') {
+            q++;
+        }
+        q++;
+        while (q < le && (t.cu[q] == ' ' || t.cu[q] == '\t')) {
+            q++;
+        }
+        g_direct.on = q < le && t.cu[q] == '1';
+    }
+}
+bool WriteDirect(bool on) {
+    const auto p = LauncherIni();
+    IniText t;
+    if (!ReadIni(p, t)) {
+        g_direct.error = "No se pudo leer launcher.ini";
+        return false;
+    }
+    const std::string line = std::string("inicio_directo=") + (on ? "1" : "0");
+    std::vector<u32> nl(line.begin(), line.end());
+    size_t lb, le;
+    if (FindIniKey(t, "inicio_directo", lb, le)) {
+        t.cu.erase(t.cu.begin() + lb, t.cu.begin() + le);
+        t.cu.insert(t.cu.begin() + lb, nl.begin(), nl.end());
+    } else {
+        // the file's own line ending (CRLF if it has any)
+        bool crlf = false, cr_only = false;
+        for (size_t i = 0; i < t.cu.size(); i++) {
+            if (t.cu[i] == '\r') {
+                if (i + 1 < t.cu.size() && t.cu[i + 1] == '\n') {
+                    crlf = true;
+                } else {
+                    cr_only = true;
+                }
+                break;
+            }
+            if (t.cu[i] == '\n') {
+                break;
+            }
+        }
+        std::vector<u32> eol = crlf ? std::vector<u32>{'\r', '\n'}
+                               : cr_only ? std::vector<u32>{'\r'}
+                                         : std::vector<u32>{'\n'};
+#ifdef _WIN32
+        if (t.cu.empty()) {
+            eol = {'\r', '\n'};
+        }
+#endif
+        if (!t.cu.empty() && t.cu.back() != '\n' && t.cu.back() != '\r') {
+            t.cu.insert(t.cu.end(), eol.begin(), eol.end());
+        }
+        t.cu.insert(t.cu.end(), nl.begin(), nl.end());
+        t.cu.insert(t.cu.end(), eol.begin(), eol.end());
+    }
+    const auto tmp = std::filesystem::path(p).concat(".tmp");
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        const std::string b = IniBytes(t);
+        f.write(b.data(), static_cast<std::streamsize>(b.size()));
+        f.flush();
+        if (!f) {
+            g_direct.error = "No se pudo escribir launcher.ini";
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, p, ec); // MoveFileEx(REPLACE_EXISTING) on Windows
+    if (ec) {
+        g_direct.error = "No se pudo reemplazar launcher.ini: " + ec.message();
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    g_direct.error.clear();
+    LOG_INFO(Frontend, "[bb-menu] launcher.ini: inicio_directo={}", on ? 1 : 0);
+    return true;
+}
+
+
 // ---------------------------------------------------------------- the layer
+constexpr int kTabs = 5;
 class MenuLayer final : public ImGui::Layer {
 public:
     int tab = 0;
     int want_tab = -1;
     bool was_open = false;
     bool confirm_exit = false;
+    float anim = 0.0f;       // open/close 0..1
+    double tab_t = 0;        // tab switch time (content cross-fade)
+    float ul_x0 = 0, ul_x1 = 0; // sliding tab underline
+    bool ul_init = false;
 
     // 1.11 (bb-fgfix-111): the default (true) made ImGui::Core::MustKeepDrawing() always true,
     // so the video-out thread re-presented the last frame (DrawLastFrame) on every vblank tick
@@ -1217,34 +1788,63 @@ public:
         const ImVec2 disp = ImGui::GetIO().DisplaySize;
         const float unit = std::max(disp.y / 1440.0f, 0.5f);
         DrawToast(std::max(disp.y / 1080.0f, 0.5f));
-        if (!g_open) {
+        const float dt = ImGui::GetIO().DeltaTime;
+        anim = std::clamp(anim + (g_open ? dt : -dt) / 0.20f, 0.0f, 1.0f);
+        if (!g_open && anim <= 0.0f) {
             was_open = false;
             return;
         }
-        if (!was_open) {
+        const bool closing = !g_open;
+        if (g_open && !was_open) {
             was_open = true;
             g_cfg.Load();
             LoadTrophies();
+            ReadDirect();
             confirm_exit = false;
+            tab_t = ImGui::GetTime();
+            g_trophy_page_t = tab_t;
+            g_trophy_bar = 0.0f;
+            ul_init = false;
             ImGui::SetNextWindowFocus();
         }
-        ApplyCapture();
+        if (g_custom_changed.exchange(false)) {
+            LoadTrophies();
+        }
+        const float e = g_open ? EaseOut(anim) : EaseInOut(anim);
+        if (!closing) {
+            ApplyCapture();
+        }
         bool capturing;
         {
             std::scoped_lock lk{g_cap_mtx};
             capturing = g_capture != Capture::None;
         }
-        // dim the game
-        ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, disp, IM_COL32(0, 0, 0, 150));
-        const ImVec2 size{disp.x * 0.86f, disp.y * 0.86f};
-        ImGui::SetNextWindowPos({disp.x * 0.5f, disp.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+        // dim the game (fades with the menu) and a vignette in place of a blur
+        auto* bg = ImGui::GetBackgroundDrawList();
+        bg->AddRectFilled({0, 0}, disp, IM_COL32(4, 3, 6, static_cast<int>(165 * e)));
+        const ImU32 vin = IM_COL32(0, 0, 0, static_cast<int>(120 * e)), clr = IM_COL32(0, 0, 0, 0);
+        bg->AddRectFilledMultiColor({0, 0}, {disp.x, disp.y * 0.25f}, vin, vin, clr, clr);
+        bg->AddRectFilledMultiColor({0, disp.y * 0.75f}, disp, clr, clr, vin, vin);
+        const float sc = 0.94f + 0.06f * e;
+        const ImVec2 size{disp.x * 0.86f * sc, disp.y * 0.86f * sc};
+        const ImVec2 center{disp.x * 0.5f, disp.y * 0.5f + (1.0f - e) * 40.0f * unit};
+        // soft shadow under the panel
+        for (int i = 1; i <= 4; i++) {
+            const float g = static_cast<float>(i) * 10.0f * unit;
+            bg->AddRectFilled({center.x - size.x * 0.5f - g, center.y - size.y * 0.5f - g + 12 * unit},
+                              {center.x + size.x * 0.5f + g, center.y + size.y * 0.5f + g + 12 * unit},
+                              IM_COL32(0, 0, 0, static_cast<int>(28 * e)), 14 * unit + g);
+        }
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, {0.5f, 0.5f});
         ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, e);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14 * unit);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {28 * unit, 22 * unit});
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {14 * unit, 8 * unit});
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {14 * unit, 10 * unit});
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8 * unit);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.07f, 0.07f, 0.09f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.05f, 0.06f, 0.97f));
         ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.93f, 0.78f, 0.47f, 0.35f));
         ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.16f, 0.15f, 0.14f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_TabSelected, ImVec4(0.45f, 0.36f, 0.20f, 1.0f));
@@ -1256,19 +1856,35 @@ public:
         ImGui::PushStyleColor(ImGuiCol_NavCursor, kGold);
         if (ImGui::Begin("Menú (F1)##bbmenu", nullptr,
                          ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                             ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings)) {
+                             ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
+                             (closing ? ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav : 0))) {
+            {
+                // gothic trim: a gold rule under the title and corner filigree
+                auto* wd = ImGui::GetWindowDrawList();
+                const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+                const ImU32 gold = IM_COL32(236, 200, 120, static_cast<int>(150 * e));
+                const float c = 26 * unit, o = 8 * unit;
+                const ImVec2 cs[4] = {{wp.x + o, wp.y + o}, {wp.x + ws.x - o, wp.y + o},
+                                      {wp.x + o, wp.y + ws.y - o}, {wp.x + ws.x - o, wp.y + ws.y - o}};
+                for (int k = 0; k < 4; k++) {
+                    const float sx = (k & 1) ? -1.0f : 1.0f, sy = (k & 2) ? -1.0f : 1.0f;
+                    wd->AddLine(cs[k], {cs[k].x + sx * c, cs[k].y}, gold, 1.5f);
+                    wd->AddLine(cs[k], {cs[k].x, cs[k].y + sy * c}, gold, 1.5f);
+                    wd->AddCircleFilled({cs[k].x + sx * 5 * unit, cs[k].y + sy * 5 * unit}, 2.0f * unit, gold);
+                }
+            }
             ImGui::SetWindowFontScale(std::max(1.0f, disp.y / 1440.0f * 1.6f));
             ImGui::TextColored(kGold, "BLOODBORNE  ·  MENÚ");
             ImGui::SameLine();
             ImGui::TextColored(kDim,
                                "   F1 / ○: volver al juego    L1 / R1: cambiar de pestaña");
             // L1 / R1 change tabs (not while rebinding)
-            if (!capturing && !confirm_exit) {
+            if (!capturing && !confirm_exit && !closing) {
                 if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) {
-                    want_tab = (tab + 3) % 4;
+                    want_tab = (tab + kTabs - 1) % kTabs;
                 }
                 if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) {
-                    want_tab = (tab + 1) % 4;
+                    want_tab = (tab + 1) % kTabs;
                 }
                 if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
                     ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -1277,25 +1893,55 @@ public:
                 }
             }
             if (ImGui::BeginTabBar("##tabs")) {
-                const char* names[] = {"Mando", "Teclado y ratón", "Trofeos", "Salir del juego"};
-                for (int i = 0; i < 4; i++) {
+                const char* names[kTabs] = {"Mando", "Teclado y ratón", "Trofeos", "Opciones",
+                                            "Salir del juego"};
+                float sel_x0 = ul_x0, sel_x1 = ul_x1, sel_y = 0;
+                for (int i = 0; i < kTabs; i++) {
                     ImGuiTabItemFlags f = want_tab == i ? ImGuiTabItemFlags_SetSelected : 0;
-                    if (ImGui::BeginTabItem(names[i], nullptr, f)) {
+                    const bool open_tab = ImGui::BeginTabItem(names[i], nullptr, f);
+                    if (open_tab) {
+                        sel_x0 = ImGui::GetItemRectMin().x;
+                        sel_x1 = ImGui::GetItemRectMax().x;
+                        sel_y = ImGui::GetItemRectMax().y;
                         if (tab != i) {
                             g_selected.clear();
                             std::scoped_lock lk{g_cap_mtx};
                             g_capture = Capture::None;
+                            tab_t = ImGui::GetTime();
+                            if (i == 2) {
+                                g_trophy_page_t = tab_t;
+                                g_trophy_bar = 0.0f;
+                            }
                         }
                         tab = i;
+                        // sliding gold underline
+                        if (!ul_init) {
+                            ul_x0 = sel_x0, ul_x1 = sel_x1, ul_init = true;
+                        }
+                        const float k = std::min(1.0f, dt * 14.0f);
+                        ul_x0 += (sel_x0 - ul_x0) * k;
+                        ul_x1 += (sel_x1 - ul_x1) * k;
+                        auto* wd = ImGui::GetWindowDrawList();
+                        wd->AddRectFilled({ul_x0 - 4 * unit, sel_y - 3 * unit}, {ul_x1 + 4 * unit, sel_y + 5 * unit},
+                                          IM_COL32(236, 196, 110, static_cast<int>(40 * e)), 4 * unit);
+                        wd->AddRectFilled({ul_x0, sel_y - 1 * unit}, {ul_x1, sel_y + 3 * unit},
+                                          IM_COL32(236, 200, 120, static_cast<int>(255 * e)), 2 * unit);
+                        // content cross-fade + slight rise
+                        const float ce = EaseOut(static_cast<float>(ImGui::GetTime() - tab_t) / 0.22f);
+                        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, e * (0.0f + ce));
+                        ImGui::Dummy({0, (1.0f - ce) * 14 * unit});
                         ImGui::Spacing();
                         switch (i) {
                         case 0: PadPage(unit); break;
                         case 1: KbmPage(unit); break;
                         case 2: TrophyPage(unit); break;
+                        case 3: OptionsPage(unit); break;
                         default: ExitPage(unit); break;
                         }
+                        ImGui::PopStyleVar();
                         ImGui::EndTabItem();
                     }
+                    ItemGlow(4 * unit);
                 }
                 want_tab = -1;
                 ImGui::EndTabBar();
@@ -1303,7 +1949,38 @@ public:
         }
         ImGui::End();
         ImGui::PopStyleColor(10);
-        ImGui::PopStyleVar(5);
+        ImGui::PopStyleVar(7);
+    }
+
+    void OptionsPage(float unit) {
+        ImGui::TextColored(kGold, "Inicio");
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::BeginDisabled(!g_direct.exists);
+        bool on = g_direct.on;
+        if (ImGui::Checkbox("Iniciar directamente (sin pasar por el launcher)", &on)) {
+            if (WriteDirect(on)) {
+                g_direct.on = on;
+            }
+        }
+        ItemGlow(4 * unit);
+        ImGui::EndDisabled();
+        ImGui::Indent(40 * unit);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 1500 * unit);
+        ImGui::TextColored(kDim, "Si está activado, la próxima vez que abras el launcher el juego "
+                                 "se inicia directamente con los ajustes guardados actuales. "
+                                 "Mantén pulsada la tecla Mayús (Shift) al abrir el launcher para "
+                                 "volver a verlo.");
+        if (!g_direct.exists) {
+            ImGui::TextColored(kWarn, "No se encontró launcher.ini junto a shadPS4.exe (%s). Abre "
+                                      "el juego una vez desde el launcher para crearlo.",
+                               LauncherIni().string().c_str());
+        }
+        if (!g_direct.error.empty()) {
+            ImGui::TextColored(kWarn, "%s", g_direct.error.c_str());
+        }
+        ImGui::PopTextWrapPos();
+        ImGui::Unindent(40 * unit);
     }
 
     void ExitPage(float unit) {
@@ -1311,20 +1988,20 @@ public:
                            "Bloodborne guarda solo, espera a que no se vea el icono de guardado.");
         ImGui::Spacing();
         if (!confirm_exit) {
-            if (ImGui::Button("Salir del juego", {360 * unit, 70 * unit})) {
+            if (FancyButton("Salir del juego", {360 * unit, 70 * unit})) {
                 confirm_exit = true;
             }
             return;
         }
         ImGui::TextColored(kWarn, "¿Seguro que quieres salir del juego?");
-        if (ImGui::Button("Sí, salir", {300 * unit, 70 * unit})) {
+        if (FancyButton("Sí, salir", {300 * unit, 70 * unit})) {
             LOG_INFO(Frontend, "[bb-menu] Salir del juego: closing the emulator");
             SDL_Event e{};
             e.type = SDL_EVENT_QUIT;
             SDL_PushEvent(&e);
         }
         ImGui::SameLine();
-        if (ImGui::Button("No, volver", {300 * unit, 70 * unit})) {
+        if (FancyButton("No, volver", {300 * unit, 70 * unit})) {
             confirm_exit = false;
         }
     }
@@ -1342,6 +2019,7 @@ void Init(SDL_Window* window) {
     g_window = window;
     g_wake_event = SDL_RegisterEvents(1);
     ImGui::Layer::AddLayer(&g_layer);
+    std::thread(CustomWatcher).detach();
 }
 
 bool IsOpen() {
