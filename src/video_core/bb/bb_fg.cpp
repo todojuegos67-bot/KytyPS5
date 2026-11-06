@@ -20,6 +20,10 @@
 #include <thread>
 #include <vector>
 #include "video_core/bb/bb_antilag.h"
+
+// bb-hitch-098: counters kept by the buffer cache / pipeline cache.
+extern std::atomic<uint32_t> bb_hitch_resident_binds;
+extern std::atomic<uint32_t> bb_hitch_shader_compiles;
 #include "video_core/bb/bb_display.h"
 #include "video_core/bb/bb_dyn_multiplier.h"
 #include "video_core/bb/bb_fg.h"
@@ -2383,7 +2387,8 @@ void AfterPresent() {
             }
             if (lines < 6) {
                 ++lines;
-                Printf("[hitch] the present call blocked %.1f ms (frame %u, Streamline status 0x%x)",
+                Printf("[hitch] cause=present-block: the present call blocked %.1f ms (frame %u, "
+                       "Streamline status 0x%x; DLSS-G / driver present queue, not the game)",
                        ms, g_frame_index, g_last_status);
             }
         }
@@ -2459,20 +2464,50 @@ void AfterPresent() {
             const auto span = [](uint64_t a, uint64_t b) {
                 return a != 0 && b >= a ? static_cast<double>(b - a) / 1000.0 : -1.0;
             };
+            // bb-hitch-098: compiles / sparse binds since the last report poll, for the cause tag.
+            static uint32_t seen_compiles = 0, seen_binds = 0;
+            const uint32_t now_compiles = bb_hitch_shader_compiles.load(std::memory_order_relaxed);
+            const uint32_t now_binds = bb_hitch_resident_binds.load(std::memory_order_relaxed);
+            const uint32_t poll_compiles = now_compiles - seen_compiles;
+            const uint32_t poll_binds = now_binds - seen_binds;
+            seen_compiles = now_compiles;
+            seen_binds = now_binds;
+            static uint32_t skipped_ids = 0;
             for (const auto* f : order) {
                 if (f->frameID <= hitch_last_id) continue;
-                const double gap = hitch_last_end != 0 && f->gpuRenderEndTime > hitch_last_end
-                                       ? static_cast<double>(f->gpuRenderEndTime - hitch_last_end) / 1000.0
-                                       : 0.0;
+                const uint64_t id_step = hitch_last_id != 0 ? f->frameID - hitch_last_id : 1;
+                double gap = hitch_last_end != 0 && f->gpuRenderEndTime > hitch_last_end
+                                 ? static_cast<double>(f->gpuRenderEndTime - hitch_last_end) / 1000.0
+                                 : 0.0;
                 hitch_last_id = f->frameID;
                 hitch_last_end = f->gpuRenderEndTime;
+                // bb-hitch-098: the 11-06 runs flagged a "33 ms" hitch on every frame id = 1 mod
+                // 128 while the presents of that second were all within 17.3 ms: the frame before
+                // it is missing from the Reflex report, so the gap covered two frames. A gap over
+                // skipped ids is now taken minus one pacer step per skipped id.
+                if (id_step > 1 && id_step < 16 && gap > 0.0) {
+                    const double step_ms = PacerIntervalMs() > 0.0 ? PacerIntervalMs() : 16.67;
+                    gap -= static_cast<double>(id_step - 1) * step_ms;
+                    ++skipped_ids;
+                }
                 if (gap > 25.0 && gap < 500.0 && hitch_lines < 12) {
                     ++hitch_lines;
-                    Printf("[hitch] frame %llu: %.1f ms after the previous real frame at the GPU | "
+                    const double game = span(f->simStartTime, f->renderSubmitEndTime);
+                    const double call = span(f->presentStartTime, f->presentEndTime);
+                    const double gpu = static_cast<double>(f->gpuActiveRenderTimeUs) / 1000.0;
+                    const char* cause = "os-queue/pacing";
+                    if (game <= 0.0 && gpu < 3.0) cause = "no-markers (loading screen)";
+                    else if (call > 8.0) cause = "present-block";
+                    else if (game > 0.6 * gap && poll_compiles > 0) cause = "shader-compile";
+                    else if (game > 0.6 * gap && poll_binds > 0) cause = "buffer-residency";
+                    else if (gpu > 0.6 * gap) cause = "gpu-bound";
+                    else if (game > 0.6 * gap) cause = "game/cpu";
+                    Printf("[hitch] cause=%s frame %llu: %.1f ms after the previous real frame at the GPU | "
                            "game %.1f ms (simulation start to render submit end), submit end to "
                            "present start %.1f, present call %.1f, driver %.1f, OS queue %.1f, "
-                           "queue to GPU start %.1f, GPU %.1f ms (active %.1f)",
-                           static_cast<unsigned long long>(f->frameID), gap,
+                           "queue to GPU start %.1f, GPU %.1f ms (active %.1f) | since the last report: "
+                           "%u shader compiles, %u sparse binds; id step %llu, skipped ids %u",
+                           cause, static_cast<unsigned long long>(f->frameID), gap,
                            span(f->simStartTime, f->renderSubmitEndTime),
                            span(f->renderSubmitEndTime, f->presentStartTime),
                            span(f->presentStartTime, f->presentEndTime),
@@ -2480,7 +2515,8 @@ void AfterPresent() {
                            span(f->osRenderQueueStartTime, f->osRenderQueueEndTime),
                            span(f->osRenderQueueEndTime, f->gpuRenderStartTime),
                            span(f->gpuRenderStartTime, f->gpuRenderEndTime),
-                           static_cast<double>(f->gpuActiveRenderTimeUs) / 1000.0);
+                           static_cast<double>(f->gpuActiveRenderTimeUs) / 1000.0, poll_compiles,
+                           poll_binds, static_cast<unsigned long long>(id_step), skipped_ids);
                 }
             }
         }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <ranges>
 
 #include "common/hash.h"
@@ -633,11 +634,17 @@ bool PipelineCache::RefreshComputeKey() {
     return true;
 }
 
+} // namespace Vulkan
+// bb-hitch-098: shader modules translated since start (read by the [hitch] lines).
+std::atomic<uint32_t> bb_hitch_shader_compiles{0};
+namespace Vulkan {
+
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
+    bb_hitch_shader_compiles.fetch_add(1, std::memory_order_relaxed);
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
