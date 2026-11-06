@@ -35,6 +35,7 @@
 #include <mutex>
 #include "common/logging/log.h"
 #include "imgui/bb_menu.h"
+#include "input/controller.h"
 #include "input/input_mouse.h"
 #include "SDL3/SDL.h"
 
