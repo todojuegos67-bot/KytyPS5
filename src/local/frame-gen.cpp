@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 #ifndef NOMINMAX
