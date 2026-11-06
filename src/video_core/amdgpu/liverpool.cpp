@@ -128,6 +128,11 @@ void Liverpool::Process(std::stop_token stoken) {
         // bb-dlss5perf-106: rounds over all queues in which every resume only re-polled a wait.
         u32 idle_rounds = 0;
         bool round_progress = false;
+        // bb-crash-119: sleeping back-off is opt-in (BB_CP_SLEEP=1); default yields only.
+        static const bool bb_cp_sleep_enabled = [] {
+            const char* v = std::getenv("BB_CP_SLEEP");
+            return v && v[0] == '1';
+        }();
 
         while (num_submits || num_commands) {
             ProcessCommands();
@@ -140,12 +145,12 @@ void Liverpool::Process(std::stop_token stoken) {
                 // execution, only less CPU burnt and no SMT sibling starved.
                 idle_rounds = round_progress ? 0 : idle_rounds + 1;
                 round_progress = false;
-                if (idle_rounds > 4096) {
+                if (idle_rounds > 4096 && bb_cp_sleep_enabled) {
                     g_bb_cp_backoffs.fetch_add(1, std::memory_order_relaxed);
                     std::unique_lock lk{submit_mutex};
                     submit_cv.wait_for(lk, std::chrono::microseconds(100),
                                        [this, &stoken] { return num_commands != 0 || stoken.stop_requested(); });
-                } else if (idle_rounds > 64) {
+                } else if (idle_rounds > 64) {  // yield
                     std::this_thread::yield();
                 }
             }

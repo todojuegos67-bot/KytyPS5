@@ -231,7 +231,7 @@ KAFFINITY BBBigCacheMask(WORD& group) {
 void BBTuneThread(const std::string& n) {
     if (!BBHotThread(n)) return;
     // The GPU command processor feeds the host GPU: above normal (BB_THREAD_PRIO=0: as before).
-    if (n.find("GpuCommandProcessor") != std::string::npos && BBEnvOn("BB_THREAD_PRIO", true)) {
+    if (n.find("GpuCommandProcessor") != std::string::npos && BBEnvOn("BB_THREAD_PRIO", false)) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
     // BB_AFFINITY=1 (default off): the hot threads prefer the big-L3 CCD (ideal processor plus a
@@ -308,8 +308,17 @@ void SetCurrentThreadName(const char* name) {
         Libraries::Kernel::g_curthread->name = name;
     }
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
-    BBRegisterThread(name);
-    BBTuneThread(name);
+    // bb-crash-119: only emulator threads are registered / tuned by default; guest threads (e.g.
+    // HavokWorkerThread) are left untouched unless BB_PERF=2.
+    const std::string bb_n{name ? name : ""};
+    const char* bb_perf = std::getenv("BB_PERF");
+    const bool bb_emu = bb_n.rfind("shadPS4:", 0) == 0 || BBHotThread(bb_n);
+    if (bb_emu || (bb_perf && bb_perf[0] == '2')) {
+        BBRegisterThread(name);
+    }
+    if (bb_emu) {
+        BBTuneThread(bb_n);
+    }
 }
 
 void SetThreadName(void* thread, const char* name) {
