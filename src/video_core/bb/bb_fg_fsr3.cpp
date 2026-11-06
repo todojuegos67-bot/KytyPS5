@@ -95,6 +95,7 @@ std::chrono::steady_clock::time_point g_last_real{};
 struct Stats {
     std::chrono::steady_clock::time_point start{};
     uint32_t real = 0, generated_on = 0, no_inputs = 0, hudless = 0, slotted = 0;
+    uint32_t hudless_mismatch = 0, hudless_none = 0; // 1.03
     uint64_t presents_at_start = 0;
     double pace_n = 0, pace_sum = 0, pace_sq = 0, pace_max = 0; // real present intervals (s)
     double prepare_ms = 0, present_ms = 0, max_present_ms = 0;
@@ -926,6 +927,12 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                g_stats.real != 0 ? g_stats.prepare_ms / g_stats.real : 0.0,
                g_stats.real != 0 ? g_stats.present_ms / g_stats.real : 0.0, g_stats.max_present_ms,
                g_stats.hudless);
+        Printf("[fsr3-ui] HUD-less image given %u, refused (size/format != backbuffer) %u, none "
+               "captured %u: generated frames %s",
+               g_stats.hudless, g_stats.hudless_mismatch, g_stats.hudless_none,
+               g_stats.hudless_mismatch + g_stats.hudless_none == 0
+                   ? "reuse the real HUD"
+                   : "warp the HUD in frames without a HUD-less image");
         if (g_stats.pace_n >= 10.0) {
             const double mean = g_stats.pace_sum / g_stats.pace_n;
             const double sd =
@@ -1026,7 +1033,10 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     if (hudless) {
         config.HUDLessColor = ImageResource(inputs->hudless, false);
         ++g_stats.hudless;
+    } else if (generate && !inputs->has_hudless) {
+        ++g_stats.hudless_none;
     } else if (generate && inputs->has_hudless) {
+        ++g_stats.hudless_mismatch;
         static bool said = false;
         if (!said) {
             said = true;

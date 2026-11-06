@@ -86,6 +86,12 @@ struct State {
     u64 st_motion_draws = 0, st_tracked = 0, st_loaded = 0, st_overflow = 0, st_gated = 0,
         st_frames = 0, st_composed = 0, st_composed_late = 0, st_overflow_large = 0;
     u32 st_overflow_max = 0; // largest dropped draw (positions)
+    u64 st_compacted = 0;    // 1.03: indexed draws stored for their index range only
+    // 1.03: per second, what reached the frame-generation input (NoteFgInput).
+    u64 fg_frames = 0, fg_with_objects = 0, fg_object_draws = 0;
+    u32 composed_draws = 0;  // draws with last frame's positions in the frame just composed
+    u32 loaded_frame = 0, loaded_last = 0; // the same, this frame / the frame the flip ended
+    std::unordered_map<u64, std::pair<u32, u32>> index_ranges; // cached [min, max] by index block
     u64 st_rigid_tracked = 0, st_rigid_static = 0, st_rigid_budget = 0, st_rigid_camera = 0;
 };
 State g;
@@ -381,6 +387,54 @@ void Attach(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
     }
 }
 
+namespace {
+struct Range {
+    bool valid = false;
+    u32 min = 0, max = 0;
+};
+// The [min, max] vertex index of an indexed draw, from the guest index buffer (cached per block:
+// address, count, type and a sample of its contents, so a rewritten block is scanned again).
+Range IndexRange(const AmdGpu::Regs& regs, u32 index_offset) {
+    static const bool on = [] {
+        const char* s = std::getenv("BB_OBJMV_INDEX_RANGE");
+        return s == nullptr || s[0] != '0';
+    }();
+    if (!on) return {};
+    const bool i16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 size = i16 ? 2u : 4u;
+    const VAddr base = regs.index_base_address.Address<VAddr>();
+    const u32 count = std::min(regs.num_indices, regs.max_index_size);
+    if (base == 0 || count == 0 || count > (16u << 20)) return {};
+    const VAddr addr = base + u64(index_offset) * size;
+    const u8* p = reinterpret_cast<const u8*>(addr);
+    const u64 bytes = u64(count) * size;
+    const u64 head = std::min<u64>(bytes, 256);
+    u64 key = Hash(p, head, addr ^ (u64(count) << 1) ^ size);
+    key = Hash(p + (bytes - head), head, key);
+    if (const auto it = g.index_ranges.find(key); it != g.index_ranges.end()) {
+        return {true, it->second.first, it->second.second};
+    }
+    u32 lo = ~0u, hi = 0;
+    const u32 restart = i16 ? 0xFFFFu : 0xFFFFFFFFu;
+    for (u32 i = 0; i < count; ++i) {
+        u32 v;
+        if (i16) {
+            u16 x;
+            std::memcpy(&x, p + size_t(i) * 2, 2);
+            v = x;
+        } else {
+            std::memcpy(&v, p + size_t(i) * 4, 4);
+        }
+        if (v == restart) continue;
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+    }
+    if (lo > hi) return {};
+    g.index_ranges[key] = {lo, hi};
+    return {true, lo, hi};
+}
+} // namespace
+
 void EnsureInit(const Vulkan::Instance& instance) {
     if (!g.tried && BB::Upscale::Enabled()) Init(instance);
 }
@@ -402,7 +456,22 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
     if (palette == Palette::None || fetch.Empty() || fetch.attributes.empty()) return;
     const auto vb = fetch.attributes[0].GetSharp(vs);
     if (vb.GetStride() == 0) return;
-    const u32 vertices = vb.num_records;
+    u32 vertices = vb.num_records;
+    // 1.03: an indexed draw only reaches the vertices its indices name. Skinned meshes share one
+    // large vertex buffer between many draws, and storing num_records positions per draw ran the
+    // per-frame budget out (the "over the budget ... large skeletons" lines): the draws that came
+    // last, often the player character, kept camera-only motion and judged in generated frames.
+    // Store [min index, max index] only (the slot base moves with it: entry[4]).
+    u32 range_first = 0;
+    if (indexed) {
+        if (const auto r = IndexRange(regs, index_offset); r.valid) {
+            if (r.max < vertices) {
+                range_first = r.min;
+                vertices = r.max - r.min + 1;
+                ++g.st_compacted;
+            }
+        }
+    }
     const u32 instances = regs.num_instances.NumInstances();
     if (vertices == 0 || vertices > kMaxVerticesPerDraw || instances > kMaxInstances ||
         u64(vertices) * instances > kMaxVerticesPerDraw) {
@@ -479,6 +548,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         load_base = it->second.base;
         flags |= 2;
         ++g.st_loaded;
+        ++g.loaded_frame;
     }
     g.cur[key] = {store_base, count};
     ++g.st_tracked;
@@ -490,7 +560,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
     entry[1] = load_base;
     entry[2] = vertices;
     entry[3] = flags;
-    entry[4] = vertex_offset;
+    entry[4] = vertex_offset + range_first;
     entry[5] = instance_offset;
     entry[6] = instances;
     entry[7] = 0;
@@ -503,6 +573,7 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     // `written`. The presenter's late upscale runs after the flip (OnFlip has already cleared
     // `written`), so it reads the flag that OnFlip latched for the frame it presents.
     const bool wrote = late ? g.latched : g.written;
+    g.composed_draws = 0;
     if (!g.ready || !wrote || reset || g.width != render.width || g.height != render.height) {
         return;
     }
@@ -533,6 +604,7 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
     ++g.st_composed;
     if (late) ++g.st_composed_late;
+    g.composed_draws = late ? g.loaded_last : g.loaded_frame;
 }
 
 void OnFlip() {
@@ -547,6 +619,9 @@ void OnFlip() {
     g.cleared = false;
     g.latched = g.written;
     g.written = false;
+    g.loaded_last = g.loaded_frame;
+    g.loaded_frame = 0;
+    if (g.index_ranges.size() > 65536) g.index_ranges.clear();
     if (g.palettes.size() > 65536) g.palettes.clear();
     if (g.rigid.size() > 65536) g.rigid.clear();
     g.rigid_camera_bound = g.rigid_seen >= 64 && g.rigid_changed * 2 > g.rigid_seen;
@@ -561,6 +636,10 @@ void OnFlip() {
                         g.st_frames, g.st_motion_draws, g.st_tracked, g.st_loaded, g.st_gated,
                         g.st_overflow, g.st_composed, g.st_composed_late, g.per_half,
                         g.st_overflow_large, g.st_overflow_max));
+        Log(fmt::format("1.03: {} indexed draws stored for their index range only (not the whole "
+                        "vertex buffer)",
+                        g.st_compacted));
+        g.st_compacted = 0;
         Log(fmt::format("rigid objects (BB_OBJMV_RIGID): last {} frames {} draws moved by their "
                         "own constants and got object vectors, {} unchanged (camera motion), {} "
                         "skipped (camera in the constants), {} over the rigid budget",
@@ -571,6 +650,10 @@ void OnFlip() {
             g.st_overflow = g.st_composed = g.st_composed_late = g.st_overflow_large = 0;
         g.st_overflow_max = 0;
     }
+}
+
+u32 ComposedDraws() {
+    return g.ready ? g.composed_draws : 0;
 }
 
 } // namespace BB::ObjMotion
