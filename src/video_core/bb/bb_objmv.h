@@ -84,5 +84,8 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
              bool reset, bool late);
 // The guest flip (end of a frame).
 void OnFlip();
+// 1.03: draws with object vectors (last frame's positions) in the frame last composed into the
+// motion vectors (0: none composed, camera-only motion).
+u32 ComposedDraws();
 
 } // namespace BB::ObjMotion

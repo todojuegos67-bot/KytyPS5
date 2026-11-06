@@ -21,6 +21,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_fg.h"
+#include <chrono>
 #include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/bb/bb_dlss5.h"
@@ -144,6 +145,8 @@ struct BBVk {
     BB::Upscale::Plan fg_plan{};
     OwnImage fg_present; // the composite without the HUD (bb_hud.comp flag 4)
     bool fg_present_ready = false;
+    bool fgn_late = false;                // 1.03: the analysis ran after the flip (HUD drawn in)
+    bool fg_hudless_late_skipped = false; // 1.03: that image was not given as HUD-less
     bool fg_raw_hudless_ready = false; // BBHudlessCopy ran this frame (the in-place path)
     OwnImage fg_hudless_view_copy; // that copy in the presenter's view format (raw bytes)
     // 0.39 (BB_FG_NATIVE): frame generation with no upscaler: the presented image before its HUD
@@ -2565,6 +2568,7 @@ bool Rasterizer::BBFgNativeAnalyze(VideoCore::Image& flip, bool late) {
         return false;
     }
     g_bb.fgn_ready = true;
+    g_bb.fgn_late = late;
     // 0.90: DLSS 5 with no upscaler (Reescalado off / native). The same point and inputs as frame
     // generation: the game's image at its own size (before the HUD when a HUD draw was found),
     // the G-buffer depth and the motion vectors just built. NR runs on an RGBA16F copy; the result
@@ -2778,7 +2782,7 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
         // The window-size path: the upscaled image with no HUD added (bb_hud.comp flag 4).
         hudless_view = g_bb.fg_present.view;
         out.hudless_source = "upscaled image before the HUD";
-    } else if (fgn_ready && g_bb.fgn_src.image &&
+    } else if (fgn_ready && g_bb.fgn_src.image && !(g_bb.fgn_late && g_bb.lut_ready) &&
                EnsureImage(g_bb.fg_hudless_view_copy, g_bb.fgn_src.extent, view_format,
                            vk::ImageUsageFlagBits::eTransferDst |
                                vk::ImageUsageFlagBits::eSampled)) {
@@ -2825,6 +2829,10 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
         hudless_view = g_bb.fg_hudless_view_copy.view;
         out.hudless_source = "A before its HUD through the game's curve (self-checked)";
     }
+    // 1.03: the late analysis copies the finished flip image, HUD included; given as the HUD-less
+    // image, FSR 3 FG / DLSS-G took the HUD for scene and warped it (ghosted bars, icons, text).
+    // The in-place HUD-less image (taken before the first HUD draw) is used instead when ready.
+    if (fgn_ready && g_bb.fgn_late && g_bb.lut_ready) g_bb.fg_hudless_late_skipped = true;
     ++g_bb.fg_frames;
     if (hudless_view) ++g_bb.fg_hudless_frames;
     if (g_bb.fg_frames % 600 == 1) {
@@ -2835,6 +2843,36 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
                        plan.camera_valid ? "valid" : "INVALID");
     }
     ++(out.valid ? n_ok : n_cam);
+    {
+        // 1.03: per second, whether per-object motion vectors reached the frame-generation input
+        // (the motion image copied above is the composed one: camera + objects) and which
+        // HUD-less image went with it.
+        using clock = std::chrono::steady_clock;
+        static clock::time_point since = clock::now();
+        static u32 frames = 0, with_objects = 0, hudless_n = 0, hudless_late_skip = 0;
+        static u64 object_draws = 0;
+        const u32 composed = BB::ObjMotion::ComposedDraws();
+        ++frames;
+        if (composed != 0) {
+            ++with_objects;
+            object_draws += composed;
+        }
+        if (hudless_view) ++hudless_n;
+        if (g_bb.fg_hudless_late_skipped) ++hudless_late_skip;
+        g_bb.fg_hudless_late_skipped = false;
+        if (clock::now() - since >= std::chrono::seconds(1)) {
+            BB::FG::Printf("[fg-objmv] last %.1f s: %u FG input frames, %u with per-object motion "
+                           "vectors (%.1f object draws a frame), %u camera-only | HUD-less given "
+                           "%u of %u (%s), %u late images with the HUD kept out",
+                           std::chrono::duration<double>(clock::now() - since).count(), frames,
+                           with_objects, with_objects ? double(object_draws) / with_objects : 0.0,
+                           frames - with_objects, hudless_n, frames,
+                           out.hudless_source ? out.hudless_source : "none", hudless_late_skip);
+            since = clock::now();
+            frames = with_objects = hudless_n = hudless_late_skip = 0;
+            object_draws = 0;
+        }
+    }
     return out.valid;
 }
 
