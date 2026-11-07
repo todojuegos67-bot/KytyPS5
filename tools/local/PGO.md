@@ -88,3 +88,19 @@ SceneGuard、TextureMips 各 1）。在 9af7b0d9 上用 `pgo-multi.ps1` 默认�
 个。旧的另存为 `_Build\pgo\windows\kyty-before-20261109.profdata`。
 （用 `-fprofile-instr-generate` 把一个 TU 编成 IR，`__profd_` 里的哈希与 `llvm-profdata show --all-functions` 的
 `Hash:` 对比，可以列出具体是哪些函数失效。）
+
+## 推测模式（`KYTY_SPECULATE=4`）
+
+默认的五次训练都在模式 0 下运行，模式 4 自己的路径（推测线程上的翻译和状态遍历、提交检查，以及模式 0 的函数在
+`kyty_local_speculate_mode` 判断之后调用的 `*Spec` 函数，例如 `ObtainBufferSpec`、`FindBufferSpec`、
+`SyncGpuCleanBackingSpec`）在 profile 里没有计数，按冷代码编译。`pgo-multi.ps1 -Speculate` 在默认五次之后，再用同样的
+五个场景各跑一次 `KYTY_SPECULATE=4`，十个原始 profile 合并成一个：
+
+```
+powershell -ExecutionPolicy Bypass -File tools\local\windows\pgo-multi.ps1 -Speculate
+```
+
+默认列表不变；命令行给了 `-Scenes` 时按它原样运行，`-Speculate` 不再追加。场景里可以连写多个开关
+（`<存档>+KYTY_SCOUT=0+KYTY_SPECULATE=4`）。`llvm-profdata merge` 把同一函数的计数相加：模式 0 走的函数仍然带着
+模式 0 五次的计数（加上模式 4 里同样经过它们的次数），只在模式 4 运行的函数多了计数。前五个原始 profile 单独合并，
+就是不带 `-Speculate` 的 profile。
