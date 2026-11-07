@@ -1346,8 +1346,14 @@ bool IconButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, in
 	const float  hgt = b.y - a.y;
 	const float  dx  = 5.0f * unit * v;
 	const ImVec2 ic {a.x + hgt * 0.62f + dx, (a.y + b.y) * 0.5f};
-	const float  breathe = 1.0f + 0.05f * v * std::sin(Souls::Time() * 3.0f);
-	Souls::Medallion(dl, ic, hgt * 0.36f, v, Al(1.0f), danger);
+	// (step5) Focus: the icon grows 14 % (eased, real time) with a soft glow behind the medallion.
+	const float  ve      = v * v * (3.0f - 2.0f * v);
+	const float  breathe = (1.0f + 0.14f * ve) * (1.0f + 0.03f * ve * std::sin(Souls::Time() * 3.0f));
+	for (int k = 5; k >= 1; k--) {
+		const float rr = hgt * 0.36f * breathe * (1.0f + 0.16f * static_cast<float>(k));
+		dl->AddCircleFilled(ic, rr, danger ? IM_COL32(230, 110, 80, A(14.0f * ve)) : IM_COL32(236, 206, 146, A(14.0f * ve)), 48);
+	}
+	Souls::Medallion(dl, ic, hgt * 0.36f * breathe, v, Al(1.0f), danger);
 	const int lift = static_cast<int>(50.0f * v);
 	const ImU32 ink = danger ? IM_COL32(std::min(255, tr + lift / 3), std::min(255, tg + lift), std::min(255, tb + lift), A(255.0f))
 	                         : IM_COL32(std::min(255, Souls::kBrass[0] + lift), std::min(255, Souls::kBrass[1] + lift),
@@ -3696,6 +3702,7 @@ ImTextureData* g_fog   = nullptr; // 1024 x 256, white, alpha = billowy fog (til
 ImTextureData* g_wisp  = nullptr; // 1024 x 192, white, alpha = fine warped wisps (tileable along x)
 ImTextureData* g_glow  = nullptr; // 128 x 128, white, alpha = a gaussian
 ImTextureData* g_ray   = nullptr; // 64 x 256, white, a light shaft (soft sides, fading toward its end)
+ImTextureData* g_haze  = nullptr; // (step5) 4 x 512, white, a dithered vertical ramp (no 8-bit bands)
 double         g_start = -1.0;
 
 struct Mote {
@@ -3733,7 +3740,7 @@ float Fbm(float x, float y, int W, int cells, int octaves, float seed) {
 	float v = 0, amp = 0.5f, sum = 0;
 	for (int o = 0; o < octaves; o++, cells *= 2, amp *= 0.5f) {
 		const float k = static_cast<float>(cells) / W;
-		v += amp * Noise(x * k, y * k + seed + o * 31.7f + x * k * 0.07f, cells);
+		v += amp * Noise(x * k, y * k + seed + o * 31.7f, cells); // (step5: no x-dependent skew: it broke the x period -> seams)
 		sum += amp;
 	}
 	return v / sum;
@@ -3788,9 +3795,17 @@ void Ensure() {
 		constexpr int W = 64, H = 256;
 		g_ray = MakeTexture(W, H, [](int x, int y) {
 			const float fx = (x + 0.5f) / W * 2 - 1, fy = (y + 0.5f) / H;
-			const float side = std::exp(-fx * fx * 3.5f) * std::clamp(1.0f - std::fabs(fx), 0.0f, 1.0f);
-			const float len  = std::sin(std::min(fy * 1.6f, 1.0f) * 1.5707963f) * (1.0f - fy) * 1.6f;
+			const float edge = std::clamp(1.0f - std::fabs(fx), 0.0f, 1.0f);
+			const float side = std::exp(-fx * fx * 3.5f) * edge * edge * (3 - 2 * edge);
+			const float s0   = std::sin(std::min(fy * 1.6f, 1.0f) * 1.5707963f), s1 = 1.0f - fy;
+			const float len  = s0 * s0 * s1 * s1 * 2.2f; // (step5: smooth to zero at both ends)
 			return std::clamp(side * len, 0.0f, 1.0f);
+		});
+	}
+	if (g_haze == nullptr) {
+		g_haze = MakeTexture(4, 512, [](int, int y) {
+			const float f = (y + 0.5f) / 512.0f;
+			return f * f * (3 - 2 * f);
 		});
 	}
 	if (g_glow == nullptr) {
@@ -3809,6 +3824,7 @@ void Free() {
 	FreeTexture(g_wisp);
 	FreeTexture(g_glow);
 	FreeTexture(g_ray);
+	FreeTexture(g_haze);
 	g_motes.clear();
 	g_start = -1.0;
 }
@@ -3868,16 +3884,22 @@ void Draw(ImDrawList* dl, float x0, float y0, float w, float h, float width, flo
 			const float cx   = x0 + sh[0] * w + sway, top = y0 + sh[1] * h, bot = std::min(bottom, y0 + 1.02f * h);
 			const float hw0 = sh[2] * w * 0.5f, hw1 = sh[2] * w * 1.7f, lean = kLean * h;
 			if (cx + lean - hw1 < x0 + 0.31f * w && top < y0 + 0.32f * h) continue; // (never over the logo)
-			dl->AddImageQuad(g_ray->GetTexRef(), {cx - hw0, top}, {cx + hw0, top}, {cx + lean + hw1, bot}, {cx + lean - hw1, bot}, {0, 0}, {1, 0},
-			                 {1, 1}, {0, 1}, IM_COL32(216, 228, 242, static_cast<int>(a * 255.0f)));
+			// (step5) 24 strips: a trapezoid as one quad is two affine triangles, whose shared diagonal shows as a crease.
+			constexpr int kStrips = 24;
+			for (int k = 0; k < kStrips; k++) {
+				const float f0 = static_cast<float>(k) / kStrips, f1 = static_cast<float>(k + 1) / kStrips;
+				const float ya = top + (bot - top) * f0, yb = top + (bot - top) * f1;
+				const float ca = cx + lean * f0, cb = cx + lean * f1, ha = hw0 + (hw1 - hw0) * f0, hb = hw0 + (hw1 - hw0) * f1;
+				dl->AddImageQuad(g_ray->GetTexRef(), {ca - ha, ya}, {ca + ha, ya}, {cb + hb, yb}, {cb - hb, yb}, {0, f0}, {1, f0}, {1, f1}, {0, f1},
+				                 IM_COL32(216, 228, 242, static_cast<int>(a * 255.0f)));
+			}
 		}
 	};
 
 	// A cold low haze (the air's own density, under the banks), then the shafts behind the fog.
 	{
 		const float top = y0 + 0.42f * h;
-		dl->AddRectFilledMultiColor({x0, top}, {x0 + w, bottom}, with_a(IM_COL32(150, 162, 178, 0), 0.0f), with_a(IM_COL32(150, 162, 178, 0), 0.0f),
-		                            with_a(IM_COL32(160, 170, 184, 0), 0.20f * fade), with_a(IM_COL32(160, 170, 184, 0), 0.20f * fade));
+		dl->AddImage(g_haze->GetTexRef(), {x0, top}, {x0 + w, bottom}, {0.5f, 0.0f}, {0.5f, 1.0f}, with_a(IM_COL32(158, 168, 182, 0), 0.20f * fade));
 	}
 	shafts(1.0f);
 
@@ -3913,14 +3935,14 @@ void Draw(ImDrawList* dl, float x0, float y0, float w, float h, float width, flo
 		const float dir    = (i % 2 == 0) ? 1.0f : -0.7f;
 		const float sway   = (std::sin(t * 0.11f + fi) * 0.010f + std::sin(t * 0.037f + fi * 2.1f) * 0.006f) * h;
 		const float a      = L.alpha * breath * fade;
-		const float scroll = (t * L.speed * w * dir - px) / tile_w;
+		const float scroll = (t * L.speed * 0.6f * w * dir - px) / tile_w; // (step5: slower)
 		band(g_fog, top + sway, band_h, tile_w, scroll + fi * 0.37f, false, with_a(L.rgb, a * 0.62f));
 		// The crossing pass: the other way, slower, mirrored, at another scale (the banks change shape, no repeat).
 		band(g_fog, top - sway + band_h * 0.10f, band_h * 0.92f, tile_w * 1.37f,
-		     (t * L.speed * 0.5f * w * -dir - px) / (tile_w * 1.37f) + 0.21f + fi * 0.13f, true, with_a(L.rgb, a * 0.46f));
+		     (t * L.speed * 0.3f * w * -dir - px) / (tile_w * 1.37f) + 0.21f + fi * 0.13f, true, with_a(L.rgb, a * 0.46f));
 		if (i >= 2) {
 			const float wh = band_h * 0.6f;
-			band(g_wisp, top + band_h * 0.25f - sway * 0.5f, wh, tile_w * 0.83f, (t * L.speed * 1.4f * w * dir - px) / (tile_w * 0.83f) + fi * 0.29f,
+			band(g_wisp, top + band_h * 0.25f - sway * 0.5f, wh, tile_w * 0.83f, (t * L.speed * 0.85f * w * dir - px) / (tile_w * 0.83f) + fi * 0.29f,
 			     (i % 2) != 0, with_a(IM_COL32(210, 216, 224, 0), a * 0.42f));
 		}
 	}
@@ -5829,7 +5851,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		g_menu_rect_hook = [](ImVec2 p, ImVec2 sz) { last_p = p, last_s = sz; };
 	}
 	ImFont* font = FindFont("segoeui");
-	ImGui::PushFont(font, std::round(26.0f * unit));
+	ImGui::PushFont(font, std::round(32.0f * unit)); // (step5: larger text, whole-pixel size)
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.01f, t));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {32 * unit, 24 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12 * unit, 14 * unit});
@@ -5884,7 +5906,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		g_edit.start_menu   = show;
 		(void)SaveSettings(g_rt.ini_path, on_disk);
 	}
-	const ImVec2 bs {420 * unit, 60 * unit};
+	const ImVec2 bs {std::round(500 * unit), std::round(84 * unit)}; // (step5: bigger entries and icons)
 	if (IconButton(I18n::T("Volver al juego"), Icons::Back, bs, unit, 0)) SetOpen(false);
 	// (port34) The trophy page (Esc, B or F1 there: back here).
 	if (g_focus_trophy_btn_request.exchange(false)) g_focus_trophy_btn = true;
