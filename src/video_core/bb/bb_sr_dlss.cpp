@@ -490,6 +490,39 @@ bool Ready() {
 }
 
 bool Evaluate(const Desc& desc) {
+    // 1.44 (r143_0222): DLSS's range is ratio <= 3 per axis. A 128x128 menu image upscaled to
+    // 1708x960 (x13) was refused by NGX 3 times (0xbad00005) and that turned DLSS off for the
+    // session: every later 1708x960 -> 2560x1440 frame "dispatch failed", then "inactive".
+    // Out-of-range inputs are skipped without calling NGX, and the refusal count belongs to one
+    // render / output size pair (a new pair starts again from 0).
+    {
+        static vk::Extent2D ref_render{}, ref_output{};
+        if (desc.render != ref_render || desc.upscale != ref_output) {
+            if (g_refusals != 0) {
+                BBLogf("DLSS: new size pair %ux%u -> %ux%u: NGX refusal count %u reset",
+                       desc.render.width, desc.render.height, desc.upscale.width,
+                       desc.upscale.height, g_refusals);
+            }
+            g_refusals = 0;
+            ref_render = desc.render;
+            ref_output = desc.upscale;
+        }
+        const bool out_of_range =
+            desc.render.width < 64 || desc.render.height < 64 ||
+            desc.upscale.width > desc.render.width * 3u + 2u ||
+            desc.upscale.height > desc.render.height * 3u + 2u ||
+            desc.upscale.width < desc.render.width || desc.upscale.height < desc.render.height;
+        if (out_of_range) {
+            static uint32_t said = 0;
+            if (said++ < 4) {
+                BBLogf("DLSS: %ux%u -> %ux%u is outside DLSS's range (ratio <= 3): skipped, NGX "
+                       "not called",
+                       desc.render.width, desc.render.height, desc.upscale.width,
+                       desc.upscale.height);
+            }
+            return false;
+        }
+    }
     if (!g_ready || g_refusals >= 3) {
         static bool said = false;
         if (g_ready && !said) {

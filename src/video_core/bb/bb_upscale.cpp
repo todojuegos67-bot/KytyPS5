@@ -2091,6 +2091,11 @@ bool RunBackend(const SR::Desc& desc) {
         return false;
     }
     static u32 failures = 0;
+    if (desc.render.width < 64 || desc.render.height < 64 ||
+        desc.upscale.width > desc.render.width * 3u + 2u ||
+        desc.upscale.height > desc.render.height * 3u + 2u) {
+        return false; // 1.44: outside every upscaler's range; not a back-end failure
+    }
 #if defined(_WIN32)
     unsigned long code = 0;
     const bool ok = CallGuarded(fn, &desc, &code);
@@ -2191,7 +2196,10 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     if (g_draw.has_depth) g_draw.depth = *depth;
 
     // The G-buffer pass: the most colour targets with a depth target (3 or more).
-    if (g_draw.has_depth && mrt >= 3 && mrt >= f.gb_mrt) {
+    // 1.44: a real scene only (r143_0222: a 128x128 menu pass with 3 targets + depth became the
+    // first upscale source, 128x128 -> 1708x960, and NGX's refusals turned DLSS off).
+    if (g_draw.has_depth && mrt >= 3 && mrt >= f.gb_mrt && depth->width >= 640 &&
+        depth->height >= 360) {
         f.gb_depth = depth->addr;
         f.gb_w = depth->width;
         f.gb_h = depth->height;
