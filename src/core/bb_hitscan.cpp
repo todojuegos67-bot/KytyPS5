@@ -3,6 +3,7 @@
 #include "core/bb_hitscan.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <atomic>
 #include <chrono>
 #include <cstring>
