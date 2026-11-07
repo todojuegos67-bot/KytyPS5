@@ -1,0 +1,171 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// 1.46 (bb-fgmv-146) BB_FG_MV=flow: dense motion of things the camera vectors miss. After the
+// camera pass (bb_mv.comp: depth + camera reprojection) and the object compose (bb_objmv.comp),
+// every 8x8 block of the render image is matched against the previous real frame's luminance
+// (block matching, log luminance, around the block's current vector). Where another vector
+// explains the block clearly better than the one it has (a character, an enemy, a cloth / cape,
+// a physics prop, a particle with a body), the pixels of the block that agree with the new vector
+// better than with their own (3x3 test per pixel) take it. Same units as bb_mv.comp: render
+// pixels towards the previous position (prev = pixel + mv).
+// p.size: width, height, flags (bit 0: previous luminance valid), search radius (px).
+// p.tune: relative gain needed, absolute gain needed (mean log2 per pixel), min texture, lambda.
+// Stats (one slot): 0 blocks textured, 1 blocks given a flow vector, 2 pixels replaced,
+// 3 sum of |flow - old| over replaced pixels x16, 4 blocks flat (skipped), 5 accepted blocks whose
+// old vector was an object vector (bb_objmv) already.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, r16f) uniform readonly image2D lum_prev;
+layout(binding = 1, r16f) uniform readonly image2D lum_cur;
+layout(binding = 2, rg16f) uniform image2D mv;
+layout(binding = 3, std430) buffer Stats {
+    uint s[8];
+} st;
+layout(push_constant) uniform Push {
+    uvec4 size;
+    vec4 tune;
+} p;
+
+shared float cur[8][8];
+shared float cand_cost[64];
+shared ivec2 cand_vec[64];
+shared vec2 seed_s;
+shared float var_s;
+shared uint accept_s;
+shared vec2 best_s;
+
+float L(float l) {
+    if (isnan(l) || isinf(l)) l = 0.0;
+    return log2(max(l, 0.0) + 0.01);
+}
+
+float Prev(ivec2 c) {
+    c = clamp(c, ivec2(0), ivec2(p.size.xy) - 1);
+    return L(imageLoad(lum_prev, c).r);
+}
+
+void main() {
+    ivec2 lc = ivec2(gl_LocalInvocationID.xy);
+    uint li = gl_LocalInvocationIndex;
+    ivec2 base = ivec2(gl_WorkGroupID.xy) * 8;
+    ivec2 c = base + lc;
+    ivec2 cc = clamp(c, ivec2(0), ivec2(p.size.xy) - 1);
+    bool inside = c.x < int(p.size.x) && c.y < int(p.size.y);
+    cur[lc.y][lc.x] = L(imageLoad(lum_cur, cc).r);
+    vec2 own = imageLoad(mv, cc).xy;
+    if (any(isnan(own)) || any(isinf(own))) own = vec2(0.0);
+    if (li == 0u) {
+        // The block's seed: its centre pixel's current vector (camera, or object where composed).
+        ivec2 m = clamp(base + 4, ivec2(0), ivec2(p.size.xy) - 1);
+        vec2 sv = imageLoad(mv, m).xy;
+        if (any(isnan(sv)) || any(isinf(sv))) sv = vec2(0.0);
+        seed_s = sv;
+        accept_s = 0u;
+    }
+    barrier();
+    if (li == 0u) {
+        float mean = 0.0, sq = 0.0;
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) {
+                mean += cur[y][x];
+                sq += cur[y][x] * cur[y][x];
+            }
+        mean /= 64.0;
+        var_s = max(sq / 64.0 - mean * mean, 0.0);
+    }
+    barrier();
+    if ((p.size.z & 1u) == 0u) return;
+    if (var_s < p.tune.z) {
+        if (li == 0u) atomicAdd(st.s[4], 1u);
+        return;
+    }
+    ivec2 seed = ivec2(round(seed_s));
+    int R = int(p.size.w);
+    int step = 2;
+    int n = (2 * (R / step) + 1);
+    int total = n * n;
+    // Coarse search: every other pixel of the block, every other vector of the window.
+    float best = 1e30;
+    ivec2 bv = seed;
+    for (int k = int(li); k < total; k += 64) {
+        ivec2 d = ivec2(k % n, k / n) * step - (R / step) * step;
+        ivec2 v = seed + d;
+        float sad = 0.0;
+        for (int y = 0; y < 8; y += 2)
+            for (int x = 0; x < 8; x += 2) {
+                sad += abs(cur[y][x] - Prev(base + ivec2(x, y) + v));
+            }
+        float cost = sad * 4.0 + p.tune.w * length(vec2(d));
+        if (cost < best) {
+            best = cost;
+            bv = v;
+        }
+    }
+    cand_cost[li] = best;
+    cand_vec[li] = bv;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (li < s && cand_cost[li + s] < cand_cost[li]) {
+            cand_cost[li] = cand_cost[li + s];
+            cand_vec[li] = cand_vec[li + s];
+        }
+        barrier();
+    }
+    ivec2 coarse = cand_vec[0];
+    barrier();
+    // Refinement: full block, +-1 around the coarse vector (threads 0..8), the seed (thread 9).
+    float cost = 1e30;
+    ivec2 rv = coarse;
+    if (li < 10u) {
+        rv = li < 9u ? coarse + ivec2(int(li % 3u) - 1, int(li / 3u) - 1) : seed;
+        float sad = 0.0;
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) {
+                sad += abs(cur[y][x] - Prev(base + ivec2(x, y) + rv));
+            }
+        cost = sad;
+    }
+    cand_cost[li] = cost;
+    cand_vec[li] = rv;
+    barrier();
+    if (li == 0u) {
+        float seed_sad = cand_cost[9];
+        // The seed's own sub-pixel vector, not its rounding, is what the block has today; its
+        // cost at the rounded position is the fair comparison for integer candidates.
+        float b = 1e30;
+        ivec2 v = coarse;
+        for (int k = 0; k < 9; ++k) {
+            if (cand_cost[k] < b) {
+                b = cand_cost[k];
+                v = cand_vec[k];
+            }
+        }
+        float gain = seed_sad - b;
+        bool far = length(vec2(v) - seed_s) >= 1.5;
+        if (far && gain > p.tune.x * seed_sad && gain > p.tune.y * 64.0) {
+            accept_s = 1u;
+            best_s = vec2(v);
+            atomicAdd(st.s[1], 1u);
+        }
+        atomicAdd(st.s[0], 1u);
+    }
+    barrier();
+    if (accept_s == 0u || !inside) return;
+    // Per pixel: the new vector only where it fits this pixel's 3x3 better than its own.
+    vec2 fv = best_s;
+    ivec2 fi = ivec2(fv);
+    ivec2 oi = ivec2(round(own));
+    float e_new = 0.0, e_own = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 q = clamp(c + ivec2(x, y), ivec2(0), ivec2(p.size.xy) - 1);
+            float lq = L(imageLoad(lum_cur, q).r);
+            e_new += abs(lq - Prev(q + fi));
+            e_own += abs(lq - Prev(q + oi));
+        }
+    if (e_new < e_own * 0.85) {
+        imageStore(mv, c, vec4(fv, 0.0, 0.0));
+        atomicAdd(st.s[2], 1u);
+        atomicAdd(st.s[3], uint(clamp(length(fv - own), 0.0, 4096.0) * 16.0));
+    }
+}

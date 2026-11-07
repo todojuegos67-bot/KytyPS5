@@ -109,6 +109,10 @@ struct CoverageStats {
     // 1.41 (bb-fg30-141): character pixels whose object vector is near zero (< 0.25 px) and
     // whose object vector differs from the camera one by more than 1 px (own motion seen).
     u64 character_still_px = 0, character_own_px = 0;
+    // 1.46 (bb-fgmv-146): pixels drawn by a motion pipeline that carry no vector, by reason: no
+    // previous position for the draw, behind the camera, not finite. All zero with object
+    // coverage zero = the motion attachment is never written (pipeline / attachment problem).
+    u64 no_prev_px = 0, behind_px = 0, nonfinite_px = 0;
 };
 CoverageStats TakeCoverage();
 // 1.41: guest frame numbers for the [fg-amd] pairing check. FrameNo(): flips seen so far (OnFlip

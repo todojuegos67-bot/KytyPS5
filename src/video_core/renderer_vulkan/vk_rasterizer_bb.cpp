@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <cstdio>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include "video_core/host_shaders/bb_hud_comp.h"
 #include "video_core/host_shaders/bb_hudless_lut_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
+#include "video_core/host_shaders/bb_fgflow_comp.h"
 #include "video_core/host_shaders/bb_rtrefl_comp.h"
 #include "video_core/host_shaders/bb_vol_comp.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -199,6 +201,18 @@ struct BBVk {
     // 1.41 (bb-fg30-141): guest frame numbers (BB::ObjMotion::FrameNo) of the camera motion pass
     // and of the in-place HUD-less image, for the [fg-amd] pairing check.
     u64 mv_frame = ~0ull, lut_frame = ~0ull;
+    // 1.46 (bb-fgmv-146) BB_FG_MV=flow: block-matching motion over the camera / object vectors.
+    vk::DescriptorSetLayout flow_set_layout{};
+    vk::PipelineLayout flow_layout{};
+    vk::Pipeline flow_pipeline{};
+    bool flow_init = false, flow_failed = false;
+    std::array<vk::Buffer, 4> flow_buf{};
+    std::array<VmaAllocation, 4> flow_alloc{};
+    std::array<u32*, 4> flow_mapped{};
+    u64 flow_no = 0;
+    u64 flow_acc[8]{};
+    u64 flow_runs = 0, flow_skipped = 0;
+    std::chrono::steady_clock::time_point flow_t{};
     // 1.16: the HUD canvas' HUD-less image for frame generation this frame (presenter view).
     bool hs_hudless_ready = false;
     vk::ImageView hs_hudless_view{};
@@ -1658,6 +1672,173 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
     return true;
 }
 
+namespace {
+// 1.46 (bb-fgmv-146): BB_FG_MV = flow (default) | camera. "flow": bb_fgflow.comp corrects the
+// camera / object vectors where block matching against the previous real frame shows the block
+// moved otherwise (characters, enemies, capes, physics, particles with a body). "camera": the
+// vectors as up to 1.41 (camera from depth + object vectors from the G-buffer pass).
+bool FlowWanted() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_FG_MV");
+        const bool v = e == nullptr || std::string_view{e} != "camera";
+        BB::FG::Printf("[fg-mv] BB_FG_MV=%s: %s", e ? e : "flow (default)",
+                       v ? "block-matching flow over the camera / object vectors (radius "
+                           "BB_FG_MV_RADIUS, default 24 px), fed to frame generation and the "
+                           "upscaler / DLAA"
+                         : "camera + object vectors only (1.41)");
+        return v;
+    }();
+    return on;
+}
+float EnvF(const char* name, float def) {
+    const char* e = std::getenv(name);
+    return e && *e ? static_cast<float>(std::atof(e)) : def;
+}
+
+bool InitFlow() {
+    if (g_bb.flow_init) return !g_bb.flow_failed;
+    g_bb.flow_init = true;
+    const vk::Device device = g_bb.device;
+    const std::array bindings{
+        vk::DescriptorSetLayoutBinding{0, vk::DescriptorType::eStorageImage, 1,
+                                       vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{1, vk::DescriptorType::eStorageImage, 1,
+                                       vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{2, vk::DescriptorType::eStorageImage, 1,
+                                       vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{3, vk::DescriptorType::eStorageBuffer, 1,
+                                       vk::ShaderStageFlagBits::eCompute},
+    };
+    auto [set_result, set_layout] =
+        device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+    const vk::PushConstantRange push{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = 32};
+    auto [layout_result, layout] = device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
+        .setLayoutCount = 1,
+        .pSetLayouts = &set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    });
+    const auto module = CompileSPV(BB_FGFLOW_COMP, device);
+    auto [pipe_result, pipeline] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage = vk::PipelineShaderStageCreateInfo{.stage = vk::ShaderStageFlagBits::eCompute,
+                                                           .module = module,
+                                                           .pName = "main"},
+                .layout = layout,
+            });
+    device.destroyShaderModule(module);
+    if (set_result != vk::Result::eSuccess || layout_result != vk::Result::eSuccess ||
+        pipe_result != vk::Result::eSuccess) {
+        BB::FG::Printf("[fg-mv] the flow pass could not be created: camera / object vectors only");
+        g_bb.flow_failed = true;
+        return false;
+    }
+    for (u32 i = 0; i < g_bb.flow_buf.size(); ++i) {
+        const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+            .size = 64,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+        };
+        VmaAllocationCreateInfo alloc{};
+        alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer buffer{};
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(g_bb.allocator, &ci, &alloc, &buffer, &g_bb.flow_alloc[i], &info) !=
+            VK_SUCCESS) {
+            g_bb.flow_failed = true;
+            BB::FG::Printf("[fg-mv] the flow statistics buffer could not be created: flow off");
+            return false;
+        }
+        g_bb.flow_buf[i] = buffer;
+        g_bb.flow_mapped[i] = static_cast<u32*>(info.pMappedData);
+        std::memset(info.pMappedData, 0, 64);
+    }
+    g_bb.flow_set_layout = set_layout;
+    g_bb.flow_layout = layout;
+    g_bb.flow_pipeline = pipeline;
+    return true;
+}
+
+void BBFgFlow(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::Extent2D render,
+              bool prev_valid) {
+    if (!FlowWanted() || !BB::FG::WantInputs() || !InitFlow()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_bb.flow_t == std::chrono::steady_clock::time_point{}) g_bb.flow_t = now;
+    // Statistics of the slot written 4 runs ago (finished on the GPU by now), then cleared.
+    const u32 slot = static_cast<u32>(g_bb.flow_no % g_bb.flow_buf.size());
+    if (g_bb.flow_no >= g_bb.flow_buf.size()) {
+        vmaInvalidateAllocation(g_bb.allocator, g_bb.flow_alloc[slot], 0, 64);
+        for (u32 i = 0; i < 6; ++i) g_bb.flow_acc[i] += g_bb.flow_mapped[slot][i];
+    }
+    ++g_bb.flow_no;
+    if (!prev_valid) ++g_bb.flow_skipped;
+    ++g_bb.flow_runs;
+    const double dt = std::chrono::duration<double>(now - g_bb.flow_t).count();
+    if (dt >= 1.0) {
+        const auto& a = g_bb.flow_acc;
+        const double px = static_cast<double>(render.width) * render.height *
+                          std::max<u64>(g_bb.flow_runs, 1);
+        BB::FG::Printf("[fg-mv] 1.46 %.1f s: flow ran %llu times (%llu without a previous frame) | "
+                       "blocks textured %llu, given a flow vector %llu (%.1f %%), flat %llu | "
+                       "pixels replaced %.2f %% of the image, mean change %.2f px",
+                       dt, static_cast<unsigned long long>(g_bb.flow_runs),
+                       static_cast<unsigned long long>(g_bb.flow_skipped),
+                       static_cast<unsigned long long>(a[0]), static_cast<unsigned long long>(a[1]),
+                       a[0] ? 100.0 * a[1] / a[0] : 0.0, static_cast<unsigned long long>(a[4]),
+                       100.0 * a[2] / px, a[2] ? a[3] / 16.0 / a[2] : 0.0);
+        for (auto& v : g_bb.flow_acc) v = 0;
+        g_bb.flow_runs = g_bb.flow_skipped = 0;
+        g_bb.flow_t = now;
+    }
+    cmd.fillBuffer(g_bb.flow_buf[slot], 0, 64, 0u);
+    const vk::MemoryBarrier2 mem{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &mem});
+    if (!prev_valid) return;
+    const vk::DescriptorImageInfo prev_info{{}, lum_prev.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo cur_info{{}, lum_cur.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo mv_info{{}, g_bb.mv.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo buf_info{g_bb.flow_buf[slot], 0, 64};
+    const std::array writes{
+        vk::WriteDescriptorSet{.dstBinding = 0, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &prev_info},
+        vk::WriteDescriptorSet{.dstBinding = 1, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &cur_info},
+        vk::WriteDescriptorSet{.dstBinding = 2, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &mv_info},
+        vk::WriteDescriptorSet{.dstBinding = 3, .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = &buf_info},
+    };
+    static const u32 radius = static_cast<u32>(std::clamp(EnvF("BB_FG_MV_RADIUS", 24.0f), 2.0f, 64.0f));
+    static const float rel = EnvF("BB_FG_MV_GAIN", 0.30f);
+    static const float abs_gain = EnvF("BB_FG_MV_MIN", 0.06f);
+    static const float tex = EnvF("BB_FG_MV_TEXTURE", 0.004f);
+    static const float lambda = EnvF("BB_FG_MV_LAMBDA", 0.05f);
+    struct {
+        u32 size[4];
+        float tune[4];
+    } push{{render.width, render.height, 1u, radius}, {rel, abs_gain, tex, lambda}};
+    static_assert(sizeof(push) == 32);
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.flow_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.flow_layout, 0, writes);
+    cmd.pushConstants(g_bb.flow_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
+}
+} // namespace
+
 bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view,
                                  vk::Format color_format, vk::ImageUsageFlags color_usage,
                                  bool late, bool mv_only) {
@@ -1808,6 +1989,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     // Object motion vectors (bb_objmv.h) over the camera ones.
     g_bb.mv_frame = late ? BB::ObjMotion::FrameNo() - 1 : BB::ObjMotion::FrameNo();
     BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset, late);
+    BBFgFlow(cmd, lum_prev, lum_cur, render, lum_prev_valid);
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
@@ -2565,7 +2747,9 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
     if (!check) {
         g_bb.lut_ready = true;
-        g_bb.lut_frame = BB::ObjMotion::FrameNo();
+        // 1.46: BBHudlessLut runs at present, after OnFlip advanced FrameNo(): the image is
+        // of the flip just ended (FrameNo() - 1), as the colour (1.41 stamped +1: false mismatch).
+        g_bb.lut_frame = BB::ObjMotion::FrameNo() - 1;
         return;
     }
     g_bb.lut_pending[slot] = true;
@@ -2608,7 +2792,9 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
         g_bb.lut_pending[slot] = false;
     });
     g_bb.lut_ready = true;
-    g_bb.lut_frame = BB::ObjMotion::FrameNo();
+    // 1.46: BBHudlessLut runs at present, after OnFlip advanced FrameNo(): the image is
+        // of the flip just ended (FrameNo() - 1), as the colour (1.41 stamped +1: false mismatch).
+        g_bb.lut_frame = BB::ObjMotion::FrameNo() - 1;
 }
 
 // 0.39 (BB_FG_NATIVE): frame generation with no upscaler. At the window-size path's point (before
