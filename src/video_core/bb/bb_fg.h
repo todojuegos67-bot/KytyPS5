@@ -48,6 +48,11 @@ int DynBaseCap(double base_fps, int& state);
 // The Demon's Souls lines ([dlssg], [fsr3], [fsr3-mfg], [dyn], [lat] ...): to the log and to the
 // metrics file (BB_METRICS_OUT, read by metricas-bb.ps1).
 void Printf(const char* format, ...);
+// 1.54 (bb-mvmask-154): present-interval standard deviations (ms) of the last second, noted by the
+// FG back ends (real frames; all presents, real + generated; < 0: not measured) for the [mvmask]
+// line. TakePacing returns and clears them.
+void NotePacing(double real_sd_ms, double shown_sd_ms);
+void TakePacing(double& real_sd_ms, double& shown_sd_ms);
 
 enum class Kind : uint32_t { Off, Amd, Dlss, Image };
 struct Config {
@@ -109,6 +114,10 @@ struct Inputs {
     bool valid = false; // a 3D frame (the upscaler ran with depth and vectors this frame)
     Image depth;        // render size, D32, SHADER_READ_ONLY_OPTIMAL
     Image motion;       // render size, RG16F pixels towards the previous frame, SHADER_READ_ONLY
+    // 1.54 (bb-mvmask-154): render size, R8 unorm, SHADER_READ_ONLY: the motion-field mask as the
+    // upscalers' reactive mask (0 = trust the vector, up to 1 = keep the current colour).
+    Image mask;
+    bool has_mask = false;
     Image hudless;      // output size, the frame image's format, SHADER_READ_ONLY_OPTIMAL
     bool has_hudless = false;
     // bb-merge-082: the same image scaled to the size of the game image inside the backbuffer

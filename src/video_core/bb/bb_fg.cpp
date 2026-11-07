@@ -137,6 +137,24 @@ int DynBaseCap(double base_fps, int& state) {
     return state;
 }
 
+namespace {
+std::mutex g_pacing_mutex;
+double g_pacing_real = -1.0, g_pacing_shown = -1.0;
+} // namespace
+
+void NotePacing(double real_sd_ms, double shown_sd_ms) {
+    std::lock_guard lock{g_pacing_mutex};
+    if (real_sd_ms >= 0.0) g_pacing_real = real_sd_ms;
+    if (shown_sd_ms >= 0.0) g_pacing_shown = shown_sd_ms;
+}
+
+void TakePacing(double& real_sd_ms, double& shown_sd_ms) {
+    std::lock_guard lock{g_pacing_mutex};
+    real_sd_ms = g_pacing_real;
+    shown_sd_ms = g_pacing_shown;
+    g_pacing_real = g_pacing_shown = -1.0;
+}
+
 void Printf(const char* format, ...) {
     char text[2048];
     va_list args;
@@ -1342,6 +1360,7 @@ void FrameTimeLine(uint32_t multiplier) {
     for (double x : real) {
         if (step_ms > 0.0 && x > 1.5 * step_ms) ++spikes;
     }
+    NotePacing(r.sd, r.sd / m); // 1.54: shown sd estimated from real / multiplier
     Printf("[dlssg-ft] real (present) mean %.2f sd %.2f p99 %.2f max %.1f ms (%zu); real (guest "
            "release) mean %.2f sd %.2f p99 %.2f max %.1f ms (%zu); shown est. x%u mean %.2f sd %.2f "
            "p99 %.2f ms; pacer step %.2f ms (%u changes), real > 1.5 step: %u",
@@ -2185,6 +2204,18 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Rect2D reg
             sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors,
                             sl::ResourceLifecycle::eValidUntilPresent, &full),
         };
+        // 1.54 (bb-mvmask-154): the motion-field mask as DLSS-G's bias-current-colour hint
+        // (BB_MVMASK_DLSSG=0: not tagged).
+        static const bool mask_tag = [] {
+            const char* value = Env("BB_MVMASK_DLSSG");
+            return value == nullptr || *value != '0';
+        }();
+        sl::Resource mask_res{};
+        if (mask_tag && inputs->has_mask) {
+            mask_res = ToResource(inputs->mask);
+            tags.emplace_back(&mask_res, sl::kBufferTypeBiasCurrentColorHint,
+                              sl::ResourceLifecycle::eValidUntilPresent, &full);
+        }
         if (partial) {
             tags.emplace_back(nullptr, sl::kBufferTypeBackbuffer,
                               sl::ResourceLifecycle::eValidUntilPresent, &game);

@@ -116,6 +116,8 @@ struct State {
     u64 st_compacted = 0;    // 1.03: indexed draws stored for their index range only
     // 1.03: per second, what reached the frame-generation input (NoteFgInput).
     u64 fg_frames = 0, fg_with_objects = 0, fg_object_draws = 0;
+    vk::ImageView composed_view{}; // 1.54
+    u32 st_attach = 0, st_attach_skip = 0; // 1.54: motion attachments bound / refused
     u64 composed_frame = ~0ull; // 1.41: guest frame of the last compose's object vectors
     u32 composed_draws = 0;  // draws with last frame's positions in the frame just composed
     u32 loaded_frame = 0, loaded_last = 0; // the same, this frame / the frame the flip ended
@@ -532,9 +534,12 @@ bool IsMotionKey(u32 mrt_mask, const Shader::PsColorBuffer& cb7) {
 
 void Attach(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
             Vulkan::RenderState& state) {
-    if (!g.ready || state.num_color_attachments <= Attachment) return;
-    // The G-buffer targets' size (attachments 0..6 already limited state.width / height).
-    if (!EnsureImage(state.width, state.height)) return;
+    if (!g.ready) return;
+    if (state.num_color_attachments <= Attachment || !EnsureImage(state.width, state.height)) {
+        ++g.st_attach_skip; // 1.54: a motion pipeline drawn without its attachment
+        return;
+    }
+    ++g.st_attach;
     auto& attachment = state.color_attachments[Attachment];
     const u32 cur = static_cast<u32>(g.frame & 1);
     attachment.image_view = g.views[cur];
@@ -808,6 +813,7 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     // `written`), so it reads the flag that OnFlip latched for the frame it presents.
     const bool wrote = late ? g.latched : g.written;
     g.composed_draws = 0;
+    g.composed_view = vk::ImageView{};
     g.viz_valid = false;
     if (g.ready) {
         if (reset) g_cov.reset_frames.fetch_add(1, std::memory_order_relaxed);
@@ -908,6 +914,7 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
     g.viz_valid = view;
+    g.composed_view = g.views[index];
     ++g.st_composed;
     if (late) ++g.st_composed_late;
     g.composed_draws = late ? g.loaded_last : g.loaded_frame;
@@ -983,6 +990,11 @@ void OnFlip() {
                 g.sk_frames, with, all ? 100.0 * double(with) / double(all) : 0.0, g.sk_pal,
                 g.sk_exact, g.sk_loose, g.sk_none, g.sk_overflow, g.ot_prev, g.ot_none,
                 PaletteIdOn() ? "on" : "off (BB_OBJMV_PALETTE_ID=0)"));
+            Log(fmt::format("1.54 motion attachment bound for {} draws, refused {} (no attachment "
+                            "slot / image), motion image {}x{}, last compose {}",
+                            g.st_attach, g.st_attach_skip, g.width, g.height,
+                            g.composed_view ? "read it" : "did not run"));
+            g.st_attach = g.st_attach_skip = 0;
             g.sk_pal = g.sk_exact = g.sk_loose = g.sk_none = g.sk_overflow = g.sk_frames = 0;
             g.ot_prev = g.ot_none = 0;
             g.sk_since = now;
@@ -1058,6 +1070,10 @@ u64 FrameNo() {
 
 u64 ComposedFrame() {
     return g.composed_frame;
+}
+
+vk::ImageView ComposedObjView() {
+    return g.ready ? g.composed_view : vk::ImageView{};
 }
 
 u32 ComposedDraws() {

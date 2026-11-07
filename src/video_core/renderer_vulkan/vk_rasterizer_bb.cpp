@@ -32,6 +32,7 @@
 #include "video_core/host_shaders/bb_hudless_lut_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/host_shaders/bb_fgflow_comp.h"
+#include "video_core/host_shaders/bb_mvmask_comp.h"
 #include "video_core/host_shaders/bb_rtrefl_comp.h"
 #include "video_core/host_shaders/bb_vol_comp.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -195,7 +196,7 @@ struct BBVk {
     u64 lut_frames = 0, lut_ok = 0, lut_conflict = 0, lut_mismatch = 0, lut_bad_streak = 0;
     u64 fg_hudless_frames = 0, fg_frames = 0;
     struct FgSlot {
-        OwnImage depth, mv;
+        OwnImage depth, mv, mask; // 1.54: + the motion-field mask (reactive copy)
     };
     std::array<FgSlot, 8> fg_slots{};
     // 1.41 (bb-fg30-141): guest frame numbers (BB::ObjMotion::FrameNo) of the camera motion pass
@@ -213,6 +214,18 @@ struct BBVk {
     u64 flow_acc[8]{};
     u64 flow_runs = 0, flow_skipped = 0;
     std::chrono::steady_clock::time_point flow_t{};
+    // 1.54 (bb-mvmask-154): whole-image motion field + source / confidence mask (bb_mvmask.comp).
+    vk::DescriptorSetLayout mvm_set_layout{};
+    vk::PipelineLayout mvm_layout{};
+    vk::Pipeline mvm_pipeline{};
+    bool mvm_init = false, mvm_failed = false;
+    OwnImage mvm_blocks, mvm_cls, mvm_dummy;
+    std::array<vk::Buffer, 4> mvm_buf{};
+    std::array<VmaAllocation, 4> mvm_alloc{};
+    std::array<u32*, 4> mvm_mapped{};
+    u64 mvm_no = 0, mvm_runs = 0, mvm_noprev = 0, mvm_noobj = 0;
+    u64 mvm_acc[8]{};
+    std::chrono::steady_clock::time_point mvm_t{};
     // 1.16: the HUD canvas' HUD-less image for frame generation this frame (presenter view).
     bool hs_hudless_ready = false;
     vk::ImageView hs_hudless_view{};
@@ -1860,6 +1873,8 @@ void BBFgFlow(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
     cmd.pushConstants(g_bb.flow_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
 }
+// 1.54 (bb-mvmask-154): BBMvMask.
+#include "video_core/renderer_vulkan/vk_rasterizer_bb_mvmask.inc"
 } // namespace
 
 bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view,
@@ -1892,7 +1907,8 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     if (!EnsureImage(g_bb.mv, render, vk::Format::eR16G16Sfloat, storage) ||
         (mv_zero && !EnsureImage(g_bb.mv_zero, render, vk::Format::eR16G16Sfloat,
                                  storage | vk::ImageUsageFlagBits::eTransferDst)) ||
-        !EnsureImage(g_bb.reactive, render, vk::Format::eR8Unorm, storage) ||
+        !EnsureImage(g_bb.reactive, render, vk::Format::eR8Unorm,
+                     storage | vk::ImageUsageFlagBits::eTransferSrc) ||
         !EnsureImage(g_bb.lum[0], render, vk::Format::eR16Sfloat, storage) ||
         !EnsureImage(g_bb.lum[1], render, vk::Format::eR16Sfloat, storage) ||
         (!mv_only && !EnsureImage(g_bb.output, output, vk::Format::eR16G16B16A16Sfloat,
@@ -2013,6 +2029,7 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     g_bb.mv_frame = late ? BB::ObjMotion::FrameNo() - 1 : BB::ObjMotion::FrameNo();
     BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset, late);
     BBFgFlow(cmd, lum_prev, lum_cur, render, lum_prev_valid);
+    BBMvMask(cmd, lum_prev, lum_cur, render, lum_prev_valid);
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
@@ -2096,6 +2113,27 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     {
         const char* r = std::getenv("BB_REACTIVE");
         desc.has_reactive = r == nullptr || r[0] != '0';
+    }
+    {
+        // 1.54 (bb-mvmask-154): once, what the upscaler receives.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            const auto kind = BB::Upscale::Cfg().kind;
+            const char* reactive_as =
+                kind == BB::SR::Kind::Dlss  ? "sl::kBufferTypeBiasCurrentColorHint"
+                : kind == BB::SR::Kind::Xess ? "XeSS responsive pixel mask"
+                                             : "FSR reactive + transparency&composition";
+            BB::FG::Printf("[mvmask] upscaler inputs: colour (HUD-less scene) %ux%u, depth, motion "
+                           "%s (%s, render px towards the previous frame, unjittered), mask %s "
+                           "as %s, jitter %.3f %.3f",
+                           render.width, render.height,
+                           upscale_mv.image == g_bb.mv.image ? "g_bb.mv" : "zero-MV image",
+                           MvMaskWanted() ? "camera + skinned object + flow"
+                                          : "camera + skinned object",
+                           desc.has_reactive ? "on" : "off (BB_REACTIVE=0)", reactive_as,
+                           plan.jitter[0], plan.jitter[1]);
+        }
     }
     desc.output = {g_bb.output.image, g_bb.output.view, g_bb.output.format, output,
                    vk::ImageLayout::eGeneral, g_bb.output.usage};
@@ -3086,6 +3124,33 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    // 1.54 (bb-mvmask-154): the mask (the reactive image after bb_mvmask.comp) for FG.
+    bool mask_ok = false;
+    if (MvMaskWanted() && g_bb.reactive.image && g_bb.reactive.extent == render &&
+        (g_bb.reactive.usage & vk::ImageUsageFlagBits::eTransferSrc) &&
+        EnsureImage(slot.mask, render, g_bb.reactive.format,
+                    vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
+        Barrier(cmd, slot.mask, vk::ImageLayout::eTransferDstOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+        Barrier(cmd, g_bb.reactive, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        cmd.copyImage(g_bb.reactive.image, vk::ImageLayout::eTransferSrcOptimal, slot.mask.image,
+                      vk::ImageLayout::eTransferDstOptimal,
+                      vk::ImageCopy{
+                          .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                          .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                          .extent = {render.width, render.height, 1},
+                      });
+        Barrier(cmd, g_bb.reactive, vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+        Barrier(cmd, slot.mask, vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+        mask_ok = true;
+    }
     DepthBarrier(cmd, slot.depth, vk::ImageLayout::eShaderReadOnlyOptimal,
                  vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
                  vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
@@ -3095,6 +3160,10 @@ bool Rasterizer::BBFrameGenCapture(u32 slot_index, BB::FG::Inputs& out,
     out.valid = plan.camera_valid;
     out.depth = {slot.depth.image, slot.depth.view, slot.depth.format, render, slot.depth.usage};
     out.motion = {slot.mv.image, slot.mv.view, slot.mv.format, render, slot.mv.usage};
+    out.has_mask = mask_ok;
+    if (mask_ok) {
+        out.mask = {slot.mask.image, slot.mask.view, slot.mask.format, render, slot.mask.usage};
+    }
     out.render = render;
     out.jitter[0] = plan.jitter[0];
     out.jitter[1] = plan.jitter[1];

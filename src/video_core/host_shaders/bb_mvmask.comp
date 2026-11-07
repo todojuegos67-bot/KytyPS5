@@ -1,0 +1,200 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// 1.54 (bb-mvmask-154): whole-image motion field + source / confidence mask for frame generation.
+// Runs after the camera pass (bb_mv.comp: depth reprojection) and the object compose
+// (bb_objmv.comp: skinned per-vertex motion). Two modes (p.size.z bits 8..9):
+//  mode 0 (quarter resolution): one invocation per 4x4 block. Photometric check of the block's
+//    current vector (previous luminance warped by it vs current luminance); where it does not
+//    explain the image, a block-matching search around it (step 2, radius p.size.w, then +-1
+//    refinement) gives an optical-flow vector. Block result: (vector, class, confidence).
+//  mode 1 (full resolution): every pixel takes its block's flow vector when that explains its own
+//    3x3 neighbourhood at least as well as its current vector; writes the class / confidence
+//    image (r16ui: class | confidence * 255 << 8; class 0 camera-only, 1 skinned object, 2 flow)
+//    and the frame-generation hint (r8: how much to trust the current colour over warping).
+// Vectors: render pixels towards the previous position (prev = pixel + mv), as bb_mv.comp.
+// p.size.z bit 0: previous luminance valid, bit 1: object image valid.
+// p.tune: relative gain, absolute gain (log2 / px), min block texture, confidence scale.
+// Stats: 0 camera px, 1 object px, 2 flow px, 3 sum of confidence * 255, 4 all px,
+// 5 blocks searched, 6 blocks given flow.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, r16f) uniform readonly image2D lum_prev;
+layout(binding = 1, r16f) uniform readonly image2D lum_cur;
+layout(binding = 2, rg16f) uniform image2D mv;
+layout(binding = 3, rg32ui) uniform readonly uimage2D obj_mv;
+layout(binding = 4, rgba16f) uniform image2D blocks;
+layout(binding = 5, r16ui) uniform writeonly uimage2D cls;
+layout(binding = 6, r8) uniform image2D reactive; // the upscalers' reactive mask (bb_mv.comp), raised here
+layout(binding = 7, std430) buffer Stats {
+    uint s[16];
+} st;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, flags | mode << 8, search radius
+    vec4 tune;
+    vec4 tune2; // x: hint gain into the reactive mask (BB_MVMASK_REACTIVE)
+} p;
+
+shared uint g_cam, g_obj, g_flow, g_conf, g_all;
+
+float L(float l) {
+    if (isnan(l) || isinf(l)) l = 0.0;
+    return log2(max(l, 0.0) + 0.01);
+}
+ivec2 Clamp(ivec2 c) {
+    return clamp(c, ivec2(0), ivec2(p.size.xy) - 1);
+}
+float Cur(ivec2 c) {
+    return L(imageLoad(lum_cur, Clamp(c)).r);
+}
+float Prev(ivec2 c) {
+    return L(imageLoad(lum_prev, Clamp(c)).r);
+}
+vec2 Fix(vec2 v) {
+    return (any(isnan(v)) || any(isinf(v))) ? vec2(0.0) : v;
+}
+bool IsObj(ivec2 c) {
+    if ((p.size.z & 2u) == 0u) return false;
+    uint y = imageLoad(obj_mv, Clamp(c)).y;
+    return y != 0u && y < 8u;
+}
+
+float cur4[16];
+float BlockCost(ivec2 base, ivec2 v) {
+    float e = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        ivec2 o = ivec2(i & 3, i >> 2);
+        e += abs(cur4[i] - Prev(base + o + v));
+    }
+    return e * (1.0 / 16.0);
+}
+
+void Blocks() {
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 qs = (ivec2(p.size.xy) + 3) / 4;
+    if (b.x >= qs.x || b.y >= qs.y) return;
+    ivec2 base = b * 4;
+    vec2 own = Fix(imageLoad(mv, Clamp(base + 2)).xy);
+    float mean = 0.0, sq = 0.0;
+    uint nobj = 0u;
+    for (int i = 0; i < 16; ++i) {
+        ivec2 c = base + ivec2(i & 3, i >> 2);
+        cur4[i] = Cur(c);
+        mean += cur4[i];
+        sq += cur4[i] * cur4[i];
+        if (IsObj(c)) ++nobj;
+    }
+    mean *= 1.0 / 16.0;
+    float var = max(sq / 16.0 - mean * mean, 0.0);
+    float cls_v = nobj >= 6u ? 1.0 : 0.0;
+    if ((p.size.z & 1u) == 0u) {
+        imageStore(blocks, b, vec4(own, cls_v, 0.5));
+        return;
+    }
+    ivec2 iown = ivec2(round(own));
+    float e_own = BlockCost(base, iown);
+    float conf_scale = max(p.tune.w, 1e-3);
+    if (var < p.tune.z) {
+        // Flat block: no evidence either way; keep the geometric vector, middling confidence.
+        imageStore(blocks, b, vec4(own, cls_v, clamp(1.0 - e_own / conf_scale, 0.3, 0.7)));
+        return;
+    }
+    atomicAdd(st.s[5], 1u);
+    ivec2 best = iown;
+    float e_best = e_own;
+    int r = int(p.size.w);
+    for (int dy = -r; dy <= r; dy += 2) {
+        for (int dx = -r; dx <= r; dx += 2) {
+            ivec2 v = iown + ivec2(dx, dy);
+            float e = BlockCost(base, v) + 0.002 * float(abs(dx) + abs(dy));
+            if (e < e_best) {
+                e_best = e;
+                best = v;
+            }
+        }
+    }
+    {
+        float e0 = BlockCost(base, ivec2(0));
+        if (e0 < e_best) {
+            e_best = e0;
+            best = ivec2(0);
+        }
+    }
+    ivec2 c0 = best;
+    for (int i = 0; i < 9; ++i) {
+        ivec2 v = c0 + ivec2(i % 3 - 1, i / 3 - 1);
+        float e = BlockCost(base, v);
+        if (e < e_best) {
+            e_best = e;
+            best = v;
+        }
+    }
+    bool flow = best != iown && e_best < e_own * (1.0 - p.tune.x) && e_own - e_best > p.tune.y;
+    if (flow) {
+        atomicAdd(st.s[6], 1u);
+        float conf = clamp(1.0 - e_best / max(e_own, 1e-4), 0.0, 1.0) *
+                     clamp(1.0 - e_best / conf_scale, 0.0, 1.0);
+        imageStore(blocks, b, vec4(vec2(best), 2.0, conf));
+    } else {
+        imageStore(blocks, b, vec4(own, cls_v, clamp(1.0 - e_own / conf_scale, 0.0, 1.0)));
+    }
+}
+
+float PixCost(ivec2 c, ivec2 v) {
+    float e = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        ivec2 o = ivec2(i % 3 - 1, i / 3 - 1);
+        e += abs(Cur(c + o) - Prev(c + o + v));
+    }
+    return e;
+}
+
+void Apply() {
+    if (gl_LocalInvocationIndex == 0u) {
+        g_cam = 0u; g_obj = 0u; g_flow = 0u; g_conf = 0u; g_all = 0u;
+    }
+    barrier();
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = c.x < int(p.size.x) && c.y < int(p.size.y);
+    if (inside) {
+        vec4 blk = imageLoad(blocks, c / 4);
+        vec2 own = Fix(imageLoad(mv, c).xy);
+        bool obj = IsObj(c);
+        uint k = obj ? 1u : 0u;
+        float conf = clamp(blk.w, 0.0, 1.0);
+        if (blk.z > 1.5) {
+            ivec2 f = ivec2(round(blk.xy));
+            if (PixCost(c, f) <= PixCost(c, ivec2(round(own)))) {
+                imageStore(mv, c, vec4(blk.xy, 0.0, 0.0));
+                k = 2u;
+            }
+        }
+        uint q = uint(conf * 255.0 + 0.5);
+        imageStore(cls, c, uvec4(k | (q << 8u)));
+        // Mask into the reactive image: flow pixels by their confidence, other pixels only where
+        // even the geometric vector clearly fails the photometric check (conf < 0.3).
+        float h = k == 2u ? (1.0 - conf) * 0.6 : max(0.3 - conf, 0.0);
+        float r0 = imageLoad(reactive, c).r;
+        imageStore(reactive, c, vec4(max(r0, clamp(h * p.tune2.x, 0.0, 1.0))));
+        atomicAdd(g_all, 1u);
+        atomicAdd(g_conf, q);
+        if (k == 0u) atomicAdd(g_cam, 1u);
+        else if (k == 1u) atomicAdd(g_obj, 1u);
+        else atomicAdd(g_flow, 1u);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && g_all != 0u) {
+        atomicAdd(st.s[0], g_cam);
+        atomicAdd(st.s[1], g_obj);
+        atomicAdd(st.s[2], g_flow);
+        atomicAdd(st.s[3], g_conf);
+        atomicAdd(st.s[4], g_all);
+    }
+}
+
+void main() {
+    if (((p.size.z >> 8u) & 3u) == 0u) {
+        Blocks();
+    } else {
+        Apply();
+    }
+}

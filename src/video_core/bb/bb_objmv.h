@@ -97,6 +97,9 @@ void OnFlip();
 // 1.03: draws with object vectors (last frame's positions) in the frame last composed into the
 // motion vectors (0: none composed, camera-only motion).
 u32 ComposedDraws();
+// 1.54 (bb-mvmask-154): the object-vector image the last Compose read (General layout, synced for
+// compute reads), or null when this frame had no compose (camera-only).
+vk::ImageView ComposedObjView();
 
 // 1.40 (bb-fgamd-140): what the compose pass put into the motion image since the last call (the
 // [fg-amd] line): pixels with an object vector / of characters (large skeletons) / all, composes,

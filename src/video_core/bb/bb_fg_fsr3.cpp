@@ -498,6 +498,7 @@ void LogPresentIntervals(double window) {
     const double mean_ms = n > 0.0 ? static_cast<double>(pace[2]) / n / 1e6 : 0.0;
     const double var_ms2 =
         n > 0.0 ? static_cast<double>(pace[3]) / n / 1e12 - mean_ms * mean_ms : 0.0;
+    NotePacing(-1.0, std::sqrt(std::max(var_ms2, 0.0))); // 1.54: all presents
     Printf("[midpoint] real %.1f fps, shown %.1f fps (%lld presents); interval over all presents: "
            "mean %.2f ms, sd %.2f ms (min %.2f, max %.2f, %lld intervals); placed %u of %u real "
            "flips; late %lld (max %.2f ms)",
@@ -1049,6 +1050,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
             const double mean = g_stats.pace_sum / g_stats.pace_n;
             const double sd =
                 std::sqrt(std::max(g_stats.pace_sq / g_stats.pace_n - mean * mean, 0.0));
+            NotePacing(sd * 1e3, -1.0); // 1.54: real frames
             Printf("[fsr3] present interval sd %.2f ms (mean %.2f, max %.1f, %.0f frames); pacer "
                    "%.2f ms (%s)",
                    sd * 1e3, mean * 1e3, g_stats.pace_max * 1e3, g_stats.pace_n,
@@ -1345,6 +1347,19 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     }
     prepare.depth = ImageResource(inputs->depth, true);
     prepare.motionVectors = ImageResource(inputs->motion, false);
+    {
+        // 1.54 (bb-mvmask-154): this FidelityFX API's frame-generation prepare takes depth and
+        // motion vectors only (no reactive / T&C input): the mask acts through the vectors
+        // (flow-refined) and through the upscaler's reactive mask.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Printf("[mvmask] FSR 3 FG inputs: depth + full motion field (camera + skinned + flow, "
+                   "render px, scale %.0f) + HUD-less colour; mask %s (no mask input in this "
+                   "FidelityFX FG prepare)",
+                   static_cast<double>(mv_sign), inputs->has_mask ? "built" : "not built");
+        }
+    }
     ++g_amd.prepared;
     if (inputs->reset) ++g_amd.input_resets;
     {
