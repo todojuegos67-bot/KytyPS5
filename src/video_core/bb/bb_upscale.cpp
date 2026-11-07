@@ -3462,6 +3462,11 @@ void OnInjected(bool ok, float) {
         if (g_ss_phase.load(std::memory_order_relaxed) == 1) {
             g_ss_phase.store(2, std::memory_order_relaxed);
             ++g_frame.native_post;
+        } else if (Pp() && g_ss_phase.load(std::memory_order_relaxed) == 2) {
+            // 1.45: prepost enters phase 2 at the post entry's computes, before the upscale; the
+            // upscale still ended the scene passes (1.44 counted 0 of 300, the check "failed" and
+            // its automatic whole-frame dump froze the game: r144pp_0342).
+            ++g_frame.native_post;
         }
     } else {
         g_frame.inject_failed = true;
@@ -3818,7 +3823,9 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             // internal-resolution path. BB_NATIVE_CHECK_OFF=1: 0.84's behaviour (turn off).
             const bool check_off = NativeCheckOff();
             static bool dumped = false;
-            if (bad && !check_off && !dumped) {
+            // 1.45: never an automatic dump in prepost (the dump's per-pass readbacks stalled the
+            // GPU thread: presents timed out, "source=none [no present completed]").
+            if (bad && !check_off && !dumped && !Pp()) {
                 dumped = true;
                 g_dump_request.store(g_frame_no + 1, std::memory_order_relaxed);
                 Checkpoint(fmt::format("native chain check below target: frame {} is dumped "
@@ -3826,7 +3833,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                                        "turns it off instead)",
                                        g_frame_no + 1));
             }
-            if (bad && check_off && g_off_at == 0) {
+            if (bad && check_off && g_off_at == 0 && !Pp()) {
                 // 0.84: the next frame is dumped with the chain still active (BB_DUMP_FRAME,
                 // into bb_dump), then scaling turns off two frames later.
                 g_dump_request.store(g_frame_no + 1, std::memory_order_relaxed);
