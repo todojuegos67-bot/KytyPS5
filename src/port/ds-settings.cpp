@@ -304,7 +304,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("mapa_mando", s->pad_map);
 	str("ajustes_juego", s->game_settings);
 	str("rt_antorchas", s->rt_lamps);
-	num("raton_velocidad_camara_forzada", s->kbm_camera); // (step5: a new key; the old raton_velocidad_camara=10 forced the pad too)
+	num("raton_velocidad_camara", s->kbm_camera);
 	s->kbm_camera = std::clamp(s->kbm_camera, 5, 15);
 	boo("raton_camara_instantanea", s->kbm_warp);
 	boo("raton_calibrar", s->kbm_calibrate);
@@ -524,8 +524,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "mapa_mando=" << s.pad_map << "\n"
 	  << "; Ajustes del juego (los del lanzador del emulador): gs_sun=3;gs_spot=1;... (0 o vacio = como viene el juego)\n"
 	  << "ajustes_juego=" << s.game_settings << "\n"
-	  << "; Forzar la velocidad de camara del juego (0 = la del menu del juego; 5-15 tambien cambia la del mando)\n"
-	  << "raton_velocidad_camara_forzada=" << s.kbm_camera << "\n"
+	  << "; Velocidad de camara con raton (5-15; 10 = el maximo del menu del juego, 11-15 extra)\n"
+	  << "raton_velocidad_camara=" << s.kbm_camera << "\n"
 	  << "; Camara instantanea (frame warp): la imagen gira con el raton antes de que el juego dibuje\n"
 	  << "raton_camara_instantanea=" << b(s.kbm_warp) << "\n"
 	  << "; 1: el proximo arranque calibra la camara del raton (kbm_curve.txt) y vuelve a 0\n"
@@ -1196,14 +1196,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Set("KYTY_KBM_WARP", s.kbm && s.kbm_warp ? "1" : "");
 	env.Set("KYTY_KBM_CALIBRATE", s.kbm_calibrate ? "1" : "");
 	if (s.kbm_calibrate) env.Set("KYTY_KBM", "1");
-	// (step5) The mouse no longer changes the pad: cp11_Setting_CameraSpeed overrode the game's own camera speed option
-	// for every input (the user's options save had 5; the convar forced 10: the pad's camera twice as fast with the
-	// mouse on), and the eboot's turn-ramp patch (KYTY_KBM_NO_RAMP) also changed the pad's full-tilt turns. Both only
-	// on request now: raton_velocidad_camara_forzada other than 0 sets the convar; KYTY_KBM_NO_RAMP=1 in the environment keeps
-	// the ramp patch. The mouse's own speed is raton_sensibilidad.
-	if ((s.kbm || s.kbm_calibrate) && demons && s.kbm_camera > 0)
-		env.AppendConvars("cp11_Setting_CameraSpeed=" + std::to_string(std::clamp(s.kbm_camera, 5, 15)));
-	if (s.kbm && std::getenv("KYTY_KBM_NO_RAMP") == nullptr) env.Set("KYTY_KBM_NO_RAMP", "0");
+	if ((s.kbm || s.kbm_calibrate) && demons) env.AppendConvars("cp11_Setting_CameraSpeed=" + std::to_string(std::clamp(s.kbm_camera, 5, 15)));
 	// The port's own: metrics (the launcher started metricas.ps1; here the in-game panel) and rumble.
 	env.Set("KYTY_FPS_HUD", ""); // (ds-pc-port37) Metricas: the emulator launcher's metricas.ps1 window (ds-main); F8 still shows the in-game panel
 	env.Set("KYTY_HAPTIC_RUMBLE", s.rumble ? "1" : "0");
