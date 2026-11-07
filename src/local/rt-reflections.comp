@@ -491,8 +491,11 @@ float Moving(vec2 uv, vec3 P) { return (push.misc.w & 128) != 0 ? MovingRaw(uv, 
 vec3 FlatFloor(vec3 N, vec3 Nd) {
 	if (!(mparams.w > -0.5) || (push.misc.w & 8) == 0) return N;
 	vec3  up = normalize(up_view.xyz);
-	float f  = smoothstep(0.93, 0.98, dot(Nd, up)) * smoothstep(0.85, 0.95, dot(N, up));
-	return f > 0.0 ? normalize(mix(N, up, 0.85 * f)) : N;
+	// (des-refl-flat) Solid floors reflect flat: when the geometry (the depth's normal) is level, the reflection ray uses
+	// world up fully, whatever the normal map's bumps say (they were kept at 15 %, and bumps past 0.85 not at all: on
+	// stone floors such as the Nexus the reflection rippled like water). Only water (WaterNormal) keeps its waves.
+	float f  = smoothstep(0.93, 0.98, dot(Nd, up));
+	return f > 0.0 ? normalize(mix(N, up, f)) : N;
 }
 
 Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
