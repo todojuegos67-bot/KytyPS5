@@ -195,6 +195,7 @@ struct AudioOut2PortStateEntry {
 	const void*            pcm_data      = nullptr;
 	float                  gain          = 1.0f; // a mono (object) port's gain attribute
 	uint32_t               ambisonics    = 0;    // an object port's attribute 8: 0x40 | ACN when it carries one
+	uint32_t               passthrough   = 0;    // an object port's attribute 5: straight to the left (1) or right (2) channel
 	// Attribute 1 as the guest sends it: one gain for each of the port's channels. Its speaker and
 	// vibration ports carry their level here, and a vibration port's is two channels wide - the old
 	// single-float read dropped both.
@@ -240,6 +241,7 @@ static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PASSTHROUGH = 5;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
 static constexpr uint32_t AUDIO_OUT2_AMBISONICS_CHANNEL           = 0x40;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
@@ -435,10 +437,12 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 // positive) by two virtual microphones facing about 74 degrees left and right: a sound straight ahead
 // plays at full level on both sides, as a binaural render plays it, one behind at -3 dB (the level of
 // a surround downmix), and one at the side with the power it has ahead. Cardioids facing 90 degrees
-// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. An object
-// that is no ambisonics channel plays in the centre. Each port's gain applies, and the result goes to
-// the front left and right of the context's first float main port. Adding the 36 channels up instead
-// cancelled most directions.
+// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. A passthrough
+// object goes to its own channel: with headphones the game gives the system its stereo mix on two of
+// them, left and right (attribute 5; its Headphone_3D_PassThru preset), and both played in the centre
+// made the music mono (issue #294). Another object that is no ambisonics channel plays in the centre. Each
+// port's gain applies, and the result goes to the front left and right of the context's first float main
+// port. Adding the 36 channels up instead cancelled most directions.
 static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
 	constexpr float HALF_POWER = 0.70710677f;
 	// Ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
@@ -456,7 +460,10 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 			continue;
 		}
 		float left = HALF_POWER, right = HALF_POWER;
-		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
+		if (object.passthrough == 1 || object.passthrough == 2) {
+			left  = object.passthrough == 1 ? 1.0f : 0.0f;
+			right = object.passthrough == 2 ? 1.0f : 0.0f;
+		} else if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
 			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
 			if (acn == 0) {
 				left = right = W_GAIN;
@@ -897,6 +904,8 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	bool        has_gains      = false;
 	uint32_t    ambisonics     = 0;
 	bool        has_ambisonics = false;
+	uint32_t    passthrough    = 0;
+	bool        has_passthrough = false;
 	for (uint32_t i = 0; i < num; i++) {
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
 		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
@@ -930,9 +939,14 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 			std::memcpy(&ambisonics, attributes[i].value, sizeof(uint32_t));
 			has_ambisonics = true;
 		}
+		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PASSTHROUGH && attributes[i].value != nullptr &&
+		    attributes[i].value_size == sizeof(uint32_t)) {
+			std::memcpy(&passthrough, attributes[i].value, sizeof(uint32_t));
+			has_passthrough = true;
+		}
 	}
 
-	if (has_pcm || has_gain || has_gains || has_ambisonics) {
+	if (has_pcm || has_gain || has_gains || has_ambisonics || has_passthrough) {
 		g_audioout2_port_mutex.Lock();
 		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
 			if (has_pcm) {
@@ -945,6 +959,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 				state->gains_set = true;
 			}
 			if (has_ambisonics) state->ambisonics = ambisonics;
+			if (has_passthrough) state->passthrough = passthrough;
 		}
 		g_audioout2_port_mutex.Unlock();
 	}
