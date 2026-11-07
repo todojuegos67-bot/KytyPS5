@@ -42,6 +42,10 @@
 #include <ffx_api/vk/ffx_api_vk.h>
 #endif
 
+namespace ImGui::Core {
+bool MustKeepDrawing(); // imgui/renderer/imgui_core.h (1.51: overlay up)
+}
+
 namespace BB::FG::Amd {
 
 #if defined(_WIN32)
@@ -989,6 +993,21 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     // bb-dcideas-094: never for movies or 2D flips (menus, loading screens).
     bool usable = inputs != nullptr && inputs->valid && !g_fg_failed && !FgBlocked(nullptr) &&
                   !g_watchdog_off.load();
+    // 1.51: while an emulator overlay is up (F1 menu, trophy list / toasts: ImGui keeps drawing)
+    // FSR 3 FG is bypassed on every present (real frames presented directly) and resumes when it
+    // closes. r149_0451 / r149_0459: opening the menu with FG on toggled generation off / on every
+    // other present until presents stopped completing. BB_FG_OVERLAY_BYPASS=0: old.
+    static const bool overlay_bypass = EnvOn("BB_FG_OVERLAY_BYPASS", true);
+    {
+        static bool was = false;
+        const bool overlay = overlay_bypass && ImGui::Core::MustKeepDrawing();
+        if (overlay != was) {
+            was = overlay;
+            Printf("[fg-ui] 1.51 overlay %s: FSR 3 frame generation %s", overlay ? "open" : "closed",
+                   overlay ? "bypassed (real frames presented directly)" : "resumes");
+        }
+        if (overlay) usable = false;
+    }
     static int first_steps = 0; // 0.41: the first 3D frames' steps, logged (a crash shows the last)
     if (usable) {
         if (const char* why = InputsProblem(*inputs, backbuffer)) {
