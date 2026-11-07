@@ -178,6 +178,14 @@ void EmitBBFragmentMotion(EmitContext& ctx) {
         bool_type, ctx.OpLogicalAnd(bool_type, front, finite),
         ctx.OpFOrdGreaterThan(bool_type, ctx.OpCompositeExtract(f32_type, previous, 2u),
                               ctx.Constant(f32_type, 0.5f)));
+    // 1.46 (bb-fgmv-146): pixels drawn by a motion pipeline with no vector carry why (o.y >= 8:
+    // 8 no previous position for the draw, 9 behind the camera, 10 not finite); bb_objmv.comp
+    // counts them for [fg-mv] and treats them as no vector (camera / flow motion kept).
+    const Id loaded = ctx.OpFOrdGreaterThan(bool_type, ctx.OpCompositeExtract(f32_type, previous, 2u),
+                                            ctx.Constant(f32_type, 0.5f));
+    const Id reason = ctx.OpSelect(u32_type, ctx.OpLogicalNot(bool_type, loaded), ctx.ConstU32(8u),
+                                   ctx.OpSelect(u32_type, ctx.OpLogicalNot(bool_type, front),
+                                                ctx.ConstU32(9u), ctx.ConstU32(10u)));
     const Id zero = ctx.Constant(f32_type, 0.0f);
     const Id vector = ctx.OpCompositeConstruct(ctx.F32[2], ctx.OpSelect(f32_type, written, dx, zero),
                                                ctx.OpSelect(f32_type, written, dy, zero));
@@ -191,7 +199,7 @@ void EmitBBFragmentMotion(EmitContext& ctx) {
                                                   ctx.OpCompositeExtract(f32_type, previous, 2u),
                                                   ctx.Constant(f32_type, 1.5f)),
                                               ctx.ConstU32(2u), ctx.ConstU32(1u)),
-                                 ctx.u32_zero_value)));
+                                 reason)));
 }
 
 } // namespace Shader::Backend::SPIRV

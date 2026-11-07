@@ -15,7 +15,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, rg32ui) uniform readonly uimage2D obj_mv;
 layout(binding = 1, rg16f) uniform image2D mv_out;
 layout(binding = 2, std430) buffer Stats {
-    uint s[16];
+    uint s[20];
 } st;
 layout(binding = 3, rgba8) uniform writeonly image2D viz;
 layout(push_constant) uniform Push {
@@ -72,7 +72,10 @@ void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool o
     uvec2 o = imageLoad(obj_mv, c).xy;
     vec2 v = cam;
     bool obj = false;
-    if (o.y != 0u) {
+    // 1.46: o.y >= 8 = drawn by a motion pipeline without a vector (8 no previous position,
+    // 9 behind the camera, 10 not finite): words 16..18; word 19: such pixels + vector pixels.
+    if ((p.size.w & 4u) != 0u && o.y >= 8u && o.y <= 10u) atomicAdd(st.s[16u + (o.y - 8u)], 1u);
+    if (o.y != 0u && o.y < 8u) {
         vec2 ov = unpackHalf2x16(o.x);
         if (!any(isnan(ov)) && !any(isinf(ov))) {
             v = ov;

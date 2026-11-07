@@ -1039,6 +1039,18 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    g_amd.far_v, g_amd.fov, g_amd.fov * 57.29578f,
                    g_amd.depth_inverted ? "inverted (near > far given, infinite flag)"
                                         : "forward");
+            Printf("[fg-mv] 1.46 object-MV attachment: %.2f %% of pixels with an object vector, "
+                   "%.2f %% drawn by a motion pipeline without one (no previous position %.2f "
+                   "%%, behind camera %.2f %%, not finite %.2f %%)%s",
+                   100.0 * static_cast<double>(cov.object_px) / all,
+                   100.0 * static_cast<double>(cov.no_prev_px + cov.behind_px + cov.nonfinite_px) / all,
+                   100.0 * static_cast<double>(cov.no_prev_px) / all,
+                   100.0 * static_cast<double>(cov.behind_px) / all,
+                   100.0 * static_cast<double>(cov.nonfinite_px) / all,
+                   cov.frames_read && cov.object_px == 0 &&
+                           cov.no_prev_px + cov.behind_px + cov.nonfinite_px == 0
+                       ? " -> the motion attachment is never written by the G-buffer pass"
+                       : "");
             const AmdSecond keep = g_amd;
             g_amd = {};
             std::copy_n(keep.mv_scale, 2, g_amd.mv_scale);
