@@ -2840,9 +2840,9 @@ void Draw(ImDrawList* dl, float W, float H, float unit) {
 	const float  tf = static_cast<float>(std::fmod(t, 36000.0)); // (wraps every 10 h; well before float precision goes)
 	// Fog: three layers, far = larger and slower (parallax), cold grey-blue, low alpha (the text stays readable).
 	const float S = std::max(W, H);
-	Layer(dl, W, H, S * 1.55f, tf * 6.0f, tf * 1.2f + 37.0f, {0.62f, 0.67f, 0.74f}, 0.10f);
-	Layer(dl, W, H, S * 1.10f, tf * 11.0f + 400.0f, -tf * 1.8f, {0.68f, 0.72f, 0.78f}, 0.085f);
-	Layer(dl, W, H, S * 0.80f, -tf * 17.0f + 900.0f, tf * 2.6f + 250.0f, {0.74f, 0.77f, 0.82f}, 0.06f);
+	Layer(dl, W, H, S * 1.55f, tf * 6.0f, tf * 1.2f + 37.0f, {0.62f, 0.67f, 0.74f, 1.0f}, 0.10f);
+	Layer(dl, W, H, S * 1.10f, tf * 11.0f + 400.0f, -tf * 1.8f, {0.68f, 0.72f, 0.78f, 1.0f}, 0.085f);
+	Layer(dl, W, H, S * 0.80f, -tf * 17.0f + 900.0f, tf * 2.6f + 250.0f, {0.74f, 0.77f, 0.82f, 1.0f}, 0.06f);
 	// Ash: depth z (0 far .. 1 near) sets size, speed, brightness and softness (the near ones are larger, blurrier, fainter).
 	dl->PushTexture(g_dot->GetTexRef());
 	for (int i = 0; i < kDust; i++) {
