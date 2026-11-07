@@ -1255,16 +1255,255 @@ void Classify(int idx, u8 bit, VAddr addr) {
 }
 } // namespace
 
+// ---------------------------------------------------------------------------------------------
+// 1.44 (bb-prepost-144) BB_SCENE_UPSCALE=prepost: the native chain with Bloodborne's pass roles
+// fixed by shader hash instead of learned at run time. Pass graph of the 1.32 full-frame captures
+// (aa_on_132 / aa_off_132, 2560x1440 game output):
+//   phase 0 (before the G-buffer): 32x32 / 1280x720 / 4096x4096 shadow passes: no scene-size image.
+//   phase 1 (scene, INTERNAL size): starts at the G-buffer draw (>= 3 colour targets with the scene
+//     depth 0x250d90000): G-buffer c0..c6, decals (samples the albedo copy 0x27e5c0000 and linear
+//     depth 0x2703b8000, both made by HLE buffer copies cs 0x3d5ebf4e), AO 0x287da0000 /
+//     0x288c00000, lighting 0x2810e0000 / 0x281f40000, SSS 0x284a60000 / 0x294e00000, the lit
+//     scene colour 0x2716c0000 (RGBA16F), forward / transparent draws into it (they sample the
+//     scene copy 0x273380000 and the linear depth). Every scene-size image bound or sampled here is
+//     internal size; image copies here stay between internal-size images.
+//   phase 2 (post + HUD, OUTPUT size): starts at the first of cs 0x9a9cf8a9 (320x180 grid, writes
+//     the post source 0x25bc10000), cs 0x200820a1 (exposure, 16x16 RGBA32F) or ps
+//     0x00000ccc53f28aa5 (post entry: samples 0x2716c0000 -> DLSS input, its output-size twin
+//     holds the DLSS output). Bloom pyramid (fixed 1280x720 .. 7x6, size independent), tonemap
+//     ps 0x5e77fc38f59 / 0xed5993eb777 into the UI image 0x24ff30000, layer chain (ps 0x57f88b16d87
+//     samples G-buffer c6 0x27c900000: output-size twin, upsampled), HUD (stencil in the scene
+//     depth's output-size twin), flip ps 0x38e3fa1a45e. No image of this phase becomes a scene
+//     target (UI / post targets are put on a deny list), compute grids here are never scaled.
+// What 1.33 / 1.34 (BB_SCENE_UPSCALE=native heuristics) got wrong, fixed here: the UI image
+// 0x24ff30000 learned as a scene target (HUD draws use the scene depth); 0x25bc10000 "bound with
+// scaled targets, scaled too" and cs 0x9a9cf8a9 learned as a scene compute (scaled grid writing an
+// internal-size post source); 0x27c900000 pinned as a "history image" at the output size while the
+// G-buffer drew it with internal-size targets; the scene-copy / albedo-copy HLE copies took the
+// source's stale output-size version ("source's other version"); linear depth 0x2703b8000 never a
+// scene target (output size, filled from an internal-size depth); small non-screen compute grids
+// (2x26) scaled.
+namespace {
+bool Pp() {
+    return BB::ResPatch::Prepost();
+}
+bool PpPostCs(u64 h) {
+    return h == 0x9a9cf8a9ull || h == 0x200820a1ull;
+}
+std::atomic<bool> g_pp_post_seen{false}, g_pp_post_last{false}, g_pp_injected{false};
+std::atomic<VAddr> g_pp_src{0};
+std::array<std::atomic<VAddr>, 64> g_pp_deny{};
+std::atomic<u32> g_pp_deny_n{0};
+std::atomic<u32> g_pp_mixed{0}, g_pp_mixed_total{0}, g_pp_cs_twin{0}, g_pp_refused{0},
+    g_pp_added{0}, g_pp_entry_cs{0}, g_pp_entry_ps{0}, g_pp_injects{0}, g_pp_grid_rejects{0},
+    g_pp_p1_out_targets{0};
+std::array<std::atomic<u32>, 4> g_pp_copy{}; // same-size, destination internal, source current, blit
+std::array<std::atomic<VAddr>, 6> g_pp_mixed_addr{};
+std::array<std::atomic<u8>, 6> g_pp_mixed_kind{};
+std::array<std::atomic<u8>, 64> g_pp_cls{};     // per second: 1 internal, 2 output, 4 compute twin
+std::array<std::atomic<u32>, 64> g_pp_upfill{}; // per second: output-size twin filled in phase 2
+bool PpDenied(VAddr a) {
+    const u32 n = g_pp_deny_n.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
+        if (g_pp_deny[i].load(std::memory_order_relaxed) == a) return true;
+    }
+    return false;
+}
+void PpMixed(VAddr a, u8 kind) {
+    g_pp_mixed.fetch_add(1, std::memory_order_relaxed);
+    if (g_pp_mixed_total.fetch_add(1, std::memory_order_relaxed) < 8) {
+        Checkpoint(fmt::format("[prepost] MIXED-SIZE SAMPLE: {:#x} ({}) phase {}", a,
+                               kind == 1   ? "phase-1 draw with internal targets reads an "
+                                             "output-size scene-size image"
+                               : kind == 2 ? "scaled scene compute reads an output-size image"
+                               : kind == 3 ? "post / HUD pass reads an internal-size image"
+                                           : "unscaled compute reads an internal-size image",
+                               g_ss_phase.load(std::memory_order_relaxed)));
+    }
+    for (u32 i = 0; i < g_pp_mixed_addr.size(); ++i) {
+        VAddr cur = g_pp_mixed_addr[i].load(std::memory_order_relaxed);
+        if (cur == a) return;
+        if (cur == 0 && g_pp_mixed_addr[i].compare_exchange_strong(cur, a)) {
+            g_pp_mixed_kind[i].store(kind, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+// Adds a scene-size address seen in the scene passes (bound or sampled) to the scene targets.
+int PpAddScene(VAddr addr) {
+    if (PpDenied(addr)) {
+        if (g_pp_refused.fetch_add(1, std::memory_order_relaxed) < 4) {
+            Checkpoint(fmt::format("[prepost] {:#x} used in the scene passes but written by a post / "
+                                   "HUD pass earlier: kept at the output size",
+                                   addr));
+        }
+        return -1;
+    }
+    const u32 n = g_ss_count.load(std::memory_order_acquire);
+    if (n >= g_ss_addrs.size()) return -1;
+    g_ss_valid[n].store(2, std::memory_order_relaxed);
+    g_ss_class[n].store(0, std::memory_order_relaxed);
+    g_ss_addrs[n] = addr;
+    g_ss_count.store(n + 1, std::memory_order_release);
+    if (g_pp_added.fetch_add(1, std::memory_order_relaxed) < 24) {
+        Checkpoint(fmt::format("[prepost] {:#x} ({}x{}) used in the scene passes: scene target, "
+                               "internal size {}x{} ({} scene targets)",
+                               addr, g_ss_w, g_ss_h, g_ss_sw, g_ss_sh, n + 1));
+    }
+    return static_cast<int>(n);
+}
+const char* PpRole(VAddr a) {
+    // Labels from the 1.32 captures, for the log only (the classification never uses them).
+    switch (a) {
+    case 0x250d90000: return "scene depth";
+    case 0x277678000: return "G-buffer c0 albedo";
+    case 0x2784e0000: return "G-buffer c1 normal";
+    case 0x279348000: return "G-buffer c2";
+    case 0x27a1b0000: return "G-buffer c3";
+    case 0x280280000: return "G-buffer c4";
+    case 0x282da0000: return "G-buffer c5";
+    case 0x27c900000: return "G-buffer c6 (read by post ps 0x57f88b16d87)";
+    case 0x2703b8000: return "linear depth (copy)";
+    case 0x27e5c0000: return "albedo copy (decals)";
+    case 0x273380000: return "scene copy (transparents)";
+    case 0x287da0000: return "AO";
+    case 0x288c00000: return "AO blur";
+    case 0x2810e0000: return "lighting diffuse";
+    case 0x281f40000: return "lighting specular";
+    case 0x284a60000: return "SSS a";
+    case 0x294e00000: return "SSS b";
+    case 0x2716c0000: return "lit scene colour (DLSS input)";
+    default: return "";
+    }
+}
+} // namespace
+
+bool Prepost() {
+    return Pp();
+}
+
+void PrepostDispatch(u64 cs_hash) {
+    if (!Pp() || !PpPostCs(cs_hash)) return;
+    g_pp_post_seen.store(true, std::memory_order_relaxed);
+    if (g_ss_frozen.load(std::memory_order_relaxed) &&
+        g_ss_phase.load(std::memory_order_relaxed) == 1) {
+        g_ss_phase.store(2, std::memory_order_relaxed);
+        g_pp_entry_cs.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void PrepostPostTarget(VAddr addr, u32 w, u32 h) {
+    if (!Pp() || addr == 0 || w != g_ss_w || h != g_ss_h || SceneIndex(addr) >= 0 ||
+        PpDenied(addr)) {
+        return;
+    }
+    const u32 n = g_pp_deny_n.load(std::memory_order_relaxed);
+    if (n >= g_pp_deny.size()) return;
+    g_pp_deny[n].store(addr, std::memory_order_relaxed);
+    g_pp_deny_n.store(n + 1, std::memory_order_release);
+    Checkpoint(fmt::format("[prepost] {:#x} {}x{} written by a post / HUD pass: output size, never "
+                           "a scene target ({} such targets)",
+                           addr, w, h, n + 1));
+}
+
+bool PrepostComputeGridOk(u32 dx, u32 dy) {
+    if (!Pp()) return true;
+    // A scene compute's grid is scaled with the image: only a screen-proportional grid.
+    const double screen = g_ss_h ? double(g_ss_w) / g_ss_h : 16.0 / 9.0;
+    const bool ok = dx >= 8 && dy >= 4 && std::fabs(double(dx) / dy / screen - 1.0) < 0.2;
+    if (!ok && g_pp_grid_rejects.fetch_add(1, std::memory_order_relaxed) < 4) {
+        Checkpoint(fmt::format("[prepost] compute grid {}x{} touches scene targets but is not "
+                               "screen-proportional: never scaled (reads output-size twins)",
+                               dx, dy));
+    }
+    return ok;
+}
+
+bool PrepostVersionCurrent(VAddr addr, bool scaled) {
+    const int idx = SceneIndex(addr);
+    if (idx < 0) return !scaled;
+    return (g_ss_valid[idx].load(std::memory_order_relaxed) & (scaled ? 1 : 2)) != 0;
+}
+
+void PrepostCopy(int how) {
+    if (how >= 0 && how < 4) g_pp_copy[how].fetch_add(1, std::memory_order_relaxed);
+}
+
+void PrepostPhase1OutputTarget() {
+    if (Pp()) g_pp_p1_out_targets.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+void PpSecond(u32 frames3d) {
+    const bool live = g_ss_frozen.load(std::memory_order_relaxed) && !g_ss_off.load(std::memory_order_relaxed);
+    std::string table;
+    const u32 n = g_ss_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
+        const u8 c = g_pp_cls[i].exchange(0, std::memory_order_relaxed);
+        const u32 up = g_pp_upfill[i].exchange(0, std::memory_order_relaxed);
+        const char* role = PpRole(g_ss_addrs[i]);
+        table += fmt::format(" | {:#x}{}{}{}: {}{}{}{}", g_ss_addrs[i], *role ? " " : "", *role ? role : "",
+                             "", c == 0 ? "unused" : "", (c & 1) ? "internal(scene)" : "",
+                             (c & 2) ? (c & 1 ? "+output(post)" : "output(post)") : "",
+                             (c & 4) ? "+compute-twin" : "");
+        if (up) table += fmt::format(" upsampled-into-post x{}", up);
+    }
+    std::string deny;
+    const u32 dn = g_pp_deny_n.load(std::memory_order_acquire);
+    for (u32 i = 0; i < dn; ++i) deny += fmt::format(" {:#x}", g_pp_deny[i].load(std::memory_order_relaxed));
+    std::string mixed;
+    for (u32 i = 0; i < g_pp_mixed_addr.size(); ++i) {
+        const VAddr a = g_pp_mixed_addr[i].exchange(0, std::memory_order_relaxed);
+        if (a) mixed += fmt::format(" {:#x}(k{})", a, g_pp_mixed_kind[i].load(std::memory_order_relaxed));
+    }
+    Checkpoint(fmt::format(
+        "[prepost] last second: {} 3D frames, chain {}, internal {}x{} -> output {}x{}; post entry by "
+        "cs 0x9a9cf8a9/0x200820a1 {} / ps {:#x} {}, DLSS at the post entry {}; MIXED-SIZE SAMPLES {} "
+        "(must be 0){}; phase-1 output-size targets {}; unscaled scene computes reading twins {}; "
+        "copies same-size {}, into internal destination {}, from current source version {}, scaled blit {}; "
+        "refused scene adds {}; targets ({}):{}; output-only (post/HUD) targets:{}",
+        frames3d, live ? "live" : "not live", g_ss_sw, g_ss_sh, g_ss_w, g_ss_h,
+        g_pp_entry_cs.exchange(0), AaPs(), g_pp_entry_ps.exchange(0), g_pp_injects.exchange(0),
+        g_pp_mixed.exchange(0), mixed, g_pp_p1_out_targets.exchange(0), g_pp_cs_twin.exchange(0),
+        g_pp_copy[0].exchange(0), g_pp_copy[1].exchange(0), g_pp_copy[2].exchange(0),
+        g_pp_copy[3].exchange(0), g_pp_refused.exchange(0), n, table, deny));
+}
+} // namespace
+
 bool ScaleImage(VAddr addr, u32& w, u32& h) {
     if (!g_ss_frozen.load(std::memory_order_acquire) || g_ss_off.load(std::memory_order_relaxed) ||
         w != g_ss_w || h != g_ss_h) {
         return false;
     }
-    const int idx = SceneIndex(addr);
+    int idx = SceneIndex(addr);
+    if (Pp()) {
+        const int phase = g_ss_phase.load(std::memory_order_relaxed);
+        const bool compute = g_ss_compute.load(std::memory_order_relaxed);
+        // The DLSS input: the post entry's sample of the lit scene colour, before the upscale.
+        if (phase == 2 && !compute && idx >= 0 && addr == g_pp_src.load(std::memory_order_relaxed) &&
+            !g_pp_injected.load(std::memory_order_relaxed)) {
+            g_pp_cls[idx].fetch_or(1, std::memory_order_relaxed);
+            w = g_ss_sw;
+            h = g_ss_sh;
+            return true;
+        }
+        // Every scene-size image bound or sampled in the scene passes is a scene target.
+        if (idx < 0 && phase == 1) {
+            idx = PpAddScene(addr);
+        }
+        if (idx >= 0) {
+            const bool scaled = phase == 1 && (!compute || g_ss_compute_scaled.load(std::memory_order_relaxed));
+            if (phase == 1 && compute && !scaled) {
+                g_ss_compute_touched.store(true, std::memory_order_relaxed);
+                g_pp_cs_twin.fetch_add(1, std::memory_order_relaxed);
+            }
+            g_pp_cls[idx].fetch_or(scaled ? 1 : compute ? 4 : 2, std::memory_order_relaxed);
+        }
+    }
     if (idx < 0) {
         return false;
     }
-    if (NativePerPass() && g_ss_pinned[idx].load(std::memory_order_relaxed)) {
+    if (NativePerPass() && !Pp() && g_ss_pinned[idx].load(std::memory_order_relaxed)) {
         return false; // 0.83: a history address, one size (output) everywhere
     }
     if (NativePerPass()) {
@@ -1318,7 +1557,7 @@ bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write, bool depth) {
         }();
         const u32 frame = g_ss_frame.load(std::memory_order_relaxed);
         if (g_ss_seen[idx].exchange(frame, std::memory_order_relaxed) != frame && !write &&
-            g_ss_phase.load(std::memory_order_relaxed) != 2 && !history_copy &&
+            g_ss_phase.load(std::memory_order_relaxed) != 2 && !history_copy && !Pp() &&
             !g_ss_pinned[idx].load(std::memory_order_relaxed) &&
             addr != g_ss_depth.load(std::memory_order_relaxed) &&
             addr != g_ss_source.load(std::memory_order_relaxed) &&
@@ -1339,6 +1578,9 @@ bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write, bool depth) {
     // image that still held the first frame's picture (06:24 run: the spawn view fixed on screen).
     (void)depth;
     const bool copy = (valid & mine) == 0 && (valid & other) != 0;
+    if (copy && Pp() && !scaled && g_ss_phase.load(std::memory_order_relaxed) == 2) {
+        g_pp_upfill[idx].fetch_add(1, std::memory_order_relaxed); // internal -> output in post
+    }
     if (!copy && !write && (valid & mine) != 0 &&
         g_ss_phase.load(std::memory_order_relaxed) == 2) {
         const u32 age = g_ss_age[idx][scaled ? 0 : 1].load(std::memory_order_relaxed);
@@ -1393,8 +1635,29 @@ void TwinFailed(VAddr addr, std::string_view why) {
     }
 }
 
-void BeginDraw(VAddr depth_addr, u32 colors) {
+void BeginDraw(VAddr depth_addr, u32 colors, u64 ps_hash) {
     g_ss_compute.store(false, std::memory_order_relaxed);
+    if (Pp()) {
+        // 1.44: phase 1 only from the G-buffer draw; phase 2 at the post entry's pixel shader.
+        const int ph = g_ss_phase.load(std::memory_order_relaxed);
+        if (ps_hash == AaPs()) {
+            g_pp_post_seen.store(true, std::memory_order_relaxed);
+            if (ph == 1 && g_ss_frozen.load(std::memory_order_relaxed)) {
+                g_ss_phase.store(2, std::memory_order_relaxed);
+                g_pp_entry_ps.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        // The frame's depth clear (no colour target, no pixel shader: aacap #0) or the G-buffer
+        // draw start the scene; HUD draws (one UI target or a stencil mask with a pixel shader,
+        // also on the scene depth) never do.
+        if (depth_addr != 0 && depth_addr == g_ss_depth.load(std::memory_order_relaxed) &&
+            ((colors >= 3 && ph != 1) || (colors == 0 && ps_hash == 0 && ph == 0))) {
+            g_ss_phase.store(1, std::memory_order_relaxed);
+            g_ss_frame.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
     // The scene passes start at the first draw with the scene depth; a G-buffer draw (3 or more
     // colour targets with the scene depth) also starts them after the upscaler, so the phases do
     // not depend on when the flip is seen (0.76).
@@ -1509,6 +1772,10 @@ void AddSceneTarget(VAddr addr) {
             }
             return;
         }
+    }
+    if (Pp() && PpDenied(addr)) {
+        g_pp_refused.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
     bool after_upscale = false, flip = false;
     {
@@ -2215,7 +2482,9 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     }
     const VAddr scene_depth = f.gb_depth != 0 ? f.gb_depth : g_learned.gb_depth;
     g_draw.scene = !f.injected && g_draw.has_depth && depth->addr == scene_depth;
-    if (g_draw.scene && SceneScaleWanted() && !g_ss_frozen.load(std::memory_order_relaxed)) {
+    if (g_draw.scene && SceneScaleWanted() && !g_ss_frozen.load(std::memory_order_relaxed) &&
+        !(Pp() && g_pp_post_seen.load(std::memory_order_relaxed))) {
+        // (1.44 prepost: HUD draws use the scene depth too; only draws before the post entry)
         const auto add = [](VAddr a) {
             if (a != 0 && g_ss_candidates.size() < 16 &&
                 std::find(g_ss_candidates.begin(), g_ss_candidates.end(), a) ==
@@ -2473,6 +2742,35 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     if (!targets_it && f.gb_w != 0 && width == f.gb_w && height == f.gb_h) {
         g_draw.samples_render_size = true;
     }
+    if (Pp()) {
+        // 1.44: the DLSS input is the HDR image the post entry samples (hash, not learned order).
+        if (!g_draw.compute && g_draw.ps_hash == AaPs() && !targets_it && IsHdr(format)) {
+            g_pp_src.store(addr, std::memory_order_relaxed);
+            g_learned.scene_color = addr;
+        }
+        if (g_ss_frozen.load(std::memory_order_relaxed) && !g_ss_off.load(std::memory_order_relaxed)) {
+            const int phase = g_ss_phase.load(std::memory_order_relaxed);
+            const bool internal_img = width == g_ss_sw && height == g_ss_sh;
+            const bool output_img = width == g_ss_w && height == g_ss_h;
+            if (phase == 1 && !g_draw.compute && output_img) {
+                bool internal_target = g_draw.has_depth && g_draw.depth.width == g_ss_sw &&
+                                       g_draw.depth.height == g_ss_sh;
+                for (u32 i = 0; i < g_draw.num_colors; ++i) {
+                    if (g_draw.colors[i].width == g_ss_sw && g_draw.colors[i].height == g_ss_sh) {
+                        internal_target = true;
+                    }
+                }
+                if (internal_target) PpMixed(addr, 1);
+            } else if (phase == 1 && g_draw.compute) {
+                const bool cs_scaled = g_ss_compute_scaled.load(std::memory_order_relaxed);
+                if (cs_scaled && output_img) PpMixed(addr, 2);
+                if (!cs_scaled && internal_img) PpMixed(addr, 4);
+            } else if (phase == 2 && internal_img &&
+                       !(addr == g_pp_src.load(std::memory_order_relaxed) && !f.injected)) {
+                PpMixed(addr, 3);
+            }
+        }
+    }
     if (!IsColorSampleable(format)) {
         return Sample::Keep;
     }
@@ -2490,7 +2788,7 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     bool aa_mode = false;
     // 1.35: the post-entry point is native DLAA only (ratio 1); scaled aapass runs through the
     // resolution patch and the HUD point.
-    aa_mode = AaPassSwitch() && NativeAaUpscaler();
+    aa_mode = (AaPassSwitch() && NativeAaUpscaler()) || (Pp() && NativeChainLive());
     if (aa_mode && !g_draw.compute && g_draw.ps_hash == AaPs() && !targets_it && IsHdr(format) &&
         f.gb_w != 0 && width == f.gb_w && height == f.gb_h && !f.injected) {
         aa_hit = true;
@@ -2524,6 +2822,9 @@ Sample OnSample(VAddr addr, u32 width, u32 height, vk::Format format) {
     const VAddr src = LearnedSource();
     if (src == 0 || addr != src || targets_it || g_draw.scene || aa_wait) {
         return Sample::Keep;
+    }
+    if (Pp() && !aa_hit && !f.injected) {
+        return Sample::Keep; // 1.44: the upscaler runs only at the post entry's sample
     }
     if (f.injected) {
         if (f.redirecting) {
@@ -3156,6 +3457,8 @@ void OnInjected(bool ok, float) {
         g_good_src_seen = g_frame_no;
         // 0.73: the scene passes end here; post-processing gets the output-size versions.
         g_ss_source.store(g_plan.color_addr, std::memory_order_relaxed);
+        g_pp_injected.store(true, std::memory_order_relaxed);
+        if (Pp()) g_pp_injects.fetch_add(1, std::memory_order_relaxed);
         if (g_ss_phase.load(std::memory_order_relaxed) == 1) {
             g_ss_phase.store(2, std::memory_order_relaxed);
             ++g_frame.native_post;
@@ -3414,6 +3717,11 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             post == 1 && f.qual_samples == 0) {
             g_ss_phase.store(0, std::memory_order_relaxed);
         }
+        if (Pp()) {
+            g_pp_post_last.store(g_pp_post_seen.exchange(false, std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        }
+        g_pp_injected.store(false, std::memory_order_relaxed);
     }
     {
         // 0.73 motion-vector source, once: the G-buffer's targets (a game velocity output would be
@@ -3571,7 +3879,8 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     if (SceneScaleWanted() && !g_ss_frozen.load(std::memory_order_relaxed)) {
         const double ratio = SR::QualityRatio(Cfg().kind, Cfg().quality);
         if (Active() && ratio > 1.01 && f.gb_depth != 0 && f.scene_draws > 0 &&
-            !g_ss_candidates.empty() && f.gb_w == width && f.gb_h == height) {
+            !g_ss_candidates.empty() && f.gb_w == width && f.gb_h == height &&
+            (!Pp() || g_pp_post_last.load(std::memory_order_relaxed))) {
             g_ss_w = f.gb_w;
             g_ss_h = f.gb_h;
             g_ss_sw = std::max<u32>(8, static_cast<u32>(std::lround(f.gb_w / ratio)) & ~1u);
@@ -3796,6 +4105,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                     g_stats.gpu_samples ? g_stats.gpu_ms_sum / g_stats.gpu_samples : 0.0));
                 g_aa.hits = g_aa.injected = g_aa.injected_first_read = 0;
             }
+            if (Pp()) PpSecond(g_sec_frames);
             if (g_sec_frames > 0) {
                 Checkpoint(fmt::format("[path] locked={}, frames this second on locked path {}/{}, "
                                        "resets {} (camera delta max {:.3f} NDC; a reset only "

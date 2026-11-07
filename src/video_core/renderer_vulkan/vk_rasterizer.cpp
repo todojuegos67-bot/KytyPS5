@@ -135,7 +135,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
              regs.depth_buffer.DepthValid())
                 ? regs.depth_buffer.DepthAddress()
                 : 0,
-            bb_colors);
+            bb_colors, key.stage_hashes[static_cast<u32>(Shader::SwStage::Fragment)]);
     }
     for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
@@ -187,6 +187,17 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             if (bb_scaled_target(cb_descs[cb].image_id)) break;
         }
     }
+    if (BB::Upscale::Prepost() && BB::Upscale::NativePostPhase()) {
+        // 1.44: a scene-size colour target of a post / HUD pass never becomes a scene target.
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (!cb_descs[cb].image_id) continue;
+            const auto& info = texture_cache.GetImage(cb_descs[cb].image_id).info;
+            if (!info.bb_scaled) {
+                BB::Upscale::PrepostPostTarget(info.guest_address, info.size.width,
+                                               info.size.height);
+            }
+        }
+    }
     if (bb_rt_guest_w != 0 && BB::Upscale::NativePostPhase()) {
         BB::Upscale::OnPostScaledTarget(
             db_desc.image_id && texture_cache.GetImage(db_desc.image_id).info.bb_scaled
@@ -215,6 +226,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                 if (!cb_descs[cb].image_id) continue;
                 const auto& info = texture_cache.GetImage(cb_descs[cb].image_id).info;
                 if (!info.bb_scaled && info.size.width == gw && info.size.height == gh) {
+                    BB::Upscale::PrepostPhase1OutputTarget();
                     BB::Upscale::AddSceneTarget(info.guest_address);
                 }
             }
@@ -587,6 +599,7 @@ void Rasterizer::DispatchDirect() {
     // BB 0.80 native chain: a compute pipeline of the scene passes seen touching a scene target
     // runs at the internal size: its images internal-size, the game's size constants patched,
     // its grid scaled. (0.76 ran it on output-size twins blitted up from the G-buffer.)
+    BB::Upscale::PrepostDispatch(cs.pgm_hash); // 1.44: the post entry's computes end the scene
     const bool bb_scene_phase = BB::Upscale::NativeScenePhase();
     const bool bb_cs_scaled = bb_scene_phase && bb_scene_cs.contains(pipeline);
     BB::Upscale::SetComputeScaled(bb_cs_scaled);
@@ -602,7 +615,8 @@ void Rasterizer::DispatchDirect() {
         BB::Upscale::SetComputeScaled(false);
         return;
     }
-    if (bb_scene_phase && !bb_cs_scaled && BB::Upscale::TakeComputeTouched()) {
+    if (bb_scene_phase && !bb_cs_scaled && BB::Upscale::TakeComputeTouched() &&
+        BB::Upscale::PrepostComputeGridOk(cs_program.dim_x, cs_program.dim_y)) {
         if (bb_scene_cs.insert(pipeline).second && bb_scene_cs.size() <= 16) {
             BB::Upscale::Checkpoint(fmt::format(
                 "native chain: compute pipeline {} (grid {}x{}x{}) uses scene targets in the scene "
@@ -999,7 +1013,45 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
             const u32 dw = d0.info.size.width, dh = d0.info.size.height;
             const u32 sw = s0.info.size.width, sh = s0.info.size.height;
             const char* how = "blit (scaled copy)";
-            if (const auto alt = texture_cache.BBVersionAt(src_id, dw, dh)) {
+            // 1.44 prepost: never the source's stale other version. First the destination's
+            // version at the source's size (internal -> internal in the scene passes), then the
+            // source's other version only when it holds the current content, else a scaled blit.
+            const bool pp = BB::Upscale::Prepost();
+            VideoCore::ImageId pp_alt{};
+            bool pp_dst = false;
+            if (pp) {
+                if (const auto d_alt = texture_cache.BBVersionAt(dst_id, sw, sh)) {
+                    dst_id = d_alt;
+                    pp_dst = true;
+                    how = "destination's other version";
+                    BB::Upscale::PrepostCopy(1);
+                } else if (BB::Upscale::PrepostVersionCurrent(s0.info.guest_address,
+                                                              !s0.info.bb_scaled)) {
+                    pp_alt = texture_cache.BBVersionAt(src_id, dw, dh);
+                }
+            }
+            if (pp_dst) {
+            } else if (pp && !pp_alt) {
+                BB::Upscale::PrepostCopy(3);
+                if (runtime.BBBlitScaled(&texture_cache.GetImage(src_id),
+                                         &texture_cache.GetImage(dst_id))) {
+                    auto& d1 = texture_cache.GetImage(dst_id);
+                    BB::Upscale::TwinDone(d1.info.guest_address, d1.info.bb_scaled, true, false);
+                    static u32 said_pp = 0;
+                    if (said_pp++ < 8) {
+                        BB::Upscale::Checkpoint(fmt::format(
+                            "[prepost] image copy {:#x} {}x{} -> {:#x} {}x{}: scaled blit from the "
+                            "current source",
+                            s0.info.guest_address, sw, sh, d1.info.guest_address, dw, dh));
+                    }
+                    return true;
+                }
+                how = "NOT resolved (plain copy)";
+            } else if (pp) {
+                src_id = pp_alt;
+                how = "source's other version (current)";
+                BB::Upscale::PrepostCopy(2);
+            } else if (const auto alt = texture_cache.BBVersionAt(src_id, dw, dh)) {
                 src_id = alt;
                 how = "source's other version";
             } else if (const auto alt2 = texture_cache.BBVersionAt(dst_id, sw, sh)) {
@@ -1026,6 +1078,8 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
                     texture_cache.GetImage(src_id).info.guest_address, sw, sh,
                     texture_cache.GetImage(dst_id).info.guest_address, dw, dh, how));
             }
+        } else if (BB::Upscale::Prepost()) {
+            BB::Upscale::PrepostCopy(0);
         }
     }
     VideoCore::Image& src_image = texture_cache.GetImage(src_id);

@@ -69,7 +69,16 @@ void AddSceneTarget(VAddr addr);
 // after an image is made current: true when the other version of this address (internal size /
 // output size) holds the content and must be copied into this one first; then TwinDone (also
 // called by TwinAccess itself when no copy is needed). TwinFailed when the copy cannot be made.
-void BeginDraw(VAddr depth_addr, u32 colors);
+void BeginDraw(VAddr depth_addr, u32 colors, u64 ps_hash = 0);
+// 1.44 BB_SCENE_UPSCALE=prepost (bb_upscale.cpp, the pass table): hash-fixed phases, deny list of
+// post / HUD targets, screen-proportional scene compute grids, copy accounting, [prepost] line.
+bool Prepost();
+void PrepostDispatch(u64 cs_hash);
+void PrepostPostTarget(VAddr addr, u32 w, u32 h);
+bool PrepostComputeGridOk(u32 dx, u32 dy);
+bool PrepostVersionCurrent(VAddr addr, bool scaled);
+void PrepostCopy(int how); // 0 same size, 1 internal destination, 2 current source version, 3 blit
+void PrepostPhase1OutputTarget();
 bool TwinAccess(VAddr addr, u32 w, u32 h, bool scaled, bool write, bool depth);
 // 0.76: scene scaling learned and on; which version of an address holds current content for an
 // address-only lookup (-1 not a scene target, 0 output size, 1 internal size); the addresses to
