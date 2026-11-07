@@ -113,20 +113,6 @@ jobs:
         git clone --depth 1 --branch $env:XESS_VERSION https://github.com/intel/xess _Build\deps\xess
         if ($LASTEXITCODE) { throw 'XeSS clone failed' }
         if (!(Test-Path _Build\deps\xess\inc\xess\xess_vk.h) -or !(Test-Path _Build\deps\xess\bin\libxess.dll)) { throw 'no xess_vk.h or libxess.dll' }
-    - name: Install LLVM 19.1.7 (compiler guard)
-      shell: pwsh
-      run: |
-        for ($i = 1; $i -le 5; $i++) {
-          choco upgrade llvm --version=19.1.7 --allow-downgrade --no-progress -y
-          $v = (& 'C:\Program Files\LLVM\bin\clang-cl.exe' --version | Select-Object -First 1)
-          Write-Host "attempt ${i}: $v"
-          if ($v -match '\b19\.1\.7\b') { break }
-          Start-Sleep -Seconds (20 * $i)
-        }
-        if ($v -notmatch '\b19\.1\.7\b') { throw "LLVM 19.1.7 could not be installed (found: $v)" }
-        $w = (& clang-cl --version | Select-Object -First 1)
-        Write-Host "compiler guard: clang-cl on PATH is: $w"
-        if ($w -notmatch '\b19\.1\.7\b') { throw "clang-cl on PATH is not 19.1.7: $w" }
     - name: Configure
       run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
     - name: Build
