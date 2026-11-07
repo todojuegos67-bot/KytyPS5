@@ -249,11 +249,11 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
-    // (bb-hitscan-150) Ctrl+F8 / Scroll Lock: arm the read-only hit scan; Ctrl+F9 / Pause: stop.
+    // (bb-hitscan-150) Insert: arm the read-only hit scan; Home: stop (no default hotkey or
+    // Bloodborne binding uses them).
     if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
-        const bool ctrl = (event.key.mod & SDL_KMOD_CTRL) != 0;
-        const bool arm = event.key.key == SDLK_SCROLLLOCK || (ctrl && event.key.key == SDLK_F8);
-        const bool stop = event.key.key == SDLK_PAUSE || (ctrl && event.key.key == SDLK_F9);
+        const bool arm = event.key.key == SDLK_INSERT;
+        const bool stop = event.key.key == SDLK_HOME;
         if (arm || stop) {
             if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
                 arm ? BB::HitScan::Arm() : BB::HitScan::Stop();

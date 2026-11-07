@@ -110,7 +110,7 @@ static void Run() {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
     LOG_INFO(Loader,
              "[hitscan] armed: {} MB scanned, {} objects with an eboot vtable ({} classes), {} "
-             "candidates (<= {} per class), {} ms. Hit enemies now; Ctrl+F9 / Pause stops.",
+             "candidates (<= {} per class), {} ms. Hit enemies now; Home stops.",
              scanned >> 20, objs.size(), per_vt.size(), cands.size(), kMaxPerVtable, ms);
     objs.clear();
     objs.shrink_to_fit();
