@@ -113,6 +113,8 @@ struct CoverageStats {
     // previous position for the draw, behind the camera, not finite. All zero with object
     // coverage zero = the motion attachment is never written (pipeline / attachment problem).
     u64 no_prev_px = 0, behind_px = 0, nonfinite_px = 0;
+    // 1.50: sums of vector magnitude x16 on character pixels / on pixels without an object vector.
+    u64 character_mag16 = 0, background_mag16 = 0, background_px = 0;
 };
 CoverageStats TakeCoverage();
 // 1.41: guest frame numbers for the [fg-amd] pairing check. FrameNo(): flips seen so far (OnFlip

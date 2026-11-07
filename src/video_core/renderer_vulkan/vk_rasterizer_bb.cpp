@@ -1791,6 +1791,29 @@ void BBFgFlow(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
                        static_cast<unsigned long long>(a[0]), static_cast<unsigned long long>(a[1]),
                        a[0] ? 100.0 * a[1] / a[0] : 0.0, static_cast<unsigned long long>(a[4]),
                        100.0 * a[2] / px, a[2] ? a[3] / 16.0 / a[2] : 0.0);
+        if (BB::FG::Cfg().kind != BB::FG::Kind::Amd) {
+            // 1.50: DLSS-G / image FG: the object-vector coverage here (FSR 3 prints it itself).
+            const auto cov = BB::ObjMotion::TakeCoverage();
+            const double all = static_cast<double>(std::max<u64>(cov.all_px, 1));
+            BB::FG::Printf("[fg-mv] 1.46 object-MV attachment: %.2f %% of pixels with an object "
+                           "vector, %.2f %% drawn by a motion pipeline without one (no previous "
+                           "position %.2f %%, behind camera %.2f %%, not finite %.2f %%)%s",
+                           100.0 * cov.object_px / all,
+                           100.0 * (cov.no_prev_px + cov.behind_px + cov.nonfinite_px) / all,
+                           100.0 * cov.no_prev_px / all, 100.0 * cov.behind_px / all,
+                           100.0 * cov.nonfinite_px / all,
+                           cov.frames_read && cov.object_px == 0 &&
+                                   cov.no_prev_px + cov.behind_px + cov.nonfinite_px == 0
+                               ? " -> the motion attachment is never written by the G-buffer pass"
+                               : "");
+            BB::FG::Printf("[fg-mv] 1.50 vectors: character pixels %.2f %% of the image with an "
+                           "object vector, mean |mv| characters %.2f px vs background %.2f px "
+                           "(%u composes read)",
+                           100.0 * cov.character_px / all,
+                           cov.character_px ? cov.character_mag16 / 16.0 / cov.character_px : 0.0,
+                           cov.background_px ? cov.background_mag16 / 16.0 / cov.background_px : 0.0,
+                           cov.frames_read);
+        }
         for (auto& v : g_bb.flow_acc) v = 0;
         g_bb.flow_runs = g_bb.flow_skipped = 0;
         g_bb.flow_t = now;

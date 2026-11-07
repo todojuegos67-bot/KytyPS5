@@ -1051,6 +1051,12 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                            cov.no_prev_px + cov.behind_px + cov.nonfinite_px == 0
                        ? " -> the motion attachment is never written by the G-buffer pass"
                        : "");
+            Printf("[fg-mv] 1.50 vectors: character pixels %.2f %% of the image with an object "
+                   "vector, mean |mv| characters %.2f px vs background %.2f px (render px a real "
+                   "frame)",
+                   100.0 * static_cast<double>(cov.character_px) / all,
+                   cov.character_px ? cov.character_mag16 / 16.0 / cov.character_px : 0.0,
+                   cov.background_px ? cov.background_mag16 / 16.0 / cov.background_px : 0.0);
             const AmdSecond keep = g_amd;
             g_amd = {};
             std::copy_n(keep.mv_scale, 2, g_amd.mv_scale);

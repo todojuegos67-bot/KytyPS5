@@ -15,7 +15,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, rg32ui) uniform readonly uimage2D obj_mv;
 layout(binding = 1, rg16f) uniform image2D mv_out;
 layout(binding = 2, std430) buffer Stats {
-    uint s[20];
+    uint s[24];
 } st;
 layout(binding = 3, rgba8) uniform writeonly image2D viz;
 layout(push_constant) uniform Push {
@@ -28,7 +28,8 @@ void Count(uint i, float v) {
 
 void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool own);
 
-shared uint cov_obj, cov_char, cov_all, cov_still, cov_own;
+shared uint cov_obj, cov_char, cov_all, cov_still, cov_own, cov_cmag, cov_bmag, cov_bg;
+vec2 g_v;
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
@@ -40,6 +41,9 @@ void main() {
             cov_all = 0u;
             cov_still = 0u;
             cov_own = 0u;
+            cov_cmag = 0u;
+            cov_bmag = 0u;
+            cov_bg = 0u;
         }
         barrier();
     }
@@ -55,6 +59,13 @@ void main() {
             if (cov_is_char) atomicAdd(cov_char, 1u);
             if (cov_is_still) atomicAdd(cov_still, 1u);
             if (cov_is_own) atomicAdd(cov_own, 1u);
+            // 1.50: mean vector magnitude, characters vs the rest (x16 fixed point).
+            uint m = uint(clamp(length(g_v), 0.0, 4096.0) * 16.0 + 0.5);
+            if (cov_is_char) atomicAdd(cov_cmag, m);
+            else if (!cov_is_obj) {
+                atomicAdd(cov_bmag, m);
+                atomicAdd(cov_bg, 1u);
+            }
         }
         barrier();
         if (gl_LocalInvocationIndex == 0u) {
@@ -63,6 +74,9 @@ void main() {
             atomicAdd(st.s[13], cov_all);
             if (cov_still != 0u) atomicAdd(st.s[14], cov_still);
             if (cov_own != 0u) atomicAdd(st.s[15], cov_own);
+            if (cov_cmag != 0u) atomicAdd(st.s[20], cov_cmag);
+            if (cov_bmag != 0u) atomicAdd(st.s[21], cov_bmag);
+            if (cov_bg != 0u) atomicAdd(st.s[22], cov_bg);
         }
     }
 }
@@ -84,6 +98,7 @@ void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool o
         }
     }
     is_obj = obj;
+    g_v = v;
     is_char = obj && o.y >= 2u;
     // 1.41: character pixels with a near-zero vector / with motion of their own.
     still = is_char && length(v) < 0.25;

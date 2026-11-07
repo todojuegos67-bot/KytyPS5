@@ -199,12 +199,12 @@ bool ResetSkip() {
 
 struct Coverage {
     std::atomic<u64> obj{0}, chr{0}, all{0}, chr_still{0}, chr_own{0}, no_prev{0}, behind{0},
-        nonfinite{0};
+        nonfinite{0}, cmag{0}, bmag{0}, bg{0};
     std::atomic<u32> composes{0}, read{0}, reset_frames{0}, reset_skipped{0}, not_written{0};
 } g_cov;
 
 constexpr u32 kStatSlots = 4; // frames in flight: a slot is read back 3 composes later
-constexpr u32 kStatWords = 20; // 1.46: + words 16..18 (pixels without a vector, by reason)
+constexpr u32 kStatWords = 24; // 1.46: + words 16..18 (pixels without a vector, by reason)
 
 bool EnvOff() {
     const char* s = std::getenv("BB_OBJMV");
@@ -839,6 +839,9 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
             g_cov.no_prev.fetch_add(words[16], std::memory_order_relaxed);
             g_cov.behind.fetch_add(words[17], std::memory_order_relaxed);
             g_cov.nonfinite.fetch_add(words[18], std::memory_order_relaxed);
+            g_cov.cmag.fetch_add(words[20], std::memory_order_relaxed);
+            g_cov.bmag.fetch_add(words[21], std::memory_order_relaxed);
+            g_cov.bg.fetch_add(words[22], std::memory_order_relaxed);
             g_cov.read.fetch_add(1, std::memory_order_relaxed);
         }
         if (debug && g.compose_no >= kStatSlots) {
@@ -1076,6 +1079,9 @@ CoverageStats TakeCoverage() {
     c.no_prev_px = g_cov.no_prev.exchange(0, std::memory_order_relaxed);
     c.behind_px = g_cov.behind.exchange(0, std::memory_order_relaxed);
     c.nonfinite_px = g_cov.nonfinite.exchange(0, std::memory_order_relaxed);
+    c.character_mag16 = g_cov.cmag.exchange(0, std::memory_order_relaxed);
+    c.background_mag16 = g_cov.bmag.exchange(0, std::memory_order_relaxed);
+    c.background_px = g_cov.bg.exchange(0, std::memory_order_relaxed);
     c.enabled = g.ready && CoverageOn();
     c.reset_skip_rule = ResetSkip();
     return c;
