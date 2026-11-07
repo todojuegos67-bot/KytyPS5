@@ -217,7 +217,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
     }
 
     // (bb-input-137) Bloodborne default keyboard + mouse: left click = R1, right click = L1,
-    // space = circle (roll), touchpad = g. New file: default.ini with that applied. Existing
+    // space = circle (roll), lshift = circle (run while held, bb-combo-149), touchpad = g. New file: default.ini with that applied. Existing
     // file: migrated only while it still has the old "touchpad_center = space" (backup kept).
     if (game_id == "CUSA03173") {
         const bool fresh = !std::filesystem::exists(config_file);
@@ -244,7 +244,8 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
                 const auto t = strip(l);
                 if (t == "touchpad_center=space") {
                     out << "touchpad_center = g  # bb-input-137 (was space)\n";
-                } else if (t == "r1=leftbutton" || t == "l1=rightbutton" || t == "circle=space") {
+                } else if (t == "r1=leftbutton" || t == "l1=rightbutton" || t == "circle=space" ||
+                           t == "circle=lshift") {
                     continue; // re-added below
                 } else {
                     out << l << "\n";
@@ -253,9 +254,10 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             out << "# bb-input-137 Bloodborne keyboard + mouse defaults\n"
                 << "r1 = leftbutton\n"
                 << "l1 = rightbutton\n"
-                << "circle = space\n";
+                << "circle = space\n"
+                << "circle = lshift  # bb-combo-149: run with Shift held\n";
             LOG_INFO(Input, "[kbm] {} Bloodborne defaults: r1=leftbutton l1=rightbutton "
-                     "circle=space touchpad_center=g (backup {})",
+                     "circle=space circle=lshift touchpad_center=g (backup {})",
                      fresh ? "wrote" : "migrated", fresh ? "none" : game_id + ".ini.bak-136");
         }
     }
