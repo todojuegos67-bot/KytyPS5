@@ -145,12 +145,21 @@ namespace Anim {
 double Now() {
 	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-constexpr double         kOpen = 0.18, kClose = 0.14, kPage = 0.22;
+constexpr double         kOpen = 0.24, kClose = 0.16, kPage = 0.22; // (step5: a little longer, eased; real time)
 std::atomic<double>      g_opened_at {0.0}, g_closed_at {0.0}, g_page_at {0.0};
 int                      g_page_seen = 0;
 float EaseOut(float t) {
 	t = std::clamp(t, 0.0f, 1.0f);
 	return 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+}
+// (step5) Opening: ease-out quint; closing: ease-in cubic (slow start, then away).
+float EaseOutQuint(float t) {
+	t = 1.0f - std::clamp(t, 0.0f, 1.0f);
+	return 1.0f - t * t * t * t * t;
+}
+float EaseIn(float t) {
+	t = std::clamp(t, 0.0f, 1.0f);
+	return t * t * t;
 }
 // 0..1 of an animation started at `at` lasting `length` (1: done).
 float Progress(double at, double length) {
@@ -198,12 +207,13 @@ bool Button(const char* label, ImVec2 size, float unit) {
 }
 // Scales the vertices a window drew (from `first`) around `center`: the open / close zoom without re-rasterizing fonts
 // at every size of the animation (ImGui 1.92 bakes glyphs per size).
-void ScaleVertices(ImDrawList* dl, int first, ImVec2 center, float k) {
-	if (dl == nullptr || k == 1.0f) return;
+void ScaleVertices(ImDrawList* dl, int first, ImVec2 center, float k, float dy = 0.0f) {
+	if (dl == nullptr || (k == 1.0f && dy == 0.0f)) return;
+	// (step5) Sub-pixel: no rounding, so the zoom and the rise are continuous (no stepping).
 	for (int i = first; i < dl->VtxBuffer.Size; i++) {
 		ImVec2& p = dl->VtxBuffer[i].pos;
 		p.x       = center.x + (p.x - center.x) * k;
-		p.y       = center.y + (p.y - center.y) * k;
+		p.y       = center.y + (p.y - center.y) * k + dy;
 	}
 }
 } // namespace Anim
@@ -5797,8 +5807,9 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	}
 	// (ds-pc-port38) Open: fade in and grow from 94 %; close: fade out and shrink back (Anim, vertex scale: the fonts stay
 	// rasterized at one size). Back from a page: the menu fades in again.
-	const float t = closing ? 1.0f - Anim::EaseOut(Anim::Progress(Anim::g_closed_at.load(), Anim::kClose))
-	                        : Anim::EaseOut(Anim::Progress(std::max(Anim::g_opened_at.load(), Anim::g_page_at.load()), Anim::kOpen));
+	// (step5) Real time (steady clock), not frames: ease-out quint in, ease-in cubic out.
+	const float t = closing ? 1.0f - Anim::EaseIn(Anim::Progress(Anim::g_closed_at.load(), Anim::kClose))
+	                        : Anim::EaseOutQuint(Anim::Progress(std::max(Anim::g_opened_at.load(), Anim::g_page_at.load()), Anim::kOpen));
 	// (perfopts-1107) The idle animations (soul motes, fog, the breathing sigil, the candle flicker) redraw while open.
 	Bump();
 	Anim::g_page_seen = 0;
@@ -5915,8 +5926,9 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		menu_dl->PopClipRect();
 		menu_dl->ChannelsMerge();
 		if (g_menu_rect_hook != nullptr) g_menu_rect_hook(wp, ws);
-		// The zoom: 94 % -> 100 % about the window's centre (the vertices it drew).
-		Anim::ScaleVertices(menu_dl, menu_first, {wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f}, 0.94f + 0.06f * t);
+		// The zoom: 96 % -> 100 % about the window's centre plus a short rise (14 px at 1080p), sub-pixel; once settled the
+		// vertices are untouched (crisp text at its baked size).
+		Anim::ScaleVertices(menu_dl, menu_first, {wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f}, 0.96f + 0.04f * t, (1.0f - t) * 14.0f * unit);
 	}
 	ImGui::End();
 	ImGui::PopStyleColor(6);

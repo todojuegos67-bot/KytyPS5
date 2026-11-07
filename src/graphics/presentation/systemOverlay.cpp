@@ -1158,52 +1158,97 @@ struct SystemOverlay::Impl {
 	// grade (its color) over "Trofeo obtenido" and the trophy's name; it fades out at the end. Draw-list only (no
 	// window, no texture: the icon is its 48x48 cells). Returns the card (x0, y0, x1, y1).
 	ImVec4 DrawTrophy(const Libs::Trophy::Toast& toast, float t, const vk::Rect2D& region, float unit) {
-		const float slide = 0.35f, fade = 0.6f;
-		const float in    = std::clamp(t / slide, 0.0f, 1.0f);
-		const float ease  = 1.0f - (1.0f - in) * (1.0f - in) * (1.0f - in);
-		const float alpha = std::clamp((toast.seconds - t) / fade, 0.0f, 1.0f) * std::min(1.0f, in * 2.0f);
+		// (step5) t is real time (CurrentToast: steady clock), so the motion does not depend on the game's frame rate.
+		// In: 0.45 s ease-out quint slide from the right with a fade and a slight zoom; out: the last 0.45 s, ease-in
+		// cubic slide back with the fade. Positions are sub-pixel (no stepping); the text is snapped to whole pixels.
+		const float t_in = 0.45f, t_out = 0.45f;
+		const float pin  = std::clamp(t / t_in, 0.0f, 1.0f);
+		const float pout = std::clamp((t - (toast.seconds - t_out)) / t_out, 0.0f, 1.0f);
+		const float q    = 1.0f - pin;
+		const float ein  = 1.0f - q * q * q * q * q;
+		const float eout = pout * pout * pout;
+		const float alpha = std::min(1.0f, pin * 1.8f) * (1.0f - eout);
 		if (alpha <= 0.0f) return {};
 		auto*       draw = ImGui::GetForegroundDrawList();
 		// (The names in Japanese, Chinese, Korean, Cyrillic...: the CJK face; Latin text: the panels' face.)
 		bool wide = false;
 		for (const unsigned char c: toast.name + toast.label + toast.detail) wide = wide || c >= 0xd0;
-		ImFont*     font      = wide && dialog_font != nullptr ? dialog_font : hud_font != nullptr ? hud_font : ImGui::GetFont();
-		const float big = 22.0f * unit, small = 16.0f * unit;
-		const float icon      = 64.0f * unit, pad = 12.0f * unit;
+		ImFont*     font = wide && dialog_font != nullptr ? dialog_font : hud_font != nullptr ? hud_font : ImGui::GetFont();
+		// Whole-pixel sizes: ImGui bakes each size, so the glyphs are rasterized at the size drawn (crisp at 1440p).
+		const float big = std::round(23.0f * unit), small = std::round(16.0f * unit);
+		const float icon = std::round(64.0f * unit), pad = std::round(13.0f * unit);
 		const std::string top = toast.grade_text.empty() ? toast.label : toast.grade_text + "  \xc2\xb7  " + toast.label;
 		const float text_w = std::max(font->CalcTextSizeA(big, FLT_MAX, 0.0f, toast.name.c_str()).x,
 		                              font->CalcTextSizeA(small, FLT_MAX, 0.0f, top.c_str()).x + 18.0f * unit);
 		const float detail_w = std::min(font->CalcTextSizeA(small, FLT_MAX, 0.0f, toast.detail.c_str()).x, 520.0f * unit);
-		const float w      = std::min(pad * 3.0f + icon + std::max(text_w, detail_w) + 8.0f * unit, static_cast<float>(region.extent.width) * 0.45f);
-		const float h      = icon + pad * 2.0f + (toast.detail.empty() ? 0.0f : small + 4.0f * unit);
+		const float w = std::min(pad * 3.0f + icon + std::max(text_w, detail_w) + 12.0f * unit, static_cast<float>(region.extent.width) * 0.45f);
+		const float h = icon + pad * 2.0f + (toast.detail.empty() ? 0.0f : small + 4.0f * unit);
 		const float margin = 28.0f * unit;
 		const float x1_end = static_cast<float>(region.offset.x) + static_cast<float>(region.extent.width) - margin;
-		const float x0     = x1_end - w + (1.0f - ease) * (w + margin + 4.0f);
-		const float y0     = static_cast<float>(region.offset.y) + 20.0f * unit;
-		const auto  a      = [&](int v) { return static_cast<int>(static_cast<float>(v) * alpha); };
-		const float round  = 12.0f * unit;
-		draw->AddRectFilled({x0 + 3.0f * unit, y0 + 4.0f * unit}, {x0 + w + 3.0f * unit, y0 + h + 4.0f * unit}, IM_COL32(0, 0, 0, a(70)), round);
-		draw->AddRectFilled({x0, y0}, {x0 + w, y0 + h}, IM_COL32(28, 29, 33, a(235)), round);
-		draw->AddRect({x0, y0}, {x0 + w, y0 + h}, IM_COL32(255, 255, 255, a(22)), round, 0, 1.0f * unit);
-		// (10-28) The icon: a cup in the grade's colour (bronze / silver / gold / platinum).
-		const float ix = x0 + pad, iy = y0 + pad;
-		const ImU32 grade = Libs::Trophy::CupColor(toast.grade >= 1 && toast.grade <= 4 ? toast.grade : 4, alpha);
-		draw->AddRectFilled({ix, iy}, {ix + icon, iy + icon}, IM_COL32(44, 46, 54, a(255)), 10.0f * unit);
-		Libs::Trophy::DrawCup(draw, ix + icon * 0.1f, iy + icon * 0.08f, icon * 0.8f, grade, alpha);
-		const float tx = ix + icon + pad, ty = iy + 6.0f * unit;
-		float lx = tx;
+		const float travel = w + margin + 24.0f * unit;
+		const float zoom   = 0.97f + 0.03f * ein;
+		const float cx     = x1_end - w * 0.5f + (1.0f - ein) * travel * 0.6f + eout * travel;
+		const float cy     = static_cast<float>(region.offset.y) + 20.0f * unit + h * 0.5f;
+		const float x0 = cx - w * 0.5f * zoom, x1 = cx + w * 0.5f * zoom, y0 = cy - h * 0.5f * zoom, y1 = cy + h * 0.5f * zoom;
+		const auto  a     = [&](int v) { return static_cast<int>(static_cast<float>(v) * alpha); };
+		const float round = 12.0f * unit;
+		const int   g     = toast.grade >= 1 && toast.grade <= 4 ? toast.grade : 4;
+		const ImU32 grade = Libs::Trophy::CupColor(g, alpha);
+		const ImU32 grade_soft = Libs::Trophy::CupColor(g, alpha * 0.22f);
+		// A soft shadow (wider, fainter layers) and a faint glow in the grade's colour.
+		for (int k = 6; k >= 1; k--) {
+			const float e = static_cast<float>(k) * 3.0f * unit;
+			draw->AddRectFilled({x0 - e, y0 - e + 5.0f * unit}, {x1 + e, y1 + e + 5.0f * unit}, IM_COL32(0, 0, 0, a(16)), round + e);
+		}
+		for (int k = 3; k >= 1; k--) {
+			const float e = static_cast<float>(k) * 2.0f * unit;
+			draw->AddRect({x0 - e, y0 - e}, {x1 + e, y1 + e}, Libs::Trophy::CupColor(g, alpha * 0.10f / static_cast<float>(k)), round + e, 0, 2.0f * unit);
+		}
+		// The card: dark stone with a cool top light, a thin tarnished-brass border and the grade's accent bar.
+		draw->AddRectFilled({x0, y0}, {x1, y1}, IM_COL32(20, 21, 25, a(238)), round);
+		draw->AddRectFilledMultiColor({x0 + round * 0.5f, y0 + 1.0f}, {x1 - round * 0.5f, y0 + h * 0.45f}, IM_COL32(120, 130, 150, a(26)),
+		                              IM_COL32(120, 130, 150, a(26)), IM_COL32(120, 130, 150, 0), IM_COL32(120, 130, 150, 0));
+		draw->AddRect({x0, y0}, {x1, y1}, IM_COL32(196, 170, 120, a(110)), round, 0, std::max(1.0f, 1.25f * unit));
+		draw->AddRectFilled({x0 + 1.0f, y0 + round}, {x0 + 1.0f + 4.0f * unit, y1 - round}, grade, 2.0f * unit);
+		// The icon: the trophy's own (48x48 cells from the package), else a cup in the grade's colour; framed in the grade.
+		const float ix = x0 + pad + 4.0f * unit, iy = y0 + pad;
+		const float is = icon * zoom;
+		draw->AddRectFilled({ix - 2.0f * unit, iy - 2.0f * unit}, {ix + is + 2.0f * unit, iy + is + 2.0f * unit}, grade_soft, 9.0f * unit);
+		if (!toast.icon.empty() && toast.icon_w > 0 && toast.icon_h > 0 &&
+		    toast.icon.size() >= static_cast<size_t>(toast.icon_w) * static_cast<size_t>(toast.icon_h)) {
+			const float cw = is / static_cast<float>(toast.icon_w), ch = is / static_cast<float>(toast.icon_h);
+			for (int y = 0; y < toast.icon_h; y++) {
+				for (int x = 0; x < toast.icon_w; x++) {
+					const uint32_t c  = toast.icon[static_cast<size_t>(y) * toast.icon_w + x];
+					const int      ca = static_cast<int>((c >> 24u) & 0xffu);
+					if (ca == 0) continue;
+					const ImU32 col = (c & 0x00ffffffu) | (static_cast<ImU32>(a(ca)) << 24u);
+					const float px = ix + static_cast<float>(x) * cw, py = iy + static_cast<float>(y) * ch;
+					draw->AddRectFilled({px, py}, {px + cw + 0.35f, py + ch + 0.35f}, col); // (a hair of overlap: no seams)
+				}
+			}
+		} else {
+			draw->AddRectFilled({ix, iy}, {ix + is, iy + is}, IM_COL32(44, 46, 54, a(255)), 8.0f * unit);
+			Libs::Trophy::DrawCup(draw, ix + is * 0.1f, iy + is * 0.08f, is * 0.8f, grade, alpha);
+		}
+		draw->AddRect({ix - 1.0f, iy - 1.0f}, {ix + is + 1.0f, iy + is + 1.0f}, Libs::Trophy::CupColor(g, alpha * 0.85f), 4.0f * unit, 0,
+		              std::max(1.0f, 1.5f * unit));
+		// The text, snapped to whole pixels (no blur from fractional glyph quads).
+		const float tx = std::round(ix + is + pad), ty = std::round(iy + 5.0f * unit);
+		float       lx = tx;
 		if (!toast.grade_text.empty()) {
 			draw->AddText(font, small, {lx, ty}, grade, toast.grade_text.c_str());
-			lx += font->CalcTextSizeA(small, FLT_MAX, 0.0f, toast.grade_text.c_str()).x;
-			draw->AddText(font, small, {lx, ty}, IM_COL32(170, 172, 180, a(255)), "  \xc2\xb7  ");
-			lx += font->CalcTextSizeA(small, FLT_MAX, 0.0f, "  \xc2\xb7  ").x;
+			lx += std::round(font->CalcTextSizeA(small, FLT_MAX, 0.0f, toast.grade_text.c_str()).x);
+			draw->AddText(font, small, {lx, ty}, IM_COL32(160, 160, 168, a(255)), "  \xc2\xb7  ");
+			lx += std::round(font->CalcTextSizeA(small, FLT_MAX, 0.0f, "  \xc2\xb7  ").x);
 		}
-		draw->AddText(font, small, {lx, ty}, IM_COL32(170, 172, 180, a(255)), toast.label.c_str());
-		const ImVec4 clip {x0, y0, x0 + w - pad, y0 + h};
-		draw->AddText(font, big, {tx, ty + small + 8.0f * unit}, IM_COL32(245, 245, 247, a(255)), toast.name.c_str(), nullptr, 0.0f, &clip);
+		draw->AddText(font, small, {lx, ty}, IM_COL32(176, 170, 156, a(255)), toast.label.c_str());
+		const ImVec4 clip {x0, y0, x1 - pad, y1};
+		draw->AddText(font, big, {tx, std::round(ty + small + 8.0f * unit)}, IM_COL32(242, 236, 222, a(255)), toast.name.c_str(), nullptr, 0.0f, &clip);
 		if (!toast.detail.empty())
-			draw->AddText(font, small, {tx, ty + small + big + 14.0f * unit}, IM_COL32(190, 192, 200, a(255)), toast.detail.c_str(), nullptr, 0.0f, &clip);
-		return {x0, y0, x0 + w, y0 + h};
+			draw->AddText(font, small, {tx, std::round(ty + small + big + 14.0f * unit)}, IM_COL32(188, 186, 180, a(255)), toast.detail.c_str(),
+			              nullptr, 0.0f, &clip);
+		return {x0, y0, x1, y1};
 	}
 
 	// Top right of the game image, below the game's own corner icon: the frame rate (KYTY_FPS_HUD)
