@@ -101,21 +101,9 @@ void main() {
     if ((p.size.w & 4u) != 0u) {
         fin = bare;
     }
-    // 1.53: translucent HUD (item-name text over its dark gradient band). 1.51 added the raw
-    // difference fin - bare = a * (C - bare) to the upscaled scene: wherever up != bare (camera
-    // motion, temporal upscaler history / jitter) the band carried a negative image of the
-    // internal-size background and the text's edges mixed in internal pixels, so it ghosted.
-    // Now the HUD is un-blended per channel as an alpha over the scene: a darkening is taken as
-    // a black layer (fin = bare * (1 - a)), a brightening as a white one (fin = bare + a (1 -
-    // bare)), and that coverage is applied to the upscaled scene. Both reduce to fin exactly when
-    // up == bare and to up exactly where the game drew no HUD; only near-opaque HUD takes fin.
     vec3 hud = fin - bare;
-    vec3 a_dark = clamp(1.0 - fin / max(bare, vec3(1e-4)), 0.0, 1.0);
-    vec3 a_light = clamp(hud / max(1.0 - bare, vec3(1e-3)), 0.0, 1.0);
-    vec3 over = mix(up * (1.0 - a_dark), up + a_light * (1.0 - up), greaterThan(hud, vec3(0.0)));
-    over = mix(up, over, greaterThan(abs(hud), vec3(1.0 / 1024.0)));
-    float cover = smoothstep(0.6, 0.85, max(max(abs(hud.r), abs(hud.g)), abs(hud.b)));
-    vec3 color = clamp(mix(over, fin, cover), 0.0, 1.0);
+    float cover = smoothstep(0.25, 0.5, max(max(abs(hud.r), abs(hud.g)), abs(hud.b)));
+    vec3 color = clamp(mix(up + hud, fin, cover), 0.0, 1.0);
     if (p.size.z != 0u) {
         color = SrgbToLinear(color);
         fin = SrgbToLinear(clamp(fin, 0.0, 1.0));
