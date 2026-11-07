@@ -17,6 +17,7 @@
 #include "libs/agc.h"
 #include "loader/guestCode.h"
 #include "loader/runtimeLinker.h"
+#include "local/local-platform.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +41,11 @@ constexpr const char* Pick = "45 85 ff 41 0f 9f c0 85 c9 41 89 4e 18 41 0f 95 c1
 constexpr uint64_t SiteOffset = 31; // sub r15d, esi (3 bytes) and mov rsi, [rip + d] (7) move to the stub
 constexpr uint32_t SiteSize   = 10;
 constexpr uint32_t Formats    = 512; // the T#'s format field: 9 bits
+
+bool SavesRam() {
+	const auto ram = LocalPlatform::EmulatorMemory();
+	return ram != 0 && ram <= (uint64_t {16} << 30u);
+}
 } // namespace
 
 void Install(Program* program) {
@@ -47,10 +53,20 @@ void Install(Program* program) {
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin" ||
 	    program->mapped_size > CaveOffset || program->base_vaddr > UINT64_MAX - CaveOffset - PageSize)
 		return;
-	// KYTY_TEXTURE_REDUCE_GAME=0: the game streams the levels the GPU leaves out as before.
+	// Only with 16 GiB of RAM or less for the emulator (LocalPlatform::EmulatorMemory), where the ~1 GiB those levels take
+	// counts. Left out, they make the buffers BDA shaders read grow with the worlds the game loads, from ~2 GiB to 3-3.4 in
+	// 30-40 loads against ~2 streamed whole (why is not known): past an 8 GB GPU's video memory budget for good (11-07, six
+	// worlds by archstone travel, 48 loads an hour: Boletaria 48 fps against 53 streamed whole on a PC with more RAM,
+	// standing 49 against 60). KYTY_TEXTURE_REDUCE_GAME=0: streamed whole on any PC; =1: left out on any PC.
 	const char*    game   = std::getenv("KYTY_TEXTURE_REDUCE_GAME");
 	const uint32_t levels = Libs::Graphics::GameTextureReduceLevels();
-	if (levels == 0 || (game != nullptr && game[0] == '0')) return;
+	if (levels == 0) return;
+	if (game != nullptr && *game != '\0' ? game[0] == '0' : !SavesRam()) {
+		if (game == nullptr || *game == '\0')
+			std::printf("Demon's Souls texture streaming: textures streamed whole (more than 16 GiB of RAM; "
+			            "KYTY_TEXTURE_REDUCE_GAME=1 leaves out the levels the GPU leaves out)\n");
+		return;
+	}
 	const auto pick = GuestCode::FindUnique(*program, GuestCode::Pattern(Pick));
 	if (!pick) {
 		std::printf("Demon's Souls texture streaming: the streamer is not of a known build; textures streamed whole\n");
