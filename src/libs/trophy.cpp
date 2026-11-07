@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -272,6 +273,7 @@ void SaveList(State& s) {
 
 bool SoundWanted();
 bool PopupWanted();
+void SyncFromSave(State& s);
 
 void Load(State& s) {
 	if (s.loaded) return;
@@ -395,6 +397,7 @@ void Load(State& s) {
 	            Common::PathToString(ucp.filename()).c_str(), s.trophies.size(), s.language.c_str(), lang,
 	            s.unlocked.size(), Common::PathToString(s.store).c_str());
 	SaveList(s);
+	SyncFromSave(s); // (1109) the trophies the game's save already proves
 }
 
 // The chime: our own, synthesized (two bell-like partials rising a fifth, soft attack, exponential decay).
@@ -452,7 +455,7 @@ bool PopupWanted() {
 
 const char* GradeName(int g) { return g == 1 ? "platinum" : g == 2 ? "gold" : g == 3 ? "silver" : g == 4 ? "bronze" : "unknown"; }
 
-void Record(State& s, int id) {
+void Record(State& s, int id, float seconds = TOAST_SECONDS) {
 	s.unlocked[id] = static_cast<int64_t>(std::time(nullptr));
 	const auto it  = s.trophies.find(id);
 	auto       t   = std::make_shared<Toast>();
@@ -465,6 +468,7 @@ void Record(State& s, int id) {
 	} else {
 		t->name = "Trophy " + std::to_string(id);
 	}
+	t->seconds    = seconds;
 	t->label      = s.words.earned;
 	t->grade_text = t->grade >= 1 && t->grade <= 4 ? s.words.grades[t->grade - 1] : "";
 	LOGF("Trophy: unlocked id %d %s (%s)\n", id, t->name.c_str(), GradeName(t->grade));
@@ -560,6 +564,277 @@ const Bytes* IconFile(const std::map<std::string, Bytes>& files, int id) {
 	for (const char* n: {a, b})
 		if (const auto it = files.find(n); it != files.end()) return &it->second;
 	return nullptr;
+}
+
+// (1109) Retroactive trophies for Demon's Souls (PPSA01341): on the first trophy load, every trophy the game's own save
+// proves is unlocked through Record (the normal path: trophies.json, the popup queue, the chime), each popup shorter.
+// Read only: the save is never written. DES_TROPHY_SYNC=0 (or des_trophy_sync=0 in settings.ini) turns it off.
+//
+// USR-DATA: a 16-byte header (u32 7, u32 crc?, u32 size - 16, u32 1), then tagged entries: u32 key (FNV-1a 32 of the
+// upper-case name, as the eboot's "Equipment_Inventory%02d_EquipId"), u8 type, the value. Types: 2/6/0c 1 byte, 3 2
+// bytes, 4/8/0a 4 bytes, 0f 16 bytes, 0d/0e a LEB128 length and that many bytes (0e: a nested block).
+namespace DesSync {
+
+constexpr float kToastSeconds = 3.5f;
+
+uint32_t Fnv(const std::string& name) {
+	uint32_t h = 0x811c9dc5u;
+	for (const char c: name) h = (h ^ static_cast<uint8_t>(std::toupper(static_cast<unsigned char>(c)))) * 0x01000193u;
+	return h;
+}
+
+struct Value {
+	uint8_t type = 0;
+	Bytes   data;
+};
+using Entries = std::map<uint32_t, Value>; // the top level only (the nested blocks are skipped whole)
+
+bool Parse(const Bytes& d, Entries* out) {
+	if (d.size() < 16) return false;
+	const uint32_t size = uint32_t(d[8]) | (uint32_t(d[9]) << 8u) | (uint32_t(d[10]) << 16u) | (uint32_t(d[11]) << 24u);
+	if (size != d.size() - 16) return false;
+	size_t o = 16;
+	while (o < d.size()) {
+		if (o + 5 > d.size()) return false;
+		const uint32_t key = uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8u) | (uint32_t(d[o + 2]) << 16u) | (uint32_t(d[o + 3]) << 24u);
+		const uint8_t  t   = d[o + 4];
+		o += 5;
+		size_t n = 0;
+		switch (t) {
+			case 0x02: case 0x06: case 0x0c: n = 1; break;
+			case 0x03: n = 2; break;
+			case 0x04: case 0x08: case 0x0a: n = 4; break;
+			case 0x0f: n = 16; break;
+			case 0x0d: case 0x0e: {
+				uint64_t len = 0;
+				for (int shift = 0;; shift += 7) {
+					if (o >= d.size() || shift > 28) return false;
+					const uint8_t b = d[o++];
+					len |= uint64_t(b & 0x7fu) << static_cast<unsigned>(shift);
+					if (b < 0x80) break;
+				}
+				n = static_cast<size_t>(len);
+				break;
+			}
+			default: return false;
+		}
+		if (n > d.size() - o) return false;
+		(*out)[key] = Value {t, Bytes(d.begin() + static_cast<ptrdiff_t>(o), d.begin() + static_cast<ptrdiff_t>(o + n))};
+		o += n;
+	}
+	return true;
+}
+
+bool Int(const Entries& e, const std::string& name, int64_t* v) {
+	const auto it = e.find(Fnv(name));
+	if (it == e.end()) return false;
+	const auto& b = it->second.data;
+	switch (it->second.type) {
+		case 0x02: case 0x06: case 0x0c: *v = b[0]; return true;
+		case 0x03: *v = b[0] | (b[1] << 8); return true;
+		case 0x04: case 0x08:
+			*v = static_cast<int32_t>(uint32_t(b[0]) | (uint32_t(b[1]) << 8u) | (uint32_t(b[2]) << 16u) | (uint32_t(b[3]) << 24u));
+			return true;
+		default: return false;
+	}
+}
+
+std::string Fmt(const char* f, int n) {
+	char b[96];
+	std::snprintf(b, sizeof(b), f, n);
+	return b;
+}
+
+// What one save file holds that matters here.
+struct Proofs {
+	std::map<uint32_t, std::string> items; // category | id (0 weapon, 1 armor, 2 ring, 4 goods in the top nibble) -> where
+	std::map<int, std::string>      rings; // the game's own ring list (TROPHIES_RING%02d): ring id -> where
+	int64_t                         clear_count = 0;
+};
+
+void Read(const std::filesystem::path& file, const Entries& e, Proofs* p) {
+	const std::string where = Common::PathToString(file.parent_path().filename()) + "/" + Common::PathToString(file.filename());
+	int64_t           v = 0, q = 0;
+	if (Int(e, "CLEARCOUNT", &v) && v > p->clear_count) p->clear_count = v;
+	// The inventory (Equipment_Inventory%02d_Type | _EquipId, _Quantity).
+	for (int n = 0, missing = 0; n < 4000 && missing < 8; n++) {
+		int64_t type = 0, id = 0;
+		if (!Int(e, Fmt("EQUIPMENT_INVENTORY%02d_EQUIPID", n), &id) || !Int(e, Fmt("EQUIPMENT_INVENTORY%02d_TYPE", n), &type)) {
+			missing++;
+			continue;
+		}
+		missing = 0;
+		if (Int(e, Fmt("EQUIPMENT_INVENTORY%02d_QUANTITY", n), &q) && q <= 0) continue;
+		const uint32_t code = static_cast<uint32_t>(type) | static_cast<uint32_t>(id);
+		p->items.emplace(code, where + " inventory slot " + std::to_string(n));
+	}
+	// The storage box (Equipment_StorageBox%02d_EquipTypeId, _LowQuantity + _HighQuantity).
+	int64_t count = 0;
+	if (!Int(e, "EQUIPMENT_STORAGEBOX_COUNT", &count)) count = 0;
+	for (int n = 0; n < count && n < 4000; n++) {
+		int64_t code = 0, lo = 0, hi = 0;
+		if (!Int(e, Fmt("EQUIPMENT_STORAGEBOX%02d_EQUIPTYPEID", n), &code)) continue;
+		(void)Int(e, Fmt("EQUIPMENT_STORAGEBOX%02d_LOWQUANTITY", n), &lo);
+		(void)Int(e, Fmt("EQUIPMENT_STORAGEBOX%02d_HIGHQUANTITY", n), &hi);
+		if (lo + hi <= 0) continue;
+		p->items.emplace(static_cast<uint32_t>(code), where + " storage box slot " + std::to_string(n));
+	}
+	// Every ring ever picked up, as the game keeps it for the ring trophy.
+	if (Int(e, "TROPHIES_RING_COUNT", &count)) {
+		for (int n = 0; n < count && n < 1000; n++)
+			if (Int(e, Fmt("TROPHIES_RING%02d", n), &v)) p->rings.emplace(static_cast<int>(v), where + " TROPHIES_RING" + Fmt("%02d", n));
+	}
+}
+
+bool Wanted() {
+	if (const char* v = std::getenv("DES_TROPHY_SYNC"); v != nullptr) {
+		const std::string x = Lower(v);
+		return !(x == "0" || x == "off" || x == "false" || x == "no");
+	}
+	std::ifstream f("settings.ini", std::ios::binary);
+	for (std::string line; std::getline(f, line);) {
+		std::string l = Lower(line);
+		l.erase(std::remove_if(l.begin(), l.end(), [](unsigned char c) { return std::isspace(c) != 0; }), l.end());
+		if (l.rfind("des_trophy_sync=", 0) == 0) {
+			const std::string x = l.substr(16);
+			return !(x == "0" || x == "off" || x == "false" || x == "no");
+		}
+	}
+	return true;
+}
+
+constexpr uint32_t kGoods = 0x40000000u, kRing = 0x20000000u;
+
+} // namespace DesSync
+
+void SyncFromSave(State& s) {
+	using namespace DesSync;
+	if (s.title_id != "PPSA01341" && s.title_id != "PPSA01342" && s.title_id != "PPSA01340") return;
+	if (!Wanted()) {
+		std::printf("[trophy-sync] off (DES_TROPHY_SYNC=0)\n");
+		return;
+	}
+	// Every character save of the profile (SAVEDATA0PlayerProfile*/USR-DATA*): read only.
+	Proofs                p;
+	std::error_code       ec;
+	const auto            root  = s.store.parent_path();
+	int                   files = 0;
+	for (const auto& dir: std::filesystem::directory_iterator(root, ec)) {
+		const std::string dn = Common::PathToString(dir.path().filename());
+		if (!dir.is_directory(ec) || dn.find("PlayerProfile") == std::string::npos) continue;
+		std::error_code ec2;
+		for (const auto& f: std::filesystem::directory_iterator(dir.path(), ec2)) {
+			const std::string fn = Common::PathToString(f.path().filename());
+			if (fn.rfind("USR-DATA", 0) != 0 || !f.is_regular_file(ec2)) continue;
+			std::ifstream in(f.path(), std::ios::binary);
+			const Bytes   data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+			Entries       e;
+			if (!Parse(data, &e)) {
+				std::printf("[trophy-sync] %s/%s: not a save this reads (skipped)\n", dn.c_str(), fn.c_str());
+				continue;
+			}
+			files++;
+			Read(f.path(), e, &p);
+		}
+	}
+	std::printf("[trophy-sync] read %d save file(s): %zu items, %zu rings in the ring list, clear count %lld\n", files,
+	            p.items.size(), p.rings.size(), static_cast<long long>(p.clear_count));
+	if (files == 0) return;
+
+	// trophy -> proof (empty: not proven)
+	std::vector<std::pair<int, std::string>> proven;
+	const auto has = [&](uint32_t code, std::string* where) {
+		const auto it = p.items.find(code);
+		if (it == p.items.end()) return false;
+		*where = it->second;
+		return true;
+	};
+	// 1-16: the boss's demon soul held (the game's goods_caption: "The soul of the <boss> Demon"), or the game cleared
+	// (every one of these is mandatory before the Old One).
+	struct Boss {
+		int         trophy;
+		uint32_t    soul;
+		const char* soul_name;
+	};
+	static const Boss bosses[] = {
+	    {1, 15, "Lead Demon Soul"},      {2, 16, "Iron Demon Soul"},    {3, 17, "Silver Demon Soul"},
+	    {4, 7, "False King Demon Soul"}, {5, 27, "Hard Demon Soul"},    {6, 28, "Searing Demon Soul"},
+	    {7, 29, "Dragon Demon Soul"},    {8, 21, "Doll Demon Soul"},    {9, 22, "Mixed Demon Soul"},
+	    {10, 23, "Golden Demon Soul"},   {11, 18, "Swollen Demon Soul"}, {12, 19, "Hero Demon Soul"},
+	    {13, 20, "Storm Demon Soul"},    {14, 24, "Writhing Demon Soul"}, {15, 25, "Eroded Demon Soul"},
+	    {16, 26, "Pureblood Demon Soul"},
+	};
+	for (const auto& b: bosses) {
+		std::string where;
+		if (has(kGoods | b.soul, &where)) proven.emplace_back(b.trophy, std::string(b.soul_name) + " (goods " + std::to_string(b.soul) + ") in " + where);
+		else if (p.clear_count >= 1)
+			proven.emplace_back(b.trophy, "game cleared (CLEARCOUNT=" + std::to_string(p.clear_count) + "): the boss is mandatory before the Old One");
+	}
+	// 26: the Maiden in Black's demon soul (only from slaying her: the soul-power ending).
+	if (std::string where; has(kGoods | 30, &where)) proven.emplace_back(26, "Maiden in Black Demon Soul (goods 30) in " + where);
+	// 31: Istarelle (weapons 70300-70305); 33: Northern Regalia (21500-21501).
+	for (uint32_t id = 70300; id <= 70305; id++)
+		if (std::string where; has(id, &where)) {
+			proven.emplace_back(31, "Istarelle (weapon " + std::to_string(id) + ") in " + where);
+			break;
+		}
+	for (uint32_t id = 21500; id <= 21501; id++)
+		if (std::string where; has(id, &where)) {
+			proven.emplace_back(33, "Northern Regalia (weapon " + std::to_string(id) + ") in " + where);
+			break;
+		}
+	// 36: every ring (accessory_name: 100-126 but 122, the four 996x; either Ring of Longevity) in the game's ring list or held.
+	{
+		std::vector<std::vector<int>> need;
+		for (int r = 100; r <= 126; r++)
+			if (r != 122) need.push_back({r});
+		need.push_back({9960});
+		need.push_back({9961, 9965});
+		need.push_back({9962});
+		need.push_back({9963});
+		int missing = 0;
+		for (const auto& any: need) {
+			bool ok = false;
+			for (const int r: any) {
+				std::string where;
+				ok = ok || p.rings.count(r) != 0 || has(kRing | static_cast<uint32_t>(r), &where);
+			}
+			if (!ok) missing++;
+		}
+		if (missing == 0) proven.emplace_back(36, "all " + std::to_string(need.size()) + " rings in the ring list / inventory");
+		else std::printf("[trophy-sync] rings: %d of %zu still missing (no trophy 36)\n", missing, need.size());
+	}
+
+	int added = 0;
+	for (const auto& [id, proof]: proven) {
+		if (s.unlocked.count(id) != 0 || s.trophies.count(id) == 0) continue;
+		if (added == 0) {
+			// The trophy state before the first sync, once.
+			const auto backup = s.store.parent_path() / "trophies.json.pre-sync";
+			if (!std::filesystem::exists(backup, ec) && std::filesystem::exists(s.store, ec)) {
+				std::filesystem::copy_file(s.store, backup, ec);
+				std::printf("[trophy-sync] backup %s%s\n", Common::PathToString(backup).c_str(), ec ? " FAILED" : "");
+			}
+		}
+		Record(s, id, kToastSeconds);
+		added++;
+		std::printf("[trophy-sync] unlocked %d %s: %s\n", id, s.trophies[id].info.name.c_str(), proof.c_str());
+		LOGF("[trophy-sync] unlocked %d %s: %s\n", id, s.trophies[id].info.name.c_str(), proof.c_str());
+	}
+	// The platinum, as Unlock gives it, when the sync completed the set.
+	int  platinum = -1;
+	bool rest     = !s.trophies.empty();
+	for (const auto& [id, e]: s.trophies) {
+		if (e.info.grade == 1) platinum = id;
+		else if (id != kNexusTrophyId && s.unlocked.count(id) == 0) rest = false;
+	}
+	if (platinum >= 0 && rest && s.unlocked.count(platinum) == 0) {
+		Record(s, platinum, kToastSeconds);
+		added++;
+		std::printf("[trophy-sync] unlocked %d %s: every other trophy held\n", platinum, s.trophies[platinum].info.name.c_str());
+	}
+	if (added > 0) SaveStore(s);
+	std::printf("[trophy-sync] %d new, %zu proven in all\n", added, proven.size());
 }
 
 } // namespace
@@ -718,7 +993,7 @@ std::shared_ptr<const Toast> CurrentToast(float* seconds) {
 		PlayChime();
 	}
 	float t = std::chrono::duration<float>(now - s.shown_at).count();
-	if (t >= TOAST_SECONDS) {
+	if (t >= s.queue.front()->seconds) {
 		s.queue.pop_front();
 		s.shown_at = {};
 		if (s.queue.empty()) return nullptr;
