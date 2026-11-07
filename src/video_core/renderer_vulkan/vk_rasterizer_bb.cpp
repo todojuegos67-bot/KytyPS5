@@ -28,6 +28,7 @@
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/host_shaders/bb_alpha_comp.h"
 #include "video_core/host_shaders/bb_flatcheck_comp.h"
+#include "video_core/host_shaders/bb_hudmask_comp.h"
 #include "video_core/host_shaders/bb_hud_comp.h"
 #include "video_core/host_shaders/bb_hudless_lut_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
@@ -217,6 +218,10 @@ struct BBVk {
     bool hs_hudless_ready = false;
     vk::ImageView hs_hudless_view{};
     const char* hs_hudless_source = "";
+    // 1.55: the HUD coverage mask at the output size (R8, 0 = no HUD), valid for the frame just
+    // presented through the canvas (sampled, shader-read-only). For frame generation consumers.
+    bool hs_mask_ready = false;
+    vk::ImageView hs_mask_view{};
 };
 BBVk g_bb;
 
@@ -3938,8 +3943,48 @@ struct HsState {
     // 1.42 diagnostics: "other image" presents (canvas live, the flip has no recent canvas).
     u32 d_other_logged = 0;
     u64 begin_pcount = 0;
+    // 1.55: per-frame fallback (never off for the session) and the [hudcanvas] line.
+    bool a0_valid = false;
+    VAddr last_addr = 0;    // the flip presented last  // a0 = the canvas before any HUD draw, this frame
+    u32 redirects = 0;      // draws redirected into a canvas since the last present
+    std::array<u32, 10> fb{};
+    u32 hc_on = 0, hc_n = 0, hc_draws = 0;
+    double hc_cost_ms = 0;
+    std::chrono::steady_clock::time_point hc_last{};
+    // The coverage mask (bb_hudmask.comp: a0 vs a, the same scene pixels before / after the HUD).
+    HsCanvas mask;
+    vk::Pipeline mk_pipeline{};
+    vk::Buffer mk_buffer{};
+    VmaAllocation mk_alloc{};
+    u32* mk_mapped = nullptr;
+    bool mk_init = false, mk_failed = false;
+    std::array<u32, 2> mk_prev{};
 };
 HsState g_hs;
+enum HsFb : u32 {
+    FbNoHudPoint = 0, // no HUD start this frame (menus, loading, 2D only): the game's own image
+    FbWarmup,         // the upscaler's history was just reset
+    FbNotReady,       // the upscaled scene was not produced this frame
+    FbNotNeeded,      // output not above the render size
+    FbFormat,         // HUD target format unusable as a canvas
+    FbAlloc,          // canvas image could not be created
+    FbOtherImage,     // canvas live but the game presented an image it drew itself
+    FbIncomplete,     // the flip's canvas was not completed (last good canvas repeated)
+    FbStaleFlip,      // presented flip's draws went to a canvas without a final pass
+    FbView,           // no presenter view of the canvas
+};
+constexpr std::array<const char*, 10> kFbName{
+    "no-hud-point", "warmup", "scene-not-ready", "not-needed", "format",
+    "alloc", "game-image", "incomplete(repeat)", "stale-flip(repeat)", "view"};
+// 1.55: timed sections of the canvas code (CPU recording cost per second).
+struct HsTimer {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~HsTimer() {
+        g_hs.hc_cost_ms += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+    }
+};
 constexpr std::array<const char*, 4> kGuardReason{
     "other image (canvas live, no canvas for this flip)", "flip canvas not completely written",
     "raw flip of a canvas-redirected image", "no presenter view of the canvas"};
@@ -4069,19 +4114,24 @@ void HsSay(const std::string& what) {
     }
 }
 
-void HsOff(const std::string& why) {
-    HsSay("off: " + why);
-    BB::Upscale::SetHudCanvasOk(false, why + " (1.14 behaviour: HUD composite at present)");
+// 1.55: never off for the session: this frame falls back to the normal path, the next frame
+// tries again (the reason is counted in the [hudcanvas] line).
+void HsOff(const std::string& why, u32 reason = FbAlloc) {
+    HsSay("this frame without the canvas: " + why);
+    ++g_hs.fb[reason];
 }
 } // namespace
 
 void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
+    HsTimer timer;
     g_hs.live = false;
     g_hs.bi = -1;
+    g_hs.a0_valid = false;
     ++g_hs.gen;
     if (!BB::Upscale::HudCanvasWanted()) {
         return;
     }
+
     // 1.38: not on the first HUD-point frames after the upscaler's history was reset (session
     // start, loading): its first output can be blank / white, and the 1.37 start flash showed
     // that canvas (white background, HUD on top). Those frames keep the game's own image.
@@ -4090,10 +4140,12 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
         if (plan.reset) g_hs.warm = 0;
         if (g_hs.warm < 3) {
             ++g_hs.warm;
+            ++g_hs.fb[FbWarmup];
             return;
         }
     }
     if (!g_bb.present_ready || !g_bb.output.image || !g_bb.present_in.image) {
+        ++g_hs.fb[FbNotReady];
         return;
     }
     const vk::Extent2D render{flip.info.size.width, flip.info.size.height};
@@ -4101,6 +4153,7 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
     if (output.width <= render.width && output.height <= render.height) {
         HsSay(fmt::format("not needed: the output {}x{} is not above the render size {}x{}",
                           output.width, output.height, render.width, render.height));
+        ++g_hs.fb[FbNotNeeded];
         return;
     }
     // The upscaled scene goes back to the HUD target's own byte layout: through the format the
@@ -4113,12 +4166,19 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
     if (!(feat(temp_fmt) & vk::FormatFeatureFlagBits::eBlitDst) ||
         !(feat(flip.info.pixel_format) & vk::FormatFeatureFlagBits::eColorAttachment)) {
         HsOff(fmt::format("the HUD target format {} cannot be the canvas (blit / attachment)",
-                          vk::to_string(flip.info.pixel_format)));
+                          vk::to_string(flip.info.pixel_format)),
+              FbFormat);
         return;
     }
     const bool want_fg = BB::FG::WantInputs();
+    // 1.55: the before-HUD copy also feeds the coverage mask (BB_HUD_MASK=0: only with FG).
+    static const bool mask_on = [] {
+        const char* v = std::getenv("BB_HUD_MASK");
+        return !(v != nullptr && *v == '0');
+    }();
+    const bool want_a0 = want_fg || mask_on;
     if (!HsEnsure(g_hs.a, output, flip.info.pixel_format, false) ||
-        (want_fg && !HsEnsure(g_hs.a0, output, flip.info.pixel_format, false))) {
+        (want_a0 && !HsEnsure(g_hs.a0, output, flip.info.pixel_format, false))) {
         HsOff("the output-size canvas could not be created");
         return;
     }
@@ -4169,14 +4229,16 @@ void Rasterizer::BBHudSharpBegin(VideoCore::Image& flip) {
     Barrier(cmd, g_bb.output, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
             vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eAllCommands,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
-    if (want_fg) {
-        // The HUD target before any HUD draw: frame generation's HUD-less source.
+    if (want_a0) {
+        // The HUD target before any HUD draw: frame generation's HUD-less source and the
+        // coverage mask's reference (the same upscaled scene pixels as the canvas).
         HsBarrier(cmd, g_hs.a, vk::ImageLayout::eTransferSrcOptimal);
         g_hs.a0.layout = vk::ImageLayout::eUndefined;
         HsBarrier(cmd, g_hs.a0, vk::ImageLayout::eTransferDstOptimal);
         cmd.copyImage(g_hs.a.image, vk::ImageLayout::eTransferSrcOptimal, g_hs.a0.image,
                       vk::ImageLayout::eTransferDstOptimal, whole);
         HsBarrier(cmd, g_hs.a0, vk::ImageLayout::eShaderReadOnlyOptimal);
+        g_hs.a0_valid = true;
     }
     HsBarrier(cmd, g_hs.a, vk::ImageLayout::eColorAttachmentOptimal);
     g_hs.live = true;
@@ -4261,6 +4323,8 @@ bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view
     layout = c->layout;
     width = c->extent.width;
     height = c->extent.height;
+    ++g_hs.redirects;
+    ++g_hs.hc_draws;
     if (bb_hs_sampled) {
         ++g_hs.s_final;
         if (g_hs.bi >= 0 && c == &g_hs.bp[g_hs.bi] && g_hs.want_fg && !bb_hs_twin.empty()) {
@@ -4309,6 +4373,7 @@ bool Rasterizer::BBHudSharpSampled(const VideoCore::Image& image,
         twin_view = game_view(g_hs.a0);
     }
     bb_hs_sampled = true;
+    ++g_hs.redirects;
     return true;
 }
 
@@ -4637,6 +4702,112 @@ HsCanvas* HsContentCheck(vk::CommandBuffer cmd, HsCanvas& c) {
     return &g_hs.pres;
 }
 
+// 1.55: the HUD coverage mask pipeline (bb_hudmask.comp; the content check's set layout).
+bool HsMaskInit() {
+    if (g_hs.mk_init || g_hs.mk_failed) return g_hs.mk_init;
+    if (!HsFcInit()) return false;
+    g_hs.mk_failed = true;
+    const auto device = g_bb.device;
+    const auto module = CompileSPV(BB_HUDMASK_COMP, device);
+    if (!module) return false;
+    auto [pr, pipeline] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage = vk::PipelineShaderStageCreateInfo{.stage = vk::ShaderStageFlagBits::eCompute,
+                                                           .module = module,
+                                                           .pName = "main"},
+                .layout = g_hs.fc_layout,
+            });
+    device.destroyShaderModule(module);
+    if (pr != vk::Result::eSuccess) return false;
+    g_hs.mk_pipeline = pipeline;
+    const VkBufferCreateInfo bci = vk::BufferCreateInfo{
+        .size = 16, .usage = vk::BufferUsageFlagBits::eStorageBuffer};
+    VmaAllocationCreateInfo alloc{};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    alloc.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    alloc.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkBuffer buffer{};
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(g_bb.allocator, &bci, &alloc, &buffer, &g_hs.mk_alloc, &info) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    g_hs.mk_buffer = buffer;
+    g_hs.mk_mapped = static_cast<u32*>(info.pMappedData);
+    std::memset(g_hs.mk_mapped, 0, 16);
+    g_hs.mk_failed = false;
+    g_hs.mk_init = true;
+    return true;
+}
+
+// 1.55: mask = where this frame's HUD draws changed canvas a (a0: the same pixels before them).
+void HsMask(vk::CommandBuffer cmd) {
+    g_bb.hs_mask_ready = false;
+    if (!g_hs.a0_valid || !g_hs.a.image || !g_hs.a0.image || g_hs.a.extent != g_hs.a0.extent ||
+        !HsMaskInit() ||
+        !HsEnsure(g_hs.mask, g_hs.a.extent, vk::Format::eR8Unorm, false, true)) {
+        return;
+    }
+    const vk::ImageView pre = HsView(g_hs.a0, g_hs.a0.format, 2);
+    const vk::ImageView post = HsView(g_hs.a, g_hs.a.format, 2);
+    const vk::ImageView out = HsView(g_hs.mask, vk::Format::eR8Unorm, 3);
+    const vk::ImageView smp = HsView(g_hs.mask, vk::Format::eR8Unorm, 2);
+    if (!pre || !post || !out || !smp) return;
+    HsBarrier(cmd, g_hs.a0, vk::ImageLayout::eShaderReadOnlyOptimal);
+    HsBarrier(cmd, g_hs.a, vk::ImageLayout::eShaderReadOnlyOptimal);
+    g_hs.mask.layout = vk::ImageLayout::eUndefined; // overwritten whole
+    HsBarrier(cmd, g_hs.mask, vk::ImageLayout::eGeneral);
+    const vk::DescriptorImageInfo pre_info{g_hs.fc_sampler, pre,
+                                           vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo post_info{g_hs.fc_sampler, post,
+                                            vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo out_info{{}, out, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo buf_info{g_hs.mk_buffer, 0, 16};
+    const std::array writes{
+        vk::WriteDescriptorSet{.dstBinding = 0,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &pre_info},
+        vk::WriteDescriptorSet{.dstBinding = 1,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &post_info},
+        vk::WriteDescriptorSet{.dstBinding = 2,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &out_info},
+        vk::WriteDescriptorSet{.dstBinding = 3,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = &buf_info},
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_hs.mk_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_hs.fc_layout, 0, writes);
+    const struct {
+        u32 size[4];
+    } push{{g_hs.mask.extent.width, g_hs.mask.extent.height, 0u, 0u}};
+    cmd.pushConstants(g_hs.fc_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((push.size[0] + 15) / 16, (push.size[1] + 15) / 16, 1);
+    const vk::ImageMemoryBarrier2 to_read{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = vk::ImageLayout::eGeneral,
+        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = g_hs.mask.image,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                            .pImageMemoryBarriers = &to_read});
+    g_hs.mask.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    g_bb.hs_mask_view = smp;
+    g_bb.hs_mask_ready = true;
+}
+
 // 1.40: the copy of a canvas that is presented (the image a guarded frame repeats).
 void HsKeepGood(vk::CommandBuffer cmd, HsCanvas& c) {
     if (!HsEnsure(g_hs.lg, c.extent, c.format, false)) {
@@ -4660,9 +4831,42 @@ void HsKeepGood(vk::CommandBuffer cmd, HsCanvas& c) {
 bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip,
                                    vk::Format view_format, vk::ImageView& out_view,
                                    vk::Extent2D& out_size) {
+    HsTimer timer;
     g_hs.presented = false;
+    g_bb.hs_hudless_ready = false;
+    g_bb.hs_mask_ready = false;
     ++g_hs.s_calls;
     const auto now = std::chrono::steady_clock::now();
+    ++g_hs.hc_n;
+    if (g_hs.hc_last.time_since_epoch().count() == 0) g_hs.hc_last = now;
+    if (now - g_hs.hc_last >= std::chrono::seconds(1)) {
+        g_hs.hc_last = now;
+        std::string why;
+        for (size_t i = 0; i < g_hs.fb.size(); ++i) {
+            if (g_hs.fb[i] != 0) {
+                why += fmt::format("{}{}={}", why.empty() ? "" : ", ", kFbName[i], g_hs.fb[i]);
+            }
+        }
+        std::string cov = "n/a";
+        if (g_hs.mk_mapped) {
+            const std::array<u32, 2> m{g_hs.mk_mapped[0], g_hs.mk_mapped[1]};
+            const u32 dc = m[0] - g_hs.mk_prev[0], df = m[1] - g_hs.mk_prev[1];
+            g_hs.mk_prev = m;
+            const double px = double(g_hs.mask.extent.width) * g_hs.mask.extent.height;
+            if (df != 0 && px > 0) cov = fmt::format("{:.2f}%", 100.0 * dc / df / px);
+        }
+        const std::string line = fmt::format(
+            "[hudcanvas] on={}/{} frames, fallback reasons: {}, hud_draws={}, hud_coverage={} "
+            "({}x{}), cost={:.2f}ms (CPU recording, per second)",
+            g_hs.hc_on, g_hs.hc_n - 1, why.empty() ? std::string("none") : why, g_hs.hc_draws,
+            cov, g_hs.output.width, g_hs.output.height, g_hs.hc_cost_ms);
+        LOG_INFO(Render_Vulkan, "{}", line);
+        BB::Upscale::Checkpoint(line);
+        g_hs.fb = {};
+        g_hs.hc_on = g_hs.hc_draws = 0;
+        g_hs.hc_n = 1;
+        g_hs.hc_cost_ms = 0;
+    }
     if (g_hs.last.time_since_epoch().count() == 0) g_hs.last = now;
     if (now - g_hs.last >= std::chrono::seconds(1)) {
         g_hs.last = now;
@@ -4738,6 +4942,8 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         }
     }
     const bool was_live = g_hs.live;
+    const u32 redirects = g_hs.redirects;
+    g_hs.redirects = 0;
     g_hs.live = false;
     ++g_hs.pcount;
     // 1.40: the frame's final pass drew its flip's canvas completely (the flip is presented).
@@ -4748,6 +4954,18 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
     const bool recent_canvas =
         g_hs.last_live_pcount != 0 && g_hs.pcount - g_hs.last_live_pcount <= 8;
     if (was_live) g_hs.last_live_pcount = g_hs.pcount;
+    const VAddr prev_addr = g_hs.last_addr;
+    g_hs.last_addr = addr;
+    // 1.55: nothing was redirected into a canvas since the last present: the game drew this flip
+    // itself (no HUD point: menus, loading, warm-up, a per-frame fallback), so it is presented as
+    // the game wrote it. 1.37-1.51 showed an older canvas of the same flip here (up to 3 frames
+    // old) or repeated the last canvas for 8 frames: stale frames / hitches whenever the HUD
+    // point was missed. Only a re-flip of the image presented just before keeps its canvas.
+    if (!was_live && redirects == 0 && !(slot >= 0 && addr == prev_addr)) {
+        ++g_hs.fb[FbNoHudPoint];
+        ++g_hs.s_no_canvas;
+        return false;
+    }
     if (was_live && addr == g_hs.target) {
         c = &g_hs.a; // filled whole by BBHudSharpBegin this frame (the upscaled scene)
         h = g_hs.want_fg ? &g_hs.a0 : nullptr;
@@ -4757,6 +4975,7 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
             // 1.40: cleared but its final pass not complete: never shown.
             if (was_live && slot != g_hs.bi) g_hs.live = true;
             ++g_hs.s_other;
+            ++g_hs.fb[FbIncomplete];
             return HsGuard(cmd, flip, view_format, 1, out_view, out_size);
         }
         c = &g_hs.bp[slot];
@@ -4772,7 +4991,9 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         if (was_live && slot != g_hs.bi) g_hs.live = true; // this frame's canvas still to come
     } else if (!was_live) {
         ++g_hs.s_no_canvas;
+        // (1.55: only reached with draws redirected since the last present, see above.)
         if (redirected_flip && recent_canvas) {
+            ++g_hs.fb[FbStaleFlip];
             // 1.40: the guest image of a flip whose draws went into a canvas a moment ago.
             return HsGuard(cmd, flip, view_format, 2, out_view, out_size);
         }
@@ -4792,9 +5013,13 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         // A flip that never had a canvas (its draws were never redirected: the game wrote it
         // itself), shown more than a second in a row (pause / menu screens): the game's own
         // image, written this frame, so that a menu is not frozen on the last canvas.
-        if (!redirected_flip && g_hs.consecutive_fail > 30) {
+        // 1.55: at once (1.40-1.51 waited 30 frames: a menu frozen on the last canvas).
+        if (!redirected_flip) {
+            ++g_hs.fb[FbOtherImage];
+            if (g_hs.pcount - g_hs.begin_pcount <= 2) g_hs.live = true;
             return false;
         }
+        ++g_hs.fb[FbStaleFlip];
         // 1.42: this frame's HUD point already ran but its final pass has not: the canvas stays
         // armed for it (1.40 dropped it here, so the rest of the frame went to the guest images).
         if (g_hs.pcount - g_hs.begin_pcount <= 2) g_hs.live = true;
@@ -4813,9 +5038,12 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
     g_hs.consecutive_fail = 0;
     out_view = HsView(*c, view_format, 1);
     if (!out_view) {
-        HsOff(fmt::format("no {} view of the canvas", vk::to_string(view_format)));
+        HsOff(fmt::format("no {} view of the canvas", vk::to_string(view_format)), FbView);
         return HsGuard(cmd, flip, view_format, 3, out_view, out_size);
     }
+    HsCanvas* const canvas = c;
+    // The mask only for this frame's completed canvas (not a re-presented one).
+    if (was_live && (c == &g_hs.a || slot == g_hs.bi)) HsMask(cmd);
     if (HsCanvas* checked = HsContentCheck(cmd, *c)) {
         // 1.42: the checked image (the canvas, or the last frame when its scene was flat).
         const vk::ImageView pv = HsView(*checked, view_format, 1);
@@ -4836,6 +5064,19 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
     g_bb.fg_present_ready = false;
     g_hs.presented = true;
     ++g_hs.s_presents;
+    ++g_hs.hc_on;
+    // 1.55: frame generation gets this frame's HUD-less twin (the same final pass from the canvas
+    // before any HUD draw): HUD excluded from FG's input, the real HUD composited over generated
+    // frames by FG's HUD-less handling. Not when the content check replaced the canvas.
+    if (h != nullptr && c == canvas && h->image) {
+        if (const vk::ImageView hv = HsView(*h, view_format, 1)) {
+            HsBarrier(cmd, *h, vk::ImageLayout::eShaderReadOnlyOptimal);
+            g_bb.hs_hudless_view = hv;
+            g_bb.hs_hudless_source = "HUD canvas twin (final pass without the HUD, output size)";
+            g_bb.hs_hudless_ready = true;
+            ++g_hs.s_hudless;
+        }
+    }
     return true;
 }
 

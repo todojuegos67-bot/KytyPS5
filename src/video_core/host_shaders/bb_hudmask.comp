@@ -1,0 +1,40 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// 1.55 HUD coverage mask (vk_rasterizer_bb.cpp HsMask): both inputs are output-size canvases of
+// the HUD target holding the very same upscaled scene pixels, one before any HUD draw (pre) and
+// one after the frame's HUD draws (post). No resampling is involved, so every pixel the HUD
+// changed differs and every other pixel is bit-identical: the mask is the HUD's exact coverage
+// at the output size (soft edge = how much the HUD changed the pixel). It never reconstructs HUD
+// colour. Counters: covered pixels (mask > 0) for the per-second [hudcanvas] line.
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D pre_tex;
+layout(binding = 1) uniform sampler2D post_tex;
+layout(binding = 2, r8) uniform writeonly image2D mask_img;
+layout(std430, binding = 3) buffer State {
+    uint covered;
+    uint frames;
+} st;
+layout(push_constant) uniform Push {
+    uvec4 size;
+} p;
+shared uint s_count;
+void main() {
+    if (gl_LocalInvocationIndex == 0u) s_count = 0u;
+    barrier();
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(uvec2(c), p.size.xy))) {
+        vec4 a = texelFetch(pre_tex, c, 0);
+        vec4 b = texelFetch(post_tex, c, 0);
+        vec3 d = abs(b.rgb - a.rgb);
+        float m = max(d.r, max(d.g, d.b));
+        float cov = m > (0.5 / 255.0) ? clamp(m * 8.0, 1.0 / 255.0, 1.0) : 0.0;
+        imageStore(mask_img, c, vec4(cov));
+        if (cov > 0.0) atomicAdd(s_count, 1u);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        atomicAdd(st.covered, s_count);
+        if (gl_GlobalInvocationID.xy == uvec2(0u)) atomicAdd(st.frames, 1u);
+    }
+}
