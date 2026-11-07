@@ -1782,10 +1782,12 @@ struct Toast {
     Tex icon;
     std::string detail;
     bool custom = false;
+    float seconds = 6.0f; // (bb-trophysync-148) retroactive unlocks use a shorter card
 };
 std::mutex g_toast_mtx;
 std::deque<Toast> g_toasts;
 constexpr float kToastSeconds = 6.0f;
+thread_local float t_toast_seconds = 0.0f; // 0: kToastSeconds
 
 void PlayChime() {
     // the DS port's chime (our own: G5, D6, G6 bell partials), through SDL3 audio
@@ -1846,13 +1848,14 @@ void DrawToast(float u) {
         std::thread(PlayChime).detach();
     }
     const float t = static_cast<float>(now - toast.start);
-    if (t > kToastSeconds) {
+    const float kSecs = toast.seconds;
+    if (t > kSecs) {
         g_toasts.pop_front();
         return;
     }
     const float saved = g_a;
     const float in = EaseOutBack(t / 0.55f);
-    const float out = EaseInOut(std::clamp((t - (kToastSeconds - 0.5f)) / 0.5f, 0.0f, 1.0f));
+    const float out = EaseInOut(std::clamp((t - (kSecs - 0.5f)) / 0.5f, 0.0f, 1.0f));
     g_a = std::clamp(t / 0.25f, 0.0f, 1.0f) * (1.0f - out);
     if (g_a <= 0.0f) {
         g_a = saved;
@@ -1965,7 +1968,7 @@ void DrawToast(float u) {
     dl->AddText(FT(g_ft_ui), small_px, {tx, ty + head_px + 20 * u + name_px}, Muted(na),
                 sub.c_str(), nullptr, 0.0f, &clip);
     // progress line along the bottom
-    const float life = std::clamp(t / kToastSeconds, 0.0f, 1.0f);
+    const float life = std::clamp(t / kSecs, 0.0f, 1.0f);
     dl->AddRectFilled({a.x + r, b.y - 3 * u}, {a.x + r + (w - 2 * r) * (1.0f - life), b.y - 1.5f * u},
                       GC(0.55f));
     g_a = saved;
@@ -3862,9 +3865,14 @@ bool PushTrophyToast(const std::filesystem::path& icon, const std::string& name,
     t.icon_path = icon;
     t.name = name;
     t.grade = grade.empty() ? 'B' : grade[0];
+    t.seconds = t_toast_seconds > 0.0f ? t_toast_seconds : kToastSeconds;
     g_toasts.push_back(std::move(t));
     // the F1 list: refresh on the next open
     return true;
+}
+
+void SetToastSecondsForThread(float seconds) {
+    t_toast_seconds = seconds;
 }
 
 bool IsPadInput(Uint32 t) {

@@ -38,6 +38,9 @@ void LoadFonts();
 bool PushTrophyToast(const std::filesystem::path& icon, const std::string& name,
                      std::string_view grade);
 
+// (bb-trophysync-148) Card length for toasts pushed from the calling thread (0: default 6 s).
+void SetToastSecondsForThread(float seconds);
+
 // (bb-trophy-134) Every guest open() path + flags (Kernel.Fs). Map loads and character-slot
 // writes (new game) drive the custom trophies.
 void OnGuestFileOpen(const char* path, int flags);
