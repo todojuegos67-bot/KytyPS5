@@ -2870,6 +2870,7 @@ bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* fon
 	const bool engraved = primary && font == g_font_display;
 	if (engraved) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0, 0, 0, 0});
 	const bool clicked = ImGui::Button(I18n::T(text), size);
+	Anim::Highlight(g_unit); // (step5) eased hover / focus glow, border and accent bar (real time)
 	if (engraved) {
 		ImGui::PopStyleColor();
 		auto*        dl  = ImGui::GetWindowDrawList();
@@ -3478,7 +3479,6 @@ void LauncherAjustes(Settings& s) {
 		}
 	}
 	LCheckRow("Copia de las partidas al arrancar", s.backup_saves, "Copia _SaveData en _SaveData-copias cada vez que pulsas JUGAR.");
-	LCheckRow("Niebla y polvo en el lanzador", s.launcher_fog, "Niebla volum\xC3\xA9trica animada y motas de polvo en suspensi\xC3\xB3n sobre la ilustraci\xC3\xB3n de este lanzador. Desact\xC3\xADvalo si prefieres la imagen quieta.");
 	// (ds-pc-port37) "Continuar donde lo dejé (F1)" removed (the owner asked).
 	{
 		const float y = RowY();
@@ -3687,317 +3687,14 @@ void DrawHourglass(ImDrawList* dl, ImVec2 c, float h, double t) {
 	dl->AddLine(P(-hw * 1.4f, hh), P(hw * 1.4f, hh), frame, std::max(2.0f, h * 0.10f));
 }
 
-// ---- (des-step3-fog) The launcher's "living illustration": only a volumetric fog and fine dust in suspension (no
-// embers, nothing warm). Fog: two CPU-made tileable textures (once, ~1 MB) of seven-octave noise with a two-level
-// domain warp, dithered before 8-bit quantization (no banding), drawn in seven depth layers with parallax (a slow shared
-// drift, each layer moving by its depth), each layer two crossed passes of different textures at different scales and
-// phases (no visible tiling), soft cool light shafts behind the fog and a fainter pass over it (light scattered in the
-// fog). Dust: up to ~420 soft gaussian sprites with a faint glow, sized by depth with a depth-of-field blur, a random-walk
-// drift, sub-pixel positions (bilinear sprites), a shimmer while inside a light shaft. All on the GPU through ImGui's
-// draw list (a few hundred quads), on the background list under every window; the logo's corner is left out.
-// settings.ini lanzador_niebla=0 turns it off. ----
-namespace Ambience {
-
-ImTextureData* g_fog   = nullptr; // 1024 x 256, white, alpha = billowy fog (tileable along x)
-ImTextureData* g_wisp  = nullptr; // 1024 x 192, white, alpha = fine warped wisps (tileable along x)
-ImTextureData* g_glow  = nullptr; // 128 x 128, white, alpha = a gaussian
-ImTextureData* g_ray   = nullptr; // 64 x 256, white, a light shaft (soft sides, fading toward its end)
-ImTextureData* g_haze  = nullptr; // (step5) 4 x 512, white, a dithered vertical ramp (no 8-bit bands)
-double         g_start = -1.0;
-
-struct Mote {
-	float x, y, vx, vy, size, phase, bright, depth;
-};
-std::vector<Mote> g_motes;
-uint32_t          g_rng = 0x9E3779B9u;
-
-float Rand() {
-	g_rng ^= g_rng << 13;
-	g_rng ^= g_rng >> 17;
-	g_rng ^= g_rng << 5;
-	return static_cast<float>(g_rng & 0xFFFFFF) / static_cast<float>(0x1000000);
-}
-
-float Hash(int x, int y, int period) {
-	x = ((x % period) + period) % period;
-	uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u;
-	h          = (h ^ (h >> 13)) * 1274126177u;
-	return static_cast<float>((h ^ (h >> 16)) & 0xFFFF) / 65535.0f;
-}
-
-float Noise(float x, float y, int period) {
-	const int   xi = static_cast<int>(std::floor(x)), yi = static_cast<int>(std::floor(y));
-	const float fx = x - xi, fy = y - yi;
-	const float sx = fx * fx * fx * (fx * (fx * 6 - 15) + 10), sy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
-	const float a = Hash(xi, yi, period), b = Hash(xi + 1, yi, period);
-	const float c = Hash(xi, yi + 1, period), d = Hash(xi + 1, yi + 1, period);
-	return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
-}
-
-// Fractal noise periodic along x over `W` pixels (`cells` per width, doubled each octave, a slight rotation of y per
-// octave against grid artefacts), in 0..1.
-float Fbm(float x, float y, int W, int cells, int octaves, float seed) {
-	float v = 0, amp = 0.5f, sum = 0;
-	for (int o = 0; o < octaves; o++, cells *= 2, amp *= 0.5f) {
-		const float k = static_cast<float>(cells) / W;
-		v += amp * Noise(x * k, y * k + seed + o * 31.7f, cells); // (step5: no x-dependent skew: it broke the x period -> seams)
-		sum += amp;
-	}
-	return v / sum;
-}
-
-ImTextureData* MakeTexture(int w, int h, const std::function<float(int, int)>& alpha) {
-	auto* t = IM_NEW(ImTextureData)();
-	t->Create(ImTextureFormat_RGBA32, w, h);
-	auto*    p    = static_cast<uint8_t*>(t->GetPixels());
-	uint32_t seed = 0x2545F491u;
-	for (int y = 0; y < h; y++)
-		for (int x = 0; x < w; x++, p += 4) {
-			// Triangular dither of +-1 LSB before quantizing: smooth gradients without 8-bit bands.
-			seed ^= seed << 13, seed ^= seed >> 17, seed ^= seed << 5;
-			const float r1 = static_cast<float>(seed & 0xFFFF) / 65535.0f, r2 = static_cast<float>(seed >> 16) / 65535.0f;
-			p[0] = p[1] = p[2] = 255;
-			p[3]               = static_cast<uint8_t>(std::min(255.0f, std::clamp(alpha(x, y) * 255.0f + (r1 - r2), 0.0f, 255.0f) + 0.5f));
-		}
-	t->UseColors = true;
-	ImGui::RegisterUserTexture(t);
-	return t;
-}
-
-void Ensure() {
-	if (g_fog == nullptr) {
-		constexpr int W = 1024, H = 256;
-		g_fog = MakeTexture(W, H, [](int x, int y) {
-			// Two-level domain warp (the warp itself warped), then seven octaves; billowy; denser toward the bottom.
-			const float qx = Fbm(x, y, W, 3, 3, 5.0f) - 0.5f, qy = Fbm(x, y, W, 3, 3, 47.0f) - 0.5f;
-			const float rx = Fbm(x + qx * 120.0f, y + qy * 60.0f, W, 4, 3, 71.0f) - 0.5f;
-			const float ry = Fbm(x + qx * 120.0f, y + qy * 60.0f, W, 4, 3, 113.0f) - 0.5f;
-			const float v  = Fbm(x + rx * 160.0f, (y + ry * 70.0f) * 1.5f, W, 4, 7, 0.0f);
-			float       d  = std::clamp((v - 0.30f) / 0.44f, 0.0f, 1.0f);
-			d              = d * d * (3 - 2 * d);
-			const float fy = (y + 0.5f) / H;
-			const float e  = std::sin(fy * 3.14159265f);
-			return std::pow(d, 1.2f) * e * e * (0.55f + 0.45f * fy);
-		});
-	}
-	if (g_wisp == nullptr) {
-		constexpr int W = 1024, H = 192;
-		g_wisp = MakeTexture(W, H, [](int x, int y) {
-			const float wx = Fbm(x, y, W, 4, 3, 91.0f) - 0.5f, wy = Fbm(x, y, W, 4, 3, 17.0f) - 0.5f;
-			const float n  = Fbm(x + wx * 90.0f, (y + wy * 30.0f) * 2.6f, W, 6, 6, 13.0f);
-			float       r  = 1.0f - std::fabs(2.0f * n - 1.0f);
-			r              = std::clamp((r - 0.55f) / 0.45f, 0.0f, 1.0f);
-			const float fy = (y + 0.5f) / H;
-			return r * r * std::sin(fy * 3.14159265f);
-		});
-	}
-	if (g_ray == nullptr) {
-		constexpr int W = 64, H = 256;
-		g_ray = MakeTexture(W, H, [](int x, int y) {
-			const float fx = (x + 0.5f) / W * 2 - 1, fy = (y + 0.5f) / H;
-			const float edge = std::clamp(1.0f - std::fabs(fx), 0.0f, 1.0f);
-			const float side = std::exp(-fx * fx * 3.5f) * edge * edge * (3 - 2 * edge);
-			const float s0   = std::sin(std::min(fy * 1.6f, 1.0f) * 1.5707963f), s1 = 1.0f - fy;
-			const float len  = s0 * s0 * s1 * s1 * 2.2f; // (step5: smooth to zero at both ends)
-			return std::clamp(side * len, 0.0f, 1.0f);
-		});
-	}
-	if (g_haze == nullptr) {
-		g_haze = MakeTexture(4, 512, [](int, int y) {
-			const float f = (y + 0.5f) / 512.0f;
-			return f * f * (3 - 2 * f);
-		});
-	}
-	if (g_glow == nullptr) {
-		constexpr int S = 128;
-		g_glow = MakeTexture(S, S, [](int x, int y) {
-			const float dx = (x + 0.5f) / S * 2 - 1, dy = (y + 0.5f) / S * 2 - 1;
-			const float r2 = dx * dx + dy * dy;
-			// A gaussian (sigma ~0.33 of the radius), brought to zero at the edge.
-			return std::exp(-r2 * 4.5f) * std::clamp(1.0f - r2, 0.0f, 1.0f);
-		});
-	}
-}
-
-void Free() {
-	FreeTexture(g_fog);
-	FreeTexture(g_wisp);
-	FreeTexture(g_glow);
-	FreeTexture(g_ray);
-	FreeTexture(g_haze);
-	g_motes.clear();
-	g_start = -1.0;
-}
-
-void SpawnMote(Mote& m) {
-	m.x      = Rand();
-	m.y      = 0.16f + Rand() * 0.84f;
-	m.vx     = (Rand() - 0.5f) * 0.003f;
-	m.vy     = (Rand() - 0.5f) * 0.003f;
-	m.depth  = Rand() * Rand() * Rand(); // (most far and sharp, a few near and blurred)
-	m.size   = (0.00045f + Rand() * 0.0006f) * (1.0f + m.depth * 4.5f);
-	m.phase  = Rand() * 6.2831853f;
-	m.bright = 0.45f + Rand() * 0.55f;
-}
-
-// The light shafts, in the art's coordinates: x at the top, top y, width, phase.
-constexpr float kShafts[][4] = {{0.55f, 0.18f, 0.040f, 0.0f}, {0.68f, 0.14f, 0.055f, 1.9f}, {0.83f, 0.20f, 0.045f, 3.3f}};
-constexpr float kLean        = -0.16f; // (the shafts' bottom moves this much of the height to the left)
-
-// How much a point (art coordinates) is inside a shaft, 0..1.
-float ShaftLight(float x, float y, float t, float aspect) {
-	float best = 0;
-	for (const auto& sh: kShafts) {
-		if (y < sh[1]) continue;
-		const float f  = std::min(1.0f, (y - sh[1]) / (1.02f - sh[1]));
-		const float cx = sh[0] + std::sin(t * 0.05f + sh[3]) * 0.010f + kLean * f / aspect;
-		const float hw = sh[2] * (0.5f + 1.2f * f);
-		const float d  = (x - cx) / hw;
-		best           = std::max(best, std::exp(-d * d * 2.5f) * (1.0f - f * 0.6f));
-	}
-	return best;
-}
-
-// `x0, y0, w, h`: where the art is on the screen.
-void Draw(ImDrawList* dl, float x0, float y0, float w, float h, float width, float height) {
-	if (!g_edit.launcher_fog || w <= 0 || h <= 0) return;
-	Ensure();
-	const double now = ImGui::GetTime();
-	if (g_start < 0) g_start = now;
-	const float fade_in = std::clamp(static_cast<float>(now - g_start) / 2.0f, 0.0f, 1.0f);
-	const float fade    = fade_in * fade_in * (3 - 2 * fade_in);
-	const float t       = static_cast<float>(now - g_start);
-	const float dt      = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
-	const float bottom  = std::min(y0 + h, height);
-	const float aspect  = w / h;
-	dl->PushClipRect({0, 0}, {width, height}, false);
-	auto with_a = [](ImU32 rgb, float a) {
-		return (rgb & ~IM_COL32_A_MASK) | (static_cast<ImU32>(std::clamp(a, 0.0f, 1.0f) * 255.0f + 0.5f) << IM_COL32_A_SHIFT);
-	};
-	// A slow shared "camera" drift: each layer moves by its depth (parallax), never a jump.
-	const float cam_x = (std::sin(t * 0.031f) * 0.6f + std::sin(t * 0.017f + 1.3f) * 0.4f) * 0.012f * w;
-	const float cam_y = std::sin(t * 0.023f + 0.7f) * 0.004f * h;
-	auto shafts = [&](float strength) {
-		for (const auto& sh: kShafts) {
-			const float sway = std::sin(t * 0.05f + sh[3]) * 0.010f * w;
-			const float a    = (0.06f + 0.035f * std::sin(t * 0.17f + sh[3] * 1.3f)) * fade * strength;
-			const float cx   = x0 + sh[0] * w + sway, top = y0 + sh[1] * h, bot = std::min(bottom, y0 + 1.02f * h);
-			const float hw0 = sh[2] * w * 0.5f, hw1 = sh[2] * w * 1.7f, lean = kLean * h;
-			if (cx + lean - hw1 < x0 + 0.31f * w && top < y0 + 0.32f * h) continue; // (never over the logo)
-			// (step5) 24 strips: a trapezoid as one quad is two affine triangles, whose shared diagonal shows as a crease.
-			constexpr int kStrips = 24;
-			for (int k = 0; k < kStrips; k++) {
-				const float f0 = static_cast<float>(k) / kStrips, f1 = static_cast<float>(k + 1) / kStrips;
-				const float ya = top + (bot - top) * f0, yb = top + (bot - top) * f1;
-				const float ca = cx + lean * f0, cb = cx + lean * f1, ha = hw0 + (hw1 - hw0) * f0, hb = hw0 + (hw1 - hw0) * f1;
-				dl->AddImageQuad(g_ray->GetTexRef(), {ca - ha, ya}, {ca + ha, ya}, {cb + hb, yb}, {cb - hb, yb}, {0, f0}, {1, f0}, {1, f1}, {0, f1},
-				                 IM_COL32(216, 228, 242, static_cast<int>(a * 255.0f)));
-			}
-		}
-	};
-
-	// A cold low haze (the air's own density, under the banks), then the shafts behind the fog.
-	{
-		const float top = y0 + 0.42f * h;
-		dl->AddImage(g_haze->GetTexRef(), {x0, top}, {x0 + w, bottom}, {0.5f, 0.0f}, {0.5f, 1.0f}, with_a(IM_COL32(158, 168, 182, 0), 0.20f * fade));
-	}
-	shafts(1.0f);
-
-	struct Layer {
-		float center, thick, speed, alpha, tile, depth;
-		ImU32 rgb;
-	};
-	static const Layer layers[] = {
-	    {0.50f, 0.28f, 0.0030f, 0.19f, 2.62f, 0.05f, IM_COL32(118, 132, 152, 0)},
-	    {0.58f, 0.30f, 0.0050f, 0.25f, 2.23f, 0.18f, IM_COL32(130, 142, 160, 0)},
-	    {0.66f, 0.32f, 0.0075f, 0.31f, 1.91f, 0.32f, IM_COL32(144, 154, 170, 0)},
-	    {0.74f, 0.34f, 0.0105f, 0.37f, 1.63f, 0.48f, IM_COL32(158, 166, 180, 0)},
-	    {0.82f, 0.34f, 0.0145f, 0.43f, 1.39f, 0.64f, IM_COL32(172, 178, 190, 0)},
-	    {0.90f, 0.32f, 0.0200f, 0.49f, 1.21f, 0.82f, IM_COL32(186, 192, 200, 0)},
-	    {0.99f, 0.30f, 0.0270f, 0.55f, 1.03f, 1.00f, IM_COL32(198, 204, 212, 0)},
-	};
-	// One tiled band of a texture: starting at u0 (0..1, scrolling) so no two passes line up, mirrored on request.
-	auto band = [&](ImTextureData* tex, float top, float bh, float tile_w, float u_scroll, bool mirror, ImU32 col) {
-		float off = -std::fmod(u_scroll, 1.0f) * tile_w;
-		if (off > 0) off -= tile_w;
-		for (float x = x0 + off - tile_w; x < width; x += tile_w)
-			dl->AddImage(tex->GetTexRef(), {x, top}, {x + tile_w, top + bh}, {mirror ? 1.0f : 0.0f, 0}, {mirror ? 0.0f : 1.0f, 1}, col);
-	};
-	for (size_t i = 0; i < std::size(layers); i++) {
-		const auto& L      = layers[i];
-		const float fi     = static_cast<float>(i);
-		const float band_h = L.thick * h;
-		const float px     = cam_x * (0.3f + L.depth * 1.7f), py = cam_y * (0.3f + L.depth * 1.7f);
-		const float top    = y0 + L.center * h - band_h * 0.5f + py;
-		if (top >= bottom) continue;
-		const float tile_w = w * L.tile;
-		const float breath = 0.78f + 0.14f * std::sin(t * 0.19f + fi * 1.7f) + 0.08f * std::sin(t * 0.071f + fi * 2.9f);
-		const float dir    = (i % 2 == 0) ? 1.0f : -0.7f;
-		const float sway   = (std::sin(t * 0.11f + fi) * 0.010f + std::sin(t * 0.037f + fi * 2.1f) * 0.006f) * h;
-		const float a      = L.alpha * breath * fade;
-		const float scroll = (t * L.speed * 0.6f * w * dir - px) / tile_w; // (step5: slower)
-		band(g_fog, top + sway, band_h, tile_w, scroll + fi * 0.37f, false, with_a(L.rgb, a * 0.62f));
-		// The crossing pass: the other way, slower, mirrored, at another scale (the banks change shape, no repeat).
-		band(g_fog, top - sway + band_h * 0.10f, band_h * 0.92f, tile_w * 1.37f,
-		     (t * L.speed * 0.3f * w * -dir - px) / (tile_w * 1.37f) + 0.21f + fi * 0.13f, true, with_a(L.rgb, a * 0.46f));
-		if (i >= 2) {
-			const float wh = band_h * 0.6f;
-			band(g_wisp, top + band_h * 0.25f - sway * 0.5f, wh, tile_w * 0.83f, (t * L.speed * 0.85f * w * dir - px) / (tile_w * 0.83f) + fi * 0.29f,
-			     (i % 2) != 0, with_a(IM_COL32(210, 216, 224, 0), a * 0.42f));
-		}
-	}
-	// Light scattered in the fog: the shafts again, fainter, over it.
-	shafts(0.55f);
-
-	// Dust in suspension: ~1 per 2.6 lines (420 at most), pale grey-white gaussian sprites; near ones (depth) bigger,
-	// softer and fainter (depth of field) with a faint glow; brighter with a shimmer inside a shaft.
-	const float  logo_r = x0 + 0.31f * w, logo_b = y0 + 0.32f * h;
-	const size_t motes  = static_cast<size_t>(std::clamp(height / 2.6f, 160.0f, 420.0f));
-	if (g_motes.size() != motes) {
-		g_motes.resize(motes);
-		for (auto& m: g_motes) SpawnMote(m);
-	}
-	const float kick = std::sqrt(std::max(dt, 1e-4f)) * 0.0035f;
-	const float damp = std::exp(-dt * 0.6f);
-	for (auto& m: g_motes) {
-		const float sp = 0.6f + m.depth * 1.6f; // (near ones cross the view faster: parallax)
-		m.vx           = m.vx * damp + (Rand() - 0.5f) * kick;
-		m.vy           = m.vy * damp + (Rand() - 0.5f) * kick - 0.00004f * dt;
-		m.x += m.vx * sp * dt;
-		m.y += m.vy * sp * dt;
-		if (m.x > 1.01f) m.x -= 1.02f;
-		if (m.x < -0.01f) m.x += 1.02f;
-		if (m.y < 0.14f || m.y > 1.02f) {
-			SpawnMote(m);
-			continue;
-		}
-		const float sx = x0 + m.x * w + cam_x * (0.4f + m.depth * 2.0f), sy = y0 + m.y * h + cam_y * (0.4f + m.depth * 2.0f);
-		if (sy > bottom || (sx < logo_r && sy < logo_b)) continue;
-		const float lit     = ShaftLight(m.x, m.y, t, aspect);
-		const float shimmer = lit * (0.5f + 0.5f * std::sin(t * 3.1f + m.phase * 7.0f)) * (0.5f + 0.5f * std::sin(t * 1.7f + m.phase * 3.0f));
-		const float tw      = 0.80f + 0.20f * std::sin(t * 0.9f + m.phase * 5.0f);
-		const float blur    = 1.0f - 0.6f * m.depth;
-		const float a       = std::clamp(m.bright * tw * blur * fade * (0.55f + 0.45f * lit + 0.5f * shimmer), 0.0f, 1.0f);
-		const float core    = std::max(0.8f, m.size * h) * (1.8f + 2.4f * m.depth); // (sub-pixel: float corners, bilinear)
-		const int   g       = 220 + static_cast<int>(m.depth * 16.0f + lit * 14.0f);
-		const ImU32 rgb     = IM_COL32(std::min(255, g), std::min(255, g + 4), std::min(255, g + 12), 0);
-		if (m.depth > 0.25f || lit > 0.3f) {
-			const float gr = core * 3.2f; // (the faint glow)
-			dl->AddImage(g_glow->GetTexRef(), {sx - gr, sy - gr}, {sx + gr, sy + gr}, {0, 0}, {1, 1}, with_a(rgb, a * 0.14f));
-		}
-		dl->AddImage(g_glow->GetTexRef(), {sx - core, sy - core}, {sx + core, sy + core}, {0, 0}, {1, 1}, with_a(rgb, a * 0.85f));
-	}
-	dl->PopClipRect();
-}
-
-} // namespace Ambience
+// (step5) The launcher's fog and dust layer was removed: the static illustration only (as before the fog work).
 
 void DrawLauncher(float width, float height) {
 	DrainInputs();
 	EnsureBackground();
 	// (ds-pc-port9) Bigger text: 1.125 x the launcher's pixels at 1080 lines; the column (440 of those) on the right, its
 	// width at most 34 % of the window: the art (the knight and the logo) is never covered.
-	g_unit = std::clamp(height / 1080.0f, 0.55f, 3.0f) * 1.125f;
+	g_unit = std::clamp(height / 1080.0f, 0.55f, 3.0f) * 1.2f; // (step5: larger text, was 1.125)
 	if (U(452) > width * 0.28f) g_unit = std::max(0.45f, width * 0.28f / 452.0f);
 	const float col_w = U(440);
 	const float px    = width - col_w - U(12);
@@ -4011,7 +3708,6 @@ void DrawLauncher(float width, float height) {
 		const float w = g_bg_w * scale, h = g_bg_h * scale;
 		const float y0 = h >= height ? 0.0f : (height - h) * 0.5f;
 		bg->AddImage(g_background->GetTexRef(), {0, y0}, {w, y0 + h});
-		Ambience::Draw(bg, 0, y0, w, h, width, height);
 		if (h < height) {
 			bg->AddRectFilledMultiColor({0, y0}, {width, y0 + U(60)}, IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0));
 			bg->AddRectFilledMultiColor({0, y0 + h - U(60)}, {width, y0 + h}, IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255));
@@ -6234,7 +5930,6 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	}
 	FreeTexture(g_knight);
 	g_knight_tried = false;
-	Ambience::Free();
 	g_font_body = g_font_semi = g_font_serif = nullptr;
 	ImGui::DestroyContext(context);
 	ImGui::SetCurrentContext(previous);
