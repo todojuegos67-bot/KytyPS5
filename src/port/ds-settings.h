@@ -188,7 +188,7 @@ struct Settings {
 	std::string kbm_map;             // KYTY_KBM_MAP
 	std::string pad_map;             // KYTY_PAD_MAP
 	std::string game_settings;       // (ds-pc-port37) ajustes_juego: "gs_sun=3;gs_spot=1;..." (the launcher's "Ajustes del juego"; 0 / absent = the game's own)
-	int         kbm_camera = 10;     // (10-28) cp11_Setting_CameraSpeed with keyboard and mouse (5-15; the launcher's kbmcam2)
+	int         kbm_camera = 0;  // (step5: 0 = the game's own option; was 10)     // (10-28) cp11_Setting_CameraSpeed with keyboard and mouse (5-15; the launcher's kbmcam2)
 	bool        kbm_warp = false;    // (10-28) Camara instantanea (frame warp): KYTY_KBM_WARP
 	bool        kbm_calibrate = false; // (10-28) the next start measures the camera into kbm_curve.txt (KYTY_KBM_CALIBRATE), once
 	// [Configurador] (10-28)
