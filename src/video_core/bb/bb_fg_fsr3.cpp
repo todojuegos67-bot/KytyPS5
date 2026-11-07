@@ -699,8 +699,32 @@ int Generated() {
     return g_mfg.on ? g_mfg.current - 1 : 1;
 }
 
+// 1.51 (bb-fgmv-151): present watchdog. r149_0459: presents stopped completing ("source=none
+// [no present completed]") while the game kept rendering: the present thread blocked in the FG
+// swapchain (its acquire waited forever, UINT64_MAX). The acquire now waits at most
+// BB_FG_WATCHDOG_MS (default 500, 0 = forever); on a timeout FSR 3 frame generation is turned
+// off for the session and the swapchain is made again as a plain one (out of date -> recreate).
+uint64_t WatchdogNs() {
+    static const uint64_t ns = [] {
+        const char* e = std::getenv("BB_FG_WATCHDOG_MS");
+        const long ms = e && *e ? std::strtol(e, nullptr, 10) : 500;
+        return ms <= 0 ? UINT64_MAX : static_cast<uint64_t>(ms) * 1'000'000ull;
+    }();
+    return ns;
+}
+std::atomic<bool> g_watchdog_off{false};
+std::atomic<uint32_t> g_watchdog_trips{0};
+
+void WatchdogTrip(const char* where, VkResult result) {
+    const uint32_t n = g_watchdog_trips.fetch_add(1) + 1;
+    g_watchdog_off.store(true);
+    Printf("[fg-watchdog] 1.51 FSR 3 FG swapchain stalled: %s gave %d after %.0f ms (trip %u): "
+           "frame generation OFF for this session, the swapchain is made again without it",
+           where, static_cast<int>(result), WatchdogNs() / 1e6, n);
+}
+
 bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* out) {
-    if (!Requested() || g_device == VK_NULL_HANDLE) return false;
+    if (!Requested() || g_device == VK_NULL_HANDLE || g_watchdog_off.load()) return false;
     std::lock_guard lock(g_mutex);
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     ffxCreateContextDescFrameGenerationSwapChainVK create{};
@@ -804,9 +828,15 @@ vk::Result GetSwapchainImages(vk::SwapchainKHR swapchain, uint32_t* count, vk::I
 
 vk::Result AcquireNextImage(vk::SwapchainKHR swapchain, vk::Semaphore semaphore, uint32_t* index) {
     if (g_functions.pOutAcquireNextImageKHR == nullptr) return vk::Result::eErrorOutOfDateKHR;
-    return static_cast<vk::Result>(g_functions.pOutAcquireNextImageKHR(
-        g_device, static_cast<VkSwapchainKHR>(swapchain), UINT64_MAX,
-        static_cast<VkSemaphore>(semaphore), VK_NULL_HANDLE, index));
+    if (g_watchdog_off.load()) return vk::Result::eErrorOutOfDateKHR;
+    const VkResult r = g_functions.pOutAcquireNextImageKHR(
+        g_device, static_cast<VkSwapchainKHR>(swapchain), WatchdogNs(),
+        static_cast<VkSemaphore>(semaphore), VK_NULL_HANDLE, index);
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) {
+        WatchdogTrip("vkAcquireNextImageKHR", r);
+        return vk::Result::eErrorOutOfDateKHR;
+    }
+    return static_cast<vk::Result>(r);
 }
 
 vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
@@ -957,7 +987,8 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     RegisterUiLayerLocked(); // 1.51: every present, generating or not
     const auto now = std::chrono::steady_clock::now();
     // bb-dcideas-094: never for movies or 2D flips (menus, loading screens).
-    bool usable = inputs != nullptr && inputs->valid && !g_fg_failed && !FgBlocked(nullptr);
+    bool usable = inputs != nullptr && inputs->valid && !g_fg_failed && !FgBlocked(nullptr) &&
+                  !g_watchdog_off.load();
     static int first_steps = 0; // 0.41: the first 3D frames' steps, logged (a crash shows the last)
     if (usable) {
         if (const char* why = InputsProblem(*inputs, backbuffer)) {
@@ -1229,7 +1260,14 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     auto& slot = g_slots[g_slot];
     g_slot = (g_slot + 1) % static_cast<uint32_t>(g_slots.size());
     if (slot.pending) {
-        wait_fences(g_device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
+        if (const VkResult w = wait_fences(g_device, 1, &slot.fence, VK_TRUE, WatchdogNs());
+            w != VK_SUCCESS) {
+            // 1.51: the prepare of a few frames ago never finished: do not block the present
+            // thread; frame generation off for the session (see WatchdogTrip).
+            WatchdogTrip("the prepare fence wait", w);
+            g_generating = false;
+            return;
+        }
         reset_fences(g_device, 1, &slot.fence);
         slot.pending = false;
     }
