@@ -11,6 +11,7 @@
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
 #include "core/bb_kbmcam.h"
+#include "core/bb_hitscan.h"
 #include "core/bb_respatch.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
@@ -298,6 +299,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             // After the XML patches: the startup Resolution Patch overrides a user's own one.
             BB::ResPatch::OnEbootLoaded(base_virtual_addr, base_size);
             BB::KbmCam::OnEbootLoaded(base_virtual_addr, base_size);
+            BB::HitScan::SetEboot(base_virtual_addr, base_size);
         }
     }
 

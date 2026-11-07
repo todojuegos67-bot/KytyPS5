@@ -845,6 +845,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/memory_patcher.h
            src/common/memory_patcher.cpp
            src/core/bb_kbmcam.cpp
+           src/core/bb_hitscan.cpp
+           src/core/bb_hitscan.h
            src/core/bb_kbmcam.h
            src/core/bb_respatch.h
            src/core/bb_respatch.cpp

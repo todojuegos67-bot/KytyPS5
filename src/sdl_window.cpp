@@ -29,6 +29,7 @@
 #include "input/input_mouse.h"
 #include "sdl_window.h"
 #include "imgui/bb_menu.h"
+#include "core/bb_hitscan.h"
 #include "video_core/bb/bb_metrics.h"
 #include "video_core/renderdoc.h"
 
@@ -246,6 +247,19 @@ void WindowSDL::WaitEvent() {
     // the game gets no input.
     if (BbMenu::OnSdlEvent(event)) {
         return;
+    }
+
+    // (bb-hitscan-150) Ctrl+F8 / Scroll Lock: arm the read-only hit scan; Ctrl+F9 / Pause: stop.
+    if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
+        const bool ctrl = (event.key.mod & SDL_KMOD_CTRL) != 0;
+        const bool arm = event.key.key == SDLK_SCROLLLOCK || (ctrl && event.key.key == SDLK_F8);
+        const bool stop = event.key.key == SDLK_PAUSE || (ctrl && event.key.key == SDLK_F9);
+        if (arm || stop) {
+            if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+                arm ? BB::HitScan::Arm() : BB::HitScan::Stop();
+            }
+            return;
+        }
     }
 
     // (bb-metrics-043) F8: the metrics panel, as the Demon's Souls port's (shadPS4's "reload
