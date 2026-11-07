@@ -9,6 +9,7 @@
 #include "local-platform.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -169,8 +170,23 @@ void MasterSemaphore::Wait(uint64_t tick) {
 				dump(now);
 			}
 			DeviceFault::Report();
+			// (Not recoverable: every later submit and wait fails. Said plainly, before the exit, so the frame-generation
+			// swapchain's "all 32 command lists in flight" waits after it read as what they are: its fences never signal.)
+			std::printf("GPU device lost while waiting for %s tick %llu (see the device fault above): exiting\n",
+			            LaneOf(tick) == 0 ? "graphics" : "compute", static_cast<unsigned long long>(tick));
+			std::fflush(stdout);
+			EXIT("GPU device lost (VK_ERROR_DEVICE_LOST) in waitSemaphores\n");
 		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eTimeout);
+		if (result != vk::Result::eTimeout) {
+			// (Another error - out of memory and the like: logged and waited again a few times before giving up.)
+			static std::atomic<uint32_t> errors {0};
+			const auto                   count = errors.fetch_add(1) + 1;
+			std::printf("waitSemaphores: tick %llu returned %s (%d), attempt %u\n", static_cast<unsigned long long>(tick),
+			            vk::to_string(result).c_str(), static_cast<int>(result), count);
+			std::fflush(stdout);
+			EXIT_NOT_IMPLEMENTED(count > 8);
+			continue;
+		}
 		uint64_t now = 0;
 		(void)m_graphics.device.getSemaphoreCounterValue(semaphore, &now);
 		std::printf("STALL %s timeline: tick %llu not reached after %llu s, at %llu\n", LaneOf(tick) == 0 ? "graphics" : "compute",
