@@ -39,6 +39,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <zstd.h>
 #include <string>
 #include <unordered_map>
@@ -718,7 +719,8 @@ static double MicrosecondsSince(std::chrono::steady_clock::time_point start) {
 
 // A pipeline the driver refused: the log names its result and the programs. True in a precompile, which leaves it out and
 // goes on (the caller destroys a null one): issue #305, one pipeline an RX Vega 56's driver refused ended its shard, and
-// the precompile never finished. The game cannot draw without it and exits.
+// the precompile never finished. The game goes on with a graphics pipeline that draws nothing (DrawNothingPipeline); it
+// exits at a compute one.
 static std::atomic<size_t> g_pipelines_refused {0};
 static bool PipelineRefused(const GraphicContext& graphics, vk::Result result, const char* kind, uint64_t hash,
                             uint64_t pixel_hash) {
@@ -735,6 +737,42 @@ static bool PipelineRefused(const GraphicContext& graphics, vk::Result result, c
 
 size_t PipelinesRefused() {
 	return g_pipelines_refused.load(std::memory_order_relaxed);
+}
+
+// A graphics pipeline the driver refused to the game: the same pipeline with a pixel shader that kills every pixel in place
+// of its own, so that its draws write no colour, depth or stencil and all the rest of the game runs (with the primitives
+// discarded instead, a pipeline counts as made for no attachments: VUID-vkCmdDraw-colorAttachmentCount-06179). An RX Vega 56
+// (AMD 26.5.2, ErrorUnknown) stopped at the third pixel shader of the game while its precompile made nearly all of 73,571
+// pipelines (issue #305). AMD's 2023 compiler makes that pipeline for its GPU, the SPIR-V is valid: the driver's reason is
+// not known.
+static vk::Result DrawNothingPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, vk::GraphicsPipelineCreateInfo info,
+                                      vk::PipelineShaderStageCreateInfo& fragment_stage) {
+	// (main: OpKill. No early fragment tests: they would write the depth before it.)
+	static const vk::ShaderModule kill = [&] {
+		static const uint32_t code[] = {
+		    0x07230203, 0x00010000, 0x00070000, 0x00000005, 0x00000000, 0x00020011, 0x00000001, 0x0003000e, 0x00000000,
+		    0x00000001, 0x0005000f, 0x00000004, 0x00000001, 0x6e69616d, 0x00000000, 0x00030010, 0x00000001, 0x00000007,
+		    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00050036, 0x00000002, 0x00000001, 0x00000000,
+		    0x00000003, 0x000200f8, 0x00000004, 0x000100fc, 0x00010038};
+		vk::ShaderModuleCreateInfo create {};
+		create.codeSize = sizeof(code);
+		create.pCode    = code;
+		vk::ShaderModule module;
+		EXIT_IF(graphics.device.createShaderModule(&create, nullptr, &module) != vk::Result::eSuccess);
+		return module;
+	}();
+	fragment_stage        = vk::PipelineShaderStageCreateInfo {};
+	fragment_stage.stage  = vk::ShaderStageFlagBits::eFragment;
+	fragment_stage.module = kill;
+	fragment_stage.pName  = "main";
+	InlineStages inlined;
+	inlined.Apply(info);
+	const auto result = graphics.device.createGraphicsPipelines(nullptr, 1, &info, nullptr, &pipeline.pipeline);
+	if (static bool reported = false; result == vk::Result::eSuccess && !std::exchange(reported, true)) {
+		std::printf("Pipeline refused by the driver: the game goes on without its draws\n");
+		std::fflush(stdout);
+	}
+	return result;
 }
 
 // The precompile's pipeline another of its shards holds: none is made (the caller destroys a null one).
@@ -1348,10 +1386,15 @@ void CreatePipelineInternal(
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
-	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
-	                     !PipelineRefused(graphics, result, "graphics", vs_input_info.stage.program->shader_hash,
-	                                      ps_active ? ps_input_info->stage.program->shader_hash : 0));
+	if (!ClaimedElsewhere(graphics, result) && (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
+	    !PipelineRefused(graphics, result, "graphics", vs_input_info.stage.program->shader_hash,
+	                     ps_active ? ps_input_info->stage.program->shader_hash : 0)) {
+		pipeline.pipeline = nullptr;
+		// (The fragment stage is the last, when there is one.)
+		if (!ps_active && empty_frag_stage_info.module == nullptr) pipeline_info.stageCount = ++shader_stage_count;
+		result = DrawNothingPipeline(graphics, pipeline, pipeline_info, shader_stages[shader_stage_count - 1]);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+	}
 	if (DeviceFault::BreadcrumbsOn()) {
 		DeviceFault::NotePipeline(pipeline.pipeline,
 		                          fmt::format("{} vs {:016x} ps {:016x}",
