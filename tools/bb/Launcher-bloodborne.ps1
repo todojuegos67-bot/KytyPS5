@@ -518,6 +518,7 @@ function Write-SharpLive { try { [IO.File]::WriteAllText($script:sharpFile, "BB_
 function Get-FgEnv {
 	$e = [ordered]@{}
 	$fg = Get-FgKey; $e['BB_FG'] = $fg
+	$e['BB_HUD_SHARP'] = '1'  # (1.55) HUD canvas: HUD drawn at the output resolution, never through the upscaler (BB_HUD_SHARP=0 = old present-time composite)
 	$e['BB_SCENE_UPSCALE'] = $(if (Get-SceneUp) { '1' } else { '0' })  # (0.93b) metodo DCport: escena y su postproceso a la interna (parche del juego), reescalado en la composicion antes del HUD  # (bb-native-071) el reescalador dentro de la cadena de render del juego  # (bb-fg-022) aqui: el arranque del emulador de reescalado solo pasa Get-FgEnv
 	$dl = ($fg -like 'dlss*')
 	$al = 0; [void][int]::TryParse("$($script:S.antilag)", [ref]$al); $rx = 0; [void][int]::TryParse("$($script:S.reflex)", [ref]$rx)
