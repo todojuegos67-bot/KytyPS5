@@ -1,5 +1,43 @@
 ## New in this build
 
+Your precompiled shaders stay valid: the shader translation is the same as in v20261106.
+
+- **A crash while a world loads fixed**: the game's physics sometimes stepped a job whose object was not there, and the
+  emulator closed with an error at `eboot+0x1ab6047`. We saw it at least five times since October 11, replaying a
+  player's route at 1-1 and in long runs of world changes. Such a job now leaves its step the way the game's own code
+  does when it has nothing to work on.
+- **8 GB graphics cards no longer slow down after many world changes, on PCs with more than 16 GB of RAM**: since
+  v20261027 the game has streamed its textures without the largest levels that cards under 12 GB leave out, on every
+  PC, to save about 1 GB of RAM. In long play with many loads this made the game's GPU buffers grow from about 2 GB to
+  3-3.4 GB, past an 8 GB card's budget. In our runs (six worlds, 48 loads an hour) Boletaria fell to 48 fps against 53,
+  and standing still to 49 against 60. With more than 16 GB of RAM the game now streams whole textures again, which
+  costs only RAM. PCs with 16 GB keep the saving, so there the frame rate can still drop by about 10% after 20 or more
+  world changes in one session; restarting the game brings it back. `-Set KYTY_TEXTURE_REDUCE_GAME=0` streams whole
+  textures on any PC, `=1` leaves those levels out on any PC.
+- **F11 with AMD FSR frame generation no longer freezes the picture in menus and loads** (#174, credit @ft1704): with
+  FidelityFX SDK 1.1.4's DLL (`amd_fidelityfx_vk.dll`), while no frames were being generated (menus, loads, the start),
+  AMD's swapchain silently dropped a frame when the window had just changed (F11, a resize), and the next wait for it
+  never ended. The emulator now makes the swapchain again itself in that case. On our RTX 5090: 144 presses of F11 at
+  the title, 12 resizes, F11 in the world and during six loads, all fine. FSR SDK 2's DLLs were not affected.
+- **A graphics pipeline the driver refuses no longer ends the game** (#305, credit @FKF-GR): an RX Vega 56 with AMD
+  26.5.2 turned down about 6,500 of the game's pipelines (it built 73,571), made with 71 of its pixel shaders, and the
+  game stopped at the first one it needed. Now the draws that need a refused pipeline are left out and the game goes
+  on, and the log names the refused pipelines. What goes missing from the picture depends on the card: on our RTX
+  5090, with 30 such pixel shaders refused on purpose, 1-1 ran at 60 fps and looked right apart from slightly cooler
+  light. A refused compute pipeline still ends the game.
+- **Stereo with Audio output on Headphones** (#294, credit @robbely): the game hands its stereo mix to the system on two
+  separate channels, left and right, and the emulator played both in the centre, so the music sounded nearly mono. Each
+  now plays on its own side (how alike left and right are at the Nexus, 1 = mono: 0.86 -> 0.53). TV output is
+  unchanged.
+- **Linux launcher: keyboard and mouse prompts** (PR #311, credit @Bipboop-beep): the Windows launcher's option from
+  v20261105, now on Linux too: button prompts as keyboard keys and mouse buttons, and the keyboard controls editor, with
+  the same files and settings.
+- **Long runs**: about 17 hours of world changes (six worlds, 48 loads an hour) with 8, 10 and 32 GB of video memory,
+  DLSS and FSR frame generation found no memory leak and no hang. The crash and the 8 GB slowdown above came out of them.
+- **Thanks** to @Bipboop-beep for the pull request, and to @robbely, @ft1704 and @FKF-GR for their reports and tests.
+
+## New in v20261106
+
 Your precompiled shaders stay valid: the shader translation is the same as in v20261105.
 
 - **The game's own stereo sound** (#294, credit @robbely): music and ambience no longer sound nearly mono, and speech is
@@ -38,45 +76,38 @@ Your precompiled shaders stay valid: the shader translation is the same as in v2
 - **Thanks** to @CarpetHead and @ponhei9502 for their pull requests, and to @robbely, @ft1704, @FKF-GR and
   @blubberbozz-wq for their reports and tests.
 
-## New in v20261105
-
-Your precompiled shaders stay valid: the shader translation is the same as in v20261103.
-
-- **Faster on most PCs: a scout thread** (PR #280, credit @DevList1454 and @opcod3; fixes in PR #288 by @ponhei9502):
-  a helper thread reads the game's graphics commands ahead of the render thread and prepares the tables its draws read,
-  which the render thread checks and uses. At 1-1 on our RTX 5090: about 5% more frames (render thread 14.1 -> 13.3 ms a
-  frame); the Boletarian Palace's Inner Ward on an RX 9070 XT +7-9% (@DevList1454); Linux with an RX 7900 XTX +11%
-  (@opcod3). It takes about one more processor core, and on PCs without idle cores it stands down by itself. Off in the
-  Steam Deck build until it is measured there. `-Set KYTY_SCOUT=0` turns it off.
-- **Optimized again for the code as it runs now** (#283, credit @DevList1454): the profile-guided optimization of the
-  build was trained again, with the scout. Latria on our RTX 5090: 5% more frames (render thread 12.6 -> 12.0 ms a
-  frame), 1-1 the same; @DevList1454 measured +5-6% at the Inner Ward on a Ryzen 7 9700X.
-- **NVIDIA: no GPU drain between the game's stencil passes** (PR #281, credit @CarpetHead): pipelines without a pixel
-  shader get an empty one, so the GPU no longer drains between such draws; 0.57 ms less GPU time a frame at the stone
-  arch. `-Set KYTY_EMPTY_FS=0` turns it off.
-- **Fewer stutters on 8 GB graphics cards whose memory budget drops in play** (#276): below 12 GB, the texture
-  collector now follows the budget when the driver lowers it during play (an 8 GB Radeon RX 6650 XT went from 7378 to
-  about 5570 MiB in the world) instead of keeping the start-up figure.
-- **The launcher no longer says "Shaders not precompiled yet" after a precompile** (#290): with graphics drivers
-  without pipeline binaries the precompile keeps the shaders in a `.blobs` file, which the Windows launcher did not
-  count. The game used them all along.
-- **Keyboard and mouse prompts** (PR #277, credit @miroslavdanutalexandru-alt): the launcher's Game page can show the
-  game's button prompts as keyboard keys and mouse buttons (English), matching the default keyboard controls, and
-  "Keyboard controls" changes the keys and the mouse sensitivity. Off by default; it needs the extracted 1.07 game
-  folder (not a `.zar`) and keeps a backup of the game files it changes.
-- **For testers, off by default**: `-Set KYTY_WRITE_GUARD=1` (PR #282, credit @CarpetHead) lets the render thread's
-  writes to game memory go ahead of older uploads (+1-2% where the game reads back a lot). It changes page protections
-  often, the kind of churn behind the MEMORY_MANAGEMENT blue screens on PCs short of RAM, so use it only with plenty of
-  RAM (on Linux it stays off with `KYTY_UFFD_WP`, #289). `-Set KYTY_TEXTURE_HOST_MODE=pd` (PR #284, credit
-  @ponhei9502): on cards under 12 GB, textures past half the budget prefer video memory (it helps on Linux; NVIDIA's
-  Windows driver keeps them there already).
-- **FSR 4 needs a current AMD driver** (#271): with Adrenalin 26.9.2 an RX 9070 showed a black 3D picture with FSR 4
-  upscaling and black generated frames with FSR 4 frame generation; a driver update fixed both.
-- **For reports**: the log names the graphics driver and its version next to the GPU in use.
-- **Thanks** to @DevList1454, @opcod3, @CarpetHead, @ponhei9502 and @miroslavdanutalexandru-alt for their pull requests,
-  reviews and measurements, and to @STALKERSK, @yura1234 and @robbely for their reports and tests.
-
 ## 本版本的变化
+
+已有的预编译着色器继续有效：着色器的翻译与 v20261106 相同。
+
+- **修复加载世界时的崩溃**：游戏的物理系统有时会处理一个对象并不存在的任务，模拟器随即报错退出（`eboot+0x1ab6047`）。
+  从 10 月 11 日起我们至少遇到过 5 次，包括重放玩家在 1-1 的路线和长时间连续换图。现在这种任务会按游戏自己代码里
+  “无事可做”时的方式结束这一步。
+- **8 GB 显卡多次换图后不再变慢（内存大于 16 GB 的电脑）**：从 v20261027 起，为了省大约 1 GB 内存，游戏在所有电脑上都
+  不再流送 12 GB 以下显卡会丢掉的最大纹理层级。长时间、多次加载后，这会让游戏的 GPU 缓冲从约 2 GB 涨到 3-3.4 GB，
+  超出 8 GB 显卡的预算。我们的测试（6 个世界轮换，每小时 48 次加载）中，Boletaria 从 53 fps 掉到 48，站着不动从 60 掉到
+  49。内存大于 16 GB 时，游戏现在重新完整流送纹理，代价只是多占内存。16 GB 内存的电脑保留这项节省，所以一次游戏中换图
+  20 次以上后，帧率仍可能下降约 10%，重启游戏即可恢复。`-Set KYTY_TEXTURE_REDUCE_GAME=0` 在任何电脑上都完整流送，
+  `=1` 在任何电脑上都不流送这些层级。
+- **AMD FSR 插帧时，在菜单和加载中按 F11 不再卡住画面**（#174，感谢 @ft1704）：使用 FidelityFX SDK 1.1.4 的 DLL
+  （`amd_fidelityfx_vk.dll`）时，在不插帧的阶段（菜单、加载、刚启动），如果窗口刚刚改变（F11、调整大小），AMD 的交换链
+  会悄悄丢掉一帧，之后等待这一帧的操作永远等不到，画面就卡住了。现在遇到这种情况，模拟器会自己重建交换链。我们的
+  RTX 5090 上：标题画面按 F11 144 次、调整窗口大小 12 次，在世界里和 6 次加载中按 F11，全部正常。FSR SDK 2 的 DLL 没有
+  这个问题。
+- **驱动拒绝某条图形管线时游戏不再停止**（#305，感谢 @FKF-GR）：一块 RX Vega 56（AMD 26.5.2）拒绝了游戏约 6,500 条管线
+  （建成 73,571 条），涉及 71 个像素着色器，游戏会停在第一条要用到的被拒管线上。现在需要被拒管线的绘制会被跳过，游戏继续
+  运行，日志会写出被拒的管线。画面会少掉什么取决于显卡：在我们的 RTX 5090 上故意拒绝 30 个这类像素着色器，1-1 仍是
+  60 fps，画面除了光线略偏冷以外都正常。计算管线被拒时游戏仍会停止。
+- **音频输出选“耳机”时恢复立体声**（#294，感谢 @robbely）：游戏会把立体声混音分成左右两个通道交给系统，模拟器之前把
+  两个通道都放在正中，音乐听起来几乎是单声道。现在左右各自在自己那一侧播放（Nexus 处左右声道的相似度，1 = 单声道：
+  0.86 -> 0.53）。电视输出不变。
+- **Linux 启动器：键盘和鼠标按键提示**（PR #311，感谢 @Bipboop-beep）：v20261105 加入 Windows 启动器的选项，现在 Linux
+  上也有了：按键提示可以显示为键盘按键和鼠标按钮，还有键盘操作设置，使用相同的文件和设置。
+- **长时间测试**：在 8、10 和 32 GB 显存、DLSS 和 FSR 插帧等设置下，共约 17 小时连续换图（6 个世界，每小时 48 次加载），
+  没有发现内存泄漏或卡死。上面的崩溃和 8 GB 变慢就是这些测试发现的。
+- **感谢** @Bipboop-beep 的 PR，以及 @robbely、@ft1704 和 @FKF-GR 的反馈与测试。
+
+## v20261106 的变化
 
 已有的预编译着色器继续有效：着色器的翻译与 v20261105 相同。
 
@@ -106,35 +137,3 @@ Your precompiled shaders stay valid: the shader translation is the same as in v2
   `KYTY_LANE_LOCAL_WIDE`（PR #304）。它们在我们的电脑上对帧率没有影响，或者有升有降。
 - **Linux 包的 README**：AMD FSR SDK 的 DLL 是 Windows 文件，Linux 上没有 FSR 4（#307）。
 - **感谢** @CarpetHead 和 @ponhei9502 的 PR，以及 @robbely、@ft1704、@FKF-GR 和 @blubberbozz-wq 的反馈与测试。
-
-## v20261105 的变化
-
-已有的预编译着色器继续有效：着色器的翻译与 v20261103 相同。
-
-- **大多数电脑上更快：scout 线程**（PR #280，感谢 @DevList1454 和 @opcod3；PR #288 的修复来自 @ponhei9502）：一个辅助线程
-  先于渲染线程读取游戏的图形命令，提前准备好绘制要读取的表，渲染线程检查后直接使用。我们的 RTX 5090 在 1-1 约多 5% 帧数
-  （渲染线程每帧 14.1 -> 13.3 ms）；RX 9070 XT 在波雷塔利亚王城内城快 7-9%（@DevList1454）；Linux 加 RX 7900 XTX 快 11%
-  （@opcod3）。它大约多占一个处理器核心，没有空闲核心的电脑上会自动停下。Steam Deck 版在测量之前默认关闭。
-  `-Set KYTY_SCOUT=0` 关闭。
-- **按现在的代码重新做了编译优化**（#283，感谢 @DevList1454）：程序的 profile 引导优化（PGO）带着 scout 重新训练。我们的
-  RTX 5090 在 Latria 快 5%（渲染线程每帧 12.6 -> 12.0 ms），1-1 持平；@DevList1454 在 Ryzen 7 9700X 上测得王城内城
-  快 5-6%。
-- **NVIDIA：游戏的模板阴影绘制之间不再让 GPU 排空**（PR #281，感谢 @CarpetHead）：没有像素着色器的管线加上一个空的像素
-  着色器，GPU 不再在这类绘制之间排空；石拱处每帧少 0.57 ms 的 GPU 时间。`-Set KYTY_EMPTY_FS=0` 关闭。
-- **游戏中显存预算下降的 8 GB 显卡卡顿更少**（#276）：显存低于 12 GB 时，驱动在游戏中调低预算后，贴图回收会跟着调整
-  （一张 8 GB 的 Radeon RX 6650 XT 进入世界后从 7378 降到约 5570 MiB），而不是一直按启动时的数值。
-- **预编译完成后，启动器不再提示「着色器尚未预编译」**（#290）：驱动不支持 pipeline binary 时，预编译把着色器存成
-  `.blobs` 文件，Windows 启动器之前没有把它算进去。游戏本身一直在使用它们。
-- **「键盘和鼠标按键提示」**（PR #277，感谢 @miroslavdanutalexandru-alt）：启动器的「游戏」页可以把游戏里的手柄按键提示
-  换成键盘按键和鼠标按钮的图标（英文），与默认键位一致；「键盘控制」可以修改键位和鼠标灵敏度。默认关闭；需要解压后的
-  1.07 游戏文件夹（不支持 `.zar`），并会备份它修改的游戏文件。
-- **供测试用，默认关闭**：`-Set KYTY_WRITE_GUARD=1`（PR #282，感谢 @CarpetHead）让渲染线程写入游戏内存时不必等待之前的
-  上传（游戏大量读回数据的地方快 1-2%）。它会频繁更改页面保护，正是内存不足的电脑上 MEMORY_MANAGEMENT 蓝屏背后的那类操作，
-  所以只在内存充足时使用（Linux 上与 `KYTY_UFFD_WP` 同时开启时会自动关闭，#289）。`-Set KYTY_TEXTURE_HOST_MODE=pd`
-  （PR #284，感谢 @ponhei9502）：显存低于 12 GB 时，超过一半预算后的贴图优先放在显存（对 Linux 有帮助；NVIDIA 的 Windows
-  驱动本来就把它们放在显存）。
-- **FSR 4 需要较新的 AMD 驱动**（#271）：使用 Adrenalin 26.9.2 时，RX 9070 开 FSR 4 超分画面是黑的，开 FSR 4 插帧时生成的帧
-  是黑的；更新驱动后两者都正常了。
-- **便于反馈问题**：日志会在所用显卡旁写出显卡驱动及其版本。
-- **感谢** @DevList1454、@opcod3、@CarpetHead、@ponhei9502 和 @miroslavdanutalexandru-alt 的 PR、审阅与测量，以及
-  @STALKERSK、@yura1234 和 @robbely 的反馈与测试。
