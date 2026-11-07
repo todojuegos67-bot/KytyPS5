@@ -1487,8 +1487,15 @@ bool ScaleImage(VAddr addr, u32& w, u32& h) {
             h = g_ss_sh;
             return true;
         }
-        // Every scene-size image bound or sampled in the scene passes is a scene target.
-        if (idx < 0 && phase == 1) {
+        // 1.46: no longer every scene-size image SAMPLED in the scene passes (1.44/1.45). Images
+        // the game writes outside render-target / storage binds (buffer-aliased compute writes,
+        // DMA, HLE copies: the linear depth 0x270db8000 "stale by address x300", ~8 twin copies
+        // a frame) got an internal-size version that never received their content: stale /
+        // black samples in the scene (missing textures, ghostly fog-lit objects, tile seams)
+        // and stale output-size reads in post. Only render targets of the scene passes become
+        // scene targets now (AddSceneTarget); sampled-only images keep their one guest-size
+        // image, read by UV.
+        if (idx < 0 && phase == 1 && std::getenv("BB_PREPOST_SAMPLED_SCENE") != nullptr) {
             idx = PpAddScene(addr);
         }
         if (idx >= 0) {
