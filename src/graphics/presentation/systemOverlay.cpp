@@ -1161,7 +1161,7 @@ struct SystemOverlay::Impl {
 		const float slide = 0.35f, fade = 0.6f;
 		const float in    = std::clamp(t / slide, 0.0f, 1.0f);
 		const float ease  = 1.0f - (1.0f - in) * (1.0f - in) * (1.0f - in);
-		const float alpha = std::clamp((Libs::Trophy::TOAST_SECONDS - t) / fade, 0.0f, 1.0f) * std::min(1.0f, in * 2.0f);
+		const float alpha = std::clamp((toast.seconds - t) / fade, 0.0f, 1.0f) * std::min(1.0f, in * 2.0f);
 		if (alpha <= 0.0f) return {};
 		auto*       draw = ImGui::GetForegroundDrawList();
 		// (The names in Japanese, Chinese, Korean, Cyrillic...: the CJK face; Latin text: the panels' face.)

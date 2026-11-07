@@ -31,6 +31,7 @@ struct Toast {
 	std::string           detail; // (10-28) the description, in the game's language
 	int                   icon_w = 0, icon_h = 0;
 	std::vector<uint32_t> icon; // RGBA8 (IM_COL32 order), icon_w * icon_h; empty: none
+	float                 seconds = 6.0f; // (1109) how long it shows (TOAST_SECONDS; the save sync's are shorter)
 };
 
 // sceNpTrophy2UnlockTrophy: false when the trophy was already unlocked (no popup). platinum_id: the platinum's id when
