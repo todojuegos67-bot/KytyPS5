@@ -173,8 +173,7 @@ std::string RumbleProbe() {
     if (!g_rumble_base || g_rumble_size < 0x5600000) return {};
     static const bool is_bb = [] {
         const auto sv = Common::ElfInfo::Instance().GameSerial();
-        return sv.find("CUSA03173") != std::string_view::npos ||
-               sv.find("CUSA00900") != std::string_view::npos;
+        return sv.find("CUSA03173") != std::string_view::npos;  // 1.09 offsets only
     }();
     if (!is_bb) return {};
     const auto rd = [](uintptr_t a) { u64 v; std::memcpy(&v, reinterpret_cast<void*>(a), 8); return v; };
