@@ -22,6 +22,12 @@
 // the first on a null object at Latria (eboot+0xc5845a 10-16, from eboot+0x421827): the world's record of an entity,
 // looked up just before (eboot+0x1475a20), was missing, as the visits skipped null children. A null object has no
 // listeners: nothing is dispatched.
+// A physics job's step (Havok; 01.007.000 eboot+0x1ab5fe0, a virtual method of the job: its vtable eboot+0x269d2f0) reads
+// the object it steps from the job (+ 0x38), then that object's state. Job workers read a null one (eboot+0x1ab6047
+// reading 0x18) at least five times since 10-11: replaying the user's route at 1-1, in world tours and in long runs of
+// world changes (11-08 loading the Shrine of Storms), the rest of the job whole (its vtables and other fields). The step
+// has its own way out when what it builds there fails: an assert (int 0x41), its timer ended and back. A job with no
+// object takes that way here, without the assert: nothing to step.
 #include "loader/demonsSoulsSceneGuard.h"
 
 #include "common/guardedCopy.h"
@@ -125,6 +131,18 @@ constexpr const char* IdLoop = "49 8b 37 4c 89 f7 e8 ?? ?? ?? ?? 49 83 c7 08 4d 
 // nothing to remove: the next index.
 constexpr const char* CharacterLoop = "49 ff c6 4d 39 f5 74 ?? 48 8b 4d d0 42 0f b7 04 73 48 8b 3d ?? ?? ?? ?? 48 8b 49 18 "
                                       "4c 8b 24 c1 41 8b 74 24 08 e8 ?? ?? ?? ?? 84 c0 75 d2";
+// The physics job step's load of its object, as both builds have it (01.007.000 eboot+0x1ab602b): the end of its timer's
+// start (mov rdi, [rbx]; mov r13d, eax; test rdi, rdi; je; lea rsi, [rip + d]; call), then mov rcx, [r12 + 0x38]; mov rdx,
+// [rcx + 0x18] (the two the jump to the stub replaces) and the reads after them. Within the next 0x100 bytes the test of
+// what it builds (mov [r12 + 0x40], rax; test rax, rax; je rel32) leads to its way out: int 0x41, then the timer's end
+// (mov rax, fs:[0], which the loader made a 9-byte call; lea rax, [rax - 0x38]; mov rdi, [rax]; test rdi, rdi; jne; jmp)
+// and its epilogue.
+constexpr const char* JobStep = "48 8b 3b 41 89 c5 48 85 ff 74 0c 48 8d 35 ?? ?? ?? ?? e8 ?? ?? ?? ?? 49 8b 4c 24 38 48 8b 51 18 "
+                                "48 63 81 34 01 00 00 48 89 55 80 48 8b 52 60 4c 8b 34 c2";
+constexpr uint64_t    JobStepLoad  = 23;
+constexpr uint32_t    JobStepMoved = 9;
+constexpr const char* JobStepTest  = "49 89 44 24 40 48 85 c0 0f 84 ?? ?? ?? ??";
+constexpr const char* JobStepExit  = "cd 41 ?? ?? ?? ?? ?? ?? ?? ?? ?? 48 8d 80 c8 ff ff ff 48 8b 38 48 85 ff 0f 85 ?? ?? ?? ?? e9";
 struct ChildLoop {
 	uint64_t increment = 0;  // the loop's add ITER, 8: a null child continues there
 	uint64_t load      = 0;  // mov REG, [ITER]
@@ -171,6 +189,7 @@ std::vector<ChildLoop> FindChildLoops(const Program& program) {
 uint64_t              g_base = 0;
 std::atomic<uint32_t> g_skips {0};
 std::atomic<uint32_t> g_child_skips {0};
+std::atomic<uint32_t> g_job_skips {0};
 
 // What leaves the null children is not known. The first null seen starts one dump (SCENE-NULL lines): every thread's
 // frames then and 200 ms later (who is in the middle of what), and the null elements seen meanwhile read again 50 ms
@@ -283,6 +302,17 @@ void KYTY_SYSV_ABI SkippedChild(uint64_t offset, uint64_t element, uint64_t r14,
 	            static_cast<unsigned long long>(offset), static_cast<unsigned long long>(element),
 	            static_cast<unsigned long long>(r14), static_cast<unsigned long long>(r15));
 }
+
+void KYTY_SYSV_ABI SkippedJob(uint64_t offset, uint64_t job) {
+	if (g_job_skips.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+	uint64_t vtable = 0;
+	(void)Common::GuardedCopy(&vtable, reinterpret_cast<const void*>(job), sizeof(vtable));
+	std::printf("Demon's Souls scene guard: a physics job with no object left its step at eboot+0x%llx (job 0x%llx, vtable "
+	            "0x%llx)\n",
+	            static_cast<unsigned long long>(offset), static_cast<unsigned long long>(job),
+	            static_cast<unsigned long long>(vtable));
+	std::fflush(stdout);
+}
 } // namespace
 
 void Install(Program* program) {
@@ -314,7 +344,27 @@ void Install(Program* program) {
 	for (const auto at: GuestCode::Find(*program, GuestCode::Pattern(Dispatch), 4))
 		if (std::memcmp(reinterpret_cast<const void*>(at), Prologue.data(), Prologue.size()) == 0) dispatches.push_back(at);
 	if (dispatches.empty()) std::printf("Demon's Souls scene guard: no event dispatch of a known build found; retaining their guest code\n");
-	if (!traversals && loops.empty() && dispatches.empty()) return;
+	// The physics job step: its object's load and its way out.
+	uint64_t job_load = 0, job_exit = 0;
+	if (const auto at = GuestCode::FindUnique(*program, GuestCode::Pattern(JobStep))) {
+		const GuestCode::Pattern test(JobStepTest), way_out(JobStepExit);
+		const uint64_t           end = program->base_vaddr + program->mapped_size;
+		for (uint64_t i = 0; i < 0x100 && *at + i + test.Size() <= end; i++) {
+			const auto* code = reinterpret_cast<const uint8_t*>(*at + i);
+			if (!test.Matches(code)) continue;
+			int32_t displacement = 0;
+			std::memcpy(&displacement, code + 10, sizeof(displacement));
+			const uint64_t target = *at + i + test.Size() + static_cast<int64_t>(displacement);
+			if (target >= program->base_vaddr && target + way_out.Size() <= end &&
+			    way_out.Matches(reinterpret_cast<const uint8_t*>(target))) {
+				job_load = *at + JobStepLoad;
+				job_exit = target + 2; // (past the int 0x41)
+			}
+			break;
+		}
+	}
+	if (job_load == 0) std::printf("Demon's Souls scene guard: no physics job step of a known build found; retaining its guest code\n");
+	if (!traversals && loops.empty() && dispatches.empty() && job_load == 0) return;
 	const auto requested = program->base_vaddr + CaveOffset;
 	const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	    requested, PageSize, Common::VirtualMemory::Mode::ExecuteReadWrite, "demons_souls_scene_guard", true);
@@ -415,6 +465,25 @@ void Install(Program* program) {
 		c.lea(rsp, ptr[rsp + 128]);
 		c.jmp(reinterpret_cast<const void*>(loop.increment));
 	}
+	// The physics job step: its object's load, and a job with no object printed, then out through the step's own way out,
+	// which reads only its frame (rbp, and r15: the stack guard's address). (The step's rsp is 16-byte aligned there.)
+	const uint8_t* job_stub = nullptr;
+	if (job_load != 0) {
+		Xbyak::Label no_object;
+		c.align(16);
+		job_stub = c.getCurr();
+		c.mov(rcx, ptr[r12 + 0x38]);
+		c.test(rcx, rcx);
+		c.jz(no_object);
+		c.mov(rdx, ptr[rcx + 0x18]);
+		c.jmp(reinterpret_cast<const void*>(job_load + JobStepMoved));
+		c.L(no_object);
+		c.mov(rdi, job_load - program->base_vaddr);
+		c.mov(rsi, r12);
+		c.mov(rax, reinterpret_cast<uint64_t>(&SkippedJob));
+		c.call(rax);
+		c.jmp(reinterpret_cast<const void*>(job_exit));
+	}
 	c.ready();
 	if (Xbyak::GetError() || !Common::VirtualMemory::FlushInstructionCache(allocated, c.getSize()) ||
 	    !Libs::LibKernel::Memory::ProtectGuestMemory(allocated, PageSize, Common::VirtualMemory::Mode::ExecuteRead, nullptr)) {
@@ -437,6 +506,7 @@ void Install(Program* program) {
 		patch(loops[i].load, loop_stubs[i], loops[i].moved);
 	for (size_t i = 0; i < dispatches.size(); i++)
 		patch(dispatches[i], dispatch_stubs[i], 5);
+	if (job_load != 0) patch(job_load, job_stub, JobStepMoved);
 	if (traversals) {
 		std::string at;
 		for (const auto entry: entries) {
@@ -452,6 +522,9 @@ void Install(Program* program) {
 	for (const auto entry: dispatches)
 		std::printf("Demon's Souls scene guard: installed (the event dispatch at eboot+0x%llx skips a null object)\n",
 		            static_cast<unsigned long long>(entry - program->base_vaddr));
+	if (job_load != 0)
+		std::printf("Demon's Souls scene guard: installed (the physics job step at eboot+0x%llx leaves a job with no object)\n",
+		            static_cast<unsigned long long>(job_load - program->base_vaddr));
 #endif
 }
 } // namespace Loader::DemonsSoulsSceneGuard
