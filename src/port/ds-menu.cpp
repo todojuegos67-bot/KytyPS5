@@ -1114,7 +1114,7 @@ inline float Hash(int i) {
 	return static_cast<float>((x >> 8) & 0xFFFF) / 65535.0f;
 }
 // Fog: slow drifting soft banks behind the panel [a, b] (stacked translucent discs, grey-blue).
-void Fog(ImDrawList* dl, ImVec2 a, ImVec2 b, float alpha) {
+[[maybe_unused]] void Fog(ImDrawList* dl, ImVec2 a, ImVec2 b, float alpha) {
 	const float t = Time(), w = b.x - a.x, h = b.y - a.y;
 	for (int i = 0; i < 9; i++) {
 		const float sx = Hash(i * 3 + 1), sy = Hash(i * 3 + 2), sr = Hash(i * 3 + 3);
@@ -1126,7 +1126,7 @@ void Fog(ImDrawList* dl, ImVec2 a, ImVec2 b, float alpha) {
 	}
 }
 // Soul motes: pale points rising slowly with a sway, fading in and out; `count` of them over [a, b].
-void Motes(ImDrawList* dl, ImVec2 a, ImVec2 b, float alpha, int count, float scale) {
+[[maybe_unused]] void Motes(ImDrawList* dl, ImVec2 a, ImVec2 b, float alpha, int count, float scale) {
 	const float t = Time(), w = b.x - a.x, h = b.y - a.y;
 	for (int i = 0; i < count; i++) {
 		const float speed = 0.05f + 0.07f * Hash(i * 7 + 11);
@@ -1217,8 +1217,6 @@ void Monolith(ImDrawList* dl, ImVec2 c, float s, float unit, float alpha) {
 	dl->AddCircle({c.x, c.y - s * 0.02f}, s * 0.11f, rune, 16, rw);
 	dl->AddLine({c.x - s * 0.12f, top + s * 0.3f}, {c.x + s * 0.12f, top + s * 0.3f}, rune, rw);
 	dl->AddLine({c.x - s * 0.08f, foot - s * 0.2f}, {c.x + s * 0.08f, foot - s * 0.2f}, rune, rw);
-	// Souls rising from it.
-	Motes(dl, {c.x - s * 0.4f, top - s * 0.4f}, {c.x + s * 0.4f, foot}, alpha * 0.9f, 7, unit);
 }
 // Engraved text: a dark cut above-left, a faint light lip below-right, the face in tarnished gold.
 void Etched(ImDrawList* dl, ImFont* f, float size, ImVec2 at, const char* text, float alpha) {
@@ -5706,20 +5704,9 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	Bump();
 	Anim::g_page_seen = 0;
 	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, static_cast<int>(140 * t)));
-	{
-		// A dark vignette and drifting fog behind the panel (last frame's window rectangle), soul motes in the dark.
-		static ImVec2 last_p {0, 0}, last_s {0, 0};
-		auto*         bg = ImGui::GetBackgroundDrawList();
-		const ImU32   v0 = IM_COL32(0, 0, 0, 0), v1 = IM_COL32(4, 5, 8, static_cast<int>(120 * t));
-		bg->AddRectFilledMultiColor({0, 0}, {width, height * 0.5f}, v1, v1, v0, v0);
-		bg->AddRectFilledMultiColor({0, height * 0.5f}, {width, height}, v0, v0, v1, v1);
-		if (last_s.x > 0) {
-			const ImVec2 a {last_p.x - 260 * unit, last_p.y - 120 * unit}, b {last_p.x + last_s.x + 260 * unit, last_p.y + last_s.y + 120 * unit};
-			Souls::Fog(bg, a, b, t);
-			Souls::Motes(bg, a, b, t * 0.8f, 26, unit);
-		}
-		g_menu_rect_hook = [](ImVec2 p, ImVec2 sz) { last_p = p, last_s = sz; };
-	}
+	// (des-fog-hq) No fog, motes or vignette behind the F1 menu: the plain dim of the game image only (the ambience is
+	// the pre-game launcher's alone).
+	g_menu_rect_hook = nullptr;
 	ImFont* font = FindFont("segoeui");
 	ImGui::PushFont(font, std::round(32.0f * unit)); // (step5: larger text, whole-pixel size)
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.01f, t));
