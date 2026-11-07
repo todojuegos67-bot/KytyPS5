@@ -4321,6 +4321,11 @@ bool HsFcFormat(vk::Format f) {
 // pres is copied as the new last-presented frame. Returns the image to present, or nullptr when
 // the check cannot run (the canvas is then presented as in 1.40).
 HsCanvas* HsContentCheck(vk::CommandBuffer cmd, HsCanvas& c) {
+    static const bool fc_off = [] {
+        const char* v = std::getenv("BB_FLATCHECK");
+        return v != nullptr && *v == '0';
+    }();
+    if (fc_off) return nullptr; // BB_FLATCHECK=0: no content check (1.40 present)
     if (!HsFcFormat(c.format) || !HsFcInit() ||
         !HsEnsure(g_hs.pres, c.extent, c.format, false, true)) {
         ++g_hs.fc_unchecked;

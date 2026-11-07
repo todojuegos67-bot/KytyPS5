@@ -54,7 +54,11 @@ void main() {
         if (i == 0u) {
             uvec3 r = s_max[0] - s_min[0];
             uint mean = s_sum[0] / 768u;
-            bool flat_ = max(r.r, max(r.g, r.b)) <= 3u && mean >= 24u && mean <= 232u;
+            // 1.43: only the observed failure signature: every sample within 3 of one value and
+            // that value mid-grey (0x7D +-12 on every channel). Dark / foggy scenes never match.
+            uvec3 lo = s_min[0], hi = s_max[0];
+            bool grey = all(greaterThanEqual(lo, uvec3(0x71u))) && all(lessThanEqual(hi, uvec3(0x89u)));
+            bool flat_ = max(r.r, max(r.g, r.b)) <= 3u && grey && (max(hi.r, max(hi.g, hi.b)) - min(lo.r, min(lo.g, lo.b))) <= 3u;
             st.checked += 1u;
             st.last_min = s_min[0].r | (s_min[0].g << 8) | (s_min[0].b << 16);
             st.last_max = s_max[0].r | (s_max[0].g << 8) | (s_max[0].b << 16);
