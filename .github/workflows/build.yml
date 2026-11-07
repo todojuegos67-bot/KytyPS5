@@ -61,9 +61,19 @@ jobs:
           "folder=$folder" >> $env:GITHUB_OUTPUT
 
       # The tested compiler (LLVM 23.1.2 crashed compiling agc.cpp; others are untested).
+      # (des-launcherfog-1108) The step must fail if 19.1.7 is not what is installed: a feed error (504) once left the
+      # image's clang-cl 20.1.8 in place, silently, and that build crashed in game.
       - name: Install LLVM 19.1.7
         shell: pwsh
-        run: choco upgrade llvm --version=19.1.7 --allow-downgrade --no-progress -y
+        run: |
+          for ($i = 1; $i -le 5; $i++) {
+            choco upgrade llvm --version=19.1.7 --allow-downgrade --no-progress -y
+            $v = (& 'C:\Program Files\LLVM\bin\clang-cl.exe' --version | Select-Object -First 1)
+            Write-Host "attempt ${i}: $v"
+            if ($v -match '\b19\.1\.7\b') { exit 0 }
+            Start-Sleep -Seconds (20 * $i)
+          }
+          throw "LLVM 19.1.7 could not be installed (found: $v); not building with another compiler"
 
       # glslangValidator: the runner has no Vulkan SDK.
       - name: Locate vcpkg
