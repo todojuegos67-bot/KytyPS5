@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -325,7 +326,15 @@ bool GameController::ApplyVibration() {
     const auto scale = [k](u8 v) {
         return static_cast<Uint16>(std::clamp(v / 255.0f * k, 0.0f, 1.0f) * 0xFFFF);
     };
-    const Uint16 lo = scale(m_vib_large), hi = scale(m_vib_small);
+    // (bb-rumble-145) Bloodborne sends the small motor as an on/off bit (0 / 1, eboot 1.09
+    // 0xf95c93: table bit >> phase & 1), so 1 would be 1/255 strength (unfelt). A small value of
+    // 1 is taken as "on" at BB_RUMBLE_SMALL_ON (default 160; 1 = raw).
+    static const int small_on = [] {
+        const char* e = std::getenv("BB_RUMBLE_SMALL_ON");
+        return e ? std::clamp(std::atoi(e), 1, 255) : 160;
+    }();
+    const u8 small_v = m_vib_small == 1 ? static_cast<u8>(small_on) : m_vib_small;
+    const Uint16 lo = scale(m_vib_large), hi = scale(small_v);
     // (bb-rumble-143) the game streams stop (0/0) commands: re-sending a stop every frame to SDL
     // cut any rumble started elsewhere (the F1 test lasted < 1 frame: "felt nothing"). A stop is
     // sent once, after a non-zero command only.

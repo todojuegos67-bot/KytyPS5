@@ -762,6 +762,21 @@ int PS4_SYSV_ABI scePadSetVibration(s32 handle, const OrbisPadVibrationParam* pP
     if (pParam != nullptr) {
         LOG_DEBUG(Lib_Pad, "scePadSetVibration called handle = {} data = {} , {}", handle,
                   pParam->smallMotor, pParam->largeMotor);
+        // (bb-rumble-145) raw bytes of the first 10 non-null params (8 bytes, hex). Bloodborne
+        // 1.09 builds the param on its stack at 0x269c790: byte 0 = large (0..255 from a float
+        // accumulator), byte 1 = small (0 / 1 on-off pattern bit), then 6 bytes of stack.
+        {
+            static std::atomic<int> raw_logged{0};
+            const int n = raw_logged.fetch_add(1);
+            if (n < 10) {
+                const u8* b = reinterpret_cast<const u8*>(pParam);
+                LOG_INFO(Lib_Pad,
+                         "[pad] scePadSetVibration raw #{} handle {} @{}: {:02x} {:02x} {:02x} "
+                         "{:02x} {:02x} {:02x} {:02x} {:02x}",
+                         n, handle, fmt::ptr(pParam), b[0], b[1], b[2], b[3], b[4], b[5], b[6],
+                         b[7]);
+            }
+        }
         // (bb-rumble-143) per-second rumble stats: calls, non-zero calls, peak values
         {
             static std::mutex vib_m;
@@ -773,7 +788,7 @@ int PS4_SYSV_ABI scePadSetVibration(s32 handle, const OrbisPadVibrationParam* pP
             if (vib_t0 == 0) vib_t0 = now + 1;
             if (now != vib_sec) {
                 // every second with a non-zero command, plus the first 10 s of the stream
-                if (vib_calls && (vib_nz || now - vib_t0 < 10)) {
+                if (vib_calls && (vib_nz || now - vib_t0 < 10 || (now % 30) == 0)) {
                     LOG_INFO(Lib_Pad,
                              "[pad] scePadSetVibration last second: {} calls, {} non-zero, peak "
                              "large {} small {}, handle {}",
