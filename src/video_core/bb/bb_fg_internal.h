@@ -22,6 +22,8 @@ int Generated();
 double PaceInterval(); // the real-frame limit while generating (0: none)
 bool Generating();     // generating frames now
 void NoteSlept(double seconds);
+void SetUiLayer(const Image* ui);
+bool WantsUiLayer();
 } // namespace BB::FG::Amd
 
 namespace BB::FG {

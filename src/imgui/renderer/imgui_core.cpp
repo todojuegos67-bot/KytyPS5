@@ -297,6 +297,55 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
     }
 }
 
+static void RenderPass(const vk::CommandBuffer& cmdbuf, const vk::ImageView& view,
+                       const vk::Extent2D& extent, ImDrawData& data) {
+    vk::RenderingAttachmentInfo color_attachments[1]{
+        {
+            .imageView = view,
+            .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .loadOp = vk::AttachmentLoadOp::eClear,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+            .clearValue = vk::ClearValue{.color = vk::ClearColorValue{std::array{0.f, 0.f, 0.f, 0.f}}},
+        },
+    };
+    vk::RenderingInfo render_info{};
+    render_info.renderArea = vk::Rect2D{.offset = {0, 0}, .extent = extent};
+    render_info.layerCount = 1;
+    render_info.colorAttachmentCount = 1;
+    render_info.pColorAttachments = color_attachments;
+    cmdbuf.beginRendering(render_info);
+    if (data.CmdListsCount > 0) Vulkan::RenderDrawData(data, cmdbuf);
+    cmdbuf.endRendering();
+}
+
+void RenderSplit(const vk::CommandBuffer& cmdbuf, const vk::ImageView& game_view,
+                 const vk::ImageView& ui_view, const vk::Extent2D& extent) {
+    ImGui::Render();
+    ImDrawData* draw_data = GetDrawData();
+    Vulkan::UpdateTextures(*draw_data, cmdbuf);
+    const ImGuiWindow* game_window = ImGui::FindWindowByName("Display##game_display");
+    const ImDrawList* game_list = game_window ? game_window->DrawList : nullptr;
+    ImDrawData game = *draw_data;
+    ImDrawData ui = *draw_data;
+    game.CmdLists.clear();
+    ui.CmdLists.clear();
+    game.TotalVtxCount = game.TotalIdxCount = ui.TotalVtxCount = ui.TotalIdxCount = 0;
+    // Everything up to and including the game window (dock host, background) is the scene layer;
+    // without a game window found, everything stays in the scene layer (the old composition).
+    bool after = false;
+    for (ImDrawList* list : draw_data->CmdLists) {
+        ImDrawData& dst = after ? ui : game;
+        dst.CmdLists.push_back(list);
+        dst.TotalVtxCount += list->VtxBuffer.Size;
+        dst.TotalIdxCount += list->IdxBuffer.Size;
+        if (game_list != nullptr && list == game_list) after = true;
+    }
+    game.CmdListsCount = game.CmdLists.Size;
+    ui.CmdListsCount = ui.CmdLists.Size;
+    RenderPass(cmdbuf, game_view, extent, game);
+    RenderPass(cmdbuf, ui_view, extent, ui);
+}
+
 bool MustKeepDrawing() {
     return std::ranges::any_of(layers, [](Layer* layer) { return layer->ShouldKeepDrawing(); }) ||
            change_layers.size() > 1;

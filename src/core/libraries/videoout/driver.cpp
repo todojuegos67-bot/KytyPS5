@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -235,7 +238,30 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+// 1.51 (bb-fgmv-151): the last guest flip, for the overlay redraw rule below.
+static std::atomic<s64> g_bb_last_flip_ns{0};
+static s64 BBNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+// 1.51: an ImGui overlay (trophy toast, F1 menu) used to re-present the last frame on every vblank
+// tick without a guest flip (DrawLastFrame). With frame generation on, each of those presents is a
+// "real" frame with no inputs: FSR 3 FG toggled off / on every other present (r149_0451: "FSR3 FG:
+// off (no 3D frame)" 1035 times, 28 of 84 presents a second), which ghosted the HUD / overlay and
+// ended in a stuck image. With FG on, the overlay is redrawn only by guest flips while the game
+// flips; on our own only after 250 ms without a flip (paused / menu). BB_OVERLAY_REDRAW=1: old.
+static bool BBOverlayRedrawAllowed() {
+    static const bool old = [] {
+        const char* e = std::getenv("BB_OVERLAY_REDRAW");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (old || BB::FG::Cfg().kind == BB::FG::Kind::Off) return true;
+    return BBNowNs() - g_bb_last_flip_ns.load(std::memory_order_relaxed) > 250'000'000;
+}
+
 void VideoOutDriver::Flip(const Request& req) {
+    g_bb_last_flip_ns.store(BBNowNs(), std::memory_order_relaxed);
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
@@ -484,7 +510,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing()) {
+                    } else if (ImGui::Core::MustKeepDrawing() && BBOverlayRedrawAllowed()) {
                         DrawLastFrame();
                     }
                 }

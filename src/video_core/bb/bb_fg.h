@@ -100,6 +100,11 @@ struct Image {
     vk::Extent2D extent{};
     vk::ImageUsageFlags usage{};
 };
+// 1.51 (bb-fgmv-151): the emulator overlay (ImGui) as a separate transparent layer composited after
+// frame generation (FSR 3 UI resource). WantsUiLayer: the presenter should draw the overlay into
+// its own image this present and hand it over with SetUiLayer (before BeforePresent).
+bool WantsUiLayer();
+void SetUiLayer(const Image* ui);
 struct Inputs {
     bool valid = false; // a 3D frame (the upscaler ran with depth and vectors this frame)
     Image depth;        // render size, D32, SHADER_READ_ONLY_OPTIMAL

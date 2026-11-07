@@ -418,6 +418,13 @@ bool Fsr3Active() {
     return Amd::Active();
 }
 
+bool WantsUiLayer() {
+    return Cfg().kind == Kind::Amd && Amd::WantsUiLayer();
+}
+void SetUiLayer(const Image* ui) {
+    Amd::SetUiLayer(ui);
+}
+
 
 // ---------------------------------------------------------------------------------------------
 // DLSS-G preset (Demon's Souls frame-gen.cpp DlssgPreset, as it is; its launcher's default C).

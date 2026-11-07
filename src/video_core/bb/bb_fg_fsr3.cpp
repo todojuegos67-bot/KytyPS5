@@ -643,6 +643,45 @@ bool Active() {
     return g_swapchain_context != nullptr;
 }
 
+// 1.51 (bb-fgmv-151): the emulator's own overlay (ImGui: trophy toasts, F1 menu, metrics) drawn
+// into a separate transparent image this present (vk_presenter.cpp), registered as FSR 3's UI
+// resource: the FG swapchain composites it over every presented frame, real and generated, after
+// interpolation (it was drawn into the back buffer and interpolated: ghosting).
+Image g_ui_layer{};
+bool g_ui_layer_set = false;
+uint64_t g_ui_layer_frames = 0;
+
+void SetUiLayer(const Image* ui) {
+    std::lock_guard lock(g_mutex);
+    g_ui_layer_set = ui != nullptr && ui->image;
+    if (g_ui_layer_set) g_ui_layer = *ui;
+}
+
+bool WantsUiLayer() {
+    static const bool on = EnvOn("BB_FG_UI_LAYER", true);
+    return on && Active();
+}
+
+void RegisterUiLayerLocked() {
+    if (g_swapchain_context == nullptr) return;
+    ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceVK ui{};
+    ui.header.type = FFX_API_CONFIGURE_DESC_TYPE_FGSWAPCHAIN_REGISTERUIRESOURCE_VK;
+    if (g_ui_layer_set) {
+        ui.uiResource = ImageResource(g_ui_layer, false);
+        ui.uiResource.state = FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
+        ui.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
+                   FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
+        if (g_ui_layer_frames++ == 0) {
+            Printf("[fg-ui] 1.51 overlay (ImGui) given to FSR 3 as its UI layer (%ux%u %s, "
+                   "premultiplied, double-buffered): composited after frame generation",
+                   g_ui_layer.extent.width, g_ui_layer.extent.height,
+                   vk::to_string(g_ui_layer.format).c_str());
+        }
+    }
+    g_ffx.Configure(&g_swapchain_context, &ui.header);
+    g_ui_layer_set = false;
+}
+
 double PaceInterval() {
     return Active() && g_generating ? CapInterval() : 0.0;
 }
@@ -915,6 +954,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         next = std::max(next, now - step) + step;
     }
     std::lock_guard lock(g_mutex);
+    RegisterUiLayerLocked(); // 1.51: every present, generating or not
     const auto now = std::chrono::steady_clock::now();
     // bb-dcideas-094: never for movies or 2D flips (menus, loading screens).
     bool usable = inputs != nullptr && inputs->valid && !g_fg_failed && !FgBlocked(nullptr);
@@ -1127,12 +1167,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     config.frameGenerationCallbackUserContext = &g_fg_context;
     config.frameGenerationEnabled = generate;
     config.allowAsyncWorkloads = EnvOn("KYTY_FSR3_ASYNC", false);
-    {
-        // No HUD layer (the HUD-less image keeps the HUD out of the generated frames).
-        ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceVK ui{};
-        ui.header.type = FFX_API_CONFIGURE_DESC_TYPE_FGSWAPCHAIN_REGISTERUIRESOURCE_VK;
-        g_ffx.Configure(&g_swapchain_context, &ui.header);
-    }
+    // 1.51: the UI layer (the emulator overlay) is registered at the top of BeforePresent.
     // 1.40: KYTY_FSR3_HUDLESS=0 gives FSR 3 no HUD-less image (A/B: FSR then interpolates the
     // whole back buffer, HUD included; with it, wherever the back buffer and the HUD-less image
     // differ FSR takes the real frame's pixels as UI, which on characters would look 30 fps).
@@ -1337,6 +1372,11 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
 }
 
 #else // !_WIN32
+
+void SetUiLayer(const Image*) {}
+bool WantsUiLayer() {
+    return false;
+}
 
 bool Requested() {
     return false;

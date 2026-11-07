@@ -609,6 +609,66 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->is_hdr = swapchain.GetHDR();
 }
 
+// 1.51 (bb-fgmv-151): the overlay layer for frame generation (BB::FG::WantsUiLayer): three
+// images in turn, the swapchain's format and size, cleared transparent and drawn by ImGui with
+// every window after the game display (toasts, F1 menu, metrics).
+namespace {
+struct BBUiLayer {
+    vk::Image image{};
+    VmaAllocation allocation{};
+    vk::ImageView view{};
+    vk::Format format = vk::Format::eUndefined;
+    vk::Extent2D extent{};
+};
+std::array<BBUiLayer, 3> g_bb_ui{};
+u32 g_bb_ui_next = 0;
+
+BBUiLayer* BBEnsureUiLayer(const Instance& instance, vk::Format format, vk::Extent2D extent) {
+    auto& l = g_bb_ui[g_bb_ui_next];
+    g_bb_ui_next = (g_bb_ui_next + 1) % g_bb_ui.size();
+    if (l.image && l.format == format && l.extent == extent) return &l;
+    const vk::Device device = instance.GetDevice();
+    if (l.image) {
+        (void)device.waitIdle();
+        device.destroyImageView(l.view);
+        vmaDestroyImage(instance.GetAllocator(), l.image, l.allocation);
+        l = {};
+    }
+    const VkImageCreateInfo image_info = vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferSrc,
+    };
+    const VmaAllocationCreateInfo alloc_info = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &image, &l.allocation,
+                       nullptr) != VK_SUCCESS) {
+        return nullptr;
+    }
+    l.image = vk::Image{image};
+    const auto [result, view] = device.createImageView(vk::ImageViewCreateInfo{
+        .image = l.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (result != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), l.image, l.allocation);
+        l = {};
+        return nullptr;
+    }
+    l.view = view;
+    l.format = format;
+    l.extent = extent;
+    return &l;
+}
+} // namespace
+
 bool Presenter::EnsureFgHudless(Frame* frame) {
     const vk::Format format = swapchain.GetSurfaceFormat().format;
     if (frame->fg_hudless && frame->fg_hudless_width == frame->width &&
@@ -1468,7 +1528,49 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                           vk::ImageUsageFlagBits::eTransferDst};
             frame->fg.has_hudless_game = true;
         }
-        ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+        // 1.51: with FSR 3 frame generation the overlay goes into its own layer, composited by the
+        // FG swapchain after interpolation on real and generated frames (it was drawn into the
+        // back buffer and interpolated: ghosting toasts / menu). BB_FG_UI_LAYER=0: old.
+        BBUiLayer* bb_ui = nullptr;
+        if (BB::FG::WantsUiLayer() && !swapchain.GetHDR()) {
+            bb_ui = BBEnsureUiLayer(instance, swapchain.GetSurfaceFormat().format,
+                                    swapchain.GetExtent());
+        }
+        if (bb_ui != nullptr) {
+            const vk::ImageMemoryBarrier2 to_target{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = bb_ui->image,
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_target});
+            ImGui::Core::RenderSplit(cmdbuf, swapchain_image_view, bb_ui->view,
+                                     swapchain.GetExtent());
+            const vk::ImageMemoryBarrier2 to_read{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .image = bb_ui->image,
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_read});
+            const BB::FG::Image ui_img{bb_ui->image, bb_ui->view, bb_ui->format, bb_ui->extent,
+                                       vk::ImageUsageFlagBits::eColorAttachment |
+                                           vk::ImageUsageFlagBits::eSampled};
+            BB::FG::SetUiLayer(&ui_img);
+        } else {
+            BB::FG::SetUiLayer(nullptr);
+            ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+        }
 
         if (capture_with_overlays_count > 0) {
             auto& readback = pending_screenshot.emplace(
