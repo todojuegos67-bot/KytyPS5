@@ -15,6 +15,8 @@
 // Flag 4: frame generation's HUD-less image (bb_fg.h): the HUD-less copy stands in for the
 // presented image, so the result is the upscaled image alone, in the same colour space.
 // Flag 8: sharp (EASU-like) reconstruction of the HUD layer instead of bilinear (see SharpSample).
+// Flag 16 (1.52, with flag 8): Lanczos-3 (6x6) reconstruction of the HUD layer with an
+// edge-aware sharpen, see LanczosSample.
 // Flag 2: frame self-check, the luminance of a 64x64 grid of the game's image and of ours is
 // summed into lum (16.16 fixed point) for the host to compare.
 #version 450
@@ -76,6 +78,70 @@ vec3 SharpSample(sampler2D tex, vec2 uv) {
     return clamp(acc, lo4, hi4);
 }
 
+// 1.52: text/icon-oriented HUD reconstruction. The HUD layer is fin - bare, i.e. already a
+// premultiplied-alpha signal (alpha * (hud - scene)), so filtering both images with one linear
+// kernel filters that premultiplied layer and keeps it exactly zero where the game drew no HUD.
+// Lanczos-3 keeps far more of the glyph edge contrast than the 4x4 Catmull-Rom; its lobes are
+// then pushed a little further against the bilinear result (unsharp on the high band) and the
+// result is clamped to the 2x2 nearest texels, so edges get steeper without ringing or halos.
+float LanczosW(float x) {
+    x = abs(x);
+    if (x < 1e-4) {
+        return 1.0;
+    }
+    if (x >= 3.0) {
+        return 0.0;
+    }
+    const float PI = 3.14159265;
+    float px = PI * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+void LanczosSample(vec2 uv, out vec3 fin_o, out vec3 bare_o) {
+    vec2 size = vec2(textureSize(final_tex, 0));
+    vec2 pos = uv * size - 0.5;
+    vec2 base = floor(pos);
+    vec2 f = pos - base;
+    float wx[6], wy[6];
+    float sx = 0.0, sy = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        wx[i] = LanczosW(float(i - 2) - f.x);
+        wy[i] = LanczosW(float(i - 2) - f.y);
+        sx += wx[i];
+        sy += wy[i];
+    }
+    ivec2 b = ivec2(base);
+    ivec2 hi = ivec2(size) - 1;
+    vec3 af = vec3(0.0), ab = vec3(0.0);
+    vec3 lof = vec3(1e9), hif = vec3(-1e9), lob = vec3(1e9), hib = vec3(-1e9);
+    vec3 blf = vec3(0.0), blb = vec3(0.0);
+    for (int j = 0; j < 6; ++j) {
+        for (int i = 0; i < 6; ++i) {
+            ivec2 q = clamp(b + ivec2(i - 2, j - 2), ivec2(0), hi);
+            vec3 tf = texelFetch(final_tex, q, 0).rgb;
+            vec3 tb = texelFetch(hudless_tex, q, 0).rgb;
+            float w = wx[i] * wy[j];
+            af += tf * w;
+            ab += tb * w;
+            if ((i == 2 || i == 3) && (j == 2 || j == 3)) {
+                lof = min(lof, tf);
+                hif = max(hif, tf);
+                lob = min(lob, tb);
+                hib = max(hib, tb);
+                float bw = (i == 2 ? 1.0 - f.x : f.x) * (j == 2 ? 1.0 - f.y : f.y);
+                blf += tf * bw;
+                blb += tb * bw;
+            }
+        }
+    }
+    float norm = 1.0 / (sx * sy);
+    af *= norm;
+    ab *= norm;
+    const float k = 0.35;
+    fin_o = clamp(af + k * (af - blf), lof, hif);
+    bare_o = clamp(ab + k * (ab - blb), lob, hib);
+}
+
 float Luma(vec3 c) {
     return dot(clamp(c, 0.0, 1.0), vec3(0.2126, 0.7152, 0.0722));
 }
@@ -92,8 +158,15 @@ void main() {
     }
     up = clamp(up, 0.0, 1.0);
     const bool sharp = (p.size.w & 8u) != 0u;
-    vec3 fin = sharp ? SharpSample(final_tex, uv) : textureLod(final_tex, uv, 0.0).rgb;
-    vec3 bare = sharp ? SharpSample(hudless_tex, uv) : textureLod(hudless_tex, uv, 0.0).rgb;
+    const bool lanczos = sharp && (p.size.w & 16u) != 0u &&
+                         textureSize(final_tex, 0) == textureSize(hudless_tex, 0);
+    vec3 fin, bare;
+    if (lanczos) {
+        LanczosSample(uv, fin, bare);
+    } else {
+        fin = sharp ? SharpSample(final_tex, uv) : textureLod(final_tex, uv, 0.0).rgb;
+        bare = sharp ? SharpSample(hudless_tex, uv) : textureLod(hudless_tex, uv, 0.0).rgb;
+    }
     if ((p.size.w & 1u) != 0u) {
         up = SrgbToLinear(up);
         bare = SrgbToLinear(bare);

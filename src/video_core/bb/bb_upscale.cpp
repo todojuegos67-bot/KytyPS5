@@ -4573,6 +4573,14 @@ bool HudSharpScale(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
            (out_w > render_w || out_h > render_h);
 }
 
+bool HudLanczos() {
+    static const bool easu = [] {
+        const char* v = std::getenv("BB_HUD_SCALE");
+        return v != nullptr && std::string_view{v} == "easu";
+    }();
+    return !easu;
+}
+
 void NoteFullFrame(const char* path, u32 in_w, u32 in_h, u32 out_w, u32 out_h, Hud2D hud,
                    bool is_3d) {
     static std::mutex m;
@@ -4585,7 +4593,9 @@ void NoteFullFrame(const char* path, u32 in_w, u32 in_h, u32 out_w, u32 out_h, H
     d3 += is_3d ? 1 : 0;
     const bool scaled2d = hud == Hud2D::Upscaled || hud == Hud2D::Spatial;
     hud_up += scaled2d ? 1 : 0;
-    const char* hud_s = hud == Hud2D::Upscaled    ? "YES (window path: HUD layer EASU-like)"
+    const char* hud_s = hud == Hud2D::Upscaled
+                            ? (HudLanczos() ? "YES (window path: HUD layer Lanczos-3 deringed)"
+                                            : "YES (window path: HUD layer EASU-like)")
                         : hud == Hud2D::Spatial    ? "YES (whole frame FSR 1 EASU)"
                         : hud == Hud2D::Native     ? "native (drawn by the game at the window size)"
                         : hud == Hud2D::Downscaled ? "NO (internal > window: downscaled)"
@@ -4597,6 +4607,33 @@ void NoteFullFrame(const char* path, u32 in_w, u32 in_h, u32 out_w, u32 out_h, H
                                         out_h, hud_s);
     const auto now = std::chrono::steady_clock::now();
     const double since = std::chrono::duration<double>(now - start).count();
+    {
+        // 1.52: one line per second on how the HUD / 2D layer of the presented frames was made.
+        static auto hud_last = start;
+        static u32 hf = 0, h_up = 0, h_nat = 0, h_sp = 0, h_other = 0;
+        ++hf;
+        (hud == Hud2D::Upscaled ? h_up
+         : hud == Hud2D::Native ? h_nat
+         : hud == Hud2D::Spatial ? h_sp
+                                 : h_other) += 1;
+        if (std::chrono::duration<double>(now - hud_last).count() >= 1.0) {
+            const char* how =
+                hud == Hud2D::Upscaled
+                    ? (HudLanczos() ? "game HUD at internal size, Lanczos-3 + deringed edge "
+                                      "sharpen to the window (not through DLSS/FSR)"
+                                    : "game HUD at internal size, EASU-like 4x4 to the window")
+                : hud == Hud2D::Native     ? "drawn natively by the game at the window size"
+                : hud == Hud2D::Spatial    ? "whole frame FSR 1 EASU"
+                : hud == Hud2D::Downscaled ? "downscaled (internal > window)"
+                                           : "plain bilinear stretch";
+            Checkpoint(fmt::format("[hud] t={:.0f}s HUD={} internal={}x{} window={}x{} | last {} "
+                                   "flips: {} filtered, {} native, {} EASU, {} other",
+                                   since, how, in_w, in_h, out_w, out_h, hf, h_up, h_nat, h_sp,
+                                   h_other));
+            hud_last = now;
+            hf = h_up = h_nat = h_sp = h_other = 0;
+        }
+    }
     const double gap = std::chrono::duration<double>(now - last).count();
     const bool changed = key != last_key;
     if (!changed && gap < (since < 120.0 ? 1.0 : 30.0)) {

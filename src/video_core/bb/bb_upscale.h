@@ -255,6 +255,9 @@ void OnPresentResult(bool presented, std::string_view why);
 // size with an EASU-like deringed 4x4 kernel instead of a bilinear stretch, when the window is
 // larger than the render size (BB_HUD_SCALE=bilinear restores 0.64).
 bool HudSharpScale(u32 render_w, u32 render_h, u32 out_w, u32 out_h);
+// 1.52: with HudSharpScale, the HUD layer uses a Lanczos-3 kernel with an edge-aware deringed
+// sharpen (text/icon oriented) instead of the EASU-like 4x4 one. BB_HUD_SCALE=easu restores 1.51.
+bool HudLanczos();
 // 0.69: one entry per presented frame, from the presenter, whatever the upscaler (also with the
 // BB upscaler off: the emulator's own FSR 1). path: what the 3D went through; hud: how the 2D
 // layer (HUD, menus, text) reached the window size. A "[frame]" line is written to

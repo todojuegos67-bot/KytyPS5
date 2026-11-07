@@ -1571,7 +1571,7 @@ bool Rasterizer::BBPresentComposite(vk::CommandBuffer cmd, VideoCore::Image& fli
             (g_bb.present_encoded ? 1u : 0u) | (measure ? 2u : 0u) |
                 (BB::Upscale::HudSharpScale(render.width, render.height, output.width,
                                             output.height)
-                     ? 8u
+                     ? (BB::Upscale::HudLanczos() ? 24u : 8u)
                      : 0u)}};
     const vk::DescriptorImageInfo up_info{g_bb.linear, g_bb.output.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo final_info{g_bb.linear, final_view,
