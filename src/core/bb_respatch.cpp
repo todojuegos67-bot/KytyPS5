@@ -148,11 +148,16 @@ bool NativeChain() {
     // size (bb_upscale.cpp); otherwise nothing changes. BB_SCENE_UPSCALE=0 turns it off.
     // 1.44: BB_SCENE_UPSCALE=prepost is the native chain with Bloodborne's pass roles fixed by
     // shader hash (bb_upscale.cpp, PP section).
-    return Mode() == "native" || Mode() == "prepost"; // 1.35: aapass no longer uses the native chain
+    return Mode() == "native" || Mode() == "prepost" || Mode() == "aapoint"; // 1.35: aapass no longer uses the native chain
 }
 
 bool Prepost() {
-    static const bool on = Mode() == "prepost";
+    static const bool on = Mode() == "prepost" || Mode() == "aapoint";
+    return on;
+}
+
+bool AaPoint() {
+    static const bool on = Mode() == "aapoint";
     return on;
 }
 
@@ -174,7 +179,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
         // 0.81: which lines of work this build carries (bb-imgfg-078 = bb-merge-075 + image frame generation).
         const std::string features =
             "build 1.43 (bb-combo-143): content check rejects only flat mid-grey canvases (all samples within 3 of one value, 0x7D +-12; dark scenes never), BB_FLATCHECK=0 turns it off. build 1.41 (bb-combo-141): 1.42 flash guard (bb-flash-142, supersedes 1.40) + FG pairing/coverage diagnostics (bb-fg30-141) + rumble fix/diag (bb-rumble-143) + mouse direct camera (bb-kbmcam-142). "
-            "build 1.46 (bb-prepost-146): prepost: only scene-pass render targets get internal-size versions (sampled-only images such as the linear depth stayed stale: missing textures, ghostly objects, grid seams, extra twin copies); BB_PREPOST_SAMPLED_SCENE=1 old. "
+            "build 1.46 (bb-prepost-146): BB_SCENE_UPSCALE=aapoint (opt-in): prepost with the boundary exactly at the DLAA point (ps 0x00000ccc53f28aa5's scene-colour sample), the exposure computes before it no longer end the scene passes; prepost: only scene-pass render targets get internal-size versions (sampled-only images such as the linear depth stayed stale: missing textures, ghostly objects, grid seams, extra twin copies); BB_PREPOST_SAMPLED_SCENE=1 old. "
             "build 1.45 (bb-prepost-145): prepost freeze fix (native chain check counts the post-entry upscale, no automatic bb_dump in prepost). "
             "build 1.44 (bb-prepost-144): BB_SCENE_UPSCALE=prepost (opt-in) + DLSS range fix (an out-of-range menu upscale no longer turns DLSS off: r143 Quality never upscaled): DLSS on the lit HDR scene before exposure / bloom / tonemap / HUD, the game at the output size, Bloodborne's passes classified by shader hash (scene passes from the G-buffer draw to cs 0x9a9cf8a9 / 0x200820a1 / ps 0x00000ccc53f28aa5 at the internal size, everything after at the output size, phase-1 copies and samples of scene-size images internal, no history pinning, no learned UI / post targets), [prepost] per-second line with the target table and a mixed-size sample counter; default (aapass resolution patch) unchanged. "
             "build 1.41 (bb-combo-141): 1.42 flash guard (bb-flash-142, supersedes 1.40) + FG pairing/coverage diagnostics (bb-fg30-141) + rumble fix/diag (bb-rumble-143) + mouse direct camera (bb-kbmcam-142). "
@@ -200,7 +205,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
             "the HUD is drawn into an output-size canvas (no native chain, no twin images; "
             "BB_SCENE_UPSCALE=native: the native chain)");
     }
-    if (mode == "prepost") {
+    if (mode == "prepost" || mode == "aapoint") {
         BB::Upscale::Checkpoint(
             "[prepost] BB_SCENE_UPSCALE=prepost (1.44, opt-in): the game renders at its output "
             "size (no eboot rewrite); the scene passes (G-buffer draw .. the post entry) run at the "

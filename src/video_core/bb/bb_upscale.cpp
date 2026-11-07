@@ -1384,6 +1384,10 @@ bool Prepost() {
 
 void PrepostDispatch(u64 cs_hash) {
     if (!Pp() || !PpPostCs(cs_hash)) return;
+    // 1.46 aapoint: the boundary is the DLAA point (the post entry's draw), as in DLAA mode; the
+    // exposure computes before it stay in the scene phase (unscaled: their grids are not learned
+    // as scene computes unless they bind a scene target).
+    if (BB::ResPatch::AaPoint()) return;
     g_pp_post_seen.store(true, std::memory_order_relaxed);
     if (g_ss_frozen.load(std::memory_order_relaxed) &&
         g_ss_phase.load(std::memory_order_relaxed) == 1) {

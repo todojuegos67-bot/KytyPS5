@@ -27,6 +27,8 @@ bool AaPass();
 // 1.44: BB_SCENE_UPSCALE=prepost: the native chain with Bloodborne's pass roles fixed by shader
 // hash (NativeChain() is true too).
 bool Prepost();
+// 1.46: BB_SCENE_UPSCALE=aapoint: Prepost() with the scene/post boundary at the DLAA point only.
+bool AaPoint();
 // 1.07 (bb-hudsharp-107): the scene patch is active with the UI at the internal size and a ratio
 // > 1: the game's HUD / menu draws after the upscale point are re-rasterised into an output-size
 // canvas (viewport / scissor scaled by output / internal), so the 2D layer is sharp at the window
