@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <string>
 #include "common/types.h"
 
 // Bloodborne 1.09: the startup Resolution Patch (BB_SCENE_UPSCALE=1, 0.23). The game's own render
@@ -29,4 +30,7 @@ bool AaPass();
 // canvas (viewport / scissor scaled by output / internal), so the 2D layer is sharp at the window
 // size. BB_HUD_SHARP=0 turns it off (1.01 behaviour: HUD at the internal size, composited).
 bool HudSharp();
+// (bb-rumble-147) one line of Bloodborne 1.09 rumble state read from guest memory (rumble
+// manager global, its rumble param table and request queue); empty before the eboot loads.
+std::string RumbleProbe();
 } // namespace BB::ResPatch
