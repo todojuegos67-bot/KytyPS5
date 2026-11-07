@@ -145,6 +145,9 @@ void                     DestroySwapchain(GraphicContext& graphics, vk::Swapchai
 [[nodiscard]] vk::Result AcquireNextImage(vk::Device device, vk::SwapchainKHR swapchain, uint64_t timeout,
                                           vk::Semaphore semaphore, uint32_t* index);
 [[nodiscard]] vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& present);
+// The window's thread, around a change of the window it makes itself (F11): no present of FSR's swapchain meanwhile
+// that could find it out of date (frame-gen.cpp FsrSwapchainStale).
+void WindowChanging(bool changing);
 // Present thread, recording the frame's present commands (before its submit): FSR's configuration for the frame
 // and its prepare pass on `inputs` (null: no inputs, generation off). `region`: the part of the backbuffer the game
 // image covers.

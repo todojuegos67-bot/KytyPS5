@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "frame-gen.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -289,6 +290,7 @@ static void ToggleDesktopFullscreen() {
 	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
 	const auto mode =
 	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	FrameGen::WindowChanging(true);
 	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
 	} else if (g_window->presenter != nullptr) {
@@ -296,6 +298,7 @@ static void ToggleDesktopFullscreen() {
 		// then kept presenting to the window it had: the picture froze, issue #174.)
 		g_window->presenter->RequestSwapchainRecreate();
 	}
+	FrameGen::WindowChanging(false);
 }
 
 static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {

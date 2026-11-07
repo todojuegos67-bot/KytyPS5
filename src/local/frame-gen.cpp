@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <thread>
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 #ifndef NOMINMAX
@@ -551,6 +552,7 @@ struct FsrState {
 	ffxContext   fg_context        = nullptr; // frame generation (made at the first frame with inputs)
 	ffxQueryDescSwapchainReplacementFunctionsVK functions {};
 	vk::SwapchainKHR swapchain = nullptr;
+	vk::SurfaceKHR   surface   = nullptr; // the window's, the swapchain's
 	vk::Extent2D     display {};
 	vk::Format       format = vk::Format::eUndefined;
 	bool             hdr    = false; // HDR10 (PQ) swapchain
@@ -569,6 +571,7 @@ FsrState g_fsr_state;
 // before are not presented: a frame without inputs between generated ones would be shown as a still).
 constexpr uint32_t FsrTurnOnAfter = 10, FsrTurnOffAfter = 4;
 std::atomic<bool>  g_fsr_discontinuity {false};
+std::atomic<bool>  g_fsr_window_changing {false}; // (WindowChanging)
 
 bool FsrOk(ffxReturnCode_t code, const char* what) {
 	if (code == FFX_API_RETURN_OK) return true;
@@ -2977,6 +2980,7 @@ vk::Result CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateIn
 		return vk::Result::eErrorInitializationFailed;
 	}
 	s.swapchain = handle;
+	s.surface   = info.surface;
 	s.display   = info.imageExtent;
 	s.format    = info.imageFormat;
 	s.hdr       = info.imageColorSpace == vk::ColorSpaceKHR::eHdr10St2084EXT;
@@ -3007,8 +3011,7 @@ void DestroySwapchain(GraphicContext& graphics, vk::SwapchainKHR swapchain) {
 	// Frame generation off, then the swapchain: its destruction stops its present thread and waits for its presents.
 	// Then FSR's own queues (nothing else submits to them) are waited for, and only then go the frame generation context
 	// and the HUD-less images its interpolation reads. Freed before the swapchain, they could still be in use: on an RTX
-	// 5090 an F11 back to the window, frame generation on at 5120x2160 since a load, lost the device, and an F11 in the
-	// main menu froze the picture while the game ran on (issue #174).
+	// 5090 an F11 back to the window, frame generation on at 5120x2160 since a load, lost the device (issue #174).
 	// All of it with the device's queues held: FSR's runtime waits for the whole device in here (DeviceQueuesGuard).
 	DeviceQueuesGuard queues(graphics);
 	FsrStopFrameGeneration();
@@ -3066,13 +3069,55 @@ vk::Result AcquireNextImage(vk::Device device, vk::SwapchainKHR swapchain, uint6
 #endif
 }
 
+#ifdef KYTY_FRAMEGEN_FSR
+// FidelityFX SDK 1.1.4's swapchain when it is not generating (menus, loads) acquires the real swapchain's image inside its
+// present. Given none (the window changed, the real swapchain out of date) it drops the frame, answers VK_SUCCESS and
+// counts the frame as sent without signalling its present semaphore: nothing shows, and the next wait for its presents
+// never ends, the one in its destruction above all. An F11 in the main menu froze the picture (the game too, with the
+// queues held in DestroySwapchain), issue #174, on a 5090 within 6 presses. So that present is not made: the emulator's
+// own recovery takes over, as from an out of date present. Its destruction then finds every present done. (FSR SDK 2's
+// swapchain does not hang like this, 48 presses, and a generating swapchain's present thread deals with a missing image.)
+static bool FsrSwapchainStale() {
+	auto& s = g_fsr_state;
+	if (s.sdk2 || s.mode_on) return false;
+	bool stale = g_fsr_window_changing.load(std::memory_order_acquire);
+	if (stale) {
+		// (The window's size is final when it is done: one new swapchain, not one for each step. At most a second.)
+		for (int i = 0; i < 1000 && g_fsr_window_changing.load(std::memory_order_acquire); ++i) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	} else {
+		// (Minimized the surface is 0 x 0: nothing to make a swapchain for, and its images come back with the window.)
+		vk::SurfaceCapabilitiesKHR surface {};
+		const auto                 extent = s.graphics->physical_device.getSurfaceCapabilitiesKHR(s.surface, &surface) == vk::Result::eSuccess
+		                                        ? surface.currentExtent
+		                                        : vk::Extent2D {};
+		stale = extent.width != 0 && extent.height != 0 && extent != s.display;
+	}
+	if (static bool reported = false; stale && !std::exchange(reported, true)) {
+		std::printf("Frame generation: FSR's swapchain made again before a present it would have lost\n");
+		std::fflush(stdout);
+	}
+	return stale;
+}
+#endif
+
 vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& present) {
 #ifdef KYTY_FRAMEGEN_FSR
+	if (FsrSwapchainStale()) return vk::Result::eErrorOutOfDateKHR;
 	const VkPresentInfoKHR& info = present;
 	return static_cast<vk::Result>(g_fsr_state.functions.pOutQueuePresentKHR(static_cast<VkQueue>(queue), &info));
 #else
 	(void)queue, (void)present;
 	return vk::Result::eErrorInitializationFailed;
+#endif
+}
+
+void WindowChanging(bool changing) {
+#ifdef KYTY_FRAMEGEN_FSR
+	g_fsr_window_changing.store(changing, std::memory_order_release);
+#else
+	(void)changing;
 #endif
 }
 
