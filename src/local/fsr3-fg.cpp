@@ -1269,7 +1269,22 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	std::lock_guard lock(g_mutex);
 	const auto now    = std::chrono::steady_clock::now();
 	const bool movie  = VideoOut::MoviePlaying() || !VideoOut::PlayerInputSeen(); // (before the first button: the logo and intro)
-	const bool usable = inputs != nullptr && inputs->valid && !movie && !g_fg_failed;
+	const bool usable_now = inputs != nullptr && inputs->valid && !movie && !g_fg_failed;
+	// (11-07 hang: after the F1 menu the TAA pass came and went every other frame and generation was switched on and off
+	// each frame - HUD layer registered and dropped with it - until the device was lost. Generation now comes back on only
+	// after KYTY_FSR3_ON_FRAMES (default 8) frames in a row with inputs; off at once, as before.)
+	static const int on_frames = [] {
+		const char* value = std::getenv("KYTY_FSR3_ON_FRAMES");
+		return value != nullptr && *value != '\0' ? std::max(std::atoi(value), 1) : 8;
+	}();
+	static int  usable_run = 0;
+	static int  flaps      = 0;
+	usable_run             = usable_now ? usable_run + 1 : 0;
+	const bool  usable     = usable_now && (g_generating || usable_run >= on_frames);
+	if (usable_now && !usable && usable_run == 1 && flaps++ < 16) {
+		std::printf("FSR3 FG: inputs back, generation held off until %d frames in a row have them\n", on_frames);
+		std::fflush(stdout);
+	}
 
 	// Per-second line: real frames, the frames shown (real and generated), how many had generation.
 	if (g_stats.start == std::chrono::steady_clock::time_point {}) g_stats.start = now;
