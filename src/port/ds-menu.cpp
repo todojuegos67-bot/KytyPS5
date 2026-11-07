@@ -2699,6 +2699,179 @@ void FreeTexture(ImTextureData*& tex) {
 	tex = nullptr;
 }
 
+// (des-fog-hq) The launcher's ambience: slow volumetric-looking fog and drifting ash, ONLY in the pre-game launcher (its own
+// SDL window and loop, RunStartMenu, before the game starts). Never drawn by the Configurador nor the in-game F1 menu.
+// Everything is a pure function of the launcher's elapsed time (no per-frame state), two small textures generated once
+// (a seamless 512x512 fBm with periodic lattices: no seams; linearly filtered, dithered alpha: no banding) and a soft dot;
+// Shutdown() frees both when the launcher closes (before the renderer backend goes).
+namespace Ambience {
+ImTextureData* g_fog  = nullptr;
+ImTextureData* g_dot  = nullptr;
+bool           g_tried = false;
+Uint64         g_t0    = 0;
+constexpr int  kFog    = 512;
+constexpr int  kDot    = 64;
+constexpr int  kDust   = 240;
+
+uint32_t Hash(uint32_t x) {
+	x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+	return x;
+}
+float Rand01(uint32_t x) {
+	return static_cast<float>(Hash(x) & 0xFFFFFFu) / 16777216.0f;
+}
+// Value noise on a lattice of `period` cells that wraps (tileable), quintic interpolation (C2: no creases).
+float Noise(float x, float y, int period, uint32_t seed) {
+	const int   xi = static_cast<int>(std::floor(x)), yi = static_cast<int>(std::floor(y));
+	const float fx = x - xi, fy = y - yi;
+	const auto  q  = [](float t) { return t * t * t * (t * (t * 6 - 15) + 10); };
+	const auto  v  = [&](int a, int b) {
+        a = ((a % period) + period) % period;
+        b = ((b % period) + period) % period;
+        return Rand01(seed ^ (static_cast<uint32_t>(a) * 73856093u) ^ (static_cast<uint32_t>(b) * 19349663u));
+	};
+	const float u = q(fx), w = q(fy);
+	const float a = v(xi, yi) + (v(xi + 1, yi) - v(xi, yi)) * u;
+	const float b = v(xi, yi + 1) + (v(xi + 1, yi + 1) - v(xi, yi + 1)) * u;
+	return a + (b - a) * w;
+}
+
+void Create() {
+	g_tried = true;
+	g_t0    = SDL_GetPerformanceCounter();
+	std::vector<float> f(static_cast<size_t>(kFog) * kFog);
+	float lo = 1e9f, hi = -1e9f;
+	for (int y = 0; y < kFog; y++)
+		for (int x = 0; x < kFog; x++) {
+			float sum = 0, amp = 1, norm = 0;
+			int   period = 4;
+			for (int o = 0; o < 6; o++) {
+				const float s = static_cast<float>(period) / kFog;
+				sum += amp * Noise(x * s, y * s, period, 0x51u + o * 977u);
+				norm += amp;
+				amp *= 0.5f;
+				period *= 2;
+			}
+			const float n = sum / norm;
+			f[static_cast<size_t>(y) * kFog + x] = n;
+			lo = std::min(lo, n);
+			hi = std::max(hi, n);
+		}
+	g_fog = IM_NEW(ImTextureData)();
+	g_fog->Create(ImTextureFormat_RGBA32, kFog, kFog);
+	auto* px = static_cast<unsigned char*>(g_fog->GetPixels());
+	for (int i = 0; i < kFog * kFog; i++) {
+		float n = (f[i] - lo) / std::max(1e-4f, hi - lo);
+		n       = std::clamp((n - 0.25f) / 0.75f, 0.0f, 1.0f);
+		n       = n * n * (3 - 2 * n); // soft wisps, empty gaps
+		// (triangular dither of +-1 LSB: the low alpha never bands)
+		const float d = Rand01(0xD17Bu + i) + Rand01(0x9E37u + i * 7u) - 1.0f;
+		px[i * 4 + 0] = px[i * 4 + 1] = px[i * 4 + 2] = 255;
+		px[i * 4 + 3] = static_cast<unsigned char>(std::clamp(n * 255.0f + d, 0.0f, 255.0f));
+	}
+	g_fog->UseColors = true;
+	ImGui::RegisterUserTexture(g_fog);
+	g_dot = IM_NEW(ImTextureData)();
+	g_dot->Create(ImTextureFormat_RGBA32, kDot, kDot);
+	auto* dp = static_cast<unsigned char*>(g_dot->GetPixels());
+	for (int y = 0; y < kDot; y++)
+		for (int x = 0; x < kDot; x++) {
+			const float dx = (x + 0.5f) / kDot * 2 - 1, dy = (y + 0.5f) / kDot * 2 - 1;
+			const float r2 = dx * dx + dy * dy;
+			const float a  = r2 >= 1 ? 0.0f : std::exp(-r2 * 4.0f) * (1 - r2);
+			unsigned char* p = dp + (y * kDot + x) * 4;
+			p[0] = p[1] = p[2] = 255;
+			p[3] = static_cast<unsigned char>(a * 255.0f + 0.5f);
+		}
+	g_dot->UseColors = true;
+	ImGui::RegisterUserTexture(g_dot);
+}
+
+void Shutdown() {
+	FreeTexture(g_fog);
+	FreeTexture(g_dot);
+	g_tried = false;
+}
+
+void Linear(ImTextureData* t) {
+	// (the SDL_Renderer backend's texture: bilinear, never nearest — no stair-steps on the upscaled fog)
+	if (t != nullptr && t->GetTexID() != ImTextureID_Invalid)
+		SDL_SetTextureScaleMode(reinterpret_cast<SDL_Texture*>(static_cast<intptr_t>(t->GetTexID())), SDL_ScaleModeLinear);
+}
+
+// One fog layer: the tile (side `tile` px) scrolled by (ox, oy), split at the tile borders (UVs stay in 0..1, the texture
+// wraps seamlessly) and in rows whose vertex alpha follows a vertical profile (denser low, thin at the top).
+void Layer(ImDrawList* dl, float W, float H, float tile, float ox, float oy, ImVec4 rgb, float alpha) {
+	const auto prof = [&](float y) {
+		const float t = std::clamp(y / H, 0.0f, 1.0f);
+		return alpha * (0.35f + 0.65f * t * t);
+	};
+	ox = std::fmod(ox, tile); if (ox < 0) ox += tile;
+	oy = std::fmod(oy, tile); if (oy < 0) oy += tile;
+	dl->PushTexture(g_fog->GetTexRef());
+	constexpr int kRows = 6;
+	for (float ty = -oy; ty < H; ty += tile)
+		for (float tx = -ox; tx < W; tx += tile) {
+			const float x0 = std::max(0.0f, tx), x1 = std::min(W, tx + tile);
+			const float u0 = (x0 - tx) / tile, u1 = (x1 - tx) / tile;
+			const float y0 = std::max(0.0f, ty), y1 = std::min(H, ty + tile);
+			if (x1 <= x0 || y1 <= y0) continue;
+			dl->PrimReserve(kRows * 6, (kRows + 1) * 2);
+			const ImDrawIdx base = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+			for (int r = 0; r <= kRows; r++) {
+				const float y = y0 + (y1 - y0) * r / kRows, v = (y - ty) / tile;
+				const ImU32 c = ImGui::ColorConvertFloat4ToU32({rgb.x, rgb.y, rgb.z, prof(y)});
+				dl->PrimWriteVtx({x0, y}, {u0, v}, c);
+				dl->PrimWriteVtx({x1, y}, {u1, v}, c);
+			}
+			for (int r = 0; r < kRows; r++) {
+				const ImDrawIdx a = static_cast<ImDrawIdx>(base + r * 2);
+				dl->PrimWriteIdx(a); dl->PrimWriteIdx(static_cast<ImDrawIdx>(a + 1)); dl->PrimWriteIdx(static_cast<ImDrawIdx>(a + 3));
+				dl->PrimWriteIdx(a); dl->PrimWriteIdx(static_cast<ImDrawIdx>(a + 3)); dl->PrimWriteIdx(static_cast<ImDrawIdx>(a + 2));
+			}
+		}
+	dl->PopTexture();
+}
+
+void Draw(ImDrawList* dl, float W, float H, float unit) {
+	if (!g_tried) Create();
+	if (g_fog == nullptr || g_dot == nullptr || W <= 0 || H <= 0) return;
+	Linear(g_fog);
+	Linear(g_dot);
+	const double t  = static_cast<double>(SDL_GetPerformanceCounter() - g_t0) / static_cast<double>(SDL_GetPerformanceFrequency());
+	const float  tf = static_cast<float>(std::fmod(t, 36000.0)); // (wraps every 10 h; well before float precision goes)
+	// Fog: three layers, far = larger and slower (parallax), cold grey-blue, low alpha (the text stays readable).
+	const float S = std::max(W, H);
+	Layer(dl, W, H, S * 1.55f, tf * 6.0f, tf * 1.2f + 37.0f, {0.62f, 0.67f, 0.74f}, 0.10f);
+	Layer(dl, W, H, S * 1.10f, tf * 11.0f + 400.0f, -tf * 1.8f, {0.68f, 0.72f, 0.78f}, 0.085f);
+	Layer(dl, W, H, S * 0.80f, -tf * 17.0f + 900.0f, tf * 2.6f + 250.0f, {0.74f, 0.77f, 0.82f}, 0.06f);
+	// Ash: depth z (0 far .. 1 near) sets size, speed, brightness and softness (the near ones are larger, blurrier, fainter).
+	dl->PushTexture(g_dot->GetTexRef());
+	for (int i = 0; i < kDust; i++) {
+		const uint32_t s  = 0xA5u + i * 131u;
+		const float    z  = Rand01(s);
+		const float    sp = 0.25f + 0.75f * z;
+		const float    x0 = Rand01(s + 1) * W, y0 = Rand01(s + 2) * H;
+		const float    ph = Rand01(s + 3) * 6.2831853f;
+		float          x  = x0 + tf * (6.0f + 10.0f * Rand01(s + 4)) * sp * unit + std::sin(tf * 0.23f + ph) * 18.0f * sp * unit;
+		float          y  = y0 - tf * (4.0f + 9.0f * Rand01(s + 5)) * sp * unit + std::sin(tf * 0.31f + ph * 1.7f) * 10.0f * sp * unit;
+		const float    m  = 20.0f * unit;
+		x = std::fmod(x + m, W + 2 * m); if (x < 0) x += W + 2 * m; x -= m;
+		y = std::fmod(y + m, H + 2 * m); if (y < 0) y += H + 2 * m; y -= m;
+		const float r       = (1.6f + 7.0f * z * z) * unit;
+		const float flicker = 0.75f + 0.25f * std::sin(tf * (0.8f + 1.7f * Rand01(s + 6)) + ph);
+		const float a       = (0.10f + 0.30f * (1 - std::abs(z - 0.45f) * 1.4f)) * flicker;
+		if (a <= 0.01f) continue;
+		const bool  ember = Rand01(s + 7) < 0.08f;
+		const ImU32 c     = ember ? ImGui::ColorConvertFloat4ToU32({1.0f, 0.70f, 0.45f, a * 0.8f})
+		                          : ImGui::ColorConvertFloat4ToU32({0.82f, 0.84f, 0.88f, a});
+		dl->PrimReserve(6, 4);
+		dl->PrimRectUV({x - r, y - r}, {x + r, y + r}, {0, 0}, {1, 1}, c);
+	}
+	dl->PopTexture();
+}
+} // namespace Ambience
+
 // The tooltip of the last item (the launcher's ToolTip: on hover, after a short pause; also on disabled rows).
 void Tip(const char* tip) {
 	if (tip == nullptr || *tip == '\0') return;
@@ -3713,6 +3886,7 @@ void DrawLauncher(float width, float height) {
 			bg->AddRectFilledMultiColor({0, y0 + h - U(60)}, {width, y0 + h}, IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255));
 		}
 	}
+	Ambience::Draw(bg, width, height, g_unit); // (des-fog-hq) the launcher only
 	if (ImFont* f = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont(); f != nullptr) {
 		// (ds-pc-port39) The fork's credit at the window's top-right corner, tight to it (margin 11 px x the unit, right-aligned
 		// by its measured width), small and subtle with a soft shadow; on the foreground list: above the Opciones column.
@@ -5928,6 +6102,7 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		ImGui::UnregisterUserTexture(g_background);
 		IM_DELETE(g_background);
 	}
+	Ambience::Shutdown(); // (des-fog-hq) fog and ash freed before the game starts
 	FreeTexture(g_knight);
 	g_knight_tried = false;
 	g_font_body = g_font_semi = g_font_serif = nullptr;
