@@ -3206,8 +3206,8 @@ void LauncherPerformance(Settings& s) {
 	const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
 	{ // (port28) always shown and usable; off by default
 		const float y = RowY();
-		LCheck(y, "Mejoras para equipos de 16 GB de RAM", s.ram16_boost,
-		       "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Pensado para PCs de 16 GB de RAM. No cambia los gráficos.");
+		LCheck(y, "Modo para PCs con 16 GB de RAM", s.ram16_boost,
+		       "Usa la memoria con más cuidado: reserva 6 GB fijos para el juego y la carga anticipada de datos espera si queda poca RAM libre. Evita cierres y tirones fuertes por falta de memoria. No cambia los gráficos y normalmente no cuesta FPS. Actívalo si tu PC tiene 16 GB de RAM o menos; con 32 GB no hace falta.");
 		RowEnd(y);
 		if (small && s.ram16_boost) {
 			const float ny = RowY();
@@ -3219,8 +3219,8 @@ void LauncherPerformance(Settings& s) {
 	s.profile16 = LowRam(s, g_rt.pc);
 	{
 		const float y = RowY();
-		LCheck(y, "Modo GPU seguro", s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.", 12);
-		LCheck(y, "Todos los CCD (Ryzen)", s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.", 216);
+		LCheck(y, "Modo seguro", s.safe_gpu, "Apaga una forma más rápida de mandar trabajo a la gráfica. Es más estable en gráficas o drivers que se cuelgan o dan pantallazo azul, pero cuesta mucho: unos 37 % menos de FPS. Déjalo apagado salvo que el juego se te cuelgue o te dé pantallazos.", 12);
+		LCheck(y, "Todos los núcleos", s.all_ccds, "Solo para Ryzen con dos bloques de núcleos (CCD), como un 7950X3D o un 5900X; en otros procesadores no cambia nada. Apagado: el juego usa solo el bloque con más caché (memoria rápida dentro del procesador), que suele dar más FPS y menos tirones. Encendido: usa todos los núcleos. Déjalo apagado salvo que notes que encendido te va mejor.", 216);
 		RowEnd(y);
 	}
 	{
@@ -3230,23 +3230,23 @@ void LauncherPerformance(Settings& s) {
 		dl->AddLine({g_lbox.at.x + U(12), y}, {g_lbox.at.x + g_lbox.w - U(12), y}, IM_COL32(222, 196, 140, 60), 1.0f);
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(6)});
 		ImGui::TextColored(kGoldL, "%s", I18n::T("Opciones de rendimiento"));
-		Tip("Mejoras experimentales de KytyPS5 (upstream). Todas desactivadas = como siempre. Se aplican al iniciar el juego.");
+		Tip("Ajustes experimentales que buscan más FPS o menos tirones de distintas formas. Todos apagados = el juego va como siempre. La ganancia suele ser pequeña y depende de tu PC: prueba uno a uno. Se aplican al iniciar el juego. Si algo va mal, apágalos.");
 		RowEnd(y, 30);
 	}
-	LCheckRow("Registros PM4 directos", s.perf_pm4_regfile,
-	          "Guarda directamente los registros de la GPU que no necesitan procesarse (comprobado al empezar). Menos trabajo de CPU por dibujo. Experimental (KYTY_PM4_REGFILE).");
-	LCheckRow("Subidas a la GPU en dos hilos", s.perf_upload_lanes,
-	          "Reparte la protección de memoria de las subidas a la GPU entre dos hilos. Ayuda en zonas con mucha carga de texturas en CPUs de 8 núcleos o más. Experimental (KYTY_UPLOAD_LANES).");
-	LCheckRow("El render ayuda con las subidas", s.perf_upload_help,
-	          "Si la CPU va cargada, el hilo de render hace él mismo las subidas pendientes en vez de esperar. Bueno en CPUs de 4-6 núcleos y portátiles (KYTY_UPLOAD_HELP).");
-	LCheckRow("Hilos sin espera activa con CPU cargada", s.perf_spin_gate,
-	          "Los hilos de ayuda dejan de girar en vacío cuando quedan menos de 3 núcleos libres, dejando la CPU al juego. Para CPUs justas (KYTY_SPIN_GATE).");
-	LCheckRow("Copias de la GPU anticipadas", s.perf_eager_feedback,
-	          "Devuelve a la memoria del juego las copias ya terminadas de la GPU antes de que las pida, evitando esperas. Puede quitar tirones. Experimental (KYTY_EAGER_FEEDBACK).");
-	LCheckRow("Copias de la GPU agrupadas", s.perf_feedback_batch,
-	          "Graba juntas las copias de la GPU de cada bloque de comandos en vez de una a una. Experimental (KYTY_FEEDBACK_BATCH).");
-	LCheckRow("Shaders lane-local ampliados", s.perf_lane_wide,
-	          "Más shaders de cálculo se traducen en su forma rápida. Cambia esos shaders: la primera vez se vuelven a compilar (algo de carga al empezar). Experimental (KYTY_LANE_LOCAL_WIDE).");
+	LCheckRow("Menos trabajo por cada dibujo", s.perf_pm4_regfile,
+	          "El juego manda a la gráfica miles de órdenes en cada imagen. Con esto, los ajustes sencillos que no hace falta traducir se apuntan directamente, sin pasar por el traductor. Ahorra algo de procesador: puede dar unos pocos FPS más si tu procesador es lo que te limita. No cambia la imagen. Experimental: si ves fallos gráficos, apágalo.");
+	LCheckRow("Enviar texturas con dos hilos", s.perf_upload_lanes,
+	          "Cuando llegan texturas y datos nuevos a la gráfica, parte de su preparación se reparte entre dos hilos (tareas que el procesador hace a la vez) en vez de uno. Puede quitar tirones en zonas con mucha carga de texturas. Útil con procesadores de 8 núcleos o más; con menos núcleos puede no notarse. Experimental.");
+	LCheckRow("Ayuda extra si el procesador va justo", s.perf_upload_help,
+	          "Cuando el procesador va muy ocupado, el hilo que dibuja cada imagen hace él mismo los envíos de texturas pendientes en vez de quedarse esperando. En procesadores de 4 a 6 núcleos y portátiles puede dar unos FPS más (en pruebas, hasta un 4 %). Con un procesador sobrado casi nunca actúa: ahí da igual.");
+	LCheckRow("Liberar el procesador cuando va saturado", s.perf_spin_gate,
+	          "Unos hilos de ayuda del emulador esperan trabajo dando vueltas sin parar (gastan procesador sin hacer nada útil). Con esto dejan de hacerlo cuando quedan menos de 3 núcleos libres, y ese procesador vuelve al juego. En procesadores de 4 a 6 núcleos reduce bastante los bajones de FPS y los tirones. Con muchos núcleos casi nunca actúa. Recomendado en portátiles y PCs modestos.");
+	LCheckRow("Devolver antes las copias de la gráfica", s.perf_eager_feedback,
+	          "Cuando la gráfica termina una copia de datos que el juego leerá después, se le devuelve en cuanto está lista en vez de esperar a que la pida. Así el juego no se queda esperando: puede quitar algunos tirones. No cambia la imagen. Experimental: si notas fallos, apágalo.");
+	LCheckRow("Agrupar las copias de la gráfica", s.perf_feedback_batch,
+	          "Esas mismas copias de datos de la gráfica se preparan juntas, por bloques, en vez de una a una. Un poco menos de trabajo para el procesador; la ganancia es pequeña. No cambia la imagen. Experimental: si notas fallos, apágalo.");
+	LCheckRow("Traducción rápida para más efectos", s.perf_lane_wide,
+	          "Más programas de efectos del juego (shaders: los pequeños programas que usa la gráfica para calcular y dibujar) se traducen a una versión más rápida. Puede dar algo más de FPS en la gráfica. La primera vez que lo actives esos shaders se vuelven a preparar: más carga y algún tirón al empezar. Experimental: si ves fallos gráficos, apágalo.");
 	BoxEnd();
 }
 
