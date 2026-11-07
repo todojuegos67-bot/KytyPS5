@@ -3,6 +3,7 @@
 
 #include "commands.h"
 #include "game.h"
+#include "keyboard_editor.h"
 #include "platform.h"
 
 #include <atomic>
@@ -38,9 +39,10 @@ public:
 	void Activated();
 
 	[[nodiscard]] bool WantsClose() const { return close_; }
-	// (--screenshot.)
-	void               ShowPage(int index) { page_ = index; }
+	// (--screenshot: the pages, then the keyboard controls editor over the Game page.)
+	void               ShowPage(int index);
 	static int         PageCount() { return 7; }
+	static int         ScreenshotCount() { return PageCount() + 1; }
 	static const char* PageName(int index);
 
 	// Called from other threads when their work is done: wakes the window up (an SDL user event).
@@ -111,6 +113,7 @@ private:
 	LauncherContext& context_;
 	Commands         commands_;
 	SDL_Renderer*    renderer_;
+	KeyboardEditor   keyboard_editor_; // Game page: Keyboard controls
 
 	ImFont* sans_          = nullptr;
 	ImFont* serif_         = nullptr;

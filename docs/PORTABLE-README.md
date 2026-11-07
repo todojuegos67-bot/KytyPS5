@@ -362,7 +362,7 @@ There are two levels of preparation, both specific to the graphics card and driv
 
 ## Controls
 
-The Windows launcher also offers **Game → Keyboard and mouse prompts**, off by default.
+The launchers (Windows and Linux) also offer **Game → Keyboard and mouse prompts**, off by default.
 For an extracted PPSA01341 v1.07 game folder, it applies 22 English key/mouse icons and matching
 keyboard/mouse bindings on Play. **Game → Keyboard controls → Edit controls…** lets you change
 keys, mouse buttons, wheel directions and sensitivity; the prompts follow the saved layout.

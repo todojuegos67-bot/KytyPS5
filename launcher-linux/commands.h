@@ -43,6 +43,14 @@ public:
 	static bool AutoHdOutput(const std::string& resolution, bool fullscreen,
 	                         const std::string& ratio, int display);
 
+	// The Game page's "Keyboard and mouse prompts": the 22 button icons of the game folder swapped
+	// for key caps that match the saved layout (or the originals put back when the option is off),
+	// as Play needs it done before the emulator starts (launcher-windows' StartPlay). Empty when done,
+	// else why not (the text is shown as it is). Plays are the only caller: --dry-run changes nothing.
+	[[nodiscard]] std::string ApplyKeyboardPrompts() const;
+	// Whether the option is on, and the saved layout is usable ("" or why not): --dry-run's report.
+	[[nodiscard]] std::string KeyboardPromptsReport() const;
+
 	// direct (--play, a start from Steam or a shortcut): no window waits for a key afterwards.
 	[[nodiscard]] Launch Play(const GameInfo& game, bool direct) const;
 	// mode: "" (every shader), "--export-hints".

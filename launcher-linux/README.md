@@ -44,6 +44,8 @@ can ask y/N and for the sudo password.
 | | AMD FSR 3 frame generation | `KYTY_FRAMEGEN=1`, `KYTY_FRAMEGEN_BACKEND=fsr` |
 | Game | Console language | `--console-language` |
 | | Audio output | `KYTY_AUDIO_OUTPUT` |
+| | Keyboard and mouse prompts | key-cap icons in the game folder, and `--keymap` pairs added last (see below) |
+| | Keyboard controls | the editor of the layout (Edit controls…) |
 | | Cheats | `--game-patch _Patches/<title id>.json`; Choose… sets the mods' `enabled` flags |
 | Shaders | Precompile, Quick, efficiency cores | `precompile-linux.sh --game … [--quick] [--cpus <E-cores>]` |
 | | Export shader hints | `precompile-linux.sh --export-hints` |
@@ -66,3 +68,30 @@ one is installed, else a built-in one.
 
 The Windows launcher's red-zone protection, Streamline folder and "Keep memory resident" are Windows-only and not shown;
 their keys stay in the file.
+
+## Keyboard and mouse prompts
+
+The same feature as the Windows launcher's (Game → Keyboard and mouse prompts, off by default), for an
+extracted Demon's Souls game folder (PPSA01341 01.007.000; a ZArchive is refused). On **Play** (or `--play`) it
+swaps the 22 button icons in `ui/textures/buttonicons/_ps5` for English key caps and adds the layout's
+`--keymap` pairs after the Advanced page's own options; off, the originals are put back on the next Play.
+`launch.json` is never rewritten. **Keyboard controls → Edit controls…** opens the editor: click an action, press a
+key, a mouse button or the wheel; an input another action has swaps the two; F7, F8, F11 and Pause are the
+emulator's. The layout is saved as `keyboard_binding_<control>` and `keyboard_mouse_sensitivity` in
+`launcher-settings.json`, the Windows launcher's keys, so one file serves both.
+
+The originals are checked by SHA-256 and kept in `.kyty-keyboard-prompts-v1` inside the game folder (the same
+folder and files as the Windows launcher's: a game folder used from both keeps working). A modified, missing or
+damaged icon stops the whole batch before anything is written; a failed write is rolled back; the emulator must not
+be running. Links inside the game folder are refused (the game folder itself may be a link), and the folder names
+are matched ignoring case. The pack (the textures, the blank template, the pixel map: `launcher-windows/KeyboardPrompts`)
+is linked into the program, so nothing is installed.
+
+Custom key caps are drawn with the desktop's bold sans font (fontconfig's `sans-serif:bold`; DejaVu Sans, Liberation
+Sans or Noto Sans work, a CFF/OpenType-only font does not) to look like the pack's own icons; without a usable TrueType
+font only the default layout's icons can be applied, and the editor says so.
+
+`--dry-run` reports the option (`prompts:`) and prints the `--keymap` pairs it would pass; it changes no file.
+`--screenshot` also draws the editor (`keyboard-controls`). The tests need no game or ImGui:
+`cmake --build <build> --target kyty_launcher_prompts_tests && ctest -R launcher_keyboard_prompts`
+(configured with `-DBUILD_TESTING=ON`).

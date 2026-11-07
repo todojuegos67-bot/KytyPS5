@@ -101,6 +101,7 @@ int main(int argc, char* argv[]) {
 		std::printf("dlss:       %s\n", context.DlssAvailable() ? context.DlssLibrary().c_str()
 		                                : context.rtx ? "no libkyty_dlss.so (get-dlss-linux.sh)"
 		                                              : "no NVIDIA RTX graphics card");
+		std::printf("prompts:    %s\n", commands.KeyboardPromptsReport().c_str());
 		std::printf("e-cores:    %s\nterminal:   %s\ngame:       %s %s %s\n\n",
 		            context.efficiency_cpus.empty() ? "-" : context.efficiency_cpus.c_str(),
 		            context.ChosenTerminal() != nullptr ? context.ChosenTerminal()->name.c_str()
@@ -117,6 +118,15 @@ int main(int argc, char* argv[]) {
 		const auto game =
 		    GameInfo::Read(context.settings->Str("game"), context.precompile_tool, context.root);
 		if (game.Found() && !context.emulator.empty()) {
+			// The keyboard prompts' icons first (a Play of the window does the same): a failure is
+			// shown, as the Windows launcher's message box, and nothing starts.
+			if (const auto problem = commands.ApplyKeyboardPrompts(); !problem.empty()) {
+				std::fprintf(stderr, "kyty_launcher: %s\n", problem.c_str());
+				if (video)
+					SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "KytyPS5", problem.c_str(), nullptr);
+				if (video) SDL_Quit();
+				return 1;
+			}
 			if (video) SDL_Quit();
 			// (Steam counts the game as running while this process lasts.)
 			return commands.RunDirect(commands.Play(game, true), true);
@@ -232,7 +242,7 @@ int main(int argc, char* argv[]) {
 					std::fprintf(stderr, "kyty_launcher: %s not saved (%s)\n", file.c_str(),
 					             SDL_GetError());
 				shot_frames = 0;
-				if (++shot >= LauncherWindow::PageCount())
+				if (++shot >= LauncherWindow::ScreenshotCount())
 					done = true;
 				else
 					launcher.ShowPage(shot);
