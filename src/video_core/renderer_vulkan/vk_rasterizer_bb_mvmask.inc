@@ -149,7 +149,7 @@ void BBMvMask(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eNone,
                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
         cmd.clearColorImage(g_bb.mvm_dummy.image, vk::ImageLayout::eGeneral,
-                            vk::ClearColorValue{std::array<u32, 4>{0u, 0u, 0u, 0u}},
+                            vk::ClearColorValue{.uint32 = std::array<u32, 4>{0u, 0u, 0u, 0u}},
                             vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
     }
     for (OwnImage* img : {&g_bb.mvm_blocks, &g_bb.mvm_cls}) {
