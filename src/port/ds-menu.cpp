@@ -3462,7 +3462,7 @@ void LauncherAjustes(Settings& s) {
 		}
 	}
 	LCheckRow("Copia de las partidas al arrancar", s.backup_saves, "Copia _SaveData en _SaveData-copias cada vez que pulsas JUGAR.");
-	LCheckRow("Niebla y brasas en el lanzador", s.launcher_fog, "Niebla animada y brasas, ceniza y luces de alma flotando sobre la ilustración de este lanzador. Desactívalo si prefieres la imagen quieta.");
+	LCheckRow("Niebla y polvo en el lanzador", s.launcher_fog, "Niebla volum\xC3\xA9trica animada y motas de polvo en suspensi\xC3\xB3n sobre la ilustraci\xC3\xB3n de este lanzador. Desact\xC3\xADvalo si prefieres la imagen quieta.");
 	// (ds-pc-port37) "Continuar donde lo dejé (F1)" removed (the owner asked).
 	{
 		const float y = RowY();
@@ -3671,36 +3671,27 @@ void DrawHourglass(ImDrawList* dl, ImVec2 c, float h, double t) {
 	dl->AddLine(P(-hw * 1.4f, hh), P(hw * 1.4f, hh), frame, std::max(2.0f, h * 0.10f));
 }
 
-// ---- (des-upstream-1106) The launcher's "living illustration": volumetric fog drifting in parallax layers over the
-// ground of fondo-launcher.jpg, and embers, ash and soul lights rising from it with a soft glow. All on the background
-// draw list, under every window (the menus are never covered); nothing above the ground line, where the logo is (the
-// logo's corner of the art is also left out explicitly). Two small textures made once on the CPU (a horizontally
-// tileable fog of value noise, a round glow); about 90 quads a frame. It fades in over two seconds and stops with
-// settings.ini lanzador_niebla=0 (Ajustes > "Niebla y brasas en el lanzador"). ----
+// ---- (des-launcherfog-1108) The launcher's "living illustration": only a volumetric fog and fine dust in suspension
+// (no embers, no warm floating lights). The fog is two CPU-made tileable textures of domain-warped multi-octave noise
+// (a billowy bank and a fine wisp detail), drawn in seven parallax depth layers that drift slowly in opposite
+// directions and breathe, plus a cold soft haze and a few faint cool light shafts. Desaturated grey / blue-white.
+// The dust: tiny pale specks with a Brownian (random-walk) drift and a depth of field (near ones bigger and softer).
+// All on the background draw list, under every window (the menus are never covered); the logo's corner is left
+// out. Fades in over two seconds; settings.ini lanzador_niebla=0 turns it off. ----
 namespace Ambience {
 
-ImTextureData* g_fog  = nullptr; // 512 x 128, white, alpha = fog density (tileable along x)
-ImTextureData* g_glow = nullptr; // 64 x 64, white, a soft round falloff
-ImTextureData* g_ray  = nullptr; // 64 x 256, white, a light shaft (soft sides, fading toward its end)
-double         g_start = -1.0;
+ImTextureData* g_fog    = nullptr; // 512 x 192, white, alpha = billowy fog density (tileable along x)
+ImTextureData* g_wisp   = nullptr; // 512 x 128, white, alpha = fine wisps (tileable along x)
+ImTextureData* g_glow   = nullptr; // 64 x 64, white, a soft round falloff
+ImTextureData* g_ray    = nullptr; // 64 x 256, white, a light shaft (soft sides, fading toward its end)
+double         g_start  = -1.0;
 
-struct Particle {
-	float x, y;   // in the art's 0..1 coordinates
-	float vx, vy; // per second
-	float size;   // in units of the art's height
-	float life, age;
-	float phase;
-	int   kind;   // 0 ember, 1 ash, 2 soul light
-	float depth;  // (1106b) 0 far .. 1 near: near ones larger, softer (a depth blur) and faster
-	float bright; // (1106b) 0.6 .. 1.2
-};
-std::vector<Particle> g_particles;
-// (1106b) Dust motes: many tiny softly lit specks drifting slowly in the light.
+// Dust motes: x, y in the art's 0..1 coordinates; a velocity that random-walks (Brownian drift).
 struct Mote {
-	float x, y, vx, vy, size, phase, bright;
+	float x, y, vx, vy, size, phase, bright, depth;
 };
 std::vector<Mote> g_motes;
-uint32_t              g_rng = 0x9E3779B9u;
+uint32_t          g_rng = 0x9E3779B9u;
 
 float Rand() {
 	g_rng ^= g_rng << 13;
@@ -3719,10 +3710,21 @@ float Hash(int x, int y, int period) {
 float Noise(float x, float y, int period) {
 	const int   xi = static_cast<int>(std::floor(x)), yi = static_cast<int>(std::floor(y));
 	const float fx = x - xi, fy = y - yi;
-	const float sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+	const float sx = fx * fx * fx * (fx * (fx * 6 - 15) + 10), sy = fy * fy * fy * (fy * (fy * 6 - 15) + 10); // (quintic)
 	const float a = Hash(xi, yi, period), b = Hash(xi + 1, yi, period);
 	const float c = Hash(xi, yi + 1, period), d = Hash(xi + 1, yi + 1, period);
 	return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+}
+
+// Fractal noise, periodic along x over `W` pixels (`cells` per width, doubled each octave), in 0..1.
+float Fbm(float x, float y, int W, int cells, int octaves, float seed) {
+	float v = 0, amp = 0.5f, sum = 0;
+	for (int o = 0; o < octaves; o++, cells *= 2, amp *= 0.5f) {
+		const float k = static_cast<float>(cells) / W;
+		v += amp * Noise(x * k, y * k + seed + o * 31.7f, cells);
+		sum += amp;
+	}
+	return v / sum;
 }
 
 ImTextureData* MakeTexture(int w, int h, const std::function<uint8_t(int, int)>& alpha) {
@@ -3741,23 +3743,31 @@ ImTextureData* MakeTexture(int w, int h, const std::function<uint8_t(int, int)>&
 
 void Ensure() {
 	if (g_fog == nullptr) {
-		constexpr int W = 512, H = 128;
+		constexpr int W = 512, H = 192;
 		g_fog = MakeTexture(W, H, [](int x, int y) {
-			// Four octaves of value noise, periodic along x (the cells per width a whole number at every octave).
-			float v = 0, amp = 0.55f, sum = 0;
-			int   cells = 6;
-			for (int o = 0; o < 4; o++, cells *= 2, amp *= 0.5f) {
-				const float k = static_cast<float>(cells) / W;
-				v += amp * Noise(x * k, y * k * 1.6f + o * 17.0f, cells);
-				sum += amp;
-			}
-			v /= sum;
-			float d = std::clamp((v - 0.32f) / 0.5f, 0.0f, 1.0f);
-			d       = d * d * (3 - 2 * d);
-			// Soft at the top and bottom of the strip, a little denser toward its bottom.
-			const float fy   = (y + 0.5f) / H;
-			const float edge = std::sin(fy * 3.14159265f);
-			return static_cast<uint8_t>(std::clamp(d * edge * edge * (0.6f + 0.4f * fy) * 255.0f, 0.0f, 255.0f));
+			// Domain warp: the coordinates pushed by a coarse noise (periodic along x too), then six octaves; billowy
+			// (the density's curve), denser toward the bottom, soft at the top and bottom of the strip.
+			const float wx = (Fbm(x, y, W, 3, 3, 5.0f) - 0.5f) * 90.0f;
+			const float wy = (Fbm(x, y, W, 3, 3, 47.0f) - 0.5f) * 40.0f;
+			const float v  = Fbm(x + wx, (y + wy) * 1.5f, W, 4, 6, 0.0f);
+			float       d  = std::clamp((v - 0.30f) / 0.45f, 0.0f, 1.0f);
+			d              = d * d * (3 - 2 * d);
+			const float fy = (y + 0.5f) / H;
+			const float e  = std::sin(fy * 3.14159265f);
+			return static_cast<uint8_t>(std::clamp(std::pow(d, 1.25f) * e * e * (0.55f + 0.45f * fy) * 255.0f, 0.0f, 255.0f));
+		});
+	}
+	if (g_wisp == nullptr) {
+		constexpr int W = 512, H = 128;
+		g_wisp = MakeTexture(W, H, [](int x, int y) {
+			// Stretched, ridged wisps (1 - |2n - 1|), warped: thin drifting tendrils over the banks.
+			const float wx = (Fbm(x, y, W, 4, 2, 91.0f) - 0.5f) * 60.0f;
+			const float n  = Fbm(x + wx, y * 2.6f, W, 6, 5, 13.0f);
+			float       r  = 1.0f - std::fabs(2.0f * n - 1.0f);
+			r              = std::clamp((r - 0.55f) / 0.45f, 0.0f, 1.0f);
+			const float fy = (y + 0.5f) / H;
+			const float e  = std::sin(fy * 3.14159265f);
+			return static_cast<uint8_t>(std::clamp(r * r * e * 255.0f, 0.0f, 255.0f));
 		});
 	}
 	if (g_ray == nullptr) {
@@ -3782,40 +3792,22 @@ void Ensure() {
 
 void Free() {
 	FreeTexture(g_fog);
+	FreeTexture(g_wisp);
 	FreeTexture(g_glow);
 	FreeTexture(g_ray);
-	g_particles.clear();
 	g_motes.clear();
 	g_start = -1.0;
 }
 
-void Spawn(Particle& p, bool anywhere) {
-	const float r = Rand();
-	p.kind        = r < 0.55f ? 0 : r < 0.85f ? 1 : 2;
-	p.x           = Rand();
-	p.y           = anywhere ? 0.45f + Rand() * 0.55f : 0.92f + Rand() * 0.1f;
-	p.vx          = (Rand() - 0.5f) * 0.012f + 0.006f;
-	p.vy          = p.kind == 1 ? -(0.008f + Rand() * 0.012f) : -(0.015f + Rand() * 0.03f);
-	p.size        = p.kind == 2 ? 0.0035f + Rand() * 0.003f : p.kind == 1 ? 0.0018f + Rand() * 0.0018f : 0.0015f + Rand() * 0.002f;
-	p.life        = 8.0f + Rand() * 10.0f;
-	p.age         = anywhere ? Rand() * p.life * 0.7f : 0.0f;
-	p.phase       = Rand() * 6.2831853f;
-	p.depth       = Rand() * Rand(); // (most far, a few near)
-	p.bright      = 0.6f + Rand() * 0.6f;
-	const float nearer = 1.0f + p.depth * 2.2f;
-	p.size *= nearer;
-	p.vx *= 0.7f + p.depth;
-	p.vy *= 0.7f + p.depth;
-}
-
 void SpawnMote(Mote& m) {
 	m.x      = Rand();
-	m.y      = 0.30f + Rand() * 0.70f;
-	m.vx     = (Rand() - 0.5f) * 0.006f + 0.002f;
-	m.vy     = (Rand() - 0.6f) * 0.004f;
-	m.size   = 0.0006f + Rand() * Rand() * 0.0016f;
+	m.y      = 0.18f + Rand() * 0.82f;
+	m.vx     = (Rand() - 0.5f) * 0.003f;
+	m.vy     = (Rand() - 0.5f) * 0.003f;
+	m.depth  = Rand() * Rand() * Rand(); // (most far and sharp, a few near and blurred)
+	m.size   = (0.0005f + Rand() * 0.0007f) * (1.0f + m.depth * 4.0f);
 	m.phase  = Rand() * 6.2831853f;
-	m.bright = 0.35f + Rand() * 0.65f;
+	m.bright = 0.45f + Rand() * 0.55f;
 }
 
 // `x0, y0, w, h`: where the art is on the screen.
@@ -3831,128 +3823,108 @@ void Draw(ImDrawList* dl, float x0, float y0, float w, float h, float width, flo
 	// The ground of the art's visible part (a wider screen cuts its bottom).
 	const float bottom = std::min(y0 + h, height);
 	dl->PushClipRect({0, 0}, {width, height}, false);
+	auto with_a = [](ImU32 rgb, float a) {
+		return (rgb & ~IM_COL32_A_MASK) | (static_cast<ImU32>(std::clamp(a, 0.0f, 1.0f) * 255.0f) << IM_COL32_A_SHIFT);
+	};
 
-	// Fog: far layers higher, slower, fainter and bluer; near ones lower, faster and denser.
+	// A cold low haze over the lower art (the air's own density, under the banks).
+	{
+		const float top = y0 + 0.42f * h;
+		dl->AddRectFilledMultiColor({x0, top}, {x0 + w, bottom}, with_a(IM_COL32(150, 162, 178, 0), 0.0f), with_a(IM_COL32(150, 162, 178, 0), 0.0f),
+		                            with_a(IM_COL32(160, 170, 184, 0), 0.20f * fade), with_a(IM_COL32(160, 170, 184, 0), 0.20f * fade));
+	}
+	// Faint cool light shafts (under the fog), from above the castle, slowly breathing and swaying.
+	{
+		static const float shafts[][4] = {{0.55f, 0.18f, 0.040f, 0.0f}, {0.68f, 0.14f, 0.055f, 1.9f}, {0.83f, 0.20f, 0.045f, 3.3f}};
+		const float        lean        = -0.16f * h;
+		for (const auto& sh: shafts) {
+			const float sway = std::sin(t * 0.05f + sh[3]) * 0.010f * w;
+			const float a    = (0.06f + 0.035f * std::sin(t * 0.17f + sh[3] * 1.3f)) * fade;
+			const float cx   = x0 + sh[0] * w + sway, top = y0 + sh[1] * h, bot = std::min(bottom, y0 + 1.02f * h);
+			const float hw0 = sh[2] * w * 0.5f, hw1 = sh[2] * w * 1.7f;
+			if (cx + lean - hw1 < x0 + 0.31f * w && top < y0 + 0.32f * h) continue; // (never over the logo)
+			dl->AddImageQuad(g_ray->GetTexRef(), {cx - hw0, top}, {cx + hw0, top}, {cx + lean + hw1, bot}, {cx + lean - hw1, bot}, {0, 0}, {1, 0},
+			                 {1, 1}, {0, 1}, IM_COL32(214, 226, 240, static_cast<int>(a * 255.0f)));
+		}
+	}
+
+	// Fog: seven depth layers; far ones higher, thinner, slower, fainter and bluer; near ones lower, faster, denser,
+	// paler. Each is the bank drifting one way plus the same bank mirrored drifting slower the other way (the banks
+	// change shape instead of sliding), and fine wisps on the nearer half.
 	struct Layer {
 		float center, thick, speed, alpha, tile;
 		ImU32 rgb;
 	};
-	// (1106b) Clearly visible: denser, thicker banks on wider tiles, a big slow back bank, a cold blue-grey far away and
-	// the art's warm ash tint near (the column and the logo are never covered: windows above, the logo corner below).
 	static const Layer layers[] = {
-	    {0.56f, 0.34f, 0.004f, 0.30f, 2.4f, IM_COL32(128, 146, 170, 0)},
-	    {0.66f, 0.30f, 0.008f, 0.38f, 1.9f, IM_COL32(150, 162, 182, 0)},
-	    {0.76f, 0.32f, 0.013f, 0.46f, 1.5f, IM_COL32(168, 172, 186, 0)},
-	    {0.86f, 0.34f, 0.021f, 0.54f, 1.25f, IM_COL32(186, 180, 176, 0)},
-	    {0.97f, 0.30f, 0.034f, 0.62f, 1.0f, IM_COL32(200, 188, 172, 0)},
+	    {0.50f, 0.28f, 0.0030f, 0.20f, 2.6f, IM_COL32(118, 132, 152, 0)},
+	    {0.58f, 0.30f, 0.0050f, 0.26f, 2.2f, IM_COL32(130, 142, 160, 0)},
+	    {0.66f, 0.32f, 0.0075f, 0.32f, 1.9f, IM_COL32(144, 154, 170, 0)},
+	    {0.74f, 0.34f, 0.0105f, 0.38f, 1.6f, IM_COL32(158, 166, 180, 0)},
+	    {0.82f, 0.34f, 0.0145f, 0.44f, 1.4f, IM_COL32(172, 178, 190, 0)},
+	    {0.90f, 0.32f, 0.0200f, 0.50f, 1.2f, IM_COL32(186, 192, 200, 0)},
+	    {0.99f, 0.30f, 0.0270f, 0.56f, 1.0f, IM_COL32(198, 204, 212, 0)},
 	};
-	// Light shafts first (under the fog), from above the castle down to the ground, slowly breathing and swaying.
-	{
-		static const float shafts[][4] = {{0.50f, 0.20f, 0.030f, 0.0f}, {0.60f, 0.15f, 0.045f, 1.9f}, {0.71f, 0.22f, 0.035f, 3.3f},
-		                                  {0.82f, 0.18f, 0.050f, 4.7f}, {0.92f, 0.25f, 0.032f, 0.8f}};
-		const float lean = -0.18f * h; // (toward the lower left)
-		for (const auto& sh: shafts) {
-			const float sway = std::sin(t * 0.07f + sh[3]) * 0.012f * w;
-			const float a    = (0.10f + 0.06f * std::sin(t * 0.23f + sh[3] * 1.3f)) * fade;
-			const float cx   = x0 + sh[0] * w + sway, top = y0 + sh[1] * h, bot = std::min(bottom, y0 + 1.02f * h);
-			const float hw0 = sh[2] * w * 0.5f, hw1 = sh[2] * w * 1.6f;
-			if (cx + lean - hw1 < x0 + 0.31f * w && top < y0 + 0.32f * h) continue; // (never over the logo)
-			dl->AddImageQuad(g_ray->GetTexRef(), {cx - hw0, top}, {cx + hw0, top}, {cx + lean + hw1, bot}, {cx + lean - hw1, bot},
-			                 {0, 0}, {1, 0}, {1, 1}, {0, 1}, IM_COL32(255, 232, 196, static_cast<int>(a * 255.0f)));
-		}
-	}
 	for (size_t i = 0; i < std::size(layers); i++) {
 		const auto& L      = layers[i];
 		const float band_h = L.thick * h;
 		const float top    = y0 + L.center * h - band_h * 0.5f;
 		if (top >= bottom) continue;
+		const float fi     = static_cast<float>(i);
 		const float tile_w = w * L.tile;
-		// A slow breathing of each layer's density; alternate layers drift the other way.
-		const float breath = 0.80f + 0.20f * std::sin(t * 0.21f + static_cast<float>(i) * 1.7f);
-		const float dir    = (i % 2 == 0) ? 1.0f : -0.6f;
+		const float breath = 0.78f + 0.14f * std::sin(t * 0.19f + fi * 1.7f) + 0.08f * std::sin(t * 0.071f + fi * 2.9f);
+		const float dir    = (i % 2 == 0) ? 1.0f : -0.7f;
+		const float sway   = (std::sin(t * 0.11f + fi) * 0.010f + std::sin(t * 0.037f + fi * 2.1f) * 0.006f) * h;
+		const float a      = L.alpha * breath * fade;
 		float       off    = std::fmod(t * L.speed * w * dir, tile_w);
 		if (off > 0) off -= tile_w;
-		const int   a   = static_cast<int>(std::clamp(L.alpha * breath * fade, 0.0f, 1.0f) * 255.0f);
-		const ImU32 col = (L.rgb & ~IM_COL32_A_MASK) | (static_cast<ImU32>(a) << IM_COL32_A_SHIFT);
-		// A gentle vertical sway, so the layers do not slide as rigid sheets.
-		const float sway = std::sin(t * 0.13f + static_cast<float>(i)) * h * 0.012f;
 		for (float x = x0 + off; x < width; x += tile_w)
-			dl->AddImage(g_fog->GetTexRef(), {x, top + sway}, {x + tile_w, top + sway + band_h}, {0, 0}, {1, 1}, col);
-		// A second, mirrored pass of the same bank drifting slower: the banks change shape instead of sliding.
-		float off2 = std::fmod(t * L.speed * 0.55f * w * -dir + tile_w * 0.37f, tile_w);
+			dl->AddImage(g_fog->GetTexRef(), {x, top + sway}, {x + tile_w, top + sway + band_h}, {0, 0}, {1, 1}, with_a(L.rgb, a));
+		float off2 = std::fmod(t * L.speed * 0.5f * w * -dir + tile_w * (0.37f + 0.13f * fi), tile_w);
 		if (off2 > 0) off2 -= tile_w;
-		const ImU32 col2 = (L.rgb & ~IM_COL32_A_MASK) | (static_cast<ImU32>(a * 0.55f) << IM_COL32_A_SHIFT);
 		for (float x = x0 + off2; x < width; x += tile_w)
-			dl->AddImage(g_fog->GetTexRef(), {x, top - sway + band_h * 0.08f}, {x + tile_w, top - sway + band_h * 1.08f}, {1, 0}, {0, 1}, col2);
+			dl->AddImage(g_fog->GetTexRef(), {x, top - sway + band_h * 0.10f}, {x + tile_w, top - sway + band_h * 1.10f}, {1, 0}, {0, 1},
+			             with_a(L.rgb, a * 0.5f));
+		if (i >= 3) {
+			const float ww = tile_w * 0.8f, wh = band_h * 0.6f;
+			float       o3 = std::fmod(t * L.speed * 1.4f * w * dir + ww * 0.61f, ww);
+			if (o3 > 0) o3 -= ww;
+			const float wt = top + band_h * 0.25f - sway * 0.5f;
+			for (float x = x0 + o3; x < width; x += ww)
+				dl->AddImage(g_wisp->GetTexRef(), {x, wt}, {x + ww, wt + wh}, {0, 0}, {1, 1}, with_a(IM_COL32(210, 216, 224, 0), a * 0.45f));
+		}
 	}
 
-	// Particles: ~90 at 1080 lines, fewer on small windows.
-	const size_t count = static_cast<size_t>(std::clamp(height / 10.0f, 50.0f, 140.0f));
-	if (g_particles.size() != count) {
-		g_particles.resize(count);
-		for (auto& p: g_particles) Spawn(p, true);
+	// Dust in suspension: ~1 per 5 lines, pale grey-white, a random-walk drift (damped), a slow twinkle; near ones
+	// (depth) bigger, softer and fainter (depth of field). The logo's corner (top-left 31 % x 32 %) gets none.
+	const float  logo_r = x0 + 0.31f * w, logo_b = y0 + 0.32f * h;
+	const size_t motes  = static_cast<size_t>(std::clamp(height / 5.0f, 120.0f, 280.0f));
+	if (g_motes.size() != motes) {
+		g_motes.resize(motes);
+		for (auto& m: g_motes) SpawnMote(m);
 	}
-	// The logo's corner of the art (its top-left 31 % x 32 %) gets none.
-	const float logo_r = x0 + 0.31f * w, logo_b = y0 + 0.32f * h;
-	// Dust motes (1106b): ~200 tiny specks, slow, brighter in the shafts' part of the art, a gentle twinkle.
-	{
-		const size_t motes = static_cast<size_t>(std::clamp(height / 5.0f, 120.0f, 260.0f));
-		if (g_motes.size() != motes) {
-			g_motes.resize(motes);
-			for (auto& m: g_motes) SpawnMote(m);
-		}
-		for (auto& m: g_motes) {
-			m.x += (m.vx + std::sin(t * 0.5f + m.phase) * 0.0015f) * dt;
-			m.y += (m.vy + std::cos(t * 0.37f + m.phase) * 0.0012f) * dt;
-			if (m.x > 1.01f || m.x < -0.01f || m.y < 0.28f || m.y > 1.02f) SpawnMote(m);
-			const float sx = x0 + m.x * w, sy = y0 + m.y * h;
-			if (sy > bottom || (sx < logo_r && sy < logo_b)) continue;
-			const float lit  = 0.45f + 0.55f * std::clamp((m.x - 0.40f) / 0.4f, 0.0f, 1.0f); // (the shafts' side)
-			const float tw   = 0.65f + 0.35f * std::sin(t * 1.3f + m.phase * 5.0f);
-			const float a    = m.bright * lit * tw * fade * 0.85f;
-			const float rr   = std::max(1.0f, m.size * h) * 2.2f;
-			dl->AddImage(g_glow->GetTexRef(), {sx - rr, sy - rr}, {sx + rr, sy + rr}, {0, 0}, {1, 1},
-			             IM_COL32(255, 238, 210, static_cast<int>(std::clamp(a, 0.0f, 1.0f) * 255.0f)));
-		}
-	}
-	for (auto& p: g_particles) {
-		p.age += dt;
-		if (p.age >= p.life || p.y < 0.25f) {
-			Spawn(p, false);
+	const float kick = std::sqrt(std::max(dt, 1e-4f)) * 0.0035f;
+	const float damp = std::exp(-dt * 0.6f);
+	for (auto& m: g_motes) {
+		const float sp = 0.6f + m.depth * 1.6f; // (near ones cross the view faster: parallax)
+		m.vx           = m.vx * damp + (Rand() - 0.5f) * kick;
+		m.vy           = m.vy * damp + (Rand() - 0.5f) * kick - 0.00004f * dt; // (an imperceptible lift)
+		m.x += m.vx * sp * dt;
+		m.y += m.vy * sp * dt;
+		if (m.x > 1.01f) m.x -= 1.02f;
+		if (m.x < -0.01f) m.x += 1.02f;
+		if (m.y < 0.16f || m.y > 1.02f) {
+			SpawnMote(m);
 			continue;
 		}
-		const float wob = std::sin(t * (p.kind == 1 ? 0.9f : 1.6f) + p.phase);
-		p.x += (p.vx + wob * 0.004f) * dt;
-		p.y += p.vy * dt;
-		if (p.x > 1.02f) p.x -= 1.04f;
-		if (p.x < -0.02f) p.x += 1.04f;
-		const float sx = x0 + p.x * w, sy = y0 + p.y * h;
+		const float sx = x0 + m.x * w, sy = y0 + m.y * h;
 		if (sy > bottom || (sx < logo_r && sy < logo_b)) continue;
-		// In over the first second, out over the last third; fainter as they climb.
-		const float life_a = std::min(p.age / 1.0f, 1.0f) * std::clamp((p.life - p.age) / (p.life * 0.33f), 0.0f, 1.0f);
-		const float climb  = std::clamp((p.y - 0.25f) / 0.35f, 0.0f, 1.0f);
-		const float flick  = p.kind == 0 ? 0.70f + 0.20f * std::sin(t * 7.0f + p.phase * 3.0f) + 0.10f * std::sin(t * 13.1f + p.phase)
-		                                 : p.kind == 2 ? 0.85f + 0.15f * std::sin(t * 1.7f + p.phase) : 1.0f;
-		// Near ones (depth): larger and softer, so less opaque at their core (a depth blur).
-		const float blur   = 1.0f - 0.55f * p.depth;
-		const float alpha  = std::clamp(life_a * climb * flick * fade * p.bright * blur, 0.0f, 1.0f);
-		if (alpha <= 0.01f) continue;
-		const float r = p.size * h;
-		int         cr, cg, cb;
-		float       core, glow;
-		switch (p.kind) {
-			case 0: cr = 255, cg = 140, cb = 60, core = 0.95f, glow = 0.42f; break;   // ember
-			case 1: cr = 170, cg = 165, cb = 160, core = 0.40f, glow = 0.0f; break;  // ash
-			default: cr = 205, cg = 225, cb = 255, core = 0.80f, glow = 0.32f; break; // soul light
-		}
-		if (glow > 0) {
-			const float g = r * (p.kind == 2 ? 7.0f : 5.0f);
-			dl->AddImage(g_glow->GetTexRef(), {sx - g, sy - g}, {sx + g, sy + g}, {0, 0}, {1, 1},
-			             IM_COL32(cr, cg, cb, static_cast<int>(glow * alpha * 255.0f)));
-		}
-		const float cs = 1.6f + 1.4f * p.depth; // (the near ones' blurred disc)
-		dl->AddImage(g_glow->GetTexRef(), {sx - r * cs, sy - r * cs}, {sx + r * cs, sy + r * cs}, {0, 0}, {1, 1},
-		             IM_COL32(std::min(255, cr + 30), std::min(255, cg + 50), std::min(255, cb + 40), static_cast<int>(core * alpha * 255.0f)));
+		const float tw   = 0.75f + 0.25f * std::sin(t * 0.9f + m.phase * 5.0f);
+		const float blur = 1.0f - 0.6f * m.depth;
+		const float a    = m.bright * tw * blur * fade * 0.80f;
+		const float rr   = std::max(0.9f, m.size * h) * (2.0f + 2.0f * m.depth);
+		const int   g    = 222 + static_cast<int>(m.depth * 18.0f);
+		dl->AddImage(g_glow->GetTexRef(), {sx - rr, sy - rr}, {sx + rr, sy + rr}, {0, 0}, {1, 1},
+		             IM_COL32(g, g + 4, std::min(255, g + 12), static_cast<int>(std::clamp(a, 0.0f, 1.0f) * 255.0f)));
 	}
 	dl->PopClipRect();
 }
