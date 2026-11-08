@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "video_core/renderer_vulkan/bb_present_sr.h"
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -156,6 +158,12 @@ private:
     std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
+    mutable bool bb_jitter_draw = false;
+
+public:
+    BB::SceneDepth bb_scene_depth; // bb-clean-021 (bb_present_sr.h)
+
+private:
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;

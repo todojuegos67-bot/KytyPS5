@@ -22,6 +22,9 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include <algorithm>
+#include <filesystem>
+#include "video_core/bb/bb_upscale.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -270,7 +273,18 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
 
-    static vk::detail::DynamicLoader dl;
+    BB::Upscale::PreInstance();
+    static vk::detail::DynamicLoader dl = [] {
+#ifdef _WIN32
+        if (const wchar_t* loader = BB::Upscale::VulkanLoaderOverride()) {
+            // DLSS with BB_SL_NO_INTERPOSER_LOADER=0: Streamline's interposer is the loader.
+            const std::filesystem::path path{loader};
+            BB::Upscale::Checkpoint(fmt::format("Vulkan loader: {}", path.string()));
+            return vk::detail::DynamicLoader(path.string());
+        }
+#endif
+        return vk::detail::DynamicLoader();
+    }();
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 
@@ -286,14 +300,29 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
-    const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss && BB::SR::Dlss::Manual()) {
+        // (Streamline manual hooking: the instance extensions its features need.)
+        static std::vector<std::string> extra;
+        for (const auto& name : BB::SR::Dlss::RequiredInstanceExtensions()) {
+            if (std::none_of(extensions.begin(), extensions.end(),
+                             [&](const char* e) { return name == e; })) {
+                extra.push_back(name);
+            }
+        }
+        for (const auto& name : extra) {
+            extensions.push_back(name.c_str());
+        }
+    }
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "shadPS4 Vulkan",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-        .apiVersion = available_version,
+        .apiVersion = BB::Upscale::VulkanLoaderOverride() != nullptr
+                          ? std::min<u32>(available_version, VK_API_VERSION_1_3)
+                          : available_version,
     };
 
     const std::string extensions_string = fmt::format("{}", fmt::join(extensions, ", "));
@@ -413,6 +442,9 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+    if (BB::Upscale::VulkanLoaderOverride() != nullptr) {
+        instance_ci_chain.unlink<vk::LayerSettingsCreateInfoEXT>();
+    }
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
     ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",
                vk::to_string(instance_result));

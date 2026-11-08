@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -772,6 +773,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                if (BB::Upscale::Enabled()) {
+                    BB::Upscale::OnConstants(stage.flattened_ud_buf.data(),
+                                             stage.flattened_ud_buf.size());
+                }
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
@@ -1092,12 +1097,35 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.color_attachments[cb] = {};
     }
 
+    bb_jitter_draw = false;
     if (auto image_id = db_desc.image_id; image_id) {
         has_attachment = true;
         auto& desc = db_desc.desc;
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+        if (BB::Upscale::Enabled()) {
+            // bb-clean-021: the scene depth (the presented image's size, depth test on): the
+            // upscaler's depth and the draws that get the sub-pixel jitter.
+            bb_jitter_draw = regs.depth_control.depth_enable &&
+                             image.info.size.width == BB::Upscale::g_scene_w &&
+                             image.info.size.height == BB::Upscale::g_scene_h;
+            if (bb_jitter_draw && regs.depth_control.depth_write_enable) {
+                const auto& vp = regs.viewports[0];
+                const auto& vp_ctl = regs.viewport_control;
+                bb_scene_depth.valid = true;
+                bb_scene_depth.desc = desc;
+                bb_scene_depth.xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
+                bb_scene_depth.xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
+                bb_scene_depth.yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
+                bb_scene_depth.yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
+                bb_scene_depth.zscale = vp_ctl.zscale_enable ? vp.zscale : 1.f;
+                bb_scene_depth.zoffset = vp_ctl.zoffset_enable ? vp.zoffset : 0.f;
+                const auto f = regs.depth_control.depth_func;
+                bb_scene_depth.greater = f == AmdGpu::CompareFunc::Greater ||
+                                         f == AmdGpu::CompareFunc::GreaterEqual;
+            }
+        }
 
         const auto slice = image_view.info.range.base.layer;
         const bool is_depth_clear =
@@ -1400,6 +1428,12 @@ void Rasterizer::UpdateViewportScissorState() const {
 
             viewport.x = xoffset - xscale;
             viewport.y = yoffset - yscale;
+            if (bb_jitter_draw) {
+                float jx = 0.f, jy = 0.f;
+                BB::Upscale::Jitter(jx, jy);
+                viewport.x += jx;
+                viewport.y += jy;
+            }
             viewport.width = xscale * 2.0f;
             viewport.height = yscale * 2.0f;
         }

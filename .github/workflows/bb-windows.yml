@@ -1,0 +1,98 @@
+name: bb-windows
+on:
+  workflow_dispatch:
+  push:
+    branches: [bb-clean-021]
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-2025-vs2026
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        fetch-depth: 1
+    - uses: egor-tensin/vs-shell@v2
+      with: { arch: x64 }
+    - name: Streamline SDK (DLSS)
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        STREAMLINE_VERSION: v2.14.16
+      run: |
+        $zips = '_Build\deps\streamline-zip'
+        $unpacked = '_Build\deps\streamline-unpacked'
+        New-Item -ItemType Directory -Force $zips, $unpacked | Out-Null
+        gh release download $env:STREAMLINE_VERSION --repo NVIDIA-RTX/Streamline --pattern '*.zip' --dir $zips
+        if ($LASTEXITCODE -or !(Get-ChildItem $zips -Filter *.zip)) {
+          git lfs install
+          git clone --depth 1 --branch $env:STREAMLINE_VERSION https://github.com/NVIDIA-RTX/Streamline "$unpacked\repo"
+          if ($LASTEXITCODE) { throw 'Streamline clone failed' }
+          git -C "$unpacked\repo" lfs pull
+          $global:LASTEXITCODE = 0
+        }
+        Get-ChildItem $zips -Filter *.zip | ForEach-Object { Expand-Archive $_.FullName (Join-Path $unpacked $_.BaseName) -Force }
+        $header = Get-ChildItem $unpacked -Recurse -Filter sl.h | Where-Object { $_.Directory.Name -eq 'include' } |
+          Where-Object { Test-Path (Join-Path $_.Directory.Parent.FullName 'bin\x64\sl.interposer.dll') } | Select-Object -First 1
+        if (!$header) { throw 'no include\sl.h with bin\x64\sl.interposer.dll' }
+        New-Item -ItemType Directory -Force _Build\deps\streamline | Out-Null
+        Move-Item $header.Directory.Parent.FullName _Build\deps\streamline\sdk
+        # DLSS-G Preset C (BB_DLSSG_PRESET=C, the default as in Demon's Souls) needs nvngx_dlssg.dll >= 310.9.16:
+        # when Streamline's is older, NVIDIA's from the official DLSS SDK release (as the DS workflow does).
+        $dlssg = '_Build\deps\streamline\sdk\bin\x64\nvngx_dlssg.dll'
+        $have = if (Test-Path $dlssg) { [version](Get-Item $dlssg).VersionInfo.FileVersion.Replace(',', '.').Split(' ')[0] } else { [version]'0.0' }
+        Write-Host "Streamline's nvngx_dlssg.dll: $have"
+        if ($have -lt [version]'310.9.16') {
+          git clone --depth 1 --branch v310.9.16 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS _Build\deps\dlss
+          if ($LASTEXITCODE) { throw 'DLSS SDK clone failed' }
+          git -C _Build\deps\dlss sparse-checkout set --no-cone /lib/Windows_x86_64/rel/nvngx_dlssg.dll /LICENSE.txt
+          $new = '_Build\deps\dlss\lib\Windows_x86_64\rel\nvngx_dlssg.dll'
+          if (!(Test-Path $new)) { throw 'no nvngx_dlssg.dll in the DLSS SDK' }
+          Copy-Item $new $dlssg -Force
+          Write-Host "nvngx_dlssg.dll from DLSS v310.9.16: $((Get-Item $dlssg).VersionInfo.FileVersion)"
+        }
+        # Never shipped: nvngx_dlssnr.dll (not used here).
+        Remove-Item _Build\deps\streamline\sdk\bin\x64\nvngx_dlssnr.dll -ErrorAction SilentlyContinue
+        # Only NVIDIA-signed Streamline files (the emulator checks sl.interposer.dll's signer too).
+        foreach ($f in Get-ChildItem _Build\deps\streamline\sdk\bin\x64 -Filter *.dll) {
+          $sig = Get-AuthenticodeSignature $f.FullName
+          $signer = if ($sig.SignerCertificate) { $sig.SignerCertificate.GetNameInfo('SimpleName', $false) } else { '' }
+          '{0,12:N0}  {1}  {2} {3}' -f $f.Length, $f.Name, $sig.Status, $signer
+          if ($signer -ne 'NVIDIA Corporation') { throw "$($f.Name) is not signed by NVIDIA Corporation" }
+        }
+    - name: Configure
+      run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+    - name: Build
+      shell: pwsh
+      run: |
+        cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS -- -k 0 2>&1 | Tee-Object build.log
+        $code = $LASTEXITCODE
+        if ($code) {
+          Select-String -Path build.log -Pattern 'error: |error [A-Z]+[0-9]+|FAILED: |undefined symbol' |
+            Select-Object -First 40 | ForEach-Object { Write-Output ("::error::" + $_.Line.Substring(0, [Math]::Min(900, $_.Line.Length))) }
+          exit $code
+        }
+    - name: Package
+      shell: pwsh
+      run: |
+        $out = 'out'
+        New-Item -ItemType Directory -Force $out, "$out\LICENSES", "$out\streamline" | Out-Null
+        Copy-Item build\shadPS4.exe $out
+        Copy-Item LICENSE "$out\LICENSES\shadPS4-GPL-2.0.txt"
+        Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"
+        if (Get-ChildItem $out -Recurse -Filter nvngx_dlssnr.dll) { throw 'nvngx_dlssnr.dll must never be shipped' }
+        Copy-Item LICENSES\Streamline-MIT.txt "$out\LICENSES\Streamline-MIT.txt"
+        Copy-Item fsr4_shaders "$out\fsr4_shaders" -Recurse
+        Copy-Item fsr4_shaders\LICENSE-FSR4-v07.txt "$out\LICENSES\FSR4-v07-LICENSE.txt"
+        7z a bb-port-win64.zip ".\$out\*" | Out-Null
+        $h = (Get-FileHash -Algorithm MD5 "$out\shadPS4.exe").Hash.ToLower()
+        $z = (Get-FileHash -Algorithm MD5 bb-port-win64.zip).Hash.ToLower()
+        "$h  out/shadPS4.exe`n$z  bb-port-win64.zip" | Tee-Object md5.txt
+    - name: Draft release
+      shell: bash
+      env: { GH_TOKEN: "${{ github.token }}" }
+      run: |
+        tag="${GITHUB_REF_NAME}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+        gh release create "$tag" bb-port-win64.zip md5.txt --draft --target "$GITHUB_SHA" \
+          --title "$tag (draft, untested)" --notes "Automated draft build of branch ${GITHUB_REF_NAME}. Not a release."

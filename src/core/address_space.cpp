@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <string_view>
 #include <map>
 #include <span>
 #include <vector>
@@ -64,6 +66,18 @@ static constexpr u64 UserSize = USER_MAX - USER_MIN + 1;
 static u64 BackingSize = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO + ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE;
 
 #ifdef _WIN32
+
+// bb-clean-021 (from bb-combo-159): DLSS (NGX) needs ~44 GiB of contiguous free address space
+// below 1 TiB at vkCreateDevice: the guest stops at 512 GiB and a 64 GiB hole above it is held
+// until right before the device is created.
+static void* dlss_hole = nullptr;
+
+void ReleaseDlssAddressHole() {
+    if (dlss_hole != nullptr) {
+        VirtualFree(dlss_hole, 0, MEM_RELEASE);
+        dlss_hole = nullptr;
+    }
+}
 
 [[nodiscard]] constexpr u64 ToWindowsProt(Core::MemoryProt prot) {
     const bool read =
@@ -143,6 +157,19 @@ struct AddressSpace::Impl {
                     Core,
                     "Older Windows version detected, reducing user max to {:#x} to avoid problems",
                     supported_user_max);
+            }
+        }
+
+        if (const char* up = std::getenv("BB_UPSCALER");
+            up != nullptr && (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa")) {
+            constexpr u64 DlssUserMax = 0x8000000000ULL;
+            if (supported_user_max > DlssUserMax) {
+                supported_user_max = DlssUserMax;
+                dlss_hole = VirtualAlloc(reinterpret_cast<PVOID>(DlssUserMax), 64ULL << 30,
+                                         MEM_RESERVE, PAGE_NOACCESS);
+                LOG_INFO(Core, "[BB_UPSCALE] DLSS: guest address space capped at {:#x}, 64 GiB "
+                               "hole {}",
+                         supported_user_max, dlss_hole != nullptr ? "held" : "NOT reserved");
             }
         }
 
@@ -908,3 +935,9 @@ boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
 }
 
 } // namespace Core
+
+#ifndef _WIN32
+namespace Core {
+void ReleaseDlssAddressHole() {}
+} // namespace Core
+#endif

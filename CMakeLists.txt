@@ -1002,6 +1002,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/memory.cpp
          src/core/memory.h
          src/core/module.cpp
+         src/core/bb_respatch.cpp
+         src/core/bb_respatch.h
          src/core/module.h
          src/core/platform.h
          src/core/signals.cpp
@@ -1194,6 +1196,17 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_platform.cpp
                src/video_core/renderer_vulkan/vk_platform.h
                src/video_core/renderer_vulkan/vk_presenter.cpp
+               src/video_core/renderer_vulkan/bb_present_sr.cpp
+               src/video_core/renderer_vulkan/bb_present_sr.h
+               src/video_core/bb/bb_kyty_compat.h
+               src/video_core/bb/bb_sr.h
+               src/video_core/bb/bb_sr_dlss.cpp
+               src/video_core/bb/bb_sr_fsr4.cpp
+               src/video_core/bb/fsr411/fsr411.cpp
+               src/video_core/bb/fsr411/fsr411.h
+               src/video_core/bb/fsr411/fsr411_vk.h
+               src/video_core/bb/bb_upscale.cpp
+               src/video_core/bb/bb_upscale.h
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
@@ -1475,6 +1488,16 @@ set(HOST_SHADERS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/host_shaders
 add_subdirectory(${HOST_SHADERS_INCLUDE})
 add_dependencies(shadps4 host_shaders)
 target_include_directories(shadps4 PRIVATE ${HOST_SHADERS_INCLUDE})
+
+# bb-clean-021 upscaling (src/video_core/bb): FidelityFX API headers (MIT, externals/ffx_api), and
+# the Streamline SDK headers when the CI fetched them into _Build/deps.
+target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/externals/ffx_api/include)
+set(BB_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH "NVIDIA Streamline SDK (include/sl.h)")
+if (WIN32 AND EXISTS "${BB_STREAMLINE_SDK}/include/sl.h")
+    set_property(SOURCE src/video_core/bb/bb_sr_dlss.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${BB_STREAMLINE_SDK}/include")
+    set_property(SOURCE src/video_core/bb/bb_sr_dlss.cpp APPEND PROPERTY COMPILE_DEFINITIONS BB_STREAMLINE=1)
+    message(STATUS "BB upscaling: Streamline SDK ${BB_STREAMLINE_SDK}")
+endif()
 
 # embed resources
 

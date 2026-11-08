@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <chrono>
+#include "video_core/renderer_vulkan/bb_present_sr.h"
+
 #include <condition_variable>
 
 #include "core/libraries/videoout/buffer.h"
@@ -126,6 +129,9 @@ private:
     Swapchain swapchain;
     Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
+    std::unique_ptr<BB::PresentSr> bb_sr; // bb-clean-021: DLSS / FSR 4 (null when off)
+    double bb_wait_ms = 0.0;
+    std::chrono::steady_clock::time_point bb_last_flip{};
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;

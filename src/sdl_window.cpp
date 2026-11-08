@@ -28,6 +28,7 @@
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
 #include "sdl_window.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/renderdoc.h"
 
 #ifdef __APPLE__
@@ -206,6 +207,15 @@ void WindowSDL::WaitEvent() {
     SDL_Event event;
 
     if (!SDL_WaitEvent(&event)) {
+        return;
+    }
+
+    // bb-clean-021 F8: the metrics overlay (fps, frame / CPU / GPU ms, upscaler in -> out).
+    if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+        event.key.key == SDLK_F8) {
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+            BB::Upscale::ToggleOverlay();
+        }
         return;
     }
 

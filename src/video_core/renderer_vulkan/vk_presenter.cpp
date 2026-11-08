@@ -21,6 +21,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -490,6 +491,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
+    bb_sr = std::make_unique<BB::PresentSr>(instance);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
@@ -669,7 +671,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
 
+    const auto bb_t0 = std::chrono::steady_clock::now();
     Frame* frame = GetRenderFrame();
+    bb_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bb_t0)
+                     .count();
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -704,7 +709,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
-    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
@@ -740,14 +745,30 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                     vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
 
+    // bb-clean-021: DLSS / FSR 4 on the presented image (its depth and camera motion), recorded
+    // into this command buffer: no wait of its own.
+    const bool srgb10 =
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    vk::Extent2D bb_in_size = image_size;
+    bool bb_upscaled = false;
+    if (BB::Upscale::Enabled()) {
+        const vk::Extent2D out_size{frame->width, frame->height};
+        if (const auto v = bb_sr->Run(cmdbuf, texture_cache, runtime, image, image_view,
+                                      image_size, out_size, rasterizer->bb_scene_depth, srgb10)) {
+            image_view = v;
+            image_size = out_size;
+            bb_upscaled = true;
+        }
+    }
+
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
-    pp_settings.srgb_input =
-        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    pp_settings.srgb_input = srgb10 && !bb_upscaled;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    bb_sr->FrameEnd(cmdbuf);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -764,6 +785,21 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    {
+        // bb-clean-021 [perf]: frame begin stamp of the next frame (top of its command buffer),
+        // the GPU times of a frame four flips back (no wait), and the CPU side of this one.
+        bb_sr->FrameBegin(draw_scheduler.CommandBuffer());
+        double gpu = 0, sr = 0, mv = 0;
+        if (!bb_sr->Poll(gpu, sr, mv)) gpu = 0;
+        const auto now = std::chrono::steady_clock::now();
+        const double frame_ms =
+            bb_last_flip.time_since_epoch().count() != 0
+                ? std::chrono::duration<double, std::milli>(now - bb_last_flip).count()
+                : 0.0;
+        bb_last_flip = now;
+        BB::Upscale::NoteFrame(frame_ms - bb_wait_ms, bb_wait_ms, gpu, sr, mv, bb_in_size.width,
+                               bb_in_size.height, frame->width, frame->height, bb_upscaled);
+    }
     return frame;
 }
 
@@ -874,6 +910,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
     ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
+    BB::Upscale::DrawOverlay(); // bb-clean-021 F8 (nothing while hidden)
 
     const vk::Image swapchain_image = swapchain.Image();
     const vk::ImageView swapchain_image_view = swapchain.ImageView();

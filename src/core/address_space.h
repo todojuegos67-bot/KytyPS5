@@ -12,6 +12,9 @@
 
 namespace Core {
 
+// bb-clean-021: frees the address range held for NVIDIA NGX (DLSS) before vkCreateDevice.
+void ReleaseDlssAddressHole();
+
 enum class MemoryPermission : u32 {
     None = 0,
     Read = 1 << 0,

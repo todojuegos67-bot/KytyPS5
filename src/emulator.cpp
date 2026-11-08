@@ -47,6 +47,7 @@
 #include "core/memory.h"
 #include "core/user_settings.h"
 #include "emulator.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
 
@@ -606,6 +607,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
+    BB::Upscale::PreInstance(); // bb-clean-021: Streamline before the window
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,
                                                    window_title);
