@@ -2835,6 +2835,7 @@ void Layer(ImDrawList* dl, float W, float H, float tile, float ox, float oy, ImV
 }
 
 void Draw(ImDrawList* dl, float W, float H, float unit) {
+	return; // (des-launcher-clean) the launcher's fog and ash are off: nothing is drawn here
 	if (!g_tried) Create();
 	if (g_fog == nullptr || g_dot == nullptr || W <= 0 || H <= 0) return;
 	Linear(g_fog, &g_fog_linear);
