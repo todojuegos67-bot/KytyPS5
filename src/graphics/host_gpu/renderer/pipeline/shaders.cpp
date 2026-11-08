@@ -719,9 +719,11 @@ static double MicrosecondsSince(std::chrono::steady_clock::time_point start) {
 
 // A pipeline the driver refused: the log names its result and the programs. True in a precompile, which leaves it out and
 // goes on (the caller destroys a null one): issue #305, one pipeline an RX Vega 56's driver refused ended its shard, and
-// the precompile never finished. The game goes on with a graphics pipeline that draws nothing (DrawNothingPipeline); it
-// exits at a compute one.
+// the precompile never finished. The game makes it again without the driver's optimizations (MadeUnoptimized), then goes
+// on with a graphics pipeline that draws nothing (DrawNothingPipeline) or exits at a compute one.
 static std::atomic<size_t> g_pipelines_refused {0};
+// Refused in play: all, made again without the driver's optimizations (MadeUnoptimized), drawing nothing in their place.
+static std::atomic<size_t> g_play_refused {0}, g_play_unoptimized {0}, g_play_draw_nothing {0};
 static bool PipelineRefused(const GraphicContext& graphics, vk::Result result, const char* kind, uint64_t hash,
                             uint64_t pixel_hash) {
 	static std::atomic<uint32_t> reports {0};
@@ -730,13 +732,66 @@ static bool PipelineRefused(const GraphicContext& graphics, vk::Result result, c
 		            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(pixel_hash));
 		std::fflush(stdout);
 	}
-	if (!graphics.precompiling) return false;
+	if (!graphics.precompiling) {
+		g_play_refused.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
 	g_pipelines_refused.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 
 size_t PipelinesRefused() {
 	return g_pipelines_refused.load(std::memory_order_relaxed);
+}
+
+// A pipeline the driver refused in play, made again without its optimizations (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT,
+// in no cache), the second try before a graphics pipeline that draws nothing (DrawNothingPipeline) or the end of the game
+// at a compute one. An RX Vega 56 (AMD 26.5.2, ErrorUnknown) refused ~6,500 of the 80,000 pipelines its precompile made,
+// among them the final composite's: the game ran on with a black screen (issue #305). Whether its driver makes them
+// unoptimized is not known: the log says (the first 16, and ReportRefusedPipelines). The pipeline stays unoptimized
+// (pipeline.unoptimized false: no optimized build is tried on a worker).
+template <typename Info, typename Create>
+static vk::Result MadeUnoptimized(PipelineCache::Pipeline& pipeline, Info info, const char* kind, uint64_t hash,
+                                  uint64_t pixel_hash, Create create) {
+	pipeline.pipeline = nullptr;
+	InlineStages inlined;
+	inlined.Apply(info);
+	info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	const auto result = create(nullptr, info);
+	const bool made   = result == vk::Result::eSuccess && pipeline.pipeline != nullptr;
+	if (made) {
+		g_play_unoptimized.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		pipeline.pipeline = nullptr;
+	}
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("Pipeline refused by the driver: %s without its optimizations (%s %016llx %016llx)\n",
+		            made ? "made" : ("refused again, " + vk::to_string(result) + ",").c_str(), kind,
+		            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(pixel_hash));
+		std::fflush(stdout);
+	}
+	return made ? vk::Result::eSuccess : result != vk::Result::eSuccess ? result : vk::Result::eErrorUnknown;
+}
+
+// The optimized build of an unoptimized pipeline refused: the pipeline made before stays, the unoptimized one or the one
+// that draws nothing (PipelineCache::PromoteOptimized replaces it only with a pipeline). Before, a graphics one became the
+// pipeline that draws nothing, a compute one ended the game.
+static void OptimizedBuildRefused() {
+	if (static std::atomic<bool> reported {false}; !reported.exchange(true, std::memory_order_relaxed)) {
+		std::printf("Pipeline refused by the driver: its optimized build; the pipeline made before stays\n");
+		std::fflush(stdout);
+	}
+}
+
+void ReportRefusedPipelines() {
+	const auto refused = g_play_refused.load(std::memory_order_relaxed);
+	if (refused == 0) return;
+	std::printf("Pipelines the driver refused in play: %zu; %zu made without its optimizations, %zu drawing nothing in "
+	            "their place\n",
+	            refused, g_play_unoptimized.load(std::memory_order_relaxed),
+	            g_play_draw_nothing.load(std::memory_order_relaxed));
+	std::fflush(stdout);
 }
 
 // A graphics pipeline the driver refused to the game: the same pipeline with a pixel shader that kills every pixel in place
@@ -768,6 +823,7 @@ static vk::Result DrawNothingPipeline(GraphicContext& graphics, PipelineCache::P
 	InlineStages inlined;
 	inlined.Apply(info);
 	const auto result = graphics.device.createGraphicsPipelines(nullptr, 1, &info, nullptr, &pipeline.pipeline);
+	if (result == vk::Result::eSuccess) g_play_draw_nothing.fetch_add(1, std::memory_order_relaxed);
 	if (static bool reported = false; result == vk::Result::eSuccess && !std::exchange(reported, true)) {
 		std::printf("Pipeline refused by the driver: the game goes on without its draws\n");
 		std::fflush(stdout);
@@ -1377,23 +1433,28 @@ void CreatePipelineInternal(
 	                                   static_params, vs_input_info, ps_input_info, native_bindings)
 	        : 0;
 	const auto handle_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build, identity,
-	                              [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
-		                              return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr,
-		                                                                            &pipeline.pipeline);
-	                              });
+	const auto create_graphics = [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
+		return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr, &pipeline.pipeline);
+	};
+	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build, identity, create_graphics);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
+	const uint64_t pixel_hash = ps_active ? ps_input_info->stage.program->shader_hash : 0;
 	if (!ClaimedElsewhere(graphics, result) && (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
-	    !PipelineRefused(graphics, result, "graphics", vs_input_info.stage.program->shader_hash,
-	                     ps_active ? ps_input_info->stage.program->shader_hash : 0)) {
+	    !PipelineRefused(graphics, result, "graphics", vs_input_info.stage.program->shader_hash, pixel_hash)) {
 		pipeline.pipeline = nullptr;
-		// (The fragment stage is the last, when there is one.)
-		if (!ps_active && empty_frag_stage_info.module == nullptr) pipeline_info.stageCount = ++shader_stage_count;
-		result = DrawNothingPipeline(graphics, pipeline, pipeline_info, shader_stages[shader_stage_count - 1]);
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+		if (build == PipelineBuild::Optimize) {
+			OptimizedBuildRefused();
+		} else if (pipeline.unoptimized || MadeUnoptimized(pipeline, pipeline_info, "graphics",
+		                                                   vs_input_info.stage.program->shader_hash, pixel_hash,
+		                                                   create_graphics) != vk::Result::eSuccess) {
+			// (The fragment stage is the last, when there is one.)
+			if (!ps_active && empty_frag_stage_info.module == nullptr) pipeline_info.stageCount = ++shader_stage_count;
+			result = DrawNothingPipeline(graphics, pipeline, pipeline_info, shader_stages[shader_stage_count - 1]);
+			EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+		}
 	}
 	if (DeviceFault::BreadcrumbsOn()) {
 		DeviceFault::NotePipeline(pipeline.pipeline,
@@ -1573,20 +1634,27 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	        ? ComputePipelineIdentity(ModuleSpirvHash(compute_module), input_info, native_bindings)
 	        : 0;
 	const auto handle_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-	const auto result =
-	    CreatePipelineHandle(graphics, pipeline, info, driver_cache, build, identity,
-	                         [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
-		                         const auto made = graphics.device.createComputePipelines(cache, 1, &create, nullptr,
-		                                                                                 &pipeline.pipeline);
-		                         if (made == vk::Result::eSuccess && graphics.pipeline_statistics_enabled)
-			                         PrintPipelineStatistics(graphics, create, input_info.stage.program->shader_hash);
-		                         return made;
-	                         });
+	const auto create_compute = [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
+		const auto made = graphics.device.createComputePipelines(cache, 1, &create, nullptr, &pipeline.pipeline);
+		if (made == vk::Result::eSuccess && graphics.pipeline_statistics_enabled)
+			PrintPipelineStatistics(graphics, create, input_info.stage.program->shader_hash);
+		return made;
+	};
+	const auto result = CreatePipelineHandle(graphics, pipeline, info, driver_cache, build, identity, create_compute);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
-	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
-	                     !PipelineRefused(graphics, result, "compute", input_info.stage.program->shader_hash, 0));
+	if (!ClaimedElsewhere(graphics, result) && (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
+	    !PipelineRefused(graphics, result, "compute", input_info.stage.program->shader_hash, 0)) {
+		pipeline.pipeline = nullptr;
+		if (build == PipelineBuild::Optimize) {
+			OptimizedBuildRefused();
+		} else {
+			// (The game cannot go on without it.)
+			EXIT_NOT_IMPLEMENTED(pipeline.unoptimized ||
+			                     MadeUnoptimized(pipeline, info, "compute", input_info.stage.program->shader_hash, 0,
+			                                     create_compute) != vk::Result::eSuccess);
+		}
+	}
 	if (DeviceFault::BreadcrumbsOn()) {
 		DeviceFault::NotePipeline(pipeline.pipeline, fmt::format("{} cs {:016x}", native_bindings ? "cs-table" : "cs-normal",
 		                                                         input_info.stage.program->shader_hash));

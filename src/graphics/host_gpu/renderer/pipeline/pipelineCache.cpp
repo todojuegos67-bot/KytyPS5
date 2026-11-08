@@ -3172,6 +3172,7 @@ void PipelineCache::ReportSession() {
 	}
 	PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
 	                 m_unoptimized_builds, m_replaced_pipelines.size());
+	ReportRefusedPipelines();
 	PipelineCacheLog("Shader plans: {} out of memory at the end, {} brought back by the render thread, {} beside it ({} of "
 	                 "those used)",
 	                 m_program_cache->plans_out, m_program_cache->plan_reloads, m_program_cache->plan_preloads,
