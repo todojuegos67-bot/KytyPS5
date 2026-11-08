@@ -9,6 +9,7 @@
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/host_shaders/bb_hudsplit_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -345,6 +346,234 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                                             BB::SR::QualityName(BB::Upscale::Cfg().quality)));
     }
     return output.view;
+}
+
+HudSplit::HudSplit(const Vulkan::Instance& instance_) : instance{instance_} {}
+
+HudSplit::~HudSplit() {
+    const auto device = instance.GetDevice();
+    if (!device) return;
+    (void)device.waitIdle();
+    Destroy(scene);
+    Destroy(output);
+    if (pipeline) device.destroyPipeline(pipeline);
+    if (layout) device.destroyPipelineLayout(layout);
+    if (set_layout) device.destroyDescriptorSetLayout(set_layout);
+    if (sampler) device.destroySampler(sampler);
+}
+
+bool HudSplit::IsFlip(VAddr guest) const {
+    if (guest == 0) return false;
+    for (const VAddr flip : flips) {
+        if (flip == guest) return true;
+    }
+    return false;
+}
+
+bool HudSplit::Init() {
+    if (init_tried) return init_ok;
+    init_tried = true;
+    const auto device = instance.GetDevice();
+    const vk::SamplerCreateInfo sci{
+        .magFilter = vk::Filter::eLinear,
+        .minFilter = vk::Filter::eLinear,
+        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        .maxLod = 0.0f,
+    };
+    auto [sr, s] = device.createSampler(sci);
+    if (sr != vk::Result::eSuccess) return false;
+    sampler = s;
+    const std::array<vk::DescriptorSetLayoutBinding, 4> bindings{{
+        {0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
+        {2, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
+        {3, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+    }};
+    auto [lr, l] = device.createDescriptorSetLayout({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    });
+    if (lr != vk::Result::eSuccess) return false;
+    set_layout = l;
+    const vk::PushConstantRange range{vk::ShaderStageFlagBits::eCompute, 0, 32};
+    auto [pr, pl] = device.createPipelineLayout({
+        .setLayoutCount = 1,
+        .pSetLayouts = &set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    });
+    if (pr != vk::Result::eSuccess) return false;
+    layout = pl;
+    const auto module = Vulkan::CompileSPV(BB_HUDSPLIT_COMP, device);
+    if (!module) return false;
+    const vk::ComputePipelineCreateInfo ci{
+        .stage{.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = "main"},
+        .layout = layout,
+    };
+    auto [cr, p] = device.createComputePipeline({}, ci);
+    device.destroyShaderModule(module);
+    if (cr != vk::Result::eSuccess) return false;
+    pipeline = p;
+    init_ok = true;
+    return true;
+}
+
+void HudSplit::Destroy(OwnImage& img) {
+    const auto device = instance.GetDevice();
+    if (img.view) device.destroyImageView(img.view);
+    if (img.image) vmaDestroyImage(instance.GetAllocator(), img.image, img.allocation);
+    img = {};
+}
+
+bool HudSplit::Ensure(OwnImage& img, vk::Extent2D extent, vk::Format format,
+                      vk::ImageUsageFlags usage) {
+    if (img.image && img.extent == extent && img.format == format) return true;
+    if (img.image) {
+        (void)instance.GetDevice().waitIdle();
+        Destroy(img);
+    }
+    const VkImageCreateInfo ici = vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = usage,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &ici, &aci, &image, &img.allocation, nullptr) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    img.image = image;
+    auto [vr, v] = instance.GetDevice().createImageView({
+        .image = img.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (vr != vk::Result::eSuccess) {
+        Destroy(img);
+        return false;
+    }
+    img.view = v;
+    img.format = format;
+    img.extent = extent;
+    img.layout = vk::ImageLayout::eUndefined;
+    return true;
+}
+
+void HudSplit::Barrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout new_layout) {
+    const vk::ImageMemoryBarrier2 b{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .oldLayout = img.layout,
+        .newLayout = new_layout,
+        .image = img.image,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                            .pImageMemoryBarriers = &b});
+    img.layout = new_layout;
+}
+
+bool HudSplit::Capture(vk::CommandBuffer cmd, Vulkan::Runtime& runtime, VideoCore::Image& flip) {
+    if (!Init() || flip.info.num_samples > 1) return false;
+    const vk::Extent2D extent{flip.info.size.width, flip.info.size.height};
+    if (!Ensure(scene, extent, flip.info.pixel_format,
+                vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst)) {
+        return false;
+    }
+    runtime.Transit(&flip, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    Barrier(cmd, scene, vk::ImageLayout::eTransferDstOptimal);
+    const vk::ImageSubresourceLayers layers{vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    const vk::ImageCopy region{layers, {0, 0, 0}, layers, {0, 0, 0},
+                               {extent.width, extent.height, 1}};
+    cmd.copyImage(flip.GetImage(), vk::ImageLayout::eTransferSrcOptimal, scene.image,
+                  vk::ImageLayout::eTransferDstOptimal, region);
+    Barrier(cmd, scene, vk::ImageLayout::eShaderReadOnlyOptimal);
+    runtime.Transit(&flip, vk::ImageLayout::eColorAttachmentOptimal,
+                    vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                    vk::AccessFlagBits2::eColorAttachmentRead |
+                        vk::AccessFlagBits2::eColorAttachmentWrite);
+    runtime.FlushBarriers();
+    captured = true;
+    captured_addr = flip.info.guest_address;
+    return true;
+}
+
+vk::ImageView HudSplit::Composite(vk::CommandBuffer cmd, vk::ImageView flip_view,
+                                  vk::ImageView upscaled, vk::Extent2D in, vk::Extent2D out,
+                                  bool srgb_decode) {
+    if (!Init() || !scene.view) return {};
+    if (!Ensure(output, out, vk::Format::eR16G16B16A16Sfloat,
+                vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled)) {
+        return {};
+    }
+    Barrier(cmd, output, vk::ImageLayout::eGeneral);
+    struct {
+        u32 size[4];
+        u32 flags[4];
+    } push{};
+    static_assert(sizeof(push) == 32);
+    push.size[0] = in.width;
+    push.size[1] = in.height;
+    push.size[2] = out.width;
+    push.size[3] = out.height;
+    push.flags[0] = srgb_decode ? 1u : 0u;
+    const vk::DescriptorImageInfo flip_info{sampler, flip_view,
+                                            vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo scene_info{sampler, scene.view,
+                                             vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo up_info{sampler, upscaled,
+                                          vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo out_info{{}, output.view, vk::ImageLayout::eGeneral};
+    const std::array writes{
+        vk::WriteDescriptorSet{.dstBinding = 0,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &flip_info},
+        vk::WriteDescriptorSet{.dstBinding = 1,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &scene_info},
+        vk::WriteDescriptorSet{.dstBinding = 2,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &up_info},
+        vk::WriteDescriptorSet{.dstBinding = 3,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &out_info},
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+    cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((out.width + 7) / 8, (out.height + 7) / 8, 1);
+    Barrier(cmd, output, vk::ImageLayout::eShaderReadOnlyOptimal);
+    return output.view;
+}
+
+void HudSplit::EndFrame(VAddr presented) {
+    if (presented != 0) {
+        flips[next_flip] = presented;
+        next_flip = (next_flip + 1) % FlipSlots;
+    }
+    scene_seen = false;
+    captured = false;
 }
 
 } // namespace BB

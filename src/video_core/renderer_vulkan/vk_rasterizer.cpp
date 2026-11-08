@@ -42,7 +42,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
-      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()}, bb_hud{instance} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -201,6 +201,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!BindResources(pipeline)) {
         return;
     }
+    BbHudStart(pipeline);
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
@@ -260,6 +261,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!BindResources(pipeline)) {
         return;
     }
+    BbHudStart(pipeline);
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
@@ -1024,6 +1026,43 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         set_write.descriptorType = vk::DescriptorType::eSampler;
         set_write.pImageInfo = &image_infos.back();
     }
+}
+
+void Rasterizer::BbHudStart(const GraphicsPipeline* pipeline) {
+    if (!BB::Upscale::Enabled() || bb_hud.Captured()) {
+        return;
+    }
+    const auto& regs = liverpool->regs;
+    const u32 scene_w = BB::Upscale::g_scene_w;
+    const u32 scene_h = BB::Upscale::g_scene_h;
+    if (regs.depth_control.depth_enable) {
+        if (db_desc.image_id) {
+            const auto& depth = texture_cache.GetImage(db_desc.image_id);
+            if (depth.info.size.width == scene_w && depth.info.size.height == scene_h) {
+                bb_hud.NoteScene();
+            }
+        }
+        return;
+    }
+    if (!bb_hud.SceneSeen() || !cb_descs[0].image_id ||
+        (pipeline->GetGraphicsKey().mrt_mask & 1u) == 0) {
+        return;
+    }
+    const auto target_id = cb_descs[0].image_id;
+    auto& target = texture_cache.GetImage(target_id);
+    if (target.binding.needs_rebind || target.info.size.width != scene_w ||
+        target.info.size.height != scene_h || !bb_hud.IsFlip(target.info.guest_address)) {
+        return;
+    }
+    for (const auto id : bound_images) {
+        const auto& image = texture_cache.GetImage(id);
+        if (id != target_id && !image.binding.is_target && image.info.size.width == scene_w &&
+            image.info.size.height == scene_h) {
+            return;
+        }
+    }
+    scheduler.EndRendering();
+    bb_hud.Capture(scheduler.CommandBuffer(), runtime, target);
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {

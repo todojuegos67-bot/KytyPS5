@@ -751,15 +751,23 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     vk::Extent2D bb_in_size = image_size;
     bool bb_upscaled = false;
+    const bool bb_split = rasterizer->bb_hud.Captured() &&
+                          rasterizer->bb_hud.CapturedAddr() == image.info.guest_address;
     if (BB::Upscale::Enabled()) {
         const vk::Extent2D out_size{frame->width, frame->height};
-        if (const auto v = bb_sr->Run(cmdbuf, texture_cache, runtime, image, image_view,
+        const vk::ImageView bb_scene_view = bb_split ? rasterizer->bb_hud.SceneView() : image_view;
+        if (const auto v = bb_sr->Run(cmdbuf, texture_cache, runtime, image, bb_scene_view,
                                       image_size, out_size, rasterizer->bb_scene_depth, srgb10)) {
-            image_view = v;
+            const vk::ImageView with_hud =
+                bb_split ? rasterizer->bb_hud.Composite(cmdbuf, image_view, v, image_size,
+                                                        out_size, srgb10)
+                         : vk::ImageView{};
+            image_view = with_hud ? with_hud : v;
             image_size = out_size;
             bb_upscaled = true;
         }
     }
+    rasterizer->bb_hud.EndFrame(image.info.guest_address);
 
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);

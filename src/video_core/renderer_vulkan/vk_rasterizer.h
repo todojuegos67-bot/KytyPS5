@@ -129,6 +129,7 @@ private:
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
     void ResetBindings(bool is_compute);
+    void BbHudStart(const GraphicsPipeline* pipeline);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -162,6 +163,7 @@ private:
 
 public:
     BB::SceneDepth bb_scene_depth; // bb-clean-021 (bb_present_sr.h)
+    BB::HudSplit bb_hud;
 
 private:
 

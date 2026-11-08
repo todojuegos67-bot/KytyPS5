@@ -1,0 +1,39 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-clean-021: the HUD split. The presented image with the HUD (flip) and the scene copy taken
+// before the HUD start (scene), both at the render size, and the upscaler's output of the scene
+// copy (up, the output size): out = up + (flip - scene), linear light.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D flip_tex;
+layout(binding = 1) uniform sampler2D scene_tex;
+layout(binding = 2) uniform sampler2D up_tex;
+layout(binding = 3, rgba16f) uniform writeonly image2D out_img;
+layout(push_constant) uniform Push {
+    uvec4 sz;    // render w, h, output w, h
+    uvec4 flags; // x: sRGB encoded (the 10-bit sRGB format has no sRGB view)
+} pc;
+
+float ToLinear(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+vec3 ToLinear(vec3 c) {
+    return vec3(ToLinear(c.r), ToLinear(c.g), ToLinear(c.b));
+}
+
+void main() {
+    const uvec2 o = gl_GlobalInvocationID.xy;
+    if (o.x >= pc.sz.z || o.y >= pc.sz.w) {
+        return;
+    }
+    const vec2 uv = (vec2(o) + 0.5) / vec2(pc.sz.z, pc.sz.w);
+    vec3 flip = texture(flip_tex, uv).rgb;
+    vec3 scene = texture(scene_tex, uv).rgb;
+    if (pc.flags.x != 0u) {
+        flip = ToLinear(flip);
+        scene = ToLinear(scene);
+    }
+    const vec3 up = texelFetch(up_tex, ivec2(o), 0).rgb;
+    imageStore(out_img, ivec2(o), vec4(max(up + (flip - scene), vec3(0.0)), 1.0));
+}
