@@ -245,7 +245,9 @@ The shortest way to a Release build of the emulator (without the Qt launcher):
    `-Fullscreen`, `-Width`/`-Height` and the others are listed at the top of the script.
    A ZArchive of the folder (`-Game D:\Games\PPSA01341-app0.zar`) works too, read without extracting
    it; `.\build-windows.cmd zarchive_tool` builds the packer, `_Build\windows\3rdparty\zarchive.exe
-   <folder> <file.zar>`.
+   <folder> <file.zar>`. A path longer than 260 characters stops it ("Failed to open input file"):
+   pack from a folder near the drive root, or turn on Windows' long paths
+   ([#240](https://github.com/chenxiao07/KytyPS5/issues/240)).
 
 The build is optimized for the CPU it is built on (`-march=native`). For an executable that other
 PCs can run, set `KYTY_CMAKE_ARGS=-DKYTY_MARCH=x86-64-v3` before the first configure. The release

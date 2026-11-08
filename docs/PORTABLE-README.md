@@ -60,7 +60,13 @@ folder (usually named `PPSA01341-app0`).
 - Optional: the folder packed into one ZArchive file (`.zar`, about two thirds of its size) works
   too, read without extracting it: choose it with the launcher's `.zar...` button, or run
   `run.cmd -Game "D:\Games\PPSA01341-app0.zar"`. Pack it with `zarchive.exe <folder> <file.zar>`
-  (ZArchive, https://github.com/Exzap/ZArchive/releases). The folder stays the main way.
+  (ZArchive, https://github.com/Exzap/ZArchive/releases). The folder stays the main way. Packing needs
+  about 55 GB free where the `.zar` goes; write it next to the folder, not inside it. If it stops with
+  "Failed to open input file" on a long file name, the path is longer than Windows' 260 characters:
+  move the folder near the drive root (for example `D:\PPSA01341-app0`) and pack again, or turn on
+  Windows' long paths (`LongPathsEnabled` = 1 under
+  `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FileSystem`)
+  ([#240](https://github.com/chenxiao07/KytyPS5/issues/240), @blazouf).
 - On a hard disk (HDD): pack the game into a `.zar` there and keep the emulator folder (with its
   `_PipelineCache`, about 6 GB) on an SSD. Unpacked on a busy hard disk, every small read of the game
   waited 100-500 ms: long area loads and freezes while walking; packed, with the emulator on the SSD, it
