@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_analyze.h"
@@ -538,6 +539,21 @@ u64 g_jittered_last_frame = 0;
 // 0.79 [taa]: the length of the Halton cycle in use and the scene draws seen per frame (with and
 // without a camera found in their vertex constants: those are not jittered unless BB_TAA_ALL=1).
 u32 g_jitter_phases = 8;
+// 1.58 [upin]: what the back end was last told (RunBackend) and the presenter's sharpening on
+// upscaled frames (NoteSharpen), for the per-second consistency line.
+struct Told {
+    u64 dispatches = 0;
+    vk::Extent2D render{}, upscale{}, color{}, depth{}, motion{};
+    float jitter[2]{};
+    bool depth_inverted = false, hdr = false;
+    float sharpness = 0.0f;
+};
+std::mutex g_told_mutex;
+Told g_told;
+u64 g_told_last_dispatches = 0;
+std::atomic<u32> g_sharp_present_rcas{0};   // presenter RCAS passes on upscaled frames
+std::atomic<u32> g_sharp_present_double{0}; // ... of those, after a back end that sharpens itself
+std::atomic<u32> g_sharp_frames{0};         // presented frames that were upscaled
 u64 g_taa_scene_draws = 0, g_taa_nocam_draws = 0;
 u64 g_taa_last_scene = 0, g_taa_last_nocam = 0;
 u64 g_taa_dispatches = 0;
@@ -2403,6 +2419,20 @@ bool RunBackend(const SR::Desc& desc) {
 #else
     const bool ok = fn(desc);
 #endif
+    if (ok) {
+        std::scoped_lock lk{g_told_mutex};
+        ++g_told.dispatches;
+        g_told.render = desc.render;
+        g_told.upscale = desc.upscale;
+        g_told.color = desc.color.extent;
+        g_told.depth = desc.depth.extent;
+        g_told.motion = desc.motion.extent;
+        g_told.jitter[0] = desc.jitter[0];
+        g_told.jitter[1] = desc.jitter[1];
+        g_told.depth_inverted = desc.depth_inverted;
+        g_told.hdr = desc.hdr;
+        g_told.sharpness = desc.sharpness;
+    }
     if (!ok && ++failures >= 8) {
         g_backend_dead = true;
         Checkpoint(fmt::format("{} failed {} times: turned off, the game runs native",
@@ -3794,6 +3824,172 @@ void FgnNoteFrame(const FrameState& f) {
         s.last = keep;
     }
 }
+
+// 1.58 [upin]: the ratio the back end really upscales by (its last dispatch), else the old
+// estimate (window or game output over the G-buffer).
+double JitterRatio() {
+    {
+        std::scoped_lock lk{g_told_mutex};
+        if (g_told.dispatches > 0 && g_told.render.height != 0 && g_told.render.width != 0) {
+            // The height: 1440 / 960 = 1.5 exactly where the width carries the game's rounding
+            // to 4 (2560 / 1708).
+            return static_cast<double>(g_told.upscale.height) / g_told.render.height;
+        }
+    }
+    return g_learned.render_w != 0
+               ? static_cast<double>(PresentMode() ? g_present_w : g_output_w) / g_learned.render_w
+               : 1.0;
+}
+
+int ForcedJitterPhases() {
+    static const int forced = [] {
+        const char* v = std::getenv("BB_JITTER_PHASES");
+        return v != nullptr && *v != '\0' ? std::clamp(std::atoi(v), 8, 128) : 0;
+    }();
+    return forced;
+}
+
+u32 JitterPhasesFor(double ratio) {
+    u32 n = ratio <= 1.01 ? 32u : std::max<u32>(8u, static_cast<u32>(8.0 * ratio * ratio + 1e-6));
+    if (ForcedJitterPhases() > 0) n = std::max<u32>(n, static_cast<u32>(ForcedJitterPhases()));
+    return std::clamp<u32>(n, 8u, 128u);
+}
+
+// 1.58 [upin]: once a second, whether what the upscaler receives agrees with itself: the game's
+// resolution patch, the G-buffer it really draws, the render / output sizes the back end is
+// told, the jitter cycle, the motion-vector scale, depth and sharpening.
+void UpinLine() {
+    if (!Enabled()) return;
+    const auto& c = Cfg();
+    const bool temporal = c.kind == SR::Kind::Dlss || c.kind == SR::Kind::Fsr3 ||
+                          c.kind == SR::Kind::Fsr4 || c.kind == SR::Kind::Xess;
+    if (!temporal) return;
+    u32 xw = 0, xh = 0, gw = 0, gh = 0;
+    const char* how = "";
+    BB::ResPatch::PatchSizes(&xw, &xh, &gw, &gh, &how);
+    Told t;
+    {
+        std::scoped_lock lk{g_told_mutex};
+        t = g_told;
+    }
+    const u64 n = t.dispatches - g_told_last_dispatches;
+    g_told_last_dispatches = t.dispatches;
+    const double asked = SR::QualityRatio(c.kind, c.quality);
+    const double rr = t.render.height != 0
+                          ? static_cast<double>(t.upscale.height) / t.render.height
+                          : 0.0;
+    const u32 want_w = t.upscale.width != 0
+                           ? std::max<u32>(4u, static_cast<u32>(std::lround(t.upscale.width / asked / 4.0)) * 4u)
+                           : 0u;
+    const u32 want_h = t.upscale.height != 0
+                           ? std::max<u32>(4u, static_cast<u32>(std::lround(t.upscale.height / asked / 4.0)) * 4u)
+                           : 0u;
+    const u32 want_phases = JitterPhasesFor(rr > 0.0 ? rr : 1.0);
+    auto env_sign = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v != nullptr && *v != '\0' && std::atof(v) < 0 ? -1 : 1;
+    };
+    std::string mv;
+    int sign = 1;
+    const char* sign_env = "";
+    switch (c.kind) {
+    case SR::Kind::Dlss:
+        mv = fmt::format("DLSS mvecScale 1/{} x 1/{} (render px -> UV), not jittered",
+                         t.render.width, t.render.height);
+        break;
+    case SR::Kind::Fsr3:
+        sign = env_sign(sign_env = "BB_FSR3_MV_SIGN");
+        mv = fmt::format("FSR 3.1 motionVectorScale {:+d},{:+d} (render px)", sign, sign);
+        break;
+    case SR::Kind::Xess:
+        sign = env_sign(sign_env = "BB_XESS_MV_SIGN");
+        mv = fmt::format("XeSS velocity scale {:+d},{:+d} (render px)", sign, sign);
+        break;
+    case SR::Kind::Fsr4:
+        sign = env_sign(sign_env = "BB_SR_MV_SIGN");
+        mv = fmt::format("FSR 4 mv_scale {:+d}/{} x {:+d}/{} (render px -> UV; 4.1.1: +1)", sign,
+                         t.render.width, sign, t.render.height);
+        break;
+    default:
+        break;
+    }
+    const u32 frames = g_sharp_frames.exchange(0, std::memory_order_relaxed);
+    const u32 prcas = g_sharp_present_rcas.exchange(0, std::memory_order_relaxed);
+    const u32 pdouble = g_sharp_present_double.exchange(0, std::memory_order_relaxed);
+    const float sharp = LiveSharpness();
+    const std::string sharpen =
+        sharp <= 0.0f ? std::string("off (sharpness 0)")
+        : BackendSharpensItself()
+            ? fmt::format("{:.2f} inside {} (its RCAS); presenter RCAS on {}/{} upscaled frames "
+                          "(must be 0)",
+                          sharp, SR::KindName(c.kind), prcas, frames)
+            : fmt::format("{:.2f} by the presenter's RCAS only ({} has none): {}/{} upscaled "
+                          "frames",
+                          sharp, SR::KindName(c.kind), prcas, frames);
+    std::vector<std::string> bad;
+    if (n > 0) {
+        if (g_learned.render_w != 0 &&
+            (t.render.width != g_learned.render_w || t.render.height != g_learned.render_h)) {
+            bad.push_back(fmt::format("render told {}x{} != G-buffer {}x{}", t.render.width,
+                                      t.render.height, g_learned.render_w, g_learned.render_h));
+        }
+        if (gw != 0 && g_learned.render_w != 0 && !NativeChainLive() &&
+            (std::abs(static_cast<int>(gw) - static_cast<int>(g_learned.render_w)) > 3 ||
+             std::abs(static_cast<int>(gh) - static_cast<int>(g_learned.render_h)) > 3)) {
+            bad.push_back(fmt::format("patch size {}x{} != G-buffer {}x{}", gw, gh,
+                                      g_learned.render_w, g_learned.render_h));
+        }
+        if (asked > 1.01 && std::abs(rr / asked - 1.0) > 0.04) {
+            bad.push_back(fmt::format(
+                "ratio {:.3f} is not {} {}'s {:.3f} (internal should be {}x{}: launcher "
+                "BB_RES_EXACT=1 with the XML patch at the output size)",
+                rr, SR::KindName(c.kind), SR::QualityName(c.quality), asked, want_w, want_h));
+        }
+        if (asked <= 1.01 && rr > 1.01) {
+            bad.push_back(fmt::format("native AA mode but the input is upscaled x{:.3f} (the "
+                                      "XML patch is below the output)",
+                                      rr));
+        }
+        if (t.depth != t.render) {
+            bad.push_back(fmt::format("depth {}x{} != render", t.depth.width, t.depth.height));
+        }
+        if (t.motion != t.render) {
+            bad.push_back(fmt::format("MV image {}x{} != render", t.motion.width, t.motion.height));
+        }
+        if (t.color.width < t.render.width || t.color.height < t.render.height) {
+            bad.push_back(fmt::format("colour {}x{} smaller than render", t.color.width,
+                                      t.color.height));
+        }
+        if (g_jitter_phases != want_phases) {
+            bad.push_back(fmt::format("jitter phases {} != {} for x{:.3f}", g_jitter_phases,
+                                      want_phases, rr));
+        }
+    }
+    if (sign < 0) {
+        bad.push_back(fmt::format("{}=-1 flips the motion vectors for {} only (the same MV image "
+                                  "goes to DLSS / FSR 4 with +1)",
+                                  sign_env, SR::KindName(c.kind)));
+    }
+    if (pdouble > 0) {
+        bad.push_back(fmt::format("sharpened twice on {} frames", pdouble));
+    }
+    std::string checks;
+    for (const auto& b : bad) checks += (checks.empty() ? "" : "; ") + b;
+    Checkpoint(fmt::format(
+        "[upin] patch: XML {}x{} -> game {}x{} ({}); G-buffer {}x{}; {} {} (mode x{:.3f}): told "
+        "render {}x{} -> output {}x{} (x{:.3f}, {} dispatches last second; colour {}x{}, depth "
+        "{}x{} {}, MV {}x{}, {} input); window {}x{}; jitter {} phases (8*r^2 rule: {}), "
+        "last told {:+.3f},{:+.3f} px; MV scale: {}; sharpening: {}; checks: {}",
+        xw, xh, gw, gh, how, g_learned.render_w, g_learned.render_h, SR::KindName(c.kind),
+        SR::QualityName(c.quality), asked, t.render.width, t.render.height, t.upscale.width,
+        t.upscale.height, rr, n, t.color.width, t.color.height, t.depth.width, t.depth.height,
+        t.depth_inverted ? "inverted" : "forward", t.motion.width, t.motion.height,
+        t.hdr ? "HDR" : "LDR", g_present_w, g_present_h, g_jitter_phases, want_phases,
+        t.jitter[0], t.jitter[1], mv.empty() ? "n/a" : mv, sharpen,
+        n == 0 ? (bad.empty() ? std::string("no dispatch this second") : "MISMATCH: " + checks)
+        : bad.empty() ? std::string("OK")
+                      : "MISMATCH: " + checks));
+}
 } // namespace
 
 void OnFlip(VAddr addr, u32 width, u32 height) {
@@ -4719,22 +4915,22 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                     g_jitter_phases));
             }
             g_stab = {};
+            UpinLine(); // 1.58: once a second
         }
     }
-    const double ratio = g_learned.render_w != 0
-                             ? static_cast<double>(PresentMode() ? g_present_w : g_output_w) /
-                                   g_learned.render_w
-                             : 1.0;
+    // 1.58 (bb-upin-158): the ratio the back end really upscales by (its last dispatch: told
+    // render -> output). 1.56 took the window / game output over the G-buffer, which with the
+    // scene patch (game output = internal size, upscale to the window at the HUD point, no
+    // present path) read 1.0 at a real 1.5.
+    const double ratio = JitterRatio();
     // 0.79: the length FSR 3's ffxFsr3UpscalerGetJitterPhaseCount gives (8 * ratio^2, truncated),
     // the cycle every back end is told about; Halton(2,3) index (phase + 1), minus 0.5.
     // 0.91: at ratio 1 (DLAA / native AA) an 8-phase cycle repeats every 8 frames and shows as a
-    // visible on/off shimmer (grass, foliage). Use at least 32 phases; BB_JITTER_PHASES overrides.
-    static const u32 min_phases = [] {
-        const char* v = std::getenv("BB_JITTER_PHASES");
-        const int n = v != nullptr ? std::atoi(v) : 32;
-        return static_cast<u32>(std::clamp(n, 8, 128));
-    }();
-    const u32 phases = std::clamp<u32>(static_cast<u32>(8.0 * ratio * ratio + 1e-6), min_phases, 128);
+    // visible on/off shimmer (grass, foliage): 32 phases there. 1.58: at a ratio > 1 the phase
+    // count follows the ratio (8 * ratio^2: 18 at 1.5, 23 at 1.72, 32 at 2, 72 at 3), as every
+    // SDK's guide asks; 1.56 clamped it to >= 32 at every ratio. BB_JITTER_PHASES=<n> forces a
+    // minimum at every ratio (the 1.56 behaviour with 32).
+    const u32 phases = JitterPhasesFor(ratio);
     g_jitter_phases = phases;
     g_taa_last_scene = g_taa_scene_draws;
     g_taa_last_nocam = g_taa_nocam_draws;
@@ -4760,6 +4956,22 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
     g_frame = {};
     g_draw = {};
     g_learned.rolled = false;
+}
+
+void NoteSharpen(bool upscaled, bool present_rcas) {
+    if (!upscaled) return;
+    g_sharp_frames.fetch_add(1, std::memory_order_relaxed);
+    if (!present_rcas) return;
+    g_sharp_present_rcas.fetch_add(1, std::memory_order_relaxed);
+    const auto k = Cfg().kind;
+    if (k == SR::Kind::Fsr3 || k == SR::Kind::Fsr4) {
+        g_sharp_present_double.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool BackendSharpensItself() {
+    const auto k = Cfg().kind;
+    return k == SR::Kind::Fsr3 || k == SR::Kind::Fsr4;
 }
 
 bool HudSharpScale(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {

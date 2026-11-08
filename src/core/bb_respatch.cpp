@@ -101,6 +101,10 @@ constexpr u32 Heap0 = 0x04b36dd8, Heap1 = 0x04b36de0;
 
 bool g_active = false;
 bool g_hud_sharp = false;
+// 1.58 [upin]: the size the user's XML Resolution Patch left in the eboot (as found) and the
+// size the game's scene immediates end with (after a rewrite here), 0 = not read.
+u32 g_xml_w = 0, g_xml_h = 0, g_game_w = 0, g_game_h = 0;
+const char* g_how = "not read (not the 1.09 eboot, or BB_SCENE_UPSCALE=native / prepost)";
 u32 g_sw = 0, g_sh = 0, g_ow = 0, g_oh = 0;
 
 std::string Mode() {
@@ -160,6 +164,14 @@ bool AaPass() {
     return Mode() == "aapass";
 }
 
+void PatchSizes(u32* xml_w, u32* xml_h, u32* game_w, u32* game_h, const char** how) {
+    if (xml_w) *xml_w = g_xml_w;
+    if (xml_h) *xml_h = g_xml_h;
+    if (game_w) *game_w = g_game_w;
+    if (game_h) *game_h = g_game_h;
+    if (how) *how = g_how;
+}
+
 bool Active(u32* scene_w, u32* scene_h, u32* out_w, u32* out_h) {
     if (scene_w) *scene_w = g_sw;
     if (scene_h) *scene_h = g_sh;
@@ -173,6 +185,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     {
         // 0.81: which lines of work this build carries (bb-imgfg-078 = bb-merge-075 + image frame generation).
         const std::string features =
+            "build 1.58 (bb-upin-158, on 1.56): upscaler input consistency: BB_RES_EXACT=1 (launcher: one XML Resolution Patch at the output size, the game's size immediates rewritten to output / mode ratio: quality 2560x1440 -> 1708x960, not the nearest XML 1600x900), scene patch aligned to 4 (1708 = the G-buffer the game really draws), jitter phases 8*ratio^2 at ratio > 1 from the real dispatch ratio (32 at native AA), DLSS mode / XeSS setting from the real ratio when the asked one disagrees, one sharpening per upscaled frame (shadPS4 rcas_enabled no longer on top), [upin] per-second line. "
             "build 1.49 (bb-combo-149): 1.44 (bb-prepost-144) + bb-trophysync-148 (retroactive Bloodborne trophies from the player's own save, once per boot, normal popup + chime one by one, 3.5 s cards, backup .trophy-backup-before-sync, [trophy-sync] log, BB_TROPHY_SYNC=0 off; platinum rule fix) + kbm default circle = lshift (run with Shift). "
             "build 1.43 (bb-combo-143): content check rejects only flat mid-grey canvases (all samples within 3 of one value, 0x7D +-12; dark scenes never), BB_FLATCHECK=0 turns it off. build 1.41 (bb-combo-141): 1.42 flash guard (bb-flash-142, supersedes 1.40) + FG pairing/coverage diagnostics (bb-fg30-141) + rumble fix/diag (bb-rumble-143) + mouse direct camera (bb-kbmcam-142). "
             "build 1.44 (bb-prepost-144): BB_SCENE_UPSCALE=prepost (opt-in) + DLSS range fix (an out-of-range menu upscale no longer turns DLSS off: r143 Quality never upscaled): DLSS on the lit HDR scene before exposure / bloom / tonemap / HUD, the game at the output size, Bloodborne's passes classified by shader hash (scene passes from the G-buffer draw to cs 0x9a9cf8a9 / 0x200820a1 / ps 0x00000ccc53f28aa5 at the internal size, everything after at the output size, phase-1 copies and samples of scene-size images internal, no history pinning, no learned UI / post targets), [prepost] per-second line with the target table and a mixed-size sample counter; default (aapass resolution patch) unchanged. "
@@ -216,9 +229,20 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
             "first reads the scene colour, into an image at the output size");
         return;
     }
-    if (mode != "scene093" && mode != "aapass") {
-        return;
-    }
+    // 1.58 (bb-upin-158): BB_RES_EXACT=1 (the launcher, temporal upscalers without the scene
+    // upscale): the user's XML Resolution Patch is the OUTPUT size and the four size immediates
+    // (scene + UI) are rewritten to output / the upscaler mode's ratio, exactly as a community
+    // "Resolution Patch WxH" of that size would set them (they are the only lines that differ
+    // between its 16:9 sizes). Quality on 2560x1440 is then 1708x960 instead of the nearest XML
+    // size (1600x900 = ratio 1.6). Nothing else changes: no scene mode, no HUD canvas flag; the
+    // emulator sees a game that renders at the internal size, as with an XML patch.
+    const bool exact = [&] {
+        if (mode == "scene093" || mode == "aapass" || mode == "shrink") return false;
+        const char* e = std::getenv("BB_RES_EXACT");
+        return e != nullptr && e[0] == '1';
+    }();
+    // Every other mode: nothing is rewritten, the sizes as found are only read for [upin].
+    const bool log_only = mode != "scene093" && mode != "aapass" && !exact;
     auto inside = [&](u32 addr, u32 size) {
         return addr >= EbootBase && addr - EbootBase + size <= image_size;
     };
@@ -249,6 +273,15 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
         BB::Upscale::Checkpoint("resolution patch: NOT applied (not Bloodborne 1.09)");
         return;
     }
+    if (log_only) {
+        const u32 fw = ReadImm(base, SceneW, 0xB8), fh = ReadImm(base, SceneH, 0xB8);
+        const bool xml = fw >= 320 && fh >= 180 && fw <= 7680 && fh <= 4320;
+        g_xml_w = g_game_w = xml ? fw : 1920;
+        g_xml_h = g_game_h = xml ? fh : 1080;
+        g_how = xml ? "the XML Resolution Patch as is (no rewrite)"
+                    : "no XML Resolution Patch: the game's native 1920x1080";
+        return;
+    }
     // The output: the size the user's own Resolution Patch set (the game's size so far), or the
     // window; BB_RES_PATCH_OUTPUT=WxH overrides.
     u32 ow = ReadImm(base, SceneW, 0xB8), oh = ReadImm(base, SceneH, 0xB8);
@@ -275,7 +308,26 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     if (const char* r = std::getenv("BB_RES_PATCH_RATIO")) {
         ratio = std::clamp(std::atof(r), 1.0, 3.0);
     }
-    const u32 align = 2; // 1.37: 2560 / 1.5 -> 1706 (8 gave 1704: output 2556)
+    const bool temporal = cfg.kind == BB::SR::Kind::Dlss || cfg.kind == BB::SR::Kind::Fsr3 ||
+                          cfg.kind == BB::SR::Kind::Fsr4 || cfg.kind == BB::SR::Kind::Xess;
+    if (exact && (!temporal || ratio <= 1.01)) {
+        // Native AA / no temporal upscaler: the XML patch (the output size) stays as it is.
+        g_xml_w = g_game_w = ow;
+        g_xml_h = g_game_h = oh;
+        g_how = !temporal ? "BB_RES_EXACT=1, no temporal upscaler: the XML patch as is"
+                          : "BB_RES_EXACT=1, ratio 1 (native AA): the XML patch as is";
+        BB::Upscale::Checkpoint(fmt::format("[upin] resolution: {} ({}x{})", g_how, ow, oh));
+        return;
+    }
+    // 1.58: aligned to 4. The game rounds its render size up to a multiple of 4 itself: the
+    // 1.37..1.56 logs show "scene 1706x960" from this patch but a 1708x960 G-buffer and flip
+    // image, so the size the upscaler was told (1708) was not the patch's (1706).
+    // BB_RES_PATCH_ALIGN=2 restores the 1.37 rounding.
+    const u32 align = [] {
+        const char* a = std::getenv("BB_RES_PATCH_ALIGN");
+        const int v = a != nullptr ? std::atoi(a) : 4;
+        return static_cast<u32>(v == 2 || v == 4 || v == 8 ? v : 4);
+    }();
     const u32 rw = std::max<u32>(align, static_cast<u32>(std::lround(ow / ratio / align)) * align);
     const u32 rh = std::max<u32>(align, static_cast<u32>(std::lround(oh / ratio / align)) * align);
     // 0.69 native scaling: BB_RES_PATCH_UI=output (default) keeps the game's UI size at the
@@ -291,7 +343,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     // 1280x720" with UI 2560x1440, so the HUD / title / menus were laid out in output-size
     // coordinates inside an internal-size target (cropped on the right) and then scaled up by
     // the window path (too big). Layout and target now agree; BB_RES_PATCH_UI=output keeps 0.93b.
-    const bool ui_internal = !(ui_env != nullptr && std::string(ui_env) == "output");
+    const bool ui_internal = exact || !(ui_env != nullptr && std::string(ui_env) == "output");
     const u32 uw = ui_internal ? rw : ow, uh = ui_internal ? rh : oh;
     for (const Line& l : Template) {
         u8 b[4];
@@ -308,6 +360,22 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
         }
         std::memcpy(reinterpret_cast<void*>(base + l.addr - EbootBase), b, l.size);
     }
+    g_xml_w = ow;
+    g_xml_h = oh;
+    g_game_w = rw;
+    g_game_h = rh;
+    if (exact) {
+        g_how = "BB_RES_EXACT=1: XML patch = output, size immediates rewritten to output / ratio";
+        BB::Upscale::Checkpoint(fmt::format(
+            "[upin] resolution: the XML Resolution Patch gives the output {}x{}; {} {} needs "
+            "/ {:.3f}: the game's scene and UI size immediates rewritten to {}x{} (as a "
+            "\"Resolution Patch {}x{}\" would; aligned to {}). No scene mode, no target "
+            "shrinking: the upscaler runs where it runs with an XML patch of that size.",
+            ow, oh, BB::SR::KindName(cfg.kind), BB::SR::QualityName(cfg.quality), ratio, rw, rh,
+            rw, rh, align));
+        return;
+    }
+    g_how = "BB_SCENE_UPSCALE=1: XML patch = output, scene immediates rewritten to output / ratio";
     g_active = true;
     {
         // 1.16 (bb-hud-116, from 1.07): the HUD canvas in every scaled mode (ratio > 1).

@@ -12,6 +12,9 @@ namespace BB::ResPatch {
 // Called once the eboot is loaded and the XML patches applied (core/module.cpp).
 void OnEbootLoaded(uintptr_t eboot_base, u64 image_size);
 // The patch was applied: the scene size (internal) and the output size it was derived from.
+// 1.58 [upin]: the size the XML Resolution Patch left in the eboot (as found), the size the
+// game's scene immediates end with, and how (0 = not read).
+void PatchSizes(u32* xml_w, u32* xml_h, u32* game_w, u32* game_h, const char** how);
 bool Active(u32* scene_w = nullptr, u32* scene_h = nullptr, u32* out_w = nullptr,
             u32* out_h = nullptr);
 // BB_SCENE_UPSCALE=shrink: the 0.22 target-shrinking path instead. Also true for =native.

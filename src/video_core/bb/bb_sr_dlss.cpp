@@ -152,6 +152,15 @@ bool FeatureFunction(sl::Feature feature, const char* name, F*& function) {
 }
 
 sl::DLSSMode ModeFor(Quality quality, double share) {
+    // 1.58 (bb-upin-158): the asked mode only when the real input agrees with it (within 4 %);
+    // otherwise the mode of the real ratio (the 1.56 runs had "quality" on a 1600x900 input of
+    // 2560x1440, x1.6). With the launcher's exact patch the two agree.
+    if (quality != Quality::Dynamic) {
+        const double nominal = 1.0 / QualityRatio(Kind::Dlss, quality);
+        if (share > 0.0 && std::abs(share / nominal - 1.0) > 0.04) {
+            quality = Quality::Dynamic;
+        }
+    }
     switch (quality) {
     case Quality::Native:
         return sl::DLSSMode::eDLAA;
