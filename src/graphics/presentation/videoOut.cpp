@@ -753,6 +753,15 @@ bool MoviePlaying() noexcept {
 	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
 	return now - last < std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(500)).count();
 }
+// The movie's pacing (SceneFreeFloor, scene_free below) holds 2 s after its last decoded frame, not 500 ms: a decode stall
+// (a heavy frame, the teardown of a skip) must not let the next frames of the intro go uncapped and burst out. Only the
+// cap uses it; MoviePlaying keeps its 500 ms for frame generation and the rest. Not reproduced (des-fix-1110).
+static bool MovieCapHeld() noexcept {
+	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
+	if (last == 0) return false;
+	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+	return now - last < std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(2000)).count();
+}
 
 // KYTY_FLIP_FPS=<fps>: the game's 3D view is flipped at most that many times a second, a whole number of vblanks apart
 // (the launcher's Smooth Souls: 40 on a 120 Hz vblank, 3 vblanks). Menus, loading screens and movies keep their rate.
@@ -1822,7 +1831,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		// (Also a movie playing, and with frame generation a frame without the game's camera: the PlayStation Studios
 		// logo at the start ran at 103-120 fps above 60 Hz, 10-18; the game draws something with its TAA behind it.)
 		NoteFrameForWorld(Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying());
-		scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MoviePlaying() || CinematicPlaying() || !PlayerInputSeen() ||
+		scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MovieCapHeld() || CinematicPlaying() || !PlayerInputSeen() ||
 		             (Graphics::Presenter::GeneratesFrames() && !Graphics::Presenter::IsGameView(*r.frame));
 		// Before the first world and during movies frame generation is off for certain: 60, not the mode's base rate
 		// (Smooth 120 held the intro to 40, 10-18). In the world the floors as they were (no new pacing there).
