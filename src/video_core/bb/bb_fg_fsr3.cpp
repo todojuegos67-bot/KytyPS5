@@ -73,6 +73,9 @@ ffxQueryDescSwapchainReplacementFunctionsVK g_functions{};
 // Patched DLL: the grid slot of the next present; the presents' intervals (read and cleared).
 void (*g_set_pace_slot)(int64_t, int64_t) = nullptr;
 void (*g_take_pace_stats)(int64_t*) = nullptr;
+// 1.58 (bb-fgpace-158, ffx-sdk-v1.1.4-pace.patch): intervals by the kind of present they end at,
+// the DLL's adaptive readiness offset (raised / lowered), late presents, min slack.
+void (*g_take_pace_stats2)(int64_t*, int) = nullptr;
 // bb-fg-074 (the display patch): the ids of the presents the DLL made, so each can be waited for.
 uint32_t (*g_take_display_ids)(uint64_t*, uint32_t) = nullptr;
 bool g_display_ids = false; // the game's presents carry ids and the DLL numbers every present
@@ -212,6 +215,41 @@ struct Mfg {
     double smooth = 0.0;
     Kyty::Local::DynMultiplier dm;
 } g_mfg;
+
+// 1.58: the refresh rate of the display the window is on, exact (QueryDisplayConfig gives the
+// mode's rational rate: 239.757 is not 240); EnumDisplaySettings' integer as a
+// fallback.
+double QueryRefreshHz() {
+    UINT32 paths = 0, modes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths, &modes) == ERROR_SUCCESS &&
+        paths > 0) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> path(paths);
+        std::vector<DISPLAYCONFIG_MODE_INFO> mode(modes);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths, path.data(), &modes, mode.data(),
+                               nullptr) == ERROR_SUCCESS) {
+            // The primary display's path first (its source at desktop 0,0), else the first.
+            double first = 0.0;
+            for (UINT32 i = 0; i < paths; ++i) {
+                const auto& r = path[i].targetInfo.refreshRate;
+                if (r.Denominator == 0 || r.Numerator == 0) continue;
+                const double hz = static_cast<double>(r.Numerator) / r.Denominator;
+                if (first <= 0.0) first = hz;
+                const UINT32 m = path[i].sourceInfo.modeInfoIdx;
+                if (m < modes && mode[m].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
+                    mode[m].sourceMode.position.x == 0 && mode[m].sourceMode.position.y == 0) {
+                    return hz;
+                }
+            }
+            if (first > 30.0) return first;
+        }
+    }
+    DEVMODEA dm{};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) != 0 && dm.dmDisplayFrequency > 30) {
+        return static_cast<double>(dm.dmDisplayFrequency);
+    }
+    return 0.0;
+}
 
 double RefreshTarget() {
     DEVMODEA mode{};
@@ -485,6 +523,23 @@ CameraValues FromCamera(const float* m, bool camera_valid) {
     return out;
 }
 
+// 1.58 (bb-fgpace-158): FG hold-off. r149_0451 / r149_0459: around menus and loading screens
+// generation went off / on on alternate presents ("generation on 58 of 77 frames (no 3D 19)",
+// "FSR3 FG: off" / "on" every frame). Off stays immediate (a present without 3D inputs); on again
+// only after BB_FG_HOLDOFF (default 8) presents in a row with good inputs.
+int HoldoffFrames() {
+    static const int n = [] {
+        const char* e = Env("BB_FG_HOLDOFF");
+        return e != nullptr && *e != '\0' ? std::clamp(std::atoi(e), 0, 600) : 8;
+    }();
+    return n;
+}
+struct Holdoff {
+    int run = 0;          // presents in a row with good inputs
+    bool waiting = false; // inputs came back, generation not yet on
+    uint32_t resumes = 0, aborted = 0, held = 0;
+} g_holdoff;
+
 void LogState(int state, const char* text) {
     if (state == g_state_logged) return;
     g_state_logged = state;
@@ -507,6 +562,39 @@ void LogPresentIntervals(double window) {
            static_cast<double>(pace[4]) / 1e6, static_cast<double>(pace[5]) / 1e6,
            static_cast<long long>(pace[1]), g_stats.slotted, g_stats.real,
            static_cast<long long>(pace[6]), static_cast<double>(pace[7]) / 1e6);
+    if (g_take_pace_stats2 != nullptr) {
+        // 1.58: the CPU present intervals by the kind of present they end at, and the DLL's
+        // readiness offset (targets = grid slot + offset; the [display] line has the display side).
+        int64_t q[24]{};
+        g_take_pace_stats2(q, 24);
+        const auto part = [](const int64_t* t, char* out, size_t size) {
+            if (t[0] < 2) {
+                std::snprintf(out, size, "n/a");
+                return;
+            }
+            const double n = static_cast<double>(t[0]);
+            const double mean = static_cast<double>(t[1]) / n / 1e6;
+            const double var = static_cast<double>(t[2]) / n / 1e12 - mean * mean;
+            std::snprintf(out, size, "mean %.2f sd %.2f min %.2f max %.2f ms (%lld)", mean,
+                          std::sqrt(std::max(var, 0.0)), static_cast<double>(t[3]) / 1e6,
+                          static_cast<double>(t[4]) / 1e6, static_cast<long long>(t[0]));
+        };
+        char into_real[96], into_gen[96];
+        part(&q[0], into_real, sizeof(into_real));
+        part(&q[5], into_gen, sizeof(into_gen));
+        Printf("[fg-pace] 1.58 presents (CPU, DLL): into generated %s | into real %s | readiness "
+               "offset %.2f ms (raised %lld, lowered %lld; KYTY_FSR3_PACE_ADAPT=0 off), late %lld "
+               "of %lld (max %.2f ms), min slack %.2f ms | hold-off %d frames: resumes %u, "
+               "aborted %u, frames held %u | step %s",
+               into_gen, into_real, static_cast<double>(q[10]) / 1e6,
+               static_cast<long long>(q[11]), static_cast<long long>(q[12]),
+               static_cast<long long>(q[14]), static_cast<long long>(q[13]),
+               static_cast<double>(q[15]) / 1e6,
+               q[16] > 0 && q[16] < 1000000000ll ? static_cast<double>(q[16]) / 1e6 : 0.0,
+               HoldoffFrames(), g_holdoff.resumes, g_holdoff.aborted, g_holdoff.held,
+               BB::FG::PaceLockText().c_str());
+        g_holdoff.resumes = g_holdoff.aborted = g_holdoff.held = 0;
+    }
 }
 
 bool LoadApi() {
@@ -534,6 +622,8 @@ bool LoadApi() {
             GetProcAddress(g_dll, "kytyFfxSetPaceSlot"));
         g_take_pace_stats =
             reinterpret_cast<void (*)(int64_t*)>(GetProcAddress(g_dll, "kytyFfxTakePaceStats"));
+        g_take_pace_stats2 = reinterpret_cast<void (*)(int64_t*, int)>(
+            GetProcAddress(g_dll, "kytyFfxTakePaceStats2"));
         g_take_display_ids = reinterpret_cast<uint32_t (*)(uint64_t*, uint32_t)>(
             GetProcAddress(g_dll, "kytyFfxTakeDisplayIds"));
         Display::SetAmdHooks(reinterpret_cast<VkSwapchainKHR (*)(VkSwapchainKHR)>(
@@ -691,6 +781,23 @@ double PaceInterval() {
     return Active() && g_generating ? CapInterval() : 0.0;
 }
 
+std::atomic<double> g_display_hz{-1.0};
+
+void UpdateDisplayHz() {
+    const double v = QueryRefreshHz();
+    const double old = g_display_hz.exchange(v);
+    if (v > 30.0 && std::fabs(v - old) > 0.001) {
+        Printf("[fg-pace] display refresh %.3f Hz (QueryDisplayConfig)", v);
+    }
+}
+
+// (QueryDisplayConfig can take milliseconds: read once and again when the FG swapchain is made,
+// never on the flip path.)
+double DisplayHz() {
+    if (g_display_hz.load(std::memory_order_relaxed) < 0.0) UpdateDisplayHz();
+    return std::max(g_display_hz.load(std::memory_order_relaxed), 0.0);
+}
+
 bool Generating() {
     return Active() && g_generating;
 }
@@ -744,6 +851,7 @@ bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* o
     create.presentQueue = {g_present_queue, g_game_family, nullptr};
     create.imageAcquireQueue = {g_acquire_queue, g_compute_family, nullptr};
     MfgInit();
+    UpdateDisplayHz(); // 1.58: the mode may have changed (fullscreen, another display)
     g_display_ids = g_take_display_ids != nullptr && Display::IdsAvailable();
     SetEnvironmentVariableA("KYTY_FSR3_DISPLAY_IDS", g_display_ids ? "1" : nullptr);
     Printf("[display] FSR 3 presents: %s", g_display_ids
@@ -1203,7 +1311,26 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         return;
     }
 
-    const bool generate = usable && g_fg_context != nullptr;
+    bool held = false;
+    {
+        auto& h = g_holdoff;
+        if (!usable) {
+            if (h.waiting) ++h.aborted;
+            h.run = 0;
+            h.waiting = false;
+        } else {
+            h.run = std::min(h.run + 1, 1 << 20);
+            held = !g_generating && h.run <= HoldoffFrames();
+            if (held) {
+                h.waiting = true;
+                ++h.held;
+            } else if (h.waiting) {
+                h.waiting = false;
+                ++h.resumes;
+            }
+        }
+    }
+    const bool generate = usable && !held && g_fg_context != nullptr;
     ++g_frame_id;
     ffxConfigureDescFrameGeneration config{};
     config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
@@ -1263,7 +1390,11 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     }
     if (!generate) {
         g_generating = false;
-        LogState(1, "off (no 3D frame: menu, loading or movie)");
+        if (held) {
+            LogState(3, "off: 3D frames back, waiting for BB_FG_HOLDOFF good frames in a row");
+        } else {
+            LogState(1, "off (no 3D frame: menu, loading or movie)");
+        }
         return;
     }
 
@@ -1460,6 +1591,9 @@ bool Generating() {
     return false;
 }
 void NoteSlept(double) {}
+double DisplayHz() {
+    return 0.0;
+}
 bool Active() {
     return false;
 }

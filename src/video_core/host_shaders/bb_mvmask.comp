@@ -1,21 +1,39 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
-// 1.54 (bb-mvmask-154): whole-image motion field + source / confidence mask for frame generation.
-// Runs after the camera pass (bb_mv.comp: depth reprojection) and the object compose
-// (bb_objmv.comp: skinned per-vertex motion). Two modes (p.size.z bits 8..9):
-//  mode 0 (quarter resolution): one invocation per 4x4 block. Photometric check of the block's
-//    current vector (previous luminance warped by it vs current luminance); where it does not
-//    explain the image, a block-matching search around it (step 2, radius p.size.w, then +-1
-//    refinement) gives an optical-flow vector. Block result: (vector, class, confidence).
-//  mode 1 (full resolution): every pixel takes its block's flow vector when that explains its own
-//    3x3 neighbourhood at least as well as its current vector; writes the class / confidence
-//    image (r16ui: class | confidence * 255 << 8; class 0 camera-only, 1 skinned object, 2 flow)
-//    and the frame-generation hint (r8: how much to trust the current colour over warping).
-// Vectors: render pixels towards the previous position (prev = pixel + mv), as bb_mv.comp.
+// 1.54 (bb-mvmask-154), 1.58 (bb-fgpace-158): whole-image motion field + source / confidence mask
+// for frame generation and the upscalers. Runs after the camera pass (bb_mv.comp: depth
+// reprojection) and the object compose (bb_objmv.comp: skinned per-vertex motion) on the HUD-less
+// scene luminance (bb_mv.comp writes it from the upscaler's colour input, before any HUD), and
+// refines the vectors where they do not explain the image: particles, cloth, physics props,
+// effects, limbs the skinned vectors miss.
+// 1.58: hierarchical search. Four passes (p.size.z bits 8..10):
+//  mode 2 (quarter res): log-luminance pyramid level, the mean of each 4x4 block of the current and
+//    previous luminance (q_cur, q_prev).
+//  mode 3 (quarter res): coarse forward (current -> previous) and backward (previous -> current)
+//    block matching on that level: 3x3 patch (12x12 render px), zero-mean SAD, a window of
+//    +-ceil(radius / 4) cells around the block's camera / object vector (every other cell, then
+//    +-1 around the best) plus +-2 around zero, then a parabola fit for a sub-cell vector.
+//    coarse = (forward, backward), render px.
+//  mode 0 (quarter res): per 4x4 block, the candidates own (camera / object), zero, the coarse
+//    vector of the block and its 8 neighbours (spatial predictors), each scored on a 6x6 support
+//    (zero-mean SAD + a smoothness term towards the median of the coarse neighbours), +-2 integer
+//    refinement around the best, a parabola fit (sub-pixel), then a forward-backward check (the
+//    backward coarse vector where the block lands must bring it back within 3 px or 20 %) and an
+//    occlusion / ambiguity check (residual cost). Block result: (vector, class, confidence).
+//  mode 1 (full res): per pixel the best of its own vector, its block's flow vector and the 4
+//    neighbouring blocks' flow vectors on its 3x3 neighbourhood (sharp object edges); writes the
+//    class / confidence image (r16ui: class | confidence * 255 << 8; class 0 camera-only,
+//    1 skinned object, 2 flow) and raises the reactive mask.
+// Vectors: render pixels towards the previous position (prev = pixel + mv), UNJITTERED, as bb_mv.comp
+// and as FSR 3 FG / DLSS-G are told (motionVectorsJittered false). The luminance images are
+// jittered: an image displacement is mv + (jitter_prev - jitter_cur) (p.tune2.yz), taken out here.
 // p.size.z bit 0: previous luminance valid, bit 1: object image valid.
 // p.tune: relative gain, absolute gain (log2 / px), min block texture, confidence scale.
+// p.tune2: x reactive gain, yz jitter_prev - jitter_cur (px), w smoothness weight.
 // Stats: 0 camera px, 1 object px, 2 flow px, 3 sum of confidence * 255, 4 all px,
-// 5 blocks searched, 6 blocks given flow.
+// 5 blocks searched, 6 blocks given flow, 7 forward-backward rejects, 8 occlusion rejects,
+// 9 sum |flow - own| x 16 over flow blocks, 10 pixels that took a neighbour block's flow,
+// 11 flow blocks whose vector came from the coarse level (not own / zero).
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, r16f) uniform readonly image2D lum_prev;
@@ -28,13 +46,16 @@ layout(binding = 6, r8) uniform image2D reactive; // the upscalers' reactive mas
 layout(binding = 7, std430) buffer Stats {
     uint s[16];
 } st;
+layout(binding = 8, r16f) uniform image2D q_prev;  // quarter-res log2 luminance, previous
+layout(binding = 9, r16f) uniform image2D q_cur;   // quarter-res log2 luminance, current
+layout(binding = 10, rgba16f) uniform image2D coarse; // forward xy, backward zw (image px)
 layout(push_constant) uniform Push {
-    uvec4 size; // width, height, flags | mode << 8, search radius
+    uvec4 size; // width, height, flags | mode << 8, search radius (render px)
     vec4 tune;
-    vec4 tune2; // x: hint gain into the reactive mask (BB_MVMASK_REACTIVE)
+    vec4 tune2;
 } p;
 
-shared uint g_cam, g_obj, g_flow, g_conf, g_all;
+shared uint g_cam, g_obj, g_flow, g_conf, g_all, g_nb;
 
 float L(float l) {
     if (isnan(l) || isinf(l)) l = 0.0;
@@ -43,11 +64,23 @@ float L(float l) {
 ivec2 Clamp(ivec2 c) {
     return clamp(c, ivec2(0), ivec2(p.size.xy) - 1);
 }
+ivec2 QSize() {
+    return (ivec2(p.size.xy) + 3) / 4;
+}
+ivec2 QClamp(ivec2 c) {
+    return clamp(c, ivec2(0), QSize() - 1);
+}
 float Cur(ivec2 c) {
     return L(imageLoad(lum_cur, Clamp(c)).r);
 }
 float Prev(ivec2 c) {
     return L(imageLoad(lum_prev, Clamp(c)).r);
+}
+float QCur(ivec2 c) {
+    return imageLoad(q_cur, QClamp(c)).r;
+}
+float QPrev(ivec2 c) {
+    return imageLoad(q_prev, QClamp(c)).r;
 }
 vec2 Fix(vec2 v) {
     return (any(isnan(v)) || any(isinf(v))) ? vec2(0.0) : v;
@@ -57,40 +90,170 @@ bool IsObj(ivec2 c) {
     uint y = imageLoad(obj_mv, Clamp(c)).y;
     return y != 0u && y < 8u;
 }
+vec2 Dj() {
+    return p.tune2.yz; // image displacement = mv + Dj()
+}
+// Sub-cell offset of a parabola through (-1, a), (0, b), (1, c), in [-0.5, 0.5].
+float Parabola(float a, float b, float c) {
+    float d = a - 2.0 * b + c;
+    if (d <= 1e-6) return 0.0;
+    return clamp(0.5 * (a - c) / d, -0.5, 0.5);
+}
 
-float cur4[16];
-float BlockCost(ivec2 base, ivec2 v) {
-    float e = 0.0;
+// ---- mode 2: pyramid level ---------------------------------------------------------------------
+void Downsample() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(q, QSize()))) return;
+    float c = 0.0, pv = 0.0;
     for (int i = 0; i < 16; ++i) {
-        ivec2 o = ivec2(i & 3, i >> 2);
-        e += abs(cur4[i] - Prev(base + o + v));
+        ivec2 o = q * 4 + ivec2(i & 3, i >> 2);
+        c += Cur(o);
+        pv += Prev(o);
     }
-    return e * (1.0 / 16.0);
+    imageStore(q_cur, q, vec4(c * (1.0 / 16.0)));
+    imageStore(q_prev, q, vec4(pv * (1.0 / 16.0)));
+}
+
+// ---- mode 3: coarse forward / backward search -----------------------------------------------------
+float src9[9];
+float mean9;
+// Zero-mean SAD of src9 against `dst` (0: q_prev, 1: q_cur) at q + o + v, plus a quarter of the
+// mean difference (so a flat shift in brightness still costs a little).
+float QCost(ivec2 q, ivec2 v, bool to_prev) {
+    float d[9];
+    float m = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        ivec2 o = q + ivec2(i % 3 - 1, i / 3 - 1) + v;
+        d[i] = to_prev ? QPrev(o) : QCur(o);
+        m += d[i];
+    }
+    m *= 1.0 / 9.0;
+    float e = 0.0;
+    for (int i = 0; i < 9; ++i) e += abs((src9[i] - mean9) - (d[i] - m));
+    return e * (1.0 / 9.0) + 0.25 * abs(mean9 - m);
+}
+
+vec2 QSearch(ivec2 q, ivec2 centre, int r, bool to_prev) {
+    float best = 1e30;
+    ivec2 bv = ivec2(0);
+    // Every other cell of the window (each cell is 4 render px), then +-1 around the best.
+    for (int dy = -r; dy <= r; dy += 2) {
+        for (int dx = -r; dx <= r; dx += 2) {
+            ivec2 v = centre + ivec2(dx, dy);
+            float e = QCost(q, v, to_prev) + 0.003 * float(abs(dx) + abs(dy));
+            if (e < best) {
+                best = e;
+                bv = v;
+            }
+        }
+    }
+    {
+        ivec2 c0 = bv;
+        for (int i = 0; i < 9; ++i) {
+            if (i == 4) continue;
+            ivec2 v = c0 + ivec2(i % 3 - 1, i / 3 - 1);
+            ivec2 d = v - centre;
+            float e = QCost(q, v, to_prev) + 0.003 * float(abs(d.x) + abs(d.y));
+            if (e < best) {
+                best = e;
+                bv = v;
+            }
+        }
+    }
+    // Around zero motion too (an object the camera follows, a still particle over a moving view).
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            ivec2 v = ivec2(dx, dy);
+            if (all(lessThanEqual(abs(v - centre), ivec2(r)))) continue;
+            float e = QCost(q, v, to_prev) + 0.003 * float(abs(dx) + abs(dy)) + 0.01;
+            if (e < best) {
+                best = e;
+                bv = v;
+            }
+        }
+    }
+    float b = QCost(q, bv, to_prev);
+    float sx = Parabola(QCost(q, bv - ivec2(1, 0), to_prev), b, QCost(q, bv + ivec2(1, 0), to_prev));
+    float sy = Parabola(QCost(q, bv - ivec2(0, 1), to_prev), b, QCost(q, bv + ivec2(0, 1), to_prev));
+    return (vec2(bv) + vec2(sx, sy)) * 4.0;
+}
+
+void Coarse() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(q, QSize()))) return;
+    vec2 own_img = Fix(imageLoad(mv, Clamp(q * 4 + 2)).xy) + Dj();
+    int r = max(int((p.size.w + 3u) / 4u), 1);
+    ivec2 centre = ivec2(round(own_img * 0.25));
+    // forward: the current patch in the previous level
+    mean9 = 0.0;
+    float sq = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        src9[i] = QCur(q + ivec2(i % 3 - 1, i / 3 - 1));
+        mean9 += src9[i];
+        sq += src9[i] * src9[i];
+    }
+    mean9 *= 1.0 / 9.0;
+    float var = max(sq / 9.0 - mean9 * mean9, 0.0);
+    vec2 fwd = own_img, bwd = -own_img;
+    if (var >= p.tune.z) fwd = QSearch(q, centre, r, true);
+    // backward: the previous patch in the current level
+    mean9 = 0.0;
+    sq = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        src9[i] = QPrev(q + ivec2(i % 3 - 1, i / 3 - 1));
+        mean9 += src9[i];
+        sq += src9[i] * src9[i];
+    }
+    mean9 *= 1.0 / 9.0;
+    var = max(sq / 9.0 - mean9 * mean9, 0.0);
+    if (var >= p.tune.z) bwd = QSearch(q, -centre, r, false);
+    imageStore(coarse, q, vec4(fwd, bwd));
+}
+
+// ---- mode 0: full-resolution refinement per 4x4 block ---------------------------------------------
+float cur36[36];
+float cmean;
+// Zero-mean SAD over the 6x6 support (the 4x4 block and a 1 px border) at image vector v.
+float BlockCost(ivec2 base, ivec2 v) {
+    float d[36];
+    float m = 0.0;
+    for (int i = 0; i < 36; ++i) {
+        d[i] = Prev(base + ivec2(i % 6 - 1, i / 6 - 1) + v);
+        m += d[i];
+    }
+    m *= 1.0 / 36.0;
+    float e = 0.0;
+    for (int i = 0; i < 36; ++i) e += abs((cur36[i] - cmean) - (d[i] - m));
+    return e * (1.0 / 36.0) + 0.25 * abs(cmean - m);
 }
 
 void Blocks() {
     ivec2 b = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 qs = (ivec2(p.size.xy) + 3) / 4;
-    if (b.x >= qs.x || b.y >= qs.y) return;
+    if (any(greaterThanEqual(b, QSize()))) return;
     ivec2 base = b * 4;
     vec2 own = Fix(imageLoad(mv, Clamp(base + 2)).xy);
-    float mean = 0.0, sq = 0.0;
     uint nobj = 0u;
-    for (int i = 0; i < 16; ++i) {
-        ivec2 c = base + ivec2(i & 3, i >> 2);
-        cur4[i] = Cur(c);
-        mean += cur4[i];
-        sq += cur4[i] * cur4[i];
-        if (IsObj(c)) ++nobj;
+    cmean = 0.0;
+    float sq = 0.0;
+    for (int i = 0; i < 36; ++i) {
+        ivec2 c = base + ivec2(i % 6 - 1, i / 6 - 1);
+        cur36[i] = Cur(c);
+        cmean += cur36[i];
+        sq += cur36[i] * cur36[i];
     }
-    mean *= 1.0 / 16.0;
-    float var = max(sq / 16.0 - mean * mean, 0.0);
+    for (int i = 0; i < 16; ++i) {
+        if (IsObj(base + ivec2(i & 3, i >> 2))) ++nobj;
+    }
+    cmean *= 1.0 / 36.0;
+    float var = max(sq / 36.0 - cmean * cmean, 0.0);
     float cls_v = nobj >= 6u ? 1.0 : 0.0;
     if ((p.size.z & 1u) == 0u) {
         imageStore(blocks, b, vec4(own, cls_v, 0.5));
         return;
     }
-    ivec2 iown = ivec2(round(own));
+    vec2 dj = Dj();
+    vec2 own_img = own + dj;
+    ivec2 iown = ivec2(round(own_img));
     float e_own = BlockCost(base, iown);
     float conf_scale = max(p.tune.w, 1e-3);
     if (var < p.tune.z) {
@@ -99,73 +262,146 @@ void Blocks() {
         return;
     }
     atomicAdd(st.s[5], 1u);
-    ivec2 best = iown;
-    float e_best = e_own;
-    int r = int(p.size.w);
-    for (int dy = -r; dy <= r; dy += 2) {
-        for (int dx = -r; dx <= r; dx += 2) {
-            ivec2 v = iown + ivec2(dx, dy);
-            float e = BlockCost(base, v) + 0.002 * float(abs(dx) + abs(dy));
-            if (e < e_best) {
-                e_best = e;
-                best = v;
-            }
-        }
-    }
-    {
-        float e0 = BlockCost(base, ivec2(0));
-        if (e0 < e_best) {
-            e_best = e0;
-            best = ivec2(0);
-        }
-    }
-    ivec2 c0 = best;
+    // Spatial predictors: the coarse forward vectors of the block and its 8 neighbours; their
+    // median (per axis) is the smoothness anchor.
+    vec2 cand[9];
+    float xs[9], ys[9];
     for (int i = 0; i < 9; ++i) {
-        ivec2 v = c0 + ivec2(i % 3 - 1, i / 3 - 1);
+        cand[i] = Fix(imageLoad(coarse, QClamp(b + ivec2(i % 3 - 1, i / 3 - 1))).xy);
+        xs[i] = cand[i].x;
+        ys[i] = cand[i].y;
+    }
+    for (int i = 1; i < 9; ++i) {
+        float kx = xs[i], ky = ys[i];
+        int j = i - 1;
+        while (j >= 0 && xs[j] > kx) { xs[j + 1] = xs[j]; --j; }
+        xs[j + 1] = kx;
+        j = i - 1;
+        while (j >= 0 && ys[j] > ky) { ys[j + 1] = ys[j]; --j; }
+        ys[j + 1] = ky;
+    }
+    vec2 med = vec2(xs[4], ys[4]);
+    float lambda = p.tune2.w;
+    float e_best = e_own + lambda * length(own_img - med) * 0.02;
+    ivec2 best = iown;
+    bool from_coarse = false;
+    {
+        ivec2 z = ivec2(round(dj));
+        float e = BlockCost(base, z) + lambda * length(vec2(z) - med) * 0.02;
+        if (e < e_best) { e_best = e; best = z; }
+    }
+    for (int i = 0; i < 9; ++i) {
+        ivec2 v = ivec2(round(cand[i]));
+        if (v == best) continue;
+        float e = BlockCost(base, v) + lambda * length(vec2(v) - med) * 0.02;
+        if (e < e_best) { e_best = e; best = v; from_coarse = true; }
+    }
+    // +-2 integer refinement around the best candidate.
+    ivec2 c0 = best;
+    float costs[25];
+    for (int i = 0; i < 25; ++i) {
+        ivec2 v = c0 + ivec2(i % 5 - 2, i / 5 - 2);
         float e = BlockCost(base, v);
-        if (e < e_best) {
-            e_best = e;
-            best = v;
+        costs[i] = e;
+        e += lambda * length(vec2(v) - med) * 0.02;
+        if (e < e_best) { e_best = e; best = v; }
+    }
+    // Sub-pixel: parabola through the neighbours of the best integer vector.
+    ivec2 rel = best - c0 + 2;
+    float eb = BlockCost(base, best);
+    float ex0 = (rel.x >= 1) ? costs[rel.y * 5 + rel.x - 1] : BlockCost(base, best - ivec2(1, 0));
+    float ex1 = (rel.x <= 3) ? costs[rel.y * 5 + rel.x + 1] : BlockCost(base, best + ivec2(1, 0));
+    float ey0 = (rel.y >= 1) ? costs[(rel.y - 1) * 5 + rel.x] : BlockCost(base, best - ivec2(0, 1));
+    float ey1 = (rel.y <= 3) ? costs[(rel.y + 1) * 5 + rel.x] : BlockCost(base, best + ivec2(0, 1));
+    vec2 vimg = vec2(best) + vec2(Parabola(ex0, eb, ex1), Parabola(ey0, eb, ey1));
+    bool flow = length(vimg - own_img) >= 0.75 && eb < e_own * (1.0 - p.tune.x) &&
+                e_own - eb > p.tune.y;
+    if (flow) {
+        // Forward-backward: the backward coarse vector where this block lands in the previous frame
+        // must bring it back (occlusions, disocclusions and wrong matches fail).
+        vec2 land = vec2(base + 2) + vimg;
+        vec2 back = Fix(imageLoad(coarse, QClamp(ivec2(floor(land * 0.25)))).zw);
+        float err = length(vimg + back);
+        if (err > max(3.0, 0.2 * length(vimg))) {
+            flow = false;
+            atomicAdd(st.s[7], 1u);
+        } else if (eb > conf_scale) {
+            // Still a poor match: occluded / transparent / changing (fire, fog); not trusted.
+            flow = false;
+            atomicAdd(st.s[8], 1u);
         }
     }
-    bool flow = best != iown && e_best < e_own * (1.0 - p.tune.x) && e_own - e_best > p.tune.y;
     if (flow) {
         atomicAdd(st.s[6], 1u);
-        float conf = clamp(1.0 - e_best / max(e_own, 1e-4), 0.0, 1.0) *
-                     clamp(1.0 - e_best / conf_scale, 0.0, 1.0);
-        imageStore(blocks, b, vec4(vec2(best), 2.0, conf));
+        if (from_coarse) atomicAdd(st.s[11], 1u);
+        vec2 v = vimg - dj; // unjittered
+        atomicAdd(st.s[9], uint(clamp(length(v - own), 0.0, 4096.0) * 16.0));
+        float conf = clamp(1.0 - eb / max(e_own, 1e-4), 0.0, 1.0) *
+                     clamp(1.0 - eb / conf_scale, 0.0, 1.0);
+        imageStore(blocks, b, vec4(v, 2.0, conf));
     } else {
         imageStore(blocks, b, vec4(own, cls_v, clamp(1.0 - e_own / conf_scale, 0.0, 1.0)));
     }
 }
 
-float PixCost(ivec2 c, ivec2 v) {
+// ---- mode 1: per pixel ----------------------------------------------------------------------------
+float cur9[9];
+float PixCost(ivec2 c, vec2 v_img) {
+    ivec2 v = ivec2(round(v_img));
     float e = 0.0;
     for (int i = 0; i < 9; ++i) {
         ivec2 o = ivec2(i % 3 - 1, i / 3 - 1);
-        e += abs(Cur(c + o) - Prev(c + o + v));
+        e += abs(cur9[i] - Prev(c + o + v));
     }
     return e;
 }
 
 void Apply() {
     if (gl_LocalInvocationIndex == 0u) {
-        g_cam = 0u; g_obj = 0u; g_flow = 0u; g_conf = 0u; g_all = 0u;
+        g_cam = 0u; g_obj = 0u; g_flow = 0u; g_conf = 0u; g_all = 0u; g_nb = 0u;
     }
     barrier();
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     bool inside = c.x < int(p.size.x) && c.y < int(p.size.y);
     if (inside) {
-        vec4 blk = imageLoad(blocks, c / 4);
+        ivec2 bi = c / 4;
+        vec4 blk = imageLoad(blocks, bi);
         vec2 own = Fix(imageLoad(mv, c).xy);
+        vec2 dj = Dj();
         bool obj = IsObj(c);
         uint k = obj ? 1u : 0u;
         float conf = clamp(blk.w, 0.0, 1.0);
-        if (blk.z > 1.5) {
-            ivec2 f = ivec2(round(blk.xy));
-            if (PixCost(c, f) <= PixCost(c, ivec2(round(own)))) {
-                imageStore(mv, c, vec4(blk.xy, 0.0, 0.0));
+        if ((p.size.z & 1u) != 0u) {
+            for (int i = 0; i < 9; ++i) cur9[i] = Cur(c + ivec2(i % 3 - 1, i / 3 - 1));
+            float e_own = PixCost(c, own + dj);
+            float e_sel = 1e30;
+            vec2 sel = own;
+            float sel_conf = conf;
+            bool nb = false;
+            if (blk.z > 1.5) {
+                e_sel = PixCost(c, blk.xy + dj);
+                sel = blk.xy;
+            }
+            // The 4 neighbouring blocks' flow vectors (a limb / cape edge crossing this block).
+            ivec2 off[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+            for (int i = 0; i < 4; ++i) {
+                ivec2 nbi = bi + off[i];
+                if (any(lessThan(nbi, ivec2(0))) || any(greaterThanEqual(nbi, QSize()))) continue;
+                vec4 n = imageLoad(blocks, nbi);
+                if (n.z <= 1.5) continue;
+                float e = PixCost(c, n.xy + dj);
+                if (e < e_sel * 0.9 && e < e_own * 0.9) {
+                    e_sel = e;
+                    sel = n.xy;
+                    sel_conf = clamp(n.w, 0.0, 1.0) * 0.9;
+                    nb = true;
+                }
+            }
+            if (e_sel <= e_own) {
+                imageStore(mv, c, vec4(sel, 0.0, 0.0));
                 k = 2u;
+                conf = sel_conf;
+                if (nb) atomicAdd(g_nb, 1u);
             }
         }
         uint q = uint(conf * 255.0 + 0.5);
@@ -188,13 +424,19 @@ void Apply() {
         atomicAdd(st.s[2], g_flow);
         atomicAdd(st.s[3], g_conf);
         atomicAdd(st.s[4], g_all);
+        atomicAdd(st.s[10], g_nb);
     }
 }
 
 void main() {
-    if (((p.size.z >> 8u) & 3u) == 0u) {
+    uint mode = (p.size.z >> 8u) & 7u;
+    if (mode == 0u) {
         Blocks();
-    } else {
+    } else if (mode == 1u) {
         Apply();
+    } else if (mode == 2u) {
+        Downsample();
+    } else {
+        Coarse();
     }
 }

@@ -123,6 +123,8 @@ struct Window {
     Clock::time_point prev{};
     bool have_prev = false;
     std::vector<double> intervals; // ms between consecutive displayed images
+    // 1.58 (bb-fgpace-158): the same, split by the kind of image the interval ends at
+    std::vector<double> into_real, into_gen;
     uint32_t done_all = 0, done_real = 0, done_gen = 0;
     uint32_t waits_ok = 0, waits_timeout = 0;
     uint32_t seen_epoch = 0;
@@ -237,6 +239,8 @@ void Report(State& s, Window& w, Clock::time_point now) {
     }
     if (real_issued == 0 && !waited && sl_calls == 0) {
         w.intervals.clear();
+        w.into_real.clear();
+        w.into_gen.clear();
         w.done_all = w.done_real = w.done_gen = 0;
         w.waits_ok = w.waits_timeout = 0;
         w.start = now;
@@ -302,6 +306,29 @@ void Report(State& s, Window& w, Clock::time_point now) {
            static_cast<unsigned long long>(acct_expected), source, why, PresentModeName(mode),
            w.waits_ok, w.waits_timeout, sl);
     if (gpu_note[0] != '\0') Printf("[display]%s", gpu_note);
+    if (!w.into_gen.empty() && w.into_real.size() >= 2 && w.into_gen.size() >= 2) {
+        // 1.58: display-side spacing by kind (present_wait): real -> generated and generated ->
+        // real should both be the shown interval; a difference is the generated frame placed off
+        // the middle.
+        const auto stat = [](std::vector<double>& v, char* out, size_t size) {
+            double sum = 0.0, sq = 0.0, mx = 0.0;
+            for (double x : v) {
+                sum += x;
+                sq += x * x;
+                mx = std::max(mx, x);
+            }
+            const double n = static_cast<double>(v.size());
+            const double mean = sum / n;
+            std::snprintf(out, size, "mean %.2f sd %.2f max %.2f ms (%zu)", mean,
+                          std::sqrt(std::max(sq / n - mean * mean, 0.0)), mx, v.size());
+        };
+        char g[80], r[80];
+        stat(w.into_gen, g, sizeof(g));
+        stat(w.into_real, r, sizeof(r));
+        Printf("[fg-pace] 1.58 display (present_wait): into generated %s | into real %s", g, r);
+    }
+    w.into_real.clear();
+    w.into_gen.clear();
     w.intervals.clear();
     w.done_all = w.done_real = w.done_gen = 0;
     w.waits_ok = w.waits_timeout = 0;
@@ -309,10 +336,18 @@ void Report(State& s, Window& w, Clock::time_point now) {
 }
 
 void Record(State& s, Window& w, uint64_t id, Path path, Clock::time_point at) {
+    double ms = -1.0;
     if (w.have_prev) {
-        const double ms = std::chrono::duration<double, std::milli>(at - w.prev).count();
-        if (ms >= 0.0 && ms < 250.0) w.intervals.push_back(ms);
+        ms = std::chrono::duration<double, std::milli>(at - w.prev).count();
+        if (ms >= 0.0 && ms < 250.0) {
+            w.intervals.push_back(ms);
+        } else {
+            ms = -1.0;
+        }
     }
+    const auto note = [&](bool generated) {
+        if (ms >= 0.0) (generated ? w.into_gen : w.into_real).push_back(ms);
+    };
     w.prev = at;
     w.have_prev = true;
     ++w.done_all;
@@ -320,23 +355,28 @@ void Record(State& s, Window& w, uint64_t id, Path path, Clock::time_point at) {
         std::lock_guard lock{s.mutex};
         if (s.gen_ids.erase(id) != 0) {
             ++w.done_gen;
+            note(true);
         } else {
             ++w.done_real;
+            note(false);
         }
         return;
     }
     if (path != Path::Amd) {
         ++w.done_real;
+        note(false);
         return;
     }
     const uint64_t group = id >> 2;
     std::lock_guard lock{s.mutex};
     if ((id & 3u) != 3u) {
         ++w.done_gen;
+        note(true);
         ++s.groups[group].seen;
         return;
     }
     ++w.done_real;
+    note(false);
     const auto it = s.groups.find(group);
     if (it != s.groups.end()) {
         if (!it->second.skip && it->second.expected > 0) {
@@ -382,6 +422,8 @@ void Run() {
             w.seen_epoch = epoch;
             w.have_prev = false;
             w.intervals.clear();
+            w.into_real.clear();
+            w.into_gen.clear();
             broken = false;
             consecutive_errors = 0;
         }

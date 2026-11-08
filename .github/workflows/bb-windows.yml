@@ -39,6 +39,8 @@ jobs:
         if ($LASTEXITCODE) { throw 'SDK patch failed' }
         git -C $src apply --verbose "$env:GITHUB_WORKSPACE\tools\bb\fsr3-mfg\ffx-sdk-v1.1.4-display.patch"
         if ($LASTEXITCODE) { throw 'SDK display patch failed' }
+        git -C $src apply --verbose "$env:GITHUB_WORKSPACE\tools\bb\fsr3-mfg\ffx-sdk-v1.1.4-pace.patch"
+        if ($LASTEXITCODE) { throw 'SDK pace patch failed' }
         $configured = $false
         foreach ($gen in @('Visual Studio 18 2026', 'Visual Studio 17 2022')) {
           cmake -S "$src\ffx-api" -B "$src\ffx-api\build" -G $gen -A x64 -DFFX_API_BACKEND=VK_X64 "-DVulkan_INCLUDE_DIR=$vk\Include" "-DVulkan_LIBRARY=$vk\Lib\vulkan-1.lib"
@@ -57,6 +59,7 @@ jobs:
         if (!$ffxText.Contains('command lists of queue family')) { throw 'amd_fidelityfx_vk.dll lacks the command list pool fix' }
         if (!$ffxText.Contains('KYTY_FSR3_FG_ACTIVE')) { throw 'amd_fidelityfx_vk.dll lacks the dynamic multiplier' }
         if (!$ffxText.Contains('kytyFfxSetPaceSlot') -or !$ffxText.Contains('kytyFfxTakePaceStats')) { throw 'amd_fidelityfx_vk.dll lacks the midpoint pacing' }
+        if (!$ffxText.Contains('kytyFfxTakePaceStats2') -or !$ffxText.Contains('KYTY_FSR3_PACE_ADAPT')) { throw 'amd_fidelityfx_vk.dll lacks the 1.58 adaptive pacing' }
         if (!$ffxText.Contains('kytyFfxTakeDisplayIds') -or !$ffxText.Contains('KYTY_FSR3_DISPLAY_IDS')) { throw 'amd_fidelityfx_vk.dll lacks the display ids' }
         Get-ChildItem _Build\deps\ffx | ForEach-Object { '{0,12:N0}  {1}  md5 {2}' -f $_.Length, $_.Name, (Get-FileHash -Algorithm MD5 $_.FullName).Hash.ToLower() }
     - name: Streamline SDK (DLSS)

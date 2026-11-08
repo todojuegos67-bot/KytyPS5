@@ -1,0 +1,197 @@
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+index 91d1ba0..eb04a5d 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+@@ -834,10 +834,34 @@ int64_t kytyQpcFrequency()
+     return frequency;
+ }
+ 
++// Kyty 1.58 (bb-fgpace-158): per frame kind present intervals and the adaptive latency offset.
++// kytyPaceStats2[]: [0..4] intervals ending at a real present (n, sum, sum of squares, min, max; ns),
++// [5..9] the same ending at a generated present, [10] the offset now (ns), [11] raises, [12] lowers,
++// [13] presents with a target, [14] late of them (> 0.25 ms), [15] max late (ns), [16] min slack (ns).
++int64_t               kytyPaceStats2[24] = {};
++thread_local int      kytyPresentKind    = 0;  // the present about to be made: 0 none / direct, 1 real, 2 generated
++volatile int64_t      kytyPaceOffsetQpc  = 0;  // added to every target: the generated frames' readiness after the slot
++int64_t               kytyPaceSlackMinQpc = INT64_MAX;
++uint32_t              kytyPaceSlackCount  = 0;
++int64_t               kytyPaceRaises = 0, kytyPaceLowers = 0;
++
++bool kytyPaceAdaptOn()
++{
++    static const bool on = []
++    {
++        char  value[8] = {};
++        const DWORD n  = GetEnvironmentVariableA("KYTY_FSR3_PACE_ADAPT", value, sizeof(value));
++        return !(n > 0 && n < sizeof(value) && value[0] == '0');
++    }();
++    return on;
++}
++
+ void kytyNotePresent()
+ {
+     int64_t now = 0;
+     QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&now));
++    const int kind  = kytyPresentKind;
++    kytyPresentKind = 0;
+     AcquireSRWLockExclusive(&kytyPaceLock);
+     ++kytyPaceStats[0];
+     if (kytyPaceLastQpc != 0 && now > kytyPaceLastQpc)
+@@ -852,6 +876,14 @@ void kytyNotePresent()
+             ++kytyPaceStats[1];
+             kytyPaceStats[2] += ns;
+             kytyPaceStats[3] += ns * ns;
++            int64_t* t = &kytyPaceStats2[kind == 2 ? 5 : 0];
++            if (t[0] == 0 || ns < t[3])
++                t[3] = ns;
++            if (ns > t[4])
++                t[4] = ns;
++            ++t[0];
++            t[1] += ns;
++            t[2] += ns * ns;
+         }
+     }
+     kytyPaceLastQpc = now;
+@@ -874,8 +906,17 @@ void kytyNotePaceLate(int64_t nowQpc, int64_t targetQpc)
+ 
+ // A present with an absolute target (Kyty midpoint pacing) waits until the target, never past it by
+ // its own choice (the spin); without one, the stock wait after the previous present.
+-void kytyWaitForPresent(const PacingData::FrameInfo& frameInfo, int64_t previousPresentQpc)
+-{
++// Kyty 1.58 (bb-fgpace-158): the targets are the emulator's grid slot (taken on the CPU at the guest flip) plus
++// kytyPaceOffsetQpc. A generated frame can only be presented once the next real frame was rendered and the
++// interpolation ran on the GPU; r149_0459 (60 real / 120 shown, 240 Hz FIFO): 62 of 122 presents a second reached
++// the presenter after their target (up to 8 ms), so the generated frame went out just before the real one
++// ([midpoint] sd 5-6 ms, min 0.6 ms; [display] sd 4.5 ms). The offset rises at once by what a frame was late (+0.5 ms)
++// and falls by at most 0.5 ms each half second in which every frame had more than 2 ms to spare (a
++// hitch, later than 3/4 of the interval, does not move it): all presents keep the same
++// spacing, at the cost of the latency the GPU really needs. KYTY_FSR3_PACE_ADAPT=0: no offset (1.57).
++void kytyWaitForPresent(const PacingData::FrameInfo& frameInfo, int64_t previousPresentQpc, int kind = 0)
++{
++    kytyPresentKind = kind;
+     if (frameInfo.presentQpcTarget == 0)
+     {
+         waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
+@@ -884,6 +925,63 @@ void kytyWaitForPresent(const PacingData::FrameInfo& frameInfo, int64_t previous
+     int64_t now = 0;
+     QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&now));
+     kytyNotePaceLate(now, frameInfo.presentQpcTarget);
++    {
++        const int64_t frequency = kytyQpcFrequency();
++        const int64_t late      = now - frameInfo.presentQpcTarget;
++        const int64_t interval  = kytyPaceIntervalQpc;
++        AcquireSRWLockExclusive(&kytyPaceLock);
++        ++kytyPaceStats2[13];
++        if (late > frequency / 4000)
++        {
++            ++kytyPaceStats2[14];
++            const int64_t ns = late * 1000000000 / frequency;
++            if (ns > kytyPaceStats2[15])
++                kytyPaceStats2[15] = ns;
++        }
++        if (kytyPaceAdaptOn() && interval > 0)
++        {
++            int64_t offset = kytyPaceOffsetQpc;
++            if (late > frequency / 4000 && late * 4 > interval * 3)
++            {
++                // a hitch (a frame later than 3/4 of the interval): presented at once, the offset kept
++                kytyPaceSlackMinQpc = INT64_MAX;
++                kytyPaceSlackCount  = 0;
++            }
++            else if (late > frequency / 4000)
++            {
++                offset = offset + late + frequency / 2000;
++                if (offset > interval)
++                    offset = interval;
++                ++kytyPaceRaises;
++                kytyPaceSlackMinQpc = INT64_MAX;
++                kytyPaceSlackCount  = 0;
++            }
++            else
++            {
++                const int64_t slack = -late;
++                if (slack < kytyPaceSlackMinQpc)
++                    kytyPaceSlackMinQpc = slack;
++                // about half a second of presents (the real frame rate x 2 presents a real frame, / 2)
++                const int64_t perHalf = frequency / interval;
++                if (++kytyPaceSlackCount >= uint32_t(perHalf < 20 ? 20 : perHalf))
++                {
++                    const int64_t spare = kytyPaceSlackMinQpc - frequency / 500;  // keep 2 ms
++                    if (spare > 0 && offset > 0)
++                    {
++                        int64_t down = spare < frequency / 2000 ? spare : frequency / 2000;
++                        offset       = offset > down ? offset - down : 0;
++                        ++kytyPaceLowers;
++                    }
++                    const int64_t ns = kytyPaceSlackMinQpc * 1000000000 / frequency;
++                    kytyPaceStats2[16] = ns;
++                    kytyPaceSlackMinQpc = INT64_MAX;
++                    kytyPaceSlackCount  = 0;
++                }
++            }
++            kytyPaceOffsetQpc = offset;
++        }
++        ReleaseSRWLockExclusive(&kytyPaceLock);
++    }
+     waitForPerformanceCount(frameInfo.presentQpcTarget);
+ }
+ }  // namespace
+@@ -964,6 +1062,26 @@ extern "C" __declspec(dllexport) void kytyFfxSetPaceSlot(int64_t slotQpc, int64_
+ }
+ 
+ // out[8]: presents, intervals, sum, sum of squares, min, max (ns); late presents, max late (ns). Read and cleared.
++// Kyty 1.58: out[count] (up to 24): see kytyPaceStats2 (the per kind intervals, offset, raises / lowers, late). Read and
++// cleared (the offset and the slack are not).
++extern "C" __declspec(dllexport) void kytyFfxTakePaceStats2(int64_t* out, int count)
++{
++    AcquireSRWLockExclusive(&kytyPaceLock);
++    const int64_t frequency = kytyQpcFrequency();
++    kytyPaceStats2[10]      = kytyPaceOffsetQpc * 1000000000 / frequency;
++    kytyPaceStats2[11]      = kytyPaceRaises;
++    kytyPaceStats2[12]      = kytyPaceLowers;
++    for (int i = 0; i < count && i < 24; ++i)
++        out[i] = kytyPaceStats2[i];
++    for (int i = 0; i < 24; ++i)
++    {
++        if (i != 16)
++            kytyPaceStats2[i] = 0;
++    }
++    kytyPaceRaises = kytyPaceLowers = 0;
++    ReleaseSRWLockExclusive(&kytyPaceLock);
++}
++
+ extern "C" __declspec(dllexport) void kytyFfxTakePaceStats(int64_t* out)
+ {
+     AcquireSRWLockExclusive(&kytyPaceLock);
+@@ -1278,7 +1396,7 @@ DWORD WINAPI copyAndPresent_presenterThread(LPVOID pParam)
+ 
+                                 res = presentCommandList->execute(toWait, toSignal);
+ 
+-                                kytyWaitForPresent(frameInfo, previousPresentQpc);
++                                kytyWaitForPresent(frameInfo, previousPresentQpc, frameType == PacingData::FrameType::Real ? 1 : 2);
+                                 QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
+ 
+                                 res = presentToSwapChain(presenter, imageIndex, imageIndex, kytyDisplayIdOf(entry, frameType));
+@@ -1390,7 +1508,7 @@ DWORD WINAPI composeAndPresent_presenterThread(LPVOID pParam)
+                                                               uiSurfaceTransfered);
+                                 FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS, "compositeSwapChainFrame failed with error %d", res);
+ 
+-                                kytyWaitForPresent(frameInfo, previousPresentQpc);
++                                kytyWaitForPresent(frameInfo, previousPresentQpc, frameType == PacingData::FrameType::Real ? 1 : 2);
+                                 QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
+ 
+                                 res = presentToSwapChain(presenter, realSwapchainImageIndex, 0, kytyDisplayIdOf(entry, frameType));
+@@ -2547,9 +2665,11 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
+         // the real frame's grid slot, the real frame one interval after its slot (the grid of its own flip).
+         const uint32_t generated = fiInterpolated3.doPresent ? 3 : fiInterpolated2.doPresent ? 2 : fiInterpolated.doPresent ? 1 : 0;
+         PacingData::FrameInfo* const generatedFrames[3] = {&fiInterpolated, &fiInterpolated2, &fiInterpolated3};
++        // Kyty 1.58: + the adaptive readiness offset (kytyWaitForPresent).
++        const int64_t base = kytyPaceSlotQpc + kytyPaceOffsetQpc;
+         for (uint32_t i = 0; i < generated; ++i)
+-            generatedFrames[i]->presentQpcTarget = kytyPaceSlotQpc + (i + 1) * kytyPaceIntervalQpc / (generated + 1);
+-        entry.frames[PacingData::FrameType::Real].presentQpcTarget = kytyPaceSlotQpc + kytyPaceIntervalQpc;
++            generatedFrames[i]->presentQpcTarget = base + (i + 1) * kytyPaceIntervalQpc / (generated + 1);
++        entry.frames[PacingData::FrameType::Real].presentQpcTarget = base + kytyPaceIntervalQpc;
+     }
+     interpolationOutputs[interpolationBufferIndex * 3].availabilitySemaphoreValue = entry.numFramesSentForPresentationBase + fiInterpolated.doPresent;
+     if (fiInterpolated2.doPresent)
