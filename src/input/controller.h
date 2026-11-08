@@ -104,6 +104,9 @@ public:
     Colour GetLightBarRGB();
     void PollLightColour();
     bool SetVibration(u8 smallMotor, u8 largeMotor);
+    bool ApplyVibration(); // (bb-input-137)
+    u8 m_vib_small = 0, m_vib_large = 0;
+    bool m_vib_sent_zero = true; // (bb-rumble-143) last command sent to SDL was a stop
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
 
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
@@ -155,5 +158,8 @@ public:
     }
     void ResetLightbarColors();
 };
+
+void SetVibrationSettings(bool on, int percent); // (bb-input-135)
+void TestRumble(); // (bb-input-137) 0.5 s rumble on every opened pad, F1 Opciones
 
 } // namespace Input
