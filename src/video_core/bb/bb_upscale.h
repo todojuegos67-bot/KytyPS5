@@ -215,6 +215,8 @@ bool WantPresentUpscale(VAddr& flip);
 // image (the composite target before its final pass into the flip) in scaled modes. Turned off
 // for the session after the canvas could not be used (then 1.14: the HUD composite at present).
 bool HudCanvasOk();
+// 1.58: the address is one of the last presented flips (the HUD canvas' final pass targets).
+bool IsFlipTarget(VAddr addr);
 bool HudCanvasWanted();
 void SetHudCanvasOk(bool ok, std::string_view why);
 void OnPresentUpscaled(bool ok);
