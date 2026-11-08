@@ -469,6 +469,13 @@ hurts.
   (up to 200). Where the CPU is at its limit and the game makes its sound too late, the sound is stretched a
   little to fill the gaps instead of cutting out (`-Set KYTY_AUDIO_STRETCH=0` turns that off).
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
+- Small square holes that come and go where the game's decals overlap: the candle wax in the Nexus, the bottom of
+  some castle walls in 1-3 (issue #315). The game blends each decal into what the one before it left, without a
+  barrier between them; the PS5 runs them nearly in order, a PC graphics card at the same time.
+  `run.cmd -Set KYTY_DRAW_READ_AFTER_WRITE=1` (or `-Set KYTY_DRAW_READ_AFTER_WRITE=1` in the launcher's Advanced >
+  "Command-line options") orders them and the holes go, but where there are hundreds of decals the frame rate can
+  drop by up to ~15% (Boletaria's start without the 60 fps cap: 73 -> 61 fps on an RTX 5090; at 60 fps it still
+  held 60 there). Off by default.
 - NVIDIA's Low Latency Mode **Ultra** (NVIDIA Control Panel) makes the emulator's presents wait: uneven frame times
   (RTSS and the emulator's panel disagree) and fewer frames (issue #129). Set Low Latency Mode to Off or On for
   `kyty_emulator.exe` (Manage 3D settings > Program Settings).

@@ -96,6 +96,10 @@ struct RenderExecutor::TableImageSet {
 	// TableSetApart read (an Image holds an ImageDesc, lines of it).
 	std::vector<ImageId>      image_ids;
 	bool                      holds_target = false;
+	// An image bound both as a texture and as storage that the shader writes (the deferred decals' G-buffer): with
+	// KYTY_DRAW_READ_AFTER_WRITE=1 a draw with the set transits it every time (TableTransit), never in place, ordered
+	// after the last draw's write (Image::GetBarriers, issue #315).
+	bool                      read_after_write = false;
 	// The words select another specialization, or an image no set can hold: the draws take the native path
 	// (TableResolveSet tries again after TableImageSet::RetryFrames).
 	bool                  refused = false;
@@ -889,6 +893,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 				set->images.push_back(dep);
 				set->image_ids.push_back(dep.id);
 				set->holds_target |= dep.target;
+				set->read_after_write |= dep.whole && dep.storage;
 				// (Its view's metadata, which may not be the image's own: KYTY_TABLE_SERIALS.)
 				if (dep.desc.info.metadata.kind != ImageMetadataKind::None)
 					m_context.GetTextureCache().NoteMetaUse(dep.desc.info.metadata.range.address, dep.id.index);
@@ -1747,12 +1752,14 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 			}
 		}
 	}
-	// As CommitBindings': the transitions all precede the one draw or dispatch.
+	// As CommitBindings': the transitions all precede the one draw or dispatch. A draw's image bound both as a texture
+	// and as storage that the shader writes: ordered after the last draw's write with KYTY_DRAW_READ_AFTER_WRITE=1
+	// (a dispatch: by the game's barriers).
 	const TransitGroup transit_group;
 	for (const auto& dep: set.images)
 		if (!dep.target)
 			textures.m_slot_images[dep.id].Transit(dep.layout, dep.access, dep.whole ? std::nullopt : std::optional {dep.range},
-			                                       vk_buffer);
+			                                       vk_buffer, draw_state != nullptr && dep.whole && dep.storage);
 	return true;
 }
 
@@ -2140,8 +2147,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// set), no image's state, registration, metadata or bytes changed since: in place, nothing to check or transit.
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto images_epoch  = texture_cache.ImagesEpoch();
+	// (A set with an image the draw reads and writes is transited for every draw: KYTY_DRAW_READ_AFTER_WRITE.)
+	const bool read_after_write =
+	    set->read_after_write && kyty_local_draw_read_after_write.load(std::memory_order_relaxed) != 0;
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
-	                      table.images_epoch == images_epoch;
+	                      table.images_epoch == images_epoch && !read_after_write;
 	// KYTY_TABLE_SERIALS: the checks again only when a serial sum moved (1), or as before with the sums counted (2).
 	const auto serials = TableSerialsMode();
 	if (!in_place) {
@@ -2165,14 +2175,14 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		const bool sum_transit   = set->transit_serials != set_sum ||
 		                         ((set->transit_state != &draw_state || set->transit_capture != draw_state.capture_id) &&
 		                          !TableSetApart(*set, draw_state));
-		const bool due_transit   = serials == 1 ? sum_transit : epoch_transit;
+		const bool due_transit   = (serials == 1 ? sum_transit : epoch_transit) || read_after_write;
 		if (serials != 0 && epoch_transit != sum_transit)
 			LiveCounters::Add(sum_transit ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
 		if (due_transit && !TableTransit(*set, vk_buffer, &draw_state)) {
-			if (serials == 2 && !sum_transit) TableSerialsUnsafe("transit refused");
+			if (serials == 2 && !sum_transit && !read_after_write) TableSerialsUnsafe("transit refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), TableResult::Native;
 		}
-		if (serials == 2 && due_transit && !sum_transit && TableSetSerials(*set) != set_sum)
+		if (serials == 2 && due_transit && !sum_transit && !read_after_write && TableSetSerials(*set) != set_sum)
 			TableSerialsUnsafe("transit moved");
 		// (Neither moves what the other placed: a target is no image the set holds as a texture.)
 		draw_state.emitted_epoch = set->transit_epoch = texture_cache.ImagesEpoch();

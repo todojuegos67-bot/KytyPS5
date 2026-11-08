@@ -76,6 +76,8 @@ volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode {1};
 // KYTY_DRAW_PACKETS: the ordinary DrawIndex/DrawAuto draws are recorded as packets too (their
 // debug phases are CPU-side notes only), instead of ~20 separately recorded Vulkan calls each.
 volatile std::atomic_uint32_t kyty_local_draw_packets_mode {1};
+// KYTY_DRAW_READ_AFTER_WRITE (image.cpp): table draws transit a set with an image they read and write every time.
+extern volatile std::atomic_uint32_t kyty_local_draw_read_after_write;
 }
 
 // Draw state in reusable preparation storage when that switch is on.

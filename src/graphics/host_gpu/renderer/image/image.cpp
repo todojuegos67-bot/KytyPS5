@@ -24,6 +24,11 @@ extern "C" {
 // 1: drop a repeated-write barrier that repeats an identical transition of the
 // same image inside one transit group.
 volatile std::atomic<uint32_t> kyty_local_image_barrier_dedupe {1};
+// KYTY_DRAW_READ_AFTER_WRITE=1: a draw that reads an image it writes keeps the barrier after the last draw's write
+// (Image::GetBarriers; TableDraw transits its set every time), so overlapping deferred decals keep all their pixels
+// (issue #315). Off by default: ~750 barriers a frame at Boletaria, 72.9 -> 61.1 fps on an RTX 5090 without the 60 fps
+// cap (a framebuffer-local barrier inside the render pass cost the same: the fragment work drains either way).
+volatile std::atomic<uint32_t> kyty_local_draw_read_after_write {0};
 }
 
 namespace Libs::Graphics {
@@ -126,7 +131,7 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
-                                   std::optional<ImageSubresourceRange> range) {
+                                   std::optional<ImageSubresourceRange> range, bool read_after_write) {
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
@@ -144,13 +149,20 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	// the console, where nothing else orders the storage writes of consecutive draws: no barrier between them
 	// (each was also a render pass break: ~800 per frame in the deferred decal pass). A repeated write after
 	// any other access (an upload, a copy, the emulator's own compute) keeps its barrier.
+	// `read_after_write` (with KYTY_DRAW_READ_AFTER_WRITE=1): a draw that reads the image it writes (bound both as a
+	// texture and as storage: the deferred decals' G-buffer, each decal reading what it blends into) keeps it too.
+	// The game puts no barrier between its decals; on the console the pixels of consecutive draws run nearly in order
+	// and an overlapping decal read what the one before it wrote, while a PC GPU runs them together: a decal reads the
+	// G-buffer from before the last one's write and writes it back over it, which loses that decal's pixels in 2x2
+	// blocks (the Nexus candles' wax, castle walls in 1-3: issue #315). A draw's own bindings share one barrier.
+	read_after_write = read_after_write && kyty_local_draw_read_after_write.load(std::memory_order_relaxed) != 0;
 	const bool     guest        = g_transit_group != 0;
 	constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
 	                              vk::AccessFlagBits2::eMemoryWrite;
 	const auto     in_place     = [&](const VulkanImageState& state, uint64_t group) {
 		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
 		return state.layout == destination_layout && state.access_mask == destination_access &&
-		       (!repeated_write || (guest && state.guest) ||
+		       (!repeated_write || (guest && state.guest && !read_after_write) ||
 		        (DedupeTransitGroups() && g_transit_group != 0 && group == g_transit_group));
 	};
 	// An image already in the layout and access as a whole (a table draw's textures, every draw): nothing changes, so
@@ -202,7 +214,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 
 				const bool repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access) &&
-				    !(guest && subresource_state.guest);
+				    !(guest && subresource_state.guest && !read_after_write);
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -396,7 +408,8 @@ static void ZeroNewImage(vk::Image image, vk::ImageAspectFlags aspect, vk::Comma
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
+                    bool read_after_write) {
 	if (backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty() &&
 	    destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
 	    vk::blockExtent(info.pixel_format)[0] == 1) {
@@ -427,7 +440,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
 	const auto& barriers =
-	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	    GetBarriers(destination_layout, destination_access, destination_stage, range, read_after_write);
 	if (barriers.empty()) {
 		return;
 	}

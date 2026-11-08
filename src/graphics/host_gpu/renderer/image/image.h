@@ -119,12 +119,15 @@ public:
 	// constructor gives a new one, but for its Vulkan image, views and barrier state (and serial: the same object).
 	void PrepareReuse(const ImageInfo& image_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// `read_after_write`: for a draw that reads the image it writes (bound both as a texture and as storage), which
+	// keeps the barrier after an earlier guest write that a repeated write in the same layout and access skips.
 	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
-	                                   std::optional<ImageSubresourceRange> range);
+	                                   std::optional<ImageSubresourceRange> range, bool read_after_write = false);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
+	             bool read_after_write = false);
 	// The whole-image barrier state the next transition starts from.
 	[[nodiscard]] const VulkanImageState& CurrentState() const;
 	// The barrier state set to `state` (each subresource's: `subresources`, unless empty), with the barriers there

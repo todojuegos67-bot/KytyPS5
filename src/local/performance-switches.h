@@ -25,6 +25,7 @@ extern volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
+extern volatile std::atomic_uint32_t kyty_local_draw_read_after_write;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
 extern volatile std::atomic_uint32_t kyty_local_write_guard_mode;
 extern volatile std::atomic_uint32_t kyty_local_flush_defer;
@@ -121,6 +122,9 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_READBACK_SPAN", &kyty_local_readback_span_mode, 0, 2},
 	    // Images and command submission.
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
+	    // 1: a draw that reads an image it writes (the deferred decals' G-buffer) waits for the last draw's write: no
+	    // 2x2 holes in overlapping decals (issue #315), up to ~15% slower where there are hundreds of them. Default 0.
+	    Switch {"KYTY_DRAW_READ_AFTER_WRITE", &kyty_local_draw_read_after_write},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
 	    // 1: a guest write of the command processor lands at once, hidden from the game until the older upload jobs are

@@ -1635,8 +1635,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
+				// A draw's shader reads the image it writes (the deferred decals' G-buffer): ordered after the last
+				// draw's write with KYTY_DRAW_READ_AFTER_WRITE=1 (Image::GetBarriers, issue #315). A dispatch is
+				// ordered by the game's own barriers.
 				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer,
+				              image.binding.shader_write && pipeline_bind_point == vk::PipelineBindPoint::eGraphics);
 			} else if (storage) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
