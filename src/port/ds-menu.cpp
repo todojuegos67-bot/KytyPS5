@@ -5969,7 +5969,18 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		flags |= SDL_WINDOW_RESIZABLE;
 	}
 	SDL_Window*  window = SDL_CreateWindow("Demon's Souls", win_x, win_y, win_w, win_h, flags);
-	SDL_Renderer* renderer = window != nullptr ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : nullptr;
+	// (des-combo-1109) Direct3D 11 first (SDL2 picks Direct3D 9 by default on Windows: a D3D9 device in a borderless window
+	// over the whole desktop, with the NVIDIA overlay/recording hooked in, showed frames without the illustration); the
+	// default driver only if D3D11 cannot be created.
+	SDL_Renderer* renderer = nullptr;
+	if (window != nullptr) {
+		SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+		SDL_SetHint(SDL_HINT_RENDER_DRIVER, "");
+		if (renderer == nullptr) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+		if (SDL_RendererInfo info {}; renderer != nullptr && SDL_GetRendererInfo(renderer, &info) == 0)
+			std::printf("[port] launcher renderer: %s\n", info.name != nullptr ? info.name : "?");
+	}
 	if (renderer == nullptr) {
 		std::printf("[port] start menu: no window (%s): straight to the game\n", SDL_GetError());
 		if (window != nullptr) SDL_DestroyWindow(window);
@@ -6027,6 +6038,12 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	g_background_tried = false;
 	g_background       = nullptr;
 	g_focus_once       = true;
+	// (des-combo-1109) The illustration and the ambience's textures are ready before the first frame (uploaded by its
+	// RenderDrawData, before anything is drawn): no black launcher while they load.
+	if (!g_config_mode) {
+		EnsureBackground();
+		if (g_saved.launcher_ambience) Ambience::Create();
+	}
 	SDL_ShowCursor(SDL_ENABLE);
 	CloseSplash();
 	while (g_start_result == 0) {
@@ -6034,6 +6051,26 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		while (SDL_PollEvent(&e) == 1) {
 			ImGui_ImplSDL2_ProcessEvent(&e);
 			if (e.type == SDL_QUIT) g_start_result = -1;
+			if (e.type == SDL_RENDER_DEVICE_RESET || e.type == SDL_RENDER_TARGETS_RESET) {
+				// (des-combo-1109) The renderer lost its textures (device reset: a driver/overlay event): every ImGui texture
+				// (the illustration, the ambience's, the fonts) is created again from the pixels it keeps.
+				std::printf("[port] launcher: render %s reset: textures uploaded again\n", e.type == SDL_RENDER_DEVICE_RESET ? "device" : "targets");
+				for (ImTextureData* tex: ImGui::GetPlatformIO().Textures) {
+					if (tex->Status == ImTextureStatus_Destroyed || tex->GetPixels() == nullptr) continue;
+					if (e.type == SDL_RENDER_DEVICE_RESET && tex->TexID != ImTextureID_Invalid)
+						SDL_DestroyTexture(reinterpret_cast<SDL_Texture*>(static_cast<intptr_t>(tex->TexID)));
+					if (e.type == SDL_RENDER_DEVICE_RESET) {
+						tex->SetTexID(ImTextureID_Invalid);
+						tex->SetStatus(ImTextureStatus_WantCreate);
+					} else if (tex->Status == ImTextureStatus_OK) {
+						tex->Updates.resize(0);
+						tex->UpdateRect = {0, 0, static_cast<unsigned short>(tex->Width), static_cast<unsigned short>(tex->Height)};
+						tex->Updates.push_back(tex->UpdateRect);
+						tex->SetStatus(ImTextureStatus_WantUpdates);
+					}
+				}
+				Ambience::g_fog_linear = Ambience::g_dot_linear = false;
+			}
 			// (ds-pc-port52) F1 in the launcher (not the Configurador, not while a key binding waits): full screen borderless
 			// <-> a normal window with a title bar (moved, minimized and resized as any). The game's F1 menu is OnEvent's.
 			if (!g_config_mode && e.type == SDL_KEYDOWN && e.key.repeat == 0 && e.key.keysym.sym == SDLK_F1 && !g_kbm_capture.load()) {
