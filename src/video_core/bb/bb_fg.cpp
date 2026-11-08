@@ -1205,8 +1205,8 @@ PresentSlot PaceGuestFlip() {
         interval = std::max(interval, target > 0.0 ? target : Adapt::Mean());
     }
     // 1.58: FSR 3 FG on a display-locked step (Lock above).
-    const bool lock = !reflex_paced && fix && PaceLock();
-    if (lock) {
+    const bool locked = !reflex_paced && fix && PaceLock();
+    if (locked) {
         const double mean = Adapt::Mean();
         interval = Lock::Step(std::max(interval, mean > 0.0 ? mean : 1.0 / 60.0));
     }
@@ -1267,7 +1267,7 @@ PresentSlot PaceGuestFlip() {
     // 1.58: under the display lock a flip late by up to half a step keeps the grid (its present
     // slot is the grid slot; the DLL's readiness offset absorbs the lateness), so one late frame
     // does not move every later present.
-    const auto kKeep = lock ? step / 2 : Clock::duration(std::chrono::microseconds(500));
+    const auto kKeep = locked ? step / 2 : Clock::duration(std::chrono::microseconds(500));
     auto grid_slot = arrive;
     if (next != Clock::time_point{} && exited != Clock::time_point{} && next > exited + step) {
         next = exited + step; // never a wait longer than target - elapsed
@@ -1291,7 +1291,7 @@ PresentSlot PaceGuestFlip() {
         const double late_ms = std::chrono::duration<double, std::milli>(late).count();
         if (late <= kKeep) {
             grid_slot = next;
-            if (lock && late_ms > 0.5) {
+            if (locked && late_ms > 0.5) {
                 ++st.missed; // (late, but kept on the grid)
                 st.late_sum += late_ms;
                 st.late_max = std::max(st.late_max, late_ms);
@@ -1308,8 +1308,8 @@ PresentSlot PaceGuestFlip() {
     }
     exited = Clock::now();
     if (Dlssg::Generating()) Dlssg::NoteGuestRelease(released, interval);
-    if ((cap > 0 || lock) && PresentOnArrival() && Amd::Generating()) {
-        return {Pace::QpcAt(lock ? grid_slot : released), Pace::QpcTicks(interval)};
+    if ((cap > 0 || locked) && PresentOnArrival() && Amd::Generating()) {
+        return {Pace::QpcAt(locked ? grid_slot : released), Pace::QpcTicks(interval)};
     }
     return {};
 }
