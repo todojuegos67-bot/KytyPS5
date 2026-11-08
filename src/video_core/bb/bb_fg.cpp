@@ -843,6 +843,81 @@ double PaceEffective() {
     return Adapt::g_last.load();
 }
 
+// 1.58 (bb-fgpace-158): FSR 3 FG real-frame step locked to the display. On a fixed-refresh FIFO
+// display (the user's: 240 Hz, fifo) a shown interval that is not a whole number of refresh
+// periods alternates between the two neighbouring ones (r149_0459: pacer step 15.4-17.5 ms, the
+// adaptive mean of the game's free frame time, 2 shown frames a step = 7.7-8.8 ms against
+// 4.17 ms vblanks). The step is now (N + 1) x k refresh periods (x2 at 240 Hz: 8.33 ms x k ->
+// 16.67 ms = 60 real / 120 shown, 25 ms = 40 / 80, ...), the smallest k whose step the game's
+// own frame (mean free frame time, or the fps cap) fits within 10 % of a period; up at once,
+// down after 2 s that fit the lower step. Refresh from QueryDisplayConfig (exact rational).
+// BB_FG_PACE_LOCK=0: off (1.57: the adaptive mean / the cap as they are).
+namespace Lock {
+int g_k = 0;
+int g_under = 0;
+double g_unit = 0.0;
+std::atomic<uint32_t> g_changes{0};
+std::atomic<double> g_step{0.0};
+
+bool Wanted() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_FG_PACE_LOCK");
+        const bool o = v == nullptr || *v == '\0' || std::strcmp(v, "0") != 0;
+        BBLogf("[fg-pace] 1.58 BB_FG_PACE_LOCK=%s: %s", v != nullptr ? v : "(default on)",
+               o ? "FSR 3 FG real frames on a step of (generated + 1) x k display refresh periods, "
+                   "the late flips kept on the grid (within half a step), the grid slot given to "
+                   "the DLL"
+                 : "off");
+        return o;
+    }();
+    return on;
+}
+
+double Step(double want) {
+    const double hz = Amd::DisplayHz();
+    const int frames = Amd::Generated() + 1;
+    if (hz <= 30.0 || frames < 2) return want;
+    const double unit = frames / hz;
+    if (!(want > 0.0)) want = 1.0 / 60.0;
+    const int k = std::max(1, static_cast<int>(std::ceil(want / unit - 0.1)));
+    if (g_k <= 0 || std::fabs(unit - g_unit) > 1e-7 || k > g_k) {
+        if (g_k != k) g_changes.fetch_add(1, std::memory_order_relaxed);
+        g_k = k;
+        g_unit = unit;
+        g_under = 0;
+    } else if (k < g_k) {
+        if (++g_under >= std::max(static_cast<int>(2.0 / (g_k * unit)), 30)) {
+            g_k = k;
+            g_under = 0;
+            g_changes.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        g_under = 0;
+    }
+    g_step = g_k * unit;
+    return g_k * unit;
+}
+} // namespace Lock
+
+bool PaceLock() {
+    return Lock::Wanted() && GuestPacing() && Cfg().kind == Kind::Amd && Amd::Generating() &&
+           Amd::DisplayHz() > 30.0;
+}
+
+std::string PaceLockText() {
+    char text[160];
+    if (!Lock::Wanted()) return "unlocked (BB_FG_PACE_LOCK=0)";
+    const double step = Lock::g_step.load();
+    if (!PaceLock() || step <= 0.0) {
+        std::snprintf(text, sizeof(text), "unlocked (display %.3f Hz)", Amd::DisplayHz());
+    } else {
+        std::snprintf(text, sizeof(text), "locked %.3f ms = %d x %.3f ms (display %.3f Hz, %u changes)",
+                      step * 1e3, Lock::g_k, Lock::g_unit * 1e3, Amd::DisplayHz(),
+                      Lock::g_changes.exchange(0));
+    }
+    return text;
+}
+
 double PacerIntervalMs() {
     const double s = Adapt::g_last.load();
     return GuestPacing() && s > 0.0 && s <= 0.1 ? s * 1e3 : 0.0;
@@ -883,7 +958,7 @@ bool PresentOnArrival() {
     }();
     const bool uncapped_dlssg = Cfg().kind == Kind::Dlss;
     return on && PaceFix() && GuestPacing() &&
-           (g_fps_cap.load(std::memory_order_relaxed) > 0 || uncapped_dlssg);
+           (g_fps_cap.load(std::memory_order_relaxed) > 0 || uncapped_dlssg || PaceLock());
 }
 
 namespace Pace {
@@ -1105,7 +1180,7 @@ PresentSlot PaceGuestFlip() {
         const double frame_s = std::chrono::duration<double>(arrive - exited).count();
         if (frame_s > 0.0 && frame_s < 0.1) {
             Adapt::Add(frame_s);
-            if (Dlssg::Generating()) Adapt::AddLong(frame_s);
+            if (Dlssg::Generating() || Amd::Generating()) Adapt::AddLong(frame_s);
         }
     }
     double interval = Dlssg::PaceInterval();
@@ -1128,6 +1203,12 @@ PresentSlot PaceGuestFlip() {
     } else if (generating && Adapt::Enabled()) {
         const double target = Dlssg::Generating() ? Adapt::HeldStep(Adapt::LongQuantile()) : 0.0;
         interval = std::max(interval, target > 0.0 ? target : Adapt::Mean());
+    }
+    // 1.58: FSR 3 FG on a display-locked step (Lock above).
+    const bool locked = !reflex_paced && fix && PaceLock();
+    if (locked) {
+        const double mean = Adapt::Mean();
+        interval = Lock::Step(std::max(interval, mean > 0.0 ? mean : 1.0 / 60.0));
     }
     Adapt::g_last = interval;
     // The per-second [pace] line (and the auto cap's window).
@@ -1183,7 +1264,11 @@ PresentSlot PaceGuestFlip() {
     // release: the slot is at most last release + step). A late one is released at once and the
     // grid re-phased from it, so the next frame gets a whole step; a flip late by under 0.5 ms
     // (the spin's and the scheduler's jitter) keeps the grid, so it does not drift.
-    constexpr auto kKeep = std::chrono::microseconds(500);
+    // 1.58: under the display lock a flip late by up to half a step keeps the grid (its present
+    // slot is the grid slot; the DLL's readiness offset absorbs the lateness), so one late frame
+    // does not move every later present.
+    const auto kKeep = locked ? step / 2 : Clock::duration(std::chrono::microseconds(500));
+    auto grid_slot = arrive;
     if (next != Clock::time_point{} && exited != Clock::time_point{} && next > exited + step) {
         next = exited + step; // never a wait longer than target - elapsed
     }
@@ -1198,12 +1283,19 @@ PresentSlot PaceGuestFlip() {
         Amd::NoteSlept(waited);
         Dlssg::NoteSlept(waited);
         released = until;
+        grid_slot = until;
         now = Clock::now();
         next = until + step;
     } else if (next != Clock::time_point{} && timed) {
         const auto late = now - next;
         const double late_ms = std::chrono::duration<double, std::milli>(late).count();
         if (late <= kKeep) {
+            grid_slot = next;
+            if (locked && late_ms > 0.5) {
+                ++st.missed; // (late, but kept on the grid)
+                st.late_sum += late_ms;
+                st.late_max = std::max(st.late_max, late_ms);
+            }
             next += step;
         } else {
             ++st.missed;
@@ -1216,8 +1308,8 @@ PresentSlot PaceGuestFlip() {
     }
     exited = Clock::now();
     if (Dlssg::Generating()) Dlssg::NoteGuestRelease(released, interval);
-    if (cap > 0 && PresentOnArrival() && Amd::Generating()) {
-        return {Pace::QpcAt(released), Pace::QpcTicks(interval)};
+    if ((cap > 0 || locked) && PresentOnArrival() && Amd::Generating()) {
+        return {Pace::QpcAt(locked ? grid_slot : released), Pace::QpcTicks(interval)};
     }
     return {};
 }

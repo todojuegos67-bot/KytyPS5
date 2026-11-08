@@ -3,6 +3,7 @@
 // Between bb_fg.cpp (settings, DLSS-G) and bb_fg_fsr3.cpp (FSR 3 frame generation).
 #pragma once
 
+#include <string>
 #include "video_core/bb/bb_fg.h"
 
 namespace BB::FG::Amd {
@@ -24,9 +25,14 @@ bool Generating();     // generating frames now
 void NoteSlept(double seconds);
 void SetUiLayer(const Image* ui);
 bool WantsUiLayer();
+// 1.58: the display's refresh rate (Hz, exact from QueryDisplayConfig; 0: unknown).
+double DisplayHz();
 } // namespace BB::FG::Amd
 
 namespace BB::FG {
 // The interval the game's flips were last held to (bb_fg.cpp PaceGuestFlip; log).
 double PaceEffective();
+// 1.58 (bb-fgpace-158): FSR 3 FG real-frame step locked to the display (bb_fg.cpp Lock).
+bool PaceLock();
+std::string PaceLockText();
 } // namespace BB::FG

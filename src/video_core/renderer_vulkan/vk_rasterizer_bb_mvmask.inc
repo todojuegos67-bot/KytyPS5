@@ -14,7 +14,9 @@ bool MvMaskWanted() {
         const bool v = e == nullptr || e[0] != '0';
         BB::FG::Printf("[mvmask] 1.54 BB_MVMASK=%s: %s", e ? e : "1 (default)",
                        v ? "per-pixel motion field = camera reprojection + skinned object vectors "
-                           "+ quarter-res photometric flow where those do not explain the image; "
+                           "+ 1.58 hierarchical flow (quarter-res coarse forward / backward search, "
+                           "full-res refinement with spatial predictors, sub-pixel, forward-backward "
+                           "and occlusion checks, unjittered) where those do not explain the image; "
                            "mask (class 0 camera / 1 skinned / 2 flow + confidence) raises the "
                            "upscalers' reactive mask and is given to frame generation"
                          : "off");
@@ -28,8 +30,8 @@ bool InitMvMask() {
     g_bb.mvm_init = true;
     g_bb.mvm_failed = true;
     const vk::Device device = g_bb.device;
-    std::array<vk::DescriptorSetLayoutBinding, 8> bindings{};
-    for (u32 i = 0; i < 8; ++i) {
+    std::array<vk::DescriptorSetLayoutBinding, 11> bindings{};
+    for (u32 i = 0; i < 11; ++i) {
         bindings[i] = vk::DescriptorSetLayoutBinding{
             i, i == 7 ? vk::DescriptorType::eStorageBuffer : vk::DescriptorType::eStorageImage, 1,
             vk::ShaderStageFlagBits::eCompute};
@@ -81,6 +83,13 @@ bool InitMvMask() {
         g_bb.mvm_mapped[i] = static_cast<u32*>(info.pMappedData);
         std::memset(info.pMappedData, 0, 64);
     }
+    {
+        auto [qr, pool] = device.createQueryPool(vk::QueryPoolCreateInfo{
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = 8,
+        });
+        g_bb.mvm_queries = qr == vk::Result::eSuccess ? pool : vk::QueryPool{};
+    }
     g_bb.mvm_set_layout = set_layout;
     g_bb.mvm_layout = layout;
     g_bb.mvm_pipeline = pipeline;
@@ -89,7 +98,7 @@ bool InitMvMask() {
 }
 
 void BBMvMask(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::Extent2D render,
-              bool prev_valid) {
+              bool prev_valid, const float* jitter) {
     if (!MvMaskWanted() || !InitMvMask()) return;
     const vk::Extent2D quarter{(render.width + 3) / 4, (render.height + 3) / 4};
     const auto storage = vk::ImageUsageFlagBits::eStorage;
@@ -98,7 +107,10 @@ void BBMvMask(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
                      storage | vk::ImageUsageFlagBits::eTransferSrc |
                          vk::ImageUsageFlagBits::eSampled) ||
         !EnsureImage(g_bb.mvm_dummy, {1, 1}, vk::Format::eR32G32Uint,
-                     storage | vk::ImageUsageFlagBits::eTransferDst)) {
+                     storage | vk::ImageUsageFlagBits::eTransferDst) ||
+        !EnsureImage(g_bb.mvm_qprev, quarter, vk::Format::eR16Sfloat, storage) ||
+        !EnsureImage(g_bb.mvm_qcur, quarter, vk::Format::eR16Sfloat, storage) ||
+        !EnsureImage(g_bb.mvm_coarse, quarter, vk::Format::eR16G16B16A16Sfloat, storage)) {
         BB::FG::Printf("[mvmask] images not created: off");
         g_bb.mvm_failed = true;
         return;
@@ -109,7 +121,22 @@ void BBMvMask(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
     const u32 slot = static_cast<u32>(g_bb.mvm_no % g_bb.mvm_buf.size());
     if (g_bb.mvm_no >= g_bb.mvm_buf.size()) {
         vmaInvalidateAllocation(g_bb.allocator, g_bb.mvm_alloc[slot], 0, 64);
-        for (u32 i = 0; i < 8; ++i) g_bb.mvm_acc[i] += g_bb.mvm_mapped[slot][i];
+        for (u32 i = 0; i < 12; ++i) g_bb.mvm_acc[i] += g_bb.mvm_mapped[slot][i];
+    }
+    if (g_bb.mvm_queries && g_bb.mvm_q_written[slot]) {
+        std::array<u64, 4> data{};
+        const auto result = g_bb.device.getQueryPoolResults(
+            g_bb.mvm_queries, slot * 2, 2, sizeof(data), data.data(), sizeof(u64) * 2,
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        if ((result == vk::Result::eSuccess || result == vk::Result::eNotReady) && data[1] != 0 &&
+            data[3] != 0 && data[2] >= data[0]) {
+            const double ms =
+                static_cast<double>(data[2] - data[0]) * g_bb.timestamp_period_ns / 1e6;
+            g_bb.mvm_gpu_sum += ms;
+            g_bb.mvm_gpu_max = std::max(g_bb.mvm_gpu_max, ms);
+            ++g_bb.mvm_gpu_n;
+        }
+        g_bb.mvm_q_written[slot] = false;
     }
     ++g_bb.mvm_no;
     ++g_bb.mvm_runs;
@@ -139,11 +166,29 @@ void BBMvMask(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
                        static_cast<unsigned long long>(g_bb.mvm_noobj),
                        static_cast<unsigned long long>(a[5]),
                        static_cast<unsigned long long>(a[6]));
+        BB::FG::Printf("[mvmask] 1.58 flow: blocks given flow %llu (%llu from the coarse level, "
+                       "mean |flow - camera/object| %.2f px), rejected forward-backward %llu, "
+                       "occluded / poor match %llu, pixels from a neighbour block %.2f%%; jitter "
+                       "taken out %.3f %.3f px; radius %u px; GPU %.3f ms avg, %.3f max (%u frames, "
+                       "render %ux%u)",
+                       static_cast<unsigned long long>(a[6]),
+                       static_cast<unsigned long long>(a[11]),
+                       a[6] ? a[9] / 16.0 / a[6] : 0.0, static_cast<unsigned long long>(a[7]),
+                       static_cast<unsigned long long>(a[8]), 100.0 * a[10] / all,
+                       g_bb.mvm_last_dj[0], g_bb.mvm_last_dj[1], g_bb.mvm_radius,
+                       g_bb.mvm_gpu_n ? g_bb.mvm_gpu_sum / g_bb.mvm_gpu_n : 0.0, g_bb.mvm_gpu_max,
+                       g_bb.mvm_gpu_n, render.width, render.height);
+        g_bb.mvm_gpu_sum = g_bb.mvm_gpu_max = 0.0;
+        g_bb.mvm_gpu_n = 0;
         for (auto& v : g_bb.mvm_acc) v = 0;
         g_bb.mvm_runs = g_bb.mvm_noprev = g_bb.mvm_noobj = 0;
         g_bb.mvm_t = now;
     }
     cmd.fillBuffer(g_bb.mvm_buf[slot], 0, 64, 0u);
+    if (g_bb.mvm_queries) {
+        cmd.resetQueryPool(g_bb.mvm_queries, slot * 2, 2);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_bb.mvm_queries, slot * 2);
+    }
     if (g_bb.mvm_dummy.layout == vk::ImageLayout::eUndefined) {
         Barrier(cmd, g_bb.mvm_dummy, vk::ImageLayout::eGeneral,
                 vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eNone,
@@ -152,7 +197,8 @@ void BBMvMask(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
                             vk::ClearColorValue{.uint32 = std::array<u32, 4>{0u, 0u, 0u, 0u}},
                             vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
     }
-    for (OwnImage* img : {&g_bb.mvm_blocks, &g_bb.mvm_cls}) {
+    for (OwnImage* img : {&g_bb.mvm_blocks, &g_bb.mvm_cls, &g_bb.mvm_qprev, &g_bb.mvm_qcur,
+                          &g_bb.mvm_coarse}) {
         Barrier(cmd, *img, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
                 vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
                 vk::PipelineStageFlagBits2::eComputeShader,
@@ -174,23 +220,46 @@ void BBMvMask(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
     const vk::DescriptorImageInfo blk_info{{}, g_bb.mvm_blocks.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo cls_info{{}, g_bb.mvm_cls.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo rea_info{{}, g_bb.reactive.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo qp_info{{}, g_bb.mvm_qprev.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo qc_info{{}, g_bb.mvm_qcur.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo co_info{{}, g_bb.mvm_coarse.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorBufferInfo buf_info{g_bb.mvm_buf[slot], 0, 64};
-    const std::array<const vk::DescriptorImageInfo*, 7> infos{&prev_info, &cur_info, &mv_info,
-                                                              &obj_info,  &blk_info, &cls_info,
-                                                              &rea_info};
-    std::array<vk::WriteDescriptorSet, 8> writes{};
-    for (u32 i = 0; i < 7; ++i) {
-        writes[i] = vk::WriteDescriptorSet{.dstBinding = i,
+    const std::array<const vk::DescriptorImageInfo*, 10> infos{
+        &prev_info, &cur_info, &mv_info, &obj_info, &blk_info, &cls_info, &rea_info,
+        &qp_info,   &qc_info,  &co_info};
+    std::array<vk::WriteDescriptorSet, 11> writes{};
+    for (u32 i = 0; i < 10; ++i) {
+        const u32 binding = i < 7 ? i : i + 1;
+        writes[i] = vk::WriteDescriptorSet{.dstBinding = binding,
                                            .descriptorCount = 1,
                                            .descriptorType = vk::DescriptorType::eStorageImage,
                                            .pImageInfo = infos[i]};
     }
-    writes[7] = vk::WriteDescriptorSet{.dstBinding = 7,
-                                       .descriptorCount = 1,
-                                       .descriptorType = vk::DescriptorType::eStorageBuffer,
-                                       .pBufferInfo = &buf_info};
+    writes[10] = vk::WriteDescriptorSet{.dstBinding = 7,
+                                        .descriptorCount = 1,
+                                        .descriptorType = vk::DescriptorType::eStorageBuffer,
+                                        .pBufferInfo = &buf_info};
+    // 1.58: the coarse level searches +-radius / 4 cells (default 32 px: a limb or a particle at
+    // 60 fps moving ~2000 px/s at 900p), the full-res refinement +-2 px around its candidates.
     static const u32 radius =
-        static_cast<u32>(std::clamp(EnvF("BB_MVMASK_RADIUS", 6.0f), 2.0f, 16.0f));
+        static_cast<u32>(std::clamp(EnvF("BB_MVMASK_RADIUS", 32.0f), 4.0f, 64.0f));
+    g_bb.mvm_radius = radius;
+    static const float smooth = EnvF("BB_MVMASK_SMOOTH", 0.25f);
+    // Image displacement = unjittered vector + (jitter_prev - jitter_cur) (bb_mv.comp's sample
+    // point is pixel + 0.5 - jitter). BB_MVMASK_JITTER=0: not taken out (1.54).
+    static const bool unjitter = EnvF("BB_MVMASK_JITTER", 1.0f) != 0.0f;
+    float dj[2]{0.0f, 0.0f};
+    if (unjitter && jitter != nullptr && g_bb.mvm_have_jitter && prev_valid) {
+        dj[0] = g_bb.mvm_jitter_prev[0] - jitter[0];
+        dj[1] = g_bb.mvm_jitter_prev[1] - jitter[1];
+    }
+    if (jitter != nullptr) {
+        g_bb.mvm_jitter_prev[0] = jitter[0];
+        g_bb.mvm_jitter_prev[1] = jitter[1];
+        g_bb.mvm_have_jitter = true;
+    }
+    g_bb.mvm_last_dj[0] = dj[0];
+    g_bb.mvm_last_dj[1] = dj[1];
     static const float rel = EnvF("BB_MVMASK_GAIN", 0.35f);
     static const float abs_gain = EnvF("BB_MVMASK_MIN", 0.08f);
     static const float tex = EnvF("BB_MVMASK_TEXTURE", 0.004f);
@@ -202,22 +271,40 @@ void BBMvMask(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
         float tune2[4];
     } push{{render.width, render.height, (prev_valid ? 1u : 0u) | (obj_view ? 2u : 0u), radius},
            {rel, abs_gain, tex, conf_scale},
-           {reactive_gain, 0.0f, 0.0f, 0.0f}};
+           {reactive_gain, dj[0], dj[1], smooth}};
     static_assert(sizeof(push) == 48);
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_bb.mvm_pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bb.mvm_layout, 0, writes);
-    cmd.pushConstants(g_bb.mvm_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-    cmd.dispatch((quarter.width + 7) / 8, (quarter.height + 7) / 8, 1);
     const vk::MemoryBarrier2 between{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
     };
+    const u32 flags = push.size[2];
+    if (prev_valid) {
+        // 1.58: mode 2 (pyramid level), mode 3 (coarse forward / backward search).
+        for (u32 mode : {2u, 3u}) {
+            push.size[2] = flags | (mode << 8);
+            cmd.pushConstants(g_bb.mvm_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+                              &push);
+            cmd.dispatch((quarter.width + 7) / 8, (quarter.height + 7) / 8, 1);
+            cmd.pipelineBarrier2(
+                vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &between});
+        }
+    }
+    push.size[2] = flags; // mode 0: blocks
+    cmd.pushConstants(g_bb.mvm_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((quarter.width + 7) / 8, (quarter.height + 7) / 8, 1);
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &between});
-    push.size[2] |= 1u << 8;
+    push.size[2] = flags | (1u << 8);
     cmd.pushConstants(g_bb.mvm_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
+    if (g_bb.mvm_queries) {
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, g_bb.mvm_queries,
+                            slot * 2 + 1);
+        g_bb.mvm_q_written[slot] = true;
+    }
     Barrier(cmd, g_bb.mvm_cls, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);

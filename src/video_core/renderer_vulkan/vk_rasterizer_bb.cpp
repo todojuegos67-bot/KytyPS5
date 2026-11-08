@@ -221,11 +221,20 @@ struct BBVk {
     vk::Pipeline mvm_pipeline{};
     bool mvm_init = false, mvm_failed = false;
     OwnImage mvm_blocks, mvm_cls, mvm_dummy;
+    OwnImage mvm_qprev, mvm_qcur, mvm_coarse; // 1.58: pyramid level + coarse fwd / bwd flow
+    float mvm_jitter_prev[2]{};
+    bool mvm_have_jitter = false;
+    float mvm_last_dj[2]{};
+    u32 mvm_radius = 0;
+    vk::QueryPool mvm_queries{}; // 1.58: GPU time of the whole pass, 4 slots of 2 timestamps
+    std::array<bool, 4> mvm_q_written{};
+    double mvm_gpu_sum = 0.0, mvm_gpu_max = 0.0;
+    u32 mvm_gpu_n = 0;
     std::array<vk::Buffer, 4> mvm_buf{};
     std::array<VmaAllocation, 4> mvm_alloc{};
     std::array<u32*, 4> mvm_mapped{};
     u64 mvm_no = 0, mvm_runs = 0, mvm_noprev = 0, mvm_noobj = 0;
-    u64 mvm_acc[8]{};
+    u64 mvm_acc[12]{};
     std::chrono::steady_clock::time_point mvm_t{};
     // 1.16: the HUD canvas' HUD-less image for frame generation this frame (presenter view).
     bool hs_hudless_ready = false;
@@ -1783,7 +1792,7 @@ bool InitFlow() {
 }
 
 void BBFgFlow(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::Extent2D render,
-              bool prev_valid) {
+              bool prev_valid, bool search = true) {
     if (!FlowWanted() || !BB::FG::WantInputs() || !InitFlow()) return;
     const auto now = std::chrono::steady_clock::now();
     if (g_bb.flow_t == std::chrono::steady_clock::time_point{}) g_bb.flow_t = now;
@@ -1801,7 +1810,7 @@ void BBFgFlow(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
         const auto& a = g_bb.flow_acc;
         const double px = static_cast<double>(render.width) * render.height *
                           std::max<u64>(g_bb.flow_runs, 1);
-        BB::FG::Printf("[fg-mv] 1.46 %.1f s: flow ran %llu times (%llu without a previous frame) | "
+        if (search) BB::FG::Printf("[fg-mv] 1.46 %.1f s: flow ran %llu times (%llu without a previous frame) | "
                        "blocks textured %llu, given a flow vector %llu (%.1f %%), flat %llu | "
                        "pixels replaced %.2f %% of the image, mean change %.2f px",
                        dt, static_cast<unsigned long long>(g_bb.flow_runs),
@@ -1844,7 +1853,7 @@ void BBFgFlow(vk::CommandBuffer cmd, OwnImage& lum_prev, OwnImage& lum_cur, vk::
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
     };
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &mem});
-    if (!prev_valid) return;
+    if (!prev_valid || !search) return;
     const vk::DescriptorImageInfo prev_info{{}, lum_prev.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo cur_info{{}, lum_cur.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo mv_info{{}, g_bb.mv.view, vk::ImageLayout::eGeneral};
@@ -2033,8 +2042,15 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     // Object motion vectors (bb_objmv.h) over the camera ones.
     g_bb.mv_frame = late ? BB::ObjMotion::FrameNo() - 1 : BB::ObjMotion::FrameNo();
     BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset, late);
-    BBFgFlow(cmd, lum_prev, lum_cur, render, lum_prev_valid);
-    BBMvMask(cmd, lum_prev, lum_cur, render, lum_prev_valid);
+    // 1.58: the hierarchical flow of bb_mvmask.comp supersedes the 1.46 pass (both searched the
+    // same luminance; BB_FG_MV_LEGACY=1 runs the 1.46 pass before it as in 1.54-1.57).
+    static const bool legacy_flow = [] {
+        const char* e = std::getenv("BB_FG_MV_LEGACY");
+        return e != nullptr && e[0] == '1';
+    }();
+    // (the 1.46 pass still keeps its per-second object-vector coverage lines for DLSS-G / image FG)
+    BBFgFlow(cmd, lum_prev, lum_cur, render, lum_prev_valid, !MvMaskWanted() || legacy_flow);
+    BBMvMask(cmd, lum_prev, lum_cur, render, lum_prev_valid, plan.jitter);
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
