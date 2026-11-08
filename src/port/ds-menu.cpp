@@ -2789,12 +2789,15 @@ void Shutdown() {
 	FreeTexture(g_fog);
 	FreeTexture(g_dot);
 	g_tried = false;
+	g_fog_linear = g_dot_linear = false;
 }
 
-void Linear(ImTextureData* t) {
-	// (the SDL_Renderer backend's texture: bilinear, never nearest — no stair-steps on the upscaled fog)
-	if (t != nullptr && t->GetTexID() != ImTextureID_Invalid)
-		SDL_SetTextureScaleMode(reinterpret_cast<SDL_Texture*>(static_cast<intptr_t>(t->GetTexID())), SDL_ScaleModeLinear);
+bool g_fog_linear = false, g_dot_linear = false;
+void Linear(ImTextureData* t, bool* done) {
+	// (the SDL_Renderer backend's texture: bilinear, never nearest; set once, as soon as the backend has created it)
+	if (*done || t == nullptr || t->Status != ImTextureStatus_OK || t->GetTexID() == ImTextureID_Invalid) return;
+	SDL_SetTextureScaleMode(reinterpret_cast<SDL_Texture*>(static_cast<intptr_t>(t->GetTexID())), SDL_ScaleModeLinear);
+	*done = true;
 }
 
 // One fog layer: the tile (side `tile` px) scrolled by (ox, oy), split at the tile borders (UVs stay in 0..1, the texture
@@ -2834,8 +2837,8 @@ void Layer(ImDrawList* dl, float W, float H, float tile, float ox, float oy, ImV
 void Draw(ImDrawList* dl, float W, float H, float unit) {
 	if (!g_tried) Create();
 	if (g_fog == nullptr || g_dot == nullptr || W <= 0 || H <= 0) return;
-	Linear(g_fog);
-	Linear(g_dot);
+	Linear(g_fog, &g_fog_linear);
+	Linear(g_dot, &g_dot_linear);
 	const double t  = static_cast<double>(SDL_GetPerformanceCounter() - g_t0) / static_cast<double>(SDL_GetPerformanceFrequency());
 	const float  tf = static_cast<float>(std::fmod(t, 36000.0)); // (wraps every 10 h; well before float precision goes)
 	// Fog: three layers, far = larger and slower (parallax), cold grey-blue, low alpha (the text stays readable).
@@ -2857,7 +2860,7 @@ void Draw(ImDrawList* dl, float W, float H, float unit) {
 		x = std::fmod(x + m, W + 2 * m); if (x < 0) x += W + 2 * m; x -= m;
 		y = std::fmod(y + m, H + 2 * m); if (y < 0) y += H + 2 * m; y -= m;
 		const float r       = (1.6f + 7.0f * z * z) * unit;
-		const float flicker = 0.75f + 0.25f * std::sin(tf * (0.8f + 1.7f * Rand01(s + 6)) + ph);
+		const float flicker = 0.92f + 0.08f * std::sin(tf * (0.25f + 0.35f * Rand01(s + 6)) + ph); // (slow, slight: no twinkle)
 		const float a       = (0.10f + 0.30f * (1 - std::abs(z - 0.45f) * 1.4f)) * flicker;
 		if (a <= 0.01f) continue;
 		const bool  ember = Rand01(s + 7) < 0.08f;
@@ -3884,7 +3887,7 @@ void DrawLauncher(float width, float height) {
 			bg->AddRectFilledMultiColor({0, y0 + h - U(60)}, {width, y0 + h}, IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255));
 		}
 	}
-	Ambience::Draw(bg, width, height, g_unit); // (des-fog-hq) the launcher only
+	if (g_saved.launcher_ambience) Ambience::Draw(bg, width, height, g_unit); // (des-fog-hq) the launcher only (lanzador_ambiente)
 	if (ImFont* f = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont(); f != nullptr) {
 		// (ds-pc-port39) The fork's credit at the window's top-right corner, tight to it (margin 11 px x the unit, right-aligned
 		// by its measured width), small and subtle with a soft shadow; on the foreground list: above the Opciones column.

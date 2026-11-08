@@ -262,6 +262,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("precompilar_hilos", s->precompile_threads);
 	str("metricas", s->metrics);
 	boo("menu_inicio", s->start_menu);
+	boo("lanzador_ambiente", s->launcher_ambience);
 	boo("vibracion", s->rumble);
 	num("vibracion_fuerza", s->rumble_gain);
 	str("extra", s->extra);
@@ -555,6 +556,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "metricas=" << s.metrics << "\n"
 	  << "; (Ya no se usa: el lanzador se abre siempre; \"Demon's Souls.exe\" --sin-lanzador lo salta una vez)\n"
 	  << "menu_inicio=" << b(s.start_menu) << "\n"
+	  << "; Niebla y ceniza animadas de fondo en el lanzador (0 = la ilustracion fija)\n"
+	  << "lanzador_ambiente=" << b(s.launcher_ambience) << "\n"
 	  << "; Vibracion del mando (el audio haptico del DualSense como vibracion; mandos Xbox, DualSense por Bluetooth)\n"
 	  << "vibracion=" << b(s.rumble) << "\n"
 	  << "vibracion_fuerza=" << Num(s.rumble_gain) << "\n\n"
