@@ -52,6 +52,7 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | spec_draw_indirect | DRAW_INDIRECT as a table draw, not a hole | - | 1 | spec_draw_indirect_verify N |
 | spec_read_one_set | a worker's clear read costs one search of one journal set | - | 1 | spec_read_one_set_verify N |
 | spec_walk_from_stamp | the clean-read check's log walk tries the read's latest stamp first | 1 | 1 | spec_commit_verify N |
+| spec_worker_packets | a worker's draws recorded as Vulkan packets on its own thread and spliced into the render thread's command buffer at commit | - | 1 | |
 | speculate_cancel_us | how long the render thread waits on a worker's chunk before taking the rest itself | - | 1000000 (always) | |
 | speculate_copy_runs | a journaled read inside one copy is one read | - | 1 | |
 | speculate_big_filter | big pending writes kept as ranges in the granule filter | - | 1 | |

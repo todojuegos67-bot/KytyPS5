@@ -34,7 +34,7 @@ inline constexpr Row Table[] = {
     {"speculate_texel_sync", 1, 0},     {"spec_late_reads", 1, 0},       {"spec_start_instance_free", 1, 0},
     {"spec_chunk_in_order", 1, 0},      {"serve_in_waits", 7, 1},        {"write_guard_spec", 1, 0},
     {"eager_feedback", 1, 0},           {"feedback_batch", 1, 0},        {"table_serials", 1, 0},
-    {"table_memo", 1, 0},
+    {"table_memo", 1, 0},               {"spec_worker_packets", 1, 0},
 };
 // KYTY_TABLE_TARGET_READ (not a live switch: read where image sets are made): on under mode 4.
 inline constexpr uint32_t TableTargetRead4 = 1, TableTargetRead0 = 0;

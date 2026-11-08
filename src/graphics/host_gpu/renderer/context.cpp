@@ -158,13 +158,23 @@ static void ReplayBegin(std::span<const LocalVulkanRecording::Segment> segments,
 }
 #endif
 
-void CommandBuffer::Begin() {
+void CommandBuffer::Begin(bool placeholder) {
 	EXIT_IF(m_rendering || IsInvalid());
 	InvalidateGraphicsState();
 	m_barrier_work = UINT64_MAX;
 	m_handle_requests = 0;
 	m_copy_run.clear();
 	m_run_tail.clear();
+	if (placeholder) {
+		// Every speculation's segments name the same placeholder handle, and the emission caches that reuse what a
+		// command buffer has bound key on (handle, GraphicsGeneration): each segment takes a generation no other
+		// CommandBuffer object has had or will reach (2^20 InvalidateGraphicsState calls apart), so no segment
+		// takes another's bound state for its own (a real buffer's handle told them apart).
+		static std::atomic<uint64_t> g_segment_generation {uint64_t {1} << 62u};
+		m_graphics_generation = g_segment_generation.fetch_add(uint64_t {1} << 20u, std::memory_order_relaxed);
+		m_timestamp_slot      = UINT32_MAX;
+		return;
+	}
 	// Not Handle(): nothing may be recorded before the buffer begins.
 	const vk::CommandBuffer buffer = m_buffer;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING

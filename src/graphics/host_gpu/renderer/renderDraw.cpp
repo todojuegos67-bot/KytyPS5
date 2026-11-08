@@ -607,7 +607,8 @@ namespace LocalDrawRecording {
 static void Replay(std::span<const LocalVulkanRecording::Segment> segments,
                    const vk::detail::DispatchLoaderDynamic& dispatch) {
     const auto& draw = *static_cast<const Draw*>(segments[0].data);
-    const auto command = draw.command;
+    // (A speculation worker's draw names the placeholder: its spliced replay resolves it to the target.)
+    const vk::CommandBuffer command {LocalVulkanRecording::Resolve(static_cast<VkCommandBuffer>(draw.command))};
     const auto vertex_count = static_cast<uint32_t>(segments[1].size / sizeof(vk::Buffer));
     if (vertex_count)
         command.bindVertexBuffers(0, vertex_count,

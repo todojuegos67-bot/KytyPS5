@@ -5,6 +5,9 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -98,6 +101,13 @@ public:
 			bool     ended          = false; // else the submission ends it (recorded through a recording stream)
 			uint32_t timestamp_slot = UINT32_MAX;
 			bool     empty          = false; // nothing recorded into it after its begin (KYTY_SPECULATE_KEEP_PASS)
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			// Worker packets (live spec_worker_packets): the segment's packets, recorded by the speculation thread's
+			// passive producer against the placeholder; spliced into this scheduler's open buffer by SubmitRecorded
+			// (index unused).
+			bool                            packets = false;
+			LocalVulkanRecording::ChunkList chunks;
+#endif
 		};
 		vk::CommandPool                pool = nullptr;
 		std::unique_ptr<CommandBuffer> command;
@@ -111,6 +121,10 @@ public:
 		// What its translation fences (CurrentTick): PendingTick and up, one value per translation in flight.
 		uint64_t pending_tick = PendingTick;
 		uint64_t begin_work   = 0; // this thread's recorded work when the open buffer began (empty buffers)
+		// Worker packets: its segments are recorded as packets (set per translation, on a speculation thread with a
+		// passive producer); `open` is PacketsOpen while one is being recorded.
+		bool                    packets     = false;
+		static constexpr size_t PacketsOpen = SIZE_MAX - 1;
 	};
 	[[nodiscard]] std::unique_ptr<Recorder> CreateRecorder();
 	void                                    DestroyRecorder(std::unique_ptr<Recorder> recorder);
@@ -130,6 +144,10 @@ public:
 	void DiscardRecorded(Recorder& recorder);
 	// One recorded buffer dropped (DiscardRecorded's, and an empty one's: KYTY_SPECULATE_KEEP_PASS).
 	void DiscardOne(Recorder& recorder, const Recorder::Recorded& recorded);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// SubmitRecorded's worker packets path.
+	uint64_t SpliceRecorded(Recorder& recorder, size_t count);
+#endif
 
 private:
 	class CommandPool {
@@ -198,6 +216,7 @@ private:
 	uint32_t                     m_recorded_dispatches = 0;
 	uint32_t                     m_recorded_draws      = 0;
 	bool                         m_flush_deferred      = false; // DeferrableFlush left the open buffer open
+	bool                         m_spliced             = false; // worker packets spliced into the open buffer (FlushRecorded)
 	std::array<SubmitEntry, MaxSubmitEntries> m_batch {}; // (SubmitRecorded's, not submitted yet: FlushRecorded)
 	size_t                                    m_batched = 0;
 	uint32_t                     m_deferred_checks     = 0;

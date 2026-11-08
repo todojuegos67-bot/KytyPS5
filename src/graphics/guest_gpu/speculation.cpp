@@ -347,6 +347,9 @@ static void PinSpeculationWorker(int64_t mask) {
 
 void Speculation::AheadRun(Translator& translator) {
 	LocalPlatform::SetThreadName("Kyty.Speculation");
+	// (Worker packets, live spec_worker_packets: its segments recorded as packets, spliced at commit. Armed only
+	// inside a segment recorded so: otherwise its calls go to the driver as before.)
+	const LocalVulkanRecording::PassiveProducerScope passive_producer;
 	static auto& live_cpus    = LiveSwitch::Find("speculate_cpus", 0);
 	int64_t      applied_cpus = live_cpus.load(std::memory_order_relaxed);
 	PinSpeculationWorker(applied_cpus);
@@ -666,6 +669,12 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	// (A speculation's thread records and ends its buffers; the GPU thread's go through its recording stream.)
 	r.recorder->own_thread   = !GuestGpu::IsGpuThread();
 	r.recorder->pending_tick = m_pending.fetch_add(1, std::memory_order_relaxed) + 1;
+	// KYTY_SPEC_WORKER_PACKETS (live spec_worker_packets; on under KYTY_SPECULATE=4): a speculation thread records its
+	// segments as packets against a placeholder, spliced into the GPU thread's recording stream at commit (no command
+	// buffers of its own, no submissions of them). The GPU thread's own translations record as before.
+	static auto& worker_packets = LiveSwitch::Find("spec_worker_packets", ModeToggle::Default("spec_worker_packets"));
+	r.recorder->packets = r.recorder->own_thread && worker_packets.load(std::memory_order_relaxed) != 0 &&
+	                      LocalVulkanRecording::HasPassiveProducer();
 	auto& processor          = *translator.cp;
 	processor.CopyStateFrom(cp, false); // (no packet it takes uses the constant RAM)
 	r.start_state->CopyStateFrom(cp, false);
@@ -777,6 +786,9 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 	} catch (const CommandScheduler::RecorderRefusal& refusal) {
 		r.failed = true;
 		r.stop   = refusal.what;
+		// (Worker packets: the open segment ends here, on its thread, so the producer stops recording this thread's
+		// calls; Finish drops it.)
+		if (r.recorder->packets) scheduler.EndRecording(*r.recorder);
 	}
 	CommandScheduler::SetThreadRecorder(nullptr);
 	Spec::t_state = nullptr;
@@ -1068,6 +1080,12 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		if (const auto tick = scheduler.SubmitRecorded(*result.recorder, segment.recorded - result.submitted); tick != 0)
 			result.last_tick = tick;
 		result.submitted = segment.recorded;
+		// (Worker packets: spliced into the open buffer, which goes on: the draw state this thread knew of it is not
+		// the buffer's any more. The recording worker's replay state is: the same buffer, replayed on the same thread.)
+		if (result.recorder->packets) {
+			DrawStateObserver::Invalidate();
+			m_renderer.GetRenderExecutor().NativeXprForgetState();
+		}
 		After(result, index);
 		if ((GuestGpu::ServeInWaits() & 2u) != 0) GuestGpu::ServePendingCommands(); // (KYTY_SERVE_IN_WAITS 2)
 		m_renderer.GetBufferCache().WriteBackCompletedFeedback(false); // (KYTY_EAGER_FEEDBACK)

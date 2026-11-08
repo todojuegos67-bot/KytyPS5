@@ -184,7 +184,8 @@ private:
 		m_shaders     = &shaders;
 	}
 
-	void Begin();
+	// (`placeholder`: a speculation thread's segment recorded as worker packets: the state reset, no Vulkan begin.)
+	void Begin(bool placeholder = false);
 	void End() const;
 	void FlushCopyRun() const;
 	void FlushRunTail() const;

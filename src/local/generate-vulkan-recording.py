@@ -102,7 +102,8 @@ def generate(registry, header):
                 args.append('nullptr')
                 continue
             if '*' not in d and '[' not in d:
-                args.append(n)
+                # A passive producer's placeholder resolves to the spliced chunk's target at replay.
+                args.append('ResolveCommand(commandBuffer)' if n == 'commandBuffer' and t == 'VkCommandBuffer' else n)
                 continue
             size = p.get('len')
             array = re.search(r'\[(\d+)\]', d)
@@ -137,8 +138,12 @@ def generate(registry, header):
                                 f'{1 if "2" in name else 0} | LiveCensus::g_queue, 0);')
         if ok:
             deferred.append(name)
-            declarations.append('    if (auto* stream = pAllocator == nullptr ? RecordingStream() : nullptr) {'
-                                if allocator else '    if (auto* stream = RecordingStream()) {')
+            # A passive producer (a speculation thread's worker packets) records commands only: its host calls
+            # (descriptor writes, view destruction) are made at once, as on a thread without a producer. A discarded
+            # segment must not leave a set its thread's caches published unwritten.
+            stream_expr = 'RecordingStream()' if name.startswith('vkCmd') else '(kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && t_passive ? nullptr : RecordingStream())'
+            declarations.append(f'    if (auto* stream = pAllocator == nullptr ? {stream_expr} : nullptr) {{'
+                                if allocator else f'    if (auto* stream = {stream_expr}) {{')
             declarations.append('        if (stream->Enqueue([&](Writer& writer) {')
             declarations.extend('            ' + c for c in copies)
             mutates_state = (name.startswith('vkCmdSet') or name.startswith('vkCmdBindPipeline') or
@@ -151,6 +156,12 @@ def generate(registry, header):
         # A progress query observes previously submitted work and neither
         # accesses a command pool nor executes commands still being recorded.
         # Preserve the real query; do not wait for our CPU recording queue.
+        # On a passive producer's thread a command on the placeholder that was not recorded (an unknown extension
+        # chain, too large) never reaches the driver: the segment fails.
+        if params and params[0].findtext('type') == 'VkCommandBuffer' and pnames[0] == 'commandBuffer':
+            fail_value = '' if ret == 'void' else ' VK_ERROR_UNKNOWN' if ret == 'VkResult' else ' {}'
+            declarations.append('    if (commandBuffer == Placeholder() && t_passive) [[unlikely]] { FailPassiveSegment(); '
+                                f'return{fail_value}; }}')
         if name not in NO_DRAIN_CALLS:
             declarations.append('    BeforeDirect();')
         if mark:
