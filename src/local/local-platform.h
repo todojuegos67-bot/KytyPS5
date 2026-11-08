@@ -26,6 +26,16 @@ bool PinThreadHandleToCpuList(uint64_t handle, const char* list);
 // Windows: the process's default CPU set as a CPU list; "" restores all CPUs. Linux: false.
 bool SetProcessDefaultCpuList(const char* list);
 
+// Windows: the speculation workers' default CPU list: the performance cores within the process's CPUs (Windows' CPU
+// set efficiency classes; every core where all are alike) without the core of CPU 0, as run-windows.ps1's "auto"
+// picks the render threads' CPUs; of those, the upper half of the cores (rounded up) with all their logical CPUs:
+// "8,9,10,11,12,13,14,15" on an 8 P-core + 16 E-core part (P-cores 1-7, CPUs 2-15, in the render list). "" when
+// there is none. Linux: "".
+std::string SpeculationCpuList();
+// The logical CPUs of the performance cores (the highest efficiency class; all of them where every core is alike) the
+// process may run on; 0 where that is not known (Linux). KYTY_SIMULATE_PCORES=<n> stands in for it (a test).
+uint32_t PerformanceLogicalCpus();
+
 // Opaque handle of the calling thread for ThreadCpuSeconds (valid while the thread runs).
 uint64_t CurrentThreadHandle();
 double   ThreadCpuSeconds(uint64_t handle);

@@ -316,10 +316,47 @@ void Speculation::Retire(std::unique_ptr<Spec::State> record) {
 	m_retired_records.emplace_back(++m_clock, std::move(record));
 }
 
+// The workers' CPUs: KYTY_SPECULATE_CPUS=<list> when set; otherwise the upper half of the performance cores
+// (LocalPlatform::SpeculationCpuList: CPUs 8-15 on an 8 P-core + 16 E-core part), never an E-core, the GPU, record and
+// upload threads still free over the whole render list; where there is no such list (Linux), off the render threads'
+// CPUs (KYTY_RENDER_CPUS). On the E-cores a worker translates a chunk slower than the GPU thread can wait for it: in
+// the 8 Nov placement trial the arena gained 2.8 fps in-process with the workers on CPUs 8-15, Latria and 1-1 were
+// level, and the translation lost to cancels fell by a third to a half everywhere. Live: speculate_cpus, a CPU mask
+// (0: this default), taken by each worker at its next wake. More workers than the list's CPUs share them (SMT).
+static const std::pair<std::string, const char*>& SpeculationCpus() {
+	static const auto cpus = []() -> std::pair<std::string, const char*> {
+		if (const char* list = std::getenv("KYTY_SPECULATE_CPUS"); list != nullptr && *list != 0) return {list, "KYTY_SPECULATE_CPUS"};
+		return {LocalPlatform::SpeculationCpuList(), "the upper half of the performance cores"};
+	}();
+	return cpus;
+}
+
+static void PinSpeculationWorker(int64_t mask) {
+	if (mask != 0) {
+		std::string list;
+		for (uint32_t cpu = 0; cpu < 64; ++cpu)
+			if ((static_cast<uint64_t>(mask) >> cpu) & 1u) list += (list.empty() ? "" : ",") + std::to_string(cpu);
+		LocalPlatform::PinThreadToCpuList(list.c_str());
+	} else if (const auto& cpus = SpeculationCpus(); !cpus.first.empty()) {
+		LocalPlatform::PinThreadToCpuList(cpus.first.c_str());
+	} else {
+		// (Off the GPU thread's CPUs: it commits what they translate, and waits for it.)
+		LocalPlatform::AvoidCpuList(std::getenv("KYTY_RENDER_CPUS"));
+	}
+}
+
 void Speculation::AheadRun(Translator& translator) {
 	LocalPlatform::SetThreadName("Kyty.Speculation");
-	// (Off the GPU thread's CPUs: it commits what they translate, and waits for it.)
-	LocalPlatform::AvoidCpuList(std::getenv("KYTY_RENDER_CPUS"));
+	static auto& live_cpus    = LiveSwitch::Find("speculate_cpus", 0);
+	int64_t      applied_cpus = live_cpus.load(std::memory_order_relaxed);
+	PinSpeculationWorker(applied_cpus);
+	if (translator.index == 0) {
+		const auto& cpus   = SpeculationCpus();
+		const char* render = std::getenv("KYTY_RENDER_CPUS");
+		std::printf("Speculation: %u workers on CPUs %s (%s); render threads on CPUs %s\n", static_cast<unsigned>(m_translators.size()),
+		            cpus.first.empty() ? "off the render threads' CPUs" : cpus.first.c_str(), cpus.first.empty() ? "no list" : cpus.second,
+		            render != nullptr && *render != 0 ? render : "any");
+	}
 	// (Its Vulkan calls go to the driver as they are made, no recording stream: what they name is alive then.)
 	RenderContext::SetThreadExecutors(&translator.executors);
 	GuestGpu::SetSpeculationThread(true);
@@ -347,6 +384,10 @@ void Speculation::AheadRun(Translator& translator) {
 			return pass != nullptr || work != nullptr;
 		});
 		if (m_quit) return;
+		if (const auto mask = live_cpus.load(std::memory_order_relaxed); mask != applied_cpus) {
+			applied_cpus = mask;
+			PinSpeculationWorker(mask);
+		}
 		if (pass != nullptr) {
 			// The state pass of the next submission (one thread at a time; the state it starts from goes to it, and its
 			// record, which reads through the one before while that is not done).

@@ -198,6 +198,71 @@ bool SetProcessDefaultCpuList(const char* list) {
 	return SetProcessDefaultCpuMask(CpuListMask(list));
 }
 
+std::string SpeculationCpuList() {
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) process = ~DWORD_PTR(0);
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	auto* first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+	if (length == 0 || !GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) return {};
+	struct Cpu {
+		uint32_t index, core, efficiency;
+	};
+	std::vector<Cpu> cpus;
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
+		    ((process >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0)
+			cpus.push_back({info->CpuSet.LogicalProcessorIndex, info->CpuSet.CoreIndex, info->CpuSet.EfficiencyClass});
+		offset += info->Size;
+	}
+	// The performance cores (the highest efficiency class; every core where all are alike) without CPU 0's core (most
+	// interrupts on Windows), as run-windows.ps1's "auto" picks the render threads' CPUs; then the upper half of them.
+	uint32_t fastest = 0, interrupts = UINT32_MAX;
+	for (const auto& cpu: cpus) {
+		fastest = std::max(fastest, cpu.efficiency);
+		if (cpu.index == 0) interrupts = cpu.core;
+	}
+	std::vector<uint32_t> cores;
+	for (const auto& cpu: cpus)
+		if (cpu.efficiency == fastest && cpu.core != interrupts && std::find(cores.begin(), cores.end(), cpu.core) == cores.end())
+			cores.push_back(cpu.core);
+	std::sort(cores.begin(), cores.end());
+	cores.erase(cores.begin(), cores.begin() + static_cast<std::ptrdiff_t>(cores.size() / 2));
+	std::sort(cpus.begin(), cpus.end(), [](const Cpu& a, const Cpu& b) { return a.index < b.index; });
+	std::string list;
+	for (const auto& cpu: cpus)
+		if (std::find(cores.begin(), cores.end(), cpu.core) != cores.end())
+			list += (list.empty() ? "" : ",") + std::to_string(cpu.index);
+	return list;
+}
+
+uint32_t PerformanceLogicalCpus() {
+	if (const char* simulate = std::getenv("KYTY_SIMULATE_PCORES"); simulate != nullptr && *simulate != '\0')
+		return static_cast<uint32_t>(std::strtoul(simulate, nullptr, 10));
+	DWORD_PTR process = 0, system = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) process = ~DWORD_PTR(0);
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 || !GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), length,
+	                                               &length, GetCurrentProcess(), 0))
+		return 0;
+	uint32_t fastest = 0, count = 0;
+	for (int pass = 0; pass < 2; ++pass)
+		for (ULONG offset = 0; offset < length;) {
+			const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+			if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
+			    ((process >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0) {
+				if (pass == 0) fastest = std::max<uint32_t>(fastest, info->CpuSet.EfficiencyClass);
+				else if (info->CpuSet.EfficiencyClass == fastest) ++count;
+			}
+			offset += info->Size;
+		}
+	return count;
+}
+
 uint64_t CurrentThreadHandle() {
 	HANDLE handle = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION | THREAD_SUSPEND_RESUME |
 	                               THREAD_GET_CONTEXT,
@@ -2036,6 +2101,16 @@ static bool MaskToSet(uint64_t mask, cpu_set_t* set) {
 void PinThreadToCpuList(const char* list) {
 	cpu_set_t set;
 	if (MaskToSet(CpuListMask(list), &set)) (void)sched_setaffinity(0, sizeof(set), &set);
+}
+
+std::string SpeculationCpuList() {
+	return {};
+}
+
+uint32_t PerformanceLogicalCpus() {
+	if (const char* simulate = std::getenv("KYTY_SIMULATE_PCORES"); simulate != nullptr && *simulate != '\0')
+		return static_cast<uint32_t>(std::strtoul(simulate, nullptr, 10));
+	return 0;
 }
 
 bool PinThreadHandleToCpuList(uint64_t handle, const char* list) {
