@@ -2710,6 +2710,7 @@ Uint64         g_t0    = 0;
 constexpr int  kFog    = 512;
 constexpr int  kDot    = 64;
 constexpr int  kDust   = 240;
+bool g_fog_linear = false, g_dot_linear = false;
 
 uint32_t Hash(uint32_t x) {
 	x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
@@ -2792,7 +2793,6 @@ void Shutdown() {
 	g_fog_linear = g_dot_linear = false;
 }
 
-bool g_fog_linear = false, g_dot_linear = false;
 void Linear(ImTextureData* t, bool* done) {
 	// (the SDL_Renderer backend's texture: bilinear, never nearest; set once, as soon as the backend has created it)
 	if (*done || t == nullptr || t->Status != ImTextureStatus_OK || t->GetTexID() == ImTextureID_Invalid) return;
