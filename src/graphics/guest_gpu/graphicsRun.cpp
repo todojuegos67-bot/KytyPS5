@@ -184,6 +184,24 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_work_available.Signal();
 }
 
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		CommandScope scope;
+		command();
+		return true;
+	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	LocalVulkanRecording::Drain(); // (as SendCommand)
+#endif
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting) return false;
+	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+	return true;
+}
+
 // Packets that only change state or record draws and dispatches.
 static constexpr auto KeepsDeferredProtectionBits = [] {
 	std::array<uint64_t, 4> bits {};

@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace Loader {
 struct Program;
@@ -25,6 +27,11 @@ struct Program;
 namespace DemonsSoulsPageFree {
 void Install(Program* program);
 void Clear();
+// The free blocks whose pages are all mapped, those over [begin, end) added to `blocks` as (address, size): the free lists
+// walked under the allocator's lock (waited for 2 ms at most). False when the free is not hooked, the lock stayed taken,
+// or the lists were not as read from the code (from then on always). For the GPU caches (BufferCache::DropFreedRange): a
+// buffer over a freed block and others free too.
+bool FreeBlocksIn(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* blocks);
 
 // The engine's free of a block as 01.007.000 has it (01.005.000, built by another compiler, has other code): the prologue
 // (push rbp; mov rbp, rsp; push r15; push r14; push rbx; sub rsp, 0x18), the stack guard load, the block descriptor kept

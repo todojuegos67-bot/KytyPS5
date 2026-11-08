@@ -201,6 +201,9 @@ void PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 // The same for a write of all of the range that reads none of it (InvalidateMemoryForWrite).
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
+// The game freed [vaddr, vaddr + size) and keeps it mapped (Demon's Souls' page allocator, demonsSoulsPageFree.cpp): when
+// the GPU caches' trackers watch a page of it, their buffers there go (GpuResourceManager::FreedByGame), without waiting.
+void NoteGameFree(uint64_t vaddr, uint64_t size);
 // The images over the range only (a GPU-written image's bytes here are stale: they are rewritten as InvalidateMemory
 // would make them).
 bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);

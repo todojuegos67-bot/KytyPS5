@@ -1590,6 +1590,13 @@ bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
 	       g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
 }
 
+void NoteGameFree(uint64_t vaddr, uint64_t size) {
+	uint64_t first = 0, end = 0;
+	if (g_gpu_resources != nullptr && size != 0 && IsGpuAddressRange(vaddr, size) &&
+	    g_gpu_resources->WatchedSpan(vaddr, size, &first, &end))
+		g_gpu_resources->FreedByGame(vaddr, size);
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // The emulator's view of the backing store: its only guards are the texture offload's (texture-offload.h Protect).
 static bool InBackingView(uint64_t address) {

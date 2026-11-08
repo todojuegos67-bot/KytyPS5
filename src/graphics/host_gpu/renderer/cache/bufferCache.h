@@ -213,10 +213,26 @@ public:
 	}
 	// The buffers no binding used for a while go (RunGarbageCollector, once a flip).
 	void RetireStaleBuffers(uint64_t tick);
-	// The buffers [vaddr, vaddr + size) holds whole go, after the guest unmapped it (GpuResourceManager::UnmapMemory).
-	void DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
-	// Then a buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts.
-	void SplitUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// The buffers [vaddr, vaddr + size) holds whole go, after the guest unmapped it (GpuResourceManager::UnmapMemory); their
+	// bytes.
+	uint64_t DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// The game's free blocks (its page allocator's, pages kept mapped) over [begin, end) added to `blocks` as (address, size):
+	// false when not known (Loader::DemonsSoulsPageFree::FreeBlocksIn).
+	using FreeBlocksQuery = bool (*)(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* blocks);
+	// What DropFreedRange's free block lists did: lists read, bytes cut off only thanks to them.
+	struct FreeBlockSplits {
+		uint64_t lists = 0, cut = 0;
+	};
+	// Then a buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts; the bytes cut
+	// off. With `free_blocks` (a freed range, DropFreedRange), the game's free blocks over it count as unmapped too.
+	uint64_t SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks = nullptr,
+	                              FreeBlockSplits* splits = nullptr);
+	// The game freed [vaddr, vaddr + size) and keeps it mapped (GpuResourceManager::FreedByGame): its GPU-written bytes read
+	// back (`read_back`) or dropped, then its buffers go as an unmapped range's do (the range, and the game's other free
+	// blocks a buffer over it spans, count as unmapped for SplitUnmappedBuffers); the bytes of buffers let go. Nothing when
+	// no buffer is registered there.
+	uint64_t DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
+	                        FreeBlockSplits* splits);
 	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
 	// The mapped parts of guest [vaddr, vaddr + size) (GpuResourceManager::MappedRanges), added to `out`.
 	void MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;

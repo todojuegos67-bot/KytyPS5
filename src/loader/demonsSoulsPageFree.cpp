@@ -66,6 +66,12 @@ Mode GetMode() {
 }
 
 uint64_t cave = 0, site = 0;
+// KYTY_ENGINE_FREE_BUFFERS (on unless 0): each block the free keeps mapped told to the GPU caches (LibKernel::Memory::
+// NoteGameFree), whose buffers over it go; the free's hook is installed for that on any PC.
+const bool g_drop_buffers = [] {
+	const char* value = std::getenv("KYTY_ENGINE_FREE_BUFFERS");
+	return value == nullptr || value[0] != '0';
+}();
 std::array<uint8_t, MovedPrologue> installed {}, original {};
 // The allocator's lock word and the global holding its statistics object's address (from the free's operands).
 uint64_t          g_lock = 0, g_stats_global = 0;
@@ -158,6 +164,9 @@ void KYTY_SYSV_ABI OnFree(uint64_t block) {
 	const uint64_t size    = Load(block + SizeAt);
 	const uint64_t mapped  = Load(block + MappedAt);
 	const uint64_t address = Load(block + AddressAt);
+	// (A block partly mapped: the engine unmaps it, and the unmap lets the buffers there go.)
+	if (g_drop_buffers && size != 0 && mapped == size) Libs::LibKernel::Memory::NoteGameFree(address, size);
+	if (GetMode() != Mode::Count) return;
 	if (size == 0 || mapped != size) {
 		// (Partly mapped: the engine unmaps it.)
 		g_stats.unmapped.fetch_add(1, std::memory_order_relaxed);
@@ -550,9 +559,38 @@ void WalkerThread() {
 }
 } // namespace
 
+bool FreeBlocksIn(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* blocks) {
+	// (The first lists checked against the allocator's own counts, as the walker's first walks are; lists not as read
+	// from the code stop them for good. The GPU thread waits 2 ms at most for that lock, as an engine thread holding it
+	// may itself wait for the GPU thread: the buffer then stays as it is.)
+	static std::atomic<uint32_t> lists {0};
+	static std::atomic<bool>     wrong {false};
+	if (cave == 0 || blocks == nullptr || begin >= end || wrong.load(std::memory_order_relaxed) || Load(g_stats_global) == 0)
+		return false;
+	thread_local std::vector<FreeRun> runs;
+	runs.clear();
+	WalkTotals totals;
+	const bool checked = lists.load(std::memory_order_relaxed) < 3;
+	if (!LockAllocator(2)) return false;
+	const bool walked = WalkFreeLocked(runs, totals, checked);
+	UnlockAllocator();
+	lists.fetch_add(1, std::memory_order_relaxed);
+	if (!walked || (checked && (totals.blocks != totals.counted_blocks || totals.pages != totals.counted_pages))) {
+		if (!wrong.exchange(true, std::memory_order_relaxed)) {
+			std::printf("Engine frees: the allocator's free lists are not as read from its code: buffers over several free "
+			            "blocks stay (KYTY_ENGINE_FREE_BUFFERS)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	for (const auto& run: runs)
+		if (run.address < end && run.address + run.size > begin) blocks->emplace_back(run.address, run.size);
+	return true;
+}
+
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
-	if (GetMode() == Mode::Off || site != 0 || program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
+	if ((GetMode() == Mode::Off && !g_drop_buffers) || site != 0 || program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
 	    program->file_name.filename() != "eboot.bin" || program->mapped_size > CaveOffset ||
 	    program->base_vaddr > UINT64_MAX - CaveOffset - PageSize)
 		return;
@@ -569,14 +607,14 @@ void Install(Program* program) {
 	g_lock         = *found + LockOperandEnd + static_cast<int64_t>(lock_displacement);
 	g_stats_global = *found + StatsOperandEnd + static_cast<int64_t>(stats_displacement);
 	site           = *found;
-	if (GetMode() != Mode::Count) {
+	if (GetMode() == Mode::Walk || GetMode() == Mode::GiveBack) {
 		std::thread(WalkerThread).detach();
 		std::printf("Engine frees: the page allocator (free at eboot+0x%llx, lock eboot+0x%llx): free blocks %s (KYTY_ENGINE_FREE)\n",
 		            static_cast<unsigned long long>(site - program->base_vaddr),
 		            static_cast<unsigned long long>(g_lock - program->base_vaddr),
 		            GetMode() == Mode::GiveBack ? "free for ~30 s given back" : "walked");
-		return;
 	}
+	if (GetMode() != Mode::Count && !g_drop_buffers) return;
 	const auto requested = program->base_vaddr + CaveOffset;
 	const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	    requested, PageSize, Common::VirtualMemory::Mode::ExecuteReadWrite, "demons_souls_page_free", true);
@@ -611,8 +649,9 @@ void Install(Program* program) {
 		return;
 	}
 	cave = allocated;
-	std::printf("Engine frees: the page allocator's free at eboot+0x%llx counted (KYTY_ENGINE_FREE)\n",
-	            static_cast<unsigned long long>(site - program->base_vaddr));
+	std::printf("Engine frees: the page allocator's free at eboot+0x%llx hooked:%s%s\n",
+	            static_cast<unsigned long long>(site - program->base_vaddr), GetMode() == Mode::Count ? " counted (KYTY_ENGINE_FREE)" : "",
+	            g_drop_buffers ? " the buffers over a freed block let go (KYTY_ENGINE_FREE_BUFFERS)" : "");
 #else
 	(void)program;
 #endif
