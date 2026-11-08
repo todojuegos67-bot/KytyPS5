@@ -123,6 +123,7 @@ struct State {
     u32 loaded_frame = 0, loaded_last = 0; // the same, this frame / the frame the flip ended
     std::unordered_map<u64, std::pair<u32, u32>> index_ranges; // cached [min, max] by index block
     u64 st_rigid_tracked = 0, st_rigid_static = 0, st_rigid_budget = 0, st_rigid_camera = 0;
+    u64 st_small_moved = 0; // 1.58: small-palette (3x4 matrices) draws whose palette changed
     // 1.29: identity of a skinned draw by its bone palette's guest address (one per character /
     // enemy instance when the game keeps it there), tried before the shader / stream identity:
     // several enemies of one model share shader, vertex and index streams and were told apart
@@ -133,6 +134,22 @@ struct State {
     u64 sk_pal = 0, sk_exact = 0, sk_loose = 0, sk_none = 0, sk_overflow = 0, sk_frames = 0;
     u64 ot_prev = 0, ot_none = 0;
     std::chrono::steady_clock::time_point sk_since = std::chrono::steady_clock::now();
+    // 1.58: a motion frame is one G-buffer pass, ended by the in-stream compose that reads it
+    // (or by the flip when nothing composes in-stream). Up to 1.57 the guest flip ended it; a
+    // flip the GPU thread runs between the next frame's G-buffer pass and its compose (non-EOP
+    // flips are queued to the GPU thread and run between command buffers) moved the frame
+    // parity and cleared `written`, so the compose read the other image: zero object pixels.
+    u64 mframe = 0;
+    bool need_advance = true;
+    u32 write_index = 0, latched_index = 0;
+    bool composed_open = false;  // the open motion frame was composed in-stream
+    bool flip_in_open = false;   // a guest flip ran while the open motion frame had draws
+    u32 flips_since_compose = 2; // guest flips since the last in-stream compose
+    u64 st_adv_compose = 0, st_adv_flip = 0, st_flip_mid = 0, st_split_composed = 0;
+    // 1.58 per second: what the compose read in the motion image (pixels, summed over composes).
+    u64 px_all = 0, px_obj = 0, px_chr = 0, px_own = 0, px_still = 0, px_no_prev = 0,
+        px_behind = 0, px_nonfinite = 0, px_cmag = 0, px_reads = 0;
+    u64 sec_composes = 0, sec_late = 0, sec_not_written = 0;
 };
 State g;
 
@@ -335,7 +352,8 @@ bool Init(const Vulkan::Instance& instance) {
     g.pipeline = pipeline;
     g.ready = true;
     Log(fmt::format("on: skinned / animated G-buffer draws get their own motion vectors "
-                    "({} Mi positions a frame, {} MiB); 1.20: motion image per frame parity, "
+                    "({} Mi positions a frame, {} MiB); 1.58: a motion frame = one G-buffer pass, "
+                    "ended by its in-stream compose (not by the guest flip); 1.20: two images, "
                     "loose identity {}, BB_OBJMV_DEBUG {}, BB_MV_VIEW {}",
                     mi, (u64(g.per_half) * 2 * 16) >> 20,
                     LooseOn() ? "on" : "off (BB_OBJMV_LOOSE=0)", DebugOn() ? "on" : "off",
@@ -514,6 +532,38 @@ bool WantPipeline(const AmdGpu::Regs& regs) {
     return bound >= 3;
 }
 
+namespace {
+// 1.58: starts the next motion frame at its first motion draw (history, positions half,
+// parameter slot, motion image).
+void MaybeAdvance() {
+    if (!g.need_advance) return;
+    g.need_advance = false;
+    ++g.mframe;
+    g.prev = std::move(g.cur);
+    g.cur.clear();
+    g.ordinals.clear();
+    g.prev_loose = std::move(g.cur_loose);
+    g.cur_loose.clear();
+    g.loose_ordinals.clear();
+    g.prev_pal = std::move(g.cur_pal);
+    g.cur_pal.clear();
+    g.pal_ordinals.clear();
+    g.cursor = 0;
+    g.params_used = 0;
+    g.cleared = false;
+    g.written = false;
+    g.composed_open = false;
+    g.flip_in_open = false;
+    g.write_index = static_cast<u32>(g.mframe & 1);
+    g.loaded_frame = 0;
+    if (g.index_ranges.size() > 65536) g.index_ranges.clear();
+    if (g.palettes.size() > 65536) g.palettes.clear();
+    if (g.rigid.size() > 65536) g.rigid.clear();
+    g.rigid_camera_bound = g.rigid_seen >= 64 && g.rigid_changed * 2 > g.rigid_seen;
+    g.rigid_seen = g.rigid_changed = g.rigid_used = 0;
+}
+} // namespace
+
 void FillKey(u32& mrt_mask, u32& num_color_attachments, Shader::PsColorBuffer& cb7,
              vk::ColorComponentFlags& write_mask7) {
     if (mrt_mask & (1u << Attachment)) return; // the shader writes MRT 7 itself
@@ -535,13 +585,14 @@ bool IsMotionKey(u32 mrt_mask, const Shader::PsColorBuffer& cb7) {
 void Attach(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
             Vulkan::RenderState& state) {
     if (!g.ready) return;
+    MaybeAdvance();
     if (state.num_color_attachments <= Attachment || !EnsureImage(state.width, state.height)) {
         ++g.st_attach_skip; // 1.54: a motion pipeline drawn without its attachment
         return;
     }
     ++g.st_attach;
     auto& attachment = state.color_attachments[Attachment];
-    const u32 cur = static_cast<u32>(g.frame & 1);
+    const u32 cur = g.write_index;
     attachment.image_view = g.views[cur];
     attachment.image_layout = vk::ImageLayout::eGeneral;
     attachment.clear_value = {0u, 0u, 0u, 0u};
@@ -618,6 +669,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
             const AmdGpu::Regs& regs, bool indexed, u32 index_offset, u32 vertex_offset,
             u32 instance_offset, u64 vs_hash) {
     if (!motion_pipeline || !g.ready) return;
+    MaybeAdvance();
     push.motion_param = 0;
     push.motion_params_addr = {u32(g.params_address), u32(g.params_address >> 32)};
     push.motion_positions_addr = {u32(g.positions_address), u32(g.positions_address >> 32)};
@@ -689,6 +741,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
             ++g.st_gated;
             return;
         }
+        ++g.st_small_moved;
     }
     if (palette == Palette::Rigid) {
         // A static object's constants do not change and the camera motion is exact for it. When
@@ -716,7 +769,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         ++g.st_rigid_tracked;
     }
 
-    const u32 half = static_cast<u32>(g.frame & 1);
+    const u32 half = static_cast<u32>(g.mframe & 1);
     if (g.cursor + count > g.per_half || g.params_used + 1 >= kParamsPerFrame) {
         // Dropped draws keep camera motion. Split by palette class, with the largest one, so the
         // next log shows whether character skeletons are among them.
@@ -792,7 +845,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
     g.cur_loose[loose_key] = {store_base, count};
     ++g.st_tracked;
 
-    const u32 slot = static_cast<u32>(g.frame % kFrameSlots);
+    const u32 slot = static_cast<u32>(g.mframe % kFrameSlots);
     const u32 index = slot * kParamsPerFrame + (++g.params_used);
     u32* entry = g.params_mapped + size_t(index) * 8;
     entry[0] = store_base;
@@ -811,22 +864,34 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     // In the frame's own command stream (before the flip) the G-buffer pass of this frame is
     // `written`. The presenter's late upscale runs after the flip (OnFlip has already cleared
     // `written`), so it reads the flag that OnFlip latched for the frame it presents.
+    // 1.58: in-stream, the open motion frame (its G-buffer pass) whatever flips ran meanwhile;
+    // late, the one the flip ended. An in-stream compose ends the motion frame.
     const bool wrote = late ? g.latched : g.written;
     g.composed_draws = 0;
     g.composed_view = vk::ImageView{};
     g.viz_valid = false;
     if (g.ready) {
         if (reset) g_cov.reset_frames.fetch_add(1, std::memory_order_relaxed);
-        if (!wrote) g_cov.not_written.fetch_add(1, std::memory_order_relaxed);
+        if (!wrote) {
+            g_cov.not_written.fetch_add(1, std::memory_order_relaxed);
+            ++g.sec_not_written;
+        }
         if (reset && wrote && ResetSkip()) g_cov.reset_skipped.fetch_add(1, std::memory_order_relaxed);
+        if (!late) {
+            if (wrote && !g.composed_open) {
+                ++g.st_adv_compose;
+                if (g.flip_in_open) ++g.st_split_composed;
+            }
+            g.composed_open = true;
+            g.need_advance = true;
+            g.flips_since_compose = 0;
+        }
     }
     if (!g.ready || !wrote || (reset && ResetSkip()) || g.width != render.width ||
         g.height != render.height) {
         return;
     }
-    // 1.20: the motion image of the frame being composed (late: the one the flip just ended,
-    // OnFlip has already advanced g.frame).
-    const u32 index = static_cast<u32>((late ? g.frame - 1 : g.frame) & 1);
+    const u32 index = late ? g.latched_index : g.write_index;
     g.composed_frame = late ? g.frame - 1 : g.frame;
     const bool debug = DebugOn() && g.stats_mapped != nullptr;
     const bool coverage = CoverageOn() && g.stats_mapped != nullptr;
@@ -849,6 +914,16 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
             g_cov.bmag.fetch_add(words[21], std::memory_order_relaxed);
             g_cov.bg.fetch_add(words[22], std::memory_order_relaxed);
             g_cov.read.fetch_add(1, std::memory_order_relaxed);
+            g.px_obj += words[11];
+            g.px_chr += words[12];
+            g.px_all += words[13];
+            g.px_still += words[14];
+            g.px_own += words[15];
+            g.px_no_prev += words[16];
+            g.px_behind += words[17];
+            g.px_nonfinite += words[18];
+            g.px_cmag += words[20];
+            ++g.px_reads;
         }
         if (debug && g.compose_no >= kStatSlots) {
             for (u32 k = 0; k < kStatWords; ++k) {
@@ -916,7 +991,11 @@ void Compose(vk::CommandBuffer cmd, vk::Image mv_image, vk::ImageView mv_view, v
     g.viz_valid = view;
     g.composed_view = g.views[index];
     ++g.st_composed;
-    if (late) ++g.st_composed_late;
+    ++g.sec_composes;
+    if (late) {
+        ++g.st_composed_late;
+        ++g.sec_late;
+    }
     g.composed_draws = late ? g.loaded_last : g.loaded_frame;
 }
 
@@ -967,16 +1046,24 @@ void OnFlip() {
     if (!g.ready) return;
     ++g.frame;
     ++g.st_frames;
-    g.prev = std::move(g.cur);
-    g.cur.clear();
-    g.ordinals.clear();
-    g.prev_loose = std::move(g.cur_loose);
-    g.cur_loose.clear();
-    g.loose_ordinals.clear();
-    g.prev_pal = std::move(g.cur_pal);
-    g.cur_pal.clear();
-    g.pal_ordinals.clear();
     ++g.sk_frames;
+    // 1.58: the flip ends the open motion frame only while nothing composes in-stream (the
+    // present-time path composes it late, from the latched image).
+    const bool open = g.written && !g.composed_open && g.flips_since_compose < 2;
+    if (open) {
+        ++g.st_flip_mid;
+        g.flip_in_open = true;
+    }
+    if (g.flips_since_compose < 2) ++g.flips_since_compose;
+    if (g.flips_since_compose >= 2 && !g.need_advance) {
+        g.latched = g.written;
+        g.latched_index = g.write_index;
+        g.loaded_last = g.loaded_frame;
+        g.need_advance = true;
+        if (g.written) ++g.st_adv_flip;
+    } else if (g.flips_since_compose >= 2) {
+        g.latched = false;
+    }
     {
         const auto now = std::chrono::steady_clock::now();
         if (now - g.sk_since >= std::chrono::seconds(1)) {
@@ -994,6 +1081,28 @@ void OnFlip() {
                             "slot / image), motion image {}x{}, last compose {}",
                             g.st_attach, g.st_attach_skip, g.width, g.height,
                             g.composed_view ? "read it" : "did not run"));
+            const double all = static_cast<double>(std::max<u64>(g.px_all, 1));
+            const auto pct = [&](u64 v) { return 100.0 * static_cast<double>(v) / all; };
+            const u64 classed = g.px_obj + g.px_no_prev + g.px_behind + g.px_nonfinite;
+            Log(fmt::format(
+                "1.58 {} composes ({} late, {} without a G-buffer motion pass), {} read back | "
+                "motion frames ended by the compose {}, by the flip {}; flips during an open "
+                "G-buffer frame {} ({} of those frames composed) | motion image: object vector "
+                "{:.2f} % (characters {:.2f} %, mean |mv| {:.2f} px, own motion {:.2f} %, still "
+                "{:.2f} %), motion pipeline without a vector {:.2f} % (no previous position "
+                "{:.2f} %, behind camera {:.2f} %, not finite {:.2f} %), never written {:.2f} %",
+                g.sec_composes, g.sec_late, g.sec_not_written, g.px_reads, g.st_adv_compose,
+                g.st_adv_flip, g.st_flip_mid, g.st_split_composed, pct(g.px_obj), pct(g.px_chr),
+                g.px_chr ? static_cast<double>(g.px_cmag) / 16.0 / static_cast<double>(g.px_chr)
+                         : 0.0,
+                pct(g.px_own), pct(g.px_still),
+                pct(g.px_no_prev + g.px_behind + g.px_nonfinite), pct(g.px_no_prev),
+                pct(g.px_behind), pct(g.px_nonfinite),
+                g.px_all > classed ? pct(g.px_all - classed) : 0.0));
+            g.px_all = g.px_obj = g.px_chr = g.px_own = g.px_still = g.px_no_prev = g.px_behind =
+                g.px_nonfinite = g.px_cmag = g.px_reads = 0;
+            g.sec_composes = g.sec_late = g.sec_not_written = 0;
+            g.st_adv_compose = g.st_adv_flip = g.st_flip_mid = g.st_split_composed = 0;
             g.st_attach = g.st_attach_skip = 0;
             g.sk_pal = g.sk_exact = g.sk_loose = g.sk_none = g.sk_overflow = g.sk_frames = 0;
             g.ot_prev = g.ot_none = 0;
@@ -1026,18 +1135,6 @@ void OnFlip() {
             g.dbg_since = now;
         }
     }
-    g.cursor = 0;
-    g.params_used = 0;
-    g.cleared = false;
-    g.latched = g.written;
-    g.written = false;
-    g.loaded_last = g.loaded_frame;
-    g.loaded_frame = 0;
-    if (g.index_ranges.size() > 65536) g.index_ranges.clear();
-    if (g.palettes.size() > 65536) g.palettes.clear();
-    if (g.rigid.size() > 65536) g.rigid.clear();
-    g.rigid_camera_bound = g.rigid_seen >= 64 && g.rigid_changed * 2 > g.rigid_seen;
-    g.rigid_seen = g.rigid_changed = g.rigid_used = 0;
     if (g.st_frames >= 1800) {
         Log(fmt::format("last {} frames: {} G-buffer draws with the motion pipeline, {} tracked "
                         "(skinned / moving), {} with last frame's positions (object vectors), {} "
@@ -1054,10 +1151,13 @@ void OnFlip() {
         g.st_compacted = 0;
         Log(fmt::format("rigid objects (BB_OBJMV_RIGID): last {} frames {} draws moved by their "
                         "own constants and got object vectors, {} unchanged (camera motion), {} "
-                        "skipped (camera in the constants), {} over the rigid budget",
+                        "skipped (camera in the constants), {} over the rigid budget | 1.58: "
+                        "moving props / weapons with a small (3x4 matrix) palette tracked {} "
+                        "(their transform is that palette, so they never reach the rigid class)",
                         g.st_frames, g.st_rigid_tracked, g.st_rigid_static, g.st_rigid_camera,
-                        g.st_rigid_budget));
+                        g.st_rigid_budget, g.st_small_moved));
         g.st_rigid_tracked = g.st_rigid_static = g.st_rigid_budget = g.st_rigid_camera = 0;
+        g.st_small_moved = 0;
         g.st_frames = g.st_motion_draws = g.st_tracked = g.st_loaded = g.st_gated =
             g.st_overflow = g.st_composed = g.st_composed_late = g.st_overflow_large = 0;
         g.st_overflow_max = 0;

@@ -29,7 +29,9 @@ void Count(uint i, float v) {
 void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool own);
 
 shared uint cov_obj, cov_char, cov_all, cov_still, cov_own, cov_cmag, cov_bmag, cov_bg;
+shared uint cov_reason[3];
 vec2 g_v;
+uint g_reason;
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
@@ -44,11 +46,15 @@ void main() {
             cov_cmag = 0u;
             cov_bmag = 0u;
             cov_bg = 0u;
+            cov_reason[0] = 0u;
+            cov_reason[1] = 0u;
+            cov_reason[2] = 0u;
         }
         barrier();
     }
     bool inside = c.x < int(p.size.x) && c.y < int(p.size.y) && p.size.z != 0u;
     bool cov_is_obj = false, cov_is_char = false, cov_is_still = false, cov_is_own = false;
+    g_reason = 0u;
     if (inside) {
         Body(c, cov_is_obj, cov_is_char, cov_is_still, cov_is_own);
     }
@@ -59,6 +65,7 @@ void main() {
             if (cov_is_char) atomicAdd(cov_char, 1u);
             if (cov_is_still) atomicAdd(cov_still, 1u);
             if (cov_is_own) atomicAdd(cov_own, 1u);
+            if (g_reason >= 8u && g_reason <= 10u) atomicAdd(cov_reason[g_reason - 8u], 1u);
             // 1.50: mean vector magnitude, characters vs the rest (x16 fixed point).
             uint m = uint(clamp(length(g_v), 0.0, 4096.0) * 16.0 + 0.5);
             if (cov_is_char) atomicAdd(cov_cmag, m);
@@ -77,6 +84,9 @@ void main() {
             if (cov_cmag != 0u) atomicAdd(st.s[20], cov_cmag);
             if (cov_bmag != 0u) atomicAdd(st.s[21], cov_bmag);
             if (cov_bg != 0u) atomicAdd(st.s[22], cov_bg);
+            for (uint r = 0u; r < 3u; ++r) {
+                if (cov_reason[r] != 0u) atomicAdd(st.s[16u + r], cov_reason[r]);
+            }
         }
     }
 }
@@ -87,8 +97,8 @@ void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool o
     vec2 v = cam;
     bool obj = false;
     // 1.46: o.y >= 8 = drawn by a motion pipeline without a vector (8 no previous position,
-    // 9 behind the camera, 10 not finite): words 16..18; word 19: such pixels + vector pixels.
-    if ((p.size.w & 4u) != 0u && o.y >= 8u && o.y <= 10u) atomicAdd(st.s[16u + (o.y - 8u)], 1u);
+    // 9 behind the camera, 10 not finite): words 16..18 (1.58: summed per group).
+    g_reason = o.y;
     if (o.y != 0u && o.y < 8u) {
         vec2 ov = unpackHalf2x16(o.x);
         if (!any(isnan(ov)) && !any(isinf(ov))) {
