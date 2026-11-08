@@ -1081,8 +1081,8 @@ void OnFlip() {
                             "slot / image), motion image {}x{}, last compose {}",
                             g.st_attach, g.st_attach_skip, g.width, g.height,
                             g.composed_view ? "read it" : "did not run"));
-            const double all = static_cast<double>(std::max<u64>(g.px_all, 1));
-            const auto pct = [&](u64 v) { return 100.0 * static_cast<double>(v) / all; };
+            const double px_total = static_cast<double>(std::max<u64>(g.px_all, 1));
+            const auto pct = [&](u64 v) { return 100.0 * static_cast<double>(v) / px_total; };
             const u64 classed = g.px_obj + g.px_no_prev + g.px_behind + g.px_nonfinite;
             Log(fmt::format(
                 "1.58 {} composes ({} late, {} without a G-buffer motion pass), {} read back | "
