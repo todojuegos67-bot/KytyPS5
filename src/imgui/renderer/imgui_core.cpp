@@ -16,6 +16,7 @@
 #include "font_stack.h"
 #include "imgui/imgui_layer.h"
 #include "imgui_core.h"
+#include "imgui/bb_menu.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_vulkan.h"
 #include "imgui_internal.h"
@@ -112,6 +113,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     io.Fonts->TexMaxHeight = atlas_max;
 
     io.FontGlobalScale = 0.5f;
+    BbMenu::LoadFonts(); // (bb-menu-121) the F1 menu's fonts (menu_assets\\fonts)
 
     StyleColorsDark();
 

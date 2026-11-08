@@ -19,6 +19,7 @@
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
 
+#include "imgui/bb_menu.h"
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
@@ -149,6 +150,7 @@ void ReleaseFlockState(Core::FileSys::File* file) {
 } // anonymous namespace
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
+    BbMenu::OnGuestFileOpen(raw_path, flags); // (bb trophies: save slot tracking)
     if (raw_path == nullptr) {
         *__Error() = POSIX_EFAULT;
         return -1;

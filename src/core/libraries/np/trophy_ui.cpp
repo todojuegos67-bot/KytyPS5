@@ -18,6 +18,7 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/np/trophy_ui.h"
+#include "imgui/bb_menu.h"
 
 CMRC_DECLARE(res);
 namespace fs = std::filesystem;
@@ -382,6 +383,10 @@ void AddTrophyToQueue(const std::filesystem::path& trophyIconPath, const std::st
     std::lock_guard<std::mutex> lock(queueMtx);
 
     if (EmulatorSettings.IsTrophyPopupDisabled()) {
+        return;
+    }
+    // (bb-menu-104) the Demon's Souls popup card and chime (BB_TROPHY_POPUP=0: shadPS4's)
+    if (BbMenu::PushTrophyToast(trophyIconPath, trophyName, rarity)) {
         return;
     } else if (current_trophy_ui.has_value()) {
         current_trophy_ui.reset();

@@ -10,6 +10,7 @@
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
+#include "core/bb_kbmcam.h"
 #include "core/bb_respatch.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
@@ -378,6 +379,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::OnGameLoaded();
             // After the XML patches: the upscaler's render size (bb-clean-021).
             BB::ResPatch::OnEbootLoaded(base_virtual_addr, base_size);
+            BB::KbmCam::OnEbootLoaded(base_virtual_addr, base_size);
         }
     }
 

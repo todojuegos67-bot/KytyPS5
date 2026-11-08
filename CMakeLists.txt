@@ -647,6 +647,8 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_matching2/np_matching2_signaling.h
             src/core/libraries/np/np_types2.h
             src/core/libraries/np/np_trophy.cpp
+            src/core/libraries/np/bb_trophy_sync.cpp
+            src/core/libraries/np/bb_trophy_sync.h
             src/core/libraries/np/np_trophy.h
             src/core/libraries/np/trophy_ui.cpp
             src/core/libraries/np/trophy_ui.h
@@ -1003,6 +1005,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/memory.h
          src/core/module.cpp
          src/core/bb_respatch.cpp
+         src/core/bb_kbmcam.cpp
+         src/core/bb_kbmcam.h
          src/core/bb_respatch.h
          src/core/module.h
          src/core/platform.h
@@ -1257,6 +1261,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
 
 set(IMGUI src/imgui/imgui_config.h
           src/imgui/imgui_layer.h
+          src/imgui/bb_menu.cpp
+          src/imgui/bb_menu.h
           src/imgui/imgui_std.h
           src/imgui/imgui_texture.h
           src/imgui/imgui_translations.cpp

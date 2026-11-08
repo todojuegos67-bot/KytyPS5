@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <map>
+#include <set>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <fmt/format.h>
@@ -13,12 +18,14 @@
 #include "common/slot_vector.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/np/bb_trophy_sync.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/np/trophy_ui.h"
 #include "core/libraries/system/userservice.h"
 #include "core/memory.h"
+#include "imgui/bb_menu.h"
 
 namespace Libraries::Np::NpTrophy {
 
@@ -978,6 +985,87 @@ s32 PS4_SYSV_ABI sceNpTrophyGetTrophyUnlockState(OrbisNpTrophyContext context,
     return ORBIS_OK;
 }
 
+// (bb-trophysync-148) Retroactive Bloodborne trophies. Once per boot, a few seconds after the
+// game registers its trophy context, reads the user's own save and unlocks every trophy the save
+// proves and the user does not hold yet, through sceNpTrophyUnlockTrophy (same files,
+// timestamps, platinum rule, shadNet report, popup + chime one by one). BB_TROPHY_SYNC=0: off.
+static void StartBbTrophySync(OrbisNpTrophyContext context, OrbisNpTrophyHandle handle,
+                              u32 user_id, std::filesystem::path xml_save_file) {
+    static std::atomic<bool> s_started{false};
+    if (const char* v = std::getenv("BB_TROPHY_SYNC"); v != nullptr && v[0] == '0') {
+        LOG_INFO(Lib_NpTrophy, "[trophy-sync] off (BB_TROPHY_SYNC=0)");
+        return;
+    }
+    if (s_started.exchange(true)) {
+        return;
+    }
+    std::thread([context, handle, user_id, xml_save_file] {
+        std::this_thread::sleep_for(std::chrono::seconds(8));
+        const auto user_home = EmulatorSettings.GetHomeDir() / std::to_string(user_id);
+        const auto save_dir = BbTrophySync::FindSaveDir(user_home);
+        if (save_dir.empty()) {
+            LOG_INFO(Lib_NpTrophy, "[trophy-sync] no Bloodborne save under {}",
+                     user_home.string());
+            return;
+        }
+        const auto proofs = BbTrophySync::ProveFromSaveDir(save_dir);
+
+        std::set<int> held;
+        {
+            pugi::xml_document doc;
+            if (!doc.load_file(xml_save_file.native().c_str())) {
+                LOG_WARNING(Lib_NpTrophy, "[trophy-sync] cannot read {}", xml_save_file.string());
+                return;
+            }
+            for (const auto& n : doc.child("trophyconf").children("trophy")) {
+                const int id = n.attribute("id").as_int(-1);
+                if (n.attribute("unlockstate").as_bool()) {
+                    held.insert(id);
+                }
+            }
+        }
+        std::vector<BbTrophySync::Proof> todo;
+        for (const auto& p : proofs) {
+            if (!held.contains(p.trophy_id)) {
+                todo.push_back(p);
+            }
+        }
+        LOG_INFO(Lib_NpTrophy, "[trophy-sync] save {}: {} trophies proven, {} new", save_dir.string(),
+                 proofs.size(), todo.size());
+        if (todo.empty()) {
+            return;
+        }
+        const auto backup = xml_save_file.parent_path() /
+                            (xml_save_file.filename().string() + ".trophy-backup-before-sync");
+        if (!std::filesystem::exists(backup)) {
+            std::error_code ec;
+            std::filesystem::copy_file(xml_save_file, backup, ec);
+            LOG_INFO(Lib_NpTrophy, "[trophy-sync] backup {} {}", backup.string(),
+                     ec ? ec.message() : std::string("ok"));
+            if (ec) {
+                return; // no backup, no changes
+            }
+        }
+        BbMenu::SetToastSecondsForThread(3.5f);
+        for (const auto& p : todo) {
+            OrbisNpTrophyId plat = ORBIS_NP_TROPHY_INVALID_TROPHY_ID;
+            const int r = sceNpTrophyUnlockTrophy(context, handle, p.trophy_id, &plat);
+            if (r == ORBIS_OK) {
+                LOG_INFO(Lib_NpTrophy, "[trophy-sync] unlocked {:03d} {}: {}", p.trophy_id,
+                         p.name, p.reason);
+                if (plat != ORBIS_NP_TROPHY_INVALID_TROPHY_ID) {
+                    LOG_INFO(Lib_NpTrophy, "[trophy-sync] unlocked {:03d} Bloodborne (platinum): "
+                             "every base trophy held", plat);
+                }
+            } else {
+                LOG_WARNING(Lib_NpTrophy, "[trophy-sync] {:03d} {} not unlocked: {:#x}",
+                            p.trophy_id, p.name, static_cast<u32>(r));
+            }
+        }
+        BbMenu::SetToastSecondsForThread(0.0f);
+    }).detach();
+}
+
 int PS4_SYSV_ABI sceNpTrophyRegisterContext(OrbisNpTrophyContext context,
                                             OrbisNpTrophyHandle handle, uint64_t options) {
     if (options != 0ull)
@@ -1038,6 +1126,10 @@ int PS4_SYSV_ABI sceNpTrophyRegisterContext(OrbisNpTrophyContext context,
     LOG_INFO(Lib_NpTrophy, "Context {} registered", context);
     CheckAndUnlockPlatinum(ctx);
 
+    if (np_comm_id == "NPWR05818_00") {
+        StartBbTrophySync(context, handle, ctx.user_id, ctx.xml_save_file);
+    }
+
     // Sync with shadNet
     {
         const auto save_file = ctx.xml_save_file;
@@ -1056,6 +1148,9 @@ int PS4_SYSV_ABI sceNpTrophyRegisterContext(OrbisNpTrophyContext context,
 
 int PS4_SYSV_ABI sceNpTrophyUnlockTrophy(OrbisNpTrophyContext context, OrbisNpTrophyHandle handle,
                                          OrbisNpTrophyId trophyId, OrbisNpTrophyId* platinumId) {
+    // (bb-trophysync-148) the game's trophy thread and the retroactive sync both unlock
+    static std::mutex s_unlock_mutex;
+    std::scoped_lock unlock_lock{s_unlock_mutex};
     LOG_INFO(Lib_NpTrophy, "Unlocking trophy id {}", trophyId);
 
     if (context == ORBIS_NP_TROPHY_INVALID_CONTEXT)
