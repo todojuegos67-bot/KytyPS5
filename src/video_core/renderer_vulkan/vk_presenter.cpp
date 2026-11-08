@@ -1001,6 +1001,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     vk::Extent2D fsr_out{frame->width, frame->height};
     auto frame_fsr = fsr_settings;
+    bool bb_sharp_pass = false; // 1.58: the DLSS / XeSS sharpening pass below
     // Bloodborne: a menu, loading screen or movie (no 3D scene, so no upscaler above) is scaled
     // to the window by the spatial FSR 1 pass instead of a plain (blurry) stretch.
     const bool bb_2d = BB::Upscale::Enabled() && !bb_presented && BB::Upscale::FlipIs2D();
@@ -1026,6 +1027,23 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         frame_fsr.sharpen_only = true;
         frame_fsr.rcas_attenuation = (1.0f - BB::Upscale::LiveSharpness()) * 2.0f;
         fsr_out = bb_size;
+        bb_sharp_pass = true;
+    }
+    {
+        // 1.58 (bb-upin-158): a frame a temporal upscaler made is sharpened once, by
+        // BB_UPSCALE_SHARPNESS: inside FSR 3.1 / FSR 4 (their RCAS), or here for DLSS / XeSS.
+        // shadPS4's own rcas_enabled (config) no longer adds a second RCAS on top of it (an FSR 1
+        // pass of an in-place upscaled frame smaller than the window, or sharpness 0).
+        const bool bb_up3d =
+            BB::Upscale::Enabled() && (bb_presented || BB::Upscale::LastFrameUpscaled());
+        if (bb_up3d && !bb_sharp_pass) {
+            frame_fsr.use_rcas = false;
+        }
+        const bool rcas_runs =
+            frame_fsr.enable && frame_fsr.use_rcas &&
+            (frame_fsr.sharpen_only || bb_size.width < fsr_out.width ||
+             bb_size.height < fsr_out.height);
+        if (BB::Upscale::Enabled()) BB::Upscale::NoteSharpen(bb_up3d, rcas_runs);
     }
     if (bb_2d) {
         // 0.48: the [2d] counter: did this 2D flip go through FSR 1 or a plain stretch?

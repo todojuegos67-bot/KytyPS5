@@ -228,6 +228,11 @@ void OnFgNativeAnalyzed(bool ok); // instead of OnPresentUpscaled in that mode
 bool TakeLateUpscale();
 // The frame just flipped went through the upscaler (in place or to the window size).
 bool LastFrameUpscaled();
+// 1.58 [upin]: the presenter reports each presented frame: upscaled by a temporal back end, and
+// whether its own RCAS pass ran on it (the [upin] line counts sharpening twice).
+void NoteSharpen(bool upscaled, bool present_rcas);
+// FSR 3.1 and FSR 4 sharpen inside the upscaler (RCAS); DLSS and XeSS have no sharpening.
+bool BackendSharpensItself();
 void OnPresentFailed(std::string_view why);
 // The flip being presented had no 3D scene (a menu, loading screen or movie) and an upscaler is
 // active: the presenter then scales it to the window with the spatial FSR 1 pass (EASU) instead of

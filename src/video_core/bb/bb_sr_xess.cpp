@@ -3,6 +3,7 @@
 // Intel XeSS super resolution (BB_UPSCALER=xess) through the XeSS SDK's libxess.dll (next to the
 // emulator) on its Vulkan backend. Ported from the Demon's Souls fork's src/local/xess-sr.cpp.
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -48,6 +49,12 @@ uint32_t g_errors = 0;
 VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT g_mutable{};
 
 xess_quality_settings_t QualityFor(Quality quality, double ratio) {
+    // 1.58 (bb-upin-158): the asked setting only when the real ratio agrees with it (within
+    // 4 %): XeSS "quality" is x1.7, and the launcher's 1.5 internal size gave it x1.5..1.6.
+    if (quality != Quality::Dynamic && ratio > 0.0 &&
+        std::abs(ratio / QualityRatio(Kind::Xess, quality) - 1.0) > 0.04) {
+        quality = Quality::Dynamic;
+    }
     switch (quality) {
     case Quality::Native:
         return XESS_QUALITY_SETTING_AA;
