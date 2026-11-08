@@ -1203,7 +1203,30 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         return;
     }
 
-    const bool generate = usable && g_fg_context != nullptr;
+    // 1.57 (bb-combo-157): hold-off. r156_0824: with the HUD canvas engaging, the present path
+    // changed every other frame (canvas / game image), the presenter skipped FG on each change,
+    // and FSR 3 generation went off / on every other present until presents stopped completing
+    // (the same FG swapchain hang as r149_0451 with the overlay). Generation now (re)starts only
+    // after BB_FG_HOLDOFF (default 30) usable frames in a row; any unusable frame stops it and
+    // restarts the count. BB_FG_HOLDOFF=0: old behaviour.
+    static const uint32_t holdoff = [] {
+        const char* e = std::getenv("BB_FG_HOLDOFF");
+        const long v = e && *e ? std::strtol(e, nullptr, 10) : 30;
+        return static_cast<uint32_t>(std::clamp<long>(v, 0, 600));
+    }();
+    static uint32_t usable_run = 0, held = 0, held_said = 0;
+    usable_run = usable ? usable_run + 1 : 0;
+    const bool hold = usable && !g_generating && usable_run <= holdoff;
+    if (hold) {
+        ++held;
+        if (held_said < 8 && (held == 1 || usable_run == holdoff)) {
+            ++held_said;
+            Printf("FSR3 FG: 1.57 hold-off: %u of %u stable frames before generation resumes "
+                   "(%u frames held so far)",
+                   usable_run, holdoff, held);
+        }
+    }
+    const bool generate = usable && !hold && g_fg_context != nullptr;
     ++g_frame_id;
     ffxConfigureDescFrameGeneration config{};
     config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
