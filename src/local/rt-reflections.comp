@@ -101,6 +101,9 @@ const int CALIB_HIST   = 300;
 const int STATS        = 560;
 const int SURVEY       = 600;
 const int WSTATS       = 1400; // (water2-1030) [0] shown change > 10 %, [1] > 20 %, [2] its max (atomicMax, cleared every 10 s)
+// (des-refl2-1108) PSTATS: which path the floors' reflection pixels take (1/16 of the render pixels, up-facing floors;
+// cumulative, never cleared; the CPU logs the difference every second, "RT reflections: floor paths"): see PathStat
+const int PSTATS       = 1404;
 layout(std430, binding = 19) readonly buffer Exposure {
 	float exposure_values[];
 };
@@ -488,14 +491,77 @@ float Moving(vec2 uv, vec3 P) { return (push.misc.w & 128) != 0 ? MovingRaw(uv, 
 // (refl-motion-1031) Flat floors that are not water: the reflection's normal settled toward world up where the geometry
 // (the depth's normal) and the surface's own normal are both level, so the depth's stair-steps and the normal map's
 // bumps do not make a wave that slides over a mirror-like floor while walking. Water keeps WaterNormal (its own option).
-vec3 FlatFloor(vec3 N, vec3 Nd) {
-	if (!(mparams.w > -0.5) || (push.misc.w & 8) == 0) return N;
-	vec3  up = normalize(up_view.xyz);
-	// (des-refl-flat) Solid floors reflect flat: when the geometry (the depth's normal) is level, the reflection ray uses
-	// world up fully, whatever the normal map's bumps say (they were kept at 15 %, and bumps past 0.85 not at all: on
-	// stone floors such as the Nexus the reflection rippled like water). Only water (WaterNormal) keeps its waves.
-	float f  = smoothstep(0.93, 0.98, dot(Nd, up));
-	return f > 0.0 ? normalize(mix(N, up, f)) : N;
+// (des-refl2-1108) KYTY_RT_REFLECTIONS_FLAT_FLOOR (misc.w & 8192, default on; 0: des-refl-flat's per-pixel test only):
+// the level test also on the floor's plane over a wider footprint (LevelWide: the depth 6 render pixels each way at
+// 720p), so a floor whose per-pixel depth normal is not level (the tessellation's displacement on "extremo", the depth's
+// precision at a distance) still reflects flat; and, on level floors, the game's own SSR confidence and the material's
+// roughness that gate the reflection are taken over the same footprint (GuideWide / RoughWide) instead of per pixel: the
+// game's SSR (its normal-mapped, jittered half-resolution rays) and the stone's per-tile roughness cut our flat
+// reflection into wobbling blobs, which is what the des-refl-flat build still showed on the Nexus floor.
+bool FlatFix() { return (push.misc.w & 8192) != 0; }
+float LevelPixel(vec3 Nd) {
+	if (!(mparams.w > -0.5) || (push.misc.w & 8) == 0) return 0.0;
+	return smoothstep(0.93, 0.98, dot(Nd, normalize(up_view.xyz)));
+}
+float LevelWide(vec2 uv, vec3 P, vec3 Nd) {
+	float f = LevelPixel(Nd);
+	if (!FlatFix() || f >= 1.0 || !(mparams.w > -0.5) || (push.misc.w & 8) == 0) return f;
+	vec3 up = normalize(up_view.xyz);
+	if (dot(Nd, up) < 0.6) return f; // (walls, steps' risers: never)
+	vec2  t  = vec2(6.0 * RenderSize().y / 720.0) / RenderSize();
+	vec2  ua = uv + vec2(t.x, 0), ub = uv - vec2(t.x, 0), uc = uv + vec2(0, t.y), ud = uv - vec2(0, t.y);
+	float da = DepthAt(ua), db = DepthAt(ub), dc = DepthAt(uc), dd = DepthAt(ud);
+	if (IsSky(da) || IsSky(db) || IsSky(dc) || IsSky(dd)) return f;
+	vec3 A = ViewPos(ua, da), B = ViewPos(ub, db), C = ViewPos(uc, dc), D = ViewPos(ud, dd);
+	// (one plane: 1 / distance is linear across a plane on screen; an edge or a step between the taps: no)
+	float iz = 1.0 / max(abs(P.z), 1e-3);
+	float jx = abs(1.0 / max(abs(A.z), 1e-3) + 1.0 / max(abs(B.z), 1e-3) - 2.0 * iz) / iz;
+	float jy = abs(1.0 / max(abs(C.z), 1e-3) + 1.0 / max(abs(D.z), 1e-3) - 2.0 * iz) / iz;
+	if (max(jx, jy) > 0.02) return f;
+	vec3  n = cross(A - B, C - D);
+	float l = length(n);
+	if (!(l > 1e-12)) return f;
+	n /= l;
+	if (dot(n, -P) < 0.0) n = -n;
+	return max(f, smoothstep(0.95, 0.985, dot(n, up)));
+}
+vec3 FlatFloor(vec3 N, float lvl) {
+	if (!(lvl > 0.0)) return N;
+	// (des-refl-flat) Solid floors reflect flat: when the geometry is level, the reflection ray uses world up fully,
+	// whatever the normal map's bumps say. Only water (WaterNormal) keeps its waves.
+	return normalize(mix(N, normalize(up_view.xyz), lvl));
+}
+// (des-refl2-1108) The game's SSR confidence over the level floor's footprint (8 taps at 4 and 8 render pixels at 720p on
+// the same plane, with the pixel itself): its per-pixel blobs gone, its overall extent kept.
+float GuideWide(vec2 uv, float z, float ga, float lvl) {
+	if (!FlatFix() || !(lvl > 0.0) || !HaveGuide()) return ga;
+	vec2  t   = vec2(RenderSize().y / 720.0) / RenderSize();
+	float sum = ga, ws = 1.0;
+	for (int i = 0; i < 8; ++i) {
+		float a   = float(i) * (PI * 0.25) + (i >= 4 ? PI * 0.125 : 0.0);
+		vec2  tuv = uv + vec2(cos(a), sin(a)) * t * (i >= 4 ? 8.0 : 4.0);
+		if (!InScreen(tuv)) continue;
+		float td = DepthAt(tuv);
+		if (IsSky(td) || abs(abs(ViewZ(td)) - z) > 0.05 * z + 0.05) continue;
+		sum += GameSsr(tuv).a, ws += 1.0;
+	}
+	return mix(ga, sum / ws, lvl);
+}
+// (des-refl2-1108) The material roughness over the level floor's footprint (the pixel and 4 taps 3 render pixels away,
+// same plane, G-buffer surfaces): the stone's per-tile roughness no longer cuts the reflection into tiles.
+float RoughWide(ivec2 p, float z, float rm, float lvl) {
+	if (!FlatFix() || !(lvl > 0.0)) return rm;
+	ivec2 hi  = ivec2(RenderSize()) - 1;
+	int   o   = max(int(3.0 * RenderSize().y / 720.0 + 0.5), 1);
+	float sum = rm, ws = 1.0;
+	for (int i = 0; i < 4; ++i) {
+		ivec2 q  = clamp(p + ivec2(i == 0 ? o : i == 1 ? -o : 0, i == 2 ? o : i == 3 ? -o : 0), ivec2(0), hi);
+		float qd = texelFetch(depth_tex, q, 0).r;
+		if (IsSky(qd) || abs(abs(ViewZ(qd)) - z) > 0.05 * z + 0.05) continue;
+		float r0;
+		sum += GbufRough(q, r0), ws += 1.0;
+	}
+	return mix(rm, sum / ws, lvl);
 }
 
 Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
@@ -509,7 +575,8 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 	float water = WaterMask(rp, d, ruv, Nd);
 	if (water > 0.0) match = false; // (the G-buffer holds the bed under the water)
 	s.N  = match ? Ng : (water > 0.0 ? WaterNormal(Nd) : Nd);
-	if (water <= 0.0) s.N = FlatFloor(s.N, Nd); // (refl-motion-1031)
+	float lvl = water <= 0.0 ? LevelWide(ruv, P, Nd) : 0.0; // (des-refl2-1108)
+	if (water <= 0.0) s.N = FlatFloor(s.N, lvl); // (refl-motion-1031)
 	s.Ng = Nd;
 	s.gb = match ? 1.0 : 0.0;
 	if (dot(s.N, V) < 0.02) s.N = normalize(s.N + V * (0.02 - dot(s.N, V) + 0.01)); // (back-facing by a little: bent)
@@ -520,12 +587,12 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 		// (refl8) The game decides: its SSR confidence here; the roughness field (when decoded) only narrows it to the
 		// mirror-like surfaces we sharpen and sets our lobe.
 		if (water <= 0.0 && GbufSurface(rp, d, match)) {
-			float gm  = GameMask(GameSsrAt(ruv, abs(P.z)).a);
+			float gm  = GameMask(GuideWide(ruv, abs(P.z), GameSsrAt(ruv, abs(P.z)).a, lvl)); // (des-refl2-1108: level floors wide)
 			float mir = 1.0;
 			mat_pr = 0.05, mat_r = 0.0; // (no roughness field: a mirror ray, at the game's share)
 			if (match && have_mat) {
 				float r0;
-				mat_pr = GbufRough(rp, r0);
+				mat_pr = RoughWide(rp, abs(P.z), GbufRough(rp, r0), lvl);
 				mir    = RoughFade(mat_pr);
 				mat_r  = LobeRough(mat_pr);
 				metal  = GbufMetal(rp);
@@ -537,7 +604,7 @@ Surf SurfaceAt(ivec2 rp, vec2 ruv, vec3 P, float d) {
 		}
 	} else if (match && have_mat) {
 		float r0;
-		mat_pr = GbufRough(rp, r0);
+		mat_pr = RoughWide(rp, abs(P.z), GbufRough(rp, r0), lvl);
 		mat    = RoughFade(mat_pr) * mparams.z;
 		mat_r  = LobeRough(mat_pr);
 		metal  = GbufMetal(rp);
@@ -674,6 +741,20 @@ bool Sampled(ivec2 p) { return ((p.x | p.y) & 3) == 0; } // (the stats: 1 pixel 
 void Stat(int k, int v) {
 	int sum = subgroupAdd(v);
 	if (subgroupElect()) atomicAdd(calib[STATS + k], sum);
+}
+
+// (des-refl2-1108) The floors' paths (PSTATS + k, sampled floor pixels): 0 floor (up-facing > 0.5, not a character),
+// 1 water (WaterMask), 2 level by the per-pixel depth normal (des-refl-flat's test), 3 level only by the footprint's plane
+// (LevelWide), 4 not level (the G-buffer / depth normal kept: bumps), 5 the G-buffer's normal-mapped normal matched, 6 the
+// game's SSR confident (> gparams.x), 7 level floor where the game's SSR confidence differs from its footprint's by > 0.15
+// (its blobs), 8 level floor where the roughness differs from its footprint's by > 0.08 (per-tile), 9 reflective (the
+// trace's mask), 10 shown (weight > 0.05), 11 shown with a screen-space hit, 12 shown without one (the hybrid's TLAS fill
+// or the history), 13 the full-resolution mirror ray, 14 sum of our weight x 1000 on level floors, 15 sum of the game's
+// SSR share taken out x 1000 (of the pixel's luminance) on level floors, 16 shown on level floors, 17 shown on not-level
+// floors, 18 shown on water, 19 guided (the game's SSR as the guide) floor pixels.
+void PathStat(int k, int v) {
+	int sum = subgroupAdd(v);
+	if (subgroupElect()) atomicAdd(calib[PSTATS + k], sum);
 }
 
 // (water2-1030) out_c.w: the hit flag + 2 on water (WaterStable): the hybrid fill's source hysteresis is water only.
@@ -1257,7 +1338,9 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 	vec3  Nd = NormalAt(uv, P);
 	vec3  Ng;
 	bool  match = GbufNormal(px, Ng) && dot(Ng, Nd) > 0.6;
-	vec3  N     = FlatFloor(match ? Ng : Nd, Nd); // (refl-motion-1031; water: WaterNormal below)
+	float lvl0  = LevelPixel(Nd);         // (des-refl2-1108: the per-pixel level test, des-refl-flat's; stats)
+	float lvl   = LevelWide(uv, P, Nd);   // (and over the floor's footprint)
+	vec3  N     = FlatFloor(match ? Ng : Nd, lvl); // (refl-motion-1031; water: WaterNormal below)
 	if (st && match) Stat(6, 1);
 	if (st && (push.misc.w & 64) != 0) {
 		float d0 = texelFetch(gdepth, px, 0).r;
@@ -1281,10 +1364,25 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 		}
 	}
 	if (st) Stat(17, MovingRaw(uv, P) > 0.5 ? 1 : 0);
+	// (des-refl2-1108) level floors: the roughness over the footprint (rm0: this pixel's, for the path stats)
+	float rm0 = rm;
+	if (match && have_mat) rm = RoughWide(px, z, rm, lvl);
 	// (refl8) The game's own SSR here (the guide) and whether this pixel is the G-buffer's surface it belongs to.
 	vec4  gs     = GameSsrAt(uv, z);
 	bool  gsurf  = GuideMode() && HaveGuide() && GbufSurface(px, d, match);
 	float ga     = gsurf ? gs.a : 0.0;
+	float gaw    = gsurf ? GuideWide(uv, z, ga, lvl) : 0.0; // (des-refl2-1108: level floors, over the footprint)
+	// (des-refl2-1108) the floors' paths (PathStat)
+	bool  pf = st && UpFacing(Nd) > 0.5 && MovingRaw(uv, P) <= 0.5;
+	bool  pw = false, pl = false;
+	if (pf) {
+		pw = WaterMask(px, d, uv, Nd) > 0.0;
+		pl = !pw && lvl > 0.5;
+		PathStat(0, 1), PathStat(1, pw ? 1 : 0), PathStat(2, !pw && lvl0 > 0.5 ? 1 : 0), PathStat(3, pl && lvl0 <= 0.5 ? 1 : 0);
+		PathStat(4, !pw && lvl <= 0.5 ? 1 : 0), PathStat(5, !pw && match ? 1 : 0), PathStat(6, ga > gparams.x ? 1 : 0);
+		PathStat(7, pl && gsurf && abs(ga - gaw) > 0.15 ? 1 : 0), PathStat(8, pl && match && have_mat && abs(rm0 - rm) > 0.08 ? 1 : 0);
+		PathStat(19, GuideMode() && HaveGuide() ? 1 : 0);
+	}
 	if (st && GuideMode() && HaveGuide()) {
 		Stat(20, ga > gparams.x ? 1 : 0);
 		Stat(22, int(ga * 1000.0));
@@ -1306,6 +1404,7 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 		return col.rgb;
 	}
 	if (st && mask > 0.05) Stat(3, 1);
+	if (pf) PathStat(9, 1);
 	float water = WaterMask(px, d, uv, Nd);
 	// (refl6) Final gate per render pixel (the trace's mask is upsampled from half resolution and could bleed onto a
 	// character or a rough neighbour): water (up-facing by its own mask), else this pixel's own material roughness, else
@@ -1319,13 +1418,13 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 		// (refl8) The game's SSR confidence at this render pixel (the trace's mask is half resolution), narrowed to the
 		// mirror-like surfaces by the roughness field when there is one.
 		float tmask = mask; // (the trace's, which holds the metal / glossy paths too)
-		mask = gsurf ? min(mask, GameMask(ga) * (match && have_mat ? RoughFade(rm) : 1.0)) : 0.0;
+		mask = gsurf ? min(mask, GameMask(gaw) * (match && have_mat ? RoughFade(rm) : 1.0)) : 0.0;
 		if (!(match && have_mat)) fr_rough = 0.05; // (no roughness field: the game's SSR marks smooth surfaces)
 		// (refl9) Metals and glossy dielectrics, any orientation: this render pixel's own material; the trace must have
 		// marked the surface (its rays are what we mix in).
 		if (gsurf && match && have_mat && tmask > 0.01) {
 			vec3 Ve = normalize(-P);
-			ex      = ExtraWeight(metal, rm, clamp(dot(N, Ve), 0.0, 1.0), UpFacing(Nd), GameMask(ga));
+			ex      = ExtraWeight(metal, rm, clamp(dot(N, Ve), 0.0, 1.0), UpFacing(Nd), GameMask(gaw));
 		}
 	} else if (have_mat) {
 		mask = match ? min(mask, RoughFade(rm) * mparams.z) : 0.0;
@@ -1367,6 +1466,7 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 		if (rg < 0.01) Rf = normalize(Rf + Nd * (0.01 - rg));
 		vec4  hc;
 		float hd;
+		if (pf) PathStat(13, 1);
 		if (!BadV(Rf) && March(P, N, Rf, Vf, push.misc2.z, hc, hd)) {
 			// (a little of the temporal result where it agrees: steadier under sub-pixel camera motion)
 			bool agree = rf.a > 1e-3 && !Bad(rf) && distance(rf.rgb / rf.a, hc.rgb / hc.a) < 0.1;
@@ -1391,11 +1491,16 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 		// (refl8) Only the game's SSR color is replaced, at the game's own share: its confidence a x the Fresnel x
 		// strength; ours' confidence (through a square root, as below) and the mirror-likeness (mask / the game's mask)
 		// scale how much of it is ours. A miss changed nothing above (the game's pixel, its IBL included, stays).
-		float gm  = GameMask(ga);
+		float gm  = GameMask(gaw);
 		float mir = gm > 1e-3 ? clamp(mask / gm, 0.0, 1.0) : 0.0;
 		float k   = sqrt(clamp(rf.a, 0.0, 1.0)) * mir * gm;
-		float wg  = clamp(gparams.w * ga * k * Spec(fr_rough, NoV, metal, 0.0), 0.0, 1.0);
-		vec3  dlt = wg * (refl - GameReflColor(gs));
+		float spg = Spec(fr_rough, NoV, metal, 0.0);
+		// (des-refl2-1108) ours at the footprint's share (gaw), the game's own (normal-mapped, blobby) SSR colour taken out at
+		// its own pixel's share (ga): on a level floor the game's wobbling blobs go and our flat reflection takes their place
+		// (elsewhere gaw == ga: as before)
+		float wg  = clamp(gparams.w * gaw * k * spg, 0.0, 1.0);
+		float wgr = clamp(gparams.w * ga * k * spg, 0.0, 1.0);
+		vec3  dlt = wg * refl - wgr * GameReflColor(gs);
 		// (never darker than MaxDarken of the pixel's luminance, as below)
 		float lc = Luma(max(col.rgb, vec3(0))), ld = Luma(dlt);
 		if (ld < 0.0) dlt *= min(1.0, MaxDarken * lc / max(-ld, 1e-30));
@@ -1436,6 +1541,16 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 			if (dl < -MaxDarken * lc0) outg = col.rgb + (outg - col.rgb) * (MaxDarken * lc0 / max(-dl, 1e-30));
 		}
 		if (BadV(outg)) outg = col.rgb;
+		if (pf) {
+			bool shown = wg > 0.05, sh = mod(ax.w, 2.0) > 0.5;
+			PathStat(10, shown ? 1 : 0), PathStat(11, shown && sh ? 1 : 0), PathStat(12, shown && !sh ? 1 : 0);
+			PathStat(16, shown && pl ? 1 : 0), PathStat(17, shown && !pl && !pw ? 1 : 0), PathStat(18, shown && pw ? 1 : 0);
+			if (pl) {
+				PathStat(14, int(wg * 1000.0));
+				float lcp = Luma(max(col.rgb, vec3(0)));
+				PathStat(15, int(clamp(Luma(wgr * GameReflColor(gs)) / max(lcp, 1e-6), 0.0, 1.0) * 1000.0));
+			}
+		}
 		if (st) {
 			Stat(21, ga * k > 0.05 ? 1 : 0);
 			if (wg > 0.05) Stat(1, 1);
@@ -1461,6 +1576,12 @@ vec3 CompositeRaw(ivec2 px, vec4 col, float d, out bool wl) {
 	// screen-space hit on a dark on-screen wall replaced up to 90 % of it, so puddles (the wet mask's plain, dark, flat
 	// pixels) turned into flat near-black shapes that came and went as the walls entered and left the screen.
 	if (lr < lc) w = min(w, MaxDarken * lc / max(lc - lr, 1e-30));
+	if (pf) {
+		bool shown = w > 0.05, sh = mod(ax.w, 2.0) > 0.5;
+		PathStat(10, shown ? 1 : 0), PathStat(11, shown && sh ? 1 : 0), PathStat(12, shown && !sh ? 1 : 0);
+		PathStat(16, shown && pl ? 1 : 0), PathStat(17, shown && !pl && !pw ? 1 : 0), PathStat(18, shown && pw ? 1 : 0);
+		if (pl) PathStat(14, int(w * 1000.0));
+	}
 	if (st) {
 		if (w > 0.05) Stat(1, 1);
 		if (w > 0.05 && match && have_mat && rm < 0.1) Stat(19, 1);

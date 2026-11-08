@@ -145,6 +145,9 @@ constexpr uint32_t WaterMaxStat  = 37; // (water-1030: an atomicMax, cleared eve
 // (water2-1030) the shader's WSTATS: what the water shows changed on a still camera, > 10 % / > 20 % counters, [2] max
 constexpr uint32_t WStatsIndex   = 1400;
 constexpr uint32_t WStatsCount   = 3;
+// (des-refl2-1108) the shader's PSTATS: which path the floors' reflection pixels take (PathStat; logged every second)
+constexpr uint32_t PStatsIndex   = 1404;
+constexpr uint32_t PStatsCount   = 20;
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -167,6 +170,7 @@ static_assert(CalibWet + 34 <= CalibHist && CalibHist + 256 <= StatsIndex);
 static_assert(HeaderBytes + (StatsIndex + StatsCount) * 4 <= FrameBytes);
 static_assert(SurveyIndex + SurveyCount <= WStatsIndex && HeaderBytes + (WStatsIndex + WStatsCount) * 4 <= FrameBytes);
 static_assert(StatsIndex + StatsCount <= SurveyIndex && HeaderBytes + (SurveyIndex + SurveyCount) * 4 <= FrameBytes);
+static_assert(WStatsIndex + WStatsCount <= PStatsIndex && HeaderBytes + (PStatsIndex + PStatsCount) * 4 <= FrameBytes);
 static_assert(SurveyHist == SurveyBits + 2 * 128 && SurveyHist + 2 * 256 == SurveyCount);
 
 struct RtPush {
@@ -218,6 +222,11 @@ struct RtPass {
 	uint32_t                wshow_max = 0;                                   // (water2-1030)
 	std::array<uint32_t, 2> wshow_last {};
 	std::array<uint64_t, 2> wshow_sum {};
+	// (des-refl2-1108) the floors' paths: the counters' last values, the sums since the last line (every second)
+	std::array<uint32_t, PStatsCount> path_last {};
+	std::array<uint64_t, PStatsCount> path_sum {};
+	uint64_t                path_frames = 0, path_hw_frames = 0, path_guide_frames = 0;
+	std::chrono::steady_clock::time_point path_time = std::chrono::steady_clock::now();
 	RtImage                 dummy; // 1x1 R32_UINT stand-in for absent G-buffer layers
 	std::vector<Retired>    retired;
 	VkBuffer                frame_buf = VK_NULL_HANDLE; // device-local: the shader's header, sums and counters
@@ -799,6 +808,63 @@ void LogHwStats(double seconds) {
 // The stats counters (the shader's atomics on 1 pixel in 16, cumulative: the difference since the last frame, modulo
 // 2^32) and, every 10 s, one line that says whether the reflections show: the share of pixels with a weight > 0.05, the
 // mean weight, the rays' hit rate, the G-buffer's state, the GPU time.
+// (des-refl2-1108) KYTY_RT_REFLECTIONS_FLAT_FLOOR (default 1; 0: des-refl-flat's per-pixel level test only, the game's
+// SSR confidence and the roughness per pixel): level floors that are not water reflect flat and stable (rt-reflections.comp
+// LevelWide / GuideWide / RoughWide).
+bool FlatFloorWanted() {
+	static const bool on = [] {
+		const char* e  = std::getenv("KYTY_RT_REFLECTIONS_FLAT_FLOOR");
+		const bool  v  = !(e != nullptr && e[0] == '0');
+		std::printf("RT reflections: flat floors (des-refl2-1108) %s: level non-water floors reflect along world up (level "
+		            "tested on the floor's plane, not only per pixel), gated by the game's SSR confidence and the roughness over "
+		            "the floor's footprint (no blobs); the game's own SSR colour replaced at its pixel's share; water keeps its "
+		            "waves (KYTY_RT_REFLECTIONS_FLAT_FLOOR=0: off)\n",
+		            v ? "on" : "off");
+		std::fflush(stdout);
+		return v;
+	}();
+	return on;
+}
+
+// (des-refl2-1108) Every second, one line on which path the floors' reflection pixels took (the sampled up-facing
+// floor pixels, characters excluded): so a user's log shows whether a floor that ripples is water, a level floor
+// (flattened), a floor not seen as level (its bumps kept), the game's own SSR blobs, the hybrid's fill.
+void LogFloorPaths() {
+	const auto* c = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + PStatsIndex);
+	for (uint32_t k = 0; k < PStatsCount; ++k) {
+		const uint32_t v = c[k];
+		if (g_rt.frame > 8) g_rt.path_sum[k] += static_cast<uint32_t>(v - g_rt.path_last[k]);
+		g_rt.path_last[k] = v;
+	}
+	++g_rt.path_frames;
+	if (g_rt.hw_ran_last) ++g_rt.path_hw_frames;
+	if (g_rt.have_guide) ++g_rt.path_guide_frames;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_rt.path_time < std::chrono::seconds(1)) return;
+	const auto&  p  = g_rt.path_sum;
+	const double fl = static_cast<double>(std::max<uint64_t>(p[0], 1));
+	const double nw = static_cast<double>(std::max<uint64_t>(p[0] - std::min(p[1], p[0]), 1)); // (floors that are not water)
+	const double lv = static_cast<double>(std::max<uint64_t>(p[2] + p[3], 1));
+	const double sh = static_cast<double>(std::max<uint64_t>(p[10], 1));
+	if (p[0] > 0) {
+		std::printf("RT reflections: floor paths 1 s (des-refl2-1108, flat fix %s, %s, hybrid %llu/%llu frames): %llu floor samples: "
+		            "water %.1f%%; not water: level per pixel %.1f%%, level only on the plane %.1f%%, not level (bumps kept) %.1f%%, "
+		            "normal-mapped G-buffer normal %.1f%%; game SSR confident %.1f%% (blobby on level floors %.1f%%), roughness "
+		            "per-tile on level floors %.1f%%; reflective %.1f%%, shown %.1f%% (screen-space hit %.0f%% / fill or history "
+		            "%.0f%% of shown; on level floors %.0f%%, not level %.0f%%, water %.0f%%), full-res mirror ray %.1f%%; level "
+		            "floors: our mean weight %.3f, the game's SSR taken out %.3f of the light\n",
+		            FlatFloorWanted() ? "on" : "off",
+		            g_rt.path_guide_frames > 0 ? "guided by the game's SSR" : "not guided", static_cast<unsigned long long>(g_rt.path_hw_frames),
+		            static_cast<unsigned long long>(g_rt.path_frames), static_cast<unsigned long long>(p[0]), 100.0 * p[1] / fl,
+		            100.0 * p[2] / nw, 100.0 * p[3] / nw, 100.0 * p[4] / nw, 100.0 * p[5] / nw, 100.0 * p[6] / fl, 100.0 * p[7] / lv,
+		            100.0 * p[8] / lv, 100.0 * p[9] / fl, 100.0 * p[10] / fl, 100.0 * p[11] / sh, 100.0 * p[12] / sh,
+		            100.0 * p[16] / sh, 100.0 * p[17] / sh, 100.0 * p[18] / sh, 100.0 * p[13] / fl, p[14] / 1000.0 / lv, p[15] / 1000.0 / lv);
+	}
+	g_rt.path_sum.fill(0);
+	g_rt.path_frames = 0, g_rt.path_hw_frames = 0, g_rt.path_guide_frames = 0;
+	g_rt.path_time = now;
+}
+
 void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	if (g_rt.mapped == nullptr) return;
 	(void)vmaInvalidateAllocation(graphics.allocator, g_rt.frame_mem, 0, VK_WHOLE_SIZE);
@@ -821,6 +887,7 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		}
 		if (g_rt.frame > 8 && !g_rt.water_max_clear) g_rt.wshow_max = std::max(g_rt.wshow_max, w[2]);
 	}
+	LogFloorPaths(); // (des-refl2-1108)
 	++g_rt.stat_frames;
 	if (have_gbuf) ++g_rt.stat_gbuf_frames;
 	if (g_rt.have_guide) ++g_rt.stat_guide_frames;
@@ -1477,7 +1544,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	               (g_rt.row0_up ? 16 : 0) | (TraceChecker(level) ? 32 : 0) | (have_water ? 64 : 0) |
 	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) |
 	               (g_rt.stable ? 1024 : 0) | // (rtfly-1029: the firefly limit and the contribution's stabilisation)
-	               (g_rt.water_stable ? 2048 : 0) | (RtFlicker::CameraStill() ? 4096 : 0); // (water-1030)
+	               (g_rt.water_stable ? 2048 : 0) | (RtFlicker::CameraStill() ? 4096 : 0) | // (water-1030)
+	               (FlatFloorWanted() ? 8192 : 0); // (des-refl2-1108)
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1787,7 +1855,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
 		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
-		vk::BufferCopy region {HeaderBytes, HeaderBytes, (WStatsIndex + WStatsCount) * 4}; // (water2-1030: + the water stats)
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (PStatsIndex + PStatsCount) * 4}; // (water2-1030 + des-refl2-1108: the water / floor stats)
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
 		if (hw_on) {
 			const vk::BufferCopy hw_region {HwHeaderBytes, HwHeaderBytes, HwStatsCount * 4};
