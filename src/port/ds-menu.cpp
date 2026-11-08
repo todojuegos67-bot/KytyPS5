@@ -2342,7 +2342,7 @@ void Draw(float width, float height) {
 							if (ChoiceRow(g.name, true, g.onoff ? onoff : levels, g.onoff ? 3 : 6, v, g.tip)) SetGameSettingLevel(&s, g.id, std::atoi(v.c_str()));
 							ImGui::PopID();
 						}
-						if (ImGui::Button(I18n::T("Todo predeterminado"))) s.game_settings.clear();
+						if (ImGui::Button(I18n::T("Todo predeterminado"))) ResetGameSettings(&s);
 										break;
 				}
 				case 9: DrawConfigurator(unit, true); break; // (10-28b) the launcher's Sistema: hardware and Optimizar
@@ -3248,7 +3248,7 @@ void LauncherGameSettings(Settings& s) {
 		const float y = RowY() + U(2);
 		if (LButton("Todo predeterminado", {g_lbox.at.x + U(12), y}, {U(396), U(32)}, false, g_font_semi, U(15),
 		            "Pone todos en Predeterminado: el juego como viene, sin tocar nada."))
-			s.game_settings.clear();
+			ResetGameSettings(&s);
 		RowEnd(y - U(2), 40);
 	}
 	BoxEnd();
@@ -5787,7 +5787,16 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 #if defined(_WIN32)
 		// Not ExitProcess: it runs the DLLs' detach routines (the GPU driver's, Streamline's) on this thread while the
 		// other threads may hold what those wait for (the same hang as assert.cpp's). TerminateProcess skips them.
-		std::fflush(nullptr);
+		// The log's last lines: flushed on a helper thread, waited for 300 ms at most. A plain fflush here can wait for
+		// good: standard output goes through the async pipe (AsyncStdout) and a stream lock held by a stuck thread.
+		{
+			static std::atomic<bool> flushed {false};
+			std::thread([] {
+				std::fflush(nullptr);
+				flushed.store(true);
+			}).detach();
+			for (int i = 0; i < 30 && !flushed.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
 		TerminateProcess(GetCurrentProcess(), 0);
 #else
 		std::_Exit(0);
@@ -6122,6 +6131,16 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		SDL_RenderClear(renderer);
 		ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
 		SDL_RenderPresent(renderer);
+		// (des-fix-1110) The launcher's black-frame flicker, diagnosed: the illustration's texture not uploaded after the draw
+		// (the frame showed only the clear colour). At most once a second.
+		if (g_background != nullptr && g_background->Status != ImTextureStatus_OK) {
+			static auto s_bg_logged = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+			if (const auto now = std::chrono::steady_clock::now(); now - s_bg_logged > std::chrono::seconds(1)) {
+				s_bg_logged = now;
+				std::printf("[port] launcher: the illustration's texture not ready after a frame (status %d)\n", static_cast<int>(g_background->Status));
+				std::fflush(stdout);
+			}
+		}
 	}
 	if (g_start_result > 0) *settings = g_edit;
 	// (ds-pc-port8) As Launcher-souls.ps1 (each change written at once): Salir / Esc keep the changes too.
