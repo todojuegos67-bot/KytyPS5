@@ -39,7 +39,7 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | **Speculation** | | | | |
 | KYTY_SPECULATE (0 or 4) | 4: graphics command buffers translated ahead on worker threads and committed in order | 0 | 4 | |
 | live `mode 0\|4` (live-control.h) | KYTY_SPECULATE's mode changed while the game runs, between submissions; every mode-defaulted switch from one table (local/mode-toggle.h), a variable set wins | - | - | |
-| KYTY_SPECULATE_THREADS (1..12) | the worker threads (our runs: 8) | - | 2 | |
+| KYTY_SPECULATE_THREADS (1..12) | the worker threads | - | 4 | |
 | KYTY_SPECULATE_ASYNC | the compute queue speculated beside the graphics queue (0: none) | - | 49 | |
 | KYTY_SPECULATE_ASYNC_THREADS | that queue's threads | - | 2 | |
 | KYTY_MIMALLOC (Windows) | the emulator's operator new/delete from mimalloc; fixed at process start from the environment (a boot in mode 0 switched live to 4 keeps the CRT heap, so a heap A/B is two boots) | 0 | 1 | |

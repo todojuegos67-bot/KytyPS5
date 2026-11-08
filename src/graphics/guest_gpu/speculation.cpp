@@ -26,7 +26,7 @@
 
 extern "C" {
 volatile std::atomic_uint32_t kyty_local_speculate_mode {0};
-volatile std::atomic_uint32_t kyty_local_speculate_threads {2};
+volatile std::atomic_uint32_t kyty_local_speculate_threads {4};
 // Translations going on and results not finished (Translate to Finish). While there are any, a speculation's executor
 // may hold what it read of the owners' catalogs (pairs, draw states, image sets) and a result's commands their
 // pipelines: the catalog sweeps (NativeXprSweepStates, TableSweepPairs) and EvictIdlePipelines wait for none.
