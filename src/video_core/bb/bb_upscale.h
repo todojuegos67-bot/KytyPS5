@@ -74,5 +74,6 @@ const Stats& LastStats();
 bool OverlayShown();
 void ToggleOverlay();
 void DrawOverlay(); // ImGui, only while shown
+void LoadOverlayFont(); // Consolas Bold from Windows fonts, at ImGui init (as Demon's Souls)
 
 } // namespace BB::Upscale

@@ -23,6 +23,7 @@
 #include "sdl_window.h"
 #include "texture_manager.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/bb/bb_upscale.h"
 
 static void CheckVkResult(const vk::Result err) {
     LOG_ERROR(ImGui, "Vulkan error {}", vk::to_string(err));
@@ -114,6 +115,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
 
     io.FontGlobalScale = 0.5f;
     BbMenu::LoadFonts(); // (bb-menu-121) the F1 menu's fonts (menu_assets\\fonts)
+    BB::Upscale::LoadOverlayFont(); // the F8 panel's Consolas Bold
 
     StyleColorsDark();
 

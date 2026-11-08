@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 #include <fmt/format.h>
@@ -686,65 +687,305 @@ bool OverlayShown() {
     return g_overlay.load(std::memory_order_relaxed);
 }
 
-void ToggleOverlay() {
-    g_overlay.store(!g_overlay.load(std::memory_order_relaxed), std::memory_order_relaxed);
+// ---- The F8 panel: Demon's Souls' "Metricas" (ds-menu.cpp, MetricsPanel) row for row. ----
+namespace Metrics {
+struct Row {
+    std::string name, value;
+    ImU32 color;
+};
+constexpr ImU32 kGreen = IM_COL32(50, 205, 50, 255), kRed = IM_COL32(255, 0, 0, 255),
+                kBlue = IM_COL32(0, 191, 255, 255), kOrange = IM_COL32(255, 165, 0, 255),
+                kWhite = IM_COL32(255, 255, 255, 255), kGold = IM_COL32(255, 215, 0, 255),
+                kName = IM_COL32(150, 150, 150, 255);
+std::mutex g_mutex;
+std::vector<Row> g_sys_rows; // GPU .. Commit, from the sampling thread once a second
+std::atomic<bool> g_started{false};
+ImFont* g_font = nullptr; // Consolas Bold (consolab.ttf), as Demon's
+
+ImU32 UseColor(double used, double total) {
+    if (total <= 0)
+        return kOrange;
+    const double f = used / total;
+    return f < 0.70 ? kGreen : f < 0.85 ? kGold : f < 0.95 ? kOrange : kRed;
 }
 
-// The F8 panel in the Demon's Souls "Metricas" style (ds-menu.cpp, MetricsPanel): top-centre, no
-// background, Consolas-sized rows (the default font here), the same colours, the FPS line and the
-// 60 s frametime graph (green mean, orange peaks, 8.3 / 16.7 / 33.3 ms lines, 40 ms at the top).
-// Only the values this build already computes: no GPU or memory queries, no readbacks.
+#if defined(_WIN32)
+// NVML (nvml.dll, the driver's: what nvidia-smi queries).
+struct Nvml {
+    bool ok = false;
+    void* dev = nullptr;
+    int (*util)(void*, unsigned int*) = nullptr; // nvmlDeviceGetUtilizationRates (gpu, memory)
+    int (*temp)(void*, int, unsigned int*) = nullptr;
+    int (*clock)(void*, int, unsigned int*) = nullptr;
+    int (*mem)(void*, unsigned long long*) = nullptr; // nvmlDeviceGetMemoryInfo (total, free, used)
+    void Init() {
+        HMODULE m = LoadLibraryW(L"nvml.dll");
+        if (m == nullptr) {
+            wchar_t sys[MAX_PATH] = {};
+            GetSystemDirectoryW(sys, MAX_PATH);
+            m = LoadLibraryW((std::wstring(sys) + L"\\nvml.dll").c_str());
+        }
+        if (m == nullptr)
+            return;
+        auto init = reinterpret_cast<int (*)()>(
+            reinterpret_cast<void*>(GetProcAddress(m, "nvmlInit_v2")));
+        auto get = reinterpret_cast<int (*)(unsigned int, void**)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetHandleByIndex_v2")));
+        util = reinterpret_cast<int (*)(void*, unsigned int*)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetUtilizationRates")));
+        temp = reinterpret_cast<int (*)(void*, int, unsigned int*)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetTemperature")));
+        clock = reinterpret_cast<int (*)(void*, int, unsigned int*)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetClockInfo")));
+        mem = reinterpret_cast<int (*)(void*, unsigned long long*)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "nvmlDeviceGetMemoryInfo")));
+        ok = init != nullptr && get != nullptr && util != nullptr && temp != nullptr &&
+             mem != nullptr && init() == 0 && get(0, &dev) == 0;
+    }
+};
+// "\Processor Information(_Total)\% Processor Performance" (pdh.dll by name) x the maximum clock.
+struct CpuPerf {
+    void* query = nullptr;
+    void* counter = nullptr;
+    long (*collect)(void*) = nullptr;
+    long (*value)(void*, unsigned long, unsigned long*, void*) = nullptr;
+    int max_mhz = 0;
+    void Init() {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                          0, KEY_READ, &key) == ERROR_SUCCESS) {
+            DWORD mhz = 0, size = sizeof(mhz);
+            if (RegQueryValueExW(key, L"~MHz", nullptr, nullptr, reinterpret_cast<BYTE*>(&mhz),
+                                 &size) == ERROR_SUCCESS)
+                max_mhz = static_cast<int>(mhz);
+            RegCloseKey(key);
+        }
+        HMODULE m = LoadLibraryW(L"pdh.dll");
+        if (m == nullptr)
+            return;
+        auto open = reinterpret_cast<long (*)(const wchar_t*, uintptr_t, void**)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "PdhOpenQueryW")));
+        auto add = reinterpret_cast<long (*)(void*, const wchar_t*, uintptr_t, void**)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "PdhAddEnglishCounterW")));
+        collect = reinterpret_cast<long (*)(void*)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "PdhCollectQueryData")));
+        value = reinterpret_cast<long (*)(void*, unsigned long, unsigned long*, void*)>(
+            reinterpret_cast<void*>(GetProcAddress(m, "PdhGetFormattedCounterValue")));
+        if (open == nullptr || add == nullptr || collect == nullptr || value == nullptr)
+            return;
+        if (open(nullptr, 0, &query) != 0)
+            return;
+        if (add(query, L"\\Processor Information(_Total)\\% Processor Performance", 0, &counter) !=
+            0)
+            counter = nullptr;
+        if (counter != nullptr)
+            collect(query);
+    }
+    int Mhz() {
+        if (counter == nullptr || max_mhz <= 0)
+            return 0;
+        struct {
+            unsigned long status;
+            double value;
+        } v{};
+        collect(query);
+        if (value(counter, 0x200 /* PDH_FMT_DOUBLE */, nullptr, &v) != 0)
+            return 0;
+        return static_cast<int>(std::lround(v.value * max_mhz / 100.0));
+    }
+};
+
+void Sample(Nvml& nv, CpuPerf& cpu, uint64_t& idle0, uint64_t& total0) {
+    std::vector<Row> rows;
+    if (nv.ok) {
+        unsigned int u[2] = {}, t = 0, clk = 0;
+        unsigned long long m[3] = {};
+        nv.util(nv.dev, u);
+        nv.temp(nv.dev, 0, &t);
+        if (nv.clock != nullptr)
+            nv.clock(nv.dev, 0 /* graphics */, &clk);
+        nv.mem(nv.dev, m);
+        const double used = static_cast<double>(m[2] >> 20),
+                     total = static_cast<double>(m[0] >> 20);
+        rows.push_back({"GPU", fmt::format("{:3} %   {} C", u[0], t), kOrange});
+        if (clk > 0)
+            rows.push_back({"GPU reloj", fmt::format("{:4} MHz", clk), kOrange});
+        rows.push_back({"VRAM", fmt::format("{:.1f} / {:.0f} GB", used / 1024.0, total / 1024.0),
+                        UseColor(used, total)});
+    } else {
+        rows.push_back({"GPU", "(sin nvidia-smi)", kOrange});
+    }
+    FILETIME fi, fk, fu;
+    if (GetSystemTimes(&fi, &fk, &fu)) {
+        const auto q = [](FILETIME f) {
+            return (static_cast<uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
+        };
+        const uint64_t idle = q(fi), total = q(fk) + q(fu);
+        const double busy = total > total0 ? 100.0 * (1.0 - static_cast<double>(idle - idle0) /
+                                                                static_cast<double>(total - total0))
+                                           : 0.0;
+        idle0 = idle, total0 = total;
+        rows.push_back(
+            {"CPU",
+             fmt::format("{:3} %", static_cast<int>(std::lround(std::clamp(busy, 0.0, 100.0)))),
+             kOrange});
+    }
+    if (const int mhz = cpu.Mhz(); mhz > 0)
+        rows.push_back({"CPU reloj", fmt::format("{:4} MHz", mhz), kOrange});
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        const double gb = 1024.0 * 1024.0 * 1024.0;
+        const double used = static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / gb,
+                     total = static_cast<double>(ms.ullTotalPhys) / gb;
+        rows.push_back(
+            {"RAM", fmt::format("{:.1f} / {:.0f} GB", used, total), UseColor(used, total)});
+        const double climit = static_cast<double>(ms.ullTotalPageFile) / gb,
+                     cused = climit - static_cast<double>(ms.ullAvailPageFile) / gb;
+        if (climit > 0)
+            rows.push_back({"Commit", fmt::format("{:.1f} / {:.0f} GB", cused, climit),
+                            cused / climit > 0.90 ? kRed : UseColor(cused, climit)});
+    }
+    std::scoped_lock lock(g_mutex);
+    g_sys_rows = std::move(rows);
+}
+#endif
+
+// The sampling thread (Demon's MetricsPanel::Start): once a second while the panel is shown.
+void Start() {
+    if (g_started.exchange(true))
+        return;
+#if defined(_WIN32)
+    std::thread([] {
+        Nvml nv;
+        CpuPerf cpu;
+        nv.Init();
+        cpu.Init();
+        uint64_t idle0 = 0, total0 = 0;
+        for (;;) {
+            if (g_overlay.load(std::memory_order_relaxed))
+                Sample(nv, cpu, idle0, total0);
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }).detach();
+#endif
+}
+
+const char* ModeEs(SR::Quality q) {
+    switch (q) {
+    case SR::Quality::Native:
+        return "Nativo AA";
+    case SR::Quality::UltraQualityPlus:
+        return "Ultra calidad+";
+    case SR::Quality::UltraQuality:
+        return "Ultra calidad";
+    case SR::Quality::Quality:
+        return "Calidad";
+    case SR::Quality::Balanced:
+        return "Equilibrado";
+    case SR::Quality::Performance:
+        return "Rendimiento";
+    case SR::Quality::UltraPerformance:
+        return "Ultra rendimiento";
+    case SR::Quality::Dynamic:
+        return "Dinamico";
+    }
+    return "";
+}
+} // namespace Metrics
+
+void LoadOverlayFont() {
+#if defined(_WIN32)
+    // Demon's systemOverlay.cpp: %WINDIR%\Fonts\consolab.ttf at 32 px.
+    wchar_t win[MAX_PATH] = {};
+    if (GetWindowsDirectoryW(win, MAX_PATH) == 0)
+        return;
+    const std::filesystem::path p = std::filesystem::path(win) / "Fonts" / "consolab.ttf";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(p, ec))
+        return;
+    const auto u8 = p.u8string();
+    Metrics::g_font = ImGui::GetIO().Fonts->AddFontFromFileTTF(
+        reinterpret_cast<const char*>(u8.c_str()), 32.0f);
+#endif
+}
+
+void ToggleOverlay() {
+    g_overlay.store(!g_overlay.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    if (g_overlay.load(std::memory_order_relaxed))
+        Metrics::Start();
+}
+
+// The F8 panel as Demon's Souls' "Metricas" (ds-menu.cpp, MetricsPanel::Draw): top-centre, no
+// background, Consolas Bold 15 / 16 / 34 / 10 px x S, the same rows in the same order (GPU, GPU
+// reloj, VRAM, CPU, CPU reloj, RAM, Commit from the sampling thread; Frame, Escala, Resol.,
+// Modelo from this build's per-second stats), the FPS line and the 60 s frametime graph.
+// Nothing new on the render thread: no GPU queries, no readbacks.
 void DrawOverlay() {
     if (!OverlayShown()) {
         return;
     }
-    const ImU32 kGreen = IM_COL32(50, 205, 50, 255), kRed = IM_COL32(255, 0, 0, 255),
-                kBlue = IM_COL32(0, 191, 255, 255), kOrange = IM_COL32(255, 165, 0, 255),
-                kWhite = IM_COL32(255, 255, 255, 255), kName = IM_COL32(150, 150, 150, 255);
-    struct Row {
-        std::string name, value;
-        ImU32 color;
-    };
+    using namespace Metrics;
     const Stats& s = g_stats;
     const bool on = Enabled();
     const bool ready = s.frame_ms > 0;
     const ImGuiIO& io = ImGui::GetIO();
     const float width = io.DisplaySize.x;
     const float S = std::clamp(io.DisplaySize.y / 1080.0f, 1.0f, 2.5f);
-    ImFont* f = ImGui::GetFont();
+    ImFont* f = g_font != nullptr ? g_font : ImGui::GetFont();
 
     std::vector<Row> rows;
+    {
+        std::scoped_lock lock(g_mutex);
+        rows = g_sys_rows;
+    }
     if (ready) {
-        rows.push_back({"GPU", s.gpu_ms > 0 ? fmt::format("{:.2f} ms", s.gpu_ms) : "--", kOrange});
-        rows.push_back(
-            {"CPU", fmt::format("{:.2f} ms (espera {:.2f})", s.cpu_ms, s.wait_ms), kOrange});
         rows.push_back({"Frame", fmt::format("{:.1f} ms", s.frame_ms), kOrange});
+        const char* dot = " \xC2\xB7 ";
+        const char* arrow = "\xE2\x86\x92";
         if (on) {
             const SR::Kind k = Cfg().kind;
             const ImU32 col = k == SR::Kind::Dlss                          ? kGreen
                               : k == SR::Kind::Fsr3 || k == SR::Kind::Fsr4 ? kRed
                               : k == SR::Kind::Xess                        ? kBlue
                                                                            : kOrange;
-            rows.push_back(
-                {"Escala",
-                 fmt::format("{} \xC2\xB7 {}", SR::KindName(k), SR::QualityName(Cfg().quality)),
-                 col});
+            const std::string rk = k == SR::Kind::Fsr4   ? "FSR 4"
+                                   : k == SR::Kind::Fsr3 ? "FSR"
+                                                         : SR::KindName(k);
+            rows.push_back({"Escala", rk + dot + ModeEs(Cfg().quality), col});
             const double ratio = s.in_h > 0 ? static_cast<double>(s.out_h) / s.in_h : 0.0;
             rows.push_back({"Resol.",
-                            fmt::format("{}p -> {}p (x{:.2f}){}", s.in_h, s.out_h, ratio,
-                                        s.upscaled ? "" : " sin escalar"),
+                            s.in_h > 0 ? fmt::format("{}p {} {}p (x{:.3g})", s.in_h, arrow,
+                                                     s.out_h, ratio)
+                                       : fmt::format("{} {}p", arrow, s.out_h),
                             col});
-            rows.push_back({"SR", fmt::format("{:.2f} ms", s.sr_ms), col});
-            rows.push_back({"MV", fmt::format("{:.2f} ms", s.mv_ms), col});
+            std::string model;
+            if (k == SR::Kind::Dlss) {
+                const char* pe = std::getenv("BB_DLSS_PRESET");
+                const std::string pk = pe != nullptr && *pe != '\0' ? std::string(1, *pe) : "";
+                model = pk == "K"   ? "K (Transformer, DLSS 4)"
+                        : pk == "L" ? "L (Transformer, DLSS 4.5)"
+                        : pk == "M" ? "M (Transformer, DLSS 4.5)"
+                        : pk.empty() ? "auto (NVIDIA)"
+                                     : pk;
+            } else if (k == SR::Kind::Xess) {
+                model = "XeSS";
+            } else if (k == SR::Kind::Fsr3) {
+                model = "FSR 3.1";
+            } else if (k == SR::Kind::Fsr4) {
+                model = SR::Fsr4::Active411()
+                            ? fmt::format("FSR 4.1.1 ({})", SR::Fsr4::ModelName411())
+                            : std::string("FSR 4 (IA)");
+            }
+            if (!model.empty())
+                rows.push_back({"Modelo", model, col});
         } else {
             rows.push_back({"Escala", "Nativo", kOrange});
-            rows.push_back({"Resol.",
-                            fmt::format("{}x{} -> {}x{}", s.in_w, s.in_h, s.out_w, s.out_h),
-                            kOrange});
+            rows.push_back({"Resol.", fmt::format("{}p {} {}p", s.in_h, arrow, s.out_h), kOrange});
         }
-    } else {
-        rows.push_back({"", "Cargando...", kOrange});
     }
+    if (rows.empty())
+        rows.push_back({"", "Cargando...", kOrange});
 
     const float row_px = std::round(15 * S), title_px = std::round(16 * S),
                 fps_px = std::round(34 * S), small_px = std::round(10 * S);
@@ -770,12 +1011,14 @@ void DrawOverlay() {
     const float tw = f->CalcTextSizeA(title_px, FLT_MAX, 0, title).x;
     dl->AddText(f, title_px, {std::floor(x0 + (W - tw) * 0.5f), y0 + pad}, kWhite, title);
     float y = y0 + pad + title_h;
+    const ImVec4 clip{x0, y0, x0 + W, y0 + 4000};
     for (const auto& r : rows) {
         if (!r.name.empty()) {
-            dl->AddText(f, row_px, {x0 + pad, y}, kName, r.name.c_str());
-            dl->AddText(f, row_px, {x0 + pad + name_w, y}, r.color, r.value.c_str());
+            dl->AddText(f, row_px, {x0 + pad, y}, kName, r.name.c_str(), nullptr, 0, &clip);
+            dl->AddText(f, row_px, {x0 + pad + name_w, y}, r.color, r.value.c_str(), nullptr, 0,
+                        &clip);
         } else {
-            dl->AddText(f, row_px, {x0 + pad, y}, r.color, r.value.c_str());
+            dl->AddText(f, row_px, {x0 + pad, y}, r.color, r.value.c_str(), nullptr, 0, &clip);
         }
         y += row_h;
     }
