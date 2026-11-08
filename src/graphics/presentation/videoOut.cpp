@@ -802,6 +802,34 @@ int SetDynamicFlipFps(int fps) noexcept {
 }
 
 // `floor`: at least floor + 1 vblanks since the last flip (beyond the game's own flip rate).
+// [flip] line, once a second (KYTY_FLIP_STATS=0: off): the game's flips the queue released, against the presents the
+// presenter made with nothing new (its last frame again: the port's overlays, a paused guest, a blank). The [fsr3] line's
+// "real" counts both: 200+ a second on the F1 menu and the shader prep screen while the flips stayed at 60.
+static std::atomic<uint32_t> g_flip_released {0};
+static std::atomic<uint32_t> g_idle_overlay {0};
+static std::atomic<uint32_t> g_idle_paused {0};
+static std::atomic<uint32_t> g_idle_blank {0};
+static std::atomic<int>      g_last_floor {0};
+static void NoteFlipStats() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FLIP_STATS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (!on) return;
+	static auto since = std::chrono::steady_clock::now();
+	const auto  now   = std::chrono::steady_clock::now();
+	if (now - since < std::chrono::seconds(1)) return;
+	since = now;
+	const uint32_t flips   = g_flip_released.exchange(0, std::memory_order_relaxed);
+	const uint32_t overlay = g_idle_overlay.exchange(0, std::memory_order_relaxed);
+	const uint32_t paused  = g_idle_paused.exchange(0, std::memory_order_relaxed);
+	const uint32_t blank   = g_idle_blank.exchange(0, std::memory_order_relaxed);
+	std::printf("[flip] %u flips/s (floor %d, vblank %u Hz), idle re-presents %u/s (overlay %u, paused %u, blank %u)\n", flips,
+	            g_last_floor.load(std::memory_order_relaxed), Config::GetVblankFrequency(), overlay + paused + blank, overlay, paused,
+	            blank);
+	std::fflush(stdout);
+}
+
 static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, int floor) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
@@ -1228,6 +1256,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		if (m_presenter.IsGuestPaused()) {
 			if (m_presenter.PresentIdle()) {
 				if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
+					g_idle_paused.fetch_add(1, std::memory_order_relaxed);
 					m_presenter.Submit(*frame, true);
 				}
 			}
@@ -1242,6 +1271,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		bool presented = FlipWhenReady() ? false : m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh() && m_presenter.PresentIdle()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
+				g_idle_overlay.fetch_add(1, std::memory_order_relaxed);
 				m_presenter.Submit(*frame, true);
 			} else {
 				uint32_t width  = 0;
@@ -1251,6 +1281,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 					width  = m_video_out_ctx[0].width;
 					height = m_video_out_ctx[0].height;
 				}
+				g_idle_blank.fetch_add(1, std::memory_order_relaxed);
 				m_presenter.SubmitBlank(width, height, true);
 			}
 			presented = true;
@@ -1272,6 +1303,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			}
 		}
 		VblankEnd();
+		NoteFlipStats();
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
@@ -1918,6 +1950,8 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	m_min_flip_ms          = std::max(1000.0 * static_cast<double>(std::max(floor, r.cfg->flip_rate) + 1) / vblank_hz,
 	                                  s_fg_paced ? g_fg_pacing.target * 1000.0 : 0.0);
 
+	g_flip_released.fetch_add(1, std::memory_order_relaxed);
+	g_last_floor.store(std::max(floor, r.cfg->flip_rate), std::memory_order_relaxed);
 	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
 		r.cfg->flip_status.count++;
 		r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;

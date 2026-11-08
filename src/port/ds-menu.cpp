@@ -5785,7 +5785,10 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		if (IconButton(I18n::T("Cerrar el juego"), Icons::Power, bs, unit, 4, true)) {
 		// Just closes: nothing saved, nothing skipped (the game's own saves are already on disk).
 #if defined(_WIN32)
-		ExitProcess(0);
+		// Not ExitProcess: it runs the DLLs' detach routines (the GPU driver's, Streamline's) on this thread while the
+		// other threads may hold what those wait for (the same hang as assert.cpp's). TerminateProcess skips them.
+		std::fflush(nullptr);
+		TerminateProcess(GetCurrentProcess(), 0);
 #else
 		std::_Exit(0);
 #endif
