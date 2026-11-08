@@ -438,6 +438,23 @@ struct FrameState {
     VAddr hud_target = 0;
     u64 hud_draw = 0;
     const char* hud_how = "";
+    // 1.58 (bb-hudclass-158): the post chain's tail and the HUD-start classification. tail = the
+    // last post-processing draw of the frame into a render-size image that is not a flip (the
+    // final pass into the flip is excluded): every scene / post pass (fog, bloom, tonemap, DOF,
+    // the copy-and-composite pairs) ends there, so the HUD starts after it.
+    u64 tail_ps = 0, tail_draw = 0;
+    VAddr tail_target = 0;
+    u32 tail_count = 0;   // occurrences of tail_ps among this frame's non-flip post draws, up to it
+    std::array<std::pair<u64, u32>, 32> post_ps{}; // non-flip post draws per pixel shader
+    u32 num_post_ps = 0;
+    u32 learned_tail_hits = 0; // occurrences of g_learned.tail_ps this frame (so far)
+    bool tail_rule = false;    // the tail requirement was active this frame
+    u32 rejected = 0;          // 2D candidates refused (the learned tail not reached yet)
+    u64 reject_draw = 0, reject_ps = 0;
+    u32 late_posts = 0;        // non-flip post draws after the chosen HUD start (start too early)
+    u64 late_draw = 0, late_ps = 0;
+    VAddr late_target = 0;
+    u64 hud_ps = 0, hud_vs = 0;
     std::string trace; // the output-size draws after the scene (first frames, for the log)
     // draws
     u64 draws = 0;
@@ -481,6 +498,15 @@ struct Learned {
     // 0.97: the last HUD start found (draw index, target): a frame that misses the point uses it.
     VAddr hud_target = 0;
     u64 hud_draw = 0;
+    // 1.58: the post chain's tail (pixel shader, occurrences) of the last frames and how many
+    // frames in a row it was the same; pixel shaders never used as the tail (they followed the
+    // last 2D draw of the frame: a HUD start after them was never found).
+    u64 tail_ps = 0;
+    u32 tail_count = 0;
+    u32 tail_stable = 0;
+    std::array<u64, 8> tail_bad{};
+    u32 num_tail_bad = 0;
+    u32 tail_blocked = 0; // frames in a row without a HUD start because of the tail rule
 };
 
 struct Stats {
@@ -559,6 +585,7 @@ struct DrawState {
     bool analyze_dump = false;
     bool vertex_camera = false; // a vertex-stage constant holds the forward view-projection
     u64 ps_hash = 0;            // 1.33: the draw's pixel shader (aapass point)
+    u64 vs_hash = 0;            // 1.58: the draw's vertex shader (HUD-start log)
 } g_draw;
 // 1.33 (bb-aapass-133): the upscaler / DLAA point at Bloodborne's own post-processing entry:
 // the scene-colour sample of its first post pass (ps 0x00000ccc53f28aa5 in the 1.32 captures:
@@ -2443,6 +2470,7 @@ void OnDraw(std::span<const Target> colors, const Target* depth, bool depth_grea
     g_draw = {};
     g_draw.valid = true;
     g_draw.ps_hash = ps_hash;
+    g_draw.vs_hash = vs_hash;
     g_draw.num_colors = static_cast<u32>(std::min<size_t>(colors.size(), 8));
     u32 mrt = 0;
     for (u32 i = 0; i < g_draw.num_colors; ++i) {
@@ -3056,6 +3084,23 @@ void SetHudCanvasOk(bool ok, std::string_view why) {
     }
 }
 
+namespace {
+// 1.58: the tail requirement of the HUD start (BB_HUD_TAIL=0: off, the 1.56 rule).
+bool TailRuleOn() {
+    static const bool off = [] {
+        const char* v = std::getenv("BB_HUD_TAIL");
+        return v != nullptr && *v == '0';
+    }();
+    return !off && g_learned.tail_ps != 0 && g_learned.tail_count != 0 &&
+           g_learned.tail_stable >= 3;
+}
+} // namespace
+
+bool IsFlipTarget(VAddr addr) {
+    std::scoped_lock lk{g_mutex};
+    return IsFlip(addr);
+}
+
 bool WantPresentUpscale(VAddr& flip) {
     if (!Enabled()) {
         return false;
@@ -3075,11 +3120,53 @@ bool WantPresentUpscale(VAddr& flip) {
     // draw is not seen uses the last known HUD start (its draw index and target).
     VAddr cand = 0;
     const bool after_scene = f.gb_depth != 0 && f.scene_draws > 0;
+    // 1.58: the HUD starts only after the post chain's last pass of the last frames (its pixel
+    // shader, as often as it ran there): a 2D draw before it is a scene / post pass (fog, haze,
+    // lens effects, the copy-and-composite pairs), and 1.56 took such a draw as the HUD start in
+    // some frames: those passes then went to the output-size canvas, the copy of the UI image
+    // into the game's scratch target claimed the final-pass canvas, the flip's real final pass
+    // stayed on the game's image, and the frame alternated between canvas and game image.
+    f.tail_rule = TailRuleOn();
+    const bool tail_ok = !f.tail_rule || f.learned_tail_hits >= g_learned.tail_count;
     if (after_scene && !g_draw.has_depth) {
         for (u32 i = 0; i < g_draw.num_colors; ++i) {
             const auto& t = g_draw.colors[i];
             if (t.addr == 0 || t.width != f.gb_w || t.height != f.gb_h) continue;
             if (g_draw.samples_render_size) {
+                if (!IsFlip(t.addr)) {
+                    // 1.58: a post pass into a render-size scratch / UI image (not the final
+                    // pass into the flip): the tail so far.
+                    u32 n = 0;
+                    u32 k = 0;
+                    for (; k < f.num_post_ps; ++k) {
+                        if (f.post_ps[k].first == g_draw.ps_hash) break;
+                    }
+                    if (k < f.num_post_ps) {
+                        n = ++f.post_ps[k].second;
+                    } else if (f.num_post_ps < f.post_ps.size()) {
+                        f.post_ps[f.num_post_ps++] = {g_draw.ps_hash, 1u};
+                        n = 1;
+                    }
+                    const bool bad =
+                        std::find(g_learned.tail_bad.begin(),
+                                  g_learned.tail_bad.begin() + g_learned.num_tail_bad,
+                                  g_draw.ps_hash) !=
+                        g_learned.tail_bad.begin() + g_learned.num_tail_bad;
+                    if (!bad && n != 0) {
+                        f.tail_ps = g_draw.ps_hash;
+                        f.tail_draw = f.draws;
+                        f.tail_target = t.addr;
+                        f.tail_count = n;
+                    }
+                    if (g_draw.ps_hash == g_learned.tail_ps) ++f.learned_tail_hits;
+                    if (f.hud_draw != 0) {
+                        if (f.late_posts++ == 0) {
+                            f.late_draw = f.draws;
+                            f.late_ps = g_draw.ps_hash;
+                            f.late_target = t.addr;
+                        }
+                    }
+                }
                 f.post_target = t.addr;
                 if (std::find(f.post_targets.begin(),
                               f.post_targets.begin() + f.num_post_targets,
@@ -3094,9 +3181,22 @@ bool WantPresentUpscale(VAddr& flip) {
                         std::find(f.post_targets.begin(),
                                   f.post_targets.begin() + f.num_post_targets,
                                   t.addr) != f.post_targets.begin() + f.num_post_targets)) {
-                cand = t.addr;
-                f.hud_how = t.addr == f.post_target ? "first 2D draw into the composite target"
-                                                    : "first 2D draw into the presented image";
+                if (!tail_ok) {
+                    if (f.hud_draw == 0 && f.rejected++ == 0) {
+                        f.reject_draw = f.draws;
+                        f.reject_ps = g_draw.ps_hash;
+                    }
+                } else {
+                    cand = t.addr;
+                    f.hud_how =
+                        f.tail_rule ? (t.addr == f.post_target
+                                           ? "first 2D draw into the composite target after the "
+                                             "post chain's last pass"
+                                           : "first 2D draw into the presented image after the "
+                                             "post chain's last pass")
+                        : t.addr == f.post_target ? "first 2D draw into the composite target"
+                                                  : "first 2D draw into the presented image";
+                }
             }
             if (g_inject_traced < 6 && f.trace.size() < 1500) {
                 f.trace += fmt::format(" #{}:{:#x}{}{}", f.draws, t.addr,
@@ -3106,8 +3206,12 @@ bool WantPresentUpscale(VAddr& flip) {
             break;
         }
         // The last known HUD start: this draw index (or later) into the same target.
+        // 1.58: a 2D draw only, after the post chain's tail. 1.56 also took a post pass here (a
+        // draw sampling a render-size image): a frame with more scene draws than the one before
+        // reached the last frame's HUD index while still in its post chain (fog / haze passes
+        // into the UI image), and the HUD start came that much too early.
         if (cand == 0 && g_learned.hud_draw != 0 && f.draws >= g_learned.hud_draw &&
-            f.post_seen) {
+            f.post_seen && !g_draw.samples_render_size && tail_ok) {
             for (u32 i = 0; i < g_draw.num_colors; ++i) {
                 if (g_draw.colors[i].addr == g_learned.hud_target &&
                     g_draw.colors[i].width == f.gb_w && g_draw.colors[i].height == f.gb_h) {
@@ -3143,6 +3247,8 @@ bool WantPresentUpscale(VAddr& flip) {
     flip = cand;
     f.hud_target = cand;
     f.hud_draw = f.draws;
+    f.hud_ps = g_draw.ps_hash;
+    f.hud_vs = g_draw.vs_hash;
     FillPresentPlan(flip, "before the first HUD draw");
     return true;
 }
@@ -4185,6 +4291,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
             }
             g_learned.hud_target = f.hud_target;
             g_learned.hud_draw = f.hud_draw;
+            g_learned.tail_blocked = 0;
         } else if (scene3d_i && (HudPointOn() || (FgNative() && g_fgn_lock != 2)) &&
                    !f.injected && !f.fg_native_done) {
             ++miss_sec;
@@ -4204,6 +4311,97 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
                 ++miss_logged;
                 Checkpoint(fmt::format("[inject] miss reason (frame {}): {}; present-time path",
                                        g_frame_no, why));
+            }
+        }
+        // 1.58: the post chain's tail, learned from every 3D frame (posts are tracked after the
+        // HUD start too, so a frame whose start came too early still learns the real tail).
+        if (scene3d_i && f.rejected > 0 && f.hud_draw == 0 && f.tail_rule) {
+            if (++g_learned.tail_blocked >= 2 && g_learned.tail_ps != 0) {
+                // The tail followed the frame's last 2D draw twice in a row: a pass after the
+                // HUD (not a scene pass). Never the tail again; the pass before it takes over.
+                if (g_learned.num_tail_bad < g_learned.tail_bad.size()) {
+                    g_learned.tail_bad[g_learned.num_tail_bad++] = g_learned.tail_ps;
+                }
+                Checkpoint(fmt::format(
+                    "[hudclass] post pass ps {:#x} came after the frame's last 2D draw in {} "
+                    "frames in a row: no longer the post chain's tail (HUD start rule keeps "
+                    "the pass before it)",
+                    g_learned.tail_ps, g_learned.tail_blocked));
+                g_learned.tail_ps = 0;
+                g_learned.tail_count = 0;
+                g_learned.tail_stable = 0;
+                g_learned.tail_blocked = 0;
+            }
+        }
+        if (scene3d_i && f.post_seen && f.tail_ps != 0 &&
+            std::find(g_learned.tail_bad.begin(),
+                      g_learned.tail_bad.begin() + g_learned.num_tail_bad,
+                      f.tail_ps) == g_learned.tail_bad.begin() + g_learned.num_tail_bad) {
+            if (f.tail_ps == g_learned.tail_ps) {
+                g_learned.tail_stable = std::min<u32>(g_learned.tail_stable + 1, 1000000u);
+                g_learned.tail_count = f.tail_count;
+            } else {
+                g_learned.tail_ps = f.tail_ps;
+                g_learned.tail_count = f.tail_count;
+                g_learned.tail_stable = 1;
+            }
+        }
+        {
+            // 1.58 [hudclass]: once per second, the HUD start of the last 3D frame that had one
+            // (draw, target, shaders, how it was chosen) and the classification counters.
+            static u32 hc_frames = 0, hc_hits = 0, hc_rejected = 0, hc_blocked = 0,
+                       hc_late_frames = 0, hc_late = 0, hc_rule = 0;
+            static std::string hc_last;
+            static auto hc_t = std::chrono::steady_clock::now();
+            if (scene3d_i) {
+                ++hc_frames;
+                if (f.tail_rule) ++hc_rule;
+                hc_rejected += f.rejected;
+                if (f.hud_draw == 0 && f.rejected > 0) ++hc_blocked;
+                if (f.late_posts > 0) {
+                    ++hc_late_frames;
+                    hc_late += f.late_posts;
+                }
+            }
+            if (f.hud_draw != 0) {
+                ++hc_hits;
+                hc_last = fmt::format(
+                    "start draw #{} of {} into {:#x} (vs {:#x} ps {:#x}), reason: {}; post "
+                    "chain tail #{} into {:#x} (ps {:#x} x{}){}{}",
+                    f.hud_draw, f.draws, f.hud_target, f.hud_vs, f.hud_ps, f.hud_how,
+                    f.tail_draw, f.tail_target, f.tail_ps, f.tail_count,
+                    f.rejected > 0 ? fmt::format(", {} earlier 2D draws refused (first #{} ps "
+                                                 "{:#x})",
+                                                 f.rejected, f.reject_draw, f.reject_ps)
+                                   : std::string(),
+                    f.late_posts > 0
+                        ? fmt::format(", LATE post passes after the start {} (first #{} into "
+                                      "{:#x} ps {:#x})",
+                                      f.late_posts, f.late_draw, f.late_target, f.late_ps)
+                        : std::string());
+            }
+            const auto now_c = std::chrono::steady_clock::now();
+            if (now_c - hc_t >= std::chrono::seconds(1)) {
+                hc_t = now_c;
+                if (hc_frames > 0) {
+                    Checkpoint(fmt::format(
+                        "[hudclass] 1.58 last second: 3D frames {}, HUD start {} (tail rule "
+                        "active {}), refused early 2D draws {}, frames without a start because "
+                        "of the tail rule {}, frames with post passes after the start {} ({} "
+                        "passes; 0 = start after the whole post chain); learned tail ps {:#x} "
+                        "x{} (stable {} frames){} | last: {}",
+                        hc_frames, hc_hits, hc_rule, hc_rejected, hc_blocked, hc_late_frames,
+                        hc_late, g_learned.tail_ps, g_learned.tail_count,
+                        g_learned.tail_stable,
+                        g_learned.num_tail_bad > 0
+                            ? fmt::format(", {} passes excluded from the tail",
+                                          g_learned.num_tail_bad)
+                            : std::string(),
+                        hc_last.empty() ? std::string("none") : hc_last));
+                }
+                hc_frames = hc_hits = hc_rejected = hc_blocked = hc_late_frames = hc_late =
+                    hc_rule = 0;
+                hc_last.clear();
             }
         }
         if (scene3d_i && !f.trace.empty()) {

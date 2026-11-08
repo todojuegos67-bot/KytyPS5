@@ -4028,6 +4028,11 @@ struct HsState {
     u32* mk_mapped = nullptr;
     bool mk_init = false, mk_failed = false;
     std::array<u32, 2> mk_prev{};
+    // 1.58 per second: draws into a render-size image that is not a flip which sampled the HUD
+    // target after the HUD start (kept on the game's images: 1.56 gave them a final-pass canvas,
+    // so the flip's real final pass stayed on the game's image) and the first such target.
+    u32 hc_offcanvas = 0, hc_nonflip_final = 0;
+    VAddr hc_offcanvas_addr = 0;
 };
 HsState g_hs;
 enum HsFb : u32 {
@@ -4340,6 +4345,11 @@ bool Rasterizer::BBHudSharpTarget(const VideoCore::Image& image, vk::Format view
         c = &g_hs.a;
     } else if (g_hs.bi >= 0 && addr == g_hs.bp_addr[g_hs.bi]) {
         c = &g_hs.bp[g_hs.bi];
+    } else if (bb_hs_sampled && g_hs.bi < 0 && !BB::Upscale::IsFlipTarget(addr)) {
+        // 1.58: the final-pass canvas only for a flip (the presenter looks the presented flip up
+        // in these slots; a scratch image never is one).
+        ++g_hs.hc_nonflip_final;
+        return false;
     } else if (bb_hs_sampled && g_hs.bi < 0) {
         // The flip's own slot, else the oldest.
         int slot = -1;
@@ -4420,6 +4430,20 @@ bool Rasterizer::BBHudSharpSampled(const VideoCore::Image& image,
         image.info.size.width != g_hs.render.width ||
         image.info.size.height != g_hs.render.height) {
         return false;
+    }
+    // 1.58: a single-target draw into a render-size image that is neither the HUD target nor a
+    // flip (a scratch copy of the UI image: the post chain's copy-and-composite pairs) is never
+    // drawn into a canvas, so it reads the game's own image of the HUD target (the scene at the
+    // HUD start, the size its shader expects), not the output-size canvas.
+    if (bb_num_cbs == 1 && cb_descs[0].image_id) {
+        const auto& t = texture_cache.GetImage(cb_descs[0].image_id).info;
+        if (t.size.width == g_hs.render.width && t.size.height == g_hs.render.height &&
+            !t.bb_scaled && t.guest_address != g_hs.target &&
+            !(g_hs.bi >= 0 && t.guest_address == g_hs.bp_addr[g_hs.bi]) &&
+            !BB::Upscale::IsFlipTarget(t.guest_address)) {
+            if (g_hs.hc_offcanvas++ == 0) g_hs.hc_offcanvas_addr = t.guest_address;
+            return false;
+        }
     }
     if (g_hs.a.layout != vk::ImageLayout::eShaderReadOnlyOptimal) {
         scheduler.EndRendering();
@@ -4926,9 +4950,16 @@ bool Rasterizer::BBHudSharpPresent(vk::CommandBuffer cmd, VideoCore::Image& flip
         }
         const std::string line = fmt::format(
             "[hudcanvas] on={}/{} frames, fallback reasons: {}, hud_draws={}, hud_coverage={} "
-            "({}x{}), cost={:.2f}ms (CPU recording, per second)",
+            "({}x{}), cost={:.2f}ms (CPU recording, per second); 1.58: UI-image copies into "
+            "non-flip targets after the HUD start {}{}, final-pass canvas refused for non-flips "
+            "{} (both 0 when the start is after the whole post chain)",
             g_hs.hc_on, g_hs.hc_n - 1, why.empty() ? std::string("none") : why, g_hs.hc_draws,
-            cov, g_hs.output.width, g_hs.output.height, g_hs.hc_cost_ms);
+            cov, g_hs.output.width, g_hs.output.height, g_hs.hc_cost_ms, g_hs.hc_offcanvas,
+            g_hs.hc_offcanvas != 0 ? fmt::format(" (first into {:#x})", g_hs.hc_offcanvas_addr)
+                                   : std::string(),
+            g_hs.hc_nonflip_final);
+        g_hs.hc_offcanvas = g_hs.hc_nonflip_final = 0;
+        g_hs.hc_offcanvas_addr = 0;
         LOG_INFO(Render_Vulkan, "{}", line);
         BB::Upscale::Checkpoint(line);
         g_hs.fb = {};
