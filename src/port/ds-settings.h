@@ -187,7 +187,7 @@ struct Settings {
 	float       kbm_antidz = 0.15f;  // KYTY_KBM_ANTIDZ
 	std::string kbm_map;             // KYTY_KBM_MAP
 	std::string pad_map;             // KYTY_PAD_MAP
-	std::string game_settings;       // (ds-pc-port37) ajustes_juego: "gs_sun=3;gs_spot=1;..." (the launcher's "Ajustes del juego"; 0 / absent = the game's own)
+	std::string game_settings;       // (ds-pc-port37) ajustes_juego: "gs_sun=3;gs_spot=1;..." (the launcher's "Ajustes del juego"; "id=0" = the game's own, an absent id = its GameSetting::def, e.g. gs_spot off)
 	int         kbm_camera = 0;  // (step5: 0 = the game's own option; was 10)     // (10-28) cp11_Setting_CameraSpeed with keyboard and mouse (5-15; the launcher's kbmcam2)
 	bool        kbm_warp = false;    // (10-28) Camara instantanea (frame warp): KYTY_KBM_WARP
 	bool        kbm_calibrate = false; // (10-28) the next start measures the camera into kbm_curve.txt (KYTY_KBM_CALIBRATE), once
@@ -255,10 +255,12 @@ struct GameSetting {
 	const char* name;
 	const char* levels[5]; // convars of level 1..5 (on / off: 1 and 2)
 	const char* tip;
+	int         def = 0;   // level when the id is absent from ajustes_juego (0 = the game's own; gs_spot: 1 No)
 };
 const GameSetting* GameSettings(size_t* count);
 int  GameSettingLevel(const Settings& settings, const char* id);
 void SetGameSettingLevel(Settings* settings, const char* id, int level);
+void ResetGameSettings(Settings* settings); // "Todo predeterminado": every entry at Predeterminado (explicit 0 where def != 0)
 std::string GameSettingsConvars(const Settings& settings);
 std::string ShadowFilterLevel(const Settings& settings); // "" (0) or "1".."3"
 

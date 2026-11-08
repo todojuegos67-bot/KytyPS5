@@ -523,7 +523,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "mapa_teclado=" << s.kbm_map << "\n"
 	  << "; Mando remapeado: a=Cross;b=Circle;... (boton fisico de SDL = control de PS5; vacio = normal)\n"
 	  << "mapa_mando=" << s.pad_map << "\n"
-	  << "; Ajustes del juego (los del lanzador del emulador): gs_sun=3;gs_spot=1;... (0 o vacio = como viene el juego)\n"
+	  << "; Ajustes del juego (los del lanzador del emulador): gs_sun=3;gs_spot=1;... (gs_x=0 = como viene el juego; sin la clave = su predeterminado, gs_spot apagadas)\n"
 	  << "ajustes_juego=" << s.game_settings << "\n"
 	  << "; Forzar la velocidad de camara del juego (0 = la del menu del juego; 5-15 tambien cambia la del mando)\n"
 	  << "raton_velocidad_camara_forzada=" << s.kbm_camera << "\n"
@@ -581,7 +581,7 @@ const GameSetting kGameSettings[] = {
 	{"gs_sun", "Sombras", false, "Sombras del sol", {"r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=60;sunShadowCascadeDistance0=60;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=125;sunShadowCascadeDistance0=22;sunShadowCascadeDistance1=125;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;sunShadowCascadeDistance0=40;sunShadowCascadeDistance1=250;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;sunShadowCascadeDistance0=27;sunShadowCascadeDistance1=61;sunShadowCascadeDistance2=131;sunShadowCascadeDistance3=400;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;sunShadowCascadeDistance0=65;sunShadowCascadeDistance1=142;sunShadowCascadeDistance2=300;sunShadowCascadeDistance3=1000;sunShadowLightDistance=1000"},
 	 "Sombras del sol del juego: hasta donde llegan y en cuantas cascadas se reparten. Bajo 60 m (1 cascada), Medio 125 m (2), Alto 250 m (2, el valor de fabrica), Ultra 400 m (4), Extremo 1000 m (4, el maximo del juego). Cuesta GPU y CPU (las sombras son unos 2600 dibujados por frame); Extremo puede costar un 10-15 % de FPS. Manda sobre el desplegable Sombras."},
 	{"gs_spot", "Sombras", true, "Sombras de focos (antorchas)", {"r_enableSpotShadows=false", "r_enableSpotShadows=true", nullptr, nullptr, nullptr},
-	 "Sombras que proyectan antorchas, hogueras y otras luces (unas 7 por escena en 1-1). No: mas FPS, pero sin esas sombras. El juego no tiene ajuste de distancia ni de resolucion para ellas."},
+	 "Sombras que proyectan antorchas, hogueras y otras luces (unas 7 por escena en 1-1). No: mas FPS, pero sin esas sombras. El juego no tiene ajuste de distancia ni de resolucion para ellas.", 1},
 	{"gs_contact", "Sombras", false, "Sombras de contacto", {"r_contactShadowsEnabled=false", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.03", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.06", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.1", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.3;r_contactShadowsThickness=0.12;r_contactShadowsSoftness=0.2"},
 	 "Sombras de contacto del juego: sombras finas donde los objetos tocan el suelo y las paredes. Bajo: apagadas. Medio, Alto (de fabrica), Ultra y Extremo: alcance 0,03 / 0,06 / 0,10 / 0,30 (Extremo tambien mas gruesas y mas definidas). Cuesta poco; con mucho alcance pueden salir halos."},
 	{"gs_ambient", "Iluminacion", false, "Sombreado ambiental del juego", {"r_enableAmbientShadowing=false", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=50;r_ambientShadowCutoffFadeDistance=10", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=100;r_ambientShadowCutoffFadeDistance=20", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=250;r_ambientShadowCutoffFadeDistance=40", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=1000;r_ambientShadowCutoffFadeDistance=100"},
@@ -630,6 +630,9 @@ int GameSettingLevel(const Settings& s, const char* id) {
 		at                = end + 1;
 		if (item.rfind(key, 0) == 0) return std::clamp(std::atoi(item.c_str() + key.size()), 0, 5);
 	}
+	// Absent from ajustes_juego: the entry's own default (gs_spot = off). An explicit "=0" is Predeterminado (the game's own).
+	for (const auto& g: kGameSettings)
+		if (std::strcmp(g.id, id) == 0) return g.def;
 	return 0;
 }
 
@@ -637,8 +640,16 @@ void SetGameSettingLevel(Settings* s, const char* id, int level) {
 	std::string out;
 	for (const auto& g: kGameSettings) {
 		const int v = std::strcmp(g.id, id) == 0 ? level : GameSettingLevel(*s, g.id);
-		if (v > 0) out += (out.empty() ? "" : ";") + std::string(g.id) + "=" + std::to_string(v);
+		// Entries whose default is not 0 are always written, so that "Predeterminado" (0) survives a reload.
+		if (v > 0 || g.def != 0) out += (out.empty() ? "" : ";") + std::string(g.id) + "=" + std::to_string(v);
 	}
+	s->game_settings = out;
+}
+
+void ResetGameSettings(Settings* s) {
+	std::string out;
+	for (const auto& g: kGameSettings)
+		if (g.def != 0) out += (out.empty() ? "" : ";") + std::string(g.id) + "=0";
 	s->game_settings = out;
 }
 
