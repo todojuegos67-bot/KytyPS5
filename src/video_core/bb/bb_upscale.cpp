@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -15,6 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <string>
+#include <vector>
 #include <fmt/format.h>
 #include <imgui.h>
 #include "common/logging/log.h"
@@ -284,9 +287,14 @@ Stats g_stats;
 std::atomic<bool> g_overlay{false};
 struct Accum {
     double cpu = 0, wait = 0, gpu = 0, sr = 0, mv = 0;
+    double frame_max = 0; // the longest flip-to-flip frame of the second (cpu + wait)
     u32 frames = 0, gpu_n = 0;
     std::chrono::steady_clock::time_point start{};
 } g_acc;
+
+// F8 frametime graph: one mean and one peak per second, the last 60 seconds (the Demon's Souls
+// Metricas graph). Written and drawn on the presenter's thread, so no lock.
+std::vector<float> g_hist_mean, g_hist_max;
 
 } // namespace
 
@@ -626,6 +634,7 @@ void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, doubl
     }
     g_acc.cpu += cpu_ms;
     g_acc.wait += wait_ms;
+    g_acc.frame_max = std::max(g_acc.frame_max, cpu_ms + wait_ms);
     if (gpu_ms > 0) {
         g_acc.gpu += gpu_ms;
         g_acc.sr += sr_ms;
@@ -652,6 +661,12 @@ void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, doubl
     s.out_h = out_h;
     s.upscaled = upscaled;
     g_stats = s;
+    g_hist_mean.push_back(s.frame_ms);
+    g_hist_max.push_back(static_cast<float>(g_acc.frame_max));
+    if (g_hist_mean.size() > 60) {
+        g_hist_mean.erase(g_hist_mean.begin());
+        g_hist_max.erase(g_hist_max.begin());
+    }
     LOG_INFO(Render_Vulkan,
              "[perf] fps {:.1f} frame {:.2f} ms | cpu {:.2f} ms (fence wait {:.2f}) | gpu {:.2f} "
              "ms | upscaler {} {} {}x{} -> {}x{} sr {:.3f} ms mv {:.3f} ms",
@@ -675,29 +690,124 @@ void ToggleOverlay() {
     g_overlay.store(!g_overlay.load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
 
+// The F8 panel in the Demon's Souls "Metricas" style (ds-menu.cpp, MetricsPanel): top-centre, no
+// background, Consolas-sized rows (the default font here), the same colours, the FPS line and the
+// 60 s frametime graph (green mean, orange peaks, 8.3 / 16.7 / 33.3 ms lines, 40 ms at the top).
+// Only the values this build already computes: no GPU or memory queries, no readbacks.
 void DrawOverlay() {
     if (!OverlayShown()) {
         return;
     }
+    const ImU32 kGreen = IM_COL32(50, 205, 50, 255), kRed = IM_COL32(255, 0, 0, 255),
+                kBlue = IM_COL32(0, 191, 255, 255), kOrange = IM_COL32(255, 165, 0, 255),
+                kWhite = IM_COL32(255, 255, 255, 255), kName = IM_COL32(150, 150, 150, 255);
+    struct Row {
+        std::string name, value;
+        ImU32 color;
+    };
     const Stats& s = g_stats;
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    if (ImGui::Begin("##bbperf", nullptr,
-                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-                         ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs)) {
-        ImGui::Text("%.1f fps  %.2f ms", s.fps, s.frame_ms);
-        ImGui::Text("CPU %.2f ms (espera %.2f)  GPU %.2f ms", s.cpu_ms, s.wait_ms, s.gpu_ms);
-        if (Enabled()) {
-            ImGui::Text("%s %s %ux%u -> %ux%u%s", SR::KindName(Cfg().kind),
-                        SR::QualityName(Cfg().quality), s.in_w, s.in_h, s.out_w, s.out_h,
-                        s.upscaled ? "" : " (sin escalar)");
-            ImGui::Text("SR %.2f ms  MV %.2f ms", s.sr_ms, s.mv_ms);
+    const bool on = Enabled();
+    const bool ready = s.frame_ms > 0;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float width = io.DisplaySize.x;
+    const float S = std::clamp(io.DisplaySize.y / 1080.0f, 1.0f, 2.5f);
+    ImFont* f = ImGui::GetFont();
+
+    std::vector<Row> rows;
+    if (ready) {
+        rows.push_back({"GPU", s.gpu_ms > 0 ? fmt::format("{:.2f} ms", s.gpu_ms) : "--", kOrange});
+        rows.push_back(
+            {"CPU", fmt::format("{:.2f} ms (espera {:.2f})", s.cpu_ms, s.wait_ms), kOrange});
+        rows.push_back({"Frame", fmt::format("{:.1f} ms", s.frame_ms), kOrange});
+        if (on) {
+            const SR::Kind k = Cfg().kind;
+            const ImU32 col = k == SR::Kind::Dlss                          ? kGreen
+                              : k == SR::Kind::Fsr3 || k == SR::Kind::Fsr4 ? kRed
+                              : k == SR::Kind::Xess                        ? kBlue
+                                                                           : kOrange;
+            rows.push_back(
+                {"Escala",
+                 fmt::format("{} \xC2\xB7 {}", SR::KindName(k), SR::QualityName(Cfg().quality)),
+                 col});
+            const double ratio = s.in_h > 0 ? static_cast<double>(s.out_h) / s.in_h : 0.0;
+            rows.push_back({"Resol.",
+                            fmt::format("{}p -> {}p (x{:.2f}){}", s.in_h, s.out_h, ratio,
+                                        s.upscaled ? "" : " sin escalar"),
+                            col});
+            rows.push_back({"SR", fmt::format("{:.2f} ms", s.sr_ms), col});
+            rows.push_back({"MV", fmt::format("{:.2f} ms", s.mv_ms), col});
         } else {
-            ImGui::Text("Nativo %ux%u -> %ux%u", s.in_w, s.in_h, s.out_w, s.out_h);
+            rows.push_back({"Escala", "Nativo", kOrange});
+            rows.push_back({"Resol.",
+                            fmt::format("{}x{} -> {}x{}", s.in_w, s.in_h, s.out_w, s.out_h),
+                            kOrange});
+        }
+    } else {
+        rows.push_back({"", "Cargando...", kOrange});
+    }
+
+    const float row_px = std::round(15 * S), title_px = std::round(16 * S),
+                fps_px = std::round(34 * S), small_px = std::round(10 * S);
+    const float pad = std::round(8 * S), row_h = std::ceil(row_px * 1.12f),
+                title_h = std::ceil(title_px * 1.4f),
+                fps_h = ready ? std::ceil(fps_px * 1.1f) : 0.0f, graph_h = std::round(90 * S);
+    float name_w = std::round(90 * S), val_w = std::round(230 * S), wide_w = 0;
+    for (const auto& r : rows) {
+        const float w = f->CalcTextSizeA(row_px, FLT_MAX, 0, r.value.c_str()).x;
+        if (!r.name.empty()) {
+            name_w = std::max(name_w, f->CalcTextSizeA(row_px, FLT_MAX, 0, r.name.c_str()).x +
+                                          std::round(10 * S));
+            val_w = std::max(val_w, w);
+        } else {
+            wide_w = std::max(wide_w, w);
         }
     }
-    ImGui::End();
+    const float W = std::min(std::max(name_w + val_w, wide_w) + 2 * pad, width * 0.4f);
+    const float x0 = std::floor((width - W) * 0.5f), y0 = std::round(10 * S);
+    auto* dl = ImGui::GetForegroundDrawList();
+
+    const char* title = "BLOODBORNE";
+    const float tw = f->CalcTextSizeA(title_px, FLT_MAX, 0, title).x;
+    dl->AddText(f, title_px, {std::floor(x0 + (W - tw) * 0.5f), y0 + pad}, kWhite, title);
+    float y = y0 + pad + title_h;
+    for (const auto& r : rows) {
+        if (!r.name.empty()) {
+            dl->AddText(f, row_px, {x0 + pad, y}, kName, r.name.c_str());
+            dl->AddText(f, row_px, {x0 + pad + name_w, y}, r.color, r.value.c_str());
+        } else {
+            dl->AddText(f, row_px, {x0 + pad, y}, r.color, r.value.c_str());
+        }
+        y += row_h;
+    }
+    if (ready) {
+        const std::string fps = fmt::format("FPS {:.0f}", s.fps);
+        dl->AddText(f, fps_px, {x0 + pad, y}, kWhite, fps.c_str());
+        y += fps_h;
+    }
+    y += pad;
+
+    const float gy = y, gw = W, top = 40.0f;
+    for (const float ms : {8.3f, 16.7f, 33.3f}) {
+        const float ly = gy + graph_h - ms / top * graph_h;
+        dl->AddLine({x0, ly}, {x0 + gw, ly}, IM_COL32(60, 60, 60, 255));
+    }
+    dl->AddText(f, small_px, {x0, gy}, IM_COL32(128, 128, 128, 255),
+                "frametime (ms)  40   verde media, naranja picos");
+    dl->AddText(f, small_px, {x0, gy + graph_h - 16.7f / top * graph_h - small_px},
+                IM_COL32(128, 128, 128, 255), "16.7");
+    const auto line = [&](const std::vector<float>& list, ImU32 col) {
+        if (list.size() < 2)
+            return;
+        const float step = gw / 59.0f, xs = x0 + gw - static_cast<float>(list.size() - 1) * step;
+        for (size_t i = 1; i < list.size(); i++) {
+            const float y1 = gy + graph_h - std::min(list[i - 1], top) / top * graph_h;
+            const float y2 = gy + graph_h - std::min(list[i], top) / top * graph_h;
+            dl->AddLine({xs + static_cast<float>(i - 1) * step, y1},
+                        {xs + static_cast<float>(i) * step, y2}, col, 2.0f * S);
+        }
+    };
+    line(g_hist_max, IM_COL32(255, 150, 40, 255));
+    line(g_hist_mean, IM_COL32(0, 255, 0, 255));
 }
 
 } // namespace BB::Upscale
