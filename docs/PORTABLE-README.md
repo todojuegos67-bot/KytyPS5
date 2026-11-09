@@ -497,6 +497,11 @@ hurts.
   (`run.cmd -Set KYTY_READ_GUARD=0` goes back to no access, for comparison). If you still get this blue screen,
   please report it in issue #50. A full RAM still makes the game slow: close other large programs while playing
   and keep a page file of at least 32 GB.
+- With less than 1.5 GB of RAM left (16 GB PCs with other programs open), the ground, walls or light can go black
+  for single frames (issues #159, #319): the price of the guard pages above, which let the game read some of the
+  data it gets back from the graphics card a moment too early. Close the browser and other large programs before
+  playing. `-Set KYTY_HOT_READS_MIN_AVAIL_MB=0` keeps the flicker away at any free RAM, but weakens the blue-screen
+  protection when the RAM runs completely full.
 - On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
   card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
   `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".
