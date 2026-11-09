@@ -5910,6 +5910,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 			}).detach();
 			for (int i = 0; i < 30 && !flushed.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
+		ReturnToLauncher(); // (11-09) TerminateProcess runs no atexit: the launcher opens again from here
 		TerminateProcess(GetCurrentProcess(), 0);
 #else
 		std::_Exit(0);

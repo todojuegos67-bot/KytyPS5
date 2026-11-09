@@ -552,7 +552,7 @@ function Start-Game {
 	$cine4k = @($(if ($cmbIbl -and $cmbIbl.SelectedIndex -eq 1) { 'r_iblResolution=Full' } else { 'r_iblResolution=HalfResX' }), $(if ($cmbTess) { $tessLv[[math]::Max(0, $cmbTess.SelectedIndex)] })) -join ';'  # (10-29) IBL y teselado del launcher (4K los pone en cinematico)
 	$gsAll = @($cine4k, (Get-GameSettingsConvars), $script:userCvExtra) | Where-Object { $_ }
 	if ($gsAll) { $env:KYTY_GAME_CONVARS_EXTRA = ($gsAll -join ';') } else { Remove-Item Env:KYTY_GAME_CONVARS_EXTRA -ErrorAction SilentlyContinue }
-	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Hidden | Out-Null
+	$script:gameProc = Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Hidden -PassThru
 	# (10-26) Equipos de 16 GB: limpiador de memoria en espera (standby) en tiempo real, como administrador. Si se rechaza el UAC, el juego sigue.
 	$metArgs = @(); if ($chkRam16.Checked) { $metArgs = @('-RamGB', '16') }
 	if ($chkVram8.Checked) { $metArgs += @('-VramMB', '8192') }
@@ -576,6 +576,23 @@ function Start-Game {
 		if ($script:fgTries -ge 90) { $script:fgTimer.Stop() }
 	})
 	$script:fgTimer.Start()
+	# (11-09) Al cerrarse el juego (F1 > Cerrar el juego, la X de la ventana o una salida normal) el launcher vuelve al frente.
+	$script:backSeen = $false; $script:backTicks = 0
+	if ($script:backTimer) { $script:backTimer.Stop() }
+	$script:backTimer = New-Object System.Windows.Forms.Timer
+	$script:backTimer.Interval = 1000
+	$script:backTimer.Add_Tick({
+		$script:backTicks++
+		$emu = Get-Process -Name 'kyty_emulator*' -ErrorAction SilentlyContinue
+		if ($emu) { $script:backSeen = $true; return }
+		$done = ($script:gameProc -eq $null) -or $script:gameProc.HasExited
+		if ($done -and ($script:backSeen -or $script:backTicks -ge 120)) {
+			$script:backTimer.Stop()
+			$form.WindowState = 'Normal'; $form.Show(); $form.Activate()
+			try { [void][FgWin]::SetForegroundWindow($form.Handle) } catch { }
+		}
+	})
+	$script:backTimer.Start()
 }
 
 # ---- ventana ----

@@ -37,6 +37,8 @@ void CloseSplash();
 void RequestRestart(bool to_launcher = false);
 // Ends the game.
 void RequestQuit();
+// (11-09) When the game was started from the launcher: opens the launcher again in a new process (the game's end).
+void ReturnToLauncher();
 // (10-27b) The launcher-style start menu, before the game (its own window, the F1 menu's pages full screen over
 // fondo-souls.jpg, with Jugar / Actualizar version / Volver a la version anterior / Salir; the static shader precompile
 // with its progress bar). `settings` gets what was chosen (saved to settings.ini). False: Salir.

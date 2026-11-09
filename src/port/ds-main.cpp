@@ -679,8 +679,25 @@ std::atomic<bool> g_restart {false};
 std::atomic<bool> g_restart_launcher {false}; // (ds-pc-port38) an update / restore: the new start opens the launcher
 fs::path          g_exe;
 
+std::atomic<bool> g_back_to_launcher {false}; // (11-09) the game was started from the launcher (JUGAR)
+
+// (11-09) The game ended (F1's "Cerrar el juego", the window's X, a normal exit): the launcher opens again in a new
+// process (the emulator cannot go back to the launcher in this one). Not after a restart (that start is its own).
+void ReopenLauncher() {
+	if (g_restart.load() || !g_back_to_launcher.exchange(false)) return;
+	std::wstring        command = L"\"" + g_exe.wstring() + L"\" --restarted --lanzador";
+	STARTUPINFOW        si {};
+	PROCESS_INFORMATION pi {};
+	si.cb = sizeof(si);
+	if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, g_exe.parent_path().c_str(), &si, &pi)) {
+		AllowSetForegroundWindow(pi.dwProcessId);
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+	}
+}
+
 void RestartIfAsked() {
-	if (!g_restart.exchange(false)) return;
+	if (!g_restart.exchange(false)) return ReopenLauncher();
 	// (ds-pc-port38) After an update or a restore the new version starts at the launcher (--lanzador), never the game by
 	// itself; F1's "Reiniciar ahora" still goes straight back to the game (--restarted alone).
 	std::wstring command = L"\"" + g_exe.wstring() + L"\" --restarted";
@@ -1001,6 +1018,10 @@ void CloseSplash() {
 	if (HWND w = g_splash.window.load(); w != nullptr) PostMessageW(w, WM_CLOSE, 0, 0);
 }
 
+void ReturnToLauncher() {
+	ReopenLauncher();
+}
+
 void RequestRestart(bool to_launcher) {
 	if (to_launcher) g_restart_launcher = true;
 	g_restart = true;
@@ -1067,6 +1088,7 @@ int main(int argc, char* argv[]) {
 	// (ds-pc-port29) Unbuffered: a crash no longer loses the last lines.
 	setvbuf(stdout, nullptr, _IONBF, 0);
 	setvbuf(stderr, nullptr, _IONBF, 0);
+	if (fg_relaunch) g_back_to_launcher = true; // (11-09) started by the launcher's JUGAR: its end opens it again
 	if (fg_relaunch) std::printf("[port] DLSS / Streamline: the game in its own process (no launcher window or D3D before Streamline)\n");
 	ReportPreviousWerCrash(root / L"logs"); // (ds-pc-port38) a fast fail of an earlier run, from Windows Error Reporting
 
@@ -1274,6 +1296,7 @@ int main(int argc, char* argv[]) {
 			return 0;
 		}
 		settings.configured = true; // (10-28b) the Configurador is the launcher's Sistema tab
+		g_back_to_launcher = true; // (11-09) the game's end opens the launcher again
 		Port::SaveSettings(ini, settings);
 		// (ds-pc-port29) DLSS frame generation (Streamline's sl.interposer, the nvapi redirect, Reflex) must be the first
 		// graphics in its process, as in the emulator started from PowerShell: the launcher's SDL renderer has loaded
