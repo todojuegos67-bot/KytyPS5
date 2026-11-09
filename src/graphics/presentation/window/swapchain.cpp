@@ -1892,6 +1892,19 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	// The PC port's options menu (src/port): its frames go out without frame generation (no generated frame
 	// drags the menu with the scene's motion).
 	const bool port_menu      = PortLive::menu_open.load(std::memory_order_relaxed);
+	{
+		// (11-10) The menu's first present after it opened / closed: what the presenter did then (the game closed at times
+		// right after F2; this shows whether frame generation was still on, or the frame a re-present of the last one).
+		static bool menu_seen = false;
+		if (port_menu != menu_seen) {
+			menu_seen = port_menu;
+			std::printf("[port] menu %s: first present %s, fg %s, fsr3 %s, generated frame %s\n", port_menu ? "open" : "closed",
+			            reuse || frame.reusing_last ? "re-presents the last frame" : "a new game frame",
+			            FrameGen::Enabled() ? "on" : "off", Fsr3::Active() ? "on" : "off",
+			            frame.fg.valid && !frame.reusing_last && !port_menu ? "yes" : "no");
+			std::fflush(stdout);
+		}
+	}
 	auto&      swapchain  = m_impl->swapchain;
 	auto*      hud        = m_impl->UpdateHud(reuse);
 	// The guest's own frames choose the color space (PQ or SDR); black and blank flips keep the current one.
