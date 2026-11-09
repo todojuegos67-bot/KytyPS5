@@ -26,6 +26,9 @@ struct Config {
 const Config& Cfg();
 bool Enabled();       // an upscaler (or native AA) was asked for
 bool Temporal();      // DLSS or FSR 4 asked
+// bb-clean-021-fg: the scene depth, camera and motion vectors are captured (an upscaler, or
+// frame generation without one: BB_FG != off).
+bool Capture();
 bool BackendReady();  // ... and its back end is up
 float LiveSharpness();
 double Ratio();       // output / render asked by the mode

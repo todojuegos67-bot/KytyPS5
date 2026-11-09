@@ -775,7 +775,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                if (BB::Upscale::Enabled()) {
+                if (BB::Upscale::Capture()) {
                     BB::Upscale::OnConstants(stage.flattened_ud_buf.data(),
                                              stage.flattened_ud_buf.size());
                 }
@@ -1143,9 +1143,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
-        if (BB::Upscale::Enabled()) {
+        if (BB::Upscale::Capture()) {
             // bb-clean-021: the scene depth (the presented image's size, depth test on): the
-            // upscaler's depth and the draws that get the sub-pixel jitter.
+            // upscaler's depth and the draws that get the sub-pixel jitter (none without an
+            // upscaler: BB_FG alone captures the depth with zero jitter).
             bb_jitter_draw = regs.depth_control.depth_enable &&
                              image.info.size.width == BB::Upscale::g_scene_w &&
                              image.info.size.height == BB::Upscale::g_scene_h;

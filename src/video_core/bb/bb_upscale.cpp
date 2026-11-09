@@ -4,6 +4,7 @@
 // Bloodborne's scene constant block, jitter and the once-per-second performance line.
 
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_fg.h"
 
 #include <algorithm>
 #include <atomic>
@@ -310,6 +311,11 @@ bool Enabled() {
 
 bool Temporal() {
     return Enabled();
+}
+
+bool Capture() {
+    static const bool on = Enabled() || BB::FG::On();
+    return on;
 }
 
 double Ratio() {

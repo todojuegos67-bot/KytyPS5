@@ -14,7 +14,9 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "core/address_space.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -404,12 +406,34 @@ bool Instance::CreateDevice() {
         }
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
-    const vk::DeviceQueueCreateInfo queue_info = {
-        .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
-        .pQueuePriorities = queue_priorities.data(),
+    if (BB::FG::On()) {
+        // bb-clean-021-fg: what the FidelityFX frame generation backend asks of the device.
+        std::vector<const char*> fg_extensions(enabled_extensions.begin(),
+                                               enabled_extensions.end());
+        BB::FG::AddDeviceExtensions(available_extensions, fg_extensions);
+        for (std::size_t i = enabled_extensions.size(); i < fg_extensions.size(); ++i) {
+            LOG_INFO(Render_Vulkan, "Enabling extension: {} (frame generation)", fg_extensions[i]);
+            enabled_extensions.push_back(fg_extensions[i]);
+        }
+    }
+
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    // bb-clean-021-fg: FSR 3 frame generation (BB_FG=amd-x2) adds a second graphics queue for its
+    // presents and two async compute queues; with BB_FG off one graphics queue as before.
+    const BB::FG::QueuePlan fg_queues = BB::FG::PlanQueues(physical_device, queue_family_index);
+    const std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = queue_family_index,
+            .queueCount = std::min<u32>(fg_queues.graphics_count, 2),
+            .pQueuePriorities = queue_priorities.data(),
+        },
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = fg_queues.compute_family,
+            .queueCount = std::min<u32>(fg_queues.compute_count, 2),
+            .pQueuePriorities = queue_priorities.data(),
+        },
     };
+    const u32 queue_info_count = fg_queues.compute_count > 0 ? 2u : 1u;
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
@@ -420,8 +444,8 @@ bool Instance::CreateDevice() {
     }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = queue_info_count,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -679,6 +703,8 @@ bool Instance::CreateDevice() {
         BB::Upscale::OnDevice(*instance, physical_device, *device, allocator, graphics_queue,
                               queue_family_index);
     }
+    BB::FG::OnDevice(physical_device, *device, queue_family_index, graphics_queue, fg_queues,
+                     &Scheduler::submit_mutex);
     return true;
 }
 

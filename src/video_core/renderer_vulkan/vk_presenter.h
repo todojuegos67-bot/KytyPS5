@@ -39,6 +39,7 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    BB::FG::Inputs fg{}; // bb-clean-021-fg: this frame's frame generation inputs (valid: 3D frame)
 
     ImTextureID imgui_texture;
 };

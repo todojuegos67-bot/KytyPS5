@@ -753,11 +753,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     bool bb_upscaled = false;
     const bool bb_split = rasterizer->bb_hud.Captured() &&
                           rasterizer->bb_hud.CapturedAddr() == image.info.guest_address;
-    if (BB::Upscale::Enabled()) {
+    frame->fg = {};
+    if (BB::Upscale::Capture()) {
         const vk::Extent2D out_size{frame->width, frame->height};
         const vk::ImageView bb_scene_view = bb_split ? rasterizer->bb_hud.SceneView() : image_view;
         if (const auto v = bb_sr->Run(cmdbuf, texture_cache, runtime, image, bb_scene_view,
-                                      image_size, out_size, rasterizer->bb_scene_depth, srgb10)) {
+                                      image_size, out_size, rasterizer->bb_scene_depth, srgb10,
+                                      &frame->fg)) {
             const vk::ImageView with_hud =
                 bb_split ? rasterizer->bb_hud.Composite(cmdbuf, image_view, v, image_size,
                                                         out_size, srgb10)
@@ -1118,9 +1120,24 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
 
+    // bb-clean-021-fg: FSR 3 frame generation's configure and prepare for this present (the
+    // frame's own inputs for a new game frame; none for a repeat). Nothing with BB_FG off.
+    if (BB::FG::Fsr3Active()) {
+        const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
+        BB::FG::BeforePresent(fg_frame ? &frame->fg : nullptr, swapchain.GetHandle(),
+                              swapchain.GetExtent(),
+                              swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                                 : swapchain.GetSurfaceFormat().format);
+    }
+
     // Present to swapchain.
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        // (FSR 3's frame interpolation swapchain submits to the game queue itself, under this
+        // lock: not held here then.)
+        std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+        if (!BB::FG::Fsr3Active()) {
+            submit_lock.lock();
+        }
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }

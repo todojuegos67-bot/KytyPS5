@@ -1,0 +1,132 @@
+diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+index 1280a2b..431d311 100644
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+@@ -136,6 +136,75 @@ void kytyWaitForPresent(const PacingData::FrameInfo& frameInfo, int64_t previous
+ }
+ }  // namespace
+ 
++namespace
++{
++// Kyty display meter. With KYTY_FSR3_DISPLAY_IDS=1 the emulator gives each game present a VkPresentIdKHR (a count) and every present
++// to the driver swapchain carries id = count * 4 + slot: the real frame is slot 3, the generated frames the slots before it
++// (3 - generated + k), so each one is a distinct, increasing present id the emulator can wait for (VK_KHR_present_wait) to time
++// when it is displayed. The ids are listed in kytyFfxTakeDisplayIds in present order.
++bool kytyDisplayIdsOn()
++{
++    static const bool on = []
++    {
++        char value[8] = {};
++        return GetEnvironmentVariableA("KYTY_FSR3_DISPLAY_IDS", value, sizeof(value)) > 0 && value[0] == '1';
++    }();
++    return on;
++}
++
++template <typename Entry, typename FrameTypeT>
++uint64_t kytyDisplayIdOf(Entry&& entry, FrameTypeT frameType)
++{
++    const uint64_t count = entry.kytyPresentId;
++    if (count == 0)
++        return 0;
++    const bool real = frameType == PacingData::FrameType::Real;
++    if (!kytyDisplayIdsOn())
++        return real ? count : 0;
++    if (real)
++        return count * 4 + 3;
++    uint32_t generated = (entry.frames[PacingData::FrameType::Interpolated_1].doPresent ? 1u : 0u)
++                         + (entry.frames[PacingData::FrameType::Interpolated_2].doPresent ? 1u : 0u)
++                         + (entry.frames[PacingData::FrameType::Interpolated_3].doPresent ? 1u : 0u);
++    const uint32_t k = frameType == PacingData::FrameType::Interpolated_1 ? 0u : (frameType == PacingData::FrameType::Interpolated_2 ? 1u : 2u);
++    if (generated < k + 1)
++        generated = k + 1;
++    return count * 4 + (3 - generated) + k;
++}
++
++uint64_t kytyRealDisplayId(uint64_t count)
++{
++    return count == 0 ? 0 : (kytyDisplayIdsOn() ? count * 4 + 3 : count);
++}
++
++constexpr uint32_t kytyIdRingSize = 512;
++SRWLOCK            kytyIdLock     = SRWLOCK_INIT;
++uint64_t           kytyIdRing[kytyIdRingSize] = {};
++uint32_t           kytyIdHead = 0;  // the next id to hand out
++uint32_t           kytyIdTail = 0;  // the next slot to fill
++
++void kytyRecordDisplayId(uint64_t id)
++{
++    AcquireSRWLockExclusive(&kytyIdLock);
++    kytyIdRing[kytyIdTail % kytyIdRingSize] = id;
++    ++kytyIdTail;
++    if (kytyIdTail - kytyIdHead > kytyIdRingSize)
++        kytyIdHead = kytyIdTail - kytyIdRingSize;
++    ReleaseSRWLockExclusive(&kytyIdLock);
++}
++}  // namespace
++
++// The display ids presented since the last call, oldest first (at most max). Count returned.
++extern "C" __declspec(dllexport) uint32_t kytyFfxTakeDisplayIds(uint64_t* out, uint32_t max)
++{
++    uint32_t n = 0;
++    AcquireSRWLockExclusive(&kytyIdLock);
++    while (kytyIdHead != kytyIdTail && n < max)
++        out[n++] = kytyIdRing[kytyIdHead++ % kytyIdRingSize];
++    ReleaseSRWLockExclusive(&kytyIdLock);
++    return n;
++}
++
+ extern "C" __declspec(dllexport) void kytyFfxSetPaceSlot(int64_t slotQpc, int64_t intervalQpc)
+ {
+     kytyPaceSlotQpc     = slotQpc;
+@@ -174,11 +243,13 @@ VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t
+     presentInfoKHR.pResults           = nullptr;  // Optional
+ 
+     EnterCriticalSection(&pPresenter->swapchainCriticalSection);
+-    if (kytyPresentId != 0)
++    if (kytyPresentId != 0 && !kytyDisplayIdsOn())
+         kytyLatencyMarker(pPresenter, kytyPresentId, 4);  // VK_LATENCY_MARKER_PRESENT_START_NV
+     kytyNotePresent();
++    if (kytyPresentId != 0 && kytyDisplayIdsOn())
++        kytyRecordDisplayId(kytyPresentId);
+     VkResult res = vkQueuePresentKHR(pPresenter->presentQueue.queue, &presentInfoKHR);
+-    if (kytyPresentId != 0)
++    if (kytyPresentId != 0 && !kytyDisplayIdsOn())
+         kytyLatencyMarker(pPresenter, kytyPresentId, 5);  // VK_LATENCY_MARKER_PRESENT_END_NV
+     LeaveCriticalSection(&pPresenter->swapchainCriticalSection);
+ 
+@@ -198,7 +269,7 @@ VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t
+                                 kytyWaitForPresent(frameInfo, previousPresentQpc);
+                                 QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
+ 
+-                                res = presentToSwapChain(presenter, imageIndex, imageIndex, frameType == PacingData::FrameType::Real ? entry.kytyPresentId : 0);
++                                res = presentToSwapChain(presenter, imageIndex, imageIndex, kytyDisplayIdOf(entry, frameType));
+                                 // VK_SUBOPTIMAL_KHR & VK_ERROR_OUT_OF_DATE_KHR: the swapchain has been recreated
+                                 FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR,
+                                                           "presentToSwapChain failed with error %d",
+@@ -209,7 +280,7 @@ VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t
+                                 kytyWaitForPresent(frameInfo, previousPresentQpc);
+                                 QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
+ 
+-                                res = presentToSwapChain(presenter, realSwapchainImageIndex, 0, frameType == PacingData::FrameType::Real ? entry.kytyPresentId : 0);
++                                res = presentToSwapChain(presenter, realSwapchainImageIndex, 0, kytyDisplayIdOf(entry, frameType));
+                                 // VK_SUBOPTIMAL_KHR & VK_ERROR_OUT_OF_DATE_KHR: the swapchain has been recreated
+                                 FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR,
+                                                           "presentToSwapChain failed with error %d",
+@@ -475,7 +546,7 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+ 
+     pCommands->execute(semaphoresToWait, semaphoresToSignal);
+ 
+-    VkResult presentRes = presentToSwapChain(&presentInfo, imageIndex, imageIndex, kytyPendingPresentId);
++    VkResult presentRes = presentToSwapChain(&presentInfo, imageIndex, imageIndex, kytyRealDisplayId(kytyPendingPresentId));
+     FFX_ASSERT_MESSAGE_FORMAT(presentRes == VK_SUCCESS || presentRes == VK_SUBOPTIMAL_KHR || presentRes == VK_ERROR_OUT_OF_DATE_KHR,
+                               "[queuePresentNonInterpolated] present failed with error %d",
+                               presentRes);
+@@ -483,7 +554,7 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t
+         FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS, "[queuePresentNonInterpolated] queue family ownership transfer to present queue failed with error %d", res);
+     }
+ 
+-    VkResult presentRes = presentToSwapChain(&presentInfo, imageIndex, imageIndex, kytyPendingPresentId);
++    VkResult presentRes = presentToSwapChain(&presentInfo, imageIndex, imageIndex, kytyRealDisplayId(kytyPendingPresentId));
+     FFX_ASSERT_MESSAGE_FORMAT(presentRes == VK_SUCCESS || presentRes == VK_SUBOPTIMAL_KHR || presentRes == VK_ERROR_OUT_OF_DATE_KHR,
+                               "[queuePresentNonInterpolated] present failed with error %d",
+                               presentRes);

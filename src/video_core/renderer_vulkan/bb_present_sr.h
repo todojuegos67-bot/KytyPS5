@@ -4,6 +4,7 @@
 // buffer (the game's own draw scheduler): no submit, no fence, no readback wait of its own.
 #pragma once
 
+#include "video_core/bb/bb_fg.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -33,7 +34,8 @@ public:
     // stock). `cmd` must be outside a render pass.
     vk::ImageView Run(vk::CommandBuffer cmd, VideoCore::TextureCache& texture_cache,
                       Vulkan::Runtime& runtime, VideoCore::Image& flip, vk::ImageView flip_view,
-                      vk::Extent2D in, vk::Extent2D out, SceneDepth& depth, bool srgb_decode);
+                      vk::Extent2D in, vk::Extent2D out, SceneDepth& depth, bool srgb_decode,
+                      BB::FG::Inputs* fg = nullptr);
 
     // Timestamps: begin of a frame's GPU work, its end (once per frame, around the flip).
     void FrameBegin(vk::CommandBuffer cmd);
@@ -52,6 +54,12 @@ private:
         vk::ImageUsageFlags usage{};
     };
     bool Ensure(OwnImage& img, vk::Extent2D extent, vk::Format format);
+    bool EnsureDepth(OwnImage& img, vk::Extent2D extent, vk::Format format);
+    void DepthBarrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout);
+    // bb-clean-021-fg: this frame's depth and motion vectors copied for FSR 3 frame generation
+    // (read at the present, after the next frame may have started drawing into the originals).
+    bool CaptureFg(vk::CommandBuffer cmd, Vulkan::Runtime& runtime, VideoCore::Image& depth,
+                   vk::Extent2D in, BB::FG::Inputs& fg);
     void Destroy(OwnImage& img);
     void Barrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout);
     bool Init();
@@ -63,6 +71,12 @@ private:
     vk::PipelineLayout layout{};
     vk::Pipeline pipeline{};
     OwnImage color, motion, output;
+    static constexpr u32 FgSlots = 4;
+    struct FgSlot {
+        OwnImage depth, motion;
+    };
+    FgSlot fg_slots[FgSlots]{};
+    u32 fg_next = 0;
 
     static constexpr u32 Slots = 8, PerSlot = 4; // begin, before mv, after mv / before sr, end
     vk::QueryPool queries{};

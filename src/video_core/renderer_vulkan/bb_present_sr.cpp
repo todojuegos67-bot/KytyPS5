@@ -27,6 +27,10 @@ PresentSr::~PresentSr() {
     Destroy(color);
     Destroy(motion);
     Destroy(output);
+    for (auto& fs : fg_slots) {
+        Destroy(fs.depth);
+        Destroy(fs.motion);
+    }
     if (pipeline) device.destroyPipeline(pipeline);
     if (layout) device.destroyPipelineLayout(layout);
     if (set_layout) device.destroyDescriptorSetLayout(set_layout);
@@ -207,14 +211,19 @@ bool PresentSr::Poll(double& gpu_ms, double& sr_ms, double& mv_ms) {
 vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& texture_cache,
                              Vulkan::Runtime& runtime, VideoCore::Image& flip,
                              vk::ImageView flip_view, vk::Extent2D in, vk::Extent2D out,
-                             SceneDepth& scene, bool srgb_decode) {
+                             SceneDepth& scene, bool srgb_decode, BB::FG::Inputs* fg) {
     // The jitter this frame was drawn with, then the frame's camera (and the next jitter).
     float jx = 0, jy = 0;
     BB::Upscale::Jitter(jx, jy);
     const BB::Upscale::Camera cam = BB::Upscale::EndFrame(in.width, in.height);
     const bool depth_ok = scene.valid;
     scene.valid = false;
-    if (!BB::Upscale::BackendReady() || !Init()) return {};
+    if (fg != nullptr) *fg = {};
+    // bb-clean-021-fg: with BB_FG on the vectors are made (and copied for FSR 3) even without an
+    // upscaler; the frame is then presented as it is.
+    const bool sr = BB::Upscale::BackendReady();
+    const bool want_fg = fg != nullptr && BB::FG::WantInputs();
+    if ((!sr && !want_fg) || !Init()) return {};
     if (in.width > out.width || in.height > out.height || !depth_ok) return {};
     auto depth_id = texture_cache.FindImage(scene.desc);
     auto& depth = texture_cache.GetImage(depth_id);
@@ -297,6 +306,23 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         slot_sr[slot] = true;
     }
 
+    if (want_fg && CaptureFg(cmd, runtime, depth, in, *fg)) {
+        fg->jitter[0] = jx;
+        fg->jitter[1] = jy;
+        fg->reset = cam.reset;
+        fg->depth_inverted = scene.greater;
+        fg->fov_y = cam.fov_y;
+        fg->z_near = cam.z_near;
+        fg->z_far = cam.z_far;
+        fg->camera_valid = cam.valid;
+        std::memcpy(fg->view_to_clip, cam.view_to_clip, sizeof(fg->view_to_clip));
+        std::memcpy(fg->clip_to_prev_clip, cam.clip_to_prev_clip, sizeof(fg->clip_to_prev_clip));
+        fg->valid = cam.valid;
+    }
+    if (!sr) {
+        return {};
+    }
+
     BB::SR::Desc desc{};
     desc.cmd = cmd;
     desc.color = {color.image, color.view, color.format, in,
@@ -346,6 +372,125 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                                             BB::SR::QualityName(BB::Upscale::Cfg().quality)));
     }
     return output.view;
+}
+
+bool PresentSr::EnsureDepth(OwnImage& img, vk::Extent2D extent, vk::Format format) {
+    if (img.image && img.extent == extent && img.format == format) return true;
+    if (img.image) {
+        (void)instance.GetDevice().waitIdle();
+        Destroy(img);
+    }
+    const auto usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+    const VkImageCreateInfo ici = vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = usage,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &ici, &aci, &image, &img.allocation, nullptr) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    img.image = image;
+    auto [vr, v] = instance.GetDevice().createImageView({
+        .image = img.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1},
+    });
+    if (vr != vk::Result::eSuccess) {
+        Destroy(img);
+        return false;
+    }
+    img.view = v;
+    img.format = format;
+    img.extent = extent;
+    img.usage = usage;
+    img.layout = vk::ImageLayout::eUndefined;
+    return true;
+}
+
+static vk::ImageAspectFlags DepthAspects(vk::Format format) {
+    switch (format) {
+    case vk::Format::eD16UnormS8Uint:
+    case vk::Format::eD24UnormS8Uint:
+    case vk::Format::eD32SfloatS8Uint:
+        return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+    default:
+        return vk::ImageAspectFlagBits::eDepth;
+    }
+}
+
+void PresentSr::DepthBarrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout new_layout) {
+    const vk::ImageMemoryBarrier2 b{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .oldLayout = img.layout,
+        .newLayout = new_layout,
+        .image = img.image,
+        .subresourceRange = {DepthAspects(img.format), 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                            .pImageMemoryBarriers = &b});
+    img.layout = new_layout;
+}
+
+bool PresentSr::CaptureFg(vk::CommandBuffer cmd, Vulkan::Runtime& runtime,
+                          VideoCore::Image& depth, vk::Extent2D in, BB::FG::Inputs& fg) {
+    auto& fs = fg_slots[fg_next];
+    if (!EnsureDepth(fs.depth, in, depth.info.pixel_format) ||
+        !Ensure(fs.motion, in, motion.format)) {
+        return false;
+    }
+    fg_next = (fg_next + 1) % FgSlots;
+    runtime.Transit(&depth, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    DepthBarrier(cmd, fs.depth, vk::ImageLayout::eTransferDstOptimal);
+    Barrier(cmd, fs.motion, vk::ImageLayout::eTransferDstOptimal);
+    Barrier(cmd, motion, vk::ImageLayout::eTransferSrcOptimal);
+    cmd.copyImage(depth.GetImage(), vk::ImageLayout::eTransferSrcOptimal, fs.depth.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+                      .extent = {in.width, in.height, 1},
+                  });
+    cmd.copyImage(motion.image, vk::ImageLayout::eTransferSrcOptimal, fs.motion.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {in.width, in.height, 1},
+                  });
+    Barrier(cmd, motion, vk::ImageLayout::eShaderReadOnlyOptimal);
+    DepthBarrier(cmd, fs.depth, vk::ImageLayout::eShaderReadOnlyOptimal);
+    Barrier(cmd, fs.motion, vk::ImageLayout::eShaderReadOnlyOptimal);
+    runtime.Transit(&depth, vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+    runtime.FlushBarriers();
+    fg.depth = {fs.depth.image, fs.depth.view, fs.depth.format, in, fs.depth.usage};
+    fg.motion = {fs.motion.image, fs.motion.view, fs.motion.format, in, fs.motion.usage};
+    fg.render = in;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        BB::FG::Printf("[fg] first frame generation inputs: render %ux%u, depth %s, vectors %s (%s)",
+                       in.width, in.height, vk::to_string(fs.depth.format).c_str(),
+                       vk::to_string(fs.motion.format).c_str(),
+                       BB::Upscale::BackendReady() ? "upscaled frame" : "no upscaler");
+    }
+    return true;
 }
 
 HudSplit::HudSplit(const Vulkan::Instance& instance_) : instance{instance_} {}

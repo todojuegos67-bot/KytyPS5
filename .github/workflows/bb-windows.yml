@@ -15,6 +15,51 @@ jobs:
         fetch-depth: 1
     - uses: egor-tensin/vs-shell@v2
       with: { arch: x64 }
+    # FidelityFX DLL (FSR 3.1 upscaling and FSR 3 frame generation, BB_FG=amd-*): built from the
+    # SDK's v1.1.4 tag with tools/bb/fsr3-mfg/ffx-sdk-v1.1.4-mfg.patch (the Demon's Souls port41
+    # build's: multi frame generation x3 / x4, the dynamic multiplier, the pacing floor, Reflex on
+    # the real swapchain, and the command list pool fix). Unsigned; replaces AMD's DLL. The build
+    # fails rather than ship a DLL without the pool fix (the AMD MFG crashes of 10-31 / 11-01).
+    - name: FidelityFX DLL (patched, multi frame generation)
+      shell: pwsh
+      env:
+        VULKAN_VERSION: 1.3.296.0
+      run: |
+        $vk = "C:\VulkanSDK\$env:VULKAN_VERSION"
+        Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe" -OutFile "$env:RUNNER_TEMP\vksdk.exe"
+        Start-Process -Wait -FilePath "$env:RUNNER_TEMP\vksdk.exe" -ArgumentList '--root', $vk, '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+        if (!(Test-Path "$vk\Lib\vulkan-1.lib")) { Get-ChildItem $vk -ErrorAction SilentlyContinue; throw 'Vulkan SDK install failed' }
+        $env:VULKAN_SDK = $vk
+        $src = "$env:RUNNER_TEMP\ffx"
+        git -c core.autocrlf=false clone --depth 1 --branch v1.1.4 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK $src
+        if ($LASTEXITCODE) { throw 'SDK clone failed' }
+        git -C $src apply --verbose "$env:GITHUB_WORKSPACE\tools\bb\fsr3-mfg\ffx-sdk-v1.1.4-mfg.patch"
+        if ($LASTEXITCODE) { throw 'SDK patch failed' }
+        git -C $src apply --verbose "$env:GITHUB_WORKSPACE\tools\bb\fsr3-mfg\ffx-sdk-v1.1.4-display.patch"
+        if ($LASTEXITCODE) { throw 'SDK display patch failed' }
+        git -C $src apply --verbose "$env:GITHUB_WORKSPACE\tools\bb\fsr3-mfg\ffx-sdk-v1.1.4-pace.patch"
+        if ($LASTEXITCODE) { throw 'SDK pace patch failed' }
+        $configured = $false
+        foreach ($gen in @('Visual Studio 18 2026', 'Visual Studio 17 2022')) {
+          cmake -S "$src\ffx-api" -B "$src\ffx-api\build" -G $gen -A x64 -DFFX_API_BACKEND=VK_X64 "-DVulkan_INCLUDE_DIR=$vk\Include" "-DVulkan_LIBRARY=$vk\Lib\vulkan-1.lib"
+          if (!$LASTEXITCODE) { $configured = $true; break }
+          Remove-Item -Recurse -Force "$src\ffx-api\build" -ErrorAction SilentlyContinue
+        }
+        if (!$configured) { throw 'SDK configure failed' }
+        cmake --build "$src\ffx-api\build" --config Release --target amd_fidelityfx_vk --parallel 4 -- /p:CL_MPcount=4 /v:minimal
+        if ($LASTEXITCODE) { throw 'SDK build failed' }
+        New-Item -ItemType Directory -Force _Build\deps\ffx | Out-Null
+        $dll = Get-ChildItem "$src\ffx-api" -Recurse -Filter amd_fidelityfx_vk.dll | Where-Object FullName -notmatch 'PrebuiltSignedDLL' | Select-Object -First 1
+        if (!$dll) { throw 'amd_fidelityfx_vk.dll not built' }
+        Copy-Item $dll.FullName _Build\deps\ffx\amd_fidelityfx_vk.dll
+        Copy-Item "$src\LICENSE.txt" _Build\deps\ffx\FidelityFX-LICENSE.txt
+        $ffxText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes('_Build\deps\ffx\amd_fidelityfx_vk.dll'))
+        if (!$ffxText.Contains('command lists of queue family')) { throw 'amd_fidelityfx_vk.dll lacks the command list pool fix' }
+        if (!$ffxText.Contains('KYTY_FSR3_FG_ACTIVE')) { throw 'amd_fidelityfx_vk.dll lacks the dynamic multiplier' }
+        if (!$ffxText.Contains('kytyFfxSetPaceSlot') -or !$ffxText.Contains('kytyFfxTakePaceStats')) { throw 'amd_fidelityfx_vk.dll lacks the midpoint pacing' }
+        if (!$ffxText.Contains('kytyFfxTakePaceStats2') -or !$ffxText.Contains('KYTY_FSR3_PACE_ADAPT')) { throw 'amd_fidelityfx_vk.dll lacks the 1.58 adaptive pacing' }
+        if (!$ffxText.Contains('kytyFfxTakeDisplayIds') -or !$ffxText.Contains('KYTY_FSR3_DISPLAY_IDS')) { throw 'amd_fidelityfx_vk.dll lacks the display ids' }
+        Get-ChildItem _Build\deps\ffx | ForEach-Object { '{0,12:N0}  {1}  md5 {2}' -f $_.Length, $_.Name, (Get-FileHash -Algorithm MD5 $_.FullName).Hash.ToLower() }
     - name: Streamline SDK (DLSS)
       shell: pwsh
       env:
@@ -83,6 +128,8 @@ jobs:
         Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"
         if (Get-ChildItem $out -Recurse -Filter nvngx_dlssnr.dll) { throw 'nvngx_dlssnr.dll must never be shipped' }
         Copy-Item LICENSES\Streamline-MIT.txt "$out\LICENSES\Streamline-MIT.txt"
+        Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll $out
+        Copy-Item _Build\deps\ffx\FidelityFX-LICENSE.txt "$out\LICENSES\FidelityFX-LICENSE.txt"
         Copy-Item fsr4_shaders "$out\fsr4_shaders" -Recurse
         Copy-Item fsr4_shaders\LICENSE-FSR4-v07.txt "$out\LICENSES\FSR4-v07-LICENSE.txt"
         Copy-Item tools\bb\menu_assets "$out\menu_assets" -Recurse
