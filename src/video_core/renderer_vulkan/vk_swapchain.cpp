@@ -8,6 +8,8 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include <cstdlib>
+#include <string>
 #include "video_core/bb/bb_fg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -230,6 +232,29 @@ void Swapchain::FindPresentMode() {
         LOG_WARNING(Render, "Requested present mode {} is not supported, falling back to {}.",
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
+    }
+    // bb-clean-021-fg: FSR 3 FG paces its own presents (real + generated). Under FIFO the
+    // present of the real frame waited a whole refresh (real fps halved, no gain over FG off):
+    // with FG on, mailbox (else immediate) unless BB_FG_PRESENT=fifo.
+    if (BB::FG::Fsr3Requested() &&
+        (present_mode == vk::PresentModeKHR::eFifo ||
+         present_mode == vk::PresentModeKHR::eFifoRelaxed)) {
+        const char* v = std::getenv("BB_FG_PRESENT");
+        const std::string want = v != nullptr ? v : "";
+        const auto has = [&](vk::PresentModeKHR m) {
+            return std::ranges::find(modes, m) != modes.cend();
+        };
+        vk::PresentModeKHR chosen = present_mode;
+        if (want == "immediate" && has(vk::PresentModeKHR::eImmediate)) {
+            chosen = vk::PresentModeKHR::eImmediate;
+        } else if (want != "fifo") {
+            chosen = has(vk::PresentModeKHR::eMailbox)     ? vk::PresentModeKHR::eMailbox
+                     : has(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
+                                                           : present_mode;
+        }
+        LOG_INFO(Render_Vulkan, "FSR 3 FG: present mode {} (configured {}; BB_FG_PRESENT={})",
+                 vk::to_string(chosen), vk::to_string(present_mode), want.empty() ? "auto" : want);
+        present_mode = chosen;
     }
 }
 

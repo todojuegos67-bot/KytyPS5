@@ -822,6 +822,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                // bb-clean-021-fg: the camera is in the game's 864-byte scene constant block, a
+                // vertex shader's constant buffer (as 1.59 reads it); one float test per buffer.
+                if ((stage.sw_stage == Shader::SwStage::Vertex ||
+                     stage.sw_stage == Shader::SwStage::Fragment) &&
+                    !desc.is_written && size >= 864 &&
+                    size <= 16384 && BB::Upscale::Capture() &&
+                    memory->IsValidMapping(vsharp.base_address, 272)) {
+                    BB::Upscale::OnConstants(reinterpret_cast<const u32*>(vsharp.base_address),
+                                             static_cast<size_t>(size / 4));
+                }
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
