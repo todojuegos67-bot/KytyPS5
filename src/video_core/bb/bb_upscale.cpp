@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -291,6 +292,21 @@ u64 g_cur_area = 0;
 bool g_cur_valid = false;
 Mat g_prev_vp;
 bool g_prev_valid = false;
+u32 g_prev_w = 0, g_prev_h = 0;
+
+// bb-clean-021-taa-cam: every distinct camera block of the frame (its render size, matrix and
+// how many draws bound it). The frame's camera is the one drawn at the scene's size by the most
+// draws; the largest area alone could be a shadow / reflection pass, or flip between two
+// cameras frame to frame, which made clip_to_prev pair two different cameras (smeared vectors).
+struct CamCandidate {
+    u32 w = 0, h = 0;
+    float raw[28]{}; // floats 8-19 and 52-67 as uploaded (identity test)
+    Mat vp;
+    u32 count = 0;
+};
+constexpr u32 kMaxCandidates = 16;
+CamCandidate g_cands[kMaxCandidates];
+u32 g_cand_n = 0;
 
 u32 g_frame_no = 0;
 float g_jitter[2]{};
@@ -668,9 +684,19 @@ void OnConstants(const u32* data, size_t count) {
         d[4] > 16384.0f || d[5] > 16384.0f) {
         return;
     }
-    const u64 area = static_cast<u64>(d[4]) * static_cast<u64>(d[5]);
+    const u32 w = static_cast<u32>(d[4]), h = static_cast<u32>(d[5]);
+    float raw[28];
+    std::memcpy(raw, d + 8, 12 * sizeof(float));
+    std::memcpy(raw + 12, d + 52, 16 * sizeof(float));
     std::scoped_lock lk{g_cam_mutex};
-    if (area <= g_cur_area) {
+    for (u32 i = 0; i < g_cand_n; ++i) {
+        CamCandidate& c = g_cands[i];
+        if (c.w == w && c.h == h && std::memcmp(c.raw, raw, sizeof(raw)) == 0) {
+            ++c.count;
+            return;
+        }
+    }
+    if (g_cand_n >= kMaxCandidates) {
         return;
     }
     Mat view, proj;
@@ -681,10 +707,40 @@ void OnConstants(const u32* data, size_t count) {
     if (!LooksLikeViewProj(vp)) {
         return;
     }
-    g_cur_vp = vp;
+    CamCandidate& c = g_cands[g_cand_n++];
+    c.w = w;
+    c.h = h;
+    std::memcpy(c.raw, raw, sizeof(raw));
+    c.vp = vp;
+    c.count = 1;
     g_cam_taken.fetch_add(1, std::memory_order_relaxed);
-    g_cur_area = area;
-    g_cur_valid = true;
+}
+
+// The frame's camera from the candidates: drawn at the scene size (else the largest area), the
+// most draws among those, the first one on a tie. Called with g_cam_mutex held.
+void PickCamera(u32 scene_w, u32 scene_h, u32& w, u32& h) {
+    const CamCandidate* best = nullptr;
+    bool best_match = false;
+    for (u32 i = 0; i < g_cand_n; ++i) {
+        const CamCandidate& c = g_cands[i];
+        const bool match = c.w == scene_w && c.h == scene_h;
+        if (best == nullptr || (match && !best_match)) {
+            best = &c;
+            best_match = match;
+            continue;
+        }
+        if (match != best_match) continue;
+        const u64 a = u64(c.w) * c.h, b = u64(best->w) * best->h;
+        if (match ? c.count > best->count : (a > b || (a == b && c.count > best->count))) {
+            best = &c;
+        }
+    }
+    if (best != nullptr) {
+        g_cur_vp = best->vp;
+        g_cur_valid = true;
+        w = best->w;
+        h = best->h;
+    }
 }
 
 void Jitter(float& x, float& y) {
@@ -695,8 +751,26 @@ void Jitter(float& x, float& y) {
 Camera EndFrame(u32 flip_w, u32 flip_h) {
     StartupDone();
     Camera cam;
+    static u32 cand_frames = 0, cand_max = 0, size_miss = 0;
     {
         std::scoped_lock lk{g_cam_mutex};
+        u32 cw = 0, ch = 0;
+        PickCamera(flip_w, flip_h, cw, ch);
+        cand_max = std::max(cand_max, g_cand_n);
+        if (g_cur_valid && (cw != flip_w || ch != flip_h)) ++size_miss;
+        if (++cand_frames == 300) {
+            Checkpoint(fmt::format("camera blocks: up to {} distinct per frame, {} of 300 frames "
+                                   "without one at the scene size {}x{}",
+                                   cand_max, size_miss, flip_w, flip_h));
+            cand_frames = cand_max = size_miss = 0;
+        }
+        g_cand_n = 0;
+        // The previous camera only pairs with one of the same pass (same render size).
+        if (g_prev_valid && (cw != g_prev_w || ch != g_prev_h)) {
+            g_prev_valid = false;
+        }
+        g_prev_w = cw;
+        g_prev_h = ch;
         if (g_cur_valid) {
             Mat inv;
             if (Invert(g_cur_vp, inv)) {
