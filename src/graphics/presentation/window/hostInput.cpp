@@ -1076,6 +1076,7 @@ bool KbmProvide(int* x, int* y) {
 		*y = std::clamp(static_cast<int>(std::lround(128.0 + k.out_y * 127.5)), 0, 255);
 	}
 	k.last_x = *x, k.last_y = *y, k.last_ret = ret;
+	Loader::DemonsSoulsCamera::DirectSetStick(*x, *y);
 	return ret;
 }
 
@@ -1150,6 +1151,10 @@ void KbmInit() {
 	     "one stick per game frame, %zu bindings)\n",
 	     g_kbm.sens, g_kbm.expo, g_kbm.adz, g_kbm.decay_ms, g_kbm.smooth_ms, g_kbm.carry_ms, g_kbm.bindings.size());
 	KbmSetupMouse();
+	Loader::DemonsSoulsCamera::DirectSetDegPerCount(static_cast<float>(g_kbm.dpc * g_kbm.sens));
+	if (Loader::DemonsSoulsCamera::DirectInstalled())
+		LOGF("KYTY_KBM: direct mouse camera on: %.3f deg per count (KYTY_KBM_DEG_PER_COUNT %.3f x sens %.2f), no speed cap\n",
+		     g_kbm.dpc * g_kbm.sens, g_kbm.dpc, g_kbm.sens);
 }
 
 void KbmCapture(bool on) {
@@ -1286,6 +1291,7 @@ void HostInputKbmSetLive(float sens_factor, float antidz) {
 	if (!g_kbm.enabled) return;
 	static const float base = g_kbm.sens;
 	if (std::isfinite(sens_factor) && sens_factor > 0.0f) g_kbm.sens = std::clamp(base * sens_factor, 0.05f, 20.0f);
+	Loader::DemonsSoulsCamera::DirectSetDegPerCount(static_cast<float>(g_kbm.dpc * g_kbm.sens));
 	if (std::isfinite(antidz)) g_kbm.adz = std::clamp(antidz, 0.0f, 0.6f);
 }
 
@@ -1308,6 +1314,12 @@ bool HostInputMouseMotion(int dx, int dy) {
 	if (g_kbm.enabled && !g_kbm.captured && !s_first_capture_done && SDL_GetKeyboardFocus() != nullptr) {
 		s_first_capture_done = true;
 		KbmCapture(true);
+	}
+	// (11-10) Direct mouse camera: while the free camera runs, the counts turn it by their angle (no stick, no cap).
+	if (g_kbm.captured && g_kbm.enabled && Loader::DemonsSoulsCamera::DirectTakesMouse()) {
+		Loader::DemonsSoulsCamera::DirectAddMouse(dx, dy);
+		g_kbm.received.fetch_add((std::llabs(dx) + std::llabs(dy)) * KBM_ONE, std::memory_order_relaxed);
+		return true;
 	}
 	if (g_kbm.captured) {
 		g_kbm.acc_x.fetch_add(static_cast<int64_t>(dx) * KBM_ONE, std::memory_order_acq_rel);

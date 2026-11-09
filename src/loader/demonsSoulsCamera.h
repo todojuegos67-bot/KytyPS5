@@ -10,5 +10,14 @@ namespace DemonsSoulsCamera {
 // KYTY_KBM=1 or KYTY_KBM_CALIBRATE=1), 2 no ramp and the yaw at the game's base rate x stick. 0 without keyboard and mouse.
 int  NoRampMode();
 void InstallNoRamp(Program* program);
+// (11-10) Direct mouse camera (KYTY_KBM_DIRECT, default on with KYTY_KBM=1): the mouse turns the free camera by its
+// angle (demonsSoulsCamera.cpp). Wanted: asked for; Installed: the hooks are in; TakesMouse: mouse counts go to
+// DirectAddMouse (the free camera running, the stick signs known) instead of the emulated stick.
+bool DirectWanted();
+bool DirectInstalled();
+bool DirectTakesMouse();
+void DirectAddMouse(int dx, int dy);
+void DirectSetStick(int x, int y);    // the emulated right stick last sent (0..255), to learn the signs
+void DirectSetDegPerCount(float deg); // degrees per mouse count (deg per count * sensitivity)
 } // namespace DemonsSoulsCamera
 } // namespace Loader

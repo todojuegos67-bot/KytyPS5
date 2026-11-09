@@ -2536,7 +2536,7 @@ void Draw(float width, float height) {
 					{
 						float cam = static_cast<float>(s.kbm_camera);
 						if (SliderRow("Velocidad de cámara (ratón)", cam, 5.0f, 15.0f, "%.0f",
-						              "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10. Sin teclado y ratón se usa la del menú del juego."))
+						              "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10. Sin teclado y ratón se usa la del menú del juego. Con el ratón en modo directo (por defecto, KYTY_KBM_DIRECT) ya no limita al ratón: el ratón gira la cámara exactamente su ángulo, sin tope; solo afecta al stick."))
 							s.kbm_camera = std::clamp(static_cast<int>(std::lround(cam)), 5, 15);
 						restart_note(s.kbm_camera != l.kbm_camera);
 					}
@@ -3573,7 +3573,7 @@ void LauncherControls(Settings& s) {
 		const float y   = RowY();
 		float       cam = static_cast<float>(s.kbm_camera);
 		if (LSlider(y, "Velocidad de cámara (ratón)", cam, 5.0f, 15.0f, "%.0f",
-		            "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10.",
+		            "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10. Con el ratón en modo directo (por defecto, KYTY_KBM_DIRECT) ya no limita al ratón: el ratón gira la cámara exactamente su ángulo, sin tope; solo afecta al stick.",
 		            12, 190))
 			s.kbm_camera = std::clamp(static_cast<int>(std::lround(cam)), 5, 15);
 		LCheck(y + U(20), "Cámara instantánea", s.kbm_warp,
