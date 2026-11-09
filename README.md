@@ -243,6 +243,19 @@ The shortest way to a Release build of the emulator (without the Qt launcher):
    The emulator's switches default to the release settings (`src/local/performance-switches.h`;
    `-Set KYTY_NAME=value` changes one); `-DryRun` prints the environment and the command,
    `-Fullscreen`, `-Width`/`-Height` and the others are listed at the top of the script.
+   `-Set KYTY_SPECULATE=4` turns on the parallel translation of the game's command buffers (mode 4,
+   [docs/PARALLEL-TRANSLATION.md](docs/PARALLEL-TRANSLATION.md)). It needs more memory than mode 0:
+   ~3.6 GB more private memory over a long session (a tour of the worlds: 21.1 against 17.5 GB), nearly
+   all of it mimalloc's heap (3.2 GiB committed at the first area). On a PC with less than 28 GB of
+   RAM it stands down at boot and the run stays in mode 0; the log says so. `KYTY_SPECULATE_RAM_GB`
+   moves the threshold (in GiB; 0 lifts the gate). It also stands down on a CPU whose performance cores
+   have fewer logical CPUs than its threads (3 render threads, the 4 workers, the async queue's 2: 9),
+   e.g. 3 performance cores with efficiency cores beside them; naming the workers' CPUs with
+   `KYTY_SPECULATE_CPUS` lifts that check.
+   Windows builds replace `operator new`/`delete` for this: mode 4 allocates from mimalloc, mode 0 from
+   the CRT heap as before (one relaxed load per allocation decides). mimalloc is linked into every
+   Windows build and starts with the process even in mode 0: its loader callbacks run, it reads the
+   `MIMALLOC_*` variables, and it adds a callback per thread start and exit.
    A ZArchive of the folder (`-Game D:\Games\PPSA01341-app0.zar`) works too, read without extracting
    it; `.\build-windows.cmd zarchive_tool` builds the packer, `_Build\windows\3rdparty\zarchive.exe
    <folder> <file.zar>`. A path longer than 260 characters stops it ("Failed to open input file"):

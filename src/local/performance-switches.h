@@ -7,6 +7,7 @@
 #include "local-platform.h"
 #include "mode-toggle.h"
 #include "native-resource-state.h"
+#include "speculation-ram-gate.h"
 #include "spin-gate.h"
 
 #include <array>
@@ -207,6 +208,35 @@ inline void InitializePerformanceSwitches() {
 		}
 		setting.value->store(static_cast<uint32_t>(value), std::memory_order_relaxed);
 		enabled += std::string(enabled.empty() ? "" : " ") + setting.environment + "=" + text;
+	}
+	// KYTY_SPECULATE=4 on a PC with less memory than KYTY_SPECULATE_RAM_GB (default 28 GiB; 0: no gate): mode 4 stands
+	// down and the run stays in mode 0 (speculation-ram-gate.h; main.cpp's heap choice agrees).
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && SpeculationRamGate::StandsDown()) {
+		kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+		std::printf("Speculation: KYTY_SPECULATE=4 stands down: %.1f GiB of physical memory, under the %u GiB it needs "
+		            "(KYTY_SPECULATE_RAM_GB; 0 lifts the gate). This run stays in mode 0.\n",
+		            static_cast<double>(LocalPlatform::PhysicalMemory()) / static_cast<double>(1ull << 30u),
+		            SpeculationRamGate::ThresholdGib());
+		enabled += std::string(enabled.empty() ? "" : " ") + "(KYTY_SPECULATE=4 stood down: memory)";
+	}
+	// KYTY_SPECULATE=4 on a CPU whose performance cores can't hold its threads: the GPU, recording and upload threads, the
+	// workers (KYTY_SPECULATE_THREADS) and the async queue's 2. With 3 performance cores (6 logical CPUs) the default
+	// placement put 4 workers on CPUs the render threads used, and mode 4 lost 6 % at Latria; on the efficiency cores it
+	// lost half (Chenxiao, 9 Nov). Mode 4 stands down and the run stays in mode 0. KYTY_SPECULATE_CPUS (the workers' CPUs
+	// named) lifts the check; the efficiency cores are never taken by default. Not known (Linux): no check.
+	if (const char* named = std::getenv("KYTY_SPECULATE_CPUS");
+	    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && (named == nullptr || *named == '\0')) {
+		const uint32_t cpus    = LocalPlatform::PerformanceLogicalCpus();
+		const uint32_t workers = kyty_local_speculate_threads.load(std::memory_order_relaxed);
+		const uint32_t need    = 3u + workers + 2u;
+		if (cpus != 0 && cpus < need) {
+			kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+			std::printf("Speculation: KYTY_SPECULATE=4 stands down: %u logical CPUs on the performance cores, under the %u its "
+			            "threads need (3 render threads, %u workers, 2 async; KYTY_SPECULATE_CPUS lifts the check). This run "
+			            "stays in mode 0.\n",
+			            cpus, need, workers);
+			enabled += std::string(enabled.empty() ? "" : " ") + "(KYTY_SPECULATE=4 stood down: CPU)";
+		}
 	}
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	// KYTY_TABLE_TARGET_READ, unset or empty: on under KYTY_SPECULATE=4 (every mode-4 measure ran with it; mode 0 measured

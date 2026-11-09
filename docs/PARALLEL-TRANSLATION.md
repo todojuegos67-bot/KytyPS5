@@ -29,6 +29,21 @@ the scout) and mode 4 reads lower; whose time it is there is being read.
 
 ## 2. Every switch of the branch
 
+Mode 4 needs more memory than mode 0: ~3.6 GB more private memory over a long session (a tour of the worlds on 8 Nov:
+21.1 against 17.5 GB), nearly all of it mimalloc's arenas (src/main.cpp: mimalloc is the heap under KYTY_SPECULATE=4).
+At the first area, 20 s in, they hold 3.2 GiB committed of 7 GiB reserved; ~1.3 GiB of that is what the CRT heap holds
+in mode 0. The working set is 1.5 GB above mode 0's there. On a PC with less than KYTY_SPECULATE_RAM_GB (28) GiB of
+RAM, mode 4 stands down at boot (src/local/speculation-ram-gate.h): a 16 or 24 GB PC would sit at the 1.5 GB-left line
+where single black frames start (README).
+
+Mode 4 also stands down at boot on a CPU whose performance cores (the highest efficiency class the process may run on)
+have fewer logical CPUs than its threads: the GPU, recording and upload threads, KYTY_SPECULATE_THREADS workers and the
+async queue's 2, 9 by default (src/local/performance-switches.h). On 3 performance cores (6 logical CPUs) beside
+efficiency cores, the default placement put the workers on the render threads' CPUs and mode 4 read 6 % under mode 0;
+with the workers on the efficiency cores, half. The workers never go to the efficiency cores by default; naming their
+CPUs with KYTY_SPECULATE_CPUS lifts the check. KYTY_SIMULATE_PCORES=<n> stands in for the count (a test). Linux: no
+check (the count is not read there).
+
 The switches this branch adds or whose default it changes (upstream's own switches are not listed). A live switch is
 read once by its first use from the environment variable KYTY_<NAME> (live-switch.h) and can be changed while running
 with the live command `set <name> <value>`. Mode 0 / mode 4: the default under KYTY_SPECULATE=0 / 4; "-" where the
@@ -40,6 +55,8 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | KYTY_SPECULATE (0 or 4) | 4: graphics command buffers translated ahead on worker threads and committed in order | 0 | 4 | |
 | live `mode 0\|4` (live-control.h) | KYTY_SPECULATE's mode changed while the game runs, between submissions; every mode-defaulted switch from one table (local/mode-toggle.h), a variable set wins | - | - | |
 | KYTY_SPECULATE_THREADS (1..12) | the worker threads | - | 4 | |
+| KYTY_SPECULATE_RAM_GB (GiB, 0 = no gate) | KYTY_SPECULATE=4 stands down at boot on a PC with less physical memory; the run stays in mode 0 and the log names the memory and the threshold | - | 28 | |
+| KYTY_SPECULATE_CPUS (a CPU list) | the workers' CPUs; unset: the upper half of the performance cores, and KYTY_SPECULATE=4 stands down at boot where they have fewer logical CPUs than its threads (9 by default; the log names both counts) | - | unset | |
 | KYTY_SPECULATE_ASYNC | the compute queue speculated beside the graphics queue (0: none) | - | 49 | |
 | KYTY_SPECULATE_ASYNC_THREADS | that queue's threads | - | 2 | |
 | KYTY_MIMALLOC (Windows) | the emulator's operator new/delete from mimalloc; fixed at process start from the environment (a boot in mode 0 switched live to 4 keeps the CRT heap, so a heap A/B is two boots) | 0 | 1 | |

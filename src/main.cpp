@@ -11,6 +11,7 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 #include "local-platform.h"
+#include "speculation-ram-gate.h"
 
 #include <atomic>
 #include <charconv>
@@ -36,7 +37,8 @@ static bool KytyMimalloc() noexcept {
 		const char* value = std::getenv("KYTY_MIMALLOC");
 		if (value != nullptr && *value != '\0') return value[0] != '0';
 		const char* mode = std::getenv("KYTY_SPECULATE");
-		return mode != nullptr && mode[0] == '4' && mode[1] == '\0';
+		// (Not when mode 4 stands down for this PC's memory: speculation-ram-gate.h.)
+		return mode != nullptr && mode[0] == '4' && mode[1] == '\0' && !SpeculationRamGate::StandsDown();
 	}();
 	g_kyty_mimalloc.store(use ? 1 : 0, std::memory_order_relaxed);
 	return use;
