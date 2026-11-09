@@ -71,6 +71,11 @@ struct Desc {
     float view_to_clip[16]{};
     float clip_to_prev_clip[16]{};
     bool camera_valid = false;
+    // bb-clean-021-bbport: Supermedo's TAA depth rejection (CameraMotion::TaaDepthParameters):
+    // projection (x, y, z scale, z offset) now and before, and row z of previous view * inverse view.
+    float taa_proj[4]{};
+    float taa_prev_proj[4]{};
+    float taa_prev_z[4]{};
 };
 
 // Before the Vulkan instance: DLSS loads Streamline, whose interposer is then the Vulkan loader.

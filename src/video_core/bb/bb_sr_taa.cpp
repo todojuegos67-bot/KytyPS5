@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bb-clean-021-taa: the emulator's own TAA (BB_UPSCALER=taa), native resolution. Two compute
-// dispatches recorded into the presenter's command buffer (no submit, fence or readback):
-// bb_taa.comp (resolve + history) and bb_taa_sharpen.comp (RCAS-like sharpening to the output).
-// History: two RGBA16F images and two R32F depth images, ping-pong, at the render size.
+// bb-clean-021-bbport: Supermedo's native TAA (BB_UPSCALER=taa), from his Bloodborne port
+// (github.com/Supermedo/bloodborne_pc @115a0299a, GPL-2.0-or-later): TemporalUpscaler::RecordTaa
+// with taa.comp / taa_sharpen.comp unchanged (bb_taa.comp / bb_taa_sharpen.comp). Two RGBA32F
+// ping-pong histories (scene RGB, depth in alpha), depth rejection against the previous camera,
+// colour clip, weight mix(0.98, 0.85, |mv| / 8); RCAS on the resolved scene. Recorded into the
+// caller's command buffer at the upscaler's position (the HUD cut).
+// BB_TAA_VARIANT: Supermedo's optional techniques (his BbToggle bits 51-55, all off by default):
+// 1 tonemapped blend, 2 YCoCg clip, 4 variance clip (with 2), 8 3x3 reconstruction, 16 old rule.
 
 #include <algorithm>
 #include <array>
 #include <span>
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_sr.h"
@@ -35,18 +40,17 @@ vk::Sampler g_nearest{}, g_linear{};
 vk::DescriptorSetLayout g_set[2]{};
 vk::PipelineLayout g_layout[2]{};
 vk::Pipeline g_pipe[2]{};
-Img g_hist[2], g_depth[2];
+Img g_hist[2], g_diag; // RGBA32F histories; the 1x1 unused diagnostic target
 vk::Extent2D g_extent{};
 u32 g_cur = 0;
 bool g_valid = false;
 
-float Feedback() {
-    static const float f = [] {
-        const char* e = std::getenv("BB_TAA_FEEDBACK");
-        return e != nullptr && *e ? std::clamp(static_cast<float>(std::atof(e)), 0.02f, 1.0f)
-                                  : 0.1f;
+u32 Variant() {
+    static const u32 v = [] {
+        const char* e = std::getenv("BB_TAA_VARIANT");
+        return e != nullptr && *e ? static_cast<u32>(std::strtoul(e, nullptr, 0)) & 31u : 0u;
     }();
-    return f;
+    return v;
 }
 
 void Destroy(Img& img) {
@@ -106,7 +110,7 @@ void Barrier(vk::CommandBuffer cmd, vk::Image image, vk::ImageLayout& layout,
     layout = new_layout;
 }
 
-bool MakePipeline(u32 i, std::span<const u32> code, u32 samplers, u32 storages) {
+bool MakePipeline(u32 i, std::span<const u32> code, u32 samplers, u32 storages, u32 push) {
     std::vector<vk::DescriptorSetLayoutBinding> bindings;
     for (u32 b = 0; b < samplers; ++b) {
         bindings.push_back({b, vk::DescriptorType::eCombinedImageSampler, 1,
@@ -123,7 +127,7 @@ bool MakePipeline(u32 i, std::span<const u32> code, u32 samplers, u32 storages) 
     });
     if (lr != vk::Result::eSuccess) return false;
     g_set[i] = l;
-    const vk::PushConstantRange range{vk::ShaderStageFlagBits::eCompute, 0, 32};
+    const vk::PushConstantRange range{vk::ShaderStageFlagBits::eCompute, 0, push};
     auto [pr, pl] = g_device.createPipelineLayout({
         .setLayoutCount = 1,
         .pSetLayouts = &g_set[i],
@@ -175,9 +179,12 @@ void OnDevice(vk::Device device, VmaAllocator allocator) {
     if (s0 != vk::Result::eSuccess || s1 != vk::Result::eSuccess) return;
     g_nearest = n;
     g_linear = l;
-    g_ready = MakePipeline(0, BB_TAA_COMP, 5, 2) && MakePipeline(1, BB_TAA_SHARPEN_COMP, 1, 1);
-    LOG_INFO(Render_Vulkan, "[taa] TAA nativo {}: feedback {:.2f}, sharpness {:.2f}",
-             g_ready ? "ready" : "NOT available", Feedback(), BB::Upscale::LiveSharpness());
+    // taa.comp: 4 samplers, 3 storage images, 64 bytes; taa_sharpen.comp: 2 storage, 4 bytes.
+    g_ready = MakePipeline(0, BB_TAA_COMP, 4, 3, 64) &&
+              MakePipeline(1, BB_TAA_SHARPEN_COMP, 0, 2, 4) &&
+              Create(g_diag, {1, 1}, vk::Format::eR16G16B16A16Sfloat);
+    LOG_INFO(Render_Vulkan, "[taa] Supermedo TAA {}: variant {}, sharpness {:.2f}",
+             g_ready ? "ready" : "NOT available", Variant(), BB::Upscale::LiveSharpness());
 }
 
 bool Ready() {
@@ -195,9 +202,7 @@ bool Evaluate(const Desc& desc) {
         }
         for (u32 i = 0; i < 2; ++i) {
             Destroy(g_hist[i]);
-            Destroy(g_depth[i]);
-            if (!Create(g_hist[i], desc.render, vk::Format::eR16G16B16A16Sfloat) ||
-                !Create(g_depth[i], desc.render, vk::Format::eR32Sfloat)) {
+            if (!Create(g_hist[i], desc.render, vk::Format::eR32G32B32A32Sfloat)) {
                 g_extent = {};
                 return false;
             }
@@ -205,75 +210,96 @@ bool Evaluate(const Desc& desc) {
         g_extent = desc.render;
         reset = true;
     }
-    const u32 prev = g_cur;
-    const u32 cur = g_cur ^ 1u;
-    Img& hp = g_hist[prev];
-    Img& hc = g_hist[cur];
-    Img& dp = g_depth[prev];
-    Img& dc = g_depth[cur];
-    // Undefined history on the first frame: give it a layout (reset ignores its contents).
-    Barrier(cmd, hp.image, hp.layout, vk::ImageLayout::eShaderReadOnlyOptimal);
-    Barrier(cmd, dp.image, dp.layout, vk::ImageLayout::eShaderReadOnlyOptimal);
-    Barrier(cmd, hc.image, hc.layout, vk::ImageLayout::eGeneral);
-    Barrier(cmd, dc.image, dc.layout, vk::ImageLayout::eGeneral);
-
-    struct {
-        u32 size[4];
-        float params[4];
-    } push{};
-    static_assert(sizeof(push) == 32);
-    push.size[0] = desc.render.width;
-    push.size[1] = desc.render.height;
-    push.size[2] = (reset ? 1u : 0u) | (desc.camera_valid ? 2u : 0u) |
-                   (desc.depth_inverted ? 4u : 0u);
-    push.params[0] = desc.jitter[0];
-    push.params[1] = desc.jitter[1];
-    push.params[2] = Feedback();
-    // Strong clamping without the camera (no reprojection: plain history).
-    push.params[3] = desc.camera_valid ? 1.25f : 0.75f;
+    // RecordTaa: history[next] is written, history[1 - next] read (Supermedo's taa_next).
+    const u32 next = g_cur;
+    Img& hr = g_hist[1 - next];
+    Img& hw = g_hist[next];
+    if (reset) {
+        hr.layout = vk::ImageLayout::eUndefined; // undefined history is never sampled on reset
+        hw.layout = vk::ImageLayout::eUndefined;
+    }
+    Barrier(cmd, hr.image, hr.layout, vk::ImageLayout::eGeneral);
+    Barrier(cmd, hw.image, hw.layout, vk::ImageLayout::eGeneral);
+    Barrier(cmd, g_diag.image, g_diag.layout, vk::ImageLayout::eGeneral);
     {
+        const vk::MemoryBarrier2 inputs{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                .pMemoryBarriers = &inputs});
+    }
+    struct Params {
+        float jitter[2];
+        u32 reset, pad;
+        float depth[3][4]; // proj, prev_proj, previous_z
+    } params{};
+    static_assert(sizeof(Params) == 64);
+    params.jitter[0] = desc.jitter[0];
+    params.jitter[1] = desc.jitter[1];
+    params.reset = reset ? 1u : 0u;
+    params.pad = Variant() << 8;
+    std::memcpy(params.depth[0], desc.taa_proj, sizeof(params.depth[0]));
+    std::memcpy(params.depth[1], desc.taa_prev_proj, sizeof(params.depth[1]));
+    std::memcpy(params.depth[2], desc.taa_prev_z, sizeof(params.depth[2]));
+    {
+        // Supermedo's taa_sampler: nearest, clamped to the edge.
         const vk::DescriptorImageInfo i0{g_nearest, desc.color.view, desc.color.layout};
         const vk::DescriptorImageInfo i1{g_nearest, desc.depth.view, desc.depth.layout};
         const vk::DescriptorImageInfo i2{g_nearest, desc.motion.view, desc.motion.layout};
-        const vk::DescriptorImageInfo i3{g_linear, hp.view, vk::ImageLayout::eShaderReadOnlyOptimal};
-        const vk::DescriptorImageInfo i4{g_nearest, dp.view,
-                                         vk::ImageLayout::eShaderReadOnlyOptimal};
-        const vk::DescriptorImageInfo i5{{}, hc.view, vk::ImageLayout::eGeneral};
-        const vk::DescriptorImageInfo i6{{}, dc.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo i3{g_nearest, hr.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo i4{{}, desc.output.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo i5{{}, hw.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo i6{{}, g_diag.view, vk::ImageLayout::eGeneral};
         const std::array writes{Write(0, i0, false), Write(1, i1, false), Write(2, i2, false),
-                                Write(3, i3, false), Write(4, i4, false), Write(5, i5, true),
+                                Write(3, i3, false), Write(4, i4, true), Write(5, i5, true),
                                 Write(6, i6, true)};
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_pipe[0]);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_layout[0], 0, writes);
-        cmd.pushConstants(g_layout[0], vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+        cmd.pushConstants(g_layout[0], vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),
+                          &params);
         cmd.dispatch((desc.render.width + 7) / 8, (desc.render.height + 7) / 8, 1);
     }
-    Barrier(cmd, hc.image, hc.layout, vk::ImageLayout::eShaderReadOnlyOptimal);
-    Barrier(cmd, dc.image, dc.layout, vk::ImageLayout::eShaderReadOnlyOptimal);
-    {
-        push.params[0] = desc.sharpness;
-        const vk::DescriptorImageInfo i0{g_nearest, hc.view,
-                                         vk::ImageLayout::eShaderReadOnlyOptimal};
-        const vk::DescriptorImageInfo i1{{}, desc.output.view, vk::ImageLayout::eGeneral};
-        const std::array writes{Write(0, i0, false), Write(1, i1, true)};
+    const float strength = std::clamp(desc.sharpness, 0.0f, 2.0f);
+    if (strength > 0.0f) {
+        const vk::MemoryBarrier2 resolved{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite};
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                .pMemoryBarriers = &resolved});
+        const vk::DescriptorImageInfo s0{{}, hw.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo s1{{}, desc.output.view, vk::ImageLayout::eGeneral};
+        const std::array writes{Write(0, s0, true), Write(1, s1, true)};
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_pipe[1]);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_layout[1], 0, writes);
-        cmd.pushConstants(g_layout[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+        cmd.pushConstants(g_layout[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(strength),
+                          &strength);
         cmd.dispatch((desc.render.width + 7) / 8, (desc.render.height + 7) / 8, 1);
     }
-    g_cur = cur;
-    g_valid = true;
-    if (reset && desc.reset) {
-        static u32 cuts = 0;
-        if (++cuts <= 20) LOG_INFO(Render_Vulkan, "[taa] history reset (camera cut)");
+    {
+        const vk::MemoryBarrier2 done{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead};
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &done});
     }
+    g_cur = 1 - next;
+    g_valid = true;
     static bool said = false;
     if (!said) {
         said = true;
-        BB::Upscale::Checkpoint(fmt::format(
-            "[taa] first TAA frame {}x{}: camera {}, jitter {:.3f},{:.3f}", desc.render.width,
-            desc.render.height, desc.camera_valid ? "yes (reprojected)" : "no (plain history)",
-            desc.jitter[0], desc.jitter[1]));
+        BB::Upscale::Checkpoint(fmt::format("[taa] first Supermedo TAA frame {}x{}, jitter "
+                                            "{:.3f},{:.3f}, variant {}",
+                                            desc.render.width, desc.render.height,
+                                            desc.jitter[0], desc.jitter[1], Variant()));
     }
     return true;
 }
