@@ -139,6 +139,9 @@ struct RenderExecutor::TableImageSet {
 	// (TableResolveSet tries again after TableImageSet::RetryFrames).
 	bool                  refused = false;
 	static constexpr uint64_t RetryFrames = 300;
+	// KYTY_TABLE_LEARN_PORTABLE=2: a retry that found its program still translating waits for that translation (asked
+	// again at every draw until then, it went pending hundreds of times a retry).
+	std::shared_ptr<const std::atomic<bool>> retry_wait;
 	// A dispatch's words that select another specialization of the pair's program whose table form is the same
 	// (TableInterchangeable: its images of other dimensions or formats): that program and its pipeline, which the set
 	// is made for (null: the pair's).
@@ -842,6 +845,14 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 // specializations), and its images and samplers as the normal path resolves and acquires them (PrepareBindingsInto,
 // RebindImages), in a descriptor set with the page table and the fault buffer. Refused for another specialization,
 // or when an image cannot be held in a set (a target the shader cannot read, or writes as storage).
+// KYTY_TABLE_LEARN_PORTABLE (live table_learn_portable; mode 4: 2, else 0): 1, a set refused for another
+// specialization that only a buffer's V# format makes (one pair's draws with an 8 and an 8_8_8_8 vertex stream) learns
+// that buffer as portable instead; 2, also a retry still pending waits for its translation.
+static int64_t TableLearnPortable() {
+	static auto& value = LiveSwitch::Find("table_learn_portable", 0);
+	return Spec::On() ? value.load(std::memory_order_relaxed) : 0;
+}
+
 RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& buffer, TablePair& pair,
                                                                const TableVariant*       variant,
                                                                const NativeXprDrawState* draw_state,
@@ -887,9 +898,39 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		                                                       buffer.GetUserConfig(), variant->mapping, stages == 2,
 		                                                       vertex_info, pixel_info, true, pair.portable);
 		if (m_context.GetPipelineCache().TablePending()) return nullptr;
-		if (vertex_info.stage.program != pair.programs[0] || (stages == 2 && pixel_info.stage.program != pair.programs[1]))
+		if (vertex_info.stage.program != pair.programs[0] || (stages == 2 && pixel_info.stage.program != pair.programs[1])) {
+			// A format of a buffer's V# alone: the buffers learned as portable, as TableBlocks learns them when it sees a
+			// format change (it never runs for a draw whose set is refused), and the pair compiled again (respecialize,
+			// TableReset) instead of the set refused for RetryFrames, its draws native. (Demon's Souls at the view of
+			// 9 Nov: 11 pairs at spawn; ~38 refused draws a frame gone, s1-10 fps +2.4, settled +2.2.)
+			if (TableLearnPortable() != 0) {
+				bool                      other = false;
+				const ShaderStageRuntime* got[2] {&vertex_info.stage, &pixel_info.stage};
+				std::array<uint32_t, 2>   masks {};
+				for (uint32_t st = 0; st < stages && !other; ++st) {
+					if (got[st]->program == pair.programs[st]) continue;
+					const auto mask = m_context.GetPipelineCache().TableFormatOnlyBuffers(pair.programs[st], got[st]->program);
+					if (mask == UINT32_MAX || mask == 0) {
+						other = true;
+						break;
+					}
+					const auto& buffers = pair.programs[st]->info.buffers;
+					for (uint32_t i = 0; i < 32; ++i)
+						if (((mask >> i) & 1u) != 0 && (i >= buffers.size() || !ShaderRecompiler::IR::RuntimeBufferFormat(buffers[i])))
+							other = true;
+					masks[st] = mask;
+				}
+				if (!other && ((pair.portable[0] | masks[0]) != pair.portable[0] || (pair.portable[1] | masks[1]) != pair.portable[1])) {
+					const auto write = CatalogWrite();
+					pair.portable[0] |= masks[0];
+					pair.portable[1] |= masks[1];
+					pair.respecialize = true;
+					return nullptr; // (no set this draw: the next one compiles the pair again)
+				}
+			}
 			return refuse(vertex_info.stage.program != pair.programs[0] ? "another specialization (VS)"
 			                                                            : "another specialization (PS)");
+		}
 	} else {
 		ResetNativeStageInput(compute_info);
 		compute_info.dispatch_thread_dimensions = pair.compute->dispatch_thread_dimensions;
@@ -1466,8 +1507,19 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 		} else {
 			const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
 			set              = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
-			if (set == nullptr || (set->refused && frame >= set->validated_frame + TableImageSet::RetryFrames))
-				set = TableResolveSet(buffer, pair, variant, draw_state, words);
+			// (KYTY_TABLE_LEARN_PORTABLE=2: a refused set whose retry found its program translating is due once that
+			// translation is done.)
+			const auto retry_due = [&](const TableImageSet& s) {
+				if (s.retry_wait != nullptr && TableLearnPortable() == 2) return s.retry_wait->load(std::memory_order_acquire);
+				return frame >= s.validated_frame + TableImageSet::RetryFrames;
+			};
+			if (set == nullptr || (set->refused && retry_due(*set))) {
+				auto* const retried = set;
+				set                 = TableResolveSet(buffer, pair, variant, draw_state, words);
+				// (A retry that came back pending: the refused set is still the slot's.)
+				if (retried != nullptr && set == nullptr && TableLearnPortable() == 2 && m_context.GetPipelineCache().TablePending())
+					retried->retry_wait = m_context.GetPipelineCache().TableWaiting();
+			}
 		}
 		// (TableResolveSet may have cleared both: a set it replaced.)
 		if (last != nullptr && pair.LastSet(Role()) == last) pair.PreviousSet(Role()) = last;

@@ -4467,6 +4467,34 @@ bool PipelineCache::TakeMaterializationFailure() {
 	return std::exchange(g_materialization_failed, false);
 }
 
+uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got) const {
+	if (want == nullptr || got == nullptr) return UINT32_MAX;
+	const ProgramCache::ProgramKey*  kw = nullptr;
+	const ProgramCache::ProgramKey*  kg = nullptr;
+	const ProgramCache::Permutation* mw = nullptr;
+	const ProgramCache::Permutation* mg = nullptr;
+	for (const auto& [key, entry]: m_program_cache->programs)
+		for (const auto& p: entry.permutations) {
+			if (&p.program == want) mw = &p, kw = &key;
+			if (&p.program == got) mg = &p, kg = &key;
+		}
+	if (mw == nullptr || mg == nullptr || kw != kg || !mw->table_mode || !mg->table_mode ||
+	    mw->program.bindings.push_data_start_dword != mg->program.bindings.push_data_start_dword)
+		return UINT32_MAX;
+	const auto& a = mw->specialization;
+	const auto& b = mg->specialization;
+	if (a.images != b.images || a.buffers.size() != b.buffers.size() || a.buffers.size() > 32) return UINT32_MAX;
+	uint32_t mask = 0;
+	for (size_t i = 0; i < a.buffers.size(); ++i) {
+		const auto& x = a.buffers[i];
+		const auto& y = b.buffers[i];
+		if (x == y) continue;
+		if (x.packed_stride != y.packed_stride || x.byte_base_offset != y.byte_base_offset) return UINT32_MAX;
+		mask |= 1u << i;
+	}
+	return mask;
+}
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,

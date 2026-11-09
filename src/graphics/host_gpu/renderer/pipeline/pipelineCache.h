@@ -268,6 +268,10 @@ public:
 	// The last GetGraphicsPrograms or GetComputeProgram in table mode found a program a worker still translates
 	// (its empty program is no refusal: asked again, it is there).
 	[[nodiscard]] bool TablePending() const;
+	// Two table programs of one source (KYTY_TABLE_LEARN_PORTABLE): the buffers whose specializations differ only in
+	// the V#'s format / swizzle (bits by buffer); UINT32_MAX when anything else differs or either is not a table
+	// permutation here.
+	[[nodiscard]] uint32_t TableFormatOnlyBuffers(const void* want, const void* got) const;
 	// When TablePending: the completion of that translation (set once it is done).
 	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
 	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.
