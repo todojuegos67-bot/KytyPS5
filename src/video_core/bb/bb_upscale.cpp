@@ -140,6 +140,10 @@ Config ParseConfig() {
         c.quality = SR::Quality::Native;
     } else if (up == "fsr4") {
         c.kind = SR::Kind::Fsr4;
+    } else if (up == "fsr4aa" || up == "fsr4native") {
+        // Native TAA through FSR 4 (as dlaa for DLSS): jitter + history at ratio 1, no upscale.
+        c.kind = SR::Kind::Fsr4;
+        c.quality = SR::Quality::Native;
     } else if (up == "xess") {
         c.kind = SR::Kind::Xess;
     } else if (up == "fsr3" || up == "fsr") {
@@ -147,7 +151,7 @@ Config ParseConfig() {
     }
     // (BB_UPSCALER=native or anything else: the stock path, nothing of this module runs.)
     const std::string q = Lower(Env("BB_UPSCALE_MODE"));
-    if (up != "dlaa" && !q.empty()) {
+    if (up != "dlaa" && up != "fsr4aa" && up != "fsr4native" && !q.empty()) {
         if (q == "native" || q == "dlaa" || q == "aa" || q == "nativeaa") {
             c.quality = SR::Quality::Native;
         } else if (q == "quality") {
