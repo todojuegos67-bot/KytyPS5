@@ -1,0 +1,2 @@
+# Applied with git apply: keep the bytes (LF) as committed.
+*.patch -text
