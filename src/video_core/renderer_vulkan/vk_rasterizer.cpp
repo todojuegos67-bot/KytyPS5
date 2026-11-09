@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/renderer_vulkan/bb_ui_composition.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -42,7 +43,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
-      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()}, bb_hud{instance} {
+      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
+      bb_cut{instance, scheduler, runtime, texture_cache} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -198,10 +200,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     PrepareRenderState(pipeline);
+    BbUiDraw(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
-    BbHudStart(pipeline);
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
@@ -213,6 +215,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
+    // bb-clean-021-bbport (Supermedo): screen-space (clip disabled) draws into the upscaler's
+    // output-size images.
+    push_data.xscale *= bb_target_scale[0];
+    push_data.xoffset *= bb_target_scale[0];
+    push_data.yscale *= bb_target_scale[1];
+    push_data.yoffset *= bb_target_scale[1];
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -258,10 +266,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     PrepareRenderState(pipeline);
+    BbUiDraw(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
-    BbHudStart(pipeline);
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
@@ -287,6 +295,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
+    // bb-clean-021-bbport (Supermedo): screen-space (clip disabled) draws into the upscaler's
+    // output-size images.
+    push_data.xscale *= bb_target_scale[0];
+    push_data.xoffset *= bb_target_scale[0];
+    push_data.yscale *= bb_target_scale[1];
+    push_data.yoffset *= bb_target_scale[1];
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -987,8 +1001,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
-                                     image.backing->state.layout);
+            vk::ImageView bb_view = *image_view.image_view;
+            vk::ImageLayout bb_layout = image.backing->state.layout;
+            // bb-clean-021-bbport (Supermedo's RedirectSampled): the display pass reads the
+            // upscaled UI image instead of the render-size UI target.
+            if (BB::Upscale::Enabled() && !is_storage && bb_cut.RedirectsSampled(image_id)) {
+                bb_cut.RedirectSampled(image_id, image_view.info.format, bb_view, bb_layout);
+            }
+            image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
         }
     }
 
@@ -1038,60 +1058,53 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
-void Rasterizer::BbHudStart(const GraphicsPipeline* pipeline) {
-    if (!BB::Upscale::Enabled() || bb_hud.Captured()) {
+void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
+    if (!BB::Upscale::Enabled()) {
         return;
     }
     const auto& regs = liverpool->regs;
-    const u32 scene_w = BB::Upscale::g_scene_w;
-    const u32 scene_h = BB::Upscale::g_scene_h;
-    if (regs.depth_control.depth_enable) {
-        if (db_desc.image_id) {
-            const auto& depth = texture_cache.GetImage(db_desc.image_id);
-            if (depth.info.size.width == scene_w && depth.info.size.height == scene_h) {
-                bb_hud.NoteScene();
-            }
-        }
-        if (bb_hud.SceneSeen() && cb_descs[0].image_id &&
-            bb_hud.IsFlip(texture_cache.GetImage(cb_descs[0].image_id).info.guest_address)) {
-            bb_hud.Reject(BB::HudSplit::DepthOnFlip); // depth test on, into a presented image
-        }
-        return;
+    // Supermedo: the pass copying a finished frame to a display buffer starts the frame (here
+    // once per run of draws into display buffers).
+    const bool display = regs.color_buffers[0] &&
+                         BB::UiCut::IsDisplayBuffer(regs.color_buffers[0].Address());
+    if (display && !bb_display_pass) {
+        bb_cut.OnFrameStart();
     }
-    if (!bb_hud.SceneSeen()) {
-        bb_hud.Reject(BB::HudSplit::NoScene);
-        return;
+    bb_display_pass = display;
+    if (cb_descs[0].image_id) {
+        bb_cut.OnColorTarget(cb_descs[0].image_id);
     }
-    if (!cb_descs[0].image_id || (pipeline->GetGraphicsKey().mrt_mask & 1u) == 0) {
-        bb_hud.Reject(BB::HudSplit::NoTarget);
-        return;
+    if (std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
+        const auto& viewport = regs.viewports[0];
+        bb_cut.OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, cb_descs[0].image_id,
+                      db_desc.image_id,
+                      UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2),
+                      bb_scene_depth);
     }
-    const auto target_id = cb_descs[0].image_id;
-    auto& target = texture_cache.GetImage(target_id);
-    if (target.binding.needs_rebind || target.info.size.width != scene_w ||
-        target.info.size.height != scene_h) {
-        bb_hud.Reject(BB::HudSplit::TargetSize);
-        return;
-    }
-    if (!bb_hud.IsFlip(target.info.guest_address)) {
-        bb_hud.Reject(BB::HudSplit::NotFlip);
-        return;
-    }
-    for (const auto id : bound_images) {
-        const auto& image = texture_cache.GetImage(id);
-        if (id != target_id && !image.binding.is_target && image.info.size.width == scene_w &&
-            image.info.size.height == scene_h) {
-            bb_hud.Reject(BB::HudSplit::SamplesScene);
-            return;
-        }
-    }
-    scheduler.EndRendering();
-    bb_hud.Capture(scheduler.CommandBuffer(), runtime, target);
+}
+
+void Rasterizer::BbUpdateUiTransform() {
+    // Supermedo's UpdateUiTransform: a native viewport (or native window-space UI vertices) must
+    // not be doubled again; the display copy uses the guest render-size coordinates.
+    const auto& regs = liverpool->regs;
+    const auto& viewport = regs.viewports[0];
+    const bool window_space = regs.IsClipDisabled() && !regs.viewport_control.xscale_enable &&
+                              !regs.viewport_control.yscale_enable;
+    bb_target_scale = UiComposition::DrawScale(
+        viewport.xscale * 2, viewport.yscale * 2, window_space, bb_ui_pass.native_ui,
+        bb_ui_pass.guest.first, bb_ui_pass.guest.second, bb_ui_pass.output.first,
+        bb_ui_pass.output.second);
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
+    // bb-clean-021-bbport (Supermedo's BeginRenderingFull): the UI pass and the display pass
+    // drawn into the upscaler's output-size images.
+    BB::UiCut::Target bb_redirect{};
+    bool bb_color_redirected = false, bb_depth_redirected = false;
+    std::pair<u32, u32> bb_guest_extent{1, 1};
+    std::pair<vk::ImageView, vk::ImageLayout> bb_original_color{};
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
     state.width = instance.GetMaxFramebufferWidth();
@@ -1155,6 +1168,15 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.is_clear = is_clear;
 
         image->usage.render_target = 1u;
+        if (cb == 0 && BB::Upscale::Enabled()) {
+            bb_color_redirected = bb_cut.RedirectColor(image_id, desc.view_info, bb_redirect);
+            if (bb_color_redirected) {
+                bb_guest_extent = {image->info.size.width, image->info.size.height};
+                bb_original_color = {attachment.image_view, attachment.image_layout};
+                attachment.image_view = bb_redirect.view;
+                attachment.image_layout = bb_redirect.layout;
+            }
+        }
     }
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
@@ -1171,16 +1193,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             // bb-clean-021: the scene depth (the presented image's size, depth test on): the
             // upscaler's depth and the draws that get the sub-pixel jitter (none without an
             // upscaler: BB_FG alone captures the depth with zero jitter).
-            bb_jitter_draw = regs.depth_control.depth_enable &&
-                             image.info.size.width == BB::Upscale::g_scene_w &&
-                             image.info.size.height == BB::Upscale::g_scene_h;
-            // bb-hudjitter: no jitter once the HUD started (the HUD split captured the scene):
-            // a HUD draw with the depth test on would otherwise shake by the jitter (letters).
-            // (Not applied: the HUD split state can still be set from the previous frame while
-            // this frame's scene draws, which turned off all jitter and the scene depth. Only
-            // counted, to see whether HUD draws get the jitter.)
-            const bool after_hud = bb_jitter_draw && bb_hud.Captured();
-            BB::Upscale::NoteJitterDraw(bb_jitter_draw, after_hud, image.info.size.width,
+            const bool scene_sized = regs.depth_control.depth_enable &&
+                                     image.info.size.width == BB::Upscale::g_scene_w &&
+                                     image.info.size.height == BB::Upscale::g_scene_h;
+            // Supermedo: the UI is not jittered (after the HUD cut).
+            bb_jitter_draw = scene_sized && !bb_cut.UiPhase();
+            BB::Upscale::NoteJitterDraw(bb_jitter_draw, scene_sized && !bb_jitter_draw,
+                                        image.info.size.width,
                                         image.info.size.height);
             if (bb_jitter_draw && regs.depth_control.depth_write_enable) {
                 const auto& vp = regs.viewports[0];
@@ -1248,8 +1267,57 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
 
         image.usage.depth_target = true;
+        if (BB::Upscale::Enabled()) {
+            BB::UiCut::Target depth_redirect{};
+            bb_depth_redirected = bb_cut.RedirectDepth(image_id, depth_redirect);
+            if (bb_depth_redirected) {
+                bb_guest_extent = {image.info.size.width, image.info.size.height};
+                attachment.image_view = depth_redirect.view;
+                attachment.image_layout = depth_redirect.layout;
+                bb_redirect = depth_redirect;
+            }
+        }
     } else {
         state.depth_stencil_attachment = {};
+    }
+
+    // Supermedo: every attachment of such a pass must be redirected; viewports and scissors
+    // are scaled.
+    bb_target_scale = {1.0f, 1.0f};
+    bb_ui_pass.active = false;
+    if (bb_color_redirected || bb_depth_redirected) {
+        u32 color_targets = 0;
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            color_targets += state.color_attachments[cb].image_view ? 1 : 0;
+        }
+        const bool has_depth = bool(db_desc.image_id);
+        if ((color_targets > 0 && !bb_color_redirected) || (has_depth && !bb_depth_redirected) ||
+            color_targets > 1) {
+            static u32 warned = 0;
+            if (warned < 8) {
+                ++warned;
+                BB::Upscale::Checkpoint(fmt::format(
+                    "Upscaler: pass not redirected (color {}, depth {}, {} targets)",
+                    bb_color_redirected ? "yes" : "no", bb_depth_redirected ? "yes" : "no",
+                    state.num_color_attachments));
+            }
+            if (bb_color_redirected) {
+                state.color_attachments[0].image_view = bb_original_color.first;
+                state.color_attachments[0].image_layout = bb_original_color.second;
+            }
+            if (bb_depth_redirected) {
+                auto& depth_image = texture_cache.GetImage(db_desc.image_id);
+                state.depth_stencil_attachment.image_view =
+                    *texture_cache.FindDepthTarget(db_desc.image_id, db_desc.desc).image_view;
+                state.depth_stencil_attachment.image_layout = depth_image.backing->state.layout;
+            }
+        } else {
+            state.width = bb_redirect.width;
+            state.height = bb_redirect.height;
+            bb_ui_pass = {true, bb_redirect.native_ui, bb_guest_extent,
+                          {bb_redirect.width, bb_redirect.height}};
+            BbUpdateUiTransform();
+        }
     }
 
     // Without attachments the area stays at the max framebuffer size. Draws cannot pass the
@@ -1498,16 +1566,17 @@ void Rasterizer::UpdateViewportScissorState() const {
             const auto yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
             const auto yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
 
-            viewport.x = xoffset - xscale;
-            viewport.y = yoffset - yscale;
+            // bb-clean-021-bbport: Supermedo's target_scale (draws into the output-size UI images).
+            viewport.x = (xoffset - xscale) * bb_target_scale[0];
+            viewport.y = (yoffset - yscale) * bb_target_scale[1];
             if (bb_jitter_draw) {
                 float jx = 0.f, jy = 0.f;
                 BB::Upscale::Jitter(jx, jy);
                 viewport.x += jx;
                 viewport.y += jy;
             }
-            viewport.width = xscale * 2.0f;
-            viewport.height = yscale * 2.0f;
+            viewport.width = xscale * 2.0f * bb_target_scale[0];
+            viewport.height = yscale * 2.0f * bb_target_scale[1];
         }
 
         viewports.push_back(viewport);
@@ -1523,10 +1592,22 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y =
                 std::min(vp_scsr.bottom_right_y, s16(regs.viewport_scissors[i].bottom_right_y));
         }
-        scissors.push_back({
-            .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
-            .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
-        });
+        if (bb_target_scale[0] != 1.0f || bb_target_scale[1] != 1.0f) {
+            const auto scale = [](s32 v, float f) { return s32(std::lround(float(v) * f)); };
+            const s32 x0 = scale(vp_scsr.top_left_x, bb_target_scale[0]);
+            const s32 y0 = scale(vp_scsr.top_left_y, bb_target_scale[1]);
+            const s32 x1 = scale(vp_scsr.top_left_x + s32(vp_scsr.GetWidth()), bb_target_scale[0]);
+            const s32 y1 = scale(vp_scsr.top_left_y + s32(vp_scsr.GetHeight()), bb_target_scale[1]);
+            scissors.push_back({
+                .offset = {x0, y0},
+                .extent = {u32(std::max(x1 - x0, 0)), u32(std::max(y1 - y0, 0))},
+            });
+        } else {
+            scissors.push_back({
+                .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
+                .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
+            });
+        }
     }
 
     if (viewports.empty()) {

@@ -32,6 +32,11 @@ public:
     bool AcquireNextImage();
 
     /// Presents the current image and move to the next one
+    // bb-clean-021-bbport: FIFO / FIFO relaxed (each present waits for the display).
+    [[nodiscard]] bool IsFifo() const {
+        return present_mode == vk::PresentModeKHR::eFifo ||
+               present_mode == vk::PresentModeKHR::eFifoRelaxed;
+    }
     bool Present();
 
     vk::SurfaceKHR GetSurface() const {

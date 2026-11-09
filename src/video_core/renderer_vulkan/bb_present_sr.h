@@ -34,9 +34,12 @@ public:
     // stock). `cmd` must be outside a render pass.
     vk::ImageView Run(vk::CommandBuffer cmd, VideoCore::TextureCache& texture_cache,
                       Vulkan::Runtime& runtime, VideoCore::Image& flip, vk::ImageView flip_view,
-                      vk::ImageView full_view,
                       vk::Extent2D in, vk::Extent2D out, SceneDepth& depth, bool srgb_decode,
-                      BB::FG::Inputs* fg = nullptr);
+                      BB::FG::Inputs* fg = nullptr, VideoCore::ImageId* depth_id = nullptr);
+    // The image behind Run's returned view (RGBA16F, SHADER_READ_ONLY_OPTIMAL after Run).
+    [[nodiscard]] vk::Image OutputImage() const {
+        return output.image;
+    }
 
     // Timestamps: begin of a frame's GPU work, its end (once per frame, around the flip).
     void FrameBegin(vk::CommandBuffer cmd);
@@ -88,80 +91,6 @@ private:
     bool slot_sr[Slots]{};
     u32 frames = 0;
     vk::Extent2D last_in{}, last_out{};
-};
-
-// The HUD split: the first draw into the presented image after the scene that samples no
-// scene-sized image starts the HUD. The scene is copied before that draw; the upscaler runs on the
-// copy and the HUD (the presented image minus the copy, at the render size) is added back after
-// it, so the temporal upscaler never sees the HUD (no trail). A frame without a HUD start is
-// upscaled as before.
-class HudSplit {
-public:
-    explicit HudSplit(const Vulkan::Instance& instance);
-    ~HudSplit();
-
-    [[nodiscard]] bool IsFlip(VAddr guest) const;
-    // bb-hudless: why a candidate draw did not start the HUD (counted, logged every 300 frames).
-    enum Reason : u32 { NoScene, NoTarget, TargetSize, NotFlip, SamplesScene, DepthOnFlip, ReasonCount };
-    void Reject(Reason r) {
-        ++rejects[r];
-    }
-    void NoteScene() {
-        scene_seen = true;
-    }
-    [[nodiscard]] bool SceneSeen() const {
-        return scene_seen;
-    }
-    [[nodiscard]] bool Captured() const {
-        return captured;
-    }
-    [[nodiscard]] VAddr CapturedAddr() const {
-        return captured_addr;
-    }
-    [[nodiscard]] vk::ImageView SceneView() const {
-        return scene.view;
-    }
-
-    // Copies `flip` (the presented image, its contents up to this draw) into the scene copy.
-    // Outside a render pass: `cmd` is the draw's command buffer.
-    bool Capture(vk::CommandBuffer cmd, Vulkan::Runtime& runtime, VideoCore::Image& flip);
-    // The HUD added to the upscaled scene; a null view when it cannot be done.
-    vk::ImageView Composite(vk::CommandBuffer cmd, vk::ImageView flip_view,
-                            vk::ImageView upscaled, vk::Extent2D in, vk::Extent2D out,
-                            bool srgb_decode);
-    // The presenter's flip: records it as a presented image and ends the frame's HUD state.
-    void EndFrame(VAddr presented);
-
-private:
-    u64 rejects[ReasonCount]{};
-    u32 log_frames = 0, log_captured = 0;
-    struct OwnImage {
-        vk::Image image{};
-        vk::ImageView view{};
-        VmaAllocation allocation{};
-        vk::Extent2D extent{};
-        vk::Format format{};
-        vk::ImageLayout layout = vk::ImageLayout::eUndefined;
-    };
-    bool Ensure(OwnImage& img, vk::Extent2D extent, vk::Format format,
-                vk::ImageUsageFlags usage);
-    void Destroy(OwnImage& img);
-    void Barrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout);
-    bool Init();
-
-    const Vulkan::Instance& instance;
-    bool init_tried = false, init_ok = false;
-    vk::Sampler sampler{};
-    vk::DescriptorSetLayout set_layout{};
-    vk::PipelineLayout layout{};
-    vk::Pipeline pipeline{};
-    OwnImage scene, output;
-    bool scene_seen = false;
-    bool captured = false;
-    VAddr captured_addr = 0;
-    static constexpr u32 FlipSlots = 4;
-    VAddr flips[FlipSlots]{};
-    u32 next_flip = 0;
 };
 
 } // namespace BB

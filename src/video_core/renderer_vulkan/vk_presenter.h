@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include "video_core/renderer_vulkan/bb_present_sr.h"
 
@@ -47,6 +49,18 @@ struct Frame {
     vk::ImageView hudless_view{};
     u32 hudless_width = 0, hudless_height = 0;
     vk::Format hudless_format = vk::Format::eUndefined;
+    // bb-clean-021-bbport: DLSS Frame Generation (Supermedo's Frame::generated): the frames shown
+    // before this one, storage images of its size; and this frame's UNORM view for NGX.
+    struct Generated {
+        vk::Image image{};
+        VmaAllocation allocation{};
+        vk::ImageView view{}; // UNORM (storage)
+        vk::Format format = vk::Format::eUndefined;
+    };
+    std::array<Generated, 3> generated{};
+    u32 generated_count = 0;
+    vk::ImageView unorm_view{};
+    vk::Format unorm_format = vk::Format::eUndefined;
 
     ImTextureID imgui_texture;
 };
@@ -140,6 +154,25 @@ private:
     std::unique_ptr<BB::PresentSr> bb_sr; // bb-clean-021: DLSS / FSR 4 (null when off)
     double bb_wait_ms = 0.0;
     std::chrono::steady_clock::time_point bb_last_flip{};
+    // bb-clean-021-bbport: Supermedo's frame generation present loop (Present, EnsureGenerated,
+    // UpdateFrameGenLimit) for DLSS-G.
+    u32 BbEnsureGenerated(Frame* frame, u32 count);
+    void BbDestroyGenerated(Frame* frame, u32 from = 0);
+    void BbUpdateFrameGenLimit(bool wanted, double present_ms);
+    bool BbPresentGenerated(Frame* frame, u32 index, bool first);
+    std::atomic<double> bb_game_frame_ms{16.6};
+    std::chrono::steady_clock::time_point bb_last_game_present{};
+    std::atomic<u32> bb_frame_gen_limit{3};
+    std::chrono::steady_clock::time_point bb_limit_window{};
+    u32 bb_limit_frames = 0, bb_limit_up_seconds = 0;
+    double bb_present_busy = 0.0;
+    std::chrono::steady_clock::time_point bb_frame_gen_hold_until{};
+    int bb_frame_gen_hold_seconds = 0;
+    // The one-line-per-second log (bb-clean-021-bbport): HUD cut, HUD-less copy, DLSS-G frames.
+    std::atomic<u32> bb_sec_cut{0}, bb_sec_hudless{0}, bb_sec_hudless_failed{0};
+    std::atomic<u32> bb_sec_game{0}, bb_sec_generated_made{0}, bb_sec_generated_shown{0},
+        bb_sec_presents{0};
+    std::chrono::steady_clock::time_point bb_sec_start{};
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;

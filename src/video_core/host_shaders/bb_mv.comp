@@ -9,8 +9,6 @@ layout(binding = 0) uniform sampler2D depth_tex;
 layout(binding = 1, rg16f) uniform writeonly image2D mv_out;
 layout(binding = 2) uniform sampler2D color_tex;
 layout(binding = 3, rgba16f) uniform writeonly image2D color_out;
-// bb-hudmv: the presented image with the HUD (the scene copy is color_tex when the HUD split is on).
-layout(binding = 4) uniform sampler2D full_tex;
 layout(push_constant) uniform Push {
     vec4 r0;
     vec4 r1;
@@ -18,7 +16,7 @@ layout(push_constant) uniform Push {
     vec4 r3;
     vec4 vp_xy; // previous projection: x scale, y scale, z scale, z offset
     vec4 vp_z;  // (unused), (unused), jitter x, jitter y
-    uvec4 size; // width, height, camera valid, flags: bit 0 decode sRGB, bit 1 HUD mask
+    uvec4 size; // width, height, camera valid, flags: bit 0 decode sRGB
 } p;
 
 vec3 SrgbToLinear(vec3 c) {
@@ -36,16 +34,6 @@ void main() {
     }
     imageStore(color_out, c, vec4(col, 1.0));
 
-    // HUD (bb-hudmv): only where the HUD is clearly drawn over the scene (the presented image
-    // differs from the scene copy by more than 0.1 in a channel; no dilation over the scene).
-    // The HUD is fixed on screen: zero motion. Frame generation gets the HUD-less colour too.
-    if ((p.size.w & 2u) != 0u) {
-        vec3 dif = abs(texelFetch(full_tex, c, 0).rgb - texelFetch(color_tex, c, 0).rgb);
-        if (max(dif.r, max(dif.g, dif.b)) > 0.1) {
-            imageStore(mv_out, c, vec4(0.0));
-            return;
-        }
-    }
     // bb-clean-021-bbport: Supermedo's camera_motion.comp (GPL-2.0-or-later): r0..r2 = previous
     // view * inverse current view (3x4 rows), r3 = current projection (x, y, z scale, z offset),
     // vp_xy = previous projection, vp_z.zw = the jitter (render pixels, x right, y down).

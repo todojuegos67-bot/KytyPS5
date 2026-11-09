@@ -106,6 +106,36 @@ jobs:
           '{0,12:N0}  {1}  {2} {3}' -f $f.Length, $f.Name, $sig.Status, $signer
           if ($signer -ne 'NVIDIA Corporation') { throw "$($f.Name) is not signed by NVIDIA Corporation" }
         }
+    # bb-clean-021-bbport: DLSS Frame Generation through NGX directly (Supermedo's path):
+    # bbport_dlss.dll, tools/bb/dlss_bridge (MIT, from IFreemz's shadps4_dlss bridge), built with
+    # MSVC against the NVIDIA DLSS SDK's headers and static NGX library (not shipped). The
+    # package's nvngx_dlssg.dll is Streamline's / DLSS v310.9.16's (the step above).
+    - name: DLSS bridge (NGX)
+      shell: pwsh
+      run: |
+        git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS _Build\deps\dlss-sdk
+        if ($LASTEXITCODE) { throw 'DLSS SDK clone failed' }
+        git -C _Build\deps\dlss-sdk sparse-checkout set --no-cone /include /lib/Windows_x86_64/x64 /LICENSE.txt
+        if ($LASTEXITCODE) { throw 'DLSS SDK sparse checkout failed' }
+        Get-ChildItem _Build\deps\dlss-sdk\include | ForEach-Object { $_.Name }
+        foreach ($f in @('include\nvsdk_ngx_vk.h', 'include\nvsdk_ngx_helpers_dlssg_vk.h', 'lib\Windows_x86_64\x64\nvsdk_ngx_s.lib')) {
+          if (!(Test-Path "_Build\deps\dlss-sdk\$f")) { throw "DLSS SDK: no $f" }
+        }
+        $sdk = (Resolve-Path _Build\deps\dlss-sdk).Path
+        $vkinc = (Resolve-Path externals\vulkan-headers\include).Path
+        $configured = $false
+        foreach ($gen in @('Visual Studio 18 2026', 'Visual Studio 17 2022')) {
+          cmake -S tools\bb\dlss_bridge -B _Build\dlss-bridge -G $gen -A x64 "-DDLSS_SDK_ROOT=$sdk" "-DVULKAN_INCLUDE=$vkinc"
+          if (!$LASTEXITCODE) { $configured = $true; break }
+          Remove-Item -Recurse -Force _Build\dlss-bridge -ErrorAction SilentlyContinue
+        }
+        if (!$configured) { throw 'DLSS bridge configure failed' }
+        cmake --build _Build\dlss-bridge --config Release -- /v:minimal
+        if ($LASTEXITCODE) { throw 'DLSS bridge build failed' }
+        $dll = Get-ChildItem _Build\dlss-bridge -Recurse -Filter bbport_dlss.dll | Select-Object -First 1
+        if (!$dll) { throw 'bbport_dlss.dll not built' }
+        Copy-Item $dll.FullName _Build\deps\bbport_dlss.dll
+        '{0,12:N0}  bbport_dlss.dll  md5 {1}' -f $dll.Length, (Get-FileHash -Algorithm MD5 $dll.FullName).Hash.ToLower()
     - name: XeSS SDK
       shell: pwsh
       env:
@@ -138,6 +168,8 @@ jobs:
         Copy-Item LICENSES\Streamline-MIT.txt "$out\LICENSES\Streamline-MIT.txt"
         Copy-Item LICENSES\FoveatedDLSS5-RenoDX-MIT.txt "$out\LICENSES\FoveatedDLSS5-RenoDX-MIT.txt"
         Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll $out
+        Copy-Item _Build\deps\bbport_dlss.dll $out
+        Copy-Item tools\bb\dlss_bridge\LICENSE.txt "$out\LICENSES\bbport_dlss-MIT.txt"
         Copy-Item _Build\deps\xess\bin\libxess.dll $out
         Copy-Item _Build\deps\xess\LICENSE.txt "$out\LICENSES\XeSS-LICENSE.txt"
         Copy-Item _Build\deps\ffx\FidelityFX-LICENSE.txt "$out\LICENSES\FidelityFX-LICENSE.txt"

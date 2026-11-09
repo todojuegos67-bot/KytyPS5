@@ -1202,11 +1202,15 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.cpp
                src/video_core/renderer_vulkan/bb_present_sr.cpp
                src/video_core/renderer_vulkan/bb_present_sr.h
+               src/video_core/renderer_vulkan/bb_ui_cut.cpp
+               src/video_core/renderer_vulkan/bb_ui_cut.h
+               src/video_core/renderer_vulkan/bb_ui_composition.h
                src/video_core/bb/bb_dlss5.cpp
                src/video_core/bb/bb_dlss5.h
                src/video_core/bb/bb_fg.cpp
                src/video_core/bb/bb_fg.h
                src/video_core/bb/bb_fg_fsr3.cpp
+               src/video_core/bb/bb_fg_dlssg.cpp
                src/video_core/bb/bb_fg_internal.h
                src/video_core/bb/bb_kyty_compat.h
                src/video_core/bb/bb_sr.h

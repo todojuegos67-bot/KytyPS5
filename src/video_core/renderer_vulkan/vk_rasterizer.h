@@ -4,6 +4,7 @@
 #pragma once
 
 #include "video_core/renderer_vulkan/bb_present_sr.h"
+#include "video_core/renderer_vulkan/bb_ui_cut.h"
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -129,7 +130,11 @@ private:
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
     void ResetBindings(bool is_compute);
-    void BbHudStart(const GraphicsPipeline* pipeline);
+    // bb-clean-021-bbport: Supermedo's HUD cut (bb_ui_cut.h): his OnFrameStart / OnColorTarget /
+    // OnDraw before the draw's resources are bound.
+    void BbUiDraw(const GraphicsPipeline* pipeline);
+    // Supermedo's UpdateUiTransform: the scale of a draw into the output-size UI images.
+    void BbUpdateUiTransform();
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -163,7 +168,16 @@ private:
 
 public:
     BB::SceneDepth bb_scene_depth; // bb-clean-021 (bb_present_sr.h)
-    BB::HudSplit bb_hud;
+    BB::UiCut bb_cut;
+
+private:
+    // A pass drawn into the upscaler's output-size images (Supermedo's ui_pass / target_scale).
+    struct {
+        bool active = false, native_ui = false;
+        std::pair<u32, u32> guest{1, 1}, output{1, 1};
+    } bb_ui_pass;
+    mutable std::array<float, 2> bb_target_scale{1.0f, 1.0f};
+    bool bb_display_pass = false; // the previous draw went into a display buffer
 
 private:
 

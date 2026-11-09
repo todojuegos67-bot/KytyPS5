@@ -236,7 +236,9 @@ void Swapchain::FindPresentMode() {
     // bb-clean-021-fg: FSR 3 FG paces its own presents (real + generated). Under FIFO the
     // present of the real frame waited a whole refresh (real fps halved, no gain over FG off):
     // with FG on, mailbox (else immediate) unless BB_FG_PRESENT=fifo.
-    if (BB::FG::Fsr3Requested() &&
+    // bb-clean-021-bbport: DLSS-G presents its generated frames itself (Supermedo's loop): the
+    // same choice.
+    if ((BB::FG::Fsr3Requested() || BB::FG::Dlss::Requested()) &&
         (present_mode == vk::PresentModeKHR::eFifo ||
          present_mode == vk::PresentModeKHR::eFifoRelaxed)) {
         const char* v = std::getenv("BB_FG_PRESENT");
@@ -252,7 +254,7 @@ void Swapchain::FindPresentMode() {
                      : has(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
                                                            : present_mode;
         }
-        LOG_INFO(Render_Vulkan, "FSR 3 FG: present mode {} (configured {}; BB_FG_PRESENT={})",
+        LOG_INFO(Render_Vulkan, "Frame generation: present mode {} (configured {}; BB_FG_PRESENT={})",
                  vk::to_string(chosen), vk::to_string(present_mode), want.empty() ? "auto" : want);
         present_mode = chosen;
     }
@@ -274,6 +276,11 @@ void Swapchain::SetSurfaceProperties() {
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
     image_count = capabilities.minImageCount + 1;
+    // bb-clean-021-bbport (Supermedo): frame generation presents several images per game frame:
+    // one more for them.
+    if (BB::FG::Dlss::Requested()) {
+        ++image_count;
+    }
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

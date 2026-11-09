@@ -411,6 +411,9 @@ bool Instance::CreateDevice() {
         std::vector<const char*> fg_extensions(enabled_extensions.begin(),
                                                enabled_extensions.end());
         BB::FG::AddDeviceExtensions(available_extensions, fg_extensions);
+        // bb-clean-021-bbport: NGX's for DLSS Frame Generation (Supermedo's bridge).
+        BB::FG::Dlss::AddDeviceExtensions(*instance, physical_device, available_extensions,
+                                          fg_extensions);
         for (std::size_t i = enabled_extensions.size(); i < fg_extensions.size(); ++i) {
             LOG_INFO(Render_Vulkan, "Enabling extension: {} (frame generation)", fg_extensions[i]);
             enabled_extensions.push_back(fg_extensions[i]);
@@ -715,6 +718,7 @@ bool Instance::CreateDevice() {
     }
     BB::FG::OnDevice(physical_device, *device, queue_family_index, graphics_queue, fg_queues,
                      &Scheduler::submit_mutex);
+    BB::FG::Dlss::OnDevice(*instance, physical_device, *device);
     return true;
 }
 

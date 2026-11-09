@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include <algorithm>
 #include <filesystem>
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_upscale.h"
 
 #ifdef __APPLE__
@@ -312,6 +313,25 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         }
         for (const auto& name : extra) {
             extensions.push_back(name.c_str());
+        }
+    }
+
+    if (BB::FG::Dlss::Requested()) {
+        // bb-clean-021-bbport: what NGX asks for DLSS Frame Generation (the bridge's query).
+        std::vector<std::string> available;
+        if (const auto [r, props] = vk::enumerateInstanceExtensionProperties();
+            r == vk::Result::eSuccess) {
+            for (const auto& p : props) available.emplace_back(p.extensionName.data());
+        }
+        static std::vector<std::string> ngx_names;
+        std::vector<const char*> list(extensions.begin(), extensions.end());
+        BB::FG::Dlss::AddInstanceExtensions(available, list);
+        for (std::size_t i = extensions.size(); i < list.size(); ++i) ngx_names.emplace_back(list[i]);
+        for (std::size_t i = 0; i < ngx_names.size(); ++i) {
+            if (std::none_of(extensions.begin(), extensions.end(),
+                             [&](const char* e) { return ngx_names[i] == e; })) {
+                extensions.push_back(ngx_names[i].c_str());
+            }
         }
     }
 
