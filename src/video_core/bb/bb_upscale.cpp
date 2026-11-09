@@ -293,6 +293,8 @@ bool g_cur_valid = false;
 Mat g_prev_vp;
 bool g_prev_valid = false;
 u32 g_prev_w = 0, g_prev_h = 0;
+// bb-mvstats: the picked camera's view matrix (raw, row-major 3x4) for the camera position delta.
+float g_cur_view[12]{}, g_prev_view[12]{};
 
 // bb-clean-021-taa-cam: every distinct camera block of the frame (its render size, matrix and
 // how many draws bound it). The frame's camera is the one drawn at the scene's size by the most
@@ -309,7 +311,7 @@ CamCandidate g_cands[kMaxCandidates];
 u32 g_cand_n = 0;
 
 struct MvStats {
-    double max = 0, mean_sum = 0, yaw_max = 0, yaw_sum = 0;
+    double max = 0, mean_sum = 0, yaw_max = 0, yaw_sum = 0, pos_max = 0, pos_sum = 0;
     u32 frames = 0, resets = 0, no_prev = 0, same = 0;
     std::chrono::steady_clock::time_point start{};
 } g_mvs;
@@ -737,6 +739,7 @@ void PickCamera(u32 scene_w, u32 scene_h, u32& w, u32& h) {
     }
     if (best != nullptr) {
         g_cur_vp = best->vp;
+        std::memcpy(g_cur_view, best->raw, sizeof(g_cur_view));
         g_cur_valid = true;
         w = best->w;
         h = best->h;
@@ -840,6 +843,25 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
                     if (dyaw < -180) dyaw += 360;
                     cam.reset = mv_mean > 0.4 * flip_w;
                 }
+                // Camera centre from the view (world -> camera): C = -R^T t; its move per frame.
+                if (g_prev_valid) {
+                    double c[3], q[3];
+                    const auto centre = [](const float* v, double* out) {
+                        for (int col = 0; col < 3; ++col) {
+                            out[col] = -(v[0 + col] * v[3] + v[4 + col] * v[7] + v[8 + col] * v[11]);
+                        }
+                    };
+                    centre(g_cur_view, c);
+                    centre(g_prev_view, q);
+                    const double d = std::sqrt((c[0] - q[0]) * (c[0] - q[0]) +
+                                               (c[1] - q[1]) * (c[1] - q[1]) +
+                                               (c[2] - q[2]) * (c[2] - q[2]));
+                    if (std::isfinite(d)) {
+                        g_mvs.pos_max = std::max(g_mvs.pos_max, d);
+                        g_mvs.pos_sum += d;
+                    }
+                }
+                std::memcpy(g_prev_view, g_cur_view, sizeof(g_prev_view));
                 g_mvs.max = std::max(g_mvs.max, mv_max);
                 g_mvs.mean_sum += mv_mean;
                 g_mvs.yaw_max = std::max(g_mvs.yaw_max, std::fabs(dyaw));
@@ -867,10 +889,11 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
             const double n = g_mvs.frames ? g_mvs.frames : 1;
             Checkpoint(fmt::format(
                 "[mv-cam] 1 s: {} frames with camera, vector px max {:.1f} mean {:.2f} (9x9 grid, "
-                "far / mid depth), yaw delta deg/frame max {:.2f} mean {:.2f}, resets {}, no "
-                "previous camera {}, previous == current {}",
+                "far / mid depth), yaw delta deg/frame max {:.2f} mean {:.2f}, camera move units/"
+                "frame max {:.3f} mean {:.3f}, resets {}, no previous camera {}, previous == "
+                "current {}",
                 g_mvs.frames, g_mvs.max, g_mvs.mean_sum / n, g_mvs.yaw_max, g_mvs.yaw_sum / n,
-                g_mvs.resets, g_mvs.no_prev, g_mvs.same));
+                g_mvs.pos_max, g_mvs.pos_sum / n, g_mvs.resets, g_mvs.no_prev, g_mvs.same));
             g_mvs = {};
             g_mvs.start = now;
         }
