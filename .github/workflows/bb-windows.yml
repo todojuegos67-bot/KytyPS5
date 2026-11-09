@@ -106,6 +106,14 @@ jobs:
           '{0,12:N0}  {1}  {2} {3}' -f $f.Length, $f.Name, $sig.Status, $signer
           if ($signer -ne 'NVIDIA Corporation') { throw "$($f.Name) is not signed by NVIDIA Corporation" }
         }
+    - name: XeSS SDK
+      shell: pwsh
+      env:
+        XESS_VERSION: v3.0.2
+      run: |
+        git clone --depth 1 --branch $env:XESS_VERSION https://github.com/intel/xess _Build\deps\xess
+        if ($LASTEXITCODE) { throw 'XeSS clone failed' }
+        if (!(Test-Path _Build\deps\xess\inc\xess\xess_vk.h) -or !(Test-Path _Build\deps\xess\bin\libxess.dll)) { throw 'no xess_vk.h or libxess.dll' }
     - name: Configure
       run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
     - name: Build
@@ -130,6 +138,8 @@ jobs:
         Copy-Item LICENSES\Streamline-MIT.txt "$out\LICENSES\Streamline-MIT.txt"
         Copy-Item LICENSES\FoveatedDLSS5-RenoDX-MIT.txt "$out\LICENSES\FoveatedDLSS5-RenoDX-MIT.txt"
         Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll $out
+        Copy-Item _Build\deps\xess\bin\libxess.dll $out
+        Copy-Item _Build\deps\xess\LICENSE.txt "$out\LICENSES\XeSS-LICENSE.txt"
         Copy-Item _Build\deps\ffx\FidelityFX-LICENSE.txt "$out\LICENSES\FidelityFX-LICENSE.txt"
         Copy-Item fsr4_shaders "$out\fsr4_shaders" -Recurse
         Copy-Item fsr4_shaders\LICENSE-FSR4-v07.txt "$out\LICENSES\FSR4-v07-LICENSE.txt"

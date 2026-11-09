@@ -140,6 +140,10 @@ Config ParseConfig() {
         c.quality = SR::Quality::Native;
     } else if (up == "fsr4") {
         c.kind = SR::Kind::Fsr4;
+    } else if (up == "xess") {
+        c.kind = SR::Kind::Xess;
+    } else if (up == "fsr3" || up == "fsr") {
+        c.kind = SR::Kind::Fsr3;
     }
     // (BB_UPSCALER=native or anything else: the stock path, nothing of this module runs.)
     const std::string q = Lower(Env("BB_UPSCALE_MODE"));
@@ -413,6 +417,10 @@ void PreInstance() {
         if (!SR::Dlss::Preload()) {
             Checkpoint("DLSS: Streamline not loaded: DLSS off, the game runs native");
         }
+    } else if (c.kind == SR::Kind::Xess) {
+        SR::Xess::Load();
+    } else if (c.kind == SR::Kind::Fsr3) {
+        SR::Fsr3::Load();
     }
 }
 
@@ -448,6 +456,14 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
     }
     if (Cfg().kind == SR::Kind::Fsr4) {
         SR::Fsr4::AddDeviceExtensions(available, extensions);
+    }
+    if (Cfg().kind == SR::Kind::Fsr3) {
+        // The FidelityFX backend calls vkGetBufferMemoryRequirements2KHR by the extension's name.
+        add(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+        add(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+    }
+    if (Cfg().kind == SR::Kind::Xess) {
+        SR::Xess::AddDeviceExtensions(instance, physical, available, extensions);
     }
     // DLSS 5 (bb_dlss5.h, from 1.59): NGX's vendor extensions, only with BB_DLSS5 1..3.
     Dlss5::AddDeviceExtensions(physical, available, extensions);
@@ -526,6 +542,9 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
     if (Cfg().kind == SR::Kind::Fsr4) {
         return SR::Fsr4::ChainDeviceFeatures(physical, extensions, f12, f13, f, next);
     }
+    if (Cfg().kind == SR::Kind::Xess) {
+        return SR::Xess::ChainDeviceFeatures(extensions, next);
+    }
     return next;
 }
 
@@ -538,6 +557,12 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
         break;
     case SR::Kind::Fsr4:
         SR::Fsr4::OnDevice(instance, physical, device, allocator, queue, family);
+        break;
+    case SR::Kind::Xess:
+        SR::Xess::OnDevice(instance, physical, device);
+        break;
+    case SR::Kind::Fsr3:
+        SR::Fsr3::OnDevice(physical, device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
         break;
     default:
         return;
@@ -556,6 +581,10 @@ bool BackendReady() {
     case SR::Kind::Fsr4:
         if (fsr4 < 0) fsr4 = SR::Fsr4::Ready() ? 1 : 0;
         return fsr4 == 1;
+    case SR::Kind::Xess:
+        return SR::Xess::Ready();
+    case SR::Kind::Fsr3:
+        return SR::Fsr3::Ready();
     default:
         return false;
     }
@@ -577,6 +606,12 @@ bool RunBackend(const SR::Desc& desc) {
         break;
     case SR::Kind::Fsr4:
         ok = SR::Fsr4::Evaluate(desc);
+        break;
+    case SR::Kind::Xess:
+        ok = SR::Xess::Evaluate(desc);
+        break;
+    case SR::Kind::Fsr3:
+        ok = SR::Fsr3::Evaluate(desc);
         break;
     default:
         return false;
