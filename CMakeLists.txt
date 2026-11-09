@@ -1213,6 +1213,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_sr_dlss.cpp
                src/video_core/bb/bb_sr_fsr3.cpp
                src/video_core/bb/bb_sr_xess.cpp
+               src/video_core/bb/bb_sr_taa.cpp
                src/video_core/bb/bb_sr_fsr4.cpp
                src/video_core/bb/fsr411/fsr411.cpp
                src/video_core/bb/fsr411/fsr411.h

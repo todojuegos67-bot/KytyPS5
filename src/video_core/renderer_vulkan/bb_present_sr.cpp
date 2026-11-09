@@ -217,6 +217,10 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     float jx = 0, jy = 0;
     BB::Upscale::Jitter(jx, jy);
     const BB::Upscale::Camera cam = BB::Upscale::EndFrame(in.width, in.height);
+    // bb-clean-021-taa: TAA is native: its output is the render size (the presenter scales it).
+    if (BB::Upscale::Cfg().kind == BB::SR::Kind::Taa) {
+        out = in;
+    }
     const bool depth_ok = scene.valid;
     scene.valid = false;
     if (fg != nullptr) *fg = {};

@@ -49,6 +49,8 @@ add_host_shader(post_process.frag post_process_frag)
 add_host_shader(bb_mv.comp bb_mv_comp)
 add_host_shader(bb_dlss5.comp bb_dlss5_comp)
 add_host_shader(bb_hudsplit.comp bb_hudsplit_comp)
+add_host_shader(bb_taa.comp bb_taa_comp)
+add_host_shader(bb_taa_sharpen.comp bb_taa_sharpen_comp)
 add_host_shader(bb_fsr4_prep.comp bb_fsr4_prep_comp)
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
