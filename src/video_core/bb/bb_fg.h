@@ -49,6 +49,12 @@ void OnDispatch(vk::Device device);
 // The swapchain's present mode with DLSS-G (no vsync on Vulkan); `current` otherwise.
 vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
                                         const std::vector<vk::PresentModeKHR>& available);
+// The swapchain's image count with DLSS-G: Streamline presents the generated frame(s) through
+// the same swapchain, so min+1 images under mailbox made its extra acquire wait for the display
+// (present call ~15 ms, real fps half of the shown cap). `current` otherwise.
+uint32_t PreferredImageCount(uint32_t current, uint32_t min, uint32_t max);
+// Swapchain acquire time with DLSS-G (per-second present breakdown).
+void AcquireTimeDlssg(double ms);
 // Before a swapchain is destroyed (the device idle): DLSS-G off and freed.
 void SwapchainChanging();
 

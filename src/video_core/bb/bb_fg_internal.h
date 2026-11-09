@@ -42,4 +42,6 @@ void AfterPresent();
 void SwapchainChanging();
 vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
                                         const std::vector<vk::PresentModeKHR>& available);
+uint32_t PreferredImageCount(uint32_t current, uint32_t min, uint32_t max);
+void AcquireTime(double ms);
 } // namespace BB::FG::Dlssg

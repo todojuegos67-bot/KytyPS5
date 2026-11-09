@@ -148,6 +148,14 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
     return DlssgEnabled() ? Dlssg::PreferredPresentMode(current, available) : current;
 }
 
+uint32_t PreferredImageCount(uint32_t current, uint32_t min, uint32_t max) {
+    return DlssgEnabled() ? Dlssg::PreferredImageCount(current, min, max) : current;
+}
+
+void AcquireTimeDlssg(double ms) {
+    if (DlssgEnabled()) Dlssg::AcquireTime(ms);
+}
+
 void SwapchainChanging() {
     if (DlssgEnabled()) Dlssg::SwapchainChanging();
 }

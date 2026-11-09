@@ -78,6 +78,24 @@ bool EnvIs(const char* name, char value) {
     return v != nullptr && *v == value;
 }
 
+uint32_t g_sc_images = 0;
+// Hardware-accelerated GPU scheduling (DLSS-G on Windows needs it): HwSchMode 2 = on, 1 = off.
+const char* HagsState() {
+#if defined(_WIN32)
+    DWORD v = 0, size = sizeof(v);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+                     "HwSchMode", RRF_RT_REG_DWORD, nullptr, &v, &size) == ERROR_SUCCESS) {
+        return v == 2 ? "on (HwSchMode 2)" : "OFF (HwSchMode != 2: DLSS-G needs HAGS)";
+    }
+    return "unknown (HwSchMode not set: OFF by default)";
+#else
+    return "n/a";
+#endif
+}
+const char* g_sc_mode = "?";
+uint32_t g_last_actual = 0, g_last_minwh = 0;
+bool g_last_vsync = false;
+
 double RefreshHz() {
 #if defined(_WIN32)
     DEVMODEA dm{};
@@ -120,7 +138,10 @@ bool g_prev_inputs_ok = false;
 struct Stats {
     Clock::time_point start{};
     uint32_t presents = 0, on = 0, inputs = 0, resets = 0, nocamera = 0, shown = 0;
-    double before_ms = 0, after_ms = 0, present_ms = 0, present_max = 0;
+    double before_ms = 0, after_ms = 0, present_ms = 0, present_max = 0, acquire_ms = 0,
+           acquire_max = 0, before_max = 0, after_max = 0;
+    uint32_t acquires = 0, generated = 0;
+    uint64_t actual_sum = 0;
 } g_stats;
 uint32_t g_last_status = 0, g_last_max = 0, g_last_presented = 1;
 int g_dyn_pend = -1, g_dyn_pend_n = 0;
@@ -358,6 +379,22 @@ void Second(Clock::time_point now) {
            (g_dynamic ? g_dyn_max : g_generate) + 1, real, real * shown_per, s.on, s.presents,
            s.inputs, s.nocamera, s.resets, (s.before_ms + s.after_ms) / n, s.before_ms / n,
            s.after_ms / n, s.present_ms / n, s.present_max, g_last_status, g_last_max);
+    // Present call breakdown, once a second: Streamline calls before vkQueuePresentKHR (token,
+    // constants, tags, options, PCL markers), inside it (sl.interposer: DLSS-G's generated
+    // frame(s) and pacing), after it (PCL, slDLSSGGetState), and the swapchain acquire.
+    Printf("[dlssg] present breakdown (ms avg/max): before Streamline %.3f/%.2f, vkQueuePresent "
+           "%.2f/%.2f, after %.3f/%.2f, acquire %.2f/%.2f; %u presents, swapchain %u images, %s",
+           s.before_ms / n, s.before_max, s.present_ms / n, s.present_max, s.after_ms / n,
+           s.after_max, s.acquire_ms / std::max<double>(s.acquires, 1.0), s.acquire_max,
+           s.presents, g_sc_images, g_sc_mode);
+    // Streamline's own numbers (measured, not real x multiplier): slDLSSGGetState.
+    Printf("[dlssg] slDLSSGGetState: status 0x%x%s, numFramesActuallyPresented %u (avg %.2f, >1 on %u "
+           "of %u presents), minWidthOrHeight %u, VSync support %s, generate max %u; HAGS %s; "
+           "measured shown %.1f fps",
+           g_last_status, g_last_status == 0 ? " (eOk)" : " (NOT OK: see sl::DLSSGStatus bits)",
+           g_last_actual, static_cast<double>(s.actual_sum) / n, s.generated, s.presents,
+           g_last_minwh, g_last_vsync ? "yes" : "no", g_last_max, HagsState(),
+           static_cast<double>(s.actual_sum) / window);
     // Real frames: the presents with inputs (game frames) in the window.
     DynamicSecond(s.inputs / window);
     s = {};
@@ -598,6 +635,7 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Format for
     g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
     g_present_begin = Clock::now();
     g_stats.before_ms += Ms(t0, g_present_begin);
+    g_stats.before_max = std::max(g_stats.before_max, Ms(t0, g_present_begin));
 #else
     (void)inputs;
     (void)backbuffer;
@@ -625,6 +663,11 @@ void AfterPresent() {
         g_last_status = static_cast<uint32_t>(state.status);
         g_last_max = state.numFramesToGenerateMax;
         g_last_presented = std::max(state.numFramesActuallyPresented, 1u);
+        g_last_actual = state.numFramesActuallyPresented;
+        g_last_minwh = state.minWidthOrHeight;
+        g_last_vsync = state.bIsVsyncSupportAvailable == sl::Boolean::eTrue;
+        g_stats.actual_sum += state.numFramesActuallyPresented;
+        if (state.numFramesActuallyPresented > 1) ++g_stats.generated;
         // More generated frames asked than the GPU / nvngx_dlssg.dll makes (x5 / x6): as many as
         // it makes.
         if (state.numFramesToGenerateMax != 0) {
@@ -670,6 +713,7 @@ void AfterPresent() {
         }
     }
     g_stats.after_ms += Ms(t0, Clock::now());
+    g_stats.after_max = std::max(g_stats.after_max, Ms(t0, Clock::now()));
 #endif
 }
 
@@ -712,11 +756,48 @@ vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
                                                                   : current;
     }
     if (!supported(wanted)) wanted = current;
+    {
+        std::string list;
+        for (const auto m : available) list += (list.empty() ? "" : ",") + vk::to_string(m);
+        Printf("[dlssg] surface present modes: %s; using %s", list.c_str(),
+               vk::to_string(wanted).c_str());
+    }
+    g_sc_mode = wanted == vk::PresentModeKHR::eMailbox     ? "mailbox"
+                : wanted == vk::PresentModeKHR::eImmediate ? "immediate"
+                : wanted == vk::PresentModeKHR::eFifo      ? "fifo"
+                                                           : "other";
     if (wanted != current) {
         Printf("[dlssg] present mode %s -> %s (DLSS-G on Vulkan has no vsync; BB_FG_PRESENT=%s)",
                vk::to_string(current).c_str(), vk::to_string(wanted).c_str(), mode.c_str());
     }
     return wanted;
+}
+
+uint32_t PreferredImageCount(uint32_t current, uint32_t min, uint32_t max) {
+    // Each real present becomes 1 + generated presents on the game's swapchain: one image on
+    // screen, one queued (mailbox) and the rest for the frames in flight, so acquiring the
+    // generated frame's image never waits for a vblank. BB_DLSSG_IMAGES=n: exactly n.
+    uint32_t want = std::max(current, min + 2u + static_cast<uint32_t>(std::max(g_generate, 1)));
+    if (const char* v = std::getenv("BB_DLSSG_IMAGES"); v != nullptr && std::atoi(v) > 0) {
+        want = std::max(static_cast<uint32_t>(std::atoi(v)), min);
+    }
+    if (max > 0) want = std::min(want, max);
+    if (want != current) {
+        Printf("[dlssg] swapchain images %u -> %u (min %u, max %u; BB_DLSSG_IMAGES)", current, want,
+               min, max);
+    }
+    g_sc_images = want;
+    return want;
+}
+
+void AcquireTime(double ms) {
+#if defined(_WIN32) && defined(BB_STREAMLINE)
+    ++g_stats.acquires;
+    g_stats.acquire_ms += ms;
+    g_stats.acquire_max = std::max(g_stats.acquire_max, ms);
+#else
+    (void)ms;
+#endif
 }
 
 void OnDispatch(vk::Device device) {

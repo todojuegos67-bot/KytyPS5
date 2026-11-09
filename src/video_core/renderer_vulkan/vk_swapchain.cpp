@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <algorithm>
 #include <limits>
 #include "common/assert.h"
@@ -114,12 +115,17 @@ void Swapchain::SetHDR(bool hdr) {
 
 bool Swapchain::AcquireNextImage() {
     vk::Device device = instance.GetDevice();
+    const auto bb_acquire_t0 = std::chrono::steady_clock::now();
     vk::Result result =
         BB::FG::Fsr3Active()
             ? BB::FG::AcquireNextImage(swapchain, image_acquired[frame_index], &image_index)
             : device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
                                          image_acquired[frame_index], VK_NULL_HANDLE,
                                          &image_index);
+
+    BB::FG::AcquireTimeDlssg(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - bb_acquire_t0)
+                                 .count());
 
     switch (result) {
     case vk::Result::eSuccess:
@@ -280,6 +286,8 @@ void Swapchain::SetSurfaceProperties() {
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }
+    image_count = BB::FG::PreferredImageCount(image_count, capabilities.minImageCount,
+                                              capabilities.maxImageCount);
 
     // Prefer identity transform if possible
     transform = vk::SurfaceTransformFlagBitsKHR::eIdentity;
