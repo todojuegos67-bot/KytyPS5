@@ -9,6 +9,9 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/bb/bb_fg.h"
+#include <array>
+#include "video_core/bb/bb_imgfg.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -59,7 +62,8 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .imageExtent = extent,
         .imageArrayLayers = 1,
         .imageUsage = vk::ImageUsageFlagBits::eColorAttachment |
-                      vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+                      vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+                      BB::ImgFg::SwapchainUsage(instance.GetPhysicalDevice(), surface),
         .imageSharingMode = sharing_mode,
         .queueFamilyIndexCount = queue_family_indices_count,
         .pQueueFamilyIndices = queue_family_indices.data(),
@@ -70,10 +74,20 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .oldSwapchain = nullptr,
     };
 
-    auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
-    ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
-               vk::to_string(swapchain_result));
-    swapchain = chain;
+    // Frame generation / latency (bb_fg.h): NVIDIA Reflex's latency mode chained in; FSR 3 frame
+    // generation makes its frame interpolation swapchain instead.
+    vk::SwapchainCreateInfoKHR fg_info = swapchain_info;
+    fg_info.pNext = BB::FG::ChainSwapchain(const_cast<void*>(fg_info.pNext));
+    vk::SwapchainKHR fg_chain{};
+    if (BB::FG::CreateSwapchain(fg_info, &fg_chain)) {
+        swapchain = fg_chain;
+    } else {
+        auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(fg_info);
+        ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
+                   vk::to_string(swapchain_result));
+        swapchain = chain;
+    }
+    BB::FG::OnSwapchain(swapchain);
 
     SetupImages();
     RefreshSemaphores();
@@ -105,8 +119,11 @@ void Swapchain::SetHDR(bool hdr) {
 bool Swapchain::AcquireNextImage() {
     vk::Device device = instance.GetDevice();
     vk::Result result =
-        device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
-                                   image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
+        BB::FG::Fsr3Active()
+            ? BB::FG::AcquireNextImage(swapchain, image_acquired[frame_index], &image_index)
+            : device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
+                                         image_acquired[frame_index], VK_NULL_HANDLE,
+                                         &image_index);
 
     switch (result) {
     case vk::Result::eSuccess:
@@ -128,15 +145,29 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
+    // bb-fg-074: the present's id, for VK_KHR_present_wait (bb_display.h).
+    // bb-imgfg-078: the real frame also waits for the work that read its image (the presenter ran
+    // BB::ImgFg::BeforeRealPresent, which presented the generated frames ahead of it).
+    const bool imgfg = static_cast<bool>(extra_present_wait);
+    const std::array<vk::Semaphore, 2> present_waits = {present_ready[image_index], extra_present_wait};
+    extra_present_wait = vk::Semaphore{};
+    u64 present_id_value = BB::FG::NextPresentId();
+    VkPresentIdKHR present_id{};
+    present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+    present_id.swapchainCount = 1;
+    present_id.pPresentIds = &present_id_value;
     const vk::PresentInfoKHR present_info = {
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &present_ready[image_index],
+        .pNext = present_id_value != 0 ? &present_id : nullptr,
+        .waitSemaphoreCount = imgfg ? 2u : 1u,
+        .pWaitSemaphores = present_waits.data(),
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
         .pImageIndices = &image_index,
     };
 
-    auto result = instance.GetPresentQueue().presentKHR(present_info);
+    auto result = BB::FG::Fsr3Active()
+                      ? BB::FG::QueuePresent(instance.GetPresentQueue(), present_info)
+                      : instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
@@ -218,6 +249,7 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+    present_mode = BB::FG::PreferredPresentMode(present_mode, modes);
 }
 
 void Swapchain::SetSurfaceProperties() {
@@ -235,7 +267,7 @@ void Swapchain::SetSurfaceProperties() {
     }
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
-    image_count = capabilities.minImageCount + 1;
+    image_count = capabilities.minImageCount + 1 + BB::ImgFg::SwapchainExtraImages();
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }
@@ -267,7 +299,14 @@ void Swapchain::Destroy() {
     images_view.clear();
 
     if (swapchain) {
-        device.destroySwapchainKHR(swapchain);
+        BB::FG::SwapchainChanging();
+        BB::FG::OnSwapchain(vk::SwapchainKHR{});
+        if (BB::FG::Fsr3Active()) {
+            BB::FG::DestroySwapchain(swapchain);
+        } else {
+            device.destroySwapchainKHR(swapchain);
+        }
+        swapchain = vk::SwapchainKHR{};
     }
 
     for (const auto& sem : image_acquired) {
@@ -308,10 +347,23 @@ void Swapchain::RefreshSemaphores() {
 
 void Swapchain::SetupImages() {
     vk::Device device = instance.GetDevice();
-    auto [images_result, imgs] = device.getSwapchainImagesKHR(swapchain);
-    ASSERT_MSG(images_result == vk::Result::eSuccess, "Failed to create swapchain images: {}",
-               vk::to_string(images_result));
-    images = std::move(imgs);
+    if (BB::FG::Fsr3Active()) {
+        u32 count = 0;
+        auto result = BB::FG::GetSwapchainImages(swapchain, &count, nullptr);
+        std::vector<vk::Image> imgs(count);
+        if (result == vk::Result::eSuccess) {
+            result = BB::FG::GetSwapchainImages(swapchain, &count, imgs.data());
+        }
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to get the FSR 3 swapchain images: {}",
+                   vk::to_string(result));
+        imgs.resize(count);
+        images = std::move(imgs);
+    } else {
+        auto [images_result, imgs] = device.getSwapchainImagesKHR(swapchain);
+        ASSERT_MSG(images_result == vk::Result::eSuccess, "Failed to create swapchain images: {}",
+                   vk::to_string(images_result));
+        images = std::move(imgs);
+    }
     image_count = static_cast<u32>(images.size());
     images_view.resize(image_count);
     for (u32 i = 0; i < image_count; ++i) {

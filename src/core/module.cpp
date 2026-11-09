@@ -10,6 +10,8 @@
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
+#include "core/bb_kbmcam.h"
+#include "core/bb_respatch.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
@@ -375,6 +377,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::g_eboot_name = name;
             MemoryPatcher::OnGameLoaded();
+            // After the XML patches: the startup Resolution Patch overrides a user's own one.
+            BB::ResPatch::OnEbootLoaded(base_virtual_addr, base_size);
+            BB::KbmCam::OnEbootLoaded(base_virtual_addr, base_size);
         }
     }
 

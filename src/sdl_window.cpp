@@ -28,6 +28,8 @@
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
 #include "sdl_window.h"
+#include "imgui/bb_menu.h"
+#include "video_core/bb/bb_metrics.h"
 #include "video_core/renderdoc.h"
 
 #ifdef __APPLE__
@@ -101,6 +103,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     if (!SDL_SetHint(SDL_HINT_APP_NAME, "shadPS4")) {
         UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
     }
+    // (bb-input-137) DualShock 4 / DualSense rumble over SDL's HIDAPI drivers (SDL2 hint names;
+    // SDL3 replaced them with ENHANCED_REPORTS, which rumble needs over Bluetooth).
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS4_RUMBLE", "1"); // SDL2 names, ignored by SDL3
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS5_RUMBLE", "1");
+#ifdef SDL_HINT_JOYSTICK_ENHANCED_REPORTS
+    SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         UNREACHABLE_MSG("Failed to initialize SDL video subsystem: {}", SDL_GetError());
     }
@@ -146,9 +155,32 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
         LOG_ERROR(Frontend, "Error getting display mode: {}", SDL_GetError());
         error = true;
     }
+    // Exclusive fullscreen switches the display to the mode closest to the configured window
+    // size (a DSR / VSR 3840x2160 mode on a 1440p panel, say) at the desktop's refresh rate, so
+    // the swapchain gets that size without the desktop being changed. Borderless keeps NULL (the
+    // desktop mode). No such mode: the desktop mode, logged.
+    SDL_DisplayMode exclusive_mode{};
+    const SDL_DisplayMode* fullscreen_mode = NULL;
+    const bool exclusive = EmulatorSettings.GetFullScreenMode() == "Fullscreen";
+    if (!error && exclusive) {
+        if (SDL_GetClosestFullscreenDisplayMode(displayIndex, width, height,
+                                                displayMode->refresh_rate, true,
+                                                &exclusive_mode)) {
+            fullscreen_mode = &exclusive_mode;
+        } else {
+            LOG_WARNING(Frontend,
+                        "display mode: no {}x{} fullscreen mode ({}), using the desktop mode "
+                        "{}x{}@{:.0f} Hz",
+                        width, height, SDL_GetError(), displayMode->w, displayMode->h,
+                        displayMode->refresh_rate);
+            fullscreen_mode = displayMode;
+        }
+        LOG_INFO(Frontend, "display mode: {}x{}@{:.0f} Hz (exclusive fullscreen{})",
+                 fullscreen_mode->w, fullscreen_mode->h, fullscreen_mode->refresh_rate,
+                 fullscreen_mode == displayMode ? ", desktop mode" : "");
+    }
     if (!error) {
-        SDL_SetWindowFullscreenMode(
-            window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? displayMode : NULL);
+        SDL_SetWindowFullscreenMode(window, exclusive ? fullscreen_mode : NULL);
     }
     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
     SDL_SyncWindow(window);
@@ -184,6 +216,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
+    BbMenu::Init(window);
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -206,6 +239,26 @@ void WindowSDL::WaitEvent() {
     SDL_Event event;
 
     if (!SDL_WaitEvent(&event)) {
+        return;
+    }
+
+    // (bb-menu-104) F1: the menu (Mando, Teclado y raton, Trofeos, Salir); while it is open
+    // the game gets no input.
+    if (BbMenu::OnSdlEvent(event)) {
+        return;
+    }
+
+    // (bb-metrics-043) F8: the metrics panel, as the Demon's Souls port's (shadPS4's "reload
+    // inputs" moves off F8 while it is on; BB_METRICS_KEY=0 / BB_METRICS_OVERLAY=0 give it back).
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 &&
+        BB::Metrics::PanelKeyEnabled()) {
+        if (!event.key.repeat) {
+            BB::Metrics::TogglePanel();
+        }
+        return;
+    }
+    if (event.type == SDL_EVENT_KEY_UP && event.key.key == SDLK_F8 &&
+        BB::Metrics::PanelKeyEnabled()) {
         return;
     }
 

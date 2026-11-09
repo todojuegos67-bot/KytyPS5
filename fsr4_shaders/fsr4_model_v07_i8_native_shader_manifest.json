@@ -1,0 +1,1729 @@
+{
+  "artifacts": {
+    "fsr4_model_v07_i8_native_1080_pass1.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass1",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "bb9f1bf97f1aeb4d122e4b3dfaf39e9c9abc3a6b8cd1bf6b73e4b5efc275e7d2",
+      "size": 45072
+    },
+    "fsr4_model_v07_i8_native_1080_pass10.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass10",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "908bfcbff12fb1c1753da2d88e0bba09dee2daa6bb6ea7118a7b1400940781ec",
+      "size": 105464
+    },
+    "fsr4_model_v07_i8_native_1080_pass11.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass11",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "dd17c45788dfc9aa2e693b43ceec0f021b6d549843ca0293014bfce75e91efc6",
+      "size": 120612
+    },
+    "fsr4_model_v07_i8_native_1080_pass12.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass12",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "17f35a3d7ea9635a01a140dc32179bdd1fec12f41f278bea800f9e97044ebe82",
+      "size": 45128
+    },
+    "fsr4_model_v07_i8_native_1080_pass2.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass2",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "a450b18536243d5b6f32d6e3e7cb056dc2bfb55333631d140fb55ef673266c08",
+      "size": 45104
+    },
+    "fsr4_model_v07_i8_native_1080_pass3.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass3",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "6bc0cc882bec201ed6f41f8114c0fd6c9c58febdb71beeafa0659a178ef1f295",
+      "size": 57520
+    },
+    "fsr4_model_v07_i8_native_1080_pass4.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass4",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "41329fcf5d9e0fa8cda3ace81f58312ad14294db6ceeeb9eb85a21aaad59fdb6",
+      "size": 105440
+    },
+    "fsr4_model_v07_i8_native_1080_pass5.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass5",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "17a3d0a262a25f0857289f3b2a2edf6a3b93bfcaa583f48409f1f16a0fc0a34e",
+      "size": 105288
+    },
+    "fsr4_model_v07_i8_native_1080_pass6.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass6",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "e21134b8c8c402672fba8697578fc6cdb67d213bef8f3604ea1e1e464e4e0df4",
+      "size": 222364
+    },
+    "fsr4_model_v07_i8_native_1080_pass7.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass7",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "d96ae1004e5d6b6b29df36dba63de491d2724c6f35d9223e2806b03ddf9c0316",
+      "size": 503664
+    },
+    "fsr4_model_v07_i8_native_1080_pass8.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass8",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "f410d69706e81c4fa5f13781bf14434e221691ba8f8123afc93ca3c91a831253",
+      "size": 503268
+    },
+    "fsr4_model_v07_i8_native_1080_pass9.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass9",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        8,
+        8,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "b27ec22973c17ddc3ad9b784eec7b49e40528baf9ee8bce4cfb7ae50b1593985",
+      "size": 508600
+    },
+    "fsr4_model_v07_i8_native_1080_post.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader",
+        "StorageImageExtendedFormats"
+      ],
+      "entry_point": "main",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        8,
+        8,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "image_format": "Unknown",
+          "name": "r_input_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 6,
+          "image_format": "Unknown",
+          "name": "r_input_exposure",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 9,
+          "image_format": "Unknown",
+          "name": "r_reprojected_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 22,
+          "image_format": "Rgba16f",
+          "name": "rw_history_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 23,
+          "image_format": "Rgba16f",
+          "name": "rw_mlsr_output_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 27,
+          "image_format": "Rgba8",
+          "name": "rw_recurrent_0",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 32,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 43,
+          "name": "MLSR_Optimized_Constants",
+          "set": 0,
+          "type": "uniform_buffer"
+        }
+      ],
+      "sha256": "0c38a8229f6f8009e1facc8f1c0fe9292de2506c92d8f1141e628af1196d2eff",
+      "size": 63316
+    },
+    "fsr4_model_v07_i8_native_1080_pre.spv": {
+      "capabilities": [
+        "ComputeDerivativeGroupLinearKHR",
+        "Float16",
+        "GroupNonUniformQuad",
+        "Int8",
+        "Shader",
+        "StorageImageExtendedFormats"
+      ],
+      "entry_point": "main",
+      "extensions": [
+        "SPV_KHR_compute_shader_derivatives"
+      ],
+      "local_size": [
+        256,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 0,
+          "image_format": "Unknown",
+          "name": "r_history_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 1,
+          "image_format": "Unknown",
+          "name": "r_velocity",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 2,
+          "image_format": "Unknown",
+          "name": "r_depth",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 3,
+          "image_format": "Unknown",
+          "name": "r_input_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 4,
+          "image_format": "Unknown",
+          "name": "r_recurrent_0",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 6,
+          "image_format": "Unknown",
+          "name": "r_input_exposure",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 24,
+          "image_format": "Rgba16f",
+          "name": "rw_reprojected_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 32,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 34,
+          "name": "cbPass_Weights",
+          "set": 0,
+          "type": "uniform_buffer"
+        },
+        {
+          "binding": 35,
+          "name": "g_history_sampler",
+          "set": 0,
+          "type": "sampler"
+        },
+        {
+          "binding": 43,
+          "name": "MLSR_Optimized_Constants",
+          "set": 0,
+          "type": "uniform_buffer"
+        }
+      ],
+      "sha256": "f6d7d4a19209f1bd2ff894520594c11ee9b842604a2356ccde8cddcbba66562f",
+      "size": 46376
+    },
+    "fsr4_model_v07_i8_native_2160_pass1.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass1",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "a5a9a00aa3a2853a0934e45fc4243051653f61d2db55a5e4447f716e4ea45088",
+      "size": 45072
+    },
+    "fsr4_model_v07_i8_native_2160_pass10.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass10",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "f418684fdc2b4bce068aa93de3ead6a5003915e73b91058decacf1b826a72d39",
+      "size": 105464
+    },
+    "fsr4_model_v07_i8_native_2160_pass11.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass11",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "4bb7d0ac14cf90e2af3d2eeb3ef7d931c4c16e324275e70b0e70e59c33ba82b5",
+      "size": 120612
+    },
+    "fsr4_model_v07_i8_native_2160_pass12.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass12",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "e38b3949be570a2dd0dc964bc74bd5de43428a4bf7d9c695849a990e0d1496d0",
+      "size": 45128
+    },
+    "fsr4_model_v07_i8_native_2160_pass2.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass2",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "6baa9bd4e41b7ad2564c746970e557583d96e9ce92e5e385fc5ea92694e4e4f0",
+      "size": 45104
+    },
+    "fsr4_model_v07_i8_native_2160_pass3.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass3",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "b4aa5d3c571e041b6d51947361aaa39edbfe60f74db5de507fb64026b5138668",
+      "size": 57520
+    },
+    "fsr4_model_v07_i8_native_2160_pass4.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass4",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "e7ec671fc72abcfe4ce728f43fccbcd75078b4a208de9eb0d7c0a4ddb25103ae",
+      "size": 105440
+    },
+    "fsr4_model_v07_i8_native_2160_pass5.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass5",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "ff3ca4ef214fcc28c318a3c53cba460690526cca7ea30798f6e3256013e70a08",
+      "size": 105288
+    },
+    "fsr4_model_v07_i8_native_2160_pass6.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass6",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "a612412bdf09fb37b5a83b80ac8714d8ed3a9a8f3d404bb64b5abfae306c4b99",
+      "size": 222364
+    },
+    "fsr4_model_v07_i8_native_2160_pass7.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass7",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "d65ae6055e9620ec59aa68e0f185e21a09e9548a0d0033b60f38b726c9cbf656",
+      "size": 503664
+    },
+    "fsr4_model_v07_i8_native_2160_pass8.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass8",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "4716125145a6a8f276278fef17b6d22c725e5eb37a2fb93bdcbe882cf327f268",
+      "size": 503268
+    },
+    "fsr4_model_v07_i8_native_2160_pass9.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass9",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        8,
+        8,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "83bf2db52fe347c5e80199c7197eb5fc4badd8fb9f6a80608e1035d2b48eedda",
+      "size": 508600
+    },
+    "fsr4_model_v07_i8_native_2160_post.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader",
+        "StorageImageExtendedFormats"
+      ],
+      "entry_point": "main",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        8,
+        8,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "image_format": "Unknown",
+          "name": "r_input_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 6,
+          "image_format": "Unknown",
+          "name": "r_input_exposure",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 9,
+          "image_format": "Unknown",
+          "name": "r_reprojected_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 22,
+          "image_format": "Rgba16f",
+          "name": "rw_history_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 23,
+          "image_format": "Rgba16f",
+          "name": "rw_mlsr_output_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 27,
+          "image_format": "Rgba8",
+          "name": "rw_recurrent_0",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 32,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 43,
+          "name": "MLSR_Optimized_Constants",
+          "set": 0,
+          "type": "uniform_buffer"
+        }
+      ],
+      "sha256": "a086677be89454986004f64d4b79f1dfdf7b2e98c222553b30d5740ce9e3f8af",
+      "size": 63316
+    },
+    "fsr4_model_v07_i8_native_2160_pre.spv": {
+      "capabilities": [
+        "ComputeDerivativeGroupLinearKHR",
+        "Float16",
+        "GroupNonUniformQuad",
+        "Int8",
+        "Shader",
+        "StorageImageExtendedFormats"
+      ],
+      "entry_point": "main",
+      "extensions": [
+        "SPV_KHR_compute_shader_derivatives"
+      ],
+      "local_size": [
+        256,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 0,
+          "image_format": "Unknown",
+          "name": "r_history_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 1,
+          "image_format": "Unknown",
+          "name": "r_velocity",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 2,
+          "image_format": "Unknown",
+          "name": "r_depth",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 3,
+          "image_format": "Unknown",
+          "name": "r_input_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 4,
+          "image_format": "Unknown",
+          "name": "r_recurrent_0",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 6,
+          "image_format": "Unknown",
+          "name": "r_input_exposure",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 24,
+          "image_format": "Rgba16f",
+          "name": "rw_reprojected_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 32,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 34,
+          "name": "cbPass_Weights",
+          "set": 0,
+          "type": "uniform_buffer"
+        },
+        {
+          "binding": 35,
+          "name": "g_history_sampler",
+          "set": 0,
+          "type": "sampler"
+        },
+        {
+          "binding": 43,
+          "name": "MLSR_Optimized_Constants",
+          "set": 0,
+          "type": "uniform_buffer"
+        }
+      ],
+      "sha256": "65c760f2199baf3b40c3ad577022996c44af75f9c9b21c32b2c25384775c6f0b",
+      "size": 46376
+    },
+    "fsr4_model_v07_i8_native_4320_pass1.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass1",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "8fe37465f715b71428e156aae2be82e39e16cb1521fe8b9f50ab8611cab0423e",
+      "size": 45072
+    },
+    "fsr4_model_v07_i8_native_4320_pass10.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass10",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "d9bc33b3b964056e0553047ce434458949e36912511009998667d9e0f968576a",
+      "size": 105464
+    },
+    "fsr4_model_v07_i8_native_4320_pass11.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass11",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "68b38ca60008c94a9ac4376f47a59734384a93d86badd9c2b8c5c52c8856929c",
+      "size": 120612
+    },
+    "fsr4_model_v07_i8_native_4320_pass12.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass12",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "160f78b474ba0c1365f6cca02f1339f34693b486a7eca1ef6bdb8bc2da55ae92",
+      "size": 45128
+    },
+    "fsr4_model_v07_i8_native_4320_pass2.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass2",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "e7e7fe23e65c84d7456805f36909c1962ca0adb8e4c73f332fab9a83df140957",
+      "size": 45104
+    },
+    "fsr4_model_v07_i8_native_4320_pass3.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass3",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "c4837c6de71e09a55602071c72c45f555919a98ffc337d2143dd4b162fe58623",
+      "size": 57520
+    },
+    "fsr4_model_v07_i8_native_4320_pass4.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass4",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "4c47522ffc3e2418468fb73d2537a3dce9edf4e8a4733bacf1695c4f723d7c22",
+      "size": 105440
+    },
+    "fsr4_model_v07_i8_native_4320_pass5.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass5",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "4d33458bd198c232e20700a28369474ba49af19fba91361ed41f6879b672ea7f",
+      "size": 105288
+    },
+    "fsr4_model_v07_i8_native_4320_pass6.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass6",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "53374419c91d6debb99885d135698a19ef5a1d1a47486915b9fc0bf9a8388c31",
+      "size": 222364
+    },
+    "fsr4_model_v07_i8_native_4320_pass7.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass7",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "459115527ef43b3b694482987126404bcf811b81b9890913f447ee08d573fbd0",
+      "size": 503664
+    },
+    "fsr4_model_v07_i8_native_4320_pass8.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass8",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "4d5a390752fe0055158dac123f4ba61dd854990a50059f3245c8629d1625ea12",
+      "size": 503268
+    },
+    "fsr4_model_v07_i8_native_4320_pass9.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader"
+      ],
+      "entry_point": "fsr4_model_v07_i8_pass9",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        8,
+        8,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 1,
+          "name": "InitializerBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 3,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        }
+      ],
+      "sha256": "556cddcad26885fb96aaa26fe0c29699a817b135970686d341f21b7c56a70643",
+      "size": 508600
+    },
+    "fsr4_model_v07_i8_native_4320_post.spv": {
+      "capabilities": [
+        "DotProduct",
+        "DotProductInput4x8BitPacked",
+        "Float16",
+        "Int8",
+        "Shader",
+        "StorageImageExtendedFormats"
+      ],
+      "entry_point": "main",
+      "extensions": [
+        "SPV_KHR_integer_dot_product"
+      ],
+      "local_size": [
+        8,
+        8,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 3,
+          "image_format": "Unknown",
+          "name": "r_input_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 6,
+          "image_format": "Unknown",
+          "name": "r_input_exposure",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 9,
+          "image_format": "Unknown",
+          "name": "r_reprojected_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 22,
+          "image_format": "Rgba16f",
+          "name": "rw_history_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 23,
+          "image_format": "Rgba16f",
+          "name": "rw_mlsr_output_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 27,
+          "image_format": "Rgba8",
+          "name": "rw_recurrent_0",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 32,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 43,
+          "name": "MLSR_Optimized_Constants",
+          "set": 0,
+          "type": "uniform_buffer"
+        }
+      ],
+      "sha256": "dca856f83d155107e279b0b7af366d4c7eccab78b608e3922ff69f8c4d91277e",
+      "size": 63316
+    },
+    "fsr4_model_v07_i8_native_4320_pre.spv": {
+      "capabilities": [
+        "ComputeDerivativeGroupLinearKHR",
+        "Float16",
+        "GroupNonUniformQuad",
+        "Int8",
+        "Shader",
+        "StorageImageExtendedFormats"
+      ],
+      "entry_point": "main",
+      "extensions": [
+        "SPV_KHR_compute_shader_derivatives"
+      ],
+      "local_size": [
+        256,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 0,
+          "image_format": "Unknown",
+          "name": "r_history_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 1,
+          "image_format": "Unknown",
+          "name": "r_velocity",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 2,
+          "image_format": "Unknown",
+          "name": "r_depth",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 3,
+          "image_format": "Unknown",
+          "name": "r_input_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 4,
+          "image_format": "Unknown",
+          "name": "r_recurrent_0",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 6,
+          "image_format": "Unknown",
+          "name": "r_input_exposure",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 24,
+          "image_format": "Rgba16f",
+          "name": "rw_reprojected_color",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 32,
+          "name": "ScratchBuffer",
+          "set": 0,
+          "type": "storage_buffer"
+        },
+        {
+          "binding": 34,
+          "name": "cbPass_Weights",
+          "set": 0,
+          "type": "uniform_buffer"
+        },
+        {
+          "binding": 35,
+          "name": "g_history_sampler",
+          "set": 0,
+          "type": "sampler"
+        },
+        {
+          "binding": 43,
+          "name": "MLSR_Optimized_Constants",
+          "set": 0,
+          "type": "uniform_buffer"
+        }
+      ],
+      "sha256": "9defd72634f8b7eae3f567b99e9d823269148f7a33d0e52f664325185b015c13",
+      "size": 46376
+    },
+    "fsr4_model_v07_i8_native_initializers.bin": {
+      "sha256": "629d42b1cc57432e9f003599ad0f305fb1d311669a819b4f22ebb8f504dece1e",
+      "size": 89216
+    },
+    "fsr4_model_v07_i8_native_pre_weights.bin": {
+      "sha256": "b6f2e8412d462ba207c1d5c7fe944486f474149bc3ee9234d6ae3f644235b102",
+      "size": 1024
+    },
+    "rcas.spv": {
+      "capabilities": [
+        "Shader",
+        "StorageImageExtendedFormats"
+      ],
+      "entry_point": "main",
+      "extensions": [],
+      "local_size": [
+        64,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 6,
+          "image_format": "Unknown",
+          "name": "r_input_exposure",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 18,
+          "image_format": "Unknown",
+          "name": "r_rcas_input",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 32,
+          "image_format": "Rgba16f",
+          "name": "rw_rcas_output",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 43,
+          "name": "cbRCAS",
+          "set": 0,
+          "type": "uniform_buffer"
+        }
+      ],
+      "sha256": "03aa0e0729f67bb9907667526ed2d5d5f933030e7faa3acd953e3de109a54950",
+      "size": 18908
+    },
+    "spd_auto_exposure.spv": {
+      "capabilities": [
+        "ComputeDerivativeGroupLinearKHR",
+        "GroupNonUniformQuad",
+        "Shader"
+      ],
+      "entry_point": "main",
+      "extensions": [
+        "SPV_KHR_compute_shader_derivatives"
+      ],
+      "local_size": [
+        256,
+        1,
+        1
+      ],
+      "resources": [
+        {
+          "binding": 0,
+          "image_format": "Unknown",
+          "name": "r_input_color",
+          "set": 0,
+          "type": "sampled_image"
+        },
+        {
+          "binding": 21,
+          "image_format": "R32ui",
+          "name": "rw_spd_global_atomic",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 22,
+          "image_format": "R32f",
+          "name": "rw_autoexp_mip_5",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 23,
+          "image_format": "R32f",
+          "name": "rw_auto_exposure_texture",
+          "set": 0,
+          "type": "storage_image"
+        },
+        {
+          "binding": 43,
+          "name": "AutoExposureSPDConstants",
+          "set": 0,
+          "type": "uniform_buffer"
+        }
+      ],
+      "sha256": "bf97092a75dcbd04ba2976278769beab15469df0eba8b986c10c2c5553c21595",
+      "size": 28924
+    }
+  },
+  "compiler": "libdxcompiler.so: 1.10(5322-c64a5165)(1.9.0.15322)",
+  "model": "fsr4_model_v07_i8_native",
+  "permutation": {
+    "FFX_MLSR_AUTOEXPOSURE_ENABLED": 0,
+    "FFX_MLSR_COLORSPACE": 0,
+    "FFX_MLSR_DEPTH_INVERTED": 0,
+    "FFX_MLSR_JITTERED_MOTION_VECTORS": 0,
+    "FFX_MLSR_LOW_RES_MV": 1,
+    "FSR4_ENABLE_DOT4": 1,
+    "WMMA_ENABLED": 0
+  },
+  "preset": "native",
+  "sampler_binding": 35,
+  "schema_version": 1
+}

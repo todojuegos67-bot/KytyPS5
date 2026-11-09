@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
@@ -20,6 +21,9 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
+
+// bb-hitch-098: sparse binds made since start (read by the [hitch] lines).
+std::atomic<uint32_t> bb_hitch_resident_binds{0};
 
 namespace VideoCore {
 
@@ -382,6 +386,17 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // bb-hitch-098: the 11-06 run (log095d, t=63 s) made 54 ranges of 1-4 blocks resident in one
+    // frame, each with its own vkAllocateMemory + sparse bind + page-table copy, and the frame took
+    // 44 ms on the GPU thread. Widen each request to an aligned 32-block chunk (2 MiB at 64 KiB
+    // blocks) inside the arena, so neighbouring small requests share one allocation.
+    {
+        constexpr u64 kChunk = 32;
+        const u64 arena_first = arena->cpu_addr >> block_shift;
+        const u64 arena_last = ((arena->cpu_addr + arena->size_bytes) >> block_shift) - 1;
+        first_block = std::max(first_block & ~(kChunk - 1), arena_first);
+        last_block = std::min(last_block | (kChunk - 1), arena_last);
+    }
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -392,6 +407,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (bind_ranges.Empty()) {
         return;
     }
+    bb_hitch_resident_binds.fetch_add(1, std::memory_order_relaxed);
 
     const bool has_bda = instance.IsBufferDeviceAddressSupported();
     const vk::MemoryAllocateFlagsInfo alloc_flags = {

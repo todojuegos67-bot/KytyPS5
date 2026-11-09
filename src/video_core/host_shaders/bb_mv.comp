@@ -1,0 +1,73 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Camera motion vectors from the scene depth (BB upscaling, bb_upscale.h): each pixel's surface
+// point, unprojected with this frame's guest viewport and moved into the previous frame's clip space
+// (clip_to_prev = prevViewProj * inverse(viewProj)), gives render pixels towards its previous
+// position. Unjittered: the jitter the scene was rasterised with is taken out first. Static geometry
+// only (Bloodborne has no per-object motion vectors).
+// Reactive mask: where the luminance at the reprojected position changed more than camera motion
+// explains (particles, fire, fog, alpha-blended effects that write no depth), the upscaler should
+// trust the current frame over its history.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1, rg16f) uniform writeonly image2D mv_out;
+layout(binding = 2) uniform sampler2D color_tex;
+layout(binding = 3, r16f) uniform readonly image2D lum_prev;
+layout(binding = 4, r16f) uniform writeonly image2D lum_out;
+layout(binding = 5, r8) uniform writeonly image2D reactive_out;
+layout(push_constant) uniform Push {
+    vec4 r0;
+    vec4 r1;
+    vec4 r2;
+    vec4 r3;
+    vec4 vp_xy; // xscale, xoffset, yscale, yoffset
+    vec4 vp_z;  // zscale, zoffset, jitter x, jitter y
+    uvec4 size; // width, height, valid, previous luminance valid
+} p;
+
+vec2 MotionVector(ivec2 c) {
+    if (p.size.z == 0u) {
+        return vec2(0.0);
+    }
+    float d = texelFetch(depth_tex, c, 0).r;
+    vec2 s = vec2(c) + 0.5 - p.vp_z.zw;
+    vec4 ndc = vec4((s.x - p.vp_xy.y) / p.vp_xy.x, (s.y - p.vp_xy.w) / p.vp_xy.z,
+                    (d - p.vp_z.y) / p.vp_z.x, 1.0);
+    vec4 prev = vec4(dot(p.r0, ndc), dot(p.r1, ndc), dot(p.r2, ndc), dot(p.r3, ndc));
+    if (abs(prev.w) < 1e-6) {
+        return vec2(0.0);
+    }
+    prev.xy /= prev.w;
+    vec2 ps = vec2(prev.x * p.vp_xy.x + p.vp_xy.y, prev.y * p.vp_xy.z + p.vp_xy.w);
+    vec2 mv = ps - s;
+    if (any(isnan(mv)) || any(isinf(mv))) {
+        return vec2(0.0);
+    }
+    return mv;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    vec2 mv = MotionVector(c);
+    imageStore(mv_out, c, vec4(mv, 0.0, 0.0));
+
+    vec3 col = texelFetch(color_tex, c, 0).rgb;
+    float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    if (isnan(l) || isinf(l)) {
+        l = 0.0;
+    }
+    imageStore(lum_out, c, vec4(l));
+    float reactive = 0.0;
+    ivec2 pc = ivec2(floor(vec2(c) + 0.5 + mv));
+    if (p.size.w != 0u && pc.x >= 0 && pc.y >= 0 && pc.x < int(p.size.x) &&
+        pc.y < int(p.size.y)) {
+        float lp = imageLoad(lum_prev, pc).r;
+        float change = abs(l - lp) / (max(l, lp) + 0.05);
+        reactive = smoothstep(0.15, 0.6, change) * 0.75;
+    }
+    imageStore(reactive_out, c, vec4(reactive));
+}

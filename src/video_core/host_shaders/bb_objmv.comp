@@ -1,0 +1,133 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB object motion vectors (bb_objmv.h): where the G-buffer pass wrote an object vector (skinned
+// characters, weapons, animated props: the vertex shader's own previous / current clip positions),
+// it replaces the camera-only vector bb_mv.comp reconstructed from depth. Same units and sign:
+// render pixels towards the previous position, unjittered (the jitter is a viewport offset that
+// clip positions never see).
+// 1.20: o.y is the class (1: small skeleton / rigid, 2: large skeleton = characters).
+// p.size.w bit 0: BB_OBJMV_DEBUG statistics (stats buffer); bit 1: BB_MV_VIEW colour (viz);
+// bit 2 (1.40): coverage (stats words 11: object-vector pixels, 12: character pixels, 13: all
+// pixels), one global add per group (the [fg-amd] line); 1.41: words 14 / 15, character pixels
+// with a near-zero vector / with a vector > 1 px off the camera one.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rg32ui) uniform readonly uimage2D obj_mv;
+layout(binding = 1, rg16f) uniform image2D mv_out;
+layout(binding = 2, std430) buffer Stats {
+    uint s[24];
+} st;
+layout(binding = 3, rgba8) uniform writeonly image2D viz;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, enabled, flags
+} p;
+
+void Count(uint i, float v) {
+    atomicAdd(st.s[i], uint(clamp(v, 0.0, 4096.0) * 16.0 + 0.5));
+}
+
+void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool own);
+
+shared uint cov_obj, cov_char, cov_all, cov_still, cov_own, cov_cmag, cov_bmag, cov_bg;
+vec2 g_v;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    bool cov = (p.size.w & 4u) != 0u;
+    if (cov) {
+        if (gl_LocalInvocationIndex == 0u) {
+            cov_obj = 0u;
+            cov_char = 0u;
+            cov_all = 0u;
+            cov_still = 0u;
+            cov_own = 0u;
+            cov_cmag = 0u;
+            cov_bmag = 0u;
+            cov_bg = 0u;
+        }
+        barrier();
+    }
+    bool inside = c.x < int(p.size.x) && c.y < int(p.size.y) && p.size.z != 0u;
+    bool cov_is_obj = false, cov_is_char = false, cov_is_still = false, cov_is_own = false;
+    if (inside) {
+        Body(c, cov_is_obj, cov_is_char, cov_is_still, cov_is_own);
+    }
+    if (cov) {
+        if (inside) {
+            atomicAdd(cov_all, 1u);
+            if (cov_is_obj) atomicAdd(cov_obj, 1u);
+            if (cov_is_char) atomicAdd(cov_char, 1u);
+            if (cov_is_still) atomicAdd(cov_still, 1u);
+            if (cov_is_own) atomicAdd(cov_own, 1u);
+            // 1.50: mean vector magnitude, characters vs the rest (x16 fixed point).
+            uint m = uint(clamp(length(g_v), 0.0, 4096.0) * 16.0 + 0.5);
+            if (cov_is_char) atomicAdd(cov_cmag, m);
+            else if (!cov_is_obj) {
+                atomicAdd(cov_bmag, m);
+                atomicAdd(cov_bg, 1u);
+            }
+        }
+        barrier();
+        if (gl_LocalInvocationIndex == 0u) {
+            if (cov_obj != 0u) atomicAdd(st.s[11], cov_obj);
+            if (cov_char != 0u) atomicAdd(st.s[12], cov_char);
+            atomicAdd(st.s[13], cov_all);
+            if (cov_still != 0u) atomicAdd(st.s[14], cov_still);
+            if (cov_own != 0u) atomicAdd(st.s[15], cov_own);
+            if (cov_cmag != 0u) atomicAdd(st.s[20], cov_cmag);
+            if (cov_bmag != 0u) atomicAdd(st.s[21], cov_bmag);
+            if (cov_bg != 0u) atomicAdd(st.s[22], cov_bg);
+        }
+    }
+}
+
+void Body(ivec2 c, out bool is_obj, out bool is_char, out bool still, out bool own) {
+    vec2 cam = imageLoad(mv_out, c).xy;
+    uvec2 o = imageLoad(obj_mv, c).xy;
+    vec2 v = cam;
+    bool obj = false;
+    // 1.46: o.y >= 8 = drawn by a motion pipeline without a vector (8 no previous position,
+    // 9 behind the camera, 10 not finite): words 16..18; word 19: such pixels + vector pixels.
+    if ((p.size.w & 4u) != 0u && o.y >= 8u && o.y <= 10u) atomicAdd(st.s[16u + (o.y - 8u)], 1u);
+    if (o.y != 0u && o.y < 8u) {
+        vec2 ov = unpackHalf2x16(o.x);
+        if (!any(isnan(ov)) && !any(isinf(ov))) {
+            v = ov;
+            obj = true;
+            imageStore(mv_out, c, vec4(v, 0.0, 0.0));
+        }
+    }
+    is_obj = obj;
+    g_v = v;
+    is_char = obj && o.y >= 2u;
+    // 1.41: character pixels with a near-zero vector / with motion of their own.
+    still = is_char && length(v) < 0.25;
+    own = is_char && length(v - cam) > 1.0;
+    if ((p.size.w & 1u) != 0u) {
+        if (obj && o.y >= 2u) {
+            // Character (large skeleton) pixels: object vs camera magnitude here.
+            atomicAdd(st.s[0], 1u);
+            Count(1u, length(v));
+            Count(2u, length(cam));
+            if (length(v - cam) > 1.0) atomicAdd(st.s[3], 1u);
+            atomicMax(st.s[4], uint(clamp(length(v), 0.0, 4096.0) * 16.0));
+            if (length(v) < 0.25) atomicAdd(st.s[5], 1u);
+        } else if (obj) {
+            atomicAdd(st.s[6], 1u);
+            Count(7u, length(v));
+            Count(8u, length(cam));
+        } else {
+            atomicAdd(st.s[9], 1u);
+            Count(10u, length(cam));
+        }
+    }
+    if ((p.size.w & 2u) != 0u) {
+        // Hue = direction, brightness = magnitude (8 px full); object pixels with a tint (blue:
+        // characters, magenta: props) so their area shows even when not moving.
+        float m = clamp(length(v) / 8.0, 0.0, 1.0);
+        vec2 d = length(v) > 1e-4 ? normalize(v) : vec2(0.0);
+        vec3 col = vec3(0.5 + 0.5 * d.x, 0.5 + 0.5 * d.y, 0.5) * m;
+        if (obj) col += o.y >= 2u ? vec3(0.0, 0.0, 0.35) : vec3(0.25, 0.0, 0.25);
+        imageStore(viz, c, vec4(clamp(col, 0.0, 1.0), 1.0));
+    }
+}

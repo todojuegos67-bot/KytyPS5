@@ -216,6 +216,52 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
         }
     }
 
+    // (bb-input-137) Bloodborne default keyboard + mouse: left click = R1, right click = L1,
+    // space = circle (roll), lshift = circle (run while held, bb-combo-149), touchpad = g. New file: default.ini with that applied. Existing
+    // file: migrated only while it still has the old "touchpad_center = space" (backup kept).
+    if (game_id == "CUSA03173") {
+        const bool fresh = !std::filesystem::exists(config_file);
+        std::vector<std::string> lines;
+        {
+            std::ifstream in(fresh ? default_config_file : config_file);
+            for (std::string l; std::getline(in, l);) lines.push_back(l);
+        }
+        const auto strip = [](std::string l) {
+            if (auto h = l.find('#'); h != std::string::npos) l = l.substr(0, h);
+            std::erase_if(l, [](unsigned char c) { return std::isspace(c); });
+            return l;
+        };
+        bool old_space = false;
+        for (const auto& l : lines) old_space |= strip(l) == "touchpad_center=space";
+        if (fresh || old_space) {
+            if (!fresh) {
+                std::error_code ec;
+                std::filesystem::copy_file(config_file, config_dir / (game_id + ".ini.bak-136"),
+                                           std::filesystem::copy_options::overwrite_existing, ec);
+            }
+            std::ofstream out(config_file, std::ios::trunc);
+            for (const auto& l : lines) {
+                const auto t = strip(l);
+                if (t == "touchpad_center=space") {
+                    out << "touchpad_center = g  # bb-input-137 (was space)\n";
+                } else if (t == "r1=leftbutton" || t == "l1=rightbutton" || t == "circle=space" ||
+                           t == "circle=lshift") {
+                    continue; // re-added below
+                } else {
+                    out << l << "\n";
+                }
+            }
+            out << "# bb-input-137 Bloodborne keyboard + mouse defaults\n"
+                << "r1 = leftbutton\n"
+                << "l1 = rightbutton\n"
+                << "circle = space\n"
+                << "circle = lshift  # bb-combo-149: run with Shift held\n";
+            LOG_INFO(Input, "[kbm] {} Bloodborne defaults: r1=leftbutton l1=rightbutton "
+                     "circle=space circle=lshift touchpad_center=g (backup {})",
+                     fresh ? "wrote" : "migrated", fresh ? "none" : game_id + ".ini.bak-136");
+        }
+    }
+
     // If game-specific config doesn't exist, create it from the default config
     if (!std::filesystem::exists(config_file)) {
         std::filesystem::copy(default_config_file, config_file);
@@ -368,6 +414,7 @@ void ParseInputConfig(const std::string game_id = "") {
     float mouse_deadzone_offset = 0.5;
     float mouse_speed = 1;
     float mouse_speed_offset = 0.125;
+    SetMouseToJoystick(2); // (bb-input-135) default mouse-look = right stick (was 0 = off)
 
     // me when I'm in a type deduction tournament and my opponent is clang
     constexpr std::array<std::pair<int, int>, 4> default_deadzone = {
@@ -742,15 +789,27 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     if (button != SDL_GAMEPAD_BUTTON_INVALID) {
         switch (button) {
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT:
-            controller->SetTouchpadState(0, new_button_state, 0.25f, 0.5f);
+            // (bb-input-135) the touchpad CLICK only: no phantom finger. A bound key (default
+            // space) used to also inject a touch point; real fingers still come from the pad's
+            // touch sensor events. Bloodborne crashed (0xc0000005) on the injected touch.
+            LOG_INFO(Input, "[kbm] touchpad click {} (button only, no injected touch)",
+                     new_button_state ? "down" : "up");
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER:
-            controller->SetTouchpadState(0, new_button_state, 0.50f, 0.5f);
+            // (bb-input-135) the touchpad CLICK only: no phantom finger. A bound key (default
+            // space) used to also inject a touch point; real fingers still come from the pad's
+            // touch sensor events. Bloodborne crashed (0xc0000005) on the injected touch.
+            LOG_INFO(Input, "[kbm] touchpad click {} (button only, no injected touch)",
+                     new_button_state ? "down" : "up");
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT:
-            controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
+            // (bb-input-135) the touchpad CLICK only: no phantom finger. A bound key (default
+            // space) used to also inject a touch point; real fingers still come from the pad's
+            // touch sensor events. Bloodborne crashed (0xc0000005) on the injected touch.
+            LOG_INFO(Input, "[kbm] touchpad click {} (button only, no injected touch)",
+                     new_button_state ? "down" : "up");
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case LEFTJOYSTICK_HALFMODE:

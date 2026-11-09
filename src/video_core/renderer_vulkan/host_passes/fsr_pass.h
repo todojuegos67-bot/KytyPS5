@@ -15,6 +15,7 @@ public:
         bool enable{true};
         bool use_rcas{true};
         float rcas_attenuation{0.25f};
+        bool sharpen_only{false};
     };
 
     void Create(vk::Device device, VmaAllocator allocator, u32 num_images);

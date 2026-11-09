@@ -99,6 +99,8 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        s64 pace_qpc = 0;      // the flip's grid slot (BB::FG::PaceGuestFlip; 0: none)
+        s64 pace_interval = 0; // the real frame interval, QPC ticks
 
         operator bool() const noexcept {
             return frame != nullptr;
@@ -108,13 +110,15 @@ private:
     void Flip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
-    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
+                            u64 lat_index = 0, s64 pace_qpc = 0, s64 pace_interval = 0);
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
+    std::condition_variable request_cv; // a request pushed (BB::FG::PresentOnArrival)
 };
 
 } // namespace Libraries::VideoOut

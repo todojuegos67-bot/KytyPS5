@@ -6,7 +6,11 @@
 #include <algorithm>
 #include <ctime>
 #include <string>
+#include <algorithm>
+#include <cstdlib>
+#include <mutex>
 #include <thread>
+#include <vector>
 #include <fmt/format.h>
 
 #include "core/libraries/fiber/fiber.h"
@@ -221,12 +225,147 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 
 #ifdef _WIN32
 
+namespace {
+struct BBPerfThread {
+    std::string name;
+    HANDLE handle = nullptr;
+    u64 last_100ns = 0;
+};
+std::mutex g_bb_perf_mutex;
+std::vector<BBPerfThread> g_bb_perf_threads;
+
+bool BBEnvOn(const char* name, bool def) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return def;
+    return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
+}
+
+bool BBHotThread(const std::string& n) {
+    return n.find("GpuCommandProcessor") != std::string::npos ||
+           n.find("PresentThread") != std::string::npos ||
+           n.find("GpuSchedPriorityPendingOpsRunner") != std::string::npos ||
+           n.find("shadPS4:Main") != std::string::npos;
+}
+
+// The processors that share the largest L3 (on a 9950X3D: the V-Cache CCD). 0: unknown / uniform.
+KAFFINITY BBBigCacheMask(WORD& group) {
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, nullptr, &len);
+    if (len == 0) return 0;
+    std::vector<char> buf(len);
+    auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+    if (!GetLogicalProcessorInformationEx(RelationCache, info, &len)) return 0;
+    DWORD best = 0, smallest = 0xFFFFFFFFu;
+    int caches = 0;
+    KAFFINITY mask = 0;
+    for (DWORD off = 0; off < len;) {
+        auto* e = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+        if (e->Relationship == RelationCache && e->Cache.Level == 3) {
+            ++caches;
+            smallest = std::min(smallest, e->Cache.CacheSize);
+            if (e->Cache.CacheSize > best) {
+                best = e->Cache.CacheSize;
+                mask = e->Cache.GroupMask.Mask;
+                group = e->Cache.GroupMask.Group;
+            }
+        }
+        off += e->Size;
+    }
+    // Only a real asymmetric part (one L3 bigger than another) gets a preference.
+    return caches >= 2 && best > smallest ? mask : 0;
+}
+
+void BBTuneThread(const std::string& n) {
+    if (!BBHotThread(n)) return;
+    // The GPU command processor feeds the host GPU: above normal (BB_THREAD_PRIO=0: as before).
+    if (n.find("GpuCommandProcessor") != std::string::npos && BBEnvOn("BB_THREAD_PRIO", false)) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    // BB_AFFINITY=1 (default off): the hot threads prefer the big-L3 CCD (ideal processor plus a
+    // group affinity on that CCD's processors). Never set on a symmetric CPU.
+    if (BBEnvOn("BB_AFFINITY", false)) {
+        WORD group = 0;
+        const KAFFINITY mask = BBBigCacheMask(group);
+        if (mask != 0) {
+            GROUP_AFFINITY ga{};
+            ga.Mask = mask;
+            ga.Group = group;
+            SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr);
+            LOG_INFO(Common, "[perf] BB_AFFINITY: {} on the big-L3 processors (mask {:#x})", n,
+                     static_cast<u64>(mask));
+        }
+    }
+}
+
+void BBRegisterThread(const char* name) {
+    HANDLE h = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                         THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, FALSE, 0)) {
+        return;
+    }
+    std::scoped_lock lk{g_bb_perf_mutex};
+    if (g_bb_perf_threads.size() >= 512) {
+        CloseHandle(h);
+        return;
+    }
+    g_bb_perf_threads.push_back({name, h, 0});
+}
+} // namespace
+
+std::string BBThreadBusyReport(double wall_seconds, int top) {
+    if (wall_seconds <= 0.0) return {};
+    std::vector<std::pair<double, std::string>> busy;
+    {
+        std::scoped_lock lk{g_bb_perf_mutex};
+        for (auto it = g_bb_perf_threads.begin(); it != g_bb_perf_threads.end();) {
+            FILETIME c, e, k, u;
+            DWORD code = 0;
+            if (!GetThreadTimes(it->handle, &c, &e, &k, &u) ||
+                (GetExitCodeThread(it->handle, &code) && code != STILL_ACTIVE)) {
+                CloseHandle(it->handle);
+                it = g_bb_perf_threads.erase(it);
+                continue;
+            }
+            const auto t = [](FILETIME f) {
+                return (static_cast<u64>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
+            };
+            const u64 now = t(k) + t(u);
+            if (it->last_100ns != 0) {
+                busy.emplace_back(static_cast<double>(now - it->last_100ns) / 1e7 / wall_seconds *
+                                      100.0,
+                                  it->name);
+            }
+            it->last_100ns = now;
+            ++it;
+        }
+    }
+    std::sort(busy.begin(), busy.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string out;
+    for (int i = 0; i < top && i < static_cast<int>(busy.size()); ++i) {
+        std::string n = busy[i].second;
+        if (n.rfind("shadPS4:", 0) == 0) n = n.substr(8);
+        out += fmt::format("{}{} {:.0f}%", i ? ", " : "", n, busy[i].first);
+    }
+    return out;
+}
+
 // Sets the debugger-visible name of the current thread.
 void SetCurrentThreadName(const char* name) {
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    // bb-crash-119: only emulator threads are registered / tuned by default; guest threads (e.g.
+    // HavokWorkerThread) are left untouched unless BB_PERF=2.
+    const std::string bb_n{name ? name : ""};
+    const char* bb_perf = std::getenv("BB_PERF");
+    const bool bb_emu = bb_n.rfind("shadPS4:", 0) == 0 || BBHotThread(bb_n);
+    if (bb_emu || (bb_perf && bb_perf[0] == '2')) {
+        BBRegisterThread(name);
+    }
+    if (bb_emu) {
+        BBTuneThread(bb_n);
+    }
 }
 
 void SetThreadName(void* thread, const char* name) {
@@ -323,5 +462,11 @@ std::string GetCurrentThreadName() {
     return std::string{name};
 #endif
 }
+
+#ifndef _WIN32
+std::string BBThreadBusyReport(double, int) {
+    return {};
+}
+#endif
 
 } // namespace Common

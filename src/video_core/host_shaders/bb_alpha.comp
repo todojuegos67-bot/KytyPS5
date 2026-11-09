@@ -1,0 +1,27 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB upscaling (vk_rasterizer_bb.cpp): the upscalers only reconstruct RGB, their alpha is
+// undefined. The game reads the redirected (upscaled) image in place of its own, alpha included,
+// so the source's alpha, filtered to the output size, is written back into the output.
+// Non-finite colour (NaN / Inf from a back end) is cleared to black so it never spreads.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src_tex;
+layout(binding = 1, rgba16f) uniform image2D out_img;
+layout(push_constant) uniform Push {
+    uvec4 size; // output width, height
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    vec2 uv = (vec2(c) + 0.5) / vec2(p.size.xy);
+    vec4 o = imageLoad(out_img, c);
+    if (any(isnan(o.rgb)) || any(isinf(o.rgb))) {
+        o.rgb = vec3(0.0);
+    }
+    o.a = textureLod(src_tex, uv, 0.0).a;
+    imageStore(out_img, c, o);
+}

@@ -1,0 +1,55 @@
+#version 450
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB_FG=image-x2 / image-x3 (bb_imgfg.cpp): the vector grids to one vector per pixel, edge-aware
+// (a joint bilateral upsampling): the four surrounding vectors are weighed by the bilinear weight
+// times how close their block's luma is to this pixel's, so the motion of a character does not
+// leak over its silhouette into the background and the other way round. Output in full resolution
+// pixels; z: the consistency ratio, the same weighting.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D ff_tex;
+layout(binding = 1) uniform sampler2D bf_tex;
+layout(binding = 2) uniform sampler2D lum_a;
+layout(binding = 3) uniform sampler2D lum_b;
+layout(binding = 8, rgba16f) uniform writeonly image2D fp_img;
+layout(binding = 9, rgba16f) uniform writeonly image2D bp_img;
+
+layout(push_constant) uniform Push {
+    ivec4 size;  // width, height, grid width, height
+    ivec4 half_size; // half width, half height
+    vec4 params; // x: sigma of the luma weight
+} p;
+
+void main() {
+    ivec2 x = ivec2(gl_GlobalInvocationID.xy);
+    if (x.x >= p.size.x || x.y >= p.size.y) {
+        return;
+    }
+    ivec2 h = min(x / 2, p.half_size.xy - 1);
+    float guide = 0.5 * (texelFetch(lum_a, h, 0).r + texelFetch(lum_b, h, 0).r);
+    vec2 xl = (vec2(x) + 0.5) * 0.5 - 0.5;
+    vec2 gi = clamp((xl - 1.5) * 0.25, vec2(0.0), vec2(p.size.zw - 1));
+    ivec2 g0 = min(ivec2(floor(gi)), max(p.size.zw - 2, ivec2(0)));
+    vec2 fr = clamp(gi - vec2(g0), 0.0, 1.0);
+    vec4 fsum = vec4(0.0);
+    vec4 bsum = vec4(0.0);
+    float wsum = 0.0;
+    float inv = 1.0 / (2.0 * p.params.x * p.params.x);
+    for (int k = 0; k < 4; ++k) {
+        ivec2 o = ivec2(k & 1, k >> 1);
+        float wb = (o.x == 0 ? 1.0 - fr.x : fr.x) * (o.y == 0 ? 1.0 - fr.y : fr.y);
+        ivec2 gc = min(g0 + o, p.size.zw - 1);
+        vec4 f = texelFetch(ff_tex, gc, 0);
+        vec4 b = texelFetch(bf_tex, gc, 0);
+        float d = guide - f.w;
+        float w = wb * exp(-d * d * inv) + 1e-4 * wb + 1e-7;
+        fsum += vec4(f.xyz, 0.0) * w;
+        bsum += vec4(b.xyz, 0.0) * w;
+        wsum += w;
+    }
+    fsum /= wsum;
+    bsum /= wsum;
+    imageStore(fp_img, x, vec4(fsum.xy * 2.0, fsum.z, 0.0));
+    imageStore(bp_img, x, vec4(bsum.xy * 2.0, bsum.z, 0.0));
+}

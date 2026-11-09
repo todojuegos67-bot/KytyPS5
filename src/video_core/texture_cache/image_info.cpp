@@ -6,6 +6,7 @@
 #include "core/libraries/videoout/buffer.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/pixel_format.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/host_compatibility.h"
@@ -88,6 +89,7 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
         mips_layout[0] = MipInfo(guest_size, pitch, size.height, 0);
     }
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && buffer.info.alt_tile_mode;
+    BBScale();
 }
 
 ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
@@ -139,6 +141,7 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
             MipInfo(guest_size, pitch, props.is_tiled ? buffer.Height() : size.height, 0);
         num_bits = 8;
     }
+    BBScale();
 }
 
 ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept {
@@ -173,6 +176,20 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
         alt_tile = Libraries::Kernel::sceKernelIsNeoMode();
     }
     UpdateSize();
+    if (resources.levels == 1) {
+        BBScale();
+    }
+}
+
+void ImageInfo::BBScale() {
+    u32 w = size.width, h = size.height;
+    if (size.depth == 1 && BB::Upscale::ScaleImage(guest_address, w, h)) {
+        bb_scaled = true;
+        bb_guest_w = size.width;
+        bb_guest_h = size.height;
+        size.width = w;
+        size.height = h;
+    }
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {

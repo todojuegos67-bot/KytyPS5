@@ -11,6 +11,9 @@
 #include "common/hash.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/bb/bb_texture.h"
+#include "core/bb_respatch.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -334,6 +337,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
+        if (image_info.bb_scaled != cache_image.info.bb_scaled) {
+            // 0.73: with the native chain both versions of a scene target live side by side (the
+            // scene passes use the internal-size one, the output chain the output-size twin).
+            if (safe_to_delete || (!BB::Upscale::SceneScaleLive() && cache_image.info.bb_scaled &&
+                                   !cache_image.binding.is_bound)) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
+        }
         const u32 lhs_block_size = image_info.num_bits * image_info.num_samples;
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
         if (image_info.BlockDim() != cache_image.info.BlockDim() ||
@@ -676,8 +688,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     SmallVector<ImageId, 4> image_ids;
+    // BB 0.76: an address with an internal-size and an output-size image (native chain): an
+    // address-only lookup (copies, buffer reads) takes the one holding the current content, and
+    // only the output-size one once the chain is off.
+    const int prefer = BB::Upscale::PreferVersion(address);
     ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
         if (ensure_valid && !image.HasGpuValidData()) {
+            return;
+        }
+        if (prefer >= 0 && image.info.guest_address == address &&
+            image.info.bb_scaled != (prefer == 1)) {
             return;
         }
         image_ids.push_back(image_id);
@@ -715,7 +735,90 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    BBTwinSync(image_id, desc.type == BindingType::Storage);
     return image.FindView(desc.view_info);
+}
+
+void TextureCache::BBNativeOff() {
+    std::vector<std::pair<VAddr, bool>> addrs;
+    if (!BB::Upscale::TakeOffPurge(addrs)) {
+        return;
+    }
+    u32 copied = 0, freed = 0;
+    for (const auto& [addr, scaled_current] : addrs) {
+        SmallVector<ImageId, 4> scaled_ids;
+        ImageId full_id{};
+        ForEachImageWithAddress(addr, [&](ImageId id, Image& image) {
+            if (image.info.guest_address != addr) return;
+            if (image.info.bb_scaled) {
+                scaled_ids.push_back(id);
+            } else if (!full_id) {
+                full_id = id;
+            }
+        });
+        for (const ImageId id : scaled_ids) {
+            Image& scaled = slot_images[id];
+            if (scaled_current && full_id &&
+                runtime.BBBlitScaled(&scaled, &slot_images[full_id])) {
+                ++copied;
+            }
+            if (!scaled.binding.is_bound) {
+                FreeImage(id);
+                ++freed;
+            }
+        }
+    }
+    BB::Upscale::OnOffPurged(copied, freed);
+}
+
+ImageId TextureCache::BBVersionAt(ImageId image_id, u32 width, u32 height) {
+    const ImageInfo info = slot_images[image_id].info;
+    ImageId found{};
+    ForEachImageWithAddress(info.guest_address, [&](ImageId id, Image& other) {
+        if (id != image_id && other.info.guest_address == info.guest_address &&
+            other.info.size.width == width && other.info.size.height == height &&
+            other.info.pixel_format == info.pixel_format && other.info.num_samples == 1) {
+            found = id;
+        }
+    });
+    if (found) {
+        UpdateImage(found);
+        BBTwinSync(found, false);
+    }
+    return found;
+}
+
+void TextureCache::BBTwinSync(ImageId image_id, bool write) {
+    Image& image = slot_images[image_id];
+    const ImageInfo& info = image.info;
+    if (info.guest_address == 0 || info.num_samples != 1 || info.size.depth != 1) {
+        return;
+    }
+    const bool scaled = info.bb_scaled;
+    if (!BB::Upscale::TwinAccess(info.guest_address, info.size.width, info.size.height, scaled,
+                                 write, info.props.is_depth)) {
+        return;
+    }
+    ImageId other_id{};
+    ForEachImageWithAddress(info.guest_address, [&](ImageId id, Image& other) {
+        if (id != image_id && other.info.guest_address == info.guest_address &&
+            other.info.bb_scaled != scaled && other.info.num_samples == 1 &&
+            other.info.props.is_depth == info.props.is_depth &&
+            other.info.pixel_format == info.pixel_format) {
+            other_id = id;
+        }
+    });
+    bool copied = false;
+    if (!other_id) {
+        BB::Upscale::TwinFailed(info.guest_address, "the other version is not in the cache");
+    } else if (!runtime.BBBlitScaled(&slot_images[other_id], &image)) {
+        BB::Upscale::TwinFailed(info.guest_address,
+                                fmt::format("{} cannot be blitted",
+                                            vk::to_string(info.pixel_format)));
+    } else {
+        copied = true;
+    }
+    BB::Upscale::TwinDone(info.guest_address, scaled, write, copied);
 }
 
 void TextureCache::RegisterMeta(VAddr address, MetaDataInfo info) {
@@ -752,6 +855,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
+    BBTwinSync(image_id, true);
 
     // Register meta data for this color buffer
     const VAddr cmask_addr = desc.info.meta_info.cmask_addr;
@@ -790,6 +894,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
+    BBTwinSync(image_id, true);
 
     // Register meta data for this depth buffer
     const VAddr htile_addr = desc.info.meta_info.htile_addr;
@@ -917,8 +1022,10 @@ void TextureCache::RefreshImage(Image& image) {
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth) {
-    // Compare and plain uses of one S# need separate samplers.
-    const u64 hash = HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth);
+    // Compare and plain uses of one S# need separate samplers. BB texture settings are part of
+    // the key so samplers built with different anisotropy or LOD bias are never shared.
+    const u64 hash = HashCombine(HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth),
+                                 BB::Texture::SettingsKey());
     const auto [it, new_sampler] = samplers.try_emplace(hash);
     if (new_sampler) {
         it->second = slot_samplers.Insert(instance, sharp, border_color_base, is_depth);

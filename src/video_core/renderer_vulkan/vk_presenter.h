@@ -7,6 +7,7 @@
 
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -38,6 +39,27 @@ struct Frame {
     u8 id{};
 
     ImTextureID imgui_texture;
+
+    // Bloodborne frame generation (bb_fg.h): the frame's inputs, and its image without the HUD
+    // (the same passes as the frame, on the upscaled image before the HUD).
+    BB::FG::Inputs fg{};
+    vk::Image fg_hudless{};
+    VmaAllocation fg_hudless_allocation{};
+    vk::ImageView fg_hudless_view{};
+    u32 fg_hudless_width{};
+    u32 fg_hudless_height{};
+    vk::Format fg_hudless_format{};
+    // bb-merge-082: that image scaled to the game image's size in the backbuffer (DLSS-G).
+    vk::Image fg_hudless_game{};
+    VmaAllocation fg_hudless_game_allocation{};
+    vk::ImageView fg_hudless_game_view{};
+    u32 fg_hudless_game_width{};
+    u32 fg_hudless_game_height{};
+    vk::Format fg_hudless_game_format{};
+    // 1.40 flash guard: this real frame must not be a frame generation pair end (guarded or a
+    // present-path switch).
+    bool bb_fg_skip = false;
+    u64 lat_index{}; // BB::AntiLag's index of the guest flip this frame shows (0: none)
 };
 
 enum SchedulerType {
@@ -108,6 +130,9 @@ private:
 
     void SetExpectedGameSize(s32 width, s32 height);
 
+    bool EnsureFgHudless(Frame* frame);
+    bool EnsureFgHudlessGame(Frame* frame, vk::Extent2D extent);
+
 private:
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
@@ -129,6 +154,7 @@ private:
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
+    int present_frames_total = 0;
     std::queue<Frame*> free_queue;
     Frame* last_submit_frame;
     std::mutex free_mutex;

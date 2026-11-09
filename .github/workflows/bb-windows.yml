@@ -1,0 +1,160 @@
+name: bb-windows
+on:
+  workflow_dispatch:
+  push:
+    branches: [bb-port, bb-upscale, bb-upscale-0171, bb-upscale-020, bb-upscale-021, bb-fg-022, bb-respatch-023]
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-2025-vs2026
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        fetch-depth: 1
+    - uses: egor-tensin/vs-shell@v2
+      with: { arch: x64 }
+    # Upscaler SDKs (src/video_core/bb), as the Demon's Souls builds fetch them: headers for the build,
+    # DLLs packaged next to shadPS4.exe. Never committed.
+    # FidelityFX DLL (FSR 3.1 upscaling and FSR 3 frame generation, BB_FG=amd-*): built from the
+    # SDK's v1.1.4 tag with tools/bb/fsr3-mfg/ffx-sdk-v1.1.4-mfg.patch (the Demon's Souls port41
+    # build's: multi frame generation x3 / x4, the dynamic multiplier, the pacing floor, Reflex on
+    # the real swapchain, and the command list pool fix). Unsigned; replaces AMD's DLL. The build
+    # fails rather than ship a DLL without the pool fix (the AMD MFG crashes of 10-31 / 11-01).
+    - name: FidelityFX DLL (patched, multi frame generation)
+      shell: pwsh
+      env:
+        VULKAN_VERSION: 1.3.296.0
+      run: |
+        $vk = "C:\VulkanSDK\$env:VULKAN_VERSION"
+        Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/VulkanSDK-$env:VULKAN_VERSION-Installer.exe" -OutFile "$env:RUNNER_TEMP\vksdk.exe"
+        Start-Process -Wait -FilePath "$env:RUNNER_TEMP\vksdk.exe" -ArgumentList '--root', $vk, '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+        if (!(Test-Path "$vk\Lib\vulkan-1.lib")) { Get-ChildItem $vk -ErrorAction SilentlyContinue; throw 'Vulkan SDK install failed' }
+        $env:VULKAN_SDK = $vk
+        $src = "$env:RUNNER_TEMP\ffx"
+        git -c core.autocrlf=false clone --depth 1 --branch v1.1.4 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK $src
+        if ($LASTEXITCODE) { throw 'SDK clone failed' }
+        git -C $src apply --verbose "$env:GITHUB_WORKSPACE\tools\bb\fsr3-mfg\ffx-sdk-v1.1.4-mfg.patch"
+        if ($LASTEXITCODE) { throw 'SDK patch failed' }
+        git -C $src apply --verbose "$env:GITHUB_WORKSPACE\tools\bb\fsr3-mfg\ffx-sdk-v1.1.4-display.patch"
+        if ($LASTEXITCODE) { throw 'SDK display patch failed' }
+        $configured = $false
+        foreach ($gen in @('Visual Studio 18 2026', 'Visual Studio 17 2022')) {
+          cmake -S "$src\ffx-api" -B "$src\ffx-api\build" -G $gen -A x64 -DFFX_API_BACKEND=VK_X64 "-DVulkan_INCLUDE_DIR=$vk\Include" "-DVulkan_LIBRARY=$vk\Lib\vulkan-1.lib"
+          if (!$LASTEXITCODE) { $configured = $true; break }
+          Remove-Item -Recurse -Force "$src\ffx-api\build" -ErrorAction SilentlyContinue
+        }
+        if (!$configured) { throw 'SDK configure failed' }
+        cmake --build "$src\ffx-api\build" --config Release --target amd_fidelityfx_vk --parallel 4 -- /p:CL_MPcount=4 /v:minimal
+        if ($LASTEXITCODE) { throw 'SDK build failed' }
+        New-Item -ItemType Directory -Force _Build\deps\ffx | Out-Null
+        $dll = Get-ChildItem "$src\ffx-api" -Recurse -Filter amd_fidelityfx_vk.dll | Where-Object FullName -notmatch 'PrebuiltSignedDLL' | Select-Object -First 1
+        if (!$dll) { throw 'amd_fidelityfx_vk.dll not built' }
+        Copy-Item $dll.FullName _Build\deps\ffx\amd_fidelityfx_vk.dll
+        Copy-Item "$src\LICENSE.txt" _Build\deps\ffx\FidelityFX-LICENSE.txt
+        $ffxText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes('_Build\deps\ffx\amd_fidelityfx_vk.dll'))
+        if (!$ffxText.Contains('command lists of queue family')) { throw 'amd_fidelityfx_vk.dll lacks the command list pool fix' }
+        if (!$ffxText.Contains('KYTY_FSR3_FG_ACTIVE')) { throw 'amd_fidelityfx_vk.dll lacks the dynamic multiplier' }
+        if (!$ffxText.Contains('kytyFfxSetPaceSlot') -or !$ffxText.Contains('kytyFfxTakePaceStats')) { throw 'amd_fidelityfx_vk.dll lacks the midpoint pacing' }
+        if (!$ffxText.Contains('kytyFfxTakeDisplayIds') -or !$ffxText.Contains('KYTY_FSR3_DISPLAY_IDS')) { throw 'amd_fidelityfx_vk.dll lacks the display ids' }
+        Get-ChildItem _Build\deps\ffx | ForEach-Object { '{0,12:N0}  {1}  md5 {2}' -f $_.Length, $_.Name, (Get-FileHash -Algorithm MD5 $_.FullName).Hash.ToLower() }
+    - name: Streamline SDK (DLSS)
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        STREAMLINE_VERSION: v2.14.16
+      run: |
+        $zips = '_Build\deps\streamline-zip'
+        $unpacked = '_Build\deps\streamline-unpacked'
+        New-Item -ItemType Directory -Force $zips, $unpacked | Out-Null
+        gh release download $env:STREAMLINE_VERSION --repo NVIDIA-RTX/Streamline --pattern '*.zip' --dir $zips
+        if ($LASTEXITCODE -or !(Get-ChildItem $zips -Filter *.zip)) {
+          git lfs install
+          git clone --depth 1 --branch $env:STREAMLINE_VERSION https://github.com/NVIDIA-RTX/Streamline "$unpacked\repo"
+          if ($LASTEXITCODE) { throw 'Streamline clone failed' }
+          git -C "$unpacked\repo" lfs pull
+          $global:LASTEXITCODE = 0
+        }
+        Get-ChildItem $zips -Filter *.zip | ForEach-Object { Expand-Archive $_.FullName (Join-Path $unpacked $_.BaseName) -Force }
+        $header = Get-ChildItem $unpacked -Recurse -Filter sl.h | Where-Object { $_.Directory.Name -eq 'include' } |
+          Where-Object { Test-Path (Join-Path $_.Directory.Parent.FullName 'bin\x64\sl.interposer.dll') } | Select-Object -First 1
+        if (!$header) { throw 'no include\sl.h with bin\x64\sl.interposer.dll' }
+        New-Item -ItemType Directory -Force _Build\deps\streamline | Out-Null
+        Move-Item $header.Directory.Parent.FullName _Build\deps\streamline\sdk
+        # DLSS-G Preset C (BB_DLSSG_PRESET=C, the default as in Demon's Souls) needs nvngx_dlssg.dll >= 310.9.16:
+        # when Streamline's is older, NVIDIA's from the official DLSS SDK release (as the DS workflow does).
+        $dlssg = '_Build\deps\streamline\sdk\bin\x64\nvngx_dlssg.dll'
+        $have = if (Test-Path $dlssg) { [version](Get-Item $dlssg).VersionInfo.FileVersion.Replace(',', '.').Split(' ')[0] } else { [version]'0.0' }
+        Write-Host "Streamline's nvngx_dlssg.dll: $have"
+        if ($have -lt [version]'310.9.16') {
+          git clone --depth 1 --branch v310.9.16 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS _Build\deps\dlss
+          if ($LASTEXITCODE) { throw 'DLSS SDK clone failed' }
+          git -C _Build\deps\dlss sparse-checkout set --no-cone /lib/Windows_x86_64/rel/nvngx_dlssg.dll /LICENSE.txt
+          $new = '_Build\deps\dlss\lib\Windows_x86_64\rel\nvngx_dlssg.dll'
+          if (!(Test-Path $new)) { throw 'no nvngx_dlssg.dll in the DLSS SDK' }
+          Copy-Item $new $dlssg -Force
+          Write-Host "nvngx_dlssg.dll from DLSS v310.9.16: $((Get-Item $dlssg).VersionInfo.FileVersion)"
+        }
+        # Never shipped: nvngx_dlssnr.dll (not used here).
+        Remove-Item _Build\deps\streamline\sdk\bin\x64\nvngx_dlssnr.dll -ErrorAction SilentlyContinue
+        # Only NVIDIA-signed Streamline files (the emulator checks sl.interposer.dll's signer too).
+        foreach ($f in Get-ChildItem _Build\deps\streamline\sdk\bin\x64 -Filter *.dll) {
+          $sig = Get-AuthenticodeSignature $f.FullName
+          $signer = if ($sig.SignerCertificate) { $sig.SignerCertificate.GetNameInfo('SimpleName', $false) } else { '' }
+          '{0,12:N0}  {1}  {2} {3}' -f $f.Length, $f.Name, $sig.Status, $signer
+          if ($signer -ne 'NVIDIA Corporation') { throw "$($f.Name) is not signed by NVIDIA Corporation" }
+        }
+    - name: XeSS SDK
+      shell: pwsh
+      env:
+        XESS_VERSION: v3.0.2
+      run: |
+        git clone --depth 1 --branch $env:XESS_VERSION https://github.com/intel/xess _Build\deps\xess
+        if ($LASTEXITCODE) { throw 'XeSS clone failed' }
+        if (!(Test-Path _Build\deps\xess\inc\xess\xess_vk.h) -or !(Test-Path _Build\deps\xess\bin\libxess.dll)) { throw 'no xess_vk.h or libxess.dll' }
+    - name: Configure
+      run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+    - name: Build
+      shell: pwsh
+      run: |
+        cmake --build build --config Release --parallel $env:NUMBER_OF_PROCESSORS -- -k 0 2>&1 | Tee-Object build.log
+        $code = $LASTEXITCODE
+        if ($code) {
+          Select-String -Path build.log -Pattern 'error: |error [A-Z]+[0-9]+|FAILED: |undefined symbol' |
+            Select-Object -First 40 | ForEach-Object { Write-Output ("::error::" + $_.Line.Substring(0, [Math]::Min(900, $_.Line.Length))) }
+          exit $code
+        }
+    - name: Package
+      shell: pwsh
+      run: |
+        $out = 'out'
+        New-Item -ItemType Directory -Force $out, "$out\LICENSES", "$out\streamline" | Out-Null
+        Copy-Item build\shadPS4.exe $out
+        Copy-Item LICENSE "$out\LICENSES\shadPS4-GPL-2.0.txt"
+        Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"
+        if (Get-ChildItem $out -Recurse -Filter nvngx_dlssnr.dll) { throw 'nvngx_dlssnr.dll must never be shipped' }
+        Copy-Item LICENSES\Streamline-MIT.txt "$out\LICENSES\Streamline-MIT.txt"
+        Copy-Item LICENSES\FoveatedDLSS5-RenoDX-MIT.txt "$out\LICENSES\FoveatedDLSS5-RenoDX-MIT.txt"
+        Copy-Item _Build\deps\xess\bin\libxess.dll $out
+        Copy-Item _Build\deps\xess\LICENSE.txt "$out\LICENSES\XeSS-LICENSE.txt"
+        Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll $out
+        Copy-Item _Build\deps\ffx\FidelityFX-LICENSE.txt "$out\LICENSES\FidelityFX-LICENSE.txt"
+        Copy-Item fsr4_shaders "$out\fsr4_shaders" -Recurse
+        Copy-Item fsr4_shaders\LICENSE-FSR4-v07.txt "$out\LICENSES\FSR4-v07-LICENSE.txt"
+        Copy-Item documents\BB-UPSCALING.md "$out\BB-UPSCALING.md"
+        Copy-Item tools\bb\*.cmd, tools\bb\*.ps1 $out
+        Copy-Item tools\bb\menu_assets "$out\menu_assets" -Recurse
+        foreach ($f in 'mando-ps4.png','mando-ps5.png','mando-8bitdo.png','raton.png','fonts\Cinzel-SemiBold.ttf','fonts\CormorantGaramond-Medium.ttf','fonts\CormorantGaramond-MediumItalic.ttf','fonts\Inter-Medium.ttf') { if (!(Test-Path "$out\menu_assets\$f")) { throw "menu asset missing: $f" } }
+        Copy-Item tools\bb\menu_assets\fonts\OFL-*.txt "$out\LICENSES"
+        7z a bb-port-win64.zip ".\$out\*" | Out-Null
+        $h = (Get-FileHash -Algorithm MD5 "$out\shadPS4.exe").Hash.ToLower()
+        $z = (Get-FileHash -Algorithm MD5 bb-port-win64.zip).Hash.ToLower()
+        "$h  out/shadPS4.exe`n$z  bb-port-win64.zip" | Tee-Object md5.txt
+    - name: Draft release
+      shell: bash
+      env: { GH_TOKEN: "${{ github.token }}" }
+      run: |
+        tag="${GITHUB_REF_NAME}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+        gh release create "$tag" bb-port-win64.zip md5.txt --draft --target "$GITHUB_SHA" \
+          --title "$tag (draft, untested)" --notes "Automated draft build of branch ${GITHUB_REF_NAME}. Not a release."

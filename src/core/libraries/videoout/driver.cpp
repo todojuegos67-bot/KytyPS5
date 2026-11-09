@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -8,6 +11,8 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#include "video_core/bb/bb_antilag.h"
+#include "video_core/bb/bb_fg.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -233,12 +238,76 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+// 1.51 (bb-fgmv-151): the last guest flip, for the overlay redraw rule below.
+static std::atomic<s64> g_bb_last_flip_ns{0};
+static s64 BBNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+// 1.51: an ImGui overlay (trophy toast, F1 menu) used to re-present the last frame on every vblank
+// tick without a guest flip (DrawLastFrame). With frame generation on, each of those presents is a
+// "real" frame with no inputs: FSR 3 FG toggled off / on every other present (r149_0451: "FSR3 FG:
+// off (no 3D frame)" 1035 times, 28 of 84 presents a second), which ghosted the HUD / overlay and
+// ended in a stuck image. With FG on, the overlay is redrawn only by guest flips while the game
+// flips; on our own only after 250 ms without a flip (paused / menu). BB_OVERLAY_REDRAW=1: old.
+static bool BBOverlayRedrawAllowed() {
+    static const bool old = [] {
+        const char* e = std::getenv("BB_OVERLAY_REDRAW");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (old || BB::FG::Cfg().kind == BB::FG::Kind::Off) return true;
+    return BBNowNs() - g_bb_last_flip_ns.load(std::memory_order_relaxed) > 250'000'000;
+}
+
 void VideoOutDriver::Flip(const Request& req) {
+    g_bb_last_flip_ns.store(BBNowNs(), std::memory_order_relaxed);
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
-    // Present the frame.
+    // Present the frame (BB::AntiLag: its guest flip's present markers around it).
+    const u64 lat_index = req.frame != nullptr ? req.frame->lat_index : 0;
+    BB::AntiLag::OnPresent(lat_index);
+    BB::FG::SetPresentSlot({req.pace_qpc, req.pace_interval});
     presenter->Present(req.frame);
+    BB::FG::SetPresentSlot({});
+    BB::AntiLag::AfterPresent(lat_index);
+    if (BB::AntiLag::ReflexActive() && req.frame != nullptr) {
+        const int vblanks = req.port->flip_rate + 1;
+        double game_ms =
+            vblanks > 1 ? 1000.0 / EmulatorSettings.GetVblankFrequency() * vblanks : 0.0;
+        // 0.72 one limiter: when the frame generation pacer (PaceGuestFlip, BB_FG_PACE=guest)
+        // already holds the flips to an interval at least as long as the game's own, it stays the
+        // only limit (0.70 pacing and the FSR 3 midpoint slots unchanged) and Reflex gets no
+        // minimum interval; otherwise the pacer never waits and Reflex holds the game's cadence.
+        const double pace_ms = BB::FG::PacerIntervalMs();
+        const bool pacer_holds = pace_ms > 0.0 && game_ms > 0.0 && pace_ms >= game_ms * 0.995;
+        static int said = -1;
+        if (game_ms > 0.0 && static_cast<int>(pacer_holds) != said) {
+            said = pacer_holds ? 1 : 0;
+            BB::FG::Printf("[reflex] one limiter: %s (game flip interval %.2f ms, pacer grid %.2f ms)",
+                           pacer_holds ? "the frame generation pacer holds the flips; Reflex game limit off"
+                                       : "Reflex holds the game's flip interval; the pacer grid is shorter",
+                           game_ms, pace_ms);
+        }
+        if (pacer_holds) {
+            game_ms = 0.0;
+        }
+        BB::AntiLag::SetGameInterval(game_ms);
+    }
+    if (BB::AntiLag::PaceOn() || BB::AntiLag::PhaseOn() || BB::AntiLag::PadLateOn()) {
+        // KYTY_LOWLAT pacing / Anti-Lag+ pad late (the DS videoOut rule): the game's own flip
+        // interval (flip rate + 1 vblanks) when it is above one vblank, else 0 (the pacing off).
+        const double vblank_ms = 1000.0 / EmulatorSettings.GetVblankFrequency();
+        const int vblanks = req.port->flip_rate + 1;
+        BB::AntiLag::SetPaceCap(req.frame != nullptr && vblanks > 1 ? vblank_ms * vblanks : 0.0,
+                                vblank_ms);
+    }
+    BB::AntiLag::OnFlipReleased(lat_index);
+    if (BB::AntiLag::PhaseOn()) {
+        BB::AntiLag::PhaseRelease(-1.0);
+    }
+    BB::AntiLag::OnPresented(lat_index);
 
     // Update flip status.
     auto* port = req.port;
@@ -304,18 +373,30 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
+    // Frame generation: the real frames held to its limit at the game's own flip (bb_fg.h); the
+    // flip's grid slot goes with its request (the frame generation presents).
+    BB::FG::PresentSlot pace{};
+    if (index != -1) {
+        pace = BB::FG::PaceGuestFlip();
+        BB::FG::GameFlipReserved();
+    }
+    // BB::AntiLag: the game's CPU frame ends at its flip.
+    const u64 lat_index = BB::AntiLag::OnFlipReserved();
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand([=, this]() {
+            SubmitFlipInternal(port, index, flip_arg, is_eop, lat_index, pace.qpc, pace.interval);
+        });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, lat_index, pace.qpc, pace.interval);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        u64 lat_index, s64 pace_qpc, s64 pace_interval) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -325,15 +406,31 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
+    if (frame != nullptr) {
+        frame->lat_index = lat_index;
+        BB::AntiLag::OnFlipReady(lat_index);
+        // KYTY_LOWLAT (Anti-Lag / Anti-Lag+): this frame's last host GPU tick (the DS
+        // FlipPreparation hook); the timeline wait at the next controller read uses it.
+        if (BB::AntiLag::OwnLowLatencyOn() && frame->ready_tick > 0) {
+            BB::AntiLag::OnFrameSubmitted(VK_NULL_HANDLE,
+                                          static_cast<VkSemaphore>(frame->ready_semaphore),
+                                          frame->ready_tick);
+        }
+    }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-    });
+    {
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+            .pace_qpc = pace_qpc,
+            .pace_interval = pace_interval,
+        });
+    }
+    request_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -355,8 +452,49 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    // BB::FG::PresentOnArrival (bb-pace-049): under the real fps cap the game's flips are already
+    // held to their grid at the submit (PaceGuestFlip), so a flip is presented as it arrives
+    // instead of at the next emulated vblank (240 Hz: up to 4.17 ms later on the vblank timer's own
+    // phase, 16.67 + 4.17 = 20.8 ms intervals); the vblanks keep their own timer.
+    const auto wait_tick_or_flip = [&](std::chrono::nanoseconds wait) {
+        const auto deadline = std::chrono::steady_clock::now() + wait;
+        while (!token.stop_requested()) {
+            Request request{};
+            bool got = false;
+            {
+                std::unique_lock lk{mutex};
+                request_cv.wait_until(lk, deadline, [&] {
+                    return !requests.empty() || token.stop_requested();
+                });
+                if (!requests.empty()) {
+                    request = requests.front();
+                    requests.pop();
+                    got = true;
+                }
+            }
+            if (!got) {
+                break;
+            }
+            if (request) {
+                Flip(request);
+                FRAME_END;
+            }
+        }
+        // The condition variable's timeout is as coarse as the system timer: the rest accurately.
+        const auto left = deadline - std::chrono::steady_clock::now();
+        if (left > std::chrono::nanoseconds{0} && !token.stop_requested()) {
+            Common::AccurateSleep(std::chrono::duration_cast<std::chrono::nanoseconds>(left),
+                                  nullptr, false);
+        }
+    };
+
     while (!token.stop_requested()) {
-        timer.Start();
+        if (BB::FG::PresentOnArrival() && main_port.flip_rate == 0 && main_port.is_open &&
+            !DebugState.IsGuestThreadsPaused()) {
+            timer.Start(wait_tick_or_flip);
+        } else {
+            timer.Start();
+        }
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
@@ -372,7 +510,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing()) {
+                    } else if (ImGui::Core::MustKeepDrawing() && BBOverlayRedrawAllowed()) {
                         DrawLastFrame();
                     }
                 }

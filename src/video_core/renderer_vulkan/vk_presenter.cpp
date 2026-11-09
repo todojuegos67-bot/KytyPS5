@@ -21,6 +21,12 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/bb/bb_objmv.h"
+#include "video_core/bb/bb_analyze.h"
+#include "video_core/bb/bb_fg.h"
+#include "video_core/bb/bb_imgfg.h"
+#include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_metrics.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -470,7 +476,19 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
-    const u32 num_images = swapchain.GetImageCount();
+    // bb-dlss5perf-106: the presentation frames were as many as the swapchain images (3 on most
+    // NVIDIA drivers), so GetRenderFrame waited on the GPU fence of the frame before last and the
+    // flip thread stalled on the GPU whenever a frame ran long: CPU and GPU in lock step. At
+    // least 4 now (BB_PRESENT_FRAMES=2..8; frame generation keeps 8 capture slots), so the
+    // CPU records the next flip while the GPU still finishes the previous two.
+    const u32 num_images = [&] {
+        u32 n = std::max<u32>(swapchain.GetImageCount(), 4u);
+        if (const char* v = std::getenv("BB_PRESENT_FRAMES"); v != nullptr && *v != '\0') {
+            n = static_cast<u32>(std::clamp(std::atoi(v), 2, 8));
+        }
+        return n;
+    }();
+    present_frames_total = static_cast<int>(num_images);
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
@@ -591,6 +609,184 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->is_hdr = swapchain.GetHDR();
 }
 
+// 1.51 (bb-fgmv-151): the overlay layer for frame generation (BB::FG::WantsUiLayer): three
+// images in turn, the swapchain's format and size, cleared transparent and drawn by ImGui with
+// every window after the game display (toasts, F1 menu, metrics).
+namespace {
+struct BBUiLayer {
+    vk::Image image{};
+    VmaAllocation allocation{};
+    vk::ImageView view{};
+    vk::Format format = vk::Format::eUndefined;
+    vk::Extent2D extent{};
+};
+std::array<BBUiLayer, 3> g_bb_ui{};
+u32 g_bb_ui_next = 0;
+
+BBUiLayer* BBEnsureUiLayer(const Instance& instance, vk::Format format, vk::Extent2D extent) {
+    auto& l = g_bb_ui[g_bb_ui_next];
+    g_bb_ui_next = (g_bb_ui_next + 1) % g_bb_ui.size();
+    if (l.image && l.format == format && l.extent == extent) return &l;
+    const vk::Device device = instance.GetDevice();
+    if (l.image) {
+        (void)device.waitIdle();
+        device.destroyImageView(l.view);
+        vmaDestroyImage(instance.GetAllocator(), l.image, l.allocation);
+        l = {};
+    }
+    const VkImageCreateInfo image_info = vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferSrc,
+    };
+    const VmaAllocationCreateInfo alloc_info = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &image, &l.allocation,
+                       nullptr) != VK_SUCCESS) {
+        return nullptr;
+    }
+    l.image = vk::Image{image};
+    const auto [result, view] = device.createImageView(vk::ImageViewCreateInfo{
+        .image = l.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (result != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), l.image, l.allocation);
+        l = {};
+        return nullptr;
+    }
+    l.view = view;
+    l.format = format;
+    l.extent = extent;
+    return &l;
+}
+} // namespace
+
+bool Presenter::EnsureFgHudless(Frame* frame) {
+    const vk::Format format = swapchain.GetSurfaceFormat().format;
+    if (frame->fg_hudless && frame->fg_hudless_width == frame->width &&
+        frame->fg_hudless_height == frame->height && frame->fg_hudless_format == format) {
+        return true;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (frame->fg_hudless) {
+        (void)device.waitIdle();
+        device.destroyImageView(frame->fg_hudless_view);
+        vmaDestroyImage(instance.GetAllocator(), frame->fg_hudless, frame->fg_hudless_allocation);
+        frame->fg_hudless = vk::Image{};
+        frame->fg_hudless_view = vk::ImageView{};
+    }
+    const VkImageCreateInfo image_info = vk::ImageCreateInfo{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {frame->width, frame->height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferSrc,
+    };
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &image,
+                       &frame->fg_hudless_allocation, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    frame->fg_hudless = vk::Image{image};
+    const auto [result, view] = device.createImageView(vk::ImageViewCreateInfo{
+        .image = frame->fg_hudless,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    });
+    if (result != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), frame->fg_hudless, frame->fg_hudless_allocation);
+        frame->fg_hudless = vk::Image{};
+        return false;
+    }
+    frame->fg_hudless_view = view;
+    frame->fg_hudless_width = frame->width;
+    frame->fg_hudless_height = frame->height;
+    frame->fg_hudless_format = format;
+    return true;
+}
+
+bool Presenter::EnsureFgHudlessGame(Frame* frame, vk::Extent2D extent) {
+    const vk::Format format = frame->fg_hudless_format;
+    if (frame->fg_hudless_game && frame->fg_hudless_game_width == extent.width &&
+        frame->fg_hudless_game_height == extent.height && frame->fg_hudless_game_format == format) {
+        return true;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (frame->fg_hudless_game) {
+        (void)device.waitIdle();
+        device.destroyImageView(frame->fg_hudless_game_view);
+        vmaDestroyImage(instance.GetAllocator(), frame->fg_hudless_game,
+                        frame->fg_hudless_game_allocation);
+        frame->fg_hudless_game = vk::Image{};
+        frame->fg_hudless_game_view = vk::ImageView{};
+    }
+    const VkImageCreateInfo image_info = vk::ImageCreateInfo{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+    };
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &image,
+                       &frame->fg_hudless_game_allocation, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    frame->fg_hudless_game = vk::Image{image};
+    const auto [result, view] = device.createImageView(vk::ImageViewCreateInfo{
+        .image = frame->fg_hudless_game,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    });
+    if (result != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), frame->fg_hudless_game,
+                        frame->fg_hudless_game_allocation);
+        frame->fg_hudless_game = vk::Image{};
+        return false;
+    }
+    frame->fg_hudless_game_view = view;
+    frame->fg_hudless_game_width = extent.width;
+    frame->fg_hudless_game_height = extent.height;
+    frame->fg_hudless_game_format = format;
+    return true;
+}
+
 Frame* Presenter::PrepareLastFrame() {
     if (last_submit_frame == nullptr) {
         return nullptr;
@@ -668,8 +864,33 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
+    if (BB::Analyze::Enabled()) {
+        const auto& bb_img = texture_cache.GetImage(image_id);
+        BB::Analyze::OnPresent(bb_img.info.size.width, bb_img.info.size.height,
+                               bb_img.info.pixel_format, cpu_address);
+    }
+    if (BB::Upscale::Enabled() || BB::Analyze::Enabled() || BB::Upscale::RtReflect()) {
+        const auto& bb_img = texture_cache.GetImage(image_id);
+        BB::Upscale::OnFlip(cpu_address, bb_img.info.size.width, bb_img.info.size.height);
+        BB::ObjMotion::OnFlip();
+    }
 
     Frame* frame = GetRenderFrame();
+    if (BB::Upscale::Enabled()) {
+        // The presentation size (the window's game area): the upscaler's output size.
+        // The output is the real window/swapchain size (DSR fullscreen may make this
+        // 3840x2160 on a 1440p panel). Never shrink it to the desktop mode or panel size;
+        // only sanity-clamp against the swapchain extent itself.
+        u32 bb_w = frame->width, bb_h = frame->height;
+        const vk::Extent2D bb_ext = swapchain.GetExtent();
+        if (bb_ext.width > 0 && bb_ext.height > 0) {
+            // 1.37: the swapchain extent itself. The render frame follows the last presented
+            // size, so 1704 x 1.5 = 2556 fed back into the next frame's output (window 2560).
+            bb_w = bb_ext.width;
+            bb_h = bb_ext.height;
+        }
+        BB::Upscale::SetPresentSize(bb_w, bb_h);
+    }
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -734,20 +955,234 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
     }
 
+    rasterizer->BBSetPresentViewFormat(view_info.format);
+    // Bloodborne: no HUD point this frame (no HUD drawn): the window-size upscale runs here.
+    if (BB::Upscale::Enabled() && BB::Upscale::TakeLateUpscale()) {
+        if (BB::Upscale::FgNative()) {
+            // 0.39: frame generation without an upscaler: inputs only, the image unchanged.
+            (void)rasterizer->BBFgNativeAnalyze(image, true);
+        } else if (!rasterizer->BBPresentUpscale(image, true)) {
+            BB::Upscale::OnPresentFailed(rasterizer->BBPresentWhy());
+        }
+    }
+
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
+    // (Bloodborne upscaling: the HUD composite, BBPresentComposite, reads the flip image from a
+    // compute shader, so the barrier must cover the compute stage too; without an upscaler the
+    // barrier is the official one.)
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+                    BB::Upscale::Enabled() ? vk::PipelineStageFlagBits2::eFragmentShader |
+                                                 vk::PipelineStageFlagBits2::eComputeShader
+                                           : vk::PipelineStageFlagBits2::eFragmentShader,
+                    vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
 
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
+    // Bloodborne upscaling to the window size: the upscaled image with the HUD on top instead.
+    vk::Extent2D bb_size = image_size;
+    bool bb_presented = false;
+    if (vk::ImageView bb_view{}; BB::Upscale::Enabled() &&
+                                 rasterizer->BBHudSharpPresent(cmdbuf, image, view_info.format,
+                                                               bb_view, bb_size)) {
+        // 1.07 sharp HUD: the output-size canvas (upscaled scene + the HUD drawn at that size).
+        image_view = bb_view;
+        bb_presented = true;
+        BB::Upscale::OnPresentResult(true, "");
+    } else if (vk::ImageView bb_view{}; BB::Upscale::Enabled() &&
+                                 rasterizer->BBPresentComposite(cmdbuf, image, view_info.format,
+                                                                bb_view, bb_size)) {
+        image_view = bb_view;
+        bb_presented = true;
+        if (BB::Upscale::Enabled()) BB::Upscale::OnPresentResult(true, "");
+    } else {
+        bb_size = image_size;
+        if (BB::Upscale::Enabled()) BB::Upscale::OnPresentResult(false, rasterizer->BBPresentWhy());
+    }
+
+    vk::Extent2D fsr_out{frame->width, frame->height};
+    auto frame_fsr = fsr_settings;
+    // Bloodborne: a menu, loading screen or movie (no 3D scene, so no upscaler above) is scaled
+    // to the window by the spatial FSR 1 pass instead of a plain (blurry) stretch.
+    const bool bb_2d = BB::Upscale::Enabled() && !bb_presented && BB::Upscale::FlipIs2D();
+    const bool bb_menu = !bb_presented && BB::Upscale::Enabled() && BB::Upscale::MenuUpscaleWanted();
+    const bool bb_smaller = bb_size.width < frame->width || bb_size.height < frame->height;
+    if (!bb_presented && BB::Upscale::Enabled() && (bb_menu || BB::Upscale::SceneSpatialFallback()) &&
+        (bb_size.width != frame->width || bb_size.height != frame->height)) {
+        frame_fsr.enable = true;
+        frame_fsr.sharpen_only = false;
+        // 0.48: a 2D frame (menu, loading screen, text) is EASU-upscaled and always sharpened by
+        // RCAS (text-friendly strength, BB_2D_RCAS), whatever the emulator's own RCAS setting.
+        if (bb_menu && BB::Upscale::Menu2DRcas() >= 0.0f) {
+            frame_fsr.use_rcas = true;
+            frame_fsr.rcas_attenuation = BB::Upscale::Menu2DRcas();
+        }
+    } else if ((bb_presented || (BB::Upscale::Enabled() && BB::Upscale::LastFrameUpscaled())) &&
+        (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss ||
+                         BB::Upscale::Cfg().kind == BB::SR::Kind::Xess ||
+                         BB::Upscale::Cfg().kind == BB::SR::Kind::Native) &&
+        BB::Upscale::LiveSharpness() > 0.0f) {
+        frame_fsr.enable = true;
+        frame_fsr.use_rcas = true;
+        frame_fsr.sharpen_only = true;
+        frame_fsr.rcas_attenuation = (1.0f - BB::Upscale::LiveSharpness()) * 2.0f;
+        fsr_out = bb_size;
+    }
+    if (bb_2d) {
+        // 0.48: the [2d] counter: did this 2D flip go through FSR 1 or a plain stretch?
+        const bool fsr1 = frame_fsr.enable && !frame_fsr.sharpen_only && bb_smaller;
+        const char* why = BB::Upscale::Menu2DWhyNot();
+        BB::Upscale::Note2DFlip(fsr1 ? (frame_fsr.use_rcas ? 0 : 1)
+                                : (bb_size.width == frame->width &&
+                                   bb_size.height == frame->height)
+                                    ? 2
+                                    : 3,
+                                fsr1 ? ""
+                                : *why != '\0' ? why
+                                : !bb_smaller   ? "larger than the window (downscale)"
+                                                : "FSR 1 not enabled for this flip");
+    }
+    {
+        // 0.69: the per-second [frame] line (bb_upscale_init.log): upscaler, internal and window
+        // size, and whether the 2D layer (HUD, menus, text) reached the window size scaled.
+        using BB::Upscale::Hud2D;
+        const bool up3d = BB::Upscale::Enabled() && (bb_presented || BB::Upscale::LastFrameUpscaled());
+        const bool is2d = BB::Upscale::Enabled() ? BB::Upscale::FlipIs2D() : false;
+        const bool same = image_size.width == frame->width && image_size.height == frame->height;
+        const bool bigger = image_size.width > frame->width || image_size.height > frame->height;
+        const bool spatial = frame_fsr.enable && !frame_fsr.sharpen_only &&
+                             (bb_size.width < frame->width || bb_size.height < frame->height);
+        u32 in_w = image_size.width, in_h = image_size.height;
+        const char* path = "no upscaler";
+        Hud2D hud = same ? Hud2D::Native : bigger ? Hud2D::Downscaled
+                                         : spatial ? Hud2D::Spatial : Hud2D::Stretched;
+        if (bb_presented && Rasterizer::BBHudSharpPresented()) {
+            // 1.16: the scene upscaled before the HUD, the HUD drawn by the game at this size.
+            path = "before-HUD path (3D upscaled before the HUD, HUD rasterised at the output "
+                   "size)";
+            hud = Hud2D::Native;
+        } else if (bb_presented) {
+            path = "window path (3D upscaled, HUD layer added at the window size)";
+            hud = BB::Upscale::HudSharpScale(image_size.width, image_size.height, bb_size.width,
+                                             bb_size.height)
+                      ? Hud2D::Upscaled
+                      : Hud2D::Stretched;
+        } else if (up3d) {
+            const auto& plan = BB::Upscale::CurrentPlan();
+            if (plan.render_w != 0) {
+                in_w = plan.render_w;
+                in_h = plan.render_h;
+            }
+            path = plan.scene_mode ? "in-game (before post-processing)"
+                                   : "in-game (at the game's scene-to-UI composite)";
+        } else if (is2d) {
+            path = "2D frame (no 3D scene: spatial only)";
+        } else if (BB::Upscale::Enabled()) {
+            path = "3D frame not upscaled (temporal not ready)";
+        }
+        BB::Upscale::NoteFullFrame(path, in_w, in_h, frame->width, frame->height, hud,
+                                   BB::Upscale::Enabled() && !is2d);
+    }
+    image_view = fsr_pass.Render(cmdbuf, image_view, bb_size, fsr_out, frame_fsr, frame->is_hdr);
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    pp_pass.Render(cmdbuf, image_view, bb_size, *frame, pp_settings);
+
+    // Bloodborne frame generation (bb_fg.h): this frame's depth, motion vectors and camera, and
+    // its image without the HUD through the same passes (FSR / sharpening and post-processing).
+    frame->fg = {};
+    if (BB::FG::WantInputs()) {
+        rasterizer->BBHudlessLut(image); // (the in-place path's HUD-less image, self-checked)
+    }
+    if (vk::ImageView fg_source{};
+        BB::FG::WantInputs() &&
+        rasterizer->BBFrameGenCapture(frame->id, frame->fg, fg_source, view_info.format) &&
+        fg_source && EnsureFgHudless(frame)) {
+        const auto fg_cmd = draw_scheduler.CommandBuffer();
+        const vk::MemoryBarrier2 war{
+            .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                            vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite |
+                             vk::AccessFlagBits2::eColorAttachmentWrite,
+        };
+        const vk::ImageMemoryBarrier2 to_attachment{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = frame->fg_hudless,
+            .subresourceRange{frame_subresources},
+        };
+        fg_cmd.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &war,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &to_attachment,
+        });
+        const auto fg_view =
+            fsr_pass.Render(fg_cmd, fg_source, bb_size, fsr_out, frame_fsr, frame->is_hdr);
+        Frame hudless_frame = *frame;
+        hudless_frame.image = frame->fg_hudless;
+        hudless_frame.image_view = frame->fg_hudless_view;
+        pp_pass.Render(fg_cmd, fg_view, bb_size, hudless_frame, pp_settings);
+        const vk::ImageMemoryBarrier2 to_read{
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                            vk::PipelineStageFlagBits2::eFragmentShader,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = frame->fg_hudless,
+            .subresourceRange{frame_subresources},
+        };
+        fg_cmd.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &to_read,
+        });
+        frame->fg.hudless = {frame->fg_hudless, frame->fg_hudless_view, frame->fg_hudless_format,
+                             vk::Extent2D{frame->fg_hudless_width, frame->fg_hudless_height},
+                             vk::ImageUsageFlagBits::eColorAttachment |
+                                 vk::ImageUsageFlagBits::eSampled |
+                                 vk::ImageUsageFlagBits::eTransferSrc};
+        frame->fg.has_hudless = true;
+    }
+    {
+        // 1.40 flash guard: frame generation never pairs a real frame with one from another
+        // present path (canvas / 1.14 composite / the game's own flip / a guarded repeat), nor
+        // uses a guarded (repeated) frame as a pair end: no interpolation for this real frame.
+        static int last_path = -1;
+        const bool guarded = BB::Upscale::Enabled() && Rasterizer::BBFlashGuarded();
+        const int path = !BB::Upscale::Enabled()                              ? 0
+                         : guarded                                            ? 3
+                         : bb_presented && Rasterizer::BBHudSharpPresented() ? 1
+                         : bb_presented                                       ? 2
+                                                                              : 0;
+        frame->bb_fg_skip = guarded || (last_path >= 0 && path != last_path);
+        last_path = path;
+        if (frame->bb_fg_skip) {
+            if (frame->fg.valid && BB::FG::WantInputs()) Rasterizer::BBFlashGuardFgSkip();
+            frame->fg.valid = false;
+            frame->fg.has_hudless = false;
+            frame->fg.reset = true;
+        }
+    }
+    if (BB::Upscale::Enabled()) {
+        rasterizer->BBHudAlphaCheck(image); // BB_HUD_DIAG=1 only
+    }
+    // DLSS-G's Reflex markers at the guest frame boundary (as Demon's Souls).
+    frame->fg.reflex_index = BB::FG::GuestFlip();
+    if (BB::Upscale::Enabled()) {
+        Rasterizer::BBStampPresentEnd(draw_scheduler.CommandBuffer());
+    }
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -880,6 +1315,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+    vk::Rect2D fg_region{.offset = {0, 0}, .extent = swapchain.GetExtent()};
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 
@@ -979,6 +1415,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 };
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
+                {
+                    const ImVec2 at = ImGui::GetCursorScreenPos();
+                    fg_region = vk::Rect2D{
+                        .offset = {static_cast<s32>(at.x), static_cast<s32>(at.y)},
+                        .extent = imgRect.extent,
+                    };
+                }
                 ImGui::Image(game_texture, size);
 
                 if (EmulatorSettings.IsNullGPU()) {
@@ -989,7 +1432,145 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             ImGui::PopStyleVar(3);
             ImGui::PopStyleColor();
         }
-        ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+        // bb-merge-082: DLSS-G's HUD-less image must be as large as the game image it is tagged
+        // with (fg_region), which is not the frame's size when the frame is scaled into the window
+        // (Streamline would refuse a HUD-less image of another size; before this the tag was
+        // dropped: "HUD-less 0"). A linear blit of the frame's HUD-less image to that size.
+        frame->fg.has_hudless_game = false;
+        if (!is_reusing_frame && is_game_frame && frame->fg.valid && frame->fg.has_hudless &&
+            frame->fg_hudless && !swapchain.GetHDR() && BB::FG::WantsGameSizedHudless() &&
+            fg_region.extent.width != 0 && fg_region.extent.height != 0 &&
+            (fg_region.extent.width != frame->fg_hudless_width ||
+             fg_region.extent.height != frame->fg_hudless_height) &&
+            EnsureFgHudlessGame(frame, fg_region.extent)) {
+            const vk::ImageSubresourceRange color_range{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            };
+            const std::array<vk::ImageMemoryBarrier2, 2> to_blit{
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = frame->fg_hudless,
+                    .subresourceRange = color_range,
+                },
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .oldLayout = vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = frame->fg_hudless_game,
+                    .subresourceRange = color_range,
+                },
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = static_cast<u32>(to_blit.size()),
+                .pImageMemoryBarriers = to_blit.data(),
+            });
+            vk::ImageBlit blit{};
+            blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            blit.srcOffsets[1] = vk::Offset3D{static_cast<s32>(frame->fg_hudless_width),
+                                              static_cast<s32>(frame->fg_hudless_height), 1};
+            blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            blit.dstOffsets[1] = vk::Offset3D{static_cast<s32>(fg_region.extent.width),
+                                              static_cast<s32>(fg_region.extent.height), 1};
+            cmdbuf.blitImage(frame->fg_hudless, vk::ImageLayout::eTransferSrcOptimal,
+                             frame->fg_hudless_game, vk::ImageLayout::eTransferDstOptimal, blit,
+                             vk::Filter::eLinear);
+            const std::array<vk::ImageMemoryBarrier2, 2> from_blit{
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                    .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = frame->fg_hudless,
+                    .subresourceRange = color_range,
+                },
+                vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = frame->fg_hudless_game,
+                    .subresourceRange = color_range,
+                },
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = static_cast<u32>(from_blit.size()),
+                .pImageMemoryBarriers = from_blit.data(),
+            });
+            frame->fg.hudless_game = {frame->fg_hudless_game, frame->fg_hudless_game_view,
+                                      frame->fg_hudless_game_format, fg_region.extent,
+                                      vk::ImageUsageFlagBits::eColorAttachment |
+                                          vk::ImageUsageFlagBits::eSampled |
+                                          vk::ImageUsageFlagBits::eTransferSrc |
+                                          vk::ImageUsageFlagBits::eTransferDst};
+            frame->fg.has_hudless_game = true;
+        }
+        // 1.51: with FSR 3 frame generation the overlay goes into its own layer, composited by the
+        // FG swapchain after interpolation on real and generated frames (it was drawn into the
+        // back buffer and interpolated: ghosting toasts / menu). BB_FG_UI_LAYER=0: old.
+        BBUiLayer* bb_ui = nullptr;
+        if (BB::FG::WantsUiLayer() && !swapchain.GetHDR()) {
+            bb_ui = BBEnsureUiLayer(instance, swapchain.GetSurfaceFormat().format,
+                                    swapchain.GetExtent());
+        }
+        if (bb_ui != nullptr) {
+            const vk::ImageMemoryBarrier2 to_target{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = bb_ui->image,
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_target});
+            ImGui::Core::RenderSplit(cmdbuf, swapchain_image_view, bb_ui->view,
+                                     swapchain.GetExtent());
+            const vk::ImageMemoryBarrier2 to_read{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .image = bb_ui->image,
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_read});
+            const BB::FG::Image ui_img{bb_ui->image, bb_ui->view, bb_ui->format, bb_ui->extent,
+                                       vk::ImageUsageFlagBits::eColorAttachment |
+                                           vk::ImageUsageFlagBits::eSampled};
+            BB::FG::SetUiLayer(&ui_img);
+        } else {
+            BB::FG::SetUiLayer(nullptr);
+            ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+        }
 
         if (capture_with_overlays_count > 0) {
             auto& readback = pending_screenshot.emplace(
@@ -1073,16 +1654,60 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
 
+    // Frame generation (bb_fg.h): DLSS-G's tags and markers, or FSR 3's configure and prepare,
+    // for this present (the frame's own inputs for a new game frame; none for a repeat).
+    const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
+    BB::FG::SetPresentIndex(!is_reusing_frame && is_game_frame ? frame->fg.reflex_index : 0);
+    BB::ImgFg::NoteFrame(!is_reusing_frame && is_game_frame && !frame->bb_fg_skip, fg_frame ? &frame->fg : nullptr,
+                         swapchain.GetExtent(), fg_region);
+    BB::FG::BeforePresent(fg_frame ? &frame->fg : nullptr, swapchain.GetHandle(),
+                          swapchain.GetExtent(),
+                          swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                             : swapchain.GetSurfaceFormat().format,
+                          fg_region,
+                          swapchain.GetImageCount());
+
+    // bb-imgfg-078: image-only frame generation presents its generated frames now (before the real
+    // one, which then also waits for the work that read its image).
+    {
+        BB::ImgFg::PresentIn imgfg_in{
+            .swapchain = swapchain.GetHandle(),
+            .image = swapchain.Image(),
+            .extent = swapchain.GetExtent(),
+            .format = swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                         : swapchain.GetSurfaceFormat().format,
+        };
+        vk::Semaphore imgfg_wait{};
+        if (BB::ImgFg::BeforeRealPresent(imgfg_in, &imgfg_wait)) {
+            swapchain.SetExtraPresentWait(imgfg_wait);
+        }
+    }
+
     // Present to swapchain.
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        // (FSR 3's frame interpolation swapchain submits to the game queue itself, under this
+        // lock: not held here.)
+        std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+        if (!BB::FG::Fsr3Active()) {
+            submit_lock.lock();
+        }
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
+    BB::FG::AfterPresent();
 
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
+        BB::Metrics::OnPresent();
+        {
+            int in_flight = 0;
+            {
+                std::scoped_lock lk{free_mutex};
+                in_flight = present_frames_total - static_cast<int>(free_queue.size());
+            }
+            BB::Metrics::PerfLine(in_flight, present_frames_total);
+        }
         DebugState.IncFlipFrameNum();
     }
 }
@@ -1092,7 +1717,11 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
+        const auto wait_start = std::chrono::steady_clock::now();
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        BB::Metrics::PerfPresentWait(std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - wait_start)
+                                         .count());
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1109,6 +1738,15 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
+    const auto fence_start = std::chrono::steady_clock::now();
+    const struct FenceTimer {
+        std::chrono::steady_clock::time_point t;
+        ~FenceTimer() {
+            BB::Metrics::PerfPresentWait(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t)
+                    .count());
+        }
+    } fence_timer{fence_start};
     while (wait() != vk::Result::eSuccess) {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");

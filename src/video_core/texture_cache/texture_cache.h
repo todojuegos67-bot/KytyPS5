@@ -135,6 +135,13 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// BB 0.76: once the native chain turned off, every scene target address back to one
+    /// output-size image (its current content copied up, the internal-size image freed).
+    void BBNativeOff();
+    /// BB 0.83: the image at the same address as image_id with the given size (the other version
+    /// of a scene target), made current; null when there is none.
+    ImageId BBVersionAt(ImageId image_id, u32 width, u32 height);
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
@@ -157,6 +164,10 @@ public:
         TrackImage(image_id);
         RefreshImage(image);
     }
+
+    /// BB 0.73 native chain: copies the other version (internal size / output size) of a scene
+    /// target into this one when that version holds the current content (bb_upscale TwinAccess).
+    void BBTwinSync(ImageId image_id, bool write);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,

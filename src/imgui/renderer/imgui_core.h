@@ -37,6 +37,13 @@ ImGuiID NewFrame(bool is_reusing_frame = false);
 void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
             const vk::Extent2D& extent);
 
+// 1.51 (bb-fgmv-151): the game display window (and what lies under it) into game_view, every
+// later window (trophy toasts, F1 menu, metrics) into ui_view cleared transparent (premultiplied
+// alpha), for frame generation to composite the overlay after interpolation. Both views have the
+// swapchain's format and extent.
+void RenderSplit(const vk::CommandBuffer& cmdbuf, const vk::ImageView& game_view,
+                 const vk::ImageView& ui_view, const vk::Extent2D& extent);
+
 bool MustKeepDrawing(); // Force the emulator redraw
 
 } // namespace ImGui::Core

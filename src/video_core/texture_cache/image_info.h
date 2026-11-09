@@ -82,6 +82,11 @@ struct ImageInfo {
     u32 guest_size;
     u8 bank_swizzle{};
     bool alt_tile{};
+    // Bloodborne scene upscale (BB_SCENE_UPSCALE=1): the host image is smaller than the guest one.
+    bool bb_scaled{};
+    u32 bb_guest_w{};
+    u32 bb_guest_h{};
+    void BBScale();
     VAddr stencil_addr{};
     u32 stencil_size{};
 };

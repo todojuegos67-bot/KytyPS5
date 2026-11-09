@@ -22,6 +22,9 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/bb/bb_upscale.h"
+#include <algorithm>
+#include <filesystem>
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -270,14 +273,42 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
 
-    static vk::detail::DynamicLoader dl;
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(
-        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+    BB::Upscale::PreInstance();
+    const bool bb = BB::Upscale::Enabled();
+    if (bb) {
+        BB::Upscale::Checkpoint("opening the Vulkan loader");
+    }
+    static vk::detail::DynamicLoader dl = [] {
+#ifdef _WIN32
+        if (const wchar_t* loader = BB::Upscale::VulkanLoaderOverride()) {
+            // DLSS: Streamline's interposer is the Vulkan loader.
+            const std::filesystem::path path{loader};
+            BB::Upscale::Checkpoint(fmt::format("Vulkan loader: {}", path.string()));
+            return vk::detail::DynamicLoader(path.string());
+        }
+#endif
+        return vk::detail::DynamicLoader();
+    }();
+    const auto gipa = dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    if (bb) {
+        BB::Upscale::Checkpoint(fmt::format("vkGetInstanceProcAddr {}", reinterpret_cast<void*>(gipa)));
+    }
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(gipa);
+    if (bb) {
+        BB::Upscale::Checkpoint("vkEnumerateInstanceVersion");
+    }
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion
             ? vk::enumerateInstanceVersion()
             : vk::ResultValue(vk::Result::eSuccess, VK_API_VERSION_1_0);
+    if (bb) {
+        BB::Upscale::Checkpoint(fmt::format("instance version {}.{} ({}); enumerating layers and "
+                                            "extensions",
+                                            VK_VERSION_MAJOR(available_version),
+                                            VK_VERSION_MINOR(available_version),
+                                            vk::to_string(available_version_result)));
+    }
     ASSERT_MSG(available_version_result == vk::Result::eSuccess,
                "Failed to query Vulkan API version: {}", vk::to_string(available_version_result));
     ASSERT_MSG(available_version >= TargetVulkanApiVersion,
@@ -286,14 +317,31 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
-    const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss && BB::SR::Dlss::Manual()) {
+        // (Manual hooking: the instance extensions Streamline's features need.)
+        static std::vector<std::string> extra;
+        for (const auto& name : BB::SR::Dlss::RequiredInstanceExtensions()) {
+            if (std::none_of(extensions.begin(), extensions.end(),
+                             [&](const char* e) { return name == e; })) {
+                extra.push_back(name);
+            }
+        }
+        for (const auto& name : extra) {
+            extensions.push_back(name.c_str());
+        }
+    }
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "shadPS4 Vulkan",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-        .apiVersion = available_version,
+        // Under Streamline (DLSS) the instance asks for Vulkan 1.3 at most, as the Demon's Souls
+        // fork does: the loader crashed in vkCreateDevice through the interposer with 1.4.
+        .apiVersion = BB::Upscale::VulkanLoaderOverride() != nullptr
+                          ? std::min<u32>(available_version, VK_API_VERSION_1_3)
+                          : available_version,
     };
 
     const std::string extensions_string = fmt::format("{}", fmt::join(extensions, ", "));
@@ -413,7 +461,32 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+    if (BB::Upscale::VulkanLoaderOverride() != nullptr) {
+        // (Streamline: no layer settings struct on the instance.)
+        instance_ci_chain.unlink<vk::LayerSettingsCreateInfoEXT>();
+        BB::Upscale::Checkpoint("DLSS: instance api clamped to 1.3, layer settings struct removed");
+    }
+    if (BB::Upscale::Enabled()) {
+        std::string chain;
+        for (auto* node = static_cast<const VkBaseInStructure*>(instance_ci_chain.get().pNext);
+             node != nullptr; node = node->pNext) {
+            chain += fmt::format(" {}", vk::to_string(static_cast<vk::StructureType>(node->sType)));
+        }
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateInstance (api {}.{}; layers: {}; extensions: {}; pNext:{}; loader "
+            "vkGetInstanceProcAddr {})",
+            VK_VERSION_MAJOR(application_info.apiVersion),
+            VK_VERSION_MINOR(application_info.apiVersion), layers_string, extensions_string, chain,
+            reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr)));
+    }
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "vkCreateInstance returned {}: instance {} via vkCreateInstance {}",
+            vk::to_string(instance_result),
+            instance_result == vk::Result::eSuccess ? static_cast<const void*>(static_cast<VkInstance>(*instance)) : nullptr,
+            BB::Upscale::Where(reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateInstance))));
+    }
     ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",
                vk::to_string(instance_result));
 

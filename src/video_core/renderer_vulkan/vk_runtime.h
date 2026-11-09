@@ -51,6 +51,9 @@ public:
                        std::span<const vk::BufferImageCopy> download_copies);
 
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
+    // BB 0.73 native chain: a scaled copy between the two versions of a scene target (same
+    // format, single sample, one level): bilinear for colour, nearest for depth / stencil.
+    bool BBBlitScaled(VideoCore::Image* src, VideoCore::Image* dst);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                              const VideoCore::Buffer* buffer, u64 offset);
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);

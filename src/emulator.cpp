@@ -59,6 +59,7 @@
 #include <unistd.h>
 #endif
 #include <core/file_format/npbind.h>
+#include "video_core/bb/bb_upscale.h"
 
 Frontend::WindowSDL* g_window = nullptr;
 
@@ -154,12 +155,48 @@ std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
 
     NPBindFile npbind;
     const auto npbind_bytes = mnt->ReadFile(npbind_guest);
+    std::vector<std::string> np_comm_ids;
     if (!npbind_bytes || !npbind.Load(std::span<const u8>{*npbind_bytes})) {
         LOG_WARNING(Common_Filesystem, "Failed to load npbind.dat file");
-        return trophy_index_map;
+    } else {
+        np_comm_ids = npbind.GetNpCommIds();
     }
-
-    auto np_comm_ids = npbind.GetNpCommIds();
+    if (np_comm_ids.empty()) {
+        // (bb-menu-104) No npbind.dat (or no IDs in it): the ID of trophy00.trp, from an
+        // override (BB_NPCOMMID), a cache next to the trophy folder, or found with the key.
+        const auto cache = Common::FS::GetUserPath(Common::FS::PathType::TrophyDir) /
+                           (std::string(Common::ElfInfo::Instance().GameSerial()) + ".npcommid");
+        std::string found;
+        if (const char* env = std::getenv("BB_NPCOMMID"); env != nullptr && *env != 0) {
+            found = env;
+        } else if (std::ifstream in(cache); in) {
+            std::getline(in, found);
+        }
+        if (found.empty()) {
+            std::optional<std::vector<u8>> trp;
+            for (const char* name : {"/trophy00.trp", "/TROPHY00.TRP", "/trophy00.TRP"}) {
+                trp = mnt->ReadFile(std::string(trophy_dir_guest) + name);
+                if (trp) {
+                    break;
+                }
+            }
+            if (trp) {
+                found = TRP::FindNpCommId(std::span<const u8>{*trp});
+                if (!found.empty()) {
+                    std::filesystem::create_directories(cache.parent_path());
+                    std::ofstream(cache) << found << "\n";
+                }
+            } else {
+                LOG_WARNING(Common_Filesystem, "[trophy] no trophy00.trp in {}",
+                            trophy_dir_guest);
+            }
+        }
+        if (!found.empty()) {
+            LOG_INFO(Common_Filesystem, "[trophy] no npbind.dat: using NP communication ID {}",
+                     found);
+            np_comm_ids.push_back(found);
+        }
+    }
     if (np_comm_ids.empty()) {
         LOG_WARNING(Common_Filesystem, "No NPCommIDs in npbind.dat");
         return trophy_index_map;
@@ -606,9 +643,18 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
+    // Bloodborne upscaling: DLSS loads Streamline before the window so SDL takes Streamline's
+    // interposer as its Vulkan library (SDL_VULKAN_LIBRARY), as the Demon's Souls fork does.
+    BB::Upscale::PreInstance();
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint("creating the SDL window");
+    }
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,
                                                    window_title);
+    if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint("SDL window created");
+    }
 
     g_window = window.get();
 

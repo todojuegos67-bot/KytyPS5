@@ -647,6 +647,8 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_matching2/np_matching2_signaling.h
             src/core/libraries/np/np_types2.h
             src/core/libraries/np/np_trophy.cpp
+            src/core/libraries/np/bb_trophy_sync.cpp
+            src/core/libraries/np/bb_trophy_sync.h
             src/core/libraries/np/np_trophy.h
             src/core/libraries/np/trophy_ui.cpp
             src/core/libraries/np/trophy_ui.h
@@ -857,6 +859,10 @@ set(COMMON src/common/logging/classes.cpp
            src/common/number_utils.cpp
            src/common/memory_patcher.h
            src/common/memory_patcher.cpp
+           src/core/bb_kbmcam.cpp
+           src/core/bb_kbmcam.h
+           src/core/bb_respatch.h
+           src/core/bb_respatch.cpp
            src/common/multi_level_page_table.h
            ${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp
            src/common/scm_rev.h
@@ -1058,6 +1064,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/backend/spirv/emit_spirv_select.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_bb_objmv.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
                       src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
@@ -1197,6 +1204,39 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
+               src/video_core/renderer_vulkan/vk_rasterizer_bb.cpp
+               src/video_core/bb/bb_analyze.h
+               src/video_core/bb/bb_audio_check.cpp
+               src/video_core/bb/bb_audio_check.h
+               src/video_core/bb/bb_antilag.cpp
+               src/video_core/bb/bb_antilag.h
+               src/video_core/bb/bb_dyn_multiplier.h
+               src/video_core/bb/bb_dlss5.cpp
+               src/video_core/bb/bb_dlss5.h
+               src/video_core/bb/bb_display.cpp
+               src/video_core/bb/bb_display.h
+               src/video_core/bb/bb_fg.cpp
+               src/video_core/bb/bb_fg.h
+               src/video_core/bb/bb_fg_fsr3.cpp
+               src/video_core/bb/bb_fg_internal.h
+               src/video_core/bb/bb_imgfg.cpp
+               src/video_core/bb/bb_imgfg.h
+               src/video_core/bb/bb_metrics.cpp
+               src/video_core/bb/bb_metrics_panel.cpp
+               src/video_core/bb/bb_objmv.cpp
+               src/video_core/bb/bb_objmv.h
+               src/video_core/bb/bb_metrics.h
+               src/video_core/bb/bb_kyty_compat.h
+               src/video_core/bb/bb_sr.h
+               src/video_core/bb/bb_sr_dlss.cpp
+               src/video_core/bb/bb_sr_fsr3.cpp
+               src/video_core/bb/bb_sr_fsr4.cpp
+               src/video_core/bb/fsr411/fsr411.cpp
+               src/video_core/bb/fsr411/fsr411.h
+               src/video_core/bb/fsr411/fsr411_vk.h
+               src/video_core/bb/bb_sr_xess.cpp
+               src/video_core/bb/bb_upscale.cpp
+               src/video_core/bb/bb_upscale.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
                src/video_core/renderer_vulkan/vk_runtime.cpp
@@ -1248,6 +1288,8 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/imgui_texture.h
           src/imgui/imgui_translations.cpp
           src/imgui/imgui_translations.h
+          src/imgui/bb_menu.cpp
+          src/imgui/bb_menu.h
           src/imgui/friends_layer.cpp
           src/imgui/friends_layer.h
           src/imgui/invitation_prompt_layer.cpp
@@ -1475,6 +1517,29 @@ set(HOST_SHADERS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/host_shaders
 add_subdirectory(${HOST_SHADERS_INCLUDE})
 add_dependencies(shadps4 host_shaders)
 target_include_directories(shadps4 PRIVATE ${HOST_SHADERS_INCLUDE})
+
+# Bloodborne upscaling (src/video_core/bb): FidelityFX API headers (MIT, externals/ffx_api), and the
+# XeSS / Streamline SDK headers when the CI fetched them into _Build/deps.
+target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/externals/ffx_api/include)
+set(BB_XESS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/xess" CACHE PATH "Intel XeSS SDK (inc/xess/xess_vk.h)")
+if (WIN32 AND EXISTS "${BB_XESS_SDK}/inc/xess/xess_vk.h")
+    set_property(SOURCE src/video_core/bb/bb_sr_xess.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${BB_XESS_SDK}/inc")
+    set_property(SOURCE src/video_core/bb/bb_sr_xess.cpp APPEND PROPERTY COMPILE_DEFINITIONS BB_XESS=1)
+    message(STATUS "BB upscaling: XeSS SDK ${BB_XESS_SDK}")
+endif()
+set(BB_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH "NVIDIA Streamline SDK (include/sl.h)")
+if (WIN32 AND EXISTS "${BB_STREAMLINE_SDK}/include/sl.h")
+    set_property(SOURCE src/video_core/bb/bb_sr_dlss.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${BB_STREAMLINE_SDK}/include")
+    set_property(SOURCE src/video_core/bb/bb_sr_dlss.cpp APPEND PROPERTY COMPILE_DEFINITIONS BB_STREAMLINE=1)
+    set_property(SOURCE src/video_core/bb/bb_fg.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${BB_STREAMLINE_SDK}/include")
+    set_property(SOURCE src/video_core/bb/bb_fg.cpp APPEND PROPERTY COMPILE_DEFINITIONS BB_STREAMLINE=1)
+    message(STATUS "BB upscaling: Streamline SDK ${BB_STREAMLINE_SDK}")
+endif()
+
+if (WIN32)
+    # (bb_audio_check.cpp: the Windows audio session check uses COM.)
+    target_link_libraries(shadps4 PRIVATE ole32)
+endif()
 
 # embed resources
 
