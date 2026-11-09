@@ -1292,6 +1292,14 @@ void HostInputFocus(bool focused) {
 
 bool HostInputMouseMotion(int dx, int dy) {
 	if (!g_kbm.enabled && !g_kbm.mouse_only) return false;
+	// (11-09) Started straight into the game (menu_inicio=0, no launcher before it), the window can get its focus before
+	// keyboard and mouse is set up, so the focus capture never happened and the mouse did not turn the camera. The first
+	// mouse move in a focused window captures it once; Esc still releases it and a click captures it again.
+	static bool s_first_capture_done = false;
+	if (g_kbm.enabled && !g_kbm.captured && !s_first_capture_done && SDL_GetKeyboardFocus() != nullptr) {
+		s_first_capture_done = true;
+		KbmCapture(true);
+	}
 	if (g_kbm.captured) {
 		g_kbm.acc_x.fetch_add(static_cast<int64_t>(dx) * KBM_ONE, std::memory_order_acq_rel);
 		g_kbm.acc_y.fetch_add(static_cast<int64_t>(dy) * KBM_ONE, std::memory_order_acq_rel);
