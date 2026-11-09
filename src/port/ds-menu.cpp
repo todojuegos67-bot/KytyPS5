@@ -1375,6 +1375,111 @@ bool IconButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, in
 	return pressed;
 }
 
+// (bb-style-f1) The F1 menu's top-level options as Bloodborne's hub cards, side by side: a dark plate with a bronze
+// border, a warm light from above when focused, a medallion with the icon (halo, turning beads), the label in Cinzel,
+// letter-spaced and centred (gold, parchment when focused), an ornamental rule under it; focus lifts the card 16 px and
+// grows it 4 %, a shine sweeps once; on open the cards rise in one after another (ease-out-back, `index` x 70 ms).
+// An ImGui button underneath: mouse click, and D-pad / stick / arrow keys left-right move between the cards (one row).
+bool CardButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, int index, bool danger = false) {
+	static std::map<ImGuiID, double> focus_at;
+	const float k   = Anim::Progress(Anim::g_opened_at.load() + 0.07 * index, 0.5);
+	if (k < 1.0f) Bump();
+	const float x1  = k - 1.0f, c1 = 1.70158f, c3 = c1 + 1.0f;
+	const float ent = 1.0f + c3 * x1 * x1 * x1 + c1 * x1 * x1; // EaseOutBack
+	ImGui::PushID(label);
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0, 0, 0, 0});
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0, 0, 0, 0});
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0, 0, 0, 0});
+	ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4 {0, 0, 0, 0}); // (the card's own focus look)
+	const bool pressed = ImGui::Button("##card", size);
+	ImGui::PopStyleColor(4);
+	const ImGuiID id = ImGui::GetItemID();
+	const bool    on = ImGui::IsItemHovered() || ImGui::IsItemFocused() || ImGui::IsItemActive();
+	const float   v  = Anim::Hot(id, on);
+	if (on && v < 0.05f) focus_at[id] = Anim::Now();
+	const ImVec2 ra = ImGui::GetItemRectMin(), rb = ImGui::GetItemRectMax();
+	const float  cw = rb.x - ra.x, ch = rb.y - ra.y;
+	const float  lift = -16.0f * unit * v + (1.0f - ent) * 80.0f * unit;
+	const float  sc   = 1.0f + 0.04f * v;
+	const ImVec2 c {(ra.x + rb.x) * 0.5f, (ra.y + rb.y) * 0.5f + lift};
+	const ImVec2 a {c.x - cw * 0.5f * sc, c.y - ch * 0.5f * sc}, b {c.x + cw * 0.5f * sc, c.y + ch * 0.5f * sc};
+	auto*        dl = ImGui::GetWindowDrawList();
+	const float  al = ImGui::GetStyle().Alpha * std::clamp(k * 1.6f, 0.0f, 1.0f);
+	const auto   G  = [&](float x) { return IM_COL32(228, 192, 122, static_cast<int>(255.0f * std::clamp(x * al, 0.0f, 1.0f))); };
+	const auto   Br = [&](float x) { return IM_COL32(158, 112, 62, static_cast<int>(255.0f * std::clamp(x * al, 0.0f, 1.0f))); };
+	const auto   Pa = [&](float x) { return IM_COL32(236, 228, 212, static_cast<int>(255.0f * std::clamp(x * al, 0.0f, 1.0f))); };
+	const auto   Cl = [&](int r, int g, int bb, float x) { return IM_COL32(r, g, bb, static_cast<int>(255.0f * std::clamp(x * al, 0.0f, 1.0f))); };
+	const float  rr = 6.0f * unit;
+	// The plate (Bloodborne's Panel: dark, a soft shadow, a bronze frame warming with the focus, an inner hairline).
+	for (int s = 3; s >= 1; s--) dl->AddRectFilled({a.x - s * 3 * unit, a.y - s * 2 * unit}, {b.x + s * 3 * unit, b.y + s * 5 * unit}, Cl(0, 0, 0, 0.12f), rr + s * 3 * unit);
+	dl->AddRectFilledMultiColor(a, b, Cl(22, 19, 18, 0.94f), Cl(22, 19, 18, 0.94f), Cl(12, 10, 10, 0.96f), Cl(12, 10, 10, 0.96f));
+	if (danger && v > 0.0f) dl->AddRectFilled(a, b, Cl(120, 40, 30, 0.22f * v), rr);
+	if (ImGui::IsItemActive()) dl->AddRectFilled(a, b, G(0.10f), rr);
+	dl->AddRect(a, b, danger ? Cl(230, 120, 100, 0.45f + 0.5f * v) : (v > 0.5f ? G(0.6f + 0.4f * v) : Br(0.75f)), rr, 0, std::max(1.0f, 1.4f * unit));
+	dl->AddRect({a.x + 6 * unit, a.y + 6 * unit}, {b.x - 6 * unit, b.y - 6 * unit}, G(0.10f + 0.20f * v), rr * 0.6f, 0, std::max(1.0f, 0.8f * unit));
+	if (v > 0.01f) dl->AddRectFilledMultiColor({a.x + 8 * unit, a.y + 8 * unit}, {b.x - 8 * unit, a.y + ch * 0.45f}, G(0.10f * v), G(0.10f * v), G(0.0f), G(0.0f));
+	// The medallion and its icon.
+	const ImVec2 m {c.x, a.y + (b.y - a.y) * 0.36f};
+	const float  mr = std::min(cw * 0.28f, ch * 0.20f) * sc;
+	const float  t  = Souls::Time();
+	for (int g = 4; g >= 1; g--) dl->AddCircleFilled(m, mr + g * 6 * unit, G(0.025f * (0.3f + v)), 48);
+	dl->AddCircleFilled(m, mr, Cl(14, 12, 12, 0.95f), 64);
+	dl->AddCircle(m, mr, Br(0.9f), 64, std::max(1.0f, 1.6f * unit));
+	dl->AddCircle(m, mr - 7 * unit, G(0.35f + 0.5f * v), 64, std::max(1.0f, unit));
+	for (int d = 0; d < 24; d++) {
+		const float ang = d * 0.2618f + t * 0.25f * (0.3f + v);
+		dl->AddCircleFilled({m.x + std::cos(ang) * (mr + 10 * unit), m.y + std::sin(ang) * (mr + 10 * unit)}, 1.4f * unit, G(0.25f + 0.6f * v));
+	}
+	const ImU32 ic = danger ? Cl(236, 140, 110, 0.75f + 0.25f * v) : G(0.75f + 0.25f * v);
+	Icons::Draw(dl, icon, {m.x + 1, m.y + 1}, mr * 0.85f, Cl(0, 0, 0, 0.6f));
+	Icons::Draw(dl, icon, m, mr * 0.85f, ic);
+	// The label: Cinzel (Demon's own bundled copy, the font Bloodborne's titles use), letter-spaced, fitted to the card.
+	ImFont* f   = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+	float   px  = std::round(28.0f * unit);
+	const float sp = 2.0f * unit;
+	const auto  spaced_w = [&](float size) {
+		float w = 0;
+		for (const char* p = label; *p;) {
+			const unsigned char u8 = static_cast<unsigned char>(*p);
+			const int n = u8 < 0x80 ? 1 : (u8 >> 5) == 6 ? 2 : (u8 >> 4) == 14 ? 3 : 4;
+			w += f->CalcTextSizeA(size, FLT_MAX, 0.0f, p, p + n).x + sp;
+			p += n;
+		}
+		return std::max(0.0f, w - sp);
+	};
+	const float maxw = cw - 28.0f * unit;
+	if (const float w = spaced_w(px); w > maxw) px = std::max(12.0f, std::floor(px * maxw / w));
+	const float ty = a.y + (b.y - a.y) * 0.66f;
+	float       x  = c.x - spaced_w(px) * 0.5f;
+	const ImU32 tc = danger ? Cl(240, 150, 125, 1.0f) : (v > 0.5f ? Pa(1.0f) : G(1.0f));
+	for (const char* p = label; *p;) {
+		const unsigned char u8 = static_cast<unsigned char>(*p);
+		const int n = u8 < 0x80 ? 1 : (u8 >> 5) == 6 ? 2 : (u8 >> 4) == 14 ? 3 : 4;
+		dl->AddText(f, px, {std::floor(x + 1), std::floor(ty + 1)}, Cl(0, 0, 0, 0.7f), p, p + n);
+		dl->AddText(f, px, {std::floor(x), std::floor(ty)}, tc, p, p + n);
+		x += f->CalcTextSizeA(px, FLT_MAX, 0.0f, p, p + n).x + sp;
+		p += n;
+	}
+	// The ornamental rule (Bloodborne's OrnLine: a line fading out each side, a diamond in the middle).
+	{
+		const float oy = ty + px + 18.0f * unit, hw = cw * 0.32f * 0.5f, oa = 0.5f + 0.5f * v, d = 4.0f * unit;
+		dl->AddRectFilledMultiColor({c.x - hw, oy - 0.5f * unit}, {c.x - d * 1.6f, oy + 0.5f * unit}, Br(0.0f), Br(oa), Br(oa), Br(0.0f));
+		dl->AddRectFilledMultiColor({c.x + d * 1.6f, oy - 0.5f * unit}, {c.x + hw, oy + 0.5f * unit}, Br(oa), Br(0.0f), Br(0.0f), Br(oa));
+		dl->AddQuadFilled({c.x, oy - d}, {c.x + d, oy}, {c.x, oy + d}, {c.x - d, oy}, G(oa));
+	}
+	// A shine sweeping once across on focus.
+	const float fs = static_cast<float>(Anim::Now() - focus_at[id]);
+	if (on && fs < 0.9f) {
+		Bump();
+		const float sx = a.x - cw * 0.5f + (fs / 0.9f) * cw * 2.0f;
+		dl->PushClipRect(a, b, true);
+		dl->AddQuadFilled({sx, a.y}, {sx + cw * 0.18f, a.y}, {sx - cw * 0.22f, b.y}, {sx - cw * 0.40f, b.y}, Cl(255, 240, 200, 0.07f));
+		dl->PopClipRect();
+	}
+	ImGui::PopID();
+	return pressed;
+}
+
 void Section(const char* title) {
 	ImGui::Spacing();
 	ImGui::PushFont(DisplayFont(), 30.0f * g_unit); // (perfopts-1107) Cinzel, as the header (nullptr: the current font)
@@ -5767,23 +5872,30 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		g_edit.start_menu   = show;
 		(void)SaveSettings(g_rt.ini_path, on_disk);
 	}
-	const ImVec2 bs {std::round(500 * unit), std::round(84 * unit)}; // (step5: bigger entries and icons)
-	if (IconButton(I18n::T("Volver al juego"), Icons::Back, bs, unit, 0)) SetOpen(false);
+	// (bb-style-f1) The options side by side as Bloodborne's hub cards (CardButton); same order, labels and actions.
+	const ImVec2 bs {std::round(270 * unit), std::round(340 * unit)};
+	ImGui::Dummy({1.0f, 24.0f * unit}); // (room for the focused card's lift)
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {28 * unit, 14 * unit});
+	if (CardButton(I18n::T("Volver al juego"), Icons::Back, bs, unit, 0)) SetOpen(false);
 	// (port34) The trophy page (Esc, B or F1 there: back here).
+	ImGui::SameLine();
 	if (g_focus_trophy_btn_request.exchange(false)) g_focus_trophy_btn = true;
 	if (g_focus_trophy_btn) {
 		ImGui::SetKeyboardFocusHere();
 		g_focus_trophy_btn = false;
 	}
-	if (IconButton(I18n::T("Ver trofeos"), Icons::Trophy, bs, unit, 1)) {
+	if (CardButton(I18n::T("Ver trofeos"), Icons::Trophy, bs, unit, 1)) {
 		g_trophy_tab_delta = 0;
 		TrophyPage::Open();
 		g_trophy_page = true;
 		Bump();
 	}
-	if (IconButton(I18n::T("Mapear mando"), Icons::Pad, bs, unit, 2)) g_f1_page = 1;
-	if (IconButton(I18n::T("Teclado y ratón"), Icons::Keyboard, bs, unit, 3)) g_f1_page = 2;
-		if (IconButton(I18n::T("Cerrar el juego"), Icons::Power, bs, unit, 4, true)) {
+	ImGui::SameLine();
+	if (CardButton(I18n::T("Mapear mando"), Icons::Pad, bs, unit, 2)) g_f1_page = 1;
+	ImGui::SameLine();
+	if (CardButton(I18n::T("Teclado y ratón"), Icons::Keyboard, bs, unit, 3)) g_f1_page = 2;
+	ImGui::SameLine();
+	if (CardButton(I18n::T("Cerrar el juego"), Icons::Power, bs, unit, 4, true)) {
 		// Just closes: nothing saved, nothing skipped (the game's own saves are already on disk).
 #if defined(_WIN32)
 		// Not ExitProcess: it runs the DLLs' detach routines (the GPU driver's, Streamline's) on this thread while the
@@ -5803,6 +5915,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		std::_Exit(0);
 #endif
 	}
+	ImGui::PopStyleVar();
 	ImGui::TextDisabled("%s", I18n::T("F1 o Esc: volver al juego"));
 	{
 		// (perfopts-1107) Under the contents: the carved stone panel and the gliding highlight; while opening or closing,
