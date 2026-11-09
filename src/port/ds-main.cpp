@@ -1124,7 +1124,9 @@ int main(int argc, char* argv[]) {
 	// --sin-lanzador skips it once.
 	// (ds-pc-port38) --lanzador (the restart after an update or a restore) shows it even with --restarted: the new version
 	// opens at the launcher, never the game by itself. --fg-relaunch (DLSS-G's fresh process after JUGAR) never.
-	const bool start_menu = !fg_relaunch && (force_launcher || (!skip_launcher && !restarted));
+	// (11-09) settings.ini menu_inicio=0 ("No mostrar al iniciar", F1 > Sistema) is honoured again: the game starts
+	// directly. A first start (configurado=0) still shows the launcher; --lanzador shows it once.
+	const bool start_menu = !fg_relaunch && (force_launcher || (!skip_launcher && !restarted && (settings.start_menu || !settings.configured)));
 	if (force_launcher && restarted && !fg_relaunch) std::printf("[port] restarted after an update / restore: the launcher first\n");
 	while (!start_menu && !IsGame(settings.game)) {
 		if (!settings.game.empty())

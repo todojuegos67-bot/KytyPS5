@@ -554,7 +554,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Interfaz]\n"
 	  << "; Metricas en pantalla: 0 no, 1 FPS, 2 FPS + detalle\n"
 	  << "metricas=" << s.metrics << "\n"
-	  << "; (Ya no se usa: el lanzador se abre siempre; \"Demon's Souls.exe\" --sin-lanzador lo salta una vez)\n"
+	  << "; Lanzador al iniciar: 1 si, 0 el juego arranca directo (F1 > Sistema lo cambia; \"Demon's Souls.exe\" --lanzador lo muestra una vez)\n"
 	  << "menu_inicio=" << b(s.start_menu) << "\n"
 	  << "; Niebla y ceniza animadas de fondo en el lanzador (0 = la ilustracion fija)\n"
 	  << "lanzador_ambiente=" << b(s.launcher_ambience) << "\n"
