@@ -828,7 +828,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             out_size = {ow, oh};
         }
         const vk::ImageView bb_scene_view = bb_split ? rasterizer->bb_hud.SceneView() : image_view;
-        if (const auto v = bb_sr->Run(cmdbuf, texture_cache, runtime, image, bb_scene_view,
+        if (const auto v = bb_sr->Run(cmdbuf, texture_cache, runtime, image, bb_scene_view, image_view,
                                       image_size, out_size, rasterizer->bb_scene_depth, srgb10,
                                       &frame->fg)) {
             const vk::ImageView with_hud =
