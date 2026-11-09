@@ -1052,22 +1052,36 @@ void Rasterizer::BbHudStart(const GraphicsPipeline* pipeline) {
                 bb_hud.NoteScene();
             }
         }
+        if (bb_hud.SceneSeen() && cb_descs[0].image_id &&
+            bb_hud.IsFlip(texture_cache.GetImage(cb_descs[0].image_id).info.guest_address)) {
+            bb_hud.Reject(BB::HudSplit::DepthOnFlip); // depth test on, into a presented image
+        }
         return;
     }
-    if (!bb_hud.SceneSeen() || !cb_descs[0].image_id ||
-        (pipeline->GetGraphicsKey().mrt_mask & 1u) == 0) {
+    if (!bb_hud.SceneSeen()) {
+        bb_hud.Reject(BB::HudSplit::NoScene);
+        return;
+    }
+    if (!cb_descs[0].image_id || (pipeline->GetGraphicsKey().mrt_mask & 1u) == 0) {
+        bb_hud.Reject(BB::HudSplit::NoTarget);
         return;
     }
     const auto target_id = cb_descs[0].image_id;
     auto& target = texture_cache.GetImage(target_id);
     if (target.binding.needs_rebind || target.info.size.width != scene_w ||
-        target.info.size.height != scene_h || !bb_hud.IsFlip(target.info.guest_address)) {
+        target.info.size.height != scene_h) {
+        bb_hud.Reject(BB::HudSplit::TargetSize);
+        return;
+    }
+    if (!bb_hud.IsFlip(target.info.guest_address)) {
+        bb_hud.Reject(BB::HudSplit::NotFlip);
         return;
     }
     for (const auto id : bound_images) {
         const auto& image = texture_cache.GetImage(id);
         if (id != target_id && !image.binding.is_target && image.info.size.width == scene_w &&
             image.info.size.height == scene_h) {
+            bb_hud.Reject(BB::HudSplit::SamplesScene);
             return;
         }
     }

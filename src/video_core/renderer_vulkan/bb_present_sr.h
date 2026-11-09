@@ -101,6 +101,11 @@ public:
     ~HudSplit();
 
     [[nodiscard]] bool IsFlip(VAddr guest) const;
+    // bb-hudless: why a candidate draw did not start the HUD (counted, logged every 300 frames).
+    enum Reason : u32 { NoScene, NoTarget, TargetSize, NotFlip, SamplesScene, DepthOnFlip, ReasonCount };
+    void Reject(Reason r) {
+        ++rejects[r];
+    }
     void NoteScene() {
         scene_seen = true;
     }
@@ -128,6 +133,8 @@ public:
     void EndFrame(VAddr presented);
 
 private:
+    u64 rejects[ReasonCount]{};
+    u32 log_frames = 0, log_captured = 0;
     struct OwnImage {
         vk::Image image{};
         vk::ImageView view{};

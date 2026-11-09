@@ -836,6 +836,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                                         out_size, srgb10)
                          : vk::ImageView{};
             if (with_hud) bb_hudless_scene = v; // the upscaled scene before the HUD
+            static u32 hl_frames = 0, hl_split = 0, hl_comp = 0;
+            hl_split += bb_split ? 1u : 0u;
+            hl_comp += with_hud ? 1u : 0u;
+            if (++hl_frames == 300) {
+                BB::Upscale::Checkpoint(fmt::format("[hudless] last 300 upscaled frames: HUD "
+                                                    "split {}, HUD composited {}",
+                                                    hl_split, hl_comp));
+                hl_frames = hl_split = hl_comp = 0;
+            }
             image_view = with_hud ? with_hud : v;
             image_size = out_size;
             bb_sr_size = out_size;

@@ -753,6 +753,19 @@ vk::ImageView HudSplit::Composite(vk::CommandBuffer cmd, vk::ImageView flip_view
 }
 
 void HudSplit::EndFrame(VAddr presented) {
+    ++log_frames;
+    log_captured += captured ? 1u : 0u;
+    if (log_frames == 300) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "[hudsplit] last 300 frames: HUD start captured on {}; draws not taken as the HUD "
+            "start: no scene yet {}, no colour target {}, target not the scene size {}, target "
+            "not a presented image {}, samples a scene-size image {}, depth test on into a "
+            "presented image {}",
+            log_captured, rejects[NoScene], rejects[NoTarget], rejects[TargetSize],
+            rejects[NotFlip], rejects[SamplesScene], rejects[DepthOnFlip]));
+        log_frames = log_captured = 0;
+        for (auto& r : rejects) r = 0;
+    }
     if (presented != 0) {
         flips[next_flip] = presented;
         next_flip = (next_flip + 1) % FlipSlots;
