@@ -4,6 +4,7 @@
 // Bloodborne's scene constant block, jitter and the once-per-second performance line.
 
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_fg.h"
 
 #include <algorithm>
@@ -413,6 +414,8 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
     if (Cfg().kind == SR::Kind::Fsr4) {
         SR::Fsr4::AddDeviceExtensions(available, extensions);
     }
+    // DLSS 5 (bb_dlss5.h, from 1.59): NGX's vendor extensions, only with BB_DLSS5 1..3.
+    Dlss5::AddDeviceExtensions(physical, available, extensions);
 }
 
 void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const char*>& extensions,
@@ -493,6 +496,7 @@ void* ChainDeviceFeatures(vk::PhysicalDevice physical, const std::vector<const c
 
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device,
               VmaAllocator allocator, vk::Queue queue, u32 family) {
+    Dlss5::OnDevice(instance, physical, device, allocator);
     switch (Cfg().kind) {
     case SR::Kind::Dlss:
         SR::Dlss::OnDevice(instance, physical, device);

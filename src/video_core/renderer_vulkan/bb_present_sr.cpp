@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include "common/logging/log.h"
+#include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_hudsplit_comp.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
@@ -362,6 +363,10 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     const bool ok = BB::Upscale::RunBackend(desc);
     if (!ok) {
         return {};
+    }
+    if (BB::Dlss5::Wanted()) {
+        // DLSS 5 (BB_DLSS5 1..3, from 1.59): Neural Rendering on the upscaled output, in place.
+        (void)BB::Dlss5::Apply(desc);
     }
     Barrier(cmd, output, vk::ImageLayout::eShaderReadOnlyOptimal);
     static bool said = false;

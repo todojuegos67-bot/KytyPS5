@@ -128,6 +128,7 @@ jobs:
         Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"
         if (Get-ChildItem $out -Recurse -Filter nvngx_dlssnr.dll) { throw 'nvngx_dlssnr.dll must never be shipped' }
         Copy-Item LICENSES\Streamline-MIT.txt "$out\LICENSES\Streamline-MIT.txt"
+        Copy-Item LICENSES\FoveatedDLSS5-RenoDX-MIT.txt "$out\LICENSES\FoveatedDLSS5-RenoDX-MIT.txt"
         Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll $out
         Copy-Item _Build\deps\ffx\FidelityFX-LICENSE.txt "$out\LICENSES\FidelityFX-LICENSE.txt"
         Copy-Item fsr4_shaders "$out\fsr4_shaders" -Recurse
