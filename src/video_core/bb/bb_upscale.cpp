@@ -208,7 +208,8 @@ Config ParseConfig() {
 }
 
 bool Streamline() {
-    return Cfg().kind == SR::Kind::Dlss;
+    // bb-clean-021-dlssg: also for DLSS-G (BB_FG=dlss-*) with any upscaler or none.
+    return Cfg().kind == SR::Kind::Dlss || BB::FG::DlssRequested();
 }
 
 bool g_backend_dead = false;
@@ -346,6 +347,10 @@ bool Enabled() {
     return Cfg().kind != SR::Kind::Off && Cfg().kind != SR::Kind::Native;
 }
 
+bool DeviceHooks() {
+    return Enabled() || Streamline();
+}
+
 bool Temporal() {
     return Enabled();
 }
@@ -422,15 +427,15 @@ void PreInstance() {
     }
     done = true;
     const auto& c = Cfg();
-    if (!Enabled()) {
+    if (!Enabled() && !Streamline()) {
         return;
     }
-    LOG_INFO(Render_Vulkan,
+    if (Enabled()) LOG_INFO(Render_Vulkan,
              "[BB_UPSCALE] bb-clean-021: upscaler {} mode {} (ratio {:.3f}), sharpness {:.2f}, "
              "jitter {}",
              SR::KindName(c.kind), SR::QualityName(c.quality), Ratio(), c.sharpness,
              c.jitter ? "on" : "off");
-    StartupNote(fmt::format("upscaler {} mode {} (ratio {:.3f}), jitter {}", SR::KindName(c.kind),
+    if (Enabled()) StartupNote(fmt::format("upscaler {} mode {} (ratio {:.3f}), jitter {}", SR::KindName(c.kind),
                             SR::QualityName(c.quality), Ratio(), c.jitter ? "on" : "off"));
     if (Streamline()) {
 #if defined(_WIN32)
@@ -449,7 +454,8 @@ void PreInstance() {
         if (!SR::Dlss::Preload()) {
             Checkpoint("DLSS: Streamline not loaded: DLSS off, the game runs native");
         }
-    } else if (c.kind == SR::Kind::Xess) {
+    }
+    if (c.kind == SR::Kind::Xess) {
         SR::Xess::Load();
     } else if (c.kind == SR::Kind::Fsr3) {
         SR::Fsr3::Load();

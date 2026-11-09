@@ -25,6 +25,7 @@ struct Config {
 };
 const Config& Cfg();
 bool Enabled();       // an upscaler (or native AA) was asked for
+bool DeviceHooks();   // Enabled() or Streamline loaded for DLSS-G (BB_FG=dlss-*): device set-up hooks
 bool Temporal();      // DLSS or FSR 4 asked
 // bb-clean-021-fg: the scene depth, camera and motion vectors are captured (an upscaler, or
 // frame generation without one: BB_FG != off).
