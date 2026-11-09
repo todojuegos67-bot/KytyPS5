@@ -8,6 +8,17 @@ param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [string[]]$Ex
 $S = $PSScriptRoot
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
 Set-Location $root
+# run-windows.ps1 puts the launch's switches into this PowerShell process's environment for its Start-Process and leaves
+# them there: the KYTY_ variables as they were here are put back after each launch (Restore-KytyEnvironment), or a -Set of
+# one launch reached every later one started from the same session (ab-exe's -SetB KYTY_SPECULATE=4 ran its A side's
+# later launches in mode 4 too, 11-09).
+$kytyEnvironment = @{}
+Get-ChildItem env: | Where-Object { $_.Name -like 'KYTY_*' } | ForEach-Object { $kytyEnvironment[$_.Name] = $_.Value }
+function Restore-KytyEnvironment {
+	Get-ChildItem env: | Where-Object { $_.Name -like 'KYTY_*' -and !$kytyEnvironment.ContainsKey($_.Name) } |
+		ForEach-Object { Remove-Item "env:$($_.Name)" }
+	foreach ($name in $kytyEnvironment.Keys) { Set-Item "env:$name" $kytyEnvironment[$name] }
+}
 # Screenshots and the start-up states go to _Build\bench.
 $out = "$root\_Build\bench"
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -150,8 +161,7 @@ function Restore-GamePath {
 }
 if ($Game) { $params['Game'] = $Game }
 # -NoPrecompile: the driver cache as it is (first-encounter measurements with KYTY_SHADER_WARMUP=0).
-if (!$NoPrecompile) { & "$root\run-windows.ps1" -Precompile -Width 1280 -Height 720 @params *> $null; Restore-GamePath }
-$env:KYTY_LIVE_FILE = "$root\_Build\windows-bench\live-commands.txt"
+if (!$NoPrecompile) { & "$root\run-windows.ps1" -Precompile -Width 1280 -Height 720 @params *> $null; Restore-GamePath; Restore-KytyEnvironment }
 # The HUD is up about 60 s after launch: a start-up still short of it after -StartupSeconds is stuck
 # (seen once in the attract loop), so it starts again from a fresh baseline save.
 for ($attempt = 1; $attempt -le $StartupAttempts; $attempt++) {
@@ -163,10 +173,12 @@ if ($attempt -gt 1) {
 	python tools\local\bench-windows.py reset | Out-Null
 	if ($LASTEXITCODE -ne 0) { 'baseline save not installed: run python tools\local\bench-windows.py prepare'; exit 1 }
 }
+$env:KYTY_LIVE_FILE = "$root\_Build\windows-bench\live-commands.txt"
 foreach ($pair in $Extra) { $k, $v = $pair -split '=', 2; Set-Item "env:$k" $v }
 & "$root\run-windows.ps1" @params 6>&1 | Select-Object -Last 1
 Restore-GamePath
-foreach ($pair in $Extra) { Remove-Item ("env:" + ($pair -split '=', 2)[0]) -ErrorAction SilentlyContinue }
+# (The emulator has its environment: the switches, -Extra's and KYTY_LIVE_FILE leave this session's.)
+Restore-KytyEnvironment
 
 $start = Get-Date
 $state = ''
