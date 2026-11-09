@@ -1,0 +1,36 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-clean-021-objmv: object motion vectors (video_core/bb/bb_objmv.h) over the camera ones.
+// obj_mv (attachment 7 of the G-buffer pass): x = half2 vector (render pixels towards the
+// previous position, same units / sign as bb_mv.comp, unjittered), y = depth bits of the fragment
+// that wrote it (0xFFFFFFFF: none). A pixel takes it only while the final scene depth is still
+// that fragment's: a later static draw in front of a moving one does not write attachment 7, so
+// the depth tells whether the object vector is still the visible surface's.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rg32ui) uniform readonly uimage2D obj_mv;
+layout(binding = 1, rg16f) uniform image2D mv_out;
+layout(binding = 2) uniform sampler2D depth_tex;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, depth tolerance (float bits), 0
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    uvec2 o = imageLoad(obj_mv, c).xy;
+    if (o.y == 0xFFFFFFFFu || o.y == 0u) {
+        return; // no object vector here: the camera one stays
+    }
+    float d = texelFetch(depth_tex, c, 0).r;
+    if (abs(uintBitsToFloat(o.y) - d) > uintBitsToFloat(p.size.z)) {
+        return; // covered by a later draw
+    }
+    vec2 v = unpackHalf2x16(o.x);
+    if (any(isnan(v)) || any(isinf(v))) {
+        return;
+    }
+    imageStore(mv_out, c, vec4(v, 0.0, 0.0));
+}

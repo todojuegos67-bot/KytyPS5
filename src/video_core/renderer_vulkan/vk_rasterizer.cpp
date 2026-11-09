@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -213,6 +214,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
+    if (const auto& key = pipeline->GetGraphicsKey();
+        key.write_masks[BB::ObjMotion::Attachment] &&
+        BB::ObjMotion::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMotion::Attachment])) {
+        // bb-clean-021-objmv: a scene draw that moved: its position slots (bb_objmv.h).
+        const auto [vo, io] = GetDrawOffsets(regs, pipeline->GetStage(Shader::SwStage::Vertex),
+                                             pipeline->GetFetchShader());
+        BB::ObjMotion::OnDraw(push_data, regs, is_indexed, index_offset, vo, io);
+    }
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1164,6 +1173,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                 const auto& vp = regs.viewports[0];
                 const auto& vp_ctl = regs.viewport_control;
                 bb_scene_depth.valid = true;
+                BB::ObjMotion::NoteSceneDepth(regs.depth_buffer.DepthAddress());
                 bb_scene_depth.desc = desc;
                 bb_scene_depth.xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
                 bb_scene_depth.xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
@@ -1228,6 +1238,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         image.usage.depth_target = true;
     } else {
         state.depth_stencil_attachment = {};
+    }
+
+    if (BB::ObjMotion::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMotion::Attachment])) {
+        BB::ObjMotion::Attach(scheduler, state); // bb-clean-021-objmv
     }
 
     // Without attachments the area stays at the max framebuffer size. Draws cannot pass the

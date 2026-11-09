@@ -97,6 +97,8 @@ struct HwVertexRuntimeInfo {
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
     u32 user_clip_plane_mask{};
+    /// BB object motion vectors (bb_objmv.h): store / load the clip position per vertex.
+    bool motion_vectors{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };
@@ -210,7 +212,8 @@ struct HwFragmentRuntimeInfo {
     u32 dual_source_blending : 1;
     u32 clip_distance_emulation : 1;
     u32 depth_before_shader : 1;
-    u32 : 12;
+    u32 motion_vectors : 1; ///< BB object motion vectors (bb_objmv.h): output at location 7
+    u32 : 11;
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -221,6 +224,7 @@ struct HwFragmentRuntimeInfo {
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
                depth_before_shader == other.depth_before_shader &&
+               motion_vectors == other.motion_vectors &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

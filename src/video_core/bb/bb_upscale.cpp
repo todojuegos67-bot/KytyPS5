@@ -4,6 +4,7 @@
 // Bloodborne's scene constant block, jitter and the once-per-second performance line.
 
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_fg.h"
 
@@ -750,6 +751,7 @@ void Jitter(float& x, float& y) {
 
 Camera EndFrame(u32 flip_w, u32 flip_h) {
     StartupDone();
+    BB::ObjMotion::OnFlip(); // bb-clean-021-objmv: the frame's object motion ends here
     Camera cam;
     static u32 cand_frames = 0, cand_max = 0, size_miss = 0;
     {

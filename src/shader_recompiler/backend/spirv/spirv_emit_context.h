@@ -253,6 +253,23 @@ public:
     Id vertex_index{};
     Id instance_id{};
     Id push_data_block{};
+    // BB object motion vectors (bb_objmv.h; emit_spirv_bb_objmv.cpp).
+    static constexpr u32 MotionCurLocation = 30;
+    static constexpr u32 MotionPrevLocation = 31;
+    static constexpr u32 MotionOutput = 7;
+    Id motion_out_cur{};
+    Id motion_out_prev{};
+    Id motion_in_cur{};
+    Id motion_in_prev{};
+    Id motion_frag_out{};
+    Id motion_frag_coord{};
+    [[nodiscard]] bool VertexMotion() const {
+        return sw_stage == SwStage::Vertex && hw_stage == HwStage::Vertex &&
+               runtime_info.hw.vs.motion_vectors;
+    }
+    [[nodiscard]] bool FragmentMotion() const {
+        return sw_stage == SwStage::Fragment && runtime_info.hw.fs.motion_vectors;
+    }
     Id base_vertex{};
     Id base_instance{};
     Id frag_coord{};

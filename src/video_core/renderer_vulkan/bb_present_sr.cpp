@@ -11,6 +11,7 @@
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_hudsplit_comp.h"
+#include "video_core/bb/bb_objmv.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -303,6 +304,7 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
     cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
     cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
+    BB::ObjMotion::Compose(cmd, motion.view, depth_view, sampler, in); // bb-clean-021-objmv
     Barrier(cmd, color, vk::ImageLayout::eShaderReadOnlyOptimal);
     Barrier(cmd, motion, vk::ImageLayout::eShaderReadOnlyOptimal);
     Barrier(cmd, output, vk::ImageLayout::eGeneral);
