@@ -2820,6 +2820,33 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		            vertex->table_plan.images.size() + (pixel != nullptr ? pixel->table_plan.images.size() : 0),
 		            vertex->table_plan.samplers.size() + (pixel != nullptr ? pixel->table_plan.samplers.size() : 0));
 	} else if (pair->programs != programs) {
+		// (KYTY_TABLE_LEARN_PORTABLE: a state whose programs differ only in runtime-format buffers' V# format, as the
+		// resolver's refusals did (Demon's Souls' view save: 4 states, 173 draws a frame as holes in mode 4), learns those
+		// buffers as portable and the pair compiles again, instead of the state refused for good.)
+		if (TableLearnPortable() != 0) {
+			std::array<uint32_t, 2> masks {};
+			bool                    other = false;
+			for (uint32_t st = 0; st < 2 && !other; ++st) {
+				if (pair->programs[st] == programs[st]) continue;
+				const auto mask = pipelines.TableFormatOnlyBuffers(pair->programs[st], programs[st]);
+				if (mask == UINT32_MAX || mask == 0) {
+					other = true;
+					break;
+				}
+				const auto& buffers = pair->programs[st]->info.buffers;
+				for (uint32_t i = 0; i < 32; ++i)
+					if (((mask >> i) & 1u) != 0 && (i >= buffers.size() || !ShaderRecompiler::IR::RuntimeBufferFormat(buffers[i])))
+						other = true;
+				masks[st] = mask;
+			}
+			if (!other && ((pair->portable[0] | masks[0]) != pair->portable[0] || (pair->portable[1] | masks[1]) != pair->portable[1])) {
+				const auto write = CatalogWrite();
+				pair->portable[0] |= masks[0];
+				pair->portable[1] |= masks[1];
+				pair->respecialize = true;
+				return;
+			}
+		}
 		// Another specialization (the pixel program's export of another draw state's targets): this state's draws
 		// keep the native path.
 		const auto write = CatalogWrite();
