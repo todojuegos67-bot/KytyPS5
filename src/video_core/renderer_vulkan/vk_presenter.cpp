@@ -751,6 +751,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     vk::Extent2D bb_in_size = image_size;
     bool bb_upscaled = false;
+    vk::Extent2D bb_sr_size{};
     const bool bb_split = rasterizer->bb_hud.Captured() &&
                           rasterizer->bb_hud.CapturedAddr() == image.info.guest_address;
     frame->fg = {};
@@ -772,6 +773,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                          : vk::ImageView{};
             image_view = with_hud ? with_hud : v;
             image_size = out_size;
+            bb_sr_size = out_size;
             bb_upscaled = true;
         }
     }
@@ -814,7 +816,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 : 0.0;
         bb_last_flip = now;
         BB::Upscale::NoteFrame(frame_ms - bb_wait_ms, bb_wait_ms, gpu, sr, mv, bb_in_size.width,
-                               bb_in_size.height, frame->width, frame->height, bb_upscaled);
+                               bb_in_size.height, bb_sr_size.width, bb_sr_size.height,
+                               frame->width, frame->height, bb_upscaled);
     }
     return frame;
 }

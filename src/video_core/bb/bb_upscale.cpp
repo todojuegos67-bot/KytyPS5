@@ -739,7 +739,7 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
 }
 
 void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, double mv_ms,
-               u32 in_w, u32 in_h, u32 out_w, u32 out_h, bool upscaled) {
+               u32 in_w, u32 in_h, u32 sr_w, u32 sr_h, u32 out_w, u32 out_h, bool upscaled) {
     const auto now = std::chrono::steady_clock::now();
     if (g_acc.frames == 0 && g_acc.start.time_since_epoch().count() == 0) {
         g_acc.start = now;
@@ -771,6 +771,8 @@ void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, doubl
     s.in_h = in_h;
     s.out_w = out_w;
     s.out_h = out_h;
+    s.sr_w = upscaled ? sr_w : 0;
+    s.sr_h = upscaled ? sr_h : 0;
     s.upscaled = upscaled;
     g_stats = s;
     g_hist_mean.push_back(s.frame_ms);
@@ -781,11 +783,12 @@ void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, doubl
     }
     LOG_INFO(Render_Vulkan,
              "[perf] fps {:.1f} frame {:.2f} ms | cpu {:.2f} ms (fence wait {:.2f}) | gpu {:.2f} "
-             "ms | upscaler {} {} {}x{} -> {}x{} sr {:.3f} ms mv {:.3f} ms",
+             "ms | upscaler {} {} {}x{} -> {} -> {}x{} (window) sr {:.3f} ms mv {:.3f} ms",
              s.fps, s.frame_ms, s.cpu_ms, s.wait_ms, s.gpu_ms,
              Enabled() ? SR::KindName(Cfg().kind) : "off",
-             Enabled() ? SR::QualityName(Cfg().quality) : "-", in_w, in_h, out_w, out_h,
-             s.sr_ms, s.mv_ms);
+             Enabled() ? SR::QualityName(Cfg().quality) : "-", in_w, in_h,
+             s.sr_w ? fmt::format("{}x{}", s.sr_w, s.sr_h) : std::string("not upscaled"), out_w,
+             out_h, s.sr_ms, s.mv_ms);
     g_acc = {};
     g_acc.start = now;
 }
@@ -1065,9 +1068,12 @@ void DrawOverlay() {
                                                          : SR::KindName(k);
             rows.push_back({"Escala", rk + dot + ModeEs(Cfg().quality), col});
             const double ratio = s.in_h > 0 ? static_cast<double>(s.out_h) / s.in_h : 0.0;
+            const u32 sr_h = s.sr_h ? s.sr_h : s.out_h;
+            const double ratio2 = s.in_h > 0 ? static_cast<double>(sr_h) / s.in_h : 0.0;
+            (void)ratio;
             rows.push_back({"Resol.",
-                            s.in_h > 0 ? fmt::format("{}p {} {}p (x{:.3g})", s.in_h, arrow,
-                                                     s.out_h, ratio)
+                            s.in_h > 0 ? fmt::format("{}p {} {}p (x{:.3g}) {} {}p", s.in_h, arrow,
+                                                     sr_h, ratio2, arrow, s.out_h)
                                        : fmt::format("{} {}p", arrow, s.out_h),
                             col});
             std::string model;

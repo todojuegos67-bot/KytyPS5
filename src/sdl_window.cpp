@@ -27,6 +27,8 @@
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
+#include <cstdio>
+#include <cstdlib>
 #include "sdl_window.h"
 #include "imgui/bb_menu.h"
 #include "video_core/bb/bb_upscale.h"
@@ -154,9 +156,44 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
         LOG_ERROR(Frontend, "Error getting display mode: {}", SDL_GetError());
         error = true;
     }
+    // bb-clean-021-fg: fullscreen at the configured size (winres / BB_RES_PATCH_OUTPUT, e.g.
+    // 3840x2160 through NVIDIA DSR) instead of the desktop's: an exclusive display mode of that
+    // size when the display lists one (DSR does), so the swapchain is that size and the driver
+    // downsamples. Borderless cannot exceed the desktop, so a larger size switches to exclusive.
+    SDL_DisplayMode bb_mode{};
+    bool bb_exclusive = false;
+    if (!error && EmulatorSettings.IsFullScreen()) {
+        int want_w = EmulatorSettings.GetWindowWidth(), want_h = EmulatorSettings.GetWindowHeight();
+        if (const char* o = std::getenv("BB_RES_PATCH_OUTPUT")) {
+            unsigned w = 0, h = 0;
+            if (std::sscanf(o, "%ux%u", &w, &h) == 2 && w >= 640 && h >= 360) {
+                want_w = static_cast<int>(w);
+                want_h = static_cast<int>(h);
+            }
+        }
+        const bool larger = want_w > displayMode->w || want_h > displayMode->h;
+        const bool exclusive = EmulatorSettings.GetFullScreenMode() == "Fullscreen";
+        if ((exclusive || larger) && (want_w != displayMode->w || want_h != displayMode->h)) {
+            if (SDL_GetClosestFullscreenDisplayMode(displayIndex, want_w, want_h,
+                                                    displayMode->refresh_rate, false, &bb_mode) &&
+                bb_mode.w == want_w && bb_mode.h == want_h) {
+                bb_exclusive = true;
+                LOG_INFO(Frontend, "fullscreen: exclusive display mode {}x{} @ {:.2f} Hz (desktop {}x{})",
+                         bb_mode.w, bb_mode.h, bb_mode.refresh_rate, displayMode->w,
+                         displayMode->h);
+            } else {
+                LOG_WARNING(Frontend,
+                            "fullscreen: the display has no {}x{} mode (enable DSR / a custom "
+                            "resolution): fullscreen at the desktop size {}x{}",
+                            want_w, want_h, displayMode->w, displayMode->h);
+            }
+        }
+    }
     if (!error) {
         SDL_SetWindowFullscreenMode(
-            window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? displayMode : NULL);
+            window, bb_exclusive ? &bb_mode
+                                 : EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? displayMode
+                                                                                        : NULL);
     }
     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
     SDL_SyncWindow(window);

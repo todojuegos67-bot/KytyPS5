@@ -72,11 +72,12 @@ Camera EndFrame(u32 flip_w, u32 flip_h);
 // Once-per-second performance line and the F8 overlay values.
 struct Stats {
     float fps = 0, frame_ms = 0, cpu_ms = 0, gpu_ms = 0, wait_ms = 0, sr_ms = 0, mv_ms = 0;
-    u32 in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    u32 in_w = 0, in_h = 0, out_w = 0, out_h = 0; // out: the window
+    u32 sr_w = 0, sr_h = 0;                       // the upscaler's output (0: not upscaled)
     bool upscaled = false;
 };
 void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, double mv_ms,
-               u32 in_w, u32 in_h, u32 out_w, u32 out_h, bool upscaled);
+               u32 in_w, u32 in_h, u32 sr_w, u32 sr_h, u32 out_w, u32 out_h, bool upscaled);
 const Stats& LastStats();
 bool OverlayShown();
 void ToggleOverlay();
