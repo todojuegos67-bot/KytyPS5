@@ -251,6 +251,10 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                          });
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
+    settings.downscale = 1.0f;
+    if (input_size.width > frame.width + 1 && frame.width > 0) {
+        settings.downscale = static_cast<float>(input_size.width) / frame.width;
+    }
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
                          &settings);
 
