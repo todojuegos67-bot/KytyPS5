@@ -177,7 +177,7 @@ std::string ModeName(int kind, int quality) {
     const auto k = static_cast<Kind>(kind);
     switch (static_cast<Quality>(quality)) {
     case Quality::Native:
-        return k == Kind::Dlss ? "DLAA" : k == Kind::Xess ? "AA" : k == Kind::Fsr4 ? "Nativo (AA)" : "AA nativo";
+        return k == Kind::Taa ? "TAA" : k == Kind::Dlss ? "DLAA" : k == Kind::Xess ? "AA" : k == Kind::Fsr4 ? "Nativo (AA)" : "AA nativo";
     case Quality::UltraQualityPlus: return "Ultra calidad+";
     case Quality::UltraQuality: return "Ultra calidad";
     case Quality::Quality: return "Calidad";
@@ -286,7 +286,7 @@ void Sample(
         if (snap.has_up && up.running) {
             // bb-dcideas-094: what really runs: FSR 4.1.1 (bbport's replay) or FSR 4.0 for fsr4.
             const bool v411 = kind == Kind::Fsr4 && BB::SR::Fsr4::Active411();
-            rk = kind == Kind::Dlss ? "DLSS" : kind == Kind::Xess ? "XeSS" : kind == Kind::Fsr4 ? (v411 ? "FSR 4.1.1" : "FSR 4.0") : "FSR 3.1";
+            rk = kind == Kind::Taa ? "TAA" : kind == Kind::Dlss ? "DLSS" : kind == Kind::Xess ? "XeSS" : kind == Kind::Fsr4 ? (v411 ? "FSR 4.1.1" : "FSR 4.0") : "FSR 3.1";
             mode = ModeName(up.kind, up.quality);
             col = kind == Kind::Dlss ? kGreen : kind == Kind::Xess ? kBlue : kRed;
             const double ratio = up.render_h != 0 ? static_cast<double>(up.output_h) / up.render_h : 0.0;

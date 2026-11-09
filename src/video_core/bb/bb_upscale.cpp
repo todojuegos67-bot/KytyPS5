@@ -48,6 +48,8 @@ const char* KindName(Kind kind) {
         return "FSR 3.1";
     case Kind::Fsr4:
         return "FSR 4";
+    case Kind::Taa:
+        return "TAA";
     }
     return "?";
 }
@@ -176,6 +178,10 @@ Config ParseConfig() {
         c.kind = SR::Kind::Fsr4;
     } else if (up == "native") {
         c.kind = SR::Kind::Native;
+    } else if (up == "taa") {
+        // bb-d7-021: the emulator's own TAA (bb-clean-021-taa 42d6697a3), native resolution.
+        // Opt-in only: nothing of it runs with any other BB_UPSCALER.
+        c.kind = SR::Kind::Taa;
     }
     // 0.90: DLSS 5 with no upscaler (Reescalado off / native): the same native analysis as frame
     // generation (G-buffer depth, camera + object motion vectors at the game's size), with
@@ -231,6 +237,13 @@ Config ParseConfig() {
     }
     if (const char* s = Env("BB_UPSCALE_SHARPNESS") ? Env("BB_UPSCALE_SHARPNESS") : Env("BB_SHARPNESS")) {
         c.sharpness = std::clamp(static_cast<float>(std::atof(s)), 0.0f, 1.0f);
+    }
+    if (c.kind == SR::Kind::Taa) {
+        c.quality = SR::Quality::Native;
+        c.sharpness = 0.25f;
+        if (const char* s = Env("BB_TAA_SHARPNESS")) {
+            c.sharpness = std::clamp(static_cast<float>(std::atof(s)), 0.0f, 1.0f);
+        }
     }
     if (const char* s = Env("BB_UPSCALE_JITTER")) {
         c.jitter = s[0] != '0';
@@ -2127,6 +2140,9 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
     case SR::Kind::Fsr4:
         SR::Fsr4::OnDevice(instance, physical, device, allocator, queue, family);
         break;
+    case SR::Kind::Taa:
+        SR::Taa::OnDevice(device, allocator);
+        break;
     default:
         break;
     }
@@ -2354,6 +2370,9 @@ bool RunBackend(const SR::Desc& desc) {
     case SR::Kind::Fsr4:
         fn = &SR::Fsr4::Evaluate;
         break;
+    case SR::Kind::Taa:
+        fn = &SR::Taa::Evaluate;
+        break;
     default:
         return false;
     }
@@ -2398,6 +2417,8 @@ bool BackendReady() {
     case SR::Kind::Fsr4:
         if (cached < 0) cached = SR::Fsr4::Ready() ? 1 : 0;
         return cached == 1;
+    case SR::Kind::Taa:
+        return SR::Taa::Ready();
     default:
         return false;
     }
