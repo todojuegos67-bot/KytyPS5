@@ -743,6 +743,16 @@ void PickCamera(u32 scene_w, u32 scene_h, u32& w, u32& h) {
     }
 }
 
+std::atomic<u32> g_jit_draws{0}, g_jit_skipped{0}, g_jit_w{0}, g_jit_h{0};
+void NoteJitterDraw(bool jittered, bool skipped_after_hud, u32 w, u32 h) {
+    if (jittered) {
+        g_jit_draws.fetch_add(1, std::memory_order_relaxed);
+        g_jit_w.store(w, std::memory_order_relaxed);
+        g_jit_h.store(h, std::memory_order_relaxed);
+    }
+    if (skipped_after_hud) g_jit_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
 void Jitter(float& x, float& y) {
     x = g_jitter[0];
     y = g_jitter[1];
@@ -816,6 +826,10 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
         ++frames;
         with_camera += cam.valid ? 1 : 0;
         if (frames == 300) {
+            Checkpoint(fmt::format("[jitter] last 300 frames: {} depth binds jittered (target "
+                                   "{}x{}), {} after the HUD start left unjittered",
+                                   g_jit_draws.exchange(0), g_jit_w.load(), g_jit_h.load(),
+                                   g_jit_skipped.exchange(0)));
             Checkpoint(fmt::format("camera: {} of 300 frames (scene blocks seen {}, taken {})",
                                    with_camera, g_cam_seen.exchange(0), g_cam_taken.exchange(0)));
             frames = with_camera = 0;

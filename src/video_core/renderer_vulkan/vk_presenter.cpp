@@ -519,7 +519,69 @@ Presenter::~Presenter() {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
+        if (frame.hudless_view) device.destroyImageView(frame.hudless_view);
+        if (frame.hudless_image) {
+            vmaDestroyImage(instance.GetAllocator(), frame.hudless_image,
+                            frame.hudless_allocation);
+        }
     }
+}
+
+// bb-hudless: (re)creates a frame's HUD-less image at the frame's size and format.
+static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::Format format) {
+    if (frame.hudless_image && frame.hudless_width == frame.width &&
+        frame.hudless_height == frame.height && frame.hudless_format == format) {
+        return true;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (frame.hudless_image) {
+        (void)device.waitIdle(); // a resize only
+        device.destroyImageView(frame.hudless_view);
+        vmaDestroyImage(instance.GetAllocator(), frame.hudless_image, frame.hudless_allocation);
+        frame.hudless_image = vk::Image{};
+        frame.hudless_view = vk::ImageView{};
+    }
+    const VkImageCreateInfo ici = vk::ImageCreateInfo{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {frame.width, frame.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+    };
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkImage image{};
+    if (vmaCreateImage(instance.GetAllocator(), &ici, &aci, &image, &frame.hudless_allocation,
+                       nullptr) != VK_SUCCESS) {
+        // Storage may be unsupported for this format: retry without it.
+        VkImageCreateInfo ici2 = ici;
+        ici2.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+        if (vmaCreateImage(instance.GetAllocator(), &ici2, &aci, &image,
+                           &frame.hudless_allocation, nullptr) != VK_SUCCESS) {
+            return false;
+        }
+    }
+    frame.hudless_image = vk::Image{image};
+    auto [vr, view] = device.createImageView({
+        .image = frame.hudless_image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (vr != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), frame.hudless_image, frame.hudless_allocation);
+        frame.hudless_image = vk::Image{};
+        return false;
+    }
+    frame.hudless_view = view;
+    frame.hudless_width = frame.width;
+    frame.hudless_height = frame.height;
+    frame.hudless_format = format;
+    return true;
 }
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
@@ -753,6 +815,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     vk::Extent2D bb_in_size = image_size;
     bool bb_upscaled = false;
     vk::Extent2D bb_sr_size{};
+    vk::ImageView bb_hudless_scene{};
     const bool bb_split = rasterizer->bb_hud.Captured() &&
                           rasterizer->bb_hud.CapturedAddr() == image.info.guest_address;
     frame->fg = {};
@@ -772,6 +835,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 bb_split ? rasterizer->bb_hud.Composite(cmdbuf, image_view, v, image_size,
                                                         out_size, srgb10)
                          : vk::ImageView{};
+            if (with_hud) bb_hudless_scene = v; // the upscaled scene before the HUD
             image_view = with_hud ? with_hud : v;
             image_size = out_size;
             bb_sr_size = out_size;
@@ -822,6 +886,63 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input = srgb10 && !bb_upscaled;
+    {
+        // bb-hudless: the HUD-less colour for frame generation, the upscaled scene through the
+        // same post-process pass into an image of the frame's size and format (the backbuffer's),
+        // so FSR 3 FG composes the real HUD instead of interpolating it.
+        static u32 sec_frames = 0, given = 0, failed = 0;
+        bool ok = false;
+        if (bb_hudless_scene && frame->fg.valid) {
+            const vk::Format fmt = swapchain.GetSurfaceFormat().format;
+            if (BbEnsureHudless(instance, *frame, fmt)) {
+                const vk::ImageMemoryBarrier2 to_att{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                    .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                    .oldLayout = vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                    .image = frame->hudless_image,
+                    .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                };
+                cmdbuf.pipelineBarrier2(
+                    vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_att});
+                Frame target = *frame;
+                target.image = frame->hudless_image;
+                target.image_view = frame->hudless_view;
+                auto hs = pp_settings;
+                hs.srgb_input = false;
+                pp_pass.Render(cmdbuf, bb_hudless_scene, image_size, target, hs);
+                const vk::ImageMemoryBarrier2 to_read{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                    .oldLayout = vk::ImageLayout::eGeneral,
+                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    .image = frame->hudless_image,
+                    .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                };
+                cmdbuf.pipelineBarrier2(
+                    vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+                frame->fg.hudless = {frame->hudless_image, frame->hudless_view, fmt,
+                                     {frame->width, frame->height},
+                                     vk::ImageUsageFlagBits::eColorAttachment |
+                                         vk::ImageUsageFlagBits::eSampled};
+                frame->fg.has_hudless = true;
+                ok = true;
+            } else {
+                ++failed;
+            }
+        }
+        given += ok ? 1u : 0u;
+        if (++sec_frames == 300) {
+            BB::Upscale::Checkpoint(fmt::format(
+                "[hudless] last 300 frames: HUD-less colour made for {} ({} failed), {}x{}",
+                given, failed, frame->width, frame->height));
+            sec_frames = given = failed = 0;
+        }
+    }
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
     bb_sr->FrameEnd(cmdbuf);
 

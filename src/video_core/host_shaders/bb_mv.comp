@@ -38,20 +38,13 @@ void main() {
     }
     imageStore(color_out, c, vec4(col, 1.0));
 
-    // HUD (bb-hudmv): the presented image differs from the scene copy at a 3x3 neighbourhood of
-    // this pixel. The HUD is fixed on screen: zero motion (no camera vector from the scene depth
-    // behind the text, which made the frame generator move the letters).
+    // HUD (bb-hudmv): only where the HUD is clearly drawn over the scene (the presented image
+    // differs from the scene copy by more than 0.1 in a channel; no dilation over the scene).
+    // The HUD is fixed on screen: zero motion. Frame generation gets the HUD-less colour too.
     if ((p.size.w & 2u) != 0u) {
-        bool hud = false;
-        for (int dy = -1; dy <= 1 && !hud; ++dy) {
-            for (int dx = -1; dx <= 1 && !hud; ++dx) {
-                ivec2 q = clamp(c + ivec2(dx, dy), ivec2(0), ivec2(int(p.size.x) - 1, int(p.size.y) - 1));
-                vec3 dif = abs(texelFetch(full_tex, q, 0).rgb - texelFetch(color_tex, q, 0).rgb);
-                hud = max(dif.r, max(dif.g, dif.b)) > 0.02;
-            }
-        }
-        if (hud) {
-            imageStore(mv_out, c, vec4(0.0, 0.0, 0.0, 0.0));
+        vec3 dif = abs(texelFetch(full_tex, c, 0).rgb - texelFetch(color_tex, c, 0).rgb);
+        if (max(dif.r, max(dif.g, dif.b)) > 0.1) {
+            imageStore(mv_out, c, vec4(0.0));
             return;
         }
     }

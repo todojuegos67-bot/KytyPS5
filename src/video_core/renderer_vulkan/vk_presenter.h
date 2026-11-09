@@ -40,6 +40,13 @@ struct Frame {
     bool is_hdr{false};
     u8 id{};
     BB::FG::Inputs fg{}; // bb-clean-021-fg: this frame's frame generation inputs (valid: 3D frame)
+    // bb-hudless: the upscaled scene without the HUD, through the same post-process pass as the
+    // frame (its size and format): FSR 3 FG's HUD-less colour (DLSS-G: kBufferTypeHUDLessColor).
+    vk::Image hudless_image{};
+    VmaAllocation hudless_allocation{};
+    vk::ImageView hudless_view{};
+    u32 hudless_width = 0, hudless_height = 0;
+    vk::Format hudless_format = vk::Format::eUndefined;
 
     ImTextureID imgui_texture;
 };

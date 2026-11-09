@@ -58,6 +58,9 @@ extern u32 g_scene_w, g_scene_h;
 void OnConstants(const u32* data, size_t count);
 // This frame's jitter in render pixels (zero when off).
 void Jitter(float& x, float& y);
+// bb-hudjitter: a depth-target bind of a draw (rasterizer): jittered (scene), skipped (after the
+// HUD start), with its target size; counted and logged every 300 frames by EndFrame.
+void NoteJitterDraw(bool jittered, bool skipped_after_hud, u32 w, u32 h);
 
 struct Camera {
     bool valid = false;
