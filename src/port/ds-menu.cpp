@@ -5781,6 +5781,39 @@ bool DrawKbm(float width, float height, float unit) {
 
 // (ds-pc-port8) In the game: F1's save and quit, a panel in the middle of the screen until the game closes.
 // (ds-pc-port38) `closing`: the fade-out after F1 / Esc closed it (drawn disabled, no input taken).
+// (bb-style-f1) The cursor is kept at every level of F1: each screen (0 the option bar, 1 Mando, 2 Teclado y ratón,
+// 3 Trofeos) remembers the item that had the keyboard / pad focus; when a screen comes back (back from an option, from a
+// sub-screen, or F1 opened again in this session) that item gets the focus again instead of ImGui's first item.
+namespace KeepFocus {
+struct Mem {
+	ImGuiID      id = 0;
+	ImGuiWindow* window = nullptr;
+};
+Mem g_mem[4];
+int g_screen = -1, g_frame = -10;
+// Called once per drawn screen, after its items were submitted.
+void After(int screen) {
+	ImGuiContext& g     = *ImGui::GetCurrentContext();
+	const int     frame = ImGui::GetFrameCount();
+	const bool    back  = g_frame != frame - 1 || g_screen != screen;
+	g_frame  = frame;
+	g_screen = screen;
+	Mem& m   = g_mem[screen];
+	if (back) {
+		if (m.id != 0 && m.window != nullptr) {
+			ImGui::FocusWindow(m.window);
+			ImGui::SetFocusID(m.id, m.window);
+			g.NavInitRequest   = false; // (not ImGui's own pick of the first item)
+			g.NavInitResult.ID = 0;
+			g.NavCursorVisible = true;
+			g.NavHighlightItemUnderNav = true;
+		}
+		return;
+	}
+	if (g.NavId != 0 && g.NavWindow != nullptr) m = {g.NavId, g.NavWindow};
+}
+} // namespace KeepFocus
+
 void (*g_menu_rect_hook)(ImVec2, ImVec2) = nullptr; // (perfopts-1107) the F1 window's rectangle, for next frame's fog
 void DrawInGameMenu(float width, float height, bool closing = false) {
 	if (!closing) DrainInputs();
@@ -5789,6 +5822,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	if (closing && (g_f1_page.load() != 0 || g_trophy_page.load())) return; // (a page closes at once)
 	if (const int page = g_f1_page.load(); page != 0) {
 		const bool open = page == 1 ? F1Pages::DrawPad(width, height, unit) : F1Pages::DrawKbm(width, height, unit);
+		KeepFocus::After(page == 1 ? 1 : 2);
 		if (!open) {
 			g_f1_page       = 0;
 			Anim::g_page_at = Anim::Now(); // (ds-pc-port38) the menu fades in again
@@ -5797,7 +5831,9 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		return;
 	}
 	if (g_trophy_page.load()) {
-		if (!TrophyPage::Draw(width, height, unit)) {
+		const bool trophy_open = TrophyPage::Draw(width, height, unit);
+		KeepFocus::After(3);
+		if (!trophy_open) {
 			g_trophy_page      = false;
 			g_focus_trophy_btn = true;
 		}
@@ -5918,6 +5954,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	}
 	ImGui::PopStyleVar();
 	ImGui::TextDisabled("%s", I18n::T("F1 o Esc: volver al juego"));
+	if (!closing) KeepFocus::After(0);
 	{
 		// (perfopts-1107) Under the contents: the carved stone panel and the gliding highlight; while opening or closing,
 		// a pale soul-light bloom around the panel that fades as it settles.
