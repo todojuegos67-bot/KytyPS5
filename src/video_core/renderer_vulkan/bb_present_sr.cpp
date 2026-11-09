@@ -345,7 +345,10 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     desc.jitter[0] = jx;
     desc.jitter[1] = jy;
     desc.reset = cam.reset || in != last_in || out != last_out;
-    desc.hdr = true;
+    // The scene colour is the game's tonemapped LDR image (as in Supermedo's RunScaled, hdr = false): telling
+    // DLSS / FSR it is HDR turned on their auto exposure and HDR handling, which shifted the colours (dull, yellow,
+    // blue shadows) and softened the picture.
+    desc.hdr = false;
     desc.depth_inverted = scene.greater;
     desc.delta_ms = 16.7f;
     desc.fov_y = cam.fov_y;
