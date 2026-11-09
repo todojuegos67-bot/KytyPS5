@@ -49,6 +49,11 @@ struct ID3D12Resource;
 
 namespace BB::Dlss5 {
 namespace {
+// F8 panel (PanelLine): read from the render thread, written where the values are made.
+std::atomic<unsigned long long> g_panel_eval_ok {0};
+std::atomic<long long>          g_panel_last_eval {0};
+std::atomic<double>             g_panel_edit {-1.0};
+std::atomic<double>             g_panel_gpu_ms {0.0};
 
 using Libs::Graphics::GraphicContext;
 
@@ -992,7 +997,7 @@ void ReadTiming(GraphicContext& graphics) {
 		double ms[3];
 		for (int i = 0; i < 3; ++i) ms[i] = static_cast<double>(stamps[i + 1] - stamps[i]) * g.period_ns / 1e6;
 		for (int i = 0; i < 3; ++i) g.sum[i] += ms[i];
-		(void)0;
+		g_panel_gpu_ms.store(ms[0] + ms[1] + ms[2], std::memory_order_relaxed);
 		++g.n;
 		const double total = ms[0] + ms[1] + ms[2];
 		if (g.ab_stage < 2) {
@@ -1029,6 +1034,7 @@ void SessionLine(GraphicContext& graphics, float strength) {
 		g.edit_pct    = 100.0 * static_cast<double>(dsum) / (256.0 * static_cast<double>(dcount));
 		g.changed_pct = 100.0 * static_cast<double>(dchanged) / static_cast<double>(dcount);
 	}
+	g_panel_edit.store(g.edit_pct, std::memory_order_relaxed);
 	char line[384] {};
 	if (frames > 0) {
 		std::snprintf(line, sizeof(line), "DLSS 5: on, evaluate OK %llu frames (%llu in all, %u failed), the model's edit %.2f%% mean, %.0f%% of the pixels changed > 1%%; strength %g, intensity %g, %s",
@@ -1193,6 +1199,31 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
 	BBLogf("DLSS 5: wanted; %s", found.empty() ? ("nvngx_dlssnr.dll NOT found (looked at " + searched + "): DLSS 5 will stay off").c_str()
 	                                             : ("nvngx_dlssnr.dll found at " + PathText(found) + ": loaded at the first upscaled frame").c_str());
 #endif
+}
+
+std::string PanelLine(bool& active) {
+	active = false;
+	if (!Wanted()) return "off";
+	const auto& s   = Settings();
+	const char* lvl = s.level == 1 ? "Suave" : s.level == 2 ? "Medio" : "Fuerte";
+	const auto ok   = g_panel_eval_ok.load(std::memory_order_relaxed);
+	const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	const bool eval = ok > 0 && now - g_panel_last_eval.load(std::memory_order_relaxed) < 2000;
+	active = eval;
+	std::string out = std::string(lvl) + " \xC2\xB7 " + s.intensity_name + " \xC2\xB7 " + (eval ? "on" : "no evalua");
+	const double edit = g_panel_edit.load(std::memory_order_relaxed);
+	if (eval && edit >= 0) {
+		char b[64];
+		std::snprintf(b, sizeof(b), " \xC2\xB7 edit %.1f%%", edit);
+		out += b;
+	}
+	const double gpu = g_panel_gpu_ms.load(std::memory_order_relaxed);
+	if (eval && gpu > 0) {
+		char b[32];
+		std::snprintf(b, sizeof(b), " \xC2\xB7 %.2f ms", gpu);
+		out += b;
+	}
+	return out;
 }
 
 std::string StatusLine() {
@@ -1374,7 +1405,12 @@ bool Apply(const SR::Desc& desc) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	if (timed) command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g.pool, entry * Stamps + 2);
 	const bool evaluated = eval_result == NgxSuccess;
-	if (evaluated) ++g.eval_ok;
+	if (evaluated) {
+		++g.eval_ok;
+		g_panel_eval_ok.fetch_add(1, std::memory_order_relaxed);
+		g_panel_last_eval.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+		                        std::memory_order_relaxed);
+	}
 	if (!evaluated) {
 		g.last_error = eval_result;
 		++g.eval_failures;

@@ -36,5 +36,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
 // After the upscaler wrote desc.output (RGBA16F, GENERAL): NR in place. False: the frame unchanged.
 bool Apply(const SR::Desc& desc);
 std::string StatusLine();
+// F8 panel row: "off", or level, intensity, evaluating / not, edit %, GPU ms (values already kept).
+std::string PanelLine(bool& active);
 
 } // namespace BB::Dlss5

@@ -1024,6 +1024,11 @@ void DrawOverlay() {
             rows.push_back({"Resol.", fmt::format("{}p {} {}p", s.in_h, arrow, s.out_h), kOrange});
         }
     }
+    if (ready) {
+        bool d5 = false;
+        const std::string d5_line = Dlss5::PanelLine(d5);
+        rows.push_back({"DLSS 5", d5_line, d5 ? kGreen : kOrange});
+    }
     if (rows.empty())
         rows.push_back({"", "Cargando...", kOrange});
 
