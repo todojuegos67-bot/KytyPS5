@@ -338,8 +338,41 @@ double Ratio() {
     return SR::QualityRatio(Cfg().kind, Cfg().quality);
 }
 
+namespace {
+// bb-clean-021-fg: until the first frame every checkpoint is also appended to bb_startup.log
+// (opened, written, flushed and closed per line), so a crash during start-up leaves its last
+// step; the previous run's file is kept as bb_startup.prev.log.
+std::atomic<bool> g_startup_done{false};
+std::mutex g_startup_mutex;
+
+void StartupNote(std::string_view text) {
+    if (g_startup_done.load(std::memory_order_relaxed)) return;
+    std::scoped_lock lk{g_startup_mutex};
+    static bool first = true;
+    if (first) {
+        first = false;
+        std::error_code ec;
+        std::filesystem::rename("bb_startup.log", "bb_startup.prev.log", ec);
+    }
+    if (std::FILE* f = std::fopen("bb_startup.log", "ab")) {
+        std::fwrite(text.data(), 1, text.size(), f);
+        std::fputc('\n', f);
+        std::fflush(f);
+        std::fclose(f);
+    }
+}
+} // namespace
+
 void Checkpoint(std::string_view text) {
     LOG_INFO(Render_Vulkan, "[BB_UPSCALE] {}", text);
+    StartupNote(text);
+}
+
+void StartupDone() {
+    if (!g_startup_done.load(std::memory_order_relaxed)) {
+        StartupNote("start-up done: first frame presented");
+        g_startup_done = true;
+    }
 }
 
 float LiveSharpness() {
@@ -361,6 +394,8 @@ void PreInstance() {
              "jitter {}",
              SR::KindName(c.kind), SR::QualityName(c.quality), Ratio(), c.sharpness,
              c.jitter ? "on" : "off");
+    StartupNote(fmt::format("upscaler {} mode {} (ratio {:.3f}), jitter {}", SR::KindName(c.kind),
+                            SR::QualityName(c.quality), Ratio(), c.jitter ? "on" : "off"));
     if (Streamline()) {
 #if defined(_WIN32)
         for (const char* var :
@@ -599,6 +634,7 @@ void Jitter(float& x, float& y) {
 }
 
 Camera EndFrame(u32 flip_w, u32 flip_h) {
+    StartupDone();
     Camera cam;
     {
         std::scoped_lock lk{g_cam_mutex};

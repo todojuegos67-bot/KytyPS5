@@ -655,7 +655,15 @@ bool Instance::CreateDevice() {
             Core::ReleaseDlssAddressHole();
         }
     }
+    if (BB::Upscale::Capture()) {
+        std::string names;
+        for (const char* e : enabled_extensions) names += std::string(e) + " ";
+        BB::Upscale::Checkpoint("vkCreateDevice: calling with " + names);
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    if (BB::Upscale::Capture()) {
+        BB::Upscale::Checkpoint("vkCreateDevice: " + vk::to_string(device_result));
+    }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
@@ -700,8 +708,10 @@ bool Instance::CreateDevice() {
 
     CreateAllocator();
     if (BB::Upscale::Enabled()) {
+        BB::Upscale::Checkpoint("upscaler device set-up: start");
         BB::Upscale::OnDevice(*instance, physical_device, *device, allocator, graphics_queue,
                               queue_family_index);
+        BB::Upscale::Checkpoint("upscaler device set-up: done");
     }
     BB::FG::OnDevice(physical_device, *device, queue_family_index, graphics_queue, fg_queues,
                      &Scheduler::submit_mutex);

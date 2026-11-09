@@ -1147,7 +1147,13 @@ int Level() {
 }
 
 bool Wanted() {
-	return Level() > 0;
+	// bb-clean-021-fg: only after DLSS (NGX through Streamline). With FSR 4 / XeSS / native the
+	// start-up died in CreateDevice: DLSS 5 is ignored there.
+	if (Level() <= 0) return false;
+	static const bool dlss = BB::Upscale::Cfg().kind == SR::Kind::Dlss;
+	static std::atomic<bool> said {false};
+	if (!dlss && !said.exchange(true)) BB::Upscale::Checkpoint("DLSS 5: off (needs DLSS as the upscaler)");
+	return dlss;
 }
 
 void AddDeviceExtensions(vk::PhysicalDevice physical, const std::vector<std::string>& available,
@@ -1203,6 +1209,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
 
 std::string PanelLine(bool& active) {
 	active = false;
+	if (Level() > 0 && !Wanted()) return "off (needs DLSS)";
 	if (!Wanted()) return "off";
 	const auto& s   = Settings();
 	const char* lvl = s.level == 1 ? "Suave" : s.level == 2 ? "Medio" : "Fuerte";
