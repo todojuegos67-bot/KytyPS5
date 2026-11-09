@@ -308,6 +308,12 @@ constexpr u32 kMaxCandidates = 16;
 CamCandidate g_cands[kMaxCandidates];
 u32 g_cand_n = 0;
 
+struct MvStats {
+    double max = 0, mean_sum = 0, yaw_max = 0, yaw_sum = 0;
+    u32 frames = 0, resets = 0, no_prev = 0, same = 0;
+    std::chrono::steady_clock::time_point start{};
+} g_mvs;
+
 u32 g_frame_no = 0;
 float g_jitter[2]{};
 
@@ -805,12 +811,51 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
                 cam.z_near = static_cast<float>(zn);
                 cam.z_far = zf > 1e7 ? 0.0f : static_cast<float>(zf);
                 cam.valid = true;
-                // A camera cut (a jump far beyond normal motion): history reset.
-                if (g_prev_valid) {
-                    double diff = 0;
-                    for (int i = 0; i < 16; ++i) diff += std::fabs(to_prev.m[i] - (i % 5 == 0));
-                    cam.reset = diff > 3.0;
+                // bb-mvstats: the camera vectors this matrix gives (render pixels towards the
+                // previous frame, as bb_mv.comp), on a 9x9 grid at a far and a mid depth: no GPU
+                // readback. A camera cut = the mean vector beyond 40% of the width (the old rule,
+                // summed matrix entries over 3, could reset on a fast turn: projection terms).
+                double mv_max = 0, mv_sum = 0;
+                u32 mv_n = 0;
+                const double hw = 0.5 * flip_w, hh = 0.5 * flip_h;
+                for (double z : {0.999, 0.9}) {
+                    for (int gy = 0; gy < 9; ++gy) {
+                        for (int gx = 0; gx < 9; ++gx) {
+                            const double x = -0.9 + 0.225 * gx, y = -0.9 + 0.225 * gy;
+                            const double* m = to_prev.m;
+                            const double px = m[0] * x + m[1] * y + m[2] * z + m[3];
+                            const double py = m[4] * x + m[5] * y + m[6] * z + m[7];
+                            const double pw = m[12] * x + m[13] * y + m[14] * z + m[15];
+                            if (!(pw > 1e-9)) continue;
+                            const double dx = (px / pw - x) * hw, dy = (py / pw - y) * hh;
+                            const double len = std::sqrt(dx * dx + dy * dy);
+                            if (!std::isfinite(len)) continue;
+                            mv_max = std::max(mv_max, len);
+                            mv_sum += len;
+                            ++mv_n;
+                        }
+                    }
                 }
+                const double mv_mean = mv_n ? mv_sum / mv_n : 0.0;
+                // Yaw: the camera's forward direction is the clip w row of the view-projection.
+                const auto yaw = [](const Mat& v) { return std::atan2(v.m[12], v.m[14]); };
+                double dyaw = 0;
+                if (g_prev_valid) {
+                    dyaw = (yaw(g_cur_vp) - yaw(g_prev_vp)) * 180.0 / 3.14159265358979;
+                    if (dyaw > 180) dyaw -= 360;
+                    if (dyaw < -180) dyaw += 360;
+                    cam.reset = mv_mean > 0.4 * flip_w;
+                }
+                g_mvs.max = std::max(g_mvs.max, mv_max);
+                g_mvs.mean_sum += mv_mean;
+                g_mvs.yaw_max = std::max(g_mvs.yaw_max, std::fabs(dyaw));
+                g_mvs.yaw_sum += std::fabs(dyaw);
+                ++g_mvs.frames;
+                g_mvs.resets += cam.reset ? 1u : 0u;
+                g_mvs.no_prev += g_prev_valid ? 0u : 1u;
+                bool same = g_prev_valid;
+                for (int i = 0; i < 16 && same; ++i) same = g_prev_vp.m[i] == g_cur_vp.m[i];
+                g_mvs.same += same ? 1u : 0u;
             }
             g_prev_vp = g_cur_vp;
             g_prev_valid = true;
@@ -819,6 +864,22 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
         }
         g_cur_valid = false;
         g_cur_area = 0;
+    }
+    {
+        // bb-mvstats: once a second.
+        const auto now = std::chrono::steady_clock::now();
+        if (g_mvs.start.time_since_epoch().count() == 0) g_mvs.start = now;
+        if (now - g_mvs.start >= std::chrono::seconds(1)) {
+            const double n = g_mvs.frames ? g_mvs.frames : 1;
+            Checkpoint(fmt::format(
+                "[mv-cam] 1 s: {} frames with camera, vector px max {:.1f} mean {:.2f} (9x9 grid, "
+                "far / mid depth), yaw delta deg/frame max {:.2f} mean {:.2f}, resets {}, no "
+                "previous camera {}, previous == current {}",
+                g_mvs.frames, g_mvs.max, g_mvs.mean_sum / n, g_mvs.yaw_max, g_mvs.yaw_sum / n,
+                g_mvs.resets, g_mvs.no_prev, g_mvs.same));
+            g_mvs = {};
+            g_mvs.start = now;
+        }
     }
     {
         // bb-clean-021-fg: camera found per frame (FG and the motion vectors need it).
