@@ -117,6 +117,7 @@ struct Api {
     PFun_slDLSSGGetState* dlssg_get_state = nullptr;
     PFun_slReflexSetOptions* reflex_set_options = nullptr;
     PFun_slReflexSleep* reflex_sleep = nullptr;
+    PFun_slReflexGetState* reflex_get_state = nullptr;
     PFun_slPCLSetMarker* pcl_set_marker = nullptr;
 } g_api;
 
@@ -442,6 +443,7 @@ void OnDevice(vk::PhysicalDevice physical) {
         !Feature(sl::kFeaturePCL, "slPCLSetMarker", g_api.pcl_set_marker)) {
         return;
     }
+    Feature(sl::kFeatureReflex, "slReflexGetState", g_api.reflex_get_state);
     if (EnvIs("BB_DLSSG_SLEEP", '1')) {
         Feature(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
     }
@@ -550,6 +552,31 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Format for
         if (const auto r = g_api.dlssg_set_options(viewport, options); r != sl::Result::eOk) {
             Printf("[dlssg] slDLSSGSetOptions failed (%d)", static_cast<int>(r));
         }
+        // The state right after every options change (VRAM estimated for these options: with
+        // nullptr options slDLSSGGetState always reports 0 MiB).
+        {
+            sl::DLSSGState st{};
+            const auto gr = g_api.dlssg_get_state(viewport, st, &options);
+            Printf("[dlssg] after slDLSSGSetOptions(mode %s, x%u, %u images, %ux%u): getState %d, "
+                   "status 0x%x, presented %u, generate max %u, minWidthOrHeight %u, VSync support "
+                   "%s, estimated VRAM %llu MiB",
+                   options.mode == sl::DLSSGMode::eOn ? "On" : "Off",
+                   options.numFramesToGenerate + 1, image_count, backbuffer.width,
+                   backbuffer.height, static_cast<int>(gr), static_cast<uint32_t>(st.status),
+                   st.numFramesActuallyPresented, st.numFramesToGenerateMax, st.minWidthOrHeight,
+                   st.bIsVsyncSupportAvailable == sl::Boolean::eTrue ? "yes" : "no",
+                   static_cast<unsigned long long>(st.estimatedVRAMUsageInBytes >> 20u));
+            if (g_api.reflex_get_state != nullptr) {
+                sl::ReflexState rs{};
+                if (g_api.reflex_get_state(rs) == sl::Result::eOk) {
+                    Printf("[dlssg] Reflex: low latency available %s, latency report %s, flash "
+                           "indicator driver controlled %s",
+                           rs.lowLatencyAvailable ? "yes" : "NO",
+                           rs.latencyReportAvailable ? "yes" : "no",
+                           rs.flashIndicatorDriverControlled ? "yes" : "no");
+                }
+            }
+        }
         static bool once = false;
         if (!once) {
             once = true;
@@ -580,6 +607,35 @@ void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Format for
         return;
     }
     auto& token = *g_token;
+    {
+        // Which module answers vkQueuePresentKHR / vkCreateSwapchainKHR for us: DLSS-G only
+        // sees presents that go through sl.interposer.dll.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            const auto module_of = [](const void* p) {
+                static char name[2][MAX_PATH];
+                static int i = 0;
+                char* out = name[i++ & 1];
+                std::strcpy(out, "?");
+                HMODULE m = nullptr;
+                if (p != nullptr &&
+                    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       static_cast<LPCSTR>(p), &m) != 0) {
+                    char full[MAX_PATH]{};
+                    GetModuleFileNameA(m, full, MAX_PATH);
+                    const char* base = std::strrchr(full, '\\');
+                    std::snprintf(out, MAX_PATH, "%s", base != nullptr ? base + 1 : full);
+                }
+                return static_cast<const char*>(out);
+            };
+            auto& vd = VULKAN_HPP_DEFAULT_DISPATCHER;
+            Printf("[dlssg] vkQueuePresentKHR -> %s, vkCreateSwapchainKHR -> %s",
+                   module_of(reinterpret_cast<const void*>(vd.vkQueuePresentKHR)),
+                   module_of(reinterpret_cast<const void*>(vd.vkCreateSwapchainKHR)));
+        }
+    }
     if (g_api.reflex_sleep != nullptr) g_api.reflex_sleep(token);
     g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
     g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
