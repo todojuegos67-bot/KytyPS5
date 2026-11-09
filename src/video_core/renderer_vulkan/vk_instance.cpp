@@ -394,8 +394,8 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    if (BB::Upscale::Enabled()) {
-        // bb-clean-021: what Streamline (DLSS) / FSR 4 ask of the device.
+    if (BB::Upscale::DeviceHooks()) {
+        // bb-clean-021: what Streamline (DLSS, DLSS-G) / FSR 4 ask of the device.
         std::vector<const char*> bb_extensions(enabled_extensions.begin(),
                                                enabled_extensions.end());
         BB::Upscale::AddDeviceExtensions(*instance, physical_device, available_extensions,
@@ -640,7 +640,7 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
-    if (BB::Upscale::Enabled()) {
+    if (BB::Upscale::DeviceHooks()) {
         auto& bb_ci = device_chain.get<vk::DeviceCreateInfo>();
         auto& bb_f12 = device_chain.get<vk::PhysicalDeviceVulkan12Features>();
         auto& bb_f13 = device_chain.get<vk::PhysicalDeviceVulkan13Features>();
@@ -651,7 +651,7 @@ bool Instance::CreateDevice() {
                                                        bb_f, const_cast<void*>(bb_ci.pNext));
         bb_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
         bb_ci.ppEnabledExtensionNames = enabled_extensions.data();
-        if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss) {
+        if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss || BB::FG::DlssRequested()) {
             Core::ReleaseDlssAddressHole();
         }
     }
@@ -671,6 +671,9 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+    // bb-clean-021-dlssg: with BB_FG=dlss-* (sl.interposer.dll is the loader) the per-command
+    // entry points go straight to the system loader again; nothing otherwise.
+    BB::FG::OnDispatch(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
@@ -707,7 +710,7 @@ bool Instance::CreateDevice() {
     }
 
     CreateAllocator();
-    if (BB::Upscale::Enabled()) {
+    if (BB::Upscale::DeviceHooks()) {
         BB::Upscale::Checkpoint("upscaler device set-up: start");
         BB::Upscale::OnDevice(*instance, physical_device, *device, allocator, graphics_queue,
                               queue_family_index);

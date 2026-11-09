@@ -231,6 +231,9 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+    // bb-clean-021-dlssg: DLSS-G on Vulkan has no vsync (FIFO -> mailbox / immediate); the mode
+    // is unchanged unless BB_FG=dlss-* and DLSS-G is ready.
+    present_mode = BB::FG::PreferredPresentMode(present_mode, modes);
 }
 
 void Swapchain::SetSurfaceProperties() {
@@ -280,6 +283,7 @@ void Swapchain::Destroy() {
     images_view.clear();
 
     if (swapchain) {
+        BB::FG::SwapchainChanging(); // (DLSS-G off and freed first; nothing without it)
         if (BB::FG::Fsr3Active()) {
             BB::FG::DestroySwapchain(swapchain);
         } else {

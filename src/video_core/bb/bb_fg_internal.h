@@ -4,6 +4,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "video_core/bb/bb_fg.h"
 
 namespace BB::FG::Amd {
@@ -27,3 +28,17 @@ void SetUiLayer(const Image* ui);
 bool WantsUiLayer();
 double DisplayHz();
 } // namespace BB::FG::Amd
+
+// bb_fg_dlssg.cpp: NVIDIA DLSS-G (BB_FG=dlss-*).
+namespace BB::FG::Dlssg {
+void OnDevice(vk::PhysicalDevice physical);
+void OnDispatch(vk::Device device);
+bool Ready();
+int Generated();
+void BeforePresent(const Inputs* inputs, vk::Extent2D backbuffer, vk::Format format,
+                   vk::Rect2D region, uint32_t image_count);
+void AfterPresent();
+void SwapchainChanging();
+vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
+                                        const std::vector<vk::PresentModeKHR>& available);
+} // namespace BB::FG::Dlssg

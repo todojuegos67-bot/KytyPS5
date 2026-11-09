@@ -8,6 +8,9 @@
 // they are.
 //
 // BB_FG=off (default: nothing changes) | amd-x2 (aliases fsr3-x2, amd-2, fsr3)
+//       | dlss-x2 | dlss-x3 | dlss-x4 | dlss-x5 | dlss-x6 | dlss-dyn (bb-clean-021-dlssg: NVIDIA
+//       DLSS Frame Generation through Streamline, bb_fg_dlssg.cpp; x5 / x6 trimmed to what the
+//       GPU and nvngx_dlssg.dll make). Only one frame generation is ever active.
 #pragma once
 
 #include <cstdint>
@@ -23,18 +26,31 @@ const char* Env(const char* kyty_name);
 void Printf(const char* format, ...);
 void NotePacing(double real_sd_ms, double shown_sd_ms);
 
-enum class Kind : uint32_t { Off, Amd };
+enum class Kind : uint32_t { Off, Amd, Dlss };
 struct Config {
     Kind kind = Kind::Off;
-    int multiplier = 2;
+    int multiplier = 2; // fixed multiplier (DLSS-G dynamic: its maximum)
+    bool dynamic = false;
 };
 const Config& Cfg();
-const char* Name(); // "off", "amd-x2"
+const char* Name(); // "off", "amd-x2", "dlss-x3", "dlss-dyn" ...
 bool On();          // BB_FG asked (inputs captured even without an upscaler)
 
 bool FgBlocked(const char** why);
 bool Fsr3Requested(); // FSR 3 frame generation asked and the FidelityFX DLL loaded
 bool Fsr3Active();    // the frame interpolation swapchain exists
+// DLSS-G (BB_FG=dlss-*): Streamline loads before the Vulkan instance with sl.interposer.dll as
+// the loader (it is not otherwise: BB_FG off / amd-* keep the clean build's manual hooking).
+bool DlssRequested();
+bool DlssgEnabled(); // DLSS-G ready on this device
+// After the dispatcher's init(device): DLSS-G's per-command entry points back to the system
+// loader (bb_fg_dlssg.cpp). Nothing unless BB_FG=dlss-*.
+void OnDispatch(vk::Device device);
+// The swapchain's present mode with DLSS-G (no vsync on Vulkan); `current` otherwise.
+vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
+                                        const std::vector<vk::PresentModeKHR>& available);
+// Before a swapchain is destroyed (the device idle): DLSS-G off and freed.
+void SwapchainChanging();
 
 // ---- Device creation ----
 void AddDeviceExtensions(const std::vector<std::string>& available,
@@ -90,5 +106,10 @@ bool WantInputs();
 // Before the swapchain present (the present thread, the frame's commands submitted).
 void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2D backbuffer,
                    vk::Format format);
+// DLSS-G, the present thread: before the swapchain present (the frame's commands submitted;
+// region: the game image in the backbuffer) and right after it.
+void BeforePresentDlssg(const Inputs* inputs, vk::Extent2D backbuffer, vk::Format format,
+                        vk::Rect2D region, uint32_t image_count);
+void AfterPresentDlssg();
 
 } // namespace BB::FG

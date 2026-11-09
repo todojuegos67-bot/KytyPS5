@@ -77,8 +77,22 @@ Config ParseConfig() {
         s == "fsr3-2" || s == "fsr-x2") {
         c.kind = Kind::Amd;
         c.multiplier = 2;
+    } else if (s == "dlss-dyn" || s == "dlss-dynamic" || s == "dlssg-dyn") {
+        c.kind = Kind::Dlss;
+        c.multiplier = 6;
+        c.dynamic = true;
+    } else if (s == "dlss" || s == "dlssg" || s.starts_with("dlss-x") || s.starts_with("dlss-") ||
+               s.starts_with("dlssg-x")) {
+        // dlss-x2 .. dlss-x6 (also dlss-2 .. dlss-6, dlssg-x3 ...): fixed multiplier.
+        int m = 2;
+        if (const auto d = s.find_last_not_of("0123456789"); d != std::string::npos && d + 1 < s.size()) {
+            m = std::atoi(s.c_str() + d + 1);
+        }
+        c.kind = Kind::Dlss;
+        c.multiplier = std::clamp(m, 2, 6);
     } else if (s != "off" && s != "0" && !s.empty()) {
-        BBLogf("Frame generation: BB_FG=%s is not available in this build (amd-x2 only): off",
+        BBLogf("Frame generation: BB_FG=%s is not available in this build (amd-x2, dlss-x2..x6, "
+               "dlss-dyn): off",
                s.c_str());
     }
     if (c.kind == Kind::Amd) {
@@ -93,8 +107,16 @@ const Config& Cfg() {
     static const Config config = [] {
         Config c = ParseConfig();
         if (c.kind != Kind::Off) {
-            BBLogf("Frame generation: BB_FG=%s (AMD FSR 3, fixed x%d)", std::getenv("BB_FG"),
-                   c.multiplier);
+            if (c.kind == Kind::Amd) {
+                BBLogf("Frame generation: BB_FG=%s (AMD FSR 3, fixed x%d)", std::getenv("BB_FG"),
+                       c.multiplier);
+            } else if (c.dynamic) {
+                BBLogf("Frame generation: BB_FG=%s (NVIDIA DLSS-G, dynamic multiplier up to x%d)",
+                       std::getenv("BB_FG"), c.multiplier);
+            } else {
+                BBLogf("Frame generation: BB_FG=%s (NVIDIA DLSS-G, fixed x%d)", std::getenv("BB_FG"),
+                       c.multiplier);
+            }
         }
         return c;
     }();
@@ -102,7 +124,41 @@ const Config& Cfg() {
 }
 
 const char* Name() {
-    return Cfg().kind == Kind::Amd ? "amd-x2" : "off";
+    static const char* names[] = {"dlss-x2", "dlss-x3", "dlss-x4", "dlss-x5", "dlss-x6"};
+    const auto& c = Cfg();
+    if (c.kind == Kind::Amd) return "amd-x2";
+    if (c.kind == Kind::Dlss) return c.dynamic ? "dlss-dyn" : names[std::clamp(c.multiplier, 2, 6) - 2];
+    return "off";
+}
+
+bool DlssRequested() {
+    return Cfg().kind == Kind::Dlss;
+}
+
+bool DlssgEnabled() {
+    return DlssRequested() && Dlssg::Ready();
+}
+
+void OnDispatch(vk::Device device) {
+    if (DlssRequested()) Dlssg::OnDispatch(device);
+}
+
+vk::PresentModeKHR PreferredPresentMode(vk::PresentModeKHR current,
+                                        const std::vector<vk::PresentModeKHR>& available) {
+    return DlssgEnabled() ? Dlssg::PreferredPresentMode(current, available) : current;
+}
+
+void SwapchainChanging() {
+    if (DlssgEnabled()) Dlssg::SwapchainChanging();
+}
+
+void BeforePresentDlssg(const Inputs* inputs, vk::Extent2D backbuffer, vk::Format format,
+                        vk::Rect2D region, uint32_t image_count) {
+    if (DlssgEnabled()) Dlssg::BeforePresent(inputs, backbuffer, format, region, image_count);
+}
+
+void AfterPresentDlssg() {
+    if (DlssgEnabled()) Dlssg::AfterPresent();
 }
 
 bool On() {
@@ -123,7 +179,7 @@ bool Fsr3Active() {
 }
 
 bool WantInputs() {
-    return Fsr3Active();
+    return Fsr3Active() || DlssgEnabled();
 }
 
 bool WantsUiLayer() {
@@ -158,13 +214,17 @@ void AddDeviceExtensions(const std::vector<std::string>& available,
 }
 
 QueuePlan PlanQueues(vk::PhysicalDevice physical, uint32_t graphics_family) {
-    if (!On()) return {};
+    if (!On() || DlssRequested()) return {}; // (DLSS-G: Streamline adds its own queues)
     return Amd::PlanQueues(physical, graphics_family);
 }
 
 void OnDevice(vk::PhysicalDevice physical, vk::Device device, uint32_t graphics_family,
               vk::Queue graphics_queue, const QueuePlan& plan, std::mutex* submit_mutex) {
     if (!On()) return;
+    if (DlssRequested()) {
+        Dlssg::OnDevice(physical);
+        return;
+    }
     Amd::OnDevice(physical, device, graphics_family, graphics_queue, plan, submit_mutex);
 }
 

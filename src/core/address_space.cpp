@@ -160,8 +160,11 @@ struct AddressSpace::Impl {
             }
         }
 
+        // bb-clean-021-dlssg: DLSS-G (BB_FG=dlss-*) loads NGX too: the same hole.
+        const char* bb_fg = std::getenv("BB_FG");
         if (const char* up = std::getenv("BB_UPSCALER");
-            up != nullptr && (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa")) {
+            (up != nullptr && (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa")) ||
+            (bb_fg != nullptr && std::string_view(bb_fg).starts_with("dlss"))) {
             constexpr u64 DlssUserMax = 0x8000000000ULL;
             if (supported_user_max > DlssUserMax) {
                 supported_user_max = DlssUserMax;

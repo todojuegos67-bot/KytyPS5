@@ -16,6 +16,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
 
@@ -309,6 +310,13 @@ bool Preload() {
             // bb-clean-021: manual hooking (the system Vulkan loader, no interposer on every call)
             // and DLSS only by default; BB_SL_NO_INTERPOSER_LOADER=0 for the interposer loader.
             g_manual = (m == nullptr || m[0] != '0') && g_api.set_vulkan_info != nullptr;
+            // bb-clean-021-dlssg: DLSS-G (BB_FG=dlss-*) needs Streamline's vkCreateDevice /
+            // swapchain / present hooks: the interposer is the loader then, unless
+            // BB_SL_NO_INTERPOSER_LOADER=1 is set explicitly (DLSS-G off). Its per-command
+            // forwards are bypassed after the device (BB::FG::OnDispatch).
+            if (BB::FG::DlssRequested() && !(m != nullptr && m[0] == '1')) {
+                g_manual = false;
+            }
             // BB_SL_FEATURES=dlss,dlssg,reflex,pcl (default all four; manual mode: dlss).
             std::string list = std::getenv("BB_SL_FEATURES") ? std::getenv("BB_SL_FEATURES")
                                : g_manual                    ? "dlss"

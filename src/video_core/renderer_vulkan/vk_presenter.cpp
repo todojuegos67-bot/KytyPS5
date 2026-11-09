@@ -975,6 +975,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     const auto cmdbuf = scheduler.CommandBuffer();
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
+    // bb-clean-021-dlssg: the game image's rectangle in the backbuffer (DLSS-G's subrect).
+    vk::Rect2D bb_fg_region{{0, 0}, swapchain.GetExtent()};
 
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
@@ -1072,6 +1074,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 };
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
+                {
+                    const ImVec2 at = ImGui::GetCursorScreenPos();
+                    const s32 x = std::clamp(static_cast<s32>(at.x), 0, static_cast<s32>(extent.width));
+                    const s32 y = std::clamp(static_cast<s32>(at.y), 0, static_cast<s32>(extent.height));
+                    bb_fg_region = vk::Rect2D{
+                        {x, y},
+                        {std::min<u32>(imgRect.extent.width, extent.width - x),
+                         std::min<u32>(imgRect.extent.height, extent.height - y)}};
+                }
                 ImGui::Image(game_texture, size);
 
                 if (EmulatorSettings.IsNullGPU()) {
@@ -1176,6 +1187,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                                  : swapchain.GetSurfaceFormat().format);
     }
 
+    // bb-clean-021-dlssg: DLSS-G's frame token, constants, tags and PCL markers for this present
+    // (present thread, frame boundary; nothing unless BB_FG=dlss-* and DLSS-G is ready).
+    const bool bb_dlssg = BB::FG::DlssgEnabled();
+    if (bb_dlssg) {
+        const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
+        BB::FG::BeforePresentDlssg(fg_frame ? &frame->fg : nullptr, swapchain.GetExtent(),
+                                   swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                                                      : swapchain.GetSurfaceFormat().format,
+                                   bb_fg_region, swapchain.GetImageCount());
+    }
+
     // Present to swapchain.
     {
         // (FSR 3's frame interpolation swapchain submits to the game queue itself, under this
@@ -1184,7 +1206,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (!BB::FG::Fsr3Active()) {
             submit_lock.lock();
         }
-        if (!swapchain.Present()) {
+        const bool presented = swapchain.Present();
+        if (bb_dlssg) {
+            BB::FG::AfterPresentDlssg();
+        }
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
