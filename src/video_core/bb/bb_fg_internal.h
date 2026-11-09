@@ -25,5 +25,6 @@ bool Generating();
 void NoteSlept(double seconds);
 void SetUiLayer(const Image* ui);
 bool WantsUiLayer();
+void PanelValues(float& real, float& shown, const char*& state);
 double DisplayHz();
 } // namespace BB::FG::Amd

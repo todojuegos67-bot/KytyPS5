@@ -122,6 +122,18 @@ bool Fsr3Active() {
     return On() && Amd::Active();
 }
 
+bool PanelInfo(float& real, float& shown, const char*& state) {
+    real = shown = 0;
+    state = "off";
+    if (!On()) return false;
+    if (!Fsr3Requested()) {
+        state = "FidelityFX DLL not loaded";
+        return true;
+    }
+    Amd::PanelValues(real, shown, state);
+    return true;
+}
+
 bool WantInputs() {
     return Fsr3Active();
 }

@@ -91,4 +91,7 @@ bool WantInputs();
 void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2D backbuffer,
                    vk::Format format);
 
+// F8 panel: FSR 3 FG's last per-second real / shown fps and its state ("on", or why off).
+bool PanelInfo(float& real, float& shown, const char*& state);
+
 } // namespace BB::FG

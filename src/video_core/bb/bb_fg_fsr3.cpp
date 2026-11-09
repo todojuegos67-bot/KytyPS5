@@ -464,7 +464,11 @@ struct Holdoff {
     uint32_t resumes = 0, aborted = 0, held = 0;
 } g_holdoff;
 
+std::atomic<float> g_panel_real{0}, g_panel_shown{0};
+std::atomic<const char*> g_panel_state{"waiting for the first 3D frame"};
+
 void LogState(int state, const char* text) {
+    g_panel_state.store(text, std::memory_order_relaxed);
     if (state == g_state_logged) return;
     g_state_logged = state;
     Printf("FSR3 FG: %s", text);
@@ -1041,6 +1045,10 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                 : 0;
         const uint64_t shown =
             presents >= g_stats.presents_at_start ? presents - g_stats.presents_at_start : 0;
+        g_panel_real.store(static_cast<float>(g_stats.real / window), std::memory_order_relaxed);
+        g_panel_shown.store(static_cast<float>(static_cast<double>(shown) / window),
+                            std::memory_order_relaxed);
+        if (g_stats.generated_on > 0) g_panel_state.store("on", std::memory_order_relaxed);
         Printf("[fsr3] real %.1f fps, shown %.1f fps; generation on %u of %u frames (no 3D %u); "
                "prepare %.2f ms, present call %.2f ms (max %.1f); HUD-less %u",
                g_stats.real / window, static_cast<double>(shown) / window, g_stats.generated_on,
@@ -1452,5 +1460,11 @@ vk::Result QueuePresent(vk::Queue, const vk::PresentInfoKHR&) {
 void BeforePresent(const Inputs*, vk::SwapchainKHR, vk::Extent2D, vk::Format) {}
 
 #endif
+
+void PanelValues(float& real, float& shown, const char*& state) {
+    real = g_panel_real.load(std::memory_order_relaxed);
+    shown = g_panel_shown.load(std::memory_order_relaxed);
+    state = g_panel_state.load(std::memory_order_relaxed);
+}
 
 } // namespace BB::FG::Amd
