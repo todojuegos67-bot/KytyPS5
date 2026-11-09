@@ -64,7 +64,7 @@ switch acts only in mode 4. A verify switch N checks every Nth use against the p
 | spec_chunk_in_order | a chunk's translation starts from the state pass's state at its start | - | 1 | |
 | spec_late_reads | a read of memory a pending write of an unlinked chain covered is checked at commit | - | 1 | |
 | spec_start_instance_free | the start-instance SGPR left out of a chunk's start-state comparison | - | 1 | |
-| spec_predict_dcc | a DCC surface's clear predicted on a worker | - | 1 | |
+| spec_predict_dcc | 1: a DCC surface's clear predicted on a worker; 3: also a surface whose fast clear another speculation's hole will consume before this one commits is read as not cleared (a consume-pending registry; the commit checks the read): the view save's cleared-target holes 1180 -> 408 a report, Latria 1216 -> 356 | - | 3 | |
 | spec_touch_batch | a committed segment's image LRU touches under one texture-cache lock | - | 1 | |
 | spec_draw_indirect | DRAW_INDIRECT as a table draw, not a hole | - | 1 | spec_draw_indirect_verify N |
 | spec_read_one_set | a worker's clear read costs one search of one journal set | - | 1 | spec_read_one_set_verify N |

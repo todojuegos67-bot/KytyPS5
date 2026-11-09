@@ -229,6 +229,36 @@ struct ImageEntry {
 	bool                          found_buffer_modified = false;
 };
 
+// (spec_predict_dcc=3.) The fast clears speculations' holes will consume, by surface and slice, until that speculation
+// finishes: speculations in flight each found a target's clear not consumed (the cache's mask, a predicted fill, a
+// chained speculation's fact) and each made its first draw on it a hole, but only the first to commit consumed it
+// (the view save, 9 Nov: ~48 speculations a report holed on one surface; 82-91 % of those holes cleared nothing).
+inline std::mutex& ConsumePendingLock() {
+	static std::mutex lock;
+	return lock;
+}
+inline std::unordered_map<uint64_t, uint32_t>& ConsumePendingMap() {
+	static std::unordered_map<uint64_t, uint32_t> map;
+	return map;
+}
+[[nodiscard]] inline uint64_t ConsumeKey(uint64_t address, uint32_t slice) noexcept {
+	return (address << 6u) ^ (slice & 63u);
+}
+inline void ConsumePendingAdd(uint64_t key, bool add) {
+	std::lock_guard lock(ConsumePendingLock());
+	auto& map = ConsumePendingMap();
+	if (add) {
+		++map[key];
+	} else if (const auto found = map.find(key); found != map.end() && --found->second == 0) {
+		map.erase(found);
+	}
+}
+// spec_predict_dcc (mode 4: 3): 3 reads a surface another speculation's hole will consume the clear of as not cleared.
+[[nodiscard]] inline bool ConsumePendingOn() {
+	static auto& predict = LiveSwitch::Find("spec_predict_dcc", ModeToggle::Default("spec_predict_dcc"));
+	return predict.load(std::memory_order_relaxed) == 3;
+}
+
 struct State {
 	// What the work needs, in order, for all segments (Segment::end splits them):
 	// - ranges it reads, made current before it (buffer uploads); ranges it writes (obtained written before it:
@@ -392,6 +422,20 @@ struct State {
 		bool     dcc   = false; // a predicted DCC fill's clear (spec_predict_dcc): not a fact about other metadata
 	};
 	std::vector<MetaFact> meta_facts;
+	std::vector<uint64_t> consume_pending; // (its holes' clears, registered: ConsumePendingAdd)
+	void ReleaseConsumePending() {
+		for (const auto key: consume_pending) ConsumePendingAdd(key, false);
+		consume_pending.clear();
+	}
+	// (spec_predict_dcc=3) another speculation's hole will consume the clear of `address` / `slice` before this one commits.
+	[[nodiscard]] bool ConsumedElsewhere(uint64_t address, uint32_t slice) const {
+		if (!ConsumePendingOn()) return false;
+		const auto key  = ConsumeKey(address, slice);
+		const auto mine = static_cast<uint32_t>(std::ranges::count(consume_pending, key));
+		std::lock_guard lock(ConsumePendingLock());
+		const auto found = ConsumePendingMap().find(key);
+		return found != ConsumePendingMap().end() && found->second > mine;
+	}
 
 	// IsMetaCleared's answer for the open segment from the latest fact: 1 cleared, 0 not, -1 none (the cache answers).
 	// Without one of its own, as a speculation before it not committed yet leaves the surface: cleared by a hole of
@@ -415,7 +459,7 @@ struct State {
 				    (last == nullptr || fact.first >= last->first))
 					last = &fact;
 			if (last == nullptr) continue;
-			if (last->cleared) return 1;
+			if (last->cleared && !ConsumedElsewhere(address, slice)) return 1;
 			NoteMetaRead(address, slice);
 			return 0;
 		}
@@ -427,6 +471,11 @@ struct State {
 	// The open segment's packet is a hole that consumes the clear / clears the surface.
 	void ConsumeMeta(uint64_t address, uint32_t slice) {
 		meta_facts.push_back({address, slice, false, closed.size() + 1, closed.size() + 1});
+		if (ConsumePendingOn()) {
+			const auto key = ConsumeKey(address, slice);
+			consume_pending.push_back(key);
+			ConsumePendingAdd(key, true);
+		}
 	}
 	void PredictClear(uint64_t address, bool dcc = false) {
 		meta_facts.push_back({address, UINT32_MAX, true, closed.size() + 1, closed.size() + 1, dcc});
@@ -647,6 +696,7 @@ struct State {
 		open_journal_set.Clear();
 		open_copy_sources.Clear();
 		closed.clear();
+		ReleaseConsumePending();
 		meta_facts.clear();
 		overlay.clear();
 		overlay_index.clear();

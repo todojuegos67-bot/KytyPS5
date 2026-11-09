@@ -1263,6 +1263,7 @@ Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, 
 void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	auto& scheduler = m_renderer.GetCommandScheduler();
 	auto& r         = *result;
+	r.state.ReleaseConsumePending(); // (its holes' clears are consumed now, or never: spec_predict_dcc=3)
 	for (const auto& hole: r.holes) ++m_hole_reasons[hole.reason];
 	if (first < r.state.closed.size() || !r.recorder->recorded.empty() || r.recorder->open != SIZE_MAX)
 		scheduler.DiscardRecorded(*r.recorder);

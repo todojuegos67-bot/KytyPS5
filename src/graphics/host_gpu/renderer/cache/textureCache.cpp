@@ -4997,7 +4997,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	};
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    slice >= 32) {
-		return dcc_filled() || not_cleared();
+		return (dcc_filled() && (spec == nullptr || !spec->ConsumedElsewhere(address, slice))) || not_cleared();
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
@@ -5005,6 +5005,9 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	if (fill_known != nullptr) {
 		*fill_known = found->second.fill_known;
 	}
+	// (spec_predict_dcc=3: a clear another speculation's hole will consume before this one commits is not this one's.)
+	if (spec != nullptr && ((found->second.clear_mask & (1u << slice)) != 0 || dcc_filled()))
+		return !spec->ConsumedElsewhere(address, slice) || not_cleared();
 	return (found->second.clear_mask & (1u << slice)) != 0 || dcc_filled() || not_cleared();
 }
 
