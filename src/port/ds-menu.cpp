@@ -1,6 +1,6 @@
 // "Demon's Souls" PC port: the launcher before the game (RunStartMenu: Launcher-souls.ps1's window, its groups, rows,
-// options and tooltips, every setting of settings.ini) and, in the game, F1 = save and quit (ds-resume.h).
-//   (ds-pc-port8) F1, or R3 held + OPTIONS (OPTIONS then never reaches the game): the game's save is let finish, the saves
+// options and tooltips, every setting of settings.ini) and, in the game, F2 = save and quit (ds-resume.h).
+//   (ds-pc-port8) F2, or R3 held + OPTIONS (OPTIONS then never reaches the game): the game's save is let finish, the saves
 //   are copied, the place is kept for JUGAR and the game closes. There is no options menu in the game any more: every
 //   option is in the launcher. The other keys (F7 mouse, F8 metrics, F11 full screen) stay the emulator's.
 // Drawn by the system overlay (src/graphics/presentation/systemOverlay.cpp) into the swapchain image, after the upscaler
@@ -94,11 +94,11 @@ void ToggleShaderThreads(bool running) {
 	if (running) std::thread([] { Precompile::Stop(); Precompile::Start(); }).detach();
 }
 std::atomic<bool>        g_open {false};
-std::atomic<bool>        g_trophy_page {false};      // (port34) F1 > Ver trofeos is shown (window and present threads)
-// (ds-pc-port37) F1 > Mapear mando / Teclado y raton: the page shown (0 none, 1 pad mapper, 2 keyboard and mouse), and a
+std::atomic<bool>        g_trophy_page {false};      // (port34) F2 > Ver trofeos is shown (window and present threads)
+// (ds-pc-port37) F2 > Mapear mando / Teclado y raton: the page shown (0 none, 1 pad mapper, 2 keyboard and mouse), and a
 // key or mouse button being captured for a binding (the window thread writes its SDL name; Esc cancels).
 std::atomic<int>         g_f1_page {0};
-std::atomic<int>         g_page_scroll {0}; // (ds-pc-port37) L1 (up) / L2 (down) presses for the F1 page's list
+std::atomic<int>         g_page_scroll {0}; // (ds-pc-port37) L1 (up) / L2 (down) presses for the F2 page's list
 bool                     g_l2_down = false;
 std::atomic<bool>        g_kbm_capture {false};
 std::atomic<bool>        g_pages_reset {false}; // (ds-pc-port42) SetOpen: the pages' own state (capture row) cleared at their next frame
@@ -124,10 +124,10 @@ bool                     g_first_present = true;
 bool                     g_focus_once = true;
 bool                     g_start_swallowed = false; // window thread: OPTIONS went to the menu's combo
 std::atomic<bool>        g_popup {false}; // a combo is open (Circle closes it, not the menu)
-bool                     g_start_mode = false; // (10-27b) the start menu (before the game), not F1
+bool                     g_start_mode = false; // (10-27b) the start menu (before the game), not F2
 int                      g_start_result = 0;   // 1 Jugar, -1 Salir
 bool                     g_config_mode = false; // (10-28) the Configurador before the game (its own window)
-bool                     g_cfg_open = false;    // (10-28) the Configurador inside F1 (Sistema > Configurador)
+bool                     g_cfg_open = false;    // (10-28) the Configurador inside F2 (Sistema > Configurador)
 std::vector<std::string> g_cfg_why;             // its "Hemos elegido: ..." lines (empty: not optimized yet)
 
 void Bump() {
@@ -139,7 +139,7 @@ void Toggle();
 bool Shown();
 } // namespace MetricsPanel
 
-// ---- (ds-pc-port38) The F1 menu's animations: open / close (fade and scale), page slide, buttons' hover and focus. ----
+// ---- (ds-pc-port38) The F2 menu's animations: open / close (fade and scale), page slide, buttons' hover and focus. ----
 // Times on the steady clock (window and present threads); the overlay is redrawn (Bump) while one runs.
 namespace Anim {
 double Now() {
@@ -226,7 +226,7 @@ void Queue(const Input& input) {
 
 void SetOpen(bool open) {
 	if (g_open.exchange(open) == open) return;
-	// (ds-pc-port42) Open or closed, every page state starts clean: no F1 page, no trophy page, no key capture waiting, no
+	// (ds-pc-port42) Open or closed, every page state starts clean: no F2 page, no trophy page, no key capture waiting, no
 	// stale combo (g_popup was set only by the launcher's frames: a value left from there made Circle / B do nothing),
 	// no queued scroll. A page or a capture left behind kept eating Esc / Circle and the menu looked stuck.
 	g_f1_page     = 0;
@@ -234,11 +234,11 @@ void SetOpen(bool open) {
 	g_popup       = false;
 	g_page_scroll = 0;
 	g_pages_reset = true;
-	std::printf("[port] F1 menu: %s\n", open ? "open" : "closed");
+	std::printf("[port] F2 menu: %s\n", open ? "open" : "closed");
 	std::fflush(stdout);
 	(open ? Anim::g_opened_at : Anim::g_closed_at).store(Anim::Now(), std::memory_order_relaxed); // (ds-pc-port38)
 	PortLive::menu_open.store(open, std::memory_order_relaxed);
-	if (!open) g_trophy_page = false; // (port34) the game again: the next F1 opens the menu, not the page
+	if (!open) g_trophy_page = false; // (port34) the game again: the next F2 opens the menu, not the page
 	if (open) {
 		g_reset_edit = true;
 		// The game sees its sticks centered (it gets nothing while the menu is open; button releases still reach it).
@@ -306,7 +306,7 @@ ImGuiKey KeyboardKey(SDL_Keycode key) {
 
 // Window thread, before the game's handling: true when the event is the menu's.
 bool OnEvent(const SDL_Event& e) {
-	// (ds-pc-port8) While F1's save and quit runs, the game gets no input (it is closing).
+	// (ds-pc-port8) While F2's save and quit runs, the game gets no input (it is closing).
 	if (Resume::SaveAndQuitActive()) {
 		switch (e.type) {
 			case SDL_KEYDOWN:
@@ -328,8 +328,10 @@ bool OnEvent(const SDL_Event& e) {
 				if (e.key.repeat == 0) MetricsPanel::Toggle();
 				return true;
 			}
-			if (e.key.keysym.sym == SDLK_F1 && e.key.repeat == 0) {
-				// (port26) F1: the small in-game menu (show the launcher next time; close the game). Nothing is saved or skipped.
+			// (11-09) The menu key is F2 now (F1 made the game close at times): F1 and F2's repeats never reach the game.
+			if (e.key.keysym.sym == SDLK_F1 || (e.key.keysym.sym == SDLK_F2 && e.key.repeat != 0)) return true;
+			if (e.key.keysym.sym == SDLK_F2) {
+				// (port26) F2: the small in-game menu (show the launcher next time; close the game). Nothing is saved or skipped.
 				if (open && g_trophy_page.exchange(false)) { // (port34) the trophy page: back to the menu
 					g_focus_trophy_btn_request = true;
 					Bump();
@@ -368,7 +370,7 @@ bool OnEvent(const SDL_Event& e) {
 			if (const ImGuiKey k = KeyboardKey(e.key.keysym.sym); k != ImGuiKey_None) Queue({Input::Key, k, true});
 			return true;
 		case SDL_KEYUP:
-			if (e.key.keysym.sym == SDLK_F1) return true;
+			if (e.key.keysym.sym == SDLK_F1 || e.key.keysym.sym == SDLK_F2) return true;
 			if (open) {
 				if (const ImGuiKey k = KeyboardKey(e.key.keysym.sym); k != ImGuiKey_None) Queue({Input::Key, k, false});
 			}
@@ -381,7 +383,7 @@ bool OnEvent(const SDL_Event& e) {
 			const bool combo = b == SDL_CONTROLLER_BUTTON_START && PadHeld(e.cbutton.which, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
 			if (combo) {
 				g_start_swallowed = true;
-				SetOpen(!open); // (port26) as F1: the in-game menu
+				SetOpen(!open); // (port26) as F2: the in-game menu
 				Bump();
 				return true;
 			}
@@ -397,7 +399,7 @@ bool OnEvent(const SDL_Event& e) {
 				}
 				return true;
 			}
-			// (ds-pc-port37) The F1 pages: Circle back to the F1 menu, L1 scrolls up (L2, a trigger, below).
+			// (ds-pc-port37) The F2 pages: Circle back to the F2 menu, L1 scrolls up (L2, a trigger, below).
 			if (g_f1_page.load() != 0 && !g_popup.load()) {
 				if (b == SDL_CONTROLLER_BUTTON_B) {
 					g_f1_page = 0;
@@ -441,7 +443,7 @@ bool OnEvent(const SDL_Event& e) {
 			if (!open) return false;
 			const float v = e.caxis.value / (e.caxis.value < 0 ? 32768.0f : 32767.0f);
 			if (e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT) {
-				// (ds-pc-port37) L2 on an F1 page: scrolls down, once a press.
+				// (ds-pc-port37) L2 on an F2 page: scrolls down, once a press.
 				if (v > 0.5f && !g_l2_down && g_f1_page.load() != 0) {
 					g_page_scroll++;
 					Bump();
@@ -450,7 +452,7 @@ bool OnEvent(const SDL_Event& e) {
 				return true;
 			}
 			// (ds-pc-port39) The stick's analog value with a dead zone: ImGui scrolls a window by the left stick's raw magnitude
-			// (its manual nav scroll), so a resting stick's drift (a few %, up) fed as is pulled the F1 pages slowly back up
+			// (its manual nav scroll), so a resting stick's drift (a few %, up) fed as is pulled the F2 pages slowly back up
 			// and away from the row being rebound. Below 0.35: exactly 0; above it, 0..1 from the edge of the dead zone.
 			if (g_kbm_capture.load()) return true; // (ds-pc-port39: no nav while a binding waits)
 			const auto dz = [](float x) { return x <= 0.35f ? 0.0f : std::min(1.0f, (x - 0.35f) / 0.65f); };
@@ -1086,7 +1088,7 @@ int ForSection(const char* title) {
 }
 } // namespace Icons
 
-// ---- (perfopts-1107) The F1 menu in the Demon's Souls look, all procedural (no game art, no logos): cold grey-blue
+// ---- (perfopts-1107) The F2 menu in the Demon's Souls look, all procedural (no game art, no logos): cold grey-blue
 // carved stone (the Nexus), tarnished brass filigree (Boletaria's gothic ironwork and gilding), pale blue-white soul
 // light (the archstones and the souls the player carries), a warm candle flicker (the Nexus' candles), drifting fog and
 // floating soul motes. Drawn only while the menu is open or animating. ----
@@ -1247,7 +1249,7 @@ void Medallion(ImDrawList* dl, ImVec2 c, float r, float v, float alpha, bool dan
 }
 } // namespace Souls
 
-// (perfopts-1107) The selection highlight that glides between the F1 menu's entries: each frame the focused (else
+// (perfopts-1107) The selection highlight that glides between the F2 menu's entries: each frame the focused (else
 // hovered) entry gives its rectangle; the highlight eases towards it and is drawn under the entries (DrawInGameMenu).
 namespace Glide {
 ImVec2 g_a {0, 0}, g_b {0, 0}, g_ta {0, 0}, g_tb {0, 0};
@@ -1302,7 +1304,7 @@ void Draw(ImDrawList* dl, float unit, float alpha) {
 }
 } // namespace Glide
 
-// (des-upstream-1106) The F1 menu's entries: a dark plate, its icon in a gold disc, the label, a chevron; on hover / focus
+// (des-upstream-1106) The F2 menu's entries: a dark plate, its icon in a gold disc, the label, a chevron; on hover / focus
 // a glow, the accent bar, the icon a little larger and brighter, the label and icon sliding right (Anim::Hot, eased);
 // on open each entry slides in after the one above (`index` x 40 ms). An ImGui button underneath: mouse, keyboard and
 // pad navigation as before. `danger`: a red tint (Cerrar el juego).
@@ -1375,7 +1377,7 @@ bool IconButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, in
 	return pressed;
 }
 
-// (bb-style-f1) The F1 menu's top-level options as Bloodborne's hub cards, side by side: a dark plate with a bronze
+// (bb-style-f1) The F2 menu's top-level options as Bloodborne's hub cards, side by side: a dark plate with a bronze
 // border, a warm light from above when focused, a medallion with the icon (halo, turning beads), the label in Cinzel,
 // letter-spaced and centred (gold, parchment when focused), an ornamental rule under it; focus lifts the card 16 px and
 // grows it 4 %, a shine sweeps once; on open the cards rise in one after another (ease-out-back, `index` x 70 ms).
@@ -1777,7 +1779,7 @@ void InfoLine(const char* caption, const std::string& value, const ImVec4& color
 	ImGui::Spacing();
 }
 
-// (F1 Trofeos) The trophies: from the trophy module when it has loaded them, else _SaveData/<title>/trophies-list.json
+// (F2 Trofeos) The trophies: from the trophy module when it has loaded them, else _SaveData/<title>/trophies-list.json
 // and trophies.json. Earned first (grade colour), then the rest greyed; hidden unearned ones as "Trofeo oculto".
 struct TrophyRow {
 	int         id = -1, grade = 0;
@@ -1989,7 +1991,7 @@ void DrawPcTab(float unit) {
 	}
 }
 
-// (10-28) Resolucion (F1 > Gráficos > Imagen): full screen, the desktop's or a monitor mode; window, its size.
+// (10-28) Resolucion (F2 > Gráficos > Imagen): full screen, the desktop's or a monitor mode; window, its size.
 void ResolutionRow(Settings& s) {
 	static const char* sizes[] = {"1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600", "3840x2160"};
 	static std::vector<std::string> ids, labels;
@@ -2090,13 +2092,13 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 		ImGui::PushTextWrapPos(0.0f);
 		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", line.c_str());
 		ImGui::PopTextWrapPos();
-		ImGui::TextColored(kDim, "%s", g_start_mode ? "Guardado. Se aplica al pulsar JUGAR; en el juego puedes cambiarlo con F1."
-		                               : g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F1."
+		ImGui::TextColored(kDim, "%s", g_start_mode ? "Guardado. Se aplica al pulsar JUGAR; en el juego puedes cambiarlo con F2."
+		                               : g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F2."
 		                                              : "Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego.");
 	}
 }
 
-// (ds-pc-port10) The DLSS 5 rows' tooltips (launcher and F1).
+// (ds-pc-port10) The DLSS 5 rows' tooltips (launcher and F2).
 const char* const kDlss5Tip =
     "DLSS 5 (Neural Rendering de NVIDIA): mejora la imagen con la IA de NVIDIA despu\xC3\xA9s del reescalado. Solo NVIDIA RTX. Necesita tu propio archivo nvngx_dlssnr.dll junto a \"Demon's Souls.exe\" (no viene incluido): sin \xC3\xA9l se ve como siempre. Compatibilidad: RTX 5000 s\xC3\xAD; RTX 4000 (Ada Lovelace) con el parche, sin estar confirmado al 100%; RTX 3000 y anteriores no (no tienen FP8). Suave, Medio y Fuerte bajan la resoluci\xC3\xB3n en los bordes de la pantalla para ahorrar GPU (Suave un poco, Fuerte m\xC3\xA1s); el centro siempre va a resoluci\xC3\xB3n completa. Experimental.";
 const char* const kDlss5StrengthTip =
@@ -2181,7 +2183,7 @@ void Draw(float width, float height) {
 	// (10-27c) A game's settings menu: five tabs (LB/RB or Q/E), each the launcher's groups as sections; the rows on the
 	// left, the focused row's description on the right.
 	// (10-28b) The launcher (before the game): Imagen, Calidad gráfica, Ray tracing, Controles, Sistema (the Configurador
-	// folded in) and Trofeos; the same sections and rows as F1, so both write the same settings.ini the same way.
+	// folded in) and Trofeos; the same sections and rows as F2, so both write the same settings.ini the same way.
 	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
 	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
 	const char* const* tabs = g_start_mode ? launcher_tabs : game_tabs;
@@ -2468,7 +2470,7 @@ void Draw(float width, float height) {
 						// (10-28b) The launcher before the game (settings.ini menu_inicio; --sin-lanzador skips it once).
 						bool show = s.start_menu;
 						if (CheckRow("Mostrar el lanzador al iniciar", false, show,
-						             "Muestra el lanzador (estas opciones, Optimizar según tu equipo y JUGAR) antes del juego. No: el juego arranca directo; las opciones siguen en F1. \"Demon's Souls.exe\" --lanzador lo muestra una vez."))
+						             "Muestra el lanzador (estas opciones, Optimizar según tu equipo y JUGAR) antes del juego. No: el juego arranca directo; las opciones siguen en F2. \"Demon's Souls.exe\" --lanzador lo muestra una vez."))
 							s.start_menu = show;
 					}
 					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile, on PCs of 20 GB or less.
@@ -2600,7 +2602,7 @@ void Draw(float width, float height) {
 			ImGui::PopFont();
 			ImGui::Separator();
 			ImGui::PushTextWrapPos(0.0f);
-			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F1 abre estas mismas opciones."
+			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F2 abre estas mismas opciones."
 			                       : g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
 			                                           : g_desc_text.c_str());
 			ImGui::PopTextWrapPos();
@@ -2638,7 +2640,7 @@ void Draw(float width, float height) {
 			}
 		}
 		DrawShaderBlock(unit);
-		ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("Los cambios se aplican al pulsar JUGAR (sin reiniciar). F1 dentro del juego: opciones en vivo.") : g_status.c_str());
+		ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("Los cambios se aplican al pulsar JUGAR (sin reiniciar). F2 dentro del juego: opciones en vivo.") : g_status.c_str());
 		const float bw = 300 * unit, bh = 60 * unit;
 		const auto  v  = Precompile::State();
 		if (ImGui::Button(I18n::T(v.running && !v.playable ? "JUGAR (sin esperar)" : "JUGAR"), {bw, bh})) {
@@ -2676,7 +2678,7 @@ void Draw(float width, float height) {
 		if (ImGui::Button(I18n::T("Salir"), {bw * 0.6f, bh})) g_start_result = -1;
 		ImGui::SameLine();
 		{
-			// (10-28b) "No mostrar al iniciar": settings.ini menu_inicio=0 (F1 > Sistema or --lanzador bring it back).
+			// (10-28b) "No mostrar al iniciar": settings.ini menu_inicio=0 (F2 > Sistema or --lanzador bring it back).
 			bool hide = !s.start_menu;
 			ImGui::AlignTextToFramePadding();
 			if (ImGui::Checkbox(I18n::T("No mostrar al iniciar"), &hide)) {
@@ -2684,7 +2686,7 @@ void Draw(float width, float height) {
 				Save();
 			}
 			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("%s", "El juego arrancará directo. Para volver a verlo: F1 > Sistema > Mostrar el lanzador al iniciar, o \"Demon's Souls.exe\" --lanzador.");
+				ImGui::SetTooltip("%s", "El juego arrancará directo. Para volver a verlo: F2 > Sistema > Mostrar el lanzador al iniciar, o \"Demon's Souls.exe\" --lanzador.");
 		}
 	} else {
 	const bool needs = NeedsRestartLive(g_rt.launched, s);
@@ -2803,7 +2805,7 @@ void FreeTexture(ImTextureData*& tex) {
 }
 
 // (des-fog-hq) The launcher's ambience: slow volumetric-looking fog and drifting ash, ONLY in the pre-game launcher (its own
-// SDL window and loop, RunStartMenu, before the game starts). Never drawn by the Configurador nor the in-game F1 menu.
+// SDL window and loop, RunStartMenu, before the game starts). Never drawn by the Configurador nor the in-game F2 menu.
 // Everything is a pure function of the launcher's elapsed time (no per-frame state), two small textures generated once
 // (a seamless 512x512 fBm with periodic lattices: no seams; linearly filtered, dithered alpha: no banding) and a soft dot;
 // Shutdown() frees both when the launcher closes (before the renderer backend goes).
@@ -3178,7 +3180,7 @@ void OpenUrl(const char* url) {
 #endif
 }
 
-// The resolution choices (F1's ResolutionRow before): full screen, the desktop's or a monitor mode; window, its size.
+// The resolution choices (F2's ResolutionRow before): full screen, the desktop's or a monitor mode; window, its size.
 void ResolutionChoices(const Settings& s, std::vector<std::string>* ids, std::vector<std::string>* labels) {
 	static const char* sizes[] = {"1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600", "3840x2160"};
 	ids->clear();
@@ -3630,7 +3632,7 @@ void LauncherControls(Settings& s) {
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(4)});
 		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
-		ImGui::TextColored(kDimL, "%s", I18n::T("En el juego: F1 guardar y salir (o R3 + OPTIONS).  F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa."));
+		ImGui::TextColored(kDimL, "%s", I18n::T("En el juego: F2 guardar y salir (o R3 + OPTIONS).  F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa."));
 		ImGui::PopTextWrapPos();
 		ImGui::Dummy({0, U(4)});
 	}
@@ -3759,7 +3761,7 @@ void LauncherAjustes(Settings& s) {
 		}
 	}
 	LCheckRow("Copia de las partidas al arrancar", s.backup_saves, "Copia _SaveData en _SaveData-copias cada vez que pulsas JUGAR.");
-	// (ds-pc-port37) "Continuar donde lo dejé (F1)" removed (the owner asked).
+	// (ds-pc-port37) "Continuar donde lo dejé (F2)" removed (the owner asked).
 	{
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(2)});
@@ -4006,10 +4008,10 @@ void DrawLauncher(float width, float height) {
 		fg->AddText(f, size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 170), text);
 		fg->AddText(f, size, {at.x + 1.5f, at.y + 1.5f}, IM_COL32(0, 0, 0, 90), text);
 		fg->AddText(f, size, at, IM_COL32(236, 226, 204, 200), text);
-		// (ds-pc-port52) The F1 hint just below it, same style, a little smaller: F1 switches the launcher between full
+		// (ds-pc-port52) The F2 hint just below it, same style, a little smaller: F2 switches the launcher between full
 		// screen borderless and a normal window (RunStartMenu).
 		const float  hsize = std::max(11.0f, std::round(U(12)));
-		const char*  hint  = I18n::T("F1 modo ventana");
+		const char*  hint  = I18n::T("F2 modo ventana");
 		const ImVec2 hs    = f->CalcTextSizeA(hsize, FLT_MAX, 0.0f, hint);
 		const ImVec2 hat   = {std::floor(width - margin - hs.x), std::floor(at.y + ts.y + U(2))};
 		fg->AddText(f, hsize, {hat.x + 1, hat.y + 1}, IM_COL32(0, 0, 0, 170), hint);
@@ -4063,7 +4065,7 @@ void DrawLauncher(float width, float height) {
 
 	// ---- The bottom of the column: the shaders' state, where JUGAR continues, JUGAR, Opciones and Salir. ----
 	const auto        pv   = Precompile::State();
-	const std::string when; // (ds-pc-port37: no "continue where F1 left")
+	const std::string when; // (ds-pc-port37: no "continue where F2 left")
 	// (ds-pc-port11) The shaders' panel: its text in big light letters wrapped inside the column (an animated hourglass
 	// beside it while they precompile), then the progress bar with the percent and the parts, then Detener; all measured
 	// first so that nothing overlaps JUGAR below.
@@ -4204,12 +4206,12 @@ void DrawLauncher(float width, float height) {
 	if (!when.empty()) {
 		const float wy = RowY();
 		char        line[256];
-		std::snprintf(line, sizeof(line), I18n::T("Partida guardada con F1 el %s: JUGAR continúa allí."), when.c_str());
+		std::snprintf(line, sizeof(line), I18n::T("Partida guardada con F2 el %s: JUGAR continúa allí."), when.c_str());
 		ImGui::SetCursorScreenPos({g_lbox.at.x, wy});
 		ImGui::PushFont(g_font_semi, U(14));
 		ImGui::TextColored(kGoldL, "%s", line);
 		ImGui::PopFont();
-		Tip("En el juego, F1 (o R3 + OPTIONS) guarda y cierra. Con esto marcado, JUGAR pasa solo la pantalla de título y carga la partida en el sitio donde pulsaste F1.");
+		Tip("En el juego, F2 (o R3 + OPTIONS) guarda y cierra. Con esto marcado, JUGAR pasa solo la pantalla de título y carga la partida en el sitio donde pulsaste F2.");
 		RowEnd(wy, 26);
 	}
 	{
@@ -4355,7 +4357,7 @@ bool WantsOverlay() {
 	return MetricsPanel::Shown() || g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive() || Anim::Closing(); // (ds-pc-port38: the fade-out)
 }
 
-// (port34) F1 > Ver trofeos: every trophy of the game, as the PS5's trophy page. Drawn with draw lists in one window of
+// (port34) F2 > Ver trofeos: every trophy of the game, as the PS5's trophy page. Drawn with draw lists in one window of
 // its own; the icons come from one atlas texture (Libs::Trophy::BuildArt, decoded on a worker thread) registered with
 // ImGui as a managed texture (ImTextureData): the in-game overlay's Vulkan backend (ImGui 1.92, RendererHasTextures)
 // uploads it once, and it costs a single descriptor (the overlay's pool holds 8).
@@ -4826,7 +4828,7 @@ bool Draw(float width, float height, float unit) {
 	const float foot_h = 46.0f * u;
 	{
 		const float y    = py0 + ph - foot_h;
-		const char* hint = I18n::T("L1/R1 o Q/E: filtro   \xC2\xB7   Y o Tab: orden   \xC2\xB7   B, Esc o F1: volver");
+		const char* hint = I18n::T("L1/R1 o Q/E: filtro   \xC2\xB7   Y o Tab: orden   \xC2\xB7   B, Esc o F2: volver");
 		const char* vb   = I18n::T("Volver");
 		const float vw   = body->CalcTextSizeA(18.0f * u, FLT_MAX, 0.0f, vb).x + 40.0f * u;
 		const ImVec2 v0 {px0 + pad, y + 6 * u}, v1 {px0 + pad + vw, y + foot_h - 10 * u};
@@ -5497,7 +5499,7 @@ void Draw(float width, float height) {
 }
 } // namespace MetricsPanel
 
-// ---- (ds-pc-port37) F1 > Mapear mando and F1 > Teclado y raton: pages of the in-game menu (as Ver trofeos). ----
+// ---- (ds-pc-port37) F2 > Mapear mando and F2 > Teclado y raton: pages of the in-game menu (as Ver trofeos). ----
 namespace F1Pages {
 ImTextureData* g_mouse = nullptr;
 ImGuiContext*  g_mouse_ctx = nullptr;
@@ -5779,11 +5781,11 @@ bool DrawKbm(float width, float height, float unit) {
 }
 } // namespace F1Pages
 
-// (ds-pc-port8) In the game: F1's save and quit, a panel in the middle of the screen until the game closes.
-// (ds-pc-port38) `closing`: the fade-out after F1 / Esc closed it (drawn disabled, no input taken).
-// (bb-style-f1) The cursor is kept at every level of F1: each screen (0 the option bar, 1 Mando, 2 Teclado y ratón,
+// (ds-pc-port8) In the game: F2's save and quit, a panel in the middle of the screen until the game closes.
+// (ds-pc-port38) `closing`: the fade-out after F2 / Esc closed it (drawn disabled, no input taken).
+// (bb-style-f1) The cursor is kept at every level of F2: each screen (0 the option bar, 1 Mando, 2 Teclado y ratón,
 // 3 Trofeos) remembers the item that had the keyboard / pad focus; when a screen comes back (back from an option, from a
-// sub-screen, or F1 opened again in this session) that item gets the focus again instead of ImGui's first item.
+// sub-screen, or F2 opened again in this session) that item gets the focus again instead of ImGui's first item.
 namespace KeepFocus {
 struct Mem {
 	ImGuiID      id = 0;
@@ -5814,7 +5816,7 @@ void After(int screen) {
 }
 } // namespace KeepFocus
 
-void (*g_menu_rect_hook)(ImVec2, ImVec2) = nullptr; // (perfopts-1107) the F1 window's rectangle, for next frame's fog
+void (*g_menu_rect_hook)(ImVec2, ImVec2) = nullptr; // (perfopts-1107) the F2 window's rectangle, for next frame's fog
 void DrawInGameMenu(float width, float height, bool closing = false) {
 	if (!closing) DrainInputs();
 	const float unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
@@ -5849,7 +5851,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	Bump();
 	Anim::g_page_seen = 0;
 	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, static_cast<int>(140 * t)));
-	// (des-fog-hq) No fog, motes or vignette behind the F1 menu: the plain dim of the game image only (the ambience is
+	// (des-fog-hq) No fog, motes or vignette behind the F2 menu: the plain dim of the game image only (the ambience is
 	// the pre-game launcher's alone).
 	g_menu_rect_hook = nullptr;
 	ImFont* font = FindFont("segoeui");
@@ -5913,7 +5915,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	ImGui::Dummy({1.0f, 24.0f * unit}); // (room for the focused card's lift)
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {28 * unit, 14 * unit});
 	if (CardButton(I18n::T("Volver al juego"), Icons::Back, bs, unit, 0)) SetOpen(false);
-	// (port34) The trophy page (Esc, B or F1 there: back here).
+	// (port34) The trophy page (Esc, B or F2 there: back here).
 	ImGui::SameLine();
 	if (g_focus_trophy_btn_request.exchange(false)) g_focus_trophy_btn = true;
 	if (g_focus_trophy_btn) {
@@ -5953,7 +5955,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 #endif
 	}
 	ImGui::PopStyleVar();
-	ImGui::TextDisabled("%s", I18n::T("F1 o Esc: volver al juego"));
+	ImGui::TextDisabled("%s", I18n::T("F2 o Esc: volver al juego"));
 	if (!closing) KeepFocus::After(0);
 	{
 		// (perfopts-1107) Under the contents: the carved stone panel and the gliding highlight; while opening or closing,
@@ -6032,7 +6034,7 @@ void Presented() {
 		g_first_present = false;
 		CloseSplash();
 	}
-	Resume::Presented(); // (ds-pc-port8) JUGAR after F1: the automatic Continue
+	Resume::Presented(); // (ds-pc-port8) JUGAR after F2: the automatic Continue
 }
 
 void WindowCreated(SDL_Window* window) {
@@ -6235,9 +6237,9 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 				}
 				Ambience::g_fog_linear = Ambience::g_dot_linear = false;
 			}
-			// (ds-pc-port52) F1 in the launcher (not the Configurador, not while a key binding waits): full screen borderless
-			// <-> a normal window with a title bar (moved, minimized and resized as any). The game's F1 menu is OnEvent's.
-			if (!g_config_mode && e.type == SDL_KEYDOWN && e.key.repeat == 0 && e.key.keysym.sym == SDLK_F1 && !g_kbm_capture.load()) {
+			// (ds-pc-port52) F2 in the launcher (not the Configurador, not while a key binding waits): full screen borderless
+			// <-> a normal window with a title bar (moved, minimized and resized as any). The game's F2 menu is OnEvent's.
+			if (!g_config_mode && e.type == SDL_KEYDOWN && e.key.repeat == 0 && e.key.keysym.sym == SDLK_F2 && !g_kbm_capture.load()) {
 				static bool windowed = false;
 				windowed             = !windowed;
 				SDL_Rect desk {}, usable {};
@@ -6263,7 +6265,7 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 					}
 				}
 				SDL_RaiseWindow(window);
-				std::printf("[port] launcher: F1 -> %s\n", windowed ? "windowed" : "full screen borderless");
+				std::printf("[port] launcher: F2 -> %s\n", windowed ? "windowed" : "full screen borderless");
 				std::fflush(stdout);
 				continue;
 			}

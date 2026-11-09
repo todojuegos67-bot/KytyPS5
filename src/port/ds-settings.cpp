@@ -366,7 +366,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 bool SaveSettings(const std::string& path, const Settings& s) {
 	std::ostringstream o;
 	const auto         b = [](bool x) { return x ? "1" : "0"; };
-	o << "; Demon's Souls PC - ajustes. Se cambian en el lanzador (se abre al ejecutar Demon's Souls.exe). En el juego F1 guarda y sale.\n"
+	o << "; Demon's Souls PC - ajustes. Se cambian en el lanzador (se abre al ejecutar Demon's Souls.exe). En el juego F2 abre el menu.\n"
 	  << "; 1 = si, 0 = no. Lo que no se reconoce se ignora; borrar este archivo vuelve a los valores por defecto.\n\n"
 	  << "[Juego]\n"
 	  << "; Carpeta del juego volcado (la que tiene eboot.bin y sce_sys), o un .zar. Vacia: se pregunta al arrancar.\n"
@@ -554,7 +554,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "[Interfaz]\n"
 	  << "; Metricas en pantalla: 0 no, 1 FPS, 2 FPS + detalle\n"
 	  << "metricas=" << s.metrics << "\n"
-	  << "; Lanzador al iniciar: 1 si, 0 el juego arranca directo (F1 > Sistema lo cambia; \"Demon's Souls.exe\" --lanzador lo muestra una vez)\n"
+	  << "; Lanzador al iniciar: 1 si, 0 el juego arranca directo (F2 > Sistema lo cambia; \"Demon's Souls.exe\" --lanzador lo muestra una vez)\n"
 	  << "menu_inicio=" << b(s.start_menu) << "\n"
 	  << "; Niebla y ceniza animadas de fondo en el lanzador (0 = la ilustracion fija)\n"
 	  << "lanzador_ambiente=" << b(s.launcher_ambience) << "\n"
@@ -1586,7 +1586,7 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	std::string  exp = std::string("Esperado: unos ") + F1(fps) + " FPS de media";
 	if (pc.refresh_hz >= 100 && fps < pc.refresh_hz * 0.9) exp += std::string(" (tu monitor va a ") + std::to_string(pc.refresh_hz) + " Hz: la frame generation de Gráficos puede llenarlo)";
 	if (base > target) exp += ". Tu procesador limita: por debajo de 60 FPS en las zonas pesadas aunque bajes gráficos";
-	why.push_back(exp + ". Es una estimación: puedes cambiar cualquier opción en F1.");
+	why.push_back(exp + ". Es una estimación: puedes cambiar cualquier opción en F2.");
 	return why;
 }
 
