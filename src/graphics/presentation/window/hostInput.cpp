@@ -1280,6 +1280,15 @@ bool HostInputKbmEnabled() {
 	return g_kbm.enabled;
 }
 
+// (11-10) The F2 menu's mouse sensitivity and anti-dead-zone, live: the sensitivity as a factor of the one the game started
+// with (that one already carries the launch's adjustments, e.g. frame generation's 0.92), the anti-dead-zone as is.
+void HostInputKbmSetLive(float sens_factor, float antidz) {
+	if (!g_kbm.enabled) return;
+	static const float base = g_kbm.sens;
+	if (std::isfinite(sens_factor) && sens_factor > 0.0f) g_kbm.sens = std::clamp(base * sens_factor, 0.05f, 20.0f);
+	if (std::isfinite(antidz)) g_kbm.adz = std::clamp(antidz, 0.0f, 0.6f);
+}
+
 void HostInputFocus(bool focused) {
 	if (!g_kbm.enabled) return;
 	if (focused) {

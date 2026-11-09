@@ -22,6 +22,7 @@ bool               HostInputKbmWarpDegrees(uint64_t shown_seq, double* yaw, doub
 // frame from a second read in the same one (the stick is constant over a game frame).
 uint64_t           HostInputKbmOnFlip();
 void               HostInputFocus(bool focused);
+void               HostInputKbmSetLive(float sens_factor, float antidz);
 bool               HostInputMouseMotion(int dx, int dy);
 bool               HostInputMouseWheel(int y);
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);

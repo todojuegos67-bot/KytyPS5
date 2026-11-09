@@ -16,6 +16,7 @@
 
 #include "local/perf-overlay.h"
 #include "local/port-live.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "libs/trophy.h"
 
 #include "SDL.h"
@@ -1541,6 +1542,8 @@ bool NeedsRestartLive(const Settings& launched, const Settings& now) {
 	if ((off & 32) != 0) n.lens_flare = launched.lens_flare;
 	if ((off & 64) != 0) n.rt_shadows = launched.rt_shadows;
 	if ((off & 1) != 0) n.rt_ss_refl = launched.rt_ss_refl;
+	// (11-10) The mouse's sensitivity and anti-dead-zone apply live with keyboard and mouse on.
+	if (launched.kbm && n.kbm) n.kbm_sens = launched.kbm_sens, n.kbm_antidz = launched.kbm_antidz;
 	return NeedsRestart(launched, n);
 }
 
@@ -2520,11 +2523,16 @@ void Draw(float width, float height) {
 					const auto restart_note = [&](bool changed) {
 						if (changed && !g_start_mode) ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", "   (requiere reinicio)");
 					};
-					SliderRow("Sensibilidad del ratón", s.kbm_sens, 0.05f, 4.0f, "%.2f", "Cuánto gira la cámara por cada movimiento del ratón (1.00 = normal).");
-					restart_note(s.kbm_sens != l.kbm_sens);
-					SliderRow("Antizona muerta", s.kbm_antidz, 0.0f, 0.5f, "%.2f",
-					          "Salta la zona muerta del stick del juego: con más, un movimiento pequeño del ratón ya gira la cámara. Si la cámara se mueve sola, bájalo.");
-					restart_note(s.kbm_antidz != l.kbm_antidz);
+					// (11-10) Sensitivity and anti-dead-zone apply live (with keyboard and mouse on since the start).
+					bool mouse_live = false;
+					mouse_live |= SliderRow("Sensibilidad del ratón", s.kbm_sens, 0.05f, 4.0f, "%.2f", "Cuánto gira la cámara por cada movimiento del ratón (1.00 = normal). Se aplica al momento.");
+					mouse_live |= SliderRow("Antizona muerta", s.kbm_antidz, 0.0f, 0.5f, "%.2f",
+					          "Salta la zona muerta del stick del juego: con más, un movimiento pequeño del ratón ya gira la cámara. Si la cámara se mueve sola, bájalo. Se aplica al momento.");
+					if (mouse_live && !g_start_mode && l.kbm) {
+						const float base_sens = l.kbm_sens > 0 ? l.kbm_sens : 1.0f;
+						Libs::Graphics::HostInputKbmSetLive((s.kbm_sens > 0 ? s.kbm_sens : 1.0f) / base_sens, s.kbm_antidz >= 0 ? s.kbm_antidz : 0.15f);
+					}
+					if (!l.kbm) restart_note(s.kbm_sens != l.kbm_sens || s.kbm_antidz != l.kbm_antidz);
 					{
 						float cam = static_cast<float>(s.kbm_camera);
 						if (SliderRow("Velocidad de cámara (ratón)", cam, 5.0f, 15.0f, "%.0f",
