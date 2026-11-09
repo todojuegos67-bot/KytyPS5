@@ -45,6 +45,8 @@ const char* KindName(Kind kind) {
         return "FSR 3.1";
     case Kind::Fsr4:
         return "FSR 4";
+    case Kind::Taa:
+        return "TAA";
     }
     return "?";
 }
@@ -144,6 +146,9 @@ Config ParseConfig() {
         c.kind = SR::Kind::Xess;
     } else if (up == "fsr3" || up == "fsr") {
         c.kind = SR::Kind::Fsr3;
+    } else if (up == "taa" || (up.empty() && Env("BB_TAA") != nullptr && Env("BB_TAA")[0] != '0')) {
+        // bb-clean-021-taa: the emulator's TAA, native resolution (also the AA with no upscaler).
+        c.kind = SR::Kind::Taa;
     }
     // (BB_UPSCALER=native or anything else: the stock path, nothing of this module runs.)
     const std::string q = Lower(Env("BB_UPSCALE_MODE"));
@@ -163,6 +168,13 @@ Config ParseConfig() {
     if (const char* s = Env("BB_UPSCALE_SHARPNESS") ? Env("BB_UPSCALE_SHARPNESS")
                                                     : Env("BB_SHARPNESS")) {
         c.sharpness = std::clamp(static_cast<float>(std::atof(s)), 0.0f, 1.0f);
+    }
+    if (c.kind == SR::Kind::Taa) {
+        c.quality = SR::Quality::Native;
+        c.sharpness = 0.25f;
+        if (const char* s = Env("BB_TAA_SHARPNESS")) {
+            c.sharpness = std::clamp(static_cast<float>(std::atof(s)), 0.0f, 1.0f);
+        }
     }
     if (const char* s = Env("BB_UPSCALE_JITTER")) {
         c.jitter = s[0] != '0';
@@ -564,6 +576,9 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
     case SR::Kind::Fsr3:
         SR::Fsr3::OnDevice(physical, device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
         break;
+    case SR::Kind::Taa:
+        SR::Taa::OnDevice(device, allocator);
+        break;
     default:
         return;
     }
@@ -585,6 +600,8 @@ bool BackendReady() {
         return SR::Xess::Ready();
     case SR::Kind::Fsr3:
         return SR::Fsr3::Ready();
+    case SR::Kind::Taa:
+        return SR::Taa::Ready();
     default:
         return false;
     }
@@ -612,6 +629,9 @@ bool RunBackend(const SR::Desc& desc) {
         break;
     case SR::Kind::Fsr3:
         ok = SR::Fsr3::Evaluate(desc);
+        break;
+    case SR::Kind::Taa:
+        ok = SR::Taa::Evaluate(desc);
         break;
     default:
         return false;
@@ -783,12 +803,13 @@ void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, doubl
     }
     LOG_INFO(Render_Vulkan,
              "[perf] fps {:.1f} frame {:.2f} ms | cpu {:.2f} ms (fence wait {:.2f}) | gpu {:.2f} "
-             "ms | upscaler {} {} {}x{} -> {} -> {}x{} (window) sr {:.3f} ms mv {:.3f} ms",
+             "ms | upscaler {} {} {}x{} -> {} -> {}x{} (window) sr {:.3f} ms mv {:.3f} ms{}",
              s.fps, s.frame_ms, s.cpu_ms, s.wait_ms, s.gpu_ms,
              Enabled() ? SR::KindName(Cfg().kind) : "off",
              Enabled() ? SR::QualityName(Cfg().quality) : "-", in_w, in_h,
              s.sr_w ? fmt::format("{}x{}", s.sr_w, s.sr_h) : std::string("not upscaled"), out_w,
-             out_h, s.sr_ms, s.mv_ms);
+             out_h, s.sr_ms, s.mv_ms,
+             Cfg().kind == SR::Kind::Taa ? fmt::format(" | taa {:.3f} ms", s.sr_ms) : std::string());
     g_acc = {};
     g_acc.start = now;
 }
@@ -1066,7 +1087,11 @@ void DrawOverlay() {
             const std::string rk = k == SR::Kind::Fsr4   ? "FSR 4"
                                    : k == SR::Kind::Fsr3 ? "FSR"
                                                          : SR::KindName(k);
-            rows.push_back({"Escala", rk + dot + ModeEs(Cfg().quality), col});
+            if (k == SR::Kind::Taa) {
+                rows.push_back({"AA", fmt::format("TAA{}{:.2f} ms", dot, s.sr_ms), kOrange});
+            } else {
+                rows.push_back({"Escala", rk + dot + ModeEs(Cfg().quality), col});
+            }
             const double ratio = s.in_h > 0 ? static_cast<double>(s.out_h) / s.in_h : 0.0;
             const u32 sr_h = s.sr_h ? s.sr_h : s.out_h;
             const double ratio2 = s.in_h > 0 ? static_cast<double>(sr_h) / s.in_h : 0.0;

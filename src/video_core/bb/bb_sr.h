@@ -19,7 +19,7 @@ namespace BB::SR {
 // re-created, first frame after a model build); counted in the per-second [sr-hist] line.
 void NoteBackendReset(const char* why);
 
-enum class Kind : uint32_t { Off, Native, Dlss, Xess, Fsr3, Fsr4 };
+enum class Kind : uint32_t { Off, Native, Dlss, Xess, Fsr3, Fsr4, Taa };
 
 // The Demon's Souls ratios (output / render, per axis).
 enum class Quality : uint32_t {
@@ -127,5 +127,12 @@ bool Evaluate(const Desc& desc);
 bool Active411();           // bb-dcideas-094: FSR 4.1.1 upscaled the last frame
 const char* ModelName411(); // its model ("INT8", "INT8 (RDNA2)" ...), "" when not running
 } // namespace Fsr4
+
+// bb-clean-021-taa: the emulator's own TAA at native resolution (render == upscale).
+namespace Taa {
+void OnDevice(vk::Device device, VmaAllocator allocator);
+bool Ready();
+bool Evaluate(const Desc& desc);
+} // namespace Taa
 
 } // namespace BB::SR

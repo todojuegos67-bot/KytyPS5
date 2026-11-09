@@ -1,0 +1,43 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-clean-021-taa: RCAS-like contrast adaptive sharpening of the TAA resolve (the history stays
+// unsharpened). Sharpness 0 = copy.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform Push {
+    uvec4 size;  // width, height
+    vec4 params; // sharpness 0..1
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = ivec2(p.size.xy);
+    if (c.x >= sz.x || c.y >= sz.y) {
+        return;
+    }
+    vec3 e = texelFetch(src, c, 0).rgb;
+    float s = p.params.x;
+    if (s <= 0.0) {
+        imageStore(dst, c, vec4(e, 1.0));
+        return;
+    }
+    vec3 b = texelFetch(src, clamp(c + ivec2(0, -1), ivec2(0), sz - 1), 0).rgb;
+    vec3 d = texelFetch(src, clamp(c + ivec2(-1, 0), ivec2(0), sz - 1), 0).rgb;
+    vec3 f = texelFetch(src, clamp(c + ivec2(1, 0), ivec2(0), sz - 1), 0).rgb;
+    vec3 h = texelFetch(src, clamp(c + ivec2(0, 1), ivec2(0), sz - 1), 0).rgb;
+    // Work in a tonemapped range so HDR highlights do not blow the limiter.
+    vec3 tb = b / (1.0 + b), td = d / (1.0 + d), te = e / (1.0 + e), tf = f / (1.0 + f),
+         th = h / (1.0 + h);
+    vec3 mn = min(min(min(tb, td), min(tf, th)), te);
+    vec3 mx = max(max(max(tb, td), max(tf, th)), te);
+    // RCAS lobe: the largest negative weight that keeps the result inside [mn, mx].
+    vec3 hit_min = mn / (4.0 * mx + 1e-5);
+    vec3 hit_max = (1.0 - mx) / (4.0 * mn - 4.0 - 1e-5);
+    vec3 lobe3 = max(-hit_min, hit_max);
+    float lobe = max(-0.1875, min(max(lobe3.r, max(lobe3.g, lobe3.b)), 0.0)) * s * 1.0;
+    vec3 t = (lobe * (tb + td + tf + th) + te) / (4.0 * lobe + 1.0);
+    t = clamp(t, vec3(0.0), vec3(0.999));
+    imageStore(dst, c, vec4(t / (1.0 - t), 1.0));
+}
