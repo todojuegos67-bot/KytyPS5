@@ -112,6 +112,13 @@ equipment, and the Space it sends pauses the emulator (Space again resumes; the 
 | `KYTY_GAME=/path/to/game` | The game somewhere else than `~/Games` |
 | `KYTY_CONSOLE_LANGUAGE=0` | The console's language (1 English, the default; 0 Japanese) |
 
+**Cheats.** The emulator's own options go after `%command%`. A GoldHEN-style cheat file for the game's version (the
+package has none; see the Windows README, "Cheats") saved as `~/KytyPS5/_Patches/PPSA01341.json` applies with
+`%command% --game-patch /home/deck/KytyPS5/_Patches/PPSA01341.json`; in the file, a cheat with `"enabled": false` is
+left out. A wrapper, such as a frame-generation tool's, goes in front of `%command%` and the switches in front of
+it: `KYTY_FPS_HUD=0 /path/to/wrapper %command% --game-patch /home/deck/KytyPS5/_Patches/PPSA01341.json`. The log has a
+`Successfully applied cheat: <name>` line for each cheat applied.
+
 The log of each run is in `~/KytyPS5/logs/`; attach it to an issue when something goes wrong.
 
 ## The Steam Deck package and the Linux package

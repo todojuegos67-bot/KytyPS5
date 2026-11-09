@@ -273,6 +273,17 @@ pairs join the launcher's own (one of the same name replaces the launcher's), an
 launcher's of the same name, e.g. `-RenderHeight 900` or `-Set KYTY_DLSS_PRESET=E`. If the game no longer starts,
 clear the box.
 
+### Cheats
+
+The package has no cheats; it applies a GoldHEN-style cheat file (JSON with `"id"`, `"version"`, `"process"` and
+`"mods"`, as made for the PS5 by others) saved as `_Patches\PPSA01341.json` (the game's title id) in the package
+folder. The launcher's Game page turns it on ("Cheats") and picks which cheats apply; without the launcher,
+`run.cmd -Patch _Patches\PPSA01341.json`. In the file, a cheat (an entry of `"mods"`) with `"enabled": false` is left
+out; one with `"enabled": true` or without the field is applied. The file must be for the game's version
+(`"version": "01.007.000"` for 1.07): for another version the emulator stops at start, and the log says
+`Game cheat error: cheat file does not match the loaded game`. The log has a `Successfully applied cheat: <name>`
+line for each cheat applied. (The Steam Deck: see its guide, "Options".)
+
 ## Game language (Chinese, Japanese, Korean and others)
 
 The emulator makes the game's language settings offer every language in every release: the text of 23
@@ -445,6 +456,7 @@ With any of them, only your own keys work on the keyboard (none of the layout ab
 | `launch.json` | The emulator's command line and extra switches; normally left alone |
 | `launcher-settings.json` | The launcher's settings |
 | `Content\<title>`, `dlc_emu.ini` | Add-on content (DLC), if you add it (see "Add-on content") |
+| `_Patches\<title>.json` | A cheat file, if you add one (see "Cheats") |
 
 ## Updating to a newer package
 

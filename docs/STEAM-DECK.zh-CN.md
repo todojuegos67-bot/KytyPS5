@@ -99,6 +99,13 @@ GPU 1600 MHz（最高）时整体反而更慢；频率保持自动（Steam 的�
 | `KYTY_GAME=/游戏/路径` | 游戏不在 `~/Games` 时 |
 | `KYTY_CONSOLE_LANGUAGE=0` | 主机语言（1 英语，默认；0 日语） |
 
+**金手指。** 模拟器自己的参数写在 `%command%` 后面。与游戏版本对应的 GoldHEN 格式金手指文件（包里不带；见 Windows 版
+README 的 "Cheats"）放在 `~/KytyPS5/_Patches/PPSA01341.json`，用
+`%command% --game-patch /home/deck/KytyPS5/_Patches/PPSA01341.json` 启用；文件里 `"enabled": false` 的条目不生效。
+包装程序（例如补帧工具的）写在 `%command%` 前面，开关再写在它前面：
+`KYTY_FPS_HUD=0 /路径/包装程序 %command% --game-patch /home/deck/KytyPS5/_Patches/PPSA01341.json`。每条生效的金手指在日志里
+有一行 `Successfully applied cheat: <名称>`。
+
 每次运行的日志在 `~/KytyPS5/logs/`；遇到问题时请附在 issue 里。
 
 ## Steam Deck 版的包与 Linux 版的包
