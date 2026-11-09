@@ -76,3 +76,15 @@ ab-exe ABBA，120 Hz 上限，源码相同（11-05 的 profile 为 A）：
 
 重扫只剩 redZonePatcher.cpp（加载器）的 17 个。新 profile 提交为 `tools\pgo\kyty.profdata`，旧的另存为
 `_Build\pgo\windows\kyty-before-20261106.profdata`。
+
+2026-11-09（台式机，v20261109 发布前）：f25c70f7（#315）改了 `table-xpr.inc` 的 TableDraw、TableResolveSet、TableTransit，
+它们的 profile 随之失效（扫描共 25 个：redZonePatcher 17、renderDraw 2、frame-gen 2、libAudio2、demonsSoulsPageFree、
+SceneGuard、TextureMips 各 1）。在 9af7b0d9 上用 `pgo-multi.ps1` 默认的五次运行重新训练。ab-exe ABBA，120 Hz 上限，源码
+相同（11-06 的 profile 为 A），各 4 个窗口：
+- 1-1：渲染线程 14.07 → 14.01 ms/帧，fps 70.41 → 70.08；
+- Latria：12.19 → 12.21 ms，fps 77.58 → 78.62；
+- 1-1 加 `KYTY_SCOUT=0`：14.30 → 14.32 ms，fps 68.58 → 69.08。
+都在噪声内：失效的几个函数在这里没有可测的代价，换新 profile 是为了让发布版与代码一致。重扫只剩 redZonePatcher.cpp 的 17
+个。旧的另存为 `_Build\pgo\windows\kyty-before-20261109.profdata`。
+（用 `-fprofile-instr-generate` 把一个 TU 编成 IR，`__profd_` 里的哈希与 `llvm-profdata show --all-functions` 的
+`Hash:` 对比，可以列出具体是哪些函数失效。）
