@@ -29,6 +29,10 @@ bool Temporal();      // DLSS or FSR 4 asked
 // bb-clean-021-fg: the scene depth, camera and motion vectors are captured (an upscaler, or
 // frame generation without one: BB_FG != off).
 bool Capture();
+// The output size the resolution patch divides by the ratio (the launcher's output resolution):
+// the upscaler outputs this size, not the window's; the presenter then scales it to the window.
+void SetOutputSize(u32 w, u32 h);
+bool OutputSize(u32& w, u32& h);
 bool BackendReady();  // ... and its back end is up
 float LiveSharpness();
 double Ratio();       // output / render asked by the mode

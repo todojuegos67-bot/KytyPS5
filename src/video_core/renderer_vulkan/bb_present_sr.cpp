@@ -221,7 +221,8 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     if (fg != nullptr) *fg = {};
     // bb-clean-021-fg: with BB_FG on the vectors are made (and copied for FSR 3) even without an
     // upscaler; the frame is then presented as it is.
-    const bool sr = BB::Upscale::BackendReady();
+    // No upscale pass when it would not change the size (except native AA, ratio 1).
+    const bool sr = BB::Upscale::BackendReady() && (in != out || BB::Upscale::Ratio() <= 1.01);
     const bool want_fg = fg != nullptr && BB::FG::WantInputs();
     if ((!sr && !want_fg) || !Init()) return {};
     if (in.width > out.width || in.height > out.height || !depth_ok) return {};

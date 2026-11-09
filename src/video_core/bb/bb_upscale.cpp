@@ -313,6 +313,21 @@ bool Temporal() {
     return Enabled();
 }
 
+namespace {
+std::atomic<u32> g_out_w{0}, g_out_h{0};
+}
+
+void SetOutputSize(u32 w, u32 h) {
+    g_out_w = w;
+    g_out_h = h;
+}
+
+bool OutputSize(u32& w, u32& h) {
+    w = g_out_w.load();
+    h = g_out_h.load();
+    return w != 0 && h != 0;
+}
+
 bool Capture() {
     static const bool on = Enabled() || BB::FG::On();
     return on;

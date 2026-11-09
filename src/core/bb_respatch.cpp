@@ -155,6 +155,7 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
         ow = EmulatorSettings.GetWindowWidth();
         oh = EmulatorSettings.GetWindowHeight();
     }
+    BB::Upscale::SetOutputSize(ow, oh);
     const double ratio = BB::Upscale::Ratio();
     if (ratio <= 1.01) {
         BB::Upscale::Checkpoint(fmt::format(

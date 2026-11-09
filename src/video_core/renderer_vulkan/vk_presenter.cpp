@@ -755,7 +755,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                           rasterizer->bb_hud.CapturedAddr() == image.info.guest_address;
     frame->fg = {};
     if (BB::Upscale::Capture()) {
-        const vk::Extent2D out_size{frame->width, frame->height};
+        // The upscaler's output: the configured output resolution (what the resolution patch
+        // divided), else the window; the post-process pass below scales it to the window.
+        vk::Extent2D out_size{frame->width, frame->height};
+        if (u32 ow = 0, oh = 0; BB::Upscale::Enabled() && BB::Upscale::OutputSize(ow, oh) &&
+                                ow >= image_size.width && oh >= image_size.height) {
+            out_size = {ow, oh};
+        }
         const vk::ImageView bb_scene_view = bb_split ? rasterizer->bb_hud.SceneView() : image_view;
         if (const auto v = bb_sr->Run(cmdbuf, texture_cache, runtime, image, bb_scene_view,
                                       image_size, out_size, rasterizer->bb_scene_depth, srgb10,
