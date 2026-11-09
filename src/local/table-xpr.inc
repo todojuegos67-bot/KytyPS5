@@ -35,9 +35,15 @@ struct TableRoleSide {
 	~TableRoleSide() { delete block.load(); }
 	[[nodiscard]] T* Peek() const noexcept { return block.load(std::memory_order_acquire); }
 	T& Get() {
+		return Get([](T&) {});
+	}
+	// (`init` fills a block before it is published.)
+	template <typename Init>
+	T& Get(Init&& init) {
 		T* at = block.load(std::memory_order_acquire);
 		if (at != nullptr) return *at;
 		auto* made = new T;
+		init(*made);
 		if (block.compare_exchange_strong(at, made, std::memory_order_acq_rel)) return *made;
 		delete made;
 		return *at;
@@ -108,8 +114,15 @@ struct RenderExecutor::TableImageSet {
 		Roles1() { validated_frame.fill(UINT64_MAX); }
 	};
 	TableRoleSide<Roles1> roles;
-	uint64_t& ValidatedFrame(uint32_t role) { return role == 0 ? validated_frame : roles.Get().validated_frame[role - 1]; }
-	uint64_t& ResolutionEpoch(uint32_t role) { return role == 0 ? resolution_epoch : roles.Get().resolution_epoch[role - 1]; }
+	// The worker roles' epochs start from role 0's proof (RoleZeroEpoch). At 0 every registration over a view's pages
+	// counted, the image's own included, so a set sampling a depth view never validated in a worker (IsSampledDepthCurrent)
+	// and every draw with it was a hole: 'table: set validation', ~24-42 a frame settled at three of the owner's spots.
+	Roles1& Side() {
+		return roles.Get([this](Roles1& side) { side.resolution_epoch.fill(RoleZeroEpoch()); });
+	}
+	[[nodiscard]] uint64_t RoleZeroEpoch() { return std::atomic_ref<uint64_t>(resolution_epoch).load(std::memory_order_relaxed); }
+	uint64_t& ValidatedFrame(uint32_t role) { return role == 0 ? validated_frame : Side().validated_frame[role - 1]; }
+	uint64_t& ResolutionEpoch(uint32_t role) { return role == 0 ? resolution_epoch : Side().resolution_epoch[role - 1]; }
 	std::atomic<uint64_t>       used_frame {0};
 	// The texture cache's flip count (TextureCache::GcTick) and frame (CurrentFrame) when the main executor last checked
 	// every image in full, which touches their uses (the LRU, the last use): again within TouchTicks of either (an image
@@ -1154,6 +1167,12 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	const auto frame      = m_context.FrameNumber();
 	const auto resolution = textures.ResolutionEpoch();
 	if (set.bda_generation != BufferCache::BdaTableGeneration()) return false; // (the page table grew since)
+	// (A worker's proof is never older than role 0's latest: the registrations since role 0's are what can have moved
+	// the views; its own stays where its last pass left it otherwise, and a registration after it failed it for good.)
+	if (Role() != 0) {
+		auto& mine = set.ResolutionEpoch(Role());
+		mine        = std::max(mine, set.RoleZeroEpoch());
+	}
 	if (set.ValidatedFrame(Role()) == frame && set.ResolutionEpoch(Role()) == resolution) return true;
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 7);
 	const auto mode  = kyty_local_table_set_proofs.load(std::memory_order_relaxed);
@@ -1259,8 +1278,11 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		}
 	}
 	// (The epoch before the checks: a registration they made, FindTexture's, stamps pages a later check looks at.)
-	set.ValidatedFrame(Role())  = frame;
-	set.ResolutionEpoch(Role()) = resolution;
+	set.ValidatedFrame(Role()) = frame;
+	if (Role() == 0)
+		std::atomic_ref<uint64_t>(set.resolution_epoch).store(resolution, std::memory_order_relaxed); // (workers read it)
+	else
+		set.ResolutionEpoch(Role()) = resolution;
 	if (own && full) {
 		set.touched_tick  = textures.GcTick();
 		set.touched_frame = textures.CurrentFrame();
