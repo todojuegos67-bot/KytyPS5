@@ -3,7 +3,10 @@
 
 #include "video_core/renderer_vulkan/bb_present_sr.h"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -345,6 +348,31 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     desc.jitter[0] = jx;
     desc.jitter[1] = jy;
     desc.reset = cam.reset || in != last_in || out != last_out;
+    {
+        // (diag) Once a second: what the upscaler gets. History resets throw the past frames away (a soft
+        // picture); frames without a camera have no motion vectors from it; jitter out of +-0.5 px is wrong.
+        static u32 n = 0, valid = 0, resets = 0, size_resets = 0, bad_jitter = 0;
+        static float jmax = 0.0f;
+        static auto t0 = std::chrono::steady_clock::now();
+        ++n;
+        valid += cam.valid ? 1 : 0;
+        resets += cam.reset ? 1 : 0;
+        size_resets += (in != last_in || out != last_out) ? 1 : 0;
+        const float ja = std::max(std::abs(jx), std::abs(jy));
+        jmax = std::max(jmax, ja);
+        bad_jitter += ja > 0.5f ? 1 : 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - t0 >= std::chrono::seconds(1)) {
+            BB::Upscale::Checkpoint(fmt::format(
+                "[sr-in] 1 s: {} frames, camera valid {}, history resets {} (camera {}, size {}), jitter max {:.3f} px "
+                "({} out of range), {}x{} -> {}x{}, sharpness {:.2f}",
+                n, valid, resets + size_resets, resets, size_resets, jmax, bad_jitter, in.width, in.height,
+                out.width, out.height, BB::Upscale::LiveSharpness()));
+            n = valid = resets = size_resets = bad_jitter = 0;
+            jmax = 0.0f;
+            t0 = now;
+        }
+    }
     // The scene colour is the game's tonemapped LDR image (as in Supermedo's RunScaled, hdr = false): telling
     // DLSS / FSR it is HDR turned on their auto exposure and HDR handling, which shifted the colours (dull, yellow,
     // blue shadows) and softened the picture.
