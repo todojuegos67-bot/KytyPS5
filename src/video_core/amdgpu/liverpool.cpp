@@ -3,7 +3,9 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include <chrono>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "common/scope_exit.h"
@@ -15,6 +17,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -137,6 +140,9 @@ void Liverpool::Process(std::stop_token stoken) {
         if (stoken.stop_requested()) {
             break;
         }
+        const bool bb_busy_log = BB::Upscale::Capture();
+        const auto bb_busy_start =
+            bb_busy_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
         VideoCore::StartCapture();
 
@@ -179,6 +185,22 @@ void Liverpool::Process(std::stop_token stoken) {
                 rasterizer->Flush();
             }
             submit_done = false;
+        }
+
+        if (bb_busy_log) {
+            // bb-clean-021-fg: the GPU command thread's busy time (ms per second, wake to idle).
+            static std::chrono::steady_clock::time_point window{};
+            static double busy_ms = 0.0;
+            const auto now = std::chrono::steady_clock::now();
+            busy_ms += std::chrono::duration<double, std::milli>(now - bb_busy_start).count();
+            if (window == std::chrono::steady_clock::time_point{}) window = now;
+            const double span = std::chrono::duration<double>(now - window).count();
+            if (span >= 1.0) {
+                LOG_INFO(Render_Vulkan, "[gpu-thread] GpuCommandProcessor busy {:.0f} ms/s ({:.0f} %)",
+                         busy_ms / span, busy_ms / span / 10.0);
+                busy_ms = 0.0;
+                window = now;
+            }
         }
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
