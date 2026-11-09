@@ -283,38 +283,20 @@ bool LooksLikeViewProj(const Mat& v) {
     return true;
 }
 
-// Written by the GPU thread (OnConstants), read at the flip (same thread in shadPS4, the
-// mutex only guards against a presenter on another thread; it is taken on a hit, a few times
-// per frame).
-std::mutex g_cam_mutex;
-Mat g_cur_vp;
-u64 g_cur_area = 0;
-bool g_cur_valid = false;
-Mat g_prev_vp;
-bool g_prev_valid = false;
-u32 g_prev_w = 0, g_prev_h = 0;
-// bb-mvstats: the picked camera's view matrix (raw, row-major 3x4) for the camera position delta.
-float g_cur_view[12]{}, g_prev_view[12]{};
-
-// bb-clean-021-taa-cam: every distinct camera block of the frame (its render size, matrix and
-// how many draws bound it). The frame's camera is the one drawn at the scene's size by the most
-// draws; the largest area alone could be a shadow / reflection pass, or flip between two
-// cameras frame to frame, which made clip_to_prev pair two different cameras (smeared vectors).
-struct CamCandidate {
-    u32 w = 0, h = 0;
-    float raw[28]{}; // floats 8-19 and 52-67 as uploaded (identity test)
-    Mat vp;
-    u32 count = 0;
+// bb-clean-021-bbport: the camera as Supermedo's port (gpu/shadps4/video_core/renderer_vulkan/
+// vk_camera_motion.cpp, GPL-2.0-or-later): the FIRST valid 864-byte scene constant block of a
+// frame is the main camera; a frame without one drops the history (current and previous).
+// Written by the GPU thread (OnConstants), read at the flip.
+struct BlockCam {
+    float view[12]{};     // world to view, 3x4 rows (floats 8-19)
+    float inv_view[12]{}; // view to world, 3x4 rows (floats 180-191)
+    float proj[4]{};      // x scale, y scale, z scale, z offset (floats 52, 57, 62, 63)
+    Mat vp;               // full projection (52-67) * view, for frame generation / DLSS
+    bool valid = false;
 };
-constexpr u32 kMaxCandidates = 16;
-CamCandidate g_cands[kMaxCandidates];
-u32 g_cand_n = 0;
-
-struct MvStats {
-    double max = 0, mean_sum = 0, yaw_max = 0, yaw_sum = 0, pos_max = 0, pos_sum = 0;
-    u32 frames = 0, resets = 0, no_prev = 0, same = 0;
-    std::chrono::steady_clock::time_point start{};
-} g_mvs;
+std::mutex g_cam_mutex;
+BlockCam g_cam_cur, g_cam_prev;
+bool g_frame_has_camera = false;
 
 u32 g_frame_no = 0;
 float g_jitter[2]{};
@@ -674,76 +656,36 @@ bool RunBackend(const SR::Desc& desc) {
     return ok;
 }
 
-// Bloodborne's scene constant block (864 bytes; 1.59 BlockCamera): [0] far plane 3000,
-// [1] 1 / far, [4] [5] the render size, floats 8-19 the view (3x4 row-major), 52-67 the
-// projection (4x4 row-major). The largest pass's block of the frame is its camera.
-std::atomic<u32> g_cam_seen{0}, g_cam_taken{0};
-
+// Bloodborne's scene constant block (864 bytes): [0] far plane 3000, [1] 1 / far, [4] [5] the
+// render size, floats 8-19 the view, 52-67 the projection, 180-191 the inverse view.
 void OnConstants(const u32* data, size_t count) {
     if (count < 216) {
         return;
     }
     const float* d = reinterpret_cast<const float*>(data);
-    if (d[0] != 3000.0f) {
-        return; // (the one test every other upload pays)
-    }
-    g_cam_seen.fetch_add(1, std::memory_order_relaxed);
-    if (std::fabs(d[1] * d[0] - 1.0f) > 1e-3f || !(d[4] >= 64.0f) || !(d[5] >= 64.0f) ||
-        d[4] > 16384.0f || d[5] > 16384.0f) {
+    if (d[0] != 3000.0f || d[4] < 64.0f || d[5] < 64.0f ||
+        std::abs(d[1] * d[0] - 1.0f) > 1e-3f) {
         return;
     }
-    const u32 w = static_cast<u32>(d[4]), h = static_cast<u32>(d[5]);
-    float raw[28];
-    std::memcpy(raw, d + 8, 12 * sizeof(float));
-    std::memcpy(raw + 12, d + 52, 16 * sizeof(float));
     std::scoped_lock lk{g_cam_mutex};
-    for (u32 i = 0; i < g_cand_n; ++i) {
-        CamCandidate& c = g_cands[i];
-        if (c.w == w && c.h == h && std::memcmp(c.raw, raw, sizeof(raw)) == 0) {
-            ++c.count;
-            return;
-        }
+    if (g_frame_has_camera) {
+        return; // the first one of a frame is the main camera
     }
-    if (g_cand_n >= kMaxCandidates) {
-        return;
-    }
+    g_cam_prev = g_cam_cur;
+    BlockCam& c = g_cam_cur;
+    std::memcpy(c.view, d + 8, sizeof(c.view));
+    std::memcpy(c.inv_view, d + 180, sizeof(c.inv_view));
+    c.proj[0] = d[52];
+    c.proj[1] = d[57];
+    c.proj[2] = d[62];
+    c.proj[3] = d[63];
+    c.valid = c.proj[0] != 0.0f && c.proj[1] != 0.0f;
     Mat view, proj;
     for (int i = 0; i < 12; ++i) view.m[i] = d[8 + i];
     view.m[15] = 1.0;
     for (int i = 0; i < 16; ++i) proj.m[i] = d[52 + i];
-    const Mat vp = Multiply(proj, view);
-    if (!LooksLikeViewProj(vp)) {
-        return;
-    }
-    CamCandidate& c = g_cands[g_cand_n++];
-    c.w = w;
-    c.h = h;
-    std::memcpy(c.raw, raw, sizeof(raw));
-    c.vp = vp;
-    c.count = 1;
-    g_cam_taken.fetch_add(1, std::memory_order_relaxed);
-}
-
-// The frame's camera from the candidates: drawn at the scene size (else the largest area), the
-// most draws among those, the first one on a tie. Called with g_cam_mutex held.
-void PickCamera(u32 scene_w, u32 scene_h, u32& w, u32& h) {
-    // Back to the 1.59 rule (the first block of the largest render size this frame): the
-    // "scene size, most draws" pick of 31ba59e took a block that does not change with the
-    // camera ([mv-cam] previous == current on every frame: zero camera vectors).
-    (void)scene_w;
-    (void)scene_h;
-    const CamCandidate* best = nullptr;
-    for (u32 i = 0; i < g_cand_n; ++i) {
-        const CamCandidate& c = g_cands[i];
-        if (best == nullptr || u64(c.w) * c.h > u64(best->w) * best->h) best = &c;
-    }
-    if (best != nullptr) {
-        g_cur_vp = best->vp;
-        std::memcpy(g_cur_view, best->raw, sizeof(g_cur_view));
-        g_cur_valid = true;
-        w = best->w;
-        h = best->h;
-    }
+    c.vp = Multiply(proj, view);
+    g_frame_has_camera = true;
 }
 
 std::atomic<u32> g_jit_draws{0}, g_jit_skipped{0}, g_jit_w{0}, g_jit_h{0};
@@ -761,156 +703,59 @@ void Jitter(float& x, float& y) {
     y = g_jitter[1];
 }
 
+// a * b for 3x4 affine matrices (rows [R | t]), as Supermedo's vk_camera_motion.cpp.
+static void Multiply34(const float* a, const float* b, float* out) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float v = c == 3 ? a[r * 4 + 3] : 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                v += a[r * 4 + k] * b[k * 4 + c];
+            }
+            out[r * 4 + c] = v;
+        }
+    }
+}
+
 Camera EndFrame(u32 flip_w, u32 flip_h) {
     StartupDone();
     Camera cam;
-    static u32 cand_frames = 0, cand_max = 0, size_miss = 0;
     {
         std::scoped_lock lk{g_cam_mutex};
-        u32 cw = 0, ch = 0;
-        PickCamera(flip_w, flip_h, cw, ch);
-        cand_max = std::max(cand_max, g_cand_n);
-        if (g_cur_valid && (cw != flip_w || ch != flip_h)) ++size_miss;
-        if (++cand_frames == 300) {
-            Checkpoint(fmt::format("camera blocks: up to {} distinct per frame, {} of 300 frames "
-                                   "without one at the scene size {}x{}",
-                                   cand_max, size_miss, flip_w, flip_h));
-            cand_frames = cand_max = size_miss = 0;
+        if (!g_frame_has_camera) {
+            g_cam_cur.valid = g_cam_prev.valid = false; // no camera this frame: drop the history
         }
-        g_cand_n = 0;
-        // The previous camera only pairs with one of the same pass (same render size).
-        if (g_prev_valid && (cw != g_prev_w || ch != g_prev_h)) {
-            g_prev_valid = false;
-        }
-        g_prev_w = cw;
-        g_prev_h = ch;
-        if (g_cur_valid) {
-            Mat inv;
-            if (Invert(g_cur_vp, inv)) {
-                const Mat prev = g_prev_valid ? g_prev_vp : g_cur_vp;
-                const Mat to_prev = Multiply(prev, inv);
-                for (int i = 0; i < 16; ++i) {
-                    cam.view_to_clip[i] = static_cast<float>(g_cur_vp.m[i]);
-                    cam.clip_to_prev_clip[i] = static_cast<float>(to_prev.m[i]);
-                }
-                const double* r1 = &g_cur_vp.m[4];
-                const double* r2 = &g_cur_vp.m[8];
-                const double* r3 = &g_cur_vp.m[12];
-                cam.fov_y =
-                    static_cast<float>(2.0 * std::atan(Len3(r3) / std::max(Len3(r1), 1e-9)));
-                const double alpha = Dot3(r2, r3) / Dot3(r3, r3);
-                const double beta = r2[3] - alpha * r3[3];
-                const double w0 = std::fabs(alpha) > 1e-9 ? -beta / alpha : 1e30;
-                const double w1 = std::fabs(1.0 - alpha) > 1e-9 ? beta / (1.0 - alpha) : 1e30;
-                double zn = std::min(std::fabs(w0), std::fabs(w1));
-                const double zf = std::max(std::fabs(w0), std::fabs(w1));
-                if (!(zn > 1e-4)) zn = 0.1;
-                cam.z_near = static_cast<float>(zn);
-                cam.z_far = zf > 1e7 ? 0.0f : static_cast<float>(zf);
-                cam.valid = true;
-                // bb-mvstats: the camera vectors this matrix gives (render pixels towards the
-                // previous frame, as bb_mv.comp), on a 9x9 grid at a far and a mid depth: no GPU
-                // readback. A camera cut = the mean vector beyond 40% of the width (the old rule,
-                // summed matrix entries over 3, could reset on a fast turn: projection terms).
-                double mv_max = 0, mv_sum = 0;
-                u32 mv_n = 0;
-                const double hw = 0.5 * flip_w, hh = 0.5 * flip_h;
-                for (double z : {0.999, 0.9}) {
-                    for (int gy = 0; gy < 9; ++gy) {
-                        for (int gx = 0; gx < 9; ++gx) {
-                            const double x = -0.9 + 0.225 * gx, y = -0.9 + 0.225 * gy;
-                            const double* m = to_prev.m;
-                            const double px = m[0] * x + m[1] * y + m[2] * z + m[3];
-                            const double py = m[4] * x + m[5] * y + m[6] * z + m[7];
-                            const double pw = m[12] * x + m[13] * y + m[14] * z + m[15];
-                            if (!(pw > 1e-9)) continue;
-                            const double dx = (px / pw - x) * hw, dy = (py / pw - y) * hh;
-                            const double len = std::sqrt(dx * dx + dy * dy);
-                            if (!std::isfinite(len)) continue;
-                            mv_max = std::max(mv_max, len);
-                            mv_sum += len;
-                            ++mv_n;
-                        }
-                    }
-                }
-                const double mv_mean = mv_n ? mv_sum / mv_n : 0.0;
-                // Yaw: the camera's forward direction is the clip w row of the view-projection.
-                const auto yaw = [](const Mat& v) { return std::atan2(v.m[12], v.m[14]); };
-                double dyaw = 0;
-                if (g_prev_valid) {
-                    dyaw = (yaw(g_cur_vp) - yaw(g_prev_vp)) * 180.0 / 3.14159265358979;
-                    if (dyaw > 180) dyaw -= 360;
-                    if (dyaw < -180) dyaw += 360;
-                    cam.reset = mv_mean > 0.4 * flip_w;
-                }
-                // Camera centre from the view (world -> camera): C = -R^T t; its move per frame.
-                if (g_prev_valid) {
-                    double c[3], q[3];
-                    const auto centre = [](const float* v, double* out) {
-                        for (int col = 0; col < 3; ++col) {
-                            out[col] = -(v[0 + col] * v[3] + v[4 + col] * v[7] + v[8 + col] * v[11]);
-                        }
-                    };
-                    centre(g_cur_view, c);
-                    centre(g_prev_view, q);
-                    const double d = std::sqrt((c[0] - q[0]) * (c[0] - q[0]) +
-                                               (c[1] - q[1]) * (c[1] - q[1]) +
-                                               (c[2] - q[2]) * (c[2] - q[2]));
-                    if (std::isfinite(d)) {
-                        g_mvs.pos_max = std::max(g_mvs.pos_max, d);
-                        g_mvs.pos_sum += d;
-                    }
-                }
-                std::memcpy(g_prev_view, g_cur_view, sizeof(g_prev_view));
-                g_mvs.max = std::max(g_mvs.max, mv_max);
-                g_mvs.mean_sum += mv_mean;
-                g_mvs.yaw_max = std::max(g_mvs.yaw_max, std::fabs(dyaw));
-                g_mvs.yaw_sum += std::fabs(dyaw);
-                ++g_mvs.frames;
-                g_mvs.resets += cam.reset ? 1u : 0u;
-                g_mvs.no_prev += g_prev_valid ? 0u : 1u;
-                bool same = g_prev_valid;
-                for (int i = 0; i < 16 && same; ++i) same = g_prev_vp.m[i] == g_cur_vp.m[i];
-                g_mvs.same += same ? 1u : 0u;
+        g_frame_has_camera = false;
+        const BlockCam& cur = g_cam_cur;
+        const BlockCam& prev = g_cam_prev;
+        Mat inv;
+        if (cur.valid && Invert(cur.vp, inv)) {
+            const Mat to_prev = Multiply(prev.valid ? prev.vp : cur.vp, inv);
+            for (int i = 0; i < 16; ++i) {
+                cam.view_to_clip[i] = static_cast<float>(cur.vp.m[i]);
+                cam.clip_to_prev_clip[i] = static_cast<float>(to_prev.m[i]);
             }
-            g_prev_vp = g_cur_vp;
-            g_prev_valid = true;
-        } else {
-            g_prev_valid = false;
+            const double* r1 = &cur.vp.m[4];
+            const double* r2 = &cur.vp.m[8];
+            const double* r3 = &cur.vp.m[12];
+            cam.fov_y = static_cast<float>(2.0 * std::atan(Len3(r3) / std::max(Len3(r1), 1e-9)));
+            const double alpha = Dot3(r2, r3) / Dot3(r3, r3);
+            const double beta = r2[3] - alpha * r3[3];
+            const double w0 = std::fabs(alpha) > 1e-9 ? -beta / alpha : 1e30;
+            const double w1 = std::fabs(1.0 - alpha) > 1e-9 ? beta / (1.0 - alpha) : 1e30;
+            double zn = std::min(std::fabs(w0), std::fabs(w1));
+            const double zf = std::max(std::fabs(w0), std::fabs(w1));
+            if (!(zn > 1e-4)) zn = 0.1;
+            cam.z_near = static_cast<float>(zn);
+            cam.z_far = zf > 1e7 ? 0.0f : static_cast<float>(zf);
+            cam.valid = true;
+            cam.reset = !prev.valid;
         }
-        g_cur_valid = false;
-        g_cur_area = 0;
-    }
-    {
-        // bb-mvstats: once a second.
-        const auto now = std::chrono::steady_clock::now();
-        if (g_mvs.start.time_since_epoch().count() == 0) g_mvs.start = now;
-        if (now - g_mvs.start >= std::chrono::seconds(1)) {
-            const double n = g_mvs.frames ? g_mvs.frames : 1;
-            Checkpoint(fmt::format(
-                "[mv-cam] 1 s: {} frames with camera, vector px max {:.1f} mean {:.2f} (9x9 grid, "
-                "far / mid depth), yaw delta deg/frame max {:.2f} mean {:.2f}, camera move units/"
-                "frame max {:.3f} mean {:.3f}, resets {}, no previous camera {}, previous == "
-                "current {}",
-                g_mvs.frames, g_mvs.max, g_mvs.mean_sum / n, g_mvs.yaw_max, g_mvs.yaw_sum / n,
-                g_mvs.pos_max, g_mvs.pos_sum / n, g_mvs.resets, g_mvs.no_prev, g_mvs.same));
-            g_mvs = {};
-            g_mvs.start = now;
-        }
-    }
-    {
-        // bb-clean-021-fg: camera found per frame (FG and the motion vectors need it).
-        static u32 frames = 0, with_camera = 0;
-        ++frames;
-        with_camera += cam.valid ? 1 : 0;
-        if (frames == 300) {
-            Checkpoint(fmt::format("[jitter] last 300 frames: {} depth binds jittered (target "
-                                   "{}x{}), {} of them after the HUD split capture",
-                                   g_jit_draws.exchange(0), g_jit_w.load(), g_jit_h.load(),
-                                   g_jit_skipped.exchange(0)));
-            Checkpoint(fmt::format("camera: {} of 300 frames (scene blocks seen {}, taken {})",
-                                   with_camera, g_cam_seen.exchange(0), g_cam_taken.exchange(0)));
-            frames = with_camera = 0;
+        // The motion-vector camera (bb_mv.comp): previous view * inverse current view.
+        if (cur.valid && prev.valid && prev.proj[0] != 0.0f) {
+            Multiply34(prev.view, cur.inv_view, cam.reproject);
+            std::memcpy(cam.proj, cur.proj, sizeof(cam.proj));
+            std::memcpy(cam.prev_proj, prev.proj, sizeof(cam.prev_proj));
+            cam.mv_valid = true;
         }
     }
     g_scene_w = flip_w;

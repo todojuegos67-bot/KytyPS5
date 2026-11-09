@@ -264,18 +264,15 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         u32 size[4];
     } push{};
     static_assert(sizeof(push) == 112);
-    std::memcpy(push.rows, cam.clip_to_prev_clip, sizeof(push.rows));
-    push.vp_xy[0] = scene.xscale;
-    push.vp_xy[1] = scene.xoffset;
-    push.vp_xy[2] = scene.yscale;
-    push.vp_xy[3] = scene.yoffset;
-    push.vp_z[0] = scene.zscale != 0.0f ? scene.zscale : 1.0f;
-    push.vp_z[1] = scene.zoffset;
+    // bb-clean-021-bbport: Supermedo's camera (bb_mv.comp): reproject rows, projections, jitter.
+    std::memcpy(push.rows, cam.reproject, sizeof(cam.reproject));
+    std::memcpy(push.rows + 12, cam.proj, sizeof(cam.proj));
+    std::memcpy(push.vp_xy, cam.prev_proj, sizeof(cam.prev_proj));
     push.vp_z[2] = jx;
     push.vp_z[3] = jy;
     push.size[0] = in.width;
     push.size[1] = in.height;
-    push.size[2] = cam.valid && scene.xscale != 0.0f && scene.yscale != 0.0f ? 1u : 0u;
+    push.size[2] = cam.mv_valid ? 1u : 0u;
     // bit 0: sRGB decode; bit 1: the HUD split is on (full_view = the presented image with the
     // HUD, flip_view = the scene copy): pixels where they differ are HUD, which is static on
     // screen, so their motion is zero (the frame generator would otherwise move the text).

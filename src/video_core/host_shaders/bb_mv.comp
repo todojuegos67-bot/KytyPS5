@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bb-clean-021: camera motion vectors from the scene depth (one pass, static geometry only), and
 // the presented image copied into RGBA16F linear for the upscaler.
-// Each pixel's surface point, unprojected with the scene viewport and moved into the previous
-// frame's clip space (clip_to_prev = prevViewProj * inverse(viewProj)) gives render pixels towards
-// its previous position. Unjittered: the jitter the scene was drawn with is taken out first.
+// The camera vectors use the formula of Supermedo's Bloodborne port (camera_motion.comp).
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D depth_tex;
@@ -18,8 +16,8 @@ layout(push_constant) uniform Push {
     vec4 r1;
     vec4 r2;
     vec4 r3;
-    vec4 vp_xy; // xscale, xoffset, yscale, yoffset
-    vec4 vp_z;  // zscale, zoffset, jitter x, jitter y
+    vec4 vp_xy; // previous projection: x scale, y scale, z scale, z offset
+    vec4 vp_z;  // (unused), (unused), jitter x, jitter y
     uvec4 size; // width, height, camera valid, flags: bit 0 decode sRGB, bit 1 HUD mask
 } p;
 
@@ -48,22 +46,31 @@ void main() {
             return;
         }
     }
+    // bb-clean-021-bbport: Supermedo's camera_motion.comp (GPL-2.0-or-later): r0..r2 = previous
+    // view * inverse current view (3x4 rows), r3 = current projection (x, y, z scale, z offset),
+    // vp_xy = previous projection, vp_z.zw = the jitter (render pixels, x right, y down).
     vec2 mv = vec2(0.0);
     if (p.size.z != 0u) {
-        float d = texelFetch(depth_tex, c, 0).r;
-        vec2 s = vec2(c) + 0.5 - p.vp_z.zw;
-        vec4 ndc = vec4((s.x - p.vp_xy.y) / p.vp_xy.x, (s.y - p.vp_xy.w) / p.vp_xy.z,
-                        (d - p.vp_z.y) / p.vp_z.x, 1.0);
-        vec4 prev = vec4(dot(p.r0, ndc), dot(p.r1, ndc), dot(p.r2, ndc), dot(p.r3, ndc));
-        // bb-mvstats: behind the previous camera (w <= 0) or at a singular far plane: no vector
-        // (huge ones streaked the dark background on fast turns), not a wrapped one.
-        if (prev.w > 1e-6) {
-            prev.xy /= prev.w;
-            vec2 ps = vec2(prev.x * p.vp_xy.x + p.vp_xy.y, prev.y * p.vp_xy.z + p.vp_xy.w);
-            mv = ps - s;
-            if (any(isnan(mv)) || any(isinf(mv)) || dot(mv, mv) > float(p.size.x * p.size.x)) {
-                mv = vec2(0.0);
-            }
+        const vec2 size = vec2(p.size.xy);
+        const vec4 proj = p.r3;
+        const vec4 prev_proj = p.vp_xy;
+        const float depth = texelFetch(depth_tex, c, 0).r;
+        const vec2 uv = (vec2(c) + 0.5) / size;
+        const vec2 scene_uv = uv - p.vp_z.zw / size;
+        const vec2 ndc = vec2(scene_uv.x * 2.0 - 1.0, 1.0 - scene_uv.y * 2.0);
+        // Clip z = zs * z + zo, w = z; depth = zs + zo / z (zo < 0, depth < zs in front).
+        const bool sky = depth >= 1.0;
+        const float denom = min(depth - proj.z, -1e-8);
+        const float z = sky ? 1.0 : proj.w / denom;
+        // Clear depth is an infinite direction: rotated with the camera, without translation.
+        const vec4 view = vec4(ndc.x * z / proj.x, ndc.y * z / proj.y, z, sky ? 0.0 : 1.0);
+        const vec3 prev_view = vec3(dot(p.r0, view), dot(p.r1, view), dot(p.r2, view));
+        const vec2 prev_ndc =
+            vec2(prev_view.x * prev_proj.x, prev_view.y * prev_proj.y) / max(prev_view.z, 1e-4);
+        const vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+        mv = (prev_uv - scene_uv) * size;
+        if (any(isnan(mv)) || any(isinf(mv))) {
+            mv = vec2(0.0);
         }
     }
     imageStore(mv_out, c, vec4(mv, 0.0, 0.0));

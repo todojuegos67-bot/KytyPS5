@@ -68,6 +68,12 @@ struct Camera {
     float view_to_clip[16]{};
     float fov_y = 1.0f, z_near = 0.1f, z_far = 1000.0f;
     bool reset = false;
+    // bb-clean-021-bbport (Supermedo's camera_motion.comp): previous view * inverse current view
+    // (3x4 rows), current and previous projection (x scale, y scale, z scale, z offset).
+    bool mv_valid = false;
+    float reproject[12]{};
+    float proj[4]{};
+    float prev_proj[4]{};
 };
 // At the flip: the frame's camera (and the motion to the previous one); starts the next frame.
 Camera EndFrame(u32 flip_w, u32 flip_h);
