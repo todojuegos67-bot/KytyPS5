@@ -11,6 +11,8 @@ layout(binding = 0) uniform sampler2D depth_tex;
 layout(binding = 1, rg16f) uniform writeonly image2D mv_out;
 layout(binding = 2) uniform sampler2D color_tex;
 layout(binding = 3, rgba16f) uniform writeonly image2D color_out;
+// bb-hudmv: the presented image with the HUD (the scene copy is color_tex when the HUD split is on).
+layout(binding = 4) uniform sampler2D full_tex;
 layout(push_constant) uniform Push {
     vec4 r0;
     vec4 r1;
@@ -18,7 +20,7 @@ layout(push_constant) uniform Push {
     vec4 r3;
     vec4 vp_xy; // xscale, xoffset, yscale, yoffset
     vec4 vp_z;  // zscale, zoffset, jitter x, jitter y
-    uvec4 size; // width, height, camera valid, decode sRGB
+    uvec4 size; // width, height, camera valid, flags: bit 0 decode sRGB, bit 1 HUD mask
 } p;
 
 vec3 SrgbToLinear(vec3 c) {
@@ -31,11 +33,28 @@ void main() {
         return;
     }
     vec3 col = texelFetch(color_tex, c, 0).rgb;
-    if (p.size.w != 0u) {
+    if ((p.size.w & 1u) != 0u) {
         col = SrgbToLinear(clamp(col, 0.0, 1.0));
     }
     imageStore(color_out, c, vec4(col, 1.0));
 
+    // HUD (bb-hudmv): the presented image differs from the scene copy at a 3x3 neighbourhood of
+    // this pixel. The HUD is fixed on screen: zero motion (no camera vector from the scene depth
+    // behind the text, which made the frame generator move the letters).
+    if ((p.size.w & 2u) != 0u) {
+        bool hud = false;
+        for (int dy = -1; dy <= 1 && !hud; ++dy) {
+            for (int dx = -1; dx <= 1 && !hud; ++dx) {
+                ivec2 q = clamp(c + ivec2(dx, dy), ivec2(0), ivec2(int(p.size.x) - 1, int(p.size.y) - 1));
+                vec3 dif = abs(texelFetch(full_tex, q, 0).rgb - texelFetch(color_tex, q, 0).rgb);
+                hud = max(dif.r, max(dif.g, dif.b)) > 0.02;
+            }
+        }
+        if (hud) {
+            imageStore(mv_out, c, vec4(0.0, 0.0, 0.0, 0.0));
+            return;
+        }
+    }
     vec2 mv = vec2(0.0);
     if (p.size.z != 0u) {
         float d = texelFetch(depth_tex, c, 0).r;

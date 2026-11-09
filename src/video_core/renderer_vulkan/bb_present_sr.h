@@ -34,6 +34,7 @@ public:
     // stock). `cmd` must be outside a render pass.
     vk::ImageView Run(vk::CommandBuffer cmd, VideoCore::TextureCache& texture_cache,
                       Vulkan::Runtime& runtime, VideoCore::Image& flip, vk::ImageView flip_view,
+                      vk::ImageView full_view,
                       vk::Extent2D in, vk::Extent2D out, SceneDepth& depth, bool srgb_decode,
                       BB::FG::Inputs* fg = nullptr);
 

@@ -55,11 +55,12 @@ bool PresentSr::Init() {
     auto [sr, s] = device.createSampler(sci);
     if (sr != vk::Result::eSuccess) return false;
     sampler = s;
-    const std::array<vk::DescriptorSetLayoutBinding, 4> bindings{{
+    const std::array<vk::DescriptorSetLayoutBinding, 5> bindings{{
         {0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
         {1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
         {2, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
         {3, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+        {4, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
     }};
     auto [lr, l] = device.createDescriptorSetLayout({
         .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
@@ -211,7 +212,8 @@ bool PresentSr::Poll(double& gpu_ms, double& sr_ms, double& mv_ms) {
 
 vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& texture_cache,
                              Vulkan::Runtime& runtime, VideoCore::Image& flip,
-                             vk::ImageView flip_view, vk::Extent2D in, vk::Extent2D out,
+                             vk::ImageView flip_view, vk::ImageView full_view, vk::Extent2D in,
+                             vk::Extent2D out,
                              SceneDepth& scene, bool srgb_decode, BB::FG::Inputs* fg) {
     // The jitter this frame was drawn with, then the frame's camera (and the next jitter).
     float jx = 0, jy = 0;
@@ -274,13 +276,35 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     push.size[0] = in.width;
     push.size[1] = in.height;
     push.size[2] = cam.valid && scene.xscale != 0.0f && scene.yscale != 0.0f ? 1u : 0u;
-    push.size[3] = srgb_decode ? 1u : 0u;
+    // bit 0: sRGB decode; bit 1: the HUD split is on (full_view = the presented image with the
+    // HUD, flip_view = the scene copy): pixels where they differ are HUD, which is static on
+    // screen, so their motion is zero (the frame generator would otherwise move the text).
+    const bool hud_mask = full_view != flip_view;
+    {
+        // bb-hudmv: one line per 300 frames (no readback): how many frames had the HUD split.
+        static u32 frames = 0, split = 0;
+        static const bool said = [] {
+            BB::Upscale::Checkpoint("[hudmv] HUD vectors zero: pixels where the presented image "
+                                    "differs from the scene copy (HUD split frames only)");
+            return true;
+        }();
+        (void)said;
+        ++frames;
+        split += hud_mask ? 1u : 0u;
+        if (frames == 300) {
+            BB::Upscale::Checkpoint(fmt::format("[hudmv] HUD split on {} of 300 frames", split));
+            frames = split = 0;
+        }
+    }
+    push.size[3] = (srgb_decode ? 1u : 0u) | (hud_mask ? 2u : 0u);
     const vk::DescriptorImageInfo depth_info{sampler, depth_view,
                                              vk::ImageLayout::eDepthStencilReadOnlyOptimal};
     const vk::DescriptorImageInfo mv_info{{}, motion.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo src_info{sampler, flip_view,
                                            vk::ImageLayout::eShaderReadOnlyOptimal};
     const vk::DescriptorImageInfo col_info{{}, color.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo full_info{sampler, full_view,
+                                            vk::ImageLayout::eShaderReadOnlyOptimal};
     const std::array writes{
         vk::WriteDescriptorSet{.dstBinding = 0,
                                .descriptorCount = 1,
@@ -298,6 +322,10 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                                .descriptorCount = 1,
                                .descriptorType = vk::DescriptorType::eStorageImage,
                                .pImageInfo = &col_info},
+        vk::WriteDescriptorSet{.dstBinding = 4,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &full_info},
     };
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
