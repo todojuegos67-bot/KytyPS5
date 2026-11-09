@@ -1162,10 +1162,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                              image.info.size.height == BB::Upscale::g_scene_h;
             // bb-hudjitter: no jitter once the HUD started (the HUD split captured the scene):
             // a HUD draw with the depth test on would otherwise shake by the jitter (letters).
+            // (Not applied: the HUD split state can still be set from the previous frame while
+            // this frame's scene draws, which turned off all jitter and the scene depth. Only
+            // counted, to see whether HUD draws get the jitter.)
             const bool after_hud = bb_jitter_draw && bb_hud.Captured();
-            BB::Upscale::NoteJitterDraw(bb_jitter_draw && !after_hud, after_hud,
-                                        image.info.size.width, image.info.size.height);
-            if (after_hud) bb_jitter_draw = false;
+            BB::Upscale::NoteJitterDraw(bb_jitter_draw, after_hud, image.info.size.width,
+                                        image.info.size.height);
             if (bb_jitter_draw && regs.depth_control.depth_write_enable) {
                 const auto& vp = regs.viewports[0];
                 const auto& vp_ctl = regs.viewport_control;

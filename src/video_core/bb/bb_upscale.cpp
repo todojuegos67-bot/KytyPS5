@@ -725,21 +725,15 @@ void OnConstants(const u32* data, size_t count) {
 // The frame's camera from the candidates: drawn at the scene size (else the largest area), the
 // most draws among those, the first one on a tie. Called with g_cam_mutex held.
 void PickCamera(u32 scene_w, u32 scene_h, u32& w, u32& h) {
+    // Back to the 1.59 rule (the first block of the largest render size this frame): the
+    // "scene size, most draws" pick of 31ba59e took a block that does not change with the
+    // camera ([mv-cam] previous == current on every frame: zero camera vectors).
+    (void)scene_w;
+    (void)scene_h;
     const CamCandidate* best = nullptr;
-    bool best_match = false;
     for (u32 i = 0; i < g_cand_n; ++i) {
         const CamCandidate& c = g_cands[i];
-        const bool match = c.w == scene_w && c.h == scene_h;
-        if (best == nullptr || (match && !best_match)) {
-            best = &c;
-            best_match = match;
-            continue;
-        }
-        if (match != best_match) continue;
-        const u64 a = u64(c.w) * c.h, b = u64(best->w) * best->h;
-        if (match ? c.count > best->count : (a > b || (a == b && c.count > best->count))) {
-            best = &c;
-        }
+        if (best == nullptr || u64(c.w) * c.h > u64(best->w) * best->h) best = &c;
     }
     if (best != nullptr) {
         g_cur_vp = best->vp;
@@ -888,7 +882,7 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
         with_camera += cam.valid ? 1 : 0;
         if (frames == 300) {
             Checkpoint(fmt::format("[jitter] last 300 frames: {} depth binds jittered (target "
-                                   "{}x{}), {} after the HUD start left unjittered",
+                                   "{}x{}), {} of them after the HUD split capture",
                                    g_jit_draws.exchange(0), g_jit_w.load(), g_jit_h.load(),
                                    g_jit_skipped.exchange(0)));
             Checkpoint(fmt::format("camera: {} of 300 frames (scene blocks seen {}, taken {})",
