@@ -29,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <csetjmp>
@@ -779,8 +780,44 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
     rasterizer->bb_hud.EndFrame(image.info.guest_address);
 
+    // bb-clean-021-scene: a frame the upscaler did not take (title screen, menus, loading: no
+    // scene depth) is still drawn at the resolution patch's reduced size; it is scaled to the
+    // window with FSR 1 EASU + RCAS instead of the bilinear stretch (BB_MENU_SHARP=0: as before).
+    // One extra pass only on those frames, in the presenter: nothing on the GPU command thread.
+    auto bb_fsr = fsr_settings;
+    {
+        static const bool menu_sharp = [] {
+            const char* v = std::getenv("BB_MENU_SHARP");
+            const bool on = v == nullptr || v[0] != '0';
+            BB::Upscale::Checkpoint(on ? "[menu-sharp] on: frames without the 3D scene (title, "
+                                         "menus) scaled with FSR 1 EASU + RCAS"
+                                       : "[menu-sharp] off (BB_MENU_SHARP=0)");
+            return on;
+        }();
+        static u32 sec_frames = 0, sec_sharp = 0;
+        static auto sec_start = std::chrono::steady_clock::now();
+        const bool sharp = menu_sharp && BB::Upscale::Enabled() && !bb_upscaled &&
+                           (image_size.width < frame->width || image_size.height < frame->height);
+        if (sharp) {
+            bb_fsr.enable = true;
+            bb_fsr.use_rcas = true;
+            if (!fsr_settings.enable) bb_fsr.rcas_attenuation = 0.25f;
+            ++sec_sharp;
+        }
+        ++sec_frames;
+        const auto now = std::chrono::steady_clock::now();
+        if (menu_sharp && BB::Upscale::Enabled() && now - sec_start >= std::chrono::seconds(5)) {
+            BB::Upscale::Checkpoint(fmt::format(
+                "[menu-sharp] last 5 s: {} of {} frames without the 3D scene scaled with FSR 1 "
+                "({}x{} -> {}x{})",
+                sec_sharp, sec_frames, image_size.width, image_size.height, frame->width,
+                frame->height));
+            sec_frames = sec_sharp = 0;
+            sec_start = now;
+        }
+    }
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
+                                 bb_fsr, frame->is_hdr);
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
