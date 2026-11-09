@@ -1831,11 +1831,13 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		// (Also a movie playing, and with frame generation a frame without the game's camera: the PlayStation Studios
 		// logo at the start ran at 103-120 fps above 60 Hz, 10-18; the game draws something with its TAA behind it.)
 		NoteFrameForWorld(Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying());
-		scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MovieCapHeld() || CinematicPlaying() || !PlayerInputSeen() ||
+		scene_free = !Graphics::Presenter::IsSceneFrame(*r.frame) || MovieCapHeld() || CinematicPlaying() || CutsceneHeld() || !PlayerInputSeen() ||
 		             (Graphics::Presenter::GeneratesFrames() && !Graphics::Presenter::IsGameView(*r.frame));
 		// Before the first world and during movies frame generation is off for certain: 60, not the mode's base rate
 		// (Smooth 120 held the intro to 40, 10-18). In the world the floors as they were (no new pacing there).
-		fg_off = MoviePlaying() || !PlayerInputSeen();
+		// CutsceneHeld too: the intro the title replays after idling reads no files (cached), so CinematicPlaying never
+		// comes on; it ran uncapped at ~110 fps (too fast) with FSR 3 generating, then the GPU hung (log 20261109-013819).
+		fg_off = MoviePlaying() || CutsceneHeld() || !PlayerInputSeen();
 		if (scene_free) floor = std::max(floor, SceneFreeFloor());
 		floor = std::max(floor, Unlock30Floor());
 		if (!fg_off) {
