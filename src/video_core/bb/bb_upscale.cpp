@@ -559,6 +559,8 @@ bool RunBackend(const SR::Desc& desc) {
 // Bloodborne's scene constant block (864 bytes; 1.59 BlockCamera): [0] far plane 3000,
 // [1] 1 / far, [4] [5] the render size, floats 8-19 the view (3x4 row-major), 52-67 the
 // projection (4x4 row-major). The largest pass's block of the frame is its camera.
+std::atomic<u32> g_cam_seen{0}, g_cam_taken{0};
+
 void OnConstants(const u32* data, size_t count) {
     if (count < 216) {
         return;
@@ -567,6 +569,7 @@ void OnConstants(const u32* data, size_t count) {
     if (d[0] != 3000.0f) {
         return; // (the one test every other upload pays)
     }
+    g_cam_seen.fetch_add(1, std::memory_order_relaxed);
     if (std::fabs(d[1] * d[0] - 1.0f) > 1e-3f || !(d[4] >= 64.0f) || !(d[5] >= 64.0f) ||
         d[4] > 16384.0f || d[5] > 16384.0f) {
         return;
@@ -585,6 +588,7 @@ void OnConstants(const u32* data, size_t count) {
         return;
     }
     g_cur_vp = vp;
+    g_cam_taken.fetch_add(1, std::memory_order_relaxed);
     g_cur_area = area;
     g_cur_valid = true;
 }
@@ -636,6 +640,17 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
         }
         g_cur_valid = false;
         g_cur_area = 0;
+    }
+    {
+        // bb-clean-021-fg: camera found per frame (FG and the motion vectors need it).
+        static u32 frames = 0, with_camera = 0;
+        ++frames;
+        with_camera += cam.valid ? 1 : 0;
+        if (frames == 300) {
+            Checkpoint(fmt::format("camera: {} of 300 frames (scene blocks seen {}, taken {})",
+                                   with_camera, g_cam_seen.exchange(0), g_cam_taken.exchange(0)));
+            frames = with_camera = 0;
+        }
     }
     g_scene_w = flip_w;
     g_scene_h = flip_h;
