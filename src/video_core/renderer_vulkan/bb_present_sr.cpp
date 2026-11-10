@@ -290,6 +290,15 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     std::memcpy(push.rows, cam.reproject, sizeof(cam.reproject));
     std::memcpy(push.rows + 12, cam.proj, sizeof(cam.proj));
     std::memcpy(push.vp_xy, cam.prev_proj, sizeof(cam.prev_proj));
+    {
+        // bb-reactive: BB_MV_SCALE multiplies the camera vectors (A/B against [mv-check]).
+        static const float mv_scale = [] {
+            const char* v = std::getenv("BB_MV_SCALE");
+            const float f = v != nullptr ? static_cast<float>(std::atof(v)) : 1.0f;
+            return std::isfinite(f) && f != 0.0f ? f : 1.0f;
+        }();
+        push.vp_z[0] = mv_scale;
+    }
     push.vp_z[2] = jx;
     push.vp_z[3] = jy;
     push.size[0] = in.width;
@@ -798,8 +807,9 @@ void PresentSr::ReactiveStats(vk::Extent2D in) {
         }
         BB::Upscale::Checkpoint(fmt::format(
             "[mv-check] 1 s: err vectors {:.4f}, zero {:.4f}, negated {:.4f} (x0.25 {:.4f}, x0.5 "
-            "{:.4f}, x2 {:.4f}, x4 {:.4f}), scale best {} over {} moving px{}",
+            "{:.4f}, x2 {:.4f}, x4 {:.4f}), scale best {} over {} moving px (DLSS 5 {}){}",
             e[0], e[1], e[2], e[5], e[3], e[4], e[6], scales[best], rs_mvn,
+            BB::Dlss5::Wanted() ? "on" : "off",
             best == 0 ? "" : "  <- VECTORS NOT BEST"));
     } else {
         BB::Upscale::Checkpoint("[mv-check] 1 s: no pixel moved by the camera (or self motion off)");
