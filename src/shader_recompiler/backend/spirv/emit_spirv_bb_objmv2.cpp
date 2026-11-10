@@ -72,6 +72,23 @@ Id EmitContext::ObjMvPrevLoad(u32 handle, Id index, Id current, Id type) {
     return OpSelect(type, use, prev, current);
 }
 
+// Main, first block: the previous-frame function only when push flags bit 0 is set (a uniform
+// branch: static draws skip the second vertex run).
+void EmitBBObjMvPrevCall(EmitContext& ctx) {
+    ctx.OpStore(ctx.objmv_prev_pos, ctx.ConstantNull(ctx.F32[4]));
+    const Id flags = PushU32(ctx, PushData::ObjMvFlagsIndex);
+    const Id has = ctx.OpINotEqual(ctx.U1[1], ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.u32_one_value),
+                                   ctx.u32_zero_value);
+    const Id call_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(has, call_label, merge_label);
+    ctx.AddLabel(call_label);
+    ctx.OpFunctionCall(ctx.void_id, ctx.objmv_prev_func);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 // Main, at the epilogue (before the host clip-space conversions): both clip positions out.
 void EmitBBObjMvVertex(EmitContext& ctx) {
     if (!Sirit::ValidId(ctx.objmv_out_cur) || ctx.objmv_prev_mode) {
@@ -118,8 +135,12 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
     const Id bad = ctx.OpLogicalOr(
         b, ctx.OpLogicalOr(b, ctx.OpIsNan(b, dx), ctx.OpIsInf(b, dx)),
         ctx.OpLogicalOr(b, ctx.OpIsNan(b, dy), ctx.OpIsInf(b, dy)));
+    // Larger than 256 render pixels in a frame: a wrong match (camera cut, other instance).
+    const Id limit = ctx.Constant(f32, 256.0f);
+    const Id sane = ctx.OpLogicalAnd(b, ctx.OpFOrdLessThan(b, ctx.OpFAbs(f32, dx), limit),
+                                     ctx.OpFOrdLessThan(b, ctx.OpFAbs(f32, dy), limit));
     const Id written = ctx.OpLogicalAnd(
-        b, ctx.OpLogicalAnd(b, front, ctx.OpLogicalNot(b, bad)),
+        b, ctx.OpLogicalAnd(b, ctx.OpLogicalAnd(b, front, ctx.OpLogicalNot(b, bad)), sane),
         ctx.OpFOrdGreaterThan(b, ctx.OpCompositeExtract(f32, previous, 2u), ctx.Constant(f32, 0.5f)));
     // Attachment 7 is RGBA16F: (dx, dy, class, weight). Opaque draws: weight 1 (written over
     // whatever was behind, class 0 where no vector: the camera vector stays). Blended draws
@@ -127,7 +148,12 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
     // the vector behind is alpha-weighted with theirs; no vector -> weight 0 (nothing changes).
     const Id zero = ctx.Constant(f32, 0.0f);
     const Id one = ctx.Constant(f32, 1.0f);
-    Id cls = ctx.Constant(f32, 1.0f);
+    // Class 1: moving opaque draw; 2: static draw run only for the check (flags bit 1, never
+    // replaces the camera vector); 3: blended.
+    const Id flags = PushU32(ctx, PushData::ObjMvFlagsIndex);
+    const Id diag = ctx.OpINotEqual(b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(2u)),
+                                    ctx.u32_zero_value);
+    Id cls = ctx.OpSelect(f32, diag, ctx.Constant(f32, 2.0f), one);
     Id weight = one;
     if (ctx.runtime_info.hw.fs.bb_objmv_blend) {
         cls = ctx.Constant(f32, 3.0f);

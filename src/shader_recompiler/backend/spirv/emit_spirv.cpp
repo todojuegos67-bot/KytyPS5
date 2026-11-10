@@ -152,6 +152,8 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+void EmitBBObjMvPrevCall(EmitContext& ctx);
+
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
@@ -165,8 +167,9 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             ctx.AddLabel(label);
             if (Sirit::ValidId(ctx.objmv_prev_func) && !ctx.objmv_prev_mode &&
                 !ctx.objmv_prev_called) {
-                // BB objmv2: last frame's clip position first (emit_spirv_bb_objmv2.cpp).
-                ctx.OpFunctionCall(ctx.void_id, ctx.objmv_prev_func);
+                // BB objmv2: last frame's clip position first (emit_spirv_bb_objmv2.cpp), only
+                // for the draws the host flagged (skinned / blended, or the static-draw check).
+                EmitBBObjMvPrevCall(ctx);
                 ctx.objmv_prev_called = true;
             }
             for (IR::Inst& inst : node.data.block->Instructions()) {

@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include <vk_mem_alloc.h>
+#include <xxhash.h>
 
 namespace BB::ObjMv2 {
 
@@ -35,7 +36,9 @@ constexpr u64 kArenaBytes = 24ull << 20;        // snapshots a frame
 constexpr u64 kTableBytes = 2ull << 20;         // table entries a frame
 constexpr u64 kHeaderBytes = 4096;              // zero entry + dummy dword
 constexpr u32 kMaxSnapBytes = 64u << 10;        // larger buffers: read the current one
-constexpr u32 kStatWords = 8;
+constexpr u32 kStatWords = 12;
+constexpr u64 kStatPeriod = 60;                 // statistics / check frame: 1 in 60
+constexpr u32 kStaticSample = 4;                // check frames: 1 static draw in 4 checked
 
 enum Cat : u32 { CatSkinned = 0, CatSmallSkel, CatRigid, CatBlend, CatCount };
 constexpr const char* kCatName[CatCount] = {"skinned(characters+enemies)",
@@ -45,6 +48,8 @@ constexpr const char* kCatName[CatCount] = {"skinned(characters+enemies)",
 struct SnapBuf {
     u64 addr;    // device address of the snapshot (0: none)
     u32 dwords;
+    u32 bytes;   // guest size (0: not hashed)
+    u64 hash;    // content hash (moving-draw test)
 };
 
 struct Rec {
@@ -103,8 +108,16 @@ struct State {
     double sec_cpu_ns = 0;
     u64 sec_px_obj = 0, sec_px_blend = 0, sec_px_all = 0, sec_chk = 0, sec_eo = 0, sec_ec = 0,
         sec_wo = 0, sec_wc = 0;
-    double sec_gpu_ms = 0;
-    u32 sec_gpu_n = 0;
+    double sec_gpu_ms = 0, sec_gpu_stat_ms = 0;
+    u32 sec_gpu_n = 0, sec_gpu_stat_n = 0;
+    u64 sec_static_px = 0, sec_static_abs = 0, sec_static_zero = 0, sec_diag_draws = 0,
+        sec_skipped = 0;
+    // Mode: the snapshots hold no camera (static draws give ~0): add the camera vector.
+    bool additive = true;
+    bool stat_frame = false;   // this frame: statistics + check
+    u64 color_stored = ~0ull;  // frame whose colour is in prev[0]
+    u32 frame_vec_draws = 0, static_seen = 0;
+    std::array<bool, kSlots> slot_stat{};
     double ts_period = 1.0;
 } g;
 
@@ -236,12 +249,21 @@ void ReadStats(u32 slot) {
     g.sec_ec += s[5];
     g.sec_wo += s[6];
     g.sec_wc += s[7];
+    g.sec_static_px += s[8];
+    g.sec_static_abs += s[9];
+    g.sec_static_zero += s[10];
     std::array<u64, 2> ts{};
     const auto r = g.device.getQueryPoolResults(g.queries, slot * 2, 2, sizeof(ts), ts.data(),
                                                 sizeof(u64), vk::QueryResultFlagBits::e64);
     if (r == vk::Result::eSuccess && ts[1] >= ts[0]) {
-        g.sec_gpu_ms += double(ts[1] - ts[0]) * g.ts_period * 1e-6;
-        ++g.sec_gpu_n;
+        const double ms = double(ts[1] - ts[0]) * g.ts_period * 1e-6;
+        if (g.slot_stat[slot]) {
+            g.sec_gpu_stat_ms += ms;
+            ++g.sec_gpu_stat_n;
+        } else {
+            g.sec_gpu_ms += ms;
+            ++g.sec_gpu_n;
+        }
     }
 }
 
@@ -403,9 +425,7 @@ Kind Want(const AmdGpu::Regs& regs) {
     if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) return Kind::None;
     if (!regs.depth_buffer.DepthValid() || regs.depth_buffer.NumSamples() != 1) return Kind::None;
     if (regs.depth_buffer.DepthAddress() != g.scene_depth) return Kind::None;
-    if (!regs.depth_control.depth_enable) return Kind::None;
     if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal) return Kind::None;
-    if (regs.IsClipDisabled()) return Kind::None;
     u32 bound = 0;
     for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
         if (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) {
@@ -413,12 +433,15 @@ Kind Want(const AmdGpu::Regs& regs) {
             ++bound;
         }
     }
-    if (bound == 0 || !regs.color_buffers[0] || !regs.color_target_mask.GetMask(0)) {
-        return Kind::None;
+    if (bound == 0) return Kind::None;
+    // Other draws of the scene pass: attachment 7 kept bound, not written (no pass restart).
+    if (!regs.depth_control.depth_enable || regs.IsClipDisabled() || !regs.color_buffers[0] ||
+        !regs.color_target_mask.GetMask(0)) {
+        return Kind::Mask;
     }
     const auto& bc = regs.blend_control[0];
     if (!bc.enable) {
-        return regs.depth_control.depth_write_enable ? Kind::Opaque : Kind::None;
+        return regs.depth_control.depth_write_enable ? Kind::Opaque : Kind::Mask;
     }
     // Alpha-blended (particles, effects) only: additive / multiplicative passes (lights, glow)
     // have no surface of their own.
@@ -426,7 +449,7 @@ Kind Want(const AmdGpu::Regs& regs) {
     if (bc.color_src_factor == F::SrcAlpha && bc.color_dst_factor == F::OneMinusSrcAlpha) {
         return Kind::Blend;
     }
-    return Kind::None;
+    return Kind::Mask;
 }
 
 void FillKey(Kind kind, u32& mrt_mask, u32& num_color_attachments, Shader::PsColorBuffer& cb7,
@@ -437,11 +460,15 @@ void FillKey(Kind kind, u32& mrt_mask, u32& num_color_attachments, Shader::PsCol
     cb7.data_format = AmdGpu::DataFormat::Format16_16_16_16;
     cb7.num_format = AmdGpu::NumberFormat::Float;
     cb7.swizzle = AmdGpu::IdentityMapping;
+    auto& bc = *static_cast<AmdGpu::BlendControl*>(blend7);
+    std::memset(&bc, 0, sizeof(bc));
+    if (kind == Kind::Mask) {
+        write_mask7 = vk::ColorComponentFlags{};
+        return;
+    }
     write_mask7 = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                   vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
     cb_shader_mask_raw |= 0xFu << (Attachment * 4);
-    auto& bc = *static_cast<AmdGpu::BlendControl*>(blend7);
-    std::memset(&bc, 0, sizeof(bc));
     if (kind == Kind::Blend) {
         using F = AmdGpu::BlendControl::BlendFactor;
         bc.enable = 1;
@@ -504,7 +531,7 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     const u64 arena_off = SlotArenaOffset(g.slot);
     for (u32 hnd = 0; hnd < n; ++hnd) {
         const auto& desc = vs.buffers[hnd];
-        SnapBuf sb{0, 0};
+        SnapBuf sb{0, 0, 0, 0};
         const void* src = nullptr;
         u64 size = 0, key = 0;
         if (desc.IsSpecial()) {
@@ -531,6 +558,11 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
                 std::memcpy(g.mapped + arena_off + g.arena_used, src, size);
                 sb.addr = g.base_addr + arena_off + g.arena_used;
                 sb.dwords = u32(size / 4);
+                // Bone palettes / transforms (3x4 matrices): hashed for the moving-draw test.
+                if (!desc.IsSpecial() && size >= 96 && size % 48 == 0) {
+                    sb.bytes = u32(size);
+                    sb.hash = XXH3_64bits(src, size);
+                }
                 g.arena_used += bytes;
                 if (key != 0) g.dedupe.emplace(key, sb);
                 if (!desc.IsSpecial()) largest = std::max<u32>(largest, u32(size));
@@ -549,15 +581,27 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     else if (largest >= 96 && largest < 640 && largest % 48 == 0) cat = CatSmallSkel;
     ++g.sec_cat[cat];
 
-    // Last frame's snapshots of the same draw.
+    // Last frame's snapshots of the same draw. Only moving draws (a bone palette / transform
+    // changed since last frame, or blended) run the vertex shader twice; static draws keep the
+    // camera vector, except a sample of them on check frames (class 2: compared, never used).
     if (g.history) {
         if (const auto it = g.map_prev.find(k); it != g.map_prev.end() && it->second.count == n) {
+            bool moving = blend;
+            bool any = false;
+            for (u32 hnd = 0; hnd < n; ++hnd) {
+                const SnapBuf& pb = g.bufs_prev[it->second.first + hnd];
+                const SnapBuf& cb = g.bufs_cur[first + hnd];
+                any |= pb.addr != 0 && pb.dwords != 0;
+                if (cb.bytes != 0 && (pb.bytes != cb.bytes || pb.hash != cb.hash)) {
+                    moving = true;
+                }
+            }
+            const bool diag = !moving && g.stat_frame && (g.static_seen++ % kStaticSample) == 0;
             const u64 bytes = u64(n) * 16;
-            if (n > 0 && g.table_used + bytes <= kTableBytes) {
+            if (any && (moving || diag) && g.table_used + bytes <= kTableBytes) {
                 const u64 off = SlotTableOffset(g.slot) + g.table_used;
                 u32* e = reinterpret_cast<u32*>(g.mapped + off);
                 const u64 dummy = g.base_addr + 2048;
-                bool any = false;
                 for (u32 hnd = 0; hnd < n; ++hnd) {
                     const SnapBuf& pb = g.bufs_prev[it->second.first + hnd];
                     const bool use = pb.addr != 0 && pb.dwords != 0;
@@ -566,17 +610,19 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
                     e[hnd * 4 + 1] = u32(a >> 32);
                     e[hnd * 4 + 2] = use ? pb.dwords : 1u;
                     e[hnd * 4 + 3] = use ? 1u : 0u;
-                    any |= use;
                 }
                 g.table_used += bytes;
                 const u64 ea = g.base_addr + off;
                 push.objmv_entry = {u32(ea), u32(ea >> 32)};
-                if (any) {
-                    push.objmv_flags = 1;
+                push.objmv_flags = diag ? 3u : 1u;
+                if (diag) {
+                    ++g.sec_diag_draws;
+                } else {
                     ++g.sec_vec_draws;
                     ++g.sec_cat_vec[cat];
+                    ++g.frame_vec_draws;
                 }
-            } else if (n > 0) {
+            } else if (any && (moving || diag)) {
                 ++g.sec_overflow;
             }
         }
@@ -592,6 +638,17 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     g.composed = true;
     const u32 slot = g.slot;
     ReadStats(slot);
+    const bool stat = g.stat_frame;
+    const bool store_color = g.check && color_view && (g.frame % kStatPeriod) == kStatPeriod - 1;
+    if (!stat && !store_color && (g.frame_vec_draws == 0 || reset)) {
+        // Nothing moving drew this frame: the camera vectors stay as they are.
+        ++g.sec_skipped;
+        if (reset) {
+            ++g.sec_resets;
+            g.reset_pending = true;
+        }
+        return;
+    }
     if (reset) {
         ++g.sec_resets;
         g.reset_pending = true; // next frame: no history (camera cut)
@@ -618,15 +675,15 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
         .image = g.image,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
-    const u32 next = g.prev_cur ^ 1u;
+    const u32 next = 0; // single previous-colour image (written the frame before a check)
     const vk::ImageMemoryBarrier2 prev_barriers[2] = {
         {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
          .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
          .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
          .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
-         .oldLayout = g.prev_valid ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+         .oldLayout = vk::ImageLayout::eGeneral,
          .newLayout = vk::ImageLayout::eGeneral,
-         .image = g.prev[g.prev_cur],
+         .image = g.prev[1],
          .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
         {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
          .srcAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
@@ -637,18 +694,20 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
          .image = g.prev[next],
          .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
     };
-    const vk::ImageMemoryBarrier2 images[3] = {obj_ready, prev_barriers[0], prev_barriers[1]};
+    // prev[1] is unused (bound as a dummy sampled image): only prev[0] needs a layout.
+    const bool prev_ready = g.prev_valid;
+    const vk::ImageMemoryBarrier2 images[2] = {obj_ready, prev_barriers[1]};
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
                                             .pMemoryBarriers = &fill_done,
-                                            .imageMemoryBarrierCount = 3,
+                                            .imageMemoryBarrierCount =
+                                                (store_color || !prev_ready) ? 2u : 1u,
                                             .pImageMemoryBarriers = images});
-    cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, g.queries, slot * 2);
+    cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, g.queries, slot * 2);
     const vk::DescriptorImageInfo obj_info{g.sampler, g.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo mv_info{{}, mv_view, vk::ImageLayout::eGeneral};
     const vk::DescriptorBufferInfo stats_info{g.stats, slot * kStatWords * 4, kStatWords * 4};
     const vk::DescriptorImageInfo cur_info{g.sampler, color_view, vk::ImageLayout::eGeneral};
-    const vk::DescriptorImageInfo prev_info{g.sampler, g.prev_view[g.prev_cur],
-                                            vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo prev_info{g.sampler, g.prev_view[0], vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo next_info{{}, g.prev_view[next], vk::ImageLayout::eGeneral};
     const auto w = [](u32 b, vk::DescriptorType t, const vk::DescriptorImageInfo* i,
                       const vk::DescriptorBufferInfo* bi) {
@@ -666,14 +725,16 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
         w(4, vk::DescriptorType::eCombinedImageSampler, &prev_info, nullptr),
         w(5, vk::DescriptorType::eStorageImage, &next_info, nullptr),
     };
-    const bool check = g.check && g.prev_valid && !reset && color_view;
+    const bool check = stat && g.check && color_view && !reset && g.prev_valid &&
+                       g.color_stored + 1 == g.frame;
     const std::array<u32, 4> push{render.width, render.height, reset ? 0u : 1u,
-                                  (check ? 1u : 0u) | (g.check && color_view ? 2u : 0u)};
+                                  (stat ? 1u : 0u) | (g.additive ? 2u : 0u) |
+                                      (store_color ? 4u : 0u) | (check ? 8u : 0u)};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
-    cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, g.queries, slot * 2 + 1);
+    cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, g.queries, slot * 2 + 1);
     const vk::MemoryBarrier2 done{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
@@ -682,8 +743,9 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     };
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &done});
     g.slot_used[slot] = true;
-    if (g.check && color_view) {
-        g.prev_cur = next;
+    g.slot_stat[slot] = stat;
+    if (store_color) {
+        g.color_stored = g.frame;
         g.prev_valid = true;
     }
 }
@@ -712,6 +774,9 @@ void OnFlip() {
     g.dedupe.clear();
     g.cleared = false;
     g.composed = false;
+    g.frame_vec_draws = 0;
+    g.static_seen = 0;
+    g.stat_frame = (g.frame % kStatPeriod) == 0;
     g.slot = (g.slot + 1) % kSlots;
     g.arena_used = 0;
     g.table_used = 0;
@@ -728,16 +793,33 @@ void OnFlip() {
     }
     const double eo = g.sec_chk ? double(g.sec_eo) / 1024.0 / double(g.sec_chk) : 0.0;
     const double ec = g.sec_chk ? double(g.sec_ec) / 1024.0 / double(g.sec_chk) : 0.0;
+    // Static draws: |obj - cam| (absolute mode) and |obj| (additive mode), render pixels.
+    const double st_abs =
+        g.sec_static_px ? double(g.sec_static_abs) / 16.0 / double(g.sec_static_px) : 0.0;
+    const double st_zero =
+        g.sec_static_px ? double(g.sec_static_zero) / 16.0 / double(g.sec_static_px) : 0.0;
+    if (g.sec_static_px >= 2000) {
+        // Pick the mode whose static-draw error is smaller (hysteresis 0.1 px).
+        if (g.additive && st_abs + 0.1 < st_zero) g.additive = false;
+        else if (!g.additive && st_zero + 0.1 < st_abs) g.additive = true;
+    }
+    const double st_err = g.additive ? st_zero : st_abs;
     Log(fmt::format(
-        "draws with object vectors {}/{}, coverage {:.1f}% (blended {:.1f}%), GPU {:.3f} ms "
-        "(compose), CPU {:.3f} us/draw added, history resets {}, frames {}, overflow {} | {} | "
-        "check: {} px, reprojection error obj {:.4f} vs cam {:.4f} ({}), obj better {} / cam "
-        "better {}",
-        g.sec_vec_draws, g.sec_draws, cov,
+        "draws with object vectors {}/{} (moving only), static checked {}, coverage {:.1f}% "
+        "(blended {:.1f}%), GPU {:.3f} ms (compose), {:.3f} ms on check frames, skipped {}, CPU "
+        "{:.3f} us/draw added, history resets {}, frames {}, overflow {} | {} | mode {} | "
+        "static-draw error {:.3f} px over {} px ({}; |obj-cam| {:.3f}, |obj| {:.3f}) | check: {} "
+        "px, reprojection error obj {:.4f} vs cam {:.4f} ({}), obj better {} / cam better {}",
+        g.sec_vec_draws, g.sec_draws, g.sec_diag_draws, cov,
         g.sec_px_all ? 100.0 * double(g.sec_px_blend) / double(g.sec_px_all) : 0.0,
         g.sec_gpu_n ? g.sec_gpu_ms / g.sec_gpu_n : 0.0,
+        g.sec_gpu_stat_n ? g.sec_gpu_stat_ms / g.sec_gpu_stat_n : 0.0, g.sec_skipped,
         g.sec_draws ? g.sec_cpu_ns / 1000.0 / double(g.sec_draws) : 0.0, g.sec_resets,
-        g.sec_frames, g.sec_overflow, cats, g.sec_chk, eo, ec,
+        g.sec_frames, g.sec_overflow, cats,
+        g.additive ? "additive (object motion + camera vector)" : "absolute",
+        st_err, g.sec_static_px,
+        g.sec_static_px == 0 ? "no static px" : (st_err <= 0.5 ? "PASS" : "FAIL"), st_abs, st_zero,
+        g.sec_chk, eo, ec,
         g.sec_chk == 0 ? "no differing px" : (eo <= ec ? "OBJECT VECTORS WIN" : "CAMERA WINS"),
         g.sec_wo, g.sec_wc));
     g.sec_draws = g.sec_vec_draws = g.sec_resets = g.sec_frames = g.sec_overflow = 0;
@@ -745,8 +827,9 @@ void OnFlip() {
     g.sec_cpu_ns = 0;
     g.sec_px_obj = g.sec_px_blend = g.sec_px_all = g.sec_chk = g.sec_eo = g.sec_ec = g.sec_wo =
         g.sec_wc = 0;
-    g.sec_gpu_ms = 0;
-    g.sec_gpu_n = 0;
+    g.sec_gpu_ms = g.sec_gpu_stat_ms = 0;
+    g.sec_gpu_n = g.sec_gpu_stat_n = 0;
+    g.sec_static_px = g.sec_static_abs = g.sec_static_zero = g.sec_diag_draws = g.sec_skipped = 0;
 }
 
 } // namespace BB::ObjMv2

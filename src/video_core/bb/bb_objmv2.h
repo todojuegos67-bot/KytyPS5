@@ -52,7 +52,9 @@ namespace BB::ObjMv2 {
 
 constexpr u32 Attachment = 7;
 
-enum class Kind : u8 { None = 0, Opaque = 1, Blend = 2 };
+// Mask: another draw of the scene pass; attachment 7 bound with write mask 0, stock shaders, so
+// switching between motion and other pipelines never restarts the render pass.
+enum class Kind : u8 { None = 0, Opaque = 1, Blend = 2, Mask = 3 };
 
 // Rasterizer: once, with the instance (creates buffers and the compose pass; false: off).
 bool Init(const Vulkan::Instance& instance);

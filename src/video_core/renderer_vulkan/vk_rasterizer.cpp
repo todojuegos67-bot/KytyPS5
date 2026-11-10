@@ -193,8 +193,9 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
         return;
     }
     const auto& key = pipeline->GetGraphicsKey();
-    if (!BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment])) {
-        return;
+    if (!BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment]) ||
+        !key.write_masks[BB::ObjMv2::Attachment]) {
+        return; // not a motion draw, or a Mask draw (attachment 7 only keeps the pass going)
     }
     BB::ObjMv2::OnDraw(push_data, pipeline->GetStage(Shader::SwStage::Vertex), memory,
                        key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)], identity,
