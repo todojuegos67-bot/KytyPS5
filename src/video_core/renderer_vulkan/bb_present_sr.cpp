@@ -448,11 +448,12 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     if (desc.has_reactive && BB::Upscale::Cfg().kind == BB::SR::Kind::Fsr4) {
         BlendFsr4(cmd, in, out, jx, jy);
     }
-    if (BB::Dlss5::Wanted() && kind == BB::SR::Kind::Taa) {
-        static bool said_taa = false;
-        if (!said_taa) {
-            said_taa = true;
-            BB::Upscale::Checkpoint("DLSS 5: on after TAA");
+    if (BB::Dlss5::Wanted()) {
+        static bool said_after = false;
+        if (!said_after) {
+            said_after = true;
+            BB::Upscale::Checkpoint(
+                fmt::format("DLSS 5: on after {}", BB::SR::KindName(kind)));
         }
     }
     if (BB::Dlss5::Wanted()) {

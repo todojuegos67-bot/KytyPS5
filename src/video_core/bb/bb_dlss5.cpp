@@ -1153,8 +1153,7 @@ bool Wanted() {
 	// bb-reactive: also after the emulator's TAA and on the native image (no upscaler); NGX is
 	// loaded by DLSS 5 itself (nvngx_dlssnr.dll), not through Streamline.
 	static const auto kind = BB::Upscale::Cfg().kind;
-	static const bool ok = kind == SR::Kind::Dlss || kind == SR::Kind::Taa || kind == SR::Kind::Native ||
-	                       kind == SR::Kind::Off;
+	static const bool ok = true; // (bb-reactive: the CreateDevice crash was the address hole, held now)
 	static std::atomic<bool> said {false};
 	if (!ok && !said.exchange(true)) BB::Upscale::Checkpoint("DLSS 5: off (runs after DLSS, TAA or on the native image)");
 	return ok;

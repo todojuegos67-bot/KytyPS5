@@ -654,9 +654,8 @@ bool Instance::CreateDevice() {
                                                        bb_f, const_cast<void*>(bb_ci.pNext));
         bb_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
         bb_ci.ppEnabledExtensionNames = enabled_extensions.data();
-        if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss) {
-            Core::ReleaseDlssAddressHole();
-        }
+        // (DLSS, and DLSS 5 with any upscaler: the hole is only held when one of them is on)
+        Core::ReleaseDlssAddressHole();
     }
     if (BB::Upscale::Capture()) {
         std::string names;

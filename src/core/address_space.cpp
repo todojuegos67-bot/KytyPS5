@@ -160,8 +160,13 @@ struct AddressSpace::Impl {
             }
         }
 
-        if (const char* up = std::getenv("BB_UPSCALER");
-            up != nullptr && (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa")) {
+        // bb-reactive: DLSS 5 (NGX, nvngx_dlssnr.dll) needs the same hole with any upscaler (or
+        // none): without it vkCreateDevice died with FSR 4 / XeSS / TAA / native + BB_DLSS5.
+        const char* up = std::getenv("BB_UPSCALER");
+        const char* d5 = std::getenv("BB_DLSS5");
+        const bool dlss5 = d5 != nullptr && *d5 != '\0' && std::atoi(d5) > 0;
+        if (dlss5 || (up != nullptr &&
+                      (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa"))) {
             constexpr u64 DlssUserMax = 0x8000000000ULL;
             if (supported_user_max > DlssUserMax) {
                 supported_user_max = DlssUserMax;
