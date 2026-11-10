@@ -111,6 +111,8 @@ enum : uint32_t {
 	BuiltInVertexIndex               = 42,
 	BuiltInInstanceIndex             = 43,
 	BuiltInBaseInstance              = 4425,
+	BuiltInBaryCoordNoPerspAMD       = 4992, // (SPV_AMD_shader_explicit_vertex_parameter: I and J, a 2-vector)
+	BuiltInBaryCoordSmoothAMD        = 4995,
 	BuiltInBaryCoordKHR              = 5286,
 	BuiltInBaryCoordNoPerspKHR       = 5287,
 };
@@ -413,6 +415,9 @@ struct EmitterState {
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         lod_stats_variable      = 0;
 	bool                                             lod_stats_subgroup      = false;
+	// A pixel shader's barycentrics (I, J) from BaryCoordSmoothAMD/BaryCoordNoPerspAMD (a 2-vector) instead of the KHR
+	// built-ins (3-vectors read at 1 and 2): IR::Program::amd_barycentrics and no per-vertex input (EmitProgram).
+	bool                                             amd_barycentrics        = false;
 	uint32_t                                         lod_helper_variable     = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;

@@ -346,6 +346,11 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());
 	CopyProgramInputsAndOutputs(state, program);
+	// (The AMD barycentrics only where no input is per-vertex: those shaders also interpolate the vertices' values by the
+	// KHR weights, which AMD's older compiler takes; issue #305's refused ones read the barycentrics alone.)
+	state.amd_barycentrics =
+	    program.amd_barycentrics && state.stage == ShaderType::Pixel &&
+	    std::none_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) { return input.per_vertex; });
 	AllocateInputVariables(state);
 	AllocateOutputVariables(state);
 	DefineModule(state);

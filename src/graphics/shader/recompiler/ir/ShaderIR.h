@@ -735,6 +735,9 @@ struct Program: ResourcePlan {
 	bool                          pixel_quad_reads = false;
 	// V_MAD/V_MAC/V_MADMK/V_MADAK_F32 (FPMad32) unfused (Frontend::TranslatorFeatureUnfusedMad).
 	bool                          unfused_mad = false;
+	// A pixel shader's barycentrics without per-vertex inputs from VK_AMD_shader_explicit_vertex_parameter
+	// (Frontend::TranslatorFeatureAmdBarycentrics; the backend checks for the per-vertex inputs).
+	bool                          amd_barycentrics = false;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };

@@ -181,9 +181,10 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
+		// (I and J: the KHR 3-vector's second and third, the AMD 2-vector's first and second.)
 		state.builder.AddFunction({OpAccessChain,
 		                           TypePointer(state, StorageClassInput, TypeF32(state)), pointer,
-		                           variable, ConstantU32(state, component + 1u)});
+		                           variable, ConstantU32(state, state.amd_barycentrics ? component : component + 1u)});
 		state.builder.AddFunction({OpLoad, TypeF32(state), value, pointer});
 		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
 		return bits;

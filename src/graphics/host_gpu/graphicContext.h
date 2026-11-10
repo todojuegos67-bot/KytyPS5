@@ -48,6 +48,9 @@ struct GraphicContext {
 	bool                               compute_wave64_native                 = false;
 	// The Steam Deck's GPU (Van Gogh) with Linux' RADV (VulkanInitSubgroupSizeControl).
 	bool                               steam_deck_radv                       = false;
+	// VK_AMD_shader_explicit_vertex_parameter enabled for the barycentrics of AMD's older Windows compiler (issue #305;
+	// AmdExplicitVertexBarycentrics in vulkanWindow.cpp, ShaderRecompiler::Frontend::TranslatorFeatureAmdBarycentrics).
+	bool                               amd_explicit_vertex_barycentrics      = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;

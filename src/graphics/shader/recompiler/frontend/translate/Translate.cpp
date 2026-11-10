@@ -18,7 +18,8 @@
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 static std::atomic<uint32_t> g_translator_features {TranslatorFeatures};
-static std::atomic<uint32_t> g_device_features {TranslatorFeatures};
+// (The AMD barycentrics only where the device setup allows them: a translation without a device, the tests', keeps KHR's.)
+static std::atomic<uint32_t> g_device_features {TranslatorFeatures & ~TranslatorFeatureAmdBarycentrics};
 static std::atomic<uint32_t> g_device_required {0};
 
 void SetTranslatorFeatures(uint32_t features) {
@@ -51,6 +52,7 @@ uint32_t TranslatorFeatureSet() {
 	static const int quad_reads   = forced("KYTY_PIXEL_QUAD_READS");
 	static const int unfused_mad  = forced("KYTY_UNFUSED_MAD");
 	static const int lane_wide    = forced("KYTY_LANE_LOCAL_WIDE");
+	static const int amd_bary     = forced("KYTY_AMD_BARYCENTRICS");
 	const auto       stored       = g_translator_features.load(std::memory_order_relaxed);
 	auto             features     = (stored & g_device_features.load(std::memory_order_relaxed)) |
 	                     g_device_required.load(std::memory_order_relaxed);
@@ -65,6 +67,7 @@ uint32_t TranslatorFeatureSet() {
 	apply(quad_reads, TranslatorFeaturePixelQuadReads);
 	apply(unfused_mad, TranslatorFeatureUnfusedMad);
 	apply(lane_wide, TranslatorFeatureLaneLocalWide);
+	apply(amd_bary, TranslatorFeatureAmdBarycentrics);
 	return features;
 }
 

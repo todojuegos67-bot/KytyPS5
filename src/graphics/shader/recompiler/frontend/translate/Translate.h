@@ -90,9 +90,17 @@ constexpr uint32_t TranslatorFeatureUnfusedMad = 64u;
 // the halves apart refused. Off unless KYTY_LANE_LOCAL_WIDE=1 (not in TranslatorFeatures until measured: it
 // changes those programs' SPIR-V).
 constexpr uint32_t TranslatorFeatureLaneLocalWide = 128u;
+// Pixel shaders that read the barycentrics (the I/J the GCN pixel shader starts with in v0/v1) without any per-vertex
+// input take them from VK_AMD_shader_explicit_vertex_parameter (BaryCoordSmoothAMD/BaryCoordNoPerspAMD, I and J), not
+// VK_KHR_fragment_shader_barycentric. Only on AMD's Windows driver with its older compiler ("AMD proprietary shader
+// compiler": GCN cards such as Vega and Polaris), which refused every pipeline with such a pixel shader although it
+// reports the KHR feature (issue #305: 7 of Demon's Souls' 173, the picture's post-processing among them: black screen).
+// No other GPU may use it (TranslatorDeviceFeatures): their SPIR-V is unchanged.
+constexpr uint32_t TranslatorFeatureAmdBarycentrics = 256u;
 constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse |
                                         TranslatorFeatureNativeFloatMinMax | TranslatorFeatureExecSelects |
-                                        TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad
+                                        TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad |
+                                        TranslatorFeatureAmdBarycentrics
 #if defined(KYTY_STEAM_DECK)
                                         | TranslatorFeatureBdaGroupWalks
 #endif
@@ -109,7 +117,8 @@ constexpr uint32_t TranslatorFeaturesBroad = TranslatorFeatureExecSelects | Tran
 // anything). KYTY_LANE_LOCAL_COOP=0/1 overrides the cooperative halves either way, KYTY_TABLE_SLOTS_AT_USE=0/1 the
 // table slots' loads, KYTY_NATIVE_FLOAT_MIN_MAX=0/1 the float min/max, KYTY_EXEC_SELECTS=0/1 the EXEC selects,
 // KYTY_BDA_GROUP_WALKS=0/1 the shared page walks, KYTY_PIXEL_QUAD_READS=0/1 the pixel shaders' quad reads,
-// KYTY_UNFUSED_MAD=0/1 the multiply-adds.
+// KYTY_UNFUSED_MAD=0/1 the multiply-adds, KYTY_AMD_BARYCENTRICS=0/1 the AMD barycentrics (1 only to look at that
+// translation elsewhere: a GPU without VK_AMD_shader_explicit_vertex_parameter refuses its pipelines).
 void                   SetTranslatorFeatures(uint32_t features);
 [[nodiscard]] uint32_t TranslatorFeatureSet();
 // Those this GPU's translation may use (default: all) and those it uses whatever the store was made with (`required`,

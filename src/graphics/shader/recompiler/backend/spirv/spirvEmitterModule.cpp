@@ -544,7 +544,11 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 			    {OpDecorate, input.variable_id, DecorationLocation, location});
 			continue;
 		}
-		const auto builtin = BuiltInForInput(input.kind);
+		auto builtin = BuiltInForInput(input.kind);
+		if (state.amd_barycentrics) {
+			if (input.kind == IR::StageInputKind::BaryCoordSmooth) builtin = BuiltInBaryCoordSmoothAMD;
+			if (input.kind == IR::StageInputKind::BaryCoordNoPerspective) builtin = BuiltInBaryCoordNoPerspAMD;
+		}
 		if (builtin != UINT32_MAX) {
 			state.builder.AddAnnotation(
 			    {OpDecorate, input.variable_id, DecorationBuiltIn, builtin});
@@ -741,7 +745,10 @@ void DefineModule(EmitterState& state) {
 		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
 		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
 	    });
-	if (fragment_barycentric) {
+	if (fragment_barycentric && state.amd_barycentrics) {
+		// (No per-vertex input: the barycentrics are the only use. The AMD built-ins need no capability.)
+		state.builder.RequireExtension("SPV_AMD_shader_explicit_vertex_parameter");
+	} else if (fragment_barycentric) {
 		state.builder.RequireCapability(CapabilityFragmentBarycentricKHR);
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
@@ -828,7 +835,7 @@ void DefineModule(EmitterState& state) {
 				break;
 			case IR::StageInputKind::BaryCoordSmooth:
 			case IR::StageInputKind::BaryCoordNoPerspective:
-				ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 3));
+				ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, state.amd_barycentrics ? 2 : 3));
 				break;
 			case IR::StageInputKind::FrontFacing:
 				ptr_type = TypePointer(state, StorageClassInput, TypeBool(state));
