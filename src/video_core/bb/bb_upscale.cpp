@@ -978,6 +978,14 @@ std::string Describe(const Target& t) {
 
 } // namespace
 
+std::atomic<u32> g_frame_events{0};
+void NoteFrameEvent(u32 bits) {
+    g_frame_events.fetch_or(bits, std::memory_order_relaxed);
+}
+u32 TakeFrameEvents() {
+    return g_frame_events.exchange(0, std::memory_order_relaxed);
+}
+
 void Checkpoint(std::string_view text) {
     static std::mutex m;
     static std::FILE* file = nullptr;
@@ -1128,6 +1136,7 @@ void SrReset(Plan& p) {
     if (!PathLockOn()) {
         if (size_changed) p.reset = true;
         if (p.reset) {
+            NoteFrameEvent(1);
             ++g_sec_resets;
             ++(size_changed ? g_rs_size : g_rs_path);
         }
@@ -1166,6 +1175,7 @@ void SrReset(Plan& p) {
     const bool is_cut = delta > cut && dclamp > 4.0 * std::max(avg, 0.05);
     avg = avg * 0.8 + dclamp * 0.2;
     p.reset = first || is_cut || size_changed;
+    if (p.reset) NoteFrameEvent(1);
     if (p.reset) {
         ++g_sec_resets;
         ++(first ? g_rs_first : size_changed ? g_rs_size : g_rs_cut);
@@ -4188,6 +4198,7 @@ void OnFlip(VAddr addr, u32 width, u32 height) {
         } else if (scene3d_i && (HudPointOn() || (FgNative() && g_fgn_lock != 2)) &&
                    !f.injected && !f.fg_native_done) {
             ++miss_sec;
+            NoteFrameEvent(2);
             const std::string why =
                 f.gb_w != g_output_w || f.gb_h != g_output_h
                     ? fmt::format("scene {}x{} is not the output size {}x{}", f.gb_w, f.gb_h,

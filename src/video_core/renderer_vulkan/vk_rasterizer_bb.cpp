@@ -4320,6 +4320,80 @@ bool HsFcFormat(vk::Format f) {
 // canvas itself, or the last presented frame / black when its scene region is flat grey), and
 // pres is copied as the new last-presented frame. Returns the image to present, or nullptr when
 // the check cannot run (the canvas is then presented as in 1.40).
+// bb-149fix flash detector: the content check's sample mean of each presented canvas (read from
+// the host-visible state buffer a few frames later, no wait) with the events of that frame
+// (BB::Upscale::NoteFrameEvent). A frame whose mean differs by more than BB_FLASH_PCT (default
+// 25) % from both neighbours is a flash; per second: count and the events of each.
+struct FlashDet {
+    u32 dispatched = 0;       // CPU count of content-check dispatches (== the GPU's `checked`)
+    u32 events[256]{};        // events of dispatch i (i % 256)
+    u32 seen = 0;             // last GPU `checked` value read
+    double mean[3]{-1, -1, -1};
+    u32 ev[3]{};
+    u32 flashes = 0, frames = 0;
+    std::string detail;
+    std::chrono::steady_clock::time_point t{};
+} g_fd;
+
+void FlashDetect(u32 events) {
+    if (!g_hs.fc_mapped) return;
+    g_fd.events[g_fd.dispatched % 256] = events;
+    ++g_fd.dispatched;
+    const u32 checked = g_hs.fc_mapped[3];
+    if (checked != g_fd.seen && checked != 0) {
+        // Only the newest finished frame is visible (the buffer holds one mean): a gap of
+        // frames is skipped, so the neighbours are the last frames read.
+        const u32 idx = checked - 1;
+        const double m = g_hs.fc_mapped[9] / 256.0;
+        const bool adjacent = checked == g_fd.seen + 1;
+        g_fd.seen = checked;
+        if (!adjacent) g_fd.mean[0] = g_fd.mean[1] = -1;
+        g_fd.mean[0] = g_fd.mean[1];
+        g_fd.ev[0] = g_fd.ev[1];
+        g_fd.mean[1] = g_fd.mean[2];
+        g_fd.ev[1] = g_fd.ev[2];
+        g_fd.mean[2] = m;
+        g_fd.ev[2] = g_fd.events[idx % 256];
+        ++g_fd.frames;
+        static const double pct = [] {
+            const char* v = std::getenv("BB_FLASH_PCT");
+            return v != nullptr && *v != '\0' ? std::atof(v) / 100.0 : 0.25;
+        }();
+        if (g_fd.mean[0] >= 0 && g_fd.mean[1] >= 0) {
+            const double a = g_fd.mean[0], b = g_fd.mean[1], cc = g_fd.mean[2];
+            const auto off = [&](double x, double y) {
+                return std::abs(x - y) > pct * std::max({x, y, 8.0});
+            };
+            if (off(b, a) && off(b, cc) && ((b > a) == (b > cc))) {
+                ++g_fd.flashes;
+                if (g_fd.detail.size() < 400) {
+                    const u32 e = g_fd.ev[1];
+                    g_fd.detail += fmt::format(
+                        " [{:.0f}->{:.0f}->{:.0f}:{}{}{}{}{}{}{}]", a, b, cc,
+                        e & 1 ? " sr-reset" : "", e & 2 ? " hud-miss" : "",
+                        e & 4 ? " path-switch" : "", e & 8 ? " guarded" : "",
+                        e & 16 ? " objmv-nohist" : "", e & 32 ? " fg-spike" : "",
+                        e == 0 ? " none" : "");
+                }
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (g_fd.t == std::chrono::steady_clock::time_point{}) g_fd.t = now;
+    if (now - g_fd.t >= std::chrono::seconds(1)) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "[flash-det] 1 s: {} frames read, {} flashes (mean jump > {:.0f}% vs both "
+            "neighbours, events of that frame){}",
+            g_fd.frames, g_fd.flashes, 100.0 * [] {
+                const char* v = std::getenv("BB_FLASH_PCT");
+                return v != nullptr && *v != '\0' ? std::atof(v) / 100.0 : 0.25;
+            }(), g_fd.detail));
+        g_fd.frames = g_fd.flashes = 0;
+        g_fd.detail.clear();
+        g_fd.t = now;
+    }
+}
+
 HsCanvas* HsContentCheck(vk::CommandBuffer cmd, HsCanvas& c) {
     static const bool fc_off = [] {
         const char* v = std::getenv("BB_FLATCHECK");
@@ -4388,6 +4462,7 @@ HsCanvas* HsContentCheck(vk::CommandBuffer cmd, HsCanvas& c) {
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
     };
+    FlashDetect(BB::Upscale::TakeFrameEvents());
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g_hs.fc_pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_hs.fc_layout, 0, writes);
     struct {

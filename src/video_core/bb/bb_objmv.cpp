@@ -963,6 +963,7 @@ void OnFlip() {
         // bb-149fix: nothing rendered with positions since the last flip: keep last rendered
         // frame's history (see State::pos_frame).
         ++g.kept_flips;
+        BB::Upscale::NoteFrameEvent(16);
         g.ordinals.clear();
         g.loose_ordinals.clear();
         g.pal_ordinals.clear();

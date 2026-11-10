@@ -130,6 +130,12 @@ void DryRunDevice(VkInstance instance, VkPhysicalDevice physical, const VkDevice
 // A start-up checkpoint: written and flushed at once to bb_upscale_init.log (next to the working
 // directory's shadPS4 log is asynchronous and may be cut off by a crash) and to the log.
 void Checkpoint(std::string_view text);
+// bb-149fix flash detector: what happened in the frame being built (bits, cleared when the
+// frame's presented image is checked): 1 upscaler history reset, 2 HUD point missed,
+// 4 present-path switch / FG pair skipped, 8 flash guard, 16 objmv flip without positions,
+// 32 FG spike skip.
+void NoteFrameEvent(u32 bits);
+u32 TakeFrameEvents();
 
 // ---- Frame tracking (GPU command processor thread) ----
 struct Target {

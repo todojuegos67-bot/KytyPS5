@@ -1108,6 +1108,51 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                                                               : 0;
         frame->bb_fg_skip = guarded || (last_path >= 0 && path != last_path);
         last_path = path;
+        if (frame->bb_fg_skip) BB::Upscale::NoteFrameEvent(guarded ? 8 : 4);
+        // bb-149fix: no generated frames across a frame-time spike (a real-frame interval over
+        // 2x the median of the last 32) or a history reset: the pair would interpolate
+        // between frames too far apart (characters jump / smear when the fps drops).
+        if (!frame->bb_fg_skip && frame->fg.valid && BB::FG::WantInputs()) {
+            using SC = std::chrono::steady_clock;
+            static SC::time_point last{};
+            static std::array<double, 32> ring{};
+            static u32 n = 0;
+            static u32 sec_spike = 0, sec_reset = 0, sec_frames = 0;
+            static SC::time_point sec_t{};
+            const auto now = SC::now();
+            const double dt =
+                last == SC::time_point{} ? 0.0 : std::chrono::duration<double, std::milli>(now - last).count();
+            last = now;
+            bool spike = false;
+            if (dt > 0.0 && dt < 500.0) {
+                if (n >= 8) {
+                    std::array<double, 32> s = ring;
+                    const u32 m = std::min<u32>(n, 32);
+                    std::nth_element(s.begin(), s.begin() + m / 2, s.begin() + m);
+                    spike = dt > 2.0 * s[m / 2];
+                }
+                ring[n % 32] = dt;
+                ++n;
+            }
+            ++sec_frames;
+            if (spike || frame->fg.reset) {
+                if (spike) ++sec_spike; else ++sec_reset;
+                BB::Upscale::NoteFrameEvent(32);
+                frame->bb_fg_skip = true;
+                frame->fg.valid = false;
+                frame->fg.has_hudless = false;
+                frame->fg.reset = true;
+            }
+            if (sec_t == SC::time_point{}) sec_t = now;
+            if (now - sec_t >= std::chrono::seconds(1)) {
+                BB::Upscale::Checkpoint(fmt::format(
+                    "[fg-timing] 1 s: {} FG frames, generation skipped across a frame-time spike "
+                    "(> 2x median) {}, across a history reset {}",
+                    sec_frames, sec_spike, sec_reset));
+                sec_spike = sec_reset = sec_frames = 0;
+                sec_t = now;
+            }
+        }
         if (frame->bb_fg_skip) {
             if (frame->fg.valid && BB::FG::WantInputs()) Rasterizer::BBFlashGuardFgSkip();
             frame->fg.valid = false;

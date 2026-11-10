@@ -23,6 +23,7 @@ layout(std430, binding = 3) buffer State {
     uint accepted_flat;
     uint last_min;
     uint last_max;
+    uint frame_mean; // bb-149fix: mean of the 256 samples x 3 channels (0..255 x 256)
 } st;
 layout(push_constant) uniform Push {
     uvec4 size; // width, height, mode
@@ -60,6 +61,7 @@ void main() {
             bool grey = all(greaterThanEqual(lo, uvec3(0x71u))) && all(lessThanEqual(hi, uvec3(0x89u)));
             bool flat_ = max(r.r, max(r.g, r.b)) <= 3u && grey && (max(hi.r, max(hi.g, hi.b)) - min(lo.r, min(lo.g, lo.b))) <= 3u;
             st.checked += 1u;
+            st.frame_mean = s_sum[0] / 3u;
             st.last_min = s_min[0].r | (s_min[0].g << 8) | (s_min[0].b << 16);
             st.last_max = s_max[0].r | (s_max[0].g << 8) | (s_max[0].b << 16);
             if (flat_ && st.consecutive < 30u) {

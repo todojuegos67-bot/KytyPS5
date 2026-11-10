@@ -1160,6 +1160,8 @@ void AddDeviceExtensions(vk::PhysicalDevice physical, const std::vector<std::str
 		return;
 	}
 	const auto kind = BB::Upscale::Cfg().kind;
+	BBLogf("DLSS 5: on after %s (any upscaler, TAA or native; NGX address hole held for BB_DLSS5 > 0)",
+	       SR::KindName(kind));
 	// 0.90: Kind::Native too (Reescalado off): DLSS 5 on the game's own image at the native
 	// analysis point, the same image and vectors frame generation reads (BBFgNativeAnalyze).
 	if (kind != SR::Kind::Dlss && kind != SR::Kind::Xess && kind != SR::Kind::Fsr3 && kind != SR::Kind::Fsr4 &&
