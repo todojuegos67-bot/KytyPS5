@@ -472,7 +472,8 @@ bool IntroMovieBlocked(const char* path) {
 		const char* v = std::getenv("KYTY_SKIP_INTRO");
 		return v != nullptr && std::strcmp(v, "1") == 0;
 	}();
-	if (!skip || path == nullptr) return false;
+	(void)skip; // (11-10 09:09: blocking the logo left the game retrying it on a black screen; it plays hidden instead)
+	if (path != nullptr || path == nullptr) return false;
 	std::string p(path);
 	for (auto& c: p) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 	const bool blocked = p.find("movies/ps_studios_logo.bk2") != std::string::npos || p.find("movies/logo_intro.bk2") != std::string::npos;

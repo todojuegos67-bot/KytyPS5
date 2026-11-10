@@ -248,7 +248,8 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 					movie_logged = true;
 					std::printf("[port] intro: skipping the start-up movie (KYTY_SKIP_INTRO)\n");
 				}
-			} else if (!cine_done && up < 240000000000LL && Libs::VideoOut::CinematicPlaying()) {
+			} else if (!cine_done && up < 240000000000LL && (cine_seen != 0 || Libs::VideoOut::CinematicPlaying())) {
+				// (from its first detection on, timed by the clock: its file reads stop long before it ends)
 				if (cine_seen == 0) cine_seen = now;
 				// Pressed 1.5 s into the cinematic (it plays by then) for 150 ms, again at 3 s in case the first was early.
 				const int64_t in = now - cine_seen;
@@ -270,7 +271,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			// Black on screen meanwhile: the movie in the first 2 minutes; the first cinematic from its start until 1 s
 			// after the presses (it is gone by then; if not, it shows again rather than staying black).
 			const bool hide = (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) ||
-			                  (cine_seen != 0 && (!cine_done || now - cine_done_at < 300000000LL) && up < 240000000000LL);
+			                  (cine_seen != 0 && now - cine_seen < 2000000000LL);
 			Libs::VideoOut::SetIntroHidden(hide);
 		}
 	}
