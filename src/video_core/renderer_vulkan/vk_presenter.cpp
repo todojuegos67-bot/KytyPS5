@@ -733,7 +733,15 @@ void Presenter::BbUpdateFrameGenLimit(bool wanted, double present_ms) {
         limit = 3;
     }
     bb_present_busy += (std::min(present_ms / interval, 1.2) - bb_present_busy) * 0.1;
-    if (before && bb_present_busy > 0.97) {
+    // bb: the "presenting does not keep up" pause measured the whole present call, which by design
+    // spans the game frame (the generated frames are spaced over it): 8.9 of 8.9 ms every time, so
+    // DLSS-G was paused 5, 10, 20, 40 s in a row on a 240 Hz display with mailbox. Off unless
+    // BB_FG_BUSY_PAUSE=1.
+    static const bool busy_pause = [] {
+        const char* v = std::getenv("BB_FG_BUSY_PAUSE");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (busy_pause && before && bb_present_busy > 0.97) {
         bb_frame_gen_hold_seconds = now - bb_frame_gen_hold_until > std::chrono::seconds(60)
                                         ? 5
                                         : std::min(bb_frame_gen_hold_seconds * 2, 120);
