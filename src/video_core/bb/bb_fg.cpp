@@ -3,6 +3,7 @@
 // bb-clean-021-fg: BB_FG settings and the swapchain / device hooks (bb_fg.h), from the 1.59
 // build's bb_fg.cpp reduced to AMD FSR 3 x2.
 
+#include <atomic>
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
@@ -77,6 +78,17 @@ Config ParseConfig() {
         s == "fsr3-2" || s == "fsr-x2") {
         c.kind = Kind::Amd;
         c.multiplier = 2;
+    } else if (s == "amd-x3" || s == "amd-3" || s == "fsr3-x3") {
+        // bb-amd-mfg: AMD multi frame generation (the patched amd_fidelityfx_vk.dll only).
+        c.kind = Kind::Amd;
+        c.multiplier = 3;
+    } else if (s == "amd-x4" || s == "amd-4" || s == "fsr3-x4") {
+        c.kind = Kind::Amd;
+        c.multiplier = 4;
+    } else if (s == "amd-dyn" || s == "amd-dynamic" || s == "amd-dinamico" || s == "fsr3-dyn") {
+        c.kind = Kind::Amd;
+        c.multiplier = 4;
+        c.dynamic = true;
     } else if (s == "dlss-x2" || s == "dlss-2" || s == "dlss" || s == "dlssg") {
         c.kind = Kind::Dlss;
         c.multiplier = 2;
@@ -91,8 +103,8 @@ Config ParseConfig() {
         c.multiplier = 4;
         c.dynamic = true;
     } else if (s != "off" && s != "0" && !s.empty()) {
-        BBLogf("Frame generation: BB_FG=%s is not available in this build (amd-x2, dlss-x2..x4, "
-               "dlss-dyn): off",
+        BBLogf("Frame generation: BB_FG=%s is not available in this build (amd-x2..x4, amd-dyn, "
+               "dlss-x2..x4, dlss-dyn): off",
                s.c_str());
     }
     if (c.kind == Kind::Amd) {
@@ -107,8 +119,8 @@ const Config& Cfg() {
     static const Config config = [] {
         Config c = ParseConfig();
         if (c.kind == Kind::Amd) {
-            BBLogf("Frame generation: BB_FG=%s (AMD FSR 3, fixed x%d)", std::getenv("BB_FG"),
-                   c.multiplier);
+            BBLogf("Frame generation: BB_FG=%s (AMD FSR 3, %s x%d)", std::getenv("BB_FG"),
+                   c.dynamic ? "dynamic x2 up to" : "fixed", c.multiplier);
         } else if (c.kind == Kind::Dlss) {
             BBLogf("Frame generation: BB_FG=%s (DLSS-G via NGX, %s)", std::getenv("BB_FG"),
                    c.dynamic ? "dynamic up to x4" : (c.multiplier == 2   ? "x2"
@@ -122,7 +134,10 @@ const Config& Cfg() {
 
 const char* Name() {
     const auto& c = Cfg();
-    if (c.kind == Kind::Amd) return "amd-x2";
+    if (c.kind == Kind::Amd) {
+        if (c.dynamic) return "amd-dyn";
+        return c.multiplier == 2 ? "amd-x2" : c.multiplier == 3 ? "amd-x3" : "amd-x4";
+    }
     if (c.kind == Kind::Dlss) {
         if (c.dynamic) return "dlss-dyn";
         return c.multiplier == 2 ? "dlss-x2" : c.multiplier == 3 ? "dlss-x3" : "dlss-x4";
@@ -147,12 +162,37 @@ bool Fsr3Active() {
     return Cfg().kind == Kind::Amd && Amd::Active();
 }
 
+namespace {
+std::atomic<float> g_note_real{0.0f}, g_note_shown{0.0f};
+std::atomic<int> g_note_mult{0};
+} // namespace
+
+void NoteRates(float real, float shown, int multiplier) {
+    g_note_real.store(real, std::memory_order_relaxed);
+    g_note_shown.store(shown, std::memory_order_relaxed);
+    g_note_mult.store(multiplier, std::memory_order_relaxed);
+}
+
+std::string Label() {
+    const auto& c = Cfg();
+    int m = g_note_mult.load(std::memory_order_relaxed);
+    if (m < 2) m = c.multiplier;
+    const char* who = c.kind == Kind::Amd ? "FSR 3" : c.kind == Kind::Dlss ? "DLSS-G" : "FG";
+    return std::string(who) + (c.dynamic ? " dyn x" : " x") + std::to_string(m);
+}
+
 bool PanelInfo(float& real, float& shown, const char*& state) {
     real = shown = 0;
     state = "off";
     if (!On()) return false;
     if (Cfg().kind == Kind::Dlss) {
-        state = Dlss::Ready() ? "DLSS-G (NGX)" : "DLSS-G unavailable";
+        if (!Dlss::Ready()) {
+            state = "DLSS-G unavailable";
+            return true;
+        }
+        real = g_note_real.load(std::memory_order_relaxed);
+        shown = g_note_shown.load(std::memory_order_relaxed);
+        state = shown > real * 1.2f ? "on" : "idle";
         return true;
     }
     if (!Fsr3Requested()) {

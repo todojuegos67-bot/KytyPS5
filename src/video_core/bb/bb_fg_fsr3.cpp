@@ -9,8 +9,9 @@
 // (tools/bb/fsr3-mfg/ffx-sdk-v1.1.4-mfg.patch, built by the bb-windows workflow with its command
 // list pool fix); AMD's signed DLL stays at x2. Same pacing: KYTY_FSR3_PACING_FLOOR (the DLL's
 // present floor), KYTY_VRR_CAP_FPS (our real-frame limiter), all read as BB_* first.
-// bb-clean-021-fg: x2 only. No guest flip pacer, present ids / present wait, dynamic multiplier or
-// object-vector statistics (the 1.59 extras that serialized CPU and GPU).
+// bb-clean-021-fg: no guest flip pacer, present ids / present wait or object-vector statistics
+// (bb-amd-mfg brings back x3 / x4 and the dynamic multiplier: BB_FG=amd-x3 / amd-x4 / amd-dyn;
+// x2 unchanged) (the 1.59 extras that serialized CPU and GPU).
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -77,6 +78,25 @@ void (*g_take_pace_stats2)(int64_t*, int) = nullptr;
 // bb-fg-074 (the display patch): the ids of the presents the DLL made, so each can be waited for.
 uint32_t (*g_take_display_ids)(uint64_t*, uint32_t) = nullptr;
 bool g_display_ids = false; // the game's presents carry ids and the DLL numbers every present
+bool g_patched = false;     // the bb-windows DLL (multi frame generation, KYTY_FSR3_FG_ACTIVE)
+
+// bb-amd-mfg: AMD multi frame generation, as the Demon's Souls port's (src/local/fsr3-fg.cpp).
+// BB_FG=amd-x3 / amd-x4: KYTY_FSR3_FG_FRAMES = N - 1 for the patched DLL (read when it makes the
+// swapchain). BB_FG=amd-dyn: frames for x4 allocated, the multiplier (x2..x4) picked once a second
+// from the measured real frame rate: the largest N with real x N <= the target
+// (KYTY_FSR3_TARGET_FPS, default refresh - refresh^2 / 3600: 224 at 240 Hz), up after 2 windows,
+// down when real x current passes the target by 5 %. No cap on real frames (the limiter of
+// KYTY_VRR_CAP_FPS only if the launcher sets it, as before); the DLL's pacing spaces the presents. The DLL reads KYTY_FSR3_FG_ACTIVE (generated frames) on every present.
+// No pause when presenting does not keep up: the multiplier only steps down.
+struct Mfg {
+    int max = 2;     // frames allocated (multiplier maximum)
+    int current = 2; // multiplier in use
+    bool dynamic = false;
+    double target = 0.0;
+    double slept = 0.0; // seconds the real-frame limiter waited in this window
+    double smooth = 0.0;
+    int up_n = 0;
+} g_mfg;
 
 ffxContext g_fg_context = nullptr;
 vk::Extent2D g_fg_display{};
@@ -545,6 +565,7 @@ bool LoadApi() {
             return false;
         }
         const bool patched = GetProcAddress(g_dll, "kytyFfxGetRealSwapchainVK") != nullptr;
+        g_patched = patched;
         g_set_pace_slot = reinterpret_cast<void (*)(int64_t, int64_t)>(
             GetProcAddress(g_dll, "kytyFfxSetPaceSlot"));
         g_take_pace_stats =
@@ -554,10 +575,85 @@ bool LoadApi() {
         g_take_display_ids = reinterpret_cast<uint32_t (*)(uint64_t*, uint32_t)>(
             GetProcAddress(g_dll, "kytyFfxTakeDisplayIds"));
         Printf("FSR3 FG: amd_fidelityfx_vk.dll loaded (%s)",
-               patched ? "patched (bb-windows build), x2" : "AMD's signed DLL, x2");
+               patched ? "patched (bb-windows build), x2..x4" : "AMD's signed DLL, x2 only");
         return true;
     }();
     return loaded;
+}
+
+void MfgSetActive(int multiplier) {
+    char text[8];
+    std::snprintf(text, sizeof(text), "%d", multiplier - 1);
+    SetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", text);
+}
+
+void MfgInit() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const auto& c = Cfg();
+    g_mfg.max = std::clamp(c.multiplier, 2, 4);
+    g_mfg.dynamic = c.dynamic;
+    if (g_mfg.max > 2 && !g_patched) {
+        Printf("[fsr3-mfg] BB_FG=%s needs the patched amd_fidelityfx_vk.dll: x2", Name());
+        g_mfg.max = 2;
+        g_mfg.dynamic = false;
+    }
+    g_mfg.current = g_mfg.dynamic ? 2 : g_mfg.max;
+    if (g_mfg.dynamic) {
+        const char* t = Env("KYTY_FSR3_TARGET_FPS");
+        g_mfg.target = t != nullptr && *t != '\0' ? std::strtod(t, nullptr) : 0.0;
+        if (g_mfg.target <= 0.0) g_mfg.target = RefreshTarget();
+        if (g_mfg.target <= 0.0) g_mfg.target = 60.0 * g_mfg.max;
+        Printf("[fsr3-mfg] dynamic multiplier x2..x%d, target %.0f fps shown", g_mfg.max,
+               g_mfg.target);
+    } else if (g_mfg.max > 2) {
+        Printf("[fsr3-mfg] fixed multiplier x%d", g_mfg.max);
+    }
+}
+
+// Once a second: real = frames / window, free = frames / (window - limiter wait).
+void MfgUpdate(uint32_t frames, double window, double shown) {
+    if (g_mfg.max <= 2) {
+        g_mfg.slept = 0.0;
+        return;
+    }
+    const double real = frames / window;
+    const double busy = std::max(window - g_mfg.slept, 0.05);
+    const double free = frames / busy;
+    g_mfg.slept = 0.0;
+    if (g_mfg.dynamic && frames > 0) {
+        g_mfg.smooth = g_mfg.smooth <= 0.0 ? real : 0.5 * g_mfg.smooth + 0.5 * real;
+        const double T = g_mfg.target;
+        int want = 2;
+        for (int n = g_mfg.max; n >= 2; --n) {
+            if (g_mfg.smooth * n <= T) {
+                want = n;
+                break;
+            }
+        }
+        int next = g_mfg.current;
+        if (want > g_mfg.current) {
+            next = ++g_mfg.up_n >= 2 ? want : g_mfg.current;
+        } else {
+            g_mfg.up_n = 0;
+            // Down only when the lower multiplier still reaches the target (5 % margin): no
+            // flapping around the edge (the limiter holds real at T / current meanwhile).
+            if (want < g_mfg.current && g_mfg.smooth * g_mfg.current > T * 1.05) {
+                next = want;
+            }
+        }
+        if (next != g_mfg.current) {
+            Printf("[fsr3-mfg] x%d (from x%d): real %.1f fps (smoothed %.1f), target %.0f", next,
+                   g_mfg.current, real, g_mfg.smooth, T);
+            g_mfg.current = next;
+            g_mfg.up_n = 0;
+            MfgSetActive(next);
+        }
+    }
+    NoteRates(static_cast<float>(real), static_cast<float>(shown), g_mfg.current);
+    Printf("[fsr3-mfg] x%d%s; real %.1f fps (free %.1f), shown %.1f fps%s", g_mfg.current,
+           g_mfg.dynamic ? " dynamic" : "", real, free, shown, "");
 }
 
 double CapInterval() {
@@ -568,7 +664,7 @@ double CapInterval() {
         if (std::string(text) == "auto") {
             cap = RefreshTarget();
         }
-        const int generated = 1;
+        const int generated = std::clamp(g_mfg.max, 2, 4) - 1;
         if (cap <= 0.0) return 0.0;
         Printf("FSR3 FG: shown frames held under %.0f fps (real at most %.1f)", cap,
                cap / (1 + generated));
@@ -771,6 +867,15 @@ bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* o
     SetEnvironmentVariableA("KYTY_FSR3_DISPLAY_IDS", nullptr);
     SetEnvironmentVariableA("KYTY_FSR3_FG_FRAMES", nullptr);
     SetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", nullptr);
+    MfgInit();
+    if (g_mfg.max > 2) {
+        // bb-amd-mfg: frames for the maximum multiplier, the active count every present.
+        char frames[8];
+        std::snprintf(frames, sizeof(frames), "%d", g_mfg.max - 1);
+        _putenv_s("KYTY_FSR3_FG_FRAMES", frames);
+        SetEnvironmentVariableA("KYTY_FSR3_FG_FRAMES", frames);
+        MfgSetActive(g_mfg.current);
+    }
     {
         // Pacing floor (the patched DLL; AMD's ignores it): no present of the frame interpolation
         // swapchain closer than the display's refresh period x KYTY_FSR3_PACING_FLOOR (default 1.0,
@@ -994,6 +1099,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
             std::chrono::duration<double>(interval));
         auto now = std::chrono::steady_clock::now();
         if (next > now) {
+            g_mfg.slept += std::chrono::duration<double>(next - now).count();
             std::this_thread::sleep_until(next - std::chrono::milliseconds(1));
             while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
             now = next;
@@ -1075,6 +1181,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         if (g_take_pace_stats != nullptr) {
             LogPresentIntervals(window);
         }
+        MfgUpdate(g_stats.real, window, static_cast<double>(shown) / window);
         {
             // 0.92: real / planned-shown frame times (ms) of the last second.
             std::string line = "[fsr3-ft] ";
