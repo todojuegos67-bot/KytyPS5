@@ -969,7 +969,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// engine logs it and the picture stays the upscaler's.
 	{
 		static const char* edge[] = {"0.5", "0.75", "0.5", "0.35"};
-		const int          level  = pc.nvidia && !s.pure_game ? std::clamp(std::atoi(s.dlss5.c_str()), 0, 3) : 0;
+		const int          level  = pc.nvidia ? std::clamp(std::atoi(s.dlss5.c_str()), 0, 3) : 0;
 		if (level > 0) {
 			sets.emplace_back("KYTY_FOVEATED", "1");
 			sets.emplace_back("KYTY_DLSS_NR_PRESR", "0");
@@ -1156,12 +1156,12 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	}
 	if (!upscaler.empty()) env.Set("KYTY_UPSCALER", upscaler);
 	for (const auto& [k, v]: sets) env.Set(k, v);
-	// Juego original (the launcher's $pureGame): no visual pass the emulator adds; performance, upscaler, frame generation
-	// and latency the same.
+	// Juego original (the launcher's $pureGame): no visual pass the emulator adds; performance, upscaler, DLSS 5, frame
+	// generation and latency the same (11-10: DLSS 5 kept, the user's choice).
 	if (s.pure_game) {
 		static const char* fx[] = {"KYTY_HWRT", "KYTY_RT_REFLECTIONS", "KYTY_RT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_RT_LOCAL",
 		                           "KYTY_GODRAYS", "KYTY_SHINE", "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_CONTACT_SHADOWS",
-		                           "KYTY_AO", "KYTY_TORCH", "KYTY_DOF", "KYTY_SMOKE", "KYTY_FOVEATED", "KYTY_FOV_", "KYTY_DLSS_NR"};
+		                           "KYTY_AO", "KYTY_TORCH", "KYTY_DOF", "KYTY_SMOKE"};
 		for (auto& [k, v]: env.list)
 			for (const char* p: fx)
 				if (k.rfind(p, 0) == 0) v.clear();
@@ -1169,8 +1169,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		                     "KYTY_RT_SHADOWS", "KYTY_CONTACT_SHADOWS", "KYTY_RT_SUN", "KYTY_RT_PARTICLES", "KYTY_GODRAYS", "KYTY_SHINE",
 		                     "KYTY_SPEC_OCCLUSION", "KYTY_GTAO", "KYTY_SSGI", "KYTY_SSR", "KYTY_HWRT_GI", "KYTY_HWRT_AO", "KYTY_HWRT_CONTACT",
 		                     "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_AO", "KYTY_TORCH", "KYTY_TORCH_FLARE",
-		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF", "KYTY_FOVEATED", "KYTY_DLSS_NR",
-		                     "KYTY_DLSS_NR_PRESR"})
+		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF"})
 			env.Set(k, "0");
 	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).

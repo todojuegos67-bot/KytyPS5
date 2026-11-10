@@ -2270,7 +2270,7 @@ void Draw(float width, float height) {
 					              "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolucion de la pantalla. Mas alto: mas nitido, pero puede marcar bordes y ruido."))
 						live_changed = true;
 					// (ds-pc-port10) DLSS 5 (restart).
-					ImGui::BeginDisabled(!nvidia || s.pure_game);
+					ImGui::BeginDisabled(!nvidia);
 					ChoiceRow("DLSS 5", s.dlss5 != g_rt.launched.dlss5, kDlss5Levels, kDlss5LevelCount, s.dlss5, kDlss5Tip);
 					{
 						std::string file = s.dlss5_unsigned ? "1" : "0";
@@ -2400,7 +2400,7 @@ void Draw(float width, float height) {
 					}
 					if (s.rt_sun && s.rt_hw_exp && (s.godrays != "0" || s.rt_shadows != "0")) s.rt_sun = false;
 					if (CheckRow("Juego original (sin efectos añadidos)", s.pure_game != l.pure_game, s.pure_game,
-					             "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, humo, SSGI, reflejos RT, DLSS 5). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian."))
+					             "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, humo, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, DLSS 5, frame generation y latencia no cambian."))
 						live_changed = true;
 					break;
 				}
@@ -3278,7 +3278,7 @@ void LauncherImage(Settings& s) {
 	LChoice("Nitidez", kSharpness, kSharpnessCount, s.sharpness,
 	        "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolucion de la pantalla. Mas alto: mas nitido, pero puede marcar bordes y ruido.");
 	// (ds-pc-port10) DLSS 5 (NVIDIA's Neural Rendering on the foveated grid) and which nvngx_dlssnr.dll it may load.
-	ImGui::BeginDisabled(!nvidia || s.pure_game);
+	ImGui::BeginDisabled(!nvidia);
 	LChoice("DLSS 5", kDlss5Levels, kDlss5LevelCount, s.dlss5, nvidia ? kDlss5Tip : "Sin DLSS 5: tu grafica no es NVIDIA.");
 	ImGui::BeginDisabled(s.dlss5 == "0");
 	{
@@ -3426,7 +3426,7 @@ void LauncherRayTracing(Settings& s) {
 	}
 	if (s.rt_sun && s.rt_hw_exp && (s.godrays != "0" || s.rt_shadows != "0")) s.rt_sun = false;
 	LCheckRow("Juego original (sin efectos añadidos)", s.pure_game,
-	          "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, humo, SSGI, reflejos RT, DLSS 5). Se ve el juego tal cual. Rendimiento, reescalador, frame generation y latencia no cambian.");
+	          "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, humo, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, DLSS 5, frame generation y latencia no cambian.");
 	BoxEnd();
 }
 
