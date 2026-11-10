@@ -271,7 +271,7 @@ public:
 	// Two table programs of one source (KYTY_TABLE_LEARN_PORTABLE): the buffers whose specializations differ only in
 	// the V#'s format / swizzle (bits by buffer); UINT32_MAX when anything else differs or either is not a table
 	// permutation here.
-	[[nodiscard]] uint32_t TableFormatOnlyBuffers(const void* want, const void* got);
+	[[nodiscard]] uint32_t TableFormatOnlyBuffers(const void* want, const void* got) const;
 	// When TablePending: the completion of that translation (set once it is done).
 	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
 	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.
@@ -415,7 +415,7 @@ private:
 	std::unordered_map<GraphicsPipelineKey, Pipeline*, NativeGraphicsPipelineKeyHash>
 	    m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
+	mutable Common::Mutex m_mutex; // (mutable: TableFormatOnlyBuffers, const, walks the programs under it)
 	// TryCreateGraphicsPipeline: pipelines a worker is still compiling, by key.
 	struct PendingGraphicsPipeline;
 	class CompileWorkers;

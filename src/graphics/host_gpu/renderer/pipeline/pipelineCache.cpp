@@ -4467,10 +4467,11 @@ bool PipelineCache::TakeMaterializationFailure() {
 	return std::exchange(g_materialization_failed, false);
 }
 
-uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got) {
+uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got) const {
 	if (want == nullptr || got == nullptr) return UINT32_MAX;
-	// (Under the lock Get takes: a warmup beside the game, RunWarmup's thread, adds programs while the render thread
-	// walks them here; an insert that rehashes the map frees the buckets this walk reads.)
+	// Under the lock: ProgramCache::Get inserts and erases programs under it, and a warmup beside the game
+	// (TranslateWarmup) inserts them from its own thread. The callers (TableResolveSet, TableStore) look the
+	// programs up with GetGraphicsPrograms first, which has released it by then (Common::Mutex is recursive anyway).
 	Common::LockGuard lock(m_mutex);
 	const ProgramCache::ProgramKey*  kw = nullptr;
 	const ProgramCache::ProgramKey*  kg = nullptr;

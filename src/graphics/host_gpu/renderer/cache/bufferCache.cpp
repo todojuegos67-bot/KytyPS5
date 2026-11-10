@@ -1169,7 +1169,13 @@ void BufferCache::ChangeRegister(BufferId id) {
 		else
 			m_sync_changes_lost = true;
 	}
-	const auto epoch = m_registration_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+	// The epoch is published after the regions' epochs below (not raised first): a speculative translation's thread
+	// reads it beside these stores, and an epoch it read must already cover every region store of that epoch. Raised
+	// first, a worker re-proving a held table entry could read a region's old epoch, then this one, and keep it as the
+	// entry's proof: the entry then held the device address of a buffer since unregistered until another registration
+	// in that region (seconds), and no later commit check stopped it (VK_ERROR_DEVICE_LOST, a device fault on a
+	// destroyed buffer). The render thread alone registers, so a plain load and store is the increment.
+	const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
 	if (m_registration_spans.size() < 64) {
 		m_registration_spans.push_back({m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size()});
 	} else {
@@ -1185,6 +1191,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_region_registrations[region].store(epoch, std::memory_order_release);
 		BdaDirtyRegions::Mark(region);
 	}
+	m_registration_epoch.store(epoch, std::memory_order_release);
 	LiveCounters::Add(LiveCounters::BufferRegistrations);
 	auto& buffer = m_slot_buffers[id];
 	if (static const bool log_registrations = std::getenv("KYTY_BUFREG_LOG") != nullptr; log_registrations)
