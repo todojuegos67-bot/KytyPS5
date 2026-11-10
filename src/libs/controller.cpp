@@ -252,7 +252,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 					Loader::DemonsSoulsSkipIntro::Disarm("4 minutes after boot");
 			}
 			if (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) {
-				if (pulse) data->buttons |= PAD_BUTTON_CROSS;
+				(void)pulse; // (11-11) no X pressed for the player: the game patches do the skipping
 				if (!movie_logged) {
 					movie_logged = true;
 					std::printf("[port] intro: skipping the start-up movie (KYTY_SKIP_INTRO)\n");
@@ -262,19 +262,18 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 				if (cine_seen == 0) cine_seen = now;
 				// Pressed 1.5 s into the cinematic (it plays by then) for 150 ms, again at 3 s in case the first was early.
 				const int64_t in = now - cine_seen;
-				if ((in > 400000000 && in < 550000000) || (in > 1200000000 && in < 1350000000)) data->buttons |= PAD_BUTTON_CROSS;
+				(void)in;
 				if (in >= 1350000000) {
 					cine_done = true;
 					cine_done_at = now;
-					std::printf("[port] intro: X pressed in the opening cinematic (KYTY_SKIP_INTRO)\n");
+					std::printf("[port] intro: opening cinematic seen (skipped by the game patch, no X pressed)\n");
 				}
 			}
 			// Then once at the title screen ("press a button"): straight to the main menu, 2 s after the cinematic's skip.
 			if (cine_done && !title_done && now - cine_done_at > 2000000000LL) {
-				data->buttons |= PAD_BUTTON_CROSS;
 				if (now - cine_done_at > 2150000000LL) {
 					title_done = true;
-					std::printf("[port] intro: X pressed at the title screen, to the main menu (KYTY_SKIP_INTRO)\n");
+					std::printf("[port] intro: title screen reached (no X pressed)\n");
 				}
 			}
 			// Black on screen meanwhile: the movie in the first 2 minutes; the first cinematic from its start until 1 s
