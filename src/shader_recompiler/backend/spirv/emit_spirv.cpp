@@ -19,6 +19,9 @@
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Backend::SPIRV {
+// BB objmv2 (emit_spirv_bb_objmv2.cpp).
+void EmitBBObjMvPrevCall(EmitContext& ctx);
+
 namespace {
 
 static constexpr spv::ExecutionMode GetInputPrimitiveType(AmdGpu::PrimitiveType type) {
@@ -151,8 +154,6 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
         UNREACHABLE_MSG("Phi node type {}", type);
     }
 }
-
-void EmitBBObjMvPrevCall(EmitContext& ctx);
 
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
