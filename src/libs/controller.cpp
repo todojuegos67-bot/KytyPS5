@@ -225,9 +225,56 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	}
 	// The player's first button (the world gate in videoOut.cpp starts from it).
 	if (connected && data->buttons != 0) Libs::VideoOut::NotePlayerInput();
-	// (11-10) KYTY_SKIP_INTRO=1: no presses for the player and nothing hidden; the PlayStation logo is skipped by the
-	// game's own cp11_debug_skipSplashScreens (demonsSoulsSkipIntro.cpp). The opening cinematic is left to the game
-	// (cutting it early broke the Nexus floor effect).
+	// (11-10) KYTY_SKIP_INTRO=1 (the launcher's "Saltar intro"): X pressed for the game while a movie plays in the first
+	// 2 minutes (the PlayStation logo), and once early in the first in-engine cinematic (the opening voidwalk) in the
+	// first 4 minutes. Not tied to the player's first button (a press during the logo must not cancel the cinematic's).
+	{
+		static const bool skip = [] {
+			const char* v = std::getenv("KYTY_SKIP_INTRO");
+			return v != nullptr && std::strcmp(v, "1") == 0;
+		}();
+		static const int64_t start     = SteadyNanoseconds();
+		static int64_t       cine_seen = 0;
+		static bool          cine_done = false, movie_logged = false;
+		static int64_t       cine_done_at = 0;
+		static bool          title_done   = false;
+		if (skip) {
+			const int64_t now   = SteadyNanoseconds();
+			const int64_t up    = now - start;
+			const bool    pulse = (now / 100000000) % 4 == 0; // (100 ms down every 400 ms)
+			if (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) {
+				if (pulse) data->buttons |= PAD_BUTTON_CROSS;
+				if (!movie_logged) {
+					movie_logged = true;
+					std::printf("[port] intro: skipping the start-up movie (KYTY_SKIP_INTRO)\n");
+				}
+			} else if (!cine_done && up < 240000000000LL && (cine_seen != 0 || Libs::VideoOut::CinematicPlaying())) {
+				// (from its first detection on, timed by the clock: its file reads stop long before it ends)
+				if (cine_seen == 0) cine_seen = now;
+				// Pressed 1.5 s into the cinematic (it plays by then) for 150 ms, again at 3 s in case the first was early.
+				const int64_t in = now - cine_seen;
+				if ((in > 400000000 && in < 550000000) || (in > 1200000000 && in < 1350000000)) data->buttons |= PAD_BUTTON_CROSS;
+				if (in >= 1350000000) {
+					cine_done = true;
+					cine_done_at = now;
+					std::printf("[port] intro: X pressed in the opening cinematic (KYTY_SKIP_INTRO)\n");
+				}
+			}
+			// Then once at the title screen ("press a button"): straight to the main menu, 2 s after the cinematic's skip.
+			if (cine_done && !title_done && now - cine_done_at > 2000000000LL) {
+				data->buttons |= PAD_BUTTON_CROSS;
+				if (now - cine_done_at > 2150000000LL) {
+					title_done = true;
+					std::printf("[port] intro: X pressed at the title screen, to the main menu (KYTY_SKIP_INTRO)\n");
+				}
+			}
+			// Black on screen meanwhile: the movie in the first 2 minutes; the first cinematic from its start until 1 s
+			// after the presses (it is gone by then; if not, it shows again rather than staying black).
+			const bool hide = (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) ||
+			                  (cine_seen != 0 && now - cine_seen < 2000000000LL);
+			Libs::VideoOut::SetIntroHidden(hide);
+		}
+	}
 	// (10-22) Only a stick ends a cutscene's hold (a button, X skipping included, keeps it until the player moves).
 	if (connected && (std::abs(data->left_stick_x - 128) > 48 || std::abs(data->left_stick_y - 128) > 48 ||
 	                  std::abs(data->right_stick_x - 128) > 48 || std::abs(data->right_stick_y - 128) > 48))
