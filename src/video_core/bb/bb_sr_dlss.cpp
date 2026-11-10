@@ -669,7 +669,13 @@ bool Evaluate(const Desc& desc) {
         sl::ResourceTag(&reactive, sl::kBufferTypeBiasCurrentColorHint,
                         sl::ResourceLifecycle::eValidUntilEvaluate, &render),
     };
-    const uint32_t tag_count = desc.has_reactive ? 5u : 4u;
+    // (11-10 09:28 log) Tagging the bias-current-colour hint flooded "isFormatSupported: Cannot have
+    // undefined format" and the game hung ~10 s in. Off for DLSS unless BB_DLSS_REACTIVE=1.
+    static const bool dlss_reactive = [] {
+        const char* v = std::getenv("BB_DLSS_REACTIVE");
+        return v != nullptr && v[0] == '1';
+    }();
+    const uint32_t tag_count = desc.has_reactive && dlss_reactive ? 5u : 4u;
     static const char* const tag_names[5]{"input colour", "output", "depth", "motion vectors",
                                           "reactive (bias current colour)"};
     static bool tags_logged = false;
