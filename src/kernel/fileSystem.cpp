@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -466,12 +467,32 @@ static void LogKernelRead(const char* kind, const std::filesystem::path& name, u
 	            static_cast<unsigned long long>(bytes), static_cast<long long>(offset), got, text.c_str());
 }
 
+bool IntroMovieBlocked(const char* path) {
+	static const bool skip = [] {
+		const char* v = std::getenv("KYTY_SKIP_INTRO");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	if (!skip || path == nullptr) return false;
+	std::string p(path);
+	for (auto& c: p) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	const bool blocked = p.find("movies/ps_studios_logo.bk2") != std::string::npos || p.find("movies/logo_intro.bk2") != std::string::npos;
+	if (blocked) {
+		static std::atomic<int> logged {0};
+		if (logged.fetch_add(1) < 4) {
+			std::printf("[port] intro: %s not loaded (KYTY_SKIP_INTRO)\n", path);
+			std::fflush(stdout);
+		}
+	}
+	return blocked;
+}
+
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	if (IntroMovieBlocked(path)) return KERNEL_ERROR_ENOENT;
 
 	auto flags_u = static_cast<uint32_t>(flags);
 	if (std::getenv("KYTY_APR_LOG") != nullptr && (std::strstr(path, "movie") != nullptr || std::strstr(path, "Movie") != nullptr))
@@ -1019,6 +1040,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	}
 
 	LOGF("\t KernelStat: %s\n", path);
+	if (IntroMovieBlocked(path)) return KERNEL_ERROR_ENOENT;
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
 

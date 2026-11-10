@@ -210,6 +210,10 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		}
 	}
 
+	if (!found && LibKernel::FileSystem::IntroMovieBlocked(path.c_str())) {
+		info.result = LibKernel::KERNEL_ERROR_ENOENT;
+		found       = true;
+	}
 	if (!found) {
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
 		info.host_path       = Common::PathToString(real_path);

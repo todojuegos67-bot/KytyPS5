@@ -10,6 +10,10 @@
 
 namespace Libs::LibKernel::FileSystem {
 
+// (11-10) KYTY_SKIP_INTRO=1: the start-up movies (movies/ps_studios_logo.bk2, movies/logo_intro.bk2) are not found.
+bool IntroMovieBlocked(const char* path);
+
+
 struct FileStat {
 	uint32_t       st_dev;
 	uint32_t       st_ino;
