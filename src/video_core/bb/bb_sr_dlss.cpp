@@ -16,6 +16,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
 
@@ -318,7 +319,13 @@ bool Preload() {
                 return l.find(std::string(",") + name + ",") != std::string::npos;
             };
             g_features.push_back(sl::kFeatureDLSS);
-            if (has("dlssg")) g_features.push_back(sl::kFeatureDLSS_G);
+            // BB_FG=dlss-*: DLSS-G is ours through NGX (bbport_dlss.dll); Streamline's DLSS-G
+            // plugin would hook the same swapchain and present a second time.
+            if (has("dlssg") && !BB::FG::Dlss::Requested()) {
+                g_features.push_back(sl::kFeatureDLSS_G);
+            } else if (has("dlssg")) {
+                BBLogf("DLSS: Streamline DLSS-G plugin not loaded (BB_FG=dlss uses the NGX bridge)");
+            }
             if (has("reflex")) g_features.push_back(sl::kFeatureReflex);
             if (has("pcl")) g_features.push_back(sl::kFeaturePCL);
             BBLogf("DLSS: Streamline features: %s; %s", list.c_str(),

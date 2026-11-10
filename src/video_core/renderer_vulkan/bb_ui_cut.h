@@ -45,6 +45,9 @@ public:
     // A presented address (the presenter's flip): a display buffer (FrameCapture::IsDisplayBuffer).
     static void NoteDisplayBuffer(VAddr address);
     static bool IsDisplayBuffer(VAddr address);
+    // The cut runs with an upscaler, or natively when frame generation wants its inputs (its
+    // HUD-less image and the frame's vectors at the cut). Native without FG: no cut.
+    static bool Active();
 
     // The draw into a display buffer (the game's first pass of a frame) starts a frame.
     void OnFrameStart();
@@ -111,6 +114,7 @@ private:
     vk::ImageView Mirror(OwnImage& img, vk::Format format, vk::ImageAspectFlags aspect,
                          bool alpha_one = false);
     bool RunScaled(SceneDepth& scene);
+    bool RunNativeFg(SceneDepth& scene, VideoCore::ImageId color, VideoCore::ImageId depth);
     void RunUiOnly(VideoCore::ImageId color, VideoCore::ImageId depth);
     void EnsureUiResources(u32 w, u32 h, vk::Format color, vk::Format depth);
     void PrepareUiDepth(VideoCore::ImageId depth);

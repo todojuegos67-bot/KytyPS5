@@ -1005,7 +1005,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             vk::ImageLayout bb_layout = image.backing->state.layout;
             // bb-clean-021-bbport (Supermedo's RedirectSampled): the display pass reads the
             // upscaled UI image instead of the render-size UI target.
-            if (BB::Upscale::Enabled() && !is_storage && bb_cut.RedirectsSampled(image_id)) {
+            if (BB::UiCut::Active() && !is_storage && bb_cut.RedirectsSampled(image_id)) {
                 bb_cut.RedirectSampled(image_id, image_view.info.format, bb_view, bb_layout);
             }
             image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
@@ -1059,7 +1059,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
-    if (!BB::Upscale::Enabled()) {
+    if (!BB::UiCut::Active()) {
         return;
     }
     const auto& regs = liverpool->regs;
@@ -1168,7 +1168,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.is_clear = is_clear;
 
         image->usage.render_target = 1u;
-        if (cb == 0 && BB::Upscale::Enabled()) {
+        if (cb == 0 && BB::UiCut::Active()) {
             bb_color_redirected = bb_cut.RedirectColor(image_id, desc.view_info, bb_redirect);
             if (bb_color_redirected) {
                 bb_guest_extent = {image->info.size.width, image->info.size.height};
@@ -1267,7 +1267,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
 
         image.usage.depth_target = true;
-        if (BB::Upscale::Enabled()) {
+        if (BB::UiCut::Active()) {
             BB::UiCut::Target depth_redirect{};
             bb_depth_redirected = bb_cut.RedirectDepth(image_id, depth_redirect);
             if (bb_depth_redirected) {

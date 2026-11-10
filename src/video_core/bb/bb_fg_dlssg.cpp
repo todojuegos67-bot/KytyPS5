@@ -17,6 +17,8 @@
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_fg_internal.h"
 #include "video_core/bb/bb_kyty_compat.h"
+#include "video_core/bb/bb_sr.h"
+#include "video_core/bb/bb_upscale.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -55,12 +57,22 @@ bool Load() {
     g_tried = true;
     const auto dir = ExeDir();
     const auto bridge = dir / L"bbport_dlss.dll";
-    HMODULE module = LoadLibraryW(bridge.c_str());
+    BBLogf("DLSS-G start 1/6: loading %ls", bridge.c_str());
+    if (!std::filesystem::exists(bridge)) {
+        BBLogf("DLSS-G: %ls is missing: off", bridge.c_str());
+        return false;
+    }
+    // Its dependencies from the executable's folder too (not the current directory).
+    HMODULE module = LoadLibraryExW(bridge.c_str(), nullptr,
+                                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                                        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!module) module = LoadLibraryW(bridge.c_str());
     if (!module) {
         BBLogf("DLSS-G: %ls not loaded (error %lu): off", bridge.c_str(), GetLastError());
         return false;
     }
     const auto get = reinterpret_cast<BbDlssGetApiFn>(GetProcAddress(module, "BbDlssGetApi"));
+    BBLogf("DLSS-G start 2/6: bridge loaded, BbDlssGetApi %s", get ? "found" : "MISSING");
     const BbDlssApi* api = get ? get() : nullptr;
     if (!api || api->abi < 2 || !api->FrameGenCreate) {
         BBLogf("DLSS-G: bbport_dlss.dll has no Frame Generation (ABI %u): off",
@@ -73,6 +85,8 @@ bool Load() {
                     ? (dir / L"streamline").wstring()
                     : dir.wstring();
     g_data_dir = dir.wstring();
+    BBLogf("DLSS-G start 3/6: configure (nvngx_dlssg.dll from %ls, found %d)", g_dll_dir.c_str(),
+           std::filesystem::exists(std::filesystem::path(g_dll_dir) / L"nvngx_dlssg.dll") ? 1 : 0);
     if (!api->Configure(g_dll_dir.c_str(), g_data_dir.c_str(), BridgeLog)) {
         BBLogf("DLSS-G: bridge configuration failed: off");
         return false;
@@ -93,7 +107,11 @@ void AddInstanceExtensions(const std::vector<std::string>& available,
     if (!Requested() || !Load()) return;
     uint32_t count = 0;
     const VkExtensionProperties* list = nullptr;
-    if (!g_api->InstanceExtensions(&count, &list)) return;
+    BBLogf("DLSS-G start 4/6: instance extension query");
+    if (!g_api->InstanceExtensions(&count, &list)) {
+        BBLogf("DLSS-G: instance extension query failed");
+        return;
+    }
     for (uint32_t i = 0; i < count; ++i) {
         const char* name = list[i].extensionName;
         const bool have = std::find(available.begin(), available.end(), name) != available.end();
@@ -112,7 +130,11 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
     if (!Requested() || !Load()) return;
     uint32_t count = 0;
     const VkExtensionProperties* list = nullptr;
-    if (!g_api->DeviceExtensions(instance, physical, &count, &list)) return;
+    BBLogf("DLSS-G start 5/6: device extension query");
+    if (!g_api->DeviceExtensions(instance, physical, &count, &list)) {
+        BBLogf("DLSS-G: device extension query failed (FG needs DLSS support): off");
+        return;
+    }
     for (uint32_t i = 0; i < count; ++i) {
         const char* name = list[i].extensionName;
         const bool have = std::find(available.begin(), available.end(), name) != available.end();
@@ -127,6 +149,10 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
 
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device) {
     if (!Requested() || !Load()) return;
+    BBLogf("DLSS-G start 6/6: NGX initialisation on the device%s",
+           BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss
+               ? " (Streamline DLSS SR already initialised NGX on it: a second init)"
+               : "");
     if (!g_api->Initialize(instance, physical, device,
                            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
                            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)) {
@@ -135,6 +161,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
     }
     g_max = g_api->FrameGenMaxCount();
     g_ready = g_max >= 1;
+    BBLogf("DLSS-G start done: MultiFrameCountMax %d", g_max);
     BBLogf("DLSS-G: %s (MultiFrameCountMax %d)", g_ready ? "available" : "NOT available", g_max);
 }
 
@@ -179,6 +206,8 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
             g_api->FrameGenRelease();
             g_has_feature = false;
         }
+        BBLogf("DLSS-G: feature creation %ux%u (render %ux%u)", want.width, want.height,
+               want.render_width, want.render_height);
         if (!g_api->FrameGenCreate(cmd, &want)) {
             BBLogf("DLSS-G: feature creation failed: off");
             g_failed = true;

@@ -219,16 +219,22 @@ void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId dep
     const bool ui_draw = movie && Rgba8(image.info.pixel_format) &&
                          RenderTarget(image.info.size.width, image.info.size.height) &&
                          !IsDisplayBuffer(image.info.guest_address);
-    const bool active = BB::Upscale::Enabled() && BB::Upscale::BackendReady();
-    switch (Vulkan::UiComposition::Choose(BB::Upscale::Enabled(), ui_draw, scene.valid && ldr_target == color,
-                                          active)) {
+    const bool scaled = BB::Upscale::Enabled();
+    // Native + frame generation (Supermedo's native path): the cut copies the background at the
+    // scene's size, the HUD-less image is taken before the UI draws, and the vectors / camera of
+    // the frame are made at the cut for the FG (the presenter then shows the display copy).
+    const bool native_fg = !scaled && BB::FG::WantInputs();
+    const bool active = scaled ? BB::Upscale::BackendReady() : native_fg;
+    switch (Vulkan::UiComposition::Choose(scaled || native_fg, ui_draw,
+                                          scene.valid && ldr_target == color, active)) {
     case Vulkan::UiComposition::Background::None:
         return;
     case Vulkan::UiComposition::Background::Temporal:
-        if (RunScaled(scene)) {
+        if (native_fg ? RunNativeFg(scene, color, depth) : RunScaled(scene)) {
             CaptureHudlessUi();
             return;
         }
+        if (ui_phase) return; // native: the vectors failed but the UI copy is in place
         // A failed dispatch must not force UI text back to the scene resolution.
         [[fallthrough]];
     case Vulkan::UiComposition::Background::Copy:
@@ -236,6 +242,35 @@ void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId dep
         CaptureHudlessUi();
         return;
     }
+}
+
+bool UiCut::Active() {
+    return BB::Upscale::Enabled() || BB::FG::WantInputs();
+}
+
+bool UiCut::RunNativeFg(SceneDepth& scene, VideoCore::ImageId color_id,
+                        VideoCore::ImageId depth_id) {
+    auto& color = texture_cache.GetImage(ldr_target);
+    const vk::Extent2D in{BB::Upscale::g_scene_w, BB::Upscale::g_scene_h};
+    VideoCore::ImageViewInfo ci{};
+    ci.format = color.info.pixel_format;
+    const vk::ImageView color_view = *color.FindView(ci, false).image_view;
+    runtime.Transit(&color, vk::ImageLayout::eShaderReadOnlyOptimal,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+    runtime.FlushBarriers();
+    scheduler.EndRendering();
+    BB::FG::Inputs fg{};
+    VideoCore::ImageId scene_depth{};
+    // No upscaler: Run only makes the vectors / camera and copies them for the FG (want_fg).
+    (void)sr->Run(scheduler.CommandBuffer(), texture_cache, runtime, color, color_view, in, in,
+                  scene, false, &fg, &scene_depth);
+    scheduler.GetDynamicState().Invalidate();
+    RunUiOnly(color_id, depth_id);
+    if (!ui_phase) return false;
+    cut_fg = fg;
+    std::scoped_lock lock{counter_mutex};
+    ++counters.cuts;
+    return fg.valid;
 }
 
 void UiCut::EnsureUiResources(u32 w, u32 h, vk::Format color, vk::Format depth) {
@@ -329,7 +364,14 @@ void UiCut::PrepareUiDepth(VideoCore::ImageId depth_id) {
 void UiCut::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId depth_id) {
     auto& color = texture_cache.GetImage(color_id);
     u32 ow = color.info.size.width, oh = color.info.size.height;
-    if (!OutputSize(ow, oh)) return;
+    const bool native = !BB::Upscale::Enabled(); // frame generation without an upscaler
+    if (native) {
+        ow = BB::Upscale::g_scene_w;
+        oh = BB::Upscale::g_scene_h;
+        if (!ow || !oh) return;
+    } else if (!OutputSize(ow, oh)) {
+        return;
+    }
     if (ow < color.info.size.width || oh < color.info.size.height) return;
     const auto depth_format = depth_id ? texture_cache.GetImage(depth_id).info.pixel_format
                                        : vk::Format::eD32SfloatS8Uint;

@@ -1089,7 +1089,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     BB::UiCut::NoteDisplayBuffer(image.info.guest_address);
     BB::UiCut::Display bb_display{};
     const bool bb_cut_frame =
-        BB::Upscale::Enabled() &&
+        BB::UiCut::Active() &&
         rasterizer->bb_cut.DisplayOverride(image.info.guest_address, view_info.format, bb_display);
     if (bb_cut_frame) {
         const vk::ImageMemoryBarrier2 to_read{
