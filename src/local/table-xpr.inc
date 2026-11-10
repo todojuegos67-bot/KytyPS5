@@ -1808,12 +1808,17 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			if (const auto* spec = Spec::Current();
 			    current && held.size != 0 && spec != nullptr && spec->JournalIntersects(held.address, held.size))
 				current = false;
-			if (current && held.size != 0 && held.registration != buffer_cache.RegistrationEpoch()) {
-				// Buffers were registered or unregistered since: it holds while none covered its tracker regions.
+			if (const auto registration = buffer_cache.RegistrationEpoch();
+			    current && held.size != 0 && held.registration != registration) {
+				// Buffers were registered or unregistered since: it holds while none covered its tracker regions. (The
+				// epoch read before the regions': a speculative translation's thread runs beside the render thread's
+				// registrations. The render thread's own entries cannot meet one midway: it registers itself. A
+				// worker's entries outlive its translation, in its executor's table, so an epoch read after a
+				// registration began proved them for later translations too.)
 				for (auto region = held.address / TRACKER_REGION_SIZE, last = (held.address + held.size - 1) / TRACKER_REGION_SIZE;
 				     current && region <= last; ++region)
 					current = buffer_cache.RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) <= held.registration;
-				if (current) held.registration = buffer_cache.RegistrationEpoch();
+				if (current) held.registration = registration;
 			}
 			if (current && held.size != 0) {
 				// Another page of its tracker regions was written: the range itself may still be clean.
@@ -1892,6 +1897,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						}
 					}
 					if (cpu_written) buffer_cache.EnsureBufferContents(address, size);
+					const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
 					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, false, formatted);
 					region_epochs.fill({UINT64_MAX, 0});
 					// (The epoch before the dirty check: a write after it moves the epoch.)
@@ -1904,7 +1910,9 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					fresh.dwords       = static_cast<uint32_t>(std::min<uint64_t>(size / 4, UINT32_MAX));
 					fresh.address      = address;
 					fresh.size         = size;
-					fresh.registration = buffer_cache.RegistrationEpoch(); // (after ObtainBuffer's own registrations)
+					// (The owner's: after ObtainBuffer's own registrations. A speculation's: before its lookup, which the
+					// render thread's registrations may pass.)
+					fresh.registration = Spec::Current() != nullptr ? registration_before : buffer_cache.RegistrationEpoch();
 				}
 				held = fresh;
 			}
@@ -2379,6 +2387,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		held = {};
 		LiveCensus::Scope miss(LiveCensus::DrawPhase, 0x7ab1e, &held == &table.args ? 10 : 11);
 		prepare();
+		const auto registration_before = buffer_cache.RegistrationEpoch(); // (a speculation's: before its lookup)
 		const auto result = buffer_cache.ObtainBuffer(address, size, false);
 		region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
 		const auto owner  = spec_state != nullptr ? buffer_cache.RegisteredBuffer(address, size)
@@ -2396,7 +2405,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 					end   = address + size;
 				}
 				if (epoch != 0 && !buffer_cache.IsRegionCpuDirty(begin, end - begin))
-					held = {begin, end, epoch, buffer_cache.RegistrationEpoch(), result.first};
+					held = {begin, end, epoch, spec_state != nullptr ? registration_before : buffer_cache.RegistrationEpoch(),
+					        result.first};
 			}
 		}
 		return result;
