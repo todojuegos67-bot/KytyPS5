@@ -130,7 +130,7 @@ void KYTY_SYSV_ABI Hook(uint8_t* cam, const uint8_t* cd) {
 	if (g_pending != nullptr) g_pending->store(0, std::memory_order_relaxed);
 	const int64_t dx = g_mx.exchange(0, std::memory_order_acq_rel);
 	const int64_t dy = g_my.exchange(0, std::memory_order_acq_rel);
-	if ((dx != 0 || dy != 0) && g_yaw_sign.load() != 0 && g_pitch_sign.load() != 0) {
+	if (dx != 0 && g_yaw_sign.load() != 0 && g_pitch_sign.load() != 0) {
 		uint32_t yaw_off = BaseYawRate;
 		std::memcpy(&yaw_off, reinterpret_cast<const void*>(g_linear + YawRateOffset), sizeof(yaw_off));
 		const float dt = F(cam, 0x44), rate_y = F(cd, yaw_off), rate_p = F(cd, 0x1ec);
@@ -140,7 +140,7 @@ void KYTY_SYSV_ABI Hook(uint8_t* cam, const uint8_t* cd) {
 			const float yaw = static_cast<float>(g_yaw_sign.load()) * static_cast<float>(dx) * rad / (rate_y * dt);
 			const float pit = static_cast<float>(g_pitch_sign.load()) * static_cast<float>(dy) * rad / (rate_p * dt);
 			std::memcpy(cam + 0x124, &yaw, sizeof(yaw));
-			std::memcpy(cam + 0x120, &pit, sizeof(pit));
+			(void)pit; // (11-10b) the vertical stays the emulated stick's (this+0x120 left as the game read it)
 			g_injected++;
 			g_deg += std::fabs(static_cast<double>(dx)) * g_dpc.load(std::memory_order_relaxed);
 		}

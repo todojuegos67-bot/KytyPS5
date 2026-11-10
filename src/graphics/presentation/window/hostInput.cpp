@@ -1317,7 +1317,10 @@ bool HostInputMouseMotion(int dx, int dy) {
 	}
 	// (11-10) Direct mouse camera: while the free camera runs, the counts turn it by their angle (no stick, no cap).
 	if (g_kbm.captured && g_kbm.enabled && Loader::DemonsSoulsCamera::DirectTakesMouse()) {
-		Loader::DemonsSoulsCamera::DirectAddMouse(dx, dy);
+		// (11-10b) Only the horizontal turn goes direct: the game's free camera ignored the vertical stick written there
+		// (the camera did not look up or down). The vertical stays on the emulated stick, as before.
+		Loader::DemonsSoulsCamera::DirectAddMouse(dx, 0);
+		g_kbm.acc_y.fetch_add(static_cast<int64_t>(dy) * KBM_ONE, std::memory_order_acq_rel);
 		g_kbm.received.fetch_add((std::llabs(dx) + std::llabs(dy)) * KBM_ONE, std::memory_order_relaxed);
 		return true;
 	}
