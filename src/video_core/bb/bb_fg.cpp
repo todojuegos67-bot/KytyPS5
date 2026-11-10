@@ -760,7 +760,11 @@ double LongQuantile() {
     if (g_long_count < 48) return 0.0;
     static const double q = [] {
         const char* v = std::getenv("BB_DLSSG_PACE_Q");
-        const double x = v != nullptr && *v != '\0' ? std::atof(v) : 95.0;
+        // bb-149fix: default the median (50th), not the 95th: with DLSS-G and no cap the
+        // 95th-percentile step held the game at ~37 fps with [pace] waits of 16-19 ms per frame
+        // (shad_log 2026-11-10: real 26.79 ms, waits avg 18.6 ms): the CPU slept while the GPU
+        // had nothing queued. BB_DLSSG_PACE_Q=95 restores the old step.
+        const double x = v != nullptr && *v != '\0' ? std::atof(v) : 50.0;
         return std::clamp(x, 50.0, 99.5) / 100.0;
     }();
     const int n = std::min(g_long_count, kLongWindow);
