@@ -253,9 +253,8 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 				if (cine_seen == 0) cine_seen = now;
 				// Pressed 1.5 s into the cinematic (it plays by then) for 150 ms, again at 3 s in case the first was early.
 				const int64_t in = now - cine_seen;
-				// The game skips this cinematic with "Hold-to-Skip (X)" (eboot string): X held from 0.4 s to 3.4 s.
-				if (in > 400000000 && in < 3400000000LL) data->buttons |= PAD_BUTTON_CROSS;
-				if (in >= 3400000000LL) {
+				if ((in > 400000000 && in < 550000000) || (in > 1200000000 && in < 1350000000)) data->buttons |= PAD_BUTTON_CROSS;
+				if (in >= 1350000000) {
 					cine_done = true;
 					cine_done_at = now;
 					std::printf("[port] intro: X pressed in the opening cinematic (KYTY_SKIP_INTRO)\n");
