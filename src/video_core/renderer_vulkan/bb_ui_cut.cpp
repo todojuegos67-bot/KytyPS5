@@ -12,6 +12,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <chrono>
 #include <fmt/format.h>
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
@@ -159,7 +163,39 @@ bool UiCut::RenderTarget(u32 w, u32 h) const {
     return sw && sh && w >= sw && h >= sh && w - sw < 8 && h - sh < 8;
 }
 
+// bb-mv149: per-second HUD-cut diagnostics: draws after the cut (UI, at the output size) and
+// draws into the LDR render-size target BEFORE the cut that are not Scaleform movie draws (scene
+// side: post passes, or HUD elements the cut missed; their VS hashes, for BB_UI_TRIGGER_VS).
+namespace {
+std::chrono::steady_clock::time_point g_diag_start{};
+u32 g_diag_ui_draws = 0, g_diag_cuts = 0, g_diag_frames = 0;
+std::unordered_map<u64, u32> g_diag_pre_cut;
+void DiagFrame() {
+    ++g_diag_frames;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_diag_start.time_since_epoch().count() == 0) g_diag_start = now;
+    if (now - g_diag_start < std::chrono::seconds(1)) return;
+    std::vector<std::pair<u64, u32>> v(g_diag_pre_cut.begin(), g_diag_pre_cut.end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::string list;
+    u32 total = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        total += v[i].second;
+        if (i < 8) list += fmt::format(" {:016x}x{}", v[i].first, v[i].second);
+    }
+    BB::Upscale::Checkpoint(fmt::format(
+        "[ui-cut] 1 s: {} frames, {} cut, HUD draws cut {} (after the cut, output size) | "
+        "non-movie draws into the LDR scene target before the cut {} (VS:{})",
+        g_diag_frames, g_diag_cuts, g_diag_ui_draws, total, list.empty() ? " none" : list));
+    g_diag_pre_cut.clear();
+    g_diag_ui_draws = g_diag_cuts = g_diag_frames = 0;
+    g_diag_start = now;
+}
+} // namespace
+
 void UiCut::OnFrameStart() {
+    if (ui_phase) ++g_diag_cuts;
+    DiagFrame();
     // The display pass of an upscaled frame reads the upscaled UI image.
     display_redirect = ui_phase;
     display_fg = display_redirect ? cut_fg : BB::FG::Inputs{};
@@ -199,6 +235,7 @@ void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId dep
     }
     if (!color) return;
     if (ui_phase) {
+        ++g_diag_ui_draws;
         // A UI movie can start without stencil and enable it for later text/masks.
         if (color == ui_color && depth && depth != ui_depth) {
             EnsureUiResources(ui_width, ui_height, ui_format,
@@ -216,6 +253,7 @@ void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId dep
     const auto& image = texture_cache.GetImage(color);
     const bool movie = (ui_trigger_vs && vs_hash == ui_trigger_vs) ||
                        Vulkan::UiComposition::MovieShader(vs_hash);
+    if (!movie && ldr_target == color) ++g_diag_pre_cut[vs_hash];
     (void)native_viewport; // Supermedo: only for his live resolution path (guest targets 1080p)
     const bool ui_draw = movie && Rgba8(image.info.pixel_format) &&
                          RenderTarget(image.info.size.width, image.info.size.height) &&
