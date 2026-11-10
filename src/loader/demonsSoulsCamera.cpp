@@ -159,11 +159,11 @@ bool InstallDirect(Program* program, uint64_t tilt, uint64_t linear, const char*
 	const uint64_t requested = program->base_vaddr + CaveOffset;
 	const uint64_t cave      = Libs::LibKernel::Memory::AllocateRuntimeMemory(
         requested, CavePage, Common::VirtualMemory::Mode::ExecuteReadWrite, "demons_souls_kbm_camera", true);
-	const auto near = [&](uint64_t a) {
+	const auto is_near = [&](uint64_t a) {
 		const int64_t d = static_cast<int64_t>(a) - static_cast<int64_t>(cave);
 		return d > -0x70000000LL && d < 0x70000000LL;
 	};
-	if (cave == 0 || !near(tilt) || !near(linear)) {
+	if (cave == 0 || !is_near(tilt) || !is_near(linear)) {
 		if (cave != 0) Libs::LibKernel::Memory::FreeGuestMemory(cave, CavePage);
 		*why = "no executable memory near the eboot";
 		return false;
@@ -177,7 +177,7 @@ bool InstallDirect(Program* program, uint64_t tilt, uint64_t linear, const char*
 	const uint8_t* site_a = c.getCurr();
 	c.db(reinterpret_cast<const uint8_t*>(tilt), 8);
 	c.cmp(byte[rip + flag], 0); // (flags are dead: the test sets them, the linear branch reads none)
-	c.jne(reinterpret_cast<const void*>(linear), Xbyak::CodeGenerator::T_NEAR);
+	c.jne(reinterpret_cast<const void*>(linear));
 	c.jmp(reinterpret_cast<const void*>(tilt + 8), Xbyak::CodeGenerator::T_NEAR);
 	// Site B: registers, flags and FP state kept, below the red zone, on a realigned stack; then "ramp = 0" and on.
 	c.align(16);
