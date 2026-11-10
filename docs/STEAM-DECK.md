@@ -52,6 +52,12 @@ In **Desktop Mode** (hold the power button > Switch to Desktop):
 
 The package's `run-deck.sh` sets everything below; nothing else needs installing.
 
+**Updating** to a newer version: extract its Steam Deck package the same way, copy everything inside the new folder
+into `~/KytyPS5` and let it replace the files (Dolphin: Overwrite All; in Konsole `cp -r <new folder>/. ~/KytyPS5/`),
+then run the `chmod +x` line above again. Your saves (`_SaveData`), the shader cache (`_PipelineCache`) and cheat files
+are not in the package, so they stay, and the Steam shortcut keeps its launch options. The first play after an update
+may compile some shaders again.
+
 ## 2. The game
 
 The game is the folder with `eboot.bin` (`PPSA01341-app0`, about 82 GB) or the same packed as a ZArchive
