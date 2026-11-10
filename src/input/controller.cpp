@@ -1,6 +1,7 @@
 ﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -465,6 +466,18 @@ void GameControllers::TryOpenSDLControllers() {
 u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     auto g = SDL_GetGamepadFromID(id);
     ASSERT(g != nullptr);
+    // bb: Bloodborne is single player. With two pads connected (e.g. an 8BitDo next to another
+    // XInput pad or receiver) the second one was player 2 and the game ignored it. Every pad
+    // drives player 1 unless BB_MULTI_PAD=1.
+    static const bool multi = [] {
+        const char* v = std::getenv("BB_MULTI_PAD");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!multi) {
+        for (int i = 0; i < 5; i++) {
+            if (controllers[i]->m_sdl_gamepad == g) return 0;
+        }
+    }
     for (int i = 0; i < 5; i++) {
         if (controllers[i]->m_sdl_gamepad == g) {
             return i;
