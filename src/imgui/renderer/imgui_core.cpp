@@ -248,7 +248,14 @@ ImGuiID NewFrame(bool is_reusing_frame) {
     if (!DebugState.IsShowingDebugMenuBar()) {
         flags |= ImGuiDockNodeFlags_NoTabBar;
     }
+    // bb: no border / padding / separator around the game's dock: the game image used to get a
+    // 2560x1438 area in a 2560x1440 window (a thin light line at the top and left edges, the frame
+    // rescaled by 2 px, and FSR 3 FG refusing the HUD-less image: 1438 != the 1440 back buffer).
+    GetStyle().DockingSeparatorSize = 0.0f;
+    PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0.0f, 0.0f});
     ImGuiID dockId = DockSpaceOverViewport(0, GetMainViewport(), flags);
+    PopStyleVar(2);
 
     for (auto* layer : layers) {
         layer->Draw();

@@ -1588,6 +1588,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 }
 
                 ImVec2 contentArea = ImGui::GetContentRegionAvail();
+                {
+                    // bb: the game area should be the whole window (was 2px short: see imgui_core.cpp).
+                    static s32 said_w = -1, said_h = -1;
+                    if ((s32)contentArea.x != said_w || (s32)contentArea.y != said_h) {
+                        said_w = (s32)contentArea.x;
+                        said_h = (s32)contentArea.y;
+                        BB::Upscale::Checkpoint(fmt::format("game area {}x{} in a {}x{} swapchain", said_w,
+                                                            said_h, extent.width, extent.height));
+                    }
+                }
                 SetExpectedGameSize((s32)contentArea.x, (s32)contentArea.y);
 
                 const auto imgRect =
