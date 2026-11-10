@@ -126,6 +126,12 @@ struct State {
     // several enemies of one model share shader, vertex and index streams and were told apart
     // only by draw order, which changes with sorting (an enemy given another one's positions).
     std::unordered_map<u64, Entry> prev_pal, cur_pal;
+    // bb-149fix: positions half by RENDERED frame (frames that stored positions), not by flip:
+    // a flip without a G-buffer pass (repeat flips when the fps drops) used to move the history
+    // on with an empty map, so the next rendered frame had no previous positions (characters
+    // camera-only) or loaded from two frames back. Such flips now keep the history.
+    u64 pos_frame = 0;
+    u64 kept_flips = 0;
     std::unordered_map<u64, u32> pal_ordinals;
     // 1.29 [fg-skinmv] per second (draws).
     u64 sk_pal = 0, sk_exact = 0, sk_loose = 0, sk_none = 0, sk_overflow = 0, sk_frames = 0;
@@ -710,7 +716,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         ++g.st_rigid_tracked;
     }
 
-    const u32 half = static_cast<u32>(g.frame & 1);
+    const u32 half = static_cast<u32>(g.pos_frame & 1);
     if (g.cursor + count > g.per_half || g.params_used + 1 >= kParamsPerFrame) {
         // Dropped draws keep camera motion. Split by palette class, with the largest one, so the
         // next log shows whether character skeletons are among them.
@@ -953,6 +959,22 @@ void OnFlip() {
     if (!g.ready) return;
     ++g.frame;
     ++g.st_frames;
+    if (g.cursor == 0 && g.cur.empty()) {
+        // bb-149fix: nothing rendered with positions since the last flip: keep last rendered
+        // frame's history (see State::pos_frame).
+        ++g.kept_flips;
+        g.ordinals.clear();
+        g.loose_ordinals.clear();
+        g.pal_ordinals.clear();
+        g.params_used = 0;
+        g.cleared = false;
+        g.latched = g.written;
+        g.written = false;
+        g.loaded_last = g.loaded_frame;
+        g.loaded_frame = 0;
+        return;
+    }
+    ++g.pos_frame;
     g.prev = std::move(g.cur);
     g.cur.clear();
     g.ordinals.clear();
@@ -972,10 +994,12 @@ void OnFlip() {
                 "[fg-skinmv] 1.29 {} frames: skinned (bone palette) draws {} with true per-vertex "
                 "previous positions ({:.1f} %: {} by palette identity, {} exact, {} loose), {} "
                 "without (camera only), {} over the budget | rigid / small-skeleton draws {} with "
-                "previous positions, {} without | palette identity {}",
+                "previous positions, {} without | palette identity {} | flips without positions "
+                "(history kept, bb-149fix) {}",
                 g.sk_frames, with, all ? 100.0 * double(with) / double(all) : 0.0, g.sk_pal,
                 g.sk_exact, g.sk_loose, g.sk_none, g.sk_overflow, g.ot_prev, g.ot_none,
-                PaletteIdOn() ? "on" : "off (BB_OBJMV_PALETTE_ID=0)"));
+                PaletteIdOn() ? "on" : "off (BB_OBJMV_PALETTE_ID=0)", g.kept_flips));
+            g.kept_flips = 0;
             g.sk_pal = g.sk_exact = g.sk_loose = g.sk_none = g.sk_overflow = g.sk_frames = 0;
             g.ot_prev = g.ot_none = 0;
             g.sk_since = now;
