@@ -31,6 +31,19 @@ LIVE_FILE = STATE / 'live-commands.txt'
 ENTRIES = ('PPSA01341', '.kyty-capacity', '.kyty-param', '.kyty-backup')
 
 
+def move(source, target):
+    """A rename on the same volume (nothing is deleted). A folder another program holds a moment (WinError 5 on
+    _SaveData/.kyty-backup at a prepare, 11-08 and 11-10) is tried again for up to 10 s before it fails."""
+    for attempt in range(20):
+        try:
+            source.rename(target)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.5)
+
+
 def digest(root):
     files = {}
     for path in sorted(root.rglob('*')):
@@ -62,12 +75,12 @@ def prepare():
             source = SAVES / name
             if source.exists():
                 manifest['entries'][name] = digest(source) if source.is_dir() else None
-                source.rename(backup / name)  # a move on the same volume: nothing is deleted
+                move(source, backup / name)
                 moved.append(name)
     except OSError:
         # (A folder another program holds, e.g. 10-20 .kyty-capacity: the ones moved go back, the user's save in place.)
         for name in reversed(moved):
-            (backup / name).rename(SAVES / name)
+            move(backup / name, SAVES / name)
         backup.rmdir()
         raise
     for name in ENTRIES:
@@ -88,7 +101,7 @@ def reset():
     used.mkdir(parents=True)
     for name in ENTRIES:
         if (SAVES / name).exists():
-            (SAVES / name).rename(used / name)
+            move(SAVES / name, used / name)
         if (BASELINE / name).exists():
             shutil.copytree(BASELINE / name, SAVES / name)
     print('baseline save reinstalled')
@@ -109,12 +122,12 @@ def restore():
     used.mkdir(parents=True, exist_ok=True)
     for name in ENTRIES:
         if (SAVES / name).exists():
-            (SAVES / name).rename(used / name)  # the benchmark's copy is kept, not deleted
+            move(SAVES / name, used / name)  # the benchmark's copy is kept, not deleted
     for name, files in manifest['entries'].items():
-        (backup / name).rename(SAVES / name)
+        move(backup / name, SAVES / name)
         if files is not None and digest(SAVES / name) != files:
             sys.exit(f'restored {name} does not match its manifest')
-    active.rename(STATE / f'restored-{manifest["stamp"]}.json')
+    move(active, STATE / f'restored-{manifest["stamp"]}.json')
     print(f'user save restored and verified ({sum(len(f or {}) for f in manifest["entries"].values())} files)')
 
 
