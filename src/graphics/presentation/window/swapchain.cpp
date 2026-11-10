@@ -1501,9 +1501,15 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 			region.dstOffsets[1]                 = vk::Offset3D {px[ix].d1, py[iy].d1, 1};
 		}
 	}
-	vk_command.blitImage(blit_source->image, vk::ImageLayout::eTransferSrcOptimal,
-	                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, count, regions,
-	                     vk::Filter::eLinear);
+	if (Libs::VideoOut::IntroHidden()) {
+		// (11-10) KYTY_SKIP_INTRO: the start-up movie and the opening cinematic are skipped behind black.
+		const vk::ClearColorValue black {std::array<float, 4> {0.0f, 0.0f, 0.0f, 1.0f}};
+		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, &black, 1, &to_transfer.subresourceRange);
+	} else {
+		vk_command.blitImage(blit_source->image, vk::ImageLayout::eTransferSrcOptimal,
+		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, count, regions,
+		                     vk::Filter::eLinear);
+	}
 
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType         = vk::StructureType::eImageMemoryBarrier;

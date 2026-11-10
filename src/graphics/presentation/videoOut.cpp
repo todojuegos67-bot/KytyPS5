@@ -693,6 +693,13 @@ void NotePace(int kind) noexcept {
 	a.clear();
 	b.clear();
 }
+static std::atomic<bool> g_intro_hidden {false};
+void SetIntroHidden(bool hidden) noexcept {
+	g_intro_hidden.store(hidden, std::memory_order_relaxed);
+}
+bool IntroHidden() noexcept {
+	return g_intro_hidden.load(std::memory_order_relaxed);
+}
 bool PlayerInputSeen() noexcept {
 	return g_world_ready.load(std::memory_order_relaxed);
 }

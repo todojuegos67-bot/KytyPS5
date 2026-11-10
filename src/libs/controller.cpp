@@ -236,6 +236,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 		static const int64_t start     = SteadyNanoseconds();
 		static int64_t       cine_seen = 0;
 		static bool          cine_done = false, movie_logged = false;
+		static int64_t       cine_done_at = 0;
 		if (skip) {
 			const int64_t now   = SteadyNanoseconds();
 			const int64_t up    = now - start;
@@ -253,9 +254,15 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 				if ((in > 1500000000 && in < 1650000000) || (in > 3000000000LL && in < 3150000000LL)) data->buttons |= PAD_BUTTON_CROSS;
 				if (in >= 3150000000LL) {
 					cine_done = true;
+					cine_done_at = now;
 					std::printf("[port] intro: X pressed in the opening cinematic (KYTY_SKIP_INTRO)\n");
 				}
 			}
+			// Black on screen meanwhile: the movie in the first 2 minutes; the first cinematic from its start until 1 s
+			// after the presses (it is gone by then; if not, it shows again rather than staying black).
+			const bool hide = (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) ||
+			                  (cine_seen != 0 && (!cine_done || now - cine_done_at < 1000000000LL) && up < 240000000000LL);
+			Libs::VideoOut::SetIntroHidden(hide);
 		}
 	}
 	// (10-22) Only a stick ends a cutscene's hold (a button, X skipping included, keeps it until the player moves).
