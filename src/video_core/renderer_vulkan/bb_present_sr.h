@@ -67,6 +67,11 @@ private:
     void Destroy(OwnImage& img);
     void Barrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout);
     bool Init();
+    // bb-reactive: the reactive mask (bb_reactive.comp) and FSR 4's blend (bb_reactive_blend.comp).
+    bool InitReactive();
+    bool RunReactive(vk::CommandBuffer cmd, vk::Extent2D in, float jx, float jy, bool camera_ok);
+    void BlendFsr4(vk::CommandBuffer cmd, vk::Extent2D in, vk::Extent2D out, float jx, float jy);
+    void ReactiveStats(vk::Extent2D in);
 
     const Vulkan::Instance& instance;
     bool init_tried = false, init_ok = false;
@@ -91,6 +96,27 @@ private:
     bool slot_sr[Slots]{};
     u32 frames = 0;
     vk::Extent2D last_in{}, last_out{};
+
+    // bb-reactive
+    bool r_tried = false, r_ok = false;
+    vk::Sampler linear{};
+    vk::DescriptorSetLayout r_set_layout{}, b_set_layout{};
+    vk::PipelineLayout r_layout{}, b_layout{};
+    vk::Pipeline r_pipeline{}, b_pipeline{};
+    OwnImage mask, prev_color;
+    bool prev_valid = false;
+    float prev_jitter[2]{};
+    vk::Buffer r_stats{};
+    VmaAllocation r_stats_alloc{};
+    u32* r_stats_ptr = nullptr;
+    static constexpr u32 RSlots = 8;
+    u32 r_slot = 0;
+    u32 r_frames = 0;
+    float t_cov_last = 0.0f; // the transparency coverage last read (the guard)
+    bool t_guard = false;
+    // The once-a-second [reactive] line.
+    u64 rs_px = 0, rs_t = 0, rs_m = 0, rs_r = 0, rs_sum = 0;
+    u32 rs_frames = 0, rs_read = 0, rs_tvalid = 0, rs_guarded = 0, rs_draws = 0, rs_copies = 0;
 };
 
 } // namespace BB

@@ -9,11 +9,15 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
+#include "video_core/host_shaders/bb_reactive_blend_comp.h"
+#include "video_core/host_shaders/bb_reactive_comp.h"
+#include "video_core/renderer_vulkan/bb_reactive.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -34,6 +38,16 @@ PresentSr::~PresentSr() {
         Destroy(fs.depth);
         Destroy(fs.motion);
     }
+    Destroy(mask);
+    Destroy(prev_color);
+    if (r_pipeline) device.destroyPipeline(r_pipeline);
+    if (b_pipeline) device.destroyPipeline(b_pipeline);
+    if (r_layout) device.destroyPipelineLayout(r_layout);
+    if (b_layout) device.destroyPipelineLayout(b_layout);
+    if (r_set_layout) device.destroyDescriptorSetLayout(r_set_layout);
+    if (b_set_layout) device.destroyDescriptorSetLayout(b_set_layout);
+    if (linear) device.destroySampler(linear);
+    if (r_stats) vmaDestroyBuffer(instance.GetAllocator(), r_stats, r_stats_alloc);
     if (pipeline) device.destroyPipeline(pipeline);
     if (layout) device.destroyPipelineLayout(layout);
     if (set_layout) device.destroyDescriptorSetLayout(set_layout);
@@ -343,6 +357,15 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     desc.output = {output.image, output.view, output.format, out, vk::ImageLayout::eGeneral,
                    output.usage};
     desc.has_reactive = false;
+    // bb-reactive: the reactive mask (transparency + self motion) for every upscaler but the
+    // emulator's TAA; FSR 4 (no reactive input in its model) gets it as a blend afterwards.
+    if (BB::Upscale::Cfg().kind != BB::SR::Kind::Taa && BB::Reactive::AnyOn() &&
+        RunReactive(cmd, in, jx, jy,
+                    cam.mv_valid && !cam.reset && in == last_in && out == last_out)) {
+        desc.has_reactive = true;
+        desc.reactive = {mask.image, mask.view, mask.format, in,
+                         vk::ImageLayout::eShaderReadOnlyOptimal, mask.usage};
+    }
     desc.render = in;
     desc.upscale = out;
     desc.jitter[0] = jx;
@@ -404,6 +427,9 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     if (!ok) {
         return {};
     }
+    if (desc.has_reactive && BB::Upscale::Cfg().kind == BB::SR::Kind::Fsr4) {
+        BlendFsr4(cmd, in, out, jx, jy);
+    }
     if (BB::Dlss5::Wanted()) {
         // DLSS 5 (BB_DLSS5 1..3, from 1.59): Neural Rendering on the upscaled output, in place.
         (void)BB::Dlss5::Apply(desc);
@@ -418,6 +444,320 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                                             BB::SR::QualityName(BB::Upscale::Cfg().quality)));
     }
     return output.view;
+}
+
+namespace {
+float EnvF(const char* name, float fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == 0) return fallback;
+    char* end = nullptr;
+    const float f = std::strtof(v, &end);
+    return end != v && std::isfinite(f) ? f : fallback;
+}
+} // namespace
+
+bool PresentSr::InitReactive() {
+    if (r_tried) return r_ok;
+    r_tried = true;
+    const auto device = instance.GetDevice();
+    const auto physical = instance.GetPhysicalDevice();
+    const auto r8 = physical.getFormatProperties(vk::Format::eR8Unorm).optimalTilingFeatures;
+    if (!(r8 & vk::FormatFeatureFlagBits::eStorageImage) ||
+        !(r8 & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)) {
+        BB::Upscale::Checkpoint("[reactive] R8 storage images not supported: reactive mask off");
+        return false;
+    }
+    auto [sr, s] = device.createSampler({
+        .magFilter = vk::Filter::eLinear,
+        .minFilter = vk::Filter::eLinear,
+        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        .maxLod = 0.0f,
+    });
+    if (sr != vk::Result::eSuccess) return false;
+    linear = s;
+    const auto make = [&](std::span<const vk::DescriptorSetLayoutBinding> bindings, u32 push_size,
+                          std::span<const u32> code, vk::DescriptorSetLayout& set_layout_out,
+                          vk::PipelineLayout& layout_out, vk::Pipeline& pipeline_out) -> bool {
+        auto [lr, l] = device.createDescriptorSetLayout({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+        if (lr != vk::Result::eSuccess) return false;
+        set_layout_out = l;
+        const vk::PushConstantRange range{vk::ShaderStageFlagBits::eCompute, 0, push_size};
+        auto [pr, pl] = device.createPipelineLayout({
+            .setLayoutCount = 1,
+            .pSetLayouts = &set_layout_out,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        });
+        if (pr != vk::Result::eSuccess) return false;
+        layout_out = pl;
+        const auto module = Vulkan::CompileSPV(code, device);
+        if (!module) return false;
+        const vk::ComputePipelineCreateInfo ci{
+            .stage{.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = "main"},
+            .layout = layout_out,
+        };
+        auto [cr, p] = device.createComputePipeline({}, ci);
+        device.destroyShaderModule(module);
+        if (cr != vk::Result::eSuccess) return false;
+        pipeline_out = p;
+        return true;
+    };
+    constexpr auto Cis = vk::DescriptorType::eCombinedImageSampler;
+    constexpr auto Comp = vk::ShaderStageFlagBits::eCompute;
+    const std::array<vk::DescriptorSetLayoutBinding, 7> rb{{
+        {0, Cis, 1, Comp},
+        {1, Cis, 1, Comp},
+        {2, Cis, 1, Comp},
+        {3, Cis, 1, Comp},
+        {4, Cis, 1, Comp},
+        {5, vk::DescriptorType::eStorageImage, 1, Comp},
+        {6, vk::DescriptorType::eStorageBuffer, 1, Comp},
+    }};
+    const std::array<vk::DescriptorSetLayoutBinding, 3> bb{{
+        {0, Cis, 1, Comp},
+        {1, Cis, 1, Comp},
+        {2, vk::DescriptorType::eStorageImage, 1, Comp},
+    }};
+    if (!make(rb, 64, BB_REACTIVE_COMP, r_set_layout, r_layout, r_pipeline) ||
+        !make(bb, 32, BB_REACTIVE_BLEND_COMP, b_set_layout, b_layout, b_pipeline)) {
+        BB::Upscale::Checkpoint("[reactive] pipelines not created: reactive mask off");
+        return false;
+    }
+    const VkBufferCreateInfo bci = vk::BufferCreateInfo{
+        .size = RSlots * 4 * sizeof(u32),
+        .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+    };
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer buffer{};
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(instance.GetAllocator(), &bci, &aci, &buffer, &r_stats_alloc, &info) ==
+        VK_SUCCESS) {
+        r_stats = buffer;
+        r_stats_ptr = static_cast<u32*>(info.pMappedData);
+    } else {
+        BB::Upscale::Checkpoint("[reactive] stats buffer not created: reactive mask off");
+        return false;
+    }
+    r_ok = true;
+    BB::Upscale::Checkpoint(fmt::format(
+        "[reactive] on: transparency {} (BB_REACTIVE), self motion {} (BB_SELFMOTION), FSR 4 "
+        "blend {:.2f} (BB_FSR4_REACTIVE)",
+        BB::Reactive::TransparencyOn() ? "on" : "off", BB::Reactive::SelfMotionOn() ? "on" : "off",
+        EnvF("BB_FSR4_REACTIVE", 0.6f)));
+    return true;
+}
+
+bool PresentSr::RunReactive(vk::CommandBuffer cmd, vk::Extent2D in, float jx, float jy,
+                            bool camera_ok) {
+    const auto snap = BB::Reactive::Take();
+    if (!InitReactive()) return false;
+    if (!Ensure(mask, in, vk::Format::eR8Unorm) ||
+        !Ensure(prev_color, in, vk::Format::eR16G16B16A16Sfloat)) {
+        return false;
+    }
+    if (prev_color.layout == vk::ImageLayout::eUndefined) prev_valid = false;
+    // Tunables (read once).
+    static const float t_scale = EnvF("BB_REACTIVE_SCALE", 2.0f);
+    static const float t_max = std::clamp(EnvF("BB_REACTIVE_MAX", 0.9f), 0.0f, 1.0f);
+    static const float t_maxcov = EnvF("BB_REACTIVE_MAXCOV", 0.5f);
+    static const float m_strength = std::clamp(EnvF("BB_SELFMOTION_STRENGTH", 0.8f), 0.0f, 1.0f);
+    static const float m_threshold = EnvF("BB_SELFMOTION_THRESHOLD", 0.03f);
+    static const float m_gain = EnvF("BB_SELFMOTION_GAIN", 8.0f);
+
+    // The stats slot four frames back (long finished in a normal pipeline): coverage, guard.
+    const u32 w_slot = r_slot;
+    r_slot = (r_slot + 1) % RSlots;
+    ++r_frames;
+    if (r_frames > 4 && r_stats_ptr != nullptr) {
+        const u32 rd = (w_slot + RSlots - 4) % RSlots;
+        vmaInvalidateAllocation(instance.GetAllocator(), r_stats_alloc, 0, VK_WHOLE_SIZE);
+        const u32* c = r_stats_ptr + rd * 4;
+        const u64 px = u64(in.width) * in.height;
+        t_cov_last = px ? float(c[0]) / float(px) : 0.0f;
+        // Deferred lighting or a full-screen pass taken for transparency would mark most of
+        // the picture: no transparency part then (measured on, applied off) until it drops.
+        t_guard = t_cov_last > t_maxcov;
+        rs_px += px;
+        rs_t += c[0];
+        rs_m += c[1];
+        rs_r += c[2];
+        rs_sum += c[3];
+        ++rs_read;
+    }
+
+    const bool t_valid = snap.valid && snap.extent == in;
+    const bool m_valid = BB::Reactive::SelfMotionOn() && camera_ok && prev_valid;
+    u32 flags = 0;
+    if (t_valid) flags |= 1u;
+    if (t_valid && !t_guard) flags |= 2u;
+    if (m_valid) flags |= 4u | 8u;
+    rs_frames++;
+    rs_tvalid += t_valid ? 1 : 0;
+    rs_guarded += (t_valid && t_guard) ? 1 : 0;
+    rs_draws += snap.draws;
+    rs_copies += snap.copies;
+
+    // Clear this frame's stats slot.
+    cmd.fillBuffer(r_stats, w_slot * 16, 16, 0);
+    {
+        const vk::BufferMemoryBarrier2 bb{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            .buffer = r_stats,
+            .offset = w_slot * 16,
+            .size = 16,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                                .pBufferMemoryBarriers = &bb});
+    }
+    if (!prev_valid || prev_color.layout != vk::ImageLayout::eShaderReadOnlyOptimal) {
+        Barrier(cmd, prev_color, vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+    Barrier(cmd, mask, vk::ImageLayout::eGeneral);
+
+    struct {
+        u32 size[4];
+        float jitter[4];
+        float k[4];
+        float k2[4];
+    } push{};
+    static_assert(sizeof(push) == 64);
+    push.size[0] = in.width;
+    push.size[1] = in.height;
+    push.size[2] = flags;
+    push.size[3] = w_slot;
+    push.jitter[0] = jx;
+    push.jitter[1] = jy;
+    push.jitter[2] = prev_jitter[0];
+    push.jitter[3] = prev_jitter[1];
+    push.k[0] = t_scale;
+    push.k[1] = t_max;
+    push.k[2] = m_strength;
+    push.k[3] = m_threshold;
+    push.k2[0] = m_gain;
+    const auto ro = vk::ImageLayout::eShaderReadOnlyOptimal;
+    const vk::DescriptorImageInfo cur_info{sampler, color.view, ro};
+    const vk::DescriptorImageInfo prev_info{linear, prev_color.view, ro};
+    const vk::DescriptorImageInfo mv_info{sampler, motion.view, ro};
+    const vk::DescriptorImageInfo before_info{sampler, t_valid ? snap.before : color.view, ro};
+    const vk::DescriptorImageInfo after_info{sampler, t_valid ? snap.after : color.view, ro};
+    const vk::DescriptorImageInfo mask_info{{}, mask.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo stats_info{r_stats, 0, VK_WHOLE_SIZE};
+    const auto img = [](u32 binding, const vk::DescriptorImageInfo* info) {
+        return vk::WriteDescriptorSet{.dstBinding = binding,
+                                      .descriptorCount = 1,
+                                      .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                      .pImageInfo = info};
+    };
+    const std::array writes{
+        img(0, &cur_info),
+        img(1, &prev_info),
+        img(2, &mv_info),
+        img(3, &before_info),
+        img(4, &after_info),
+        vk::WriteDescriptorSet{.dstBinding = 5,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &mask_info},
+        vk::WriteDescriptorSet{.dstBinding = 6,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = &stats_info},
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, r_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, r_layout, 0, writes);
+    cmd.pushConstants(r_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
+    Barrier(cmd, mask, vk::ImageLayout::eShaderReadOnlyOptimal);
+
+    // This frame's colour becomes the next frame's previous one.
+    Barrier(cmd, color, vk::ImageLayout::eTransferSrcOptimal);
+    Barrier(cmd, prev_color, vk::ImageLayout::eTransferDstOptimal);
+    cmd.copyImage(color.image, vk::ImageLayout::eTransferSrcOptimal, prev_color.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {in.width, in.height, 1},
+                  });
+    Barrier(cmd, color, vk::ImageLayout::eShaderReadOnlyOptimal);
+    Barrier(cmd, prev_color, vk::ImageLayout::eShaderReadOnlyOptimal);
+    prev_valid = true;
+    prev_jitter[0] = jx;
+    prev_jitter[1] = jy;
+    ReactiveStats(in);
+    return true;
+}
+
+void PresentSr::ReactiveStats(vk::Extent2D in) {
+    static auto t0 = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - t0 < std::chrono::seconds(1)) return;
+    t0 = now;
+    const auto pct = [&](u64 v) { return rs_px ? 100.0 * double(v) / double(rs_px) : 0.0; };
+    BB::Upscale::Checkpoint(fmt::format(
+        "[reactive] 1 s: {} frames ({} read), mask >0.1: {:.1f}% (transparency {:.1f}%, self "
+        "motion {:.1f}%), mean {:.3f}; transparency snapshots {} frames ({} guarded off, last "
+        "coverage {:.1f}%), {:.1f} draws / {:.1f} copies per frame, {}x{}",
+        rs_frames, rs_read, pct(rs_r), pct(rs_t), pct(rs_m),
+        rs_px ? double(rs_sum) / 255.0 / double(rs_px) : 0.0, rs_tvalid, rs_guarded,
+        100.0 * t_cov_last, rs_frames ? double(rs_draws) / rs_frames : 0.0,
+        rs_frames ? double(rs_copies) / rs_frames : 0.0, in.width, in.height));
+    rs_px = rs_t = rs_m = rs_r = rs_sum = 0;
+    rs_frames = rs_read = rs_tvalid = rs_guarded = rs_draws = rs_copies = 0;
+}
+
+void PresentSr::BlendFsr4(vk::CommandBuffer cmd, vk::Extent2D in, vk::Extent2D out, float jx,
+                          float jy) {
+    static const float strength = std::clamp(EnvF("BB_FSR4_REACTIVE", 0.6f), 0.0f, 1.0f);
+    if (strength <= 0.0f || !r_ok) return;
+    Barrier(cmd, output, vk::ImageLayout::eGeneral);
+    struct {
+        u32 size[4];
+        float k[4];
+    } push{};
+    static_assert(sizeof(push) == 32);
+    push.size[0] = out.width;
+    push.size[1] = out.height;
+    push.size[2] = in.width;
+    push.size[3] = in.height;
+    push.k[0] = jx;
+    push.k[1] = jy;
+    push.k[2] = strength;
+    const auto ro = vk::ImageLayout::eShaderReadOnlyOptimal;
+    const vk::DescriptorImageInfo cur_info{linear, color.view, ro};
+    const vk::DescriptorImageInfo mask_info{linear, mask.view, ro};
+    const vk::DescriptorImageInfo out_info{{}, output.view, vk::ImageLayout::eGeneral};
+    const std::array writes{
+        vk::WriteDescriptorSet{.dstBinding = 0,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &cur_info},
+        vk::WriteDescriptorSet{.dstBinding = 1,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &mask_info},
+        vk::WriteDescriptorSet{.dstBinding = 2,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &out_info},
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, b_pipeline);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, b_layout, 0, writes);
+    cmd.pushConstants(b_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+    cmd.dispatch((out.width + 7) / 8, (out.height + 7) / 8, 1);
+    Barrier(cmd, output, vk::ImageLayout::eGeneral);
 }
 
 bool PresentSr::EnsureDepth(OwnImage& img, vk::Extent2D extent, vk::Format format) {

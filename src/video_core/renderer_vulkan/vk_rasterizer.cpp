@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/renderer_vulkan/bb_reactive.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -201,6 +202,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     PrepareRenderState(pipeline);
     BbUiDraw(pipeline);
+    BbReactiveDraw();
     if (!BindResources(pipeline)) {
         return;
     }
@@ -267,6 +269,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     PrepareRenderState(pipeline);
     BbUiDraw(pipeline);
+    BbReactiveDraw();
     if (!BindResources(pipeline)) {
         return;
     }
@@ -1081,6 +1084,25 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
                       UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2),
                       bb_scene_depth);
     }
+}
+
+void Rasterizer::BbReactiveDraw() {
+    // bb-reactive: the transparency mask's snapshots (bb_reactive.h). Only with an upscaler up;
+    // the same scene test as the jitter (BeginRendering), before this draw's resources are bound.
+    if (!BB::Upscale::BackendReady() || !BB::Reactive::TransparencyOn()) {
+        return;
+    }
+    const auto& regs = liverpool->regs;
+    bool scene = false;
+    if (db_desc.image_id && regs.depth_control.depth_enable && !bb_cut.UiPhase()) {
+        const auto& depth = texture_cache.GetImage(db_desc.image_id);
+        scene = depth.info.size.width == BB::Upscale::g_scene_w &&
+                depth.info.size.height == BB::Upscale::g_scene_h;
+    }
+    const bool blend =
+        regs.blend_control[0].enable && !regs.color_buffers[0].info.blend_bypass;
+    BB::Reactive::OnDraw(instance, scheduler, runtime, texture_cache, cb_descs[0].image_id, scene,
+                         regs.depth_control.depth_write_enable, blend, bb_scene_depth.valid);
 }
 
 void Rasterizer::BbUpdateUiTransform() {

@@ -1,0 +1,99 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-reactive: the upscalers' reactive mask (R8, render size, 1 = trust this frame's colour).
+//  - transparency: what the transparent draws (fog, particles, effects) added to the scene
+//    colour, from the copies before / after them (bb_reactive.h);
+//  - self motion: the previous frame's colour, reprojected by the camera vectors, outside this
+//    frame's 3x3 colour range: the pixel moved on its own (player, weapon, enemies, cloth) or was
+//    uncovered by such a move, so the camera-only vector is wrong there.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D cur_tex;    // this frame (nearest)
+layout(binding = 1) uniform sampler2D prev_tex;   // previous frame (linear)
+layout(binding = 2) uniform sampler2D mv_tex;     // render pixels towards the previous frame
+layout(binding = 3) uniform sampler2D before_tex; // scene colour before the transparent draws
+layout(binding = 4) uniform sampler2D after_tex;  // ... and after them
+layout(binding = 5, r8) uniform writeonly image2D mask_out;
+layout(std430, binding = 6) buffer Stats {
+    uint counts[];
+} stats;
+layout(push_constant) uniform Push {
+    uvec4 size;  // width, height, flags, stats slot
+    vec4 jitter; // this frame's jitter, the previous frame's (render pixels)
+    vec4 k;      // transparency scale, transparency max, self motion strength, threshold
+    vec4 k2;     // self motion gain
+} p;
+
+// flags
+const uint TRANSP_VALID = 1u;   // before / after copies of this frame
+const uint TRANSP_APPLY = 2u;   // ... written into the mask
+const uint MOTION_VALID = 4u;   // previous frame and camera vectors usable
+const uint MOTION_APPLY = 8u;
+
+shared uint s_counts[4];
+
+float Max3(vec3 v) {
+    return max(v.x, max(v.y, v.z));
+}
+
+vec3 Tonemap(vec3 c) {
+    c = max(c, vec3(0.0));
+    return c / (1.0 + Max3(c));
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationIndex;
+    if (lid < 4u) {
+        s_counts[lid] = 0u;
+    }
+    barrier();
+
+    const ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = ivec2(p.size.xy);
+    const bool inside = c.x < size.x && c.y < size.y;
+    float rt = 0.0, rm = 0.0, r = 0.0;
+    if (inside) {
+        if ((p.size.z & TRANSP_VALID) != 0u) {
+            const vec3 a = Tonemap(texelFetch(before_tex, c, 0).rgb);
+            const vec3 b = Tonemap(texelFetch(after_tex, c, 0).rgb);
+            const float d = Max3(abs(b - a));
+            rt = isnan(d) ? 0.0 : clamp(d * p.k.x, 0.0, p.k.y);
+        }
+        if ((p.size.z & MOTION_VALID) != 0u) {
+            // This frame's 3x3 range, in a roughly perceptual (square root) space.
+            vec3 mn = vec3(1e9), mx = vec3(-1e9);
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    const ivec2 q = clamp(c + ivec2(x, y), ivec2(0), size - 1);
+                    const vec3 v = sqrt(clamp(texelFetch(cur_tex, q, 0).rgb, 0.0, 1.0));
+                    mn = min(mn, v);
+                    mx = max(mx, v);
+                }
+            }
+            const vec2 mv = texelFetch(mv_tex, c, 0).rg;
+            // Scene position = pixel - jitter (bb_mv.comp); the previous pixel = its scene
+            // position + the previous jitter.
+            const vec2 prev_px = vec2(c) + 0.5 - p.jitter.xy + mv + p.jitter.zw;
+            if (all(greaterThanEqual(prev_px, vec2(0.5))) &&
+                all(lessThanEqual(prev_px, vec2(size) - 0.5)) && !any(isnan(mv))) {
+                const vec3 pv =
+                    sqrt(clamp(textureLod(prev_tex, prev_px / vec2(size), 0.0).rgb, 0.0, 1.0));
+                const float d = Max3(max(mn - pv, pv - mx));
+                rm = clamp((d - p.k.w) * p.k2.x, 0.0, 1.0) * p.k.z;
+            }
+        }
+        r = max((p.size.z & TRANSP_APPLY) != 0u ? rt : 0.0,
+                (p.size.z & MOTION_APPLY) != 0u ? rm : 0.0);
+        imageStore(mask_out, c, vec4(r, 0.0, 0.0, 0.0));
+        // Coverage (pixels over 0.1): transparency (as measured), self motion, written mask;
+        // and the mask's sum (x255).
+        if (rt > 0.1) atomicAdd(s_counts[0], 1u);
+        if (rm > 0.1) atomicAdd(s_counts[1], 1u);
+        if (r > 0.1) atomicAdd(s_counts[2], 1u);
+        atomicAdd(s_counts[3], uint(r * 255.0 + 0.5));
+    }
+    barrier();
+    if (lid < 4u && s_counts[lid] != 0u) {
+        atomicAdd(stats.counts[p.size.w * 4u + lid], s_counts[lid]);
+    }
+}

@@ -132,6 +132,7 @@ private:
     void ResetBindings(bool is_compute);
     // bb-clean-021-bbport: Supermedo's HUD cut (bb_ui_cut.h): his OnFrameStart / OnColorTarget /
     // OnDraw before the draw's resources are bound.
+    void BbReactiveDraw();
     void BbUiDraw(const GraphicsPipeline* pipeline);
     // Supermedo's UpdateUiTransform: the scale of a draw into the output-size UI images.
     void BbUpdateUiTransform();
