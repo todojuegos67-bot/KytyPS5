@@ -89,6 +89,15 @@ SceneGuard、TextureMips 各 1）。在 9af7b0d9 上用 `pgo-multi.ps1` 默认�
 （用 `-fprofile-instr-generate` 把一个 TU 编成 IR，`__profd_` 里的哈希与 `llvm-profdata show --all-functions` 的
 `Hash:` 对比，可以列出具体是哪些函数失效。）
 
+2026-11-10（台式机）：合并 PR #293（推测翻译，43054ac5，不含它用于验证的 profile 提交）和 #305 的 f48636db 之后，在合并后的
+树（edddd1d9）上用 `pgo-multi.ps1` 默认的五次运行（模式 0）重新训练。ab-exe ABBA，120 Hz 上限，3 轮，每轮走 10 秒后测两个
+10 秒窗口，A 为合并前（f48636db，11-09 的 profile），B 为合并后（新 profile），模式 0：
+- 1-1：渲染线程 13.88 → 13.39 ms/帧，fps 70.30 → 72.47；
+- Latria：12.06 → 12.08 ms，fps 78.95 → 78.17；
+- 1-1 竞技场（`rec-m02_00_00_00-c0000_0006`）：8.66 → 8.68 ms，fps 108.50 → 108.58。
+持平（1-1 略好）。17 次启动的日志都是模式 0，没有致命错误。重扫只剩 redZonePatcher.cpp 的 17 个。旧的另存为
+`_Build\pgo\windows\kyty-before-20261110.profdata`。
+
 ## 推测模式（`KYTY_SPECULATE=4`）
 
 默认的五次训练都在模式 0 下运行，模式 4 自己的路径（推测线程上的翻译和状态遍历、提交检查，以及模式 0 的函数在
