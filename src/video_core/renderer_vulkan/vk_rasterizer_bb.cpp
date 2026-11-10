@@ -4330,6 +4330,7 @@ struct FlashDet {
     u32 seen = 0;             // last GPU `checked` value read
     double mean[3]{-1, -1, -1};
     u32 ev[3]{};
+    u32 lo[3]{}, hi[3]{}, dec[3]{};
     u32 flashes = 0, frames = 0;
     std::string detail;
     std::chrono::steady_clock::time_point t{};
@@ -4345,6 +4346,7 @@ void FlashDetect(u32 events) {
         // frames is skipped, so the neighbours are the last frames read.
         const u32 idx = checked - 1;
         const double m = g_hs.fc_mapped[9] / 256.0;
+        const u32 smin = g_hs.fc_mapped[7], smax = g_hs.fc_mapped[8], sdec = g_hs.fc_mapped[0];
         const bool adjacent = checked == g_fd.seen + 1;
         g_fd.seen = checked;
         if (!adjacent) g_fd.mean[0] = g_fd.mean[1] = -1;
@@ -4352,6 +4354,12 @@ void FlashDetect(u32 events) {
         g_fd.ev[0] = g_fd.ev[1];
         g_fd.mean[1] = g_fd.mean[2];
         g_fd.ev[1] = g_fd.ev[2];
+        g_fd.lo[1] = g_fd.lo[2];
+        g_fd.hi[1] = g_fd.hi[2];
+        g_fd.dec[1] = g_fd.dec[2];
+        g_fd.lo[2] = smin;
+        g_fd.hi[2] = smax;
+        g_fd.dec[2] = sdec;
         g_fd.mean[2] = m;
         g_fd.ev[2] = g_fd.events[idx % 256];
         ++g_fd.frames;
@@ -4369,7 +4377,8 @@ void FlashDetect(u32 events) {
                 if (g_fd.detail.size() < 400) {
                     const u32 e = g_fd.ev[1];
                     g_fd.detail += fmt::format(
-                        " [{:.0f}->{:.0f}->{:.0f}:{}{}{}{}{}{}{}]", a, b, cc,
+                        " [{:.0f}->{:.0f}->{:.0f} rgb {:06x}..{:06x} guard {}:{}{}{}{}{}{}{}]", a,
+                        b, cc, g_fd.lo[1], g_fd.hi[1], g_fd.dec[1],
                         e & 1 ? " sr-reset" : "", e & 2 ? " hud-miss" : "",
                         e & 4 ? " path-switch" : "", e & 8 ? " guarded" : "",
                         e & 16 ? " objmv-nohist" : "", e & 32 ? " fg-spike" : "",

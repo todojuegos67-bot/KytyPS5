@@ -58,7 +58,9 @@ void main() {
             // 1.43: only the observed failure signature: every sample within 3 of one value and
             // that value mid-grey (0x7D +-12 on every channel). Dark / foggy scenes never match.
             uvec3 lo = s_min[0], hi = s_max[0];
-            bool grey = all(greaterThanEqual(lo, uvec3(0x71u))) && all(lessThanEqual(hi, uvec3(0x89u)));
+            // bb-149fix: 0x60..0xA0 (bb-149fix-359 log: single-frame flashes at mean 139 = 0x8B, above
+            // the 1.43 window, never rejected).
+            bool grey = all(greaterThanEqual(lo, uvec3(0x60u))) && all(lessThanEqual(hi, uvec3(0xA0u)));
             bool flat_ = max(r.r, max(r.g, r.b)) <= 3u && grey && (max(hi.r, max(hi.g, hi.b)) - min(lo.r, min(lo.g, lo.b))) <= 3u;
             st.checked += 1u;
             st.frame_mean = s_sum[0] / 3u;
