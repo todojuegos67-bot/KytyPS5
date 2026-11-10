@@ -266,6 +266,7 @@ shortcut):
 | `-Set KYTY_FSR_SHARPNESS=0.3` | With `-Upscaler fsr`: FSR 3's own sharpening, 0 (none) to 1 (the launcher's "Sharpening"; 0.6, Medium, by default) |
 | `-FrameGen 1` | DLSS frame generation, the number of generated frames per rendered one (`1` = 2x, up to `5`; RTX 40 or newer, needs Streamline) |
 | `-Gpu 1` | The graphics card on a PC with more than one: its number in the log's `Vulkan GPU <n>:` lines, or a part of its name (`-Gpu 4090`); give `precompile.cmd` the same `-Gpu`, so the shaders are compiled for that card. Without it the first discrete GPU, in the order Windows' graphics settings give |
+| `-Set KYTY_SPECULATE=4` | Experimental: the game's GPU work translated ahead by worker threads (parallel translation, mode 4), faster where the render thread limits the frame rate (+6% to +16% over the worlds in one test at 120 fps: Core i9-12900K, RTX 5090). Needs 28 GB of RAM or more (it uses about 3.6 GB more) and at least 9 logical CPUs on the performance cores; otherwise it stays off and the log says so |
 | `-Set KEY=VALUE` | An emulator switch, e.g. `-Set KYTY_SHADER_PREFETCH=0` (several: `-Set A=1,B=2`); the issues name the ones worth trying |
 
 The launcher has a box for these too (Advanced, "Command-line options"), written as after `run.cmd`: its `-Set`
