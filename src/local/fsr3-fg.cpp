@@ -291,6 +291,17 @@ void DestroyFrameGeneration() {
 }
 
 bool CreateFrameGeneration(GraphicContext& graphics, vk::Extent2D display, vk::Extent2D render, vk::Format format) {
+	// (11-10) The device was lost right as the frame generation context was created (after a cutscene, the F2 menu
+	// opened before): the GPU first finishes everything in flight (both queues held while it does).
+	{
+		Common::LockGuard queue_lock(graphics.queue_mutex);
+		if (graphics.present_queue != nullptr && &graphics.present_queue_mutex != &graphics.queue_mutex) {
+			Common::LockGuard present_lock(graphics.present_queue_mutex);
+			(void)graphics.device.waitIdle();
+		} else {
+			(void)graphics.device.waitIdle();
+		}
+	}
 	DestroyFrameGeneration();
 	ffxCreateBackendVKDesc backend {};
 	backend.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
