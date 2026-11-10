@@ -1378,11 +1378,13 @@ int main(int argc, char* argv[]) {
 		// (ds-pc-port46) The warmup threads as the emulator launcher's fixed 16 (was the CCD's CPUs - 2: 14).
 		// (ds-pc-port47) The prefetch threads left to the emulator's default (no override).
 	}
-	// (11-10) The frame generation switches the plan does not set are cleared: the process (and the DLSS fresh process,
+	// (11-10) The frame generation and fps-cap switches the plan does not set are cleared (KYTY_FLIP_FPS=30 left by
+	// a Souls ligero / low run held the next ultra run at 30 real fps): the process (and the DLSS fresh process,
 	// which inherits it) could still hold an earlier mode's (AMD's KYTY_FSR3_FG after switching to DLSS: both frame
 	// generations ran at once, the FSR 3 interpolation queue stalled and the GPU was lost).
 	for (const char* stale: {"KYTY_FSR3_FG", "KYTY_FSR3_FG_FRAMES", "KYTY_FSR3_HUD_LAYER", "KYTY_FSR3_MFG", "KYTY_FSR3_DYNAMIC",
-	                         "KYTY_FRAMEGEN", "KYTY_DLSSG_DYNAMIC", "KYTY_FLIP_DECOUPLE"}) {
+	                         "KYTY_FRAMEGEN", "KYTY_DLSSG_DYNAMIC", "KYTY_FLIP_DECOUPLE", "KYTY_FLIP_FPS",
+	                         "KYTY_VRR_CAP_FPS", "KYTY_FRAMEGEN_BASE"}) {
 		bool set = false;
 		for (const auto& kv: plan.env) set = set || kv.first == stale;
 		if (!set && std::getenv(stale) != nullptr) {
