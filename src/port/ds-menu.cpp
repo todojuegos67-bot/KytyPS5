@@ -2988,6 +2988,7 @@ void Draw(ImDrawList* dl, float W, float H, float unit) {
 	dl->PopTexture();
 }
 } // namespace Ambience
+#include "port/ds-fog.inc"
 
 // The tooltip of the last item (the launcher's ToolTip: on hover, after a short pause; also on disabled rows).
 void Tip(const char* tip) {
@@ -4003,7 +4004,18 @@ void DrawLauncher(float width, float height) {
 			bg->AddRectFilledMultiColor({0, y0 + h - U(60)}, {width, y0 + h}, IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 0), IM_COL32(14, 16, 22, 255), IM_COL32(14, 16, 22, 255));
 		}
 	}
-	if (g_saved.launcher_ambience) Ambience::Draw(bg, width, height, g_unit); // (des-fog-hq) the launcher only (lanzador_ambiente)
+	// (11-10) The fog and the embers, on the GPU (ds-fog.inc), over the art and under the menus (lanzador_ambiente).
+	if (g_saved.launcher_ambience) {
+		float ix = 0, iy = 0, iw = width, ih = height;
+		if (g_background != nullptr && g_bg_w > 0 && g_bg_h > 0) {
+			iw = width;
+			ih = g_bg_h * (width / g_bg_w);
+			iy = ih >= height ? 0.0f : (height - ih) * 0.5f;
+		}
+#if defined(_WIN32)
+		FogGpu::Draw(bg, width, height, ix, iy, iw, ih, 1.0f);
+#endif
+	}
 	if (ImFont* f = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont(); f != nullptr) {
 		// (ds-pc-port39) The fork's credit at the window's top-right corner, tight to it (margin 11 px x the unit, right-aligned
 		// by its measured width), small and subtle with a soft shadow; on the foreground list: above the Opciones column.
@@ -6216,7 +6228,7 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	// RenderDrawData, before anything is drawn): no black launcher while they load.
 	if (!g_config_mode) {
 		EnsureBackground();
-		if (g_saved.launcher_ambience) Ambience::Create();
+		FogGpu::g_renderer = renderer; // (11-10) the GPU fog draws through this renderer's D3D11 device
 	}
 	SDL_ShowCursor(SDL_ENABLE);
 	CloseSplash();
@@ -6307,6 +6319,8 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	if (g_start_result > 0) *settings = g_edit;
 	// (ds-pc-port8) As Launcher-souls.ps1 (each change written at once): Salir / Esc keep the changes too.
 	if (g_start_result < 0 && !g_config_mode) Save();
+	FogGpu::Shutdown();
+	FogGpu::g_renderer = nullptr;
 	ImGui_ImplSDLRenderer2_Shutdown(); // (destroys the background's SDL texture too)
 	ImGui_ImplSDL2_Shutdown();
 	if (g_background != nullptr) {
