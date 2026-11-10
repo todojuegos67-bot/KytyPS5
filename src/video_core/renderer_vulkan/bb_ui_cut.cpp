@@ -568,6 +568,7 @@ bool UiCut::RedirectColor(VideoCore::ImageId color, const VideoCore::ImageViewIn
     display.valid = true;
     display.fg = display_fg;
     display.hudless = display_hudless;
+    display.rt_format = view_info.format;
     target = {Mirror(display.image, view_info.format, vk::ImageAspectFlagBits::eColor),
               vk::ImageLayout::eGeneral, ui_width, ui_height, false};
     {
@@ -614,9 +615,21 @@ bool UiCut::DisplayOverride(VAddr address, vk::Format format, Display& out) {
     auto& d = it->second;
     out = {};
     out.image = d.image.image;
-    // As the presenter views the guest buffer: alpha one.
-    out.view = Mirror(d.image, format, vk::ImageAspectFlagBits::eColor, true);
-    out.format = format;
+    // Viewed with the format the display pass WROTE it with (as Supermedo's DisplayOverride returns
+    // the display image's own format), alpha one. The presenter's frame format can differ (BGRA vs
+    // RGBA order, sRGB vs UNORM): viewing the host copy with it swapped red and blue / shifted the
+    // gamma on every frame (menus too). Only the sRGB-ness of the presenter's format is kept.
+    const vk::Format rt = d.rt_format != vk::Format::eUndefined ? d.rt_format : format;
+    const vk::Format shown = WithSrgb(rt, IsSrgb(format));
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        BB::Upscale::Checkpoint(fmt::format("Display: written as {}, presenter asks {}, shown as {}",
+                                            vk::to_string(rt), vk::to_string(format),
+                                            vk::to_string(shown)));
+    }
+    out.view = Mirror(d.image, shown, vk::ImageAspectFlagBits::eColor, true);
+    out.format = shown;
     out.width = d.image.width;
     out.height = d.image.height;
     out.fg = d.fg;

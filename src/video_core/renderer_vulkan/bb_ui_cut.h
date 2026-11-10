@@ -144,6 +144,7 @@ private:
         bool valid = false;
         BB::FG::Inputs fg{};
         int hudless = -1;
+        vk::Format rt_format = vk::Format::eUndefined; // the format the display pass wrote it with
     };
     std::mutex display_mutex;
     std::unordered_map<VAddr, HostDisplay> displays;
