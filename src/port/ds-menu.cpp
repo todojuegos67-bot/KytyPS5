@@ -6316,7 +6316,11 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	Ambience::Shutdown(); // (des-fog-hq) fog and ash freed before the game starts
 	FreeTexture(g_knight);
 	g_knight_tried = false;
-	g_font_body = g_font_semi = g_font_serif = nullptr;
+	// (11-10) g_font_display too: it was left pointing into the destroyed launcher context, and the in-game menu (F2:
+	// headers and cards through DisplayFont()) then used a freed ImFont - ImGui wrote through it into freed memory
+	// (heap corruption: the game crashing in its job worker or the GPU lost right after the menu opened, or a crash
+	// in ImFont::GetFontBaked, exe+0x1ff83c). The menu falls back to its current font.
+	g_font_body = g_font_semi = g_font_serif = g_font_display = nullptr;
 	ImGui::DestroyContext(context);
 	ImGui::SetCurrentContext(previous);
 	g_background       = nullptr;
