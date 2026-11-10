@@ -6,8 +6,6 @@
 // a motion streak and a soft glow (the near ones larger and softer). Premultiplied alpha, dithered (no banding).
 // Nothing is drawn when the renderer is not Direct3D 11 or the shader does not compile (the plain art stays).
 #if defined(_WIN32)
-#include <d3d11.h>
-#include <d3dcompiler.h>
 
 namespace FogGpu {
 

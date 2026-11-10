@@ -19,6 +19,14 @@
 #include "graphics/presentation/window/hostInput.h"
 #include "libs/trophy.h"
 
+#if defined(_WIN32)
+// (11-10) Before SDL.h (its SDL_system.h only declares ID3D11Device): the launcher fog (ds-fog.inc) uses the full types.
+#include <d3d11.h>
+#include <d3dcompiler.h>
+#undef interface
+#undef small
+#undef hyper
+#endif
 #include "SDL.h"
 #include "SDL_syswm.h"
 #include "imgui.h"
