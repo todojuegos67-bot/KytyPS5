@@ -2415,8 +2415,8 @@ void Draw(float width, float height) {
 					CheckRow("HDR", true, s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows");
 					CheckRow("VSync", true, s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando");
 					if (ChoiceRow("Metricas", false, kMetrics, kMetricsCount, s.metrics, "Panel dentro del juego (F8 lo cambia en vivo): FPS, el modo de frame generation, latencia y el detalle. Ya no abre una ventana aparte.")) live_changed = true;
-					static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}};
-					ChoiceRow("Monitor", true, aspects, 3, s.aspect, "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9 o 32:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.");
+					static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}, {"48:9", "Monitor 48:9"}};
+					ChoiceRow("Monitor", true, aspects, 4, s.aspect, "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9, 32:9 o 48:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.");
 					CheckRow("Mantener 16:9 (bandas negras)", true, s.aspect_fit);
 					{
 						std::vector<Choice> langs;
@@ -3469,13 +3469,13 @@ void LauncherDisplay(Settings& s) {
 		const float y = RowY();
 		LCheck(y, "HDR", s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows", 12);
 		LCheck(y, "VSync", s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando", 92);
-		static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}};
+		static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}, {"48:9", "Monitor 48:9"}};
 		int current = 0;
-		for (int i = 0; i < 3; i++)
+		for (int i = 0; i < 4; i++)
 			if (s.aspect == aspects[i].id) current = i;
 		const std::function<const char*(int)> list = [](int i) -> const char* { return aspects[i].label; };
-		if (Field("Monitor", y, 3, current, list,
-		          "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9 o 32:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.",
+		if (Field("Monitor", y, 4, current, list,
+		          "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9, 32:9 o 48:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.",
 		          280, 128))
 			s.aspect = aspects[current].id;
 		RowEnd(y);

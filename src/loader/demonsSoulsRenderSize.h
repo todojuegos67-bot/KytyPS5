@@ -18,7 +18,7 @@ struct Program;
 // loader/demonsSoulsSuperResolution.h) the performance mode is display mode 5: the height sizes its 3D instead
 // (unset: the PS5 Pro's 2688x1512; 720-2160, the game's 1080 least patched out: DemonsSoulsSuperResolution::AnyHeight), the upscaler making the 3840x2160 image from it.
 // KYTY_RENDER_ASPECT=<w>:<h> (run-windows.ps1 -Aspect, the launcher's "Aspect ratio"; 21:9 is taken as 64:27): the 3D
-// rendered wider than 16:9, up to 32:9, at the render height - 3416x1440 for 21:9 - and its projection's aspect (the
+// rendered wider than 16:9, up to 48:9, at the render height - 3416x1440 for 21:9 - and its projection's aspect (the
 // render setup's 16:9, AspectStore) to match: more of the world to the sides, not a stretched 16:9 view. The game's
 // output stays 3840x2160: the wider picture is squeezed into it, the HUD drawn over it as at 16:9, and the presenter
 // widens the frames showing the 3D back to the aspect (movies, menus and loading screens stay 16:9: WideAspect()). The
@@ -88,7 +88,9 @@ inline constexpr int      PerformanceMode = 2, TrinityMode = 4; // (indexes in t
 // (01.007.000 0x90090ae7f, 01.005.000 0x9008ef287; the only such store either build has).
 inline constexpr std::string_view AspectStore = "c7 43 04 39 8e e3 3f";
 inline constexpr double           GameAspect  = 16.0 / 9.0;
-inline constexpr double           WidestAspect = 32.0 / 9.0;
+// 48:9: the triple-screen super ultrawide (5760x1080, 7680x1440). Its 3D is held by the render target memory
+// (FitsRenderTargets) at 6400x1200, and with the wide output (at most MaxWideOutputWidth) at 5120x960.
+inline constexpr double           WidestAspect = 48.0 / 9.0;
 // The widest wide output (InstallWideOutput): 21:9's 5120x2160; a wider aspect's output is held at it.
 inline constexpr uint32_t         MaxWideOutputWidth = 5120;
 
@@ -158,7 +160,7 @@ inline bool FitsRenderTargets(Size size) {
 	return true;
 }
 // The highest render height (a multiple of 8) whose size at `aspect` fits (FitsRenderTargets): 2160 at 16:9, 1832 at
-// 21:9 (4344x1832), 1512 at 32:9 (5376x1512).
+// 21:9 (4344x1832), 1512 at 32:9 (5376x1512), 1200 at 48:9 (6400x1200).
 inline uint32_t MaxRenderHeight(double aspect) {
 	for (uint32_t height = OutputHeight; height >= 720; height -= 8) {
 		if (FitsRenderTargets(RenderSizeFor(height, aspect))) return height;
@@ -167,7 +169,7 @@ inline uint32_t MaxRenderHeight(double aspect) {
 }
 
 // KYTY_RENDER_ASPECT's value: "<w>:<h>" or a number; 21:9 is the displays' 64:27. 0 when unset, at most 16:9 or wider
-// than 32:9 (wider is untested: the game's targets were made for 3840 at most).
+// than 48:9 (wider is untested: the game's targets were made for 3840 at most).
 inline double ParseAspect(std::string_view text) {
 	if (text == "21:9") return 64.0 / 27.0;
 	double     w = 0.0, h = 1.0;

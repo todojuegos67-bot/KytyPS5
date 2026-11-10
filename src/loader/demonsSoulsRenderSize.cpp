@@ -273,7 +273,7 @@ static void InstallRenderSize(Program* program) {
 		}
 	}
 	// KYTY_RENDER_ASPECT=auto: the primary display's own aspect (its current mode's width over its height); within 2% of
-	// 16:9 (or the display not known) as with no aspect at all, wider than 32:9 at 32:9.
+	// 16:9 (or the display not known) as with no aspect at all, wider than 48:9 at 48:9.
 	const bool by_display = wide != nullptr && std::strcmp(wide, "auto") == 0;
 	double     detected   = 0.0;
 	if (by_display) {
@@ -285,13 +285,13 @@ static void InstallRenderSize(Program* program) {
 		} else {
 			detected = std::min(display_a, WidestAspect);
 			std::printf("Demon's Souls render size: KYTY_RENDER_ASPECT=auto on a %ux%u display: aspect %.3f%s\n", display_w,
-			            display_h, detected, display_a > WidestAspect ? " (at most 32:9)" : "");
+			            display_h, detected, display_a > WidestAspect ? " (at most 48:9)" : "");
 		}
 		if (detected == 0.0 && (setting == nullptr || *setting == 0) && !by_ratio) return;
 	}
 	const auto aspect    = by_display ? detected : wide != nullptr && *wide != 0 ? ParseAspect(wide) : 0.0;
 	if (!by_display && wide != nullptr && *wide != 0 && aspect == 0.0)
-		std::printf("Demon's Souls render size: KYTY_RENDER_ASPECT=%s is not wider than 16:9 and at most 32:9; 16:9 kept\n",
+		std::printf("Demon's Souls render size: KYTY_RENDER_ASPECT=%s is not wider than 16:9 and at most 48:9; 16:9 kept\n",
 		            wide);
 	if (trinity && !DemonsSoulsSuperResolution::AnyHeight() && requested >= 720 && requested < SuperResolutionLeastHeight) {
 		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%u is below the game's super resolution (1080 at "

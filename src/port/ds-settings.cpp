@@ -402,7 +402,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "tope_fps=" << Num(s.fps_cap) << "\n"
 	  << "; Mantener 16:9 con bandas negras en vez de estirar\n"
 	  << "ajustar_aspecto=" << b(s.aspect_fit) << "\n"
-	  << "; Aspecto del 3D: 16:9, 21:9 o 32:9 (ultrapanoramico)\n"
+	  << "; Aspecto del 3D: 16:9, 21:9, 32:9 o 48:9 (ultrapanoramico; 48:9 = triple monitor)\n"
 	  << "aspecto=" << s.aspect << "\n\n"
 	  << "[Reescalado]\n"
 	  << "; nativo, dlss-dlaa, dlss-ucalidad, dlss-calidad, dlss-equilibrado, dlss-rendimiento,\n"
