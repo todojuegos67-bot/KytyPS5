@@ -415,7 +415,7 @@ private:
 	std::unordered_map<GraphicsPipelineKey, Pipeline*, NativeGraphicsPipelineKeyHash>
 	    m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
+	mutable Common::Mutex m_mutex; // (mutable: TableFormatOnlyBuffers, const, walks the programs under it)
 	// TryCreateGraphicsPipeline: pipelines a worker is still compiling, by key.
 	struct PendingGraphicsPipeline;
 	class CompileWorkers;

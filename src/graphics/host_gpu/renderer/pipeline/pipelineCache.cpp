@@ -4469,6 +4469,10 @@ bool PipelineCache::TakeMaterializationFailure() {
 
 uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got) const {
 	if (want == nullptr || got == nullptr) return UINT32_MAX;
+	// Under the lock: ProgramCache::Get inserts and erases programs under it, and a warmup beside the game
+	// (TranslateWarmup) inserts them from its own thread. The callers (TableResolveSet, TableStore) look the
+	// programs up with GetGraphicsPrograms first, which has released it by then (Common::Mutex is recursive anyway).
+	Common::LockGuard lock(m_mutex);
 	const ProgramCache::ProgramKey*  kw = nullptr;
 	const ProgramCache::ProgramKey*  kg = nullptr;
 	const ProgramCache::Permutation* mw = nullptr;
