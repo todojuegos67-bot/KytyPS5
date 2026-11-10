@@ -225,27 +225,35 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	}
 	// The player's first button (the world gate in videoOut.cpp starts from it).
 	if (connected && data->buttons != 0) Libs::VideoOut::NotePlayerInput();
-	// (11-10) KYTY_SKIP_INTRO=1 (the launcher's "Saltar intro"): X pressed for the game while the PlayStation logo movie
-	// plays, and once early in the opening cinematic, before the player's own first button only. Never at the title.
-	if (data->buttons == 0 && !Libs::VideoOut::PlayerInputSeen()) {
+	// (11-10) KYTY_SKIP_INTRO=1 (the launcher's "Saltar intro"): X pressed for the game while a movie plays in the first
+	// 2 minutes (the PlayStation logo), and once early in the first in-engine cinematic (the opening voidwalk) in the
+	// first 4 minutes. Not tied to the player's first button (a press during the logo must not cancel the cinematic's).
+	{
 		static const bool skip = [] {
 			const char* v = std::getenv("KYTY_SKIP_INTRO");
 			return v != nullptr && std::strcmp(v, "1") == 0;
 		}();
-		static int64_t cine_seen = 0;
-		static bool    cine_done = false;
+		static const int64_t start     = SteadyNanoseconds();
+		static int64_t       cine_seen = 0;
+		static bool          cine_done = false, movie_logged = false;
 		if (skip) {
 			const int64_t now   = SteadyNanoseconds();
+			const int64_t up    = now - start;
 			const bool    pulse = (now / 100000000) % 4 == 0; // (100 ms down every 400 ms)
-			if (Libs::VideoOut::MoviePlaying()) {
+			if (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) {
 				if (pulse) data->buttons |= PAD_BUTTON_CROSS;
-			} else if (!cine_done && Libs::VideoOut::CinematicPlaying()) {
+				if (!movie_logged) {
+					movie_logged = true;
+					std::printf("[port] intro: skipping the start-up movie (KYTY_SKIP_INTRO)\n");
+				}
+			} else if (!cine_done && up < 240000000000LL && Libs::VideoOut::CinematicPlaying()) {
 				if (cine_seen == 0) cine_seen = now;
-				// One press 1.5 s into the cinematic (it is playing by then), held 150 ms.
-				if (now - cine_seen > 1500000000 && now - cine_seen < 1650000000) data->buttons |= PAD_BUTTON_CROSS;
-				if (now - cine_seen >= 1650000000) {
+				// Pressed 1.5 s into the cinematic (it plays by then) for 150 ms, again at 3 s in case the first was early.
+				const int64_t in = now - cine_seen;
+				if ((in > 1500000000 && in < 1650000000) || (in > 3000000000LL && in < 3150000000LL)) data->buttons |= PAD_BUTTON_CROSS;
+				if (in >= 3150000000LL) {
 					cine_done = true;
-					std::printf("[port] intro: the opening cinematic skipped (KYTY_SKIP_INTRO)\n");
+					std::printf("[port] intro: X pressed in the opening cinematic (KYTY_SKIP_INTRO)\n");
 				}
 			}
 		}
