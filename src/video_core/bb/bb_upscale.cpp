@@ -716,6 +716,12 @@ static void Multiply34(const float* a, const float* b, float* out) {
     }
 }
 
+u32 g_mv_frames = 0, g_mv_valid = 0;
+void NoteMvSource(bool valid) {
+    ++g_mv_frames;
+    g_mv_valid += valid ? 1 : 0;
+}
+
 Camera EndFrame(u32 flip_w, u32 flip_h) {
     StartupDone();
     Camera cam;
@@ -825,6 +831,11 @@ void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, doubl
              s.sr_w ? fmt::format("{}x{}", s.sr_w, s.sr_h) : std::string("not upscaled"), out_w,
              out_h, s.sr_ms, s.mv_ms,
              Cfg().kind == SR::Kind::Taa ? fmt::format(" | taa {:.3f} ms", s.sr_ms) : std::string());
+    LOG_INFO(Render_Vulkan,
+             "[mv] camera vectors source 149 (valid {}/{} passes) | object vectors 0% (not "
+             "ported, off)",
+             g_mv_valid, g_mv_frames);
+    g_mv_frames = g_mv_valid = 0;
     g_acc = {};
     g_acc.start = now;
 }

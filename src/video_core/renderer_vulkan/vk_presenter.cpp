@@ -466,6 +466,62 @@ static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     }
 }
 
+
+// bb-mv149: BB_HUD_DUMP=1 — one frame's full image (HUD included), its HUD-less scene (the
+// image the upscaler / frame generation get) and the HUD-only layer (pixels where the two differ,
+// transparent elsewhere), saved as PNGs to the screenshots folder. Once, at the 300th cut frame
+// (BB_HUD_DUMP=<n> picks the cut frame); the readback runs once and costs nothing otherwise.
+static bool BbDumpFormatOk(vk::Format f) {
+    switch (f) {
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eB8G8R8A8Unorm:
+    case vk::Format::eB8G8R8A8Srgb:
+    case vk::Format::eA2R10G10B10UnormPack32:
+    case vk::Format::eA2B10G10R10UnormPack32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void BbSaveHudDump(const ScreenshotReadback& full, const ScreenshotReadback* hudless,
+                          const std::filesystem::path& dir, const std::string& stem) {
+    std::vector<u8> a, b;
+    if (!ConvertReadbackToRgba8(full, a)) return;
+    const auto p_full = dir / (stem + "_full.png");
+    if (WritePng(p_full, a, full.width, full.height)) {
+        LOG_INFO(Render_Vulkan, "[hud-dump] full frame: {}", p_full.string());
+    }
+    if (hudless == nullptr || !ConvertReadbackToRgba8(*hudless, b) || b.size() != a.size()) {
+        LOG_WARNING(Render_Vulkan, "[hud-dump] no HUD-less image this frame: HUD-only not made");
+        return;
+    }
+    const auto p_scene = dir / (stem + "_hudless.png");
+    if (WritePng(p_scene, b, hudless->width, hudless->height)) {
+        LOG_INFO(Render_Vulkan, "[hud-dump] HUD-less scene: {}", p_scene.string());
+    }
+    std::vector<u8> hud(a.size(), 0);
+    u64 hud_px = 0;
+    for (size_t i = 0; i + 3 < a.size(); i += 4) {
+        const int d = std::max({std::abs(int(a[i]) - int(b[i])),
+                                std::abs(int(a[i + 1]) - int(b[i + 1])),
+                                std::abs(int(a[i + 2]) - int(b[i + 2]))});
+        if (d > 2) {
+            hud[i] = a[i];
+            hud[i + 1] = a[i + 1];
+            hud[i + 2] = a[i + 2];
+            hud[i + 3] = 255;
+            ++hud_px;
+        }
+    }
+    const auto p_hud = dir / (stem + "_hud_only.png");
+    if (WritePng(p_hud, hud, full.width, full.height)) {
+        LOG_INFO(Render_Vulkan, "[hud-dump] HUD-only layer: {} ({:.2f}% of the pixels differ)",
+                 p_hud.string(), 100.0 * double(hud_px) / double(a.size() / 4));
+    }
+}
+
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
@@ -531,9 +587,12 @@ Presenter::~Presenter() {
 }
 
 // bb-hudless: (re)creates a frame's HUD-less image at the frame's size and format.
-static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::Format format) {
-    if (frame.hudless_image && frame.hudless_width == frame.width &&
-        frame.hudless_height == frame.height && frame.hudless_format == format) {
+// bb-mv149: at `size` (the FG backbuffer's: FSR 3 FG refuses a HUD-less image of another size,
+// e.g. a 2560x1438 client area against its 2560x1440 swapchain).
+static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::Format format,
+                            vk::Extent2D size) {
+    if (frame.hudless_image && frame.hudless_width == size.width &&
+        frame.hudless_height == size.height && frame.hudless_format == format) {
         return true;
     }
     const vk::Device device = instance.GetDevice();
@@ -548,7 +607,7 @@ static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::
         .flags = vk::ImageCreateFlagBits::eMutableFormat,
         .imageType = vk::ImageType::e2D,
         .format = format,
-        .extent = {frame.width, frame.height, 1},
+        .extent = {size.width, size.height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
@@ -581,8 +640,8 @@ static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::
         return false;
     }
     frame.hudless_view = view;
-    frame.hudless_width = frame.width;
-    frame.hudless_height = frame.height;
+    frame.hudless_width = size.width;
+    frame.hudless_height = size.height;
     frame.hudless_format = format;
     return true;
 }
@@ -1112,6 +1171,70 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         };
         cmdbuf.pipelineBarrier2(
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+        // bb-mv149: BB_HUD_DUMP (see BbSaveHudDump).
+        static u32 bb_dump_frame = [] {
+            const char* v = std::getenv("BB_HUD_DUMP");
+            const long n = v != nullptr ? std::strtol(v, nullptr, 10) : 0;
+            return n > 1 ? u32(n) : 300u;
+        }();
+        static u32 bb_dump_count = 0;
+        if (BB::UiCut::HudDumpOn() && bb_dump_frame != 0 && ++bb_dump_count >= bb_dump_frame) {
+            bb_dump_frame = 0; // once
+            const vk::Format full_fmt = bb_display.format;
+            const bool hl = bb_display.hudless && BbDumpFormatOk(bb_display.hudless_format);
+            if (!BbDumpFormatOk(full_fmt)) {
+                LOG_WARNING(Render_Vulkan, "[hud-dump] display format {} not supported",
+                            vk::to_string(full_fmt));
+            } else {
+                const auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir);
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                const std::string stem = fmt::format(
+                    "bb_hud_dump_{}",
+                    std::chrono::system_clock::now().time_since_epoch().count() / 1000000);
+                auto full = std::make_shared<ScreenshotReadback>(
+                    instance, ScreenshotKind::GameOnly, std::vector<std::filesystem::path>{},
+                    bb_display.width, bb_display.height, full_fmt, false);
+                std::shared_ptr<ScreenshotReadback> scene;
+                if (hl) {
+                    scene = std::make_shared<ScreenshotReadback>(
+                        instance, ScreenshotKind::GameOnly, std::vector<std::filesystem::path>{},
+                        bb_display.width, bb_display.height, bb_display.hudless_format, false);
+                }
+                const auto barrier = [&](vk::Image img, vk::ImageLayout from, vk::ImageLayout to) {
+                    const vk::ImageMemoryBarrier2 b{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .dstAccessMask =
+                            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                        .oldLayout = from,
+                        .newLayout = to,
+                        .image = img,
+                        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                    };
+                    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                               .pImageMemoryBarriers = &b});
+                };
+                const auto ro = vk::ImageLayout::eShaderReadOnlyOptimal;
+                const auto src = vk::ImageLayout::eTransferSrcOptimal;
+                barrier(bb_display.image, ro, src);
+                CopyImageToReadback(cmdbuf, bb_display.image, src, *full);
+                barrier(bb_display.image, src, ro);
+                if (scene) {
+                    barrier(bb_display.hudless, ro, src);
+                    CopyImageToReadback(cmdbuf, bb_display.hudless, src, *scene);
+                    barrier(bb_display.hudless, src, ro);
+                }
+                draw_scheduler.DeferPriorityOperation([full, scene, dir, stem]() {
+                    BbSaveHudDump(*full, scene.get(), dir, stem);
+                });
+                LOG_INFO(Render_Vulkan, "[hud-dump] reading back cut frame {} ({}x{}, {} / {})",
+                         bb_dump_count, bb_display.width, bb_display.height,
+                         vk::to_string(full_fmt),
+                         hl ? vk::to_string(bb_display.hudless_format) : std::string("no HUD-less"));
+            }
+        }
         image_view = bb_display.view;
         image_size = {bb_display.width, bb_display.height};
         bb_sr_size = image_size;
@@ -1188,7 +1311,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         bool ok = false;
         if (bb_hudless_scene && frame->fg.valid) {
             const vk::Format fmt = swapchain.GetSurfaceFormat().format;
-            if (BbEnsureHudless(instance, *frame, fmt)) {
+            // FSR 3 FG: the backbuffer is the swapchain image; DLSS-G: the frame image.
+            const vk::Extent2D hl_size = BB::FG::Fsr3Active()
+                                             ? swapchain.GetExtent()
+                                             : vk::Extent2D{frame->width, frame->height};
+            if (BbEnsureHudless(instance, *frame, fmt, hl_size)) {
                 const vk::ImageMemoryBarrier2 to_att{
                     .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                     .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
@@ -1202,6 +1329,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 cmdbuf.pipelineBarrier2(
                     vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_att});
                 Frame target = *frame;
+                target.width = hl_size.width;
+                target.height = hl_size.height;
                 target.image = frame->hudless_image;
                 target.image_view = frame->hudless_view;
                 auto hs = pp_settings;
@@ -1219,8 +1348,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 };
                 cmdbuf.pipelineBarrier2(
                     vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
-                frame->fg.hudless = {frame->hudless_image, frame->hudless_view, fmt,
-                                     {frame->width, frame->height},
+                frame->fg.hudless = {frame->hudless_image, frame->hudless_view, fmt, hl_size,
                                      vk::ImageUsageFlagBits::eColorAttachment |
                                          vk::ImageUsageFlagBits::eSampled};
                 frame->fg.has_hudless = true;

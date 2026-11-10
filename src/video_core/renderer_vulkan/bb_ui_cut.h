@@ -86,7 +86,11 @@ public:
         BB::FG::Inputs fg{};
         vk::Image hudless{};
         vk::ImageView hudless_view{};
+        vk::Format hudless_format{}; // bb-mv149: the HUD-less image's own format (BB_HUD_DUMP)
     };
+    // bb-mv149: BB_HUD_DUMP=1 (default off): the HUD-less copy is taken even without frame
+    // generation, so the presenter can save full frame / HUD-less / HUD-only PNGs once.
+    static bool HudDumpOn();
     bool DisplayOverride(VAddr address, vk::Format format, Display& display);
 
     // Per-second log of the presenter: frames cut, HUD-less copies made.

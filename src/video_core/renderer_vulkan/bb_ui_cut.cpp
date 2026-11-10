@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <fmt/format.h>
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
@@ -499,14 +500,16 @@ bool UiCut::RunScaled(SceneDepth& scene) {
 }
 
 void UiCut::CaptureHudlessUi() {
-    if (!ui_phase || !ui_image.image || hudless_taken || !BB::FG::WantInputs()) return;
+    if (!ui_phase || !ui_image.image || hudless_taken || !(BB::FG::WantInputs() || HudDumpOn()))
+        return;
     hudless_taken = true;
     // The background is in the UI image (General): copied before the UI draws into it.
     auto& slot = hudless_images[hudless_next];
     if (slot.width != ui_width || slot.height != ui_height || slot.format != ui_format) {
         scheduler.Finish();
         if (!Create(slot, ui_width, ui_height, ui_format,
-                    vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+                    vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst |
+                        vk::ImageUsageFlagBits::eTransferSrc,
                     true)) {
             return;
         }
@@ -678,12 +681,21 @@ bool UiCut::DisplayOverride(VAddr address, vk::Format format, Display& out) {
     if (d.hudless >= 0 && hudless_images[d.hudless].image) {
         auto& h = hudless_images[d.hudless];
         out.hudless = h.image;
+        out.hudless_format = h.format;
         out.hudless_view = Mirror(h, WithSrgb(h.format, IsSrgb(format)),
                                   vk::ImageAspectFlagBits::eColor, true);
     }
     // Shown once: the next display pass decides again.
     d.valid = false;
     return out.view != vk::ImageView{};
+}
+
+bool UiCut::HudDumpOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_HUD_DUMP");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
 }
 
 UiCut::Counters UiCut::TakeCounters() {

@@ -1056,6 +1056,9 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                g_stats.real != 0 ? g_stats.prepare_ms / g_stats.real : 0.0,
                g_stats.real != 0 ? g_stats.present_ms / g_stats.real : 0.0, g_stats.max_present_ms,
                g_stats.hudless);
+        Printf("[fsr3-ui] HUD-less to FG %s", g_stats.hudless > 0 && g_stats.hudless_mismatch == 0
+                                                  ? "yes"
+                                                  : "no");
         Printf("[fsr3-ui] HUD-less image given %u, refused (size/format != backbuffer) %u, none "
                "captured %u: generated frames %s",
                g_stats.hudless, g_stats.hudless_mismatch, g_stats.hudless_none,

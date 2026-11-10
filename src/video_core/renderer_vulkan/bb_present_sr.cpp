@@ -266,15 +266,22 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         u32 size[4];
     } push{};
     static_assert(sizeof(push) == 112);
-    // bb-clean-021-bbport: Supermedo's camera (bb_mv.comp): reproject rows, projections, jitter.
-    std::memcpy(push.rows, cam.reproject, sizeof(cam.reproject));
-    std::memcpy(push.rows + 12, cam.proj, sizeof(cam.proj));
-    std::memcpy(push.vp_xy, cam.prev_proj, sizeof(cam.prev_proj));
+    // bb-mv149: build 149's camera vectors (bb_mv.comp): clip_to_prev rows, the guest scene
+    // viewport, the jitter.
+    std::memcpy(push.rows, cam.clip_to_prev_clip, sizeof(cam.clip_to_prev_clip));
+    push.vp_xy[0] = scene.xscale;
+    push.vp_xy[1] = scene.xoffset;
+    push.vp_xy[2] = scene.yscale;
+    push.vp_xy[3] = scene.yoffset;
+    push.vp_z[0] = scene.zscale != 0.0f ? scene.zscale : 1.0f;
+    push.vp_z[1] = scene.zoffset;
     push.vp_z[2] = jx;
     push.vp_z[3] = jy;
     push.size[0] = in.width;
     push.size[1] = in.height;
-    push.size[2] = cam.mv_valid ? 1u : 0u;
+    push.size[2] =
+        cam.valid && !cam.reset && scene.xscale != 0.0f && scene.yscale != 0.0f ? 1u : 0u;
+    BB::Upscale::NoteMvSource(push.size[2] != 0);
     push.size[3] = srgb_decode ? 1u : 0u; // bit 0: sRGB decode
     const vk::DescriptorImageInfo depth_info{sampler, depth_view,
                                              vk::ImageLayout::eDepthStencilReadOnlyOptimal};

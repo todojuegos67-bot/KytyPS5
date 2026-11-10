@@ -77,6 +77,8 @@ struct Camera {
 };
 // At the flip: the frame's camera (and the motion to the previous one); starts the next frame.
 Camera EndFrame(u32 flip_w, u32 flip_h);
+// bb-mv149: one camera-vector pass ran (valid: with a camera and its previous frame).
+void NoteMvSource(bool valid);
 
 // Once-per-second performance line and the F8 overlay values.
 struct Stats {
