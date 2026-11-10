@@ -1831,6 +1831,10 @@ bool Presenter::IsHdrSupported() const noexcept {
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
 	// (ds-pc-port43) Only what needs an idle re-present (a dialog, the port's menu), never the Metricas panel alone.
+	// (11-10) Not while frame generation runs: the game keeps flipping with the menu open (the menu is redrawn at each of
+	// its frames), and a re-present of the last frame between them, with frame generation switching, preceded the GPU
+	// device loss after the menu opened.
+	if (Fsr3::Active() || FrameGen::Enabled()) return false;
 	const auto visual = GetSystemOverlayVisualState();
 	return visual.refresh || visual.refresh_revision != m_impl->presented_refresh_revision.load(std::memory_order_acquire);
 }
@@ -1898,6 +1902,21 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		static bool menu_seen = false;
 		if (port_menu != menu_seen) {
 			menu_seen = port_menu;
+			// (11-10) Every close right after the menu opened / closed began with a GPU device loss ("Device fault" the line
+			// after "menu: open/closed", AMD FSR 3 frame generation x2-x4 generating), the game's crash came after it. The
+			// frame generation switches off / back on at this present: let the GPU finish the generated frames in flight
+			// first, so the switch never meets them half done.
+			if (Fsr3::Active() || FrameGen::Enabled()) {
+				auto& g = m_impl->window.graphic_ctx;
+				{
+					Common::LockGuard queue_lock(g.queue_mutex);
+					(void)g.queue.waitIdle();
+				}
+				if (g.present_queue != nullptr) {
+					Common::LockGuard queue_lock(g.present_queue_mutex);
+					(void)g.present_queue.waitIdle();
+				}
+			}
 			std::printf("[port] menu %s: first present %s, fg %s, fsr3 %s, generated frame %s\n", port_menu ? "open" : "closed",
 			            reuse || frame.reusing_last ? "re-presents the last frame" : "a new game frame",
 			            FrameGen::Enabled() ? "on" : "off", Fsr3::Active() ? "on" : "off",

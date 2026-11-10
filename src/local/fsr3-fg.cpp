@@ -1384,6 +1384,12 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	config.onlyPresentGenerated = false;
 	config.generationRect       = {0, 0, static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height)};
 	config.frameID              = g_frame_id;
+	// (11-10) Generation switching off or back on (the F2 menu, loading, movies): the GPU first finishes the generated
+	// frames in flight. The device was lost right at such a switch (after the menu opened / closed, x2-x4 generating).
+	if (generate != g_generating) {
+		Common::LockGuard queue_lock(graphics.queue_mutex);
+		(void)graphics.queue.waitIdle();
+	}
 	if (const auto result = g_ffx.Configure(&g_fg_context, &config.header); result != FFX_API_RETURN_OK) {
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1) < 8) {
