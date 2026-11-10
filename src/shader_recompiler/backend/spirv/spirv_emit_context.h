@@ -5,6 +5,7 @@
 
 #include <array>
 #include <unordered_map>
+#include <vector>
 #include <sirit/sirit.h>
 
 #include "shader_recompiler/backend/bindings.h"
@@ -187,7 +188,7 @@ public:
             flatbuf_buffer.aliases[u32(PointerType::U32)];
         const auto ptr{
             OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
-        return OpLoad(U32[1], ptr);
+        return ObjMvPrevLoad(static_cast<u32>(flatbuf_index), flatbuf_offset, OpLoad(U32[1], ptr), U32[1]);
     }
 
     Info& info;
@@ -246,6 +247,29 @@ public:
     boost::container::small_vector<Id, 16> interfaces;
 
     Id output_position{};
+    // BB object motion vectors v2 (emit_spirv_bb_objmv2.cpp; video_core/bb/bb_objmv2.h).
+    static constexpr u32 ObjMvCurLocation = 30;
+    static constexpr u32 ObjMvPrevLocation = 31;
+    static constexpr u32 ObjMvOutput = 7;
+    bool ObjMvVertex() const {
+        return hw_stage == HwStage::Vertex && sw_stage == SwStage::Vertex &&
+               runtime_info.hw.vs.bb_objmv && profile.support_bda;
+    }
+    // The vertex shader runs a second time with last frame's buffers (no side effects allowed).
+    bool ObjMvPrevPass() const;
+    bool ObjMvFragment() const {
+        return sw_stage == SwStage::Fragment && runtime_info.hw.fs.bb_objmv &&
+               !runtime_info.hw.fs.dual_source_blending;
+    }
+    bool objmv_prev_mode = false; // emitting the previous-frame function
+    Id objmv_prev_func{};         // called at the start of main
+    bool objmv_prev_called = false;
+    std::vector<Id> objmv_prev_defs;
+    Id objmv_prev_pos{};          // Private vec4: last frame's clip position
+    Id objmv_out_cur{}, objmv_out_prev{};
+    Id objmv_in_cur{}, objmv_in_prev{}, objmv_frag_out{};
+    // Last frame's dword `index` (before the binding offset) of buffer `handle`, or `current`.
+    Id ObjMvPrevLoad(u32 handle, Id index, Id current, Id type);
     Id output_point_size{};
     Id output_layer{};
     Id output_viewport_index{};

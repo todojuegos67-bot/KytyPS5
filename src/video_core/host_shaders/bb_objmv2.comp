@@ -1,0 +1,87 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// BB object motion vectors v2 (bb_objmv2.h): the G-buffer pass wrote per-object vectors (vertex
+// shader run once more with last frame's constants) into an RGBA16F image: (dx, dy, class,
+// weight), class 1 opaque objects, 3 blended (particles / effects, alpha-weighted). Where an
+// object vector exists it replaces the camera-only vector bb_mv.comp reconstructed from depth.
+// Same units and sign: render pixels towards the previous position.
+// Correctness check (p.size.w bit 0): on pixels whose object vector differs from the camera one
+// by more than 1 px, the previous presented colour fetched with each vector against the current
+// colour (luma error, fixed point 1/1024); the object vectors must give the smaller error.
+// Stats words: 0 object px, 1 blended px, 2 all px, 3 checked px, 4 err obj, 5 err cam,
+// 6 px where obj wins, 7 px where cam wins.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D obj_mv;
+layout(binding = 1, rg16f) uniform image2D mv_out;
+layout(binding = 2, std430) buffer Stats {
+    uint s[8];
+} st;
+layout(binding = 3) uniform sampler2D cur_color;
+layout(binding = 4) uniform sampler2D prev_color;
+layout(binding = 5, rgba16f) uniform writeonly image2D next_prev_color;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, replace (0 on history resets), flags (bit 0: check,
+                // bit 1: keep this colour for the next frame's check)
+} p;
+
+shared uint g_obj, g_blend, g_all, g_chk, g_eo, g_ec, g_wo, g_wc;
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        g_obj = 0u; g_blend = 0u; g_all = 0u; g_chk = 0u;
+        g_eo = 0u; g_ec = 0u; g_wo = 0u; g_wc = 0u;
+    }
+    barrier();
+    const ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    const bool inside = c.x < int(p.size.x) && c.y < int(p.size.y);
+    if (inside) {
+        atomicAdd(g_all, 1u);
+        if ((p.size.w & 2u) != 0u) {
+            imageStore(next_prev_color, c, texelFetch(cur_color, c, 0));
+        }
+        const vec4 o = texelFetch(obj_mv, c, 0);
+        // Blended writes scale (dx, dy, class) by their weight over a cleared (0) background
+        // or an opaque vector: class > 0.5 means an object vector dominates.
+        if (o.z > 0.5 && !any(isnan(o.xy)) && !any(isinf(o.xy))) {
+            vec2 ov = o.xy;
+            if (o.z > 1.5) {
+                atomicAdd(g_blend, 1u);
+            }
+            atomicAdd(g_obj, 1u);
+            const vec2 cam = imageLoad(mv_out, c).xy;
+            if ((p.size.w & 1u) != 0u && length(ov - cam) > 1.0) {
+                const vec2 size = vec2(p.size.xy);
+                const vec2 uv = (vec2(c) + 0.5) / size;
+                const float cur = Luma(texelFetch(cur_color, c, 0).rgb);
+                const float eo = abs(Luma(textureLod(prev_color, uv + ov / size, 0.0).rgb) - cur);
+                const float ec = abs(Luma(textureLod(prev_color, uv + cam / size, 0.0).rgb) - cur);
+                atomicAdd(g_chk, 1u);
+                atomicAdd(g_eo, uint(clamp(eo, 0.0, 4.0) * 1024.0));
+                atomicAdd(g_ec, uint(clamp(ec, 0.0, 4.0) * 1024.0));
+                if (eo + 1e-3 < ec) atomicAdd(g_wo, 1u);
+                else if (ec + 1e-3 < eo) atomicAdd(g_wc, 1u);
+            }
+            if (p.size.z != 0u) {
+                imageStore(mv_out, c, vec4(ov, 0.0, 0.0));
+            }
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (g_obj != 0u) atomicAdd(st.s[0], g_obj);
+        if (g_blend != 0u) atomicAdd(st.s[1], g_blend);
+        atomicAdd(st.s[2], g_all);
+        if (g_chk != 0u) {
+            atomicAdd(st.s[3], g_chk);
+            atomicAdd(st.s[4], g_eo);
+            atomicAdd(st.s[5], g_ec);
+            atomicAdd(st.s[6], g_wo);
+            atomicAdd(st.s[7], g_wc);
+        }
+    }
+}

@@ -7,6 +7,7 @@
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
 
+#include <cstddef>
 #include <boost/container/static_vector.hpp>
 
 namespace Shader {
@@ -225,18 +226,27 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
+    // BB object motion vectors v2 (video_core/bb/bb_objmv2.h): flags (bit 0: this draw has last
+    // frame's buffer snapshots) and the device address of its snapshot table entry (lo, hi).
+    static constexpr u32 ObjMvFlagsIndex = 7;
+    static constexpr u32 ObjMvEntryIndex = 8;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    u32 objmv_flags;
+    u32 objmv_pad;
+    std::array<u32, 2> objmv_entry;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
         buf_offsets[binding] = offset;
     }
 };
+static_assert(offsetof(PushData, objmv_flags) == 72);
+static_assert(offsetof(PushData, objmv_entry) == 80);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

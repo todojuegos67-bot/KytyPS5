@@ -17,6 +17,7 @@
 #include "imgui/renderer/imgui_impl_vulkan.h"
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
+#include "video_core/bb/bb_objmv2.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -1006,6 +1007,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
+    // bb-objmv-gpu: the guest frame ended (object vector history, bb_objmv2.h).
+    BB::ObjMv2::OnFlip();
 
     const auto bb_t0 = std::chrono::steady_clock::now();
     Frame* frame = GetRenderFrame();

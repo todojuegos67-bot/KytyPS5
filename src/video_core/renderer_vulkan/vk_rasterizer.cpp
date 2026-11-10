@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/bb/bb_objmv2.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -49,6 +50,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    BB::ObjMv2::Init(instance);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -184,6 +186,22 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+// BB object motion vectors v2 (bb_objmv2.h): last frame's buffers for a motion pipeline's draw.
+void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32 count,
+                             u32 instances) {
+    if (!BB::ObjMv2::Active()) {
+        return;
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    if (!BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment])) {
+        return;
+    }
+    BB::ObjMv2::OnDraw(push_data, pipeline->GetStage(Shader::SwStage::Vertex), memory,
+                       key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)], identity,
+                       count, instances, key.blend_controls[BB::ObjMv2::Attachment].enable != 0,
+                       bb_cut.UiPhase());
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -221,6 +239,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     push_data.xoffset *= bb_target_scale[0];
     push_data.yscale *= bb_target_scale[1];
     push_data.yoffset *= bb_target_scale[1];
+    BbObjMvDraw(pipeline,
+                is_indexed ? regs.index_base_address.Address<VAddr>() + index_offset : 0,
+                regs.num_indices, regs.num_instances.NumInstances());
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -301,6 +322,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     push_data.xoffset *= bb_target_scale[0];
     push_data.yscale *= bb_target_scale[1];
     push_data.yoffset *= bb_target_scale[1];
+    BbObjMvDraw(pipeline, arg_address + offset, max_count, 0);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1181,6 +1203,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
     }
+    if (BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment])) {
+        BB::ObjMv2::Attach(scheduler, state);
+    }
 
     bb_jitter_draw = false;
     if (auto image_id = db_desc.image_id; image_id) {
@@ -1205,6 +1230,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                 const auto& vp = regs.viewports[0];
                 const auto& vp_ctl = regs.viewport_control;
                 bb_scene_depth.valid = true;
+                BB::ObjMv2::NoteSceneDepth(regs.depth_buffer.DepthAddress());
                 bb_scene_depth.desc = desc;
                 bb_scene_depth.xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
                 bb_scene_depth.xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;

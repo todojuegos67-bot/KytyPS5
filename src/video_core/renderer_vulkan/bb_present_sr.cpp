@@ -13,6 +13,7 @@
 #include "common/logging/log.h"
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_objmv2.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -304,6 +305,8 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
     cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
     cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
+    // bb-objmv-gpu: the per-object vectors (bb_objmv2.h) over the camera ones, for every consumer.
+    BB::ObjMv2::Compose(cmd, motion.view, color.view, in, cam.reset);
     Barrier(cmd, color, vk::ImageLayout::eShaderReadOnlyOptimal);
     Barrier(cmd, motion, vk::ImageLayout::eShaderReadOnlyOptimal);
     Barrier(cmd, output, vk::ImageLayout::eGeneral);

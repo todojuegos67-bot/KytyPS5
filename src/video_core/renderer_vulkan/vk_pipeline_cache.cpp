@@ -14,6 +14,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/bb/bb_objmv2.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -21,6 +22,9 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
+
+// BB object motion vectors v2 (bb_objmv2.h): the motion variant this draw takes.
+static BB::ObjMv2::Kind g_bb_objmv2 = BB::ObjMv2::Kind::None;
 
 using Shader::HwStage;
 using Shader::Output;
@@ -162,6 +166,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
+        info.hw.vs.bb_objmv = g_bb_objmv2 != BB::ObjMv2::Kind::None;
         break;
     }
     case HwStage::Fragment: {
@@ -176,6 +181,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 ? regs.aa_config.NumSamples()
                 : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
+        info.hw.fs.bb_objmv = g_bb_objmv2 != BB::ObjMv2::Kind::None;
+        info.hw.fs.bb_objmv_blend = g_bb_objmv2 == BB::ObjMv2::Kind::Blend;
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |
@@ -448,8 +455,16 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
+    g_bb_objmv2 = skip_cb_binding ? BB::ObjMv2::Kind::None : BB::ObjMv2::Want(regs);
     if (!RefreshGraphicsStages()) {
         return false;
+    }
+    if (g_bb_objmv2 != BB::ObjMv2::Kind::None && infos[static_cast<u32>(SwStage::Fragment)] &&
+        (key.mrt_mask & (1u << BB::ObjMv2::Attachment)) == 0) {
+        BB::ObjMv2::FillKey(g_bb_objmv2, key.mrt_mask, key.num_color_attachments,
+                            key.color_buffers[BB::ObjMv2::Attachment],
+                            key.write_masks[BB::ObjMv2::Attachment], key.cb_shader_mask.raw,
+                            &key.blend_controls[BB::ObjMv2::Attachment]);
     }
 
     // Second pass to mask out render targets not written by shader and fill remaining info

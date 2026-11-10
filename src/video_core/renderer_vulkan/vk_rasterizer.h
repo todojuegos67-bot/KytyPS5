@@ -135,6 +135,7 @@ private:
     void BbUiDraw(const GraphicsPipeline* pipeline);
     // Supermedo's UpdateUiTransform: the scale of a draw into the output-size UI images.
     void BbUpdateUiTransform();
+    void BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32 count, u32 instances);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);

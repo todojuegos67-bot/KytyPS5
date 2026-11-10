@@ -163,6 +163,12 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (Sirit::ValidId(ctx.objmv_prev_func) && !ctx.objmv_prev_mode &&
+                !ctx.objmv_prev_called) {
+                // BB objmv2: last frame's clip position first (emit_spirv_bb_objmv2.cpp).
+                ctx.OpFunctionCall(ctx.void_id, ctx.objmv_prev_func);
+                ctx.objmv_prev_called = true;
+            }
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
             }
@@ -218,6 +224,26 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
 
 Id DefineMain(EmitContext& ctx, const IR::Program& program) {
     const Id void_function{ctx.TypeFunction(ctx.void_id)};
+    if (ctx.ObjMvPrevPass()) {
+        // BB objmv2: the whole vertex program once more as a function reading last frame's
+        // buffer snapshots; its definitions are kept for the phi patching (PatchPhiNodes).
+        const Id prev{ctx.OpFunction(ctx.void_id, spv::FunctionControlMask::MaskNone,
+                                     void_function)};
+        ctx.Name(prev, "bb_objmv_prev");
+        for (IR::Block* const block : program.blocks) {
+            block->SetDefinition(ctx.OpLabel());
+        }
+        ctx.objmv_prev_mode = true;
+        Traverse(ctx, program);
+        ctx.objmv_prev_mode = false;
+        ctx.OpFunctionEnd();
+        ctx.objmv_prev_func = prev;
+        for (IR::Block* const block : program.blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                ctx.objmv_prev_defs.push_back(inst.Definition<Id>());
+            }
+        }
+    }
     const Id main{ctx.OpFunction(ctx.void_id, spv::FunctionControlMask::MaskNone, void_function)};
     for (IR::Block* const block : program.blocks) {
         block->SetDefinition(ctx.OpLabel());
@@ -363,7 +389,7 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     } else if (stage == SwStage::Geometry && info.stores.GetAny(IR::Attribute::ViewportIndex)) {
         ctx.AddCapability(spv::Capability::MultiViewport);
     }
-    if (info.uses_dma) {
+    if (info.uses_dma || ctx.ObjMvVertex()) {
         ctx.AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
         ctx.AddExtension("SPV_KHR_physical_storage_buffer");
     }
@@ -646,22 +672,79 @@ void SetupFloatMode(EmitContext& ctx, const Profile& profile, const RuntimeInfo&
 }
 
 void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
+    // BB objmv2: with the previous-frame function its phis come first (one more round of the
+    // program's phis), patched with that function's definitions.
+    const bool two_rounds = Sirit::ValidId(ctx.objmv_prev_func);
+    std::vector<Id> main_defs;
+    size_t num_phis = 0;
+    const auto set_defs = [&](const std::vector<Id>& defs) {
+        size_t i = 0;
+        for (IR::Block* const block : program.blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                inst.SetDefinition<Id>(defs[i++]);
+            }
+        }
+    };
+    if (two_rounds) {
+        for (IR::Block* const block : program.blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                main_defs.push_back(inst.Definition<Id>());
+                num_phis += inst.GetOpcode() == IR::Opcode::Phi ? 1 : 0;
+            }
+        }
+        set_defs(ctx.objmv_prev_defs);
+    }
+    size_t phis_seen = 0;
     auto inst{program.blocks.front()->begin()};
     size_t block_index{0};
     ctx.PatchDeferredPhi([&](u32 phi_arg, Id first_parent) {
         if (phi_arg == 0) {
-            ++inst;
-            while (inst == program.blocks[block_index]->end() ||
-                   inst->GetOpcode() != IR::Opcode::Phi) {
-                ++block_index;
-                inst = program.blocks[block_index]->begin();
+            if (two_rounds && phis_seen == num_phis) {
+                // Second round: main's phis, from the first phi of the program again.
+                set_defs(main_defs);
+                block_index = 0;
+                inst = program.blocks.front()->begin();
+                while (inst == program.blocks[block_index]->end() ||
+                       inst->GetOpcode() != IR::Opcode::Phi) {
+                    if (inst == program.blocks[block_index]->end()) {
+                        ++block_index;
+                        inst = program.blocks[block_index]->begin();
+                    } else {
+                        ++inst;
+                    }
+                }
+            } else if (phis_seen == 0) {
+                while (inst == program.blocks[block_index]->end() ||
+                       inst->GetOpcode() != IR::Opcode::Phi) {
+                    if (inst == program.blocks[block_index]->end()) {
+                        ++block_index;
+                        inst = program.blocks[block_index]->begin();
+                    } else {
+                        ++inst;
+                    }
+                }
+            } else {
+                ++inst;
+                while (inst == program.blocks[block_index]->end() ||
+                       inst->GetOpcode() != IR::Opcode::Phi) {
+                    if (inst == program.blocks[block_index]->end()) {
+                        ++block_index;
+                        inst = program.blocks[block_index]->begin();
+                    } else {
+                        ++inst;
+                    }
+                }
             }
+            ++phis_seen;
         }
         ASSERT(inst != program.blocks[block_index]->end());
         const Id arg = ctx.Def(inst->Arg(phi_arg));
         const Id parent = ctx.first_to_last_label_map[first_parent.value];
         return std::make_pair(arg, parent);
     });
+    if (two_rounds) {
+        set_defs(main_defs);
+    }
 }
 } // Anonymous namespace
 
