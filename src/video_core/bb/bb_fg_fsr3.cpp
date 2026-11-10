@@ -83,10 +83,10 @@ bool g_patched = false;     // the bb-windows DLL (multi frame generation, KYTY_
 // bb-amd-mfg: AMD multi frame generation, as the Demon's Souls port's (src/local/fsr3-fg.cpp).
 // BB_FG=amd-x3 / amd-x4: KYTY_FSR3_FG_FRAMES = N - 1 for the patched DLL (read when it makes the
 // swapchain). BB_FG=amd-dyn: frames for x4 allocated, the multiplier (x2..x4) picked once a second
-// from the real frame rate the game reaches without our limiter ("free"): the largest N with
-// free x N <= the target (KYTY_FSR3_TARGET_FPS, default refresh - refresh^2 / 3600: 224 at 240 Hz),
-// up after 2 windows, down after 1 (5 % margin); real frames limited to target / N so the shown rate
-// never passes the display. The DLL reads KYTY_FSR3_FG_ACTIVE (generated frames) on every present.
+// from the measured real frame rate: the largest N with real x N <= the target
+// (KYTY_FSR3_TARGET_FPS, default refresh - refresh^2 / 3600: 224 at 240 Hz), up after 2 windows,
+// down when real x current passes the target by 5 %. No cap on real frames (the limiter of
+// KYTY_VRR_CAP_FPS only if the launcher sets it, as before); the DLL's pacing spaces the presents. The DLL reads KYTY_FSR3_FG_ACTIVE (generated frames) on every present.
 // No pause when presenting does not keep up: the multiplier only steps down.
 struct Mfg {
     int max = 2;     // frames allocated (multiplier maximum)
@@ -623,7 +623,7 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
     const double free = frames / busy;
     g_mfg.slept = 0.0;
     if (g_mfg.dynamic && frames > 0) {
-        g_mfg.smooth = g_mfg.smooth <= 0.0 ? free : 0.5 * g_mfg.smooth + 0.5 * free;
+        g_mfg.smooth = g_mfg.smooth <= 0.0 ? real : 0.5 * g_mfg.smooth + 0.5 * real;
         const double T = g_mfg.target;
         int want = 2;
         for (int n = g_mfg.max; n >= 2; --n) {
@@ -639,14 +639,13 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
             g_mfg.up_n = 0;
             // Down only when the lower multiplier still reaches the target (5 % margin): no
             // flapping around the edge (the limiter holds real at T / current meanwhile).
-            if (want < g_mfg.current && g_mfg.smooth * (g_mfg.current - 1) >= T * 1.05) {
+            if (want < g_mfg.current && g_mfg.smooth * g_mfg.current > T * 1.05) {
                 next = want;
             }
         }
         if (next != g_mfg.current) {
-            Printf("[fsr3-mfg] x%d (from x%d): free %.1f fps (smoothed %.1f), target %.0f; real "
-                   "limit %.1f",
-                   next, g_mfg.current, free, g_mfg.smooth, T, T / next);
+            Printf("[fsr3-mfg] x%d (from x%d): real %.1f fps (smoothed %.1f), target %.0f", next,
+                   g_mfg.current, real, g_mfg.smooth, T);
             g_mfg.current = next;
             g_mfg.up_n = 0;
             MfgSetActive(next);
@@ -658,10 +657,6 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 }
 
 double CapInterval() {
-    if (g_mfg.dynamic && g_mfg.target > 0.0) {
-        // Real frames at most target / current multiplier: shown never above the target.
-        return g_mfg.current / g_mfg.target;
-    }
     static const double interval = [] {
         const char* text = Env("KYTY_VRR_CAP_FPS");
         if (text == nullptr || *text == '\0') return 0.0;

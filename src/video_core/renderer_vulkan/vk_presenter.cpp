@@ -692,162 +692,88 @@ u32 Presenter::BbEnsureGenerated(Frame* frame, u32 count) {
 // has room for one generated frame, on 240 Hz for three), decided once a second from that
 // second's game frame rate: down at once when 10% short, up after two seconds with 5% to spare;
 // paused for a while when presenting holds the game back.
-// bb-amd-mfg: DLSS-G real-frame limiter. The game's frames arrived whenever they were done (80-84
-// fps, uncapped) and the generated frames were spaced by a smoothed mean of that, so on a fixed
-// 240 Hz display (mailbox) real x2 = 162 shown landed on 1-2 vblanks unevenly: heavy judder. Now
-// the game's frames are released on a fixed grid and the generated frames split it evenly:
-//  - fixed refresh (default): shown = refresh / k (240, 120, 80, ...), the smallest k whose real
-//    rate shown / multiplier the game sustains (free rate x 0.97, measured without our wait); so
-//    240 Hz x2: real 120 (shown 240) or real 60 (shown 120); dlss-dyn picks multiplier and k for the
-//    highest shown rate (x3 at real 80 -> 240).
-//  - BB_FG_VRR=1 (G-Sync / FreeSync): shown just under the refresh (refresh - refresh^2 / 3600:
-//    224 at 240 Hz), real = that / multiplier when the game is faster, else uncapped.
-//  - BB_FG_CAP=<fps>: shown at most <fps> (as VRR); BB_FG_CAP=off: no limiter (the old path).
-// Lower rates at once, higher after 2 s. One "[fg-cap]" line a second.
+// bb-amd-mfg: DLSS-G presentation pacing (no cap on real frames). The game's frames arrive when
+// they are done (80-84 fps on the user's 240 Hz display) and the generated frames before each are
+// spaced over the expected real interval. That was a 0.1 EMA of the last intervals, which lags
+// every change, so the last generated frame and the real one bunched or gapped. Now: the median
+// of the last 15 real intervals (robust to one long frame), and one "[fg-pace]" line a second
+// with real / shown fps, the multiplier, the real frame time mean / sd / max, the shown present
+// interval sd, and generated frames dropped because no frame slot was free.
 namespace {
-struct BbFgCap {
-    std::chrono::steady_clock::time_point next{}, win{}, last{};
-    u32 frames = 0;
-    double slept = 0.0, smooth = 0.0;
+struct BbFgPace {
+    std::chrono::steady_clock::time_point win{}, last{};
+    std::array<double, 15> ring{};
+    u32 ring_n = 0, ring_i = 0;
+    u32 frames = 0, n = 0, shown_n = 0;
     double sum = 0.0, sq = 0.0, mx = 0.0;
-    u32 n = 0;
-    int k = 1, mult = 2, up_n = 0;
-    double shown = 0.0, interval = 0.0; // seconds
+    double ssum = 0.0, ssq = 0.0, smx = 0.0;
+    u32 presents = 0, dropped = 0;
 };
-BbFgCap g_bb_cap;
+BbFgPace g_bb_pace;
 
-int BbFgCapMode() { // 0 off, 1 fixed refresh, 2 VRR / number
-    static const int mode = [] {
-        const char* c = std::getenv("BB_FG_CAP");
-        const std::string v = c != nullptr ? c : "auto";
-        if (v == "off" || v == "0") return 0;
-        if (v != "auto" && std::strtod(v.c_str(), nullptr) > 0.0) return 2;
-        const char* r = std::getenv("BB_FG_VRR");
-        return r != nullptr && r[0] == '1' ? 2 : 1;
-    }();
-    return mode;
-}
-
-double BbFgCapNumber() {
-    const char* c = std::getenv("BB_FG_CAP");
-    return c != nullptr ? std::strtod(c, nullptr) : 0.0;
-}
-
-// Picks the multiplier and the shown rate for the free real rate `free` on a `hz` display.
-void BbFgCapChoose(double free, double hz, bool fifo) {
-    auto& c = g_bb_cap;
-    const auto& cfg = BB::FG::Cfg();
-    const int fixed = std::clamp(cfg.multiplier, 2, 4);
-    const int mode = BbFgCapMode();
-    int best_m = fixed, best_k = 1;
-    double best_shown = 0.0;
-    if (mode == 2) {
-        double T = BbFgCapNumber();
-        if (T <= 0.0) T = hz - hz * hz / 3600.0;
-        if (fifo) T = std::min(T, hz);
-        best_m = fixed;
-        if (cfg.dynamic) {
-            best_m = 2;
-            for (int m = 4; m >= 2; --m) {
-                if (free * m <= T * 1.02 || m == 2) {
-                    best_m = m;
-                    break;
-                }
-            }
-            // Below the target even at x4: x4.
-            if (free * 4 < T) best_m = 4;
-        }
-        best_shown = std::min(T, free * best_m * 0.97); // under the game: just its own rate
-        best_k = 0;
-    } else {
-        for (int m = cfg.dynamic ? 2 : fixed; m <= (cfg.dynamic ? 4 : fixed); ++m) {
-            for (int k = 1; k <= 8; ++k) {
-                const double shown = hz / k;
-                if (shown / m <= free * 0.97 || k == 8) {
-                    if (shown > best_shown + 0.5) {
-                        best_shown = shown;
-                        best_m = m;
-                        best_k = k;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    const bool lower = best_shown < c.shown - 0.5 || c.shown <= 0.0;
-    const bool higher = best_shown > c.shown + 0.5;
-    if (lower || (higher && ++c.up_n >= 2) || (!higher && best_m != c.mult && c.shown > 0.0)) {
-        if (best_m != c.mult || std::fabs(best_shown - c.shown) > 0.5) {
-            BB::Upscale::Checkpoint(fmt::format(
-                "[fg-cap] x{} shown {:.1f} fps (refresh {:.0f} Hz / {}), real held at {:.1f} "
-                "(free {:.1f})",
-                best_m, best_shown, hz, best_k, best_shown / best_m, free));
-        }
-        c.mult = best_m;
-        c.k = best_k;
-        c.shown = best_shown;
-        c.up_n = 0;
-    } else if (!higher) {
-        c.up_n = 0;
-    }
-    c.interval = c.shown > 0.0 ? c.mult / c.shown : 0.0;
-}
-
-// Waits for the game frame's slot; returns the real interval in seconds (0: no limiter).
-double BbFgCapWait(bool fifo) {
-    auto& c = g_bb_cap;
-    if (BbFgCapMode() == 0) return 0.0;
-    const double hz_d = BB::FG::Amd::DisplayHz();
-    const double hz = hz_d > 1.0 ? hz_d : 60.0;
-    auto now = std::chrono::steady_clock::now();
+// A real frame arrived (before its presents): returns the expected interval in ms (0: unknown).
+double BbFgPaceReal(bool fifo) {
+    auto& c = g_bb_pace;
+    const auto now = std::chrono::steady_clock::now();
     if (c.win.time_since_epoch().count() == 0) c.win = now;
     const double window = std::chrono::duration<double>(now - c.win).count();
     if (window >= 1.0) {
         if (window < 3.0 && c.frames > 0) {
-            const double busy = std::max(window - c.slept, 0.05);
-            const double free = c.frames / busy;
-            c.smooth = c.smooth <= 0.0 ? free : 0.5 * c.smooth + 0.5 * free;
-            BbFgCapChoose(std::min(c.smooth, free), hz, fifo);
             const double mean = c.n ? c.sum / c.n : 0.0;
             const double sd = c.n ? std::sqrt(std::max(c.sq / c.n - mean * mean, 0.0)) : 0.0;
+            const double smean = c.shown_n ? c.ssum / c.shown_n : 0.0;
+            const double ssd =
+                c.shown_n ? std::sqrt(std::max(c.ssq / c.shown_n - smean * smean, 0.0)) : 0.0;
+            const double hz = BB::FG::Amd::DisplayHz();
             BB::Upscale::Checkpoint(fmt::format(
-                "[fg-cap] 1 s: real {:.1f} fps (free {:.1f}), shown target {:.1f}, cap {:.1f} real "
-                "(interval {:.2f} ms), x{}, {} Hz {}; real frame time mean {:.2f} sd {:.2f} max "
-                "{:.2f} ms",
-                c.frames / window, free, c.shown, c.interval > 0 ? 1.0 / c.interval : 0.0,
-                c.interval * 1e3, c.mult, hz, fifo ? "FIFO" : "mailbox/immediate", mean, sd, c.mx));
+                "[fg-pace] 1 s: real {:.1f} fps, shown {:.1f} fps (x{:.2f}), no cap; display {:.0f} "
+                "Hz {}; real frame time mean {:.2f} sd {:.2f} max {:.2f} ms; shown interval mean "
+                "{:.2f} sd {:.2f} max {:.2f} ms; generated dropped {}",
+                c.frames / window, c.presents / window,
+                c.frames ? double(c.presents) / c.frames : 0.0, hz,
+                fifo ? "FIFO" : "mailbox/immediate", mean, sd, c.mx, smean, ssd, c.smx, c.dropped));
         }
         c.win = now;
-        c.frames = 0;
-        c.slept = 0.0;
-        c.sum = c.sq = c.mx = 0.0;
-        c.n = 0;
+        c.frames = c.n = c.shown_n = c.presents = c.dropped = 0;
+        c.sum = c.sq = c.mx = c.ssum = c.ssq = c.smx = 0.0;
     }
     ++c.frames;
-    if (c.interval > 0.0) {
-        const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double>(c.interval));
-        if (c.next > now && c.next - now < step * 2) {
-            c.slept += std::chrono::duration<double>(c.next - now).count();
-            const auto spin = std::chrono::microseconds(1500);
-            if (c.next - now > spin) std::this_thread::sleep_for(c.next - now - spin);
-            while (std::chrono::steady_clock::now() < c.next) std::this_thread::yield();
-            now = c.next;
-        }
-        // Late by more than a slot: a new grid (no catch-up burst).
-        c.next = (c.next + step < now ? now : c.next) + step;
-    }
     if (c.last.time_since_epoch().count() != 0) {
         const double dt = std::chrono::duration<double, std::milli>(now - c.last).count();
-        if (dt < 100.0) {
+        if (dt > 1.0 && dt < 100.0) {
             c.sum += dt;
             c.sq += dt * dt;
             c.mx = std::max(c.mx, dt);
             ++c.n;
+            c.ring[c.ring_i] = dt;
+            c.ring_i = (c.ring_i + 1) % c.ring.size();
+            c.ring_n = std::min<u32>(c.ring_n + 1, u32(c.ring.size()));
         }
     }
     c.last = now;
-    return c.interval;
+    if (c.ring_n < 5) return 0.0;
+    std::array<double, 15> v{};
+    std::copy_n(c.ring.begin(), c.ring_n, v.begin());
+    std::nth_element(v.begin(), v.begin() + c.ring_n / 2, v.begin() + c.ring_n);
+    return v[c.ring_n / 2];
+}
+
+// Every present of the frame generation loop (generated or real).
+void BbFgPaceShown() {
+    static std::chrono::steady_clock::time_point last{};
+    auto& c = g_bb_pace;
+    const auto now = std::chrono::steady_clock::now();
+    ++c.presents;
+    if (last.time_since_epoch().count() != 0) {
+        const double dt = std::chrono::duration<double, std::milli>(now - last).count();
+        if (dt < 100.0) {
+            c.ssum += dt;
+            c.ssq += dt * dt;
+            c.smx = std::max(c.smx, dt);
+            ++c.shown_n;
+        }
+    }
+    last = now;
 }
 } // namespace
 
@@ -913,11 +839,6 @@ void Presenter::BbUpdateFrameGenLimit(bool wanted, double present_ms) {
     }
     if (now < bb_frame_gen_hold_until) {
         limit = 0;
-    }
-    // bb-amd-mfg: the real-frame limiter's multiplier (dlss-dyn) when it runs.
-    if (BB::FG::Cfg().dynamic && BbFgCapMode() != 0 && g_bb_cap.shown > 0.0 &&
-        now >= bb_frame_gen_hold_until) {
-        limit = u32(std::clamp(g_bb_cap.mult - 1, 1, 3));
     }
     if (limit != before && BB::FG::Cfg().dynamic) {
         BB::Upscale::Checkpoint(fmt::format("Frame generation: {} generated per game frame "
@@ -1601,10 +1522,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // frames (the generated ones belong to the time before this frame). A frame shown again has
     // none.
     u32 bb_generated = is_reusing_frame ? 0 : frame->generated_count;
-    double bb_cap_s = 0.0;
-    if (!is_reusing_frame && is_game_frame && BB::FG::Dlss::Ready()) {
-        bb_cap_s = BbFgCapWait(swapchain.IsFifo());
-    }
+    const bool bb_pace = !is_reusing_frame && is_game_frame && BB::FG::Dlss::Ready();
+    const double bb_median_ms = bb_pace ? BbFgPaceReal(swapchain.IsFifo()) : 0.0;
     const auto bb_start = std::chrono::steady_clock::now();
     if (!is_reusing_frame && is_game_frame) {
         const double ms =
@@ -1617,7 +1536,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
     const auto bb_step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double, std::milli>(
-            (bb_cap_s > 0.0 && bb_cap_s < 0.1 ? bb_cap_s * 1e3 : double(bb_game_frame_ms)) /
+            (bb_median_ms > 0.0 ? bb_median_ms : double(bb_game_frame_ms)) /
             (bb_generated + 1)));
     // The game must never wait for generated frames: when every frame is in use they are
     // dropped and the game's frame goes out at once.
@@ -1625,6 +1544,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         std::scoped_lock lock{free_mutex};
         return free_queue.empty();
     };
+    const u32 bb_made = bb_generated;
     if (bb_generated && bb_behind()) {
         bb_generated = 0;
     }
@@ -1646,11 +1566,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             bb_wait_until(bb_start + bb_step * bb_shown);
         }
         if (!BbPresentGenerated(frame, bb_shown, bb_shown == 0)) break;
+        if (bb_pace) BbFgPaceShown();
     }
     if (bb_shown && !bb_behind()) {
         bb_wait_until(bb_start + bb_step * bb_shown);
     }
     bb_sec_generated_shown += bb_shown;
+    if (bb_pace) {
+        g_bb_pace.dropped += bb_made - bb_shown;
+        BbFgPaceShown(); // the real frame, presented next
+    }
 
     if (!swapchain.AcquireNextImage()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
