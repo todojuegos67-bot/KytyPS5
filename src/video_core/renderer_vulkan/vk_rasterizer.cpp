@@ -1569,7 +1569,10 @@ void Rasterizer::UpdateViewportScissorState() const {
             // bb-clean-021-bbport: Supermedo's target_scale (draws into the output-size UI images).
             viewport.x = (xoffset - xscale) * bb_target_scale[0];
             viewport.y = (yoffset - yscale) * bb_target_scale[1];
-            if (bb_jitter_draw) {
+            // Supermedo (vk_rasterizer.cpp ~1122): jitter geometry, not full-screen passes (a
+            // shifted full-screen quad leaves an edge column/row unwritten).
+            if (bb_jitter_draw &&
+                (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
                 float jx = 0.f, jy = 0.f;
                 BB::Upscale::Jitter(jx, jy);
                 viewport.x += jx;
