@@ -1075,8 +1075,17 @@ bool KbmProvide(int* x, int* y) {
 		*x = std::clamp(static_cast<int>(std::lround(128.0 + k.out_x * 127.5)), 0, 255);
 		*y = std::clamp(static_cast<int>(std::lround(128.0 + k.out_y * 127.5)), 0, 255);
 	}
-	k.last_x = *x, k.last_y = *y, k.last_ret = ret;
+	// Learn the signs from the real stick only (before the hold can apply).
 	Loader::DemonsSoulsCamera::DirectSetStick(*x, *y);
+	// (11-10c) The direct mouse camera: hold the stick X off centre while the mouse turns it (the hook zeroes its turn),
+	// so the game's follow camera does not recentre behind a running player. Only while the mouse moved recently.
+	if (!calibrating && *x == 128) {
+		if (const int hx = Loader::DemonsSoulsCamera::DirectHoldStickX(); hx != 128) {
+			*x  = hx;
+			ret = true;
+		}
+	}
+	k.last_x = *x, k.last_y = *y, k.last_ret = ret;
 	return ret;
 }
 
@@ -1325,6 +1334,7 @@ bool HostInputMouseMotion(int dx, int dy) {
 		return true;
 	}
 	if (g_kbm.captured) {
+		Loader::DemonsSoulsCamera::DirectNoteStickRouted(std::llabs(dx));
 		g_kbm.acc_x.fetch_add(static_cast<int64_t>(dx) * KBM_ONE, std::memory_order_acq_rel);
 		g_kbm.acc_y.fetch_add(static_cast<int64_t>(dy) * KBM_ONE, std::memory_order_acq_rel);
 		g_kbm.received.fetch_add((std::llabs(dx) + std::llabs(dy)) * KBM_ONE, std::memory_order_relaxed);

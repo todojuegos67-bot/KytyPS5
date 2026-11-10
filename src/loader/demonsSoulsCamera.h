@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 namespace Loader {
 struct Program;
@@ -17,6 +18,11 @@ bool DirectWanted();
 bool DirectInstalled();
 bool DirectTakesMouse();
 void DirectAddMouse(int dx, int dy);
+// (11-10c) While the mouse turned the camera in the last KYTY_KBM_HOLD_MS (default 400), the emulated right stick's X
+// is held off centre (HoldStickX, 0..255; 128 = none) so the game sees camera input and its auto-follow behind a running
+// player stays off; the hook cancels that held stick's own turn (yaw stick = 0 in frames without counts).
+int  DirectHoldStickX();
+void DirectNoteStickRouted(int64_t counts); // mouse counts that went to the emulated stick path (log)
 void DirectSetStick(int x, int y);    // the emulated right stick last sent (0..255), to learn the signs
 void DirectSetDegPerCount(float deg); // degrees per mouse count (deg per count * sensitivity)
 } // namespace DemonsSoulsCamera
