@@ -114,5 +114,9 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
 
 // F8 panel: FSR 3 FG's last per-second real / shown fps and its state ("on", or why off).
 bool PanelInfo(float& real, float& shown, const char*& state);
+// bb-amd-mfg: the DLSS-G real / shown rates of the last second (the presenter's 1 s line), for the
+// panels; Label(): "FSR 3 x3", "DLSS-G dyn x3", ... (the multiplier in use).
+void NoteRates(float real, float shown, int multiplier);
+std::string Label();
 
 } // namespace BB::FG

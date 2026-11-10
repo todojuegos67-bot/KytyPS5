@@ -3,6 +3,7 @@
 // bb-clean-021-fg: BB_FG settings and the swapchain / device hooks (bb_fg.h), from the 1.59
 // build's bb_fg.cpp reduced to AMD FSR 3 x2.
 
+#include <atomic>
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
@@ -161,12 +162,37 @@ bool Fsr3Active() {
     return Cfg().kind == Kind::Amd && Amd::Active();
 }
 
+namespace {
+std::atomic<float> g_note_real{0.0f}, g_note_shown{0.0f};
+std::atomic<int> g_note_mult{0};
+} // namespace
+
+void NoteRates(float real, float shown, int multiplier) {
+    g_note_real.store(real, std::memory_order_relaxed);
+    g_note_shown.store(shown, std::memory_order_relaxed);
+    g_note_mult.store(multiplier, std::memory_order_relaxed);
+}
+
+std::string Label() {
+    const auto& c = Cfg();
+    int m = g_note_mult.load(std::memory_order_relaxed);
+    if (m < 2) m = c.multiplier;
+    const char* who = c.kind == Kind::Amd ? "FSR 3" : c.kind == Kind::Dlss ? "DLSS-G" : "FG";
+    return std::string(who) + (c.dynamic ? " dyn x" : " x") + std::to_string(m);
+}
+
 bool PanelInfo(float& real, float& shown, const char*& state) {
     real = shown = 0;
     state = "off";
     if (!On()) return false;
     if (Cfg().kind == Kind::Dlss) {
-        state = Dlss::Ready() ? "DLSS-G (NGX)" : "DLSS-G unavailable";
+        if (!Dlss::Ready()) {
+            state = "DLSS-G unavailable";
+            return true;
+        }
+        real = g_note_real.load(std::memory_order_relaxed);
+        shown = g_note_shown.load(std::memory_order_relaxed);
+        state = shown > real * 1.2f ? "on" : "idle";
         return true;
     }
     if (!Fsr3Requested()) {

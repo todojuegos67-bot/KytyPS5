@@ -652,6 +652,7 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
             MfgSetActive(next);
         }
     }
+    NoteRates(static_cast<float>(real), static_cast<float>(shown), g_mfg.current);
     Printf("[fsr3-mfg] x%d%s; real %.1f fps (free %.1f), shown %.1f fps%s", g_mfg.current,
            g_mfg.dynamic ? " dynamic" : "", real, free, shown, "");
 }

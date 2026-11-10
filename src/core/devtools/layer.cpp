@@ -15,6 +15,7 @@
 #include "imgui/imgui_std.h"
 #include "imgui_internal.h"
 #include "options.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "widget/frame_dump.h"
 #include "widget/frame_graph.h"
@@ -288,6 +289,15 @@ void L::DrawSimple() {
         PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f)); // White
     }
     Text("%d FPS (%.1f ms)", static_cast<int>(std::round(frameRate)), 1000.0f / frameRate);
+    {
+        // bb-amd-mfg: with frame generation on, the real and the shown (real + generated) rates.
+        float real = 0, shown = 0;
+        const char* state = "";
+        if (BB::FG::PanelInfo(real, shown, state) && real > 0.0f) {
+            Text("FG %s: real %.0f / shown %.0f FPS (generated %.0f)", BB::FG::Label().c_str(),
+                 real, shown, std::max(shown - real, 0.0f));
+        }
+    }
     PopStyleColor();
 }
 
