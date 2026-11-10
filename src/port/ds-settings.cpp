@@ -263,6 +263,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("metricas", s->metrics);
 	boo("menu_inicio", s->start_menu);
 	boo("lanzador_ambiente", s->launcher_ambience);
+	boo("saltar_intro", s->skip_intro);
 	boo("vibracion", s->rumble);
 	num("vibracion_fuerza", s->rumble_gain);
 	str("extra", s->extra);
@@ -558,6 +559,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "menu_inicio=" << b(s.start_menu) << "\n"
 	  << "; Niebla y ceniza animadas de fondo en el lanzador (0 = la ilustracion fija)\n"
 	  << "lanzador_ambiente=" << b(s.launcher_ambience) << "\n"
+	  << "; Saltar el video de PlayStation y la cinematica de inicio (1 si, 0 no)\n"
+	  << "saltar_intro=" << b(s.skip_intro) << "\n"
 	  << "; Vibracion del mando (el audio haptico del DualSense como vibracion; mandos Xbox, DualSense por Bluetooth)\n"
 	  << "vibracion=" << b(s.rumble) << "\n"
 	  << "vibracion_fuerza=" << Num(s.rumble_gain) << "\n\n"
@@ -1001,6 +1004,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// run-windows.ps1, in its order.
 	if (env.Get("KYTY_RENDER_CPUS").empty() && env.Has("KYTY_RECORDING_CPUS")) env.Set("KYTY_RENDER_CPUS", env.Get("KYTY_RECORDING_CPUS"));
 	if (env.Get("KYTY_ASYNC_UPLOAD") == "1") env.Set("KYTY_ASYNC_UPLOAD", "2");
+	if (s.skip_intro) env.Set("KYTY_SKIP_INTRO", "1");
 	env.Default("KYTY_BUFFER_RECLAIM", "1");
 	env.Default("KYTY_DRAW_PACKETS", "1");
 	env.Default("KYTY_PARTIAL_IMAGE_DIRTY", "1");

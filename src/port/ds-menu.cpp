@@ -4136,6 +4136,7 @@ void DrawLauncher(float width, float height) {
 		sh_h      = sh_pad + sh_text_h + (pv.running ? U(12) + U(32) : 0.0f) + (sh_button ? U(12) + U(36) : 0.0f) + sh_pad;
 	}
 	float bottom_h = U(58 + 8 + 40 + 16);
+	bottom_h += U(44); // (11-10) the "skip the intro" row
 	if (g_rt.pick_folder) bottom_h += U(44); // (port26) the game folder row
 	if (shader_row) bottom_h += sh_h + U(14);
 	if (!when.empty()) bottom_h += U(26);
@@ -4154,6 +4155,21 @@ void DrawLauncher(float width, float height) {
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), 0});
 	g_lbox.at = {px + U(10), ImGui::GetCursorScreenPos().y};
 	g_lbox.w  = U(420);
+	{
+		// (11-10) Skip the PlayStation logo video and the opening cinematic: above the game folder, saved at once.
+		const float y     = RowY();
+		std::string label = std::string(I18n::T("Saltar intro y videos de inicio: ")) + I18n::T(s.skip_intro ? "Si" : "No");
+		if (LButton(label.c_str(), {g_lbox.at.x, y}, {U(420), U(36)}, s.skip_intro, g_font_semi, U(15),
+		            "Salta el video de PlayStation y la cinematica del principio, hasta la pantalla de titulo.")) {
+			s.skip_intro       = !s.skip_intro;
+			g_saved.skip_intro = s.skip_intro;
+			Settings on_disk;
+			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_edit;
+			on_disk.skip_intro = s.skip_intro;
+			g_status = SaveSettings(g_rt.ini_path, on_disk) ? "Guardado en settings.ini" : "No se pudo guardar settings.ini";
+		}
+		RowEnd(y, 44);
+	}
 	if (g_rt.pick_folder) {
 		// (port26) The game folder, above the shaders' panel: chosen, checked and saved to settings.ini at once (only that key).
 		const float y     = RowY();

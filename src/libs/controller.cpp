@@ -225,6 +225,31 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	}
 	// The player's first button (the world gate in videoOut.cpp starts from it).
 	if (connected && data->buttons != 0) Libs::VideoOut::NotePlayerInput();
+	// (11-10) KYTY_SKIP_INTRO=1 (the launcher's "Saltar intro"): X pressed for the game while the PlayStation logo movie
+	// plays, and once early in the opening cinematic, before the player's own first button only. Never at the title.
+	if (data->buttons == 0 && !Libs::VideoOut::PlayerInputSeen()) {
+		static const bool skip = [] {
+			const char* v = std::getenv("KYTY_SKIP_INTRO");
+			return v != nullptr && std::strcmp(v, "1") == 0;
+		}();
+		static int64_t cine_seen = 0;
+		static bool    cine_done = false;
+		if (skip) {
+			const int64_t now   = SteadyNanoseconds();
+			const bool    pulse = (now / 100000000) % 4 == 0; // (100 ms down every 400 ms)
+			if (Libs::VideoOut::MoviePlaying()) {
+				if (pulse) data->buttons |= PAD_BUTTON_CROSS;
+			} else if (!cine_done && Libs::VideoOut::CinematicPlaying()) {
+				if (cine_seen == 0) cine_seen = now;
+				// One press 1.5 s into the cinematic (it is playing by then), held 150 ms.
+				if (now - cine_seen > 1500000000 && now - cine_seen < 1650000000) data->buttons |= PAD_BUTTON_CROSS;
+				if (now - cine_seen >= 1650000000) {
+					cine_done = true;
+					std::printf("[port] intro: the opening cinematic skipped (KYTY_SKIP_INTRO)\n");
+				}
+			}
+		}
+	}
 	// (10-22) Only a stick ends a cutscene's hold (a button, X skipping included, keeps it until the player moves).
 	if (connected && (std::abs(data->left_stick_x - 128) > 48 || std::abs(data->left_stick_y - 128) > 48 ||
 	                  std::abs(data->right_stick_x - 128) > 48 || std::abs(data->right_stick_y - 128) > 48))

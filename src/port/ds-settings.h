@@ -204,6 +204,7 @@ struct Settings {
 	bool        perf_lane_wide = false;     // KYTY_LANE_LOCAL_WIDE=1
 	// [Interfaz]
 	std::string metrics = "0"; // KYTY_FPS_HUD 0/1/2
+	bool        skip_intro        = false; // (11-10) saltar_intro: the PlayStation logo and the opening cinematic skipped
 	bool        launcher_ambience = true; // (des-combo-1108) lanzador_ambiente: fog and ash in the launcher
 	bool        start_menu = true; // (10-27b) menu_inicio: the launcher-style menu before the game
 	bool        rumble = true;
