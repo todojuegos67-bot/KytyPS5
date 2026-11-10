@@ -1,3 +1,4 @@
+#include "graphics/presentation/videoOut.h"
 #include "local/port-live.h"
 #include "libs/audio.h"
 
@@ -757,6 +758,12 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 		}
 	}
 
+	// (11-10) KYTY_SKIP_INTRO: silence while the start-up movie and the opening cinematic are skipped.
+	thread_local std::vector<uint8_t> hush;
+	if (Libs::VideoOut::IntroHidden() && queue_size > 0) {
+		if (hush.size() < queue_size) hush.assign(queue_size, 0);
+		queue_data = hush.data();
+	}
 	if (SDL_QueueAudio(port->audio_device, queue_data, queue_size) < 0) {
 		LOGF("AudioOut: SDL_QueueAudio failed: %s\n", SDL_GetError());
 		return false;
