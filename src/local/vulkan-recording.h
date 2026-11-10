@@ -4,8 +4,10 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace vk::detail { class DispatchLoaderDynamic; }
+struct VkCommandBuffer_T;
 
 // Vulkan command recording on a worker thread (KYTY_VULKAN_RECORDING). The
 // renderer remains the sole resource/cache owner; a producer scope transfers
@@ -59,11 +61,64 @@ uint64_t StateEpoch();
 uint64_t WorkCalls();
 // Work calls and packets (draws, descriptors) the calling thread recorded: unchanged = nothing recorded.
 uint64_t RecordedWork();
+// Commands that change memory or images (draws, dispatches, copies, clears) and packets the calling thread
+// recorded: unchanged = nothing but barriers and rendering scopes recorded.
+uint64_t RecordedWrites();
 class ProducerScope {
 public:
     ProducerScope();
     ~ProducerScope();
     ProducerScope(const ProducerScope&) = delete;
     ProducerScope& operator=(const ProducerScope&) = delete;
+};
+
+// Worker packets spliced at commit. A passive producer (a speculation worker's) records exactly as a producer
+// does, into chunks from its own pool, with no replay thread: nothing it records reaches the driver until the
+// render thread splices the chunks into its own stream, where its replay thread executes them in order between
+// the render thread's packets. Its commands name the placeholder command buffer, which a spliced chunk's replay
+// resolves to the splice's target (the render thread's open command buffer).
+struct Chunk;
+// A passive producer's closed segment: its chunks in recording order, not replayed. Destroying (or Discard) runs
+// each packet's destructor without executing it and returns the chunks to their pool.
+class ChunkList {
+public:
+    ChunkList() = default;
+    ChunkList(ChunkList&& other) noexcept;
+    ChunkList& operator=(ChunkList&& other) noexcept;
+    ~ChunkList();
+    ChunkList(const ChunkList&) = delete;
+    ChunkList& operator=(const ChunkList&) = delete;
+    [[nodiscard]] bool empty() const { return chunks.empty(); }
+    std::vector<Chunk*> chunks;
+    uint64_t commands = 0;
+    // A command of the segment could not be recorded (too large, an unknown extension chain, a direct call on the
+    // placeholder): the segment is incomplete and must be discarded, never spliced.
+    bool failed = false;
+};
+VkCommandBuffer_T* PlaceholderCommandBuffer();
+// The placeholder resolved to the target of the spliced chunk being replayed; any other handle is itself.
+VkCommandBuffer_T* Resolve(VkCommandBuffer_T* command);
+// The calling thread records into its passive producer (inside a segment).
+bool Passive();
+// The calling thread has a passive producer (PassiveProducerScope).
+bool HasPassiveProducer();
+// The passive producer's segment: Begin discards anything recorded since the last End and arms the producer (the
+// thread's calls are recorded from then on); End disarms it, closes the open chunk and hands the segment's chunks over.
+// Outside a segment the thread's calls go to the driver as without a producer.
+void BeginSegment();
+ChunkList EndSegment();
+void Discard(ChunkList& list);
+// Render thread (a producer's thread): the list's chunks appended to its stream after everything it recorded so
+// far, each replayed with the placeholder resolved to `target`. A failed list is discarded instead (false).
+bool Splice(ChunkList& list, VkCommandBuffer_T* target);
+// Chunks spliced and passive chunks allocated so far (diagnostics).
+uint64_t SplicedChunks();
+uint64_t PassiveChunksAllocated();
+class PassiveProducerScope {
+public:
+    PassiveProducerScope();
+    ~PassiveProducerScope();
+    PassiveProducerScope(const PassiveProducerScope&) = delete;
+    PassiveProducerScope& operator=(const PassiveProducerScope&) = delete;
 };
 }

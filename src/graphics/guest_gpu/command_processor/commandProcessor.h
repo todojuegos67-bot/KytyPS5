@@ -26,10 +26,15 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
-	// Each buffer's commands through `rebase`, which gives another view of the same bytes back (KYTY_WRITE_GUARD).
+	// Each buffer's commands through `rebase`, which gives another view of the same bytes back (KYTY_WRITE_GUARD). The
+	// guest view's address is kept: a position is the buffer's guest address and offset, whichever view reads it
+	// (SamePosition; 4 Nov wg6: compared by the view's pointer, a rebased in-order run missed its chunk's end).
 	template <typename F>
 	void RebaseCommands(F&& rebase) {
-		for (auto& cursor: m_buffer_stack) cursor.commands = rebase(cursor.commands);
+		for (auto& cursor: m_buffer_stack) {
+			if (cursor.guest == nullptr) cursor.guest = cursor.commands.data();
+			cursor.commands = rebase(cursor.commands);
+		}
 	}
 
 private:
@@ -39,6 +44,8 @@ private:
 		std::span<const uint32_t> commands;
 		uint32_t                  offset_dw           = 0;
 		uint32_t                  deferred_advance_dw = 0;
+		const uint32_t*           guest               = nullptr; // the guest view's commands once rebased, else null
+		[[nodiscard]] const uint32_t* Position() const noexcept { return guest != nullptr ? guest : commands.data(); }
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
@@ -63,6 +70,35 @@ public:
 
 	void Reset();
 	void ApplyContextStateOperation(ContextStateOperation operation);
+	// The registers and the rest of the processor's state (with the constant RAM: `const_ram`), not the queue it
+	// serves: a speculative translation starts from the processor's state and, committed, leaves its own
+	// (speculation.cpp).
+	void CopyStateFrom(const CommandProcessor& other, bool const_ram);
+	// The state draws and dispatches may change besides the registers they read is the same.
+	[[nodiscard]] bool SameDrawState(const CommandProcessor& other) const;
+	// The same registers and draw state (all CopyStateFrom copies but the flip, submit id and constant engine).
+	[[nodiscard]] bool SameState(const CommandProcessor& other) const;
+	// A state pass (KYTY_SPECULATE=4): Process runs only the packets that change this processor's state (registers,
+	// index and indirect bases, instances, counters, predication, context pushes), translating and executing nothing:
+	// the state a command buffer leaves, before it is translated.
+	void SetStateOnly(bool state_only) noexcept { m_state_only = state_only; }
+	// Chunks of a command buffer (KYTY_SPECULATE=4): a state pass suspends before every `every`-th draw or dispatch that
+	// does not continue a run of indirect draws (TakeBoundary: it did); Process suspends before the packet at `at` (the
+	// next chunk's start; null: none; TakeStopReached: it did). Positions are compared by the packets they are at.
+	void SetChunking(uint32_t every) noexcept {
+		m_chunk_every       = every;
+		m_chunk_work        = 0;
+		m_chunk_last_opcode = 0;
+	}
+	[[nodiscard]] bool        TakeBoundary() noexcept { return std::exchange(m_at_boundary, false); }
+	void                      SetStopAt(const Pm4Execution* at) noexcept { m_stop_at = at; }
+	[[nodiscard]] bool        TakeStopReached() noexcept { return std::exchange(m_stop_reached, false); }
+	[[nodiscard]] static bool SamePosition(const Pm4Execution& a, const Pm4Execution& b);
+	// The packet a suspended execution stopped at (its length in `dwords`), and past it.
+	[[nodiscard]] static const uint32_t* SuspendedPacket(const Pm4Execution& execution, uint32_t& dwords);
+	// The execution stopped at a WAIT_REG_MEM.
+	[[nodiscard]] static bool AtWait(const Pm4Execution& execution);
+	static void                          SkipSuspendedPacket(Pm4Execution& execution);
 
 	void            BufferInit();
 	void            BufferFlush();
@@ -92,6 +128,9 @@ public:
 	[[nodiscard]] uint32_t TryNativeDirectDraw(std::span<const uint32_t> packet);
 	// A DRAW_INDEX_AUTO of a triangle list or strip as a table draw: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeAutoDraw(std::span<const uint32_t> packet);
+	// KYTY_SPEC_DRAW_INDIRECT (live spec_draw_indirect): a DRAW_INDIRECT (non-indexed) as a table draw, its arguments
+	// read on the GPU: the packet's dwords, or 0.
+	[[nodiscard]] uint32_t TryNativeIndirectAutoDraw(std::span<const uint32_t> packet);
 	// A DRAW_INDEX_INDIRECT_MULTI of a count it holds, as that many DRAW_INDEX_INDIRECT: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeMultiDraw(std::span<const uint32_t> packet);
 	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);
@@ -161,13 +200,18 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
-	uint32_t m_draw_run_skip = 0;
+	uint32_t            m_draw_run_skip = 0;
+	bool                m_state_only    = false;
+	uint32_t            m_chunk_every = 0, m_chunk_work = 0, m_chunk_last_opcode = 0;
+	bool                m_at_boundary = false, m_stop_reached = false;
+	const Pm4Execution* m_stop_at = nullptr;
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
+	void ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }

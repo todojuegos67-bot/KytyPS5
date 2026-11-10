@@ -1,6 +1,10 @@
-param([string]$Scenes = 'world-prologue,rec-m02_00_00_00-c0000_0001,world-latria,rec-m02_00_00_00-c0000_0006,rec-m02_00_00_00-c0000_0001+KYTY_SCOUT=0')
-# (-File passes one string: scenes separated by commas; <save>+<SWITCH=value> = that save with a launch switch.)
+param([string]$Scenes = 'world-prologue,rec-m02_00_00_00-c0000_0001,world-latria,rec-m02_00_00_00-c0000_0006,rec-m02_00_00_00-c0000_0001+KYTY_SCOUT=0',
+	[switch]$Speculate)
+# (-File passes one string: scenes separated by commas; <save>+<SWITCH=value>[+<SWITCH=value>] = that save with launch switches.)
 $SceneList = @($Scenes -split ',')
+# -Speculate: the default five again with KYTY_SPECULATE=4 after them, for a profile that also covers mode 4's own paths
+# (tools/local/PGO.md). A -Scenes list given on the command line is run as it is.
+if ($Speculate -and !$PSBoundParameters.ContainsKey('Scenes')) { $SceneList += @($SceneList | ForEach-Object { "$_+KYTY_SPECULATE=4" }) }
 # PGO training over several scenes (tools/local/PGO.md; by default the release profile's five runs): the user's save moved aside once, each scene's
 # baseline (_Build\bench-baselines\<save>) installed by bench-run (KYTY_BENCH_BASELINE), pgo-train.ps1 per scene, the raw
 # profiles merged into _Build\pgo\windows\kyty-<date>.profdata. The user's save is restored at the end.
@@ -25,7 +29,7 @@ try {
 		for ($i = 0; $i -lt 90 -and (Running); $i++) { Start-Sleep 1 }
 		"== $tag $(Get-Date -Format HH:mm:ss)"
 		$params = @{ Out = $out; NoPrecompile = $true }
-		if ($switch) { $params['Set'] = @($switch) }
+		if ($switch) { $params['Set'] = @($switch -split '\+') }
 		& "$root\tools\local\windows\pgo-train.ps1" @params
 		if (Test-Path "$out.profraw") { "raw: $((Get-Item "$out.profraw").Length) bytes" }
 		else { "NO PROFILE for $tag" }

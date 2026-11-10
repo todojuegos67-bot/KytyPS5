@@ -21,6 +21,9 @@ namespace Libs::Graphics {
 class Buffer;
 class CommandScheduler;
 struct ImageTestAccess;
+namespace Spec {
+struct ImageEntry;
+} // namespace Spec
 
 using ImageId = Common::SlotId;
 
@@ -57,7 +60,8 @@ struct ImageBinding {
 void BeginTransitGroup() noexcept;
 void EndTransitGroup() noexcept;
 
-// Moves whenever an image's barrier state (layout, access) is set: what was found in place holds while it does not.
+// Moves whenever an image's barrier state (layout, access) is set outside a speculation's own view: what was found
+// in place holds while it does not.
 [[nodiscard]] uint64_t ImageStateEpoch() noexcept;
 class Image;
 // (`image`: the one whose state moved, which its serial records too; null when unknown, which moves every image's.)
@@ -128,10 +132,14 @@ public:
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
 	             bool read_after_write = false);
-	// The whole-image barrier state the next transition starts from.
+	// The whole-image barrier state the calling thread's next transition starts from (a speculative translation's
+	// own once it used the image: speculation-state.h).
 	[[nodiscard]] const VulkanImageState& CurrentState() const;
+	// A speculative translation's work uses the image as it is now (its commit puts it there first: a use without a
+	// transition needs this too); null outside one.
+	Spec::ImageEntry* SpeculativeEntry();
 	// The barrier state set to `state` (each subresource's: `subresources`, unless empty), with the barriers there
-	// from the image's.
+	// from the image's (a speculative translation's work is committed where it found the image).
 	void RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
 	                  vk::CommandBuffer command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -422,7 +430,8 @@ public:
 	const Buffer*    staged_ring        = nullptr;
 	uint64_t         staged_offset      = 0;
 	uint64_t         staged_serial      = 0;
-	// The barrier state (backing.state, backing.subresource_states, transit_group): changed under this lock.
+	// The barrier state (backing.state, backing.subresource_states, transit_group): changed under this lock, which a
+	// speculative translation's thread reads it under (SpeculativeEntry).
 	struct StateLock {
 		explicit StateLock(const Image& owner) noexcept: image(owner) {
 			while (image.state_busy.exchange(true, std::memory_order_acquire)) _mm_pause();

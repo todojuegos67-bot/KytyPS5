@@ -11,11 +11,86 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 #include "local-platform.h"
+#include "speculation-ram-gate.h"
 
+#include <atomic>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
+
+#if defined(KYTY_MIMALLOC)
+#include <malloc.h>
+#include <mimalloc.h>
+#include <new>
+
+// The executable's operator new/delete (this translation unit only): mimalloc's under KYTY_SPECULATE=4, else the CRT
+// heap's (KYTY_MIMALLOC=1 / 0 chooses either), chosen at the first allocation from the environment and kept for the
+// process (a block is always freed by the heap that made it; a boot in mode 0 switched live to 4 keeps the CRT heap).
+// Mode 4's eight threads allocate and free on the CRT heap's locks, and after the shader plan sweep frees its ~3.4K
+// plans (a million small blocks) the CRT heap stays slow: the stone arch, mode 4, 12 x 20 s: CRT heap 36.1 fps after the
+// sweep, 54.5 without it, mimalloc 58.1 through it (the Segment Heap 57.7). Plain pages, mimalloc's default options.
+static std::atomic<int> g_kyty_mimalloc {-1}; // (-1: not chosen yet; then 0 / 1)
+static bool KytyMimalloc() noexcept {
+	if (const int chosen = g_kyty_mimalloc.load(std::memory_order_relaxed); chosen >= 0) return chosen != 0;
+	const bool use = [] {
+		const char* value = std::getenv("KYTY_MIMALLOC");
+		if (value != nullptr && *value != '\0') return value[0] != '0';
+		const char* mode = std::getenv("KYTY_SPECULATE");
+		// (Not when mode 4 stands down for this PC's memory: speculation-ram-gate.h.)
+		return mode != nullptr && mode[0] == '4' && mode[1] == '\0' && !SpeculationRamGate::StandsDown();
+	}();
+	g_kyty_mimalloc.store(use ? 1 : 0, std::memory_order_relaxed);
+	return use;
+}
+static void* KytyAlloc(std::size_t size) noexcept {
+	return KytyMimalloc() ? mi_malloc(size) : std::malloc(size == 0 ? 1 : size);
+}
+static void* KytyAllocAligned(std::size_t size, std::align_val_t align) noexcept {
+	return KytyMimalloc() ? mi_malloc_aligned(size, static_cast<std::size_t>(align))
+	                      : _aligned_malloc(size == 0 ? 1 : size, static_cast<std::size_t>(align));
+}
+static void KytyFree(void* p) noexcept {
+	if (KytyMimalloc()) mi_free(p); else std::free(p);
+}
+static void KytyFreeAligned(void* p) noexcept {
+	if (KytyMimalloc()) mi_free(p); else _aligned_free(p);
+}
+// (Built without exceptions: an allocation that fails ends the process, as an uncaught std::bad_alloc would.)
+static void* KytyNew(std::size_t size) {
+	if (void* p = KytyAlloc(size)) return p;
+	std::abort();
+}
+static void* KytyNewAligned(std::size_t size, std::align_val_t align) {
+	if (void* p = KytyAllocAligned(size, align)) return p;
+	std::abort();
+}
+
+void* operator new(std::size_t size) { return KytyNew(size); }
+void* operator new[](std::size_t size) { return KytyNew(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept { return KytyAlloc(size); }
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept { return KytyAlloc(size); }
+void* operator new(std::size_t size, std::align_val_t align) { return KytyNewAligned(size, align); }
+void* operator new[](std::size_t size, std::align_val_t align) { return KytyNewAligned(size, align); }
+void* operator new(std::size_t size, std::align_val_t align, const std::nothrow_t&) noexcept {
+	return KytyAllocAligned(size, align);
+}
+void* operator new[](std::size_t size, std::align_val_t align, const std::nothrow_t&) noexcept {
+	return KytyAllocAligned(size, align);
+}
+void operator delete(void* p) noexcept { KytyFree(p); }
+void operator delete[](void* p) noexcept { KytyFree(p); }
+void operator delete(void* p, std::size_t) noexcept { KytyFree(p); }
+void operator delete[](void* p, std::size_t) noexcept { KytyFree(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { KytyFree(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { KytyFree(p); }
+void operator delete(void* p, std::align_val_t) noexcept { KytyFreeAligned(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { KytyFreeAligned(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { KytyFreeAligned(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { KytyFreeAligned(p); }
+void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept { KytyFreeAligned(p); }
+void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept { KytyFreeAligned(p); }
+#endif
 
 using namespace Common;
 using namespace Emulator;
@@ -378,6 +453,15 @@ int main(int argc, char* argv[]) {
 	if (const char* sizes = std::getenv("KYTY_ALLOC_TRACE"); sizes != nullptr && *sizes != '\0')
 		std::printf("Allocation trace from start-up (%s): %s\n", sizes,
 		            LocalPlatform::StartAllocTrace(sizes) ? "on" : "unavailable");
+#if defined(KYTY_MIMALLOC)
+	// The heap this process's operator new/delete took (KytyMimalloc: fixed at the first allocation), so a log says
+	// which one ran.
+	if (KytyMimalloc())
+		std::printf("Heap: mimalloc %d.%d.%d (vendored)\n", MI_MALLOC_VERSION / 10000, MI_MALLOC_VERSION / 100 % 100,
+		            MI_MALLOC_VERSION % 100);
+	else
+		std::printf("Heap: CRT\n");
+#endif
 
 	RunOptions options;
 	bool       show_help = false;

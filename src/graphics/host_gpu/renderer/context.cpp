@@ -20,6 +20,12 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <atomic>
+
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
@@ -30,6 +36,8 @@ bool CommandBuffer::IsInvalid() const {
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
+	// (An empty buffer: none. Read by the worker packets' splice only: KYTY_SPECULATE=4.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) ++m_handle_requests;
 	EXIT_IF(IsInvalid());
 	FlushCopyRun();
 	if (m_compute_access_pending) {
@@ -40,6 +48,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 }
 
 vk::CommandBuffer CommandBuffer::ChainHandle() const {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) ++m_handle_requests; // (as Handle)
 	EXIT_IF(IsInvalid() || m_rendering);
 	FlushCopyRun();
 	return m_buffer;
@@ -88,6 +97,7 @@ void CommandBuffer::FlushCopyRun() const {
 
 vk::CommandBuffer CommandBuffer::CopyRunHandle(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
                                                uint64_t destination_offset, uint64_t size) const {
+	++m_handle_requests; // (an empty buffer: none)
 	EXIT_IF(IsInvalid() || m_rendering);
 	const auto meets = [](const CopyRunRange& range, VkBuffer buffer, uint64_t begin, uint64_t end) {
 		return range.buffer == buffer && begin < range.end && range.begin < end;
@@ -120,6 +130,7 @@ void CommandBuffer::ContinueComputeChain() const {
 }
 
 vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
+	++m_handle_requests; // (an empty buffer: none)
 	EXIT_IF(IsInvalid());
 	// The caller records a full AllCommands memory dependency immediately (after the run's owed copies).
 	m_compute_access_pending = false;
@@ -147,12 +158,23 @@ static void ReplayBegin(std::span<const LocalVulkanRecording::Segment> segments,
 }
 #endif
 
-void CommandBuffer::Begin() {
+void CommandBuffer::Begin(bool placeholder) {
 	EXIT_IF(m_rendering || IsInvalid());
 	InvalidateGraphicsState();
 	m_barrier_work = UINT64_MAX;
+	m_handle_requests = 0;
 	m_copy_run.clear();
 	m_run_tail.clear();
+	if (placeholder) {
+		// Every speculation's segments name the same placeholder handle, and the emission caches that reuse what a
+		// command buffer has bound key on (handle, GraphicsGeneration): each segment takes a generation no other
+		// CommandBuffer object has had or will reach (2^20 InvalidateGraphicsState calls apart), so no segment
+		// takes another's bound state for its own (a real buffer's handle told them apart).
+		static std::atomic<uint64_t> g_segment_generation {uint64_t {1} << 62u};
+		m_graphics_generation = g_segment_generation.fetch_add(uint64_t {1} << 20u, std::memory_order_relaxed);
+		m_timestamp_slot      = UINT32_MAX;
+		return;
+	}
 	// Not Handle(): nothing may be recorded before the buffer begins.
 	const vk::CommandBuffer buffer = m_buffer;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING

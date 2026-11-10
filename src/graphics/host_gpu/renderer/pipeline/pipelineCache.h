@@ -268,6 +268,10 @@ public:
 	// The last GetGraphicsPrograms or GetComputeProgram in table mode found a program a worker still translates
 	// (its empty program is no refusal: asked again, it is there).
 	[[nodiscard]] bool TablePending() const;
+	// Two table programs of one source (KYTY_TABLE_LEARN_PORTABLE): the buffers whose specializations differ only in
+	// the V#'s format / swizzle (bits by buffer); UINT32_MAX when anything else differs or either is not a table
+	// permutation here.
+	[[nodiscard]] uint32_t TableFormatOnlyBuffers(const void* want, const void* got) const;
 	// When TablePending: the completion of that translation (set once it is done).
 	[[nodiscard]] std::shared_ptr<const std::atomic<bool>> TableWaiting() const;
 	// When TryCreateGraphicsPipeline or TryCreateComputePipeline returned null: the completion of that compile.
@@ -510,6 +514,8 @@ private:
 	std::array<int64_t, 32768> m_flip_times {};
 	bool                      m_evict_pressure = false;
 	bool                      m_idle_evict_off = false;
+	// (EvictIdlePipelines) A check came due and a speculation was live: tried again at every flip until none is.
+	bool                      m_evict_due = false;
 	// (EvictIdlePipelines) The world the game is in: its SceneTags generation, the flip and time it began (and the flip
 	// the world before it began), and whether the pipelines of the worlds before those two went.
 	uint64_t                              m_scene_generation = 0;

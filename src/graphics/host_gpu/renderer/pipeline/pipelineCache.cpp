@@ -70,6 +70,10 @@
 extern "C" {
 // 1: find graphics pipelines through a block-hashed index of the full key.
 volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode {1};
+// (speculation.cpp, KYTY_SPECULATE) Speculative translations going on and results unfinished, and EvictIdlePipelines
+// destroying handles (a translation does not begin meanwhile).
+extern volatile std::atomic_uint32_t kyty_local_speculations_live;
+extern volatile std::atomic_uint32_t kyty_local_pipelines_evicting;
 }
 
 namespace Libs::Graphics {
@@ -3004,10 +3008,11 @@ vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline) {
 // least 5) leave it: their handles destroyed (BindPipelineHandle makes one again from the store, ~1-2 ms). Their shader
 // code is video memory: on an 8 GB GPU, a 5-minute 1-1 tour took the driver's share 0.6 -> 1.0 GB while the video memory
 // in use went past the budget (7.7 GB of 7.25); evicting every pipeline idle for 5 s there (a test: 9,946 evicted, 6,188
-// made again at 1.1 ms each, fps unchanged) kept it at 0.8 GB. Not those an optimized build will replace. The time
-// since a pipeline's last binding is what keeps its handle out of commands still to run: GPU work is never minutes
-// behind. Only pipelines in this cache's maps: a worker's result enters them on this thread, its remake set before
-// (PipelineEvictSettings, KeepsRemake).
+// made again at 1.1 ms each, fps unchanged) kept it at 0.8 GB. Not those an optimized build will replace, and none while
+// a speculative translation (KYTY_SPECULATE) is going on or has a result unfinished: its worker binds pipelines, its
+// commands hold them until the result is finished. The time since a pipeline's last binding is what keeps its
+// handle out of commands still to run: GPU work is never minutes behind. Only pipelines in this cache's maps: a worker's
+// result enters them on this thread, its remake set before (PipelineEvictSettings, KeepsRemake).
 void PipelineCache::EvictIdlePipelines() {
 	const auto& settings = PipelineEvictSettings();
 	constexpr uint32_t CheckFlips   = 60;
@@ -3035,7 +3040,11 @@ void PipelineCache::EvictIdlePipelines() {
 		m_scene_since      = now;
 		m_scene_swept      = false;
 	}
-	if (!settings.on || flip % CheckFlips != 0) return;
+	// (Under KYTY_SPECULATE a translation or an unfinished result is live most of the time: a check that finds one is
+	// tried again at the next flip, until one finds none.)
+	if (flip % CheckFlips == 0) m_evict_due = true;
+	if (!settings.on || !m_evict_due || kyty_local_speculations_live.load(std::memory_order_relaxed) != 0) return;
+	m_evict_due = false;
 	const bool scene_left = SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	uint64_t video = 0, budget = 0;
 	const bool known = m_graphics.QueryLocalVideoMemory(&video, &budget);
@@ -3092,8 +3101,17 @@ void PipelineCache::EvictIdlePipelines() {
 		evicted++;
 		left += idle ? 0 : 1;
 	};
+	// (No translation begins while the flag is up: Translate counts itself, then waits for it; this sets it, then
+	// sees the count. One counted since the check above puts the check off to the next flip.)
+	kyty_local_pipelines_evicting.store(1, std::memory_order_seq_cst);
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) {
+		kyty_local_pipelines_evicting.store(0, std::memory_order_seq_cst);
+		m_evict_due = true;
+		return;
+	}
 	for (auto& [key, pipeline]: m_graphics_pipelines) evict(*pipeline);
 	for (auto& [id, pipeline]: m_compute_pipelines) evict(*pipeline);
+	kyty_local_pipelines_evicting.store(0, std::memory_order_seq_cst);
 	if (scene_left && evicted < MaxEvictions) m_scene_swept = true;
 	g_pipeline_evictions.scene.fetch_add(left, std::memory_order_relaxed);
 	if (scene_left && m_scene_swept) {
@@ -4447,6 +4465,34 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 bool PipelineCache::TakeMaterializationFailure() {
 	return std::exchange(g_materialization_failed, false);
+}
+
+uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got) const {
+	if (want == nullptr || got == nullptr) return UINT32_MAX;
+	const ProgramCache::ProgramKey*  kw = nullptr;
+	const ProgramCache::ProgramKey*  kg = nullptr;
+	const ProgramCache::Permutation* mw = nullptr;
+	const ProgramCache::Permutation* mg = nullptr;
+	for (const auto& [key, entry]: m_program_cache->programs)
+		for (const auto& p: entry.permutations) {
+			if (&p.program == want) mw = &p, kw = &key;
+			if (&p.program == got) mg = &p, kg = &key;
+		}
+	if (mw == nullptr || mg == nullptr || kw != kg || !mw->table_mode || !mg->table_mode ||
+	    mw->program.bindings.push_data_start_dword != mg->program.bindings.push_data_start_dword)
+		return UINT32_MAX;
+	const auto& a = mw->specialization;
+	const auto& b = mg->specialization;
+	if (a.images != b.images || a.buffers.size() != b.buffers.size() || a.buffers.size() > 32) return UINT32_MAX;
+	uint32_t mask = 0;
+	for (size_t i = 0; i < a.buffers.size(); ++i) {
+		const auto& x = a.buffers[i];
+		const auto& y = b.buffers[i];
+		if (x == y) continue;
+		if (x.packed_stride != y.packed_stride || x.byte_base_offset != y.byte_base_offset) return UINT32_MAX;
+		mask |= 1u << i;
+	}
+	return mask;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,

@@ -175,6 +175,13 @@ inline void NoteSubmit(uint64_t timeline, uint64_t tick, const VkCommandBuffer* 
 	}
 }
 
+// A buffer reset without a submission.
+inline void NoteDiscard(VkCommandBuffer command) {
+	if (!BreadcrumbsOn()) return;
+	std::lock_guard lock(g_breadcrumbs.mutex);
+	if (const auto found = g_breadcrumbs.open.find(command); found != g_breadcrumbs.open.end()) found->second.clear();
+}
+
 inline void NoteCreated(uint64_t device, uint64_t size, uint64_t cpu) {
 	if (device == 0 || g_registry.device.load(std::memory_order_relaxed) == VK_NULL_HANDLE) return;
 	std::lock_guard lock(g_registry.mutex);
@@ -360,8 +367,9 @@ inline std::array<DispatchNote, 4096> g_dispatches;
 inline std::atomic<size_t>            g_dispatch_next {0};
 inline void NoteDispatch(uint64_t tick, uint64_t hash, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
 	if (!BreadcrumbsOn()) return;
-	// (The render thread's: no locked add. The add and the entry's store were ~0.6% of the render thread at Latria,
-	// ~1250 dispatches a frame.)
+	// (The render thread's: no locked add. A speculation's thread may note one too, which at worst overwrites an entry
+	// of this diagnostic. The add and the entry's store were ~0.6% of the render thread at Latria, ~1250 dispatches a
+	// frame.)
 	const auto at = g_dispatch_next.load(std::memory_order_relaxed);
 	g_dispatch_next.store(at + 1, std::memory_order_relaxed);
 	g_dispatches[at % g_dispatches.size()] = {.tick = tick, .hash = hash, .indirect = indirect, .x = x, .y = y, .z = z};

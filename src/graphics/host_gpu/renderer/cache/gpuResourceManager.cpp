@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "kernel/memory.h"
 #include "loader/demonsSoulsPageFree.h"
+#include "speculation-state.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
 
@@ -142,6 +143,17 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	} else {
 		LiveCounters::Add(LiveCounters::ReadFault);
 		if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::RenderReadFaults);
+		// A speculative translation's thread read GPU-written memory: the readback is the normal path's (the
+		// scheduler's own command buffers and ticks), as the translation in order would make it there.
+		struct NormalPath {
+			Spec::State*                state    = std::exchange(Spec::t_state, nullptr);
+			CommandScheduler::Recorder* recorder = CommandScheduler::ThreadRecorder();
+			NormalPath() { CommandScheduler::SetThreadRecorder(nullptr); }
+			~NormalPath() {
+				Spec::t_state = state;
+				CommandScheduler::SetThreadRecorder(recorder);
+			}
+		} normal_path;
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -409,6 +421,13 @@ void GpuResourceManager::RefreshBdaRanges() {
 bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
 	if (ranges.empty() || ranges.size() > 128 ||
 	    std::ranges::any_of(ranges, [](const auto& range) { return !range.Valid(); })) return false;
+	if (auto* spec = Spec::Current()) {
+		// Prepared when it is committed (and its guest memory writes made after its work).
+		if (std::ranges::any_of(ranges, [&](const auto& range) { return spec->open_journal_set.Intersects(range.address, range.size); }))
+			Spec::Refuse("memory the processor writes");
+		spec->bda.insert(spec->bda.end(), ranges.begin(), ranges.end());
+		return true;
+	}
 	// (Before the lock: making buffers asks for it.)
 	m_buffer_cache.EnsureBdaReadable(ranges);
 	std::shared_lock lock(m_mapped_ranges_mutex);
@@ -465,6 +484,12 @@ void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 }
 
 void GpuResourceManager::PrepareBda() {
+	if (auto* spec = Spec::Current()) {
+		// Prepared when it is committed (and its guest memory writes made after its work).
+		if (spec->writes.size() > spec->Sealed().writes) Spec::Refuse("memory the processor writes");
+		spec->bda_all = true;
+		return;
+	}
 	// Unknown shader addresses cannot prove disjointness from an in-flight readback.
 	LiveCounters::Add(LiveCounters::BdaFullSyncs);
 	m_buffer_cache.DrainGuestReadback();

@@ -20,6 +20,7 @@
 #include "native-resource-state.h"
 #include "texture-offload.h"
 #include "write-guard.h"
+#include "speculation-state.h"
 
 #include <algorithm>
 #include <array>
@@ -65,6 +66,10 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
 
 namespace Libs::LibKernel::Memory {
 
@@ -1328,11 +1333,22 @@ bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBackingToHost(vaddr, data, size);
 }
 
+// A speculative translation's CPU read of guest memory no GPU work wrote: not memory its own work or its guest
+// memory writes write (both wait for its commit), and noted (speculation-state.h: a hole that writes it stops the
+// commit before the reading segment).
+static bool SpeculationReadsClean(uint64_t vaddr, uint64_t size) {
+	auto* spec = Graphics::Spec::Current();
+	if (spec == nullptr) return true;
+	if (spec->WrittenIntersects(vaddr, size) || spec->JournalIntersects(vaddr, size)) return false;
+	spec->NoteCleanRead(vaddr, size);
+	return true;
+}
+
 bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread() ||
+		if (!Graphics::GuestGpu::IsTranslatingThread() ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) || !SpeculationReadsClean(vaddr, size)) {
 			return false;
 		}
 	}
@@ -1350,7 +1366,7 @@ bool IsUniqueGuestBackingRangeAcrossMappings(uint64_t vaddr, uint64_t size) {
 // `data` is host memory (every caller reads into a local or a scratch vector): the lock-free
 // host read applies; the guest-destination variant took both backing locks for each word.
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size) {
-	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsTranslatingThread() &&
 	       IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size) &&
 	       TryReadGpuCleanBackingToHost(vaddr, data, size);
 }
@@ -1361,9 +1377,13 @@ bool ReadFaults(uint64_t vaddr, uint64_t size) {
 
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean) {
 	if (!data || size < 8 || size > (clean ? 4096u : 64u) || size % 4 != 0 || !g_gpu_resources ||
-	    !Graphics::GuestGpu::IsGpuThread() || !IsGpuAddressRange(vaddr, size))
+	    !Graphics::GuestGpu::IsTranslatingThread() || !IsGpuAddressRange(vaddr, size))
 		return false;
-	if (!clean && !g_gpu_resources->HasReadWatchers(vaddr, size)) {
+	if (!clean && !g_gpu_resources->HasReadWatchers(vaddr, size) && SpeculationReadsClean(vaddr, size)) {
+		// A speculation's thread: the GPU thread may read-protect the page after the look above (work it commits
+		// writes it), and a fault there waits for the GPU thread, which may wait for this thread (a mode 4 hang at the
+		// stone arch, 11-01): a guarded read, none on a fault (the caller's word reads refuse the speculation).
+		if (!Graphics::GuestGpu::IsGpuThread()) return Common::GuardedCopy(data, reinterpret_cast<const void*>(vaddr), size) == 0;
 		// 8..64 bytes of whole words: fixed-size moves inline, a variable-size memcpy is a CRT call
 		// (thousands of SRT span reads per frame).
 		auto*       out = static_cast<uint8_t*>(data);
@@ -1378,10 +1398,24 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 
 thread_local uint64_t g_srt_shader_hash = 0;
 
+// A speculative translation (speculation-state.h) reads guest memory as it is: words the GPU wrote need the GPU first
+// (the translation that follows waits for it). Out of line, so SyncGpuCleanBacking keeps main's body.
+[[gnu::noinline]] static bool SyncGpuCleanBackingSpec(uint64_t vaddr, uint64_t size) {
+	if (GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) ||
+	    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+	    (!Graphics::GuestGpu::IsGpuThread() && ReadFaults(vaddr, size)) || !SpeculationReadsClean(vaddr, size))
+		Graphics::Spec::Refuse("GPU-written guest memory");
+	return true;
+}
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;
 	}
+	// (A plain global first, not the thread-local state on every call: KYTY_SPECULATE unset, main's path. The mode is set
+	// before a speculation starts and cleared only when its results are discarded.)
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Graphics::Spec::Current() != nullptr)
+		[[unlikely]] return SyncGpuCleanBackingSpec(vaddr, size);
 	if (!Graphics::GuestGpu::IsGpuThread() ||
 	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 		return false;

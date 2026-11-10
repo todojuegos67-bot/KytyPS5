@@ -66,6 +66,26 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(opus)
 
+# KYTY_MIMALLOC: the emulator's operator new/delete (src/main.cpp) from mimalloc instead of the CRT heap.
+if(KYTY_MIMALLOC)
+	# Vendored: 3rdparty/mimalloc is mimalloc v2.5.2 (2406cc5f), the files src/static.c includes (Windows only),
+	# include/ and LICENSE, unchanged. Built as its own CMake build of the static library would build it here: one
+	# translation unit (static.c) compiled as C++ (MI_USE_CXX, as with MSVC), MI_STATIC_LIB, the release defines.
+	add_library(mimalloc-static STATIC mimalloc/src/static.c)
+	set_source_files_properties(mimalloc/src/static.c PROPERTIES LANGUAGE CXX)
+	set_target_properties(mimalloc-static PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+	target_include_directories(mimalloc-static PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/mimalloc/include")
+	target_compile_definitions(mimalloc-static PRIVATE MI_BUILD_RELEASE MI_CMAKE_BUILD_TYPE=release MI_STATIC_LIB NOMINMAX)
+	target_link_libraries(mimalloc-static PUBLIC psapi shell32 user32 advapi32 bcrypt)
+	if(MSVC)
+		target_compile_options(mimalloc-static PRIVATE /W0 /Zc:__cplusplus) # (/Zc:__cplusplus: as mimalloc's own build)
+	else()
+		target_compile_options(mimalloc-static PRIVATE -w)
+	endif()
+	# SPIRV-Tools would add mimalloc a second time.
+	set(SPIRV_TOOLS_USE_MIMALLOC OFF CACHE BOOL "" FORCE)
+endif()
+
 add_library(zarchive STATIC
 	"${zarchive_source_SOURCE_DIR}/src/zarchivereader.cpp"
 	"${zarchive_source_SOURCE_DIR}/src/zarchivewriter.cpp"

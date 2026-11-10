@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "speculation-state.h"
 
+#include <span>
 #include <array>
 #include <atomic>
 #include <map>
@@ -69,10 +71,13 @@ public:
 	// Appends the (epoch, address) entries logged after `epoch`; false when the
 	// log no longer reaches back that far.
 	[[nodiscard]] bool NewImageStartsSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& out);
+	// The image (of `serial`) still registered, and no image registered or unregistered over its pages since `epoch`
+	// (a speculation's work used it: speculation.cpp).
+	[[nodiscard]] bool StillResolved(const Image& image, uint64_t serial, uint64_t epoch) const;
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
-	// Moves whenever an image's slot is erased (EraseSlot, the only place): an id allocated when it was E is still
+	// Moves whenever an image's slot is erased (EraseRetired, the only place): an id allocated when it was E is still
 	// allocated while it is E.
 	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
@@ -122,6 +127,10 @@ public:
 	// The image, or null when `id` names no live image (an erased one a record kept): not touched.
 	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
 	void MarkGpuWritten(ImageId id);
+	// A speculative translation's use of the image, when it is committed (`serial`: the image it used).
+	void TouchSpeculated(Image& image, uint64_t serial);
+	// A committed segment's images (each with its serial at the touch) under one lock, repeats in a row once.
+	void TouchSpeculated(std::span<const std::pair<Image*, uint64_t>> images);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -134,6 +143,9 @@ public:
 	// An image over the range holds data the GPU wrote to it (a download of the range must come
 	// from the image, not from the buffer).
 	[[nodiscard]] bool HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
+	// A speculation's (Spec::Current): whether one of those images is one its own work uses (its commit cannot then
+	// synchronize a texel buffer over it before that work: KYTY_SPECULATE_TEXEL_SYNC). True without a speculation.
+	[[nodiscard]] bool SpeculationUsesGpuWrittenImage(uint64_t address, uint64_t size);
 	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
 	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
@@ -154,11 +166,14 @@ public:
 	// A use of the metadata at `address` by the image in serial slot `slot` (a table set's texture, a draw state's
 	// target, whose view names it): a change there moves the slot's image serial too (MoveMeta; ImageSerials).
 	void               NoteMetaUse(uint64_t address, uint32_t slot);
+	// (`dcc_ok` false: the caller knows the surface is not DCC, e.g. a depth target's HTile; a speculation's DCC
+	// predictions, KYTY_SPEC_PREDICT_DCC, do not answer for it.)
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
-	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
+	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr, bool dcc_ok = true);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	// Record deferred DCC state while the original guest dispatch writes the metadata.
-	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
+	// True when the fill leaves the surface's DCC cleared (a recognized clear code over a DCC entry).
+	bool               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
@@ -263,8 +278,9 @@ private:
 	// can read it.
 	[[nodiscard]] bool        DetachImage(ImageId id);
 	void                      RetireImage(ImageId id);
-	// A deleted image destroyed, its slot erased (RetireImage's, once nothing uses it).
-	void                      EraseSlot(ImageId id);
+	// Deleted images a speculation's packet may still read (Spec::PacketsPassed), destroyed once it passed.
+	std::vector<std::pair<ImageId, Spec::PacketMarks>> m_retired;
+	void                                               EraseRetired();
 	// An image a depth overlap replaced, out of every index but kept (one an address, the collector's run it was parked
 	// at): ResolveDepthOverlap takes it back when the memory is asked for in its description again, instead of making
 	// another image (the game takes one surface as a depth target and as a color target in turn every frame).
@@ -415,11 +431,23 @@ private:
 	};
 	std::unordered_map<uint64_t, PartialPlan> m_partial_plans;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// KYTY_SPEC_PREDICT_DCC: the surfaces a DCC fill has cleared (kept apart from m_surface_metas, whose entries image
+	// registrations rebuild), and those whose pending clear FindTexture left pending when the normal path sampled them.
+	std::unordered_set<uint64_t> m_dcc_filled, m_dcc_sticky;
 	// KYTY_TABLE_SERIALS: the registered images by their metadata address, as their serial slots (MoveMeta).
 	std::multimap<uint64_t, uint32_t> m_meta_slots;
 	// (Each slot's addresses in m_meta_slots: ForgetMetaSlot erases them alone, not a pass over every entry.)
 	std::unordered_map<uint32_t, std::vector<uint64_t>> m_meta_by_slot;
 	std::mutex                        m_meta_slots_lock;
+
+public:
+	// KYTY_SPEC_PREDICT_DCC: the normal path sampled a DCC surface with a pending clear; `sticks`: FindTexture left it
+	// pending. DccClearSticks: with the switch on, whether it was seen to (a speculation does not assume that a hole of
+	// such a use consumes the clear).
+	void               NoteDccClear(uint64_t address, bool sticks);
+	[[nodiscard]] bool DccClearSticks(uint64_t address);
+
+private:
 	std::atomic<uint64_t>                             m_meta_epoch {1};
 	// The m_surface_metas keys as bits of a 1024-bit filter: a clear bit proves an address holds
 	// no metadata without m_lock (IsMeta and ClearMeta run for the buffers of every dispatch).

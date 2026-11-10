@@ -667,6 +667,18 @@ void StreamBuffer::Commit() {
 	watch.tick        = tick;
 }
 
+void StreamBuffer::ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept {
+	// The watches in use only (what waits reads: the current ones to the cursor, the previous to the invalidation
+	// mark). Both vectors hold at least WATCHES_INITIAL_RESERVE: a whole scan of the two, for each of a speculation
+	// thread's rings at each translation, was ~10% of that thread.
+	const auto resolve = [&](std::vector<Watch>& watches, size_t count) {
+		for (size_t i = 0, n = std::min(count, watches.size()); i < n; ++i)
+			if (watches[i].tick == pending) watches[i].tick = tick;
+	};
+	resolve(m_current_watches, m_current_watch_cursor);
+	if (m_invalidation_mark) resolve(m_previous_watches, *m_invalidation_mark);
+}
+
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {
 	EXIT_IF(source == nullptr);
 	const auto [data, offset] = Map(size, alignment);

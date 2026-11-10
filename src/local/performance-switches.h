@@ -5,7 +5,9 @@
 
 #include "native-buffer-residency.h"
 #include "local-platform.h"
+#include "mode-toggle.h"
 #include "native-resource-state.h"
+#include "speculation-ram-gate.h"
 #include "spin-gate.h"
 
 #include <array>
@@ -56,9 +58,13 @@ extern volatile std::atomic_uint32_t kyty_local_table_indirect_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
 extern volatile std::atomic_uint32_t kyty_local_table_set_proofs;
 extern volatile std::atomic_uint32_t kyty_local_table_mru;
+extern volatile std::atomic_uint32_t kyty_local_table_target_read;
 extern volatile std::atomic<uint32_t> kyty_local_table_gather_memo; // KYTY_TABLE_GATHER_MEMO (local/table-xpr.inc TableGather)
 #endif
 extern volatile std::atomic_uint32_t kyty_local_scout_mode;
+// Speculative translation of graphics command buffers (src/graphics/guest_gpu/speculation.h).
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
+extern volatile std::atomic_uint32_t kyty_local_speculate_threads;
 }
 
 inline void InitializePerformanceSwitches() {
@@ -128,8 +134,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
 	    // 1: a guest write of the command processor lands at once, hidden from the game until the older upload jobs are
-	    // done (local/write-guard.h); 0, the default: it waits for them (per-page protection churn on the mapped views is
-	    // behind MEMORY_MANAGEMENT blue screens on small-memory Windows PCs, #5, #50).
+	    // done (local/write-guard.h); 0: it waits for them (per-page protection churn on the mapped views is behind
+	    // MEMORY_MANAGEMENT blue screens on small-memory Windows PCs, #5, #50). Unset: on under KYTY_SPECULATE=4 only.
 	    Switch {"KYTY_WRITE_GUARD", &kyty_local_write_guard_mode},
 	    // Submissions the GPU has still to run for a flush nothing waits on to be deferred (0: never).
 	    Switch {"KYTY_FLUSH_DEFER", &kyty_local_flush_defer, 0, 64},
@@ -175,7 +181,12 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_SET_PROOFS", &kyty_local_table_set_proofs, 0, 2},
 	    // Table lookups that ask the last answer first (bits: pair cache size, variant, image set).
 	    Switch {"KYTY_TABLE_MRU", &kyty_local_table_mru, 0, 7},
+	    // Table image sets that hold a target the shaders sample (on by default under KYTY_SPECULATE=4, set below;
+	    // local/native-xpr.inc).
+	    Switch {"KYTY_TABLE_TARGET_READ", &kyty_local_table_target_read},
 #endif
+	    Switch {"KYTY_SPECULATE", &kyty_local_speculate_mode, 0, 4},
+	    Switch {"KYTY_SPECULATE_THREADS", &kyty_local_speculate_threads, 1, 12},
 	};
 	std::string enabled;
 	for (const auto& setting: switches) {
@@ -190,9 +201,50 @@ inline void InitializePerformanceSwitches() {
 			             setting.minimum, setting.maximum);
 			std::abort();
 		}
+		// (KYTY_SPECULATE: 0 or 4, the modes measured and kept.)
+		if (setting.value == &kyty_local_speculate_mode && value != 0 && value != 4) {
+			std::fprintf(stderr, "%s must be 0 or 4\n", setting.environment);
+			std::abort();
+		}
 		setting.value->store(static_cast<uint32_t>(value), std::memory_order_relaxed);
 		enabled += std::string(enabled.empty() ? "" : " ") + setting.environment + "=" + text;
 	}
+	// KYTY_SPECULATE=4 on a PC with less memory than KYTY_SPECULATE_RAM_GB (default 28 GiB; 0: no gate): mode 4 stands
+	// down and the run stays in mode 0 (speculation-ram-gate.h; main.cpp's heap choice agrees).
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && SpeculationRamGate::StandsDown()) {
+		kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+		std::printf("Speculation: KYTY_SPECULATE=4 stands down: %.1f GiB of physical memory, under the %u GiB it needs "
+		            "(KYTY_SPECULATE_RAM_GB; 0 lifts the gate). This run stays in mode 0.\n",
+		            static_cast<double>(LocalPlatform::PhysicalMemory()) / static_cast<double>(1ull << 30u),
+		            SpeculationRamGate::ThresholdGib());
+		enabled += std::string(enabled.empty() ? "" : " ") + "(KYTY_SPECULATE=4 stood down: memory)";
+	}
+	// KYTY_SPECULATE=4 on a CPU whose performance cores can't hold its threads: the GPU, recording and upload threads, the
+	// workers (KYTY_SPECULATE_THREADS) and the async queue's 2. With 3 performance cores (6 logical CPUs) the default
+	// placement put 4 workers on CPUs the render threads used, and mode 4 lost 6 % at Latria; on the efficiency cores it
+	// lost half (Chenxiao, 9 Nov). Mode 4 stands down and the run stays in mode 0. KYTY_SPECULATE_CPUS (the workers' CPUs
+	// named) lifts the check; the efficiency cores are never taken by default. Not known (Linux): no check.
+	if (const char* named = std::getenv("KYTY_SPECULATE_CPUS");
+	    kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && (named == nullptr || *named == '\0')) {
+		const uint32_t cpus    = LocalPlatform::PerformanceLogicalCpus();
+		const uint32_t workers = kyty_local_speculate_threads.load(std::memory_order_relaxed);
+		const uint32_t need    = 3u + workers + 2u;
+		if (cpus != 0 && cpus < need) {
+			kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+			std::printf("Speculation: KYTY_SPECULATE=4 stands down: %u logical CPUs on the performance cores, under the %u its "
+			            "threads need (3 render threads, %u workers, 2 async; KYTY_SPECULATE_CPUS lifts the check). This run "
+			            "stays in mode 0.\n",
+			            cpus, need, workers);
+			enabled += std::string(enabled.empty() ? "" : " ") + "(KYTY_SPECULATE=4 stood down: CPU)";
+		}
+	}
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	// KYTY_TABLE_TARGET_READ, unset or empty: on under KYTY_SPECULATE=4 (every mode-4 measure ran with it; mode 0 measured
+	// neutral, 1 Nov).
+	if (const char* text = std::getenv("KYTY_TABLE_TARGET_READ");
+	    (text == nullptr || *text == '\0') && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4)
+		kyty_local_table_target_read.store(ModeToggle::TableTargetRead4, std::memory_order_relaxed);
+#endif
 	// External tools find the render thread by this name (for example to pin it).
 	LocalPlatform::SetThreadName("Kyty.Gpu");
 	// KYTY_RENDER_CPUS (e.g. "1,2,3,6,7"): the CPUs this thread may run on; other threads are

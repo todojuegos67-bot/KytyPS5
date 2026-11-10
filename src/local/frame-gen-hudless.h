@@ -36,7 +36,7 @@ extern bool g_hudless;
 // OnDevice, once DLSS-G is ready: the switches, read once.
 void InitializeHudless();
 
-// Renderer thread (Kyty.Gpu), normal draw path, while HudlessCapturing(). FlipSlot:
+// Renderer thread (Kyty.Gpu), normal draw path, while HudlessCapturing(), not in a speculative translation. FlipSlot:
 // the slot of `targets` that is a recent flip image while this frame's composite is still to come (-1: none). Such a
 // draw is recorded directly and stored for neither the table nor the native XPR path. BeforeFlipDraw, with everything
 // of the draw (`state`) bound and before its render pass begins, when the frame has DLSS-G's inputs so far

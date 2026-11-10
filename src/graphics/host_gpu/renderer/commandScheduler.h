@@ -5,6 +5,9 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -64,7 +67,7 @@ public:
 	// both sides. Not into a buffer the open buffer recorded a copy into (`written_serial`, Buffer::written_serial:
 	// a buffer created now gets its old buffers' bytes by a copy, an image download writes more than the range synced).
 	// A shader's write synchronized its pages first: those are not among the pages still CPU-dirty.
-	// Null: the upload is recorded in order (pages dirtied since, switch off).
+	// Null: the upload is recorded in order (pages dirtied since, a speculation's recorder, switch off).
 	[[nodiscard]] vk::CommandBuffer UploadPrologue(uint64_t last_dirty, uint64_t written_serial);
 	// Called with the upload prologue's buffer as it closes, before its closing barrier (BufferCache: the prologue's
 	// copies gathered as one indirect copy).
@@ -74,13 +77,77 @@ public:
 	void SetEpilogueHook(std::function<void(CommandBuffer&)> hook) { m_epilogue_hook = std::move(hook); }
 	// Advances with every command buffer this scheduler begins.
 	[[nodiscard]] uint64_t CommandSerial() const noexcept { return m_command_serial; }
+	// A speculative translation's (src/graphics/guest_gpu/speculation.cpp): its recorder's pending tick (from
+	// PendingTick on), which no GPU completion reaches; what it fences gets the real tick when it is committed.
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept;
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
-	static constexpr size_t MaxSubmitEntries = 8; // command buffers in one submission
+	static constexpr uint64_t PendingTick = uint64_t {1} << 62u;
+	// Thrown on a thread with a recorder for a call that would submit or wait (the translation is dropped).
+	struct RecorderRefusal {
+		const char* what = nullptr;
+	};
+
+	// The command buffers of a speculative translation, recorded on the thread that made it current
+	// (SetThreadRecorder) and submitted later, in guest order, by the thread that owns the scheduler
+	// (SubmitRecorded). While it is current, that thread's recording calls (Current, BeginRendering, ...)
+	// use it; calls that submit or wait for the GPU must not be made.
+	struct Recorder {
+		struct Recorded {
+			size_t   index          = 0;     // in buffers
+			bool     ended          = false; // else the submission ends it (recorded through a recording stream)
+			uint32_t timestamp_slot = UINT32_MAX;
+			bool     empty          = false; // nothing recorded into it after its begin (KYTY_SPECULATE_KEEP_PASS)
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			// Worker packets (live spec_worker_packets): the segment's packets, recorded by the speculation thread's
+			// passive producer against the placeholder; spliced into this scheduler's open buffer by SubmitRecorded
+			// (index unused).
+			bool                            packets = false;
+			LocalVulkanRecording::ChunkList chunks;
+#endif
+		};
+		vk::CommandPool                pool = nullptr;
+		std::unique_ptr<CommandBuffer> command;
+		size_t                         open = SIZE_MAX; // the buffer `command` records into
+		// Each buffer and the tick of its last submission (UINT64_MAX: being recorded or recorded, not submitted).
+		std::vector<std::pair<vk::CommandBuffer, uint64_t>> buffers;
+		std::vector<Recorded>                               recorded; // in order
+		// Its thread ends its buffers (that thread, not the submitting one, owns the pool: a discarded buffer is
+		// begun again as it is, the pool resets it).
+		bool own_thread = false;
+		// What its translation fences (CurrentTick): PendingTick and up, one value per translation in flight.
+		uint64_t pending_tick = PendingTick;
+		uint64_t begin_work   = 0; // this thread's recorded work when the open buffer began (empty buffers)
+		// Worker packets: its segments are recorded as packets (set per translation, on a speculation thread with a
+		// passive producer); `open` is PacketsOpen while one is being recorded.
+		bool                    packets     = false;
+		static constexpr size_t PacketsOpen = SIZE_MAX - 1;
+	};
+	[[nodiscard]] std::unique_ptr<Recorder> CreateRecorder();
+	void                                    DestroyRecorder(std::unique_ptr<Recorder> recorder);
+	static void                             SetThreadRecorder(Recorder* recorder) noexcept;
+	[[nodiscard]] static Recorder*          ThreadRecorder() noexcept;
+	// Begins a command buffer bound to these registers / ends the open one (kept for SubmitRecorded).
+	void BeginRecording(Recorder& recorder, HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
+	void EndRecording(Recorder& recorder);
+	// The first `count` recorded buffers, in order, after this scheduler's open one (submitted first): the tick of
+	// the last (0: none submitted, KYTY_SPECULATE_KEEP_PASS's empty ones).
+	uint64_t SubmitRecorded(Recorder& recorder, size_t count);
+	// SubmitRecorded's buffers held for one submission with what follows (KYTY_SPECULATE_BATCH_SUBMITS: a speculation's
+	// segments of one commit, ~100 submissions a frame otherwise): submitted now, or with the next Submit.
+	void FlushRecorded();
+	static constexpr size_t MaxSubmitEntries = 24; // command buffers in one submission
+	// Drops what was recorded (never submitted): the buffers are free again.
+	void DiscardRecorded(Recorder& recorder);
+	// One recorded buffer dropped (DiscardRecorded's, and an empty one's: KYTY_SPECULATE_KEEP_PASS).
+	void DiscardOne(Recorder& recorder, const Recorder::Recorded& recorded);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	// SubmitRecorded's worker packets path.
+	uint64_t SpliceRecorded(Recorder& recorder, size_t count);
+#endif
 
 private:
 	class CommandPool {
@@ -114,12 +181,17 @@ private:
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
-	// Submits the buffers, in order, in one submission, the next tick signalled.
+	// Submits the buffers, in order, in one submission (each ended already when `ended`), the next tick signalled.
 	struct SubmitEntry {
 		vk::CommandBuffer buffer;
+		bool              ended          = false;
 		uint32_t          timestamp_slot = UINT32_MAX;
 	};
 	uint64_t SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit);
+	uint64_t SubmitBuffer(vk::CommandBuffer buffer, bool ended, uint32_t timestamp_slot, SubmitInfo submit) {
+		const SubmitEntry entry {buffer, ended, timestamp_slot};
+		return SubmitBuffers({&entry, 1}, submit);
+	}
 
 	// The open buffer's upload prologue (UploadPrologue), ended and put ahead of it in its submission.
 	[[nodiscard]] SubmitEntry ClosePrologue();
@@ -144,6 +216,9 @@ private:
 	uint32_t                     m_recorded_dispatches = 0;
 	uint32_t                     m_recorded_draws      = 0;
 	bool                         m_flush_deferred      = false; // DeferrableFlush left the open buffer open
+	bool                         m_spliced             = false; // worker packets spliced into the open buffer (FlushRecorded)
+	std::array<SubmitEntry, MaxSubmitEntries> m_batch {}; // (SubmitRecorded's, not submitted yet: FlushRecorded)
+	size_t                                    m_batched = 0;
 	uint32_t                     m_deferred_checks     = 0;
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t>        m_driver_tick {0};

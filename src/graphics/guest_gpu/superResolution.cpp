@@ -42,6 +42,8 @@ static void LogPacket(const SuperResolution::Packet& sr) {
 }
 
 void CommandProcessor::SuperResolution(const uint32_t* packet, uint32_t dwords) {
+	// (A state pass: no work.)
+	if (m_state_only) return;
 	SuperResolution::Packet sr {};
 	if (dwords * 4u < sizeof(sr)) return;
 	std::memcpy(&sr, packet, sizeof(sr));
