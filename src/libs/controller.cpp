@@ -237,6 +237,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 		static int64_t       cine_seen = 0;
 		static bool          cine_done = false, movie_logged = false;
 		static int64_t       cine_done_at = 0;
+		static bool          title_done   = false;
 		if (skip) {
 			const int64_t now   = SteadyNanoseconds();
 			const int64_t up    = now - start;
@@ -256,6 +257,14 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 					cine_done = true;
 					cine_done_at = now;
 					std::printf("[port] intro: X pressed in the opening cinematic (KYTY_SKIP_INTRO)\n");
+				}
+			}
+			// Then once at the title screen ("press a button"): straight to the main menu, 2 s after the cinematic's skip.
+			if (cine_done && !title_done && now - cine_done_at > 2000000000LL) {
+				data->buttons |= PAD_BUTTON_CROSS;
+				if (now - cine_done_at > 2150000000LL) {
+					title_done = true;
+					std::printf("[port] intro: X pressed at the title screen, to the main menu (KYTY_SKIP_INTRO)\n");
 				}
 			}
 			// Black on screen meanwhile: the movie in the first 2 minutes; the first cinematic from its start until 1 s
