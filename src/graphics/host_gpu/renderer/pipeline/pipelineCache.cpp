@@ -4467,8 +4467,11 @@ bool PipelineCache::TakeMaterializationFailure() {
 	return std::exchange(g_materialization_failed, false);
 }
 
-uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got) const {
+uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got) {
 	if (want == nullptr || got == nullptr) return UINT32_MAX;
+	// (Under the lock Get takes: a warmup beside the game, RunWarmup's thread, adds programs while the render thread
+	// walks them here; an insert that rehashes the map frees the buckets this walk reads.)
+	Common::LockGuard lock(m_mutex);
 	const ProgramCache::ProgramKey*  kw = nullptr;
 	const ProgramCache::ProgramKey*  kg = nullptr;
 	const ProgramCache::Permutation* mw = nullptr;
