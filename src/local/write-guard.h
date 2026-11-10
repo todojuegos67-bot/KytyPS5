@@ -80,7 +80,8 @@ inline uint64_t (*g_upload_done)() = nullptr;
 // bytes the GPU thread wrote, as its own reads do: a speculation reads the processor's writes, it does not release
 // the game.
 [[nodiscard]] inline bool InSpeculation() {
-	static auto& on = LiveSwitch::Find("write_guard_spec", [] {
+	// (The lambda's type named: atoll's long long and ModeToggle::Default's int64_t, long on Linux, are two types there.)
+	static auto& on = LiveSwitch::Find("write_guard_spec", []() -> int64_t {
 		const char* value = std::getenv("KYTY_WRITE_GUARD_SPEC");
 		if (value != nullptr) return std::atoll(value);
 		return ModeToggle::Default("write_guard_spec");
