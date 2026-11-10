@@ -1131,6 +1131,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                       image_size, out_size, rasterizer->bb_scene_depth, srgb10,
                                       &frame->fg)) {
             image_view = v;
+            out_size = bb_sr->LastOutput(); // (DLSS 5 on the native image: the render size)
             image_size = out_size;
             bb_sr_size = out_size;
             bb_upscaled = true;

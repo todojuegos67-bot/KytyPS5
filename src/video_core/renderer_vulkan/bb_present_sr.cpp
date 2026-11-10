@@ -246,7 +246,13 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     // No upscale pass when it would not change the size (except native AA, ratio 1).
     const bool sr = BB::Upscale::BackendReady() && (in != out || BB::Upscale::Ratio() <= 1.01);
     const bool want_fg = fg != nullptr && BB::FG::WantInputs();
-    if ((!sr && !want_fg) || !Init()) return {};
+    // bb-reactive: DLSS 5 on the native image (no upscaler, no TAA): the vectors are made, the
+    // image is copied to the output at the render size and DLSS 5 runs on it.
+    const auto kind = BB::Upscale::Cfg().kind;
+    const bool d5_native = !sr && (kind == BB::SR::Kind::Native || kind == BB::SR::Kind::Off) &&
+                           BB::Dlss5::Wanted();
+    if (d5_native) out = in;
+    if ((!sr && !want_fg && !d5_native) || !Init()) return {};
     if (in.width > out.width || in.height > out.height || !depth_ok) return {};
     auto depth_id = texture_cache.FindImage(scene.desc);
     if (depth_out != nullptr) *depth_out = depth_id;
@@ -342,6 +348,9 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         // camera the vectors are zero and FSR 3 uses its default near / far / fov.
         fg->valid = true;
     }
+    if (!sr && d5_native) {
+        return RunDlss5Native(cmd, depth, depth_view, in, jx, jy, cam, scene.greater);
+    }
     if (!sr) {
         return {};
     }
@@ -430,6 +439,13 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     if (desc.has_reactive && BB::Upscale::Cfg().kind == BB::SR::Kind::Fsr4) {
         BlendFsr4(cmd, in, out, jx, jy);
     }
+    if (BB::Dlss5::Wanted() && kind == BB::SR::Kind::Taa) {
+        static bool said_taa = false;
+        if (!said_taa) {
+            said_taa = true;
+            BB::Upscale::Checkpoint("DLSS 5: on after TAA");
+        }
+    }
     if (BB::Dlss5::Wanted()) {
         // DLSS 5 (BB_DLSS5 1..3, from 1.59): Neural Rendering on the upscaled output, in place.
         (void)BB::Dlss5::Apply(desc);
@@ -455,6 +471,59 @@ float EnvF(const char* name, float fallback) {
     return end != v && std::isfinite(f) ? f : fallback;
 }
 } // namespace
+
+vk::ImageView PresentSr::RunDlss5Native(vk::CommandBuffer cmd, VideoCore::Image& depth,
+                                        vk::ImageView depth_view, vk::Extent2D in, float jx,
+                                        float jy, const BB::Upscale::Camera& cam, bool greater) {
+    // The colour copy (RGBA16F linear) is the output: same size, DLSS 5 edits it in place.
+    Barrier(cmd, color, vk::ImageLayout::eTransferSrcOptimal);
+    Barrier(cmd, output, vk::ImageLayout::eTransferDstOptimal);
+    cmd.copyImage(color.image, vk::ImageLayout::eTransferSrcOptimal, output.image,
+                  vk::ImageLayout::eTransferDstOptimal,
+                  vk::ImageCopy{
+                      .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                      .extent = {in.width, in.height, 1},
+                  });
+    Barrier(cmd, color, vk::ImageLayout::eShaderReadOnlyOptimal);
+    Barrier(cmd, output, vk::ImageLayout::eGeneral);
+    BB::SR::Desc desc{};
+    desc.cmd = cmd;
+    desc.color = {color.image, color.view, color.format, in,
+                  vk::ImageLayout::eShaderReadOnlyOptimal, color.usage};
+    desc.depth = {depth.GetImage(), depth_view, depth.info.pixel_format, in,
+                  vk::ImageLayout::eDepthStencilReadOnlyOptimal, depth.usage_flags};
+    desc.motion = {motion.image, motion.view, motion.format, in,
+                   vk::ImageLayout::eShaderReadOnlyOptimal, motion.usage};
+    desc.output = {output.image, output.view, output.format, in, vk::ImageLayout::eGeneral,
+                   output.usage};
+    desc.render = in;
+    desc.upscale = in;
+    desc.jitter[0] = jx;
+    desc.jitter[1] = jy;
+    desc.reset = cam.reset || in != last_in;
+    desc.hdr = false;
+    desc.depth_inverted = greater;
+    desc.fov_y = cam.fov_y;
+    desc.z_near = cam.z_near;
+    desc.z_far = cam.z_far;
+    desc.quality = BB::SR::Quality::Native;
+    desc.camera_valid = cam.valid;
+    std::memcpy(desc.view_to_clip, cam.view_to_clip, sizeof(desc.view_to_clip));
+    std::memcpy(desc.clip_to_prev_clip, cam.clip_to_prev_clip, sizeof(desc.clip_to_prev_clip));
+    last_in = in;
+    last_out = in;
+    if (!BB::Dlss5::Apply(desc)) {
+        return {};
+    }
+    Barrier(cmd, output, vk::ImageLayout::eShaderReadOnlyOptimal);
+    static bool said = false;
+    if (!said) {
+        said = true;
+        BB::Upscale::Checkpoint(fmt::format("DLSS 5: on (native) {}x{}", in.width, in.height));
+    }
+    return output.view;
+}
 
 bool PresentSr::InitReactive() {
     if (r_tried) return r_ok;

@@ -1150,10 +1150,14 @@ bool Wanted() {
 	// bb-clean-021-fg: only after DLSS (NGX through Streamline). With FSR 4 / XeSS / native the
 	// start-up died in CreateDevice: DLSS 5 is ignored there.
 	if (Level() <= 0) return false;
-	static const bool dlss = BB::Upscale::Cfg().kind == SR::Kind::Dlss;
+	// bb-reactive: also after the emulator's TAA and on the native image (no upscaler); NGX is
+	// loaded by DLSS 5 itself (nvngx_dlssnr.dll), not through Streamline.
+	static const auto kind = BB::Upscale::Cfg().kind;
+	static const bool ok = kind == SR::Kind::Dlss || kind == SR::Kind::Taa || kind == SR::Kind::Native ||
+	                       kind == SR::Kind::Off;
 	static std::atomic<bool> said {false};
-	if (!dlss && !said.exchange(true)) BB::Upscale::Checkpoint("DLSS 5: off (needs DLSS as the upscaler)");
-	return dlss;
+	if (!ok && !said.exchange(true)) BB::Upscale::Checkpoint("DLSS 5: off (runs after DLSS, TAA or on the native image)");
+	return ok;
 }
 
 void AddDeviceExtensions(vk::PhysicalDevice physical, const std::vector<std::string>& available,
@@ -1174,7 +1178,7 @@ void AddDeviceExtensions(vk::PhysicalDevice physical, const std::vector<std::str
 	// 0.90: Kind::Native too (Reescalado off): DLSS 5 on the game's own image at the native
 	// analysis point, the same image and vectors frame generation reads (BBFgNativeAnalyze).
 	if (kind != SR::Kind::Dlss && kind != SR::Kind::Xess && kind != SR::Kind::Fsr3 && kind != SR::Kind::Fsr4 &&
-	    kind != SR::Kind::Native) {
+	    kind != SR::Kind::Native && kind != SR::Kind::Taa && kind != SR::Kind::Off) {
 		g_off_reason = "Reescalado off without the native analysis (DLSS 5 runs after DLSS, XeSS, FSR 3.1, FSR 4 or on the native image)";
 		return;
 	}

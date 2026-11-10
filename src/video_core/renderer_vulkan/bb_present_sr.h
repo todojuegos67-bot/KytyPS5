@@ -5,6 +5,7 @@
 #pragma once
 
 #include "video_core/bb/bb_fg.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -37,6 +38,9 @@ public:
                       vk::Extent2D in, vk::Extent2D out, SceneDepth& depth, bool srgb_decode,
                       BB::FG::Inputs* fg = nullptr, VideoCore::ImageId* depth_id = nullptr);
     // The image behind Run's returned view (RGBA16F, SHADER_READ_ONLY_OPTIMAL after Run).
+    [[nodiscard]] vk::Extent2D LastOutput() const {
+        return output.extent;
+    }
     [[nodiscard]] vk::Image OutputImage() const {
         return output.image;
     }
@@ -69,6 +73,10 @@ private:
     bool Init();
     // bb-reactive: the reactive mask (bb_reactive.comp) and FSR 4's blend (bb_reactive_blend.comp).
     bool InitReactive();
+    // bb-reactive: DLSS 5 on the native image (no upscaler): returns the output view or null.
+    vk::ImageView RunDlss5Native(vk::CommandBuffer cmd, VideoCore::Image& depth,
+                                 vk::ImageView depth_view, vk::Extent2D in, float jx, float jy,
+                                 const BB::Upscale::Camera& cam, bool greater);
     bool RunReactive(vk::CommandBuffer cmd, vk::Extent2D in, float jx, float jy, bool camera_ok);
     void BlendFsr4(vk::CommandBuffer cmd, vk::Extent2D in, vk::Extent2D out, float jx, float jy);
     void ReactiveStats(vk::Extent2D in);

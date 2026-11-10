@@ -356,7 +356,8 @@ bool OutputSize(u32& w, u32& h) {
 }
 
 bool Capture() {
-    static const bool on = Enabled() || BB::FG::On();
+    // bb-reactive: DLSS 5 on the native image (no upscaler) needs the depth and vectors too.
+    static const bool on = Enabled() || BB::FG::On() || Dlss5::Level() > 0;
     return on;
 }
 
