@@ -1,3 +1,4 @@
+#include "loader/demonsSoulsSkipIntro.h"
 #include "local/port-live.h"
 #include "libs/controller.h"
 
@@ -242,6 +243,14 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			const int64_t now   = SteadyNanoseconds();
 			const int64_t up    = now - start;
 			const bool    pulse = (now / 100000000) % 4 == 0; // (100 ms down every 400 ms)
+			// The one-shot cinematic skip patch (loader/demonsSoulsSkipIntro.cpp) is removed 6 s after the first
+			// cinematic is seen, or 4 minutes after boot, so later cinematics play.
+			if (Loader::DemonsSoulsSkipIntro::CinematicSkipArmed()) {
+				if (cine_seen != 0 && now - cine_seen > 6000000000LL)
+					Loader::DemonsSoulsSkipIntro::Disarm("after the opening cinematic");
+				else if (up > 240000000000LL)
+					Loader::DemonsSoulsSkipIntro::Disarm("4 minutes after boot");
+			}
 			if (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) {
 				if (pulse) data->buttons |= PAD_BUTTON_CROSS;
 				if (!movie_logged) {
