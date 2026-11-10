@@ -115,6 +115,7 @@ private:
     float t_cov_last = 0.0f; // the transparency coverage last read (the guard)
     bool t_guard = false;
     // The once-a-second [reactive] line.
+    u64 rs_mvn = 0, rs_mve[7]{};
     u64 rs_px = 0, rs_t = 0, rs_m = 0, rs_r = 0, rs_sum = 0;
     u32 rs_frames = 0, rs_read = 0, rs_tvalid = 0, rs_guarded = 0, rs_draws = 0, rs_copies = 0;
 };

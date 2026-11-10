@@ -30,7 +30,9 @@ const uint TRANSP_APPLY = 2u;   // ... written into the mask
 const uint MOTION_VALID = 4u;   // previous frame and camera vectors usable
 const uint MOTION_APPLY = 8u;
 
-shared uint s_counts[4];
+const int NV = 7; // mv-check variants: vector scale 1, 0, -1, 0.5, 2, 0.25, 4
+const float kScales[7] = float[7](1.0, 0.0, -1.0, 0.5, 2.0, 0.25, 4.0);
+shared uint s_counts[12];
 
 float Max3(vec3 v) {
     return max(v.x, max(v.y, v.z));
@@ -43,7 +45,7 @@ vec3 Tonemap(vec3 c) {
 
 void main() {
     const uint lid = gl_LocalInvocationIndex;
-    if (lid < 4u) {
+    if (lid < 12u) {
         s_counts[lid] = 0u;
     }
     barrier();
@@ -81,6 +83,28 @@ void main() {
                 const float d = Max3(max(mn - pv, pv - mx));
                 rm = clamp((d - p.k.w) * p.k2.x, 0.0, 1.0) * p.k.z;
             }
+            // [mv-check]: where the camera moves the pixel by more than half a pixel, the
+            // reprojection error of the previous colour with the vectors scaled by each variant.
+            if (dot(mv, mv) > 0.25 && !any(isnan(mv))) {
+                const vec3 cv = sqrt(clamp(texelFetch(cur_tex, c, 0).rgb, 0.0, 1.0));
+                const vec2 base = vec2(c) + 0.5 - p.jitter.xy + p.jitter.zw;
+                bool ok = true;
+                uint errs[7];
+                for (int i = 0; i < NV; ++i) {
+                    const vec2 q = base + mv * kScales[i];
+                    ok = ok && all(greaterThanEqual(q, vec2(0.5))) &&
+                         all(lessThanEqual(q, vec2(size) - 0.5));
+                    const vec3 pv =
+                        sqrt(clamp(textureLod(prev_tex, q / vec2(size), 0.0).rgb, 0.0, 1.0));
+                    errs[i] = uint(Max3(abs(cv - pv)) * 256.0 + 0.5);
+                }
+                if (ok) {
+                    atomicAdd(s_counts[4], 1u);
+                    for (int i = 0; i < NV; ++i) {
+                        atomicAdd(s_counts[5 + i], errs[i]);
+                    }
+                }
+            }
         }
         r = max((p.size.z & TRANSP_APPLY) != 0u ? rt : 0.0,
                 (p.size.z & MOTION_APPLY) != 0u ? rm : 0.0);
@@ -93,7 +117,7 @@ void main() {
         atomicAdd(s_counts[3], uint(r * 255.0 + 0.5));
     }
     barrier();
-    if (lid < 4u && s_counts[lid] != 0u) {
-        atomicAdd(stats.counts[p.size.w * 4u + lid], s_counts[lid]);
+    if (lid < 12u && s_counts[lid] != 0u) {
+        atomicAdd(stats.counts[p.size.w * 16u + lid], s_counts[lid]);
     }
 }

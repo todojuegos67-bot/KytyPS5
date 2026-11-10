@@ -531,7 +531,7 @@ bool PresentSr::InitReactive() {
         return false;
     }
     const VkBufferCreateInfo bci = vk::BufferCreateInfo{
-        .size = RSlots * 4 * sizeof(u32),
+        .size = RSlots * 16 * sizeof(u32),
         .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
     };
     VmaAllocationCreateInfo aci{};
@@ -580,7 +580,7 @@ bool PresentSr::RunReactive(vk::CommandBuffer cmd, vk::Extent2D in, float jx, fl
     if (r_frames > 4 && r_stats_ptr != nullptr) {
         const u32 rd = (w_slot + RSlots - 4) % RSlots;
         vmaInvalidateAllocation(instance.GetAllocator(), r_stats_alloc, 0, VK_WHOLE_SIZE);
-        const u32* c = r_stats_ptr + rd * 4;
+        const u32* c = r_stats_ptr + rd * 16;
         const u64 px = u64(in.width) * in.height;
         t_cov_last = px ? float(c[0]) / float(px) : 0.0f;
         // Deferred lighting or a full-screen pass taken for transparency would mark most of
@@ -591,15 +591,18 @@ bool PresentSr::RunReactive(vk::CommandBuffer cmd, vk::Extent2D in, float jx, fl
         rs_m += c[1];
         rs_r += c[2];
         rs_sum += c[3];
+        rs_mvn += c[4];
+        for (int i = 0; i < 7; ++i) rs_mve[i] += c[5 + i];
         ++rs_read;
     }
 
     const bool t_valid = snap.valid && snap.extent == in;
-    const bool m_valid = BB::Reactive::SelfMotionOn() && camera_ok && prev_valid;
+    const bool m_valid = camera_ok && prev_valid; // (the [mv-check] runs without BB_SELFMOTION)
     u32 flags = 0;
     if (t_valid) flags |= 1u;
     if (t_valid && !t_guard) flags |= 2u;
-    if (m_valid) flags |= 4u | 8u;
+    if (m_valid) flags |= 4u;
+    if (m_valid && BB::Reactive::SelfMotionOn()) flags |= 8u;
     rs_frames++;
     rs_tvalid += t_valid ? 1 : 0;
     rs_guarded += (t_valid && t_guard) ? 1 : 0;
@@ -607,7 +610,7 @@ bool PresentSr::RunReactive(vk::CommandBuffer cmd, vk::Extent2D in, float jx, fl
     rs_copies += snap.copies;
 
     // Clear this frame's stats slot.
-    cmd.fillBuffer(r_stats, w_slot * 16, 16, 0);
+    cmd.fillBuffer(r_stats, w_slot * 64, 64, 0);
     {
         const vk::BufferMemoryBarrier2 bb{
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
@@ -615,8 +618,8 @@ bool PresentSr::RunReactive(vk::CommandBuffer cmd, vk::Extent2D in, float jx, fl
             .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
             .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
             .buffer = r_stats,
-            .offset = w_slot * 16,
-            .size = 16,
+            .offset = w_slot * 64,
+            .size = 64,
         };
         cmd.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
                                                 .pBufferMemoryBarriers = &bb});
@@ -714,6 +717,26 @@ void PresentSr::ReactiveStats(vk::Extent2D in) {
         rs_px ? double(rs_sum) / 255.0 / double(rs_px) : 0.0, rs_tvalid, rs_guarded,
         100.0 * t_cov_last, rs_frames ? double(rs_draws) / rs_frames : 0.0,
         rs_frames ? double(rs_copies) / rs_frames : 0.0, in.width, in.height));
+    if (rs_mvn > 0) {
+        // [mv-check]: mean reprojection error (sqrt colour, 0..1) of the previous frame with
+        // the vectors x1, zero, negated and other scales; the right vectors must be lowest.
+        static const float scales[7] = {1.0f, 0.0f, -1.0f, 0.5f, 2.0f, 0.25f, 4.0f};
+        double e[7];
+        int best = 0;
+        for (int i = 0; i < 7; ++i) {
+            e[i] = double(rs_mve[i]) / 256.0 / double(rs_mvn);
+            if (e[i] < e[best]) best = i;
+        }
+        BB::Upscale::Checkpoint(fmt::format(
+            "[mv-check] 1 s: err vectors {:.4f}, zero {:.4f}, negated {:.4f} (x0.25 {:.4f}, x0.5 "
+            "{:.4f}, x2 {:.4f}, x4 {:.4f}), scale best {} over {} moving px{}",
+            e[0], e[1], e[2], e[5], e[3], e[4], e[6], scales[best], rs_mvn,
+            best == 0 ? "" : "  <- VECTORS NOT BEST"));
+    } else {
+        BB::Upscale::Checkpoint("[mv-check] 1 s: no pixel moved by the camera (or self motion off)");
+    }
+    rs_mvn = 0;
+    for (auto& v : rs_mve) v = 0;
     rs_px = rs_t = rs_m = rs_r = rs_sum = 0;
     rs_frames = rs_read = rs_tvalid = rs_guarded = rs_draws = rs_copies = 0;
 }
