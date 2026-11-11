@@ -635,7 +635,8 @@ bool ReadLayout(Replayed& out, Reader& r, vk::DescriptorSetLayout bindless) {
 	info.setLayoutCount         = uses_bl ? 2 : 1;
 	info.pSetLayouts            = sets.data();
 	info.pushConstantRangeCount = 1;
-	const vk::PushConstantRange range(push_range);
+	vk::PushConstantRange range {};
+	std::memcpy(static_cast<void*>(&range), &push_range, sizeof(range));
 	info.pPushConstantRanges = &range;
 	if (out.device.createPipelineLayout(&info, nullptr, &out.layout) != vk::Result::eSuccess) {
 		out.layout = nullptr;
