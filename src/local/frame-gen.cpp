@@ -41,6 +41,7 @@
 #include "local/dof.h"
 #include "local/dlss-nr.h"
 #include "local/smoke.h"
+#include "local/particle-mv.h" // (des-particles-fg: KYTY_FG_PARTICLE_MV)
 #include "local/rt-local-lights.h"
 #include "local/rt-flicker.h"
 #include "local/rt-capture.h"
@@ -234,7 +235,7 @@ void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFl
 // (Re)create `image` as a sampled copy target like `source`; with `attachment`, a color
 // attachment too where the format allows it (*attachment tells).
 void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view,
-               const VulkanImage& source, bool* attachment) {
+               const VulkanImage& source, bool* attachment, bool storage = false) {
 	if (image.image != nullptr && image.format == source.format &&
 	    image.extent.width == source.extent.width && image.extent.height == source.extent.height) {
 		return;
@@ -263,6 +264,11 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 			create.usage |= vk::ImageUsageFlagBits::eColorAttachment;
 		}
 	}
+	// (des-particles-fg) KYTY_FG_PARTICLE_MV: the FG motion copy written in place by particle-mv.comp (RG16F only).
+	if (storage && source.format == vk::Format::eR16G16Sfloat &&
+	    static_cast<bool>(graphics.physical_device.getFormatProperties(source.format).optimalTilingFeatures &
+	                      vk::FormatFeatureFlagBits::eStorageImage))
+		create.usage |= vk::ImageUsageFlagBits::eStorage;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, image)) {
@@ -3586,7 +3592,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 		return; // the images were replaced after the TAA pass
 	}
 	Configure(graphics, inputs.depth, inputs.depth_view, depth.backing);
-	Configure(graphics, inputs.motion, inputs.motion_view, motion.backing, &inputs.motion_attachment);
+	Configure(graphics, inputs.motion, inputs.motion_view, motion.backing, &inputs.motion_attachment, ParticleMvWanted()); // (des-particles-fg: storage use for KYTY_FG_PARTICLE_MV)
 	command.EndRendering();
 	auto vk_command = command.Handle();
 	CopyInto(vk_command, depth, inputs.depth);
@@ -3594,6 +3600,9 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	if (inputs.motion_attachment) {
 		ZeroStaticRect(vk_command, inputs.motion, inputs.motion_view);
 	}
+	// (des-particles-fg) KYTY_FG_PARTICLE_MV: the particle layer's vectors (measured in Upscale this frame) mixed into this
+	// copy only: frame generation moves fire, sparks, rain and spells instead of repeating them. Nothing when off.
+	if (ParticleMvWanted()) ParticleMvCompose(vk_command, graphics, inputs.motion);
 	if (hudless && HudlessWanted()) {
 		ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format, vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
 		CopyRaw(vk_command, g_hudless, inputs.hudless);
@@ -4641,10 +4650,10 @@ bool RtParticlesDebug() {
 	}();
 	return debug;
 }
-bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug() || HwParticlesWanted() || SmokeWanted(); } // (ds-particles-1029: KYTY_SMOKE)
+bool RtParticlesWanted() { return RtParticlesLevel() > 0 || RtParticlesDebug() || HwParticlesWanted() || SmokeWanted() || ParticleMvWanted(); } // (ds-particles-1029: KYTY_SMOKE)
 // (hwrt3p) KYTY_HWRT_PARTICLES' read of the pre-particle copy (no SSGI counters; the copy is taken for it too).
 vk::ImageView RtParticlesPreCopy(uint64_t color_address, vk::Extent2D extent) {
-	if (!HwParticlesWanted() && !SmokeWanted()) return nullptr; // (ds-particles-1029: KYTY_SMOKE reads it too)
+	if (!HwParticlesWanted() && !SmokeWanted() && !ParticleMvWanted()) return nullptr; // (ds-particles-1029: KYTY_SMOKE reads it too; des-particles-fg: KYTY_FG_PARTICLE_MV)
 	const bool ok = g_rtpart.taken && g_rtpart.pre_view != nullptr && g_rtpart.pre_address == color_address &&
 	                g_rtpart.pre_flip == GuestFlips() && g_rtpart.pre.extent.width == extent.width &&
 	                g_rtpart.pre.extent.height == extent.height;
@@ -4684,7 +4693,7 @@ void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderSt
 		e.instances += draw.instances;
 		e.indices += draw.index_count;
 	}
-	if ((RtParticlesLevel() == 0 && !HwParticlesWanted() && !SmokeWanted()) || g_rtpart.taken) return; // (ds-particles-1029: KYTY_SMOKE) // (hwrt3p: also for KYTY_HWRT_PARTICLES)
+	if ((RtParticlesLevel() == 0 && !HwParticlesWanted() && !SmokeWanted() && !ParticleMvWanted()) || g_rtpart.taken) return; // (des-particles-fg: KYTY_FG_PARTICLE_MV) // (ds-particles-1029: KYTY_SMOKE) // (hwrt3p: also for KYTY_HWRT_PARTICLES)
 	// The particle pass's first draw: blended, depth test on, depth writes off (KYTY_RT_PARTICLES_VS pins the shaders).
 	static const std::vector<uint64_t> pinned = [] {
 		std::vector<uint64_t> out;
@@ -9690,7 +9699,8 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	TimedPass("GtaoApply", [&] { GtaoApply(command, inputs); }); // (KYTY_GTAO: likewise, after SSGI; nothing when off)
 	probed(RtFlicker::Ao, "RtAoApply", [&] { return RtAoApply(command, inputs); }); // (ao-1028: KYTY_AO, rt-ao.cpp: the new ambient occlusion on the ambient term; nothing when off)
 	probed(RtFlicker::Torch, "TorchApply", [&] { return TorchApply(command, inputs); }); // (KYTY_TORCH / KYTY_TORCH_FLARE: the firelight, torch.cpp; before SSR / RT reflections so they reflect it; nothing when off)
-	TimedPass("SmokeApply", [&] { SmokeApply(command, inputs, inputs_in.color); }); // (ds-particles-1029: KYTY_SMOKE, smoke.cpp: soft particles + torch-lit smoke on the particle layer; after the torch tracked its lights; nothing when off)
+	TimedPass("SmokeApply", [&] { SmokeApply(command, inputs, inputs_in.color); });
+	TimedPass("ParticleMvMeasure", [&] { ParticleMvMeasure(command, inputs, inputs_in.color); }); // (des-particles-fg: KYTY_FG_PARTICLE_MV, particle-mv.cpp: the particle layer's vectors for FG only; nothing when off) // (ds-particles-1029: KYTY_SMOKE, smoke.cpp: soft particles + torch-lit smoke on the particle layer; after the torch tracked its lights; nothing when off)
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Gi, "HwGiApply")
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	probed(RtFlicker::Reflections, "RtReflectionsApply", [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)

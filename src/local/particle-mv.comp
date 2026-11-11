@@ -1,0 +1,121 @@
+#version 450
+// KYTY_FG_PARTICLE_MV (particle-mv.cpp): motion vectors for Demon's Souls' particle layer, for frame generation only.
+// The particle-translucent pass draws without motion vectors (the G-buffer's vector under a flame is the wall's): FSR 3.1
+// FG repeats fire, sparks, rain, mist and spells at the real 30 fps. The particle layer is exact (game colour after the
+// pass minus the copy taken right before its first draw, frame-gen.cpp BeforeSceneDraw); its motion is measured by
+// block matching that layer against the previous real frame's, at half resolution.
+// Modes (push.misc.x):
+//   0 layer:     half res: L = luma |game - pre| (2x2 mean, compressed L/(1+L)); coverage = the particle share of the
+//                pixel. out = (L, coverage, -, -) into lay[cur].
+//   1 match:     half res: where coverage > threshold, the displacement d (half-res px, previous -> current) minimising
+//                the SAD of a 5x5 footprint (3x3 taps, step 2) of lay[cur] at p against lay[prev] at p - d, coarse
+//                (step 2 over +-range) then refined (+-1); candidates also around the background vector. Confidence:
+//                how much better than the background vector's SAD and than "no motion". out = (dx, dy full-res px,
+//                weight, -) into pmv.
+//   2 compose:   full res, on the frame generation's copy of the motion vectors (never the game's own image, never the
+//                upscaler's): mv = mix(mv, particle vector in the game's units, weight x strength).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D game_tex;   // mode 0: the game's colour after the particles
+layout(binding = 1) uniform sampler2D pre_tex;    // mode 0: the pre-particle copy
+layout(binding = 2) uniform sampler2D cur_tex;    // mode 1: lay[cur]
+layout(binding = 3) uniform sampler2D prev_tex;   // mode 1: lay[prev]
+layout(binding = 4) uniform sampler2D motion_tex; // mode 1: the game's motion vectors (render size)
+layout(binding = 5) uniform sampler2D pmv_tex;    // mode 2: the particle vectors (half res, linear)
+layout(binding = 6, rgba16f) uniform writeonly image2D out_img; // modes 0 / 1
+layout(binding = 7, rg16f) uniform image2D fg_motion;           // mode 2: the FG copy, in place
+layout(std430, binding = 8) buffer Stats {
+	uint stats[8]; // 0 -, 1 particle px (half res), 2 matched px, 3 sum of |d| (px), 4 composed px (full res)
+};
+
+layout(push_constant) uniform Push {
+	vec4  size;   // full w, h, half w, half h
+	vec4  motion; // game motion scale x, y (raw x scale / size = UV), range (half px), threshold
+	vec4  par;    // strength, -, -, -
+	ivec4 misc;   // mode, -, -, -
+} push;
+
+float Luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+float Sad(ivec2 p, ivec2 d) {
+	float s = 0.0;
+	for (int y = -2; y <= 2; y += 2)
+		for (int x = -2; x <= 2; x += 2) {
+			const ivec2 a = p + ivec2(x, y);
+			s += abs(texelFetch(cur_tex, clamp(a, ivec2(0), ivec2(push.size.zw) - 1), 0).x -
+			         texelFetch(prev_tex, clamp(a - d, ivec2(0), ivec2(push.size.zw) - 1), 0).x);
+		}
+	return s;
+}
+
+void main() {
+	const ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
+	const int   mode = push.misc.x;
+	if (mode == 0) {
+		if (any(greaterThanEqual(p, ivec2(push.size.zw)))) return;
+		float l = 0.0, b = 0.0;
+		for (int i = 0; i < 4; ++i) {
+			const ivec2 f  = min(p * 2 + ivec2(i & 1, i >> 1), ivec2(push.size.xy) - 1);
+			const vec3  g  = texelFetch(game_tex, f, 0).rgb;
+			const vec3  pr = texelFetch(pre_tex, f, 0).rgb;
+			l += Luma(abs(g - pr));
+			b += Luma(max(pr, vec3(0.0)));
+		}
+		l *= 0.25, b *= 0.25;
+		const float cov = l / (l + b + 1e-3);
+		imageStore(out_img, p, vec4(l / (1.0 + l), cov, 0.0, 0.0));
+		return;
+	}
+	if (mode == 1) {
+		if (any(greaterThanEqual(p, ivec2(push.size.zw)))) return;
+		const float cov = texelFetch(cur_tex, p, 0).y;
+		if (cov < push.motion.w) {
+			imageStore(out_img, p, vec4(0.0));
+			return;
+		}
+		atomicAdd(stats[1], 1u);
+		// The background vector here (half-res px, previous -> current): the candidate the game's vectors give.
+		const vec2  uv   = (vec2(p) + 0.5) / push.size.zw;
+		const vec2  mvuv = textureLod(motion_tex, uv, 0).xy * push.motion.xy / push.size.xy;
+		const ivec2 bg   = ivec2(round(mvuv * push.size.zw));
+		const float sad_bg   = Sad(p, bg);
+		const float sad_zero = Sad(p, ivec2(0));
+		const int   range    = int(push.motion.z);
+		float best = min(sad_bg, sad_zero);
+		ivec2 bd   = sad_bg <= sad_zero ? bg : ivec2(0);
+		for (int y = -range; y <= range; y += 2)
+			for (int x = -range; x <= range; x += 2) {
+				const float s = Sad(p, ivec2(x, y));
+				if (s < best) best = s, bd = ivec2(x, y);
+			}
+		const ivec2 c = bd;
+		for (int y = -1; y <= 1; ++y)
+			for (int x = -1; x <= 1; ++x) {
+				const float s = Sad(p, c + ivec2(x, y));
+				if (s < best) best = s, bd = c + ivec2(x, y);
+			}
+		// Confident only where the match is clearly better than the background's vector and than standing still, and
+		// on an actual signal (not a flat glow).
+		const float ref    = min(sad_bg, sad_zero);
+		const float gain   = clamp(1.0 - best / max(ref, 1e-4), 0.0, 1.0);
+		const float signal = clamp(ref * 4.0, 0.0, 1.0);
+		const float w      = clamp(gain * 2.0, 0.0, 1.0) * signal * smoothstep(push.motion.w, push.motion.w * 3.0, cov);
+		if (w > 0.05 && bd != bg) {
+			atomicAdd(stats[2], 1u);
+			atomicAdd(stats[3], uint(length(vec2(bd)) * 2.0));
+		}
+		imageStore(out_img, p, vec4(vec2(bd) * 2.0, bd != bg ? w : 0.0, 0.0));
+		return;
+	}
+	// mode 2: compose into the FG copy of the vectors (full res).
+	if (any(greaterThanEqual(p, ivec2(push.size.xy)))) return;
+	const vec2 uv = (vec2(p) + 0.5) / push.size.xy;
+	const vec4 pm = textureLod(pmv_tex, uv, 0);
+	const float w = clamp(pm.z * push.par.x, 0.0, 1.0);
+	if (w < 0.02) return;
+	const vec2 mv = imageLoad(fg_motion, p).xy;
+	// The game's raw units: previous uv = uv - raw x scale / size, so raw = d (px) x size / scale / size = d / scale.
+	const vec2 raw = pm.xy / push.motion.xy;
+	imageStore(fg_motion, p, vec4(mix(mv, raw, w), 0.0, 0.0));
+	atomicAdd(stats[4], 1u);
+}
