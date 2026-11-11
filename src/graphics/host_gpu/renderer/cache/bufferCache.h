@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 
+#include <array>
+#include <mutex>
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
@@ -227,7 +229,19 @@ private:
 	// when cq_value is set, the copy-queue timeline value (WaitAsyncCopy).
 	[[nodiscard]] uint64_t BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
 	                                          uint64_t& window_begin, uint64_t& window_end,
-	                                          uint64_t& cq_value);
+	                                          uint64_t& cq_value, uint32_t* cq_slot = nullptr);
+	// KYTY_FAULT_LOCAL_FINISH (wolv-perf-1111e): the faulting guest thread publishes a finished
+	// copy-queue slot itself (staging -> guest backing, bytes no longer downloading). Any thread.
+	// True when the slot's bytes are in guest memory (by this call or an earlier publication).
+	bool PublishAsyncCopyFromGuest(uint32_t slot, uint64_t value);
+	// One lock per staging slot: guards copies/value/published against a guest publishing while
+	// Thread_Gpu publishes, frees or reuses the slot.
+	struct SlotSync {
+		std::mutex mutex;
+		uint64_t   value     = 0;
+		bool       published = false;
+	};
+	std::array<SlotSync, 16> m_slot_sync;
 	// False when `snapshot` and the GPU wrote the page again: the caller reads the downloaded
 	// bytes.
 	bool FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_write, uint64_t window_begin,

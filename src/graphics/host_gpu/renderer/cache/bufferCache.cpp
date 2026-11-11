@@ -432,6 +432,10 @@ struct FaultPathStats {
 	std::atomic<uint64_t> sync_downloads {0};    // ReadMemoryOnGpu main-queue download + full wait
 	std::atomic<uint64_t> sync_download_us {0};
 	std::atomic<uint64_t> sync_bytes {0};        // window bytes of those downloads
+	std::atomic<uint64_t> rt1_queue_us {0};      // round trip 1: enqueue -> Thread_Gpu starts the command
+	std::atomic<uint64_t> rt1_run_us {0};        // round trip 1: the command itself
+	std::atomic<uint64_t> local_finish {0};      // KYTY_FAULT_LOCAL_FINISH: published by the guest, no round trip 2
+	std::atomic<uint64_t> local_refault {0};     // same page faulted again right after: old path
 };
 FaultPathStats g_fp;
 
@@ -448,7 +452,8 @@ void PrintFaultPaths() {
 	::printf("Fault paths (5 s, KYTY_ASYNC_READ_SNAPSHOT=%d): %llu buffer faults (render %llu, other %llu); per fault "
 	         "round trip 1 %.0f us, copy wait %.0f us, round trip 2 %.0f us; first command resolved %llu, copy queue "
 	         "%llu, main queue %llu; finish ok %llu, snapshot %llu, sync again %llu (%.1f ms on Thread_Gpu); "
-	         "Thread_Gpu sync downloads %llu (%.1f ms, %.1f MiB windows)\n",
+	         "Thread_Gpu sync downloads %llu (%.1f ms, %.1f MiB windows); local finish %llu (KYTY_FAULT_LOCAL_FINISH=%lld), "
+	         "refaults %llu; round trip 1 = %.0f us queued + %.0f us running + rest wake-up\n",
 	         AsyncReadSnapshotEnabled() ? 1 : 0, static_cast<unsigned long long>(n),
 	         static_cast<unsigned long long>(f0), static_cast<unsigned long long>(f1), per(rt1), per(wt), per(rt2),
 	         static_cast<unsigned long long>(g_fp.begin_none.exchange(0)),
@@ -460,7 +465,11 @@ void PrintFaultPaths() {
 	         static_cast<double>(g_fp.finish_sync_us.exchange(0)) / 1000.0,
 	         static_cast<unsigned long long>(g_fp.sync_downloads.exchange(0)),
 	         static_cast<double>(g_fp.sync_download_us.exchange(0)) / 1000.0,
-	         static_cast<double>(g_fp.sync_bytes.exchange(0)) / (1024.0 * 1024.0));
+	         static_cast<double>(g_fp.sync_bytes.exchange(0)) / (1024.0 * 1024.0),
+	         static_cast<unsigned long long>(g_fp.local_finish.exchange(0)),
+	         static_cast<long long>(Common::LiveSwitches::Get("KYTY_FAULT_LOCAL_FINISH", 1).load()),
+	         static_cast<unsigned long long>(g_fp.local_refault.exchange(0)), per(g_fp.rt1_queue_us.exchange(0)),
+	         per(g_fp.rt1_run_us.exchange(0)));
 }
 
 // GPU thread: "CQ async readbacks (5 s)" line.
@@ -987,12 +996,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		uint64_t window_begin = 0;
 		uint64_t window_end   = 0;
 		uint64_t cq_value     = 0;
+		uint32_t cq_slot      = UINT32_MAX;
 		g_fp.faults[PhaseStats::IsRenderThread() ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
 		auto fp_t = std::chrono::steady_clock::now();
 		gpu.SendCommandSync([&] {
+			// Round trip 1 split: waiting in Thread_Gpu's command queue vs running the command.
+			const auto run_begin = std::chrono::steady_clock::now();
+			g_fp.rt1_queue_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                                       run_begin - fp_t)
+			                                                       .count()),
+			                            std::memory_order_relaxed);
 			ReadbackStats::s_forwarded = true;
-			tick = BeginWriteReadback(vaddr, size, is_write, window_begin, window_end, cq_value);
+			tick = BeginWriteReadback(vaddr, size, is_write, window_begin, window_end, cq_value, &cq_slot);
 			ReadbackStats::s_forwarded = false;
+			g_fp.rt1_run_us.fetch_add(ElapsedUs(run_begin), std::memory_order_relaxed);
 		});
 		g_fp.rt1_us.fetch_add(ElapsedUs(fp_t), std::memory_order_relaxed);
 		(tick == 0 ? g_fp.begin_none : cq_value != 0 ? g_fp.begin_cq : g_fp.begin_main)
@@ -1012,7 +1029,36 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			g_fp.wait_us.fetch_add(ElapsedUs(fp_t), std::memory_order_relaxed);
 			fp_t           = std::chrono::steady_clock::now();
-			bool redirtied = false;
+			// KYTY_FAULT_LOCAL_FINISH (live, default 1; 0 = old): a read whose copy-queue download has
+			// landed is published by this thread (staging -> guest memory, bytes no longer
+			// downloading) and Thread_Gpu's bookkeeping (pending entry, slot, page protection) is
+			// posted without waiting for it: no second round trip (log 11-11 08:07: ~290 us a fault,
+			// 3.7-4.5K faults per 5 s). The faulting load then re-executes: the page is still
+			// protected, but its bytes are clean, so the clean-read emulation serves it (and the
+			// other loads of the page) on this thread. A second fault on the same page by this thread
+			// before Thread_Gpu lifted the protection (a load the emulator does not handle, or the GPU
+			// wrote again) takes the old path.
+			static auto& local_finish = Common::LiveSwitches::Get("KYTY_FAULT_LOCAL_FINISH", 1);
+			thread_local uint64_t last_local_page = ~uint64_t {0};
+			const uint64_t        fault_page      = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+			if (!is_write && cq_value != 0 && cq_slot != UINT32_MAX &&
+			    local_finish.load(std::memory_order_relaxed) != 0 && fault_page != last_local_page &&
+			    PublishAsyncCopyFromGuest(cq_slot, cq_value)) {
+				last_local_page = fault_page;
+				// snapshot=true: if the GPU wrote the page again, the bookkeeping leaves it protected
+				// and resolves nothing synchronously (this thread is not waiting for it).
+				gpu.SendCommand([this, vaddr, size, window_begin, window_end, tick, cq_value] {
+					(void)FinishWriteReadback(vaddr, size, false, window_begin, window_end, tick, true, cq_value);
+				});
+				g_fp.local_finish.fetch_add(1, std::memory_order_relaxed);
+				g_fp.rt2_us.fetch_add(ElapsedUs(fp_t), std::memory_order_relaxed);
+				return;
+			}
+			if (fault_page == last_local_page) {
+				g_fp.local_refault.fetch_add(1, std::memory_order_relaxed);
+			}
+			last_local_page = ~uint64_t {0};
+			bool redirtied  = false;
 			gpu.SendCommandSync([&] {
 				redirtied = !FinishWriteReadback(vaddr, size, is_write, window_begin, window_end,
 				                                 tick, !is_write && AsyncReadSnapshotEnabled(), cq_value);
@@ -1527,9 +1573,12 @@ bool BufferCache::EagerWriteback() {
 // GPU thread. Returns the tick the guest must wait for, or 0 when the fault is already resolved.
 uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
                                          uint64_t& window_begin, uint64_t& window_end,
-                                         uint64_t& cq_value) {
+                                         uint64_t& cq_value, uint32_t* cq_slot) {
 	KYTY_PROFILER_FUNCTION();
 	cq_value = 0;
+	if (cq_slot != nullptr) {
+		*cq_slot = UINT32_MAX;
+	}
 	NoteCqStats();
 	if (!is_write && !IsRegionRegistered(vaddr, size)) {
 		// A read of an unregistered region: the synchronous path finds its buffer.
@@ -1550,6 +1599,9 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 			window_begin = pending.begin;
 			window_end   = pending.end;
 			cq_value     = pending.cq;
+			if (cq_slot != nullptr && pending.cq != 0) {
+				*cq_slot = pending.slot;
+			}
 			return pending.cq != 0 ? pending.cq : pending.tick;
 		}
 	}
@@ -1643,6 +1695,9 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 			stats.SetOutcome(ReadbackStats::Downloaded);
 			NoteAsyncReadback(true);
 			m_pending_write_readbacks.push_back({window_begin, window_end, 0, value, slot});
+			if (cq_slot != nullptr) {
+				*cq_slot = slot;
+			}
 			g_cq.async.fetch_add(1, std::memory_order_relaxed);
 			if (writer_submitted) {
 				g_cq.async_running.fetch_add(1, std::memory_order_relaxed);
@@ -2003,10 +2058,14 @@ bool BufferCache::TryAsyncCopyQueueReadback(Buffer& buffer, uint64_t window_begi
 		                     "allocate async readback command buffer");
 		slot.staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                        vk::BufferUsageFlagBits::eTransferDst, StagingSize);
+		// Reserved once: a guest publishing a slot (KYTY_FAULT_LOCAL_FINISH) holds a reference into
+		// this vector, so it must never reallocate.
+		cq.slots.reserve(MaxSlots);
 		cq.slots.push_back(std::move(slot));
 		slot_index = static_cast<uint32_t>(cq.slots.size() - 1);
 	}
 	auto& slot = cq.slots[slot_index];
+	EXIT_IF(slot_index >= m_slot_sync.size());
 
 	// From here the bytes are on their way back: no longer GPU-written, not yet in guest memory.
 	// Only this thread adds GPU-written ranges, so the collection above is still exact.
@@ -2057,12 +2116,52 @@ bool BufferCache::TryAsyncCopyQueueReadback(Buffer& buffer, uint64_t window_begi
 	RequireVulkanSuccess(m_graphics.readback_queue.submit(1, &submit, nullptr), "submit async readback");
 	cq.submitted = value;
 
-	slot.busy           = true;
-	slot.value          = value;
-	slot.buffer_address = buffer_address;
-	slot.total_size     = total_size;
-	slot.copies         = std::move(copies);
+	{
+		std::lock_guard sync_lock(m_slot_sync[slot_index].mutex);
+		slot.busy           = true;
+		slot.value          = value;
+		slot.buffer_address = buffer_address;
+		slot.total_size     = total_size;
+		slot.copies         = std::move(copies);
+		m_slot_sync[slot_index].value     = value;
+		m_slot_sync[slot_index].published = false;
+	}
 	cq_value            = value;
+	return true;
+}
+
+bool BufferCache::PublishAsyncCopyFromGuest(uint32_t slot_index, uint64_t value) {
+	if (slot_index >= m_slot_sync.size() || value == 0) {
+		return false;
+	}
+	auto&           sync = m_slot_sync[slot_index];
+	std::lock_guard sync_lock(sync.mutex);
+	if (sync.value != value) {
+		// Thread_Gpu completed (published) this readback already and freed or reused the slot.
+		return true;
+	}
+	if (sync.published) {
+		return true;
+	}
+	if (!AsyncCopyDone(value)) {
+		return false;
+	}
+	auto& slot = m_async_cq.slots[slot_index];
+	slot.staging->Invalidate(0, slot.total_size);
+	const auto* mapped = slot.staging->Mapped().data();
+	for (const auto& copy: slot.copies) {
+		if (!Libs::LibKernel::Memory::TryWriteBacking(slot.buffer_address + copy.srcOffset, mapped + copy.dstOffset,
+		                                              copy.size)) {
+			return false; // Thread_Gpu publishes it (and reports) as before
+		}
+	}
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: slot.copies) {
+			m_downloading_ranges.Subtract(slot.buffer_address + copy.srcOffset, copy.size);
+		}
+	}
+	sync.published = true;
 	return true;
 }
 
@@ -2070,19 +2169,24 @@ void BufferCache::PublishAsyncCopy(uint32_t slot_index) {
 	auto& slot = m_async_cq.slots[slot_index];
 	EXIT_IF(!slot.busy);
 	WaitAsyncCopy(slot.value);
-	slot.staging->Invalidate(0, slot.total_size);
-	const auto* mapped = slot.staging->Mapped().data();
-	for (const auto& copy: slot.copies) {
-		Libs::LibKernel::Memory::WriteBacking(slot.buffer_address + copy.srcOffset, mapped + copy.dstOffset,
-		                                      copy.size);
-	}
-	{
-		// Guest memory holds the bytes before they stop counting as downloading.
-		std::unique_lock lock(m_dirty_ranges_mutex);
+	std::lock_guard sync_lock(m_slot_sync[slot_index].mutex);
+	if (!m_slot_sync[slot_index].published) {
+		slot.staging->Invalidate(0, slot.total_size);
+		const auto* mapped = slot.staging->Mapped().data();
 		for (const auto& copy: slot.copies) {
-			m_downloading_ranges.Subtract(slot.buffer_address + copy.srcOffset, copy.size);
+			Libs::LibKernel::Memory::WriteBacking(slot.buffer_address + copy.srcOffset, mapped + copy.dstOffset,
+			                                      copy.size);
+		}
+		{
+			// Guest memory holds the bytes before they stop counting as downloading.
+			std::unique_lock lock(m_dirty_ranges_mutex);
+			for (const auto& copy: slot.copies) {
+				m_downloading_ranges.Subtract(slot.buffer_address + copy.srcOffset, copy.size);
+			}
 		}
 	}
+	m_slot_sync[slot_index].published = false;
+	m_slot_sync[slot_index].value     = 0;
 	slot.copies.clear();
 	slot.busy = false;
 	g_cq.published.fetch_add(1, std::memory_order_relaxed);
