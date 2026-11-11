@@ -31,6 +31,11 @@ class UserConfig;
 struct ComputeShaderInfo;
 } // namespace HW
 
+// KYTY_ASYNC_PS (pipelineCache.cpp): the draw being prepared may be skipped while its new pixel
+// program translates on a worker (it writes no depth/stencil); and whether the last lookup did so.
+extern thread_local bool t_async_ps_may_skip;
+extern thread_local bool t_async_ps_pending;
+
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {

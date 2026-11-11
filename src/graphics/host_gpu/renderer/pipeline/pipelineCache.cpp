@@ -43,6 +43,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -653,6 +654,19 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	return hash;
 }
 
+// wolv-perf-1111b: KYTY_ASYNC_PS (live, default 1; 0 = old behaviour, every new pixel program
+// translated inline on Thread_Gpu). Log 2026-11-11: in the slow area Thread_Gpu spent 1-2 s of every
+// 5 s in "prog.recompile" (~35 ms per new program, 70 % of them pixel shaders), with 0.6 % idle.
+// A brand-new pixel program is translated (RDNA2 -> IR, the expensive part) on worker threads
+// (KYTY_ASYNC_PS_THREADS, default 3); its draws are skipped while that runs, only when the draw
+// writes no depth/stencil (same visible-critical rule as the background pipeline compile). Any other
+// draw that needs the program waits for the job (or runs it inline if no worker took it yet). The
+// SPIR-V emission, resource plan and module creation stay on Thread_Gpu, as before. Results with
+// subroutine calls or unsupported translations are discarded and redone inline (old path).
+// Log: "Async PS translate (5 s, KYTY_ASYNC_PS=N): ..." every 5 s.
+thread_local bool t_async_ps_may_skip = false; // set by the draw path (PrepareDrawRenderState)
+thread_local bool t_async_ps_pending  = false; // the last pixel lookup was skipped while translating
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -1034,6 +1048,135 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// KYTY_ASYNC_PS: background translation of new pixel programs (see the comment above the struct).
+	struct AsyncTranslateJob {
+		std::vector<uint32_t>               code;
+		std::vector<uint32_t>               user_data;
+		ShaderPixelInputInfo                pixel_info {};
+		ShaderRecompiler::CompileOptions    options;
+		ShaderRecompiler::TranslateResult   result;
+		std::atomic<int>                    state {0}; // 0 queued, 1 running, 2 done
+		uint64_t                            work_us = 0;
+	};
+	std::unordered_map<ProgramKey, std::shared_ptr<AsyncTranslateJob>, ProgramKeyHash> async_jobs;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              async_sync_only;
+	std::mutex                                                  async_mutex;
+	std::condition_variable                                     async_wake;
+	std::condition_variable                                     async_done;
+	std::deque<std::shared_ptr<AsyncTranslateJob>>              async_queue;
+	std::vector<std::thread>                                    async_threads;
+	bool                                                        async_stop = false;
+	std::atomic<uint64_t> async_worker_us {0}, async_completed {0};
+	uint64_t async_submitted = 0, async_skipped_draws = 0, async_waits = 0, async_wait_us = 0,
+	         async_inline = 0, async_fallbacks = 0, async_used = 0, async_unskippable = 0;
+	std::chrono::steady_clock::time_point async_report = std::chrono::steady_clock::now();
+
+	static bool AsyncPsEnabled() {
+		static auto& on = Common::LiveSwitches::Get("KYTY_ASYNC_PS", 1);
+		return on.load(std::memory_order_relaxed) != 0;
+	}
+	static void RunAsyncJob(AsyncTranslateJob& job) {
+		const auto begin = std::chrono::steady_clock::now();
+		job.result       = ShaderRecompiler::TranslateProgram(job.code, job.options);
+		job.work_us      = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                         std::chrono::steady_clock::now() - begin)
+		                                         .count());
+	}
+	void AsyncWorker() {
+		for (;;) {
+			std::shared_ptr<AsyncTranslateJob> job;
+			{
+				std::unique_lock lock(async_mutex);
+				async_wake.wait(lock, [&] { return async_stop || !async_queue.empty(); });
+				if (async_stop) {
+					return;
+				}
+				job = std::move(async_queue.front());
+				async_queue.pop_front();
+			}
+			int expected = 0;
+			if (!job->state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+				continue; // Thread_Gpu took it inline
+			}
+			RunAsyncJob(*job);
+			async_worker_us.fetch_add(job->work_us, std::memory_order_relaxed);
+			async_completed.fetch_add(1, std::memory_order_relaxed);
+			{
+				std::lock_guard lock(async_mutex);
+				job->state.store(2, std::memory_order_release);
+			}
+			async_done.notify_all();
+		}
+	}
+	void StartAsyncWorkers() {
+		if (!async_threads.empty()) {
+			return;
+		}
+		unsigned threads = 3;
+		if (const char* value = std::getenv("KYTY_ASYNC_PS_THREADS"); value != nullptr && *value != '\0') {
+			threads = std::clamp(static_cast<unsigned>(std::strtoul(value, nullptr, 10)), 1u, 8u);
+		}
+		for (unsigned i = 0; i < threads; i++) {
+			async_threads.emplace_back([this] { AsyncWorker(); });
+		}
+		::printf("Async PS translate: %u worker threads (KYTY_ASYNC_PS_THREADS)\n", threads);
+	}
+	void StopAsyncWorkers() {
+		{
+			std::lock_guard lock(async_mutex);
+			async_stop = true;
+		}
+		async_wake.notify_all();
+		for (auto& thread: async_threads) {
+			thread.join();
+		}
+		async_threads.clear();
+	}
+	// Waits for a job, or runs it here when no worker has started it.
+	void FinishAsyncJob(AsyncTranslateJob& job) {
+		int expected = 0;
+		if (job.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+			RunAsyncJob(job);
+			job.state.store(2, std::memory_order_release);
+			async_inline++;
+			return;
+		}
+		if (job.state.load(std::memory_order_acquire) == 2) {
+			return;
+		}
+		const auto begin = std::chrono::steady_clock::now();
+		{
+			std::unique_lock lock(async_mutex);
+			async_done.wait(lock, [&] { return job.state.load(std::memory_order_acquire) == 2; });
+		}
+		async_waits++;
+		async_wait_us += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                           std::chrono::steady_clock::now() - begin)
+		                                           .count());
+	}
+	void MaybeReportAsync() {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - async_report < std::chrono::seconds(5)) {
+			return;
+		}
+		async_report = now;
+		if (async_submitted == 0 && async_skipped_draws == 0 && async_waits == 0 && async_unskippable == 0) {
+			return;
+		}
+		::printf("Async PS translate (5 s, KYTY_ASYNC_PS=%d): %llu submitted, %llu translated on workers in %.0f ms "
+		         "(off Thread_Gpu), %llu used; %llu draws skipped while translating; %llu waits for a job (%.1f ms), "
+		         "%llu run inline, %llu fell back to the inline path; %llu new programs translated inline (draw writes depth/stencil); %zu pending\n",
+		         AsyncPsEnabled() ? 1 : 0, static_cast<unsigned long long>(async_submitted),
+		         static_cast<unsigned long long>(async_completed.exchange(0, std::memory_order_relaxed)),
+		         static_cast<double>(async_worker_us.exchange(0, std::memory_order_relaxed)) / 1000.0,
+		         static_cast<unsigned long long>(async_used), static_cast<unsigned long long>(async_skipped_draws),
+		         static_cast<unsigned long long>(async_waits), static_cast<double>(async_wait_us) / 1000.0,
+		         static_cast<unsigned long long>(async_inline), static_cast<unsigned long long>(async_fallbacks),
+		         static_cast<unsigned long long>(async_unskippable), async_jobs.size());
+		async_submitted = async_skipped_draws = async_waits = async_wait_us = async_inline = async_fallbacks =
+		    async_used = async_unskippable = 0;
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -1049,6 +1192,9 @@ struct PipelineCache::ProgramCache {
 
 		if (SkipShaderRequested(params.hash) || LiveSkipRequested(params.hash, stage)) {
 			return ShaderProgram {};
+		}
+		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			MaybeReportAsync();
 		}
 		BufferCache::SetReadbackStatsShader(params.hash);
 		DrawDiff::t_shader = params.hash;
@@ -1177,6 +1323,62 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		// KYTY_ASYNC_PS: a brand-new pixel program is translated on a worker (see the struct comment).
+		std::shared_ptr<AsyncTranslateJob> async_job;
+		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			if (entry == programs.end()) {
+				auto found = async_jobs.find(lookup_key);
+				if (found != async_jobs.end()) {
+					async_job = found->second;
+				} else if (AsyncPsEnabled() && t_async_ps_may_skip && params.back_code.empty() &&
+				           !call_targets.contains(params.hash) && !async_sync_only.contains(lookup_key)) {
+					StartAsyncWorkers();
+					async_job            = std::make_shared<AsyncTranslateJob>();
+					async_job->code.assign(params.code.begin(), params.code.end());
+					async_job->user_data.assign(user_data.begin(), user_data.end());
+					async_job->pixel_info       = input_info;
+					async_job->pixel_info.stage = {};
+					auto& o            = async_job->options;
+					o.stage            = stage;
+					o.shader_hash      = params.hash;
+					o.user_data        = async_job->user_data;
+					o.wave_size        = input_info.wave_size;
+					o.dump_ir          = false;
+					o.early_dump       = false;
+					o.dump_label       = "ShaderRecompiler PS (async)";
+					o.non_fatal        = ShaderFailureNonFatal();
+					o.bindless_images  = bindless_images;
+					o.input_info.pixel = &async_job->pixel_info;
+					// No read_code: subroutine calls stay unsupported here and are redone inline.
+					async_jobs.emplace(lookup_key, async_job);
+					{
+						std::lock_guard lock(async_mutex);
+						async_queue.push_back(async_job);
+					}
+					async_wake.notify_one();
+					async_submitted++;
+				}
+				if (async_job == nullptr && AsyncPsEnabled() && !t_async_ps_may_skip) {
+					async_unskippable++;
+				}
+				if (async_job != nullptr) {
+					if (async_job->state.load(std::memory_order_acquire) != 2 && t_async_ps_may_skip &&
+					    AsyncPsEnabled()) {
+						async_skipped_draws++;
+						t_async_ps_pending = true;
+						return ShaderProgram {};
+					}
+					FinishAsyncJob(*async_job);
+					async_jobs.erase(lookup_key);
+					if (async_job->result.unsupported || !async_job->result.call_target_user_data.empty()) {
+						async_fallbacks++;
+						async_sync_only.insert(lookup_key);
+						async_job.reset();
+					}
+				}
+			}
+		}
+
 		// A program (or permutation) this session has not built yet: recompiled on the GPU
 		// thread. Wolverine run 54: the 0.3-0.7 s frames while turning were spent here.
 		prog_phase.reset();
@@ -1229,7 +1431,11 @@ struct PipelineCache::ProgramCache {
 		const auto compile_code = lookup_key.function_code.empty()
 		                              ? params.code
 		                              : std::span<const uint32_t>(lookup_key.function_code);
-		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+		auto translated = async_job != nullptr ? std::move(async_job->result)
+		                                       : ShaderRecompiler::TranslateProgram(compile_code, options);
+		if (async_job != nullptr) {
+			async_used++;
+		}
 		if (!translated.unsupported && !translated.call_target_user_data.empty() &&
 		    call_targets.try_emplace(params.hash, translated.call_target_user_data).second) {
 			for (const auto index: translated.call_target_user_data) {
@@ -1305,6 +1511,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
+		StopAsyncWorkers();
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -1739,8 +1946,15 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	t_async_ps_pending = false;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		if (!result.pixel && t_async_ps_pending) {
+			// KYTY_ASYNC_PS: skipped while its pixel program translates; no VS lookup (it would
+			// build a permutation for a push-data layout without the pixel stage).
+			t_async_ps_pending = false;
+			return {};
+		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);

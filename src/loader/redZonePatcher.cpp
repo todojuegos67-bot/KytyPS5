@@ -149,10 +149,13 @@ struct InstructionRewrite {
 // copy computes the same accurate estimate inline (sqrt, then 1/x; specials match: +-0 -> +-inf, inf -> 0,
 // negative -> default NaN, NaN quieted), saving a scratch YMM below the red zone. Only difference: a
 // denormal input with MXCSR.DAZ clear gives a finite result instead of inf.
+// wolv-perf-1111b: default ON (KYTY_NATIVE_RSQRT=0 restores the trap). The 11-11 log ran 0.3-2.6 million
+// trapped VRSQRTPS per 5 s in the slow area ([traps] line), each a host exception on a guest thread; the
+// inline copy computes the same accurate estimate as the trap handler (float sqrt + div instead of double).
 static bool NativeRsqrtEnabled() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_NATIVE_RSQRT");
-		return v != nullptr && v[0] == '1';
+		return v == nullptr || v[0] != '0';
 	}();
 	return on;
 }

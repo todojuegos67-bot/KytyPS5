@@ -976,7 +976,22 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	{
 		PhaseStats::Scope phase {PhaseStats::PhStateShaders};
+		// KYTY_ASYNC_PS: only a draw that writes no depth or stencil (registers, conservative: any
+		// write/clear/copy enable) may be skipped while its new pixel program translates.
+		const auto& hw = buffer.GetRegisters();
+		const auto& dc = hw.GetDepthControl();
+		const auto& rc = hw.GetRenderControl();
+		// KYTY_ASYNC_PS=2 (opt-in) also skips depth/stencil writers: faster, but a cached shadow
+		// map can keep a missing caster (see KYTY_DEFER_DEPTH_DRAWS).
+		static auto& async_ps = Common::LiveSwitches::Get("KYTY_ASYNC_PS", 1);
+		const auto   async_mode = async_ps.load(std::memory_order_relaxed);
+		t_async_ps_may_skip = state.ps_active && async_mode != 0 &&
+		                      (async_mode == 2 ||
+		                       (!dc.z_write_enable && !dc.stencil_enable && !rc.depth_clear_enable &&
+		                        !rc.stencil_clear_enable && !rc.copy_depth_to_color &&
+		                        !rc.copy_stencil_to_color));
 		RefreshShaders(buffer, draw, color_output_mask, state);
+		t_async_ps_may_skip = false;
 	}
 	PhaseStats::Scope targets_phase {PhaseStats::PhStateTargets};
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
