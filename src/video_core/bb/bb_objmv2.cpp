@@ -116,7 +116,12 @@ struct State {
     std::unordered_map<u64, u32> use_cur, use_prev;
     u32 shared_min = 48;
     u64 sec_shared = 0;
-    u64 sec_ui_skipped = 0; // pipeline lookups refused as screen-space (depth test Always/Never)
+    u64 sec_ui_skipped = 0;
+    // bb-149-objmv: the 149 composes at its HUD start or at the present, which can come after
+    // the guest flip: the frame's state now rolls over at the next frame's first motion draw
+    // (flip_pending), and v2 hands back to v1 when it composes nothing for 2 s of 3D frames.
+    bool flip_pending = false;
+    u32 sec_composed = 0, sec_motion_frames = 0, bad_secs = 0; // pipeline lookups refused as screen-space (depth test Always/Never)
     u64 sec_camera_only = 0, sec_dedupe = 0, sec_bytes_hashed = 0, sec_bytes_copied = 0;
     bool history = false; // map_prev is exactly the previous frame
     bool reset_pending = false;
@@ -454,6 +459,8 @@ bool Init(const Vulkan::Instance& instance) {
     return true;
 }
 
+void Rollover(); // bb-149-objmv: the frame rollover (deferred from OnFlip)
+
 bool Active() {
     return g.ready;
 }
@@ -563,6 +570,7 @@ bool IsMotionKey(u32 mrt_mask, const Shader::PsColorBuffer& cb7) {
 }
 
 void Attach(Vulkan::Scheduler& scheduler, Vulkan::RenderState& state) {
+    if (g.ready && g.flip_pending) Rollover();
     if (!g.ready || state.num_color_attachments <= Attachment) return;
     // bb-149-objmv: the scene's render size from the 149 plan.
     const auto& plan = BB::Upscale::CurrentPlan();
@@ -631,6 +639,7 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
             u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase) {
     push.objmv_flags = 0;
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
+    if (g.ready && g.flip_pending) Rollover();
     if (!g.ready || ui_phase) return;
     const auto t0 = std::chrono::steady_clock::now();
     ++g.sec_draws;
@@ -804,6 +813,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     if (!g.ready || g.composed || !g.cleared || !g.image) return;
     if (render.width > g.width || render.height > g.height) return;
     g.composed = true;
+    ++g.sec_composed;
     const u32 slot = g.slot;
     ReadStats(slot);
     const bool stat = g.stat_frame;
@@ -920,9 +930,15 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
 
 void OnFlip() {
     if (!g.ready) return;
+    g.flip_pending = true;
+}
+
+void Rollover() {
+    g.flip_pending = false;
     ++g.frame;
     ++g.sec_frames;
     const bool had_pass = g.cleared;
+    if (had_pass) ++g.sec_motion_frames;
     if (had_pass && !g.composed) {
         ++g.sec_not_composed;
         if (!g.logged_not_composed) {
@@ -969,6 +985,25 @@ void OnFlip() {
         g_stat_period = period; // a stored colour without its check frame is simply unused
     }
     g.t0 = now;
+    {
+        static const bool fallback = !EnvOff("BB_OBJMV2_FALLBACK");
+        if (g.sec_motion_frames >= 5 && g.sec_composed == 0) {
+            ++g.bad_secs;
+        } else if (g.sec_composed != 0) {
+            g.bad_secs = 0;
+        }
+        Log(fmt::format("[objmv-149] composed {} of {} frames with motion draws this second{}",
+                        g.sec_composed, g.sec_motion_frames,
+                        g.bad_secs ? fmt::format(" ({} s in a row without a compose)", g.bad_secs)
+                                   : std::string()));
+        g.sec_composed = g.sec_motion_frames = 0;
+        if (fallback && g.bad_secs >= 2) {
+            g.ready = false;
+            Log("[objmv-149] v2 composed no frame for 2 s of 3D frames: off for this session, the "
+                "149's own object vectors (v1) take over (BB_OBJMV2_FALLBACK=0 keeps v2)");
+            return;
+        }
+    }
     const double cov = g.sec_px_all ? 100.0 * double(g.sec_px_obj) / double(g.sec_px_all) : 0.0;
     std::string cats;
     for (u32 c = 0; c < CatCount; ++c) {
