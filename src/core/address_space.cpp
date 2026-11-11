@@ -160,8 +160,14 @@ struct AddressSpace::Impl {
             }
         }
 
-        if (const char* up = std::getenv("BB_UPSCALER");
-            up != nullptr && (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa")) {
+        // NGX (DLSS, DLSS-G through bbport_dlss.dll, DLSS 5) needs the hole with any upscaler.
+        const char* up = std::getenv("BB_UPSCALER");
+        const char* fg = std::getenv("BB_FG");
+        const char* d5 = std::getenv("BB_DLSS5");
+        const bool ngx_fg = fg != nullptr && std::string_view(fg).starts_with("dlss");
+        const bool dlss5 = d5 != nullptr && *d5 != '\0' && std::atoi(d5) > 0;
+        if (ngx_fg || dlss5 ||
+            (up != nullptr && (std::string_view(up) == "dlss" || std::string_view(up) == "dlaa"))) {
             constexpr u64 DlssUserMax = 0x8000000000ULL;
             if (supported_user_max > DlssUserMax) {
                 supported_user_max = DlssUserMax;
