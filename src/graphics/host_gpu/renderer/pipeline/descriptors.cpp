@@ -42,6 +42,9 @@
 #include <cstdio>
 #include <unordered_map>
 #include <atomic>
+#include <array>
+#include <chrono>
+#include <memory>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
@@ -611,6 +614,69 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
+// KYTY_TEXTURE_DESC_MEMO (see ResolveTexture).
+struct TextureDescMemoEntry {
+	bool                                  valid        = false;
+	const ShaderRecompiler::IR::ImageResource* resource_ptr = nullptr;
+	ShaderRecompiler::IR::ImageResource   resource;
+	ShaderRecompiler::IR::DescriptorValue value;
+	TextureCache::ImageDesc               desc;
+	bool                                  shader_conversion = false;
+	vk::Format                            pixel_format      = vk::Format::eUndefined;
+	vk::Format                            view_format       = vk::Format::eUndefined;
+	uint64_t                              total_size        = 0;
+};
+struct TextureDescMemoStats {
+	uint64_t hits = 0, misses = 0, mismatches = 0;
+};
+static thread_local TextureDescMemoStats g_texture_desc_memo_stats;
+
+static TextureDescMemoEntry& TextureDescMemoSlot(const ShaderRecompiler::IR::ImageResource* resource,
+                                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+	constexpr size_t Entries = 4096;
+	static thread_local std::unique_ptr<std::array<TextureDescMemoEntry, Entries>> table;
+	if (table == nullptr) {
+		table = std::make_unique<std::array<TextureDescMemoEntry, Entries>>();
+	}
+	uint64_t h = reinterpret_cast<uintptr_t>(resource) * 0x9e3779b97f4a7c15ull;
+	for (uint32_t i = 0; i < value.dword_count && i < value.dwords.size(); i++) {
+		h = (h ^ value.dwords[i]) * 0x100000001b3ull;
+	}
+	h ^= h >> 29u;
+	return (*table)[h & (Entries - 1u)];
+}
+
+static bool SameTextureDesc(const TextureCache::ImageDesc& a, const TextureCache::ImageDesc& b, bool rest) {
+	const auto& x = a.info;
+	const auto& y = b.info;
+	return rest && a.type == b.type && a.view_info == b.view_info && x.data.address == y.data.address &&
+	       x.data.size == y.data.size && x.stencil.address == y.stencil.address && x.stencil.size == y.stencil.size &&
+	       x.metadata.kind == y.metadata.kind && x.metadata.range.address == y.metadata.range.address &&
+	       x.metadata.range.size == y.metadata.range.size && x.metadata.dcc_alpha_msb == y.metadata.dcc_alpha_msb &&
+	       x.htile_clear_mask == y.htile_clear_mask && x.pixel_format == y.pixel_format &&
+	       x.guest_format == y.guest_format && x.type == y.type && x.extent == y.extent &&
+	       x.resources == y.resources && x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
+	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.bgra16 == y.bgra16 &&
+	       x.mip_layout == y.mip_layout;
+}
+
+static void NoteTextureDescMemo() {
+	static thread_local std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) {
+		return;
+	}
+	last = now;
+	auto& st = g_texture_desc_memo_stats;
+	::printf("Texture desc memo (5 s, KYTY_TEXTURE_DESC_MEMO=%lld): %llu image bindings reused their description, %llu "
+	         "computed; verify mismatches %llu\n",
+	         static_cast<long long>(Common::LiveSwitches::Get("KYTY_TEXTURE_DESC_MEMO", 1).load()),
+	         static_cast<unsigned long long>(st.hits), static_cast<unsigned long long>(st.misses),
+	         static_cast<unsigned long long>(st.mismatches));
+	std::fflush(stdout);
+	st = {};
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -628,6 +694,54 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
+	}
+
+	// The part after the image description: the lookup and the checks against the image found.
+	const auto finish = [&](TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
+	                        vk::Format view_format, uint64_t total_size) -> TextureBinding {
+		auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+		auto*      image               = &texture_cache.GetImage(id);
+		const bool stencil_association = static_cast<bool>(image->depth_id);
+		if (stencil_association) {
+			id    = image->depth_id;
+			image = &texture_cache.GetImage(id);
+		} else if (image->info.IsDepth()) {
+			if (storage) {
+				EXIT("depth target cannot be bound as a storage image\n");
+			}
+			ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, total_size);
+		} else if (storage) {
+			ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+		} else {
+			(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+			                             descriptor.DstSelXYZW());
+		}
+		return {id, nullptr, std::move(desc)};
+	};
+	// wolv-draw-1111: KYTY_TEXTURE_DESC_MEMO (live, default 1; 0 = old; 2 = compute every time
+	// and compare with the memo). Everything below up to FindImage is a function of the image
+	// resource (the program's, stable while the program lives) and the T# words alone: tile pitch,
+	// total size, DCC size, mip layout, view info. Every draw redid it for every image it binds.
+	// A direct-mapped memo (4096 entries) keyed on the resource and the T# keeps the result;
+	// the image lookup and the checks against the image found still run every time.
+	static auto& desc_memo_switch = Common::LiveSwitches::Get("KYTY_TEXTURE_DESC_MEMO", 1);
+	const auto   desc_memo_mode   = desc_memo_switch.load(std::memory_order_relaxed);
+	TextureDescMemoEntry* memo_slot = nullptr;
+	bool                  memo_verify = false;
+	if (desc_memo_mode != 0) {
+		memo_slot = &TextureDescMemoSlot(&resource, value);
+		if (memo_slot->valid && memo_slot->resource_ptr == &resource && memo_slot->value == value &&
+		    memo_slot->resource == resource) {
+			g_texture_desc_memo_stats.hits++;
+			if (desc_memo_mode == 1) {
+				NoteTextureDescMemo();
+				return finish(memo_slot->desc, memo_slot->shader_conversion, memo_slot->pixel_format,
+				              memo_slot->view_format, memo_slot->total_size);
+			}
+			memo_verify = true;
+		} else {
+			g_texture_desc_memo_stats.misses++;
+		}
 	}
 
 	const auto address         = descriptor.Base40();
@@ -769,24 +883,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
-	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association) {
-		id    = image->depth_id;
-		image = &texture_cache.GetImage(id);
-	} else if (image->info.IsDepth()) {
-		if (storage) {
-			EXIT("depth target cannot be bound as a storage image\n");
+	if (memo_slot != nullptr) {
+		if (memo_verify && !SameTextureDesc(memo_slot->desc, desc, memo_slot->shader_conversion == shader_conversion &&
+		                                                          memo_slot->pixel_format == pixel_format &&
+		                                                          memo_slot->view_format == view_format &&
+		                                                          memo_slot->total_size == size.size)) {
+			g_texture_desc_memo_stats.mismatches++;
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
-	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
-	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
-		                             descriptor.DstSelXYZW());
+		memo_slot->valid             = true;
+		memo_slot->resource_ptr      = &resource;
+		memo_slot->resource          = resource;
+		memo_slot->value             = value;
+		memo_slot->desc              = desc;
+		memo_slot->shader_conversion = shader_conversion;
+		memo_slot->pixel_format      = pixel_format;
+		memo_slot->view_format       = view_format;
+		memo_slot->total_size        = size.size;
+		NoteTextureDescMemo();
 	}
-	return {id, nullptr, std::move(desc)};
+	return finish(std::move(desc), shader_conversion, pixel_format, view_format, size.size);
 }
 
 // Wolverine's moon (title workaround, live, default off). A sampler the recompiler could not
