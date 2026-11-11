@@ -42,6 +42,30 @@ public:
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
 	            uint32_t wave_size);
 
+	// wolv-draw-1111: Expand without copying the result. `code` is shared with the expander's
+	// cache (null when the shader has no calls or the expansion failed); hash_lo/hash_hi are
+	// XXH3-128 of it, computed once per expansion. code_hash, when nonzero, is the registered
+	// hash of `code` (the program cache keys programs on it): the same address, size and hash
+	// skip the word-by-word code comparison. fast = true also reuses the call-target resolution
+	// while the user-data words it consulted and every word it read are unchanged.
+	struct Result {
+		std::shared_ptr<const std::vector<uint32_t>> code;
+		uint64_t                                     hash_lo = 0;
+		uint64_t                                     hash_hi = 0;
+	};
+	bool ExpandShared(std::span<const uint32_t> code, uint64_t base,
+	                  std::span<const uint32_t> user_data, const ShaderCodeReader& read,
+	                  uint32_t wave_size, uint64_t code_hash, bool fast, Result& result,
+	                  std::string& reason);
+
+	// Counters since the last call (Thread_Gpu only).
+	struct Stats {
+		uint64_t calls = 0, no_calls = 0, code_compares = 0, code_hash_skips = 0;
+		uint64_t resolve_full = 0, resolve_reused = 0, expansions_reused = 0, expansions_built = 0;
+		uint64_t resolve_words_checked = 0, callee_words_checked = 0;
+	};
+	Stats TakeStats();
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

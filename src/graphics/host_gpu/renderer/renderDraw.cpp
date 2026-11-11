@@ -1244,14 +1244,17 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
-	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
-	}
-	if (state.ps_active) {
-		if (!bindings.pixel) bindings.pixel.emplace();
-		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-		descriptor_stages[stage_count++] = &*bindings.pixel;
+	{
+		PhaseStats::Scope prepare_phase {PhaseStats::PhBindPrepare};
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+			descriptor_stages[stage_count++] = &bindings.vertex[i];
+		}
+		if (state.ps_active) {
+			if (!bindings.pixel) bindings.pixel.emplace();
+			PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
+			descriptor_stages[stage_count++] = &*bindings.pixel;
+		}
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
@@ -1355,7 +1358,10 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u, ps_hash);
 	}
+	std::optional<PhaseStats::Scope> commit_phase {std::in_place, PhaseStats::PhCommitBindings};
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	commit_phase.reset();
+	commit_phase.emplace(PhaseStats::PhCommitDynamic);
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
@@ -1382,6 +1388,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u, ps_hash);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
+	commit_phase.reset();
 	// KYTY_STATE_CACHE: the same pipeline bound again is a no-op. GetDynamicState().valid is set
 	// only while the cache is on (SetGraphicsDynamicParams above).
 	if (auto& cached = buffer.GetDynamicState();

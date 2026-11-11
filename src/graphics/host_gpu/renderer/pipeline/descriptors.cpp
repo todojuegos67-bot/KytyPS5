@@ -1,3 +1,4 @@
+#include "graphics/phaseStats.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
@@ -36,6 +37,7 @@
 #include <unordered_set>
 #include <mutex>
 #include <algorithm>
+#include <optional>
 #include <cinttypes>
 #include <cstdio>
 #include <unordered_map>
@@ -1435,6 +1437,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
+	std::optional<PhaseStats::Scope> phase {std::in_place, PhaseStats::PhBindFind};
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
@@ -1442,6 +1445,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
+	phase.reset();
+	phase.emplace(PhaseStats::PhBindImages);
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
@@ -1465,6 +1470,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	phase.reset();
+	phase.emplace(PhaseStats::PhBindBuffers);
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}

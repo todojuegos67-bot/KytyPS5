@@ -13,6 +13,8 @@
 #include <set>
 #include <unordered_map>
 
+#include <xxhash.h>
+
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
@@ -651,73 +653,220 @@ struct ShaderFunctionExpander::Impl {
 		bool                  ok = false;
 		std::string           reason;
 		std::vector<uint32_t> code;
+		// ExpandShared: the same code, shared, and its XXH3-128.
+		std::shared_ptr<const std::vector<uint32_t>> shared;
+		uint64_t                                     hash_lo = 0, hash_hi = 0;
+	};
+	// One ResolveCalls result and everything it consulted (wolv-draw-1111, ExpandShared fast).
+	struct Resolution {
+		uint64_t                                  base            = 0;
+		uint32_t                                  wave_size       = 0;
+		size_t                                    user_data_count = 0;
+		std::vector<std::pair<uint32_t, uint32_t>> consulted; // user-data register, value
+		Reads                                     reads;
+		Reads                                     failed;
+		bool                                      ok = false;
+		std::string                               reason;
+		std::vector<CallSite>                     sites;
+		std::set<uint32_t>                        dependencies;
+		std::shared_ptr<Expansion>                expansion; // the last expansion found for it
 	};
 	struct Shader {
-		ShaderAnalysis         analysis;
-		std::vector<Expansion> expansions; // most recent last
+		ShaderAnalysis                          analysis;
+		uint64_t                                code_hash = 0; // registered hash, 0 unknown
+		std::vector<std::shared_ptr<Expansion>> expansions;  // most recent last
+		std::vector<Resolution>                 resolutions; // most recent last
 	};
-	static constexpr size_t MaxExpansions = 8;
+	static constexpr size_t MaxExpansions  = 8;
+	static constexpr size_t MaxResolutions = 8;
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;
+	Stats                                stats;
 
-	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
-		for (const auto& [address, words]: expansion.reads) {
+	bool StillReads(const Reads& reads, const Reads& failed, const ShaderCodeReader& read,
+	                uint64_t& words_checked) {
+		for (const auto& [address, words]: reads) {
 			scratch.resize(words.size());
+			words_checked += words.size();
 			if (!read(address, scratch) || scratch != words) return false;
 		}
-		for (const auto& [address, words]: expansion.failed) {
+		for (const auto& [address, words]: failed) {
 			scratch.resize(words.size());
 			if (read(address, scratch)) return false;
 		}
 		return true;
+	}
+	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
+		uint64_t words = 0;
+		return StillReads(expansion.reads, expansion.failed, read, words);
+	}
+
+	Shader& Analyzed(std::span<const uint32_t> code, uint64_t code_hash) {
+		auto& shader = shaders[reinterpret_cast<uint64_t>(code.data())];
+		if (code_hash != 0 && shader.code_hash == code_hash &&
+		    shader.analysis.code.size() == code.size()) {
+			stats.code_hash_skips++;
+			return shader;
+		}
+		stats.code_compares++;
+		if (shader.analysis.code.size() != code.size() ||
+		    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
+			shader = {};
+			AnalyzeShader(code, shader.analysis);
+		}
+		shader.code_hash = code_hash;
+		return shader;
+	}
+
+	static void Share(Expansion& expansion) {
+		if (expansion.shared == nullptr && !expansion.code.empty()) {
+			expansion.shared = std::make_shared<const std::vector<uint32_t>>(expansion.code);
+			const auto hash  = XXH3_128bits(expansion.code.data(),
+			                                expansion.code.size() * sizeof(uint32_t));
+			expansion.hash_lo = hash.low64;
+			expansion.hash_hi = hash.high64;
+		}
 	}
 };
 
 ShaderFunctionExpander::ShaderFunctionExpander(): m_impl(std::make_unique<Impl>()) {}
 ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 
+ShaderFunctionExpander::Stats ShaderFunctionExpander::TakeStats() {
+	const auto stats = m_impl->stats;
+	m_impl->stats    = {};
+	return stats;
+}
+
 bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
                                     std::string& reason, uint32_t wave_size) {
-	expanded.clear();
+	Result     result;
+	const bool ok = ExpandShared(code, base, user_data, read, wave_size, 0, false, result, reason);
+	if (result.code != nullptr) {
+		expanded = *result.code;
+	} else {
+		expanded.clear();
+	}
+	return ok;
+}
+
+bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64_t base,
+                                          std::span<const uint32_t> user_data,
+                                          const ShaderCodeReader& read, uint32_t wave_size,
+                                          uint64_t code_hash, bool fast, Result& result,
+                                          std::string& reason) {
+	result = {};
 	reason.clear();
+	m_impl->stats.calls++;
 	if (wave_size != 32u && wave_size != 64u) {
 		reason = "shader calls require a known wave size";
 		return false;
 	}
-	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
-	if (shader.analysis.code.size() != code.size() ||
-	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
-		shader = {};
-		AnalyzeShader(code, shader.analysis);
-	}
+	auto&       shader   = m_impl->Analyzed(code, code_hash);
 	const auto& analysis = shader.analysis;
-	if (!analysis.has_calls) return true;
+	if (!analysis.has_calls) {
+		m_impl->stats.no_calls++;
+		return true;
+	}
 	if (analysis.has_setpc) {
 		reason = "shader calls combined with indirect branches are unsupported";
 		return false;
 	}
-	std::vector<CallSite> sites;
-	std::set<uint32_t>    dependencies;
-	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
-		return false;
-	}
-	for (const auto& expansion: shader.expansions) {
-		if (expansion.base == base && expansion.wave_size == wave_size &&
-		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
-		    m_impl->StillReads(expansion, read)) {
-			expanded = expansion.code;
-			reason   = expansion.reason;
-			return expansion.ok;
+	const auto finish = [&](const std::shared_ptr<Impl::Expansion>& expansion) {
+		Impl::Share(*expansion);
+		result.code    = expansion->shared;
+		result.hash_lo = expansion->hash_lo;
+		result.hash_hi = expansion->hash_hi;
+		reason         = expansion->reason;
+		return expansion->ok;
+	};
+	// Fast: a resolution whose consulted user-data words and reads are unchanged gives the same
+	// sites, dependencies and outcome (ResolveCalls is a function of the code, base, wave size,
+	// user-data count, those words and those reads).
+	Impl::Resolution* reused = nullptr;
+	if (fast) {
+		for (auto it = shader.resolutions.rbegin(); it != shader.resolutions.rend(); ++it) {
+			auto& r = *it;
+			if (r.base != base || r.wave_size != wave_size || r.user_data_count != user_data.size()) {
+				continue;
+			}
+			bool same = true;
+			for (const auto& [reg, value]: r.consulted) {
+				if (reg >= user_data.size() || user_data[reg] != value) {
+					same = false;
+					break;
+				}
+			}
+			if (same && m_impl->StillReads(r.reads, r.failed, read, m_impl->stats.resolve_words_checked)) {
+				reused = &r;
+				break;
+			}
 		}
 	}
-	Impl::Expansion expansion;
+	Impl::Resolution fresh;
+	if (reused != nullptr) {
+		m_impl->stats.resolve_reused++;
+		if (!reused->ok) {
+			reason = reused->reason;
+			return false;
+		}
+		if (reused->expansion != nullptr &&
+		    m_impl->StillReads(reused->expansion->reads, reused->expansion->failed, read,
+		                       m_impl->stats.callee_words_checked)) {
+			m_impl->stats.expansions_reused++;
+			return finish(reused->expansion);
+		}
+	} else {
+		m_impl->stats.resolve_full++;
+		fresh.base            = base;
+		fresh.wave_size       = wave_size;
+		fresh.user_data_count = user_data.size();
+		const ShaderCodeReader recording = [&](uint64_t address, std::span<uint32_t> words) {
+			const bool ok = read(address, words);
+			(ok ? fresh.reads : fresh.failed)
+			    .emplace_back(address, std::vector<uint32_t>(words.begin(), words.end()));
+			return ok;
+		};
+		fresh.ok = ResolveCalls(analysis, base, user_data, fast ? recording : read, wave_size,
+		                        fresh.sites, fresh.dependencies, fresh.reason);
+		if (fast) {
+			for (const auto reg: fresh.dependencies) {
+				fresh.consulted.emplace_back(reg, reg < user_data.size() ? user_data[reg] : 0u);
+			}
+			if (shader.resolutions.size() >= Impl::MaxResolutions) {
+				shader.resolutions.erase(shader.resolutions.begin());
+			}
+			shader.resolutions.push_back(std::move(fresh));
+			reused = &shader.resolutions.back();
+		} else {
+			reused = &fresh;
+		}
+		if (!reused->ok) {
+			reason = reused->reason;
+			return false;
+		}
+	}
+	const auto& sites        = reused->sites;
+	const auto& dependencies = reused->dependencies;
+	for (const auto& expansion: shader.expansions) {
+		if (expansion->base == base && expansion->wave_size == wave_size &&
+		    expansion->user_data_count == user_data.size() && expansion->sites == sites &&
+		    m_impl->StillReads(*expansion, read)) {
+			m_impl->stats.expansions_reused++;
+			if (fast) reused->expansion = expansion;
+			return finish(expansion);
+		}
+	}
+	m_impl->stats.expansions_built++;
+	auto  made      = std::make_shared<Impl::Expansion>();
+	auto& expansion = *made;
 	expansion.base            = base;
 	expansion.wave_size       = wave_size;
 	expansion.user_data_count = user_data.size();
-	expansion.sites           = std::move(sites);
+	expansion.sites           = sites;
 	const ShaderCodeReader recording = [&](uint64_t address, std::span<uint32_t> words) {
 		const bool ok = read(address, words);
 		(ok ? expansion.reads : expansion.failed)
@@ -727,13 +876,12 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
 	                              wave_size, expansion.code, expansion.reason);
 	MergeReads(expansion.reads);
-	expanded = expansion.code;
-	reason   = expansion.reason;
 	if (shader.expansions.size() >= Impl::MaxExpansions) {
 		shader.expansions.erase(shader.expansions.begin());
 	}
-	shader.expansions.push_back(std::move(expansion));
-	return shader.expansions.back().ok;
+	shader.expansions.push_back(made);
+	if (fast) reused->expansion = made;
+	return finish(made);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

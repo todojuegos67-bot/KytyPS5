@@ -676,9 +676,19 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t> static_state;
 		// Exact expanded code includes callees and their original return-PC constants.
 		// A different target/body must not reuse a program compiled for an earlier call.
-		std::vector<uint32_t> function_code;
+		// wolv-draw-1111: shared with the expander's cache and compared by its XXH3-128 and
+		// size (was a copy compared word by word, up to 128K words, on every compute lookup).
+		std::shared_ptr<const std::vector<uint32_t>> function_code;
+		uint64_t                                     function_hash_lo = 0;
+		uint64_t                                     function_hash_hi = 0;
+		uint32_t                                     function_size    = 0;
 
-		bool operator==(const ProgramKey&) const = default;
+		bool operator==(const ProgramKey& other) const {
+			return stage == other.stage && hash == other.hash &&
+			       user_data_count == other.user_data_count && code_size == other.code_size &&
+			       function_size == other.function_size && function_hash_lo == other.function_hash_lo &&
+			       function_hash_hi == other.function_hash_hi && static_state == other.static_state;
+		}
 	};
 
 	struct Permutation {
@@ -699,6 +709,14 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		uint64_t                                     last_use = 0;
 		uint64_t                                     input_hash = 0;
+	};
+	// A snapshot word: kind 0/1/2 = buffers/images/samplers[index].dwords[dword], 3 = flattened_srt[index].
+	struct PatchPosition {
+		uint8_t  kind  = 0;
+		uint8_t  word  = 0; // the user-data word it copies
+		uint16_t dword = 0;
+		uint32_t index = 0;
+		bool     operator==(const PatchPosition&) const = default;
 	};
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
@@ -727,8 +745,318 @@ struct PipelineCache::ProgramCache {
 		// lookups still go straight to MaterializeResources.
 		uint32_t                                     bypass_window = 0, bypass_window_hits = 0;
 		uint32_t                                     bypass_left   = 0;
+		// KYTY_MEMO_PATCH: the last full evaluation and what it learned (see TryPatch).
+		struct Patch {
+			bool                                         valid = false;
+			bool                                         banned = false;
+			std::vector<uint32_t>                        key; // all user-data words
+			uint64_t                                     shader_base = 0;
+			std::array<uint32_t, 3>                      workgroup_count {};
+			std::array<uint32_t, 3>                      workgroup_size {};
+			ShaderReadChunks::ReadLog                    log;
+			ShaderRecompiler::IR::ResourceSnapshot       resources;
+			ShaderRecompiler::IR::ResourceSpecialization specialization;
+			// Per user-data word: consistent observations (word changed, every snapshot change
+			// it caused was a verbatim copy of it, nothing else changed); 255 = never patch it.
+			std::array<uint8_t, 64>                      learned {};
+			// Snapshot words that are verbatim copies of a user-data word.
+			std::vector<PatchPosition>                   positions;
+			uint32_t                                     since_check = 0;
+		} patch;
 	};
 	SourceEntry* memo_worst = nullptr;
+
+	// --- KYTY_MEMO_PATCH (wolv-draw-1111) -------------------------------------------------------
+	// Log 11-11: ~120K memo misses per 5 s at 9-10 us, most of them programs whose user data
+	// changes on every draw (0xc8202066634a4c62: words 8, 10, 20 new on each miss, ring-allocated
+	// constants). When such a word only ever lands verbatim in the snapshot (a V# base or size
+	// built from user data, a flattened-SRT copy) the snapshot of the new draw is the previous full
+	// evaluation's with those words replaced. Learned per program and word: after a full
+	// evaluation, the previous one is compared with it; a word that changed counts as consistent
+	// when every snapshot word that changed held that user-data word before and after, the read
+	// log (addresses, sizes and values), the specialization and every other snapshot field are
+	// identical. A word with 2 consistent observations and no inconsistent one is patchable; one
+	// inconsistent observation bans the word for good. A lookup whose changed words (among those
+	// the plan reads) are all patchable, whose shader base and dispatch size are the previous
+	// evaluation's and whose logged guest words all read the same, copies that evaluation and
+	// patches the words. Every 32nd patch is also evaluated in full and compared; a mismatch bans
+	// the program (then the full result is used). KYTY_MEMO_PATCH=2 compares every patch.
+	// 0 = old path. Log: "Memo patch (5 s)".
+	static int64_t MemoPatchMode() {
+		static auto& mode = Common::LiveSwitches::Get("KYTY_MEMO_PATCH", 1);
+		return mode.load(std::memory_order_relaxed);
+	}
+	static constexpr uint8_t PatchLearnedNeeded = 2;
+	static constexpr uint8_t PatchBanned        = 255;
+	uint64_t patch_hits = 0, patch_checks = 0, patch_check_mismatch = 0, patch_verify_mismatch = 0;
+	uint64_t patch_no_base = 0, patch_unlearned = 0, patch_reads_changed = 0, patch_banned_programs = 0;
+	uint64_t patch_obs_ok = 0, patch_obs_log = 0, patch_obs_spec = 0, patch_obs_other = 0, patch_obs_unexplained = 0;
+	uint64_t patch_obs_many = 0, patch_obs_memory = 0;
+	std::chrono::steady_clock::time_point patch_report = std::chrono::steady_clock::now();
+
+	static uint32_t* PatchSlot(ShaderRecompiler::IR::ResourceSnapshot& r, const PatchPosition& p) {
+		switch (p.kind) {
+			case 0: return p.index < r.buffers.size() ? &r.buffers[p.index].dwords[p.dword & 7u] : nullptr;
+			case 1: return p.index < r.images.size() ? &r.images[p.index].dwords[p.dword & 7u] : nullptr;
+			case 2: return p.index < r.samplers.size() ? &r.samplers[p.index].dwords[p.dword & 7u] : nullptr;
+			default: return p.index < r.flattened_srt.size() ? &r.flattened_srt[p.index] : nullptr;
+		}
+	}
+	static bool SnapshotsEqual(const ShaderRecompiler::IR::ResourceSnapshot& a,
+	                           const ShaderRecompiler::IR::ResourceSnapshot& b) {
+		return a.buffer_write_extents == b.buffer_write_extents && a.bindless_heaps == b.bindless_heaps &&
+		       a.bindless_sampler_heaps == b.bindless_sampler_heaps && a.buffers == b.buffers &&
+		       a.images == b.images && a.samplers == b.samplers && a.flattened_srt == b.flattened_srt &&
+		       a.user_data == b.user_data && a.specialization_reads == b.specialization_reads &&
+		       a.uniform_fill == b.uniform_fill;
+	}
+	static bool LogShapesEqual(const ShaderReadChunks::ReadLog& a, const ShaderReadChunks::ReadLog& b) {
+		if (a.reads.size() != b.reads.size() || a.words.size() != b.words.size()) return false;
+		for (size_t i = 0; i < a.reads.size(); i++) {
+			const auto& x = a.reads[i];
+			const auto& y = b.reads[i];
+			if (x.address != y.address || x.count != y.count || x.ok != y.ok || x.first != y.first) return false;
+		}
+		return true;
+	}
+	static bool UsedWord(const SourceEntry& entry, size_t i) {
+		return !entry.used_computed || (i < entry.used_user_data.size() && entry.used_user_data[i] != 0);
+	}
+
+	// The patched result into entry.resources/specialization, or false (nothing changed).
+	bool TryPatch(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime, ShaderReadChunks& reads) {
+		auto& pt = entry.patch;
+		if (!pt.valid || pt.banned || pt.key.size() != runtime.user_data.size() ||
+		    pt.shader_base != runtime.shader_base || pt.workgroup_count != runtime.workgroup_count ||
+		    pt.workgroup_size != runtime.workgroup_size) {
+			patch_no_base++;
+			return false;
+		}
+		bool any = false;
+		for (size_t i = 0; i < pt.key.size(); i++) {
+			if (pt.key[i] == runtime.user_data[i] || !UsedWord(entry, i)) continue;
+			if (i >= pt.learned.size() || pt.learned[i] < PatchLearnedNeeded || pt.learned[i] == PatchBanned) {
+				patch_unlearned++;
+				return false;
+			}
+			any = true;
+		}
+		if (!any) {
+			patch_no_base++;
+			return false; // same inputs: the memo's case
+		}
+		if (!ReadsUnchanged(pt.log, reads)) {
+			patch_reads_changed++;
+			return false;
+		}
+		entry.resources      = pt.resources;
+		entry.specialization = pt.specialization;
+		for (const auto& position: pt.positions) {
+			if (auto* word = PatchSlot(entry.resources, position); word != nullptr) {
+				*word = runtime.user_data[position.word];
+			}
+		}
+		entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		patch_hits++;
+		return true;
+	}
+
+	// After a full evaluation (entry.resources/specialization hold it): learn from the previous
+	// one, then keep this one as the base for the next patch.
+	void LearnPatch(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                ShaderReadChunks::ReadLog& log) {
+		auto& pt = entry.patch;
+		if (pt.banned) return;
+		if (pt.valid && pt.key.size() == runtime.user_data.size() && pt.shader_base == runtime.shader_base &&
+		    pt.workgroup_count == runtime.workgroup_count && pt.workgroup_size == runtime.workgroup_size) {
+			std::array<uint32_t, 64> changed {};
+			uint32_t                 changed_count = 0;
+			bool                     too_many      = false;
+			for (size_t i = 0; i < pt.key.size(); i++) {
+				if (pt.key[i] == runtime.user_data[i] || !UsedWord(entry, i)) continue;
+				if (i >= changed.size() || changed_count >= 8) {
+					too_many = true;
+					break;
+				}
+				changed[changed_count++] = static_cast<uint32_t>(i);
+			}
+			if (too_many) {
+				patch_obs_many++;
+			} else if (changed_count != 0) {
+				const auto& oldr = pt.resources;
+				const auto& newr = entry.resources;
+				int         verdict = 0; // 0 ok, 1 log, 2 spec, 3 other, 4 unexplained
+				bool        positions_broken = false;
+				if (!LogShapesEqual(pt.log, log)) {
+					verdict = 1;
+				} else if (pt.log.words != log.words) {
+					verdict = 5; // guest memory changed between the two: learn nothing, ban nothing
+				} else if (!(pt.specialization == entry.specialization)) {
+					verdict = 2;
+				} else if (!(oldr.buffer_write_extents == newr.buffer_write_extents) ||
+				           !(oldr.bindless_heaps == newr.bindless_heaps) ||
+				           !(oldr.bindless_sampler_heaps == newr.bindless_sampler_heaps) ||
+				           !(oldr.specialization_reads == newr.specialization_reads) ||
+				           !(oldr.uniform_fill == newr.uniform_fill) || oldr.buffers.size() != newr.buffers.size() ||
+				           oldr.images.size() != newr.images.size() || oldr.samplers.size() != newr.samplers.size() ||
+				           oldr.flattened_srt.size() != newr.flattened_srt.size()) {
+					verdict = 3;
+				}
+				patch_scratch.clear();
+				const auto explain = [&](uint8_t kind, uint32_t index, uint32_t dword, uint32_t before, uint32_t after) {
+					if (before == after) return true;
+					for (uint32_t c = 0; c < changed_count; c++) {
+						const auto w = changed[c];
+						if (pt.key[w] == before && runtime.user_data[w] == after) {
+							patch_scratch.push_back({kind, static_cast<uint8_t>(w), static_cast<uint16_t>(dword), index});
+							return true;
+						}
+					}
+					return false;
+				};
+				const auto descriptors = [&](uint8_t kind, const auto& a, const auto& b) {
+					for (uint32_t i = 0; i < a.size(); i++) {
+						if (a[i].dword_count != b[i].dword_count) return false;
+						for (uint32_t d = 0; d < 8; d++) {
+							if (!explain(kind, i, d, a[i].dwords[d], b[i].dwords[d])) return false;
+						}
+					}
+					return true;
+				};
+				if (verdict == 0) {
+					bool ok = descriptors(0, oldr.buffers, newr.buffers) && descriptors(1, oldr.images, newr.images) &&
+					          descriptors(2, oldr.samplers, newr.samplers);
+					for (uint32_t i = 0; ok && i < oldr.flattened_srt.size(); i++) {
+						ok = explain(3, i, 0, oldr.flattened_srt[i], newr.flattened_srt[i]);
+					}
+					if (!ok) verdict = 4;
+				}
+				// Every position learned earlier must still copy its word, whatever changed.
+				for (const auto& position: (verdict == 0 || verdict == 4) ? pt.positions : patch_scratch_empty) {
+					const auto* word = PatchSlot(entry.resources, position);
+					if (word == nullptr || position.word >= runtime.user_data.size() ||
+					    *word != runtime.user_data[position.word]) {
+						positions_broken = true;
+						break;
+					}
+				}
+				if (positions_broken && verdict == 0) {
+					verdict = 4;
+				}
+				if (verdict == 0) {
+					patch_obs_ok++;
+					for (const auto& position: patch_scratch) {
+						if (std::ranges::find(pt.positions, position) == pt.positions.end()) {
+							pt.positions.push_back(position);
+						}
+					}
+					for (uint32_t c = 0; c < changed_count; c++) {
+						auto& learned = pt.learned[changed[c]];
+						if (learned < PatchLearnedNeeded) learned++;
+					}
+				} else if (verdict == 5) {
+					patch_obs_memory++;
+				} else {
+					(verdict == 1 ? patch_obs_log
+					              : verdict == 2 ? patch_obs_spec : verdict == 3 ? patch_obs_other : patch_obs_unexplained)++;
+					for (uint32_t c = 0; c < changed_count; c++) {
+						pt.learned[changed[c]] = PatchBanned;
+					}
+					if (positions_broken) {
+						pt.banned = true; // a learned copy stopped holding: trust nothing learned here
+						patch_banned_programs++;
+					}
+				}
+			}
+		}
+		pt.valid = true;
+		pt.key.assign(runtime.user_data.begin(), runtime.user_data.end());
+		pt.shader_base     = runtime.shader_base;
+		pt.workgroup_count = runtime.workgroup_count;
+		pt.workgroup_size  = runtime.workgroup_size;
+		pt.log             = log;
+		pt.resources       = entry.resources;
+		pt.specialization  = entry.specialization;
+	}
+	std::vector<PatchPosition> patch_scratch;
+	const std::vector<PatchPosition> patch_scratch_empty;
+
+	// Patch, check or verify; true when entry.resources/specialization hold the result.
+	bool MaterializeWithPatch(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                          ShaderReadChunks& reads, bool& patched) {
+		patched = false;
+		const auto mode = MemoPatchMode();
+		if (mode == 0) {
+			return false;
+		}
+		bool tried = false;
+		{
+			PhaseStats::Scope patch_phase {PhaseStats::PhMemoPatch};
+			tried = TryPatch(entry, runtime, reads);
+		}
+		if (!tried) {
+			return false;
+		}
+		auto& pt = entry.patch;
+		if (mode != 2 && ++pt.since_check < 32u) {
+			patched = true;
+			return true;
+		}
+		pt.since_check = 0;
+		// Check: the full evaluation must give the same.
+		patch_checks++;
+		patch_check_resources      = entry.resources;
+		patch_check_specialization = entry.specialization;
+		PhaseStats::Scope miss_phase {PhaseStats::PhMemoMiss};
+		if (!ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime, entry.resources,
+		                                                entry.specialization)) {
+			return false; // let the caller evaluate again and fail as before
+		}
+		if (!SnapshotsEqual(patch_check_resources, entry.resources) ||
+		    !(patch_check_specialization == entry.specialization)) {
+			(mode == 2 ? patch_verify_mismatch : patch_check_mismatch)++;
+			if (mode != 2) {
+				pt.banned = true;
+				patch_banned_programs++;
+			}
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1) < 16) {
+				::printf("Memo patch MISMATCH: shader 0x%016" PRIx64 " stage %u (program %s)\n",
+				         entry.resource_plan.shader_hash, static_cast<uint32_t>(entry.resource_plan.stage),
+				         mode == 2 ? "kept, verify mode" : "banned");
+			}
+		}
+		patched = true; // entry holds the full evaluation
+		return true;
+	}
+	ShaderRecompiler::IR::ResourceSnapshot       patch_check_resources;
+	ShaderRecompiler::IR::ResourceSpecialization patch_check_specialization;
+
+	void ReportPatch() {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - patch_report < std::chrono::seconds(5)) {
+			return;
+		}
+		patch_report = now;
+		::printf("Memo patch (5 s, KYTY_MEMO_PATCH=%lld): %llu lookups patched instead of evaluated (est. saved %.0f ms "
+		         "at the memo.miss us/call); declined: %llu no base/same inputs, %llu a changed word not learned, %llu "
+		         "logged reads changed; learning: %llu consistent, inconsistent %llu reads / %llu specialization / %llu "
+		         "other fields / %llu unexplained words, %llu too many words changed, %llu guest words changed; checks %llu, mismatches %llu "
+		         "(%llu programs banned), verify mismatches %llu\n",
+		         static_cast<long long>(MemoPatchMode()), static_cast<unsigned long long>(patch_hits),
+		         static_cast<double>(patch_hits) * 9.5 / 1000.0, static_cast<unsigned long long>(patch_no_base),
+		         static_cast<unsigned long long>(patch_unlearned), static_cast<unsigned long long>(patch_reads_changed),
+		         static_cast<unsigned long long>(patch_obs_ok), static_cast<unsigned long long>(patch_obs_log),
+		         static_cast<unsigned long long>(patch_obs_spec), static_cast<unsigned long long>(patch_obs_other),
+		         static_cast<unsigned long long>(patch_obs_unexplained), static_cast<unsigned long long>(patch_obs_many),
+		         static_cast<unsigned long long>(patch_obs_memory),
+		         static_cast<unsigned long long>(patch_checks), static_cast<unsigned long long>(patch_check_mismatch),
+		         static_cast<unsigned long long>(patch_banned_programs), static_cast<unsigned long long>(patch_verify_mismatch));
+		patch_hits = patch_checks = patch_check_mismatch = patch_verify_mismatch = 0;
+		patch_no_base = patch_unlearned = patch_reads_changed = patch_banned_programs = 0;
+		patch_obs_ok = patch_obs_log = patch_obs_spec = patch_obs_other = patch_obs_unexplained = patch_obs_many = patch_obs_memory = 0;
+		std::fflush(stdout);
+	}
 
 	// The plan owns every instruction it evaluates (value_storage), and user data reaches the
 	// walk, its native code and the clean walk only through GetUserData. Words no GetUserData
@@ -797,10 +1125,21 @@ struct PipelineCache::ProgramCache {
 		if (bypass_on && entry.bypass_left != 0) {
 			entry.bypass_left--;
 			memo_bypassed++;
+			if (bool patched = false; MaterializeWithPatch(entry, runtime, reads, patched)) {
+				ReportMemo();
+				ReportPatch();
+				return true;
+			}
 			PhaseStats::Scope miss_phase {PhaseStats::PhMemoMiss};
+			const bool learn = MemoPatchMode() != 0;
+			ShaderReadChunks::ReadLog log;
+			if (learn) reads.SetLog(&log);
 			const bool ok = ShaderRecompiler::IR::MaterializeResources(
 			    entry.resource_plan, runtime, entry.resources, entry.specialization);
+			reads.SetLog(nullptr);
+			if (ok && learn) LearnPatch(entry, runtime, log);
 			ReportMemo();
+			ReportPatch();
 			return ok;
 		}
 		if (++entry.bypass_window >= 256u) {
@@ -854,6 +1193,11 @@ struct PipelineCache::ProgramCache {
 				return true;
 			}
 		}
+		if (bool patched = false; MaterializeWithPatch(entry, runtime, reads, patched)) {
+			ReportMemo();
+			ReportPatch();
+			return true;
+		}
 		memo_misses++;
 		(inputs_seen ? memo_miss_reads : memo_miss_inputs)++;
 		PhaseStats::Scope miss_phase {PhaseStats::PhMemoMiss};
@@ -885,6 +1229,9 @@ struct PipelineCache::ProgramCache {
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(
 		    entry.resource_plan, runtime, entry.resources, entry.specialization);
 		reads.SetLog(nullptr);
+		if (ok && MemoPatchMode() != 0) {
+			LearnPatch(entry, runtime, log);
+		}
 		if (ok) {
 			MemoSlot* slot = nullptr;
 			// Same inputs whose reads changed: refresh that slot instead of taking another.
@@ -913,6 +1260,7 @@ struct PipelineCache::ProgramCache {
 			slot->last_use = memo_clock;
 		}
 		ReportMemo();
+		ReportPatch();
 		return ok;
 	}
 
@@ -1041,7 +1389,7 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
-			PipelineKeyHash::Mix(hash, key.function_code.size());
+			PipelineKeyHash::Mix(hash, key.function_size);
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing the full state first.
 			return hash;
@@ -1248,10 +1596,12 @@ struct PipelineCache::ProgramCache {
 			}
 			// Research: ShaderFunctions expands calls first; the calls it refuses reach the
 			// recompiler's own inliner.
-			lookup_key.function_code.clear();
+			lookup_key.function_code.reset();
+			lookup_key.function_size    = 0;
+			lookup_key.function_hash_lo = lookup_key.function_hash_hi = 0;
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-				ExpandShaderFunctions(params, user_data, input_info.wave_size,
-				                      lookup_key.function_code);
+				PhaseStats::Scope expand_phase {PhaseStats::PhKeyExpand};
+				ExpandShaderFunctions(params, user_data, input_info.wave_size, lookup_key);
 			}
 		}
 		auto entry = programs.end();
@@ -1460,9 +1810,9 @@ struct PipelineCache::ProgramCache {
 		options.non_fatal = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
 		options.read_code       = ReadShaderCode;
-		const auto compile_code = lookup_key.function_code.empty()
+		const auto compile_code = lookup_key.function_code == nullptr || lookup_key.function_code->empty()
 		                              ? params.code
-		                              : std::span<const uint32_t>(lookup_key.function_code);
+		                              : std::span<const uint32_t>(*lookup_key.function_code);
 		auto translated = async_job != nullptr ? std::move(async_job->result)
 		                                       : ShaderRecompiler::TranslateProgram(compile_code, options);
 		if (async_job != nullptr) {
@@ -1552,17 +1902,55 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	std::chrono::steady_clock::time_point expand_report = std::chrono::steady_clock::now();
+	void ReportExpand(bool fast) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - expand_report < std::chrono::seconds(5)) {
+			return;
+		}
+		expand_report = now;
+		const auto st = function_expander.TakeStats();
+		::printf("Shader expand (5 s, KYTY_EXPAND_CACHE=%d): %llu compute lookups, %llu without calls; code compared %llu, "
+		         "skipped by hash %llu; call resolutions run %llu, reused %llu (%llu table words re-read); expansions "
+		         "reused %llu (%llu callee words re-read), built %llu (time: key.expand in Phases)\n",
+		         fast ? 1 : 0, static_cast<unsigned long long>(st.calls), static_cast<unsigned long long>(st.no_calls),
+		         static_cast<unsigned long long>(st.code_compares), static_cast<unsigned long long>(st.code_hash_skips),
+		         static_cast<unsigned long long>(st.resolve_full), static_cast<unsigned long long>(st.resolve_reused),
+		         static_cast<unsigned long long>(st.resolve_words_checked),
+		         static_cast<unsigned long long>(st.expansions_reused),
+		         static_cast<unsigned long long>(st.callee_words_checked),
+		         static_cast<unsigned long long>(st.expansions_built));
+		std::fflush(stdout);
+	}
+
 	// Shader function expansion decodes the shader and every callee, and a shader with table
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
+	// wolv-draw-1111: KYTY_EXPAND_CACHE (live, default 1; 0 = old: every dispatch compares the
+	// whole shader code with the cached copy and resolves its call targets again, decoding
+	// register writes through enum names). 1: the shader's registered hash stands for its code
+	// (as the program key already does), and a call-target resolution is reused while the
+	// user-data words it consulted and every guest word it read are unchanged. The callee code is
+	// still re-read and compared every time. Log: "Shader expand (5 s)".
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
-	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
+	                           uint32_t wave_size, ProgramKey& key) {
+		static auto& expand_cache = Common::LiveSwitches::Get("KYTY_EXPAND_CACHE", 1);
+		const bool   fast         = expand_cache.load(std::memory_order_relaxed) != 0;
 		std::string reason;
-		if (!function_expander.Expand(
-		        params.code, params.Base(), user_data,
-		        [](uint64_t address, std::span<uint32_t> words) {
-			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
-		        },
-		        expanded, reason, wave_size)) {
+		ShaderRecompiler::Decoder::ShaderFunctionExpander::Result result;
+		const bool ok = function_expander.ExpandShared(
+		    params.code, params.Base(), user_data,
+		    [](uint64_t address, std::span<uint32_t> words) {
+			    return ReadShaderGuestMemoryRaw(nullptr, address, words);
+		    },
+		    wave_size, fast ? params.hash : 0, fast, result, reason);
+		if (result.code != nullptr && !result.code->empty()) {
+			key.function_code    = std::move(result.code);
+			key.function_size    = static_cast<uint32_t>(key.function_code->size());
+			key.function_hash_lo = result.hash_lo;
+			key.function_hash_hi = result.hash_hi;
+		}
+		ReportExpand(fast);
+		if (!ok) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1) < 16) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,

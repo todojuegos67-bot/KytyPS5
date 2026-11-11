@@ -32,6 +32,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <optional>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -479,6 +481,23 @@ void RenderExecutor::DumpBuffers(const ShaderRecompiler::IR::CompiledShaderInfo&
 	}
 }
 
+// KYTY_DISPATCH_ONE_PASS stats: "Dispatch one pass (5 s)".
+static void NoteDispatchOnePass(bool one_pass) {
+	static uint64_t                              skipped = 0, kept = 0;
+	static std::chrono::steady_clock::time_point last    = std::chrono::steady_clock::now();
+	(one_pass ? skipped : kept)++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last >= std::chrono::seconds(5)) {
+		last = now;
+		::printf("Dispatch one pass (5 s, KYTY_DISPATCH_ONE_PASS=%lld): %llu dispatches bound once (first "
+		         "RebindImages+RebindBuffers pass skipped), %llu kept both passes (recovery-capable or switch off)\n",
+		         static_cast<long long>(Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 1).load()),
+		         static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(kept));
+		std::fflush(stdout);
+		skipped = kept = 0;
+	}
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
@@ -686,14 +705,33 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_SINGLE_REBIND=1 (live, A/B): the loop below resolves the images again before recording, so
 	// this first pass (the recovery transaction only needs the buffers) only repeats view lookups.
 	static auto& single_rebind = Common::LiveSwitches::Get("KYTY_SINGLE_REBIND", 0);
-	if (single_rebind.load(std::memory_order_relaxed) == 0) {
-		RebindImages(bindings);
+	// wolv-draw-1111: KYTY_DISPATCH_ONE_PASS (live, default 1; 0 = old). The first RebindImages +
+	// RebindBuffers pass exists for the recovery transaction (DMA shaders without written images),
+	// which saves the written buffers before the loop below binds everything again. Any other
+	// dispatch ran both twice (image views looked up, every buffer resolved and the flattened SRT
+	// and shader data uploaded twice, the first copies unused). Those skip the first pass.
+	static auto& one_pass_switch = Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 1);
+	const bool   recovery_possible =
+	    program.info.uses_dma && std::none_of(program.info.images.begin(), program.info.images.end(),
+	                                          [](const auto& image) { return image.written; });
+	const bool one_pass = one_pass_switch.load(std::memory_order_relaxed) != 0 && !recovery_possible;
+	{
+		PhaseStats::Scope state_phase {PhaseStats::PhDispatchState};
+		if (!one_pass) {
+			if (single_rebind.load(std::memory_order_relaxed) == 0) {
+				RebindImages(bindings);
+			}
+			RebindBuffers(bindings);
+		}
+		NoteDispatchOnePass(one_pass);
 	}
-	RebindBuffers(bindings);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
+		std::optional<PhaseStats::Scope> commit_phase {std::in_place, PhaseStats::PhDispatchState};
 		RebindImages(bindings);
 		RebindBuffers(bindings);
+		commit_phase.reset();
+		commit_phase.emplace(PhaseStats::PhDispatchCommit);
 		const auto        vk_buffer        = buffer.Recorder();
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -790,10 +828,19 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_SINGLE_REBIND=1 (live, A/B): the loop below resolves the images again before recording, so
 	// this first pass (the recovery transaction only needs the buffers) only repeats view lookups.
 	static auto& single_rebind = Common::LiveSwitches::Get("KYTY_SINGLE_REBIND", 0);
-	if (single_rebind.load(std::memory_order_relaxed) == 0) {
-		RebindImages(bindings);
+	// KYTY_DISPATCH_ONE_PASS: as in DispatchDirect.
+	static auto& one_pass_switch = Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 1);
+	const bool   recovery_possible =
+	    program.info.uses_dma && std::none_of(program.info.images.begin(), program.info.images.end(),
+	                                          [](const auto& image) { return image.written; });
+	const bool one_pass = one_pass_switch.load(std::memory_order_relaxed) != 0 && !recovery_possible;
+	if (!one_pass) {
+		if (single_rebind.load(std::memory_order_relaxed) == 0) {
+			RebindImages(bindings);
+		}
+		RebindBuffers(bindings);
 	}
-	RebindBuffers(bindings);
+	NoteDispatchOnePass(one_pass);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
