@@ -110,6 +110,7 @@ public:
 		return false;
 	}
 	[[nodiscard]] bool Ok() const { return m_ok; }
+	[[nodiscard]] size_t Remaining() const { return m_data.size() - m_offset; }
 	[[nodiscard]] bool AtEnd() const { return m_ok && m_offset == m_data.size(); }
 
 private:
@@ -135,6 +136,8 @@ void AppendInputKey(ByteWriter& key, const ShaderVertexInputInfo& info);
 void AppendInputKey(ByteWriter& key, const ShaderPixelInputInfo& info);
 void AppendInputKey(ByteWriter& key, const ShaderComputeInputInfo& info);
 void AppendSpecialization(ByteWriter& key, const ShaderRecompiler::IR::ResourceSpecialization& value);
+// AppendSpecialization's bytes back (guest pipeline seeds, pipelineSeeds.h).
+[[nodiscard]] bool ReadSpecialization(ByteReader& in, ShaderRecompiler::IR::ResourceSpecialization& value);
 
 struct SourceRecord {
 	bool                             unsupported = false;

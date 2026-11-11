@@ -826,6 +826,12 @@ void AppendSpecialization(ByteWriter& key, const IR::ResourceSpecialization& val
 	writer(value);
 }
 
+bool ReadSpecialization(ByteReader& in, IR::ResourceSpecialization& value) {
+	Reader reader {.in = in};
+	reader(value);
+	return in.Ok();
+}
+
 bool EncodeSourceRecord(bool unsupported, bool uses_clock, const IR::ResourcePlan* plan,
                         std::vector<uint8_t>& out) {
 	ByteWriter writer;

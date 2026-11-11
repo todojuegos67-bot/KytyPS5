@@ -27,7 +27,8 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          if [ "$GITHUB_REPOSITORY" = "todojuegos67-bot/kytyps5" ]; then
+          # Case-insensitive: the fork was renamed todojuegos67-bot/KytyPS5.
+          if [ "${GITHUB_REPOSITORY,,}" = "todojuegos67-bot/kytyps5" ]; then
             # The Gran Turismo 7 PC port's package ("Gran Turismo 7.exe", src/port).
             echo "value=GranTurismo7PC-$(date -u +'%Y%m%d')-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
           else
@@ -475,7 +476,8 @@ jobs:
       ((github.event_name == 'push' &&
         (github.repository == 'KytyPS5/KytyPS5' ||
          (github.repository == 'Senaxx/KytyPS5' && github.ref == 'refs/heads/wolverine'))) ||
-       (github.repository == 'todojuegos67-bot/kytyps5' && startsWith(github.ref, 'refs/heads/gt7-') &&
+       (github.repository == 'todojuegos67-bot/kytyps5' &&
+        startsWith(github.ref, 'refs/heads/gt7-') &&
         github.event_name == 'workflow_dispatch') ||
        (github.repository == 'usa-ratt/KytyPS5-GT7' && github.ref == 'refs/heads/gt7-eqaa' &&
         (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))) &&

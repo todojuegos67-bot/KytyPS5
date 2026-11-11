@@ -274,6 +274,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 		const LaunchPlan plan = BuildLaunch(s, rt.pc.amd_cpu, rt.pc.screen_w, rt.pc.screen_h);
 		for (const auto& [k, v]: plan.env) SetEnvironmentVariableW(Wide(k).c_str(), v.empty() ? nullptr : Wide(v).c_str());
 
+		// Shaders: the package's seeds merged, then the precompile when due (first time, new driver or emulator).
+		MergeShippedSeeds(rt);
+		if (s.precompile_auto && PrecompileDue(rt, s, nullptr)) {
+			const std::string result = RunPrecompile(rt, s, CommandLine(rt, plan));
+			if (!result.empty()) status = result; // the game starts anyway (it compiles what it needs, as before)
+		}
+
 		// The emulator's output: logs\gt7-<date>.log (or its own console, Desarrollador).
 		fs::create_directories(rt.exe_dir / L"logs", ec);
 		wchar_t stamp[32];

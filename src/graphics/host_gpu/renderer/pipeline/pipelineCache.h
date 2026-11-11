@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineSeeds.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
@@ -252,6 +253,9 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// KYTY_PRECOMPILE=1 (pipelineSeeds.h): every guest seed's program into the shader disk cache
+	// and every seed pipeline into the driver cache, on all processors.
+	void PrecompileSeeds();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -440,6 +444,9 @@ private:
 	struct GraphicsPipelineKeyHash {
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
+	void RecordPipelineSeed(const GraphicsPipelineKey& key, const GraphicsPrograms& programs,
+	                        uint32_t vertex_stages, bool ps_active);
+	static uint64_t SeedFormat();
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;

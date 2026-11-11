@@ -1097,6 +1097,13 @@ if (KYTY_GT7_PORT AND WIN32)
 	add_dependencies(gt7_port kyty_emulator)
 	install(TARGETS gt7_port DESTINATION .)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/resources/gt7/LEEME.txt" DESTINATION .)
+	# Guest seeds for every player (assets/gt7/seeds/README.md): seeds-PPSA01317_<version>.seeds beside the exe, read
+	# with the player's own by the precompile. Only when the repository has one.
+	file(GLOB gt7_seed_files "${CMAKE_CURRENT_SOURCE_DIR}/assets/gt7/seeds/seeds-PPSA01317_*.seeds")
+	if (gt7_seed_files)
+		install(FILES ${gt7_seed_files} DESTINATION .)
+		message(STATUS "Gran Turismo 7: guest seeds packaged: ${gt7_seed_files}")
+	endif()
 	message(STATUS "Building the Gran Turismo 7 PC launcher (KYTY_GT7_PORT)")
 endif()
 if(KYTY_BUILD_LAUNCHER)
