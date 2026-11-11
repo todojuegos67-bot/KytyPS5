@@ -482,10 +482,6 @@ Kind Want(const AmdGpu::Regs& regs) {
     }
     if (bound == 0) return Kind::None;
     // Other draws of the scene pass: attachment 7 kept bound, not written (no pass restart).
-    if (!regs.depth_control.depth_enable || regs.IsClipDisabled() || !regs.color_buffers[0] ||
-        !regs.color_target_mask.GetMask(0)) {
-        return Kind::Mask;
-    }
     // bb-149-objmv (HUD duplicates under DLSS-G, build 376): a draw whose depth test passes
     // everything (Always / Never) is screen-space: the HUD / UI (Scaleform) or a full-screen pass,
     // never a moving surface. It keeps attachment 7 bound but writes no object vector, so its
@@ -498,12 +494,23 @@ Kind Want(const AmdGpu::Regs& regs) {
                   "get no object vector");
         return old;
     }();
+    // bb-149-objmv: screen-space draws (no depth test, clip disabled: HUD, UI, full-screen
+    // passes) get the stock pipeline, without attachment 7: in 376 they took the Mask variant, an
+    // extra attachment the 149's HUD redirection / HUD-less capture does not expect.
+    if (!ui_old && (!regs.depth_control.depth_enable || regs.IsClipDisabled())) {
+        ++g.sec_ui_skipped;
+        return Kind::None;
+    }
+    if (!regs.depth_control.depth_enable || regs.IsClipDisabled() || !regs.color_buffers[0] ||
+        !regs.color_target_mask.GetMask(0)) {
+        return Kind::Mask;
+    }
     {
         using CF = AmdGpu::CompareFunc;
         const auto f = regs.depth_control.depth_func;
         if (!ui_old && (f == CF::Always || f == CF::Never)) {
             ++g.sec_ui_skipped;
-            return Kind::Mask;
+            return Kind::None;
         }
     }
     const auto& bc = regs.blend_control[0];
