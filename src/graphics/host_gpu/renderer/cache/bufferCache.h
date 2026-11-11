@@ -256,9 +256,26 @@ private:
 	// GPU thread: records and submits the window's GPU-written bytes on the readback queue behind
 	// the buffer's last writer (completed or already handed to the driver); the bytes move from
 	// GPU-written to downloading. False (nothing changed) when it cannot.
+	// With `pages` (KYTY_EAGER_ASYNC): the GPU-written bytes of those whole pages instead of the
+	// window, as many as fit; the pages taken go to `copied`.
 	[[nodiscard]] bool TryAsyncCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
 	                                             uint64_t window_end, uint64_t& cq_value,
-	                                             uint32_t& slot);
+	                                             uint32_t& slot,
+	                                             const std::vector<uint64_t>* pages  = nullptr,
+	                                             std::vector<uint64_t>*       copied = nullptr);
+	// KYTY_EAGER_ASYNC (wolv-perf-1111d): eager write-back batches submitted on the copy queue and
+	// published later on Thread_Gpu. Their pages stay GPU-owned (protected) until then; any fault,
+	// download or invalidation touching them completes the batch first.
+	struct EagerInflight {
+		uint32_t              slot  = UINT32_MAX;
+		uint64_t              value = 0;
+		std::vector<uint64_t> pages;
+	};
+	std::vector<EagerInflight> m_eager_inflight;
+	[[nodiscard]] bool         EagerInflightOverlaps(uint64_t begin, uint64_t end) const;
+	void                       CompleteEagerInflight(uint64_t begin, uint64_t end);
+	void                       FinishEagerInflight(size_t index);
+	void                       PollEagerInflight();
 	// GPU thread: writes a finished slot's bytes to guest memory and frees the slot.
 	void PublishAsyncCopy(uint32_t slot);
 	// Any thread: blocks until the copy-queue timeline reaches `value`.

@@ -675,6 +675,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	// newer main-queue download of bytes the GPU wrote again always lands after it, and a window
 	// unprotected after this download never holds bytes still on their way back.
 	CompleteAsyncCopies(vaddr, vaddr + size);
+	CompleteEagerInflight(vaddr, vaddr + size);
 	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
 	// windows; a window that does not fit drains the ring before it is mapped.
 	const auto capacity = m_download_buffer.Size();
@@ -1050,6 +1051,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	// Pages of an asynchronous write readback stay GPU-owned until its download is
 	// published.
+	CompleteEagerInflight(page_begin, page_end);
 	CompletePendingWriteReadbacks(page_begin, page_end);
 	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
 	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
@@ -1076,6 +1078,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	// Whatever the width, the window must hold every faulting byte: only those are unprotected
 	// below, the rest of the buffer stays GPU-owned and faults on its own.
 	EXIT_IF(window_begin > vaddr || window_end < std::min(vaddr + size, buffer_end));
+	CompleteEagerInflight(window_begin, window_end);
 
 	if (stats.Enabled()) {
 		stats.FindWriter([this](uint64_t tick) { return m_scheduler.IsFree(tick); });
@@ -1387,24 +1390,37 @@ void BufferCache::CollectReadbackHistory(const Buffer& buffer, uint64_t window_b
 bool BufferCache::EagerWriteback() {
 	static auto& eager_ms = Common::LiveSwitches::Get("KYTY_EAGER_WRITEBACK", 0);
 	const auto   age      = eager_ms.load(std::memory_order_relaxed);
-	static uint64_t s_runs = 0, s_batches = 0, s_pages = 0, s_bytes = 0, s_us = 0, s_waits = 0;
+	static uint64_t s_runs = 0, s_batches = 0, s_pages = 0, s_bytes = 0, s_us = 0, s_waits = 0, s_async_batches = 0;
 	static auto     s_begin = std::chrono::steady_clock::now();
 	const auto      start   = std::chrono::steady_clock::now();
 	if (start - s_begin >= std::chrono::seconds(5)) {
 		if (s_runs != 0 || age > 0) {
-			::printf("Eager write-back (5 s, KYTY_EAGER_WRITEBACK=%lld): %llu batches, %llu pages, %.1f MiB, "
-			         "%.1f ms on Thread_Gpu, %llu polls waited for a writer, %zu hot pages\n",
-			         static_cast<long long>(age), static_cast<unsigned long long>(s_batches),
+			::printf("Eager write-back (5 s, KYTY_EAGER_WRITEBACK=%lld, KYTY_EAGER_ASYNC=%lld: %llu async): %llu batches, "
+			         "%llu pages, %.1f MiB, %.1f ms on Thread_Gpu, %llu polls waited for a writer, %zu hot pages\n",
+			         static_cast<long long>(age),
+			         static_cast<long long>(Common::LiveSwitches::Get("KYTY_EAGER_ASYNC", 1).load()),
+			         static_cast<unsigned long long>(s_async_batches), static_cast<unsigned long long>(s_batches),
 			         static_cast<unsigned long long>(s_pages), static_cast<double>(s_bytes) / 1048576.0,
 			         static_cast<double>(s_us) / 1000.0, static_cast<unsigned long long>(s_waits),
 			         m_readback_history.size());
 			std::fflush(stdout);
 		}
-		s_runs = s_batches = s_pages = s_bytes = s_us = s_waits = 0;
+		s_runs = s_batches = s_pages = s_bytes = s_us = s_waits = s_async_batches = 0;
 		s_begin = start;
 	}
+	// KYTY_EAGER_ASYNC (live, default 1; 0 = old): batches go on the copy queue without Thread_Gpu
+	// waiting for them (log 11-11: 480 synchronous batches, 263-313 ms of Thread_Gpu per 5 s, each a
+	// fence wait during which guest commands are not served); finished ones are published here.
+	static auto& eager_async = Common::LiveSwitches::Get("KYTY_EAGER_ASYNC", 1);
+	const bool   use_async   = eager_async.load(std::memory_order_relaxed) != 0 && AsyncCopyQueueEnabled();
+	if (!m_eager_inflight.empty()) {
+		PollEagerInflight();
+	}
 	if (age <= 0 || m_readback_history.empty() || !m_pending_write_readbacks.empty()) {
-		return false;
+		return !m_eager_inflight.empty();
+	}
+	if (use_async && m_eager_inflight.size() >= 4) {
+		return true; // poll again soon
 	}
 	const auto now_ms = static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::milliseconds>(start.time_since_epoch()).count());
@@ -1435,7 +1451,7 @@ bool BufferCache::EagerWriteback() {
 	}
 	if (candidates.empty()) {
 		s_waits += waiting ? 1 : 0;
-		return waiting;
+		return waiting || !m_eager_inflight.empty();
 	}
 	s_runs++;
 	std::stable_sort(candidates.begin(), candidates.end(),
@@ -1460,14 +1476,29 @@ bool BufferCache::EagerWriteback() {
 					                                     [&](uint64_t b, uint64_t e) { bytes += e - b; });
 				}
 			}
-			if (!TryCopyQueueReadback(buffer, window, window + TRACKER_PAGE_SIZE, rest.empty() ? nullptr : &rest,
-			                          &copied)) {
-				break;
+			if (use_async) {
+				if (m_eager_inflight.size() >= 4) {
+					break;
+				}
+				uint64_t value = 0;
+				uint32_t slot  = UINT32_MAX;
+				if (!TryAsyncCopyQueueReadback(buffer, 0, 0, value, slot, &pages, &copied) || copied.empty()) {
+					break;
+				}
+				m_eager_inflight.push_back({slot, value, copied});
+				s_async_batches++;
+			} else {
+				if (!TryCopyQueueReadback(buffer, window, window + TRACKER_PAGE_SIZE, rest.empty() ? nullptr : &rest,
+				                          &copied)) {
+					break;
+				}
+				copied.push_back(window);
 			}
-			copied.push_back(window);
-			for (const auto page: copied) {
-				if (!HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
-					m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+			if (!use_async) {
+				for (const auto page: copied) {
+					if (!HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
+						m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+					}
 				}
 			}
 			s_batches++;
@@ -1490,7 +1521,7 @@ bool BufferCache::EagerWriteback() {
 	}
 	s_us += static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
-	return waiting;
+	return waiting || !m_eager_inflight.empty();
 }
 
 // GPU thread. Returns the tick the guest must wait for, or 0 when the fault is already resolved.
@@ -1511,6 +1542,8 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	}
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	// KYTY_EAGER_ASYNC: an eager batch holding this page is published first (it waits for its copy).
+	CompleteEagerInflight(page_begin, page_end);
 	// Another guest's readback of this page is still landing: wait for the same download.
 	for (const auto& pending: m_pending_write_readbacks) {
 		if (pending.begin < page_end && page_begin < pending.end) {
@@ -1541,6 +1574,7 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	window_begin                = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 	window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 	EXIT_IF(window_begin > vaddr || window_end < std::min(vaddr + size, buffer_end));
+	CompleteEagerInflight(window_begin, window_end);
 	if (OverlapsPendingWriteReadback(window_begin, window_end)) {
 		// The page itself is not pending (checked above), but the window shares bytes with a
 		// landing readback (neighbouring pages read by other guest threads): download only the
@@ -1765,7 +1799,62 @@ void BufferCache::CompletePendingWriteReadbacks(uint64_t begin, uint64_t end) {
 	}
 }
 
+bool BufferCache::EagerInflightOverlaps(uint64_t begin, uint64_t end) const {
+	for (const auto& batch: m_eager_inflight) {
+		for (const auto page: batch.pages) {
+			if (page < end && begin < page + TRACKER_PAGE_SIZE) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// GPU thread: publishes an eager batch (waiting for its copy if needed) and lifts the GPU ownership
+// of every page the GPU did not write again meanwhile.
+void BufferCache::FinishEagerInflight(size_t index) {
+	auto batch = std::move(m_eager_inflight[index]);
+	m_eager_inflight.erase(m_eager_inflight.begin() + static_cast<std::ptrdiff_t>(index));
+	PublishAsyncCopy(batch.slot);
+	for (const auto page: batch.pages) {
+		if (!HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
+}
+
+void BufferCache::CompleteEagerInflight(uint64_t begin, uint64_t end) {
+	for (size_t i = 0; i < m_eager_inflight.size();) {
+		bool overlaps = false;
+		for (const auto page: m_eager_inflight[i].pages) {
+			if (page < end && begin < page + TRACKER_PAGE_SIZE) {
+				overlaps = true;
+				break;
+			}
+		}
+		if (overlaps) {
+			FinishEagerInflight(i);
+		} else {
+			i++;
+		}
+	}
+}
+
+void BufferCache::PollEagerInflight() {
+	for (size_t i = 0; i < m_eager_inflight.size();) {
+		if (AsyncCopyDone(m_eager_inflight[i].value)) {
+			FinishEagerInflight(i);
+		} else {
+			i++;
+		}
+	}
+}
+
 bool BufferCache::OverlapsPendingWriteReadback(uint64_t begin, uint64_t end) const {
+	// KYTY_EAGER_ASYNC batches count as pending too: their bytes are GPU-owned until published.
+	if (!m_eager_inflight.empty() && EagerInflightOverlaps(begin, end)) {
+		return true;
+	}
 	return std::ranges::any_of(m_pending_write_readbacks, [&](const PendingWriteReadback& pending) {
 		return pending.begin < end && begin < pending.end;
 	});
@@ -1813,10 +1902,12 @@ void BufferCache::WaitAsyncCopy(uint64_t value, std::source_location where) {
 }
 
 bool BufferCache::TryAsyncCopyQueueReadback(Buffer& buffer, uint64_t window_begin, uint64_t window_end,
-                                            uint64_t& cq_value, uint32_t& slot_index) {
+                                            uint64_t& cq_value, uint32_t& slot_index,
+                                            const std::vector<uint64_t>* pages, std::vector<uint64_t>* copied) {
 	constexpr uint64_t StagingSize = 4ull * 1024 * 1024;
 	constexpr size_t   MaxSlots    = 16;
-	if (m_graphics.readback_queue == nullptr || OverlapsPendingWriteReadback(window_begin, window_end)) {
+	if (m_graphics.readback_queue == nullptr ||
+	    (pages == nullptr && (OverlapsPendingWriteReadback(window_begin, window_end)))) {
 		return false;
 	}
 	auto& cq     = m_async_cq;
@@ -1837,7 +1928,35 @@ bool BufferCache::TryAsyncCopyQueueReadback(Buffer& buffer, uint64_t window_begi
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
-	{
+	if (pages != nullptr) {
+		// KYTY_EAGER_ASYNC: whole pages while they fit; a page shared with another download or a
+		// pending readback is left for later.
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		for (const auto page: *pages) {
+			if (!buffer.IsInBounds(page, TRACKER_PAGE_SIZE) || OverlapsPendingWriteReadback(page, page + TRACKER_PAGE_SIZE) ||
+			    EagerInflightOverlaps(page, page + TRACKER_PAGE_SIZE) ||
+			    m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				continue;
+			}
+			const auto first      = copies.size();
+			const auto size_first = total_size;
+			m_memory_tracker.ForEachDownloadRange<false>(
+			    page, TRACKER_PAGE_SIZE, [&](uint64_t address, uint64_t bytes) noexcept {
+				    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+					    copies.emplace_back(start - buffer_address, total_size, end - start);
+					    total_size += Common::AlignUp(end - start, 64);
+				    });
+			    });
+			if (total_size > StagingSize) {
+				copies.resize(first);
+				total_size = size_first;
+				break;
+			}
+			if (copies.size() != first && copied != nullptr) {
+				copied->push_back(page);
+			}
+		}
+	} else {
 		std::shared_lock lock(m_dirty_ranges_mutex);
 		if (m_downloading_ranges.Intersects(window_begin, window_end - window_begin)) {
 			return false;
@@ -1851,6 +1970,9 @@ bool BufferCache::TryAsyncCopyQueueReadback(Buffer& buffer, uint64_t window_begi
 		    });
 	}
 	if (copies.empty() || total_size > StagingSize) {
+		if (copied != nullptr) {
+			copied->clear();
+		}
 		return false;
 	}
 
