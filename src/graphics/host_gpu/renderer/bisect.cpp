@@ -1165,7 +1165,7 @@ bool ScanOldTaint() {
 bool StateFilter() {
 	static const bool whole_run = [] {
 		const char* value = std::getenv("KYTY_STATE_FILTER");
-		const bool  on    = value != nullptr && std::strcmp(value, "1") == 0;
+		const bool  on    = value == nullptr || std::strcmp(value, "0") != 0;
 		LOGF("State filter: %s (KYTY_STATE_FILTER=1, or KYTY_BISECT's state:filter for a step: "
 		     "pipeline binds and dynamic state calls that set what the command buffer holds "
 		     "already are left out)\n",
@@ -1386,7 +1386,7 @@ bool RendererPm4Barriers() {
 static bool LeanBarriersDefault() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_LEAN_BARRIERS");
-		const bool  lean  = value != nullptr && std::strcmp(value, "1") == 0;
+		const bool  lean  = value == nullptr || std::strcmp(value, "0") != 0;
 		LOGF("Lean barriers: %s (KYTY_LEAN_BARRIERS=1: copies share their barriers, image uses in "
 		     "an unchanged layout make none; KYTY_BISECT's copies:lean, images:lean and lean:off "
 		     "for a step)\n",
