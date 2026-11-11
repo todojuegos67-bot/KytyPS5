@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fmt/format.h>
 #include <memory>
+#include <cstdlib>
 #include <mutex>
 #include <spdlog/formatter.h>
 #include <spdlog/logger.h>
@@ -164,6 +165,24 @@ void Initialize() {
 		case Config::LogDirection::Silent: g_direction = Direction::Silent; break;
 		case Config::LogDirection::Console: g_direction = Direction::Console; break;
 		case Config::LogDirection::File: g_direction = Direction::File; break;
+	}
+	// The port's launcher leaves printf's output Silent, so the LOGF reports of the measuring
+	// switches (KYTY_OP_STATS, KYTY_GPU_TIMING, KYTY_SYNC_STATS, KYTY_PHASE_STATS) were lost. Any of
+	// them set, or KYTY_LOG_CONSOLE=1, sends LOGF to stdout (the port's logs\gt7-*.log);
+	// KYTY_LOG_CONSOLE=0 keeps Silent.
+	if (g_direction == Direction::Silent) {
+		const char* console = std::getenv("KYTY_LOG_CONSOLE");
+		bool        on      = console != nullptr && console[0] == '1';
+		if (console == nullptr) {
+			for (const char* name: {"KYTY_OP_STATS", "KYTY_GPU_TIMING", "KYTY_SYNC_STATS",
+			                        "KYTY_PHASE_STATS"}) {
+				const char* value = std::getenv(name);
+				on = on || (value != nullptr && value[0] != '\0' && value[0] != '0');
+			}
+		}
+		if (on) {
+			g_direction = Direction::Console;
+		}
 	}
 	g_output_file =
 	    (g_direction == Direction::File ? Config::GetPrintfOutputFile() : std::filesystem::path {});
