@@ -804,9 +804,10 @@ struct PipelineCache::ProgramCache {
 	// evaluation's and whose logged guest words all read the same, copies that evaluation and
 	// patches the words. Every 32nd patch is also evaluated in full and compared; a mismatch bans
 	// the program (then the full result is used). KYTY_MEMO_PATCH=2 compares every patch.
-	// 0 = old path. Log: "Memo patch (5 s)".
+	// 0 = old path (default since 1111d: learned, not proven; menu text lost with build 5590a12f
+	// while it was on, under bisection). Log: "Memo patch (5 s)".
 	static int64_t MemoPatchMode() {
-		static auto& mode = Common::LiveSwitches::Get("KYTY_MEMO_PATCH", 1);
+		static auto& mode = Common::LiveSwitches::Get("KYTY_MEMO_PATCH", 0);
 		return mode.load(std::memory_order_relaxed);
 	}
 	static constexpr uint8_t PatchLearnedNeeded = 2;
