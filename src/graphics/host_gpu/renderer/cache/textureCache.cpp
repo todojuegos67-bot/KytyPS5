@@ -2698,60 +2698,6 @@ void DirtyRowBands(const std::vector<std::pair<uint64_t, uint64_t>>& dirty, uint
 
 } // namespace
 
-// KYTY_PARTIAL_IMAGE_DIRTY=2: every granule of a large image is hashed at a whole upload, and the
-// dirty granules again after a partial one; a partial upload first checks that the granules it
-// leaves alone still hold the data uploaded last time (a write the page watchers missed).
-void TextureCache::UpdatePartialHashes(Image& image, bool all) {
-	const auto& info  = image.info;
-	const auto  count = (info.data.size + PartialDirtyGranule - 1) / PartialDirtyGranule;
-	if (image.partial_hashes.size() != count) {
-		if (!all) {
-			return;
-		}
-		image.partial_hashes.assign(count, 0);
-	}
-	for (uint64_t index = 0; index < count; index++) {
-		const auto begin = info.data.address + index * PartialDirtyGranule;
-		const auto size  = std::min(PartialDirtyGranule, info.data.End() - begin);
-		if (all || IntersectsRanges(image.CpuDirtyRanges(), begin, begin + size)) {
-			image.partial_hashes[index] = HashGuestRange(begin, size);
-		}
-	}
-}
-
-bool TextureCache::CheckPartialHashes(const Image& image) {
-	const auto& info  = image.info;
-	const auto  count = (info.data.size + PartialDirtyGranule - 1) / PartialDirtyGranule;
-	if (image.partial_hashes.size() != count) {
-		std::printf("PARTIAL VERIFY no baseline addr=0x%llx size=0x%llx\n",
-		            static_cast<unsigned long long>(info.data.address),
-		            static_cast<unsigned long long>(info.data.size));
-		return false;
-	}
-	uint64_t mismatches = 0;
-	uint64_t first      = 0;
-	for (uint64_t index = 0; index < count; index++) {
-		const auto begin = info.data.address + index * PartialDirtyGranule;
-		const auto size  = std::min(PartialDirtyGranule, info.data.End() - begin);
-		if (!IntersectsRanges(image.CpuDirtyRanges(), begin, begin + size) &&
-		    HashGuestRange(begin, size) != image.partial_hashes[index]) {
-			if (mismatches++ == 0) {
-				first = begin;
-			}
-		}
-	}
-	if (mismatches != 0) {
-		std::printf("PARTIAL VERIFY mismatch addr=0x%llx size=0x%llx granules=%llu first=0x%llx "
-		            "dirty_ranges=%zu\n",
-		            static_cast<unsigned long long>(info.data.address),
-		            static_cast<unsigned long long>(info.data.size),
-		            static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(first),
-		            image.CpuDirtyRanges().size());
-		return false;
-	}
-	return true;
-}
-
 // KYTY_SHADOW_REFRESH_FIX (on unless 0): a layer of a depth array the GPU rendered is refreshed from guest memory only
 // when its guest bytes changed since the GPU took it. Guest memory never holds the GPU's depth: re-uploading bytes that
 // did not change only replaces a rendered shadow with what the memory held before it. The game's 80-layer spot-shadow
@@ -5817,27 +5763,7 @@ void TextureCache::RunGarbageCollector() {
 		m_graphics.LogVideoMemory("30 s");
 		std::fflush(stdout);
 	}
-	if (KytyGcLiveBudget() && m_graphics.CanReportMemoryUsage()) {
-		static auto   kyty_budget_window = std::chrono::steady_clock::time_point {};
-		const auto    now                = std::chrono::steady_clock::now();
-		const uint64_t budget            = KytyGcLiveBudgetValue(m_graphics);
-		if (now - kyty_budget_window >= std::chrono::seconds(2)) {
-			kyty_budget_window = now;
-			uint64_t trigger = 0, pressure = 0, critical = 0;
-			KytyTextureGcThresholds(budget, trigger, pressure, critical);
-			const auto moved = [](uint64_t a, uint64_t b) { return (a > b ? a - b : b - a) >= (uint64_t {64} << 20u); };
-			if (moved(trigger, m_trigger_gc_memory)) {
-				std::printf("KYTYGCBUDGET texture budget=%lluMB trigger=%lluMB pressure=%lluMB critical=%lluMB "
-				            "used=%lluMB\n",
-				            static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(trigger >> 20),
-				            static_cast<unsigned long long>(pressure >> 20),
-				            static_cast<unsigned long long>(critical >> 20),
-				            static_cast<unsigned long long>(m_total_used_memory >> 20));
-				std::fflush(stdout);
-			}
-			m_trigger_gc_memory = trigger;
-		}
-	} else if (m_graphics.CanReportMemoryUsage()) {
+	if (m_graphics.CanReportMemoryUsage()) {
 		// The budget Windows gives now, not the one at start-up: another program's video memory lowers it (a Discord
 		// stream: 15.2 -> 13.9 GB on a 16 GB GPU), and past it Windows moves the game's memory out of video memory
 		// (60 -> 20-30 fps). Its lowest of the last 30 s (KytyGcLiveBudgetValue), less GetTotalMemoryBudget's headroom
