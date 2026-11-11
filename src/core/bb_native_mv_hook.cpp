@@ -155,6 +155,17 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         NativeMv::SetHooksInstalled(false, "BB_NATIVE_MV_HOOK=0: the game's code is untouched");
         return;
     }
+    // bb-perf-1111: off by default (the LIMPIO log: 0 scene draws with game identity). The game's
+    // code is only patched with BB_NATIVE_MV=1 (or BB_NATIVE_MV_HOOK=1).
+    {
+        const char* on = std::getenv("BB_NATIVE_MV");
+        const char* hook = std::getenv("BB_NATIVE_MV_HOOK");
+        if (!(on != nullptr && on[0] == '1') && !(hook != nullptr && hook[0] == '1')) {
+            NativeMv::SetHooksInstalled(false, "off by default (BB_NATIVE_MV=1 turns it on): the "
+                                               "game's code is untouched");
+            return;
+        }
+    }
     const u8* img = reinterpret_cast<const u8*>(eboot_base);
     // The code is in the first segment; search the whole image once (~1 s worst case is avoided:
     // the first byte filter skips most positions).

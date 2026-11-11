@@ -3638,8 +3638,10 @@ bool WantHudlessCopy() {
 
 bool HudSkipFullscreen() {
     static const bool on = [] {
+        // Off by default: the LIMPIO log (build 389) showed 5-10 HUD draws a frame with a
+        // full-target viewport taken for full-screen passes. BB_HUD_SKIP_FULLSCREEN=1 opt-in.
         const char* v = std::getenv("BB_HUD_SKIP_FULLSCREEN");
-        const bool r = v == nullptr || v[0] != '0';
+        const bool r = v != nullptr && v[0] == '1';
         Checkpoint(fmt::format("[hud-fs] bb-perf-1111: full-screen blended passes after the post "
                                "chain are {} (BB_HUD_SKIP_FULLSCREEN={})",
                                r ? "not a HUD start: HUD point / HUD-less capture after them"
