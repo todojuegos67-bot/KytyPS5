@@ -3439,11 +3439,11 @@ void LauncherFrameGen(Settings& s) {
 		if (nvidia || std::strncmp(id, "dlss", 4) != 0) modes.push_back({id, FrameGenLabel(id)});
 	// (ds-pc-port9) Modo Souls ligero / equilibrado / low profile: AMD x2 fixed and its Anti-Lag Ultra (shown, not changeable).
 	const bool  fixed  = FixedFg(s);
-	std::string locked = "amd-x2", ultra = "ultra";
+	std::string locked = s.souls_mode == "ligero-plus" ? "amd-x3" : "amd-x2", ultra = "ultra";
 	ImGui::BeginDisabled(fixed);
 	LRow("Frame generation", static_cast<int>(modes.size()), modes.data(), fixed ? locked : s.framegen, [](const Choice& c) { return c.id; },
 	     [](const Choice& c) { return c.label; },
-	     fixed ? "Con este Modo Souls la frame generation es fija: AMD x2." : "AMD: todas las graficas (tambien con reescalado DLSS). DLSS: NVIDIA RTX 40/50. FPS desbloqueados siempre.",
+	     fixed ? (s.souls_mode == "ligero-plus" ? "Con este Modo Souls la frame generation es fija: AMD x3." : "Con este Modo Souls la frame generation es fija: AMD x2.") : "AMD: todas las graficas (tambien con reescalado DLSS). DLSS: NVIDIA RTX 40/50. FPS desbloqueados siempre.",
 	     12, 396, true);
 	if (fixed) {
 		LChoice("Anti-Lag", g_rt.pc.amd ? kAntiLagAmd : kAntiLagOther, g_rt.pc.amd ? kAntiLagAmdCount : kAntiLagOtherCount, ultra,
@@ -3674,6 +3674,8 @@ void LauncherSoulsModes(Settings& s) {
 	     "Para RTX 5060 / 5060 Ti / 5070 / 5070 Ti y RX 9070 / 9070 XT: todo al maximo, Detail Very High, Luz RT y Oclusion en Alta. Los FPS dependen de la potencia de tu GPU y tu CPU."},
 	    {"extremo", "Modo Souls extremo",
 	     "Para enfermos de Souls. RTX 5080, RTX 5090 o superior: modo cinematico del juego a 4K y absolutamente todo al maximo (Ultra en todo, filtrado x16 y texturas nitidas). Los FPS dependen de la potencia de tu GPU y tu CPU."},
+	    {"ligero-plus", "Modo Souls ligero +",
+	     "Como el Modo Souls ligero (mismos graficos), pero con frame generation de AMD x3: el juego a 30 FPS estables y 90 en pantalla, y el mando leido un poco mas tarde para algo menos de latencia."},
 	    {"low", "Modo Souls PC low profile (900p, todo en bajo)",
 	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p."}};
 	const auto pick = [&](float y, const Mode& m, float x) {
@@ -3692,12 +3694,13 @@ void LauncherSoulsModes(Settings& s) {
 	{
 		const float y = RowY();
 		pick(y, modes[4], 12);
+		pick(y, modes[5], 216);
 		RowEnd(y);
 	}
 	if (FixedFg(s)) {
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y + U(4)});
-		ImGui::TextColored(kGoldL, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Frame generation fija: AMD x2 (45 reales, 90 en pantalla)." : "Frame generation fija: AMD x2 (30 reales, 60 en pantalla)."));
+		ImGui::TextColored(kGoldL, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Frame generation fija: AMD x2 (45 reales, 90 en pantalla)." : s.souls_mode == "ligero-plus" ? "Frame generation fija: AMD x3 (30 reales, 90 en pantalla)." : "Frame generation fija: AMD x2 (30 reales, 60 en pantalla)."));
 		RowEnd(y, 28);
 	}
 	BoxEnd();
@@ -5191,10 +5194,10 @@ void Sample(LogState& L,
 	const Settings&  s = g_rt.launched;
 	// The launcher.ini values (StartMetricsWindow's): scalelabel, fglabel, antilagon, soulsmodo, dlsspreset.
 	const std::string souls = s.souls_mode;
-	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "equilibrado" ? "Modo Souls equilibrado"
+	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "ligero-plus" ? "Modo Souls ligero +" : souls == "equilibrado" ? "Modo Souls equilibrado"
 	                        : souls == "ultra" ? "Modo Souls ultra" : souls == "extremo" ? "Modo Souls extremo"
 	                        : souls == "low" ? "Modo Souls PC low profile" : "Personalizado";
-	const bool  fixed = souls == "ligero" || souls == "equilibrado" || souls == "low";
+	const bool  fixed = souls == "ligero" || souls == "ligero-plus" || souls == "equilibrado" || souls == "low";
 	std::string fg_label = fixed ? modo : FrameGenLabel(s.framegen);
 	std::string al       = "No";
 	if (fixed) al = "Ultra";
@@ -6118,10 +6121,11 @@ void InstallMenu(const Runtime& runtime) {
 	g_edit  = runtime.launched;
 	ApplyLive(runtime.launched);
 	const bool        fixed = FixedFg(runtime.launched);
-	const std::string fg    = fixed ? std::string("amd-x2") : runtime.launched.framegen;
+	const std::string fg    = fixed ? std::string(runtime.launched.souls_mode == "ligero-plus" ? "amd-x3" : "amd-x2") : runtime.launched.framegen;
 	if (fg != "sin-fg" && !fg.empty()) {
 		PortLive::fg_label  = fixed ? (runtime.launched.souls_mode == "equilibrado" ? "MODO SOULS EQUILIBRADO"
 		                               : runtime.launched.souls_mode == "low"       ? "MODO SOULS PC LOW PROFILE"
+		                               : runtime.launched.souls_mode == "ligero-plus" ? "MODO SOULS LIGERO +"
 		                                                                            : "MODO SOULS LIGERO")
 		                            : FrameGenLabel(fg);
 		PortLive::fg_plain  = fixed;

@@ -616,10 +616,10 @@ void StartMetricsWindow(const fs::path& root, const Port::Settings& s, const Por
 		return;
 	}
 	const std::string souls = s.souls_mode;
-	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "equilibrado" ? "Modo Souls equilibrado"
+	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "ligero-plus" ? "Modo Souls ligero +" : souls == "equilibrado" ? "Modo Souls equilibrado"
 	                        : souls == "ultra" ? "Modo Souls ultra" : souls == "extremo" ? "Modo Souls extremo"
 	                        : souls == "low" ? "Modo Souls PC low profile" : "Personalizado";
-	const bool  fixed = souls == "ligero" || souls == "equilibrado" || souls == "low";
+	const bool  fixed = souls == "ligero" || souls == "ligero-plus" || souls == "equilibrado" || souls == "low";
 	std::string fg    = fixed ? modo : Port::FrameGenLabel(s.framegen);
 	std::string al    = "No";
 	if (fixed) al = "Ultra";

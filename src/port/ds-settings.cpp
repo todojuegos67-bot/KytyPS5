@@ -115,11 +115,12 @@ const Choice kYesNo[] = {{"0", "No"}, {"1", "Sí"}};
 const int    kYesNoCount = 2;
 const Choice kSoulsModes[] = {{"ninguno", "Personalizado (ningun modo)"},
                               {"ligero", "Modo Souls ligero"},
+                              {"ligero-plus", "Modo Souls ligero +"},
                               {"equilibrado", "Modo Souls equilibrado"},
                               {"ultra", "Modo Souls ultra"},
                               {"extremo", "Modo Souls extremo"},
                               {"low", "Modo Souls PC low profile (900p, todo en bajo)"}};
-const int    kSoulsModeCount = 6;
+const int    kSoulsModeCount = 7;
 const Choice kMetrics[] = {{"0", "No"}, {"1", "FPS"}, {"2", "FPS + detalle"}};
 const int    kMetricsCount = 3;
 const Choice kLanguages[] = {{"3", "Espanol (Espana)"}, {"20", "Espanol (Latinoamerica)"}, {"1", "English (US)"},
@@ -739,7 +740,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// Souls ligero / equilibrado / PC low profile: AMD x2 whatever frame_generation says, the game flipped at 30 / 45 / 30.
 	// (10-23) No DLSS on a graphics card that is not NVIDIA (the launcher does not offer it).
 	const bool  fixed_fg = FixedFg(s);
-	std::string fg_id    = fixed_fg ? "amd-x2" : s.framegen;
+	std::string fg_id    = fixed_fg ? (s.souls_mode == "ligero-plus" ? "amd-x3" : "amd-x2") : s.framegen;
 	if (!pc.nvidia && fg_id.rfind("dlss", 0) == 0) {
 		fg_id = "sin-fg";
 		plan.notes.emplace_back("DLSS frame generation needs NVIDIA: without frame generation");
@@ -768,7 +769,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	double      ratio    = upscaler.empty() ? 0.0 : res->value;
 	// (10-27) DLSS in Souls ligero / PC low profile: DLSS outputs 4K inside and only takes 2160 / an exact ratio (1440, 1256,
 	// 1080, 720): any DLSS quality there renders at 720 (DLAA at 1080 stays).
-	if (upscaler == "dlss" && pc.nvidia && (s.souls_mode == "ligero" || s.souls_mode == "low")) {
+	if (upscaler == "dlss" && pc.nvidia && (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus" || s.souls_mode == "low")) {
 		int mode_w = 0, mode_h = 0;
 		const bool mode = s.fullscreen && std::sscanf(s.resolution.c_str(), "%dx%d", &mode_w, &mode_h) == 2 && mode_h > 0;
 		const int out_h = mode ? mode_h : s.fullscreen && pc.screen_h > 0 ? pc.screen_h : (s.height > 0 ? s.height : 1440);
@@ -797,7 +798,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	EnvList sets;
 	if (low_ram) sets.emplace_back("KYTY_LOWRAM", "1"); // (10-24) the emulator's 16 GB limits
 	if (s.simulate_ram16) sets.emplace_back("KYTY_SIMULATE_RAM_MB", "16384");
-	if (fixed_fg) sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : "43"); // (10-25) Anti-Lag+
+	// (11-11) Souls ligero +: the pad read 4 ms later than ligero's (39 ms before its 30 fps flip slot, the game's ~7 ms
+	// of CPU plus margin): about 4 ms less input latency.
+	if (fixed_fg)
+		sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : s.souls_mode == "ligero-plus" ? "39" : "43"); // (10-25) Anti-Lag+
 	// (10-26) The RAM flush is gone (hitches): none of it, and out of the config too.
 	for (const char* k: {"KYTY_MEMCUT", "KYTY_REBAR_STAGING", "KYTY_STAGING_RING_MB", "KYTY_RAM_TARGET_MB", "KYTY_RAM_FLUSH_SECONDS",
 	                     "KYTY_RAM_FLUSH_MB", "KYTY_RAM_FLUSH_LEVEL"})
@@ -878,7 +882,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// Upscaler sharpness: (10-24) ligero 75 %, (10-24) PC low profile 100 %.
 	std::string sharp = s.sharpness == "auto" ? std::string() : s.sharpness;
 	if (s.souls_mode == "low") sharp = "1";
-	else if (s.souls_mode == "ligero") sharp = "0.75";
+	else if (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus") sharp = "0.75";
 	if (!sharp.empty()) sets.emplace_back("KYTY_UPSCALE_SHARPNESS", sharp);
 	if (fixed_fg) sets.emplace_back("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : "30");
 	if (unlocked && with_fg) sets.emplace_back("KYTY_FRAMEGEN_BASE", "0");
@@ -1271,7 +1275,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 }
 
 bool FixedFg(const Settings& s) {
-	return s.souls_mode == "ligero" || s.souls_mode == "equilibrado" || s.souls_mode == "low";
+	return s.souls_mode == "ligero" || s.souls_mode == "ligero-plus" || s.souls_mode == "equilibrado" || s.souls_mode == "low";
 }
 
 void RtAllOff(Settings* s) {
@@ -1295,7 +1299,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 	const auto post_on = [&]() { s->motion_blur = s->dof = s->vignette = s->bloom = s->eye_adapt = true; };
 	s->rt_light          = "0"; // (10-26) gone
 	s->ambient_occlusion = "0";
-	if (preset == "ligero") {
+	if (preset == "ligero" || preset == "ligero-plus") {
 		// Set-PresetLight; FSR Calidad recommended (10-25); sharpness 75 %.
 		s->texture_reduce = "1";
 		s->quality        = "high";
