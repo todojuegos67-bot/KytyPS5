@@ -1267,9 +1267,9 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	for (const auto& hole: r.holes) ++m_hole_reasons[hole.reason];
 	if (first < r.state.closed.size() || !r.recorder->recorded.empty() || r.recorder->open != SIZE_MAX)
 		scheduler.DiscardRecorded(*r.recorder);
-	// (Its rings' data is read by the command buffers it submitted, done with the last; none submitted: free now. Not
-	// the open command buffer's tick: a speculation thread waiting for its ring would wait for a submission that may
-	// wait for it.)
+	// (Its rings' data is read by the command buffers it submitted, done with the last; none submitted: free now. Under
+	// speculate_batch_submits or a splice the last is the GPU thread's open or held buffer's tick, not yet submitted:
+	// CommandScheduler::Wait refuses such a tick on a speculation's thread, so no worker waits for it.)
 	const auto tick    = r.last_tick;
 	const auto pending = r.recorder->pending_tick;
 	auto&      owner   = *r.owner;

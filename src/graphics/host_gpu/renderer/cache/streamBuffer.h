@@ -133,6 +133,10 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// Copy without waiting for the GPU: none (nothing mapped or committed) when the ring's space is still in use. A
+	// speculation's thread uses it: it may hold a lock the GPU thread takes (the catalog), and the tick it would wait
+	// for may be one only the GPU thread submits.
+	[[nodiscard]] std::optional<uint64_t> TryCopy(const void* source, uint64_t size, uint64_t alignment = 0);
 	// KYTY_STAGING_STATS: an upload the caller sends around the ring (a temporary buffer, the
 	// large path), counted with its use.
 	void NoteBypass(uint64_t size);

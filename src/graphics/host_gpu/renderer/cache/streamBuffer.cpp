@@ -679,6 +679,15 @@ void StreamBuffer::ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept
 	if (m_invalidation_mark) resolve(m_previous_watches, *m_invalidation_mark);
 }
 
+std::optional<uint64_t> StreamBuffer::TryCopy(const void* source, uint64_t size, uint64_t alignment) {
+	EXIT_IF(source == nullptr);
+	const auto [data, offset] = Map(size, alignment, false);
+	if (data == nullptr) return std::nullopt;
+	std::memcpy(data, source, static_cast<size_t>(size));
+	Commit();
+	return offset;
+}
+
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {
 	EXIT_IF(source == nullptr);
 	const auto [data, offset] = Map(size, alignment);

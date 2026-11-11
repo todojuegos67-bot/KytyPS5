@@ -284,6 +284,13 @@ bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out);
 [[nodiscard]] uint64_t ShaderMapGeneration();
 // The hash the pipeline cache knows the shader registered at `addr` by (the code's), 0 when none is.
 [[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
+// A speculation's thread hashes shader code without faulting (ShaderHashAt gives 0 where a read would fault).
+extern thread_local bool t_shader_hash_no_fault;
+struct ShaderHashNoFaultScope {
+	bool old;
+	explicit ShaderHashNoFaultScope(bool on) noexcept: old(t_shader_hash_no_fault) { t_shader_hash_no_fault = on || old; }
+	~ShaderHashNoFaultScope() { t_shader_hash_no_fault = old; }
+};
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
