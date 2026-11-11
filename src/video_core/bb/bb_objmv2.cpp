@@ -19,6 +19,7 @@
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_objmv2_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -119,6 +120,7 @@ struct State {
     u32 frame_vec_draws = 0, static_seen = 0;
     std::array<bool, kSlots> slot_stat{};
     double ts_period = 1.0;
+    u64 sec_gpu_bufs = 0;
     u64 sec_nonzero = 0, sec_stat_frames = 0, sec_not_composed = 0;
     bool logged_nonzero = false, logged_not_composed = false;
 } g;
@@ -522,6 +524,7 @@ void Attach(Vulkan::Scheduler& scheduler, Vulkan::RenderState& state) {
 }
 
 void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
+            VideoCore::BufferCache& buffer_cache,
             u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase) {
     push.objmv_flags = 0;
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
@@ -554,7 +557,15 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
             size = vsharp.GetSize();
             if (vsharp.base_address != 0 && size != 0 && size <= kMaxSnapBytes) {
                 key = Mix(vsharp.base_address, size);
-                if (const auto it = g.dedupe.find(key); it != g.dedupe.end()) {
+                const auto* guest = reinterpret_cast<const void*>(vsharp.base_address);
+                if (buffer_cache.IsRegionGpuModified(vsharp.base_address, size)) {
+                    // Written by the GPU: guest memory is stale, keep the current buffer.
+                    ++g.sec_gpu_bufs;
+                    key = 0;
+                } else if (const auto it = g.dedupe.find(key);
+                           it != g.dedupe.end() && it->second.addr != 0 &&
+                           std::memcmp(g.mapped + (it->second.addr - g.base_addr), guest,
+                                       size) == 0) {
                     sb = it->second;
                     largest = std::max<u32>(largest, u32(size));
                 } else if (memory->IsValidMapping(vsharp.base_address, size)) {
@@ -574,7 +585,7 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
                     sb.hash = XXH3_64bits(src, size);
                 }
                 g.arena_used += bytes;
-                if (key != 0) g.dedupe.emplace(key, sb);
+                if (key != 0) g.dedupe[key] = sb;
                 if (!desc.IsSpecial()) largest = std::max<u32>(largest, u32(size));
             } else {
                 ++g.sec_overflow;
@@ -598,11 +609,12 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
         if (const auto it = g.map_prev.find(k); it != g.map_prev.end() && it->second.count == n) {
             bool moving = blend;
             bool any = false;
+            const bool skeleton = cat == CatSkinned || cat == CatSmallSkel;
             for (u32 hnd = 0; hnd < n; ++hnd) {
                 const SnapBuf& pb = g.bufs_prev[it->second.first + hnd];
                 const SnapBuf& cb = g.bufs_cur[first + hnd];
                 any |= pb.addr != 0 && pb.dwords != 0;
-                if (cb.bytes != 0 && (pb.bytes != cb.bytes || pb.hash != cb.hash)) {
+                if (skeleton && cb.bytes != 0 && (pb.bytes != cb.bytes || pb.hash != cb.hash)) {
                     moving = true;
                 }
             }
@@ -827,7 +839,8 @@ void OnFlip() {
         "{:.3f} us/draw added, history resets {}, frames {}, overflow {} | {} | mode {} | "
         "static-draw error {:.3f} px over {} px ({}; |obj-cam| {:.3f}, |obj| {:.3f}) | check: {} "
         "px, reprojection error obj {:.4f} vs cam {:.4f} ({}), obj better {} / cam better {} | "
-        "attachment 7 non-zero texels {:.0f}/frame, frames not composed {}",
+        "attachment 7 non-zero texels {:.0f}/frame, frames not composed {}, GPU-written buffers "
+        "kept current {}",
         g.sec_vec_draws, g.sec_draws, g.sec_diag_draws, cov,
         g.sec_px_all ? 100.0 * double(g.sec_px_blend) / double(g.sec_px_all) : 0.0,
         g.sec_gpu_n ? g.sec_gpu_ms / g.sec_gpu_n : 0.0,
@@ -841,7 +854,8 @@ void OnFlip() {
         g.sec_chk == 0 ? "no differing px" : (eo <= ec ? "OBJECT VECTORS WIN" : "CAMERA WINS"),
         g.sec_wo, g.sec_wc,
         g.sec_stat_frames ? double(g.sec_nonzero) / double(g.sec_stat_frames) : 0.0,
-        g.sec_not_composed));
+        g.sec_not_composed, g.sec_gpu_bufs));
+    g.sec_gpu_bufs = 0;
     g.sec_nonzero = g.sec_stat_frames = g.sec_not_composed = 0;
     g.sec_draws = g.sec_vec_draws = g.sec_resets = g.sec_frames = g.sec_overflow = 0;
     for (u32 c = 0; c < CatCount; ++c) g.sec_cat[c] = g.sec_cat_vec[c] = 0;

@@ -198,6 +198,7 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
         return; // not a motion draw, or a Mask draw (attachment 7 only keeps the pass going)
     }
     BB::ObjMv2::OnDraw(push_data, pipeline->GetStage(Shader::SwStage::Vertex), memory,
+                       buffer_cache,
                        key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)], identity,
                        count, instances, key.blend_controls[BB::ObjMv2::Attachment].enable != 0,
                        bb_cut.UiPhase());

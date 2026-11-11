@@ -622,11 +622,10 @@ bool Evaluate(const Desc& desc) {
     constants.prevClipToClip = desc.camera_valid && Inverted(desc.clip_to_prev_clip, prev_to_clip)
                                    ? transposed(prev_to_clip)
                                    : Matrix(identity);
-    // desc.jitter is the shift added to the viewport (FSR convention: the geometry moves by +j
-    // px). DLSS takes the sample offset, the opposite sign; BB_DLSS_JITTER_SIGN=1 keeps +j.
+    // desc.jitter as FSR takes it by default; BB_DLSS_JITTER_SIGN=-1 negates it.
     static const float jitter_sign = [] {
         const char* v = std::getenv("BB_DLSS_JITTER_SIGN");
-        const float sign = v != nullptr && *v != '\0' && std::atof(v) > 0 ? 1.0f : -1.0f;
+        const float sign = v != nullptr && *v != '\0' && std::atof(v) < 0 ? -1.0f : 1.0f;
         BBLogf("DLSS: jitter offset sign %+.0f vs the viewport shift (BB_DLSS_JITTER_SIGN)", sign);
         return sign;
     }();
