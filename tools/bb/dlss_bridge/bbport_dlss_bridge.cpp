@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -415,7 +416,20 @@ int32_t FrameGenEvaluate(VkCommandBuffer command, const BbDlssgEvaluate* evaluat
     Inverse(options.clipToCameraView, options.cameraViewToClip);
     options.jitterOffset[0] = evaluate->jitter_x;
     options.jitterOffset[1] = evaluate->jitter_y;
-    options.mvecScale[0] = options.mvecScale[1] = 1.0f;
+    // The vectors are render pixels; NGX DLSS-G (like Streamline's mvecScale) wants them
+    // normalised to the render size. BB_DLSSG_MVEC_SCALE=1 keeps the old 1.0 scale.
+    static const bool raw_scale = [] {
+        const char* v = std::getenv("BB_DLSSG_MVEC_SCALE");
+        return v != nullptr && *v == '1';
+    }();
+    options.mvecScale[0] = raw_scale ? 1.0f : 1.0f / float(state.fg_desc.render_width);
+    options.mvecScale[1] = raw_scale ? 1.0f : 1.0f / float(state.fg_desc.render_height);
+    static bool said = false;
+    if (!said) {
+        said = true;
+        Log(0, "Frame Generation mvecScale %.6f %.6f (%s)", options.mvecScale[0],
+            options.mvecScale[1], raw_scale ? "BB_DLSSG_MVEC_SCALE=1" : "1 / render size");
+    }
     options.cameraUp[1] = 1.0f;
     options.cameraRight[0] = 1.0f;
     options.cameraFwd[2] = 1.0f;
