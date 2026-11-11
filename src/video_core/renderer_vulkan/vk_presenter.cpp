@@ -22,6 +22,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_objmv.h"
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_fg.h"
@@ -818,6 +819,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // bb-149-objmv: the guest frame ended (object vector history v2, bb_objmv2.h), after the
     // frame's compose pass (gpu3: called before it, the compose always returned early).
     BB::ObjMv2::OnFlip();
+    BB::NativeMv::OnPresent();
 
     Frame* frame = GetRenderFrame();
     if (BB::Upscale::Enabled()) {

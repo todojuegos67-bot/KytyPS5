@@ -21,6 +21,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_objmv2_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -146,6 +147,17 @@ struct State {
     u64 sec_gpu_bufs = 0;
     u64 sec_nonzero = 0, sec_stat_frames = 0, sec_not_composed = 0;
     bool logged_nonzero = false, logged_not_composed = false;
+    // bb-velocity: native velocity buffer (every G-buffer draw writes its own vector in its
+    // vertex shader: previous view-projection, previous bone palette). Snapshots of this frame
+    // by (address, size) and by game identity (ring palette, camera block ordinal).
+    bool velocity = true;
+    std::unordered_map<u64, SnapBuf> vel_addr_cur, vel_addr_prev, vel_id_cur, vel_id_prev;
+    std::unordered_map<u64, u32> cam_ord; // camera block (address, size) -> ordinal this frame
+    std::unordered_map<u64, u64> role_cache; // vs hash -> handles that may hold camera / palette
+    u64 vs_frames = 0, vs_draws = 0, vs_native = 0, vs_static = 0, vs_skinned = 0,
+        vs_skinned_ring = 0, vs_skinned_addr = 0, vs_no_cam = 0, vs_no_pal = 0, vs_blend = 0,
+        vs_gpu = 0, vs_bytes = 0;
+    double vs_cpu_ns = 0;
 } g;
 
 // Statistics / check frame: 1 in 60, or 1 in 30 below 75 fps (at least one a second at 30 fps).
@@ -451,7 +463,14 @@ bool Init(const Vulkan::Instance& instance) {
     g.map_prev.reserve(8192);
     g.occ.reserve(8192);
     g.dedupe.reserve(8192);
+    g.velocity = !EnvOff("BB_VELOCITY");
+    if (g.velocity) g.additive = false; // absolute vectors: the previous camera is in the VS
     g.ready = true;
+    Log(g.velocity ? "[velocity] on (bb-velocity): every G-buffer draw writes its own velocity "
+                     "in its vertex shader (previous view-projection from the 864 B camera "
+                     "block, previous bone palette from the skin ring), bb_mv.comp only where "
+                     "none is written; BB_VELOCITY=0: objmv2 as bb-149-objmv"
+                   : "[velocity] off (BB_VELOCITY=0)");
     Log(fmt::format("on: scene draws run their vertex shader once more with last frame's buffers "
                     "(GPU), vectors in attachment 7, composed over bb_mv; snapshot arena {} MiB x "
                     "{}, check {}",
@@ -634,6 +653,179 @@ bool RelDiffer(const float* a, const float* b, u32 pairs) {
     return false;
 }
 
+// bb-velocity helpers live in the anonymous namespace
+namespace {
+// ---------------------------------------------------------------------------------------------
+// bb-velocity (native velocity buffer, as a game with TAA writes it).
+//
+// Identification of a vertex shader's buffers (the table to extend; phase 2 adds rigid world
+// transforms): the role comes from the V# the shader reads, no CPU scan of the draw.
+//   864 B                                   camera block (view-projection): previous frame's copy
+//   640..16384 B, multiple of 16, not 864   bone palette: previous frame's copy of the same game
+//                                           skin ring slot (BB::NativeMv), else same address+size
+//   anything else                           current buffer (world transform: phase 2)
+enum class VelRole : u8 { Current = 0, Camera = 1, Palette = 2 };
+
+VelRole IdentifyVelocityBuffer(u32 size) {
+    if (size == 864) return VelRole::Camera;
+    if (size >= 640 && size <= 16384 && size % 16 == 0) return VelRole::Palette;
+    return VelRole::Current;
+}
+
+// This frame's copy of a guest buffer (once per address, size and frame).
+bool VelSnap(Core::MemoryManager* memory, VideoCore::BufferCache& buffer_cache, u64 addr,
+             u32 size, SnapBuf& out) {
+    const u64 key = Mix(addr, size);
+    if (const auto it = g.vel_addr_cur.find(key); it != g.vel_addr_cur.end()) {
+        out = it->second;
+        return out.addr != 0;
+    }
+    SnapBuf sb{0, 0, 0, 0};
+    const u64 bytes = (u64(size) + 15) & ~u64(15);
+    if (buffer_cache.IsRegionGpuModified(addr, size)) {
+        ++g.vs_gpu; // GPU-written: guest memory is stale
+    } else if (memory->IsValidMapping(addr, size) && g.arena_used + bytes <= kArenaBytes) {
+        std::memcpy(g.mapped + SlotArenaOffset(g.slot) + g.arena_used,
+                    reinterpret_cast<const void*>(addr), size);
+        sb.addr = g.base_addr + SlotArenaOffset(g.slot) + g.arena_used;
+        sb.dwords = size / 4;
+        sb.bytes = size;
+        g.arena_used += bytes;
+        g.vs_bytes += size;
+    } else {
+        ++g.sec_overflow;
+    }
+    g.vel_addr_cur[key] = sb;
+    out = sb;
+    return sb.addr != 0;
+}
+
+void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
+                  VideoCore::BufferCache& buffer_cache, u64 vs_hash, bool blend) {
+    const auto t0 = std::chrono::steady_clock::now();
+    ++g.vs_draws;
+    ++g.sec_draws;
+    if (blend) {
+        // Particles / effects: no vector of their own, bb_mv.comp stays under them.
+        ++g.vs_blend;
+        return;
+    }
+    const u32 n = static_cast<u32>(std::min<size_t>(vs.buffers.size(), Shader::NUM_BUFFERS));
+    // Shader cache: handles that are plain read-only V#s (the only ones that can take a role).
+    u64 cand;
+    if (const auto it = g.role_cache.find(vs_hash); it != g.role_cache.end()) {
+        cand = it->second;
+    } else {
+        cand = 0;
+        for (u32 h = 0; h < n; ++h) {
+            if (!vs.buffers[h].IsSpecial() && !vs.buffers[h].is_written) cand |= 1ull << h;
+        }
+        g.role_cache[vs_hash] = cand;
+    }
+    std::array<SnapBuf, Shader::NUM_BUFFERS> prev{};
+    std::array<bool, Shader::NUM_BUFFERS> use{};
+    bool camera = false, ok = true, skinned = false, ring = false;
+    for (u32 h = 0; h < n && ok; ++h) {
+        if ((cand & (1ull << h)) == 0) continue;
+        const auto sharp = vs.buffers[h].GetSharp(vs);
+        const u32 size = sharp.GetSize();
+        const u64 addr = sharp.base_address;
+        const VelRole role = IdentifyVelocityBuffer(size);
+        if (role == VelRole::Current || addr == 0) continue;
+        SnapBuf cur{0, 0, 0, 0};
+        const bool have_cur = VelSnap(memory, buffer_cache, addr, size, cur);
+        const u64 akey = Mix(addr, size);
+        const SnapBuf* found = nullptr;
+        if (role == VelRole::Camera) {
+            // The camera block: same address last frame, else the same ordinal (the game may
+            // place it anew every frame).
+            u32 ord;
+            if (const auto it = g.cam_ord.find(akey); it != g.cam_ord.end()) {
+                ord = it->second;
+            } else {
+                ord = static_cast<u32>(g.cam_ord.size());
+                g.cam_ord[akey] = ord;
+                if (have_cur) g.vel_id_cur[Mix(0x63616d65ull, ord)] = cur;
+            }
+            if (const auto it = g.vel_addr_prev.find(akey);
+                it != g.vel_addr_prev.end() && it->second.addr != 0) {
+                found = &it->second;
+            } else if (const auto it2 = ord < 4 ? g.vel_id_prev.find(Mix(0x63616d65ull, ord))
+                                                : g.vel_id_prev.end();
+                       it2 != g.vel_id_prev.end() && it2->second.addr != 0) {
+                found = &it2->second;
+            }
+            if (found == nullptr) {
+                ++g.vs_no_cam;
+                ok = false;
+                break;
+            }
+            camera = true;
+        } else {
+            skinned = true;
+            const auto id = BB::NativeMv::LookupPalette(addr);
+            if (id.key != 0) {
+                const u64 ikey = Mix(Mix(id.key, id.slot_offset), size);
+                if (have_cur) g.vel_id_cur[ikey] = cur;
+                if (const auto it = g.vel_id_prev.find(ikey);
+                    it != g.vel_id_prev.end() && it->second.addr != 0) {
+                    found = &it->second;
+                    ring = true;
+                }
+            }
+            if (found == nullptr) {
+                if (const auto it = g.vel_addr_prev.find(akey);
+                    it != g.vel_addr_prev.end() && it->second.addr != 0) {
+                    found = &it->second;
+                }
+            }
+            if (found == nullptr) {
+                ++g.vs_no_pal;
+                ok = false;
+                break;
+            }
+        }
+        prev[h] = *found;
+        use[h] = true;
+    }
+    const u64 bytes = u64(n) * 16;
+    if (ok && camera && g.history && g.table_used + bytes <= kTableBytes) {
+        const u64 off = SlotTableOffset(g.slot) + g.table_used;
+        u32* e = reinterpret_cast<u32*>(g.mapped + off);
+        const u64 dummy = g.base_addr + 2048;
+        for (u32 h = 0; h < n; ++h) {
+            const u64 a = use[h] ? prev[h].addr : dummy;
+            e[h * 4 + 0] = u32(a);
+            e[h * 4 + 1] = u32(a >> 32);
+            e[h * 4 + 2] = use[h] ? prev[h].dwords : 1u;
+            e[h * 4 + 3] = use[h] ? 1u : 0u;
+        }
+        g.table_used += bytes;
+        const u64 ea = g.base_addr + off;
+        push.objmv_entry = {u32(ea), u32(ea >> 32)};
+        // Static draws: 1 in kStaticSample on statistics frames is class 2 (compared with
+        // bb_mv.comp's camera vector: the [velocity] static check), else class 1.
+        const bool diag = !skinned && g.stat_frame && (g.static_seen++ % kStaticSample) == 0;
+        push.objmv_flags = diag ? 3u : 1u;
+        ++g.vs_native;
+        ++g.frame_vec_draws;
+        ++g.sec_vec_draws;
+        if (diag) ++g.sec_diag_draws;
+        if (skinned) {
+            ++g.vs_skinned;
+            ring ? ++g.vs_skinned_ring : ++g.vs_skinned_addr;
+        } else {
+            ++g.vs_static;
+        }
+    } else if (ok && camera && g.history) {
+        ++g.sec_overflow;
+    }
+    g.vs_cpu_ns +=
+        std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+}
+
+} // namespace
+
 void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
             VideoCore::BufferCache& buffer_cache,
             u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase) {
@@ -641,6 +833,10 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
     if (g.ready && g.flip_pending) Rollover();
     if (!g.ready || ui_phase) return;
+    if (g.velocity) {
+        VelocityDraw(push, vs, memory, buffer_cache, vs_hash, blend);
+        return;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     ++g.sec_draws;
 
@@ -951,12 +1147,16 @@ void Rollover() {
         std::swap(g.map_prev, g.map_cur);
         std::swap(g.bufs_prev, g.bufs_cur);
         std::swap(g.rel_prev, g.rel_cur);
+        std::swap(g.vel_addr_prev, g.vel_addr_cur);
+        std::swap(g.vel_id_prev, g.vel_id_cur);
         g.history = true;
     } else {
         if (g.history) ++g.sec_resets;
         g.map_prev.clear();
         g.bufs_prev.clear();
         g.rel_prev.clear();
+        g.vel_addr_prev.clear();
+        g.vel_id_prev.clear();
         g.history = false;
         if (!had_pass) g.prev_valid = false;
     }
@@ -964,6 +1164,10 @@ void Rollover() {
     g.map_cur.clear();
     g.bufs_cur.clear();
     g.rel_cur.clear();
+    g.vel_addr_cur.clear();
+    g.vel_id_cur.clear();
+    g.cam_ord.clear();
+    if (had_pass) ++g.vs_frames;
     std::swap(g.use_prev, g.use_cur);
     g.use_cur.clear();
     g.occ.clear();
@@ -1017,7 +1221,7 @@ void Rollover() {
         g.sec_static_px ? double(g.sec_static_abs) / 16.0 / double(g.sec_static_px) : 0.0;
     const double st_zero =
         g.sec_static_px ? double(g.sec_static_zero) / 16.0 / double(g.sec_static_px) : 0.0;
-    if (g.sec_static_px >= 2000) {
+    if (!g.velocity && g.sec_static_px >= 2000) {
         // Pick the mode whose static-draw error is smaller (hysteresis 0.1 px).
         if (g.additive && st_abs + 0.1 < st_zero) g.additive = false;
         else if (!g.additive && st_zero + 0.1 < st_abs) g.additive = true;
@@ -1045,6 +1249,33 @@ void Rollover() {
         g.sec_wo, g.sec_wc,
         g.sec_stat_frames ? double(g.sec_nonzero) / double(g.sec_stat_frames) : 0.0,
         g.sec_not_composed, g.sec_gpu_bufs));
+    if (g.velocity) {
+        // Native share of the G-buffer pixels (statistics frames): pixels written by a draw's own
+        // vector (moving / skinned class 1 + the sampled static draws, class 2) over all pixels;
+        // the rest keeps bb_mv.comp (backup: sky, particles, draws without a previous camera).
+        const double native_px =
+            g.sec_px_all ? 100.0 * double(g.sec_px_obj - g.sec_px_blend + g.sec_static_px) /
+                               double(g.sec_px_all)
+                         : 0.0;
+        const double f = double(std::max<u64>(1, g.vs_frames));
+        Log(fmt::format(
+            "[velocity] native velocity draws {:.1f}/frame of {:.1f} (static {:.1f}, skinned "
+            "{:.1f}: ring palette {:.1f}, palette by address {:.1f}) | G-buffer px native {:.1f}% "
+            "(sampled statics included), backup bb_mv {:.1f}% | static check |native-cam| "
+            "{:.3f} px over {} px ({}) | without previous camera {:.1f}/frame, without previous "
+            "palette {:.1f}/frame, blended (backup) {:.1f}/frame, GPU-written skipped {} | CPU "
+            "{:.3f} us/draw, copied {:.0f} B/frame",
+            double(g.vs_native) / f, double(g.vs_draws) / f, double(g.vs_static) / f,
+            double(g.vs_skinned) / f, double(g.vs_skinned_ring) / f,
+            double(g.vs_skinned_addr) / f, native_px, g.sec_px_all ? 100.0 - native_px : 0.0,
+            st_abs, g.sec_static_px,
+            g.sec_static_px == 0 ? "no static px" : (st_abs <= 0.5 ? "PASS" : "FAIL"),
+            double(g.vs_no_cam) / f, double(g.vs_no_pal) / f, double(g.vs_blend) / f, g.vs_gpu,
+            g.vs_draws ? g.vs_cpu_ns / 1000.0 / double(g.vs_draws) : 0.0, double(g.vs_bytes) / f));
+        g.vs_frames = g.vs_draws = g.vs_native = g.vs_static = g.vs_skinned = g.vs_skinned_ring =
+            g.vs_skinned_addr = g.vs_no_cam = g.vs_no_pal = g.vs_blend = g.vs_gpu = g.vs_bytes = 0;
+        g.vs_cpu_ns = 0;
+    }
     Log(fmt::format("[objmv-gpu6] moving test {}: changed palettes kept static {}/s (shared "
                     "constant blocks, read by >= {} draws: {}); CPU per draw: hashed {:.0f} B, "
                     "copied {:.0f} B, dedupe hits {}",
