@@ -9,8 +9,20 @@
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/bb/fsr411/fsr411.h"
 #include <memory>
+#include <cstdlib>
 #include "video_core/host_shaders/bb_fsr4_prep_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+
+// gpu7: BB_FSR_MV_SIGN / BB_FSR_JITTER_SIGN (-1 negates) for every AMD path (FSR 4, FSR 3.1,
+// FSR 3 FG); by default the same physical meaning as DLSS (vectors towards the previous frame in
+// render pixels, the jitter as DLSS gets it).
+static float BbFsrSign(const char* name) {
+    const char* v = std::getenv(name);
+    const float sign = v != nullptr && *v != '\0' && std::atof(v) < 0 ? -1.0f : 1.0f;
+    BBLogf("[fsr-sign] %s %+.0f", name, sign);
+    return sign;
+}
+
 namespace Libs::Graphics::Fsr4 {
 struct UpscaleDesc {
     GraphicContext* graphics = nullptr;
@@ -1533,10 +1545,12 @@ bool Evaluate(const Desc& desc) {
     d.render = desc.render;
     d.upscale = desc.upscale;
     d.reset = desc.reset;
-    d.jitter[0] = desc.jitter[0];
-    d.jitter[1] = desc.jitter[1];
-    d.mv_scale[0] = 1.0f;
-    d.mv_scale[1] = 1.0f;
+    static const float mv_sign = BbFsrSign("BB_FSR_MV_SIGN");
+    static const float jitter_sign = BbFsrSign("BB_FSR_JITTER_SIGN");
+    d.jitter[0] = jitter_sign * desc.jitter[0];
+    d.jitter[1] = jitter_sign * desc.jitter[1];
+    d.mv_scale[0] = mv_sign;
+    d.mv_scale[1] = mv_sign;
     return Libs::Graphics::Fsr4::Upscale(g_ctx, d);
 }
 } // namespace BB::SR::Fsr4

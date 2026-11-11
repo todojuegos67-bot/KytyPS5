@@ -195,6 +195,16 @@ bool EnvOn(const char* name, bool fallback) {
     if (value == nullptr || *value == '\0') return fallback;
     return *value != '0';
 }
+// gpu7: BB_FSR_MV_SIGN / BB_FSR_JITTER_SIGN (-1 negates) for every AMD path (FSR 4, FSR 3.1,
+// FSR 3 FG); by default the same physical meaning as DLSS (vectors towards the previous frame in
+// render pixels, the jitter as DLSS gets it).
+static float BbFsrSign(const char* name) {
+    const char* v = std::getenv(name);
+    const float sign = v != nullptr && *v != '\0' && std::atof(v) < 0 ? -1.0f : 1.0f;
+    BBLogf("[fsr-sign] %s %+.0f", name, sign);
+    return sign;
+}
+
 float EnvFloat(const char* name, float fallback) {
     const char* value = Env(name);
     return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value)) : fallback;
@@ -1277,14 +1287,16 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     const auto camera = FromCamera(inputs->view_to_clip, inputs->camera_valid);
     // Our vectors are render pixels towards the previous frame, as FSR 3.1 takes them
     // (KYTY_FSR3_MV_SIGN=-1 flips them).
-    static const float mv_sign = EnvFloat("KYTY_FSR3_MV_SIGN", 1.0f) >= 0 ? 1.0f : -1.0f;
+    static const float mv_sign = (EnvFloat("KYTY_FSR3_MV_SIGN", 1.0f) >= 0 ? 1.0f : -1.0f) *
+                                 BbFsrSign("BB_FSR_MV_SIGN");
+    static const float jitter_sign = BbFsrSign("BB_FSR_JITTER_SIGN");
     ffxDispatchDescFrameGenerationPrepare prepare{};
     prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
     prepare.frameID = g_frame_id;
     prepare.flags = config.flags;
     prepare.commandList = slot.command;
     prepare.renderSize = {inputs->render.width, inputs->render.height};
-    prepare.jitterOffset = {inputs->jitter[0], inputs->jitter[1]};
+    prepare.jitterOffset = {jitter_sign * inputs->jitter[0], jitter_sign * inputs->jitter[1]};
     prepare.motionVectorScale = {mv_sign, mv_sign};
     prepare.frameTimeDelta = static_cast<float>(std::clamp(delta_ms, 1.0, 100.0));
     prepare.unused_reset = inputs->reset;

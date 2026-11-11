@@ -66,6 +66,16 @@ uint32_t g_flags = 0;
 bool g_failed = false;
 uint32_t g_errors = 0;
 
+// gpu7: BB_FSR_MV_SIGN / BB_FSR_JITTER_SIGN (-1 negates) for every AMD path (FSR 4, FSR 3.1,
+// FSR 3 FG); by default the same physical meaning as DLSS (vectors towards the previous frame in
+// render pixels, the jitter as DLSS gets it).
+static float BbFsrSign(const char* name) {
+    const char* v = std::getenv(name);
+    const float sign = v != nullptr && *v != '\0' && std::atof(v) < 0 ? -1.0f : 1.0f;
+    BBLogf("[fsr-sign] %s %+.0f", name, sign);
+    return sign;
+}
+
 float EnvFloat(const char* name, float fallback) {
     const char* value = std::getenv(name);
     return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value)) : fallback;
@@ -193,7 +203,9 @@ bool Evaluate(const Desc& desc) {
                desc.hdr ? "HDR" : "LDR", desc.depth_inverted ? "inverted" : "forward");
     }
     // Our vectors: render pixels towards the previous frame (BB_FSR3_MV_SIGN=-1 flips).
-    static const float mv_sign = EnvFloat("BB_FSR3_MV_SIGN", 1.0f) >= 0 ? 1.0f : -1.0f;
+    static const float mv_sign = (EnvFloat("BB_FSR3_MV_SIGN", 1.0f) >= 0 ? 1.0f : -1.0f) *
+                                 BbFsrSign("BB_FSR_MV_SIGN");
+    static const float jitter_sign = BbFsrSign("BB_FSR_JITTER_SIGN");
     ffxDispatchDescUpscale up{};
     up.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     up.commandList = static_cast<VkCommandBuffer>(desc.cmd);
@@ -207,7 +219,7 @@ bool Evaluate(const Desc& desc) {
     }
     up.output.state = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
     up.output.description.usage = FFX_API_RESOURCE_USAGE_UAV;
-    up.jitterOffset = {desc.jitter[0], desc.jitter[1]};
+    up.jitterOffset = {jitter_sign * desc.jitter[0], jitter_sign * desc.jitter[1]};
     up.motionVectorScale = {mv_sign, mv_sign};
     up.renderSize = {desc.render.width, desc.render.height};
     up.upscaleSize = {desc.upscale.width, desc.upscale.height};
