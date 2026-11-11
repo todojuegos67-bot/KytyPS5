@@ -1004,7 +1004,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// run-windows.ps1, in its order.
 	if (env.Get("KYTY_RENDER_CPUS").empty() && env.Has("KYTY_RECORDING_CPUS")) env.Set("KYTY_RENDER_CPUS", env.Get("KYTY_RECORDING_CPUS"));
 	if (env.Get("KYTY_ASYNC_UPLOAD") == "1") env.Set("KYTY_ASYNC_UPLOAD", "2");
-	if (s.skip_intro) env.Set("KYTY_SKIP_INTRO", "1");
+	// (11-11) Always set: "" clears a KYTY_SKIP_INTRO=1 inherited from an earlier run (the restart after an update or the DLSS
+	// fresh process kept it, so "Saltar intro" off still skipped).
+	env.Set("KYTY_SKIP_INTRO", s.skip_intro ? "1" : "");
 	env.Default("KYTY_BUFFER_RECLAIM", "1");
 	env.Default("KYTY_DRAW_PACKETS", "1");
 	env.Default("KYTY_PARTIAL_IMAGE_DIRTY", "1");
