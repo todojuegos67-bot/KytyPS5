@@ -2572,7 +2572,7 @@ uint64_t AvailablePhysicalMemory() {
 	return GlobalMemoryStatusEx(&status) != 0 ? status.ullAvailPhys : 0;
 }
 
-CommitState SystemCommit() {
+CommitState SystemCommitState() {
 	MEMORYSTATUSEX status {};
 	status.dwLength = sizeof(status);
 	if (GlobalMemoryStatusEx(&status) == 0) return {};
@@ -3227,7 +3227,7 @@ uint64_t AvailablePhysicalMemory() {
 	return available;
 }
 
-CommitState SystemCommit() {
+CommitState SystemCommitState() {
 	uint64_t limit = 0, committed = 0;
 	if (FILE* file = std::fopen("/proc/meminfo", "r")) {
 		char line[256];

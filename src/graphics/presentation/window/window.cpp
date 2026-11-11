@@ -876,7 +876,7 @@ void WindowContext::ProcessEvent(double time_s) {
 			GameEventMouse(mb);
 			// (Notches away from the user count as up whatever the system's scroll direction.)
 			if (event->wheel.which != SDL_TOUCH_MOUSEID)
-				HostInputMouseWheel(event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event->wheel.y : event->wheel.y);
+				HostInputMouseWheelNotches(event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event->wheel.y : event->wheel.y);
 
 			break;
 		}

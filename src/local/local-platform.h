@@ -223,7 +223,7 @@ struct CommitState {
 	uint64_t available = 0;
 	uint64_t limit     = 0;
 };
-CommitState SystemCommit();
+CommitState SystemCommitState(); // (des-up-1110: upstream's SystemCommit, renamed beside ours)
 // KYTY_HEAP_TRIM=1 (off by default): the heap's free pages go back to the system on a thread of its
 // own, checked every 30 s, after 64 MiB of growth since the last trim; the first 10 are told.
 // Linux (glibc): malloc_trim (in Demon's Souls 130-150 MiB of its 1 GB of arenas were free chunks

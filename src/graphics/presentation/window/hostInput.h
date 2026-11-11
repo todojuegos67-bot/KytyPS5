@@ -16,7 +16,7 @@ void               HostInputKey(int key_code, bool down);
 [[nodiscard]] bool HostInputDefaultKeysUsed();
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
 // Wheel notches (up > 0, down < 0) on the controls mapped to Mouse:WheelUp / Mouse:WheelDown: a short press each.
-void               HostInputMouseWheel(int notches);
+void               HostInputMouseWheelNotches(int notches); // (des-up-1110: upstream's, renamed)
 void               HostInputToggleMouseToJoystick();
 // KYTY_KBM=1: keyboard and mouse play (hostInput.cpp). The motion/wheel calls return true when they took the event.
 [[nodiscard]] bool HostInputKbmEnabled();

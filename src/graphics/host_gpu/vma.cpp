@@ -633,7 +633,7 @@ void GraphicContext::DescribeAllocationFailure(const char* what, uint64_t bytes)
 	if (described.fetch_add(1, std::memory_order_relaxed) >= 4) return;
 	VmaTotalStatistics statistics {};
 	vmaCalculateStatistics(allocator, &statistics);
-	const auto commit = LocalPlatform::SystemCommit();
+	const auto commit = LocalPlatform::SystemCommitState();
 	std::printf("Vulkan: %s of %" PRIu64 " MiB not made: VMA holds %u memory objects (the GPU's limit %u); the PC has %" PRIu64
 	            " MiB of RAM left and %" PRIu64 " MiB to commit of %" PRIu64 " MiB\n",
 	            what, bytes >> 20u, statistics.total.statistics.blockCount, physical_device_properties.limits.maxMemoryAllocationCount,

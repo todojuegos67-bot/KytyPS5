@@ -1554,7 +1554,7 @@ static int UpdateWheel(uint64_t now) {
 	}
 }
 
-void HostInputMouseWheel(int notches) {
+void HostInputMouseWheelNotches(int notches) {
 	const auto& map = GetInputMap();
 	if (!map.Custom() || notches == 0) return;
 	const auto control = map.FindMouseButton(notches > 0 ? MOUSE_WHEEL_UP : MOUSE_WHEEL_DOWN);
