@@ -565,12 +565,12 @@ private:
 // (ds-pc-port45) The translator's version: the SPIR-V store is keyed on it, not on the build. Bump it whenever a change
 // makes the shader recompiler (graphics/shader/recompiler, the resource plans, the prefetch's records) translate any
 // program differently; builds that leave the translation alone keep every translation already on disk.
-static constexpr uint32_t SpirvTranslatorVersion = 1;
+static constexpr uint32_t SpirvTranslatorVersion = 2; // (2: des-up-1110, upstream translator)
 
 // Everything the translation of a program depends on besides its inputs (SpirvDiskStore's identity).
 static std::string SpirvDiskIdentity(const std::string& prefetch_identity) {
 	std::string id = fmt::format("tr{}|{}|{:08x}|{}", SpirvTranslatorVersion, prefetch_identity,
-	                             ShaderRecompiler::Frontend::TranslatorDeviceFeatures(), ShaderRecompiler::IR::PortableShaders() ? 1 : 0);
+	                             ShaderRecompiler::Frontend::TranslatorDeviceFeatures(), 0);
 	// (The translator's own switches: graphics/shader reads these.)
 	for (const char* name: {"KYTY_LANE_LOCAL", "KYTY_LANE_LOCAL_COOP_RANGE", "KYTY_LANE_LOCAL_COOP_SKIP", "KYTY_LANE_LOCAL_UNIFORM_LOADS",
 	                        "KYTY_PORTABLE_SHADERS", "KYTY_PS_WAVE_OR", "KYTY_SHADOW_FILTER", "KYTY_SHADOW_FILTER_RADIUS",

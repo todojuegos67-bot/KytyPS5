@@ -1355,7 +1355,6 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 		prepared.images.push_back(std::move(binding));
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
-	const bool material = MaterialSamplers(program);
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i],
 		                                          LodBiasForSampler(m_context.GetTextureCache(), program, prepared, i,
