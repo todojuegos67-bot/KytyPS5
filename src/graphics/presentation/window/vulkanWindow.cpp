@@ -696,9 +696,14 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	// the game's compute programs at 1-1 (the Windows driver's RDNA2 crash above is AMD's compiler, not RADV's).
 	const bool steam_deck_radv = device_properties.vendorID == 0x1002u && (id == 0x163fu || id == 0x1435u) &&
 	                             std::string_view(device_properties.deviceName.data()).find("RADV") != std::string_view::npos;
+	// And a GPU whose compute subgroups are 64 lanes and nothing else (GCN: RX 400/500, Vega): emulated, a wave is one
+	// program's 32 invocations of two lanes each, a whole subgroup only where subgroups have 32 lanes; on 64, two waves of
+	// a workgroup share one subgroup, their ballots and EXEC masks mixed (issue #305: an RX Vega 56's opening movie, its
+	// right half garbage; with KYTY_COMPUTE_WAVE64=1 it played right, AMD's older compiler refusing none of them).
+	const bool compute_64_lanes_only = graphics.min_subgroup_size > 32u;
 	const char* setting = std::getenv("KYTY_COMPUTE_WAVE64");
 	const bool  wanted  = setting != nullptr && *setting != '\0' ? std::string_view(setting) != "0"
-	                                                             : amd_rdna3_or_later || steam_deck_radv;
+	                                                             : amd_rdna3_or_later || steam_deck_radv || compute_64_lanes_only;
 	graphics.compute_wave64_native = graphics.compute_subgroup_size_control_enabled && wanted;
 	graphics.steam_deck_radv       = steam_deck_radv;
 	std::printf("Vulkan compute wave64: %s (%s, device 0x%04x:0x%04x)\n",
@@ -706,6 +711,7 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	            setting != nullptr && *setting != '\0' ? "KYTY_COMPUTE_WAVE64"
 	            : amd_rdna3_or_later                    ? "AMD RDNA3 or later"
 	            : steam_deck_radv                       ? "Steam Deck GPU with RADV"
+	            : compute_64_lanes_only                 ? "64-lane compute subgroups only"
 	                                                    : "default",
 	            device_properties.vendorID, id);
 	// The cooperative halves (ShaderRecompiler::Frontend::TranslatorFeatures) only on NVIDIA GPUs, where they were
