@@ -11,6 +11,7 @@
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
 #include "core/bb_kbmcam.h"
+#include "core/bb_native_mv_hook.h"
 #include "core/bb_respatch.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
@@ -444,6 +445,10 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                      total.uncovered_inplace_cpu_patch_instruction_count,
                      total.uncovered_unsupported_cpu_patch_instruction_count);
         }
+    }
+    if (MemoryPatcher::g_eboot_address == base_virtual_addr) {
+        // After the static patching: the detours are the code that runs.
+        BB::NativeMvHook::OnEbootPatched(base_virtual_addr, base_size);
     }
 #endif
 }

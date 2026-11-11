@@ -75,7 +75,7 @@ void Attach(Vulkan::Scheduler& scheduler, Vulkan::RenderState& state);
 // Rasterizer, every motion draw (after BindResources): snapshot + table entry, push constants.
 // `identity`: index buffer address or indirect argument address.
 void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
-            VideoCore::BufferCache& buffer_cache,
+            VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler,
             u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase);
 // Presenter (bb_present_sr.cpp), after bb_mv.comp: the object vectors over the camera ones
 // (`mv` RG16F, General); `color` the presented colour (RGBA16F, General) for the check.

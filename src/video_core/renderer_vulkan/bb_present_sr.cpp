@@ -14,6 +14,7 @@
 #include "common/logging/log.h"
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/bb/bb_objmv2.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -346,6 +347,9 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
     cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
     cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
+    // bb-velocity: the native per-draw velocity (bb_objmv2.h) over the camera vectors, only where
+    // a G-buffer draw wrote its own vector; bb_mv stays everywhere else.
+    BB::ObjMv2::Compose(cmd, motion.view, color.view, in, cam.reset);
     lum_index ^= 1;
     lum_valid = true;
     Barrier(cmd, color, vk::ImageLayout::eShaderReadOnlyOptimal);

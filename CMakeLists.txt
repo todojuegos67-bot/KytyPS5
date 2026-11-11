@@ -859,6 +859,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/number_utils.cpp
            src/common/memory_patcher.h
            src/common/memory_patcher.cpp
+           src/core/bb_native_mv_hook.cpp
+           src/core/bb_native_mv_hook.h
            src/common/multi_level_page_table.h
            ${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp
            src/common/scm_rev.h
@@ -1215,6 +1217,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_fg_fsr3.cpp
                src/video_core/bb/bb_fg_dlssg.cpp
                src/video_core/bb/bb_fg_internal.h
+               src/video_core/bb/bb_native_mv.cpp
+               src/video_core/bb/bb_native_mv.h
                src/video_core/bb/bb_kyty_compat.h
                src/video_core/bb/bb_sr.h
                src/video_core/bb/bb_sr_dlss.cpp

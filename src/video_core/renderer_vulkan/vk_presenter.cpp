@@ -17,6 +17,7 @@
 #include "imgui/renderer/imgui_impl_vulkan.h"
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
+#include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_objmv2.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
@@ -1347,6 +1348,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         BbDestroyGenerated(frame);
     }
     bb_sr->FrameEnd(draw_scheduler.CommandBuffer());
+    // bb-velocity: the guest frame ended, after its compose pass (bb_sr->Run) was recorded.
+    BB::ObjMv2::OnFlip();
+    BB::NativeMv::OnPresent();
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
