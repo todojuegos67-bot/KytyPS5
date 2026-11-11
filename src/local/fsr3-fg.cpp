@@ -1257,6 +1257,71 @@ double RealFrameInterval() {
 	return Active() ? CapInterval() : 0.0;
 }
 
+// (11-11) KYTY_FSR3_SWITCH_GUARD (default 1; 0: the 11-10 switch, the graphics queue idle only). Generation switching
+// off or back on (the F2 menu, the game's menus, loading, movies) makes FidelityFX wait for its presents
+// (FrameInterpolationSwapChainVK::waitForPresents): vkQueueWaitIdle on the game queue, its present queue and
+// vkDeviceWaitIdle, without the emulator's queue locks, and while its presenter thread may still be presenting the
+// last real frame's generated frames on that present queue (with x3 at 30 real fps it presents all the time: one
+// present every ~11 ms, the real one ~33 ms after the frame came). Both are host accesses Vulkan requires to be
+// externally synchronized; the device was lost at that switch (11-11: x3, the third F2 menu open, "deferred
+// vkQueueSubmit failed: -4" one frame after it, then every FidelityFX command list stuck in flight). Now the switch
+// first lets the presenter thread present what it was given, then holds the graphics and present queues' locks
+// (no submission of ours meets FidelityFX's waits) and lets the GPU finish, and only then reconfigures.
+static bool SwitchGuardWanted() {
+	static const bool wanted = EnvOn("KYTY_FSR3_SWITCH_GUARD", true);
+	return wanted;
+}
+
+// Waits until the frame interpolation swapchain's presenter thread is done: its count of real presents unchanged for
+// a little over one present interval (real frame time / 2 + 2 ms, 6-40 ms), at most about three real frames.
+static double WaitPresenterIdle(vk::SwapchainKHR swapchain, double real_interval_ms, uint64_t& presents, bool& settled) {
+	settled  = true;
+	presents = 0;
+	if (g_functions.pOutGetLastPresentCountFFXAPI == nullptr) return 0.0;
+	const auto count = [&] { return g_functions.pOutGetLastPresentCountFFXAPI(static_cast<VkSwapchainKHR>(swapchain)); };
+	const double interval = std::clamp(real_interval_ms, 4.0, 100.0);
+	const auto   quiet    = std::chrono::duration<double, std::milli>(std::clamp(interval * 0.5 + 2.0, 6.0, 40.0));
+	const auto   limit    = std::chrono::duration<double, std::milli>(std::min(interval * 3.0 + 40.0, 250.0));
+	const auto   begin    = std::chrono::steady_clock::now();
+	auto         changed  = begin;
+	uint64_t     last     = count();
+	const uint64_t first  = last;
+	for (;;) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - changed >= quiet) break;
+		if (now - begin >= limit) {
+			settled = false;
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		const uint64_t value = count();
+		if (value != last) {
+			last    = value;
+			changed = std::chrono::steady_clock::now();
+		}
+	}
+	presents = last - first;
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+}
+
+// The graphics and present queues' locks, held for a switch (the order CreateFrameGeneration takes them in).
+struct QueueHold {
+	Common::Mutex* graphics = nullptr;
+	Common::Mutex* present  = nullptr;
+	void Take(GraphicContext& g) {
+		graphics = &g.queue_mutex;
+		graphics->Lock();
+		if (g.present_queue != nullptr && &g.present_queue_mutex != &g.queue_mutex) {
+			present = &g.present_queue_mutex;
+			present->Lock();
+		}
+	}
+	~QueueHold() {
+		if (present != nullptr) present->Unlock();
+		if (graphics != nullptr) graphics->Unlock();
+	}
+};
+
 void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs, vk::SwapchainKHR swapchain,
                    vk::Extent2D backbuffer, vk::Format format) {
 	if (!Active()) return;
@@ -1397,7 +1462,29 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	config.frameID              = g_frame_id;
 	// (11-10) Generation switching off or back on (the F2 menu, loading, movies): the GPU first finishes the generated
 	// frames in flight. The device was lost right at such a switch (after the menu opened / closed, x2-x4 generating).
-	if (generate != g_generating) {
+	const bool switching = generate != g_generating;
+	QueueHold  hold;
+	if (switching && SwitchGuardWanted()) {
+		// (11-11) See SwitchGuardWanted: the presenter thread done, our submissions held off, the GPU idle; the locks
+		// stay held through the reconfiguration below (FidelityFX's own waits), released at the end of this function.
+		uint64_t   presents = 0;
+		bool       settled  = true;
+		const double idle_ms = WaitPresenterIdle(swapchain, delta_ms, presents, settled);
+		const auto  gpu_begin = std::chrono::steady_clock::now();
+		hold.Take(graphics);
+		const vk::Result idle = graphics.readback_queue == nullptr ? graphics.device.waitIdle() : graphics.queue.waitIdle();
+		if (idle == vk::Result::eSuccess && graphics.readback_queue != nullptr && graphics.present_queue != nullptr)
+			(void)graphics.present_queue.waitIdle();
+		const double gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gpu_begin).count();
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 24 || idle != vk::Result::eSuccess) {
+			std::printf("FSR3 FG: generation switching %s: FidelityFX presenter %s after %.1f ms (%llu presents), queues held, "
+			            "GPU idle after %.1f ms (%s) (KYTY_FSR3_SWITCH_GUARD=0: as before)\n",
+			            generate ? "on" : "off", settled ? "idle" : "still presenting", idle_ms,
+			            static_cast<unsigned long long>(presents), gpu_ms, vk::to_string(idle).c_str());
+			std::fflush(stdout);
+		}
+	} else if (switching) {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		(void)graphics.queue.waitIdle();
 	}
