@@ -766,6 +766,9 @@ struct PipelineCache::ProgramCache {
 			// moves its address by the same amount (a pointer into a ring of tables).
 			std::vector<int8_t>                          read_word;
 			uint32_t                                     since_check = 0;
+			// Full evaluations learned from and patches applied: a program with 64 of the first
+			// and none of the second stops learning (its read logs and copies cost every miss).
+			uint32_t                                     learned_from = 0, patches = 0;
 		} patch;
 	};
 	SourceEntry* memo_worst = nullptr;
@@ -796,7 +799,7 @@ struct PipelineCache::ProgramCache {
 	uint64_t patch_no_base = 0, patch_unlearned = 0, patch_reads_changed = 0, patch_banned_programs = 0;
 	uint64_t patch_obs_ok = 0, patch_obs_log = 0, patch_obs_spec = 0, patch_obs_other = 0, patch_obs_unexplained = 0;
 	uint64_t patch_obs_many = 0, patch_obs_memory = 0, patch_obs_ambiguous = 0, patch_obs_shape = 0;
-	uint64_t patch_relocated_reads = 0;
+	uint64_t patch_relocated_reads = 0, patch_gave_up = 0;
 	std::chrono::steady_clock::time_point patch_report = std::chrono::steady_clock::now();
 
 	static uint32_t* PatchSlot(ShaderRecompiler::IR::ResourceSnapshot& r, const PatchPosition& p) {
@@ -882,6 +885,7 @@ struct PipelineCache::ProgramCache {
 		}
 		entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 		patch_hits++;
+		pt.patches++;
 		return true;
 	}
 
@@ -891,6 +895,11 @@ struct PipelineCache::ProgramCache {
 	                ShaderReadChunks::ReadLog& log) {
 		auto& pt = entry.patch;
 		if (pt.banned) return;
+		if (++pt.learned_from >= 64u && pt.patches == 0) {
+			pt.banned = true;
+			patch_gave_up++;
+			return;
+		}
 		const auto& ud = runtime.user_data;
 		bool keep_relations = true;
 		if (pt.valid && pt.key.size() == ud.size() && pt.shader_base == runtime.shader_base &&
@@ -1128,7 +1137,7 @@ struct PipelineCache::ProgramCache {
 		         "at the memo.miss us/call); declined: %llu no base/same inputs, %llu a changed word not learned, %llu "
 		         "logged reads changed; learning: %llu consistent, inconsistent %llu reads / %llu specialization / %llu "
 		         "other fields / %llu unexplained words, %llu too many words changed, %llu guest words changed, %llu ambiguous, "
-		         "%llu new read structure; %llu reads relocated with a pointer word; checks %llu, mismatches %llu "
+		         "%llu new read structure; %llu reads relocated with a pointer word; %llu programs gave up (64 evaluations, no patch); checks %llu, mismatches %llu "
 		         "(%llu programs banned), verify mismatches %llu\n",
 		         static_cast<long long>(MemoPatchMode()), static_cast<unsigned long long>(patch_hits),
 		         static_cast<double>(patch_hits) * 9.5 / 1000.0, static_cast<unsigned long long>(patch_no_base),
@@ -1138,12 +1147,13 @@ struct PipelineCache::ProgramCache {
 		         static_cast<unsigned long long>(patch_obs_unexplained), static_cast<unsigned long long>(patch_obs_many),
 		         static_cast<unsigned long long>(patch_obs_memory), static_cast<unsigned long long>(patch_obs_ambiguous),
 		         static_cast<unsigned long long>(patch_obs_shape), static_cast<unsigned long long>(patch_relocated_reads),
+		         static_cast<unsigned long long>(patch_gave_up),
 		         static_cast<unsigned long long>(patch_checks), static_cast<unsigned long long>(patch_check_mismatch),
 		         static_cast<unsigned long long>(patch_banned_programs), static_cast<unsigned long long>(patch_verify_mismatch));
 		patch_hits = patch_checks = patch_check_mismatch = patch_verify_mismatch = 0;
 		patch_no_base = patch_unlearned = patch_reads_changed = patch_banned_programs = 0;
 		patch_obs_ok = patch_obs_log = patch_obs_spec = patch_obs_other = patch_obs_unexplained = patch_obs_many = patch_obs_memory = 0;
-		patch_obs_ambiguous = patch_obs_shape = patch_relocated_reads = 0;
+		patch_obs_ambiguous = patch_obs_shape = patch_relocated_reads = patch_gave_up = 0;
 		std::fflush(stdout);
 	}
 
@@ -1220,7 +1230,7 @@ struct PipelineCache::ProgramCache {
 				return true;
 			}
 			PhaseStats::Scope miss_phase {PhaseStats::PhMemoMiss};
-			const bool learn = MemoPatchMode() != 0;
+			const bool learn = MemoPatchMode() != 0 && !entry.patch.banned;
 			ShaderReadChunks::ReadLog log;
 			if (learn) reads.SetLog(&log);
 			const bool ok = ShaderRecompiler::IR::MaterializeResources(
@@ -1318,7 +1328,7 @@ struct PipelineCache::ProgramCache {
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(
 		    entry.resource_plan, runtime, entry.resources, entry.specialization);
 		reads.SetLog(nullptr);
-		if (ok && MemoPatchMode() != 0) {
+		if (ok && MemoPatchMode() != 0 && !entry.patch.banned) {
 			LearnPatch(entry, runtime, log);
 		}
 		if (ok) {
