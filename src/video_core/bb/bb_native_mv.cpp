@@ -101,7 +101,7 @@ struct Ring {
 std::unordered_map<u64, Ring> g_rings;
 std::map<u64, std::pair<u64, u64>> g_ring_addr; // palette buffer address -> (ring, last seen)
 constexpr u64 kRingSpan = 0x10000;
-std::atomic<int> g_ring_offset{-1};
+std::atomic<int> g_ring_offset{0x1018}; // the GX buffer object's V# at +0x18 (1.09 0x2168a20)
 u64 g_present = 1, g_map_present = 0;       // -1: entries are the addresses; else [entry + offset]
 std::vector<u64> g_missed;                // palette addresses of draws without identity (learning)
 u64 st_ring_calls = 0, st_ring_hits = 0, st_ring_miss = 0;
