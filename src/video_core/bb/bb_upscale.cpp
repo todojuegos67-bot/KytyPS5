@@ -2604,11 +2604,16 @@ static bool all_scene_on();
 
 u64 g_diag_asked = 0, g_diag_inactive = 0, g_diag_noscene = 0, g_diag_calls = 0, g_diag_small = 0;
 
+bool LockFast();
 bool WantCameraScan(bool vertex) {
     g_scan_vertex = vertex;
     ++g_diag_asked;
     if ((!Active() && !AnalyzeOn() && !FgNative()) || !Cfg().mv_reconstruct) {
         ++g_diag_inactive;
+        return false;
+    }
+    if (LockFast() && (!g_draw.valid || !g_draw.scene)) {
+        ++g_diag_noscene;
         return false;
     }
     std::scoped_lock lk{g_mutex};
@@ -3060,6 +3065,10 @@ void SetHudCanvasOk(bool ok, std::string_view why) {
 bool WantPresentUpscale(VAddr& flip) {
     if (!Enabled()) {
         return false;
+    }
+    if (LockFast() &&
+        (!g_draw.valid || g_draw.compute || g_draw.has_depth || g_draw.num_colors == 0)) {
+        return false; // (no HUD-point candidate: see the after_scene test below)
     }
     std::scoped_lock lk{g_mutex};
     auto& f = g_frame;
@@ -3595,7 +3604,21 @@ void TaaPass(const float (&applied)[2], bool camera_valid, float (&passed)[2]) {
     Checkpoint(line);
 }
 
+// bb-perf-1111 (BB_CP_LOCKFAST, default on): g_draw is written only on the GPU command thread
+// (OnDraw / OnDispatch / OnSample / OnInjected / OnFlip), where these are called too: a draw
+// that cannot qualify is turned away before taking g_mutex.
+bool LockFast() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_CP_LOCKFAST");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 bool WantHudlessCopy() {
+    if (LockFast() && (!g_draw.valid || !g_draw.targets_flip)) {
+        return false;
+    }
     std::scoped_lock lk{g_mutex};
     if (!g_draw.valid || !g_draw.targets_flip) {
         return false;
