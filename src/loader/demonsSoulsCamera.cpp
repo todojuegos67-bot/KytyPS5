@@ -38,6 +38,10 @@
 // the mouse turned the camera in the last KYTY_KBM_HOLD_MS (400), the stick X is held off centre (KYTY_KBM_HOLD, 0.35 of
 // full tilt, the last mouse direction) and the hook writes yaw stick 0 in frames without counts, so the held stick
 // never turns the camera itself. Counts are never dropped: if the hook cannot convert them they stay for the next frame.
+// (11-11) KYTY_KBM_EQUAL_AXES=1 (default): the horizontal no longer comes here as raw counts (no cap) but as the degrees
+// the emulated stick path paid this game frame (DirectAddDegrees): the same drain, the same top rate (the curve's or the
+// linear mapping's), the same carry as the vertical stick, so both axes turn alike; the hook still turns the camera by
+// exactly that angle. =0: raw counts, no cap (the 11-10 behaviour).
 #include "loader/demonsSoulsCamera.h"
 
 #include "common/abi.h"
@@ -85,6 +89,8 @@ constexpr uint64_t     CavePage = 0x4000, CaveOffset = 0x8000000 + 8 * CavePage;
 std::atomic<bool>      g_direct {false}; // the detours installed
 std::atomic<uint8_t>*  g_pending = nullptr; // in the cave: counts pending (site A takes the linear branch)
 std::atomic<int64_t>   g_mx {0}, g_my {0};
+std::atomic<int64_t>   g_udeg {0};          // (11-11) yaw degrees pending from the metered path, in 1e-6 deg
+std::atomic<float>     g_rate_y_deg {0.0f}, g_rate_p_deg {0.0f}; // the game's yaw / pitch full-stick rates, deg/s
 std::atomic<int>       g_yaw_sign {0}, g_pitch_sign {0};
 std::atomic<int>       g_stick_x {128}, g_stick_y {128};
 std::atomic<float>     g_dpc {0.05f};
@@ -148,20 +154,25 @@ void KYTY_SYSV_ABI Hook(uint8_t* cam, const uint8_t* cd) {
 	}
 	if (g_pending != nullptr) g_pending->store(0, std::memory_order_relaxed);
 	const int64_t dx = g_mx.exchange(0, std::memory_order_acq_rel);
+	const int64_t du = g_udeg.exchange(0, std::memory_order_acq_rel); // (11-11) metered degrees
 	g_my.exchange(0, std::memory_order_acq_rel); // (the vertical is the emulated stick's)
 	uint32_t yaw_off = BaseYawRate;
 	std::memcpy(&yaw_off, reinterpret_cast<const void*>(g_linear + YawRateOffset), sizeof(yaw_off));
 	const float dt = F(cam, 0x44), rate_y = F(cd, yaw_off), rate_p = F(cd, 0x1ec);
+	if (std::isfinite(rate_y)) g_rate_y_deg.store(rate_y * 57.2957795f, std::memory_order_relaxed);
+	if (std::isfinite(rate_p)) g_rate_p_deg.store(rate_p * 57.2957795f, std::memory_order_relaxed);
 	const bool  ok = g_yaw_sign.load() != 0 && dt > 1e-4f && rate_y > 1e-4f && std::isfinite(dt) && std::isfinite(rate_y);
-	if (dx != 0 && ok) {
-		const float rad = g_dpc.load(std::memory_order_relaxed) * 3.14159265f / 180.0f;
-		const float yaw = static_cast<float>(g_yaw_sign.load()) * static_cast<float>(dx) * rad / (rate_y * dt);
+	const double deg = static_cast<double>(dx) * g_dpc.load(std::memory_order_relaxed) + static_cast<double>(du) * 1e-6;
+	if ((dx != 0 || du != 0) && ok) {
+		const float rad = static_cast<float>(deg) * 3.14159265f / 180.0f;
+		const float yaw = static_cast<float>(g_yaw_sign.load()) * rad / (rate_y * dt);
 		std::memcpy(cam + 0x124, &yaw, sizeof(yaw));
 		g_injected++;
-		g_deg += std::fabs(static_cast<double>(dx)) * g_dpc.load(std::memory_order_relaxed);
-	} else if (dx != 0) {
-		// Not convertible this frame: keep the counts (never lost), the camera turns by them next frame.
+		g_deg += std::fabs(deg);
+	} else if (dx != 0 || du != 0) {
+		// Not convertible this frame: keep the counts / degrees (never lost), the camera turns by them next frame.
 		g_mx.fetch_add(dx, std::memory_order_acq_rel);
+		g_udeg.fetch_add(du, std::memory_order_acq_rel);
 		g_kept.fetch_add(std::llabs(dx), std::memory_order_relaxed);
 		if (g_pending != nullptr) g_pending->store(1, std::memory_order_release);
 	} else if (now - g_mouse_ns.load(std::memory_order_relaxed) < HoldNs() + 50000000) {
@@ -173,9 +184,10 @@ void KYTY_SYSV_ABI Hook(uint8_t* cam, const uint8_t* cd) {
 	if (now - g_log_ns > 2000000000 && (g_injected != 0 || g_held != 0 || g_kept.load() != 0 || g_routed.load() != 0)) {
 		std::printf("Demon's Souls direct mouse camera: %d of %d frames turned by the mouse, %d held (stick held, yaw 0), "
 		            "%.0f deg yaw asked, counts kept for a later frame %lld, counts routed to the stick path %lld, %.3f "
-		            "deg/count, yaw rate %.2f (cd+0x%x) pitch rate %.2f, dt %.4f\n",
+		            "deg/count, yaw rate %.2f (cd+0x%x, %.0f deg/s) pitch rate %.2f (cd+0x1ec, %.0f deg/s), dt %.4f\n",
 		            g_injected, g_frames, g_held, g_deg, static_cast<long long>(g_kept.exchange(0)),
-		            static_cast<long long>(g_routed.exchange(0)), g_dpc.load(), rate_y, yaw_off, rate_p, dt);
+		            static_cast<long long>(g_routed.exchange(0)), g_dpc.load(), rate_y, yaw_off, rate_y * 57.2957795f, rate_p,
+		            rate_p * 57.2957795f, dt);
 		std::fflush(stdout);
 		g_log_ns = now, g_injected = g_frames = g_held = 0, g_deg = 0.0;
 	} else if (now - g_log_ns > 2000000000) {
@@ -291,6 +303,22 @@ void DirectAddMouse(int dx, int dy) {
 		g_last_dir.store(dx > 0 ? 1 : -1, std::memory_order_relaxed);
 	}
 	if (g_pending != nullptr) g_pending->store(1, std::memory_order_release);
+}
+
+void DirectAddDegrees(double deg) {
+	if (!std::isfinite(deg) || deg == 0.0) return;
+	g_udeg.fetch_add(static_cast<int64_t>(std::llround(deg * 1e6)), std::memory_order_acq_rel);
+	g_mouse_ns.store(NowNs(), std::memory_order_relaxed);
+	g_last_dir.store(deg > 0 ? 1 : -1, std::memory_order_relaxed);
+	if (g_pending != nullptr) g_pending->store(1, std::memory_order_release);
+}
+
+float DirectGameYawRateDeg() {
+	return g_rate_y_deg.load(std::memory_order_relaxed);
+}
+
+float DirectGamePitchRateDeg() {
+	return g_rate_p_deg.load(std::memory_order_relaxed);
 }
 
 int DirectHoldStickX() {

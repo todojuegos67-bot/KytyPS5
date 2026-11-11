@@ -564,6 +564,9 @@ struct KbmState {
 	// game frame of full tilt, the rest dropped). Was 200 ms: a flick beyond the camera's top speed kept turning for
 	// up to 200 ms after the hand stopped (the "holgura", worse with a higher sensitivity, which saturates sooner).
 	float                   carry_ms = 0.0f;
+	// (11-11) KYTY_KBM_EQUAL_AXES (1, default): with the direct mouse camera the horizontal goes through the same metered
+	// path as the vertical (drain, top rate, curve, carry) and only its paid degrees go direct; 0: raw counts, no cap.
+	bool                    equal_axes = true;
 	std::vector<KbmBinding> bindings;
 	bool                    captured = false;
 	bool                    walking  = false;
@@ -930,6 +933,9 @@ bool KbmProvide(int* x, int* y) {
 
 	double     sent_x = 0.0, sent_y = 0.0;
 	const bool calibrating = KbmCalibStep(k, now, dt);
+	// (11-11) KYTY_KBM_EQUAL_AXES=1 and the direct camera running: both axes metered here alike; the horizontal's paid
+	// degrees go to the camera hook (exact angle), the vertical to the stick, as if it were alone on it.
+	const bool direct_x = !calibrating && k.equal_axes && Loader::DemonsSoulsCamera::DirectTakesMouse();
 	if (!calibrating) {
 		int64_t       ax = k.acc_x.load(std::memory_order_acquire);
 		int64_t       ay = k.acc_y.load(std::memory_order_acquire);
@@ -985,6 +991,12 @@ bool KbmProvide(int* x, int* y) {
 				k.debt_x -= ux * paid, k.debt_y -= uy * paid;
 				k.out_x = ux * st, k.out_y = uy * st;
 				sent_x = ux * paid, sent_y = uy * paid;
+				if (direct_x) {
+					// The vertical's own stick for its part of the rate (the curve is per stick length, not per axis).
+					const double sy = k.curve.Stick(std::abs(uy) * cmd);
+					k.out_y = uy < 0.0 ? -sy : sy;
+					Loader::DemonsSoulsCamera::DirectAddDegrees(sent_x);
+				}
 			}
 		} else {
 			// No kbm_curve.txt: the linear mapping (counts/s -> deflection). (10-25) The counts drained this read (a
@@ -1022,7 +1034,16 @@ bool KbmProvide(int* x, int* y) {
 				k.out_x          = fx / len * out;
 				k.out_y          = fy / len * out;
 				sent_x = fx, sent_y = fy;
-				k.win_stick_x += mag * std::abs(fx) / len * dt;
+				if (direct_x) {
+					// The horizontal's counts of this read, already capped at the top rate with the vertical: their
+					// angle direct; the vertical's stick for its part alone (same deg per count below the cap).
+					Loader::DemonsSoulsCamera::DirectAddDegrees(fx * dpc);
+					const double my = mag * std::abs(fy) / len;
+					const double oy = my < 0.005 ? 0.0 : k.adz + (1.0 - k.adz) * std::pow(my, static_cast<double>(k.expo));
+					k.out_y = fy < 0.0 ? -oy : oy;
+				} else {
+					k.win_stick_x += mag * std::abs(fx) / len * dt;
+				}
 			} else if (k.decay_ms <= 0.0f) {
 				k.out_x = k.out_y = 0.0;
 			} else {
@@ -1033,6 +1054,7 @@ bool KbmProvide(int* x, int* y) {
 			}
 		}
 	}
+	if (direct_x) k.out_x = 0.0; // the horizontal went to the hook; the stick X stays centred (or held, below)
 	k.win_sent_x += std::abs(sent_x), k.win_sent_y += std::abs(sent_y);
 	KbmNoteSent(k, sent_x, sent_y);
 
@@ -1154,6 +1176,7 @@ void KbmInit() {
 	g_kbm.walk     = EnvFloat("KYTY_KBM_WALK", 0.5f, 0.1f, 1.0f);
 	g_kbm.carry_ms = EnvFloat("KYTY_KBM_CARRY_MS", 0.0f, 0.0f, 2000.0f);
 	g_kbm.smooth_ms = EnvFloat("KYTY_KBM_SMOOTH_MS", 2.0f, 0.0f, 100.0f);
+	if (const char* eq = std::getenv("KYTY_KBM_EQUAL_AXES"); eq != nullptr && eq[0] == '0') g_kbm.equal_axes = false;
 	KbmAddList(KBM_DEFAULTS, false);
 	if (const char* map = std::getenv("KYTY_KBM_MAP"); map != nullptr) KbmAddList(map, true);
 	LOGF("KYTY_KBM: keyboard and mouse on (sens %.2f, exp %.2f, antideadzone %.2f, decay %.0f ms, smoothing %.0f ms, carry %.0f ms, "
@@ -1162,8 +1185,27 @@ void KbmInit() {
 	KbmSetupMouse();
 	Loader::DemonsSoulsCamera::DirectSetDegPerCount(static_cast<float>(g_kbm.dpc * g_kbm.sens));
 	if (Loader::DemonsSoulsCamera::DirectInstalled())
-		LOGF("KYTY_KBM: direct mouse camera on: %.3f deg per count (KYTY_KBM_DEG_PER_COUNT %.3f x sens %.2f), no speed cap\n",
-		     g_kbm.dpc * g_kbm.sens, g_kbm.dpc, g_kbm.sens);
+		LOGF("KYTY_KBM: direct mouse camera on: %.3f deg per count (KYTY_KBM_DEG_PER_COUNT %.3f x sens %.2f), %s\n",
+		     g_kbm.dpc * g_kbm.sens, g_kbm.dpc, g_kbm.sens,
+		     g_kbm.equal_axes ? "horizontal capped as the vertical (KYTY_KBM_EQUAL_AXES=1)" : "no speed cap on the horizontal");
+	// (11-11) The two axes' top rates. The vertical is always the emulated stick's (the host's cap: the curve's top or
+	// the linear mapping's top rate, learned from the camera later: the "camera top rate" line).
+	const double top = g_kbm.curve.valid ? g_kbm.curve.MaxRate() : g_kbm.rmax;
+	const char*  src = g_kbm.curve.valid ? "kbm_curve.txt" : "linear mapping, until measured";
+	// (DirectWanted, not DirectInstalled: the window can be set up before the eboot is patched; the camera's own line
+	// says whether the direct camera was applied.)
+	if (!Loader::DemonsSoulsCamera::DirectWanted())
+		LOGF("KYTY_KBM_EQUAL_AXES=%d: direct camera off, both axes on the emulated stick: max horizontal %.0f deg/s, "
+		     "max vertical %.0f deg/s (%s)\n",
+		     g_kbm.equal_axes ? 1 : 0, top, top, src);
+	else if (g_kbm.equal_axes)
+		LOGF("KYTY_KBM_EQUAL_AXES=1: equal axes: horizontal direct but metered as the vertical: max horizontal %.0f deg/s, "
+		     "max vertical %.0f deg/s (%s); %.3f deg per count both\n",
+		     top, top, src, g_kbm.dpc * g_kbm.sens);
+	else
+		LOGF("KYTY_KBM_EQUAL_AXES=0: horizontal direct, no cap: max horizontal unlimited (%.3f deg per count at any speed), "
+		     "max vertical %.0f deg/s (%s)\n",
+		     g_kbm.dpc * g_kbm.sens, top, src);
 }
 
 void KbmCapture(bool on) {
@@ -1328,6 +1370,13 @@ bool HostInputMouseMotion(int dx, int dy) {
 	if (g_kbm.captured && g_kbm.enabled && Loader::DemonsSoulsCamera::DirectTakesMouse()) {
 		// (11-10b) Only the horizontal turn goes direct: the game's free camera ignored the vertical stick written there
 		// (the camera did not look up or down). The vertical stays on the emulated stick, as before.
+		// (11-11) KYTY_KBM_EQUAL_AXES=1: the horizontal is metered with the vertical (KbmProvide), then goes direct.
+		if (g_kbm.equal_axes) {
+			g_kbm.acc_x.fetch_add(static_cast<int64_t>(dx) * KBM_ONE, std::memory_order_acq_rel);
+			g_kbm.acc_y.fetch_add(static_cast<int64_t>(dy) * KBM_ONE, std::memory_order_acq_rel);
+			g_kbm.received.fetch_add((std::llabs(dx) + std::llabs(dy)) * KBM_ONE, std::memory_order_relaxed);
+			return true;
+		}
 		Loader::DemonsSoulsCamera::DirectAddMouse(dx, 0);
 		g_kbm.acc_y.fetch_add(static_cast<int64_t>(dy) * KBM_ONE, std::memory_order_acq_rel);
 		g_kbm.received.fetch_add((std::llabs(dx) + std::llabs(dy)) * KBM_ONE, std::memory_order_relaxed);
