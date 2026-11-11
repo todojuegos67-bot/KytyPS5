@@ -278,8 +278,10 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			}
 			// Black on screen meanwhile: the movie in the first 2 minutes; the first cinematic from its start until 1 s
 			// after the presses (it is gone by then; if not, it shows again rather than staying black).
-			const bool hide = (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) ||
-			                  (cine_seen != 0 && now - cine_seen < 2000000000LL);
+			// (11-11) Only the start-up movie is hidden: the cinematic window also caught the first in-engine
+			// cinematic after loading a save (2 s of black and silence after "Continuar"); the game patch ends the
+			// opening cinematic by itself, so nothing needs hiding there.
+			const bool hide = up < 120000000000LL && Libs::VideoOut::MoviePlaying();
 			Libs::VideoOut::SetIntroHidden(hide);
 		}
 	}
