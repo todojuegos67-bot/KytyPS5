@@ -1248,8 +1248,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // finished frame, the HUD-less copy (when the HUD cut ran) and the previous real frame; drawn
     // over DLSS-G's generated frames below and given to FSR 3 as its UI resource at the present.
     const BB::FG::Image* bb_ui_layer = nullptr;
+    // bb-clean-2: the UI layer only feeds DLSS-G (and FSR 3 when BB_FSR3_UI_LAYER=1).
     const bool bb_fg_on = !frame->is_hdr && frame->fg.valid &&
-                          (BB::FG::Dlss::Ready() || BB::FG::Fsr3Active());
+                          (BB::FG::Dlss::Ready() ||
+                           (BB::FG::Fsr3Active() && std::getenv("BB_FSR3_UI_LAYER") != nullptr));
     if (bb_fg_on && std::getenv("BB_HUD_FG") == nullptr) {
         bb_ui_layer = bb_hud_fg->Build(cmdbuf, frame->image, frame->image_view,
                                        swapchain.GetSurfaceFormat().format,
@@ -1757,7 +1759,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
         // bb-clean: this frame's HUD layer as the FG swapchain's UI resource (composited over the
         // real and the generated frames after interpolation; registered in BeforePresent).
-        if (fg_frame && frame->has_ui_layer) {
+        // bb-clean-2: only opt-in (BB_FSR3_UI_LAYER=1) and only at the backbuffer's exact size:
+        // 854db18 hung with FSR 3 x2 right after registering a 2560x1438 layer on a 2560x1440
+        // FG swapchain. By default FSR 3 gets the HUD-less colour (HUDLessColor) only.
+        static const bool fsr3_ui = [] {
+            const char* v = std::getenv("BB_FSR3_UI_LAYER");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (fsr3_ui && fg_frame && frame->has_ui_layer &&
+            frame->ui_layer.extent == swapchain.GetExtent()) {
             BB::FG::SetUiLayer(&frame->ui_layer);
             bb_hud_fg->NoteFrame(false, BB::FG::Name(), true);
         }

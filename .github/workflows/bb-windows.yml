@@ -144,6 +144,17 @@ jobs:
         git clone --depth 1 --branch $env:XESS_VERSION https://github.com/intel/xess _Build\deps\xess
         if ($LASTEXITCODE) { throw 'XeSS clone failed' }
         if (!(Test-Path _Build\deps\xess\inc\xess\xess_vk.h) -or !(Test-Path _Build\deps\xess\bin\libxess.dll)) { throw 'no xess_vk.h or libxess.dll' }
+    - name: Validate bb shaders (glslang + spirv-val)
+      shell: pwsh
+      run: |
+        $bin = "C:\VulkanSDK\1.3.296.0\Bin"
+        foreach ($s in 'bb_mv.comp','bb_hud_mask.comp','bb_hud_over.comp') {
+          & "$bin\glslangValidator.exe" -V --target-env vulkan1.2 "src\video_core\host_shaders\$s" -o "$env:RUNNER_TEMP\$s.spv"
+          if ($LASTEXITCODE) { throw "glslang failed: $s" }
+          & "$bin\spirv-val.exe" --target-env vulkan1.2 "$env:RUNNER_TEMP\$s.spv"
+          if ($LASTEXITCODE) { throw "spirv-val failed: $s" }
+          "$s ok"
+        }
     - name: Configure
       run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
     - name: Build
