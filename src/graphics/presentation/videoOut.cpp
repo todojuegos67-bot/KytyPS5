@@ -26,6 +26,7 @@
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/demonsSoulsSkipIntro.h"
 #include "loader/systemContent.h"
 #include "local/fsr3-fg.h"
 #include "local/frame-gen.h"
@@ -705,6 +706,11 @@ bool PlayerInputSeen() noexcept {
 }
 static std::atomic<int64_t> g_cinematic_ns {0};
 void NoteCinematic(const char* name) noexcept {
+	// (11-11) The intro's cinematic skip patch is only for the opening voidwalk: any other cinematic's files (the
+	// Nexus arrival, scn000001_maidentravel, came while it was still armed and was cut, breaking the Nexus floor
+	// effect) remove it before that cinematic plays.
+	if (name != nullptr && std::strstr(name, "voidwalk") == nullptr && Loader::DemonsSoulsSkipIntro::CinematicSkipArmed())
+		Loader::DemonsSoulsSkipIntro::Disarm("another cinematic started (only the opening one is skipped)");
 	const auto now  = std::chrono::steady_clock::now().time_since_epoch().count();
 	const auto last = g_cinematic_ns.exchange(now, std::memory_order_relaxed);
 	if (name != nullptr && now - last > std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(5)).count()) {
