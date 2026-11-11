@@ -20,6 +20,10 @@
 // work, a speculation's recorder) is a miss: counted and logged, the bytes it sees zeros, and the render thread restores
 // them after (Drain).
 //
+// KYTY_TEXTURE_OFFLOAD_TARGETS=1 (default off, with the offload on): color render targets the GPU wrote (tiled,
+// downloadable, no stencil/metadata/MSAA) taken too, without the exact check (their guest bytes are stale: a restore
+// gives the image's current contents back). TryDownloadImage drops their range before writing it whole.
+//
 // Read watchers go at once after a touch by game code (a guest thread holds no lock of the emulator's) or a host write or
 // unmap (normal context); after one by the emulator's own code the fault handler only gives the pages a protection that
 // lets the access through, and the render thread removes them (Drain).

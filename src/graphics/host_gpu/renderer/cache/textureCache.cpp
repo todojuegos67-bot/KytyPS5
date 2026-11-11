@@ -4454,6 +4454,10 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 		return false;
 	}
 	const auto range    = image.info.data;
+	// (KYTY_TEXTURE_OFFLOAD_TARGETS: an offloaded range of it is written over whole by this download: dropped, not
+	// restored.)
+	if (TextureOffload::GetMode() == TextureOffload::Mode::Offload && TextureOffload::Overlaps(range.address, range.size))
+		TextureOffload::OnHostAccess(range.address, range.size, false, true);
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	// (Larger than the download buffer, it could not be mapped: not downloaded, and kept by the caller.)
 	if (range.size > download.Size() / 2) {
@@ -4599,10 +4603,24 @@ void TextureCache::OffloadScan(uint64_t tick) {
 	std::vector<ImageId>                          take;
 	std::vector<std::pair<ImageId, DownloadPlan>> check;
 	uint64_t                                      check_bytes = 0;
+	uint64_t                                      targets_taken = 0; // (KYTY_TEXTURE_OFFLOAD_TARGETS: offered)
+	// KYTY_TEXTURE_OFFLOAD_TARGETS=1 (default off; offload mode only): color render targets the GPU wrote, tiled and
+	// downloadable, taken as well. Their guest bytes are stale (the image holds the truth), so no check: a restore
+	// downloads the image's current contents, as a readback would. A download of the image to guest memory
+	// (TryDownloadImage) drops the range first.
+	static const bool targets = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_OFFLOAD_TARGETS");
+		return value != nullptr && value[0] == '1';
+	}();
 	m_slot_images.ForEach([&](ImageId id, Image& image) {
-		if (!image.registered || image.depth_id || image.IsGpuModified() || image.IsCpuDirty() || image.IsBufferModified() ||
-		    !image.usage.texture || image.usage.storage || image.usage.render_target || image.usage.depth_target ||
-		    image.usage.video_out || !image.IsTracked() || !image.untracked_holes.empty())
+		const bool target = offload && targets && image.IsGpuModified() && image.usage.render_target &&
+		                    image.info.IsTiled() && image.info.tile_mode != Prospero::TileMode::kDepth &&
+		                    !image.info.IsDepth() && !image.info.HasStencil() && !image.info.HasMetadata() &&
+		                    image.info.samples == 1 && SafeToDownload(image);
+		if (!image.registered || image.depth_id || (image.IsGpuModified() && !target) || image.IsCpuDirty() ||
+		    image.IsBufferModified() || (!image.usage.texture && !target) || image.usage.storage ||
+		    (image.usage.render_target && !target) || image.usage.depth_target || image.usage.video_out ||
+		    !image.IsTracked() || !image.untracked_holes.empty())
 			return;
 		const auto [begin, end] = pages_of(image);
 		if (end <= begin || end - begin < MinSize) return;
@@ -4616,6 +4634,10 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		if (image.backing.image == nullptr || image.info.data.size > MaxSize ||
 		    HasPendingDownload(image.info.data.address, image.info.data.size))
 			return;
+		if (target) {
+			m_offload_exact[image.serial] = true; // (its guest bytes are not its contents: nothing to check)
+			targets_taken++;
+		}
 		if (const auto exact = m_offload_exact.find(image.serial); exact != m_offload_exact.end()) {
 			if (exact->second) take.push_back(id);
 			return;
@@ -4646,6 +4668,9 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		check.emplace_back(id, std::move(plan));
 	});
 	m_offload_clean.swap(seen);
+	if (targets_taken != 0 && (tick % 3600) == 0)
+		std::printf("Texture offload: %llu render targets offered this scan (KYTY_TEXTURE_OFFLOAD_TARGETS)\n",
+		            static_cast<unsigned long long>(targets_taken));
 	std::erase_if(m_offload_exact, [&](const auto& item) { return !m_offload_clean.contains(item.first); });
 	ms[0] = since(scan_start);
 	const auto report = [&] {
