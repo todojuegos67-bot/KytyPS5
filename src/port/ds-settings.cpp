@@ -1310,7 +1310,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->aa_sharp       = "alto";
 		s->object_fade    = "normal";
 		s->reflections    = "normal";
-		s->res            = "fsr-calidad";
+		s->res            = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default (was FSR 3.1 Calidad)
 		s->sharpness      = "0.75";
 	} else if (preset == "equilibrado") {
 		// (10-25) The user's capture: DLSS Calidad (K), sharpness 100 %, textures Maximo, distance and shadows Alto, Detail
@@ -1327,6 +1327,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->dlss_preset = "K";
 	} else if (preset == "ultra") {
 		max();
+		s->res = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default
 		s->detail   = "muy-alto";
 		s->aa_sharp = "ultra"; // (10-23) costs nothing
 	} else if (preset == "extremo") {
