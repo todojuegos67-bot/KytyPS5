@@ -638,7 +638,11 @@ void StartMetricsWindow(const fs::path& root, const Port::Settings& s, const Por
 		    << "fglabel=" << fg << "\r\n"
 		    << "antilagon=" << al << "\r\n"
 		    << "soulsmodo=" << modo << "\r\n"
-		    << "dlsspreset=" << preset << "\r\n";
+		    << "dlsspreset=" << preset << "\r\n"
+		    // (11-11) DLSS 5 for the metrics' Modelo row ("No" or its intensity and file)
+		    << "dlss5=" << (s.dlss5.empty() || s.dlss5 == "0" ? std::string("No")
+		                                                       : "Si (" + s.dlss5_strength + (s.dlss5_unsigned ? ", no oficial)" : ")"))
+		    << "\r\n";
 	}
 	std::wstring command = L"\"" + std::wstring(_wgetenv(L"SystemRoot") != nullptr ? _wgetenv(L"SystemRoot") : L"C:\\Windows") +
 	                       L"\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +

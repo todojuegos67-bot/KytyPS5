@@ -352,7 +352,7 @@ function Read-Ini {
 # (10-22) Antes el modelo no salia: el texto solo se formaba con la linea "WxH -> WxH", el "Nativo" iba dentro
 # del bucle (llave mal puesta) y la fila de 28 px cortaba el texto largo en la 2a linea, que quedaba tapada.
 $script:sc = @{ log = ''; pos = 0 }
-function Reset-Scale { $script:sc = @{ log = ''; pos = 0; kind = ''; inH = 0; outH = 0; ratio = ''; xessVer = ''; dlssReady = $false; force4k = $false; native = 0; logPreset = '' } }
+function Reset-Scale { $script:sc = @{ log = ''; pos = 0; kind = ''; inH = 0; outH = 0; ratio = ''; xessVer = ''; dlssReady = $false; force4k = $false; native = 0; logPreset = ''; dlss5on = $false } }
 Reset-Scale
 function Get-ScaleModeName([string]$label) {
 	$mode = ($label -split ' ', 2)[1]
@@ -395,6 +395,7 @@ function Update-ScaleLog {
 		# Sin reescalador: la resolucion a la que dibuja el juego (con TURBO, 1080 aunque pongas 1440).
 		$r = [regex]::Matches($text, 'performance mode renders (\d{3,4})x(\d{3,4})')
 		if ($r.Count -gt 0) { $script:sc.native = [int]$r[$r.Count - 1].Groups[2].Value }
+		if ($text -match 'DLSS 5: on, evaluate OK') { $script:sc.dlss5on = $true }  # (11-11)
 	} catch { }
 }
 # Devuelve @{ kind; mode; res; model } para las filas Reescalado / Resolucion / Modelo.
@@ -430,6 +431,12 @@ function Get-Scale($ini) {
 	elseif ($s.native) { $r.kind = 'Nativo'; $r.res = "{0}p $ARROW {1}p" -f $s.native, $outH }
 	elseif ($lbl) { $r.kind = $lbl }
 	if ($lbl -like 'FSR 4*' -and $r.kind -eq 'FSR') { $r.kind = 'FSR 4'; $r.mode = ($lbl -replace '^FSR 4 ', ''); $r.model = 'FSR 4 (IA, modelo v07)' }  # (fsr4)
+	# (11-11) DLSS 5: lo que eligio el lanzador; "activo" solo cuando el log dice que esta evaluando.
+	$d5 = "$($ini['dlss5'])"
+	if ($d5 -and $d5 -ne 'No') {
+		$t = if ($s.dlss5on) { "DLSS 5 $d5 activo" } else { "DLSS 5 $d5 ..." }
+		$r.model = if ($r.model) { "$($r.model) + $t" } else { $t }
+	}
 	return $r
 }
 
