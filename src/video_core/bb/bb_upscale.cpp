@@ -724,9 +724,33 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
         if (!g_frame_has_camera) {
             g_cam_cur.valid = g_cam_prev.valid = false; // no camera this frame: drop the history
         }
+        const bool had_camera = g_frame_has_camera;
         g_frame_has_camera = false;
         const BlockCam& cur = g_cam_cur;
         const BlockCam& prev = g_cam_prev;
+        {
+            // gpu7 [cam-dup]: frames a second whose camera is the previous frame's exactly (with
+            // Uncap FPS++ the game may render frames without moving the camera) and frames
+            // without a camera block (the upscaler's history is dropped on those).
+            static u32 frames = 0, same = 0, none = 0;
+            static auto t0 = std::chrono::steady_clock::now();
+            ++frames;
+            if (!had_camera) {
+                ++none;
+            } else if (cur.valid && prev.valid &&
+                       std::memcmp(cur.view, prev.view, sizeof(cur.view)) == 0 &&
+                       std::memcmp(cur.proj, prev.proj, sizeof(cur.proj)) == 0) {
+                ++same;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - t0 >= std::chrono::seconds(1)) {
+                t0 = now;
+                Checkpoint(fmt::format("[cam-dup] 1 s: {} frames, camera identical to the previous "
+                                       "frame {}, no camera block {}",
+                                       frames, same, none));
+                frames = same = none = 0;
+            }
+        }
         Mat inv;
         if (cur.valid && Invert(cur.vp, inv)) {
             const Mat to_prev = Multiply(prev.valid ? prev.vp : cur.vp, inv);
