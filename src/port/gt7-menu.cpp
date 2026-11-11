@@ -8,6 +8,7 @@
 #include "port/gt7-steam.h"
 
 #include <windows.h>
+#include <dxgi.h>
 #include <pdh.h>
 #include <psapi.h>
 #include <shellapi.h>
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -424,6 +426,19 @@ void DrawPerf(State& st) {
 		}
 		Describe("Tarjeta gráfica", "El índice del dispositivo Vulkan (--gpu). Automática: la dedicada. Útil en portátiles con dos gráficas.");
 	}
+	Heading("Shaders");
+	if (CheckRow("Precompilar shaders", s.precompile_auto,
+	             "Antes de jugar, cuando hace falta (primera vez, otra gráfica, otro driver u otra versión del emulador): crea todos los "
+	             "pipelines del juego con todos los hilos de la CPU para que no se compilen en plena carrera. Se puede omitir."))
+		st.dirty = true;
+	if (ImGui::Button(T("Precompilar de nuevo"))) {
+		ForgetPrecompile(*st.rt);
+		st.message = T("Los shaders se precompilarán al pulsar JUGAR.");
+	}
+	Describe("Precompilar de nuevo", "Repite la precompilación al próximo JUGAR (por ejemplo tras varias partidas nuevas o si notas tirones).");
+	if (CheckRow("Contadores en el log", s.log_stats,
+	             "Escribe en logs\\ una línea de rendimiento con los fps cada 5 s (KYTY_PERF=5) y los contadores de sincronización (KYTY_SYNC_STATS=1)."))
+		st.dirty = true;
 	if (CheckRow("NVIDIA Smooth Motion", s.cuda_early,
 	             "Inicializa CUDA antes que el juego (KYTY_CUDA_EARLY_INIT) para que Smooth Motion del driver de NVIDIA (RTX 40/50) pueda activarse."))
 		st.dirty = true;
@@ -877,6 +892,241 @@ void WatchGame(const Runtime& rt, const Settings& s, HANDLE process, DWORD pid) 
 	gui.Close();
 	if (hotkey) UnregisterHotKey(nullptr, 0x67);
 	SDL_SetWindowsMessageHook(nullptr, nullptr);
+}
+
+// ---- Shader precompile. ----
+
+namespace {
+
+const wchar_t kTitle[] = L"PPSA01317";
+
+fs::path CacheDir(const Runtime& rt) {
+	return rt.exe_dir / L"_ShaderCache" / kTitle;
+}
+
+fs::path StampPath(const Runtime& rt) {
+	return CacheDir(rt) / L"precompile-stamp.txt";
+}
+
+std::string ReadText(const fs::path& p) {
+	std::ifstream in(p, std::ios::binary);
+	return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+void WriteText(const fs::path& p, const std::string& text) {
+	std::ofstream out(p, std::ios::binary | std::ios::trunc);
+	out << text;
+}
+
+// The graphics card's name and driver version (the one rt.pc.gpu names).
+std::string DriverKey(const Runtime& rt) {
+	std::string    key = rt.pc.gpu;
+	IDXGIFactory1* factory = nullptr;
+	if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory != nullptr) {
+		IDXGIAdapter1* adapter = nullptr;
+		for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+			DXGI_ADAPTER_DESC1 d {};
+			LARGE_INTEGER      version {};
+			if (SUCCEEDED(adapter->GetDesc1(&d)) && Utf8(d.Description).rfind(rt.pc.gpu, 0) == 0 &&
+			    SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &version))) {
+				char text[64];
+				std::snprintf(text, sizeof(text), " %u.%u.%u.%u", HIWORD(version.HighPart), LOWORD(version.HighPart),
+				              HIWORD(version.LowPart), LOWORD(version.LowPart));
+				key += text;
+				adapter->Release();
+				break;
+			}
+			adapter->Release();
+		}
+		factory->Release();
+	}
+	return key;
+}
+
+// What a precompile is valid for: the GPU, its driver, the emulator (its size and date: another build may translate
+// shaders another way) and the options that change the shaders.
+std::string StampKey(const Runtime& rt, const Settings& s) {
+	std::error_code ec;
+	const fs::path  emu  = rt.exe_dir / L"kyty_emulator.exe";
+	const auto      size = fs::file_size(emu, ec);
+	const auto      time = fs::last_write_time(emu, ec).time_since_epoch().count();
+	return "gpu=" + DriverKey(rt) + "\nemulador=" + std::to_string(size) + "/" + std::to_string(time) + "\ngpu_indice=" +
+	       std::to_string(s.gpu) + "\nbindless=" + (s.bindless ? "1" : "0") + "\nteselado=" + (s.tessellation ? "1" : "0") + "\n";
+}
+
+} // namespace
+
+void MergeShippedSeeds(const Runtime& rt) {
+	const fs::path  from = rt.exe_dir / L"seeds" / kTitle;
+	const fs::path  to   = CacheDir(rt);
+	std::error_code ec;
+	const fs::path  seeds = from / L"pipelines.seeds";
+	if (!fs::is_directory(from, ec)) return;
+	const std::string mark = std::to_string(fs::file_size(seeds, ec)) + "/" +
+	                         std::to_string(fs::last_write_time(seeds, ec).time_since_epoch().count());
+	const fs::path mark_path = to / L"seeds-merged.txt";
+	if (ReadText(mark_path) == mark) return;
+	fs::create_directories(to, ec);
+	// Every file the package has and the cache does not (translated shaders, SPIR-V); the seeds appended.
+	for (fs::recursive_directory_iterator it(from, ec), end; !ec && it != end; it.increment(ec)) {
+		if (!it->is_regular_file()) continue;
+		const fs::path rel = fs::relative(it->path(), from, ec);
+		if (rel == L"pipelines.seeds") continue;
+		const fs::path dst = to / rel;
+		if (fs::exists(dst)) continue;
+		fs::create_directories(dst.parent_path(), ec);
+		fs::copy_file(it->path(), dst, ec);
+	}
+	ec.clear();
+	const std::string shipped = ReadText(seeds);
+	if (shipped.size() > 8) {
+		const fs::path mine = to / L"pipelines.seeds";
+		if (!fs::exists(mine) || fs::file_size(mine, ec) <= 8) {
+			WriteText(mine, shipped);
+		} else if (shipped.compare(0, 8, ReadText(mine).substr(0, 8)) == 0) {
+			// Same format: the package's records after the cache's (repeats are skipped by the emulator).
+			std::ofstream out(mine, std::ios::binary | std::ios::app);
+			out.write(shipped.data() + 8, static_cast<std::streamsize>(shipped.size() - 8));
+		}
+	}
+	WriteText(mark_path, mark);
+}
+
+bool PrecompileDue(const Runtime& rt, const Settings& s, std::string* why) {
+	std::error_code ec;
+	if (!fs::exists(CacheDir(rt) / L"pipelines.seeds", ec)) {
+		if (why != nullptr) *why = "sin semillas todavía";
+		return false;
+	}
+	const std::string stamp = ReadText(StampPath(rt));
+	if (stamp == StampKey(rt, s)) return false;
+	if (why != nullptr) *why = stamp.empty() ? "primera vez" : "cambió la gráfica, el driver, el emulador o una opción";
+	return true;
+}
+
+void ForgetPrecompile(const Runtime& rt) {
+	std::error_code ec;
+	fs::remove(StampPath(rt), ec);
+}
+
+std::string RunPrecompile(const Runtime& rt, const Settings& s, const std::wstring& command_line) {
+	const fs::path  dir      = CacheDir(rt);
+	const fs::path  progress = dir / L"precompile.progress";
+	const fs::path  stop     = fs::path(progress.wstring() + L".stop");
+	std::error_code ec;
+	fs::remove(progress, ec);
+	fs::remove(stop, ec);
+	fs::create_directories(rt.exe_dir / L"logs", ec);
+
+	SetEnvironmentVariableW(L"KYTY_PRECOMPILE", L"1");
+	SetEnvironmentVariableW(L"KYTY_PRECOMPILE_PROGRESS", progress.wstring().c_str());
+	wchar_t stamp[32];
+	{
+		const std::time_t t = std::time(nullptr);
+		std::tm           tm {};
+		localtime_s(&tm, &t);
+		wcsftime(stamp, std::size(stamp), L"%Y%m%d-%H%M%S", &tm);
+	}
+	const fs::path      log_path = rt.exe_dir / L"logs" / (std::wstring(L"gt7-precompilar-") + stamp + L".log");
+	SECURITY_ATTRIBUTES sa {sizeof(sa), nullptr, TRUE};
+	HANDLE log = CreateFileW(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	STARTUPINFOW si {};
+	si.cb = sizeof(si);
+	if (log != INVALID_HANDLE_VALUE) {
+		si.dwFlags    = STARTF_USESTDHANDLES;
+		si.hStdOutput = log;
+		si.hStdError  = log;
+		si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+	}
+	std::wstring        cmd = command_line;
+	PROCESS_INFORMATION pi {};
+	const BOOL started = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, log != INVALID_HANDLE_VALUE,
+	                                    CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, rt.exe_dir.c_str(), &si, &pi);
+	SetEnvironmentVariableW(L"KYTY_PRECOMPILE", nullptr);
+	SetEnvironmentVariableW(L"KYTY_PRECOMPILE_PROGRESS", nullptr);
+	if (!started) {
+		if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+		return "No se pudo iniciar la precompilación (error " + std::to_string(GetLastError()) + ").";
+	}
+	CloseHandle(pi.hThread);
+
+	Gui gui;
+	const bool window = gui.Open("Gran Turismo 7 - Shaders", 620, 230, 0);
+	if (window) gui.LoadBackground(rt.exe_dir / L"fondo-gt7.jpg");
+	unsigned long done = 0, total = 0, compiled = 0, failed = 0, final_flag = 0;
+	bool          skipping = false, finished = false;
+	Uint64        skip_at = 0, next_read = 0;
+	while (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) {
+		const Uint64 now = SDL_GetTicks();
+		if (now >= next_read) {
+			next_read = now + 250;
+			const std::string text = ReadText(progress);
+			(void)std::sscanf(text.c_str(), "%lu %lu %lu %lu %lu", &done, &total, &compiled, &failed, &final_flag);
+		}
+		if (skipping && now - skip_at > 120000) {
+			TerminateProcess(pi.hProcess, 1); // the save did not end in two minutes
+			break;
+		}
+		if (!window) {
+			SDL_Delay(100);
+			continue;
+		}
+		SDL_Event e;
+		bool      close = false;
+		while (SDL_PollEvent(&e)) {
+			ImGui::SetCurrentContext(gui.context);
+			ImGui_ImplSDL3_ProcessEvent(&e);
+			if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) close = true;
+		}
+		gui.Begin();
+		ImGui::SetNextWindowPos({0, 0});
+		ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.02f, 0.03f, 0.07f, 0.80f});
+		ImGui::Begin("##precompile", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings);
+		ImGui::PopStyleColor();
+		ImGui::PushFont(gui.title, 26.0f);
+		ImGui::TextColored(kText, "%s", T("Preparando los shaders"));
+		ImGui::PopFont();
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextColored(kDim, "%s",
+		                   T("Solo la primera vez (o tras cambiar de driver): así el juego no compila nada durante la carrera."));
+		ImGui::PopTextWrapPos();
+		const float fraction = total > 0 ? static_cast<float>(done) / static_cast<float>(total) : 0.0f;
+		char        overlay[64];
+		if (total > 0) std::snprintf(overlay, sizeof(overlay), "%lu / %lu", done, total);
+		else std::snprintf(overlay, sizeof(overlay), "%s", T("Arrancando..."));
+		ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kAccent);
+		ImGui::ProgressBar(fraction, {-FLT_MIN, 28.0f}, overlay);
+		ImGui::PopStyleColor();
+		ImGui::BeginDisabled(skipping);
+		if (ImGui::Button(skipping ? T("Guardando lo compilado...") : T("Omitir"), {-FLT_MIN, 0}) || (close && !skipping)) {
+			WriteText(stop, "stop");
+			skipping = true;
+			skip_at  = now;
+		}
+		ImGui::EndDisabled();
+		ImGui::End();
+		gui.End({0.02f, 0.03f, 0.07f, 1.0f});
+	}
+	WaitForSingleObject(pi.hProcess, 5000);
+	DWORD code = 1;
+	GetExitCodeProcess(pi.hProcess, &code);
+	CloseHandle(pi.hProcess);
+	if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+	gui.Close();
+	{
+		const std::string text = ReadText(progress);
+		(void)std::sscanf(text.c_str(), "%lu %lu %lu %lu %lu", &done, &total, &compiled, &failed, &final_flag);
+	}
+	finished = code == 0 && final_flag == 1;
+	fs::remove(stop, ec);
+	// Done, skipped or failed: not run again by itself until something changes (Rendimiento: "Precompilar de nuevo").
+	WriteText(StampPath(rt), StampKey(rt, s));
+	if (!finished) {
+		return "La precompilación de shaders no terminó (código " + std::to_string(code) + "). Log: logs\\" +
+		       Utf8(log_path.filename().wstring());
+	}
+	return {};
 }
 
 } // namespace Port

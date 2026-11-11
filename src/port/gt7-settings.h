@@ -45,6 +45,8 @@ struct Settings {
 	bool        redzone    = true;     // red_zone (--redzone / --no-redzone)
 	bool        playgo_hack = false;   // playgo_hack
 	bool        cuda_early = false;    // smooth_motion: KYTY_CUDA_EARLY_INIT=1 (NVIDIA Smooth Motion)
+	bool        precompile_auto = true; // precompilar_shaders: the shader precompile before the game when needed
+	bool        log_stats  = true;     // contadores_log: KYTY_PERF=5 and KYTY_SYNC_STATS=1 (fps and sync lines in the log)
 	// Mando
 	std::string pad_color;             // color_mando: #RRGGBB (empty: the game's)
 	int         pad_volume    = 50;    // volumen_mando

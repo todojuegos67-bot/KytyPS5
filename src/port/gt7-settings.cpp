@@ -139,6 +139,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	bol("red_zone", s->redzone);
 	bol("playgo_hack", s->playgo_hack);
 	bol("smooth_motion", s->cuda_early);
+	bol("precompilar_shaders", s->precompile_auto);
+	bol("contadores_log", s->log_stats);
 	str("color_mando", s->pad_color);
 	num("volumen_mando", s->pad_volume, 0, 100);
 	num("vibracion_mando", s->pad_vibration, 0, 100);
@@ -201,6 +203,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "red_zone=" << b(s.redzone) << "\r\n"
 	  << "playgo_hack=" << b(s.playgo_hack) << "\r\n"
 	  << "smooth_motion=" << b(s.cuda_early) << "\r\n"
+	  << "precompilar_shaders=" << b(s.precompile_auto) << "\r\n"
+	  << "contadores_log=" << b(s.log_stats) << "\r\n"
 	  << "[mando]\r\n"
 	  << "color_mando=" << s.pad_color << "\r\n"
 	  << "volumen_mando=" << s.pad_volume << "\r\n"
@@ -312,6 +316,12 @@ LaunchPlan BuildLaunch(const Settings& s, bool amd_cpu_detected, int desktop_w, 
 	for (auto& a: SplitArgs(s.dev_args)) p.args.push_back(a);
 
 	if (s.cuda_early) p.env.emplace_back("KYTY_CUDA_EARLY_INIT", "1");
+	if (s.log_stats) {
+		// The emulator's counters in the log (entorno_extra, set after, can change them): a "Perf:" line with the fps
+		// every 5 s (common/perfStats.cpp, KYTY_PERF=<seconds>) and the "SyncStats:" lines (bufferCache.cpp).
+		p.env.emplace_back("KYTY_PERF", "5");
+		p.env.emplace_back("KYTY_SYNC_STATS", "1");
+	}
 	size_t at = 0;
 	while (at < s.dev_env.size()) {
 		const size_t      end  = std::min(s.dev_env.find(';', at), s.dev_env.size());

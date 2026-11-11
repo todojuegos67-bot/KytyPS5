@@ -4362,6 +4362,16 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	           "from, is off"
 	         : "");
 	InitializeDriverCache();
+	{
+		// Pipeline seeds (pipelineSeeds.h): recorded beside the shader disk cache, by session.
+		const auto session_key = ShaderDiskCache::SessionKey(ShaderDiskCache::SessionInfo {
+		    .vendor_id           = graphics.GetPhysicalDeviceProperties().vendorID,
+		    .device_id           = graphics.GetPhysicalDeviceProperties().deviceID,
+		    .bindless_images     = graphics.bindless_enabled && Config::BindlessImagesEnabled(),
+		    .float_image_atomics = Config::FloatImageAtomicsEnabled()});
+		PipelineSeeds::Open(ShaderDiskCacheDirectory(),
+		                    XXH3_64bits(session_key.data(), session_key.size()));
+	}
 	if (g_async_pipelines) {
 		// KYTY_PIPELINE_THREADS=<n>; by default half the processors, 2 to 16, at below normal
 		// priority (a third, 2 to 10, before; 4 at most before round 70). A race brings hundreds of
@@ -4652,7 +4662,16 @@ void PipelineCache::InitializeDriverCache() {
 	                 (older_bytes + initial_data.size()) >> 20u);
 }
 
+void PipelineCache::PrecompileSeeds() {
+	const auto result = PipelineSeeds::Replay(m_graphics.device, m_driver_cache, m_driver_older,
+	                                          m_graphics.bindless_layout,
+	                                          m_graphics.pipeline_cache_control_enabled);
+	PipelineCacheLog("Pipeline seeds: precompile wrote {} new pipelines into the driver cache",
+	                 result.compiled);
+}
+
 void PipelineCache::Save() {
+	PipelineSeeds::Flush();
 	{
 		// Round 134: no save during play starts from now, and one still writing finishes first.
 		std::lock_guard lock(m_save_mutex);

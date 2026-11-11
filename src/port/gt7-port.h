@@ -41,6 +41,19 @@ LauncherResult RunLauncher(const Runtime& runtime, Settings* settings, const std
 // While the game runs: the metrics window (when on; F10 shows or hides it). Returns when the process has ended.
 void WatchGame(const Runtime& runtime, const Settings& settings, HANDLE process, DWORD pid);
 
+// Shader precompile (gt7-menu.cpp; the emulator's side: pipelineSeeds.h). The game's pipelines recorded in
+// _ShaderCache\PPSA01317 (pipelines.seeds, seed-spirv\) are made again by "kyty_emulator.exe" with KYTY_PRECOMPILE=1
+// into this PC's driver cache, before the game, so that the first race does not compile them.
+// The folder seeds\ beside the exe (the release's package) is merged into _ShaderCache first.
+void MergeShippedSeeds(const Runtime& runtime);
+// Whether a precompile is due: seeds there and never precompiled with this GPU, driver and emulator. `why`: the reason.
+bool PrecompileDue(const Runtime& runtime, const Settings& settings, std::string* why);
+// Forget the last precompile (Rendimiento: "Precompilar de nuevo"): the next JUGAR precompiles again.
+void ForgetPrecompile(const Runtime& runtime);
+// The emulator in precompile mode (the environment already set for the game) with a progress window and "Omitir".
+// Returns a line for the launcher's status (empty when all went well).
+std::string RunPrecompile(const Runtime& runtime, const Settings& settings, const std::wstring& command_line);
+
 bool        IsGame(const std::string& path);
 std::string PickFolder();
 std::string PickFile(const wchar_t* filter_name, const wchar_t* filter);

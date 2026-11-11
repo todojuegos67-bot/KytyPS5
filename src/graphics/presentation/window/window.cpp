@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineSeeds.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/timeline.h"
@@ -28,6 +29,7 @@
 #include "libs/wheelHost.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -840,6 +842,10 @@ static void WindowCreate(WindowContext& context) {
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
 	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+	if (PipelineSeeds::PrecompileRequested()) {
+		// Precompile mode: nothing is shown (the launcher shows the progress).
+		return flags | static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	}
 	if (fullscreen) {
 		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
 	}
@@ -859,6 +865,19 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	window->CreateVulkan();
 	auto& presenter = *window->presenter;
 	g_window        = std::move(window);
+	if (PipelineSeeds::PrecompileRequested()) {
+		// KYTY_PRECOMPILE=1 (pipelineSeeds.h): the recorded pipelines into the driver cache, saved,
+		// and the end of the process; the game itself does not run.
+		{
+			Common::LockGuard lock(g_window->render_context->GetMutex());
+			auto&             cache = g_window->render_context->GetPipelineCache();
+			cache.PrecompileSeeds();
+			cache.Save();
+		}
+		LOGF("Pipeline seeds: precompile done; exiting\n");
+		std::fflush(nullptr);
+		std::quick_exit(0);
+	}
 	return presenter;
 }
 

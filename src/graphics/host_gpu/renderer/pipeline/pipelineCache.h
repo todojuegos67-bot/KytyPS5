@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineSeeds.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
@@ -221,6 +222,7 @@ struct GraphicsPipelineBuild {
 	vk::SpecializationInfo                                                layer_limit_spec {};
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;
+	PipelineSeeds::Layout                                                 seed_layout;
 };
 
 // A graphics pipeline a worker thread compiles (see PipelineCache::TryGetGraphicsPipeline).
@@ -252,6 +254,8 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// KYTY_PRECOMPILE=1 (pipelineSeeds.h): every recorded pipeline into the driver cache.
+	void PrecompileSeeds();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;

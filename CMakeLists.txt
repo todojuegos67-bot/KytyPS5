@@ -1097,6 +1097,12 @@ if (KYTY_GT7_PORT AND WIN32)
 	add_dependencies(gt7_port kyty_emulator)
 	install(TARGETS gt7_port DESTINATION .)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/resources/gt7/LEEME.txt" DESTINATION .)
+	# Pipeline seeds for new players (assets/gt7/seeds/README.md): seeds\PPSA01317 beside the exe, merged into
+	# _ShaderCache by the launcher. Only when the repository has them.
+	if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets/gt7/seeds/PPSA01317")
+		install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/gt7/seeds/PPSA01317" DESTINATION seeds)
+		message(STATUS "Gran Turismo 7: pipeline seeds packaged (assets/gt7/seeds/PPSA01317)")
+	endif()
 	message(STATUS "Building the Gran Turismo 7 PC launcher (KYTY_GT7_PORT)")
 endif()
 if(KYTY_BUILD_LAUNCHER)
