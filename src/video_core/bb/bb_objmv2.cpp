@@ -116,6 +116,7 @@ struct State {
     std::unordered_map<u64, u32> use_cur, use_prev;
     u32 shared_min = 48;
     u64 sec_shared = 0;
+    u64 sec_ui_skipped = 0; // pipeline lookups refused as screen-space (depth test Always/Never)
     u64 sec_camera_only = 0, sec_dedupe = 0, sec_bytes_hashed = 0, sec_bytes_copied = 0;
     bool history = false; // map_prev is exactly the previous frame
     bool reset_pending = false;
@@ -484,6 +485,26 @@ Kind Want(const AmdGpu::Regs& regs) {
     if (!regs.depth_control.depth_enable || regs.IsClipDisabled() || !regs.color_buffers[0] ||
         !regs.color_target_mask.GetMask(0)) {
         return Kind::Mask;
+    }
+    // bb-149-objmv (HUD duplicates under DLSS-G, build 376): a draw whose depth test passes
+    // everything (Always / Never) is screen-space: the HUD / UI (Scaleform) or a full-screen pass,
+    // never a moving surface. It keeps attachment 7 bound but writes no object vector, so its
+    // pixels keep the camera vector. BB_OBJMV_UI=1 restores 376.
+    static const bool ui_old = [] {
+        const char* v = std::getenv("BB_OBJMV_UI");
+        const bool old = v != nullptr && *v == '1';
+        Log(old ? "[objmv-ui] BB_OBJMV_UI=1: depth-test-always draws may get object vectors (376)"
+                : "[objmv-ui] draws with depth test Always/Never (HUD, UI, full-screen passes) "
+                  "get no object vector");
+        return old;
+    }();
+    {
+        using CF = AmdGpu::CompareFunc;
+        const auto f = regs.depth_control.depth_func;
+        if (!ui_old && (f == CF::Always || f == CF::Never)) {
+            ++g.sec_ui_skipped;
+            return Kind::Mask;
+        }
     }
     const auto& bc = regs.blend_control[0];
     if (!bc.enable) {
@@ -991,7 +1012,13 @@ void OnFlip() {
                     g.sec_draws ? double(g.sec_bytes_copied) / double(g.sec_draws) : 0.0,
                     g.sec_dedupe));
     g.sec_camera_only = g.sec_dedupe = g.sec_bytes_hashed = g.sec_bytes_copied = 0;
+    if (g.sec_ui_skipped != 0) {
+        Log(fmt::format("[objmv-ui] screen-space draws (depth test Always/Never) without object "
+                        "vectors: {} pipeline lookups/s",
+                        g.sec_ui_skipped));
+    }
     g.sec_shared = 0;
+    g.sec_ui_skipped = 0;
     g.sec_gpu_bufs = 0;
     g.sec_nonzero = g.sec_stat_frames = g.sec_not_composed = 0;
     g.sec_draws = g.sec_vec_draws = g.sec_resets = g.sec_frames = g.sec_overflow = 0;
