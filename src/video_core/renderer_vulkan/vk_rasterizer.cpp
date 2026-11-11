@@ -4,6 +4,7 @@
 #include "common/debug.h"
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <optional>

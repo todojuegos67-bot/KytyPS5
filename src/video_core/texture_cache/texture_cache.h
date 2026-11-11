@@ -138,11 +138,7 @@ public:
     bool BBLastFindExact() const noexcept {
         return bb_last_find_exact;
     }
-    void BBTouch(ImageId image_id) {
-        Image& image = slot_images[image_id];
-        image.tick_accessed_last = scheduler.CurrentTick();
-        TouchImage(image);
-    }
+    void BBTouch(ImageId image_id);
     /// BB 0.83: the image at the same address as image_id with the given size (the other version
     /// of a scene target), made current; null when there is none.
     ImageId BBVersionAt(ImageId image_id, u32 width, u32 height);

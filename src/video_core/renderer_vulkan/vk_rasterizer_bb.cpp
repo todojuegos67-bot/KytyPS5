@@ -2385,6 +2385,16 @@ bool Rgba8(vk::Format f) {
 }
 } // namespace
 
+namespace {
+bool give_up_hudless() {
+    static const bool give_up = [] {
+        const char* v = std::getenv("BB_FG_HUDLESS_GIVEUP");
+        return v != nullptr && v[0] == '1';
+    }();
+    return give_up;
+}
+} // namespace
+
 void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
     g_bb.lut_ready = false;
     const bool captured = g_bb.lut_captured;
@@ -2654,10 +2664,7 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
         // fade or the full-screen pass of a few frames ended it for good: DLSS-G / FSR 3 FG then
         // warped the HUD until restart). A failed check only holds it back until the next check
         // passes. BB_FG_HUDLESS_GIVEUP=1: 1.49 (off after 5 failed checks in a row).
-        static const bool give_up = [] {
-            const char* v = std::getenv("BB_FG_HUDLESS_GIVEUP");
-            return v != nullptr && v[0] == '1';
-        }();
+        const bool give_up = give_up_hudless();
         if (!give_up && bad && g_bb.lut_bad_streak == 5) {
             BB::FG::Printf("[fg-hudless] 5 sampled checks in a row failed (conflicts %u, "
                            "mismatches %u): HUD-less image held back until a check passes (not "
@@ -2675,7 +2682,8 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
         g_bb.lut_table_slot = slot;
         g_bb.lut_pending[slot] = false;
     });
-    g_bb.lut_ready = true;
+    // bb-perf-1111: a check frame after a failed check is not given (its verdict comes later).
+    g_bb.lut_ready = g_bb.lut_verdict_ok || g_bb.lut_frames == 0 || give_up_hudless();
     g_bb.lut_frame = BB::ObjMotion::FrameNo();
 }
 

@@ -616,6 +616,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     return image_id;
 }
 
+void TextureCache::BBTouch(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
+}
+
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     SmallVector<ImageId, 4> image_ids;
     // BB 0.76: an address with an internal-size and an output-size image (native chain): an
