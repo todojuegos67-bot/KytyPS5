@@ -164,6 +164,13 @@ bool Finite(const Mat34& a) {
     return true;
 }
 
+const Slot* FindSlot(const Obj& o, u64 frame) {
+    for (const Slot& s : o.slots) {
+        if (s.frame == frame) return &s;
+    }
+    return nullptr;
+}
+
 // The object's own frame-to-frame transform (root bone): cur0 x prev0^-1.
 bool ObjDelta(const Slot& s, Mat34& out) {
     Mat34 inv;
@@ -188,8 +195,9 @@ const Mat34* FrameCommon(u64 frame) {
     std::array<std::vector<float>, 12> comp;
     for (auto& v : comp) v.reserve(eligible);
     for (const auto& [b, o] : g_objs) {
-        const Slot& s = o.slots[slot];
-        if (s.frame != frame || !s.has_prev) continue;
+        const Slot* sp = FindSlot(o, frame);
+        if (sp == nullptr || !sp->has_prev) continue;
+        const Slot& s = *sp;
         Mat34 d;
         if (!ObjDelta(s, d)) continue;
         for (int i = 0; i < 12; ++i) comp[i].push_back(d.m[i]);
@@ -230,8 +238,9 @@ int Classify(u64 bones, u64 frame, bool& recent) {
     const auto it = g_objs.find(bones);
     if (it == g_objs.end()) return -1;
     Obj& o = it->second;
-    Slot& s = o.slots[frame % kSlots];
-    if (s.frame != frame) return -1;
+    Slot* sp = const_cast<Slot*>(FindSlot(o, frame));
+    if (sp == nullptr) return -1;
+    Slot& s = *sp;
     if (s.state < 0 && s.has_prev) {
         const Mat34* c = FrameCommon(frame);
         if (c != nullptr) {
@@ -340,8 +349,15 @@ void GuestDrawMesh(u64 model, u64 mesh, u64 instance) {
             o.bones = n;
         }
         if (o.last_frame != frame) {
-            Slot& s = o.slots[frame % kSlots];
-            const Slot& p = o.slots[(frame + kSlots - 1) % kSlots];
+            // The newest earlier record (guest flips may skip a number when the game flips
+            // through more than one entry point).
+            u32 pi = 0;
+            for (u32 k = 1; k < kSlots; ++k) {
+                if (o.slots[k].frame > o.slots[pi].frame) pi = k;
+            }
+            const u32 si = (pi + 1) % kSlots;
+            Slot& s = o.slots[si];
+            const Slot& p = o.slots[pi];
             const u32 ns = std::min(n, kSamples);
             s.frame = frame;
             s.n = ns;
@@ -351,7 +367,7 @@ void GuestDrawMesh(u64 model, u64 mesh, u64 instance) {
                 const u32 b = ns > 1 ? u32(u64(i) * (n - 1) / (ns - 1)) : 0u;
                 s.cur[i] = src[b];
             }
-            s.has_prev = o.last_frame + 1 == frame && p.frame + 1 == frame && p.n == ns;
+            s.has_prev = p.frame != 0 && p.frame < frame && frame - p.frame <= 4 && p.n == ns;
             if (s.has_prev) {
                 s.prev = p.cur;
                 Eligible& e = g_eligible[frame % kSlots];
