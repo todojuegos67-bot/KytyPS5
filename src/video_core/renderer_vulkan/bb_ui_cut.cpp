@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <fmt/format.h>
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
@@ -53,6 +54,42 @@ vk::ImageAspectFlags DepthAspect(vk::Format f) {
                 ? vk::ImageAspectFlagBits::eStencil
                 : vk::ImageAspectFlags{});
 }
+// Why no draw started the HUD cut (logged once a second while no cut happens).
+struct CutWhy {
+    u64 movie_not_target = 0, target_not_movie = 0, display_buffer = 0, no_scene = 0,
+        not_ready = 0, cuts_seen = 0;
+    u64 hashes[8]{};
+    u32 hash_count = 0;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+} g_why;
+
+void NoteTargetHash(u64 hash) {
+    for (u32 i = 0; i < g_why.hash_count; ++i) {
+        if (g_why.hashes[i] == hash) return;
+    }
+    if (g_why.hash_count < 8) g_why.hashes[g_why.hash_count++] = hash;
+}
+
+void FlushWhy() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_why.t0 < std::chrono::seconds(1)) return;
+    g_why.t0 = now;
+    if (g_why.cuts_seen == 0) {
+        std::string hashes;
+        for (u32 i = 0; i < g_why.hash_count; ++i) {
+            hashes += fmt::format("{}{:#010x}", i ? " " : "", g_why.hashes[i]);
+        }
+        BB::Upscale::Checkpoint(fmt::format(
+            "[hud-cut] no cut this second: UI-movie shader on a non-scene target {}, scene-size "
+            "RGBA8 draws by other shaders {} (vs: {}), display buffer {}, scene not ready {}, "
+            "upscaler/FG not ready {}",
+            g_why.movie_not_target, g_why.target_not_movie, hashes.empty() ? "none" : hashes,
+            g_why.display_buffer, g_why.no_scene, g_why.not_ready));
+    }
+    g_why = CutWhy{};
+    g_why.t0 = now;
+}
+
 } // namespace
 
 void UiCut::NoteDisplayBuffer(VAddr address) {
@@ -225,6 +262,20 @@ void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId dep
     // the frame are made at the cut for the FG (the presenter then shows the display copy).
     const bool native_fg = !scaled && BB::FG::WantInputs();
     const bool active = scaled ? BB::Upscale::BackendReady() : native_fg;
+    {
+        const bool target = Rgba8(image.info.pixel_format) &&
+                            RenderTarget(image.info.size.width, image.info.size.height);
+        if (movie && !target) ++g_why.movie_not_target;
+        if (!movie && target && !IsDisplayBuffer(image.info.guest_address)) {
+            ++g_why.target_not_movie;
+            NoteTargetHash(vs_hash);
+        }
+        if (movie && target && IsDisplayBuffer(image.info.guest_address)) ++g_why.display_buffer;
+        if (ui_draw && !(scene.valid && ldr_target == color)) ++g_why.no_scene;
+        if (ui_draw && !active) ++g_why.not_ready;
+        if (ui_draw) ++g_why.cuts_seen;
+        FlushWhy();
+    }
     switch (Vulkan::UiComposition::Choose(scaled || native_fg, ui_draw,
                                           scene.valid && ldr_target == color, active)) {
     case Vulkan::UiComposition::Background::None:

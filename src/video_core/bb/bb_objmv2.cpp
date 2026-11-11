@@ -125,6 +125,12 @@ struct State {
     bool logged_nonzero = false, logged_not_composed = false;
 } g;
 
+// Statistics / check frame: 1 in 60, or 1 in 30 below 75 fps (at least one a second at 30 fps).
+u64 g_stat_period = kStatPeriod;
+bool IsStatFrame(u64 frame) {
+    return (frame % g_stat_period) == 0;
+}
+
 bool EnvOff(const char* name) {
     const char* s = std::getenv(name);
     return s != nullptr && (s[0] == '0' || std::string(s) == "off");
@@ -661,7 +667,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     const u32 slot = g.slot;
     ReadStats(slot);
     const bool stat = g.stat_frame;
-    const bool store_color = g.check && color_view && (g.frame % kStatPeriod) == kStatPeriod - 1;
+    const bool store_color = g.check && color_view && IsStatFrame(g.frame + 1);
     if (!stat && !store_color && (g.frame_vec_draws == 0 || reset)) {
         // Nothing moving drew this frame: the camera vectors stay as they are.
         ++g.sec_skipped;
@@ -805,7 +811,7 @@ void OnFlip() {
     g.composed = false;
     g.frame_vec_draws = 0;
     g.static_seen = 0;
-    g.stat_frame = (g.frame % kStatPeriod) == 0;
+    g.stat_frame = IsStatFrame(g.frame);
     g.slot = (g.slot + 1) % kSlots;
     g.arena_used = 0;
     g.table_used = 0;
@@ -813,6 +819,10 @@ void OnFlip() {
     const auto now = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(now - g.t0).count();
     if (secs < 1.0) return;
+    {
+        const u64 period = double(g.sec_frames) / secs < 75.0 ? kStatPeriod / 2 : kStatPeriod;
+        g_stat_period = period; // a stored colour without its check frame is simply unused
+    }
     g.t0 = now;
     const double cov = g.sec_px_all ? 100.0 * double(g.sec_px_obj) / double(g.sec_px_all) : 0.0;
     std::string cats;
