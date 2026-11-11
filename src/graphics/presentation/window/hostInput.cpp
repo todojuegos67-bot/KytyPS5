@@ -1192,8 +1192,10 @@ void KbmInit() {
 	// the linear mapping's top rate, learned from the camera later: the "camera top rate" line).
 	const double top = g_kbm.curve.valid ? g_kbm.curve.MaxRate() : g_kbm.rmax;
 	const char*  src = g_kbm.curve.valid ? "kbm_curve.txt" : "linear mapping, until measured";
-	if (!Loader::DemonsSoulsCamera::DirectInstalled())
-		LOGF("KYTY_KBM_EQUAL_AXES=%d: direct camera not in use, both axes on the emulated stick: max horizontal %.0f deg/s, "
+	// (DirectWanted, not DirectInstalled: the window can be set up before the eboot is patched; the camera's own line
+	// says whether the direct camera was applied.)
+	if (!Loader::DemonsSoulsCamera::DirectWanted())
+		LOGF("KYTY_KBM_EQUAL_AXES=%d: direct camera off, both axes on the emulated stick: max horizontal %.0f deg/s, "
 		     "max vertical %.0f deg/s (%s)\n",
 		     g_kbm.equal_axes ? 1 : 0, top, top, src);
 	else if (g_kbm.equal_axes)
