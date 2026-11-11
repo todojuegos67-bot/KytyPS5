@@ -253,7 +253,7 @@ public:
     static constexpr u32 ObjMvOutput = 7;
     bool ObjMvVertex() const {
         return hw_stage == HwStage::Vertex && sw_stage == SwStage::Vertex &&
-               runtime_info.hw.vs.bb_objmv && profile.support_bda;
+               runtime_info.hw.vs.bb_objmv; // bb-149: BDA always on (as v1)
     }
     // The vertex shader runs a second time with last frame's buffers (no side effects allowed).
     bool ObjMvPrevPass() const;

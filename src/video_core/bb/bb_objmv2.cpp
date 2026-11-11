@@ -311,10 +311,7 @@ bool Init(const Vulkan::Instance& instance) {
         Log("off (BB_OBJMV2=0): camera-only motion vectors (bb_mv.comp)");
         return false;
     }
-    if (!instance.IsBufferDeviceAddressSupported()) {
-        Log("off: buffer device address not supported");
-        return false;
-    }
+    // bb-149: buffer device addresses are always enabled on this base (v1 relies on them too).
     g.check = !EnvOff("BB_OBJMV2_CHECK");
     {
         const char* mv = std::getenv("BB_OBJMV_MOVE");
