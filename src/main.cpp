@@ -651,7 +651,52 @@ static void InitCudaEarly() {
 }
 #endif
 
+// KYTY_TIMER_RESOLUTION (default 1 ms; 0 leaves Windows' default, often 15.6 ms): the waits with a
+// timeout (semaphores, condition variables, SyncOnAddress slices, the GPU thread's 100 us poll)
+// otherwise round up to the system tick when no wake arrives. KYTY_POWER_THROTTLING=1 keeps
+// Windows' EcoQoS (by default it is turned off for this process, so its threads are not moved to
+// efficiency cores or slowed when the window is in the background). Both are once per run.
+static void SetupWindowsScheduling() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const char* res_env = std::getenv("KYTY_TIMER_RESOLUTION");
+	const auto  res_ms  = res_env != nullptr ? std::strtoul(res_env, nullptr, 10) : 1ul;
+	std::string text;
+	if (res_ms != 0) {
+		using TimeBeginPeriod = UINT(WINAPI*)(UINT);
+		HMODULE winmm         = LoadLibraryW(L"winmm.dll");
+		auto*   begin = winmm != nullptr ? reinterpret_cast<TimeBeginPeriod>(
+		                                     reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")))
+		                                 : nullptr;
+		const bool ok = begin != nullptr && begin(static_cast<UINT>(res_ms)) == 0;
+		text += fmt::format("timer resolution {} ms {}", res_ms, ok ? "set" : "NOT set");
+	} else {
+		text += "timer resolution left alone";
+	}
+	const char* pt_env = std::getenv("KYTY_POWER_THROTTLING");
+	if (pt_env == nullptr || pt_env[0] != '1') {
+		struct PowerThrottlingState {
+			ULONG version;
+			ULONG control_mask;
+			ULONG state_mask;
+		};
+		// ProcessPowerThrottling = 4; EXECUTION_SPEED = 1, IGNORE_TIMER_RESOLUTION = 4.
+		PowerThrottlingState state {1, 0x1u | 0x4u, 0};
+		using SetProcessInformationFn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+		auto* set = reinterpret_cast<SetProcessInformationFn>(reinterpret_cast<void*>(
+		    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation")));
+		const bool ok = set != nullptr && set(GetCurrentProcess(), 4, &state, sizeof(state)) != 0;
+		text += fmt::format(", power throttling (EcoQoS) {}", ok ? "off" : "NOT changed");
+	} else {
+		text += ", power throttling left alone";
+	}
+	std::printf("Scheduling: %s (KYTY_TIMER_RESOLUTION=0, KYTY_POWER_THROTTLING=1 for Windows' defaults)\n",
+	            text.c_str());
+	std::fflush(stdout);
+#endif
+}
+
 static int Main(int argc, char* argv[]) {
+	SetupWindowsScheduling();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	InitCudaEarly();
 #endif

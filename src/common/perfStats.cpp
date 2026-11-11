@@ -39,7 +39,7 @@ namespace {
 uint32_t IntervalSeconds() {
 	static const uint32_t seconds = [] {
 		const char* value = std::getenv("KYTY_PERF");
-		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u;
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 5u;
 	}();
 	return seconds;
 }
@@ -734,8 +734,8 @@ void Start() {
 			return;
 		}
 		Detail::g_enabled.store(true, std::memory_order_relaxed);
-		LOGF("Perf: a summary every %u s (KYTY_PERF=<seconds>, 0 turns it off)\n",
-		     IntervalSeconds());
+		Log::WriteUnmuted(fmt::format(
+		    "Perf: a summary every {} s (KYTY_PERF=<seconds>, 0 turns it off)\n", IntervalSeconds()));
 		std::thread([] {
 			NameThread("PerfReport");
 			Run();

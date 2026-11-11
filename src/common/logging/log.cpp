@@ -188,7 +188,13 @@ void SetMuted(bool muted) {
 	g_muted.store(muted, std::memory_order_relaxed);
 }
 
+// Also the perf reports (KYTY_PERF, KYTY_SAMPLE): with printf's output Silent (the default) they
+// go straight to stdout, so a port's log (its stdout) still carries them.
 void WriteUnmuted(std::string_view text) {
+	if (g_initialized && g_direction == Direction::Silent) {
+		WriteStdout(text);
+		return;
+	}
 	WriteImpl(text);
 }
 
