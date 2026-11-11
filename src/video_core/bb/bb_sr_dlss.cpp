@@ -622,7 +622,16 @@ bool Evaluate(const Desc& desc) {
     constants.prevClipToClip = desc.camera_valid && Inverted(desc.clip_to_prev_clip, prev_to_clip)
                                    ? transposed(prev_to_clip)
                                    : Matrix(identity);
-    constants.jitterOffset = sl::float2(desc.jitter[0], desc.jitter[1]);
+    // desc.jitter is the shift added to the viewport (FSR convention: the geometry moves by +j
+    // px). DLSS takes the sample offset, the opposite sign; BB_DLSS_JITTER_SIGN=1 keeps +j.
+    static const float jitter_sign = [] {
+        const char* v = std::getenv("BB_DLSS_JITTER_SIGN");
+        const float sign = v != nullptr && *v != '\0' && std::atof(v) > 0 ? 1.0f : -1.0f;
+        BBLogf("DLSS: jitter offset sign %+.0f vs the viewport shift (BB_DLSS_JITTER_SIGN)", sign);
+        return sign;
+    }();
+    constants.jitterOffset =
+        sl::float2(jitter_sign * desc.jitter[0], jitter_sign * desc.jitter[1]);
     // Our vectors are render pixels; Streamline wants render-size UV.
     constants.mvecScale = sl::float2(1.0f / static_cast<float>(desc.render.width),
                                      1.0f / static_cast<float>(desc.render.height));
