@@ -1049,6 +1049,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_bb_objmv.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_bb_objmv2.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
                       src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
@@ -1220,6 +1221,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/fsr411/fsr411_vk.h
                src/video_core/bb/bb_sr_xess.cpp
                src/video_core/bb/bb_upscale.cpp
+               src/video_core/bb/bb_objmv2.cpp
+               src/video_core/bb/bb_objmv2.h
                src/video_core/bb/bb_upscale.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h

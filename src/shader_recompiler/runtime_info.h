@@ -99,6 +99,8 @@ struct HwVertexRuntimeInfo {
     u32 user_clip_plane_mask{};
     /// BB object motion vectors (bb_objmv.h): store / load the clip position per vertex.
     bool motion_vectors{};
+    /// BB object motion vectors v2 (bb_objmv2.h): previous-frame clip position varying.
+    bool bb_objmv{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };
@@ -213,7 +215,9 @@ struct HwFragmentRuntimeInfo {
     u32 clip_distance_emulation : 1;
     u32 depth_before_shader : 1;
     u32 motion_vectors : 1; ///< BB object motion vectors (bb_objmv.h): output at location 7
-    u32 : 11;
+    u32 bb_objmv : 1;       ///< BB object motion vectors v2 (bb_objmv2.h): MRT 7 output
+    u32 bb_objmv_blend : 1; ///< ... of a blended (transparent) draw: written where alpha >= 0.5
+    u32 : 9;
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -225,6 +229,7 @@ struct HwFragmentRuntimeInfo {
                clip_distance_emulation == other.clip_distance_emulation &&
                depth_before_shader == other.depth_before_shader &&
                motion_vectors == other.motion_vectors &&
+               bb_objmv == other.bb_objmv && bb_objmv_blend == other.bb_objmv_blend &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

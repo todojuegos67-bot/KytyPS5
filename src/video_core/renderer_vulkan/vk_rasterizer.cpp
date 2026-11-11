@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/bb/bb_objmv2.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -53,6 +54,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    BB::ObjMv2::Init(instance);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -389,6 +391,26 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+// BB object motion vectors v2 (bb_objmv2.h): last frame's buffers for a motion pipeline's draw.
+void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32 count,
+                             u32 instances) {
+    if (!BB::ObjMv2::Active()) {
+        return;
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    if (!BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment])) {
+        return;
+    }
+    if (!key.write_masks[BB::ObjMv2::Attachment]) {
+        return; // a Mask draw (attachment 7 only keeps the pass going)
+    }
+    BB::ObjMv2::OnDraw(push_data, pipeline->GetStage(Shader::SwStage::Vertex), memory,
+                       buffer_cache,
+                       key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)], identity,
+                       count, instances, key.blend_controls[BB::ObjMv2::Attachment].enable != 0,
+                       false);
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     BB::Metrics::CpTimer bb_cp_t{BB::Metrics::CpDraw};
@@ -436,6 +458,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                         bb_rt_scale_x, bb_rt_scale_y);
     }
     bb_rec_t.emplace(BB::Metrics::CpRec);
+    BbObjMvDraw(pipeline,
+                is_indexed ? regs.index_base_address.Address<VAddr>() + index_offset : 0,
+                regs.num_indices, regs.num_instances.NumInstances());
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -539,6 +564,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     BBObjMotionDraw(instance, push_data, *pipeline, liverpool->regs, is_indexed, 0, true,
                     bb_rt_scale_x, bb_rt_scale_y);
+    BbObjMvDraw(pipeline, arg_address + offset, max_count, 0);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1656,6 +1682,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     }
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
+    }
+    if (BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment])) {
+        BB::ObjMv2::Attach(scheduler, state);
     }
 
     // 1.37: a depth-only HUD draw (the bars' depth / stencil mask) goes into the depth twin too.

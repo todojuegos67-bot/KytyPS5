@@ -66,13 +66,14 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
 
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto& buffer = ctx.buffers[handle];
+    const Id raw_index = index;
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
     const Id result{ctx.OpLoad(ctx.U32[1], ptr)};
-    return result;
+    return ctx.ObjMvPrevLoad(handle, raw_index, result, ctx.U32[1]);
 }
 
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
@@ -255,6 +256,9 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
 }
 
 void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 element) {
+    if (ctx.objmv_prev_mode && attr != IR::Attribute::Position0) {
+        return; // BB objmv2 previous-frame pass: the position only (main writes all outputs)
+    }
     const auto op_store = [&](Id pointer) {
         const auto [component_type, is_integer] = OutputAttrComponentType(ctx, attr);
         if (is_integer) {
@@ -384,6 +388,7 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
+    const Id raw_address = address;
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -394,7 +399,12 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
         const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
-        const Id result_i = ctx.OpLoad(data_types[1], ptr_i);
+        Id result_i = ctx.OpLoad(data_types[1], ptr_i);
+        if (ctx.objmv_prev_mode) {
+            const Id raw_i =
+                i == 0 ? raw_address : ctx.OpIAdd(ctx.U32[1], raw_address, ctx.ConstU32(i));
+            result_i = ctx.ObjMvPrevLoad(handle, raw_i, result_i, data_types[1]);
+        }
         ids.push_back(result_i);
     }
 

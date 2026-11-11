@@ -72,7 +72,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma || VertexMotion()) {
+    if (info.uses_dma || VertexMotion() || ObjMvVertex()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -650,6 +650,15 @@ void EmitContext::DefineOutputs() {
                 ++num_attrs;
             }
 
+            if (ObjMvVertex()) {
+                objmv_out_cur = DefineOutput(F32[4], ObjMvCurLocation);
+                objmv_out_prev = DefineOutput(F32[4], ObjMvPrevLocation);
+                Name(objmv_out_cur, "bb_objmv_cur");
+                Name(objmv_out_prev, "bb_objmv_prev");
+                objmv_prev_pos = DefineVar(F32[4], spv::StorageClass::Private);
+                Name(objmv_prev_pos, "bb_objmv_prev_pos");
+                interfaces.push_back(objmv_prev_pos);
+            }
             if (needs_clip_distance_emulation) {
                 clip_distances = Id{DefineOutput(F32[MaxEmulatedClipDistances], 0)};
                 output_params[num_attrs] = GetAttributeInfo(
@@ -749,6 +758,12 @@ void EmitContext::DefineOutputs() {
             frag_outputs[i] = GetAttributeInfo(num_format, id, num_components, true);
             ++num_render_targets;
         }
+        if (ObjMvFragment() && !Sirit::ValidId(frag_outputs[ObjMvOutput].id)) {
+            objmv_frag_out = DefineOutput(F32[4], ObjMvOutput);
+            objmv_in_cur = DefineInput(F32[4], ObjMvCurLocation);
+            objmv_in_prev = DefineInput(F32[4], ObjMvPrevLocation);
+            Name(objmv_frag_out, "bb_objmv_vector");
+        }
         // Dual source blending allows at most 2 render targets, one for each source.
         // Fewer targets are allowed but the missing blending source values will be
         // undefined.
@@ -783,7 +798,7 @@ void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{
         Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[1], U32[2],
-                        U32[2]),
+                        U32[2], U32[1], U32[2]),
              "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -807,6 +822,11 @@ void EmitContext::DefinePushDataBlock() {
                    PushData::MotionParamOffset);
     MemberDecorate(struct_type, PushData::MotionParamsAddrIndex, spv::Decoration::Offset, 80U);
     MemberDecorate(struct_type, PushData::MotionPositionsAddrIndex, spv::Decoration::Offset, 88U);
+    // bb-149-objmv: v2's members after v1's (offsets 96 and 104).
+    MemberName(struct_type, PushData::ObjMvFlagsIndex, "bb_objmv_flags");
+    MemberName(struct_type, PushData::ObjMvEntryIndex, "bb_objmv_entry");
+    MemberDecorate(struct_type, PushData::ObjMvFlagsIndex, spv::Decoration::Offset, 96U);
+    MemberDecorate(struct_type, PushData::ObjMvEntryIndex, spv::Decoration::Offset, 104U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);

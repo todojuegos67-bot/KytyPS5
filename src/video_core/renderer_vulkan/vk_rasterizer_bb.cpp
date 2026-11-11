@@ -23,6 +23,7 @@
 #include "video_core/bb/bb_fg.h"
 #include <chrono>
 #include "video_core/bb/bb_objmv.h"
+#include "video_core/bb/bb_objmv2.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/host_shaders/bb_alpha_comp.h"
@@ -1807,7 +1808,15 @@ bool Rasterizer::BBRecordUpscale(vk::Image color_image, vk::ImageView color_view
     }
     // Object motion vectors (bb_objmv.h) over the camera ones.
     g_bb.mv_frame = late ? BB::ObjMotion::FrameNo() - 1 : BB::ObjMotion::FrameNo();
-    BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset, late);
+    if (BB::ObjMv2::Active()) {
+        // bb-149-objmv: object motion vectors v2 (bb_objmv2.h: the vertex shader run again with
+        // last frame's buffers, attachment 7) over the 149 camera vectors, only where a skeleton
+        // moved or a blended draw wrote; the scenery keeps the camera vector. No colour check
+        // (the scene colour is not in the General layout here).
+        BB::ObjMv2::Compose(cmd, g_bb.mv.view, vk::ImageView{}, render, plan.reset);
+    } else {
+        BB::ObjMotion::Compose(cmd, g_bb.mv.image, g_bb.mv.view, render, plan.reset, late);
+    }
     Barrier(cmd, g_bb.mv, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);

@@ -69,13 +69,27 @@ void ConvertPositionToClipSpace(EmitContext& ctx) {
 // BB object motion vectors (emit_spirv_bb_objmv.cpp).
 void EmitBBVertexMotion(EmitContext& ctx);
 void EmitBBFragmentMotion(EmitContext& ctx);
+// BB object motion vectors v2 (emit_spirv_bb_objmv2.cpp).
+void EmitBBObjMvVertex(EmitContext& ctx);
+void EmitBBObjMvFragment(EmitContext& ctx);
 
 void EmitEpilogue(EmitContext& ctx) {
+    if (ctx.objmv_prev_mode) {
+        // Previous-frame pass: its position (as the guest wrote it) is all it produces.
+        ctx.OpStore(ctx.objmv_prev_pos, ctx.OpLoad(ctx.F32[4], ctx.output_position));
+        return;
+    }
     if (ctx.VertexMotion()) {
         EmitBBVertexMotion(ctx);
     }
     if (ctx.FragmentMotion()) {
         EmitBBFragmentMotion(ctx);
+    }
+    if (ctx.ObjMvVertex()) {
+        EmitBBObjMvVertex(ctx);
+    }
+    if (ctx.ObjMvFragment()) {
+        EmitBBObjMvFragment(ctx);
     }
     if (ctx.hw_stage == HwStage::Vertex &&
         ctx.runtime_info.hw.vs.emulate_depth_negative_one_to_one) {

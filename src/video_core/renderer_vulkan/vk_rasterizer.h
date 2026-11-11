@@ -203,6 +203,8 @@ private:
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
     void ResetBindings(bool is_compute);
+    // bb-149-objmv: object motion vectors v2 (bb_objmv2.h) of a draw.
+    void BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32 count, u32 instances);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
