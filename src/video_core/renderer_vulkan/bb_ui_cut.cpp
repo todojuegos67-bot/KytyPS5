@@ -244,7 +244,17 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
     const bool seq_on = seq_frame == 1;
     if (seq_on && color && seq.size() < 1800) {
         const auto& im = texture_cache.GetImage(color);
-        if (Rgba8(im.info.pixel_format) && RenderTarget(im.info.size.width, im.info.size.height)) {
+        const bool display = IsDisplayBuffer(im.info.guest_address);
+        if (display || (!RenderTarget(im.info.size.width, im.info.size.height) &&
+                        im.info.size.width >= 1280)) {
+            // gpu7: where the in-game HUD goes (370: no UI draw reached the scene target).
+            seq += fmt::format(" [{} {}x{} {}] vs{:#x}/ps{:#x}{}{}", display ? "display" : "target",
+                               im.info.size.width, im.info.size.height,
+                               vk::to_string(im.info.pixel_format), vs_hash, info.ps_hash,
+                               info.samples_scene ? " reads-scene" : "",
+                               info.blend ? " blend" : "");
+        } else if (Rgba8(im.info.pixel_format) &&
+                   RenderTarget(im.info.size.width, im.info.size.height)) {
             seq += fmt::format(" {}vs{:#x}/ps{:#x}{}{}{}{}", ui_phase ? "UI:" : "", vs_hash,
                                info.ps_hash, info.samples_scene ? " reads-scene" : "",
                                info.depth_test ? " depth" : "", info.blend ? " blend" : "",
@@ -305,21 +315,24 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
     // BB_HUD_TRIGGER=movie: only the UI-movie shaders (gpu5).
     static const int trigger_mode = [] {
         const char* v = std::getenv("BB_HUD_TRIGGER");
-        const int m = v == nullptr || std::strcmp(v, "auto") == 0 ? 2
-                      : std::strcmp(v, "list") == 0              ? 1
-                                                                 : 0;
+        // gpu7: default movie (the 370 log: "auto" cut at vs 0xb0acf50 ps 0x8c08444c, a blended
+        // full-screen pass at the end of the post chain, and the HUD came out broken).
+        const int m = v != nullptr && std::strcmp(v, "auto") == 0   ? 2
+                      : v != nullptr && std::strcmp(v, "list") == 0 ? 1
+                                                                    : 0;
         BB::Upscale::Checkpoint(fmt::format(
             "[hud-cut] trigger {} (BB_HUD_TRIGGER=auto|list|movie)",
-            m == 2 ? "auto: UI-movie shaders, the HUD list, or the first blended 2D draw after "
-                     "the scene"
-            : m == 1 ? "list: UI-movie shaders and the HUD list"
-                     : "movie: UI-movie shaders only"));
+            m == 2 ? "auto: UI-movie shaders, BB_HUD_VS/BB_HUD_PS, or the first blended draw "
+                     "after the scene that reads no scene-size image"
+            : m == 1 ? "list: UI-movie shaders and BB_HUD_VS/BB_HUD_PS"
+                     : "movie (default): UI-movie shaders only"));
         return m;
     }();
-    static const std::vector<u64> hud_list = [] {
-        std::vector<u64> list{0x1ea5a07e, 0x061fbbf6, 0x0b0acf50};
-        if (const char* v = std::getenv("BB_HUD_VS"); v != nullptr && *v != '\0') {
-            list.clear();
+    // gpu7: no default list (the 369 hashes 0x1ea5a07e / 0x061fbbf6 / 0x0b0acf50 are post passes
+    // reading the scene, 370 [hud-seq]); BB_HUD_VS / BB_HUD_PS name vertex / pixel shaders.
+    const auto parse_list = [](const char* name) {
+        std::vector<u64> list;
+        if (const char* v = std::getenv(name); v != nullptr && *v != '\0') {
             std::string text{v};
             size_t pos = 0;
             while (pos < text.size()) {
@@ -331,9 +344,16 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
                 pos = end + 1;
             }
         }
+        return list;
+    };
+    static const std::vector<u64> hud_list = parse_list("BB_HUD_VS");
+    static const std::vector<u64> hud_ps_list = [&] {
+        auto list = parse_list("BB_HUD_PS");
         std::string shown;
-        for (const u64 h : list) shown += fmt::format(" {:#x}", h);
-        BB::Upscale::Checkpoint(fmt::format("[hud-cut] HUD vertex shaders:{}", shown));
+        for (const u64 h : hud_list) shown += fmt::format(" vs {:#x}", h);
+        for (const u64 h : list) shown += fmt::format(" ps {:#x}", h);
+        BB::Upscale::Checkpoint(fmt::format("[hud-cut] HUD start shaders (BB_HUD_VS/BB_HUD_PS):{}",
+                                            shown.empty() ? " none" : shown));
         return list;
     }();
     const bool refused = std::find(bad_vs.begin(), bad_vs.begin() + num_bad_vs, vs_hash) !=
@@ -342,6 +362,7 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
     const bool hud_start =
         !listed_movie && trigger_mode != 0 && flat && !refused &&
         (std::find(hud_list.begin(), hud_list.end(), vs_hash) != hud_list.end() ||
+         std::find(hud_ps_list.begin(), hud_ps_list.end(), info.ps_hash) != hud_ps_list.end() ||
          (trigger_mode == 2 && info.blend));
     const bool movie = listed_movie || hud_start;
     (void)native_viewport; // Supermedo: only for his live resolution path (guest targets 1080p)
