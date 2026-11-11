@@ -1298,7 +1298,7 @@ void KbmControl(std::size_t control, bool down) {
 		KbmLeftStick();
 		return;
 	}
-	SetControl(control, down);
+	SetControl(control, down, FROM_KEY);
 }
 
 const KbmBinding* KbmFind(SDL_Keycode key, uint8_t mouse_button, bool shift) {
