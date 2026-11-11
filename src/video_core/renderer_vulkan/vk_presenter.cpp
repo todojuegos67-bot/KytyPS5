@@ -1886,8 +1886,8 @@ void Presenter::SetExpectedGameSize(s32 width, s32 height) {
     // frame in a 2560x1440 window: the output-size HUD (display copy 2560x1440) was resampled to
     // 1438 rows and again to 1440 by the swapchain (soft HUD). Within 0.5 % of the window: the
     // window's own size, pixel for pixel.
-    if (std::abs(expected_frame_width - static_cast<s32>(width)) * 200 <= static_cast<s32>(width)) expected_frame_width = width;
-    if (std::abs(expected_frame_height - static_cast<s32>(height)) * 200 <= static_cast<s32>(height)) expected_frame_height = height;
+    if (std::abs(static_cast<s32>(expected_frame_width) - width) * 200 <= width) expected_frame_width = width;
+    if (std::abs(static_cast<s32>(expected_frame_height) - height) * 200 <= height) expected_frame_height = height;
 }
 
 } // namespace Vulkan
