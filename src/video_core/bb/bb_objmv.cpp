@@ -652,8 +652,14 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
     // bb-native-mv: a draw the game's DrawMesh issued (bb_native_mv.h) is keyed by the game's own
     // object (bone matrices + mesh) and gets an object vector only while that object moves in the
     // world; static ones keep the camera vector. The reconstructed identity below is not used.
-    if (const auto& nid = BB::NativeMv::Current(); nid.key != 0) {
-        BB::NativeMv::NoteSceneDraw(true);
+    BB::NativeMv::DrawId nid = BB::NativeMv::Current();
+    if (nid.key == 0 && BB::NativeMv::On()) {
+        // Characters: the bone palette's GPU address is one of a game skin ring's slots.
+        nid = BB::NativeMv::LookupPalette(palette == Palette::Large ? large_address
+                                                                     : palette_address);
+    }
+    if (nid.key != 0) {
+        BB::NativeMv::NoteSceneDraw(nid);
         if (!nid.moving && !nid.recent) return;
         const u32 half = static_cast<u32>(g.frame & 1);
         if (g.cursor + count > g.per_half || g.params_used + 1 >= kParamsPerFrame) {
@@ -697,7 +703,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         push.motion_param = index;
         return;
     }
-    if (BB::NativeMv::On()) BB::NativeMv::NoteSceneDraw(true);
+    if (BB::NativeMv::On()) BB::NativeMv::NoteSceneDraw(nid);
 
     // The draw's identity across frames: shader, vertex and index streams, range, instances,
     // and its order among identical draws this frame.

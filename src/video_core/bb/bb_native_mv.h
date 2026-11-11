@@ -40,6 +40,8 @@ void SetHooksInstalled(bool installed, const char* detail);
 // Guest threads (from the detours).
 void GuestDrawMesh(u64 model, u64 mesh, u64 instance);
 void GuestDrawEmit(u64 gx_context, u64 return_address);
+// SkinRingUpdate(ring, bones): a character's per-frame skin ring update.
+void GuestSkinRing(u64 ring, u64 bones);
 void SetDrawMeshRange(u64 begin, u64 end);
 // Guest flip (sceGnmSubmitAndFlipCommandBuffers): the guest frame ends.
 void OnGuestFlip();
@@ -55,9 +57,12 @@ struct DrawId {
 };
 // The current draw's identity (after SetDrawPacket).
 const DrawId& Current();
+// A draw's bone palette address: the character whose skin ring holds it (key 0: none).
+DrawId LookupPalette(u64 palette_address);
 
-// objmv2 statistics feed (GPU thread).
-void NoteSceneDraw(bool motion_candidate);
+
+// v1 statistics feed (GPU thread).
+void NoteSceneDraw(const DrawId& id);
 void NoteVectorDraw(bool with_previous);
 
 // Presenter, once a frame: live switch file, the per-second log.

@@ -84,6 +84,26 @@ std::mutex g_mx; // objects + markers
 std::unordered_map<u64, Obj> g_objs;
 std::map<u64, Marker> g_markers;
 
+// Per-character GPU skin rings (SkinRingUpdate, eboot 0x21c9ce0 base / 0x21c8c50 1.09): the
+// ring object keeps [ring+0x9c] palette slots, arrays [ring+0x10] / [ring+0x18] (one entry per
+// slot), index [ring+0x98], skeleton [ring+0xb0] (bone count +0x1c). Its draws read a slot's
+// palette: the palette's GPU address names the character.
+struct Ring {
+    u64 bones = 0;
+    u64 frame = 0;
+    u32 n = 0;
+    bool skinned = true;
+    std::array<u64, 16> entries{}; // [ring+0x10][i], [ring+0x18][i]
+    u32 count = 0;
+    u64 mapped_frame = 0;
+};
+std::unordered_map<u64, Ring> g_rings;
+std::map<u64, u64> g_ring_addr; // palette buffer GPU address -> ring (draws read inside it)
+constexpr u64 kRingSpan = 0x10000;
+std::atomic<int> g_ring_offset{-1};       // -1: entries are the addresses; else [entry + offset]
+std::vector<u64> g_missed;                // palette addresses of draws without identity (learning)
+u64 st_ring_calls = 0, st_ring_hits = 0, st_ring_miss = 0;
+
 // Frame camera (common transform) cache, GPU thread under g_mx.
 struct CamCache {
     u64 frame = 0;
@@ -107,6 +127,11 @@ u64 st_packets = 0, st_matched = 0, st_scene = 0, st_scene_id = 0, st_scene_movi
     st_vec = 0, st_vec_prev = 0, st_gpu_ns = 0, st_classified = 0, st_moving_obj = 0,
     st_skinned_scene_id = 0, st_skinned_scene_moving = 0, st_frames = 0;
 Clock::time_point st_t0 = Clock::now();
+
+// A buffer V#'s first 8 bytes: base address bits 0..43.
+u64 VsharpBase(u64 v) {
+    return (v & 0xffffffffull) | (((v >> 32) & 0xfffull) << 32);
+}
 
 u64 Mix(u64 a, u64 b) {
     u64 h = a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2));
@@ -242,9 +267,11 @@ int Classify(u64 bones, u64 frame, bool& recent) {
     if (sp == nullptr) return -1;
     Slot& s = *sp;
     if (s.state < 0 && s.has_prev) {
+        static const Mat34 ident{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}};
         const Mat34* c = FrameCommon(frame);
-        if (c != nullptr) {
-            s.state = Moved(s, *c) ? 1 : 0;
+        {
+            const bool moved = Moved(s, ident) && (c == nullptr || Moved(s, *c));
+            s.state = moved ? 1 : 0;
             ++st_classified;
             if (s.state == 1) {
                 ++st_moving_obj;
@@ -295,6 +322,49 @@ void Log(const std::string& text) {
     BB::Upscale::Checkpoint(text);
 }
 
+// Under g_mx: this frame's record of an object's bones (false: not readable).
+bool RecordBones(u64 bones, u32 n, u64 frame) {
+    Obj& o = g_objs[bones];
+    if (!o.validated || o.bones != n) {
+        auto* memory = Core::Memory::Instance();
+        if (memory == nullptr || !memory->IsValidMapping(bones, u64(n) * 48)) {
+            g_objs.erase(bones);
+            return false;
+        }
+        o.validated = true;
+        o.bones = n;
+    }
+    if (o.last_frame != frame) {
+        // The newest earlier record (guest flips may skip a number when the game flips
+        // through more than one entry point).
+        u32 pi = 0;
+        for (u32 k = 1; k < kSlots; ++k) {
+            if (o.slots[k].frame > o.slots[pi].frame) pi = k;
+        }
+        const u32 si = (pi + 1) % kSlots;
+        Slot& s = o.slots[si];
+        const Slot& p = o.slots[pi];
+        const u32 ns = std::min(n, kSamples);
+        s.frame = frame;
+        s.n = ns;
+        s.state = -1;
+        const auto* src = reinterpret_cast<const Mat34*>(bones);
+        for (u32 i = 0; i < ns; ++i) {
+            const u32 b = ns > 1 ? u32(u64(i) * (n - 1) / (ns - 1)) : 0u;
+            s.cur[i] = src[b];
+        }
+        s.has_prev = p.frame != 0 && p.frame < frame && frame - p.frame <= 4 && p.n == ns;
+        if (s.has_prev) {
+            s.prev = p.cur;
+            Eligible& e = g_eligible[frame % kSlots];
+            if (e.frame != frame) e = {frame, 0};
+            ++e.count;
+        }
+        o.last_frame = frame;
+    }
+    return true;
+}
+
 } // namespace
 
 bool On() {
@@ -338,44 +408,7 @@ void GuestDrawMesh(u64 model, u64 mesh, u64 instance) {
     const u64 frame = g_frame.load(std::memory_order_relaxed);
     {
         std::scoped_lock lk{g_mx};
-        Obj& o = g_objs[bones];
-        if (!o.validated || o.bones != n) {
-            auto* memory = Core::Memory::Instance();
-            if (memory == nullptr || !memory->IsValidMapping(bones, u64(n) * 48)) {
-                g_objs.erase(bones);
-                return;
-            }
-            o.validated = true;
-            o.bones = n;
-        }
-        if (o.last_frame != frame) {
-            // The newest earlier record (guest flips may skip a number when the game flips
-            // through more than one entry point).
-            u32 pi = 0;
-            for (u32 k = 1; k < kSlots; ++k) {
-                if (o.slots[k].frame > o.slots[pi].frame) pi = k;
-            }
-            const u32 si = (pi + 1) % kSlots;
-            Slot& s = o.slots[si];
-            const Slot& p = o.slots[pi];
-            const u32 ns = std::min(n, kSamples);
-            s.frame = frame;
-            s.n = ns;
-            s.state = -1;
-            const auto* src = reinterpret_cast<const Mat34*>(bones);
-            for (u32 i = 0; i < ns; ++i) {
-                const u32 b = ns > 1 ? u32(u64(i) * (n - 1) / (ns - 1)) : 0u;
-                s.cur[i] = src[b];
-            }
-            s.has_prev = p.frame != 0 && p.frame < frame && frame - p.frame <= 4 && p.n == ns;
-            if (s.has_prev) {
-                s.prev = p.cur;
-                Eligible& e = g_eligible[frame % kSlots];
-                if (e.frame != frame) e = {frame, 0};
-                ++e.count;
-            }
-            o.last_frame = frame;
-        }
+        if (!RecordBones(bones, n, frame)) return;
     }
     t_id.bones = bones;
     t_id.key = Mix(bones, mesh);
@@ -387,6 +420,82 @@ void GuestDrawMesh(u64 model, u64 mesh, u64 instance) {
                                  Clock::now() - t0)
                                  .count()),
                          std::memory_order_relaxed);
+}
+
+void GuestSkinRing(u64 ring, u64 bones) {
+    if (!On() || ring == 0 || bones == 0 || (bones & 15) != 0) return;
+    const auto t0 = Clock::now();
+    const u64 skel = *reinterpret_cast<const u64*>(ring + 0xb0);
+    s32 count = 0, slots = 0;
+    if (skel != 0) std::memcpy(&count, reinterpret_cast<const void*>(skel + 0x1c), 4);
+    std::memcpy(&slots, reinterpret_cast<const void*>(ring + 0x9c), 4);
+    const u32 n = count >= 1 && count <= s32(kMaxBones) ? u32(count) : 1u;
+    const u64 frame = g_frame.load(std::memory_order_relaxed);
+    {
+        std::scoped_lock lk{g_mx};
+        ++st_ring_calls;
+        if (!RecordBones(bones, n, frame)) return;
+        Ring& r = g_rings[ring];
+        const bool fresh = r.bones != bones || r.count == 0 || frame > r.mapped_frame + 120;
+        r.bones = bones;
+        r.frame = frame;
+        r.n = n;
+        r.skinned = n > 1;
+        if (fresh && slots >= 1 && slots <= 8) {
+            const u64 a = *reinterpret_cast<const u64*>(ring + 0x10);
+            const u64 b = *reinterpret_cast<const u64*>(ring + 0x18);
+            auto* memory = Core::Memory::Instance();
+            r.count = 0;
+            for (const u64 arr : {a, b}) {
+                if (arr == 0 || memory == nullptr || !memory->IsValidMapping(arr, u64(slots) * 8)) {
+                    continue;
+                }
+                for (s32 i = 0; i < slots; ++i) {
+                    r.entries[r.count++] = reinterpret_cast<const u64*>(arr)[i];
+                }
+            }
+            r.mapped_frame = frame;
+            const int off = g_ring_offset.load();
+            for (u32 i = 0; i < r.count; ++i) {
+                u64 addr = r.entries[i];
+                const int o = off & 0xfff;
+                if (off >= 0 && addr != 0 && memory->IsValidMapping(addr, u64(o) + 8)) {
+                    addr = *reinterpret_cast<const u64*>(addr + o);
+                    if (off & 0x1000) addr = VsharpBase(addr);
+                }
+                if (addr != 0) g_ring_addr[addr] = ring;
+            }
+        }
+    }
+    st_hook_calls.fetch_add(1, std::memory_order_relaxed);
+    st_hook_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 Clock::now() - t0)
+                                 .count()),
+                         std::memory_order_relaxed);
+}
+
+DrawId LookupPalette(u64 palette_address) {
+    DrawId id{};
+    if (!On() || palette_address == 0) return id;
+    std::scoped_lock lk{g_mx};
+    auto it = g_ring_addr.upper_bound(palette_address);
+    if (it != g_ring_addr.begin()) --it;
+    if (it == g_ring_addr.end() || it->first > palette_address ||
+        palette_address - it->first >= kRingSpan) {
+        ++st_ring_miss;
+        if (!g_rings.empty() && g_missed.size() < 256) g_missed.push_back(palette_address);
+        return id;
+    }
+    const auto r = g_rings.find(it->second);
+    if (r == g_rings.end()) return id;
+    ++st_ring_hits;
+    bool recent = false;
+    const int state = Classify(r->second.bones, r->second.frame, recent);
+    id.key = Mix(it->second, 0x72696e67ull);
+    id.moving = state == 1;
+    id.recent = recent || state == 1;
+    id.skinned = r->second.skinned;
+    return id;
 }
 
 void GuestDrawEmit(u64 gx_context, u64 return_address) {
@@ -445,15 +554,14 @@ const DrawId& Current() {
     return On() ? g_cur : g_none;
 }
 
-void NoteSceneDraw(bool motion_candidate) {
-    if (!motion_candidate) return;
+void NoteSceneDraw(const DrawId& id) {
     ++st_scene;
-    if (g_cur.key != 0) {
+    if (id.key != 0) {
         ++st_scene_id;
-        if (g_cur.moving) ++st_scene_moving;
-        if (g_cur.skinned) {
+        if (id.moving) ++st_scene_moving;
+        if (id.skinned) {
             ++st_skinned_scene_id;
-            if (g_cur.moving) ++st_skinned_scene_moving;
+            if (id.moving) ++st_skinned_scene_moving;
         }
     }
 }
@@ -482,6 +590,70 @@ void OnPresent() {
             }
         }
     }
+    std::string ring_text;
+    {
+        std::scoped_lock lk{g_mx};
+        // Ring palettes not found by their entries: learn where the entry keeps the address.
+        if (st_ring_hits == 0 && !g_missed.empty() && !g_rings.empty()) {
+            std::sort(g_missed.begin(), g_missed.end());
+            std::array<u32, 33> votes{};
+            std::array<u32, 32> vvotes{};
+            auto* memory = Core::Memory::Instance();
+            u32 checked = 0;
+            for (const auto& [ring, r] : g_rings) {
+                for (u32 i = 0; i < r.count && checked < 512; ++i, ++checked) {
+                    const u64 e = r.entries[i];
+                    const auto near = [&](u64 v) {
+                        const auto m = std::lower_bound(g_missed.begin(), g_missed.end(), v);
+                        return v != 0 && m != g_missed.end() && *m - v < kRingSpan;
+                    };
+                    if (near(e)) ++votes[32];
+                    if (e == 0 || memory == nullptr || !memory->IsValidMapping(e, 0x100)) continue;
+                    for (u32 o = 0; o < 32; ++o) {
+                        const u64 v = reinterpret_cast<const u64*>(e)[o];
+                        if (near(v)) ++votes[o];
+                        if (near(VsharpBase(v))) ++vvotes[o];
+                    }
+                }
+            }
+            u32 best = 0;
+            bool vs = false;
+            for (u32 o = 0; o < 32; ++o) {
+                if (votes[o] > (vs ? vvotes[best] : votes[best])) best = o, vs = false;
+                if (vvotes[o] > (vs ? vvotes[best] : votes[best])) best = o, vs = true;
+            }
+            const u32 best_votes = vs ? vvotes[best] : votes[best];
+            ring_text = fmt::format("; ring learning: {} missed palettes, entry hits direct {}, "
+                                    "best entry+0x{:x}{} ({} hits)",
+                                    g_missed.size(), votes[32], best * 8, vs ? " (V#)" : "",
+                                    best_votes);
+            if (best_votes >= 2 && best_votes > votes[32]) {
+                g_ring_offset.store(int(best * 8) + (vs ? 0x1000 : 0));
+                g_ring_addr.clear();
+                for (auto& [ring, r] : g_rings) r.count = 0;
+                ring_text += fmt::format(" -> palette address at [entry+0x{:x}]", best * 8);
+            }
+        }
+        g_missed.clear();
+        ring_text = fmt::format("; skin rings {} (updates {:.1f}/frame), ring palette draws {:.1f}/frame, "
+                                "palette draws without game identity {:.1f}/frame, entry offset {}{}",
+                                g_rings.size(), double(st_ring_calls) / std::max<u64>(1, st_frames),
+                                double(st_ring_hits) / std::max<u64>(1, st_frames),
+                                double(st_ring_miss) / std::max<u64>(1, st_frames),
+                                g_ring_offset.load(), ring_text);
+        st_ring_calls = st_ring_hits = st_ring_miss = 0;
+        for (auto it = g_rings.begin(); it != g_rings.end();) {
+            if (it->second.frame + 120 < frame) {
+                it = g_rings.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (g_ring_addr.size() > 65536) {
+            g_ring_addr.clear();
+            for (auto& [ring, r] : g_rings) r.count = 0;
+        }
+    }
     const u64 hook_calls = st_hook_calls.exchange(0), emits = st_emit_calls.exchange(0);
     const u64 hook_ns = st_hook_ns.exchange(0);
     const double frames = std::max<double>(1.0, double(st_frames));
@@ -498,14 +670,14 @@ void OnPresent() {
             "{:.1f} draws/frame with game-identity previous transforms (vectors), {:.1f} without "
             "history; draw packets {:.0f}/frame, matched {:.0f}/frame; DrawMesh calls {:.0f}/frame, "
             "draw markers {:.0f}/frame; CPU added: guest hooks {:.3f} ms/frame, GPU thread {:.3f} "
-            "ms/frame",
+            "ms/frame{}",
             On() ? "on" : "off", tracked, double(st_moving_obj) / frames,
             double(st_classified) / frames, double(st_scene) / frames, cov_id,
             double(st_scene_id) / frames, double(st_scene_moving) / frames, cov_char,
             double(st_skinned_scene_id) / frames, double(st_vec_prev) / frames,
             double(st_vec - st_vec_prev) / frames, double(st_packets) / frames,
             double(st_matched) / frames, double(hook_calls) / frames, double(emits) / frames,
-            double(hook_ns) / 1e6 / frames, double(st_gpu_ns) / 1e6 / frames));
+            double(hook_ns) / 1e6 / frames, double(st_gpu_ns) / 1e6 / frames, ring_text));
     }
     st_packets = st_matched = st_scene = st_scene_id = st_scene_moving = st_vec = st_vec_prev = 0;
     st_gpu_ns = st_classified = st_moving_obj = st_skinned_scene_id = st_skinned_scene_moving = 0;

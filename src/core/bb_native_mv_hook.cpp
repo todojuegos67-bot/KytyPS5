@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <vector>
 #include <fmt/format.h>
 #include "common/logging/log.h"
@@ -58,6 +59,13 @@ constexpr int SigDrawCalls[] = {0x48, 0x8b, 0x78, 0x08, 0x48, 0x8d, 0xb7, W,    
                                 0x8d, W,    W,    W,    W,    0xe8, W,    W,    W,    W};
 constexpr u32 CallAOff = 29, CallBOff = 49;
 
+// SkinRingUpdate(rdi ring, rsi bones, rdx ?): ++[ring+0x98] mod [ring+0x9c] first.
+constexpr int SigSkinRing[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41,
+                               0x54, 0x53, 0x48, 0x83, 0xec, W,    0x49, 0x89, 0xd4, 0x49, 0x89,
+                               0xf7, 0x48, 0x89, 0xfb, 0x8b, 0x83, 0x98, 0x00, 0x00, 0x00, 0xff,
+                               0xc0, 0x89, 0x83, 0x98, 0x00, 0x00, 0x00};
+constexpr u32 SkinRingPrologue = 17;
+
 constexpr u8 PrologueA[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
                             0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
 constexpr u8 PrologueB[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
@@ -66,6 +74,10 @@ constexpr u8 PrologueB[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41
 void PS4_SYSV_ABI HookDrawMesh(const u64* regs) {
     // regs: rbx r11 r10 r9 r8 rdi rsi rdx rcx rax, return address
     NativeMv::GuestDrawMesh(regs[5], regs[7], regs[4]);
+}
+
+void PS4_SYSV_ABI HookSkinRing(const u64* regs) {
+    NativeMv::GuestSkinRing(regs[5], regs[6]);
 }
 
 void PS4_SYSV_ABI HookEmit(const u64* regs) {
@@ -156,62 +168,75 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         return;
     }
     const u8* img = reinterpret_cast<const u8*>(eboot_base);
-    // The code is in the first segment; search the whole image once (~1 s worst case is avoided:
-    // the first byte filter skips most positions).
     const u64 code = std::min<u64>(image_size, 0x4000000);
-    const auto dm = Find(img, code, SigDrawMesh, std::size(SigDrawMesh));
-    if (!dm) {
-        NativeMv::SetHooksInstalled(false, "DrawMesh signature not found (unknown eboot)");
-        return;
-    }
-    const auto calls = Find(img + *dm, DrawMeshSize, SigDrawCalls, std::size(SigDrawCalls));
-    if (!calls) {
-        NativeMv::SetHooksInstalled(false, "GX draw calls not found inside DrawMesh");
-        return;
-    }
-    const u64 site = *dm + *calls;
-    const auto target = [&](u32 off) {
-        s32 rel;
-        std::memcpy(&rel, img + site + off + 1, 4);
-        return s64(site + off + 5) + rel;
-    };
-    const s64 wa = target(CallAOff), wb = target(CallBOff);
-    if (wa <= 0 || wb <= 0 || u64(wa) + 32 > code || u64(wb) + 32 > code ||
-        std::memcmp(img + wa, PrologueA, sizeof(PrologueA)) != 0 ||
-        std::memcmp(img + wb, PrologueB, sizeof(PrologueB)) != 0) {
-        NativeMv::SetHooksInstalled(false, "GX draw wrapper prologues differ: no patch");
-        return;
-    }
     u8* cave = static_cast<u8*>(AllocExec(4096));
     if (cave == nullptr) {
         NativeMv::SetHooksInstalled(false, "no executable memory for the caves");
         return;
     }
-    u8* at_dm = reinterpret_cast<u8*>(eboot_base + *dm);
-    u8* at_wa = reinterpret_cast<u8*>(eboot_base + wa);
-    u8* at_wb = reinterpret_cast<u8*>(eboot_base + wb);
-    const u32 len_b = sizeof(PrologueB) + 1; // sub rsp, imm8
-    const auto c1 = BuildCave(reinterpret_cast<u64>(&HookDrawMesh), at_dm, DrawMeshPrologue,
-                              reinterpret_cast<u64>(at_dm + DrawMeshPrologue));
-    const auto c2 = BuildCave(reinterpret_cast<u64>(&HookEmit), at_wa, sizeof(PrologueA),
-                              reinterpret_cast<u64>(at_wa + sizeof(PrologueA)));
-    const auto c3 = BuildCave(reinterpret_cast<u64>(&HookEmit), at_wb, len_b,
-                              reinterpret_cast<u64>(at_wb + len_b));
-    u8* p1 = cave;
-    u8* p2 = p1 + ((c1.size() + 15) & ~size_t(15));
-    u8* p3 = p2 + ((c2.size() + 15) & ~size_t(15));
-    std::memcpy(p1, c1.data(), c1.size());
-    std::memcpy(p2, c2.data(), c2.size());
-    std::memcpy(p3, c3.data(), c3.size());
-    NativeMv::SetDrawMeshRange(eboot_base + *dm, eboot_base + *dm + DrawMeshSize);
-    Detour(at_wa, p2);
-    Detour(at_wb, p3);
-    Detour(at_dm, p1);
-    NativeMv::SetHooksInstalled(
-        true, fmt::format("DrawMesh eboot+0x{:x}, GX draw eboot+0x{:x} / +0x{:x}, draw calls at "
-                          "eboot+0x{:x}",
-                          *dm, wa, wb, site)
-                  .c_str());
+    u8* next = cave;
+    const auto place = [&](const std::vector<u8>& c) {
+        u8* p = next;
+        std::memcpy(p, c.data(), c.size());
+        next += (c.size() + 15) & ~size_t(15);
+        return p;
+    };
+    std::string detail;
+    bool any = false;
+
+    // Characters: the per-frame skin ring update (ring, bones).
+    if (const auto sr = Find(img, code, SigSkinRing, std::size(SigSkinRing))) {
+        u8* at = reinterpret_cast<u8*>(eboot_base + *sr);
+        u8* p = place(BuildCave(reinterpret_cast<u64>(&HookSkinRing), at, SkinRingPrologue,
+                                reinterpret_cast<u64>(at + SkinRingPrologue)));
+        Detour(at, p);
+        any = true;
+        detail += fmt::format("SkinRingUpdate eboot+0x{:x}", *sr);
+    } else {
+        detail += "SkinRingUpdate not found";
+    }
+
+    // FLVER DrawMesh and its two GX draw calls.
+    const auto dm = Find(img, code, SigDrawMesh, std::size(SigDrawMesh));
+    const auto calls = dm ? Find(img + *dm, DrawMeshSize, SigDrawCalls, std::size(SigDrawCalls))
+                          : std::nullopt;
+    if (dm && calls) {
+        const u64 site = *dm + *calls;
+        const auto target = [&](u32 off) {
+            s32 rel;
+            std::memcpy(&rel, img + site + off + 1, 4);
+            return s64(site + off + 5) + rel;
+        };
+        const s64 wa = target(CallAOff), wb = target(CallBOff);
+        if (wa > 0 && wb > 0 && u64(wa) + 32 <= code && u64(wb) + 32 <= code &&
+            std::memcmp(img + wa, PrologueA, sizeof(PrologueA)) == 0 &&
+            std::memcmp(img + wb, PrologueB, sizeof(PrologueB)) == 0) {
+            u8* at_dm = reinterpret_cast<u8*>(eboot_base + *dm);
+            u8* at_wa = reinterpret_cast<u8*>(eboot_base + wa);
+            u8* at_wb = reinterpret_cast<u8*>(eboot_base + wb);
+            const u32 len_b = sizeof(PrologueB) + 1; // sub rsp, imm8
+            u8* p1 = place(BuildCave(reinterpret_cast<u64>(&HookDrawMesh), at_dm,
+                                     DrawMeshPrologue,
+                                     reinterpret_cast<u64>(at_dm + DrawMeshPrologue)));
+            u8* p2 = place(BuildCave(reinterpret_cast<u64>(&HookEmit), at_wa, sizeof(PrologueA),
+                                     reinterpret_cast<u64>(at_wa + sizeof(PrologueA))));
+            u8* p3 = place(BuildCave(reinterpret_cast<u64>(&HookEmit), at_wb, len_b,
+                                     reinterpret_cast<u64>(at_wb + len_b)));
+            NativeMv::SetDrawMeshRange(eboot_base + *dm, eboot_base + *dm + DrawMeshSize);
+            Detour(at_wa, p2);
+            Detour(at_wb, p3);
+            Detour(at_dm, p1);
+            any = true;
+            detail += fmt::format(", DrawMesh eboot+0x{:x}, GX draw eboot+0x{:x} / +0x{:x}, "
+                                  "draw calls at eboot+0x{:x}",
+                                  *dm, wa, wb, site);
+        } else {
+            detail += ", GX draw wrapper prologues differ (no DrawMesh hook)";
+        }
+    } else {
+        detail += ", DrawMesh not found";
+    }
+    NativeMv::SetHooksInstalled(any, detail.c_str());
 }
 
 } // namespace BB::NativeMvHook
