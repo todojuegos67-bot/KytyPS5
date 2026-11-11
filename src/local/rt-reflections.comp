@@ -834,6 +834,17 @@ bool March(vec3 P, vec3 N, vec3 R, vec3 V, int iters, out vec4 res, out float hd
 	float face = smoothstep(0.0, 0.25, dot(HN, -R));
 	// (the reflector's own plane: a hit a short way off on a surface parallel to it is self-intersection)
 	float self_ = (dot(HN, N) > 0.97 && length(HP - P) < 0.05 * dist + 0.1) ? 0.0 : 1.0;
+	// (des-glitch-1111) The reflector's own surface found again: a hit on the ray lies at its height above the reflector's
+	// plane (N: on level floors the flattened, world-up normal); one far lower than that (on the plane itself) is a
+	// point the depth-thickness test let through behind a bump of the same surface (the tessellation's displacement,
+	// a normal-mapped wall, wax): the surface's own nearby colour, shifted. On the Nexus floor the golden runes came
+	// back smeared into a noisy, rippling field around themselves; on wax under candles, smears. Never a reflection.
+	{
+		float hd_ = length(HP - P);
+		float hh  = dot(HP - P, N);
+		float he  = max(dot(R, N), 0.0) * hd_;
+		if (hh < 0.35 * he && hh < 0.03 * dist + 0.05) self_ = 0.0;
+	}
 	vec2  edge  = min(huv, 1.0 - huv);
 	float fade  = smoothstep(0.0, 0.10, edge.x) * smoothstep(0.0, 0.10, edge.y);
 	float conf  = clamp(fade * face * sil * self_ * toward, 0.0, 1.0);

@@ -847,7 +847,7 @@ void LogFloorPaths() {
 	const double lv = static_cast<double>(std::max<uint64_t>(p[2] + p[3], 1));
 	const double sh = static_cast<double>(std::max<uint64_t>(p[10], 1));
 	if (p[0] > 0) {
-		std::printf("RT reflections: floor paths 1 s (des-refl2-1108, flat fix %s, %s, hybrid %llu/%llu frames): %llu floor samples: "
+		std::printf("RT reflections: floor paths 1 s (des-refl2-1108 + des-glitch-1111 self-hit fix, flat fix %s, %s, hybrid %llu/%llu frames): %llu floor samples: "
 		            "water %.1f%%; not water: level per pixel %.1f%%, level only on the plane %.1f%%, not level (bumps kept) %.1f%%, "
 		            "normal-mapped G-buffer normal %.1f%%; game SSR confident %.1f%% (blobby on level floors %.1f%%), roughness "
 		            "per-tile on level floors %.1f%%; reflective %.1f%%, shown %.1f%% (screen-space hit %.0f%% / fill or history "
