@@ -6,6 +6,7 @@
 // BB object motion vectors: see bb_objmv.h.
 
 #include "video_core/bb/bb_objmv.h"
+#include "video_core/bb/bb_native_mv.h"
 
 #include <algorithm>
 #include <atomic>
@@ -647,6 +648,56 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         return;
     }
     const u32 count = vertices * instances;
+
+    // bb-native-mv: a draw the game's DrawMesh issued (bb_native_mv.h) is keyed by the game's own
+    // object (bone matrices + mesh) and gets an object vector only while that object moves in the
+    // world; static ones keep the camera vector. The reconstructed identity below is not used.
+    if (const auto& nid = BB::NativeMv::Current(); nid.key != 0) {
+        BB::NativeMv::NoteSceneDraw(true);
+        if (!nid.moving && !nid.recent) return;
+        const u32 half = static_cast<u32>(g.frame & 1);
+        if (g.cursor + count > g.per_half || g.params_used + 1 >= kParamsPerFrame) {
+            ++g.st_overflow;
+            return;
+        }
+        std::array<u64, 4> nidk{nid.key, vs_hash, regs.num_indices, count};
+        const u64 nbase = Hash(nidk.data(), sizeof(nidk), 0x6e6174697665ull);
+        const u32 nord = g.ordinals[nbase]++;
+        const u64 nkey = Hash(&nord, sizeof(nord), nbase);
+        const u32 store_base = half * g.per_half + g.cursor;
+        g.cursor += count;
+        u32 flags = 1;
+        if (nid.skinned) flags |= 4;
+        u32 load_base = 0;
+        bool found = false;
+        if (nid.moving) {
+            if (const auto it = g.prev.find(nkey);
+                it != g.prev.end() && it->second.count == count && it->second.base != store_base) {
+                load_base = it->second.base;
+                found = true;
+                flags |= 2;
+                ++g.st_loaded;
+                ++g.loaded_frame;
+            }
+            BB::NativeMv::NoteVectorDraw(found);
+        }
+        g.cur[nkey] = {store_base, count};
+        ++g.st_tracked;
+        const u32 slot = static_cast<u32>(g.frame % kFrameSlots);
+        const u32 index = slot * kParamsPerFrame + (++g.params_used);
+        u32* entry = g.params_mapped + size_t(index) * 8;
+        entry[0] = store_base;
+        entry[1] = load_base;
+        entry[2] = vertices;
+        entry[3] = flags;
+        entry[4] = vertex_offset + range_first;
+        entry[5] = instance_offset;
+        entry[6] = instances;
+        entry[7] = 0;
+        push.motion_param = index;
+        return;
+    }
+    if (BB::NativeMv::On()) BB::NativeMv::NoteSceneDraw(true);
 
     // The draw's identity across frames: shader, vertex and index streams, range, instances,
     // and its order among identical draws this frame.

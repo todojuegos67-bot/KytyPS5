@@ -848,6 +848,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/memory_patcher.cpp
            src/core/bb_kbmcam.cpp
            src/core/bb_kbmcam.h
+           src/core/bb_native_mv_hook.cpp
+           src/core/bb_native_mv_hook.h
            src/core/bb_respatch.h
            src/core/bb_respatch.cpp
            src/common/multi_level_page_table.h
@@ -1208,6 +1210,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_metrics.cpp
                src/video_core/bb/bb_metrics_panel.cpp
                src/video_core/bb/bb_objmv.cpp
+               src/video_core/bb/bb_native_mv.cpp
+               src/video_core/bb/bb_native_mv.h
                src/video_core/bb/bb_objmv.h
                src/video_core/bb/bb_metrics.h
                src/video_core/bb/bb_kyty_compat.h
