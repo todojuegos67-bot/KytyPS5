@@ -260,6 +260,7 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	g_labels_deferred.store(true, std::memory_order_relaxed);
 	const auto sequence        = ++m_label_sequence;
 	m_pending_labels[address] = {value, size, sequence};
+	NoteLabelWriteTick(address, m_renderer.GetCommandScheduler().CurrentTick());
 	// The completion runs on the scheduler's priority thread, which must not fault on guest
 	// memory the GPU wrote to; the write itself goes back to the GPU thread.
 	m_renderer.GetCommandScheduler().DeferPriorityOperation([this, address, value, size,
@@ -313,6 +314,33 @@ void GuestGpu::NoteRecordedLabel(uint64_t address, uint64_t value, uint32_t size
 		return; // only forwarded waits need it; they run on the GPU thread
 	}
 	m_recorded_labels[address] = {value, size, tick};
+}
+
+void GuestGpu::NoteLabelWriteTick(uint64_t address, uint64_t tick) {
+	std::lock_guard lock(m_label_tick_mutex);
+	m_label_write_ticks[address] = tick;
+}
+
+bool GuestGpu::HasLabelWriteInFlight(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(!IsGpuThread());
+	const uint64_t end = vaddr + size;
+	// A deferred label write stays in m_pending_labels until the GPU thread stored it.
+	for (const auto& [address, pending]: m_pending_labels) {
+		if (address < end && address + pending.size > vaddr) {
+			return true;
+		}
+	}
+	auto&           scheduler = m_renderer.GetCommandScheduler();
+	std::lock_guard lock(m_label_tick_mutex);
+	// Labels are at most 8 bytes: one that starts up to 7 bytes before the range reaches into it.
+	auto it = m_label_write_ticks.lower_bound(vaddr >= 8 ? vaddr - 7 : 0);
+	while (it != m_label_write_ticks.end() && it->first < end) {
+		if (!scheduler.IsFree(it->second)) {
+			return true;
+		}
+		it = m_label_write_ticks.erase(it);
+	}
+	return false;
 }
 
 template <typename T>
@@ -2108,6 +2136,7 @@ void CommandProcessor::PublishLabelAtCompletion(void* dst, uint64_t value, uint3
 		renderer.GetGpu().NoteRecordedLabel(reinterpret_cast<uint64_t>(dst), value, bytes,
 		                                    GetScheduler().CurrentTick());
 	}
+	renderer.GetGpu().NoteLabelWriteTick(reinterpret_cast<uint64_t>(dst), GetScheduler().CurrentTick());
 	GetScheduler().DeferPriorityOperation([&renderer, dst, value, bytes, clock] {
 		const uint64_t data = clock ? Sync::ReadReferenceClock() : value;
 		// The backing write cannot fault into the caches from this thread.

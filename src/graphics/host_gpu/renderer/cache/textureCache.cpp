@@ -2114,6 +2114,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
 	                                                 nullptr, 1, &barrier, 0, nullptr);
+	m_last_download_tick.store(m_scheduler.CurrentTick(), std::memory_order_relaxed);
 	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset] {
 		download->Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);

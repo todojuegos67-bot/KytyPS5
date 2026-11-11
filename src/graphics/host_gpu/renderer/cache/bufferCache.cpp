@@ -2340,6 +2340,15 @@ bool BufferCache::MayReferenceRange(uint64_t vaddr, uint64_t size) {
 	       m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+bool BufferCache::HasGuestBoundBytes(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid() || OverlapsPendingWriteReadback(vaddr, vaddr + size)) {
+		return true;
+	}
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	return m_downloading_ranges.Intersects(vaddr, size) ||
+	       m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }

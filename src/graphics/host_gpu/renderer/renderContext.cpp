@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <iterator>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -198,36 +199,78 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		static auto&               skip_idle = Common::LiveSwitches::Get("KYTY_UNMAP_SKIP_IDLE", 0);
-		static uint64_t            unmaps_total   = 0;
-		static uint64_t            unmaps_skipped = 0;
-		static auto                stats_begin    = std::chrono::steady_clock::now();
+		// KYTY_UNMAP_SKIP_IDLE (live): when an unmap may skip the full GPU drain (Finish + priority
+		// completions). TURBO log 10-25: 400-980 unmaps per 5 s in gameplay (8.5K while loading),
+		// every one a Finish on Thread_Gpu (renderContext.cpp:229, ~120 ms and ~900 forced submits
+		// per 5 s), "0 skipped".
+		//   0: always drain (old behaviour).
+		//   1: skip when no cached buffer or image, pending readback or in-flight download shares
+		//      bytes with the range.
+		//   2 (default): skip when nothing that completes later writes guest memory in the range:
+		//      no image there (unmapping deletes them) and no GPU-written texture bytes, no
+		//      GPU-written / downloading / pending-readback buffer bytes, no label write still to
+		//      come (EOP labels, deferred label writes), no image download in flight. Cached
+		//      buffers that only cover the range are allowed: unmapping keeps them, and in-flight
+		//      GPU work reads and writes their device copy, never guest memory.
+		static auto&    skip_idle      = Common::LiveSwitches::Get("KYTY_UNMAP_SKIP_IDLE", 2);
+		static uint64_t unmaps_total   = 0;
+		static uint64_t unmaps_skipped = 0;
+		// Why mode 2 still drained: images, buffer bytes, labels, image downloads.
+		static uint64_t drain_reason[4] {};
+		static uint64_t drain_us       = 0;
+		static auto     stats_begin    = std::chrono::steady_clock::now();
 		unmaps_total++;
-		// With KYTY_UNMAP_SKIP_IDLE, the drain is skipped when no cached buffer or image, pending
-		// readback or in-flight download shares bytes with the range: nothing the GPU still
-		// runs can then read or write it.
-		bool drain = true;
-		if (skip_idle.load(std::memory_order_relaxed) != 0 &&
-		    !m_buffer_cache.MayReferenceRange(vaddr, size) &&
-		    !m_texture_cache.HasImagesInRegion(vaddr, size)) {
-			drain = false;
+		bool       drain = true;
+		const auto mode  = skip_idle.load(std::memory_order_relaxed);
+		if (mode == 1) {
+			if (!m_buffer_cache.MayReferenceRange(vaddr, size) &&
+			    !m_texture_cache.HasImagesInRegion(vaddr, size)) {
+				drain = false;
+			}
+		} else if (mode >= 2 && m_gpu != nullptr && GuestGpu::IsGpuThread()) {
+			if (m_texture_cache.HasImagesInRegion(vaddr, size) ||
+			    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+				drain_reason[0]++;
+			} else if (m_buffer_cache.HasGuestBoundBytes(vaddr, size)) {
+				drain_reason[1]++;
+			} else if (m_gpu->HasLabelWriteInFlight(vaddr, size)) {
+				drain_reason[2]++;
+			} else if (m_command_scheduler.Active() &&
+			           !m_command_scheduler.IsFree(m_texture_cache.LastDownloadTick())) {
+				drain_reason[3]++;
+			} else {
+				drain = false;
+			}
+		}
+		if (!drain) {
 			unmaps_skipped++;
 		}
 		const auto now = std::chrono::steady_clock::now();
 		if (now - stats_begin >= std::chrono::seconds(5)) {
-			char line[128];
+			char line[256];
 			std::snprintf(line, sizeof(line),
-			              "Unmaps (5 s): %" PRIu64 " total, %" PRIu64 " skipped the GPU drain\n",
-			              unmaps_total, unmaps_skipped);
+			              "Unmaps (5 s): %" PRIu64 " total, %" PRIu64
+			              " skipped the GPU drain (KYTY_UNMAP_SKIP_IDLE=%d); drained %.1f ms; "
+			              "drain reasons: images %" PRIu64 ", buffer bytes %" PRIu64 ", labels %" PRIu64
+			              ", image downloads %" PRIu64 "\n",
+			              unmaps_total, unmaps_skipped, static_cast<int>(mode),
+			              static_cast<double>(drain_us) / 1000.0, drain_reason[0], drain_reason[1],
+			              drain_reason[2], drain_reason[3]);
 			Log::WriteToConsoleAndLog(line);
 			unmaps_total   = 0;
 			unmaps_skipped = 0;
+			drain_us       = 0;
+			std::fill(std::begin(drain_reason), std::end(drain_reason), uint64_t {0});
 			stats_begin    = now;
 		}
 		if (drain && m_command_scheduler.Active()) {
-			const auto tick = m_command_scheduler.CurrentTick();
+			const auto begin = std::chrono::steady_clock::now();
+			const auto tick  = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+			drain_us += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                      std::chrono::steady_clock::now() - begin)
+			                                      .count());
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

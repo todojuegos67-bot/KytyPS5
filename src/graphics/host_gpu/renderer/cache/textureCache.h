@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 
 #include "common/abi.h"
+#include <atomic>
 #include <source_location>
 #include "common/common.h"
 #include "common/lruCache.h"
@@ -77,6 +78,10 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// Tick of the last image download whose completion writes guest memory (KYTY_UNMAP_SKIP_IDLE=2).
+	[[nodiscard]] uint64_t LastDownloadTick() const noexcept {
+		return m_last_download_tick.load(std::memory_order_relaxed);
+	}
 	void ProcessDownloadImages();
 	// Marks the images as used now (bindless textures the shaders sampled).
 	void TouchImages(std::span<const ImageId> ids);
@@ -189,6 +194,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	std::atomic<uint64_t>                             m_last_download_tick {0};
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;

@@ -106,6 +106,10 @@ public:
 	// GPU thread: a cached buffer, a pending asynchronous readback or an in-flight download
 	// shares bytes with [vaddr, vaddr + size) (KYTY_UNMAP_SKIP_IDLE). Conservative.
 	[[nodiscard]] bool              MayReferenceRange(uint64_t vaddr, uint64_t size);
+	// GPU thread (KYTY_UNMAP_SKIP_IDLE=2): bytes of the range are GPU-written, on their way back
+	// from the GPU, or held by a pending readback: a completion may still write guest memory there.
+	// Cached buffers that merely cover the range do not count (unmapping never deletes them).
+	[[nodiscard]] bool              HasGuestBoundBytes(uint64_t vaddr, uint64_t size);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;

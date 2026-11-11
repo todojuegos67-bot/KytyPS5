@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -51,6 +52,13 @@ public:
 	// GPU thread. The recorded value of a label whose publishing tick has not completed yet.
 	template <typename T>
 	[[nodiscard]] bool FindRecordedLabel(const volatile T* address, T* value);
+	// GPU thread (KYTY_UNMAP_SKIP_IDLE=2): a label write into [vaddr, vaddr + size) is still to
+	// come, from a priority completion (EOP label, deferred label write) whose tick has not
+	// completed, or from the GPU thread's queue. Such a write would fault on unmapped memory.
+	// Entries of the range that already completed are dropped.
+	[[nodiscard]] bool HasLabelWriteInFlight(uint64_t vaddr, uint64_t size);
+	// Any thread: a label write at `address` is published when `tick` completes.
+	void NoteLabelWriteTick(uint64_t address, uint64_t tick);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void              Submit(std::span<const uint32_t> draw_commands,
@@ -139,6 +147,9 @@ private:
 	// KYTY_LABELS_AFTER_GPU: the last value recorded for each label and the scheduler tick that
 	// publishes it. An entry is stale once its tick has completed. GPU thread only.
 	std::unordered_map<uint64_t, RecordedLabel> m_recorded_labels;
+	// NoteLabelWriteTick: the latest publishing tick of each label address. Any thread.
+	std::mutex                   m_label_tick_mutex;
+	std::map<uint64_t, uint64_t> m_label_write_ticks;
 	// A completed slice skipped its submit (KYTY_SLICE_FLUSH_US). GPU thread only.
 	bool m_slice_flush_pending = false;
 
