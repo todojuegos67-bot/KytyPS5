@@ -390,9 +390,9 @@ function Start-Game {
 	if ((Is-Unlocked) -and -not (Is-FixedFg) -and ($fgConfig -like 'fsr3*' -or $fgConfig -like 'dlss*')) { $sets += 'KYTY_FRAMEGEN_BASE=0' }  # (10-22) AMD y sin FG: siempre desbloqueados; DLSS y los modos Souls/8 GB bloqueados
 	if ($chkAf16.Checked) { $sets += 'KYTY_FORCE_AF=16' }
 	if ($cmbLod -and $cmbLod.SelectedIndex -eq 2) {
-		# (10-25) Extra nitidas: log2(3D / salida) - 1 con reescalador (guia de NVIDIA para DLSS), -0,5 sin reescalador; tope -2.
+		# (10-25) Extra nitidas: log2(3D / salida) - 1 con reescalador (guia de NVIDIA para DLSS), -0,5 sin reescalador; tope -1,5 (des-glitch-1111).
 		$rq = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]; $rr = 1.0; if ($rq -and $rq[2] -in 'dlss', 'xess', 'fsr') { $rr = [double]$rq[1] }
-		$lb = if ($rr -gt 1.0) { -([math]::Log($rr, 2)) - 1.0 } else { -0.5 }; $lb = [math]::Max(-2.0, $lb)
+		$lb = if ($rr -gt 1.0) { -([math]::Log($rr, 2)) - 1.0 } else { -0.5 }; $lb = [math]::Max(-1.5, $lb)
 		$sets += ('KYTY_TEXTURE_LOD_BIAS=' + $lb.ToString('0.000', [System.Globalization.CultureInfo]::InvariantCulture))
 	} elseif ($chkLod.Checked) { $sets += 'KYTY_TEXTURE_LOD_BIAS=auto' }  # (10-23) solo texturas 2D comprimidas de superficie  # (10-23) texturas con el detalle de la resolucion final
 	$sets += 'KYTY_DLSSG_PACE=grid'  # (10-22 e) reflexfree esperaba el limite de Reflex en cada fotograma mostrado: 14 reales

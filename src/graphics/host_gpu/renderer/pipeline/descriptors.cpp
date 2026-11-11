@@ -1173,7 +1173,11 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 // (no render target, nothing IsRegionGpuModified / HasGpuWrittenImageOverlap), and the sampler passes the scene-texture
 // test. Demon's Souls' volumetric fog/smoke/noise is 3D, small, uncompressed or GPU-written: a negative bias sharpened
 // its blurred low mips into hard, bright puffs. Counts logged once and every 30 s.
-enum LodBiasReason : uint32_t { LbBiased, Lb3d, LbSmall, LbFewMips, LbNotBc, LbGpuWritten, LbSampler, LbCount };
+// (des-glitch-1111) A blended draw (particles, decals such as the candles' wax splats, the Nexus floor's glowing
+// runes, glows) never gets the bias: sharper mips on those alpha-shaped / emissive textures shimmered frame to frame
+// at "Texturas extra nitidas" (-2), and DLSS, its frame generation and DLSS 5 turned the shimmer into noisy, rippling
+// smears and popping blobs. Counted as "blended".
+enum LodBiasReason : uint32_t { LbBiased, Lb3d, LbSmall, LbFewMips, LbNotBc, LbGpuWritten, LbSampler, LbBlended, LbCount };
 
 static uint32_t LodBiasImageReason(TextureCache& cache, const ShaderRecompiler::IR::ImageResource& resource,
                                    const TextureBinding& binding) {
@@ -1212,6 +1216,7 @@ static bool LodBiasForSampler(TextureCache& cache, const ShaderRecompiler::IR::C
 		}
 	}
 	if (!paired) return false; // no image known for it: plain sampler, not counted
+	if (reason == LbCount && SamplerCache::DrawBlended()) reason = LbBlended;
 	if (reason == LbCount) {
 		auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 		reason          = SamplerCache::IsSceneSampler(descriptor) ? LbBiased : LbSampler;
@@ -1225,14 +1230,15 @@ static bool LodBiasForSampler(TextureCache& cache, const ShaderRecompiler::IR::C
 	int64_t due = next_log.load(std::memory_order_relaxed);
 	if (now >= due && next_log.compare_exchange_strong(due, now + 30)) {
 		std::printf("Texture LOD bias %.3f (image+sampler): biased %llu, skipped: 3d %llu, small %llu, few-mips %llu, "
-		            "not-bc %llu, gpu-written %llu, sampler %llu\n",
+		            "not-bc %llu, gpu-written %llu, sampler %llu, blended %llu\n",
 		            extra, static_cast<unsigned long long>(counts[LbBiased].load()),
 		            static_cast<unsigned long long>(counts[Lb3d].load()),
 		            static_cast<unsigned long long>(counts[LbSmall].load()),
 		            static_cast<unsigned long long>(counts[LbFewMips].load()),
 		            static_cast<unsigned long long>(counts[LbNotBc].load()),
 		            static_cast<unsigned long long>(counts[LbGpuWritten].load()),
-		            static_cast<unsigned long long>(counts[LbSampler].load()));
+		            static_cast<unsigned long long>(counts[LbSampler].load()),
+		            static_cast<unsigned long long>(counts[LbBlended].load()));
 		std::fflush(stdout);
 	}
 	return reason == LbBiased;

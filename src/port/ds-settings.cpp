@@ -884,8 +884,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (unlocked && with_fg) sets.emplace_back("KYTY_FRAMEGEN_BASE", "0");
 	if (s.af16) sets.emplace_back("KYTY_FORCE_AF", "16");
 	if (s.texture_sharpness == "2") {
-		// (10-25) Extra nitidas: log2(render / output) - 1 with an upscaler (NVIDIA's DLSS guide), -0.5 without; at least -2.
-		const double lb = std::max(-2.0, ratio > 1.0 ? -std::log2(ratio) - 1.0 : -0.5);
+		// (10-25) Extra nitidas: log2(render / output) - 1 with an upscaler (NVIDIA's DLSS guide), -0.5 without.
+		// (des-glitch-1111) at least -1.5 (was -2: DLSS Rendimiento sat at -2, the Nexus runes and the candles' wax
+		// shimmered into noise); blended draws (effects, decals) never get it (descriptors.cpp).
+		const double lb = std::max(-1.5, ratio > 1.0 ? -std::log2(ratio) - 1.0 : -0.5);
 		char         text[32];
 		std::snprintf(text, sizeof(text), "%.3f", lb);
 		sets.emplace_back("KYTY_TEXTURE_LOD_BIAS", text);

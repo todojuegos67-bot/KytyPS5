@@ -17,6 +17,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
@@ -1530,8 +1531,20 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	NativePreparationScratch<GraphicsBindings> binding_storage(
 	    kyty_local_binding_scratch_mode.load(std::memory_order_relaxed) != 0);
 	auto& bindings = binding_storage.Get();
-	PrepareGraphicsBindingsInto(state.vs_input_info.stage, state.ps_input_info.stage,
-	                            state.ps_active, bindings);
+	{
+		// (des-glitch-1111) blended draws keep the guest's texture LOD bias (descriptors.cpp, LodBiasForSampler)
+		bool blended = false;
+		if (state.ps_active && SamplerCache::TextureLodBias() != 0.0f) {
+			const auto& regs = buffer.GetRegisters();
+			for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+				if (regs.GetBlendControl(state.color_info[i].target_slot).enable) blended = true;
+			}
+		}
+		SamplerCache::SetDrawBlended(blended);
+		PrepareGraphicsBindingsInto(state.vs_input_info.stage, state.ps_input_info.stage,
+		                            state.ps_active, bindings);
+		SamplerCache::SetDrawBlended(false);
+	}
 	if (FrameCapture::Active()) {
 		CaptureFrameDraw(buffer, draw, state, bindings.vertex, bindings.pixel);
 	}

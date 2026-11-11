@@ -49,6 +49,13 @@ float SamplerCache::TextureLodBias() {
 	return bias;
 }
 
+namespace {
+thread_local bool t_draw_blended = false;
+} // namespace
+
+void SamplerCache::SetDrawBlended(bool blended) { t_draw_blended = blended; }
+bool SamplerCache::DrawBlended() { return t_draw_blended; }
+
 SamplerCache::~SamplerCache() {
 	for (const auto& [key, sampler]: m_samplers) {
 		(void)key;

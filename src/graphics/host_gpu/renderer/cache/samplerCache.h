@@ -32,6 +32,11 @@ public:
 	// KYTY_TEXTURE_LOD_BIAS_ALL=1: legacy sampler-level selection.
 	static bool LodBiasLegacyAll();
 	static bool IsSceneSampler(const ShaderSamplerResource& r);
+	// (des-glitch-1111) The draw whose bindings are being prepared on this thread blends into a colour target
+	// (particles, decals, emissive overlays, glows): its textures keep the guest's LOD bias (renderDraw.cpp sets it
+	// around PrepareGraphicsBindingsInto; compute and opaque draws: false).
+	static void SetDrawBlended(bool blended);
+	static bool DrawBlended();
 
 private:
 	using SamplerKey = std::array<uint32_t, 5>;
