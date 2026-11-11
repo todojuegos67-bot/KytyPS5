@@ -236,7 +236,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			} else if (m_gpu->HasLabelWriteInFlight(vaddr, size)) {
 				drain_reason[2]++;
 			} else if (m_command_scheduler.Active() &&
-			           !m_command_scheduler.IsFree(m_texture_cache.LastDownloadTick())) {
+			           !m_command_scheduler.CompletedWithOperations(m_texture_cache.LastDownloadTick())) {
 				drain_reason[3]++;
 			} else {
 				drain = false;

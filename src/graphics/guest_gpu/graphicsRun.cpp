@@ -330,12 +330,13 @@ bool GuestGpu::HasLabelWriteInFlight(uint64_t vaddr, uint64_t size) {
 			return true;
 		}
 	}
-	auto&           scheduler = m_renderer.GetCommandScheduler();
+	auto& scheduler = m_renderer.GetCommandScheduler();
+	// Completed on the GPU is not enough: the priority thread writes the label afterwards.
 	std::lock_guard lock(m_label_tick_mutex);
 	// Labels are at most 8 bytes: one that starts up to 7 bytes before the range reaches into it.
 	auto it = m_label_write_ticks.lower_bound(vaddr >= 8 ? vaddr - 7 : 0);
 	while (it != m_label_write_ticks.end() && it->first < end) {
-		if (!scheduler.IsFree(it->second)) {
+		if (!scheduler.CompletedWithOperations(it->second)) {
 			return true;
 		}
 		it = m_label_write_ticks.erase(it);

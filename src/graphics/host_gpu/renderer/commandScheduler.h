@@ -64,6 +64,9 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Any thread but the priority thread: the GPU completed `tick` and every priority operation
+	// deferred at or before it has run (non-blocking WaitPriorityOperations).
+	[[nodiscard]] bool        CompletedWithOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
