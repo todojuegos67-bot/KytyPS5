@@ -569,9 +569,17 @@ static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& o
 // in its 7.3 GB budget. An image of the whole texture, or of the texture from a lower level, serves the view as before;
 // when the game samples a larger level, the lookup makes the texture from that level (or the whole), and the smaller
 // image goes unused (a new image over its memory ends the resolution cache's hold on it).
+// (des-glitch-1111) On with any video memory (KYTY_TEXTURE_PREFIX=0 turns it off). The levels before the T#'s base are
+// the ones the game has not streamed in: with "Texturas: Maximo" on a card of 12 GiB or more (KYTY_TEXTURE_REDUCE=0,
+// prefix off) the whole texture was made, its non-resident largest levels uploaded from whatever the memory past the
+// streamed levels held (the levels kept are the first bytes: the left-out ones lie over other data), and the image's
+// range then overlapped the textures there; the Nexus floor's runes and the candles' wax came out as noisy, rippling
+// smears. "Alto" (KYTY_TEXTURE_REDUCE=h) held textures of 2048+ texels from level 1 and did not show it. Held from the
+// T#'s base, a texture is whole again (and at full detail) as soon as the game samples it from level 0.
 static bool TexturePrefixEnabled(bool small_video_memory) {
+	(void)small_video_memory;
 	static const char* const value = std::getenv("KYTY_TEXTURE_PREFIX");
-	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
+	return value == nullptr || value[0] == '\0' || value[0] != '0';
 }
 
 // KYTY_TEXTURE_REDUCE=0|1|2 (default: 1 with less than 12 GiB of video memory, else 0): a sampled 2D block-compressed
@@ -1095,6 +1103,31 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		}
 	}
 
+	// (des-glitch-1111) How the game streams its large textures: sampled 2D block-compressed views of 1024+ texels whose
+	// T# starts past level 0, or clamps with its MIN_LOD field (not applied here), every 30 s.
+	if (!storage && levels > 1 && block_bytes != 0 && std::max(width, height) >= 1024u) {
+		static std::atomic<uint64_t> seen {0}, based {0}, min_lod {0}, max_min_lod {0};
+		static std::atomic<int64_t>  next_log {0};
+		seen.fetch_add(1, std::memory_order_relaxed);
+		if (base_level > 0) based.fetch_add(1, std::memory_order_relaxed);
+		if (const uint64_t ml = descriptor.MinLod(); ml != 0) {
+			min_lod.fetch_add(1, std::memory_order_relaxed);
+			uint64_t cur = max_min_lod.load(std::memory_order_relaxed);
+			while (ml > cur && !max_min_lod.compare_exchange_weak(cur, ml)) {}
+		}
+		const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+		                        std::chrono::steady_clock::now().time_since_epoch())
+		                        .count();
+		int64_t due = next_log.load(std::memory_order_relaxed);
+		if (now >= due && next_log.compare_exchange_strong(due, now + 30)) {
+			std::printf("Textures (des-glitch-1111): large BC views %llu: from a base level > 0 %llu, with a T# MIN_LOD %llu "
+			            "(largest %.2f); held from the base level: %s\n",
+			            static_cast<unsigned long long>(seen.load()), static_cast<unsigned long long>(based.load()),
+			            static_cast<unsigned long long>(min_lod.load()), static_cast<double>(max_min_lod.load()) / 256.0,
+			            TexturePrefixEnabled(m_context.GetGraphics().small_video_memory) ? "yes" : "no (KYTY_TEXTURE_PREFIX=0)");
+			std::fflush(stdout);
+		}
+	}
 	if (!storage && (type == Prospero::ImageType::kColor2D || type == Prospero::ImageType::kColor2DArray)) {
 		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
 	}
