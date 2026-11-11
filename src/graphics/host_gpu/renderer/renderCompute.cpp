@@ -491,7 +491,7 @@ static void NoteDispatchOnePass(bool one_pass) {
 		last = now;
 		::printf("Dispatch one pass (5 s, KYTY_DISPATCH_ONE_PASS=%lld): %llu dispatches bound once (first "
 		         "RebindImages+RebindBuffers pass skipped), %llu kept both passes (recovery-capable or switch off)\n",
-		         static_cast<long long>(Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 0).load()),
+		         static_cast<long long>(Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 1).load()),
 		         static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(kept));
 		std::fflush(stdout);
 		skipped = kept = 0;
@@ -705,15 +705,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_SINGLE_REBIND=1 (live, A/B): the loop below resolves the images again before recording, so
 	// this first pass (the recovery transaction only needs the buffers) only repeats view lookups.
 	static auto& single_rebind = Common::LiveSwitches::Get("KYTY_SINGLE_REBIND", 0);
-	// wolv-draw-1111: KYTY_DISPATCH_ONE_PASS (live, default 0 since 1111d = old double pass; 1 = one
-	// pass). Not proven equivalent: RebindBuffers can alias-copy buffers into images and read back
-	// metadata, and only the second RebindImages saw images invalidated by the first RebindBuffers
-	// (menu text lost with build 5590a12f, under bisection). The first RebindImages +
+	// wolv-draw-1111: KYTY_DISPATCH_ONE_PASS (live, default 1; 0 = old double pass). Checked after
+	// the menu-text report (cause confirmed elsewhere: KYTY_MEMO_PATCH): the binding path's
+	// ObtainBuffer does not touch the texture cache, so the skipped first pass changed no image. The first RebindImages +
 	// RebindBuffers pass exists for the recovery transaction (DMA shaders without written images),
 	// which saves the written buffers before the loop below binds everything again. Any other
 	// dispatch ran both twice (image views looked up, every buffer resolved and the flattened SRT
 	// and shader data uploaded twice, the first copies unused). Those skip the first pass.
-	static auto& one_pass_switch = Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 0);
+	static auto& one_pass_switch = Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 1);
 	const bool   recovery_possible =
 	    program.info.uses_dma && std::none_of(program.info.images.begin(), program.info.images.end(),
 	                                          [](const auto& image) { return image.written; });
@@ -832,7 +831,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// this first pass (the recovery transaction only needs the buffers) only repeats view lookups.
 	static auto& single_rebind = Common::LiveSwitches::Get("KYTY_SINGLE_REBIND", 0);
 	// KYTY_DISPATCH_ONE_PASS: as in DispatchDirect.
-	static auto& one_pass_switch = Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 0);
+	static auto& one_pass_switch = Common::LiveSwitches::Get("KYTY_DISPATCH_ONE_PASS", 1);
 	const bool   recovery_possible =
 	    program.info.uses_dma && std::none_of(program.info.images.begin(), program.info.images.end(),
 	                                          [](const auto& image) { return image.written; });
