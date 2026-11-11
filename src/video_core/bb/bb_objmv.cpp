@@ -206,6 +206,8 @@ struct Coverage {
 constexpr u32 kStatSlots = 4; // frames in flight: a slot is read back 3 composes later
 constexpr u32 kStatWords = 16;
 
+bool g_native_only = false;
+
 bool EnvOff() {
     const char* s = std::getenv("BB_OBJMV");
     return s != nullptr && (s[0] == '0' || std::string(s) == "off");
@@ -247,7 +249,15 @@ bool CreateBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, bool host, vk
 bool Init(const Vulkan::Instance& instance) {
     if (g.tried) return g.ready;
     g.tried = true;
-    if (EnvOff()) {
+    const char* nmv = std::getenv("BB_NATIVE_MV");
+    const bool native_env = nmv == nullptr || *nmv == '\0' || (nmv[0] != '0' && std::string(nmv) != "off");
+    if (EnvOff() && native_env) {
+        // bb-native-mv: native-only mode. v1's motion pipeline runs, but only draws the game
+        // names (skin ring / DrawMesh) and that move get a vector; nothing is reconstructed.
+        g_native_only = true;
+        Log("native-only (BB_OBJMV=0, BB_NATIVE_MV=1): object vectors only for moving game "
+            "objects (characters by skin ring), everything else keeps the 149 camera vector");
+    } else if (EnvOff()) {
         g.off = true;
         Log("off (BB_OBJMV=0): camera-only motion vectors");
         return false;
@@ -704,6 +714,7 @@ void OnDraw(const Vulkan::Instance& instance, Shader::PushData& push, bool motio
         return;
     }
     if (BB::NativeMv::On()) BB::NativeMv::NoteSceneDraw(nid);
+    if (g_native_only) return;
 
     // The draw's identity across frames: shader, vertex and index streams, range, instances,
     // and its order among identical draws this frame.
