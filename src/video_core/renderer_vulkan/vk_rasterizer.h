@@ -133,6 +133,7 @@ private:
     // bb-clean-021-bbport: Supermedo's HUD cut (bb_ui_cut.h): his OnFrameStart / OnColorTarget /
     // OnDraw before the draw's resources are bound.
     void BbUiDraw(const GraphicsPipeline* pipeline);
+    void BbLodBias();
     // Supermedo's UpdateUiTransform: the scale of a draw into the output-size UI images.
     void BbUpdateUiTransform();
     void BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32 count, u32 instances);
@@ -166,6 +167,9 @@ private:
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
     mutable bool bb_jitter_draw = false;
+    // bb-gpu6 (BB_LOD_BIAS): extra texture LOD bias of this draw's samplers (scene draws while
+    // upscaling), and the one BindResources applies (0 for compute).
+    float bb_lod_bias = 0.0f, bb_bind_lod_bias = 0.0f;
 
 public:
     BB::SceneDepth bb_scene_depth; // bb-clean-021 (bb_present_sr.h)

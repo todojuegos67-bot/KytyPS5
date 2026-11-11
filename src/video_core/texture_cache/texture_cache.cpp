@@ -916,12 +916,16 @@ void TextureCache::RefreshImage(Image& image) {
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
                                      AmdGpu::BorderColorBuffer border_color_base,
-                                     const bool is_depth) {
+                                     const bool is_depth, const float extra_lod_bias) {
     // Compare and plain uses of one S# need separate samplers.
-    const u64 hash = HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth);
+    u64 hash = HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth);
+    if (extra_lod_bias != 0.0f) {
+        hash = HashCombine(hash, u64(std::bit_cast<u32>(extra_lod_bias)) | (1ull << 40));
+    }
     const auto [it, new_sampler] = samplers.try_emplace(hash);
     if (new_sampler) {
-        it->second = slot_samplers.Insert(instance, sharp, border_color_base, is_depth);
+        it->second =
+            slot_samplers.Insert(instance, sharp, border_color_base, is_depth, extra_lod_bias);
         Sampler& sampler = slot_samplers[it->second];
         sampler.hash = hash;
         sampler_lru_cache.Insert(sampler, gc_tick);

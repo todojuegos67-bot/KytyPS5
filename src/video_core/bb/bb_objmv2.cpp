@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -51,6 +52,9 @@ struct SnapBuf {
     u32 dwords;
     u32 bytes;   // guest size (0: not hashed)
     u64 hash;    // content hash (moving-draw test)
+    u64 chash = 0;    // bb-gpu6: content hash of the guest buffer (in-frame dedupe)
+    u32 rel_off = 0;  // bb-gpu6: relative bone transforms in rel_cur / rel_prev (12 floats each)
+    u32 rel_n = 0;    // matrix pairs (0: none)
 };
 
 struct Rec {
@@ -100,6 +104,12 @@ struct State {
     std::unordered_map<u64, Rec> map_cur, map_prev;
     std::unordered_map<u64, u32> occ;
     std::unordered_map<u64, SnapBuf> dedupe;
+    // bb-gpu6: relative transforms of consecutive 3x4 matrices (M[i]^-1 * M[i+1]) of each hashed
+    // buffer, this frame and the last: unchanged by a transform common to all of them (the
+    // camera, when the game multiplies it in), changed by animation.
+    std::vector<float> rel_cur, rel_prev;
+    bool rel_test = true;
+    u64 sec_camera_only = 0, sec_dedupe = 0, sec_bytes_hashed = 0, sec_bytes_copied = 0;
     bool history = false; // map_prev is exactly the previous frame
     bool reset_pending = false;
     // Per-second statistics.
@@ -299,6 +309,10 @@ bool Init(const Vulkan::Instance& instance) {
         return false;
     }
     g.check = !EnvOff("BB_OBJMV2_CHECK");
+    {
+        const char* mv = std::getenv("BB_OBJMV_MOVE");
+        g.rel_test = !(mv != nullptr && std::strcmp(mv, "hash") == 0);
+    }
     g.device = instance.GetDevice();
     g.allocator = instance.GetAllocator();
     g.ts_period = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
@@ -529,6 +543,45 @@ void Attach(Vulkan::Scheduler& scheduler, Vulkan::RenderState& state) {
     }
 }
 
+// bb-gpu6: M[i]^-1 * M[i+1] of the 3x4 matrices (rows [R | t], column vectors) in `src`.
+// Returns false when a matrix is not invertible (not a matrix palette).
+bool RelTransforms(const float* m, u32 count, std::vector<float>& out) {
+    for (u32 i = 0; i + 1 < count; ++i) {
+        const float* a = m + i * 12;
+        const float* b = m + (i + 1) * 12;
+        const double a00 = a[0], a01 = a[1], a02 = a[2], a10 = a[4], a11 = a[5], a12 = a[6],
+                     a20 = a[8], a21 = a[9], a22 = a[10];
+        const double c00 = a11 * a22 - a12 * a21, c01 = a02 * a21 - a01 * a22,
+                     c02 = a01 * a12 - a02 * a11, c10 = a12 * a20 - a10 * a22,
+                     c11 = a00 * a22 - a02 * a20, c12 = a02 * a10 - a00 * a12,
+                     c20 = a10 * a21 - a11 * a20, c21 = a01 * a20 - a00 * a21,
+                     c22 = a00 * a11 - a01 * a10;
+        const double det = a00 * c00 + a01 * c10 + a02 * c20;
+        if (!(std::fabs(det) > 1e-12) || !std::isfinite(det)) return false;
+        const double inv[9] = {c00 / det, c01 / det, c02 / det, c10 / det, c11 / det,
+                               c12 / det, c20 / det, c21 / det, c22 / det};
+        const double dt[3] = {double(b[3]) - a[3], double(b[7]) - a[7], double(b[11]) - a[11]};
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                out.push_back(float(inv[r * 3 + 0] * b[0 * 4 + c] + inv[r * 3 + 1] * b[1 * 4 + c] +
+                                    inv[r * 3 + 2] * b[2 * 4 + c]));
+            }
+            out.push_back(float(inv[r * 3 + 0] * dt[0] + inv[r * 3 + 1] * dt[1] +
+                                inv[r * 3 + 2] * dt[2]));
+        }
+    }
+    return true;
+}
+
+bool RelDiffer(const float* a, const float* b, u32 pairs) {
+    for (u32 i = 0; i < pairs * 12; ++i) {
+        const bool translation = (i % 4) == 3;
+        const float tol = translation ? 2e-3f * (1.0f + std::fabs(a[i])) : 2e-3f;
+        if (!(std::fabs(a[i] - b[i]) <= tol)) return true;
+    }
+    return false;
+}
+
 void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
             VideoCore::BufferCache& buffer_cache,
             u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase) {
@@ -552,7 +605,7 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
         const auto& desc = vs.buffers[hnd];
         SnapBuf sb{0, 0, 0, 0};
         const void* src = nullptr;
-        u64 size = 0, key = 0;
+        u64 size = 0, key = 0, chash = 0;
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::Flatbuf && !vs.flattened_ud_buf.empty()) {
                 src = vs.flattened_ud_buf.data();
@@ -568,14 +621,20 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
                     // Written by the GPU: guest memory is stale, keep the current buffer.
                     ++g.sec_gpu_bufs;
                     key = 0;
-                } else if (const auto it = g.dedupe.find(key);
-                           it != g.dedupe.end() && it->second.addr != 0 &&
-                           std::memcmp(g.mapped + (it->second.addr - g.base_addr), guest,
-                                       size) == 0) {
-                    sb = it->second;
-                    largest = std::max<u32>(largest, u32(size));
                 } else if (memory->IsValidMapping(vsharp.base_address, size)) {
-                    src = reinterpret_cast<const void*>(vsharp.base_address);
+                    // bb-gpu6: the in-frame dedupe compares content hashes of the guest copy
+                    // (cached memory) instead of memcmp against the snapshot arena (host-visible
+                    // write-combined memory: every read was uncached, ~4 us a draw).
+                    chash = XXH3_64bits(guest, size);
+                    g.sec_bytes_hashed += size;
+                    if (const auto it = g.dedupe.find(key);
+                        it != g.dedupe.end() && it->second.addr != 0 && it->second.chash == chash) {
+                        sb = it->second;
+                        largest = std::max<u32>(largest, u32(size));
+                        ++g.sec_dedupe;
+                    } else {
+                        src = guest;
+                    }
                 }
             }
         }
@@ -583,12 +642,24 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
             const u64 bytes = (size + 15) & ~u64(15);
             if (g.arena_used + bytes <= kArenaBytes) {
                 std::memcpy(g.mapped + arena_off + g.arena_used, src, size);
+                g.sec_bytes_copied += size;
                 sb.addr = g.base_addr + arena_off + g.arena_used;
                 sb.dwords = u32(size / 4);
+                sb.chash = chash;
                 // Bone palettes / transforms (3x4 matrices): hashed for the moving-draw test.
                 if (!desc.IsSpecial() && size >= 96 && size % 48 == 0) {
                     sb.bytes = u32(size);
-                    sb.hash = XXH3_64bits(src, size);
+                    sb.hash = chash != 0 ? chash : XXH3_64bits(src, size);
+                    if (g.rel_test && size <= 48u * 256u) {
+                        const u32 off = u32(g.rel_cur.size());
+                        if (RelTransforms(static_cast<const float*>(src), u32(size / 48),
+                                          g.rel_cur)) {
+                            sb.rel_off = off;
+                            sb.rel_n = u32(size / 48) - 1;
+                        } else {
+                            g.rel_cur.resize(off);
+                        }
+                    }
                 }
                 g.arena_used += bytes;
                 if (key != 0) g.dedupe[key] = sb;
@@ -614,6 +685,7 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     if (g.history) {
         if (const auto it = g.map_prev.find(k); it != g.map_prev.end() && it->second.count == n) {
             bool moving = blend;
+            bool camera_only = false;
             bool any = false;
             const bool skeleton = cat == CatSkinned || cat == CatSmallSkel;
             for (u32 hnd = 0; hnd < n; ++hnd) {
@@ -621,9 +693,23 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
                 const SnapBuf& cb = g.bufs_cur[first + hnd];
                 any |= pb.addr != 0 && pb.dwords != 0;
                 if (skeleton && cb.bytes != 0 && (pb.bytes != cb.bytes || pb.hash != cb.hash)) {
-                    moving = true;
+                    // bb-gpu6 (BB_OBJMV_MOVE=rel, default): a palette whose matrices all changed
+                    // by one common transform (the camera multiplied in, the 369 log's 90 %
+                    // "moving" coverage while turning: the scenery got object vectors) is not
+                    // moving; one whose bones moved relative to each other is (animation: the
+                    // characters keep their object vectors). BB_OBJMV_MOVE=hash: any change.
+                    if (g.rel_test && pb.bytes == cb.bytes && pb.rel_n != 0 &&
+                        pb.rel_n == cb.rel_n && pb.rel_off + pb.rel_n * 12 <= g.rel_prev.size() &&
+                        cb.rel_off + cb.rel_n * 12 <= g.rel_cur.size() &&
+                        !RelDiffer(g.rel_prev.data() + pb.rel_off, g.rel_cur.data() + cb.rel_off,
+                                   cb.rel_n)) {
+                        camera_only = true;
+                    } else {
+                        moving = true;
+                    }
                 }
             }
+            if (camera_only && !moving) ++g.sec_camera_only;
             const bool diag = !moving && g.stat_frame && (g.static_seen++ % kStaticSample) == 0;
             const u64 bytes = u64(n) * 16;
             if (any && (moving || diag) && g.table_used + bytes <= kTableBytes) {
@@ -794,17 +880,20 @@ void OnFlip() {
     if (had_pass && !g.reset_pending) {
         std::swap(g.map_prev, g.map_cur);
         std::swap(g.bufs_prev, g.bufs_cur);
+        std::swap(g.rel_prev, g.rel_cur);
         g.history = true;
     } else {
         if (g.history) ++g.sec_resets;
         g.map_prev.clear();
         g.bufs_prev.clear();
+        g.rel_prev.clear();
         g.history = false;
         if (!had_pass) g.prev_valid = false;
     }
     g.reset_pending = false;
     g.map_cur.clear();
     g.bufs_cur.clear();
+    g.rel_cur.clear();
     g.occ.clear();
     g.dedupe.clear();
     g.cleared = false;
@@ -865,6 +954,15 @@ void OnFlip() {
         g.sec_wo, g.sec_wc,
         g.sec_stat_frames ? double(g.sec_nonzero) / double(g.sec_stat_frames) : 0.0,
         g.sec_not_composed, g.sec_gpu_bufs));
+    Log(fmt::format("[objmv-gpu6] moving test {}: palettes changed only by a common transform "
+                    "(camera) kept static {}/s; CPU per draw: hashed {:.0f} B, copied {:.0f} B, "
+                    "dedupe hits {}",
+                    g.rel_test ? "rel (BB_OBJMV_MOVE=rel)" : "hash (BB_OBJMV_MOVE=hash)",
+                    g.sec_camera_only,
+                    g.sec_draws ? double(g.sec_bytes_hashed) / double(g.sec_draws) : 0.0,
+                    g.sec_draws ? double(g.sec_bytes_copied) / double(g.sec_draws) : 0.0,
+                    g.sec_dedupe));
+    g.sec_camera_only = g.sec_dedupe = g.sec_bytes_hashed = g.sec_bytes_copied = 0;
     g.sec_gpu_bufs = 0;
     g.sec_nonzero = g.sec_stat_frames = g.sec_not_composed = 0;
     g.sec_draws = g.sec_vec_draws = g.sec_resets = g.sec_frames = g.sec_overflow = 0;

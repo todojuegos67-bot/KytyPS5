@@ -11,6 +11,8 @@
 // refresh rate leaves room for), capped by NGX's MultiFrameCountMax.
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -230,11 +232,46 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
     e.depth_inverted = in.depth_inverted ? 1 : 0;
     e.reset = reset ? 1 : 0;
     e.has_matrices = in.camera_valid ? 1 : 0;
+    // bb-gpu6 (BB_DLSSG_MATRIX): NGX DLSS-G takes row-vector matrices (clip = p * M, as
+    // Streamline: bb_sr_dlss.cpp gives DLSS SR the same matrices transposed), and its
+    // cameraViewToClip must be a projection (the bridge inverts it as one). Ours are row major for
+    // column vectors and view_to_clip is the whole view-projection: before gpu6 DLSS-G got them
+    // as they are (transposed clipToPrevClip, a view-projection read as a projection), so its
+    // camera motion contradicted the vectors on every camera turn and the generated frames
+    // smeared the background. BB_DLSSG_MATRIX=raw restores that.
+    static const bool raw_matrices = [] {
+        const char* v = std::getenv("BB_DLSSG_MATRIX");
+        const bool raw = v != nullptr && std::strcmp(v, "raw") == 0;
+        BBLogf("DLSS-G: camera matrices %s (BB_DLSSG_MATRIX)",
+               raw ? "raw (as before gpu6)"
+                   : "row-vector: clipToPrevClip transposed, cameraViewToClip = projection "
+                     "from fov/near/far");
+        return raw;
+    }();
+    float to_prev_rv[16];
     if (in.camera_valid) {
-        std::memcpy(e.view_to_clip, in.view_to_clip, sizeof(e.view_to_clip));
-        std::memcpy(e.clip_to_prev_clip, in.clip_to_prev_clip, sizeof(e.clip_to_prev_clip));
+        if (raw_matrices) {
+            std::memcpy(e.view_to_clip, in.view_to_clip, sizeof(e.view_to_clip));
+            std::memcpy(to_prev_rv, in.clip_to_prev_clip, sizeof(to_prev_rv));
+        } else {
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) to_prev_rv[j * 4 + i] = in.clip_to_prev_clip[i * 4 + j];
+            // The bridge's Perspective (row vectors, depth 0 at near).
+            const float aspect = float(in.render.width) / float(std::max(in.render.height, 1u));
+            const float y = 1.0f / std::tan(std::max(in.fov_y, 0.01f) * 0.5f);
+            const float n = std::max(in.z_near, 1e-4f);
+            const float f = std::max(in.z_far, n * 2.0f);
+            float p[16]{};
+            p[0] = y / aspect;
+            p[5] = y;
+            p[10] = f / (f - n);
+            p[11] = 1.0f;
+            p[14] = -n * f / (f - n);
+            std::memcpy(e.view_to_clip, p, sizeof(e.view_to_clip));
+        }
+        std::memcpy(e.clip_to_prev_clip, to_prev_rv, sizeof(e.clip_to_prev_clip));
         // prev_clip_to_clip: the inverse (general 4x4).
-        const float* m = in.clip_to_prev_clip;
+        const float* m = to_prev_rv;
         float inv[16];
         inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] +
                  m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];

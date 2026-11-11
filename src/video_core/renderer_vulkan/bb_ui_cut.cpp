@@ -12,6 +12,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
 #include <fmt/format.h>
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
@@ -207,6 +211,21 @@ void UiCut::OnFrameStart() {
     cut_fg = {};
     cut_hudless = -1;
     ldr_target = {};
+    cut_vs = 0;
+    // [hud-seq]: the frame traced (seq_frame 1) is logged at the next frame start.
+    if (seq_frame == 1 && !seq.empty()) {
+        BB::Upscale::Checkpoint("[hud-seq] draws into scene-size RGBA8 targets (UI: after the "
+                                "cut):" + seq);
+    }
+    seq.clear();
+    static auto t_seq = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - t_seq >= std::chrono::seconds(1)) {
+        t_seq = now;
+        seq_frame = 1;
+    } else {
+        seq_frame = 0;
+    }
 }
 
 void UiCut::OnColorTarget(VideoCore::ImageId color) {
@@ -218,8 +237,33 @@ void UiCut::OnColorTarget(VideoCore::ImageId color) {
     }
 }
 
-void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId depth,
+void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::ImageId depth,
                    bool native_viewport, SceneDepth& scene) {
+    const u64 vs_hash = info.vs_hash;
+    // bb-gpu6 [hud-seq]: once a second, one frame's draws into scene-size RGBA8 targets.
+    const bool seq_on = seq_frame == 1;
+    if (seq_on && color && seq.size() < 1800) {
+        const auto& im = texture_cache.GetImage(color);
+        if (Rgba8(im.info.pixel_format) && RenderTarget(im.info.size.width, im.info.size.height)) {
+            seq += fmt::format(" {}vs{:#x}/ps{:#x}{}{}{}{}", ui_phase ? "UI:" : "", vs_hash,
+                               info.ps_hash, info.samples_scene ? " reads-scene" : "",
+                               info.depth_test ? " depth" : "", info.blend ? " blend" : "",
+                               color == ldr_target ? "" : " other-target");
+        }
+    }
+    // bb-gpu6: a post pass (reads a scene-size image) into the UI target after a cut started by a
+    // non-movie shader: that shader is not the HUD start; it is refused from now on.
+    if (ui_phase && cut_vs != 0 && color && color == ui_color && info.samples_scene &&
+        num_bad_vs < bad_vs.size() &&
+        std::find(bad_vs.begin(), bad_vs.begin() + num_bad_vs, cut_vs) ==
+            bad_vs.begin() + num_bad_vs) {
+        bad_vs[num_bad_vs++] = cut_vs;
+        BB::Upscale::Checkpoint(fmt::format(
+            "[hud-cut] post pass vs {:#x} ps {:#x} came after the cut started by vs {:#x}: that "
+            "shader no longer starts the HUD cut ({} refused)",
+            vs_hash, info.ps_hash, cut_vs, num_bad_vs));
+        cut_vs = 0;
+    }
     // A UI draw without a color target (a Scaleform mask: color writes off) writes the stencil
     // the next UI draws test, so it belongs in the UI's output-size depth like them.
     if (ui_phase && !color && depth && depth != ui_depth && ui_color) {
@@ -250,8 +294,56 @@ void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId dep
         return hash ? std::strtoull(hash, nullptr, 16) : 0ull;
     }();
     const auto& image = texture_cache.GetImage(color);
-    const bool movie = (ui_trigger_vs && vs_hash == ui_trigger_vs) ||
-                       Vulkan::UiComposition::MovieShader(vs_hash);
+    const bool listed_movie = (ui_trigger_vs && vs_hash == ui_trigger_vs) ||
+                              Vulkan::UiComposition::MovieShader(vs_hash);
+    // bb-gpu6 (BB_HUD_TRIGGER): the in-game HUD draws with none of the UI-movie shaders (369 log:
+    // "UI-movie shader on a non-scene target 0, scene-size RGBA8 draws by other shaders 210 (vs:
+    // 0x1ea5a07e 0x0b0acf50 0x061fbbf6)"). After the scene, a draw into the UI target that reads
+    // no scene-size image (not a post pass) and tests no depth starts the HUD: one of those vertex
+    // shaders (BB_HUD_VS="0x..,0x.." replaces the list), or with "auto" any blended such draw.
+    // A shader followed by a post pass into the UI target is refused afterwards.
+    // BB_HUD_TRIGGER=movie: only the UI-movie shaders (gpu5).
+    static const int trigger_mode = [] {
+        const char* v = std::getenv("BB_HUD_TRIGGER");
+        const int m = v == nullptr || std::strcmp(v, "auto") == 0 ? 2
+                      : std::strcmp(v, "list") == 0              ? 1
+                                                                 : 0;
+        BB::Upscale::Checkpoint(fmt::format(
+            "[hud-cut] trigger {} (BB_HUD_TRIGGER=auto|list|movie)",
+            m == 2 ? "auto: UI-movie shaders, the HUD list, or the first blended 2D draw after "
+                     "the scene"
+            : m == 1 ? "list: UI-movie shaders and the HUD list"
+                     : "movie: UI-movie shaders only"));
+        return m;
+    }();
+    static const std::vector<u64> hud_list = [] {
+        std::vector<u64> list{0x1ea5a07e, 0x061fbbf6, 0x0b0acf50};
+        if (const char* v = std::getenv("BB_HUD_VS"); v != nullptr && *v != '\0') {
+            list.clear();
+            std::string text{v};
+            size_t pos = 0;
+            while (pos < text.size()) {
+                const size_t end = text.find_first_of(", ;", pos);
+                const std::string item =
+                    text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+                if (!item.empty()) list.push_back(std::strtoull(item.c_str(), nullptr, 16));
+                if (end == std::string::npos) break;
+                pos = end + 1;
+            }
+        }
+        std::string shown;
+        for (const u64 h : list) shown += fmt::format(" {:#x}", h);
+        BB::Upscale::Checkpoint(fmt::format("[hud-cut] HUD vertex shaders:{}", shown));
+        return list;
+    }();
+    const bool refused = std::find(bad_vs.begin(), bad_vs.begin() + num_bad_vs, vs_hash) !=
+                         bad_vs.begin() + num_bad_vs;
+    const bool flat = !info.samples_scene && !info.depth_test;
+    const bool hud_start =
+        !listed_movie && trigger_mode != 0 && flat && !refused &&
+        (std::find(hud_list.begin(), hud_list.end(), vs_hash) != hud_list.end() ||
+         (trigger_mode == 2 && info.blend));
+    const bool movie = listed_movie || hud_start;
     (void)native_viewport; // Supermedo: only for his live resolution path (guest targets 1080p)
     const bool ui_draw = movie && Rgba8(image.info.pixel_format) &&
                          RenderTarget(image.info.size.width, image.info.size.height) &&
@@ -276,12 +368,23 @@ void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId dep
         if (ui_draw) ++g_why.cuts_seen;
         FlushWhy();
     }
+    if (ui_draw && hud_start && scene.valid && ldr_target == color && active) {
+        static u32 said = 0;
+        if (said < 4) {
+            ++said;
+            BB::Upscale::Checkpoint(fmt::format(
+                "[hud-cut] HUD start by vs {:#x} ps {:#x} (not a UI-movie shader){}", vs_hash,
+                info.ps_hash, info.blend ? ", blended" : ""));
+        }
+    }
+    const u64 trigger_vs = hud_start ? vs_hash : 0;
     switch (Vulkan::UiComposition::Choose(scaled || native_fg, ui_draw,
                                           scene.valid && ldr_target == color, active)) {
     case Vulkan::UiComposition::Background::None:
         return;
     case Vulkan::UiComposition::Background::Temporal:
         if (native_fg ? RunNativeFg(scene, color, depth) : RunScaled(scene)) {
+            cut_vs = trigger_vs;
             CaptureHudlessUi();
             return;
         }
@@ -290,6 +393,7 @@ void UiCut::OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId dep
         [[fallthrough]];
     case Vulkan::UiComposition::Background::Copy:
         RunUiOnly(color, depth);
+        cut_vs = trigger_vs;
         CaptureHudlessUi();
         return;
     }

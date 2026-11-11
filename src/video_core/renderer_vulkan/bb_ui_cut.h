@@ -18,6 +18,7 @@
 
 #include <array>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include "video_core/bb/bb_fg.h"
@@ -52,7 +53,13 @@ public:
     // The draw into a display buffer (the game's first pass of a frame) starts a frame.
     void OnFrameStart();
     void OnColorTarget(VideoCore::ImageId color);
-    void OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId depth,
+    // bb-gpu6: the draw as the HUD-start rule sees it.
+    struct DrawInfo {
+        u64 vs_hash = 0, ps_hash = 0;
+        bool depth_test = false, blend = false;
+        bool samples_scene = false; // reads an image of the scene's size (a post pass)
+    };
+    void OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::ImageId depth,
                 bool native_viewport, SceneDepth& scene);
 
     struct Target {
@@ -130,6 +137,13 @@ private:
 
     bool ui_phase = false, display_redirect = false, done_this_frame = false;
     bool ui_read_barrier = false, hudless_taken = false;
+    // bb-gpu6: the trigger of this frame's cut (0: a UI-movie shader or none) and the vertex
+    // shaders refused as HUD start (a post pass into the UI target came after them).
+    u64 cut_vs = 0;
+    std::array<u64, 16> bad_vs{};
+    u32 num_bad_vs = 0;
+    u32 seq_frame = 0;
+    std::string seq;
     VideoCore::ImageId ldr_target{}, ui_color{}, ui_depth{};
     OwnImage ui_image, ui_depth_image;
     // Three copies without the HUD: the presenter reads one a frame later than it was cut.

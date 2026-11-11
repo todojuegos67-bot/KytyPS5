@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -458,6 +461,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
+    bb_bind_lod_bias = pipeline->IsCompute() ? 0.0f : bb_lod_bias;
 
     bool uses_dma = false;
 
@@ -1070,7 +1074,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             ssharp = AmdGpu::Sampler{};
         }
         const auto vk_sampler =
-            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
+            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth,
+                                     sampler.is_depth ? 0.0f : bb_bind_lod_bias);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
@@ -1082,11 +1087,58 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
+// bb-gpu6 (BB_LOD_BIAS): with an upscaler the scene is drawn at the render size but shown at
+// the output's: its textures need the output's mip level (log2(render / output), the bias DLSS
+// and FSR ask for), or they are sampled one mip too blurry and the upscaler cannot bring the
+// detail back. Scene draws only (depth test on into the scene-size depth, before the HUD cut).
+// BB_LOD_BIAS=off: none; a number: that bias instead; BB_LOD_BIAS_EXTRA adds to the automatic one.
+void Rasterizer::BbLodBias() {
+    bb_lod_bias = 0.0f;
+    static const int mode = [] {
+        const char* v = std::getenv("BB_LOD_BIAS");
+        if (v != nullptr && (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0)) return 0;
+        if (v != nullptr && *v != '\0' && std::strcmp(v, "auto") != 0) return 2;
+        return 1;
+    }();
+    static const float fixed = [] {
+        const char* v = std::getenv("BB_LOD_BIAS");
+        return v != nullptr ? float(std::atof(v)) : 0.0f;
+    }();
+    static const float extra = [] {
+        const char* v = std::getenv("BB_LOD_BIAS_EXTRA");
+        return v != nullptr ? float(std::atof(v)) : 0.0f;
+    }();
+    if (mode == 0 || !BB::Upscale::Enabled() || !BB::Upscale::BackendReady()) return;
+    const auto& regs = liverpool->regs;
+    if (!regs.depth_control.depth_enable || !db_desc.image_id || bb_cut.UiPhase()) return;
+    const auto& depth = texture_cache.GetImage(db_desc.image_id);
+    if (depth.info.size.width != BB::Upscale::g_scene_w ||
+        depth.info.size.height != BB::Upscale::g_scene_h) {
+        return;
+    }
+    u32 ow = 0, oh = 0;
+    if (!BB::Upscale::OutputSize(ow, oh) || ow == 0 || BB::Upscale::g_scene_w == 0) return;
+    const float ratio = float(BB::Upscale::g_scene_w) / float(ow);
+    float bias = mode == 2 ? fixed : (ratio < 0.99f ? std::log2(ratio) + extra : 0.0f);
+    bias = std::round(bias * 8.0f) / 8.0f; // few distinct samplers
+    bb_lod_bias = bias;
+    static float logged = 1e9f;
+    if (bias != logged) {
+        logged = bias;
+        BB::Upscale::Checkpoint(fmt::format(
+            "[lod-bias] scene textures {:+.3f} (render {}x{} -> output {}x{}; BB_LOD_BIAS={}, "
+            "BB_LOD_BIAS_EXTRA {:+.2f})",
+            bias, BB::Upscale::g_scene_w, BB::Upscale::g_scene_h, ow, oh,
+            mode == 2 ? "fixed" : "auto", extra));
+    }
+}
+
 void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
+    const auto& regs = liverpool->regs;
+    BbLodBias();
     if (!BB::UiCut::Active()) {
         return;
     }
-    const auto& regs = liverpool->regs;
     // Supermedo: the pass copying a finished frame to a display buffer starts the frame (here
     // once per run of draws into display buffers).
     const bool display = regs.color_buffers[0] &&
@@ -1100,8 +1152,26 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
     }
     if (std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = regs.viewports[0];
-        bb_cut.OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, cb_descs[0].image_id,
-                      db_desc.image_id,
+        // bb-gpu6: what the HUD-start rule needs of the draw: does it read a scene-size image
+        // (a post pass: fog, tonemap, composites), depth test, blending, its pixel shader.
+        BB::UiCut::DrawInfo info{};
+        info.vs_hash = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
+        info.depth_test = regs.depth_control.depth_enable != 0;
+        info.blend = pipeline->GetGraphicsKey().blend_controls[0].enable != 0;
+        const u32 sw = BB::Upscale::g_scene_w, sh = BB::Upscale::g_scene_h;
+        for (const auto* stage : pipeline->GetStages()) {
+            if (!stage) continue;
+            if (stage->sw_stage == Shader::SwStage::Fragment) info.ps_hash = stage->pgm_hash;
+            for (const auto& image_desc : stage->images) {
+                const auto tsharp = image_desc.GetSharp(*stage);
+                if (tsharp.Address() == 0) continue;
+                const u32 w = u32(tsharp.width) + 1, h = u32(tsharp.height) + 1;
+                if (sw && sh && w + 8 > sw && h + 8 > sh && w < sw + 8 && h < sh + 8) {
+                    info.samples_scene = true;
+                }
+            }
+        }
+        bb_cut.OnDraw(info, cb_descs[0].image_id, db_desc.image_id,
                       UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2),
                       bb_scene_depth);
     }

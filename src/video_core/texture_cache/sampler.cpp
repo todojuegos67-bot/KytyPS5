@@ -9,7 +9,8 @@
 namespace VideoCore {
 
 Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
-                 const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth) {
+                 const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth,
+                 float extra_lod_bias) {
     using namespace Vulkan;
     const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
                                    (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
@@ -51,7 +52,9 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
-        .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
+        // bb-gpu6 (BB_LOD_BIAS): scene samplers get log2(render/output) more when upscaling.
+        .mipLodBias = std::clamp(sampler.LodBias() + extra_lod_bias, -instance.MaxSamplerLodBias(),
+                                 instance.MaxSamplerLodBias()),
         .anisotropyEnable = anisotropy_enable,
         .maxAnisotropy = max_anisotropy,
         // GCN compares per instruction; a plain read of a compare sampler is undefined in Vulkan.
