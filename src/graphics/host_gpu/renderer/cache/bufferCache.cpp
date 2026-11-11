@@ -386,6 +386,17 @@ uint64_t RepeatReadWindowSize(uint64_t page, bool is_write) {
 // other access to them waits for the same download. The faulting guest thread waits for the copy
 // itself, then Thread_Gpu publishes the bytes and lifts the pages' GPU ownership exactly as for the
 // main-queue asynchronous readback (FinishWriteReadback). Same bytes, same order: only who waits.
+int64_t HotWritebackMs() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_HOT_WRITEBACK", 1);
+	static auto& ms = Common::LiveSwitches::Get("KYTY_HOT_WRITEBACK_MS", 1000);
+	return on.load(std::memory_order_relaxed) != 0 ? std::max<int64_t>(ms.load(std::memory_order_relaxed), 0) : 0;
+}
+
+struct HotStats {
+	std::atomic<uint64_t> calls {0}, runs {0}, pages {0}, completed {0}, fault_hits {0}, fault_resolved {0};
+};
+HotStats g_hot;
+
 bool AsyncCopyQueueEnabled() {
 	static auto& enabled = Common::LiveSwitches::Get("KYTY_CQ_ASYNC", 1);
 	return enabled.load(std::memory_order_relaxed) != 0;
@@ -451,6 +462,20 @@ thread_local bool t_sync_own    = true;
 uint64_t ElapsedUs(std::chrono::steady_clock::time_point begin) {
 	return static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+}
+
+void PrintHot() {
+	::printf("Hot write-back (5 s, KYTY_HOT_WRITEBACK=%lld, _MS=%lld): %llu label points with hot pages, %llu downloads "
+	         "(%llu pages) before labels, %llu completed by Thread_Gpu, %llu faults found one still open, %llu faults resolved "
+	         "by a published one in the first command\n",
+	         static_cast<long long>(Common::LiveSwitches::Get("KYTY_HOT_WRITEBACK", 1).load()),
+	         static_cast<long long>(Common::LiveSwitches::Get("KYTY_HOT_WRITEBACK_MS", 1000).load()),
+	         static_cast<unsigned long long>(g_hot.calls.exchange(0)),
+	         static_cast<unsigned long long>(g_hot.runs.exchange(0)),
+	         static_cast<unsigned long long>(g_hot.pages.exchange(0)),
+	         static_cast<unsigned long long>(g_hot.completed.exchange(0)),
+	         static_cast<unsigned long long>(g_hot.fault_hits.exchange(0)),
+	         static_cast<unsigned long long>(g_hot.fault_resolved.exchange(0)));
 }
 
 void PrintFaultPaths() {
@@ -519,6 +544,7 @@ void NoteCqStats() {
 	         static_cast<double>(wait_us) / 1000.0, static_cast<unsigned long long>(no_slot),
 	         static_cast<unsigned long long>(sync_run));
 	PrintFaultPaths();
+	PrintHot();
 	std::fflush(stdout);
 }
 
@@ -1491,6 +1517,90 @@ void BufferCache::CollectReadbackHistory(const Buffer& buffer, uint64_t window_b
 // write marks and protects the page again (the fault path then serves it as before). Data is never
 // older than at the fault: only bytes whose writer has finished, on the thread that records GPU work.
 // Returns true when hot pages wait for a writer still in flight (the caller polls again in ~1 ms).
+void BufferCache::HotWriteback() {
+	if (m_hot_dirty.empty()) {
+		return;
+	}
+	if (HotWritebackMs() <= 0 || m_scheduler.Current().IsInvalid()) {
+		m_hot_dirty.clear();
+		return;
+	}
+	g_hot.calls.fetch_add(1, std::memory_order_relaxed);
+	std::vector<uint64_t> pages(m_hot_dirty.begin(), m_hot_dirty.end());
+	m_hot_dirty.clear();
+	const auto tick = m_scheduler.CurrentTick();
+	for (size_t i = 0; i < pages.size();) {
+		// A run of consecutive pages of one buffer.
+		const auto  begin = pages[i];
+		const auto* owner = m_page_table.Find(begin >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			i++;
+			continue;
+		}
+		auto&    buffer = m_slot_buffers[*owner];
+		uint64_t end    = begin + TRACKER_PAGE_SIZE;
+		size_t   j      = i + 1;
+		while (j < pages.size() && pages[j] == end && buffer.IsInBounds(begin, end + TRACKER_PAGE_SIZE - begin)) {
+			end += TRACKER_PAGE_SIZE;
+			j++;
+		}
+		i = j;
+		if (!buffer.IsInBounds(begin, end - begin) || OverlapsPendingWriteReadback(begin, end) ||
+		    !m_memory_tracker.IsRegionGpuModified(begin, end - begin)) {
+			continue;
+		}
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			if (!m_gpu_modified_ranges.Intersects(begin, end - begin) ||
+			    m_downloading_ranges.Intersects(begin, end - begin)) {
+				continue;
+			}
+		}
+		if (DownloadBufferMemory(buffer, begin, end - begin)) {
+			// GPU-owned until completed (PollHotWriteback, or a fault that finds it).
+			m_pending_write_readbacks.push_back({begin, end, tick});
+			m_hot_pending_ticks.push_back(tick);
+			g_hot.runs.fetch_add(1, std::memory_order_relaxed);
+			g_hot.pages.fetch_add((end - begin) / TRACKER_PAGE_SIZE, std::memory_order_relaxed);
+		}
+	}
+}
+
+void BufferCache::PollHotWriteback() {
+	if (m_hot_pending_ticks.empty()) {
+		return;
+	}
+	// Called at every PM4 packet: the timeline query at most every 50 us.
+	static auto last_poll = std::chrono::steady_clock::time_point {};
+	const auto  now       = std::chrono::steady_clock::now();
+	if (now - last_poll < std::chrono::microseconds(50)) {
+		return;
+	}
+	last_poll = now;
+	const auto oldest = *std::min_element(m_hot_pending_ticks.begin(), m_hot_pending_ticks.end());
+	if (!m_scheduler.CompletedWithOperations(oldest)) {
+		return;
+	}
+	for (size_t i = 0; i < m_pending_write_readbacks.size();) {
+		const auto& pending = m_pending_write_readbacks[i];
+		if (pending.cq == 0 && std::find(m_hot_pending_ticks.begin(), m_hot_pending_ticks.end(), pending.tick) !=
+		                           m_hot_pending_ticks.end() &&
+		    m_scheduler.CompletedWithOperations(pending.tick)) {
+			CompletePendingWriteReadback(i); // no wait: published already
+			g_hot.completed.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			i++;
+		}
+	}
+	std::erase_if(m_hot_pending_ticks, [&](uint64_t t) {
+		if (!m_scheduler.CompletedWithOperations(t)) {
+			return false;
+		}
+		return std::none_of(m_pending_write_readbacks.begin(), m_pending_write_readbacks.end(),
+		                    [&](const PendingWriteReadback& p) { return p.cq == 0 && p.tick == t; });
+	});
+}
+
 bool BufferCache::EagerWriteback() {
 	static auto& eager_ms = Common::LiveSwitches::Get("KYTY_EAGER_WRITEBACK", 0);
 	const auto   age      = eager_ms.load(std::memory_order_relaxed);
@@ -1520,8 +1630,11 @@ bool BufferCache::EagerWriteback() {
 	if (!m_eager_inflight.empty()) {
 		PollEagerInflight();
 	}
-	if (age <= 0 || m_readback_history.empty() || !m_pending_write_readbacks.empty()) {
-		return !m_eager_inflight.empty();
+	PollHotWriteback();
+	// Hot write-backs (KYTY_HOT_WRITEBACK) are pending entries too; eager batches skip their pages.
+	if (age <= 0 || m_readback_history.empty() ||
+	    (!m_pending_write_readbacks.empty() && m_hot_pending_ticks.empty())) {
+		return !m_eager_inflight.empty() || !m_hot_pending_ticks.empty();
 	}
 	if (use_async && m_eager_inflight.size() >= 4) {
 		return true; // poll again soon
@@ -1651,9 +1764,39 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	// KYTY_EAGER_ASYNC: an eager batch holding this page is published first (it waits for its copy).
 	CompleteEagerInflight(page_begin, page_end);
+	PollHotWriteback();
+	// KYTY_HOT_WRITEBACK: a write-back of this page already published is completed here (no wait,
+	// no copy); the fault is resolved by this command alone.
+	if (!m_hot_pending_ticks.empty()) {
+		bool completed = false;
+		for (size_t i = 0; i < m_pending_write_readbacks.size();) {
+			const auto& pending = m_pending_write_readbacks[i];
+			if (pending.cq == 0 && pending.begin < page_end && page_begin < pending.end &&
+			    m_scheduler.CompletedWithOperations(pending.tick)) {
+				CompletePendingWriteReadback(i);
+				completed = true;
+			} else {
+				i++;
+			}
+		}
+		if (completed) {
+			g_hot.fault_resolved.fetch_add(1, std::memory_order_relaxed);
+			if (!m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+				if (is_write) {
+					m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				}
+				return 0;
+			}
+		}
+	}
 	// Another guest's readback of this page is still landing: wait for the same download.
 	for (const auto& pending: m_pending_write_readbacks) {
 		if (pending.begin < page_end && page_begin < pending.end) {
+			if (pending.cq == 0 && pending.tick >= m_scheduler.CurrentTick()) {
+				// A hot write-back still in the open command buffer: the guest waits for its tick.
+				g_hot.fault_hits.fetch_add(1, std::memory_order_relaxed);
+				m_scheduler.Flush();
+			}
 			window_begin = pending.begin;
 			window_end   = pending.end;
 			cq_value     = pending.cq;
@@ -1717,7 +1860,8 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
                                                     .count());
 	// KYTY_EAGER_WRITEBACK keeps the same fault history (its own age limit): EagerWriteback() reads it.
 	static auto& eager_ms = Common::LiveSwitches::Get("KYTY_EAGER_WRITEBACK", 0);
-	const auto   keep_ms  = std::max<int64_t>(history, eager_ms.load(std::memory_order_relaxed));
+	const auto   keep_ms  = std::max<int64_t>(std::max<int64_t>(history, eager_ms.load(std::memory_order_relaxed)),
+	                                         HotWritebackMs());
 	if (keep_ms > 0) {
 		if (m_readback_history.size() >= 16384) {
 			std::erase_if(m_readback_history, [&](const auto& entry) {
@@ -2547,6 +2691,19 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
+	}
+	if (!m_readback_history.empty()) {
+		if (const auto hot_ms = HotWritebackMs(); hot_ms > 0) {
+			const auto now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			                                              std::chrono::steady_clock::now().time_since_epoch())
+			                                              .count());
+			for (auto it = m_readback_history.lower_bound(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
+			     it != m_readback_history.end() && it->first < vaddr + size; ++it) {
+				if (now_ms - it->second <= static_cast<uint64_t>(hot_ms)) {
+					m_hot_dirty.insert(it->first);
+				}
+			}
+		}
 	}
 	ReadbackStats::NoteWrite(vaddr, size, m_scheduler.CurrentTick());
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names

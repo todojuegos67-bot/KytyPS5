@@ -257,6 +257,8 @@ bool GuestGpu::LabelsAtCompletion() {
 
 void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) {
 	EXIT_IF(!IsGpuThread() || (size != 4 && size != 8));
+	// KYTY_HOT_WRITEBACK: hot GPU-written pages reach guest memory before this label does.
+	m_renderer.GetBufferCache().HotWriteback();
 	g_labels_deferred.store(true, std::memory_order_relaxed);
 	const auto sequence        = ++m_label_sequence;
 	m_pending_labels[address] = {value, size, sequence};
@@ -366,6 +368,9 @@ template bool GuestGpu::FindRecordedLabel<uint64_t>(const volatile uint64_t*, ui
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	// KYTY_HOT_WRITEBACK: unprotect hot pages as soon as their write-back is published, before a
+	// guest thread that saw the label reads them.
+	m_renderer.GetBufferCache().PollHotWriteback();
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -2162,6 +2167,7 @@ void CommandProcessor::SynchronizeGpu() {
 void CommandProcessor::PublishLabelAtCompletion(void* dst, uint64_t value, uint32_t bytes,
                                                 bool clock) {
 	auto& renderer = m_renderer;
+	renderer.GetBufferCache().HotWriteback(); // KYTY_HOT_WRITEBACK
 	if (!clock) {
 		renderer.GetGpu().NoteRecordedLabel(reinterpret_cast<uint64_t>(dst), value, bytes,
 		                                    GetScheduler().CurrentTick());

@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 
 #include <array>
+#include <set>
 #include <mutex>
 #include "common/abi.h"
 #include "common/common.h"
@@ -121,6 +122,14 @@ public:
 	// GPU thread, between submissions: KYTY_EAGER_WRITEBACK (see bufferCache.cpp). True while hot pages
 	// wait for a writer still in flight.
 	bool                            EagerWriteback();
+	// KYTY_HOT_WRITEBACK (wolv-perf-1111g): GPU thread, before an end-of-pipe label, interrupt or
+	// fence is recorded. Downloads, in the current command buffer, the GPU-written bytes of hot pages
+	// (pages guest threads faulted on in the last KYTY_HOT_WRITEBACK_MS) written since the last call,
+	// so they reach guest memory before the label becomes visible; the pages stay GPU-owned until
+	// PollHotWriteback lifts them on this thread.
+	void                            HotWriteback();
+	// GPU thread: completes the finished hot write-backs (publication done) and unprotects their pages.
+	void                            PollHotWriteback();
 	// GPU thread: writes bytes on a page protected because the GPU wrote to it, without
 	// downloading the page: the host copy through the backing store, the GPU copy in the command
 	// stream, after the GPU's earlier writes. Bytes the GPU had written are then current on both
@@ -286,6 +295,8 @@ private:
 		std::vector<uint64_t> pages;
 	};
 	std::vector<EagerInflight> m_eager_inflight;
+	std::set<uint64_t>         m_hot_dirty;          // hot pages GPU-written since the last HotWriteback
+	std::vector<uint64_t>      m_hot_pending_ticks;  // ticks of hot write-backs not completed yet
 	[[nodiscard]] bool         EagerInflightOverlaps(uint64_t begin, uint64_t end) const;
 	void                       CompleteEagerInflight(uint64_t begin, uint64_t end);
 	void                       FinishEagerInflight(size_t index);
