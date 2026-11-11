@@ -1,0 +1,15 @@
+Gran Turismo 7 PC (KytyPS5-GT7)
+
+1. Descomprime todo en una carpeta (por ejemplo C:\Juegos\Gran Turismo 7 PC).
+2. Abre "Gran Turismo 7.exe". La primera vez elige la carpeta del juego volcado
+   (por defecto E:\gran turismo 7\PPSA01317-app, la que tiene eboot.bin; GT7 1.710).
+3. Ajusta las opciones (se guardan en settings.ini junto al exe) y pulsa JUGAR.
+
+- Mando: DualSense (USB o Bluetooth) u 8BitDo / Xbox. LB / RB cambian de sección en el lanzador.
+- Volante: pestaña Volante. El mapeo de ejes y botones se hace con launcher.exe (Mapear volante...),
+  la fuerza y los grados desde el propio lanzador. Todo queda en wheel.json.
+- Teclado y ratón: F7 captura el ratón como stick derecho; F11 pantalla completa.
+- Métricas: ventana con FPS, RAM y VRAM encima del juego; F10 la muestra u oculta.
+- Añadir a Steam: pestaña Tu PC. Pon una imagen fondo-gt7.jpg junto al exe para el fondo y las portadas.
+- Logs: carpeta logs\ (gt7-<fecha>.log por partida).
+- Reescalado (DLSS / FSR / XeSS) y generación de fotogramas: próximamente.

@@ -1,0 +1,29 @@
+// "Gran Turismo 7.exe" (KYTY_GT7_PORT): its icon, the icon's bytes (Anadir a Steam) and Cinzel (the titles).
+#include <winver.h>
+
+1 ICON "gran-turismo-7.ico"
+2 RCDATA "gran-turismo-7.ico"
+3 RCDATA "cinzel.ttf"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+	BLOCK "StringFileInfo"
+	BEGIN
+		BLOCK "040A04B0"
+		BEGIN
+			VALUE "FileDescription", "Gran Turismo 7 PC (KytyPS5-GT7)"
+			VALUE "ProductName", "Gran Turismo 7 PC"
+			VALUE "OriginalFilename", "Gran Turismo 7.exe"
+			VALUE "FileVersion", "1.0"
+			VALUE "ProductVersion", "1.0"
+		END
+	END
+	BLOCK "VarFileInfo"
+	BEGIN
+		VALUE "Translation", 0x040A, 1200
+	END
+END

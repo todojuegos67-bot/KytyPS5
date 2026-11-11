@@ -1062,6 +1062,43 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
+
+# -DKYTY_GT7_PORT=ON (Windows): "Gran Turismo 7.exe" (src/port, ported from the Demon's Souls port's launcher): a
+# launcher (SDL3 + Dear ImGui) that starts kyty_emulator.exe beside it with the options of settings.ini and shows the
+# metrics window over the game. kyty_emulator itself is built as always.
+option(KYTY_GT7_PORT "Build the Gran Turismo 7 PC launcher (Windows)" OFF)
+if (KYTY_GT7_PORT AND WIN32)
+	enable_language(RC)
+	add_executable(gt7_port WIN32
+		"${KYTY_SOURCE_DIR}/port/gt7-main.cpp"
+		"${KYTY_SOURCE_DIR}/port/gt7-menu.cpp"
+		"${KYTY_SOURCE_DIR}/port/gt7-settings.cpp"
+		"${KYTY_SOURCE_DIR}/port/gt7-i18n.cpp"
+		"${KYTY_SOURCE_DIR}/port/gt7-steam.cpp"
+		"${KYTY_SOURCE_DIR}/port/gt7-port.h"
+		"${KYTY_SOURCE_DIR}/port/gt7-settings.h"
+		"${KYTY_SOURCE_DIR}/port/gt7-i18n.h"
+		"${KYTY_SOURCE_DIR}/port/gt7-steam.h"
+		"${KYTY_THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdl3.cpp"
+		"${KYTY_THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdlrenderer3.cpp"
+		"${KYTY_THIRD_PARTY_DIR}/imgui/misc/cpp/imgui_stdlib.cpp"
+		"${KYTY_SOURCE_DIR}/port/gt7-port.rc")
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/port/gt7-port.rc" APPEND PROPERTY INCLUDE_DIRECTORIES
+		"${CMAKE_CURRENT_SOURCE_DIR}/resources/gt7" "${KYTY_SOURCE_DIR}/port")
+	target_include_directories(gt7_port PRIVATE "${KYTY_SOURCE_DIR}" "${KYTY_THIRD_PARTY_DIR}/imgui" "${KYTY_THIRD_PARTY_DIR}/imgui/backends"
+		"${KYTY_THIRD_PARTY_DIR}/stb")
+	target_compile_definitions(gt7_port PRIVATE UNICODE _UNICODE NOMINMAX)
+	if (KYTY_CLANG_CL OR MSVC)
+		target_compile_options(gt7_port PRIVATE /EHsc /utf-8)
+	endif()
+	target_link_libraries(gt7_port PRIVATE imgui SDL3::SDL3-static nlohmann_json::nlohmann_json
+		ole32 oleaut32 shell32 uuid gdi32 dxgi advapi32 windowscodecs pdh psapi user32 setupapi winmm imm32 version)
+	set_target_properties(gt7_port PROPERTIES OUTPUT_NAME "Gran Turismo 7")
+	add_dependencies(gt7_port kyty_emulator)
+	install(TARGETS gt7_port DESTINATION .)
+	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/resources/gt7/LEEME.txt" DESTINATION .)
+	message(STATUS "Building the Gran Turismo 7 PC launcher (KYTY_GT7_PORT)")
+endif()
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 
