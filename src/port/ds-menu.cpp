@@ -5177,6 +5177,7 @@ struct LogState {
 	std::string kind, ratio, xess_ver, preset, fsr_ver;
 	int         in_h = 0, out_h = 0, native = 0;
 	bool        dlss_ready = false, force4k = false;
+	bool        dlss5_on = false; // (11-11) "DLSS 5: on, evaluate OK" seen in the log
 	int64_t     last_key = -1;
 	std::chrono::steady_clock::time_point last_key_at {};
 };
@@ -5287,6 +5288,7 @@ void Sample(LogState& L,
 			if (L.out_h == 0) L.out_h = 2160;
 		}
 		if (std::regex_search(part, std::regex(R"(DLSS super resolution[^\r\n]*ready)"))) L.dlss_ready = true, L.kind = "DLSS";
+		if (part.find("DLSS 5: on, evaluate OK") != std::string::npos) L.dlss5_on = true; // (11-11)
 		if (std::regex_search(part, mm, re_xess)) {
 			L.xess_ver = mm[1];
 			if (L.kind.empty()) L.kind = "XeSS";
@@ -5410,6 +5412,15 @@ void Sample(LogState& L,
 		else if (L.native != 0) rk = "Nativo", res = Fmt("%dp %s %dp", L.native, arrow, out_h);
 		else rk = scale_label;
 		if (scale_label.rfind("FSR 4", 0) == 0 && rk == "FSR") rk = "FSR 4", mode = scale_label.substr(6), model = "FSR 4 (IA, modelo v07)";
+		// (11-11) DLSS 5 in the Modelo row: the level it was launched with; "activo" once the log says it evaluates.
+		if (!g_rt.launched.dlss5.empty() && g_rt.launched.dlss5 != "0") {
+			std::string lvl = g_rt.launched.dlss5;
+			for (int i = 0; i < kDlss5LevelCount; i++)
+				if (g_rt.launched.dlss5 == kDlss5Levels[i].id) lvl = kDlss5Levels[i].label;
+			const std::string d5 = "DLSS 5 " + lvl + (L.dlss5_on ? " activo" : " ...");
+			model = model.empty() ? d5 : model + " + " + d5;
+			if (rk.empty()) rk = "Nativo";
+		}
 		if (!rk.empty()) {
 			const ImU32 col = rk == "DLSS" ? kGreen : rk == "FSR" || rk == "FSR 4" ? kRed : rk == "XeSS" ? kBlue : kOrange;
 			rows.push_back({"Escala", mode.empty() ? rk : rk + dot + mode, col});
