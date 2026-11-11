@@ -1007,9 +1007,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
-    // bb-objmv-gpu: the guest frame ended (object vector history, bb_objmv2.h).
-    BB::ObjMv2::OnFlip();
-
     const auto bb_t0 = std::chrono::steady_clock::now();
     Frame* frame = GetRenderFrame();
     bb_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bb_t0)
@@ -1311,6 +1308,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         BbDestroyGenerated(frame);
     }
     bb_sr->FrameEnd(draw_scheduler.CommandBuffer());
+    // bb-objmv-gpu3: the guest frame ended, after its compose pass (bb_sr->Run) was recorded.
+    BB::ObjMv2::OnFlip();
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};

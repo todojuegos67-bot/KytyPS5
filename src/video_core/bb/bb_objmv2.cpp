@@ -36,7 +36,7 @@ constexpr u64 kArenaBytes = 24ull << 20;        // snapshots a frame
 constexpr u64 kTableBytes = 2ull << 20;         // table entries a frame
 constexpr u64 kHeaderBytes = 4096;              // zero entry + dummy dword
 constexpr u32 kMaxSnapBytes = 64u << 10;        // larger buffers: read the current one
-constexpr u32 kStatWords = 12;
+constexpr u32 kStatWords = 12; // word 11: attachment 7 texels != 0
 constexpr u64 kStatPeriod = 60;                 // statistics / check frame: 1 in 60
 constexpr u32 kStaticSample = 4;                // check frames: 1 static draw in 4 checked
 
@@ -119,6 +119,8 @@ struct State {
     u32 frame_vec_draws = 0, static_seen = 0;
     std::array<bool, kSlots> slot_stat{};
     double ts_period = 1.0;
+    u64 sec_nonzero = 0, sec_stat_frames = 0, sec_not_composed = 0;
+    bool logged_nonzero = false, logged_not_composed = false;
 } g;
 
 bool EnvOff(const char* name) {
@@ -252,6 +254,14 @@ void ReadStats(u32 slot) {
     g.sec_static_px += s[8];
     g.sec_static_abs += s[9];
     g.sec_static_zero += s[10];
+    if (g.slot_stat[slot]) {
+        g.sec_nonzero += s[11];
+        ++g.sec_stat_frames;
+    }
+    if (g.slot_stat[slot] && !g.logged_nonzero) {
+        g.logged_nonzero = true;
+        Log(fmt::format("attachment 7: {} non-zero texels in the first statistics frame", s[11]));
+    }
     std::array<u64, 2> ts{};
     const auto r = g.device.getQueryPoolResults(g.queries, slot * 2, 2, sizeof(ts), ts.data(),
                                                 sizeof(u64), vk::QueryResultFlagBits::e64);
@@ -755,6 +765,13 @@ void OnFlip() {
     ++g.frame;
     ++g.sec_frames;
     const bool had_pass = g.cleared;
+    if (had_pass && !g.composed) {
+        ++g.sec_not_composed;
+        if (!g.logged_not_composed) {
+            g.logged_not_composed = true;
+            Log("frame ended with a motion pass but no compose pass");
+        }
+    }
     // History = exactly this frame, if it had the pass (and no camera cut).
     if (had_pass && !g.reset_pending) {
         std::swap(g.map_prev, g.map_cur);
@@ -809,7 +826,8 @@ void OnFlip() {
         "(blended {:.1f}%), GPU {:.3f} ms (compose), {:.3f} ms on check frames, skipped {}, CPU "
         "{:.3f} us/draw added, history resets {}, frames {}, overflow {} | {} | mode {} | "
         "static-draw error {:.3f} px over {} px ({}; |obj-cam| {:.3f}, |obj| {:.3f}) | check: {} "
-        "px, reprojection error obj {:.4f} vs cam {:.4f} ({}), obj better {} / cam better {}",
+        "px, reprojection error obj {:.4f} vs cam {:.4f} ({}), obj better {} / cam better {} | "
+        "attachment 7 non-zero texels {:.0f}/frame, frames not composed {}",
         g.sec_vec_draws, g.sec_draws, g.sec_diag_draws, cov,
         g.sec_px_all ? 100.0 * double(g.sec_px_blend) / double(g.sec_px_all) : 0.0,
         g.sec_gpu_n ? g.sec_gpu_ms / g.sec_gpu_n : 0.0,
@@ -821,7 +839,10 @@ void OnFlip() {
         g.sec_static_px == 0 ? "no static px" : (st_err <= 0.5 ? "PASS" : "FAIL"), st_abs, st_zero,
         g.sec_chk, eo, ec,
         g.sec_chk == 0 ? "no differing px" : (eo <= ec ? "OBJECT VECTORS WIN" : "CAMERA WINS"),
-        g.sec_wo, g.sec_wc));
+        g.sec_wo, g.sec_wc,
+        g.sec_stat_frames ? double(g.sec_nonzero) / double(g.sec_stat_frames) : 0.0,
+        g.sec_not_composed));
+    g.sec_nonzero = g.sec_stat_frames = g.sec_not_composed = 0;
     g.sec_draws = g.sec_vec_draws = g.sec_resets = g.sec_frames = g.sec_overflow = 0;
     for (u32 c = 0; c < CatCount; ++c) g.sec_cat[c] = g.sec_cat_vec[c] = 0;
     g.sec_cpu_ns = 0;
