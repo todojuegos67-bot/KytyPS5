@@ -235,7 +235,7 @@ void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFl
 // (Re)create `image` as a sampled copy target like `source`; with `attachment`, a color
 // attachment too where the format allows it (*attachment tells).
 void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view,
-               const VulkanImage& source, bool* attachment, bool storage = false) {
+               const VulkanImage& source, bool* attachment, bool storage) {
 	if (image.image != nullptr && image.format == source.format &&
 	    image.extent.width == source.extent.width && image.extent.height == source.extent.height) {
 		return;

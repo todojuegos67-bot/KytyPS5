@@ -215,7 +215,7 @@ void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInpu
 // them: `image` (re)made as a sampled copy target like `source`, with its view (with `attachment`, a color attachment
 // too where the format allows it, *attachment tells); a barrier from `image`'s state to `layout`, `access` at `stage`.
 void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view, const VulkanImage& source,
-               bool* attachment = nullptr);
+               bool* attachment = nullptr, bool storage = false);
 void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
                 vk::AccessFlags2 access, vk::PipelineStageFlags2 stage);
 
