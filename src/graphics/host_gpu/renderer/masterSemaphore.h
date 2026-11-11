@@ -36,6 +36,9 @@ public:
 	void Poll();
 	// Blocking waits are timed per call site and printed every 5 s ("GPU waits (5 s)").
 	void Wait(uint64_t tick, std::source_location where = std::source_location::current());
+	// A blocking wait on another GPU semaphore (the copy-queue readback timeline), counted in the
+	// same "GPU waits (5 s)" list by call site and thread.
+	static void NoteBlockingWait(const std::source_location& where, int64_t us);
 
 private:
 	GraphicContext&       m_graphics;

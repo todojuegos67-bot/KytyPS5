@@ -74,6 +74,12 @@ public:
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
+	// Highest tick whose command buffer the driver has accepted (vkQueueSubmit returned), on any
+	// thread (the recording thread submits with KYTY_RECORD_THREAD). A submission on another queue
+	// may wait for any tick up to this one without a wait-before-signal on the master semaphore.
+	[[nodiscard]] uint64_t DriverSubmittedTick() const noexcept {
+		return m_driver_submitted_tick.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 	// Steady-clock time of the last vkQueueSubmit, in microseconds.
@@ -195,6 +201,7 @@ private:
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 	std::atomic<int64_t>         m_last_submit_us {0};
+	std::atomic<uint64_t>        m_driver_submitted_tick {0};
 
 	// Recording thread state. m_chunk and m_threaded belong to the recording side's producer (the
 	// thread that owns the scheduler); the queue, the free list and the counters are guarded by

@@ -929,6 +929,12 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		                  debug.arg1, debug.arg2, debug.arg3, debug.arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	{
+		auto known = m_driver_submitted_tick.load(std::memory_order_relaxed);
+		while (known < tick && !m_driver_submitted_tick.compare_exchange_weak(
+		                           known, tick, std::memory_order_release, std::memory_order_relaxed)) {
+		}
+	}
 	m_gpu_timer->Submitted(tick);
 }
 

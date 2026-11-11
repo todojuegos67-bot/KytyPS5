@@ -129,6 +129,10 @@ void NoteWaitSite(const std::source_location& where, int64_t us) {
 
 } // namespace
 
+void MasterSemaphore::NoteBlockingWait(const std::source_location& where, int64_t us) {
+	NoteWaitSite(where, us);
+}
+
 void MasterSemaphore::Poll() {
 	static auto& poll_us  = Common::LiveSwitches::Get("KYTY_TICK_POLL_US", 0);
 	const auto   interval = poll_us.load(std::memory_order_relaxed);

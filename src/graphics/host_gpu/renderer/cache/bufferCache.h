@@ -15,6 +15,8 @@
 #include <map>
 #include <memory>
 #include <shared_mutex>
+#include <source_location>
+#include <atomic>
 #include <span>
 #include <utility>
 #include <vector>
@@ -211,19 +213,59 @@ private:
 		uint64_t begin = 0;
 		uint64_t end   = 0;
 		uint64_t tick  = 0;
+		// KYTY_CQ_ASYNC: the copy-queue timeline value of an asynchronous copy-queue download
+		// (0 = a main-queue download published at `tick`) and its staging slot.
+		uint64_t cq    = 0;
+		uint32_t slot  = UINT32_MAX;
 	};
 	// The asynchronous readback of a guest thread's fault (KYTY_ASYNC_WRITE_READBACK for writes,
-	// KYTY_ASYNC_READBACK for reads).
+	// KYTY_ASYNC_READBACK for reads). Returns the token the guest waits for: a master tick, or,
+	// when cq_value is set, the copy-queue timeline value (WaitAsyncCopy).
 	[[nodiscard]] uint64_t BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_write,
-	                                          uint64_t& window_begin, uint64_t& window_end);
+	                                          uint64_t& window_begin, uint64_t& window_end,
+	                                          uint64_t& cq_value);
 	// False when `snapshot` and the GPU wrote the page again: the caller reads the downloaded
 	// bytes.
 	bool FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_write, uint64_t window_begin,
-	                         uint64_t window_end, uint64_t tick, bool snapshot = false);
+	                         uint64_t window_end, uint64_t tick, bool snapshot = false,
+	                         uint64_t cq_value = 0);
+	// KYTY_CQ_ASYNC (see bufferCache.cpp): copy-queue downloads for guest faults that Thread_Gpu
+	// submits without waiting for them. Each in-flight download owns a staging slot until the
+	// pending readback that holds it is completed (published to guest memory) on Thread_Gpu.
+	struct AsyncCopySlot {
+		vk::CommandBuffer           command = nullptr;
+		std::unique_ptr<Buffer>     staging;
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    buffer_address = 0;
+		uint64_t                    total_size     = 0;
+		uint64_t                    value          = 0;
+		bool                        busy           = false;
+	};
+	struct AsyncCopyQueue {
+		vk::CommandPool            pool     = nullptr;
+		vk::Semaphore              timeline = nullptr;
+		uint64_t                   submitted = 0; // GPU thread: last value submitted
+		std::atomic<uint64_t>      completed {0}; // any thread: last value known complete
+		std::vector<AsyncCopySlot> slots;
+	};
+	AsyncCopyQueue m_async_cq;
+	// GPU thread: records and submits the window's GPU-written bytes on the readback queue behind
+	// the buffer's last writer (completed or already handed to the driver); the bytes move from
+	// GPU-written to downloading. False (nothing changed) when it cannot.
+	[[nodiscard]] bool TryAsyncCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
+	                                             uint64_t window_end, uint64_t& cq_value,
+	                                             uint32_t& slot);
+	// GPU thread: writes a finished slot's bytes to guest memory and frees the slot.
+	void PublishAsyncCopy(uint32_t slot);
+	// Any thread: blocks until the copy-queue timeline reaches `value`.
+	void WaitAsyncCopy(uint64_t value, std::source_location where = std::source_location::current());
+	[[nodiscard]] bool AsyncCopyDone(uint64_t value);
 	// Reads served from a download the GPU overwrote afterwards (KYTY_ASYNC_READ_SNAPSHOT).
 	uint64_t               m_snapshot_reads = 0;
 	void                   CompletePendingWriteReadback(size_t index);
 	void                   CompletePendingWriteReadbacks(uint64_t begin, uint64_t end);
+	// GPU thread: completes the KYTY_CQ_ASYNC readbacks that share bytes with [begin, end).
+	void                   CompleteAsyncCopies(uint64_t begin, uint64_t end);
 	[[nodiscard]] bool     OverlapsPendingWriteReadback(uint64_t begin, uint64_t end) const;
 
 	// KYTY_BDA_VERIFY (research): compares the GPU's BDA page table with the host's expectation.
