@@ -95,12 +95,14 @@ struct Ring {
     bool skinned = true;
     std::array<u64, 16> entries{}; // [ring+0x10][i], [ring+0x18][i]
     u32 count = 0;
+    u32 valid_arrays = 0;
     u64 mapped_frame = 0;
 };
 std::unordered_map<u64, Ring> g_rings;
-std::map<u64, u64> g_ring_addr; // palette buffer GPU address -> ring (draws read inside it)
+std::map<u64, std::pair<u64, u64>> g_ring_addr; // palette buffer address -> (ring, last seen)
 constexpr u64 kRingSpan = 0x10000;
-std::atomic<int> g_ring_offset{-1};       // -1: entries are the addresses; else [entry + offset]
+std::atomic<int> g_ring_offset{-1};
+u64 g_present = 1, g_map_present = 0;       // -1: entries are the addresses; else [entry + offset]
 std::vector<u64> g_missed;                // palette addresses of draws without identity (learning)
 u64 st_ring_calls = 0, st_ring_hits = 0, st_ring_miss = 0;
 
@@ -441,29 +443,40 @@ void GuestSkinRing(u64 ring, u64 bones) {
         r.frame = frame;
         r.n = n;
         r.skinned = n > 1;
-        if (fresh && slots >= 1 && slots <= 8) {
-            const u64 a = *reinterpret_cast<const u64*>(ring + 0x10);
-            const u64 b = *reinterpret_cast<const u64*>(ring + 0x18);
-            auto* memory = Core::Memory::Instance();
-            r.count = 0;
-            for (const u64 arr : {a, b}) {
-                if (arr == 0 || memory == nullptr || !memory->IsValidMapping(arr, u64(slots) * 8)) {
-                    continue;
+        if (slots >= 1 && slots <= 8) {
+            const u64 arr[2] = {*reinterpret_cast<const u64*>(ring + 0x10),
+                                *reinterpret_cast<const u64*>(ring + 0x18)};
+            if (fresh) {
+                auto* memory = Core::Memory::Instance();
+                r.valid_arrays = 0;
+                for (u32 k = 0; k < 2; ++k) {
+                    if (arr[k] != 0 && memory != nullptr &&
+                        memory->IsValidMapping(arr[k], u64(slots) * 8)) {
+                        r.valid_arrays |= 1u << k;
+                    }
                 }
+                r.mapped_frame = frame;
+            }
+            r.count = 0;
+            for (u32 k = 0; k < 2; ++k) {
+                if ((r.valid_arrays & (1u << k)) == 0) continue;
                 for (s32 i = 0; i < slots; ++i) {
-                    r.entries[r.count++] = reinterpret_cast<const u64*>(arr)[i];
+                    r.entries[r.count++] = reinterpret_cast<const u64*>(arr[k])[i];
                 }
             }
-            r.mapped_frame = frame;
             const int off = g_ring_offset.load();
+            const int o = off & 0xfff;
+            auto* memory = Core::Memory::Instance();
             for (u32 i = 0; i < r.count; ++i) {
                 u64 addr = r.entries[i];
-                const int o = off & 0xfff;
-                if (off >= 0 && addr != 0 && memory->IsValidMapping(addr, u64(o) + 8)) {
+                if (off >= 0) {
+                    if (addr == 0 || memory == nullptr || !memory->IsValidMapping(addr, u64(o) + 8)) {
+                        continue;
+                    }
                     addr = *reinterpret_cast<const u64*>(addr + o);
                     if (off & 0x1000) addr = VsharpBase(addr);
                 }
-                if (addr != 0) g_ring_addr[addr] = ring;
+                if (addr != 0) g_ring_addr[addr] = {ring, g_present};
             }
         }
     }
@@ -478,6 +491,30 @@ DrawId LookupPalette(u64 palette_address) {
     DrawId id{};
     if (!On() || palette_address == 0) return id;
     std::scoped_lock lk{g_mx};
+    if (g_map_present != g_present) {
+        // The slots' buffer objects may move their memory on every update: map them again once a
+        // frame, reading where each entry keeps its GPU address now.
+        g_map_present = g_present;
+        for (auto e = g_ring_addr.begin(); e != g_ring_addr.end();) {
+            e = e->second.second + 8 < g_present ? g_ring_addr.erase(e) : std::next(e);
+        }
+        auto* memory = Core::Memory::Instance();
+        const int off = g_ring_offset.load();
+        const int o = off & 0xfff;
+        for (const auto& [ring, r] : g_rings) {
+            for (u32 i = 0; i < r.count; ++i) {
+                u64 addr = r.entries[i];
+                if (off >= 0) {
+                    if (addr == 0 || memory == nullptr || !memory->IsValidMapping(addr, u64(o) + 8)) {
+                        continue;
+                    }
+                    addr = *reinterpret_cast<const u64*>(addr + o);
+                    if (off & 0x1000) addr = VsharpBase(addr);
+                }
+                if (addr != 0) g_ring_addr[addr] = {ring, g_present};
+            }
+        }
+    }
     auto it = g_ring_addr.upper_bound(palette_address);
     if (it != g_ring_addr.begin()) --it;
     if (it == g_ring_addr.end() || it->first > palette_address ||
@@ -486,12 +523,12 @@ DrawId LookupPalette(u64 palette_address) {
         if (!g_rings.empty() && g_missed.size() < 256) g_missed.push_back(palette_address);
         return id;
     }
-    const auto r = g_rings.find(it->second);
+    const auto r = g_rings.find(it->second.first);
     if (r == g_rings.end()) return id;
     ++st_ring_hits;
     bool recent = false;
     const int state = Classify(r->second.bones, r->second.frame, recent);
-    id.key = Mix(it->second, 0x72696e67ull);
+    id.key = Mix(it->second.first, 0x72696e67ull);
     id.moving = state == 1;
     id.recent = recent || state == 1;
     id.skinned = r->second.skinned;
@@ -574,6 +611,10 @@ void NoteVectorDraw(bool with_previous) {
 void OnPresent() {
     PollLive();
     ++st_frames;
+    {
+        std::scoped_lock lk{g_mx};
+        ++g_present;
+    }
     const auto now = Clock::now();
     const double sec = std::chrono::duration<double>(now - st_t0).count();
     if (sec < 1.0) return;
@@ -629,8 +670,7 @@ void OnPresent() {
                                     best_votes);
             if (best_votes >= 2 && best_votes > votes[32]) {
                 g_ring_offset.store(int(best * 8) + (vs ? 0x1000 : 0));
-                g_ring_addr.clear();
-                for (auto& [ring, r] : g_rings) r.count = 0;
+                g_map_present = 0;
                 ring_text += fmt::format(" -> palette address at [entry+0x{:x}]", best * 8);
             }
         }
@@ -648,10 +688,6 @@ void OnPresent() {
             } else {
                 ++it;
             }
-        }
-        if (g_ring_addr.size() > 65536) {
-            g_ring_addr.clear();
-            for (auto& [ring, r] : g_rings) r.count = 0;
         }
     }
     const u64 hook_calls = st_hook_calls.exchange(0), emits = st_emit_calls.exchange(0);
