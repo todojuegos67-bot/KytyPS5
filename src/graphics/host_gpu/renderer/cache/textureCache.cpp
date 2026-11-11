@@ -1,3 +1,4 @@
+#include "graphics/phaseStats.h"
 #include "graphics/drawDiff.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
@@ -1189,6 +1190,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	PhaseStats::Scope upload_phase(PhaseStats::PhUploadImage);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {

@@ -53,6 +53,8 @@ enum Phase : int {
 	PhProgRecompile,
 	PhMemoHit,
 	PhMemoMiss,
+	PhUploadBuffer,
+	PhUploadImage,
 	Count
 };
 
@@ -64,7 +66,7 @@ inline const char* const kNames[Count] = {"gpu.idle",       "gpu.cmd",       "gp
                                           "draw.pipeline", "draw.targets", "draw.commit", "dispatch.total", "dispatch.bindings",
                                           "state.shaders", "state.targets", "prog.key", "prog.lookup",
                                           "prog.materialize", "prog.find", "prog.recompile",
-                                          "memo.hit", "memo.miss"};
+                                          "memo.hit", "memo.miss", "upload.buffer", "upload.image"};
 
 // wolv-perf-1111c: one cache line per phase. The counters sat in two packed arrays updated by
 // Thread_Gpu (draw.*, prog.*, ~15 scopes a draw) and by every faulting guest thread at once, so the
