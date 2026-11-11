@@ -716,6 +716,7 @@ struct PipelineCache::ProgramCache {
 		uint8_t  word  = 0; // the user-data word it copies
 		uint16_t dword = 0;
 		uint32_t index = 0;
+		uint32_t offset = 0; // the snapshot word = user-data word + offset (mod 2^32)
 		bool     operator==(const PatchPosition&) const = default;
 	};
 	struct SourceEntry {
@@ -761,6 +762,9 @@ struct PipelineCache::ProgramCache {
 			std::array<uint8_t, 64>                      learned {};
 			// Snapshot words that are verbatim copies of a user-data word.
 			std::vector<PatchPosition>                   positions;
+			// Per read of `log`: -1 at a fixed address, else the user-data word whose 32-bit change
+			// moves its address by the same amount (a pointer into a ring of tables).
+			std::vector<int8_t>                          read_word;
 			uint32_t                                     since_check = 0;
 		} patch;
 	};
@@ -791,7 +795,8 @@ struct PipelineCache::ProgramCache {
 	uint64_t patch_hits = 0, patch_checks = 0, patch_check_mismatch = 0, patch_verify_mismatch = 0;
 	uint64_t patch_no_base = 0, patch_unlearned = 0, patch_reads_changed = 0, patch_banned_programs = 0;
 	uint64_t patch_obs_ok = 0, patch_obs_log = 0, patch_obs_spec = 0, patch_obs_other = 0, patch_obs_unexplained = 0;
-	uint64_t patch_obs_many = 0, patch_obs_memory = 0;
+	uint64_t patch_obs_many = 0, patch_obs_memory = 0, patch_obs_ambiguous = 0, patch_obs_shape = 0;
+	uint64_t patch_relocated_reads = 0;
 	std::chrono::steady_clock::time_point patch_report = std::chrono::steady_clock::now();
 
 	static uint32_t* PatchSlot(ShaderRecompiler::IR::ResourceSnapshot& r, const PatchPosition& p) {
@@ -823,6 +828,10 @@ struct PipelineCache::ProgramCache {
 		return !entry.used_computed || (i < entry.used_user_data.size() && entry.used_user_data[i] != 0);
 	}
 
+	static int64_t WordDelta(uint32_t now, uint32_t before) {
+		return static_cast<int64_t>(static_cast<int32_t>(now - before));
+	}
+
 	// The patched result into entry.resources/specialization, or false (nothing changed).
 	bool TryPatch(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime, ShaderReadChunks& reads) {
 		auto& pt = entry.patch;
@@ -845,15 +854,30 @@ struct PipelineCache::ProgramCache {
 			patch_no_base++;
 			return false; // same inputs: the memo's case
 		}
-		if (!ReadsUnchanged(pt.log, reads)) {
-			patch_reads_changed++;
-			return false;
+		// The logged reads, those that move with a pointer word moved by its change, must read
+		// the same words as in the base evaluation.
+		const auto& log = pt.log;
+		for (size_t r = 0; r < log.reads.size(); r++) {
+			const auto& read    = log.reads[r];
+			uint64_t    address = read.address;
+			if (r < pt.read_word.size() && pt.read_word[r] >= 0) {
+				const auto w = static_cast<size_t>(pt.read_word[r]);
+				address += static_cast<uint64_t>(WordDelta(runtime.user_data[w], pt.key[w]));
+				patch_relocated_reads++;
+			}
+			memo_words.resize(read.count);
+			const bool ok = ReadShaderGuestMemoryImpl(&reads, address, memo_words);
+			if (ok != read.ok || (ok && !std::equal(memo_words.begin(), memo_words.end(),
+			                                        log.words.begin() + read.first))) {
+				patch_reads_changed++;
+				return false;
+			}
 		}
 		entry.resources      = pt.resources;
 		entry.specialization = pt.specialization;
 		for (const auto& position: pt.positions) {
 			if (auto* word = PatchSlot(entry.resources, position); word != nullptr) {
-				*word = runtime.user_data[position.word];
+				*word = runtime.user_data[position.word] + position.offset;
 			}
 		}
 		entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
@@ -867,52 +891,98 @@ struct PipelineCache::ProgramCache {
 	                ShaderReadChunks::ReadLog& log) {
 		auto& pt = entry.patch;
 		if (pt.banned) return;
-		if (pt.valid && pt.key.size() == runtime.user_data.size() && pt.shader_base == runtime.shader_base &&
+		const auto& ud = runtime.user_data;
+		bool keep_relations = true;
+		if (pt.valid && pt.key.size() == ud.size() && pt.shader_base == runtime.shader_base &&
 		    pt.workgroup_count == runtime.workgroup_count && pt.workgroup_size == runtime.workgroup_size) {
 			std::array<uint32_t, 64> changed {};
 			uint32_t                 changed_count = 0;
+			uint64_t                 changed_mask  = 0;
 			bool                     too_many      = false;
 			for (size_t i = 0; i < pt.key.size(); i++) {
-				if (pt.key[i] == runtime.user_data[i] || !UsedWord(entry, i)) continue;
+				if (pt.key[i] == ud[i] || !UsedWord(entry, i)) continue;
 				if (i >= changed.size() || changed_count >= 8) {
 					too_many = true;
 					break;
 				}
 				changed[changed_count++] = static_cast<uint32_t>(i);
+				changed_mask |= uint64_t {1} << i;
 			}
+			// The changed word whose delta is `delta` (32-bit wrap or sign-extended), -1 none, -2 several.
+			const auto candidate = [&](int64_t delta, bool wrap32) -> int {
+				int found = -1;
+				for (uint32_t c = 0; c < changed_count; c++) {
+					const auto w = changed[c];
+					const bool match =
+					    wrap32 ? static_cast<uint32_t>(delta) == ud[w] - pt.key[w] : delta == WordDelta(ud[w], pt.key[w]);
+					if (match) {
+						if (found != -1) return -2;
+						found = static_cast<int>(w);
+					}
+				}
+				return found;
+			};
 			if (too_many) {
 				patch_obs_many++;
 			} else if (changed_count != 0) {
 				const auto& oldr = pt.resources;
 				const auto& newr = entry.resources;
-				int         verdict = 0; // 0 ok, 1 log, 2 spec, 3 other, 4 unexplained
-				bool        positions_broken = false;
-				if (!LogShapesEqual(pt.log, log)) {
-					verdict = 1;
-				} else if (pt.log.words != log.words) {
-					verdict = 5; // guest memory changed between the two: learn nothing, ban nothing
-				} else if (!(pt.specialization == entry.specialization)) {
+				// 0 ok, 1 read shape/address unexplained, 2 spec, 3 other, 4 unexplained snapshot word,
+				// 5 guest words changed, 6 ambiguous (learn nothing, ban nothing)
+				int  verdict          = 0;
+				bool positions_broken = false;
+				patch_scratch.clear();
+				patch_read_scratch.assign(log.reads.size(), -1);
+				bool shape = log.reads.size() == pt.log.reads.size() && log.words.size() == pt.log.words.size();
+				for (size_t r = 0; shape && r < log.reads.size(); r++) {
+					shape = log.reads[r].count == pt.log.reads[r].count && log.reads[r].ok == pt.log.reads[r].ok &&
+					        log.reads[r].first == pt.log.reads[r].first;
+				}
+				if (!shape) {
+					verdict        = 1;
+					keep_relations = false; // a new read structure: relations by index mean nothing
+				}
+				for (size_t r = 0; verdict == 0 && r < log.reads.size(); r++) {
+					const auto delta = static_cast<int64_t>(log.reads[r].address - pt.log.reads[r].address);
+					const int  known = r < pt.read_word.size() ? pt.read_word[r] : -1;
+					if (delta == 0) {
+						if (known >= 0 && ((changed_mask >> known) & 1u) != 0) verdict = 1;
+						continue;
+					}
+					const int w = candidate(delta, false);
+					if (w == -2) {
+						verdict = 6;
+					} else if (w == -1 || (known >= 0 && known != w)) {
+						verdict = 1;
+					} else {
+						patch_read_scratch[r] = static_cast<int8_t>(w);
+					}
+				}
+				if (verdict == 0 && pt.log.words != log.words) {
+					verdict = 5;
+				} else if (verdict == 0 && !(pt.specialization == entry.specialization)) {
 					verdict = 2;
-				} else if (!(oldr.buffer_write_extents == newr.buffer_write_extents) ||
-				           !(oldr.bindless_heaps == newr.bindless_heaps) ||
-				           !(oldr.bindless_sampler_heaps == newr.bindless_sampler_heaps) ||
-				           !(oldr.specialization_reads == newr.specialization_reads) ||
-				           !(oldr.uniform_fill == newr.uniform_fill) || oldr.buffers.size() != newr.buffers.size() ||
-				           oldr.images.size() != newr.images.size() || oldr.samplers.size() != newr.samplers.size() ||
-				           oldr.flattened_srt.size() != newr.flattened_srt.size()) {
+				} else if (verdict == 0 &&
+				           (!(oldr.buffer_write_extents == newr.buffer_write_extents) ||
+				            !(oldr.bindless_heaps == newr.bindless_heaps) ||
+				            !(oldr.bindless_sampler_heaps == newr.bindless_sampler_heaps) ||
+				            !(oldr.specialization_reads == newr.specialization_reads) ||
+				            !(oldr.uniform_fill == newr.uniform_fill) || oldr.buffers.size() != newr.buffers.size() ||
+				            oldr.images.size() != newr.images.size() || oldr.samplers.size() != newr.samplers.size() ||
+				            oldr.flattened_srt.size() != newr.flattened_srt.size())) {
 					verdict = 3;
 				}
-				patch_scratch.clear();
 				const auto explain = [&](uint8_t kind, uint32_t index, uint32_t dword, uint32_t before, uint32_t after) {
 					if (before == after) return true;
-					for (uint32_t c = 0; c < changed_count; c++) {
-						const auto w = changed[c];
-						if (pt.key[w] == before && runtime.user_data[w] == after) {
-							patch_scratch.push_back({kind, static_cast<uint8_t>(w), static_cast<uint16_t>(dword), index});
-							return true;
-						}
+					const int w = candidate(static_cast<int64_t>(after - before), true);
+					if (w == -2) {
+						verdict = 6;
+						return false;
 					}
-					return false;
+					if (w == -1) return false;
+					patch_scratch.push_back({kind, static_cast<uint8_t>(w), static_cast<uint16_t>(dword), index,
+					                         before - pt.key[static_cast<size_t>(w)]});
+					return true;
 				};
 				const auto descriptors = [&](uint8_t kind, const auto& a, const auto& b) {
 					for (uint32_t i = 0; i < a.size(); i++) {
@@ -929,19 +999,18 @@ struct PipelineCache::ProgramCache {
 					for (uint32_t i = 0; ok && i < oldr.flattened_srt.size(); i++) {
 						ok = explain(3, i, 0, oldr.flattened_srt[i], newr.flattened_srt[i]);
 					}
-					if (!ok) verdict = 4;
+					if (!ok && verdict == 0) verdict = 4;
 				}
-				// Every position learned earlier must still copy its word, whatever changed.
-				for (const auto& position: (verdict == 0 || verdict == 4) ? pt.positions : patch_scratch_empty) {
-					const auto* word = PatchSlot(entry.resources, position);
-					if (word == nullptr || position.word >= runtime.user_data.size() ||
-					    *word != runtime.user_data[position.word]) {
-						positions_broken = true;
-						break;
+				// Every position learned earlier must still hold its word plus offset.
+				if (verdict == 0 || verdict == 4) {
+					for (const auto& position: pt.positions) {
+						const auto* word = PatchSlot(entry.resources, position);
+						if (word == nullptr || position.word >= ud.size() || *word != ud[position.word] + position.offset) {
+							positions_broken = true;
+							break;
+						}
 					}
-				}
-				if (positions_broken && verdict == 0) {
-					verdict = 4;
+					if (positions_broken && verdict == 0) verdict = 4;
 				}
 				if (verdict == 0) {
 					patch_obs_ok++;
@@ -950,12 +1019,20 @@ struct PipelineCache::ProgramCache {
 							pt.positions.push_back(position);
 						}
 					}
+					pt.read_word.resize(log.reads.size(), -1);
+					for (size_t r = 0; r < log.reads.size(); r++) {
+						if (patch_read_scratch[r] >= 0) pt.read_word[r] = patch_read_scratch[r];
+					}
 					for (uint32_t c = 0; c < changed_count; c++) {
 						auto& learned = pt.learned[changed[c]];
 						if (learned < PatchLearnedNeeded) learned++;
 					}
 				} else if (verdict == 5) {
 					patch_obs_memory++;
+				} else if (verdict == 6) {
+					patch_obs_ambiguous++;
+				} else if (verdict == 1 && !keep_relations) {
+					patch_obs_shape++;
 				} else {
 					(verdict == 1 ? patch_obs_log
 					              : verdict == 2 ? patch_obs_spec : verdict == 3 ? patch_obs_other : patch_obs_unexplained)++;
@@ -963,23 +1040,32 @@ struct PipelineCache::ProgramCache {
 						pt.learned[changed[c]] = PatchBanned;
 					}
 					if (positions_broken) {
-						pt.banned = true; // a learned copy stopped holding: trust nothing learned here
+						pt.banned = true; // a learned relation stopped holding: trust nothing learned here
 						patch_banned_programs++;
 					}
 				}
 			}
 		}
+		if (!keep_relations) {
+			// The read structure changed: what was learned by read index or snapshot index is void.
+			pt.read_word.clear();
+			pt.positions.clear();
+			for (auto& learned: pt.learned) {
+				if (learned != PatchBanned) learned = 0;
+			}
+		}
 		pt.valid = true;
-		pt.key.assign(runtime.user_data.begin(), runtime.user_data.end());
+		pt.key.assign(ud.begin(), ud.end());
 		pt.shader_base     = runtime.shader_base;
 		pt.workgroup_count = runtime.workgroup_count;
 		pt.workgroup_size  = runtime.workgroup_size;
 		pt.log             = log;
+		pt.read_word.resize(log.reads.size(), -1);
 		pt.resources       = entry.resources;
 		pt.specialization  = entry.specialization;
 	}
+	std::vector<int8_t>        patch_read_scratch;
 	std::vector<PatchPosition> patch_scratch;
-	const std::vector<PatchPosition> patch_scratch_empty;
 
 	// Patch, check or verify; true when entry.resources/specialization hold the result.
 	bool MaterializeWithPatch(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
@@ -1041,7 +1127,8 @@ struct PipelineCache::ProgramCache {
 		::printf("Memo patch (5 s, KYTY_MEMO_PATCH=%lld): %llu lookups patched instead of evaluated (est. saved %.0f ms "
 		         "at the memo.miss us/call); declined: %llu no base/same inputs, %llu a changed word not learned, %llu "
 		         "logged reads changed; learning: %llu consistent, inconsistent %llu reads / %llu specialization / %llu "
-		         "other fields / %llu unexplained words, %llu too many words changed, %llu guest words changed; checks %llu, mismatches %llu "
+		         "other fields / %llu unexplained words, %llu too many words changed, %llu guest words changed, %llu ambiguous, "
+		         "%llu new read structure; %llu reads relocated with a pointer word; checks %llu, mismatches %llu "
 		         "(%llu programs banned), verify mismatches %llu\n",
 		         static_cast<long long>(MemoPatchMode()), static_cast<unsigned long long>(patch_hits),
 		         static_cast<double>(patch_hits) * 9.5 / 1000.0, static_cast<unsigned long long>(patch_no_base),
@@ -1049,12 +1136,14 @@ struct PipelineCache::ProgramCache {
 		         static_cast<unsigned long long>(patch_obs_ok), static_cast<unsigned long long>(patch_obs_log),
 		         static_cast<unsigned long long>(patch_obs_spec), static_cast<unsigned long long>(patch_obs_other),
 		         static_cast<unsigned long long>(patch_obs_unexplained), static_cast<unsigned long long>(patch_obs_many),
-		         static_cast<unsigned long long>(patch_obs_memory),
+		         static_cast<unsigned long long>(patch_obs_memory), static_cast<unsigned long long>(patch_obs_ambiguous),
+		         static_cast<unsigned long long>(patch_obs_shape), static_cast<unsigned long long>(patch_relocated_reads),
 		         static_cast<unsigned long long>(patch_checks), static_cast<unsigned long long>(patch_check_mismatch),
 		         static_cast<unsigned long long>(patch_banned_programs), static_cast<unsigned long long>(patch_verify_mismatch));
 		patch_hits = patch_checks = patch_check_mismatch = patch_verify_mismatch = 0;
 		patch_no_base = patch_unlearned = patch_reads_changed = patch_banned_programs = 0;
 		patch_obs_ok = patch_obs_log = patch_obs_spec = patch_obs_other = patch_obs_unexplained = patch_obs_many = patch_obs_memory = 0;
+		patch_obs_ambiguous = patch_obs_shape = patch_relocated_reads = 0;
 		std::fflush(stdout);
 	}
 
