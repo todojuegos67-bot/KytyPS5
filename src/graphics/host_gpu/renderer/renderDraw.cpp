@@ -40,6 +40,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <type_traits>
+#include <xxhash.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -967,6 +970,182 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
 }
 
+// --- KYTY_NATIVE_REPLAY (wolv-draw-1111c; live, default 0 = off) --------------------------------
+// Draw records after Demon's Souls' native XPR records, in the part this tree can prove without the
+// buffer tracker's region epochs: the shader state. A record is keyed on every register the
+// program lookups read (VS/PS stage registers with their user data, the whole graphics context
+// with the shader registers, the user configuration, the color output mask and whether the pixel
+// shader runs); it holds the programs, the stage input infos and, per stage, a copy of the
+// resource snapshot with the read log of the evaluation behind it. A draw whose key has a record
+// whose every logged guest word still reads the same takes the record instead of RefreshShaders
+// (shader map lookups, program keys, lookups, resource memo, permutation search). Everything
+// after (targets, buffers, images, descriptors) runs as before, so coherence is untouched.
+// A record is stored on the second sighting of its key, only from lookups that are exact
+// (memo hits, stored misses, same-input reuses; no patched or bypassed evaluation, no new
+// program). 2 = verify: the normal path runs and its programs and snapshots are compared with
+// the record ("mismatches"). Log: "Native replay (5 s, ...)", phase "replay.hit".
+namespace {
+struct DrawReplayRecord {
+	PipelineCache::GraphicsPrograms      programs;
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	ShaderPixelInputInfo                 ps_input_info;
+	PipelineCache::ReplayStages          stages; // one per stage runtime, in lookup order
+	uint64_t                             uses = 0;
+};
+struct DrawReplayStore {
+	std::unordered_map<uint64_t, std::unique_ptr<DrawReplayRecord>> records;
+	std::unordered_map<uint64_t, uint32_t>                           seen;
+	uint64_t lookups = 0, hits = 0, no_record = 0, stale = 0, stored = 0, not_capturable = 0;
+	uint64_t verified = 0, mismatches = 0, first_sightings = 0;
+	std::chrono::steady_clock::time_point report = std::chrono::steady_clock::now();
+};
+DrawReplayStore& ReplayStore() {
+	static DrawReplayStore store;
+	return store;
+}
+template <typename T>
+void HashBytes(uint64_t& h, const T& value) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	h = XXH3_64bits_withSeed(&value, sizeof(T), h);
+}
+uint64_t DrawReplayKey(const CommandBuffer& buffer, uint32_t color_output_mask, bool ps_active) {
+	uint64_t h = 0x6b7974795265706cull;
+	HashBytes(h, buffer.GetShaders().GetVs());
+	HashBytes(h, buffer.GetShaders().GetPs());
+	HashBytes(h, buffer.GetRegisters());
+	HashBytes(h, buffer.GetUserConfig());
+	const uint64_t extra = (static_cast<uint64_t>(color_output_mask) << 1u) | (ps_active ? 1u : 0u);
+	HashBytes(h, extra);
+	return h;
+}
+// The stage runtimes of a prepared state, in program lookup order (pixel first, then vertex).
+template <typename State>
+std::array<ShaderStageRuntime*, 4> DrawReplayRuntimes(State& state, uint32_t& count) {
+	std::array<ShaderStageRuntime*, 4> out {};
+	count = 0;
+	if (state.ps_active && state.programs.pixel) {
+		out[count++] = &state.ps_input_info.stage;
+	}
+	for (uint32_t i = 0; i < state.programs.VertexStageCount(); i++) {
+		if (state.programs.vertex[i]) {
+			out[count++] = &state.vertex_info[i].stage;
+		}
+	}
+	return out;
+}
+void ReportReplay(int64_t mode) {
+	auto&      st  = ReplayStore();
+	const auto now = std::chrono::steady_clock::now();
+	if (now - st.report < std::chrono::seconds(5)) {
+		return;
+	}
+	st.report = now;
+	::printf("Native replay (5 s, KYTY_NATIVE_REPLAY=%lld): %llu draws looked up, %llu replayed (RefreshShaders "
+	         "skipped), %llu without a record (%llu first sightings), %llu records stale (guest words changed), %llu "
+	         "stored, %llu not capturable; verify: %llu compared, %llu mismatches; %zu records\n",
+	         static_cast<long long>(mode), static_cast<unsigned long long>(st.lookups),
+	         static_cast<unsigned long long>(st.hits), static_cast<unsigned long long>(st.no_record),
+	         static_cast<unsigned long long>(st.first_sightings), static_cast<unsigned long long>(st.stale),
+	         static_cast<unsigned long long>(st.stored), static_cast<unsigned long long>(st.not_capturable),
+	         static_cast<unsigned long long>(st.verified), static_cast<unsigned long long>(st.mismatches),
+	         st.records.size());
+	std::fflush(stdout);
+	st.lookups = st.hits = st.no_record = st.stale = st.stored = st.not_capturable = 0;
+	st.verified = st.mismatches = st.first_sightings = 0;
+}
+} // namespace
+
+// RefreshShaders through the replay records (KYTY_NATIVE_REPLAY).
+static void RefreshShadersReplay(CommandBuffer& buffer, const DrawCallInfo& draw, uint32_t color_output_mask,
+                                 DrawRenderState& state, int64_t mode) {
+	auto&      store = ReplayStore();
+	auto&      cache = buffer.GetContext().GetPipelineCache();
+	const auto key   = DrawReplayKey(buffer, color_output_mask, state.ps_active);
+	store.lookups++;
+	DrawReplayRecord* record = nullptr;
+	if (auto found = store.records.find(key); found != store.records.end()) {
+		PhaseStats::Scope hit_phase {PhaseStats::PhReplayHit};
+		if (cache.ReplayStagesCurrent(found->second->stages)) {
+			record = found->second.get();
+			if (mode == 1) {
+				state.programs      = record->programs;
+				state.vertex_info   = record->vertex_info;
+				state.ps_input_info = record->ps_input_info;
+				uint32_t count      = 0;
+				auto     runtimes   = DrawReplayRuntimes(state, count);
+				for (uint32_t i = 0; i < count && i < record->stages.size(); i++) {
+					runtimes[i]->program   = PipelineCache::ReplayStageProgram(*record->stages[i]);
+					runtimes[i]->resources = PipelineCache::ReplayStageResources(*record->stages[i]);
+				}
+				record->uses++;
+				store.hits++;
+				ReportReplay(mode);
+				return;
+			}
+		} else {
+			store.stale++;
+		}
+	} else {
+		store.no_record++;
+	}
+	cache.ReplayCaptureBegin();
+	RefreshShaders(buffer, draw, color_output_mask, state);
+	PipelineCache::ReplayStages stages;
+	const bool capturable = cache.ReplayCaptureEnd(stages);
+	uint32_t   count      = 0;
+	auto       runtimes   = DrawReplayRuntimes(state, count);
+	const bool complete   = capturable && state.programs.vertex[0] && (!state.ps_active || state.programs.pixel) &&
+	                      count == stages.size();
+	if (record != nullptr && mode == 2 && complete) {
+		store.verified++;
+		bool same = record->stages.size() == count && record->programs.pixel.module == state.programs.pixel.module;
+		for (uint32_t i = 0; same && i < count; i++) {
+			same = PipelineCache::ReplayStageMatches(*record->stages[i], *runtimes[i]);
+		}
+		if (!same) {
+			store.mismatches++;
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1) < 16) {
+				::printf("Native replay MISMATCH: key 0x%016llx, %u stages\n", static_cast<unsigned long long>(key), count);
+			}
+		}
+	}
+	if (!complete) {
+		store.not_capturable++;
+		ReportReplay(mode);
+		return;
+	}
+	// The stages captured must be the state's own, in order.
+	for (uint32_t i = 0; i < count; i++) {
+		if (PipelineCache::ReplayStageProgram(*stages[i]) != runtimes[i]->program) {
+			store.not_capturable++;
+			ReportReplay(mode);
+			return;
+		}
+	}
+	if (record != nullptr) {
+		ReportReplay(mode); // verify mode: the current record stays
+		return;
+	}
+	if (++store.seen[key] < 2u) {
+		store.first_sightings++;
+		if (store.seen.size() > 65536u) store.seen.clear();
+		ReportReplay(mode);
+		return;
+	}
+	if (store.records.size() >= 16384u) {
+		store.records.clear();
+	}
+	auto made           = std::make_unique<DrawReplayRecord>();
+	made->programs      = state.programs;
+	made->vertex_info   = state.vertex_info;
+	made->ps_input_info = state.ps_input_info;
+	made->stages        = std::move(stages);
+	store.records[key]  = std::move(made); // replaces a stale record
+	store.stored++;
+	ReportReplay(mode);
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -992,7 +1171,12 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		                       (!dc.z_write_enable && !dc.stencil_enable && !rc.depth_clear_enable &&
 		                        !rc.stencil_clear_enable && !rc.copy_depth_to_color &&
 		                        !rc.copy_stencil_to_color));
-		RefreshShaders(buffer, draw, color_output_mask, state);
+		static auto& native_replay = Common::LiveSwitches::Get("KYTY_NATIVE_REPLAY", 0);
+		if (const auto replay_mode = native_replay.load(std::memory_order_relaxed); replay_mode != 0) {
+			RefreshShadersReplay(buffer, draw, color_output_mask, state, replay_mode);
+		} else {
+			RefreshShaders(buffer, draw, color_output_mask, state);
+		}
 		t_async_ps_may_skip = false;
 	}
 	PhaseStats::Scope targets_phase {PhaseStats::PhStateTargets};

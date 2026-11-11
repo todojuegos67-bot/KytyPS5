@@ -63,6 +63,11 @@ enum Phase : int {
 	PhCommitDynamic,
 	PhDispatchState,
 	PhDispatchCommit,
+	PhReplayHit,
+	PhCommitOverlap,
+	PhCommitImages,
+	PhCommitWrites,
+	PhCommitPush,
 	Count
 };
 
@@ -76,7 +81,8 @@ inline const char* const kNames[Count] = {"gpu.idle",       "gpu.cmd",       "gp
                                           "prog.materialize", "prog.find", "prog.recompile",
                                           "memo.hit", "memo.miss", "key.expand", "memo.patch",
                                           "bind.prepare", "bind.find", "bind.images", "bind.buffers",
-                                          "commit.bindings", "commit.dynamic", "dispatch.state", "dispatch.commit"};
+                                          "commit.bindings", "commit.dynamic", "dispatch.state", "dispatch.commit",
+                                          "replay.hit", "commit.overlap", "commit.images", "commit.writes", "commit.push"};
 
 // wolv-perf-1111c: one cache line per phase. The counters sat in two packed arrays updated by
 // Thread_Gpu (draw.*, prog.*, ~15 scopes a draw) and by every faulting guest thread at once, so the

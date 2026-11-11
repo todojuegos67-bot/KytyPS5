@@ -1641,6 +1641,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			     what, reader_hash, address, size, writer_hash, written_address, written_size);
 		}
 	};
+	std::optional<PhaseStats::Scope> commit_phase {std::in_place, PhaseStats::PhCommitOverlap};
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -1691,6 +1692,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	}
+	commit_phase.reset();
+	commit_phase.emplace(PhaseStats::PhCommitImages);
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
 	m_descriptor_writes.clear();
@@ -1699,6 +1702,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_writes.reserve(write_count);
 
 	for (auto* prepared: prepared_bindings) {
+		commit_phase.reset();
+		commit_phase.emplace(PhaseStats::PhCommitImages);
 		const auto& program       = *prepared->runtime->program;
 		auto&       descriptors   = *prepared;
 		const auto  shader_stage  = NativeShaderStage(program.stage);
@@ -1807,6 +1812,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			binding.layout = image.backing.state.layout;
 		}
 
+		commit_phase.reset();
+		commit_phase.emplace(PhaseStats::PhCommitWrites);
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
 			vk::WriteDescriptorSet write {};
@@ -1900,6 +1907,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	commit_phase.reset();
+	commit_phase.emplace(PhaseStats::PhCommitPush);
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());

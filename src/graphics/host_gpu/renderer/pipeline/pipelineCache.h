@@ -191,6 +191,20 @@ public:
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info);
+	// KYTY_NATIVE_REPLAY (renderDraw.cpp): the program lookups of one draw, kept so a later draw
+	// with the same registers can take their result without looking them up again.
+	struct ReplayStage;
+	using ReplayStages = std::vector<std::shared_ptr<const ReplayStage>>;
+	void ReplayCaptureBegin();
+	// False when some lookup since ReplayCaptureBegin cannot be replayed (new program, patched or
+	// bypassed resources, memo off).
+	bool ReplayCaptureEnd(ReplayStages& out);
+	// Every guest word the stages' resource evaluations read still reads the same.
+	bool ReplayStagesCurrent(const ReplayStages& stages);
+	static const ShaderRecompiler::IR::CompiledShaderInfo* ReplayStageProgram(const ReplayStage& stage);
+	static const ShaderRecompiler::IR::ResourceSnapshot*   ReplayStageResources(const ReplayStage& stage);
+	static bool ReplayStageMatches(const ReplayStage& stage, const ShaderStageRuntime& runtime);
+
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);

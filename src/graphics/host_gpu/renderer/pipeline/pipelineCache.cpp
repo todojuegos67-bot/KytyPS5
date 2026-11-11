@@ -293,6 +293,14 @@ private:
 	size_t               m_next_page  = 0;
 };
 
+} // namespace
+struct PipelineCache::ReplayStage {
+	ShaderReadChunks::ReadLog                       log;
+	ShaderRecompiler::IR::ResourceSnapshot          resources;
+	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
+};
+namespace {
+
 // Both SRT readers: only memory the guest has committed. Bytes the GPU has not written are
 // current in the backing store; reading them there skips the tracked-page fault, which drains
 // the GPU to refresh whatever else on the page the GPU wrote (constants that share a page with
@@ -774,6 +782,13 @@ struct PipelineCache::ProgramCache {
 	};
 	SourceEntry* memo_worst = nullptr;
 
+	// KYTY_NATIVE_REPLAY capture (see PipelineCache::ReplayCaptureBegin).
+	bool                                                    replay_capture = false;
+	PipelineCache::ReplayStages                             replay_stages;
+	// The read log behind entry.resources after the last Materialize, when it is exact for
+	// those resources (memo hit, stored miss, same-input reuse); null otherwise.
+	const ShaderReadChunks::ReadLog*                        last_log = nullptr;
+
 	// --- KYTY_MEMO_PATCH (wolv-draw-1111) -------------------------------------------------------
 	// Log 11-11: ~120K memo misses per 5 s at 9-10 us, most of them programs whose user data
 	// changes on every draw (0xc8202066634a4c62: words 8, 10, 20 new on each miss, ring-allocated
@@ -888,6 +903,10 @@ struct PipelineCache::ProgramCache {
 		}
 		entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 		(same_inputs ? patch_same_inputs : patch_hits)++;
+		if (same_inputs) {
+			// Unless a relocation applied: no word changed, so every read is at its logged address.
+			last_log = &pt.log;
+		}
 		pt.patches++;
 		return true;
 	}
@@ -1101,6 +1120,7 @@ struct PipelineCache::ProgramCache {
 			return true;
 		}
 		pt.since_check = 0;
+		last_log       = nullptr; // the full evaluation below is not logged
 		// Check: the full evaluation must give the same.
 		patch_checks++;
 		patch_check_resources      = entry.resources;
@@ -1217,6 +1237,7 @@ struct PipelineCache::ProgramCache {
 	// stored result instead of evaluating the resource plan again.
 	bool Materialize(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                 ShaderReadChunks& reads) {
+		last_log = nullptr;
 		if (!ResourceMemoEnabled()) {
 			return ShaderRecompiler::IR::MaterializeResources(
 			    entry.resource_plan, runtime, entry.resources, entry.specialization);
@@ -1293,6 +1314,7 @@ struct PipelineCache::ProgramCache {
 				// The only verbatim copy of the inputs in the snapshot (shader data words).
 				entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 				slot.last_use = memo_clock;
+				last_log      = &slot.log;
 				memo_hits++;
 				entry.bypass_window_hits++;
 				ReportMemo();
@@ -1364,6 +1386,7 @@ struct PipelineCache::ProgramCache {
 			slot->resources      = entry.resources;
 			slot->specialization = entry.specialization;
 			slot->last_use = memo_clock;
+			last_log       = &slot->log;
 		}
 		ReportMemo();
 		ReportPatch();
@@ -1676,6 +1699,9 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		if (replay_capture) {
+			replay_stages.push_back(nullptr); // replaced below when this lookup can be replayed
+		}
 		if (SkipShaderRequested(params.hash) || LiveSkipRequested(params.hash, stage)) {
 			return ShaderProgram {};
 		}
@@ -1806,6 +1832,15 @@ struct PipelineCache::ProgramCache {
 			if (permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
+				if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+					if (replay_capture && last_log != nullptr && !replay_stages.empty()) {
+						auto captured       = std::make_shared<PipelineCache::ReplayStage>();
+						captured->log       = *last_log;
+						captured->resources = entry->second.resources;
+						captured->program   = &permutation->program;
+						replay_stages.back() = std::move(captured);
+					}
+				}
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -2505,6 +2540,52 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		DrawDiff::t_shader = pixel_params.hash;
 	}
 	return result;
+}
+
+void PipelineCache::ReplayCaptureBegin() {
+	m_program_cache->replay_capture = true;
+	m_program_cache->replay_stages.clear();
+}
+
+bool PipelineCache::ReplayCaptureEnd(ReplayStages& out) {
+	auto& pc          = *m_program_cache;
+	pc.replay_capture = false;
+	out.clear();
+	if (pc.replay_stages.empty()) {
+		return false;
+	}
+	for (auto& stage: pc.replay_stages) {
+		if (stage == nullptr) {
+			pc.replay_stages.clear();
+			return false;
+		}
+		out.push_back(std::move(stage));
+	}
+	pc.replay_stages.clear();
+	return true;
+}
+
+bool PipelineCache::ReplayStagesCurrent(const ReplayStages& stages) {
+	ShaderReadChunks read_chunks(ShaderReadChunks::Mode());
+	for (const auto& stage: stages) {
+		if (!m_program_cache->ReadsUnchanged(stage->log, read_chunks)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+const ShaderRecompiler::IR::CompiledShaderInfo* PipelineCache::ReplayStageProgram(const ReplayStage& stage) {
+	return stage.program;
+}
+
+const ShaderRecompiler::IR::ResourceSnapshot* PipelineCache::ReplayStageResources(const ReplayStage& stage) {
+	return &stage.resources;
+}
+
+bool PipelineCache::ReplayStageMatches(const ReplayStage& stage, const ShaderStageRuntime& runtime) {
+	return runtime.program == stage.program && runtime.resources != nullptr &&
+	       ProgramCache::SnapshotsEqual(stage.resources, *runtime.resources);
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
