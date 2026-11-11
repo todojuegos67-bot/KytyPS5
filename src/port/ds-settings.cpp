@@ -360,8 +360,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	// (ds-pc-port10) and the hardware RT Antorchas (torches, lamps, fire and magic lights) too.
 	s->rt_lamps       = "0";
 	s->rt_particles   = false;
-	s->simulate_ram16 = false;
-	s->simulate_vram8 = false;
+	// (11-11) the 16 GB RAM / 8 GB GPU simulations are back as Opciones de desarrollador in the launcher.
 	return true;
 }
 
