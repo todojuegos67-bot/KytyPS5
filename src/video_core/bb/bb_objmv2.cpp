@@ -55,6 +55,7 @@ struct SnapBuf {
     u64 chash = 0;    // bb-gpu6: content hash of the guest buffer (in-frame dedupe)
     u32 rel_off = 0;  // bb-gpu6: relative bone transforms in rel_cur / rel_prev (12 floats each)
     u32 rel_n = 0;    // matrix pairs (0: none)
+    u64 pkey = 0;     // gpu7: (address, size) of a hashed palette-like buffer (shared-use count)
 };
 
 struct Rec {
@@ -108,7 +109,13 @@ struct State {
     // buffer, this frame and the last: unchanged by a transform common to all of them (the
     // camera, when the game multiplies it in), changed by animation.
     std::vector<float> rel_cur, rel_prev;
-    bool rel_test = true;
+    bool rel_test = false;
+    // gpu7: draws a frame reading each palette-like buffer (address, size), this frame and the
+    // last. A buffer read by many draws is a per-frame / per-pass constant block (it holds the
+    // camera: in the 370 log every draw changed with it, coverage 100 %), not a skeleton.
+    std::unordered_map<u64, u32> use_cur, use_prev;
+    u32 shared_min = 48;
+    u64 sec_shared = 0;
     u64 sec_camera_only = 0, sec_dedupe = 0, sec_bytes_hashed = 0, sec_bytes_copied = 0;
     bool history = false; // map_prev is exactly the previous frame
     bool reset_pending = false;
@@ -311,7 +318,12 @@ bool Init(const Vulkan::Instance& instance) {
     g.check = !EnvOff("BB_OBJMV2_CHECK");
     {
         const char* mv = std::getenv("BB_OBJMV_MOVE");
-        g.rel_test = !(mv != nullptr && std::strcmp(mv, "hash") == 0);
+        g.rel_test = mv != nullptr && std::strcmp(mv, "rel") == 0;
+        const char* sh = std::getenv("BB_OBJMV_SHARED");
+        g.shared_min = sh != nullptr && *sh != '\0' ? u32(std::max(0, std::atoi(sh))) : 48u;
+        Log(fmt::format("[objmv-gpu7] moving test: a changed palette moves its draw unless {} "
+                        "draws a frame read it (BB_OBJMV_SHARED, 0: off){}",
+                        g.shared_min, g.rel_test ? ", plus the relative-bone test" : ""));
     }
     g.device = instance.GetDevice();
     g.allocator = instance.GetAllocator();
@@ -616,6 +628,10 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
             size = vsharp.GetSize();
             if (vsharp.base_address != 0 && size != 0 && size <= kMaxSnapBytes) {
                 key = Mix(vsharp.base_address, size);
+                if (size >= 96 && size % 48 == 0) {
+                    sb.pkey = key;
+                    ++g.use_cur[key];
+                }
                 const auto* guest = reinterpret_cast<const void*>(vsharp.base_address);
                 if (buffer_cache.IsRegionGpuModified(vsharp.base_address, size)) {
                     // Written by the GPU: guest memory is stale, keep the current buffer.
@@ -698,7 +714,13 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
                     // "moving" coverage while turning: the scenery got object vectors) is not
                     // moving; one whose bones moved relative to each other is (animation: the
                     // characters keep their object vectors). BB_OBJMV_MOVE=hash: any change.
-                    if (g.rel_test && pb.bytes == cb.bytes && pb.rel_n != 0 &&
+                    const auto use = cb.pkey != 0 && g.shared_min != 0 ? g.use_prev.find(cb.pkey)
+                                                                         : g.use_prev.end();
+                    if (use != g.use_prev.end() && use->second >= g.shared_min) {
+                        // gpu7: a constant block shared by many draws (the camera's): static.
+                        camera_only = true;
+                        ++g.sec_shared;
+                    } else if (g.rel_test && pb.bytes == cb.bytes && pb.rel_n != 0 &&
                         pb.rel_n == cb.rel_n && pb.rel_off + pb.rel_n * 12 <= g.rel_prev.size() &&
                         cb.rel_off + cb.rel_n * 12 <= g.rel_cur.size() &&
                         !RelDiffer(g.rel_prev.data() + pb.rel_off, g.rel_cur.data() + cb.rel_off,
@@ -894,6 +916,8 @@ void OnFlip() {
     g.map_cur.clear();
     g.bufs_cur.clear();
     g.rel_cur.clear();
+    std::swap(g.use_prev, g.use_cur);
+    g.use_cur.clear();
     g.occ.clear();
     g.dedupe.clear();
     g.cleared = false;
@@ -954,15 +978,16 @@ void OnFlip() {
         g.sec_wo, g.sec_wc,
         g.sec_stat_frames ? double(g.sec_nonzero) / double(g.sec_stat_frames) : 0.0,
         g.sec_not_composed, g.sec_gpu_bufs));
-    Log(fmt::format("[objmv-gpu6] moving test {}: palettes changed only by a common transform "
-                    "(camera) kept static {}/s; CPU per draw: hashed {:.0f} B, copied {:.0f} B, "
-                    "dedupe hits {}",
-                    g.rel_test ? "rel (BB_OBJMV_MOVE=rel)" : "hash (BB_OBJMV_MOVE=hash)",
-                    g.sec_camera_only,
+    Log(fmt::format("[objmv-gpu6] moving test {}: changed palettes kept static {}/s (shared "
+                    "constant blocks, read by >= {} draws: {}); CPU per draw: hashed {:.0f} B, "
+                    "copied {:.0f} B, dedupe hits {}",
+                    g.rel_test ? "shared+rel (BB_OBJMV_MOVE=rel)" : "shared",
+                    g.sec_camera_only, g.shared_min, g.sec_shared,
                     g.sec_draws ? double(g.sec_bytes_hashed) / double(g.sec_draws) : 0.0,
                     g.sec_draws ? double(g.sec_bytes_copied) / double(g.sec_draws) : 0.0,
                     g.sec_dedupe));
     g.sec_camera_only = g.sec_dedupe = g.sec_bytes_hashed = g.sec_bytes_copied = 0;
+    g.sec_shared = 0;
     g.sec_gpu_bufs = 0;
     g.sec_nonzero = g.sec_stat_frames = g.sec_not_composed = 0;
     g.sec_draws = g.sec_vec_draws = g.sec_resets = g.sec_frames = g.sec_overflow = 0;
