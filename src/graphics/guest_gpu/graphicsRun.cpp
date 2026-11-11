@@ -47,6 +47,7 @@
 #include <bit>
 #include <x86intrin.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -1793,6 +1794,62 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+// KYTY_DECAL_SAFE (on unless 0; des-candle-1111): a blended draw that tests depth without writing it and is not an
+// equal test (decals and mesh decals over the G-buffer: the wax runs and splashes under candle groups, blood, dirt;
+// forward translucent meshes) is drawn by the normal path, never from a native XPR record, a table draw or a
+// continued table run. Those paths key a draw by its pair, its draw state and its n-th use in the frame and patch only
+// its data words; a decal pass draws many small objects of one pair in an order that changes from frame to frame, so a
+// record could be replayed for another object or another blend state, and a whole decal came and went on a still
+// camera (TAA then showed it half transparent). The normal path evaluates every draw from its registers and memory.
+// The G-buffer itself (depth writes or an equal test) and everything without blending keep the fast paths.
+static bool DecalSafeOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_DECAL_SAFE");
+		const bool  set   = value == nullptr || value[0] != '0';
+		std::printf("Decal draws: KYTY_DECAL_SAFE=%d: blended draws that test depth without writing it (decals, wax, "
+		            "translucent meshes) %s\n",
+		            set ? 1 : 0, set ? "take the normal path (no native XPR record, table draw or continued run)"
+		                         : "may take the native XPR / table paths (as before)");
+		std::fflush(stdout);
+		return set;
+	}();
+	return on;
+}
+
+static bool DecalLikeDraw(const HW::Context& ctx) {
+	const auto& depth = ctx.GetDepthControl();
+	if (!depth.z_enable || depth.z_write_enable || depth.zfunc == static_cast<uint8_t>(vk::CompareOp::eEqual) ||
+	    depth.zfunc == static_cast<uint8_t>(vk::CompareOp::eAlways))
+		return false;
+	const uint32_t mask = ctx.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < 8; ++slot) {
+		if (((mask >> (slot * 4u)) & 0xfu) == 0) continue;
+		const auto& target = ctx.GetRenderTarget(slot);
+		if (target.base.addr == 0 || target.info.blend_bypass) continue;
+		if (ctx.GetBlendControl(slot).enable) return true;
+	}
+	return false;
+}
+
+// The normal path takes the draw (KYTY_DECAL_SAFE): counted, the first ones and then every power of two printed.
+static bool DecalTakesNormalPath(const HW::Context& ctx) {
+	if (!DecalSafeOn() || !DecalLikeDraw(ctx)) return false;
+	static std::atomic<uint64_t> routed {0};
+	const uint64_t               n = routed.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 2 || (n & (n - 1)) == 0) {
+		const auto& depth = ctx.GetDepthControl();
+		std::printf("Decal draws: %llu drawn by the normal path (KYTY_DECAL_SAFE; last: depth func %u, targets mask "
+		            "0x%08x, blend CB0 %d; KYTY_DECAL_SAFE=0: as before)\n",
+		            static_cast<unsigned long long>(n), static_cast<unsigned>(depth.zfunc), ctx.GetRenderTargetMask(),
+		            ctx.GetBlendControl(0).enable ? 1 : 0);
+		std::fflush(stdout);
+	}
+	return true;
+}
+
+#endif // KYTY_LOCAL_VULKAN_RECORDING
+
 uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, bool clean) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 0);
 	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
@@ -1802,6 +1859,10 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	auto& executor = m_renderer.GetRenderExecutor();
 	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed))) { // a recorded frame sees every draw on the normal path
+		executor.NativeXprForgetState();
+		return 0;
+	}
+	if (DecalTakesNormalPath(m_ctx)) {
 		executor.NativeXprForgetState();
 		return 0;
 	}
@@ -1863,6 +1924,7 @@ uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) 
 	    m_index_type_and_size > 1 || !m_index_base_addr || !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
 		return skip();
+	if (DecalTakesNormalPath(m_ctx)) return skip();
 	const uint32_t                  count = packet[5];
 	std::array<uint64_t, max_draws> commands; // the first `count` are written, only they are read
 	for (uint32_t i = 0; i < count; ++i)
@@ -1898,6 +1960,7 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled() || m_index_type_and_size > 1 ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
 		return skip();
+	if (DecalTakesNormalPath(m_ctx)) return skip();
 	// What CpOpDrawIndex / CpOpDrawIndexOffset accept (anything else takes them).
 	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
 	uint64_t       index_address = 0;
@@ -1944,6 +2007,10 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	    (FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled() ||
 	    (primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip))
 		return 0;
+	if (DecalTakesNormalPath(m_ctx)) {
+		m_renderer.GetRenderExecutor().NativeXprForgetState();
+		return 0;
+	}
 	CheckBuffer();
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h); a draw over several of its
 	// areas goes the normal way, drawn once for each.
