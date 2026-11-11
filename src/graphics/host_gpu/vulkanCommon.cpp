@@ -1,5 +1,4 @@
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineSeeds.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -136,8 +135,6 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	vk::ShaderModule module = nullptr;
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
-	// Pipeline seeds (pipelineSeeds.h): the module's SPIR-V, once per module.
-	PipelineSeeds::NoteModule(module, code);
 	return module;
 }
 

@@ -896,6 +896,8 @@ void WatchGame(const Runtime& rt, const Settings& s, HANDLE process, DWORD pid) 
 
 // ---- Shader precompile. ----
 
+fs::path ShippedSeeds(const Runtime& rt);
+
 namespace {
 
 const wchar_t kTitle[] = L"PPSA01317";
@@ -950,57 +952,48 @@ std::string StampKey(const Runtime& rt, const Settings& s) {
 	const fs::path  emu  = rt.exe_dir / L"kyty_emulator.exe";
 	const auto      size = fs::file_size(emu, ec);
 	const auto      time = fs::last_write_time(emu, ec).time_since_epoch().count();
-	return "gpu=" + DriverKey(rt) + "\nemulador=" + std::to_string(size) + "/" + std::to_string(time) + "\ngpu_indice=" +
+	const fs::path  shipped = ShippedSeeds(rt);
+	const std::string seeds = shipped.empty() ? std::string("-")
+	                                          : Utf8(shipped.filename().wstring()) + "/" + std::to_string(fs::file_size(shipped, ec));
+	return "gpu=" + DriverKey(rt) + "\nemulador=" + std::to_string(size) + "/" + std::to_string(time) + "\nsemillas=" + seeds +
+	       "\ngpu_indice=" +
 	       std::to_string(s.gpu) + "\nbindless=" + (s.bindless ? "1" : "0") + "\nteselado=" + (s.tessellation ? "1" : "0") + "\n";
 }
 
 } // namespace
 
-void MergeShippedSeeds(const Runtime& rt) {
-	const fs::path  from = rt.exe_dir / L"seeds" / kTitle;
-	const fs::path  to   = CacheDir(rt);
+// The release's seed file: seeds-PPSA01317_<version>.seeds beside the exe or in seeds\ (the newest name wins).
+fs::path ShippedSeeds(const Runtime& rt) {
 	std::error_code ec;
-	const fs::path  seeds = from / L"pipelines.seeds";
-	if (!fs::is_directory(from, ec)) return;
-	const std::string mark = std::to_string(fs::file_size(seeds, ec)) + "/" +
-	                         std::to_string(fs::last_write_time(seeds, ec).time_since_epoch().count());
-	const fs::path mark_path = to / L"seeds-merged.txt";
-	if (ReadText(mark_path) == mark) return;
-	fs::create_directories(to, ec);
-	// Every file the package has and the cache does not (translated shaders, SPIR-V); the seeds appended.
-	for (fs::recursive_directory_iterator it(from, ec), end; !ec && it != end; it.increment(ec)) {
-		if (!it->is_regular_file()) continue;
-		const fs::path rel = fs::relative(it->path(), from, ec);
-		if (rel == L"pipelines.seeds") continue;
-		const fs::path dst = to / rel;
-		if (fs::exists(dst)) continue;
-		fs::create_directories(dst.parent_path(), ec);
-		fs::copy_file(it->path(), dst, ec);
-	}
-	ec.clear();
-	const std::string shipped = ReadText(seeds);
-	if (shipped.size() > 8) {
-		const fs::path mine = to / L"pipelines.seeds";
-		if (!fs::exists(mine) || fs::file_size(mine, ec) <= 8) {
-			WriteText(mine, shipped);
-		} else if (shipped.compare(0, 8, ReadText(mine).substr(0, 8)) == 0) {
-			// Same format: the package's records after the cache's (repeats are skipped by the emulator).
-			std::ofstream out(mine, std::ios::binary | std::ios::app);
-			out.write(shipped.data() + 8, static_cast<std::streamsize>(shipped.size() - 8));
+	fs::path        best;
+	for (const fs::path& dir: {rt.exe_dir, rt.exe_dir / L"seeds"}) {
+		for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+			const std::wstring name = it->path().filename().wstring();
+			if (it->is_regular_file() && name.rfind(std::wstring(L"seeds-") + kTitle, 0) == 0 &&
+			    it->path().extension() == L".seeds" && (best.empty() || name > best.filename().wstring())) {
+				best = it->path();
+			}
 		}
+		ec.clear();
 	}
-	WriteText(mark_path, mark);
+	return best;
+}
+
+void MergeShippedSeeds(const Runtime& rt) {
+	// The emulator reads the release's file with the player's own (KYTY_PRECOMPILE_SEEDS, set by RunPrecompile):
+	// nothing to copy. Only the old SPIR-V seeds of an earlier build are left behind.
+	(void)rt;
 }
 
 bool PrecompileDue(const Runtime& rt, const Settings& s, std::string* why) {
 	std::error_code ec;
-	if (!fs::exists(CacheDir(rt) / L"pipelines.seeds", ec)) {
+	if (!fs::exists(CacheDir(rt) / L"guest.seeds", ec) && ShippedSeeds(rt).empty()) {
 		if (why != nullptr) *why = "sin semillas todavía";
 		return false;
 	}
 	const std::string stamp = ReadText(StampPath(rt));
 	if (stamp == StampKey(rt, s)) return false;
-	if (why != nullptr) *why = stamp.empty() ? "primera vez" : "cambió la gráfica, el driver, el emulador o una opción";
+	if (why != nullptr) *why = stamp.empty() ? "primera vez" : "cambió la gráfica, el driver, el emulador, las semillas o una opción";
 	return true;
 }
 
@@ -1020,6 +1013,8 @@ std::string RunPrecompile(const Runtime& rt, const Settings& s, const std::wstri
 
 	SetEnvironmentVariableW(L"KYTY_PRECOMPILE", L"1");
 	SetEnvironmentVariableW(L"KYTY_PRECOMPILE_PROGRESS", progress.wstring().c_str());
+	const fs::path shipped = ShippedSeeds(rt);
+	SetEnvironmentVariableW(L"KYTY_PRECOMPILE_SEEDS", shipped.empty() ? nullptr : shipped.wstring().c_str());
 	wchar_t stamp[32];
 	{
 		const std::time_t t = std::time(nullptr);
@@ -1044,6 +1039,7 @@ std::string RunPrecompile(const Runtime& rt, const Settings& s, const std::wstri
 	                                    CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, rt.exe_dir.c_str(), &si, &pi);
 	SetEnvironmentVariableW(L"KYTY_PRECOMPILE", nullptr);
 	SetEnvironmentVariableW(L"KYTY_PRECOMPILE_PROGRESS", nullptr);
+	SetEnvironmentVariableW(L"KYTY_PRECOMPILE_SEEDS", nullptr);
 	if (!started) {
 		if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
 		return "No se pudo iniciar la precompilación (error " + std::to_string(GetLastError()) + ").";

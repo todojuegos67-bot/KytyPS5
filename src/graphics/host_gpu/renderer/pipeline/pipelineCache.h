@@ -222,7 +222,6 @@ struct GraphicsPipelineBuild {
 	vk::SpecializationInfo                                                layer_limit_spec {};
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;
-	PipelineSeeds::Layout                                                 seed_layout;
 };
 
 // A graphics pipeline a worker thread compiles (see PipelineCache::TryGetGraphicsPipeline).
@@ -254,7 +253,8 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
-	// KYTY_PRECOMPILE=1 (pipelineSeeds.h): every recorded pipeline into the driver cache.
+	// KYTY_PRECOMPILE=1 (pipelineSeeds.h): every guest seed's program into the shader disk cache
+	// and every seed pipeline into the driver cache, on all processors.
 	void PrecompileSeeds();
 
 	struct Pipeline {
@@ -444,6 +444,9 @@ private:
 	struct GraphicsPipelineKeyHash {
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
+	void RecordPipelineSeed(const GraphicsPipelineKey& key, const GraphicsPrograms& programs,
+	                        uint32_t vertex_stages, bool ps_active);
+	static uint64_t SeedFormat();
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;

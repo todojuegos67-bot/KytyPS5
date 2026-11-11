@@ -645,12 +645,6 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
-	if (PipelineSeeds::Recording()) {
-		build.seed_layout = {.bindings         = descriptor_bindings,
-		                     .push_descriptors = pipeline.uses_push_descriptors,
-		                     .bindless         = pipeline.uses_bindless,
-		                     .push_constants   = push_constants};
-	}
 
 	std::array<vk::DescriptorSetLayout, 2> set_layouts {};
 	uint32_t                               set_layout_count = 0;
@@ -830,10 +824,6 @@ vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
 	const Common::CrashNoteScope crash_note(note.data());
 	const auto                   result =
 	    build.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, pipeline);
-	if (!no_optimization && PipelineSeeds::Recording() &&
-	    (result == vk::Result::eSuccess || result == vk::Result::ePipelineCompileRequired)) {
-		PipelineSeeds::RecordGraphics(build.pipeline_info, build.seed_layout);
-	}
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
@@ -937,16 +927,6 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
 	const auto create_begin = std::chrono::steady_clock::now();
-	if (build != ComputeBuild::Compile && PipelineSeeds::Recording()) {
-		std::vector<vk::DescriptorSetLayoutBinding> seed_bindings;
-		AddLayoutBindings(seed_bindings, *input_info.stage.program, vk::ShaderStageFlagBits::eCompute);
-		PipelineSeeds::RecordCompute(
-		    info, {.bindings         = std::move(seed_bindings),
-		           .push_descriptors = pipeline.uses_push_descriptors,
-		           .bindless         = pipeline.uses_bindless,
-		           .push_constants   = {vk::ShaderStageFlagBits::eCompute, 0,
-		                                ShaderRecompiler::IR::NativePushConstantSize}});
-	}
 	// Round 92: the full cache files first, with lookups alone; a pipeline none holds is compiled
 	// into the cache that is saved.
 	result = vk::Result::ePipelineCompileRequired;

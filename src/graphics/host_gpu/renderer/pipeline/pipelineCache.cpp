@@ -46,6 +46,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <unordered_map>
 #include <deque>
 #include <filesystem>
 #include <fmt/format.h>
@@ -2541,6 +2543,286 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// The modules of a permutation: the stage's, and its per-pixel and normalized-LOD copies when
+	// it has them (AddPermutation, and the precompile of guest seeds).
+	struct Modules {
+		vk::ShaderModule module     = nullptr;
+		vk::ShaderModule pixel_rate = nullptr;
+		vk::ShaderModule normalized = nullptr;
+	};
+	Modules MakeModules(const ShaderRecompiler::CompileOptions&         options,
+	                    const std::vector<uint32_t>&                    spirv,
+	                    const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+		std::vector<uint32_t> exact;
+		if (options.stage != ShaderType::Pixel && options.stage != ShaderType::Compute &&
+		    ExactFloatShader(options.shader_hash)) {
+			exact = ExactFloatVariant(options, spirv);
+		}
+		std::vector<uint32_t> mesh_test;
+		if (options.stage == ShaderType::Mesh) {
+			if (const auto flags = MeshTestSetting() | MeshHostFlags(); flags != 0) {
+				mesh_test = MeshTestVariant(options, exact.empty() ? spirv : exact, flags);
+			}
+		}
+		const auto module = CompileSPV(!mesh_test.empty() ? mesh_test
+		                               : exact.empty()    ? spirv
+		                                                  : exact,
+		                               device);
+		EXIT_IF(module == nullptr);
+		vk::ShaderModule pixel_rate_module = nullptr;
+		if (options.stage == ShaderType::Pixel && pixel_rate_variants &&
+		    std::ranges::any_of(program.info.inputs, [](const auto& input) {
+			    return input.kind == ShaderRecompiler::IR::StageInputKind::SampleId;
+		    })) {
+			pixel_rate_module = CompilePixelRateVariant(options, spirv);
+		}
+		vk::ShaderModule normalized_module = nullptr;
+		if (options.stage == ShaderType::TessellationControl && UnnormalizedFixBuilt() &&
+		    !program.info.sampled_pairs.empty()) {
+			normalized_module = CompileNormalizedVariant(options, exact.empty() ? spirv : exact);
+		}
+		return {.module = module, .pixel_rate = pixel_rate_module, .normalized = normalized_module};
+	}
+
+	// ---- Guest pipeline seeds (pipelineSeeds.h) ----------------------------------------------
+	// The code Get translates (set by Get before AddPermutation).
+	std::span<const uint32_t> seed_code;
+
+	// The stage inputs as a seed keeps them: no runtime pointers, no host-dependent fields (the
+	// precompile sets those for the player's GPU, as GetGraphicsPrograms/GetComputeProgram do).
+	template <typename InputInfo>
+	static InputInfo SeedInfo(InputInfo info) {
+		info.stage = {};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			info.host_subgroup_size = 0;
+			info.lds_storage        = false;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			info.mesh.host_subgroup_size = 0;
+			info.mesh.passes             = 0;
+			info.prepare_failed          = false;
+		}
+		return info;
+	}
+
+	template <typename InputInfo>
+	static constexpr uint8_t SeedInfoKind() {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			return 0;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			return 1;
+		} else {
+			return 2;
+		}
+	}
+
+	// The canonical identity of a program seed: what the disk cache keys (without the session).
+	template <typename InputInfo>
+	static uint64_t SeedProgramHash(ShaderType stage, uint64_t shader_hash, uint32_t wave_size,
+	                                uint32_t user_data_base, std::span<const uint32_t> code,
+	                                std::span<const uint32_t> back_code,
+	                                std::span<const uint32_t> user_data, const InputInfo& info,
+	                                const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                uint32_t push_data_cursor) {
+		ShaderDiskCache::ByteWriter key;
+		key.bytes.reserve(code.size_bytes() + back_code.size_bytes() + 1024u);
+		key.Put(static_cast<uint32_t>(stage));
+		key.Put(shader_hash);
+		key.Put(wave_size);
+		key.Put(user_data_base);
+		key.PutWords(code);
+		key.PutWords(back_code);
+		key.PutWords(user_data);
+		ShaderDiskCache::AppendInputKey(key, info);
+		ShaderDiskCache::AppendSpecialization(key, specialization);
+		key.Put(push_data_cursor);
+		return XXH3_64bits(key.bytes.data(), key.bytes.size());
+	}
+
+	// A new permutation: its seed, once per run and program (nothing per draw).
+	template <typename InputInfo>
+	void RecordSeed(const ShaderRecompiler::CompileOptions& options, const InputInfo& input_info,
+	                const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                uint32_t push_data_cursor, const ShaderProgram& handle) {
+		if (!PipelineSeeds::Recording() || seed_code.empty()) {
+			return;
+		}
+		const auto info = SeedInfo(input_info);
+		const auto hash = SeedProgramHash(options.stage, options.shader_hash, options.wave_size,
+		                                  options.user_data_base, seed_code, options.back_code,
+		                                  options.user_data, info, specialization, push_data_cursor);
+		ShaderDiskCache::ByteWriter payload;
+		payload.Put(PipelineSeeds::KindProgram);
+		payload.Put(static_cast<uint32_t>(options.stage));
+		payload.Put(options.shader_hash);
+		payload.Put(options.wave_size);
+		payload.Put(options.user_data_base);
+		payload.Put(push_data_cursor);
+		payload.Put(SeedInfoKind<InputInfo>());
+		payload.PutWords(seed_code);
+		payload.PutWords(options.back_code);
+		payload.PutWords(options.user_data);
+		payload.Put<uint64_t>(sizeof(InputInfo));
+		payload.PutBytes({reinterpret_cast<const uint8_t*>(&info), sizeof(InputInfo)});
+		ShaderDiskCache::AppendSpecialization(payload, specialization);
+		const std::array<uint64_t, 2> ids {handle.id, handle.normalized_id};
+		PipelineSeeds::RecordProgram(hash, std::move(payload.bytes), ids);
+		seed_code = {};
+	}
+
+	// A program seed, parsed.
+	struct SeedProgram {
+		uint64_t                                     record = 0;
+		ShaderType                                   stage  = ShaderType::Unknown;
+		uint64_t                                     shader_hash = 0;
+		uint32_t                                     wave_size = 0, user_data_base = 0, push_data_cursor = 0;
+		uint8_t                                      kind = 0;
+		std::vector<uint32_t>                        code, back_code, user_data;
+		ShaderVertexInputInfo                        vertex {};
+		ShaderPixelInputInfo                         pixel {};
+		ShaderComputeInputInfo                       compute {};
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		// Made by the precompile.
+		bool                                         ok = false;
+		std::vector<uint32_t>                        spirv;
+		ShaderRecompiler::IR::CompiledShaderInfo     program;
+		Modules                                      modules;
+	};
+
+	static bool ParseSeedProgram(std::span<const uint8_t> bytes, SeedProgram& seed) {
+		ShaderDiskCache::ByteReader in(bytes);
+		uint8_t                     tag = 0;
+		uint32_t                    stage = 0;
+		uint64_t                    size = 0;
+		if (!in.Get(tag) || tag != PipelineSeeds::KindProgram || !in.Get(stage) ||
+		    !in.Get(seed.shader_hash) || !in.Get(seed.wave_size) || !in.Get(seed.user_data_base) ||
+		    !in.Get(seed.push_data_cursor) || !in.Get(seed.kind) || !in.GetWords(seed.code) ||
+		    !in.GetWords(seed.back_code) || !in.GetWords(seed.user_data) || !in.Get(size)) {
+			return false;
+		}
+		seed.stage = static_cast<ShaderType>(stage);
+		void* target = nullptr;
+		switch (seed.kind) {
+			case 0: target = &seed.vertex; if (size != sizeof(ShaderVertexInputInfo)) return false; break;
+			case 1: target = &seed.pixel; if (size != sizeof(ShaderPixelInputInfo)) return false; break;
+			case 2: target = &seed.compute; if (size != sizeof(ShaderComputeInputInfo)) return false; break;
+			default: return false;
+		}
+		const auto offset = bytes.size() - in.Remaining();
+		if (in.Remaining() < size) {
+			return false;
+		}
+		std::memcpy(target, bytes.data() + offset, size);
+		ShaderDiskCache::ByteReader rest(bytes.subspan(offset + size));
+		return ShaderDiskCache::ReadSpecialization(rest, seed.specialization) && rest.AtEnd() &&
+		       !seed.code.empty() && seed.user_data.size() <= 64;
+	}
+
+	// Called once before ReplaySeed runs on several threads.
+	void PrepareReplay() {
+		if (disk != nullptr && disk_session_key.empty()) {
+			disk_session_key = ShaderDiskCache::SessionKey(disk_session);
+		}
+	}
+
+	enum class SeedOutcome : uint8_t { Cached, Compiled, Failed };
+
+	// Translates and compiles a program seed into the disk cache (what Get would on its first
+	// draw), keeping its SPIR-V and program for the pipelines. Any thread; no modules made.
+	template <typename InputInfo>
+	SeedOutcome ReplaySeed(SeedProgram& seed, InputInfo& info) {
+		ShaderRecompiler::CompileOptions options;
+		ShaderStageInputInfo             stage_input {};
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage_input.vertex = &info;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			stage_input.pixel = &info;
+		} else {
+			stage_input.compute = &info;
+		}
+		options.stage           = seed.stage;
+		options.shader_hash     = seed.shader_hash;
+		options.user_data       = seed.user_data;
+		options.back_code       = seed.back_code;
+		options.dump_label      = "ShaderRecompiler (precompile)";
+		options.input_info      = stage_input;
+		options.wave_size       = seed.wave_size;
+		options.user_data_base  = seed.user_data_base;
+		options.non_fatal       = ShaderFailureNonFatal();
+		options.bindless_images = bindless_images;
+		ShaderParams params;
+		params.code            = seed.code;
+		params.back_code       = seed.back_code;
+		params.hash            = seed.shader_hash;
+		std::vector<uint8_t> source_key, permutation_key, payload;
+		bool                 source_cached = false;
+		if (disk != nullptr) {
+			BuildSourceKey(source_key, seed.code, params, options, info);
+			BuildPermutationKey(permutation_key, source_key, seed.specialization, seed.push_data_cursor);
+			ShaderDiskCache::PermutationRecord record;
+			if (disk->Load(permutation_key, payload) &&
+			    ShaderDiskCache::DecodePermutationRecord(payload, record)) {
+				seed.spirv   = std::move(record.spirv);
+				seed.program = std::move(record.program);
+				return SeedOutcome::Cached;
+			}
+			ShaderDiskCache::SourceRecord source;
+			if (disk->Load(source_key, payload) && ShaderDiskCache::DecodeSourceRecord(payload, source)) {
+				if (source.unsupported || (source.uses_clock && !shader_clock)) {
+					return SeedOutcome::Failed;
+				}
+				source_cached = true;
+			}
+		}
+		auto translated = ShaderRecompiler::TranslateProgram(seed.code, options);
+		if (translated.unsupported) {
+			return SeedOutcome::Failed;
+		}
+		const bool uses_clock = UsesShaderClock(translated.program);
+		if (disk != nullptr && !source_cached) {
+			const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			if (ShaderDiskCache::EncodeSourceRecord(false, uses_clock, &plan, payload) &&
+			    ShaderDiskCache::SourceRecordRoundTrips(payload)) {
+				disk->Save(source_key, payload);
+			}
+		}
+		if (uses_clock && !shader_clock) {
+			return SeedOutcome::Failed;
+		}
+		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                               seed.specialization, seed.push_data_cursor);
+		if (result.unsupported != nullptr || result.spirv.empty()) {
+			return SeedOutcome::Failed;
+		}
+		seed.spirv   = std::move(result.spirv);
+		seed.program = std::move(result.program).TakeCompiledInfo();
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, seed.spirv)) {
+			return SeedOutcome::Failed;
+		}
+		if (disk != nullptr) {
+			ShaderDiskCache::EncodePermutationRecord(seed.spirv, seed.program, payload);
+			if (ShaderDiskCache::PermutationRecordRoundTrips(payload)) {
+				disk->Save(permutation_key, payload);
+			}
+		}
+		return SeedOutcome::Compiled;
+	}
+
+	// The modules of a replayed seed (serialized: the variant counters are not atomic).
+	void MakeSeedModules(SeedProgram& seed) {
+		std::lock_guard                  lock(seed_modules_mutex);
+		ShaderRecompiler::CompileOptions options;
+		options.stage       = seed.stage;
+		options.shader_hash = seed.shader_hash;
+		options.dump_label  = "ShaderRecompiler (precompile)";
+		seed.modules        = MakeModules(options, seed.spirv, seed.program);
+	}
+	void FlushDiskForReplay() {
+		if (disk != nullptr) {
+			disk->Flush();
+		}
+	}
+	std::mutex seed_modules_mutex;
+
 	// A compiled (or cached) permutation of the source: its module, bound for this stage.
 	template <typename InputInfo>
 	ShaderProgram AddPermutation(SourceEntry& source, const char* stage_name,
@@ -2560,36 +2842,10 @@ struct PipelineCache::ProgramCache {
 		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
-		std::vector<uint32_t> exact;
-		if (options.stage != ShaderType::Pixel && options.stage != ShaderType::Compute &&
-		    ExactFloatShader(options.shader_hash)) {
-			exact = ExactFloatVariant(options, spirv);
-		}
-		std::vector<uint32_t> mesh_test;
-		if (options.stage == ShaderType::Mesh) {
-			if (const auto flags = MeshTestSetting() | MeshHostFlags(); flags != 0) {
-				mesh_test = MeshTestVariant(options, exact.empty() ? spirv : exact, flags);
-			}
-		}
-		const auto module = CompileSPV(!mesh_test.empty() ? mesh_test
-		                               : exact.empty()    ? spirv
-		                                                  : exact,
-		                               device);
-		EXIT_IF(module == nullptr);
-		vk::ShaderModule pixel_rate_module = nullptr;
-		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			if (pixel_rate_variants &&
-			    std::ranges::any_of(program.info.inputs, [](const auto& input) {
-				    return input.kind == ShaderRecompiler::IR::StageInputKind::SampleId;
-			    })) {
-				pixel_rate_module = CompilePixelRateVariant(options, spirv);
-			}
-		}
-		vk::ShaderModule normalized_module = nullptr;
-		if (options.stage == ShaderType::TessellationControl && UnnormalizedFixBuilt() &&
-		    !program.info.sampled_pairs.empty()) {
-			normalized_module = CompileNormalizedVariant(options, exact.empty() ? spirv : exact);
-		}
+		const auto modules           = MakeModules(options, spirv, program);
+		const auto module            = modules.module;
+		const auto pixel_rate_module = modules.pixel_rate;
+		const auto normalized_module = modules.normalized;
 		phases.End();
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -2610,6 +2866,7 @@ struct PipelineCache::ProgramCache {
 		                            .normalized_id     = normalized_module != nullptr ? ++next_shader_id : 0u},
 		});
 		const auto& permutation = source.permutations.back();
+		RecordSeed(options, input_info, source.specialization, push_data_cursor, permutation.handle);
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -3012,6 +3269,7 @@ struct PipelineCache::ProgramCache {
 		const auto compile_code = lookup_key.function_code.empty()
 		                              ? params.code
 		                              : std::span<const uint32_t>(lookup_key.function_code);
+		seed_code = compile_code;
 		// The shader disk cache (shaderDiskCache.h): a source entry stands in for the translation
 		// of a source new to this session, a permutation entry for the compile. In verify mode
 		// both are only compared with a fresh translation. A hit is not a compile: it is not
@@ -4363,14 +4621,8 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	         : "");
 	InitializeDriverCache();
 	{
-		// Pipeline seeds (pipelineSeeds.h): recorded beside the shader disk cache, by session.
-		const auto session_key = ShaderDiskCache::SessionKey(ShaderDiskCache::SessionInfo {
-		    .vendor_id           = graphics.GetPhysicalDeviceProperties().vendorID,
-		    .device_id           = graphics.GetPhysicalDeviceProperties().deviceID,
-		    .bindless_images     = graphics.bindless_enabled && Config::BindlessImagesEnabled(),
-		    .float_image_atomics = Config::FloatImageAtomicsEnabled()});
-		PipelineSeeds::Open(ShaderDiskCacheDirectory(),
-		                    XXH3_64bits(session_key.data(), session_key.size()));
+		// Guest pipeline seeds (pipelineSeeds.h): beside the shader disk cache, for any GPU.
+		PipelineSeeds::Open(ShaderDiskCacheDirectory(), SeedFormat());
 	}
 	if (g_async_pipelines) {
 		// KYTY_PIPELINE_THREADS=<n>; by default half the processors, 2 to 16, at below normal
@@ -4662,14 +4914,284 @@ void PipelineCache::InitializeDriverCache() {
 	                 (older_bytes + initial_data.size()) >> 20u);
 }
 
-void PipelineCache::PrecompileSeeds() {
-	const auto result = PipelineSeeds::Replay(m_graphics.device, m_driver_cache, m_driver_older,
-	                                          m_graphics.bindless_layout,
-	                                          m_graphics.pipeline_cache_control_enabled);
-	PipelineCacheLog("Pipeline seeds: precompile wrote {} new pipelines into the driver cache",
-	                 result.compiled);
+void PipelineCache::RecordPipelineSeed(const GraphicsPipelineKey& key, const GraphicsPrograms& programs,
+                                       uint32_t vertex_stages, bool ps_active) {
+	ShaderDiskCache::ByteWriter payload;
+	payload.Put(PipelineSeeds::KindPipeline);
+	payload.Put(static_cast<uint8_t>(vertex_stages));
+	for (uint32_t i = 0; i < vertex_stages; i++) {
+		const auto hash = PipelineSeeds::ProgramHash(programs.vertex[i].id);
+		if (hash == 0) {
+			return; // a program without a seed (recording was off when it was made)
+		}
+		payload.Put(hash);
+		payload.Put(programs.vertex[i].normalized_samplers);
+	}
+	payload.Put(ps_active);
+	if (ps_active) {
+		const auto hash = PipelineSeeds::ProgramHash(programs.pixel.id);
+		if (hash == 0) {
+			return;
+		}
+		payload.Put(hash);
+	}
+	payload.PutBytes({reinterpret_cast<const uint8_t*>(&key.rendering), sizeof(key.rendering)});
+	payload.PutBytes({reinterpret_cast<const uint8_t*>(&key.static_params), sizeof(key.static_params)});
+	payload.Put(key.vertex_input.binding_count);
+	for (uint32_t i = 0; i < key.vertex_input.binding_count; i++) {
+		payload.Put(key.vertex_input.bindings[i].stride);
+		payload.Put(key.vertex_input.bindings[i].instance);
+	}
+	payload.Put(key.vertex_input.attribute_count);
+	for (uint32_t i = 0; i < key.vertex_input.attribute_count; i++) {
+		payload.Put(key.vertex_input.attributes[i].offset);
+		payload.Put(key.vertex_input.attributes[i].binding);
+	}
+	PipelineSeeds::RecordPipeline(std::move(payload.bytes));
 }
 
+uint64_t PipelineCache::SeedFormat() {
+	// The structures a seed copies whole: another layout is another format (the seeds of an older
+	// emulator build are then set aside, and a release's seed file has to be made again).
+	const uint64_t sizes[] = {2,
+	                          sizeof(ShaderVertexInputInfo),
+	                          sizeof(ShaderPixelInputInfo),
+	                          sizeof(ShaderComputeInputInfo),
+	                          sizeof(PipelineRenderingState),
+	                          sizeof(PipelineStaticParameters),
+	                          static_cast<uint64_t>(ShaderVertexInputInfo::RES_MAX)};
+	return XXH3_64bits(sizes, sizeof(sizes));
+}
+
+void PipelineCache::PrecompileSeeds() {
+	using Seed    = ProgramCache::SeedProgram;
+	using Outcome = ProgramCache::SeedOutcome;
+	const auto begin   = std::chrono::steady_clock::now();
+	uint32_t   other   = 0;
+	auto       records = PipelineSeeds::LoadAll(&other);
+
+	std::unordered_map<uint64_t, std::unique_ptr<Seed>> programs;
+	std::vector<std::span<const uint8_t>>              pipelines;
+	uint32_t                                           damaged = 0;
+	for (const auto& record: records) {
+		if (record.payload.empty()) continue;
+		if (record.payload[0] == PipelineSeeds::KindProgram) {
+			auto seed = std::make_unique<Seed>();
+			if (ProgramCache::ParseSeedProgram(record.payload, *seed)) {
+				seed->record = record.hash;
+				programs.emplace(record.hash, std::move(seed));
+			} else {
+				damaged++;
+			}
+		} else if (record.payload[0] == PipelineSeeds::KindPipeline) {
+			pipelines.emplace_back(record.payload);
+		}
+	}
+	std::vector<Seed*> program_list;
+	program_list.reserve(programs.size());
+	for (auto& [hash, seed]: programs) program_list.push_back(seed.get());
+	const auto total = static_cast<uint32_t>(program_list.size() + pipelines.size());
+	const uint32_t threads = std::max(1u, std::thread::hardware_concurrency());
+	PipelineCacheLog("Pipeline seeds: precompiling {} programs and {} graphics pipelines on {} threads "
+	                 "({} records unreadable, {} files of another build)",
+	                 program_list.size(), pipelines.size(), threads, damaged, other);
+	m_program_cache->PrepareReplay();
+
+	const ShaderRecompiler::IR::ResourceSnapshot no_resources {};
+	std::atomic<uint32_t> done {0}, compiled {0}, failed {0}, cached {0};
+	std::atomic<bool>     stop {false};
+	const bool            wave64 = m_graphics.SupportsComputeWave64();
+	const auto            lds_limit =
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+
+	const auto run_parallel = [&](size_t count, const auto& fn) {
+		std::atomic<size_t>      next {0};
+		std::atomic<uint32_t>    exited {0};
+		std::vector<std::thread> workers;
+		for (uint32_t t = 0; t < threads; t++) {
+			workers.emplace_back([&] {
+				for (;;) {
+					const auto i = next.fetch_add(1);
+					if (i >= count || stop.load(std::memory_order_relaxed)) break;
+					fn(i);
+					done++;
+				}
+				exited++;
+			});
+		}
+		while (exited.load() < threads) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			PipelineSeeds::WriteProgress(done, total, compiled, failed, false);
+			if (PipelineSeeds::StopRequested()) {
+				stop = true;
+			}
+		}
+		for (auto& w: workers) w.join();
+	};
+
+	// 1. Programs: translated and compiled into the shader disk cache; compute pipelines made.
+	run_parallel(program_list.size(), [&](size_t i) {
+		auto&   seed    = *program_list[i];
+		Outcome outcome = Outcome::Failed;
+		switch (seed.kind) {
+			case 0: {
+				auto& info = seed.vertex;
+				if (info.logical_stage == ShaderType::Mesh) {
+					if (!m_graphics.mesh_shader_enabled) break;
+					auto&      mesh     = info.mesh;
+					const auto required = m_graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT,
+					                                                      mesh.wave_size);
+					mesh.host_subgroup_size = required != 0 ? required : m_graphics.subgroup_size;
+					const auto& limits      = m_graphics.mesh_shader_properties;
+					mesh.passes             = mesh.PassesFor(
+                        std::min(limits.maxMeshWorkGroupInvocations, limits.maxMeshWorkGroupSize[0]));
+					if (mesh.passes == 0) break;
+				}
+				outcome = m_program_cache->ReplaySeed(seed, info);
+				break;
+			}
+			case 1: outcome = m_program_cache->ReplaySeed(seed, seed.pixel); break;
+			case 2:
+				seed.compute.host_subgroup_size = wave64 ? 64u : 32u;
+				seed.compute.lds_storage        = seed.compute.lds_size_dwords * 4u > lds_limit;
+				outcome = m_program_cache->ReplaySeed(seed, seed.compute);
+				break;
+			default: break;
+		}
+		if (outcome == Outcome::Failed) {
+			failed++;
+			return;
+		}
+		(outcome == Outcome::Compiled ? compiled : cached)++;
+		m_program_cache->MakeSeedModules(seed);
+		seed.ok = seed.modules.module != nullptr;
+		if (seed.ok && seed.kind == 2) {
+			Pipeline pipeline;
+			auto     info = seed.compute;
+			info.stage    = {.program = &seed.program, .resources = &no_resources};
+			if (CreatePipelineInternal(m_graphics, pipeline, info, seed.modules.module, m_driver_cache,
+			                           m_driver_older, ComputeBuild::Full)) {
+				if (pipeline.pipeline != nullptr) m_graphics.device.destroyPipeline(pipeline.pipeline);
+			}
+			if (pipeline.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout);
+			if (pipeline.descriptor_set_layout != nullptr)
+				m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout);
+		}
+	});
+
+	// 2. Graphics pipelines, from the programs' modules, into the driver cache.
+	if (!stop.load()) {
+		run_parallel(pipelines.size(), [&](size_t i) {
+			ShaderDiskCache::ByteReader in(pipelines[i]);
+			uint8_t                     tag = 0, stages = 0;
+			bool                        ps_active = false;
+			std::array<Seed*, 3>        vertex {};
+			std::array<bool, 3>         normalized {};
+			Seed*                       pixel = nullptr;
+			const auto find = [&](uint64_t hash) -> Seed* {
+				const auto it = programs.find(hash);
+				return it != programs.end() && it->second->ok ? it->second.get() : nullptr;
+			};
+			bool ok = in.Get(tag) && in.Get(stages) && (stages == 1 || stages == 3);
+			for (uint32_t s = 0; ok && s < stages; s++) {
+				uint64_t hash = 0;
+				ok = in.Get(hash) && in.Get(normalized[s]) && (vertex[s] = find(hash)) != nullptr &&
+				     vertex[s]->kind == 0;
+			}
+			if (ok && in.Get(ps_active) && ps_active) {
+				uint64_t hash = 0;
+				ok = in.Get(hash) && (pixel = find(hash)) != nullptr && pixel->kind == 1;
+			}
+			GraphicsPipelineKey key {};
+			const auto          read_raw = [&](void* target, size_t size) {
+                const auto offset = pipelines[i].size() - in.Remaining();
+                if (!ok || in.Remaining() < size) return false;
+                std::memcpy(target, pipelines[i].data() + offset, size);
+                ShaderDiskCache::ByteReader skip(pipelines[i].subspan(offset + size));
+                in = skip;
+                return true;
+			};
+			ok = ok && read_raw(&key.rendering, sizeof(key.rendering)) &&
+			     read_raw(&key.static_params, sizeof(key.static_params)) &&
+			     in.Get(key.vertex_input.binding_count) &&
+			     key.vertex_input.binding_count <= ShaderVertexInputInfo::RES_MAX;
+			for (uint32_t b = 0; ok && b < key.vertex_input.binding_count; b++) {
+				ok = in.Get(key.vertex_input.bindings[b].stride) && in.Get(key.vertex_input.bindings[b].instance);
+			}
+			ok = ok && in.Get(key.vertex_input.attribute_count) &&
+			     key.vertex_input.attribute_count <= ShaderVertexInputInfo::RES_MAX;
+			for (uint32_t a = 0; ok && a < key.vertex_input.attribute_count; a++) {
+				ok = in.Get(key.vertex_input.attributes[a].offset) &&
+				     in.Get(key.vertex_input.attributes[a].binding);
+			}
+			if (!ok || !in.AtEnd()) {
+				failed++;
+				return;
+			}
+			std::array<ShaderVertexInputInfo, 3> vertex_info {};
+			GraphicsPrograms                     progs;
+			for (uint32_t s = 0; s < stages; s++) {
+				vertex_info[s]       = vertex[s]->vertex;
+				vertex_info[s].stage = {.program = &vertex[s]->program, .resources = &no_resources};
+				auto& p              = progs.vertex[s];
+				p.id                 = s + 1;
+				p.module             = vertex[s]->modules.module;
+				p.spirv_words        = static_cast<uint32_t>(vertex[s]->spirv.size());
+				p.hash               = vertex[s]->shader_hash;
+				if (normalized[s]) {
+					if (vertex[s]->modules.normalized == nullptr) {
+						failed++;
+						return;
+					}
+					p.module              = vertex[s]->modules.normalized;
+					p.normalized_samplers = true;
+				}
+			}
+			ShaderPixelInputInfo pixel_info {};
+			if (ps_active) {
+				pixel_info                   = pixel->pixel;
+				pixel_info.stage             = {.program = &pixel->program, .resources = &no_resources};
+				progs.pixel.id                = 4;
+				progs.pixel.module            = pixel->modules.module;
+				progs.pixel.spirv_words       = static_cast<uint32_t>(pixel->spirv.size());
+				progs.pixel.hash              = pixel->shader_hash;
+				progs.pixel.pixel_rate_module = pixel->modules.pixel_rate;
+			}
+			Pipeline   pipeline;
+			const auto build = PrepareGraphicsPipeline(
+			    m_graphics, pipeline, key.rendering, key.vertex_input,
+			    std::span<const ShaderVertexInputInfo>(vertex_info.data(), stages),
+			    ps_active ? &pixel_info : nullptr, progs, key.static_params);
+			if (CreateFromOlderFiles(*build, m_driver_older, &pipeline.pipeline)) {
+				cached++;
+			} else if (CreateGraphicsPipeline(*build, m_driver_cache, &pipeline.pipeline) ==
+			               vk::Result::eSuccess &&
+			           pipeline.pipeline != nullptr) {
+				compiled++;
+			} else {
+				failed++;
+			}
+			if (pipeline.pipeline != nullptr) m_graphics.device.destroyPipeline(pipeline.pipeline);
+			if (pipeline.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout);
+			if (pipeline.descriptor_set_layout != nullptr)
+				m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout);
+		});
+	}
+
+	for (auto& [hash, seed]: programs) {
+		for (const auto module: {seed->modules.module, seed->modules.pixel_rate, seed->modules.normalized}) {
+			if (module != nullptr) m_graphics.device.destroyShaderModule(module);
+		}
+	}
+	m_program_cache->FlushDiskForReplay();
+	const auto secs =
+	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - begin).count();
+	PipelineCacheLog("Pipeline seeds: precompile {} in {} s: {} made, {} already cached, {} failed, {} of {} done",
+	                 stop.load() ? "stopped" : "finished", secs, compiled.load(), cached.load(), failed.load(),
+	                 done.load(), total);
+	PipelineSeeds::WriteProgress(done, total, compiled, failed, true);
+	PipelineSeeds::RemoveStopFile();
+}
 void PipelineCache::Save() {
 	PipelineSeeds::Flush();
 	{
@@ -6084,6 +6606,11 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	if (PipelineSeeds::Recording() && coverage_module == nullptr) {
+		// Guest pipeline seeds (pipelineSeeds.h): once per new pipeline, its programs by their
+		// seeds and the key's state.
+		RecordPipelineSeed(key, programs, static_cast<uint32_t>(vertex_info.size()), ps_active);
+	}
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	auto build_programs            = programs;
