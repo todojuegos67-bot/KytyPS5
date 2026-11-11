@@ -113,3 +113,20 @@ powershell -ExecutionPolicy Bypass -File tools\local\windows\pgo-multi.ps1 -Spec
 （`<存档>+KYTY_SCOUT=0+KYTY_SPECULATE=4`）。`llvm-profdata merge` 把同一函数的计数相加：模式 0 走的函数仍然带着
 模式 0 五次的计数（加上模式 4 里同样经过它们的次数），只在模式 4 运行的函数多了计数。前五个原始 profile 单独合并，
 就是不带 `-Speculate` 的 profile。
+
+## IR 级 profile（`KYTY_PGO_KIND=ir`）
+
+插桩构建默认用 clang 前端的计数（`-fprofile-instr-generate`）。`-DKYTY_PGO_KIND=ir` 改用 LLVM 的 IR 级计数
+（`-fprofile-generate`），计数取在优化器实际看到的代码上。优化构建不用改：`-fprofile-instr-use` 两种都能读，按文件头区分；
+live 命令 `pgo <file>` 也一样。
+
+```
+powershell -ExecutionPolicy Bypass -File tools\local\windows\pgo-multi.ps1 -Kind ir
+```
+
+- 插桩版本建在 `_Build\windows-pgogen-ir`：`KYTY_CMAKE_ARGS` 只在目录第一次配置时生效，已有的 `_Build\windows-pgogen`
+  会一直是前端计数。`pgo-train.ps1` 发现目录里的计数种类不对就不训练。
+- 原始 profile 和合并结果名为 `kyty-ir-<日期>*`。两种 profile 不能合并，换用 IR 要把所有场景重新训练。
+- 过时检查：IR profile 的失配不报 `-Wprofile-instr-out-of-date`，而是 `-Wbackend-plugin` 的
+  "function control flow change detected (hash mismatch)"（构建同样用 `-Wno-backend-plugin` 关掉了），扫描时把它也打开。
+- IR profile 的函数数比前端的少，因为它在早期内联之后才计数，这是正常的。
