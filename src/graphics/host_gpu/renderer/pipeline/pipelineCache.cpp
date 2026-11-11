@@ -1,4 +1,5 @@
 #include "graphics/phaseStats.h"
+#include "graphics/host_gpu/regionManager.h"
 #include <optional>
 #include "graphics/drawDiff.h"
 #include "graphics/frameCosts.h"
@@ -799,7 +800,7 @@ struct PipelineCache::ProgramCache {
 	uint64_t patch_no_base = 0, patch_unlearned = 0, patch_reads_changed = 0, patch_banned_programs = 0;
 	uint64_t patch_obs_ok = 0, patch_obs_log = 0, patch_obs_spec = 0, patch_obs_other = 0, patch_obs_unexplained = 0;
 	uint64_t patch_obs_many = 0, patch_obs_memory = 0, patch_obs_ambiguous = 0, patch_obs_shape = 0;
-	uint64_t patch_relocated_reads = 0, patch_gave_up = 0;
+	uint64_t patch_relocated_reads = 0, patch_gave_up = 0, patch_same_inputs = 0, patch_other_shape = 0;
 	std::chrono::steady_clock::time_point patch_report = std::chrono::steady_clock::now();
 
 	static uint32_t* PatchSlot(ShaderRecompiler::IR::ResourceSnapshot& r, const PatchPosition& p) {
@@ -838,10 +839,13 @@ struct PipelineCache::ProgramCache {
 	// The patched result into entry.resources/specialization, or false (nothing changed).
 	bool TryPatch(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime, ShaderReadChunks& reads) {
 		auto& pt = entry.patch;
-		if (!pt.valid || pt.banned || pt.key.size() != runtime.user_data.size() ||
-		    pt.shader_base != runtime.shader_base || pt.workgroup_count != runtime.workgroup_count ||
-		    pt.workgroup_size != runtime.workgroup_size) {
+		if (!pt.valid || pt.banned) {
 			patch_no_base++;
+			return false;
+		}
+		if (pt.key.size() != runtime.user_data.size() || pt.shader_base != runtime.shader_base ||
+		    pt.workgroup_count != runtime.workgroup_count || pt.workgroup_size != runtime.workgroup_size) {
+			patch_other_shape++;
 			return false;
 		}
 		bool any = false;
@@ -853,10 +857,9 @@ struct PipelineCache::ProgramCache {
 			}
 			any = true;
 		}
-		if (!any) {
-			patch_no_base++;
-			return false; // same inputs: the memo's case
-		}
+		// No word the plan reads changed: the base evaluation itself, if its reads still hold
+		// (a one-slot memo; bypassed programs skip the memo, so this was a full evaluation).
+		const bool same_inputs = !any;
 		// The logged reads, those that move with a pointer word moved by its change, must read
 		// the same words as in the base evaluation.
 		const auto& log = pt.log;
@@ -884,7 +887,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-		patch_hits++;
+		(same_inputs ? patch_same_inputs : patch_hits)++;
 		pt.patches++;
 		return true;
 	}
@@ -1133,14 +1136,17 @@ struct PipelineCache::ProgramCache {
 			return;
 		}
 		patch_report = now;
-		::printf("Memo patch (5 s, KYTY_MEMO_PATCH=%lld): %llu lookups patched instead of evaluated (est. saved %.0f ms "
-		         "at the memo.miss us/call); declined: %llu no base/same inputs, %llu a changed word not learned, %llu "
+		::printf("Memo patch (5 s, KYTY_MEMO_PATCH=%lld): %llu lookups patched + %llu same inputs reused instead of "
+		         "evaluated (est. saved %.0f ms at the memo.miss us/call); declined: %llu no base, %llu other shader "
+		         "base/dispatch size, %llu a changed word not learned, %llu "
 		         "logged reads changed; learning: %llu consistent, inconsistent %llu reads / %llu specialization / %llu "
 		         "other fields / %llu unexplained words, %llu too many words changed, %llu guest words changed, %llu ambiguous, "
 		         "%llu new read structure; %llu reads relocated with a pointer word; %llu programs gave up (64 evaluations, no patch); checks %llu, mismatches %llu "
 		         "(%llu programs banned), verify mismatches %llu\n",
 		         static_cast<long long>(MemoPatchMode()), static_cast<unsigned long long>(patch_hits),
-		         static_cast<double>(patch_hits) * 9.5 / 1000.0, static_cast<unsigned long long>(patch_no_base),
+		         static_cast<unsigned long long>(patch_same_inputs),
+		         static_cast<double>(patch_hits + patch_same_inputs) * 9.5 / 1000.0,
+		         static_cast<unsigned long long>(patch_no_base), static_cast<unsigned long long>(patch_other_shape),
 		         static_cast<unsigned long long>(patch_unlearned), static_cast<unsigned long long>(patch_reads_changed),
 		         static_cast<unsigned long long>(patch_obs_ok), static_cast<unsigned long long>(patch_obs_log),
 		         static_cast<unsigned long long>(patch_obs_spec), static_cast<unsigned long long>(patch_obs_other),
@@ -1154,6 +1160,7 @@ struct PipelineCache::ProgramCache {
 		patch_no_base = patch_unlearned = patch_reads_changed = patch_banned_programs = 0;
 		patch_obs_ok = patch_obs_log = patch_obs_spec = patch_obs_other = patch_obs_unexplained = patch_obs_many = patch_obs_memory = 0;
 		patch_obs_ambiguous = patch_obs_shape = patch_relocated_reads = patch_gave_up = 0;
+		patch_same_inputs = patch_other_shape = 0;
 		std::fflush(stdout);
 	}
 
@@ -2009,10 +2016,13 @@ struct PipelineCache::ProgramCache {
 		}
 		expand_report = now;
 		const auto st = function_expander.TakeStats();
-		::printf("Shader expand (5 s, KYTY_EXPAND_CACHE=%d): %llu compute lookups, %llu without calls; code compared %llu, "
+		::printf("Shader expand (5 s, KYTY_EXPAND_CACHE=%d, KYTY_EXPAND_TABLE_EPOCH=%lld): call tables read %llu, "
+		         "served from this submission's copy %llu; %llu compute lookups, %llu without calls; code compared %llu, "
 		         "skipped by hash %llu; call resolutions run %llu, reused %llu (%llu table words re-read); expansions "
 		         "reused %llu (%llu callee words re-read), built %llu (time: key.expand in Phases)\n",
-		         fast ? 1 : 0, static_cast<unsigned long long>(st.calls), static_cast<unsigned long long>(st.no_calls),
+		         fast ? 1 : 0, static_cast<long long>(Common::LiveSwitches::Get("KYTY_EXPAND_TABLE_EPOCH", 1).load()),
+		         static_cast<unsigned long long>(st.table_reads), static_cast<unsigned long long>(st.table_hits),
+		         static_cast<unsigned long long>(st.calls), static_cast<unsigned long long>(st.no_calls),
 		         static_cast<unsigned long long>(st.code_compares), static_cast<unsigned long long>(st.code_hash_skips),
 		         static_cast<unsigned long long>(st.resolve_full), static_cast<unsigned long long>(st.resolve_reused),
 		         static_cast<unsigned long long>(st.resolve_words_checked),
@@ -2034,6 +2044,14 @@ struct PipelineCache::ProgramCache {
 	                           uint32_t wave_size, ProgramKey& key) {
 		static auto& expand_cache = Common::LiveSwitches::Get("KYTY_EXPAND_CACHE", 1);
 		const bool   fast         = expand_cache.load(std::memory_order_relaxed) != 0;
+		// KYTY_EXPAND_TABLE_EPOCH (live, default 1; 0 = re-read every call table at every
+		// resolution and reuse): a call table is read once per guest submission (what the game
+		// wrote before submitting, as PrepareBda's BDA sync), and reused resolutions are checked
+		// against its version. Only with KYTY_EXPAND_CACHE=1.
+		static auto& table_epoch = Common::LiveSwitches::Get("KYTY_EXPAND_TABLE_EPOCH", 1);
+		function_expander.SetTableEpoch(fast && table_epoch.load(std::memory_order_relaxed) != 0
+		                                    ? g_guest_submission_seq.load(std::memory_order_relaxed)
+		                                    : 0);
 		std::string reason;
 		ShaderRecompiler::Decoder::ShaderFunctionExpander::Result result;
 		const bool ok = function_expander.ExpandShared(

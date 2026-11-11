@@ -12,6 +12,8 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <functional>
+#include <cstring>
 
 #include <xxhash.h>
 
@@ -264,10 +266,15 @@ struct CallSite {
 // Resolves each call's targets from the user data and the memory holding call tables. Which
 // registers it consults depends on the code alone; their values reach the result only through
 // the targets.
+// A call table's words, read whole (nullptr: not readable). ResolveCalls takes the table through
+// it when given, instead of reading it into a new vector.
+using CallTableSource = std::function<const std::vector<uint32_t>*(uint64_t address, size_t words)>;
+
 bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
                   std::span<const uint32_t> user_data, const ShaderCodeReader& read,
                   uint32_t wave_size, std::vector<CallSite>& sites,
-                  std::set<uint32_t>& dependencies, std::string& reason) {
+                  std::set<uint32_t>& dependencies, std::string& reason,
+                  const CallTableSource* table_source = nullptr) {
 	const auto& program = analysis.program;
 	const auto& labels  = analysis.labels;
 	const auto resolve = [&](auto&& self, uint32_t reg, size_t before, size_t first, uint32_t depth,
@@ -409,11 +416,19 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 				reason = "shader call table needs unsupported bounds or addressing";
 				return false;
 			}
-			std::vector<uint32_t> table(size / 4u);
-			if (!read(descriptor.Base48(), table)) {
+			std::vector<uint32_t>        local_table;
+			const std::vector<uint32_t>* table_ptr = nullptr;
+			if (table_source != nullptr) {
+				table_ptr = (*table_source)(descriptor.Base48(), size / 4u);
+			} else {
+				local_table.resize(size / 4u);
+				if (read(descriptor.Base48(), local_table)) table_ptr = &local_table;
+			}
+			if (table_ptr == nullptr) {
 				reason = "shader call table is not fully mapped";
 				return false;
 			}
+			const auto& table = *table_ptr;
 			const uint64_t step       = uint64_t {1} << shift;
 			const uint64_t first_slot = (load.offset % step) + lo->second * 4u;
 			for (uint64_t offset = first_slot; offset + 8u <= size; offset += step) {
@@ -665,12 +680,53 @@ struct ShaderFunctionExpander::Impl {
 		std::vector<std::pair<uint32_t, uint32_t>> consulted; // user-data register, value
 		Reads                                     reads;
 		Reads                                     failed;
+		// Call tables taken through the table cache: address, words, version seen.
+		std::vector<std::array<uint64_t, 3>>      tables;
 		bool                                      ok = false;
 		std::string                               reason;
 		std::vector<CallSite>                     sites;
 		std::set<uint32_t>                        dependencies;
 		std::shared_ptr<Expansion>                expansion; // the last expansion found for it
 	};
+	// wolv-draw-1111b: call tables, read once per read epoch (a guest submission). Log 08:13: the
+	// tables are heap-wide V#s of up to 16 MiB; every resolution read them whole (and a reuse
+	// re-read and compared them), 409 M words per 5 s, key.expand 361 ms.
+	struct Table {
+		uint64_t              words   = 0;
+		uint64_t              epoch   = 0;
+		uint64_t              version = 0; // bumped when a re-read finds other words
+		bool                  ok      = false;
+		std::vector<uint32_t> data;
+		std::vector<uint32_t> scratch;
+	};
+	std::unordered_map<uint64_t, Table> tables; // by address
+	uint64_t                            next_table_version = 1;
+
+	// The table's words as of this epoch; reads it again when the epoch moved (and keeps its
+	// version when the words are the same).
+	Table* GetTable(uint64_t address, size_t words, uint64_t epoch, const ShaderCodeReader& read) {
+		if (tables.size() > 32 && !tables.contains(address)) {
+			tables.clear(); // bounded memory: tables of up to 16 MiB each
+		}
+		auto& t = tables[address];
+		if (epoch != 0 && t.version != 0 && t.words == words && t.epoch == epoch) {
+			stats.table_hits++;
+			return &t;
+		}
+		stats.table_reads++;
+		stats.resolve_words_checked += words;
+		t.scratch.resize(words);
+		const bool ok = words != 0 && read(address, t.scratch);
+		if (t.version == 0 || t.words != words || t.ok != ok || (ok && t.scratch != t.data)) {
+			t.data.swap(t.scratch);
+			t.version = next_table_version++;
+		}
+		t.words = words;
+		t.ok    = ok;
+		t.epoch = epoch;
+		return &t;
+	}
+
 	struct Shader {
 		ShaderAnalysis                          analysis;
 		uint64_t                                code_hash = 0; // registered hash, 0 unknown
@@ -800,6 +856,11 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 					break;
 				}
 			}
+			for (const auto& [address, words, version]: r.tables) {
+				if (!same) break;
+				const auto* t = m_impl->GetTable(address, words, m_table_epoch, read);
+				same          = t->ok && t->version == version;
+			}
 			if (same && m_impl->StillReads(r.reads, r.failed, read, m_impl->stats.resolve_words_checked)) {
 				reused = &r;
 				break;
@@ -830,8 +891,15 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 			    .emplace_back(address, std::vector<uint32_t>(words.begin(), words.end()));
 			return ok;
 		};
+		const CallTableSource table_source = [&](uint64_t address, size_t words) -> const std::vector<uint32_t>* {
+			const auto* t = m_impl->GetTable(address, words, m_table_epoch, read);
+			fresh.tables.push_back({address, words, t->version});
+			return t->ok ? &t->data : nullptr;
+		};
+		const bool use_tables = fast && m_table_epoch != 0;
 		fresh.ok = ResolveCalls(analysis, base, user_data, fast ? recording : read, wave_size,
-		                        fresh.sites, fresh.dependencies, fresh.reason);
+		                        fresh.sites, fresh.dependencies, fresh.reason,
+		                        use_tables ? &table_source : nullptr);
 		if (fast) {
 			for (const auto reg: fresh.dependencies) {
 				fresh.consulted.emplace_back(reg, reg < user_data.size() ? user_data[reg] : 0u);

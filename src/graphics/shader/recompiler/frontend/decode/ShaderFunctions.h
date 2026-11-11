@@ -58,8 +58,14 @@ public:
 	                  uint32_t wave_size, uint64_t code_hash, bool fast, Result& result,
 	                  std::string& reason);
 
+	// wolv-draw-1111b: with `fast`, call tables (heap-wide V#s, up to 16 MiB) are read at most once
+	// per epoch (nonzero; the caller passes the guest submission sequence) and resolutions are
+	// validated against the table's version instead of re-reading it. 0 = read every time.
+	void SetTableEpoch(uint64_t epoch) { m_table_epoch = epoch; }
+
 	// Counters since the last call (Thread_Gpu only).
 	struct Stats {
+		uint64_t table_reads = 0, table_hits = 0;
 		uint64_t calls = 0, no_calls = 0, code_compares = 0, code_hash_skips = 0;
 		uint64_t resolve_full = 0, resolve_reused = 0, expansions_reused = 0, expansions_built = 0;
 		uint64_t resolve_words_checked = 0, callee_words_checked = 0;
@@ -69,6 +75,7 @@ public:
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;
+	uint64_t              m_table_epoch = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
