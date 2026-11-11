@@ -364,6 +364,7 @@ struct Api {
 	PFun_slDLSSGGetState*        dlssg_get_state     = nullptr;
 	PFun_slReflexSetOptions*     reflex_set_options  = nullptr;
 	PFun_slReflexSleep*          reflex_sleep        = nullptr;
+	PFun_slReflexGetState*       reflex_get_state    = nullptr;
 	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
 	PFun_slEvaluateFeature*      evaluate            = nullptr;
 	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr;
@@ -1277,6 +1278,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	// pacer held every present ~25 ms (the game at ~37 fps), and with Reflex off the game reached ~56 but DLSS-G
 	// reported Reflex missing (a tinted picture).
 	FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
+	FeatureFunction(sl::kFeatureReflex, "slReflexGetState", g_api.reflex_get_state); // (KYTY_LATENCY's reports)
 	sl::ReflexOptions& reflex = g_reflex_opts;
 	reflex = {};
 	reflex.mode = sl::ReflexMode::eLowLatency;
@@ -9870,6 +9872,28 @@ void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInpu
 		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
 		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
 	inputs.has_hudless_display = true;
+}
+
+uint32_t ReflexLatencies(uint64_t& after, double* ms, uint32_t max) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_ready || g_api.reflex_get_state == nullptr || max == 0) return 0;
+	static sl::ReflexState state {}; // (large: ~16 KB; called once a second from the latency report only)
+	state = {};
+	if (g_api.reflex_get_state(state) != sl::Result::eOk || !state.latencyReportAvailable) return 0;
+	uint32_t n = 0;
+	uint64_t top = after;
+	for (const auto& r: state.frameReport) {
+		if (r.frameID <= after || r.inputSampleTime == 0 || r.gpuRenderEndTime <= r.inputSampleTime) continue;
+		const double v = static_cast<double>(r.gpuRenderEndTime - r.inputSampleTime) / 1000.0;
+		if (v < 1000.0 && n < max) ms[n++] = v;
+		top = std::max<uint64_t>(top, r.frameID);
+	}
+	after = top;
+	return n;
+#else
+	(void)after, (void)ms, (void)max;
+	return 0;
+#endif
 }
 
 } // namespace Libs::Graphics::FrameGen

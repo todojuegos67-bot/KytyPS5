@@ -93,6 +93,9 @@ std::mutex            g_mutex;
 PFN_vkSetLatencySleepModeNV g_sleep_mode = nullptr;
 PFN_vkLatencySleepNV        g_sleep      = nullptr;
 PFN_vkSetLatencyMarkerNV    g_marker     = nullptr;
+// ---- Reflex reports (VK_NV_low_latency2 without Streamline): vkGetLatencyTimingsNV, input sample -> GPU render end.
+using GetLatencyTimingsFn = void(VKAPI_PTR*)(VkDevice, VkSwapchainKHR, VkGetLatencyMarkerInfoNV*);
+GetLatencyTimingsFn g_timings = nullptr;
 PFN_vkWaitSemaphores        g_wait       = nullptr;
 std::mutex                  g_reflex_mutex;
 VkSwapchainKHR              g_swapchain = VK_NULL_HANDLE;
@@ -231,6 +234,7 @@ void OnDevice(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool extensio
 			g_sleep_mode = reinterpret_cast<PFN_vkSetLatencySleepModeNV>(get_proc(dev, "vkSetLatencySleepModeNV"));
 			g_sleep      = reinterpret_cast<PFN_vkLatencySleepNV>(get_proc(dev, "vkLatencySleepNV"));
 			g_marker     = reinterpret_cast<PFN_vkSetLatencyMarkerNV>(get_proc(dev, "vkSetLatencyMarkerNV"));
+			g_timings    = reinterpret_cast<GetLatencyTimingsFn>(get_proc(dev, "vkGetLatencyTimingsNV"));
 			g_wait       = reinterpret_cast<PFN_vkWaitSemaphores>(get_proc(dev, "vkWaitSemaphores"));
 			auto create_semaphore = reinterpret_cast<PFN_vkCreateSemaphore>(get_proc(dev, "vkCreateSemaphore"));
 			if (g_sleep_mode != nullptr && g_sleep != nullptr && g_marker != nullptr && g_wait != nullptr &&
@@ -609,7 +613,84 @@ struct LatWindow {
 	uint32_t            st_n = 0;
 	int64_t             start = 0, first_present = 0, last_present = 0;
 	uint32_t            presents = 0;
+	std::vector<double> shown;      // measured: input -> the first displayed frame holding it (present wait)
+	uint64_t            reflex_after = 0;
 } g_lat;
+
+// ---- Measured display time (KYTY_LATENCY): VK_KHR_present_wait on the swapchain the driver shows (ours, or the
+// patched FSR 3 DLL's real swapchain behind its frame interpolation one: the real frame's present carries our frame index
+// as its VkPresentIdKHR). A worker thread waits for each real frame's id (vkWaitForPresentKHR, 100 ms at most) and
+// stamps the moment it completes: the frame reached the display. With frame generation the first frame shown that holds
+// frame N's input is the first one interpolated between N - 1 and N, presented 1 / (g + 1) of the way between the two real
+// frames' measured display times (the DLL paces them evenly); generated frames carry no id of their own.
+using WaitForPresentFn = VkResult(VKAPI_PTR*)(VkDevice, VkSwapchainKHR, uint64_t, uint64_t);
+WaitForPresentFn        g_pw_fn     = nullptr;
+VkDevice                g_pw_device = VK_NULL_HANDLE;
+std::mutex              g_pw_sc_mutex;                 // the swapchain waited on (held during a wait)
+VkSwapchainKHR          g_pw_swapchain = VK_NULL_HANDLE;
+std::atomic<bool>       g_pw_ready {false};            // a swapchain to wait on
+struct PwJob {
+	uint64_t id;
+	int64_t  input;
+	int      g;
+};
+std::mutex              g_pw_mutex;
+std::condition_variable g_pw_cv;
+PwJob                   g_pw_jobs[16];
+uint32_t                g_pw_head = 0, g_pw_tail = 0;
+uint64_t                g_pw_last_id = 0;
+int64_t                 g_pw_last_shown = 0;
+
+void PwThread() {
+	for (;;) {
+		PwJob job {};
+		{
+			std::unique_lock lock(g_pw_mutex);
+			g_pw_cv.wait(lock, [] { return g_pw_head != g_pw_tail; });
+			job = g_pw_jobs[g_pw_tail % 16];
+			g_pw_tail++;
+		}
+		int64_t shown = 0;
+		{
+			std::lock_guard lock(g_pw_sc_mutex);
+			if (g_pw_swapchain == VK_NULL_HANDLE) continue;
+			const VkResult r = g_pw_fn(g_pw_device, g_pw_swapchain, job.id, 100000000ull);
+			if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+				g_pw_last_id = 0;
+				continue;
+			}
+			shown = LatNow();
+		}
+		const double per_ms = LatTicksPerMs();
+		double       ms     = static_cast<double>(shown - job.input) / per_ms;
+		if (job.g > 0) {
+			// The first interpolated frame toward N: needs N - 1's display time.
+			if (g_pw_last_id + 1 != job.id || g_pw_last_shown == 0 || shown <= g_pw_last_shown) {
+				g_pw_last_id    = job.id;
+				g_pw_last_shown = shown;
+				continue;
+			}
+			ms -= static_cast<double>(shown - g_pw_last_shown) / per_ms * job.g / (job.g + 1.0);
+		}
+		g_pw_last_id    = job.id;
+		g_pw_last_shown = shown;
+		if (ms <= 0.0 || ms >= 1000.0) continue;
+		std::lock_guard lock(g_lat.mutex);
+		if (g_lat.shown.size() < 4096) g_lat.shown.push_back(ms);
+	}
+}
+
+void PwQueue(uint64_t id, int64_t input, int g) {
+	if (!g_pw_ready.load(std::memory_order_acquire)) return;
+	{
+		std::lock_guard lock(g_pw_mutex);
+		if (g_pw_head - g_pw_tail >= 16) return; // (the display stalled: frames skipped, no backlog)
+		g_pw_jobs[g_pw_head % 16] = {id, input, g};
+		g_pw_head++;
+	}
+	g_pw_cv.notify_one();
+}
+
 
 const char* LatModeName(Mode mode) {
 	if (FrameGen::StreamlineLoaded()) return "reflex-sl"; // (Streamline's Reflex with DLSS / DLSS-G)
@@ -622,15 +703,21 @@ const char* LatModeName(Mode mode) {
 	return Own().on ? "lowlat" : "off";
 }
 // Generated frames per real one right now (0: no frame generation).
+// (11-11: FSR 3 first, and its fixed multiplier read: Streamline loaded for DLSS super resolution next to FSR 3 frame
+// generation made FrameGen::Enabled() true with 0 generated (fg +0), and x3 / x4 (KYTY_FSR3_FG_FRAMES, no KYTY_FSR3_MFG,
+// so no KYTY_FSR3_FG_ACTIVE) counted as x2.)
 int LatGenerated() {
-	if (FrameGen::Enabled()) return std::max(FrameGen::GeneratedFrames(), 0);
 	if (Fsr3::Active()) {
 #if defined(_WIN32)
 		char text[8] {};
-		if (GetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", text, sizeof(text)) > 0) return std::clamp(std::atoi(text), 1, 7);
+		if (GetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", text, sizeof(text)) > 0 && std::atoi(text) > 0)
+			return std::clamp(std::atoi(text), 1, 7);
+		if (GetEnvironmentVariableA("KYTY_FSR3_FG_FRAMES", text, sizeof(text)) > 0 && std::atoi(text) > 0)
+			return std::clamp(std::atoi(text), 1, 3);
 #endif
 		return 1;
 	}
+	if (FrameGen::Enabled()) return std::max(FrameGen::GeneratedFrames(), 0);
 	return 0;
 }
 double LatRefreshMs() {
@@ -672,6 +759,7 @@ void OnPresented(uint64_t frame_index) {
 		g_lat.ms.reserve(512);
 	}
 	if (ms < 1000.0) g_lat.ms.push_back(ms); // (a pause / loading screen: not a frame's latency)
+	PwQueue(frame_index, at, LatGenerated());
 	if (const auto* st = StageFor(frame_index); st != nullptr && ms < 1000.0) {
 		const int64_t in = st->input.load(), rs = st->reserve.load(), rd = st->ready.load(), rl = st->release.load();
 		if (in != 0 && rs >= in && rd >= rs && rl >= rd && now >= rl) {
@@ -704,6 +792,62 @@ void OnPresented(uint64_t frame_index) {
 		                                                 static_cast<double>(g_lat.presents - 1)
 		                                           : 0.0;
 		const double fg = g > 0 ? interval * g / (g + 1.0) : 0.0;
+		{
+			// The measured latency: present wait (the display), else Reflex's reports (input -> GPU render end), else the
+			// estimate above (input -> present + half a refresh + the frame generation hold).
+			const char* source = "estimate";
+			double      rm = mean + scanout + fg, rp = p95 + scanout + fg;
+			uint32_t    rn = static_cast<uint32_t>(n);
+			auto        stats = [&](std::vector<double>& x) {
+                double t = 0.0;
+                for (double y: x) t += y;
+                rm = t / static_cast<double>(x.size());
+                const size_t q = std::min(x.size() - 1, static_cast<size_t>(static_cast<double>(x.size()) * 0.95));
+                std::nth_element(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(q), x.end());
+                rp = x[q];
+                rn = static_cast<uint32_t>(x.size());
+			};
+			std::vector<double> rx;
+			if (!g_lat.shown.empty()) {
+				stats(g_lat.shown);
+				source = "present_wait";
+			} else {
+				double   buf[64];
+				uint32_t k = 0;
+				if (FrameGen::StreamlineLoaded()) {
+					k = FrameGen::ReflexLatencies(g_lat.reflex_after, buf, 64);
+				} else if (g_timings != nullptr) {
+					std::lock_guard rl(g_reflex_mutex);
+					if (g_swapchain != VK_NULL_HANDLE) {
+						static VkLatencyTimingsFrameReportNV reports[64];
+						VkGetLatencyMarkerInfoNV             info {};
+						info.sType       = VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV;
+						info.timingCount = 64;
+						for (auto& r: reports) r = {VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV};
+						info.pTimings = reports;
+						g_timings(g_device, g_swapchain, &info);
+						uint64_t top = g_lat.reflex_after;
+						for (uint32_t i = 0; i < std::min<uint32_t>(info.timingCount, 64); ++i) {
+							const auto& r = reports[i];
+							if (r.presentID <= g_lat.reflex_after || r.inputSampleTimeUs == 0 ||
+							    r.gpuRenderEndTimeUs <= r.inputSampleTimeUs)
+								continue;
+							const double v = static_cast<double>(r.gpuRenderEndTimeUs - r.inputSampleTimeUs) / 1000.0;
+							if (v < 1000.0) buf[k++] = v;
+							top = std::max<uint64_t>(top, r.presentID);
+						}
+						g_lat.reflex_after = top;
+					}
+				}
+				if (k > 0) {
+					rx.assign(buf, buf + k);
+					stats(rx);
+					source = "reflex";
+				}
+			}
+			g_lat.shown.clear();
+			std::printf("[lat] real input->display mean %.1f ms, p95 %.1f (source: %s; n %u, fg x%d)\n", rm, rp, source, rn, g + 1);
+		}
 		std::printf("[lat] input->present mean %.1f ms, p95 %.1f, max %.1f; +scanout %.1f; fg +%.1f (n %u); total %.1f, p95 %.1f; "
 		            "mode %s, fg x%d\n",
 		            mean, p95, max, scanout, fg, static_cast<unsigned>(n), mean + scanout + fg, p95 + scanout + fg,
@@ -1043,7 +1187,39 @@ void* ChainSwapchain(void* next, bool fsr3) {
 	return &g_latency_create;
 }
 
+void OnPresentWait(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool enabled) {
+	if (!LatencyOn()) return;
+	if (enabled && get_proc != nullptr && g_pw_fn == nullptr) {
+		g_pw_device = static_cast<VkDevice>(device);
+		g_pw_fn     = reinterpret_cast<WaitForPresentFn>(get_proc(g_pw_device, "vkWaitForPresentKHR"));
+		if (g_pw_fn != nullptr) std::thread(PwThread).detach();
+	}
+	std::printf("[lat] display time: %s\n", g_pw_fn != nullptr ? "measured (VK_KHR_present_wait)"
+	                                                             : "VK_KHR_present_wait unavailable (Reflex reports or estimate)");
+	std::fflush(stdout);
+}
+
+namespace {
+void PwSwapchain(VkSwapchainKHR swapchain, bool fsr3) {
+	if (g_pw_fn == nullptr) return;
+	VkSwapchainKHR wait = VK_NULL_HANDLE;
+	if (swapchain != VK_NULL_HANDLE && !FrameGen::StreamlineLoaded()) {
+		if (!fsr3) {
+			wait = swapchain;
+		} else if (const auto get = Fsr3RealSwapchain(); get != nullptr) {
+			wait = get(swapchain); // (the patched DLL: the driver swapchain its real frames go to, with our ids)
+		}
+	}
+	g_pw_ready.store(false, std::memory_order_release);
+	std::lock_guard lock(g_pw_sc_mutex); // (a wait in progress ends first: at most 100 ms)
+	g_pw_swapchain = wait;
+	g_pw_last_id   = 0;
+	g_pw_ready.store(wait != VK_NULL_HANDLE, std::memory_order_release);
+}
+} // namespace
+
 void OnSwapchain(VkSwapchainKHR swapchain, bool fsr3) {
+	PwSwapchain(swapchain, fsr3);
 	if (!ReflexActive()) return;
 	std::lock_guard lock(g_reflex_mutex);
 	g_swapchain = VK_NULL_HANDLE;
@@ -1090,6 +1266,7 @@ void AfterPresent(uint64_t frame_index) {
 }
 
 uint64_t PresentId(uint64_t frame_index) {
+	if (g_pw_ready.load(std::memory_order_acquire)) return frame_index; // (KYTY_LATENCY: present wait)
 	if (!ReflexActive()) return 0;
 	std::lock_guard lock(g_reflex_mutex);
 	return g_swapchain != VK_NULL_HANDLE ? frame_index : 0;

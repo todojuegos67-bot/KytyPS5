@@ -5328,6 +5328,7 @@ void Sample(LogState& L,
 	}
 	struct {
 		double mean = 0, max = 0, fps = 0, fg_shown = 0, fg_real = 0, lat_mean = 0, lat_p95 = 0;
+		std::string lat_source;
 		int    fg_mult = 0;
 		int64_t key = -1;
 		bool   any = false;
@@ -5338,6 +5339,7 @@ void Sample(LogState& L,
 		static const std::regex re_rs(R"(\[[a-z0-9]+\][^\r\n]*?real ([0-9.]+) fps, shown ([0-9.]+) fps)");
 		static const std::regex re_x(R"(\[(dlssg|fsr3-mfg)\][^\r\n]*?x(\d))");
 		static const std::regex re_lat(R"(\[lat\] input->present mean ([0-9.]+) ms, p95 ([0-9.]+), max ([0-9.]+); \+scanout ([0-9.]+); fg \+([0-9.]+) \(n (\d+)\)(?:; total ([0-9.]+), p95 ([0-9.]+))?)");
+		static const std::regex re_real(R"(\[lat\] real input->display mean ([0-9.]+) ms, p95 ([0-9.]+) \(source: ([a-z_]+))");
 		std::vector<std::smatch> fm;
 		for (std::sregex_iterator it(text.begin(), text.end(), re_fps), end; it != end; ++it) fm.push_back(*it);
 		int64_t prev_idx = -1;
@@ -5359,10 +5361,18 @@ void Sample(LogState& L,
 		for (std::sregex_iterator it(text.begin(), text.end(), re_lat), end; it != end; ++it) ml = *it, hl = true;
 		if (hx) f.fg_mult = std::atoi(mx[2].str().c_str());
 		if (hr && mr.position(0) > prev_idx && mr[2].str() != mr[1].str()) f.fg_shown = std::round(Num(mr[2])), f.fg_real = std::round(Num(mr[1]));
-		if (hl) {
+		std::smatch mrl;
+		bool        hrl = false;
+		for (std::sregex_iterator it(text.begin(), text.end(), re_real), end; it != end; ++it) mrl = *it, hrl = true;
+		if (hrl) { // (11-11) the measured line: present wait (display) / Reflex reports / estimate
+			f.lat_mean   = Num(mrl[1]);
+			f.lat_p95    = Num(mrl[2]);
+			f.lat_source = mrl[3].str();
+		} else if (hl) {
 			const double add = Num(ml[4]) + Num(ml[5]);
-			f.lat_mean = ml[7].matched ? Num(ml[7]) : Num(ml[1]) + add;
-			f.lat_p95  = ml[8].matched ? Num(ml[8]) : Num(ml[2]) + add;
+			f.lat_mean   = ml[7].matched ? Num(ml[7]) : Num(ml[1]) + add;
+			f.lat_p95    = ml[8].matched ? Num(ml[8]) : Num(ml[2]) + add;
+			f.lat_source = "estimate";
 		}
 	}
 	const bool fg_on = !fg_label.empty() && fg_label != "Sin frame generation" && fg_label != "No frame generation";
@@ -5386,7 +5396,8 @@ void Sample(LogState& L,
 	}
 	if (f.lat_mean > 0) {
 		const ImU32 lc = f.lat_mean < 40 ? kGreen : f.lat_mean < 60 ? kGold : f.lat_mean < 80 ? kOrange : kRed;
-		rows.push_back({"Latencia", Fmt("%.0f ms (p95 %.0f)", f.lat_mean, f.lat_p95), lc});
+		const char* src = f.lat_source == "present_wait" ? "medida" : f.lat_source == "reflex" ? "Reflex" : "estimada";
+		rows.push_back({"Latencia", Fmt("%.0f ms (p95 %.0f, %s)", f.lat_mean, f.lat_p95, src), lc});
 	}
 	// Get-Scale.
 	{

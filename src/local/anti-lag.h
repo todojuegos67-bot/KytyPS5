@@ -93,6 +93,9 @@ void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint6
 // Off: one cached flag test per controller read / flip / present.
 [[nodiscard]] bool LatencyOn();
 void               OnPresented(uint64_t frame_index);
+// KYTY_LATENCY: VK_KHR_present_wait enabled on the device (with present-id): each real frame's display time measured
+// on a worker thread; the [lat] real input->display line (source present_wait | reflex | estimate) once a second.
+void OnPresentWait(vk::Device device, PFN_vkGetDeviceProcAddr get_proc, bool enabled);
 
 } // namespace Libs::Graphics::AntiLag
 

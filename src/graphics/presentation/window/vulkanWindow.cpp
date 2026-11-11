@@ -1023,6 +1023,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		present_id.pNext     = const_cast<void*>(create_info.pNext);
 		create_info.pNext    = &present_id;
 	}
+	VkPhysicalDevicePresentWaitFeaturesKHR present_wait {};
+	const bool present_wait_extension = HasExtension(device_extensions, "VK_KHR_present_wait") &&
+	                                    HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+	if (present_wait_extension) {
+		present_wait.sType       = static_cast<VkStructureType>(1000248000); // ..._PRESENT_WAIT_FEATURES_KHR
+		present_wait.presentWait = VK_TRUE;
+		present_wait.pNext       = const_cast<void*>(create_info.pNext);
+		create_info.pNext        = &present_wait;
+	}
 	vk::PhysicalDevicePipelineBinaryFeaturesKHR     binaries {};
 	vk::PhysicalDeviceMaintenance5FeaturesKHR       maintenance5 {};
 	vk::DevicePipelineBinaryInternalCacheControlKHR internal_cache {};
@@ -1118,6 +1127,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	if (fault_extension) DeviceFault::Enable(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Libs::Graphics::AntiLag::OnDevice(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, anti_lag_extension,
 	                                  reflex_extension);
+	Libs::Graphics::AntiLag::OnPresentWait(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, present_wait_extension);
 
 	return device;
 }
@@ -1636,6 +1646,13 @@ void WindowContext::CreateVulkan() {
 			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
 				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 		}
+		// KYTY_LATENCY=1: VK_KHR_present_wait (with present-id) to time when each real frame reaches the display.
+		if (Libs::Graphics::AntiLag::LatencyOn() && HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, "VK_KHR_present_wait")) {
+			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
+				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+			if (!HasExtension(device_extensions, "VK_KHR_present_wait")) device_extensions.push_back("VK_KHR_present_wait");
+		}
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
@@ -1831,6 +1848,13 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 			device_extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
 			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
 				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		}
+		// KYTY_LATENCY=1: VK_KHR_present_wait (with present-id) to time when each real frame reaches the display.
+		if (Libs::Graphics::AntiLag::LatencyOn() && HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, "VK_KHR_present_wait")) {
+			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
+				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+			if (!HasExtension(device_extensions, "VK_KHR_present_wait")) device_extensions.push_back("VK_KHR_present_wait");
 		}
 	}
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);

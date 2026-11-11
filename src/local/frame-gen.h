@@ -93,6 +93,10 @@ void Initialize();
 [[nodiscard]] double RealFrameInterval();
 // Frames to generate per rendered frame (KYTY_FRAMEGEN; 0 when off).
 [[nodiscard]] int  GeneratedFrames();
+// KYTY_LATENCY: Streamline Reflex's latency reports (slReflexGetState, up to 64 recent frames): each frame's input
+// sample -> GPU render end in ms (microsecond timestamps), only frames with an id above `after`; the highest id seen
+// goes back in `after`. 0 reports: none (no Streamline, no Reflex reports).
+uint32_t ReflexLatencies(uint64_t& after, double* ms, uint32_t max);
 // The present thread's stages around a DLSS-G present, timed into the [dlssg] line: the swapchain image acquire, the
 // wait for the frame's own GPU work (present_scheduler) and the flip's whole Present (the flip is done when it returns).
 void NoteAcquireMs(double ms);

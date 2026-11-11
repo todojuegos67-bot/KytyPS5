@@ -56,6 +56,13 @@ uint32_t        g_compute_family = UINT32_MAX;
 PFN_vkGetDeviceProcAddr g_get_device_proc = nullptr;
 PFN_vkQueueSubmit       g_queue_submit    = nullptr;
 
+// The patched DLL (tools/local/fsr3-mfg) exports kytyFfxGetRealSwapchainVK and reads a chained VkPresentIdKHR;
+// AMD's signed one gets no extra structure.
+bool Fsr3RealSwapchainExported() {
+	static const bool patched = g_dll != nullptr && GetProcAddress(g_dll, "kytyFfxGetRealSwapchainVK") != nullptr;
+	return patched;
+}
+
 // The swapchain context and its replacement functions.
 ffxContext                                g_swapchain_context = nullptr;
 ffxQueryDescSwapchainReplacementFunctionsVK g_functions {};
@@ -848,6 +855,14 @@ vk::Result QueuePresent(GraphicContext& graphics, const vk::PresentInfoKHR& info
 	const auto      begin   = std::chrono::steady_clock::now();
 	VkPresentInfoKHR present = info;
 	present.pNext            = nullptr;
+	// The real frame's VkPresentIdKHR (Reflex markers, KYTY_LATENCY's present wait): the patched DLL reads it and puts it
+	// on that frame's present to the driver swapchain. (Was dropped here: the DLL never saw an id.) Nothing else chained.
+	for (auto* p = static_cast<const VkBaseInStructure*>(info.pNext); p != nullptr; p = p->pNext) {
+		if (p->sType == VK_STRUCTURE_TYPE_PRESENT_ID_KHR && Fsr3RealSwapchainExported()) {
+			present.pNext = p;
+			break;
+		}
+	}
 	// (10-25: the crash minutes into play here, a write to 0x38 in amd_fidelityfx_vk.dll, was its command list pool
 	// running dry: VulkanCommandPool::get returned null with all 8 lists of the shared graphics family in flight.
 	// Fixed in the DLL, tools/local/fsr3-mfg/ffx-sdk-v1.1.4-mfg.patch; AMD's signed DLL keeps the 8-list pool.)
