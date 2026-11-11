@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -132,7 +133,22 @@ void Scheduler::Wait(u64 tick) {
 }
 
 void Scheduler::PopPendingOperations() {
+    // bb-perf-1111 (BB_CP_POPFAST, default on): called on every draw and dispatch; with nothing
+    // queued, or the oldest operation's tick not reached by the last known GPU tick, the timeline
+    // semaphore is read only on every 16th call (1.49 read it on every draw: a driver call).
+    static const bool pop_fast = [] {
+        const char* v = std::getenv("BB_CP_POPFAST");
+        return v == nullptr || v[0] != '0';
+    }();
     std::unique_lock lk(pending_ops_mutex);
+    if (pop_fast) {
+        if (pending_ops.empty()) {
+            return;
+        }
+        if (!work_semaphore.IsFree(pending_ops.front().gpu_tick) && (++bb_pop_skips & 15) != 0) {
+            return;
+        }
+    }
     work_semaphore.Refresh();
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();

@@ -472,6 +472,7 @@ private:
         u64 gpu_tick;
     };
     std::queue<PendingOp> pending_ops;
+    u32 bb_pop_skips = 0; // bb-perf-1111 (BB_CP_POPFAST)
     std::recursive_mutex pending_ops_mutex;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;

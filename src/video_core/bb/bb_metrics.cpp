@@ -252,6 +252,15 @@ bool CpFastPatch() {
     static const bool on = EnvOn("BB_CP_FASTPATCH", true);
     return on;
 }
+uint32_t CpSampleEvery() {
+    static const uint32_t every = [] {
+        const char* v = std::getenv("BB_CP_TIMER_SAMPLE");
+        if (!v || !*v) return 8u;
+        const long n = std::strtol(v, nullptr, 10);
+        return n <= 1 ? 1u : static_cast<uint32_t>(std::min<long>(n, 1024));
+    }();
+    return every;
+}
 bool CpDetail() {
     static const bool on = EnvOn("BB_CP_DETAIL", true);
     return on;
@@ -344,6 +353,12 @@ void PerfLine(int frames_in_flight, int frames_total) {
                  std::max(0.0, cp[CpBind] - cp[CpBuf] - cp[CpTex] - cp[CpScan] - cp[CpPatch] -
                                    cp[CpHook] - cp[CpSamp]));
     }
+    LOG_INFO(Render_Vulkan,
+             "[perf] cp3 ms/s (bb-perf-1111, timed 1 draw in {}): pop pending {:.0f}, filter {:.0f}, "
+             "begin rendering {:.0f}, vertex+index {:.0f}, descriptors+push {:.0f}, dynamic state "
+             "{:.0f}, reset bindings {:.0f}",
+             CpSampleEvery(), cp[CpPop], cp[CpFilter], cp[CpRtBegin], cp[CpVtx], cp[CpDesc],
+             cp[CpDyn], cp[CpReset]);
     LOG_INFO(Render_Vulkan,
              "[perf] {:.0f} fps | threads: {} | GPU cmd processor: {} wait polls, {} sleeps | "
              "present waits {} ({:.1f} ms) | frames in flight {} (max {} of {}) | {}",

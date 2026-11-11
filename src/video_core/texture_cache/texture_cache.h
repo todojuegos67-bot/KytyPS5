@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -128,6 +129,20 @@ public:
     /// BB 0.76: once the native chain turned off, every scene target address back to one
     /// output-size image (its current content copied up, the internal-size image freed).
     void BBNativeOff();
+    /// bb-perf-1111: lookup cache support. The generation changes whenever an image is added to
+    /// or removed from the page table; the last FindImage took the exact-match path (no overlap
+    /// resolve, no new image); BBTouch does what FindImage does to the image it returns.
+    u64 BBGeneration() const noexcept {
+        return bb_generation.load(std::memory_order_acquire);
+    }
+    bool BBLastFindExact() const noexcept {
+        return bb_last_find_exact;
+    }
+    void BBTouch(ImageId image_id) {
+        Image& image = slot_images[image_id];
+        image.tick_accessed_last = scheduler.CurrentTick();
+        TouchImage(image);
+    }
     /// BB 0.83: the image at the same address as image_id with the given size (the other version
     /// of a scene target), made current; null when there is none.
     ImageId BBVersionAt(ImageId image_id, u32 width, u32 height);
@@ -404,6 +419,8 @@ private:
     BufferCache& buffer_cache;
     PageManager& tracker;
     PageTable page_table;
+    std::atomic<u64> bb_generation{1};
+    bool bb_last_find_exact = false;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     Common::SlotVector<Sampler> slot_samplers;

@@ -529,6 +529,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
+    bb_last_find_exact = false;
 
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
@@ -557,6 +558,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         image_id = cache_id;
     }
+    const ImageId bb_exact_id = image_id;
+    const u64 bb_gen_before = bb_generation.load(std::memory_order_acquire);
 
     // Try to resolve overlaps (if any)
     int view_mip{-1};
@@ -598,6 +601,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
+    bb_last_find_exact =
+        static_cast<bool>(bb_exact_id) && image_id == bb_exact_id &&
+        bb_generation.load(std::memory_order_acquire) == bb_gen_before;
 
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {
@@ -965,6 +971,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    bb_generation.fetch_add(1, std::memory_order_acq_rel);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
@@ -983,6 +990,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    bb_generation.fetch_add(1, std::memory_order_acq_rel);
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {

@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include <array>
 #include <bit>
+#include <cstring>
 #include <cmath>
 #include <optional>
+#include <xxhash.h>
 #include "video_core/bb/bb_analyze.h"
 #include "video_core/bb/bb_metrics.h"
 #include "video_core/bb/bb_objmv.h"
@@ -38,6 +41,61 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
     push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
     return push_data;
+}
+
+namespace {
+template <typename... T>
+u64 BBKey(u32 tag, const T&... parts) {
+    std::array<u8, (sizeof(T) + ... + 4)> bytes{};
+    std::memcpy(bytes.data(), &tag, 4);
+    size_t at = 4;
+    ((std::memcpy(bytes.data() + at, &parts, sizeof(T)), at += sizeof(T)), ...);
+    return XXH3_64bits(bytes.data(), bytes.size()) | 1;
+}
+} // namespace
+
+bool Rasterizer::BBImgCacheOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_CP_IMGCACHE");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on && !BB::Upscale::SceneScaleLive();
+}
+
+template <typename Build>
+VideoCore::ImageId Rasterizer::BBFindImageCached(u64 key, VideoCore::TextureCache::ImageDesc& desc,
+                                                 Build&& build) {
+    if (!BBImgCacheOn()) {
+        build(desc);
+        return texture_cache.FindImage(desc);
+    }
+    if (bb_img_cache.empty()) {
+        bb_img_cache.resize(4096);
+    }
+    auto& e = bb_img_cache[key & (bb_img_cache.size() - 1)];
+    if (e.key == key && e.gen == texture_cache.BBGeneration() && e.id) {
+        desc = e.desc;
+        texture_cache.BBTouch(e.id);
+        ++bb_img_hits;
+        return e.id;
+    }
+    build(desc);
+    const auto id = texture_cache.FindImage(desc);
+    ++bb_img_misses;
+    if (texture_cache.BBLastFindExact()) {
+        e.key = key;
+        e.gen = texture_cache.BBGeneration();
+        e.id = id;
+        e.desc = desc;
+    }
+    if (((bb_img_hits + bb_img_misses) & ((1u << 20) - 1)) == 0) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "[perf] bb-perf-1111 image lookup cache (BB_CP_IMGCACHE): {} hits, {} misses since "
+            "start ({:.1f}% hit)",
+            bb_img_hits, bb_img_misses,
+            100.0 * double(bb_img_hits) / double(std::max<u64>(1, bb_img_hits + bb_img_misses))));
+    }
+    return id;
 }
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
@@ -146,8 +204,9 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        std::construct_at(&desc, col_buf, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        image_id = bound_images.emplace_back(
+            BBFindImageCached(BBKey(1, col_buf, hint), desc,
+                              [&](auto& d) { std::construct_at(&d, col_buf, hint); }));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
@@ -157,9 +216,12 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
-                          htile_address, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        image_id = bound_images.emplace_back(BBFindImageCached(
+            BBKey(2, regs.depth_buffer, regs.depth_view, regs.depth_control, htile_address, hint),
+            desc, [&](auto& d) {
+                std::construct_at(&d, regs.depth_buffer, regs.depth_view, regs.depth_control,
+                                  htile_address, hint);
+            }));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {
@@ -265,6 +327,33 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     BBOnDraw(std::bit_width(key.mrt_mask),
              key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)],
              key.stage_hashes[static_cast<u32>(Shader::SwStage::Fragment)]);
+    if (BB::Upscale::Enabled() && !db_desc.image_id) {
+        // bb-perf-1111: a blended draw covering its only colour target (the game's last post
+        // pass) is never the HUD start (BB::Upscale::NoteFullscreenBlend).
+        s32 only = -1;
+        u32 n = 0;
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (cb_descs[cb].image_id) {
+                only = cb;
+                ++n;
+            }
+        }
+        if (n == 1 && regs.blend_control[only].enable) {
+            const auto& info = texture_cache.GetImage(cb_descs[only].image_id).info;
+            const float tw = float(info.bb_scaled ? info.bb_guest_w : info.size.width);
+            const float th = float(info.bb_scaled ? info.bb_guest_h : info.size.height);
+            const auto& vp = regs.viewports[0];
+            const auto& vc = regs.viewport_control;
+            const float vw = vc.xscale_enable ? std::fabs(vp.xscale) * 2.0f : 0.0f;
+            const float vh = vc.yscale_enable ? std::fabs(vp.yscale) * 2.0f : 0.0f;
+            const auto* vs = pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Vertex)];
+            const auto* ps =
+                pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Fragment)];
+            const u64 vs_pgm = vs ? vs->pgm_hash : 0;
+            const bool fs = (vw >= 0.98f * tw && vh >= 0.98f * th) || vs_pgm == 0x0b0acf50ull;
+            BB::Upscale::NoteFullscreenBlend(fs, vs_pgm, ps ? ps->pgm_hash : 0);
+        }
+    }
 }
 
 bool Rasterizer::BBPatchConstants(const void* data, u64 size, std::vector<u32>& out) const {
@@ -394,9 +483,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     BB::Metrics::CpTimer bb_cp_t{BB::Metrics::CpDraw};
     BB::Metrics::g_cp_draws.fetch_add(1, std::memory_order_relaxed);
 
-    scheduler.PopPendingOperations();
+    {
+        BB::Metrics::CpTimer t{BB::Metrics::CpPop};
+        scheduler.PopPendingOperations();
+    }
 
-    if (!FilterDraw()) {
+    if (BB::Metrics::CpTimer t{BB::Metrics::CpFilter}; !FilterDraw()) {
         return;
     }
 
@@ -418,12 +510,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     std::optional<BB::Metrics::CpTimer> bb_rec_t{std::in_place, BB::Metrics::CpRec};
+    std::optional<BB::Metrics::CpTimer> bb_sub_t{std::in_place, BB::Metrics::CpRtBegin};
     const auto state = BeginRendering(pipeline);
 
+    bb_sub_t.emplace(BB::Metrics::CpVtx);
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
+    bb_sub_t.reset();
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -436,8 +531,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                         bb_rt_scale_x, bb_rt_scale_y);
     }
     bb_rec_t.emplace(BB::Metrics::CpRec);
+    bb_sub_t.emplace(BB::Metrics::CpDesc);
     pipeline->BindResources(set_writes, push_data);
+    bb_sub_t.emplace(BB::Metrics::CpDyn);
     UpdateDynamicState(pipeline, is_indexed);
+    bb_sub_t.reset();
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -479,6 +577,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
+    bb_rec_t.reset();
+    BB::Metrics::CpTimer bb_reset_t{BB::Metrics::CpReset};
     ResetBindings(false);
 }
 
@@ -1330,20 +1430,26 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
-            std::construct_at(&desc, tsharp, image_desc);
-
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
-            }
-
+            const u32 tex_flags = u32(image_desc.is_depth) | (u32(image_desc.is_array) << 1) |
+                                  (u32(image_desc.is_written) << 2) |
+                                  (u32(mip_fallback_mode) << 3) |
+                                  (u32(image_desc.constant_mip_index) << 8);
+            const u32 tex_index = static_cast<u32>(i);
             {
                 BB::Metrics::CpTimer t{BB::Metrics::CpTex};
-                image_id = texture_cache.FindImage(desc);
+                image_id = BBFindImageCached(
+                    BBKey(3, tsharp, tex_flags, tex_index), desc, [&](auto& d) {
+                        std::construct_at(&d, tsharp, image_desc);
+                        if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                            ASSERT(num_bindings == 1);
+                            d.view_info.range.base.level += image_desc.constant_mip_index;
+                            d.view_info.range.extent.levels = 1;
+                        } else if (mip_fallback_mode ==
+                                   Shader::MipStorageFallbackMode::DynamicIndex) {
+                            d.view_info.range.base.level += i;
+                            d.view_info.range.extent.levels = 1;
+                        }
+                    });
             }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
@@ -1433,7 +1539,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (!is_storage && !image.info.props.is_depth &&
                 (BB::Upscale::Enabled() || BB::Analyze::Enabled())) {
                 BBNoteSample(image.info.guest_address, image.info.size.width,
-                             image.info.size.height);
+                             image.info.size.height, image_id);
                 switch (BB::Upscale::OnSample(image.info.guest_address, image.info.size.width,
                                               image.info.size.height, image.info.pixel_format)) {
                 case BB::Upscale::Sample::Inject: {

@@ -559,6 +559,7 @@ struct DrawState {
     bool analyze_dump = false;
     bool vertex_camera = false; // a vertex-stage constant holds the forward view-projection
     u64 ps_hash = 0;            // 1.33: the draw's pixel shader (aapass point)
+    bool fullscreen_blend = false; // bb-perf-1111: never a HUD start (NoteFullscreenBlend)
 } g_draw;
 // 1.33 (bb-aapass-133): the upscaler / DLAA point at Bloodborne's own post-processing entry:
 // the scene-colour sample of its first post pass (ps 0x00000ccc53f28aa5 in the 1.32 captures:
@@ -3089,7 +3090,7 @@ bool WantPresentUpscale(VAddr& flip) {
                 }
                 f.post_draw = f.draws;
                 f.post_seen = true;
-            } else if (cand == 0 &&
+            } else if (cand == 0 && !(g_draw.fullscreen_blend && HudSkipFullscreen()) &&
                        (t.addr == f.post_target || IsFlip(t.addr) ||
                         std::find(f.post_targets.begin(),
                                   f.post_targets.begin() + f.num_post_targets,
@@ -3107,7 +3108,7 @@ bool WantPresentUpscale(VAddr& flip) {
         }
         // The last known HUD start: this draw index (or later) into the same target.
         if (cand == 0 && g_learned.hud_draw != 0 && f.draws >= g_learned.hud_draw &&
-            f.post_seen) {
+            f.post_seen && !(g_draw.fullscreen_blend && HudSkipFullscreen())) {
             for (u32 i = 0; i < g_draw.num_colors; ++i) {
                 if (g_draw.colors[i].addr == g_learned.hud_target &&
                     g_draw.colors[i].width == f.gb_w && g_draw.colors[i].height == f.gb_h) {
@@ -3610,6 +3611,48 @@ bool WantHudlessCopy() {
     }
     g_frame.hudless = true;
     return true;
+}
+
+bool HudSkipFullscreen() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_HUD_SKIP_FULLSCREEN");
+        const bool r = v == nullptr || v[0] != '0';
+        Checkpoint(fmt::format("[hud-fs] bb-perf-1111: full-screen blended passes after the post "
+                               "chain are {} (BB_HUD_SKIP_FULLSCREEN={})",
+                               r ? "not a HUD start: HUD point / HUD-less capture after them"
+                                 : "a HUD start (1.49)",
+                               r ? 1 : 0));
+        return r;
+    }();
+    return on;
+}
+
+void NoteFullscreenBlend(bool fullscreen, u64 vs_pgm, u64 ps_pgm) {
+    if (!fullscreen) {
+        return;
+    }
+    std::scoped_lock lk{g_mutex};
+    if (!g_draw.valid || g_draw.compute) {
+        return;
+    }
+    g_draw.fullscreen_blend = true;
+    // Logged for the first few such draws after the scene (the ones that could be a HUD start).
+    static u32 said = 0;
+    if (g_frame.gb_depth != 0 && g_frame.scene_draws > 0 && !g_draw.samples_render_size &&
+        said < 6) {
+        ++said;
+        Checkpoint(fmt::format("[hud-fs] full-screen blended pass vs {:#x} ps {:#x} into {:#x} "
+                               "{}x{} (draw {}): {}",
+                               vs_pgm, ps_pgm, g_draw.num_colors ? g_draw.colors[0].addr : 0,
+                               g_draw.num_colors ? g_draw.colors[0].width : 0,
+                               g_draw.num_colors ? g_draw.colors[0].height : 0, g_frame.draws,
+                               HudSkipFullscreen() ? "skipped as HUD start" : "HUD start allowed"));
+    }
+}
+
+bool DrawIsFullscreenBlend() {
+    std::scoped_lock lk{g_mutex};
+    return g_draw.valid && g_draw.fullscreen_blend;
 }
 
 void OnHudlessCopied() {

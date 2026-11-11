@@ -167,6 +167,13 @@ void OnFlip(VAddr addr, u32 width, u32 height);
 // The current draw renders into the presented image (HUD stage): true once per frame, before its
 // first HUD draw, when the HUD-less copy should be taken.
 bool WantHudlessCopy();
+// bb-perf-1111 (HUD flicker): the current draw is a full-screen blended pass with one colour
+// target (the game's last post pass, vs 0x0b0acf50 / ps 0x8c08444c, drawn after the post chain
+// into the UI image). It is never the HUD start: the HUD point (upscaler / HUD canvas) and the
+// HUD-less capture of the FG curve path move after it. BB_HUD_SKIP_FULLSCREEN=0: 1.49 behaviour.
+void NoteFullscreenBlend(bool fullscreen, u64 vs_pgm, u64 ps_pgm);
+bool HudSkipFullscreen();
+bool DrawIsFullscreenBlend();
 
 // ---- What an injection needs (filled by OnSample(...) == Inject) ----
 struct Plan {

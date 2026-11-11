@@ -103,7 +103,7 @@ public:
     // Frame generation's HUD-less image on the in-place path: the image the presented image is
     // copied from (A) is copied before its first HUD draw, and the game's own per-channel curve
     // from A to the presented image (learned from the frame) is applied to that copy.
-    void BBNoteSample(VAddr address, u32 width, u32 height);
+    void BBNoteSample(VAddr address, u32 width, u32 height, VideoCore::ImageId id = {});
     void BBHudCapturePoint(VideoCore::ImageId target);
     void BBHudlessLut(VideoCore::Image& flip);
     bool BBFrameGenCapture(u32 slot, BB::FG::Inputs& out, vk::ImageView& hudless_view,
@@ -251,6 +251,22 @@ private:
 
     VideoCore::TextureCache::ImageDesc bb_gb_depth_desc{};
     bool bb_gb_depth_valid{};
+
+    // bb-perf-1111 (BB_CP_IMGCACHE): the image a texture / render-target descriptor resolved to
+    // (FindImage's exact match), reused while no image was added to or removed from the texture
+    // cache and the native chain's scaling is not live. Direct-mapped by the descriptor's hash.
+    struct BBImgCacheEntry {
+        u64 key = 0;
+        u64 gen = 0;
+        VideoCore::ImageId id{};
+        VideoCore::TextureCache::ImageDesc desc{};
+    };
+    std::vector<BBImgCacheEntry> bb_img_cache;
+    u64 bb_img_hits = 0, bb_img_misses = 0;
+    bool BBImgCacheOn();
+    template <typename Build>
+    VideoCore::ImageId BBFindImageCached(u64 key, VideoCore::TextureCache::ImageDesc& desc,
+                                         Build&& build);
 
     // Bloodborne upscaling (video_core/bb/bb_upscale.h, vk_rasterizer_bb.cpp).
     bool BBInject(VideoCore::ImageId color_id, const VideoCore::ImageViewInfo& view_info,

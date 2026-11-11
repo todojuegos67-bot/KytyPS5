@@ -171,7 +171,7 @@ struct BBVk {
     void* diag_mapped = nullptr;
     bool diag_pending = false;
     // The in-place HUD-less image through the game's curve (BBHudlessLut).
-    std::vector<std::tuple<VAddr, u32, u32>> draw_samples; // this draw's sampled images
+    std::vector<std::tuple<VAddr, u32, u32, VideoCore::ImageId>> draw_samples; // this draw's sampled images
     std::unordered_map<VAddr, VAddr> sampled_by;            // target -> same-size image it sampled
     VAddr lut_a = 0;                    // the image the presented image is copied from
     bool lut_captured = false;
@@ -179,6 +179,9 @@ struct BBVk {
     OwnImage lut_s, lut_f, lut_out;
     vk::Pipeline lut_pipeline{};
     bool lut_failed_init = false, lut_disabled = false, lut_ready = false;
+    // bb-perf-1111: full-screen post pass skipped as the HUD start this frame; counters.
+    bool lut_fs_skipped = false;
+    u64 lut_fs_skips = 0, lut_fs_final = 0, lut_fs_presents = 0;
     std::array<vk::Buffer, 4> lut_buf{};
     std::array<VmaAllocation, 4> lut_alloc{};
     std::array<void*, 4> lut_mapped{};
@@ -2279,12 +2282,12 @@ void Rasterizer::BBHudAlphaCheck(VideoCore::Image& flip) {
     });
 }
 
-void Rasterizer::BBNoteSample(VAddr address, u32 width, u32 height) {
+void Rasterizer::BBNoteSample(VAddr address, u32 width, u32 height, VideoCore::ImageId id) {
     if (g_bb.lut_disabled || !BB::FG::WantInputs()) {
         return;
     }
     if (g_bb.draw_samples.size() < 16) {
-        g_bb.draw_samples.emplace_back(address, width, height);
+        g_bb.draw_samples.emplace_back(address, width, height, id);
     }
 }
 
@@ -2294,35 +2297,69 @@ void Rasterizer::BBHudCapturePoint(VideoCore::ImageId target_id) {
         return;
     }
     auto& target = texture_cache.GetImage(target_id);
-    const VAddr addr = target.info.guest_address;
+    VAddr addr = target.info.guest_address;
     bool same_size = false;
-    for (const auto& [a, w, h] : g_bb.draw_samples) {
+    bool samples_a = false;
+    bool at_final = false;
+    VideoCore::ImageId a_sampled{};
+    for (const auto& [a, w, h, id] : g_bb.draw_samples) {
         if (w == target.info.size.width && h == target.info.size.height) {
             if (!same_size) g_bb.sampled_by[addr] = a;
             same_size = true;
+            if (a == g_bb.lut_a && a != addr && id) {
+                samples_a = true;
+                a_sampled = id;
+            }
         }
     }
     g_bb.draw_samples.clear();
     if (g_bb.sampled_by.size() > 256) g_bb.sampled_by.clear();
+    // bb-perf-1111: the game's last post pass (a blended full-screen draw into A that samples
+    // nothing of A's size, vs 0x0b0acf50 / ps 0x8c08444c) is not the HUD start: captured before
+    // it, A missed that pass and every pixel of the presented image disagreed with the curve
+    // (HUD pixels = the whole screen, self-check failures, HUD-less off for the session, DLSS-G
+    // warping the HUD). The capture waits for the first real HUD draw; a frame without one takes
+    // A where the final pass reads it. BB_HUD_SKIP_FULLSCREEN=0: 1.49.
+    if (addr == g_bb.lut_a && !g_bb.lut_captured && !same_size &&
+        BB::Upscale::HudSkipFullscreen() && BB::Upscale::DrawIsFullscreenBlend()) {
+        g_bb.lut_fs_skipped = true;
+        ++g_bb.lut_fs_skips;
+        return;
+    }
+    if (samples_a && g_bb.lut_fs_skipped && !g_bb.lut_captured) {
+        // (the final pass reading A, no HUD drawn into A after the full-screen pass)
+        auto& a_img = texture_cache.GetImage(a_sampled);
+        if (a_img.info.guest_address == g_bb.lut_a &&
+            a_img.info.size.width == target.info.size.width &&
+            a_img.info.size.height == target.info.size.height) {
+            target_id = a_sampled;
+            addr = g_bb.lut_a;
+            same_size = false;
+            at_final = true;
+            ++g_bb.lut_fs_final;
+        }
+    }
     // The first draw into A that samples nothing of A's size: its HUD begins (the post-processing
     // passes before it all read a full-size image).
     if (addr != g_bb.lut_a || g_bb.lut_captured || same_size || !InitOnce(instance)) {
         return;
     }
-    const vk::Extent2D extent{target.info.size.width, target.info.size.height};
-    if (!EnsureImage(g_bb.lut_s, extent, target.info.pixel_format,
+    auto& target_a = texture_cache.GetImage(target_id);
+    const vk::ImageLayout a_layout = target_a.backing->state.layout;
+    const vk::Extent2D extent{target_a.info.size.width, target_a.info.size.height};
+    if (!EnsureImage(g_bb.lut_s, extent, target_a.info.pixel_format,
                      vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled)) {
         return;
     }
     scheduler.EndRendering();
-    runtime.Transit(&target, vk::ImageLayout::eTransferSrcOptimal,
+    runtime.Transit(&target_a, vk::ImageLayout::eTransferSrcOptimal,
                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
     runtime.FlushBarriers();
     const auto cmd = scheduler.CommandBuffer();
     Barrier(cmd, g_bb.lut_s, vk::ImageLayout::eTransferDstOptimal,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
-    cmd.copyImage(target.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.lut_s.image,
+    cmd.copyImage(target_a.GetImage(), vk::ImageLayout::eTransferSrcOptimal, g_bb.lut_s.image,
                   vk::ImageLayout::eTransferDstOptimal,
                   vk::ImageCopy{
                       .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
@@ -2332,6 +2369,12 @@ void Rasterizer::BBHudCapturePoint(VideoCore::ImageId target_id) {
     Barrier(cmd, g_bb.lut_s, vk::ImageLayout::eShaderReadOnlyOptimal,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    if (at_final) {
+        // A is sampled by this draw: back to the layout its descriptor was written with.
+        runtime.Transit(&target_a, a_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
+    }
     g_bb.lut_captured = true;
     g_bb.lut_a_id = target_id;
 }
@@ -2346,6 +2389,15 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
     g_bb.lut_ready = false;
     const bool captured = g_bb.lut_captured;
     g_bb.lut_captured = false;
+    g_bb.lut_fs_skipped = false;
+    if (++g_bb.lut_fs_presents % 600 == 0 && BB::Upscale::HudSkipFullscreen()) {
+        BB::FG::Printf("[hud-fs] last 600 presents: %llu full-screen post passes not taken as the "
+                       "HUD start (HUD-less capture after them), %llu captures where the final "
+                       "pass reads A (no HUD drawn after the pass)",
+                       static_cast<unsigned long long>(g_bb.lut_fs_skips),
+                       static_cast<unsigned long long>(g_bb.lut_fs_final));
+        g_bb.lut_fs_skips = g_bb.lut_fs_final = 0;
+    }
     // A: the same-size image the presented image's last draw read (learned for the next frame).
     if (const auto it = g_bb.sampled_by.find(flip.info.guest_address); it != g_bb.sampled_by.end()) {
         if (g_bb.lut_a != it->second) {
@@ -2434,7 +2486,9 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
                        "frame in 0.22)", g_bb.lut_every);
     }
     const bool have_table = g_bb.lut_table_slot < g_bb.lut_buf.size();
-    const bool check = !have_table || (g_bb.lut_recorded % g_bb.lut_every) == 0;
+    // bb-perf-1111: after a failed check the next one comes 8 presents later, not lut_every.
+    const u32 every = (!g_bb.lut_verdict_ok && g_bb.lut_every != ~0u) ? 8u : g_bb.lut_every;
+    const bool check = !have_table || (g_bb.lut_recorded % every) == 0;
     u32 slot = g_bb.lut_table_slot;
     if (check) {
         slot = g_bb.lut_slot;
@@ -2596,7 +2650,21 @@ void Rasterizer::BBHudlessLut(VideoCore::Image& flip) {
                            static_cast<unsigned long long>(g_bb.lut_conflict),
                            static_cast<unsigned long long>(g_bb.lut_mismatch));
         }
-        if (g_bb.lut_bad_streak >= 5 && !g_bb.lut_disabled) {
+        // bb-perf-1111: failed checks no longer turn the HUD-less image off for the session (a
+        // fade or the full-screen pass of a few frames ended it for good: DLSS-G / FSR 3 FG then
+        // warped the HUD until restart). A failed check only holds it back until the next check
+        // passes. BB_FG_HUDLESS_GIVEUP=1: 1.49 (off after 5 failed checks in a row).
+        static const bool give_up = [] {
+            const char* v = std::getenv("BB_FG_HUDLESS_GIVEUP");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (!give_up && bad && g_bb.lut_bad_streak == 5) {
+            BB::FG::Printf("[fg-hudless] 5 sampled checks in a row failed (conflicts %u, "
+                           "mismatches %u): HUD-less image held back until a check passes (not "
+                           "off for the session: BB_FG_HUDLESS_GIVEUP=1 for that)",
+                           conflicts, mismatches);
+        }
+        if (give_up && g_bb.lut_bad_streak >= 5 && !g_bb.lut_disabled) {
             g_bb.lut_disabled = true;
             BB::FG::Printf("[fg-hudless] 5 sampled checks in a row failed the self-check (conflicts "
                            "%u, mismatches %u): off for this session, frame generation without "

@@ -31,9 +31,12 @@ void PerfLine(int frames_in_flight, int frames_total);
 // render setup + command recording (BeginRendering, vertex/index, barriers, dynamic state, cmds).
 // bb-perf-132: + render-target lookup (PrepareRenderState), BB constant patch scan (inside bind),
 // BB sample hooks (upscale / HUD per sampled image, inside bind), samplers (inside bind).
+// bb-perf-1111: + PopPendingOperations, FilterDraw, BeginRendering (render setup + BB HUD hooks),
+// vertex / index bind, descriptor push (pipeline BindResources), dynamic state, ResetBindings.
 enum CpCat : int {
     CpDraw, CpPipe, CpBind, CpBuf, CpTex, CpScan, CpObjMv, CpRec,
-    CpPrep, CpPatch, CpHook, CpSamp, CpCount
+    CpPrep, CpPatch, CpHook, CpSamp,
+    CpPop, CpFilter, CpRtBegin, CpVtx, CpDesc, CpDyn, CpReset, CpCount
 };
 extern std::atomic<uint64_t> g_cp_ns[CpCount];
 extern std::atomic<uint64_t> g_cp_draws, g_cp_dispatches;
@@ -44,14 +47,30 @@ extern std::atomic<uint64_t> g_cp_patch_scans, g_cp_patch_bytes, g_cp_patch_fast
 bool CpFastPatch();
 // BB_CP_DETAIL=0: no sub-timers for the bb-perf-132 categories (prep/patch/hook/samplers).
 bool CpDetail();
+// bb-perf-1111 (BB_CP_TIMER_SAMPLE=N, default 8): only one draw / dispatch in N is timed (its
+// times counted N times), so the ~25 clock reads per draw of 1.49 (about 1 us a draw) are not paid
+// on the other N-1. 1 = every draw (1.49).
+uint32_t CpSampleEvery();
+inline thread_local bool g_cp_timed = true;
+inline thread_local uint32_t g_cp_seq = 0;
 struct CpTimer {
     using C = std::chrono::steady_clock;
     int cat;
+    bool on;
     C::time_point t0;
-    explicit CpTimer(int c) : cat(c), t0(C::now()) {}
+    explicit CpTimer(int c) : cat(c) {
+        if (c == CpDraw) {
+            const uint32_t every = CpSampleEvery();
+            g_cp_timed = every <= 1 || (++g_cp_seq % every) == 0;
+        }
+        on = g_cp_timed;
+        if (on) t0 = C::now();
+    }
     ~CpTimer() {
+        if (!on) return;
         g_cp_ns[cat].fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(C::now() - t0).count()),
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(C::now() - t0).count()) *
+                CpSampleEvery(),
             std::memory_order_relaxed);
     }
 }; // once per presented game frame // a line as it is (frame generation: "[dlssg] ... real X fps, shown Y fps")
