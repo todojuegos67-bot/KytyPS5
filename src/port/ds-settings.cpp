@@ -1311,6 +1311,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->object_fade    = "normal";
 		s->reflections    = "normal";
 		s->res            = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default (was FSR 3.1 Calidad)
+		s->pure_game      = true;           // (11-11) and Juego original (no added effects)
 		s->sharpness      = "0.75";
 	} else if (preset == "equilibrado") {
 		// (10-25) The user's capture: DLSS Calidad (K), sharpness 100 %, textures Maximo, distance and shadows Alto, Detail
@@ -1323,11 +1324,13 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->texture_sharpness = "2";
 		post_on();
 		s->sharpness = "1";
-		s->res       = "dlss-calidad";
+		s->res       = "fsr4-calidad"; // (11-11) FSR 4 Calidad (was DLSS Calidad K) and Juego original
 		s->dlss_preset = "K";
+		s->pure_game = true;
 	} else if (preset == "ultra") {
 		max();
-		s->res = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default
+		s->res = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default, and Juego original
+		s->pure_game = true;
 		s->detail   = "muy-alto";
 		s->aa_sharp = "ultra"; // (10-23) costs nothing
 	} else if (preset == "extremo") {
