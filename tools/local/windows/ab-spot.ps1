@@ -6,7 +6,7 @@ param([string]$Label = 'ab', [string]$Plan = 'w:down:0,w:up:10000',
 # there, then switch a 32-bit variable (a kyty_local_* switch, by its linker-map address) between
 # the hex values -A and -B with the live poke32 command, measuring one window per setting in
 # ABBA order. Prints each window and the per-setting means of fps and render-thread ms/frame.
-#   ab-spot.ps1 -Label srt -Symbol kyty_local_srt_native_mode -A 0 -B 1
+#   ab-spot.ps1 -Label srt -Symbol kyty_local_srt_predicate_mode -A 0 -B 1
 if (!$Symbol) { 'usage: ab-spot.ps1 -Symbol <kyty_local_* switch> -A <hex> -B <hex>'; exit 1 }
 $S = $PSScriptRoot
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path

@@ -1,13 +1,14 @@
 param([string]$Label = 'prof', [string]$Plan = 'w:down:0,w:up:10000',
       [double]$Seconds = 8, [int]$Top = 60, [string[]]$Focus = @(), [string[]]$Poke = @(),
-      [string]$Live = '', [string[]]$Set = @(), [switch]$KeepRunning)
+      [string]$Live = '', [string[]]$Set = @(), [switch]$KeepRunning, [int]$Vblank = 0)
 # Render-thread profile at one place of the walk route: launch (bench-run.ps1), walk -Plan and
 # stop there, sample the render thread (live `prof`) and symbolize it with profreport.exe against
 # this build's linker map while the process is still alive. Writes _Build/prof/<label>/prof.txt,
 # and prof-<focus>.txt per -Focus text (hottest addresses and emulator callers of those leaves).
 #   prof-spot.ps1 -Label heavy1 -Seconds 8 -Top 80 -Focus _NLG_Return2,memchr
 # -Poke symbol=hexvalue: poke32 a kyty_local_* variable (linker-map address) before sampling;
-# -Live: more live commands after the profile (e.g. 'sleep 2').
+# -Live: more live commands after the profile (e.g. 'sleep 2'). -Vblank 120: the 120 Hz cap (bench-run's), so the render
+# thread works most of the frame instead of waiting for the 60 Hz flip.
 $S = $PSScriptRoot
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
 Set-Location $root
@@ -27,6 +28,7 @@ $pokes = foreach ($item in ($Poke | ForEach-Object { $_ -split ',' } | Where-Obj
 }
 $params = @{ Label = $Label; KeepRunning = $true; NoWalk = $true; ShotOnly = $true }
 if ($Set.Count) { $params['Set'] = $Set }
+if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
 & "$S\bench-run.ps1" @params | Select-Object -Last 3
 $process = Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 } | Select-Object -First 1
 if (!$process) { 'emulator not running'; exit 1 }

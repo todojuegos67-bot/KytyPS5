@@ -353,8 +353,8 @@ inline void AppendCheckpoints(std::string& text) {
 	}
 }
 
-// A diagnostic's report of its own state for the work past `reached` (KYTY_TABLE_WATCH: what the stalled dispatches'
-// blocks held when they were recorded and hold now), called once per stall.
+// A diagnostic's report of its own state for the work past `reached` (KYTY_DISPATCH_TIMING: which of the timed
+// dispatches the GPU is in, and what that one read), called once per stall.
 inline std::atomic<void (*)(uint64_t reached)> g_stall_dump {nullptr};
 
 // The last dispatches recorded (the render thread's; a stall reads them unlocked, a torn entry is possible): their
@@ -378,7 +378,7 @@ inline void NoteDispatch(uint64_t tick, uint64_t hash, uint32_t x, uint32_t y, u
 // A timeline that stopped (MasterSemaphore::Wait's STALL): the submissions of it the GPU has not finished (the first
 // few), each with what it waits for and where those semaphores are now (`counter`: a semaphore's current value).
 // The 8 GB simulation froze with everything submitted and no thread in a binding (10-13): is the first unfinished
-// submission waiting for a semaphore that never comes (a sparse binding's, WaitBeforeNextSubmit), or did the GPU stall?
+// submission waiting for a semaphore that never comes, or did the GPU stall?
 template <typename Counter>
 inline void ReportStall(uint64_t timeline, uint64_t reached, Counter&& counter) {
 	if (const auto dump = g_stall_dump.load(std::memory_order_acquire); dump != nullptr) {

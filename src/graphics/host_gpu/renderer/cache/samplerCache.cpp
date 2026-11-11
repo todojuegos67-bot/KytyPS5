@@ -13,6 +13,10 @@
 #include <cmath>
 #include <cstring>
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 namespace Libs::Graphics {
 
 // KYTY_TEXTURE_LOD_BIAS=<float|auto> (default off): an extra mip LOD bias for scene textures when the 3D renders below
@@ -49,6 +53,16 @@ float SamplerCache::TextureLodBias() {
 	return bias;
 }
 
+// (Upstream's automatic upscaler LOD bias, issue #224: kept as a stored value only; Demon's Souls uses our
+// KYTY_TEXTURE_LOD_BIAS per image+sampler instead, so the two never stack.)
+namespace {
+std::atomic<float> g_upscale_lod_bias {0.0f};
+} // namespace
+
+void SetUpscaleLodBias(float bias) {
+	g_upscale_lod_bias.store(bias, std::memory_order_relaxed);
+}
+
 SamplerCache::~SamplerCache() {
 	for (const auto& [key, sampler]: m_samplers) {
 		(void)key;
@@ -76,10 +90,19 @@ bool SamplerCache::IsSceneSampler(const ShaderSamplerResource& r) {
 	return max_lod >= 1.0f && max_lod > min_lod;
 }
 
+bool UpscaleBiasApplies(bool pixel, uint32_t color_targets) {
+	static const uint32_t least = [] {
+		const char* value = std::getenv("KYTY_UPSCALE_LOD_BIAS_TARGETS");
+		return value != nullptr && *value != 0 ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 3u;
+	}();
+	return pixel && (color_targets == 0 || color_targets >= least);
+}
+
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool lod_bias) {
 	// The bias flag only splits the key when a bias is on and the legacy mode (sampler-level) is off.
 	lod_bias = lod_bias && TextureLodBias() != 0.0f && !LodBiasLegacyAll();
 	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], lod_bias ? 1u : 0u};
+
 	// Samplers live as long as the cache: a thread's recent lookups need neither the lock nor
 	// the map.
 	struct Recent {
@@ -316,6 +339,18 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool lod_bi
 		sampler_info.maxAnisotropy    = 1.0f;
 		sampler_info.compareEnable    = VK_FALSE;
 		sampler_info.mipLodBias       = 0.0f;
+	}
+	// (In the log: the first sampler of each opaque border color that samples its border.)
+	if (static bool noted[2] {}; border != vk::BorderColor::eFloatTransparentBlack) {
+		const bool white   = border == vk::BorderColor::eFloatOpaqueWhite;
+		const auto borders = [](vk::SamplerAddressMode mode) { return mode == vk::SamplerAddressMode::eClampToBorder; };
+		if (!noted[white ? 1 : 0] && (borders(sampler_info.addressModeU) || borders(sampler_info.addressModeV) ||
+		                              borders(sampler_info.addressModeW))) {
+			noted[white ? 1 : 0] = true;
+			std::printf("Samplers: the first with an opaque %s border (clamp %u/%u/%u, depth compare %u)\n", white ? "white" : "black",
+			            static_cast<unsigned>(r.ClampX()), static_cast<unsigned>(r.ClampY()), static_cast<unsigned>(r.ClampZ()),
+			            static_cast<unsigned>(r.DepthCompareFunc()));
+		}
 	}
 
 	vk::Sampler vk_sampler = nullptr;

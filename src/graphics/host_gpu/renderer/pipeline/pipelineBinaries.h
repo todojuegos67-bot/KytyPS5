@@ -115,8 +115,14 @@ public:
 	void Copy(const PipelineBinaries::Key& key, const PipelineBinaries& from);
 	// Every pipeline of another store.
 	void CopyAll(const PipelineBinaries& from);
+	// What Save did besides writing: the pipelines left out because a binary of theirs could not be read back from the
+	// store holding it (its file damaged on the disk), and why it failed.
+	struct SaveReport {
+		size_t      unreadable_binaries = 0, dropped_pipelines = 0;
+		std::string failure;
+	};
 	// Written whole to a temporary file renamed to `path`.
-	bool Save(const std::filesystem::path& path, const std::string& signature) const;
+	bool Save(const std::filesystem::path& path, const std::string& signature, SaveReport* report = nullptr) const;
 	[[nodiscard]] size_t Pipelines() const;
 	// Pipelines copied from another store, captured (compiled, or from a static cache's hit), and left out
 	// (compressed with NVIDIA's dictionary).

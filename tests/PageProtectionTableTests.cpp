@@ -7,6 +7,8 @@
 #include <map>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <csignal>
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -113,11 +115,102 @@ void CheckPlatformProtection() {
 	Check(SysVirtualFreeRange(address, (page * 9)), "split allocation release failed");
 #endif
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+using namespace Common;
+
+volatile sig_atomic_t g_watch_signal  = 0;
+volatile uint64_t     g_watch_address = 0;
+
+// As the GPU trackers' fault handler: note the write, then let it through.
+void WatchFault(int signal_number, siginfo_t* info, void* /*context*/) {
+	const auto address = reinterpret_cast<uint64_t>(info->si_addr) & ~uint64_t {0xfff};
+	g_watch_signal     = signal_number;
+	g_watch_address    = address;
+	if (!SysVirtualProtectWriteWatch(address, 0x1000, VirtualMemory::Mode::ReadWrite)) std::abort();
+}
+
+void Write(uint64_t address, uint32_t value) {
+	g_watch_signal                                 = 0;
+	*reinterpret_cast<volatile uint32_t*>(address) = value;
+}
+#endif
+
+// KYTY_UFFD_WP=1: the trackers' Read is userfaultfd write protection (SIGBUS) on a shared view, else mprotect (SIGSEGV);
+// either way a write to a watched page faults once and lands, and other pages do not fault.
+void CheckWriteWatch() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	using Mode = VirtualMemory::Mode;
+	setenv("KYTY_UFFD_WP", "1", 1);
+	SysVirtualInit();
+	constexpr uint64_t page = 0x1000;
+	constexpr uint64_t size = page * 4;
+	const int          fd   = memfd_create("write_watch", MFD_CLOEXEC);
+	Check(fd >= 0 && ftruncate(fd, size) == 0, "memfd failed");
+	// Inside the watched low 1 TiB, as the guest's views.
+	auto* ptr = mmap(reinterpret_cast<void*>(uint64_t {0x7e0000000}), size, PROT_READ | PROT_WRITE,
+	                 MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+	Check(ptr != MAP_FAILED, "view map failed");
+	const auto address = reinterpret_cast<uint64_t>(ptr);
+	SysVirtualWriteWatchMapped(address, size, Mode::ReadWrite);
+
+	struct sigaction action {};
+	struct sigaction old_bus {};
+	struct sigaction old_segv {};
+	action.sa_sigaction = WatchFault;
+	action.sa_flags     = SA_SIGINFO;
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGBUS, &action, &old_bus);
+	sigaction(SIGSEGV, &action, &old_segv);
+
+	Write(address + page, 1);
+	Check(SysVirtualProtectWriteWatch(address + page, page, Mode::Read), "watch failed");
+	Check(*reinterpret_cast<volatile uint32_t*>(address + page) == 1, "watched page not readable");
+	Write(address, 2);
+	Check(g_watch_signal == 0, "write next to a watched page faulted");
+	Write(address + page, 3);
+	const int signal_number = g_watch_signal;
+	Check((signal_number == SIGBUS || signal_number == SIGSEGV) && g_watch_address == address + page,
+	      "write to a watched page did not fault there");
+	Check(*reinterpret_cast<volatile uint32_t*>(address + page) == 3, "faulted write was lost");
+	Write(address + page, 4);
+	Check(g_watch_signal == 0, "unwatched page faulted again");
+
+	// Watch, unwatch: no fault; no access and back keeps the contents.
+	Check(SysVirtualProtectWriteWatch(address, size, Mode::Read), "range watch failed");
+	Check(SysVirtualProtectWriteWatch(address, size, Mode::ReadWrite), "range unwatch failed");
+	Write(address + (page * 3), 5);
+	Check(g_watch_signal == 0, "unwatched range faulted");
+	Check(SysVirtualProtectWriteWatch(address + page, page, Mode::NoAccess) &&
+	          SysVirtualProtectWriteWatch(address + page, page, Mode::ReadWrite) &&
+	          *reinterpret_cast<volatile uint32_t*>(address + page) == 4,
+	      "no access and back lost the contents");
+
+	// A view mapped again over the old one is watched again.
+	SysVirtualWriteWatchUnmapped(address, size);
+	Check(mmap(ptr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == ptr, "view remap failed");
+	SysVirtualWriteWatchMapped(address, size, Mode::ReadWrite);
+	Check(SysVirtualProtectWriteWatch(address + (page * 2), page, Mode::Read), "watch after remap failed");
+	Write(address + (page * 2), 6);
+	Check(g_watch_signal == signal_number && g_watch_address == address + (page * 2),
+	      "write after remap did not fault the same way");
+
+	sigaction(SIGBUS, &old_bus, nullptr);
+	sigaction(SIGSEGV, &old_segv, nullptr);
+	SysVirtualWriteWatchUnmapped(address, size);
+	munmap(ptr, size);
+	close(fd);
+	unsetenv("KYTY_UFFD_WP");
+	std::printf("PageProtectionTableTests: write watch by %s\n",
+	            signal_number == SIGBUS ? "userfaultfd write protection" : "mprotect");
+#endif
+}
 } // namespace
 
 int main() {
 	CheckSparseTable();
 	CheckRandomTransactions();
 	CheckPlatformProtection();
+	CheckWriteWatch();
 	std::puts("PageProtectionTableTests: all cases passed");
 }

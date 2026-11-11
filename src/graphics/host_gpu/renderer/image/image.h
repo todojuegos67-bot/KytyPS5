@@ -64,7 +64,41 @@ void EndTransitGroup() noexcept;
 // Moves whenever an image's barrier state (layout, access) is set outside a speculation's own view: what was found
 // in place holds while it does not.
 [[nodiscard]] uint64_t ImageStateEpoch() noexcept;
-void                   MoveImageStateEpoch() noexcept;
+class Image;
+// (`image`: the one whose state moved, which its serial records too; null when unknown, which moves every image's.)
+void MoveImageStateEpoch(const Image* image = nullptr) noexcept;
+
+// The image serials (KYTY_TABLE_SERIALS): one per image slot, in a table apart from the images, moved by each change of
+// one image that TextureCache::ImagesEpoch moves with (its barrier state or GPU-written state, a CPU write, its
+// registration, its metadata, a registration over its pages), and never reset (a slot reused goes on counting). A sum of
+// the serials of some images, with the unattributed serial (a change no image was named for), is unchanged only while
+// each of them is: a table draw's state and set keep the sum at their last emission and check it without reading an
+// image (RenderExecutor::TableDraw).
+namespace ImageSerials {
+inline constexpr uint32_t ChunkBits = 12;
+inline constexpr uint32_t ChunkSize = 1u << ChunkBits;
+inline constexpr uint32_t Chunks    = 1024;
+extern std::atomic<std::atomic<uint64_t>*> g_chunks[Chunks];
+extern std::atomic<uint64_t>               g_unattributed;
+// (KYTY_TABLE_SERIALS on: the table path's TableSerialsMode sets it as the switch changes; off, no serial moves, and
+// the switch's change moves the unattributed serial, so no sum kept before it holds after.)
+extern std::atomic<bool>                   g_on;
+extern std::atomic<uint64_t>               g_beyond; // (Read's for a slot beyond the table)
+void Ensure(uint32_t slot); // (the texture cache, as it makes an image)
+inline void Move(uint32_t slot) noexcept {
+	if (!g_on.load(std::memory_order_relaxed) || (slot >> ChunkBits) >= Chunks) return;
+	if (auto* chunk = g_chunks[slot >> ChunkBits].load(std::memory_order_acquire))
+		chunk[slot & (ChunkSize - 1)].fetch_add(1, std::memory_order_acq_rel);
+}
+[[nodiscard]] inline uint64_t Read(uint32_t slot) noexcept {
+	// (A slot beyond the table has no serial: it reads differently every time, so a sum over it never holds and a state
+	// or set with that image is always checked.)
+	if ((slot >> ChunkBits) >= Chunks) return g_beyond.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto* chunk = g_chunks[slot >> ChunkBits].load(std::memory_order_acquire);
+	return chunk != nullptr ? chunk[slot & (ChunkSize - 1)].load(std::memory_order_acquire) : 0;
+}
+[[nodiscard]] inline uint64_t Unattributed() noexcept { return g_unattributed.load(std::memory_order_acquire); }
+} // namespace ImageSerials
 
 class TransitGroup final {
 public:
@@ -90,12 +124,15 @@ public:
 	// constructor gives a new one, but for its Vulkan image, views and barrier state (and serial: the same object).
 	void PrepareReuse(const ImageInfo& image_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// `read_after_write`: for a draw that reads the image it writes (bound both as a texture and as storage), which
+	// keeps the barrier after an earlier guest write that a repeated write in the same layout and access skips.
 	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
-	                                   std::optional<ImageSubresourceRange> range);
+	                                   std::optional<ImageSubresourceRange> range, bool read_after_write = false);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
+	             bool read_after_write = false);
 	// The whole-image barrier state the calling thread's next transition starts from (a speculative translation's
 	// own once it used the image: speculation-state.h).
 	[[nodiscard]] const VulkanImageState& CurrentState() const;
@@ -262,7 +299,7 @@ public:
 	}
 	void               ClearGpuModified() noexcept {
 		m_gpu_modified = false;
-		MoveImageStateEpoch();
+		MoveImageStateEpoch(this);
 	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
@@ -274,7 +311,7 @@ public:
 		m_buffer_ranges.clear();
 		m_buffer_fill     = BufferFill::Mixed;
 		++validity;
-		MoveImageStateEpoch();
+		MoveImageStateEpoch(this);
 	}
 	void MarkBufferModified(uint64_t begin, uint64_t end) {
 		AddBufferRange(begin, end);
@@ -335,7 +372,7 @@ private:
 			}
 		}
 		++validity;
-		MoveImageStateEpoch();
+		MoveImageStateEpoch(this);
 	}
 
 public:
@@ -343,7 +380,7 @@ public:
 	void               MarkStencilModified() noexcept {
 		m_stencil_modified = true;
 		++validity;
-		MoveImageStateEpoch();
+		MoveImageStateEpoch(this);
 	}
 	void               ClearStencilModified() noexcept { m_stencil_modified = false; }
 
@@ -364,6 +401,8 @@ public:
 	// Unique per image object: a deleted image's slot id goes to later images. (First, with validity: on the line of
 	// the slot's liveness, which a lookup reads anyway.)
 	uint64_t         serial             = 0;
+	// Its slot's entry in the image serials (ImageSerials; UINT32_MAX until the texture cache inserted it).
+	uint32_t         serial_slot        = UINT32_MAX;
 	// Moves with each change of what a use of the image was proven by (RenderExecutor::TableValidateSet): bytes the CPU
 	// wrote or may have written, a GPU buffer or stencil-plane write over them, the first GPU write or use as a target or
 	// storage (a texture used so refreshes whole), its metadata, a stencil association. Registrations over its pages are
@@ -383,8 +422,6 @@ public:
 	// Page-aligned ranges inside the tracked pages the image stopped watching after partial
 	// CPU writes; always inside CpuDirtyRanges while the image is partially dirty.
 	std::vector<std::pair<uint64_t, uint64_t>> untracked_holes;
-	// KYTY_PARTIAL_IMAGE_DIRTY=2: guest data hashes per partial-dirty granule at the last upload.
-	std::vector<uint64_t> partial_hashes;
 	ImageId          depth_id {};
 	uint64_t         frame_accessed_last = 0; // TextureCache::AdvanceFrame count at the last use
 	size_t           lru_id             = 0;
@@ -431,7 +468,10 @@ private:
 	CommandScheduler& m_scheduler;
 	bool              m_create_failed    = false;
 	uint64_t          m_maybe_cpu_hash   = 0;
-	static void NoteCpuDirty() noexcept { s_cpu_dirty_epoch.fetch_add(1, std::memory_order_release); }
+	void NoteCpuDirty() const noexcept {
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+		ImageSerials::Move(serial_slot);
+	}
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

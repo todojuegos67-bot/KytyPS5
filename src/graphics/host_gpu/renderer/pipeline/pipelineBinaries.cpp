@@ -420,58 +420,94 @@ size_t PipelineBinaryWriter::Pipelines() const {
 	return m_pipelines.size();
 }
 
-bool PipelineBinaryWriter::Save(const std::filesystem::path& file_path, const std::string& signature) const {
+bool PipelineBinaryWriter::Save(const std::filesystem::path& file_path, const std::string& signature,
+                                SaveReport* report) const {
 	std::lock_guard lock(m_mutex);
+	SaveReport      own;
+	auto&           out = report != nullptr ? *report : own;
+	out             = {};
 	std::error_code error;
 	std::filesystem::create_directories(file_path.parent_path(), error);
-	std::ofstream   file(file_path, std::ios::binary | std::ios::trunc);
-	const auto      signature_size = static_cast<uint32_t>(signature.size());
+	std::ofstream file(file_path, std::ios::binary | std::ios::trunc);
+	if (!file) {
+		out.failure = "the file could not be created";
+		return false;
+	}
+	const auto signature_size = static_cast<uint32_t>(signature.size());
 	file.write(Magic, sizeof(Magic));
 	file.write(reinterpret_cast<const char*>(&signature_size), sizeof(signature_size));
 	file.write(signature.data(), static_cast<std::streamsize>(signature.size()));
-	uint64_t    offset = sizeof(Magic) + sizeof(signature_size) + signature.size();
-	std::string tables;
+	uint64_t offset = sizeof(Magic) + sizeof(signature_size) + signature.size();
 	// Only binaries a pipeline uses: one captured or copied again leaves its earlier ones unused.
-	std::vector<uint32_t> renumbered(m_binaries.size(), UINT32_MAX);
+	std::vector<uint8_t>  listed(m_binaries.size(), 0);
 	std::vector<uint32_t> used;
 	for (const auto& [key, list]: m_pipelines) {
 		for (const auto ref: list) {
-			if (renumbered[ref] != UINT32_MAX) continue;
-			renumbered[ref] = static_cast<uint32_t>(used.size());
+			if (listed[ref] != 0) continue;
+			listed[ref] = 1;
 			used.push_back(ref);
 		}
 	}
-	Put(tables, static_cast<uint32_t>(used.size()));
-	std::vector<uint8_t> copied;
+	// A binary the store holding it cannot give back (its file damaged on the disk: cut short, or other bytes than its
+	// hash) is left out, with every pipeline that uses it, which then compiles when first needed: before, one damaged
+	// shard of a precompile failed its merge every time (issue #225).
+	std::vector<uint32_t> renumbered(m_binaries.size(), UINT32_MAX);
+	std::string           binary_table;
+	uint32_t              written = 0;
+	std::vector<uint8_t>  copied;
 	for (const auto ref: used) {
 		const auto& binary = m_binaries[ref];
 		const auto* data   = &binary.data;
 		if (binary.from != nullptr) {
-			if (!binary.from->ReadData(binary.from->m_binaries[binary.index], copied)) return false;
+			if (!binary.from->ReadData(binary.from->m_binaries[binary.index], copied)) {
+				out.unreadable_binaries++;
+				continue;
+			}
 			data = &copied;
 		}
 		file.write(reinterpret_cast<const char*>(data->data()), static_cast<std::streamsize>(data->size()));
-		PutKey(tables, binary.key);
-		Put(tables, offset);
-		Put(tables, static_cast<uint64_t>(data->size()));
-		Put(tables, static_cast<uint64_t>(XXH3_64bits(data->data(), data->size())));
+		PutKey(binary_table, binary.key);
+		Put(binary_table, offset);
+		Put(binary_table, static_cast<uint64_t>(data->size()));
+		Put(binary_table, static_cast<uint64_t>(XXH3_64bits(data->data(), data->size())));
 		offset += data->size();
+		renumbered[ref] = written++;
 	}
-	Put(tables, static_cast<uint32_t>(m_pipelines.size()));
+	if (!file) {
+		out.failure = "writing it failed after " + std::to_string(offset >> 20u) + " MiB";
+		return false;
+	}
+	std::string tables;
+	Put(tables, written);
+	tables += binary_table;
+	std::string           pipeline_table;
+	uint32_t              kept = 0;
 	std::vector<uint32_t> refs;
 	for (const auto& [key, list]: m_pipelines) {
-		PutKey(tables, key);
-		Put(tables, static_cast<uint32_t>(refs.size()));
-		Put(tables, static_cast<uint32_t>(list.size()));
+		if (std::any_of(list.begin(), list.end(), [&](uint32_t ref) { return renumbered[ref] == UINT32_MAX; })) {
+			out.dropped_pipelines++;
+			continue;
+		}
+		PutKey(pipeline_table, key);
+		Put(pipeline_table, static_cast<uint32_t>(refs.size()));
+		Put(pipeline_table, static_cast<uint32_t>(list.size()));
 		for (const auto ref: list) refs.push_back(renumbered[ref]);
+		kept++;
 	}
+	Put(tables, kept);
+	tables += pipeline_table;
 	Put(tables, static_cast<uint32_t>(refs.size()));
 	for (const auto ref: refs) Put(tables, ref);
 	file.write(tables.data(), static_cast<std::streamsize>(tables.size()));
 	const uint64_t footer[2] {offset, XXH3_64bits(tables.data(), tables.size())};
 	file.write(reinterpret_cast<const char*>(footer), sizeof(footer));
 	file.write(Magic, sizeof(Magic));
-	return static_cast<bool>(file);
+	file.close();
+	if (!file) {
+		out.failure = "writing its tables failed";
+		return false;
+	}
+	return true;
 }
 
 // <n>: <name>.played.<n>.binaries beside <base>, <name>.played.binaries.

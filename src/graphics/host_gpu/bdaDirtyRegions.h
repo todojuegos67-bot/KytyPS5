@@ -8,7 +8,7 @@
 #include <cstdint>
 
 // One bit per tracker region: set whenever the region's CPU modification epoch may have
-// moved, or every bit when the BDA region list or the buffer registrations change. A clear
+// moved, and over a buffer registration's regions and a new BDA region request's. A clear
 // bit proves that every BDA region request inside the region still holds its epochs, so a
 // bounded BDA preparation only visits the set bits of its (usually 4 GiB) ranges.
 namespace Libs::Graphics::BdaDirtyRegions {
@@ -54,10 +54,6 @@ inline void Publish() {
 				g_bits[word].fetch_or(bits, std::memory_order_release);
 		}
 	}
-}
-
-inline void MarkAll() {
-	for (auto& word: g_bits) word.store(~uint64_t {0}, std::memory_order_release);
 }
 
 } // namespace Libs::Graphics::BdaDirtyRegions

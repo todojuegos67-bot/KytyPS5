@@ -31,6 +31,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "frame-capture.h"
+#include "mode-toggle.h"
 #include "frame-gen.h"
 #include "native-preparation-state.h"
 #include "live-counters.h"
@@ -52,6 +53,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "live-switch.h"
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -417,6 +419,13 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
                                       ShaderBufferResource& resolved_descriptor,
                                       uint32_t& resolved_clear, uint64_t& resolved_size);
 
+// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc, on by default under KYTY_SPECULATE=4): RenderExecutor::m_dcc_fills.
+static bool PredictDccFills() {
+	// (One fallback at every site: LiveSwitch::Find binds the first; the environment's KYTY_SPEC_PREDICT_DCC wins.)
+	static auto& on = LiveSwitch::Find("spec_predict_dcc", ModeToggle::Default("spec_predict_dcc"));
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 // The shader and user data of a dispatch (a compute clear's: RenderExecutor::m_meta_clears).
 static uint64_t MetaClearKey(const HW::ComputeShaderInfo& cs) {
 	std::array<uint32_t, 2 + HW::UserSgprInfo::SGPRS_MAX> words {static_cast<uint32_t>(cs.cs_regs.data_addr),
@@ -649,7 +658,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
 		// Track deferred DCC state while the original dispatch writes the metadata allocation.
-		cache.TrackDccFill(descriptor.Base48(), size, packed_clear);
+		m_last_dcc_fill     = cache.TrackDccFill(descriptor.Base48(), size, packed_clear) ? descriptor.Base48() : 0;
+		m_last_dcc_fill_set = true;
 		static std::atomic<uint32_t> logged_metadata_clears {0};
 		if (logged_metadata_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: metadata fill shader=0x%016" PRIx64
@@ -666,6 +676,20 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			if (buffer != nullptr && (offset & 3u) == 0) {
 				buffer->Fill(offset, size, packed_clear);
 				cache.InvalidateMemoryFromGPU(base, size, "fill", &packed_clear);
+				return true;
+			}
+		}
+		// KYTY_FILL_BUFFER_CLEARS (live fill_buffer_clears, on by default under KYTY_SPECULATE=4): the same fill over
+		// memory no tracked image holds (the system image-clear shader's ~24 a frame at 1-1, 4 KiB to 288 KiB of one
+		// value: plain buffer memory) as a transfer fill in the dispatch's place, the buffer's barriers around it
+		// (Buffer::Fill), not the shader.
+		static auto& fill_buffer = LiveSwitch::Find("fill_buffer_clears", ModeToggle::Default("fill_buffer_clears"));
+		if (fill_buffer.load(std::memory_order_relaxed) != 0 && Spec::Current() == nullptr && ((base | size) & 3u) == 0 &&
+		    !cache.HasTrackedDataOverlap(base, size)) {
+			const auto [buffer, offset] = m_context.GetBufferCache().ObtainBuffer(base, size, true, true);
+			if (buffer != nullptr && (offset & 3u) == 0) {
+				buffer->Fill(offset, size, packed_clear);
+				LiveCounters::Add(LiveCounters::FillBufferClears);
 				return true;
 			}
 		}
@@ -706,6 +730,10 @@ void RenderExecutor::PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_g
 	const auto read = CatalogRead();
 	if (const auto found = learned.m_meta_clears.find(MetaClearKey(cs)); found != learned.m_meta_clears.end())
 		record.PredictClear(found->second);
+	if (PredictDccFills())
+		if (const auto found = learned.m_dcc_fills.find(MetaClearKey(cs)); found != learned.m_dcc_fills.end())
+			for (const auto address: found->second)
+				if (address != 0) record.PredictClear(address, true);
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -717,22 +745,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
-	{
-		// (Diagnostic, KYTY_DISPATCH_TRACE_ADDR=<cs address hex>: that shader's dispatch sizes and user data.)
-		static const uint64_t trace = std::getenv("KYTY_DISPATCH_TRACE_ADDR") != nullptr
-		                                  ? std::strtoull(std::getenv("KYTY_DISPATCH_TRACE_ADDR"), nullptr, 16)
-		                                  : 0;
-		static std::atomic<uint32_t> traced {0};
-		if (trace != 0 && sh_ctx.GetCs().cs_regs.data_addr == trace && traced.fetch_add(1) < 400) {
-			const auto& cs = sh_ctx.GetCs();
-			std::printf("DISPATCH-TRACE cs 0x%llx groups %u %u %u indirect 0x%llx threads %u %u %u user",
-			            static_cast<unsigned long long>(trace), thread_group_x, thread_group_y, thread_group_z,
-			            static_cast<unsigned long long>(indirect_args), cs.cs_regs.num_thread_x, cs.cs_regs.num_thread_y,
-			            cs.cs_regs.num_thread_z);
-			for (uint32_t i = 0; i < 16; i++) std::printf(" %08x", cs.cs_user_sgpr.value[i]);
-			std::printf("\n");
-		}
-	}
 	if (FrameCapture::Active()) {
 		FrameCapture::g_call.cs_address = sh_ctx.GetCs().cs_regs.data_addr;
 		FrameCapture::g_call.indirect   = indirect_args;
@@ -780,9 +792,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_dispatch_declined          = nullptr;
 	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 && (!thread_dimensions || indirect_args == 0) &&
-	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0))) {
-		LiveCensus::Scope census_table(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 10);
-		if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions)) return;
+	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0)) &&
+	    (LiveCensus::Scope(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 10),
+	     TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions))) {
+		// (KYTY_SPEC_PREDICT_DCC: one the table way refused is a speculation's hole too: "table: set validation" and the
+		// like. Its DCC fill is predicted as for those the speculation declines below.)
+		if (auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr && indirect_args == 0 && PredictDccFills()) {
+			auto&      learned = Catalog();
+			const auto read    = CatalogRead();
+			if (const auto found = learned.m_dcc_fills.find(MetaClearKey(sh_ctx.GetCs())); found != learned.m_dcc_fills.end())
+				for (const auto address: found->second)
+					if (address != 0) spec->PredictClear(address, true);
+		}
+		return;
 	}
 	// A direct dispatch of no thread groups (with thread dimensions: no threads) runs nothing: skipped before its
 	// program is prepared (about 60 a frame at 1-1, each evaluating its resource tables first).
@@ -797,6 +819,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			const auto read = CatalogRead();
 			if (const auto found = learned.m_meta_clears.find(MetaClearKey(sh_ctx.GetCs())); found != learned.m_meta_clears.end())
 				Spec::Current()->PredictClear(found->second);
+			if (PredictDccFills())
+				if (const auto found = learned.m_dcc_fills.find(MetaClearKey(sh_ctx.GetCs())); found != learned.m_dcc_fills.end())
+					for (const auto address: found->second)
+						if (address != 0) Spec::Current()->PredictClear(address, true);
 		}
 		return Spec::Refuse(m_dispatch_declined != nullptr ? m_dispatch_declined
 		                    : thread_dimensions            ? "dispatch (thread dimensions)"
@@ -927,15 +953,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (uint64_t cleared = 0; indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
 	                                                                          thread_group_y, thread_group_z, mode, cleared)) {
-		const auto write                            = CatalogWrite();
-		m_meta_clears[MetaClearKey(sh_ctx.GetCs())] = cleared;
+		// (Learned for mode 4's holes only: KYTY_SPECULATE unset collects nothing.)
+		if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+			const auto write                            = CatalogWrite();
+			m_meta_clears[MetaClearKey(sh_ctx.GetCs())] = cleared;
+		}
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "meta_clear";
 		TableDispatchSeen(sh_ctx.GetCs(), "dispatch: meta clear", use_thread_dimensions);
 		ResetBindings();
 		return;
 	}
-	if (indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
-	                                                      thread_group_y, thread_group_z, mode)) {
+	m_last_dcc_fill_set    = false;
+	const bool image_clear = indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+	                                                                           thread_group_y, thread_group_z, mode);
+	// (KYTY_SPEC_PREDICT_DCC: what a speculation's hole of this dispatch does to the surface's DCC. A tracked DCC fill
+	// returns false, the dispatch itself writing the metadata: learned all the same. A run that clears nothing does not
+	// erase what the same dispatch and user data cleared before.)
+	if (m_last_dcc_fill_set && m_last_dcc_fill != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+		const auto write  = CatalogWrite();
+		auto&      recent = m_dcc_fills[MetaClearKey(sh_ctx.GetCs())];
+		if (recent[0] != m_last_dcc_fill) {
+			if (const auto at = std::ranges::find(recent, m_last_dcc_fill); at != recent.end()) std::rotate(recent.begin(), at, at + 1);
+			else std::shift_right(recent.begin(), recent.end(), 1), recent[0] = m_last_dcc_fill;
+		}
+	}
+	if (image_clear) {
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "image_clear";
 		TableDispatchSeen(sh_ctx.GetCs(), "dispatch: image clear", use_thread_dimensions);
 		ResetBindings();
@@ -1212,7 +1254,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_offset = owner.Offset(indirect_args);
 	}
 
-	const bool        chain            = DemonsSouls::ComputeChains(program.shader_hash);
+	const bool        chain            = DemonsSouls::ComputeChains();
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
 	// (KYTY_SSR: before a G-buffer consumer, the packed layers copied; before the commit, the bindings intact.)
 	if (FrameGen::SsrWanted() && !bindings.images.empty())
@@ -1250,12 +1292,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		args_barrier.buffer              = indirect_buffer;
 		args_barrier.offset              = indirect_offset;
 		args_barrier.size                = 3u * sizeof(uint32_t);
-		// (KYTY_INDIRECT_ARGS_BARRIER=1: also within a chain of dispatches, as TableDispatch's.)
-		static const bool args_barrier_always = [] {
-			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
-			return value != nullptr && value[0] == '1';
-		}();
-		if (!continues_chain || args_barrier_always) {
+		if (!continues_chain) {
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 			                          vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,

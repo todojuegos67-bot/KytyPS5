@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "local/anti-lag.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -35,11 +36,11 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
-#include "local-platform.h"
 #include "frame-gen.h"
 #include "local/xess-sr.h"
 #include "local/fsr4-sr.h"
@@ -54,6 +55,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -113,6 +115,17 @@ static bool HasExtension(const std::vector<const char*>& extensions, const char*
 	                   [name](const char* ext) { return strcmp(ext, name) == 0; });
 }
 
+#if defined(_WIN32)
+// KYTY_FULLSCREEN_EXCLUSIVE=0|1 (GraphicContext::full_screen_exclusive): -1 when unset.
+static int FullscreenExclusiveRequest() {
+	static const int request = [] {
+		const char* value = std::getenv("KYTY_FULLSCREEN_EXCLUSIVE");
+		return value == nullptr || *value == '\0' ? -1 : value[0] == '0' ? 0 : 1;
+	}();
+	return request;
+}
+#endif
+
 // VK_KHR_pipeline_binary for the static precompile's pipelines (pipelineBinaries.h), with maintenance5
 // for the pipeline creation flags it needs. KYTY_PIPELINE_BINARIES=0: the static pipeline cache instead.
 // Without the binaries, maintenance5 alone where the driver has it: pipelines take their SPIR-V inline,
@@ -141,6 +154,29 @@ static void AddCopyMemoryIndirectExtension(const std::vector<vk::ExtensionProper
 	if ((setting == nullptr || std::string_view(setting) != "0") &&
 	    HasExtension(available, VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME))
 		extensions.push_back(VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
+}
+
+// AMD's Windows driver with its older shader compiler (driver info "AMD proprietary shader compiler": the GCN cards'
+// driver, Vega and Polaris; RDNA's says "LLPC") refused every pipeline whose pixel shader reads
+// VK_KHR_fragment_shader_barycentric's BaryCoordKHR without a per-vertex input (ErrorUnknown, with or without
+// optimization; an RX Vega 56 with 26.5.2, issue #305: the picture's post-processing among them, a black screen),
+// although it reports the feature. Its VK_AMD_shader_explicit_vertex_parameter gives the same I/J
+// (TranslatorFeatureAmdBarycentrics): enabled, and `graphics` told, where both are there. Returns whether.
+static bool AmdExplicitVertexBarycentrics(vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available,
+                                          std::vector<const char*>& extensions, GraphicContext& graphics) {
+	graphics.amd_explicit_vertex_barycentrics = false;
+	if (!HasExtension(available, VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME)) return false;
+	vk::PhysicalDeviceDriverProperties driver {};
+	vk::PhysicalDeviceProperties2      properties {};
+	properties.pNext = &driver;
+	physical_device.getProperties2(&properties);
+	if (properties.properties.vendorID != 0x1002u || driver.driverID != vk::DriverId::eAmdProprietary ||
+	    std::string_view(driver.driverInfo.data()).find("AMD proprietary shader compiler") == std::string_view::npos)
+		return false;
+	if (!HasExtension(extensions, VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME))
+		extensions.push_back(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
+	graphics.amd_explicit_vertex_barycentrics = true;
+	return true;
 }
 
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
@@ -205,11 +241,55 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	return static_cast<uint32_t>(-1);
 }
 
+// The GPU asked for: --gpu (the emulator's command line), else KYTY_GPU (the emulator and the precompile program alike;
+// run-windows.ps1 and precompile-windows.ps1 -Gpu): a device's index in Vulkan's list, or a part of its name ("4090").
+// Empty: automatic, the first discrete GPU in Vulkan's order, which on Windows follows its graphics settings (issue #132).
+static std::string RequestedGpu(int32_t config_index) {
+	if (config_index >= 0) return std::to_string(config_index);
+	const char* value = std::getenv("KYTY_GPU");
+	return value != nullptr ? value : "";
+}
+
+static std::string Lowercase(std::string text) {
+	std::transform(text.begin(), text.end(), text.begin(),
+	               [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+	return text;
+}
+
+// The devices a request leaves (all of them without one, or when it names none), each listed with its index (list). A
+// number below the device count is an index, anything else a part of the name ("4090" in "NVIDIA GeForce RTX 4090").
+static std::vector<vk::PhysicalDevice> GpusAsked(const std::vector<vk::PhysicalDevice>& devices, const std::string& request,
+                                                 bool list) {
+	const bool digits   = !request.empty() && std::all_of(request.begin(), request.end(), [](char c) { return c >= '0' && c <= '9'; });
+	const bool by_index = digits && request.size() < 4 && std::strtoul(request.c_str(), nullptr, 10) < devices.size();
+	std::vector<vk::PhysicalDevice> kept;
+	for (size_t i = 0; i < devices.size(); ++i) {
+		vk::PhysicalDeviceProperties properties {};
+		devices[i].getProperties(&properties);
+		const auto type = properties.deviceType;
+		if (list)
+			std::printf("Vulkan GPU %zu: %s (%s)\n", i, properties.deviceName.data(),
+			            type == vk::PhysicalDeviceType::eDiscreteGpu     ? "discrete"
+			            : type == vk::PhysicalDeviceType::eIntegratedGpu ? "integrated"
+			                                                             : "other");
+		const bool match = request.empty() ||
+		                   (by_index ? std::strtoul(request.c_str(), nullptr, 10) == i
+		                             : Lowercase(properties.deviceName.data()).find(Lowercase(request)) != std::string::npos);
+		if (match) kept.push_back(devices[i]);
+	}
+	if (kept.empty() && !devices.empty()) {
+		std::printf("Vulkan GPU \"%s\" (--gpu or KYTY_GPU): no such GPU; chosen automatically\n", request.c_str());
+		return devices;
+	}
+	return kept;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surface,
                                      const std::vector<const char*>& device_extensions,
                                      SurfaceCapabilities&            out_capabilities,
-                                     vk::PhysicalDevice& out_device, uint32_t& out_queue_family) {
+                                     vk::PhysicalDevice& out_device, uint32_t& out_queue_family,
+                                     bool asked = true) {
 	EXIT_IF(instance == nullptr);
 	EXIT_IF(surface == nullptr);
 
@@ -219,17 +299,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	    });
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
-	if (Config::GetGpuIndex() >= 0) {
-		if (static_cast<size_t>(Config::GetGpuIndex()) < devices.size()) {
-			devices = {devices[Config::GetGpuIndex()]};
-		} else {
-			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
-			     Config::GetGpuIndex());
-		}
-	}
+	// (asked false: the automatic choice, after the GPU asked for could not run the emulator.)
+	const auto request = asked ? RequestedGpu(Config::GetGpuIndex()) : std::string();
+	const auto count   = devices.size();
+	devices            = GpusAsked(devices, request, asked);
 
 	vk::PhysicalDevice  best_device       = nullptr;
 	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
+	bool                best_discrete     = false;
 	SurfaceCapabilities best_capabilities;
 
 	for (const auto& device: devices) {
@@ -269,15 +346,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		vk::PhysicalDeviceVulkan12Features features12 {};
 		features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
-#if defined(__APPLE__)
 		features12.pNext = &depth_clip_control;
-#else
-		vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
-		fragment_barycentric.sType =
-		    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
-		fragment_barycentric.pNext = &depth_clip_control;
-		features12.pNext           = &fragment_barycentric;
-#endif
 		features13.pNext = &features12;
 
 		device_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
@@ -310,13 +379,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			skip_device = true;
 #endif
 		}
-#if !defined(__APPLE__)
-		if (fragment_barycentric.fragmentShaderBarycentric != VK_TRUE) {
-			// (Pascal - GTX 10xx -, RDNA 1 and older drivers: started without it, as KytyPS5 890393fb; only pixel
-			// shaders with per-vertex inputs need it, and they fail alone.)
-			LOGF("fragmentShaderBarycentric is not supported (continuing without it)\n");
-		}
-#endif
 
 		if (required_features12.samplerMirrorClampToEdge == VK_TRUE &&
 		    features12.samplerMirrorClampToEdge != VK_TRUE) {
@@ -543,18 +605,33 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
-		if (best_device == nullptr ||
-		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		// The first discrete GPU, else the first other one (the last discrete GPU before: with two, the one Windows'
+		// graphics settings did not prefer, and not the precompile program's, CreateHeadlessGraphicContext).
+		const bool discrete = device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+		if (best_device == nullptr || (discrete && !best_discrete)) {
 			best_device       = device;
 			best_queue_family = queue_family;
+			best_discrete     = discrete;
 			best_capabilities = std::move(candidate_capabilities);
 		}
 	}
 
+	if (best_device == nullptr && devices.size() != count) {
+		std::printf("Vulkan GPU \"%s\" lacks what the emulator needs; chosen automatically\n", request.c_str());
+		VulkanFindPhysicalDevice(instance, surface, device_extensions, out_capabilities, out_device, out_queue_family, false);
+		return;
+	}
 	out_device       = best_device;
 	out_queue_family = best_queue_family;
 	if (best_device != nullptr) {
 		out_capabilities = std::move(best_capabilities);
+		// (With the driver and its version: issue reports rarely name them, and some faults are one driver's.)
+		vk::PhysicalDeviceDriverProperties driver {};
+		vk::PhysicalDeviceProperties2      properties {};
+		properties.pNext = &driver;
+		best_device.getProperties2(&properties);
+		std::printf("Vulkan GPU in use: %s (driver: %s %s)\n", properties.properties.deviceName.data(), driver.driverName.data(),
+		            driver.driverInfo.data());
 	}
 }
 
@@ -592,6 +669,14 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	graphics.fragment_subgroup_reduction =
 	    bool(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eFragment) &&
 	    (properties11.subgroupSupportedOperations & reductions) == reductions;
+	// (Quad operations in the fragment stage come with the quad feature: quadOperationsInAllStages is about the others.)
+	const bool fragment_quad =
+	    bool(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eFragment) &&
+	    bool(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eQuad);
+	ShaderRecompiler::Spirv::SetPixelQuadOperations(fragment_quad);
+	if (!fragment_quad) {
+		std::printf("Vulkan subgroups: no quad operations in pixel shaders; their DPP quad moves as shuffles\n");
+	}
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
@@ -613,13 +698,26 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	    device_properties.vendorID == 0x1002u &&
 	    ((id >= 0x7440u && id <= 0x75ffu) || id == 0x15bfu || id == 0x15c8u || id == 0x150eu || id == 0x1586u ||
 	     id == 0x1114u);
+	// The Steam Deck's GPU (Van Gogh, RDNA2; the OLED model's too) with Linux' RADV runs them too: 23% less GPU time in
+	// the game's compute programs at 1-1 (the Windows driver's RDNA2 crash above is AMD's compiler, not RADV's).
+	const bool steam_deck_radv = device_properties.vendorID == 0x1002u && (id == 0x163fu || id == 0x1435u) &&
+	                             std::string_view(device_properties.deviceName.data()).find("RADV") != std::string_view::npos;
+	// And a GPU whose compute subgroups are 64 lanes and nothing else (GCN: RX 400/500, Vega): emulated, a wave is one
+	// program's 32 invocations of two lanes each, a whole subgroup only where subgroups have 32 lanes; on 64, two waves of
+	// a workgroup share one subgroup, their ballots and EXEC masks mixed (issue #305: an RX Vega 56's opening movie, its
+	// right half garbage; with KYTY_COMPUTE_WAVE64=1 it played right, AMD's older compiler refusing none of them).
+	const bool compute_64_lanes_only = graphics.min_subgroup_size > 32u;
 	const char* setting = std::getenv("KYTY_COMPUTE_WAVE64");
-	const bool  wanted  = setting != nullptr && *setting != '\0' ? std::string_view(setting) != "0" : amd_rdna3_or_later;
+	const bool  wanted  = setting != nullptr && *setting != '\0' ? std::string_view(setting) != "0"
+	                                                             : amd_rdna3_or_later || steam_deck_radv || compute_64_lanes_only;
 	graphics.compute_wave64_native = graphics.compute_subgroup_size_control_enabled && wanted;
+	graphics.steam_deck_radv       = steam_deck_radv;
 	std::printf("Vulkan compute wave64: %s (%s, device 0x%04x:0x%04x)\n",
 	            graphics.SupportsComputeWave64() ? "native" : "emulated on 32-lane subgroups",
 	            setting != nullptr && *setting != '\0' ? "KYTY_COMPUTE_WAVE64"
 	            : amd_rdna3_or_later                    ? "AMD RDNA3 or later"
+	            : steam_deck_radv                       ? "Steam Deck GPU with RADV"
+	            : compute_64_lanes_only                 ? "64-lane compute subgroups only"
 	                                                    : "default",
 	            device_properties.vendorID, id);
 	// The cooperative halves (ShaderRecompiler::Frontend::TranslatorFeatures) only on NVIDIA GPUs, where they were
@@ -633,14 +731,24 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	// again); until then its table mode pipelines are compiled at their first use.
 	// Float min/max as host instructions only on AMD GPUs (Translate::TranslatorFeatureNativeFloatMinMax).
 	namespace Translate = ShaderRecompiler::Frontend;
-	const bool     amd      = device_properties.vendorID == 0x1002u;
-	const uint32_t features = amd ? Translate::TranslatorFeatures
-	                              : Translate::TranslatorFeatures & ~Translate::TranslatorFeatureNativeFloatMinMax;
+	const bool amd      = device_properties.vendorID == 0x1002u;
+	uint32_t   features = amd ? Translate::TranslatorFeatures
+	                          : Translate::TranslatorFeatures & ~Translate::TranslatorFeatureNativeFloatMinMax;
+	// The AMD barycentrics only with AMD's older compiler, its extension enabled (AmdExplicitVertexBarycentrics), and
+	// whatever the store was made with: the KHR ones' pipelines are refused there (issue #305).
+	if (!graphics.amd_explicit_vertex_barycentrics) features &= ~Translate::TranslatorFeatureAmdBarycentrics;
+	const uint32_t amd_required =
+	    Translate::TranslatorFeatureTableSlotsAtUse |
+	    (graphics.amd_explicit_vertex_barycentrics ? Translate::TranslatorFeatureAmdBarycentrics : 0u);
 	if (device_properties.vendorID != 0x10deu) {
 		Translate::SetTranslatorDeviceFeatures(features & ~Translate::TranslatorFeatureCooperativeHalves,
-		                                       amd ? Translate::TranslatorFeatureTableSlotsAtUse : 0u);
-		std::printf("Cooperative halves: off on this GPU (tested on NVIDIA GPUs; KYTY_LANE_LOCAL_COOP=1 forces them)%s\n",
-		            amd ? "; table mode slots loaded at use, float min/max native" : "");
+		                                       amd ? amd_required : 0u);
+		std::printf("Cooperative halves: off on this GPU (tested on NVIDIA GPUs; KYTY_LANE_LOCAL_COOP=1 forces them)%s%s\n",
+		            amd ? "; table mode slots loaded at use, float min/max native" : "",
+		            graphics.amd_explicit_vertex_barycentrics
+		                ? "; pixel shaders' barycentrics without per-vertex inputs from VK_AMD_shader_explicit_vertex_parameter "
+		                  "(AMD's older compiler)"
+		                : "");
 	} else {
 		Translate::SetTranslatorDeviceFeatures(features);
 	}
@@ -669,7 +777,7 @@ static Libs::Graphics::Fsr3::QueuePlan g_fsr3_plan;
 static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
                                      uint32_t                        queue_family,
                                      const std::vector<const char*>& device_extensions,
-                                     GraphicContext&                 graphics) {
+                                     GraphicContext& graphics, vk::SurfaceKHR surface = nullptr) {
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
@@ -684,6 +792,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	std::array<vk::DeviceQueueCreateInfo, 3> queue_create_infos {queue_create_info, queue_create_info, queue_create_info};
 	uint32_t                                 queue_create_count = 1;
 	graphics.readback_family                                    = static_cast<uint32_t>(-1);
+	graphics.fsr_compute_family                                 = static_cast<uint32_t>(-1);
+	graphics.fsr_present_family                                 = static_cast<uint32_t>(-1);
+	bool fsr_queues                                             = false;
 #if defined(_WIN32)
 	// A second graphics-family queue for presents (GraphicContext::present_queue).
 	{
@@ -705,8 +816,16 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		}
 	}
 #endif
-	if (const char* readback = std::getenv("KYTY_READBACK_QUEUE");
-	    readback != nullptr && readback[0] != '\0' && std::strcmp(readback, "0") != 0) {
+	(void)fsr_queues;
+	// (KYTY_READBACK_QUEUE=0: no transfer queue, as the switch's mode; performance-switches.h.) Not on an Intel GPU unless
+	// it is set: an Arc B580 (driver 8801) stopped finishing that queue's copies after a while in 1-2 and 3-1, then the
+	// graphics queue too, the game frozen; with the copies on the graphics queue an hour played clean (issue #255).
+	const char* readback = std::getenv("KYTY_READBACK_QUEUE");
+	const bool  intel    = physical_device.getProperties().vendorID == 0x8086u;
+	if (readback == nullptr || *readback == '\0') {
+		if (intel) std::printf("Readback copies: on the graphics queue (an Intel GPU; KYTY_READBACK_QUEUE=1: the copy queue, issue #255)\n");
+	}
+	if (readback != nullptr && *readback != '\0' ? std::strcmp(readback, "0") != 0 : !intel) {
 		uint32_t family_count = 0;
 		physical_device.getQueueFamilyProperties(&family_count, nullptr);
 		std::vector<vk::QueueFamilyProperties> families(family_count);
@@ -716,9 +835,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			const auto flags = families[family].queueFlags;
 			if (family != queue_family && families[family].queueCount != 0 &&
 			    (flags & vk::QueueFlagBits::eTransfer) && (flags & ~transfer_only) == vk::QueueFlags {}) {
-				graphics.readback_family                         = family;
-				queue_create_infos[1].queueFamilyIndex           = family;
-				queue_create_count                               = 2;
+				graphics.readback_family                                = family;
+				queue_create_infos[queue_create_count].queueFamilyIndex = family;
+				queue_create_infos[queue_create_count].queueCount       = 1;
+				++queue_create_count;
 				LOGF("\treadback queue family %u\n", family);
 				break;
 			}
@@ -774,14 +894,6 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	supported_features12.pNext = nullptr;
 	supported_features13.pNext = &supported_features12;
 
-#if !defined(__APPLE__)
-	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_fragment_barycentric {};
-	supported_fragment_barycentric.sType =
-	    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
-	supported_fragment_barycentric.pNext = nullptr;
-	supported_features12.pNext           = &supported_fragment_barycentric;
-#endif
-
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
@@ -789,11 +901,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	supported_robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
 	supported_robustness2.pNext = nullptr;
 	if (robustness2_ext_enabled) {
-#if defined(__APPLE__)
 		supported_features12.pNext = &supported_robustness2;
-#else
-		supported_fragment_barycentric.pNext = &supported_robustness2;
-#endif
 	}
 
 	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -841,14 +949,38 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		supported_copy_indirect.pNext = supported_features2.pNext;
 		supported_features2.pNext     = &supported_copy_indirect;
 	}
+	const bool executable_extension = HasExtension(device_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR supported_executables {};
+	if (executable_extension) {
+		supported_executables.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &supported_executables;
+	}
+	const bool barycentric_extension =
+	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
+	if (barycentric_extension) {
+		fragment_barycentric.pNext = supported_features2.pNext;
+		supported_features2.pNext  = &fragment_barycentric;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.copy_memory_indirect_enabled = copy_indirect_extension && supported_copy_indirect.indirectCopy;
+	graphics.pipeline_statistics_enabled  = executable_extension && supported_executables.pipelineExecutableInfo;
 	LOGF("Vulkan indirect memory copies: %s\n", graphics.copy_memory_indirect_enabled ? "true" : "false");
 	graphics.maintenance5_enabled      = maintenance5_extension && supported_maintenance5.maintenance5;
 	graphics.pipeline_binaries_enabled = binary_extensions && supported_binaries.pipelineBinaries && graphics.maintenance5_enabled;
 	// (With maintenance5, with or without the binaries, pipelines take SPIR-V inline.)
 	ModuleStore::Enable(graphics.maintenance5_enabled);
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
+	// No fragment shader barycentrics on this GPU (NVIDIA before Turing, Polaris and RDNA 1 on RADV, older drivers): continue without
+	// them, and pixel shaders needing them fail at pipeline creation (issue #149). That is 4,550 of Demon's Souls' 4,583: the
+	// PS5 compiler's shaders read each vertex's packed raw values and interpolate by themselves, so plain interpolated inputs
+	// cannot stand in for them (tried: colourless characters and textures in blocks; issue #305).
+	const bool barycentric_supported =
+	    barycentric_extension && fragment_barycentric.fragmentShaderBarycentric == VK_TRUE;
+	if (!barycentric_supported) {
+		std::printf("Vulkan: this GPU has no fragment shader barycentrics (VK_KHR_fragment_shader_barycentric): nearly every "
+		            "pixel shader of Demon's Souls needs them, and their pipelines will fail\n");
+	}
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -895,17 +1027,6 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                     supported_features12.bufferDeviceAddress != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 	                     supported_features12.shaderBufferInt64Atomics != VK_TRUE);
-#if !defined(__APPLE__)
-	const bool barycentric_supported =
-	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) &&
-	    supported_fragment_barycentric.fragmentShaderBarycentric == VK_TRUE;
-	if (!barycentric_supported) {
-		LOGF("WARNING: this GPU has no fragmentShaderBarycentric (GTX 10xx, RDNA 1): a few effects may be missing or "
-		     "wrong.\n");
-		std::printf("WARNING: this GPU has no fragmentShaderBarycentric (GTX 10xx, RDNA 1): a few effects may be "
-		            "missing or wrong.\n");
-	}
-#endif
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
@@ -929,7 +1050,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.multiDrawIndirect                    = VK_TRUE; // (indirect draws of several argument sets)
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
-	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue (the BDA page table).
+	// Sparse binding and residency stay enabled where the sparse BDA table could use them (nothing uses them since it
+	// went): the pipeline binary stores users already have were made on such devices, and a device's features may
+	// enter its pipeline keys.
 	{
 		vk::PhysicalDeviceProperties properties {};
 		physical_device.getProperties(&properties);
@@ -937,12 +1060,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		physical_device.getQueueFamilyProperties(&family_count, nullptr);
 		std::vector<vk::QueueFamilyProperties> families(family_count);
 		physical_device.getQueueFamilyProperties(&family_count, families.data());
-		graphics.sparse_residency_buffers =
-		    supported_features2.features.sparseBinding == VK_TRUE &&
+		if (supported_features2.features.sparseBinding == VK_TRUE &&
 		    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
 		    properties.sparseProperties.residencyNonResidentStrict == VK_TRUE && queue_family < family_count &&
-		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
-		if (graphics.sparse_residency_buffers) {
+		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding)) {
 			device_features.sparseBinding         = VK_TRUE;
 			device_features.sparseResidencyBuffer = VK_TRUE;
 		}
@@ -950,16 +1071,16 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
-#if defined(__APPLE__)
-	robustness2.pNext = &features12;
-#else
-	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
-	fragment_barycentric.sType =
-	    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
-	fragment_barycentric.pNext                     = &features12;
-	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
-	robustness2.pNext = barycentric_supported ? static_cast<void*>(&fragment_barycentric) : static_cast<void*>(&features12);
-#endif
+	// (Barycentrics stay out on GPUs without them: requesting an unsupported feature fails device creation.)
+	if (barycentric_supported) {
+		fragment_barycentric.sType =
+		    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+		fragment_barycentric.pNext                     = &features12;
+		fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
+		robustness2.pNext                              = &fragment_barycentric;
+	} else {
+		robustness2.pNext = &features12;
+	}
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
@@ -985,14 +1106,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	    supported_features13.subgroupSizeControl == VK_TRUE;
 
 	auto features13 = required_features13;
-#if defined(__APPLE__)
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&features12);
-#else
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                   : barycentric_supported ? static_cast<void*>(&fragment_barycentric)
-	                                           : static_cast<void*>(&features12);
-#endif
+	// (Without robustness2 the chain still takes the barycentrics where the GPU has them: robustness2.pNext's head.)
+	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2) : robustness2.pNext;
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 	features13.pipelineCreationCacheControl = supported_features13.pipelineCreationCacheControl;
@@ -1055,17 +1170,17 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		copy_indirect.pNext        = const_cast<void*>(create_info.pNext);
 		create_info.pNext          = &copy_indirect;
 	}
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executables {};
+	if (graphics.pipeline_statistics_enabled) {
+		executables.pipelineExecutableInfo = VK_TRUE;
+		executables.pNext                  = const_cast<void*>(create_info.pNext);
+		create_info.pNext                  = &executables;
+	}
 	vk::PhysicalDeviceMemoryPriorityFeaturesEXT memory_priority {};
 	if (graphics.memory_priority_enabled) {
 		memory_priority.memoryPriority = VK_TRUE;
 		memory_priority.pNext          = const_cast<void*>(create_info.pNext);
 		create_info.pNext              = &memory_priority;
-	}
-	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_features {};
-	if (graphics.pipeline_statistics_enabled) {
-		executable_features.pipelineExecutableInfo = VK_TRUE;
-		executable_features.pNext                  = const_cast<void*>(create_info.pNext);
-		create_info.pNext                          = &executable_features;
 	}
 	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
 	const bool fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
@@ -1095,17 +1210,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	vk::Device device = nullptr;
 
+	VkPhysicalDeviceAntiLagFeaturesAMD anti_lag {};
+	AntiLag::ChainFeature(physical_device, device_extensions, create_info, anti_lag);
 	// (Frame generation's device creation reserves host address space below 1 TiB: the range kept free for it, issue #45.)
 	LibKernel::Memory::ReleaseFrameGenAddressHole();
-	// KYTY_FRAMEGEN_VMMAP=1: the host address space from 4 GiB to 4 TiB before and after the device creation (what the
-	// driver reserves for it, issue #45).
-	static const bool vmmap = [] {
-		const char* value = std::getenv("KYTY_FRAMEGEN_VMMAP");
-		return value != nullptr && *value == '1';
-	}();
-	if (vmmap) LocalPlatform::LogAddressSpace("before vkCreateDevice", uint64_t {1} << 32u, uint64_t {1} << 42u);
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
-	if (vmmap) LocalPlatform::LogAddressSpace("after vkCreateDevice", uint64_t {1} << 32u, uint64_t {1} << 42u);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
 		std::printf("vkCreateDevice failed: %s (%u extensions)\n", vk::to_string(result).c_str(),
@@ -1159,12 +1268,14 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
 		r.required_extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
 	}
 
-	// KYTY_EXCLUSIVE_FULLSCREEN: the surface's capabilities asked with the exclusive full screen info chained
-	// (vkGetPhysicalDeviceSurfaceCapabilities2KHR, swapchain.cpp).
-	if (ExclusiveFullscreen::Requested() && HasExtension(r.available_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+#if defined(_WIN32)
+	// KYTY_FULLSCREEN_EXCLUSIVE (issue #166): VK_EXT_full_screen_exclusive needs this instance extension. (Unset too:
+	// an AMD GPU, known only after the instance, keeps out of exclusive fullscreen by default.)
+	if (HasExtension(r.available_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
 	    !HasExtension(r.required_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
 		r.required_extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
 	}
+#endif
 
 	if (HasExtension(r.available_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
 		r.required_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -1448,6 +1559,8 @@ void WindowContext::CreateVulkan() {
 	}
 #endif
 	inst_info.pApplicationInfo        = &app_info;
+	// Linux DLSS (KYTY_UPSCALER=dlss): the instance extensions NVIDIA's NGX needs.
+	FrameGen::AddInstanceExtensions(r.available_extensions, r.required_extensions);
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());
 	inst_info.ppEnabledExtensionNames = r.required_extensions.data();
 	inst_info.enabledLayerCount =
@@ -1455,6 +1568,7 @@ void WindowContext::CreateVulkan() {
 	inst_info.ppEnabledLayerNames =
 	    (r.enable_validation_layers ? r.required_layers.data() : nullptr);
 
+	AntiLag::BeforeInstance(); // (Mesa's anti-lag layer is implicit: an environment variable before the instance)
 	const vk::Result result = vk::createInstance(&inst_info, nullptr, &graphic_ctx.instance);
 	switch (result) {
 		case vk::Result::eSuccess: break;
@@ -1506,7 +1620,8 @@ void WindowContext::CreateVulkan() {
 	                         graphic_ctx.physical_device, queue_family);
 
 	if (graphic_ctx.physical_device == nullptr) {
-		EXIT("Could not find suitable device");
+		EXIT("Could not find suitable device: no Vulkan GPU has what the emulator needs (the log's lines above name what "
+		     "each one lacks; NVIDIA cards need a GeForce GTX 16 or RTX 20 series or newer)");
 	}
 
 	vk::PhysicalDevicePushDescriptorProperties push_descriptor_properties {};
@@ -1565,13 +1680,7 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
-		// KYTY_PIPELINE_STATS=1 (a survey): each pipeline made again with the driver's statistics (shaders.cpp).
-		if (const char* stats = std::getenv("KYTY_PIPELINE_STATS");
-		    stats != nullptr && *stats == '1' &&
-		    HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
-			graphic_ctx.pipeline_statistics_enabled = true;
-		}
+		(void)AmdExplicitVertexBarycentrics(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx);
 		// KYTY_GPU_CHECKPOINTS (diagnostic): the pipelines a GPU hang or fault ran (device-fault.h).
 		if (DeviceFault::CheckpointsRequested() &&
 		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
@@ -1648,7 +1757,7 @@ void WindowContext::CreateVulkan() {
 	// (Streamline's own answer whether DLSS-G can run here, asked before the device: the refusal below gives it.)
 	const std::string frame_gen_problem = FrameGen::SupportProblem(graphic_ctx.physical_device);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, r, queue_family,
-	                                        device_extensions, graphic_ctx);
+	                                        device_extensions, graphic_ctx, surface);
 	if (graphic_ctx.device == nullptr) {
 		// (Issue #32: an RTX 5080 whose driver refused the device Streamline asked for; the game runs without it.)
 		if (FrameGen::StreamlineLoaded()) {
@@ -1660,6 +1769,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	AntiLag::OnDevice(graphic_ctx.device);
 	FrameGen::BypassCommandHooks(graphic_ctx.device);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::Install();
@@ -1735,11 +1845,13 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
 #endif
-	// The first device with the target API and a graphics+compute queue, preferring discrete.
-	auto devices = EnumerateVulkan<vk::PhysicalDevice>(
+	// The first device with the target API and a graphics+compute queue, preferring discrete (as the emulator's choice,
+	// VulkanFindPhysicalDevice, KYTY_GPU too).
+	const auto all = EnumerateVulkan<vk::PhysicalDevice>(
 	    "vkEnumeratePhysicalDevices", [&](uint32_t* count, vk::PhysicalDevice* values) {
 		    return graphic_ctx.instance.enumeratePhysicalDevices(count, values);
 	    });
+	const auto devices = GpusAsked(all, RequestedGpu(-1), false);
 	uint32_t queue_family = static_cast<uint32_t>(-1);
 	for (const bool discrete_only: {true, false}) {
 		for (const auto& device: devices) {
@@ -1770,6 +1882,8 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 	physical_device_properties.pNext = &push_descriptor_properties;
 	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
+	// (With more than one GPU: the one compiled for.)
+	if (all.size() > 1) std::printf("Vulkan GPU in use: %s\n", physical_device_properties.properties.deviceName.data());
 	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
@@ -1832,6 +1946,10 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 			if (!HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME))
 				device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 		}
+		if (HasExtension(available_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+		}
+		(void)AmdExplicitVertexBarycentrics(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx);
 	}
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
 	const VulkanExtensions no_layers {};

@@ -268,10 +268,12 @@ void Inst::AddUse(Inst* used, size_t operand) {
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {
+	// From the back: passes remove users latest first (dead code, EXEC selects), which is then O(1) where a value of
+	// thousands of users (an EXEC predicate) took O(n) for each. A use is there once: the same one goes either way.
 	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found == used->uses.end());
-	used->uses.erase(found);
+	    used->uses.rbegin(), used->uses.rend(), [&](const Use& use) { return use.user == this && use.operand == operand; });
+	EXIT_IF(found == used->uses.rend());
+	used->uses.erase(std::next(found).base());
 }
 
 void Inst::DropLinks() {

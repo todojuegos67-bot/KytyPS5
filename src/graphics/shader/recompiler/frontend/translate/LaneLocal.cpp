@@ -24,10 +24,7 @@
 // - a lane mask only selects lanes (EXEC, a V_CNDMASK or carry select, masks combined bit by bit) and is made from
 //   compares and EXEC (or is 0 / -1): other scalar bits hold the wave's layout, lanes 32-63 in the high word;
 // - V_READFIRSTLANE, with an active lane in the half, reads either a value the same in every lane (computed from
-//   scalar values under the same EXEC; with KYTY_LANE_LOCAL_UNIFORM_LOADS=1, for a program the proof refuses
-//   otherwise, also loaded by a buffer load whose address is: the program then holds
-//   IR::Program::lane_local_uniform_loads, and CompileProgram runs it two lanes per invocation where a buffer adds
-//   the lane to its index, ADD_TID) or the head of a waterfall loop (the lanes equal to it run the loop body, then
+//   scalar values under the same EXEC) or the head of a waterfall loop (the lanes equal to it run the loop body, then
 //   leave: every lane runs once with its own value, whichever lane was first);
 // - DPP within a row of 16 lanes, V_PERMLANE(X)16 within a half, quad modes.
 // A branch on EXEC or VCC goes another way for a half than for the wave only when none of the half's lanes is active
@@ -301,7 +298,6 @@ struct State {
 	std::bitset<256> uniform;  // VGPRs the same in every active lane (computed from scalar values under this EXEC)
 	bool             scc_mask = false;
 	bool             active   = true; // each half has an active lane
-	bool             uniform_load_rule = false; // UniformLoad applies (the proof's second pass)
 	bool             operator==(const State&) const = default;
 
 	void Join(const State& other) {
@@ -313,7 +309,6 @@ struct State {
 		uniform &= other.uniform;
 		scc_mask = scc_mask || other.scc_mask;
 		active   = active && other.active;
-		uniform_load_rule = uniform_load_rule || other.uniform_load_rule;
 	}
 };
 
@@ -335,9 +330,8 @@ using Syms = std::array<Sym, 128>;
 
 class Analysis {
 public:
-	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool uniform_load_rule = false,
-	         bool cooperative = false)
-	    : m_program(program), m_cfg(cfg), m_uniform_load_rule(uniform_load_rule), m_cooperative(cooperative) {}
+	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool cooperative = false)
+	    : m_program(program), m_cfg(cfg), m_cooperative(cooperative) {}
 
 	bool Run(std::string* reason) {
 		const auto& blocks = m_cfg.blocks;
@@ -370,7 +364,6 @@ private:
 		size_t             entry = 0;
 		if (const auto found = m_index_of.find(m_cfg.entry_block); found != m_index_of.end()) entry = found->second;
 		in[entry].mask.set(ExecLo).set(ExecHi);
-		in[entry].uniform_load_rule = m_uniform_load_rule;
 		reached[entry] = true;
 		// The masks a block may receive (union) and the facts it surely receives (intersection), to a fixpoint.
 		std::deque<size_t> work {entry};
@@ -495,33 +488,6 @@ private:
 	static bool WritesExec(const Instruction& inst) {
 		const auto index = ScalarIndex(inst.dst);
 		return index == ExecLo || index == ExecHi || SaveExec(inst.opcode);
-	}
-
-	// The proof's second pass (UniformLoadsEnabled): a buffer load at the same address in every lane loads the same
-	// value in every lane, unless the buffer adds the lane to its index (ADD_TID: a descriptor bit only the
-	// specialization knows, CompileProgram). A buffer load (not a store or an atomic) whose index and offset VGPRs,
-	// descriptor and scalar offset are the same in every active lane.
-	static bool UniformLoad(const Instruction& inst, const State& state) {
-		if (!state.uniform_load_rule || (inst.family != Family::MUBUF && inst.family != Family::MTBUF)) return false;
-		const auto name = magic_enum::enum_name(inst.opcode);
-		// (A 16-bit load keeps the other half of its register.)
-		if ((!name.starts_with("BUFFER_LOAD_") && !name.starts_with("TBUFFER_LOAD_")) || name.find("D16") != name.npos)
-			return false;
-		if (inst.src0.kind != OperandKind::Vgpr) return false;
-		const auto vgpr = [&](uint32_t reg) { return reg < 256 && state.uniform.test(reg); };
-		if (inst.idxen && !vgpr(inst.src0.reg)) return false;
-		if (inst.offen && !vgpr(inst.idxen ? inst.src0.reg + 1 : inst.src0.reg)) return false;
-		bool mask = false;
-		if (ScalarIndex(inst.src1) < 0 || MaskIn(inst.src1, 4, state)) return false;
-		switch (inst.src2.kind) {
-			case OperandKind::IntegerInlineConstant:
-			case OperandKind::FloatInlineConstant:
-			case OperandKind::LiteralConstant: break;
-			default:
-				ReadScalar(inst, inst.src2, state, mask);
-				if (ScalarIndex(inst.src2) < 0 || mask) return false;
-		}
-		return true;
 	}
 
 	// Sources the same in every active lane: constants, scalar values (not masks), uniform VGPRs.
@@ -663,6 +629,9 @@ private:
 				if (SaveExec(inst.opcode)) {
 					WriteScalar(inst.dst, 2, true, state); // (the old EXEC)
 					SetPair(state.lanes, ScalarIndex(inst.dst), NameHas64(inst.opcode));
+					// SCC: whether the new EXEC has a lane, the wave's answer (a half's lanes alone could tell the halves
+					// apart: MaskSccSaveexecBranchesTheWholeWave).
+					state.scc_mask = true;
 					break;
 				}
 				if (inst.family != Family::SOPC && inst.dst.kind != OperandKind::Unknown) {
@@ -726,8 +695,7 @@ private:
 					const auto written = std::max({inst.data_dwords, inst.data_components,
 					                               static_cast<uint32_t>(std::popcount(inst.dmask)), 1u}) +
 					                     (inst.family == Family::MIMG ? 1u : 0u);
-					const bool uniform = UniformLoad(inst, before);
-					for (uint32_t k = 0; k < written && inst.dst.reg + k < 256; ++k) state.uniform.set(inst.dst.reg + k, uniform);
+					for (uint32_t k = 0; k < written && inst.dst.reg + k < 256; ++k) state.uniform.reset(inst.dst.reg + k);
 				}
 				break;
 			default: break;
@@ -1236,24 +1204,11 @@ private:
 
 	const Decoder::Program&              m_program;
 	const CFG::Graph&                    m_cfg;
-	bool                                 m_uniform_load_rule = false;
-	bool                                 m_cooperative       = false;
+	bool                                 m_cooperative = false;
 	std::unordered_map<uint32_t, size_t> m_index_of;
 	std::vector<bool>                    m_exact;    // (by block) a lane-mask branch the wave decides
 	std::vector<bool>                    m_exchange; // (by instruction) a lane read the wave runs
 };
-
-// KYTY_LANE_LOCAL_UNIFORM_LOADS=1: a program the proof refuses is tried again taking buffer loads at one address for
-// values the same in every lane (an engine prologue reads a count at a constant index, then V_READFIRSTLANE of it:
-// ~950 more of Demon's Souls' 1.07 programs lane-local, the biggest 1.97 M SPIR-V words -> 0.98 M, an NVIDIA compile
-// 82 -> 40 s). A program the first pass proves stays as it was, byte for byte.
-bool UniformLoadsEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_LANE_LOCAL_UNIFORM_LOADS");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
-}
 
 // LDS under TranslatorFeatureLaneLocalWide (the lane batch's (ii)): plain reads and writes of workgroup memory. A wave's
 // lanes may exchange data there with no barrier between (in lockstep on the guest); the halves of a lane-local wave
@@ -1598,11 +1553,9 @@ private:
 
 } // namespace
 
-bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason, bool* uniform_loads) {
+bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason) {
 	LaneLocalProof proof;
-	const bool     lane_local = ProveWaveLaneLocal(program, false, proof, reason);
-	if (uniform_loads != nullptr) *uniform_loads = proof.uniform_loads;
-	return lane_local;
+	return ProveWaveLaneLocal(program, false, proof, reason);
 }
 
 bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof, std::string* reason) {
@@ -1615,13 +1568,9 @@ bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneL
 		return LdsBarriers(program, cfg).Run(proof.lds_barriers, reason);
 	};
 	if (Analysis(program, cfg).Run(reason)) return lds();
-	if (UniformLoadsEnabled() && Analysis(program, cfg, true).Run(reason)) {
-		proof.uniform_loads = true;
-		return lds();
-	}
 	if (!cooperative) return false;
 	std::string why;
-	Analysis    analysis(program, cfg, false, true);
+	Analysis    analysis(program, cfg, true);
 	if (!analysis.Run(&why)) {
 		if (reason != nullptr) *reason += " (cooperative: " + why + ")";
 		return false;

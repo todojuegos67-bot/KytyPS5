@@ -7,21 +7,33 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
+#include "live-counters.h"
 #include "live-trace.h"
 #include "speculation-state.h"
 
+#include <vulkan/vulkan_format_traits.hpp>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <xxhash.h>
+
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
 
 extern "C" {
 // 1: drop a repeated-write barrier that repeats an identical transition of the
 // same image inside one transit group.
-volatile std::atomic<uint32_t> kyty_local_image_barrier_dedupe {0};
+volatile std::atomic<uint32_t> kyty_local_image_barrier_dedupe {1};
+// KYTY_DRAW_READ_AFTER_WRITE=1: a draw that reads an image it writes keeps the barrier after the last draw's write
+// (Image::GetBarriers; TableDraw transits its set every time), so overlapping deferred decals keep all their pixels
+// (issue #315). Off by default: ~750 barriers a frame at Boletaria, 72.9 -> 61.1 fps on an RTX 5090 without the 60 fps
+// cap (a framebuffer-local barrier inside the render pass cost the same: the fragment work drains either way).
+volatile std::atomic<uint32_t> kyty_local_draw_read_after_write {0};
 }
 
 namespace Libs::Graphics {
@@ -152,6 +164,9 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 		entry->found              = entry->state;
 		entry->found_subresources = entry->subresources;
 		entry->found_group        = entry->group;
+		// (A GPU buffer write over it before the commit reaches this segment leaves it to be uploaded first: Speculation's
+		// CommitSegments.)
+		entry->found_buffer_modified = IsBufferModified();
 		spec->used.push_back(found->second);
 	}
 	return entry;
@@ -160,8 +175,9 @@ Spec::ImageEntry* Image::SpeculativeEntry() {
 const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
-                                   std::optional<ImageSubresourceRange> range) {
-	auto* const entry = SpeculativeEntry();
+                                   std::optional<ImageSubresourceRange> range, bool read_after_write) {
+	// (Behind a plain global: KYTY_SPECULATE unset, no call and no thread-local read per barrier.)
+	auto* const entry = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? SpeculativeEntry() : nullptr;
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
@@ -179,13 +195,20 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	// the console, where nothing else orders the storage writes of consecutive draws: no barrier between them
 	// (each was also a render pass break: ~800 per frame in the deferred decal pass). A repeated write after
 	// any other access (an upload, a copy, the emulator's own compute) keeps its barrier.
+	// `read_after_write` (with KYTY_DRAW_READ_AFTER_WRITE=1): a draw that reads the image it writes (bound both as a
+	// texture and as storage: the deferred decals' G-buffer, each decal reading what it blends into) keeps it too.
+	// The game puts no barrier between its decals; on the console the pixels of consecutive draws run nearly in order
+	// and an overlapping decal read what the one before it wrote, while a PC GPU runs them together: a decal reads the
+	// G-buffer from before the last one's write and writes it back over it, which loses that decal's pixels in 2x2
+	// blocks (the Nexus candles' wax, castle walls in 1-3: issue #315). A draw's own bindings share one barrier.
+	read_after_write = read_after_write && kyty_local_draw_read_after_write.load(std::memory_order_relaxed) != 0;
 	const bool     guest        = g_transit_group != 0;
 	constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
 	                              vk::AccessFlagBits2::eMemoryWrite;
 	const auto     in_place     = [&](const VulkanImageState& state, uint64_t group) {
 		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
 		return state.layout == destination_layout && state.access_mask == destination_access &&
-		       (!repeated_write || (guest && state.guest) ||
+		       (!repeated_write || (guest && state.guest && !read_after_write) ||
 		        (DedupeTransitGroups() && g_transit_group != 0 && group == g_transit_group));
 	};
 	// An image already in the layout and access as a whole (a table draw's textures, every draw): nothing changes, so
@@ -217,7 +240,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	std::optional<StateLock> lock;
 	if (entry == nullptr) {
 		lock.emplace(*this);
-		MoveImageStateEpoch();
+		MoveImageStateEpoch(this);
 	}
 	auto&      state                  = entry != nullptr ? entry->state : backing.state;
 	auto&      subresource_states     = entry != nullptr ? entry->subresources : backing.subresource_states;
@@ -240,7 +263,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 
 				const bool repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access) &&
-				    !(guest && subresource_state.guest);
+				    !(guest && subresource_state.guest && !read_after_write);
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -294,7 +317,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 }
 
 const VulkanImageState& Image::CurrentState() const {
-	if (const auto* spec = Spec::Current()) {
+	if (const auto* spec = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 ? Spec::Current() : nullptr) {
 		if (const auto found = spec->overlay_index.find(this); found != spec->overlay_index.end())
 			return spec->overlay[found->second].state;
 		if (const auto* chain = spec->ChainImage(this, serial)) return chain->state;
@@ -305,7 +328,7 @@ const VulkanImageState& Image::CurrentState() const {
 void Image::RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
                          vk::CommandBuffer command_buffer) {
 	const StateLock       lock(*this);
-	MoveImageStateEpoch();
+	MoveImageStateEpoch(this);
 	thread_local Barriers barriers;
 	barriers.clear();
 	const auto add = [&](const VulkanImageState& from, const VulkanImageState& to, uint32_t level, uint32_t levels,
@@ -349,8 +372,30 @@ uint64_t ImageStateEpoch() noexcept {
 	return g_image_state_epoch.load(std::memory_order_acquire);
 }
 
-void MoveImageStateEpoch() noexcept {
+namespace ImageSerials {
+std::atomic<std::atomic<uint64_t>*> g_chunks[Chunks] {};
+std::atomic<uint64_t>               g_unattributed {0};
+std::atomic<bool>                   g_on {false};
+std::atomic<uint64_t>               g_beyond {0};
+
+void Ensure(uint32_t slot) {
+	static std::mutex lock;
+	if ((slot >> ChunkBits) >= Chunks) return; // (beyond the table: no chunk; Read gives a new value each time, Move nothing)
+	auto& chunk = g_chunks[slot >> ChunkBits];
+	if (chunk.load(std::memory_order_acquire) != nullptr) return;
+	const std::lock_guard guard(lock);
+	if (chunk.load(std::memory_order_acquire) == nullptr) chunk.store(new std::atomic<uint64_t>[ChunkSize] {}, std::memory_order_release);
+}
+} // namespace ImageSerials
+
+void MoveImageStateEpoch(const Image* image) noexcept {
 	g_image_state_epoch.fetch_add(1, std::memory_order_acq_rel);
+	// (An image not inserted yet is in no state or set: its slot's entry moves as it is inserted.)
+	if (image != nullptr) ImageSerials::Move(image->serial_slot);
+	else {
+		ImageSerials::g_unattributed.fetch_add(1, std::memory_order_acq_rel);
+		LiveCounters::Add(LiveCounters::SerialsUnattributed);
+	}
 }
 
 void BeginTransitGroup() noexcept {
@@ -369,12 +414,68 @@ void EndTransitGroup() noexcept {
 	g_transit_group = 0;
 }
 
+// A new image's memory is the PS5's fresh memory, zeroed, not whatever the VRAM had (Vulkan leaves a new image
+// undefined): an image leaving the undefined layout as a whole is cleared to zero first (block-compressed images, always
+// uploaded, are left as they are). Demon's Souls at 1080p FSR with the 43:18 squeeze read its first frame's history of a
+// new image and, with garbage there, kept NaN (the 3D green) or huge red in it for the whole session.
+// KYTY_ZERO_NEW_IMAGES=0: left undefined, as before.
+static bool ZeroNewImages() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_ZERO_NEW_IMAGES");
+		const bool  zero  = value == nullptr || value[0] != '0';
+		if (!zero) std::printf("Zero new images: off (KYTY_ZERO_NEW_IMAGES=0)\n");
+		return zero;
+	}();
+	return on;
+}
+
+// `aspect`: every aspect of the image's format (Image::FullAspectMask: X8D24 is depth alone and S8 stencil alone, both
+// cleared as depth/stencil).
+static void ZeroNewImage(vk::Image image, vk::ImageAspectFlags aspect, vk::CommandBuffer command_buffer) {
+	vk::ImageSubresourceRange whole {};
+	whole.aspectMask = aspect;
+	const bool depth = !(aspect & vk::ImageAspectFlagBits::eColor);
+	whole.levelCount = VK_REMAINING_MIP_LEVELS;
+	whole.layerCount = VK_REMAINING_ARRAY_LAYERS;
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	barrier.oldLayout           = vk::ImageLayout::eUndefined;
+	barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image;
+	barrier.subresourceRange    = whole;
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command_buffer.pipelineBarrier2(dependency);
+	if (depth) {
+		const vk::ClearDepthStencilValue zero {0.0f, 0};
+		command_buffer.clearDepthStencilImage(image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &whole);
+	} else {
+		vk::ClearColorValue zero {};
+		zero.uint32 = std::array<uint32_t, 4> {0u, 0u, 0u, 0u};
+		command_buffer.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &whole);
+	}
+}
+
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
+                    bool read_after_write) {
 	constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
 	                        vk::AccessFlagBits2::eColorAttachmentWrite |
 	                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
 	                        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
+	if (backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty() &&
+	    destination_layout != vk::ImageLayout::eUndefined && backing.image && ZeroNewImages() &&
+	    vk::blockExtent(info.pixel_format)[0] == 1) {
+		m_scheduler.EndRendering();
+		ZeroNewImage(backing.image, FullAspectMask(info.pixel_format), command_buffer);
+		backing.state = {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+		                 vk::ImageLayout::eTransferDstOptimal};
+	}
 	if (LiveTrace::WriteTicks()) {
 		LiveTrace::Event(LiveTrace::ImageUse, info.data.address,
 		                 (info.data.size & 0xffffffffu) |
@@ -393,7 +494,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
 	const auto& barriers =
-	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	    GetBarriers(destination_layout, destination_access, destination_stage, range, read_after_write);
 	// KYTY_ASYNC_COMPUTE: a layout transition is a write of the image too (the other lane must be done with it).
 	LaneSync::Note(lane_marks, static_cast<bool>(destination_access & writes) || !barriers.empty());
 	if (barriers.empty()) {
@@ -888,7 +989,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0;
 	}();
 	const bool test_fail = test_fail_above != 0 && info.data.size > test_fail_above;
-	if ((may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing)) {
+	if ((may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing, true)) {
 		m_create_failed = true;
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -921,7 +1022,6 @@ void Image::PrepareReuse(const ImageInfo& image_info) {
 	track_addr          = 0;
 	track_addr_end      = 0;
 	untracked_holes.clear();
-	partial_hashes.clear();
 	depth_id            = {};
 	frame_accessed_last = 0;
 	staged_ring         = nullptr;

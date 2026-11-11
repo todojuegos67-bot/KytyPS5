@@ -4,13 +4,13 @@
 #include "live-counters.h"
 #include "live-trace.h"
 #include "time-census.h"
-#include "writeback-verify.h"
 #include "fresh-memory.h"
 #include "guest-lazy-commit.h"
 #include "mem-guard.h"
 #include "ram-guard.h"
 
 #include "common/assert.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -18,14 +18,18 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "native-resource-state.h"
+#include "texture-offload.h"
+#include "write-guard.h"
 #include "speculation-state.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -36,10 +40,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <shared_mutex>
-#include <string>
 #include <thread>
-#include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #include <immintrin.h>
@@ -50,6 +51,7 @@
 #endif
 #include <windows.h> // IWYU pragma: keep
 #include <winioctl.h> // FSCTL_SET_SPARSE (KYTY_BACKING_FILE)
+#include <psapi.h>   // (K32QueryWorkingSetEx: CountReadGuardRace)
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
 #endif
@@ -70,24 +72,55 @@
 #include <unistd.h>
 #endif
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace Libs::LibKernel::Memory {
 
 extern "C" {
 // 1: small host-copy reads of guest backing take a lock-free read transaction
 // with a cached translation instead of the backing mutex.
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_backing_read_mode {0};
-// 1: the other parts of a view a partial unmap maps again (Windows) get the GPU trackers' protection of their watched
-// pages at once, before the address-space lock is released (GuestBackingStore::ProtectRemapped). 0: given back after
-// the lock (ReapplyRemappedViews): a CPU write to a watched page in between went unseen (a GPU copy left stale, or a
-// GPU-owned page later written back over the write).
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_protective_remap {1};
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_backing_read_mode {1};
 // 1: a partial unmap of a view (Windows) leaves the range parked in the view instead of unmapping the whole view and
 // mapping its other parts again (GuestBackingStore::UnmapOne); 2: parked no-access (a stray access faults, for
 // debugging). 0: views with nothing parked yet are split at once, as before (a view holding parked ranges keeps parking).
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_park_unmaps {1};
-// (Diagnostic: microseconds UnmapBacking waits after it mapped views again, before ReapplyRemappedViews: the window
-// kyty_local_protective_remap 0 leaves, widened.)
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_remap_window_us {0};
+// Windows (KYTY_READ_GUARD=0 turns it off): a guest view's no access (the GPU trackers' read protection of pages the GPU
+// wrote, the texture offload's holds) is a guard page over read-only instead, armed again at once by the fault it raises
+// and the page given its trackers' protection once the fault is served (hostException.cpp). Bug check 0x1A/0x41202
+// (issues #5, #50: a no-access page of a paged section view) came with no access only: the stand-alone reproducer
+// (_transfer/bsod-tests/ptetest4) blue-screened a 32 GB laptop under paging in 15, 529 and 656 s, and ran 1800 s with
+// guard pages, and 1800 s with read-only / read-write only, under the same or heavier paging; the emulator itself with
+// a RAM hog leaving ~0.4 GB free (16 GB policies, deaths and world trips) blue-screened in 7.4 min without guards (the
+// desktop in 5.5) and ran 22 min with them (10-23). (The texture offload's backing view takes guards too:
+// texture-offload.h Protect.) A live change applies to the protections made after it (guards made before are still
+// served).
+// On by default with 20 GiB of RAM or less only (the PC's, not LocalPlatform::EmulatorMemory as the other savings: with
+// that, v20261029 gave guards to a 24 GB PC whose other programs held the rest, its RAM then ran full, the hot reads
+// below stood aside, and textures were there one frame and gone the next, issue #242; KYTY_READ_GUARD=1|0 sets it): a
+// guard is gone from its page the moment
+// it raises the fault, and other threads read the page meanwhile without one. The game reads GPU-written pages from
+// several threads at once: with guards, whole areas lost their light, screen tiles turned black or the picture showed at
+// twice its size (issues #157, #158, #159; reproduced at the Tower of Latria with a 1080p render and DLSS: black and
+// dark frames from the second point of the tour, every frame right without guards), and putting the guard back without
+// waiting (f2ecf299) did not help. The blue screen needs the RAM to run full: the PCs with little of it keep the guards.
+// With guards, the pages the game reads back keep no access, their memory locked in RAM (kyty_local_hot_reads below):
+// the same tour with guards read a page before its guard was back ~0.9 times a frame, with them 0.001, every frame right.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_read_guard {[] {
+	// (The emulator's RAM measured here, before main: what other programs hold, not yet what the emulator took.)
+	(void)LocalPlatform::EmulatorMemory();
+	if (const char* value = std::getenv("KYTY_READ_GUARD"); value != nullptr && *value != '\0') return value[0] == '0' ? 0u : 1u;
+	const auto ram = LocalPlatform::PhysicalMemory();
+	return ram != 0 && ram <= (uint64_t {20} << 30u) ? 1u : 0u;
+}()};
+// KYTY_HOT_READS (live kyty_local_hot_reads, on by default): with guard pages, the pages the game read back lately keep
+// no access instead, their page of the backing view locked in RAM (GuestAddressSpace::NoteRead), while the PC has 1.5 GiB
+// of RAM left or more (KYTY_HOT_READS_MIN_AVAIL_MB, GuestAddressSpace::HotReadsPressure). 0: guards everywhere.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_hot_reads {[] {
+	const char* value = std::getenv("KYTY_HOT_READS");
+	return value != nullptr && value[0] == '0' ? 0u : 1u;
+}()};
 }
 
 namespace VirtualMemory = Common::VirtualMemory;
@@ -553,29 +586,6 @@ public:
 			return 0;
 		}
 		if (FullyCommitted(virtual_addr, size)) {
-			// KYTY_VERIFY_COMMITTED=1: the locked walk's answer compared (COMMITTED-MISMATCH lines; none over two
-			// rounds of the user's 1-1 route).
-			static const bool verify = std::getenv("KYTY_VERIFY_COMMITTED") != nullptr;
-			if (verify) {
-				Common::LockGuard lock(m_mutex);
-				uint64_t          covered = 0;
-				auto              it      = m_ranges.upper_bound(virtual_addr);
-				if (it != m_ranges.begin()) {
-					--it;
-					uint64_t expected = virtual_addr;
-					for (; it != m_ranges.end() && it->second.start <= expected && covered < size; ++it) {
-						const auto range_end = End(it->second.start, it->second.size);
-						if (range_end <= expected || !IsCommittedRangeType(it->second.type)) break;
-						covered += std::min(size - covered, range_end - expected);
-						expected = range_end;
-					}
-				}
-				static std::atomic<uint32_t> mismatches {0};
-				if (covered != size && mismatches.fetch_add(1, std::memory_order_relaxed) < 32)
-					std::printf("COMMITTED-MISMATCH addr=0x%llx size=0x%llx covered=0x%llx\n",
-					            static_cast<unsigned long long>(virtual_addr), static_cast<unsigned long long>(size),
-					            static_cast<unsigned long long>(covered));
-			}
 			return size;
 		}
 		struct CachedRange {
@@ -897,8 +907,69 @@ private:
 	static constexpr uint64_t CommittedPageBits = 12, CommittedChunkBits = 30, CommittedChunks = 1024;
 	static constexpr uint64_t CommittedChunkWords = uint64_t {1} << (CommittedChunkBits - CommittedPageBits - 6);
 	std::array<std::atomic<std::atomic<uint64_t>*>, CommittedChunks> m_committed {};
+	// Raised after the bits change: the whole bitmap's generation and each chunk's (CommittedGranules).
+	std::atomic<uint64_t>                                m_commit_generation {1};
+	std::array<std::atomic<uint64_t>, CommittedChunks> m_chunk_generations {};
+	// CommittedGranules' copy: each chunk's granule bits as of its generation then, the bitmap generation they were
+	// read at, and the version of the granules (raised when a chunk's bits change).
+	struct ChunkGranules {
+		uint64_t                                         generation = 0;
+		std::array<uint64_t, CommittedChunkWords / 512> mask {};
+	};
+	std::mutex                                   m_granule_mutex;
+	std::array<ChunkGranules, CommittedChunks> m_granule_chunks {};
+	std::atomic<uint64_t>                        m_granules_read_at {0}, m_granule_version {1};
 
+public:
+	// Memory::CommittedGranules (`*version`: the granules' version the caller has). Bits read without m_mutex: a change
+	// racing this call raises the generation after its bits, so the next call reads them again.
+	bool CommittedGranules(uint64_t* version, std::vector<uint32_t>* out) {
+		static_assert(CommittedGranuleBits - CommittedPageBits == 9, "a granule is 8 bitmap words");
+		if (m_commit_generation.load(std::memory_order_acquire) == m_granules_read_at.load(std::memory_order_acquire) &&
+		    m_granule_version.load(std::memory_order_acquire) == *version)
+			return false;
+		std::lock_guard lock(m_granule_mutex);
+		const auto now = m_commit_generation.load(std::memory_order_acquire);
+		if (now != m_granules_read_at.load(std::memory_order_relaxed)) {
+			bool changed = false;
+			for (size_t index = 0; index < CommittedChunks; ++index) {
+				auto&      cached           = m_granule_chunks[index];
+				const auto chunk_generation = m_chunk_generations[index].load(std::memory_order_acquire);
+				if (chunk_generation == cached.generation) continue;
+				cached.generation = chunk_generation;
+				decltype(cached.mask) mask {};
+				if (const auto* words = m_committed[index].load(std::memory_order_acquire); words != nullptr) {
+					for (uint64_t word = 0; word < CommittedChunkWords; ++word)
+						if (words[word].load(std::memory_order_relaxed) != 0) mask[word / 512] |= uint64_t {1} << (word / 8 % 64);
+				}
+				if (mask != cached.mask) {
+					cached.mask = mask;
+					changed     = true;
+				}
+			}
+			if (changed) m_granule_version.fetch_add(1, std::memory_order_release);
+			m_granules_read_at.store(now, std::memory_order_release);
+		}
+		if (m_granule_version.load(std::memory_order_relaxed) == *version) return false;
+		*version = m_granule_version.load(std::memory_order_relaxed);
+		out->clear();
+		for (size_t index = 0; index < CommittedChunks; ++index) {
+			for (size_t part = 0; part < m_granule_chunks[index].mask.size(); ++part) {
+				for (auto bits = m_granule_chunks[index].mask[part]; bits != 0; bits &= bits - 1) {
+					out->push_back(static_cast<uint32_t>((index << (CommittedChunkBits - CommittedGranuleBits)) + part * 64 +
+					                                     static_cast<uint64_t>(std::countr_zero(bits))));
+				}
+			}
+		}
+		return true;
+	}
+
+private:
 	void MarkCommittedUnlocked(uint64_t start, uint64_t size, bool on) {
+		struct Raise {
+			VirtualRanges& owner;
+			~Raise() { owner.m_commit_generation.fetch_add(1, std::memory_order_release); }
+		} raise {*this};
 		const auto end = End(start, size);
 		// Set: the pages the range covers whole; cleared: every page it touches.
 		auto first = on ? (start + (uint64_t {1} << CommittedPageBits) - 1) >> CommittedPageBits : start >> CommittedPageBits;
@@ -928,6 +999,7 @@ private:
 					chunk[local >> 6].fetch_and(~mask, std::memory_order_release);
 				page += count;
 			}
+			m_chunk_generations[chunk_index].fetch_add(1, std::memory_order_release);
 		}
 	}
 
@@ -1287,11 +1359,16 @@ bool GuestRangeAccess(uint64_t vaddr, uint64_t size, bool* gpu, bool* cpu_write)
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	// (Ranges the texture or file offload took there given back first, dropped ones it writes part
+	// of read back: their backing view has no access, and a write-back in a fault handler - a guest
+	// readback's - cannot fault.)
+	TextureOffload::OnHostAccess(vaddr, size, false, true);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
 bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	TextureOffload::OnHostAccess(vaddr, size, false, true); // (TryWriteBacking)
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteCpuBacking(vaddr, data, size);
 }
@@ -1309,6 +1386,15 @@ const uint8_t* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
 
 uint64_t BackingMappingEnd(uint64_t vaddr) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingMappingEnd(vaddr) : 0;
+}
+
+uint8_t* SpareBackingPointer(uint64_t address) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->SpareBackingPointer(address)
+	                                        : nullptr;
+}
+
+bool DiscardBacking(uint64_t address, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->DiscardBacking(address, size);
 }
 
 void TrimGuestRange(uint64_t vaddr, uint64_t size) {
@@ -1383,6 +1469,10 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 	    !Graphics::GuestGpu::IsTranslatingThread() || !IsGpuAddressRange(vaddr, size))
 		return false;
 	if (!clean && !g_gpu_resources->HasReadWatchers(vaddr, size) && SpeculationReadsClean(vaddr, size)) {
+		// A speculation's thread: the GPU thread may read-protect the page after the look above (work it commits
+		// writes it), and a fault there waits for the GPU thread, which may wait for this thread (a mode 4 hang at the
+		// stone arch, 11-01): a guarded read, none on a fault (the caller's word reads refuse the speculation).
+		if (!Graphics::GuestGpu::IsGpuThread()) return Common::GuardedCopy(data, reinterpret_cast<const void*>(vaddr), size) == 0;
 		// 8..64 bytes of whole words: fixed-size moves inline, a variable-size memcpy is a CRT call
 		// (thousands of SRT span reads per frame).
 		auto*       out = static_cast<uint8_t*>(data);
@@ -1397,19 +1487,24 @@ bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean)
 
 thread_local uint64_t g_srt_shader_hash = 0;
 
+// A speculative translation (speculation-state.h) reads guest memory as it is: words the GPU wrote need the GPU first
+// (the translation that follows waits for it). Out of line, so SyncGpuCleanBacking keeps main's body.
+[[gnu::noinline]] static bool SyncGpuCleanBackingSpec(uint64_t vaddr, uint64_t size) {
+	if (GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) ||
+	    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+	    (!Graphics::GuestGpu::IsGpuThread() && ReadFaults(vaddr, size)) || !SpeculationReadsClean(vaddr, size))
+		Graphics::Spec::Refuse("GPU-written guest memory");
+	return true;
+}
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;
 	}
-	if (Graphics::Spec::Current() != nullptr) {
-		// A speculative translation (speculation-state.h) reads guest memory as it is: words the GPU wrote need the
-		// GPU first (the translation that follows waits for it).
-		if (GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size) ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-		    (!Graphics::GuestGpu::IsGpuThread() && ReadFaults(vaddr, size)) || !SpeculationReadsClean(vaddr, size))
-			Graphics::Spec::Refuse("GPU-written guest memory");
-		return true;
-	}
+	// (A plain global first, not the thread-local state on every call: KYTY_SPECULATE unset, main's path. The mode is set
+	// before a speculation starts and cleared only when its results are discarded.)
+	if (::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && Graphics::Spec::Current() != nullptr)
+		[[unlikely]] return SyncGpuCleanBackingSpec(vaddr, size);
 	if (!Graphics::GuestGpu::IsGpuThread() ||
 	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 		return false;
@@ -1461,6 +1556,10 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 
 bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges == nullptr || g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
+}
+
+bool CommittedGranules(uint64_t* version, std::vector<uint32_t>* out) {
+	return g_virtual_ranges != nullptr && g_virtual_ranges->CommittedGranules(version, out);
 }
 
 void MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* parts) {
@@ -1516,15 +1615,6 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* s
 	const auto index = g_write_back_count.fetch_add(1, std::memory_order_relaxed);
 	g_write_backs[index % WriteBackRecords] = {std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                          vaddr, size, source};
-	// (Diagnostic, KYTY_WRITEBACK_VERIFY: the GPU-owned pages checked before, hashed again after.)
-	struct Verify {
-		uint64_t vaddr, size;
-		bool     on;
-		~Verify() {
-			if (on) WritebackVerify::Rehash(vaddr, size);
-		}
-	} verify {vaddr, size, WritebackVerify::Enabled()};
-	if (verify.on) WritebackVerify::Check(vaddr, static_cast<const uint8_t*>(data), size, source);
 	if (TryWriteBacking(vaddr, data, size)) {
 		return;
 	}
@@ -1586,9 +1676,21 @@ bool PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
 		(void)g_gpu_resources->InvalidateMemoryForWrite(first, end - first);
 		return true;
 	}
-	return false;
-#else
-	return false;
+#elif defined(__linux__)
+	// Linux the same, with KYTY_LINUX_COALESCE_MPROTECT (on unless 0): the tracked span made writable in one go, its
+	// pages' protection changes coalesced (ProtectMappedUnlocked), instead of a fault for each page the store reaches.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LINUX_COALESCE_MPROTECT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (enabled) {
+		uint64_t first = 0, end = 0;
+		if (g_gpu_resources->WatchedSpan(vaddr, size, &first, &end)) {
+			first = std::max(first, vaddr);
+			end   = std::min(end, vaddr + size);
+			(void)g_gpu_resources->InvalidateMemoryForWrite(first, end - first);
+		}
+	}
 #endif
 }
 
@@ -1613,14 +1715,75 @@ bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->InvalidateImages(vaddr, size);
 }
 
+bool GuestRangeWatched(uint64_t vaddr, uint64_t size) {
+	uint64_t first = 0, end = 0;
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       g_gpu_resources->WatchedSpan(vaddr, size, &first, &end);
+}
+
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
 }
 
+void NoteGameFree(uint64_t vaddr, uint64_t size) {
+	uint64_t first = 0, end = 0;
+	if (g_gpu_resources != nullptr && size != 0 && IsGpuAddressRange(vaddr, size) &&
+	    g_gpu_resources->WatchedSpan(vaddr, size, &first, &end))
+		g_gpu_resources->FreedByGame(vaddr, size);
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The emulator's view of the backing store: its only guards are the texture offload's (texture-offload.h Protect).
+static bool InBackingView(uint64_t address) {
+	if (g_guest_address_space == nullptr) return false;
+	const uint64_t base = g_guest_address_space->GetBackingBase();
+	return base != 0 && address >= base && address - base < g_guest_address_space->GetBackingSize();
+}
+
+// KYTY_READ_GUARD (kyty_local_read_guard): a guest view's page whose guard raised a fault, guarded again at once (one
+// of the backing view by the texture offload, which knows whether its range is still to be guarded).
+static bool ArmReadGuard(uint64_t address) {
+	if (InBackingView(address)) {
+		TextureOffload::RearmBackingGuard(address);
+		return true;
+	}
+	if (g_guest_address_space == nullptr || !IsGpuAddressRange(address, 1) || !g_guest_address_space->ArmReadGuard(address))
+		return false;
+	LiveCounters::Add(LiveCounters::ReadGuardFaults);
+	return true;
+}
+
+// ... and once the fault was served, its trackers' protection, if the page still has a guard (a guard armed again can
+// outlive a change another thread made meanwhile; the fault's own service mostly gave the page its access already).
+static void SettleReadGuard(uint64_t address) {
+	constexpr uint64_t Page = 0x1000;
+	if (InBackingView(address)) return; // (the texture offload's: no trackers there)
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(address & ~(Page - 1)), &info, sizeof(info)) != sizeof(info) ||
+	    (info.Protect & PAGE_GUARD) == 0 || g_gpu_resources == nullptr)
+		return;
+	LiveCounters::Add(LiveCounters::ReadGuardSettles);
+	g_gpu_resources->SettleProtection(address);
+}
+#endif
+
 void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// (Installed whatever the switch: guards made while it was on are served after it changed.)
+	if (resources != nullptr) {
+		Common::HostException::SetReadGuardHandlers(ArmReadGuard, SettleReadGuard);
+		std::printf(kyty_local_read_guard.load(std::memory_order_relaxed) == 0
+		                ? "Memory: guest pages kept from reads by no access (KYTY_READ_GUARD=1: guard pages)\n"
+		            : kyty_local_hot_reads.load(std::memory_order_relaxed) != 0
+		                ? "Memory: guest pages kept from reads by guard pages, those read back lately by no access, "
+		                  "locked in RAM, while 1.5 GiB of RAM or more is left (KYTY_READ_GUARD=0: no access everywhere, "
+		                  "KYTY_HOT_READS=0: guards everywhere, KYTY_HOT_READS_MIN_AVAIL_MB: another limit)\n"
+		                : "Memory: guest pages kept from reads by guard pages (KYTY_READ_GUARD=0: no access)\n");
+	}
+#endif
 }
 
 bool IsGuestMappedAfterChanges(uint64_t vaddr) {
@@ -1633,7 +1796,37 @@ bool InRemapWindow(uint64_t vaddr) noexcept {
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+	if (g_gpu_resources == nullptr || !g_gpu_resources->HandleFault(access, fault_vaddr)) return false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// (A page read back: it keeps no access a while, GuestAddressSpace::NoteRead.)
+	if (access == Graphics::PageFaultAccess::Read && kyty_local_read_guard.load(std::memory_order_relaxed) != 0 &&
+	    kyty_local_hot_reads.load(std::memory_order_relaxed) != 0 && g_guest_address_space != nullptr &&
+	    IsGpuAddressRange(fault_vaddr, 1))
+		g_guest_address_space->NoteRead(fault_vaddr);
+#endif
+	return true;
+}
+
+void CoolHotReads() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_guest_address_space != nullptr) g_guest_address_space->CoolHotReads();
+#endif
+}
+
+bool ReadGuardsOn() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return kyty_local_read_guard.load(std::memory_order_relaxed) != 0;
+#else
+	return false;
+#endif
+}
+
+void DropHotReadsBacking(uint64_t backing, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_guest_address_space != nullptr) g_guest_address_space->DropHotBacking(backing, size);
+#else
+	(void)backing, (void)size;
+#endif
 }
 
 struct PrtAperture {
@@ -1669,6 +1862,22 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	}
 
 	return false;
+}
+
+// The guest's own protection of [vaddr, vaddr + size) (one guest mapping), whatever it is.
+bool RestoreGuestProtection(uint64_t vaddr, uint64_t size) {
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr || g_guest_address_space == nullptr || !g_virtual_ranges->Query(vaddr, 0, &range) ||
+	    range.start > vaddr || vaddr + size > range.start + range.size) {
+		return false;
+	}
+	const bool read = (range.protection & PROT_CPU_READ) != 0, write = (range.protection & PROT_CPU_WRITE) != 0;
+	const auto mode = (range.protection & PROT_CPU_EXEC) != 0
+	                      ? (write ? VirtualMemory::Mode::ExecuteReadWrite
+	                               : read ? VirtualMemory::Mode::ExecuteRead : VirtualMemory::Mode::Execute)
+	                      : (write ? VirtualMemory::Mode::ReadWrite
+	                               : read ? VirtualMemory::Mode::Read : VirtualMemory::Mode::NoAccess);
+	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
 bool RestoreGuestWritable(uint64_t vaddr, uint64_t size) {
@@ -1902,10 +2111,44 @@ uint64_t FlushTrim(uint64_t budget, uint64_t* held_us) {
 }
 
 } // namespace RamFlushGuest
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// KYTY_RESIDENT_MB=<n> (a test, off by default; the launcher's Experimental "Keep memory resident", with
+// KYTY_WORKING_SET_TRIM=0): Windows keeps at least n MiB of the emulator in RAM (a hard minimum working set, at most 2/5
+// of the RAM). A fork's measure against the MEMORY_MANAGEMENT blue screen (0x1A/0x41202, issues #5 and #50), whose stack
+// is a protection change of a guest page Windows had taken out of the working set under memory pressure; unverified,
+// and the RAM it keeps the rest of the PC does without.
+[[maybe_unused]] static void KeepResident() {
+	const char* value = std::getenv("KYTY_RESIDENT_MB");
+	uint64_t    floor = value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0;
+	if (floor == 0) return;
+	MEMORYSTATUSEX status {sizeof(status)};
+	if (!GlobalMemoryStatusEx(&status)) return;
+	floor          = std::min<uint64_t>(floor, status.ullTotalPhys / 5 * 2);
+	const bool set = SetProcessWorkingSetSizeEx(GetCurrentProcess(), floor, status.ullTotalPhys,
+	                                            QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
+	std::printf("Memory: %llu MiB of the emulator kept in RAM at least (KYTY_RESIDENT_MB)%s\n",
+	            static_cast<unsigned long long>(floor >> 20u), set ? "" : ": refused by Windows");
+	if (!set) std::printf("Memory: SetProcessWorkingSetSizeEx failed (error %lu)\n", GetLastError());
+}
+
+// The pages read back lately are locked in RAM (KYTY_HOT_READS, GuestAddressSpace::NoteRead): Windows locks no more than
+// the minimum working set holds, a few hundred KiB unless raised.
+static void AllowHotReadLocks() {
+	SIZE_T minimum = 0, maximum = 0;
+	DWORD  flags   = 0;
+	if (GetProcessWorkingSetSizeEx(GetCurrentProcess(), &minimum, &maximum, &flags) == 0) return;
+	constexpr SIZE_T Budget = SIZE_T {40} << 20u; // 8192 pages and room
+	if (SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum + Budget, std::max(maximum, minimum + Budget), flags) == 0)
+		std::printf("Memory: SetProcessWorkingSetSizeEx for the locked pages failed (error %lu)\n", GetLastError());
+}
 #endif
 
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// (KYTY_RESIDENT_MB: ours, LocalPlatform::KeepResident from GraphicContext's start-up.)
+	AllowHotReadLocks();
+#endif
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
 	LocalPlatform::SetTrimRunner([](void (*call)()) {
@@ -3512,10 +3755,37 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	return result;
 }
 
+// The direct memory the game is told it has (sceKernelGetDirectMemorySize; sceKernelAvailableDirectMemorySize and
+// sceKernelAllocateMainDirectMemory search below it): for Demon's Souls 12 GiB, a base PS5's (other games: all of it,
+// as before). Demon's Souls' engine takes all it is told
+// at start-up (PlatformPageAllocator::Init, eboot 0x80c200, whose constants are a base PS5's 0x300000000 and a PS5 Pro's
+// 0x34c000000; on a devkit, whose GPI switch says so, more counts as debug memory) and over a session writes nearly all
+// of it: its texture streamer keeps loading textures until ~400 MiB are left (texturePoolLowMemoryLimitMiBs +
+// texturePoolLowMemStopStreamingOffsetMiBs). Told the 12.5 GiB of before (13.5 less the 1 GiB flexible memory), the
+// half GiB more only became texture cache: Boletaria and four worlds (16 GB policy) ended 0.46 GB lower in the PC's
+// memory at 12 GiB, the streamer at 3.5 instead of 4.0 GiB; four of the heaviest maps toured clean, and 1-3 walked at
+// 62.0 fps against 58.2 back to back (58.3 at 12 GiB an hour before: the same within the runs' spread). (Told 11 GiB it
+// held 2.4-2.8 GiB and Boletaria's memory fell by 1.2 GiB; the crashes once put on it came from the kill tour, whose
+// suicide kills break the game's physics at any size.) KYTY_DIRECT_MEMORY_MB=<n>: n MiB (0: all of it, 12.5 GiB).
+static uint64_t ReportedDirectMemorySize() {
+	static const uint64_t cap = [] {
+		constexpr uint64_t Base = uint64_t {12} << 30u;
+		const char*        value = std::getenv("KYTY_DIRECT_MEMORY_MB");
+		if (value == nullptr || *value == '\0') return Libs::Graphics::DemonsSouls::IsSupportedGame() ? Base : ~uint64_t {0};
+		const uint64_t mib = std::strtoull(value, nullptr, 10);
+		if (mib == 0) return ~uint64_t {0};
+		std::printf("Direct memory: at most %llu MiB told to the game (KYTY_DIRECT_MEMORY_MB)\n",
+		            static_cast<unsigned long long>(mib));
+		std::fflush(stdout);
+		return mib << 20u;
+	}();
+	return std::min<uint64_t>(PhysicalMemory::Size(), cap);
+}
+
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 
-	return PhysicalMemory::Size();
+	return ReportedDirectMemorySize();
 }
 
 int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end,
@@ -3541,6 +3811,7 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	search_end = std::min<int64_t>(search_end, static_cast<int64_t>(ReportedDirectMemorySize()));
 	if (search_end <= search_start) {
 		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
 		return NoMemory(__func__, __LINE__);
@@ -3723,7 +3994,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 	     "\t memory_type  = %d\n",
 	     len, alignment, memory_type);
 
-	return KernelAllocateDirectMemory(0, static_cast<int64_t>(PhysicalMemory::Size()), len,
+	return KernelAllocateDirectMemory(0, static_cast<int64_t>(ReportedDirectMemorySize()), len,
 	                                  alignment, memory_type, phys_addr_out);
 }
 

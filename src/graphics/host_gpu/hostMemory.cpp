@@ -3,6 +3,13 @@
 #include <cinttypes>
 #include <cstdio>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <atomic>
+#include <cerrno>
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -57,6 +64,50 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 		current = finish < end ? finish : end;
 	}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// process_vm_readv can be refused by a seccomp filter (sandboxes, some containers): from then on, /proc/self/maps.
+	static std::atomic_bool vm_readv_unavailable {false};
+	if (access == HostMemoryAccess::Read && !vm_readv_unavailable.load(std::memory_order_relaxed)) {
+		// One byte of each page through process_vm_readv on this process: the kernel checks the mappings (no
+		// fault handler, no signal) and stops at the first page it cannot read. Reading /proc/self/maps at each
+		// call, as below, took most of the render thread's time with KYTY_RENDER_ASPECT (src/local/hud-anchor.h
+		// asks several times a draw; ~7400 mappings: 1-5 fps).
+		static const uint64_t page  = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+		constexpr int         batch = 256;
+		const pid_t           self  = getpid();
+		unsigned char         sink[batch];
+		struct iovec          local[batch];
+		struct iovec          remote[batch];
+		while (current < end) {
+			int      count = 0;
+			uint64_t probe = current;
+			while (count < batch && probe < end) {
+				local[count]  = {&sink[count], 1};
+				remote[count] = {reinterpret_cast<void*>(static_cast<uintptr_t>(probe)), 1};
+				count++;
+				const uint64_t next = (probe & ~(page - 1)) + page;
+				probe               = next > probe ? next : end; // wrapped at the top of the address space
+			}
+			const auto copied = process_vm_readv(self, local, static_cast<unsigned long>(count), remote,
+			                                     static_cast<unsigned long>(count), 0);
+			if (copied < 0 && errno != EFAULT) {
+				vm_readv_unavailable.store(true, std::memory_order_relaxed);
+				break;
+			}
+			if (copied <= 0) {
+				break;
+			}
+			if (copied < count) {
+				current = reinterpret_cast<uint64_t>(remote[copied].iov_base);
+				break;
+			}
+			current = probe < end ? probe : end;
+		}
+		if (!vm_readv_unavailable.load(std::memory_order_relaxed)) {
+			accessible_size = current - addr;
+			return accessible_size != 0;
+		}
+		current = addr;
+	}
 	auto* maps = std::fopen("/proc/self/maps", "r");
 	if (maps == nullptr) {
 		return false;

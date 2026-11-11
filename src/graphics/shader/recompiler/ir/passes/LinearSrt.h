@@ -2,7 +2,6 @@
 #define KYTY_LINEAR_SRT_H
 
 #include "common/abi.h"
-#include "SrtAotAbi.h"
 #if defined(__x86_64__) || defined(_M_X64)
 #ifndef XBYAK_NO_EXCEPTION
 #define XBYAK_NO_EXCEPTION
@@ -43,14 +42,10 @@ struct LinearSrtPlan {
 	std::vector<uint8_t>                              active_sources;
 	std::vector<std::shared_ptr<const LinearSrtPlan>> control_variants;
 	uint32_t                                          active_count = 0;
-	// Uses the add-with-carry lowering (KYTY_SRT_LINEAR_VERIFY compares it with the interpreter).
-	bool                                              add_carry = false;
 	// The generated register convention is explicit on every host, including
 	// Windows. C++ helpers bridge to the host ABI of reader callbacks.
 	using Function    = KYTY_SYSV_ABI bool (*)(const SrtRuntime*, uint64_t*);
 	Function function = nullptr;
-    KytySrtAot::Function aot_function = nullptr;
-    KytySrtAot::MaterializeFunction aot_materialize = nullptr;
     std::shared_ptr<const LinearSrtPlan> single_condition;
     std::array<uint32_t, 3> single_condition_variants{};
 #if defined(__x86_64__) || defined(_M_X64)
@@ -348,7 +343,6 @@ private:
 						const auto lhs = Add(packed->Arg(0), clean, depth + 1);
 						const auto rhs = Add(packed->Arg(1), clean, depth + 1);
 						if (lhs == Invalid || rhs == Invalid) return Invalid;
-						result.add_carry = true;
 						Node sum;
 						sum.kind    = Kind::Binary;
 						sum.op      = ValueOpcode::IAdd32;
@@ -393,8 +387,8 @@ private:
                     const auto shift_amount = Add(Value(offset.U32()), clean, depth + 1);
                     const auto mask_value = Add(Value(mask), clean, depth + 1);
                     if (shift_amount == Invalid || mask_value == Invalid) return Invalid;
-                    // Lower to existing integer nodes so both Xbyak and AOT use
-                    // the same semantics. Even width zero still evaluates input.
+                    // Lower to existing integer nodes so the Xbyak code needs no
+                    // bitfield operation. Even width zero still evaluates input.
                     Node shift;
                     shift.kind = Kind::Binary; shift.op = ValueOpcode::ShiftRightLogical32;
                     shift.clean = clean; shift.args[0] = input; shift.args[1] = shift_amount;
@@ -502,6 +496,12 @@ public:
     }
 	bool Generate(bool group_reads) {
 		if (group_reads) GroupReads();
+		// The plan keeps these for its life (the shader prefetch's for every program of the game: ~300 MB with 16 GB of
+		// RAM), without their growth's spare capacity; before the code takes the nodes' addresses.
+		result.nodes.shrink_to_fit();
+		result.read_groups.shrink_to_fit();
+		result.descriptor_words.shrink_to_fit();
+		result.descriptor_sizes.shrink_to_fit();
 		Xbyak::ClearError();
 		result.code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 		if (Xbyak::GetError() != 0 || !result.code->getCode()) {

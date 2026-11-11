@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/tickClock.h"
 #include "speculation-state.h"
 
 #include <vk_mem_alloc.h>
@@ -59,6 +60,8 @@ public:
 	void                   PrintSyncState();
 	// Live "buffers <path>": the cached buffers as a tab-separated table (on the GPU thread).
 	void                   WriteBufferReport(const char* path);
+	// The staging ring's size (KYTY_STAGING_MB).
+	[[nodiscard]] uint64_t StagingSize() const { return m_staging_buffer.Size(); }
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
@@ -70,6 +73,8 @@ public:
 		return buffer;
 	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// FindBuffer's speculative-translation form, out of line (bufferCache.cpp).
+	[[gnu::noinline]] [[nodiscard]] BufferId FindBufferSpec(uint64_t vaddr, uint64_t size);
 	// FindBuffer's registered buffer over the range, none registered: the null id (a speculative translation's
 	// question whether ObtainBuffer gave the range's buffer).
 	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size) {
@@ -77,19 +82,24 @@ public:
 		return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size) ? *owner : BufferId {};
 	}
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
+	// As EnsureBufferContents, for a texel buffer: an image GPU work wrote over the range is copied in (SynchronizeBuffer).
+	void                   EnsureTexelContents(uint64_t vaddr, uint64_t size);
 	// The start of each range shaders read through pointers held by a buffer with the guest's bytes (see the definition).
 	void                   EnsureBdaReadable(std::span<const GuestRange> ranges);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// ObtainBuffer's speculative-translation form, out of line (bufferCache.cpp).
+	[[gnu::noinline]] [[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferSpec(Spec::State& spec, uint64_t vaddr,
+	                                                                              uint64_t size, bool is_written,
+	                                                                              bool is_texel_buffer);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
 			case MemoryUsage::Stream: return m_stream_buffer;
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
-			case MemoryUsage::SparseDeviceLocal: break;
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
@@ -148,7 +158,7 @@ public:
 	[[nodiscard]] bool PrepareAliasesForCpuWrite(uint64_t vaddr, uint64_t size);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
-	// KYTY_EAGER_FEEDBACK (live eager_feedback, off by default): GPU thread, the copy-feedback
+	// KYTY_EAGER_FEEDBACK (live eager_feedback, default off: fps flat in PR #300): GPU thread, the copy-feedback
 	// snapshots whose tick has completed are written back to guest memory now (TryGuestReadFromFeedback, as a fault's
 	// read would), before a guest read faults on them. `may_wait`: between guest packets, where a synchronous download
 	// may run (the verify's).
@@ -250,11 +260,29 @@ public:
 	}
 	// The buffers no binding used for a while go (RunGarbageCollector, once a flip).
 	void RetireStaleBuffers(uint64_t tick);
-	// The buffers [vaddr, vaddr + size) holds whole go, after the guest unmapped it (GpuResourceManager::UnmapMemory).
-	void DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
-	// Then a buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts.
-	void SplitUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// The buffers [vaddr, vaddr + size) holds whole go, after the guest unmapped it (GpuResourceManager::UnmapMemory); their
+	// bytes.
+	uint64_t DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// The game's free blocks (its page allocator's, pages kept mapped) over [begin, end) added to `blocks` as (address, size):
+	// false when not known (Loader::DemonsSoulsPageFree::FreeBlocksIn).
+	using FreeBlocksQuery = bool (*)(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* blocks);
+	// What DropFreedRange's free block lists did: lists read, bytes cut off only thanks to them.
+	struct FreeBlockSplits {
+		uint64_t lists = 0, cut = 0;
+	};
+	// Then a buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts; the bytes cut
+	// off. With `free_blocks` (a freed range, DropFreedRange), the game's free blocks over it count as unmapped too.
+	uint64_t SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks = nullptr,
+	                              FreeBlockSplits* splits = nullptr);
+	// The game freed [vaddr, vaddr + size) and keeps it mapped (GpuResourceManager::FreedByGame): its GPU-written bytes read
+	// back (`read_back`) or dropped, then its buffers go as an unmapped range's do (the range, and the game's other free
+	// blocks a buffer over it spans, count as unmapped for SplitUnmappedBuffers); the bytes of buffers let go. Nothing when
+	// no buffer is registered there.
+	uint64_t DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
+	                        FreeBlockSplits* splits);
 	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
+	// The mapped parts of guest [vaddr, vaddr + size) (GpuResourceManager::MappedRanges), added to `out`.
+	void MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;
 	void CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
 	                                   std::vector<RangeSet::Range>& ranges) const;
 	// The spans of the buffers registered or unregistered since the last call, appended to `spans`; false when
@@ -474,9 +502,8 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
-	// When each recent collector tick began (steady clock, by tick % size): RetireStaleBuffers counts idleness in time.
-	std::array<int64_t, 8192> m_tick_times {};
-	bool                      m_retire_pressure = false; // the video memory in use at the critical level
+	TickClock m_tick_clock;                // RetireStaleBuffers counts idleness in time
+	bool      m_retire_pressure = false; // the video memory in use at the critical level
 	// The registered game buffers in system memory and the room those in use need (MoveSpilledBufferBack).
 	std::vector<BufferId> m_spilled;
 	uint64_t              m_spilled_room = 0;
@@ -530,10 +557,6 @@ private:
 	// request's copy may still be pending on either queue when its slot is reused.
 	std::array<uint64_t, GuestReadbackSlots> m_download_queue_values {};
 	std::array<uint64_t, GuestReadbackSlots> m_download_ticks {};
-	// Mode 3 (verification): the same bytes copied on the graphics queue, compared on use.
-	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_verify_downloads {};
-	void VerifyReadback(uint64_t address, const uint8_t* fast, const uint8_t* reference, uint64_t size,
-	                    const char* path, uint64_t waited);
 
 	// Last member: destroyed (queue idle) before the buffers its copies use.
 	std::unique_ptr<ReadbackQueue::Queue> m_readback_queue;

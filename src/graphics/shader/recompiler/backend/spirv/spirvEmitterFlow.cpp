@@ -184,14 +184,73 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
+		// (I and J: the KHR 3-vector's second and third, the AMD 2-vector's first and second.)
 		state.builder.AddFunction({OpAccessChain,
 		                           TypePointer(state, StorageClassInput, TypeF32(state)), pointer,
-		                           variable, ConstantU32(state, component + 1u)});
+		                           variable, ConstantU32(state, state.amd_barycentrics ? component : component + 1u)});
 		state.builder.AddFunction({OpLoad, TypeF32(state), value, pointer});
 		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
 		return bits;
 	}
 	return EmitInputComponentU32(state, kind, component);
+}
+
+// Whether the GPU has quad operations in pixel shaders (Spirv::SetPixelQuadOperations). Vulkan does not require them:
+// without them, quad_perm DPP moves stay shuffles (EmitDppQuadPermPixel below).
+static std::atomic<bool> g_pixel_quad_operations {true};
+
+// A quad_perm DPP move in a pixel shader, read by quad operations. Whole quad mode's helper pixels may be inactive for a
+// subgroup shuffle, which then returns an undefined value, but Vulkan counts them in quad operations (on Demon's Souls'
+// debug menu, PS b29a3e133609034e takes its font's edge width from DPP quad moves: lines along every partly covered
+// quad, the diagonal of each glyph). Each source lane the control names is broadcast once, with its exec bit, and every
+// lane takes the one its selector picks. (The capability only where it is used, as for PS_WAVE_OR below.)
+static uint32_t EmitDppQuadPermPixel(ValueEmitContext& ctx, const IR::Inst& inst, const IR::DppMoveFlags& flags,
+                                     uint32_t target_lane) {
+	auto& state = ctx.state;
+	state.builder.RequireCapability(CapabilityGroupNonUniformQuad);
+	const auto scope    = ConstantU32(state, ScopeSubgroup);
+	const auto selector = EmitBinaryU32(state, OpBitwiseAnd, target_lane, ConstantU32(state, 3));
+	uint32_t   value    = 0;
+	uint32_t   active   = 0;
+	for (uint32_t source = 0; source < 4; source++) {
+		bool used = false;
+		for (uint32_t lane = 0; lane < 4; lane++) {
+			used = used || ((flags.control >> (2u * lane)) & 3u) == source;
+		}
+		if (!used) {
+			continue;
+		}
+		const auto index = ConstantU32(state, source);
+		const auto read  = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformQuadBroadcast, TypeU32(state), read, scope, ctx.Arg(inst, 0), index});
+		uint32_t read_active = 0;
+		if (!flags.fetch_inactive) {
+			read_active = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpGroupNonUniformQuadBroadcast, TypeBool(state), read_active, scope, ctx.Arg(inst, 1), index});
+		}
+		if (value == 0) {
+			value  = read;
+			active = read_active;
+			continue;
+		}
+		const auto picked = state.builder.AllocateId();
+		state.builder.AddFunction({OpIEqual, TypeBool(state), picked, selector, index});
+		const auto picked_value = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, TypeU32(state), picked_value, picked, read, value});
+		value = picked_value;
+		if (!flags.fetch_inactive) {
+			const auto picked_active = state.builder.AllocateId();
+			state.builder.AddFunction({OpSelect, TypeBool(state), picked_active, picked, read_active, active});
+			active = picked_active;
+		}
+	}
+	if (flags.fetch_inactive) {
+		return value;
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeU32(state), result, active, value, ConstantU32(state, 0)});
+	return result;
 }
 
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
@@ -664,6 +723,12 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::DppMoveU32: {
 			const auto flags    = inst.Flags<IR::DppMoveFlags>();
 			const auto target   = EmitDppTargetLane(state, flags.control);
+			// (A translation feature: a static store made without it keeps its pipelines, its next precompile brings it.)
+			if (state.stage == ShaderType::Pixel && flags.control <= 0xffu && state.program.pixel_quad_reads &&
+			    g_pixel_quad_operations.load(std::memory_order_relaxed)) {
+				ctx.Define(inst, EmitDppQuadPermPixel(ctx, inst, flags, target.lane));
+				return true;
+			}
 			const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
 			if (flags.fetch_inactive) {
 				ctx.Define(inst, shuffled);
@@ -856,3 +921,11 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+void SetPixelQuadOperations(bool supported) {
+	Emitter::g_pixel_quad_operations.store(supported, std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

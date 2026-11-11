@@ -129,6 +129,12 @@ uint64_t               BackingMappingEnd(uint64_t vaddr);
 // Windows: the pages of a guest range taken out of the working set later, by Kyty.Trim's thread (as parked ranges: no map
 // or unmap runs in their page-table pages meanwhile). A page touched again faults back in.
 void                   TrimGuestRange(uint64_t vaddr, uint64_t size);
+// Linux, the texture offload: the pages of [address, address + size) of the backing view freed, in
+// every view of them (a later read gets zeros). False elsewhere.
+bool DiscardBacking(uint64_t address, uint64_t size);
+// Linux, the file offload: the byte at `address` of the backing view in a second read-write view of
+// the backing store, which protections of the backing view leave alone. Null elsewhere.
+uint8_t* SpareBackingPointer(uint64_t address);
 // The backing view (every guest mapping's bytes, at their backing offset): its base and size; false when there is none.
 bool                   BackingView(uint64_t* base, uint64_t* size);
 // Diagnostics (live `ranges`): the guest's virtual ranges (start, size, direct memory offset, protection, memory type,
@@ -164,6 +170,8 @@ bool                   TryReadMappedOrZero(uint64_t vaddr, void* data, uint64_t 
 // A page no GPU watcher holds that still faults on writes: back to the guest's own writable
 // protection. False when the guest itself made the range read-only (or it is unknown).
 bool                   RestoreGuestWritable(uint64_t vaddr, uint64_t size);
+// The guest's own protection of [vaddr, vaddr + size) (one guest mapping), whatever it is.
+bool                   RestoreGuestProtection(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size,
                                          const char** failure_reason = nullptr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
@@ -173,6 +181,11 @@ bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t si
 // (address, size), in order): what can be read of a range that reaches into unmapped memory.
 [[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
 void                   MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* parts);
+// The 2 MiB granules (guest address >> CommittedGranuleBits, below 1 TiB) that hold a committed page, ascending, into
+// `out` (replaced) when their version differs from `*version` (0 at first; made current); false, `out` as it was, when
+// it is the same.
+inline constexpr uint32_t CommittedGranuleBits = 21;
+bool                   CommittedGranules(uint64_t* version, std::vector<uint32_t>* out);
 // `source` names the path in crash reports (PrintWriteBacksOverlapping).
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size,
                                     const char* source = "image") noexcept;
@@ -197,15 +210,29 @@ void FinishHostOverwrite(uint64_t vaddr, uint64_t size, bool prepared);
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 // The same for a write of all of the range that reads none of it (InvalidateMemoryForWrite).
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
+// The game freed [vaddr, vaddr + size) and keeps it mapped (Demon's Souls' page allocator, demonsSoulsPageFree.cpp): when
+// the GPU caches' trackers watch a page of it, their buffers there go (GpuResourceManager::FreedByGame), without waiting.
+void NoteGameFree(uint64_t vaddr, uint64_t size);
 // The images over the range only (a GPU-written image's bytes here are stale: they are rewritten as InvalidateMemory
 // would make them).
 bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);
+// Whether a page of the range is one the GPU caches' trackers protect (PageManager::WatchedSpan: no system call).
+[[nodiscard]] bool GuestRangeWatched(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 // Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
 [[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);
 // Whether the address is in a view a partial unmap is mapping again (Windows; statistics: remap_window_writes).
 [[nodiscard]] bool     InRemapWindow(uint64_t vaddr) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// Windows with guard pages: the pages read back lately that were not for a while get guards again (the render thread's,
+// once a frame; GuestAddressSpace::CoolHotReads).
+void CoolHotReads();
+// Windows: the texture offload is about to give part of the backing view no access or discard it (texture-offload.h); the
+// pages read back there leave GuestAddressSpace::NoteRead's set, their locks with them.
+void DropHotReadsBacking(uint64_t backing, uint64_t size);
+// Windows: whether a no-access protection is a guard page (KYTY_READ_GUARD, kyty_local_read_guard); the texture
+// offload's backing view takes the same (texture-offload.h Protect). False elsewhere.
+[[nodiscard]] bool ReadGuardsOn();
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

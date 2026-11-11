@@ -59,7 +59,11 @@ def main():
 
     back_idle = intervals(4) or intervals(14)
     front_idle = intervals(3)
-    frames = [t for t, _, _, _ in by_type[5]]
+    # (BackFrame, 5, is no longer recorded: the flips' completions, FlipComplete, mark the frames then.)
+    frames = [t for t, _, _, _ in by_type[5]] or [t for t, _, _, _ in by_type[9]]
+    if len(frames) < 2:
+        print('fewer than two frames in the trace')
+        return
     flips = [t for t, _, _, _ in by_type[9]]
     print(f'frames {len(frames)}: ' + (f'mean {(frames[-1] - frames[0]) / (len(frames) - 1):.2f} ms' if len(frames) > 1 else ''))
     total = (frames[-1] - frames[0]) if len(frames) > 1 else 1

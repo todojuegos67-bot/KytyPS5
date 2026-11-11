@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "frame-gen.h"
 #include "slow-log.h"
 
 #include "common/assert.h"
@@ -48,7 +49,7 @@
 #endif
 
 extern "C" {
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {0};
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {1};
 }
 
 namespace Libs::Graphics {
@@ -582,7 +583,8 @@ static bool TexturePrefixEnabled(bool small_video_memory) {
 	return value == nullptr || value[0] == '\0' || value[0] != '0';
 }
 
-// KYTY_TEXTURE_REDUCE=0|1|2 (default: 1 with less than 12 GiB of video memory, else 0): a sampled 2D block-compressed
+// KYTY_TEXTURE_REDUCE=0|1|2 (default: 1 on a card of 12 GiB of video memory or less, else 0:
+// GraphicContext::reduce_texture_levels): a sampled 2D block-compressed
 // texture of at least 1024 texels on a side is held without its 1 or 2 largest levels, as a T# from that level would be
 // (TextureFromLevel): its kept levels are the first bytes of its memory, so the left-out ones take no video memory and
 // are not uploaded when the game writes them. One level left out is a quarter of the texture: at 1-1 its BC textures
@@ -590,13 +592,14 @@ static bool TexturePrefixEnabled(bool small_video_memory) {
 // layer's kept levels the first bytes of its own (the game's writes to the left-out ones then count as the array's: its
 // range takes them in): the texture pools' 1024x1024 arrays at 1-1 (256 and 64 layers) took 470 of the 1,313 MiB left
 // with one level out. Shaders sample the smaller texture (half the texels across); size queries, explicit levels and
-// texel loads see it too (a little blur).
-static uint32_t TextureReduceLevels(bool small_video_memory) {
+// texel loads see it too (a little blur). Demon's Souls streams none of the levels left out into its memory either
+// (loader/demonsSoulsTextureMips.cpp).
+uint32_t TextureReduceLevels(bool reduce_texture_levels) {
 	static const uint32_t levels = [&] {
 		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
 		const uint32_t chosen = value != nullptr && value[0] != '\0'
 		                            ? (value[0] == 'h' ? 1u : static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)))
-		                            : (small_video_memory ? 1u : 0u);
+		                            : (reduce_texture_levels ? 1u : 0u);
 		if (chosen != 0) {
 			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
 			            "(KYTY_TEXTURE_REDUCE=0 keeps them whole)\n",
@@ -617,13 +620,13 @@ static uint32_t TextureReduceMinSize() {
 	return size;
 }
 
-static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
+static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, const GraphicContext& graphics) {
 	const auto  base = desc.view_info.base_level;
 	const auto  last = base + desc.view_info.level_count - 1u;
 	const auto& full = desc.info;
 	// The levels left out of a large BC texture (none where the view reads only those, nor of one the GPU wrote: the
 	// character creator compresses faces on the GPU through texel views of the same memory, which must stay whole).
-	const auto reduce = TextureReduceLevels(small_video_memory);
+	const auto reduce = TextureReduceLevels(graphics.reduce_texture_levels);
 	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= TextureReduceMinSize() &&
 	                          full.resources.levels > reduce && last >= reduce &&
 	                          !cache.IsRegionGpuModified(full.data.address, full.data.size) &&
@@ -633,7 +636,7 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	// The first level held: the T#'s base, or past the levels left out.
 	const auto first_held = std::max(base, drop);
 	// (An array only for the levels left out: one held from its T#'s later base level is not tried.)
-	if (first_held == 0 || (drop == 0 && (!TexturePrefixEnabled(small_video_memory) || full.resources.layers > 1)) ||
+	if (first_held == 0 || (drop == 0 && (!TexturePrefixEnabled(graphics.small_video_memory) || full.resources.layers > 1)) ||
 	    full.resources.layers == 0 || full.samples != 1 || full.type != Prospero::ImageType::kColor2D ||
 	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() ||
 	    full.tile_mode == Prospero::TileMode::kLinear || full.tile_mode == Prospero::TileMode::kDepth ||
@@ -1129,7 +1132,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		}
 	}
 	if (!storage && (type == Prospero::ImageType::kColor2D || type == Prospero::ImageType::kColor2DArray)) {
-		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
+		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics());
 	}
 	// KYTY_TEST_MAX_ARRAY_LAYERS=<n>: textures held as if the GPU's images held no more than n layers. 2048 = NVIDIA's: an
 	// AMD GPU (8192) then binds the texture-pool views past it null as NVIDIA does (issue #24: a picture broken on AMD
@@ -1352,6 +1355,7 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 		prepared.images.push_back(std::move(binding));
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
+	const bool material = MaterialSamplers(program);
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i],
 		                                          LodBiasForSampler(m_context.GetTextureCache(), program, prepared, i,
@@ -1754,8 +1758,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
+				// A draw's shader reads the image it writes (the deferred decals' G-buffer): ordered after the last
+				// draw's write with KYTY_DRAW_READ_AFTER_WRITE=1 (Image::GetBarriers, issue #315). A dispatch is
+				// ordered by the game's own barriers.
 				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer,
+				              image.binding.shader_write && pipeline_bind_point == vk::PipelineBindPoint::eGraphics);
 			} else if (storage) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,

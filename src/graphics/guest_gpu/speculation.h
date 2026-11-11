@@ -33,6 +33,10 @@ namespace Libs::Graphics {
 
 class StreamBuffer;
 
+// KYTY_SPEC_DRAW_INDIRECT_VERIFY: a sampled DRAW_INDIRECT table draw against what the normal path would draw there (on
+// the GPU thread, where its arguments are current; graphicsRun.cpp).
+void VerifyDrawIndirect(RenderContext& renderer, const Spec::DrawIndirectVerify& entry);
+
 // Speculative translation of graphics command buffers (KYTY_SPECULATE, docs/PARALLEL-TRANSLATION.md): a command
 // buffer is translated into command buffers of its own, by its own processor and executors, without changing what
 // other translations see (src/local/speculation-state.h), then committed in guest order: the uploads, page-table
@@ -45,9 +49,15 @@ class StreamBuffer;
 // (RenderExecutor::ReadCatalogOf); its holes and the rest of the command buffer are translated by those.
 class Speculation {
 public:
-	explicit Speculation(RenderContext& renderer);
+	// `interrupt_id`: the queue's processor's (0: the graphics queue; an async compute queue's: KYTY_SPECULATE_ASYNC);
+	// `base`: the first speculation thread's packet slot and executor role less one (after another speculation's).
+	explicit Speculation(RenderContext& renderer, int interrupt_id = 0, uint32_t base = 0, uint32_t threads = 0);
 	~Speculation();
 	KYTY_CLASS_NO_COPY(Speculation);
+	// (Tooling, the live mode toggle: on the GPU thread, between submissions.) The threads stopped and every result not
+	// committed finished as a lost one (Finish: its recorded command buffers discarded, their ticks given up, its
+	// pending writes dropped, the live count down), so the destructor waits for no tick that will never be submitted.
+	void Stop();
 
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
 	// committed up to the end of its chunk (mode 4: the execution is where the next begins).
@@ -89,6 +99,11 @@ public:
 	                                  std::optional<Pm4Execution>& end);
 	void                  Done(uint64_t serial, const CommandProcessor& cp);
 	static constexpr uint32_t ChunkWork = 128;
+	// KYTY_SPEC_CHUNK_IN_ORDER (live spec_chunk_in_order, default off): a chunk the state pass has not cut when the GPU
+	// thread comes for it ("not passed yet") is translated in order up to where the pass will end it (ChunkWork draws
+	// and dispatches from its start), not to the command buffer's end; the chunks after it stay the speculation's
+	// threads' (~1.3 ms of in-order translation each, 0.4-0.9 ms a frame at the arch, 1 Nov).
+	[[nodiscard]] static bool ChunkInOrder();
 	// The graphics queue's time in a slice of a command buffer (the report's total).
 	void NoteQueueTime(uint64_t ns) noexcept { m_queue_ns += ns; }
 	// What the normal translation does while a speculation is not committed (Spec::t_effects of the thread that
@@ -150,7 +165,7 @@ private:
 	// 3), the serial it translates, its latest result (the commits unlink it), when the translation going on began
 	// (m_clock; 0: none: it walks no speculation before it).
 	struct Translator {
-		explicit Translator(RenderContext& renderer, uint32_t number);
+		explicit Translator(RenderContext& renderer, uint32_t number, int interrupt_id);
 		uint32_t                                   index = 0;
 		std::unique_ptr<RenderExecutor>            draw, compute;
 		RenderContext::Executors                   executors;
@@ -162,6 +177,9 @@ private:
 		uint64_t                                   translating = 0; // (under m_mutex: serial, chunk)
 		uint32_t                                   translating_chunk = 0;
 		Result*                                    current     = nullptr;
+		// The GPU thread's request that the translation going on stop (Spec::State::cancel); when it began (under m_mutex).
+		std::atomic<bool>                          cancel {false};
+		uint64_t                                   began_ns = 0;
 		uint64_t                                   since       = 0;
 	};
 	// A chunk of a submission (mode 4), once the state pass passed it: the processor state and position it starts at,
@@ -240,6 +258,7 @@ private:
 	std::atomic<uint64_t>                    m_pending {CommandScheduler::PendingTick}; // the latest pending tick
 	// What the normal translation did, and what of it was logged since the result being committed began.
 	Spec::EffectsLog                     m_log;
+	int                                  m_interrupt_id = 0; // its queue's processor's
 	Spec::Effects                        m_effects;
 	// Outcomes since the last report: command buffers committed whole, partly, not at all; segments and holes
 	// committed; why packets became holes, why speculations or commits stopped.
@@ -248,6 +267,7 @@ private:
 	// Time (ns) translating the segments committed and the others, committing (holes apart), in holes, in the graphics
 	// queue; the frame of the last report.
 	uint64_t m_kept_ns = 0, m_lost_ns = 0, m_commit_ns = 0, m_hole_ns = 0, m_queue_ns = 0, m_report_frame = 0;
+	uint32_t m_held_commits = 0; // commits since the last flush (KYTY_SPECULATE_FLUSH_EVERY; this instance's)
 	std::mutex m_mutex;
 	bool       m_quit  = false;
 	uint64_t   m_clock = 0; // (under m_mutex) orders translations beginning and results retired
@@ -271,6 +291,7 @@ private:
 	// translations by duration: < 0.5, 1, 2, 4, 8 ms and longer, and the longest.)
 	uint64_t                          m_wait_ns = 0, m_start_delay_ns = 0, m_started = 0, m_longest_ns = 0;
 	std::array<uint64_t, 6>           m_durations {};
+	uint64_t                          m_cancelled = 0; // (the report's: translations the GPU thread stopped, under m_mutex)
 };
 
 } // namespace Libs::Graphics

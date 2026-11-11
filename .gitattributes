@@ -21,3 +21,5 @@ tools/local/fsr3-mfg/prebuilt/** -text
 /Capturar-RT.cmd -text
 /Capturar-RT.ps1 -text
 *.ttf binary
+# Shell scripts run in bash on Linux, WSL and Git Bash: LF in every checkout (a CR ends each command line badly).
+*.sh text eol=lf

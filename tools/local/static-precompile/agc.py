@@ -8,8 +8,7 @@ AGC header (`struct Shader` in src/graphics/shader/shader.h; AgcCreateShader in 
   80 u32 num_input_semantics   84 u16 scratch_dw_per_thread   86 u16 num_output_semantics
   88 u16 special_sizes_bytes   90 u8 type (Prospero::ShaderBinaryType)   91 u8 n_cx   92 u8 n_sh
 
-A CSDR bundle is a table of entries, each the shader code followed by its AGC header (layout checked
-the same way as tools/local/extract-game-shaders.py). eboot.bin carries a further array of AGC headers
+A CSDR bundle is a table of entries, each the shader code followed by its AGC header. eboot.bin carries a further array of AGC headers
 in its data segment with the code laid out after it, one blob per header in header order, each
 256-byte aligned (the relocations that pair a header with its code confirm the rule).
 """

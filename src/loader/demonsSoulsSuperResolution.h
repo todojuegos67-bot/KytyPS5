@@ -20,4 +20,7 @@ void Install(Program* program);
 // Install patched SuperResolution::IsEnabled's 1080 least height out (render heights below 1080 keep the upscaler).
 [[nodiscard]] bool AnyHeight();
 } // namespace DemonsSoulsSuperResolution
+// (des-up-1110) Upstream's KYTY_HD_OUTPUT PS5 Pro path at 1080p: our own output sizes (KYTY_OUTPUT_HEIGHT,
+// KYTY_UPSCALE_RATIO, AnyHeight) cover it, so it is never on here; kept for demonsSoulsHdOutput.cpp.
+[[nodiscard]] inline bool HdOutput() { return false; }
 } // namespace Loader

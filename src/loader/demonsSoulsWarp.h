@@ -9,8 +9,7 @@
 #include <vector>
 
 // Debug warp for Demon's Souls (PPSA01341): start the character on another map. A warp is armed
-// (the live command `warp MAP SPAWN`; Select/ToggleSelected have no keys now: F8 is the overlay, F9 a debug
-// snapshot); the next time the game reads its save (Continue on the title screen) it gets a copy whose map and position
+// (the live command `warp MAP SPAWN`; Select/ToggleSelected have no keys now: F8 is the overlay); the next time the game reads its save (Continue on the title screen) it gets a copy whose map and position
 // are those
 // of the chosen spawn point, a player part of the map's MSB file. The save on disk is not touched:
 // the game writes the new location itself when it next saves, which ends the warp.

@@ -9,7 +9,14 @@ namespace Libs::Graphics {
 
 void               HostInputInit();
 void               HostInputKey(int key_code, bool down);
+// The keymap (--keymap) gives that key to a control of the pad.
+[[nodiscard]] bool HostInputMapsKey(int key_code);
+// Whether the keyboard's default keys count (false in the Steam Deck build unless KYTY_DECK_KEYBOARD=1: there Steam's
+// desktop layout sends keys for the Deck's own buttons).
+[[nodiscard]] bool HostInputDefaultKeysUsed();
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
+// Wheel notches (up > 0, down < 0) on the controls mapped to Mouse:WheelUp / Mouse:WheelDown: a short press each.
+void               HostInputMouseWheel(int notches);
 void               HostInputToggleMouseToJoystick();
 // KYTY_KBM=1: keyboard and mouse play (hostInput.cpp). The motion/wheel calls return true when they took the event.
 [[nodiscard]] bool HostInputKbmEnabled();

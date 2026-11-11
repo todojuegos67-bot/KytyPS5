@@ -203,4 +203,7 @@ inline double ParseAspect(std::string_view text) {
 	return aspect > GameAspect + 0.01 && aspect <= WidestAspect + 0.01 ? aspect : 0.0;
 }
 } // namespace DemonsSoulsRenderSize
+// (des-up-1110) Upstream's automatic render height for the window: none here (our KYTY_UPSCALE_RATIO / KYTY_OUTPUT_HEIGHT
+// size it), so DemonsSoulsHdOutput's automatic HD output stays off.
+[[nodiscard]] inline uint32_t AutoHeight(bool /*upscaler*/) { return 0; }
 } // namespace Loader

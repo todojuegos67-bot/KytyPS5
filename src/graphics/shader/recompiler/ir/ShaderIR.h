@@ -117,7 +117,7 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
-	// indirect_search_iterations of a portable table (PortableShaders): the search runs until its
+	// indirect_search_iterations of a portable table: the search runs until its
 	// range is empty, and indirect_mapping_offset names the flattened-SRT word that holds the
 	// offset of the key mapping.
 	static constexpr uint32_t RuntimeIndirectSearch = UINT32_MAX;
@@ -423,12 +423,10 @@ struct BufferWord {
 	static constexpr uint32_t PackedLayouts = 12;
 };
 
-// Portable shader modules (KYTY_PORTABLE_SHADERS, default on; read once, fixed for the process):
-// what a module could only get from the descriptors the game binds at run time (a buffer's stride
-// and format, a null texture's type) no longer selects one, so the modules of a program can be
-// compiled ahead from the game files (tools/local/static-precompile). Buffers take those values
-// from their buffer words (BufferWord) in the shader data.
-bool PortableShaders();
+// Portable shader modules: what a module could only get from the descriptors the game binds at run
+// time (a buffer's stride and format, a null texture's type) no longer selects one, so the modules
+// of a program can be compiled ahead from the game files (tools/local/static-precompile). Buffers
+// take those values from their buffer words (BufferWord) in the shader data.
 
 inline constexpr uint32_t BufferAddTidBit = 1u << 20u;
 
@@ -702,9 +700,6 @@ struct Program: ResourcePlan {
 	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
 	// (Frontend::IsWaveLaneLocal): a host with 32-wide subgroups runs it one GCN lane per invocation.
 	bool                          lane_local     = false;
-	// Its proof took buffer loads at one address for values the same in every lane: two lanes per invocation after
-	// all where the specialization has a buffer that adds the lane to its index (ADD_TID; CompileProgram).
-	bool                          lane_local_uniform_loads = false;
 	// Its proof had a 64-thread group's two halves cooperate (Frontend::ProveWaveLaneLocal): these lane reads (pc)
 	// run wave-wide and these lane-mask branches (pc of the branch) are the wave's decision (IR::WaveFlags).
 	bool                          lane_cooperative = false;
@@ -734,6 +729,15 @@ struct Program: ResourcePlan {
 	bool                          table_slots_at_use = false;
 	// Float min/max as host instructions (Frontend::TranslatorFeatureNativeFloatMinMax).
 	bool                          native_float_min_max = false;
+	// Address loads from one base share a page walk (Frontend::TranslatorFeatureBdaGroupWalks).
+	bool                          bda_group_walks = false;
+	// Pixel shaders' DPP quad_perm moves read by quad operations (Frontend::TranslatorFeaturePixelQuadReads).
+	bool                          pixel_quad_reads = false;
+	// V_MAD/V_MAC/V_MADMK/V_MADAK_F32 (FPMad32) unfused (Frontend::TranslatorFeatureUnfusedMad).
+	bool                          unfused_mad = false;
+	// A pixel shader's barycentrics without per-vertex inputs from VK_AMD_shader_explicit_vertex_parameter
+	// (Frontend::TranslatorFeatureAmdBarycentrics; the backend checks for the per-vertex inputs).
+	bool                          amd_barycentrics = false;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };

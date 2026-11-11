@@ -3,9 +3,9 @@
 // takes longer than KYTY_SLOW_LOG_MS (default off). The hitches of the walk route (hundreds of
 // milliseconds in one texture lookup, page-watcher update or tile setup) are single calls; the
 // line names the resource so the case can be reproduced.
-// KYTY_HITCH_LOG_MS (run-windows.ps1: 100) covers only what runs once per frame or on a miss (frames,
+// KYTY_HITCH_LOG_MS (default 100; 0: off) covers only what runs once per frame or on a miss (frames,
 // shader translations, pipeline creations, image uploads, unmaps), cheap enough for every session: what
-// a stutter was. Without it they follow KYTY_SLOW_LOG_MS.
+// a stutter was.
 
 #include <chrono>
 #include <cstdio>
@@ -26,7 +26,12 @@ inline double Threshold() {
 inline double HitchThreshold() {
 	static const double ms = [] {
 		const char* text = std::getenv("KYTY_HITCH_LOG_MS");
-		return text != nullptr ? std::atof(text) : Threshold();
+#if defined(KYTY_STATIC_PRECOMPILE)
+		constexpr double fallback = 0.0; // (the precompile program: compiles that long are its work, not stutters)
+#else
+		constexpr double fallback = 100.0;
+#endif
+		return text != nullptr ? std::atof(text) : fallback;
 	}();
 	return ms;
 }

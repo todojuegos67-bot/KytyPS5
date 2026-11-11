@@ -14,9 +14,14 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <atomic>
 #include <shared_mutex>
 #include <unordered_set>
 #include <vector>
+
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
 
 namespace Libs::Graphics {
 
@@ -132,6 +137,8 @@ public:
 	void ResumeRendering(const RenderState& state) const;
 	// The render pass in progress is `state`'s, as BeginRendering compares them.
 	[[nodiscard]] bool RenderingWith(const RenderState& state) const;
+	// A render pass is in progress.
+	[[nodiscard]] bool Rendering() const noexcept { return m_rendering; }
 	// Raw internal graphics operations must invalidate the values recorded by
 	// the ordinary draw path. Compute and transfer commands do not alter them.
 	void InvalidateGraphicsState() const noexcept;
@@ -177,7 +184,8 @@ private:
 		m_shaders     = &shaders;
 	}
 
-	void Begin();
+	// (`placeholder`: a speculation thread's segment recorded as worker packets: the state reset, no Vulkan begin.)
+	void Begin(bool placeholder = false);
 	void End() const;
 	void FlushCopyRun() const;
 	void FlushRunTail() const;
@@ -210,6 +218,7 @@ private:
 	mutable RenderState m_render_state;
 	mutable uint64_t    m_barrier_work = UINT64_MAX;
 	mutable bool        m_rendering   = false;
+	mutable uint32_t    m_handle_requests = 0; // Handle and the like since Begin (none: nothing recorded)
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -352,7 +361,7 @@ private:
 	                                        std::span<const std::pair<uint32_t, uint32_t>> images,
 	                                        std::span<const std::pair<uint32_t, uint32_t>> buffers);
 	void NativeXprCollect();
-	void NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
+	bool NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
 	// A draw state's dynamic state, only what differs from what the emissions recorded in the command buffer.
 	static void NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuffer vk_buffer, const NativeXprDrawState& draw_state,
 	                                 bool same_command);
@@ -380,14 +389,27 @@ private:
 public:
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
 	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances; or a direct draw
-	// of vertices (DRAW_INDEX_AUTO, not `indexed`: the count is of vertices; table draws only).
+	// of vertices (DRAW_INDEX_AUTO, not `indexed`: the count is of vertices; table draws only). `indirect` (not
+	// `indexed`; KYTY_SPEC_DRAW_INDIRECT): a draw of vertices whose arguments the GPU reads, one VkDrawIndirectCommand at
+	// `commands[0]` (DRAW_INDIRECT; table draws only; the counts here unused).
 	struct NativeXprDirectDraw {
 		uint64_t index_address  = 0;
 		uint32_t index_count    = 0;
 		uint32_t instance_count = 1;
 		bool     indexed        = true;
+		bool     indirect       = false;
 	};
-	// `direct`: that draw instead of the DRAW_INDEX_INDIRECT run `commands`.
+	// KYTY_SPEC_DRAW_INDIRECT_VERIFY: the arguments the last `indirect` table draw read (TableDraw): its buffer (identity
+	// only), offset, stride and count; `copy`: a host-visible ring's copy of the bytes, `copied` them.
+	struct TableArgsEmit {
+		const void*             buffer = nullptr;
+		uint64_t                offset = 0;
+		uint32_t                stride = 0, count = 0;
+		bool                    copy   = false;
+		std::array<uint32_t, 4> copied {};
+	};
+	TableArgsEmit m_table_args_emit;
+	// `direct`: that draw instead of the DRAW_INDEX_INDIRECT run `commands` (an `indirect` one: with its arguments).
 	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,
 	                                uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
 	                                const NativeXprDirectDraw* direct = nullptr);
@@ -413,18 +435,22 @@ public:
 	void ResolvePendingTicks(uint64_t pending, uint64_t tick);
 	// A speculation's executor draws with what `owner` (the graphics queue's) learned: its table pairs and dispatches,
 	// draw states, linear copy shader and compute clears (RenderExecutor::Catalog); `role` its own proofs' (1..Roles-1:
-	// one per speculation thread).
+	// one per speculation thread). The owner sweeps its catalog only while no translation is going on and no result is
+	// left unfinished (kyty_local_speculations_live).
 	void ReadCatalogOf(RenderExecutor& owner, uint32_t role) noexcept {
 		m_catalog = &owner;
 		m_role    = role;
-		owner.m_catalog_readers.fetch_add(1, std::memory_order_relaxed);
 	}
-	static constexpr uint32_t Roles = 9;
+	// At the start of a translation: what this executor kept of the catalog from its last one, dropped when the owner
+	// changed it since (TableXpr::epoch; table-xpr.inc).
+	void ForgetStaleCatalog();
+	static constexpr uint32_t Roles = 13; // (the GPU thread, Spec::MaxPacketSlots speculation threads)
 
 private:
 	// Table draws (src/local/table-xpr.inc).
 	struct TableXpr;
 	struct TablePair;
+	void TableMemoRetired(); // KYTY_TABLE_MEMO: a set left service (memo_epoch moves; table-xpr.inc)
 	struct TableFlatStage;
 	struct TableVariant;
 	void TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat);
@@ -437,13 +463,15 @@ private:
 	// it across draws is dropped when the owner changed it (TableXpr::epoch).
 	RenderExecutor* m_catalog = nullptr;
 	uint32_t        m_role    = 0;
-	// Executors that read this one's catalog (ReadCatalogOf): its draw states stay while there are any.
-	std::atomic<uint32_t> m_catalog_readers {0};
 	[[nodiscard]] RenderExecutor& Catalog() noexcept { return m_catalog != nullptr ? *m_catalog : *this; }
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
 	mutable std::shared_mutex m_catalog_mutex;
-	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const { return std::unique_lock(m_catalog_mutex); }
+	// (Outside KYTY_SPECULATE=4 no other executor reads the catalog: no lock. The mode changes only between submissions.)
+	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const {
+		return ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 ? std::unique_lock(m_catalog_mutex)
+		                                                                       : std::unique_lock<std::shared_mutex>();
+	}
 	[[nodiscard]] std::shared_lock<std::shared_mutex> CatalogRead() { return std::shared_lock(Catalog().m_catalog_mutex); }
 	[[nodiscard]] uint32_t        Role() const noexcept { return m_role; }
 	// The catalog's table (null: nothing learned yet), and this executor's own table state.
@@ -460,6 +488,15 @@ private:
 	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
 	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)
 	std::unordered_map<uint64_t, uint64_t> m_meta_clears;
+	// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc): the DCC surfaces image-clear dispatches filled with a clear code
+	// (TryConsumeComputeImageClear's TrackDccFill), by their shader and user data: a speculation's hole of such a
+	// dispatch clears them too (Spec::State::PredictClear), as m_meta_clears' do. Without it the draws after the hole
+	// were translated as on an uncleared surface and the commit stopped there ("commit: a surface cleared"). (The
+	// surfaces it filled lately, newest first: one dispatch and user data runs more than once a frame over descriptors
+	// the game rewrites between the runs; all are predicted, a stale one costs a hole.)
+	std::unordered_map<uint64_t, std::array<uint64_t, 4>> m_dcc_fills;
+	uint64_t m_last_dcc_fill     = 0;     // (the dispatch being made: the surface its DCC fill cleared, 0 none)
+	bool     m_last_dcc_fill_set = false; // (it tracked a DCC fill)
 	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
 	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
@@ -485,7 +522,10 @@ private:
 	void NativeXprCaptureState(CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering,
 	                           uint64_t state_key);
 	[[nodiscard]] bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
-	[[nodiscard]] bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer);
+	[[nodiscard]] bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,
+	                                        const TableImageSet* reading = nullptr);
+	// The shader access a table image set adds to target `id` (KYTY_TABLE_TARGET_READ; none: empty).
+	[[nodiscard]] static vk::AccessFlags2 TableTargetRead(const TableImageSet& set, ImageId id);
 
 
 private:

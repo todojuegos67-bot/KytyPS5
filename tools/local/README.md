@@ -1,55 +1,41 @@
 # Local tools
 
-For day-to-day launching and the required assets see the [current build](../../docs/CURRENT-PLAYABLE.md),
-for every experiment's conclusion the [experiment log](../../docs/EXPERIMENTS.md), and for the test
-procedure [benchmarking](../../docs/BENCHMARKING.md).
+Developer tools: the Windows bench and profiling scripts (`windows/`, `bench-windows.py`), the static shader
+precompile (`static-precompile/`), the Linux launcher (`run_ds.sh`) and the Linux DLSS bridge (`dlss-bridge/`).
+Building, running and the developer's workflow are in [docs/CURRENT-PLAYABLE.md](../../docs/CURRENT-PLAYABLE.md).
 
-## Running and measuring
+## Running and measuring (Windows)
 
-- `./run.sh` in the repository root, or `play-demons-souls.py --2k`: the same release configuration.
-  The latter supports run logs, recording and shader warmup options.
-- `benchmark-entry.py`: backs up the user's save, loads the fixed baseline, continues normally,
-  positions, measures standing still, and restores the original save after a normal exit.
-- `quick-benchmark-game.py`: a short measurement/screenshot of a running process; no camera input by
-  default.
-- `switch-control.py`, `abba-switch.py`, `abba-cpu.py`: same-process switch and CPU/frame comparisons
-  bound to the process identity/fingerprint.
-- `debug-run.py`, `debug_cpu_policy.py`, `demons-souls-smoke.py`, `close-game-window.py`: processes,
-  CPU pinning, menus and a clean shutdown.
-- `game_recording.py`, `recording_hud.py`, `playtest_log.py`: recording and run logs.
-- Windows: `windows/bench-run.ps1` (launch to the HUD from the fixed save), `windows/ab-spot.ps1`
-  (same-process ABBA of a runtime switch), `windows/ab-exe.ps1` (ABBA of two builds),
-  `windows/walk-run.ps1` (the walk route), `windows/prof-spot.ps1` (render-thread profile),
-  `windows/pgo-train.ps1` (PGO profile refresh).
-- Hitches on screen: with `KYTY_HITCH_LOG_MS` the run log's SLOW Frame lines carry `unix_ms`;
-  `windows/record.ps1` records the emulator window with wall-clock timestamps (ffmpeg 8+:
-  `winget install Gyan.FFmpeg`), `windows/capture.ps1` takes stills without ffmpeg, and `hitch-sheet.py`
-  puts the screen before and after each slow frame side by side; `hitch-prof.py` splits a render-thread
-  profile into the slow frames' samples and the rest.
+- `bench-windows.py`: the client of the emulator's live command file (`KYTY_LIVE_FILE`: measures, counters,
+  traces, profiles) and the bench save handling (`prepare` installs a fixed save, `restore` puts the user's back).
+- `windows/bench-run.ps1`: a launch to the HUD from a fixed bench save; `windows/walk-run.ps1`: the walk route;
+  `windows/ab-spot.ps1`: a same-process ABBA of a runtime switch; `windows/ab-exe.ps1`: an ABBA of two builds.
+- `windows/prof-spot.ps1` and `windows/profreport.cpp`: render-thread profiles; `prof-callees.py`,
+  `prof-dll-callers.py`, `prof-hot-lines.py`, `prof-inline.py`, `prof-slices.py`, `guest-prof.py`: their views.
+- Flicker: the live `screenshots <path> <count>` command takes the next frames small into one file; `flicker.py`
+  scores each against the median of its neighbours and names the wrong ones (a frame with objects missing differs
+  from both neighbours, motion only a little), with a strip of the worst beside a neighbour (numpy; PIL for the strip).
+- Live captures: `live-trace.py`, `live-trace-report.py`, `walk-report.py`, `render-faults.py` (`trace`),
+  `live-census-report.py`, `census-compare.py` (`census`), `persec-report.py`, `ab-counters.py`
+  (measures and counters), `frame-capture-report.py` (`capture`), `slow-timeline.py` (`KYTY_SLOW_LOG_MS`).
+- Hitches: the run log's SLOW Frame lines (`KYTY_HITCH_LOG_MS`, default 100 ms) carry `unix_ms`;
+  `windows/record.ps1` records the window with wall-clock timestamps (ffmpeg 8+), `windows/capture.ps1` and
+  `windows/screen.ps1` take stills, `hitch-sheet.py` shows the screen before and after each slow frame and
+  `hitch-prof.py` splits a profile into the slow frames' samples and the rest.
+- `windows/key.ps1`, `windows/keys.ps1`: input for scripted walks; `windows/record-fg.ps1`: a 30 fps game with
+  DLSS frame generation, for recordings.
 
-## Building and diagnostics
+## Diagnostics
 
-- `compile-srt-aot.py` (Linux) / `compile-srt-aot-windows.py` (Windows DLL): rebuild the SRT AOT
-  library from exported plans; the ABI header is `src/local/SrtAotAbi.h`.
-- `extract-game-shaders.py`, `capture-srt-plans.py`, `shader_precompile_audit.py`: resource
-  extraction, plan export and warmup audits.
-- [static-precompile](static-precompile/README.md): collects every shader/pipeline statically from the
-  game files; a standalone program (`precompile-windows.ps1`, several processes) precompiles them into a
-  static pipeline cache kept across builds; includes coverage comparisons with recorded caches.
-- `profile-game.py`, `perf-code-maps.py`, `prof-inline.py` and the `*-report.py` scripts: on-demand
-  diagnostics; instrumented FPS is never a net gain.
-- `stage-candidate.py`: makes a configuration for an independent candidate without overwriting the
-  release one.
-- `run-reviewed.py`, `benchmark-build.py`: advanced entry points for independent builds; they need
-  their own binary/receipt given explicitly and are not the day-to-day entry.
-- [PGO](PGO.md): the current profile inputs and notes on retraining.
+- `windows/stackdump.cpp`, `windows/threads.ps1`: the threads and stacks of a running emulator.
+- `windows/guest-disasm.py`, `windows/pe-func.py`, `windows/vmmap.py`: guest code and the address space.
+- `spirv-stats.py`, `windows/spirv-stats.cpp`: driver statistics of dumped SPIR-V (`KYTY_SHADER_DUMP`).
+- `demons-souls-save.py`: Demon's Souls save editing (positions and worlds).
 
-The local sources CMake and the tests refer to (vulkan-recording, native-resource, ...) are all in
-`src/local/`; optional experiments are off by default. The old experiment sources of this folder
-(shader-preparation, prepared-draw, render-cost/playtest), old copies of `src/local` files, `*.cmake`
-fragments with their test sources, and `build-pbr-full-overlay.py` were no longer referenced and were
-removed on 2026-09-28. Tools for the finished PT/SRT capture replays, the old checkpoint byte-patch
-tools and large run outputs were removed as well.
+## Building
 
-A new experiment only appends one line to the experiment log. Keep reusable tools and delete old
-output folders promptly; never delete process locks in use, release libraries, saves or build inputs.
+- [static-precompile](static-precompile/README.md): every shader and pipeline of the game from its files, for the
+  static pipeline cache that `precompile-windows.ps1` (Linux: `precompile-linux.sh`) makes.
+- [PGO](PGO.md): the profile the release build uses and how to retrain it (`windows/pgo-train.ps1`).
+
+Keep reusable tools here and one-off scripts out of the repository; git keeps the history of the removed ones.

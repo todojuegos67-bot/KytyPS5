@@ -44,9 +44,18 @@ using GuardPageHandler = bool (*)(uint64_t address, void* native_context);
 
 void SetGuardPageHandler(GuardPageHandler handler);
 
-// Windows, the texture offload (src/local/texture-offload.h): an access violation outside the guest's fault handling is
-// first offered to this handler (the touched address, the faulting instruction, whether it wrote); true resumes the
-// thread.
+// Windows, KYTY_READ_GUARD (memory.cpp): guest pages kept from reads by a guard page in place of no access. A guard-page
+// violation the guard-page handler leaves is first offered to `arm` (the touched address): true when it is such a page,
+// guarded again at once. It is then served as the access violation no access would have raised; once served, `settle`
+// gives the page its trackers' protection (a guard armed again may outlive a change another thread made meanwhile).
+using ReadGuardArm    = bool (*)(uint64_t address);
+using ReadGuardSettle = void (*)(uint64_t address);
+
+void SetReadGuardHandlers(ReadGuardArm arm, ReadGuardSettle settle);
+
+// Windows and Linux, the texture offload (src/local/texture-offload.h): an access violation outside
+// the guest's fault handling is first offered to this handler (the touched address, the faulting
+// instruction, whether it wrote); true resumes the thread.
 using ProbeHandler = bool (*)(uint64_t address, uint64_t rip, const void* native_context, bool write);
 
 void SetProbeHandler(ProbeHandler handler);

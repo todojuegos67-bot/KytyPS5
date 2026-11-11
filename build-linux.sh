@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Linux build: clang + Ninja, like the Windows one (build-windows.cmd).
-#   ./build-linux.sh              configure (first time) and build kyty_emulator
-#   ./build-linux.sh <target>     build another target (for example all, kyty_shader_precompile)
+#   ./build-linux.sh              configure (first time) and build kyty_emulator and kyty_launcher (the settings window)
+#   ./build-linux.sh <target>...  build other targets (for example all, kyty_shader_precompile)
 #
 # Needs Git, Clang, Ninja, CMake, glslangValidator (glslang-tools) and Python 3, plus the SDL2
 # development libraries (README.md, "Building on Linux"). Missing submodules are checked out first.
@@ -47,5 +47,5 @@ if [ ! -f "$BUILD/build.ninja" ]; then
 		"${DEPS_ARGS[@]}" ${KYTY_CMAKE_ARGS:-}
 fi
 
-TARGET="${1:-kyty_emulator}"
-cmake --build "$BUILD" --target "$TARGET" --parallel
+[ $# -gt 0 ] || set -- kyty_emulator kyty_launcher
+cmake --build "$BUILD" --target "$@" --parallel

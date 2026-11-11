@@ -51,7 +51,9 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void                                                    UpdateTitle();
+	// Present thread, after a game frame: `presented` images shown for it (with frame generation more than one, the title
+	// then also shows their rate, named `generator`).
+	void                                                    UpdateTitle(uint32_t presented = 1, const char* generator = nullptr);
 	void                                                    Resize(uint32_t width, uint32_t height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);

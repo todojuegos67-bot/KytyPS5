@@ -13,6 +13,8 @@
 #include <QStringList>
 #include <QVariant>
 
+#include <algorithm>
+
 #define KYTY_CFG_SET(n) s->setValue(#n, QVariant::fromValue(n).toString());
 #define KYTY_CFG_GET(n) n = s->value(#n).value<decltype(n)>();
 
@@ -78,6 +80,21 @@ public:
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
+	// Graphics enhancements, given to the emulator as its KYTY_* environment variables (CreateEmulatorEnvironment):
+	// the upscaler in the game's PS5 Pro path (FSR 3 built in on Linux, DLSS on NVIDIA RTX), frame generation (FSR 3, or
+	// DLSS-G with 1-3 generated frames), low latency (a one-frame flip queue, AMD Anti-Lag on top).
+	enum class Upscaler { Off, Fsr, Dlss };
+	Q_ENUM(Upscaler)
+	enum class FrameGeneration { Off, Fsr2x, Dlss2x, Dlss3x, Dlss4x };
+	Q_ENUM(FrameGeneration)
+	enum class LowLatency { Off, On, AntiLag };
+	Q_ENUM(LowLatency)
+	// A pipeline no cache holds (KYTY_PIPELINE_FAST_BUILD): Auto (unoptimized first on NVIDIA and Mesa's RADV, where it
+	// was measured), unoptimized first (a shorter stall, the optimized build replaces it in the background), or
+	// optimized at once.
+	enum class PipelineBuild { Auto, FastFirst, Optimized };
+	Q_ENUM(PipelineBuild)
+
 	Configuration() = default;
 
 	QString    name;
@@ -110,6 +127,14 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   renderdoc_enabled           = false;
+	Upscaler               upscaler                    = Upscaler::Off;
+	int                    render_height               = 0;  // 0: the emulator's choice (no KYTY_RENDER_HEIGHT)
+	int                    fsr_sharpness               = 60; // percent (KYTY_FSR_SHARPNESS)
+	FrameGeneration        frame_generation            = FrameGeneration::Off;
+	LowLatency             low_latency                 = LowLatency::Off;
+	bool                   fps_overlay                 = false;
+	PipelineBuild          pipeline_build              = PipelineBuild::Auto;
+	QString                streamline_dir;               // Windows: NVIDIA Streamline's runtime (DLSS)
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -138,6 +163,14 @@ public:
 		printf_output_file          = other.printf_output_file;
 		profiler_direction          = other.profiler_direction;
 		renderdoc_enabled           = other.renderdoc_enabled;
+		upscaler                    = other.upscaler;
+		render_height               = other.render_height;
+		fsr_sharpness               = other.fsr_sharpness;
+		frame_generation            = other.frame_generation;
+		low_latency                 = other.low_latency;
+		fps_overlay                 = other.fps_overlay;
+		pipeline_build              = other.pipeline_build;
+		streamline_dir              = other.streamline_dir;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -183,6 +216,14 @@ public:
 		KYTY_CFG_SET(printf_output_file);
 		KYTY_CFG_SET(profiler_direction);
 		KYTY_CFG_SET(renderdoc_enabled);
+		KYTY_CFG_SET(upscaler);
+		KYTY_CFG_SET(render_height);
+		KYTY_CFG_SET(fsr_sharpness);
+		KYTY_CFG_SET(frame_generation);
+		KYTY_CFG_SET(low_latency);
+		KYTY_CFG_SET(fps_overlay);
+		KYTY_CFG_SET(pipeline_build);
+		KYTY_CFG_SET(streamline_dir);
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -225,6 +266,16 @@ public:
 		KYTY_CFG_GET(printf_output_file);
 		KYTY_CFG_GET(profiler_direction);
 		KYTY_CFG_GET(renderdoc_enabled);
+		// (Settings written before these existed keep the defaults.)
+		if (s->contains("upscaler")) KYTY_CFG_GET(upscaler);
+		render_height = s->value("render_height", render_height).toInt();
+		if (render_height != 0 && (render_height < 720 || render_height > 2160)) render_height = 0;
+		fsr_sharpness = std::clamp(s->value("fsr_sharpness", fsr_sharpness).toInt(), 0, 100);
+		if (s->contains("frame_generation")) KYTY_CFG_GET(frame_generation);
+		if (s->contains("low_latency")) KYTY_CFG_GET(low_latency);
+		fps_overlay    = s->value("fps_overlay", fps_overlay).toBool();
+		if (s->contains("pipeline_build")) KYTY_CFG_GET(pipeline_build);
+		streamline_dir = s->value("streamline_dir", streamline_dir).toString();
 #if defined(_WIN32)
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();

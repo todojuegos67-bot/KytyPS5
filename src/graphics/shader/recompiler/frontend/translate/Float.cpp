@@ -144,6 +144,10 @@ bool Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode 
 		args[index]        = type == IR::Type::F32 && mix ? IR::Value(ReadMixF32(operand))
 		                                                  : ReadOperand(operand, type);
 	}
+	// (Unfused only with TranslatorFeatureUnfusedMad: IR::Program::unfused_mad, read by the backend.)
+	if (opcode == IR::ValueOpcode::FPFma32 && inst.opcode != Decoder::Opcode::V_FMA_F32) {
+		opcode = IR::ValueOpcode::FPMad32;
+	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1], args[2]}));
 	return true;
 }

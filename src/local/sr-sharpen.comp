@@ -1,0 +1,59 @@
+#version 450
+// DLSS's image sharpened (KYTY_DLSS_SHARPNESS, renderSuperResolution.cpp; issue #224: the game's own TAA sharpens its
+// image, DLSS in its place does not): read from DLSS's own output (source) into the game's (target), with the game's
+// exposure as sr-exposure.comp applies it. The sharpening is RCAS, FSR 1's robust contrast adaptive sharpening: a cross
+// of five taps, the centre pushed away from its four neighbours as far as their range allows without clipping, less in
+// noise. RCAS is made for [0, 1]: each tap tone mapped c / (1 + max(c)) first and mapped back after, as FSR 3 does.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1) writeonly uniform image2D target;
+layout(set = 0, binding = 2, std430) readonly buffer Exposure {
+    float values[];
+} exposure;
+layout(push_constant) uniform Parameters {
+    uint  width;
+    uint  height;
+    uint  index;
+    float sharpness; // the lobe's scale: 2^(2 s - 2) for KYTY_DLSS_SHARPNESS s, as FSR 3 maps its sharpness
+} parameters;
+
+vec3 Tap(ivec2 p, float scale) {
+    p = clamp(p, ivec2(0), ivec2(int(parameters.width) - 1, int(parameters.height) - 1));
+    const vec3 c = max(texelFetch(source, p, 0).rgb * scale, vec3(0.0));
+    return c / (1.0 + max(c.r, max(c.g, c.b)));
+}
+
+float Luma2(vec3 c) {
+    return c.b * 0.5 + (c.r * 0.5 + c.g);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(parameters.width) || p.y >= int(parameters.height)) return;
+    float scale = exposure.values[parameters.index];
+    if (!(scale > 0.0 && scale < 65536.0)) scale = 1.0;
+    // The cross: b above, d left, e the pixel, f right, h below.
+    const vec3 b = Tap(p + ivec2(0, -1), scale);
+    const vec3 d = Tap(p + ivec2(-1, 0), scale);
+    const vec3 e = Tap(p, scale);
+    const vec3 f = Tap(p + ivec2(1, 0), scale);
+    const vec3 h = Tap(p + ivec2(0, 1), scale);
+    // Noise: the centre's luma against the ring's, over their range; sharpened half as much where it stands out alone.
+    const float bL = Luma2(b), dL = Luma2(d), eL = Luma2(e), fL = Luma2(f), hL = Luma2(h);
+    const float lumaRange = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);
+    float noise = clamp(abs(0.25 * (bL + dL + fL + hL) - eL) / max(lumaRange, 1.0e-5), 0.0, 1.0);
+    noise = -0.5 * noise + 1.0;
+    // The ring's per-channel minimum and maximum, and the most negative lobe that keeps the result within [0, 1].
+    const vec3 ringMin = min(min(b, d), min(f, h));
+    const vec3 ringMax = max(max(b, d), max(f, h));
+    const vec3 hitMin  = ringMin / max(4.0 * ringMax, vec3(1.0e-5));
+    const vec3 hitMax  = (1.0 - ringMax) / min(4.0 * ringMin - 4.0, vec3(-1.0e-5));
+    const vec3 lobes   = max(-hitMin, hitMax);
+    const float limit  = 0.25 - 1.0 / 16.0;
+    const float lobe   = max(-limit, min(max(lobes.r, max(lobes.g, lobes.b)), 0.0)) * parameters.sharpness * noise;
+    vec3 c = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+    // Back to the image's range.
+    c = clamp(c, vec3(0.0), vec3(0.999));
+    c = c / (1.0 - max(c.r, max(c.g, c.b)));
+    imageStore(target, p, vec4(c, 1.0));
+}

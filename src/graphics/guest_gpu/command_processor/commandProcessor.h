@@ -26,6 +26,16 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// Each buffer's commands through `rebase`, which gives another view of the same bytes back (KYTY_WRITE_GUARD). The
+	// guest view's address is kept: a position is the buffer's guest address and offset, whichever view reads it
+	// (SamePosition; 4 Nov wg6: compared by the view's pointer, a rebased in-order run missed its chunk's end).
+	template <typename F>
+	void RebaseCommands(F&& rebase) {
+		for (auto& cursor: m_buffer_stack) {
+			if (cursor.guest == nullptr) cursor.guest = cursor.commands.data();
+			cursor.commands = rebase(cursor.commands);
+		}
+	}
 
 private:
 	friend class CommandProcessor;
@@ -34,6 +44,8 @@ private:
 		std::span<const uint32_t> commands;
 		uint32_t                  offset_dw           = 0;
 		uint32_t                  deferred_advance_dw = 0;
+		const uint32_t*           guest               = nullptr; // the guest view's commands once rebased, else null
+		[[nodiscard]] const uint32_t* Position() const noexcept { return guest != nullptr ? guest : commands.data(); }
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
@@ -116,6 +128,9 @@ public:
 	[[nodiscard]] uint32_t TryNativeDirectDraw(std::span<const uint32_t> packet);
 	// A DRAW_INDEX_AUTO of a triangle list or strip as a table draw: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeAutoDraw(std::span<const uint32_t> packet);
+	// KYTY_SPEC_DRAW_INDIRECT (live spec_draw_indirect): a DRAW_INDIRECT (non-indexed) as a table draw, its arguments
+	// read on the GPU: the packet's dwords, or 0.
+	[[nodiscard]] uint32_t TryNativeIndirectAutoDraw(std::span<const uint32_t> packet);
 	// A DRAW_INDEX_INDIRECT_MULTI of a count it holds, as that many DRAW_INDEX_INDIRECT: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeMultiDraw(std::span<const uint32_t> packet);
 	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);
@@ -196,6 +211,7 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
+	void ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }

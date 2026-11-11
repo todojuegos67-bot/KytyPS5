@@ -12,10 +12,12 @@
 // on such a wait-before-signal, and the worker's own submission of that tick is one of them.
 // Without them the GPU thread records and submits.
 
+#include "anti-lag.h"
 #include "common/assert.h"
 #include "device-fault.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "live-trace.h"
 #include "graphics/host_gpu/graphicContext.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -25,6 +27,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <utility>
 
@@ -39,12 +42,14 @@ public:
 	};
 	// One copy's queue submission (plain data: it is copied into the recording stream).
 	struct SubmitPacket {
-		VkQueue         queue;
-		VkCommandBuffer command;
-		VkSemaphore     wait;
-		uint64_t        wait_value;
-		VkSemaphore     signal;
-		uint64_t        signal_value;
+		VkQueue                queue;
+		VkCommandBuffer        command;
+		VkSemaphore            wait;
+		uint64_t               wait_value;
+		VkSemaphore            signal;
+		uint64_t               signal_value;
+		std::atomic<uint64_t>* handed; // (the queue's: the last value its submissions handed to the driver)
+		Common::Mutex*         mutex;  // (GraphicContext::readback_queue_mutex)
 	};
 	template <typename Dispatch>
 	static void Submit(const SubmitPacket& packet, const Dispatch& dispatch) {
@@ -65,7 +70,13 @@ public:
 		submit.pCommandBuffers      = &packet.command;
 		submit.signalSemaphoreCount = 1;
 		submit.pSignalSemaphores    = &packet.signal;
-		Check(dispatch.vkQueueSubmit(packet.queue, 1, &submit, VK_NULL_HANDLE), "submit readback copy");
+		{
+			Common::LockGuard lock(*packet.mutex);
+			Check(Libs::Graphics::AntiLag::QueueSubmit(packet.queue, submit, dispatch.vkQueueSubmit, dispatch.vkQueueSubmit2),
+			      "submit readback copy");
+		}
+		packet.handed->store(packet.signal_value, std::memory_order_release);
+		LiveTrace::Event(LiveTrace::RbSubmit, packet.signal_value, 0);
 	}
 	// The copy's commands: an earlier copy on this queue may target the same download slot (a detached request).
 	template <typename Dispatch>
@@ -109,6 +120,14 @@ public:
 	}
 #endif
 
+	// The copies of final bytes recorded and submitted by the GPU thread (Copy): on a Steam Deck's GPU with RADV, where
+	// the guest waited less (1.48 -> 1.09 ms at 1-1); on an RTX 5090 they cost the render thread 0.4 ms a frame for no
+	// frame rate (the worker keeps up there). KYTY_READBACK_DIRECT=0/1 decides otherwise.
+	static bool DirectCopies(const Libs::Graphics::GraphicContext& graphics) {
+		const char* value = std::getenv("KYTY_READBACK_DIRECT");
+		return value != nullptr && *value != '\0' ? *value != '0' : graphics.steam_deck_radv;
+	}
+
 	explicit Queue(Libs::Graphics::GraphicContext& graphics)
 	    :
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -116,7 +135,8 @@ public:
 #else
 	      d(VULKAN_HPP_DEFAULT_DISPATCHER),
 #endif
-	      m_device(graphics.device), m_queue(graphics.readback_queue) {
+	      m_device(graphics.device), m_queue(graphics.readback_queue), m_queue_mutex(&graphics.readback_queue_mutex),
+	      m_direct_copies(DirectCopies(graphics)) {
 		VkCommandPoolCreateInfo pool {};
 		pool.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 		pool.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
@@ -146,19 +166,26 @@ public:
 
 	// GPU thread: copies `regions` to `destination` once `timeline` reaches `wait_value`.
 	// Returns the value this queue's timeline reaches when the bytes are available to the host.
+	// `wait_done`: the timeline is there already. Then, when the worker has handed all of this queue's earlier copies to
+	// the driver, this thread records and submits the copy (no wait-before-signal, nothing of the worker's in the pool):
+	// the guest reading final bytes does not wait for the worker to replay the graphics work queued ahead of the copy
+	// (~0.4 ms on a Steam Deck at 1-1). Only where DirectCopies.
 	uint64_t Copy(std::span<const Region> regions, VkBuffer destination, VkSemaphore timeline,
-	              uint64_t wait_value) {
+	              uint64_t wait_value, bool wait_done = false) {
 		const uint64_t value   = ++m_submitted;
 		const size_t   index   = value % Buffers;
 		const auto     command = m_commands[index];
 		if (m_used[index] != 0) Wait(m_used[index]);
 		m_used[index]  = value;
 		m_waits[index] = {timeline, wait_value};
-		const SubmitPacket packet {m_queue, command, timeline, wait_value, m_semaphore, value};
+		LiveTrace::Event(LiveTrace::RbEnqueue, value, wait_value);
+		const SubmitPacket packet {m_queue, command, timeline, wait_value, m_semaphore, value, &m_handed, m_queue_mutex};
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
+		const bool direct = wait_done && m_direct_copies && m_handed.load(std::memory_order_acquire) == value - 1;
+		if (direct) m_worker_records = false;
 		// With deferred submits the worker records the command buffer too: the driver calls leave the GPU thread
 		// (~1.3% of it at 1-1, ~50 readbacks a frame).
-		if (LocalVulkanRecording::DeferredSubmitEnabled() && regions.size() <= MaxDeferredRegions) {
+		if (!direct && LocalVulkanRecording::DeferredSubmitEnabled() && regions.size() <= MaxDeferredRegions) {
 			const CopyPacket copy {packet, destination, static_cast<uint32_t>(regions.size())};
 			const LocalVulkanRecording::Segment segments[] {{&copy, sizeof(copy)},
 			                                                {regions.data(), regions.size_bytes()}};
@@ -173,7 +200,7 @@ public:
 		Record(d, command, regions, destination);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		const LocalVulkanRecording::Segment segments[] {{&packet, sizeof(packet)}};
-		if (LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) return value;
+		if (!direct && LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) return value;
 #endif
 		Submit(packet, d);
 		return value;
@@ -240,12 +267,15 @@ private:
 	const vk::detail::DispatchLoaderDynamic& d;
 	VkDevice                                 m_device;
 	VkQueue                                  m_queue;
+	Common::Mutex*                           m_queue_mutex;
 	VkCommandPool                            m_pool      = VK_NULL_HANDLE;
 	VkSemaphore                              m_semaphore = VK_NULL_HANDLE;
 	std::array<VkCommandBuffer, Buffers>     m_commands {};
 	std::array<uint64_t, Buffers>            m_used {};
 	std::array<std::pair<VkSemaphore, uint64_t>, Buffers> m_waits {}; // each copy's graphics timeline wait (stall reports)
 	uint64_t                                 m_submitted = 0;
+	std::atomic<uint64_t>                    m_handed {0}; // the last copy handed to the driver (by either thread)
+	bool                                     m_direct_copies = false; // (DirectCopies)
 	bool                                     m_worker_records = false; // the worker may record into the pool
 	std::atomic<uint64_t>                    m_known {0};
 };

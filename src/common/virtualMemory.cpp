@@ -58,6 +58,22 @@ bool FlushInstructionCache(uint64_t address, uint64_t size) {
 	return SysVirtualFlushInstructionCache(address, size);
 }
 
+bool ProtectWriteWatch(uint64_t address, uint64_t size, Mode mode) {
+	return SysVirtualProtectWriteWatch(address, size, mode);
+}
+
+void WriteWatchMapped(uint64_t address, uint64_t size, Mode mode) {
+	SysVirtualWriteWatchMapped(address, size, mode);
+}
+
+void WriteWatchUnmapped(uint64_t address, uint64_t size) {
+	SysVirtualWriteWatchUnmapped(address, size);
+}
+
+void ZapNoAccess(bool on) {
+	SysVirtualZapNoAccess(on);
+}
+
 } // namespace VirtualMemory
 
 } // namespace Common

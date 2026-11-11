@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <vector>
 #include <functional>
 #include <memory>
 #include <span>
@@ -378,6 +379,19 @@ void OnSunCascadeDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt,
 // copies the cascade layers into our own array, with the matrices that drew them.
 void RtSunAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                         std::span<const TextureBinding> images);
+
+// (des-up-1110) Upstream's FSR frame generation backend (KYTY_FRAMEGEN_BACKEND=fsr) and its menu bars: the DeS port's
+// frame generation (DLSS-G, fsr3-fg.cpp) stays; these keep upstream's call sites compiling and do nothing.
+inline void AddInstanceExtensions(const std::vector<vk::ExtensionProperties>& /*available*/,
+                                  std::vector<const char*>& /*extensions*/) {}
+[[nodiscard]] inline bool     FsrMarksHud() { return false; }
+[[nodiscard]] inline uint64_t VideoMemoryReserve() { return 0; }
+inline void                   WindowChanging(bool /*changing*/) {}
+inline void                   NoteUiCanvas(uint64_t /*address*/) {}
+inline void                   NoteMenu() {}
+inline void                   NoteCentred() {}
+[[nodiscard]] inline bool     TakeMenu() { return false; }
+[[nodiscard]] inline bool     MenuNoted() { return false; }
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

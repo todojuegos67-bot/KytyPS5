@@ -51,8 +51,8 @@ public:
 	// Only the overlay's content changed (not merely shown).
 	[[nodiscard]] bool           SystemOverlayChanged() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
-	// KYTY_FLIP_RATE caps the frame's flip. With frame generation only frames carrying its inputs
-	// are capped (the game's 3D view): movies and menus keep a flip per vblank.
+	// KYTY_FLIP_RATE caps the frame's flip: frames of the game's 3D view only (IsSceneFrame; with frame generation, the
+	// frames carrying its inputs), movies and menus keep a flip per vblank.
 	[[nodiscard]] static bool FlipRateApplies(const Frame& frame) noexcept;
 	// A frame of the game's 3D view (its TAA pass was seen: gameplay or an in-engine scene), not a menu, load or movie.
 	[[nodiscard]] static bool IsGameView(const Frame& frame) noexcept;

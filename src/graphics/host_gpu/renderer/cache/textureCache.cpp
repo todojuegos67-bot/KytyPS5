@@ -5,12 +5,15 @@
 #include <thread>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "slow-log.h"
+#include "live-switch.h"
+#include "mode-toggle.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -53,18 +56,15 @@
 #include "soft-release.h"
 #include "ram-guard.h"
 
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {0};
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {0};
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_texture_resolve_pages_mode {0};
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_image_dirty_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_window_handoff_mode {1};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_image_granules_mode {2};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_texture_resolve_pages_mode {1};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_image_dirty_mode {1};
 // 1: a partial refresh uploads only the rows of tile blocks over the dirty ranges of a large
 // subresource, not the whole subresource (UploadImagePartial).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode {1};
 // 0: a sampled view refreshes the whole texture, not only its levels (RefreshTextureLevels; on by default, 0 for an A/B).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_texture_levels_mode {1};
-// 0: an image GPU buffer writes covered parts of is uploaded whole, not only the subresources over them (InitializeImage;
-// on by default, 0 for an A/B).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_ranges_mode {1};
 // 0: a compute fill over images it does not match runs as the dispatch, and the images are uploaded after it, not cleared
 // (TryConsumeComputeImageClear, InitializeImage; on by default, 0 for an A/B; KYTY_FILL_CLEAR=0 from the start).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_fill_clear_mode {[] {
@@ -100,9 +100,9 @@ constexpr uint64_t PartialDirtyCandidateSize = 2 * PartialDirtyGranule;
 constexpr uint64_t PartialUploadMaxShare = 2;
 // Staged runs of picked subresources closer than this are staged as one run.
 constexpr uint64_t PartialStageGap = uint64_t {64} << 10;
-// UploadImageChunked: images from this size whose bytes no cached buffer holds whole, uploaded this much of guest
-// memory at a time.
-constexpr uint64_t ChunkedUploadMin   = uint64_t {256} << 20;
+// UploadImageChunked: images from this size (or half the staging ring, where that is less: an image past it would take
+// a buffer of its own size) whose bytes no cached buffer holds whole, uploaded this much of guest memory at a time.
+constexpr uint64_t ChunkedUploadMax   = uint64_t {256} << 20;
 constexpr uint64_t ChunkedUploadPiece = uint64_t {64} << 20;
 
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, vk::Format format,
@@ -375,13 +375,18 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// below it a kept image costs nothing, a deleted one an upload when the game uses it again.
 	m_trigger_gc_memory       = m_graphics.GetTotalMemoryBudget();
 	m_start_trigger_gc_memory = m_trigger_gc_memory;
-#if defined(_WIN32)
-	if (TextureOffload::Enabled()) {
+#if KYTY_TEXTURE_OFFLOAD_SUPPORTED
+	if (TextureOffload::AnyEnabled()) {
 		const bool offload = TextureOffload::GetMode() == TextureOffload::Mode::Offload;
 		g_offload_cache    = this;
 		g_offload_alive.store(true, std::memory_order_release);
 		auto& state = TextureOffload::Get();
-		state.remove.store(+[](uint64_t vaddr, uint64_t size) { g_offload_cache->m_page_manager.UpdateReadWatchers<false>(vaddr, size); });
+		// (Every page then gets the protection the page manager has for it: the touch let reads
+		// through (TouchLocked), and a page other read watchers hold (the GPU wrote it) keeps its
+		// no access without a change the hold's end would make.)
+		state.remove.store(+[](uint64_t vaddr, uint64_t size) {
+			g_offload_cache->m_page_manager.UpdateReadWatchers<false, true>(vaddr, size);
+		});
 		if (offload) {
 			// A restore on the render thread; from a game thread through it (as a guest readback: BufferCache::ReadMemory).
 			state.restore.store(+[](uint64_t vaddr, uint64_t size, TextureOffload::Touch touch) {
@@ -401,33 +406,36 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 					return false;
 				return GuestGpu::IsGpuThread() || LibKernel::PthreadSelfOrNull() != nullptr;
 			});
+			// (A host write's wait for the asynchronous restores under it, on the render thread:
+			// their downloads go first.)
+			state.submit.store(+[] {
+				auto* cache = g_offload_cache;
+				if (cache == nullptr || !g_offload_alive.load(std::memory_order_acquire) ||
+				    !GuestGpu::IsGpuThread() || CommandScheduler::InDeferredOperation() ||
+				    !cache->m_offload_unsubmitted)
+					return;
+				cache->m_offload_unsubmitted = false;
+				cache->m_scheduler.Flush();
+			});
 		}
 		Common::HostException::SetProbeHandler(TextureOffload::OnFault);
-		std::printf(offload ? "Texture offload: on (the guest bytes of clean sampled textures of 256 KiB or more dropped from RAM "
-		                      "after 2 s clean and a download that gives them back exactly; KYTY_TEXTURE_OFFLOAD=0 keeps them)\n"
-		                    : "Texture offload probe: on (clean sampled textures of 256 KiB or more made inaccessible after 2 s "
-		                      "clean; nothing discarded)\n");
+		if (FileOffload::Enabled()) {
+			std::printf(FileOffload::GetMode() == FileOffload::Mode::Offload
+			                ? "File offload: on (APR-read guest pages still equal to their files "
+			                  "dropped from RAM, read back from the files when touched)\n"
+			                : "File offload probe: on (APR-read guest pages still equal to their "
+			                  "files made inaccessible; touches counted, nothing dropped)\n");
+		}
+		if (TextureOffload::Enabled()) {
+			std::printf(offload ? "Texture offload: on (the guest bytes of clean sampled textures "
+			                      "of 256 KiB or more dropped from RAM after 2 s clean and a "
+			                      "download that gives them back exactly; KYTY_TEXTURE_OFFLOAD=0 "
+			                      "keeps them)\n"
+			                    : "Texture offload probe: on (clean sampled textures of 256 KiB or "
+			                      "more made inaccessible after 2 s clean; nothing discarded)\n");
+		}
 	}
 #endif
-}
-
-void KytyTextureGcThresholds(uint64_t total_budget, uint64_t& trigger, uint64_t& pressure, uint64_t& critical) {
-	constexpr int64_t GiB       = 1024ll * 1024 * 1024;
-	const auto        budget    = static_cast<int64_t>(std::min<uint64_t>(total_budget, INT64_MAX));
-	const auto        threshold = std::min<int64_t>(budget, 8 * GiB);
-	pressure =
-	    static_cast<uint64_t>(std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-	critical =
-	    static_cast<uint64_t>(std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-	trigger = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
-}
-
-bool KytyGcLiveBudget() {
-	static const bool enabled = [] {
-		const char* env = std::getenv("KYTY_GC_LIVE_BUDGET");
-		return env != nullptr && std::atoi(env) != 0;
-	}();
-	return enabled;
 }
 
 uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics) {
@@ -528,6 +536,15 @@ bool TextureCache::SafeToDownload(const Image& image) {
 // Collector runs (flips) before memory an image could not be made for is asked for again.
 constexpr uint64_t FailedRetryTicks = 30;
 
+// The collectors count ages in time (m_tick_clock), not flips: at -Fps120 the 600 and 1200 flips they were came in 5
+// and 10 s (issue #221: an RTX 4080 SUPER at its video memory budget lost the textures a 5 s menu kept from being drawn
+// and made ~1.3 GB of them again as it closed, frames of 1.2-4.8 s), and flips scaled by the vblank rate were 4 times
+// as long with a 240 Hz vblank and the game at 45-60 fps (issue #215). Never an image used in the last MinIdleTicks
+// flips (a long frame is no idle time).
+constexpr auto     StaleTime    = std::chrono::seconds(10);
+constexpr auto     RetireTime   = std::chrono::seconds(20);
+constexpr uint64_t MinIdleTicks = 120;
+
 // KYTY_TEST_RECLAIM=<n>: the first n images that must exist, of 1 MiB and more, asked for from the 600th flip on, are
 // taken as not made once (ReclaimImageMemory, then made again); KYTY_TEST_RECLAIM_ROUNDS=2: twice (the second round's
 // downloads too).
@@ -592,6 +609,10 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
 		m_failed_tick = m_gc_tick + 1;
 		return {};
 	}
+	// (A slot reused goes on counting: what held the one before sees its sum move.)
+	m_slot_images[id].serial_slot = id.index;
+	ImageSerials::Ensure(id.index);
+	ImageSerials::Move(id.index);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -605,14 +626,14 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
 // (The collector frees images unused for 30 flips at the earliest, and a mode switch needs the room in the flip it makes
 // its targets. A table set touches its images at least every 8 flips: TableImageSet::TouchTicks.)
 size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
-	constexpr uint64_t UnusedTicks = 16;
+	constexpr uint64_t UnusedTicks  = 16;
 	// (A speculation's recorder cannot wait for the GPU: the GPU thread translates that work again.)
 	if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"ReclaimImageMemory"};
-	const auto           start        = std::chrono::steady_clock::now();
-	const uint64_t       goal         = all ? UINT64_MAX : std::max(bytes * 2, uint64_t {256} << 20u);
-	const uint64_t       download_max = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2;
-	uint64_t             freed = 0, written_bytes = 0;
-	size_t               written = 0;
+	const auto         start        = std::chrono::steady_clock::now();
+	const uint64_t     goal         = all ? UINT64_MAX : std::max(bytes * 2, uint64_t {256} << 20u);
+	const uint64_t     download_max = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2;
+	uint64_t           freed = 0, written_bytes = 0;
+	size_t             written = 0;
 	std::vector<ImageId> victims;
 	// (KYTY_CUBE_SHADOW_FIX: a shadow pool's parked twin goes first; the next switch makes it again.)
 	std::vector<ImageId> twins;
@@ -650,25 +671,35 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 	});
 	std::erase_if(victims, [&](ImageId id) { return !DetachImage(id); });
 	for (const auto id: twins) victims.push_back(id); // (parked: already out of every index)
+	size_t   held       = 0;
+	uint64_t held_bytes = 0;
 	if (!victims.empty()) {
 		m_scheduler.Wait(m_scheduler.CurrentTick());
 		// (Destroyed now, not after RetireImage's operation: the GPU is done with them.)
 		const auto packet = Spec::PacketNow();
 		for (const auto id: victims) m_retired.emplace_back(id, packet);
 		EraseRetired();
-		LiveCounters::Add(LiveCounters::GcImageDeletes, victims.size());
+		// (KYTY_SPECULATE=4: one a speculation's packet may still read stays retired until the packet passed, and its room
+		// with it: not counted as freed. The caller's retries erase it then, InsertImage.)
+		for (const auto id: victims)
+			if (const auto* image = m_slot_images.try_get(id); image != nullptr) {
+				++held;
+				held_bytes += image->AccountedSize();
+			}
+		LiveCounters::Add(LiveCounters::GcImageDeletes, victims.size() - held);
 	}
 	static std::atomic<uint32_t> reports {0};
 	if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
 		std::printf("Texture cache: no memory for a %llu MiB image, %zu images unused for %llu flips freed (%llu MiB; %zu "
-		            "of them the GPU wrote, %llu MiB) in %.1f ms\n",
-		            static_cast<unsigned long long>(bytes >> 20u), victims.size(),
-		            static_cast<unsigned long long>(UnusedTicks), static_cast<unsigned long long>(freed >> 20u), written,
-		            static_cast<unsigned long long>(written_bytes >> 20u),
+		            "of them the GPU wrote, %llu MiB; %zu more retired, %llu MiB, held by a speculation's packet) in %.1f ms\n",
+		            static_cast<unsigned long long>(bytes >> 20u), victims.size() - held,
+		            static_cast<unsigned long long>(UnusedTicks), static_cast<unsigned long long>((freed - held_bytes) >> 20u),
+		            written, static_cast<unsigned long long>(written_bytes >> 20u), held,
+		            static_cast<unsigned long long>(held_bytes >> 20u),
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 		std::fflush(stdout);
 	}
-	return victims.size();
+	return victims.size() - held;
 }
 
 bool TextureCache::RecentlyFailed(const ImageInfo& info) const {
@@ -687,6 +718,12 @@ void TextureCache::StampRegistrationPages(const Image& image, uint64_t epoch) {
 }
 
 bool TextureCache::RegistrationsOverlapSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) const {
+	// (A speculation's thread holds m_lock for the read: the GPU thread's registrations erase from the log and
+	// append to it under m_lock, which moves or frees its storage; a worker read it unlocked and faulted (8 Nov). The
+	// GPU thread, the log's only other user, reads it as before. Not m_lock.ReadShared: its first try reads unlocked.)
+	auto&                              guard = const_cast<TrackingSpinLock&>(m_lock);
+	std::unique_lock<TrackingSpinLock> lock(guard, std::defer_lock);
+	if (Spec::Current() != nullptr && !guard.OwnedByCurrentThread()) lock.lock();
 	const auto& log = m_registration_log;
 	known           = log.empty() || log.front().epoch <= epoch + 1;
 	if (!known) return true;
@@ -713,12 +750,66 @@ bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t 
 	return false;
 }
 
+void TextureCache::MoveRegistrationSerials(const Image& image) {
+	if (!ImageSerials::g_on.load(std::memory_order_relaxed)) return; // (KYTY_TABLE_SERIALS off: no serial moves)
+	ImageSerials::Move(image.serial_slot);
+	for (const auto other: FindImagesInRegion(image.info.data.address, image.info.data.size, true))
+		if (const auto* found = m_slot_images.try_get(other)) ImageSerials::Move(found->serial_slot);
+}
+
+void TextureCache::MoveMeta(uint64_t begin, uint64_t end) {
+	if (ImageSerials::g_on.load(std::memory_order_relaxed)) {
+		const std::lock_guard lock(m_meta_slots_lock);
+		for (auto it = m_meta_slots.lower_bound(begin); it != m_meta_slots.end() && it->first < end; ++it)
+			ImageSerials::Move(it->second);
+	}
+	m_meta_epoch.fetch_add(1, std::memory_order_release);
+}
+
+void TextureCache::NoteMetaUse(uint64_t address, uint32_t slot) {
+	if (address == 0 || slot == UINT32_MAX) return;
+	const std::lock_guard lock(m_meta_slots_lock);
+	for (auto [it, end] = m_meta_slots.equal_range(address); it != end; ++it)
+		if (it->second == slot) return;
+	m_meta_slots.emplace(address, slot);
+	m_meta_by_slot[slot].push_back(address);
+}
+
+void TextureCache::NoteMetaSlot(const Image& image, bool add) {
+	const auto address = image.info.metadata.range.address;
+	if (image.info.metadata.kind == ImageMetadataKind::None || address == 0) return;
+	if (add) return NoteMetaUse(address, image.serial_slot); // (A parked image taken back holds its entry already.)
+	const std::lock_guard lock(m_meta_slots_lock);
+	for (auto [it, end] = m_meta_slots.equal_range(address); it != end; ++it)
+		if (it->second == image.serial_slot) {
+			m_meta_slots.erase(it);
+			if (const auto found = m_meta_by_slot.find(image.serial_slot); found != m_meta_by_slot.end()) {
+				if (const auto at = std::ranges::find(found->second, address); at != found->second.end()) found->second.erase(at);
+			}
+			return;
+		}
+}
+
+// KYTY_TABLE_SERIALS: every metadata entry of a slot whose image is gone (its own, NoteMetaSlot, and each view's a table
+// draw noted, NoteMetaUse): none would move the serial of an image there, and a new image in the slot notes its own. Not
+// at an unregistration: a parked image comes back (TakeParkedImage) to the sets that hold it, which note no view again.
+void TextureCache::ForgetMetaSlot(uint32_t slot) {
+	const std::lock_guard lock(m_meta_slots_lock);
+	const auto            found = m_meta_by_slot.find(slot);
+	if (found == m_meta_by_slot.end()) return;
+	for (const auto address: found->second)
+		for (auto [it, end] = m_meta_slots.equal_range(address); it != end;) it = it->second == slot ? m_meta_slots.erase(it) : std::next(it);
+	m_meta_by_slot.erase(found);
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
 	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
+	MoveRegistrationSerials(image); // (KYTY_TABLE_SERIALS)
+	NoteMetaSlot(image, true);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
@@ -754,6 +845,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		                 true);
 	}
 	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
+	MoveRegistrationSerials(image); // (KYTY_TABLE_SERIALS)
 	++m_image_granule_releases;
 	UntrackImage(id, "unregister");
 	ImagePageTable::PageRange pages {};
@@ -824,8 +916,9 @@ bool TextureCache::DetachImage(ImageId id) {
 		     (image->info.metadata.kind == ImageMetadataKind::Htile &&
 		      metadata->second.type == MetaDataInfo::Type::HTile))) {
 			// A later binding may have reused this address for another metadata type.
+			const auto meta_address = metadata->first;
 			m_surface_metas.erase(metadata);
-			m_meta_epoch.fetch_add(1, std::memory_order_release);
+			MoveMeta(meta_address);
 		}
 	}
 	UnregisterImage(id);
@@ -2424,10 +2517,6 @@ void TextureCache::InitializeImage(ImageId id) {
 		// A refill first: no GPU work at all, where a partial upload records some (and would end the refills: its
 		// copies come after the whole upload's, which a refill would then overwrite with older bytes).
 		bool uploaded = RefillUpload(image);
-		if (uploaded && kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
-		    PartialDirtyCandidate(image)) {
-			UpdatePartialHashes(image, true);
-		}
 		if (!uploaded && image.IsPartiallyCpuDirty() && !image.IsBufferModified()) {
 			g_partial_fail = "";
 			uploaded = UploadImagePartial(image);
@@ -2472,8 +2561,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		// buffers holding them. At Boletaria every frame a compute shader writes two 15 MiB buffers in memory shared with
 		// render targets - a 1440p R32 array, 720p RGBA16F ones - and each of them was uploaded whole again: 105 MiB of
 		// detiles a frame for 30 MiB written (10-13).
-		if (!uploaded && image.IsBufferModified() && !image.IsCpuDirty() && !image.BufferModifiedRanges().empty() &&
-		    kyty_local_buffer_ranges_mode.load(std::memory_order_relaxed) != 0) {
+		if (!uploaded && image.IsBufferModified() && !image.IsCpuDirty() && !image.BufferModifiedRanges().empty()) {
 			const auto ranges = image.BufferModifiedRanges();
 			uploaded          = UploadImageChunked(image, &ranges);
 			if (uploaded) image.staged_ring = nullptr;
@@ -2486,23 +2574,18 @@ void TextureCache::InitializeImage(ImageId id) {
 		// again and again (an 8 GB laptop's GPU faults in the culling chain came 3 times in 4 tours with that, 10-18).
 		if (!uploaded && image.IsPartiallyCpuDirty() && !image.IsMaybeCpuDirty() &&
 		    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 1 &&
-		    (!image.IsBufferModified() || (!image.BufferModifiedRanges().empty() &&
-		                                   kyty_local_buffer_ranges_mode.load(std::memory_order_relaxed) != 0))) {
+		    (!image.IsBufferModified() || !image.BufferModifiedRanges().empty())) {
 			auto ranges = image.CpuDirtyRanges();
 			if (image.IsBufferModified()) {
 				for (const auto& [begin, end]: image.BufferModifiedRanges()) Image::AddRange(ranges, begin, end);
 			}
-			uploaded = image.info.data.size >= ChunkedUploadMin ? UploadImageChunked(image, &ranges)
-			                                                    : UploadImageSubresources(image, ranges);
+			uploaded = image.info.data.size >= ChunkedUploadMin() ? UploadImageChunked(image, &ranges)
+			                                                      : UploadImageSubresources(image, ranges);
 			if (uploaded) image.staged_ring = nullptr;
 		}
 		if (!uploaded && UploadImageChunked(image)) {
 			uploaded            = true;
 			image.staged_ring   = nullptr;
-			if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
-			    PartialDirtyCandidate(image)) {
-				UpdatePartialHashes(image, true);
-			}
 		}
 		if (!uploaded) {
 			DepthArrayEvent("whole upload", image, image.info.data.address, image.info.data.size, kind);
@@ -2535,10 +2618,6 @@ void TextureCache::InitializeImage(ImageId id) {
 			image.staged_ring   = refillable ? source : nullptr;
 			image.staged_offset = source_offset;
 			image.staged_serial = m_scheduler.CommandSerial();
-			if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
-			    PartialDirtyCandidate(image)) {
-				UpdatePartialHashes(image, true);
-			}
 		}
 		image.ClearBufferModified();
 	}
@@ -2962,11 +3041,15 @@ bool TextureCache::UploadImageSubresources(Image& image, const std::vector<std::
 // buffer: one each lived until the submission completed, as much again. (An image a cached buffer holds whole too: its
 // pieces copy from that buffer, where its whole detile asked for a scratch buffer of the image's size - a user's 8 GB
 // GPU had neither the video nor the system memory for one of 2 GiB, and the emulator exited, 10-13.)
+uint64_t TextureCache::ChunkedUploadMin() const {
+	return std::min(ChunkedUploadMax, std::max(m_buffer_cache.StagingSize() / 2, ChunkedUploadPiece));
+}
+
 bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>* only) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
-	if (binding == BindingType::DepthTarget || (only == nullptr && info.data.size < ChunkedUploadMin) ||
+	if (binding == BindingType::DepthTarget || (only == nullptr && info.data.size < ChunkedUploadMin()) ||
 	    info.IsVolume() || base % 256 != 0) {
 		return false;
 	}
@@ -2993,7 +3076,24 @@ bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<
 	}
 	std::sort(order.begin(), order.end(),
 	          [&](size_t left, size_t right) { return plan.tiles[left].tiled_offset < plan.tiles[right].tiled_offset; });
-	const auto                       start = std::chrono::steady_clock::now();
+	// A whole upload's tiles over no mapped guest memory: zeros, what their staged copy reads (ReadMappedOrZero),
+	// written on the GPU instead of staged, detiled and copied. Texture pools' released layers were most of their bytes
+	// at Stonefang 2-1's entry (10-23: 202 of 352 MiB and 167 of 256 MiB; a 1.47 GB pool's upload made a 780 ms
+	// frame with an 8 GB video memory budget, 234 ms with 32 GB).
+	std::vector<bool> unmapped;
+	if (only == nullptr) {
+		RangeSet mapped;
+		m_buffer_cache.MappedRanges(base, info.data.size, mapped);
+		unmapped.resize(plan.tiles.size());
+		// (Not over GPU-written bytes: their upload reads the buffer the GPU wrote, ObtainBufferForImage's "gpu" path.)
+		for (size_t index = 0; index < plan.tiles.size(); index++) {
+			const auto& tile = plan.tiles[index];
+			unmapped[index]  = !mapped.Intersects(base + tile.tiled_offset, tile.tiled_size) &&
+			                  !m_buffer_cache.IsRegionGpuModified(base + tile.tiled_offset, tile.tiled_size);
+		}
+	}
+	const auto skipped = [&](size_t index) { return !unmapped.empty() && unmapped[index]; };
+	const auto start   = std::chrono::steady_clock::now();
 	std::vector<GpuTileInfo>         tiles;
 	std::vector<vk::BufferImageCopy> regions;
 	uint64_t                         pieces     = 0;
@@ -3003,7 +3103,7 @@ bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<
 		const auto& first   = plan.tiles[order[at]];
 		uint64_t    begin   = base + first.tiled_offset;
 		uint64_t    end     = begin + first.tiled_size;
-		if (!selected(begin, end)) {
+		if (!selected(begin, end) || skipped(order[at])) {
 			at++;
 			continue;
 		}
@@ -3014,7 +3114,7 @@ bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<
 			const uint64_t tile_begin = base + tile.tiled_offset;
 			const uint64_t tile_end   = tile_begin + tile.tiled_size;
 			if (std::max(end, tile_end) - begin > ChunkedUploadPiece || !selected(tile_begin, tile_end) ||
-			    m_buffer_cache.IsRegionGpuModified(tile_begin, tile.tiled_size)) {
+			    skipped(order[next]) || m_buffer_cache.IsRegionGpuModified(tile_begin, tile.tiled_size)) {
 				break;
 			}
 			end = std::max(end, tile_end);
@@ -3051,6 +3151,27 @@ bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<
 		uploaded += end - begin;
 		at = next;
 	}
+	uint64_t zero_bytes = 0;
+	if (!unmapped.empty()) {
+		uint64_t zero_size = 0;
+		regions.clear();
+		for (size_t index = 0; index < plan.tiles.size(); index++) {
+			if (!unmapped[index]) continue;
+			auto region = plan.regions[index];
+			region.bufferOffset -= plan.tiles[index].linear_offset; // (into one tile's zeros: they all read the same)
+			regions.push_back(region);
+			zero_size = std::max(zero_size, plan.tiles[index].linear_size);
+			zero_bytes += plan.tiles[index].tiled_size;
+		}
+		if (!regions.empty()) {
+			const auto zeros = m_tiler.GetScratchBuffer(zero_size);
+			m_scheduler.EndRendering();
+			m_scheduler.Current().Handle().fillBuffer(zeros.buffer, zeros.offset, zeros.size, 0);
+			for (auto& region: regions) region.bufferOffset += zeros.offset;
+			image.Upload(regions, zeros.buffer, zeros.offset, zeros.size); // (its barrier waits for the fill)
+			LiveCounters::Add(LiveCounters::UnmappedUploadBytes, zero_bytes);
+		}
+	}
 	if (only != nullptr) {
 		LiveCounters::Add(LiveCounters::PartialUploads);
 		LiveCounters::Add(LiveCounters::PartialUploadBytes, uploaded);
@@ -3072,10 +3193,10 @@ bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<
 	static std::atomic<uint32_t> reports {0};
 	if (reports.fetch_add(1, std::memory_order_relaxed) < 64) {
 		std::printf("TextureCache: chunked upload addr=0x%llx size=0x%llx layers=%u levels=%u: %llu pieces (%llu with "
-		            "GPU-written bytes) in %.1f ms\n",
+		            "GPU-written bytes), %llu MiB over unmapped memory as zeros, in %.1f ms\n",
 		            static_cast<unsigned long long>(base), static_cast<unsigned long long>(info.data.size),
 		            info.resources.layers, info.resources.levels, static_cast<unsigned long long>(pieces),
-		            static_cast<unsigned long long>(gpu_pieces),
+		            static_cast<unsigned long long>(gpu_pieces), static_cast<unsigned long long>(zero_bytes >> 20u),
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 	}
 	return true;
@@ -3101,10 +3222,6 @@ bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint6
 	if (!plan.valid || plan.swap_bgra16 || plan.tiles.empty() ||
 	    plan.tiles.size() != plan.regions.size()) {
 		return PartialFail("plan");
-	}
-	if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
-	    !CheckPartialHashes(image)) {
-		return PartialFail("hashes");
 	}
 	// The subresources over the dirty ranges (region i is the copy of tile i), or the rows of
 	// blocks over them (KYTY_PARTIAL_ROW_BANDS).
@@ -3235,9 +3352,6 @@ bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint6
 	LiveCounters::Add(LiveCounters::PartialUploads);
 	LiveCounters::Add(LiveCounters::PartialUploadBytes, total);
 	LogPartialUpload(image, pieces.size(), total);
-	if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2) {
-		UpdatePartialHashes(image, false);
-	}
 	return true;
 }
 
@@ -3248,7 +3362,10 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	auto&      image       = m_slot_images[id];
 	bool       changed     = !(image.info.metadata == desc.info.metadata);
 	if (changed) ++image.validity;
+	if (changed && image.registered) NoteMetaSlot(image, false);
 	image.info.metadata    = desc.info.metadata;
+	if (changed && image.registered) NoteMetaSlot(image, true);
+	if (changed) ImageSerials::Move(image.serial_slot);
 	auto [entry, inserted] = m_surface_metas.try_emplace(
 	    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::Dcc});
 	MetaFilterAdd(desc.info.metadata.range.address);
@@ -3261,7 +3378,7 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: image reuses non-DCC metadata\n");
 	}
 	// (Only when the record changed: every DCC target acquisition passes here.)
-	if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
+	if (changed) MoveMeta(desc.info.metadata.range.address);
 	if (metadata.clear_mask == 0 || image.info.resources.levels != 1 ||
 	    desc.info.metadata.range.size == 0 || metadata.fill_size < desc.info.metadata.range.size) {
 		return;
@@ -3942,6 +4059,34 @@ bool TextureCache::NewImageStartsSince(uint64_t epoch, std::vector<std::pair<uin
 	return true;
 }
 
+ImageId TextureCache::FindImageAt(uint64_t address, uint32_t width, uint32_t height, vk::Format format, uint32_t* count) {
+	if (count != nullptr) *count = 0;
+	if (!GuestRange {address, 1}.Valid()) {
+		return {};
+	}
+	std::scoped_lock lock {m_lock};
+	if (!MayStartAt(address) || !m_image_starts.contains(address)) {
+		return {};
+	}
+	ImageId  selected {};
+	uint64_t last = 0;
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || image->info.data.address != address) continue;
+		if (count != nullptr) ++*count;
+		if (image->backing.image == nullptr || image->backing.extent.width != width ||
+		    image->backing.extent.height != height ||
+		    (format != vk::Format::eUndefined && image->backing.format != format)) {
+			continue;
+		}
+		if (!selected || image->frame_accessed_last >= last) {
+			selected = id;
+			last     = image->frame_accessed_last;
+		}
+	}
+	return selected;
+}
+
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
@@ -4088,7 +4233,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		// acquisition passes here.
 		bool changed        = !(image.info.metadata == desc.info.metadata);
 		if (changed) ++image.validity;
+		if (changed && image.registered) NoteMetaSlot(image, false);
 		image.info.metadata = desc.info.metadata;
+		if (changed && image.registered) NoteMetaSlot(image, true);
+		if (changed) ImageSerials::Move(image.serial_slot);
 		auto [metadata, inserted] =
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address,
 		                                MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
@@ -4102,7 +4250,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 			                    .clear_mask = image.info.htile_clear_mask};
 			changed          = true;
 		}
-		if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
+		if (changed) MoveMeta(desc.info.metadata.range.address);
 	}
 	CommitGpuWrite(image, scoped);
 	NoteDepthLayersRendered(image, desc.view_info.base_layer, desc.view_info.layer_count);
@@ -4280,6 +4428,11 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	// (KYTY_SLOW_LOG_MS: the time under the lock, which the render thread waits for.)
+	SlowLog::Scope slow([&](double ms) {
+		std::printf("SLOW TextureCache::InvalidateMemory %.1f ms under its lock addr=0x%llx size=0x%llx\n", ms,
+		            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+	});
 	ReleaseDownloadPages(address, size);
 	InvalidateCpuAliases(address, size);
 }
@@ -4517,6 +4670,7 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 			const auto begin     = std::max(run_begin, range.address);
 			const auto end       = std::min(run_end, range.address + range.size);
 			LibKernel::Memory::WriteBacking(begin, mapped + (begin - range.address), end - begin, "image");
+			if (Scout::Running()) Scout::NoteHostWrite(begin, end - begin, true);
 			m_page_manager.UpdatePageWatchers<false>(run_begin, run_end - run_begin);
 			first = last;
 		}
@@ -4557,7 +4711,7 @@ std::unique_ptr<Buffer> TextureCache::StageOffloadDownloads(std::vector<std::pai
 // a row (GPU work never wrote it, no CPU write since its upload, tracked whole) has its whole pages probed, or dropped
 // once a download of it gave its guest bytes back exactly (checked here first, 16 MiB of images a scan by default).
 void TextureCache::OffloadScan(uint64_t tick) {
-#if defined(_WIN32)
+#if KYTY_TEXTURE_OFFLOAD_SUPPORTED
 	const bool offload = TextureOffload::GetMode() == TextureOffload::Mode::Offload;
 	TextureOffload::Drain();
 	TextureOffload::Report(false);
@@ -4578,6 +4732,10 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		m_scheduler.Flush();
 	}
 	if (tick % 120 != 0) return;
+#if KYTY_FILE_OFFLOAD_SUPPORTED
+	if (FileOffload::Enabled()) OffloadFiles();
+#endif
+	if (!TextureOffload::Enabled()) return;
 	// (Diagnostics: where a scan's time goes, printed when it took 10 ms or more.)
 	using Clock          = std::chrono::steady_clock;
 	const auto scan_start = Clock::now();
@@ -4678,30 +4836,37 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		auto mark = Clock::now();
 		if (offload) AsyncUpload::DrainRange(begin, end - begin);
 		ms[1] += since(mark);
-		TextureOffload::Add(begin, end - begin, pieces, image.serial, (static_cast<uint64_t>(id.generation) << 32u) | id.index,
-		                    offload);
 		mark = Clock::now();
-		m_page_manager.UpdateReadWatchers<true>(begin, end - begin);
+		TextureOffload::Add(begin, end - begin, pieces, image.serial,
+		                    (static_cast<uint64_t>(id.generation) << 32u) | id.index, offload, [&] {
+			                    m_page_manager.UpdateReadWatchers<true>(begin, end - begin);
+			                    // (Its no access now, not with this thread's other deferred
+			                    // ones: TextureOffload::Add.)
+			                    PageManager::FlushDeferredProtection(begin, end - begin);
+		                    });
 		ms[2] += since(mark);
 		if (offload) {
 			discards.emplace_back(begin, end - begin);
 			continue;
 		}
 		mark = Clock::now();
-		for (const auto& piece: pieces) (void)TextureOffload::Protect(piece.backing, piece.size, PAGE_NOACCESS);
+		for (const auto& piece: pieces)
+			(void)TextureOffload::Protect(piece.backing, piece.size, TextureOffload::Access::None);
 		ms[4] += since(mark);
 	}
 	// The pages dropped by the worker thread (DiscardVirtualMemory took 10-90 ms of the render thread a scan): until then
 	// they hold their bytes, and a restore meanwhile has nothing to wait for.
 	if (!discards.empty()) {
 		OffloadWorker::Post([discards = std::move(discards)] {
-			// (KYTY_TEXTURE_OFFLOAD_TRIM=0: the guest view's pages left to Windows.)
+			// (Windows, KYTY_TEXTURE_OFFLOAD_TRIM=0: the guest view's pages left to Windows. Linux:
+			// the hole freed them.)
 			static const bool trim = [] {
 				const char* value = std::getenv("KYTY_TEXTURE_OFFLOAD_TRIM");
 				return value == nullptr || value[0] != '0';
 			}();
 			for (const auto& [begin, size]: discards)
-				if (TextureOffload::DiscardRange(begin) && trim) Libs::LibKernel::Memory::TrimGuestRange(begin, size);
+				if (TextureOffload::DiscardRange(begin) && trim)
+					Libs::LibKernel::Memory::TrimGuestRange(begin, size);
 		});
 	}
 	if (check.empty()) {
@@ -4783,12 +4948,115 @@ void TextureCache::OffloadScan(uint64_t tick) {
 #endif
 }
 
-// Render thread (a speculation's recorder refuses): the discarded ranges over [vaddr, vaddr + size) downloaded back from
-// their images in one submission, the render thread waiting for it; their read watchers then go.
+#if KYTY_FILE_OFFLOAD_SUPPORTED
+// The offload worker's compares of a scan's file ranges (CheckFileRange) 8 MiB at a time, each
+// batch posting the next: an image's asynchronous restore posted meanwhile, which threads wait for,
+// runs between two batches, not after a whole scan's (up to 256 MiB of reads and compares).
+static void PostFileChecks(std::shared_ptr<std::vector<std::pair<uint64_t, uint64_t>>> taken,
+                           size_t first, bool drop) {
+	OffloadWorker::Post([taken = std::move(taken), first, drop]() mutable {
+		constexpr uint64_t Batch = uint64_t {8} << 20u;
+		uint64_t           bytes = 0;
+		size_t             next  = first;
+		for (; next < taken->size() && bytes < Batch; ++next) {
+			TextureOffload::CheckFileRange((*taken)[next].first, drop);
+			bytes += (*taken)[next].second;
+		}
+		if (next < taken->size()) PostFileChecks(std::move(taken), next, drop);
+	});
+}
+#endif
+
+// KYTY_FILE_OFFLOAD (file-offload.h; from OffloadScan, every 120 flips): pieces of APR reads that
+// no read replaced for 10 s are taken (the page manager's hold on the guest view, no access in the
+// backing view: each touch faults from now on) and compared with their files by the offload
+// worker, which drops the equal ones (KYTY_FILE_OFFLOAD=1).
+void TextureCache::OffloadFiles() {
+#if KYTY_FILE_OFFLOAD_SUPPORTED
+	static const auto age = [] {
+		const char* value = std::getenv("KYTY_FILE_OFFLOAD_AGE");
+		return std::chrono::seconds(
+		    value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : 10);
+	}();
+	// (KYTY_FILE_OFFLOAD_SCAN_MB, default 256: the bytes a scan takes;
+	// KYTY_FILE_OFFLOAD_SCAN_RANGES, default 256: the ranges, each a hold and protection changes on
+	// this thread.)
+	static const uint64_t budget = [] {
+		const char* value = std::getenv("KYTY_FILE_OFFLOAD_SCAN_MB");
+		return (value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10)
+		                                             : uint64_t {256})
+		       << 20u;
+	}();
+	static const size_t count = [] {
+		const char* value = std::getenv("KYTY_FILE_OFFLOAD_SCAN_RANGES");
+		return static_cast<size_t>(
+		    value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : 256);
+	}();
+	const auto start = std::chrono::steady_clock::now();
+	const bool drop  = FileOffload::GetMode() == FileOffload::Mode::Offload;
+	auto       taken = std::make_shared<std::vector<std::pair<uint64_t, uint64_t>>>();
+	// (As IsRegionGpuModified, under the lock this thread holds: OffloadScan's caller.)
+	const auto gpu_written = [&](uint64_t begin, uint64_t size) {
+		if (m_buffer_cache.IsRegionGpuModified(begin, size)) return true;
+		for (const auto id: FindImagesInRegion(begin, size, false)) {
+			const auto& image = m_slot_images[id];
+			if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty())
+				return true;
+		}
+		return false;
+	};
+	for (const auto& candidate: FileOffload::Take(age, budget, count)) {
+		const uint64_t                     size = candidate.end - candidate.begin;
+		std::vector<TextureOffload::Piece> pieces;
+		uint64_t                           covered = 0;
+		for (uint64_t at = candidate.begin; at < candidate.end;) {
+			const auto  mapping_end = Libs::LibKernel::Memory::BackingMappingEnd(at);
+			const auto  piece = mapping_end > at ? std::min(mapping_end, candidate.end) - at : 0;
+			const auto* backing =
+			    piece != 0 ? Libs::LibKernel::Memory::TryGetBackingPointer(at, piece) : nullptr;
+			if (backing == nullptr) break;
+			pieces.push_back({reinterpret_cast<uint64_t>(backing), piece});
+			covered += piece;
+			at += piece;
+		}
+		// (Memory without backing bytes for all of it, flexible memory, or under a taken range:
+		// left alone. So is memory mapped at another guest address too (a write there would not
+		// fault) and memory the GPU wrote (its bytes are the GPU's, read back when the game reads
+		// them).)
+		if (covered != size || TextureOffload::AnyTaken(candidate.begin, size) ||
+		    !Libs::LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(candidate.begin,
+		                                                                      size) ||
+		    gpu_written(candidate.begin, size))
+			continue;
+		const auto hold = [&] {
+			m_page_manager.UpdateReadWatchers<true>(candidate.begin, size);
+			// (Its no access now, not with this thread's other deferred ones: TextureOffload::Add.
+			// The worker's compare comes after it too.)
+			PageManager::FlushDeferredProtection(candidate.begin, size);
+		};
+		if (TextureOffload::AddFile(candidate.begin, size, std::move(pieces), candidate.file,
+		                            candidate.offset, hold))
+			taken->emplace_back(candidate.begin, size);
+	}
+	const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+	    std::chrono::steady_clock::now() - start);
+	TextureOffload::NoteFileScan(taken->size(), static_cast<uint64_t>(us.count()));
+	if (!taken->empty()) PostFileChecks(std::move(taken), 0, drop);
+#endif
+}
+
+// Render thread (a speculation's recorder refuses): the discarded ranges over [vaddr, vaddr + size) downloaded back from their images in one submission,
+// the render thread waiting for it; their read watchers then go.
 void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch_value, bool async) {
-#if defined(_WIN32)
+#if KYTY_TEXTURE_OFFLOAD_SUPPORTED
 	if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"texture offload restore"};
 	const auto touch  = static_cast<TextureOffload::Touch>(touch_value);
+#if KYTY_FILE_OFFLOAD_SUPPORTED
+	// (Dropped file bytes there: read back from their files first, on this thread. Not for an image
+	// gone: nothing reads them.)
+	if (touch != TextureOffload::Touch::Count && touch != TextureOffload::Touch::ImageGone)
+		TextureOffload::RestoreFiles(vaddr, size, touch);
+#endif
 	auto       ranges = TextureOffload::BeginRestore(vaddr, size, touch, touch == TextureOffload::Touch::Count, async);
 	if (ranges.empty()) return;
 	const auto                         start = std::chrono::steady_clock::now();
@@ -4804,7 +5072,9 @@ void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch
 	uint64_t         total = 0, bytes = 0, lost = 0;
 	for (size_t i = 0; i < ranges.size(); i++) {
 		const auto& range = ranges[i];
-		for (const auto& piece: range.pieces) (void)TextureOffload::Protect(piece.backing, piece.size, PAGE_READWRITE);
+		for (const auto& piece: range.pieces)
+			(void)TextureOffload::Protect(piece.backing, piece.size,
+			                              TextureOffload::Access::ReadWrite);
 		auto* image = m_slot_images.try_get(ImageId {static_cast<uint32_t>(range.image), static_cast<uint32_t>(range.image >> 32u)});
 		auto  plan  = image != nullptr && image->serial == range.serial && image->backing.image != nullptr ? BuildDownload(*image)
 		                                                                                                 : DownloadPlan {};
@@ -4856,6 +5126,8 @@ void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch
 						source += piece.size;
 					}
 				}
+				if (Scout::Running())
+					for (const auto& range: raw->ranges) Scout::NoteHostWrite(range.begin, range.end - range.begin, true);
 				for (const auto& range: raw->ranges) m_page_manager.UpdateReadWatchers<false>(range.begin, range.end - range.begin);
 				const auto us = static_cast<uint64_t>(
 				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - raw->start).count());
@@ -4877,6 +5149,8 @@ void TextureCache::RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch
 			bytes += range.end - range.begin;
 		}
 	}
+	if (Scout::Running())
+		for (const auto& range: ranges) Scout::NoteHostWrite(range.begin, range.end - range.begin, true);
 	for (const auto& range: ranges) m_page_manager.UpdateReadWatchers<false>(range.begin, range.end - range.begin);
 	const auto us = static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
@@ -4930,6 +5204,20 @@ void TextureCache::TouchSpeculated(Image& image, uint64_t serial) {
 	if (image.serial != serial || !image.registered) return;
 	image.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
 	TouchImage(image);
+}
+
+void TextureCache::TouchSpeculated(std::span<const std::pair<Image*, uint64_t>> images) {
+	if (images.empty()) return;
+	std::scoped_lock lock {m_lock};
+	const auto   frame = m_frame.load(std::memory_order_relaxed);
+	const Image* last  = nullptr;
+	for (const auto& [image, serial]: images) {
+		if (image == last) continue;
+		last = image;
+		if (image->serial != serial || !image->registered) continue;
+		image->frame_accessed_last = frame;
+		TouchImage(*image);
+	}
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source, const uint32_t* fill) {
@@ -4990,6 +5278,19 @@ bool TextureCache::HasGpuWrittenImageOverlap(uint64_t address, uint64_t size) {
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
 		if (image.IsGpuModified() || image.IsStencilModified()) return true;
+	}
+	return false;
+}
+
+bool TextureCache::SpeculationUsesGpuWrittenImage(uint64_t address, uint64_t size) {
+	const auto* spec = Spec::Current();
+	if (spec == nullptr || !GuestRange {address, size}.Valid()) return true;
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		// (Any use of its own, conservatively: its work may write it before the texel read. A speculation before it is
+		// committed before it: what that one writes lands first, as in order.)
+		if ((image.IsGpuModified() || image.IsStencilModified()) && spec->overlay_index.contains(&image)) return true;
 	}
 	return false;
 }
@@ -5126,11 +5427,11 @@ bool TextureCache::IsMeta(uint64_t address) {
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value,
-                                 bool* fill_known) {
+                                 bool* fill_known, bool dcc_ok) {
 	// A speculation's answer is as after its holes; one it relies on is noted (speculation-state.h).
 	auto* spec = slice < 32 && fill_value == nullptr && fill_known == nullptr ? Spec::Current() : nullptr;
 	if (spec != nullptr)
-		if (const auto known = spec->KnownMeta(address, slice); known >= 0) return known == 1;
+		if (const auto known = spec->KnownMeta(address, slice, dcc_ok); known >= 0) return known == 1;
 	const auto not_cleared = [&] {
 		if (spec != nullptr) spec->NoteMetaRead(address, slice);
 		return false;
@@ -5138,9 +5439,22 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	if (!MetaFilterMayHold(address)) return not_cleared();
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
+	// KYTY_SPEC_PREDICT_DCC (live spec_predict_dcc): a surface DCC fills clear (every frame, in the game) is read by a
+	// speculation as cleared when it finds it not: a fill in work not committed yet, of its command buffer or an earlier
+	// one it is not chained to, may clear it before its commit ("commit: a surface cleared"). The draw that would consume
+	// the clear becomes a hole (the normal path decides at commit); a not-cleared answer would be checked at commit
+	// instead, and a fill meanwhile made the rest of the chunk go in order.
+	// (Only for a surface the caller may hold as DCC: m_dcc_filled keeps the addresses fills were tracked at while no
+	// image said what the metadata was, no entry or a pending one, and some are depth targets' HTile, which the normal
+	// path never finds cleared there: ~42 needless holes a frame on depth targets at the arch, 2 Nov.)
+	static auto& predict_dcc = LiveSwitch::Find("spec_predict_dcc", ModeToggle::Default("spec_predict_dcc"));
+	const auto   dcc_filled  = [&] {
+		return spec != nullptr && dcc_ok && slice < 32 && predict_dcc.load(std::memory_order_relaxed) != 0 &&
+		       m_dcc_filled.contains(address);
+	};
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    slice >= 32) {
-		return not_cleared();
+		return (dcc_filled() && (spec == nullptr || !spec->ConsumedElsewhere(address, slice))) || not_cleared();
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
@@ -5148,7 +5462,10 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	if (fill_known != nullptr) {
 		*fill_known = found->second.fill_known;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0 || not_cleared();
+	// (spec_predict_dcc=3: a clear another speculation's hole will consume before this one commits is not this one's.)
+	if (spec != nullptr && ((found->second.clear_mask & (1u << slice)) != 0 || dcc_filled()))
+		return !spec->ConsumedElsewhere(address, slice) || not_cleared();
+	return (found->second.clear_mask & (1u << slice)) != 0 || dcc_filled() || not_cleared();
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -5163,7 +5480,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask = UINT32_MAX;
 	found->second.fill_known = false;
-	m_meta_epoch.fetch_add(1, std::memory_order_release); // (a clear pending: cached answers ask again)
+	MoveMeta(address); // (a clear pending: cached answers ask again)
 	return true;
 }
 
@@ -5178,11 +5495,11 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	found->second.clear_mask = UINT32_MAX;
 	found->second.fill_value = fill_value;
 	found->second.fill_known = true;
-	m_meta_epoch.fetch_add(1, std::memory_order_release);
+	MoveMeta(address);
 	return true;
 }
 
-void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value) {
+bool TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid DCC fill range\n");
 	}
@@ -5207,14 +5524,31 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 	// image descriptor confirms its role; never reinterpret CMask/FMask/HTile as DCC.
 	const auto found = m_surface_metas.try_emplace(address).first;
 	MetaFilterAdd(address);
-	m_meta_epoch.fetch_add(1, std::memory_order_release);
+	MoveMeta(address);
 	if (found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    found->second.type == MetaDataInfo::Type::Dcc) {
 		found->second.clear_mask = dcc_clear_mask;
 		found->second.fill_value = fill_value;
 		found->second.fill_size  = size;
 		found->second.fill_known = true;
+		// (Mode 4's predictions read it: KYTY_SPECULATE unset keeps nothing.)
+		if (dcc_clear_mask != 0 && ::kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) m_dcc_filled.insert(address);
+		return dcc_clear_mask != 0;
 	}
+	return false;
+}
+
+void TextureCache::NoteDccClear(uint64_t address, bool sticks) {
+	std::scoped_lock lock {m_lock};
+	if (sticks) m_dcc_sticky.insert(address);
+	else m_dcc_sticky.erase(address);
+}
+
+bool TextureCache::DccClearSticks(uint64_t address) {
+	static auto& predict = LiveSwitch::Find("spec_predict_dcc", ModeToggle::Default("spec_predict_dcc"));
+	if (predict.load(std::memory_order_relaxed) == 0) return false;
+	std::scoped_lock lock {m_lock};
+	return m_dcc_sticky.contains(address);
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
@@ -5227,7 +5561,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	}
 	if (is_clear) {
 		found->second.clear_mask |= 1u << slice;
-		m_meta_epoch.fetch_add(1, std::memory_order_release);
+		MoveMeta(address);
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
 	}
@@ -5305,7 +5639,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		}
 		for (size_t i = 0; i < bits.size(); ++i) m_meta_filter[i].store(bits[i], std::memory_order_release);
 	}
-	m_meta_epoch.fetch_add(1, std::memory_order_release);
+	MoveMeta(address, address + size);
 	auto images = FindImagesInRegion(address, size, false);
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);
@@ -5342,6 +5676,8 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::EraseRetired() {
 	std::erase_if(m_retired, [&](const auto& retired) {
 		if (!Spec::PacketsPassed(retired.second)) return false;
+		ImageSerials::Move(m_slot_images[retired.first].serial_slot);
+		ForgetMetaSlot(m_slot_images[retired.first].serial_slot);
 		m_slot_images.erase(retired.first);
 		m_erase_epoch.fetch_add(1, std::memory_order_release);
 		return true;
@@ -5349,37 +5685,38 @@ void TextureCache::EraseRetired() {
 }
 
 // Per flip, whatever the memory use (the collector below runs only near the video memory budget, never on a 32 GB GPU):
-// images no draw or dispatch used for RetireTicks flips go, at most MaxRetirements a flip, as stale buffers do
+// images no draw or dispatch used for RetireTime go, at most MaxRetirements a flip, as stale buffers do
 // (BufferCache::RetireStaleBuffers). Kept, their page watchers took a fault at every write the game made when it gave
 // that memory to other data (the third loop of the user's 1-1 route: partial dirty faults 17 -> 164 a frame, write
 // faults 73 -> 232), and they held their video memory for good. One the game draws again is made again from its bytes.
 // Passed over (to the back of the list): images whose bytes only the GPU has (no download here), depth images with a
 // stencil association (deleting depth deletes it too), unregistered ones.
 // Texture pools of the world the game is in stay where the budget is 12 GiB or more (the collector below takes them,
-// oldest first, when it runs): one-level arrays of ChunkedUploadMin and up that shaders only sample. The game samples a
+// oldest first, when it runs): one-level arrays of ChunkedUploadMax and up that shaders only sample. The game samples a
 // pool through views from a few first layers to a last one that moves as it streams, and leaves one for minutes as the
 // camera moves on: retired, the next view made it again whole from guest memory (2-2 and 5-2 tours: 1.3-2 GB, 150-460
 // ms frames, 2-3 times a map), where the image kept serves it or gives its layers on the GPU (HoldLayers). A kept
 // pool's watchers take a fault per MiB the game writes at most (partial dirty state). One last used before the game
 // entered its world (SceneTags) goes as before: the memory of the worlds left comes back.
 void TextureCache::RetireStaleImages(uint64_t tick) {
-	constexpr uint64_t RetireTicks    = 1200;
-	constexpr size_t   MaxRetirements = 16;
+	constexpr size_t MaxRetirements = 16;
 	if (const auto generation = SceneTags::Generation(); generation != m_scene_generation) {
 		m_scene_generation = generation;
 		m_scene_tick       = tick;
 	}
-	if (tick <= RetireTicks) return;
+	if (tick <= MinIdleTicks) return;
+	const uint64_t below = std::min(m_tick_clock.Before(tick, RetireTime), tick - MinIdleTicks);
+	if (below == 0) return;
 	thread_local std::vector<ImageId> stale, kept;
 	stale.clear();
 	kept.clear();
 	const bool keep_pools = !m_graphics.small_video_memory;
-	m_lru_cache.ForEachItemBelow(tick - RetireTicks, [&](ImageId id) {
+	m_lru_cache.ForEachItemBelow(below, [&](ImageId id) {
 		const auto* owner = m_slot_images.try_get(id);
 		if (owner == nullptr || !owner->registered) return false;
 		// (Left at its age: the collector's.)
 		if (keep_pools && owner->info.resources.levels == 1 && owner->info.resources.layers > 1 &&
-		    owner->info.data.size >= ChunkedUploadMin && GuestTexture(*owner) &&
+		    owner->info.data.size >= ChunkedUploadMax && GuestTexture(*owner) &&
 		    m_lru_cache.TickOf(owner->lru_id) >= m_scene_tick)
 			return false;
 		if (owner->depth_id || owner->IsGpuModified())
@@ -5427,6 +5764,7 @@ void TextureCache::RunGarbageCollector() {
 	EraseRetired();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	m_tick_clock.Begin(tick);
 	// Parked images not taken back since the flip before: the game left that use of the memory.
 	std::erase_if(m_parked, [&](const auto& item) {
 		if (item.second.tick + item.second.keep >= tick) return false;
@@ -5435,7 +5773,7 @@ void TextureCache::RunGarbageCollector() {
 	});
 	RetireStaleImages(tick);
 	ShadowPoolTrace::Flip(tick);
-	if (TextureOffload::Enabled()) OffloadScan(tick);
+	if (TextureOffload::AnyEnabled()) OffloadScan(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -5561,13 +5899,15 @@ void TextureCache::RunGarbageCollector() {
 		ram_target = 0;
 	}
 	const uint64_t     over          = m_total_used_memory > collect_above ? m_total_used_memory - collect_above : 0;
-	const uint64_t     StaleTicks    = by_ram ? 600 : over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
 	const size_t       MaxDeletions  = by_ram ? 40 : over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
-	// For a while after the GPU could not make an image (InsertImage), images unused for FailedRetryTicks go too: the
-	// superseded ones whose memory it needs (issue #49: a 16 GB GPU full of texture-pool images).
-	const bool     failing     = m_failed_tick != 0 && tick < m_failed_tick + 600;
-	const uint64_t stale_ticks = failing ? std::min<uint64_t>(FailedRetryTicks, StaleTicks) : StaleTicks;
-	if (m_total_used_memory < collect_above || tick < stale_ticks) {
+	// (des-up-1110) Ages in time (upstream's TickClock, StaleTime): the images no draw or dispatch used for StaleTime.
+	const uint64_t stale_tick = m_tick_clock.Before(tick, StaleTime);
+	// For StaleTime after the GPU could not make an image (InsertImage), images unused for FailedRetryTicks go too:
+	// the superseded ones whose memory it needs (issue #49: a 16 GB GPU full of texture-pool images).
+	const bool     failing = m_failed_tick != 0 && m_failed_tick > stale_tick;
+	const uint64_t below   = failing ? tick - std::min(tick, FailedRetryTicks)
+	                                 : std::min(stale_tick, tick - std::min(tick, MinIdleTicks));
+	if (m_total_used_memory < collect_above || below == 0) {
 		return;
 	}
 	// An image the collector keeps (a depth image with its stencil association; one the GPU wrote, tiled: no download
@@ -5581,7 +5921,7 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t       download_max = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2;
 	std::vector<ImageId> candidates;
 	candidates.reserve(MaxDeletions);
-	m_lru_cache.ForEachItemBelow(tick - stale_ticks, [&](ImageId id) {
+	m_lru_cache.ForEachItemBelow(below, [&](ImageId id) {
 		const auto* owner = m_slot_images.try_get(id);
 		if (owner == nullptr || !owner->registered || owner->depth_id ||
 		    (owner->IsGpuModified() && owner->info.IsTiled() && SafeToDownload(*owner) &&

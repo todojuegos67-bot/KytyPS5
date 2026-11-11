@@ -1,17 +1,7 @@
-# 本地 PGO
+# PGO
 
-当前正式构建：`_Build/agent30fps-20260917/build/`，Clang 18 / Release / ThinLTO。
-其 profile 输入是 `_Build/pgo/walk8-20260915-v5/kyty.profdata`，不是可随测试日志删除的临时文件。
-实际编译/链接参数以该构建的 Ninja 命令和 CMakeCache 为准。
-
-重新训练时使用独立目录，保持训练和使用时的源码一致：
-
-1. 用 `-fprofile-instr-generate` 构建训练版本；若正常退出走 `std::quick_exit`，训练版本额外链接 `pgo-quick-exit.cpp`，确保 profile 写出。
-2. 设置 `LLVM_PROFILE_FILE` 到新的输出目录，正常运行代表性场景并退出。训练版本 FPS 不是收益结果。
-3. 用 `llvm-profdata-18 merge` 合并确认属于本次成功运行的非空 profraw。
-4. 在独立构建中使用 `-fprofile-instr-use=/绝对路径/kyty.profdata`，记录源码和二进制指纹，按 [同进程测量方法](../../docs/BENCHMARKING.md) 验证。
-
-不要在 FPS 测量期间编译或训练，不要覆盖正在运行或正式交付的二进制。mimalloc 是独立宿主分配器选择，不能把更换分配器与 PGO 收益混为一谈。
+发布构建（GitHub Actions 和本地 `build-windows.cmd`）都用 profile 引导优化。不要在测帧率时编译或训练，
+也不要覆盖正在运行或已发布的可执行文件。
 
 ## Windows
 
@@ -49,6 +39,94 @@ ab-exe ABBA，120 Hz 上限（`-Vblank 120`），走 10 s 后两个 6 s 窗口�
 - 1-1：渲染线程 13.52 → 12.81 ms/帧（-5.3%），fps 65.3 → 69.3（A 的第一轮带预热，去掉它 +2.7%）；
 - Latria：12.47 → 12.15 ms/帧（-2.6%），fps 75.2 → 76.1。
 2026-10-20（台式机，发布前）：10-18 之后的提交让 20 个 TU 里 62 个函数失配（bufferCache 6、renderDraw 6、graphicsRun 4、
-textureCache 4 等）。在 ddc59a8e 上用同样四个场景重新训练（`pgo-multi.ps1`），ab-exe ABBA，120 Hz 上限：
+textureCache 4 等）。在 ddc59a8e 上用同样四个场景重新训练（`tools\local\windows\pgo-multi.ps1`），ab-exe ABBA，120 Hz 上限：
 - 1-1：渲染线程 13.71 → 13.04 ms/帧（-4.9%），fps 70.0 → 72.8；
 - Latria：12.23 → 12.17 ms/帧，fps 75.8 → 76.5。
+
+2026-10-25（台式机，v20261025 发布前）：扫描 22 个 TU 里 82 个函数失配。v20261024 的可执行文件对比当前 HEAD（同一份 10-20
+profile），1-1、120 Hz 上限：fps 85.3 / 84.9，渲染线程 9.71 / 10.44 ms。在 HEAD 上用同样四个场景重新训练后，ab-exe ABBA（旧
+profile 为 A）：渲染线程 10.30 → 10.23 ms/帧，但四轮里 B 的 fps 都更低（84.3、86.5、83.5、84.2 对 81.0、80.7、78.3、78.7，
+平均 84.6 → 79.7）：新 profile 拖慢了渲染线程以外的线程。所以 v20261025 仍用 10-20 的 profile；新的另存为
+`_Build\pgo\windows\kyty-20261025.profdata`，没有提交。
+
+2026-11-05（台式机，v20261105 发布前）：PR #280（scout）等改动之后，在 aff2a569 上训练五个场景：原来的四个（scout 默认开），
+加上 `user-20261001` 配 `KYTY_SCOUT=0`（空闲核心不够、scout 停下的电脑上，渲染线程自己求值表；issue #283）。ab-exe ABBA，
+120 Hz 上限（旧的 10-21 profile 为 A）：
+- Latria：渲染线程 12.61 → 11.97 ms/帧，fps 76.0 → 80.0（B 的四个窗口都高于 A 的）；
+- 1-1：14.19 / 14.26 ms，fps 69.0 / 69.2（持平）；
+- 1-1 加 `KYTY_SCOUT=0`，两次 ABBA 合计：14.32 / 14.55 ms，fps 69.1 / 68.1（这个位置单次启动之间相差 ±5%，在噪声内）。
+@DevList1454 在 Ryzen 7 9700X + RX 9070 XT 上按同样的方法重新训练（scout 开），王城内城 +5-6%。新 profile 提交为
+`tools\pgo\kyty.profdata`，旧的另存为 `_Build\pgo\windows\kyty-before-20261105.profdata`。
+
+2026-11-06（台式机）：合并 PR #285、#287、#297-#304、#308、#309 之后，扫描 10 个 TU 里 65 个函数失配（pm4Handlers 30、redZonePatcher 17、
+bufferCache 7、renderDraw 3 等）。旧的场景存档已随 `_Build` 删除，所以这次的存档全部由 1-1 竞技场的
+`rec-m02_00_00_00-c0000_0006` 派生（`tools\local\demons-souls-save.py set-map`；游戏只有 `.zar` 时，先把
+`cp11demonssouls/dvdroot/map/mapstudio/m0*.msb` 取到一个文件夹，用 `--game` 指过去）。`tools\local\windows\pgo-multi.ps1`
+现在默认跑这五次：
+- `world-prologue`（m08_00_00_00 c0000_0000，教程的隧道）；
+- `rec-m02_00_00_00-c0000_0001`（1-1 城门广场，代替 `user-20261001`）；
+- `world-latria`（m04_00_00_00 c0000_0000）；
+- `rec-m02_00_00_00-c0000_0006`；
+- `rec-m02_00_00_00-c0000_0001` 配 `KYTY_SCOUT=0`。
+
+ab-exe ABBA，120 Hz 上限，源码相同（11-05 的 profile 为 A）：
+- 1-1：渲染线程 14.68 → 13.65 ms/帧，fps 65.95 → 70.03（4 个窗口）；
+- 1-1 加 `KYTY_SCOUT=0`：14.50 → 14.36 ms，fps 68.35 → 69.33（8 个窗口）；
+- Latria：12.69 → 12.48 ms，fps 76.91 → 75.98（8 个窗口；这里帧率不只取决于渲染线程）。
+
+重扫只剩 redZonePatcher.cpp（加载器）的 17 个。新 profile 提交为 `tools\pgo\kyty.profdata`，旧的另存为
+`_Build\pgo\windows\kyty-before-20261106.profdata`。
+
+2026-11-09（台式机，v20261109 发布前）：f25c70f7（#315）改了 `table-xpr.inc` 的 TableDraw、TableResolveSet、TableTransit，
+它们的 profile 随之失效（扫描共 25 个：redZonePatcher 17、renderDraw 2、frame-gen 2、libAudio2、demonsSoulsPageFree、
+SceneGuard、TextureMips 各 1）。在 9af7b0d9 上用 `pgo-multi.ps1` 默认的五次运行重新训练。ab-exe ABBA，120 Hz 上限，源码
+相同（11-06 的 profile 为 A），各 4 个窗口：
+- 1-1：渲染线程 14.07 → 14.01 ms/帧，fps 70.41 → 70.08；
+- Latria：12.19 → 12.21 ms，fps 77.58 → 78.62；
+- 1-1 加 `KYTY_SCOUT=0`：14.30 → 14.32 ms，fps 68.58 → 69.08。
+都在噪声内：失效的几个函数在这里没有可测的代价，换新 profile 是为了让发布版与代码一致。重扫只剩 redZonePatcher.cpp 的 17
+个。旧的另存为 `_Build\pgo\windows\kyty-before-20261109.profdata`。
+（用 `-fprofile-instr-generate` 把一个 TU 编成 IR，`__profd_` 里的哈希与 `llvm-profdata show --all-functions` 的
+`Hash:` 对比，可以列出具体是哪些函数失效。）
+
+2026-11-10（台式机）：合并 PR #293（推测翻译，43054ac5，不含它用于验证的 profile 提交）和 #305 的 f48636db 之后，在合并后的
+树（edddd1d9）上用 `pgo-multi.ps1` 默认的五次运行（模式 0）重新训练。ab-exe ABBA，120 Hz 上限，3 轮，每轮走 10 秒后测两个
+10 秒窗口，A 为合并前（f48636db，11-09 的 profile），B 为合并后（新 profile），模式 0：
+- 1-1：渲染线程 13.88 → 13.39 ms/帧，fps 70.30 → 72.47；
+- Latria：12.06 → 12.08 ms，fps 78.95 → 78.17；
+- 1-1 竞技场（`rec-m02_00_00_00-c0000_0006`）：8.66 → 8.68 ms，fps 108.50 → 108.58。
+持平（1-1 略好）。17 次启动的日志都是模式 0，没有致命错误。重扫只剩 redZonePatcher.cpp 的 17 个。旧的另存为
+`_Build\pgo\windows\kyty-before-20261110.profdata`。
+
+## 推测模式（`KYTY_SPECULATE=4`）
+
+默认的五次训练都在模式 0 下运行，模式 4 自己的路径（推测线程上的翻译和状态遍历、提交检查，以及模式 0 的函数在
+`kyty_local_speculate_mode` 判断之后调用的 `*Spec` 函数，例如 `ObtainBufferSpec`、`FindBufferSpec`、
+`SyncGpuCleanBackingSpec`）在 profile 里没有计数，按冷代码编译。`pgo-multi.ps1 -Speculate` 在默认五次之后，再用同样的
+五个场景各跑一次 `KYTY_SPECULATE=4`，十个原始 profile 合并成一个：
+
+```
+powershell -ExecutionPolicy Bypass -File tools\local\windows\pgo-multi.ps1 -Speculate
+```
+
+默认列表不变；命令行给了 `-Scenes` 时按它原样运行，`-Speculate` 不再追加。场景里可以连写多个开关
+（`<存档>+KYTY_SCOUT=0+KYTY_SPECULATE=4`）。`llvm-profdata merge` 把同一函数的计数相加：模式 0 走的函数仍然带着
+模式 0 五次的计数（加上模式 4 里同样经过它们的次数），只在模式 4 运行的函数多了计数。前五个原始 profile 单独合并，
+就是不带 `-Speculate` 的 profile。
+
+## IR 级 profile（`KYTY_PGO_KIND=ir`）
+
+插桩构建默认用 clang 前端的计数（`-fprofile-instr-generate`）。`-DKYTY_PGO_KIND=ir` 改用 LLVM 的 IR 级计数
+（`-fprofile-generate`），计数取在优化器实际看到的代码上。优化构建不用改：`-fprofile-instr-use` 两种都能读，按文件头区分；
+live 命令 `pgo <file>` 也一样。
+
+```
+powershell -ExecutionPolicy Bypass -File tools\local\windows\pgo-multi.ps1 -Kind ir
+```
+
+- 插桩版本建在 `_Build\windows-pgogen-ir`：`KYTY_CMAKE_ARGS` 只在目录第一次配置时生效，已有的 `_Build\windows-pgogen`
+  会一直是前端计数。`pgo-train.ps1` 发现目录里的计数种类不对就不训练。
+- 原始 profile 和合并结果名为 `kyty-ir-<日期>*`。两种 profile 不能合并，换用 IR 要把所有场景重新训练。
+- 过时检查：IR profile 的失配不报 `-Wprofile-instr-out-of-date`，而是 `-Wbackend-plugin` 的
+  "function control flow change detected (hash mismatch)"（构建同样用 `-Wno-backend-plugin` 关掉了），扫描时把它也打开。
+- IR profile 的函数数比前端的少，因为它在早期内联之后才计数，这是正常的。

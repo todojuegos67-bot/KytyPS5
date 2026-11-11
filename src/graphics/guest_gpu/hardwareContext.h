@@ -1095,6 +1095,16 @@ public:
 		    ((id + 1) > m_vs.gs_user_sgpr.count ? (id + 1) : m_vs.gs_user_sgpr.count);
 	}
 	void SetStartInstanceUserSgpr(int32_t id) { m_vs.start_instance_user_sgpr = id; }
+	// As ==, but not the start-instance user SGPR: every draw sets it before its shaders are translated (ProcessPm4: an
+	// indirect draw to the SGPR its packet names, a direct draw or a draw preamble to none), and nothing else reads it,
+	// so its value where a chunk begins changes nothing translated from there.
+	[[nodiscard]] bool SameButStartInstance(const Shader& other) const {
+		if (!(m_ps == other.m_ps) || !(m_cs == other.m_cs)) return false;
+		if (m_vs.start_instance_user_sgpr == other.m_vs.start_instance_user_sgpr) return m_vs == other.m_vs;
+		auto vs                     = m_vs;
+		vs.start_instance_user_sgpr = other.m_vs.start_instance_user_sgpr;
+		return vs == other.m_vs;
+	}
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }

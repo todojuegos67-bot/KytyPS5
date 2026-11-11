@@ -22,6 +22,13 @@ bool     SysVirtualFreeRange(uint64_t address, uint64_t size);
 bool     SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
                            VirtualMemory::Mode* old_mode = nullptr);
 bool     SysVirtualFlushInstructionCache(uint64_t address, uint64_t size);
+bool     SysVirtualProtectWriteWatch(uint64_t address, uint64_t size, VirtualMemory::Mode mode);
+void     SysVirtualWriteWatchMapped(uint64_t address, uint64_t size, VirtualMemory::Mode mode);
+void     SysVirtualWriteWatchUnmapped(uint64_t address, uint64_t size);
+// (Linux) VirtualMemory::ZapNoAccess; a SIGBUS of a minor-mode page, or of a write protection the bits lost, served
+// (sysLinuxVirtual.cpp).
+void     SysVirtualZapNoAccess(bool on);
+bool     SysVirtualResolveMinorFault(uint64_t address, bool present, bool write);
 
 } // namespace Common
 

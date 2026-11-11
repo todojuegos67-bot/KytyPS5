@@ -22,7 +22,7 @@
 #include <unordered_set>
 
 extern "C" {
-volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode {0};
+volatile std::atomic<uint32_t> kyty_local_specialization_guard_mode {1};
 }
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -917,23 +917,15 @@ bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<Descr
 	return true;
 }
 
-bool PortableShaders() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_PORTABLE_SHADERS");
-		return !(value != nullptr && std::string_view(value) == "0");
-	}();
-	return enabled;
-}
-
 // A null texture reads zero whatever its type. Bound as a 1x1 image of the type the shader declares
-// (NullTextureDesc), it takes the module of the texture bound other times; without portable
-// modules, and when multisampled, a 2D one.
+// (NullTextureDesc), it takes the module of the texture bound other times; when multisampled, a 2D
+// one.
 static Decoder::ImageDimension NullImageDimension(Decoder::ImageDimension declared) {
 	switch (declared) {
 		case Decoder::ImageDimension::Dim1D:
 		case Decoder::ImageDimension::Dim1DArray:
 		case Decoder::ImageDimension::Dim2DArray:
-		case Decoder::ImageDimension::Dim3D: return PortableShaders() ? declared : Decoder::ImageDimension::Dim2D;
+		case Decoder::ImageDimension::Dim3D: return declared;
 		default: return Decoder::ImageDimension::Dim2D;
 	}
 }
@@ -960,9 +952,6 @@ void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& 
 			image.dimension = layers;
 		}
 	}
-	if (!PortableShaders()) {
-		return;
-	}
 	for (size_t i = 0; i < specialization.buffers.size() && i < info.buffers.size(); i++) {
 		auto& buffer = specialization.buffers[i];
 		if (RuntimeBufferStride(buffer.packed_stride)) {
@@ -973,9 +962,6 @@ void CanonicalizeSpecialization(const ShaderInfo& info, ResourceSpecialization& 
 
 bool PortableFormats(const ShaderInfo& info, ResourceSpecialization& specialization) {
 	bool changed = false;
-	if (!PortableShaders()) {
-		return changed;
-	}
 	for (size_t i = 0; i < specialization.buffers.size() && i < info.buffers.size(); i++) {
 		auto& buffer = specialization.buffers[i];
 		if (RuntimeBufferFormat(info.buffers[i]) &&
@@ -1167,8 +1153,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	// Portable modules: a table's candidates padded with null images to a power of two, its key
 	// mapping found through a header word (IndirectMappingHeader), so the module depends on neither
 	// its exact size nor its key count.
-	const bool portable = PortableShaders();
-	auto&      padded   = workspace.padded_candidates;
+	auto& padded = workspace.padded_candidates;
 	padded.clear();
 	for (const auto& table: snapshot.indirect_images) {
 		if (table.resource >= program.info.images.size() || table.descriptors.size() < 2u ||
@@ -1177,19 +1162,17 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			    "indirect image candidates exceed the dense image resource limit");
 		}
 		auto candidates = table.descriptors.size();
-		if (portable && image_count + std::bit_ceil(candidates) - 1u <= ShaderInfo::MaxImages) {
+		if (image_count + std::bit_ceil(candidates) - 1u <= ShaderInfo::MaxImages) {
 			candidates = std::bit_ceil(candidates);
 		}
 		padded.push_back(static_cast<uint32_t>(candidates));
 		image_count += candidates - 1u;
-		mapping_words += (portable ? 2u : 1u) + table.keys.size() * 2u;
+		mapping_words += 2u + table.keys.size() * 2u;
 	}
 	next_snapshot.images.reserve(image_count);
 	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + mapping_words);
 	const auto header = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
-	if (portable) {
-		next_snapshot.flattened_srt.resize(header + snapshot.indirect_images.size());
-	}
+	next_snapshot.flattened_srt.resize(header + snapshot.indirect_images.size());
 	next_specialization.images.reserve(image_count);
 	for (const auto& image: program.info.images) {
 		next_specialization.images.push_back({
@@ -1217,14 +1200,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		auto&      root    = next_specialization.images[table.resource];
 		const auto mapping = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
 		root.indirect_root = table.resource;
-		if (portable) {
-			root.indirect_mapping_offset    = header + static_cast<uint32_t>(table_index);
-			root.indirect_search_iterations = ImageResource::RuntimeIndirectSearch;
-			next_snapshot.flattened_srt[root.indirect_mapping_offset] = mapping;
-		} else {
-			root.indirect_mapping_offset    = mapping;
-			root.indirect_search_iterations = std::bit_width(table.keys.size());
-		}
+		root.indirect_mapping_offset    = header + static_cast<uint32_t>(table_index);
+		root.indirect_search_iterations = ImageResource::RuntimeIndirectSearch;
+		next_snapshot.flattened_srt[root.indirect_mapping_offset] = mapping;
 		next_snapshot.flattened_srt.resize(mapping + 1u + table.keys.size() * 2u);
 		std::vector<uint32_t> order(table.keys.size());
 		std::iota(order.begin(), order.end(), 0u);
@@ -1814,7 +1792,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
-ResourcePlan ExtractResourcePlan(const Program& program) {
+ResourcePlan ExtractResourcePlan(const Program& program, bool linear) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
@@ -1911,7 +1889,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			                   plan.clean_flat_slots);
 		}
 	}
-	BuildLinearSrtPlan(plan);
+	if (linear) BuildLinearSrtPlan(plan);
 	return plan;
 }
 

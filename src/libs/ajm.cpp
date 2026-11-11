@@ -697,7 +697,11 @@ static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer
 		output_size += output_buffers[i].size;
 	}
 
-	std::vector<uint8_t> input(input_size);
+	// (Zeros past the input: LibAtrac9's bit reader takes up to 4 bytes at a time and reads past a frame's last byte. With
+	// the input's exact size it read past the allocation, which a heap without slack after its blocks turned into an
+	// access violation in PeekInt.)
+	constexpr size_t     ReadSlack = 16;
+	std::vector<uint8_t> input(input_size + ReadSlack);
 	size_t               input_offset = 0;
 	for (size_t i = 0; i < input_buffers_num && input_buffers != nullptr; i++) {
 		if (input_buffers[i].address != nullptr && input_buffers[i].size != 0) {
@@ -708,7 +712,7 @@ static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer
 	}
 
 	std::vector<uint8_t> output(output_size);
-	auto result = AjmDecodeInstance(instance, input.data(), input.size(), output.data(),
+	auto result = AjmDecodeInstance(instance, input.data(), input_size, output.data(),
 	                                output.size(), multiple_frames);
 
 	size_t output_offset = 0;

@@ -128,22 +128,32 @@
          </widget>
         </item>
         <item row="4" column="0">
+         <widget class="QLabel" name="label_pipeline_build">
+          <property name="text"><string>Pipeline compile:</string></property>
+         </widget>
+        </item>
+        <item row="4" column="1">
+         <widget class="QComboBox" name="comboBox_pipeline_build">
+          <property name="toolTip"><string>A shader pipeline met for the first time: compiled fast without optimizations (a much shorter stutter; the optimized build replaces it in the background moments later) or optimized at once. Auto: fast first on NVIDIA and on AMD with Linux (Mesa RADV: compile stutters 31 s -> 18 s on a cold cache)</string></property>
+         </widget>
+        </item>
+        <item row="5" column="0">
          <widget class="QLabel" name="label_gpu">
           <property name="text"><string>GPU:</string></property>
          </widget>
         </item>
-        <item row="4" column="1">
+        <item row="5" column="1">
          <widget class="QComboBox" name="comboBox_gpu">
           <property name="toolTip"><string>Graphics device used by the emulator</string></property>
          </widget>
         </item>
-        <item row="5" column="1">
+        <item row="6" column="1">
          <widget class="QCheckBox" name="checkBox_fullscreen">
           <property name="toolTip"><string>Run in borderless desktop fullscreen</string></property>
           <property name="text"><string>Fullscreen</string></property>
          </widget>
         </item>
-        <item row="6" column="1">
+        <item row="7" column="1">
          <widget class="QCheckBox" name="checkBox_readback">
           <property name="toolTip"><string>Read back writable linear images</string></property>
           <property name="text"><string>Enable readback</string></property>
@@ -153,6 +163,86 @@
       </widget>
      </item>
      <item row="2" column="0" colspan="2">
+      <widget class="QGroupBox" name="enhancements_group">
+       <property name="title">
+        <string>Enhancements (upscaling, frame generation, latency)</string>
+       </property>
+       <layout class="QGridLayout" name="enhancementsLayout" columnstretch="0,1,0,1">
+        <item row="0" column="0">
+         <widget class="QLabel" name="label_upscaler">
+          <property name="text"><string>Upscaler:</string></property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QComboBox" name="comboBox_upscaler">
+          <property name="toolTip"><string>Upscales the game's 3D in its own PS5 Pro path, before its post-processing and HUD. FSR 3 runs on any GPU (built in, Linux); DLSS needs an NVIDIA RTX GPU and NVIDIA's runtime</string></property>
+         </widget>
+        </item>
+        <item row="0" column="2">
+         <widget class="QLabel" name="label_render_height">
+          <property name="text"><string>Render height:</string></property>
+         </widget>
+        </item>
+        <item row="0" column="3">
+         <widget class="QComboBox" name="comboBox_render_height">
+          <property name="toolTip"><string>The height the game renders its 3D at. Auto: the window's own height (pixel-exact); with an upscaler the window's height / 1.5, at least 1080</string></property>
+         </widget>
+        </item>
+        <item row="1" column="0">
+         <widget class="QLabel" name="label_frame_generation">
+          <property name="text"><string>Frame generation:</string></property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="QComboBox" name="comboBox_frame_generation">
+          <property name="toolTip"><string>Frames generated between the game's own. FSR 3 (2x) runs on any GPU; DLSS-G needs an NVIDIA RTX 40 or newer. Best with a display faster than the game (vblank frequency 120)</string></property>
+         </widget>
+        </item>
+        <item row="1" column="2">
+         <widget class="QLabel" name="label_fsr_sharpness">
+          <property name="text"><string>FSR sharpness:</string></property>
+         </widget>
+        </item>
+        <item row="1" column="3">
+         <widget class="QSpinBox" name="spinBox_fsr_sharpness">
+          <property name="toolTip"><string>FSR 3's sharpening (RCAS) of the upscaled image</string></property>
+          <property name="suffix"><string> %</string></property>
+          <property name="minimum"><number>0</number></property>
+          <property name="maximum"><number>100</number></property>
+          <property name="singleStep"><number>10</number></property>
+          <property name="value"><number>60</number></property>
+         </widget>
+        </item>
+        <item row="2" column="0">
+         <widget class="QLabel" name="label_low_latency">
+          <property name="text"><string>Low latency:</string></property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <widget class="QComboBox" name="comboBox_low_latency">
+          <property name="toolTip"><string>On: at most one game frame waits for the display (input shows sooner). AMD Anti-Lag adds the driver's frame start pacing (AMD's driver, or Mesa's layer on Linux). NVIDIA Reflex comes with DLSS frame generation</string></property>
+         </widget>
+        </item>
+        <item row="2" column="2" colspan="2">
+         <widget class="QCheckBox" name="checkBox_fps_overlay">
+          <property name="toolTip"><string>The emulator's frame rate panel at the top right (F8 cycles it)</string></property>
+          <property name="text"><string>Show frame rate</string></property>
+         </widget>
+        </item>
+        <item row="3" column="0">
+         <widget class="QLabel" name="label_streamline_dir">
+          <property name="text"><string>Streamline folder:</string></property>
+         </widget>
+        </item>
+        <item row="3" column="1" colspan="3">
+         <widget class="QLineEdit" name="lineEdit_streamline_dir">
+          <property name="toolTip"><string>Windows, DLSS: the folder with NVIDIA's Streamline runtime (the SDK's bin\x64)</string></property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="3" column="0" colspan="2">
       <widget class="QGroupBox" name="debug_group">
        <property name="title">
         <string>Debugging &amp;&amp; logs</string>

@@ -3,10 +3,17 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+
+#include <string>
 namespace Libs::Audio {
 
 void Initialize();
 void Shutdown();
+// SDL's audio subsystem, up (with the Steam Deck build's driver choice made first): the main ports and the
+// DualSense's own output device (dualSenseHaptics.cpp) open through it.
+bool EnsureSdlAudio();
+// The SDL output device named for a DualSense, or empty when none or ambiguous (two pads). Needs EnsureSdlAudio.
+std::string FindControllerAudioDevice();
 
 struct Lifecycle {
 	static constexpr const char* name       = "Audio";

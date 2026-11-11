@@ -1064,11 +1064,21 @@ void TestFaultOnProtectedStack() {
 
 } // namespace
 
+// The switches the trackers read, at the emulator's defaults (bufferCache.cpp).
+extern "C" {
+volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {1};
+volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {1};
+}
+
 namespace Libs::LibKernel::Memory {
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
                             Common::VirtualMemory::Mode mode) {
   return ProtectAddressSpace(vaddr, size, mode);
+}
+
+bool RestoreGuestWritable(uint64_t /*vaddr*/, uint64_t /*size*/) {
+  return false;
 }
 
 } // namespace Libs::LibKernel::Memory

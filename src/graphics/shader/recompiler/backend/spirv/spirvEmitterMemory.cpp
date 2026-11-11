@@ -220,7 +220,7 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	});
 }
 
-uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+uint32_t LoadBdaEach(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
 	             uint32_t bits) {
 	auto&      state   = ctx.state;
 	const auto address = GuestAddress(ctx, inst, mem);
@@ -259,6 +259,95 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 		           : Binary(state, OpBitwiseAnd, TypeU32(state), merged,
 		                    ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	});
+}
+
+// A dword load from an address in a block where a load from the same base (registers, EXEC) walked the page table
+// already: the earlier one's host pointer plus the immediate offsets' difference, when the earlier address is dword
+// aligned and this one lies in its page. Otherwise (a page crossed, an unaligned base) LoadBdaEach walks again. The
+// components of a FLAT_LOAD_DWORDX4 or S_LOAD_DWORDX16 then walk once, not once (or twice) each.
+uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+	             uint32_t bits) {
+	auto& state = ctx.state;
+	if (bits != 32u || !state.program.bda_group_walks) {
+		return LoadBdaEach(ctx, inst, mem, bits);
+	}
+	ValueEmitContext::BdaWalk key;
+	key.block = inst.Parent();
+	key.kind  = static_cast<uint32_t>(mem.kind);
+	key.low   = ctx.Arg(inst, 1);
+	if (mem.address_is_full) {
+		key.high = ctx.Arg(inst, 2);
+	} else {
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2) {
+			return LoadBdaEach(ctx, inst, mem, bits);
+		}
+		key.handle_low  = ctx.Arg(*handle, 0);
+		key.handle_high = ctx.Arg(*handle, 1);
+	}
+	key.active    = ctx.Arg(inst, inst.NumArgs() - 1);
+	key.immediate = mem.kind == IR::ResourceKind::ScalarAddress
+	                    ? static_cast<int32_t>(mem.offset & ~3u)
+	                    : static_cast<int32_t>(mem.offset);
+
+	auto& walks = ctx.bda_walks;
+	if (!walks.empty() && walks.back().block != key.block) {
+		walks.clear();
+	}
+	const auto same = [&](const ValueEmitContext::BdaWalk& walk) {
+		return walk.kind == key.kind && walk.low == key.low && walk.high == key.high &&
+		       walk.handle_low == key.handle_low && walk.handle_high == key.handle_high &&
+		       walk.active == key.active;
+	};
+	constexpr auto page_size = static_cast<int64_t>(BufferCache::CACHING_PAGESIZE);
+	auto           found     = std::find_if(walks.rbegin(), walks.rend(), same);
+	if (found == walks.rend() || key.immediate - found->immediate <= -page_size ||
+	    key.immediate - found->immediate >= page_size) {
+		const auto address = GuestAddress(ctx, inst, mem);
+		key.pointer        = EmitValueOrDefaultIfCondition(state, key.active, TypeDeviceAddress(state),
+		                                                   ConstantDeviceAddress(state, 0),
+		                                                   [&]() { return GetBdaPointer(ctx, address); });
+		const auto low     = Unary(state, OpUConvert, TypeU32(state), address);
+		key.page_offset    = Binary(state, OpBitwiseAnd, TypeU32(state), low,
+		                            ConstantU32(state, static_cast<uint32_t>(page_size - 1)));
+		key.aligned        = Binary(state, OpIEqual, TypeBool(state),
+		                            Binary(state, OpBitwiseAnd, TypeU32(state), low, ConstantU32(state, 3)),
+		                            ConstantU32(state, 0));
+		if (found != walks.rend()) {
+			*found = key;
+		} else {
+			walks.push_back(key);
+			found = walks.rbegin();
+		}
+	}
+	const auto walk  = *found;
+	const auto delta = key.immediate - walk.immediate;
+	// (The page offset plus the difference, as U32, is at most a page less a dword exactly when it lies in the page.)
+	const auto in_page =
+	    delta == 0 ? walk.aligned
+	               : AndCondition(state, walk.aligned,
+	                              Binary(state, OpULessThanEqual, TypeBool(state),
+	                                     Binary(state, OpIAdd, TypeU32(state), walk.page_offset,
+	                                            ConstantU32(state, static_cast<uint32_t>(delta))),
+	                                     ConstantU32(state, static_cast<uint32_t>(page_size) - 4u)));
+	const auto mapped = AndCondition(state, in_page,
+	                                 Binary(state, OpINotEqual, TypeBool(state), walk.pointer,
+	                                        ConstantDeviceAddress(state, 0)));
+	const auto shared = EmitValueOrZeroIfCondition(state, mapped, [&]() {
+		const auto address = delta == 0 ? walk.pointer
+		                                : Binary(state, OpIAdd, TypeDeviceAddress(state), walk.pointer,
+		                                         ConstantDeviceAddress(state, static_cast<uint64_t>(delta)));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction({OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address});
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpLoad, TypeU32(state), value, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
+		return value;
+	});
+	const auto own = EmitValueOrZeroIfCondition(state, Unary(state, OpLogicalNot, TypeBool(state), in_page),
+	                                            [&]() { return LoadBdaEach(ctx, inst, mem, bits); });
+	return Select(state, TypeU32(state), in_page, shared, own);
 }
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,

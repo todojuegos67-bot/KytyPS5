@@ -6,7 +6,6 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
-#include "writeback-verify.h"
 
 #include <atomic>
 #include <immintrin.h>
@@ -277,16 +276,6 @@ private:
 		m_readable    = readable;
 		if (mask.None()) {
 			return;
-		}
-		// (Diagnostic, KYTY_WRITEBACK_VERIFY: the pages becoming GPU-owned hashed, the ones given back forgotten.)
-		if (WritebackVerify::Enabled()) {
-			for (const auto [start, end]: mask) {
-				if constexpr (track) {
-					WritebackVerify::Owned(m_cpu_addr + start * TRACKER_PAGE_SIZE, end - start);
-				} else {
-					WritebackVerify::Released(m_cpu_addr + start * TRACKER_PAGE_SIZE, end - start);
-				}
-			}
 		}
 		if constexpr (track) {
 			m_page_manager.UpdatePageWatchersForRegion<true, true>(m_cpu_addr, mask);

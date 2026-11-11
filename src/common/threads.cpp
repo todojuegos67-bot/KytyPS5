@@ -19,6 +19,10 @@
 #define KYTY_POSIX_HIGH_RES_SLEEP
 #include <ctime>
 #endif
+#if defined(__linux__)
+#include <cstdlib>
+#include <immintrin.h>
+#endif
 
 #include <sstream>
 #include <string>
@@ -347,6 +351,21 @@ Mutex::~Mutex() {
 void Mutex::Lock() {
 #ifdef KYTY_WIN_CS
 	EnterCriticalSection(&m_mutex->m_cs);
+#elif defined(__linux__)
+	// Linux: a short spin before blocking, as Windows' critical sections do; a contended std::mutex otherwise goes
+	// straight to a futex wait and its wake-up system call. KYTY_LINUX_FAST_LOCKS=0: blocks at once.
+	static const bool fast_locks = [] {
+		const char* value = std::getenv("KYTY_LINUX_FAST_LOCKS");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (fast_locks) {
+		if (m_mutex->m_mutex.try_lock()) return;
+		for (int spin = 0; spin < 4000; ++spin) {
+			_mm_pause();
+			if ((spin & 15) == 15 && m_mutex->m_mutex.try_lock()) return;
+		}
+	}
+	m_mutex->m_mutex.lock();
 #else
 	m_mutex->m_mutex.lock();
 #endif

@@ -81,7 +81,8 @@ inline int controller_get_axis(int min, int max, int value) {
 
 void Connect(int id);
 void Disconnect(int id);
-void SetButton(int id, uint32_t button, bool down);
+// `queued_ms`: a press's time in SDL's event queue (the input timing in the log, issue #236; 0: not known).
+void SetButton(int id, uint32_t button, bool down, uint32_t queued_ms = 0);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
@@ -111,6 +112,11 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info);
 int KYTY_SYSV_ABI PadResetLightBar(int handle);
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param);
+
+// The game's vibration as rumble on a pad without the DualSense's haptics (an Xbox controller, a Steam Deck's; issue
+// #236): the vibration port's audio (signed 16-bit, or float when `is_float`; `gains` the guest's per channel), its
+// peaks per channel driving the active pad's two motors. For when no DualSense haptics endpoint takes that port.
+void RumbleFromVibrationAudio(const void* data, uint32_t frames, uint32_t channels, bool is_float, const float* gains);
 
 } // namespace Libs::Controller
 

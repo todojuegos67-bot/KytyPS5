@@ -346,14 +346,6 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 	}
 }
 
-[[nodiscard]] inline constexpr bool
-CanUseVideoOutNativeWithoutUpload(VideoOutCompression compression, bool render_target,
-                                  bool gpu_modified, bool guest_modified) noexcept {
-	return compression != VideoOutCompression::Uncompressed &&
-	       compression != VideoOutCompression::Unsupported && !guest_modified &&
-	       (render_target || gpu_modified);
-}
-
 struct VideoOutPixelFormatInfo {
 	vk::Format             format            = vk::Format::eUndefined;
 	Prospero::BufferFormat guest_format      = Prospero::BufferFormat::kInvalid;

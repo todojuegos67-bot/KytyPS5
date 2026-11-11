@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -12,6 +13,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
+#include "file-offload.h"
 #include "local-platform.h"
 #include "scene-tags.h"
 #include "shader-gate.h"
@@ -20,8 +22,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -1607,10 +1611,20 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		const auto root      = Common::PathToString(LibKernel::FileSystem::GetRealFilename("/app0"));
 		const auto id        = title + (version.empty() ? "" : "_" + version);
 		const auto recording = "_PipelineCache/files/" + id + ".files";
-		SeedFileRecording(recording, "tools/local/static-precompile/files-" + id + ".files");
+		// (The EU and Asian editions take the US one's: Libs::Graphics::DemonsSouls::ShippedTitle.)
+		auto            released = "tools/local/static-precompile/files-" + id + ".files";
+		std::error_code error;
+		if (const auto shipped = Libs::Graphics::DemonsSouls::ShippedTitle(title);
+		    shipped != title && !std::filesystem::exists(released, error))
+			released = "tools/local/static-precompile/files-" + std::string(shipped) + id.substr(title.size()) + ".files";
+		SeedFileRecording(recording, released);
 		LocalPlatform::FollowKeptFiles(recording, root);
 	});
 	if (uint64_t kept_size = 0; const auto kept = LocalPlatform::OpenKeptReadFile(host_path, &kept_size)) {
+		const struct Done {
+			const std::string& path;
+			~Done() { LocalPlatform::DoneKeptReadFile(path); }
+		} done {host_path};
 		opening = Clock::now() - start;
 		if (file_offset >= kept_size) {
 			return OK;
@@ -1641,12 +1655,19 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		}
 		LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
 		LogAprRead(host_path, destination, *bytes_read, file_offset);
+		FileOffload::NoteRead(host_path, destination, *bytes_read, file_offset);
 		return OK;
 	}
 
 	Common::File file;
 	if (!file.Open(Common::PathFromUtf8(host_path), Common::File::Mode::Read)) {
 		LOGF("\tAPR read missing host file: %s\n", host_path.c_str());
+		// (In the run log too, the first few: a game whose file reads fail waits on its loading screen, issue #249.)
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("APR: the game's file %s could not be opened\n", host_path.c_str());
+			std::fflush(stdout);
+		}
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
 	opening = Clock::now() - start;
@@ -1687,6 +1708,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
 
 	file.Close();
+	FileOffload::NoteRead(host_path, destination, *bytes_read, file_offset);
 	return OK;
 }
 

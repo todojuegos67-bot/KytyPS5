@@ -28,7 +28,7 @@ fork's `KYTY_*` names; the ideas carry over to any HLE PS5 emulator. Title-speci
 | | Batch boundaries wait while the GPU still runs handed work | +3.6%, 1% low +3 | fewer, larger submissions without starving the GPU |
 | | Engine linear-copy compute shader on the CPU: detected from registers, writes only differing pages through the backing view keeping protection, big compares on helpers, accepted across consecutive mappings | +0.8%, +0.4%, +1.8%, -0.15 ms chain; one level 69 -> 85 fps | a refused copy made its destination GPU-owned and every table read of it a sync readback |
 | | Wave64 programs proven lane-local run one lane per invocation on 32-wide GPUs | GPU 10.05 -> 9.07 ms | emulating 2 lanes per invocation doubled registers and code |
-| Build | -O3 + ThinLTO; PGO + AOT-compiled resource-table plans; PGO retrained after big changes | ~+4%; +8.4%; +3% per retrain | a stale profile loses it; ship x86-64-v3 (-march=native leaked GFNI/VNNI into a build) |
+| Build | -O3 + ThinLTO; PGO, retrained after big changes | ~+4%; render -3..-5% per retrain | a stale profile loses it (a new branch drops a function's profile); ship x86-64-v3 (-march=native leaked GFNI/VNNI into a build) |
 | Coherence | Readbacks on a transfer-only queue, waiting only for the last writer's timeline value | sync downloads 1.19 -> 0.29 ms/frame; +3.6% | 83% read data finished frames earlier |
 | | Fault handler releases its lock before mprotect; reprotect on a worker; 64 KiB "image here" bitmaps | +1.1 fps; mprotect 608 -> 320/frame; +0.7 fps | the render thread spun ~300x/frame on that lock; cheap negative lookups |
 | | Readback readiness checked only over GPU-owned pages actually written back | +6.5% | whole-window checks waited on unrelated writers |

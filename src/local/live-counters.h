@@ -7,6 +7,10 @@
 #include <chrono>
 #include <cstdlib>
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace LiveCounters {
 
 enum Id : uint32_t {
@@ -50,9 +54,6 @@ enum Id : uint32_t {
 	RbRejectImage,         // ... an image overlaps the window
 	RbRejectCapacity,      // ... more than the download capacity
 	RbQueueDone,           // guest readbacks on the copy engine: no GPU write of the bytes in flight
-	RbQueueInflight,       // ... waiting only for their last writer (KYTY_READBACK_QUEUE=2)
-	RbQueueVerified,       // copy-engine copies compared with a graphics-queue copy (mode 3)
-	RbQueueMismatch,       // ... that differed
 	IndirectTables,        // indirect register tables / command buffers synchronized before parsing
 	DirectDraws,           // prepared draws recorded directly (not as a recording packet)
 	MeshDraws,             // ... of them, mesh-shader draws
@@ -72,9 +73,6 @@ enum Id : uint32_t {
 	BackingHoldZeroUs,     // backing store mutex held to zero new allocations (any thread), microseconds
 	BackingHoldWriteUs,    // ... held for backing writes (GPU readback results)
 	BackingHoldMapUs,      // ... held for mapping changes
-	AliasRebuilds,         // rebuilds of the guest backing alias intervals (IsUniqueGuestBackingRange)
-	AliasRebuildUs,        // ... their time in microseconds
-	AliasMaps,             // ... guest mappings summed over the rebuilds
 	UnmapFinishes,         // guest unmaps that waited for a download of an image over the range (GpuResourceManager::UnmapMemory)
 	UnmapFinishUs,         // ... their wait in microseconds
 	PartialDirtyFaults,    // CPU writes into large images recorded as dirty ranges (KYTY_PARTIAL_IMAGE_DIRTY)
@@ -196,17 +194,88 @@ enum Id : uint32_t {
 	ParkedSplits,          // views split for real: something mapped over a range parked in them (Materialize)
 	TimelineQueries,       // timeline semaphore reads (vkGetSemaphoreCounterValue: a system call on Linux' RADV, issue #80)
 	TimelineQueriesRender, // ... by the render thread
+	UploadSleeps,          // times the upload worker went to sleep (its next push pays a wake-up system call)
+	RecordSleeps,          // ... the recording worker (its next publish)
+	SpinGateShuts,         // times the workers stopped spinning: the process's CPUs had fewer than three idle (spin-gate.h)
+	ReadGuardFaults,       // KYTY_READ_GUARD: faults of guest pages' read guards (each armed again at once)
+	ReadGuardSettles,      // ... served pages still guarded after, given their trackers' protection
+	ReadHotLocks,          // KYTY_HOT_READS: guest pages read back, their backing pages locked (no access, not guards)
+	ReadHotCools,          // ... not read back for a while: guards again, unlocked
+	ReadHotFull,           // ... read back but not locked: as many locked already (GuestAddressSpace::HotReadsMax)
+	UnmappedUploadBytes,   // whole-image upload bytes over unmapped guest memory, zeros written on the GPU instead
+	Presents,              // frames the presenter gave the swapchain (Windows: its own thread with direct presentation off)
+	PresentsReplaced,      // ... frames a newer one replaced while they waited, never shown
+	PresentsNotDue,        // ... frames dropped because the display could not take them yet
+	ReadGuardRaces,        // KYTY_READ_GUARD_RACES=1: read guard faults whose page another thread read before it was guarded again
+	RbSpans,               // KYTY_READBACK_SPAN: readbacks copied from more than one host buffer
+	GuestBarrierCs,        // the game's compute partial flushes (full barriers: CommandProcessor::EmitGlobalBarrier)
+	GuestBarrierGfx,       // ... vertex and pixel partial flushes (full barriers)
+	GuestBarrierCache,     // ... render target cache flush events (full barriers)
+	GuestBarrierRelease,   // ... end-of-pipe releases with a cache action (full barriers)
+	UploadHelpUs,          // the render thread's time running upload jobs itself while it drained them (AsyncUpload::Drain)
 	TableGatherMemoHits,   // KYTY_TABLE_GATHER_MEMO (table-xpr.inc TableGather): V#s whose words equalled the last gathered at their index (no hash)
-	Pm4RegfileFast,        // KYTY_PM4_REGFILE: indirect-table register values stored without their handler call (raw / ign)
-	Pm4RegfileMismatch,    // ... KYTY_PM4_REGFILE=2: values whose handler result differed from the plain store (must stay 0)
-	UploadLaneRuns,        // KYTY_UPLOAD_LANES: runs whose write protections were split over the two upload lanes
-	UploadLaneJobs,        // ... protection jobs the second lane ran
-	UploadLaneMismatch,    // ... =3: order-rule violations found (must stay 0)
-	UploadLaneJoinUs,      // ... the worker's wait for the second lane after its own lane's jobs, us
-	UploadLaneFutexJoins,  // ... joins that outlasted the spin and slept on the futex
-	UploadSleeps,
-	SpinGateShuts,
-	UploadHelpUs,
+	ScoutChecks,           // table draws TableDraw evaluated with the scout running (KYTY_SCOUT, scout.h)
+	ScoutUsed,             // ... whose ticket held (1: used; 2: compared)
+	ScoutLostNoView,       // ... none: the pair has no view (not the flat form)
+	ScoutLostMissing,      // ... none: the scout made no ticket for the draw
+	ScoutLostIdentity,     // ... another packet's
+	ScoutLostPair,         // ... another view's (the pair packed again or reset)
+	ScoutLostRegisters,    // ... other user data than the render thread's
+	ScoutLostEpoch,        // ... the mapping epoch moved
+	ScoutLostWatched,      // ... a page of its tables has read watchers now
+	ScoutMismatches,       // KYTY_SCOUT=2: tickets that differ from the render thread's evaluation
+	ScoutMismatchRefused,  // ... the render thread's evaluation failed
+	ScoutMismatchSlots,    // ... in the slots
+	ScoutMismatchWords,    // ... in the T#/S# words
+	ScoutMismatchLod,      // ... in the LOD statistics words
+	ScoutMismatchEntries,  // ... in the V#s or their entries
+	ScoutSubmissions,      // the scout thread: submissions it walked
+	ScoutDrawPackets,      // ... draw packets in them
+	ScoutTickets,          // ... tickets made
+	ScoutTicketWords,      // ... their data words
+	ScoutNotTable,         // ... draws with tessellation or no vertex program (none)
+	ScoutNoView,           // ... draws whose pair it has no view of
+	ScoutConstant,         // ... draws while a submission with constant engine commands may be unfinished
+	ScoutBehind,           // ... draws the render thread reached first
+	ScoutRefused,          // ... draws whose tables are unmapped or out of their bounds
+	ScoutShort,            // ... draws whose tables a guarded copy could not read
+	ScoutTooBig,           // ... draws whose ticket would not fit
+	ScoutWaitsPassed,      // ... waits on words the stream wrote
+	ScoutWaitsStopped,     // ... other waits and rewinds, where it waited for the render thread
+	ScoutRewinds,          // ... rewinds
+	ScoutAbandoned,        // ... submissions it left unwalked or part-walked (render thread past, memory unreadable)
+	ScoutLeadStalls,       // ... draws it waited at (the lead or the ticket ring full)
+	ScoutFeedFull,         // submissions not fed: the scout's feed was full
+	ScoutNoViewOther,      // ... draws whose pair's directory entry holds another pair's view
+	ScoutLostWritten,      // table draws whose ticket's pages the emulator wrote after the scout read them
+	ScoutMissUnwalked,     // no ticket at TableDraw, by the scout's reason (scout.h Reason, in its order): none noted
+	ScoutMissTicket,       // ... it made one (not found)
+	ScoutMissNotNative,    // ... not a native draw packet
+	ScoutMissContinuation, // ... a run's later packet
+	ScoutMissNotTable,     // ... tessellation or no vertex program
+	ScoutMissConstant,     // ... constant engine commands pending
+	ScoutMissBehind,       // ... the render thread there first
+	ScoutMissNoViewEmpty,  // ... no view in the directory entry
+	ScoutMissNoViewOther,  // ... another pair's view there
+	ScoutMissRefused,      // ... unmapped or out of bounds
+	ScoutMissShort,        // ... a guarded copy stopped short
+	ScoutMissTooBig,       // ... too big
+	ScoutMissFenced,       // ... a submission before it not walked whole (State::fence)
+	ScoutBackingRanges,    // the scout thread: ranges on watched pages it read from the backing
+	ScoutBackingTickets,   // ... tickets with such a range
+	ScoutUsedBacking,      // table draws whose ticket held with such a range (counted in ScoutUsed too)
+	ScoutLostDirty,        // ... none: such a range has GPU-written bytes now
+	ScoutLostChanged,      // ... none: such a range's bytes differ from the ticket's now
+	ScoutWriteBacks,       // GPU results copied into guest memory, noted in the scout's write ring
+	ScoutLostWriteBack,    // table draws whose ticket such a write refused (counted in ScoutLostWritten too)
+	ScoutWaitChecks,       // KYTY_SCOUT=2 (Scout::CheckWait): queue 0's met waits the scout's rule passes
+	ScoutWaitChanged,      // ... of which a word holds another value than the command processor's last
+	ScoutWaitOther,        // ... queue 0's met waits it doesn't pass
+	ScoutMismatchApply,    // KYTY_SCOUT=2: tickets whose slots are right and whose apply's block differs
+	ScoutApplyRuns,        // ... compared tickets: their stages' runs
+	ScoutApplySegments,    // ... and their segments
+	ScoutStoodDown,        // the scout thread: submissions it left or didn't walk while the spin gate was shut (spin-gate.h)
+	ScoutFenced,           // KYTY_SCOUT: draws with no ticket while a submission before them was not walked whole (State::fence)
 	EagerWritten,           // live eager_feedback: completed snapshots written back before any fault
 	EagerStale,             // ... dropped: the slot invalidated (a later GPU write) or reused
 	EagerClean,             // ... dropped: no GPU-modified page left (a fault or a CPU write took it first)
@@ -214,11 +283,328 @@ enum Id : uint32_t {
 	EagerVerified,          // live eager_feedback_verify N: write-backs checked against a synchronous readback
 	EagerMismatch,          // ... whose snapshot bytes differed (zero is the bar)
 	FeedbackBatches,        // copy-feedback batches recorded as an open buffer closed (KYTY_FEEDBACK_BATCH)
+	SerialsUnattributed,    // image state changes no image was named for (every serial sum moves: KYTY_TABLE_SERIALS)
+	SerialsSkipped,         // dirty table draws' targets or set checks a serial sum proved unneeded (the epoch had moved)
+	SerialsUnsafe,          // KYTY_TABLE_SERIALS=2: ... that the check then needed (refused, or moved an image): must be 0
+	SerialsExtra,           // KYTY_TABLE_SERIALS=2: checks the sum asked for that the epoch had not
+	TableMemoHits,          // KYTY_TABLE_MEMO (table-xpr.inc TableTry): table draws that took their pair and key's last variant, state and set
+	TableMemoVerified,      // live table_memo_verify N: table memo hits whose variant, draw state and set were looked up the full way as well
+	TableMemoMismatch,      // ... that differed (a TABLE_MEMO_MISMATCH line each, the first 8; the full path's taken)
+	Pm4RegfileFast,        // KYTY_PM4_REGFILE: indirect-table register values stored without their handler call (raw / ign)
+	Pm4RegfileMismatch,    // ... KYTY_PM4_REGFILE=2: values whose handler result differed from the plain store (must stay 0)
+	UploadLaneRuns,        // KYTY_UPLOAD_LANES: runs whose write protections were split over the two upload lanes
+	UploadLaneJobs,        // ... protection jobs the second lane ran
+	UploadLaneMismatch,    // ... =3: order-rule violations found (must stay 0)
+	UploadLaneJoinUs,      // ... the worker's wait for the second lane after its own lane's jobs, us
+	UploadLaneFutexJoins,  // ... joins that outlasted the spin and slept on the futex
+	DrawIndirectTables,   // live spec_draw_indirect: DRAW_INDIRECT (non-indexed) packets drawn as table draws, any thread
+	DrawIndirectVerified, // live spec_draw_indirect_verify: those table draws checked against the normal path's (VerifyDrawIndirect)
+	DrawIndirectMismatch, // ... that differed in a field it checks (a DRAW_INDIRECT_VERIFY line each, the first 8)
+	SpecOneSetVerified,   // live spec_read_one_set_verify N: reads pending_set cleared, every Nth put through the four searches
+	SpecOneSetMismatch,   // ... of them, ones the four searches did not clear (a SPEC_ONE_SET_MISMATCH line each, the first 8)
+	KeptPasses,            // segments that recorded nothing, the open buffer and its pass kept (KYTY_SPECULATE_KEEP_PASS)
+	FillBufferClears,      // image-clear fills over plain buffer memory made as transfer fills (KYTY_FILL_BUFFER_CLEARS)
+	SpecWalkDirect,       // live spec_walk_from_stamp: clean-read walks the latest stamp's entry answered
+	SpecCommitVerified,   // live spec_commit_verify N: filter skips and stamp-led walks checked the old way as well
+	SpecCommitMismatch,   // ... that disagreed (zero is the bar)
 	Count
 };
 
 inline constexpr const char* Names[Count] = {
-    "window_faults", "window_pages", "write_faults", "read_faults", "reprotects", "reprotect_pages", "unprotects", "unprotect_pages", "protect_calls", "protect_calls_render", "upload_copies", "upload_bytes", "sync_downloads", "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored", "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen", "xpr_miss_budget", "readback_regions", "table_draws", "table_evals", "table_stores", "table_continued", "table_store_variant", "table_store_targets", "table_refused_sets", "table_dispatches", "table_registered", "render_passes", "writeback_skips", "backing_write_waits", "backing_write_wait_us", "gc_image_deletes", "gc_buffer_deletes", "image_refills", "image_refill_bytes", "image_init_us", "buffer_sync_us", "draw_us", "region_sync_us", "async_draw_wait_us", "async_draw_skips", "queue_lock_us", "translate_us", "translates", "compute_pipeline_us", "compute_pipelines", "graphics_pipeline_us", "graphics_pipelines", "flip_slot_wait_us", "inorder_uploads", "inorder_upload_bytes", "level_refreshes", "level_skipped_bytes", "table_no_set", "table_draw_native", "table_store_deferred", "upload_wait_us", "upload_busy_us", "record_wait_us", "upload_call_us", "upload_shared_runs", "upload_guard_stops", "sparse_upload_pieces", "table_proof_mismatches", "table_ring_copies", "table_ring_bytes", "table_ring_shared", "table_ring_shared_bytes", "rb_narrowed", "rb_window_narrowed", "unmap_buffer_deletes", "bda_fault_pages", "backing_span_writes", "discarded_gpu_bytes", "guest_move_bytes", "guest_move_same_bytes", "guest_move_gpu_bytes", "unmap_buffer_splits", "unmap_split_freed_bytes", "table_written_memo", "shortcut_mismatches", "remapped_views", "write_back_retries", "remap_window_writes", "download_pages_released", "address_space_holds", "address_space_hold_kt", "address_space_waits", "address_space_wait_kt", "address_space_wait_kt_render", "address_space_unmap_hold_kt", "address_space_busy_waits", "gpu_unmap_kt", "gpu_map_kt", "placeholder_calls", "placeholder_kt", "parked_unmaps", "parked_releases", "parked_splits", "timeline_queries", "timeline_queries_render", "table_gather_memo_hits", "pm4_regfile_fast", "pm4_regfile_mismatch", "upload_lane_runs", "upload_lane_jobs", "upload_lane_mismatch", "upload_lane_join_us", "upload_lane_futex_joins", "upload_sleeps", "spin_gate_shuts", "upload_help_us", "eager_written", "eager_stale", "eager_clean", "eager_refused", "eager_verified", "eager_mismatch", "feedback_batches"};
+    "window_faults",
+    "window_pages",
+    "write_faults",
+    "read_faults",
+    "reprotects",
+    "reprotect_pages",
+    "unprotects",
+    "unprotect_pages",
+    "protect_calls",
+    "protect_calls_render",
+    "upload_copies",
+    "upload_bytes",
+    "sync_downloads",
+    "async_readbacks",
+    "readback_detaches",
+    "readback_evictions",
+    "dispatch_after_dispatch",
+    "dispatch_same_shader",
+    "pm4_suspends",
+    "submission_requeues",
+    "guest_commands",
+    "render_read_faults",
+    "srt_watched_reads",
+    "submission_slices",
+    "buffer_registrations",
+    "bda_rebuilds",
+    "region_syncs",
+    "region_skips",
+    "bda_full_syncs",
+    "bda_range_calls",
+    "bda_ranges",
+    "bda_range_mib",
+    "protect_calls_gfx",
+    "sync_reads_guest",
+    "sync_reads_render",
+    "rb_reject_size",
+    "rb_reject_backing",
+    "rb_reject_image",
+    "rb_reject_capacity",
+    "rb_queue_done",
+    "indirect_tables",
+    "direct_draws",
+    "mesh_draws",
+    "backing_read_bytes",
+    "backing_read_us",
+    "xpr_tries",
+    "xpr_hits",
+    "xpr_miss_key",
+    "xpr_miss_state",
+    "xpr_miss_target",
+    "xpr_miss_validate",
+    "xpr_stores",
+    "vblanks",
+    "async_image_bytes",
+    "backing_lock_waits",
+    "backing_lock_wait_us",
+    "backing_hold_zero_us",
+    "backing_hold_write_us",
+    "backing_hold_map_us",
+    "unmap_finishes",
+    "unmap_finish_us",
+    "partial_dirty_faults",
+    "partial_uploads",
+    "partial_upload_bytes",
+    "partial_fallbacks",
+    "partial_unmaps",
+    "stale_protect_repairs",
+    "readback_parts",
+    "gpu_range_entries",
+    "texture_unmaps",
+    "texture_unmap_us",
+    "texture_unmap_deletes",
+    "full_uploads",
+    "full_upload_bytes",
+    "async_pipelines",
+    "xpr_store_pending",
+    "dispatch_key_new",
+    "dispatch_key_same",
+    "dispatch_key_changed",
+    "draw_key_new",
+    "draw_key_same",
+    "xpr_direct_tries",
+    "xpr_direct_hits",
+    "xpr_stored",
+    "xpr_refuse_program",
+    "xpr_refuse_reads",
+    "xpr_refuse_bind",
+    "xpr_refuse_draw",
+    "xpr_relocated",
+    "xpr_relocated_stored",
+    "depth_overlaps",
+    "depth_overlap_bytes",
+    "xpr_miss_blocked",
+    "xpr_miss_refused",
+    "xpr_miss_unseen",
+    "xpr_miss_budget",
+    "readback_regions",
+    "table_draws",
+    "table_evals",
+    "table_stores",
+    "table_continued",
+    "table_store_variant",
+    "table_store_targets",
+    "table_refused_sets",
+    "table_dispatches",
+    "table_registered",
+    "render_passes",
+    "writeback_skips",
+    "backing_write_waits",
+    "backing_write_wait_us",
+    "gc_image_deletes",
+    "gc_buffer_deletes",
+    "image_refills",
+    "image_refill_bytes",
+    "image_init_us",
+    "buffer_sync_us",
+    "draw_us",
+    "region_sync_us",
+    "async_draw_wait_us",
+    "async_draw_skips",
+    "queue_lock_us",
+    "translate_us",
+    "translates",
+    "compute_pipeline_us",
+    "compute_pipelines",
+    "graphics_pipeline_us",
+    "graphics_pipelines",
+    "flip_slot_wait_us",
+    "inorder_uploads",
+    "inorder_upload_bytes",
+    "level_refreshes",
+    "level_skipped_bytes",
+    "table_no_set",
+    "table_draw_native",
+    "table_store_deferred",
+    "upload_wait_us",
+    "upload_busy_us",
+    "record_wait_us",
+    "upload_call_us",
+    "upload_shared_runs",
+    "upload_guard_stops",
+    "sparse_upload_pieces",
+    "table_proof_mismatches",
+    "table_ring_copies",
+    "table_ring_bytes",
+    "table_ring_shared",
+    "table_ring_shared_bytes",
+    "rb_narrowed",
+    "rb_window_narrowed",
+    "unmap_buffer_deletes",
+    "bda_fault_pages",
+    "backing_span_writes",
+    "discarded_gpu_bytes",
+    "guest_move_bytes",
+    "guest_move_same_bytes",
+    "guest_move_gpu_bytes",
+    "unmap_buffer_splits",
+    "unmap_split_freed_bytes",
+    "table_written_memo",
+    "shortcut_mismatches",
+    "remapped_views",
+    "write_back_retries",
+    "remap_window_writes",
+    "download_pages_released",
+    "address_space_holds",
+    "address_space_hold_kt",
+    "address_space_waits",
+    "address_space_wait_kt",
+    "address_space_wait_kt_render",
+    "address_space_unmap_hold_kt",
+    "address_space_busy_waits",
+    "gpu_unmap_kt",
+    "gpu_map_kt",
+    "placeholder_calls",
+    "placeholder_kt",
+    "parked_unmaps",
+    "parked_releases",
+    "parked_splits",
+    "timeline_queries",
+    "timeline_queries_render",
+    "upload_sleeps",
+    "record_sleeps",
+    "spin_gate_shuts",
+    "read_guard_faults",
+    "read_guard_settles",
+    "read_hot_locks",
+    "read_hot_cools",
+    "read_hot_full",
+    "unmapped_upload_bytes",
+    "presents",
+    "presents_replaced",
+    "presents_not_due",
+    "read_guard_races",
+    "rb_spans",
+    "gb_cs",
+    "gb_gfx",
+    "gb_cache",
+    "gb_release",
+    "upload_help_us",
+    "table_gather_memo_hits",
+    "scout_checks",
+    "scout_used",
+    "scout_lost_noview",
+    "scout_lost_missing",
+    "scout_lost_identity",
+    "scout_lost_pair",
+    "scout_lost_registers",
+    "scout_lost_epoch",
+    "scout_lost_watched",
+    "scout_mismatches",
+    "scout_mm_refused",
+    "scout_mm_slots",
+    "scout_mm_words",
+    "scout_mm_lod",
+    "scout_mm_entries",
+    "scout_submissions",
+    "scout_draw_packets",
+    "scout_tickets",
+    "scout_ticket_words",
+    "scout_not_table",
+    "scout_noview",
+    "scout_constant",
+    "scout_behind",
+    "scout_refused",
+    "scout_short",
+    "scout_too_big",
+    "scout_waits_passed",
+    "scout_waits_stopped",
+    "scout_rewinds",
+    "scout_abandoned",
+    "scout_lead_stalls",
+    "scout_feed_full",
+    "scout_noview_other",
+    "scout_lost_written",
+    "scout_miss_unwalked",
+    "scout_miss_ticket",
+    "scout_miss_not_native",
+    "scout_miss_continuation",
+    "scout_miss_not_table",
+    "scout_miss_constant",
+    "scout_miss_behind",
+    "scout_miss_noview_empty",
+    "scout_miss_noview_other",
+    "scout_miss_refused",
+    "scout_miss_short",
+    "scout_miss_too_big",
+    "scout_miss_fenced",
+    "scout_backing_ranges",
+    "scout_backing_tickets",
+    "scout_used_backing",
+    "scout_lost_dirty",
+    "scout_lost_changed",
+    "scout_write_backs",
+    "scout_lost_write_back",
+    "scout_wait_checks",
+    "scout_wait_changed",
+    "scout_wait_other",
+    "scout_mm_apply",
+    "scout_apply_runs",
+    "scout_apply_segments",
+    "scout_stood_down",
+    "scout_fenced",
+    "eager_written",
+    "eager_stale",
+    "eager_clean",
+    "eager_refused",
+    "eager_verified",
+    "eager_mismatch",
+    "feedback_batches",
+    "serials_unattributed",
+    "serials_skipped",
+    "serials_unsafe",
+    "serials_extra",
+    "table_memo_hits",
+    "table_memo_verified",
+    "table_memo_mismatch",
+    "pm4_regfile_fast",
+    "pm4_regfile_mismatch",
+    "upload_lane_runs",
+    "upload_lane_jobs",
+    "upload_lane_mismatch",
+    "upload_lane_join_us",
+    "upload_lane_futex_joins",
+    "draw_indirect_tables",
+    "draw_indirect_verified",
+    "draw_indirect_mismatch",
+    "spec_one_set_verified",
+    "spec_one_set_mismatch",
+    "kept_passes",
+    "fill_buffer_clears",
+    "spec_walk_direct",
+    "spec_commit_verified",
+    "spec_commit_mismatch",
+};
 
 inline std::atomic<uint64_t> g_values[Count];
 // The render thread's counts: it is their only writer, so an increment needs no locked
@@ -291,7 +677,10 @@ inline void AddGranule(uint64_t address, GranuleField field, uint64_t n) {
 // PM4 packets per opcode (render thread; relaxed atomics so the live thread can read).
 inline std::atomic<uint64_t> g_pm4[256];
 inline void AddPm4(uint32_t opcode) {
-	// Only the render thread counts: no locked add.
+	// Only the render thread counts: no locked add. (A speculation's threads and state pass skip it: their unlocked adds
+	// to the render thread's counts moved its cache lines between up to ten threads on every packet.)
+	// (KYTY_SPECULATE unset or 0: only the render thread runs packets; the global first, no thread-local read.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !g_single_writer) return;
 	auto& value = g_pm4[opcode & 0xffu];
 	value.store(value.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }

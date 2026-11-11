@@ -10432,8 +10432,14 @@ public:
       sampled.view = view;
       sampled.layout = image.backing.state.layout;
       Dispatch(test, compiled, output, nullptr, &sampled, nullptr, nullptr, sampler);
-      Require(name, "native comparisons",
-              ReadBuffer(name, output, test.expected.size()) == test.expected,
+      const auto samples = ReadBuffer(name, output, test.expected.size());
+      if (samples != test.expected) {
+        std::string lines;
+        for (size_t i = 0; i < samples.size(); i++)
+          lines += fmt::format("{}{}:{:x}/{:x}", i ? " " : "", i, samples[i], test.expected[i]);
+        std::fprintf(stderr, "%s %s: got/expected %s\n", name, cube ? "cube" : "1D", lines.c_str());
+      }
+      Require(name, "native comparisons", samples == test.expected,
               "comparison samples lost a depth value or guest layer stride");
 
       image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
@@ -22844,10 +22850,7 @@ TestCase BufferFormatVariants() {
 // The runtime (portable) format decode against the descriptor-specialized one, for every format:
 // each load precedes every store, so both executions see the same source bytes.
 void CheckPortableFormatDecoder(bool emission_only, bool strict_specialization = false) {
-  namespace IR = ShaderRecompiler::IR;
   namespace Format = ShaderRecompiler::Format;
-  Require("PortableFormatDecoder", "configuration", IR::PortableShaders(),
-          "this test requires KYTY_PORTABLE_SHADERS=1");
   std::unique_ptr<VulkanHarness> vulkan;
   if (!emission_only) vulkan = std::make_unique<VulkanHarness>();
   const u32 subgroup = vulkan ? vulkan->SubgroupSize() : 32;
@@ -32392,16 +32395,27 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, MaskSccSaveexecBranchesTheWholeWave());
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--shader-cases-only") == 0) {
+  // --shader-cases-only <name>: the cases after that one (a run on past a failure, which aborts).
+  if ((argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--shader-cases-only") == 0) {
     VulkanHarness vulkan;
     const auto tests = MakeCases();
     const auto graphics_tests = MakeGraphicsCases();
     CheckOpcodeCoverage(tests, graphics_tests);
+    bool skipping = argc == 3;
     for (const auto &test : tests) {
-      RunCase(&vulkan, test);
+      if (!skipping) {
+        RunCase(&vulkan, test);
+      } else if (std::strcmp(test.name, argv[2]) == 0) {
+        skipping = false;
+      }
     }
     for (const auto &test : graphics_tests) {
-      RunGraphicsCase(&vulkan, test);
+      if (!skipping) {
+        RunGraphicsCase(&vulkan, test);
+      } else if (std::strcmp(test.name, argv[2]) == 0) {
+        skipping = false;
+      }
     }
     return 0;
   }

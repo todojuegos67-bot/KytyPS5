@@ -69,6 +69,9 @@ public:
 	// after a submission, a label or a guest command of the GPU thread: it flushes before each of them.
 	static void DeferReadProtection(bool on) noexcept;
 	static void FlushDeferredProtection() noexcept;
+	// The calling thread's deferred read protections over [vaddr, vaddr + size) applied now (the
+	// texture offload's hold in force at once); the others stay pending.
+	static void FlushDeferredProtection(uint64_t vaddr, uint64_t size) noexcept;
 	// Moves with each flush of the calling thread's deferred read protections: on the GPU thread, before each point at
 	// which the guest can learn that work it submitted ran (above). Until then the guest writes no memory that work
 	// reads: guest memory the GPU thread's translation reads twice in one epoch was not changed by the guest in
@@ -79,16 +82,21 @@ public:
 	// false when the page is watched. Checked and changed under the page's lock, so a watcher
 	// protecting the page meanwhile is not undone.
 	[[nodiscard]] bool RestoreIfUnwatched(uint64_t vaddr) noexcept;
+	// The page's protection as its watchers have it, or the guest's own when none holds it, under the page's lock
+	// (KYTY_READ_GUARD: a guard armed again after its fault may outlive a change another thread made meanwhile).
+	void SettleProtection(uint64_t vaddr) noexcept;
 	// From the first to the end of the last page of [vaddr, vaddr + size) a watcher holds (its host protection is the
 	// trackers'), by the pages' state: no system call. False when no page of the range has one.
 	[[nodiscard]] bool WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept;
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
-	// The texture offload's hold on whole pages (texture-offload.h): no access while it lasts, a count of its own beside
-	// the watchers (the memory tracker's read watcher of a page GPU work wrote stays its own); reads of them fault
-	// (HasReadWatchers).
-	template <bool track>
+	// The texture offload's hold on whole pages (texture-offload.h): no access while it lasts, a
+	// count of its own beside the watchers (the memory tracker's read watcher of a page GPU work
+	// wrote stays its own); reads of them fault (HasReadWatchers). `reapply` (a release): the
+	// offload changed the pages' host protection (a touch made them readable), so every page gets
+	// its protection again, the ones whose protection the release does not change too.
+	template <bool track, bool reapply = false>
 	void UpdateReadWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);

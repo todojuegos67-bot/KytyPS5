@@ -1,7 +1,9 @@
 #include "loader/gameArgs.h"
 
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "loader/demonsSoulsSuperResolution.h"
 #include "loader/runtimeLinker.h"
 
@@ -15,6 +17,8 @@
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace Loader::GameArgs {
 namespace {
@@ -57,36 +61,61 @@ const CamSpeed& Cam() {
 	return c;
 }
 
-// One "+name=value" line per entry of KYTY_GAME_CONVARS (';' or ',' between entries), then of
-// KYTY_GAME_CONVARS_EXTRA: the launcher sets KYTY_GAME_CONVARS itself, the extra list (a user environment variable) is
-// read after it, so its values win (A/B tests of single engine settings, e.g. r_enableSpotShadows=false).
+// One "+name=value" line per console variable: Demon's Souls' defaults, then those of KYTY_GAME_CONVARS (';' or ','
+// between entries), whose names replace the defaults'. The default: no XPR index-buffer culling, a GPU pass that culls
+// every object's triangles (~2800 compute dispatches a frame at Boletaria 1-1) before drawing them; the PC GPU draws
+// them all instead, the image unchanged (Boletaria 1-1 standing 34.30 -> 36.48 fps; doIndexBufferCulling=true: back).
+// sound_enableAmbisonics=false: the game's own mix for speakers. Left alone it gives a console's system a fifth-order ambisonics
+// scene to render, of which the emulator plays the first order (libAudio2.cpp): music and ambience close to mono (left and right
+// correlate 0.74 in the Nexus and 0.93 at Latria, here 0.27 and 0.42; issue #294) and speech 7 dB lower against the ambience.
+// The third-order voice files play here too, and the frames cost the same (=true: back).
+// Above a 60 Hz vblank also gameMinDeltaTime=0.004 (as run_ds.sh gives it): the game steps by at least a frame of its
+// target rate each frame, so every frame past 60 fps played it that much faster (whatever started the emulator).
+// KYTY_SKIP_LOGOS=1: the game's own cp11_debug_skipSplashScreens=true, no start-up logos (Sony Interactive Entertainment
+// presents, PlayStation Studios, Bluepoint: ~16 s that no button skips; issue #263). The opening cinematic still plays.
+// A test switch only: the launchers no longer offer it, as a player with it on crashed twice after ~50 minutes and
+// played over two hours without it (issue #266; in the game's code it only keeps the logo movie from starting).
+bool SkipLogos() {
+	const char* value = std::getenv("KYTY_SKIP_LOGOS");
+	return value != nullptr && value[0] == '1';
+}
+
 const std::string& ExtraLines() {
 	static const std::string lines = [] {
-		std::string out;
-		const char* value = std::getenv("KYTY_GAME_CONVARS");
-		const char* extra = std::getenv("KYTY_GAME_CONVARS_EXTRA");
-		std::string list  = value != nullptr ? value : "";
-		if (extra != nullptr && *extra != '\0') {
-			list += std::string(";") + extra;
+		std::vector<std::pair<std::string, std::string>> entries; // (name, "name=value")
+		const auto add = [&](const std::string& list) {
+			for (size_t at = 0; at < list.size();) {
+				auto end = list.find_first_of(";,", at);
+				if (end == std::string::npos) end = list.size();
+				const auto first = list.find_first_not_of(' ', at);
+				const auto last  = list.find_last_not_of(' ', end - 1);
+				if (first != std::string::npos && first < end && last >= first) {
+					auto       entry = list.substr(first, last - first + 1);
+					const auto name  = entry.substr(0, entry.find('='));
+					std::erase_if(entries, [&](const auto& held) { return held.first == name; });
+					entries.emplace_back(name, std::move(entry));
+				}
+				at = end + 1;
+			}
+		};
+		const char* value = std::getenv("KYTY_GAME_CONVARS"); // (0: none, not even the defaults)
+		if (value != nullptr && std::string_view(value) == "0") return std::string();
+		if (Libs::Graphics::DemonsSouls::IsSupportedGame()) {
+			add("doIndexBufferCulling=false");
+			add("sound_enableAmbisonics=false");
+			if (Config::GetVblankFrequency() > 60) add("gameMinDeltaTime=0.004");
+			if (SkipLogos()) add("cp11_debug_skipSplashScreens=true");
+		}
+		if (value != nullptr) add(value);
+		// (DeS port) KYTY_GAME_CONVARS_EXTRA (a user environment variable): read after the launcher's list, its values win.
+		if (const char* extra = std::getenv("KYTY_GAME_CONVARS_EXTRA"); extra != nullptr && *extra != '\0') {
+			add(extra);
 			std::printf("Game convars: KYTY_GAME_CONVARS_EXTRA=%s (after the launcher's)\n", extra);
 			std::fflush(stdout);
 		}
-		// (10-25) Keyboard and mouse: the camera speed raised to KYTY_KBM_CAM_MIN (KbmCameraSpeed): its own entry,
-		// the launcher's dropped.
-		const int  cam      = KbmCameraSpeed();
-		const bool cam_mine = cam > 0 && KbmCameraSpeedRaised();
-		for (size_t at = 0; at < list.size();) {
-			auto end = list.find_first_of(";,", at);
-			if (end == std::string::npos) end = list.size();
-			const auto first = list.find_first_not_of(' ', at);
-			const auto last  = list.find_last_not_of(' ', end - 1);
-			if (first != std::string::npos && first < end && last >= first) {
-				const auto entry = list.substr(first, last - first + 1);
-				if (!(cam_mine && entry.rfind("cp11_Setting_CameraSpeed", 0) == 0)) out += "+" + entry + "\n";
-			}
-			at = end + 1;
-		}
-		if (cam_mine) out += "+cp11_Setting_CameraSpeed=" + std::to_string(cam) + "\n";
+		// (10-25) Keyboard and mouse: the camera speed raised to KYTY_KBM_CAM_MIN (KbmCameraSpeed).
+		if (const int cam = KbmCameraSpeed(); cam > 0 && KbmCameraSpeedRaised())
+			add("cp11_Setting_CameraSpeed=" + std::to_string(cam));
 		// (ao-1028) KYTY_AO (rt-ao.cpp) replaces the game's own ambient occlusion: r_enableAmbientShadowing off, so the
 		// occlusion is never applied twice (KYTY_AO_GAME=keep leaves the game's on; a list naming the convar wins)
 		{
@@ -94,12 +123,16 @@ const std::string& ExtraLines() {
 			const char* game = std::getenv("KYTY_AO_GAME");
 			const bool  on   = ao != nullptr && *ao != '\0' && *ao != '0' && (*ao | 0x20) != 'n' && (*ao | 0x20) != 'o';
 			const bool  keep = game != nullptr && (game[0] | 0x20) == 'k';
-			if (on && !keep && list.find("r_enableAmbientShadowing") == std::string::npos) {
-				out += "+r_enableAmbientShadowing=false\n";
+			const bool  named = std::any_of(entries.begin(), entries.end(),
+			                                [](const auto& e) { return e.first == "r_enableAmbientShadowing"; });
+			if (on && !keep && !named) {
+				add("r_enableAmbientShadowing=false");
 				std::printf("Game convars: r_enableAmbientShadowing=false (KYTY_AO replaces the game's ambient occlusion)\n");
 				std::fflush(stdout);
 			}
 		}
+		std::string out;
+		for (const auto& [name, entry]: entries) out += "+" + entry + "\n";
 		return out;
 	}();
 	return lines;

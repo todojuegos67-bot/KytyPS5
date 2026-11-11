@@ -359,18 +359,117 @@ bool Load(std::span<const uint8_t> bytes, IR::ResourcePlan& plan, bool* defer_li
 	return !linear || plan.linear_srt != nullptr || (plan = {}, false);
 }
 
-// ---- (ds-pc-port37) A translated module: its specialization and compiled info. ----
+// A translated module's infos (the shader prefetch's cache on disk). From issue #200's patch (Psychowarden).
 namespace {
-constexpr uint32_t ModuleMagic = 0x4d4c5052u; // "RPLM"
-static_assert(std::is_trivially_copyable_v<IR::ResourceSpecialization::Buffer>);
-static_assert(std::is_trivially_copyable_v<IR::ResourceSpecialization::Image>);
+
 static_assert(std::is_trivially_copyable_v<IR::BdaReadSpan>);
 static_assert(std::is_trivially_copyable_v<IR::TablePlan::Slot>);
 static_assert(std::is_trivially_copyable_v<IR::TablePlan::Descriptor>);
 static_assert(std::is_trivially_copyable_v<IR::TablePlan::IndirectImage>);
 static_assert(std::is_trivially_copyable_v<std::array<IR::TablePlan::Operand, 4>>);
+static_assert(std::is_trivially_copyable_v<IR::ResourceSpecialization::Buffer>);
+static_assert(std::is_trivially_copyable_v<IR::ResourceSpecialization::Image>);
+
+void PutModule(Writer& w, const IR::CompiledShaderInfo& info, const IR::ResourceSpecialization& specialization) {
+	w.PutVector(info.bda_read_plan.spans);
+	w.Put(info.bda_read_plan.complete);
+	w.Put(info.stage);
+	w.Put(info.shader_hash);
+	w.Put(info.wave_size);
+	w.Put(info.user_data_base);
+	w.Put(info.user_data_count);
+	w.Put(info.scratch_dwords);
+	w.Put(info.param_export_mask);
+	w.Put(info.table_mode);
+	const auto& table = info.table_plan;
+	w.PutVector(table.slots);
+	w.PutVector(table.buffers);
+	w.PutVector(table.images);
+	w.PutVector(table.samplers);
+	w.PutVector(table.gpu);
+	w.PutVector(table.cpu);
+	w.Put(table.global_memory);
+	w.Put(table.dynamic_reads);
+	w.PutVector(table.indirect);
+	PutInfo(w, info.info);
+	const auto& bindings = info.bindings;
+	w.Put(bindings.push_data_start_dword);
+	w.Put(bindings.memory_offset_dword);
+	w.Put(bindings.memory_offset_count);
+	w.Put(bindings.buffer_word_count);
+	w.Put(bindings.lod_stats_count);
+	w.Put(bindings.table_block_dwords);
+	w.PutVector(bindings.user_data_registers);
+	w.Put(static_cast<uint32_t>(bindings.descriptors.size()));
+	for (const auto& descriptor: bindings.descriptors) {
+		w.Put(descriptor.kind);
+		w.PutVector(descriptor.resources);
+	}
+	w.PutVector(specialization.buffers);
+	w.PutVector(specialization.images);
+}
+
+bool GetModule(Reader& r, IR::CompiledShaderInfo& info, IR::ResourceSpecialization& specialization) {
+	auto&    table    = info.table_plan;
+	auto&    bindings = info.bindings;
+	uint32_t count    = 0;
+	if (!r.GetVector(info.bda_read_plan.spans) || !r.Get(info.bda_read_plan.complete) || !r.Get(info.stage) ||
+	    !r.Get(info.shader_hash) || !r.Get(info.wave_size) || !r.Get(info.user_data_base) || !r.Get(info.user_data_count) ||
+	    !r.Get(info.scratch_dwords) || !r.Get(info.param_export_mask) || !r.Get(info.table_mode) || !r.GetVector(table.slots) ||
+	    !r.GetVector(table.buffers) || !r.GetVector(table.images) || !r.GetVector(table.samplers) || !r.GetVector(table.gpu) ||
+	    !r.GetVector(table.cpu) || !r.Get(table.global_memory) || !r.Get(table.dynamic_reads) || !r.GetVector(table.indirect) ||
+	    !GetInfo(r, info.info) || !r.Get(bindings.push_data_start_dword) || !r.Get(bindings.memory_offset_dword) ||
+	    !r.Get(bindings.memory_offset_count) || !r.Get(bindings.buffer_word_count) || !r.Get(bindings.lod_stats_count) ||
+	    !r.Get(bindings.table_block_dwords) || !r.GetVector(bindings.user_data_registers) || !r.Get(count))
+		return false;
+	bindings.descriptors.resize(count);
+	for (auto& descriptor: bindings.descriptors)
+		if (!r.Get(descriptor.kind) || !r.GetVector(descriptor.resources)) return false;
+	return r.GetVector(specialization.buffers) && r.GetVector(specialization.images);
+}
+
+bool SameModule(const IR::CompiledShaderInfo& a, const IR::CompiledShaderInfo& b) {
+	return a.bda_read_plan == b.bda_read_plan && a.stage == b.stage && a.shader_hash == b.shader_hash &&
+	       a.wave_size == b.wave_size && a.user_data_base == b.user_data_base && a.user_data_count == b.user_data_count &&
+	       a.scratch_dwords == b.scratch_dwords && a.param_export_mask == b.param_export_mask && a.table_mode == b.table_mode &&
+	       a.table_plan == b.table_plan && a.info == b.info && a.bindings == b.bindings;
+}
+
 } // namespace
 
+bool SaveModule(const IR::CompiledShaderInfo& info, const IR::ResourceSpecialization& specialization, std::vector<uint8_t>& out) {
+	std::vector<uint8_t> bytes;
+	Writer               w(bytes);
+	PutModule(w, info, specialization);
+	// (A field the format misses shows here, not as a wrong module in a later session.)
+	IR::CompiledShaderInfo     info_back;
+	IR::ResourceSpecialization specialization_back;
+	Reader                     r(bytes);
+	if (bytes.size() > UINT32_MAX || !GetModule(r, info_back, specialization_back) || !r.AtEnd() ||
+	    !SameModule(info, info_back) || !(specialization == specialization_back))
+		return false;
+	Writer(out).Put(static_cast<uint32_t>(bytes.size()));
+	out.insert(out.end(), bytes.begin(), bytes.end());
+	return true;
+}
+
+bool LoadModule(std::span<const uint8_t> bytes, size_t& at, IR::CompiledShaderInfo& info,
+                IR::ResourceSpecialization& specialization) {
+	uint32_t size = 0;
+	if (at > bytes.size() || bytes.size() - at < sizeof(size)) return false;
+	std::memcpy(&size, bytes.data() + at, sizeof(size));
+	if (bytes.size() - at - sizeof(size) < size) return false;
+	Reader r(bytes.subspan(at + sizeof(size), size));
+	if (!GetModule(r, info, specialization) || !r.AtEnd()) return false;
+	at += sizeof(size) + size;
+	return true;
+}
+
+namespace {
+constexpr uint32_t ModuleMagic = 0x4d4c5052u; // "RPLM"
+} // namespace
+
+// (ds-pc-port37) A translated module: its specialization and compiled info (our prefetch store; upstream's own above).
 bool SaveModule(const IR::ResourceSpecialization& spec, const IR::CompiledShaderInfo& info, std::vector<uint8_t>& out) {
 	std::vector<uint8_t> bytes;
 	Writer               w(bytes);

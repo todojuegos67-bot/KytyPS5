@@ -39,7 +39,8 @@ struct Machine {
 	// The emulator's video memory and the budget Windows gives it (0: unknown).
 	uint64_t video_usage = 0, video_budget = 0;
 	// The logical processors' load (0..1) and efficiency class (a hybrid CPU's E cores have the lower one), their
-	// effective clocks in MHz (empty: unknown); all of them together, the emulator's CPU time (in cores' worth) and
+	// clocks in MHz (Windows: effective, Linux: /proc/cpuinfo; empty: unknown); all of them together,
+	// the emulator's CPU time (in cores' worth) and
 	// its render thread's (0..1).
 	std::vector<float>    core_load;
 	std::vector<uint8_t>  core_class;

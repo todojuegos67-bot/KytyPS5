@@ -275,19 +275,59 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	return args;
 }
 
+// The settings the emulator takes from its environment (src/local: KYTY_UPSCALER, KYTY_FRAMEGEN, ...), as NAME=VALUE.
+static QStringList CreateEmulatorEnvironment(const Configuration& info) {
+	using C = Configuration;
+	QStringList env;
+	switch (info.upscaler) {
+		case C::Upscaler::Fsr:
+			env << "KYTY_UPSCALER=fsr" << QStringLiteral("KYTY_FSR_SHARPNESS=%1").arg(info.fsr_sharpness / 100.0, 0, 'f', 2);
+			break;
+		case C::Upscaler::Dlss: env << "KYTY_UPSCALER=dlss"; break;
+		case C::Upscaler::Off: break;
+	}
+	// (Auto: the emulator's own choice.)
+	if (info.render_height != 0) env << QStringLiteral("KYTY_RENDER_HEIGHT=%1").arg(info.render_height);
+	switch (info.frame_generation) {
+		case C::FrameGeneration::Fsr2x: env << "KYTY_FRAMEGEN=1" << "KYTY_FRAMEGEN_BACKEND=fsr"; break;
+		case C::FrameGeneration::Dlss2x: env << "KYTY_FRAMEGEN=1"; break;
+		case C::FrameGeneration::Dlss3x: env << "KYTY_FRAMEGEN=2"; break;
+		case C::FrameGeneration::Dlss4x: env << "KYTY_FRAMEGEN=3"; break;
+		case C::FrameGeneration::Off: break;
+	}
+	switch (info.low_latency) {
+		case C::LowLatency::On: env << "KYTY_LOW_LATENCY=1"; break;
+		case C::LowLatency::AntiLag: env << "KYTY_LOW_LATENCY=1" << "KYTY_ANTI_LAG=1"; break;
+		case C::LowLatency::Off: break;
+	}
+	if (info.fps_overlay) env << "KYTY_FPS_HUD=1";
+	switch (info.pipeline_build) {
+		case C::PipelineBuild::FastFirst: env << "KYTY_PIPELINE_FAST_BUILD=1"; break;
+		case C::PipelineBuild::Optimized: env << "KYTY_PIPELINE_FAST_BUILD=0"; break;
+		case C::PipelineBuild::Auto: break;
+	}
+	if (!info.streamline_dir.isEmpty()) env << "KYTY_STREAMLINE_DIR=" + info.streamline_dir;
+	return env;
+}
+
 #ifdef __linux__
 static QString BashQuote(QString value) {
 	value.replace('\'', "'\\''");
 	return QStringLiteral("'") + value + QStringLiteral("'");
 }
 
-static bool CreateBashScript(const QString& interpreter, const QStringList& args,
+static bool CreateBashScript(const QString& interpreter, const QStringList& args, const QStringList& environment,
                              const QString& file_name) {
 	QFile file(file_name);
 	if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
 		QTextStream s(&file);
 
 		s << "#!/bin/bash\n";
+		// (In the script: a terminal that is already running may not pass the launcher's environment on.)
+		for (const auto& variable: environment) {
+			const auto equals = variable.indexOf('=');
+			s << "export " << variable.left(equals) << "=" << BashQuote(variable.mid(equals + 1)) << "\n";
+		}
 		s << BashQuote(interpreter);
 		for (const auto& arg: args) {
 			s << " " << BashQuote(arg);
@@ -396,7 +436,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 
 #ifdef __linux__
 	auto bash_file_name = dir.filePath(KYTY_BASH_FILE);
-	if (!CreateBashScript(interpreter, args, bash_file_name)) {
+	if (!CreateBashScript(interpreter, args, CreateEmulatorEnvironment(info), bash_file_name)) {
 		QMessageBox::critical(this, tr("Error"), tr("Can't create file:\n") + bash_file_name);
 		QApplication::quit();
 		return;
@@ -426,6 +466,16 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 #else
 	process->setProgram(interpreter);
 	process->setArguments(args);
+#endif
+#if !defined(__linux__)
+	{
+		auto environment = QProcessEnvironment::systemEnvironment();
+		for (const auto& variable: CreateEmulatorEnvironment(info)) {
+			const auto equals = variable.indexOf('=');
+			environment.insert(variable.left(equals), variable.mid(equals + 1));
+		}
+		process->setProcessEnvironment(environment);
+	}
 #endif
 	process->setWorkingDirectory(dir.path());
 #if defined(_WIN32)

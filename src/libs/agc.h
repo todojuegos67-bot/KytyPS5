@@ -22,6 +22,9 @@ struct MemoryRange {
 
 void Initialize();
 void Shutdown();
+// The largest levels the GPU leaves out of large block-compressed textures (KYTY_TEXTURE_REDUCE; its default by the video
+// memory of the GPU Initialize set up), for the game's own texture streaming; 0 before Initialize.
+uint32_t GameTextureReduceLevels();
 
 struct Lifecycle {
 	static constexpr const char* name       = "Graphics";

@@ -9,8 +9,15 @@
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <atomic>
+#include <map>
+#include <mutex>
+#include <regex>
+#include <set>
+#include <sstream>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -31,6 +38,7 @@ namespace AppContent {
 constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL   = 3;
 constexpr int      APP_CONTENT_ERROR_PARAMETER          = -2133262334; /* 0x80D90002 */
 constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED        = -2133262332; /* 0x80D90004 */
+constexpr int      APP_CONTENT_ERROR_MOUNT_FULL         = -2133262330; /* 0x80D90006 */
 constexpr int      APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT = -2133262329; /* 0x80D90007 */
 
 static std::string g_title_id;
@@ -185,32 +193,38 @@ std::filesystem::path Directory(const std::string& title_id) {
 	return std::filesystem::path("Content") / title_id;
 }
 
-static std::string ContentId(const std::filesystem::path& folder) {
+// The console's own content id: UP0001-PPSA01341_00-XXXXXXXXXXXXXXXX.
+static bool IsContentId(const std::string& content_id, const std::string& title_id) {
+	static const std::regex pattern("^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_[0-9]{2}-[A-Z0-9]{16}$");
+	if (!std::regex_match(content_id, pattern)) {
+		return false;
+	}
+	return title_id.empty() || content_id.compare(7, title_id.size(), title_id) == 0;
+}
+
+static std::string ContentId(const std::filesystem::path& folder, const std::string& title_id) {
 	std::ifstream param(folder / "sce_sys" / "param.json");
 	if (!param) {
 		return {};
 	}
-	const std::string text((std::istreambuf_iterator<char>(param)), std::istreambuf_iterator<char>());
-
-	const auto key = text.find("\"contentId\"");
-	if (key == std::string::npos) {
+	const auto param_json = nlohmann::json::parse(param, nullptr, false);
+	if (!param_json.is_object()) {
 		return {};
 	}
-	const auto colon = text.find(':', key);
-	const auto first = colon == std::string::npos ? std::string::npos : text.find('"', colon + 1);
-	const auto last  = first == std::string::npos ? std::string::npos : text.find('"', first + 1);
-	if (first == std::string::npos || last == std::string::npos) {
+	// applicationCategoryType marks an application's own param.json, never an add-on's.
+	if (param_json.contains("applicationCategoryType")) {
 		return {};
 	}
-	return text.substr(first + 1, last - first - 1);
+	const auto content_id = param_json.value("contentId", std::string {});
+	return IsContentId(content_id, title_id) ? content_id : std::string {};
 }
 
 // The entitlement label a folder answers to: the last dash-separated part of its contentId, which is
 // what the guest asks about, or the folder's own name when there is no readable param.json, so a
 // dump can simply be renamed to the label it carries. Cut to the guest's label field, so the mount
 // and the entitlement list always speak of the same sixteen characters.
-static std::string FolderLabel(const std::filesystem::path& folder) {
-	const auto content_id = ContentId(folder);
+static std::string FolderLabel(const std::filesystem::path& folder, const std::string& title_id) {
+	const auto content_id = ContentId(folder, title_id);
 	const auto dash       = content_id.rfind('-');
 
 	auto label = (dash != std::string::npos && dash + 1 < content_id.size())
@@ -237,19 +251,110 @@ std::vector<Folder> Folders(const std::string& title_id) {
 	}
 	std::vector<std::filesystem::path> paths;
 	for (const auto& entry: std::filesystem::directory_iterator(root, error)) {
-		if (entry.is_directory(error)) {
+		std::error_code entry_error;
+		// A link could stand for another add-on's folder, or lead back to this one.
+		if (entry.is_directory(entry_error) && !entry.is_symlink(entry_error) && !entry_error) {
 			paths.push_back(entry.path());
 		}
 	}
 	std::sort(paths.begin(), paths.end());
 
+	// One folder per label, the first in name order, so the mount and the list pick the same one.
+	std::set<std::string> labels;
 	for (const auto& path: paths) {
-		const auto label = FolderLabel(path);
-		if (!label.empty()) {
+		const auto label = FolderLabel(path, title_id);
+		if (!label.empty() && labels.insert(label).second) {
 			addons.push_back({label, path});
 		}
 	}
 	return addons;
+}
+
+std::vector<LocalEntitlement> LocalEntitlements(const std::string& title_id) {
+	std::vector<LocalEntitlement> result;
+	if (title_id.size() != 9) {
+		return result;
+	}
+	std::ifstream file("dlc_emu.ini", std::ios::binary);
+	if (!file) {
+		return result;
+	}
+	// A handful of keys at most; anything larger is not a file of ours to read.
+	std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	if (contents.size() > 64 * 1024) {
+		return result;
+	}
+
+	const auto trim = [](std::string value) {
+		const auto first = value.find_first_not_of(" \t\r\n");
+		if (first == std::string::npos) {
+			return std::string {};
+		}
+		const auto last = value.find_last_not_of(" \t\r\n");
+		return value.substr(first, last - first + 1);
+	};
+
+	std::set<std::string>              labels;
+	std::map<std::string, std::string> fields;
+	bool                               psal    = false;
+	bool                               invalid = false;
+	const auto                         flush   = [&] {
+        const auto id      = fields.find("content_id");
+        const auto status  = fields.find("download_status");
+        const auto service = fields.find("service_label");
+        if (!psal || invalid || id == fields.end() || status == fields.end() ||
+            status->second != "NO_EXTRA_DATA") {
+            return;
+        }
+        // Only the platform service carries add-ons here.
+        if (service != fields.end() && service->second != "0") {
+            return;
+        }
+        if (!IsContentId(id->second, title_id)) {
+            return;
+        }
+        const auto entitlement_label = id->second.substr(20);
+        if (labels.insert(entitlement_label).second) {
+            result.push_back({id->second, entitlement_label});
+        }
+	};
+
+	std::istringstream stream(contents);
+	std::string        line;
+	while (std::getline(stream, line)) {
+		line = trim(line);
+		if (line.empty() || line[0] == '#' || line[0] == ';') {
+			continue;
+		}
+		if (line[0] == '[') {
+			flush();
+			fields.clear();
+			invalid = false;
+			psal    = line == "[PSAL]";
+			continue;
+		}
+		if (!psal) {
+			continue;
+		}
+		const auto equals = line.find('=');
+		if (equals == std::string::npos) {
+			invalid = true;
+			continue;
+		}
+		const auto key   = trim(line.substr(0, equals));
+		const auto value = trim(line.substr(equals + 1));
+		// Unknown keys could change what ownership means here; they are not ignored silently.
+		if (key != "content_id" && key != "download_status" && key != "service_label" &&
+		    key != "entitlement_key") {
+			invalid = true;
+			continue;
+		}
+		if (!fields.emplace(key, value).second) {
+			invalid = true;
+		}
+	}
+	flush();
+	return result;
 }
 
 } // namespace Addcont
@@ -264,10 +369,17 @@ static std::string EntitlementText(const NpUnifiedEntitlementLabel* label) {
 	return text;
 }
 
-// Mount points are handed out in order. Only a folder that answers to the label mounts, so nothing
-// else about a mount needs remembering: the guest hands its own mount point back to unmount, and a
-// later mount of the same label finds the same folder again.
-static std::atomic<uint32_t> g_next_mount_point {0};
+// Mounts are remembered: the guest hands back the point it was given, and a mount of the same label
+// again is handed the same one, so the console's own limit is not spent by unmounting and mounting.
+static constexpr size_t ADDCONT_MOUNT_MAX = 64;
+
+struct AddcontMount {
+	std::string label;
+	std::string point;
+};
+
+static std::mutex                g_addcont_mutex;
+static std::vector<AddcontMount> g_addcont_mounts;
 
 int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         service_label,
                                          const NpUnifiedEntitlementLabel* entitlement_label,
@@ -302,8 +414,32 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 		return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
 	}
 
-	const auto point = "/addcont" + std::to_string(g_next_mount_point.fetch_add(1));
-	LibKernel::FileSystem::Mount(chosen, point);
+	std::string point;
+	{
+		std::lock_guard lock(g_addcont_mutex);
+		for (const auto& mount: g_addcont_mounts) {
+			if (mount.label == label) {
+				point = mount.point;
+				break;
+			}
+		}
+		if (point.empty()) {
+			if (g_addcont_mounts.size() >= ADDCONT_MOUNT_MAX) {
+				std::printf("AppContent: %zu add-ons are mounted already\n", g_addcont_mounts.size());
+				return APP_CONTENT_ERROR_MOUNT_FULL;
+			}
+			// The lowest number no mount holds (after an unmount the count would name a point still in use).
+			for (uint32_t index = 0; point.empty(); index++) {
+				const auto name = "/addcont" + std::to_string(index);
+				if (std::none_of(g_addcont_mounts.begin(), g_addcont_mounts.end(),
+				                 [&](const AddcontMount& mount) { return mount.point == name; })) {
+					point = name;
+				}
+			}
+			LibKernel::FileSystem::Mount(chosen, point);
+			g_addcont_mounts.push_back({label, point});
+		}
+	}
 
 	std::printf("AppContent: add-on '%s' -> %s (mounted at %s)\n", label.c_str(),
 	            chosen.string().c_str(), point.c_str());
@@ -325,6 +461,11 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 		return APP_CONTENT_ERROR_NOT_MOUNTED;
 	}
 
+	{
+		std::lock_guard lock(g_addcont_mutex);
+		std::erase_if(g_addcont_mounts,
+		              [mount_point](const auto& mount) { return mount.point == mount_point->data; });
+	}
 	LibKernel::FileSystem::Umount(mount_point->data);
 
 	std::printf("AppContent: add-on unmounted (%s)\n", mount_point->data);

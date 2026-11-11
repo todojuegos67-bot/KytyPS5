@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "live-switch.h"
 #include "slow-log.h"
 
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -13,6 +14,7 @@
 #include <immintrin.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -287,17 +289,32 @@ struct PageManager::Impl {
 		}
 	}
 
+	// The deferred read protections' no access, by minor mode where the platform can (VirtualMemory::ZapNoAccess:
+	// Linux, KYTY_UFFD_MINOR; live switch uffd_minor, 0: mprotect for the protections made from then on).
+	struct ZapScope {
+		ZapScope() noexcept {
+			static auto& zap = LiveSwitch::Find("uffd_minor", 1);
+			Common::VirtualMemory::ZapNoAccess(zap.load(std::memory_order_relaxed) != 0);
+		}
+		~ZapScope() { Common::VirtualMemory::ZapNoAccess(false); }
+	};
+
 	static void FlushReadProtect() noexcept {
+		if (g_read_protects.empty()) return;
+		ZapScope zap;
 		for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
 		g_read_protects.clear();
 	}
 
 	// The pending no-access ranges that overlap [begin, end), applied first (a protection change of those pages
-	// comes after them; pages of the others keep theirs pending).
-	static void FlushReadProtectOverlapping(uint64_t begin, uint64_t end) noexcept {
+	// comes after them; pages of the others keep theirs pending). Not zapped for the texture offload's hold (`zap`
+	// false): it then frees the pages, and a hole's access would not fault.
+	static void FlushReadProtectOverlapping(uint64_t begin, uint64_t end, bool zap = true) noexcept {
 		auto& ranges = g_read_protects;
 		for (size_t i = 0; i < ranges.size();) {
 			if (ranges[i].begin < end && begin < ranges[i].end) {
+				std::optional<ZapScope> zapping;
+				if (zap) zapping.emplace();
 				ProtectHost(ranges[i].begin, ranges[i].end - ranges[i].begin, NO_ACCESS_PROTECTION);
 				ranges[i] = ranges.back();
 				ranges.pop_back();
@@ -344,7 +361,7 @@ struct PageManager::Impl {
 		ProtectHost(vaddr, size, protection);
 	}
 
-	template <bool track, bool is_read, bool masked, bool offload = false>
+	template <bool track, bool is_read, bool masked, bool offload = false, bool reapply = false>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
 		// The lowest 64 KiB hold no guest memory (no mapping is ever made there): a range a stale descriptor put there
@@ -418,7 +435,7 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
-			if (watcher_edge && old_perms != new_perms) {
+			if (reapply || (watcher_edge && old_perms != new_perms)) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
 					potential_range_bytes = PAGE_SIZE;
@@ -539,7 +556,7 @@ struct PageManager::Impl {
 		}
 	}
 
-	template <bool track, bool is_read, bool offload = false>
+	template <bool track, bool is_read, bool offload = false, bool reapply = false>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 		const auto begin = PageStart(vaddr);
 		const auto end   = PageEnd(vaddr, size);
@@ -552,7 +569,8 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false, offload>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, is_read, false, offload, reapply>(*region, region_base,
+			                                                              first, last);
 			chunk_begin = chunk_end;
 		}
 	}
@@ -616,6 +634,18 @@ bool PageManager::RestoreIfUnwatched(uint64_t vaddr) noexcept {
 	return Libs::LibKernel::Memory::RestoreGuestWritable(PageStart(vaddr), PAGE_SIZE);
 }
 
+void PageManager::SettleProtection(uint64_t vaddr) noexcept {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		(void)Libs::LibKernel::Memory::RestoreGuestProtection(PageStart(vaddr), PAGE_SIZE);
+		return;
+	}
+	SpinGuard  lock(region->lock);
+	const auto perms = Impl::PermsOf(*region, (vaddr % REGION_SIZE) / PAGE_SIZE);
+	if (perms == READ_WRITE_PROTECTION) (void)Libs::LibKernel::Memory::RestoreGuestProtection(PageStart(vaddr), PAGE_SIZE);
+	else Impl::ProtectHost(PageStart(vaddr), PAGE_SIZE, perms);
+}
+
 bool PageManager::WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept {
 	bool           any  = false;
 	const uint64_t stop = UINT64_MAX - vaddr < size ? UINT64_MAX : vaddr + size;
@@ -656,13 +686,14 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
-template <bool track>
+template <bool track, bool reapply>
 void PageManager::UpdateReadWatchers(uint64_t vaddr, uint64_t size) {
-	m_impl->UpdatePageWatchers<track, false, true>(vaddr, size);
+	m_impl->UpdatePageWatchers<track, false, true, reapply>(vaddr, size);
 }
 
 template void PageManager::UpdateReadWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdateReadWatchers<false>(uint64_t, uint64_t);
+template void PageManager::UpdateReadWatchers<false, true>(uint64_t, uint64_t);
 
 void PageManager::DeferReadProtection(bool on) noexcept {
 	if (!on) {
@@ -675,6 +706,11 @@ void PageManager::DeferReadProtection(bool on) noexcept {
 void PageManager::FlushDeferredProtection() noexcept {
 	Impl::FlushReadProtect();
 	++g_observation_epoch;
+}
+
+// (No new observation epoch: the guest learns nothing new from protections applied early.)
+void PageManager::FlushDeferredProtection(uint64_t vaddr, uint64_t size) noexcept {
+	Impl::FlushReadProtectOverlapping(vaddr, vaddr + size, false);
 }
 
 uint64_t PageManager::ObservationEpoch() noexcept {

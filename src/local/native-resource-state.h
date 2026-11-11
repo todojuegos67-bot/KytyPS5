@@ -5,8 +5,6 @@
 #include <cstdint>
 
 extern "C" {
-// 1: SRT outputs come from the ahead-of-time compiled linear plan.
-extern volatile std::atomic<uint32_t> kyty_local_srt_native_mode;
 // 1: a plan with one control-flow condition selects its variant through the
 // compiled predicate instead of the interpreter.
 extern volatile std::atomic<uint32_t> kyty_local_srt_predicate_mode;
@@ -47,8 +45,7 @@ extern volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode;
 extern volatile std::atomic<uint32_t> kyty_local_image_granules_mode;
 // 1: cached texture resolutions survive registrations away from their range (textureCache.cpp).
 extern volatile std::atomic<uint32_t> kyty_local_texture_resolve_pages_mode;
-// 1: CPU writes into large images release and re-upload only the written part (textureCache.cpp);
-// 2: also checks every partial upload against guest data hashes of the untouched part.
+// 1: CPU writes into large images release and re-upload only the written part (textureCache.cpp).
 extern volatile std::atomic<uint32_t> kyty_local_partial_image_dirty_mode;
 extern volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode;
 extern volatile std::atomic<uint32_t> kyty_local_texture_levels_mode;
@@ -57,4 +54,7 @@ extern volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode;
 // 1: guest readbacks narrow a window that meets an image to the request's pages (bufferCache.cpp).
 extern volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode;
 extern volatile std::atomic<uint32_t> kyty_local_readback_queue_mode;
+// 1: a guest readback window also takes the host buffers next to the request's; 2: the same
+// while read guards are off (bufferCache.cpp).
+extern volatile std::atomic<uint32_t> kyty_local_readback_span_mode;
 }

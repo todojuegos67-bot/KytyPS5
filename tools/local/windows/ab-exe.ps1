@@ -15,15 +15,19 @@ $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
 Set-Location $root
 $out = "$root\_Build\ab\$Label"
 New-Item -ItemType Directory -Force $out | Out-Null
-function Emulator { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 } }
+function Emulator { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 -and $_.Path -like "$root*" } }
 $sums = @{}
 $order = @()
 for ($round = 1; $round -le $Rounds; $round++) { $order += if ($round % 2) { @('A', 'B') } else { @('B', 'A') } }
+# (A screenshot per launch, scene-<label>-A1.png ...: the default bench save starts in one of two places, tunnel or plain,
+# ~80 or ~87 fps at 120 Hz - compare launches at the same place.)
+$launches = @{ A = 0; B = 0 }
 foreach ($side in $order) {
 	$exe = (Resolve-Path $(if ($side -eq 'A') { $A } else { $B })).Path
-	$params = @{ Label = "$Label-$side"; Exe = $exe; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = $StartupSeconds }
-	$switches = @($Set) + $(if ($side -eq 'A') { @($SetA) } else { @($SetB) })
-	if ($switches.Count) { $params['Set'] = $switches }
+	$launches[$side]++
+	$params = @{ Label = "$Label-$side$($launches[$side])"; Exe = $exe; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = $StartupSeconds }
+	# (Without the shader prefetch's cache: two executables taking turns would each make it again, ~2 GB written a launch.)
+	$params['Set'] = @('KYTY_PREFETCH_CACHE=0') + @($Set) + $(if ($side -eq 'A') { @($SetA) } else { @($SetB) })
 	if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
 	& "$S\bench-run.ps1" @params | Select-Object -Last 1
 	if (!(Emulator)) { "$side`: emulator not running"; continue }

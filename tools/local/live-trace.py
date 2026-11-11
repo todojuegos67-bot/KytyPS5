@@ -231,6 +231,28 @@ VULKAN_MARKS = {1: 'Dispatch', 2: 'DispatchIndirect', 3: 'DispatchBase', 10: 'Co
                 30: 'ClearColorImage', 31: 'ClearDepthStencilImage', 32: 'ClearAttachments', 40: 'BlitImage',
                 41: 'BlitImage2', 42: 'ResolveImage', 43: 'ResolveImage2', 50: 'PipelineBarrier',
                 51: 'PipelineBarrier2'}
+# Bits 16-31 of a kind-4 mark: the emulator's own work it belongs to (MarkSiteId in src/local/live-trace-gpu.h).
+MARK_SITES = {1: 'tiler-detile', 2: 'tiler-tile', 3: 'tiler-image', 4: 'tiler-d16', 5: 'tiler-bgra16',
+              6: 'fault-process', 7: 'lod-stats'}
+
+
+def code_names(exe, trace):
+    """An address -> 'function' namer for code of `exe` loaded at TRACE.base (nm -C)."""
+    import bisect
+    import subprocess
+    base_file = Path(str(trace) + '.base')
+    base = int(base_file.read_text(), 16) if base_file.exists() else 0
+    out = subprocess.run(['nm', '-C', '--defined-only', '-n', exe], capture_output=True, text=True, check=True).stdout
+    addresses, names = [], []
+    for line in out.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) == 3 and parts[1] in 'tTwW':
+            addresses.append(int(parts[0], 16))
+            names.append(parts[2].split('(')[0])
+    def name(address):
+        i = bisect.bisect_right(addresses, address - base) - 1
+        return names[i] if i >= 0 else f'{address:#x}'
+    return name
 
 
 def cmd_marks(t, args):
@@ -240,6 +262,9 @@ def cmd_marks(t, args):
         if kind == 24:
             recorded[a] = (t.ms(tsc), b >> 60, b & 0x0fffffffffffffff)
     done = {a: b / 1e6 + t.gpu_offset for tsc, tid, kind, a, b in t.records if kind == 25}
+    # A barrier's mark: the code that recorded it (GpuMarkCaller), named with --exe and TRACE.base.
+    callers = {a: b for tsc, tid, kind, a, b in t.records if kind == 40}
+    name_of = code_names(args.exe, args.trace) if args.exe and callers else None
     flush_times, flush_ticks = [], []
     for tsc, tid, kind, a, b in t.records:
         if tid == t.render and kind == GPU_SUBMIT and b == 0:
@@ -247,23 +272,42 @@ def cmd_marks(t, args):
             flush_ticks.append(a)
     begin = {tick: s for s, e, tick in t.gpu}
     import bisect
+    # The guest queue whose slice the render thread recorded each mark in ('-': outside slices).
+    slices, opened = [], None
+    for tsc, tid, kind, a, b in t.records:
+        if tid == t.render and kind == RENDER_SLICE:
+            if (a >> 17) & 1:
+                opened = (t.ms(tsc), a & 0xff)
+            elif opened is not None:
+                slices.append((opened[0], t.ms(tsc), opened[1]))
+                opened = None
+    slice_begins = [b for b, _, _ in slices]
+
+    def queue_of(x):
+        i = bisect.bisect_right(slice_begins, x) - 1
+        return f'q{slices[i][2]}' if i >= 0 and x <= slices[i][1] else '-'
     by_tick = collections.defaultdict(list)
     for slot, (x, kind, shader) in recorded.items():
         i = bisect.bisect_left(flush_times, x)
         if i < len(flush_ticks) and slot in done:
-            by_tick[flush_ticks[i]].append((slot, kind, shader))
+            by_tick[flush_ticks[i]].append((slot, kind, shader, queue_of(x)))
     total, after_flip = collections.Counter(), collections.Counter()
-    count = collections.Counter()
+    count, by_queue = collections.Counter(), collections.Counter()
     frames = max(1, len(t.flips) - 1)
     for tick, marks in by_tick.items():
         if tick not in begin:
             continue
         previous = begin[tick]
-        for slot, kind, shader in sorted(marks):
+        for slot, kind, shader, queue in sorted(marks):
             end = done[slot]
             cost = max(0.0, end - previous)
             previous = max(previous, end)
+            by_queue[queue] += cost
+            if args.queue is not None and queue != args.queue:
+                continue
             key = (kinds.get(kind, kind), shader)
+            if slot in callers:
+                key += (name_of(callers[slot]) if name_of else f'{callers[slot]:#x}',)
             total[key] += cost
             count[key] += 1
             i = bisect.bisect_right(t.flips, end) - 1
@@ -271,15 +315,24 @@ def cmd_marks(t, args):
                 after_flip[key] += cost
     print(f'{frames} frames; GPU ms per frame by shader (whole frame | first {args.after} ms after each flip)')
     for key, value in total.most_common(args.top):
-        name = VULKAN_MARKS.get(key[1], str(key[1])) if key[0] == 'vk' else f'{key[1]:#014x}'
-        print(f'  {key[0]:8s} {name:>14s}  {value / frames:6.3f} | {after_flip[key] / frames:6.3f}  '
+        if key[0] == 'vk':
+            name = VULKAN_MARKS.get(key[1] & 0xffff, str(key[1] & 0xffff))
+            if key[1] >> 16:
+                name += '@' + MARK_SITES.get(key[1] >> 16, str(key[1] >> 16))
+            if len(key) > 2:
+                name += ' ' + key[2]
+        else:
+            name = f'{key[1]:#014x}'
+        print(f'  {key[0]:8s} {name:>28s}  {value / frames:6.3f} | {after_flip[key] / frames:6.3f}  '
               f'({count[key] / frames:.1f}/frame)')
     print(f'  all marks: {sum(total.values()) / frames:.2f} | {sum(after_flip.values()) / frames:.2f}')
+    print('  by the guest queue that recorded them: ' +
+          ', '.join(f'{q} {v / frames:.2f}' for q, v in by_queue.most_common()))
     busy = sum(e - s for s, e, tick in t.gpu) / frames
     print(f'  GPU busy (command buffer spans): {busy:.2f} ms/frame; by kind:')
-    for kind in sorted(set(k for k, _ in total)):
-        print(f'    {kind:8s} {sum(v for (k, _), v in total.items() if k == kind) / frames:6.2f} | '
-              f'{sum(v for (k, _), v in after_flip.items() if k == kind) / frames:6.2f}')
+    for kind in sorted(set(key[0] for key in total)):
+        print(f'    {kind:8s} {sum(v for key, v in total.items() if key[0] == kind) / frames:6.2f} | '
+              f'{sum(v for key, v in after_flip.items() if key[0] == kind) / frames:6.2f}')
 
 
 def cmd_sites(t, args):
@@ -349,9 +402,11 @@ def main():
     p.add_argument('--min', type=float, default=0.1)
     p.set_defaults(func=cmd_gpu)
     p = sub.add_parser('marks')
+    p.add_argument('--queue', help="only marks recorded in this guest queue's slices (q0, q49, ...; - outside)")
     p.add_argument('trace')
     p.add_argument('--top', type=int, default=30)
     p.add_argument('--after', type=float, default=7.0)
+    p.add_argument('--exe', help='the build that made the capture: barriers by the function that recorded them')
     p.set_defaults(func=cmd_marks)
     p = sub.add_parser('sites')
     p.add_argument('trace')

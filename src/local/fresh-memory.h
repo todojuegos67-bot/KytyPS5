@@ -161,48 +161,4 @@ bool ForEachBackingRun(const uint8_t* backing, uint64_t size, Run&& run) {
 	return true;
 }
 
-// Calls run(offset, size, fresh) for the runs of guest range [vaddr, vaddr + size) in order: fresh runs are bytes of
-// granules nobody wrote; bytes outside the backing store are never fresh. False (nothing called) when tracking is off.
-template <typename Run>
-bool ForEachRun(uint64_t vaddr, uint64_t size, Run&& run) {
-	auto* state = Get();
-	if (state == nullptr || size == 0) return false;
-	uint64_t   run_begin = 0, run_end = 0;
-	bool       run_fresh = false;
-	const auto add       = [&](uint64_t begin, uint64_t end, bool fresh) {
-        if (run_end == run_begin) {
-            run_begin = begin;
-            run_fresh = fresh;
-        } else if (fresh != run_fresh) {
-            run(run_begin, run_end - run_begin, run_fresh);
-            run_begin = begin;
-            run_fresh = fresh;
-        }
-        run_end = end;
-	};
-	for (uint64_t done = 0; done < size;) {
-		const uint64_t at      = vaddr + done;
-		const auto     end     = Libs::LibKernel::Memory::BackingMappingEnd(at);
-		const auto     piece   = end > at ? std::min(end - at, size - done) : size - done;
-		const auto*    backing = end > at ? Libs::LibKernel::Memory::TryGetBackingPointer(at, piece) : nullptr;
-		if (backing == nullptr) {
-			add(done, done + piece, false);
-			done += piece;
-			continue;
-		}
-		for (uint64_t offset = 0; offset < piece;) {
-			const auto address = reinterpret_cast<uint64_t>(backing) + offset;
-			const auto granule = GranuleOf(*state, address);
-			const auto bytes   = granule == UINT64_MAX
-			                         ? piece - offset
-			                         : std::min(piece - offset, Granule - ((address - state->base) & (Granule - 1)));
-			add(done + offset, done + offset + bytes, granule != UINT64_MAX && !IsWritten(*state, granule));
-			offset += bytes;
-		}
-		done += piece;
-	}
-	if (run_end != run_begin) run(run_begin, run_end - run_begin, run_fresh);
-	return true;
-}
-
 } // namespace FreshMemory

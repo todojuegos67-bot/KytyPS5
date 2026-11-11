@@ -16,6 +16,18 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 
+// The texture LOD bias of an upscaler's 3D below its output (Loader::DemonsSoulsRenderSize: the PS5 Pro path with DLSS or
+// FSR 3), log2(render height / output height), added to the materials' samplers made from then on (GetSampler). Set
+// before the game makes any.
+void SetUpscaleLodBias(float bias);
+
+// Whether a shader's samplers are the materials' (the upscaler's LOD bias applies): a pixel shader writing at least
+// KYTY_UPSCALE_LOD_BIAS_TARGETS color targets (default 3: the G-buffer's, 5 or 6 at 1-1) or none (the depth passes,
+// whose alpha tests must keep the G-buffer's coverage); not a forward one of one or two (flames, smoke, glows drawn over
+// the scene), whose finer texture levels flickered under DLSS and FSR 3 (issues #232, #85). 0: every pixel shader's.
+// (1-1: 224 pixel shaders without a color target, 195 of 5-8, 21 of one and 6 of two.)
+[[nodiscard]] bool UpscaleBiasApplies(bool pixel, uint32_t color_targets);
+
 class SamplerCache {
 public:
 	explicit SamplerCache(GraphicContext& graphics): m_graphics(graphics) {

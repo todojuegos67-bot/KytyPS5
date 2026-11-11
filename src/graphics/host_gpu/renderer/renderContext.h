@@ -21,6 +21,10 @@ namespace Libs::VideoOut {
 class VideoOutDriver;
 }
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace Libs::Graphics {
 
 class GuestGpu;
@@ -108,11 +112,17 @@ public:
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
-	RenderExecutor&     GetRenderExecutor() { return t_executors != nullptr ? *t_executors->draw : m_render_executor; }
+	// (KYTY_SPECULATE unset or 0: no thread's executors; the global is read first, so mode 0 reads no thread-local.)
+	RenderExecutor& GetRenderExecutor() {
+		return kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && t_executors != nullptr ? *t_executors->draw
+		                                                                                                 : m_render_executor;
+	}
 	// Dispatches use their own executor, so draws do not displace their
 	// per-operation scratch and texture resolutions.
 	RenderExecutor&     GetComputeRenderExecutor() {
-		return t_executors != nullptr ? *t_executors->compute : m_compute_render_executor;
+		return kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && t_executors != nullptr
+		           ? *t_executors->compute
+		           : m_compute_render_executor;
 	}
 	// The executors above whatever the calling thread's are (what a speculation's read: RenderExecutor::ReadCatalogOf).
 	RenderExecutor& DefaultRenderExecutor() { return m_render_executor; }

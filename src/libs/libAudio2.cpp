@@ -178,6 +178,7 @@ struct AudioOut2ContextState {
 	uint32_t               queued      = 0;
 	uint32_t               num_grains  = 512;
 	uint64_t               last_update = 0;
+	uint32_t               last_update_sixths = 0; // past last_update, in sixths of a us (a grain: num_grains * 125)
 	uint64_t               drained_at  = 0; // (KYTY_AUDIO_LOG) the device time its queue ran out, until the next push
 };
 
@@ -194,6 +195,7 @@ struct AudioOut2PortStateEntry {
 	const void*            pcm_data      = nullptr;
 	float                  gain          = 1.0f; // a mono (object) port's gain attribute
 	uint32_t               ambisonics    = 0;    // an object port's attribute 8: 0x40 | ACN when it carries one
+	uint32_t               passthrough   = 0;    // an object port's attribute 5: straight to the left (1) or right (2) channel
 	// Attribute 1 as the guest sends it: one gain for each of the port's channels. Its speaker and
 	// vibration ports carry their level here, and a vibration port's is two channels wide - the old
 	// single-float read dropped both.
@@ -239,6 +241,7 @@ static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PASSTHROUGH = 5;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
 static constexpr uint32_t AUDIO_OUT2_AMBISONICS_CHANNEL           = 0x40;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
@@ -340,18 +343,23 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		const char* value = std::getenv("KYTY_AUDIO_CATCHUP_MS");
 		return static_cast<uint64_t>(value != nullptr ? std::clamp(std::atoi(value), 0, 1000) : 0) * 1000u;
 	}();
-	const auto grain_micros = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+	// A grain lasts num_grains / 48000 s = num_grains * 125/6 us: counted in sixths of a microsecond, as the device
+	// plays it. (In whole microseconds, 5333 for 256 samples' 5333.33, the game handed over 62.5 grains a million too
+	// many: the device queue, and with it the sound's delay, grew by about 0.2 s an hour of play.)
+	const uint64_t grain_sixths = static_cast<uint64_t>(state->num_grains == 0 ? 512u : state->num_grains) * 125u;
 	// With the queue drained: the device time since last_update the game missed is dropped beyond catchup_us
 	// (last_update = now), as before with catchup_us 0.
 	const auto drained_queue = [&](uint64_t now) {
 		if (now - state->last_update > catchup_us) {
-			state->last_update = now;
+			state->last_update        = now;
+			state->last_update_sixths = 0;
 		}
 	};
 
 	const auto now = LibKernel::KernelGetProcessTime();
 	if (state->last_update == 0 || now < state->last_update) {
-		state->last_update = now;
+		state->last_update        = now;
+		state->last_update_sixths = 0;
 		return;
 	}
 	if (state->queued == 0) {
@@ -359,18 +367,19 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		return;
 	}
 
-	if (now == state->last_update || grain_micros == 0) {
+	const auto elapsed_sixths = (now - state->last_update) * 6u;
+	if (elapsed_sixths <= state->last_update_sixths) {
 		return;
 	}
-
-	const auto elapsed = now - state->last_update;
-	const auto drained = std::min<uint64_t>(state->queued, elapsed / grain_micros);
+	const auto drained = std::min<uint64_t>(state->queued, (elapsed_sixths - state->last_update_sixths) / grain_sixths);
 	if (drained == 0) {
 		return;
 	}
 
 	state->queued -= static_cast<uint32_t>(drained);
-	state->last_update += drained * grain_micros;
+	const auto advanced       = state->last_update_sixths + drained * grain_sixths;
+	state->last_update       += advanced / 6u;
+	state->last_update_sixths = static_cast<uint32_t>(advanced % 6u);
 	if (state->queued == 0) {
 		if (state->drained_at == 0) {
 			state->drained_at = state->last_update;
@@ -428,10 +437,12 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 // positive) by two virtual microphones facing about 74 degrees left and right: a sound straight ahead
 // plays at full level on both sides, as a binaural render plays it, one behind at -3 dB (the level of
 // a surround downmix), and one at the side with the power it has ahead. Cardioids facing 90 degrees
-// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. An object
-// that is no ambisonics channel plays in the centre. Each port's gain applies, and the result goes to
-// the front left and right of the context's first float main port. Adding the 36 channels up instead
-// cancelled most directions.
+// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. A passthrough
+// object goes to its own channel: with headphones the game gives the system its stereo mix on two of
+// them, left and right (attribute 5; its Headphone_3D_PassThru preset), and both played in the centre
+// made the music mono (issue #294). Another object that is no ambisonics channel plays in the centre. Each
+// port's gain applies, and the result goes to the front left and right of the context's first float main
+// port. Adding the 36 channels up instead cancelled most directions.
 static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
 	constexpr float HALF_POWER = 0.70710677f;
 	// Ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
@@ -449,7 +460,10 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 			continue;
 		}
 		float left = HALF_POWER, right = HALF_POWER;
-		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
+		if (object.passthrough == 1 || object.passthrough == 2) {
+			left  = object.passthrough == 1 ? 1.0f : 0.0f;
+			right = object.passthrough == 2 ? 1.0f : 0.0f;
+		} else if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
 			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
 			if (acn == 0) {
 				left = right = W_GAIN;
@@ -890,6 +904,8 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	bool        has_gains      = false;
 	uint32_t    ambisonics     = 0;
 	bool        has_ambisonics = false;
+	uint32_t    passthrough    = 0;
+	bool        has_passthrough = false;
 	for (uint32_t i = 0; i < num; i++) {
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
 		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
@@ -923,9 +939,14 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 			std::memcpy(&ambisonics, attributes[i].value, sizeof(uint32_t));
 			has_ambisonics = true;
 		}
+		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PASSTHROUGH && attributes[i].value != nullptr &&
+		    attributes[i].value_size == sizeof(uint32_t)) {
+			std::memcpy(&passthrough, attributes[i].value, sizeof(uint32_t));
+			has_passthrough = true;
+		}
 	}
 
-	if (has_pcm || has_gain || has_gains || has_ambisonics) {
+	if (has_pcm || has_gain || has_gains || has_ambisonics || has_passthrough) {
 		g_audioout2_port_mutex.Lock();
 		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
 			if (has_pcm) {
@@ -938,6 +959,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 				state->gains_set = true;
 			}
 			if (has_ambisonics) state->ambisonics = ambisonics;
+			if (has_passthrough) state->passthrough = passthrough;
 		}
 		g_audioout2_port_mutex.Unlock();
 	}
@@ -951,7 +973,7 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
 
 	std::memset(state, 0, sizeof(AudioOut2PortState));
-	state->output          = 1;
+	state->output          = AudioInternal::MainOutputReported().connection;
 	state->num_channels    = 2;
 	state->volume          = 127;
 	state->reroute_counter = 0;
@@ -1126,7 +1148,7 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
-	info->type             = 0;
+	info->type             = AudioInternal::MainOutputReported().speaker_type;
 	info->available_bits   = 0x03;
 	info->flags            = 0;
 	info->speaker_angle[0] = {-30, 0};

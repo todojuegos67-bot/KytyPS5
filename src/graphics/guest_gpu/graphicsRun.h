@@ -32,6 +32,9 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// SendCommand, or false once the GPU thread takes no more (shutting down): for callers on guest threads that may still
+	// run then.
+	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void              Submit(std::span<const uint32_t> draw_commands,
@@ -42,6 +45,14 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// KYTY_SERVE_IN_WAITS (live serve_in_waits, default 1): where the GPU thread runs the guest commands queued for it (a
+	// game thread's readback fault among them) besides before each packet: 1 while it waits for the upload worker (only
+	// from the drains told to serve, never inside a command), 2 after each segment a speculation commits, 4 while it
+	// waits for a speculation's chunk and between chunks.
+	[[nodiscard]] static uint32_t ServeInWaits() noexcept;
+	// GPU thread: runs the guest commands queued for it, if any (ProcessCommands); not from inside one of them.
+	static void               ServePendingCommands();
+	[[nodiscard]] static bool CommandsPending() noexcept;
 	// The GPU thread, or the speculation's thread while the GPU thread waits for its translation (KYTY_SPECULATE=2):
 	// what reads the GPU thread's caches to translate (not what may fault: only the GPU thread reads back).
 	[[nodiscard]] static bool IsTranslatingThread() noexcept;
@@ -73,6 +84,7 @@ private:
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  frame_epoch       = 0;
+		uint64_t                  scout_sequence    = 0; // queue 0's graphics submissions, numbered (scout.h)
 		uint64_t                  serial            = 0; // its place in its queue (from 1)
 		// KYTY_SPECULATE=4: the chunk committed next; whether the one it is in is translated the normal way, up to where
 		// the next begins (none: to the end).
@@ -109,11 +121,19 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
+	// Under m_queue_mutex: the last graphics submission's number, and a reset a flip preparation carried (the next one's).
+	uint64_t                                       m_scout_sequence    = 0;
+	bool                                           m_scout_reset       = false;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	// KYTY_SPECULATE (speculation.h): made at the first graphics command buffer it translates.
 	std::unique_ptr<Speculation>                                     m_speculation;
 	std::atomic<Speculation*>                                        m_ahead {nullptr}; // KYTY_SPECULATE=4's
+	// KYTY_SPECULATE_ASYNC=<queue id> (mode 4): that async compute queue's command buffers speculated too, by
+	// KYTY_SPECULATE_ASYNC_THREADS threads of their own (the culling chain's, 3.7 ms a frame on the GPU thread, 10-31).
+	std::unique_ptr<Speculation>                                     m_speculation_async;
+	std::atomic<Speculation*>                                        m_ahead_async {nullptr};
+	uint32_t                                                         m_async_queue = 0; // (0: none)
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	uint64_t        m_submit_id = 0;

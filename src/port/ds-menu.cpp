@@ -2510,6 +2510,8 @@ void Draw(float width, float height) {
 					         "Devuelve a la memoria del juego las copias ya terminadas de la GPU antes de que las pida, evitando esperas. Puede quitar tirones. Experimental (KYTY_EAGER_FEEDBACK).");
 					CheckRow("Copias de la GPU agrupadas", s.perf_feedback_batch != g_rt.launched.perf_feedback_batch, s.perf_feedback_batch,
 					         "Graba juntas las copias de la GPU de cada bloque de comandos en vez de una a una. Experimental (KYTY_FEEDBACK_BATCH).");
+					CheckRow("Traducción en paralelo", s.perf_speculate != g_rt.launched.perf_speculate, s.perf_speculate,
+					         "Traduce el trabajo de la GPU en varios hilos a la vez. Más FPS si la CPU limita. Necesita 28 GB de RAM (con menos se ignora). Experimental (KYTY_SPECULATE=4).");
 					CheckRow("Shaders lane-local ampliados", s.perf_lane_wide != g_rt.launched.perf_lane_wide, s.perf_lane_wide,
 					         "Más shaders de cálculo se traducen en su forma rápida. Cambia esos shaders: la primera vez se vuelven a compilar (algo de carga al empezar). Experimental (KYTY_LANE_LOCAL_WIDE).");
 					CheckRow("Carga de shaders al máximo", true, s.shader_turbo,
@@ -3561,6 +3563,8 @@ void LauncherPerformance(Settings& s) {
 	          "Cuando la gráfica termina una copia de datos que el juego leerá después, se le devuelve en cuanto está lista en vez de esperar a que la pida. Así el juego no se queda esperando: puede quitar algunos tirones. No cambia la imagen. Experimental: si notas fallos, apágalo.");
 	LCheckRow("Agrupar las copias de la gráfica", s.perf_feedback_batch,
 	          "Esas mismas copias de datos de la gráfica se preparan juntas, por bloques, en vez de una a una. Un poco menos de trabajo para el procesador; la ganancia es pequeña. No cambia la imagen. Experimental: si notas fallos, apágalo.");
+	LCheckRow("Traducción en paralelo", s.perf_speculate,
+	          "Traduce el trabajo de la gráfica en varios hilos a la vez en lugar de uno solo (opción de KytyPS5, PR #293). Puede dar bastantes más FPS si el procesador es lo que te limita. Necesita 28 GB de RAM o más: con menos, el emulador la ignora y sigue como siempre. Experimental: si ves fallos o cierres, apágala.");
 	LCheckRow("Traducción rápida para más efectos", s.perf_lane_wide,
 	          "Más programas de efectos del juego (shaders: los pequeños programas que usa la gráfica para calcular y dibujar) se traducen a una versión más rápida. Puede dar algo más de FPS en la gráfica. La primera vez que lo actives esos shaders se vuelven a preparar: más carga y algún tirón al empezar. Experimental: si ves fallos gráficos, apágalo.");
 	{

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Disassemble guest x86-64 code out of the running emulator (Windows counterpart of
-tools/local/guest-disasm.py).
+"""Disassemble guest x86-64 code out of the running emulator.
 
 Guest modules are identity-mapped in kyty_emulator.exe, so a guest address is also an address
 in the emulator process. The bytes are read with ReadProcessMemory, wrapped as .byte lines,

@@ -28,6 +28,9 @@
 #include <QVBoxLayout>
 #include <QtAlgorithms>
 
+#include <utility>
+#include <vector>
+
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
 #include <QVulkanWindow>
@@ -163,6 +166,57 @@ static void ListInit(QComboBox* combo, T value) {
 	combo->setCurrentText(EnumToText(value));
 }
 
+// A combo's items as (label, value) pairs, `value`'s selected (the first when it is not offered).
+static void ChoiceInit(QComboBox* combo, const std::vector<std::pair<QString, int>>& items, int value) {
+	combo->clear();
+	for (const auto& [label, data]: items) combo->addItem(label, data);
+	const int index = combo->findData(value);
+	combo->setCurrentIndex(index >= 0 ? index : 0);
+}
+
+static void InitEnhancements(Ui::ConfigurationEditDialog& ui, const Configuration& info) {
+	using C = Configuration;
+	std::vector<std::pair<QString, int>> upscalers {{QObject::tr("Off (the game's TAA)"), static_cast<int>(C::Upscaler::Off)}};
+#if defined(__linux__)
+	upscalers.emplace_back(QObject::tr("AMD FSR 3"), static_cast<int>(C::Upscaler::Fsr)); // (built in on Linux)
+#endif
+	upscalers.emplace_back(QObject::tr("NVIDIA DLSS (RTX)"), static_cast<int>(C::Upscaler::Dlss));
+	ChoiceInit(ui.comboBox_upscaler, upscalers, static_cast<int>(info.upscaler));
+	std::vector<std::pair<QString, int>> heights {{QObject::tr("Auto"), 0}};
+	for (const int height: {720, 900, 1080, 1260, 1440, 1512, 1620, 1800, 2160}) heights.emplace_back(QString::number(height), height);
+	ChoiceInit(ui.comboBox_render_height, heights, info.render_height);
+	ChoiceInit(ui.comboBox_frame_generation,
+	           {{QObject::tr("Off"), static_cast<int>(C::FrameGeneration::Off)},
+	            {QObject::tr("AMD FSR 3 (2x)"), static_cast<int>(C::FrameGeneration::Fsr2x)},
+	            {QObject::tr("NVIDIA DLSS-G 2x (RTX 40+)"), static_cast<int>(C::FrameGeneration::Dlss2x)},
+	            {QObject::tr("NVIDIA DLSS-G 3x (RTX 50)"), static_cast<int>(C::FrameGeneration::Dlss3x)},
+	            {QObject::tr("NVIDIA DLSS-G 4x (RTX 50)"), static_cast<int>(C::FrameGeneration::Dlss4x)}},
+	           static_cast<int>(info.frame_generation));
+	ChoiceInit(ui.comboBox_low_latency,
+	           {{QObject::tr("Off"), static_cast<int>(C::LowLatency::Off)},
+	            {QObject::tr("On (one queued frame)"), static_cast<int>(C::LowLatency::On)},
+	            {QObject::tr("On + AMD Anti-Lag"), static_cast<int>(C::LowLatency::AntiLag)}},
+	           static_cast<int>(info.low_latency));
+	ChoiceInit(ui.comboBox_pipeline_build,
+	           {{QObject::tr("Auto (fast first on NVIDIA and AMD/Linux)"), static_cast<int>(C::PipelineBuild::Auto)},
+	            {QObject::tr("Fast first, optimized in the background"), static_cast<int>(C::PipelineBuild::FastFirst)},
+	            {QObject::tr("Optimized at once"), static_cast<int>(C::PipelineBuild::Optimized)}},
+	           static_cast<int>(info.pipeline_build));
+	ui.spinBox_fsr_sharpness->setValue(info.fsr_sharpness);
+	ui.checkBox_fps_overlay->setChecked(info.fps_overlay);
+	ui.lineEdit_streamline_dir->setText(info.streamline_dir);
+#if !defined(_WIN32)
+	ui.label_streamline_dir->setVisible(false);
+	ui.lineEdit_streamline_dir->setVisible(false);
+#endif
+	const auto update = [&ui] {
+		ui.spinBox_fsr_sharpness->setEnabled(ui.comboBox_upscaler->currentData().toInt() ==
+		                                     static_cast<int>(Configuration::Upscaler::Fsr));
+	};
+	QObject::connect(ui.comboBox_upscaler, &QComboBox::currentIndexChanged, ui.spinBox_fsr_sharpness, update);
+	update();
+}
+
 void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
@@ -231,6 +285,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
 	ListInit(m_ui->comboBox_profiler_direction, info.profiler_direction);
+	InitEnhancements(*m_ui, info);
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -367,6 +422,14 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.printf_output_file = ui.lineEdit_printf_file->text();
 	info.profiler_direction =
 	    TextToEnum<Configuration::ProfilerDirection>(ui.comboBox_profiler_direction->currentText());
+	info.upscaler         = static_cast<Configuration::Upscaler>(ui.comboBox_upscaler->currentData().toInt());
+	info.render_height    = ui.comboBox_render_height->currentData().toInt();
+	info.fsr_sharpness    = ui.spinBox_fsr_sharpness->value();
+	info.frame_generation = static_cast<Configuration::FrameGeneration>(ui.comboBox_frame_generation->currentData().toInt());
+	info.low_latency      = static_cast<Configuration::LowLatency>(ui.comboBox_low_latency->currentData().toInt());
+	info.fps_overlay      = ui.checkBox_fps_overlay->isChecked();
+	info.pipeline_build   = static_cast<Configuration::PipelineBuild>(ui.comboBox_pipeline_build->currentData().toInt());
+	info.streamline_dir   = ui.lineEdit_streamline_dir->text().trimmed();
 }
 
 void ConfigurationEditDialog::update_info() {

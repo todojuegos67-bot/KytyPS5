@@ -591,6 +591,21 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitExt(state, TypeF32(state), GlslFma,
 			                         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)}));
 			return true;
+		case IR::ValueOpcode::FPMad32: {
+			// (A translation feature: a static store made without it keeps its pipelines, its next precompile brings it.)
+			if (!state.program.unfused_mad) {
+				ctx.Define(inst, EmitExt(state, TypeF32(state), GlslFma,
+				                         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)}));
+				return true;
+			}
+			// The product rounded, then the add: neither may be contracted into a fused multiply-add (NoContraction = 42).
+			const auto product = state.builder.AllocateId();
+			state.builder.AddFunction({OpFMul, TypeF32(state), product, ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
+			state.builder.AddAnnotation({OpDecorate, product, 42u});
+			const auto sum = ctx.Emit(inst, OpFAdd, IR::Type::F32, {product, ctx.Arg(inst, 2)});
+			state.builder.AddAnnotation({OpDecorate, sum, 42u});
+			return true;
+		}
 		case IR::ValueOpcode::FPMin32:
 			ctx.Define(inst, EmitMinMaxF32Value(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), false));
 			return true;

@@ -228,6 +228,21 @@ jobs:
           }
           if ($bad) { exit 1 }
 
+      # AMD's FSR runtime (src/local/frame-gen.cpp: KYTY_FRAMEGEN_BACKEND=fsr, and FSR 4 upscaling for KYTY_UPSCALER=fsr):
+      # AMD FSR SDK 2.4's API headers (MIT, LICENSES/FidelityFX-SDK-MIT.txt) at build time, in their layout; its runtime
+      # (the DLLs signed by AMD) is the user's own, next to the emulator. Without them the build has no AMD runtime path.
+      - name: FSR SDK headers
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          git clone --quiet --depth 1 --branch v2.4.0 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git _Build\fsr-sdk-src
+          git -C _Build\fsr-sdk-src sparse-checkout set Kits/FidelityFX/api/include Kits/FidelityFX/framegeneration/include Kits/FidelityFX/upscalers/include
+          foreach ($folder in 'api', 'framegeneration', 'upscalers') {
+            New-Item -ItemType Directory -Force "_Build\deps\fsr-sdk\Kits\FidelityFX\$folder" | Out-Null
+            Copy-Item "_Build\fsr-sdk-src\Kits\FidelityFX\$folder\include" "_Build\deps\fsr-sdk\Kits\FidelityFX\$folder" -Recurse
+          }
+          Get-ChildItem _Build\deps\fsr-sdk -Recurse -Name -Filter *.h
+
       # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
         shell: cmd
@@ -251,6 +266,11 @@ jobs:
               Write-Output "::error::$line"
             }
           }
+
+      # The settings window (launcher-windows: WPF on .NET Framework 4.7.2, part of Windows 10 and 11).
+      - name: Build launcher
+        shell: cmd
+        run: call launcher-windows\build.cmd || exit /b 1
 
       - name: Package
         shell: pwsh
@@ -348,7 +368,7 @@ jobs:
           $out = "_Build\package\$env:PACKAGE"
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item "$build\kyty_emulator.exe", "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll",
-            run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
+            _Build\launcher\KytyLauncher.exe, run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
           Copy-Item LICENSES $out -Recurse
           if (Test-Path "$build\3rdparty\zarchive.exe") { Copy-Item "$build\3rdparty\zarchive.exe" $out }
           # Demon's Souls launcher (window with frame generation choice) and its two configs.

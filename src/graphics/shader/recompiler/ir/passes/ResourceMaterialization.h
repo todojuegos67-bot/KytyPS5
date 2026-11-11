@@ -39,8 +39,9 @@ struct ResourceSpecialization {
 };
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
-// its values and is independent of the translated shader CFG.
-ResourcePlan ExtractResourcePlan(const Program& program);
+// its values and is independent of the translated shader CFG. Without `linear`, no linear SRT plan
+// (BuildLinearSrtPlan, made from the plan alone: the caller makes it when the plan is used).
+ResourcePlan ExtractResourcePlan(const Program& program, bool linear = true);
 
 // Resolves and specializes the immutable resource plan in one transaction. On failure both
 // destinations are unchanged.
@@ -84,7 +85,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
-// The canonical form of a specialization of portable modules (PortableShaders): the fields the
+// The canonical form of a specialization of portable modules (ShaderIR.h): the fields the
 // code reads from its buffer words at run time (a stride below 4096 without swizzling) are cleared,
 // so a warmup record from before canonicalizes to the permutation the game now selects (but for a
 // null texture, which such a record holds as 2D; MaterializeResources now gives it the dimension

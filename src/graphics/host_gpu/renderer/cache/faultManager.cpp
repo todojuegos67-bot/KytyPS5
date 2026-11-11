@@ -7,7 +7,10 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/memory.h"
 #include "live-counters.h"
+#include "live-switch.h"
+#include "live-trace-gpu.h"
 
 #include <algorithm>
 #include <bit>
@@ -20,6 +23,8 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr size_t MaxPageFaults    = 1024;
+// Bitmap words each invocation of fault_buffer_process.comp reads (FAULT_WORDS_PER_INVOCATION in CMakeLists.txt).
+constexpr uint64_t FaultWordsPerInvocation = 16;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 
 } // namespace
@@ -30,12 +35,15 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                      BufferCache::CACHING_NUMPAGES / 8),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * PageFaultAreaSize) {
+                        MaxPendingFaults * PageFaultAreaSize),
+      m_granule_buffer(graphics, scheduler, MemoryUsage::Upload, 0, AllFlags,
+                       MaxPendingFaults * MaxGranules * sizeof(uint32_t)) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
 	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
 	};
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
@@ -53,9 +61,12 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
 	                     "create fault-buffer shader module");
 
+	const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t)};
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount = 1;
-	pipeline_layout_info.pSetLayouts    = &m_fault_process_desc_layout;
+	pipeline_layout_info.setLayoutCount         = 1;
+	pipeline_layout_info.pSetLayouts            = &m_fault_process_desc_layout;
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push;
 	RequireVulkanSuccess(
 	    m_graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                           &m_fault_process_pipeline_layout),
@@ -86,6 +97,7 @@ FaultManager::~FaultManager() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
+	const LiveTrace::MarkSite site(LiveTrace::SiteFaultProcess);
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
@@ -95,6 +107,22 @@ void FaultManager::ProcessFaultBuffer() {
 	auto*      mapped = m_download_buffer.Mapped().data() + offset;
 	std::memset(mapped, 0, PageFaultAreaSize);
 	m_download_buffer.Flush(offset, PageFaultAreaSize);
+
+	// Only the bitmap's uvec4s over committed guest memory (one per 2 MiB granule: Demon's Souls commits ~11 GB of the
+	// bitmap's 1 TiB). A shader's read elsewhere is zero whether or not a buffer is made there, and its bit stays set
+	// until the memory is committed (then scanned with the rest).
+	static_assert(LibKernel::Memory::CommittedGranuleBits == BufferCache::CACHING_PAGEBITS + 7, "a uvec4 is 128 pages");
+	(void)LibKernel::Memory::CommittedGranules(&m_granule_version, &m_granules);
+	static auto& listed       = LiveSwitch::Find("fault_granules", 1); // (0: the whole bitmap, for A/B)
+	const auto granule_count  = m_granules.size() <= MaxGranules && listed.load(std::memory_order_relaxed) != 0
+	                                ? static_cast<uint32_t>(m_granules.size())
+	                                : 0u;
+	const auto granule_offset = m_current_area * MaxGranules * sizeof(uint32_t);
+	if (granule_count != 0 && m_area_granule_versions[m_current_area] != m_granule_version) {
+		std::memcpy(m_granule_buffer.Mapped().data() + granule_offset, m_granules.data(), granule_count * sizeof(uint32_t));
+		m_granule_buffer.Flush(granule_offset, granule_count * sizeof(uint32_t));
+		m_area_granule_versions[m_current_area] = m_granule_version;
+	}
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -113,8 +141,9 @@ void FaultManager::ProcessFaultBuffer() {
 	const vk::DescriptorBufferInfo infos[] {
 	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
 	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
+	    {m_granule_buffer.Handle(), granule_offset, MaxGranules * sizeof(uint32_t)},
 	};
-	std::array<vk::WriteDescriptorSet, 2> writes {};
+	std::array<vk::WriteDescriptorSet, 3> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
 		writes[index].dstBinding      = index;
 		writes[index].descriptorCount = 1;
@@ -132,7 +161,10 @@ void FaultManager::ProcessFaultBuffer() {
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	command.pushConstants(m_fault_process_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(granule_count),
+	                      &granule_count);
+	const auto num_threads    = granule_count != 0 ? granule_count
+	                                               : BufferCache::CACHING_NUMPAGES / 32 / FaultWordsPerInvocation;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;

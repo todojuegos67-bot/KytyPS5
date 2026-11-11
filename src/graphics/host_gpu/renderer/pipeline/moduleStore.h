@@ -4,7 +4,7 @@
 // enabled): a pipeline then gets its shaders' SPIR-V inline (CreatePipelineHandle) and the driver keeps none of it
 // once the pipeline is made. NVIDIA kept a copy of every module's SPIR-V while the module lived: ~1.8 GB of heap with
 // the 1.07 warmup's ~16k modules, and more with every area played. The pipeline keys (the static store's) are the
-// same either way (KYTY_INLINE_KEY_CHECK). A stored module's handle is the store's own (an address in an array of its
+// same either way. A stored module's handle is the store's own (an address in an array of its
 // own, never a driver object): only pipeline creation takes it. Its SPIR-V waits zstd-compressed in a scratch file
 // (a fifth of the bytes), the last few loaded in memory.
 

@@ -1,6 +1,7 @@
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
+#include "write-guard.h"
 #include "live-counters.h"
 #include "async-upload.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
@@ -8,6 +9,8 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <vector>
 #include <cstdio>
@@ -20,19 +23,16 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "kernel/memory.h"
+#include "loader/demonsSoulsPageFree.h"
 #include "speculation-state.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
 
 extern "C" {
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {1};
 // 1: watchers removed while memory is released skip the host protection change there
 // (PageManager::SetUnmappingRange); a write fault on a page nothing watches unprotects it.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode {0};
-// Live switch (same-process A/B): a write fault in the 16 KiB window right after the one the same thread's last window
-// fault ended in, within 2 ms (a sequential stream of writes), takes the next 64 KiB at once. (1-1 route, 120 cap, A-B-A
-// over 29 points: window faults -13.6%, fps +0.7%, 1% low +3.8%, p99 -4.1%; uploads +9%, on the upload worker.)
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_window_stream_mode {1};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode {1};
 }
 
 namespace Libs::Graphics {
@@ -69,23 +69,21 @@ bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault) {
 	constexpr uint64_t window_size  = 4 * TRACKER_PAGE_SIZE;
 	constexpr uint64_t stream_size  = 16 * TRACKER_PAGE_SIZE;
 	const auto         window_begin = fault & ~(window_size - 1);
-	if (kyty_local_window_stream_mode.load(std::memory_order_relaxed) != 0) {
-		// The window after the one this thread's last window fault ended in, within 2 ms (~6.4M TSC ticks at 3.2 GHz):
-		// a stream, whose next 64 KiB goes at once (the next fault in it is the window after that).
-		thread_local uint64_t last_end = 0, last_tsc = 0;
-		const uint64_t        now      = __rdtsc();
-		const bool            stream   = window_begin == last_end && now - last_tsc < 6'400'000;
-		if (stream && TryInvalidateCpuWriteWindow(fault, window_begin, stream_size)) {
-			last_end = window_begin + stream_size;
-			last_tsc = now;
-			return true;
-		}
-		if (!TryInvalidateCpuWriteWindow(fault, window_begin, window_size)) return false;
-		last_end = window_begin + window_size;
+	// The window after the one this thread's last window fault ended in, within 2 ms (~6.4M TSC ticks at 3.2 GHz): a
+	// stream, whose next 64 KiB goes at once (the next fault in it is the window after that). (1-1 route, 120 cap, A-B-A
+	// over 29 points: window faults -13.6%, fps +0.7%, 1% low +3.8%, p99 -4.1%; uploads +9%, on the upload worker.)
+	thread_local uint64_t last_end = 0, last_tsc = 0;
+	const uint64_t        now      = __rdtsc();
+	const bool            stream   = window_begin == last_end && now - last_tsc < 6'400'000;
+	if (stream && TryInvalidateCpuWriteWindow(fault, window_begin, stream_size)) {
+		last_end = window_begin + stream_size;
 		last_tsc = now;
 		return true;
 	}
-	return TryInvalidateCpuWriteWindow(fault, window_begin, window_size);
+	if (!TryInvalidateCpuWriteWindow(fault, window_begin, window_size)) return false;
+	last_end = window_begin + window_size;
+	last_tsc = now;
+	return true;
 }
 
 bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_begin, uint64_t window_size) {
@@ -309,6 +307,9 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		// Pending upload jobs on the range read its backing (or change its protection): they finish before
 		// it changes owner. Jobs elsewhere keep running.
 		AsyncUpload::DrainRange(vaddr, size);
+		// Guards of pending guest writes on the range (KYTY_WRITE_GUARD) dropped: a lift after the unmap would protect
+		// whatever is mapped there next (its lift job then finds none).
+		WriteGuard::Drop(vaddr, size);
 		// The GPU only works on the caches' own buffers and images, which are freed after the
 		// work in flight completes (deferred operations), so the unmap need not wait for the GPU
 		// (it used to finish all of it: up to a frame of GPU work, for every guest unmap). What
@@ -352,6 +353,47 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+void GpuResourceManager::FreedByGame(uint64_t vaddr, uint64_t size) {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_ENGINE_FREE_BUFFERS");
+		return value != nullptr && (value[0] == '0' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 1u;
+	}();
+	if (mode == 0 || m_gpu == nullptr || !GuestRange {vaddr, size}.Valid()) return;
+	(void)m_gpu->TrySendCommand([this, vaddr, size] {
+		// (Unmapped meanwhile: UnmapMemory dealt with its buffers.)
+		if (!IsMapped(vaddr, size)) return;
+		const auto start = std::chrono::steady_clock::now();
+		// What went, reported every 30 s it happened (the GPU thread's own counts: all of its time here, a freed block's read
+		// back included when nothing went).
+		static BufferCache::FreeBlockSplits splits;
+		static uint64_t                     blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0;
+		static auto                         next   = start + std::chrono::seconds(30);
+		const auto lists = splits.lists;
+		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, mode != 2, &Loader::DemonsSoulsPageFree::FreeBlocksIn, &splits);
+		const auto took  = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+		ns += took;
+		max_ns = std::max(max_ns, took);
+		if (freed != 0) {
+			blocks++;
+			bytes += size;
+			let_go += freed;
+		}
+		if ((freed == 0 && splits.lists == lists) || start < next) return;
+		std::printf("Engine frees: %llu freed blocks (%.0f MiB) had buffers over them: %.0f MiB of buffers let go (%.0f MiB cut off "
+		            "buffers over other free blocks too, the allocator's lists read %llu times), %.1f ms on the GPU thread (at most "
+		            "%.2f ms a block); BDA reads of unbuffered pages so far %llu (KYTY_ENGINE_FREE_BUFFERS)\n",
+		            static_cast<unsigned long long>(blocks), static_cast<double>(bytes) / 1048576.0,
+		            static_cast<double>(let_go) / 1048576.0, static_cast<double>(splits.cut) / 1048576.0,
+		            static_cast<unsigned long long>(splits.lists), static_cast<double>(ns) / 1e6, static_cast<double>(max_ns) / 1e6,
+		            static_cast<unsigned long long>(LiveCounters::Value(LiveCounters::BdaFaultPages)));
+		std::fflush(stdout);
+		blocks = bytes = let_go = ns = max_ns = 0;
+		splits = {};
+		next   = start + std::chrono::seconds(30);
+	});
 }
 
 bool GpuResourceManager::UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept {
@@ -666,6 +708,7 @@ void GpuResourceManager::RunCollectors() {
 	const bool over_budget = m_graphics.CanReportMemoryUsage() &&
 	                         m_graphics.GetDeviceMemoryUsage() >= m_graphics.GetTotalMemoryBudget();
 	m_buffer_cache.RunGarbageCollector(bda_free || (over_budget && (++m_collections % 60) == 0));
+	LibKernel::Memory::CoolHotReads();
 }
 
 } // namespace Libs::Graphics

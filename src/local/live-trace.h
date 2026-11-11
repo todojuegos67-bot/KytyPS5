@@ -12,7 +12,7 @@
 
 namespace LiveTrace {
 
-// Values 3-6 and 15-18 belonged to events no longer recorded; they are not reused.
+// Values 3-6, 15-18 and 29 belonged to events no longer recorded; they are not reused.
 enum Type : uint32_t {
 	Submit        = 1,  // a: queue | type << 8, b: dwords
 	GuestDone     = 2,  // a: submitted frame
@@ -34,7 +34,6 @@ enum Type : uint32_t {
 	GpuWrite      = 26, // a: address, b: size | tick the writing command is recorded in << 32
 	LabelWrite    = 27, // a: address, b: value (low 48 bits) | source << 56 (1 end of pipe, 2 WRITE_DATA)
 	SyncReadback  = 28, // a: address, b: size | tick the copy is recorded in << 32 (drains the queue)
-	RbMismatch    = 29, // a: address, b: size | tick the copy engine waited for << 32 (KYTY_READBACK_QUEUE=3)
 	RbFast        = 30, // a: window address, b: size | tick the copy engine waits for << 32
 	BufferUse     = 31, // a: address, b: size | 1 << 63 when written (every ObtainBuffer, `tracew`)
 	FaultSite     = 32, // a: faulting guest instruction, b: fault address | 1 << 63 for a write (tracked pages)
@@ -43,6 +42,9 @@ enum Type : uint32_t {
 	SlowOsCall    = 35, // a: address, b: call << 56 | TSC ticks / 1024 (24 bits) << 32 | size in 4 KiB pages
 	FaultDone     = 36, // the handled fault of the thread's last FaultSite: a: 1 write / 0 read, b: fault address
 	GuestCommand  = 37, // render thread runs a guest thread's command (SendCommand): a: 1 begin / 0 end
+	RbEnqueue     = 38, // a readback copy for the copy engine (ReadbackQueue::Copy): a: its value, b: graphics tick it waits for
+	RbSubmit      = 39, // that copy handed to the driver (recording worker or GPU thread): a: its value
+	GpuMarkCaller = 40, // follows GpuMark of a barrier: a: mark slot, b: return address of the code that recorded it
 };
 
 // SlowOsCall ids: address-space calls that hold the process's memory locks (a page fault anywhere

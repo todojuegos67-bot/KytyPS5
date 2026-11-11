@@ -384,7 +384,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool ena
 		next.table_block_dwords = 2;
 	} else {
 		next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
-		if (PortableShaders()) next.buffer_word_count = static_cast<uint32_t>(program.info.buffers.size());
+		next.buffer_word_count   = static_cast<uint32_t>(program.info.buffers.size());
 	}
 	if (enable_lod_stats && program.stage == ShaderType::Pixel && !program.info.images.empty()) {
 		next.lod_stats_count = static_cast<uint32_t>(program.info.images.size());

@@ -54,6 +54,38 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(zstd zarchive_source)
 
+# Opus: the DualSense's Bluetooth link carries the pad speaker as Opus packets inside HID reports (there is no
+# USB audio endpoint over Bluetooth), so src/libs/dualSenseBluetooth.cpp encodes them with this.
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	opus
+	GIT_REPOSITORY https://github.com/xiph/opus.git
+	GIT_TAG ddbe48383984d56acd9e1ab6a090c54ca6b735a6 # v1.5.2
+	GIT_SHALLOW FALSE
+)
+FetchContent_MakeAvailable(opus)
+
+# KYTY_MIMALLOC: the emulator's operator new/delete (src/main.cpp) from mimalloc instead of the CRT heap.
+if(KYTY_MIMALLOC)
+	# Vendored: 3rdparty/mimalloc is mimalloc v2.5.2 (2406cc5f), the files src/static.c includes (Windows only),
+	# include/ and LICENSE, unchanged. Built as its own CMake build of the static library would build it here: one
+	# translation unit (static.c) compiled as C++ (MI_USE_CXX, as with MSVC), MI_STATIC_LIB, the release defines.
+	add_library(mimalloc-static STATIC mimalloc/src/static.c)
+	set_source_files_properties(mimalloc/src/static.c PROPERTIES LANGUAGE CXX)
+	set_target_properties(mimalloc-static PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+	target_include_directories(mimalloc-static PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/mimalloc/include")
+	target_compile_definitions(mimalloc-static PRIVATE MI_BUILD_RELEASE MI_CMAKE_BUILD_TYPE=release MI_STATIC_LIB NOMINMAX)
+	target_link_libraries(mimalloc-static PUBLIC psapi shell32 user32 advapi32 bcrypt)
+	if(MSVC)
+		target_compile_options(mimalloc-static PRIVATE /W0 /Zc:__cplusplus) # (/Zc:__cplusplus: as mimalloc's own build)
+	else()
+		target_compile_options(mimalloc-static PRIVATE -w)
+	endif()
+	# SPIRV-Tools would add mimalloc a second time.
+	set(SPIRV_TOOLS_USE_MIMALLOC OFF CACHE BOOL "" FORCE)
+endif()
+
 add_library(zarchive STATIC
 	"${zarchive_source_SOURCE_DIR}/src/zarchivereader.cpp"
 	"${zarchive_source_SOURCE_DIR}/src/zarchivewriter.cpp"
@@ -82,6 +114,17 @@ endif()
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL2)
+# SDL without its C library (SDL_LIBC off, its MSVC default) is compiled with /Gs1048576: no stack probe for a frame
+# under 1 MiB, as it has no __chkstk of its own. Each SDL function carries that probe size, and one that ThinLTO inlines
+# into the emulator's code hands it to the caller (LLVM's adjustCallerStackProbeSize, for a caller without its own):
+# the caller's frame then skips the stack's guard page. The DualSense Bluetooth sender thread's 16 KiB frame did, and
+# the process ended at start-up with 0xC0000005 and no word in the log (the fault cannot be delivered on that stack).
+# The emulator links the C runtime, whose __chkstk serves SDL too.
+if(MSVC AND NOT SDL_LIBC AND TARGET SDL2-static)
+	get_target_property(sdl_compile_options SDL2-static COMPILE_OPTIONS)
+	list(REMOVE_ITEM sdl_compile_options "/Gs1048576")
+	set_target_properties(SDL2-static PROPERTIES COMPILE_OPTIONS "${sdl_compile_options}")
+endif()
 
 add_library(Vulkan-Headers INTERFACE)
 add_library(Vulkan::Headers ALIAS Vulkan-Headers)
@@ -119,6 +162,12 @@ add_library(spirv-tools ALIAS SPIRV-Tools-static)
 add_library(spirv-tools-opt ALIAS SPIRV-Tools-opt)
 
 add_subdirectory(xxHash/build/cmake)
+
+# AMD FidelityFX SDK 1.1.4 sources (FSR 3 upscaling, and frame interpolation on Linux) for Linux and Windows builds.
+# (des-up-1110) Not built in the DeS port (upstream's fsr-native.cpp is left out; our FSR goes through AMD's DLL).
+if (FALSE)
+	add_subdirectory(fidelityfx)
+endif()
 
 set(FMT_DOC OFF CACHE BOOL "" FORCE)
 set(FMT_INSTALL OFF CACHE BOOL "" FORCE)

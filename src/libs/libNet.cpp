@@ -1574,13 +1574,12 @@ static const std::vector<NpEntitlementAccessAddcontEntitlementInfo>& AddcontEnti
 		// so a label is never unowned here and mounted there.
 		const auto folders = Addcont::Folders(title_id);
 		if (folders.empty()) {
-			std::printf("NpEntitlementAccess: %s holds no add-on; only the built-in add-on list is "
-			            "answered\n",
+			std::printf("NpEntitlementAccess: %s holds no add-on\n",
 			            Addcont::Directory(title_id).string().c_str());
-			return;
+		} else {
+			std::printf("NpEntitlementAccess: reading add-ons from %s\n",
+			            Addcont::Directory(title_id).string().c_str());
 		}
-		std::printf("NpEntitlementAccess: reading add-ons from %s\n",
-		            Addcont::Directory(title_id).string().c_str());
 
 		for (const auto& folder: folders) {
 			NpEntitlementAccessAddcontEntitlementInfo info {};
@@ -1593,6 +1592,26 @@ static const std::vector<NpEntitlementAccessAddcontEntitlementInfo>& AddcontEnti
 			// printf, not LOGF: the console's LOGF is silent in the release configuration.
 			std::printf("NpEntitlementAccess: add-on '%s' reported as owned (%s)\n",
 			            folder.label.c_str(), folder.path.string().c_str());
+		}
+
+		// A license-only declaration is owned although no folder holds its files: nothing can mount it,
+		// but the game is told it owns it, which is what unlocks a deluxe edition's extras.
+		for (const auto& local: Addcont::LocalEntitlements(title_id)) {
+			bool installed = false;
+			for (const auto& folder: folders) {
+				installed = installed || folder.label == local.label;
+			}
+			if (installed) {
+				continue;
+			}
+			NpEntitlementAccessAddcontEntitlementInfo info {};
+			std::snprintf(info.entitlement_label.data, sizeof(info.entitlement_label.data), "%s",
+			              local.label.c_str());
+			info.package_type    = NP_ENTITLEMENT_ACCESS_ADDON_LIST[0].package_type;
+			info.download_status = NP_ENTITLEMENT_ACCESS_ADDON_LIST[0].download_status;
+			entitlements.push_back(info);
+			std::printf("NpEntitlementAccess: license-only add-on '%s' reported as owned (%s)\n",
+			            local.label.c_str(), local.content_id.c_str());
 		}
 	});
 

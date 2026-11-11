@@ -1,74 +1,13 @@
 #!/bin/bash
-# Production switch set for Demon's Souls (from run-windows.json) + best binary.
+# Runs Demon's Souls with the best binary (the emulator's own switch defaults are the release settings).
 # Work in the repository root when this is the checked-out script (tools/local/), else in the folder
 # of a packaged copy (the executable next to it).
 _kyty_here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 if [ -d "$_kyty_here/../../_Build" ]; then cd "$_kyty_here/../.." || exit 1
 elif [ -d "$_kyty_here/../_Build" ]; then cd "$_kyty_here/.." || exit 1
 else cd "$_kyty_here" || exit 1; fi
-# A switch set before this script keeps its value (KYTY_TABLE_DISPATCH=0 ./run_ds.sh: issue #51, where the script
-# set it back to 1 and the test changed nothing).
-export KYTY_SHADER_WARMUP=${KYTY_SHADER_WARMUP:-1}
-export KYTY_GPU_BUFFER_PAGES=${KYTY_GPU_BUFFER_PAGES:-1}
-export KYTY_RECORDING_CPUS=${KYTY_RECORDING_CPUS:-auto}
-export KYTY_SRT_NATIVE=${KYTY_SRT_NATIVE:-1}
-export KYTY_SRT_PREDICATES=${KYTY_SRT_PREDICATES:-1}
-export KYTY_PREPARATION_SCRATCH=${KYTY_PREPARATION_SCRATCH:-1}
-export KYTY_PREPARATION_LOOKUP=${KYTY_PREPARATION_LOOKUP:-1}
-export KYTY_PREPARATION_TRIM=${KYTY_PREPARATION_TRIM:-1}
-export KYTY_SPECIALIZATION_GUARD=${KYTY_SPECIALIZATION_GUARD:-1}
-export KYTY_PIPELINE_INDEX=${KYTY_PIPELINE_INDEX:-1}
-export KYTY_BINDING_SCRATCH=${KYTY_BINDING_SCRATCH:-1}
-export KYTY_DRAW_RUN_RANGES=${KYTY_DRAW_RUN_RANGES:-1}
-export KYTY_BUFFER_RESIDENCY=${KYTY_BUFFER_RESIDENCY:-1}
-export KYTY_COPY_FEEDBACK=${KYTY_COPY_FEEDBACK:-1}
-export KYTY_ASYNC_LOD_STATS=${KYTY_ASYNC_LOD_STATS:-1}
-export KYTY_BACKING_READ=${KYTY_BACKING_READ:-1}
-export KYTY_STREAM_UPLOAD=${KYTY_STREAM_UPLOAD:-1}
-export KYTY_FRAME_PIPELINE=${KYTY_FRAME_PIPELINE:-1}
-export KYTY_IMAGE_BARRIER_DEDUPE=${KYTY_IMAGE_BARRIER_DEDUPE:-1}
-export KYTY_IMAGE_POOL=${KYTY_IMAGE_POOL:-1}
-export KYTY_PENDING_DRAIN=${KYTY_PENDING_DRAIN:-1}
-export KYTY_DISPATCH_BATCH=${KYTY_DISPATCH_BATCH:-128}
-export KYTY_VULKAN_RECORDING=${KYTY_VULKAN_RECORDING:-1}
-export KYTY_DEFERRED_SUBMIT=${KYTY_DEFERRED_SUBMIT:-1}
-export KYTY_NATIVE_XPR=${KYTY_NATIVE_XPR:-1}
-export KYTY_WRITE_WINDOW_HANDOFF=${KYTY_WRITE_WINDOW_HANDOFF:-1}
-export KYTY_READBACK_DETACH=${KYTY_READBACK_DETACH:-1}
-export KYTY_ASYNC_WRITE_READBACK=${KYTY_ASYNC_WRITE_READBACK:-1}
-export KYTY_READBACK_SLOTS=${KYTY_READBACK_SLOTS:-1}
-export KYTY_ASYNC_UPLOAD=${KYTY_ASYNC_UPLOAD:-2}
-export KYTY_BDA_DIRTY_REGIONS=${KYTY_BDA_DIRTY_REGIONS:-1}
-export KYTY_GLOBAL_BARRIER_DEDUPE=${KYTY_GLOBAL_BARRIER_DEDUPE:-1}
-export KYTY_RANGE_SET_FAST=${KYTY_RANGE_SET_FAST:-1}
-export KYTY_IMAGE_GRANULES=${KYTY_IMAGE_GRANULES:-2}
-export KYTY_NATIVE_XPR_PREDICT=${KYTY_NATIVE_XPR_PREDICT:-1}
-export KYTY_NATIVE_IMAGE_PROOF=${KYTY_NATIVE_IMAGE_PROOF:-1}
-export KYTY_TEXTURE_RESOLVE_PAGES=${KYTY_TEXTURE_RESOLVE_PAGES:-1}
-export KYTY_ASYNC_REPROTECT=${KYTY_ASYNC_REPROTECT:-1}
-export KYTY_READBACK_NARROW=${KYTY_READBACK_NARROW:-1}
-export KYTY_SHADER_WARMUP_THREADS=${KYTY_SHADER_WARMUP_THREADS:-16}
-export KYTY_READBACK_QUEUE=${KYTY_READBACK_QUEUE:-1}
-export KYTY_TABLE_XPR=${KYTY_TABLE_XPR:-2}
-export KYTY_TABLE_DISPATCH=${KYTY_TABLE_DISPATCH:-1}
-# The rest of run-windows.ps1's defaults (src/local/performance-switches.h).
-export KYTY_BUFFER_RECLAIM=${KYTY_BUFFER_RECLAIM:-1}
-export KYTY_DRAW_PACKETS=${KYTY_DRAW_PACKETS:-1}
-export KYTY_PARTIAL_IMAGE_DIRTY=${KYTY_PARTIAL_IMAGE_DIRTY:-1}
-export KYTY_PARTIAL_ROW_BANDS=${KYTY_PARTIAL_ROW_BANDS:-1}
-export KYTY_ASYNC_XPR_PIPELINES=${KYTY_ASYNC_XPR_PIPELINES:-1}
-export KYTY_NATIVE_XPR_RELOCATE=${KYTY_NATIVE_XPR_RELOCATE:-1}
-export KYTY_NATIVE_XPR_STORE_BUDGET=${KYTY_NATIVE_XPR_STORE_BUDGET:-256}
-export KYTY_NATIVE_XPR_KEEP_FRAMES=${KYTY_NATIVE_XPR_KEEP_FRAMES:-600}
-export KYTY_NATIVE_XPR_INSTANCES=${KYTY_NATIVE_XPR_INSTANCES:-1}
-export KYTY_UNMAP_PROTECT_SKIP=${KYTY_UNMAP_PROTECT_SKIP:-1}
-# Demon's Souls' own engine setting (src/loader/gameArgs.h), as run-windows.ps1 gives it: no XPR index-buffer
-# culling, ~2800 compute dispatches a frame at Boletaria 1-1 that cull triangles the GPU then draws anyway
-# (KYTY_GAME_CONVARS= empty: none).
-export KYTY_GAME_CONVARS=${KYTY_GAME_CONVARS-doIndexBufferCulling=false}
-# One driver pipeline cache for every build (_PipelineCache/local/<key>), as run-windows.ps1: keyed by the
-# executable, every update compiled the warmup pipelines again (minutes), and a modified source tree had none.
-export KYTY_DRIVER_CACHE_KEY=${KYTY_DRIVER_CACHE_KEY:-1f3c29b70e536c8f5a5e812e793b33ac2eb6858b4810ed98ca2a51b9fa5eed97}
+# The emulator's switches default to the release settings (src/local/performance-switches.h); one set before this
+# script reaches it unchanged (KYTY_TABLE_DISPATCH=0 ./run_ds.sh: an A/B or a workaround, as in issue #51).
 # GPU render thread pinned off CPU 0 (interrupt-heavy); physical cores 1-7.
 export KYTY_RENDER_CPUS=${KYTY_RENDER_CPUS:-"1,2,3,4,5,6,7"}
 # KYTY_BIN, else the first there of _Build/linux-nt, _Build/linux (build-linux.sh) and a packaged copy's executable

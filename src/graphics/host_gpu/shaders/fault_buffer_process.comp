@@ -4,8 +4,19 @@
 #version 450
 #extension GL_ARB_gpu_shader_int64 : enable
 
+// The page bitmap (CACHING_NUMPAGES bits: 8 MiB) read as uvec4s, each 2 MiB of guest addresses; only a nonzero word is
+// cleared. With granule_count: one uvec4 an invocation, those granules[] lists (FaultManager: the granules holding
+// committed guest memory). With 0: the whole bitmap, FAULT_WORDS_PER_INVOCATION words per invocation, each pass of the
+// loop reading consecutive uvec4s across the invocations. The bitmap is nearly all zeros: one word per invocation with a
+// store of zero after every read took ~1 ms a dispatch on a Steam Deck's GPU (2^21 invocations, 7 dispatches a frame at
+// 1-1), the whole bitmap as uvec4s ~0.14 ms. Past MAX_PAGE_FAULTS the words not reached stay set for the next
+// processing.
+
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+layout(std430, binding = 0) buffer input_vec {
+    uvec4 fault_vec[];
+};
 layout(std430, binding = 0) buffer input_buf {
     uint fault_buffer[];
 };
@@ -17,19 +28,54 @@ layout(std430, binding = 1) buffer output_buf32 {
     uint download_buffer32[];
 };
 
+layout(std430, binding = 2) readonly buffer granule_buf {
+    uint granules[];
+};
+
+layout(push_constant) uniform Push {
+    uint granule_count;
+} push;
+
+// The records of one uvec4's set bits: false once MAX_PAGE_FAULTS are taken.
+bool Scan(uint vec) {
+    const uvec4 words = fault_vec[vec];
+    if (all(equal(words, uvec4(0u)))) {
+        return true;
+    }
+    for (uint component = 0u; component < 4u; ++component) {
+        if (words[component] == 0u) {
+            continue;
+        }
+        const uint index = vec * 4u + component;
+        // Taken and cleared in one step: a bit a shader sets after the read above (on another queue, or a submission
+        // not ordered before this one) stays set for the next processing instead of being cleared unreported.
+        uint word = atomicExchange(fault_buffer[index], 0u);
+        const uint base_bit = index * 32u;
+        while (word != 0u) {
+            const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
+            if (store_index >= MAX_PAGE_FAULTS) {
+                return false;
+            }
+            const uint bit = findLSB(word);
+            word &= word - 1u;
+            const uint page = base_bit + bit;
+            download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+        }
+    }
+    return true;
+}
+
 void main() {
-    const uint id = gl_GlobalInvocationID.x;
-    uint word = fault_buffer[id];
-    fault_buffer[id] = 0u;
-    const uint base_bit = id * 32u;
-    while (word != 0u) {
-        const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
-        if (store_index >= MAX_PAGE_FAULTS) {
+    if (push.granule_count != 0u) {
+        if (gl_GlobalInvocationID.x < push.granule_count) {
+            Scan(granules[gl_GlobalInvocationID.x]);
+        }
+        return;
+    }
+    const uint invocations = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint pass = 0u; pass < FAULT_WORDS_PER_INVOCATION / 4u; ++pass) {
+        if (!Scan(pass * invocations + gl_GlobalInvocationID.x)) {
             return;
         }
-        const uint bit = findLSB(word);
-        word &= word - 1;
-        const uint page = base_bit + bit;
-        download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
     }
 }

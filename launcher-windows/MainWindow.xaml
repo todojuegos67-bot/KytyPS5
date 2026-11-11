@@ -1,0 +1,50 @@
+<Window x:Class="KytyLauncher.MainWindow" x:ClassModifier="internal"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="KytyPS5" Width="1120" Height="760" MinWidth="900" MinHeight="560"
+        Icon="launcher.ico"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}"
+        FontFamily="{StaticResource UiFont}" FontSize="13"
+        WindowStartupLocation="CenterScreen" UseLayoutRounding="True" SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display">
+    <Grid x:Name="RootGrid">
+        <Grid.RowDefinitions>
+            <RowDefinition />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="232" />
+            <ColumnDefinition />
+        </Grid.ColumnDefinitions>
+
+        <!-- Sidebar -->
+        <Border Grid.RowSpan="2" Background="{StaticResource SidebarBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Top" Margin="24,26,16,26">
+                    <TextBlock x:Name="GameTitle" FontFamily="{StaticResource SerifFont}" FontSize="21" Foreground="{StaticResource GoldBrush}"
+                               TextWrapping="Wrap" />
+                    <TextBlock x:Name="AppTitle" Text="KytyPS5" FontSize="12.5" Foreground="{StaticResource TextBrush}" Margin="0,8,0,0" />
+                    <TextBlock x:Name="AppSubtitle" FontSize="12" Foreground="{StaticResource TextFaintBrush}" Margin="0,2,0,0" />
+                </StackPanel>
+                <TextBlock x:Name="NavHint" DockPanel.Dock="Bottom" Margin="24,0,18,22" Style="{StaticResource Desc}"
+                           Foreground="{StaticResource TextFaintBrush}" />
+                <ListBox x:Name="Nav" Style="{StaticResource NavList}" ItemContainerStyle="{StaticResource NavItem}" />
+            </DockPanel>
+        </Border>
+
+        <!-- Pages -->
+        <Grid x:Name="PageHost" Grid.Column="1" />
+
+        <!-- Bottom bar -->
+        <Border Grid.Column="1" Grid.Row="1" Background="{StaticResource BarBrush}" BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0" Padding="28,14">
+            <DockPanel LastChildFill="True">
+                <Button x:Name="PlayButton" DockPanel.Dock="Right" Style="{StaticResource PlayButton}" IsDefault="True" />
+                <Button x:Name="PrecompileButton" DockPanel.Dock="Right" Style="{StaticResource FlatButton}" Margin="0,0,14,0"
+                        Padding="16,8" VerticalAlignment="Center" />
+                <TextBlock x:Name="Summary" VerticalAlignment="Center" Foreground="{StaticResource TextDimBrush}" FontSize="12.5"
+                           TextTrimming="CharacterEllipsis" Margin="0,0,16,0" />
+            </DockPanel>
+        </Border>
+    </Grid>
+</Window>

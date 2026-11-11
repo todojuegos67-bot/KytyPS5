@@ -258,7 +258,7 @@ void ToggleSelected() {
 	Arm(spawns[selected].map, spawns[selected].name);
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 namespace {
 
 // A guest read that stops at a page without access (no player while loading) instead of faulting.
@@ -433,7 +433,7 @@ void GlideThread() {
 #endif
 
 bool QueueCommand(std::string_view text) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	if (text.empty() || !IsCommandBuild()) return false;
 	std::lock_guard lock(g_command_mutex);
 	g_command = text;
@@ -446,7 +446,7 @@ bool QueueCommand(std::string_view text) {
 }
 
 bool QueueKill(float radius, KillMode mode) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	if (!(radius > 0) || !IsPlayerBuild() || !IsKillBuild() || (mode == KillMode::Death && !IsDeathBuild())) return false;
 	g_kill_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
 	g_kill_radius.store(radius, std::memory_order_release);
@@ -458,7 +458,7 @@ bool QueueKill(float radius, KillMode mode) {
 }
 
 void RunQueuedCommand() {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	if (g_kill_radius.load(std::memory_order_relaxed) > 0)
 		RunKill(g_kill_radius.exchange(0.0f, std::memory_order_acq_rel),
 		        static_cast<KillMode>(g_kill_mode.load(std::memory_order_relaxed)));
@@ -481,7 +481,7 @@ void RunQueuedCommand() {
 #endif
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 } // namespace Loader::DemonsSoulsWarp
 namespace Libs::Controller {
 void SetScriptedInput(int left_x, int left_y, int right_x, int right_y, uint32_t buttons, double seconds);
@@ -490,7 +490,7 @@ namespace Loader::DemonsSoulsWarp {
 #endif
 
 std::string Strike(float radius) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	if (!(radius > 0) || !IsPlayerBuild() || !IsKillBuild()) return "not this build";
 	// cp11_characters_playerExterminate (01.007.000, live byte): the player's hits kill. The normal death a hit makes:
 	// the game's events (a boss's "DEMON VANQUISHED"), souls, drops, ragdolls.
@@ -557,7 +557,7 @@ std::string Strike(float radius) {
 }
 
 std::string Sweep(double seconds, float radius) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	if (!(seconds > 0) || !(radius > 0) || !IsPlayerBuild() || !IsKillBuild()) return "not this build";
 	const auto start    = std::chrono::steady_clock::now();
 	const auto deadline = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
@@ -657,7 +657,7 @@ std::string Sweep(double seconds, float radius) {
 }
 
 double Glide(float x, float y, float z, float speed) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	uint64_t ctrl = 0, body = 0;
 	float    from[3] {};
 	if (!(speed > 0) || !IsPlayerBuild() || !FindPlayer(&ctrl, &body) || !Peek(body + 0x20, &from)) return -1;
@@ -688,7 +688,7 @@ double Glide(float x, float y, float z, float speed) {
 void RecordWaypoint() {
 	float xyz[3] {}, angles[4] {};
 	bool  found = false;
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	uint64_t ctrl = 0, body = 0;
 	if (!IsPlayerBuild()) {
 		std::lock_guard lock(g_mutex);
@@ -750,7 +750,7 @@ void ShowNotice(std::string message, int seconds) {
 }
 
 bool PlayerPlace(float xyz[3], float* yaw) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	uint64_t ctrl = 0, body = 0;
 	float    at[3] {}, angles[4] {};
 	if (!IsPlayerBuild() || !FindPlayer(&ctrl, &body) || !Peek(body + 0x10, &angles) || !Peek(body + 0x20, &at) ||

@@ -2,6 +2,7 @@
 
 #include "common/guardedCopy.h"
 #include "local/mem-guard.h"
+#include "common/platform/sysVirtual.h"
 
 #include <atomic>
 #include <cstdio>
@@ -96,6 +97,14 @@ static std::atomic<GuardPageHandler> g_guard_page_handler {nullptr};
 
 void SetGuardPageHandler(GuardPageHandler handler) {
 	g_guard_page_handler.store(handler, std::memory_order_release);
+}
+
+static std::atomic<ReadGuardArm>    g_read_guard_arm {nullptr};
+static std::atomic<ReadGuardSettle> g_read_guard_settle {nullptr};
+
+void SetReadGuardHandlers(ReadGuardArm arm, ReadGuardSettle settle) {
+	g_read_guard_settle.store(settle, std::memory_order_release);
+	g_read_guard_arm.store(arm, std::memory_order_release);
 }
 
 static std::atomic<ProbeHandler> g_probe_handler {nullptr};
@@ -228,24 +237,38 @@ static void InstallFatalReports() {
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
+	// A guest page's read guard (KYTY_READ_GUARD): served as the access violation no access raises.
+	bool read_guard = false;
 	if (exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
-		const auto handler = g_guard_page_handler.load(std::memory_order_acquire);
-		return handler != nullptr && exception_record->NumberParameters >= 2 &&
-		               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
-		           ? EXCEPTION_CONTINUE_EXECUTION
-		           : EXCEPTION_CONTINUE_SEARCH;
+		// (First: guest stacks, whose guards the guard-page handler takes, lie among guest memory's addresses but are
+		// private memory, no view's.)
+		const auto arm = g_read_guard_arm.load(std::memory_order_acquire);
+		if (arm != nullptr && exception_record->NumberParameters >= 2 && arm(exception_record->ExceptionInformation[1])) {
+			read_guard = true;
+		} else {
+			const auto handler = g_guard_page_handler.load(std::memory_order_acquire);
+			return handler != nullptr && exception_record->NumberParameters >= 2 &&
+			               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
+			           ? EXCEPTION_CONTINUE_EXECUTION
+			           : EXCEPTION_CONTINUE_SEARCH;
+		}
 	}
+	const bool access_violation = exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || read_guard;
+	const auto served           = [&] {
+		if (read_guard) g_read_guard_settle.load(std::memory_order_acquire)(exception_record->ExceptionInformation[1]);
+		return EXCEPTION_CONTINUE_EXECUTION;
+	};
 
-	// A guarded copy reached a page without access: it stops there (never the guest's fault).
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ResumeGuardedCopy(exception->ContextRecord)) {
+	// A guarded copy reached a page without access: it stops there (never the guest's fault). (A read guard stays armed.)
+	if (access_violation && ResumeGuardedCopy(exception->ContextRecord)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && exception_record->NumberParameters >= 2) {
+	if (access_violation && exception_record->NumberParameters >= 2) {
 		if (const auto probe = g_probe_handler.load(std::memory_order_acquire);
 		    probe != nullptr &&
 		    probe(exception_record->ExceptionInformation[1], exception->ContextRecord->Rip, exception->ContextRecord,
 		          exception_record->ExceptionInformation[0] == 1))
-			return EXCEPTION_CONTINUE_EXECUTION;
+			return served();
 	}
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
@@ -263,7 +286,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.native_code       = exception_record->ExceptionCode;
 	info.native_context    = exception->ContextRecord;
 
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+	if (access_violation) {
 		info.type = ExceptionType::AccessViolation;
 		switch (exception_record->ExceptionInformation[0]) {
 			case 0: info.access_violation_type = AccessViolationType::Read; break;
@@ -297,7 +320,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
-		return EXCEPTION_CONTINUE_EXECUTION;
+		return served();
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -376,8 +399,15 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 #else
 
 // x86-64 page-fault error bits.
+constexpr uint64_t PAGE_FAULT_ERROR_PRESENT     = 0x01;
 constexpr uint64_t PAGE_FAULT_ERROR_WRITE       = 0x02;
 constexpr uint64_t PAGE_FAULT_ERROR_INSTRUCTION = 0x10;
+
+static std::atomic<ProbeHandler> g_probe_handler {nullptr};
+
+void SetProbeHandler(ProbeHandler handler) {
+	g_probe_handler.store(handler, std::memory_order_release);
+}
 
 // Let the kernel handle an unresolved fault on retry.
 static void ChainToDefault(int signal_number) noexcept {
@@ -400,6 +430,19 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	if (signal_number == SIGSEGV || signal_number == SIGBUS) {
 		info.type             = ExceptionType::AccessViolation;
 		const auto error_code = static_cast<uint64_t>(gregs[REG_ERR]);
+		// A minor-mode page's missing PTE first (sysLinuxVirtual.cpp, KYTY_UFFD_MINOR): mapped again, the access runs again;
+		// so does a write whose page the kernel write-protects while its bits say none.
+		if (signal_number == SIGBUS &&
+		    SysVirtualResolveMinorFault(reinterpret_cast<uint64_t>(signal_info->si_addr),
+		                                (error_code & PAGE_FAULT_ERROR_PRESENT) != 0,
+		                                (error_code & PAGE_FAULT_ERROR_WRITE) != 0))
+			return;
+		// The texture offload's pages next, as on Windows: true runs the access again.
+		if (const auto probe = g_probe_handler.load(std::memory_order_acquire);
+		    probe != nullptr && probe(reinterpret_cast<uint64_t>(signal_info->si_addr),
+		                              static_cast<uint64_t>(gregs[REG_RIP]), context,
+		                              (error_code & PAGE_FAULT_ERROR_WRITE) != 0))
+			return;
 		if ((error_code & PAGE_FAULT_ERROR_INSTRUCTION) != 0) {
 			info.access_violation_type = AccessViolationType::Execute;
 		} else if ((error_code & PAGE_FAULT_ERROR_WRITE) != 0) {
@@ -502,7 +545,7 @@ bool InstallHandler(Handler handler) {
 	return true;
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#if defined(__APPLE__)
 void SetProbeHandler(ProbeHandler /*handler*/) {}
 #endif
 

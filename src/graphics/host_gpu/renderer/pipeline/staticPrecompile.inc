@@ -3,7 +3,7 @@
 // The specializations a seed is compiled with: every resource bound to a plain descriptor of the kind
 // the shader declares (an image of the declared dimension and the numeric class its use suggests
 // (PredictImageNumericClasses), a buffer without stride, and where a
-// store packs a format, the one most of them use: one 32-bit integer), and with portable modules each
+// store packs a format, the one most of them use: one 32-bit integer), and each
 // indirect image table, whose size is the game's data, in turn in its plain form (one texture) and
 // padded to 2, 4, 8 and 16 candidates (BuildResourceSpecialization), for programs with at most two
 // tables; a vertex or pixel shader's two tables (texture sets sampled twice) with the same size.
@@ -58,7 +58,7 @@ SeedSpecializations(const ShaderRecompiler::IR::Program& program) {
 		}
 		return out;
 	};
-	if (tables.empty() || tables.size() > 2 || !ShaderRecompiler::IR::PortableShaders()) {
+	if (tables.empty() || tables.size() > 2) {
 		return with_volumes_as_2d({plain});
 	}
 	constexpr uint32_t sizes[] = {1, 2, 4, 8, 16};
@@ -105,13 +105,55 @@ SeedSpecializations(const ShaderRecompiler::IR::Program& program) {
 	return with_volumes_as_2d(std::move(out));
 }
 
+// A compute seed's recorded specialization, then the same with the 3D images the shader declares (outside tables) given
+// 2D textures as SeedSpecializations' guesses do, and given volumes again where the record had 2D: the game binds either
+// to the same program, and the hints hold the one their recording met. The other compiled at its first encounter
+// (10-18, RX 9070 XT: a boss's death met 3 large CS 0x44353015859c5f9b... whose hints were 3D 3D with 3D 2D, 16 s each,
+// a 51 s freeze).
+static std::vector<ShaderRecompiler::IR::ResourceSpecialization>
+RecordedSpecializations(const ShaderRecompiler::IR::Program&               program,
+                        const ShaderRecompiler::IR::ResourceSpecialization& recorded) {
+	using ShaderRecompiler::Decoder::ImageDimension;
+	using ShaderRecompiler::IR::ImageResource;
+	std::vector out {recorded};
+	if (program.stage != ShaderType::Compute) return out;
+	std::vector<uint32_t> volumes;
+	for (uint32_t index = 0; index < program.info.images.size() && index < recorded.images.size(); index++) {
+		const auto& image = program.info.images[index];
+		const bool  table = image.source < program.descriptor_sources.size() &&
+		                   program.descriptor_sources[image.source].indirect_image.has_value();
+		if (image.dimension == ImageDimension::Dim3D && !table &&
+		    recorded.images[index].indirect_root == ImageResource::NoIndirectImage &&
+		    (recorded.images[index].dimension == ImageDimension::Dim3D ||
+		     recorded.images[index].dimension == ImageDimension::Dim2D))
+			volumes.push_back(index);
+	}
+	if (volumes.empty()) return out;
+	// (The sets of SeedSpecializations: the last 1, 2, ... of them 2D; with three also 2D 2D 3D and 3D 2D 3D.)
+	std::vector<std::vector<uint32_t>> flat_sets;
+	for (size_t last = 1; last <= volumes.size(); last++) flat_sets.emplace_back(volumes.end() - last, volumes.end());
+	if (volumes.size() == 3) flat_sets.insert(flat_sets.end(), {{volumes[0], volumes[1]}, {volumes[1]}});
+	auto volume = recorded;
+	for (const auto index: volumes) volume.images[index].dimension = ImageDimension::Dim3D;
+	const auto add = [&](ShaderRecompiler::IR::ResourceSpecialization specialization) {
+		if (std::ranges::find(out, specialization) == out.end()) out.push_back(std::move(specialization));
+	};
+	add(volume);
+	for (const auto& flat_set: flat_sets) {
+		auto flat = volume;
+		for (const auto index: flat_set) flat.images[index].dimension = ImageDimension::Dim2D;
+		add(std::move(flat));
+	}
+	return out;
+}
+
 // A recorded specialization's indirect image tables in their portable form (BuildResourceSpecialization):
 // candidates padded to a power of two, the key mapping found through a header word.
 static void PortableIndirectTables(const ShaderRecompiler::IR::Program&         program,
                                    ShaderRecompiler::IR::ResourceSpecialization& specialization) {
 	using ShaderRecompiler::IR::ImageResource;
 	const auto base = program.info.images.size();
-	if (!ShaderRecompiler::IR::PortableShaders() || specialization.images.size() <= base) return;
+	if (specialization.images.size() <= base) return;
 	std::vector<ShaderRecompiler::IR::ResourceSpecialization::Image> images(specialization.images.begin(),
 	                                                                         specialization.images.begin() + base);
 	uint32_t active = 0;
@@ -312,11 +354,13 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 			if (std::ranges::any_of(translated.program.descriptor_sources,
 			                        [](const auto& source) { return source.indirect_image.has_value(); }))
 				indirect.fetch_add(1, std::memory_order_relaxed);
-			// A seed that carries a specialization (a recorded warmup file) is compiled with it.
+			// A seed that carries a specialization (a recorded warmup file) is compiled with it (a compute seed's with its
+			// volumes' other dimensions too: RecordedSpecializations).
 			const bool recorded = !seed.specialization.buffers.empty() || !seed.specialization.images.empty();
-			auto       specializations =
-			    recorded ? std::vector {seed.specialization} : SeedSpecializations(translated.program);
-			if (recorded) PortableIndirectTables(translated.program, specializations[0]);
+			auto       specializations = recorded ? RecordedSpecializations(translated.program, seed.specialization)
+			                                      : SeedSpecializations(translated.program);
+			if (recorded)
+				for (auto& specialization: specializations) PortableIndirectTables(translated.program, specialization);
 			for (size_t variant = 0; variant < specializations.size(); variant++) {
 				auto& specialization = specializations[variant];
 				if (variant != 0) translated = ShaderRecompiler::TranslateProgram(seed.code, options);
@@ -623,8 +667,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	}
 	auto target_file = binaries ? StaticBinariesPath() : blobs ? StaticBlobsPath() : StaticCachePath();
 	// Named after the seed file too: a run shards several (precompile-windows.ps1: seeds and recorded).
-	if (shards > 1 || binaries || blobs)
-		target_file += fmt::format(".shard{}of{}-{}", shard, shards, Common::PathToString(args.seeds.stem()));
+	const bool shard_file = shards > 1 || binaries || blobs;
+	if (shard_file) target_file += fmt::format(".shard{}of{}-{}", shard, shards, Common::PathToString(args.seeds.stem()));
 	const auto save = [&] {
 		if (blobs) {
 			auto temporary = target_file;
@@ -721,6 +765,116 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	const auto spirv_hash = [&](const Permutation* permutation) { return spirv_of.find(permutation)->second.hash; };
 	// (Its layouts are shared with other pipelines of the same bindings: the pipeline cache destroys them.)
 	const auto destroy = [&](Pipeline& pipeline) { m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr); };
+	// The hang guard (issue #126: an RX 7800 XT's shards waited for hours on compiles its driver never finished, a thread
+	// of each still busy): the compiles in flight, looked at every 15 s. One running for 2 minutes is named in the log;
+	// one past KYTY_PRECOMPILE_STUCK_SECONDS (default 300; 0: no limit; a boss's death took ~75 s on an AMD GPU) is
+	// slow, and the other threads go on. Only when every compile in flight is past twice the limit and none began for a
+	// minute (the threads all wait on the driver) is the shard stuck: it adds the stuck pipelines' keys to the file
+	// KYTY_PRECOMPILE_STUCK names (the scripts: the run's stuck-pipelines.txt, whose keys every shard leaves out), saves,
+	// keeps its file as .part<k> (merged like the shards') and ends with exit code 4, for the script to start it again.
+	// (An RX 6600 took more than 300 s on a few compute pipelines that did finish: stopping there left no keys out, and
+	// every restart met them again.)
+	struct InFlight {
+		std::chrono::steady_clock::time_point start;
+		const char*                           kind       = nullptr;
+		uint64_t                              key        = 0;
+		uint64_t                              hash       = 0; // the seeds' (the pixel shader's in pixel_hash)
+		uint64_t                              pixel_hash = 0;
+		size_t                                n          = 0;
+		bool                                  reported   = false;
+		bool                                  slow       = false;
+	};
+	std::mutex                   in_flight_mutex;
+	std::map<uint64_t, InFlight> in_flight;
+	uint64_t                     in_flight_tokens = 0;
+	auto                         last_begin       = std::chrono::steady_clock::now();
+	std::atomic<bool>            stop_new {false};
+	const uint64_t               stuck_seconds = [] {
+		const char* value = std::getenv("KYTY_PRECOMPILE_STUCK_SECONDS");
+		return value != nullptr && *value != 0 ? std::strtoull(value, nullptr, 10) : uint64_t {300};
+	}();
+	const char*                  stuck_list = std::getenv("KYTY_PRECOMPILE_STUCK");
+	std::unordered_set<uint64_t> stuck_keys;
+	if (stuck_list != nullptr && *stuck_list != 0) {
+		std::ifstream file {std::filesystem::path(stuck_list)};
+		for (std::string line; std::getline(file, line);)
+			if (line.size() >= 16) stuck_keys.insert(std::strtoull(line.substr(0, 16).c_str(), nullptr, 16));
+	}
+	std::atomic<size_t> stuck_left_out {0};
+	const auto          compile_begins = [&](const char* kind, uint64_t key, uint64_t hash, uint64_t pixel_hash, size_t n) {
+		std::lock_guard lock(in_flight_mutex);
+		const auto      token = ++in_flight_tokens;
+		last_begin            = std::chrono::steady_clock::now();
+		in_flight.emplace(token, InFlight {std::chrono::steady_clock::now(), kind, key, hash, pixel_hash, n});
+		return token;
+	};
+	const auto compile_ends = [&](uint64_t token) {
+		std::lock_guard lock(in_flight_mutex);
+		in_flight.erase(token);
+	};
+	const auto seconds_since = [](std::chrono::steady_clock::time_point start) {
+		return static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count());
+	};
+	// (The checkpoint thread's.) Ends the process when its compiles are stuck.
+	const auto guard_compiles = [&] {
+		bool stuck = false;
+		{
+			std::lock_guard lock(in_flight_mutex);
+			stuck = stuck_seconds != 0 && !in_flight.empty() && seconds_since(last_begin) >= 60;
+			for (auto& [token, compile]: in_flight) {
+				const auto seconds = seconds_since(compile.start);
+				if (!compile.reported && seconds >= 120) {
+					compile.reported = true;
+					PipelineCacheLog("Shader seeds: still compiling after {} s: {} {:016x} (seeds {:016x} {:016x}, work item {})",
+					                 seconds, compile.kind, compile.key, compile.hash, compile.pixel_hash, compile.n);
+				}
+				const bool past = stuck_seconds != 0 && seconds >= stuck_seconds;
+				if (past && !compile.slow) {
+					compile.slow = true;
+					PipelineCacheLog("Shader seeds: past {} s, the other threads go on: {} {:016x} (work item {})", stuck_seconds,
+					                 compile.kind, compile.key, compile.n);
+				}
+				stuck &= seconds >= 2 * stuck_seconds;
+			}
+		}
+		if (!stuck) return;
+		stop_new.store(true, std::memory_order_relaxed);
+		PipelineCacheLog("Shader seeds: every compile is past {} s and none began for a minute, the driver does not return",
+		                 2 * stuck_seconds);
+		std::string lines;
+		{
+			std::lock_guard lock(in_flight_mutex);
+			for (const auto& [token, compile]: in_flight) {
+				const auto seconds = seconds_since(compile.start);
+				PipelineCacheLog("Shader seeds: never finished compiling (after {} s): {} {:016x} (seeds {:016x} {:016x}, work "
+				                 "item {})",
+				                 seconds, compile.kind, compile.key, compile.hash, compile.pixel_hash, compile.n);
+				lines += fmt::format("{:016x} {} seeds {:016x} {:016x} work item {} after {} s ({})\n", compile.key,
+				                     compile.kind, compile.hash, compile.pixel_hash, compile.n, seconds, seed_name);
+			}
+		}
+		if (stuck_list != nullptr && *stuck_list != 0) {
+			std::ofstream file(std::filesystem::path(stuck_list), std::ios::app | std::ios::binary);
+			file << lines;
+		}
+		// What it made, kept beside the shards' files under a name of its own: it starts again, empty, as itself.
+		if (save() && shard_file) {
+			std::error_code error;
+			for (uint32_t k = 1; k < 100000; k++) {
+				auto part = target_file;
+				part += fmt::format(".part{}", k);
+				if (std::filesystem::exists(part, error)) continue;
+				std::filesystem::rename(target_file, part, error);
+				PipelineCacheLog("Shader seeds: {} pipelines kept in {}", created.load(), Common::PathToString(part));
+				break;
+			}
+		}
+		std::printf("Shader precompile: stuck (exit 4: start the shard again; KYTY_PRECOMPILE_STUCK lists the pipelines it "
+		            "leaves out)\n");
+		std::fflush(nullptr);
+		std::_Exit(4);
+	};
 	// Saved every ten minutes too: an interrupted precompile loses at most that.
 	std::mutex              checkpoint_mutex;
 	std::condition_variable checkpoint_wake;
@@ -729,16 +883,22 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	if (create_pipelines && !args.dry_run && (target != nullptr || binaries || blobs)) {
 		checkpoints = std::jthread([&] {
 			std::unique_lock lock(checkpoint_mutex);
-			while (!checkpoint_wake.wait_for(lock, std::chrono::minutes(10), [&] { return pipelines_done; })) {
+			auto             saved_at = std::chrono::steady_clock::now();
+			while (!checkpoint_wake.wait_for(lock, std::chrono::seconds(15), [&] { return pipelines_done; })) {
 				lock.unlock();
-				if (save())
-					PipelineCacheLog("Shader seeds: checkpoint after {} pipelines, {} ms", created.load(), elapsed());
+				guard_compiles();
+				if (std::chrono::steady_clock::now() - saved_at >= std::chrono::minutes(10)) {
+					if (save())
+						PipelineCacheLog("Shader seeds: checkpoint after {} pipelines, {} ms", created.load(), elapsed());
+					saved_at = std::chrono::steady_clock::now();
+				}
 				lock.lock();
 			}
 		});
 	}
 	if (create_pipelines) {
 		parallel(seed_words.size() + recipes.size(), [&](size_t n) {
+			if (stop_new.load(std::memory_order_relaxed)) return;
 			// Once binaries (or blobs) are left out, the rest would be too: for a smaller shard.
 			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0) ||
 			    (blob_writer != nullptr && blob_writer->LeftOut() != 0))
@@ -760,10 +920,18 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 					if (!here && !args.dry_run) return;
 					const auto start = std::chrono::steady_clock::now();
 					if (here) {
-						Pipeline pipeline;
+						// (One an earlier attempt's driver never finished: left out. None once the shard stops.)
+						if (stuck_keys.contains(key)) {
+							stuck_left_out.fetch_add(1, std::memory_order_relaxed);
+							return;
+						}
+						if (stop_new.load(std::memory_order_relaxed)) return;
+						const auto token = compile_begins(kind, key, input.hash, 0, n);
+						Pipeline   pipeline;
 						CreatePipelineInternal(m_graphics, pipeline, input.compute, permutation.handle.module, driver_cache,
 						                       PipelineBuild::Full, native);
 						destroy(pipeline);
+						compile_ends(token);
 					}
 					created_one(start, words_of(&permutation), input.hash, 0, kind, key, n);
 				};
@@ -812,11 +980,18 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				if (!here && !args.dry_run) return;
 				const auto start = std::chrono::steady_clock::now();
 				if (here) {
-					Pipeline pipeline;
+					if (stuck_keys.contains(key)) {
+						stuck_left_out.fetch_add(1, std::memory_order_relaxed);
+						return;
+					}
+					if (stop_new.load(std::memory_order_relaxed)) return;
+					const auto token = compile_begins(kind, key, vs.hash, pixel != nullptr ? ps.hash : 0, n);
+					Pipeline   pipeline;
 					CreatePipelineInternal(m_graphics, pipeline, recipe.rendering, recipe.vertex_input, vs.vertex,
 					                       vertex_permutation.handle, pixel ? &ps.pixel : nullptr,
 					                       pixel ? pixel->handle : ShaderProgram {}, recipe.state, driver_cache, native);
 					destroy(pipeline);
+					compile_ends(token);
 				}
 				created_one(start, words_of(&vertex_permutation) + words_of(pixel), vs.hash, pixel != nullptr ? ps.hash : 0,
 				            kind, key, n);
@@ -898,6 +1073,10 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		PipelineCacheLog("Shader seeds: stopped after {} captured pipelines (KYTY_PRECOMPILE_SHARD_CAP), {} work items left "
 		                 "to a smaller shard",
 		                 writer->Captured(), stopped);
+	if (const auto stuck_out = stuck_left_out.load(); stuck_out != 0)
+		PipelineCacheLog("Shader seeds: {} pipelines left out: the driver never finished them in an earlier attempt "
+		                 "(KYTY_PRECOMPILE_STUCK)",
+		                 stuck_out);
 	left_out = (writer != nullptr ? writer->LeftOut() : 0) + (blob_writer != nullptr ? blob_writer->LeftOut() : 0) +
 	           capped.load();
 	if (const auto refused = PipelinesRefused(); refused != 0)
@@ -1046,6 +1225,16 @@ bool PipelineCache::Precompile(GraphicContext& graphics, const PrecompileOptions
 	return cache.WarmSeeds(options, left_out);
 }
 
+// (This program translates with every feature of the GPU's: TranslatorFeatureSet() is what a precompile would use.)
+bool PipelineCache::StaticCacheRedoesAll() {
+	namespace Translate = ShaderRecompiler::Frontend;
+	std::error_code error;
+	const auto      exists = [&](const std::filesystem::path& path) { return std::filesystem::exists(path, error); };
+	if (!exists(StaticBinariesPath()) && !exists(StaticBlobsPath()) && !exists(StaticCachePath())) return false;
+	const auto broad = Translate::TranslatorFeatureSet() & Translate::TranslatorFeaturesBroad;
+	return (ReadStaticFeatures() & broad) != broad;
+}
+
 // Both files are saved whole (a temporary file renamed), so their first line tells the GPU and driver.
 bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::filesystem::path& seeds) {
 	const bool blobs = StaticBlobsMode(graphics);
@@ -1056,16 +1245,23 @@ bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::file
 		if (error) return false;
 		const auto seeded = std::filesystem::last_write_time(seeds, error);
 		if (error || written < seeded) return false;
-		// Older than the release's hints too (run from the package's folder): a package with new hints, or a precompile
-		// that compiled the seeds alone (v20261016 on a PC without recorded play, issue #28), compiles what they add.
-		const auto hints  = std::filesystem::path("tools") / "local" / "static-precompile" /
-		                    ("hints-" + PipelineCacheGameId() + ".hints");
-		const auto hinted = std::filesystem::last_write_time(hints, error);
-		if (!error && written < hinted) return false;
+		// Made before the release's hints too: a package with new hints, or a precompile that compiled the seeds alone
+		// (v20261016 on a PC without recorded play, issue #28), compiles what they add. By the hints' hash the last
+		// precompile recorded: a zip holds its files' local times without a zone, so a package made in UTC and unpacked
+		// west of it had hints from hours ahead, and a store precompiled in between stayed out of date (issue #143).
+		// From an older precompile: by the files' times.
+		const auto hinted = std::filesystem::last_write_time(StaticHintsPath(), error);
+		if (!error) {
+			if (const auto recorded = ReadStaticHintsStamp()) {
+				if (*recorded != StaticHintsHash()) return false;
+			} else if (written < hinted) {
+				return false;
+			}
+		}
 		// Made without a translation feature of this emulator's for this GPU, and no precompile with it tried since: one
-		// makes the pipelines it changes.
+		// makes the pipelines it changes (those that wait for the next precompile aside).
 		namespace Translate = ShaderRecompiler::Frontend;
-		const auto wanted = Translate::TranslatorDeviceFeatures();
+		const auto wanted = Translate::TranslatorDeviceFeatures() & ~Translate::TranslatorFeaturesWithNextPrecompile;
 		if ((ReadStaticStamp().second & wanted) != wanted) return false;
 	}
 	if (graphics.pipeline_binaries_enabled) {
@@ -1110,6 +1306,25 @@ bool PipelineCache::StaticInputsCurrent(GraphicContext& graphics, const std::fil
 	return true;
 }
 
+// Shard files the store's signature does not open (another graphics driver or GPU made them, or they were cut short):
+// never mergeable here, and run-windows.ps1 took them for an unfinished precompile at every start (issue #126).
+static void RemoveStaleShards(const std::vector<std::filesystem::path>& stale, const char* what) {
+	std::error_code error;
+	for (const auto& file: stale) std::filesystem::remove(file, error);
+	if (!stale.empty()) PipelineCacheLog("Static pipeline {}: removed {} shard file(s) of another driver or GPU", what, stale.size());
+}
+
+// `from` renamed to `to`, replacing it, tried again for 5 s: a file just written is often held for a moment by a
+// scanner (an antivirus, the search indexer), and a precompile's merge of a ~5.5 GB store failed at its end (issue
+// #225). `error` keeps the last try's.
+static void RenameReplacing(const std::filesystem::path& from, const std::filesystem::path& to, std::error_code& error) {
+	for (int attempt = 0;; ++attempt) {
+		std::filesystem::rename(from, to, error);
+		if (!error || attempt == 10) return;
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+	}
+}
+
 // The store and its shards' files (or only the shards': prune), into a new store; the shard files are
 // removed once merged. Their data is copied from the files when the new one is written.
 bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune, bool keep_shards) {
@@ -1117,7 +1332,7 @@ bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune, bool
 	const auto                                     signature = StaticBinariesSignature(graphics);
 	PipelineBinaryWriter                           writer(graphics.device);
 	std::vector<std::unique_ptr<PipelineBinaries>> sources;
-	std::vector<std::filesystem::path>             files;
+	std::vector<std::filesystem::path>             files, stale;
 	if (!prune) {
 		if (auto store = PipelineBinaries::Open(graphics.device, path, signature)) {
 			writer.CopyAll(*store);
@@ -1132,23 +1347,47 @@ bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune, bool
 			writer.CopyAll(*shard);
 			sources.push_back(std::move(shard));
 			files.push_back(entry.path());
+		} else {
+			stale.push_back(entry.path());
 		}
 	}
+	if (!keep_shards) RemoveStaleShards(stale, "binaries");
 	if (files.empty()) {
 		PipelineCacheLog("Static pipeline binaries: no shards to merge");
 		return true;
 	}
 	auto temporary = path;
 	temporary += ".tmp";
-	const bool saved = writer.Save(temporary, signature);
+	PipelineBinaryWriter::SaveReport report;
+	const bool                       saved = writer.Save(temporary, signature, &report);
 	sources.clear(); // closes the files: the store may be replaced
-	if (saved) std::filesystem::rename(temporary, path, error);
+	if (saved) RenameReplacing(temporary, path, error);
 	const bool merged = saved && !error;
 	if (merged && !keep_shards) {
 		for (const auto& file: files) std::filesystem::remove(file, error);
 	}
 	PipelineCacheLog("Static pipeline binaries: merged {} shards{}, {} pipelines{}", files.size(),
-	                 prune ? " (pruned)" : "", writer.Pipelines(), merged ? "" : ": FAILED");
+	                 prune ? " (pruned)" : "", writer.Pipelines() - report.dropped_pipelines, merged ? "" : ": FAILED");
+	if (report.unreadable_binaries != 0)
+		PipelineCacheLog("Static pipeline binaries: {} binaries could not be read back from their shards' files (damaged on "
+		                 "the disk): their {} pipelines left out, made when first needed",
+		                 report.unreadable_binaries, report.dropped_pipelines);
+	if (!merged) {
+		// Why (issue #225: every shard done, then this): the new store not written (a drive without room for it, or a
+		// FAT32 one, which holds no file of 4 GiB: the store is ~5.5 GiB), or not put in place (the store open in a
+		// running game).
+		std::error_code space_error;
+		const auto      space  = std::filesystem::space(path.parent_path(), space_error);
+		const auto      system = LocalPlatform::FileSystemName(Common::PathToString(path.parent_path()));
+		const auto      what   = saved ? "the new store could not replace the old one: " + error.message()
+		                               : "the new store could not be written: " + report.failure;
+		const auto      fat    = system == "FAT32" || system == "FAT"
+		                             ? ", a " + system + " drive, which holds no file of 4 GiB or more: move the emulator's "
+		                                                 "folder to an NTFS or exFAT drive"
+		                             : std::string();
+		PipelineCacheLog("Static pipeline binaries: {}; {} GiB free on its drive{}", what,
+		                 space_error ? 0 : space.available >> 30u, fat);
+	}
 	return merged;
 }
 
@@ -1159,7 +1398,7 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune, bool keep_shar
 	const auto                                       signature = StaticBlobsSignature(graphics.GetPhysicalDeviceProperties());
 	PipelineCacheBlobWriter                          writer;
 	std::vector<std::unique_ptr<PipelineCacheBlobs>> sources;
-	std::vector<std::filesystem::path>               files;
+	std::vector<std::filesystem::path>               files, stale;
 	if (!prune) {
 		if (auto store = PipelineCacheBlobs::Open(path, signature)) {
 			writer.CopyAll(*store);
@@ -1174,8 +1413,11 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune, bool keep_shar
 			writer.CopyAll(*shard);
 			sources.push_back(std::move(shard));
 			files.push_back(entry.path());
+		} else {
+			stale.push_back(entry.path());
 		}
 	}
+	if (!keep_shards) RemoveStaleShards(stale, "blobs");
 	if (files.empty()) {
 		PipelineCacheLog("Static pipeline blobs: no shards to merge");
 		return true;
@@ -1184,7 +1426,7 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune, bool keep_shar
 	temporary += ".tmp";
 	const bool saved = writer.Save(temporary, signature);
 	sources.clear(); // closes the files: the blobs may be replaced
-	if (saved) std::filesystem::rename(temporary, path, error);
+	if (saved) RenameReplacing(temporary, path, error);
 	const bool merged = saved && !error;
 	if (merged && !keep_shards) {
 		for (const auto& file: files) std::filesystem::remove(file, error);
@@ -1197,10 +1439,38 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune, bool keep_shar
 // The shard files are removed once merged. A pruned merge makes the store of this run's pipelines alone: stamped with the
 // translation features they were made with; a precompile's last merge (`stamp`) with those it tried (WriteStaticFeatures).
 bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards, bool stamp) {
-	const auto stamped = [&](bool merged) {
-		if (merged && (prune || stamp)) WriteStaticFeatures(prune);
+	const auto active  = graphics.pipeline_binaries_enabled ? StaticBinariesPath()
+	                     : StaticBlobsMode(graphics)         ? StaticBlobsPath()
+	                                                         : StaticCachePath();
+	// A merge that makes the store (none there before it) makes it of this precompile's pipelines alone, as --prune
+	// does: their translation features are the store's. A --quick precompile (which never prunes) left a store made
+	// from nothing stamped with none of them, and the emulator then translated without them and missed most of it
+	// (issue #189: "Translation features 0x3 off", 3,205 pipelines not among the store's, a compute pipeline compiled
+	// for 5 s in the prologue boss's fight on a 16 GB PC).
+	std::error_code exists_error;
+	const bool      fresh   = !std::filesystem::exists(active, exists_error);
+	const auto      stamped = [&](bool merged) {
+		if (merged && (prune || stamp || fresh)) {
+			WriteStaticFeatures(prune || fresh);
+			// (The store as of this precompile: with nothing new to merge it is not rewritten, and it kept its time from
+			// before the seeds of a newer emulator - out of date at every start, issue #143.)
+			std::error_code error;
+			std::filesystem::last_write_time(active, std::filesystem::file_time_type::clock::now(), error);
+		}
 		return merged;
 	};
+	// The shards of the other two kinds of store (made by another driver, with or without pipeline binaries): never
+	// merged here, gone with the rest (issue #126).
+	if (!keep_shards) {
+		std::vector<std::filesystem::path> stale;
+		std::error_code                    error;
+		for (const auto& other: {StaticBinariesPath(), StaticBlobsPath(), StaticCachePath()}) {
+			if (other == active) continue;
+			for (const auto& entry: std::filesystem::directory_iterator(other.parent_path(), error))
+				if (entry.path().filename().string().starts_with(other.filename().string() + ".shard")) stale.push_back(entry.path());
+		}
+		RemoveStaleShards(stale, "stores");
+	}
 	if (graphics.pipeline_binaries_enabled) return stamped(MergeBinaryShards(graphics, prune, keep_shards));
 	if (StaticBlobsMode(graphics)) return stamped(MergeBlobShards(graphics, prune, keep_shards));
 	PipelineCache cache(graphics);
@@ -1209,20 +1479,24 @@ bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, 
 	const auto                         path      = StaticCachePath();
 	const auto                         signature = StaticCacheSignature(graphics.GetPhysicalDeviceProperties());
 	std::vector<vk::PipelineCache>     shards;
-	std::vector<std::filesystem::path> files;
+	std::vector<std::filesystem::path> files, stale;
 	std::error_code                    error;
 	for (const auto& entry: std::filesystem::directory_iterator(path.parent_path(), error)) {
-		if (!entry.path().filename().string().starts_with(path.filename().string() + ".shard")) continue;
+		const auto name = entry.path().filename().string();
+		if (!name.starts_with(path.filename().string() + ".shard") || name.ends_with(".tmp")) continue;
 		const auto payload = ReadPipelineCacheFile(entry.path(), signature);
-		if (payload.empty()) continue;
 		vk::PipelineCacheCreateInfo info {};
 		info.initialDataSize = payload.size();
 		info.pInitialData    = payload.data();
 		vk::PipelineCache shard = nullptr;
-		if (graphics.device.createPipelineCache(&info, nullptr, &shard) != vk::Result::eSuccess) continue;
+		if (payload.empty() || graphics.device.createPipelineCache(&info, nullptr, &shard) != vk::Result::eSuccess) {
+			stale.push_back(entry.path());
+			continue;
+		}
 		shards.push_back(shard);
 		files.push_back(entry.path());
 	}
+	if (!keep_shards) RemoveStaleShards(stale, "cache");
 	const bool merged = shards.empty() ||
 	                    (graphics.device.mergePipelineCaches(cache.m_static_cache, static_cast<uint32_t>(shards.size()),
 	                                                         shards.data()) == vk::Result::eSuccess &&

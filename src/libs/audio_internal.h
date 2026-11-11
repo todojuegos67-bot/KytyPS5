@@ -70,6 +70,15 @@ inline float PcmPeak(const void* data, size_t count, int encoding, size_t stride
 	}
 	return peak;
 }
+// What the game is told its main output is (KYTY_AUDIO_OUTPUT, the launcher's Audio output; issue #207): the ports'
+// connection (AudioOutGetPortState, AudioOut2PortGetState) and the speaker type (AudioOut2GetSpeakerInfo). Demon's Souls
+// shows it in Settings > Sound and mixes for it: tv (connection 1, type 0: the default), headphones (connection 0x40),
+// amplifier (type 1), soundbar (type 2). (Type 3 played nothing there.)
+struct MainOutput {
+	uint16_t connection   = 1;
+	uint8_t  speaker_type = 0;
+};
+MainOutput MainOutputReported();
 
 } // namespace Libs::Audio::AudioInternal
 

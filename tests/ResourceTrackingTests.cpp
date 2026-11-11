@@ -3560,10 +3560,7 @@ void TestLinearSrtReads() {
 
 int main(int argc, char** argv) {
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
-  // The same cases through the compiled SRT paths.
-  if (const char* mode = std::getenv("KYTY_SRT_NATIVE")) {
-    kyty_local_srt_native_mode.store(std::strtoul(mode, nullptr, 10));
-  }
+  // KYTY_SRT_PREDICATES: the same cases with or without the compiled SRT predicates.
   if (const char* mode = std::getenv("KYTY_SRT_PREDICATES")) {
     kyty_local_srt_predicate_mode.store(std::strtoul(mode, nullptr, 10));
   }

@@ -35,8 +35,10 @@
 // emission pixel by pixel against the normal path.
 
 extern "C" {
+// (speculation.cpp) Speculative translations going on and results unfinished: the catalog sweeps wait for none.
+extern volatile std::atomic_uint32_t kyty_local_speculations_live;
 // 0 off, 1 native XPR draws, 2 verification.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_mode {1};
 // Negative controls for the offline replay only: bit 0 zeroes the vertex
 // stage's flattened SRT in the upload, bit 1 skips the draw call.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_debug {0};
@@ -49,9 +51,9 @@ extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_diag {0};
 // 1: objects are drawn in last frame's order, so the record that followed this
 // one last frame is prefetched while this draw runs.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {1};
 // 1: native image proofs check the image's own registration (see NativeXprValidateResources).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_image_proof_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_image_proof_mode {1};
 // 1: a store whose pipeline variant is not compiled yet hands it to the compile workers and
 // is skipped; the draw takes the normal path until a later store finds the variant ready.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_xpr_pipelines_mode {0};
@@ -62,22 +64,22 @@ extern "C" {
 // 1: relocation. Objects whose user data points at a new copy of the same tables every frame (a ring)
 // had keys new every frame, so no record; the pointer words (user data pairs the SRT reads through and
 // uses for nothing else) leave the key, and the record reads the same offsets from the new base.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_relocate_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_relocate_mode {1};
 // N > 0: at most N store requests a frame. Walking brings hundreds of meshes and LODs
 // into view at once; storing them all in one frame (about 16 us each) made it a hitch. The others ask again
 // in later frames (their draws take the normal path until then).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_store_budget {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_store_budget {256};
 // N > 2: records stay N frames unused (2 before: a turn of the camera dropped every record behind it, and
 // turning back stored them all again within the store budget, thousands of normal draws a frame for seconds).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_keep_frames {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_keep_frames {600};
 // 1: a relocated key holds the object's descriptor bases (read through the draw's pointers) before its use in
 // the frame: the instances of one mesh keep their records when the frame draws them in another order (a culled
 // instance shifted every later use onto another instance's record, which rebound its descriptors).
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_instance_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_instance_mode {1};
 // 1: table draws (src/local/table-xpr.inc) for the pairs that allow them.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_xpr_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_xpr_mode {2};
 // 1: table dispatches (src/local/table-xpr.inc) for the compute shaders that allow them.
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_dispatch_mode {1};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_indirect_mode {1};
 // N > 0: at most N table store requests a frame (each takes its draw to the normal path; the others draw from native
 // records meanwhile); 0: no limit. A new area brings hundreds of pairs whose programs and pipelines compile in the
@@ -94,6 +96,42 @@ extern "C" {
 // Table lookups that ask the last answer first (bits): 1 the pair cache's 4096 entries (else 256), 2 the pair's variant
 // found last, 4 the pair's image set before the last (TableTry, TableSet).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_mru {7};
+// KYTY_TABLE_SERIALS (live table_serials, default 0): 1: a table draw's targets and set images are checked
+// (NativeXprEmitTargets, TableTransit) only when the sum of their image serials (ImageSerials) moved since the state's or
+// set's last emission, not whenever any image changed; 2: checked as before, the checks the sums would have skipped that
+// changed something counted (serials_unsafe: the verify). A change of the switch moves the unattributed serial, so no
+// sum kept before it holds after.
+static uint32_t TableSerialsMode() {
+	static auto&                 mode = LiveSwitch::Find("table_serials", 0);
+	static std::atomic<int64_t>  seen {0};
+	const auto                   now  = mode.load(std::memory_order_relaxed);
+	if (seen.load(std::memory_order_relaxed) != now && seen.exchange(now, std::memory_order_relaxed) != now) {
+		ImageSerials::g_on.store(now != 0, std::memory_order_relaxed);
+		MoveImageStateEpoch();
+	}
+	return static_cast<uint32_t>(now);
+}
+// KYTY_TABLE_MEMO (live table_memo, default off): a table draw takes the variant, the draw
+// state and the image set its pair and state key drew with last (TableXpr::memo), not the variant find, the states find
+// and the set lookup; the set's validation still runs. (Live: an entry holds only while memo_epoch does, which moves on
+// or off.)
+static bool TableMemoOn() {
+	static auto& on = LiveSwitch::Find("table_memo", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_TABLE_MEMO_VERIFY (live table_memo_verify N, default 0): every Nth memo hit (TableTry), the variant and the draw
+// state the full path finds, and the image set the words' lookup finds (TableSet), looked up beside the memo's, read
+// only; a difference counted (table_memo_mismatch, a TABLE_MEMO_MISMATCH line each, the first 8) and the full path's
+// answer taken, the memo's entry dropped.
+static int64_t TableMemoVerifyEvery() {
+	static auto& every = LiveSwitch::Find("table_memo_verify", 0);
+	return every.load(std::memory_order_relaxed);
+}
+// 1: a table image set may hold a target of its draw state that the shaders sample (the scene's depth read in its own
+// pass, the decals' G-buffer), in its attachment layout with shader access added, as the normal path's CommitBindings
+// transits it; 0: such sets are refused, their draws take the normal path (holes in a speculation: ~360 draws a frame at
+// the stone arch, 11-01).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_target_read {0};
 // 1: NativeXprStateKey hashes the context and the user configuration again only after a change of their registers;
 // 0: at every call; 2: as 1, each key checked against the full hash (STATE-KEY MISMATCH lines, counter
 // shortcut_mismatches).
@@ -253,6 +291,12 @@ struct RenderExecutor::NativeXprDrawState {
 	// TextureCache::ImagesEpoch after the main executor's last table draw emitted the targets (UINT64_MAX: none): they
 	// stay in place while it does not move (RenderExecutor::TableDraw).
 	mutable uint64_t                 emitted_epoch = UINT64_MAX;
+	// The sum of its targets' image serials then (KYTY_TABLE_SERIALS; UINT64_MAX: none).
+	mutable uint64_t                 emitted_serials = UINT64_MAX;
+	// Unique per capture: a state captured again at its address is another (a set's transit under it does not hold).
+	uint64_t                         capture_id      = 0;
+	// The targets' ids alone, in a line or two: what the serial sums read (a Target holds an ImageInfo, lines of it).
+	std::vector<ImageId>             target_ids;
 	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
 	mutable uint64_t                 used_frame = 0;
 	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
@@ -673,6 +717,14 @@ struct RenderExecutor::NativeXprCache {
 		ResolvedDynamicState           dynamic {};
 		vk::ImageAspectFlags           feedback {};
 		bool                           dynamic_held = false, feedback_held = false;
+		// The command buffer a draw just went into. The indices of another one (or of this one before a direct draw) are not
+		// bound there: a table draw of vertices binds none and leaves them, and the indexed draw after it, the same indices
+		// as in the last command buffer, drew with none bound (the validation layer, at 5-1).
+		void MovedTo(vk::CommandBuffer next, uint64_t next_generation) {
+			if (next != command || next_generation != generation) index_base = index_bytes = 0;
+			command    = next;
+			generation = next_generation;
+		}
 	} emit;
 	// Programs the SRT trace cannot cover (no single linear plan): never retried.
 	std::unordered_set<const ShaderRecompiler::IR::CompiledShaderInfo*> untraceable;
@@ -1026,6 +1078,7 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
 // A descriptor set leaves service; it may be in flight until the current tick.
 void RenderExecutor::NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set) {
 	if (!set) return;
+	TableMemoRetired(); // (a memo entry may hold it)
 	Spec::NoteRetiredSet(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSet>(set)));
 	NativeXprState().retired.push_back({pool, set, m_context.GetCommandScheduler().CurrentTick()});
 }
@@ -1054,18 +1107,20 @@ void RenderExecutor::ResolvePendingTicks(uint64_t pending, uint64_t tick) {
 }
 
 // The draw states no draw used for StateKeepFrames leave. What holds one by its address forgets it: this executor's
-// emission and lookup, its table's last draw and its image sets' transits (TableXpr::epoch moves). Not while another
-// executor reads this catalog (a speculation's): it holds them across draws too.
-void RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame) {
-	if (Role() != 0 || m_catalog_readers.load(std::memory_order_relaxed) != 0 ||
-	    cache.states.size() <= NativeXprCache::StatesKept)
-		return;
-	const auto   write  = CatalogWrite();
+// emission and lookup, its table's last draw and its image sets' transits (TableXpr::epoch moves). Not while a
+// speculation translates or has a result unfinished (kyty_local_speculations_live): it holds them across draws too; the
+// next translation drops what it held (ForgetStaleCatalog). False: put off for that, tried again at the next call.
+bool RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame) {
+	if (Role() != 0 || cache.states.size() <= NativeXprCache::StatesKept) return true;
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return false;
+	const auto write = CatalogWrite();
+	// (Under the lock: a translation counted after this reads the catalog after the sweep, and sees its epoch.)
+	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return false;
 	const size_t before = cache.states.size();
 	std::erase_if(cache.states, [&](const auto& item) {
 		return item.second->UsedFrame() + NativeXprCache::StateKeepFrames < frame;
 	});
-	if (cache.states.size() == before) return;
+	if (cache.states.size() == before) return true;
 	cache.emit           = {};
 	cache.last_state     = nullptr;
 	cache.last_state_key = 0;
@@ -1074,6 +1129,7 @@ void RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame)
 	if (SlowLog::HitchThreshold() > 0.0)
 		std::printf("[tsc %llu] XPR draw states %zu -> %zu\n", static_cast<unsigned long long>(__rdtsc()), before,
 		            cache.states.size());
+	return true;
 }
 
 // Once per frame: the retired sets the GPU is done with are kept for reuse or freed, one call per
@@ -1110,10 +1166,9 @@ void RenderExecutor::NativeXprCollect() {
 			it = cache.records.erase(it);
 		}
 	}
-	if (frame - cache.states_swept_frame >= NativeXprCache::StateSweepFrames) {
+	// (Put off while a speculation holds the states: tried at every call until done.)
+	if (frame - cache.states_swept_frame >= NativeXprCache::StateSweepFrames && NativeXprSweepStates(cache, frame))
 		cache.states_swept_frame = frame;
-		NativeXprSweepStates(cache, frame);
-	}
 	if (cache.collected_frame == frame || cache.retired.empty()) return;
 	cache.collected_frame = frame;
 	auto& scheduler       = m_context.GetCommandScheduler();
@@ -1804,6 +1859,12 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
 	}
 	draw_state.meta_epoch = 0;
+	static std::atomic<uint64_t> captures {0};
+	draw_state.capture_id = captures.fetch_add(1, std::memory_order_relaxed) + 1;
+	for (const auto& target: draw_state.targets) {
+		textures.NoteMetaUse(target.metadata, target.id.index); // (KYTY_TABLE_SERIALS)
+		draw_state.target_ids.push_back(target.id);
+	}
 	draw_state.dynamic = LocalDrawRecording::Capture(
 	    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
 	    m_context.GetGraphics().attachment_feedback_loop_enabled,
@@ -2602,6 +2663,13 @@ public:
 					if (!spec->ReadJournaled(address, count, out)) return Spec::Refuse("memory the processor writes");
 					return;
 				}
+				// (KYTY_WRITE_GUARD: a page a pending guest write guards, through the backing view: the bytes written.)
+				if (WriteGuard::g_count.load(std::memory_order_relaxed) != 0) {
+					if (const auto* backing = WriteGuard::GuardedBacking(address, bytes)) {
+						std::memcpy(out, backing, bytes);
+						return;
+					}
+				}
 				if (count <= 16) {
 					// (A run of a few words: a CRT call each, ~10-15 per evaluation, was ~2% of the render thread on a
 					// laptop's Ryzen 9 5900HX; inline, its render time 33.6 -> 33.0 ms a frame, same process.)
@@ -3091,7 +3159,8 @@ struct RenderExecutor::NativeXprDirect {
 // What the normal path's target acquisition establishes must still hold: the image is registered,
 // GPU-owned (so CPU reads download it) and CPU-clean, and no fast clear is pending in its metadata.
 // Otherwise the normal path acquires. Then the targets in the state's layouts.
-bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer) {
+bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, vk::CommandBuffer vk_buffer,
+                                          const TableImageSet* reading) {
 	auto&      textures   = m_context.GetTextureCache();
 	const auto meta_epoch = textures.MetaEpoch();
 	auto*      spec       = Spec::Current();
@@ -3103,7 +3172,8 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		if (!image->SafeToDownload()) return Spec::Refuse("table: target download"), false;
 		// (A speculation asks each time: its answers are noted.)
 		if (target.metadata != 0 && (spec != nullptr || draw_state.meta_epoch != meta_epoch) &&
-		    textures.IsMetaCleared(target.metadata, target.slice)) {
+		    textures.IsMetaCleared(target.metadata, target.slice, nullptr, nullptr,
+		                           target.requested.metadata.kind == ImageMetadataKind::Dcc)) {
 			// The normal path clears it first. A speculation's draw is a hole that does: the draws after it find it
 			// cleared (speculation-state.h).
 			if (spec != nullptr) spec->ConsumeMeta(target.metadata, target.slice);
@@ -3118,8 +3188,13 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 		// speculation's commit that left a layer elsewhere (rendering to layer 0 of four left the image's layout the
 		// target's, layers 1-3 sampled), the target's own subresources decide; a speculation's always do: it does not
 		// see its holes' transitions.)
-		if (spec != nullptr || image.CurrentState().layout != target.layout || !image.backing.subresource_states.empty())
-			image.Transit(target.layout, target.access, target.range, vk_buffer);
+		if (spec != nullptr || image.CurrentState().layout != target.layout || !image.backing.subresource_states.empty()) {
+			// (A target the table set's shaders sample: with their access, which TableTransit gives it next, the whole
+			// image's; else that transition would follow this one at every draw, a render pass break each.)
+			const auto read = reading != nullptr ? TableTargetRead(*reading, target.id) : vk::AccessFlags2 {};
+			if (read) image.Transit(target.layout, target.access | read, std::nullopt, vk_buffer);
+			else image.Transit(target.layout, target.access, target.range, vk_buffer);
+		}
 	}
 	return true;
 }
@@ -3416,8 +3491,11 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	// A changed state leaves no key behind, even when this try stops before computing it.
 	if (!clean) cache.state_key_valid = false;
 	const bool indexed = direct == nullptr || direct->indexed;
-	if (buffer.IsInvalid() || (direct == nullptr ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
-	    (indexed && (index_base == 0 || index_bytes == 0)))
+	// (A draw of vertices of arguments the GPU reads: its one argument address, as a run's.)
+	const bool with_arguments = direct == nullptr || direct->indirect;
+	if (buffer.IsInvalid() || (with_arguments ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
+	    (indexed && (index_base == 0 || index_bytes == 0)) ||
+	    (direct != nullptr && direct->indirect && (direct->indexed || commands.size() != 1)))
 		return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	// (The GPU thread's: a speculation's thread does not take it.)

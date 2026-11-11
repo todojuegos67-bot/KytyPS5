@@ -4,7 +4,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "live-census.h"
-#include "native-resource-aot.h"
 #include "native-resource-runtime.h"
 
 #include <algorithm>
@@ -19,11 +18,10 @@
 #include <unordered_set>
 
 extern "C" {
-volatile std::atomic<uint32_t> kyty_local_srt_native_mode {0};
-volatile std::atomic<uint32_t> kyty_local_srt_predicate_mode {0};
-volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode {0};
-volatile std::atomic<uint32_t> kyty_local_preparation_lookup_mode {0};
-volatile std::atomic<uint32_t> kyty_local_preparation_trim_mode {0};
+volatile std::atomic<uint32_t> kyty_local_srt_predicate_mode {1};
+volatile std::atomic<uint32_t> kyty_local_preparation_scratch_mode {1};
+volatile std::atomic<uint32_t> kyty_local_preparation_lookup_mode {1};
+volatile std::atomic<uint32_t> kyty_local_preparation_trim_mode {1};
 }
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1388,8 +1386,6 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
                                  ValueOpcodeName(compiler.failed_op));
             return {};
         }
-        PrepareLinearSrtAot(*leaf);
-        root->add_carry |= leaf->add_carry;
         root->control_variants.push_back(std::move(leaf));
     }
     BuildNativePredicate(program, *root, conditional);
@@ -1403,7 +1399,6 @@ void BuildLinearSrtPlan(ResourcePlan& program) {
     auto compiled=std::make_shared<LinearSrtPlan>();
     LinearSrtCompiler compiler(program,*compiled);
     if (compiler.Build()) {
-        PrepareLinearSrtAot(*compiled);
         program.linear_srt=std::move(compiled);
         return;
     }
@@ -1480,7 +1475,6 @@ static bool EvaluateLinearSrtOriginal(const LinearSrtPlan& plan,const SrtRuntime
 static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtime,
                              std::vector<DescriptorValue>& results,std::vector<uint32_t>& flat,
                              std::vector<uint8_t>& active_sources) {
-    if (const auto native = LocalNativeResource::Try(plan, runtime, results, flat, active_sources)) return *native;
     return EvaluateLinearSrtOriginal(plan, runtime, results, flat, active_sources);
 }
 
@@ -1827,44 +1821,6 @@ bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint
 	                                  active);
 }
 
-// KYTY_SRT_LINEAR_VERIFY: every linear evaluation that uses the add-with-carry lowering is
-// repeated by the interpreter (which evaluated those plans before) and compared.
-static void VerifyLinearSrt(const ResourcePlan& program, std::span<const uint32_t> sources,
-                            const SrtRuntime& runtime, std::span<const uint8_t> clean_flat_slots, bool ok,
-                            const std::vector<DescriptorValue>& results, const std::vector<uint32_t>& flat,
-                            const std::vector<uint8_t>& active_sources) {
-    static std::atomic<uint64_t> checks {0}, mismatches {0};
-    std::vector<DescriptorValue> expected_results;
-    std::vector<uint32_t>        expected_flat;
-    std::vector<uint8_t>         expected_active;
-    const bool expected_ok = EvaluateRuntimeSourcesImpl(program, sources, runtime, expected_results, expected_flat,
-                                                        true, clean_flat_slots, expected_active);
-    const bool same = ok == expected_ok &&
-                      (!ok || (results == expected_results && flat == expected_flat &&
-                               active_sources == expected_active));
-    const auto count = checks.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (!same) {
-        const auto failed = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (failed <= 16) {
-            size_t first_result = 0, first_flat = 0;
-            while (first_result < std::min(results.size(), expected_results.size()) &&
-                   results[first_result] == expected_results[first_result]) ++first_result;
-            while (first_flat < std::min(flat.size(), expected_flat.size()) &&
-                   flat[first_flat] == expected_flat[first_flat]) ++first_flat;
-            std::printf("SRT linear verify MISMATCH: hash=0x%016llx ok=%d/%d results=%zu/%zu (first diff %zu) "
-                        "flat=%zu/%zu (first diff %zu) active=%zu/%zu\n",
-                        static_cast<unsigned long long>(program.shader_hash), ok, expected_ok, results.size(),
-                        expected_results.size(), first_result, flat.size(), expected_flat.size(), first_flat,
-                        active_sources.size(), expected_active.size());
-        }
-    }
-    if (count % 20000 == 0) {
-        std::printf("SRT linear verify: %llu checks, %llu mismatches\n", static_cast<unsigned long long>(count),
-                    static_cast<unsigned long long>(mismatches.load(std::memory_order_relaxed)));
-        std::fflush(stdout);
-    }
-}
-
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
@@ -1892,11 +1848,7 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
                 // duplicate a reader's side effects or mask a failed ownership check.
                 return EvaluateLinearSrt(*linear,runtime,results,flat,active_sources);
             };
-            const bool ok = run();
-            static const bool verify = std::getenv("KYTY_SRT_LINEAR_VERIFY") != nullptr;
-            if (verify && linear->add_carry)
-                VerifyLinearSrt(program, sources, runtime, clean_flat_slots, ok, results, flat, active_sources);
-            return ok;
+            return run();
         }
     }
 	const auto& linear = program.linear_srt;

@@ -8,11 +8,13 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/tickClock.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "speculation-state.h"
 
+#include <span>
 #include <array>
 #include <atomic>
 #include <map>
@@ -32,9 +34,6 @@ class CommandScheduler;
 class RenderExecutor;
 struct TextureCacheTestAccess;
 
-void                   KytyTextureGcThresholds(uint64_t total_budget, uint64_t& trigger, uint64_t& pressure,
-                                               uint64_t& critical);
-[[nodiscard]] bool     KytyGcLiveBudget();
 [[nodiscard]] uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics);
 
 class TextureCache {
@@ -109,6 +108,10 @@ public:
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
+	// The image starting at `address` with a `width`x`height` backing (of `format`, unless undefined), the one used
+	// last if several are; `count`: how many images start there (frame generation's interface canvas, frame-gen.cpp).
+	[[nodiscard]] ImageId FindImageAt(uint64_t address, uint32_t width, uint32_t height,
+	                                  vk::Format format = vk::Format::eUndefined, uint32_t* count = nullptr);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	// Whether FindTexture with `desc` uploads anything first: guest bytes the CPU wrote, a GPU buffer write over them or
 	// over the stencil plane. A sampled view of a texture whose levels below it stay dirty (RefreshTextureLevels) needs
@@ -129,6 +132,8 @@ public:
 	void MarkGpuWritten(ImageId id);
 	// A speculative translation's use of the image, when it is committed (`serial`: the image it used).
 	void TouchSpeculated(Image& image, uint64_t serial);
+	// A committed segment's images (each with its serial at the touch) under one lock, repeats in a row once.
+	void TouchSpeculated(std::span<const std::pair<Image*, uint64_t>> images);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -141,6 +146,9 @@ public:
 	// An image over the range holds data the GPU wrote to it (a download of the range must come
 	// from the image, not from the buffer).
 	[[nodiscard]] bool HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
+	// A speculation's (Spec::Current): whether one of those images is one its own work uses (its commit cannot then
+	// synchronize a texel buffer over it before that work: KYTY_SPECULATE_TEXEL_SYNC). True without a speculation.
+	[[nodiscard]] bool SpeculationUsesGpuWrittenImage(uint64_t address, uint64_t size);
 	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
 	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
@@ -158,11 +166,17 @@ public:
 		return ImageStateEpoch() + m_resolution_epoch.load(std::memory_order_acquire) +
 		       m_meta_epoch.load(std::memory_order_acquire) + Image::CpuDirtyEpoch();
 	}
+	// A use of the metadata at `address` by the image in serial slot `slot` (a table set's texture, a draw state's
+	// target, whose view names it): a change there moves the slot's image serial too (MoveMeta; ImageSerials).
+	void               NoteMetaUse(uint64_t address, uint32_t slot);
+	// (`dcc_ok` false: the caller knows the surface is not DCC, e.g. a depth target's HTile; a speculation's DCC
+	// predictions, KYTY_SPEC_PREDICT_DCC, do not answer for it.)
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
-	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
+	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr, bool dcc_ok = true);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	// Record deferred DCC state while the original guest dispatch writes the metadata.
-	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
+	// True when the fill leaves the surface's DCC cleared (a recognized clear code over a DCC entry).
+	bool               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
@@ -173,6 +187,9 @@ public:
 	// KYTY_TEXTURE_OFFLOAD(_PROBE) (texture-offload.h): the guest bytes of clean sampled textures probed for touches, or
 	// dropped from RAM after a download checked to give them back exactly (RunGarbageCollector).
 	void OffloadScan(uint64_t tick);
+	// KYTY_FILE_OFFLOAD (file-offload.h): APR-read pages still equal to their files probed, or
+	// dropped (OffloadScan).
+	void OffloadFiles();
 	// Render thread: the dropped bytes over [vaddr, vaddr + size) downloaded back from their images (texture-offload.h;
 	// `touch`: TextureOffload::Touch; `async`: written back by the offload worker when the GPU is done, touches waiting
 	// till then). Takes m_lock unless the caller holds it.
@@ -250,6 +267,15 @@ private:
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
+	// The image serials (ImageSerials) of a registration change: the image's and those of the images over its pages.
+	void                      MoveRegistrationSerials(const Image& image);
+	// The metadata epoch, and the serials of the registered images whose metadata starts in [begin, end).
+	void                      MoveMeta(uint64_t begin, uint64_t end);
+	void                      MoveMeta(uint64_t address) { MoveMeta(address, address + 1); }
+	// A registered image's metadata address in m_meta_slots (`add` false: out of it).
+	void                      NoteMetaSlot(const Image& image, bool add);
+	// Every m_meta_slots entry of `slot` out (its image gone: NoteMetaUse's entries too).
+	void                      ForgetMetaSlot(uint32_t slot);
 	void                      DeleteImage(ImageId id);
 	// DeleteImage's halves: out of every index (false: it was not registered), then destroyed once no recorded work
 	// can read it.
@@ -312,6 +338,8 @@ private:
 	// A whole upload of a large image a piece of guest memory at a time; false: not such an image (ObtainBufferForImage's).
 	// `only`: the subresources over those [begin, end) ranges alone, of an image of any size.
 	[[nodiscard]] bool UploadImageChunked(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>* only = nullptr);
+	// The size from which images upload in pieces (UploadImageChunked): 256 MiB, or half the staging ring where less.
+	[[nodiscard]] uint64_t ChunkedUploadMin() const;
 	[[nodiscard]] bool UploadImageSubresources(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 	// The dirty layers in [first_layer, last_layer) only.
 	[[nodiscard]] bool UploadDepthPartial(Image& image, uint32_t first_layer = 0,
@@ -328,8 +356,6 @@ private:
 	                                         uint64_t& end);
 	// A sampled view's refresh of its levels (the others stay dirty); false: RefreshImage's.
 	[[nodiscard]] bool RefreshTextureLevels(ImageId id, const ImageViewInfo& view);
-	void               UpdatePartialHashes(Image& image, bool all);
-	[[nodiscard]] bool CheckPartialHashes(const Image& image);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -419,6 +445,23 @@ private:
 	};
 	std::unordered_map<uint64_t, PartialPlan> m_partial_plans;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// KYTY_SPEC_PREDICT_DCC: the surfaces a DCC fill has cleared (kept apart from m_surface_metas, whose entries image
+	// registrations rebuild), and those whose pending clear FindTexture left pending when the normal path sampled them.
+	std::unordered_set<uint64_t> m_dcc_filled, m_dcc_sticky;
+	// KYTY_TABLE_SERIALS: the registered images by their metadata address, as their serial slots (MoveMeta).
+	std::multimap<uint64_t, uint32_t> m_meta_slots;
+	// (Each slot's addresses in m_meta_slots: ForgetMetaSlot erases them alone, not a pass over every entry.)
+	std::unordered_map<uint32_t, std::vector<uint64_t>> m_meta_by_slot;
+	std::mutex                        m_meta_slots_lock;
+
+public:
+	// KYTY_SPEC_PREDICT_DCC: the normal path sampled a DCC surface with a pending clear; `sticks`: FindTexture left it
+	// pending. DccClearSticks: with the switch on, whether it was seen to (a speculation does not assume that a hole of
+	// such a use consumes the clear).
+	void               NoteDccClear(uint64_t address, bool sticks);
+	[[nodiscard]] bool DccClearSticks(uint64_t address);
+
+private:
 	std::atomic<uint64_t>                             m_meta_epoch {1};
 	// The m_surface_metas keys as bits of a 1024-bit filter: a clear bit proves an address holds
 	// no metadata without m_lock (IsMeta and ClearMeta run for the buffers of every dispatch).
@@ -445,6 +488,7 @@ private:
 	uint64_t                                          m_logged_private       = 0;
 	bool                                              m_logged_short_of_ram  = false;
 	uint64_t         m_gc_tick                = 0;
+	TickClock        m_tick_clock;                 // the collectors count ages in time
 	uint64_t         m_scene_generation       = 0; // RetireStaleImages: the world the game is in (SceneTags), entered
 	uint64_t         m_scene_tick             = 0; // at this tick
 	std::atomic<uint64_t> m_frame {0};

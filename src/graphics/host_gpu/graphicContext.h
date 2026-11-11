@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -34,15 +35,22 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	// VK_EXT_memory_priority, enabled only for KYTY_SIMULATE_VRAM_MB (vma.cpp).
 	bool                               memory_priority_enabled               = false;
-	// VK_KHR_pipeline_executable_properties, enabled only for KYTY_PIPELINE_STATS=1 (shaders.cpp: a survey).
-	bool                               pipeline_statistics_enabled           = false;
-	bool                               rt_extensions_enabled                 = false;
+	// KYTY_FULLSCREEN_EXCLUSIVE=0|1 (Windows, issue #166): the swapchain asks the driver to keep out of exclusive
+	// fullscreen (0) or allows it (1), through VK_EXT_full_screen_exclusive; -1 (unset on a GPU other than AMD's, or
+	// the extension missing): the driver's own choice. Unset on an AMD GPU: 0, full_screen_exclusive_default.
+	int                                full_screen_exclusive                 = -1;
+	bool                               full_screen_exclusive_default         = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// A pipeline may require 64-lane subgroups of its pixel shader (KYTY_PS_WAVE64).
 	bool                               fragment_wave64_requirable            = false;
 	// With subgroup size control: wave64 compute programs run on 64-lane subgroups (else emulated on 32-lane ones, two
 	// guest lanes an invocation). VulkanInitSubgroupSizeControl decides it (KYTY_COMPUTE_WAVE64).
 	bool                               compute_wave64_native                 = false;
+	// The Steam Deck's GPU (Van Gogh) with Linux' RADV (VulkanInitSubgroupSizeControl).
+	bool                               steam_deck_radv                       = false;
+	// VK_AMD_shader_explicit_vertex_parameter enabled for the barycentrics of AMD's older Windows compiler (issue #305;
+	// AmdExplicitVertexBarycentrics in vulkanWindow.cpp, ShaderRecompiler::Frontend::TranslatorFeatureAmdBarycentrics).
+	bool                               amd_explicit_vertex_barycentrics      = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
@@ -60,6 +68,8 @@ struct GraphicContext {
 	bool                               maintenance5_enabled                  = false;
 	// VK_NV_copy_memory_indirect: an upload prologue's copies are one command (BufferCache::UploadDirtyRanges).
 	bool                               copy_memory_indirect_enabled          = false;
+	// KYTY_PIPELINE_STATS (diagnostic): VK_KHR_pipeline_executable_properties, the driver's statistics of pipelines.
+	bool                               pipeline_statistics_enabled           = false;
 	// False (the emulator): the driver keeps no copy of its own of the pipelines it makes (the
 	// precompile's captures of static cache hits come from that copy).
 	bool                               pipeline_binary_internal_cache        = true;
@@ -89,6 +99,7 @@ struct GraphicContext {
 	// copies (src/local/readback-queue.h); buffers are then shared with its family.
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
 	vk::Queue                          readback_queue  = nullptr;
+	Common::Mutex                      readback_queue_mutex; // (DeviceQueuesGuard; one thread submits at a time)
 	// Windows: a second queue of the graphics family used only for vkQueuePresentKHR. The
 	// driver can block a present in the kernel until earlier GPU work on its queue is done;
 	// on the graphics queue that held queue_mutex against the very submissions that work
@@ -99,6 +110,14 @@ struct GraphicContext {
 	// KYTY_ASYNC_COMPUTE: a third queue of the graphics family for the game's compute queues (lane-sync.h).
 	vk::Queue                          compute_queue         = nullptr;
 	bool                               compute_queue_created = false; // queue index 2 of queue_family
+	// KYTY_FRAMEGEN_BACKEND=fsr: the queues of FSR's frame generation swapchain (frame-gen.cpp), its own: presents and
+	// UI composition (queue index 2 of queue_family, or with fewer graphics queues index 2 of the compute family, which
+	// then can present), async compute and image acquires (a compute-only family). Null without FSR.
+	vk::Queue                          fsr_present_queue = nullptr;
+	vk::Queue                          fsr_compute_queue = nullptr;
+	vk::Queue                          fsr_acquire_queue = nullptr;
+	uint32_t                           fsr_compute_family = static_cast<uint32_t>(-1);
+	uint32_t                           fsr_present_family = static_cast<uint32_t>(-1);
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -174,21 +193,33 @@ struct GraphicContext {
 	void                   LogVideoMemory(const char* label) const;
 	// capped: the caches' budget (KYTY_VRAM_BUDGET_MB, room kept for Windows); false: what the driver allows.
 	[[nodiscard]] uint64_t GetTotalMemoryBudget(bool capped = true) const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// `guest_texture`: an image of the guest's (Image, image.cpp), not one of the emulator's own (presenter, frame generation, super
+	// resolution): KYTY_TEXTURE_HOST_MODE=pd places only those flexibly.
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image, bool guest_texture = false);
+	// (CreateImage: a texture made in the host-preferred type, KYTY_TEXTURE_HOST_AT; where it really is, logged.)
+	void                   NoteHostPreferredTexture(VmaAllocation allocation, double host_at);
 	void                   DeleteImage(VulkanImage& image);
 	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
 	void                   TrimImagePool();
 	void                   ReportMemoryFallback(const char* what, uint64_t bytes) const;
+	// Out of memory past every fallback (issue #228: VMA's answer is OUT_OF_DEVICE_MEMORY whatever refused it): the
+	// driver's own answer to the same size in video and in system memory, VMA's memory objects against the GPU's limit
+	// and the PC's RAM and commit, the first few times.
+	void                   DescribeAllocationFailure(const char* what, uint64_t bytes) const;
+	// That, then `create` again every 100 ms for up to 10 s while memory may come back (frees in flight, Windows growing
+	// its page file), with the images kept for reuse freed each time; true once it made it.
+	bool                   RetryAllocation(const char* what, uint64_t bytes, const std::function<bool()>& create);
 	// KYTY_SIMULATE_VRAM_MB: the video memory taken at start-up (left out of the budget and usage above).
 	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video
 	// memory to render targets and buffers (CreateImage); the pipeline warmup leaves its pipelines to first use.
 	bool                          small_video_memory = false;
+	// The default of the reduced texture levels (KYTY_TEXTURE_REDUCE, vma.cpp): a card of 12 GiB of video memory or
+	// less, by its size, not its budget, which other programs and frame generation move (issue #215: a 16 GB RTX 5080 at
+	// 12.06-12.21 GiB of budget, DLSS-G and DLSS on, ran with full textures at 11.7 GiB in use and no frame drops).
+	bool                          reduce_texture_levels = false;
 	// The game buffers' own VMA pool (BufferCache), whose blocks BufferCache::Defragment compacts. KYTY_BUFFER_DEFRAG:
 	// on with a small video memory, 0 off, 1 on any GPU. Null: off, game buffers in VMA's default pools.
 	VmaPool                       game_buffer_pool = nullptr;
-	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
-	// (MemoryUsage::SparseDeviceLocal).
-	bool                          sparse_residency_buffers = false;
 	// An image only sampled and copied (CreateImage places these apart on such a GPU).
 	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
 		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |
@@ -196,10 +227,6 @@ struct GraphicContext {
 	}
 	std::vector<vk::DeviceMemory> simulation_ballast;
 	uint64_t                      simulation_ballast_bytes = 0;
-	void                   AppendHardwareRayTracingDeviceExtensions(
-	    const std::vector<vk::ExtensionProperties>& available_extensions,
-	    std::vector<const char*>&                   device_extensions);
-	void LoadHardwareRayTracingFunctions() const;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
@@ -212,6 +239,20 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+};
+
+// Every queue the emulator submits to, held: a call that waits for the whole device (vkDeviceWaitIdle, as AMD's FSR
+// runtime does making and destroying its contexts) wants them left alone, and the validation layer caught the recording
+// worker submitting through it at an F11 (issue #174). Nothing new reaches the GPU meanwhile.
+class DeviceQueuesGuard {
+public:
+	// NOLINTNEXTLINE(google-runtime-references)
+	explicit DeviceQueuesGuard(GraphicContext& graphics)
+	    : m_queue(graphics.queue_mutex), m_readback(graphics.readback_queue_mutex), m_present(graphics.present_queue_mutex) {}
+	KYTY_CLASS_NO_COPY(DeviceQueuesGuard);
+
+private:
+	Common::LockGuard m_queue, m_readback, m_present;
 };
 
 struct VulkanImageState {

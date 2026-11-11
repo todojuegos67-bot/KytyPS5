@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,8 @@
 #include <span>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
+#include <utility>
 #include <zstd.h>
 #include <string>
 #include <unordered_map>
@@ -223,11 +226,11 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 
 // The precompile's capture (PipelineBinaryWriter): a pipeline the static pipeline cache holds (the first
 // store is made from it), its binaries then from the driver's own cache (a pipeline created with the
-// capture flag is never a cache hit: compiled); else compiled with its binaries kept.
+// capture flag is never a cache hit: compiled); else compiled with its binaries kept, in no pipeline cache
+// (the capture flag takes none: VUID-vkCreateGraphicsPipelines-pNext-09617).
 template <typename Info, typename Create>
 static vk::Result CapturePipelineBinaries(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, Info info,
-                                          vk::PipelineCache driver_cache, const PipelineBinaries::Key& key,
-                                          Create create) {
+                                          const PipelineBinaries::Key& key, Create create) {
 	auto* writer = graphics.pipeline_binary_writer;
 	if (graphics.static_pipeline_cache != nullptr && graphics.pipeline_cache_control_enabled) {
 		auto lookup = info;
@@ -243,7 +246,7 @@ static vk::Result CapturePipelineBinaries(GraphicContext& graphics, PipelineCach
 	              vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR;
 	flags.pNext       = info.pNext;
 	info.pNext        = &flags;
-	const auto result = create(driver_cache, info);
+	const auto result = create(nullptr, info);
 	if (result == vk::Result::eSuccess && !writer->Capture(key, pipeline.pipeline)) {
 		std::printf("Pipeline binaries: the driver gave none for a pipeline\n");
 	}
@@ -525,62 +528,6 @@ void LogPipelineKey(const char* what, const PipelineBinaries::Key& key, const In
 // (KYTY_PIPELINE_SOURCE_LOG) Each module's SPIR-V size.
 static std::unordered_map<VkShaderModule, size_t> g_module_bytes;
 
-bool InlineKeyCheck() {
-	static const bool on = std::getenv("KYTY_INLINE_KEY_CHECK") != nullptr;
-	return on;
-}
-static std::mutex                                                 g_inline_mutex;
-static std::unordered_map<VkShaderModule, std::vector<uint32_t>> g_inline_spirv;
-void NoteInlineSpirv(vk::ShaderModule module, const std::vector<uint32_t>& spirv) {
-	std::lock_guard lock(g_inline_mutex);
-	g_inline_spirv[static_cast<VkShaderModule>(module)] = spirv;
-}
-
-// (KYTY_INLINE_KEY_CHECK) The key of the pipeline with its stages' SPIR-V inline against `key` (its modules').
-template <typename Info>
-static void CheckInlineKey(vk::Device device, const Info& info, const PipelineBinaries::Key& key) {
-	static std::atomic<uint64_t> same {0}, differ {0}, missing {0};
-	std::vector<vk::PipelineShaderStageCreateInfo> stages;
-	if constexpr (std::is_same_v<Info, vk::GraphicsPipelineCreateInfo>) {
-		stages.assign(info.pStages, info.pStages + info.stageCount);
-	} else {
-		stages.push_back(info.stage);
-	}
-	std::vector<vk::ShaderModuleCreateInfo> modules(stages.size());
-	{
-		std::lock_guard lock(g_inline_mutex);
-		for (size_t i = 0; i < stages.size(); i++) {
-			const auto found = g_inline_spirv.find(static_cast<VkShaderModule>(stages[i].module));
-			if (found == g_inline_spirv.end()) {
-				missing++;
-				return;
-			}
-			modules[i].codeSize = found->second.size() * sizeof(uint32_t);
-			modules[i].pCode    = found->second.data();
-			modules[i].pNext    = stages[i].pNext;
-			stages[i].pNext     = &modules[i];
-			stages[i].module    = nullptr;
-		}
-	}
-	auto inline_info = info;
-	if constexpr (std::is_same_v<Info, vk::GraphicsPipelineCreateInfo>) {
-		inline_info.pStages = stages.data();
-	} else {
-		inline_info.stage = stages[0];
-	}
-	PipelineBinaries::Key inline_key;
-	const bool            ok    = PipelineBinaries::PipelineKey(device, &inline_info, inline_key);
-	const bool            equal = ok && inline_key.size == key.size && std::memcmp(inline_key.bytes.data(), key.bytes.data(), key.size) == 0;
-	const auto            count = (equal ? same : differ).fetch_add(1) + 1;
-	if (!equal && count <= 5)
-		std::printf("Inline key check: DIFFERENT key (%s, %u stages)\n", ok ? "made" : "not made",
-		            static_cast<unsigned>(stages.size()));
-	if ((same + differ) % 100 == 0)
-		std::printf("Inline key check: %llu same, %llu different, %llu without SPIR-V\n",
-		            static_cast<unsigned long long>(same.load()), static_cast<unsigned long long>(differ.load()),
-		            static_cast<unsigned long long>(missing.load()));
-}
-
 void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes) {
 	std::lock_guard lock(g_key_log_mutex);
 	g_key_log_modules[static_cast<VkShaderModule>(module)] = {shader_hash, spirv_hash};
@@ -777,8 +724,11 @@ static double MicrosecondsSince(std::chrono::steady_clock::time_point start) {
 
 // A pipeline the driver refused: the log names its result and the programs. True in a precompile, which leaves it out and
 // goes on (the caller destroys a null one): issue #305, one pipeline an RX Vega 56's driver refused ended its shard, and
-// the retries split the shard 561 ways. The game cannot draw without it and exits.
+// the precompile never finished. The game makes it again without the driver's optimizations (MadeUnoptimized), then goes
+// on with a graphics pipeline that draws nothing (DrawNothingPipeline) or exits at a compute one.
 static std::atomic<size_t> g_pipelines_refused {0};
+// Refused in play: all, made again without the driver's optimizations (MadeUnoptimized), drawing nothing in their place.
+static std::atomic<size_t> g_play_refused {0}, g_play_unoptimized {0}, g_play_draw_nothing {0};
 static bool PipelineRefused(const GraphicContext& graphics, vk::Result result, const char* kind, uint64_t hash,
                             uint64_t pixel_hash) {
 	static std::atomic<uint32_t> reports {0};
@@ -787,13 +737,103 @@ static bool PipelineRefused(const GraphicContext& graphics, vk::Result result, c
 		            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(pixel_hash));
 		std::fflush(stdout);
 	}
-	if (!graphics.precompiling) return false;
+	if (!graphics.precompiling) {
+		g_play_refused.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
 	g_pipelines_refused.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 
 size_t PipelinesRefused() {
 	return g_pipelines_refused.load(std::memory_order_relaxed);
+}
+
+// A pipeline the driver refused in play, made again without its optimizations (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT,
+// in no cache), the second try before a graphics pipeline that draws nothing (DrawNothingPipeline) or the end of the game
+// at a compute one. An RX Vega 56 (AMD 26.5.2, ErrorUnknown) refused ~6,500 of the 80,000 pipelines its precompile made,
+// among them the final composite's: the game ran on with a black screen (issue #305). Whether its driver makes them
+// unoptimized is not known: the log says (the first 16, and ReportRefusedPipelines). The pipeline stays unoptimized
+// (pipeline.unoptimized false: no optimized build is tried on a worker).
+template <typename Info, typename Create>
+static vk::Result MadeUnoptimized(PipelineCache::Pipeline& pipeline, Info info, const char* kind, uint64_t hash,
+                                  uint64_t pixel_hash, Create create) {
+	pipeline.pipeline = nullptr;
+	InlineStages inlined;
+	inlined.Apply(info);
+	info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	const auto result = create(nullptr, info);
+	const bool made   = result == vk::Result::eSuccess && pipeline.pipeline != nullptr;
+	if (made) {
+		g_play_unoptimized.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		pipeline.pipeline = nullptr;
+	}
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("Pipeline refused by the driver: %s without its optimizations (%s %016llx %016llx)\n",
+		            made ? "made" : ("refused again, " + vk::to_string(result) + ",").c_str(), kind,
+		            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(pixel_hash));
+		std::fflush(stdout);
+	}
+	return made ? vk::Result::eSuccess : result != vk::Result::eSuccess ? result : vk::Result::eErrorUnknown;
+}
+
+// The optimized build of an unoptimized pipeline refused: the pipeline made before stays, the unoptimized one or the one
+// that draws nothing (PipelineCache::PromoteOptimized replaces it only with a pipeline). Before, a graphics one became the
+// pipeline that draws nothing, a compute one ended the game.
+static void OptimizedBuildRefused() {
+	if (static std::atomic<bool> reported {false}; !reported.exchange(true, std::memory_order_relaxed)) {
+		std::printf("Pipeline refused by the driver: its optimized build; the pipeline made before stays\n");
+		std::fflush(stdout);
+	}
+}
+
+void ReportRefusedPipelines() {
+	const auto refused = g_play_refused.load(std::memory_order_relaxed);
+	if (refused == 0) return;
+	std::printf("Pipelines the driver refused in play: %zu; %zu made without its optimizations, %zu drawing nothing in "
+	            "their place\n",
+	            refused, g_play_unoptimized.load(std::memory_order_relaxed),
+	            g_play_draw_nothing.load(std::memory_order_relaxed));
+	std::fflush(stdout);
+}
+
+// A graphics pipeline the driver refused to the game: the same pipeline with a pixel shader that kills every pixel in place
+// of its own, so that its draws write no colour, depth or stencil and all the rest of the game runs (with the primitives
+// discarded instead, a pipeline counts as made for no attachments: VUID-vkCmdDraw-colorAttachmentCount-06179). An RX Vega 56
+// (AMD 26.5.2, ErrorUnknown) stopped at the third pixel shader of the game while its precompile made nearly all of 73,571
+// pipelines (issue #305). AMD's 2023 compiler makes that pipeline for its GPU, the SPIR-V is valid: the driver's reason is
+// not known.
+static vk::Result DrawNothingPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, vk::GraphicsPipelineCreateInfo info,
+                                      vk::PipelineShaderStageCreateInfo& fragment_stage) {
+	// (main: OpKill. No early fragment tests: they would write the depth before it.)
+	static const vk::ShaderModule kill = [&] {
+		static const uint32_t code[] = {
+		    0x07230203, 0x00010000, 0x00070000, 0x00000005, 0x00000000, 0x00020011, 0x00000001, 0x0003000e, 0x00000000,
+		    0x00000001, 0x0005000f, 0x00000004, 0x00000001, 0x6e69616d, 0x00000000, 0x00030010, 0x00000001, 0x00000007,
+		    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00050036, 0x00000002, 0x00000001, 0x00000000,
+		    0x00000003, 0x000200f8, 0x00000004, 0x000100fc, 0x00010038};
+		vk::ShaderModuleCreateInfo create {};
+		create.codeSize = sizeof(code);
+		create.pCode    = code;
+		vk::ShaderModule module;
+		EXIT_IF(graphics.device.createShaderModule(&create, nullptr, &module) != vk::Result::eSuccess);
+		return module;
+	}();
+	fragment_stage        = vk::PipelineShaderStageCreateInfo {};
+	fragment_stage.stage  = vk::ShaderStageFlagBits::eFragment;
+	fragment_stage.module = kill;
+	fragment_stage.pName  = "main";
+	InlineStages inlined;
+	inlined.Apply(info);
+	const auto result = graphics.device.createGraphicsPipelines(nullptr, 1, &info, nullptr, &pipeline.pipeline);
+	if (result == vk::Result::eSuccess) g_play_draw_nothing.fetch_add(1, std::memory_order_relaxed);
+	if (static bool reported = false; result == vk::Result::eSuccess && !std::exchange(reported, true)) {
+		std::printf("Pipeline refused by the driver: the game goes on without its draws\n");
+		std::fflush(stdout);
+	}
+	return result;
 }
 
 // The precompile's pipeline another of its shards holds: none is made (the caller destroys a null one).
@@ -808,57 +848,6 @@ static vk::PipelineCache BlobCache(GraphicContext& graphics, const std::vector<u
 	create.pInitialData     = data.data();
 	vk::PipelineCache cache = nullptr;
 	return graphics.device.createPipelineCache(&create, nullptr, &cache) == vk::Result::eSuccess ? cache : nullptr;
-}
-
-// KYTY_PIPELINE_STATS=1 (a survey): each pipeline made once more with the driver's statistics
-// (VK_KHR_pipeline_executable_properties), a "PIPESTATS kind hash hash executable: name=value; ..." line per executable,
-// and destroyed. A pipeline's local memory (its spills) is per thread: the driver keeps one pool for the largest of
-// them times the threads the GPU runs, video memory it never gives back (8 GB cards: ~1 GB more with 1-1 dragon fire's
-// table forms before 966c891d; destroying 13,000 idle pipelines freed none).
-template <typename Info, typename Create>
-static void LogPipelineStatistics(GraphicContext& graphics, Info info, Create create, const char* kind, uint64_t a,
-                                  uint64_t b) {
-	if (!graphics.pipeline_statistics_enabled) return;
-	InlineStages inlined;
-	inlined.Apply(info);
-	info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
-	vk::Pipeline made = nullptr;
-	if (create(info, made) != vk::Result::eSuccess || made == nullptr) return;
-	vk::PipelineInfoKHR pipeline_info {};
-	pipeline_info.pipeline = made;
-	uint32_t executables   = 0;
-	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &executables, nullptr);
-	std::vector<vk::PipelineExecutablePropertiesKHR> properties(executables);
-	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &executables, properties.data());
-	for (uint32_t e = 0; e < executables; e++) {
-		vk::PipelineExecutableInfoKHR executable {};
-		executable.pipeline        = made;
-		executable.executableIndex = e;
-		uint32_t count             = 0;
-		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &count, nullptr);
-		std::vector<vk::PipelineExecutableStatisticKHR> statistics(count);
-		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &count, statistics.data());
-		std::string line = fmt::format("PIPESTATS {} {:016x} {:016x} {}:", kind, a, b, properties[e].name.data());
-		for (const auto& statistic: statistics) {
-			switch (statistic.format) {
-				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
-					line += fmt::format(" {}={};", statistic.name.data(), statistic.value.b32);
-					break;
-				case vk::PipelineExecutableStatisticFormatKHR::eInt64:
-					line += fmt::format(" {}={};", statistic.name.data(), statistic.value.i64);
-					break;
-				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
-					line += fmt::format(" {}={};", statistic.name.data(), statistic.value.u64);
-					break;
-				case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
-					line += fmt::format(" {}={:.1f};", statistic.name.data(), statistic.value.f64);
-					break;
-			}
-		}
-		std::printf("%s\n", line.c_str());
-	}
-	std::fflush(stdout);
-	graphics.device.destroyPipeline(made, nullptr);
 }
 
 // The static precompile's pipeline when it holds this one (no compilation), else built as `build` says. `identity`
@@ -903,7 +892,6 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 		keyed = PipelineBinaries::PipelineKey(graphics.device, &info, key);
 		if (keyed) {
 			if (writer != nullptr && PipelineKeyLog()) LogPipelineKey("tool", key, original);
-			if (InlineKeyCheck()) CheckInlineKey(graphics.device, original, key);
 			// Another shard of this precompile holds it: no pipeline (see CreatePipelineInternal).
 			if (writer != nullptr && writer->Claimed(key)) return vk::Result::ePipelineCompileRequired;
 			// The precompile keeps a stored pipeline's binaries as they are, intact: the store is this GPU's and
@@ -943,7 +931,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				}
 			}
 			if (writer == nullptr && PipelineKeyLog()) LogPipelineKey("miss", key, original);
-			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
+			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, key, create);
 		} else if (writer == nullptr && store != nullptr) {
 			g_binary_outcomes.Count(g_binary_outcomes.unasked);
 			t_store_why = "static store: no driver key";
@@ -994,12 +982,6 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 			g_blob_outcomes.Count(blobs->Holds(identity) ? g_blob_outcomes.damaged : g_blob_outcomes.absent);
 		}
 		if (blob_writer != nullptr) {
-			// A static pipeline cache from before the blobs (a conversion, KYTY_STATIC_BLOBS_FROM_CACHE): its hit gives the
-			// driver the pipeline, which a cache of the pipeline's own may then take without compiling.
-			if (cached(graphics.static_pipeline_cache)) {
-				graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-				pipeline.pipeline = nullptr;
-			}
 			vk::PipelineCacheCreateInfo empty {};
 			vk::PipelineCache           own = nullptr;
 			if (graphics.device.createPipelineCache(&empty, nullptr, &own) == vk::Result::eSuccess) {
@@ -1023,6 +1005,8 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 		return vk::Result::eSuccess;
 	}
 	// A pipeline compiled now (in no cache) is kept for the sessions after (PlayedPipelines); a driver cache's is not.
+	// Created in no pipeline cache: the capture flag takes none (VUID-vkCreateGraphicsPipelines-pNext-09617); the driver
+	// cache given before was neither searched nor added to (NVIDIA 617.42, RADV 26.0).
 	if (build == PipelineBuild::Full && keyed && played != nullptr && played->Capturing() &&
 	    graphics.pipeline_cache_control_enabled) {
 		if (cached(driver_cache)) return vk::Result::eSuccess;
@@ -1032,7 +1016,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 		flags.pNext       = info.pNext;
 		auto kept         = info;
 		kept.pNext        = &flags;
-		const auto result = create(driver_cache, kept);
+		const auto result = create(nullptr, kept);
 		if (result == vk::Result::eSuccess) played->Capture(key, pipeline.pipeline);
 		return result;
 	}
@@ -1475,26 +1459,29 @@ void CreatePipelineInternal(
 	                                   static_params, vs_input_info, ps_input_info, native_bindings)
 	        : 0;
 	const auto handle_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build, identity,
-	                              [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
-		                              return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr,
-		                                                                            &pipeline.pipeline);
-	                              });
+	const auto create_graphics = [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
+		return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr, &pipeline.pipeline);
+	};
+	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build, identity, create_graphics);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
-	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
-	                     !PipelineRefused(graphics, result, "graphics", vs_input_info.stage.program->shader_hash,
-	                                      ps_active ? ps_input_info->stage.program->shader_hash : 0));
-	LogPipelineStatistics(
-	    graphics, pipeline_info,
-	    [&](const vk::GraphicsPipelineCreateInfo& create, vk::Pipeline& made) {
-		    return graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &made);
-	    },
-	    vs_input_info.stage.program->table_mode ? "gfx-table" : native_bindings ? "gfx-native" : "gfx-normal",
-	    vs_input_info.stage.program->shader_hash, ps_active ? ps_input_info->stage.program->shader_hash : 0);
+	const uint64_t pixel_hash = ps_active ? ps_input_info->stage.program->shader_hash : 0;
+	if (!ClaimedElsewhere(graphics, result) && (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
+	    !PipelineRefused(graphics, result, "graphics", vs_input_info.stage.program->shader_hash, pixel_hash)) {
+		pipeline.pipeline = nullptr;
+		if (build == PipelineBuild::Optimize) {
+			OptimizedBuildRefused();
+		} else if (pipeline.unoptimized || MadeUnoptimized(pipeline, pipeline_info, "graphics",
+		                                                   vs_input_info.stage.program->shader_hash, pixel_hash,
+		                                                   create_graphics) != vk::Result::eSuccess) {
+			// (The fragment stage is the last, when there is one.)
+			if (!ps_active && empty_frag_stage_info.module == nullptr) pipeline_info.stageCount = ++shader_stage_count;
+			result = DrawNothingPipeline(graphics, pipeline, pipeline_info, shader_stages[shader_stage_count - 1]);
+			EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+		}
+	}
 	if (DeviceFault::BreadcrumbsOn()) {
 		DeviceFault::NotePipeline(pipeline.pipeline,
 		                          fmt::format("{} vs {:016x} ps {:016x}",
@@ -1529,6 +1516,97 @@ void CreatePipelineInternal(
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
+}
+
+// KYTY_PIPELINE_STATS=<hash,...> or * (diagnostic, VK_KHR_pipeline_executable_properties): the driver's statistics of
+// those compute programs' pipelines (registers, spills, waves a SIMD holds, instructions), once a program, from a
+// second pipeline compiled from the same SPIR-V with them captured: PIPESTATS lines.
+static void PrintPipelineStatistics(GraphicContext& graphics, vk::ComputePipelineCreateInfo create, uint64_t hash) {
+	static const std::string wanted = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_STATS");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	if (wanted != "*" && wanted.find(fmt::format("{:016x}", hash)) == std::string::npos) return;
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> printed;
+	{
+		std::lock_guard lock(mutex);
+		if (!printed.insert(hash).second) return;
+	}
+	// (Compiled from the SPIR-V: not from pipeline binaries, whose pipelines hold no statistics.)
+	if (const auto* first = static_cast<const VkBaseInStructure*>(create.pNext);
+	    first != nullptr && first->sType == VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR)
+		create.pNext = first->pNext;
+	// KYTY_PIPELINE_STATS_DIR=<dir>: also the driver's internal representations of it there (RADV: its final NIR, ACO's
+	// IR and the GPU's assembly), CS_<hash>.<executable>.<name>.txt.
+	static const char* const directory = std::getenv("KYTY_PIPELINE_STATS_DIR");
+	create.flags = (create.flags & ~vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired) |
+	               vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	if (directory != nullptr && *directory != '\0')
+		create.flags |= vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+	vk::Pipeline captured = nullptr;
+	if (graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &captured) != vk::Result::eSuccess) return;
+	vk::PipelineInfoKHR pipeline_info {};
+	pipeline_info.pipeline = captured;
+	uint32_t count         = 0;
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &count, nullptr);
+	std::vector<vk::PipelineExecutablePropertiesKHR> executables(count);
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &count, executables.data());
+	for (uint32_t index = 0; index < count; ++index) {
+		vk::PipelineExecutableInfoKHR executable {};
+		executable.pipeline        = captured;
+		executable.executableIndex = index;
+		uint32_t statistics_count  = 0;
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &statistics_count, nullptr);
+		std::vector<vk::PipelineExecutableStatisticKHR> statistics(statistics_count);
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &statistics_count, statistics.data());
+		std::string line = fmt::format("PIPESTATS cs {:016x} {} (subgroup {}):", hash, executables[index].name.data(),
+		                               executables[index].subgroupSize);
+		for (const auto& statistic: statistics) {
+			switch (statistic.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+					line += fmt::format(" {}={}", statistic.name.data(), statistic.value.b32 != 0 ? 1 : 0);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+					line += fmt::format(" {}={}", statistic.name.data(), statistic.value.i64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+					line += fmt::format(" {}={}", statistic.name.data(), statistic.value.u64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
+					line += fmt::format(" {}={:.1f}", statistic.name.data(), statistic.value.f64);
+					break;
+			}
+		}
+		std::printf("%s\n", line.c_str());
+		if (directory == nullptr || *directory == '\0') continue;
+		uint32_t representation_count = 0;
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &representation_count, nullptr);
+		std::vector<vk::PipelineExecutableInternalRepresentationKHR> representations(representation_count);
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &representation_count,
+		                                                                      representations.data());
+		std::vector<std::vector<char>> data(representation_count);
+		for (uint32_t r = 0; r < representation_count; ++r) {
+			data[r].resize(representations[r].dataSize);
+			representations[r].pData = data[r].data();
+		}
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &representation_count,
+		                                                                      representations.data());
+		for (uint32_t r = 0; r < representation_count; ++r) {
+			std::string name = representations[r].name.data();
+			for (auto& c: name)
+				if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+			const auto path = fmt::format("{}/CS_{:016x}.{}.{}.txt", directory, hash, index, name);
+			if (FILE* file = std::fopen(path.c_str(), "wb")) {
+				// (Text up to its terminating zero.)
+				const auto end = std::find(data[r].begin(), data[r].end(), '\0');
+				std::fwrite(data[r].data(), 1, static_cast<size_t>(end - data[r].begin()), file);
+				std::fclose(file);
+			}
+		}
+	}
+	std::fflush(stdout);
+	graphics.device.destroyPipeline(captured, nullptr);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1582,23 +1660,27 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	        ? ComputePipelineIdentity(ModuleSpirvHash(compute_module), input_info, native_bindings)
 	        : 0;
 	const auto handle_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-	const auto result =
-	    CreatePipelineHandle(graphics, pipeline, info, driver_cache, build, identity,
-	                         [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
-		                         return graphics.device.createComputePipelines(cache, 1, &create, nullptr,
-		                                                                      &pipeline.pipeline);
-	                         });
+	const auto create_compute = [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
+		const auto made = graphics.device.createComputePipelines(cache, 1, &create, nullptr, &pipeline.pipeline);
+		if (made == vk::Result::eSuccess && graphics.pipeline_statistics_enabled)
+			PrintPipelineStatistics(graphics, create, input_info.stage.program->shader_hash);
+		return made;
+	};
+	const auto result = CreatePipelineHandle(graphics, pipeline, info, driver_cache, build, identity, create_compute);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
-	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
-	                     !PipelineRefused(graphics, result, "compute", input_info.stage.program->shader_hash, 0));
-	LogPipelineStatistics(
-	    graphics, info,
-	    [&](const vk::ComputePipelineCreateInfo& create, vk::Pipeline& made) {
-		    return graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &made);
-	    },
-	    native_bindings ? "cs-table" : "cs-normal", input_info.stage.program->shader_hash, 0);
+	if (!ClaimedElsewhere(graphics, result) && (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) &&
+	    !PipelineRefused(graphics, result, "compute", input_info.stage.program->shader_hash, 0)) {
+		pipeline.pipeline = nullptr;
+		if (build == PipelineBuild::Optimize) {
+			OptimizedBuildRefused();
+		} else {
+			// (The game cannot go on without it.)
+			EXIT_NOT_IMPLEMENTED(pipeline.unoptimized ||
+			                     MadeUnoptimized(pipeline, info, "compute", input_info.stage.program->shader_hash, 0,
+			                                     create_compute) != vk::Result::eSuccess);
+		}
+	}
 	if (DeviceFault::BreadcrumbsOn()) {
 		DeviceFault::NotePipeline(pipeline.pipeline, fmt::format("{} cs {:016x}", native_bindings ? "cs-table" : "cs-normal",
 		                                                         input_info.stage.program->shader_hash));

@@ -14,6 +14,7 @@
 #include "local-platform.h"
 #include "parallel-pages.h"
 #include "spin-gate.h"
+#include "write-guard.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -32,11 +33,11 @@
 
 extern "C" {
 extern volatile std::atomic<uint32_t> kyty_local_async_upload_mode;
-// KYTY_UPLOAD_LANES (live 1..3, default 1; re-notes agent/tasks/20261103-UPLOAD-WORKERS-2.md): 2 = a run's write protections split by
+// KYTY_UPLOAD_LANES (live 1..3, default 1; PR #287): 2 = a run's write protections split by
 // guest region (4 MiB, the trackers' and the page manager's region: their per-region locks) over the worker and a second thread
 // (Kyty.Upload2), which sleeps on a futex between runs and never spins; the run's copies still start only after both lanes are done,
 // and one region's protections stay in queue order in its one lane. 3 = 2 with the order checks (upload_lane_mismatch must stay 0).
-// (A census at 1-1, usc 1103-1817: the waited batches' protections all single-region with no call among them, the lanes 45-57 / 43-55 %.)
+// (At 1-1 the waited batches' protections were all single-region with no call among them, the lanes 45-57 / 43-55 %.)
 extern volatile std::atomic<uint32_t> kyty_local_upload_lanes;
 // KYTY_UPLOAD_HELP (live kyty_local_upload_help): whether the render thread's Drain runs the jobs the upload worker is not
 // at itself (Worker::Help): 1 always (the Steam Deck build's default), 0 never, 2 (the default elsewhere) while the
@@ -58,7 +59,7 @@ namespace AsyncUpload {
 // True on the worker's thread (a fault there cannot wait for the render thread, which may wait for the worker).
 inline thread_local bool t_worker = false;
 
-// KYTY_SERVE_IN_WAITS (GuestGpu::ServeInWaits), set by the GPU thread. Asked only by a Wait that was told to serve
+// KYTY_SERVE_IN_WAITS bit 1 (GuestGpu::ServeInWaits), set by the GPU thread. Asked only by a Wait that was told to serve
 // (the drains before a guest memory write of the command processor and at the frame boundary; a submit's or an
 // unmap's drain never serves). With false: whether that Wait spins to the copies' end, running the guest commands
 // queued for the GPU thread meanwhile (a game thread's readback fault waits for its command there); with true: run
@@ -78,6 +79,8 @@ public:
 		m_head.fetch_add(0, std::memory_order_seq_cst);
 		m_head.notify_all();
 		m_thread.join();
+		// (The wake below reads as a post: no jobs in it. The worker is gone and the second thread idle.)
+		m_lane_jobs[1].clear();
 		m_lane_posted.fetch_add(1, std::memory_order_seq_cst);
 		m_lane_posted.notify_all();
 		if (m_lane_thread.joinable()) m_lane_thread.join();
@@ -209,6 +212,7 @@ private:
 	void Run() {
 		LocalPlatform::SetThreadName("Kyty.Upload");
 		t_worker = true;
+		WriteGuard::t_no_wait = true; // (KYTY_WRITE_GUARD: the lifts are this thread's jobs)
 		// Created by the render thread: do not inherit its dedicated CPU.
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
 		// Pause iterations the worker polls for new copies before it sleeps (while its CPUs idle: spin-gate.h).
@@ -286,7 +290,7 @@ private:
 
 	static void CallJob(const Job& job) { job.call(job.context, reinterpret_cast<uint64_t>(job.destination), job.size); }
 
-	// KYTY_UPLOAD_LANES: the jobs each lane needs at least for a run to be split: the second thread's wake-up (~3-4 us, protwait)
+	// KYTY_UPLOAD_LANES: the jobs each lane needs at least for a run to be split: the second thread's wake-up (~3-4 us)
 	// plus the waker's FUTEX_WAKE (~2-3 us) against ~3 us a protection; lane 1 runs late by the wake-up, so it needs more.
 	static constexpr size_t LaneMinJobs0 = 2;
 	static constexpr size_t LaneMinJobs1 = 4;

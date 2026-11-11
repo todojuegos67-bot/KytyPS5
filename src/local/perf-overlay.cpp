@@ -30,6 +30,9 @@
 #undef max
 #else
 #include <cpuid.h>
+#if defined(__linux__)
+#include <time.h>
+#endif
 #endif
 
 // The detailed panel's sampling (a diagnostic switch, poked live): 1 the GPU (NVML), 2 the cores' clocks (performance
@@ -378,15 +381,104 @@ void Run(std::array<uint8_t, 16> uuid, std::string gpu_name) {
 
 #else
 
+#if defined(__linux__)
+struct CpuTimes {
+	uint64_t total = 0, idle = 0;
+};
+
+std::vector<CpuTimes> ReadCpuTimes() {
+	std::vector<CpuTimes> result;
+	if (FILE* file = std::fopen("/proc/stat", "re")) {
+		char line[512];
+		while (std::fgets(line, sizeof(line), file)) {
+			if (std::strncmp(line, "cpu", 3) != 0 || line[3] < '0' || line[3] > '9') continue;
+			unsigned int id = 0;
+			unsigned long long user = 0, nice = 0, system = 0, idle = 0, wait = 0, irq = 0, softirq = 0, steal = 0;
+			if (std::sscanf(line, "cpu%u %llu %llu %llu %llu %llu %llu %llu %llu", &id, &user, &nice, &system,
+			                &idle, &wait, &irq, &softirq, &steal) < 5 || id >= 65536)
+				continue;
+			if (result.size() <= id) result.resize(id + 1);
+			// Guest times are already included in user/nice, so do not add them a second time.
+			result[id] = {user + nice + system + idle + wait + irq + softirq + steal, idle + wait};
+		}
+		std::fclose(file);
+	}
+	return result;
+}
+
+std::vector<uint32_t> ReadCpuClocks() {
+	std::vector<uint32_t> result;
+	if (FILE* file = std::fopen("/proc/cpuinfo", "re")) {
+		char line[512];
+		unsigned int id = 65536;
+		while (std::fgets(line, sizeof(line), file)) {
+			unsigned int processor = 0;
+			double mhz = 0;
+			if (std::sscanf(line, "processor : %u", &processor) == 1) {
+				id = processor;
+				if (id < 65536 && result.size() <= id) result.resize(id + 1, 0);
+			} else if (id < result.size() && std::sscanf(line, "cpu MHz : %lf", &mhz) == 1 && mhz > 0)
+				result[id] = static_cast<uint32_t>(mhz);
+		}
+		std::fclose(file);
+	}
+	return result;
+}
+#endif
+
 void Run(std::array<uint8_t, 16> /*uuid*/, std::string gpu_name) {
 	LocalPlatform::SetThreadName("Kyty.Overlay");
 	const std::string cpu_name = CpuName();
+#if defined(__linux__)
+	std::vector<CpuTimes> last;
+	double last_process = 0, last_render = 0;
+	int64_t last_ns = 0;
+#endif
 	for (;;) {
 		Machine machine;
 		machine.gpu_name        = gpu_name;
 		machine.cpu_name        = cpu_name;
 		machine.ram_total       = LocalPlatform::PhysicalMemory();
 		machine.process_memory  = LocalPlatform::ProcessMemory().working_set;
+#if defined(__linux__)
+		const auto parts = kyty_local_overlay_sampling.load(std::memory_order_relaxed);
+		const int64_t ns = NowNs();
+		if ((parts & 4u) != 0) {
+			machine.ram_used = machine.ram_total - std::min(machine.ram_total, LocalPlatform::AvailablePhysicalMemory());
+			auto now = ReadCpuTimes();
+			machine.core_load.resize(now.size(), 0);
+			machine.core_class.resize(now.size(), 0);
+			double busy_sum = 0, total_sum = 0;
+			for (size_t i = 0; i < now.size() && i < last.size(); ++i) {
+				if (last[i].total == 0 || now[i].total < last[i].total || now[i].idle < last[i].idle) continue;
+				const auto total = now[i].total - last[i].total;
+				const auto idle = std::min(total, now[i].idle - last[i].idle);
+				if (total != 0) machine.core_load[i] = static_cast<float>(static_cast<double>(total - idle) / total);
+				busy_sum += static_cast<double>(total - idle);
+				total_sum += static_cast<double>(total);
+			}
+			if (total_sum > 0) machine.cpu_load = static_cast<float>(busy_sum / total_sum);
+			last = std::move(now);
+			const double seconds = static_cast<double>(ns - last_ns) / 1e9;
+			timespec process_time {};
+			if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &process_time) == 0) {
+				const double process = static_cast<double>(process_time.tv_sec) + static_cast<double>(process_time.tv_nsec) / 1e9;
+				if (last_ns != 0 && seconds > 0 && process >= last_process)
+					machine.process_cores = static_cast<float>((process - last_process) / seconds);
+				last_process = process;
+			}
+			const double render = LocalPlatform::NamedThreadsCpuSeconds("Kyty.Gpu");
+			if (last_ns != 0 && last_render > 0 && seconds > 0 && render >= last_render)
+				machine.render_thread = static_cast<float>(std::clamp((render - last_render) / seconds, 0.0, 1.0));
+			last_render = render;
+			last_ns = ns;
+		} else {
+			last.clear();
+			last_ns = 0;
+			last_process = last_render = 0;
+		}
+		if ((parts & 2u) != 0) machine.core_clock = ReadCpuClocks();
+#endif
 		Publish(std::move(machine));
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
 	}

@@ -4,6 +4,7 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -15,6 +16,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "live-census.h"
+#include "write-guard.h"
 #include "live-counters.h"
 #include "speculation-state.h"
 
@@ -55,7 +57,13 @@
 	    [[maybe_unused]] uint32_t num_dw
 #define KYTY_CP_OP_PARSER(f) uint32_t f(KYTY_CP_OP_PARSER_ARGS)
 
+extern "C" {
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode; // KYTY_SPECULATE (graphics/guest_gpu/speculation.cpp)
+}
+
 namespace Libs::Graphics {
+
+static bool HwCtxIsFakeRegister(uint32_t cmd_offset); // (GuardTable, below)
 
 namespace {
 
@@ -82,6 +90,11 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 // read before its first download is all zeros (an "unknown register 0" crash at startup).
 // False when a speculative translation refused it (speculation-state.h): the packet applies nothing.
 [[nodiscard]] bool SyncCommandMemory(uint64_t address, uint64_t bytes, const char* what) {
+	// (A state pass syncs nothing off the GPU thread, and reads the table in a guarded copy, GuardTable: ~18% of the pass
+	// went here per table, the counters it shares with the GPU thread among it.)
+	// (KYTY_SPECULATE unset: a plain global, not the two thread-locals, on every indirect table.)
+	const bool speculating = ::kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
+	if (speculating && Spec::Record() != nullptr) return true;
 	LiveCounters::Add(LiveCounters::IndirectTables);
 	LiveCensus::Scope census(LiveCensus::CommandSync, 0, 0);
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(address, bytes)) {
@@ -92,8 +105,68 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 			     what, address, bytes);
 		}
 	}
+	if (!speculating) return true;
 	const auto* spec = Spec::Current();
 	return spec == nullptr || spec->refused == nullptr;
+}
+
+// Off the GPU thread (a speculation's translation or a state pass), an indirect register table read in one guarded
+// copy: the GPU thread may read-protect its pages after SyncCommandMemory looked (work it commits writes them), and a
+// fault there waits for the GPU thread, which may wait for this thread (the hang of 11-01 had that in a span read). A
+// fault refuses a speculation; a state pass applies nothing of the table (its chunks' start states then differ from
+// the GPU thread's, which the commit checks).
+//
+// The copy is also checked as a register table (`bank`: 0 context, 1 SH, 2 uconfig): an entry past its bank's registers
+// (not the sentinel, a context table's fake registers or the bank's NOP) is not one, and the table is not applied: the
+// speculation is refused, a state pass applies nothing of it (its start states then differ from the GPU thread's, which
+// the commit checks). The pass reads tables as they are (no command-memory sync off the GPU thread): one GPU work wrote
+// whose pages the GPU thread has not read-protected yet, or one the game has reused, may be other data. Such a table,
+// floats read as pairs, set DB_RENDER_CONTROL's copy-depth-to-color bit and ended a mode 4 run at the arch (11-01).
+// A state pass's register packet past its bank (a command buffer of other data): reported a few times.
+void ReportOtherData(uint32_t cmd_id, uint32_t offset) {
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+		std::printf("Speculation: a state pass skipped a register packet of other data (header 0x%08x, register 0x%08x)\n",
+		            cmd_id, offset);
+}
+
+[[nodiscard]] bool GuardTable(uint32_t*& table, uint32_t pairs, uint32_t bank) {
+	if (GuestGpu::IsGpuThread()) {
+		// (KYTY_WRITE_GUARD: a table on a page a pending guest write guards, through the backing view: the bytes this
+		// thread wrote, local/write-guard.h.)
+		if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u))
+			table = const_cast<uint32_t*>(static_cast<const uint32_t*>(backing));
+		return true;
+	}
+	thread_local std::vector<uint32_t> copy;
+	copy.resize(size_t {pairs} * 2u);
+	// (KYTY_WRITE_GUARD_SPEC: a table on a guarded page, through the backing view: the bytes the GPU thread wrote.)
+	if (const auto* backing = WriteGuard::GuardedBacking(reinterpret_cast<uint64_t>(table), uint64_t {pairs} * 8u)) {
+		std::memcpy(copy.data(), backing, uint64_t {pairs} * 8u);
+	} else if (Common::GuardedCopy(copy.data(), table, uint64_t {pairs} * 8u) != 0) {
+		if (Spec::Current() != nullptr) Spec::Refuse("GPU-written guest memory");
+		return false;
+	}
+	for (uint32_t i = 0; i < pairs; ++i) {
+		const uint32_t raw = copy[size_t {i} * 2u];
+		if (raw == 0xffffffffu) continue;
+		const uint32_t offset = NormalizeRegisterOffset(raw);
+		const bool     known  = bank == 0   ? offset < Pm4::CX_NUM || HwCtxIsFakeRegister(offset)
+		                        : bank == 1 ? offset < Pm4::SH_NUM || offset == Pm4::SH_NOP
+		                                    : offset < Pm4::UC_NUM || offset == Pm4::UC_NOP;
+		if (!known) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+				std::printf("Speculation: an indirect register table at 0x%016llx not applied off the GPU thread: entry %u of %u "
+				            "names register 0x%08x, past its bank (%s)\n",
+				            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(table)), i, pairs, raw,
+				            bank == 0 ? "context" : bank == 1 ? "sh" : "uconfig");
+			if (Spec::Current() != nullptr) Spec::Refuse("indirect register table of other data");
+			return false;
+		}
+	}
+	table = copy.data();
+	return true;
 }
 
 // An entry of an indirect register table the emulator cannot apply: report the table once in a
@@ -1413,12 +1486,15 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			cp.ReportLodStats(dst, buffer_size, (buffer[3] & ((1u << 19) | (1u << 18))) != 0);
 			return 4;
 		}
+		// (A guest memory write of the emulator's: logged for the speculations that read it, upstream #288 F4.)
+		Spec::NoteHostWrite(reinterpret_cast<uint64_t>(dst), buffer_size);
 		memset(dst, 0, buffer_size);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
+		if (Scout::Running()) Scout::NoteHostWrite(reinterpret_cast<uint64_t>(dst), buffer_size); // (KYTY_SCOUT: every emulator write)
 	}
 
 	return 4;
@@ -2031,14 +2107,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
-// KYTY_PM4_REGFILE (live 0..2, default 0; re-notes agent/tasks/20261103-PM4-REGFILE.md; the studio's census and plan,
-// docs/kyty-facts/PM4-REGFILE-PLAN.md): the indirect register tables (SET_*_REG_INDIRECT, ~252,100 values a frame at 1-1)
+// KYTY_PM4_REGFILE (live 0..2, default 0; PR #285: faster on a Ryzen 5 7600, flat on an i9-14900K, slower on a Ryzen 7
+// 9700X): the indirect register tables (SET_*_REG_INDIRECT, ~252,100 values a frame at 1-1)
 // call a handler per value; 70 % of the values go to handlers that store the value into one context field (raw) or do
 // nothing (ign). The register file is the HW context already (no dirty bits), so 1 replaces those calls by the store
 // itself (or nothing), through a per-offset descriptor; the other handlers (dec, rmw, side, sgpr) are still called.
 // 2 = verify: the calls run, and each raw value's field must hold the value after its call (pm4_regfile_mismatch: 0).
-// Which handler is which is proved, not trusted: the candidates are the studio's ign / raw classes (its classifier,
-// pm4-regfile-classifier-20261103), and at the first packet with the switch on each candidate's own handler runs on the
+// Which handler is which is proved, not trusted: the candidates are the ign / raw lists below, and at the first packet
+// with the switch on each candidate's own handler runs on the
 // command processor's contexts from four base states (the live one, all zeros, all ones, a non-uniform fill) with two
 // complementary values: a raw one must change exactly the one aligned dword it
 // stores, to the value, in every run, an ign one nothing, and neither any byte of the command processor outside the
@@ -2065,7 +2141,7 @@ bool g_ready = false; // (the GPU thread's: the descriptors are built once, at t
 static_assert(std::is_trivially_copyable_v<HW::Context> && std::is_trivially_copyable_v<HW::Shader> &&
               std::is_trivially_copyable_v<HW::UserConfig>);
 
-// The candidates: the studio's classifier's ign and raw rows (the rest stays a call whatever the probe says).
+// The candidates: the handlers read as ign or raw (the rest stays a call whatever the probe says).
 void MarkCandidates() {
 	auto set = [](Desc* table, uint32_t size, uint32_t first, uint32_t last, uint32_t step, uint8_t kind) {
 		for (uint32_t off = first; off <= last && off < size; off += step) table[off].kind = kind;
@@ -2110,7 +2186,7 @@ void MarkCandidates() {
 	sh(Ign, {Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS, Pm4::SPI_SHADER_PACE_ID_GS,
 	         Pm4::SPI_SHADER_PGM_RSRC4_GS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS, Pm4::SPI_SHADER_PGM_CHKSUM_HS,
 	         Pm4::SPI_SHADER_PGM_RSRC4_HS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS});
-	// (Not empty here, unlike the classifier's table: SetHsUserDataAddress merges one 32-bit half of the 64-bit address, one
+	// (SetHsUserDataAddress merges one 32-bit half of the 64-bit address, one
 	// dword: a raw candidate, which the proof accepts or keeps as a call.)
 	sh(Raw, {Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS, Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS});
 	uc(Raw, {Pm4::VGT_OBJECT_ID, Pm4::GE_INDX_OFFSET, Pm4::GE_MULTI_PRIM_IB_RESET_EN});
@@ -2281,6 +2357,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 0)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2360,6 +2437,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 1)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2416,6 +2494,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs"))
 		return KYTY_PM4_LEN(cmd_id) - 1u;
+	if (!GuardTable(indirect_buffer, indirect_num_dw, 2)) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2602,6 +2681,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	if (data_sel == 0 || interrupt_selector == 4) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
+			LiveCounters::Add(LiveCounters::GuestBarrierRelease);
 			cp.EmitGlobalBarrier();
 		}
 
@@ -2612,6 +2692,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
+			LiveCounters::Add(LiveCounters::GuestBarrierRelease);
 			cp.EmitGlobalBarrier();
 		}
 
@@ -2621,6 +2702,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	}
 
 	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
+		LiveCounters::Add(LiveCounters::GuestBarrierRelease);
 		cp.EmitGlobalBarrier();
 	}
 
@@ -2693,6 +2775,11 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 	}
 
 	if (cmd_offset >= Pm4::CX_NUM) {
+		if (!GuestGpu::IsGpuThread()) { // (as CpOpSetShaderReg's)
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("unknown extended context register\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
 		     "\n\tcmd_offset = %08" PRIx32 "\n\tvalue = %08" PRIx32 "\n",
 		     num_dw - dw, cmd_id, cmd_offset, buffer[1]);
@@ -2737,7 +2824,17 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		return 2;
 	}
 
-	EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+	if (cmd_offset >= Pm4::SH_NUM) {
+		// (Off the GPU thread, a register packet past its bank is a command buffer of other data, one the game reused or GPU
+		// work wrote: the speculation is refused, a state pass skips it; its chunks' start states then differ, which the
+		// commit checks. A mode 4 run ended here during the arch's load, 11-01.)
+		if (!GuestGpu::IsGpuThread()) {
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
+		EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+	}
 
 	auto pfunc = g_hw_sh_func[cmd_offset];
 
@@ -2790,6 +2887,11 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	if (cmd_offset >= Pm4::UC_NUM) {
+		if (!GuestGpu::IsGpuThread()) { // (as CpOpSetShaderReg's)
+			if (Spec::Current() != nullptr) Spec::Refuse("register packet of other data");
+			else ReportOtherData(cmd_id, buffer[0]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("unsupported UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 		     "), cmd_id = 0x%08" PRIx32 "\n",
 		     cmd_offset, raw_cmd_offset, cmd_id);

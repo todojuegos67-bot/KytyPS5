@@ -551,19 +551,6 @@ bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeS
 	times.modtime = s.st_mtime;
 
 	return !(0 != utime(real_name_str.c_str(), &times));
-
-	//	if (0 != stat(n.data(), &s))
-	//	{
-	//		return false;
-	//	}
-	//
-	//	times.actime += times.actime - s.st_atime;
-	//	times.modtime += times.modtime - s.st_mtime;
-	//
-	//	if (0 != utime(n.data(), &times))
-	//	{
-	//		return false;
-	//	}
 }
 
 bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& write) {
@@ -585,19 +572,6 @@ bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeSt
 	times.modtime = write.time;
 
 	return !(0 != utime(real_name_str.c_str(), &times));
-
-	//	if (0 != stat(n.data(), &s))
-	//	{
-	//		return false;
-	//	}
-	//
-	//	times.actime += times.actime - s.st_atime;
-	//	times.modtime += times.modtime - s.st_mtime;
-	//
-	//	if (0 != utime(n.data(), &times))
-	//	{
-	//		return false;
-	//	}
 }
 
 bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
@@ -620,19 +594,6 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 	times.modtime = write.time;
 
 	return !(0 != utime(real_name_str.c_str(), &times));
-
-	//	if (0 != stat(n.data(), &s))
-	//	{
-	//		return false;
-	//	}
-	//
-	//	times.actime += times.actime - s.st_atime;
-	//	times.modtime += times.modtime - s.st_mtime;
-	//
-	//	if (0 != utime(n.data(), &times))
-	//	{
-	//		return false;
-	//	}
 }
 
 // Recursively collect regular files.

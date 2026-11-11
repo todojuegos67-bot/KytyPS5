@@ -24,8 +24,10 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
    - Pipeline state: each material pass's render target/blend/depth-stencil state table
      (`pass-states.json`, the "engine render pass configurations" `learn-states` learned from recorded
      caches), each state with culling on and off.
-2. `precompile-windows.ps1` (repository root): the standalone program `kyty_shader_precompile` (no game,
-   no window; build it with `build-windows.cmd kyty_shader_precompile`) translates every seed into
+2. `precompile-windows.ps1` (repository root; on Linux `precompile-linux.sh`, the same run with `--jobs`,
+   `--quick`, `--coverage` ... for `-Jobs`, `-Quick`, `-Coverage` ...): the standalone program `kyty_shader_precompile`
+   (no game, no window; build it with `build-windows.cmd kyty_shader_precompile` or
+   `./build-linux.sh kyty_shader_precompile`) translates every seed into
    SPIR-V (portable specialization, see below), creates every pipeline and writes the **static pipeline
    cache** `_PipelineCache/static/PPSA01341_<version>.bin` (one per game version). It runs step 1 first when the seed file is missing.
    - The static cache is keyed by the GPU/driver signature only and survives emulator rebuilds; the
@@ -70,7 +72,7 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
 
    Recording tours (`demons-souls-save.py set-map` spawn points, every world) make the recordings.
 
-## Portable specialization (recompiler, `KYTY_PORTABLE_SHADERS`, on by default)
+## Portable specialization (recompiler)
 
 Information that is not in the shader binary but only in runtime descriptors used to be baked into the
 SPIR-V, which a static pass cannot predict:

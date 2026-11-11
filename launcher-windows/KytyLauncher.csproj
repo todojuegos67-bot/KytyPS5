@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Windows launcher (KytyLauncher.exe): a settings window in front of run-windows.ps1 and precompile-windows.ps1.
+     .NET Framework 4.7.2 (part of Windows 10 since 1803 and of Windows 11), WPF. build.cmd builds it with Visual Studio's MSBuild. -->
+<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{6B7E3E0A-2C4D-4F7B-9E1A-5A3C8D2F1B47}</ProjectGuid>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>KytyLauncher</RootNamespace>
+    <AssemblyName>KytyLauncher</AssemblyName>
+    <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <ProjectTypeGuids>{60dc8134-eba5-43b8-bcc9-bb4bc16c2548};{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}</ProjectTypeGuids>
+    <WarningLevel>4</WarningLevel>
+    <LangVersion>7.3</LangVersion>
+    <Prefer32Bit>false</Prefer32Bit>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>launcher.ico</ApplicationIcon>
+    <DebugType>none</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath Condition=" '$(OutputPath)' == '' ">..\_Build\launcher\</OutputPath>
+    <IntermediateOutputPath>..\_Build\launcher-obj\</IntermediateOutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Management" />
+    <Reference Include="System.Xaml" />
+    <Reference Include="System.Xml" />
+    <Reference Include="System.Web.Extensions" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="WindowsBase" />
+    <Reference Include="PresentationCore" />
+    <Reference Include="PresentationFramework" />
+  </ItemGroup>
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </ApplicationDefinition>
+    <Page Include="Theme.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="MainWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="CheatsWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Compile Include="App.xaml.cs">
+      <DependentUpon>App.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="MainWindow.xaml.cs">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="CheatsWindow.xaml.cs">
+      <DependentUpon>CheatsWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Settings.cs" />
+    <Compile Include="KeyboardPrompts.cs" />
+    <Compile Include="KeyboardLayout.cs" />
+    <Compile Include="PromptTexture.cs" />
+    <Compile Include="KeyboardControlsWindow.cs" />
+    <EmbeddedResource Include="KeyboardPrompts\*">
+      <WithCulture>false</WithCulture>
+      <LogicalName>KytyLauncher.KeyboardPrompts.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <Compile Include="Platform.cs" />
+    <Compile Include="Game.cs" />
+    <Compile Include="Commands.cs" />
+    <Compile Include="Strings.cs" />
+    <Compile Include="FolderPicker.cs" />
+    <Compile Include="AssemblyInfo.cs" />
+    <None Include="app.manifest" />
+    <Resource Include="launcher.ico" />
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

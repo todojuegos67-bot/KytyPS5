@@ -41,6 +41,8 @@ public:
 		return m_page_manager.WatchedSpan(vaddr, size, first, end);
 	}
 	void SyncProtection(uint64_t vaddr, uint64_t size) { m_page_manager.SyncProtection(vaddr, size); }
+	// KYTY_READ_GUARD: the page's trackers' protection after its read guard's fault was served (PageManager).
+	void SettleProtection(uint64_t vaddr) { m_page_manager.SettleProtection(vaddr); }
 	// (PageManager::WatchedRuns: for a holder of the guest address-space lock.)
 	void WatchedRuns(uint64_t vaddr, uint64_t size, std::vector<PageManager::WatchedRun>* runs) const {
 		m_page_manager.WatchedRuns(vaddr, size, runs);
@@ -59,6 +61,11 @@ public:
 	// `releasing`: the caller unmaps or decommits the range right after (munmap, free,
 	// memory pool decommit), not a range about to receive a mapping.
 	void               UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing = false);
+	// The game freed the range and keeps it mapped (LibKernel::Memory::NoteGameFree): queued for the GPU thread, whose
+	// commands run before any later submission (and between the packets of the one under way), without waiting. The
+	// buffers it holds go as for an unmap (BufferCache::DropFreedRange). KYTY_ENGINE_FREE_BUFFERS=0: nothing; =2: their
+	// GPU-written bytes dropped instead of read back first.
+	void               FreedByGame(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void BeginAliasWrite() noexcept;
 	void EndAliasWrite() noexcept;

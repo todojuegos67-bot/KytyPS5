@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace Libs::Graphics::AntiLag {
 
@@ -94,6 +95,25 @@ void               OnFrameSubmitted(VkDevice device, VkSemaphore timeline, uint6
 [[nodiscard]] bool LatencyOn();
 void               OnPresented(uint64_t frame_index);
 
+} // namespace Libs::Graphics::AntiLag
+
+// (des-up-1110) Upstream's KYTY_LOW_LATENCY Anti-Lag (PR on Mesa's layer) covers the same ground as our KYTY_ANTILAG /
+// KYTY_LOWLAT above: ours is kept, and upstream's entry points stay as no-ops so its call sites compile unchanged.
+namespace Libs::Graphics::AntiLag {
+inline void BeforeInstance() {}
+inline void AddDeviceExtension(const std::vector<vk::ExtensionProperties>& /*available*/,
+                               std::vector<const char*>& /*extensions*/) {}
+inline void ChainFeature(vk::PhysicalDevice /*physical_device*/, const std::vector<const char*>& /*extensions*/,
+                         vk::DeviceCreateInfo& /*create_info*/, VkPhysicalDeviceAntiLagFeaturesAMD& /*storage*/) {}
+inline void OnDevice(vk::Device /*device*/) {}
+[[nodiscard]] inline bool Enabled() { return false; }
+inline void Input() {}
+[[nodiscard]] inline uint64_t Flip() { return 0; }
+inline void Present(uint64_t /*frame*/) {}
+[[nodiscard]] inline VkResult QueueSubmit(VkQueue queue, const VkSubmitInfo& info, PFN_vkQueueSubmit submit,
+                                          PFN_vkQueueSubmit2 /*submit2*/) {
+	return submit(queue, 1, &info, VK_NULL_HANDLE);
+}
 } // namespace Libs::Graphics::AntiLag
 
 #endif
