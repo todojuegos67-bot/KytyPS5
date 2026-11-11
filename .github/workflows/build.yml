@@ -475,7 +475,7 @@ jobs:
       ((github.event_name == 'push' &&
         (github.repository == 'KytyPS5/KytyPS5' ||
          (github.repository == 'Senaxx/KytyPS5' && github.ref == 'refs/heads/wolverine'))) ||
-       (github.repository == 'todojuegos67-bot/kytyps5' && github.ref == 'refs/heads/gt7-launcher-1111' &&
+       (github.repository == 'todojuegos67-bot/kytyps5' && startsWith(github.ref, 'refs/heads/gt7-') &&
         github.event_name == 'workflow_dispatch') ||
        (github.repository == 'usa-ratt/KytyPS5-GT7' && github.ref == 'refs/heads/gt7-eqaa' &&
         (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))) &&
