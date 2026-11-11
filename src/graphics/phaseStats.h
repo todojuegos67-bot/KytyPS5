@@ -66,8 +66,19 @@ inline const char* const kNames[Count] = {"gpu.idle",       "gpu.cmd",       "gp
                                           "prog.materialize", "prog.find", "prog.recompile",
                                           "memo.hit", "memo.miss"};
 
-inline std::atomic<uint64_t> g_us[Count] {};
-inline std::atomic<uint64_t> g_calls[Count] {};
+// wolv-perf-1111c: one cache line per phase. The counters sat in two packed arrays updated by
+// Thread_Gpu (draw.*, prog.*, ~15 scopes a draw) and by every faulting guest thread at once, so the
+// diagnostic itself bounced cache lines on the hot path.
+struct alignas(64) PaddedCounter {
+	std::atomic<uint64_t> value {0};
+	uint64_t fetch_add(uint64_t v, std::memory_order order) noexcept { return value.fetch_add(v, order); }
+	uint64_t exchange(uint64_t v, std::memory_order order = std::memory_order_seq_cst) noexcept {
+		return value.exchange(v, order);
+	}
+	uint64_t load(std::memory_order order = std::memory_order_seq_cst) const noexcept { return value.load(order); }
+};
+inline PaddedCounter g_us[Count] {};
+inline PaddedCounter g_calls[Count] {};
 inline thread_local int      t_role = 0; // 0 other guest/host thread, 1 Thread_Gpu, 2 guest render thread
 
 inline bool Enabled() {

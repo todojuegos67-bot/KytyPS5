@@ -150,3 +150,9 @@
 - Same windows: [traps] 0.3-2.6 million emulated VRSQRTPS per 5 s (--amd-cpu), host exceptions on guest threads.
 - KYTY_ASYNC_PS=1 (live, new default; 0 = old; 2 = also skip depth/stencil writers): new pixel programs are translated on KYTY_ASYNC_PS_THREADS (3) workers; draws that write no depth/stencil are skipped meanwhile, others wait for (or run inline) the job. SPIR-V emission and module creation stay on Thread_Gpu. Log: "Async PS translate (5 s, ...)"; compare "prog.recompile" in "Phases".
 - KYTY_NATIVE_RSQRT now defaults to 1 (0 = trap as before). Log: "Native VRSQRTPS (KYTY_NATIVE_RSQRT): ..., N inline, M still trapped" at load; compare the [traps] line.
+
+## 2026-11-11 — e74eed96 tested: same fps (log 20261111-063045); three Thread_Gpu cuts (not measured yet)
+- KYTY_ASYNC_PS and inline VRSQRTPS worked (prog.recompile 0-25 ms in many windows; 809 inline, 10 trapped) but fps stayed 6.5-10.1, also in windows with 0 new shaders. Thread_Gpu stays the limit (idle 2.9 %): draw.total 25 us x 106K draws, dispatch.total 1078 ms / 125K, prog.materialize 1407 ms, memo.miss 1165 ms (48.6 % hits), draw.commit 725 ms, eager write-back 346 ms on Thread_Gpu. KYTY_READBACK_STATS=1 and KYTY_PHASE_STATS=1 were on in live.txt (diagnostic overhead included).
+- KYTY_STATE_CACHE default 0 -> 1 (live; 0 = old): unchanged dynamic state and pipeline binds are not recorded again.
+- KYTY_MEMO_BYPASS=1 (live, new; 0 = old): a program with 0 memo hits in its last 256 lookups evaluates its resource plan directly for 2048 lookups (no key hash/slot scan/read log/slot copy). Log: "Resource memo bypass (5 s, ...)"; compare memo.miss us/call.
+- Phase counters padded to one cache line each (diagnostic cost only).

@@ -723,6 +723,10 @@ struct PipelineCache::ProgramCache {
 		uint64_t                                     base_changes = 0, workgroup_changes = 0;
 		uint64_t                                     last_missed_base = 0;
 		std::array<uint32_t, 3>                      last_missed_groups {};
+		// KYTY_MEMO_BYPASS: lookups and hits in the current 256-lookup window, and how many
+		// lookups still go straight to MaterializeResources.
+		uint32_t                                     bypass_window = 0, bypass_window_hits = 0;
+		uint32_t                                     bypass_left   = 0;
 	};
 	SourceEntry* memo_worst = nullptr;
 
@@ -771,7 +775,7 @@ struct PipelineCache::ProgramCache {
 		h ^= XXH3_64bits(runtime.workgroup_size.data(), sizeof(runtime.workgroup_size)) * 131u;
 		return h;
 	}
-	uint64_t memo_miss_inputs = 0, memo_miss_reads = 0;
+	uint64_t memo_miss_inputs = 0, memo_miss_reads = 0, memo_bypassed = 0, memo_bypass_starts = 0;
 
 	// Materialization reads guest memory only through the runtime's two readers, so the same
 	// user data and shader base, with every logged read returning the same result and words,
@@ -784,6 +788,28 @@ struct PipelineCache::ProgramCache {
 			    entry.resource_plan, runtime, entry.resources, entry.specialization);
 		}
 		memo_clock++;
+		// KYTY_MEMO_BYPASS (live, default 1; 0 = old): a program whose last 256 lookups all missed
+		// (log 11-11 06:30: 0xc8202066634a4c62, 21K new-input misses per 5 s, 128 slots full, a
+		// pointer word new on every draw) evaluates its plan directly for its next 2048 lookups:
+		// no key hash, slot scan, read log or snapshot copy into a slot. Same result as a miss.
+		static auto& bypass_switch = Common::LiveSwitches::Get("KYTY_MEMO_BYPASS", 1);
+		const bool   bypass_on     = bypass_switch.load(std::memory_order_relaxed) != 0;
+		if (bypass_on && entry.bypass_left != 0) {
+			entry.bypass_left--;
+			memo_bypassed++;
+			PhaseStats::Scope miss_phase {PhaseStats::PhMemoMiss};
+			const bool ok = ShaderRecompiler::IR::MaterializeResources(
+			    entry.resource_plan, runtime, entry.resources, entry.specialization);
+			ReportMemo();
+			return ok;
+		}
+		if (++entry.bypass_window >= 256u) {
+			if (bypass_on && entry.bypass_window_hits == 0) {
+				entry.bypass_left = 2048;
+				memo_bypass_starts++;
+			}
+			entry.bypass_window = entry.bypass_window_hits = 0;
+		}
 		// KYTY_MEMO_USED_KEY (live, default 1): the key holds only the user-data words the plan
 		// reads; the others (per-object constants and addresses the walk never follows) are
 		// zeroed, so objects drawn with the same descriptor tables share a slot.
@@ -823,6 +849,7 @@ struct PipelineCache::ProgramCache {
 				entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 				slot.last_use = memo_clock;
 				memo_hits++;
+				entry.bypass_window_hits++;
 				ReportMemo();
 				return true;
 			}
@@ -912,6 +939,11 @@ struct PipelineCache::ProgramCache {
 		         " hits, %" PRIu64 " misses\n",
 		         memo_hits, memo_misses, total != 0 ? 100.0 * memo_hits / total : 0.0, memo_miss_inputs,
 		         memo_miss_reads, MemoSlots(), lookup_hits, lookup_misses);
+		::printf("Resource memo bypass (5 s, KYTY_MEMO_BYPASS=%lld): %" PRIu64 " lookups evaluated directly, %" PRIu64
+		         " programs entered bypass\n",
+		         static_cast<long long>(Common::LiveSwitches::Get("KYTY_MEMO_BYPASS", 1).load()), memo_bypassed,
+		         memo_bypass_starts);
+		memo_bypassed = memo_bypass_starts = 0;
 		::printf("Resource memo key (5 s): KYTY_MEMO_USED_KEY=%lld, %.1f%% of user-data words left out of the key\n",
 		         static_cast<long long>(Common::LiveSwitches::Get("KYTY_MEMO_USED_KEY", 1).load()),
 		         memo_total_words != 0 ? 100.0 * static_cast<double>(memo_masked_words) / memo_total_words : 0.0);

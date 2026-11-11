@@ -365,7 +365,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	}
 	// KYTY_STATE_CACHE: record only the dynamic state that differs from what this command buffer
 	// already holds (see CommandBuffer::DynamicState).
-	static auto& state_cache = Common::LiveSwitches::Get("KYTY_STATE_CACHE", 0);
+	// wolv-perf-1111c: default 1 (was 0; KYTY_STATE_CACHE=0 restores it). Log 11-11 06:30: draw.commit
+	// 7.1 us x ~2100 draws a frame; every draw recorded ~14 dynamic states and its pipeline again.
+	static auto& state_cache = Common::LiveSwitches::Get("KYTY_STATE_CACHE", 1);
 	auto&        cached      = buffer.GetDynamicState();
 	const bool   use_cache   = state_cache.load(std::memory_order_relaxed) != 0;
 	const bool   known       = use_cache && cached.valid;

@@ -1300,7 +1300,7 @@ static void NoteFrameStats() {
 		static auto& sw_memo   = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO", 1);
 		static auto& sw_lookup = Common::LiveSwitches::Get("KYTY_LOOKUP_CACHE", 1);
 		static auto& sw_rt     = Common::LiveSwitches::Get("KYTY_RT_CACHE", 1);
-		static auto& sw_state  = Common::LiveSwitches::Get("KYTY_STATE_CACHE", 0);
+		static auto& sw_state  = Common::LiveSwitches::Get("KYTY_STATE_CACHE", 1);
 		static auto& sw_eager  = Common::LiveSwitches::Get("KYTY_EAGER_WRITEBACK", 0);
 		static auto& sw_defer  = Common::LiveSwitches::Get("KYTY_DEFER_DEPTH_DRAWS", 0);
 		static auto& sw_used   = Common::LiveSwitches::Get("KYTY_MEMO_USED_KEY", 1);
