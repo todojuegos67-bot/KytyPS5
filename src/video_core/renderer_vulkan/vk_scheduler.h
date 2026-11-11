@@ -378,6 +378,14 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    /// bb-velocity: true inside a rendering scope.
+    bool IsRendering() const noexcept {
+        return is_rendering;
+    }
+    /// bb-velocity: called right after a rendering scope ends (the velocity buffer's deferred
+    /// snapshot copies go there, so no render pass is ever cut for them).
+    static inline void (*bb_end_rendering_hook)(vk::CommandBuffer) = nullptr;
+
     /// Starts a new session.
     void BeginSession();
 

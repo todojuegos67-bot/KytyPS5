@@ -140,11 +140,17 @@ struct State {
     std::unordered_map<u64, SnapBuf> vel_addr_cur, vel_addr_prev, vel_id_cur, vel_id_prev;
     std::unordered_map<u64, u32> cam_ord; // camera block (address, size) -> ordinal this frame
     std::unordered_map<u64, u64> role_cache; // vs hash -> read-only V# handles
+    std::unordered_map<u64, bool> cam_checked; // camera block -> matched by order, similar
+    std::unordered_map<u64, BB::NativeMv::DrawId> pal_ids; // palette address -> game identity
+    u64 vs_cam_rejected = 0, vs_cam_unchecked = 0;
+    std::unordered_map<u32, std::array<float, 216>> cam_cpu_cur, cam_cpu_prev; // by order
     u64 vs_frames = 0, vs_draws = 0, vs_native = 0, vs_static = 0, vs_skinned = 0,
         vs_skinned_ring = 0, vs_skinned_addr = 0, vs_no_cam = 0, vs_no_pal = 0, vs_blend = 0,
         vs_gpu_copies = 0, vs_bytes = 0, vs_cam_addr = 0, vs_cam_ord = 0, vs_ring_seen = 0;
     double vs_cpu_ns = 0;
 } g;
+
+void FlushVelocityCopies(vk::CommandBuffer cmd); // bb-velocity (below)
 
 // Statistics / check frame: 1 in 60, or 1 in 30 below 75 fps (at least one a second at 30 fps).
 u64 g_stat_period = kStatPeriod;
@@ -449,7 +455,10 @@ bool Init(const Vulkan::Instance& instance) {
     g.occ.reserve(8192);
     g.dedupe.reserve(8192);
     g.velocity = !EnvOff("BB_VELOCITY");
-    if (g.velocity) g.additive = false; // absolute vectors: the previous camera is in the VS
+    if (g.velocity) {
+        g.additive = false; // absolute vectors: the previous camera is in the VS
+        Vulkan::Scheduler::bb_end_rendering_hook = &FlushVelocityCopies;
+    }
     g.ready = true;
     Log(g.velocity ? "[velocity] on (bb-clean-velocity): every opaque G-buffer draw writes its own "
                      "velocity in its vertex shader (previous 864 B camera block, previous skin "
@@ -619,11 +628,43 @@ VelRole IdentifyVelocityBuffer(u32 size) {
     return VelRole::Current;
 }
 
-// This frame's copy of a guest buffer (once per address, size and frame). Buffers the GPU wrote
-// (the skin rings' palettes and the camera blocks are uploaded by the command processor: the 393
-// log skipped ~28 a frame as "GPU-written") are copied on the GPU from the buffer cache.
-bool VelSnap(Core::MemoryManager* memory, VideoCore::BufferCache& buffer_cache,
-             Vulkan::Scheduler& scheduler, u64 addr, u32 size, SnapBuf& out) {
+// This frame's copy of a guest buffer (once per address, size and frame), always made by the GPU
+// from the buffer cache (the skin rings' palettes and the camera blocks are written by the
+// command processor: guest memory is stale for them). The copies are deferred to the end of the
+// current rendering scope (Scheduler::bb_end_rendering_hook): no render pass is cut for them, so
+// no attachment is loaded or cleared again. The data is read by the next frame only.
+struct PendingCopy {
+    vk::Buffer src;
+    u64 src_off, dst_off, size;
+};
+std::vector<PendingCopy> g_pending;
+
+void FlushVelocityCopies(vk::CommandBuffer cmd) {
+    if (g_pending.empty()) return;
+    const vk::MemoryBarrier2 before{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+    for (const auto& c : g_pending) {
+        cmd.copyBuffer(c.src, g.buf, vk::BufferCopy{c.src_off, c.dst_off, c.size});
+    }
+    const vk::MemoryBarrier2 after{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eVertexShader |
+                        vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+    g.vs_gpu_copies += g_pending.size();
+    g_pending.clear();
+}
+
+bool VelSnap(VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler, u64 addr,
+             u32 size, SnapBuf& out) {
     const u64 key = Mix(addr, size);
     if (const auto it = g.vel_addr_cur.find(key); it != g.vel_addr_cur.end()) {
         out = it->second;
@@ -634,45 +675,43 @@ bool VelSnap(Core::MemoryManager* memory, VideoCore::BufferCache& buffer_cache,
     const u64 off = SlotArenaOffset(g.slot) + g.arena_used;
     if (g.arena_used + bytes > kArenaBytes) {
         ++g.sec_overflow;
-    } else if (buffer_cache.IsRegionGpuModified(addr, size)) {
-        const auto [buffer, buffer_off] = buffer_cache.ObtainBuffer(addr, size);
-        if (buffer != nullptr) {
-            scheduler.EndRendering();
-            const auto cmd = scheduler.CommandBuffer();
-            const vk::MemoryBarrier2 before{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-            };
-            cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
-                                                    .pMemoryBarriers = &before});
-            cmd.copyBuffer(buffer->Handle(), g.buf, vk::BufferCopy{buffer_off, off, size});
-            const vk::MemoryBarrier2 after{
-                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eVertexShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-            };
-            cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
-                                                    .pMemoryBarriers = &after});
-            sb.addr = g.base_addr + off;
-            sb.dwords = size / 4;
-            sb.bytes = size;
-            g.arena_used += bytes;
-            ++g.vs_gpu_copies;
-        }
-    } else if (memory->IsValidMapping(addr, size)) {
-        std::memcpy(g.mapped + off, reinterpret_cast<const void*>(addr), size);
+    } else if (const auto [buffer, buffer_off] = buffer_cache.ObtainBuffer(addr, size);
+               buffer != nullptr) {
+        g_pending.push_back({buffer->Handle(), buffer_off, off, size});
         sb.addr = g.base_addr + off;
         sb.dwords = size / 4;
         sb.bytes = size;
         g.arena_used += bytes;
         g.vs_bytes += size;
+        if (!scheduler.IsRendering()) {
+            FlushVelocityCopies(scheduler.CommandBuffer());
+        }
     }
     g.vel_addr_cur[key] = sb;
     out = sb;
     return sb.addr != 0;
+}
+
+// Camera blocks matched by their order in the frame (not by address): accepted only when the
+// block still looks like last frame's block of that order (most of its 216 floats within 5 %).
+// Both sides are CPU copies of guest memory (864 B, once per block and frame; the GPU snapshot
+// may still be in flight). A GPU-written block (guest memory stale) cannot be checked: no vector.
+bool CameraCpuCopy(Core::MemoryManager* memory, VideoCore::BufferCache& buffer_cache, u64 addr,
+                   std::array<float, 216>& out) {
+    if (buffer_cache.IsRegionGpuModified(addr, 864) || !memory->IsValidMapping(addr, 864)) {
+        return false;
+    }
+    std::memcpy(out.data(), reinterpret_cast<const void*>(addr), 864);
+    return true;
+}
+
+bool CameraSimilar(const std::array<float, 216>& a, const std::array<float, 216>& b) {
+    u32 close = 0;
+    for (u32 i = 0; i < 216; ++i) {
+        const float d = std::fabs(a[i] - b[i]);
+        if (a[i] == b[i] || d <= 0.05f * std::max(1.0f, std::fabs(a[i]))) ++close;
+    }
+    return close >= 216 * 3 / 4;
 }
 
 void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
@@ -708,7 +747,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         const VelRole role = IdentifyVelocityBuffer(size);
         if (role == VelRole::Current || addr == 0) continue;
         SnapBuf cur{0, 0, 0, 0};
-        const bool have_cur = VelSnap(memory, buffer_cache, scheduler, addr, size, cur);
+        const bool have_cur = VelSnap(buffer_cache, scheduler, addr, size, cur);
         const u64 akey = Mix(addr, size);
         const SnapBuf* found = nullptr;
         if (role == VelRole::Camera) {
@@ -721,6 +760,8 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 ord = static_cast<u32>(g.cam_ord.size());
                 g.cam_ord[akey] = ord;
                 if (have_cur) g.vel_id_cur[Mix(0x63616d65ull, ord)] = cur;
+                std::array<float, 216> c;
+                if (CameraCpuCopy(memory, buffer_cache, addr, c)) g.cam_cpu_cur[ord] = c;
             }
             if (const auto it = g.vel_addr_prev.find(akey);
                 it != g.vel_addr_prev.end() && it->second.addr != 0) {
@@ -728,8 +769,23 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 ++g.vs_cam_addr;
             } else if (const auto it2 = g.vel_id_prev.find(Mix(0x63616d65ull, ord));
                        it2 != g.vel_id_prev.end() && it2->second.addr != 0) {
-                found = &it2->second;
-                ++g.vs_cam_ord;
+                // Per address and frame: the similarity check runs once per camera block.
+                const auto chk = g.cam_checked.try_emplace(akey, false);
+                if (chk.second) {
+                    const auto c = g.cam_cpu_cur.find(ord);
+                    const auto p = g.cam_cpu_prev.find(ord);
+                    if (c == g.cam_cpu_cur.end() || p == g.cam_cpu_prev.end()) {
+                        ++g.vs_cam_unchecked;
+                    } else {
+                        chk.first->second = CameraSimilar(c->second, p->second);
+                    }
+                }
+                if (chk.first->second) {
+                    found = &it2->second;
+                    ++g.vs_cam_ord;
+                } else {
+                    ++g.vs_cam_rejected;
+                }
             }
             if (found == nullptr) {
                 ++g.vs_no_cam;
@@ -739,7 +795,12 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             camera = true;
         } else {
             skinned = true;
-            const auto id = BB::NativeMv::LookupPalette(addr);
+            // Game identity of the palette, once per address and frame (no lock per draw).
+            const auto pid = g.pal_ids.find(addr);
+            const auto id = pid != g.pal_ids.end()
+                                ? pid->second
+                                : g.pal_ids.emplace(addr, BB::NativeMv::LookupPalette(addr))
+                                      .first->second;
             if (id.key != 0) {
                 ++g.vs_ring_seen;
                 const u64 ikey = Mix(Mix(id.key, id.slot_offset), size);
@@ -1095,6 +1156,9 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
 
 void OnFlip() {
     if (!g.ready) return;
+    // bb-velocity: a flip without a G-buffer motion pass since the last one (a re-presented or
+    // repeated guest image) is not a frame: history and snapshots stay as they are.
+    if (g.velocity && !g.cleared) return;
     ++g.frame;
     ++g.sec_frames;
     const bool had_pass = g.cleared;
@@ -1112,6 +1176,7 @@ void OnFlip() {
         std::swap(g.rel_prev, g.rel_cur);
         std::swap(g.vel_addr_prev, g.vel_addr_cur);
         std::swap(g.vel_id_prev, g.vel_id_cur);
+        std::swap(g.cam_cpu_prev, g.cam_cpu_cur);
         g.history = true;
     } else {
         if (g.history) ++g.sec_resets;
@@ -1120,6 +1185,7 @@ void OnFlip() {
         g.rel_prev.clear();
         g.vel_addr_prev.clear();
         g.vel_id_prev.clear();
+        g.cam_cpu_prev.clear();
         g.history = false;
         if (!had_pass) g.prev_valid = false;
     }
@@ -1130,6 +1196,9 @@ void OnFlip() {
     g.vel_addr_cur.clear();
     g.vel_id_cur.clear();
     g.cam_ord.clear();
+    g.cam_checked.clear();
+    g.cam_cpu_cur.clear();
+    g.pal_ids.clear();
     if (had_pass) ++g.vs_frames;
     g.occ.clear();
     g.dedupe.clear();
@@ -1204,22 +1273,24 @@ void OnFlip() {
             "[velocity] native velocity draws {:.1f}/frame of {:.1f} (static {:.1f}, skinned "
             "{:.1f}: ring palette {:.1f}, palette by address {:.1f}; ring palettes seen {:.1f}) | "
             "G-buffer px native {:.1f}%, backup bb_mv {:.1f}% | static check |native-cam| "
-            "{:.3f} px over {} px ({}) | previous camera by address {:.1f} / by order {:.1f}, "
-            "without {:.1f}/frame; without previous palette {:.1f}/frame; blended (backup) "
-            "{:.1f}/frame | GPU copies {:.1f}/frame, CPU copied {:.0f} B/frame, CPU {:.3f} "
+            "{:.3f} px over {} px ({}) | previous camera by address {:.1f} / by order {:.1f} "
+            "(rejected as different {:.1f}, uncheckable {:.1f}), without {:.1f}/frame; without previous palette {:.1f}/frame; blended (backup) "
+            "{:.1f}/frame | GPU copies {:.1f}/frame, snapshot {:.0f} B/frame, CPU {:.3f} "
             "us/draw",
             double(g.vs_native) / f, double(g.vs_draws) / f, double(g.vs_static) / f,
             double(g.vs_skinned) / f, double(g.vs_skinned_ring) / f,
             double(g.vs_skinned_addr) / f, double(g.vs_ring_seen) / f, native_px,
             g.sec_px_all ? 100.0 - native_px : 0.0, st_abs, g.sec_static_px,
             g.sec_static_px == 0 ? "no static px" : (st_abs <= 0.5 ? "PASS" : "FAIL"),
-            double(g.vs_cam_addr) / f, double(g.vs_cam_ord) / f, double(g.vs_no_cam) / f,
+            double(g.vs_cam_addr) / f, double(g.vs_cam_ord) / f, double(g.vs_cam_rejected) / f,
+            double(g.vs_cam_unchecked) / f, double(g.vs_no_cam) / f,
             double(g.vs_no_pal) / f, double(g.vs_blend) / f, double(g.vs_gpu_copies) / f,
             double(g.vs_bytes) / f,
             g.vs_draws ? g.vs_cpu_ns / 1000.0 / double(g.vs_draws) : 0.0));
         g.vs_frames = g.vs_draws = g.vs_native = g.vs_static = g.vs_skinned = g.vs_skinned_ring =
             g.vs_skinned_addr = g.vs_no_cam = g.vs_no_pal = g.vs_blend = g.vs_gpu_copies =
-                g.vs_bytes = g.vs_cam_addr = g.vs_cam_ord = g.vs_ring_seen = 0;
+                g.vs_bytes = g.vs_cam_addr = g.vs_cam_ord = g.vs_ring_seen = g.vs_cam_rejected =
+                    g.vs_cam_unchecked = 0;
         g.vs_cpu_ns = 0;
     }
     Log(fmt::format("[objmv-gpu6] moving test {}: palettes changed only by a common transform "

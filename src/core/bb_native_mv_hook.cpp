@@ -196,7 +196,14 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         detail += "SkinRingUpdate not found";
     }
 
-    // FLVER DrawMesh and its two GX draw calls.
+    // FLVER DrawMesh and its two GX draw calls: per-mesh CPU work on the guest thread, not used
+    // by the velocity buffer (bb-clean-velocity: only the skin ring). BB_NATIVE_MV_DRAWMESH=1.
+    const char* dm_env = std::getenv("BB_NATIVE_MV_DRAWMESH");
+    if (dm_env == nullptr || dm_env[0] != '1') {
+        detail += ", DrawMesh / GX draw not hooked (BB_NATIVE_MV_DRAWMESH=1 hooks them)";
+        NativeMv::SetHooksInstalled(any, detail.c_str());
+        return;
+    }
     const auto dm = Find(img, code, SigDrawMesh, std::size(SigDrawMesh));
     const auto calls = dm ? Find(img + *dm, DrawMeshSize, SigDrawCalls, std::size(SigDrawCalls))
                           : std::nullopt;

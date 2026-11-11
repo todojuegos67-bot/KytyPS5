@@ -89,6 +89,9 @@ void Scheduler::EndRendering() {
     }
     is_rendering = false;
     CommandBuffer().endRendering();
+    if (bb_end_rendering_hook != nullptr) {
+        bb_end_rendering_hook(CommandBuffer());
+    }
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {

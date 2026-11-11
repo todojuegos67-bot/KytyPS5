@@ -18,7 +18,6 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_upscale.h"
-#include "video_core/bb/bb_native_mv.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -497,7 +496,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker("gfx:{}:DrawIndex2", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->Draw(true); });
                 break;
@@ -515,7 +513,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndexOffset2", fmt::make_format_args(cmd_address),
                     [&] { rasterizer->Draw(true, draw_index_off->index_offset); });
@@ -532,7 +529,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->Draw(false); });
                 break;
@@ -548,7 +544,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndirect", fmt::make_format_args(cmd_address), [&] {
                         rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0,
@@ -569,7 +564,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndirectCountMulti", fmt::make_format_args(cmd_address), [&] {
                         rasterizer->DrawIndirect(
@@ -590,7 +584,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndirectMulti", fmt::make_format_args(cmd_address), [&] {
                         rasterizer->DrawIndirect(false, indirect_args_addr, offset,
@@ -613,7 +606,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndexIndirect", fmt::make_format_args(cmd_address), [&] {
                         rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0,
@@ -634,7 +626,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndexIndirectMulti", fmt::make_format_args(cmd_address), [&] {
                         rasterizer->DrawIndirect(
@@ -656,7 +647,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
-                BB::NativeMv::SetDrawPacket(reinterpret_cast<u64>(header));
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndexIndirectCountMulti", fmt::make_format_args(cmd_address), [&] {
                         rasterizer->DrawIndirect(

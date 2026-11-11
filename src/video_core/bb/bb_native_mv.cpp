@@ -401,6 +401,10 @@ void OnGuestFlip() {
 void GuestDrawMesh(u64 model, u64 mesh, u64 instance) {
     t_id.valid = false;
     if (!On() || instance == 0 || model == 0) return;
+    if (auto* m = Core::Memory::Instance();
+        m == nullptr || !m->IsValidMapping(instance, 8) || !m->IsValidMapping(model + 0x1c, 4)) {
+        return;
+    }
     const auto t0 = Clock::now();
     const u64 bones = *reinterpret_cast<const u64*>(instance);
     if (bones == 0 || (bones & 15) != 0) return;
@@ -427,16 +431,22 @@ void GuestDrawMesh(u64 model, u64 mesh, u64 instance) {
 void GuestSkinRing(u64 ring, u64 bones) {
     if (!On() || ring == 0 || bones == 0 || (bones & 15) != 0) return;
     const auto t0 = Clock::now();
+    auto* const mem = Core::Memory::Instance();
+    if (mem == nullptr || !mem->IsValidMapping(ring, 0xb8)) return;
     const u64 skel = *reinterpret_cast<const u64*>(ring + 0xb0);
     s32 count = 0, slots = 0;
-    if (skel != 0) std::memcpy(&count, reinterpret_cast<const void*>(skel + 0x1c), 4);
+    if (skel != 0 && mem->IsValidMapping(skel + 0x1c, 4)) {
+        std::memcpy(&count, reinterpret_cast<const void*>(skel + 0x1c), 4);
+    }
     std::memcpy(&slots, reinterpret_cast<const void*>(ring + 0x9c), 4);
     const u32 n = count >= 1 && count <= s32(kMaxBones) ? u32(count) : 1u;
     const u64 frame = g_frame.load(std::memory_order_relaxed);
     {
         std::scoped_lock lk{g_mx};
         ++st_ring_calls;
-        if (!RecordBones(bones, n, frame)) return;
+        // bb-clean-velocity: the bone history (RecordBones, per-object classification) is only
+        // for the DrawMesh path (BB_NATIVE_MV_DRAWMESH=1); the velocity buffer needs the slots.
+        if (g_dm_end.load(std::memory_order_relaxed) != 0 && !RecordBones(bones, n, frame)) return;
         Ring& r = g_rings[ring];
         const bool fresh = r.bones != bones || r.count == 0 || frame > r.mapped_frame + 120;
         r.bones = bones;
@@ -527,7 +537,9 @@ DrawId LookupPalette(u64 palette_address) {
     if (r == g_rings.end()) return id;
     ++st_ring_hits;
     bool recent = false;
-    const int state = Classify(r->second.bones, r->second.frame, recent);
+    const int state = g_dm_end.load(std::memory_order_relaxed) != 0
+                          ? Classify(r->second.bones, r->second.frame, recent)
+                          : 0;
     id.key = Mix(it->second.first, 0x72696e67ull);
     id.moving = state == 1;
     id.recent = recent || state == 1;
