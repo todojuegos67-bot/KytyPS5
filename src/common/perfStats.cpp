@@ -112,6 +112,9 @@ struct Counters {
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Lock::Count)> lock_waits {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Lock::Count)> lock_wait_ns {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Lock::Count)> longest_lock_wait_ns {};
+	// The GPU thread's share of them.
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Lock::Count)> gpu_lock_waits {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Lock::Count)> gpu_lock_wait_ns {};
 };
 Counters g_counters;
 
@@ -396,12 +399,20 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 			const auto waits        = take(c.lock_waits[i]);
 			const auto wait_ns      = take(c.lock_wait_ns[i]);
 			const auto longest_wait = take(c.longest_lock_wait_ns[i]);
+			const auto gpu_waits    = take(c.gpu_lock_waits[i]);
+			const auto gpu_wait_ns  = take(c.gpu_lock_wait_ns[i]);
 			line += fmt::format("{} {} {:.0f} {}/s, {:.1f} ms/s, longest {:.2f} ms",
 			                    i == 0 ? "" : " |", names[i], static_cast<double>(waits) / seconds,
 			                    nouns[i], static_cast<double>(wait_ns) / 1e6 / seconds,
 			                    static_cast<double>(longest_wait) / 1e6);
+			if (i < 2) {
+				line += fmt::format(" (GPU thread {:.0f}/s, {:.1f} ms/s)",
+				                    static_cast<double>(gpu_waits) / seconds,
+				                    static_cast<double>(gpu_wait_ns) / 1e6 / seconds);
+			}
 		}
 		line += SpinLocks() ? " (spinning as before round 65)" : "";
+		line += GpuLockSpin() ? "" : " (KYTY_GPU_LOCK_SPIN=0)";
 		Log::WriteUnmuted(line + "\n");
 	}
 
@@ -624,6 +635,10 @@ void AddLockWaitSlow(uint32_t lock, uint64_t nanoseconds) {
 	g_counters.lock_waits[lock].fetch_add(1, std::memory_order_relaxed);
 	g_counters.lock_wait_ns[lock].fetch_add(nanoseconds, std::memory_order_relaxed);
 	StoreMax(g_counters.longest_lock_wait_ns[lock], nanoseconds);
+	if (t_gpu_thread) {
+		g_counters.gpu_lock_waits[lock].fetch_add(1, std::memory_order_relaxed);
+		g_counters.gpu_lock_wait_ns[lock].fetch_add(nanoseconds, std::memory_order_relaxed);
+	}
 }
 
 } // namespace Detail
@@ -636,6 +651,14 @@ bool SpinLocksFromEnvironment() {
 	static const bool spin = [] {
 		const char* value = std::getenv("KYTY_LOCKS_SPIN");
 		return value != nullptr && value[0] == '1';
+	}();
+	return spin;
+}
+
+bool GpuLockSpin() {
+	static const bool spin = [] {
+		const char* value = std::getenv("KYTY_GPU_LOCK_SPIN");
+		return value == nullptr || value[0] != '0';
 	}();
 	return spin;
 }

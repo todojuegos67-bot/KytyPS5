@@ -182,6 +182,20 @@ enum class Lock : uint32_t {
 	RendererHeldByPresenter,
 	Count
 };
+// GT7 (KYTY_GPU_LOCK_SPIN): the GPU thread marks itself, so the "Perf locks:" line gives its own
+// waits apart from the game threads' (fault handlers), and its waits do not yield the processor.
+namespace Detail {
+inline thread_local bool t_gpu_thread = false;
+} // namespace Detail
+inline void MarkGpuThread() {
+	Detail::t_gpu_thread = true;
+}
+[[nodiscard]] inline bool IsGpuThread() {
+	return Detail::t_gpu_thread;
+}
+// Whether the GPU thread, waiting for a cache lock, keeps spinning instead of yielding its
+// processor (KYTY_GPU_LOCK_SPIN, on by default; =0 yields as the other threads do).
+[[nodiscard]] bool GpuLockSpin();
 inline void AddLockWait(Lock lock, uint64_t nanoseconds) {
 	if (Active()) {
 		Detail::AddLockWaitSlow(static_cast<uint32_t>(lock), nanoseconds);

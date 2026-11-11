@@ -839,6 +839,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::PreferPerformanceCores("GPU thread");
 	Common::RegisterGpuSideThread("Thread_Gpu");
 	Profiler::t_gpu_thread = true;
+	Common::PerfStats::MarkGpuThread();
 	t_guest_gpu_thread     = true;
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
