@@ -170,3 +170,9 @@
 - Fault paths: 3.0-4.5K buffer faults / 5 s (render 0.8-1.3K), per fault round trip 1 221-259 us + copy wait 163-241 us + round trip 2 257-298 us (~0.74 ms). Thread_Gpu sync downloads still 109-188 / 5 s (117-206 ms, 2 MiB windows).
 - KYTY_FAULT_LOCAL_FINISH=1 (live, new; 0 = old): for read faults served by an async copy-queue download, the faulting thread publishes the landed slot itself (staging -> guest memory, bytes leave the downloading set; per-slot lock against Thread_Gpu publishing/reusing it) and posts the bookkeeping (pending entry, slot, protection) without waiting. The load re-executes and the clean-read emulation serves it. A second fault on the same page right after takes the old path.
 - Round trip 1 split in the log: queued vs running (to decide between prioritising fault commands and guest-side submission).
+
+## 2026-11-11 — a29f5d85 tested (log 20261111-084435): faults faster, sync downloads up
+- Measured: round trip 1 240 -> 150-177 us (131-159 queued + 14 running), round trip 2 290 -> 112-184 us (local finish 584-3545 per 5 s, refaults 0-6), copy wait 142-199 us. Slow zone ~8.5-9 fps (end windows 11-14.8, maybe another spot). New top cost: Thread_Gpu sync downloads 165-309 per 5 s (183-323 ms, 2 MiB windows).
+- KYTY_FAULT_PRIORITY=1 (live, new; 0 = old): the first command of a guest buffer fault goes ahead of every queued non-urgent command (posted bookkeeping and the rest), behind earlier urgent ones.
+- KYTY_SYNC_NARROW=1 (live, new; 0 = old): in ReadMemoryOnGpu a window sharing bytes with a landing readback or a download in flight is cut to the faulting pages so the copy queue can take it (it always fell to a main-queue download + full GPU wait before).
+- Fault-path line: sync downloads by cause (pending / downloading / writer in the open command buffer / other), Thread_Gpu's own vs for guests, writes, narrowed.

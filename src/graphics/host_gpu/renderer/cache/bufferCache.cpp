@@ -432,12 +432,21 @@ struct FaultPathStats {
 	std::atomic<uint64_t> sync_downloads {0};    // ReadMemoryOnGpu main-queue download + full wait
 	std::atomic<uint64_t> sync_download_us {0};
 	std::atomic<uint64_t> sync_bytes {0};        // window bytes of those downloads
+	std::atomic<uint64_t> sync_narrowed {0};     // KYTY_SYNC_NARROW: windows cut to the faulting pages
+	std::atomic<uint64_t> sync_reason[4] {};     // sync downloads by why the copy queue declined:
+	                                             // pending readback, downloading, writer in the open
+	                                             // command buffer, other (empty/too big/disabled)
+	std::atomic<uint64_t> sync_own {0};          // fault of Thread_Gpu itself (SRT/args reads, unmaps)
+	std::atomic<uint64_t> sync_forwarded {0};    // for a guest thread
+	std::atomic<uint64_t> sync_write {0};
 	std::atomic<uint64_t> rt1_queue_us {0};      // round trip 1: enqueue -> Thread_Gpu starts the command
 	std::atomic<uint64_t> rt1_run_us {0};        // round trip 1: the command itself
 	std::atomic<uint64_t> local_finish {0};      // KYTY_FAULT_LOCAL_FINISH: published by the guest, no round trip 2
 	std::atomic<uint64_t> local_refault {0};     // same page faulted again right after: old path
 };
 FaultPathStats g_fp;
+thread_local int  t_sync_reason = 3;
+thread_local bool t_sync_own    = true;
 
 uint64_t ElapsedUs(std::chrono::steady_clock::time_point begin) {
 	return static_cast<uint64_t>(
@@ -453,7 +462,9 @@ void PrintFaultPaths() {
 	         "round trip 1 %.0f us, copy wait %.0f us, round trip 2 %.0f us; first command resolved %llu, copy queue "
 	         "%llu, main queue %llu; finish ok %llu, snapshot %llu, sync again %llu (%.1f ms on Thread_Gpu); "
 	         "Thread_Gpu sync downloads %llu (%.1f ms, %.1f MiB windows); local finish %llu (KYTY_FAULT_LOCAL_FINISH=%lld), "
-	         "refaults %llu; round trip 1 = %.0f us queued + %.0f us running + rest wake-up\n",
+	         "refaults %llu; round trip 1 = %.0f us queued + %.0f us running + rest wake-up; sync downloads by cause: "
+	         "pending %llu, downloading %llu, writer in open command buffer %llu, other %llu; Thread_Gpu's own %llu, "
+	         "for guests %llu, writes %llu; narrowed %llu (KYTY_SYNC_NARROW=%lld); KYTY_FAULT_PRIORITY=%lld\n",
 	         AsyncReadSnapshotEnabled() ? 1 : 0, static_cast<unsigned long long>(n),
 	         static_cast<unsigned long long>(f0), static_cast<unsigned long long>(f1), per(rt1), per(wt), per(rt2),
 	         static_cast<unsigned long long>(g_fp.begin_none.exchange(0)),
@@ -469,7 +480,16 @@ void PrintFaultPaths() {
 	         static_cast<unsigned long long>(g_fp.local_finish.exchange(0)),
 	         static_cast<long long>(Common::LiveSwitches::Get("KYTY_FAULT_LOCAL_FINISH", 1).load()),
 	         static_cast<unsigned long long>(g_fp.local_refault.exchange(0)), per(g_fp.rt1_queue_us.exchange(0)),
-	         per(g_fp.rt1_run_us.exchange(0)));
+	         per(g_fp.rt1_run_us.exchange(0)), static_cast<unsigned long long>(g_fp.sync_reason[0].exchange(0)),
+	         static_cast<unsigned long long>(g_fp.sync_reason[1].exchange(0)),
+	         static_cast<unsigned long long>(g_fp.sync_reason[2].exchange(0)),
+	         static_cast<unsigned long long>(g_fp.sync_reason[3].exchange(0)),
+	         static_cast<unsigned long long>(g_fp.sync_own.exchange(0)),
+	         static_cast<unsigned long long>(g_fp.sync_forwarded.exchange(0)),
+	         static_cast<unsigned long long>(g_fp.sync_write.exchange(0)),
+	         static_cast<unsigned long long>(g_fp.sync_narrowed.exchange(0)),
+	         static_cast<long long>(Common::LiveSwitches::Get("KYTY_SYNC_NARROW", 1).load()),
+	         static_cast<long long>(Common::LiveSwitches::Get("KYTY_FAULT_PRIORITY", 1).load()));
 }
 
 // GPU thread: "CQ async readbacks (5 s)" line.
@@ -999,7 +1019,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		uint32_t cq_slot      = UINT32_MAX;
 		g_fp.faults[PhaseStats::IsRenderThread() ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
 		auto fp_t = std::chrono::steady_clock::now();
-		gpu.SendCommandSync([&] {
+		gpu.SendCommandSyncUrgent([&] {
 			// Round trip 1 split: waiting in Thread_Gpu's command queue vs running the command.
 			const auto run_begin = std::chrono::steady_clock::now();
 			g_fp.rt1_queue_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1119,12 +1139,45 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	const uint64_t WindowSize    = repeat_window != 0 ? repeat_window : ReadbackWindowSize();
 	const auto     buffer_begin = buffer.CpuAddress();
 	const auto     buffer_end   = buffer_begin + buffer.Size();
-	const auto     window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	auto           window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+	auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 	// Whatever the width, the window must hold every faulting byte: only those are unprotected
 	// below, the rest of the buffer stays GPU-owned and faults on its own.
 	EXIT_IF(window_begin > vaddr || window_end < std::min(vaddr + size, buffer_end));
 	CompleteEagerInflight(window_begin, window_end);
+	// wolv-perf-1111f: why the copy queue cannot take this window (counted for the fault-path line),
+	// and KYTY_SYNC_NARROW (live, default 1; 0 = old): a window that shares bytes with another
+	// readback still landing (other threads' async faults, 3-5K per 5 s now) or a download in flight
+	// is narrowed to the faulting pages, as BeginWriteReadback does, so the copy queue can take it.
+	// Before, such a window always went to the main queue and waited for the whole GPU tail (log
+	// 11-11 08:44: 306 synchronous 2 MiB downloads per 5 s on Thread_Gpu, 310 ms).
+	{
+		static auto& narrow = Common::LiveSwitches::Get("KYTY_SYNC_NARROW", 1);
+		bool         downloading = false;
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			downloading = m_downloading_ranges.Intersects(window_begin, window_end - window_begin);
+		}
+		const bool pending = OverlapsPendingWriteReadback(window_begin, window_end);
+		if ((pending || downloading) && narrow.load(std::memory_order_relaxed) != 0) {
+			window_begin = std::max(page_begin, buffer_begin);
+			window_end   = std::min(page_end, buffer_end);
+			g_fp.sync_narrowed.fetch_add(1, std::memory_order_relaxed);
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				downloading = m_downloading_ranges.Intersects(window_begin, window_end - window_begin);
+			}
+		}
+		const bool writer_running = !m_scheduler.IsFree(buffer.last_gpu_write_tick);
+		const bool writer_open    = writer_running && !(SubmittedWriterEnabled() &&
+		                                             buffer.last_gpu_write_tick <= m_scheduler.DriverSubmittedTick());
+		const int  reason = OverlapsPendingWriteReadback(window_begin, window_end) ? 0
+		                    : downloading                                          ? 1
+		                    : writer_open                                          ? 2
+		                                                                           : 3;
+		t_sync_reason = reason;
+		t_sync_own    = !ReadbackStats::s_forwarded;
+	}
 
 	if (stats.Enabled()) {
 		stats.FindWriter([this](uint64_t tick) { return m_scheduler.IsFree(tick); });
@@ -1145,6 +1198,11 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		g_fp.sync_downloads.fetch_add(1, std::memory_order_relaxed);
+		g_fp.sync_reason[t_sync_reason].fetch_add(1, std::memory_order_relaxed);
+		(t_sync_own ? g_fp.sync_own : g_fp.sync_forwarded).fetch_add(1, std::memory_order_relaxed);
+		if (is_write) {
+			g_fp.sync_write.fetch_add(1, std::memory_order_relaxed);
+		}
 		g_fp.sync_download_us.fetch_add(ElapsedUs(dl_begin), std::memory_order_relaxed);
 		g_fp.sync_bytes.fetch_add(window_end - window_begin, std::memory_order_relaxed);
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);

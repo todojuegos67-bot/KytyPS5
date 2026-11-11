@@ -373,6 +373,9 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_commands.empty());
 			command = std::move(m_commands.front());
 			m_commands.pop_front();
+			if (m_urgent_commands != 0) {
+				m_urgent_commands--;
+			}
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		KYTY_PROFILER_BLOCK("GuestGpu::ProcessCommands(command)");
@@ -392,6 +395,29 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		operation();
 		done.release();
 	});
+	done.acquire();
+}
+
+void GuestGpu::SendCommandSyncUrgent(Common::UniqueFunction<void>&& command) {
+	static auto& priority = Common::LiveSwitches::Get("KYTY_FAULT_PRIORITY", 1);
+	if (IsGpuThread() || priority.load(std::memory_order_relaxed) == 0) {
+		SendCommandSync(std::move(command));
+		return;
+	}
+	PhaseStats::Scope    phase {PhaseStats::GuestPhase(PhaseStats::RenderSync, PhaseStats::OtherSync)};
+	std::binary_semaphore done {0};
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		EXIT_IF(!m_accepting);
+		m_commands.insert(m_commands.begin() + static_cast<std::ptrdiff_t>(m_urgent_commands),
+		                  Common::UniqueFunction<void>([operation = std::move(command), &done]() mutable {
+			                  operation();
+			                  done.release();
+		                  }));
+		m_urgent_commands++;
+		m_pending_commands.fetch_add(1, std::memory_order_release);
+		m_work_available.Signal();
+	}
 	done.acquire();
 }
 
@@ -887,6 +913,9 @@ void GuestGpu::ThreadRun(void* data) {
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
+				if (gpu->m_urgent_commands != 0) {
+					gpu->m_urgent_commands--;
+				}
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {

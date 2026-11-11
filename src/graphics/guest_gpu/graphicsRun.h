@@ -34,6 +34,10 @@ public:
 	// Like SendCommand, but false instead of exiting once the GPU no longer accepts commands.
 	bool               TrySendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// KYTY_FAULT_PRIORITY (wolv-perf-1111f): SendCommandSync whose command goes ahead of every
+	// queued non-urgent command (behind earlier urgent ones). For the first command of a guest buffer
+	// fault: it only reads and starts readbacks, and the faulting thread is blocked on it.
+	void               SendCommandSyncUrgent(Common::UniqueFunction<void>&& command);
 
 	// End-of-pipe labels (RELEASE_MEM without an interrupt) become visible to the CPU once the
 	// host GPU has executed the work recorded before them, as on hardware, instead of when the
@@ -117,6 +121,7 @@ private:
 	Common::CondVar                                m_idle;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
+	uint32_t                                       m_urgent_commands = 0; // at the front of m_commands
 	Common::CondVar                                m_suspend_point_done;
 	uint64_t                                       m_suspend_points_issued = 0;
 	uint64_t                                       m_suspend_points_done   = 0;
