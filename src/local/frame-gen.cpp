@@ -3602,7 +3602,9 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	}
 	// (des-particles-fg) KYTY_FG_PARTICLE_MV: the particle layer's vectors (measured in Upscale this frame) mixed into this
 	// copy only: frame generation moves fire, sparks, rain and spells instead of repeating them. Nothing when off.
-	if (ParticleMvWanted()) ParticleMvCompose(vk_command, graphics, inputs.motion);
+	// (Its compute pipeline and push descriptors are bound in the guest's command stream: the ordinary path's recorded
+	// state is invalidated after it, as the TAA bypass does - without it the next guest dispatch ran with ours: device lost.)
+	if (ParticleMvWanted() && ParticleMvCompose(vk_command, graphics, inputs.motion, inputs.motion_view)) command.InvalidateGraphicsState();
 	if (hudless && HudlessWanted()) {
 		ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format, vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
 		CopyRaw(vk_command, g_hudless, inputs.hudless);

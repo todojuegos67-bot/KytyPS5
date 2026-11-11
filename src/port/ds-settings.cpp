@@ -803,7 +803,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : s.souls_mode == "ligero-plus" ? "39" : "43"); // (10-25) Anti-Lag+
 	// (des-particles-fg) Souls ligero (30x2) and ligero + (30x3) only: the particle layer's motion vectors for AMD frame
 	// generation (particle-mv.cpp): fire, sparks, rain, mist and spells interpolated instead of shown at the real 30.
-	if (fixed_fg && (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus")) sets.emplace_back("KYTY_FG_PARTICLE_MV", "1");
+	// (11-11) Off by default until verified in game (the first build lost the device): KYTY_FG_PARTICLE_MV=1 by hand.
+	// if (fixed_fg && (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus")) sets.emplace_back("KYTY_FG_PARTICLE_MV", "1");
 	// (10-26) The RAM flush is gone (hitches): none of it, and out of the config too.
 	for (const char* k: {"KYTY_MEMCUT", "KYTY_REBAR_STAGING", "KYTY_STAGING_RING_MB", "KYTY_RAM_TARGET_MB", "KYTY_RAM_FLUSH_SECONDS",
 	                     "KYTY_RAM_FLUSH_MB", "KYTY_RAM_FLUSH_LEVEL"})

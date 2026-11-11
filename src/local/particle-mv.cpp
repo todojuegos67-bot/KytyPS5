@@ -66,8 +66,6 @@ struct {
 	const uint32_t*         mapped = nullptr;
 	bool                    cleared = false;
 	uint64_t                frame = 0, ran = 0, no_pre = 0, composed = 0, not_storage = 0;
-	vk::Image               fg_image = nullptr;
-	vk::ImageView           fg_view  = nullptr;
 	vk::QueryPool           pool = nullptr;
 	double                  period_ns = 1.0;
 	uint64_t                written = 0, read = 0;
@@ -439,7 +437,8 @@ bool ParticleMvMeasure(vk::CommandBuffer command, const UpscaleInputs& inputs, c
 	return g_pm.measured;
 }
 
-bool ParticleMvCompose(vk::CommandBuffer command, GraphicContext& graphics, VulkanImage& motion) {
+bool ParticleMvCompose(vk::CommandBuffer command, GraphicContext& graphics, VulkanImage& motion, vk::ImageView view) {
+	(void)graphics;
 	if (!ParticleMvWanted() || !g_pm.measured || g_pm.pipeline == nullptr) return false;
 	g_pm.measured = false; // (once per measured frame)
 	if (motion.image == nullptr || motion.extent.width != g_pm.full.width || motion.extent.height != g_pm.full.height) return false;
@@ -453,23 +452,9 @@ bool ParticleMvCompose(vk::CommandBuffer command, GraphicContext& graphics, Vulk
 		}
 		return false;
 	}
-	if (g_pm.fg_image != motion.image) {
-		if (g_pm.fg_view != nullptr) {
-			graphics.device.waitIdle();
-			graphics.device.destroyImageView(g_pm.fg_view, nullptr);
-			g_pm.fg_view = nullptr;
-		}
-		vk::ImageViewCreateInfo view_info {};
-		view_info.image            = motion.image;
-		view_info.viewType         = vk::ImageViewType::e2D;
-		view_info.format           = vk::Format::eR16G16Sfloat;
-		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		if (graphics.device.createImageView(&view_info, nullptr, &g_pm.fg_view) != vk::Result::eSuccess) {
-			g_pm.fg_view = nullptr;
-			return false;
-		}
-		g_pm.fg_image = motion.image;
-	}
+	// (11-11) The FG copy's own view (made with the image, same RG16F format; its usage includes storage): a view cached
+	// by image handle outlived the image when Configure remade it (a handle value can be reused): device lost.
+	if (view == nullptr) return false;
 	const auto layout = motion.state.layout;
 	const auto gen    = vk::ImageLayout::eGeneral;
 	Layout(command, motion.image, layout, gen);
@@ -477,7 +462,7 @@ bool ParticleMvCompose(vk::CommandBuffer command, GraphicContext& graphics, Vulk
 	const vk::DescriptorImageInfo infos[8] {
 	    {g_pm.point, g_pm.pmv.view, gen},  {g_pm.point, g_pm.pmv.view, gen}, {g_pm.point, g_pm.lay[0].view, gen},
 	    {g_pm.point, g_pm.lay[1].view, gen}, {g_pm.point, g_pm.lay[0].view, gen}, {g_pm.linear, g_pm.pmv.view, gen},
-	    {nullptr, g_pm.lay[0].view, gen},  {nullptr, g_pm.fg_view, gen},
+	    {nullptr, g_pm.lay[0].view, gen},  {nullptr, view, gen},
 	};
 	Dispatch(command, push, 2, infos, g_pm.full);
 	Layout(command, motion.image, gen, layout);

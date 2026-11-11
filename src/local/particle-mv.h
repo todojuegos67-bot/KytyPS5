@@ -15,7 +15,7 @@ namespace Libs::Graphics::FrameGen {
 bool ParticleMvMeasure(vk::CommandBuffer command, const UpscaleInputs& inputs, const UpscaleImage& game);
 // At the guest flip, right after frame generation's motion copy (frame-gen.cpp): the vectors measured this frame mixed
 // into that copy, in place. `motion` must have been made with storage usage (R16G16_SFLOAT). False: nothing done.
-bool ParticleMvCompose(vk::CommandBuffer command, GraphicContext& graphics, VulkanImage& motion);
+bool ParticleMvCompose(vk::CommandBuffer command, GraphicContext& graphics, VulkanImage& motion, vk::ImageView view);
 
 } // namespace Libs::Graphics::FrameGen
 
