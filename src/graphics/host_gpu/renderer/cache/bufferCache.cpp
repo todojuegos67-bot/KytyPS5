@@ -305,8 +305,12 @@ bool AsyncWriteReadbackEnabled() {
 // busiest readback buffer is rewritten by the GPU before the asynchronous download lands (run 41:
 // the writer was still running for 194 of 402 readbacks per 5 s); the guest never waits for it,
 // so it reads whatever the GPU had written by then, as the download captured.
+// wolv-perf-1111d: default 1 (0 = old). Readback stats 11-11: the 0x1193020000 faults that the
+// GPU had rewritten by the time their async download landed (writer still running 140 of 312) went
+// down the synchronous path inside the guest's second command: a main-queue download and a wait for
+// the whole GPU tail on Thread_Gpu ("bufferCache.cpp:1034", 272 waits / 294 ms per 5 s).
 bool AsyncReadSnapshotEnabled() {
-	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_READ_SNAPSHOT", 0);
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_READ_SNAPSHOT", 1);
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
@@ -412,6 +416,53 @@ struct CqStats {
 };
 CqStats g_cq;
 
+// wolv-perf-1111d: "Fault paths (5 s)" line, always on (relaxed counters; faults cost ~0.1-1 ms each).
+struct FaultPathStats {
+	std::atomic<uint64_t> faults[2] {};          // guest buffer faults (async path): render, other
+	std::atomic<uint64_t> rt1_us {0};            // first round trip (BeginWriteReadback), wall on the guest
+	std::atomic<uint64_t> wait_us {0};           // copy / tick wait on the guest
+	std::atomic<uint64_t> rt2_us {0};            // second round trip (FinishWriteReadback)
+	std::atomic<uint64_t> begin_none {0};        // resolved in the first command (unmarked, nothing to download, sync CQ)
+	std::atomic<uint64_t> begin_cq {0};          // async copy queue
+	std::atomic<uint64_t> begin_main {0};        // main-queue download, guest waits for its tick
+	std::atomic<uint64_t> finish_ok {0};
+	std::atomic<uint64_t> finish_snapshot {0};   // served from the download (KYTY_ASYNC_READ_SNAPSHOT)
+	std::atomic<uint64_t> finish_sync {0};       // GPU wrote again: synchronous path on Thread_Gpu
+	std::atomic<uint64_t> finish_sync_us {0};
+	std::atomic<uint64_t> sync_downloads {0};    // ReadMemoryOnGpu main-queue download + full wait
+	std::atomic<uint64_t> sync_download_us {0};
+	std::atomic<uint64_t> sync_bytes {0};        // window bytes of those downloads
+};
+FaultPathStats g_fp;
+
+uint64_t ElapsedUs(std::chrono::steady_clock::time_point begin) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+}
+
+void PrintFaultPaths() {
+	const auto f0 = g_fp.faults[0].exchange(0), f1 = g_fp.faults[1].exchange(0);
+	const auto n  = f0 + f1;
+	const auto per = [n](uint64_t us) { return n != 0 ? static_cast<double>(us) / static_cast<double>(n) : 0.0; };
+	const auto rt1 = g_fp.rt1_us.exchange(0), wt = g_fp.wait_us.exchange(0), rt2 = g_fp.rt2_us.exchange(0);
+	::printf("Fault paths (5 s, KYTY_ASYNC_READ_SNAPSHOT=%d): %llu buffer faults (render %llu, other %llu); per fault "
+	         "round trip 1 %.0f us, copy wait %.0f us, round trip 2 %.0f us; first command resolved %llu, copy queue "
+	         "%llu, main queue %llu; finish ok %llu, snapshot %llu, sync again %llu (%.1f ms on Thread_Gpu); "
+	         "Thread_Gpu sync downloads %llu (%.1f ms, %.1f MiB windows)\n",
+	         AsyncReadSnapshotEnabled() ? 1 : 0, static_cast<unsigned long long>(n),
+	         static_cast<unsigned long long>(f0), static_cast<unsigned long long>(f1), per(rt1), per(wt), per(rt2),
+	         static_cast<unsigned long long>(g_fp.begin_none.exchange(0)),
+	         static_cast<unsigned long long>(g_fp.begin_cq.exchange(0)),
+	         static_cast<unsigned long long>(g_fp.begin_main.exchange(0)),
+	         static_cast<unsigned long long>(g_fp.finish_ok.exchange(0)),
+	         static_cast<unsigned long long>(g_fp.finish_snapshot.exchange(0)),
+	         static_cast<unsigned long long>(g_fp.finish_sync.exchange(0)),
+	         static_cast<double>(g_fp.finish_sync_us.exchange(0)) / 1000.0,
+	         static_cast<unsigned long long>(g_fp.sync_downloads.exchange(0)),
+	         static_cast<double>(g_fp.sync_download_us.exchange(0)) / 1000.0,
+	         static_cast<double>(g_fp.sync_bytes.exchange(0)) / (1024.0 * 1024.0));
+}
+
 // GPU thread: "CQ async readbacks (5 s)" line.
 void NoteCqStats() {
 	static auto s_begin = std::chrono::steady_clock::now();
@@ -438,6 +489,7 @@ void NoteCqStats() {
 	         static_cast<unsigned long long>(published), static_cast<unsigned long long>(waits),
 	         static_cast<double>(wait_us) / 1000.0, static_cast<unsigned long long>(no_slot),
 	         static_cast<unsigned long long>(sync_run));
+	PrintFaultPaths();
 	std::fflush(stdout);
 }
 
@@ -934,12 +986,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		uint64_t window_begin = 0;
 		uint64_t window_end   = 0;
 		uint64_t cq_value     = 0;
+		g_fp.faults[PhaseStats::IsRenderThread() ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+		auto fp_t = std::chrono::steady_clock::now();
 		gpu.SendCommandSync([&] {
 			ReadbackStats::s_forwarded = true;
 			tick = BeginWriteReadback(vaddr, size, is_write, window_begin, window_end, cq_value);
 			ReadbackStats::s_forwarded = false;
 		});
+		g_fp.rt1_us.fetch_add(ElapsedUs(fp_t), std::memory_order_relaxed);
+		(tick == 0 ? g_fp.begin_none : cq_value != 0 ? g_fp.begin_cq : g_fp.begin_main)
+		    .fetch_add(1, std::memory_order_relaxed);
 		if (tick != 0) {
+			fp_t = std::chrono::steady_clock::now();
 			if (cq_value != 0) {
 				KYTY_PROFILER_BLOCK("BufferCache::WaitAsyncCopy");
 				// KYTY_CQ_ASYNC: only the copy (and the writer it waits for), on this thread.
@@ -951,11 +1009,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				m_scheduler.Wait(tick);
 				m_scheduler.WaitPriorityOperations(tick);
 			}
+			g_fp.wait_us.fetch_add(ElapsedUs(fp_t), std::memory_order_relaxed);
+			fp_t           = std::chrono::steady_clock::now();
 			bool redirtied = false;
 			gpu.SendCommandSync([&] {
 				redirtied = !FinishWriteReadback(vaddr, size, is_write, window_begin, window_end,
 				                                 tick, !is_write && AsyncReadSnapshotEnabled(), cq_value);
 			});
+			g_fp.rt2_us.fetch_add(ElapsedUs(fp_t), std::memory_order_relaxed);
 			if (redirtied) {
 				// The download holds the bytes as of this read; the fault handler completes the
 				// load from them (KYTY_ASYNC_READ_SNAPSHOT).
@@ -1028,11 +1089,15 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	if (TryCopyQueueReadback(buffer, window_begin, window_end)) {
 		stats.SetOutcome(ReadbackStats::Downloaded);
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
-	} else if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+	} else if (const auto dl_begin = std::chrono::steady_clock::now();
+	           DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		stats.SetOutcome(ReadbackStats::Downloaded);
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
+		g_fp.sync_downloads.fetch_add(1, std::memory_order_relaxed);
+		g_fp.sync_download_us.fetch_add(ElapsedUs(dl_begin), std::memory_order_relaxed);
+		g_fp.sync_bytes.fetch_add(window_end - window_begin, std::memory_order_relaxed);
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	} else {
 		stats.SetOutcome(ReadbackStats::NothingToDownload);
@@ -1522,6 +1587,16 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	} else if (!m_readback_history.empty()) {
 		m_readback_history.clear();
 	}
+	if (stats.Enabled()) {
+		// wolv-perf-1111d: this path recorded no writer ("unknown") and no dirty bytes ("0 KiB")
+		// in the readback stats; the synchronous path did.
+		stats.FindWriter([this](uint64_t t) { return m_scheduler.IsFree(t); });
+		uint64_t         dirty_bytes = 0;
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		m_gpu_modified_ranges.ForEachInRange(window_begin, window_end - window_begin,
+		                                     [&](uint64_t start, uint64_t end) { dirty_bytes += end - start; });
+		stats.SetDownloadBytes(dirty_bytes);
+	}
 	const bool writer_done      = m_scheduler.IsFree(buffer.last_gpu_write_tick);
 	const bool writer_submitted = !writer_done && SubmittedWriterEnabled() &&
 	                              buffer.last_gpu_write_tick <= m_scheduler.DriverSubmittedTick();
@@ -1632,13 +1707,18 @@ bool BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_wri
 			// holds the bytes as of the guest's read, which the caller serves; the page stays
 			// GPU-owned and protected.
 			m_snapshot_reads++;
+			g_fp.finish_snapshot.fetch_add(1, std::memory_order_relaxed);
 			return false;
 		}
 		// The GPU wrote the window again while the download was landing, or another readback
 		// still covers the page: resolve this fault the synchronous way.
+		const auto sync_begin = std::chrono::steady_clock::now();
 		ReadMemoryOnGpu(vaddr, size, is_write);
+		g_fp.finish_sync.fetch_add(1, std::memory_order_relaxed);
+		g_fp.finish_sync_us.fetch_add(ElapsedUs(sync_begin), std::memory_order_relaxed);
 		return true;
 	}
+	g_fp.finish_ok.fetch_add(1, std::memory_order_relaxed);
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}

@@ -156,3 +156,10 @@
 - KYTY_STATE_CACHE default 0 -> 1 (live; 0 = old): unchanged dynamic state and pipeline binds are not recorded again.
 - KYTY_MEMO_BYPASS=1 (live, new; 0 = old): a program with 0 memo hits in its last 256 lookups evaluates its resource plan directly for 2048 lookups (no key hash/slot scan/read log/slot copy). Log: "Resource memo bypass (5 s, ...)"; compare memo.miss us/call.
 - Phase counters padded to one cache line each (diagnostic cost only).
+
+## 2026-11-11 — cc3dd112 measured by the user; fault-path build (agent A: faults/coherence/readbacks)
+- cc3dd112 (log 20261111-065834): first zone 36 -> 45.6 fps; slow zone mean 7.9 -> 8.3-8.6 (+5-9 %), best window 11.7. Diagnostics were off this time (no READBACK_STATS / PHASE_STATS in live.txt): Thread_Gpu 74-80 % CPU, Guest_RenderThread 76-87 %.
+- Finding (code): the async fault path never set the readback-stats writer or dirty bytes, so "unknown" writers and "0 KiB" (0x1210000000) were artifacts. Fixed (stats only).
+- Finding (log 063045 + code): 0x1193020000 faults whose window the GPU rewrote before the async copy landed (writer still running 140 of 312) fell back inside FinishWriteReadback to ReadMemoryOnGpu: main-queue download of a 2 MiB window + wait for the whole GPU tail on Thread_Gpu (bufferCache.cpp:1034, 272 waits / 294 ms per 5 s on tid 47512 = Thread_Gpu).
+- KYTY_ASYNC_READ_SNAPSHOT default 0 -> 1 (live; 0 = old): such a read is served from the download it waited for (instruction emulation; anything it cannot emulate goes the synchronous way as before).
+- New always-on line "Fault paths (5 s, ...)": faults per thread kind, per-fault round trip 1 / copy wait / round trip 2, first-command outcomes, finish outcomes (ok / snapshot / sync again + ms), Thread_Gpu synchronous downloads (count, ms, MiB).
