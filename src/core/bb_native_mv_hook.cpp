@@ -18,6 +18,7 @@
 
 #include "core/bb_native_mv_hook.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
