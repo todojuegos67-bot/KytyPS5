@@ -245,11 +245,19 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			const bool    pulse = (now / 100000000) % 4 == 0; // (100 ms down every 400 ms)
 			// The one-shot cinematic skip patch (loader/demonsSoulsSkipIntro.cpp) is removed 6 s after the first
 			// cinematic is seen, or 4 minutes after boot, so later cinematics play.
+			// (11-11) The first two cinematics (voidwalk, then the new game's maidentravel): the patch stays until 6 s after
+			// the second one starts, or 10 minutes after boot.
+			static bool    cine_was = false;
+			static int     cine_count = 0;
+			static int64_t cine2_seen = 0;
+			const bool     cine_now = Libs::VideoOut::CinematicPlaying();
+			if (cine_now && !cine_was && ++cine_count == 2) cine2_seen = now;
+			cine_was = cine_now;
 			if (Loader::DemonsSoulsSkipIntro::CinematicSkipArmed()) {
-				if (cine_seen != 0 && now - cine_seen > 6000000000LL)
-					Loader::DemonsSoulsSkipIntro::Disarm("after the opening cinematic");
-				else if (up > 240000000000LL)
-					Loader::DemonsSoulsSkipIntro::Disarm("4 minutes after boot");
+				if (cine2_seen != 0 && now - cine2_seen > 6000000000LL)
+					Loader::DemonsSoulsSkipIntro::Disarm("after the second cinematic");
+				else if (up > 600000000000LL)
+					Loader::DemonsSoulsSkipIntro::Disarm("10 minutes after boot");
 			}
 			if (up < 120000000000LL && Libs::VideoOut::MoviePlaying()) {
 				(void)pulse; // (11-11) no X pressed for the player: the game patches do the skipping
