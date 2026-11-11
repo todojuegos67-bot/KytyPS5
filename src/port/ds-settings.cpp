@@ -1122,7 +1122,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			env.Set("KYTY_GAME_CONVARS_EXTRA", x);
 		}
 	}
-	env.Set("KYTY_TEXTURE_REDUCE", texture == "h" || texture == "1" || texture == "2" ? texture : "0"); // (an old "auto": Maximo)
+	// (11-11) "Maximo" runs as "Alto" (one level left out of the >= 2048 textures): whole streamed textures still showed
+	// the Nexus floor / candle glitch on cards of 12 GB and more.
+	env.Set("KYTY_TEXTURE_REDUCE", texture == "1" || texture == "2" ? texture : "h");
 	env.Default("KYTY_UNMAP_PROTECT_SKIP", "1");
 	env.Set("KYTY_DRIVER_CACHE_KEY", DriverCacheKey(s));
 	env.Set("KYTY_SHADER_WARMUP_ONLY", "");
