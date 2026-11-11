@@ -75,6 +75,10 @@ private:
     vk::PipelineLayout layout{};
     vk::Pipeline pipeline{};
     OwnImage color, motion, output;
+    // bb-clean (1.49 bb_mv.comp): reactive mask and the luminance ping-pong it compares against.
+    OwnImage reactive, lum[2];
+    u32 lum_index = 0;
+    bool lum_valid = false;
     static constexpr u32 FgSlots = 4;
     struct FgSlot {
         OwnImage depth, motion;

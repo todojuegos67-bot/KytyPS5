@@ -457,7 +457,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
-    g_bb_objmv2 = skip_cb_binding ? BB::ObjMv2::Kind::None : BB::ObjMv2::Want(regs);
+    g_bb_objmv2 = BB::ObjMv2::Kind::None; // bb-clean: no object motion vectors
     if (!RefreshGraphicsStages()) {
         return false;
     }

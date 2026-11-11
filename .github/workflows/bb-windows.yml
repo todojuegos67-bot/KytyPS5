@@ -2,7 +2,7 @@ name: bb-windows
 on:
   workflow_dispatch:
   push:
-    branches: [bb-clean-021]
+    branches: [bb-clean-021, bb-clean]
 permissions:
   contents: write
 jobs:

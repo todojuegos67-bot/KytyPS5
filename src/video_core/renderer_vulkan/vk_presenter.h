@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include "video_core/renderer_vulkan/bb_present_sr.h"
+#include "video_core/renderer_vulkan/bb_hud_fg.h"
 
 #include <condition_variable>
 
@@ -55,12 +56,16 @@ struct Frame {
         vk::Image image{};
         VmaAllocation allocation{};
         vk::ImageView view{}; // UNORM (storage)
+        vk::ImageView rgba_view{}; // bb-clean: R8G8B8A8 storage view (HUD overlay pass)
         vk::Format format = vk::Format::eUndefined;
     };
     std::array<Generated, 3> generated{};
     u32 generated_count = 0;
     vk::ImageView unorm_view{};
     vk::Format unorm_format = vk::Format::eUndefined;
+    // bb-clean: this frame's HUD layer for FSR 3 FG (bb_hud_fg.h), valid when has_ui_layer.
+    BB::FG::Image ui_layer{};
+    bool has_ui_layer = false;
 
     ImTextureID imgui_texture;
 };
@@ -152,6 +157,7 @@ private:
     Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
     std::unique_ptr<BB::PresentSr> bb_sr; // bb-clean-021: DLSS / FSR 4 (null when off)
+    std::unique_ptr<BB::HudFg> bb_hud_fg; // bb-clean: the HUD kept out of frame generation
     double bb_wait_ms = 0.0;
     std::chrono::steady_clock::time_point bb_last_flip{};
     // bb-clean-021-bbport: Supermedo's frame generation present loop (Present, EnsureGenerated,

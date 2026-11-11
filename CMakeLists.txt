@@ -1203,6 +1203,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.cpp
                src/video_core/renderer_vulkan/bb_present_sr.cpp
                src/video_core/renderer_vulkan/bb_present_sr.h
+               src/video_core/renderer_vulkan/bb_hud_fg.cpp
+               src/video_core/renderer_vulkan/bb_hud_fg.h
                src/video_core/renderer_vulkan/bb_ui_cut.cpp
                src/video_core/renderer_vulkan/bb_ui_cut.h
                src/video_core/renderer_vulkan/bb_ui_composition.h

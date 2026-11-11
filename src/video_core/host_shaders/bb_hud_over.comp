@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-clean: the HUD layer (bb_hud_mask.comp, premultiplied) over one DLSS-G generated frame.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D ui_tex;
+layout(binding = 1, rgba8) uniform image2D target;
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, 1: the target is BGRA memory viewed as RGBA
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    vec4 ui = texelFetch(ui_tex, c, 0);
+    if (ui.a <= 0.0) {
+        return;
+    }
+    vec4 t = imageLoad(target, c);
+    if (p.size.z != 0u) {
+        t = t.bgra;
+    }
+    vec3 o = t.rgb * (1.0 - ui.a) + ui.rgb;
+    vec4 r = vec4(o, t.a);
+    if (p.size.z != 0u) {
+        r = r.bgra;
+    }
+    imageStore(target, c, r);
+}

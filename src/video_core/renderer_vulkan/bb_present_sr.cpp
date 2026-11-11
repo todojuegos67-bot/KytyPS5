@@ -9,11 +9,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_upscale.h"
-#include "video_core/bb/bb_objmv2.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -31,6 +31,9 @@ PresentSr::~PresentSr() {
     Destroy(color);
     Destroy(motion);
     Destroy(output);
+    Destroy(reactive);
+    Destroy(lum[0]);
+    Destroy(lum[1]);
     for (auto& fs : fg_slots) {
         Destroy(fs.depth);
         Destroy(fs.motion);
@@ -58,11 +61,14 @@ bool PresentSr::Init() {
     auto [sr, s] = device.createSampler(sci);
     if (sr != vk::Result::eSuccess) return false;
     sampler = s;
-    const std::array<vk::DescriptorSetLayoutBinding, 4> bindings{{
+    const std::array<vk::DescriptorSetLayoutBinding, 7> bindings{{
         {0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
         {1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
         {2, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
         {3, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+        {4, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+        {5, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+        {6, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
     }};
     auto [lr, l] = device.createDescriptorSetLayout({
         .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
@@ -99,7 +105,7 @@ bool PresentSr::Init() {
         ns_per_tick = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
     }
     init_ok = true;
-    BB::Upscale::Checkpoint("present upscaler pass ready (motion vectors + colour copy, 1 dispatch)");
+    BB::Upscale::Checkpoint("present upscaler pass ready (bb-clean: 1.49 camera vectors 4x4 + reactive mask + colour copy, 1 dispatch per frame, nothing per draw)");
     return true;
 }
 
@@ -244,7 +250,9 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     }
     if (!Ensure(color, in, vk::Format::eR16G16B16A16Sfloat) ||
         !Ensure(motion, in, vk::Format::eR16G16Sfloat) ||
-        !Ensure(output, out, vk::Format::eR16G16B16A16Sfloat)) {
+        !Ensure(output, out, vk::Format::eR16G16B16A16Sfloat) ||
+        !Ensure(reactive, in, vk::Format::eR8Unorm) ||
+        !Ensure(lum[0], in, vk::Format::eR16Sfloat) || !Ensure(lum[1], in, vk::Format::eR16Sfloat)) {
         return {};
     }
     VideoCore::ImageViewInfo dv{};
@@ -258,8 +266,16 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     if (timed) {
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, queries, slot * PerSlot + 1);
     }
+    // bb-clean: the luminance of the previous frame (reactive mask) is valid only with history.
+    auto& lum_cur = lum[lum_index];
+    auto& lum_prev = lum[lum_index ^ 1];
+    const bool lum_prev_valid = lum_valid && !cam.reset && lum_prev.extent == in &&
+                                lum_prev.layout == vk::ImageLayout::eGeneral;
     Barrier(cmd, color, vk::ImageLayout::eGeneral);
     Barrier(cmd, motion, vk::ImageLayout::eGeneral);
+    Barrier(cmd, reactive, vk::ImageLayout::eGeneral);
+    Barrier(cmd, lum_cur, vk::ImageLayout::eGeneral);
+    if (lum_prev.layout != vk::ImageLayout::eGeneral) Barrier(cmd, lum_prev, vk::ImageLayout::eGeneral);
     struct {
         float rows[16];
         float vp_xy[4];
@@ -267,47 +283,73 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         u32 size[4];
     } push{};
     static_assert(sizeof(push) == 112);
-    // bb-clean-021-bbport: Supermedo's camera (bb_mv.comp): reproject rows, projections, jitter.
-    std::memcpy(push.rows, cam.reproject, sizeof(cam.reproject));
-    std::memcpy(push.rows + 12, cam.proj, sizeof(cam.proj));
-    std::memcpy(push.vp_xy, cam.prev_proj, sizeof(cam.prev_proj));
+    // bb-clean: build 1.49's camera vectors (bb_mv.comp): one 4x4 clip_to_prev_clip
+    // (prevViewProj * inverse(viewProj), the same matrix DLSS-G / FSR 3 get) and the scene pass's
+    // guest viewport (recorded with the scene depth, no extra per-draw work). Without a recorded
+    // viewport: the full render size, y down, depth = clip z / w.
+    std::memcpy(push.rows, cam.clip_to_prev_clip, sizeof(push.rows));
+    const bool have_vp = scene.xscale != 0.0f && scene.yscale != 0.0f;
+    push.vp_xy[0] = have_vp ? scene.xscale : 0.5f * float(in.width);
+    push.vp_xy[1] = have_vp ? scene.xoffset : 0.5f * float(in.width);
+    push.vp_xy[2] = have_vp ? scene.yscale : -0.5f * float(in.height);
+    push.vp_xy[3] = have_vp ? scene.yoffset : 0.5f * float(in.height);
+    push.vp_z[0] = have_vp && scene.zscale != 0.0f ? scene.zscale : 1.0f;
+    push.vp_z[1] = have_vp ? scene.zoffset : 0.0f;
     push.vp_z[2] = jx;
     push.vp_z[3] = jy;
     push.size[0] = in.width;
     push.size[1] = in.height;
-    push.size[2] = cam.mv_valid ? 1u : 0u;
-    push.size[3] = srgb_decode ? 1u : 0u; // bit 0: sRGB decode
+    push.size[2] = cam.valid ? 1u : 0u;
+    push.size[3] = (srgb_decode ? 1u : 0u) | (lum_prev_valid ? 2u : 0u);
+    {
+        static bool said = false;
+        if (!said && cam.valid) {
+            said = true;
+            BB::Upscale::Checkpoint(fmt::format(
+                "[mv149] camera vectors: 4x4 clip_to_prev, viewport {} ({:.1f},{:.1f},{:.1f},{:.1f} "
+                "z {:.3f},{:.3f}), reactive mask on, {}x{}",
+                have_vp ? "guest" : "derived", push.vp_xy[0], push.vp_xy[1], push.vp_xy[2],
+                push.vp_xy[3], push.vp_z[0], push.vp_z[1], in.width, in.height));
+        }
+    }
     const vk::DescriptorImageInfo depth_info{sampler, depth_view,
                                              vk::ImageLayout::eDepthStencilReadOnlyOptimal};
     const vk::DescriptorImageInfo mv_info{{}, motion.view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo src_info{sampler, flip_view,
                                            vk::ImageLayout::eShaderReadOnlyOptimal};
     const vk::DescriptorImageInfo col_info{{}, color.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo prev_info{{}, lum_prev.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo lum_info{{}, lum_cur.view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo rx_info{{}, reactive.view, vk::ImageLayout::eGeneral};
+    const auto storage = [](u32 binding, const vk::DescriptorImageInfo* info) {
+        return vk::WriteDescriptorSet{.dstBinding = binding,
+                                      .descriptorCount = 1,
+                                      .descriptorType = vk::DescriptorType::eStorageImage,
+                                      .pImageInfo = info};
+    };
     const std::array writes{
         vk::WriteDescriptorSet{.dstBinding = 0,
                                .descriptorCount = 1,
                                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
                                .pImageInfo = &depth_info},
-        vk::WriteDescriptorSet{.dstBinding = 1,
-                               .descriptorCount = 1,
-                               .descriptorType = vk::DescriptorType::eStorageImage,
-                               .pImageInfo = &mv_info},
+        storage(1, &mv_info),
         vk::WriteDescriptorSet{.dstBinding = 2,
                                .descriptorCount = 1,
                                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
                                .pImageInfo = &src_info},
-        vk::WriteDescriptorSet{.dstBinding = 3,
-                               .descriptorCount = 1,
-                               .descriptorType = vk::DescriptorType::eStorageImage,
-                               .pImageInfo = &col_info},
+        storage(3, &col_info),
+        storage(4, &prev_info),
+        storage(5, &lum_info),
+        storage(6, &rx_info),
     };
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
     cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
     cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
-    // bb-objmv-gpu: the per-object vectors (bb_objmv2.h) over the camera ones, for every consumer.
-    BB::ObjMv2::Compose(cmd, motion.view, color.view, in, cam.reset);
+    lum_index ^= 1;
+    lum_valid = true;
     Barrier(cmd, color, vk::ImageLayout::eShaderReadOnlyOptimal);
+    Barrier(cmd, reactive, vk::ImageLayout::eShaderReadOnlyOptimal);
     Barrier(cmd, motion, vk::ImageLayout::eShaderReadOnlyOptimal);
     Barrier(cmd, output, vk::ImageLayout::eGeneral);
     if (timed) {
@@ -345,7 +387,10 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                    vk::ImageLayout::eShaderReadOnlyOptimal, motion.usage};
     desc.output = {output.image, output.view, output.format, out, vk::ImageLayout::eGeneral,
                    output.usage};
-    desc.has_reactive = false;
+    desc.reactive = {reactive.image, reactive.view, reactive.format, in,
+                     vk::ImageLayout::eShaderReadOnlyOptimal, reactive.usage};
+    desc.has_reactive = std::getenv("BB_REACTIVE") == nullptr ||
+                        std::string_view{std::getenv("BB_REACTIVE")} != "0";
     desc.render = in;
     desc.upscale = out;
     desc.jitter[0] = jx;

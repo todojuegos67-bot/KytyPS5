@@ -496,6 +496,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     bb_sr = std::make_unique<BB::PresentSr>(instance);
+    bb_hud_fg = std::make_unique<BB::HudFg>(instance);
     rasterizer->bb_cut.SetUpscaler(bb_sr.get()); // bb-clean-021-bbport: the HUD cut runs it
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
@@ -607,6 +608,7 @@ void Presenter::BbDestroyGenerated(Frame* frame, u32 from) {
     for (u32 i = from; i < frame->generated.size(); ++i) {
         auto& generated = frame->generated[i];
         if (generated.view) device.destroyImageView(generated.view);
+        if (generated.rgba_view) device.destroyImageView(generated.rgba_view);
         if (generated.image) {
             vmaDestroyImage(instance.GetAllocator(), generated.image, generated.allocation);
         }
@@ -685,6 +687,14 @@ u32 Presenter::BbEnsureGenerated(Frame* frame, u32 count) {
             return i;
         }
         generated.view = view;
+        // bb-clean: an R8G8B8A8 view of the same memory (mutable) for the HUD overlay pass.
+        auto [rr, rgba] = device.createImageView({
+            .image = generated.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        });
+        if (rr == vk::Result::eSuccess) generated.rgba_view = rgba;
     }
     return count;
 }
@@ -1234,6 +1244,25 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
 
+    // bb-clean: the HUD as a separate UI layer for frame generation (bb_hud_fg.h): built from the
+    // finished frame, the HUD-less copy (when the HUD cut ran) and the previous real frame; drawn
+    // over DLSS-G's generated frames below and given to FSR 3 as its UI resource at the present.
+    const BB::FG::Image* bb_ui_layer = nullptr;
+    const bool bb_fg_on = !frame->is_hdr && frame->fg.valid &&
+                          (BB::FG::Dlss::Ready() || BB::FG::Fsr3Active());
+    if (bb_fg_on && std::getenv("BB_HUD_FG") == nullptr) {
+        bb_ui_layer = bb_hud_fg->Build(cmdbuf, frame->image, frame->image_view,
+                                       swapchain.GetSurfaceFormat().format,
+                                       {frame->width, frame->height},
+                                       frame->fg.has_hudless ? frame->fg.hudless.view
+                                                             : vk::ImageView{});
+    }
+    if (bb_fg_on) {
+        bb_hud_fg->NoteFrame(true, BB::FG::Name(), false);
+    }
+    frame->has_ui_layer = bb_ui_layer != nullptr;
+    if (bb_ui_layer) frame->ui_layer = *bb_ui_layer;
+
     // bb-clean-021-bbport: DLSS Frame Generation (Supermedo's PrepareFrame): the frames between
     // the previous frame and this one, from this frame (UI included) and its inputs.
     frame->generated_count = 0;
@@ -1290,6 +1319,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                                             instance.GetDevice());
             // A DLSS interposer may continue the recording in another command buffer.
             draw_scheduler.GetDynamicState().Invalidate();
+            if (bb_ui_layer) {
+                // bb-clean: the real frame's HUD over each generated one (never interpolated).
+                const bool bgra = frame->unorm_format == vk::Format::eB8G8R8A8Unorm;
+                for (u32 i = 0; i < frame->generated_count; ++i) {
+                    bb_hud_fg->Overlay(draw_scheduler.CommandBuffer(), frame->generated[i].rgba_view,
+                                       {frame->width, frame->height}, bgra);
+                }
+            }
             std::vector<vk::ImageMemoryBarrier2> back;
             for (auto b : to_general) {
                 if (b.image == frame->image ||
@@ -1308,8 +1345,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         BbDestroyGenerated(frame);
     }
     bb_sr->FrameEnd(draw_scheduler.CommandBuffer());
-    // bb-objmv-gpu3: the guest frame ended, after its compose pass (bb_sr->Run) was recorded.
-    BB::ObjMv2::OnFlip();
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -1720,6 +1755,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // frame's own inputs for a new game frame; none for a repeat). Nothing with BB_FG off.
     if (BB::FG::Fsr3Active()) {
         const bool fg_frame = !is_reusing_frame && is_game_frame && frame->fg.valid;
+        // bb-clean: this frame's HUD layer as the FG swapchain's UI resource (composited over the
+        // real and the generated frames after interpolation; registered in BeforePresent).
+        if (fg_frame && frame->has_ui_layer) {
+            BB::FG::SetUiLayer(&frame->ui_layer);
+            bb_hud_fg->NoteFrame(false, BB::FG::Name(), true);
+        }
         BB::FG::BeforePresent(fg_frame ? &frame->fg : nullptr, swapchain.GetHandle(),
                               swapchain.GetExtent(),
                               swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
@@ -1768,6 +1809,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 hudless ? "yes" : "no", cut.hudless, hudless, hudless_failed,
                 BB::FG::Dlss::Ready() ? (shown ? "on" : "idle") : "off", made, shown,
                 bb_frame_gen_limit.load(), game / sec, (presents + shown) / sec));
+            bb_hud_fg->LogSecond(sec);
             bb_sec_start = now;
         }
     }
