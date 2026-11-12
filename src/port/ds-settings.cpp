@@ -1367,6 +1367,11 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 	} else {
 		max();
 	}
+	// (11-12) Equilibrado, Ultra and Extremo: 1440p by default (changeable by hand afterwards).
+	if (preset == "equilibrado" || preset == "ultra" || preset == "extremo") {
+		s->fullscreen = true;
+		s->resolution = "2560x1440";
+	}
 	// (11-12) IBL and tessellation: Extremo at Alto + Completa; every other mode at the PS5 performance mode (mitad + medio).
 	if (preset == "extremo") {
 		s->ibl  = "completa";
