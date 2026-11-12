@@ -3613,8 +3613,7 @@ void LauncherPerformance(Settings& s) {
 	}
 	LCheckRow("Simular 16 GB RAM", s.simulate_ram16,
 	          "El juego se comporta como en un PC de 16 GB de RAM: limita la memoria que puede usar y activa el perfil de 16 GB.");
-	LCheckRow("Simular gráfica de 8 GB", s.simulate_vram8,
-	          "El juego se comporta como con una gráfica de 8 GB de memoria (VRAM): limita la memoria de vídeo que puede usar.");
+	// (11-12) "Simular grafica de 8 GB" removed (the owner: black textures with it).
 	BoxEnd();
 }
 

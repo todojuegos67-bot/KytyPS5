@@ -258,6 +258,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("calidad", s->quality);
 	str("reducir_texturas", s->texture_reduce);
 	boo("simular_vram_8gb", s->simulate_vram8);
+	s->simulate_vram8 = false; // (11-12) option removed: always off, whatever the file says
 	boo("todos_los_ccd", s->all_ccds);
 	boo("carga_shaders_maxima", s->shader_turbo);
 	str("precompilar_hilos", s->precompile_threads);
