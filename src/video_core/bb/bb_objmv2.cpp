@@ -165,7 +165,8 @@ struct State {
     // bb-skin-mv2: why a palette buffer had no previous copy (per buffer, 1 s), and draws whose
     // other palette buffers matched (the unmatched one reads its current data).
     std::array<u64, 8> vs_why{};
-    u64 vs_pal_partial = 0, vs_multi_pal = 0;
+    u64 vs_pal_partial = 0, vs_multi_pal = 0, vs_mesh = 0;
+    std::unordered_map<u64, u32> mesh_occ; // mesh draw -> occurrences this frame
     std::unordered_map<u64, u8> ring_seen_cur, ring_seen_prev; // ring keys drawn this / last frame
     bool skin_order = true; // BB_SKIN_MV=0: off (previous behaviour)
     u64 vs_frames = 0, vs_draws = 0, vs_native = 0, vs_static = 0, vs_skinned = 0,
@@ -750,7 +751,7 @@ bool CameraSimilar(const std::array<float, 216>& a, const std::array<float, 216>
 
 void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
                   VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler, u64 vs_hash,
-                  bool blend) {
+                  bool blend, u64 mesh) {
     const auto t0 = std::chrono::steady_clock::now();
     ++g.vs_draws;
     ++g.sec_draws;
@@ -947,6 +948,20 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                     }
                 }
             }
+            if (mesh != 0) {
+                // Last frame's palette of this handle in the same mesh draw (fallback: layout
+                // shifted or ring grew). Stored for every palette, used only when all else failed.
+                const u64 mkey = Mix(Mix(mesh, h), size);
+                if (have_cur) g.vel_id_cur.try_emplace(mkey, cur);
+                if (found == nullptr) {
+                    if (const auto it = g.vel_id_prev.find(mkey);
+                        it != g.vel_id_prev.end() && it->second.addr != 0 &&
+                        it->second.dwords == size / 4) {
+                        found = &it->second;
+                        ++g.vs_mesh;
+                    }
+                }
+            }
             if (found == nullptr) {
                 if (!have_cur) {
                     why = 0; // no copy of this frame (snapshot arena full / no buffer)
@@ -1040,7 +1055,14 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
     if (!g.ready || ui_phase) return;
     if (g.velocity) {
-        VelocityDraw(push, vs, memory, buffer_cache, scheduler, vs_hash, blend);
+        // Mesh identity (vertex program, index buffer, counts, occurrence this frame): palettes
+        // whose order / layout moved are matched to last frame's palette of the same mesh draw.
+        u64 mesh = 0;
+        if (!blend && g.skin_order) {
+            const u64 m = Mix(Mix(Mix(vs_hash, identity), count), instances);
+            mesh = Mix(Mix(m, 0x6d657368ull), g.mesh_occ[m]++);
+        }
+        VelocityDraw(push, vs, memory, buffer_cache, scheduler, vs_hash, blend, mesh);
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -1381,6 +1403,7 @@ void OnFlip() {
     g.ring_ord_of.clear();
     g.ring_ord_n.clear();
     g.ring_seen_cur.clear();
+    g.mesh_occ.clear();
     g.pal_ids.clear();
     if (had_pass) ++g.vs_frames;
     g.occ.clear();
@@ -1493,14 +1516,16 @@ void OnFlip() {
                         "size {:.1f}, ring with more palettes than last frame {:.1f}, order new "
                         "{:.1f}, order other size {:.1f}, order data differs {:.1f}, order "
                         "GPU-written + layout moved {:.1f} | draws kept by their other palette "
-                        "{:.1f}/frame, draws with 2+ palette buffers {:.1f}/frame",
+                        "{:.1f}/frame, draws with 2+ palette buffers {:.1f}/frame | palettes "
+                        "matched by mesh draw (index buffer + occurrence) {:.1f}/frame",
                         double(g.vs_why[0]) / f, double(g.vs_why[1]) / f,
                         double(g.vs_why[2]) / f, double(g.vs_why[3]) / f,
                         double(g.vs_why[4]) / f, double(g.vs_why[5]) / f,
                         double(g.vs_why[6]) / f, double(g.vs_why[7]) / f,
-                        double(g.vs_pal_partial) / f, double(g.vs_multi_pal) / f));
+                        double(g.vs_pal_partial) / f, double(g.vs_multi_pal) / f,
+                        double(g.vs_mesh) / f));
         g.vs_why.fill(0);
-        g.vs_pal_partial = g.vs_multi_pal = 0;
+        g.vs_pal_partial = g.vs_multi_pal = g.vs_mesh = 0;
         g.vs_skin_draws = g.vs_skin_draws_all = g.vs_ring_ord = g.vs_pal_layout = 0;
     }
     Log(fmt::format("[objmv-gpu6] moving test {}: palettes changed only by a common transform "
