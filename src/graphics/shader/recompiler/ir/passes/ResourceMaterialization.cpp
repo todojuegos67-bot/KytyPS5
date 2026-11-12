@@ -1949,6 +1949,13 @@ const char* UnsupportedResourceSpecialization(const Program&                prog
 	// ApplyResourceSpecialization's check, before it changes anything: enumerated candidates only
 	// sample (EmitImageSample), and an image load or query through one stopped the emulator in
 	// GT7's cafe. The shader is skipped for this specialization instead.
+	// Fewer resources than the program tracks (ApplyResourceSpecialization's EXIT_IF): a seed whose
+	// specialization does not fit this translation stopped the precompile with a fatal error
+	// (gt7-precompilar-20261112-054529: 31,367 programs, nothing saved); it fails alone now.
+	if (program.info.buffers.size() > specialization.buffers.size() ||
+	    program.info.images.size() > specialization.images.size()) {
+		return "the specialization holds fewer resources than the program tracks";
+	}
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();

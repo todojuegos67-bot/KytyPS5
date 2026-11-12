@@ -1127,8 +1127,12 @@ std::string RunPrecompile(const Runtime& rt, const Settings& s, const std::wstri
 	}
 	finished = code == 0 && final_flag == 1;
 	fs::remove(stop, ec);
-	// Done, skipped or failed: not run again by itself until something changes (Rendimiento: "Precompilar de nuevo").
-	WriteText(StampPath(rt), StampKey(rt, s));
+	// Done or skipped: not run again by itself until something changes (Rendimiento: "Precompilar de nuevo"). A
+	// precompile that died (a fatal error: gt7-precompilar-20261112-054529 stopped at 31,367 programs and saved
+	// nothing) is not stamped: before, its stamp left every later run compiling in game what it never made.
+	if (finished || skipping) {
+		WriteText(StampPath(rt), StampKey(rt, s));
+	}
 	if (!finished) {
 		return "La precompilación de shaders no terminó (código " + std::to_string(code) + "). Log: logs\\" +
 		       Utf8(log_path.filename().wstring());

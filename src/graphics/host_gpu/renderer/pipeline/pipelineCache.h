@@ -222,6 +222,16 @@ struct GraphicsPipelineBuild {
 	vk::SpecializationInfo                                                layer_limit_spec {};
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;
+	// Its guest seed (PipelineSeedState), for the pipelines compiled in game: 0 when not asked.
+	uint8_t                                                               seed_state = 0;
+};
+
+// What the guest seeds knew of a graphics pipeline the game made (PipelineCache::RecordPipelineSeed).
+enum PipelineSeedState : uint8_t {
+	SeedNotAsked    = 0, // precompile mode
+	SeedKnown       = 1, // its record was in guest.seeds: the precompile should have made it
+	SeedNew         = 2, // recorded now: the next precompile makes it
+	SeedUnrecorded  = 3, // no record (a program without a seed, a coverage copy, recording off)
 };
 
 // A graphics pipeline a worker thread compiles (see PipelineCache::TryGetGraphicsPipeline).
@@ -446,8 +456,8 @@ private:
 	struct GraphicsPipelineKeyHash {
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
-	void RecordPipelineSeed(const GraphicsPipelineKey& key, const GraphicsPrograms& programs,
-	                        uint32_t vertex_stages, bool ps_active);
+	[[nodiscard]] uint8_t RecordPipelineSeed(const GraphicsPipelineKey& key, const GraphicsPrograms& programs,
+	                                         uint32_t vertex_stages, bool ps_active);
 	static uint64_t SeedFormat();
 
 	GraphicContext&               m_graphics;
@@ -581,6 +591,8 @@ struct PipelineMadeCounts {
 	std::atomic<uint64_t>    graphics_compiled {0};
 	std::atomic<uint64_t>    compute_cached {0};
 	std::atomic<uint64_t>    compute_compiled {0};
+	// Graphics compiled in game by PipelineSeedState (1..3).
+	std::atomic<uint64_t>    graphics_compiled_seed[4] {};
 };
 PipelineMadeCounts& MadeCounts();
 bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

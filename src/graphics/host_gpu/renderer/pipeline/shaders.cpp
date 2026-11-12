@@ -829,9 +829,28 @@ vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
 		                    std::chrono::steady_clock::now() - create_begin)
 		                    .count();
 		auto& counts = MadeCounts();
-		(cache_only || ms < PipelineMadeCounts::CachedMs ? counts.graphics_cached
-		                                                 : counts.graphics_compiled)
+		const bool compiled = !cache_only && ms >= PipelineMadeCounts::CachedMs;
+		(compiled ? counts.graphics_compiled : counts.graphics_cached)
 		    .fetch_add(1, std::memory_order_relaxed);
+		if (compiled && build.seed_state != SeedNotAsked && build.seed_state <= SeedUnrecorded) {
+			counts.graphics_compiled_seed[build.seed_state].fetch_add(1, std::memory_order_relaxed);
+			// KYTY_SHADER_MISS_LOG=<n> (64 by default, 0: none): the first named, with why the
+			// precompile did not make them (only when one is compiled: nothing per draw).
+			static const uint32_t miss_log = [] {
+				const char* v = std::getenv("KYTY_SHADER_MISS_LOG");
+				return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 64u;
+			}();
+			static std::atomic<uint32_t> logged {0};
+			if (logged.load(std::memory_order_relaxed) < miss_log &&
+			    logged.fetch_add(1, std::memory_order_relaxed) < miss_log) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Pipeline compiled in game: VS 0x{:016x} PS 0x{:016x}, {} ms, {}\n",
+				    build.vs_hash, build.ps_hash, static_cast<long long>(ms),
+				                 build.seed_state == SeedKnown ? "in guest.seeds before this run"
+				                 : build.seed_state == SeedNew ? "new to the seeds"
+				                                               : "without a seed"));
+			}
+		}
 	}
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

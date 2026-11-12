@@ -267,14 +267,16 @@ uint64_t ProgramHash(uint64_t id) {
 	return it == s.programs.end() ? 0 : it->second;
 }
 
-void RecordPipeline(std::vector<uint8_t> payload) {
+bool RecordPipeline(std::vector<uint8_t> payload) {
 	auto&           s    = S();
 	const auto      hash = XXH3_64bits(payload.data(), payload.size());
 	std::lock_guard lock(s.mutex);
 	if (s.records.insert(hash).second) {
 		s.new_records++;
 		Enqueue(hash, std::move(payload));
+		return false;
 	}
+	return true;
 }
 
 void Flush() {

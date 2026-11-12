@@ -50,7 +50,8 @@ void Open(const std::filesystem::path& directory, uint64_t format);
 void RecordProgram(uint64_t hash, std::vector<uint8_t> payload, std::span<const uint64_t> ids);
 // The record hash of the program with this id in this run, or 0.
 [[nodiscard]] uint64_t ProgramHash(uint64_t id);
-void RecordPipeline(std::vector<uint8_t> payload);
+// True when the record was already known (in guest.seeds or recorded earlier this run).
+bool RecordPipeline(std::vector<uint8_t> payload);
 void Flush();
 
 [[nodiscard]] bool PrecompileRequested();

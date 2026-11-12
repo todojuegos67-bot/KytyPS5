@@ -5229,15 +5229,15 @@ void PipelineCache::InitializeDriverCache() {
 	                 (older_bytes + initial_data.size()) >> 20u);
 }
 
-void PipelineCache::RecordPipelineSeed(const GraphicsPipelineKey& key, const GraphicsPrograms& programs,
-                                       uint32_t vertex_stages, bool ps_active) {
+uint8_t PipelineCache::RecordPipelineSeed(const GraphicsPipelineKey& key, const GraphicsPrograms& programs,
+                                          uint32_t vertex_stages, bool ps_active) {
 	ShaderDiskCache::ByteWriter payload;
 	payload.Put(PipelineSeeds::KindPipeline);
 	payload.Put(static_cast<uint8_t>(vertex_stages));
 	for (uint32_t i = 0; i < vertex_stages; i++) {
 		const auto hash = PipelineSeeds::ProgramHash(programs.vertex[i].id);
 		if (hash == 0) {
-			return; // a program without a seed (recording was off when it was made)
+			return SeedUnrecorded; // a program without a seed (recording was off when it was made)
 		}
 		payload.Put(hash);
 		payload.Put(programs.vertex[i].normalized_samplers);
@@ -5246,7 +5246,7 @@ void PipelineCache::RecordPipelineSeed(const GraphicsPipelineKey& key, const Gra
 	if (ps_active) {
 		const auto hash = PipelineSeeds::ProgramHash(programs.pixel.id);
 		if (hash == 0) {
-			return;
+			return SeedUnrecorded;
 		}
 		payload.Put(hash);
 	}
@@ -5262,7 +5262,7 @@ void PipelineCache::RecordPipelineSeed(const GraphicsPipelineKey& key, const Gra
 		payload.Put(key.vertex_input.attributes[i].offset);
 		payload.Put(key.vertex_input.attributes[i].binding);
 	}
-	PipelineSeeds::RecordPipeline(std::move(payload.bytes));
+	return PipelineSeeds::RecordPipeline(std::move(payload.bytes)) ? SeedKnown : SeedNew;
 }
 
 uint64_t PipelineCache::SeedFormat() {
@@ -5585,6 +5585,15 @@ void PipelineCache::LogPipelinesMade() {
 	                 counts.graphics_cached.load(), counts.graphics_compiled.load(),
 	                 counts.compute_cached.load(), counts.compute_compiled.load(), m_background_started,
 	                 seeded, unseeded, PipelineMadeCounts::CachedMs);
+	// Why the graphics pipelines compiled in game were not made by the precompile.
+	PipelineCacheLog("Graphics pipelines compiled in game: {} in guest.seeds before this run (the "
+	                 "precompile did not make them: it failed, did not run since, or the driver "
+	                 "dropped them), {} new to the seeds (made by the next precompile), {} without "
+	                 "a seed (a program without one, a coverage copy or KYTY_PIPELINE_SEEDS=0); "
+	                 "the first KYTY_SHADER_MISS_LOG are named by \"Pipeline compiled in game\"",
+	                 counts.graphics_compiled_seed[SeedKnown].load(),
+	                 counts.graphics_compiled_seed[SeedNew].load(),
+	                 counts.graphics_compiled_seed[SeedUnrecorded].load());
 }
 void PipelineCache::Save() {
 	PipelineSeeds::Flush();
@@ -7016,10 +7025,11 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	uint8_t seed_state = SeedUnrecorded;
 	if (PipelineSeeds::Recording() && coverage_module == nullptr) {
 		// Guest pipeline seeds (pipelineSeeds.h): once per new pipeline, its programs by their
 		// seeds and the key's state.
-		RecordPipelineSeed(key, programs, static_cast<uint32_t>(vertex_info.size()), ps_active);
+		seed_state = RecordPipelineSeed(key, programs, static_cast<uint32_t>(vertex_info.size()), ps_active);
 	}
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
@@ -7027,6 +7037,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	build_programs.coverage_module = coverage_module;
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
 	                                     vertex_info, ps_input_info, build_programs, static_params);
+	build->seed_state = seed_state;
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 	uint64_t vertex_words = 0;
 	for (const auto& program: programs.vertex) {
