@@ -3569,9 +3569,12 @@ struct PipelineCache::ProgramCache {
 				        ? function_expander.ExcludeFailedCallTarget(lookup_key.function_code, pc)
 				        : 0;
 				// Not kept for the next run either (SaveCallTargets): its expansion would give up
-				// again before the exclusion is learned.
+				// again before the exclusion is learned. The exclusion itself is kept
+				// (excluded_call_targets.txt, KYTY_CALL_EXCLUDED_KEEP), with a hash of the words
+				// at the target, so the next run leaves the target out from its first expansion.
 				if (target != 0) {
 					excluded_call_targets.insert(target);
+					NoteExcludedTarget(target);
 				} else {
 					gave_up_call_shaders.insert(params.hash);
 				}
@@ -3732,6 +3735,8 @@ struct PipelineCache::ProgramCache {
 		if (disk != nullptr) {
 			call_targets_path = disk->Directory() / "call_targets.txt";
 			LoadCallTargets();
+			excluded_targets_path = disk->Directory() / "excluded_call_targets.txt";
+			LoadExcludedTargets();
 		}
 		if (g_async_translation) {
 			// KYTY_TRANSLATION_THREADS=<n> (default a third of the processors, 2 to 12, at below
@@ -3772,6 +3777,137 @@ struct PipelineCache::ProgramCache {
 			disk->LogTotals("saved");
 		}
 		SaveCallTargets();
+		SaveExcludedTargets();
+		// Round rtfix: translations (partitions of table calls among them) whose program was never
+		// made before the end of the run: neither their source nor their permutation is on disk,
+		// so the next run translates them again under the same key.
+		if (!translating.empty()) {
+			size_t expansions = 0;
+			for (const auto& [key, job]: translating) {
+				(void)job;
+				expansions += key.function_code.empty() ? 0u : 1u;
+			}
+			PipelineCacheLog("Shader translations left unbuilt at the end: {} ({} expansions)",
+			                 translating.size(), expansions);
+		}
+	}
+
+	// Round rtfix: table targets whose inlined bodies failed resource tracking
+	// (ExcludeFailedCallTarget), kept between runs: each run learned them again, one failed
+	// translation of the expansion (and a miss of the shader disk cache under the same key as the
+	// run before) per target. A kept target is excluded only once the guest words at its address
+	// hash as they did when it failed (ExcludedWordsHash), so other code at that address in a
+	// later run is not left out. KYTY_CALL_EXCLUDED_KEEP=0: neither read nor written.
+	static bool KeepExcludedTargets() {
+		static const bool value = [] {
+			const char* text = std::getenv("KYTY_CALL_EXCLUDED_KEEP");
+			return text == nullptr || text[0] != '0';
+		}();
+		return value;
+	}
+	static constexpr const char* ExcludedTargetsHeader = "kyty excluded call targets 1";
+	static constexpr size_t      ExcludedHashWords     = 64;
+
+	// 0 when the words cannot be read.
+	static uint64_t ExcludedWordsHash(uint64_t target) {
+		std::array<uint32_t, ExcludedHashWords> words {};
+		if (!ReadShaderGuestMemoryRaw(nullptr, target, words)) {
+			return 0;
+		}
+		const auto hash = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+		return hash != 0 ? hash : 1;
+	}
+
+	void NoteExcludedTarget(uint64_t target) {
+		if (!KeepExcludedTargets() || excluded_hashes.size() >= 65536) {
+			return;
+		}
+		if (const auto hash = ExcludedWordsHash(target); hash != 0) {
+			excluded_hashes[target] = hash;
+		}
+	}
+
+	void LoadExcludedTargets() {
+		if (!KeepExcludedTargets() || excluded_targets_path.empty()) {
+			return;
+		}
+		std::ifstream file(excluded_targets_path);
+		if (!file) {
+			return;
+		}
+		std::string line;
+		if (!std::getline(file, line)) {
+			return;
+		}
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+		if (line != ExcludedTargetsHeader) {
+			return;
+		}
+		while (std::getline(file, line) && pending_exclusions.size() < 65536) {
+			uint64_t target = 0;
+			uint64_t hash   = 0;
+			if (std::sscanf(line.c_str(), "%" SCNx64 " %" SCNx64, &target, &hash) == 2 &&
+			    target != 0 && hash != 0) {
+				pending_exclusions.emplace_back(target, hash);
+			}
+		}
+		PipelineCacheLog("Table call targets: {} excluded by earlier runs (applied once their code "
+		                 "matches)",
+		                 pending_exclusions.size());
+	}
+
+	// Called before expansions: the kept exclusions whose code is readable now are applied (when
+	// it is the code that failed) or dropped (other code).
+	void ApplyPendingExclusions() {
+		if (pending_exclusions.empty() || (pending_tries++ & 63u) != 0) {
+			return;
+		}
+		std::erase_if(pending_exclusions, [&](const std::pair<uint64_t, uint64_t>& kept) {
+			const auto hash = ExcludedWordsHash(kept.first);
+			if (hash == 0) {
+				return false;
+			}
+			if (hash == kept.second) {
+				(void)function_expander.ExcludeCallTarget(kept.first);
+				excluded_call_targets.insert(kept.first);
+				excluded_hashes[kept.first] = hash;
+				exclusions_applied++;
+			}
+			return true;
+		});
+	}
+
+	void SaveExcludedTargets() {
+		if (!KeepExcludedTargets() || excluded_targets_path.empty() ||
+		    (excluded_hashes.empty() && pending_exclusions.empty())) {
+			return;
+		}
+		std::string text = std::string(ExcludedTargetsHeader) + "\n";
+		for (const auto& [target, hash]: excluded_hashes) {
+			text += fmt::format("{:016x} {:016x}\n", target, hash);
+		}
+		// Not seen this run: kept for a later one.
+		for (const auto& [target, hash]: pending_exclusions) {
+			if (!excluded_hashes.contains(target)) {
+				text += fmt::format("{:016x} {:016x}\n", target, hash);
+			}
+		}
+		auto temp_path = excluded_targets_path;
+		temp_path += ".tmp";
+		{
+			std::ofstream file(temp_path, std::ios::binary | std::ios::trunc);
+			file << text;
+			if (!file.flush()) {
+				return;
+			}
+		}
+		std::error_code error;
+		std::filesystem::rename(temp_path, excluded_targets_path, error);
+		PipelineCacheLog("Table call targets: {} excluded kept for the next run ({} applied from "
+		                 "earlier runs)",
+		                 excluded_hashes.size(), exclusions_applied);
 	}
 
 	// Round 95: the table call targets the GPU reported (ReportShaderCallMiss), kept between runs
@@ -4029,6 +4165,7 @@ struct PipelineCache::ProgramCache {
 			expanded.clear();
 			return;
 		}
+		ApplyPendingExclusions();
 		// Round 82 (from the Frank fork, 1165e585 / 76e4833d): a shader the expander found to make
 		// no calls is not expanded again while the shader map's hash of its code is the same (the
 		// program lookup trusts that hash too): the expander compared the whole code at every
@@ -4178,6 +4315,12 @@ struct PipelineCache::ProgramCache {
 	static constexpr uint64_t    MaxKeptCallTargets = 65536;
 	std::filesystem::path        call_targets_path;
 	std::unordered_set<uint64_t> call_shaders;
+	// Round rtfix: excluded_call_targets.txt (LoadExcludedTargets, SaveExcludedTargets).
+	std::filesystem::path                          excluded_targets_path;
+	std::unordered_map<uint64_t, uint64_t>         excluded_hashes;
+	std::vector<std::pair<uint64_t, uint64_t>>     pending_exclusions;
+	uint64_t                                       pending_tries      = 0;
+	uint64_t                                       exclusions_applied = 0;
 	// Targets an expansion left out after their inlined bodies failed resource tracking, and
 	// shaders whose expansion gave up outside any inlined body: not kept.
 	std::unordered_set<uint64_t> excluded_call_targets;

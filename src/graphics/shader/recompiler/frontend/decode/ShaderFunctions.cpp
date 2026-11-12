@@ -1820,6 +1820,12 @@ uint64_t ShaderFunctionExpander::ExcludeFailedCallTarget(std::span<const uint32_
 	return 0;
 }
 
+bool ShaderFunctionExpander::ExcludeCallTarget(uint64_t target) {
+	if (target == 0 || !m_impl->excluded.insert(target).second) return false;
+	m_impl->exclusion_generation++;
+	return true;
+}
+
 bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,

@@ -180,6 +180,9 @@ public:
 	// expansions, of every shader, and takes the miss path instead. Returns that target, or 0
 	// when pc is in no inlined table body.
 	uint64_t ExcludeFailedCallTarget(std::span<const uint32_t> expanded, uint32_t pc);
+	// A table target an earlier run excluded (ExcludeFailedCallTarget, kept between runs by the
+	// pipeline cache): left out of later expansions from now on. False when it already was.
+	bool ExcludeCallTarget(uint64_t target);
 
 private:
 	struct Impl;

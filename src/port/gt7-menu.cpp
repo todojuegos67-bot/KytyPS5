@@ -14,6 +14,7 @@
 #include <shellapi.h>
 
 #include <SDL3/SDL.h>
+#include <cstdlib>
 
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
@@ -955,7 +956,17 @@ std::string StampKey(const Runtime& rt, const Settings& s) {
 	const fs::path  shipped = ShippedSeeds(rt);
 	const std::string seeds = shipped.empty() ? std::string("-")
 	                                          : Utf8(shipped.filename().wstring()) + "/" + std::to_string(fs::file_size(shipped, ec));
+	// The player's own guest.seeds too (each run appends the programs and pipelines new to it): before, only the
+	// release's file counted, so a run's new seeds were never precompiled (the next run made them in game again).
+	// Its size, not its time (a run that adds nothing leaves it as it was). KYTY_PRECOMPILE_NEW_SEEDS=0: as before.
+	std::string own = "-";
+	if (const char* v = std::getenv("KYTY_PRECOMPILE_NEW_SEEDS"); v == nullptr || v[0] != '0') {
+		const auto own_size = fs::file_size(CacheDir(rt) / L"guest.seeds", ec);
+		own                 = ec ? std::string("-") : std::to_string(own_size);
+		ec.clear();
+	}
 	return "gpu=" + DriverKey(rt) + "\nemulador=" + std::to_string(size) + "/" + std::to_string(time) + "\nsemillas=" + seeds +
+	       "\nsemillas_propias=" + own +
 	       "\ngpu_indice=" +
 	       std::to_string(s.gpu) + "\nbindless=" + (s.bindless ? "1" : "0") + "\nteselado=" + (s.tessellation ? "1" : "0") + "\n";
 }
@@ -993,7 +1004,7 @@ bool PrecompileDue(const Runtime& rt, const Settings& s, std::string* why) {
 	}
 	const std::string stamp = ReadText(StampPath(rt));
 	if (stamp == StampKey(rt, s)) return false;
-	if (why != nullptr) *why = stamp.empty() ? "primera vez" : "cambió la gráfica, el driver, el emulador, las semillas o una opción";
+	if (why != nullptr) *why = stamp.empty() ? "primera vez" : "cambió la gráfica, el driver, el emulador, las semillas (o hay semillas nuevas de la última partida) o una opción";
 	return true;
 }
 
