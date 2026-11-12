@@ -133,6 +133,7 @@ struct Program {
 	bool                            fail_if_global_not_resolved = true;
 	bool                            dbg_print_reloc             = false;
 	bool                            relocated                   = false;
+	uint32_t                        load_count                  = 0; // Successful sceKernelLoadStartModule calls.
 	uint64_t                        proc_param_vaddr            = 0;
 	uint64_t                        custom_call_plt_vaddr       = 0;
 	uint32_t                        custom_call_plt_num         = 0;
