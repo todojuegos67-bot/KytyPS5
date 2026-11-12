@@ -1252,7 +1252,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const bool bb_fg_on = !frame->is_hdr && frame->fg.valid &&
                           (BB::FG::Dlss::Ready() ||
                            (BB::FG::Fsr3Active() && std::getenv("BB_FSR3_UI_LAYER") != nullptr));
-    if (bb_fg_on && std::getenv("BB_HUD_FG") == nullptr) {
+    // bb-clean-3: opt-in (BB_HUD_FG=1). With DLSS-G x2 on (31 of 31 generated and presented)
+    // the user saw no frame generation: the HUD-less diff can cover the whole picture (the copy
+    // at the cut is not bit-equal to the finished frame), and the overlay then replaced every
+    // generated frame with the real one. DLSS-G / FSR 3 get the HUD-less image as in 370.
+    static const bool hud_fg = [] {
+        const char* v = std::getenv("BB_HUD_FG");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (bb_fg_on && hud_fg) {
         bb_ui_layer = bb_hud_fg->Build(cmdbuf, frame->image, frame->image_view,
                                        swapchain.GetSurfaceFormat().format,
                                        {frame->width, frame->height},

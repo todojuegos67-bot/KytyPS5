@@ -389,8 +389,11 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                    output.usage};
     desc.reactive = {reactive.image, reactive.view, reactive.format, in,
                      vk::ImageLayout::eShaderReadOnlyOptimal, reactive.usage};
-    desc.has_reactive = std::getenv("BB_REACTIVE") == nullptr ||
-                        std::string_view{std::getenv("BB_REACTIVE")} != "0";
+    // bb-clean-3: not for DLSS (Streamline has no R8_UNORM in its format table: "Cannot have
+    // undefined format" several times per frame); FSR 3.1 / XeSS take it. BB_REACTIVE=0 off.
+    desc.has_reactive = BB::Upscale::Cfg().kind != BB::SR::Kind::Dlss &&
+                        (std::getenv("BB_REACTIVE") == nullptr ||
+                         std::string_view{std::getenv("BB_REACTIVE")} != "0");
     desc.render = in;
     desc.upscale = out;
     desc.jitter[0] = jx;
