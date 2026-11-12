@@ -45,6 +45,22 @@ void AddClassicCycles(uint64_t cycles);
 // GPU thread: whether this hit should go the classic way (every 64th).
 [[nodiscard]] bool CalibrateNext();
 
+// gt7-caches-1112: the caches' pre-resolved work (KYTY_SYNC_SKIP=1: a written buffer sync of a
+// range already all GPU-dirty is skipped). GPU thread only. A "Caches" line every 10 s after the
+// "Spec" line, while one of them is on.
+[[nodiscard]] bool SyncSkipEnabled();
+enum class CacheCounter : uint32_t {
+	SyncSkipHit,  // written syncs skipped
+	SyncSkipMiss, // written syncs that had to run (some page not GPU-dirty yet)
+	Count,
+};
+void CacheAdd(CacheCounter counter, uint64_t value = 1);
+// The cycles of a hit's check, and of a full written sync of a range the check passed (every
+// 64th hit runs the full sync to measure what a skip saves).
+void AddSyncCheckCycles(uint64_t cycles);
+void AddSyncFullCycles(uint64_t cycles);
+[[nodiscard]] bool CalibrateSyncNext();
+
 // GPU thread, after the "GPU phases" line: the "Spec" line (Log::WriteUnmuted).
 void Report(double cycles_per_us, double seconds);
 

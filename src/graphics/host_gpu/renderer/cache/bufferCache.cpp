@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/speculation.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
 #include "graphics/host_gpu/timeline.h"
@@ -2337,6 +2338,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		RecordSync(size, false, false, 0.0);
 		return false;
 	}
+	// gt7-caches-1112, KYTY_SYNC_SKIP=1: a written sync of a range whose pages are all GPU-dirty
+	// already has nothing to upload (no page can be CPU-dirty or hot) and sets bits and
+	// protections that are set: skipped. Every 64th hit runs the full sync to measure the saving.
+	uint64_t skip_start = 0;
+	if (is_written && !is_texel_buffer && t_guest_gpu_thread &&
+	    Libs::Graphics::Speculation::SyncSkipEnabled()) {
+		namespace Spec = Libs::Graphics::Speculation;
+		skip_start     = GpuPhases::Now();
+		if (m_memory_tracker.IsRangeAllGpuDirtyHint(vaddr, size)) {
+			if (!Spec::CalibrateSyncNext()) {
+				Spec::CacheAdd(Spec::CacheCounter::SyncSkipHit);
+				Spec::AddSyncCheckCycles(GpuPhases::Now() - skip_start);
+				RecordSync(size, true, false, 0.0);
+				return false;
+			}
+		} else {
+			Spec::CacheAdd(Spec::CacheCounter::SyncSkipMiss);
+			skip_start = 0;
+		}
+	}
 	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
 	// times the tracker walk only with KYTY_SYNC_STATS=1.
 	static const bool timed = std::getenv("KYTY_SYNC_STATS") != nullptr;
@@ -2367,6 +2388,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
 	if (source) {
 		RecordUpload(buffer, copies, total_size, source);
+	}
+	if (skip_start != 0) {
+		// A calibration: the full sync of a range the skip would have passed.
+		Libs::Graphics::Speculation::AddSyncFullCycles(GpuPhases::Now() - skip_start);
 	}
 	if (is_texel_buffer && !is_written) {
 		KYTY_PROFILER_BLOCK("Sync::TexelImage");
