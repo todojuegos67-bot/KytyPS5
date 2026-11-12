@@ -6,7 +6,11 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -1414,6 +1418,43 @@ private:
 				}
 			}
 			bad_dword = 0;
+		}
+		if (!ValidateSource(descriptor, bad_dword, reason) && expected == ValueOpcode::GetSamplerResource &&
+		    width == 4u && handle->NumArgs() == 4u) {
+			// From the GT7 port: a sampler the host cannot evaluate before the draw (a bindless
+			// sampler, read per material from a sampler heap) is sampled with one fixed sampler
+			// (trilinear, wrap, full LOD range) instead of ending the emulator; only the filtering
+			// and edge addressing can differ from the material's own. An explicit-LOD gather takes
+			// point mips.
+			constexpr std::array<uint32_t, 4> DefaultSampler {
+			    0x00000000u,                             // wrap on every axis
+			    0xfffu << 12u,                           // max_lod 255.9
+			    (1u << 20u) | (1u << 22u) | (2u << 26u), // bilinear mag/min, linear mip
+			    0x00000000u};
+			const bool point_mip = std::ranges::any_of(handle->Uses(), [&](const Use& use) {
+				const auto& user = *use.user;
+				if (user.GetOpcode() != ValueOpcode::ImageGatherRaw) return false;
+				const auto index = user.Flags<MemoryFlags>().index;
+				return index < m_program.memory_info.size() &&
+				       (m_program.memory_info[index].image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
+			});
+			for (uint32_t dword = 0; dword < 4u; dword++) {
+				auto word = DefaultSampler[dword];
+				if (dword == 2u && point_mip) {
+					word = (word & ~(3u << 26u)) | (1u << 26u); // point mip
+				}
+				handle->SetArg(dword, Value(word));
+			}
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+				std::printf("shader resource tracking: hash=0x%016" PRIx64
+				            " pc=0x%08x sampler dword %u (%s): using a default sampler\n",
+				            m_program.shader_hash, pc, bad_dword, reason.c_str());
+			}
+			descriptor = {};
+			MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
+			bad_dword = 0;
+			reason.clear();
 		}
 		if (!ValidateSource(descriptor, bad_dword, reason)) {
 			const auto indirect = m_indirect_reasons.find(handle);
