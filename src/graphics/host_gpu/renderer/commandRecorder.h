@@ -292,19 +292,21 @@ public:
 	}
 	// vkUpdateDescriptorSets of a set allocated for this command buffer, then its bind: both move
 	// to the recording thread (the update is driver work too). The set must not be in use yet.
+	// `first_set`: the set number it is bound as (KYTY_FASTDRAW_IMAGESET's set 2; 0 otherwise).
 	void updateAndBindDescriptorSet(vk::Device device, vk::PipelineBindPoint bind_point,
 	                                vk::PipelineLayout layout, vk::DescriptorSet set,
-	                                uint32_t count, const vk::WriteDescriptorSet* writes) const {
+	                                uint32_t count, const vk::WriteDescriptorSet* writes,
+	                                uint32_t first_set = 0) const {
 		if (!Threaded()) {
 			device.updateDescriptorSets(count, writes, 0, nullptr);
-			m_direct.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
+			m_direct.bindDescriptorSets(bind_point, layout, first_set, 1, &set, 0, nullptr);
 			return;
 		}
 		const auto* copy = StashWrites(writes, count);
 		m_scheduler->Record([=](vk::CommandBuffer command) {
 			ScrubDeadDescriptorViews(copy, count, "recorded descriptors");
 			device.updateDescriptorSets(count, copy, 0, nullptr);
-			command.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
+			command.bindDescriptorSets(bind_point, layout, first_set, 1, &set, 0, nullptr);
 		});
 	}
 	void pipelineBarrier(vk::PipelineStageFlags source, vk::PipelineStageFlags destination,

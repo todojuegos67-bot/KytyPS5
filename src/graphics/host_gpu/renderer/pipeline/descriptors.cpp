@@ -4220,6 +4220,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_images.reserve(descriptor_count);
 	m_descriptor_writes.reserve(write_count);
+	// KYTY_FASTDRAW_IMAGESET: the writes of set 2 (the stages' images and samplers), when the
+	// pipeline has that set; their infos stay in m_descriptor_images like the others.
+	thread_local std::vector<vk::WriteDescriptorSet> image_set_writes;
+	image_set_writes.clear();
+	const bool image_set = pipeline.image_set_layout != nullptr;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -4433,7 +4438,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (m_descriptor_images.size() != image_start) {
 				write.pImageInfo = m_descriptor_images.data() + image_start;
 			}
-			m_descriptor_writes.push_back(write);
+			if (image_set && ShaderRecompiler::IR::NativeDescriptorSet(binding.kind) ==
+			                     ShaderRecompiler::IR::ImageSetDescriptorSet) {
+				image_set_writes.push_back(write);
+			} else {
+				m_descriptor_writes.push_back(write);
+			}
 		}
 		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
 			const auto expected =
@@ -4476,6 +4486,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
 			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data());
 		}
+	}
+	if (!image_set_writes.empty()) {
+		// A fresh set each time (DescriptorHeap), updated and bound on the recording thread.
+		ScrubDeadDescriptorViews(image_set_writes.data(),
+		                         static_cast<uint32_t>(image_set_writes.size()),
+		                         "a draw's image set");
+		const auto set = m_context.GetDescriptorHeap().Commit(pipeline.image_set_layout);
+		for (auto& write: image_set_writes) {
+			write.dstSet = set;
+		}
+		vk_buffer.updateAndBindDescriptorSet(
+		    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
+		    static_cast<uint32_t>(image_set_writes.size()), image_set_writes.data(),
+		    ShaderRecompiler::IR::ImageSetDescriptorSet);
 	}
 	if (pipeline.uses_bindless) {
 		const auto set = m_context.GetGraphics().bindless_set;

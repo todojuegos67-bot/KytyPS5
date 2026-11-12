@@ -5024,6 +5024,9 @@ PipelineCache::~PipelineCache() {
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
+			if (pipeline->image_set_layout != nullptr) {
+				m_graphics.device.destroyDescriptorSetLayout(pipeline->image_set_layout, nullptr);
+			}
 		}
 	};
 	for (const auto quick: m_quick_retired) {
@@ -5444,6 +5447,8 @@ void PipelineCache::PrecompileSeeds() {
 			if (pipeline.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout);
 			if (pipeline.descriptor_set_layout != nullptr)
 				m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout);
+			if (pipeline.image_set_layout != nullptr)
+				m_graphics.device.destroyDescriptorSetLayout(pipeline.image_set_layout);
 		}
 	});
 
@@ -5543,6 +5548,8 @@ void PipelineCache::PrecompileSeeds() {
 			if (pipeline.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout);
 			if (pipeline.descriptor_set_layout != nullptr)
 				m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout);
+			if (pipeline.image_set_layout != nullptr)
+				m_graphics.device.destroyDescriptorSetLayout(pipeline.image_set_layout);
 		});
 	}
 

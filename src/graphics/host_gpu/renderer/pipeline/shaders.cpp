@@ -278,11 +278,18 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
+// `image_bindings`: with KYTY_FASTDRAW_IMAGESET, where the images and samplers go (set 2,
+// IR::NativeDescriptorSet); without it they stay in `descriptor_bindings` (set 0), as before.
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
+                              std::vector<vk::DescriptorSetLayoutBinding>& image_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
                               vk::ShaderStageFlagBits              stage) {
 	for (const auto& binding: program.bindings.descriptors) {
-		descriptor_bindings.push_back(
+		auto& target = ShaderRecompiler::IR::NativeDescriptorSet(binding.kind) ==
+		                       ShaderRecompiler::IR::ImageSetDescriptorSet
+		                   ? image_bindings
+		                   : descriptor_bindings;
+		target.push_back(
 		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
 		     NativeDescriptorType(binding.kind), NativeDescriptorCount(binding), stage, nullptr});
 	}
@@ -294,10 +301,24 @@ static bool UsesBindless(const ShaderRecompiler::IR::CompiledShaderInfo& program
 	                           &ShaderRecompiler::IR::SamplerResource::bindless);
 }
 
+// An empty descriptor set layout: set 1 of a KYTY_FASTDRAW_IMAGESET pipeline without bindless
+// images (a pipeline layout's sets below its last must all be valid layouts). Made once, kept for
+// the device's life.
+static vk::DescriptorSetLayout EmptySetLayout(GraphicContext& graphics) {
+	static const vk::DescriptorSetLayout layout = [&] {
+		vk::DescriptorSetLayoutCreateInfo create {};
+		vk::DescriptorSetLayout           made = nullptr;
+		EXIT_IF(graphics.device.createDescriptorSetLayout(&create, nullptr, &made) !=
+		        vk::Result::eSuccess);
+		return made;
+	}();
+	return layout;
+}
+
 // Set 0 is the pipeline's own descriptors; set 1, when a stage samples bindless images, is the
-// shared bindless table.
+// shared bindless table; set 2, with KYTY_FASTDRAW_IMAGESET, the stages' own images and samplers.
 static void FillSetLayouts(GraphicContext& graphics, const PipelineCache::Pipeline& pipeline,
-                           std::array<vk::DescriptorSetLayout, 2>& layouts, uint32_t& count) {
+                           std::array<vk::DescriptorSetLayout, 3>& layouts, uint32_t& count) {
 	layouts[0] = pipeline.descriptor_set_layout;
 	count      = 1;
 	if (pipeline.uses_bindless) {
@@ -305,6 +326,28 @@ static void FillSetLayouts(GraphicContext& graphics, const PipelineCache::Pipeli
 		layouts[1] = graphics.bindless_layout;
 		count      = 2;
 	}
+	if (pipeline.image_set_layout != nullptr) {
+		if (!pipeline.uses_bindless) {
+			layouts[1] = EmptySetLayout(graphics);
+		}
+		static_assert(ShaderRecompiler::IR::ImageSetDescriptorSet == 2);
+		layouts[2] = pipeline.image_set_layout;
+		count      = 3;
+	}
+}
+
+// KYTY_FASTDRAW_IMAGESET: set 2's layout (an ordinary set, from DescriptorHeap), when the stages
+// have images or samplers of their own.
+static void CreateImageSetLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	if (bindings.empty()) {
+		return;
+	}
+	vk::DescriptorSetLayoutCreateInfo create {};
+	create.bindingCount = static_cast<uint32_t>(bindings.size());
+	create.pBindings    = bindings.data();
+	EXIT_IF(graphics.device.createDescriptorSetLayout(
+	            &create, nullptr, &pipeline.image_set_layout) != vk::Result::eSuccess);
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
@@ -629,24 +672,26 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	color_blending.pAttachments    = color_blend_attachment.data();
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	std::vector<vk::DescriptorSetLayoutBinding> image_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
 	for (const auto& stage: vertex_info) {
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
-		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
+		AddLayoutBindings(descriptor_bindings, image_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
 		pipeline.uses_bindless |= UsesBindless(*stage.stage.program);
 	}
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
-		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
+		AddLayoutBindings(descriptor_bindings, image_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
 		pipeline.uses_bindless |= UsesBindless(*ps_input_info->stage.program);
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	CreateImageSetLayout(graphics, pipeline, image_bindings);
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
-	std::array<vk::DescriptorSetLayout, 2> set_layouts {};
+	std::array<vk::DescriptorSetLayout, 3> set_layouts {};
 	uint32_t                               set_layout_count = 0;
 	FillSetLayouts(graphics, pipeline, set_layouts, set_layout_count);
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
@@ -891,14 +936,16 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	auto result = vk::Result::eSuccess;
 	if (build != ComputeBuild::Compile) {
 		std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-		AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
+		std::vector<vk::DescriptorSetLayoutBinding> image_bindings;
+		AddLayoutBindings(descriptor_bindings, image_bindings, *input_info.stage.program,
 		                  vk::ShaderStageFlagBits::eCompute);
 		pipeline.uses_bindless = UsesBindless(*input_info.stage.program);
 		CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+		CreateImageSetLayout(graphics, pipeline, image_bindings);
 		const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 		                                            ShaderRecompiler::IR::NativePushConstantSize};
 
-		std::array<vk::DescriptorSetLayout, 2> set_layouts {};
+		std::array<vk::DescriptorSetLayout, 3> set_layouts {};
 		uint32_t                               set_layout_count = 0;
 		FillSetLayouts(graphics, pipeline, set_layouts, set_layout_count);
 		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
