@@ -1,6 +1,7 @@
 #include "loader/runtimeLinker.h"
 #include "local/mem-guard.h"
 #include "loader/gameArgs.h"
+#include "loader/gt7Title.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -2057,11 +2058,29 @@ void RuntimeLinker::PreloadAdjacentPrograms() {
 		return;
 	}
 
-	add_dir(root);
-	add_dir(root / "sce_module");
-	add_dir(root / "sce_modules");
+	if (IsGranTurismo7()) {
+		// Gran Turismo 7: the runtime loads only libc; the game loads its other PRXs itself
+		// (sceKernelLoadStartModule), and some files beside eboot.bin (pdiWheel_0.prx) are no ELF.
+		auto libc = root / "sce_module" / "libc.prx";
+		if (Common::File::IsFileExisting(libc)) {
+			add_path(libc);
+		}
+	} else {
+		add_dir(root);
+		add_dir(root / "sce_module");
+		add_dir(root / "sce_modules");
+	}
 
 	for (const auto& path: module_paths) {
+		{
+			Elf64 probe;
+			probe.Open(path);
+			if (!probe.IsValid()) {
+				LOGF("Preload: skipping %s (not a valid ELF/SELF)\n", Common::PathToString(path).c_str());
+				std::printf("Preload: skipping %s (not a valid ELF/SELF)\n", Common::PathToString(path).c_str());
+				continue;
+			}
+		}
 		auto* program                        = LoadProgram(path);
 		program->fail_if_global_not_resolved = false;
 	}
