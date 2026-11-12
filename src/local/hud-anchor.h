@@ -221,6 +221,33 @@ inline bool IsReticle(const HW::VertexShaderInfo& vs, uint32_t first) {
 	});
 }
 
+// Where an interface draw's vertex positions are (Classify, NoteMarkers): the V#'s base and stride, and (not `clip`)
+// the pixel scale.
+inline bool ReadSource(const HW::VertexShaderInfo& vs, bool clip, uint64_t& base, uint32_t& stride, float scale[2]) {
+	const auto& user   = vs.gs_user_sgpr;
+	if (clip) {
+		if (user.count < 4 || !ReadVsharp(user.value, base, stride)) return false;
+	} else {
+		// As its code reads them: the user data's first two words point to two pointers, the first to its V#s, the
+		// second to constants whose words 170 and 171 scale the pixels (1/3840, 1/2160): clip = 2 * pixels * scale - 1,
+		// y negated.
+		if (user.count < 2) return false;
+		const uint64_t root = user.value[0] | (static_cast<uint64_t>(user.value[1] & 0xffffu) << 32u);
+		uint64_t       pointers[2] {};
+		if (root == 0 || !HostMemoryRangeIsReadable(root, sizeof(pointers))) return false;
+		std::memcpy(pointers, reinterpret_cast<const void*>(root), sizeof(pointers));
+		const uint64_t vsharps = pointers[0] & 0xffffffffffffull, constants = (pointers[1] & 0xffffffffffffull) + 680u;
+		uint32_t       words[4] {};
+		if (vsharps == 0 || !HostMemoryRangeIsReadable(vsharps, sizeof(words)) ||
+		    !HostMemoryRangeIsReadable(constants, 2 * sizeof(float)))
+			return false;
+		std::memcpy(words, reinterpret_cast<const void*>(vsharps), sizeof(words));
+		std::memcpy(scale, reinterpret_cast<const void*>(constants), 2 * sizeof(float));
+		if (!ReadVsharp(words, base, stride) || !(scale[0] > 0.0f) || !(scale[1] > 0.0f)) return false;
+	}
+	return true;
+}
+
 // The areas the draw's vertices lie in (a bit each, Outside for one in none), from its vertices in guest memory; 0 when
 // it is no interface draw into the canvas in a frame showing the 3D, or its vertices are not readable.
 inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs, uint32_t first, uint32_t count) {
@@ -236,30 +263,10 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 	if (width != CanvasWidth) state.canvas = target.base.addr;
 	if (!FrameGen::SceneNoted()) return 0;
 	const auto& viewport = ctx.GetScreenViewport().viewports[0];
-	const auto& user   = vs.gs_user_sgpr;
 	uint64_t    base   = 0;
 	uint32_t    stride = 0;
 	float       scale[2] {};
-	if (clip) {
-		if (user.count < 4 || !ReadVsharp(user.value, base, stride)) return 0;
-	} else {
-		// As its code reads them: the user data's first two words point to two pointers, the first to its V#s, the
-		// second to constants whose words 170 and 171 scale the pixels (1/3840, 1/2160): clip = 2 * pixels * scale - 1,
-		// y negated.
-		if (user.count < 2) return 0;
-		const uint64_t root = user.value[0] | (static_cast<uint64_t>(user.value[1] & 0xffffu) << 32u);
-		uint64_t       pointers[2] {};
-		if (root == 0 || !HostMemoryRangeIsReadable(root, sizeof(pointers))) return 0;
-		std::memcpy(pointers, reinterpret_cast<const void*>(root), sizeof(pointers));
-		const uint64_t vsharps = pointers[0] & 0xffffffffffffull, constants = (pointers[1] & 0xffffffffffffull) + 680u;
-		uint32_t       words[4] {};
-		if (vsharps == 0 || !HostMemoryRangeIsReadable(vsharps, sizeof(words)) ||
-		    !HostMemoryRangeIsReadable(constants, sizeof(scale)))
-			return 0;
-		std::memcpy(words, reinterpret_cast<const void*>(vsharps), sizeof(words));
-		std::memcpy(scale, reinterpret_cast<const void*>(constants), sizeof(scale));
-		if (!ReadVsharp(words, base, stride) || !(scale[0] > 0.0f) || !(scale[1] > 0.0f)) return 0;
-	}
+	if (!ReadSource(vs, clip, base, stride, scale)) return 0;
 	count = std::min(count, MaxVertices);
 	if (!HostMemoryRangeIsReadable(base + static_cast<uint64_t>(first) * stride, static_cast<uint64_t>(count) * stride))
 		return 0;
@@ -314,6 +321,47 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 		return Marker;
 	}
 	return 0u;
+}
+
+// (hpbar) The markers over the world (enemies' health bars, damage dealt, KYTY_FG_ENEMYBAR, on by default) belong to the
+// 3D, not the HUD: the HUD-less image frame generation interpolates keeps them (frame-gen.cpp, BeforeFlipDraw), so they move with
+// their targets in the generated frames instead of standing at the real frame's place. They are what the canvas holds
+// just before the HUD's round icon is drawn: the icon's first draw in a frame showing the 3D asks the renderer for a copy
+// of the canvas before it (RequestMarkerSnapshot) and goes the normal path (true here), where the copy is taken. Any
+// width, wide aspect or not.
+inline bool NoteMarkers(const HW::Context& ctx, const HW::VertexShaderInfo& vs, uint32_t first, uint32_t count) {
+	if (!FrameGen::MarkersWanted() || count == 0 || count > MaxVertices || !FrameGen::SceneNoted()) return false;
+	auto&      state = g_state;
+	const auto frame = state.frame + 1;
+	// (Asked already this frame: the same draw again on the normal path, or a later one.)
+	if (state.markers_frame == frame) return false;
+	const auto& target = ctx.GetRenderTarget(0);
+	const auto  width  = CanvasWidthOf(ctx);
+	if (width == 0) return false;
+	const uint64_t hash = HashAt(vs.es_regs.data_addr);
+	const bool     clip = std::find(ClipShaders.begin(), ClipShaders.end(), hash) != ClipShaders.end();
+	if (!clip && hash != PixelShader) return false;
+	uint64_t base   = 0;
+	uint32_t stride = 0;
+	float    scale[2] {};
+	if (!ReadSource(vs, clip, base, stride, scale) ||
+	    !HostMemoryRangeIsReadable(base + static_cast<uint64_t>(first) * stride, static_cast<uint64_t>(count) * stride))
+		return false;
+	const auto& viewport = ctx.GetScreenViewport().viewports[0];
+	for (uint32_t i = 0; i < count; ++i) {
+		float xy[2] {};
+		std::memcpy(xy, reinterpret_cast<const void*>(base + static_cast<uint64_t>(first + i) * stride), sizeof(xy));
+		if (!std::isfinite(xy[0]) || !std::isfinite(xy[1])) return false;
+		if (!clip) {
+			xy[0] = 2.0f * xy[0] * scale[0] - 1.0f;
+			xy[1] = 1.0f - 2.0f * xy[1] * scale[1];
+		}
+		if (width != CanvasWidth) xy[0] = 2.0f * (viewport.xoffset + xy[0] * viewport.xscale) / CanvasWidth - 1.0f;
+		if (!(xy[0] >= Icon.x0 && xy[0] <= Icon.x1 && xy[1] >= Icon.y0 && xy[1] <= Icon.y1)) return false;
+	}
+	state.markers_frame = frame;
+	FrameGen::RequestMarkerSnapshot(target.base.addr);
+	return true;
 }
 
 // The draws a draw is drawn as: once for each of `areas` (Scope), and with `outside` once for each rectangle of the

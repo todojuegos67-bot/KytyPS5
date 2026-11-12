@@ -2012,6 +2012,8 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 		return 0;
 	}
 	CheckBuffer();
+	// (hpbar) The HUD's first draw goes the normal path, where the canvas is copied before it (HudAnchor::NoteMarkers).
+	if (HudAnchor::NoteMarkers(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), packet[1])) return 0;
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h); a draw over several of its
 	// areas goes the normal way, drawn once for each.
 	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), packet[1]));
@@ -2385,6 +2387,8 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
+	// (hpbar) The HUD's first draw: the canvas copied before it on the normal path (the renderer's).
+	(void)HudAnchor::NoteMarkers(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), args.vertex_count);
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h).
 	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), args.vertex_count));
 	if (hud.areas == 0 || hud.Single()) {

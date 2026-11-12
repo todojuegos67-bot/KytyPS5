@@ -1862,6 +1862,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 		}
 	};
+	// (hpbar) The interface canvas before the HUD's first draw: the markers over the world, for the HUD-less image.
+	if (flip_slot < 0 && state.color_count > 0 && FrameGen::MarkerSnapshotPending())
+		FrameGen::TakeMarkerSnapshot(buffer, rendering, state.color_info[0].image_id, state.color_info[0].desc.info.data.address,
+		                             !record_draw && !mesh_active);
 	if (flip_slot >= 0) {
 		FrameGen::BeforeFlipDraw(buffer, rendering, state.color_info[flip_slot].image_id, static_cast<uint32_t>(flip_slot),
 		                         std::span<const TextureBinding> {bindings.pixel->images}, emit_draw);

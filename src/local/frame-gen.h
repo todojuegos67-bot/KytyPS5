@@ -186,6 +186,17 @@ void NoteDraw(ImageId target);
 [[nodiscard]] int FlipSlot(std::span<const ImageId> targets);
 void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
                     std::span<const TextureBinding> images, const std::function<void()>& redraw);
+// (hpbar) KYTY_FG_ENEMYBAR (on unless 0): the markers over the world (enemies' health bars, damage dealt) kept in the
+// HUD-less image, so the generated frames move them with their targets instead of pasting them at the real frame's
+// place. The game draws them into its HUD canvas before the HUD's round icon: the GPU thread (HudAnchor::NoteMarkers)
+// asks for a copy of the canvas (guest `canvas`) before the icon's draw, which goes the normal path; there, before its
+// pass goes on, TakeMarkerSnapshot copies it; BeforeFlipDraw puts that copy in the HUD texture's place (not cleared).
+[[nodiscard]] bool MarkersWanted();
+void               RequestMarkerSnapshot(uint64_t canvas);
+[[nodiscard]] bool MarkerSnapshotPending();
+// (`usable`: the draw is recorded here, in `command`; else the request is dropped.)
+void TakeMarkerSnapshot(CommandBuffer& command, const RenderState& rendering, ImageId target, uint64_t address,
+                        bool usable);
 // Upscaling (KYTY_UPSCALE=fsr): with everything bound for the game's composite into the flip image and before the
 // descriptors are written, its 3D image (render size, RGBA16F) upscaled by FSR 3.1 to KYTY_UPSCALE_HEIGHT (default
 // 1440) with the TAA pass's depth and motion vectors, and the composite's binding pointed at the result. Its draw

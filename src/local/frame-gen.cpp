@@ -2420,6 +2420,97 @@ void CopyBack(vk::CommandBuffer command, VulkanImage& backup, Image& image) {
 } // namespace
 
 namespace {
+// (hpbar) KYTY_FG_ENEMYBAR (frame-gen.h): the canvas before the HUD's first draw this frame (renderer thread) and the
+// image it was copied from; the canvas the GPU thread asked a copy of (0: none).
+VulkanImage           g_markers;
+vk::ImageView         g_markers_view   = nullptr;
+vk::Image             g_markers_source = nullptr;
+bool                  g_markers_valid  = false;
+std::atomic<uint64_t> g_markers_pending {0};
+std::atomic<uint32_t> g_marker_requests {0};
+struct MarkerStats {
+	uint32_t taken = 0, skipped = 0, used = 0, cleared = 0;
+} g_marker_stats;
+std::chrono::steady_clock::time_point g_marker_last {};
+
+bool MarkersSwitch() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FG_ENEMYBAR");
+		return !(value != nullptr && value[0] == '0' && value[1] == '\0');
+	}();
+	return on;
+}
+
+// At the frame's flip (PrepareInputs): the 1 s line. (The copy stays: the GPU thread may queue the next frame's
+// interface before this flip; a copy is used once, by the next composite, and a request is dropped by the draw it
+// matches.)
+void MarkersFrameEnd() {
+	if (!MarkersSwitch() || !HudlessWanted()) return;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_marker_last < std::chrono::seconds(1)) return;
+	if (g_marker_last != std::chrono::steady_clock::time_point {}) {
+		auto& m = g_marker_stats;
+		std::printf("[hpbar] 1 s: HUD icon draws found %u, canvas copies before them %u (skipped %u); HUD-less images "
+		            "with the enemy bars %u, HUD cleared %u\n",
+		            g_marker_requests.exchange(0, std::memory_order_relaxed), m.taken, m.skipped, m.used, m.cleared);
+		std::fflush(stdout);
+		m = {};
+	}
+	g_marker_last = now;
+}
+} // namespace
+
+bool MarkersWanted() {
+	return LiveCensus::g_render && MarkersSwitch() && HudlessWanted();
+}
+
+void RequestMarkerSnapshot(uint64_t canvas) {
+	if (canvas == 0) return;
+	g_markers_pending.store(canvas, std::memory_order_relaxed);
+	g_marker_requests.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool MarkerSnapshotPending() {
+	return g_markers_pending.load(std::memory_order_relaxed) != 0;
+}
+
+void TakeMarkerSnapshot(CommandBuffer& command, const RenderState& rendering, ImageId target, uint64_t address,
+                        bool usable) {
+	const uint64_t pending = g_markers_pending.load(std::memory_order_relaxed);
+	if (pending == 0 || pending != address) return;
+	g_markers_pending.store(0, std::memory_order_relaxed);
+	g_markers_valid = false;
+	if (!usable || !target || g_cache == nullptr || g_graphics_ctx == nullptr) {
+		++g_marker_stats.skipped;
+		return;
+	}
+	auto&      image   = g_cache->GetImage(target);
+	const bool in_pass = command.RenderingWith(rendering);
+	// (A pass about to begin by clearing the canvas: what it holds now is not this frame's.)
+	if (IsDepthFormat(image.backing.format) || image.backing.image == nullptr || rendering.num_color_attachments == 0 ||
+	    (!in_pass && rendering.color_attachments[0].is_clear)) {
+		++g_marker_stats.skipped;
+		return;
+	}
+	const auto layout = rendering.color_attachments[0].image_layout;
+	auto vk_command = command.Handle();
+	command.EndRendering();
+	ConfigureAs(*g_graphics_ctx, g_markers, g_markers_view, image.backing.format, image.backing.extent);
+	CopyInto(vk_command, image, g_markers);
+	// Back an attachment, as BeforeFlipDraw leaves the flip image (the pass resumed, or begun by the draw as usual).
+	image.Transit(layout, vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite, {},
+	              vk_command);
+	if (in_pass) {
+		g_resuming = true;
+		command.ResumeRendering(rendering);
+		g_resuming = false;
+	}
+	g_markers_source = image.backing.image;
+	g_markers_valid  = true;
+	++g_marker_stats.taken;
+}
+
+namespace {
 // IsFlipImage's answers per image id (direct-mapped), valid while g_flip_epoch holds (it moves when a flip image changes).
 struct FlipAnswer {
 	ImageId  id;
@@ -2527,12 +2618,21 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageI
 	CopyInto(vk_command, flip, g_flip_backup);
 	ConfigureAs(*g_graphics_ctx, g_ui_backup, g_ui_backup_view, ui.backing.format, ui.backing.extent);
 	CopyInto(vk_command, ui, g_ui_backup);
-	// No HUD.
-	ui.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
-	vk::ClearColorValue             transparent {};
-	transparent.uint32 = std::array<uint32_t, 4> {0u, 0u, 0u, 0u};
-	const vk::ImageSubresourceRange level {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-	vk_command.clearColorImage(ui.backing.image, vk::ImageLayout::eTransferDstOptimal, &transparent, 1, &level);
+	// No HUD; (hpbar) but the markers over the world when the canvas was copied before the HUD's first draw this frame.
+	if (g_markers_valid && g_markers.image != nullptr && g_markers_source == ui.backing.image &&
+	    g_markers.format == ui.backing.format && g_markers.extent.width == ui.backing.extent.width &&
+	    g_markers.extent.height == ui.backing.extent.height) {
+		CopyBack(vk_command, g_markers, ui);
+		++g_marker_stats.used;
+	} else {
+		ui.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
+		vk::ClearColorValue             transparent {};
+		transparent.uint32 = std::array<uint32_t, 4> {0u, 0u, 0u, 0u};
+		const vk::ImageSubresourceRange level {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk_command.clearColorImage(ui.backing.image, vk::ImageLayout::eTransferDstOptimal, &transparent, 1, &level);
+		++g_marker_stats.cleared;
+	}
+	g_markers_valid = false;
 	ui.Transit(ui_layout, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
 	flip.Transit(flip_layout, flip_access, {}, vk_command);
 	// The draw without it (the pass as the game began it: cleared, unless it was already in progress).
@@ -3532,6 +3632,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	const auto flip_renders  = g_flip_renders;
 	const auto flip_draws    = g_flip_max_draws;
 	g_hudless_taken          = false;
+	MarkersFrameEnd();
 	const bool composite     = std::exchange(g_composite, false);
 	g_target_draws.clear();
 	g_flip_renders           = 0;
