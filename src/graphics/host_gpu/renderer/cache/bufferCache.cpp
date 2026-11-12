@@ -2323,12 +2323,50 @@ static void NoteSyncRepeat(uint64_t vaddr, uint64_t size, bool is_written, bool 
 	stats.last                                                                         = now;
 }
 
+// gt7, KYTY_BUFCACHE_V2=1 (off by default). Written buffer syncs of ranges that were last synced
+// as written and whose GPU-dirty state has not been cleared since: a direct-mapped memo of
+// (range, g_gpu_clear_epoch) on the GPU thread, the only thread that changes GPU-dirty bits.
+static bool BufCacheV2() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BUFCACHE_V2");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+namespace {
+struct WrittenMemo {
+	uint64_t vaddr = 0;
+	uint64_t size  = 0;
+	uint64_t epoch = 0; // 0 never matches: the epoch starts at 1
+};
+constexpr size_t kWrittenMemoSlots = 256;
+// GPU thread only.
+std::array<WrittenMemo, kWrittenMemoSlots> g_written_memo {};
+
+size_t WrittenMemoSlot(uint64_t vaddr, uint64_t size) {
+	return static_cast<size_t>(((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull)) %
+	                           kWrittenMemoSlots);
+}
+} // namespace
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope phase(GpuPhases::Phase::BufferSync);
 	if (t_guest_gpu_thread) {
 		NoteSyncRepeat(vaddr, size, is_written, is_texel_buffer);
+	}
+	const bool written_memo = BufCacheV2() && is_written && !is_texel_buffer && t_guest_gpu_thread;
+	if (written_memo) {
+		const auto& memo = g_written_memo[WrittenMemoSlot(vaddr, size)];
+		if (memo.vaddr == vaddr && memo.size == size &&
+		    memo.epoch == g_gpu_clear_epoch.load(std::memory_order_acquire)) {
+			// Still all GPU-dirty: a full sync would find no CPU-dirty page to copy and change no
+			// bit nor protection.
+			RecordSync(size, true, false, 0.0);
+			return false;
+		}
 	}
 	// Most calls (~22k a frame in a race) read a range whose tracker regions are all clean: what
 	// ForEachUploadRange finds for it is nothing to copy. Answer from the lock-free summary bitmap
@@ -2386,6 +2424,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    });
 	}
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
+	if (written_memo) {
+		// The whole range is GPU-dirty now (ChangeState<Gpu, true> over every region of it).
+		auto& memo = g_written_memo[WrittenMemoSlot(vaddr, size)];
+		memo       = {vaddr, size, g_gpu_clear_epoch.load(std::memory_order_acquire)};
+	}
 	if (source) {
 		RecordUpload(buffer, copies, total_size, source);
 	}

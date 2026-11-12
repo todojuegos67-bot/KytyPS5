@@ -152,6 +152,12 @@ inline thread_local bool t_guest_gpu_thread = false;
 // released itself (one queue waiting for another's label) then calls for no new walk.
 inline std::atomic<uint64_t> g_cpu_write_epoch {1};
 
+// gt7 (KYTY_BUFCACHE_V2): bumped whenever GPU-dirty pages become clean (a download, an unmark),
+// and when a MemoryTracker is created or destroyed. A range found all GPU-dirty stays so until the
+// next bump, so a written buffer sync that sees the same range and the same value skips its walk
+// (BufferCache::SynchronizeBuffer). Only the GPU thread changes GPU-dirty bits.
+inline std::atomic<uint64_t> g_gpu_clear_epoch {1};
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -260,6 +266,9 @@ public:
 			if (bits.None()) {
 				StoreSummary<source>(false);
 			}
+			if constexpr (source == DirtySource::Gpu) {
+				g_gpu_clear_epoch.fetch_add(1, std::memory_order_release);
+			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateCpuProtection();
@@ -289,6 +298,9 @@ public:
 			PublishDirtyBits();
 			if (bits.None()) {
 				StoreSummary<source>(false);
+			}
+			if constexpr (source == DirtySource::Gpu) {
+				g_gpu_clear_epoch.fetch_add(1, std::memory_order_release);
 			}
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateCpuProtection();

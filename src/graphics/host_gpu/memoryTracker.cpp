@@ -8,6 +8,8 @@ namespace Libs::Graphics {
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
+	// A new tracker starts with no GPU-dirty pages: whatever a memo kept for the old one is void.
+	g_gpu_clear_epoch.fetch_add(1, std::memory_order_release);
 	m_regions           = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	m_present_regions   = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
 	m_cpu_dirty_regions = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
@@ -127,7 +129,7 @@ bool MemoryTracker::IsRangeAllGpuDirtyHint(uint64_t vaddr, uint64_t size) const 
 	return true;
 }
 
-MemoryTracker::~MemoryTracker() = default;
+MemoryTracker::~MemoryTracker() { g_gpu_clear_epoch.fetch_add(1, std::memory_order_release); }
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
