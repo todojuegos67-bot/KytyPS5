@@ -282,6 +282,13 @@ void DefineBvhIntersect(EmitterState& s) {
 			require(Unary(s, spv::OpLogicalNot, b, Unary(s, spv::OpIsNan, b, value)));
 		require(Unary(s, spv::OpLogicalNot, b, Unary(s, spv::OpIsInf, b, origin[i])));
 	}
+	// KYTY_NO_RT=miss: the pipeline sets this specialization constant (IR::BvhMissSpecId), and
+	// every intersection gives the invalid result below, as a ray that hits nothing: the shader
+	// writes its own "no hit" and the game falls back to its other reflections. False by default,
+	// so the SPIR-V is the same whatever the switch.
+	const auto miss = s.builder.Constant(spv::OpSpecConstantFalse, b);
+	s.builder.AddAnnotation(spv::OpDecorate, miss, spv::DecorationSpecId, IR::BvhMissSpecId);
+	require(Unary(s, spv::OpLogicalNot, b, miss));
 	const std::array triangle_invalid {ConstantU32(s, 0x7f800000), ConstantU32(s, 0x3f800000),
 	                                  ConstantU32(s, ~0u), ConstantU32(s, 0)};
 	const std::array box_invalid {ConstantU32(s, ~0u), ConstantU32(s, ~0u),

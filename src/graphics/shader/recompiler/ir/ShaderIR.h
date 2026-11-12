@@ -253,6 +253,10 @@ enum class StageOutputKind {
 // The specialization constant a pre-rasterization stage clamps its exported render target
 // array index with: the bound layer count (0: no clamp).
 inline constexpr uint32_t LayerLimitSpecId = 0x4c00u;
+// The specialization constant (a bool, false by default) that makes a ray tracing shader's BVH
+// intersections all miss (KYTY_NO_RT=miss): the shader runs and writes what it writes for rays
+// that hit nothing, without reading the BVH.
+inline constexpr uint32_t BvhMissSpecId = 0x4c01u;
 
 struct PositionExportComponent {
 	uint32_t clip_distance = UINT32_MAX;

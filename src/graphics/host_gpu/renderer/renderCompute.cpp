@@ -95,15 +95,22 @@ static bool NoRayTracing() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_NO_RT");
 		const bool  on    = value == nullptr || value[0] != '0';
-		LOGF("Ray tracing: %s (KYTY_NO_RT=%s)\n",
-		     on ? "off, BVH dispatches are not run" : "on", on ? "1, =0 turns it on" : "0");
+		if (RayTracingMissMode()) {
+			LOGF("Ray tracing: off, BVH dispatches run with every ray a miss (KYTY_NO_RT=miss; "
+			     "=1 does not run them, =0 turns ray tracing on)\n");
+		} else {
+			LOGF("Ray tracing: %s (KYTY_NO_RT=%s)\n",
+			     on ? "off, BVH dispatches are not run" : "on",
+			     on ? "1, =0 turns it on, =miss runs them with every ray a miss" : "0");
+		}
 		return on;
 	}();
 	return enabled;
 }
 
 static bool SkipRayTracingDispatch(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
-	if (!program.info.uses_bvh || !NoRayTracing()) {
+	// KYTY_NO_RT=miss: run, the pipeline makes every intersection a miss (RayTracingMissMode).
+	if (!program.info.uses_bvh || !NoRayTracing() || RayTracingMissMode()) {
 		return false;
 	}
 	static std::atomic<uint64_t> skipped {0};

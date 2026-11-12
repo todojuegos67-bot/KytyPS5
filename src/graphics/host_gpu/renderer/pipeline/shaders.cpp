@@ -28,6 +28,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
@@ -36,6 +37,14 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+bool RayTracingMissMode() {
+	static const bool miss = [] {
+		const char* value = std::getenv("KYTY_NO_RT");
+		return value != nullptr && std::strcmp(value, "miss") == 0;
+	}();
+	return miss;
+}
 
 // KYTY_DISABLE_OPTIMIZATION_HASHES="hash,hash,...": build the pipelines of these guest shaders
 // with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, to tell driver code-generation problems apart
@@ -898,6 +907,15 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
+	// KYTY_NO_RT=miss: a ray tracing shader's intersections all miss (IR::BvhMissSpecId).
+	static constexpr vk::Bool32             bvh_miss_value = VK_TRUE;
+	static const vk::SpecializationMapEntry bvh_miss_entry {
+	    ShaderRecompiler::IR::BvhMissSpecId, 0, sizeof(vk::Bool32)};
+	static const vk::SpecializationInfo bvh_miss_spec {1, &bvh_miss_entry, sizeof(vk::Bool32),
+	                                                   &bvh_miss_value};
+	if (input_info.stage.program->info.uses_bvh && RayTracingMissMode()) {
+		comp_shader_stage_info.pSpecializationInfo = &bvh_miss_spec;
+	}
 	const auto wave_size = input_info.stage.program->wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {

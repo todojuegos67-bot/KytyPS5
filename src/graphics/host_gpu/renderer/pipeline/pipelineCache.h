@@ -249,6 +249,11 @@ bool SmallColorTargetDraw(const HW::Context& context);
 // pipelines compile. GPU thread only.
 void NoteReflectionCubeTarget(uint64_t address);
 
+// KYTY_NO_RT=miss (gt7-texpop-1112): the dispatches of ray tracing shaders run, with every BVH
+// intersection a miss (the pipeline specializes IR::BvhMissSpecId), so what they write is the
+// game's own "no hit" each frame instead of what the memory held. Any thread.
+[[nodiscard]] bool RayTracingMissMode();
+
 // Why a draw's new pipeline may not be compiled in the background (TryGetGraphicsPipeline).
 enum class PipelineDefer : uint8_t {
 	Allowed,      // the draw may be skipped while a worker compiles it
