@@ -122,10 +122,10 @@ void Native() {
 				const uint em     = RecW(false, slot, 3u);
 				const bool ribbon = em < prm.argi.z && (emit_w[em * (prm.reci.w >> 2) + 12u] & 1u) != 0u;
 				const vec3 dp     = RecV3(false, slot, 0u) - RecV3(true, slot, 0u);
-				const bool same   = prm.reci.z != 0u && RecW(true, slot, 3u) == em && dot(dp, dp) <= prm.parf.x * prm.parf.x;
+				const bool same   = prm.reci.z != 0u && (prm.reci.x != 248u || RecW(true, slot, 3u) == em) && dot(dp, dp) <= prm.parf.x * prm.parf.x;
 				if (!same) {
 					atomicAdd(stats[6], 1u);
-					if (prm.reci.z != 0u) atomicAdd(stats[RecW(true, slot, 3u) != em ? 12u : 13u], 1u);
+					if (prm.reci.z != 0u) atomicAdd(stats[(prm.reci.x == 248u && RecW(true, slot, 3u) != em) ? 12u : 13u], 1u);
 				} else {
 					bool  okw = true;
 					vec2  lo = vec2(1e9), hi = vec2(-1e9);
