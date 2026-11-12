@@ -128,11 +128,7 @@ inline const Config& Get() {
 	static const Config config = Load();
 	return config;
 }
-// (Read once at start, so the line is printed at start.)
-inline const bool g_loaded = [] {
-	(void)Get();
-	return true;
-}();
+// (Read at the first dispatch/draw: settings.ini `extra` is in the environment by then, not at static init.)
 
 // Key: kind ('D' draw, 'C' dispatch), shader address, width, height, format, channel type.
 using Key = std::tuple<char, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>;
