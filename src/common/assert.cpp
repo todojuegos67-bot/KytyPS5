@@ -64,11 +64,30 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 	                   file, line, memory);
 }
 
+// A fatal error ends the process even when its shutdown waits forever (a subsystem's emergency
+// shutdown, the log or stdout blocked by a thread the error left holding them): the window used to
+// stay open, hung. After 20 s (room for the out-of-memory message box) the process is terminated
+// wherever the shutdown is.
+static void StartFatalExitWatchdog(int status) {
+	static std::atomic_bool started {false};
+	if (started.exchange(true)) {
+		return;
+	}
+	std::thread([status] {
+		std::this_thread::sleep_for(std::chrono::seconds(20));
+#if defined(_WIN32)
+		TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
+#endif
+		std::_Exit(status);
+	}).detach();
+}
+
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	if (t_recoverable) {
 		t_recoverable_message = fmt::format("{} in {}:{}", text, file, line);
 		return 1;
 	}
+	StartFatalExitWatchdog(321);
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
 	WriteFatalBacktrace();
 	Subsystems::EmergencyShutdownActive();
@@ -89,6 +108,7 @@ int DbgExitHandler(const char* file, int line, std::string_view text) {
 		t_recoverable_message = fmt::format("{} in {}:{}", text, file, line);
 		return 1;
 	}
+	StartFatalExitWatchdog(321);
 	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
 	WriteFatalBacktrace();
 	return 1;
@@ -99,6 +119,7 @@ int DbgExitHandler(const char* file, int line, fmt::text_style style, std::strin
 		t_recoverable_message = fmt::format("{} in {}:{}", text, file, line);
 		return 1;
 	}
+	StartFatalExitWatchdog(321);
 	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
 	WriteFatalBacktrace();
 	return 1;
@@ -128,6 +149,7 @@ void DbgExit(int status) {
 	if (t_recoverable) {
 		throw RecoverableExit {std::move(t_recoverable_message)};
 	}
+	StartFatalExitWatchdog(status);
 	// (A device loss: the thread that met it first writes what the driver reports while the others' submissions fail.)
 	for (int i = 0; i < 500 && g_exit_blocking_reports.load(std::memory_order_acquire) > 0; ++i)
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
