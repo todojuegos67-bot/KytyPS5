@@ -1917,10 +1917,10 @@ void DrawPcTab(float unit) {
 	ImGui::PopFont();
 	const auto& pc  = g_rt.pc;
 	std::string gpu = pc.gpu.empty() ? std::string("no detectada") : pc.gpu;
-	if (pc.vram > 0) gpu += "  (" + std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB)";
+	if (pc.vram > 0) gpu += "  (" + (g_rt.launched.simulate_vram8 ? std::string("8 GB simulados") : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB") + ")";
 	if (!pc.nvidia && !pc.gpu.empty()) gpu += "  (sin DLSS: solo NVIDIA)";
 	InfoLine("Grafica", gpu, ink);
-	InfoLine("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + std::to_string(pc.ram_gb) + " GB RAM", ink);
+	InfoLine("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + (g_rt.launched.simulate_ram16 ? std::string("16 GB RAM (simulados)") : std::to_string(pc.ram_gb) + " GB RAM"), ink);
 	if (!pc.recommended.empty()) {
 		InfoLine("Modo recomendado", pc.recommended, pc.unsupported ? red : kGold);
 		InfoLine("Esperado (estimacion)", pc.expected, pc.unsupported ? red : ink);
@@ -2058,13 +2058,13 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
 	ImGui::BeginChild("##hw", {0, 330 * unit}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
 	std::string gpu = pc.gpu.empty() ? std::string("no detectada") : pc.gpu;
-	if (pc.vram > 0) gpu += "  -  " + std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB de VRAM";
+	if (pc.vram > 0) gpu += "  -  " + (g_rt.launched.simulate_vram8 ? std::string("8 GB de VRAM (simulados)") : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB de VRAM");
 	InfoLine("Tarjeta gráfica", gpu, ink);
 	std::string cpu = pc.cpu.empty() ? std::string("?") : pc.cpu;
 	if (pc.cpu_cores > 0) cpu += "  -  " + std::to_string(pc.cpu_cores) + " núcleos / " + std::to_string(pc.cpu_threads) + " hilos";
 	InfoLine("Procesador", cpu, ink);
-	const bool low = pc.ram_gb > 0 && pc.ram_gb <= 20;
-	InfoLine("Memoria RAM", std::to_string(pc.ram_gb) + " GB" + (low ? "  (se activan las mejoras para equipos de 16 GB de RAM)" : ""), low ? kWarn : ink);
+	const bool low = g_rt.launched.simulate_ram16 || (pc.ram_gb > 0 && pc.ram_gb <= 20);
+	InfoLine("Memoria RAM", (g_rt.launched.simulate_ram16 ? std::string("16 GB (simulados)") : std::to_string(pc.ram_gb) + " GB") + (low ? "  (se activan las mejoras para equipos de 16 GB de RAM)" : ""), low ? kWarn : ink);
 	InfoLine("Monitor", pc.screen_w > 0 ? std::to_string(pc.screen_w) + "x" + std::to_string(pc.screen_h) + " a " + std::to_string(pc.refresh_hz) + " Hz" : std::string("?"), ink);
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
@@ -5233,7 +5233,9 @@ void Sample(LogState& L,
 		nv.temp(nv.dev, 0, &t);
 		if (nv.clock != nullptr) nv.clock(nv.dev, 0 /* graphics */, &clk);
 		nv.mem(nv.dev, m);
-		const double used = static_cast<double>(m[2] >> 20), total = static_cast<double>(m[0] >> 20);
+		const double used = static_cast<double>(m[2] >> 20);
+		// (11-12) Simular grafica de 8 GB: the overlay shows the simulated card's 8 GB.
+		const double total = g_rt.launched.simulate_vram8 ? 8192.0 : static_cast<double>(m[0] >> 20);
 		rows.push_back({"GPU", Fmt("%3u %%   %u C", u[0], t), kOrange});
 		if (clk > 0) rows.push_back({"GPU reloj", Fmt("%4u MHz", clk), kOrange});
 		rows.push_back({"VRAM", Fmt("%.1f / %.0f GB", used / 1024.0, total / 1024.0), UseColor(used, total)});
@@ -5255,7 +5257,9 @@ void Sample(LogState& L,
 		ms.dwLength = sizeof(ms);
 		if (GlobalMemoryStatusEx(&ms)) {
 			const double gb = 1024.0 * 1024.0 * 1024.0;
-			const double used = static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / gb, total = static_cast<double>(ms.ullTotalPhys) / gb;
+			const double used = static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / gb;
+			// (11-12) Simular 16 GB RAM: the overlay shows the simulated PC's 16 GB.
+			const double total = g_rt.launched.simulate_ram16 ? 16.0 : static_cast<double>(ms.ullTotalPhys) / gb;
 			rows.push_back({"RAM", Fmt("%.1f / %.0f GB", used, total), UseColor(used, total)});
 			const double climit = static_cast<double>(ms.ullTotalPageFile) / gb, cused = climit - static_cast<double>(ms.ullAvailPageFile) / gb;
 			if (climit > 0) rows.push_back({"Commit", Fmt("%.1f / %.0f GB", cused, climit), cused / climit > 0.90 ? kRed : UseColor(cused, climit)});
