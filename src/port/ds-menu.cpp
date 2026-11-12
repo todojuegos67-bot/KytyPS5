@@ -15,6 +15,8 @@
 #include "port/ds-resume.h"
 
 #include "local/perf-overlay.h"
+#include "local/local-platform.h"
+#include "local/ram-guard.h"
 #include "local/port-live.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "libs/trophy.h"
@@ -5233,7 +5235,9 @@ void Sample(LogState& L,
 		nv.temp(nv.dev, 0, &t);
 		if (nv.clock != nullptr) nv.clock(nv.dev, 0 /* graphics */, &clk);
 		nv.mem(nv.dev, m);
-		const double used = static_cast<double>(m[2] >> 20);
+		// (11-12) Simular grafica de 8 GB: the ballast held to simulate it is not the game's (14.7 / 8 GB before).
+		const uint64_t ballast = g_rt.launched.simulate_vram8 ? LocalPlatform::SimulationBallast() : 0;
+		const double used = static_cast<double>((m[2] > ballast ? m[2] - ballast : 0) >> 20);
 		// (11-12) Simular grafica de 8 GB: the overlay shows the simulated card's 8 GB.
 		const double total = g_rt.launched.simulate_vram8 ? 8192.0 : static_cast<double>(m[0] >> 20);
 		rows.push_back({"GPU", Fmt("%3u %%   %u C", u[0], t), kOrange});
@@ -5257,7 +5261,9 @@ void Sample(LogState& L,
 		ms.dwLength = sizeof(ms);
 		if (GlobalMemoryStatusEx(&ms)) {
 			const double gb = 1024.0 * 1024.0 * 1024.0;
-			const double used = static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / gb;
+			const uint64_t rb = g_rt.launched.simulate_ram16 ? RamGuard::RamBallast() : 0;
+			const uint64_t in_use = ms.ullTotalPhys - ms.ullAvailPhys;
+			const double used = static_cast<double>(in_use > rb ? in_use - rb : 0) / gb;
 			// (11-12) Simular 16 GB RAM: the overlay shows the simulated PC's 16 GB.
 			const double total = g_rt.launched.simulate_ram16 ? 16.0 : static_cast<double>(ms.ullTotalPhys) / gb;
 			rows.push_back({"RAM", Fmt("%.1f / %.0f GB", used, total), UseColor(used, total)});

@@ -95,7 +95,56 @@ bool LowRam() {
 	return on;
 }
 
+#if defined(_WIN32)
+namespace {
+std::atomic<uint64_t> g_ram_ballast {0};
+// (11-12) KYTY_SIMULATE_RAM_MB=<n> on a bigger PC: hold (physical - n MiB - 1 GiB margin for the bigger PC's own
+// OS headroom is NOT kept: the rest of the machine behaves as an n MiB PC) of real RAM, committed, touched and locked,
+// so the game and Windows see the memory pressure of an n MiB PC, as the VRAM ballast does for KYTY_SIMULATE_VRAM_MB.
+void HoldRamBallast() {
+	const char* text = std::getenv("KYTY_SIMULATE_RAM_MB");
+	if (text == nullptr || *text == '\0') return;
+	const uint64_t want = std::strtoull(text, nullptr, 10) << 20u;
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	if (want == 0 || GlobalMemoryStatusEx(&status) == 0 || status.ullTotalPhys <= want) return;
+	uint64_t ballast = status.ullTotalPhys - want;
+	// Never more than what is free now less 2 GiB (the game must still start).
+	if (status.ullAvailPhys < (2ull << 30u)) return;
+	ballast = std::min<uint64_t>(ballast, status.ullAvailPhys - (2ull << 30u));
+	SIZE_T wmin = 0, wmax = 0;
+	GetProcessWorkingSetSize(GetCurrentProcess(), &wmin, &wmax);
+	SetProcessWorkingSetSizeEx(GetCurrentProcess(), wmin + ballast + (64ull << 20u), wmax + ballast + (256ull << 20u),
+	                           QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+	constexpr uint64_t kChunk = 256ull << 20u;
+	uint64_t held = 0, locked = 0;
+	for (; held + kChunk <= ballast; held += kChunk) {
+		void* p = VirtualAlloc(nullptr, kChunk, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		if (p == nullptr) break;
+		for (uint64_t o = 0; o < kChunk; o += 4096) static_cast<volatile char*>(p)[o] = 1;
+		if (VirtualLock(p, kChunk) != 0) locked += kChunk;
+	}
+	g_ram_ballast = held;
+	std::printf("RAM simulation: %llu MiB PC on %llu MiB: %llu MiB of RAM held (%llu MiB locked)\n",
+	            static_cast<unsigned long long>(want >> 20u), static_cast<unsigned long long>(status.ullTotalPhys >> 20u),
+	            static_cast<unsigned long long>(held >> 20u), static_cast<unsigned long long>(locked >> 20u));
+	std::fflush(stdout);
+}
+} // namespace
+#endif
+
+uint64_t RamBallast() {
+#if defined(_WIN32)
+	return g_ram_ballast.load();
+#else
+	return 0;
+#endif
+}
+
 void ApplyLowRamDefaults() {
+#if defined(_WIN32)
+	HoldRamBallast(); // (11-12) before the game reserves anything
+#endif
 	static std::once_flag once;
 	std::call_once(once, [] {
 		const uint64_t ram    = LocalPlatform::PhysicalMemory();

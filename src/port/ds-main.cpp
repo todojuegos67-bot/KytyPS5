@@ -648,6 +648,7 @@ void StartMetricsWindow(const fs::path& root, const Port::Settings& s, const Por
 	                       L"\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +
 	                       script.wstring() + L"\" -LogDir \"" + (root / L"logs").wstring() + L"\" -Proceso \"Demon's Souls\"";
 	if (s.simulate_vram8) command += L" -VramMB 8192";
+	if (s.simulate_ram16) command += L" -RamGB 16"; // (11-12) the RAM ballast held is left out
 	STARTUPINFOW        si {};
 	PROCESS_INFORMATION pi {};
 	si.cb = sizeof(si);

@@ -495,9 +495,9 @@ $timer.Add_Tick({
 		$rows.Add(@('CPU', ("{0,3} %" -f $cpu), $cOrange))
 		if ($script:clk.cpuMHz) { $rows.Add(@('CPU reloj', ("{0,4} MHz" -f $script:clk.cpuMHz), $cOrange)) }
 		if ($RamGB -gt 0) {
-			$ws = 0; $e2 = $emu | Select-Object -First 1
-			if ($e2) { $ws = $e2.WorkingSet64 / 1GB }
-			$rows.Add(@('RAM', ("{0:N1} / {1} GB{2}" -f ($ws + 4), $RamGB, $(if ($script:limitedPid -and -not $script:limitOk) { ' (sin limite!)' } else { '' })), (Get-UseColor ($ws + 4) $RamGB)))
+			# (11-12) The emulator holds (RAM - RamGB) as a ballast (KYTY_SIMULATE_RAM_MB): the PC's use less that, of RamGB.
+			$simUsed = [Math]::Max(0.0, $ramUsed - [Math]::Max(0.0, $ramTotal - $RamGB))
+			$rows.Add(@('RAM', ("{0:N1} / {1} GB" -f $simUsed, $RamGB), (Get-UseColor $simUsed $RamGB)))
 		} else {
 			$rows.Add(@('RAM', ("{0:N1} / {1:N0} GB" -f $ramUsed, $ramTotal), (Get-UseColor $ramUsed $ramTotal)))
 		}
@@ -512,7 +512,7 @@ $timer.Add_Tick({
 			$commitLimit = $RamGB + $pageFile
 			$priv = 0; $e3 = $emu | Select-Object -First 1
 			if ($e3) { $priv = $e3.PrivateMemorySize64 / 1GB }
-			$commitUsed = $priv + 4
+			$commitUsed = [Math]::Max(0.0, $priv - [Math]::Max(0.0, $ramTotal - $RamGB)) + 4
 			$commitSim = ' (simulado)'
 		}
 		if ($commitLimit -gt 0) {

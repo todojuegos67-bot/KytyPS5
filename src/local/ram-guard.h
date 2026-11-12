@@ -62,6 +62,8 @@ namespace RamGuard {
 void ApplyLowRamDefaults();
 // Starts the watcher thread once (nothing when off or not on Windows).
 void Start();
+// (11-12) The RAM held for KYTY_SIMULATE_RAM_MB (bytes; 0 without it).
+uint64_t RamBallast();
 
 enum Level : int { None = 0, Low = 1, Critical = 2 };
 // The pressure now (one relaxed load).
