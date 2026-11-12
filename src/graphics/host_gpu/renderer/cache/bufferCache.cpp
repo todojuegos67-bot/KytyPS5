@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/speculation.h"
@@ -3187,6 +3188,8 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		} else if (!m_bitmap_tracked.Empty()) {
 			m_bitmap_tracked.Subtract(first, last - first);
 		}
+		// KYTY_MT_PROG: prepared draws' seals over these bytes break before they are dirty.
+		DrawPrep::NoteGpuWrite(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 		// The tick the writing command goes into, unless the scheduler submits before it is
 		// recorded (WritesRecorded then moves it on).

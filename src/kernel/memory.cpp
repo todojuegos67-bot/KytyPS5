@@ -1525,6 +1525,11 @@ const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->FindBacking(vaddr, size);
 }
 
+const uint8_t* FindBackingUnchecked(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->FindBacking(vaddr, size)
+	                                        : nullptr;
+}
+
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return !MaybeGpuDirtyForClean(vaddr, size) && TryReadBacking(vaddr, data, size);
 }

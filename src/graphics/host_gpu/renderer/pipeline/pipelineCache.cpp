@@ -4816,7 +4816,7 @@ struct PipelineCache::ProgramCache {
 			DrawPrep::Add(DrawPrep::Counter::MissInputs);
 			return false;
 		}
-		if (!result->reads.Validate()) {
+		if (!result->reads.ValidateFast()) {
 			DrawPrep::Add(DrawPrep::Counter::MissReads);
 			return false;
 		}

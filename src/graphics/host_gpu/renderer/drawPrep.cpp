@@ -73,6 +73,22 @@ GoodPairs& GetGoodPairs() {
 	return pairs;
 }
 
+// KYTY_MT_PROG's GPU-write clock (after chenxiao07's write stamps, db93d5f87 / 20a5f5d08: a
+// check compares stamps of the units it read instead of searching the written ranges). Each
+// GPU write takes the next clock value into the slots of its 64 KiB regions (hashed); a write over
+// more than 64 regions moves the wide slot instead, which every seal covers. A seal holds while
+// every slot it recorded keeps its value, and none was moved after the recording began.
+constexpr uint32_t SealRegionBits = 16;
+constexpr uint32_t SealSlots      = 16384;
+constexpr uint64_t SealMaxRegions = 64;
+std::atomic<uint64_t>                         g_seal_clock {1};
+std::atomic<uint64_t>                         g_seal_wide {1};
+std::array<std::atomic<uint64_t>, SealSlots> g_seal_slots {};
+
+uint32_t SealSlotOf(uint64_t region) {
+	return static_cast<uint32_t>((region * 0x9e3779b97f4a7c15ull) >> 50u) & (SealSlots - 1u);
+}
+
 uint64_t PairKey(uint64_t vs_addr, uint64_t ps_addr) {
 	// Shader addresses are 256-byte aligned guest addresses below 2^48.
 	return (vs_addr >> 8u) * 0x9e3779b97f4a7c15ull ^ (ps_addr >> 8u);
@@ -101,6 +117,30 @@ int VerifyMode() {
 	return mode;
 }
 
+bool MtProgEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MT_PROG");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (!MtProgEnabled() || size == 0) {
+		return;
+	}
+	const uint64_t value = g_seal_clock.fetch_add(1, std::memory_order_seq_cst) + 1;
+	const uint64_t first = vaddr >> SealRegionBits;
+	const uint64_t last  = (vaddr + size - 1) >> SealRegionBits;
+	if (last - first >= SealMaxRegions) {
+		g_seal_wide.store(value, std::memory_order_seq_cst);
+		return;
+	}
+	for (uint64_t region = first; region <= last; region++) {
+		g_seal_slots[SealSlotOf(region)].store(value, std::memory_order_seq_cst);
+	}
+}
+
 bool CountsAsDrawOrDispatch(uint32_t opcode) {
 	switch (opcode) {
 		case Pm4::IT_DRAW_INDEX_2:
@@ -118,9 +158,38 @@ bool CountsAsDrawOrDispatch(uint32_t opcode) {
 	}
 }
 
+void ReadSet::Clear() {
+	m_ranges.clear();
+	m_bytes.clear();
+	m_seal.clear();
+	m_sealed = MtProgEnabled();
+	if (m_sealed) {
+		// The clock first: a write the reads below may have missed moves a slot past it.
+		m_seal_start = g_seal_clock.load(std::memory_order_seq_cst);
+		m_seal_wide  = g_seal_wide.load(std::memory_order_seq_cst);
+		m_sealed     = m_seal_wide <= m_seal_start;
+	}
+}
+
 void ReadSet::Add(uint64_t address, const void* data, uint32_t size) {
 	if (size == 0) {
 		return;
+	}
+	if (m_sealed) {
+		// Read after the bytes were checked clean: a write since the recording began shows here
+		// (past the start), or later on the GPU thread (a value other than this one).
+		const uint64_t first = address >> SealRegionBits;
+		const uint64_t last  = (address + size - 1) >> SealRegionBits;
+		for (uint64_t region = first; region <= last && m_sealed; region++) {
+			const uint32_t slot  = SealSlotOf(region);
+			const uint64_t value = g_seal_slots[slot].load(std::memory_order_seq_cst);
+			if (value > m_seal_start) {
+				m_sealed = false;
+			} else if (std::none_of(m_seal.begin(), m_seal.end(),
+			                        [slot](const SealSlot& s) { return s.slot == slot; })) {
+				m_seal.push_back({slot, value});
+			}
+		}
 	}
 	const auto offset = static_cast<uint32_t>(m_bytes.size());
 	m_bytes.resize(m_bytes.size() + size);
@@ -192,6 +261,43 @@ bool ReadSet::Validate() const {
 			left -= in_page;
 		}
 	}
+	return true;
+}
+
+bool ReadSet::SealHolds() const {
+	if (!m_sealed || g_seal_wide.load(std::memory_order_seq_cst) != m_seal_wide) {
+		return false;
+	}
+	for (const auto& entry: m_seal) {
+		if (g_seal_slots[entry.slot].load(std::memory_order_seq_cst) != entry.value) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool ReadSet::ValidateFast() const {
+	if (!m_sealed) {
+		return Validate();
+	}
+	KYTY_PROFILER_BLOCK("DrawPrep::ValidateSealed");
+	if (!SealHolds()) {
+		DrawPrep::Add(Counter::SealMisses);
+		return Validate();
+	}
+	// No GPU write over these bytes since they were read clean: only their values are compared
+	// (the game's CPU writes are not tracked), straight from the backing, no dirty-range query.
+	for (const auto& range: m_ranges) {
+		const auto* backing = LibKernel::Memory::FindBackingUnchecked(range.address, range.size);
+		if (backing == nullptr) {
+			DrawPrep::Add(Counter::SealMisses);
+			return Validate();
+		}
+		if (std::memcmp(backing, m_bytes.data() + range.offset, range.size) != 0) {
+			return false;
+		}
+	}
+	DrawPrep::Add(Counter::SealHits);
 	return true;
 }
 
@@ -392,6 +498,10 @@ void LogCountersIfDue() {
 	     c(Counter::MissReads), c(Counter::ScanCondExec), c(Counter::ScanCondSkip),
 	     c(Counter::ScanCondStop), c(Counter::GpuCondExec), c(Counter::GpuCondSkip),
 	     c(Counter::VerifyChecks), c(Counter::VerifyMismatches));
+	if (MtProgEnabled()) {
+		LOGF("DrawPrep MT_PROG (10 s): sealed checks %llu, seal broken %llu\n",
+		     c(Counter::SealHits), c(Counter::SealMisses));
+	}
 	for (size_t i = 0; i < delta.size(); i++) {
 		const auto value    = g_compute_counters[i].value.load(std::memory_order_relaxed);
 		delta[i]            = value - previous_compute[i];

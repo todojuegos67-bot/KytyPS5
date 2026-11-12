@@ -28,6 +28,13 @@ namespace Libs::Graphics::DrawPrep {
 
 [[nodiscard]] bool Enabled();
 [[nodiscard]] int  VerifyMode(); // 0 off, 1 count and log, 2 exit on a difference
+// KYTY_MT_PROG=1 (default 0): a prepared result carries a GPU-write seal (per-region write clock,
+// as chenxiao07's write stamps), and the GPU thread checks the seal instead of asking the dirty
+// ranges for every page; it still compares the recorded bytes (CPU writes are not tracked).
+[[nodiscard]] bool MtProgEnabled();
+// Buffer cache, under its dirty-range lock, before a range is marked GPU-written: moves the
+// region clock of [vaddr, vaddr + size) (a seal over it no longer holds).
+void NoteGpuWrite(uint64_t vaddr, uint64_t size);
 
 // GPU queues (GuestGpu: graphics 0, compute 1..56).
 constexpr uint32_t MaxQueues = 64;
@@ -53,13 +60,13 @@ struct Key {
 // The guest bytes a preparation read, in read order, merged where contiguous.
 class ReadSet {
 public:
-	void Clear() {
-		m_ranges.clear();
-		m_bytes.clear();
-	}
+	// Starts a recording (and its seal under KYTY_MT_PROG) before any of its reads.
+	void Clear();
 	void Add(uint64_t address, const void* data, uint32_t size);
 	// GPU thread: every range is still clean for a backing read and holds the recorded bytes.
 	[[nodiscard]] bool Validate() const;
+	// GPU thread: Validate, through the seal when it holds (no dirty-range query per page).
+	[[nodiscard]] bool ValidateFast() const;
 	[[nodiscard]] size_t RangeCount() const { return m_ranges.size(); }
 
 private:
@@ -68,8 +75,17 @@ private:
 		uint32_t offset; // into m_bytes
 		uint32_t size;
 	};
-	std::vector<Range>   m_ranges;
-	std::vector<uint8_t> m_bytes;
+	struct SealSlot {
+		uint32_t slot;
+		uint64_t value;
+	};
+	[[nodiscard]] bool SealHolds() const;
+	std::vector<Range>    m_ranges;
+	std::vector<uint8_t>  m_bytes;
+	std::vector<SealSlot> m_seal;
+	uint64_t              m_seal_start = 0;
+	uint64_t              m_seal_wide  = 0;
+	bool                  m_sealed     = false;
 };
 
 // One stage's prepared refresh.
@@ -155,6 +171,8 @@ enum class Counter : uint32_t {
 	VerifyChecks,
 	VerifyMismatches,
 	TessScanned, // tessellated draws described for preparation (round 78)
+	SealHits,    // KYTY_MT_PROG: results checked by their seal
+	SealMisses,  // ... whose seal no longer held (checked the full way)
 	Count,
 };
 void Add(Counter counter, uint64_t value = 1);
