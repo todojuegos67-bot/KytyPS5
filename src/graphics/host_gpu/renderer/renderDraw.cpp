@@ -62,6 +62,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -2031,6 +2032,39 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					if (!nd.base_from_args) {
 						if (prog.info.instance_offset_sgpr == 10) nd.base_instance = emit.first_instance;
 						else if (sgpr(10, s10)) nd.base_instance = s10;
+					}
+					// (11-12) The record layout, from the guest's own bytes (the table is read the same way above): the
+					// first 3 records with a non-zero word, 2 dumps a few frames apart, once per run per VS.
+					{
+						static uint64_t dumped_vs[2] = {0, 0};
+						static int      dumps[2]     = {0, 0};
+						static int      wait[2]      = {0, 0};
+						const int       w            = dumped_vs[0] == 0 || dumped_vs[0] == prog.shader_hash ? 0 : 1;
+						if (dumped_vs[w] == 0) dumped_vs[w] = prog.shader_hash;
+						if (dumped_vs[w] == prog.shader_hash && dumps[w] < 2 && re.base != 0 && re.stride >= 32 && re.stride <= 256 &&
+						    ++wait[w] % 90 == 0) {
+							const auto* rec = reinterpret_cast<const uint32_t*>(re.base);
+							int         shown = 0;
+							for (uint32_t i = 0; i < re.count && i < 1024 && shown < 3; ++i) {
+								const uint32_t* r = rec + uint64_t {i} * (re.stride / 4);
+								bool any = false;
+								for (uint32_t k = 0; k < re.stride / 4; ++k) any = any || r[k] != 0;
+								if (!any) continue;
+								std::string line;
+								char        b[32];
+								for (uint32_t k = 0; k < re.stride / 4 && k < 24; ++k) {
+									float f;
+									std::memcpy(&f, &r[k], 4);
+									std::snprintf(b, sizeof(b), " %u:%g/%08x", k, f, r[k]);
+									line += b;
+								}
+								std::printf("FG particle native: record dump %d VS %016llx slot %u:%s\n", dumps[w],
+								            static_cast<unsigned long long>(prog.shader_hash), i, line.c_str());
+								++shown;
+							}
+							std::fflush(stdout);
+							++dumps[w];
+						}
 					}
 					FrameGen::ParticleNativeCapture(buffer, rendering, nd);
 				}
