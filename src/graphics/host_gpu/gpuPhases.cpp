@@ -598,7 +598,9 @@ void ReportIfDue(uint64_t frames) {
 		                frame(Phase::Process), frame(Phase::Draw), frame(Phase::Dispatch),
 		                frame(Phase::DrawBda) + frame(Phase::DispatchBda), frame(Phase::Command));
 	}
-	LOGF("%s\n", line.c_str());
+	// GT7 port: the line goes where the Perf lines go (the port's log), so a run shows where
+	// the GPU thread's time per draw goes without a console.
+	Log::WriteUnmuted(line + "\n");
 	{
 		// Round 165: what the renderer recorded besides draws and dispatches, a frame.
 		namespace RC = RecordedCommands;

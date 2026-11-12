@@ -76,9 +76,15 @@ private:
 			}
 		} else {
 			uint32_t spins = 0;
+			// GT7: the GPU thread is the bottleneck and has a core of its own; a yield there can
+			// hand its core to a compile thread for a whole time slice (waits of 16 ms and more
+			// on the texture cache), so it keeps spinning (KYTY_GPU_LOCK_SPIN=0: yields as before).
+			const uint32_t spin_limit =
+			    Common::PerfStats::IsGpuThread() && Common::PerfStats::GpuLockSpin() ? ~0u
+			                                                                         : 256u;
 			do {
 				while (m_lock.load(std::memory_order_relaxed)) {
-					if (spins < 256) {
+					if (spins < spin_limit) {
 						spins++;
 						Pause();
 					} else {
