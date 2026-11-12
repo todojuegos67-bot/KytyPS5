@@ -501,13 +501,29 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		auto button = ControllerButtonToPadButton(f.button);
 		// A pad without a touchpad (an Xbox pad's View, others' Back or Select) presses it with that button (issue #197:
 		// otherwise the game's touchpad menu was out of reach); a PlayStation pad's Create button stays the system's.
+		// (With a finger on the pad's middle, as a DualSense's click comes: its touch before the click is down, lifted
+		// after it is up. The game may read where the pad was pressed, not only the click: issue #328.)
+		bool touch = false;
 		if (f.button == SDL_CONTROLLER_BUTTON_BACK) {
-			const auto type = SDL_GameControllerGetType(SDL_GameControllerFromInstanceID(f.id));
-			if (type != SDL_CONTROLLER_TYPE_PS4 && type != SDL_CONTROLLER_TYPE_PS5) button = Controller::PAD_BUTTON_TOUCH_PAD;
+			auto*      pad  = SDL_GameControllerFromInstanceID(f.id);
+			const auto type = SDL_GameControllerGetType(pad);
+			if (type != SDL_CONTROLLER_TYPE_PS4 && type != SDL_CONTROLLER_TYPE_PS5) {
+				button = Controller::PAD_BUTTON_TOUCH_PAD;
+				touch  = true;
+				static bool logged = false;
+				if (f.down && !logged) {
+					logged           = true;
+					const char* name = pad != nullptr ? SDL_GameControllerName(pad) : nullptr;
+					std::printf("Pad: %s's View/Back button pressed the touch pad (type %d)\n", name != nullptr ? name : "a pad",
+					            static_cast<int>(type));
+				}
+			}
 		}
+		if (touch && f.down) Controller::SetTouchPad(f.id, 0, true, 0.5f, 0.5f);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down, f.queued_ms);
 		}
+		if (touch && f.up) Controller::SetTouchPad(f.id, 0, false, 0.5f, 0.5f);
 	}
 
 	if (f.axis) {
