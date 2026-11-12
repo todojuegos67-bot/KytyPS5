@@ -129,7 +129,22 @@ void Native() {
 				} else {
 					bool  okw = true;
 					vec2  lo = vec2(1e9), hi = vec2(-1e9);
+					// (11-12) The 120-byte records (the VS's own particle buffer: words 0-2 the position, word 4 the size):
+					// a screen-aligned square around the projected centre, sized by the projected world size.
+					const bool  simple = prm.reci.x == 120u;
+					const vec3  wc     = RecV3(false, slot, 0u), wp = RecV3(true, slot, 0u);
+					const float sz     = clamp(abs(uintBitsToFloat(RecW(false, slot, 4u))), 0.01, 50.0);
+					const vec4  c0 = Clip(prm.vp, wc), p0 = Clip(prm.vpp, wp), c1 = Clip(prm.vp, wc + vec3(0.0, sz, 0.0));
+					const vec2  pc0 = Px(c0, prm.parf.z), pp0 = Px(p0, prm.parf.z);
+					const float rad = clamp(length(Px(c1, prm.parf.z) - pc0), 2.0, prm.parf.y * 0.5);
 					for (uint c = 0u; c < 4u; ++c) {
+						if (simple) {
+							okw = okw && c0.w > 1e-4 && p0.w > 1e-4 && c1.w > 1e-4;
+							const vec2 pc = pc0 + (vec2(float(c & 1u), float(c >> 1u)) * 2.0 - 1.0) * rad;
+							s_cur[c] = pc, s_d[c] = pc0 - pp0;
+							lo = min(lo, pc), hi = max(hi, pc);
+							continue;
+						}
 						const vec4 cc = Clip(prm.vp, Corner(false, slot, ribbon, c));
 						const vec4 cp = Clip(prm.vpp, Corner(true, slot, ribbon, c));
 						okw = okw && cc.w > 1e-4 && cp.w > 1e-4;

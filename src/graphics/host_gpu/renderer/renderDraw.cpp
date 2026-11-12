@@ -1969,7 +1969,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					from       = 2;
 					return src;
 				};
-				const Vs em = vsharp(0xd8), so = vsharp(0xe8), re = vsharp(0xf8);
+				const Vs em = vsharp(0xd8), so_table = vsharp(0xe8), re_table = vsharp(0xf8);
 				{ // (11-12) Once per VS: the table's V#s and the draw's own bound buffers (to verify the layout in the log).
 					static uint64_t said[4] {};
 					static uint32_t said_n = 0;
@@ -1980,9 +1980,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 						std::printf("FG particle native: VS %016llx table V#s: emitters 0x%llx %u x %u B%s, sorted 0x%llx %u x %u B%s, "
 						            "records 0x%llx %u x %u B%s; the VS binds %zu buffers%s, %zu BDA read spans\n",
 						            static_cast<unsigned long long>(prog.shader_hash), static_cast<unsigned long long>(em.base), em.count,
-						            em.stride, em.ok ? "" : " (invalid)", static_cast<unsigned long long>(so.base), so.count, so.stride,
-						            so.ok ? "" : " (invalid)", static_cast<unsigned long long>(re.base), re.count, re.stride,
-						            re.ok ? "" : " (invalid)", vres.size(), vb_ok ? "" : " (bindings mismatch)",
+						            em.stride, em.ok ? "" : " (invalid)", static_cast<unsigned long long>(so_table.base), so_table.count, so_table.stride,
+						            so_table.ok ? "" : " (invalid)", static_cast<unsigned long long>(re_table.base), re_table.count, re_table.stride,
+						            re_table.ok ? "" : " (invalid)", vres.size(), vb_ok ? "" : " (bindings mismatch)",
 						            prog.bda_read_plan.spans.size());
 						for (size_t i = 0; i < vres.size() && i < prog.info.buffers.size(); ++i) {
 							if (vres[i].dword_count < 4) continue;
@@ -2069,6 +2069,21 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 							++f->phase;
 						}
 					}
+				}
+				// (11-12) The real particle state: the VS's own bound buffer of 120-byte records (positions written by the
+				// GPU simulation each frame; the log's 'FG particle find' dumps), and its 8-byte sorted list. The table's
+				// +0xf8 V# is the material data. Both found by stride among what the VS binds.
+				Vs re = re_table, so = so_table;
+				for (size_t i = 0; i < vres.size() && i < prog.info.buffers.size(); ++i) {
+					if (vres[i].dword_count < 4) continue;
+					const auto     d  = DecodeNativeDescriptor<ShaderBufferResource>(vres[i]);
+					const uint32_t st = static_cast<uint32_t>(d.Stride());
+					const uint64_t n  = d.NumRecords();
+					if (d.Base48() == 0 || n < 256) continue;
+					Vs v {d.Base48(), st, static_cast<uint32_t>(n), uint64_t {st} * n, true};
+					v.ok = v.size != 0 && v.size <= (64ull << 20);
+					if (st == 120 && v.ok) re = v;
+					else if (st == 8 && v.ok) so = v;
 				}
 				FrameGen::ParticleNativeDraw nd;
 				nd.vs          = prog.shader_hash;
