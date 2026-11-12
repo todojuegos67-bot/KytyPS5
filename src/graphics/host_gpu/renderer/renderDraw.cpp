@@ -1995,6 +1995,81 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 						std::fflush(stdout);
 					}
 				}
+				{ // (11-12) Where the particle positions live: per VS (2 VSs), 2 dumps ~3 s apart, each plus one taken on the
+				  // next frame (>= 8 ms later), of every buffer the VS binds (guest bytes, only when mapped; a range the GPU
+				  // wrote is flagged since its guest bytes may be stale) and the table's non-zero V#s (0x00..0x200).
+					struct Find {
+						uint64_t vs = 0;
+						int      phase = 0; // 0,2: wait ~3 s; 1,3: the next frame; 4: done
+						double   t = 0;     // seconds (steady clock) of the last dump
+						uint64_t hash[8] {};
+					};
+					static Find find[2];
+					Find*       f = nullptr;
+					for (auto& e : find)
+						if (f == nullptr && (e.vs == prog.shader_hash || e.vs == 0)) f = &e;
+					if (f != nullptr) {
+						const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+						if (f->vs == 0) f->vs = prog.shader_hash, f->t = now;
+						const double dt  = now - f->t;
+						const bool   due = (f->phase == 0 || f->phase == 2) ? dt >= 3.0 : (f->phase < 4 && dt >= 0.008);
+						if (due) {
+							const int dump = f->phase / 2, next = f->phase & 1;
+							std::printf("FG particle find: VS %016llx dump %d%s (+%.0f ms)\n", static_cast<unsigned long long>(prog.shader_hash),
+							            dump, next ? "b (next frame)" : "a", dt * 1000.0);
+							if (f->phase == 0 && LibKernel::Memory::IsFullyMapped(table, 0x200)) {
+								std::string line;
+								char        b[96];
+								for (uint32_t off = 0; off < 0x200; off += 16) {
+									const uint32_t* v = t + off / 4;
+									if ((v[0] | v[1] | v[2] | v[3]) == 0) continue;
+									const Vs s = vsharp(off);
+									if (!s.ok) continue;
+									std::snprintf(b, sizeof(b), " +%03x:0x%llx/%ux%u", off, static_cast<unsigned long long>(s.base), s.stride,
+									              s.count);
+									line += b;
+								}
+								std::printf("FG particle find:   table V#s:%s\n", line.empty() ? " none" : line.c_str());
+							}
+							for (size_t i = 0; i < vres.size() && i < prog.info.buffers.size() && i < 8; ++i) {
+								if (vres[i].dword_count < 4) continue;
+								const auto     d      = DecodeNativeDescriptor<ShaderBufferResource>(vres[i]);
+								const uint64_t base   = d.Base48();
+								const uint32_t stride = static_cast<uint32_t>(d.Stride());
+								const uint64_t size   = stride != 0 ? uint64_t {stride} * d.NumRecords() : uint64_t {d.NumRecords()};
+								const uint64_t hsize  = std::min<uint64_t>(size, 4096);
+								const bool     gpu    = base != 0 && size != 0 && (cache.IsRegionGpuModified(base, size) || cache.HasGpuDirtyBytes(base, size));
+								const bool     mapped = base != 0 && hsize != 0 && LibKernel::Memory::IsFullyMapped(base, hsize);
+								uint64_t       h      = 0;
+								std::string    line;
+								if (mapped) {
+									const auto* p = reinterpret_cast<const uint8_t*>(base);
+									h             = 1469598103934665603ull;
+									for (uint64_t k = 0; k < hsize; ++k) h = (h ^ p[k]) * 1099511628211ull;
+									const auto*    w  = reinterpret_cast<const uint32_t*>(base);
+									const uint32_t es = stride != 0 ? stride / 4 : 4;
+									const uint64_t nw = std::min<uint64_t>(std::min<uint64_t>(uint64_t {es} * 3, 24), hsize / 4);
+									char           b[40];
+									for (uint64_t k = 0; k < nw; ++k) {
+										float fl;
+										std::memcpy(&fl, &w[k], 4);
+										std::snprintf(b, sizeof(b), "%s%llu:%g/%08x", k % es == 0 ? " |" : " ", static_cast<unsigned long long>(k), fl, w[k]);
+										line += b;
+									}
+								}
+								std::printf("FG particle find:   buf %zu 0x%llx stride %u n %u%s%s%s%s hash %016llx%s%s\n", i,
+								            static_cast<unsigned long long>(base), stride, d.NumRecords(), prog.info.buffers[i].read ? " R" : "",
+								            prog.info.buffers[i].written ? " W" : "", gpu ? " GPU-MODIFIED(guest bytes stale?)" : "",
+								            mapped ? "" : " unmapped", static_cast<unsigned long long>(h),
+								            !next ? "" : (h != f->hash[i] ? " CHANGED" : " same"), line.c_str());
+								f->hash[i] = h;
+							}
+							std::fflush(stdout);
+							f->t = now;
+							++f->phase;
+						}
+					}
+				}
 				FrameGen::ParticleNativeDraw nd;
 				nd.vs          = prog.shader_hash;
 				nd.rec_address = re.base;
