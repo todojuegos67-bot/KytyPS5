@@ -12,6 +12,8 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/tableMode.h"
+#include "graphics/host_gpu/renderer/tableTargets.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -85,6 +87,37 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 
 		return;
+	}
+	// KYTY_TABLE (tableTargets.h): these registers resolved before to an image found with the
+	// same backing, and no image was registered or unregistered since.
+	TableTargets::ColorEntry* table_hit = nullptr;
+	if (TableMode::Enabled() && rt_slot < 8u) {
+		if (m_target_table == nullptr) {
+			m_target_table = std::make_shared<TableTargets::Table>();
+		}
+		const auto generation = m_context.GetTextureCache().ImageSetGeneration();
+		for (auto& entry: m_target_table->color[rt_slot]) {
+			if (entry.valid && entry.generation == generation && entry.mask == mask &&
+			    entry.slice_offset == render_target_slice_offset &&
+			    entry.exact_format == exact_format && TableTargets::SameBytes(entry.rt, rt)) {
+				table_hit = &entry;
+				break;
+			}
+		}
+		if (table_hit != nullptr && !TableMode::Verifying()) {
+			if (m_context.GetTextureCache().RefindTarget(table_hit->result.image_id,
+			                                             table_hit->result.desc)) {
+				TableMode::Add(TableMode::Counter::TargetHits);
+				r = table_hit->result;
+				BindRenderTarget(r.image_id);
+				return;
+			}
+			table_hit->valid = false;
+			table_hit        = nullptr;
+		}
+		if (table_hit == nullptr) {
+			TableMode::Add(TableMode::Counter::TargetMisses);
+		}
 	}
 	// NUM_SAMPLES (coverage) and NUM_FRAGMENTS (stored colors) are both log2. EQAA stores fewer
 	// fragments than it has coverage samples (e.g. 4s/2f) and keeps the sample->fragment map in
@@ -381,9 +414,40 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	bool same_backing          = false;
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format, &same_backing);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	if (table_hit != nullptr) {
+		// KYTY_TABLE=2: the table's target against the one just resolved.
+		TableMode::Add(TableMode::Counter::TargetHits);
+		TableMode::Add(TableMode::Counter::TargetVerifyChecks);
+		const auto& t = table_hit->result;
+		if (!(t.image_id == r.image_id) || !TableTargets::SameDesc(t.desc, r.desc) ||
+		    t.target_slot != r.target_slot || t.guest_mip_level != r.guest_mip_level ||
+		    t.guest_array_layer != r.guest_array_layer ||
+		    t.export_mapping.packed != r.export_mapping.packed) {
+			TableMode::Add(TableMode::Counter::TargetVerifyMismatches);
+			if (TableMode::VerifyLogAllowed()) {
+				LOGF("Table verify: color target slot %u at 0x%012" PRIx64
+				     " differs from the normal path (entry dropped)\n",
+				     rt_slot, static_cast<uint64_t>(rt.base.addr));
+			}
+			table_hit->valid = false;
+		}
+	} else if (TableMode::Enabled() && rt_slot < 8u && same_backing && m_target_table != nullptr) {
+		auto& way   = m_target_table->color_next[rt_slot];
+		auto& entry = m_target_table->color[rt_slot][way];
+		way         = (way + 1u) % TableTargets::Ways;
+		entry.valid = true;
+		// After the lookup: what it registered (nothing, found with the same backing) is in.
+		entry.generation   = texture_cache.ImageSetGeneration();
+		entry.mask         = mask;
+		entry.slice_offset = render_target_slice_offset;
+		entry.exact_format = exact_format;
+		TableTargets::CopyBytes(entry.rt, rt);
+		entry.result = r;
+	}
 }
 
 } // namespace Libs::Graphics

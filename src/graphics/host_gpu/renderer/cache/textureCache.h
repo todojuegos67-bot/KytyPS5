@@ -81,6 +81,11 @@ public:
 	// backing (SameBacking), as it was: no overlap had to be resolved and no image was made.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      bool* same_backing = nullptr);
+	// KYTY_TABLE (tableTargets.h): a render target FindImage found with the same backing before,
+	// while ImageSetGeneration has not moved since: what FindImage does besides the lookup (the
+	// image's tick and LRU touch, its uint array description, its color clear's
+	// materialization). False when the image is gone (the caller then looks it up).
+	[[nodiscard]] bool          RefindTarget(ImageId id, const ImageDesc& desc);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);

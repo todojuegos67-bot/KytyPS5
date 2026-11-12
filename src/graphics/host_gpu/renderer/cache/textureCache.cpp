@@ -4101,6 +4101,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 	return result;
 }
 
+bool TextureCache::RefindTarget(ImageId id, const ImageDesc& desc) {
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid()) {
+		EXIT("TextureCache: image lookup requires a valid command buffer\n");
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		auto*            image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			return false;
+		}
+		image->tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(*image);
+	}
+	// As FindImage after its lookup; a same-backing find leaves the view where the description
+	// put it, so its first layer is the metadata's.
+	DescribeUintArrayImage(id, desc);
+	MaterializeColorClear(id, desc, desc.view_info.base_layer);
+	return true;
+}
+
 void TextureCache::UpdateImage(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];

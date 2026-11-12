@@ -15,6 +15,8 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/tableMode.h"
+#include "graphics/host_gpu/renderer/tableTargets.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -25,6 +27,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -341,6 +344,45 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		r.unsupported = true;
 		return;
 	}
+	// KYTY_TABLE (tableTargets.h): these registers resolved before to an image found with the
+	// same backing, and no image was registered or unregistered since.
+	TableTargets::DepthEntry* table_hit = nullptr;
+	if (TableMode::Enabled()) {
+		if (m_target_table == nullptr) {
+			m_target_table = std::make_shared<TableTargets::Table>();
+		}
+		const auto  generation    = m_context.GetTextureCache().ImageSetGeneration();
+		const float depth_clear   = hw.GetDepthClearValue();
+		const float bounds_min    = hw.GetDepthBoundsMin();
+		const float bounds_max    = hw.GetDepthBoundsMax();
+		const auto  stencil_clear = static_cast<uint8_t>(hw.GetStencilClearValue());
+		for (auto& entry: m_target_table->depth) {
+			if (entry.valid && entry.generation == generation &&
+			    std::memcmp(&entry.depth_clear, &depth_clear, sizeof(float)) == 0 &&
+			    std::memcmp(&entry.bounds_min, &bounds_min, sizeof(float)) == 0 &&
+			    std::memcmp(&entry.bounds_max, &bounds_max, sizeof(float)) == 0 &&
+			    entry.stencil_clear == stencil_clear && TableTargets::SameBytes(entry.z, z) &&
+			    TableTargets::SameBytes(entry.rc, rc) && TableTargets::SameBytes(entry.dc, dc) &&
+			    TableTargets::SameBytes(entry.sc, sc) && TableTargets::SameBytes(entry.sm, sm)) {
+				table_hit = &entry;
+				break;
+			}
+		}
+		if (table_hit != nullptr && !TableMode::Verifying()) {
+			if (m_context.GetTextureCache().RefindTarget(table_hit->result.image_id,
+			                                             table_hit->result.desc)) {
+				TableMode::Add(TableMode::Counter::TargetHits);
+				r = table_hit->result;
+				BindRenderTarget(r.image_id);
+				return;
+			}
+			table_hit->valid = false;
+			table_hit        = nullptr;
+		}
+		if (table_hit == nullptr) {
+			TableMode::Add(TableMode::Counter::TargetMisses);
+		}
+	}
 	r.desc                    = MakeDepthTargetDesc(buffer, z);
 	r.guest_array_layer       = r.desc.view_info.base_layer;
 	r.depth_clear_enable      = rc.depth_clear_enable;
@@ -386,9 +428,55 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	auto& cache        = m_context.GetTextureCache();
+	bool  same_backing = false;
+	r.image_id         = cache.FindImage(r.desc, false, &same_backing);
 	BindRenderTarget(r.image_id);
+	if (table_hit != nullptr) {
+		// KYTY_TABLE=2: the table's target against the one just resolved.
+		TableMode::Add(TableMode::Counter::TargetHits);
+		TableMode::Add(TableMode::Counter::TargetVerifyChecks);
+		const auto& t = table_hit->result;
+		const bool  same =
+		    t.image_id == r.image_id && TableTargets::SameDesc(t.desc, r.desc) &&
+		    t.guest_array_layer == r.guest_array_layer &&
+		    t.depth_clear_enable == r.depth_clear_enable &&
+		    t.depth_load_clear_enable == r.depth_load_clear_enable &&
+		    t.depth_test_enable == r.depth_test_enable &&
+		    t.depth_write_enable == r.depth_write_enable &&
+		    t.depth_compare_op == r.depth_compare_op &&
+		    t.depth_bounds_test_enable == r.depth_bounds_test_enable &&
+		    t.stencil_clear_enable == r.stencil_clear_enable &&
+		    t.stencil_test_enable == r.stencil_test_enable &&
+		    (!r.stencil_test_enable ||
+		     (t.stencil_front == r.stencil_front && t.stencil_back == r.stencil_back)) &&
+		    t.unsupported == r.unsupported;
+		if (!same) {
+			TableMode::Add(TableMode::Counter::TargetVerifyMismatches);
+			if (TableMode::VerifyLogAllowed()) {
+				LOGF("Table verify: depth target at 0x%012" PRIx64
+				     " differs from the normal path (entry dropped)\n",
+				     static_cast<uint64_t>(z.z_read_base_addr));
+			}
+			table_hit->valid = false;
+		}
+	} else if (TableMode::Enabled() && same_backing && m_target_table != nullptr) {
+		auto& way   = m_target_table->depth_next;
+		auto& entry = m_target_table->depth[way];
+		way         = (way + 1u) % TableTargets::Ways;
+		entry.valid      = true;
+		entry.generation = cache.ImageSetGeneration();
+		entry.depth_clear   = hw.GetDepthClearValue();
+		entry.bounds_min    = hw.GetDepthBoundsMin();
+		entry.bounds_max    = hw.GetDepthBoundsMax();
+		entry.stencil_clear = static_cast<uint8_t>(hw.GetStencilClearValue());
+		TableTargets::CopyBytes(entry.z, z);
+		TableTargets::CopyBytes(entry.rc, rc);
+		TableTargets::CopyBytes(entry.dc, dc);
+		TableTargets::CopyBytes(entry.sc, sc);
+		TableTargets::CopyBytes(entry.sm, sm);
+		entry.result = r;
+	}
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {

@@ -31,6 +31,9 @@ struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
 struct RenderDepthInfo;
 struct RenderColorInfo;
+namespace TableTargets {
+struct Table;
+} // namespace TableTargets
 struct DrawCallInfo;
 struct DiagnosticCheckpoint;
 struct DrawEmitInfo;
@@ -376,6 +379,8 @@ private:
 	RenderContext&                        m_context;
 	std::vector<MsColorTarget>            m_ms_color_targets;
 	GraphicsBindings                     m_graphics_bindings;
+	// KYTY_TABLE (tableTargets.h): the render targets' table.
+	std::shared_ptr<TableTargets::Table> m_target_table; // shared: Table is incomplete here
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	// Bindless heaps already surveyed (base ^ table offset << 48).

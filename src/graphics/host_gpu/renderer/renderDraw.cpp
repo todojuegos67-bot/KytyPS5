@@ -14,6 +14,8 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/gpuPhases.h"
+#include "graphics/host_gpu/renderer/tableMode.h"
+#include "graphics/host_gpu/renderer/tableTargets.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -2228,6 +2230,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	// KYTY_TABLE: the time of the steps its tables replace (programs and targets), per draw.
+	const uint64_t table_start = TableMode::Enabled() ? GpuPhases::Now() : 0;
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
@@ -2269,6 +2273,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 		}
 		ResolveRenderDepthTarget(buffer, state.depth_info);
+	}
+	if (table_start != 0) {
+		TableMode::AddDraw(TableMode::ProgramHitFlag(), GpuPhases::Now() - table_start);
 	}
 	if (state.depth_info.unsupported) {
 		if (FrameGraph::Logging()) {
