@@ -1375,6 +1375,17 @@ bool ReadFaults(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size);
 }
 
+bool TryReadGuestNoFault(uint64_t vaddr, void* data, uint64_t size) {
+	if (data == nullptr || size == 0 || !Graphics::GuestGpu::IsTranslatingThread() || Graphics::GuestGpu::IsGpuThread())
+		return false;
+	// (As TryReadGpuShaderSpan's raw form: a page no read watcher guards holds what the GPU thread reads there; a guarded
+	// copy, a fault refused. A read-watched one only through its clean backing.)
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    (!g_gpu_resources->HasReadWatchers(vaddr, size) && SpeculationReadsClean(vaddr, size)))
+		return Common::GuardedCopy(data, reinterpret_cast<const void*>(vaddr), size) == 0;
+	return TryReadGpuCleanBackingToHost(vaddr, data, size);
+}
+
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean) {
 	if (!data || size < 8 || size > (clean ? 4096u : 64u) || size % 4 != 0 || !g_gpu_resources ||
 	    !Graphics::GuestGpu::IsTranslatingThread() || !IsGpuAddressRange(vaddr, size))

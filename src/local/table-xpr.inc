@@ -693,7 +693,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		return Spec::Refuse("table: pair key"), TableResult::Native;
 	if (const auto generation = ShaderMapGeneration(); generation != pair.Generation(Role())) {
 		if (pair.programs[0] != nullptr &&
-		    (ShaderHashAt(vs_address) != pair.programs[0]->shader_hash ||
+		    (ShaderHashNoFaultScope {Role() != 0 && !GuestGpu::IsGpuThread()}, ShaderHashAt(vs_address) != pair.programs[0]->shader_hash ||
 		     (pair.programs[1] != nullptr && ShaderHashAt(ps_address) != pair.programs[1]->shader_hash))) {
 			if (Role() != 0) return Spec::Refuse("table: shaders changed"), TableResult::Native;
 			const auto write = CatalogWrite();
@@ -1925,8 +1925,14 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			block[plan.BufferDword(i) + 3] = word;
 			block[plan.BufferDword(i) + 4] = stride;
 		}
-		if (plan.BlockDwords() != 0) // (a stage with neither slots nor buffers reads no block)
-			blocks[st] = upload.BufferDeviceAddress() + upload.Copy(block.data(), block.size() * sizeof(uint32_t), 16);
+		if (plan.BlockDwords() != 0) { // (a stage with neither slots nor buffers reads no block)
+			// (A speculation's thread never waits for its ring: it holds the catalog shared; the hole runs the draw.)
+			const auto copied = Spec::Current() == nullptr
+			                        ? std::optional<uint64_t> {upload.Copy(block.data(), block.size() * sizeof(uint32_t), 16)}
+			                        : upload.TryCopy(block.data(), block.size() * sizeof(uint32_t), 16);
+			if (!copied) return Spec::Refuse("table: upload ring busy"), false;
+			blocks[st] = upload.BufferDeviceAddress() + *copied;
+		}
 	}
 	return true;
 }
@@ -2973,6 +2979,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	if (Role() != 0 && (pair.programs[0] == nullptr || pair.pipeline == nullptr || pair.respecialize))
 		return Spec::Refuse("table program"), false;
 	if (const auto generation = ShaderMapGeneration(); generation != pair.Generation(Role())) {
+		const ShaderHashNoFaultScope no_fault {Role() != 0 && !GuestGpu::IsGpuThread()}; // (a worker under the catalog: no read that can fault)
 		if (pair.programs[0] != nullptr && ShaderHashAt(pair.vs) != pair.programs[0]->shader_hash) {
 			if (Role() != 0) return Spec::Refuse("table: shaders changed"), false;
 			const auto write = CatalogWrite();

@@ -466,6 +466,15 @@ const uint32_t* CommandProcessor::SuspendedPacket(const Pm4Execution& execution,
 	return packet;
 }
 
+bool CommandProcessor::SuspendedPacketFits(const Pm4Execution& execution) {
+	if (execution.m_buffer_stack.empty()) return false;
+	const auto& cursor = execution.m_buffer_stack.back();
+	if (cursor.offset_dw >= cursor.commands.size() || cursor.deferred_advance_dw != 0) return false;
+	const auto header = cursor.commands[cursor.offset_dw];
+	const auto dwords = header == 0x80000000u ? 1u : KYTY_PM4_LEN(header);
+	return dwords != 0 && dwords <= cursor.commands.size() - cursor.offset_dw;
+}
+
 bool CommandProcessor::SamePosition(const Pm4Execution& a, const Pm4Execution& b) {
 	// (The innermost first: most packets differ there. Not the deferred advances: an outer level's is set only when the
 	// execution was suspended inside the buffer it called.)

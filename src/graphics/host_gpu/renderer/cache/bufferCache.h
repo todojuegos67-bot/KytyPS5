@@ -72,11 +72,9 @@ public:
 	// FindBuffer's speculative-translation form, out of line (bufferCache.cpp).
 	[[gnu::noinline]] [[nodiscard]] BufferId FindBufferSpec(uint64_t vaddr, uint64_t size);
 	// FindBuffer's registered buffer over the range, none registered: the null id (a speculative translation's
-	// question whether ObtainBuffer gave the range's buffer).
-	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size) {
-		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-		return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size) ? *owner : BufferId {};
-	}
+	// question whether ObtainBuffer gave the range's buffer). Out of line (bufferCache.cpp): its page-table entry read
+	// once (LoadOwner), as on any speculation thread.
+	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size);
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	// As EnsureBufferContents, for a texel buffer: an image GPU work wrote over the range is copied in (SynchronizeBuffer).
 	void                   EnsureTexelContents(uint64_t vaddr, uint64_t size);

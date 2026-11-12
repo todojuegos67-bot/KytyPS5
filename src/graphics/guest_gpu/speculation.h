@@ -152,7 +152,7 @@ private:
 		bool         failed = false, progressed = false;
 		bool         blind  = false; // translated without the one before it while that was not done (mode 4)
 		size_t       submitted = 0, next = 0; // recorded command buffers submitted, segments committed
-		uint64_t     last_tick = 0;           // the tick the last of them was submitted with (0: none)
+		uint64_t     last_tick = 0;           // the last of them's tick (0: none; batched / spliced: not yet submitted)
 		size_t       blocked   = SIZE_MAX;    // the wait hole the commit waits at
 		uint64_t     retired   = 0;           // when Finish kept it for reuse (m_clock; 0: in use)
 		// When its translation started and ended, when each segment's ended.

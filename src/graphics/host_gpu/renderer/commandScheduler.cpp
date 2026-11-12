@@ -427,8 +427,10 @@ void CommandScheduler::Finish() {
 
 void CommandScheduler::Wait(uint64_t tick) {
 	if (Rec() != nullptr) {
-		// (A recorder's own work is not submitted: waiting for it would never end.)
-		if (tick >= PendingTick) throw RecorderRefusal {"Wait"};
+		// (A recorder's own work is not submitted: waiting for it would never end. Nor is the GPU thread's open command
+		// buffer, or a batch it holds (speculate_batch_submits, a splice): a tick at or past the master semaphore's current
+		// one is submitted only by the GPU thread, which may be waiting for a lock this thread holds (the catalog).)
+		if (tick >= PendingTick || tick >= m_master.CurrentTick()) throw RecorderRefusal {"Wait"};
 		m_master.Wait(tick);
 		return;
 	}

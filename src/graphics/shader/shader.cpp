@@ -130,9 +130,20 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 // Shader memory read as HashShaderCode reads the code: GPU ownership is byte-exact, CPU protection
 // covers whole pages, so bytes that only share a page with GPU-written data come from the backing (a
 // load would fault on the page and wait for its download). GPU-written bytes are loaded.
+// (A speculation's thread, t_shader_hash_no_fault: a guarded copy instead of a load that can fault into a readback that
+// waits for the GPU thread while the catalog is held; a fault sets t_shader_hash_failed.)
+thread_local bool t_shader_hash_no_fault = false;
+static thread_local bool t_shader_hash_failed = false;
 static void ReadShaderMemory(uint64_t address, void* out, size_t bytes) {
-	if (!LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, out, bytes))
-		std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
+	if (LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, out, bytes)) return;
+	if (t_shader_hash_no_fault) {
+		if (!LibKernel::Memory::TryReadGuestNoFault(address, out, bytes)) { // (a read-watched page only through its clean backing)
+			t_shader_hash_failed = true;
+			std::memset(out, 0, bytes);
+		}
+		return;
+	}
+	std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
 }
 
 static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
@@ -159,7 +170,13 @@ static uint64_t HashShaderCode(std::span<const uint32_t> code) {
 		        reinterpret_cast<uint64_t>(code.data()), scratch.data(), code.size_bytes())) {
 			return XXH3_64bits(scratch.data(), code.size_bytes());
 		}
+		if (t_shader_hash_no_fault) { // (no load that can fault: the guarded copy, then the hash)
+			if (!LibKernel::Memory::TryReadGuestNoFault(reinterpret_cast<uint64_t>(code.data()), scratch.data(), code.size_bytes()))
+				return t_shader_hash_failed = true, 0;
+			return XXH3_64bits(scratch.data(), code.size_bytes());
+		}
 	}
+	if (t_shader_hash_no_fault) return t_shader_hash_failed = true, 0; // (over 1 MiB: not read on such a thread)
 	return XXH3_64bits(code.data(), code.size_bytes());
 }
 
@@ -178,8 +195,10 @@ static uint64_t ShaderCodeHash(uint64_t shader_addr, std::span<const uint32_t> c
 	auto&      entry      = (*entries)[((shader_addr >> 8u) * 0x9e3779b97f4a7c15ull) >> 51u];
 	const bool known      = entry.addr == shader_addr && entry.generation == generation;
 	if (known && (++entry.uses & 63u) != 0) return entry.hash;
-	const auto declared = GetDeclaredShaderHash(shader_addr);
-	const auto hash     = declared != 0 ? declared : HashShaderCode(code);
+	t_shader_hash_failed = false;
+	const auto declared  = GetDeclaredShaderHash(shader_addr);
+	const auto hash      = declared != 0 ? declared : HashShaderCode(code);
+	if (t_shader_hash_failed) return 0; // (a no-fault read faulted: 0, never cached)
 	if (known && hash != entry.hash) {
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1, std::memory_order_relaxed) < 16)

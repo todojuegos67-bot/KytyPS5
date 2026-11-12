@@ -70,6 +70,8 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <tuple>
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <type_traits>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -1175,6 +1177,15 @@ void BufferCache::ChangeRegister(BufferId id) {
 	// entry's proof: the entry then held the device address of a buffer since unregistered until another registration
 	// in that region (seconds), and no later commit check stopped it (VK_ERROR_DEVICE_LOST, a device fault on a
 	// destroyed buffer). The render thread alone registers, so a plain load and store is the increment.
+	// The page table first, one 8-byte store an entry (a speculation's thread reads it concurrently: LoadOwner), then the
+	// epochs: a speculation that acquires the new epoch then reads the new entry (an unregister's cleared one); one that
+	// read the old entry took the old epoch, which its commit's registration check finds moved.
+	PageTable::PageRange pages {};
+	EXIT_IF(!PageTable::TryGetPageRange(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size(), pages));
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		const BufferId entry = insert ? id : BufferId {};
+		__atomic_store_n(reinterpret_cast<uint64_t*>(&m_page_table[page]), std::bit_cast<uint64_t>(entry), __ATOMIC_RELEASE);
+	}
 	const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
 	if (m_registration_spans.size() < 64) {
 		m_registration_spans.push_back({m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size()});
@@ -1199,15 +1210,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		            insert ? '+' : '-', static_cast<unsigned long long>(buffer.CpuAddress()),
 		            static_cast<unsigned long long>(buffer.Size()));
 	if constexpr (!insert) InvalidateCopyFeedback(buffer.CpuAddress(), buffer.Size());
-	PageTable::PageRange pages {};
-	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
-		if constexpr (insert) {
-			m_page_table[page] = id;
-		} else {
-			m_page_table[page] = {};
-		}
-	}
 	const auto size_pages = pages.last_exclusive - pages.first;
 	if constexpr (insert) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
@@ -2114,6 +2116,22 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 
 // A speculative translation's FindBuffer: no drain (its work reads the buffer on the GPU, after its commit), the range
 // noted (its commit checks nothing registered over it since), nothing registered.
+// A speculation's thread reads a page-table entry once, as one 8-byte load: the GPU thread may clear it (an unregister)
+// between two plain reads, and a second read then names no slot (SlotVector::operator[]'s EXIT on a worker, a
+// terminate).
+static BufferId LoadOwner(const BufferId* owner) noexcept {
+	static_assert(sizeof(BufferId) == sizeof(uint64_t) && std::is_trivially_copyable_v<BufferId>);
+	if (owner == nullptr) return {};
+	return std::bit_cast<BufferId>(__atomic_load_n(reinterpret_cast<const uint64_t*>(owner), __ATOMIC_SEQ_CST));
+}
+
+BufferId BufferCache::RegisteredBuffer(uint64_t vaddr, uint64_t size) {
+	const BufferId owner = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	if (!owner) return {};
+	const auto* buffer = m_slot_buffers.try_get(owner); // (its slot gone since: no buffer, the null id)
+	return buffer != nullptr && buffer->IsInBounds(vaddr, size) ? owner : BufferId {};
+}
+
 BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -2121,12 +2139,14 @@ BufferId BufferCache::FindBufferSpec(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	if (owner != nullptr && *owner) {
-		auto& buffer = m_slot_buffers[*owner];
-		if (buffer.IsInBounds(vaddr, size)) {
+	const BufferId owner = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	if (owner) {
+		// (Its slot gone since: unregistered and retired meanwhile. Refused: the hole runs it.)
+		const auto* buffer = m_slot_buffers.try_get(owner);
+		if (buffer == nullptr) return Spec::Refuse("buffer registration (unregistered meanwhile)"), NULL_BUFFER_ID;
+		if (buffer->IsInBounds(vaddr, size)) {
 			Spec::Current()->NoteBufferRange(vaddr, size);
-			return *owner;
+			return owner;
 		}
 	}
 	return Spec::Refuse("buffer registration"), NULL_BUFFER_ID;
@@ -2700,8 +2720,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferSpec(Spec::State& spec, ui
 	}
 	// The registered buffer over the range, which its commit obtains again before the work (a range it reads made
 	// current, one it writes made GPU-owned).
-	const auto* owner  = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	auto*       buffer = owner != nullptr && *owner ? m_slot_buffers.try_get(*owner) : nullptr;
+	const BufferId owner_id = LoadOwner(m_page_table.Find(vaddr >> PageTable::kPageBits)); // (one read: LoadOwner)
+	const auto*    owner    = &owner_id; // (its later use names the buffer found here, not a re-read)
+	auto*          buffer   = owner_id ? m_slot_buffers.try_get(owner_id) : nullptr;
 	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size))
 		return Spec::Refuse("buffer lookup"), std::pair<Buffer*, uint64_t> {nullptr, 0};
 	// A texel buffer over an image GPU work wrote: the normal path copies the image in at the draw. Its commit does that

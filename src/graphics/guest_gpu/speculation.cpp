@@ -743,6 +743,14 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 				if (processed != Pm4ProcessResult::Complete) r.stop = processor.TakeStopReached() ? ChunkEnd : "suspended";
 				break;
 			}
+			// (A packet that does not fit its buffer, refused "malformed packet" before its Mark: a command buffer the game
+			// rewrote after the GPU thread passed it. Not sized (SuspendedPacket would end the process) and nothing taken:
+			// the checkpoint is the packet before's, so a Rollback would drop that packet's notes; the GPU thread redoes it.)
+			if (!CommandProcessor::SuspendedPacketFits(spec)) {
+				r.failed = true;
+				r.stop   = r.state.refused;
+				break;
+			}
 			uint32_t   dwords  = 0;
 			const auto packet  = CommandProcessor::SuspendedPacket(spec, dwords);
 			const bool partial = LocalVulkanRecording::RecordedWrites() != r.state.checkpoint_work;
@@ -1267,9 +1275,9 @@ void Speculation::Finish(std::unique_ptr<Result> result, size_t first) {
 	for (const auto& hole: r.holes) ++m_hole_reasons[hole.reason];
 	if (first < r.state.closed.size() || !r.recorder->recorded.empty() || r.recorder->open != SIZE_MAX)
 		scheduler.DiscardRecorded(*r.recorder);
-	// (Its rings' data is read by the command buffers it submitted, done with the last; none submitted: free now. Not
-	// the open command buffer's tick: a speculation thread waiting for its ring would wait for a submission that may
-	// wait for it.)
+	// (Its rings' data is read by the command buffers it submitted, done with the last; none submitted: free now. Under
+	// speculate_batch_submits or a splice the last is the GPU thread's open or held buffer's tick, not yet submitted:
+	// CommandScheduler::Wait refuses such a tick on a speculation's thread, so no worker waits for it.)
 	const auto tick    = r.last_tick;
 	const auto pending = r.recorder->pending_tick;
 	auto&      owner   = *r.owner;
