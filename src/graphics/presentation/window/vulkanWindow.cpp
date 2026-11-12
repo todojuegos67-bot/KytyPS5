@@ -929,6 +929,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.multiDrawIndirect                    = VK_TRUE; // (indirect draws of several argument sets)
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	// FP64 shader arithmetic (GT7's V_*_F64), where the device has it.
+	device_features.shaderFloat64 = supported_features2.features.shaderFloat64;
 	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue (the BDA page table).
 	{
 		vk::PhysicalDeviceProperties properties {};

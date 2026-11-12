@@ -276,6 +276,87 @@ uint32_t EmitPackHalf(EmitterState& state, uint32_t src) {
 
 } // namespace
 
+// FP64 (GT7): IR values are the double's bits (U64, a uvec2); computed in double (Float64).
+static bool EmitValueAluF64(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto op    = inst.GetOpcode();
+	switch (op) {
+		case IR::ValueOpcode::ConvertF64F32:
+		case IR::ValueOpcode::ConvertF32F64:
+		case IR::ValueOpcode::ConvertF64S32:
+		case IR::ValueOpcode::ConvertF64U32:
+		case IR::ValueOpcode::FPTrunc64:
+		case IR::ValueOpcode::FPCeil64:
+		case IR::ValueOpcode::FPFloor64:
+		case IR::ValueOpcode::FPFract64:
+		case IR::ValueOpcode::FPRecip64:
+		case IR::ValueOpcode::FPAdd64:
+		case IR::ValueOpcode::FPMul64:
+		case IR::ValueOpcode::FPMin64:
+		case IR::ValueOpcode::FPMax64:
+		case IR::ValueOpcode::FPFma64:
+		case IR::ValueOpcode::FPOrdEqual64:
+		case IR::ValueOpcode::FPOrdLessThanEqual64:
+		case IR::ValueOpcode::FPOrdGreaterThanEqual64: break;
+		default: return false;
+	}
+	state.builder.RequireCapability(CapabilityFloat64);
+	const auto f64      = state.builder.Type(OpTypeFloat, {64});
+	const auto to_f64   = [&](uint32_t bits) { return Unary(state, OpBitcast, f64, bits); };
+	const auto from_f64 = [&](uint32_t value) { return Unary(state, OpBitcast, TypeU64(state), value); };
+	const auto arg      = [&](size_t index) { return to_f64(ctx.Arg(inst, index)); };
+	const auto ext      = [&](uint32_t glsl, std::initializer_list<uint32_t> args) {
+		return from_f64(EmitExt(state, f64, glsl, args));
+	};
+	switch (op) {
+		case IR::ValueOpcode::ConvertF64F32:
+			ctx.Define(inst, from_f64(Unary(state, OpFConvert, f64, ctx.Arg(inst, 0))));
+			return true;
+		case IR::ValueOpcode::ConvertF32F64:
+			ctx.Define(inst, Unary(state, OpFConvert, TypeF32(state), arg(0)));
+			return true;
+		case IR::ValueOpcode::ConvertF64S32: {
+			const auto signed_value = Unary(state, OpBitcast, TypeI32(state), ctx.Arg(inst, 0));
+			ctx.Define(inst, from_f64(Unary(state, OpConvertSToF, f64, signed_value)));
+			return true;
+		}
+		case IR::ValueOpcode::ConvertF64U32:
+			ctx.Define(inst, from_f64(Unary(state, OpConvertUToF, f64, ctx.Arg(inst, 0))));
+			return true;
+		case IR::ValueOpcode::FPTrunc64: ctx.Define(inst, ext(GlslTrunc, {arg(0)})); return true;
+		case IR::ValueOpcode::FPCeil64: ctx.Define(inst, ext(GlslCeil, {arg(0)})); return true;
+		case IR::ValueOpcode::FPFloor64: ctx.Define(inst, ext(GlslFloor, {arg(0)})); return true;
+		case IR::ValueOpcode::FPFract64: ctx.Define(inst, ext(GlslFract, {arg(0)})); return true;
+		case IR::ValueOpcode::FPRecip64: {
+			const auto one = to_f64(ConstantU64(state, 0x3ff0000000000000ull));
+			ctx.Define(inst, from_f64(Binary(state, OpFDiv, f64, one, arg(0))));
+			return true;
+		}
+		case IR::ValueOpcode::FPAdd64:
+			ctx.Define(inst, from_f64(Binary(state, OpFAdd, f64, arg(0), arg(1))));
+			return true;
+		case IR::ValueOpcode::FPMul64:
+			ctx.Define(inst, from_f64(Binary(state, OpFMul, f64, arg(0), arg(1))));
+			return true;
+		case IR::ValueOpcode::FPMin64: ctx.Define(inst, ext(GlslNMin, {arg(0), arg(1)})); return true;
+		case IR::ValueOpcode::FPMax64: ctx.Define(inst, ext(GlslNMax, {arg(0), arg(1)})); return true;
+		case IR::ValueOpcode::FPFma64:
+			ctx.Define(inst, ext(GlslFma, {arg(0), arg(1), arg(2)}));
+			return true;
+		case IR::ValueOpcode::FPOrdEqual64:
+			ctx.Define(inst, Binary(state, OpFOrdEqual, TypeBool(state), arg(0), arg(1)));
+			return true;
+		case IR::ValueOpcode::FPOrdLessThanEqual64:
+			ctx.Define(inst, Binary(state, OpFOrdLessThanEqual, TypeBool(state), arg(0), arg(1)));
+			return true;
+		case IR::ValueOpcode::FPOrdGreaterThanEqual64:
+			ctx.Define(inst,
+			           Binary(state, OpFOrdGreaterThanEqual, TypeBool(state), arg(0), arg(1)));
+			return true;
+		default: return false;
+	}
+}
+
 bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto op    = inst.GetOpcode();
@@ -656,7 +737,7 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::FPCeil32: return ext_unary(GlslCeil);
 		case IR::ValueOpcode::FPTrunc32: return ext_unary(GlslTrunc);
 		case IR::ValueOpcode::FPFract32: return ext_unary(GlslFract);
-		default: return false;
+		default: return EmitValueAluF64(ctx, inst);
 	}
 }
 

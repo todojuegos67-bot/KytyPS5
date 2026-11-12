@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <array>
+#include <bit>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -243,6 +244,80 @@ bool Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kin
 	}
 	WriteOperand(DestinationOperand(inst), result);
 	return true;
+}
+
+IR::U64 Translator::ReadF64(const Decoder::Operand& operand) {
+	std::array<IR::U32, 2> halves {};
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		// Inline float constants are doubles here; 1/(2*pi) has its own double encoding.
+		const uint64_t bits =
+		    operand.value == 0x3e22f983u
+		        ? 0x3fc45f306dc9c882ull
+		        : std::bit_cast<uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
+		halves = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+		          IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+	} else if (operand.kind == Decoder::OperandKind::LiteralConstant) {
+		// A 32-bit literal of a 64-bit float operand is its high dword.
+		halves = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
+	} else {
+		halves = ReadU32Pair(PlainOperand(operand));
+	}
+	if (operand.absolute) {
+		halves[1] = ir.BitwiseAnd(halves[1], IR::U32(IR::Value(0x7fffffffu)));
+	}
+	if (operand.negate) {
+		halves[1] = ir.BitwiseXor(halves[1], IR::U32(IR::Value(0x80000000u)));
+	}
+	return ir.ConstructU64(halves[0], halves[1]);
+}
+
+// FP64 instructions (from the GT7 port), computed in double by the SPIR-V emitter.
+bool Translator::EmitFloat64(const Decoder::Instruction& inst) {
+	using O       = Decoder::Opcode;
+	using VO      = IR::ValueOpcode;
+	const auto write = [&](IR::Value value) {
+		WriteOperand(DestinationOperand(inst), value);
+		return true;
+	};
+	const auto unary = [&](VO opcode) { return write(ir.Emit(opcode, {ReadF64(inst.src0)})); };
+	const auto binary = [&](VO opcode) {
+		const auto lhs = ReadF64(inst.src0);
+		const auto rhs = ReadF64(inst.src1);
+		return write(ir.Emit(opcode, {lhs, rhs}));
+	};
+	const auto compare = [&](VO opcode, bool cmpx) {
+		const auto lhs = ReadF64(inst.src0);
+		const auto rhs = ReadF64(inst.src1);
+		EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs})), false, cmpx);
+		return true;
+	};
+	switch (inst.opcode) {
+		case O::V_CVT_F64_F32:
+			return write(ir.Emit(VO::ConvertF64F32, {ReadOperand(inst.src0, IR::Type::F32)}));
+		case O::V_CVT_F64_I32: return write(ir.Emit(VO::ConvertF64S32, {ReadU32(inst.src0)}));
+		case O::V_CVT_F64_U32: return write(ir.Emit(VO::ConvertF64U32, {ReadU32(inst.src0)}));
+		case O::V_CVT_F32_F64: return write(ir.Emit(VO::ConvertF32F64, {ReadF64(inst.src0)}));
+		case O::V_TRUNC_F64: return unary(VO::FPTrunc64);
+		case O::V_CEIL_F64: return unary(VO::FPCeil64);
+		case O::V_FLOOR_F64: return unary(VO::FPFloor64);
+		case O::V_FRACT_F64: return unary(VO::FPFract64);
+		case O::V_RCP_F64: return unary(VO::FPRecip64);
+		case O::V_ADD_F64: return binary(VO::FPAdd64);
+		case O::V_MUL_F64: return binary(VO::FPMul64);
+		case O::V_MIN_F64: return binary(VO::FPMin64);
+		case O::V_MAX_F64: return binary(VO::FPMax64);
+		case O::V_FMA_F64: {
+			const auto a = ReadF64(inst.src0);
+			const auto b = ReadF64(inst.src1);
+			const auto c = ReadF64(inst.src2);
+			return write(ir.Emit(VO::FPFma64, {a, b, c}));
+		}
+		case O::V_CMP_EQ_F64: return compare(VO::FPOrdEqual64, false);
+		case O::V_CMP_LE_F64: return compare(VO::FPOrdLessThanEqual64, false);
+		case O::V_CMPX_LE_F64: return compare(VO::FPOrdLessThanEqual64, true);
+		case O::V_CMPX_GE_F64: return compare(VO::FPOrdGreaterThanEqual64, true);
+		default: return false;
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

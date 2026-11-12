@@ -5,6 +5,24 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 bool Translator::EmitVector(const Decoder::Instruction& inst) {
 	using O = Decoder::Opcode;
 	switch (inst.opcode) {
+		case O::V_CVT_F64_I32:
+		case O::V_CVT_F32_F64:
+		case O::V_CVT_F64_F32:
+		case O::V_CVT_F64_U32:
+		case O::V_TRUNC_F64:
+		case O::V_CEIL_F64:
+		case O::V_FLOOR_F64:
+		case O::V_FRACT_F64:
+		case O::V_RCP_F64:
+		case O::V_ADD_F64:
+		case O::V_MUL_F64:
+		case O::V_MIN_F64:
+		case O::V_MAX_F64:
+		case O::V_FMA_F64:
+		case O::V_CMP_EQ_F64:
+		case O::V_CMP_LE_F64:
+		case O::V_CMPX_LE_F64:
+		case O::V_CMPX_GE_F64: return EmitFloat64(inst);
 		case O::V_NOP: return true;
 		case O::V_ADD_I32: ADD_U32(inst, true, false); return true;
 		case O::V_ADDC_U32: ADD_U32(inst, true, true); return true;
