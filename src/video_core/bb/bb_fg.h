@@ -85,8 +85,6 @@ struct Inputs {
     bool camera_valid = false;
     float view_to_clip[16]{};
     float clip_to_prev_clip[16]{};
-    bool proj_valid = false;
-    float projection[16]{}; // the game's projection (row major, column vectors)
     uint64_t color_frame = ~0ull, depth_frame = ~0ull, mv_frame = ~0ull, obj_frame = ~0ull,
              hudless_frame = ~0ull;
 };

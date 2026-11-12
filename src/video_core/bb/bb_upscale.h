@@ -74,10 +74,6 @@ struct Camera {
     float reproject[12]{};
     float proj[4]{};
     float prev_proj[4]{};
-    // bb-dlssg-proj: the game's own projection (scene block floats 52-67, row major for column
-    // vectors), for DLSS-G's cameraViewToClip.
-    bool proj_valid = false;
-    float projection[16]{};
 };
 // At the flip: the frame's camera (and the motion to the previous one); starts the next frame.
 Camera EndFrame(u32 flip_w, u32 flip_h);

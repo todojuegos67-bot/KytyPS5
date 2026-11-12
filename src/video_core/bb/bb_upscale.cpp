@@ -292,7 +292,6 @@ struct BlockCam {
     float inv_view[12]{}; // view to world, 3x4 rows (floats 180-191)
     float proj[4]{};      // x scale, y scale, z scale, z offset (floats 52, 57, 62, 63)
     Mat vp;               // full projection (52-67) * view, for frame generation / DLSS
-    float projection[16]{}; // the projection (52-67)
     bool valid = false;
 };
 std::mutex g_cam_mutex;
@@ -685,7 +684,6 @@ void OnConstants(const u32* data, size_t count) {
     for (int i = 0; i < 12; ++i) view.m[i] = d[8 + i];
     view.m[15] = 1.0;
     for (int i = 0; i < 16; ++i) proj.m[i] = d[52 + i];
-    std::memcpy(c.projection, d + 52, sizeof(c.projection));
     c.vp = Multiply(proj, view);
     g_frame_has_camera = true;
 }
@@ -751,8 +749,6 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
             cam.z_far = zf > 1e7 ? 0.0f : static_cast<float>(zf);
             cam.valid = true;
             cam.reset = !prev.valid;
-            std::memcpy(cam.projection, cur.projection, sizeof(cam.projection));
-            cam.proj_valid = true;
         }
         // The motion-vector camera (bb_mv.comp): previous view * inverse current view.
         if (cur.valid && prev.valid && prev.proj[0] != 0.0f) {
