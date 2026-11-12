@@ -845,13 +845,65 @@ bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
     };
     cmdbuf.blitImage(generated.image, vk::ImageLayout::eTransferSrcOptimal, dst,
                      vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eLinear);
-    const std::array post{
-        vk::ImageMemoryBarrier2{
+    // bb-dlssg-ui2: the last game frame's ImGui (port menus, F8 metrics) drawn over the generated
+    // frame too, without the window that shows the game image: no flicker, and DLSS-G stays on.
+    bool ui_drawn = false;
+    if (ImDrawData* dd = ImGui::GetDrawData(); bb_imgui_ui_shown && dd != nullptr && dd->Valid &&
+                                              dd->CmdListsCount > 0) {
+        const vk::ImageMemoryBarrier2 to_att{
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                             vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = dst,
+            .subresourceRange = range,
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_att});
+        std::vector<std::pair<ImDrawCmd*, unsigned int>> hidden;
+        for (int l = 0; l < dd->CmdListsCount; ++l) {
+            ImDrawList* list = dd->CmdLists[l];
+            bool game = false;
+            for (const ImDrawCmd& c : list->CmdBuffer) {
+                if (c.UserCallback == nullptr && c.GetTexID() == frame->imgui_texture) game = true;
+            }
+            if (!game) continue;
+            for (ImDrawCmd& c : list->CmdBuffer) {
+                if (c.UserCallback == nullptr && c.ElemCount != 0) {
+                    hidden.emplace_back(&c, c.ElemCount);
+                    c.ElemCount = 0;
+                }
+            }
+        }
+        vk::RenderingAttachmentInfo att{
+            .imageView = swapchain.ImageView(),
+            .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .loadOp = vk::AttachmentLoadOp::eLoad,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+        };
+        vk::RenderingInfo ri{};
+        ri.renderArea = vk::Rect2D{.offset = {0, 0}, .extent = extent};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &att;
+        cmdbuf.beginRendering(ri);
+        ImGui::Vulkan::RenderDrawData(*dd, cmdbuf);
+        cmdbuf.endRendering();
+        for (auto& [c, n] : hidden) c->ElemCount = n;
+        ui_drawn = true;
+    }
+    const std::array post{
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = ui_drawn ? vk::PipelineStageFlagBits2::eColorAttachmentOutput
+                                     : vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = ui_drawn ? vk::AccessFlagBits2::eColorAttachmentWrite
+                                      : vk::AccessFlagBits2::eTransferWrite,
             .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .dstAccessMask = vk::AccessFlagBits2::eNone,
-            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .oldLayout = ui_drawn ? vk::ImageLayout::eColorAttachmentOptimal
+                                  : vk::ImageLayout::eTransferDstOptimal,
             .newLayout = vk::ImageLayout::ePresentSrcKHR,
             .image = dst,
             .subresourceRange = range,
@@ -1547,7 +1599,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         std::scoped_lock lock{free_mutex};
         return free_queue.empty();
     };
-    if (bb_generated && (bb_behind() || bb_imgui_ui_shown)) {
+    if (bb_generated && bb_behind()) {
         bb_generated = 0;
     }
     const auto bb_wait_until = [](std::chrono::steady_clock::time_point at) {
