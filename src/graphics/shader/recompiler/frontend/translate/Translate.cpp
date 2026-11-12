@@ -946,6 +946,31 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	include_vector(inst.src1);
 	include_vector(inst.src2);
 	include_vector(inst.src3);
+	switch (inst.opcode) {
+		// FP64: 64-bit destinations and sources are register pairs.
+		case Decoder::Opcode::V_CVT_F64_I32:
+		case Decoder::Opcode::V_CVT_F64_F32:
+		case Decoder::Opcode::V_CVT_F64_U32: include_vector(inst.dst, 2u); break;
+		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_ADD_F64:
+		case Decoder::Opcode::V_MIN_F64:
+		case Decoder::Opcode::V_MAX_F64:
+		case Decoder::Opcode::V_MUL_F64: include_vector(inst.src1, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_RCP_F64:
+		case Decoder::Opcode::V_TRUNC_F64:
+		case Decoder::Opcode::V_CEIL_F64:
+		case Decoder::Opcode::V_FLOOR_F64:
+		case Decoder::Opcode::V_FRACT_F64: include_vector(inst.dst, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
+		case Decoder::Opcode::V_CMP_EQ_F64:
+		case Decoder::Opcode::V_CMP_LE_F64:
+		case Decoder::Opcode::V_CMPX_LE_F64:
+		case Decoder::Opcode::V_CMPX_GE_F64:
+			include_vector(inst.src0, 2u);
+			include_vector(inst.src1, 2u);
+			break;
+		default: break;
+	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_WRITE_B64:

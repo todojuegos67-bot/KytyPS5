@@ -41,6 +41,9 @@ private:
 	IR::U32                ReadU32(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> ReadU32Pair(const Decoder::Operand& operand);
 	IR::U64                ReadU64(const Decoder::Operand& operand);
+	// A double source as its bits (inline constants as doubles, a literal as the high dword,
+	// ABS/NEG on bit 63).
+	IR::U64                ReadF64(const Decoder::Operand& operand);
 	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed = false);
 	IR::F32 ReadF16AsF32(const Decoder::Operand& operand);
 	IR::F32 ReadMixF32(const Decoder::Operand& operand);
@@ -251,6 +254,7 @@ private:
 
 	bool EmitScalar(const Decoder::Instruction& inst);
 	bool EmitVector(const Decoder::Instruction& inst);
+	bool EmitFloat64(const Decoder::Instruction& inst);
 	bool EmitInterpolation(const Decoder::Instruction& inst);
 	bool EmitMemory(const Decoder::Instruction& inst);
 
