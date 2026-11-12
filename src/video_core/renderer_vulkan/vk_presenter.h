@@ -170,6 +170,7 @@ private:
     bool BbPresentGenerated(Frame* frame, u32 index, bool first);
     std::atomic<double> bb_game_frame_ms{16.6};
     std::chrono::steady_clock::time_point bb_last_game_present{};
+    bool bb_imgui_ui_shown = false; // bb-dlssg-ui
     std::atomic<u32> bb_frame_gen_limit{3};
     std::chrono::steady_clock::time_point bb_limit_window{};
     u32 bb_limit_frames = 0, bb_limit_up_seconds = 0;

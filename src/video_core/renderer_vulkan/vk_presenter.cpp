@@ -1547,7 +1547,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         std::scoped_lock lock{free_mutex};
         return free_queue.empty();
     };
-    if (bb_generated && bb_behind()) {
+    if (bb_generated && (bb_behind() || bb_imgui_ui_shown)) {
         bb_generated = 0;
     }
     const auto bb_wait_until = [](std::chrono::steady_clock::time_point at) {
@@ -1723,6 +1723,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             ImGui::PopStyleColor();
         }
         ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+        // bb-dlssg-ui: anything ImGui drew besides the game image (the port's menus, the F8
+        // overlay): DLSS-G's generated frames are blitted without it, so it flickered at 30 Hz.
+        // While it is up the game's frames go out alone (FSR 3 draws it into its own).
+        if (const ImDrawData* dd = ImGui::GetDrawData(); dd != nullptr) {
+            bb_imgui_ui_shown = dd->TotalVtxCount > 48;
+        }
 
         if (capture_with_overlays_count > 0) {
             auto& readback = pending_screenshot.emplace(
