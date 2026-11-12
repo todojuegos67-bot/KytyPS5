@@ -3063,14 +3063,30 @@ struct PipelineCache::ProgramCache {
 				                      lookup_key.function_code);
 			}
 		}
-		if (unsupported.contains(lookup_key)) {
+		// gt7-prog-1112, KYTY_PROG_MEMO: the entry this stage's shader found last, when the key is
+		// the same (ProgramMemo), without hashing the key for `unsupported` and `programs`.
+		ProgramMemo* memo_slot = nullptr;
+		bool         memo_hit  = false;
+		if (ProgMemoEnabled()) {
+			memo_slot = &MemoSlotFor(stage, params.code.data());
+			memo_hit  = memo_slot->Matches(lookup_key, params.code.data(), unsupported.size(),
+			                               programs.size(), programs.bucket_count());
+			GpuPhases::Count(memo_hit ? GpuPhases::Phase::ProgramMemoHit
+			                          : GpuPhases::Phase::ProgramMemoMiss,
+			                 1);
+		}
+		if (!memo_hit && unsupported.contains(lookup_key)) {
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
 			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
 			                                StageLabel(stage), params.hash);
 			return ShaderProgram {};
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
-		auto                                         entry = programs.find(lookup_key);
+		auto entry = memo_hit ? memo_slot->entry : programs.find(lookup_key);
+		if (memo_slot != nullptr && !memo_hit && entry != programs.end()) {
+			memo_slot->Store(lookup_key, params.code.data(), unsupported.size(), programs.size(),
+			                 programs.bucket_count(), entry);
+		}
 		key_phase.End();
 		// Scoped to this call only: see GuestPageReadCache.
 		GuestPageReadCache                           clean_read_cache;
@@ -3209,6 +3225,7 @@ struct PipelineCache::ProgramCache {
 					return ShaderProgram {};
 				}
 			}
+			GpuPhases::Scope match_phase(GpuPhases::Phase::ProgramMatch);
 			auto&      source  = entry->second;
 			// Round 79: by the hash the scanner made, when there is one (comparing the
 			// specializations themselves read the scanner's freshly written vectors: ~2 % of the
@@ -3245,6 +3262,7 @@ struct PipelineCache::ProgramCache {
 					EXIT("DrawPrep verify: specialization hash collision\n");
 				}
 			}
+			match_phase.End();
 			if (permutation != nullptr) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &source.resources};
@@ -4283,6 +4301,71 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<std::string>                               partial_logged;
 	std::unordered_set<std::string>                               failure_logged;
 	ProgramKey                                                     lookup_key;
+	// gt7-prog-1112, KYTY_PROG_MEMO (off by default): per stage and shader code address, the last
+	// key Get found in `programs` and the iterator it found. A hit needs the whole key equal
+	// (stage, the shader map's hash, user data count, code size, the static state and the
+	// expanded code, compared word for word), so it finds what programs.find would: the memo only
+	// skips hashing the key twice (unsupported, programs) and the bucket search. The iterator is
+	// kept only while `programs` has the same size and bucket count (entries are never erased, and
+	// only an insertion, which changes the size, can rehash), and `unsupported` the same size (it
+	// only grows: a key added to it after the store misses, and is checked as before).
+	using ProgramMap = std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>;
+	struct ProgramMemo {
+		bool                  valid           = false;
+		ShaderType            stage           = ShaderType::Unknown;
+		const uint32_t*       code            = nullptr;
+		uint64_t              hash            = 0;
+		uint32_t              user_data_count = 0;
+		uint32_t              code_size       = 0;
+		size_t                unsupported_size = 0;
+		size_t                programs_size    = 0;
+		size_t                bucket_count     = 0;
+		std::vector<uint32_t> static_state;
+		std::vector<uint32_t> function_code;
+		ProgramMap::iterator  entry;
+
+		[[nodiscard]] bool Matches(const ProgramKey& key, const uint32_t* code_address,
+		                           size_t unsupported_now, size_t programs_now,
+		                           size_t buckets_now) const {
+			return valid && code == code_address && stage == key.stage && hash == key.hash &&
+			       user_data_count == key.user_data_count && code_size == key.code_size &&
+			       unsupported_size == unsupported_now && programs_size == programs_now &&
+			       bucket_count == buckets_now && static_state == key.static_state &&
+			       function_code == key.function_code;
+		}
+		void Store(const ProgramKey& key, const uint32_t* code_address, size_t unsupported_now,
+		           size_t programs_now, size_t buckets_now, ProgramMap::iterator found) {
+			valid            = true;
+			stage            = key.stage;
+			code             = code_address;
+			hash             = key.hash;
+			user_data_count  = key.user_data_count;
+			code_size        = key.code_size;
+			unsupported_size = unsupported_now;
+			programs_size    = programs_now;
+			bucket_count     = buckets_now;
+			static_state.assign(key.static_state.begin(), key.static_state.end());
+			function_code.assign(key.function_code.begin(), key.function_code.end());
+			entry = found;
+		}
+	};
+	static constexpr size_t           ProgramMemoSlots = 512;
+	std::array<ProgramMemo, ProgramMemoSlots> program_memo {};
+	[[nodiscard]] static bool ProgMemoEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_PROG_MEMO");
+			return value != nullptr && value[0] != '\0' && value[0] != '0';
+		}();
+		return enabled;
+	}
+	// Direct-mapped by code address and stage: a slot another shader took is a miss, then
+	// replaced.
+	ProgramMemo& MemoSlotFor(ShaderType stage, const uint32_t* code_address) {
+		auto index = reinterpret_cast<uintptr_t>(code_address) >> 8u;
+		index ^= index >> 9u;
+		index ^= static_cast<uintptr_t>(stage) * 0x9e37u;
+		return program_memo[index & (ProgramMemoSlots - 1u)];
+	}
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;

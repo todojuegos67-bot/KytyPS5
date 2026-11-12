@@ -451,6 +451,11 @@ void ReportIfDue(uint64_t frames) {
 	    " | program gets {} x {:.2f} us: key {:.2f}, {}, {}", count(Phase::ProgramGet),
 	    each(Phase::ProgramGet, Phase::ProgramGet), each(Phase::ProgramKey, Phase::ProgramGet),
 	    counted("scanned", Phase::ProgramScanned), counted("walks", Phase::ProgramWalk));
+	if (count(Phase::ProgramMemoHit) + count(Phase::ProgramMemoMiss) != 0) {
+		line += fmt::format(" (memo {} hits, {} misses)", count(Phase::ProgramMemoHit),
+		                    count(Phase::ProgramMemoMiss));
+	}
+	line += fmt::format(" (match {:.2f})", each(Phase::ProgramMatch, Phase::ProgramGet));
 	line += fmt::format(" | {}, {}, {}, {}, {}", counted("draw bda", Phase::DrawBda),
 	                    counted("dispatch bda", Phase::DispatchBda),
 	                    counted("buffer syncs", Phase::BufferSync),

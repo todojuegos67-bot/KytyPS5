@@ -98,6 +98,10 @@ enum class Phase : uint32_t {
 	CleanStore, // (a count only) a GPU-thread store to watched CPU-clean pages done on both copies
 	// Round 134: shader disk cache files read on worker threads.
 	DiskReadSkip, // (a count only) a draw skipped while its shader's records were read from disk
+	// gt7-prog-1112 (KYTY_PROG_MEMO): ProgramCache::Get's per-stage memo of its last lookup.
+	ProgramMemoHit,  // (a count only) a get whose entry the memo gave, without hashing the key
+	ProgramMemoMiss, // (a count only) a get the memo could not serve (the map was searched)
+	ProgramMatch,    // a get's search of its entry's permutations (after the key and the refresh)
 	Count
 };
 
