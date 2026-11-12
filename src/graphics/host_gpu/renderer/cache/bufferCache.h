@@ -316,6 +316,17 @@ public:
 	// which only a BDA walk uploads: RenderContext::PrepareBda then walks again within a
 	// submission. GPU thread.
 	[[nodiscard]] bool TakeNewRegions() noexcept { return std::exchange(m_new_regions, false); }
+	// KYTY_TABLE's bindings table (tableBindings.h): moves whenever a cached buffer is registered
+	// or unregistered (ChangeRegister), so a BufferId and handle kept since it stays name the same
+	// buffer over the same range. GPU thread.
+	[[nodiscard]] uint64_t BufferSetGeneration() const noexcept { return m_buffer_set_generation; }
+	// KYTY_TABLE: whether a read-only, non-texel binding that ObtainBuffer gave earlier (buffer
+	// `id`, its `handle`, guest range [vaddr, vaddr + size)) can be used again as it was: the
+	// buffer is alive with that handle and covers the range, and no page of it is CPU-dirty, so
+	// SynchronizeBuffer would copy nothing and the stream path would not be taken. It is then
+	// touched and its last use is this tick, as ObtainBuffer does. GPU thread.
+	[[nodiscard]] bool ReuseReadBinding(BufferId id, vk::Buffer handle, uint64_t vaddr,
+	                                    uint64_t size);
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	// The BDA walk (RenderContext::PrepareBda): the cached buffers over the CPU-dirty pages of the
@@ -424,6 +435,7 @@ private:
 	// The creation of every live buffer, by its address.
 	std::map<uint64_t, BufferEvent> m_buffer_origins;
 	bool                            m_new_regions = false; // TakeNewRegions
+	uint64_t                        m_buffer_set_generation = 1; // BufferSetGeneration
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void                   Unregister(BufferId id);

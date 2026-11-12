@@ -111,6 +111,7 @@ static bool BufferRegions() {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
+	m_buffer_set_generation++;
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -2629,6 +2630,27 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		MarkGpuWritten(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+bool BufferCache::ReuseReadBinding(BufferId id, vk::Buffer handle, uint64_t vaddr,
+                                   uint64_t size) {
+	if (IsBufferInvalid(id)) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[id];
+	if (buffer.Handle() != handle || !buffer.IsInBounds(vaddr, size)) {
+		return false;
+	}
+	// As SynchronizeBuffer's clean answer: nothing to upload. The exact query otherwise.
+	const bool clean = g_tracker_skip_clean && g_tracker_bitmap
+	                       ? m_memory_tracker.IsRangeCpuCleanHint(vaddr, size)
+	                       : !m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	if (!clean) {
+		return false;
+	}
+	TouchBuffer(buffer);
+	buffer.last_use_tick = m_scheduler.CurrentTick();
+	return true;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, uint64_t size,
