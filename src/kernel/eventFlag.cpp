@@ -1,4 +1,5 @@
 #include "kernel/eventFlag.h"
+#include "kernel/waitDiag.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -291,6 +292,8 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+	const WaitDiag::Scope wait_diag("sceKernelWaitEventFlag", reinterpret_cast<uint64_t>(ef), {},
+	                                timeout == nullptr ? -1 : static_cast<int64_t>(*timeout));
 
 	if (bit_pattern == 0) {
 		return KERNEL_ERROR_EINVAL;

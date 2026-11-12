@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "kernel/waitDiag.h"
 #include "time-census.h"
 
 #include "common/assert.h"
@@ -3266,6 +3267,8 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
+	const WaitDiag::Scope wait_diag("pthread_cond_timedwait", reinterpret_cast<uint64_t>(cond), {},
+	                                static_cast<int64_t>(usec));
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3437,6 +3440,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
+	const WaitDiag::Scope wait_diag("pthread_cond_wait", reinterpret_cast<uint64_t>(cond), {}, -1);
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
