@@ -1205,11 +1205,10 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     // 1.40: KYTY_FSR3_HUDLESS=0 gives FSR 3 no HUD-less image (A/B: FSR then interpolates the
     // whole back buffer, HUD included; with it, wherever the back buffer and the HUD-less image
     // differ FSR takes the real frame's pixels as UI, which on characters would look 30 fps).
-    // bb-fsr3-hudless-off: default now off. With the HUD cut the HUD-less image comes from a
-    // separate post-process pass; wherever it differs from the back buffer (everywhere, if the
-    // passes differ even slightly) FSR 3 takes the real frame's pixels as UI, so every generated
-    // frame repeated the real one: 60 presents but 30 distinct images. KYTY_FSR3_HUDLESS=1: on.
-    static const bool give_hudless = EnvOn("KYTY_FSR3_HUDLESS", false);
+    // bb-fsr3-hudless: on again; the presenter now makes the HUD-less image equal to the back
+    // buffer outside the HUD (bb_hudless_fix.comp, "[fsr3-hudless]" line). Before, it differed
+    // everywhere, FSR 3 took the whole picture as UI and generated frames repeated the real one.
+    static const bool give_hudless = EnvOn("KYTY_FSR3_HUDLESS", true);
     const bool hudless = give_hudless && generate && inputs->has_hudless && inputs->hudless.image &&
                          inputs->hudless.extent == backbuffer && inputs->hudless.format == format;
     config.HUDLessColor = FfxApiResource{};

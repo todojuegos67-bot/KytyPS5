@@ -176,6 +176,7 @@ UiCut::~UiCut() {
     Destroy(ui_image);
     Destroy(ui_depth_image);
     for (auto& h : hudless_images) Destroy(h);
+    for (auto& h : hud_images) Destroy(h);
     for (auto& [_, d] : displays) Destroy(d.image);
     Destroy(clear_layer);
     Destroy(layer_tmp);
@@ -867,6 +868,17 @@ void UiCut::CaptureHudlessUi() {
             return;
         }
     }
+    // bb-fsr3-hudless: its partner, the UI target once the HUD is drawn (RedirectSampled).
+    hud_ok[hudless_next].store(false, std::memory_order_relaxed);
+    if (auto& hs = hud_images[hudless_next];
+        hs.width != ui_width || hs.height != ui_height || hs.format != ui_format) {
+        scheduler.Finish();
+        if (!Create(hs, ui_width, ui_height, ui_format,
+                    vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+                    true)) {
+            Destroy(hs); // none: the HUD-less image stays as post-processed
+        }
+    }
     scheduler.EndRendering();
     const auto cmd = scheduler.CommandBuffer();
     vk::ImageMemoryBarrier2 b[2]{
@@ -988,6 +1000,59 @@ bool UiCut::RedirectSampled(VideoCore::ImageId image, vk::Format format, vk::Ima
     if (!ui_read_barrier) {
         ui_read_barrier = true;
         scheduler.EndRendering();
+        // bb-fsr3-hudless: the UI target as the display pass first reads it (HUD drawn), copied
+        // beside this frame's HUD-less copy: the presenter matches the HUD-less image to the
+        // finished frame wherever the two copies are equal (bb_hudless_fix.comp).
+        if (display_hudless >= 0 && display_hudless < int(HudlessSlots)) {
+            auto& hs = hud_images[static_cast<u32>(display_hudless)];
+            if (hs.image && ui_image.image && hs.width == ui_width && hs.height == ui_height &&
+                hs.format == ui_format) {
+                const auto cmd = scheduler.CommandBuffer();
+                vk::ImageMemoryBarrier2 hb[2]{
+                    {
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                        .oldLayout = vk::ImageLayout::eGeneral,
+                        .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                        .image = ui_image.image,
+                        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                    },
+                    {
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                        .oldLayout = vk::ImageLayout::eUndefined,
+                        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                        .image = hs.image,
+                        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                    }};
+                cmd.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = hb});
+                const vk::ImageCopy copy{
+                    .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                    .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                    .extent = {ui_width, ui_height, 1},
+                };
+                cmd.copyImage(ui_image.image, vk::ImageLayout::eTransferSrcOptimal, hs.image,
+                              vk::ImageLayout::eTransferDstOptimal, copy);
+                hb[0].srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+                hb[0].srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+                hb[0].dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+                hb[0].dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+                hb[0].oldLayout = vk::ImageLayout::eTransferSrcOptimal;
+                hb[0].newLayout = vk::ImageLayout::eGeneral;
+                hb[1].srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+                hb[1].srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+                hb[1].dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+                hb[1].dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+                hb[1].oldLayout = vk::ImageLayout::eTransferDstOptimal;
+                hb[1].newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+                cmd.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = hb});
+                hud_ok[static_cast<u32>(display_hudless)].store(true, std::memory_order_release);
+            }
+        }
         const vk::ImageMemoryBarrier2 b{
             .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
@@ -1036,6 +1101,12 @@ bool UiCut::DisplayOverride(VAddr address, vk::Format format, Display& out) {
         out.hudless = h.image;
         out.hudless_view = Mirror(h, WithSrgb(h.format, IsSrgb(format)),
                                   vk::ImageAspectFlagBits::eColor, true);
+        auto& hh = hud_images[d.hudless];
+        if (hud_ok[d.hudless].load(std::memory_order_acquire) && hh.image &&
+            hh.width == h.width && hh.height == h.height && hh.format == h.format) {
+            out.hud_view = Mirror(hh, WithSrgb(hh.format, IsSrgb(format)),
+                                  vk::ImageAspectFlagBits::eColor, true);
+        }
     }
     // Shown once: the next display pass decides again.
     d.valid = false;

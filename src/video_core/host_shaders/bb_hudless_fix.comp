@@ -1,0 +1,50 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-fsr3-hudless: the HUD-less image for FSR 3 FG made pixel-identical to the finished frame
+// wherever the HUD did not draw. The HUD-less copy is taken from the UI target before the first
+// HUD draw; the game's display pass then turns the UI target (HUD included) into the shown image,
+// so the post-processed copy differed from the finished frame everywhere and FSR 3 took the whole
+// picture as UI (generated frames = the real one). Here: where the UI target with the HUD (copied
+// as the display pass starts) equals the copy without it, the finished frame's own pixel is used.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D final_tex;   // the finished frame (backbuffer format)
+layout(binding = 1) uniform sampler2D hud_tex;     // UI target, HUD drawn (raw copy)
+layout(binding = 2) uniform sampler2D hudless_tex; // UI target before the HUD (raw copy)
+layout(binding = 3, rgba8) uniform image2D target; // the HUD-less image (BGRA viewed as RGBA)
+layout(std430, binding = 4) buffer Counts {
+    uint counts[]; // per slot: [HUD pixels, non-HUD pixels that differed (now fixed)]
+};
+layout(push_constant) uniform Push {
+    uvec4 size; // width, height, 1: the target is BGRA memory viewed as RGBA, counter slot
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
+        return;
+    }
+    vec2 uv = (vec2(c) + 0.5) / vec2(p.size.xy);
+    vec4 a = textureLod(hud_tex, uv, 0.0);
+    vec4 b = textureLod(hudless_tex, uv, 0.0);
+    vec3 d = abs(a.rgb - b.rgb);
+    uint base = p.size.w * 2u;
+    if (max(d.r, max(d.g, d.b)) > 0.5 / 255.0) {
+        atomicAdd(counts[base], 1u); // the HUD drew here: keep the post-processed HUD-less pixel
+        return;
+    }
+    vec4 f = texelFetch(final_tex, c, 0);
+    vec4 t = imageLoad(target, c);
+    if (p.size.z != 0u) {
+        t = t.bgra;
+    }
+    vec3 e = abs(f.rgb - t.rgb);
+    if (max(e.r, max(e.g, e.b)) > 0.5 / 255.0) {
+        atomicAdd(counts[base + 1u], 1u);
+    }
+    vec4 r = vec4(f.rgb, t.a);
+    if (p.size.z != 0u) {
+        r = r.bgra;
+    }
+    imageStore(target, c, r);
+}

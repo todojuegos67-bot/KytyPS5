@@ -48,6 +48,8 @@ struct Frame {
     vk::Image hudless_image{};
     VmaAllocation hudless_allocation{};
     vk::ImageView hudless_view{};
+    // bb-fsr3-hudless: an R8G8B8A8Unorm storage view of it (8-bit UNORM frames with storage only).
+    vk::ImageView hudless_rgba_view{};
     u32 hudless_width = 0, hudless_height = 0;
     vk::Format hudless_format = vk::Format::eUndefined;
     // bb-clean-021-bbport: DLSS Frame Generation (Supermedo's Frame::generated): the frames shown

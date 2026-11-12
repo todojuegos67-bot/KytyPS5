@@ -526,6 +526,7 @@ Presenter::~Presenter() {
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
         if (frame.hudless_view) device.destroyImageView(frame.hudless_view);
+        if (frame.hudless_rgba_view) device.destroyImageView(frame.hudless_rgba_view);
         if (frame.hudless_image) {
             vmaDestroyImage(instance.GetAllocator(), frame.hudless_image,
                             frame.hudless_allocation);
@@ -543,9 +544,11 @@ static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::
     if (frame.hudless_image) {
         (void)device.waitIdle(); // a resize only
         device.destroyImageView(frame.hudless_view);
+        if (frame.hudless_rgba_view) device.destroyImageView(frame.hudless_rgba_view);
         vmaDestroyImage(instance.GetAllocator(), frame.hudless_image, frame.hudless_allocation);
         frame.hudless_image = vk::Image{};
         frame.hudless_view = vk::ImageView{};
+        frame.hudless_rgba_view = vk::ImageView{};
     }
     const VkImageCreateInfo ici = vk::ImageCreateInfo{
         .flags = vk::ImageCreateFlagBits::eMutableFormat,
@@ -561,9 +564,11 @@ static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::
     VmaAllocationCreateInfo aci{};
     aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     VkImage image{};
+    bool storage = true;
     if (vmaCreateImage(instance.GetAllocator(), &ici, &aci, &image, &frame.hudless_allocation,
                        nullptr) != VK_SUCCESS) {
         // Storage may be unsupported for this format: retry without it.
+        storage = false;
         VkImageCreateInfo ici2 = ici;
         ici2.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
         if (vmaCreateImage(instance.GetAllocator(), &ici2, &aci, &image,
@@ -584,6 +589,15 @@ static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::
         return false;
     }
     frame.hudless_view = view;
+    if (storage && (format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eR8G8B8A8Unorm)) {
+        auto [rr, rgba] = device.createImageView({
+            .image = frame.hudless_image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        });
+        if (rr == vk::Result::eSuccess) frame.hudless_rgba_view = rgba;
+    }
     frame.hudless_width = frame.width;
     frame.hudless_height = frame.height;
     frame.hudless_format = format;
@@ -1100,6 +1114,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     bool bb_upscaled = false;
     vk::Extent2D bb_sr_size{};
     vk::ImageView bb_hudless_scene{};
+    vk::ImageView bb_hud_raw{}; // bb-fsr3-hudless: the UI target with the HUD (raw copy)
     frame->fg = {};
     // bb-clean-021-bbport: Supermedo's HUD cut (bb_ui_cut.h). A frame upscaled at its first UI
     // draw has an output-size host copy of this display buffer (the game's display pass drew it,
@@ -1128,6 +1143,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         bb_sr_size = image_size;
         frame->fg = bb_display.fg;
         bb_hudless_scene = bb_display.hudless_view;
+        bb_hud_raw = bb_display.hud_view;
         bb_upscaled = true;
         ++bb_sec_cut;
     } else if (BB::Upscale::Capture()) {
@@ -1244,6 +1260,26 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         bb_sec_hudless_failed += failed;
     }
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+
+    // bb-fsr3-hudless: FSR 3 FG takes every pixel where the back buffer and the HUD-less image
+    // differ as UI (the real frame's pixel in generated frames). The HUD-less copy went through
+    // our post-process pass but not the game's display pass, so it differed everywhere and the
+    // generated frames repeated the real one. Outside the HUD it now is the finished frame itself.
+    // FSR 3 only (DLSS-G keeps its input as before).
+    if (frame->fg.has_hudless && BB::FG::Fsr3Active() && !frame->is_hdr) {
+        const vk::Format fmt = swapchain.GetSurfaceFormat().format;
+        const vk::MemoryBarrier2 written{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        };
+        cmdbuf.pipelineBarrier2(
+            vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &written});
+        bb_hud_fg->FixHudless(cmdbuf, frame->image_view, bb_hud_raw, bb_hudless_scene,
+                              frame->hudless_image, frame->hudless_rgba_view,
+                              {frame->width, frame->height}, fmt == vk::Format::eB8G8R8A8Unorm);
+    }
 
     // bb-clean: the HUD as a separate UI layer for frame generation (bb_hud_fg.h): built from the
     // finished frame, the HUD-less copy (when the HUD cut ran) and the previous real frame; drawn
@@ -1833,6 +1869,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 BB::FG::Dlss::Ready() ? (shown ? "on" : "idle") : "off", made, shown,
                 bb_frame_gen_limit.load(), game / sec, (presents + shown) / sec));
             bb_hud_fg->LogSecond(sec);
+            bb_hud_fg->LogHudlessSecond(sec);
             bb_sec_start = now;
         }
     }

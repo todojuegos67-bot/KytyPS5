@@ -17,6 +17,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -122,6 +123,9 @@ public:
         BB::FG::Inputs fg{};
         vk::Image hudless{};
         vk::ImageView hudless_view{};
+        // bb-fsr3-hudless: the UI target with the HUD drawn, copied as the display pass started
+        // (same size, format and view as `hudless_view`; SHADER_READ_ONLY), null when none.
+        vk::ImageView hud_view{};
     };
     bool DisplayOverride(VAddr address, vk::Format format, Display& display);
 
@@ -205,6 +209,9 @@ private:
     // Three copies without the HUD: the presenter reads one a frame later than it was cut.
     static constexpr u32 HudlessSlots = 3;
     OwnImage hudless_images[HudlessSlots];
+    // bb-fsr3-hudless: per slot, the UI target with the HUD (copied at the display pass).
+    OwnImage hud_images[HudlessSlots];
+    std::array<std::atomic<bool>, HudlessSlots> hud_ok{};
     u32 hudless_next = 0;
     vk::ImageView ui_depth_view{};
     u32 ui_width = 0, ui_height = 0;

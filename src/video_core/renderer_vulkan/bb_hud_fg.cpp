@@ -9,6 +9,7 @@
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_hud_mask_comp.h"
 #include "video_core/host_shaders/bb_hud_over_comp.h"
+#include "video_core/host_shaders/bb_hudless_fix_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -29,6 +30,10 @@ HudFg::~HudFg() {
     if (mask_set) device.destroyDescriptorSetLayout(mask_set);
     if (over_set) device.destroyDescriptorSetLayout(over_set);
     if (sampler) device.destroySampler(sampler);
+    if (fix_pipe) device.destroyPipeline(fix_pipe);
+    if (fix_layout) device.destroyPipelineLayout(fix_layout);
+    if (fix_set) device.destroyDescriptorSetLayout(fix_set);
+    if (fix_counts) vmaDestroyBuffer(instance.GetAllocator(), fix_counts, fix_counts_alloc);
 }
 
 bool HudFg::Init() {
@@ -277,6 +282,172 @@ void HudFg::Overlay(vk::CommandBuffer cmd, vk::ImageView rgba_view, vk::Extent2D
     };
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &done});
     ++sec_overlaid;
+}
+
+bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::ImageView raw_hud,
+                       vk::ImageView raw_hudless, vk::Image target, vk::ImageView target_rgba,
+                       vk::Extent2D extent, bool bgra) {
+    if (!frame_view || !raw_hud || !raw_hudless || !target || !target_rgba || extent.width == 0 ||
+        extent.height == 0 || !Init()) {
+        ++sec_fix_skipped;
+        return false;
+    }
+    const auto device = instance.GetDevice();
+    if (!fix_tried) {
+        fix_tried = true;
+        constexpr auto C = vk::ShaderStageFlagBits::eCompute;
+        const std::array<vk::DescriptorSetLayoutBinding, 5> fb{{
+            {0, vk::DescriptorType::eCombinedImageSampler, 1, C},
+            {1, vk::DescriptorType::eCombinedImageSampler, 1, C},
+            {2, vk::DescriptorType::eCombinedImageSampler, 1, C},
+            {3, vk::DescriptorType::eStorageImage, 1, C},
+            {4, vk::DescriptorType::eStorageBuffer, 1, C},
+        }};
+        auto [lr, l] = device.createDescriptorSetLayout({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+            .bindingCount = static_cast<u32>(fb.size()),
+            .pBindings = fb.data(),
+        });
+        if (lr == vk::Result::eSuccess) {
+            fix_set = l;
+            const vk::PushConstantRange range{C, 0, 16};
+            auto [pr, pl] = device.createPipelineLayout({
+                .setLayoutCount = 1,
+                .pSetLayouts = &fix_set,
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &range,
+            });
+            if (pr == vk::Result::eSuccess) fix_layout = pl;
+        }
+        if (fix_layout) {
+            if (const auto module = Vulkan::CompileSPV(BB_HUDLESS_FIX_COMP, device)) {
+                auto [cr, p] = device.createComputePipeline(
+                    {}, vk::ComputePipelineCreateInfo{
+                            .stage{.stage = C, .module = module, .pName = "main"},
+                            .layout = fix_layout,
+                        });
+                device.destroyShaderModule(module);
+                if (cr == vk::Result::eSuccess) fix_pipe = p;
+            }
+        }
+        if (fix_pipe) {
+            const VkBufferCreateInfo ci = vk::BufferCreateInfo{
+                .size = FixSlots * 2 * sizeof(u32),
+                .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                         vk::BufferUsageFlagBits::eTransferDst,
+                .sharingMode = vk::SharingMode::eExclusive,
+            };
+            VmaAllocationCreateInfo aci{};
+            aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                        VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            VkBuffer raw{};
+            VmaAllocationInfo info{};
+            if (vmaCreateBuffer(instance.GetAllocator(), &ci, &aci, &raw, &fix_counts_alloc,
+                                &info) == VK_SUCCESS) {
+                fix_counts = raw;
+                fix_counts_map = static_cast<u32*>(info.pMappedData);
+                if (fix_counts_map == nullptr) {
+                    vmaDestroyBuffer(instance.GetAllocator(), fix_counts, fix_counts_alloc);
+                    fix_counts = vk::Buffer{};
+                }
+            }
+        }
+        fix_ok = fix_pipe && fix_counts;
+        BB::Upscale::Checkpoint(fix_ok ? "[fsr3-hudless] HUD-less image matched to the finished "
+                                         "frame outside the HUD (bb_hudless_fix.comp)"
+                                       : "[fsr3-hudless] fix pass unavailable: HUD-less image "
+                                         "as post-processed");
+    }
+    if (!fix_ok) {
+        ++sec_fix_skipped;
+        return false;
+    }
+    // Counts of the slot written FixSlots - 1 frames ago (long done: frames in flight are fewer).
+    const u32 slot = fix_slot;
+    fix_slot = (fix_slot + 1) % FixSlots;
+    if (fix_frames >= FixSlots) {
+        sec_hud_px += fix_counts_map[slot * 2];
+        sec_fixed_px += fix_counts_map[slot * 2 + 1];
+    }
+    ++fix_frames;
+    sec_px += static_cast<u64>(extent.width) * extent.height;
+    cmd.fillBuffer(fix_counts, slot * 2 * sizeof(u32), 2 * sizeof(u32), 0u);
+    const vk::MemoryBarrier2 mem{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+    };
+    const vk::ImageMemoryBarrier2 to_general{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+        .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = target,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                            .pMemoryBarriers = &mem,
+                                            .imageMemoryBarrierCount = 1,
+                                            .pImageMemoryBarriers = &to_general});
+    const vk::DescriptorImageInfo f_info{sampler, frame_view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo a_info{sampler, raw_hud,
+                                         vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo b_info{sampler, raw_hudless,
+                                         vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo t_info{{}, target_rgba, vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo c_info{fix_counts, 0, VK_WHOLE_SIZE};
+    const auto w = [](u32 b, vk::DescriptorType t, const vk::DescriptorImageInfo* i) {
+        return vk::WriteDescriptorSet{
+            .dstBinding = b, .descriptorCount = 1, .descriptorType = t, .pImageInfo = i};
+    };
+    const std::array writes{
+        w(0, vk::DescriptorType::eCombinedImageSampler, &f_info),
+        w(1, vk::DescriptorType::eCombinedImageSampler, &a_info),
+        w(2, vk::DescriptorType::eCombinedImageSampler, &b_info),
+        w(3, vk::DescriptorType::eStorageImage, &t_info),
+        vk::WriteDescriptorSet{.dstBinding = 4,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                               .pBufferInfo = &c_info},
+    };
+    const u32 push[4] = {extent.width, extent.height, bgra ? 1u : 0u, slot};
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, fix_pipe);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, fix_layout, 0, writes);
+    cmd.pushConstants(fix_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
+    cmd.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+    const vk::ImageMemoryBarrier2 to_read{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = vk::ImageLayout::eGeneral,
+        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .image = target,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+    ++sec_fix;
+    return true;
+}
+
+void HudFg::LogHudlessSecond(double seconds) {
+    const u32 fixed = sec_fix.exchange(0), skipped = sec_fix_skipped.exchange(0);
+    const u64 hud = sec_hud_px.exchange(0), mism = sec_fixed_px.exchange(0),
+              px = sec_px.exchange(0);
+    if (fixed == 0 && skipped == 0) return;
+    const double total = px > 0 ? static_cast<double>(px) : 1.0;
+    BB::Upscale::Checkpoint(fmt::format(
+        "[fsr3-hudless] 1 s: HUD-less matched in {} frames (skipped {}) | HUD pixels {:.2f}% | "
+        "outside the HUD, post-processed copy != finished frame on {:.2f}% (now replaced by the "
+        "frame's pixels) | {:.2f} s",
+        fixed, skipped, 100.0 * static_cast<double>(hud) / total,
+        100.0 * static_cast<double>(mism) / total, seconds));
 }
 
 void HudFg::NoteFrame(bool fg_frame, const char* fg_kind, bool fsr3_layer) {

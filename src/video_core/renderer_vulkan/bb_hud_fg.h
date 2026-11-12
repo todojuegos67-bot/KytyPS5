@@ -33,6 +33,16 @@ public:
     // The UI layer over one generated frame (GENERAL, `rgba_view` an R8G8B8A8 storage view).
     void Overlay(vk::CommandBuffer cmd, vk::ImageView rgba_view, vk::Extent2D extent, bool bgra);
 
+    // bb-fsr3-hudless: makes `target` (the post-processed HUD-less image, SHADER_READ_ONLY, an
+    // R8G8B8A8 storage view `target_rgba` of it) equal to the finished frame (`frame_view`,
+    // GENERAL, UNORM 8-bit) wherever the raw UI target with the HUD (`raw_hud`) equals the raw
+    // copy without it (`raw_hudless`), both SHADER_READ_ONLY. Leaves `target` SHADER_READ_ONLY.
+    bool FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::ImageView raw_hud,
+                    vk::ImageView raw_hudless, vk::Image target, vk::ImageView target_rgba,
+                    vk::Extent2D extent, bool bgra);
+    // Once a second (presenter): "[fsr3-hudless] ..." (HUD pixels, mismatching pixels fixed).
+    void LogHudlessSecond(double seconds);
+
     // Once a second (presenter): "[hud-fg] ..." with what was done.
     void NoteFrame(bool fg_frame, const char* fg_kind, bool fsr3_layer);
     void LogSecond(double seconds);
@@ -65,6 +75,19 @@ private:
     Own prev;
     bool prev_valid = false;
     BB::FG::Image ui_out{};
+
+    // bb-fsr3-hudless (FixHudless).
+    bool fix_tried = false, fix_ok = false;
+    vk::DescriptorSetLayout fix_set{};
+    vk::PipelineLayout fix_layout{};
+    vk::Pipeline fix_pipe{};
+    vk::Buffer fix_counts{};
+    VmaAllocation fix_counts_alloc{};
+    u32* fix_counts_map = nullptr;
+    static constexpr u32 FixSlots = 8; // read back FixSlots - 1 frames later
+    u32 fix_slot = 0, fix_frames = 0;
+    std::atomic<u32> sec_fix{0}, sec_fix_skipped{0};
+    std::atomic<u64> sec_hud_px{0}, sec_fixed_px{0}, sec_px{0};
 
     // Per-second counters (the GPU thread builds, the present thread logs).
     std::atomic<u32> sec_fg{0}, sec_layer{0}, sec_hudless{0}, sec_static{0}, sec_overlaid{0},
