@@ -451,7 +451,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Con la frame generation de NVIDIA: reflex (recomendado), normal o ultra (el nuestro, con Reflex apagado)\n"
 	  << "antilag_dlssg=" << s.antilag_dlssg << "\n\n"
 	  << "[Graficos]\n"
-	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 40 reales x2 AMD, ligero + 40 reales x3 AMD, FSR Calidad, texturas y sombras medio);\n"
+	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 30 reales x2 AMD, ligero + 35 reales x2 AMD, para monitores de mas de 60 Hz, FSR Calidad, texturas y sombras medio);\n"
 	  << "; equilibrado (45 reales x2 AMD, texturas, distancia y sombras alto); ultra (RTX 5060-5070 Ti, RX 9070);\n"
 	  << "; extremo (RTX 5080 / 5090: todo al maximo). Los FPS dependen de tu GPU y tu CPU.\n"
 	  << "; Ligero, equilibrado y low mandan sobre frame_generation (AMD x2 fija; el reescalado DLSS si se puede usar).\n"
@@ -700,7 +700,7 @@ void RecommendFor(PcInfo* pc) {
 	    {{"RTX 4070", "RTX 4060 TI 16", "RTX 3080", "RTX 506", "RX 6800", "RX 6900", "RX 7800", "RX 7700", "B580", "B570"},
 	     "Modo Souls equilibrado", "1440p: 45 FPS reales fijos (90 en pantalla con AMD x2)"},
 	    {{"RTX 4060", "RTX 3070", "RTX 3060", "RTX 207", "RTX 208", "RTX 2060", "RX 66", "RX 7600", "RX 6700", "ARC A7"},
-	     "Modo Souls ligero", "1080p: 40 FPS reales fijos (80 en pantalla con AMD x2); 8 GB de VRAM justos"},
+	     "Modo Souls ligero", "1080p: 30 FPS reales fijos (60 en pantalla con AMD x2); 8 GB de VRAM justos"},
 	    {{"GTX", "RX 6500", "RX 6400", "ARC A3", "ARC A5", "RADEON(TM) GRAPHICS", "IRIS", "UHD"}, "Modo Souls PC low profile",
 	     "900p: 30 FPS reales fijos (60 con AMD x2); puede no ir fluido"},
 	};
@@ -741,7 +741,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// Souls ligero / equilibrado / PC low profile: AMD x2 whatever frame_generation says, the game flipped at 30 / 45 / 30.
 	// (10-23) No DLSS on a graphics card that is not NVIDIA (the launcher does not offer it).
 	const bool  fixed_fg = FixedFg(s);
-	std::string fg_id    = fixed_fg ? (s.souls_mode == "ligero-plus" ? "amd-x3" : "amd-x2") : s.framegen;
+	std::string fg_id    = fixed_fg ? std::string("amd-x2") : s.framegen; // (11-12) ligero + is 35x2 now
 	if (!pc.nvidia && fg_id.rfind("dlss", 0) == 0) {
 		fg_id = "sin-fg";
 		plan.notes.emplace_back("DLSS frame generation needs NVIDIA: without frame generation");
@@ -802,7 +802,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-11) Souls ligero +: the pad read 4 ms later than ligero's (39 ms before its 30 fps flip slot, the game's ~7 ms
 	// of CPU plus margin): about 4 ms less input latency.
 	if (fixed_fg)
-		sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : s.souls_mode == "ligero-plus" ? "29" : s.souls_mode == "ligero" ? "33" : "43"); // (11-12) ligero / ligero + at 40 // (10-25) Anti-Lag+
+		sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : s.souls_mode == "ligero-plus" ? "37" : "43"); // (11-12) ligero 30x2 (43), ligero + 35x2 (37) // (10-25) Anti-Lag+
 	// (des-particles-fg) Souls ligero (30x2) and ligero + (30x3) only: the particle layer's motion vectors for AMD frame
 	// generation (particle-mv.cpp): fire, sparks, rain, mist and spells interpolated instead of shown at the real 30.
 	// (11-11) Off by default until verified in game (the first build lost the device): KYTY_FG_PARTICLE_MV=1 by hand.
@@ -889,7 +889,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (s.souls_mode == "low") sharp = "1";
 	else if (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus") sharp = "0.75";
 	if (!sharp.empty()) sets.emplace_back("KYTY_UPSCALE_SHARPNESS", sharp);
-	if (fixed_fg) sets.emplace_back("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus") ? "40" : "30"); // (11-12) ligero 40x2, ligero + 40x3
+	if (fixed_fg) sets.emplace_back("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : s.souls_mode == "ligero-plus" ? "35" : "30"); // (11-12) ligero 30x2, ligero + 35x2
 	if (unlocked && with_fg) sets.emplace_back("KYTY_FRAMEGEN_BASE", "0");
 	if (s.af16) sets.emplace_back("KYTY_FORCE_AF", "16");
 	if (s.texture_sharpness == "2") {
