@@ -524,8 +524,7 @@ bool ParticleNativeWanted() {
 		const char* value = std::getenv("KYTY_FG_PARTICLE_NATIVE");
 		// (11-12) Unset: on with the particle vectors (KYTY_FG_PARTICLE_MV=1); KYTY_FG_PARTICLE_NATIVE=0 turns it off.
 		const char* mv = std::getenv("KYTY_FG_PARTICLE_MV");
-		(void)mv; // (11-12) off by default again: while on it replaced the mixing method and gave no vectors yet
-		const bool  v  = value != nullptr && *value == '1';
+		const bool  v  = value != nullptr && *value != '\0' ? *value == '1' : (mv != nullptr && *mv == '1');
 		std::printf("FG particle native: KYTY_FG_PARTICLE_NATIVE=%d (%s)\n", v ? 1 : 0,
 		            v ? "the particle pass's own simulated positions (this and last real frame) as frame generation's particle vectors"
 		              : "off");
