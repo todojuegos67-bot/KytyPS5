@@ -20,9 +20,13 @@ public:
         u32 srgb_input = 0;
         // Set by Render: input/output size ratio when the input is larger (Catmull-Rom downscale).
         float downscale = 1.0f;
-        // Set by Render: bb-overscan source UV scale about the centre (BB_OVERSCAN_PERCENT).
+        // bb-overscan: source UV scale about the centre (< 1 crops the edges); the presenter
+        // sets OverscanScale() or 1 (frames given to frame generation: its depth and vectors are
+        // not cropped, so the colour must not be either).
         float uv_scale = 1.0f;
     };
+
+    static float OverscanScale(); // BB_OVERSCAN_PERCENT (default 0.4, 0 = off) as a UV scale
 
     void Create(vk::Device device, vk::Format surface_format);
 

@@ -182,6 +182,22 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     sampler = Check<"create pp sampler">(device.createSamplerUnique(sampler_ci));
 }
 
+// bb-overscan: the output samples the source enlarged by BB_OVERSCAN_PERCENT (default 0.4 %,
+// 0 = off) about the centre, hiding the 1-3 light source pixels along the edges seen on the
+// boot/loading screens.
+float PostProcessingPass::OverscanScale() {
+    static const float scale = [] {
+        float pct = 0.4f;
+        if (const char* e = std::getenv("BB_OVERSCAN_PERCENT"); e && *e) {
+            pct = static_cast<float>(std::atof(e));
+        }
+        if (!(pct >= 0.0f)) pct = 0.0f; // also NaN
+        if (pct > 10.0f) pct = 10.0f;
+        return 1.0f - pct / 100.0f;
+    }();
+    return scale;
+}
+
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
@@ -256,20 +272,6 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     if (input_size.width > frame.width + 1 && frame.width > 0) {
         settings.downscale = static_cast<float>(input_size.width) / frame.width;
     }
-    // bb-overscan: the output samples the source enlarged by BB_OVERSCAN_PERCENT (default 0.4 %,
-    // 0 = off) per axis about the centre, hiding the 1-3 light source pixels along the edges seen
-    // on the boot/loading screens. Both the back buffer and the HUD-less FG image go through
-    // here, so frame generation gets matching inputs.
-    static const float bb_uv_scale = [] {
-        float pct = 0.4f;
-        if (const char* e = std::getenv("BB_OVERSCAN_PERCENT"); e && *e) {
-            pct = static_cast<float>(std::atof(e));
-        }
-        if (!(pct >= 0.0f)) pct = 0.0f; // also NaN
-        if (pct > 10.0f) pct = 10.0f;
-        return 1.0f - pct / 100.0f;
-    }();
-    settings.uv_scale = bb_uv_scale;
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
                          &settings);
 
