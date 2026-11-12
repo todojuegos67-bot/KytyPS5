@@ -4420,6 +4420,19 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	thread_local ShaderParams params;
 	PrepareProgramInto(regs, sh, input_info, params);
 	Common::LockGuard lock(m_mutex);
+	// With KYTY_PAINT_LIVE: each compute program's guest address and hash, once (the live groups
+	// name addresses; KYTY_SHADER_DUMP_ONLY takes hashes).
+	{
+		static const bool live = [] {
+			const char* v = std::getenv("KYTY_PAINT_LIVE");
+			return v != nullptr && v[0] != '\0' && v[0] != '0';
+		}();
+		static std::unordered_set<uint64_t> said;
+		if (live && said.insert(params.Base()).second) {
+			std::printf("[cs-hash] %llx = %016llx\n", static_cast<unsigned long long>(params.Base()),
+			            static_cast<unsigned long long>(params.hash));
+		}
+	}
 	m_program_cache->table_pending = false;
 	m_program_cache->table_waiting.reset();
 	uint32_t          push_data_cursor = 0;
