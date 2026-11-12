@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -19,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
 #include <cinttypes>
 #include <cstdlib>
 #include <mutex>
@@ -54,6 +56,37 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	       info.channel_order == Prospero::ChannelOrder::kAlt;
 }
 
+// KYTY_FASTDRAW_TARGETS=1 (gt7-fastdraw-1112, off by default): a color target's description is
+// kept per slot with the register bytes it was computed from (Demon's Souls' table path resolves
+// a draw state's targets once per state, not per draw). A draw whose target registers, mask,
+// slice offset and flags equal the kept ones takes the kept description and skips the tiling and
+// layout arithmetic; the texture cache lookup (FindImage) and BindRenderTarget still run every
+// draw, so image creation, overlap and rebinding behave as without it. A byte difference
+// anywhere (padding included) is a miss, never a wrong hit. Hits and misses: "GPU phases" line.
+static bool FastDrawTargets() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FASTDRAW_TARGETS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+namespace {
+struct ColorTargetMemo {
+	alignas(HW::RenderTarget) unsigned char regs[sizeof(HW::RenderTarget)] {};
+	uint32_t                        mask         = 0;
+	uint32_t                        slice_offset = 0;
+	uint32_t                        flags        = 0; // exact_format | MsaaCmaskClears() << 1
+	bool                            valid        = false;
+	TextureCache::ImageDesc         desc;
+	uint32_t                        guest_mip_level   = 0;
+	uint32_t                        guest_array_layer = 0;
+	Prospero::ColorComponentMapping export_mapping;
+};
+// Per thread (the GPU thread in practice; any other caller keeps its own).
+thread_local std::array<ColorTargetMemo, RENDER_COLOR_ATTACHMENTS_MAX> t_color_target_memo {};
+} // namespace
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
@@ -85,6 +118,28 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 
 		return;
+	}
+	ColorTargetMemo* memo = nullptr;
+	if (FastDrawTargets() && rt_slot < RENDER_COLOR_ATTACHMENTS_MAX) {
+		memo                 = &t_color_target_memo[rt_slot];
+		const uint32_t flags = (exact_format ? 1u : 0u) | (MsaaCmaskClears() ? 2u : 0u);
+		if (memo->valid && memo->mask == mask && memo->slice_offset == render_target_slice_offset &&
+		    memo->flags == flags && std::memcmp(memo->regs, &rt, sizeof(memo->regs)) == 0) {
+			GpuPhases::Count(GpuPhases::Phase::TargetMemoHit, 1);
+			r.desc              = memo->desc;
+			r.guest_mip_level   = memo->guest_mip_level;
+			r.guest_array_layer = memo->guest_array_layer;
+			r.export_mapping    = memo->export_mapping;
+			r.image_id          = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+			BindRenderTarget(r.image_id);
+			return;
+		}
+		GpuPhases::Count(GpuPhases::Phase::TargetMemoMiss, 1);
+		memo->valid = false;
+		std::memcpy(memo->regs, &rt, sizeof(memo->regs));
+		memo->mask         = mask;
+		memo->slice_offset = render_target_slice_offset;
+		memo->flags        = flags;
 	}
 	// NUM_SAMPLES (coverage) and NUM_FRAGMENTS (stored colors) are both log2. EQAA stores fewer
 	// fragments than it has coverage samples (e.g. 4s/2f) and keeps the sample->fragment map in
@@ -381,8 +436,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	if (memo != nullptr) {
+		// The description as computed, before FindImage remaps its view into a cache image.
+		memo->desc              = r.desc;
+		memo->guest_mip_level   = r.guest_mip_level;
+		memo->guest_array_layer = r.guest_array_layer;
+		memo->export_mapping    = r.export_mapping;
+		memo->valid             = true;
+	}
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

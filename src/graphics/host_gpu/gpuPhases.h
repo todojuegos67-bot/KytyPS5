@@ -102,6 +102,9 @@ enum class Phase : uint32_t {
 	ProgramMemoHit,  // (a count only) a get whose entry the memo gave, without hashing the key
 	ProgramMemoMiss, // (a count only) a get the memo could not serve (the map was searched)
 	ProgramMatch,    // a get's search of its entry's permutations (after the key and the refresh)
+	// gt7-fastdraw-1112 (KYTY_FASTDRAW_TARGETS): ResolveRenderColorTarget's per-slot memo.
+	TargetMemoHit,  // (a count only) a color target whose description the memo gave
+	TargetMemoMiss, // (a count only) one computed again (registers changed, or first use)
 	Count
 };
 
