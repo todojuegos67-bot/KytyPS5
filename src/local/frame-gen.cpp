@@ -9874,4 +9874,12 @@ void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInpu
 	inputs.has_hudless_display = true;
 }
 
+// (11-12) The current guest frame's camera (row-major, clip = M * world), for the particle vectors: the particle
+// draws' user table holds no view-projection. False until the G-buffer pass gave it this frame.
+bool CurrentViewProj(float out[16]) {
+	if (!g_camera.valid) return false;
+	for (int i = 0; i < 16; ++i) out[i] = g_camera.view_proj[i];
+	return true;
+}
+
 } // namespace Libs::Graphics::FrameGen

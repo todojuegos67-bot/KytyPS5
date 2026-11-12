@@ -41,6 +41,8 @@ constexpr uint32_t SrtViewProj     = 29; // 16 floats, row-major, clip = M * wor
 constexpr uint32_t SrtPrevViewProj = 45; // 12 floats: the previous frame's rows x, y and w
 constexpr uint32_t SrtJitter       = 57; // 2 floats: clip-space offset (NDC units)
 
+bool CurrentViewProj(float out[16]);
+
 struct Camera {
 	std::array<float, 16> view_proj {};
 	std::array<float, 16> prev_view_proj {};

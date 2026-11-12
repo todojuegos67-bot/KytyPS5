@@ -2109,6 +2109,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					}
 					for (int r = 0; r < 4; ++r)
 						for (int c = 0; c < 4; ++c) std::memcpy(&nd.vp[r * 4 + c], t + r * 4 + c, 4);
+					// (11-12) The game's camera (the G-buffer pass's view-projection): the table's first words are not it
+					// for these VS (particles projected off screen: 5 of 250 000 with a vector).
+					if (nd.rec_stride == 120) (void)FrameGen::CurrentViewProj(nd.vp);
 					nd.indirect = emit.gpu_args != 0;
 					if (nd.indirect) {
 						uint8_t args_from = 0;
