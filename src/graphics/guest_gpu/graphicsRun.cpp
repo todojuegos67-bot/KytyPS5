@@ -22,6 +22,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "loader/gt7Title.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 
@@ -47,10 +48,12 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <x86intrin.h>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <fmt/format.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -77,6 +80,145 @@ extern "C" {
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
+
+// Queue-wait diagnostics (Gran Turismo 7, or KYTY_QUEUE_WAIT_DIAG=1): a queue that suspended at a wait and has not
+// advanced a packet since is reported every 5 s (the queue, its interrupt id, what it waits for: the address, the
+// value read, the reference, mask and function of a WAIT_REG_MEM, or a REWIND / CE-DE counter), so a black screen
+// with 0 flips names the wait the GPU side is stuck at.
+namespace QueueWaitDiag {
+
+struct Slot {
+	std::atomic<const void*> cp {nullptr};
+	std::atomic<int>         event_id {0};
+	std::atomic<uint32_t>    kind {0};
+	std::atomic<uint32_t>    func {0};
+	std::atomic<uint64_t>    addr {0};
+	std::atomic<uint64_t>    value {0};
+	std::atomic<uint64_t>    ref {0};
+	std::atomic<uint64_t>    mask {0};
+	std::atomic<uint64_t>    since_ns {0}; // 0: advancing
+	std::atomic<uint64_t>    suspends {0};
+};
+
+enum Kind : uint32_t { None, WaitRegMem, Rewind, WaitCe, WaitDeDiff };
+
+static std::array<Slot, 32>          g_slots;
+static thread_local const void*      t_cp   = nullptr;
+static thread_local Slot*            t_slot = nullptr;
+
+static bool Enabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_QUEUE_WAIT_DIAG");
+		if (env != nullptr) return env[0] == '1';
+		return ::Loader::IsGranTurismo7();
+	}();
+	return enabled;
+}
+
+static uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+static const char* KindName(uint32_t kind) {
+	switch (kind) {
+		case WaitRegMem: return "WAIT_REG_MEM";
+		case Rewind: return "REWIND (valid bit clear)";
+		case WaitCe: return "WAIT_ON_CE_COUNTER";
+		case WaitDeDiff: return "WAIT_ON_DE_COUNTER_DIFF";
+		default: return "?";
+	}
+}
+
+static void Monitor() {
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(5));
+		const auto now = NowNs();
+		for (auto& slot: g_slots) {
+			const auto* cp = slot.cp.load(std::memory_order_acquire);
+			if (cp == nullptr) continue;
+			const auto since = slot.since_ns.load(std::memory_order_acquire);
+			if (since == 0 || now - since < 5'000'000'000ull) continue;
+			const auto id  = slot.event_id.load(std::memory_order_relaxed);
+			const auto msg = fmt::format(
+			    "GPU queue {} (interrupt 0x{:x}{}) stuck {:.1f} s at {}: addr=0x{:016x} value=0x{:x} ref=0x{:x} "
+			    "mask=0x{:x} func={} ({} retries)\n",
+			    cp, id, id >= 0x20 ? ", async compute" : "", static_cast<double>(now - since) / 1e9,
+			    KindName(slot.kind.load(std::memory_order_relaxed)), slot.addr.load(std::memory_order_relaxed),
+			    slot.value.load(std::memory_order_relaxed), slot.ref.load(std::memory_order_relaxed),
+			    slot.mask.load(std::memory_order_relaxed), slot.func.load(std::memory_order_relaxed),
+			    slot.suspends.load(std::memory_order_relaxed));
+			std::printf("%s", msg.c_str());
+			std::fflush(stdout);
+			LOGF("%s", msg.c_str());
+		}
+	}
+}
+
+static Slot* SlotOf(const void* cp, int event_id) {
+	if (t_cp == cp && t_slot != nullptr) return t_slot;
+	Slot* found = nullptr;
+	for (auto& slot: g_slots) {
+		if (slot.cp.load(std::memory_order_acquire) == cp) {
+			found = &slot;
+			break;
+		}
+	}
+	if (found == nullptr) {
+		for (auto& slot: g_slots) {
+			const void* expected = nullptr;
+			if (slot.cp.compare_exchange_strong(expected, cp, std::memory_order_acq_rel)) {
+				slot.event_id.store(event_id, std::memory_order_relaxed);
+				found = &slot;
+				break;
+			}
+		}
+	}
+	t_cp   = cp;
+	t_slot = found;
+	return found;
+}
+
+static void NoteWait(const void* cp, int event_id, uint32_t kind, uint64_t addr = 0, uint64_t value = 0,
+                     uint64_t ref = 0, uint64_t mask = 0, uint32_t func = 0) {
+	if (!Enabled()) return;
+	static std::once_flag started;
+	std::call_once(started, [] { std::thread(Monitor).detach(); });
+	auto* slot = SlotOf(cp, event_id);
+	if (slot == nullptr) return;
+	slot->kind.store(kind, std::memory_order_relaxed);
+	slot->addr.store(addr, std::memory_order_relaxed);
+	slot->value.store(value, std::memory_order_relaxed);
+	slot->ref.store(ref, std::memory_order_relaxed);
+	slot->mask.store(mask, std::memory_order_relaxed);
+	slot->func.store(func, std::memory_order_relaxed);
+	slot->suspends.fetch_add(1, std::memory_order_relaxed);
+	uint64_t zero = 0;
+	slot->since_ns.compare_exchange_strong(zero, NowNs(), std::memory_order_acq_rel);
+}
+
+static void NoteProgress(const void* cp) {
+	if (!Enabled()) return;
+	auto* slot = (t_cp == cp) ? t_slot : nullptr;
+	if (slot == nullptr) {
+		for (auto& s: g_slots) {
+			if (s.cp.load(std::memory_order_acquire) == cp) {
+				slot = &s;
+				break;
+			}
+		}
+		if (slot == nullptr) return;
+		t_cp   = cp;
+		t_slot = slot;
+	}
+	if (slot->since_ns.load(std::memory_order_relaxed) != 0) {
+		slot->since_ns.store(0, std::memory_order_release);
+		slot->suspends.store(0, std::memory_order_relaxed);
+	}
+}
+
+} // namespace QueueWaitDiag
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
@@ -670,6 +812,7 @@ void CommandProcessor::ResetDeCe() {
 
 void CommandProcessor::WaitCe() {
 	if (m_ce_count <= m_de_count && !m_ce_complete) {
+		QueueWaitDiag::NoteWait(this, m_interrupt_event_id, QueueWaitDiag::WaitCe, 0, m_ce_count, m_de_count);
 		SuspendPm4();
 	}
 }
@@ -677,12 +820,15 @@ void CommandProcessor::WaitCe() {
 void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	EXIT_IF(m_de_count > m_ce_count);
 	if (m_ce_count - m_de_count >= diff) {
+		QueueWaitDiag::NoteWait(this, m_interrupt_event_id, QueueWaitDiag::WaitDeDiff, 0, m_ce_count, m_de_count,
+		                        diff);
 		SuspendPm4();
 	}
 }
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
+		QueueWaitDiag::NoteWait(this, m_interrupt_event_id, QueueWaitDiag::Rewind);
 		SuspendPm4();
 	}
 }
@@ -969,6 +1115,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		}
 		LiveTrace::Event(LiveTrace::FrontSuspend, reinterpret_cast<uint64_t>(addr),
 		                 (static_cast<uint64_t>(value) << 32u) | static_cast<uint32_t>(ref));
+		QueueWaitDiag::NoteWait(this, m_interrupt_event_id, QueueWaitDiag::WaitRegMem,
+		                        reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(value),
+		                        static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func);
 		SuspendPm4();
 	} else if (Spec::Current() == nullptr) { // (a speculation's commit publishes them)
 		BdaDirtyRegions::Publish();
@@ -2552,6 +2701,7 @@ void CommandProcessor::ProcessPm4Spec(Pm4Execution& execution, size_t stop_depth
 		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
 		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		QueueWaitDiag::NoteProgress(this);
 		if (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
 		    opcode == Pm4::IT_DRAW_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_INDIRECT ||
 		    opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI)
