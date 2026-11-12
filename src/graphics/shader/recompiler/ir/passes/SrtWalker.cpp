@@ -109,6 +109,10 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
 		case ValueOpcode::BitCount32:
+		case ValueOpcode::BitReverse32:
+		case ValueOpcode::UMulHi:
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::FindILsb32:
 		case ValueOpcode::FindUMsb32:
 		case ValueOpcode::IAdd32:
@@ -996,6 +1000,36 @@ private:
 			case ValueOpcode::BitCount32:
 				if (Arg(inst, 0, a)) {
 					result = static_cast<uint32_t>(std::popcount(static_cast<uint32_t>(a)));
+					return true;
+				}
+				return false;
+			case ValueOpcode::BitReverse32:
+				if (Arg(inst, 0, a)) {
+					auto     source   = static_cast<uint32_t>(a);
+					uint32_t reversed = 0;
+					for (uint32_t bit = 0; bit < 32u; ++bit, source >>= 1u) {
+						reversed = (reversed << 1u) | (source & 1u);
+					}
+					result = reversed;
+					return true;
+				}
+				return false;
+			case ValueOpcode::UMulHi:
+				if (binary()) {
+					result = (uint64_t {static_cast<uint32_t>(a)} * static_cast<uint32_t>(b)) >> 32u;
+					return true;
+				}
+				return false;
+			case ValueOpcode::ULessThanEqual32:
+				if (binary()) {
+					result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
+					return true;
+				}
+				return false;
+			case ValueOpcode::SGreaterThanEqual32:
+				if (binary()) {
+					result = static_cast<int32_t>(static_cast<uint32_t>(a)) >=
+					         static_cast<int32_t>(static_cast<uint32_t>(b));
 					return true;
 				}
 				return false;
