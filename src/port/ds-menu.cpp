@@ -191,6 +191,36 @@ float Hot(ImGuiID id, bool on) {
 	else Bump();
 	return v;
 }
+// (11-12) Smooth scrolling of the current window (call right after its Begin / BeginChild): the mouse wheel moves a
+// target and the scroll eases to it (~120 ms), instead of ImGui's instant jumps; keyboard / pad focus moves (SetScrollY
+// elsewhere, ImGui's own scroll-to-focus) are followed as they are.
+std::map<ImGuiID, float> g_scroll_target;
+void SmoothScroll() {
+	ImGuiWindow* w = ImGui::GetCurrentWindow();
+	if (w == nullptr) return;
+	const ImGuiID id     = w->ID;
+	auto&         io     = ImGui::GetIO();
+	const float   max_y  = ImGui::GetScrollMaxY();
+	const float   now_y  = ImGui::GetScrollY();
+	auto          it     = g_scroll_target.find(id);
+	float         target = it != g_scroll_target.end() ? it->second : now_y;
+	static std::map<ImGuiID, float> last_set;
+	// Something else scrolled the window (focus, a page jump): follow it.
+	if (auto ls = last_set.find(id); ls != last_set.end() && std::fabs(ls->second - now_y) > 0.5f) target = now_y;
+	w->Flags |= ImGuiWindowFlags_NoScrollWithMouse;
+	if (io.MouseWheel != 0.0f && max_y > 0.0f && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+		target -= io.MouseWheel * std::max(60.0f, ImGui::GetTextLineHeightWithSpacing() * 4.0f);
+		io.MouseWheel = 0.0f;
+	}
+	target                  = std::clamp(target, 0.0f, max_y);
+	g_scroll_target[id]     = target;
+	const float dt          = std::clamp(io.DeltaTime, 0.0f, 0.1f);
+	float       y           = now_y + (target - now_y) * std::min(1.0f, dt * 16.0f);
+	if (std::fabs(target - y) < 0.5f) y = target;
+	else Bump();
+	if (y != now_y) ImGui::SetScrollY(y);
+	last_set[id] = y;
+}
 // The last item's highlight: a gold wash, a border and an accent bar on the left that grow with the hover / focus.
 void Highlight(float unit) {
 	const ImGuiID id = ImGui::GetItemID();
@@ -1878,7 +1908,7 @@ void DrawTrophyTab(float unit) {
 	                                    {0.78f, 0.80f, 0.84f, 1.0f}, {0.80f, 0.52f, 0.30f, 1.0f}};
 	static const char*  grade_txt[5] = {"", "Platino", "Oro", "Plata", "Bronce"};
 	const ImVec4        grey {0.45f, 0.45f, 0.45f, 1.0f};
-	ImGui::BeginChild("##trophies", {0, 0}, ImGuiChildFlags_None);
+	ImGui::BeginChild("##trophies", {0, 0}, ImGuiChildFlags_None); Anim::SmoothScroll();
 	for (const auto& r: rows) {
 		ImGui::PushID(r.id);
 		const int    g      = r.grade >= 1 && r.grade <= 4 ? r.grade : 0;
@@ -2159,7 +2189,12 @@ void Draw(float width, float height) {
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {32 * unit, 24 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12 * unit, 12 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {12 * unit, 6 * unit});
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, 8 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 8 * unit);
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.02f, 0.02f, 0.025f, 0.80f});
 	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.45f});
 	ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4 {0.12f, 0.11f, 0.10f, 1.0f});
@@ -2237,7 +2272,7 @@ void Draw(float width, float height) {
 		for (int once = 0, t = g_tab; once < 1; once++) {
 			const float page_h = size.y - footer - ImGui::GetCursorPosY();
 			const float list_w = ImGui::GetContentRegionAvail().x * 0.62f;
-			ImGui::BeginChild("##page", {list_w, page_h}, ImGuiChildFlags_None);
+			ImGui::BeginChild("##page", {list_w, page_h}, ImGuiChildFlags_None); Anim::SmoothScroll();
 			const bool fixed = FixedFg(s);
 			g_desc_title.clear();
 			g_desc_text.clear();
@@ -2615,7 +2650,7 @@ void Draw(float width, float height) {
 			// The description panel.
 			ImGui::SameLine();
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.06f, 0.055f, 0.05f, 0.75f});
-			ImGui::BeginChild("##desc", {0, page_h}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+			ImGui::BeginChild("##desc", {0, page_h}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding); Anim::SmoothScroll();
 			ImGui::PushFont(nullptr, 30.0f * unit);
 			ImGui::TextColored(kGold, "%s", g_desc_title.empty() ? tabs[t] : g_desc_title.c_str());
 			ImGui::PopFont();
@@ -3915,7 +3950,7 @@ void LauncherTrophiesBox() {
 	ImGui::SetCursorScreenPos({g_lbox.at.x, ly});
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.04f, 0.045f, 0.06f, 0.95f});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), U(4)});
-	ImGui::BeginChild("##trophylist", {U(420), U(300)}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+	ImGui::BeginChild("##trophylist", {U(420), U(300)}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding); Anim::SmoothScroll();
 	if (rows.empty()) {
 		ImGui::TextWrapped("%s", I18n::T("Aún no hay trofeos: aparecen al jugar."));
 	} else {
@@ -4076,12 +4111,12 @@ void DrawLauncher(float width, float height) {
 	const int     colors_before = ctx.ColorStack.Size, vars_before = ctx.StyleVarStack.Size;
 	ImGui::PushFont(g_font_semi, U(16));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {U(14), U(12)});
-	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), U(6)});
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(6), U(3)});
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(10), U(9)});
+	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(9), U(5)});
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, U(3));
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, U(6));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, U(4));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, U(8));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, U(12));
+	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, U(10));
 	ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, U(12));
 	ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha, 0.55f);
 	ImGui::PushStyleColor(ImGuiCol_Text, kInkL);
@@ -5684,8 +5719,8 @@ bool Begin(const char* title, float width, float height, float unit) {
 	var(ImGuiStyleVar_ItemSpacing, {std::round(16 * unit), std::round(14 * unit)});
 	var(ImGuiStyleVar_FramePadding, {std::round(16 * unit), std::round(9 * unit)});
 	var(ImGuiStyleVar_CellPadding, {std::round(14 * unit), std::round(10 * unit)});
-	var1(ImGuiStyleVar_FrameRounding, 6 * unit);
-	var1(ImGuiStyleVar_GrabRounding, 4 * unit);
+	var1(ImGuiStyleVar_FrameRounding, 10 * unit);
+	var1(ImGuiStyleVar_GrabRounding, 8 * unit);
 	var1(ImGuiStyleVar_GrabMinSize, 24 * unit);
 	var1(ImGuiStyleVar_ScrollbarSize, 20 * unit);
 	var1(ImGuiStyleVar_FrameBorderSize, std::max(1.0f, unit));
@@ -5749,7 +5784,7 @@ bool Footer(float unit) {
 
 bool DrawPad(float width, float height, float unit) {
 	Begin("Mapear mando", width, height, unit);
-	ImGui::BeginChild("##padpage", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened); // (ds-pc-port41) the D-pad / stick move row by row inside the list and the page follows the focus
+	ImGui::BeginChild("##padpage", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened); Anim::SmoothScroll(); // (ds-pc-port41) the D-pad / stick move row by row inside the list and the page follows the focus
 	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	(void)PadMap::Draw(g_edit, unit);
 	ImGui::EndChild();
@@ -5778,7 +5813,7 @@ bool DrawKbm(float width, float height, float unit) {
 	}
 	LoadMouse();
 	Begin("Teclado y ratón", width, height, unit);
-	ImGui::BeginChild("##kbmpage", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened); // (ds-pc-port41) the D-pad / stick move row by row inside the list and the page follows the focus
+	ImGui::BeginChild("##kbmpage", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened); Anim::SmoothScroll(); // (ds-pc-port41) the D-pad / stick move row by row inside the list and the page follows the focus
 	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	ImGui::Checkbox(I18n::T("Jugar con teclado y ratón"), &g_edit.kbm);
 	Anim::Highlight(unit);
@@ -5945,8 +5980,8 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.01f, t));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {32 * unit, 24 * unit});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12 * unit, 14 * unit});
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * unit);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14 * unit);
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0, 0, 0, 0}); // (perfopts-1107: the carved stone panel, Souls::Panel)
 	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0, 0, 0, 0});
 	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.13f, 0.125f, 0.12f, 1.0f});
@@ -6088,7 +6123,7 @@ void DrawInGame(float width, float height) {
 	ImFont* font = FindFont("segoeui");
 	ImGui::PushFont(font, 28.0f * unit);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {36 * unit, 28 * unit});
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8 * unit);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14 * unit);
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.03f, 0.03f, 0.035f, 0.92f});
 	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.55f});
 	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
@@ -6259,7 +6294,15 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 			for (const wchar_t* name: names) {
 				std::error_code ec;
 				const auto      ttf = fonts / name;
-				if (std::filesystem::exists(ttf, ec)) return io.Fonts->AddFontFromFileTTF(ttf.string().c_str());
+				if (std::filesystem::exists(ttf, ec)) {
+					// (11-12) Sharper text: oversampled, sub-pixel placed, a touch heavier.
+					ImFontConfig cfg;
+					cfg.OversampleH       = 3;
+					cfg.OversampleV       = 2;
+					cfg.PixelSnapH        = false;
+					cfg.RasterizerMultiply = 1.12f;
+					return io.Fonts->AddFontFromFileTTF(ttf.string().c_str(), 0.0f, &cfg);
+				}
 			}
 			return nullptr;
 		};
