@@ -2430,6 +2430,9 @@ std::atomic<uint64_t> g_markers_pending {0};
 std::atomic<uint32_t> g_marker_requests {0};
 struct MarkerStats {
 	uint32_t taken = 0, skipped = 0, used = 0, cleared = 0;
+	// Why skipped: not recorded directly (packet path / mesh), no image or context, depth / no attachment, a pass that
+	// begins by clearing it.
+	uint32_t skip_unusable = 0, skip_no_image = 0, skip_format = 0, skip_clear = 0;
 } g_marker_stats;
 std::chrono::steady_clock::time_point g_marker_last {};
 
@@ -2451,8 +2454,10 @@ void MarkersFrameEnd() {
 	if (g_marker_last != std::chrono::steady_clock::time_point {}) {
 		auto& m = g_marker_stats;
 		std::printf("[hpbar] 1 s: HUD icon draws found %u, canvas copies before them %u (skipped %u); HUD-less images "
-		            "with the enemy bars %u, HUD cleared %u\n",
-		            g_marker_requests.exchange(0, std::memory_order_relaxed), m.taken, m.skipped, m.used, m.cleared);
+		            "with the enemy bars %u, HUD cleared %u [skip reasons: not direct %u, no image %u, format %u, "
+		            "clear %u]\n",
+		            g_marker_requests.exchange(0, std::memory_order_relaxed), m.taken, m.skipped, m.used, m.cleared,
+		            m.skip_unusable, m.skip_no_image, m.skip_format, m.skip_clear);
 		std::fflush(stdout);
 		m = {};
 	}
@@ -2474,6 +2479,11 @@ bool MarkerSnapshotPending() {
 	return g_markers_pending.load(std::memory_order_relaxed) != 0;
 }
 
+bool MarkerSnapshotPendingFor(uint64_t address) {
+	const uint64_t pending = g_markers_pending.load(std::memory_order_relaxed);
+	return pending != 0 && pending == address;
+}
+
 void TakeMarkerSnapshot(CommandBuffer& command, const RenderState& rendering, ImageId target, uint64_t address,
                         bool usable) {
 	const uint64_t pending = g_markers_pending.load(std::memory_order_relaxed);
@@ -2482,14 +2492,20 @@ void TakeMarkerSnapshot(CommandBuffer& command, const RenderState& rendering, Im
 	g_markers_valid = false;
 	if (!usable || !target || g_cache == nullptr || g_graphics_ctx == nullptr) {
 		++g_marker_stats.skipped;
+		++(usable ? g_marker_stats.skip_no_image : g_marker_stats.skip_unusable);
 		return;
 	}
 	auto&      image   = g_cache->GetImage(target);
 	const bool in_pass = command.RenderingWith(rendering);
 	// (A pass about to begin by clearing the canvas: what it holds now is not this frame's.)
-	if (IsDepthFormat(image.backing.format) || image.backing.image == nullptr || rendering.num_color_attachments == 0 ||
-	    (!in_pass && rendering.color_attachments[0].is_clear)) {
+	if (IsDepthFormat(image.backing.format) || image.backing.image == nullptr || rendering.num_color_attachments == 0) {
 		++g_marker_stats.skipped;
+		++g_marker_stats.skip_format;
+		return;
+	}
+	if (!in_pass && rendering.color_attachments[0].is_clear) {
+		++g_marker_stats.skipped;
+		++g_marker_stats.skip_clear;
 		return;
 	}
 	const auto layout = rendering.color_attachments[0].image_layout;

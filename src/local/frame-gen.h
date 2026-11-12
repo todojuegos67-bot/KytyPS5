@@ -194,6 +194,8 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageI
 [[nodiscard]] bool MarkersWanted();
 void               RequestMarkerSnapshot(uint64_t canvas);
 [[nodiscard]] bool MarkerSnapshotPending();
+// (The draw into guest `address` the copy is asked before: recorded directly, not into a packet stream.)
+[[nodiscard]] bool MarkerSnapshotPendingFor(uint64_t address);
 // (`usable`: the draw is recorded here, in `command`; else the request is dropped.)
 void TakeMarkerSnapshot(CommandBuffer& command, const RenderState& rendering, ImageId target, uint64_t address,
                         bool usable);

@@ -1835,6 +1835,11 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	     primitive == Prospero::PrimitiveType::kRectList);
 #endif
 	if (flip_slot >= 0) record_draw = false;
+	// (hpbar) The HUD's first draw, the canvas copied before it (FrameGen::TakeMarkerSnapshot): recorded directly, since a
+	// draw recorded into a packet stream is not in `buffer` and the copy could not go before it.
+	if (record_draw && flip_slot < 0 && state.color_count > 0 &&
+	    FrameGen::MarkerSnapshotPendingFor(state.color_info[0].desc.info.data.address))
+		record_draw = false;
 	// Upscaling (KYTY_UPSCALE): the game's 3D image upscaled before the composite's descriptors are written.
 	if (flip_slot >= 0 && bindings.pixel.has_value())
 		FrameGen::UpscaleComposite(buffer, rendering, std::span<TextureBinding> {bindings.pixel->images});
@@ -2489,7 +2494,17 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	RenderLockGuard lock(m_context.GetMutex());
-	if (SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr)) return true; // live `skipcs` probe
+	{
+		// KYTY_PAINT (skip-shader.h): draws left out to find which pass draws an artifact; live `skipcs` probe.
+		const auto& paint_ctx    = buffer.GetRegisters();
+		const auto& paint_target = paint_ctx.GetRenderTarget(0);
+		const bool  paint_color  = (paint_ctx.GetRenderTargetMask() & 0xfu) != 0 && paint_target.base.addr != 0;
+		if (SkipShader::Paint::SkipDraw(sh_ctx.GetPs().ps_regs.data_addr, paint_color, paint_target.attrib2.width + 1u,
+		                                paint_target.attrib2.height + 1u, static_cast<uint32_t>(paint_target.info.format),
+		                                static_cast<uint32_t>(paint_target.info.channel_type)) ||
+		    SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr))
+			return true;
+	}
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return true;
 	}
@@ -2669,7 +2684,17 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	RenderLockGuard lock(m_context.GetMutex());
-	if (SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr)) return true; // live `skipcs` probe
+	{
+		// KYTY_PAINT (skip-shader.h): draws left out to find which pass draws an artifact; live `skipcs` probe.
+		const auto& paint_ctx    = buffer.GetRegisters();
+		const auto& paint_target = paint_ctx.GetRenderTarget(0);
+		const bool  paint_color  = (paint_ctx.GetRenderTargetMask() & 0xfu) != 0 && paint_target.base.addr != 0;
+		if (SkipShader::Paint::SkipDraw(sh_ctx.GetPs().ps_regs.data_addr, paint_color, paint_target.attrib2.width + 1u,
+		                                paint_target.attrib2.height + 1u, static_cast<uint32_t>(paint_target.info.format),
+		                                static_cast<uint32_t>(paint_target.info.channel_type)) ||
+		    SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr))
+			return true;
+	}
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return true;
 	}
