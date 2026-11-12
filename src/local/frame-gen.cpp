@@ -28,6 +28,7 @@
 #include "local/dyn-multiplier.h"
 #include "local/hwrt-gi.h"
 #include "gpu_tiler_shaders/taa_bypass_spv.h"
+#include "gpu_tiler_shaders/enemybar_mv_spv.h" // (hpbar: KYTY_FG_ENEMYBAR_MV)
 #include "gpu_tiler_shaders/sharpen_spv.h"
 #include "gpu_tiler_shaders/ssgi_spv.h"
 #include "gpu_tiler_shaders/gtao_spv.h"
@@ -2444,6 +2445,198 @@ bool MarkersSwitch() {
 	return on;
 }
 
+// (hpbar) KYTY_FG_ENEMYBAR_MV (on unless 0; with KYTY_FG_ENEMYBAR): the markers' pixels in frame generation's motion copy
+// take the vector of the enemy below them (enemybar-mv.comp), so generated frames move the bars with their enemy and not
+// with the background behind them. Any failure: nothing written (the vectors as before).
+bool g_markers_mv_ready = false; // BeforeFlipDraw put g_markers in the HUD-less image this frame
+struct EnemyBarMv {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             point = nullptr, linear = nullptr;
+	VkBuffer                stats = VK_NULL_HANDLE, read = VK_NULL_HANDLE;
+	VmaAllocation           stats_mem = nullptr, read_mem = nullptr;
+	const uint32_t*         mapped    = nullptr;
+	bool                    failed = false, zeroed = false, disabled = false;
+	// Per 1 s line: frames dispatched, not dispatched (motion copy not storage RG16F / size or image missing).
+	uint32_t frames = 0, not_storage = 0, no_canvas = 0, pixels_frames = 0;
+	uint64_t pixels = 0; // MV pixels per dispatched frame (summed)
+	std::array<uint32_t, 3> last {};
+} g_bmv;
+struct EnemyBarPush {
+	int32_t size[2];
+	float   threshold;
+	int32_t search;
+};
+static_assert(sizeof(EnemyBarPush) == 16);
+
+bool EnemyBarMvSwitch() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FG_ENEMYBAR_MV");
+		return !(value != nullptr && value[0] == '0' && value[1] == '\0');
+	}();
+	return on && MarkersSwitch();
+}
+
+bool EnsureEnemyBarMv(GraphicContext& graphics) {
+	if (g_bmv.pipeline != nullptr) return true;
+	if (g_bmv.failed) return false;
+	g_bmv.failed      = true; // until it is made
+	const auto device = graphics.device;
+	std::array<vk::DescriptorSetLayoutBinding, 4> bindings {};
+	for (uint32_t i = 0; i < 4; ++i) {
+		bindings[i].binding         = i;
+		bindings[i].descriptorType  = i < 2 ? vk::DescriptorType::eCombinedImageSampler
+		                              : i == 2 ? vk::DescriptorType::eStorageImage
+		                                       : vk::DescriptorType::eStorageBuffer;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	}
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+	set_info.pBindings    = bindings.data();
+	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_bmv.set_layout) != vk::Result::eSuccess) return false;
+	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(EnemyBarPush)};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &g_bmv.set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push;
+	if (device.createPipelineLayout(&layout_info, nullptr, &g_bmv.layout) != vk::Result::eSuccess) return false;
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize    = sizeof(ENEMYBAR_MV_SPV);
+	module_info.pCode       = ENEMYBAR_MV_SPV;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	pipeline_info.stage.module = module;
+	pipeline_info.stage.pName  = "main";
+	pipeline_info.layout       = g_bmv.layout;
+	const auto created = device.createComputePipelines(LocalPassCache::Get(device), 1, &pipeline_info, nullptr, &g_bmv.pipeline);
+	device.destroyShaderModule(module, nullptr);
+	if (created != vk::Result::eSuccess) {
+		g_bmv.pipeline = nullptr;
+		return false;
+	}
+	for (int i = 0; i < 2; ++i) {
+		vk::SamplerCreateInfo sampler {};
+		sampler.magFilter    = i == 0 ? vk::Filter::eNearest : vk::Filter::eLinear;
+		sampler.minFilter    = sampler.magFilter;
+		sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+		sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+		sampler.maxLod       = 0.0f;
+		if (device.createSampler(&sampler, nullptr, i == 0 ? &g_bmv.point : &g_bmv.linear) != vk::Result::eSuccess) {
+			g_bmv.pipeline = nullptr; // (never used: failed stays set)
+			return false;
+		}
+	}
+	VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+	create.size  = 16;
+	create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationCreateInfo allocate {};
+	allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_bmv.stats, &g_bmv.stats_mem, nullptr) != VK_SUCCESS) {
+		g_bmv.stats    = VK_NULL_HANDLE;
+		g_bmv.pipeline = nullptr;
+		return false;
+	}
+	create.usage   = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	allocate.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VmaAllocationInfo mapped {};
+	if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_bmv.read, &g_bmv.read_mem, &mapped) == VK_SUCCESS)
+		g_bmv.mapped = static_cast<const uint32_t*>(mapped.pMappedData);
+	else
+		g_bmv.read = VK_NULL_HANDLE; // (statistics only)
+	g_bmv.failed = false;
+	return true;
+}
+
+void EnemyBarMemoryBarrier(vk::CommandBuffer command) {
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+}
+
+// PrepareInputs, after the motion copy (and the particle vectors): true when it dispatched (the caller invalidates the
+// recorded graphics state: this pass binds its own pipeline and push descriptors).
+bool EnemyBarMv(vk::CommandBuffer command, GraphicContext& graphics, VulkanImage& motion, vk::ImageView motion_view,
+                VulkanImage& depth, vk::ImageView depth_view) {
+	if (g_bmv.disabled || !EnemyBarMvSwitch()) return false;
+	if (g_markers.image == nullptr || g_markers_view == nullptr) {
+		++g_bmv.no_canvas;
+		return false;
+	}
+	if (motion.image == nullptr || motion_view == nullptr || depth.image == nullptr || depth_view == nullptr ||
+	    motion.format != vk::Format::eR16G16Sfloat || !(motion.usage & vk::ImageUsageFlagBits::eStorage) ||
+	    depth.extent.width != motion.extent.width || depth.extent.height != motion.extent.height) {
+		++g_bmv.not_storage;
+		return false;
+	}
+	if (!EnsureEnemyBarMv(graphics)) return false;
+	EnemyBarMemoryBarrier(command);
+	if (!g_bmv.zeroed) {
+		command.fillBuffer(vk::Buffer(g_bmv.stats), 0, 16, 0u);
+		EnemyBarMemoryBarrier(command);
+		g_bmv.zeroed = true;
+	}
+	Transition(command, g_markers, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader);
+	Transition(command, depth, vk::ImageAspectFlagBits::eDepth, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader);
+	Transition(command, motion, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+	           vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite,
+	           vk::PipelineStageFlagBits2::eComputeShader);
+	const vk::DescriptorImageInfo canvas_info {g_bmv.linear, g_markers_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	const vk::DescriptorImageInfo depth_info {g_bmv.point, depth_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	const vk::DescriptorImageInfo motion_info {nullptr, motion_view, vk::ImageLayout::eGeneral};
+	const vk::DescriptorBufferInfo stats_info {vk::Buffer(g_bmv.stats), 0, 16};
+	std::array<vk::WriteDescriptorSet, 4> writes {};
+	for (uint32_t i = 0; i < 4; ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = i < 2 ? vk::DescriptorType::eCombinedImageSampler
+		                            : i == 2 ? vk::DescriptorType::eStorageImage
+		                                     : vk::DescriptorType::eStorageBuffer;
+	}
+	writes[0].pImageInfo  = &canvas_info;
+	writes[1].pImageInfo  = &depth_info;
+	writes[2].pImageInfo  = &motion_info;
+	writes[3].pBufferInfo = &stats_info;
+	EnemyBarPush push {};
+	push.size[0]   = static_cast<int32_t>(motion.extent.width);
+	push.size[1]   = static_cast<int32_t>(motion.extent.height);
+	push.threshold = 0.02f;
+	// About 100 pixels at 1440 lines below the bar: past the gap to the enemy's head and into its body.
+	push.search = std::clamp(static_cast<int32_t>(motion.extent.height) * 100 / 1440, 8, 256);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_bmv.pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bmv.layout, 0, static_cast<uint32_t>(writes.size()),
+	                             writes.data());
+	command.pushConstants(g_bmv.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	command.dispatch((motion.extent.width + 7) / 8, (motion.extent.height + 7) / 8, 1);
+	EnemyBarMemoryBarrier(command);
+	if (g_bmv.read != VK_NULL_HANDLE) {
+		const vk::BufferCopy region {0, 0, 16};
+		command.copyBuffer(vk::Buffer(g_bmv.stats), vk::Buffer(g_bmv.read), 1, &region);
+		EnemyBarMemoryBarrier(command);
+	}
+	Transition(command, motion, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	++g_bmv.frames;
+	g_bmv.pixels += static_cast<uint64_t>(motion.extent.width) * motion.extent.height;
+	return true;
+}
+
 // At the frame's flip (PrepareInputs): the 1 s line. (The copy stays: the GPU thread may queue the next frame's
 // interface before this flip; a copy is used once, by the next composite, and a request is dropped by the draw it
 // matches.)
@@ -2453,13 +2646,34 @@ void MarkersFrameEnd() {
 	if (now - g_marker_last < std::chrono::seconds(1)) return;
 	if (g_marker_last != std::chrono::steady_clock::time_point {}) {
 		auto& m = g_marker_stats;
+		// (hpbar MV) The pass's counters since the last line (read a frame or two late: statistics only).
+		std::array<uint32_t, 3> bar {};
+		if (g_bmv.mapped != nullptr && g_graphics_ctx != nullptr) {
+			(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_bmv.read_mem, 0, VK_WHOLE_SIZE);
+			for (size_t i = 0; i < bar.size(); ++i) {
+				const uint32_t now_value = g_bmv.mapped[i];
+				bar[i]                   = now_value - g_bmv.last[i];
+				g_bmv.last[i]            = now_value;
+			}
+			// A canvas that is not mostly transparent (over a quarter of the pixels masked): off for the session.
+			if (g_bmv.pixels > 0 && static_cast<uint64_t>(bar[0]) * 4 > g_bmv.pixels && !g_bmv.disabled) {
+				g_bmv.disabled = true;
+				std::printf("[hpbar] bar MV: %u of %llu pixels masked - the canvas is not the markers alone; bar MV off\n",
+				            bar[0], static_cast<unsigned long long>(g_bmv.pixels));
+			}
+		}
 		std::printf("[hpbar] 1 s: HUD icon draws found %u, canvas copies before them %u (skipped %u); HUD-less images "
 		            "with the enemy bars %u, HUD cleared %u [skip reasons: not direct %u, no image %u, format %u, "
-		            "clear %u]\n",
+		            "clear %u]; bar MV (KYTY_FG_ENEMYBAR_MV%s): frames %u, masked px %u, MV writes %u, no source %u "
+		            "[not done: motion not storage RG16F %u, no canvas %u]\n",
 		            g_marker_requests.exchange(0, std::memory_order_relaxed), m.taken, m.skipped, m.used, m.cleared,
-		            m.skip_unusable, m.skip_no_image, m.skip_format, m.skip_clear);
+		            m.skip_unusable, m.skip_no_image, m.skip_format, m.skip_clear,
+		            !EnemyBarMvSwitch() ? "=0 off" : g_bmv.disabled ? " auto-off: mask too large" : "", g_bmv.frames,
+		            bar[0], bar[1], bar[2], g_bmv.not_storage, g_bmv.no_canvas);
 		std::fflush(stdout);
 		m = {};
+		g_bmv.frames = g_bmv.not_storage = g_bmv.no_canvas = 0;
+		g_bmv.pixels = 0;
 	}
 	g_marker_last = now;
 }
@@ -2640,6 +2854,7 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageI
 	    g_markers.extent.height == ui.backing.extent.height) {
 		CopyBack(vk_command, g_markers, ui);
 		++g_marker_stats.used;
+		g_markers_mv_ready = true; // (hpbar MV: this frame's markers, for PrepareInputs)
 	} else {
 		ui.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
 		vk::ClearColorValue             transparent {};
@@ -3650,6 +3865,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	g_hudless_taken          = false;
 	MarkersFrameEnd();
 	const bool composite     = std::exchange(g_composite, false);
+	const bool bars          = std::exchange(g_markers_mv_ready, false) && composite && hudless; // (hpbar MV)
 	g_target_draws.clear();
 	g_flip_renders           = 0;
 	g_flip_max_draws         = 0;
@@ -3709,7 +3925,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 		return; // the images were replaced after the TAA pass
 	}
 	Configure(graphics, inputs.depth, inputs.depth_view, depth.backing);
-	Configure(graphics, inputs.motion, inputs.motion_view, motion.backing, &inputs.motion_attachment, ParticleMvWanted()); // (des-particles-fg: storage use for KYTY_FG_PARTICLE_MV)
+	Configure(graphics, inputs.motion, inputs.motion_view, motion.backing, &inputs.motion_attachment, ParticleMvWanted() || EnemyBarMvSwitch()); // (hpbar MV: storage use too) // (des-particles-fg: storage use for KYTY_FG_PARTICLE_MV)
 	command.EndRendering();
 	auto vk_command = command.Handle();
 	CopyInto(vk_command, depth, inputs.depth);
@@ -3722,6 +3938,9 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	// (Its compute pipeline and push descriptors are bound in the guest's command stream: the ordinary path's recorded
 	// state is invalidated after it, as the TAA bypass does - without it the next guest dispatch ran with ours: device lost.)
 	if (ParticleMvWanted() && ParticleMvCompose(vk_command, graphics, inputs.motion, inputs.motion_view)) command.InvalidateGraphicsState();
+	// (hpbar) KYTY_FG_ENEMYBAR_MV: the enemies' bars (in the HUD-less image this frame) take their enemy's vectors.
+	if (bars && EnemyBarMv(vk_command, graphics, inputs.motion, inputs.motion_view, inputs.depth, inputs.depth_view))
+		command.InvalidateGraphicsState();
 	if (hudless && HudlessWanted()) {
 		ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format, vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
 		CopyRaw(vk_command, g_hudless, inputs.hudless);

@@ -1,0 +1,60 @@
+#version 450
+// (hpbar) KYTY_FG_ENEMYBAR_MV (frame-gen.cpp, EnemyBarMv): the enemies' health bars (2D markers on the HUD canvas, kept
+// in the HUD-less image) write no motion vectors: frame generation moved them with whatever is behind them (often the
+// distant background) and they ghosted. For frame generation's copy of the motion vectors only: each pixel under a
+// marker (canvas alpha, dilated by one pixel) takes the vector of the closest (reversed-Z: greatest depth) pixel not
+// under a marker in the `search` pixels below it in its column - the enemy the bar floats above. Pixels that are read
+// are never written (the same mask), so reading and writing one image is race-free.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D canvas; // the HUD canvas with the markers (linear)
+layout(binding = 1) uniform sampler2D depth;  // FG's depth copy (point; texelFetch)
+layout(binding = 2, rg16f) uniform image2D motion;
+layout(binding = 3, std430) buffer Stats {
+	uint masked;
+	uint written;
+	uint no_source;
+	uint pad;
+} stats;
+
+layout(push_constant) uniform Push {
+	ivec2 size;
+	float threshold;
+	int   search;
+} pc;
+
+bool Masked(ivec2 p) {
+	vec2 texel = 1.0 / vec2(pc.size);
+	vec2 uv    = (vec2(p) + 0.5) * texel;
+	float a = textureLod(canvas, uv, 0.0).a;
+	a = max(a, textureLod(canvas, uv + vec2(texel.x, 0.0), 0.0).a);
+	a = max(a, textureLod(canvas, uv - vec2(texel.x, 0.0), 0.0).a);
+	a = max(a, textureLod(canvas, uv + vec2(0.0, texel.y), 0.0).a);
+	a = max(a, textureLod(canvas, uv - vec2(0.0, texel.y), 0.0).a);
+	return a > pc.threshold;
+}
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+	if (!Masked(p)) return;
+	atomicAdd(stats.masked, 1u);
+	float best  = 0.0;
+	ivec2 bestp = ivec2(-1);
+	for (int dy = 2; dy <= pc.search; dy += 2) {
+		ivec2 q = ivec2(p.x, p.y + dy);
+		if (q.y >= pc.size.y) break;
+		if (Masked(q)) continue;
+		float d = texelFetch(depth, q, 0).r;
+		if (d > best) {
+			best  = d;
+			bestp = q;
+		}
+	}
+	if (bestp.x < 0) {
+		atomicAdd(stats.no_source, 1u);
+		return;
+	}
+	imageStore(motion, p, imageLoad(motion, bestp));
+	atomicAdd(stats.written, 1u);
+}

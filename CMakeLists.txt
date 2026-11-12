@@ -671,6 +671,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${pmv_header}")
 
+# (hpbar) KYTY_FG_ENEMYBAR_MV: the enemies' health bars get their enemy's motion vectors for frame generation (frame-gen.cpp).
+set(ebmv_source "${KYTY_SOURCE_DIR}/local/enemybar-mv.comp")
+set(ebmv_spv "${gpu_tiler_generated_dir}/enemybar_mv.spv")
+set(ebmv_header "${gpu_tiler_generated_dir}/enemybar_mv_spv.h")
+add_custom_command(
+	OUTPUT "${ebmv_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${ebmv_spv}" "${ebmv_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${ebmv_spv} -DOUTPUT=${ebmv_header}
+	        -DSYMBOL=ENEMYBAR_MV_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${ebmv_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${ebmv_header}")
+
 # KYTY_SMOKE: soft particles + torch-lit smoke on the particle layer (src/local/smoke.cpp).
 set(smoke_source "${KYTY_SOURCE_DIR}/local/smoke.comp")
 set(smoke_spv "${gpu_tiler_generated_dir}/smoke.spv")
