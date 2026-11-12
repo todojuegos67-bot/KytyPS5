@@ -1167,8 +1167,8 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
         info.vs_hash = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
         info.depth_test = regs.depth_control.depth_enable != 0;
         info.blend = pipeline->GetGraphicsKey().blend_controls[0].enable != 0;
+        info.clip_disabled = regs.IsClipDisabled();
         const u32 sw = BB::Upscale::g_scene_w, sh = BB::Upscale::g_scene_h;
-        const VAddr hud_layer = bb_cut.HudLayer();
         const bool tracing = bb_cut.Tracing();
         std::string reads;
         for (const auto* stage : pipeline->GetStages()) {
@@ -1178,8 +1178,11 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
                 const auto tsharp = image_desc.GetSharp(*stage);
                 if (tsharp.Address() == 0) continue;
                 const u32 w = u32(tsharp.width) + 1, h = u32(tsharp.height) + 1;
-                const bool is_layer = hud_layer != 0 && tsharp.Address() == hud_layer;
-                if (is_layer) info.samples_hud_layer = true;
+                const bool is_layer = bb_cut.IsLayerCandidate(tsharp.Address());
+                if (is_layer) {
+                    info.samples_hud_layer = true;
+                    info.layer_read = tsharp.Address();
+                }
                 if (sw && sh && w + 8 > sw && h + 8 > sh && w < sw + 8 && h < sh + 8) {
                     info.samples_scene = true;
                 }
@@ -1199,9 +1202,9 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
                                      vk::to_string(im.info.pixel_format));
             }
             bb_cut.TraceDraw(fmt::format(
-                "{}vs {:#x} ps {:#x} -> {}{}{}{} reads:{}", bb_cut.UiPhase() ? "[UI] " : "",
+                "{}vs {:#x} ps {:#x} -> {}{}{}{}{} reads:{}", bb_cut.UiPhase() ? "[UI] " : "",
                 info.vs_hash, info.ps_hash, target, info.depth_test ? " depth" : "",
-                info.blend ? " blend" : "",
+                info.blend ? " blend" : "", info.clip_disabled ? " 2d" : "",
                 UiComposition::MovieShader(info.vs_hash) ? " movie" : "",
                 reads.empty() ? " none" : reads));
         }

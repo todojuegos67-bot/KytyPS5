@@ -59,7 +59,18 @@ public:
         bool depth_test = false, blend = false;
         bool samples_scene = false; // reads an image of the scene's size (a post pass)
         bool samples_hud_layer = false; // reads the HUD layer (HudLayer())
+        VAddr layer_read = 0;           // the layer candidate it reads (IsLayerCandidate)
+        bool clip_disabled = false;     // screen-space vertices (2D)
     };
+    // bb-hud-layer v2: a full-size 8-bit colour target that received blended 2D draws (no depth
+    // test, no scene read) this frame: the HUD layer may be any of them.
+    [[nodiscard]] bool IsLayerCandidate(VAddr address) const {
+        if (address == 0) return false;
+        for (u32 i = 0; i < num_cand; ++i) {
+            if (cand[i].address == address) return true;
+        }
+        return false;
+    }
     // bb-hud-layer: the target the UI-movie shaders draw into in game (not the scene target):
     // the HUD layer, composited over the scene later by a post pass. 0: none seen.
     [[nodiscard]] VAddr HudLayer() const {
@@ -158,6 +169,14 @@ private:
 
     // bb-hud-layer state (see AfterDraw).
     VAddr hud_layer = 0;
+    struct Candidate {
+        VAddr address = 0;
+        u32 width = 0, height = 0, draws = 0;
+        u64 first_vs = 0;
+    };
+    static constexpr u32 MaxCandidates = 8;
+    std::array<Candidate, MaxCandidates> cand{};
+    u32 num_cand = 0;
     u32 hud_layer_w = 0, hud_layer_h = 0;
     bool layer_pending = false, layer_substituted = false;
     VideoCore::ImageId layer_color{}, layer_depth{}, layer_image{};

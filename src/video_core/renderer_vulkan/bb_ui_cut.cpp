@@ -108,8 +108,8 @@ bool LayerCutEnabled() {
 }
 bool TraceEnabled() {
     static const bool on = [] {
-        const char* v = std::getenv("BB_HUD_TRACE");
-        return v != nullptr && v[0] == '1';
+        const char* v = std::getenv("BB_HUD_TRACE"); // on by default for now; 0 silences
+        return !(v != nullptr && v[0] == '0');
     }();
     return on;
 }
@@ -122,7 +122,7 @@ bool LayerStraightAlpha() {
 }
 // Per second: what the HUD-layer path saw (GPU thread only).
 struct LayerWhy {
-    u64 movie_layer_draws = 0, composites = 0, armed = 0, substituted = 0, not_substituted = 0,
+    u64 movie_layer_draws = 0, candidate_draws = 0, composites = 0, armed = 0, substituted = 0, not_substituted = 0,
         not_ready = 0, pipe_failed = 0, cut_failed = 0, composited = 0;
     VAddr layer = 0;
     u32 layer_w = 0, layer_h = 0;
@@ -134,11 +134,11 @@ struct LayerWhy {
 void FlushLayer() {
     const auto now = std::chrono::steady_clock::now();
     if (now - g_layer.t0 < std::chrono::seconds(1)) return;
-    if (g_layer.movie_layer_draws != 0 || g_layer.composites != 0) BB::Upscale::Checkpoint(fmt::format(
-        "[hud-layer] 1 s: HUD-layer draws {} (layer {:#x} {}x{} {}), composite draws {} (vs {:#x} "
+    BB::Upscale::Checkpoint(fmt::format(
+        "[hud-layer] 1 s: 2D layer draws {} (UI-movie {}; last layer {:#x} {}x{} {}), composite draws {} (vs {:#x} "
         "ps {:#x}), armed {}, layer swapped {} / not found in the draw {}, not ready {}, pipeline "
         "failed {}, cut failed {}, HUD drawn over the upscaled scene {} (BB_HUD_CUT=0 disables)",
-        g_layer.movie_layer_draws, g_layer.layer, g_layer.layer_w, g_layer.layer_h,
+        g_layer.candidate_draws, g_layer.movie_layer_draws, g_layer.layer, g_layer.layer_w, g_layer.layer_h,
         vk::to_string(g_layer.layer_format), g_layer.composites, g_layer.comp_vs, g_layer.comp_ps,
         g_layer.armed, g_layer.substituted, g_layer.not_substituted, g_layer.not_ready,
         g_layer.pipe_failed, g_layer.cut_failed, g_layer.composited));
@@ -277,6 +277,7 @@ void UiCut::OnFrameStart() {
     layer_color = {};
     layer_depth = {};
     layer_image = {};
+    num_cand = 0;
     // [hud-trace] (BB_HUD_TRACE=1): the traced frame's last draws, logged at the next frame start.
     if (trace_frame && trace_total != 0) {
         const u32 n = u32(trace_ring.size());
@@ -386,18 +387,43 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
         const auto& im = texture_cache.GetImage(color);
         const bool scene_target =
             Rgba8(im.info.pixel_format) && RenderTarget(im.info.size.width, im.info.size.height);
-        if (movie_shader && !scene_target && !IsDisplayBuffer(im.info.guest_address)) {
-            hud_layer = im.info.guest_address;
-            hud_layer_w = im.info.size.width;
-            hud_layer_h = im.info.size.height;
-            ++g_layer.movie_layer_draws;
-            g_layer.layer = hud_layer;
+        // v2 (the 2nd log: no UI-movie draw at all in game): any full-size 8-bit target that
+        // gets blended 2D draws (no depth test, no scene read) is a layer candidate; a draw into
+        // the scene target that reads one is the composite.
+        const u32 sw = BB::Upscale::g_scene_w, sh = BB::Upscale::g_scene_h;
+        const auto f = im.info.pixel_format;
+        const bool eight_bit = Rgba8(f) || f == vk::Format::eB8G8R8A8Unorm ||
+                               f == vk::Format::eB8G8R8A8Srgb;
+        const bool full_size = sw != 0 && sh != 0 && im.info.size.width + 8 >= sw &&
+                               im.info.size.height + 8 >= sh;
+        const bool layer_like =
+            (movie_shader || (info.blend && !info.depth_test && !info.samples_scene)) &&
+            eight_bit && full_size;
+        if (layer_like && !scene_target && !IsDisplayBuffer(im.info.guest_address) &&
+            im.info.guest_address != 0) {
+            const VAddr a = im.info.guest_address;
+            u32 i = 0;
+            while (i < num_cand && cand[i].address != a) ++i;
+            if (i == num_cand && num_cand < MaxCandidates) {
+                cand[num_cand++] = {a, im.info.size.width, im.info.size.height, 0, vs_hash};
+            }
+            if (i < num_cand) ++cand[i].draws;
+            if (movie_shader) ++g_layer.movie_layer_draws;
+            ++g_layer.candidate_draws;
+            g_layer.layer = a;
             g_layer.layer_w = im.info.size.width;
             g_layer.layer_h = im.info.size.height;
-            g_layer.layer_format = im.info.pixel_format;
+            g_layer.layer_format = f;
         }
-        if (info.samples_hud_layer && !movie_shader && scene_target && color == ldr_target &&
-            !IsDisplayBuffer(im.info.guest_address)) {
+        if (info.samples_hud_layer && info.layer_read != 0 && !movie_shader && scene_target &&
+            color == ldr_target && !IsDisplayBuffer(im.info.guest_address)) {
+            for (u32 i = 0; i < num_cand; ++i) {
+                if (cand[i].address == info.layer_read) {
+                    hud_layer = cand[i].address;
+                    hud_layer_w = cand[i].width;
+                    hud_layer_h = cand[i].height;
+                }
+            }
             ++g_layer.composites;
             g_layer.comp_vs = vs_hash;
             g_layer.comp_ps = info.ps_hash;
