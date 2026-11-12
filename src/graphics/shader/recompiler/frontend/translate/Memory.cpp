@@ -243,6 +243,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
 			case Decoder::Opcode::DS_WRITE_B16_D16_HI:
+			case Decoder::Opcode::DS_WRITE_B8_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B32:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
@@ -252,6 +253,10 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE2_B64:
 			case Decoder::Opcode::DS_WRITE2ST64_B64:
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
+			case Decoder::Opcode::DS_INC_U32:
+			case Decoder::Opcode::DS_DEC_U32:
+			case Decoder::Opcode::DS_ADD_U64:
+			case Decoder::Opcode::DS_OR_B64: return index == 0u ? decoded.src1 : decoded.src0;
 			default:
 				if (decoded.opcode >= Decoder::Opcode::DS_ADD_U32 &&
 				    decoded.opcode <= Decoder::Opcode::DS_WRXCHG_RTN_B32) {
@@ -567,6 +572,32 @@ bool Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
 	if (returns_value) {
 		WriteOperand(inst.dst, result);
 	}
+	return true;
+}
+
+// DS_ADD_U64 / DS_OR_B64 (no return) as two 32-bit atomics, as the GT7 port does: the low dword,
+// then the high one (with the low add's carry). Exact; only a read between the two could see one
+// half updated.
+bool Translator::DS_ATOMIC64(const Decoder::Instruction& inst, bool add) {
+	auto memory            = MemoryInfoFromDecoded(inst);
+	memory.data_dwords     = 1u;
+	memory.component_count = 1u;
+	const auto address     = ReadU32(MemorySourceAt(inst, 1));
+	const auto data        = MemorySourceAt(inst, 0);
+	const auto low         = ReadU32(OffsetOperand(data, 0));
+	const auto high        = ReadU32(OffsetOperand(data, 1));
+	const auto opcode = add ? IR::ValueOpcode::SharedAtomicIAdd32 : IR::ValueOpcode::SharedAtomicOr32;
+	const auto old_low =
+	    IR::U32(ir.Emit(opcode, {address, low, ir.GetExec()}, AddMemoryInfo(memory, inst.pc)));
+	auto high_value = high;
+	if (add) {
+		const auto carry = ir.Select(ir.ULessThan(ir.IAdd(old_low, low), old_low),
+		                             IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
+		high_value       = ir.IAdd(high, carry);
+	}
+	auto high_memory = memory;
+	high_memory.offset += 4u;
+	ir.Emit(opcode, {address, high_value, ir.GetExec()}, AddMemoryInfo(high_memory, inst.pc));
 	return true;
 }
 
@@ -1084,10 +1115,17 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_WRITE_B8:
 		case Decoder::Opcode::DS_WRITE_B16:
 		case Decoder::Opcode::DS_WRITE_B16_D16_HI:
+		case Decoder::Opcode::DS_WRITE_B8_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B32:
 		case Decoder::Opcode::DS_WRITE_B64:
 		case Decoder::Opcode::DS_WRITE_B96:
 		case Decoder::Opcode::DS_WRITE_B128: return DS_WRITE(inst);
+		case Decoder::Opcode::DS_INC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, false);
+		case Decoder::Opcode::DS_DEC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, false);
+		case Decoder::Opcode::DS_ADD_U64: return DS_ATOMIC64(inst, true);
+		case Decoder::Opcode::DS_OR_B64: return DS_ATOMIC64(inst, false);
 		default: return false;
 	}
 }
