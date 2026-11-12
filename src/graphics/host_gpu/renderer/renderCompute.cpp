@@ -84,6 +84,40 @@ static void SkipDispatchWhileCompiling(uint64_t shader_hash) {
 	}
 }
 
+// gt7-nort-1112, KYTY_NO_RT (on by default; KYTY_NO_RT=0 runs ray tracing as before): the
+// dispatches of compute shaders that intersect rays with a BVH (IMAGE_BVH_INTERSECT_RAY) are not
+// run, and their pipelines are never compiled. Their hit lists stay empty, so the material passes
+// that shade the hits have no lanes to shade and report no call targets: no new table call
+// expansions. The picture is the one of the dispatches skipped while compiling (reflections
+// without ray-traced content). GPU only: nothing reaches the game's memory beyond what the pass
+// would have written, and no save data is touched.
+static bool NoRayTracing() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NO_RT");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Ray tracing: %s (KYTY_NO_RT=%s)\n",
+		     on ? "off, BVH dispatches are not run" : "on", on ? "1, =0 turns it on" : "0");
+		return on;
+	}();
+	return enabled;
+}
+
+static bool SkipRayTracingDispatch(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	if (!program.info.uses_bvh || !NoRayTracing()) {
+		return false;
+	}
+	static std::atomic<uint64_t> skipped {0};
+	const auto                   n = skipped.fetch_add(1, std::memory_order_relaxed);
+	if (n == 0) {
+		LOGF("Ray tracing: first BVH dispatch not run (cs %016" PRIx64 ", KYTY_NO_RT)\n",
+		     program.shader_hash);
+	}
+	if (FrameGraph::Logging()) {
+		FrameGraph::Log("  not run: KYTY_NO_RT leaves out cs %016" PRIx64, program.shader_hash);
+	}
+	return true;
+}
+
 static void LogSkippedDispatch(const HW::ComputeShaderInfo& cs, const char* groups) {
 	static const uint32_t budget = [] {
 		const char* value = std::getenv("KYTY_LOG_SKIPPED_DISPATCHES");
@@ -1652,6 +1686,10 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 		                                             input_info.workgroup_counts[1] *
 		                                             input_info.workgroup_counts[2]);
 	}
+	if (SkipRayTracingDispatch(program)) {
+		ResetBindings();
+		return;
+	}
 	// KYTY_BISECT (bisect.h): a step that leaves out this shader's dispatches.
 	if (Bisect::SkipsShader(program.shader_hash)) {
 		if (FrameGraph::Logging()) {
@@ -2049,6 +2087,10 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 	// Indirect: its thread groups are on the GPU (counted as none).
 	if (GpuPhases::OpStatsOn()) {
 		GpuPhases::SetOpKey(input_info.stage.program->shader_hash, 0);
+	}
+	if (SkipRayTracingDispatch(*input_info.stage.program)) {
+		ResetBindings();
+		return;
 	}
 	// KYTY_BISECT (bisect.h): a step that leaves out this shader's dispatches.
 	if (Bisect::SkipsShader(input_info.stage.program->shader_hash)) {
