@@ -286,10 +286,12 @@ struct TextureCache::OffloadCheck {
 		uint64_t    serial = 0, address = 0, begin = 0, end = 0, offset = 0; // (offset: of the image's first byte, `address`)
 		uint64_t    kind = 0;                                                // (OffloadKind)
 		std::string what;                                                    // (for the log)
+		uint64_t    format = 0;                                              // (OffloadFormat)
 	};
 	struct Result {
 		uint64_t serial = 0, kind = 0;
 		bool     equal = false, known = true; // (known: its guest bytes were there to compare)
+		uint64_t format = 0;                  // (OffloadFormat)
 	};
 	std::unique_ptr<Buffer> buffer, scratch; // (system memory; video memory the images are detiled into first)
 	std::vector<Entry>      entries;
@@ -357,6 +359,28 @@ private:
 	                            static_cast<uint64_t>(info.bgra16 ? 1 : 0)})
 		kind = kind * 0x100000001b3ull ^ value;
 	return kind;
+}
+
+// KYTY_GPU_ONLY_OFFLOAD: what makes two images' downloads the same transformation of their bytes but for their size
+// (format, tiling): a texture check that gave a format's guest bytes back exactly proves a GPU-written image's restore.
+[[maybe_unused]] static uint64_t OffloadFormat(const Image& image) {
+	const auto& info = image.info;
+	return (static_cast<uint64_t>(info.guest_format) * 0x100000001b3ull ^ static_cast<uint64_t>(info.tile_mode)) * 0x100000001b3ull ^
+	       static_cast<uint64_t>(info.bgra16 ? 1 : 0);
+}
+
+// KYTY_GPU_ONLY_OFFLOAD (texture-offload.h): with the texture offload on, the guest bytes of GPU-written images taken too
+// (=1; default: with the low-RAM profile, or while the RAM guard's pressure is critical; =0 never).
+[[maybe_unused]] static bool GpuOnlyOffloadActive() {
+	if (TextureOffload::GetMode() != TextureOffload::Mode::Offload) return false;
+	const int setting = TextureOffload::GpuOnlySetting();
+	if (setting >= 0) return setting != 0;
+	return RamGuard::LowRam() || RamGuard::PressureLevel() >= RamGuard::Critical;
+}
+
+// The images a GPU write made the owner of their bytes (their guest copy is stale or the same).
+[[maybe_unused]] static bool GpuWrittenImage(const Image& image) {
+	return image.IsGpuModified() || image.usage.render_target || image.usage.storage || image.usage.depth_target;
 }
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -4469,6 +4493,14 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 		return false;
 	}
 	const auto range    = image.info.data;
+#if defined(_WIN32)
+	// (KYTY_GPU_ONLY_OFFLOAD: the dropped guest bytes under it back first, as its read of the backing below would fault
+	// for them; here, not inside that read.)
+	if (g_offload_alive.load(std::memory_order_relaxed) && GpuOnlyOffloadActive() && CommandScheduler::ThreadRecorder() == nullptr &&
+	    TextureOffload::Overlaps(range.address, range.size)) {
+		RestoreOffloaded(range.address, range.size, static_cast<uint8_t>(TextureOffload::Touch::Readback));
+	}
+#endif
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	// (Larger than the download buffer, it could not be mapped: not downloaded, and kept by the caller.)
 	if (range.size > download.Size() / 2) {
@@ -4581,6 +4613,8 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		for (const auto& result: check->results) {
 			m_offload_exact[result.serial] = result.equal;
 			if (!result.equal && result.known) m_offload_differ_kinds.insert(result.kind);
+			if (result.equal && result.known) m_offload_good_formats.insert(result.format);
+			if (!result.equal && result.known) m_offload_bad_formats.insert(result.format);
 		}
 		for (const auto& entry: check->entries) m_offload_checking.erase(entry.serial);
 		return true;
@@ -4598,7 +4632,10 @@ void TextureCache::OffloadScan(uint64_t tick) {
 	const auto scan_start = Clock::now();
 	double     ms[8] {}; // images, drain, watch, discard, protect, buffer, record, total
 	const auto since = [](Clock::time_point from) { return std::chrono::duration<double, std::milli>(Clock::now() - from).count(); };
-	constexpr uint64_t MinSize     = uint64_t {256} << 10u;
+	// KYTY_GPU_ONLY_OFFLOAD: GPU-written images taken too; under critical RAM pressure images from 64 KiB.
+	const bool         gpu_only = offload && GpuOnlyOffloadActive();
+	const uint64_t     MinSize  = gpu_only && RamGuard::PressureLevel() >= RamGuard::Critical ? uint64_t {64} << 10u
+	                                                                                         : uint64_t {256} << 10u;
 	constexpr uint64_t MaxSize     = uint64_t {512} << 20u;
 	// (KYTY_TEXTURE_OFFLOAD_CHECK_MB, default 16: the images a scan checks. Their downloads go with the frame's GPU work: 128
 	// MiB a scan made walk frames of 30-55 ms every 2 s, the game waiting for its GPU work behind them.)
@@ -4614,7 +4651,82 @@ void TextureCache::OffloadScan(uint64_t tick) {
 	std::vector<ImageId>                          take;
 	std::vector<std::pair<ImageId, DownloadPlan>> check;
 	uint64_t                                      check_bytes = 0;
+	// KYTY_GPU_ONLY_OFFLOAD: why a GPU-written image's guest bytes cannot go (0: they can). Its restore is the download a
+	// CPU read of a GPU-written image gets anyway, proven for its format by a texture check; none for depth (no download),
+	// linear images (the CPU reads them back), ones a CPU read or a GPU buffer write is pending over, dirty ones.
+	enum GpuBlock : int { GpuOk, GpuDepth, GpuDirty, GpuReadback, GpuUnproven, GpuSmall, GpuUntracked, GpuTooBig, GpuBlocks };
+	const auto gpu_block = [&](ImageId id, const Image& image) -> int {
+		if (image.depth_id || image.usage.depth_target || image.info.tile_mode == Prospero::TileMode::kDepth || image.usage.video_out)
+			return GpuDepth;
+		if (image.IsCpuDirty() || image.IsBufferModified()) return GpuDirty;
+		if (!image.IsTracked() || !image.untracked_holes.empty()) return GpuUntracked;
+		const auto [begin, end] = pages_of(image);
+		if (end <= begin || end - begin < MinSize) return GpuSmall;
+		if (image.backing.image == nullptr || image.info.data.size > MaxSize) return GpuTooBig;
+		if (!image.info.IsTiled() || m_download_images.contains(id) || HasPendingDownload(image.info.data.address, image.info.data.size) ||
+		    m_buffer_cache.HasGpuDirtyBytes(image.info.data.address, image.info.data.size))
+			return GpuReadback;
+		const auto format = OffloadFormat(image);
+		if (m_offload_bad_formats.contains(format) || m_offload_differ_kinds.contains(OffloadKind(image)) ||
+		    (TextureOffload::GpuOnlySetting() != 2 && !m_offload_good_formats.contains(format)))
+			return GpuUnproven;
+		const auto plan = BuildDownload(image);
+		if (!plan.valid || plan.depth_target) return GpuUnproven;
+		return GpuOk;
+	};
+	std::unordered_set<uint64_t> gpu_take; // (serials of `take` the GPU wrote)
+	// (Diagnostics, every 30 s: the guest bytes the GPU caches know of, by what could be dropped from RAM.)
+	static auto breakdown_last = Clock::now() - std::chrono::seconds(20);
+	const bool  breakdown      = Clock::now() - breakdown_last >= std::chrono::seconds(30);
+	if (breakdown) breakdown_last = Clock::now();
+	enum TexState : int { TexOffloaded, TexVerified, TexUnverified, TexWaiting, TexDiffers, TexDirty, TexSmall, TexUntracked,
+		                  TexTooBig, TexTouched, TexStates };
+	uint64_t gpu_bytes[GpuBlocks] {}, gpu_offloaded = 0, gpu_touched = 0, gpu_all = 0, gpu_count = 0;
+	uint64_t tex_bytes[TexStates] {}, tex_all = 0, tex_count = 0, other_all = 0;
+	const auto note = [&](ImageId id, const Image& image) {
+		if (!image.registered) return;
+		const auto [begin, end] = pages_of(image);
+		const uint64_t bytes    = end > begin ? end - begin : 0;
+		const int      status   = bytes != 0 ? TextureOffload::RangeStatus(begin, bytes, image.serial) : 0;
+		if (GpuWrittenImage(image)) {
+			gpu_all += bytes;
+			gpu_count++;
+			if (status == 1) gpu_offloaded += bytes;
+			else if (status == 2) gpu_touched += bytes;
+			else gpu_bytes[gpu_block(id, image)] += bytes;
+			return;
+		}
+		if (!image.usage.texture || image.usage.video_out) {
+			other_all += bytes;
+			return;
+		}
+		tex_all += bytes;
+		tex_count++;
+		int state = TexUnverified;
+		if (status == 1) state = TexOffloaded;
+		else if (status == 2) state = TexTouched;
+		else if (image.depth_id || image.IsCpuDirty() || image.IsBufferModified()) state = TexDirty;
+		else if (!image.IsTracked() || !image.untracked_holes.empty()) state = TexUntracked;
+		else if (bytes < MinSize) state = TexSmall;
+		else if (image.backing.image == nullptr || image.info.data.size > MaxSize) state = TexTooBig;
+		else if (!m_offload_clean.contains(image.serial)) state = TexWaiting;
+		else if (const auto exact = m_offload_exact.find(image.serial); exact != m_offload_exact.end())
+			state = exact->second ? TexVerified : TexDiffers;
+		tex_bytes[state] += bytes;
+	};
 	m_slot_images.ForEach([&](ImageId id, Image& image) {
+		if (breakdown) note(id, image);
+		// (KYTY_GPU_ONLY_OFFLOAD: a GPU-written image the texture filter below refuses anyway, clean at two scans in a row.)
+		if (gpu_only && image.registered && GpuWrittenImage(image)) {
+			if (gpu_block(id, image) != GpuOk) return;
+			const auto [begin, end] = pages_of(image);
+			const auto first        = m_offload_clean.find(image.serial);
+			seen[image.serial]      = first != m_offload_clean.end() ? first->second : tick;
+			if (first == m_offload_clean.end() || TextureOffload::Taken(begin, end - begin, image.serial)) return;
+			gpu_take.insert(image.serial);
+			take.push_back(id);
+			return;
+		}
 		if (!image.registered || image.depth_id || image.IsGpuModified() || image.IsCpuDirty() || image.IsBufferModified() ||
 		    !image.usage.texture || image.usage.storage || image.usage.render_target || image.usage.depth_target ||
 		    image.usage.video_out || !image.IsTracked() || !image.untracked_holes.empty())
@@ -4662,6 +4774,34 @@ void TextureCache::OffloadScan(uint64_t tick) {
 	});
 	m_offload_clean.swap(seen);
 	std::erase_if(m_offload_exact, [&](const auto& item) { return !m_offload_clean.contains(item.first); });
+	if (breakdown) {
+		constexpr double MiB = 1024.0 * 1024.0;
+		uint64_t buffer_total = 0, buffer_gpu = 0, buffer_gpu_full = 0, buffer_cpu = 0, buffer_count = 0;
+		const bool buffers = GuestGpu::IsGpuThread();
+		if (buffers) m_buffer_cache.GuestUseBreakdown(buffer_total, buffer_gpu, buffer_gpu_full, buffer_cpu, buffer_count);
+		std::printf("Guest RAM by GPU cache (30 s, MiB; GPU-only offload %s%s): GPU-written images %.0f in %llu (offloaded %.0f, "
+		            "could drop %.0f, depth %.0f, dirty %.0f, read back/linear %.0f, format unproven %.0f, small %.0f, untracked "
+		            "%.0f, too big %.0f, touched once %.0f); sampled textures %.0f in %llu (offloaded %.0f, verified %.0f, not "
+		            "verified yet %.0f, clean <1 scan %.0f, differs %.0f, dirty %.0f, small %.0f, untracked %.0f, too big %.0f, "
+		            "touched once %.0f); other images %.0f\n",
+		            gpu_only ? "on" : "off", gpu_only && MinSize < (uint64_t {256} << 10u) ? ", from 64 KiB: RAM critical" : "",
+		            gpu_all / MiB, static_cast<unsigned long long>(gpu_count), gpu_offloaded / MiB, gpu_bytes[GpuOk] / MiB,
+		            gpu_bytes[GpuDepth] / MiB, gpu_bytes[GpuDirty] / MiB, gpu_bytes[GpuReadback] / MiB, gpu_bytes[GpuUnproven] / MiB,
+		            gpu_bytes[GpuSmall] / MiB, gpu_bytes[GpuUntracked] / MiB, gpu_bytes[GpuTooBig] / MiB, gpu_touched / MiB,
+		            tex_all / MiB, static_cast<unsigned long long>(tex_count), tex_bytes[TexOffloaded] / MiB,
+		            tex_bytes[TexVerified] / MiB, tex_bytes[TexUnverified] / MiB, tex_bytes[TexWaiting] / MiB,
+		            tex_bytes[TexDiffers] / MiB, tex_bytes[TexDirty] / MiB, tex_bytes[TexSmall] / MiB, tex_bytes[TexUntracked] / MiB,
+		            tex_bytes[TexTooBig] / MiB, tex_bytes[TexTouched] / MiB, other_all / MiB);
+		std::printf("Guest RAM by GPU cache (30 s, MiB): buffers %.0f in %llu%s (a page GPU-written %.0f, all GPU-written %.0f: "
+		            "could drop, not offloaded; a page CPU-written %.0f); could drop now: %.0f (GPU-written images %.0f, verified "
+		            "textures %.0f, GPU-only buffers %.0f); the rest of the guest store committed (RAM line) is the game's own "
+		            "data (images and buffers can overlap)\n",
+		            buffer_total / MiB, static_cast<unsigned long long>(buffer_count), buffers ? "" : " (not on the GPU thread: not counted)",
+		            buffer_gpu / MiB, buffer_gpu_full / MiB, buffer_cpu / MiB,
+		            (gpu_bytes[GpuOk] + tex_bytes[TexVerified] + buffer_gpu_full) / MiB, gpu_bytes[GpuOk] / MiB,
+		            tex_bytes[TexVerified] / MiB, buffer_gpu_full / MiB);
+		std::fflush(stdout);
+	}
 	ms[0] = since(scan_start);
 	const auto report = [&] {
 		ms[7] = since(scan_start);
@@ -4694,7 +4834,7 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		if (offload) AsyncUpload::DrainRange(begin, end - begin);
 		ms[1] += since(mark);
 		TextureOffload::Add(begin, end - begin, pieces, image.serial, (static_cast<uint64_t>(id.generation) << 32u) | id.index,
-		                    offload);
+		                    offload, gpu_take.contains(image.serial));
 		mark = Clock::now();
 		m_page_manager.UpdateReadWatchers<true>(begin, end - begin);
 		ms[2] += since(mark);
@@ -4741,6 +4881,7 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		              info.extent.height, info.extent.depth, info.resources.levels, info.resources.layers,
 		              static_cast<unsigned long long>(info.data.size), info.bgra16 ? 1 : 0);
 		entry->entries.push_back({image.serial, info.data.address, begin, end, offset, OffloadKind(image), what});
+		entry->entries.back().format = OffloadFormat(image);
 		m_offload_checking.insert(image.serial);
 		downloads.emplace_back(&image, std::move(plan));
 		offsets.push_back(offset);
@@ -4789,6 +4930,7 @@ void TextureCache::OffloadScan(uint64_t tick) {
 			bytes += item.end - item.begin;
 			failed += equal || !known ? 0 : 1;
 			raw->results.push_back({item.serial, item.kind, equal, known});
+			raw->results.back().format = item.format;
 		}
 		TextureOffload::NoteCheck(raw->entries.size(), bytes, failed);
 		raw->done.store(true, std::memory_order_release);

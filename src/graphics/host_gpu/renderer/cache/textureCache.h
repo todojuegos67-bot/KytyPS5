@@ -186,6 +186,9 @@ public:
 	std::unordered_map<uint64_t, bool>          m_offload_exact;    // image serial -> its download gave its guest bytes
 	std::unordered_set<uint64_t>                m_offload_checking; // image serials a check downloads
 	std::vector<std::unique_ptr<OffloadCheck>> m_offload_checks;
+	// KYTY_GPU_ONLY_OFFLOAD: formats (guest format, tiling, bgra16) a check proved (or found to differ) the download of.
+	std::unordered_set<uint64_t>                m_offload_good_formats;
+	std::unordered_set<uint64_t>                m_offload_bad_formats;
 	// RunGarbageCollector's line on the PC's memory, when it moved.
 	void LogPcMemory(uint64_t tick);
 	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).

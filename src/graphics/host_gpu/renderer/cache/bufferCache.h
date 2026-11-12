@@ -59,6 +59,10 @@ public:
 	void                   PrintSyncState();
 	// Live "buffers <path>": the cached buffers as a tab-separated table (on the GPU thread).
 	void                   WriteBufferReport(const char* path);
+	// (Diagnostics, KYTY_GPU_ONLY_OFFLOAD's breakdown; the GPU thread) the cached buffers' bytes: all of them, those with a
+	// page the GPU wrote, those the GPU wrote all of, those with a page the CPU wrote; and their count.
+	void                   GuestUseBreakdown(uint64_t& total, uint64_t& gpu_any, uint64_t& gpu_full, uint64_t& cpu_any,
+	                                         uint64_t& count);
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }

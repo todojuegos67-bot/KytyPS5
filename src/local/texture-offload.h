@@ -20,6 +20,14 @@
 // work, a speculation's recorder) is a miss: counted and logged, the bytes it sees zeros, and the render thread restores
 // them after (Drain).
 //
+// KYTY_GPU_ONLY_OFFLOAD=1|0 (default: on with the low-RAM profile, or while the RAM guard's pressure is critical; needs
+// the offload on; =2 also formats no check proved, diagnostics): the guest bytes of GPU-written images too (render
+// targets, storage images; not depth, linear ones, ones dirty, read back or under GPU buffer writes), clean at two scans
+// in a row and of a format (guest format + tiling) a texture check proved the download of. Their guest copy is stale or
+// the same: a touch gets the image's bytes as a CPU read back of it would. Under critical pressure images from 64 KiB.
+// Logged: "GPU-only offload: ..." (ranges, MiB, restores and their time), and every 30 s "Guest RAM by GPU cache" (what
+// the GPU caches know of the guest bytes: what could be dropped and why the rest cannot).
+//
 // Read watchers go at once after a touch by game code (a guest thread holds no lock of the emulator's) or a host write or
 // unmap (normal context); after one by the emulator's own code the fault handler only gives the pages a protection that
 // lets the access through, and the render thread removes them (Drain).
@@ -86,6 +94,7 @@ enum class Touch : uint8_t {
 	Unmap,
 	Upload,
 	ImageGone,
+	Readback, // (KYTY_GPU_ONLY_OFFLOAD: a GPU-written image's download to guest memory over it, TryDownloadImage)
 	Count
 };
 
@@ -100,7 +109,8 @@ inline const char* TouchName(Touch touch) {
 	                              "host write over all",
 	                              "unmap",
 	                              "image upload over it",
-	                              "image gone"};
+	                              "image gone",
+	                              "GPU result written back"};
 	return names[static_cast<int>(touch)];
 }
 
@@ -118,6 +128,7 @@ struct Range {
 	bool                                  missed    = false; // (discarded and touched by a thread that could not wait)
 	bool                                  restoring = false; // (its restore runs: other touches wait for its end)
 	std::thread::id                       restorer {};       // (the thread restoring it; none: the offload worker)
+	bool                                  gpu       = false; // (KYTY_GPU_ONLY_OFFLOAD: a GPU-written image's range)
 };
 
 // Set by the texture cache: the page manager's read watchers of a guest range removed; a restore of the discarded ranges
@@ -143,6 +154,9 @@ struct State {
 	uint64_t ages[4] {}; // <1 s, <10 s, <60 s, later
 	uint64_t restores = 0, restore_bytes = 0, restore_us = 0, restore_us_max = 0, lost = 0, missed = 0, missed_bytes = 0;
 	uint64_t checked = 0, checked_bytes = 0, check_failed = 0;
+	// KYTY_GPU_ONLY_OFFLOAD: the GPU-written images' ranges (render targets, storage images) among the above.
+	uint64_t gpu_now = 0, gpu_peak = 0, gpu_total = 0, gpu_ranges_total = 0, gpu_restores = 0, gpu_restore_bytes = 0;
+	uint64_t gpu_restore_us = 0, gpu_restore_us_max = 0;
 	// Ranges being restored (any thread), and buffer uploads that waited for an asynchronous restore (WaitBeforeRead).
 	std::atomic<uint64_t> restoring_ranges {0}, read_waits {0}, read_wait_bytes {0};
 	std::unordered_map<uint64_t, uint64_t> rips;    // the emulator's instructions -> touches
@@ -181,7 +195,8 @@ inline uint64_t CallerOf(const void* native_context) {
 
 // A guest range [vaddr, vaddr + size) taken, with its backing pieces and image (texture cache, render thread; the
 // caller protects, and discards, after).
-inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64_t serial, uint64_t image, bool discarded) {
+inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64_t serial, uint64_t image, bool discarded,
+                bool gpu = false) {
 	auto&           state = Get();
 	std::lock_guard lock(state.mutex);
 	Range           range;
@@ -191,6 +206,7 @@ inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64
 	range.image     = image;
 	range.since     = std::chrono::steady_clock::now();
 	range.discarded = discarded;
+	range.gpu       = gpu;
 	for (const auto& piece: range.pieces) {
 		state.backing[piece.backing] = vaddr;
 		if (piece.backing < state.backing_lo.load(std::memory_order_relaxed)) state.backing_lo.store(piece.backing, std::memory_order_relaxed);
@@ -204,6 +220,23 @@ inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64
 	state.peak = std::max(state.peak, state.now);
 	state.total += size;
 	state.ranges_total++;
+	if (gpu) {
+		state.gpu_now += size;
+		state.gpu_peak = std::max(state.gpu_peak, state.gpu_now);
+		state.gpu_total += size;
+		state.gpu_ranges_total++;
+	}
+}
+
+// (Diagnostics, KYTY_GPU_ONLY_OFFLOAD's breakdown) 1: a range over [vaddr, vaddr + size) is taken now; 2: the image was
+// touched once (not taken again); 0: neither.
+[[nodiscard]] inline int RangeStatus(uint64_t vaddr, uint64_t size, uint64_t serial) {
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	auto            it = state.guest.upper_bound(vaddr);
+	if (it != state.guest.begin() && std::prev(it)->second.guest_end > vaddr) return 1;
+	if (it != state.guest.end() && it->first < vaddr + size) return 1;
+	return state.touched_serials.count(serial) != 0 ? 2 : 0;
 }
 
 #if defined(_WIN32)
@@ -305,6 +338,7 @@ inline void CountLocked(State& state, std::map<uint64_t, Range>::iterator it, To
 	if (caller != 0) state.callers[caller]++;
 	state.touched_serials.insert(range.serial);
 	state.now -= std::min(state.now, size);
+	if (range.gpu) state.gpu_now -= std::min(state.gpu_now, size);
 }
 
 // (state.mutex held) The touch of range `it`: counted, its views given a protection that lets accesses through (the
@@ -375,9 +409,15 @@ inline std::vector<Restoring> BeginRestore(uint64_t vaddr, uint64_t size, Touch 
 inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uint64_t us, uint64_t lost) {
 	auto&           state = Get();
 	std::lock_guard lock(state.mutex);
+	bool            gpu = false;
 	for (const auto& restored: ranges) {
 		auto range = state.guest.find(restored.begin);
 		if (range == state.guest.end()) continue;
+		if (range->second.gpu) {
+			gpu = true;
+			state.gpu_restores++;
+			state.gpu_restore_bytes += range->second.guest_end - restored.begin;
+		}
 		if (range->second.restoring) state.restoring_ranges.fetch_sub(1, std::memory_order_acq_rel);
 		for (const auto& piece: range->second.pieces) state.backing.erase(piece.backing);
 		state.guest.erase(range);
@@ -388,6 +428,21 @@ inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uin
 	state.restore_us += us;
 	state.restore_us_max = std::max(state.restore_us_max, us);
 	state.lost += lost;
+	if (gpu) {
+		state.gpu_restore_us += us;
+		state.gpu_restore_us_max = std::max(state.gpu_restore_us_max, us);
+	}
+}
+
+// KYTY_GPU_ONLY_OFFLOAD=1|0|2 (-1: unset; the texture cache turns it on with the low-RAM profile or critical RAM
+// pressure; 2: also images whose format no texture check proved: diagnostics).
+inline int GpuOnlySetting() {
+	static const int setting = [] {
+		const char* value = std::getenv("KYTY_GPU_ONLY_OFFLOAD");
+		if (value == nullptr || value[0] == '\0') return -1;
+		return value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
+	}();
+	return setting;
 }
 
 inline void NoteCheck(uint64_t images, uint64_t bytes, uint64_t failed) {
@@ -600,6 +655,13 @@ inline void Report(bool force) {
 		            state.restore_bytes / MiB, state.restore_us / 1000.0, state.restore_us_max / 1000.0,
 		            static_cast<unsigned long long>(state.lost), static_cast<unsigned long long>(state.missed), state.missed_bytes / MiB,
 		            static_cast<unsigned long long>(state.read_waits.load()), state.read_wait_bytes.load() / MiB);
+		if (state.gpu_ranges_total != 0) {
+			std::printf("GPU-only offload: %.0f MiB of GPU-written images out of RAM now (peak %.0f, %llu ranges / %.0f MiB ever); "
+			            "restored on a touch %llu ranges (%.0f MiB, %.1f ms, at most %.1f ms)\n",
+			            state.gpu_now / MiB, state.gpu_peak / MiB, static_cast<unsigned long long>(state.gpu_ranges_total),
+			            state.gpu_total / MiB, static_cast<unsigned long long>(state.gpu_restores), state.gpu_restore_bytes / MiB,
+			            state.gpu_restore_us / 1000.0, state.gpu_restore_us_max / 1000.0);
+		}
 	}
 #if defined(_WIN32)
 	const auto exe  = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));

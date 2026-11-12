@@ -1735,6 +1735,23 @@ void BufferCache::WriteBufferReport(const char* path) {
 	});
 }
 
+void BufferCache::GuestUseBreakdown(uint64_t& total, uint64_t& gpu_any, uint64_t& gpu_full, uint64_t& cpu_any,
+                                    uint64_t& count) {
+	total = gpu_any = gpu_full = cpu_any = count = 0;
+	m_slot_buffers.ForEach([&](BufferId /*id*/, const Buffer& buffer) {
+		if (buffer.is_deleted || buffer.CpuAddress() == 0) return;
+		const uint64_t address = buffer.CpuAddress(), size = buffer.Size();
+		if (size == 0) return;
+		count++;
+		total += size;
+		if (m_memory_tracker.IsRegionGpuModified(address, size)) {
+			gpu_any += size;
+			if (m_memory_tracker.IsRegionFullyGpuModified(address, size)) gpu_full += size;
+		}
+		if (m_memory_tracker.IsRegionCpuModified(address, size)) cpu_any += size;
+	});
+}
+
 void BufferCache::PrintSyncState() {
 	auto&    master = m_scheduler.GetMasterSemaphore();
 	uint64_t gpu    = 0;
