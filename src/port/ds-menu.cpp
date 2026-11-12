@@ -3611,8 +3611,7 @@ void LauncherPerformance(Settings& s) {
 		Tip("Para probar en este PC cómo iría el juego en equipos más modestos. Se aplican al iniciar el juego. Apágalas para jugar normal.");
 		RowEnd(y, 30);
 	}
-	LCheckRow("Simular 16 GB RAM", s.simulate_ram16,
-	          "El juego se comporta como en un PC de 16 GB de RAM: limita la memoria que puede usar y activa el perfil de 16 GB.");
+	// (11-12) "Simular 16 GB RAM" removed too (the owner).
 	// (11-12) "Simular grafica de 8 GB" removed (the owner: black textures with it).
 	BoxEnd();
 }

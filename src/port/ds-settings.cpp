@@ -274,6 +274,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("antilag_modo", s->antilag_mode);
 	str("antilag_dlssg", s->antilag_dlssg);
 	boo("simular_ram_16gb", s->simulate_ram16);
+	s->simulate_ram16 = false; // (11-12) option removed: always off
 	boo("rt_reflejos", s->rt_reflections);
 	boo("rt_sombras_sol", s->rt_sun);
 	boo("rt_niebla", s->rt_fog);
