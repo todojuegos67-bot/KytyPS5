@@ -37,7 +37,7 @@ namespace Libs::Graphics::FrameGen {
 namespace {
 
 constexpr uint32_t Bindings   = 15;
-constexpr uint32_t StatsCount = 16;
+constexpr uint32_t StatsCount = 20;
 
 struct Push {
 	float   size[4];
@@ -60,6 +60,8 @@ struct {
 	vk::Sampler             point = nullptr, linear = nullptr;
 	bool                    failed = false;
 	Img                     lay[2], pmv, dummy; // dummy: 1x1 RG16F, binding 7 outside the compose
+	Img                     show;               // (11-12) KYTY_FG_PARTICLE_NATIVE_SHOW: the game colour + the vectors drawn (full res)
+	bool                    reset_max = false;  // (11-12) stats 15 (the max vector length) zeroed at the next measure
 	vk::Extent2D            full {}, half {};
 	bool                    ready = false, history_valid = false;
 	bool                    measured = false; // this frame's pmv is valid for the compose
@@ -169,6 +171,19 @@ float EnvFloat(const char* name, float fallback, float lo, float hi) {
 	return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
 }
 
+// (11-12) KYTY_FG_PARTICLE_NATIVE_SHOW=1 (native only): the real frames show the native vectors (hue = direction,
+// brightness = length) where pmv has one and a faint magenta tint on the rest of the particle coverage.
+bool ParticleNativeShow() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FG_PARTICLE_NATIVE_SHOW");
+		const bool  v     = value != nullptr && *value == '1';
+		std::printf("FG particle native: KYTY_FG_PARTICLE_NATIVE_SHOW=%d\n", v ? 1 : 0);
+		std::fflush(stdout);
+		return v;
+	}();
+	return on;
+}
+
 void Barrier(vk::CommandBuffer command, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
              vk::AccessFlags2 dst) {
 	vk::MemoryBarrier2 barrier {};
@@ -208,7 +223,7 @@ bool MakeImage(GraphicContext& graphics, vk::Extent2D extent, Img& img, vk::Form
 	create.arrayLayers   = 1;
 	create.samples       = VK_SAMPLE_COUNT_1_BIT;
 	create.tiling        = VK_IMAGE_TILING_OPTIMAL;
-	create.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	create.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	create.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
 	create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	VmaAllocationCreateInfo allocate {};
@@ -322,12 +337,15 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D full) {
 	if (g_pm.pmv.image != VK_NULL_HANDLE) graphics.device.waitIdle(); // (a resolution change: rare)
 	Img* all[] {&g_pm.lay[0], &g_pm.lay[1], &g_pm.pmv};
 	for (Img* img: all) Destroy(graphics, *img);
+	Destroy(graphics, g_pm.show);
 	if (g_pm.dummy.image == VK_NULL_HANDLE && !MakeImage(graphics, vk::Extent2D {1, 1}, g_pm.dummy, vk::Format::eR16G16Sfloat)) return false;
 	g_pm.ready = false, g_pm.history_valid = false, g_pm.measured = false;
 	g_pm.full = full;
 	g_pm.half = vk::Extent2D {(full.width + 1) / 2, (full.height + 1) / 2};
 	for (Img* img: all)
 		if (!MakeImage(graphics, g_pm.half, *img)) return false;
+	// (11-12) The SHOW view's image (optional: without it nothing is drawn).
+	if (ParticleNativeShow() && !MakeImage(graphics, g_pm.full, g_pm.show)) Destroy(graphics, g_pm.show);
 	return true;
 }
 
@@ -401,6 +419,7 @@ void Dispatch(vk::CommandBuffer command, Push& push, int mode, const vk::Descrip
 
 
 void NativeLog(GraphicContext& graphics);
+float NativeMaxPx();
 // After the frame's measure: this frame's view-projection becomes the next one's previous; the draws and the ring reset.
 void NativeEndFrame(GraphicContext& graphics) {
 	for (NKey& key: g_pn.keys)
@@ -449,6 +468,14 @@ void NativeLog(GraphicContext& graphics) {
 	            "discarded as recycled: emitter changed %u, moved too far %u\n",
 	            static_cast<unsigned long long>(g_pn.draws_native - std::min(g_pn.draws_native, g_pn.prev_other + g_pn.prev_none)),
 	            static_cast<unsigned long long>(g_pn.prev_other), static_cast<unsigned long long>(g_pn.prev_none), d[12], d[13]);
+	// (11-12) The written vectors' length (render px; stats 14 = sum x 4, 15 = max x 4 since the last line, 16 > 32 px,
+	// 17 discarded > KYTY_FG_PARTICLE_NATIVE_MAX_PX). Next test: with the floor smear, a large max / many > 32 px means wrong
+	// vectors (the MAX_PX cap should then remove the smear); small lengths with the smear still there mean the coverage
+	// (where they are written: SHOW=1 shows it), not the length, is wrong.
+	std::printf("FG particle native: vector length avg %.1f px, max %.1f px, > 32 px %u, discarded > %.0f px %u (SHOW %d)\n",
+	            d[5] > 0 ? d[14] / 4.0 / d[5] : 0.0, cur[15] / 4.0, d[16], static_cast<double>(NativeMaxPx()), d[17],
+	            ParticleNativeShow() ? 1 : 0);
+	g_pm.reset_max = true;
 	std::fflush(stdout);
 	g_pm.sum_ms = 0.0, g_pm.max_ms = 0.0, g_pm.samples = 0;
 	g_pn.why[0] = g_pn.why[1] = g_pn.why[2] = g_pn.why[3] = 0;
@@ -465,6 +492,11 @@ struct NParams {
 static_assert(sizeof(NParams) == 192);
 
 // This frame's captured draws into pmv (cleared first). False: none ran.
+float NativeMaxPx() {
+	static const float v = EnvFloat("KYTY_FG_PARTICLE_NATIVE_MAX_PX", 48.0f, 1.0f, 4096.0f);
+	return v;
+}
+
 bool NativeRun(GraphicContext& graphics, vk::CommandBuffer command, Push& push, vk::DescriptorImageInfo (&infos)[8]) {
 	if (g_pn.draws.empty() || g_pn.params.mapped == nullptr) return false;
 	static const float max_step = EnvFloat("KYTY_FG_PARTICLE_NATIVE_MAX_STEP", 3.0f, 0.01f, 1000.0f);
@@ -488,7 +520,7 @@ bool NativeRun(GraphicContext& graphics, vk::CommandBuffer command, Push& push, 
 		prm.sorti[3] = nd.prev_valid ? (nd.prev_buf != VK_NULL_HANDLE ? nd.prev_count : key.prev_count) : 0;
 		prm.reci[0] = key.stride, prm.reci[1] = key.count, prm.reci[2] = nd.prev_valid ? 1u : 0u, prm.reci[3] = nd.emit_stride;
 		prm.argi[0] = nd.indirect ? 1u : 0u, prm.argi[1] = nd.instances, prm.argi[2] = nd.emit_count, prm.argi[3] = nd.first_word;
-		prm.parf[0] = max_step, prm.parf[1] = max_quad, prm.parf[2] = g_pn.y_down ? 1.0f : 0.0f;
+		prm.parf[0] = max_step, prm.parf[1] = max_quad, prm.parf[2] = g_pn.y_down ? 1.0f : 0.0f, prm.parf[3] = NativeMaxPx();
 		std::memcpy(static_cast<uint8_t*>(g_pn.params.mapped) + slot * slot_size, &prm, sizeof(prm));
 		vmaFlushAllocation(graphics.allocator, g_pn.params.memory, slot * slot_size, sizeof(prm));
 		const VkBuffer prev = nd.prev_buf != VK_NULL_HANDLE ? nd.prev_buf : key.buf[key.cur ^ 1].buffer != VK_NULL_HANDLE ? key.buf[key.cur ^ 1].buffer : key.buf[key.cur].buffer;
@@ -722,7 +754,7 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 	}
 }
 
-bool ParticleMvMeasure(vk::CommandBuffer command, const UpscaleInputs& inputs, const UpscaleImage& game) {
+bool ParticleMvMeasure(vk::CommandBuffer command, UpscaleInputs& inputs, const UpscaleImage& game) {
 	g_pm.measured = false;
 	if (!ParticleMvWanted()) return false;
 	GraphicContext* graphics = inputs.graphics;
@@ -784,13 +816,19 @@ bool ParticleMvMeasure(vk::CommandBuffer command, const UpscaleInputs& inputs, c
 	        vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite);
 	if (!g_pm.ready) {
-		for (Img* img: {&g_pm.lay[0], &g_pm.lay[1], &g_pm.pmv, &g_pm.dummy})
-			Layout(command, vk::Image(img->image), vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral);
+		for (Img* img: {&g_pm.lay[0], &g_pm.lay[1], &g_pm.pmv, &g_pm.dummy, &g_pm.show})
+			if (img->image != VK_NULL_HANDLE) Layout(command, vk::Image(img->image), vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral);
 		g_pm.ready = true, g_pm.history_valid = false;
 	}
 	if (!g_pm.cleared) {
 		g_pm.cleared = true;
 		command.fillBuffer(vk::Buffer(g_pm.stats_buf), 0, VK_WHOLE_SIZE, 0);
+		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	}
+	if (g_pm.reset_max) {
+		g_pm.reset_max = false;
+		command.fillBuffer(vk::Buffer(g_pm.stats_buf), 15 * 4, 4, 0);
 		Barrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 		        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	}
@@ -815,11 +853,32 @@ bool ParticleMvMeasure(vk::CommandBuffer command, const UpscaleInputs& inputs, c
 		infos[2] = {g_pm.point, g_pm.lay[cur].view, gen};
 		infos[6] = {nullptr, g_pm.pmv.view, gen};
 		infos[5] = {g_pm.point, g_pm.lay[prev].view, gen};
-		if (NativeRun(*graphics, command, push, infos)) {
+		const bool native_ran = NativeRun(*graphics, command, push, infos);
+		if (native_ran) {
 			infos[5] = {g_pm.point, g_pm.pmv.view, gen};
 			infos[6] = {nullptr, g_pm.lay[prev].view, gen};
 			Dispatch(command, push, 4, infos, g_pm.half);
 			g_pm.measured = true;
+		}
+		// (11-12) KYTY_FG_PARTICLE_NATIVE_SHOW: the colour from here on (the real frames, and FG's input) becomes our copy
+		// with the vectors drawn (mode 5: reads inputs.color, lay[cur], pmv; writes show). Never the game's own image.
+		const UpscaleImage& color = inputs.color;
+		if (ParticleNativeShow() && g_pm.show.image != VK_NULL_HANDLE && color.view != nullptr && color.extent == extent &&
+		    color.image != vk::Image(g_pm.show.image)) {
+			infos[0] = {g_pm.point, color.view, color.layout};
+			infos[2] = {g_pm.point, g_pm.lay[cur].view, gen};
+			infos[5] = {g_pm.point, g_pm.pmv.view, gen};
+			infos[6] = {nullptr, g_pm.show.view, gen};
+			push.par[1] = native_ran ? 1.0f : 0.0f; // (pmv is this frame's only when the native pass ran)
+			Dispatch(command, push, 5, infos, g_pm.full);
+			inputs.color.image  = vk::Image(g_pm.show.image);
+			inputs.color.view   = g_pm.show.view;
+			inputs.color.layout = gen;
+			inputs.color.format = vk::Format::eR16G16B16A16Sfloat;
+			inputs.color.usage  = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc |
+			                     vk::ImageUsageFlagBits::eTransferDst;
+			inputs.color.level = 0;
+			inputs.color.layer = 0;
 		}
 	} else if (g_pm.history_valid) {
 		infos[2] = {g_pm.point, g_pm.lay[cur].view, gen};

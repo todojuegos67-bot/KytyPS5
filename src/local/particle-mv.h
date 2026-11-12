@@ -11,8 +11,9 @@ namespace Libs::Graphics::FrameGen {
 
 [[nodiscard]] bool ParticleMvWanted();
 // In Upscale (after SmokeApply): `game` is the game's own colour after the particles. Measures this frame's particle
-// vectors (kept until the next call). Changes nothing in `inputs`. False: nothing measured (the composite then skips).
-bool ParticleMvMeasure(vk::CommandBuffer command, const UpscaleInputs& inputs, const UpscaleImage& game);
+// vectors (kept until the next call). Changes nothing in `inputs` (except SHOW, below). False: nothing measured (the composite then skips).
+// (11-12) Changes inputs.color only with KYTY_FG_PARTICLE_NATIVE_SHOW=1 (a debug view: the vectors drawn on a copy).
+bool ParticleMvMeasure(vk::CommandBuffer command, UpscaleInputs& inputs, const UpscaleImage& game);
 // At the guest flip, right after frame generation's motion copy (frame-gen.cpp): the vectors measured this frame mixed
 // into that copy, in place. `motion` must have been made with storage usage (R16G16_SFLOAT). False: nothing done.
 bool ParticleMvCompose(vk::CommandBuffer command, GraphicContext& graphics, VulkanImage& motion, vk::ImageView view);
