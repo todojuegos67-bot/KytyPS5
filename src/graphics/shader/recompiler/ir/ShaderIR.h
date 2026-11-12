@@ -14,6 +14,7 @@
 
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <deque>
 #include <list>
 #include <memory>
@@ -382,6 +383,31 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 		return ImageResourceClass::Storage;
 	}
 	return ImageResourceClass::None;
+}
+
+// KYTY_FASTDRAW_IMAGESET=1 (gt7-fastdraw-1112, off by default): the images and samplers of a
+// shader's own descriptors are declared in descriptor set ImageSetDescriptorSet instead of set 0
+// (set 1 is the bindless table, BindlessBindings.h), and the pipeline layouts follow
+// (shaders.cpp). The switch is named here, in the recompiler's sources, so the shader disk cache's
+// session key records its value (shader_cache_version.cmake): translations of either mode are
+// never mixed. The driver's pipeline cache keys pipelines by their SPIR-V and layout already.
+inline constexpr uint32_t ImageSetDescriptorSet = 2;
+[[nodiscard]] inline bool FastDrawImageSet() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FASTDRAW_IMAGESET");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// A binding that goes to set ImageSetDescriptorSet in that mode: images (sampled or storage) and
+// samplers.
+[[nodiscard]] constexpr bool ImageSetBindingKind(DescriptorBindingKind kind) {
+	return kind == DescriptorBindingKind::Samplers ||
+	       ImageBindingResourceClass(kind) != ImageResourceClass::None;
+}
+// The descriptor set of a shader's own binding of `kind`.
+[[nodiscard]] inline uint32_t NativeDescriptorSet(DescriptorBindingKind kind) {
+	return FastDrawImageSet() && ImageSetBindingKind(kind) ? ImageSetDescriptorSet : 0u;
 }
 
 [[nodiscard]] constexpr uint32_t ImageBindingIndex(DescriptorBindingKind kind) {
