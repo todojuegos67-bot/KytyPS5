@@ -1311,13 +1311,13 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		// (11-12) the user's second screenshot: Texturas Medio, Distancia Maximo, Sombras Medio, Detalle Normal, x16,
 		// extra sharp, Reflejos / Desvanecimiento Normal, AA Alto; motion blur off, DoF / bloom / vignette / eye adaptation on.
 		s->texture_reduce    = "1";
-		s->quality           = "standard";
+		s->quality           = "high"; // (11-12) third screenshot: Distancia Alto, Detalle Alto, Desvanecimiento Alto
 		s->shadows           = "medio";
-		s->detail            = "normal";
+		s->detail            = "alto";
 		s->af16              = true;
 		s->texture_sharpness = "2";
 		s->aa_sharp          = "alto";
-		s->object_fade       = "normal";
+		s->object_fade       = "alto";
 		s->reflections       = "normal";
 		s->motion_blur = false;
 		s->dof = s->bloom = s->vignette = s->eye_adapt = true;
