@@ -248,10 +248,19 @@ void NoteImageViewCreated(vk::ImageView view) {
 	registry.views.erase(static_cast<VkImageView>(view));
 }
 
+namespace {
+std::atomic<uint64_t> g_image_view_destroy_generation {0};
+} // namespace
+
+uint64_t ImageViewDestroyGeneration() {
+	return g_image_view_destroy_generation.load(std::memory_order_acquire);
+}
+
 void NoteImageViewDestroyed(vk::ImageView view, uint64_t guest_address, vk::Format format) {
 	if (view == nullptr) {
 		return;
 	}
+	g_image_view_destroy_generation.fetch_add(1, std::memory_order_acq_rel);
 	const auto       key      = static_cast<VkImageView>(view);
 	auto&            registry = GetDeadViews();
 	std::unique_lock lock(registry.mutex);

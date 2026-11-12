@@ -87,6 +87,10 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics);
 // handle is live again.
 void NoteImageViewCreated(vk::ImageView view);
 void NoteImageViewDestroyed(vk::ImageView view, uint64_t guest_address, vk::Format format);
+// KYTY_FASTDRAW_IMAGESET (gt7-fastdraw-1112): how many image views NoteImageViewDestroyed was told of
+// so far (any thread). A descriptor set written while it had a value names live views only while
+// it keeps that value (the image set memo, descriptors.cpp).
+[[nodiscard]] uint64_t ImageViewDestroyGeneration();
 [[nodiscard]] bool DiagnosticViewIsLive(vk::ImageView view);
 void               ScrubDeadRenderingViews(const vk::RenderingInfo& info, const char* where);
 // Storage image descriptors only.
