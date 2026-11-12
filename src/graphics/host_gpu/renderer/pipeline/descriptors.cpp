@@ -30,6 +30,7 @@
 #include "graphics/host_gpu/renderer/image/imageDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -41,6 +42,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -48,6 +50,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
@@ -4061,6 +4064,179 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// KYTY_FASTDRAW_IMAGESET's image set memo (gt7-fastdraw-1112; KYTY_FASTDRAW_IMAGESET_MEMO=0 turns
+// it off, every set is then a fresh DescriptorHeap set as in b1). A set 2 is keyed by its whole
+// content as this draw's normal path resolved it: the layout, and for every write its binding,
+// type, count and each element's sampler, view and image layout. A set found with that content is
+// bound as it is (no vkUpdateDescriptorSets); a new content gets a set of the memo's own pool,
+// written once on the GPU thread and never again. The textures, image views and layout
+// transitions are still resolved every draw by the normal path (PrepareBindings, RebindImages),
+// so the content is checked in full at each use: a set is only ever bound for what it already
+// holds. The memo is dropped whole (its pool retired, destroyed once the GPU passed its last use)
+// when any image view or image set layout was destroyed since it was made (a handle can come
+// back for another object) or its pool is full. Sets with storage images are left to the heap
+// (their views are scrubbed at recording, ScrubDeadDescriptorViews).
+static bool ImageSetMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FASTDRAW_IMAGESET_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+namespace {
+
+struct ImageSetMemo {
+	static constexpr uint32_t MaxSets = 4096;
+	struct Entry {
+		std::vector<uint64_t> content;
+		vk::DescriptorSet     set = nullptr;
+	};
+	vk::DescriptorPool                                  pool              = nullptr;
+	uint32_t                                            used              = 0;
+	uint64_t                                            view_generation   = 0;
+	uint64_t                                            layout_generation = 0;
+	std::unordered_map<uint64_t, Entry>                 entries;
+	std::deque<std::pair<vk::DescriptorPool, uint64_t>> retired;
+	std::vector<uint64_t>                               content;
+};
+
+// Per thread (the GPU thread draws and dispatches); never freed: it may outlive the device at exit.
+ImageSetMemo& GetImageSetMemo() {
+	thread_local auto* memo = new ImageSetMemo;
+	return *memo;
+}
+
+template <typename Handle>
+uint64_t HandleBits(Handle handle) {
+	static_assert(sizeof(Handle) <= sizeof(uint64_t));
+	uint64_t bits = 0;
+	std::memcpy(&bits, &handle, sizeof(Handle));
+	return bits;
+}
+
+void RetireImageSetMemo(GraphicContext& graphics, MasterSemaphore& master, ImageSetMemo& memo) {
+	if (memo.pool != nullptr) {
+		memo.retired.emplace_back(memo.pool, master.CurrentTick());
+		memo.pool = nullptr;
+	}
+	memo.entries.clear();
+	memo.used = 0;
+	while (!memo.retired.empty() && master.IsFree(memo.retired.front().second)) {
+		graphics.device.destroyDescriptorPool(memo.retired.front().first, nullptr);
+		memo.retired.pop_front();
+	}
+}
+
+bool CreateImageSetPool(GraphicContext& graphics, ImageSetMemo& memo) {
+	constexpr std::array sizes = {
+	    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, ImageSetMemo::MaxSets * 16u},
+	    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, ImageSetMemo::MaxSets * 4u},
+	};
+	vk::DescriptorPoolCreateInfo create {};
+	create.maxSets       = ImageSetMemo::MaxSets;
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
+	vk::DescriptorPool pool = nullptr;
+	if (graphics.device.createDescriptorPool(&create, nullptr, &pool) != vk::Result::eSuccess) {
+		return false;
+	}
+	memo.pool = pool;
+	memo.used = 0;
+	return true;
+}
+
+// The memo's set for these writes (already scrubbed), or null for the heap's. `write_now`: the
+// set is new and must be written (the caller writes it before binding it).
+vk::DescriptorSet LookUpImageSet(GraphicContext& graphics, MasterSemaphore& master,
+                                 vk::DescriptorSetLayout                layout,
+                                 std::span<const vk::WriteDescriptorSet> writes, bool& write_now) {
+	using GpuPhases::Phase;
+	write_now  = false;
+	auto& memo = GetImageSetMemo();
+	// Dropped whole once a view or a layout it may name is gone.
+	const auto views   = ImageViewDestroyGeneration();
+	const auto layouts = ImageSetLayoutGeneration();
+	if (views != memo.view_generation || layouts != memo.layout_generation) {
+		if (memo.pool != nullptr || !memo.entries.empty()) {
+			GpuPhases::Count(views != memo.view_generation ? Phase::ImageSetRetireViews
+			                                               : Phase::ImageSetRetireLayouts,
+			                 1);
+		}
+		RetireImageSetMemo(graphics, master, memo);
+		memo.view_generation   = views;
+		memo.layout_generation = layouts;
+	}
+	auto& content = memo.content;
+	content.clear();
+	content.push_back(HandleBits(static_cast<VkDescriptorSetLayout>(layout)));
+	for (const auto& write: writes) {
+		if (write.descriptorType != vk::DescriptorType::eSampledImage &&
+		    write.descriptorType != vk::DescriptorType::eSampler) {
+			GpuPhases::Count(Phase::ImageSetMissStorage, 1);
+			return nullptr;
+		}
+		if (write.pImageInfo == nullptr || write.pNext != nullptr) {
+			GpuPhases::Count(Phase::ImageSetMissStorage, 1);
+			return nullptr;
+		}
+		content.push_back(static_cast<uint64_t>(write.dstBinding) |
+		                  (static_cast<uint64_t>(static_cast<uint32_t>(write.descriptorType)) << 32u));
+		content.push_back(static_cast<uint64_t>(write.dstArrayElement) |
+		                  (static_cast<uint64_t>(write.descriptorCount) << 32u));
+		for (uint32_t k = 0; k < write.descriptorCount; k++) {
+			const auto& info = write.pImageInfo[k];
+			content.push_back(HandleBits(static_cast<VkSampler>(info.sampler)));
+			content.push_back(HandleBits(static_cast<VkImageView>(info.imageView)));
+			content.push_back(static_cast<uint64_t>(static_cast<uint32_t>(info.imageLayout)));
+		}
+	}
+	const auto hash = static_cast<uint64_t>(
+	    XXH3_64bits(content.data(), content.size() * sizeof(uint64_t)));
+	if (const auto found = memo.entries.find(hash); found != memo.entries.end()) {
+		if (found->second.content == content) {
+			GpuPhases::Count(Phase::ImageSetHit, 1);
+			return found->second.set;
+		}
+		GpuPhases::Count(Phase::ImageSetMissCollision, 1);
+		return nullptr;
+	}
+	GpuPhases::Count(Phase::ImageSetMissNew, 1);
+	if (memo.pool != nullptr && memo.used >= ImageSetMemo::MaxSets) {
+		GpuPhases::Count(Phase::ImageSetRetireFull, 1);
+		RetireImageSetMemo(graphics, master, memo);
+	}
+	vk::DescriptorSet set = nullptr;
+	for (int attempt = 0; attempt < 2 && set == nullptr; attempt++) {
+		if (memo.pool == nullptr && !CreateImageSetPool(graphics, memo)) {
+			break;
+		}
+		vk::DescriptorSetAllocateInfo allocate {};
+		allocate.descriptorPool     = memo.pool;
+		allocate.descriptorSetCount = 1;
+		allocate.pSetLayouts        = &layout;
+		vk::DescriptorSet made      = nullptr;
+		if (graphics.device.allocateDescriptorSets(&allocate, &made) == vk::Result::eSuccess) {
+			set = made;
+		} else if (attempt == 0) {
+			// Out of pool memory (or fragmented): a fresh pool, once.
+			GpuPhases::Count(Phase::ImageSetRetireFull, 1);
+			RetireImageSetMemo(graphics, master, memo);
+		}
+	}
+	if (set == nullptr) {
+		GpuPhases::Count(Phase::ImageSetMissPool, 1);
+		return nullptr;
+	}
+	memo.used++;
+	memo.entries.emplace(hash, ImageSetMemo::Entry {content, set});
+	GpuPhases::Count(Phase::ImageSetWritten, 1);
+	write_now = true;
+	return set;
+}
+
+} // namespace
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -4492,14 +4668,39 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		ScrubDeadDescriptorViews(image_set_writes.data(),
 		                         static_cast<uint32_t>(image_set_writes.size()),
 		                         "a draw's image set");
-		const auto set = m_context.GetDescriptorHeap().Commit(pipeline.image_set_layout);
-		for (auto& write: image_set_writes) {
-			write.dstSet = set;
+		bool              write_now = false;
+		vk::DescriptorSet memo_set  = nullptr;
+		if (ImageSetMemoEnabled()) {
+			memo_set = LookUpImageSet(m_context.GetGraphics(),
+			                          m_context.GetCommandScheduler().GetMasterSemaphore(),
+			                          pipeline.image_set_layout,
+			                          std::span<const vk::WriteDescriptorSet> {image_set_writes},
+			                          write_now);
 		}
-		vk_buffer.updateAndBindDescriptorSet(
-		    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
-		    static_cast<uint32_t>(image_set_writes.size()), image_set_writes.data(),
-		    ShaderRecompiler::IR::ImageSetDescriptorSet);
+		if (memo_set != nullptr) {
+			if (write_now) {
+				// Written here, on the GPU thread, before any command that binds it is recorded:
+				// the set is new, no command buffer uses it yet.
+				for (auto& write: image_set_writes) {
+					write.dstSet = memo_set;
+				}
+				m_context.GetGraphics().device.updateDescriptorSets(
+				    static_cast<uint32_t>(image_set_writes.size()), image_set_writes.data(), 0,
+				    nullptr);
+			}
+			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+			                             ShaderRecompiler::IR::ImageSetDescriptorSet, 1, &memo_set,
+			                             0, nullptr);
+		} else {
+			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.image_set_layout);
+			for (auto& write: image_set_writes) {
+				write.dstSet = set;
+			}
+			vk_buffer.updateAndBindDescriptorSet(
+			    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
+			    static_cast<uint32_t>(image_set_writes.size()), image_set_writes.data(),
+			    ShaderRecompiler::IR::ImageSetDescriptorSet);
+		}
 	}
 	if (pipeline.uses_bindless) {
 		const auto set = m_context.GetGraphics().bindless_set;

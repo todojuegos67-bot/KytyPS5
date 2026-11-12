@@ -429,6 +429,18 @@ void ReportIfDue(uint64_t frames) {
 		line += fmt::format(" (target memo {} hits, {} misses)", count(Phase::TargetMemoHit),
 		                    count(Phase::TargetMemoMiss));
 	}
+	if (count(Phase::ImageSetHit) + count(Phase::ImageSetMissNew) +
+	        count(Phase::ImageSetMissCollision) + count(Phase::ImageSetMissStorage) +
+	        count(Phase::ImageSetMissPool) !=
+	    0) {
+		line += fmt::format(" (image sets {} hits, {} written; misses: {} new, {} collision, {} "
+		                    "storage, {} pool; dropped: {} views, {} layouts, {} full)",
+		                    count(Phase::ImageSetHit), count(Phase::ImageSetWritten),
+		                    count(Phase::ImageSetMissNew), count(Phase::ImageSetMissCollision),
+		                    count(Phase::ImageSetMissStorage), count(Phase::ImageSetMissPool),
+		                    count(Phase::ImageSetRetireViews), count(Phase::ImageSetRetireLayouts),
+		                    count(Phase::ImageSetRetireFull));
+	}
 	if (count(Phase::DepthMemoHit) + count(Phase::DepthMemoMiss) != 0) {
 		line += fmt::format(" (depth memo {} hits, {} misses)", count(Phase::DepthMemoHit),
 		                    count(Phase::DepthMemoMiss));

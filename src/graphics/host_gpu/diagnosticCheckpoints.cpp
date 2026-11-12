@@ -250,7 +250,16 @@ void NoteImageViewCreated(vk::ImageView view) {
 
 namespace {
 std::atomic<uint64_t> g_image_view_destroy_generation {0};
+std::atomic<uint64_t> g_image_set_layout_generation {0};
 } // namespace
+
+void NoteImageSetLayoutDestroyed() {
+	g_image_set_layout_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+uint64_t ImageSetLayoutGeneration() {
+	return g_image_set_layout_generation.load(std::memory_order_acquire);
+}
 
 uint64_t ImageViewDestroyGeneration() {
 	return g_image_view_destroy_generation.load(std::memory_order_acquire);

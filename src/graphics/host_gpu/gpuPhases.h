@@ -108,6 +108,16 @@ enum class Phase : uint32_t {
 	// gt7-fastdraw-1112 (KYTY_FASTDRAW_STATE): ResolveRenderDepthTarget's memo.
 	DepthMemoHit,  // (a count only) a depth target description the memo gave
 	DepthMemoMiss, // (a count only) one made again
+	// gt7-fastdraw-1112 (KYTY_FASTDRAW_IMAGESET): CommitBindings' image set memo (counts only).
+	ImageSetHit,           // a set found with the same content: bound, not written
+	ImageSetWritten,       // a set allocated from the memo's pool and written
+	ImageSetMissNew,       // a content not in the memo (written: ImageSetWritten)
+	ImageSetMissCollision, // another content under the same hash: the heap's set, not kept
+	ImageSetMissStorage,   // storage images in the set: the heap's set, not kept
+	ImageSetMissPool,      // the pool could not give a set: the heap's set
+	ImageSetRetireViews,   // the memo dropped: an image view was destroyed
+	ImageSetRetireLayouts, // the memo dropped: an image set layout was destroyed
+	ImageSetRetireFull,    // the memo dropped: its pool was full
 	Count
 };
 

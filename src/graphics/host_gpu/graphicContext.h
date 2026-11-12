@@ -91,6 +91,10 @@ void NoteImageViewDestroyed(vk::ImageView view, uint64_t guest_address, vk::Form
 // so far (any thread). A descriptor set written while it had a value names live views only while
 // it keeps that value (the image set memo, descriptors.cpp).
 [[nodiscard]] uint64_t ImageViewDestroyGeneration();
+// The same for the pipelines' image set layouts (PipelineCache::Pipeline::image_set_layout): a
+// layout handle may be made again for another layout once destroyed.
+void                   NoteImageSetLayoutDestroyed();
+[[nodiscard]] uint64_t ImageSetLayoutGeneration();
 [[nodiscard]] bool DiagnosticViewIsLive(vk::ImageView view);
 void               ScrubDeadRenderingViews(const vk::RenderingInfo& info, const char* where);
 // Storage image descriptors only.
