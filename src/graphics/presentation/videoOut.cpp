@@ -1543,6 +1543,37 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
 	attribute->dcc_control                 = dcc_control;
 }
 
+// Gran Turismo 7 imports (from the GT7 port): an extra attribute option, a flip master (a
+// single output here: accepted), VRR pegging and WQHD detection (fixed refresh: accepted).
+KYTY_SYSV_ABI void VideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* attribute,
+                                                   uint64_t                  option) {
+	PRINT_NAME();
+	EXIT_IF(attribute == nullptr);
+	attribute->option |= option;
+}
+
+KYTY_SYSV_ABI int VideoOutSetFlipMaster(int slave_handle, int master_handle) {
+	PRINT_NAME();
+	LOGF("\t slave_handle = %d, master_handle = %d\n", slave_handle, master_handle);
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
+	return DriverState().IsOpened(handle) ? OK : VIDEO_OUT_ERROR_INVALID_HANDLE;
+}
+
+KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2) {
+	PRINT_NAME();
+	LOGF("\t handle = %d, arg1 = 0x%016" PRIx64 ", arg2 = 0x%016" PRIx64 "\n", handle, arg1, arg2);
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle) {
+	PRINT_NAME();
+	LOGF("\t handle = %d\n", handle);
+	return OK;
+}
+
 KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
 
