@@ -493,7 +493,7 @@ static_assert(sizeof(NParams) == 192);
 
 // This frame's captured draws into pmv (cleared first). False: none ran.
 float NativeMaxPx() {
-	static const float v = EnvFloat("KYTY_FG_PARTICLE_NATIVE_MAX_PX", 48.0f, 1.0f, 4096.0f);
+	static const float v = EnvFloat("KYTY_FG_PARTICLE_NATIVE_MAX_PX", 24.0f, 1.0f, 4096.0f);
 	return v;
 }
 
