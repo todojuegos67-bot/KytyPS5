@@ -79,6 +79,7 @@ struct MaskPatch {
 struct State {
 	std::array<std::pair<uint64_t, uint64_t>, 256> hashes {}; // shader address -> hash (direct mapped)
 	uint64_t icon_frame = 0;              // `frame` + 1 of the frame the icon was last drawn in
+	uint64_t markers_frame = 0;           // `frame` + 1 of the frame the enemy-bar snapshot was last asked in
 	uint64_t frame      = 0;              // the guest flips the GPU thread's command stream has reached (NoteFlip)
 	std::array<MaskPatch, 32> patches {};  // (by address, round robin)
 	uint32_t                  next_patch = 0;
