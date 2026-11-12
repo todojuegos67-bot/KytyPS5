@@ -1363,6 +1363,14 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 	} else {
 		max();
 	}
+	// (11-12) IBL and tessellation: Extremo at Alto + Completa; every other mode at the PS5 performance mode (mitad + medio).
+	if (preset == "extremo") {
+		s->ibl  = "completa";
+		s->tess = "alto";
+	} else {
+		s->ibl  = "mitad";
+		s->tess = "medio";
+	}
 	// (10-28, the emulator launcher's rule) Every mode / preset: every RT effect No (Reflejos RT, Luz RT, Luz volumetrica,
 	// Oclusion ambiental, Luz de antorchas RT, Destellos de lente, Sombras RT and the hardware rows); enabled by hand after.
 	RtAllOff(s);
