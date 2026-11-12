@@ -188,6 +188,7 @@ private:
     vk::Pipeline layer_pipe{};
     bool trace_frame = false;
     std::vector<std::string> trace_ring;
+    std::vector<std::string> trace_head;
     u32 trace_next = 0, trace_total = 0;
     bool ui_phase = false, display_redirect = false, done_this_frame = false;
     bool ui_read_barrier = false, hudless_taken = false;

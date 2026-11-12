@@ -1159,6 +1159,24 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
     if (cb_descs[0].image_id) {
         bb_cut.OnColorTarget(cb_descs[0].image_id);
     }
+    // [hud-trace]: the registers behind the bound targets (a draw with no bound colour target
+    // shows why: no colour buffer, target mask 0, colour disabled), for every draw.
+    std::string raw;
+    if (bb_cut.Tracing()) {
+        const auto& key = pipeline->GetGraphicsKey();
+        raw = fmt::format(
+            " [mrt {:#x} cb0 {:#x} mask {:#x} mode {} display {} db {:#x} stencil {} vp {:.0f}x{:.0f}]",
+            key.mrt_mask, regs.color_buffers[0] ? VAddr(regs.color_buffers[0].Address()) : VAddr(0),
+            regs.color_target_mask.GetMask(0), u32(regs.color_control.mode), display ? 1 : 0,
+            regs.depth_buffer.DepthValid() ? VAddr(regs.depth_buffer.DepthAddress()) : VAddr(0),
+            regs.depth_control.stencil_enable ? 1 : 0, regs.viewports[0].xscale * 2,
+            regs.viewports[0].yscale * 2);
+        if (std::popcount(key.mrt_mask) != 1) {
+            bb_cut.TraceDraw(fmt::format(
+                "vs {:#x} (not single-target){}",
+                pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, raw));
+        }
+    }
     if (std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = regs.viewports[0];
         // bb-gpu6: what the HUD-start rule needs of the draw: does it read a scene-size image
@@ -1202,11 +1220,11 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
                                      vk::to_string(im.info.pixel_format));
             }
             bb_cut.TraceDraw(fmt::format(
-                "{}vs {:#x} ps {:#x} -> {}{}{}{}{} reads:{}", bb_cut.UiPhase() ? "[UI] " : "",
+                "{}vs {:#x} ps {:#x} -> {}{}{}{}{} reads:{}{}", bb_cut.UiPhase() ? "[UI] " : "",
                 info.vs_hash, info.ps_hash, target, info.depth_test ? " depth" : "",
                 info.blend ? " blend" : "", info.clip_disabled ? " 2d" : "",
                 UiComposition::MovieShader(info.vs_hash) ? " movie" : "",
-                reads.empty() ? " none" : reads));
+                reads.empty() ? " none" : reads, raw));
         }
         bb_cut.OnDraw(info, cb_descs[0].image_id, db_desc.image_id,
                       UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2),

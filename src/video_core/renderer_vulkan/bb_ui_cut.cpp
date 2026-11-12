@@ -280,17 +280,28 @@ void UiCut::OnFrameStart() {
     num_cand = 0;
     // [hud-trace] (BB_HUD_TRACE=1): the traced frame's last draws, logged at the next frame start.
     if (trace_frame && trace_total != 0) {
+        // The first TraceHead draws of the frame (the display pass and what follows it), then the
+        // last draws (from the scene's end to the next display pass), without repeating any.
         const u32 n = u32(trace_ring.size());
-        std::string text = fmt::format("[hud-trace] last {} of {} draws of one frame (oldest "
-                                       "first):",
-                                       std::min(trace_total, n), trace_total);
+        std::string text = fmt::format("[hud-trace] {} draws of one frame; first {}:",
+                                       trace_total, u32(trace_head.size()));
+        for (const auto& line : trace_head) {
+            text += "\n  ";
+            text += line;
+        }
+        const u32 tail = std::min(trace_total, n);
         const u32 start = trace_total > n ? trace_next : 0;
-        for (u32 i = 0; i < std::min(trace_total, n); ++i) {
+        u32 shown = 0;
+        for (u32 i = 0; i < tail; ++i) {
+            const u32 index = trace_total - tail + i; // the draw's number in the frame
+            if (index < u32(trace_head.size())) continue;
+            if (shown++ == 0) text += fmt::format("\n  ... last draws from #{}:", index);
             text += "\n  ";
             text += trace_ring[(start + i) % n];
         }
         BB::Upscale::Checkpoint(text);
     }
+    trace_head.clear();
     trace_frame = false;
     trace_total = 0;
     trace_next = 0;
@@ -305,7 +316,8 @@ void UiCut::OnFrameStart() {
     if (now - t_seq >= std::chrono::seconds(1)) {
         t_seq = now;
         seq_frame = 1;
-        trace_frame = TraceEnabled();
+        static u32 trace_seconds = 0;
+        trace_frame = TraceEnabled() && (trace_seconds++ % 2) == 0; // one frame every 2 s
     } else {
         seq_frame = 0;
     }
@@ -1295,12 +1307,14 @@ bool UiCut::CompositeLayer(VideoCore::ImageId layer_id) {
 
 void UiCut::TraceDraw(std::string&& line) {
     if (!trace_frame) return;
+    constexpr u32 TraceHead = 48;
+    if (trace_total < TraceHead) trace_head.push_back(fmt::format("#{} {}", trace_total, line));
     constexpr u32 Keep = 64;
     if (trace_ring.size() != Keep) {
         trace_ring.assign(Keep, std::string{});
         trace_next = 0;
     }
-    trace_ring[trace_next] = std::move(line);
+    trace_ring[trace_next] = fmt::format("#{} {}", trace_total, line);
     trace_next = (trace_next + 1) % Keep;
     ++trace_total;
 }
