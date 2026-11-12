@@ -466,6 +466,11 @@ private:
 	std::vector<vk::Pipeline> m_quick_retired;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// gt7-cache-pipe-1112, KYTY_PIPECACHE_V2=1 (off by default): the key of the last draw whose
+	// pipeline was found, and that pipeline. Entries of m_graphics_pipelines are never erased
+	// before the cache is destroyed, so the pointer stays valid. GPU thread only.
+	GraphicsPipelineKey m_last_graphics_key {};
+	Pipeline*           m_last_graphics_pipeline = nullptr;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	// Round 97: by shader hash, its last expansion whose compute pipeline is ready (the program id
 	// and the expanded code), run while a newer one compiles (GetComputeProgram); and the newer

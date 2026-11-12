@@ -75,6 +75,17 @@
 
 namespace Libs::Graphics {
 
+// gt7-cache-pipe-1112, KYTY_PIPECACHE_V2=1 turns on the lookup changes of this round: the pipeline
+// of the last found draw key is reused without hashing it again, and a shader key is not hashed
+// against the unsupported set while that set is empty. Off (unset or anything but 1): as before.
+static bool PipeCacheV2() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PIPECACHE_V2");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 bool ShaderFailureNonFatal() {
 	static const bool value = true;
 	return value;
@@ -3063,7 +3074,8 @@ struct PipelineCache::ProgramCache {
 				                      lookup_key.function_code);
 			}
 		}
-		if (unsupported.contains(lookup_key)) {
+		// gt7-cache-pipe-1112 (KYTY_PIPECACHE_V2): an empty set holds no key, so the hash is skipped.
+		if ((!PipeCacheV2() || !unsupported.empty()) && unsupported.contains(lookup_key)) {
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
 			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
 			                                StageLabel(stage), params.hash);
@@ -6904,8 +6916,20 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		return nullptr;
 	};
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		auto& found = *iter->second;
+	// gt7-cache-pipe-1112 (KYTY_PIPECACHE_V2): the same key as the last found draw is the same
+	// map entry, so the hash and the bucket probe are skipped for it.
+	Pipeline* known = nullptr;
+	if (PipeCacheV2() && m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+		known = m_last_graphics_pipeline;
+	} else if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		known = iter->second.get();
+		if (PipeCacheV2()) {
+			m_last_graphics_key      = key;
+			m_last_graphics_pipeline = known;
+		}
+	}
+	if (known != nullptr) {
+		auto& found = *known;
 		if (found.pending && !FinishPending(found)) {
 			if (defer == PipelineDefer::Allowed) {
 				return skip_draw(*found.pending);
