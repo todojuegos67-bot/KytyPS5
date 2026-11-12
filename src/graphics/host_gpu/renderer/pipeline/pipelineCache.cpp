@@ -3278,7 +3278,20 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint8_t> cached_source;
 		std::vector<uint8_t> permutation_key;
 		std::vector<uint8_t> cached_permutation;
-		if (disk != nullptr) {
+		// A translation finished on the workers was looked up (and missed) when it was queued: a
+		// second lookup only reads (or fails to open) the same file again and counts a second miss.
+		// KYTY_SHADER_DISK_ONCE=0 looks again. The keys are still built (the result is saved under
+		// them below).
+		static const bool disk_once = [] {
+			const char* v = std::getenv("KYTY_SHADER_DISK_ONCE");
+			return v == nullptr || v[0] != '0';
+		}();
+		const bool translated_on_worker =
+		    disk_once && entry == programs.end() && !translating.empty() &&
+		    translating.contains(lookup_key);
+		if (disk != nullptr && translated_on_worker) {
+			BuildSourceKey(source_key, compile_code, params, options, input_info);
+		} else if (disk != nullptr) {
 			GpuPhases::Scope disk_phase(GpuPhases::Phase::ShaderDisk);
 			Profiler::Phases disk_zone;
 			disk_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
@@ -3308,6 +3321,23 @@ struct PipelineCache::ProgramCache {
 				CountDiskLookup();
 				if (!loaded) {
 					disk->counters.source_misses++;
+					// KYTY_SHADER_MISS_LOG=<n> (64 by default, 0: none): the first misses named, to
+					// tell what a precompile did not cover (only on a miss: nothing per draw).
+					static const uint32_t miss_log = [] {
+						const char* v = std::getenv("KYTY_SHADER_MISS_LOG");
+						return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10))
+						                    : 64u;
+					}();
+					static std::atomic<uint32_t> misses_logged {0};
+					if (misses_logged.load(std::memory_order_relaxed) < miss_log &&
+					    misses_logged.fetch_add(1, std::memory_order_relaxed) < miss_log) {
+						PipelineCacheLog("Shader disk cache miss: {} 0x{:016x}, {} words{}{}, key "
+						                 "{:016x}",
+						                 stage_name, params.hash, compile_code.size(),
+						                 lookup_key.function_code.empty() ? "" : " (expanded)",
+						                 read_async ? "" : " (read here)",
+						                 XXH3_64bits(source_key.data(), source_key.size()));
+					}
 				} else if (disk_verify) {
 					disk->counters.source_hits++;
 					cached_source = std::move(payload);
@@ -4963,6 +4993,16 @@ uint64_t PipelineCache::SeedFormat() {
 	return XXH3_64bits(sizes, sizeof(sizes));
 }
 
+// KYTY_SEED_VERTEX_DEFAULTS=0: the precompile keeps the cleared mesh fields of non-mesh vertex
+// seeds (the keys before this fix).
+static bool SeedVertexDefaults() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SEED_VERTEX_DEFAULTS");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
 void PipelineCache::PrecompileSeeds() {
 	using Seed    = ProgramCache::SeedProgram;
 	using Outcome = ProgramCache::SeedOutcome;
@@ -5036,6 +5076,16 @@ void PipelineCache::PrecompileSeeds() {
 		switch (seed.kind) {
 			case 0: {
 				auto& info = seed.vertex;
+				if (info.logical_stage != ShaderType::Mesh && SeedVertexDefaults()) {
+					// SeedInfo cleared these for every vertex-like stage, but the game leaves a
+					// non-mesh stage's at their defaults (only GetGraphicsPrograms' mesh branch sets
+					// them), and the disk cache keys them (AppendInputKey): without this, every
+					// VS/LS/HS/DS/ES the precompile translated was saved under a key the game never
+					// asks for (gt7-20261112-040749: 12,275 source misses after a precompile).
+					const ShaderMeshInputInfo defaults {};
+					info.mesh.host_subgroup_size = defaults.host_subgroup_size;
+					info.mesh.passes             = defaults.passes;
+				}
 				if (info.logical_stage == ShaderType::Mesh) {
 					if (!m_graphics.mesh_shader_enabled) break;
 					auto&      mesh     = info.mesh;
