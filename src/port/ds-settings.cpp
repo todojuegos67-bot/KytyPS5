@@ -449,7 +449,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Con la frame generation de NVIDIA: reflex (recomendado), normal o ultra (el nuestro, con Reflex apagado)\n"
 	  << "antilag_dlssg=" << s.antilag_dlssg << "\n\n"
 	  << "[Graficos]\n"
-	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 30 reales x2 AMD, FSR Calidad, texturas y sombras medio);\n"
+	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 40 reales x2 AMD, ligero + 40 reales x3 AMD, FSR Calidad, texturas y sombras medio);\n"
 	  << "; equilibrado (45 reales x2 AMD, texturas, distancia y sombras alto); ultra (RTX 5060-5070 Ti, RX 9070);\n"
 	  << "; extremo (RTX 5080 / 5090: todo al maximo). Los FPS dependen de tu GPU y tu CPU.\n"
 	  << "; Ligero, equilibrado y low mandan sobre frame_generation (AMD x2 fija; el reescalado DLSS si se puede usar).\n"
