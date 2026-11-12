@@ -639,13 +639,20 @@ thread_local bool g_native_suppressed = false;
 
 SrtNativeStats g_native_stats;
 bool           g_native_report = false;
+// KYTY_SPECULATE (gt7-spec-1112): ProgramCache::Get asks for the report on every program get
+// (~130,000 a second in a GT7 race); a relaxed flag spares it the mutex while there is none.
+std::atomic<bool> g_native_report_pending {false};
 // The stage-preparation helper (pipelineCache.cpp) walks plans of its own concurrently.
 std::mutex     g_native_stats_mutex;
 
 } // namespace
 
 bool TakeSrtNativeReport(SrtNativeStats& stats) {
+	if (!g_native_report_pending.load(std::memory_order_relaxed)) {
+		return false;
+	}
 	std::lock_guard lock(g_native_stats_mutex);
+	g_native_report_pending.store(false, std::memory_order_relaxed);
 	if (!g_native_report) {
 		return false;
 	}
@@ -679,6 +686,7 @@ void SrtWalker::BindNative() {
 		const auto total = stats.plans + stats.failed;
 		if ((total & (total - 1u)) == 0u) {
 			g_native_report = true;
+			g_native_report_pending.store(true, std::memory_order_relaxed);
 		}
 		if (program.native_code == nullptr) {
 			return;

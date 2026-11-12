@@ -184,6 +184,30 @@ public:
 	// IsModified without the lock (mainline #1284), for the GPU thread, which owns the GPU-dirty
 	// bits and clears CPU-dirty bits. Other threads only set CPU-dirty bits, under the lock and
 	// before the page becomes writable, so a clean answer cannot miss a write already made.
+	// gt7-caches-1112 (KYTY_SYNC_SKIP): whether every page of the range is GPU-dirty, from the
+	// published bits without the lock. Exact on the GPU thread, which alone changes GPU-dirty bits;
+	// a GPU-dirty page can be neither CPU-dirty (ChangeState refuses it) nor hot (MarkHot).
+	[[nodiscard]] bool IsAllGpuDirtyUnlocked(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		if (end <= start) {
+			return false;
+		}
+		const auto first = start / 64;
+		const auto last  = (end - 1) / 64;
+		for (auto word = first; word <= last; word++) {
+			auto mask = ~uint64_t {0};
+			if (word == first) {
+				mask &= ~uint64_t {0} << (start % 64);
+			}
+			if (word == last && end % 64 != 0) {
+				mask &= (uint64_t {1} << (end % 64)) - 1;
+			}
+			if ((m_gpu_words[word].load(std::memory_order_acquire) & mask) != mask) {
+				return false;
+			}
+		}
+		return true;
+	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModifiedUnlocked(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);

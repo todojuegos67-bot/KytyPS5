@@ -107,6 +107,26 @@ bool MemoryTracker::IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noe
 	return true;
 }
 
+bool MemoryTracker::IsRangeAllGpuDirtyHint(uint64_t vaddr, uint64_t size) const noexcept {
+	if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+		return false;
+	}
+	const uint64_t end = vaddr + size;
+	for (uint64_t address = vaddr; address < end;) {
+		const uint64_t index        = address / TRACKER_REGION_SIZE;
+		const uint64_t region_begin = index * TRACKER_REGION_SIZE;
+		const uint64_t region_end   = region_begin + TRACKER_REGION_SIZE;
+		const uint64_t piece_end    = end < region_end ? end : region_end;
+		const auto*    manager      = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr || !manager->MaybeModified<DirtySource::Gpu>() ||
+		    !manager->IsAllGpuDirtyUnlocked(address - region_begin, piece_end - address)) {
+			return false;
+		}
+		address = piece_end;
+	}
+	return true;
+}
+
 MemoryTracker::~MemoryTracker() = default;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG

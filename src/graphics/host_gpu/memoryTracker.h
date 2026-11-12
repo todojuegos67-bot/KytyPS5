@@ -57,6 +57,10 @@ public:
 	// InvalidateRegion).
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// gt7-caches-1112 (KYTY_SYNC_SKIP), GPU thread: whether every page of the range is GPU-dirty
+	// (its regions all exist). A written sync of such a range uploads nothing and changes no bit
+	// nor protection, so BufferCache::SynchronizeBuffer may skip it.
+	[[nodiscard]] bool IsRangeAllGpuDirtyHint(uint64_t vaddr, uint64_t size) const noexcept;
 	// A CPU write fault's release of [vaddr, vaddr + size) at once: each tracker region of it is
 	// marked CPU-dirty (and writable) in the same lock hold that finds no GPU-written page there.
 	// False when one holds GPU-written pages: that region is left as it was.
