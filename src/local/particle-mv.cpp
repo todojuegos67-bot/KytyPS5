@@ -117,6 +117,7 @@ struct {
 	uint64_t             alignment = 256;
 	// log (every second)
 	uint64_t draws_seen = 0, draws_native = 0, draws_skipped = 0, frames = 0;
+	uint64_t why[4] = {};
 	uint64_t hits_down = 0, hits_up = 0;
 	bool     y_down = true;
 	std::array<uint32_t, StatsCount> stat_last {};
@@ -434,8 +435,13 @@ void NativeLog(GraphicContext& graphics) {
 	            d[11] > 0 ? 100.0 * d[7] / d[11] : 0.0, d[7], d[11], g_pn.y_down ? "down" : "up",
 	            static_cast<unsigned long long>(g_pn.hits_down), static_cast<unsigned long long>(g_pn.hits_up),
 	            g_pm.samples > 0 ? g_pm.sum_ms / g_pm.samples : 0.0, g_pm.max_ms);
+	if (g_pn.draws_skipped > 0)
+		std::printf("FG particle native: skipped: %llu no record buffer, %llu no sort buffer, %llu layout, %llu indirect args\n",
+		            static_cast<unsigned long long>(g_pn.why[0]), static_cast<unsigned long long>(g_pn.why[1]),
+		            static_cast<unsigned long long>(g_pn.why[2]), static_cast<unsigned long long>(g_pn.why[3]));
 	std::fflush(stdout);
 	g_pm.sum_ms = 0.0, g_pm.max_ms = 0.0, g_pm.samples = 0;
+	g_pn.why[0] = g_pn.why[1] = g_pn.why[2] = g_pn.why[3] = 0;
 	g_pn.frames = 0, g_pn.draws_seen = 0, g_pn.draws_native = 0, g_pn.draws_skipped = 0;
 }
 
@@ -557,6 +563,11 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 	const uint64_t sort_size = std::min<uint64_t>(d.sort.size, uint64_t {d.sort_count} * d.sort_stride);
 	const uint64_t emit_size = d.emit.buffer != nullptr ? std::min<uint64_t>(d.emit.size, uint64_t {d.emit_count} * d.emit_stride) : 0;
 	const uint64_t args_size = d.indirect ? std::min<uint64_t>(d.args.size, 64) : 0;
+	// (11-12) Why a draw is skipped (the 1 s line): 0 no record buffer, 1 no sort buffer, 2 layout, 3 indirect args.
+	if (d.rec.buffer == nullptr) ++g_pn.why[0];
+	else if (d.sort.buffer == nullptr) ++g_pn.why[1];
+	else if (d.indirect && args_size < 8) ++g_pn.why[3];
+	else if (d.rec_stride < 32 || (d.rec_stride & 3u) != 0 || d.sort_stride < 8 || d.rec.size > NRecMax) ++g_pn.why[2];
 	if (g_pn.failed || g_pn.draws.size() >= NDrawsMax || d.rec.buffer == nullptr || d.sort.buffer == nullptr || d.rec_stride < 32 ||
 	    (d.rec_stride & 3u) != 0 || d.sort_stride < 8 || (d.sort_stride & 3u) != 0 || d.rec.size == 0 || d.rec.size > NRecMax ||
 	    sort_size == 0 || (d.indirect && args_size < 8) || (d.emit_stride & 3u) != 0) {

@@ -24,6 +24,7 @@
 #if defined(_WIN32)
 // (11-10) Before SDL.h (its SDL_system.h only declares ID3D11Device): the launcher fog (ds-fog.inc) uses the full types.
 #include <d3d11.h>
+#include <psapi.h>
 #include <d3dcompiler.h>
 #undef interface
 #undef small
@@ -5261,9 +5262,11 @@ void Sample(LogState& L,
 		ms.dwLength = sizeof(ms);
 		if (GlobalMemoryStatusEx(&ms)) {
 			const double gb = 1024.0 * 1024.0 * 1024.0;
-			const uint64_t rb = g_rt.launched.simulate_ram16 ? RamGuard::RamBallast() : 0;
-			const uint64_t in_use = ms.ullTotalPhys - ms.ullAvailPhys;
-			const double used = static_cast<double>(in_use > rb ? in_use - rb : 0) / gb;
+			// (11-12) Simular 16 GB RAM: as the RAM guard counts it (the emulator's working set + 4 GB for Windows), not the
+			// bigger PC's whole use.
+			PROCESS_MEMORY_COUNTERS pmc {};
+			const double ws = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) != 0 ? static_cast<double>(pmc.WorkingSetSize) / gb : 0.0;
+			const double used = g_rt.launched.simulate_ram16 ? ws + 4.0 : static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / gb;
 			// (11-12) Simular 16 GB RAM: the overlay shows the simulated PC's 16 GB.
 			const double total = g_rt.launched.simulate_ram16 ? 16.0 : static_cast<double>(ms.ullTotalPhys) / gb;
 			rows.push_back({"RAM", Fmt("%.1f / %.0f GB", used, total), UseColor(used, total)});

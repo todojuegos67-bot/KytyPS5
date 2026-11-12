@@ -1924,7 +1924,13 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					FrameGen::ParticleNativeSrc src;
 					if (address == 0 || size == 0) return src;
 					// Only a buffer already registered over the range (the draw's own): nothing created or merged here.
-					const auto id = cache.RegisteredBuffer(address, size);
+					auto id = cache.RegisteredBuffer(address, size);
+					// (11-12) The game allocates the full V# range but registers (uses) less of it: the largest registered
+					// prefix, halving down to 4 KiB (the rest of the records lie past what was ever written).
+					for (uint64_t part = size / 2; !id && part >= 4096; part /= 2) {
+						id = cache.RegisteredBuffer(address, part);
+						if (id) size = part;
+					}
 					if (!id) return src;
 					auto& b = cache.GetBuffer(id);
 					src.buffer = b.Handle(), src.offset = b.Offset(address), src.size = size;

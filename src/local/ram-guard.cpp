@@ -142,9 +142,6 @@ uint64_t RamBallast() {
 }
 
 void ApplyLowRamDefaults() {
-#if defined(_WIN32)
-	HoldRamBallast(); // (11-12) before the game reserves anything
-#endif
 	static std::once_flag once;
 	std::call_once(once, [] {
 		const uint64_t ram    = LocalPlatform::PhysicalMemory();
