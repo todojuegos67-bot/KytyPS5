@@ -361,6 +361,28 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
             vs_hash, info.ps_hash, cut_vs, num_bad_vs));
         cut_vs = 0;
     }
+    // bb-hud-mask (3rd log, [hud-trace]): in game the HUD starts with a Scaleform stencil mask
+    // (vs 0x34e8a281: colour buffer 0 is the scene target, write mask 0, so no colour target is
+    // bound) right after the last post pass; the HUD's colour draws follow. That mask draw starts
+    // the cut on the scene target, and its stencil goes into the UI's output-size depth.
+    bool mask_cut = false;
+    if (!ui_phase && !color && depth && ldr_target && !done_this_frame && sr != nullptr &&
+        info.cb0_address != 0 && Vulkan::UiComposition::MovieShader(vs_hash) &&
+        texture_cache.GetImage(ldr_target).info.guest_address == info.cb0_address) {
+        color = ldr_target;
+        mask_cut = true;
+    }
+    const auto mask_depth = [&] {
+        if (!mask_cut || !ui_phase || !depth || depth == ui_depth || !ui_color) return;
+        const auto& depth_image = texture_cache.GetImage(depth);
+        const auto& ui_target = texture_cache.GetImage(ui_color);
+        if (depth_image.info.size.width == ui_target.info.size.width &&
+            depth_image.info.size.height == ui_target.info.size.height) {
+            EnsureUiResources(ui_width, ui_height, ui_format, depth_image.info.pixel_format);
+            PrepareUiDepth(depth);
+            ui_depth = depth;
+        }
+    };
     // A UI draw without a color target (a Scaleform mask: color writes off) writes the stencil
     // the next UI draws test, so it belongs in the UI's output-size depth like them.
     if (ui_phase && !color && depth && depth != ui_depth && ui_color) {
@@ -560,15 +582,20 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
         if (native_fg ? RunNativeFg(scene, color, depth) : RunScaled(scene)) {
             cut_vs = trigger_vs;
             CaptureHudlessUi();
+            mask_depth();
             return;
         }
-        if (ui_phase) return; // native: the vectors failed but the UI copy is in place
+        if (ui_phase) {
+            mask_depth();
+            return; // native: the vectors failed but the UI copy is in place
+        }
         // A failed dispatch must not force UI text back to the scene resolution.
         [[fallthrough]];
     case Vulkan::UiComposition::Background::Copy:
         RunUiOnly(color, depth);
         cut_vs = trigger_vs;
         CaptureHudlessUi();
+        mask_depth();
         return;
     }
 }

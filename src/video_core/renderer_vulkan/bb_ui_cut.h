@@ -61,6 +61,7 @@ public:
         bool samples_hud_layer = false; // reads the HUD layer (HudLayer())
         VAddr layer_read = 0;           // the layer candidate it reads (IsLayerCandidate)
         bool clip_disabled = false;     // screen-space vertices (2D)
+        VAddr cb0_address = 0;          // colour buffer 0 in the registers (bound or not)
     };
     // bb-hud-layer v2: a full-size 8-bit colour target that received blended 2D draws (no depth
     // test, no scene read) this frame: the HUD layer may be any of them.

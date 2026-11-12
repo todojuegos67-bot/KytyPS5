@@ -1142,6 +1142,16 @@ void Rasterizer::BbLodBias() {
     }
 }
 
+// bb-hud-mask: the game's colour buffer 0 plus only the motion attachment of BB object motion
+// vectors (bb_objmv2.h, attachment 7, the port's own): the in-game HUD's Scaleform draws
+// (mrt 0x81 in the 3rd log's [hud-trace]); a single target for the HUD cut.
+bool Rasterizer::BbUiSingleTarget(const GraphicsPipeline* pipeline) const {
+    const auto& key = pipeline->GetGraphicsKey();
+    constexpr u32 motion = 1u << BB::ObjMv2::Attachment;
+    return key.mrt_mask == (1u | motion) &&
+           BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment]);
+}
+
 void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
     BbLodBias();
@@ -1171,13 +1181,13 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
             regs.depth_buffer.DepthValid() ? VAddr(regs.depth_buffer.DepthAddress()) : VAddr(0),
             regs.depth_control.stencil_enable ? 1 : 0, regs.viewports[0].xscale * 2,
             regs.viewports[0].yscale * 2);
-        if (std::popcount(key.mrt_mask) != 1) {
+        if (std::popcount(key.mrt_mask) != 1 && !BbUiSingleTarget(pipeline)) {
             bb_cut.TraceDraw(fmt::format(
                 "vs {:#x} (not single-target){}",
                 pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, raw));
         }
     }
-    if (std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
+    if (std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1 || BbUiSingleTarget(pipeline)) {
         const auto& viewport = regs.viewports[0];
         // bb-gpu6: what the HUD-start rule needs of the draw: does it read a scene-size image
         // (a post pass: fog, tonemap, composites), depth test, blending, its pixel shader.
@@ -1186,6 +1196,7 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
         info.depth_test = regs.depth_control.depth_enable != 0;
         info.blend = pipeline->GetGraphicsKey().blend_controls[0].enable != 0;
         info.clip_disabled = regs.IsClipDisabled();
+        info.cb0_address = regs.color_buffers[0] ? VAddr(regs.color_buffers[0].Address()) : 0;
         const u32 sw = BB::Upscale::g_scene_w, sh = BB::Upscale::g_scene_h;
         const bool tracing = bb_cut.Tracing();
         std::string reads;
@@ -1330,7 +1341,14 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
     }
-    if (BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment])) {
+    if (bb_color_redirected && BbUiSingleTarget(pipeline)) {
+        // bb-hud-mask: a HUD draw into the output-size UI image writes no motion (the HUD is not
+        // part of the scene): its motion attachment is left unbound (writes discarded).
+        for (u32 cb = 1; cb < state.num_color_attachments; ++cb) {
+            state.color_attachments[cb] = {};
+        }
+    } else if (BB::ObjMv2::IsMotionKey(key.mrt_mask,
+                                       key.color_buffers[BB::ObjMv2::Attachment])) {
         BB::ObjMv2::Attach(scheduler, state);
     }
 
