@@ -24,6 +24,12 @@
 //   through the KYTY_MT_PROG GPU-write seal of 36f7cc513 (ReadSet::ValidateFast) as the draw-prep
 //   results are. Only a draw whose every stage was served by the draw-prep scanner (so has a read
 //   set) is stored, and only when its key comes a second time.
+// - bindings (tableBindings.h): per stage slot, the PreparedBindings of the slot's last draw are
+//   used again (no PrepareBindings, RebindImages, FindBuffers nor RebindBuffers; the stage's SRT
+//   and shader data are uploaded again) when the draw's programs came from the table and the
+//   stage repeats the program and the image, sampler and buffer descriptors, with the image and
+//   buffer set generations unchanged and every image and buffer still clean (ReuseTextureBinding,
+//   BufferCache::ReuseReadBinding). CommitBindings (layout transitions, writes) runs as before.
 // - targets (ResolveRenderColorTarget / ResolveRenderDepthTarget): per slot, the description and
 //   the image of the target registers seen last, while the texture cache's image set generation
 //   holds (as the texture memo: FindImage then finds the same image); the lookup's side effects
@@ -69,6 +75,15 @@ enum class Counter : uint32_t {
 	TargetMisses,
 	TargetVerifyChecks,
 	TargetVerifyMismatches,
+	// Bindings (tableBindings.h), per stage of a draw.
+	BindingHits,
+	BindingMisses,
+	BindingMissProgram,   // the draw's programs did not come from the table
+	BindingMissKey,       // another program or resource snapshot than the slot's last
+	BindingMissStale,     // image or buffer set generation moved, or an image or buffer refused
+	BindingNotStored,     // a stage the table does not keep (storage, written, bindless, DMA...)
+	BindingVerifyChecks,
+	BindingVerifyMismatches,
 	Count,
 };
 
@@ -128,7 +143,7 @@ inline void LogIfDue() {
 		r.last_tsc   = tsc;
 		r.last_time  = std::chrono::steady_clock::now();
 		r.next_check = tsc + 50'000'000u;
-		LOGF("Table: KYTY_TABLE=%d (%s): programs and render targets from tables; a \"Table:\" "
+		LOGF("Table: KYTY_TABLE=%d (%s): programs, render targets and bindings from tables; a \"Table:\" "
 		     "line every 10 s\n",
 		     Mode(), Verifying() ? "verifier: the normal path draws, differences logged" : "on");
 		return;
@@ -175,14 +190,19 @@ inline void LogIfDue() {
 	LOGF("Table (%.0f s): hits %llu / misses %llu / %.2f us per draw (programs+targets; hit "
 	     "%.2f, miss %.2f) | programs: misses new %llu, stale %llu, reads %llu, not stored %llu "
 	     "(vertex tables %llu), stored %llu | targets: hits %llu / misses %llu | verify: programs "
-	     "%llu checks, %llu mismatches; targets %llu checks, %llu mismatches\n",
+	     "%llu checks, %llu mismatches; targets %llu checks, %llu mismatches | bindings: hits %llu / "
+	     "misses %llu (program %llu, key %llu, stale %llu, not stored %llu), verify %llu checks, "
+	     "%llu mismatches\n",
 	     seconds, c(Counter::ProgramHits), c(Counter::ProgramMisses), all_us,
 	     us_per(dh_cycles, dh_draws), us_per(dm_cycles, dm_draws), c(Counter::ProgramMissNew),
 	     c(Counter::ProgramMissStale), c(Counter::ProgramMissReads), c(Counter::ProgramNotStored),
 	     c(Counter::ProgramFetchTables), c(Counter::ProgramStored), c(Counter::TargetHits),
 	     c(Counter::TargetMisses), c(Counter::ProgramVerifyChecks),
 	     c(Counter::ProgramVerifyMismatches), c(Counter::TargetVerifyChecks),
-	     c(Counter::TargetVerifyMismatches));
+	     c(Counter::TargetVerifyMismatches), c(Counter::BindingHits), c(Counter::BindingMisses),
+	     c(Counter::BindingMissProgram), c(Counter::BindingMissKey), c(Counter::BindingMissStale),
+	     c(Counter::BindingNotStored), c(Counter::BindingVerifyChecks),
+	     c(Counter::BindingVerifyMismatches));
 	r.last_tsc  = tsc;
 	r.last_time = now;
 }

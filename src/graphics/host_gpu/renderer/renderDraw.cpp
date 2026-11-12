@@ -2860,22 +2860,36 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
+	// KYTY_TABLE (tableBindings.h): bit i, stage i takes the slot's last bindings.
+	uint32_t   table_reused = 0;
+	const bool table        = TableMode::Enabled();
+	// Whether the stage's bindings are the slot's last; otherwise they are prepared.
+	const auto prepare = [&](const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                         bool normalize) {
+		if (table && TableBindingsMatch(prepared, runtime, normalize)) {
+			prepared.runtime = &runtime; // the same program and descriptors, this draw's snapshot
+			table_reused |= 1u << stage_count;
+		} else {
+			PrepareBindings(runtime, prepared);
+		}
+		descriptor_stages[stage_count++] = &prepared;
+	};
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawTextures);
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-			bindings.vertex[i].normalize_unnormalized =
-			    state.programs.vertex[i].normalized_samplers;
-			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-			descriptor_stages[stage_count++] = &bindings.vertex[i];
+			const bool normalize = state.programs.vertex[i].normalized_samplers;
+			bindings.vertex[i].normalize_unnormalized = normalize;
+			prepare(state.vertex_info[i].stage, bindings.vertex[i], normalize);
 		}
 		if (state.ps_active) {
 			if (!bindings.pixel) bindings.pixel.emplace();
-			PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-			descriptor_stages[stage_count++] = &*bindings.pixel;
+			prepare(state.ps_input_info.stage, *bindings.pixel,
+			        bindings.pixel->normalize_unnormalized);
 		}
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count},
+	                        table_reused);
 	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch) {
 		DumpTessellatedDraw(buffer, draw, state, index_source, bindings.vertex);
 	}

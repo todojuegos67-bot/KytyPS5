@@ -34,6 +34,9 @@ struct RenderColorInfo;
 namespace TableTargets {
 struct Table;
 } // namespace TableTargets
+namespace TableBindings {
+struct Table;
+} // namespace TableBindings
 struct DrawCallInfo;
 struct DiagnosticCheckpoint;
 struct DrawEmitInfo;
@@ -317,8 +320,23 @@ private:
 	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
 	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
 	    vk::Format view_format, uint32_t size, bool* same_backing = nullptr);
+	// KYTY_TABLE (tableBindings.h). The slot (0-2 vertex, 3 pixel) of a graphics stage's bindings.
+	[[nodiscard]] uint32_t TableBindingsSlot(const PreparedBindings& prepared) const;
+	// Whether the slot's last bindings were prepared from this program and descriptors (counts
+	// the misses). KYTY_TABLE=2 keeps a copy of them for TableBindingsVerify.
+	[[nodiscard]] bool TableBindingsMatch(PreparedBindings& prepared,
+	                                      const ShaderStageRuntime& runtime, bool normalize);
+	// Whether they may be used again now; with `replay`, binds their images as PrepareBindings
+	// would.
+	[[nodiscard]] bool TableBindingsReuse(PreparedBindings& prepared, bool replay);
+	// A reused stage's per-draw uploads (user data words, flattened SRT, shader data).
+	void TableBindingsUpload(PreparedBindings& prepared);
+	// After the normal path: keep (or drop) the slot's entry; `verify`: compare with the copy.
+	void TableBindingsStore(PreparedBindings& prepared, bool verify);
+	// `table_reused`: bit i, stage i's bindings are the slot's last (TableBindingsMatch), not
+	// prepared again.
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	                             std::span<RenderColorInfo> colors, uint32_t table_reused = 0);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
@@ -381,6 +399,8 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	// KYTY_TABLE (tableTargets.h): the render targets' table.
 	std::shared_ptr<TableTargets::Table> m_target_table; // shared: Table is incomplete here
+	// KYTY_TABLE (tableBindings.h): the bindings table.
+	std::shared_ptr<TableBindings::Table> m_binding_table;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
