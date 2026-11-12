@@ -162,6 +162,11 @@ struct State {
     std::unordered_map<u64, u64> pal_rel_cur, pal_rel_prev; // order key -> address - first
     std::unordered_map<u64, u32> pal_n_prev;  // group -> palettes seen last frame
     u64 vs_ring_ord = 0, vs_pal_layout = 0, vs_skin_draws = 0, vs_skin_draws_all = 0;
+    // bb-skin-mv2: why a palette buffer had no previous copy (per buffer, 1 s), and draws whose
+    // other palette buffers matched (the unmatched one reads its current data).
+    std::array<u64, 8> vs_why{};
+    u64 vs_pal_partial = 0, vs_multi_pal = 0;
+    std::unordered_map<u64, u8> ring_seen_cur, ring_seen_prev; // ring keys drawn this / last frame
     bool skin_order = true; // BB_SKIN_MV=0: off (previous behaviour)
     u64 vs_frames = 0, vs_draws = 0, vs_native = 0, vs_static = 0, vs_skinned = 0,
         vs_skinned_ring = 0, vs_skinned_addr = 0, vs_no_cam = 0, vs_no_pal = 0, vs_blend = 0,
@@ -768,6 +773,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     std::array<SnapBuf, Shader::NUM_BUFFERS> prev{};
     std::array<bool, Shader::NUM_BUFFERS> use{};
     bool camera = false, ok = true, skinned = false, ring = false;
+    u32 pal_matched = 0, pal_failed = 0, pal_bufs = 0;
     for (u32 h = 0; h < n && ok; ++h) {
         if ((cand & (1ull << h)) == 0) continue;
         const auto sharp = vs.buffers[h].GetSharp(vs);
@@ -825,6 +831,8 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         } else {
             if (!skinned) ++g.vs_skin_draws_all;
             skinned = true;
+            ++pal_bufs;
+            u32 why = 0; // index into vs_why when no previous copy is found
             // Game identity of the palette, once per address and frame (no lock per draw).
             const auto pid = g.pal_ids.find(addr);
             const auto id = pid != g.pal_ids.end()
@@ -834,6 +842,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             u64 rkey = 0;
             if (id.key != 0) {
                 ++g.vs_ring_seen;
+                g.ring_seen_cur[id.key] = 1;
                 const u64 ikey = Mix(Mix(id.key, id.slot_offset), size);
                 if (have_cur) g.vel_id_cur[ikey] = cur;
                 if (const auto it = g.vel_id_prev.find(ikey);
@@ -885,7 +894,13 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                         g.pal_cpu_cur[okey] = c;
                     }
                 }
-                if (const auto it = g.vel_id_prev.find(okey);
+                const auto oprev = g.vel_id_prev.find(okey);
+                if (oprev == g.vel_id_prev.end() || oprev->second.addr == 0) {
+                    why = 4;
+                } else if (oprev->second.dwords != size / 4) {
+                    why = 5;
+                }
+                if (const auto it = oprev;
                     it != g.vel_id_prev.end() && it->second.addr != 0 &&
                     it->second.dwords == size / 4) {
                     const auto chk = g.pal_checked.try_emplace(okey, false);
@@ -925,18 +940,56 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                     if (chk.first->second) {
                         found = &it->second;
                         ++g.vs_pal_ord;
+                    } else {
+                        why = g.pal_cpu_cur.count(okey) != 0 && g.pal_cpu_prev.count(okey) != 0
+                                  ? 6u
+                                  : 7u;
                     }
                 }
             }
             if (found == nullptr) {
-                ++g.vs_no_pal;
-                ok = false;
-                break;
+                if (!have_cur) {
+                    why = 0; // no copy of this frame (snapshot arena full / no buffer)
+                } else if (id.key != 0) {
+                    why = 1; // ring palette: none of slot, ring order or address last frame
+                    if (rkey != 0) {
+                        if (const auto it = g.vel_id_prev.find(rkey);
+                            it != g.vel_id_prev.end() && it->second.addr != 0) {
+                            why = 2; // ring order found, other size
+                        } else if (g.ring_seen_prev.count(id.key) != 0) {
+                            why = 3; // ring drawn last frame with fewer palettes
+                        }
+                    }
+                } else if (why == 0) {
+                    why = 4;
+                }
+                ++g.vs_why[why];
+                ++pal_failed;
+                if (!g.skin_order) {
+                    ++g.vs_no_pal;
+                    ok = false;
+                    break;
+                }
+                // Keep going: the draw's later buffers are still copied for the next frame.
+                continue;
             }
+            ++pal_matched;
         }
         prev[h] = *found;
         use[h] = true;
     }
+    if (ok && pal_bufs > 1) ++g.vs_multi_pal;
+    if (ok && pal_failed != 0) {
+        if (pal_matched != 0) {
+            // Another palette of this draw has last frame's copy: the unmatched one reads its
+            // current data (use 0) instead of the whole draw losing its vector.
+            ++g.vs_pal_partial;
+        } else {
+            ++g.vs_no_pal;
+            ok = false;
+        }
+    }
+
     const u64 bytes = u64(n) * 16;
     if (ok && camera && g.history && g.table_used + bytes <= kTableBytes) {
         const u64 off = SlotTableOffset(g.slot) + g.table_used;
@@ -1291,6 +1344,7 @@ void OnFlip() {
         std::swap(g.cam_cpu_prev, g.cam_cpu_cur);
         std::swap(g.pal_cpu_prev, g.pal_cpu_cur);
         std::swap(g.pal_rel_prev, g.pal_rel_cur);
+        std::swap(g.ring_seen_prev, g.ring_seen_cur);
         g.pal_n_prev.clear();
         for (const auto& [grp, cnt] : g.pal_ord_n) g.pal_n_prev[grp] = cnt;
         g.history = true;
@@ -1305,6 +1359,7 @@ void OnFlip() {
         g.pal_cpu_prev.clear();
         g.pal_rel_prev.clear();
         g.pal_n_prev.clear();
+        g.ring_seen_prev.clear();
         g.history = false;
         if (!had_pass) g.prev_valid = false;
     }
@@ -1325,6 +1380,7 @@ void OnFlip() {
     g.pal_first.clear();
     g.ring_ord_of.clear();
     g.ring_ord_n.clear();
+    g.ring_seen_cur.clear();
     g.pal_ids.clear();
     if (had_pass) ++g.vs_frames;
     g.occ.clear();
@@ -1432,6 +1488,19 @@ void OnFlip() {
                                             : 0.0,
                         double(g.vs_ring_ord) / f, double(g.vs_pal_layout),
                         g.skin_order ? "on (BB_SKIN_MV=0: off)" : "off (BB_SKIN_MV=0)"));
+        Log(fmt::format("[skin-mv] palette buffers without last frame's copy, per frame: no copy "
+                        "this frame {:.1f}, ring new/not drawn last frame {:.1f}, ring order other "
+                        "size {:.1f}, ring with more palettes than last frame {:.1f}, order new "
+                        "{:.1f}, order other size {:.1f}, order data differs {:.1f}, order "
+                        "GPU-written + layout moved {:.1f} | draws kept by their other palette "
+                        "{:.1f}/frame, draws with 2+ palette buffers {:.1f}/frame",
+                        double(g.vs_why[0]) / f, double(g.vs_why[1]) / f,
+                        double(g.vs_why[2]) / f, double(g.vs_why[3]) / f,
+                        double(g.vs_why[4]) / f, double(g.vs_why[5]) / f,
+                        double(g.vs_why[6]) / f, double(g.vs_why[7]) / f,
+                        double(g.vs_pal_partial) / f, double(g.vs_multi_pal) / f));
+        g.vs_why.fill(0);
+        g.vs_pal_partial = g.vs_multi_pal = 0;
         g.vs_skin_draws = g.vs_skin_draws_all = g.vs_ring_ord = g.vs_pal_layout = 0;
     }
     Log(fmt::format("[objmv-gpu6] moving test {}: palettes changed only by a common transform "
