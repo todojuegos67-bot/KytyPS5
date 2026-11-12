@@ -480,6 +480,34 @@ bool Translator::S_BITCMP_B32(const Decoder::Instruction& inst, bool expected) {
 	return true;
 }
 
+bool Translator::S_BITCMP_B64(const Decoder::Instruction& inst, bool expected) {
+	const auto value  = ReadU32Pair(inst.src0);
+	const auto offset = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(63u)));
+	const auto high   = ir.UGreaterThan(offset, IR::U32(IR::Value(31u)));
+	const auto word   = ir.Select(high, value[1], value[0]);
+	const auto shift  = ir.BitwiseAnd(offset, IR::U32(IR::Value(31u)));
+	const auto bit =
+	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {word, shift, IR::Value(1u)}));
+	WriteCompareResult(inst.dst, ir.IEqual(bit, IR::U32(IR::Value(expected ? 1u : 0u))));
+	return true;
+}
+
+bool Translator::S_ASHR_I64(const Decoder::Instruction& inst) {
+	// Signed 64-bit sources sign-extend literals; generic B64 operands zero-extend them.
+	const auto source =
+	    inst.src0.kind == Decoder::OperandKind::LiteralConstant
+	        ? ir.ConstructU64(
+	              ReadU32(inst.src0),
+	              IR::U32(IR::Value((inst.src0.value & 0x80000000u) != 0u ? 0xffffffffu : 0u)))
+	        : ReadU64(inst.src0);
+	const auto result =
+	    ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64, {source, ReadU32(inst.src1)});
+	WriteOperand(inst.dst, result);
+	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64,
+	                         {result, ir.ConstructU64(IR::U32(IR::Value(0u)), IR::U32(IR::Value(0u)))})));
+	return true;
+}
+
 bool Translator::V_ALIGNBIT_B32(const Decoder::Instruction& inst) {
 	const auto hi      = ReadU32(inst.src0);
 	const auto lo      = ReadU32(inst.src1);
