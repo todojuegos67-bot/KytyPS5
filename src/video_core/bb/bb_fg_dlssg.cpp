@@ -239,15 +239,23 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
     // as they are (transposed clipToPrevClip, a view-projection read as a projection), so its
     // camera motion contradicted the vectors on every camera turn and the generated frames
     // smeared the background. BB_DLSSG_MATRIX=raw restores that.
-    static const bool raw_matrices = [] {
+    // bb-dlssg-proj: cameraViewToClip = the game's own projection (transposed to row vectors)
+    // by default. The one rebuilt from fov / near / far assumed the render aspect and a depth
+    // mapping that is not the game's, so DLSS-G placed the scene wrong, worst toward the screen
+    // edges, and blurred them on camera turns (AMD FG does not use that matrix).
+    // BB_DLSSG_MATRIX=fov restores the rebuilt one, raw the one before gpu6.
+    static const int matrix_mode = [] {
         const char* v = std::getenv("BB_DLSSG_MATRIX");
-        const bool raw = v != nullptr && std::strcmp(v, "raw") == 0;
+        const int mode = v && std::strcmp(v, "raw") == 0 ? 0 : v && std::strcmp(v, "fov") == 0 ? 1 : 2;
         BBLogf("DLSS-G: camera matrices %s (BB_DLSSG_MATRIX)",
-               raw ? "raw (as before gpu6)"
-                   : "row-vector: clipToPrevClip transposed, cameraViewToClip = projection "
-                     "from fov/near/far");
-        return raw;
+               mode == 0 ? "raw (as before gpu6)"
+               : mode == 1 ? "row-vector: clipToPrevClip transposed, cameraViewToClip = projection "
+                             "from fov/near/far"
+                           : "row-vector: clipToPrevClip transposed, cameraViewToClip = the game's "
+                             "projection transposed");
+        return mode;
     }();
+    const bool raw_matrices = matrix_mode == 0;
     float to_prev_rv[16];
     if (in.camera_valid) {
         if (raw_matrices) {
@@ -268,6 +276,10 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
             p[11] = 1.0f;
             p[14] = -n * f / (f - n);
             std::memcpy(e.view_to_clip, p, sizeof(e.view_to_clip));
+            if (matrix_mode == 2 && in.proj_valid) {
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 4; ++j) e.view_to_clip[j * 4 + i] = in.projection[i * 4 + j];
+            }
         }
         std::memcpy(e.clip_to_prev_clip, to_prev_rv, sizeof(e.clip_to_prev_clip));
         // prev_clip_to_clip: the inverse (general 4x4).

@@ -373,6 +373,8 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         fg->camera_valid = cam.valid;
         std::memcpy(fg->view_to_clip, cam.view_to_clip, sizeof(fg->view_to_clip));
         std::memcpy(fg->clip_to_prev_clip, cam.clip_to_prev_clip, sizeof(fg->clip_to_prev_clip));
+        fg->proj_valid = cam.proj_valid;
+        std::memcpy(fg->projection, cam.projection, sizeof(fg->projection));
         // A 3D frame is one with the scene depth (movies and 2D flips have none); without the
         // camera the vectors are zero and FSR 3 uses its default near / far / fov.
         fg->valid = true;
