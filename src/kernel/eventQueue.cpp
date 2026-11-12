@@ -10,6 +10,7 @@
 #include "common/timer.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/gt7Title.h"
 
 #include <algorithm>
 #include <chrono>
@@ -266,6 +267,10 @@ static void UserEventTriggerFunc(KernelEqueueEvent* event, void* trigger_data) {
 	event->triggered   = true;
 	event->event.data  = reinterpret_cast<intptr_t>(trigger_data);
 	event->event.udata = trigger_data;
+}
+
+int16_t AmprEventFilter() {
+	return Loader::IsGranTurismo7() ? KERNEL_EVFILT_AMPR : KERNEL_EVFILT_USER;
 }
 
 static void AmprEventTriggerFunc(KernelEqueueEvent* event, void* trigger_data) {
@@ -576,7 +581,7 @@ int KYTY_SYSV_ABI KernelAddAmprEvent(KernelEqueue eq, int id, void* udata) {
 	if (eq != KERNEL_EQUEUE_INVALID) {
 		KernelEqueueEvent event {};
 		event.event.ident         = static_cast<uintptr_t>(id);
-		event.event.filter        = KERNEL_EVFILT_USER;
+		event.event.filter        = AmprEventFilter();
 		event.event.flags         = EV_ADD | EV_CLEAR;
 		event.event.fflags        = 0;
 		event.event.data          = 0;
@@ -604,7 +609,7 @@ int KYTY_SYSV_ABI KernelDeleteAmprEvent(KernelEqueue eq, int id) {
 	LOGF("\t AMPR event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq), id);
 
 	if (eq != KERNEL_EQUEUE_INVALID) {
-		(void)KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
+		(void)KernelDeleteEvent(eq, static_cast<uintptr_t>(id), AmprEventFilter());
 	}
 
 	return OK;

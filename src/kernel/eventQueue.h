@@ -18,6 +18,11 @@ constexpr int16_t KERNEL_EVFILT_FILE      = -4;
 constexpr int16_t KERNEL_EVFILT_GRAPHICS  = -14;
 constexpr int16_t KERNEL_EVFILT_VIDEO_OUT = -13;
 constexpr int16_t KERNEL_EVFILT_HRTIMER   = -15;
+constexpr int16_t KERNEL_EVFILT_AMPR      = -25;
+
+// The filter of APR/AMPR completion events: EVFILT_AMPR for Gran Turismo 7 (as on the console,
+// from the GT7 port), EVFILT_USER otherwise (what the Demon's Souls core has always used).
+int16_t AmprEventFilter();
 
 class KernelEqueuePrivate;
 struct KernelEqueueEvent;
