@@ -152,6 +152,17 @@ struct State {
     std::unordered_map<u64, bool> pal_checked; // order key -> similar to last frame's
     std::unordered_map<u64, std::array<float, 64>> pal_cpu_cur, pal_cpu_prev; // by order key
     u64 vs_pal_ord = 0, vs_pal_rejected = 0, vs_pal_unchecked = 0;
+    // bb-skin-mv: ring palettes whose slot key had no copy last frame, matched by their order
+    // among the same game skin ring's palettes (game identity: no data check needed); palettes
+    // the GPU wrote (no CPU check possible) accepted by order when their address offset from the
+    // first palette of their group is the same as last frame (same buffer layout).
+    std::unordered_map<u64, u64> ring_ord_of; // (address, size) -> ring order key this frame
+    std::unordered_map<u64, u32> ring_ord_n;  // ring key -> palettes seen this frame
+    std::unordered_map<u64, u64> pal_first;   // group -> first palette address this frame
+    std::unordered_map<u64, u64> pal_rel_cur, pal_rel_prev; // order key -> address - first
+    std::unordered_map<u64, u32> pal_n_prev;  // group -> palettes seen last frame
+    u64 vs_ring_ord = 0, vs_pal_layout = 0, vs_skin_draws = 0, vs_skin_draws_all = 0;
+    bool skin_order = true; // BB_SKIN_MV=0: off (previous behaviour)
     u64 vs_frames = 0, vs_draws = 0, vs_native = 0, vs_static = 0, vs_skinned = 0,
         vs_skinned_ring = 0, vs_skinned_addr = 0, vs_no_cam = 0, vs_no_pal = 0, vs_blend = 0,
         vs_gpu_copies = 0, vs_bytes = 0, vs_cam_addr = 0, vs_cam_ord = 0, vs_ring_seen = 0;
@@ -463,6 +474,7 @@ bool Init(const Vulkan::Instance& instance) {
     g.occ.reserve(8192);
     g.dedupe.reserve(8192);
     g.velocity = !EnvOff("BB_VELOCITY");
+    g.skin_order = !EnvOff("BB_SKIN_MV");
     if (g.velocity) {
         g.additive = false; // absolute vectors: the previous camera is in the VS
         Vulkan::Scheduler::bb_end_rendering_hook = &FlushVelocityCopies;
@@ -811,6 +823,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             }
             camera = true;
         } else {
+            if (!skinned) ++g.vs_skin_draws_all;
             skinned = true;
             // Game identity of the palette, once per address and frame (no lock per draw).
             const auto pid = g.pal_ids.find(addr);
@@ -818,6 +831,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                                 ? pid->second
                                 : g.pal_ids.emplace(addr, BB::NativeMv::LookupPalette(addr))
                                       .first->second;
+            u64 rkey = 0;
             if (id.key != 0) {
                 ++g.vs_ring_seen;
                 const u64 ikey = Mix(Mix(id.key, id.slot_offset), size);
@@ -827,11 +841,30 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                     found = &it->second;
                     ring = true;
                 }
+                if (g.skin_order) {
+                    // Order among this ring's palettes (once per address and frame).
+                    if (const auto it = g.ring_ord_of.find(akey); it != g.ring_ord_of.end()) {
+                        rkey = it->second;
+                    } else {
+                        rkey = Mix(Mix(Mix(id.key, 0x726f7264ull), g.ring_ord_n[id.key]++), size);
+                        g.ring_ord_of[akey] = rkey;
+                        if (have_cur) g.vel_id_cur[rkey] = cur;
+                    }
+                }
             }
             if (found == nullptr) {
                 if (const auto it = g.vel_addr_prev.find(akey);
                     it != g.vel_addr_prev.end() && it->second.addr != 0) {
                     found = &it->second;
+                }
+            }
+            if (found == nullptr && rkey != 0) {
+                if (const auto it = g.vel_id_prev.find(rkey);
+                    it != g.vel_id_prev.end() && it->second.addr != 0 &&
+                    it->second.dwords == size / 4) {
+                    found = &it->second;
+                    ring = true;
+                    ++g.vs_ring_ord;
                 }
             }
             if (found == nullptr && id.key == 0) {
@@ -842,6 +875,8 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                     const u64 group = Mix(Mix(0x70616cull, vs_hash), size);
                     okey = Mix(group, g.pal_ord_n[group]++);
                     g.pal_ord_of[akey] = okey;
+                    const u64 first = g.pal_first.try_emplace(group, addr).first->second;
+                    g.pal_rel_cur[okey] = addr - first;
                     if (have_cur) g.vel_id_cur[okey] = cur;
                     if (!buffer_cache.IsRegionGpuModified(addr, 256) &&
                         memory->IsValidMapping(addr, 256)) {
@@ -866,6 +901,21 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                         if (c == g.pal_cpu_cur.end() || p == g.pal_cpu_prev.end()) {
                             ++g.vs_pal_unchecked;
                             chk.first->second = trust;
+                            if (!trust && g.skin_order) {
+                                // GPU-written palette: same place in the same buffer layout
+                                // (offset from the group's first palette, group of 2+ last
+                                // frame) as last frame's palette of that order.
+                                const u64 group = Mix(Mix(0x70616cull, vs_hash), size);
+                                const auto rc = g.pal_rel_cur.find(okey);
+                                const auto rp = g.pal_rel_prev.find(okey);
+                                const auto np = g.pal_n_prev.find(group);
+                                if (rc != g.pal_rel_cur.end() && rp != g.pal_rel_prev.end() &&
+                                    np != g.pal_n_prev.end() && np->second >= 2 &&
+                                    rc->second == rp->second) {
+                                    chk.first->second = true;
+                                    ++g.vs_pal_layout;
+                                }
+                            }
                         } else if (PaletteSimilar(c->second, p->second)) {
                             chk.first->second = true;
                         } else {
@@ -912,6 +962,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         if (diag) ++g.sec_diag_draws;
         if (skinned) {
             ++g.vs_skinned;
+            ++g.vs_skin_draws;
             if (ring) {
                 ++g.vs_skinned_ring;
             } else {
@@ -1239,6 +1290,9 @@ void OnFlip() {
         std::swap(g.vel_id_prev, g.vel_id_cur);
         std::swap(g.cam_cpu_prev, g.cam_cpu_cur);
         std::swap(g.pal_cpu_prev, g.pal_cpu_cur);
+        std::swap(g.pal_rel_prev, g.pal_rel_cur);
+        g.pal_n_prev.clear();
+        for (const auto& [grp, cnt] : g.pal_ord_n) g.pal_n_prev[grp] = cnt;
         g.history = true;
     } else {
         if (g.history) ++g.sec_resets;
@@ -1249,6 +1303,8 @@ void OnFlip() {
         g.vel_id_prev.clear();
         g.cam_cpu_prev.clear();
         g.pal_cpu_prev.clear();
+        g.pal_rel_prev.clear();
+        g.pal_n_prev.clear();
         g.history = false;
         if (!had_pass) g.prev_valid = false;
     }
@@ -1265,6 +1321,10 @@ void OnFlip() {
     g.pal_ord_of.clear();
     g.pal_ord_n.clear();
     g.pal_checked.clear();
+    g.pal_rel_cur.clear();
+    g.pal_first.clear();
+    g.ring_ord_of.clear();
+    g.ring_ord_n.clear();
     g.pal_ids.clear();
     if (had_pass) ++g.vs_frames;
     g.occ.clear();
@@ -1363,6 +1423,16 @@ void OnFlip() {
                     g.vs_cam_unchecked = g.vs_pal_ord = g.vs_pal_rejected =
                         g.vs_pal_unchecked = 0;
         g.vs_cpu_ns = 0;
+        Log(fmt::format("[skin-mv] skinned (bone palette) draws with own vectors {:.1f}/frame of "
+                        "{:.1f} ({:.1f}%) | extra from ring order {:.1f}/frame, GPU-written by "
+                        "layout {:.1f}/s | {}",
+                        double(g.vs_skin_draws) / f, double(g.vs_skin_draws_all) / f,
+                        g.vs_skin_draws_all ? 100.0 * double(g.vs_skin_draws) /
+                                                  double(g.vs_skin_draws_all)
+                                            : 0.0,
+                        double(g.vs_ring_ord) / f, double(g.vs_pal_layout),
+                        g.skin_order ? "on (BB_SKIN_MV=0: off)" : "off (BB_SKIN_MV=0)"));
+        g.vs_skin_draws = g.vs_skin_draws_all = g.vs_ring_ord = g.vs_pal_layout = 0;
     }
     Log(fmt::format("[objmv-gpu6] moving test {}: palettes changed only by a common transform "
                     "(camera) kept static {}/s; CPU per draw: hashed {:.0f} B, copied {:.0f} B, "
