@@ -877,6 +877,26 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                     ++g.vs_ring_ord;
                 }
             }
+            // bb-vel-mesh-first: a palette without a ring identity is matched first to last
+            // frame's palette of the same mesh draw (vertex program, index buffer, counts,
+            // occurrence, handle, size) and only then by draw order: the order changes whenever
+            // a character / enemy / part is drawn in another place of the frame, and a similar
+            // palette of another instance passed the order check (wrong previous pose: the
+            // character's limbs and coat smeared in the generated frames). BB_VEL_MESH_FIRST=0:
+            // as before (order first, mesh last).
+            static const bool mesh_first = [] {
+                const char* v = std::getenv("BB_VEL_MESH_FIRST");
+                return !(v != nullptr && v[0] == '0');
+            }();
+            if (found == nullptr && id.key == 0 && mesh_first && mesh != 0) {
+                const u64 mkey = Mix(Mix(mesh, h), size);
+                if (const auto it = g.vel_id_prev.find(mkey);
+                    it != g.vel_id_prev.end() && it->second.addr != 0 &&
+                    it->second.dwords == size / 4) {
+                    found = &it->second;
+                    ++g.vs_mesh;
+                }
+            }
             if (found == nullptr && id.key == 0) {
                 u64 okey;
                 if (const auto it = g.pal_ord_of.find(akey); it != g.pal_ord_of.end()) {
