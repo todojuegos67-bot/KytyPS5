@@ -98,6 +98,16 @@ SceneGuard、TextureMips 各 1）。在 9af7b0d9 上用 `pgo-multi.ps1` 默认�
 持平（1-1 略好）。17 次启动的日志都是模式 0，没有致命错误。重扫只剩 redZonePatcher.cpp 的 17 个。旧的另存为
 `_Build\pgo\windows\kyty-before-20261110.profdata`。
 
+2026-11-12（台式机）：合并 PR #329 等之后扫描，bufferCache 3、renderDraw 2（表路径）、speculation 1、shader 1 个函数失配
+（另有 redZonePatcher 17）。在 c0652736 上用 `pgo-multi.ps1` 默认的五次运行重新训练，同一份源码对比（A 为 11-10 的 profile，
+B 为新的），abx 两轮 ABBA，120 Hz 上限，每次启动两个 10 秒窗口：
+- 1-1：渲染线程 13.82 → 13.32 ms/帧，fps 69.23 → 73.60（B 的两次都高于 A 的两次）；
+- Latria：12.40 → 12.39 ms，fps 77.88 → 78.55；
+- 1-1 竞技场：8.12 → 8.14 ms，fps 114.12 → 114.07；
+- 1-1 加 `KYTY_SCOUT=0`（6 + 6 次启动）：14.01 → 14.21 ms，fps 69.69 → 68.39，略慢，部分来自场景波动（这个位置慢的那几次
+  启动，每帧写异常多约 30%、上传多约 2 MB，两边都有）。scout 停下的只有核心很少的电脑；Steam Deck 用的是 Linux 的 profile。
+采用新 profile，旧的另存为 `_Build\pgo\windows\kyty-before-20261112.profdata`。
+
 ## 推测模式（`KYTY_SPECULATE=4`）
 
 默认的五次训练都在模式 0 下运行，模式 4 自己的路径（推测线程上的翻译和状态遍历、提交检查，以及模式 0 的函数在
