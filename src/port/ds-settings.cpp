@@ -1308,15 +1308,19 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		// Set-PresetLight; FSR Calidad recommended (10-25); sharpness 75 %.
 		// (11-12) the user's screenshot: Texturas Medio, Distancia Alto, Sombras Alto, Detalle Alto (PS5 performance),
 		// Filtrado x16, Texturas extra nitidas, Reflejos / Desvanecimiento Normal, Nitidez del AA Alto.
+		// (11-12) the user's second screenshot: Texturas Medio, Distancia Maximo, Sombras Medio, Detalle Normal, x16,
+		// extra sharp, Reflejos / Desvanecimiento Normal, AA Alto; motion blur off, DoF / bloom / vignette / eye adaptation on.
 		s->texture_reduce    = "1";
-		s->quality           = "high";
-		s->shadows           = "alto";
-		s->detail            = "alto";
+		s->quality           = "standard";
+		s->shadows           = "medio";
+		s->detail            = "normal";
 		s->af16              = true;
 		s->texture_sharpness = "2";
 		s->aa_sharp          = "alto";
 		s->object_fade       = "normal";
 		s->reflections       = "normal";
+		s->motion_blur = false;
+		s->dof = s->bloom = s->vignette = s->eye_adapt = true;
 		s->res            = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default (was FSR 3.1 Calidad)
 		s->pure_game      = true;           // (11-11) and Juego original (no added effects)
 		s->sharpness      = "0.75";
