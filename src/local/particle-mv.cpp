@@ -119,7 +119,7 @@ struct {
 	uint64_t             alignment = 256;
 	// log (every second)
 	uint64_t draws_seen = 0, draws_native = 0, draws_skipped = 0, frames = 0;
-	uint64_t why[4] = {}, prev_other = 0, prev_none = 0;
+	uint64_t why[4] = {}, prev_other = 0, prev_none = 0, src_rec[3] = {}, src_sort[3] = {};
 	uint64_t hits_down = 0, hits_up = 0;
 	bool     y_down = true;
 	std::array<uint32_t, StatsCount> stat_last {};
@@ -437,10 +437,14 @@ void NativeLog(GraphicContext& graphics) {
 	            d[11] > 0 ? 100.0 * d[7] / d[11] : 0.0, d[7], d[11], g_pn.y_down ? "down" : "up",
 	            static_cast<unsigned long long>(g_pn.hits_down), static_cast<unsigned long long>(g_pn.hits_up),
 	            g_pm.samples > 0 ? g_pm.sum_ms / g_pm.samples : 0.0, g_pm.max_ms);
-	if (g_pn.draws_skipped > 0)
-		std::printf("FG particle native: skipped: %llu no record buffer, %llu no sort buffer, %llu layout, %llu indirect args\n",
-		            static_cast<unsigned long long>(g_pn.why[0]), static_cast<unsigned long long>(g_pn.why[1]),
-		            static_cast<unsigned long long>(g_pn.why[2]), static_cast<unsigned long long>(g_pn.why[3]));
+	std::printf("FG particle native: sources: records from the draw's binding %llu / registered %llu; sorted list from the draw's "
+	            "binding %llu / registered %llu / none (every record, live = moved) %llu; skipped: %llu no record buffer, %llu "
+	            "layout, %llu indirect args, %llu ring or draw limit\n",
+	            static_cast<unsigned long long>(g_pn.src_rec[1]), static_cast<unsigned long long>(g_pn.src_rec[2]),
+	            static_cast<unsigned long long>(g_pn.src_sort[1]), static_cast<unsigned long long>(g_pn.src_sort[2]),
+	            static_cast<unsigned long long>(g_pn.src_sort[0]), static_cast<unsigned long long>(g_pn.why[0]),
+	            static_cast<unsigned long long>(g_pn.why[1]), static_cast<unsigned long long>(g_pn.why[2]),
+	            static_cast<unsigned long long>(g_pn.why[3]));
 	std::printf("FG particle native: last frame's records from the same buffer %llu, from the other buffer %llu, none %llu; "
 	            "discarded as recycled: emitter changed %u, moved too far %u\n",
 	            static_cast<unsigned long long>(g_pn.draws_native - std::min(g_pn.draws_native, g_pn.prev_other + g_pn.prev_none)),
@@ -448,6 +452,7 @@ void NativeLog(GraphicContext& graphics) {
 	std::fflush(stdout);
 	g_pm.sum_ms = 0.0, g_pm.max_ms = 0.0, g_pm.samples = 0;
 	g_pn.why[0] = g_pn.why[1] = g_pn.why[2] = g_pn.why[3] = 0;
+	for (int i = 0; i < 3; ++i) g_pn.src_rec[i] = g_pn.src_sort[i] = 0;
 	g_pn.prev_other = g_pn.prev_none = 0;
 	g_pn.frames = 0, g_pn.draws_seen = 0, g_pn.draws_native = 0, g_pn.draws_skipped = 0;
 }
@@ -488,14 +493,15 @@ bool NativeRun(GraphicContext& graphics, vk::CommandBuffer command, Push& push, 
 		vmaFlushAllocation(graphics.allocator, g_pn.params.memory, slot * slot_size, sizeof(prm));
 		const VkBuffer prev = nd.prev_buf != VK_NULL_HANDLE ? nd.prev_buf : key.buf[key.cur ^ 1].buffer != VK_NULL_HANDLE ? key.buf[key.cur ^ 1].buffer : key.buf[key.cur].buffer;
 		const vk::DescriptorBufferInfo native[6] {
-		    {ring, nd.sort_off, nd.sort_size},
+		    nd.sort_size > 0 ? vk::DescriptorBufferInfo {ring, nd.sort_off, nd.sort_size} : vk::DescriptorBufferInfo {stats, 0, VK_WHOLE_SIZE},
 		    {vk::Buffer(key.buf[key.cur].buffer), 0, VK_WHOLE_SIZE},
 		    {vk::Buffer(prev), 0, VK_WHOLE_SIZE},
 		    nd.emit_size > 0 ? vk::DescriptorBufferInfo {ring, nd.emit_off, nd.emit_size} : vk::DescriptorBufferInfo {stats, 0, VK_WHOLE_SIZE},
 		    nd.indirect ? vk::DescriptorBufferInfo {ring, nd.args_off, 64} : vk::DescriptorBufferInfo {stats, 0, VK_WHOLE_SIZE},
 		    {vk::Buffer(g_pn.params.buffer), slot * slot_size, sizeof(NParams)},
 		};
-		const uint32_t n = std::min<uint32_t>(nd.indirect ? nd.sort_count : nd.instances, 65535u * 64u);
+		// No sort list: one workgroup per record (key.count); else per instance (indirect: up to the list's size).
+		const uint32_t n = std::min<uint32_t>(nd.sort_size == 0 ? key.count : nd.indirect ? nd.sort_count : nd.instances, 65535u * 64u);
 		if (n == 0) continue;
 		Dispatch(command, push, 3, infos, g_pm.half, native, std::min(n, 65535u), (n + 65534u) / 65535u);
 		++g_pn.draws_native;
@@ -568,20 +574,28 @@ bool ParticleMvWanted() {
 void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering, const ParticleNativeDraw& d) {
 	if (!ParticleNativeWanted()) return;
 	++g_pn.draws_seen;
-	const uint64_t sort_size = std::min<uint64_t>(d.sort.size, uint64_t {d.sort_count} * d.sort_stride);
+	// (11-12) The sorted list when there is a usable one; else every record (no sort list: sort_size 0, sort stride 0).
+	const bool     has_sort  = d.sort.buffer != nullptr && d.sort_stride >= 8 && (d.sort_stride & 3u) == 0 && d.sort_count != 0;
+	const uint64_t sort_size = has_sort ? std::min<uint64_t>(d.sort.size, uint64_t {d.sort_count} * d.sort_stride) : 0;
 	const uint64_t emit_size = d.emit.buffer != nullptr ? std::min<uint64_t>(d.emit.size, uint64_t {d.emit_count} * d.emit_stride) : 0;
-	const uint64_t args_size = d.indirect ? std::min<uint64_t>(d.args.size, 64) : 0;
-	// (11-12) Why a draw is skipped (the 1 s line): 0 no record buffer, 1 no sort buffer, 2 layout, 3 indirect args.
-	if (d.rec.buffer == nullptr) ++g_pn.why[0];
-	else if (d.sort.buffer == nullptr) ++g_pn.why[1];
-	else if (d.indirect && args_size < 8) ++g_pn.why[3];
-	else if (d.rec_stride < 32 || (d.rec_stride & 3u) != 0 || d.sort_stride < 8 || d.rec.size > NRecMax) ++g_pn.why[2];
-	if (g_pn.failed || g_pn.draws.size() >= NDrawsMax || d.rec.buffer == nullptr || d.sort.buffer == nullptr || d.rec_stride < 32 ||
-	    (d.rec_stride & 3u) != 0 || d.sort_stride < 8 || (d.sort_stride & 3u) != 0 || d.rec.size == 0 || d.rec.size > NRecMax ||
-	    sort_size == 0 || (d.indirect && args_size < 8) || (d.emit_stride & 3u) != 0) {
+	const uint64_t args_size = d.indirect && has_sort ? std::min<uint64_t>(d.args.size, 64) : 0; // (no sort list: unused)
+	// Why a draw is skipped (the 1 s line): 0 no record buffer, 1 layout, 2 indirect args, 3 ring / draw limit / buffers.
+	int why = -1;
+	if (d.rec.buffer == nullptr) why = 0;
+	else if (d.rec_stride < 32 || (d.rec_stride & 3u) != 0 || d.rec.size < d.rec_stride || d.rec.size > NRecMax || (d.emit_stride & 3u) != 0 ||
+	         (has_sort && sort_size < d.sort_stride))
+		why = 1;
+	else if (has_sort && d.indirect && args_size < 8) why = 2;
+	else if (g_pn.failed || g_pn.draws.size() >= NDrawsMax) why = 3;
+	if (why >= 0) {
+		++g_pn.why[why];
 		++g_pn.draws_skipped;
 		return;
 	}
+	++g_pn.src_rec[d.rec_from > 2 ? 0 : d.rec_from];
+	++g_pn.src_sort[has_sort ? (d.sort_from > 2 ? 0 : d.sort_from) : 0];
+	// The records actually taken (a registered prefix may hold fewer than the V# count).
+	const uint32_t rec_count = static_cast<uint32_t>(std::min<uint64_t>(d.rec_count, d.rec.size / d.rec_stride));
 	auto& graphics = command.GetGraphics();
 	if (g_pn.ring.buffer == VK_NULL_HANDLE) {
 		g_pn.alignment = std::max<uint64_t>(graphics.GetPhysicalDeviceProperties().limits.minStorageBufferOffsetAlignment, 16);
@@ -596,6 +610,7 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 	const uint64_t a        = g_pn.alignment;
 	const uint64_t sort_off = AlignUp(g_pn.ring_used, a), emit_off = AlignUp(sort_off + sort_size, a), args_off = AlignUp(emit_off + emit_size, a);
 	if (args_off + args_size > NRingSize) {
+		++g_pn.why[3];
 		++g_pn.draws_skipped;
 		return;
 	}
@@ -627,9 +642,14 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 				return;
 			}
 		}
-	} else if (key.stride != d.rec_stride || key.count != d.rec_count) {
+	} else if (key.stride != d.rec_stride || key.count != rec_count) {
 		++g_pn.draws_skipped; // (another layout on the same buffer this frame)
 		return;
+	}
+	// Without a sort list a draw takes every record of its buffer: once per buffer and frame is enough.
+	if (!has_sort && !first) {
+		for (const NDraw& o: g_pn.draws)
+			if (o.key == k && o.sort_size == 0) return;
 	}
 	// Only a pass already open with this draw's state is resumed (attachments loaded, never cleared again: ResumeRendering);
 	// otherwise the draw's own BeginRendering opens it afterwards with its real load / clear operations.
@@ -639,12 +659,12 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 	Barrier(vk_command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
 	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
 	if (first) {
-		const vk::BufferCopy region {d.rec.offset, 0, d.rec.size};
+		const vk::BufferCopy region {d.rec.offset, 0, uint64_t {rec_count} * d.rec_stride};
 		vk_command.copyBuffer(d.rec.buffer, vk::Buffer(key.buf[key.cur].buffer), 1, &region);
-		key.copied_serial = g_pn.serial, key.stride = d.rec_stride, key.count = d.rec_count;
+		key.copied_serial = g_pn.serial, key.stride = d.rec_stride, key.count = rec_count;
 	}
 	const vk::Buffer ring(g_pn.ring.buffer);
-	{
+	if (sort_size > 0) {
 		const vk::BufferCopy region {d.sort.offset, sort_off, sort_size};
 		vk_command.copyBuffer(d.sort.buffer, ring, 1, &region);
 	}
@@ -663,10 +683,10 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 	g_pn.ring_used = args_off + args_size;
 	NDraw nd;
 	nd.key = k, nd.sort_off = sort_off, nd.emit_off = emit_off, nd.args_off = args_off, nd.sort_size = sort_size, nd.emit_size = emit_size;
-	nd.sort_stride = d.sort_stride, nd.sort_count = d.sort_count, nd.emit_stride = d.emit_stride;
+	nd.sort_stride = has_sort ? d.sort_stride : 0, nd.sort_count = has_sort ? static_cast<uint32_t>(sort_size / d.sort_stride) : 0, nd.emit_stride = d.emit_stride;
 	nd.emit_count  = emit_size > 0 && d.emit_stride > 0 ? static_cast<uint32_t>(emit_size / d.emit_stride) : 0;
-	nd.base = d.base_instance, nd.instances = d.instance_count, nd.indirect = d.indirect;
-	nd.first_word = d.indirect && d.base_from_args ? d.args_first_instance_word + 1 : 0;
+	nd.base = d.base_instance, nd.instances = d.instance_count, nd.indirect = d.indirect && has_sort;
+	nd.first_word = nd.indirect && d.base_from_args ? d.args_first_instance_word + 1 : 0;
 	nd.prev_valid = key.prev_serial != UINT64_MAX && key.prev_serial + 1 == g_pn.serial && key.prev_stride == d.rec_stride &&
 	                key.vp_prev_valid && key.buf[key.cur ^ 1].buffer != VK_NULL_HANDLE;
 	std::memcpy(nd.vp, d.vp, sizeof(nd.vp));
@@ -691,9 +711,13 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 	static bool said = false;
 	if (!said) {
 		said = true;
-		std::printf("FG particle native: first draw VS %016llx: records 0x%llx (%u x %u B), sorted list %u x %u B, emitters %u x %u B, %s\n",
-		            static_cast<unsigned long long>(d.vs), static_cast<unsigned long long>(d.rec_address), d.rec_count, d.rec_stride,
-		            d.sort_count, d.sort_stride, d.emit_count, d.emit_stride, d.indirect ? "indirect" : "direct");
+		static const char* const from[3] = {"none", "draw binding", "registered"};
+		std::printf("FG particle native: first draw VS %016llx: records 0x%llx (%u of %u x %u B, %s), sorted list %u x %u B (%s), "
+		            "emitters %u x %u B (%s), %s\n",
+		            static_cast<unsigned long long>(d.vs), static_cast<unsigned long long>(d.rec_address), rec_count, d.rec_count,
+		            d.rec_stride, from[d.rec_from > 2 ? 0 : d.rec_from], nd.sort_count, nd.sort_stride,
+		            from[has_sort && d.sort_from <= 2 ? d.sort_from : 0], nd.emit_count, d.emit_stride,
+		            from[d.emit_from > 2 ? 0 : d.emit_from], d.indirect ? "indirect" : "direct");
 		std::fflush(stdout);
 	}
 }

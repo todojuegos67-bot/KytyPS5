@@ -105,11 +105,19 @@ void Native() {
 	const uint t = gl_LocalInvocationIndex;
 	if (t == 0u) {
 		s_ok = 0;
-		const uint count = prm.argi.x != 0u ? args_w[1] : prm.argi.y;
-		const uint si    = (prm.argi.w != 0u ? args_w[prm.argi.w - 1u] : prm.sorti.z) + i;
-		if (i < count && si < prm.sorti.y) {
-			const uint slot = sort_w[si * (prm.sorti.x >> 2) + 1u];
-			if (slot < prm.reci.y) {
+		// (11-12) No sort list (sorti.x 0): workgroup i is record i, live when it moved since last frame (a dead record
+		// keeps its position: never a zero vector over a moving particle).
+		const bool nosort = prm.sorti.x == 0u;
+		const uint count  = nosort ? prm.reci.y : prm.argi.x != 0u ? args_w[1] : prm.argi.y;
+		const uint si     = nosort ? i : (prm.argi.w != 0u ? args_w[prm.argi.w - 1u] : prm.sorti.z) + i;
+		if (i < count && (nosort || si < prm.sorti.y)) {
+			const uint slot = nosort ? i : sort_w[si * (prm.sorti.x >> 2) + 1u];
+			bool       live = slot < prm.reci.y;
+			if (live && nosort) {
+				const vec3 p = RecV3(false, slot, 0u);
+				live = prm.reci.z != 0u && slot < prm.sorti.w && all(lessThan(abs(p), vec3(1e7))) && any(notEqual(p, RecV3(true, slot, 0u)));
+			}
+			if (live) {
 				atomicAdd(stats[10], 1u);
 				const uint em     = RecW(false, slot, 3u);
 				const bool ribbon = em < prm.argi.z && (emit_w[em * (prm.reci.w >> 2) + 12u] & 1u) != 0u;

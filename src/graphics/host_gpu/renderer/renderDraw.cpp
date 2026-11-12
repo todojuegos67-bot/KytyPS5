@@ -1915,15 +1915,46 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				struct Vs {
 					uint64_t base;
 					uint32_t stride, count;
+					uint64_t size; // bytes (stride 0: num_records is a byte count)
+					bool     ok;   // a plausible buffer V# (type 0, base set, size within 64 MiB)
 				};
+				// GCN V#: base [47:0], stride dword1 [29:16] (14 bits), num_records dword2, type dword3 [31:30] = 0.
 				const auto vsharp = [&](uint32_t off) {
 					const uint32_t* v = t + off / 4;
-					return Vs {(uint64_t {v[1] & 0xffffu} << 32 | v[0]), (v[1] >> 16) & 0x3fffu, v[2]};
+					Vs              r {(uint64_t {v[1] & 0xffffu} << 32 | v[0]), (v[1] >> 16) & 0x3fffu, v[2], 0, false};
+					r.size = r.stride != 0 ? uint64_t {r.stride} * r.count : uint64_t {r.count};
+					r.ok   = r.base != 0 && ((v[3] >> 30) & 3u) == 0 && r.size != 0 && r.size <= (64ull << 20);
+					return r;
 				};
-				const auto obtain = [&](uint64_t address, uint64_t size) {
+				// (11-12) The draw's own storage buffers (bindings.vertex: what its VS reads, resolved and bound for this very
+				// draw in this command buffer): the host handle of the range holding `address`. Nothing created or obtained.
+				const auto& vb    = bindings.vertex;
+				const auto& vres  = state.vs_input_info.stage.resources.buffers;
+				const bool  vb_ok = vb.buffers.size() == vb.buffer_sources.size() && vres.size() == vb.buffers.size();
+				const auto  bound = [&](uint64_t address, uint64_t size, FrameGen::ParticleNativeSrc& src) {
+					if (!vb_ok || address == 0 || size == 0) return false;
+					for (size_t i = 0; i < vb.buffers.size(); ++i) {
+						const auto& s = vb.buffer_sources[i];
+						const auto& b = vb.buffers[i];
+						if (s.address == 0 || s.size == 0 || !b.buffer || address < s.address || address >= s.address + s.size) continue;
+						if (b.range == VK_WHOLE_SIZE || b.range < s.size || b.range - s.size >= 256) continue;
+						// NativeStorageBuffer binds [aligned offset, size + adjustment): the guest base is at offset + adjustment.
+						src.buffer = b.buffer;
+						src.offset = b.offset + (b.range - s.size) + (address - s.address);
+						src.size   = std::min<uint64_t>(size, s.address + s.size - address);
+						return true;
+					}
+					return false;
+				};
+				const auto obtain = [&](uint64_t address, uint64_t size, uint8_t& from) {
 					FrameGen::ParticleNativeSrc src;
+					from = 0;
 					if (address == 0 || size == 0) return src;
-					// Only a buffer already registered over the range (the draw's own): nothing created or merged here.
+					if (bound(address, size, src)) {
+						from = 1;
+						return src;
+					}
+					// Else only a buffer already registered over the range: nothing created or merged here.
 					auto id = cache.RegisteredBuffer(address, size);
 					// (11-12) The game allocates the full V# range but registers (uses) less of it: the largest registered
 					// prefix, halving down to 4 KiB (the rest of the records lie past what was ever written).
@@ -1934,24 +1965,63 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					if (!id) return src;
 					auto& b = cache.GetBuffer(id);
 					src.buffer = b.Handle(), src.offset = b.Offset(address), src.size = size;
+					from       = 2;
 					return src;
 				};
-				const Vs                      em = vsharp(0xd8), so = vsharp(0xe8), re = vsharp(0xf8);
+				const Vs em = vsharp(0xd8), so = vsharp(0xe8), re = vsharp(0xf8);
+				{ // (11-12) Once per VS: the table's V#s and the draw's own bound buffers (to verify the layout in the log).
+					static uint64_t said[4] {};
+					static uint32_t said_n = 0;
+					bool            known  = false;
+					for (uint32_t i = 0; i < said_n; ++i) known = known || said[i] == prog.shader_hash;
+					if (!known && said_n < 4) {
+						said[said_n++] = prog.shader_hash;
+						std::printf("FG particle native: VS %016llx table V#s: emitters 0x%llx %u x %u B%s, sorted 0x%llx %u x %u B%s, "
+						            "records 0x%llx %u x %u B%s; the VS binds %zu buffers%s, %zu BDA read spans\n",
+						            static_cast<unsigned long long>(prog.shader_hash), static_cast<unsigned long long>(em.base), em.count,
+						            em.stride, em.ok ? "" : " (invalid)", static_cast<unsigned long long>(so.base), so.count, so.stride,
+						            so.ok ? "" : " (invalid)", static_cast<unsigned long long>(re.base), re.count, re.stride,
+						            re.ok ? "" : " (invalid)", vres.size(), vb_ok ? "" : " (bindings mismatch)",
+						            prog.bda_read_plan.spans.size());
+						for (size_t i = 0; i < vres.size() && i < prog.info.buffers.size(); ++i) {
+							if (vres[i].dword_count < 4) continue;
+							const auto d = DecodeNativeDescriptor<ShaderBufferResource>(vres[i]);
+							std::printf("FG particle native:   buffer %zu: 0x%llx stride %u records %u%s%s%s\n", i,
+							            static_cast<unsigned long long>(d.Base48()), static_cast<unsigned>(d.Stride()), d.NumRecords(),
+							            prog.info.buffers[i].read ? " read" : "", prog.info.buffers[i].written ? " written" : "",
+							            prog.info.buffers[i].scalar ? " scalar" : "");
+						}
+						std::fflush(stdout);
+					}
+				}
 				FrameGen::ParticleNativeDraw nd;
 				nd.vs          = prog.shader_hash;
 				nd.rec_address = re.base;
-				nd.rec_stride = re.stride, nd.rec_count = re.count, nd.sort_stride = so.stride, nd.sort_count = so.count;
-				nd.emit_stride = em.stride, nd.emit_count = em.count;
-				const uint64_t limit = 64ull << 20;
-				if (re.stride != 0 && so.stride != 0 && uint64_t {re.stride} * re.count <= limit && uint64_t {so.stride} * so.count <= limit) {
-					nd.rec  = obtain(re.base, uint64_t {re.stride} * re.count);
-					nd.sort = obtain(so.base, uint64_t {so.stride} * so.count);
-					if (em.stride != 0 && uint64_t {em.stride} * em.count <= limit) nd.emit = obtain(em.base, uint64_t {em.stride} * em.count);
+				nd.rec_stride = re.stride, nd.rec_count = re.count;
+				// The records must be a strided array (the VS indexes them by slot); else the draw is skipped (layout).
+				if (re.ok && re.stride >= 32 && re.stride <= 1024 && (re.stride & 3u) == 0) {
+					nd.rec = obtain(re.base, re.size, nd.rec_from);
+					// The sorted list: (key, slot) pairs; a V# with stride 0 counts bytes (8 B entries then). Without a usable
+					// one the capture takes every record instead (no sort list: live = moved since last frame).
+					if (so.ok) {
+						const uint32_t s_stride = so.stride != 0 ? so.stride : 8u;
+						const uint32_t s_count  = so.stride != 0 ? so.count : so.count / 8u;
+						if (s_stride >= 8 && s_stride <= 64 && (s_stride & 3u) == 0 && s_count != 0) {
+							nd.sort = obtain(so.base, uint64_t {s_stride} * s_count, nd.sort_from);
+							if (nd.sort.buffer) nd.sort_stride = s_stride, nd.sort_count = s_count;
+						}
+					}
+					if (!nd.sort.buffer) nd.sort = {}, nd.sort_from = 0;
+					if (em.ok && em.stride >= 52 && (em.stride & 3u) == 0) { // (the shader reads emitter word 12)
+						nd.emit = obtain(em.base, em.size, nd.emit_from);
+						if (nd.emit.buffer) nd.emit_stride = em.stride, nd.emit_count = em.count;
+					}
 					for (int r = 0; r < 4; ++r)
 						for (int c = 0; c < 4; ++c) std::memcpy(&nd.vp[r * 4 + c], t + r * 4 + c, 4);
 					nd.indirect = emit.gpu_args != 0;
 					if (nd.indirect) {
-						nd.args = obtain(emit.gpu_args, emit.indexed ? 20 : 16);
+						uint8_t args_from = 0;
+						nd.args           = obtain(emit.gpu_args, emit.indexed ? 20 : 16, args_from);
 						// The instance offset SGPR is s10: the arguments' first instance, else the user data.
 						nd.base_from_args           = prog.info.instance_offset_sgpr == 10;
 						nd.args_first_instance_word = emit.indexed ? 4 : 3;

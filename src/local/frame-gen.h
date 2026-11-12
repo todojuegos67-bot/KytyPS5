@@ -360,6 +360,9 @@ struct ParticleNativeDraw {
 	uint32_t          sort_stride = 0, sort_count = 0, rec_stride = 0, rec_count = 0, emit_stride = 0, emit_count = 0;
 	uint32_t          base_instance = 0, instance_count = 0, args_first_instance_word = 0;
 	bool              indirect = false, base_from_args = false;
+	// (11-12) Where each copy comes from: 0 none, 1 the draw's own storage-buffer binding, 2 a registered cached buffer.
+	// No sort list (sort.buffer null): every record is taken (live = moved since last frame).
+	uint8_t           rec_from = 0, sort_from = 0, emit_from = 0;
 	float             vp[16] {};
 };
 [[nodiscard]] bool ParticleNativeWanted();
