@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "graphics/presentation/videoOut.h"
+#include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -43,7 +44,27 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("MCJ8SkzsQxY", VideoOut::VideoOutLatencyMeasureSetStartPoint);
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
+	LIB_FUNC("WkYtyOg30do", VideoOut::VideoOutSetFlipMaster);
+	LIB_FUNC("MBlv8YWoyOk", VideoOut::VideoOutAddBufferAttributeOption);
+	LIB_FUNC("5tRaBjtdTzY", VideoOut::VideoOutVrrPegToFixedRate);
+	LIB_FUNC("T4ucGB8CsnM", VideoOut::VideoOutVrrUnpegFromFixedRate);
+	LIB_FUNC("w7Ipp9Xl7hg", VideoOut::VideoOutAllowOutputResolutionWqhdDetection);
 }
+
+namespace VrrStatus {
+
+LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
+
+static KYTY_SYSV_ABI int VideoOutVrrStatus_kP2L8t3j_aM() {
+	// GT7 calls it with no arguments; fixed refresh here: success.
+	return OK;
+}
+
+LIB_DEFINE(InitVideoOutVrrStatus_1) {
+	LIB_FUNC("kP2L8t3j-aM", VideoOutVrrStatus_kP2L8t3j_aM);
+}
+
+} // namespace VrrStatus
 
 } // namespace LibGen5
 
