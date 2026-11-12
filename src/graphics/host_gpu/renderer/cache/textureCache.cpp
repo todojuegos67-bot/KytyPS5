@@ -657,6 +657,8 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 		for (const auto id: victims) m_retired.emplace_back(id, packet);
 		EraseRetired();
 		LiveCounters::Add(LiveCounters::GcImageDeletes, victims.size());
+		VramSaverAdd(VramEvicted, victims.size());
+		VramSaverAdd(VramEvictedBytes, freed);
 	}
 	static std::atomic<uint32_t> reports {0};
 	if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -3745,6 +3747,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fai
 			// (No image: the caller binds a null one. Memory it could not have is not asked for at every draw.)
 			if (may_fail && RecentlyFailed(desc.info)) return {};
 			result = InsertImage(desc.info, may_fail);
+			// KYTY_VRAM_SAVER (a GPU short of video memory only): a texture the GPU could not make was a null (black)
+			// one; images unused for 16 flips go (ReclaimImageMemory) and it is tried once more. (Not on a
+			// speculation's recorder: it cannot wait for the GPU.)
+			if (!result && may_fail && m_graphics.VramSaver() && CommandScheduler::ThreadRecorder() == nullptr &&
+			    !AsyncUpload::t_worker && !CommandScheduler::InDeferredOperation()) {
+				if (ReclaimImageMemory(desc.info.data.size, false) != 0) {
+					std::erase_if(m_failed_images, [&](const FailedImage& failed) {
+						return failed.address == desc.info.data.address;
+					});
+					result = InsertImage(desc.info, may_fail);
+					if (result) VramSaverAdd(VramRescued, 1);
+				}
+			}
 			if (!result) return {};
 			auto& inserted       = m_slot_images[result];
 			inserted.guest_alias = m_alias_insert;
@@ -5439,6 +5454,23 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	// KYTY_VRAM_SAVER: where the video memory stands every 2 s (a GPU short of it only).
+	if (m_graphics.VramSaver()) {
+		static auto last_vram_log = std::chrono::steady_clock::now();
+		if (const auto now = std::chrono::steady_clock::now(); now - last_vram_log >= std::chrono::seconds(2)) {
+			last_vram_log = now;
+			std::printf("[vram] used %llu / budget %llu MiB, evicted %llu (%llu MiB), fallback host %llu, failed %llu, "
+			            "rescued %llu\n",
+			            static_cast<unsigned long long>(m_graphics.GetDeviceMemoryUsage() >> 20u),
+			            static_cast<unsigned long long>(m_graphics.GetTotalMemoryBudget(false) >> 20u),
+			            static_cast<unsigned long long>(VramSaverGet(VramEvicted)),
+			            static_cast<unsigned long long>(VramSaverGet(VramEvictedBytes) >> 20u),
+			            static_cast<unsigned long long>(VramSaverGet(VramFallbackHost)),
+			            static_cast<unsigned long long>(VramSaverGet(VramFailed)),
+			            static_cast<unsigned long long>(VramSaverGet(VramRescued)));
+			std::fflush(stdout);
+		}
+	}
 	// Every 30 seconds: where the video memory and the process's memory stand (the run log).
 	static auto last_report = std::chrono::steady_clock::now();
 	if (m_graphics.CanReportMemoryUsage() && std::chrono::steady_clock::now() - last_report >= std::chrono::seconds(30)) {
@@ -5618,6 +5650,8 @@ void TextureCache::RunGarbageCollector() {
 			std::fflush(stdout);
 		}
 		if (by_ram) RamGuard::NoteReleased(RamGuard::Images, 1, owner->info.data.size);
+		VramSaverAdd(VramEvicted, 1);
+		VramSaverAdd(VramEvictedBytes, owner->info.data.size);
 		DeleteImage(id);
 		LiveCounters::Add(LiveCounters::GcImageDeletes);
 	}

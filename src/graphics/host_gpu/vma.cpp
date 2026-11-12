@@ -599,6 +599,22 @@ static uint64_t FlushImagePool(uint64_t budget, uint64_t* held_us) {
 	return bytes;
 }
 
+static std::atomic<uint64_t> g_vram_saver_counters[VramCounterCount] {};
+void VramSaverAdd(int counter, uint64_t value) {
+	if (counter >= 0 && counter < VramCounterCount) g_vram_saver_counters[counter].fetch_add(value, std::memory_order_relaxed);
+}
+uint64_t VramSaverGet(int counter) {
+	return counter >= 0 && counter < VramCounterCount ? g_vram_saver_counters[counter].load(std::memory_order_relaxed) : 0;
+}
+
+bool GraphicContext::VramSaver() const {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_VRAM_SAVER");
+		return env == nullptr || std::strcmp(env, "0") != 0;
+	}();
+	return enabled && small_video_memory;
+}
+
 void GraphicContext::TrimImagePool() {
 	if (allocator != nullptr) DestroyImagePool(allocator);
 }
@@ -692,11 +708,13 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 				if (created) vmaGetAllocationInfo(allocator, image.allocation, &allocated);
 			}
 			if (created) {
+				VramSaverAdd(VramFallbackHost, 1);
 				ReportMemoryFallback("an image is in system memory", allocated.size);
 			} else {
 				// (Which memory ran out: OUT_OF_HOST_MEMORY is the system's commit, OUT_OF_DEVICE_MEMORY the GPU's.)
 				const auto what = "an image could not be created (" + vk::to_string(result) + ")";
 				ReportMemoryFallback(what.c_str(), 0);
+				VramSaverAdd(VramFailed, 1);
 				return false;
 			}
 		}

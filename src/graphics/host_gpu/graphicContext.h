@@ -196,6 +196,9 @@ struct GraphicContext {
 	}
 	std::vector<vk::DeviceMemory> simulation_ballast;
 	uint64_t                      simulation_ballast_bytes = 0;
+	// KYTY_VRAM_SAVER (on unless "0"): only on a GPU short of video memory (small_video_memory), textures the GPU could
+	// not make get room made and one more try instead of a null (black) texture; "[vram]" log line every 2 s.
+	[[nodiscard]] bool            VramSaver() const;
 	void                   AppendHardwareRayTracingDeviceExtensions(
 	    const std::vector<vk::ExtensionProperties>& available_extensions,
 	    std::vector<const char*>&                   device_extensions);
@@ -240,6 +243,11 @@ struct VulkanImage {
 };
 
 
+
+// KYTY_VRAM_SAVER counters (vma.cpp), for its "[vram]" log line.
+enum VramSaverCounter { VramEvicted = 0, VramEvictedBytes, VramFallbackHost, VramFailed, VramRescued, VramCounterCount };
+void     VramSaverAdd(int counter, uint64_t value);
+uint64_t VramSaverGet(int counter);
 
 // Offline tools: the emulator's device without a window (vulkanWindow.cpp).
 bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx);
