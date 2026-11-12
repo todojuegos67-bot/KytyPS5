@@ -2315,10 +2315,29 @@ private:
 
 	bool ProtectMappedPages(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, bool trackers) {
 		const auto end = vaddr + size;
-		auto       it  = m_mapped.upper_bound(vaddr);
+		// The region this thread's last call found, while m_mapped has not changed since (the caller holds m_mutex, which
+		// every change takes exclusively): a range inside it protects that region's pages as the walk below would, without
+		// the tree walk. (1-1, 120 Hz cap: ~1,000 protections a frame, ~6,000 regions; in play ~45% of the calls hit, at
+		// start-up ~88%. ABBA 1-1 / Latria / arena: render -0.22 / -0.06 / -0.10 ms, the render thread's waits for the
+		// upload worker -25 / -43 / -59 us a frame.)
+		struct Found {
+			const void*  owner      = nullptr;
+			uint64_t     generation = 0;
+			MappedRegion region;
+		};
+		thread_local Found found;
+		const auto         generation = m_mapped_generation.load(std::memory_order_relaxed);
+		if (found.owner == this && found.generation == generation && vaddr >= found.region.vaddr &&
+		    end <= found.region.vaddr + found.region.size) {
+			LiveTrace::SlowOsCallScope slow(LiveTrace::OsProtect, vaddr, size);
+			return ProtectView(vaddr, size, mode, found.region.type, trackers);
+		}
+		auto it = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {
 			--it;
 		}
+		if (it != m_mapped.end() && it->second.vaddr <= vaddr && end <= it->second.vaddr + it->second.size)
+			found = {this, generation, it->second};
 #if defined(__linux__)
 		static const bool coalesce = [] {
 			const char* value = std::getenv("KYTY_LINUX_COALESCE_MPROTECT");
@@ -2600,6 +2619,7 @@ private:
 				return false;
 			}
 		}
+		m_mapped_generation.fetch_add(1, std::memory_order_relaxed);
 		return m_mapped.emplace(vaddr, MappedRegion {vaddr, size, type}).second;
 	}
 
@@ -2607,6 +2627,7 @@ private:
 		if (!ContainsMappedUnlocked(vaddr, size, type)) {
 			return false;
 		}
+		m_mapped_generation.fetch_add(1, std::memory_order_relaxed);
 		const auto end     = vaddr + size;
 		auto       current = vaddr;
 		while (current < end) {
@@ -2959,6 +2980,9 @@ private:
 	std::condition_variable_any                m_busy_done;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	// Moves with every change of m_mapped (under m_mutex exclusive): a region a thread found earlier is still m_mapped's
+	// while it has not moved (ProtectMappedPages' lookup cache).
+	std::atomic<uint64_t>                      m_mapped_generation {0};
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
