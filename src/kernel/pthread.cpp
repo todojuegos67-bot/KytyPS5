@@ -4741,6 +4741,10 @@ int KYTY_SYSV_ABI pthread_attr_setschedpolicy(LibKernel::PthreadAttr* attr, int 
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetschedpolicy(attr, policy));
 }
 
+int KYTY_SYSV_ABI pthread_attr_setstack(LibKernel::PthreadAttr* attr, void* addr, size_t size) {
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetstack(attr, addr, size));
+}
+
 int KYTY_SYSV_ABI pthread_attr_setstacksize(LibKernel::PthreadAttr* attr, size_t stack_size) {
 	// PRINT_NAME();
 
