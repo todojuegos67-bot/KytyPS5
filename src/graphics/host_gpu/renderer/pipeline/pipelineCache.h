@@ -462,6 +462,16 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	// KYTY_TABLE (tableMode.h): the programs table of GetGraphicsPrograms (GPU thread).
+	struct ProgramTable;
+	std::unique_ptr<ProgramTable> m_program_table;
+	GraphicsPrograms
+	GetGraphicsProgramsFull(const HW::VertexShaderInfo& vertex_regs,
+	                        const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+	                        const HW::Context& context, const HW::UserConfig& user_config,
+	                        std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                        bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	                        ShaderPixelInputInfo& pixel_info);
 	// Round 159: the fragment shaders' copies that apply PA_SC_AA_MASK (destroyed first).
 	std::unique_ptr<CoverageVariants> m_coverage;
 	// The driver cache new pipelines go to, saved to m_driver_cache_path; round 92: and the older

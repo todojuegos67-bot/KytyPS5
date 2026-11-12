@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/speculation.h"
+#include "graphics/host_gpu/renderer/tableMode.h"
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
@@ -47,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <thread>
 #include <unordered_map>
 #include <deque>
@@ -4382,6 +4384,12 @@ struct PipelineCache::ProgramCache {
 	uint32_t                                                    exact_float_failures  = 0;
 	bool                                                        exact_float_logged    = false;
 	uint64_t                                                    next_shader_id = 0;
+	// KYTY_TABLE (tableMode.h): while table_capture is set (GetGraphicsPrograms' table path, GPU
+	// thread), each TakeScanned that serves a stage notes the read set it validated, in call order;
+	// a stage served otherwise (a walk here) leaves table_capture_count short.
+	bool                                      table_capture       = false;
+	uint32_t                                  table_capture_count = 0;
+	std::array<const DrawPrep::ReadSet*, 4>   table_capture_reads {};
 	// SPIR-V size of the last permutation compiled (for the profiler).
 	size_t                                                      last_spirv_words = 0;
 	// The shader disk cache (null when off) and its session key, built at first use.
@@ -4828,6 +4836,9 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		result->consumed = true;
+		if (table_capture && table_capture_count < table_capture_reads.size()) {
+			table_capture_reads[table_capture_count++] = &result->reads;
+		}
 		// The refresh as it will be used: the result's before the swap, the entry's when again.
 		const auto& used_resources      = again ? entry.resources : result->resources;
 		const auto& used_specialization = again ? entry.specialization : result->specialization;
@@ -4894,6 +4905,87 @@ struct PipelineCache::ProgramCache {
 
 	void SetDeferTranslation(bool value) { defer_translation = value; }
 };
+
+// KYTY_TABLE (tableMode.h): GetGraphicsPrograms' table. An entry holds a draw's registers (its key),
+// what GetGraphicsPrograms made of them, the stages' resource snapshots (owned here: the program
+// cache's source entry is refreshed by every later draw of the shader) and the read sets their
+// walks recorded (with the KYTY_MT_PROG seal). GPU thread only.
+struct PipelineCache::ProgramTable {
+	static constexpr uint32_t Slots     = 16384;
+	static constexpr uint32_t SeenSlots = 65536;
+
+	struct Entry {
+		uint64_t                                       hash           = 0;
+		uint64_t                                       program_gen    = 0;
+		uint64_t                                       shader_map_gen = 0;
+		HW::VertexShaderInfo                           vertex_regs;
+		HW::PixelShaderInfo                            pixel_regs;
+		HW::Context                                    context;
+		HW::UserConfig                                 user_config;
+		std::array<Prospero::ColorComponentMapping, 8> export_mapping {};
+		bool                                           pixel_active = false;
+		GraphicsPrograms                               programs;
+		uint32_t                                       vertex_count = 0;
+		std::array<ShaderVertexInputInfo, 3>           vertex_info {};
+		ShaderPixelInputInfo                           pixel_info {};
+		// [0..2] the vertex stages, [3] the pixel stage.
+		std::array<ShaderRecompiler::IR::ResourceSnapshot, 4> snapshots;
+		uint32_t                                              read_count = 0;
+		std::array<DrawPrep::ReadSet, 4>                      reads;
+	};
+
+	std::vector<std::unique_ptr<Entry>> slots {Slots};
+	std::vector<uint64_t>               seen = std::vector<uint64_t>(SeenSlots, 0);
+
+	static uint64_t Hash(const HW::VertexShaderInfo& vertex_regs,
+	                     const HW::PixelShaderInfo& pixel_regs, const HW::Context& context,
+	                     const HW::UserConfig&                               user_config,
+	                     std::span<const Prospero::ColorComponentMapping, 8> export_mapping,
+	                     bool                                                pixel_active) {
+		uint64_t h = XXH3_64bits(&context, sizeof(context));
+		h          = XXH3_64bits_withSeed(&vertex_regs, sizeof(vertex_regs), h);
+		h          = XXH3_64bits_withSeed(&pixel_regs, sizeof(pixel_regs), h);
+		h          = XXH3_64bits_withSeed(&user_config, sizeof(user_config), h);
+		h          = XXH3_64bits_withSeed(export_mapping.data(), export_mapping.size_bytes(), h);
+		return h ^ (pixel_active ? 0x9e3779b97f4a7c15ull : 0u) ^ 1u; // never 0
+	}
+
+	[[nodiscard]] static bool SameKey(const Entry& e, const HW::VertexShaderInfo& vertex_regs,
+	                                  const HW::PixelShaderInfo& pixel_regs,
+	                                  const HW::Context& context, const HW::UserConfig& user_config,
+	                                  std::span<const Prospero::ColorComponentMapping, 8> mapping,
+	                                  bool pixel_active) {
+		return e.pixel_active == pixel_active &&
+		       std::memcmp(&e.context, &context, sizeof(context)) == 0 &&
+		       std::memcmp(&e.vertex_regs, &vertex_regs, sizeof(vertex_regs)) == 0 &&
+		       std::memcmp(&e.pixel_regs, &pixel_regs, sizeof(pixel_regs)) == 0 &&
+		       std::memcmp(&e.user_config, &user_config, sizeof(user_config)) == 0 &&
+		       std::memcmp(e.export_mapping.data(), mapping.data(), mapping.size_bytes()) == 0;
+	}
+};
+
+static_assert(std::is_trivially_copyable_v<HW::Context> &&
+              std::is_trivially_copyable_v<HW::VertexShaderInfo> &&
+              std::is_trivially_copyable_v<HW::PixelShaderInfo> &&
+              std::is_trivially_copyable_v<HW::UserConfig> &&
+              std::is_trivially_copyable_v<Prospero::ColorComponentMapping>);
+
+// KYTY_TABLE=2: a resource snapshot as the table holds it and as the normal path made it.
+static const char* TableSnapshotDiff(const ShaderRecompiler::IR::ResourceSnapshot& a,
+                                     const ShaderRecompiler::IR::ResourceSnapshot& b) {
+	if (a.buffers != b.buffers) return "buffers";
+	if (a.images != b.images) return "images";
+	if (a.samplers != b.samplers) return "samplers";
+	if (a.flattened_srt != b.flattened_srt) return "flattened_srt";
+	if (a.user_data != b.user_data) return "user_data";
+	if (a.bindless_heaps != b.bindless_heaps) return "bindless_heaps";
+	if (a.bindless_sampler_heaps != b.bindless_sampler_heaps) return "bindless_sampler_heaps";
+	if (a.buffer_write_extents != b.buffer_write_extents) return "buffer_write_extents";
+	if (a.specialization_reads != b.specialization_reads) return "specialization_reads";
+	if (!(a.uniform_fill == b.uniform_fill)) return "uniform_fill";
+	if (a.gpu_fills != b.gpu_fills) return "gpu_fills";
+	return nullptr;
+}
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
@@ -6219,6 +6311,173 @@ static uint64_t DrawPrepTessIdentity(const HW::VertexShaderInfo& vertex_regs,
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	// KYTY_TABLE (tableMode.h). The key is the registers describe reads: the shader registers are
+	// the context's own (RefreshShaders); anything else, or a bisect step, takes the normal path.
+	if (!TableMode::Enabled() || &sh != &context.GetShaderRegisters() || Bisect::Active()) {
+		return GetGraphicsProgramsFull(vertex_regs, pixel_regs, sh, context, user_config,
+		                               target_export_mapping, pixel_active, vertex_info, pixel_info);
+	}
+	TableMode::LogIfDue();
+	TableMode::ProgramHitFlag() = false;
+	if (m_program_table == nullptr) {
+		m_program_table = std::make_unique<ProgramTable>();
+	}
+	auto&          table = *m_program_table;
+	const uint64_t hash  = ProgramTable::Hash(vertex_regs, pixel_regs, context, user_config,
+                                             target_export_mapping, pixel_active);
+	const uint64_t program_gen    = m_program_cache->next_shader_id;
+	const uint64_t shader_map_gen = ShaderMapGeneration();
+	auto&          slot           = table.slots[hash & (ProgramTable::Slots - 1u)];
+
+	// The table's answer, when the entry holds.
+	ProgramTable::Entry* hit = nullptr;
+	if (slot != nullptr && slot->hash == hash &&
+	    ProgramTable::SameKey(*slot, vertex_regs, pixel_regs, context, user_config,
+	                          target_export_mapping, pixel_active)) {
+		if (slot->program_gen != program_gen || slot->shader_map_gen != shader_map_gen) {
+			TableMode::Add(TableMode::Counter::ProgramMissStale);
+		} else {
+			bool reads_hold = true;
+			for (uint32_t i = 0; i < slot->read_count && reads_hold; i++) {
+				reads_hold = slot->reads[i].ValidateFast();
+			}
+			if (reads_hold) {
+				hit = slot.get();
+			} else {
+				TableMode::Add(TableMode::Counter::ProgramMissReads);
+			}
+		}
+	} else {
+		TableMode::Add(TableMode::Counter::ProgramMissNew);
+	}
+
+	if (hit != nullptr && !TableMode::Verifying()) {
+		TableMode::Add(TableMode::Counter::ProgramHits);
+		TableMode::ProgramHitFlag() = true;
+		for (uint32_t i = 0; i < hit->vertex_count; i++) {
+			vertex_info[i] = hit->vertex_info[i];
+		}
+		if (pixel_active) {
+			pixel_info = hit->pixel_info;
+		}
+		GraphicsPrograms result = hit->programs;
+		result.redrawn_target   = RedrawnTargetDraw(context);
+		return result;
+	}
+
+	// The normal path, noting the read sets its stages' draw-prep results were validated with.
+	m_program_cache->table_capture       = true;
+	m_program_cache->table_capture_count = 0;
+	auto result = GetGraphicsProgramsFull(vertex_regs, pixel_regs, sh, context, user_config,
+	                                      target_export_mapping, pixel_active, vertex_info,
+	                                      pixel_info);
+	m_program_cache->table_capture = false;
+	const uint32_t captured        = m_program_cache->table_capture_count;
+	const bool     complete        = static_cast<bool>(result.vertex[0]) &&
+	                      (!pixel_active || static_cast<bool>(result.pixel));
+	const uint32_t vertex_count = complete ? result.VertexStageCount() : 0u;
+
+	if (hit != nullptr) {
+		// KYTY_TABLE=2: the table's answer against the normal path's; the normal one draws.
+		TableMode::Add(TableMode::Counter::ProgramHits);
+		TableMode::ProgramHitFlag() = true;
+		TableMode::Add(TableMode::Counter::ProgramVerifyChecks);
+		const char* diff = nullptr;
+		if (!complete) {
+			diff = "the normal path made no programs";
+		} else if (vertex_count != hit->vertex_count) {
+			diff = "vertex stage count";
+		} else if (pixel_active && (result.pixel.id != hit->programs.pixel.id ||
+		                            pixel_info.stage.program != hit->pixel_info.stage.program)) {
+			diff = "pixel program";
+		} else if (pixel_active && (diff = TableSnapshotDiff(*pixel_info.stage.resources,
+		                                                     hit->snapshots[3])) != nullptr) {
+		} else {
+			for (uint32_t i = 0; i < vertex_count && diff == nullptr; i++) {
+				if (result.vertex[i].id != hit->programs.vertex[i].id ||
+				    result.vertex[i].normalized_samplers !=
+				        hit->programs.vertex[i].normalized_samplers ||
+				    vertex_info[i].stage.program != hit->vertex_info[i].stage.program) {
+					diff = "vertex program";
+				} else {
+					diff = TableSnapshotDiff(*vertex_info[i].stage.resources, hit->snapshots[i]);
+				}
+			}
+		}
+		if (diff != nullptr) {
+			TableMode::Add(TableMode::Counter::ProgramVerifyMismatches);
+			if (TableMode::VerifyLogAllowed()) {
+				LOGF("Table verify: programs of vs 0x%012" PRIx64 " ps 0x%012" PRIx64
+				     " differ from the normal path: %s (entry dropped)\n",
+				     static_cast<uint64_t>(vertex_regs.es_regs.data_addr),
+				     static_cast<uint64_t>(pixel_regs.ps_regs.data_addr), diff);
+			}
+			slot.reset();
+		}
+		return result;
+	}
+	TableMode::Add(TableMode::Counter::ProgramMisses);
+	if (!complete) {
+		return result;
+	}
+	bool fetch_tables = false;
+	for (uint32_t i = 0; i < vertex_count; i++) {
+		fetch_tables = fetch_tables || vertex_info[i].fetch_embedded || vertex_info[i].fetch_external;
+	}
+	if (fetch_tables || captured != vertex_count + (pixel_active ? 1u : 0u)) {
+		// Describe read vertex tables from guest memory (no read set covers them), or a stage was
+		// walked here: not kept.
+		TableMode::Add(TableMode::Counter::ProgramNotStored);
+		if (fetch_tables) {
+			TableMode::Add(TableMode::Counter::ProgramFetchTables);
+		}
+		return result;
+	}
+	// Kept the second time its key comes (most keys come once: user data in per-frame memory).
+	auto& seen = table.seen[hash & (ProgramTable::SeenSlots - 1u)];
+	if (seen != hash) {
+		seen = hash;
+		return result;
+	}
+	if (slot == nullptr) {
+		slot = std::make_unique<ProgramTable::Entry>();
+	}
+	auto& e          = *slot;
+	e.hash           = hash;
+	e.program_gen    = program_gen;
+	e.shader_map_gen = shader_map_gen;
+	std::memcpy(&e.vertex_regs, &vertex_regs, sizeof(vertex_regs));
+	std::memcpy(&e.pixel_regs, &pixel_regs, sizeof(pixel_regs));
+	std::memcpy(&e.context, &context, sizeof(context));
+	std::memcpy(&e.user_config, &user_config, sizeof(user_config));
+	std::memcpy(e.export_mapping.data(), target_export_mapping.data(),
+	            target_export_mapping.size_bytes());
+	e.pixel_active  = pixel_active;
+	e.programs      = result;
+	e.vertex_count  = vertex_count;
+	for (uint32_t i = 0; i < vertex_count; i++) {
+		e.vertex_info[i] = vertex_info[i];
+		e.snapshots[i]   = *vertex_info[i].stage.resources;
+		e.vertex_info[i].stage.resources = &e.snapshots[i];
+	}
+	if (pixel_active) {
+		e.pixel_info                = pixel_info;
+		e.snapshots[3]              = *pixel_info.stage.resources;
+		e.pixel_info.stage.resources = &e.snapshots[3];
+	}
+	e.read_count = captured;
+	for (uint32_t i = 0; i < captured; i++) {
+		e.reads[i] = *m_program_cache->table_capture_reads[i];
+	}
+	TableMode::Add(TableMode::Counter::ProgramStored);
+	return result;
+}
+
+PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsProgramsFull(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,

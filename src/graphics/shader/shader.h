@@ -372,6 +372,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// KYTY_TABLE: moves whenever a shader is registered (a described draw may describe otherwise).
+[[nodiscard]] uint64_t ShaderMapGeneration();
 // The guest hash the shader binary declares (a content hash when it declares none).
 uint64_t ShaderDeclaredHash(uint64_t shader_addr);
 

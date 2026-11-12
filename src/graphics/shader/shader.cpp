@@ -132,6 +132,10 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	g_shader_map_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
+uint64_t ShaderMapGeneration() {
+	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 

@@ -120,7 +120,10 @@ int VerifyMode() {
 bool MtProgEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_MT_PROG");
-		return value != nullptr && value[0] != '\0' && value[0] != '0';
+		// KYTY_TABLE (tableMode.h) checks its programs table through the same seal.
+		const char* table = std::getenv("KYTY_TABLE");
+		return (value != nullptr && value[0] != '\0' && value[0] != '0') ||
+		       (table != nullptr && table[0] != '\0' && table[0] != '0');
 	}();
 	return enabled;
 }
