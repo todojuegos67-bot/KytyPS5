@@ -56,6 +56,26 @@ std::atomic_bool& RuntimeRecordsSwitch() {
 	return value;
 }
 
+// Round rtexp: canonical expansions (KYTY_CALL_CANONICAL=0 turns them off). A table call's
+// inlined variants are emitted in ascending order of target (and data), whatever order they were
+// chosen in, so the same set always gives the same code (and the same cache key); and a material
+// table call of runtime records inlines the union of the reported targets every table of the
+// shader offered so far in this run (CallSite union, Expand), not just the current table's. GT7
+// dispatches one material pass over several tables a frame, and each table's own set made an
+// expansion of its own: a dozen programs and pipeline compiles of one shader at once, then more
+// as the tables grew. A target in the union that the current table does not hold is never
+// selected by its call (the compare against its address never matches), so the extra bodies are
+// dead code there; when the call does name it, the body is that target's code as read now
+// (StillReads), as the real call would run.
+std::atomic_bool& CanonicalSwitch() {
+	static std::atomic_bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_CANONICAL");
+		return text == nullptr || text[0] != '0';
+	}();
+	return value;
+}
+std::atomic<uint64_t> g_union_growths {0};
+
 bool RuntimeRecords() {
 	return RuntimeRecordsSwitch().load(std::memory_order_relaxed);
 }
@@ -976,6 +996,12 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			st.callee_words += function.code.size();
 			call.variants.emplace_back(variant, *found->second);
 		}
+		if (CanonicalSwitch().load(std::memory_order_relaxed)) {
+			// The chosen set in canonical order: the selection chains compare distinct
+			// variants, so their order changes the code but not what runs.
+			std::sort(call.variants.begin(), call.variants.end(),
+			          [](const auto& a, const auto& b) { return a.first < b.first; });
+		}
 		st.inlined += call.variants.size();
 		calls.emplace(site.pc, std::move(call));
 	}
@@ -1558,6 +1584,9 @@ struct ShaderFunctionExpander::Impl {
 		// out of the partitions.
 		std::optional<std::string> unpartitionable; // why not (empty: it is partitioned)
 		std::set<uint64_t>         unpartitioned;
+		// Round rtexp: per call site (pc), the reported targets any table of the shader offered
+		// in this run (ascending): what its material table calls inline (CanonicalSwitch).
+		std::map<uint32_t, std::vector<CallSite::Variant>> union_targets;
 	};
 	// GT7 dispatches one material shader over several tables a frame.
 	static constexpr size_t MaxExpansions = 32;
@@ -1943,6 +1972,27 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		}
 	}
 	const bool partitioned = partition != nullptr && !partition->targets.empty();
+	if (!partitioned && shader_hash != 0 && !null_calls && RuntimeRecords() &&
+	    CanonicalSwitch().load(std::memory_order_relaxed)) {
+		for (auto& site: sites) {
+			// The material table calls that offer only reported targets (SelectTableTargets).
+			if (!site.dynamic || site.specialized || !site.records || site.null_callee) continue;
+			auto& known = shader.union_targets[site.pc];
+			if (!std::includes(known.begin(), known.end(), site.preferred.begin(),
+			                   site.preferred.end())) {
+				std::vector<CallSite::Variant> merged;
+				merged.reserve(known.size() + site.preferred.size());
+				std::set_union(known.begin(), known.end(), site.preferred.begin(),
+				               site.preferred.end(), std::back_inserter(merged));
+				known = std::move(merged);
+				g_union_growths.fetch_add(1, std::memory_order_relaxed);
+			}
+			// Every candidate is preferred: the code depends on the union alone, not on which
+			// table this dispatch reads (over the size bound, the highest targets are left out).
+			site.variants  = known;
+			site.preferred = known;
+		}
+	}
 	for (const auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
@@ -2015,6 +2065,27 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	}
 	shader.expansions.push_back(std::move(expansion));
 	return shader.expansions.back().ok;
+}
+
+bool ShaderCallCanonical() {
+	return CanonicalSwitch().load(std::memory_order_relaxed);
+}
+void SetShaderCallCanonical(bool value) {
+	CanonicalSwitch().store(value, std::memory_order_relaxed);
+}
+
+void ShaderCallKnownTargets(uint64_t& targets, uint64_t& shaders, uint64_t& union_growths) {
+	auto&           registry = CallMissRegistry::Get();
+	std::lock_guard lock(registry.mutex);
+	targets = 0;
+	shaders = 0;
+	for (const auto& [hash, shader]: registry.shaders) {
+		(void)hash;
+		const auto count = shader.pending.size() + (shader.absorbed ? shader.absorbed->size() : 0u);
+		targets += count;
+		shaders += count != 0 ? 1u : 0u;
+	}
+	union_growths = g_union_growths.load(std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

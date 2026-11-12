@@ -128,6 +128,16 @@ uint32_t ShaderCallPartitionIdle();
 // it from being partitioned, or empty when it would be (its call permitting).
 std::string ShaderCallPartitionCheck(std::span<const uint32_t> code);
 
+// Round rtexp: canonical expansions (KYTY_CALL_CANONICAL, on by default): a table call's inlined
+// variants in ascending order, and a material table call of runtime records inlining the union of
+// the reported targets the shader's tables offered so far in the run (see CanonicalSwitch in
+// ShaderFunctions.cpp). Tests switch it.
+bool ShaderCallCanonical();
+void SetShaderCallCanonical(bool value);
+// For the log: the table call targets known (reported in this run or read from earlier runs'
+// call_targets.txt), the shaders they belong to, and how many times a call site's union grew.
+void ShaderCallKnownTargets(uint64_t& targets, uint64_t& shaders, uint64_t& union_growths);
+
 // Expands scalar calls through immutable pointers or bounded scalar-buffer tables.
 // Table calls retain runtime selection and trap on targets outside the captured set.
 // Empty output means no calls; unresolved calls never discard guest instructions.

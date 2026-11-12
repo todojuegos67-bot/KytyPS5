@@ -187,6 +187,10 @@ std::filesystem::path ShaderDiskCacheDirectory() {
 	return title_id.empty() ? std::filesystem::path() : std::filesystem::path("_ShaderCache") / title_id;
 }
 
+// Round rtexp: expansions of shaders with calls whose source missed the shader disk cache (each
+// translated in game), for the "Call expansions" line at the end of the run.
+static std::atomic<uint64_t> g_expansions_in_game {0};
+
 template <typename... Args>
 void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
@@ -3321,6 +3325,10 @@ struct PipelineCache::ProgramCache {
 				CountDiskLookup();
 				if (!loaded) {
 					disk->counters.source_misses++;
+					if (!lookup_key.function_code.empty()) {
+						// Round rtexp: an expansion translated (and its pipeline made) in game.
+						g_expansions_in_game.fetch_add(1, std::memory_order_relaxed);
+					}
 					// Round seedcs: whether the seeds hold this source (then its key differs from
 					// the precompile's) or not (new to them). Only on a miss.
 					int seeded = -1;
@@ -5317,6 +5325,21 @@ void PipelineCache::LogPipelinesMade() {
 void PipelineCache::Save() {
 	PipelineSeeds::Flush();
 	LogPipelinesMade();
+	if (!PipelineSeeds::PrecompileRequested()) {
+		// Round rtexp: canonical expansions (ShaderCallCanonical), once per run.
+		static std::atomic<bool> expansions_logged {false};
+		if (!expansions_logged.exchange(true)) {
+			uint64_t targets = 0, shaders = 0, growths = 0;
+			ShaderRecompiler::Decoder::ShaderCallKnownTargets(targets, shaders, growths);
+			PipelineCacheLog("Call expansions: {} table call targets known ({} shaders), {} "
+			                 "expansions translated in game, union grew {} times ({})",
+			                 targets, shaders, g_expansions_in_game.load(), growths,
+			                 ShaderRecompiler::Decoder::ShaderCallCanonical()
+			                     ? "canonical: union of the targets, ascending; "
+			                       "KYTY_CALL_CANONICAL=0 turns it off"
+			                     : "KYTY_CALL_CANONICAL=0: as before");
+		}
+	}
 	{
 		// Round 134: no save during play starts from now, and one still writing finishes first.
 		std::lock_guard lock(m_save_mutex);
