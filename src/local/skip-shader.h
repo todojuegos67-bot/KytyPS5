@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <string>
 #include <mutex>
 #include <tuple>
 #include <utility>
@@ -56,6 +57,7 @@ namespace Paint {
 struct Config {
 	bool                                    active = false;
 	bool                                    list   = false;
+	bool                                    live   = false; // KYTY_PAINT_LIVE=1: hotkeys choose what is left out
 	uint32_t                                klass  = 0;
 	std::vector<std::pair<uint32_t, uint32_t>> sizes;
 };
@@ -86,8 +88,11 @@ inline void ParseAddresses(const char* name) {
 	}
 }
 
+inline std::atomic<bool> g_live {false}; // set at Load (first draw); the hotkeys do nothing before
+
 inline Config Load() {
 	Config      c;
+	if (const char* live = std::getenv("KYTY_PAINT_LIVE"); live != nullptr && live[0] != '\0' && live[0] != '0') c.live = true;
 	const char* klass = std::getenv("KYTY_PAINT");
 	if (klass != nullptr) c.klass = static_cast<uint32_t>(std::strtoul(klass, nullptr, 10));
 	if (c.klass > 6) c.klass = 0;
@@ -113,13 +118,18 @@ inline Config Load() {
 	}
 	ParseAddresses("KYTY_PAINT_SKIP_PS");
 	ParseAddresses("KYTY_PAINT_SKIP_CS");
-	c.active = c.list || c.klass != 0 || !c.sizes.empty() || g_any.load();
+	c.active = c.live || c.list || c.klass != 0 || !c.sizes.empty() || g_any.load();
 	if (c.active) {
 		g_any.store(true); // every draw on the normal path, where it is seen
 		std::printf("Paint: active: class %u left out (0 none), %zu target sizes left out", c.klass, c.sizes.size());
 		for (const auto& size: c.sizes) std::printf(" %ux%u", size.first, size.second);
 		std::printf(", shaders left out via KYTY_PAINT_SKIP_PS/CS above, list %s\n", c.list ? "on" : "off");
 		std::fflush(stdout);
+	}
+	if (c.live) {
+		std::printf("[paint-live] on: F7 next group, F6 previous, F8 off, F9 first/second half, F10 narrow into the half left out\n");
+		std::fflush(stdout);
+		g_live.store(true);
 	}
 	return c;
 }
@@ -178,12 +188,191 @@ inline void Note(char kind, uint64_t address, uint32_t width, uint32_t height, u
 	t.last    = now;
 }
 
+// KYTY_PAINT_LIVE: in-game bisection. Counts of the last full second (CS addresses; PS addresses drawing into a 1280x720
+// color target) are snapshot when a group is chosen from off (F8 off retakes it). Groups, in order:
+//  0 off, 1 blended draws (color target 0 blending), 2 depth test without depth write, 3 draws into 3840x2160,
+//  4 draws into 1280x720, 5 CS range, 6 PS(1280x720) range, then each CS alone (by count), then each PS alone.
+// A range group leaves out list[lo, hi); F9 halves it (first half, second half, whole), F10 makes the half left out
+// the new whole. Only with live on: a mutex per draw/dispatch.
+namespace Live {
+enum Kind : uint32_t { Off = 0, Blend, DepthNoWrite, Rt4k, Rt720, CsRange, PsRange, CsOne, PsOne };
+struct State {
+	std::mutex                            mutex;
+	std::map<uint64_t, uint32_t>          cs_cur, ps_cur, cs_prev, ps_prev;
+	std::chrono::steady_clock::time_point last {};
+	std::vector<uint64_t>                 cs_list, ps_list; // snapshot, by count
+	uint32_t                              group = 0;        // index in the order above
+	Kind                                  kind  = Off;
+	size_t                                lo = 0, hi = 0;   // the whole of a range (or the one entry)
+	uint32_t                              half = 0;         // 0 whole, 1 first half, 2 second half
+	std::vector<uint64_t>                 out;              // sorted addresses left out (CS / PS kinds)
+};
+inline State& GetState() {
+	static State s;
+	return s;
+}
+
+inline void Roll(State& s) { // (locked)
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.last < std::chrono::seconds(1)) return;
+	s.cs_prev.swap(s.cs_cur);
+	s.ps_prev.swap(s.ps_cur);
+	s.cs_cur.clear();
+	s.ps_cur.clear();
+	s.last = now;
+}
+
+inline std::vector<uint64_t> Sorted(const std::map<uint64_t, uint32_t>& m) {
+	std::vector<std::pair<uint32_t, uint64_t>> v;
+	for (const auto& [a, n]: m) v.emplace_back(n, a);
+	std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+	std::vector<uint64_t> r;
+	r.reserve(v.size());
+	for (const auto& e: v) r.push_back(e.second);
+	return r;
+}
+
+inline uint32_t GroupCount(const State& s) { return 7u + static_cast<uint32_t>(s.cs_list.size() + s.ps_list.size()); }
+
+inline void LeftOutRange(const State& s, size_t* lo, size_t* hi) {
+	*lo = s.lo;
+	*hi = s.hi;
+	if (s.half == 0 || s.hi - s.lo < 2) return;
+	const size_t mid = s.lo + (s.hi - s.lo) / 2;
+	if (s.half == 1) *hi = mid;
+	else *lo = mid;
+}
+
+inline void Rebuild(State& s) { // (locked) out from kind/lo/hi/half
+	s.out.clear();
+	const std::vector<uint64_t>* list = (s.kind == CsRange || s.kind == CsOne) ? &s.cs_list
+	                                    : (s.kind == PsRange || s.kind == PsOne) ? &s.ps_list
+	                                                                             : nullptr;
+	if (list == nullptr) return;
+	size_t lo = 0, hi = 0;
+	LeftOutRange(s, &lo, &hi);
+	for (size_t i = lo; i < hi && i < list->size(); ++i) s.out.push_back((*list)[i]);
+	std::sort(s.out.begin(), s.out.end());
+}
+
+inline void SelectGroup(State& s, uint32_t g) { // (locked)
+	s.group = g;
+	s.half  = 0;
+	s.lo = s.hi = 0;
+	const uint32_t ncs = static_cast<uint32_t>(s.cs_list.size());
+	if (g <= 4) s.kind = static_cast<Kind>(g);
+	else if (g == 5) { s.kind = CsRange; s.hi = s.cs_list.size(); }
+	else if (g == 6) { s.kind = PsRange; s.hi = s.ps_list.size(); }
+	else if (g - 7 < ncs) { s.kind = CsOne; s.lo = g - 7; s.hi = s.lo + 1; }
+	else { s.kind = PsOne; s.lo = g - 7 - ncs; s.hi = s.lo + 1; }
+	Rebuild(s);
+}
+
+inline std::string Describe(const State& s) { // (locked)
+	char buf[512];
+	const uint32_t total = GroupCount(s);
+	const char*    name  = "";
+	switch (s.kind) {
+		case Off: name = "nothing (off)"; break;
+		case Blend: name = "blended draws"; break;
+		case DepthNoWrite: name = "draws with depth test, no depth write"; break;
+		case Rt4k: name = "draws into 3840x2160"; break;
+		case Rt720: name = "draws into 1280x720"; break;
+		case CsRange: name = "CS list range"; break;
+		case PsRange: name = "PS(1280x720) list range"; break;
+		case CsOne: name = "CS"; break;
+		case PsOne: name = "PS(1280x720)"; break;
+	}
+	size_t lo = 0, hi = 0;
+	LeftOutRange(s, &lo, &hi);
+	if (s.kind == CsOne || s.kind == PsOne)
+		std::snprintf(buf, sizeof(buf), "group %u/%u: %s #%zu 0x%016llx", s.group, total - 1, name, lo,
+		              static_cast<unsigned long long>(s.out.empty() ? 0ull : s.out[0]));
+	else if (s.kind == CsRange || s.kind == PsRange)
+		std::snprintf(buf, sizeof(buf), "group %u/%u: %s [%zu..%zu) of %zu (%zu left out)%s", s.group, total - 1, name, lo, hi,
+		              s.kind == CsRange ? s.cs_list.size() : s.ps_list.size(), s.out.size(),
+		              s.half == 1 ? " first half" : s.half == 2 ? " second half" : "");
+	else std::snprintf(buf, sizeof(buf), "group %u/%u: %s", s.group, total - 1, name);
+	return buf;
+}
+
+// A hotkey (SDL keycode as F6..F10 = 6..10). Returns the label (empty: not a live key / live off).
+inline std::string Key(int f) {
+	if (!g_live.load(std::memory_order_relaxed) || f < 6 || f > 10) return {};
+	auto&                       s = GetState();
+	std::lock_guard<std::mutex> lock(s.mutex);
+	if (f == 8) {
+		SelectGroup(s, 0);
+	} else if (f == 6 || f == 7) {
+		if (s.group == 0) {
+			s.cs_list = Sorted(s.cs_prev.empty() ? s.cs_cur : s.cs_prev);
+			s.ps_list = Sorted(s.ps_prev.empty() ? s.ps_cur : s.ps_prev);
+		}
+		const uint32_t total = GroupCount(s);
+		SelectGroup(s, f == 7 ? (s.group + 1) % total : (s.group + total - 1) % total);
+	} else if (f == 9) {
+		if ((s.kind == CsRange || s.kind == PsRange) && s.hi - s.lo >= 2) {
+			s.half = (s.half + 1) % 3;
+			Rebuild(s);
+		}
+	} else if (f == 10) {
+		if ((s.kind == CsRange || s.kind == PsRange) && s.half != 0) {
+			size_t lo = 0, hi = 0;
+			LeftOutRange(s, &lo, &hi);
+			s.lo   = lo;
+			s.hi   = hi;
+			s.half = 0;
+			Rebuild(s);
+		}
+	}
+	std::string label = Describe(s);
+	std::printf("[paint-live] now leaving out: %s\n", label.c_str());
+	if (!s.out.empty()) {
+		std::printf("[paint-live]   addresses:");
+		for (size_t i = 0; i < s.out.size() && i < 64; ++i) std::printf(" %llx", static_cast<unsigned long long>(s.out[i]));
+		std::printf(s.out.size() > 64 ? " ...\n" : "\n");
+	}
+	std::fflush(stdout);
+	return label;
+}
+
+inline bool Has(const State& s, uint64_t a) { return std::binary_search(s.out.begin(), s.out.end(), a); }
+
+inline bool Draw(uint64_t ps, bool has_color, uint32_t width, uint32_t height, bool blend, bool ztest, bool zwrite) {
+	auto&                       s = GetState();
+	std::lock_guard<std::mutex> lock(s.mutex);
+	Roll(s);
+	const bool is720 = has_color && width == 1280 && height == 720;
+	if (is720 && ps != 0 && s.ps_cur.size() < 4096) ++s.ps_cur[ps];
+	switch (s.kind) {
+		case Off: return false;
+		case Blend: return has_color && blend;
+		case DepthNoWrite: return ztest && !zwrite;
+		case Rt4k: return has_color && width == 3840 && height == 2160;
+		case Rt720: return is720;
+		case PsRange:
+		case PsOne: return is720 && Has(s, ps);
+		default: return false;
+	}
+}
+
+inline bool Dispatch(uint64_t cs) {
+	auto&                       s = GetState();
+	std::lock_guard<std::mutex> lock(s.mutex);
+	Roll(s);
+	if (cs != 0 && s.cs_cur.size() < 4096) ++s.cs_cur[cs];
+	return (s.kind == CsRange || s.kind == CsOne) && Has(s, cs);
+}
+} // namespace Live
+
 // A draw (pixel shader `ps`, color target 0 `width` x `height`, 0 without one): true when left out.
-inline bool SkipDraw(uint64_t ps, bool has_color, uint32_t width, uint32_t height, uint32_t format, uint32_t type) {
+inline bool SkipDraw(uint64_t ps, bool has_color, uint32_t width, uint32_t height, uint32_t format, uint32_t type,
+                     bool blend = false, bool ztest = false, bool zwrite = false) {
 	const auto& c = Get();
 	if (!c.active) return false;
 	if (!has_color) width = height = format = type = 0;
 	bool skip = c.klass != 0 && ClassOf(width, has_color) == c.klass;
+	if (c.live && Live::Draw(ps, has_color, width, height, blend, ztest, zwrite)) skip = true;
 	if (!skip && has_color)
 		for (const auto& size: c.sizes)
 			if (size.first == width && size.second == height) skip = true;
@@ -196,6 +385,12 @@ inline bool SkipDraw(uint64_t ps, bool has_color, uint32_t width, uint32_t heigh
 inline void NoteDispatch(uint64_t cs, uint32_t x, uint32_t y, uint32_t z) {
 	const auto& c = Get();
 	if (c.list) Note('C', cs, x, y, z, 0, Skipped(cs));
+}
+
+// KYTY_PAINT_LIVE: true when this dispatch is left out by the live group (counts it too).
+inline bool SkipDispatchLive(uint64_t cs) {
+	const auto& c = Get();
+	return c.live && Live::Dispatch(cs);
 }
 } // namespace Paint
 } // namespace SkipShader

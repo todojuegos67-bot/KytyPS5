@@ -1,4 +1,5 @@
 #include "local/port-live.h"
+#include "local/skip-shader.h"
 #include "graphics/presentation/window.h"
 
 #include "SDL.h"
@@ -650,6 +651,20 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
+	if (SkipShader::Paint::g_live.load(std::memory_order_relaxed) && (event->type == SDL_KEYDOWN || event->type == SDL_KEYUP)) {
+		// KYTY_PAINT_LIVE (skip-shader.h): F6..F10 choose what is left out (their usual uses are off while it is on).
+		const SDL_Keycode k = event->key.keysym.sym;
+		if (k >= SDLK_F6 && k <= SDLK_F10) {
+			if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
+				const std::string label = SkipShader::Paint::Live::Key(6 + static_cast<int>(k - SDLK_F6));
+				if (!label.empty()) {
+					LOGF("[paint-live] now leaving out: %s\n", label.c_str());
+					Loader::DemonsSoulsWarp::ShowNotice("PAINT LIVE: " + label, 3600);
+				}
+			}
+			return;
+		}
+	}
 	if (PortLive::g_hooks != nullptr && PortLive::g_hooks->event != nullptr && PortLive::g_hooks->event(*event)) {
 		return; // (the PC port's options menu)
 	}

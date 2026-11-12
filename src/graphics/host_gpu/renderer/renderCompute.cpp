@@ -773,7 +773,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	SkipShader::Paint::NoteDispatch(sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y, thread_group_z);
-	if (SkipShader::Skipped(sh_ctx.GetCs().cs_regs.data_addr)) return; // live `skipcs` probe
+	if (SkipShader::Skipped(sh_ctx.GetCs().cs_regs.data_addr) ||
+	    SkipShader::Paint::SkipDispatchLive(sh_ctx.GetCs().cs_regs.data_addr))
+		return; // live `skipcs` probe; KYTY_PAINT_LIVE
 
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 	// A compute shader the normal path dispatched before (TableDispatchSeen) whose program allows table mode (an

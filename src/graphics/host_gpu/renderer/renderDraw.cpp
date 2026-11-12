@@ -2464,7 +2464,9 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		const bool  paint_color  = (paint_ctx.GetRenderTargetMask() & 0xfu) != 0 && paint_target.base.addr != 0;
 		if (SkipShader::Paint::SkipDraw(sh_ctx.GetPs().ps_regs.data_addr, paint_color, paint_target.attrib2.width + 1u,
 		                                paint_target.attrib2.height + 1u, static_cast<uint32_t>(paint_target.info.format),
-		                                static_cast<uint32_t>(paint_target.info.channel_type)) ||
+		                                static_cast<uint32_t>(paint_target.info.channel_type),
+		                                paint_ctx.GetBlendControl(0).enable, paint_ctx.GetDepthControl().z_enable,
+		                                paint_ctx.GetDepthControl().z_write_enable) ||
 		    SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr))
 			return true;
 	}
@@ -2654,7 +2656,9 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		const bool  paint_color  = (paint_ctx.GetRenderTargetMask() & 0xfu) != 0 && paint_target.base.addr != 0;
 		if (SkipShader::Paint::SkipDraw(sh_ctx.GetPs().ps_regs.data_addr, paint_color, paint_target.attrib2.width + 1u,
 		                                paint_target.attrib2.height + 1u, static_cast<uint32_t>(paint_target.info.format),
-		                                static_cast<uint32_t>(paint_target.info.channel_type)) ||
+		                                static_cast<uint32_t>(paint_target.info.channel_type),
+		                                paint_ctx.GetBlendControl(0).enable, paint_ctx.GetDepthControl().z_enable,
+		                                paint_ctx.GetDepthControl().z_write_enable) ||
 		    SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr))
 			return true;
 	}
