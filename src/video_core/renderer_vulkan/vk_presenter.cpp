@@ -1561,16 +1561,58 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             std::this_thread::yield();
         }
     };
+    // bb-dlssg-pace: the pair went out at the CPU arrival of the game frame, which wanders a few
+    // ms from frame to frame, so the real frame stayed on screen 13-20 ms instead of 16.7 and
+    // DLSS-G looked less smooth than FSR 3 (whose DLL holds a grid). Now the pair keeps a grid:
+    // the generated frame one step after the last real one (not before the frame arrived; a frame
+    // arriving more than half a step late restarts the grid). BB_DLSSG_PACE=0: as before.
+    static const bool bb_grid = [] {
+        const char* v = std::getenv("BB_DLSSG_PACE");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    auto bb_origin = bb_start;
+    if (bb_grid && bb_generated && bb_last_real_shown.time_since_epoch().count() != 0) {
+        const auto slot = bb_last_real_shown + bb_step;
+        if (slot > bb_start) {
+            bb_origin = slot;
+            if (!bb_behind()) bb_wait_until(slot);
+        } else if (bb_start - slot < bb_step / 2) {
+            bb_origin = bb_start;
+        }
+    }
     u32 bb_shown = 0;
     for (; bb_shown < bb_generated; ++bb_shown) {
         if (bb_shown > 0) {
             if (bb_behind()) break;
-            bb_wait_until(bb_start + bb_step * bb_shown);
+            bb_wait_until(bb_origin + bb_step * bb_shown);
         }
         if (!BbPresentGenerated(frame, bb_shown, bb_shown == 0)) break;
     }
     if (bb_shown && !bb_behind()) {
-        bb_wait_until(bb_start + bb_step * bb_shown);
+        bb_wait_until(bb_origin + bb_step * bb_shown);
+    }
+    if (bb_shown) {
+        // Real-to-real interval statistics, once a second.
+        static double n = 0, sum = 0, sq = 0, mx = 0;
+        static auto window = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (bb_last_real_shown.time_since_epoch().count() != 0) {
+            const double ms = std::chrono::duration<double, std::milli>(now - bb_last_real_shown).count();
+            if (ms < 100.0) { n += 1; sum += ms; sq += ms * ms; mx = std::max(mx, ms); }
+        }
+        bb_last_real_shown = now;
+        if (now - window >= std::chrono::seconds(1) && n > 0) {
+            const double mean = sum / n;
+            BB::Upscale::Checkpoint(fmt::format(
+                "[dlssg-pace] 1 s: real frame every {:.2f} ms (sd {:.2f}, max {:.2f}, {} frames), "
+                "grid {} (BB_DLSSG_PACE=0 off)",
+                mean, std::sqrt(std::max(sq / n - mean * mean, 0.0)), mx, int(n),
+                bb_grid ? "on" : "off"));
+            n = sum = sq = mx = 0;
+            window = now;
+        }
+    } else {
+        bb_last_real_shown = {};
     }
     bb_sec_generated_shown += bb_shown;
 
