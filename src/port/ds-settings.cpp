@@ -1311,13 +1311,13 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		// (11-12) the user's second screenshot: Texturas Medio, Distancia Maximo, Sombras Medio, Detalle Normal, x16,
 		// extra sharp, Reflejos / Desvanecimiento Normal, AA Alto; motion blur off, DoF / bloom / vignette / eye adaptation on.
 		s->texture_reduce    = "1";
-		s->quality           = "high"; // (11-12) third screenshot: Distancia Alto, Detalle Alto, Desvanecimiento Alto
-		s->shadows           = "medio";
-		s->detail            = "alto";
+		s->quality           = "high"; // (11-12) fourth screenshot: Distancia Alto, Detalle Normal, Desvanecimiento Normal,
+		s->shadows           = "medio";  // Texturas nitidas, AA Normal (de serie), Teselado Bajo
+		s->detail            = "normal";
 		s->af16              = true;
-		s->texture_sharpness = "2";
-		s->aa_sharp          = "alto";
-		s->object_fade       = "alto";
+		s->texture_sharpness = "1";
+		s->aa_sharp          = "normal";
+		s->object_fade       = "normal";
 		s->reflections       = "normal";
 		s->motion_blur = false;
 		s->dof = s->bloom = s->vignette = s->eye_adapt = true;
@@ -1382,7 +1382,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->tess = "alto";
 	} else {
 		s->ibl  = "mitad";
-		s->tess = "medio";
+		s->tess = (preset == "ligero" || preset == "ligero-plus") ? "bajo" : "medio"; // (11-12) ligero / + : Teselado Bajo
 	}
 	// (10-28, the emulator launcher's rule) Every mode / preset: every RT effect No (Reflejos RT, Luz RT, Luz volumetrica,
 	// Oclusion ambiental, Luz de antorchas RT, Destellos de lente, Sombras RT and the hardware rows); enabled by hand after.
