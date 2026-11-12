@@ -77,6 +77,18 @@ Config ParseConfig() {
         s == "fsr3-2" || s == "fsr-x2") {
         c.kind = Kind::Amd;
         c.multiplier = 2;
+    } else if (s == "amd-x3" || s == "amd-3") {
+        // (11-12) AMD multi frame generation as in Demon's Souls: the patched FidelityFX DLL
+        // interpolates N-1 frames at t = k/N and paces them (KYTY_FSR3_FG_FRAMES / _ACTIVE).
+        c.kind = Kind::Amd;
+        c.multiplier = 3;
+    } else if (s == "amd-x4" || s == "amd-4") {
+        c.kind = Kind::Amd;
+        c.multiplier = 4;
+    } else if (s == "amd-dyn" || s == "amd-dinamico" || s == "amd-dynamic") {
+        c.kind = Kind::Amd;
+        c.multiplier = 4;
+        c.dynamic = true;
     } else if (s == "dlss-x2" || s == "dlss-2" || s == "dlss" || s == "dlssg") {
         c.kind = Kind::Dlss;
         c.multiplier = 2;
@@ -97,18 +109,30 @@ Config ParseConfig() {
     }
     if (c.kind == Kind::Amd) {
         SetProcessEnv("KYTY_FSR3_FG", "1");
+        char frames[8], active[8];
+        std::snprintf(frames, sizeof(frames), "%d", c.multiplier - 1);
+        std::snprintf(active, sizeof(active), "%d", c.dynamic ? 1 : c.multiplier - 1);
+        SetProcessEnv("KYTY_FSR3_FG_FRAMES", frames); // read by the DLL when it makes the swapchain
+        SetProcessEnv("KYTY_FSR3_FG_ACTIVE", active); // read on every present
     }
     return c;
 }
 
 } // namespace
 
+void SetAmdActive(int multiplier) {
+    char active[8];
+    std::snprintf(active, sizeof(active), "%d", std::clamp(multiplier, 2, 4) - 1);
+    SetProcessEnv("KYTY_FSR3_FG_ACTIVE", active);
+}
+
 const Config& Cfg() {
     static const Config config = [] {
         Config c = ParseConfig();
         if (c.kind == Kind::Amd) {
-            BBLogf("Frame generation: BB_FG=%s (AMD FSR 3, fixed x%d)", std::getenv("BB_FG"),
-                   c.multiplier);
+            if (c.dynamic) BBLogf("Frame generation: BB_FG=%s (AMD FSR 3, dynamic x2..x4)", std::getenv("BB_FG"));
+            else BBLogf("Frame generation: BB_FG=%s (AMD FSR 3, fixed x%d)", std::getenv("BB_FG"),
+                        c.multiplier);
         } else if (c.kind == Kind::Dlss) {
             BBLogf("Frame generation: BB_FG=%s (DLSS-G via NGX, %s)", std::getenv("BB_FG"),
                    c.dynamic ? "dynamic up to x4" : (c.multiplier == 2   ? "x2"
@@ -122,7 +146,10 @@ const Config& Cfg() {
 
 const char* Name() {
     const auto& c = Cfg();
-    if (c.kind == Kind::Amd) return "amd-x2";
+    if (c.kind == Kind::Amd) {
+        if (c.dynamic) return "amd-dyn";
+        return c.multiplier == 2 ? "amd-x2" : c.multiplier == 3 ? "amd-x3" : "amd-x4";
+    }
     if (c.kind == Kind::Dlss) {
         if (c.dynamic) return "dlss-dyn";
         return c.multiplier == 2 ? "dlss-x2" : c.multiplier == 3 ? "dlss-x3" : "dlss-x4";

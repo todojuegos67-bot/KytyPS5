@@ -29,10 +29,11 @@ enum class Kind : uint32_t { Off, Amd, Dlss };
 struct Config {
     Kind kind = Kind::Off;
     int multiplier = 2;
-    bool dynamic = false; // dlss-dyn
+    bool dynamic = false; // dlss-dyn, amd-dyn
 };
 const Config& Cfg();
 const char* Name(); // "off", "amd-x2", "dlss-x3", "dlss-dyn"
+void SetAmdActive(int multiplier); // (amd-dyn) generated frames per real one + 1, on every present
 bool On();          // BB_FG asked (inputs captured even without an upscaler)
 
 bool FgBlocked(const char** why);

@@ -1120,6 +1120,25 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    ffx_resets, g_amd.restarts, g_amd.gaps, g_amd.input_resets, g_amd.jitter[0],
                    g_amd.jitter[1], g_amd.near_v, g_amd.far_v, g_amd.fov,
                    g_amd.depth_inverted ? "inverted" : "forward");
+            // (11-12) amd-dyn: the largest multiplier with real x N within the display's target
+            // (refresh - refresh^2/3600, as Demon's Souls), changed after 2 seconds agreeing.
+            if (Cfg().kind == Kind::Amd && Cfg().dynamic && window > 0.5) {
+                static int cur = 2, want_prev = 2, agree = 0;
+                const double hz = DisplayHz() > 30.0 ? DisplayHz() : 60.0;
+                const double target = hz - hz * hz / 3600.0;
+                const double real = g_stats.real / window;
+                int want = 2;
+                for (int n = 4; n >= 2; --n) {
+                    if (real * n <= target * 1.03) { want = n; break; }
+                }
+                agree = want == want_prev ? agree + 1 : 0;
+                want_prev = want;
+                if (want != cur && agree >= 1) {
+                    Printf("[fg-amd] dynamic: x%d -> x%d (real %.1f fps, target %.0f shown)", cur, want, real, target);
+                    cur = want;
+                    SetAmdActive(cur);
+                }
+            }
             const AmdSecond keep = g_amd;
             g_amd = {};
             std::copy_n(keep.mv_scale, 2, g_amd.mv_scale);
