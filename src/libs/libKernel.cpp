@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -2334,9 +2335,12 @@ struct FiberCpuContext {
 	uint64_t r15;
 	uint64_t rsp;
 	uint64_t rip;
+	// MXCSR at + 80, the x87 control word at + 84 (the SysV ABI keeps their control bits across calls: each fiber has
+	// its own).
+	Common::FpEnv fp_env;
 };
 
-static_assert(sizeof(FiberCpuContext) == 80);
+static_assert(sizeof(FiberCpuContext) == 88 && offsetof(FiberCpuContext, fp_env) == 80);
 
 struct FiberObject {
 	uint32_t        magic_start;
@@ -2553,6 +2557,8 @@ static uint64_t FiberMapStack(const FiberObject* fiber, uint64_t size) {
 	             "movq %r11, 64(%r10)\n\t"
 	             "movq (%rsp), %r11\n\t"
 	             "movq %r11, 72(%r10)\n\t"
+	             "stmxcsr 80(%r10)\n\t"
+	             "fnstcw 84(%r10)\n\t"
 	             "xorl %eax, %eax\n\t"
 	             "retq\n");
 }
@@ -2570,6 +2576,18 @@ FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
 	             "movq 40(%r10), %r13\n\t"
 	             "movq 48(%r10), %r14\n\t"
 	             "movq 56(%r10), %r15\n\t"
+	             // The context's MXCSR control bits with the current exception flags (the low 6), its x87 control word
+	             // (rcx and rdx are no part of a context; the stack below is left).
+	             "subq $8, %rsp\n\t"
+	             "stmxcsr (%rsp)\n\t"
+	             "movl (%rsp), %ecx\n\t"
+	             "andl $0x3f, %ecx\n\t"
+	             "movl 80(%r10), %edx\n\t"
+	             "andl $0xffffffc0, %edx\n\t"
+	             "orl %ecx, %edx\n\t"
+	             "movl %edx, (%rsp)\n\t"
+	             "ldmxcsr (%rsp)\n\t"
+	             "fldcw 84(%r10)\n\t"
 	             "movq 64(%r10), %rsp\n\t"
 	             "jmp *%r11\n");
 }
@@ -2600,6 +2618,9 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 	ctx.rsp = rsp;
 	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
+	// (A fiber of an SDK from 3.50 starts with the console's floating-point environment; an older one with its runner's.)
+	if ((fiber->flags & FIBER_FLAG_SET_FPU_REGS) != 0) Common::EnterGuestFpEnv();
+	ctx.fp_env = Common::ReadFpEnv();
 
 	g_starting_fiber = fiber;
 	FiberRestoreContext(&ctx, 1);

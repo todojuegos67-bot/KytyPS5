@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
@@ -1639,6 +1640,13 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsTextureMips::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsEnginePools::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsLanguages::Install(m_programs.empty() ? nullptr : m_programs.front());
+	// The main thread runs guest code from here (module initializers, then main): the console's floating-point
+	// environment, as its other threads get it (RunThread) and fibers that ask for it.
+	Common::EnterGuestFpEnv();
+	if (Common::GuestFpEnvOn())
+		std::printf("Guest floating point: MXCSR 0x%04x (flush-to-zero, denormals-are-zero), x87 control 0x%04x, as on the "
+		            "console (KYTY_GUEST_FP_ENV=0 keeps the host's)\n",
+		            Common::GuestFpEnv.mxcsr, Common::GuestFpEnv.control);
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
