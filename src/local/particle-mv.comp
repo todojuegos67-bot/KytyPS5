@@ -14,6 +14,13 @@
 //                weight, -) into pmv.
 //   2 compose:   full res, on the frame generation's copy of the motion vectors (never the game's own image, never the
 //                upscaler's): mv = mix(mv, particle vector in the game's units, weight x strength).
+//   3 native:    (KYTY_FG_PARTICLE_NATIVE) one workgroup per particle of one particle-translucent draw (VS a64d43c72c1c5c87 /
+//                b6761454c17bea3c): the particle's slot from the draw's sorted list, its 4 billboard corners from the GPU
+//                simulation's record (this frame) and from the copy of the same slot one real frame earlier, both
+//                projected (this / last frame's view-projection) -> per-corner screen displacement, rasterised over the
+//                quad at half res where the particle layer covers the pixel (coverage > threshold) into pmv (w = 1).
+//                A slot whose emitter changed or that jumped more than the max step is a recycled slot: skipped.
+//   4 count:     half res: particle px (coverage > threshold) with a native vector (stats 7).
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D game_tex;   // mode 0: the game's colour after the particles
@@ -25,8 +32,25 @@ layout(binding = 5) uniform sampler2D pmv_tex;    // mode 2: the particle vector
 layout(binding = 6, rgba16f) uniform writeonly image2D out_img; // modes 0 / 1
 layout(binding = 7, rg16f) uniform image2D fg_motion;           // mode 2: the FG copy, in place
 layout(std430, binding = 8) buffer Stats {
-	uint stats[8]; // 0 -, 1 particle px (half res), 2 matched px, 3 sum of |d| (px), 4 composed px (full res)
+	// 0 -, 1 particle px (half res), 2 matched px, 3 sum of |d| (px), 4 composed px (full res); native: 5 particles with a
+	// vector, 6 recycled slots skipped, 7 particle px with a native vector, 8 / 9 particle centres on covered px (y down /
+	// y up), 10 particles seen, 11 particle px (half res, mode 0)
+	uint stats[16];
 };
+// Mode 3: copies taken at the draw (particle-mv.cpp ParticleNativeCapture), word-addressed.
+layout(std430, binding = 9) readonly buffer SortList { uint sort_w[]; };
+layout(std430, binding = 10) readonly buffer RecCur { uint rec_w[]; };
+layout(std430, binding = 11) readonly buffer RecPrev { uint prev_w[]; };
+layout(std430, binding = 12) readonly buffer Emitters { uint emit_w[]; };
+layout(std430, binding = 13) readonly buffer Args { uint args_w[]; };
+layout(std430, binding = 14) readonly buffer Params {
+	mat4  vp;   // this frame's view-projection (rows as the VS reads them: clip.x = dot(row0, (p, 1)))
+	mat4  vpp;  // last real frame's
+	uvec4 sorti; // sort stride (bytes), sort count, base instance, last frame's record count
+	uvec4 reci;  // record stride, record count, previous valid, emitter stride
+	uvec4 argi;  // indirect (1) / direct (0), direct instance count, emitter count, 1 + args word of the base instance (0: sorti.z)
+	vec4  parf;  // max world step a frame, max quad size (half px), y down (1) / up (0), -
+} prm;
 
 layout(push_constant) uniform Push {
 	vec4  size;   // full w, h, half w, half h
@@ -48,9 +72,119 @@ float Sad(ivec2 p, ivec2 d) {
 	return s;
 }
 
+uint RecW(bool prev, uint slot, uint word) {
+	if (prev && slot >= prm.sorti.w) return 0xffffffffu; // (last frame's copy is smaller)
+	const uint i = slot * (prm.reci.x >> 2) + word;
+	return prev ? prev_w[i] : rec_w[i];
+}
+vec3 RecV3(bool prev, uint slot, uint word) {
+	return uintBitsToFloat(uvec3(RecW(prev, slot, word), RecW(prev, slot, word + 1u), RecW(prev, slot, word + 2u)));
+}
+// The VS's world corner (both VS): pos + axisX (cx - 0.5) + axisY (cy - 0.5); an emitter flagged as a ribbon / streak
+// (emitter word 12 bit 0) takes the linked particle's (record word 11) pos + axisY (cy - 0.5) on the cx = 1 side.
+vec3 Corner(bool prev, uint slot, bool ribbon, uint c) {
+	const float a = float(c & 1u) - 0.5, b = float(c >> 1u) - 0.5;
+	if (ribbon && (c & 1u) != 0u) {
+		const uint l = RecW(prev, slot, 11u);
+		if (l < prm.reci.y) return RecV3(prev, l, 0u) + RecV3(prev, l, 12u) * b;
+	}
+	return RecV3(prev, slot, 0u) + RecV3(prev, slot, 8u) * a + RecV3(prev, slot, 12u) * b;
+}
+vec4 Clip(mat4 m, vec3 w) { return vec4(dot(m[0], vec4(w, 1.0)), dot(m[1], vec4(w, 1.0)), dot(m[2], vec4(w, 1.0)), dot(m[3], vec4(w, 1.0))); }
+vec2 Px(vec4 c, float ydown) {
+	const vec2 n = c.xy / c.w;
+	return vec2((n.x * 0.5 + 0.5) * push.size.x, (ydown > 0.5 ? 0.5 - n.y * 0.5 : n.y * 0.5 + 0.5) * push.size.y);
+}
+float Cross2(vec2 a, vec2 b) { return a.x * b.y - a.y * b.x; }
+
+shared vec2 s_cur[4], s_d[4];
+shared int  s_ok;
+
+void Native() {
+	const uint i = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+	const uint t = gl_LocalInvocationIndex;
+	if (t == 0u) {
+		s_ok = 0;
+		const uint count = prm.argi.x != 0u ? args_w[1] : prm.argi.y;
+		const uint si    = (prm.argi.w != 0u ? args_w[prm.argi.w - 1u] : prm.sorti.z) + i;
+		if (i < count && si < prm.sorti.y) {
+			const uint slot = sort_w[si * (prm.sorti.x >> 2) + 1u];
+			if (slot < prm.reci.y) {
+				atomicAdd(stats[10], 1u);
+				const uint em     = RecW(false, slot, 3u);
+				const bool ribbon = em < prm.argi.z && (emit_w[em * (prm.reci.w >> 2) + 12u] & 1u) != 0u;
+				const vec3 dp     = RecV3(false, slot, 0u) - RecV3(true, slot, 0u);
+				const bool same   = prm.reci.z != 0u && RecW(true, slot, 3u) == em && dot(dp, dp) <= prm.parf.x * prm.parf.x;
+				if (!same) {
+					atomicAdd(stats[6], 1u);
+				} else {
+					bool  okw = true;
+					vec2  lo = vec2(1e9), hi = vec2(-1e9);
+					for (uint c = 0u; c < 4u; ++c) {
+						const vec4 cc = Clip(prm.vp, Corner(false, slot, ribbon, c));
+						const vec4 cp = Clip(prm.vpp, Corner(true, slot, ribbon, c));
+						okw = okw && cc.w > 1e-4 && cp.w > 1e-4;
+						const vec2 pc = Px(cc, prm.parf.z);
+						s_cur[c] = pc, s_d[c] = pc - Px(cp, prm.parf.z);
+						lo = min(lo, pc), hi = max(hi, pc);
+					}
+					// Which way is down: the particle centre on a covered pixel, both ways (stats 8 / 9; the host follows).
+					const vec4 cm = Clip(prm.vp, RecV3(false, slot, 0u));
+					if (okw && cm.w > 1e-4) {
+						const vec2 n = cm.xy / cm.w;
+						const vec2 a = vec2((n.x * 0.5 + 0.5) * push.size.z, (0.5 - n.y * 0.5) * push.size.w);
+						const vec2 b = vec2(a.x, (n.y * 0.5 + 0.5) * push.size.w);
+						if (all(greaterThanEqual(a, vec2(0.0))) && all(lessThan(a, push.size.zw)) && texelFetch(cur_tex, ivec2(a), 0).y >= push.motion.w)
+							atomicAdd(stats[8], 1u);
+						if (all(greaterThanEqual(b, vec2(0.0))) && all(lessThan(b, push.size.zw)) && texelFetch(cur_tex, ivec2(b), 0).y >= push.motion.w)
+							atomicAdd(stats[9], 1u);
+					}
+					const vec2 ext = (hi - lo) * 0.5;
+					if (okw && all(lessThan(ext, vec2(prm.parf.y))) && all(greaterThan(hi, vec2(0.0))) && all(lessThan(lo, push.size.xy))) {
+						s_ok = 1;
+						atomicAdd(stats[5], 1u);
+					}
+				}
+			}
+		}
+	}
+	barrier();
+	if (s_ok == 0) return;
+	vec2 lo = min(min(s_cur[0], s_cur[1]), min(s_cur[2], s_cur[3])), hi = max(max(s_cur[0], s_cur[1]), max(s_cur[2], s_cur[3]));
+	const ivec2 a = max(ivec2(floor(lo * 0.5)), ivec2(0)), b = min(ivec2(ceil(hi * 0.5)), ivec2(push.size.zw) - 1);
+	for (int y = a.y + int(gl_LocalInvocationID.y); y <= b.y; y += 8)
+		for (int x = a.x + int(gl_LocalInvocationID.x); x <= b.x; x += 8) {
+			const ivec2 q = ivec2(x, y);
+			if (texelFetch(cur_tex, q, 0).y < push.motion.w) continue;
+			const vec2 f = (vec2(q) + 0.5) * 2.0;
+			// Corners 0 (0,0) 1 (1,0) 2 (0,1) 3 (1,1): triangles 0-1-2 and 1-3-2.
+			for (int tri = 0; tri < 2; ++tri) {
+				const uint i0 = tri == 0 ? 0u : 1u, i1 = tri == 0 ? 1u : 3u, i2 = 2u;
+				const vec2 p0 = s_cur[i0], p1 = s_cur[i1], p2 = s_cur[i2];
+				const float area = Cross2(p1 - p0, p2 - p0);
+				if (abs(area) < 1e-6) continue;
+				const float u1 = Cross2(p1 - p0, f - p0) / area;
+				const float v1 = Cross2(f - p0, p2 - p0) / area;
+				if (v1 < -0.01 || u1 < -0.01 || u1 + v1 > 1.01) continue;
+				const vec2 d = s_d[i0] * (1.0 - u1 - v1) + s_d[i1] * v1 + s_d[i2] * u1;
+				imageStore(out_img, q, vec4(d, 1.0, 0.0));
+				break;
+			}
+		}
+}
+
 void main() {
 	const ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
 	const int   mode = push.misc.x;
+	if (mode == 3) {
+		Native();
+		return;
+	}
+	if (mode == 4) {
+		if (any(greaterThanEqual(p, ivec2(push.size.zw)))) return;
+		if (texelFetch(cur_tex, p, 0).y >= push.motion.w && texelFetch(pmv_tex, p, 0).z > 0.5) atomicAdd(stats[7], 1u);
+		return;
+	}
 	if (mode == 0) {
 		if (any(greaterThanEqual(p, ivec2(push.size.zw)))) return;
 		float l = 0.0, b = 0.0;
@@ -63,6 +197,7 @@ void main() {
 		}
 		l *= 0.25, b *= 0.25;
 		const float cov = l / (l + b + 1e-3);
+		if (cov >= push.motion.w) atomicAdd(stats[11], 1u);
 		imageStore(out_img, p, vec4(l / (1.0 + l), cov, 0.0, 0.0));
 		return;
 	}

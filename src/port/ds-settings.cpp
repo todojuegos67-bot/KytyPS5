@@ -1316,6 +1316,8 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->res            = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default (was FSR 3.1 Calidad)
 		s->pure_game      = true;           // (11-11) and Juego original (no added effects)
 		s->sharpness      = "0.75";
+		s->fullscreen     = true;           // (11-12) 1080p by default in Souls ligero / ligero +
+		s->resolution     = "1920x1080";
 	} else if (preset == "equilibrado") {
 		// (10-25) The user's capture: DLSS Calidad (K), sharpness 100 %, textures Maximo, distance and shadows Alto, Detail
 		// High, Reflections / Object Fade High, AA Sharpness High, x16, extra sharp textures, all the post-processing.

@@ -1893,6 +1893,74 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		sd.index_count = draw.index_count;
 		FrameGen::BeforeSceneDraw(buffer, m_context.GetTextureCache(), rendering, rendering.color_attachments[0].image_layout, sd);
 	}
+	// (des-particles-native) KYTY_FG_PARTICLE_NATIVE: a particle-translucent draw's simulated particles for frame
+	// generation's vectors (particle-mv.cpp). Its VS (a64d43c72c1c5c87 / b6761454c17bea3c) reads s[8:9] = a table: the
+	// view-projection rows at 0x00..0x3f, V#s at 0xd8 (emitters), 0xe8 (sorted list, slot at +4) and 0xf8 (records);
+	// the particle is s10 + the instance id.
+	if (FrameGen::ParticleNativeWanted() && flip_slot < 0 && !record_draw && state.vs_input_info.stage.program != nullptr &&
+	    FrameGen::ParticleNativeVs(state.vs_input_info.stage.program->shader_hash) && rendering.num_color_attachments > 0) {
+		const auto& prog = *state.vs_input_info.stage.program;
+		const auto& ud   = state.vs_input_info.stage.resources.user_data;
+		const auto  sgpr = [&](uint32_t reg, uint32_t& out) {
+			if (reg < prog.user_data_base || reg - prog.user_data_base >= ud.size()) return false;
+			out = ud[reg - prog.user_data_base];
+			return true;
+		};
+		uint32_t lo = 0, hi = 0, s10 = 0;
+		if (sgpr(8, lo) && sgpr(9, hi)) {
+			const uint64_t table = (uint64_t {hi} << 32 | lo) & 0x0000ffffffffffffull;
+			if (table != 0) {
+				const auto* t     = reinterpret_cast<const uint32_t*>(table);
+				auto&       cache = m_context.GetBufferCache();
+				struct Vs {
+					uint64_t base;
+					uint32_t stride, count;
+				};
+				const auto vsharp = [&](uint32_t off) {
+					const uint32_t* v = t + off / 4;
+					return Vs {(uint64_t {v[1] & 0xffffu} << 32 | v[0]), (v[1] >> 16) & 0x3fffu, v[2]};
+				};
+				const auto obtain = [&](uint64_t address, uint64_t size) {
+					FrameGen::ParticleNativeSrc src;
+					if (address == 0 || size == 0) return src;
+					// Only a buffer already registered over the range (the draw's own): nothing created or merged here.
+					const auto id = cache.RegisteredBuffer(address, size);
+					if (!id) return src;
+					auto& b = cache.GetBuffer(id);
+					src.buffer = b.Handle(), src.offset = b.Offset(address), src.size = size;
+					return src;
+				};
+				const Vs                      em = vsharp(0xd8), so = vsharp(0xe8), re = vsharp(0xf8);
+				FrameGen::ParticleNativeDraw nd;
+				nd.vs          = prog.shader_hash;
+				nd.rec_address = re.base;
+				nd.rec_stride = re.stride, nd.rec_count = re.count, nd.sort_stride = so.stride, nd.sort_count = so.count;
+				nd.emit_stride = em.stride, nd.emit_count = em.count;
+				const uint64_t limit = 64ull << 20;
+				if (re.stride != 0 && so.stride != 0 && uint64_t {re.stride} * re.count <= limit && uint64_t {so.stride} * so.count <= limit) {
+					nd.rec  = obtain(re.base, uint64_t {re.stride} * re.count);
+					nd.sort = obtain(so.base, uint64_t {so.stride} * so.count);
+					if (em.stride != 0 && uint64_t {em.stride} * em.count <= limit) nd.emit = obtain(em.base, uint64_t {em.stride} * em.count);
+					for (int r = 0; r < 4; ++r)
+						for (int c = 0; c < 4; ++c) std::memcpy(&nd.vp[r * 4 + c], t + r * 4 + c, 4);
+					nd.indirect = emit.gpu_args != 0;
+					if (nd.indirect) {
+						nd.args = obtain(emit.gpu_args, emit.indexed ? 20 : 16);
+						// The instance offset SGPR is s10: the arguments' first instance, else the user data.
+						nd.base_from_args           = prog.info.instance_offset_sgpr == 10;
+						nd.args_first_instance_word = emit.indexed ? 4 : 3;
+					} else {
+						nd.instance_count = draw.instance_count;
+					}
+					if (!nd.base_from_args) {
+						if (prog.info.instance_offset_sgpr == 10) nd.base_instance = emit.first_instance;
+						else if (sgpr(10, s10)) nd.base_instance = s10;
+					}
+					FrameGen::ParticleNativeCapture(buffer, rendering, nd);
+				}
+			}
+		}
+	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	if (!record_draw) {
 		if (set_auto_debug) {

@@ -346,6 +346,25 @@ struct SceneDraw {
 // pass in progress, copy the target and resume it (`layout`: the target's attachment layout).
 void BeforeSceneDraw(CommandBuffer& command, TextureCache& cache, const RenderState& rendering, vk::ImageLayout layout,
                      const SceneDraw& draw);
+// (des-particles-native) KYTY_FG_PARTICLE_NATIVE=1 (particle-mv.cpp): native particle motion vectors for frame
+// generation. A particle-translucent draw (VS a64d43c72c1c5c87 / b6761454c17bea3c, KYTY_FG_PARTICLE_NATIVE_VS) hands its
+// sorted list, its GPU-simulated particle records, the emitter table, the indirect arguments and its view-projection
+// (the VS's user-data table, 0x00..0x3f); they are copied right there (a render-pass break, a few buffer copies).
+struct ParticleNativeSrc {
+	vk::Buffer buffer = nullptr;
+	uint64_t   offset = 0, size = 0;
+};
+struct ParticleNativeDraw {
+	uint64_t          vs = 0, rec_address = 0;
+	ParticleNativeSrc sort, rec, emit, args;
+	uint32_t          sort_stride = 0, sort_count = 0, rec_stride = 0, rec_count = 0, emit_stride = 0, emit_count = 0;
+	uint32_t          base_instance = 0, instance_count = 0, args_first_instance_word = 0;
+	bool              indirect = false, base_from_args = false;
+	float             vp[16] {};
+};
+[[nodiscard]] bool ParticleNativeWanted();
+[[nodiscard]] bool ParticleNativeVs(uint64_t vs_hash);
+void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering, const ParticleNativeDraw& draw);
 // Table / native-path draws (counted only: the copy is taken on the normal path).
 void NoteOtherPathDraw(uint64_t address, uint64_t vs, bool blend, int path);
 // A dispatch binding a storage image it writes (census only).
