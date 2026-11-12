@@ -1122,6 +1122,45 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 	return OK;
 }
 
+struct SaveDataConvertParam {
+	int32_t                   user_id;
+	int32_t                   reserved0;
+	const SceSaveDataDirName* src_dir_name;
+	const SceSaveDataDirName* dst_dir_name; // may be null
+	uint64_t                  dst_blocks;   // 0 keeps the source size
+	uint8_t                   reserved[24];
+};
+
+static_assert(sizeof(SaveDataConvertParam) == 56);
+
+// From the GT7 port: a result >= 0 starts an asynchronous conversion polled with
+// GetConvertProgress; GT7 treats NOT_FOUND and NO_NEED_CONVERT as "nothing to convert" and goes on
+// to mount or create its save. Kyty only writes save data in the current format.
+int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
+	PRINT_NAME();
+
+	if (convert == nullptr || convert->src_dir_name == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	const std::string name(convert->src_dir_name->data,
+	                       strnlen(convert->src_dir_name->data, sizeof(convert->src_dir_name->data)));
+	if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	if (convert->user_id < 0) {
+		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
+	}
+
+	LOGF("\t user_id    = %" PRId32 "\n"
+	     "\t src        = %s\n"
+	     "\t dst_blocks = %" PRIu64 "\n",
+	     convert->user_id, name.c_str(), convert->dst_blocks);
+
+	std::error_code error;
+	const auto      dir = std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / name;
+	return std::filesystem::exists(dir, error) ? SAVE_DATA_ERROR_NO_NEED_CONVERT : SAVE_DATA_ERROR_NOT_FOUND;
+}
+
 } // namespace SaveData
 
 namespace LibSaveDataNative {
@@ -1155,6 +1194,7 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("cGjO3wM3V28", ::Libs::SaveData::SaveDataLoadIcon);
 	LIB_FUNC("X4MYzukPc3g", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("yKDy8S5yLA0", ::Libs::SaveData::SaveDataTerminate);
+	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
 }
 
 } // namespace LibSaveDataNative
@@ -1185,6 +1225,7 @@ LIB_DEFINE(InitSaveData_1) {
 	LIB_FUNC("cGjO3wM3V28", SaveData::SaveDataLoadIcon);
 	LIB_FUNC("X4MYzukPc3g", SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("yKDy8S5yLA0", SaveData::SaveDataTerminate);
+	LIB_FUNC("2mfSRGdshtk", SaveData::SaveDataConvert);
 
 	LibSaveDataNative::InitSaveDataNative_1(s);
 }
