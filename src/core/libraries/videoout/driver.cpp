@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -337,8 +338,18 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
-    const std::chrono::nanoseconds vblank_period(1000000000 /
-                                                 EmulatorSettings.GetVblankFrequency());
+    // bb-cap40: BB_FPS_CAP between 35 and 59 (Soulsborne ligero: 40 with the 60 FPS++ patch,
+    // which flips on every vblank and times the physics by the real frame time) runs the vblank
+    // at that rate, so the game makes that many frames. 30 / 60 / unlocked keep the setting.
+    u32 vblank_hz = EmulatorSettings.GetVblankFrequency();
+    if (const char* cap = std::getenv("BB_FPS_CAP"); cap != nullptr) {
+        const int c = std::atoi(cap);
+        if (c >= 35 && c < 60) {
+            vblank_hz = u32(c);
+            LOG_INFO(Lib_VideoOut, "BB_FPS_CAP={}: vblank at {} Hz", c, c);
+        }
+    }
+    const std::chrono::nanoseconds vblank_period(1000000000 / vblank_hz);
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
