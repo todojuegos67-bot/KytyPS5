@@ -58,13 +58,7 @@ public:
         u64 vs_hash = 0, ps_hash = 0;
         bool depth_test = false, blend = false;
         bool samples_scene = false; // reads an image of the scene's size (a post pass)
-        bool samples_hud_layer = false; // reads the image the UI-movie shaders drew (HUD layer)
     };
-    // The game's HUD layer: the non-display, non-RGBA8-scene target the UI-movie shaders draw
-    // into in game (composited later over the scene by a post-like draw). 0: none seen.
-    [[nodiscard]] VAddr HudLayer() const {
-        return hud_layer;
-    }
     void OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::ImageId depth,
                 bool native_viewport, SceneDepth& scene);
 
@@ -141,7 +135,6 @@ private:
     VideoCore::TextureCache& texture_cache;
     PresentSr* sr = nullptr;
 
-    VAddr hud_layer = 0;
     bool ui_phase = false, display_redirect = false, done_this_frame = false;
     bool ui_read_barrier = false, hudless_taken = false;
     // bb-gpu6: the trigger of this frame's cut (0: a UI-movie shader or none) and the vertex
