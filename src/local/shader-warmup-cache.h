@@ -251,6 +251,9 @@ public:
 
     uint32_t Add(Record& record) {
         if (!Enabled()) return NoShader;
+        // ps_alpha_to_mask (DB_ALPHA_TO_MASK emulation) is not part of this file's schema: such a record
+        // would not rebuild its key on load, so it is never recorded (it compiles live).
+        if (record.stage == ShaderType::Pixel && record.pixel.ps_alpha_to_mask != 0u) return NoShader;
         Writer writer;
         if (!Visit(writer, record) || !ValidKey(record)) return NoShader;
         return AddWords(std::move(writer.words), false);

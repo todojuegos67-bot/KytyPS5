@@ -619,6 +619,7 @@ struct ShaderRegisters {
 	uint32_t m_paScShaderControl = 0;
 
 	DepthShaderControl db_shader_control;
+	uint32_t           m_dbAlphaToMask = 0; // DB_ALPHA_TO_MASK raw value
 
 	[[nodiscard]] uint32_t GetExportCount() const {
 		return 1u + ((m_spiVsOutConfig >> 1u) & 0x1Fu);
@@ -959,6 +960,7 @@ public:
 	}
 
 	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
+	void SetAlphaToMask(uint32_t value) { m_sh_regs.m_dbAlphaToMask = value; }
 
 private:
 	float    m_line_width            = 1.0f;

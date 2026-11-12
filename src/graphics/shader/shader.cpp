@@ -22,8 +22,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -664,6 +666,39 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	return true;
 }
 
+bool ShaderAlphaToMaskFixEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_ALPHA_TO_MASK_FIX");
+		const bool  on = !(v != nullptr && v[0] == '0');
+		std::printf("[alpha-to-mask] DB_ALPHA_TO_MASK emulation (ordered-dither discard on MRT0 alpha): %s "
+		       "(KYTY_ALPHA_TO_MASK_FIX=0 disables)\n",
+		       on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
+void ShaderAlphaToMaskNoteDraw() {
+	static std::atomic<uint32_t> s_count {0};
+	static std::atomic<int64_t>  s_last {0};
+	static std::atomic<bool>     s_first {true};
+	s_count.fetch_add(1, std::memory_order_relaxed);
+	const int64_t  now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	int64_t last = s_last.load(std::memory_order_relaxed);
+	if (s_first.exchange(false, std::memory_order_relaxed)) {
+		std::printf("[alpha-to-mask] first draw with DB_ALPHA_TO_MASK emulated (dithered discard on MRT0 alpha)\n");
+		s_last.store(now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last >= 1000 && s_last.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		const uint32_t total = s_count.exchange(0, std::memory_order_relaxed);
+		std::printf("[alpha-to-mask] last %.1f s: %u draws with DB_ALPHA_TO_MASK emulated\n",
+		       static_cast<double>(now - last) / 1000.0, total);
+	}
+}
+
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
@@ -704,6 +739,16 @@ static void ShaderGetStaticInputInfoPS(
 	     !sh.db_shader_control.shader_z_export_enable &&
 	     !sh.db_shader_control.shader_mask_export_enable);
 	ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
+	// DB_ALPHA_TO_MASK: the host target is single-sample, so the guest's alpha-to-coverage (which on PS5
+	// dithers with the 2x2 ALPHA_TO_MASK_OFFSET pattern and is resolved by the game's TAA) is emulated in
+	// the shader as an ordered-dither discard on MRT0 alpha. Off when the register is off, when the shader
+	// disables it (DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE), when MRT0 is not written, or KYTY_ALPHA_TO_MASK_FIX=0.
+	ps_info.ps_alpha_to_mask = 0;
+	if ((sh.m_dbAlphaToMask & 1u) != 0u && !sh.db_shader_control.alpha_to_mask_disable &&
+	    sh.target_output_mode[0] != 0 && sh.target_output_mode[0] != 7u && ShaderAlphaToMaskFixEnabled()) {
+		ps_info.ps_alpha_to_mask = 0x80000000u | (sh.m_dbAlphaToMask & 0x0001FF00u);
+		ps_info.ps_early_z       = false; // the shader may now discard
+	}
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
@@ -810,6 +855,12 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
+	if (info.ps_alpha_to_mask != 0u) {
+		// Only when on (bit 31 set, unlike any target_output_mode word that follows), so every key without it
+		// stays as before. Not serialized by the shader warmup file: such a record fails ValidKey when
+		// recorded and is simply not warmed.
+		key.push_back(info.ps_alpha_to_mask);
+	}
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;

@@ -154,6 +154,9 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_shading            = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
+	// DB_ALPHA_TO_MASK emulated in the shader (single-sample host): 0 = off, else bit 31 set with the
+	// register's ALPHA_TO_MASK_OFFSET0..3 (bits 15:8) and OFFSET_ROUND (bit 16). See KYTY_ALPHA_TO_MASK_FIX.
+	uint32_t                                       ps_alpha_to_mask             = 0;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
@@ -173,6 +176,11 @@ inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType          
 		default: return nullptr;
 	}
 }
+
+// KYTY_ALPHA_TO_MASK_FIX (default on): emulate DB_ALPHA_TO_MASK in pixel shaders. Logs once.
+bool ShaderAlphaToMaskFixEnabled();
+// A draw whose pixel shader has ps_alpha_to_mask: counted, printed once a second (only while such draws happen).
+void ShaderAlphaToMaskNoteDraw();
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,

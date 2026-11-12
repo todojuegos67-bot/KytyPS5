@@ -1275,6 +1275,9 @@ static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info);
+	if (state.ps_active && state.ps_input_info.ps_alpha_to_mask != 0u) {
+		ShaderAlphaToMaskNoteDraw();
+	}
 	return !PipelineCache::TakeMaterializationFailure();
 }
 
@@ -2466,7 +2469,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		                                paint_target.attrib2.height + 1u, static_cast<uint32_t>(paint_target.info.format),
 		                                static_cast<uint32_t>(paint_target.info.channel_type),
 		                                paint_ctx.GetBlendControl(0).enable, paint_ctx.GetDepthControl().z_enable,
-		                                paint_ctx.GetDepthControl().z_write_enable) ||
+		                                paint_ctx.GetDepthControl().z_write_enable,
+		                                (paint_ctx.GetShaderRegisters().m_dbAlphaToMask & 1u) != 0u &&
+		                                    !paint_ctx.GetShaderRegisters().db_shader_control.alpha_to_mask_disable,
+		                                paint_ctx.GetShaderRegisters().db_shader_control.shader_kill_enable) ||
 		    SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr))
 			return true;
 	}
@@ -2658,7 +2664,10 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		                                paint_target.attrib2.height + 1u, static_cast<uint32_t>(paint_target.info.format),
 		                                static_cast<uint32_t>(paint_target.info.channel_type),
 		                                paint_ctx.GetBlendControl(0).enable, paint_ctx.GetDepthControl().z_enable,
-		                                paint_ctx.GetDepthControl().z_write_enable) ||
+		                                paint_ctx.GetDepthControl().z_write_enable,
+		                                (paint_ctx.GetShaderRegisters().m_dbAlphaToMask & 1u) != 0u &&
+		                                    !paint_ctx.GetShaderRegisters().db_shader_control.alpha_to_mask_disable,
+		                                paint_ctx.GetShaderRegisters().db_shader_control.shader_kill_enable) ||
 		    SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr))
 			return true;
 	}

@@ -415,6 +415,11 @@ void AllocateInputVariables(EmitterState& state) {
 		// (A lane-local wave64 program's GCN lane: BufferByteAddress, a cooperative program's exchange slot.)
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 	}
+	if (state.stage == ShaderType::Pixel && state.input_info.pixel != nullptr &&
+	    state.input_info.pixel->ps_alpha_to_mask != 0u) {
+		// (DB_ALPHA_TO_MASK emulation: the dither cell comes from the pixel position.)
+		add_builtin(IR::StageInputKind::FragCoord, 4, "gl_FragCoord");
+	}
 	for (auto& binding: state.inputs) {
 		binding.variable_id = state.builder.AllocateId();
 		state.interface_variables.push_back(binding.variable_id);

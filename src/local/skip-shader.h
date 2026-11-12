@@ -188,14 +188,18 @@ inline void Note(char kind, uint64_t address, uint32_t width, uint32_t height, u
 	t.last    = now;
 }
 
-// KYTY_PAINT_LIVE: in-game bisection. Counts of the last full second (CS addresses; PS addresses drawing into a 1280x720
-// color target) are snapshot when a group is chosen from off (F8 off retakes it). Groups, in order:
+// KYTY_PAINT_LIVE: in-game bisection. Counts of the last full second (CS addresses; PS addresses of draws with a color
+// target, any size: the scene's targets are not always exactly 1280x720, which left that list empty) are snapshot when a
+// group is chosen from off (F8 off retakes it). Groups, in order:
 //  0 off, 1 blended draws (color target 0 blending), 2 depth test without depth write, 3 draws into 3840x2160,
-//  4 draws into 1280x720, 5 CS range, 6 PS(1280x720) range, then each CS alone (by count), then each PS alone.
+//  4 draws into 1280x720, 5 draws with alpha-to-mask (DB_ALPHA_TO_MASK on, not disabled by the shader), 6 draws whose
+//  PS may discard (DB_SHADER_CONTROL.KILL_ENABLE), 7 CS range, 8 PS(color) range, then each CS alone (by count), then
+//  each PS alone.
 // A range group leaves out list[lo, hi); F9 halves it (first half, second half, whole), F10 makes the half left out
 // the new whole. Only with live on: a mutex per draw/dispatch.
 namespace Live {
-enum Kind : uint32_t { Off = 0, Blend, DepthNoWrite, Rt4k, Rt720, CsRange, PsRange, CsOne, PsOne };
+enum Kind : uint32_t { Off = 0, Blend, DepthNoWrite, Rt4k, Rt720, AlphaToMask, PsKill, CsRange, PsRange, CsOne, PsOne };
+inline constexpr uint32_t FixedGroups = 9; // 0..6 the kinds above, 7 CS range, 8 PS range
 struct State {
 	std::mutex                            mutex;
 	std::map<uint64_t, uint32_t>          cs_cur, ps_cur, cs_prev, ps_prev;
@@ -206,6 +210,7 @@ struct State {
 	size_t                                lo = 0, hi = 0;   // the whole of a range (or the one entry)
 	uint32_t                              half = 0;         // 0 whole, 1 first half, 2 second half
 	std::vector<uint64_t>                 out;              // sorted addresses left out (CS / PS kinds)
+	std::map<uint64_t, uint32_t>          ps_rt;            // PS -> its last color target, (width << 16) | height
 };
 inline State& GetState() {
 	static State s;
@@ -232,7 +237,9 @@ inline std::vector<uint64_t> Sorted(const std::map<uint64_t, uint32_t>& m) {
 	return r;
 }
 
-inline uint32_t GroupCount(const State& s) { return 7u + static_cast<uint32_t>(s.cs_list.size() + s.ps_list.size()); }
+inline uint32_t GroupCount(const State& s) {
+	return FixedGroups + static_cast<uint32_t>(s.cs_list.size() + s.ps_list.size());
+}
 
 inline void LeftOutRange(const State& s, size_t* lo, size_t* hi) {
 	*lo = s.lo;
@@ -260,11 +267,11 @@ inline void SelectGroup(State& s, uint32_t g) { // (locked)
 	s.half  = 0;
 	s.lo = s.hi = 0;
 	const uint32_t ncs = static_cast<uint32_t>(s.cs_list.size());
-	if (g <= 4) s.kind = static_cast<Kind>(g);
-	else if (g == 5) { s.kind = CsRange; s.hi = s.cs_list.size(); }
-	else if (g == 6) { s.kind = PsRange; s.hi = s.ps_list.size(); }
-	else if (g - 7 < ncs) { s.kind = CsOne; s.lo = g - 7; s.hi = s.lo + 1; }
-	else { s.kind = PsOne; s.lo = g - 7 - ncs; s.hi = s.lo + 1; }
+	if (g <= 6) s.kind = static_cast<Kind>(g);
+	else if (g == 7) { s.kind = CsRange; s.hi = s.cs_list.size(); }
+	else if (g == 8) { s.kind = PsRange; s.hi = s.ps_list.size(); }
+	else if (g - FixedGroups < ncs) { s.kind = CsOne; s.lo = g - FixedGroups; s.hi = s.lo + 1; }
+	else { s.kind = PsOne; s.lo = g - FixedGroups - ncs; s.hi = s.lo + 1; }
 	Rebuild(s);
 }
 
@@ -278,14 +285,22 @@ inline std::string Describe(const State& s) { // (locked)
 		case DepthNoWrite: name = "draws with depth test, no depth write"; break;
 		case Rt4k: name = "draws into 3840x2160"; break;
 		case Rt720: name = "draws into 1280x720"; break;
+		case AlphaToMask: name = "draws with alpha-to-mask enabled"; break;
+		case PsKill: name = "draws whose PS uses discard/kill"; break;
 		case CsRange: name = "CS list range"; break;
-		case PsRange: name = "PS(1280x720) list range"; break;
+		case PsRange: name = "PS(color target) list range"; break;
 		case CsOne: name = "CS"; break;
-		case PsOne: name = "PS(1280x720)"; break;
+		case PsOne: name = "PS(color target)"; break;
 	}
 	size_t lo = 0, hi = 0;
 	LeftOutRange(s, &lo, &hi);
-	if (s.kind == CsOne || s.kind == PsOne)
+	if (s.kind == PsOne) {
+		const uint64_t ps = s.out.empty() ? 0ull : s.out[0];
+		const auto     rt = s.ps_rt.find(ps);
+		const uint32_t wh = rt != s.ps_rt.end() ? rt->second : 0u;
+		std::snprintf(buf, sizeof(buf), "group %u/%u: %s #%zu 0x%016llx (target %ux%u)", s.group, total - 1, name, lo,
+		              static_cast<unsigned long long>(ps), wh >> 16u, wh & 0xffffu);
+	} else if (s.kind == CsOne)
 		std::snprintf(buf, sizeof(buf), "group %u/%u: %s #%zu 0x%016llx", s.group, total - 1, name, lo,
 		              static_cast<unsigned long long>(s.out.empty() ? 0ull : s.out[0]));
 	else if (s.kind == CsRange || s.kind == PsRange)
@@ -338,20 +353,27 @@ inline std::string Key(int f) {
 
 inline bool Has(const State& s, uint64_t a) { return std::binary_search(s.out.begin(), s.out.end(), a); }
 
-inline bool Draw(uint64_t ps, bool has_color, uint32_t width, uint32_t height, bool blend, bool ztest, bool zwrite) {
+inline bool Draw(uint64_t ps, bool has_color, uint32_t width, uint32_t height, bool blend, bool ztest, bool zwrite,
+                 bool alpha_to_mask, bool kill) {
 	auto&                       s = GetState();
 	std::lock_guard<std::mutex> lock(s.mutex);
 	Roll(s);
 	const bool is720 = has_color && width == 1280 && height == 720;
-	if (is720 && ps != 0 && s.ps_cur.size() < 4096) ++s.ps_cur[ps];
+	if (has_color && ps != 0 && s.ps_cur.size() < 4096) {
+		++s.ps_cur[ps];
+		if (s.ps_rt.size() < 8192 || s.ps_rt.count(ps) != 0)
+			s.ps_rt[ps] = ((width & 0xffffu) << 16u) | (height & 0xffffu);
+	}
 	switch (s.kind) {
 		case Off: return false;
 		case Blend: return has_color && blend;
 		case DepthNoWrite: return ztest && !zwrite;
 		case Rt4k: return has_color && width == 3840 && height == 2160;
 		case Rt720: return is720;
+		case AlphaToMask: return alpha_to_mask;
+		case PsKill: return kill;
 		case PsRange:
-		case PsOne: return is720 && Has(s, ps);
+		case PsOne: return has_color && Has(s, ps);
 		default: return false;
 	}
 }
@@ -367,12 +389,13 @@ inline bool Dispatch(uint64_t cs) {
 
 // A draw (pixel shader `ps`, color target 0 `width` x `height`, 0 without one): true when left out.
 inline bool SkipDraw(uint64_t ps, bool has_color, uint32_t width, uint32_t height, uint32_t format, uint32_t type,
-                     bool blend = false, bool ztest = false, bool zwrite = false) {
+                     bool blend = false, bool ztest = false, bool zwrite = false, bool alpha_to_mask = false,
+                     bool kill = false) {
 	const auto& c = Get();
 	if (!c.active) return false;
 	if (!has_color) width = height = format = type = 0;
 	bool skip = c.klass != 0 && ClassOf(width, has_color) == c.klass;
-	if (c.live && Live::Draw(ps, has_color, width, height, blend, ztest, zwrite)) skip = true;
+	if (c.live && Live::Draw(ps, has_color, width, height, blend, ztest, zwrite, alpha_to_mask, kill)) skip = true;
 	if (!skip && has_color)
 		for (const auto& size: c.sizes)
 			if (size.first == width && size.second == height) skip = true;

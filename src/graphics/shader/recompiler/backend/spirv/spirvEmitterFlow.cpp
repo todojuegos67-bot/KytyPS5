@@ -345,6 +345,64 @@ uint32_t MrtOutputMode(const EmitterState& state, const IR::ExportInfo& exp) {
 	return state.input_info.pixel->target_output_mode[exp.index];
 }
 
+// DB_ALPHA_TO_MASK on a single-sample target: the PS5 turns MRT0 alpha into coverage with a 2x2 per-pixel
+// dither (ALPHA_TO_MASK_OFFSET0..3: pixel (x&1) + 2*(y&1)); with one sample that is an ordered screen-door
+// pattern the game's TAA resolves. Covered when alpha * 4 + offset >= 4 (- 0.5 with OFFSET_ROUND), so alpha 0
+// is never covered and alpha 1 always is; uncovered pixels are discarded (colour and depth, as on hardware).
+void EmitAlphaToMaskKill(EmitterState& state, uint32_t f32_vector) {
+	const auto a2m = state.input_info.pixel->ps_alpha_to_mask;
+	uint32_t   frag_coord = 0;
+	for (const auto& input: state.inputs) {
+		if (input.kind == IR::StageInputKind::FragCoord) {
+			frag_coord = input.variable_id;
+			break;
+		}
+	}
+	if (frag_coord == 0) {
+		return;
+	}
+	const float round = ((a2m >> 16u) & 1u) != 0u ? 0.5f : 0.0f;
+	uint32_t    threshold[4];
+	for (uint32_t i = 0; i < 4u; i++) {
+		const auto offset = static_cast<float>((a2m >> (8u + i * 2u)) & 3u);
+		threshold[i]      = ConstantF32Value(state, (4.0f - offset - round) * 0.25f);
+	}
+	const auto alpha = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), alpha, f32_vector, 3});
+	uint32_t odd[2] = {};
+	for (uint32_t axis = 0; axis < 2u; axis++) {
+		const auto pointer = state.builder.AllocateId();
+		const auto coord   = state.builder.AllocateId();
+		const auto integer = state.builder.AllocateId();
+		const auto bit     = state.builder.AllocateId();
+		odd[axis]          = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain,
+		                           TypePointer(state, StorageClassInput, TypeF32(state)), pointer,
+		                           frag_coord, ConstantU32(state, axis)});
+		state.builder.AddFunction({OpLoad, TypeF32(state), coord, pointer});
+		state.builder.AddFunction({OpConvertFToU, TypeU32(state), integer, coord});
+		state.builder.AddFunction(
+		    {OpBitwiseAnd, TypeU32(state), bit, integer, ConstantU32(state, 1)});
+		state.builder.AddFunction(
+		    {OpINotEqual, TypeBool(state), odd[axis], bit, ConstantU32(state, 0)});
+	}
+	const auto row0 = state.builder.AllocateId();
+	const auto row1 = state.builder.AllocateId();
+	const auto thr  = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeF32(state), row0, odd[0], threshold[1], threshold[0]});
+	state.builder.AddFunction({OpSelect, TypeF32(state), row1, odd[0], threshold[3], threshold[2]});
+	state.builder.AddFunction({OpSelect, TypeF32(state), thr, odd[1], row1, row0});
+	const auto uncovered   = state.builder.AllocateId();
+	const auto kill_label  = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction({OpFOrdLessThan, TypeBool(state), uncovered, alpha, thr});
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction({OpBranchConditional, uncovered, kill_label, merge_label});
+	EmitLabel(state, kill_label);
+	state.builder.AddFunction({OpKill});
+	EmitLabel(state, merge_label);
+}
+
 uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t component) {
 	const auto value = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(
@@ -574,6 +632,11 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const bool uint_output = MrtOutputMode(state, exp) == 7u;
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    exp.index == 0 && !uint_output && (exp.en & (exp.compr ? 0xCu : 8u)) != 0u &&
+		    state.input_info.pixel->ps_alpha_to_mask != 0u) {
+			EmitAlphaToMaskKill(state, value);
+		}
 		if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index < state.input_info.pixel->target_export_mapping.size()) {
 			const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
