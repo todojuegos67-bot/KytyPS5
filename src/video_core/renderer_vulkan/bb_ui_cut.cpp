@@ -61,7 +61,7 @@ vk::ImageAspectFlags DepthAspect(vk::Format f) {
 // Why no draw started the HUD cut (logged once a second while no cut happens).
 struct CutWhy {
     u64 movie_not_target = 0, target_not_movie = 0, display_buffer = 0, no_scene = 0,
-        not_ready = 0, cuts_seen = 0;
+        not_ready = 0, cuts_seen = 0, layer_reads = 0, layer_reads_post = 0, layer_starts = 0;
     u64 hashes[8]{};
     u32 hash_count = 0;
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -86,9 +86,16 @@ void FlushWhy() {
         BB::Upscale::Checkpoint(fmt::format(
             "[hud-cut] no cut this second: UI-movie shader on a non-scene target {}, scene-size "
             "RGBA8 draws by other shaders {} (vs: {}), display buffer {}, scene not ready {}, "
-            "upscaler/FG not ready {}",
+            "upscaler/FG not ready {}; HUD-layer reads into the scene target {} (also reading "
+            "another scene-size image {}, HUD start candidates {})",
             g_why.movie_not_target, g_why.target_not_movie, hashes.empty() ? "none" : hashes,
-            g_why.display_buffer, g_why.no_scene, g_why.not_ready));
+            g_why.display_buffer, g_why.no_scene, g_why.not_ready, g_why.layer_reads,
+            g_why.layer_reads_post, g_why.layer_starts));
+    } else {
+        BB::Upscale::Checkpoint(fmt::format(
+            "[hud-cut] cut this second: {} draws at the cut point, {} of them by the HUD-layer "
+            "composite; HUD-layer reads {} (also reading the scene {})",
+            g_why.cuts_seen, g_why.layer_starts, g_why.layer_reads, g_why.layer_reads_post));
     }
     g_why = CutWhy{};
     g_why.t0 = now;
@@ -338,11 +345,34 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
     }();
     const bool refused = std::find(bad_vs.begin(), bad_vs.begin() + num_bad_vs, vs_hash) !=
                          bad_vs.begin() + num_bad_vs;
+    // In game the UI-movie shaders draw into a HUD layer (not an RGBA8 scene-size target); a later
+    // draw composites it over the scene. That draw reads the HUD layer (not counted as a scene
+    // read) and starts the HUD cut, so the scene is upscaled and handed to FG without the HUD.
+    {
+        const auto& im = texture_cache.GetImage(color);
+        const bool rgba8_scene =
+            Rgba8(im.info.pixel_format) && RenderTarget(im.info.size.width, im.info.size.height);
+        if (listed_movie && !rgba8_scene && !IsDisplayBuffer(im.info.guest_address) &&
+            im.info.guest_address != hud_layer) {
+            hud_layer = im.info.guest_address;
+            static u32 layer_logs = 0;
+            if (layer_logs++ < 8) BB::Upscale::Checkpoint(fmt::format(
+                "[hud-cut] HUD layer: UI-movie vs {:#x} draws into {:#x} {}x{} {}; a draw reading "
+                "it into the scene target starts the HUD cut",
+                vs_hash, hud_layer, im.info.size.width, im.info.size.height,
+                vk::to_string(im.info.pixel_format)));
+        }
+        if (info.samples_hud_layer && rgba8_scene) {
+            ++g_why.layer_reads;
+            if (info.samples_scene) ++g_why.layer_reads_post;
+        }
+    }
     const bool flat = !info.samples_scene && !info.depth_test;
+    const bool layer_start = info.samples_hud_layer && trigger_mode != 0;
     const bool hud_start =
         !listed_movie && trigger_mode != 0 && flat && !refused &&
         (std::find(hud_list.begin(), hud_list.end(), vs_hash) != hud_list.end() ||
-         (trigger_mode == 2 && info.blend));
+         (trigger_mode == 2 && info.blend) || layer_start);
     const bool movie = listed_movie || hud_start;
     (void)native_viewport; // Supermedo: only for his live resolution path (guest targets 1080p)
     const bool ui_draw = movie && Rgba8(image.info.pixel_format) &&
@@ -366,6 +396,7 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
         if (ui_draw && !(scene.valid && ldr_target == color)) ++g_why.no_scene;
         if (ui_draw && !active) ++g_why.not_ready;
         if (ui_draw) ++g_why.cuts_seen;
+        if (ui_draw && hud_start && layer_start) ++g_why.layer_starts;
         FlushWhy();
     }
     if (ui_draw && hud_start && scene.valid && ldr_target == color && active) {

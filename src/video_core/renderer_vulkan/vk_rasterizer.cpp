@@ -1159,12 +1159,17 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
         info.depth_test = regs.depth_control.depth_enable != 0;
         info.blend = pipeline->GetGraphicsKey().blend_controls[0].enable != 0;
         const u32 sw = BB::Upscale::g_scene_w, sh = BB::Upscale::g_scene_h;
+        const VAddr hud_layer = bb_cut.HudLayer();
         for (const auto* stage : pipeline->GetStages()) {
             if (!stage) continue;
             if (stage->sw_stage == Shader::SwStage::Fragment) info.ps_hash = stage->pgm_hash;
             for (const auto& image_desc : stage->images) {
                 const auto tsharp = image_desc.GetSharp(*stage);
                 if (tsharp.Address() == 0) continue;
+                if (hud_layer != 0 && tsharp.Address() == hud_layer) {
+                    info.samples_hud_layer = true;
+                    continue;
+                }
                 const u32 w = u32(tsharp.width) + 1, h = u32(tsharp.height) + 1;
                 if (sw && sh && w + 8 > sw && h + 8 > sh && w < sw + 8 && h < sh + 8) {
                     info.samples_scene = true;

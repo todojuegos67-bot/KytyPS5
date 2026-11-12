@@ -144,6 +144,14 @@ struct State {
     std::unordered_map<u64, BB::NativeMv::DrawId> pal_ids; // palette address -> game identity
     u64 vs_cam_rejected = 0, vs_cam_unchecked = 0;
     std::unordered_map<u32, std::array<float, 216>> cam_cpu_cur, cam_cpu_prev; // by order
+    // Palettes without a game identity whose address changes every frame (double-buffered):
+    // matched by their order among the frame's palettes of that vertex shader and size, accepted
+    // only when the first 64 floats still look like last frame's (CPU copies of guest memory).
+    std::unordered_map<u64, u64> pal_ord_of;  // (address, size) -> order key this frame
+    std::unordered_map<u64, u32> pal_ord_n;   // (vs hash, size) -> palettes seen this frame
+    std::unordered_map<u64, bool> pal_checked; // order key -> similar to last frame's
+    std::unordered_map<u64, std::array<float, 64>> pal_cpu_cur, pal_cpu_prev; // by order key
+    u64 vs_pal_ord = 0, vs_pal_rejected = 0, vs_pal_unchecked = 0;
     u64 vs_frames = 0, vs_draws = 0, vs_native = 0, vs_static = 0, vs_skinned = 0,
         vs_skinned_ring = 0, vs_skinned_addr = 0, vs_no_cam = 0, vs_no_pal = 0, vs_blend = 0,
         vs_gpu_copies = 0, vs_bytes = 0, vs_cam_addr = 0, vs_cam_ord = 0, vs_ring_seen = 0;
@@ -705,6 +713,15 @@ bool CameraCpuCopy(Core::MemoryManager* memory, VideoCore::BufferCache& buffer_c
     return true;
 }
 
+bool PaletteSimilar(const std::array<float, 64>& a, const std::array<float, 64>& b) {
+    u32 close = 0;
+    for (u32 i = 0; i < 64; ++i) {
+        const float d = std::fabs(a[i] - b[i]);
+        if (a[i] == b[i] || d <= 0.05f * std::max(1.0f, std::fabs(a[i]))) ++close;
+    }
+    return close >= 64 * 3 / 4;
+}
+
 bool CameraSimilar(const std::array<float, 216>& a, const std::array<float, 216>& b) {
     u32 close = 0;
     for (u32 i = 0; i < 216; ++i) {
@@ -815,6 +832,50 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 if (const auto it = g.vel_addr_prev.find(akey);
                     it != g.vel_addr_prev.end() && it->second.addr != 0) {
                     found = &it->second;
+                }
+            }
+            if (found == nullptr && id.key == 0) {
+                u64 okey;
+                if (const auto it = g.pal_ord_of.find(akey); it != g.pal_ord_of.end()) {
+                    okey = it->second;
+                } else {
+                    const u64 group = Mix(Mix(0x70616cull, vs_hash), size);
+                    okey = Mix(group, g.pal_ord_n[group]++);
+                    g.pal_ord_of[akey] = okey;
+                    if (have_cur) g.vel_id_cur[okey] = cur;
+                    if (!buffer_cache.IsRegionGpuModified(addr, 256) &&
+                        memory->IsValidMapping(addr, 256)) {
+                        std::array<float, 64> c;
+                        std::memcpy(c.data(), reinterpret_cast<const void*>(addr), 256);
+                        g.pal_cpu_cur[okey] = c;
+                    }
+                }
+                if (const auto it = g.vel_id_prev.find(okey);
+                    it != g.vel_id_prev.end() && it->second.addr != 0 &&
+                    it->second.dwords == size / 4) {
+                    const auto chk = g.pal_checked.try_emplace(okey, false);
+                    if (chk.second) {
+                        const auto c = g.pal_cpu_cur.find(okey);
+                        const auto p = g.pal_cpu_prev.find(okey);
+                        // BB_VEL_PAL_ORDER=trust: also accept palettes the GPU wrote (stale
+                        // guest memory, no check possible).
+                        static const bool trust = [] {
+                            const char* v = std::getenv("BB_VEL_PAL_ORDER");
+                            return v != nullptr && std::strcmp(v, "trust") == 0;
+                        }();
+                        if (c == g.pal_cpu_cur.end() || p == g.pal_cpu_prev.end()) {
+                            ++g.vs_pal_unchecked;
+                            chk.first->second = trust;
+                        } else if (PaletteSimilar(c->second, p->second)) {
+                            chk.first->second = true;
+                        } else {
+                            ++g.vs_pal_rejected;
+                        }
+                    }
+                    if (chk.first->second) {
+                        found = &it->second;
+                        ++g.vs_pal_ord;
+                    }
                 }
             }
             if (found == nullptr) {
@@ -1177,6 +1238,7 @@ void OnFlip() {
         std::swap(g.vel_addr_prev, g.vel_addr_cur);
         std::swap(g.vel_id_prev, g.vel_id_cur);
         std::swap(g.cam_cpu_prev, g.cam_cpu_cur);
+        std::swap(g.pal_cpu_prev, g.pal_cpu_cur);
         g.history = true;
     } else {
         if (g.history) ++g.sec_resets;
@@ -1186,6 +1248,7 @@ void OnFlip() {
         g.vel_addr_prev.clear();
         g.vel_id_prev.clear();
         g.cam_cpu_prev.clear();
+        g.pal_cpu_prev.clear();
         g.history = false;
         if (!had_pass) g.prev_valid = false;
     }
@@ -1198,6 +1261,10 @@ void OnFlip() {
     g.cam_ord.clear();
     g.cam_checked.clear();
     g.cam_cpu_cur.clear();
+    g.pal_cpu_cur.clear();
+    g.pal_ord_of.clear();
+    g.pal_ord_n.clear();
+    g.pal_checked.clear();
     g.pal_ids.clear();
     if (had_pass) ++g.vs_frames;
     g.occ.clear();
@@ -1275,8 +1342,9 @@ void OnFlip() {
             "G-buffer px native {:.1f}%, backup bb_mv {:.1f}% | static check |native-cam| "
             "{:.3f} px over {} px ({}) | previous camera by address {:.1f} / by order {:.1f} "
             "(rejected as different {:.1f}, uncheckable {:.1f}), without {:.1f}/frame; without previous palette {:.1f}/frame; blended (backup) "
-            "{:.1f}/frame | GPU copies {:.1f}/frame, snapshot {:.0f} B/frame, CPU {:.3f} "
-            "us/draw",
+            "{:.1f}/frame | palettes without identity matched by order {:.1f}/frame (rejected as "
+            "different {:.1f}, uncheckable {:.1f}) | GPU copies {:.1f}/frame, snapshot {:.0f} "
+            "B/frame, CPU {:.3f} us/draw",
             double(g.vs_native) / f, double(g.vs_draws) / f, double(g.vs_static) / f,
             double(g.vs_skinned) / f, double(g.vs_skinned_ring) / f,
             double(g.vs_skinned_addr) / f, double(g.vs_ring_seen) / f, native_px,
@@ -1284,13 +1352,16 @@ void OnFlip() {
             g.sec_static_px == 0 ? "no static px" : (st_abs <= 0.5 ? "PASS" : "FAIL"),
             double(g.vs_cam_addr) / f, double(g.vs_cam_ord) / f, double(g.vs_cam_rejected) / f,
             double(g.vs_cam_unchecked) / f, double(g.vs_no_cam) / f,
-            double(g.vs_no_pal) / f, double(g.vs_blend) / f, double(g.vs_gpu_copies) / f,
+            double(g.vs_no_pal) / f, double(g.vs_blend) / f, double(g.vs_pal_ord) / f,
+            double(g.vs_pal_rejected) / f, double(g.vs_pal_unchecked) / f,
+            double(g.vs_gpu_copies) / f,
             double(g.vs_bytes) / f,
             g.vs_draws ? g.vs_cpu_ns / 1000.0 / double(g.vs_draws) : 0.0));
         g.vs_frames = g.vs_draws = g.vs_native = g.vs_static = g.vs_skinned = g.vs_skinned_ring =
             g.vs_skinned_addr = g.vs_no_cam = g.vs_no_pal = g.vs_blend = g.vs_gpu_copies =
                 g.vs_bytes = g.vs_cam_addr = g.vs_cam_ord = g.vs_ring_seen = g.vs_cam_rejected =
-                    g.vs_cam_unchecked = 0;
+                    g.vs_cam_unchecked = g.vs_pal_ord = g.vs_pal_rejected =
+                        g.vs_pal_unchecked = 0;
         g.vs_cpu_ns = 0;
     }
     Log(fmt::format("[objmv-gpu6] moving test {}: palettes changed only by a common transform "
