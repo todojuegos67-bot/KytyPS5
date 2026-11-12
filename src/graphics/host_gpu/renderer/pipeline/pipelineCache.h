@@ -256,6 +256,8 @@ public:
 	// KYTY_PRECOMPILE=1 (pipelineSeeds.h): every guest seed's program into the shader disk cache
 	// and every seed pipeline into the driver cache, on all processors.
 	void PrecompileSeeds();
+	// Round seedcs: the "Pipelines this run" line (at Save).
+	void LogPipelinesMade();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -570,6 +572,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // (false when none holds it, the layouts kept); Compile compiles it into driver_cache, on any
 // thread, after a LookUp made its layouts.
 enum class ComputeBuild : uint8_t { Full, LookUp, Compile };
+// Round seedcs: pipelines made this run (the log's "Pipelines this run" line at the end), from the
+// driver's caches (a lookup that found it, or a create of under CachedMs) or compiled. Counted
+// when a pipeline is made, never per draw or dispatch.
+struct PipelineMadeCounts {
+	static constexpr int64_t CachedMs = 10;
+	std::atomic<uint64_t>    graphics_cached {0};
+	std::atomic<uint64_t>    graphics_compiled {0};
+	std::atomic<uint64_t>    compute_cached {0};
+	std::atomic<uint64_t>    compute_compiled {0};
+};
+PipelineMadeCounts& MadeCounts();
 bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,

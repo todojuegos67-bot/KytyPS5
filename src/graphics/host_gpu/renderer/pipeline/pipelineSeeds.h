@@ -55,6 +55,17 @@ void Flush();
 
 [[nodiscard]] bool PrecompileRequested();
 
+// Round seedcs: whether a seed of the file read at Open holds this program source (stage, shader
+// hash and the code translated, the expanded code for a compute shader that inlines calls), for
+// the shader disk cache's misses: a seeded source that misses has another key than the
+// precompile's (or failed there); an unseeded one is new to the seeds (a new expansion or
+// content). Only asked on a miss. KYTY_SEED_MISS_CHECK=0: not asked.
+[[nodiscard]] uint64_t SourceId(uint32_t stage, uint64_t shader_hash, std::span<const uint32_t> code);
+[[nodiscard]] bool     MissCheck();
+[[nodiscard]] bool     HasSource(uint64_t source_id);
+void                   NoteSourceMiss(bool seeded);
+void                   MissCounts(uint64_t& seeded, uint64_t& unseeded);
+
 // Every intact record of the player's file and of KYTY_PRECOMPILE_SEEDS's, once each.
 struct Record {
 	uint64_t             hash = 0;

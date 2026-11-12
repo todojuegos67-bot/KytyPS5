@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -35,6 +36,7 @@ struct State {
 	std::unordered_set<uint64_t>           records; // hashes in guest.seeds
 	std::unordered_map<uint64_t, uint64_t> programs; // program id -> record hash
 	uint32_t                               new_records = 0;
+	std::unordered_set<uint64_t>           sources; // SourceId of the file's program records
 
 	std::deque<std::pair<uint64_t, std::vector<uint8_t>>> queue;
 	std::condition_variable                               wake, idle;
@@ -177,9 +179,25 @@ void Open(const fs::path& directory, uint64_t format) {
 	}
 	const auto path   = SeedsPath(directory);
 	uint32_t   total  = 0;
-	const auto state  = ReadSeeds(path, format, [&](uint64_t hash, std::span<const uint8_t>) {
+	const bool miss_check = MissCheck();
+	const auto state  = ReadSeeds(path, format, [&](uint64_t hash, std::span<const uint8_t> payload) {
 		s.records.insert(hash);
 		total++;
+		// A program record: tag, u32 stage, u64 shader hash, u32 wave, user data base, push
+		// cursor, u8 kind, then the code (u64 count, words).
+		constexpr size_t code_at = 1 + 4 + 8 + 4 + 4 + 4 + 1;
+		if (miss_check && payload.size() >= code_at + 8 && payload[0] == KindProgram) {
+			uint32_t stage = 0;
+			uint64_t shader_hash = 0, words = 0;
+			std::memcpy(&stage, payload.data() + 1, 4);
+			std::memcpy(&shader_hash, payload.data() + 5, 8);
+			std::memcpy(&words, payload.data() + code_at, 8);
+			if (words <= (payload.size() - code_at - 8) / 4) {
+				std::vector<uint32_t> code(static_cast<size_t>(words));
+				std::memcpy(code.data(), payload.data() + code_at + 8, code.size() * 4);
+				s.sources.insert(SourceId(stage, shader_hash, code));
+			}
+		}
 	});
 	if (state == FileState::OtherFormat) {
 		// Records of another emulator build's structures: set aside, a new file starts.
@@ -189,6 +207,39 @@ void Open(const fs::path& directory, uint64_t format) {
 	}
 	LOGF("Pipeline seeds: %u guest records in %s; recording %s\n", total, path.string().c_str(),
 	     s.recording ? "on" : "off (KYTY_PIPELINE_SEEDS=0)");
+}
+
+namespace {
+std::atomic<uint64_t> g_seeded_misses {0};
+std::atomic<uint64_t> g_unseeded_misses {0};
+} // namespace
+
+uint64_t SourceId(uint32_t stage, uint64_t shader_hash, std::span<const uint32_t> code) {
+	return XXH3_64bits_withSeed(code.data(), code.size_bytes(),
+	                            shader_hash ^ (static_cast<uint64_t>(stage) << 56u));
+}
+
+bool MissCheck() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SEED_MISS_CHECK");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
+bool HasSource(uint64_t source_id) {
+	auto&           s = S();
+	std::lock_guard lock(s.mutex);
+	return s.sources.contains(source_id);
+}
+
+void NoteSourceMiss(bool seeded) {
+	(seeded ? g_seeded_misses : g_unseeded_misses).fetch_add(1, std::memory_order_relaxed);
+}
+
+void MissCounts(uint64_t& seeded, uint64_t& unseeded) {
+	seeded   = g_seeded_misses.load(std::memory_order_relaxed);
+	unseeded = g_unseeded_misses.load(std::memory_order_relaxed);
 }
 
 bool Recording() {

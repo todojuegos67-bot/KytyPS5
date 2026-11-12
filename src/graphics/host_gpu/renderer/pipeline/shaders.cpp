@@ -824,6 +824,15 @@ vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
 	const Common::CrashNoteScope crash_note(note.data());
 	const auto                   result =
 	    build.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, pipeline);
+	if (result == vk::Result::eSuccess && *pipeline != nullptr && !no_optimization) {
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                    std::chrono::steady_clock::now() - create_begin)
+		                    .count();
+		auto& counts = MadeCounts();
+		(cache_only || ms < PipelineMadeCounts::CachedMs ? counts.graphics_cached
+		                                                 : counts.graphics_compiled)
+		    .fetch_add(1, std::memory_order_relaxed);
+	}
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
@@ -940,12 +949,14 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			lookups.push_back(driver_cache);
 		}
 	}
+	bool from_lookup = false;
 	for (const auto cache: lookups) {
 		auto lookup = info;
 		lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 		result =
 		    graphics.device.createComputePipelines(cache, 1, &lookup, nullptr, &pipeline.pipeline);
 		if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
+			from_lookup = true;
 			break;
 		}
 		if (pipeline.pipeline != nullptr) {
@@ -1006,7 +1017,21 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		pipeline.build_failed = true;
 		return false;
 	}
+	{
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                    std::chrono::steady_clock::now() - create_begin)
+		                    .count();
+		auto& counts = MadeCounts();
+		(from_lookup || ms < PipelineMadeCounts::CachedMs ? counts.compute_cached
+		                                                  : counts.compute_compiled)
+		    .fetch_add(1, std::memory_order_relaxed);
+	}
 	return true;
+}
+
+PipelineMadeCounts& MadeCounts() {
+	static PipelineMadeCounts counts;
+	return counts;
 }
 
 } // namespace Libs::Graphics

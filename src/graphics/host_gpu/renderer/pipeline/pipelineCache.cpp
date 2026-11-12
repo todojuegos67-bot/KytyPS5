@@ -3321,6 +3321,16 @@ struct PipelineCache::ProgramCache {
 				CountDiskLookup();
 				if (!loaded) {
 					disk->counters.source_misses++;
+					// Round seedcs: whether the seeds hold this source (then its key differs from
+					// the precompile's) or not (new to them). Only on a miss.
+					int seeded = -1;
+					if (PipelineSeeds::MissCheck()) {
+						seeded = PipelineSeeds::HasSource(PipelineSeeds::SourceId(
+						             static_cast<uint32_t>(stage), params.hash, compile_code))
+						             ? 1
+						             : 0;
+						PipelineSeeds::NoteSourceMiss(seeded == 1);
+					}
 					// KYTY_SHADER_MISS_LOG=<n> (64 by default, 0: none): the first misses named, to
 					// tell what a precompile did not cover (only on a miss: nothing per draw).
 					static const uint32_t miss_log = [] {
@@ -3332,11 +3342,14 @@ struct PipelineCache::ProgramCache {
 					if (misses_logged.load(std::memory_order_relaxed) < miss_log &&
 					    misses_logged.fetch_add(1, std::memory_order_relaxed) < miss_log) {
 						PipelineCacheLog("Shader disk cache miss: {} 0x{:016x}, {} words{}{}, key "
-						                 "{:016x}",
+						                 "{:016x}{}",
 						                 stage_name, params.hash, compile_code.size(),
 						                 lookup_key.function_code.empty() ? "" : " (expanded)",
 						                 read_async ? "" : " (read here)",
-						                 XXH3_64bits(source_key.data(), source_key.size()));
+						                 XXH3_64bits(source_key.data(), source_key.size()),
+						                 seeded == 1   ? ", in the seeds (another key)"
+						                 : seeded == 0 ? ", not in the seeds"
+						                               : "");
 					}
 				} else if (disk_verify) {
 					disk->counters.source_hits++;
@@ -5003,6 +5016,16 @@ static bool SeedVertexDefaults() {
 	return on;
 }
 
+// KYTY_PRECOMPILE_COMPUTE=0: the precompile makes no compute pipelines (their programs still go to
+// the shader disk cache).
+static bool PrecompileCompute() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_PRECOMPILE_COMPUTE");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
 void PipelineCache::PrecompileSeeds() {
 	using Seed    = ProgramCache::SeedProgram;
 	using Outcome = ProgramCache::SeedOutcome;
@@ -5039,6 +5062,11 @@ void PipelineCache::PrecompileSeeds() {
 
 	const ShaderRecompiler::IR::ResourceSnapshot no_resources {};
 	std::atomic<uint32_t> done {0}, compiled {0}, failed {0}, cached {0};
+	std::atomic<uint32_t> compute_cached {0}, compute_compiled {0}, compute_failed {0};
+	uint32_t              compute_seeds = 0;
+	for (const auto* seed: program_list) {
+		compute_seeds += seed->kind == 2 ? 1u : 0u;
+	}
 	std::atomic<bool>     stop {false};
 	const bool            wave64 = m_graphics.SupportsComputeWave64();
 	const auto            lds_limit =
@@ -5115,13 +5143,31 @@ void PipelineCache::PrecompileSeeds() {
 		(outcome == Outcome::Compiled ? compiled : cached)++;
 		m_program_cache->MakeSeedModules(seed);
 		seed.ok = seed.modules.module != nullptr;
-		if (seed.ok && seed.kind == 2) {
+		if (seed.ok && seed.kind == 2 && PrecompileCompute()) {
+			// Round seedcs: as the game makes it (GetComputePipeline): looked up in the driver's
+			// caches first, compiled into the one that is saved when none holds it; counted apart.
 			Pipeline pipeline;
 			auto     info = seed.compute;
 			info.stage    = {.program = &seed.program, .resources = &no_resources};
-			if (CreatePipelineInternal(m_graphics, pipeline, info, seed.modules.module, m_driver_cache,
-			                           m_driver_older, ComputeBuild::Full)) {
-				if (pipeline.pipeline != nullptr) m_graphics.device.destroyPipeline(pipeline.pipeline);
+			bool made     = CreatePipelineInternal(m_graphics, pipeline, info, seed.modules.module,
+			                                       m_driver_cache, m_driver_older, ComputeBuild::LookUp);
+			if (made) {
+				compute_cached++;
+			} else if (pipeline.pipeline_layout != nullptr && !pipeline.build_failed) {
+				const auto begin = std::chrono::steady_clock::now();
+				made = CreatePipelineInternal(m_graphics, pipeline, info, seed.modules.module,
+				                              m_driver_cache, {}, ComputeBuild::Compile);
+				const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                    std::chrono::steady_clock::now() - begin)
+				                    .count();
+				(!made ? compute_failed
+				 : ms < PipelineMadeCounts::CachedMs ? compute_cached
+				                                     : compute_compiled)++;
+			} else {
+				compute_failed++;
+			}
+			if (made && pipeline.pipeline != nullptr) {
+				m_graphics.device.destroyPipeline(pipeline.pipeline);
 			}
 			if (pipeline.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout);
 			if (pipeline.descriptor_set_layout != nullptr)
@@ -5239,11 +5285,38 @@ void PipelineCache::PrecompileSeeds() {
 	PipelineCacheLog("Pipeline seeds: precompile {} in {} s: {} made, {} already cached, {} failed, {} of {} done",
 	                 stop.load() ? "stopped" : "finished", secs, compiled.load(), cached.load(), failed.load(),
 	                 done.load(), total);
+	PipelineCacheLog("Pipeline seeds: compute pipelines of {} compute programs: {} already in the driver's "
+	                 "caches, {} compiled into it, {} failed{}",
+	                 compute_seeds, compute_cached.load(), compute_compiled.load(), compute_failed.load(),
+	                 PrecompileCompute() ? "" : " (KYTY_PRECOMPILE_COMPUTE=0: none made)");
 	PipelineSeeds::WriteProgress(done, total, compiled, failed, true);
 	PipelineSeeds::RemoveStopFile();
 }
+
+void PipelineCache::LogPipelinesMade() {
+	// KYTY_PIPELINE_SUMMARY=0: no line. Not in precompile mode (it has its own lines).
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_PIPELINE_SUMMARY");
+		return v == nullptr || v[0] != '0';
+	}();
+	static std::atomic<bool> logged {false};
+	if (!on || PipelineSeeds::PrecompileRequested() || logged.exchange(true)) {
+		return;
+	}
+	auto&    counts = MadeCounts();
+	uint64_t seeded = 0, unseeded = 0;
+	PipelineSeeds::MissCounts(seeded, unseeded);
+	PipelineCacheLog("Pipelines this run: graphics {} from the driver's caches, {} compiled in game; "
+	                 "compute {} from the caches, {} compiled in game ({} in the background); shader "
+	                 "source misses: {} of sources in the seeds (another key), {} not in the seeds "
+	                 "(a create under {} ms counts as from the caches)",
+	                 counts.graphics_cached.load(), counts.graphics_compiled.load(),
+	                 counts.compute_cached.load(), counts.compute_compiled.load(), m_background_started,
+	                 seeded, unseeded, PipelineMadeCounts::CachedMs);
+}
 void PipelineCache::Save() {
 	PipelineSeeds::Flush();
+	LogPipelinesMade();
 	{
 		// Round 134: no save during play starts from now, and one still writing finishes first.
 		std::lock_guard lock(m_save_mutex);
