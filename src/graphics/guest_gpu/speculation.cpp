@@ -743,6 +743,14 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 				if (processed != Pm4ProcessResult::Complete) r.stop = processor.TakeStopReached() ? ChunkEnd : "suspended";
 				break;
 			}
+			// (A packet that does not fit its buffer, refused "malformed packet" before its Mark: a command buffer the game
+			// rewrote after the GPU thread passed it. Not sized (SuspendedPacket would end the process) and nothing taken:
+			// the checkpoint is the packet before's, so a Rollback would drop that packet's notes; the GPU thread redoes it.)
+			if (!CommandProcessor::SuspendedPacketFits(spec)) {
+				r.failed = true;
+				r.stop   = r.state.refused;
+				break;
+			}
 			uint32_t   dwords  = 0;
 			const auto packet  = CommandProcessor::SuspendedPacket(spec, dwords);
 			const bool partial = LocalVulkanRecording::RecordedWrites() != r.state.checkpoint_work;

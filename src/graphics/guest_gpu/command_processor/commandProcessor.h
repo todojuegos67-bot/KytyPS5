@@ -96,6 +96,8 @@ public:
 	[[nodiscard]] static bool SamePosition(const Pm4Execution& a, const Pm4Execution& b);
 	// The packet a suspended execution stopped at (its length in `dwords`), and past it.
 	[[nodiscard]] static const uint32_t* SuspendedPacket(const Pm4Execution& execution, uint32_t& dwords);
+	// SuspendedPacket would size it (the packet is in its buffer: not past a rewritten buffer's end).
+	[[nodiscard]] static bool            SuspendedPacketFits(const Pm4Execution& execution);
 	// The execution stopped at a WAIT_REG_MEM.
 	[[nodiscard]] static bool AtWait(const Pm4Execution& execution);
 	static void                          SkipSuspendedPacket(Pm4Execution& execution);
