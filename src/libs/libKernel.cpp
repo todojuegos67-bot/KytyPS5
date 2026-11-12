@@ -1182,7 +1182,6 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
 		PthreadWakeForSignal(thread);
 		CloseHandle(target_thread);
 		return OK;
@@ -1207,7 +1206,6 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
 		PthreadWakeForSignal(thread);
 		WaitForSignalDispatch(thread, signum);
 		return OK;
