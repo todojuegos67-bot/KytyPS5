@@ -344,11 +344,18 @@ bool CreateFrameGeneration(vk::Extent2D display, vk::Extent2D render, vk::Format
     create.header.pNext = &backend.header;
     // Bloodborne's depth is reversed (1 near, 0 far) with the far plane taken as infinite, as the
     // upscaler gives FSR 3.1 (KYTY_FSR3_DEPTH=normal: as is).
+    // (11-12) KYTY_FSR3_DEPTH=inverted forces reversed depth (1 near, 0 far; finite far) even when
+    // the scene's depth test says forward: the character ghosted only with FSR 3 FG (DLSS-G
+    // fine with the same vectors), as if FG took it for background. =normal forces forward.
     const char* depth = Env("KYTY_FSR3_DEPTH");
-    const bool normal = (depth != nullptr && std::string(depth) == "normal") || !depth_inverted;
+    const bool force_inv = depth != nullptr && std::string(depth) == "inverted";
+    const bool normal = !force_inv && ((depth != nullptr && std::string(depth) == "normal") || !depth_inverted);
     create.flags = normal ? 0u
-                          : (FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
-                             FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE);
+                   : force_inv ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED
+                               : (FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
+                                  FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE);
+    Printf("FSR3 FG: depth %s (KYTY_FSR3_DEPTH=%s)", normal ? "forward" : force_inv ? "inverted (forced, finite far)" : "inverted + infinite",
+           depth != nullptr ? depth : "");
     if (EnvOn("KYTY_FSR3_DEBUG", false)) create.flags |= FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING;
     if (format == vk::Format::eA2B10G10R10UnormPack32 ||
         format == vk::Format::eA2R10G10B10UnormPack32) {
@@ -1309,7 +1316,11 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     const float z_far = !far_inf && std::isfinite(inputs->z_far) && inputs->z_far > z_near * 2.0f
                             ? inputs->z_far
                             : FLT_MAX;
-    if (inputs->depth_inverted) {
+    static const bool depth_forced_inv = [] {
+        const char* d = Env("KYTY_FSR3_DEPTH");
+        return d != nullptr && std::string(d) == "inverted";
+    }();
+    if (inputs->depth_inverted || depth_forced_inv) {
         prepare.cameraNear = z_far;
         prepare.cameraFar = z_near;
     } else {
