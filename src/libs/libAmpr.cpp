@@ -8,6 +8,8 @@
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
+#include "loader/gt7Title.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -727,10 +729,23 @@ struct CommandBufferState {
 		int32_t  id            = 0;
 		uint64_t data          = 0;
 	};
+	// What a WriteAddress record writes (GT7: the counters and the time counter, from the GT7 port;
+	// other titles keep the value given, 0 for those).
+	enum class WriteSource : uint8_t {
+		Value,
+		Counter,      // the 4-byte counter
+		CounterPair,  // the 8-byte counter pair
+		TimeCounter,  // the process time counter when the command runs
+		CounterWrite, // no address: writes the counter (store/or/and-not/xor/add)
+	};
 	struct WriteAddressCommand {
-		uint64_t record_offset = 0;
-		uint64_t address       = 0;
-		uint64_t value         = 0;
+		uint64_t    record_offset = 0;
+		uint64_t    address       = 0;
+		uint64_t    value         = 0;
+		WriteSource source        = WriteSource::Value;
+		uint8_t     counter_index = 0;
+		uint8_t     access        = 0;
+		uint8_t     op            = 0;
 	};
 	struct AmmMapCommand {
 		uint64_t       record_offset = 0;
@@ -751,6 +766,92 @@ struct CommandBufferState {
 	uint64_t                         gather_scatter_destination = 0;
 	uint64_t                         gather_scatter_file_offset = 0;
 };
+
+// AMPR counters (from the GT7 port): 256 32-bit counters the command buffers write (store, or,
+// and-not, xor, add) and copy to guest memory. Commands run in order at submission here, so
+// "immediately" and "on completion" coincide.
+namespace AmprCounters {
+
+constexpr uint8_t ACCESS_SIZE_8          = 0;
+constexpr uint8_t ACCESS_SIZE_4          = 1;
+constexpr uint8_t ACCESS_SIZE_2_OFFSET_0 = 2;
+constexpr uint8_t ACCESS_SIZE_1_OFFSET_0 = 4;
+constexpr uint8_t ACCESS_SIZE_1_OFFSET_3 = 7;
+
+constexpr uint8_t WRITE_STORE                 = 0;
+constexpr uint8_t WRITE_ATOMIC_OR             = 1;
+constexpr uint8_t WRITE_ATOMIC_AND_COMPLEMENT = 2;
+constexpr uint8_t WRITE_ATOMIC_XOR            = 3;
+constexpr uint8_t WRITE_ATOMIC_ADD            = 4;
+
+constexpr size_t NUM_COUNTERS = 256;
+
+static std::mutex            g_mutex;
+alignas(8) static uint8_t    g_counters[NUM_COUNTERS * sizeof(uint32_t)] = {};
+
+struct Access {
+	uint32_t byte_offset = 0;
+	uint32_t bytes       = 0;
+};
+
+static bool Decode(uint8_t index, uint8_t access, Access* out) {
+	const uint32_t base = static_cast<uint32_t>(index) * sizeof(uint32_t);
+	switch (access) {
+		case ACCESS_SIZE_8:
+			if ((index & 1u) != 0 || static_cast<size_t>(index) + 1u >= NUM_COUNTERS) {
+				return false;
+			}
+			*out = {base, 8};
+			return true;
+		case ACCESS_SIZE_4: *out = {base, 4}; return true;
+		case ACCESS_SIZE_2_OFFSET_0:
+		case ACCESS_SIZE_2_OFFSET_0 + 1:
+			*out = {base + static_cast<uint32_t>(access - ACCESS_SIZE_2_OFFSET_0) * 2u, 2};
+			return true;
+		case ACCESS_SIZE_1_OFFSET_0:
+		case ACCESS_SIZE_1_OFFSET_0 + 1:
+		case ACCESS_SIZE_1_OFFSET_0 + 2:
+		case ACCESS_SIZE_1_OFFSET_3:
+			*out = {base + static_cast<uint32_t>(access - ACCESS_SIZE_1_OFFSET_0), 1};
+			return true;
+		default: return false;
+	}
+}
+
+static uint64_t Read(uint8_t index, uint8_t access) {
+	Access decoded {};
+	if (!Decode(index, access, &decoded)) {
+		return 0;
+	}
+	std::scoped_lock lock(g_mutex);
+	uint64_t         value = 0;
+	std::memcpy(&value, g_counters + decoded.byte_offset, decoded.bytes);
+	return value;
+}
+
+static void Write(uint8_t index, uint8_t access, uint8_t op, uint64_t value) {
+	Access decoded {};
+	if (!Decode(index, access, &decoded)) {
+		return;
+	}
+	const uint64_t   mask = decoded.bytes >= 8 ? ~uint64_t {0} : (uint64_t {1} << (decoded.bytes * 8u)) - 1u;
+	std::scoped_lock lock(g_mutex);
+	uint64_t         current = 0;
+	std::memcpy(&current, g_counters + decoded.byte_offset, decoded.bytes);
+	uint64_t next = value;
+	switch (op) {
+		case WRITE_STORE: next = value; break;
+		case WRITE_ATOMIC_OR: next = current | value; break;
+		case WRITE_ATOMIC_AND_COMPLEMENT: next = current & ~value; break;
+		case WRITE_ATOMIC_XOR: next = current ^ value; break;
+		case WRITE_ATOMIC_ADD: next = current + value; break;
+		default: break;
+	}
+	next &= mask;
+	std::memcpy(g_counters + decoded.byte_offset, &next, decoded.bytes);
+}
+
+} // namespace AmprCounters
 
 struct AmmAutoPoolRange {
 	uint64_t start = 0;
@@ -1174,6 +1275,28 @@ static bool AppendKernelEventRecord(uint64_t command_buffer, uint64_t eq, int32_
 	return CommitCommandBufferRecord(command_buffer, &state, KERNEL_EVENT_RECORD_SIZE);
 }
 
+static bool AppendWriteAddressRecord(uint64_t command_buffer,
+                                     const CommandBufferState::WriteAddressCommand& command,
+                                     uint64_t record_size = 0x20) {
+	std::scoped_lock      lock(g_command_buffer_mutex);
+	CommandBufferIterator it;
+	if (!GetOrCreateCommandBufferStateLocked(command_buffer, &it)) {
+		return false;
+	}
+
+	auto& state = it->second;
+	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, record_size)) {
+		return false;
+	}
+
+	auto record          = command;
+	record.record_offset = state.write_offset;
+	std::memset(reinterpret_cast<void*>(state.buffer + record.record_offset), 0,
+	            static_cast<size_t>(record_size));
+	state.write_address_commands.push_back(record);
+	return CommitCommandBufferRecord(command_buffer, &state, record_size);
+}
+
 static bool AppendWriteAddressRecord(uint64_t command_buffer, uint64_t address, uint64_t value,
                                      uint64_t record_size = 0x20) {
 	std::scoped_lock      lock(g_command_buffer_mutex);
@@ -1190,7 +1313,7 @@ static bool AppendWriteAddressRecord(uint64_t command_buffer, uint64_t address, 
 	const auto record_offset = state.write_offset;
 	std::memset(reinterpret_cast<void*>(state.buffer + record_offset), 0,
 	            static_cast<size_t>(record_size));
-	state.write_address_commands.push_back({record_offset, address, value});
+	state.write_address_commands.push_back({record_offset, address, value, CommandBufferState::WriteSource::Value, 0, 0, 0});
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
@@ -1427,7 +1550,24 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 			} break;
 			case CommandKind::WriteAddress: {
 				const auto& command = state.write_address_commands[entry.index];
-				if (!AprShared::WriteGuest(command.address, command.value)) {
+				if (command.source == CommandBufferState::WriteSource::CounterWrite) {
+					AmprCounters::Write(command.counter_index, command.access, command.op, command.value);
+					break;
+				}
+				uint64_t value = command.value;
+				switch (command.source) {
+					case CommandBufferState::WriteSource::Counter:
+						value = AmprCounters::Read(command.counter_index, AmprCounters::ACCESS_SIZE_4);
+						break;
+					case CommandBufferState::WriteSource::CounterPair:
+						value = AmprCounters::Read(command.counter_index, AmprCounters::ACCESS_SIZE_8);
+						break;
+					case CommandBufferState::WriteSource::TimeCounter:
+						value = LibKernel::KernelGetProcessTimeCounter();
+						break;
+					default: break;
+				}
+				if (!AprShared::WriteGuest(command.address, value)) {
 					LOGF("\tAMPR submit write-address failed: address=0x%016" PRIx64
 					     " value=0x%016" PRIx64 "\n",
 					     command.address, command.value);
@@ -2209,18 +2349,55 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*            
 	return AppendWriteAddressCommand(command_buffer, address, value);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t, uint8_t, uint64_t,
-                                                   uint8_t, uint32_t) {
-	PRINT_NAME();
-
-	return AppendNoOpCommand(command_buffer, 0x20);
+// GT7: the counter commands and the address writes from counters (from the GT7 port); other titles
+// keep the no-ops and zeros they had.
+static int AppendCounterSourcedWrite(void* command_buffer, volatile uint64_t* address,
+                                     CommandBufferState::WriteSource source, uint8_t counter_index = 0,
+                                     uint8_t access = 0, uint8_t op = 0, uint64_t value = 0) {
+	if (!::Loader::IsGranTurismo7()) {
+		if (source == CommandBufferState::WriteSource::CounterWrite) {
+			return AppendNoOpCommand(command_buffer, 0x20);
+		}
+		return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	}
+	if (command_buffer == nullptr ||
+	    (source != CommandBufferState::WriteSource::CounterWrite && address == nullptr)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	if (source == CommandBufferState::WriteSource::CounterWrite &&
+	    op > AmprCounters::WRITE_ATOMIC_ADD) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	CommandBufferState::WriteAddressCommand command {};
+	command.address       = reinterpret_cast<uint64_t>(address);
+	command.value         = value;
+	command.source        = source;
+	command.counter_index = counter_index;
+	command.access        = access;
+	command.op            = op;
+	return AppendWriteAddressRecord(reinterpret_cast<uint64_t>(command_buffer), command)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t,
-                                                               uint8_t, uint64_t, uint8_t) {
+static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t counter_index,
+                                                   uint8_t access, uint64_t value, uint8_t op,
+                                                   uint32_t) {
 	PRINT_NAME();
 
-	return AppendNoOpCommand(command_buffer, 0x20);
+	return AppendCounterSourcedWrite(command_buffer, nullptr,
+	                                 CommandBufferState::WriteSource::CounterWrite, counter_index,
+	                                 access, op, value);
+}
+
+static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer,
+                                                               uint8_t counter_index, uint8_t access,
+                                                               uint64_t value, uint8_t op) {
+	PRINT_NAME();
+
+	return AppendCounterSourcedWrite(command_buffer, nullptr,
+	                                 CommandBufferState::WriteSource::CounterWrite, counter_index,
+	                                 access, op, value);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*              command_buffer,
@@ -2228,44 +2405,50 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*         
                                                                   uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendCounterSourcedWrite(command_buffer, address,
+	                                 CommandBufferState::WriteSource::TimeCounter);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendCounterSourcedWrite(command_buffer, address,
+	                                 CommandBufferState::WriteSource::TimeCounter);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*              command_buffer,
-                                                              volatile uint64_t* address, uint8_t,
-                                                              uint32_t) {
+                                                              volatile uint64_t* address,
+                                                              uint8_t counter_index, uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendCounterSourcedWrite(command_buffer, address,
+	                                 CommandBufferState::WriteSource::Counter, counter_index);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterOnCompletion(
-    void* command_buffer, volatile uint64_t* address, uint8_t) {
+    void* command_buffer, volatile uint64_t* address, uint8_t counter_index) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendCounterSourcedWrite(command_buffer, address,
+	                                 CommandBufferState::WriteSource::Counter, counter_index);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*              command_buffer,
                                                                   volatile uint64_t* address,
-                                                                  uint8_t, uint32_t) {
+                                                                  uint8_t counter_index, uint32_t) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendCounterSourcedWrite(command_buffer, address,
+	                                 CommandBufferState::WriteSource::CounterPair, counter_index);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPairOnCompletion(
-    void* command_buffer, volatile uint64_t* address, uint8_t) {
+    void* command_buffer, volatile uint64_t* address, uint8_t counter_index) {
 	PRINT_NAME();
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendCounterSourcedWrite(command_buffer, address,
+	                                 CommandBufferState::WriteSource::CounterPair, counter_index);
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer, uint64_t, uint64_t,
