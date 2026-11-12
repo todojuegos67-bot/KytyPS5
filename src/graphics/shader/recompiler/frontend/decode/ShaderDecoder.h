@@ -581,6 +581,12 @@ enum class Opcode {
 	DS_WRITE_B8,
 	DS_WRITE_B16,
 	DS_WRITE_B16_D16_HI,
+	// LDS from the GT7 port (outside the DS_ADD_U32..DS_WRXCHG_RTN_B32 range on purpose).
+	DS_WRITE_B8_D16_HI,
+	DS_INC_U32,
+	DS_DEC_U32,
+	DS_ADD_U64,
+	DS_OR_B64,
 	DS_WRITE2_B32,
 	DS_WRITE2ST64_B32,
 	DS_WRITE2_B64,
