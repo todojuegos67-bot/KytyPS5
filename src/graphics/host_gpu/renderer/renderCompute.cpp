@@ -772,6 +772,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!ShaderAddressValid(sh_ctx.GetCs().cs_regs.data_addr)) {
 		return;
 	}
+	SkipShader::Paint::NoteDispatch(sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y, thread_group_z);
 	if (SkipShader::Skipped(sh_ctx.GetCs().cs_regs.data_addr)) return; // live `skipcs` probe
 
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;

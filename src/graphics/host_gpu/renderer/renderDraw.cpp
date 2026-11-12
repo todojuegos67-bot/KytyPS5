@@ -165,6 +165,27 @@ static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::Po
 		case vk::Format::eD16Unorm:
 		case vk::Format::eD16UnormS8Uint: host_depth_bits = 16; break;
 		case vk::Format::eD24UnormS8Uint: host_depth_bits = 24; break;
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint: {
+			// KYTY_SHADOW_FIX (on unless 0): a fixed-point guest depth (D16 shadow pools, kept as D32F on the host) got
+			// its bias unscaled. Guest: units of 2^neg_num_db_bits; a float host: units of 2^(exponent - 23), ~2^-24 for
+			// depths in [0.5, 1), so the bias was ~256x too small (shadow acne: dark blocks flickering on walls near
+			// lights). Scaled for exponent -1: never more than the guest's bias, smaller only for depths under 0.5.
+			static const bool fix = [] {
+				const char* env = std::getenv("KYTY_SHADOW_FIX");
+				return env == nullptr || env[0] != '0';
+			}();
+			if (!fix) return guest_factor;
+			static std::atomic<bool> logged {false};
+			if (guest_factor != 0.0f && !logged.exchange(true, std::memory_order_relaxed)) {
+				std::printf("[shadow] KYTY_SHADOW_FIX: fixed-point depth bias on a float host target scaled: guest %g "
+				            "(2^%d units) -> host %g\n",
+				            static_cast<double>(guest_factor), static_cast<int>(offset.neg_num_db_bits),
+				            static_cast<double>(std::ldexp(guest_factor, 24 + offset.neg_num_db_bits)));
+				std::fflush(stdout);
+			}
+			return std::ldexp(guest_factor, 24 + offset.neg_num_db_bits);
+		}
 		default:
 			// A fixed-point guest bias cannot be represented exactly by a floating-point host
 			// attachment without VK_EXT_depth_bias_control.
@@ -2436,7 +2457,17 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	RenderLockGuard lock(m_context.GetMutex());
-	if (SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr)) return true; // live `skipcs` probe
+	{
+		// KYTY_PAINT (skip-shader.h): draws left out to find which pass draws an artifact; live `skipcs` probe.
+		const auto& paint_ctx    = buffer.GetRegisters();
+		const auto& paint_target = paint_ctx.GetRenderTarget(0);
+		const bool  paint_color  = (paint_ctx.GetRenderTargetMask() & 0xfu) != 0 && paint_target.base.addr != 0;
+		if (SkipShader::Paint::SkipDraw(sh_ctx.GetPs().ps_regs.data_addr, paint_color, paint_target.attrib2.width + 1u,
+		                                paint_target.attrib2.height + 1u, static_cast<uint32_t>(paint_target.info.format),
+		                                static_cast<uint32_t>(paint_target.info.channel_type)) ||
+		    SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr))
+			return true;
+	}
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return true;
 	}
@@ -2616,7 +2647,17 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	RenderLockGuard lock(m_context.GetMutex());
-	if (SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr)) return true; // live `skipcs` probe
+	{
+		// KYTY_PAINT (skip-shader.h): draws left out to find which pass draws an artifact; live `skipcs` probe.
+		const auto& paint_ctx    = buffer.GetRegisters();
+		const auto& paint_target = paint_ctx.GetRenderTarget(0);
+		const bool  paint_color  = (paint_ctx.GetRenderTargetMask() & 0xfu) != 0 && paint_target.base.addr != 0;
+		if (SkipShader::Paint::SkipDraw(sh_ctx.GetPs().ps_regs.data_addr, paint_color, paint_target.attrib2.width + 1u,
+		                                paint_target.attrib2.height + 1u, static_cast<uint32_t>(paint_target.info.format),
+		                                static_cast<uint32_t>(paint_target.info.channel_type)) ||
+		    SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr))
+			return true;
+	}
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return true;
 	}
