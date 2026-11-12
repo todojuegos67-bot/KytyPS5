@@ -490,6 +490,16 @@ void LogPresentIntervals(double window) {
            static_cast<double>(pace[4]) / 1e6, static_cast<double>(pace[5]) / 1e6,
            static_cast<long long>(pace[1]), g_stats.slotted, g_stats.real,
            static_cast<long long>(pace[6]), static_cast<double>(pace[7]) / 1e6);
+    {
+        // bb-fsr3-presented: frames the DLL's frame generation swapchain actually presented in
+        // this window (its own pace counter), split into real and generated.
+        const long long presented = static_cast<long long>(pace[0]);
+        const long long real = static_cast<long long>(g_stats.real);
+        Printf("[fsr3-presented] FG swapchain presented %lld frames in %.1f s: real %lld, "
+               "generated %lld (HUD-less given %u)",
+               presented, window, real, presented > real ? presented - real : 0LL,
+               g_stats.hudless);
+    }
     if (g_take_pace_stats2 != nullptr) {
         // 1.58: the CPU present intervals by the kind of present they end at, and the DLL's
         // readiness offset (targets = grid slot + offset; the [display] line has the display side).
@@ -1195,7 +1205,11 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     // 1.40: KYTY_FSR3_HUDLESS=0 gives FSR 3 no HUD-less image (A/B: FSR then interpolates the
     // whole back buffer, HUD included; with it, wherever the back buffer and the HUD-less image
     // differ FSR takes the real frame's pixels as UI, which on characters would look 30 fps).
-    static const bool give_hudless = EnvOn("KYTY_FSR3_HUDLESS", true);
+    // bb-fsr3-hudless-off: default now off. With the HUD cut the HUD-less image comes from a
+    // separate post-process pass; wherever it differs from the back buffer (everywhere, if the
+    // passes differ even slightly) FSR 3 takes the real frame's pixels as UI, so every generated
+    // frame repeated the real one: 60 presents but 30 distinct images. KYTY_FSR3_HUDLESS=1: on.
+    static const bool give_hudless = EnvOn("KYTY_FSR3_HUDLESS", false);
     const bool hudless = give_hudless && generate && inputs->has_hudless && inputs->hudless.image &&
                          inputs->hudless.extent == backbuffer && inputs->hudless.format == format;
     config.HUDLessColor = FfxApiResource{};
