@@ -128,6 +128,7 @@ const Row kRows[] = {
 	{{"Si", "On", "Sim", "Oui", "S\xC3\xAC", "An"}},
 	{{"Bajo", "Low", "Baixo", "Bas", "Basso", "Niedrig"}},
 	{{"Medio", "Medium", "M\xC3\xA9" "dio", "Moyen", "Medio", "Mittel"}},
+	{{"Optimizado", "Optimized", "Otimizado", "Optimis\xC3\xA9", "Ottimizzato", "Optimiert"}},
 	{{"Alto", "High", "Alto", "\xC3\x89lev\xC3\xA9", "Alto", "Hoch"}},
 	{{"Alta", "High", "Alta", "\xC3\x89lev\xC3\xA9" "e", "Alta", "Hoch"}},
 	{{"Muy alta", "Very high", "Muito alta", "Tr\xC3\xA8s \xC3\xA9lev\xC3\xA9" "e", "Molto alta", "Sehr hoch"}},

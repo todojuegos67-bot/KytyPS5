@@ -58,22 +58,22 @@ const Choice kSharpness[] = {{"auto", "Nitidez: auto"}, {"0", "Nitidez: 0"}, {"0
 const int    kSharpnessCount = 6;
 const Choice kDlssPresets[] = {{"auto", "DLSS auto"}, {"K", "DLSS 4 (K)"}, {"L", "DLSS 4.5 (L)"}, {"M", "DLSS 4.5 (M)"}};
 const int    kDlssPresetCount = 4;
-const Choice kQualities[] = {{"standard", "Maximo"}, {"high", "Alto"}, {"low", "Medio"}, {"lowest", "Bajo"}}; // draw distance (LOD)
-const int    kQualityCount = 4;
-const Choice kTextureReduce[] = {{"0", "Maximo"}, {"h", "Alto"}, {"1", "Medio"}, {"2", "Bajo"}};
-const int    kTextureReduceCount = 4;
-const Choice kShadows[] = {{"maximo", "Maximo"}, {"alto", "Alto"}, {"medio", "Medio"}, {"bajo", "Bajo"}};
-const int    kShadowCount = 4;
+const Choice kQualities[] = {{"standard", "Maximo"}, {"high", "Alto"}, {"low", "Medio"}, {"optimizado", "Optimizado"}, {"lowest", "Bajo"}}; // draw distance (LOD)
+const int    kQualityCount = 5;
+const Choice kTextureReduce[] = {{"0", "Maximo"}, {"h", "Alto"}, {"1", "Medio"}, {"o", "Optimizado"}, {"2", "Bajo"}};
+const int    kTextureReduceCount = 5;
+const Choice kShadows[] = {{"maximo", "Maximo"}, {"alto", "Alto"}, {"medio", "Medio"}, {"optimizado", "Optimizado"}, {"bajo", "Bajo"}};
+const int    kShadowCount = 5;
 const Choice kIbl[] = {{"mitad", "Mitad"}, {"completa", "Completa"}};
 const int    kIblCount = 2;
-const Choice kTess[] = {{"bajo", "Bajo"}, {"medio", "Medio"}, {"alto", "Alto"}, {"ultra", "Ultra"}, {"extremo", "Extremo"}};
-const int    kTessCount = 5;
-const Choice kDetails[] = {{"ultra", "Ultra"}, {"muy-alto", "Muy alto (cine)"}, {"alto", "Alto (rendimiento de PS5)"}, {"normal", "Normal"}, {"bajo", "Bajo"}};
-const int    kDetailCount = 5;
-const Choice kReflections[] = {{"ultra", "Ultra"}, {"alto", "Alto (de serie)"}, {"normal", "Normal"}, {"bajo", "Bajo"}};
-const int    kReflectionCount = 4;
-const Choice kAaSharp[] = {{"ultra", "Ultra"}, {"alto", "Alto"}, {"normal", "Normal (de serie)"}, {"bajo", "Bajo"}, {"no", "No"}};
-const int    kAaSharpCount = 5;
+const Choice kTess[] = {{"bajo", "Bajo"}, {"optimizado", "Optimizado"}, {"medio", "Medio"}, {"alto", "Alto"}, {"ultra", "Ultra"}, {"extremo", "Extremo"}};
+const int    kTessCount = 6;
+const Choice kDetails[] = {{"ultra", "Ultra"}, {"muy-alto", "Muy alto (cine)"}, {"alto", "Alto (rendimiento de PS5)"}, {"normal", "Normal"}, {"optimizado", "Optimizado"}, {"bajo", "Bajo"}};
+const int    kDetailCount = 6;
+const Choice kReflections[] = {{"ultra", "Ultra"}, {"alto", "Alto (de serie)"}, {"normal", "Normal"}, {"optimizado", "Optimizado"}, {"bajo", "Bajo"}};
+const int    kReflectionCount = 5;
+const Choice kAaSharp[] = {{"ultra", "Ultra"}, {"alto", "Alto"}, {"normal", "Normal (de serie)"}, {"optimizado", "Optimizado"}, {"bajo", "Bajo"}, {"no", "No"}};
+const int    kAaSharpCount = 6;
 const Choice kShadowEdges[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "Muy alta"}, {"3", "Ultra"}};
 const int    kShadowEdgeCount = 4;
 const Choice kCornerShadows[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "Maxima"}};
@@ -235,7 +235,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("iluminacion_ibl", s->ibl);
 	if (s->ibl != "mitad" && s->ibl != "completa") s->ibl.clear();
 	str("teselado", s->tess);
-	if (s->tess != "bajo" && s->tess != "medio" && s->tess != "alto" && s->tess != "ultra" && s->tess != "extremo") s->tess.clear();
+	if (s->tess != "bajo" && s->tess != "optimizado" && s->tess != "medio" && s->tess != "alto" && s->tess != "ultra" && s->tess != "extremo") s->tess.clear();
 	if (s->resolution.empty()) s->resolution = "escritorio";
 	boo("hdr", s->hdr);
 	boo("vsync", s->vsync);
@@ -1055,7 +1055,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	static const std::map<std::string, std::string> convars = {
 	    {"high", "r_forceViewportHeightForPixelSizeCalc=1080"},
 	    {"low", "r_forceViewportHeightForPixelSizeCalc=720"},
-	    {"lowest", "r_forceViewportHeightForPixelSizeCalc=480"}};
+	    {"optimizado", "r_forceViewportHeightForPixelSizeCalc=600"},
+    {"lowest", "r_forceViewportHeightForPixelSizeCalc=480"}};
 	if (auto it = convars.find(quality); it != convars.end() && demons) env.AppendConvars(it->second);
 	if (amd_al) env.Set("KYTY_ANTILAG", "1"); // (run-windows -AntiLag)
 	if (demons) {
@@ -1065,12 +1066,15 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		static const std::map<std::string, std::string> extra = {
 		    {"refl_ultra", "r_ssrEnableOverrides=true;r_ssrMaxIterations=192;r_ssrMaxRayLength=1400;r_ssrCutoffDistance=1500"},
 		    {"refl_normal", "r_ssrEnableOverrides=true;r_ssrMaxIterations=64;r_ssrMaxRayLength=600;r_ssrCutoffDistance=500"},
+		    {"refl_optimizado", "r_ssrEnableOverrides=true;r_ssrMaxIterations=48;r_ssrMaxRayLength=450;r_ssrCutoffDistance=375"},
 		    {"refl_bajo", "r_ssrEnableOverrides=true;r_ssrMaxIterations=32;r_ssrMaxRayLength=300;r_ssrCutoffDistance=250"},
 		    {"fade_ultra", "r_fadeOutInstanceOverDistance=35"},
 		    {"fade_normal", "r_fadeOutInstanceOverDistance=10"},
+		    {"fade_optimizado", "r_fadeOutInstanceOverDistance=8"},
 		    {"fade_bajo", "r_fadeOutInstanceOverDistance=6"},
 		    {"aa_ultra", "r_aaSharpenStrengthStatic=5;r_aaSharpenStrengthMotion=5;r_aaHistorySharpeningStrength=1.0"},
 		    {"aa_alto", "r_aaSharpenStrengthStatic=3.5;r_aaSharpenStrengthMotion=3.5;r_aaHistorySharpeningStrength=0.9"},
+		    {"aa_optimizado", "r_aaSharpenStrengthStatic=1.6;r_aaSharpenStrengthMotion=1.6;r_aaHistorySharpeningStrength=0.6"},
 		    {"aa_bajo", "r_aaSharpenStrengthStatic=1.2;r_aaSharpenStrengthMotion=1.2;r_aaHistorySharpeningStrength=0.5"},
 		    {"aa_no", "r_aaSharpenStrengthStatic=0;r_aaSharpenStrengthMotion=0;r_aaHistorySharpeningStrength=0"}};
 		for (const std::string& k: {"refl_" + s.reflections, "fade_" + s.object_fade, "aa_" + s.aa_sharp})
@@ -1098,12 +1102,16 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		    {"normal", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=180;sunShadowCascadeDistance0=30;sunShadowCascadeDistance1=180;"
 		               "r_iblResolution=HalfResX;r_tessellationDensity=6.0;r_tessellationSmallestEdgeLength=0.06;r_tessellationFadeOutStart=9.0;"
 		               "r_tessellationFadeOutRange=3.0"},
+		    {"optimizado", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=150;sunShadowCascadeDistance0=28;sunShadowCascadeDistance1=150;"
+		                   "r_iblResolution=HalfResX;r_tessellationDensity=5.0;r_tessellationSmallestEdgeLength=0.07;r_tessellationFadeOutStart=7.5;"
+		                   "r_tessellationFadeOutRange=2.5"},
 		    {"bajo", "r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=125;sunShadowCascadeDistance0=125;r_iblResolution=HalfResX;"
 		             "r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0"}};
 		if (auto it = details.find(s.detail); it != details.end()) env.AppendConvars(it->second);
 		static const std::map<std::string, std::string> shadows = {
 		    {"alto", "sunShadowMaxDistance=190;sunShadowLightDistance=1000"},
 		    {"medio", "sunShadowMaxDistance=125;sunShadowLightDistance=1000"},
+		    {"optimizado", "sunShadowMaxDistance=90;sunShadowLightDistance=1000;r_enableAmbientShadowing=false"},
 		    {"bajo", "sunShadowMaxDistance=60;sunShadowLightDistance=1000;r_enableAmbientShadowing=false;r_enableSpotShadows=false"}};
 		if (auto it = shadows.find(s.shadows); it != shadows.end()) env.AppendConvars(it->second);
 		{
@@ -1113,6 +1121,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			const std::string tess = !s.tess.empty() ? s.tess : cine4k ? "alto" : "medio";
 			static const std::map<std::string, std::string> tess_cv = {
 			    {"bajo", "r_tessellationDensity=4.0;r_tessellationSmallestEdgeLength=0.08;r_tessellationFadeOutStart=6.0;r_tessellationFadeOutRange=2.0"},
+			    {"optimizado", "r_tessellationDensity=6.0;r_tessellationSmallestEdgeLength=0.06;r_tessellationFadeOutStart=9.0;r_tessellationFadeOutRange=2.5"},
 			    {"medio", "r_tessellationDensity=8.0;r_tessellationSmallestEdgeLength=0.04;r_tessellationFadeOutStart=12.0;r_tessellationFadeOutRange=3.0"},
 			    {"alto", "r_tessellationDensity=18.0;r_tessellationSmallestEdgeLength=0.02;r_tessellationFadeOutStart=15.0;r_tessellationFadeOutRange=3.0"},
 			    {"ultra", "r_tessellationDensity=20.0;r_tessellationSmallestEdgeLength=0.015;r_tessellationFadeOutStart=25.0;r_tessellationFadeOutRange=5.0"},
@@ -1127,7 +1136,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	}
 	// (11-11) "Maximo" runs as "Alto" (one level left out of the >= 2048 textures): whole streamed textures still showed
 	// the Nexus floor / candle glitch on cards of 12 GB and more.
-	env.Set("KYTY_TEXTURE_REDUCE", texture == "1" || texture == "2" ? texture : "h");
+	env.Set("KYTY_TEXTURE_REDUCE", texture == "1" || texture == "2" || texture == "o" ? texture : "h");
 	env.Default("KYTY_UNMAP_PROTECT_SKIP", "1");
 	env.Set("KYTY_DRIVER_CACHE_KEY", DriverCacheKey(s));
 	env.Set("KYTY_SHADER_WARMUP_ONLY", "");

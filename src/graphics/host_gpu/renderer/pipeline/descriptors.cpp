@@ -595,7 +595,7 @@ static uint32_t TextureReduceLevels(bool small_video_memory) {
 	static const uint32_t levels = [&] {
 		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
 		const uint32_t chosen = value != nullptr && value[0] != '\0'
-		                            ? (value[0] == 'h' ? 1u : static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)))
+		                            ? (value[0] == 'h' ? 1u : value[0] == 'o' ? 2u : static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)))
 		                            : (small_video_memory ? 1u : 0u);
 		if (chosen != 0) {
 			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
@@ -623,7 +623,14 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	const auto& full = desc.info;
 	// The levels left out of a large BC texture (none where the view reads only those, nor of one the GPU wrote: the
 	// character creator compresses faces on the GPU through texel views of the same memory, which must stay whole).
-	const auto reduce = TextureReduceLevels(small_video_memory);
+	// KYTY_TEXTURE_REDUCE=o (launcher "Optimizado", between Medio and Bajo): 2 levels out of textures of 2048+ texels,
+	// 1 of those of 1024-2047.
+	static const bool optimized = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_REDUCE");
+		return value != nullptr && value[0] == 'o';
+	}();
+	const auto reduce = optimized && std::max(full.extent.width, full.extent.height) < 2048u ? 1u
+	                                                                                       : TextureReduceLevels(small_video_memory);
 	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= TextureReduceMinSize() &&
 	                          full.resources.levels > reduce && last >= reduce &&
 	                          !cache.IsRegionGpuModified(full.data.address, full.data.size) &&
