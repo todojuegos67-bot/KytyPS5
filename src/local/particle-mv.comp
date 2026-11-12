@@ -136,7 +136,7 @@ void Native() {
 					const float sz     = clamp(abs(uintBitsToFloat(RecW(false, slot, 4u))), 0.01, 50.0);
 					const vec4  c0 = Clip(prm.vp, wc), p0 = Clip(prm.vpp, wp), c1 = Clip(prm.vp, wc + vec3(0.0, sz, 0.0));
 					const vec2  pc0 = Px(c0, prm.parf.z), pp0 = Px(p0, prm.parf.z);
-					const float rad = clamp(length(Px(c1, prm.parf.z) - pc0), 2.0, prm.parf.y * 0.5);
+					const float rad = clamp(0.5 * length(Px(c1, prm.parf.z) - pc0), 1.5, 12.0); // (11-12) half the size, at most 12 px: big squares smeared the floor
 					for (uint c = 0u; c < 4u; ++c) {
 						if (simple) {
 							okw = okw && c0.w > 1e-4 && p0.w > 1e-4 && c1.w > 1e-4;
