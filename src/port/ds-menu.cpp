@@ -3601,16 +3601,6 @@ void LauncherPerformance(Settings& s) {
 	          "Esas mismas copias de datos de la gráfica se preparan juntas, por bloques, en vez de una a una. Un poco menos de trabajo para el procesador; la ganancia es pequeña. No cambia la imagen. Experimental: si notas fallos, apágalo.");
 	LCheckRow("Traducción rápida para más efectos", s.perf_lane_wide,
 	          "Más programas de efectos del juego (shaders: los pequeños programas que usa la gráfica para calcular y dibujar) se traducen a una versión más rápida. Puede dar algo más de FPS en la gráfica. La primera vez que lo actives esos shaders se vuelven a preparar: más carga y algún tirón al empezar. Experimental: si ves fallos gráficos, apágalo.");
-	{
-		// (11-11) Opciones de desarrollador: simulate a 16 GB RAM PC and an 8 GB GPU on this PC.
-		const float y = RowY() + U(4);
-		auto*       dl = ImGui::GetWindowDrawList();
-		dl->AddLine({g_lbox.at.x + U(12), y}, {g_lbox.at.x + g_lbox.w - U(12), y}, IM_COL32(222, 196, 140, 60), 1.0f);
-		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(6)});
-		ImGui::TextColored(kGoldL, "%s", "Opciones de desarrollador");
-		Tip("Para probar en este PC cómo iría el juego en equipos más modestos. Se aplican al iniciar el juego. Apágalas para jugar normal.");
-		RowEnd(y, 30);
-	}
 	// (11-12) "Simular 16 GB RAM" removed too (the owner).
 	// (11-12) "Simular grafica de 8 GB" removed (the owner: black textures with it).
 	BoxEnd();
