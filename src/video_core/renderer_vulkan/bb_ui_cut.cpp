@@ -18,10 +18,12 @@
 #include <vector>
 #include <fmt/format.h>
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/host_shaders/bb_hud_layer_comp.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/image.h"
 
 namespace BB {
@@ -94,6 +96,56 @@ void FlushWhy() {
     g_why.t0 = now;
 }
 
+// bb-hud-layer: BB_HUD_CUT=0 turns the HUD-layer cut off (the frame is upscaled with the HUD,
+// as before). BB_HUD_TRACE=1 logs one frame's last draws a second. BB_HUD_LAYER_ALPHA=straight
+// if the layer is not premultiplied.
+bool LayerCutEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_HUD_CUT");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    return on;
+}
+bool TraceEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_HUD_TRACE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+bool LayerStraightAlpha() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_HUD_LAYER_ALPHA");
+        return v != nullptr && std::strcmp(v, "straight") == 0;
+    }();
+    return on;
+}
+// Per second: what the HUD-layer path saw (GPU thread only).
+struct LayerWhy {
+    u64 movie_layer_draws = 0, composites = 0, armed = 0, substituted = 0, not_substituted = 0,
+        not_ready = 0, pipe_failed = 0, cut_failed = 0, composited = 0;
+    VAddr layer = 0;
+    u32 layer_w = 0, layer_h = 0;
+    vk::Format layer_format{};
+    u64 comp_vs = 0, comp_ps = 0;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+} g_layer;
+
+void FlushLayer() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_layer.t0 < std::chrono::seconds(1)) return;
+    if (g_layer.movie_layer_draws != 0 || g_layer.composites != 0) BB::Upscale::Checkpoint(fmt::format(
+        "[hud-layer] 1 s: HUD-layer draws {} (layer {:#x} {}x{} {}), composite draws {} (vs {:#x} "
+        "ps {:#x}), armed {}, layer swapped {} / not found in the draw {}, not ready {}, pipeline "
+        "failed {}, cut failed {}, HUD drawn over the upscaled scene {} (BB_HUD_CUT=0 disables)",
+        g_layer.movie_layer_draws, g_layer.layer, g_layer.layer_w, g_layer.layer_h,
+        vk::to_string(g_layer.layer_format), g_layer.composites, g_layer.comp_vs, g_layer.comp_ps,
+        g_layer.armed, g_layer.substituted, g_layer.not_substituted, g_layer.not_ready,
+        g_layer.pipe_failed, g_layer.cut_failed, g_layer.composited));
+    g_layer = LayerWhy{};
+    g_layer.t0 = now;
+}
+
 } // namespace
 
 void UiCut::NoteDisplayBuffer(VAddr address) {
@@ -125,6 +177,14 @@ UiCut::~UiCut() {
     Destroy(ui_depth_image);
     for (auto& h : hudless_images) Destroy(h);
     for (auto& [_, d] : displays) Destroy(d.image);
+    Destroy(clear_layer);
+    Destroy(layer_tmp);
+    const auto device = instance.GetDevice();
+    if (layer_pipe) device.destroyPipeline(layer_pipe);
+    if (layer_layout) device.destroyPipelineLayout(layer_layout);
+    if (layer_set) device.destroyDescriptorSetLayout(layer_set);
+    if (layer_sampler_nearest) device.destroySampler(layer_sampler_nearest);
+    if (layer_sampler_linear) device.destroySampler(layer_sampler_linear);
 }
 
 bool UiCut::Create(OwnImage& img, u32 w, u32 h, vk::Format format, vk::ImageUsageFlags usage,
@@ -212,6 +272,27 @@ void UiCut::OnFrameStart() {
     cut_hudless = -1;
     ldr_target = {};
     cut_vs = 0;
+    layer_pending = false;
+    layer_substituted = false;
+    layer_color = {};
+    layer_depth = {};
+    layer_image = {};
+    // [hud-trace] (BB_HUD_TRACE=1): the traced frame's last draws, logged at the next frame start.
+    if (trace_frame && trace_total != 0) {
+        const u32 n = u32(trace_ring.size());
+        std::string text = fmt::format("[hud-trace] last {} of {} draws of one frame (oldest "
+                                       "first):",
+                                       std::min(trace_total, n), trace_total);
+        const u32 start = trace_total > n ? trace_next : 0;
+        for (u32 i = 0; i < std::min(trace_total, n); ++i) {
+            text += "\n  ";
+            text += trace_ring[(start + i) % n];
+        }
+        BB::Upscale::Checkpoint(text);
+    }
+    trace_frame = false;
+    trace_total = 0;
+    trace_next = 0;
     // [hud-seq]: the frame traced (seq_frame 1) is logged at the next frame start.
     if (seq_frame == 1 && !seq.empty()) {
         BB::Upscale::Checkpoint("[hud-seq] draws into scene-size RGBA8 targets (UI: after the "
@@ -223,6 +304,7 @@ void UiCut::OnFrameStart() {
     if (now - t_seq >= std::chrono::seconds(1)) {
         t_seq = now;
         seq_frame = 1;
+        trace_frame = TraceEnabled();
     } else {
         seq_frame = 0;
     }
@@ -239,6 +321,8 @@ void UiCut::OnColorTarget(VideoCore::ImageId color) {
 
 void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::ImageId depth,
                    bool native_viewport, SceneDepth& scene) {
+    layer_pending = false; // armed by this draw only (a skipped draw never reached AfterDraw)
+    layer_substituted = false;
     const u64 vs_hash = info.vs_hash;
     // bb-gpu6 [hud-seq]: once a second, one frame's draws into scene-size RGBA8 targets.
     const bool seq_on = seq_frame == 1;
@@ -289,6 +373,58 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
         return;
     }
     if (done_this_frame || sr == nullptr) return;
+    // bb-hud-layer: in game the UI-movie shaders draw into a HUD layer of their own (the log: "UI-
+    // movie shader on a non-scene target 60" a second, no UI draw into the scene target), and a
+    // post pass reading that layer composites it over the scene in the scene target. e022c2aad
+    // cut at that pass and let it run into the upscaled image: an opaque full-screen pass, it
+    // replaced the upscaled scene with the render-size one (scaling broken). Here the pass runs
+    // as the game wrote it, at the render size, with a transparent layer (SubstituteLayer): the
+    // scene target gets the picture without the HUD; after the draw (AfterDraw) that picture is
+    // upscaled (or copied, native FG) and the real layer is drawn over the output-size image.
+    {
+        const bool movie_shader = Vulkan::UiComposition::MovieShader(vs_hash);
+        const auto& im = texture_cache.GetImage(color);
+        const bool scene_target =
+            Rgba8(im.info.pixel_format) && RenderTarget(im.info.size.width, im.info.size.height);
+        if (movie_shader && !scene_target && !IsDisplayBuffer(im.info.guest_address)) {
+            hud_layer = im.info.guest_address;
+            hud_layer_w = im.info.size.width;
+            hud_layer_h = im.info.size.height;
+            ++g_layer.movie_layer_draws;
+            g_layer.layer = hud_layer;
+            g_layer.layer_w = im.info.size.width;
+            g_layer.layer_h = im.info.size.height;
+            g_layer.layer_format = im.info.pixel_format;
+        }
+        if (info.samples_hud_layer && !movie_shader && scene_target && color == ldr_target &&
+            !IsDisplayBuffer(im.info.guest_address)) {
+            ++g_layer.composites;
+            g_layer.comp_vs = vs_hash;
+            g_layer.comp_ps = info.ps_hash;
+            const bool scaled_now = BB::Upscale::Enabled();
+            const bool ready = scaled_now ? BB::Upscale::BackendReady() : BB::FG::WantInputs();
+            if (!LayerCutEnabled()) {
+                // off: the old behaviour
+            } else if (u32 ow = 0, oh = 0;
+                       !ready || im.info.pixel_format != vk::Format::eR8G8B8A8Unorm ||
+                       (scaled_now && !OutputSize(ow, oh)) ||
+                       !EnsureClearLayer(hud_layer_w, hud_layer_h)) {
+                ++g_layer.not_ready;
+            } else if (!InitLayerPipe()) {
+                ++g_layer.pipe_failed;
+            } else {
+                layer_pending = true;
+                layer_substituted = false;
+                layer_color = color;
+                layer_depth = depth;
+                layer_image = {};
+                ++g_layer.armed;
+                FlushLayer();
+                return; // the cut runs after this draw (AfterDraw)
+            }
+        }
+        FlushLayer();
+    }
     static const u64 ui_trigger_vs = [] {
         const char* hash = std::getenv("BB_UI_TRIGGER_VS");
         return hash ? std::strtoull(hash, nullptr, 16) : 0ull;
@@ -839,6 +975,308 @@ bool UiCut::DisplayOverride(VAddr address, vk::Format format, Display& out) {
     // Shown once: the next display pass decides again.
     d.valid = false;
     return out.view != vk::ImageView{};
+}
+
+bool UiCut::InitLayerPipe() {
+    if (layer_pipe_tried) return layer_pipe_ok;
+    layer_pipe_tried = true;
+    const auto device = instance.GetDevice();
+    const auto sampler = [&](vk::Filter filter, vk::Sampler& out) {
+        auto [r, smp] = device.createSampler({
+            .magFilter = filter,
+            .minFilter = filter,
+            .mipmapMode = vk::SamplerMipmapMode::eNearest,
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+            .maxLod = 0.0f,
+        });
+        if (r != vk::Result::eSuccess) return false;
+        out = smp;
+        return true;
+    };
+    if (!sampler(vk::Filter::eNearest, layer_sampler_nearest) ||
+        !sampler(vk::Filter::eLinear, layer_sampler_linear)) {
+        return false;
+    }
+    constexpr auto C = vk::ShaderStageFlagBits::eCompute;
+    const std::array<vk::DescriptorSetLayoutBinding, 3> bindings{{
+        {0, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {1, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {2, vk::DescriptorType::eStorageImage, 1, C},
+    }};
+    auto [lr, set] = device.createDescriptorSetLayout({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    });
+    if (lr != vk::Result::eSuccess) return false;
+    layer_set = set;
+    const vk::PushConstantRange range{C, 0, 16};
+    auto [pr, pl] = device.createPipelineLayout({
+        .setLayoutCount = 1,
+        .pSetLayouts = &layer_set,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    });
+    if (pr != vk::Result::eSuccess) return false;
+    layer_layout = pl;
+    const vk::ShaderModule module = Vulkan::CompileSPV(BB_HUD_LAYER_COMP, device);
+    if (!module) return false;
+    auto [cr, pipe] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage{.stage = C, .module = module, .pName = "main"},
+                .layout = layer_layout,
+            });
+    device.destroyShaderModule(module);
+    if (cr != vk::Result::eSuccess) return false;
+    layer_pipe = pipe;
+    layer_pipe_ok = true;
+    BB::Upscale::Checkpoint(fmt::format(
+        "[hud-layer] HUD-layer cut ready: the composite pass gets a transparent layer, the scene "
+        "is upscaled without the HUD, the layer is drawn over the output ({} alpha)",
+        LayerStraightAlpha() ? "straight" : "premultiplied"));
+    return true;
+}
+
+bool UiCut::EnsureClearLayer(u32 w, u32 h) {
+    if (w == 0 || h == 0) return false;
+    if (clear_layer.image && clear_layer.width == w && clear_layer.height == h) return true;
+    if (clear_layer.image) scheduler.Finish();
+    if (!Create(clear_layer, w, h, vk::Format::eR8G8B8A8Unorm,
+                vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst, false)) {
+        return false;
+    }
+    if (!Mirror(clear_layer, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor)) {
+        Destroy(clear_layer);
+        return false;
+    }
+    scheduler.EndRendering();
+    const auto cmd = scheduler.CommandBuffer();
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    vk::ImageMemoryBarrier2 b{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eNone,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .image = clear_layer.image,
+        .subresourceRange = range,
+    };
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+    cmd.clearColorImage(clear_layer.image, vk::ImageLayout::eTransferDstOptimal,
+                        vk::ClearColorValue{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}}, range);
+    b.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+    b.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    b.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+    b.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+    b.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+    b.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+    BB::Upscale::Checkpoint(fmt::format("[hud-layer] transparent stand-in layer {}x{}", w, h));
+    return true;
+}
+
+bool UiCut::SubstituteLayer(VideoCore::ImageId image, vk::ImageView& view,
+                            vk::ImageLayout& layout) {
+    if (!layer_pending || hud_layer == 0 || !image || !clear_layer.image) return false;
+    const auto& im = texture_cache.GetImage(image);
+    if (im.info.guest_address != hud_layer) return false;
+    const vk::ImageView v =
+        Mirror(clear_layer, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor);
+    if (!v) return false;
+    view = v;
+    layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    layer_image = image;
+    layer_substituted = true;
+    return true;
+}
+
+void UiCut::AfterDraw(SceneDepth& scene) {
+    if (!layer_pending) return;
+    layer_pending = false;
+    const VideoCore::ImageId color = layer_color, depth = layer_depth, layer = layer_image;
+    const bool substituted = layer_substituted;
+    layer_substituted = false;
+    layer_color = {};
+    layer_depth = {};
+    layer_image = {};
+    if (!substituted || !color || !layer) {
+        // The draw read the HUD as the game drew it: the frame stays as before (no cut).
+        ++g_layer.not_substituted;
+        return;
+    }
+    ++g_layer.substituted;
+    // From here the scene target has no HUD: the cut must run and the layer must be drawn over.
+    const bool scaled = BB::Upscale::Enabled();
+    const bool native_fg = !scaled && BB::FG::WantInputs();
+    const bool active = scaled ? BB::Upscale::BackendReady() : native_fg;
+    // Every upscaler goes through PresentSr::Run (DLSS, FSR 4, FSR 3.1, XeSS, TAA, native AA);
+    // without a usable one the HUD-less scene is copied (scaled linearly) as for menus.
+    switch (Vulkan::UiComposition::Choose(scaled || native_fg, true,
+                                          scene.valid && ldr_target == color, active)) {
+    case Vulkan::UiComposition::Background::None:
+        break;
+    case Vulkan::UiComposition::Background::Temporal:
+        if (native_fg ? RunNativeFg(scene, color, depth) : RunScaled(scene)) break;
+        if (ui_phase) break;
+        [[fallthrough]];
+    case Vulkan::UiComposition::Background::Copy:
+        RunUiOnly(color, depth);
+        break;
+    }
+    if (!ui_phase) {
+        ++g_layer.cut_failed;
+        std::scoped_lock lock{counter_mutex};
+        ++counters.layer_failed;
+        return;
+    }
+    cut_vs = 0;
+    CaptureHudlessUi(); // the picture without the HUD for frame generation
+    const bool drawn = CompositeLayer(layer);
+    if (drawn) ++g_layer.composited;
+    std::scoped_lock lock{counter_mutex};
+    ++counters.layer_cuts;
+    if (drawn) {
+        ++counters.layer_composites;
+    } else {
+        ++counters.layer_failed;
+    }
+}
+
+bool UiCut::CompositeLayer(VideoCore::ImageId layer_id) {
+    if (!layer_pipe_ok || !layer_id || !ui_image.image || ui_width == 0 || ui_height == 0 ||
+        ui_format != vk::Format::eR8G8B8A8Unorm) {
+        return false;
+    }
+    if (!layer_tmp.image || layer_tmp.width != ui_width || layer_tmp.height != ui_height) {
+        if (layer_tmp.image) scheduler.Finish();
+        if (!Create(layer_tmp, ui_width, ui_height, vk::Format::eR8G8B8A8Unorm,
+                    vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+                    false)) {
+            return false;
+        }
+    }
+    const vk::ImageView scene_view =
+        Mirror(ui_image, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor);
+    const vk::ImageView out_view =
+        Mirror(layer_tmp, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor);
+    if (!scene_view || !out_view) return false;
+    scheduler.EndRendering();
+    auto& layer = texture_cache.GetImage(layer_id);
+    VideoCore::ImageViewInfo li{};
+    li.format = layer.info.pixel_format;
+    const vk::ImageView layer_view = *layer.FindView(li, false).image_view;
+    if (!layer_view) return false;
+    runtime.Transit(&layer, vk::ImageLayout::eShaderReadOnlyOptimal,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+    runtime.FlushBarriers();
+    const auto cmd = scheduler.CommandBuffer();
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    vk::ImageMemoryBarrier2 b[2]{
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = ui_image.image,
+            .subresourceRange = range,
+        },
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = layer_tmp.image,
+            .subresourceRange = range,
+        }};
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = b});
+    const vk::DescriptorImageInfo scene_info{layer_sampler_nearest, scene_view,
+                                             vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo hud_info{layer_sampler_linear, layer_view,
+                                           vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo out_info{{}, out_view, vk::ImageLayout::eGeneral};
+    const std::array writes{
+        vk::WriteDescriptorSet{.dstBinding = 0,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &scene_info},
+        vk::WriteDescriptorSet{.dstBinding = 1,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &hud_info},
+        vk::WriteDescriptorSet{.dstBinding = 2,
+                               .descriptorCount = 1,
+                               .descriptorType = vk::DescriptorType::eStorageImage,
+                               .pImageInfo = &out_info},
+    };
+    const u32 flags = (LayerStraightAlpha() ? 1u : 0u) | (IsSrgb(li.format) ? 2u : 0u);
+    const u32 push[4] = {ui_width, ui_height, flags, 0u};
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, layer_pipe);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layer_layout, 0, writes);
+    cmd.pushConstants(layer_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
+    cmd.dispatch((ui_width + 7) / 8, (ui_height + 7) / 8, 1);
+    // The result back into the UI image (the display pass of the next frame reads it).
+    b[0] = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eGeneral,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .image = ui_image.image,
+        .subresourceRange = range,
+    };
+    b[1] = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .oldLayout = vk::ImageLayout::eGeneral,
+        .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .image = layer_tmp.image,
+        .subresourceRange = range,
+    };
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = b});
+    const vk::ImageCopy copy{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .extent = {ui_width, ui_height, 1},
+    };
+    cmd.copyImage(layer_tmp.image, vk::ImageLayout::eTransferSrcOptimal, ui_image.image,
+                  vk::ImageLayout::eTransferDstOptimal, copy);
+    b[0] = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                         vk::AccessFlagBits2::eColorAttachmentWrite |
+                         vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = ui_image.image,
+        .subresourceRange = range,
+    };
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = b});
+    scheduler.GetDynamicState().Invalidate();
+    return true;
+}
+
+void UiCut::TraceDraw(std::string&& line) {
+    if (!trace_frame) return;
+    constexpr u32 Keep = 64;
+    if (trace_ring.size() != Keep) {
+        trace_ring.assign(Keep, std::string{});
+        trace_next = 0;
+    }
+    trace_ring[trace_next] = std::move(line);
+    trace_next = (trace_next + 1) % Keep;
+    ++trace_total;
 }
 
 UiCut::Counters UiCut::TakeCounters() {

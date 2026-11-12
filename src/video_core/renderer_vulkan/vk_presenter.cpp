@@ -1824,11 +1824,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             const u32 hudless_failed = bb_sec_hudless_failed.exchange(0);
             BB::Upscale::Checkpoint(fmt::format(
                 "[bbport] 1 s: HUD cut {} ({} of {} frames shown cut; {} cuts, {} UI-only, {} "
-                "display copies) | HUD-less to FG {} ({} copies at the cut, {} given, {} "
+                "display copies; HUD layer: {} cuts, {} drawn over, {} failed) | HUD-less to FG {} "
+                "({} copies at the cut, {} given, {} "
                 "failed) | DLSS-G {} ({} generated, {} presented, limit {}) | real {:.1f} fps, "
                 "shown {:.1f} fps",
                 frames_cut ? "yes" : "no", frames_cut, game, cut.cuts, cut.ui_only, cut.displays,
-                hudless ? "yes" : "no", cut.hudless, hudless, hudless_failed,
+                cut.layer_cuts, cut.layer_composites, cut.layer_failed, hudless ? "yes" : "no", cut.hudless, hudless, hudless_failed,
                 BB::FG::Dlss::Ready() ? (shown ? "on" : "idle") : "off", made, shown,
                 bb_frame_gen_limit.load(), game / sec, (presents + shown) / sec));
             bb_hud_fg->LogSecond(sec);

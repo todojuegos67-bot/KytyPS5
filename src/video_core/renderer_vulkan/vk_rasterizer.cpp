@@ -267,6 +267,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
+    if (BB::UiCut::Active()) {
+        bb_cut.AfterDraw(bb_scene_depth); // bb-hud-layer: the cut after the HUD composite
+    }
     ResetBindings(false);
 }
 
@@ -357,6 +360,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         DebugState.IncDrawCall();
     }
 
+    if (BB::UiCut::Active()) {
+        bb_cut.AfterDraw(bb_scene_depth); // bb-hud-layer: the cut after the HUD composite
+    }
     ResetBindings(false);
 }
 
@@ -1035,6 +1041,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // upscaled UI image instead of the render-size UI target.
             if (BB::UiCut::Active() && !is_storage && bb_cut.RedirectsSampled(image_id)) {
                 bb_cut.RedirectSampled(image_id, image_view.info.format, bb_view, bb_layout);
+            } else if (BB::UiCut::Active() && !is_storage) {
+                // bb-hud-layer: the HUD composite pass reads a transparent layer (AfterDraw).
+                bb_cut.SubstituteLayer(image_id, bb_view, bb_layout);
             }
             image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
         }
@@ -1159,6 +1168,9 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
         info.depth_test = regs.depth_control.depth_enable != 0;
         info.blend = pipeline->GetGraphicsKey().blend_controls[0].enable != 0;
         const u32 sw = BB::Upscale::g_scene_w, sh = BB::Upscale::g_scene_h;
+        const VAddr hud_layer = bb_cut.HudLayer();
+        const bool tracing = bb_cut.Tracing();
+        std::string reads;
         for (const auto* stage : pipeline->GetStages()) {
             if (!stage) continue;
             if (stage->sw_stage == Shader::SwStage::Fragment) info.ps_hash = stage->pgm_hash;
@@ -1166,10 +1178,32 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
                 const auto tsharp = image_desc.GetSharp(*stage);
                 if (tsharp.Address() == 0) continue;
                 const u32 w = u32(tsharp.width) + 1, h = u32(tsharp.height) + 1;
+                const bool is_layer = hud_layer != 0 && tsharp.Address() == hud_layer;
+                if (is_layer) info.samples_hud_layer = true;
                 if (sw && sh && w + 8 > sw && h + 8 > sh && w < sw + 8 && h < sh + 8) {
                     info.samples_scene = true;
                 }
+                if (tracing && reads.size() < 160) {
+                    reads += fmt::format(" {:#x}:{}x{}{}", tsharp.Address(), w, h,
+                                         is_layer ? "(HUD layer)" : "");
+                }
             }
+        }
+        if (tracing) {
+            // BB_HUD_TRACE=1: vs/ps, colour target (address size format), depth, blend, reads.
+            std::string target = "none";
+            if (cb_descs[0].image_id) {
+                const auto& im = texture_cache.GetImage(cb_descs[0].image_id);
+                target = fmt::format("{:#x} {}x{} {}", im.info.guest_address,
+                                     im.info.size.width, im.info.size.height,
+                                     vk::to_string(im.info.pixel_format));
+            }
+            bb_cut.TraceDraw(fmt::format(
+                "{}vs {:#x} ps {:#x} -> {}{}{}{} reads:{}", bb_cut.UiPhase() ? "[UI] " : "",
+                info.vs_hash, info.ps_hash, target, info.depth_test ? " depth" : "",
+                info.blend ? " blend" : "",
+                UiComposition::MovieShader(info.vs_hash) ? " movie" : "",
+                reads.empty() ? " none" : reads));
         }
         bb_cut.OnDraw(info, cb_descs[0].image_id, db_desc.image_id,
                       UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2),
