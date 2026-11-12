@@ -610,6 +610,9 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 		++g_pn.draws_skipped; // (another layout on the same buffer this frame)
 		return;
 	}
+	// Only a pass already open with this draw's state is resumed (attachments loaded, never cleared again: ResumeRendering);
+	// otherwise the draw's own BeginRendering opens it afterwards with its real load / clear operations.
+	const bool resume = command.RenderingWith(rendering);
 	command.EndRendering();
 	const auto vk_command = command.Handle();
 	Barrier(vk_command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
@@ -635,7 +638,7 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 	Barrier(vk_command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	        vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
 	        vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eTransferRead);
-	command.ResumeRendering(rendering);
+	if (resume) command.ResumeRendering(rendering);
 	g_pn.ring_used = args_off + args_size;
 	NDraw nd;
 	nd.key = k, nd.sort_off = sort_off, nd.emit_off = emit_off, nd.args_off = args_off, nd.sort_size = sort_size, nd.emit_size = emit_size;
