@@ -13,6 +13,7 @@ layout (push_constant) uniform settings {
     bool hdr;
     bool srgb_input;
     float downscale;
+    float uv_scale; // bb-overscan: < 1 crops the source edges (scaled about the centre)
 } pp;
 
 float catrom(float x) {
@@ -65,7 +66,8 @@ vec3 degamma(vec3 rgb) {
 }
 
 void main() {
-    vec4 color_linear = pp.downscale > 1.01 ? downsample(uv) : texture(texSampler, uv);
+    const vec2 st = (uv - 0.5) * pp.uv_scale + 0.5;
+    vec4 color_linear = pp.downscale > 1.01 ? downsample(st) : texture(texSampler, st);
     if (pp.hdr) {
         color = color_linear;
     } else {
