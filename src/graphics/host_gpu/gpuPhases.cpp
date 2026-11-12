@@ -429,6 +429,10 @@ void ReportIfDue(uint64_t frames) {
 		line += fmt::format(" (target memo {} hits, {} misses)", count(Phase::TargetMemoHit),
 		                    count(Phase::TargetMemoMiss));
 	}
+	if (count(Phase::DepthMemoHit) + count(Phase::DepthMemoMiss) != 0) {
+		line += fmt::format(" (depth memo {} hits, {} misses)", count(Phase::DepthMemoHit),
+		                    count(Phase::DepthMemoMiss));
+	}
 	// Round 78: the tessellated ones among them (GT7's car bodies), and their shaders' share.
 	line += fmt::format(" | tessellated draws {}, {:.2f} us each (shaders {:.2f})",
 	                    count(Phase::TessDraw), each(Phase::TessDraw, Phase::TessDraw),

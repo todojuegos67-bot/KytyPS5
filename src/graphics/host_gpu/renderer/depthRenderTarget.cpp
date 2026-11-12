@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -25,6 +26,8 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -280,6 +283,48 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	return desc;
 }
 
+// KYTY_FASTDRAW_STATE=1 (gt7-fastdraw-1112, off by default): the depth target's description
+// (MakeDepthTargetDesc: tiling arithmetic and a driver query of the host format's support) is kept
+// with the bytes of the DB registers it was made from; a draw whose registers are byte-identical
+// takes it. FindImage, BindRenderTarget and the per-draw depth/stencil state below still run every
+// draw. Any byte difference (padding included) is a miss. Counted on the "GPU phases" line.
+static bool FastDrawState() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FASTDRAW_STATE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+namespace {
+struct DepthTargetMemo {
+	alignas(HW::DepthRenderTarget) unsigned char regs[sizeof(HW::DepthRenderTarget)] {};
+	bool                    valid = false;
+	TextureCache::ImageDesc desc;
+};
+thread_local DepthTargetMemo t_depth_target_memo {};
+} // namespace
+
+// MakeDepthTargetDesc(buffer, z) through the memo above when it is on.
+static TextureCache::ImageDesc MemoDepthTargetDesc(const CommandBuffer&         buffer,
+                                                   const HW::DepthRenderTarget& z) {
+	if (!FastDrawState()) {
+		return MakeDepthTargetDesc(buffer, z);
+	}
+	auto& memo = t_depth_target_memo;
+	if (memo.valid && std::memcmp(memo.regs, &z, sizeof(memo.regs)) == 0) {
+		GpuPhases::Count(GpuPhases::Phase::DepthMemoHit, 1);
+		return memo.desc;
+	}
+	GpuPhases::Count(GpuPhases::Phase::DepthMemoMiss, 1);
+	memo.valid = false;
+	auto desc  = MakeDepthTargetDesc(buffer, z);
+	std::memcpy(memo.regs, &z, sizeof(memo.regs));
+	memo.desc  = desc;
+	memo.valid = true;
+	return desc;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
@@ -341,7 +386,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		r.unsupported = true;
 		return;
 	}
-	r.desc                    = MakeDepthTargetDesc(buffer, z);
+	r.desc                    = MemoDepthTargetDesc(buffer, z);
 	r.guest_array_layer       = r.desc.view_info.base_layer;
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;

@@ -65,8 +65,10 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 // anywhere (padding included) is a miss, never a wrong hit. Hits and misses: "GPU phases" line.
 static bool FastDrawTargets() {
 	static const bool enabled = [] {
+		// KYTY_FASTDRAW_STATE=1 (the draw state memo, depthRenderTarget.cpp) turns it on too.
 		const char* value = std::getenv("KYTY_FASTDRAW_TARGETS");
-		return value != nullptr && value[0] == '1';
+		const char* state = std::getenv("KYTY_FASTDRAW_STATE");
+		return (value != nullptr && value[0] == '1') || (state != nullptr && state[0] == '1');
 	}();
 	return enabled;
 }

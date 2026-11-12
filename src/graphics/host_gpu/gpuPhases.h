@@ -105,6 +105,9 @@ enum class Phase : uint32_t {
 	// gt7-fastdraw-1112 (KYTY_FASTDRAW_TARGETS): ResolveRenderColorTarget's per-slot memo.
 	TargetMemoHit,  // (a count only) a color target whose description the memo gave
 	TargetMemoMiss, // (a count only) one computed again (registers changed, or first use)
+	// gt7-fastdraw-1112 (KYTY_FASTDRAW_STATE): ResolveRenderDepthTarget's memo.
+	DepthMemoHit,  // (a count only) a depth target description the memo gave
+	DepthMemoMiss, // (a count only) one made again
 	Count
 };
 
