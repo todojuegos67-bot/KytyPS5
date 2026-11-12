@@ -777,8 +777,33 @@ struct TextureDescKey {
 };
 static_assert(sizeof(TextureDescKey) == 64);
 
+// KYTY_TEXCACHE_V2=1 (off by default): the key's hash is a cheap mix of its eight words instead of
+// XXH3, on every lookup of the descriptor cache. Only the bucket and the front's slot depend on it;
+// keys are still compared in full. Off, the hash is XXH3, as before.
+bool TexCacheV2Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXCACHE_V2");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+uint64_t TextureDescKeyMix(const TextureDescKey& key) noexcept {
+	std::array<uint64_t, 8> words {};
+	std::memcpy(words.data(), &key, sizeof(key));
+	uint64_t hash = 0x9E3779B97F4A7C15ull;
+	for (const auto word: words) {
+		hash = (hash ^ word) * 0xFF51AFD7ED558CCDull;
+		hash ^= hash >> 29u;
+	}
+	return hash;
+}
+
 struct TextureDescKeyHash {
 	size_t operator()(const TextureDescKey& key) const noexcept {
+		if (TexCacheV2Enabled()) {
+			return static_cast<size_t>(TextureDescKeyMix(key));
+		}
 		return static_cast<size_t>(XXH3_64bits(&key, sizeof(key)));
 	}
 };
