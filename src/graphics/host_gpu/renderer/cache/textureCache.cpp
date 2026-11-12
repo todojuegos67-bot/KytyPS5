@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "loader/gt7Title.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -3464,8 +3465,22 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fai
 			const bool native_current =
 			    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
 			if (!native_current) {
-				EXIT("TextureCache: compressed video-out read requires clean native GPU "
-				     "contents\n");
+				if (!::Loader::IsGranTurismo7()) {
+					EXIT("TextureCache: compressed video-out read requires clean native GPU "
+					     "contents\n");
+				}
+				// Gran Turismo 7 flips buffers it has not drawn yet (its first flips at boot) or
+				// whose guest bytes changed: their memory is read as is (DCC metadata ignored),
+				// at worst one wrong frame instead of an exit.
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("TextureCache: GT7 compressed video-out 0x%016" PRIx64
+					     " without clean GPU contents (render_target=%d gpu_modified=%d "
+					     "buffer_modified=%d cpu_dirty=%d): read from guest memory\n",
+					     desc.info.data.address, image.usage.render_target ? 1 : 0,
+					     image.IsGpuModified() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+					     image.IsCpuDirty() ? 1 : 0);
+				}
 			}
 		}
 		if (view_mip >= 0) {
