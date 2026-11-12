@@ -35,6 +35,10 @@ struct HostFormatInfo {
 
 HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
                                  Prospero::ChannelOrder order) {
+	// From the GT7 port: red held in red (the transfers convert the bits).
+	if (guest_format == Prospero::BufferFormat::k10_11_11Float) {
+		return {vk::Format::eB10G11R11UfloatPack32, {}};
+	}
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k8_8_8_8UNorm:
@@ -53,6 +57,11 @@ HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
 		case Prospero::BufferFormat::k5_5_5_1UNorm: return {format, Prospero::ColorMappingBgra};
 		case Prospero::BufferFormat::k1_5_5_5UNorm:
 		case Prospero::BufferFormat::k4_4_4_4UNorm: return {format, Prospero::ColorMappingAbgr};
+		// The 2-bit component (the first, at the bottom) in the host's alpha, the 10-bit ones in
+		// its red, green and blue (from the GT7 port: GT7 renders to one when a race is left).
+		case Prospero::BufferFormat::k2_10_10_10UNorm:
+		case Prospero::BufferFormat::k2_10_10_10UInt:
+			return {format, Prospero::ColorComponentMapping {0x39u}}; // 1, 2, 3, 0
 		default: return {format, {}};
 	}
 }

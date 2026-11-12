@@ -46,6 +46,10 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k16_16SInt, vk::Format::eR16G16Sint},
     {Prospero::BufferFormat::k16_16Float, vk::Format::eR16G16Sfloat},
     {Prospero::BufferFormat::k11_11_10Float, vk::Format::eB10G11R11UfloatPack32},
+    // 2_10_10_10 keeps its 2-bit component at the bottom, which no Vulkan format does: the host
+    // image holds it in alpha (ResolveHostFormat in textureCommon.cpp maps the components).
+    {Prospero::BufferFormat::k2_10_10_10UNorm, vk::Format::eA2B10G10R10UnormPack32},
+    {Prospero::BufferFormat::k2_10_10_10UInt, vk::Format::eA2B10G10R10UintPack32},
     {Prospero::BufferFormat::k10_10_10_2UNorm, vk::Format::eA2B10G10R10UnormPack32},
     {Prospero::BufferFormat::k10_10_10_2SNorm, vk::Format::eA2B10G10R10SnormPack32},
     {Prospero::BufferFormat::k10_10_10_2UInt, vk::Format::eA2B10G10R10UintPack32},
