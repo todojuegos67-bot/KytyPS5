@@ -378,6 +378,40 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
+// KYTY_DECAL_FIX (on unless 0; des-decal-1112): a draw that tests depth with a strict compare (GREATER in the
+// reverse-Z G-buffer, LESS otherwise) and does not write depth is a decal / mesh decal over surfaces already in the
+// depth buffer (candle wax on the Nexus floor, soot on walls). Its triangles lie on that surface, so its depth equals
+// the stored depth up to rounding: a strict test passes or fails per pixel and per frame (z-fighting flicker; the
+// host GPU rounds differently from the PS5, and the recompiled position math is not bit-identical between the two
+// shaders). The draw gets the non-strict compare and, when the guest set no polygon offset of its own, a constant
+// bias of a few depth units toward the viewer. Depth-writing draws are untouched.
+static bool DecalFixOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_DECAL_FIX");
+		const bool  set   = value == nullptr || value[0] != '0';
+		std::printf("Decal fix: KYTY_DECAL_FIX=%d: depth-tested draws without depth writes %s\n", set ? 1 : 0,
+		            set ? "use GEQUAL/LEQUAL and a small depth bias toward the viewer (anti z-fight)"
+		                : "keep the guest strict compare (as before)");
+		std::fflush(stdout);
+		return set;
+	}();
+	return on;
+}
+
+static void DecalFixCount(bool biased, vk::CompareOp guest_op) {
+	static std::atomic<uint64_t> total {0}, with_bias {0};
+	const uint64_t               n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint64_t               b = biased ? with_bias.fetch_add(1, std::memory_order_relaxed) + 1
+	                                        : with_bias.load(std::memory_order_relaxed);
+	if (n <= 2 || (n & (n - 1)) == 0) {
+		std::printf("Decal fix: %llu draws relaxed (%llu with added bias, the rest had a guest polygon offset; last "
+		            "guest compare %u; KYTY_DECAL_FIX=0: off)\n",
+		            static_cast<unsigned long long>(n), static_cast<unsigned long long>(b),
+		            static_cast<unsigned>(guest_op));
+		std::fflush(stdout);
+	}
+}
+
 // A draw's dynamic state as Vulkan values (SetGraphicsDynamicParamsImpl): what it records, computed once.
 struct ResolvedDynamicState {
 	static constexpr uint32_t ViewportSlots = std::size(HW::ScreenViewport {}.viewports);
@@ -481,6 +515,21 @@ static ResolvedDynamicState ResolveGraphicsDynamicParams(const Buffer& buffer, b
 		                                                       depth.desc.view_info.format);
 		out.bias_clamp    = poly_offset.clamp;
 		out.bias_slope    = (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
+	}
+	if (out.depth_test && !out.depth_write &&
+	    (out.depth_compare == vk::CompareOp::eGreater || out.depth_compare == vk::CompareOp::eLess) && DecalFixOn()) {
+		const bool reverse = out.depth_compare == vk::CompareOp::eGreater;
+		const vk::CompareOp guest_op = out.depth_compare;
+		out.depth_compare  = reverse ? vk::CompareOp::eGreaterOrEqual : vk::CompareOp::eLessOrEqual;
+		const bool add_bias = !depth_bias_enable;
+		if (add_bias) {
+			// Constant units: one LSB of a UNORM attachment, 2^(e-23) of the primitive's largest depth for D32F.
+			out.depth_bias_enable = VK_TRUE;
+			out.bias_constant     = reverse ? 4.0f : -4.0f;
+			out.bias_clamp        = 0.0f;
+			out.bias_slope        = 0.0f;
+		}
+		DecalFixCount(add_bias, guest_op);
 	}
 
 	out.stencil = depth.stencil_test_enable;
