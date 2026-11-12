@@ -138,6 +138,19 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return SimpleInteger(inst, IR::ValueOpcode::IMul32, IR::Type::U32, false, false, false);
 		case O::S_MUL_HI_U32:
 			return SimpleInteger(inst, IR::ValueOpcode::UMulHi, IR::Type::U32, false, false, false);
+		case O::S_MUL_HI_I32:
+			return SimpleInteger(inst, IR::ValueOpcode::SMulHi, IR::Type::U32, false, false, false);
+		case O::S_BREV_B64: {
+			const auto value = ReadU32Pair(inst.src0);
+			WriteU32Pair(inst.dst, {IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[1]})),
+			                        IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[0]}))});
+			return true;
+		}
+		case O::S_ASHR_I64: return S_ASHR_I64(inst);
+		// Signed form: the count of leading bits equal to the sign bit, -1 for 0 and -1.
+		case O::S_FLBIT_I32: return V_FFBH_32(inst, true);
+		case O::S_BITCMP0_B64: return S_BITCMP_B64(inst, false);
+		case O::S_BITCMP1_B64: return S_BITCMP_B64(inst, true);
 		case O::S_AND_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitwiseAnd32, IR::Type::U32, false, false,
 			                     true);

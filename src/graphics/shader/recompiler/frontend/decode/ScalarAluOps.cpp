@@ -24,7 +24,8 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x1cu, Opcode::S_XNOR_B32},        {0x1du, Opcode::S_XNOR_B64},
     {0x1eu, Opcode::S_LSHL_B32},        {0x1fu, Opcode::S_LSHL_B64},
     {0x20u, Opcode::S_LSHR_B32},        {0x21u, Opcode::S_LSHR_B64},
-    {0x22u, Opcode::S_ASHR_I32},        {0x24u, Opcode::S_BFM_B32},
+    {0x22u, Opcode::S_ASHR_I32},        {0x23u, Opcode::S_ASHR_I64},
+    {0x24u, Opcode::S_BFM_B32},
     {0x25u, Opcode::S_BFM_B64},         {0x26u, Opcode::S_MUL_I32},
     {0x27u, Opcode::S_BFE_U32},         {0x28u, Opcode::S_BFE_I32},
     {0x29u, Opcode::S_BFE_U64},         {0x2cu, Opcode::S_ABSDIFF_I32},
@@ -33,6 +34,7 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x31u, Opcode::S_LSHL4_ADD_U32},   {0x32u, Opcode::S_PACK_LL_B32_B16},
     {0x33u, Opcode::S_PACK_LH_B32_B16}, {0x34u, Opcode::S_PACK_HH_B32_B16},
     {0x35u, Opcode::S_MUL_HI_U32},
+    {0x36u, Opcode::S_MUL_HI_I32},
 };
 
 constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
@@ -44,12 +46,14 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x09u, Opcode::S_WQM_B32},
     {0x0au, Opcode::S_WQM_B64},
     {0x0bu, Opcode::S_BREV_B32},
+    {0x0cu, Opcode::S_BREV_B64},
     {0x0fu, Opcode::S_BCNT1_I32_B32},
     {0x10u, Opcode::S_BCNT1_I32_B64},
     {0x13u, Opcode::S_FF1_I32_B32},
     {0x14u, Opcode::S_FF1_I32_B64},
     {0x15u, Opcode::S_FLBIT_I32_B32},
     {0x16u, Opcode::S_FLBIT_I32_B64},
+    {0x17u, Opcode::S_FLBIT_I32},
     {0x1bu, Opcode::S_BITSET0_B32},
     {0x1cu, Opcode::S_BITSET0_B64},
     {0x1du, Opcode::S_BITSET1_B32},
@@ -72,7 +76,8 @@ constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
     {0x03u, Opcode::S_CMP_GE_I32},  {0x04u, Opcode::S_CMP_LT_I32},  {0x05u, Opcode::S_CMP_LE_I32},
     {0x06u, Opcode::S_CMP_EQ_U32},  {0x07u, Opcode::S_CMP_LG_U32},  {0x08u, Opcode::S_CMP_GT_U32},
     {0x09u, Opcode::S_CMP_GE_U32},  {0x0au, Opcode::S_CMP_LT_U32},  {0x0bu, Opcode::S_CMP_LE_U32},
-    {0x0cu, Opcode::S_BITCMP0_B32}, {0x0du, Opcode::S_BITCMP1_B32}, {0x12u, Opcode::S_CMP_EQ_U64},
+    {0x0cu, Opcode::S_BITCMP0_B32}, {0x0du, Opcode::S_BITCMP1_B32},
+    {0x0eu, Opcode::S_BITCMP0_B64}, {0x0fu, Opcode::S_BITCMP1_B64}, {0x12u, Opcode::S_CMP_EQ_U64},
     {0x13u, Opcode::S_CMP_LG_U64},
 };
 
@@ -104,6 +109,12 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x10u, Opcode::S_SENDMSG},
     {0x12u, Opcode::S_TRAP},
     {0x16u, Opcode::S_TTRACEDATA},
+    // S_CBRANCH_CDBGSYS / CDBGUSER / CDBGSYS_OR_USER / CDBGSYS_AND_USER: branches on the debugger's
+    // bits, which are clear with no debugger attached: never taken, so no-ops.
+    {0x17u, Opcode::S_NOP},
+    {0x18u, Opcode::S_NOP},
+    {0x19u, Opcode::S_NOP},
+    {0x1au, Opcode::S_NOP},
     {0x20u, Opcode::S_INST_PREFETCH},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
 };
