@@ -6,7 +6,10 @@
 // Two players of the European 01.005.000 crashed there within minutes of play, one of them also at start-up (issues
 // #185, #204); neither the regions' languages nor the job workers' spin settings changed it, and 01.007.000 has the
 // same code. Here a node without a request makes the loader wait until it is unlinked (or has a request again; a
-// second at most), then scan its lists again from the start.
+// second at most), then scan its lists again from the start. A node already unlinked (linked to itself), or still
+// without a request after that second, that a list still begins with stays so: the loader holds the lists' lock while
+// it scans, so nothing would ever move it, and the scan found it again without end (issue #327, 01.005.000 at King
+// Allant's fog: 268 million scans, the game frozen). That list is rebuilt from its last node backwards first (Repair).
 #include "loader/demonsSoulsLoaderGuard.h"
 
 #include "common/abi.h"
@@ -44,20 +47,84 @@ constexpr uint32_t SiteSize   = 10;
 constexpr uint64_t ScanDistance = 0x3a1;
 
 uint64_t              g_base = 0;
-std::atomic<uint32_t> g_waits {0};
+std::atomic<uint32_t> g_waits {0}, g_repairs {0};
 
-// A node whose request was cleared: wait until it is unlinked (its next is itself) or has a request again, at most a
-// second; the loader then scans its lists again.
+// The loader's five priority lists: sentinel nodes at + 0xd0 + i * 0x28 (the owner, prev at + 0x8, next at + 0x10, the
+// list at + 0x18, the node count at + 0x20, an int). The loader holds their lock (its mutex at + 0x50) while it scans.
+constexpr uint64_t ListSentinels = 0xd0, ListStride = 0x28;
+constexpr uint32_t Lists = 5, LongestWalk = 1u << 16;
+
+bool ReadPointer(uint64_t address, uint64_t& value) {
+	return address != 0 && (address & 7u) == 0 &&
+	       Common::GuardedCopy(&value, reinterpret_cast<const void*>(address), sizeof(value)) == 0 && value != 0 &&
+	       (value & 7u) == 0;
+}
+
+// `node`, a list's first node, links to itself (or has had no request for a second): it left the chain without the
+// list's sentinel knowing (issue #327: the sentinel's next named it forever after, the guard waited out nothing and the
+// loader scanned again without end). The list is rebuilt from the sentinel's prev back to that node (or to the
+// sentinel): the chain its tail insertions linked, every node's next set to the one after it, the count recounted.
+// Returns the list, or -1 (the node first in none, or a chain that does not end).
+int Repair(uint64_t loader, uint64_t node, uint32_t& kept) {
+	for (uint32_t i = 0; i < Lists; ++i) {
+		const uint64_t sentinel = loader + ListSentinels + ListStride * i;
+		uint64_t       first = 0, last = 0;
+		if (!ReadPointer(sentinel + 0x10, first) || first != node || !ReadPointer(sentinel + 0x8, last)) continue;
+		// (`after` is the node after `at` in the list.)
+		uint64_t after = sentinel, at = last;
+		uint32_t count = 0;
+		while (at != sentinel && at != node) {
+			uint64_t before = 0;
+			if (count == LongestWalk || !ReadPointer(at + 0x8, before)) return -1;
+			if (before == at) break; // (another node out of the chain: the list starts after it)
+			*reinterpret_cast<uint64_t*>(at + 0x10) = after;
+			after = at;
+			at    = before;
+			++count;
+		}
+		*reinterpret_cast<uint64_t*>(sentinel + 0x10) = after;
+		*reinterpret_cast<uint64_t*>(after + 0x8)     = sentinel;
+		*reinterpret_cast<int32_t*>(sentinel + 0x20)  = static_cast<int32_t>(count);
+		kept                                          = count;
+		return static_cast<int>(i);
+	}
+	return -1;
+}
+
+// A node whose request was cleared: wait until it has a request again (at most a second); the loader then scans its
+// lists again. Linked to itself already, or the second out with no request, it stays so: the loader holds the lists' lock
+// while it scans (its mutex, locked at eboot+0x890310), so no thread that takes it can move the node. That list is
+// repaired first.
 void KYTY_SYSV_ABI Withdrawn(uint64_t node, uint64_t loader) {
 	const auto begin = std::chrono::steady_clock::now();
+	bool       unlinked = false, stuck = false;
 	for (uint32_t round = 0;; ++round) {
 		uint64_t request = 0, next = 0;
 		if (Common::GuardedCopy(&request, reinterpret_cast<const void*>(node), sizeof(request)) != 0 ||
-		    Common::GuardedCopy(&next, reinterpret_cast<const void*>(node + 0x10), sizeof(next)) != 0 || request != 0 ||
-		    next == node || std::chrono::steady_clock::now() - begin >= std::chrono::seconds(1))
+		    Common::GuardedCopy(&next, reinterpret_cast<const void*>(node + 0x10), sizeof(next)) != 0 || request != 0)
 			break;
+		if (next == node) {
+			unlinked = true;
+			break;
+		}
+		if (std::chrono::steady_clock::now() - begin >= std::chrono::seconds(1)) {
+			stuck = true;
+			break;
+		}
 		if (round < 64) std::this_thread::yield();
 		else std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+	if (unlinked || stuck) {
+		uint32_t kept = 0;
+		if (const int list = Repair(loader, node, kept); list >= 0) {
+			const auto repairs = g_repairs.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (repairs <= 16 || (repairs & (repairs - 1)) == 0)
+				std::printf("Demon's Souls loader guard: list %d of the loader 0x%llx still began at the %s node 0x%llx; "
+				            "rebuilt from its last node (%u node(s) kept; %u repair(s) so far)\n",
+				            list, static_cast<unsigned long long>(loader), unlinked ? "unlinked" : "requestless",
+				            static_cast<unsigned long long>(node), kept, repairs);
+			return;
+		}
 	}
 	const auto count = g_waits.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (count <= 8 || (count & (count - 1)) == 0)
