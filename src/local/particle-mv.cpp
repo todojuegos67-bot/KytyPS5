@@ -102,6 +102,8 @@ struct NDraw {
 	uint32_t sort_stride = 0, sort_count = 0, emit_stride = 0, emit_count = 0, base = 0, instances = 0, first_word = 0;
 	bool     indirect = false, prev_valid = false;
 	float    vp[16] {}, vpp[16] {};
+	VkBuffer prev_buf = VK_NULL_HANDLE; // (11-12) last frame's records from another key (the game alternates buffers)
+	uint32_t prev_count = 0;
 };
 constexpr uint32_t NKeys = 4, NDrawsMax = 16, NParamSlot = 256, NParamSlots = 128;
 constexpr uint64_t NRingSize = 8ull << 20, NRecMax = 64ull << 20;
@@ -117,7 +119,7 @@ struct {
 	uint64_t             alignment = 256;
 	// log (every second)
 	uint64_t draws_seen = 0, draws_native = 0, draws_skipped = 0, frames = 0;
-	uint64_t why[4] = {};
+	uint64_t why[4] = {}, prev_other = 0, prev_none = 0;
 	uint64_t hits_down = 0, hits_up = 0;
 	bool     y_down = true;
 	std::array<uint32_t, StatsCount> stat_last {};
@@ -439,9 +441,14 @@ void NativeLog(GraphicContext& graphics) {
 		std::printf("FG particle native: skipped: %llu no record buffer, %llu no sort buffer, %llu layout, %llu indirect args\n",
 		            static_cast<unsigned long long>(g_pn.why[0]), static_cast<unsigned long long>(g_pn.why[1]),
 		            static_cast<unsigned long long>(g_pn.why[2]), static_cast<unsigned long long>(g_pn.why[3]));
+	std::printf("FG particle native: last frame's records from the same buffer %llu, from the other buffer %llu, none %llu; "
+	            "discarded as recycled: emitter changed %u, moved too far %u\n",
+	            static_cast<unsigned long long>(g_pn.draws_native - std::min(g_pn.draws_native, g_pn.prev_other + g_pn.prev_none)),
+	            static_cast<unsigned long long>(g_pn.prev_other), static_cast<unsigned long long>(g_pn.prev_none), d[12], d[13]);
 	std::fflush(stdout);
 	g_pm.sum_ms = 0.0, g_pm.max_ms = 0.0, g_pm.samples = 0;
 	g_pn.why[0] = g_pn.why[1] = g_pn.why[2] = g_pn.why[3] = 0;
+	g_pn.prev_other = g_pn.prev_none = 0;
 	g_pn.frames = 0, g_pn.draws_seen = 0, g_pn.draws_native = 0, g_pn.draws_skipped = 0;
 }
 
@@ -472,13 +479,14 @@ bool NativeRun(GraphicContext& graphics, vk::CommandBuffer command, Push& push, 
 		NParams        prm {};
 		std::memcpy(prm.vp, nd.vp, sizeof(prm.vp));
 		std::memcpy(prm.vpp, nd.vpp, sizeof(prm.vpp));
-		prm.sorti[0] = nd.sort_stride, prm.sorti[1] = nd.sort_count, prm.sorti[2] = nd.base, prm.sorti[3] = nd.prev_valid ? key.prev_count : 0;
+		prm.sorti[0] = nd.sort_stride, prm.sorti[1] = nd.sort_count, prm.sorti[2] = nd.base,
+		prm.sorti[3] = nd.prev_valid ? (nd.prev_buf != VK_NULL_HANDLE ? nd.prev_count : key.prev_count) : 0;
 		prm.reci[0] = key.stride, prm.reci[1] = key.count, prm.reci[2] = nd.prev_valid ? 1u : 0u, prm.reci[3] = nd.emit_stride;
 		prm.argi[0] = nd.indirect ? 1u : 0u, prm.argi[1] = nd.instances, prm.argi[2] = nd.emit_count, prm.argi[3] = nd.first_word;
 		prm.parf[0] = max_step, prm.parf[1] = max_quad, prm.parf[2] = g_pn.y_down ? 1.0f : 0.0f;
 		std::memcpy(static_cast<uint8_t*>(g_pn.params.mapped) + slot * slot_size, &prm, sizeof(prm));
 		vmaFlushAllocation(graphics.allocator, g_pn.params.memory, slot * slot_size, sizeof(prm));
-		const VkBuffer prev = key.buf[key.cur ^ 1].buffer != VK_NULL_HANDLE ? key.buf[key.cur ^ 1].buffer : key.buf[key.cur].buffer;
+		const VkBuffer prev = nd.prev_buf != VK_NULL_HANDLE ? nd.prev_buf : key.buf[key.cur ^ 1].buffer != VK_NULL_HANDLE ? key.buf[key.cur ^ 1].buffer : key.buf[key.cur].buffer;
 		const vk::DescriptorBufferInfo native[6] {
 		    {ring, nd.sort_off, nd.sort_size},
 		    {vk::Buffer(key.buf[key.cur].buffer), 0, VK_WHOLE_SIZE},
@@ -663,6 +671,21 @@ void ParticleNativeCapture(CommandBuffer& command, const RenderState& rendering,
 	                key.vp_prev_valid && key.buf[key.cur ^ 1].buffer != VK_NULL_HANDLE;
 	std::memcpy(nd.vp, d.vp, sizeof(nd.vp));
 	std::memcpy(nd.vpp, key.vp_prev, sizeof(nd.vpp));
+	// (11-12) The game alternates its record buffers between frames: last frame's records are another key's latest copy
+	// (same layout, copied last frame), with that frame's view-projection.
+	if (!nd.prev_valid && g_pn.serial > 0) {
+		for (uint32_t j = 0; j < NKeys; ++j) {
+			const NKey& o = g_pn.keys[j];
+			if (static_cast<int>(j) == k || o.address == 0 || o.copied_serial + 1 != g_pn.serial || o.stride != d.rec_stride ||
+			    o.buf[o.cur].buffer == VK_NULL_HANDLE)
+				continue;
+			nd.prev_valid = true, nd.prev_buf = o.buf[o.cur].buffer, nd.prev_count = o.count;
+			std::memcpy(nd.vpp, o.vp_last, sizeof(nd.vpp));
+			++g_pn.prev_other;
+			break;
+		}
+	}
+	if (!nd.prev_valid) ++g_pn.prev_none;
 	std::memcpy(key.vp_last, d.vp, sizeof(key.vp_last));
 	g_pn.draws.push_back(nd);
 	static bool said = false;

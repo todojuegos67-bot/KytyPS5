@@ -117,6 +117,7 @@ void Native() {
 				const bool same   = prm.reci.z != 0u && RecW(true, slot, 3u) == em && dot(dp, dp) <= prm.parf.x * prm.parf.x;
 				if (!same) {
 					atomicAdd(stats[6], 1u);
+					if (prm.reci.z != 0u) atomicAdd(stats[RecW(true, slot, 3u) != em ? 12u : 13u], 1u);
 				} else {
 					bool  okw = true;
 					vec2  lo = vec2(1e9), hi = vec2(-1e9);
