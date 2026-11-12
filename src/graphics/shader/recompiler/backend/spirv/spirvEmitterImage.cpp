@@ -648,6 +648,8 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32: return OpAtomicIAdd;
 		case IR::ValueOpcode::ImageAtomicUMin32: return OpAtomicUMin;
+		case IR::ValueOpcode::ImageAtomicSMin32: return OpAtomicSMin;
+		case IR::ValueOpcode::ImageAtomicSMax32: return OpAtomicSMax;
 		case IR::ValueOpcode::ImageAtomicUMax32: return OpAtomicUMax;
 		case IR::ValueOpcode::ImageAtomicAnd32: return OpAtomicAnd;
 		case IR::ValueOpcode::ImageAtomicOr32: return OpAtomicOr;

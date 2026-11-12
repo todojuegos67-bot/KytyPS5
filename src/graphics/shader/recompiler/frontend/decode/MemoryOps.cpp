@@ -61,6 +61,9 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
+    {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
+    {0x71u, Opcode::BUFFER_GL0_INV, 0, 0},
+    {0x72u, Opcode::BUFFER_GL1_INV, 0, 0},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -82,6 +85,7 @@ constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
     {0x18u, Opcode::FLAT_STORE_BYTE, 1, 8},     {0x1au, Opcode::FLAT_STORE_SHORT, 1, 16},
     {0x1cu, Opcode::FLAT_STORE_DWORD, 1, 32},   {0x1du, Opcode::FLAT_STORE_DWORDX2, 2, 32},
     {0x1eu, Opcode::FLAT_STORE_DWORDX4, 4, 32}, {0x1fu, Opcode::FLAT_STORE_DWORDX3, 3, 32},
+    {0x24u, Opcode::FLAT_LOAD_SHORT_D16, 1, 16},
 };
 
 constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
@@ -280,6 +284,12 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
 	}
+	if (inst.opcode == Opcode::BUFFER_GL0_INV || inst.opcode == Opcode::BUFFER_GL1_INV) {
+		// Cache invalidations: no operands (the host GPU's caches are coherent here).
+		inst.dst.kind  = OperandKind::Null;
+		inst.src_count = 0;
+		return;
+	}
 
 	DecodeVectorGpr(vdata, inst.dst);
 	DecodeVectorGpr(vaddr, inst.src0);
@@ -361,6 +371,10 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	DecodeVectorGpr(IsFlatStoreOpcode(inst.opcode) ? data : vdst, inst.dst);
+	if (inst.opcode == Opcode::FLAT_LOAD_SHORT_D16) {
+		// D16 loads write the low half and keep the high one (as DS_READ_U16_D16).
+		inst.dst.sdwa_sel = 4u;
+	}
 	DecodeVectorGpr(addr, inst.src0);
 	inst.src_count = 1;
 	if (seg == 0u || saddr == 0x7du || saddr == 0x7fu) {

@@ -993,6 +993,7 @@ uint32_t SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicUMax32:
 		case IR::ValueOpcode::SharedAtomicUMax32: return OpAtomicUMax;
 		case IR::ValueOpcode::BufferAtomicAnd32:
+		case IR::ValueOpcode::BufferAtomicAnd64:
 		case IR::ValueOpcode::SharedAtomicAnd32: return OpAtomicAnd;
 		case IR::ValueOpcode::BufferAtomicOr32:
 		case IR::ValueOpcode::BufferAtomicOr64:
