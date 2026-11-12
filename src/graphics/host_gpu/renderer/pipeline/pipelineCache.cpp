@@ -1407,12 +1407,6 @@ struct PipelineCache::ProgramCache {
 			const auto& words = p.inputs.records[index];
 			h = XXH3_64bits_withSeed(words.data(), words.size() * sizeof(uint32_t), h ^ (static_cast<uint64_t>(words.size()) << 32u));
 		}
-		// KYTY_OCCLUSION_FIX (ShaderRecompiler.cpp) translates this one program differently: its own key, so the
-		// translation stored before the fix is not reused (the rest of the store stays).
-		if (group.key.hash == 0x89bcd398e231085full) {
-			const char* v = std::getenv("KYTY_OCCLUSION_FIX");
-			if (!(v != nullptr && v[0] == '0')) h ^= 0x6f63636c75646531ull;
-		}
 		return h;
 	}
 

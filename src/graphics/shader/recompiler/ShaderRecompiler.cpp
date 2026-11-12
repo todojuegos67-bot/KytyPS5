@@ -624,25 +624,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
 	                  decoded);
-	// KYTY_OCCLUSION_FIX (default on; =0 off): Demon's Souls' Hi-Z occlusion test of lights / decals
-	// (CS 89bcd398e231085f, `V_CMP_GT_F32 vcc, max_depth, min(4 Hi-Z samples)` at 0x748) culls
-	// objects that are visible, a different set every frame: lighter squares flickering on the walls
-	// by the braziers and the Nexus candles. The test is made to pass (frustum culling stays).
-	{
-		static const bool occlusion_fix = [] {
-			const char* v = std::getenv("KYTY_OCCLUSION_FIX");
-			return !(v != nullptr && v[0] == '0');
-		}();
-		if (occlusion_fix && options.stage == ShaderType::Compute && options.shader_hash == 0x89bcd398e231085full) {
-			for (auto& inst : decoded.instructions) {
-				if (inst.pc == 0x748 && inst.opcode == Decoder::Opcode::V_CMP_GT_F32) {
-					inst.opcode = Decoder::Opcode::V_CMP_TRU_F32;
-					std::printf("[occlusion-fix] CS %016llx: Hi-Z occlusion test passes (KYTY_OCCLUSION_FIX=0 off)\n",
-					            static_cast<unsigned long long>(options.shader_hash));
-				}
-			}
-		}
-	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
