@@ -1946,6 +1946,17 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				if (re.stride != 0 && so.stride != 0 && uint64_t {re.stride} * re.count <= limit && uint64_t {so.stride} * so.count <= limit) {
 					nd.rec  = obtain(re.base, uint64_t {re.stride} * re.count);
 					nd.sort = obtain(so.base, uint64_t {so.stride} * so.count);
+					// (11-12) The sorted list is often in no cached buffer (the VS reads it through its device address): the
+					// cache's own buffer for it, as a draw's V# would get (KYTY_FG_PARTICLE_NATIVE_OBTAIN=0: never).
+					static const bool obtain_sort = [] {
+						const char* v = std::getenv("KYTY_FG_PARTICLE_NATIVE_OBTAIN");
+						return v == nullptr || *v != '0';
+					}();
+					if (nd.sort.buffer == nullptr && obtain_sort && nd.rec.buffer != nullptr) {
+						const uint64_t size = uint64_t {so.stride} * so.count;
+						const auto [b, off] = cache.ObtainBuffer(so.base, size, false);
+						if (b != nullptr) nd.sort.buffer = b->Handle(), nd.sort.offset = off, nd.sort.size = size;
+					}
 					if (em.stride != 0 && uint64_t {em.stride} * em.count <= limit) nd.emit = obtain(em.base, uint64_t {em.stride} * em.count);
 					for (int r = 0; r < 4; ++r)
 						for (int c = 0; c < 4; ++c) std::memcpy(&nd.vp[r * 4 + c], t + r * 4 + c, 4);
