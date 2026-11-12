@@ -11,6 +11,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/gt7Title.h"
+#include "kernel/waitDiag.h"
 
 #include <algorithm>
 #include <chrono>
@@ -410,6 +411,8 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	if (!owner) {
 		return KERNEL_ERROR_EBADF;
 	}
+	const WaitDiag::Scope wait_diag("sceKernelWaitEqueue", static_cast<uint64_t>(eq), owner->GetName(),
+	                                timo == nullptr ? -1 : static_cast<int64_t>(*timo));
 
 	if (ev == nullptr) {
 		return KERNEL_ERROR_EFAULT;

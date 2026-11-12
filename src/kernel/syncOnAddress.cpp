@@ -1,4 +1,5 @@
 #include "kernel/syncOnAddress.h"
+#include "kernel/waitDiag.h"
 
 #include "common/threads.h"
 #include "libs/errno.h"
@@ -270,11 +271,15 @@ int WaitImpl(volatile T* address, T expected, const uint32_t* timeout_micros,
 
 int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros,
            signal_poll_func_t signal_poll) {
+	const WaitDiag::Scope wait_diag("sceKernelSyncOnAddressWait32", reinterpret_cast<uint64_t>(address), {},
+	                                timeout_micros == nullptr ? -1 : static_cast<int64_t>(*timeout_micros));
 	return WaitImpl(address, expected, timeout_micros, signal_poll);
 }
 
 int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeout_micros,
            signal_poll_func_t signal_poll) {
+	const WaitDiag::Scope wait_diag("sceKernelSyncOnAddressWait64", reinterpret_cast<uint64_t>(address), {},
+	                                timeout_micros == nullptr ? -1 : static_cast<int64_t>(*timeout_micros));
 	return WaitImpl(address, expected, timeout_micros, signal_poll);
 }
 

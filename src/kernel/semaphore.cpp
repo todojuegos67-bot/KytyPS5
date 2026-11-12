@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "kernel/waitDiag.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -291,6 +292,8 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	const WaitDiag::Scope wait_diag("sceKernelWaitSema", reinterpret_cast<uint64_t>(sem), {},
+	                                time == nullptr ? -1 : static_cast<int64_t>(*time));
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;
