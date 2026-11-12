@@ -11,6 +11,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/speculation.h"
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
@@ -3090,7 +3091,40 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (entry != programs.end()) {
-			{
+			// gt7-spec-1112, KYTY_SPECULATE (speculation.h): the refresh the draw-prep workers
+			// speculated, validated as TakeScanned always does, on a short path without the walk's
+			// set-up. Every 64th one goes the classic way, to measure what this saves.
+			bool     fast_done     = false;
+			bool     scanned_tried = false;
+			bool     calibrating   = false;
+			uint64_t spec_start    = 0;
+			if (Speculation::Enabled() && DrawPrep::Enabled() && !Bisect::DrawPrepOff()) {
+				spec_start = GpuPhases::Now();
+				if (Speculation::CalibrateNext()) {
+					calibrating = true;
+					Speculation::Add(Speculation::Counter::Calibration);
+				} else {
+					entry->second.resources.gpu_fills.clear();
+					if (stage == ShaderType::Compute && SrtGpuFillEnabled()) {
+						runtime.gpu_written = SrtBytesGpuWritten;
+						runtime.gpu_fills   = &entry->second.resources.gpu_fills;
+					}
+					scanned_tried = true;
+					{
+						const GpuPhases::Scope phase(GpuPhases::Phase::ProgramScanned);
+						fast_done = TakeScanned(entry->second, stage, runtime, params.hash);
+					}
+					runtime.gpu_written = nullptr;
+					runtime.gpu_fills   = nullptr;
+					if (fast_done) {
+						Speculation::Add(Speculation::Counter::FastHit);
+						Speculation::AddFastCycles(GpuPhases::Now() - spec_start);
+					} else {
+						Speculation::Add(Speculation::Counter::FastMiss);
+					}
+				}
+			}
+			if (!fast_done) {
 				// One zone per refresh, named by the program (kept with KYTY_PROFILE_ZONES=0).
 				Profiler::Phases refresh_zone;
 				refresh_zone.SetText("%s %016" PRIx64, StageLabel(stage), params.hash);
@@ -3113,7 +3147,7 @@ struct PipelineCache::ProgramCache {
 					if (verify) {
 						VerifyPrepared(entry->second, runtime, stage, params.hash);
 					}
-				} else if (DrawPrep::Enabled() && !Bisect::DrawPrepOff() && [&] {
+				} else if (!scanned_tried && DrawPrep::Enabled() && !Bisect::DrawPrepOff() && [&] {
 					           const GpuPhases::Scope phase(GpuPhases::Phase::ProgramScanned);
 					           return TakeScanned(entry->second, stage, runtime, params.hash);
 				           }()) {
@@ -3131,6 +3165,10 @@ struct PipelineCache::ProgramCache {
 				if (!scanned) {
 					// Refreshed here: its specialization has no hash made with it.
 					entry->second.specialization_hash_valid = false;
+				}
+				if (calibrating && scanned) {
+					// The classic way of a speculated refresh: what the short path compares with.
+					Speculation::AddClassicCycles(GpuPhases::Now() - spec_start);
 				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;

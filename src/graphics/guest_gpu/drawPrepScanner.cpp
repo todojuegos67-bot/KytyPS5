@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/speculation.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -91,7 +92,9 @@ bool RegisterPacketIsSane(uint32_t opcode, uint32_t header, const uint32_t* body
 uint32_t WorkerCount() {
 	static const uint32_t count = [] {
 		const char* value = std::getenv("KYTY_DRAW_PREP_WORKERS");
-		const long  n     = value != nullptr ? std::strtol(value, nullptr, 10) : 2l;
+		long        n     = value != nullptr ? std::strtol(value, nullptr, 10) : 2l;
+		// gt7-spec-1112: KYTY_SPECULATE=<n> asks for n walk workers at least.
+		n = std::max(n, static_cast<long>(Speculation::Threads()));
 		return static_cast<uint32_t>(std::clamp(n, 0l, 8l));
 	}();
 	return count;

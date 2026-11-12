@@ -4,6 +4,7 @@
 #include "common/perfStats.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/speculation.h"
 
 #include <algorithm>
 #include <array>
@@ -601,6 +602,8 @@ void ReportIfDue(uint64_t frames) {
 	// GT7 port: the line goes where the Perf lines go (the port's log), so a run shows where
 	// the GPU thread's time per draw goes without a console.
 	Log::WriteUnmuted(line + "\n");
+	// gt7-spec-1112: KYTY_SPECULATE's counters, on a line of their own.
+	Speculation::Report(cycles_per_us, seconds);
 	{
 		// Round 165: what the renderer recorded besides draws and dispatches, a frame.
 		namespace RC = RecordedCommands;
