@@ -5266,7 +5266,8 @@ void Sample(LogState& L,
 			// bigger PC's whole use.
 			PROCESS_MEMORY_COUNTERS pmc {};
 			const double ws = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) != 0 ? static_cast<double>(pmc.WorkingSetSize) / gb : 0.0;
-			const double used = g_rt.launched.simulate_ram16 ? ws + 4.0 : static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / gb;
+			// (11-12) A 16 GB PC never shows more than 16 GB in use (the rest goes to its page file): capped.
+			const double used = g_rt.launched.simulate_ram16 ? std::min(ws + 4.0, 16.0) : static_cast<double>(ms.ullTotalPhys - ms.ullAvailPhys) / gb;
 			// (11-12) Simular 16 GB RAM: the overlay shows the simulated PC's 16 GB.
 			const double total = g_rt.launched.simulate_ram16 ? 16.0 : static_cast<double>(ms.ullTotalPhys) / gb;
 			rows.push_back({"RAM", Fmt("%.1f / %.0f GB", used, total), UseColor(used, total)});

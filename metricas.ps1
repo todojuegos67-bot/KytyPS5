@@ -497,7 +497,8 @@ $timer.Add_Tick({
 		if ($RamGB -gt 0) {
 			$ws = 0; $e2 = $emu | Select-Object -First 1
 			if ($e2) { $ws = $e2.WorkingSet64 / 1GB }
-			$rows.Add(@('RAM', ("{0:N1} / {1} GB{2}" -f ($ws + 4), $RamGB, $(if ($script:limitedPid -and -not $script:limitOk) { ' (sin limite!)' } else { '' })), (Get-UseColor ($ws + 4) $RamGB)))
+			$ramSim = [Math]::Min($ws + 4, [double]$RamGB) # (11-12) a 16 GB PC never shows more than 16 GB
+			$rows.Add(@('RAM', ("{0:N1} / {1} GB{2}" -f $ramSim, $RamGB, $(if ($script:limitedPid -and -not $script:limitOk) { ' (sin limite!)' } else { '' })), (Get-UseColor $ramSim $RamGB)))
 		} else {
 			$rows.Add(@('RAM', ("{0:N1} / {1:N0} GB" -f $ramUsed, $ramTotal), (Get-UseColor $ramUsed $ramTotal)))
 		}
