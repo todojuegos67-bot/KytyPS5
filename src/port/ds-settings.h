@@ -134,7 +134,7 @@ struct Settings {
 	bool        simulate_ram16 = false; // (10-24) "Simular 16 GB RAM": KYTY_SIMULATE_RAM_MB=16384 (and the 16 GB profile)
 	bool        safe_gpu = false;   // KYTY_COMPUTE_CHAIN=0
 	std::string quality = "standard";
-	std::string texture_reduce = "o"; // (11-13) Optimizado by default: less VRAM
+	std::string texture_reduce = "0";
 	bool        simulate_vram8 = false;
 	bool        all_ccds = false;
 	bool        shader_turbo = true; // (ds-pc-port37) carga_shaders_maxima: the in-game shader prefetch and warmup on every CPU thread
