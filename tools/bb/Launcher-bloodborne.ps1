@@ -1553,14 +1553,20 @@ function Build-Bg([int]$bw, [int]$bh) {
 		# Fondo "cover" (sin deformar), anclado arriba para no cortar el titulo.
 		$img = [System.Drawing.Image]::FromFile($fondo)
 		$scale = [math]::Max($bw / $img.Width, $bh / $img.Height)
-		$sw = [int][math]::Round($bw / $scale); $sh = [int][math]::Round($bh / $scale)
+		$sw = [int][math]::Min($img.Width, [math]::Round($bw / $scale)); $sh = [int][math]::Min($img.Height, [math]::Round($bh / $scale))
 		# Recorte centrado, pero sin cortar el titulo (esta a la izquierda): el borde izquierdo no pasa de su X0 - 2 %.
 		$sx = [int](($img.Width - $sw) / 2); $sxMax = [int]([math]::Max(0, $img.Width * (($bgLayout.Title.X0 / $bgLayout.W) - 0.02)))
 		$sx = [math]::Max(0, [math]::Min($sx, $sxMax))
 		$src = New-Object System.Drawing.Rectangle($sx, 0, $sw, $sh)
 		$bmp = New-Object System.Drawing.Bitmap($bw, $bh, [System.Drawing.Imaging.PixelFormat]::Format32bppPArgb)  # PArgb: copia mas rapida por fotograma
 		$gr = [System.Drawing.Graphics]::FromImage($bmp); $gr.InterpolationMode = 'HighQualityBicubic'
-		$gr.DrawImage($img, (New-Object System.Drawing.Rectangle(0, 0, $bw, $bh)), $src, [System.Drawing.GraphicsUnit]::Pixel)
+		# (bb-launcher-2) Raya arriba de la ilustracion: al escalar, GDI+ mezcla los pixeles del borde con "fuera de la
+		# imagen" (transparente), y la primera fila salia medio transparente (oscura sobre el fondo de la ventana). Con el
+		# borde reflejado (TileFlipXY) y el centro de pixel correcto (PixelOffsetMode Half) el borde es la propia imagen.
+		$gr.PixelOffsetMode = 'HighQuality'; $gr.CompositingMode = 'SourceCopy'
+		$ia = New-Object System.Drawing.Imaging.ImageAttributes; $ia.SetWrapMode([System.Drawing.Drawing2D.WrapMode]::TileFlipXY)
+		try { $gr.DrawImage($img, (New-Object System.Drawing.Rectangle(0, 0, $bw, $bh)), [int]$src.X, [int]$src.Y, [int]$src.Width, [int]$src.Height, [System.Drawing.GraphicsUnit]::Pixel, $ia) }
+		finally { $ia.Dispose(); $gr.CompositingMode = 'SourceOver' }
 		# Vinyeta suave fija (bordes oscuros): no se anima, no cuesta nada por fotograma.
 		try {
 			$vp = New-Object System.Drawing.Drawing2D.GraphicsPath; $vp.AddEllipse([int](-$bw * 0.25), [int](-$bh * 0.3), [int]($bw * 1.5), [int]($bh * 1.6))
@@ -1572,13 +1578,18 @@ function Build-Bg([int]$bw, [int]$bh) {
 		$script:titleR = Map-BgRect $bgLayout.Title $img.Width $img.Height $src.X $kx $ky
 		$script:hunterR = Map-BgRect $bgLayout.Hunter $img.Width $img.Height $src.X $kx $ky
 		$gr.Dispose(); $img.Dispose()
-		$old = $script:bgBmp; $script:bgBmp = $bmp; if ($old) { $old.Dispose() }
+		$old = $script:bgBmp; $script:bgBmp = $bmp; if ($script:bd) { $script:bd.Bmp = $bmp }; if ($old) { $old.Dispose() }
 	} catch { Write-Log "Fondo ilegible: $_" }
 }
 # El fondo lo pinta Paint (no BackgroundImage): permite el zoom lento de entrada y las brasas. Los controles
 # semitransparentes copian este mismo dibujo (PaintParent), asi que todo cuadra.
-$script:bgZoom = 1.0; $script:embers = $null; $script:fog = $null
-$form.Add_Paint({ param($s, $e)
+$script:bgZoom = 1.0; $script:embers = $null; $script:fog = $null; $script:bd = $null; $script:bbx = $false
+function Set-BgZoom([double]$z) {
+	$script:bgZoom = $z
+	if ($script:bd) { $tr = $script:titleR; $script:bd.Center = New-Object System.Drawing.PointF([float]($tr.X + $tr.Width / 2.0), [float]($tr.Y + $tr.Height / 2.0)); $script:bd.Zoom = [float]$z }
+}
+# (bb-launcher-2) Este Paint solo se usa si BbBackdrop (C#, mas abajo) no compila; si compila, el fondo lo pinta BbBackdrop.
+$script:paintOld = { param($s, $e)
 	$g = $e.Graphics
 	if ($script:bgBmp) {
 		if ($script:bgZoom -gt 1.0001) {
@@ -1591,7 +1602,7 @@ $form.Add_Paint({ param($s, $e)
 	}
 	if ($script:fog) { $script:fog.Draw($g) }
 	if ($script:embers) { $script:embers.Draw($g) }
-})
+}
 Build-Bg $W $H
 if (-not $fondo) { Write-Log 'Sin fondo (fondo-bloodborne2.png no esta junto al lanzador)' }
 if ($script:S.emu -and (Test-Path -LiteralPath $script:S.emu)) { try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($script:S.emu) } catch { } }
@@ -1645,6 +1656,7 @@ function New-Btn([string]$text, $x, $y, $w, $h, [bool]$primary = $false) {
 		$b.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(110, 110, 100)
 		$b.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(255, 48, 44, 40); $b.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(255, 30, 28, 26)
 	}
+	$b.Gradient = 0.16  # (bb-launcher-2) relieve: el relleno se oscurece un poco hacia abajo
 	return $b
 }
 # (wheel) Los desplegables no cambian de valor con la rueda: la rueda sigue desplazando la columna.
@@ -1780,7 +1792,10 @@ public class BbEmbers {
     SmoothingMode sm = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
     for (int i = 0; i < n; i++) {
       if (Avoid.Contains((int)x[i], (int)y[i]) || !Zone.Contains((int)x[i], (int)y[i])) continue;
-      float a = (float)Math.Sin(Math.PI * Math.Min(1f, life[i] / max[i])) * alpha[i]; if (a <= 0.02f) continue;
+      float a = (float)Math.Sin(Math.PI * Math.Min(1f, life[i] / max[i])) * alpha[i];
+      float ez = (y[i] - Zone.Y) / 70f, er = (Zone.Right - x[i]) / 40f;  // (bb-launcher-2) se desvanecen en los bordes de la zona
+      if (ez < 1f) a *= Math.Max(0f, ez); if (er < 1f) a *= Math.Max(0f, er);
+      if (a <= 0.02f) continue;
       float s = size[i];
       if (ash[i]) {
         using (SolidBrush b0 = new SolidBrush(Color.FromArgb((int)(30 * a), 225, 225, 230))) g.FillEllipse(b0, x[i] - s * 1.8f, y[i] - s * 1.8f, s * 3.6f, s * 3.6f);
@@ -1869,6 +1884,7 @@ public class BbFog {
         float dens = SS(0.30f, 0.85f, d1) * 0.50f + SS(0.38f, 0.90f, d2) * 0.38f * (0.30f + 0.70f * g) + SS(0.45f, 0.95f, d3) * 0.30f * g;
         dens *= 0.30f + 0.95f * g;
         float a = Math.Max(0f, Math.Min(1f, dens * inten));
+        a *= SS(0f, 0.22f, v) * SS(1.0f, 0.92f, u);  // (bb-launcher-2) sin borde recto arriba ni junto al panel
         float lit = (0.80f + 0.30f * d2) * (0.85f + 0.25f * (1f - v));
         // tramado (sin bandas)
         uint hsh = (uint)(xx * 73856093 ^ yy * 19349663 ^ (int)(tt * 60f) * 83492791); float dith = ((hsh & 255) / 255f - 0.5f) / 255f;
@@ -1902,6 +1918,9 @@ public class BbFog {
 public class BbButton : Button {
   public static bool ReduceMotion = false;
   public float Radius = 10f;
+  // (bb-launcher-2) Tracking: espacio extra entre letras (titulos); TextShadow: relieve 1 px debajo del texto;
+  // Gradient: el relleno se oscurece hacia abajo (0 = plano).
+  public int Tracking = 0; public Color TextShadow = Color.Empty; public float Gradient = 0f;
   float hover = 0f, press = 0f, hoverT = 0f, pressT = 0f; int last = 0;
   Timer anim = new Timer();
   public BbButton() {
@@ -1947,7 +1966,12 @@ public class BbButton : Button {
       }
     }
     using (GraphicsPath p = BbGfx.Round(r, Radius)) {
-      using (SolidBrush b = new SolidBrush(fill)) g.FillPath(b, p);
+      if (Gradient > 0.001f) {
+        RectangleF gr = new RectangleF(r.X, r.Y - 1f, r.Width, r.Height + 2f);
+        using (LinearGradientBrush fb = new LinearGradientBrush(gr, BbGfx.Shade(fill, 1f + Gradient * 0.30f), BbGfx.Shade(fill, 1f - Gradient), 90f)) g.FillPath(fb, p);
+      } else {
+        using (SolidBrush b = new SolidBrush(fill)) g.FillPath(b, p);
+      }
       // Brillo arriba (mas al pasar el raton): relieve sutil.
       RectangleF top = new RectangleF(r.X, r.Y, r.Width, Math.Max(1f, r.Height / 2f));
       using (LinearGradientBrush lg = new LinearGradientBrush(new RectangleF(top.X, top.Y - 1, top.Width, top.Height + 2), Color.FromArgb((int)(22 + 20 * hover), 255, 255, 255), Color.FromArgb(0, 255, 255, 255), 90f)) {
@@ -1972,7 +1996,29 @@ public class BbButton : Button {
       fl |= TextFormatFlags.Left;
     } else if (left) { tr.Inflate(-10, 0); fl |= TextFormatFlags.Left; }
     else fl |= TextFormatFlags.HorizontalCenter;
+    if (Tracking > 0 && Image == null && !left) { DrawTracked(g, tr, fc); return; }
+    if (!TextShadow.IsEmpty && Enabled) { Rectangle sr = tr; sr.Offset(0, 1); TextRenderer.DrawText(g, Text, Font, sr, TextShadow, fl); }
     TextRenderer.DrawText(g, Text, Font, tr, fc, fl);
+  }
+  void DrawTracked(Graphics g, Rectangle tr, Color fc) {
+    string s = Text == null ? "" : Text; if (s.Length == 0) return;
+    TextFormatFlags mf = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+    int[] w = new int[s.Length]; int total = 0;
+    for (int i = 0; i < s.Length; i++) {
+      w[i] = s[i] == ' ' ? Math.Max(2, Font.Height / 3) : TextRenderer.MeasureText(g, s[i].ToString(), Font, new Size(10000, 1000), mf).Width;
+      total += w[i];
+    }
+    total += Tracking * (s.Length - 1);
+    int x = tr.X + (tr.Width - total) / 2;
+    TextFormatFlags df = mf | TextFormatFlags.VerticalCenter | TextFormatFlags.Left;
+    for (int i = 0; i < s.Length; i++) {
+      if (s[i] != ' ') {
+        Rectangle cr = new Rectangle(x, tr.Y, w[i] + 4, tr.Height);
+        if (!TextShadow.IsEmpty && Enabled) { Rectangle sr = cr; sr.Offset(0, 1); TextRenderer.DrawText(g, s[i].ToString(), Font, sr, TextShadow, df); }
+        TextRenderer.DrawText(g, s[i].ToString(), Font, cr, fc, df);
+      }
+      x += w[i] + Tracking;
+    }
   }
   protected override void Dispose(bool d) { if (d) { anim.Stop(); anim.Dispose(); } base.Dispose(d); }
 }
@@ -2039,6 +2085,330 @@ public class BbScrollBar : Control {
 "@
 }
 [BbButton]::ReduceMotion = [bool]$reduceMotion; [BbScrollBar]::ReduceMotion = [bool]$reduceMotion
+# (bb-launcher-2) Extras en C#, aparte: si no compilan, el lanzador sigue con lo de antes ($script:bbx = $false).
+#   BbSmoothScroll: desplazamiento con muelle criticamente amortiguado (sin tirones al encadenar muescas), medido con
+#     Stopwatch (igual a cualquier fps) y sincronizado con el refresco del monitor (DwmFlush) mientras se mueve.
+#   BbBackdrop: el fondo (imagen, niebla, brasas) pintado en C#: los controles semitransparentes lo repintan en cada
+#     fotograma del desplazamiento y antes pasaba por PowerShell. Zoom de entrada sin bordes (TileFlipXY).
+#   BbFonts: Cinzel (menu_assets\fonts, SIL OFL) para titulos, cargada para GDI+ y para GDI (TextRenderer, ClearType).
+#   BbGroup / BbPaint: apartados con esquinas redondeadas y filete fino, cabecera con regla dorada que se desvanece.
+try {
+	if (-not ('BbSmoothScroll' -as [type])) {
+Add-Type -IgnoreWarnings -ReferencedAssemblies System.Windows.Forms,System.Drawing -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Diagnostics; using System.Drawing; using System.Drawing.Drawing2D;
+using System.Drawing.Imaging; using System.Drawing.Text; using System.Reflection; using System.Runtime.InteropServices; using System.Windows.Forms;
+[StructLayout(LayoutKind.Sequential)]
+public struct BbNativeMsg { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; }
+public static class BbFonts {
+  [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] static extern int AddFontResourceEx(string name, uint fl, IntPtr res);
+  static PrivateFontCollection pfc = new PrivateFontCollection();
+  // GDI+ (PrivateFontCollection) para crear la Font y GDI (FR_PRIVATE, solo este proceso) para TextRenderer.
+  public static FontFamily Load(string path, string family) {
+    try {
+      if (String.IsNullOrEmpty(path) || !System.IO.File.Exists(path)) return null;
+      if (AddFontResourceEx(path, 0x10, IntPtr.Zero) == 0) return null;
+      pfc.AddFontFile(path);
+      foreach (FontFamily f in pfc.Families) { if (String.Equals(f.Name, family, StringComparison.OrdinalIgnoreCase)) return f; }
+    } catch { }
+    return null;
+  }
+}
+public static class BbPaint {
+  sealed class Helper : Control {
+    public void Bg(Control p, PaintEventArgs pe) { InvokePaintBackground(p, pe); InvokePaint(p, pe); }
+    public void Deco(Control p, PaintEventArgs pe) { InvokePaint(p, pe); }
+  }
+  static Helper helper = new Helper();
+  public static GraphicsPath Round(RectangleF r, float rad) {
+    GraphicsPath p = new GraphicsPath(); float d = Math.Max(1f, Math.Min(rad * 2f, Math.Min(r.Width, r.Height)));
+    p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90); p.CloseFigure(); return p;
+  }
+  // Lo mismo que BbGfx.PaintParent: el fondo de los padres bajo el control (formulario: imagen; contenedores: color y adorno).
+  public static void Parent(Control c, PaintEventArgs e) {
+    if (c.Parent == null) { e.Graphics.Clear(SystemColors.Control); return; }
+    List<Control> chain = new List<Control>(); List<Point> offs = new List<Point>();
+    int ox = c.Left, oy = c.Top;
+    for (Control p = c.Parent; p != null; p = p.Parent) {
+      chain.Add(p); offs.Add(new Point(ox, oy));
+      if (p is Form || p.Parent == null) break;
+      ox += p.Left; oy += p.Top;
+    }
+    Graphics g = e.Graphics;
+    for (int i = chain.Count - 1; i >= 0; i--) {
+      Control a = chain[i]; Point o = offs[i];
+      GraphicsState st = g.Save();
+      try {
+        g.TranslateTransform(-o.X, -o.Y);
+        Rectangle r = new Rectangle(o.X, o.Y, c.Width, c.Height);
+        if (i == chain.Count - 1) { helper.Bg(a, new PaintEventArgs(g, r)); continue; }
+        g.IntersectClip(new Rectangle(0, 0, a.Width, a.Height));
+        if (a.Region != null) g.SetClip(a.Region, CombineMode.Intersect);
+        Color bc = a.BackColor;
+        if (bc.A > 0) { using (SolidBrush b = new SolidBrush(bc)) g.FillRectangle(b, r); }
+        helper.Deco(a, new PaintEventArgs(g, r));
+      } finally { g.Restore(st); }
+    }
+  }
+  // Filete fino siguiendo la Region redondeada del control (diametro de esquina = el de New-RoundPath).
+  public static void Frame(Control c, float diameter, Color col) {
+    c.Paint += delegate(object s, PaintEventArgs e) {
+      Control k = (Control)s; Graphics g = e.Graphics;
+      SmoothingMode sm = g.SmoothingMode; PixelOffsetMode pm = g.PixelOffsetMode;
+      g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+      using (GraphicsPath p = Round(new RectangleF(0.5f, 0.5f, k.Width - 1f, k.Height - 1f), diameter / 2f))
+      using (Pen pen = new Pen(col, 1f)) g.DrawPath(pen, p);
+      g.SmoothingMode = sm; g.PixelOffsetMode = pm;
+    };
+  }
+  // Cabecera de apartado: flecha que gira (0 plegado .. 1 abierto) y regla dorada bajo el titulo que se desvanece a la derecha.
+  public static void Header(Graphics g, int w, int h, float open, Color col, Color rule) {
+    SmoothingMode sm = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+    double ang = open * Math.PI / 2.0, cs = Math.Cos(ang), sn = Math.Sin(ang);
+    float cx = 13f, cy = h / 2f;
+    float[] px = new float[] { -3.5f, 2.5f, -3.5f }, py = new float[] { -4.5f, 0f, 4.5f };
+    PointF[] pts = new PointF[3];
+    for (int i = 0; i < 3; i++) pts[i] = new PointF((float)(cx + px[i] * cs - py[i] * sn), (float)(cy + px[i] * sn + py[i] * cs));
+    using (Pen pen = new Pen(col, 2f)) { pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round; pen.LineJoin = LineJoin.Round; g.DrawLines(pen, pts); }
+    g.SmoothingMode = sm;
+    int rw = w - 22;
+    if (rw > 8 && rule.A > 0) {
+      RectangleF rr = new RectangleF(21f, h - 1f, rw, 1f);
+      using (LinearGradientBrush lb = new LinearGradientBrush(new RectangleF(20f, h - 2f, rw + 2f, 3f), rule, Color.FromArgb(0, rule), 0f)) g.FillRectangle(lb, rr);
+    }
+  }
+}
+public class BbGroup : Panel {
+  public Color Frame = Color.FromArgb(84, 222, 196, 140); public float Radius = 6f;
+  public BbGroup() { SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true); }
+  protected override void OnPaintBackground(PaintEventArgs e) { BbPaint.Parent(this, e); }
+  protected override void OnPaint(PaintEventArgs e) {
+    Graphics g = e.Graphics; SmoothingMode sm = g.SmoothingMode; PixelOffsetMode pm = g.PixelOffsetMode;
+    g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+    using (GraphicsPath p = BbPaint.Round(new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), Radius)) {
+      using (SolidBrush b = new SolidBrush(BackColor)) g.FillPath(b, p);
+      using (Pen pen = new Pen(Frame, 1f)) g.DrawPath(pen, p);
+    }
+    g.SmoothingMode = sm; g.PixelOffsetMode = pm;
+    base.OnPaint(e);
+  }
+}
+// Cabecera de apartado dibujada en C# (antes un Paint de PowerShell por cabecera y por fotograma al desplazar).
+public class BbHeader : Label {
+  public float Open = 1f; public Color Rule = Color.FromArgb(120, 222, 196, 140);
+  protected override void OnPaint(PaintEventArgs e) { base.OnPaint(e); BbPaint.Header(e.Graphics, Width, Height, Open, ForeColor, Rule); }
+}
+// Flecha de los desplegables (tapa la nativa): la misma que dibujaba Set-ComboStyle, sin pasar por PowerShell.
+public class BbComboArrow : Panel {
+  public ComboBox Combo; public Color On = Color.FromArgb(222, 196, 140), Off = Color.FromArgb(165, 160, 150);
+  public BbComboArrow() { SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true); }
+  protected override void OnPaint(PaintEventArgs e) {
+    base.OnPaint(e);
+    ComboBox cb = Combo; if (cb == null) return;
+    Graphics g = e.Graphics; SmoothingMode sm = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+    float dir = cb.DroppedDown ? -1f : 1f, cx = Width / 2f, cy = Height / 2f;
+    PointF[] pts = new PointF[] { new PointF(cx - 4.5f, cy - 2.5f * dir), new PointF(cx, cy + 2.5f * dir), new PointF(cx + 4.5f, cy - 2.5f * dir) };
+    using (Pen pen = new Pen(cb.Enabled ? On : Off, 1.8f)) { pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round; pen.LineJoin = LineJoin.Round; g.DrawLines(pen, pts); }
+    g.SmoothingMode = sm;
+  }
+}
+public class BbBackdrop {
+  public Bitmap Bmp; public float Zoom = 1f; public PointF Center = PointF.Empty;
+  object fog, em; MethodInfo fogDraw, emDraw;
+  ImageAttributes wrap = new ImageAttributes();
+  public BbBackdrop() { wrap.SetWrapMode(WrapMode.TileFlipXY); }
+  public object Fog { get { return fog; } set { fog = value; fogDraw = Find(value); } }
+  public object Embers { get { return em; } set { em = value; emDraw = Find(value); } }
+  static MethodInfo Find(object o) { return o == null ? null : o.GetType().GetMethod("Draw", new Type[] { typeof(Graphics) }); }
+  public void Attach(Control c) { c.Paint += OnPaint; }
+  void OnPaint(object s, PaintEventArgs e) { Draw(e.Graphics, e.ClipRectangle); }
+  public void Draw(Graphics g, Rectangle clip) {
+    Bitmap b = Bmp;
+    if (b != null) {
+      try {
+        if (Zoom > 1.0001f) {
+          float z = Zoom, x0 = Center.X - Center.X * z, y0 = Center.Y - Center.Y * z;
+          GraphicsState st = g.Save();
+          try {
+            g.InterpolationMode = InterpolationMode.Bilinear; g.PixelOffsetMode = PixelOffsetMode.Half;
+            PointF[] d = new PointF[] { new PointF(x0, y0), new PointF(x0 + b.Width * z, y0), new PointF(x0, y0 + b.Height * z) };
+            g.DrawImage(b, d, new RectangleF(0f, 0f, b.Width, b.Height), GraphicsUnit.Pixel, wrap);
+          } finally { g.Restore(st); }
+        } else {
+          g.DrawImage(b, clip, clip, GraphicsUnit.Pixel);
+        }
+      } catch { }
+    }
+    try { if (fogDraw != null) fogDraw.Invoke(fog, new object[] { g }); } catch { }
+    try { if (emDraw != null) emDraw.Invoke(em, new object[] { g }); } catch { }
+  }
+}
+// Desplazamiento suave de una columna (Content dentro de Host). Posicion = muelle criticamente amortiguado hacia el destino,
+// integrado de forma exacta con el tiempo real (Stopwatch): mismo recorrido a 60, 144 o 30 fps, sin rebote, y la velocidad
+// se conserva al encadenar muescas de la rueda (antes cada muesca reiniciaba la curva: tironcitos).
+// Fotogramas: bucle en Application.Idle que pinta y espera al compositor (DwmFlush = al ritmo del monitor); un
+// temporizador de 10 ms de respaldo por si Idle no llega. Solo corre mientras algo se mueve.
+public class BbSmoothScroll {
+  [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr h, IntPtr rc, IntPtr rgn, uint flags);
+  [DllImport("user32.dll")] static extern bool PeekMessage(out BbNativeMsg m, IntPtr h, uint min, uint max, uint remove);
+  [DllImport("dwmapi.dll")] static extern int DwmFlush();
+  [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint p);
+  [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint p);
+  public static bool ReduceMotion = false;
+  public Control Host, Content, MaxRef;
+  public int BaseTop = 0, Pad = 0, Slide = 0;
+  public bool Freeze = false, OwnVisible = false;
+  public double WheelOmega = 24.0, DragOmega = 44.0, Kick = 0.5;
+  public int Y = 0;
+  object bar; MethodInfo barSet;
+  double pos = 0, vel = 0, target = 0, omega = 24.0, lastT = 0; bool active = false;
+  static Stopwatch clock = Stopwatch.StartNew();
+  static List<BbSmoothScroll> running = new List<BbSmoothScroll>();
+  static Timer pump = null; static bool idleHooked = false, period = false; static double lastStep = 0;
+  static MethodInfo getState = typeof(Control).GetMethod("GetState", BindingFlags.Instance | BindingFlags.NonPublic, null, new Type[] { typeof(int) }, null);
+  public object Bar { get { return bar; } set { bar = value; barSet = value == null ? null : value.GetType().GetMethod("SetState", new Type[] { typeof(double), typeof(double), typeof(double) }); } }
+  public bool Animating { get { return active; } }
+  public double Goal { get { return active ? target : (double)Y; } }
+  static bool Vis(Control c, bool own) {
+    if (!own) return c.Visible;
+    if (getState != null) { try { return (bool)getState.Invoke(c, new object[] { 2 }); } catch { } }
+    return true;
+  }
+  public double Max() {
+    if (Content == null || MaxRef == null) return 0.0;
+    int ch = 0;
+    foreach (Control c in Content.Controls) { if (Vis(c, OwnVisible) && c.Bottom > ch) ch = c.Bottom; }
+    return Math.Max(0.0, (double)(ch + Pad - MaxRef.ClientSize.Height));
+  }
+  void Move(int top) {
+    if (Freeze && Host != null && Host.IsHandleCreated && Host.Visible) {
+      SendMessage(Host.Handle, 0x000B, IntPtr.Zero, IntPtr.Zero);
+      try { Content.Top = top; }
+      finally {
+        SendMessage(Host.Handle, 0x000B, new IntPtr(1), IntPtr.Zero);
+        RedrawWindow(Host.Handle, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0004 | 0x0080 | 0x0100);  // INVALIDATE | ERASE | ALLCHILDREN | UPDATENOW
+      }
+      return;
+    }
+    Content.Top = top;
+    if (Host != null && Host.IsHandleCreated && Host.Visible) RedrawWindow(Host.Handle, IntPtr.Zero, IntPtr.Zero, 0x0080 | 0x0100);  // lo destapado, ya
+  }
+  void Apply(double y, double max) {
+    if (y > max) y = max; if (y < 0) y = 0;
+    int iy = (int)Math.Round(y);
+    Y = iy;
+    if (Content != null) { int nt = BaseTop - iy + Slide; if (Content.Top != nt) Move(nt); }
+    if (barSet != null && Host != null) { try { barSet.Invoke(bar, new object[] { max, (double)iy, (double)Math.Max(1, Host.ClientSize.Height) }); } catch { } }
+  }
+  bool Step(double dt) {
+    double max = Max();
+    double t = target; if (t > max) t = max; if (t < 0) t = 0;
+    double w = omega, d = pos - t, e = Math.Exp(-w * dt), k = (vel + w * d) * dt;
+    pos = t + (d + k) * e;
+    vel = (vel - w * k) * e;
+    if (pos <= 0) { pos = 0; if (vel < 0) vel = 0; }
+    if (pos >= max) { pos = max; if (vel > 0) vel = 0; }
+    bool done = Math.Abs(pos - t) < 0.35 && Math.Abs(vel) < 8.0;
+    if (done) { pos = t; vel = 0; }
+    Apply(pos, max);
+    return !done;
+  }
+  void Begin() { if (!active) { pos = Y; vel = 0; target = Y; } }
+  // Rueda / salto de pagina: suma al destino (recortado a la columna, sin "reserva" contra los topes). Cada muesca da
+  // tambien un empujon de velocidad (Kick < 1: nunca se pasa del destino): arranca al momento y frena suave.
+  public void Wheel(double px) {
+    Begin();
+    double max = Max(), b = target; if (b > max) b = max; if (b < 0) b = 0;
+    double nt = Math.Max(0.0, Math.Min(max, b + px));
+    omega = WheelOmega; vel += Kick * omega * (nt - b); target = nt; Run();
+  }
+  // Destino sin recortar (la columna puede estar creciendo: un apartado que se abre).
+  public void AnimateTo(double y, double w) { Begin(); target = y; omega = w > 0 ? w : WheelOmega; Run(); }
+  // Arrastre de la barra: la sigue de cerca.
+  public void Drag(double y) { Begin(); double max = Max(); target = Math.Max(0.0, Math.Min(max, y)); omega = DragOmega; Run(); }
+  public void Stop() { if (active) { active = false; running.Remove(this); } vel = 0; pos = Y; target = Y; }
+  public void Jump(double y) { Stop(); Apply(y, Max()); pos = Y; target = Y; }
+  // Coloca sin animar (cambios de disposicion). Si se esta moviendo, mantiene su posicion actual.
+  public void Place(double y) { if (active) { Apply(pos, Max()); return; } Apply(y, Max()); pos = Y; target = Y; vel = 0; }
+  void Run() {
+    if (ReduceMotion) { double max = Max(); vel = 0; pos = Math.Max(0.0, Math.Min(max, target)); Apply(pos, max); pos = Y; target = Y; return; }
+    if (!active) { active = true; lastT = clock.Elapsed.TotalSeconds; running.Add(this); }
+    EnsurePump();
+  }
+  // Teclado (Tab): el control que recibe el foco entra en la vista con el mismo deslizamiento. Con el raton no (el clic ya
+  // esta sobre el control y una lista desplegada no debe moverse).
+  public void HookFocus(Control root) { foreach (Control c in root.Controls) { c.Enter += OnEnter; HookFocus(c); } }
+  void OnEnter(object s, EventArgs e) {
+    if (Control.MouseButtons != MouseButtons.None || Content == null || Host == null) return;
+    Control c = s as Control; if (c == null) return;
+    int top = 0; Control p = c;
+    while (p != null && p != Content) { top += p.Top; p = p.Parent; }
+    if (p == null) return;
+    double cur = Goal, vh = Host.ClientSize.Height, m = 16;
+    double v0 = cur - BaseTop, v1 = v0 + vh;
+    if (top < v0 + m) AnimateTo(Math.Max(0.0, top + BaseTop - m), WheelOmega);
+    else if (top + c.Height > v1 - m) AnimateTo(Math.Min(Max(), top + c.Height + BaseTop - vh + m), WheelOmega);
+  }
+  static void EnsurePump() {
+    if (!idleHooked) { Application.Idle += OnIdle; idleHooked = true; }
+    if (pump == null) { pump = new Timer(); pump.Interval = 10; pump.Tick += OnPump; }
+    if (!pump.Enabled) pump.Start();
+    if (!period) { try { timeBeginPeriod(1); period = true; } catch { } }
+  }
+  static void OnPump(object s, EventArgs e) { if (clock.Elapsed.TotalSeconds - lastStep > 0.012) StepAll(); }
+  static void StepAll() {
+    double now = clock.Elapsed.TotalSeconds; lastStep = now;
+    BbSmoothScroll[] arr = running.ToArray();
+    foreach (BbSmoothScroll s in arr) {
+      if (!s.active) continue;
+      double dt = now - s.lastT; if (dt < 0.0005) dt = 0.0005; if (dt > 0.05) dt = 0.05; s.lastT = now;
+      bool more = false;
+      try { more = s.Step(dt); } catch { more = false; }
+      if (!more) { s.active = false; running.Remove(s); }
+    }
+    if (running.Count == 0) {
+      if (pump != null) pump.Stop();
+      if (period) { try { timeEndPeriod(1); } catch { } period = false; }
+    }
+  }
+  static void OnIdle(object sender, EventArgs e) {
+    int guard = 0;
+    while (running.Count > 0 && guard < 2000) {
+      guard++;
+      BbNativeMsg m;
+      if (PeekMessage(out m, IntPtr.Zero, 0, 0, 0)) break;  // PM_NOREMOVE: hay algo que atender, el bucle de mensajes vuelve luego
+      StepAll();
+      if (running.Count == 0) break;
+      bool synced = false;
+      try { synced = DwmFlush() == 0; } catch { }
+      if (!synced) System.Threading.Thread.Sleep(4);
+    }
+  }
+}
+'@
+	}
+	$script:bbx = $true
+	[BbSmoothScroll]::ReduceMotion = [bool]$reduceMotion
+} catch { $script:bbx = $false; Write-Log "Extras C# (desplazamiento suave, fondo, letra): $_" }
+if ($script:bbx) {
+	try { $script:bd = New-Object BbBackdrop; $script:bd.Bmp = $script:bgBmp; $script:bd.Attach($form) } catch { $script:bd = $null; Write-Log "BbBackdrop: $_" }
+}
+if (-not $script:bd) { $form.Add_Paint($script:paintOld) }
+# Cinzel (la de los titulos del menu F1), junto al lanzador o junto al emulador; si falta, Segoe UI como antes.
+$script:fam = $null
+if ($script:bbx) {
+	$cinzelPaths = @((Join-Path $root 'menu_assets\fonts\Cinzel-SemiBold.ttf'))
+	try { if ($script:S.emu) { $cinzelPaths += (Join-Path (Split-Path -Parent $script:S.emu) 'menu_assets\fonts\Cinzel-SemiBold.ttf') } } catch { }
+	foreach ($f in $cinzelPaths) { if (-not $script:fam -and (Test-Path -LiteralPath $f)) { try { $script:fam = [BbFonts]::Load($f, 'Cinzel') } catch { } } }
+	if ($script:fam) { Write-Log 'Letra de titulos: Cinzel' } else { Write-Log 'Letra de titulos: Segoe UI (no se encontro menu_assets\fonts\Cinzel-SemiBold.ttf)' }
+}
+function New-DisplayFont([double]$pt, [double]$fallbackPt) {
+	if ($script:fam) { return (New-Object System.Drawing.Font($script:fam, [float]$pt, [System.Drawing.FontStyle]::Regular)) }
+	return (New-Object System.Drawing.Font('Segoe UI Semibold', [float]$fallbackPt, [System.Drawing.FontStyle]::Bold))
+}
+if ($script:fam) { $fGroup = New-DisplayFont 12.75 13.5 }
+$ruleCol = [System.Drawing.Color]::FromArgb(120, 222, 196, 140)
 function New-Combo($items, $x, $y, $w, [string]$key, $enabledFlags = $null, $map = $null) {
 	$c = New-Object NoWheelCombo
 	$c.DropDownStyle = 'DropDownList'; $c.FlatStyle = 'Flat'; $c.Font = $fText
@@ -2082,13 +2452,14 @@ function Set-ComboStyle($c) {
 	$c.Add_EnabledChanged({ param($s, $e) $s.Invalidate() })
 	# Flecha nativa tapada por un panel del color del campo con una flecha dibujada (gira al desplegar); un clic en ella abre la lista.
 	if ($c.Parent) {
-		$ov = New-Object System.Windows.Forms.Panel
+		$ov = $(if ($script:bbx) { New-Object BbComboArrow } else { New-Object System.Windows.Forms.Panel })
 		$ov.BackColor = $field; $ov.Cursor = [System.Windows.Forms.Cursors]::Hand
 		$ov.Size = New-Object System.Drawing.Size(27, $c.Height)
 		$ov.Location = New-Object System.Drawing.Point(($c.Left + $c.Width - 26), $c.Top)
 		$ov.Visible = $c.Visible
 		$ov.Tag = $c
-		$ov.Add_Paint({ param($s, $e)
+		if ($script:bbx) { $ov.Combo = $c; $ov.On = $gold; $ov.Off = $dim }
+		else { $ov.Add_Paint({ param($s, $e)
 			# Flecha dibujada (dorada; gris si no esta disponible). Desplegada: apunta arriba.
 			$cb = $s.Tag; $col = $(if ($cb.Enabled) { $gold } else { $dim })
 			$dir = $(if ($cb.DroppedDown) { -1.0 } else { 1.0 })
@@ -2097,7 +2468,7 @@ function Set-ComboStyle($c) {
 			foreach ($p in @(@(-4.5, -2.5), @(0.0, 2.5), @(4.5, -2.5))) { $pts += New-Object System.Drawing.PointF([float]($cxh + $p[0]), [float]($cyh + $p[1] * $dir)) }
 			$pen = New-Object System.Drawing.Pen($col, 1.8); $pen.StartCap = 'Round'; $pen.EndCap = 'Round'; $pen.LineJoin = 'Round'
 			$e.Graphics.SmoothingMode = 'AntiAlias'; $e.Graphics.DrawLines($pen, [System.Drawing.PointF[]]$pts); $pen.Dispose()
-		})
+		}) }
 		$ov.Add_Click({ $c.Focus() | Out-Null; $c.DroppedDown = $true }.GetNewClosure())
 		$c.Add_VisibleChanged({ $ov.Visible = $c.Visible }.GetNewClosure())
 		$c.Add_DropDown({ $ov.Invalidate() }.GetNewClosure())
@@ -2171,17 +2542,21 @@ function Draw-Chevron($gr, [double]$cx, [double]$cy, [double]$open, $col) {
 	$pen = New-Object System.Drawing.Pen($col, 2.0); $pen.StartCap = 'Round'; $pen.EndCap = 'Round'; $pen.LineJoin = 'Round'
 	$gr.SmoothingMode = 'AntiAlias'; $gr.DrawLines($pen, [System.Drawing.PointF[]]$pts); $pen.Dispose()
 }
+# (bb-launcher-2) La cabecera C# (BbHeader) lleva su propio giro de flecha: se copia de Tag.Progress.
+function Sync-Header($info) { if ($script:bbx) { try { $info.Header.Open = [float]$info.Progress } catch { } }; $info.Header.Invalidate() }
 function Toggle-Group($grp) {
 	$info = $grp.Tag; $info.Collapsed = -not $info.Collapsed
 	$to = $(if ($info.Collapsed) { 34 } else { $info.Full })
 	$toP = $(if ($info.Collapsed) { 0.0 } else { 1.0 })
-	if ($reduceMotion) { $grp.Height = $to; $info.Progress = $toP; $info.Header.Invalidate(); Relayout-Stack; return }
+	if ($reduceMotion) { $grp.Height = $to; $info.Progress = $toP; Sync-Header $info; Relayout-Stack; return }
 	$script:wheelT.Stop()
 	$script:anims = @($script:anims | Where-Object { $_.G -ne $grp }) + [pscustomobject]@{ G = $grp; From = $grp.Height; To = $to; FromP = $info.Progress; ToP = $toP; T0 = [Environment]::TickCount }
 	if (-not $info.Collapsed) {
 		# Al abrir, el desplazamiento suave baja hasta que la seccion entera se vea.
 		$want = [math]::Max(0, ($grp.Top + $to) - ($panel.ClientSize.Height - 16))
-		$script:scrollAnim = [pscustomobject]@{ From = $script:scrollY; To = $want; T0 = [Environment]::TickCount }
+		# (bb-launcher-2) con BbSmoothScroll: el mismo muelle que la rueda (el destino se recorta cada fotograma a lo que ya mide la columna)
+		if ($script:sm) { $script:scrollAnim = $null; if ($want -gt $script:sm.Goal) { $script:sm.AnimateTo([double]$want, 15.0) } }
+		else { $script:scrollAnim = [pscustomobject]@{ From = $script:scrollY; To = $want; T0 = [Environment]::TickCount } }
 	}
 	$script:animTimer.Start()
 }
@@ -2191,11 +2566,11 @@ $script:animTimer.Add_Tick({
 	foreach ($a in $script:anims) {
 		$t = [math]::Min(1.0, ($now - $a.T0) / 240.0); $e = 1 - [math]::Pow(1 - $t, 4)  # (launcher113) 240 ms, ease-out cuartico
 		$a.G.Height = [int]($a.From + ($a.To - $a.From) * $e)
-		$inf = $a.G.Tag; $inf.Progress = $a.FromP + ($a.ToP - $a.FromP) * $e; $inf.Header.Invalidate()
+		$inf = $a.G.Tag; $inf.Progress = $a.FromP + ($a.ToP - $a.FromP) * $e; Sync-Header $inf
 		if ($t -lt 1) { $done = $false }
 	}
 	Relayout-Stack
-	Set-ScrollY $script:scrollY
+	Set-ScrollY (Get-ScrollYNow)
 	if ($script:scrollAnim) {
 		$st = $script:scrollAnim; $t = [math]::Min(1.0, ($now - $st.T0) / 240.0); $e = 1 - [math]::Pow(1 - $t, 4)
 		Set-ScrollY ($st.From + ($st.To - $st.From) * $e)
@@ -2204,20 +2579,22 @@ $script:animTimer.Add_Tick({
 	if ($done) { $script:anims = @(); $script:animTimer.Stop() }
 })
 function New-Group([string]$text, $parent, $x, $y, $w, $h) {
-	$g = New-Object System.Windows.Forms.GroupBox
+	$g = $(if ($script:bbx) { New-Object BbGroup } else { New-Object System.Windows.Forms.GroupBox })  # (bb-launcher-2) BbGroup: esquinas redondeadas y filete
 	# Apartado con fondo solido (como los de Settings): el texto sale con ClearType. El titulo lo pinta una etiqueta
 	# opaca (Header), no el GroupBox, que con fondo transparente dibuja la letra en escala de grises.
 	$g.Text = ''; $g.Font = $fGroup; $g.ForeColor = $gold
 	$g.BackColor = $grpBack
 	$g.Location = New-Object System.Drawing.Point($x, $y); $g.Size = New-Object System.Drawing.Size($w, $h)
 	# Franja de cabecera (solo el titulo y la flecha, sin tapar los controles de la primera fila).
-	$hd = New-Object System.Windows.Forms.Label
-	$hd.Location = New-Object System.Drawing.Point(6, 0); $hd.Size = New-Object System.Drawing.Size(($w - 12), 24)
+	$hd = $(if ($script:bbx) { New-Object BbHeader } else { New-Object System.Windows.Forms.Label })
+	if ($script:bbx) { $hd.Location = New-Object System.Drawing.Point(8, 3); $hd.Size = New-Object System.Drawing.Size(($w - 16), 22) }  # deja ver el filete de arriba
+	else { $hd.Location = New-Object System.Drawing.Point(6, 0); $hd.Size = New-Object System.Drawing.Size(($w - 12), 24) }
 	$hd.Font = $fGroup; $hd.ForeColor = $gold; $hd.BackColor = $grpBack; $hd.TextAlign = 'MiddleLeft'
 	$hd.Padding = New-Object System.Windows.Forms.Padding(22, 0, 0, 0); $hd.Cursor = [System.Windows.Forms.Cursors]::Hand
 	$hd.Text = $text
 	$g.Tag = [pscustomobject]@{ Full = $h; Collapsed = $false; Title = $text; Header = $hd; Progress = 1.0 }
-	$hd.Add_Paint({ param($s, $e) Draw-Chevron $e.Graphics 13.0 12.0 ([double]$s.Parent.Tag.Progress) $s.ForeColor })
+	if ($script:bbx) { $hd.Rule = $ruleCol }
+	else { $hd.Add_Paint({ param($s, $e) Draw-Chevron $e.Graphics 13.0 12.0 ([double]$s.Parent.Tag.Progress) $s.ForeColor }) }
 	$hd.Add_Click({ param($s, $e) Toggle-Group $s.Parent })
 	$hd.Add_MouseEnter({ param($s, $e) $s.ForeColor = $goldHi })
 	$hd.Add_MouseLeave({ param($s, $e) $s.ForeColor = $gold })
@@ -2254,7 +2631,7 @@ function New-DarkCombo($items, [string]$font = 'text') {
 
 # ---------------------------------------------------------------- ventana Settings (juego, emulador, parches, controles, sistema)
 # Apartados redondeados de antes, en una sola columna que se desplaza. Se abre con el boton Settings.
-$fSec = New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Bold)
+$fSec = $(if ($script:fam) { New-DisplayFont 12 12 } else { New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Bold) })
 $script:secY = 10
 function New-RoundPath($x, $y, $w, $h, $r) {
 	$p = New-Object System.Drawing.Drawing2D.GraphicsPath
@@ -2303,6 +2680,15 @@ $scrollC = New-Object System.Windows.Forms.Panel; $scrollC.Location = New-Object
 Set-DoubleBuffer $scrollC; $scroll.Controls.Add($scrollC)
 $sbarS = New-Object BbScrollBar; $sbarS.Dock = 'Right'; $sbarS.Width = 12; $sbarS.Visible = $false
 $scroll.Controls.Add($sbarS); $sbarS.BringToFront()
+# (bb-launcher-2) Motor de desplazamiento suave de la ventana Emulador (si los extras C# compilaron).
+$script:smS = $null
+if ($script:bbx) {
+	try {
+		$script:smS = New-Object BbSmoothScroll
+		$script:smS.Host = $scroll; $script:smS.Content = $scrollC; $script:smS.MaxRef = $scroll; $script:smS.Pad = 8; $script:smS.BaseTop = 0
+		$script:smS.OwnVisible = $true; $script:smS.Bar = $sbarS
+	} catch { $script:smS = $null; Write-Log "Desplazamiento suave (Emulador): $_" }
+}
 # Sombra suave bajo cada apartado redondeado (se pinta en el contenido, detras del apartado).
 $scrollC.Add_Paint({
 	param($s, $e)
@@ -2321,11 +2707,13 @@ function Set-SetScrollY([double]$y) {
 	$ph = $scroll.ClientSize.Height; $max = Get-SetMax
 	$script:setY = [math]::Max(0.0, [math]::Min($max, $y))
 	$nh = [int]($max + $ph); if ($scrollC.Height -ne $nh) { $scrollC.Height = $nh }
+	if ($script:smS) { $script:smS.Slide = [int][math]::Round($script:setSlide); $script:smS.Place($script:setY); $script:setY = [double]$script:smS.Y; return }
 	$nt = -[int][math]::Round($script:setY) + [int][math]::Round($script:setSlide); if ($scrollC.Top -ne $nt) { $scrollC.Top = $nt }  # (launcher134) sin WM_SETREDRAW en esta ventana
 	$sbarS.SetState($max, $script:setY, $ph)
 }
 $script:setWheelT = New-Object System.Windows.Forms.Timer; $script:setWheelT.Interval = 15
 function Add-SetWheel([double]$px) {
+	if ($script:smS) { $script:smS.Wheel($px); return }
 	if (-not $script:setWheelT.Enabled) { $script:setPos = $script:setY; $script:setTarget = $script:setY; $script:setLast = [Environment]::TickCount - 15 }
 	$script:setTau = 90.0
 	$script:setTarget = [math]::Max(0.0, [math]::Min((Get-SetMax), $script:setTarget + $px))
@@ -2339,9 +2727,10 @@ $script:setWheelT.Add_Tick({
 	if ([math]::Abs($d) -lt 0.5) { $script:setPos = $script:setTarget; $script:setWheelT.Stop() } else { $script:setPos += $d * (1 - [math]::Exp(-$dt / $script:setTau)) }
 	Set-SetScrollY $script:setPos
 })
-function Set-SetNow([double]$y) { $script:setWheelT.Stop(); Set-SetScrollY $y; $script:setPos = $script:setY; $script:setTarget = $script:setY }
+function Set-SetNow([double]$y) { $script:setWheelT.Stop(); if ($script:smS) { $script:smS.Stop() }; Set-SetScrollY $y; $script:setPos = $script:setY; $script:setTarget = $script:setY }
 $sbarS.add_Scrolled({
 	if ($reduceMotion) { Set-SetNow $sbarS.Requested; return }
+	if ($script:smS) { $script:smS.Drag([double]$sbarS.Requested); return }
 	if (-not $script:setWheelT.Enabled) { $script:setPos = $script:setY; $script:setLast = [Environment]::TickCount - 15 }
 	$script:setTau = 35.0; $script:setTarget = [math]::Max(0.0, [math]::Min((Get-SetMax), [double]$sbarS.Requested)); $script:setWheelT.Start()
 })
@@ -2362,6 +2751,7 @@ $fSet.Add_VisibleChanged({
 })
 $btnSetOk = New-Btn (T 'Cerrar' 'Close') 12 10 $colW 40 $true
 $btnSetOk.Add_Click({ $fSet.Hide() }); $setBar.Controls.Add($btnSetOk)
+if ($script:fam) { $btnSetOk.Font = New-DisplayFont 12 12; $btnSetOk.Tracking = 2 }
 $c1 = 12; $iw = $colW - 24
 $lw = 168; $cx = 190; $cw = $colW - $cx - 12
 # (launcher131) Opciones con rejilla por filas: cada apartado guarda sus filas (Tag.Rows) y Fit-Sections las coloca de
@@ -2471,6 +2861,7 @@ function Show-SetFallback {
 	if ($script:setAutoH) { $want = [int][math]::Min(($y + $setBar.Height), ($H - 60)); if ($fSet.ClientSize.Height -ne $want) { $fSet.ClientSize = New-Object System.Drawing.Size($fSet.ClientSize.Width, $want) } }
 	$vh = [int][math]::Max(1, $scroll.ClientSize.Height)
 	$scrollC.SetBounds(0, 0, ($colW + 24), [int][math]::Max(($y + 8), $vh))
+	if ($script:smS) { try { $script:smS.Jump(0) } catch { } }
 	try { $sbarS.SetState([double][math]::Max(0, ($y + 8) - $vh), 0.0, [double]$vh) } catch { }
 	$scrollC.Invalidate($true)
 }
@@ -2628,6 +3019,7 @@ $panel.Anchor = 'None'  # (launcher113) posicion y alto los fija Apply-Layout (f
 $panel.BackColor = $panelBack
 $panel.SuspendLayout(); Set-DoubleBuffer $panel
 $form.Controls.Add($panel)
+if ($script:bbx) { try { [BbPaint]::Frame($panel, 18, [System.Drawing.Color]::FromArgb(110, 176, 140, 82)) } catch { } }  # (bb-launcher-2) filete del panel
 # Columna desplazable a mano: $cont se mueve (sin blit del sistema, que deja rayas con controles transparentes).
 $cont = New-Object System.Windows.Forms.Panel; $cont.BackColor = [System.Drawing.Color]::Transparent; $cont.Location = New-Object System.Drawing.Point(0, 0); $cont.Size = New-Object System.Drawing.Size($panelW, $H)
 # (launcher115) JUGAR fijo arriba del panel; debajo, la vista desplazable ($view) con $cont dentro (cabecera $script:hd px).
@@ -2650,10 +3042,27 @@ function Set-ScrollY([double]$y) {
 	$script:scrollY = [int][math]::Max(0, [math]::Min($max, [math]::Round($y)))
 	$hd = $script:hd; $vh = [math]::Max(1, $ph - $hd)
 	if ($view.Top -ne $hd -or $view.Height -ne $vh -or $view.Width -ne $panelW) { $view.SetBounds(0, $hd, $panelW, $vh) }
-	$nh = [int][math]::Max($ph, $total); if ($cont.Height -ne $nh) { $cont.Height = $nh }; $nt = -$hd - [int]$script:scrollY; if ($cont.Top -ne $nt) { [BbGfx]::MoveTop($view, $cont, $nt) }
+	$nh = [int][math]::Max($ph, $total); if ($cont.Height -ne $nh) { $cont.Height = $nh }
 	# (launcher115) barra de arriba abajo de la zona desplazable (debajo de JUGAR hasta el borde inferior)
 	$sx = $panelW - $sbar.Width - 2; $sy = $hd + 4; $sh = [math]::Max(1, $vh - 12); if ($sbar.Left -ne $sx -or $sbar.Top -ne $sy -or $sbar.Height -ne $sh) { $sbar.SetBounds($sx, $sy, $sbar.Width, $sh) }
-	$sbar.SetState($max, [double]$script:scrollY, $vh); if ($panel.Controls.GetChildIndex($sbar) -ne 0) { $sbar.BringToFront() }
+	if ($script:sm) {
+		# (bb-launcher-2) BbSmoothScroll coloca la columna y la barra (si se esta moviendo, sigue su propio recorrido)
+		$script:sm.BaseTop = -$hd; $script:sm.Place([double]$script:scrollY); $script:scrollY = $script:sm.Y
+	} else {
+		$nt = -$hd - [int]$script:scrollY; if ($cont.Top -ne $nt) { [BbGfx]::MoveTop($view, $cont, $nt) }
+		$sbar.SetState($max, [double]$script:scrollY, $vh)
+	}
+	if ($panel.Controls.GetChildIndex($sbar) -ne 0) { $sbar.BringToFront() }
+}
+# (bb-launcher-2) Posicion que se ve ahora (con el motor suave, $script:scrollY puede ir por detras mientras se mueve).
+function Get-ScrollYNow { if ($script:sm) { return [double]$script:sm.Y }; return [double]$script:scrollY }
+$script:sm = $null
+if ($script:bbx) {
+	try {
+		$script:sm = New-Object BbSmoothScroll
+		$script:sm.Host = $view; $script:sm.Content = $cont; $script:sm.MaxRef = $panel; $script:sm.Pad = 24; $script:sm.BaseTop = -$script:hd
+		$script:sm.Freeze = $true; $script:sm.Bar = $sbar
+	} catch { $script:sm = $null; Write-Log "Desplazamiento suave: $_" }
 }
 
 # Rueda suave (sin AutoScroll): cada muesca suma 72 px (como antes) al destino; la posicion se acerca a el
@@ -2662,6 +3071,7 @@ $script:scrollTarget = 0.0; $script:scrollPos = 0.0; $script:wheelLast = 0; $scr
 $script:wheelT = New-Object System.Windows.Forms.Timer; $script:wheelT.Interval = 15
 function Get-ScrollMax { $ch = 0; foreach ($c in $cont.Controls) { if ($c.Visible -and $c.Bottom -gt $ch) { $ch = $c.Bottom } }; return [double][math]::Max(0, ($ch + 24) - $panel.ClientSize.Height) }
 function Add-WheelStep([double]$px) {
+	if ($script:sm) { $script:scrollAnim = $null; $script:sm.Wheel($px); return }
 	if (-not $script:wheelT.Enabled) { $script:scrollPos = [double]$script:scrollY; $script:scrollTarget = [double]$script:scrollY; $script:wheelLast = [Environment]::TickCount - 16 }
 	$script:scrollAnim = $null; $script:wheelTau = 90.0
 	$script:scrollTarget = [math]::Max(0.0, [math]::Min((Get-ScrollMax), $script:scrollTarget + $px))
@@ -2678,11 +3088,12 @@ $script:wheelT.Add_Tick({
 })
 # (ui055) Arrastrar la barra y clic en el carril.
 $script:dragY = -1; $script:dragStart = 0
-function Set-ScrollNow([double]$y) { $script:wheelT.Stop(); Set-ScrollY $y; $script:scrollPos = [double]$script:scrollY; $script:scrollTarget = [double]$script:scrollY }
+function Set-ScrollNow([double]$y) { $script:wheelT.Stop(); if ($script:sm) { $script:sm.Stop() }; Set-ScrollY $y; $script:scrollPos = [double]$script:scrollY; $script:scrollTarget = [double]$script:scrollY }
 # Arrastre 1:1: BbScrollBar captura el raton (no se pierde al moverse) y la posicion sigue al cursor sin animacion.
 # (launcher119) Arrastre suave: la barra sigue al cursor y el contenido la persigue con un suavizado corto (tau 35 ms).
 function Drag-ScrollTo([double]$y) {
 	if ($reduceMotion) { Set-ScrollNow $y; return }
+	if ($script:sm) { $script:scrollAnim = $null; $script:sm.Drag($y); return }
 	if (-not $script:wheelT.Enabled) { $script:scrollPos = [double]$script:scrollY; $script:wheelLast = [Environment]::TickCount - 15 }
 	$script:scrollAnim = $null; $script:wheelTau = 35.0
 	$script:scrollTarget = [math]::Max(0.0, [math]::Min((Get-ScrollMax), $y)); $script:wheelT.Start()
@@ -2695,9 +3106,18 @@ $btnPlay = New-Btn (T 'JUGAR' 'PLAY') 10 12 ($gwTop - $fgW - 6) 74 $true
 # (ui055) JUGAR: fondo rojo y letra gotica blanca (la primera gotica instalada; si no hay, Segoe UI Black).
 $fams = @([System.Drawing.FontFamily]::Families | ForEach-Object { $_.Name })
 $goth = @('Old English Text MT', 'UnifrakturMaguntia', 'UnifrakturCook', 'Blackletter', 'Fraktur', 'Blackadder ITC') | Where-Object { $fams -contains $_ } | Select-Object -First 1
+if ($script:fam) {
+	# (bb-launcher-2) JUGAR en Cinzel (versalitas romanas, como el logotipo), letras espaciadas, marfil con relieve sobre
+	# carmesi oscuro degradado y filete dorado.
+	$btnPlay.Font = New-DisplayFont 24 24; $btnPlay.Tracking = 7
+	$btnPlay.BackColor = [System.Drawing.Color]::FromArgb(126, 18, 20); $btnPlay.ForeColor = [System.Drawing.Color]::FromArgb(246, 236, 214)
+	$btnPlay.TextShadow = [System.Drawing.Color]::FromArgb(46, 6, 8); $btnPlay.Gradient = 0.42
+	$btnPlay.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(176, 140, 82); $btnPlay.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(160, 28, 28); $btnPlay.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(98, 12, 14)
+} else {
 if ($goth) { $btnPlay.Font = New-Object System.Drawing.Font($goth, 30, [System.Drawing.FontStyle]::Regular) } else { $btnPlay.Font = New-Object System.Drawing.Font('Segoe UI Black', 22.5, [System.Drawing.FontStyle]::Bold) }
 $btnPlay.BackColor = [System.Drawing.Color]::FromArgb(150, 14, 14); $btnPlay.ForeColor = [System.Drawing.Color]::White
 $btnPlay.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(90, 8, 8); $btnPlay.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(185, 24, 24); $btnPlay.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(120, 10, 10)
+}
 $tips.SetToolTip($btnPlay, (T 'Arranca Bloodborne con estos ajustes (Esc cierra el lanzador).' 'Starts Bloodborne with these settings (Esc closes the launcher).'))
 $panel.Controls.Add($btnPlay)  # (launcher115) fijo arriba (no se desplaza)
 $btnFolder = New-Btn (T "Carpeta`ndel juego" "Game`nfolder") (10 + $gwTop - $fgW) 12 $fgW 74; $btnFolder.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold)
@@ -2993,18 +3413,20 @@ $cont.Controls.Add($pcCard); $script:pcCardRef = $pcCard
 $bw2 = [int](($gw - 8) / 2); $byy = $pcCard.Bottom + 14
 $btnUpd.Location = New-Object System.Drawing.Point(10, $byy); $btnUpd.Size = New-Object System.Drawing.Size($bw2, 46); $btnUpd.Font = $fBtn
 $btnSettings.Location = New-Object System.Drawing.Point((18 + $bw2), $byy); $btnSettings.Size = New-Object System.Drawing.Size($bw2, 46); $btnSettings.Font = $fBtn
+if ($script:fam) { $fBtnD = New-DisplayFont 11.25 12; $btnUpd.Font = $fBtnD; $btnSettings.Font = $fBtnD }
 $pbUpd.Location = New-Object System.Drawing.Point(10, ($byy + 52)); $pbUpd.Size = New-Object System.Drawing.Size(($gw - 20), 6)
 # Orden: lo que se toca a menudo arriba (Imagen, Frame generation, Calidad); Pantalla y Rendimiento
 # plegados (un clic en el titulo los abre con animacion).
 $script:bottomReady = $true
 $script:stackGroups = @($gImg, $gFg, $gD5, $gJuego, $gGL, $gQ, $gScr, $gPc)  # (launcher129) Opciones del juego entra en la pila
-foreach ($cg in @($gScr, $gPc)) { $cg.Tag.Collapsed = $true; $cg.Tag.Progress = 0.0; $cg.Height = 34; $cg.Tag.Header.Invalidate() }
+foreach ($cg in @($gScr, $gPc)) { $cg.Tag.Collapsed = $true; $cg.Tag.Progress = 0.0; $cg.Height = 34; Sync-Header $cg.Tag }
 Fit-AllGroups
 
 # ---- Trofeos (abajo a la izquierda, desplegable como en Demon's Souls)
 $trophyW = 420; $trophyListH = 360
 $btnTrophy = New-Btn (T 'Trofeos  v' 'Trophies  v') 24 ($H - 70) $trophyW 46
 $btnTrophy.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Bold)
+if ($script:fam) { $btnTrophy.Font = New-DisplayFont 12 12 }
 $btnTrophy.TextAlign = 'MiddleLeft'
 try {
 	$ti = New-Object System.Drawing.Bitmap 30, 30; $tg = [System.Drawing.Graphics]::FromImage($ti); $tg.SmoothingMode = 'AntiAlias'
@@ -3019,6 +3441,7 @@ $form.Controls.Add($btnTrophy)
 $tkeyW = 176
 $btnTKey = New-Btn (T 'Clave de trofeos' 'Trophy key') (24 + $trophyW + 8) ($H - 70) $tkeyW 46
 $btnTKey.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11, [System.Drawing.FontStyle]::Bold)
+if ($script:fam) { $btnTKey.Font = New-DisplayFont 10.5 11 }
 $tips.SetToolTip($btnTKey, (T 'Ver o cambiar la clave de trofeos de PS4 (keys.json de shadPS4).' 'View or change the PS4 trophy key (shadPS4 keys.json).'))
 $btnTKey.Add_Click({ try { Show-TrophyKeyPrompt -Force } catch { Write-Log "Clave de trofeos: $_" } })
 $form.Controls.Add($btnTKey)
@@ -3443,6 +3866,9 @@ Hook-Wheel $cont; Hook-Wheel $view; Hook-Wheel $btnPlay; $panel.Add_MouseWheel({
 # (launcher112) Opciones: misma rueda suave (72 px por muesca) en todo el contenido.
 function Hook-SetWheel($ctl) { $ctl.Add_MouseWheel({ param($s, $e) Add-SetWheel (-1.0 * [double]$e.Delta * 0.6) }); foreach ($ch in $ctl.Controls) { Hook-SetWheel $ch } }
 Hook-SetWheel $scrollC; $scroll.Add_MouseWheel({ param($s, $e) Add-SetWheel (-1.0 * [double]$e.Delta * 0.6) }); $sbarS.Add_MouseWheel({ param($s, $e) Add-SetWheel (-1.0 * [double]$e.Delta * 0.6) })
+# (bb-launcher-2) Con Tab, el control enfocado entra en la vista deslizando (con el raton no se mueve nada).
+if ($script:sm) { try { $script:sm.HookFocus($cont) } catch { } }
+if ($script:smS) { try { $script:smS.HookFocus($scrollC) } catch { } }
 Set-SetScrollY 0
 # ---- (launcher113) Distribucion: nada tapa el titulo "Bloodborne PC" (rectangulo calculado con la misma escala y
 # recorte del fondo). Panel de ajustes: tarjeta semitransparente redondeada a la derecha, bajo la franja del titulo si
@@ -3494,7 +3920,7 @@ function Apply-Layout {
 	$script:panelHome = New-Object System.Drawing.Point($px, $py)
 	$panel.SetBounds(($px + $script:panelSlide), $py, $panelW, $ph)
 	try { $rp = New-RoundPath 0 0 $panelW $ph 18; $old = $panel.Region; $panel.Region = New-Object System.Drawing.Region($rp); $rp.Dispose(); if ($old) { $old.Dispose() } } catch { }
-	Set-ScrollY $script:scrollY
+	Set-ScrollY (Get-ScrollYNow)
 	# --- boton, distintivo y lista
 	$script:trW = $tw; $script:trTop = $ty
 	$btnTrophy.SetBounds($tx, ($ty + $script:trSlide), $tw, $bH)
@@ -3529,6 +3955,7 @@ function Apply-Layout {
 if (-not $reduceMotion) {
 	if ($fxEmbers -gt 0) { $script:embers = New-Object BbEmbers ([int]$fxEmbers) }
 	if ($fxFog -gt 0) { try { $script:fog = New-Object BbFog ([int]$fxFog) } catch { $script:fog = $null; Write-Log "Niebla: $_" } }
+	if ($script:bd) { $script:bd.Fog = $script:fog; $script:bd.Embers = $script:embers }
 }
 Apply-Layout
 $script:lastSize = $form.ClientSize
@@ -3563,7 +3990,7 @@ $fxT.Add_Tick({
 	if ($form.WindowState -eq 'Minimized' -or -not $form.Visible) { return }
 	if ($script:bgZoom -gt 1.0) {
 		$z = 1.0 + 0.03 * (1 - (Ease 0 3200 ($now - $script:fxT0)))
-		if ($z -le 1.0005) { $script:bgZoom = 1.0; $form.Invalidate($true) } else { $script:bgZoom = $z; $form.Invalidate($false); $panel.Invalidate($true) }
+		if ($z -le 1.0005) { Set-BgZoom 1.0; $form.Invalidate($true) } else { Set-BgZoom $z; $form.Invalidate($false); $panel.Invalidate($true) }
 	}
 	$fs = [float]($dt / 1000.0)
 	if ($script:fog) {
@@ -3642,7 +4069,7 @@ $form.Add_Shown({ try { Show-TrophyKeyPrompt } catch { Write-Log "Clave de trofe
 $form.Add_Shown({
 	$script:shownOnce = $true
 	if ($reduceMotion) { $form.Opacity = 1; $form.Refresh(); return }
-	$script:bgZoom = 1.03; $script:panelSlide = $script:slideDist; $script:trSlide = 0; if ($script:fog) { $script:fog.Fade = 0 }; Apply-Layout
+	Set-BgZoom 1.03; $script:panelSlide = $script:slideDist; $script:trSlide = 0; if ($script:fog) { $script:fog.Fade = 0 }; Apply-Layout
 	$form.Refresh(); $filete.Width = 1; $script:fadeT0 = [Environment]::TickCount; $script:fxT0 = $script:fadeT0; $script:fxLast = $script:fadeT0
 	$form.Opacity = 0.01; $fadeT.Start(); $fxT.Start()
 })
