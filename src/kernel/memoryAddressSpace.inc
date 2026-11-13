@@ -2115,6 +2115,7 @@ public:
 			return false;
 		}
 		LiveCounters::Add(LiveCounters::ProtectCalls);
+		::Loader::DemonsSoulsNativeMem::Note(::Loader::DemonsSoulsNativeMem::Protect, vaddr, size);
 		if (LiveCensus::g_render) {
 			LiveCounters::Add(LiveCounters::ProtectCallsRender);
 			if (LiveCensus::g_queue == 0) LiveCounters::Add(LiveCounters::ProtectCallsGfx);
