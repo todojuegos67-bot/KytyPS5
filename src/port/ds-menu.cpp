@@ -3240,10 +3240,10 @@ void SetBigPagefile() {
 	    "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false}; "
 	    "$p=Get-CimInstance Win32_PageFileSetting | Where-Object {$_.Name -like 'C:*'}; "
 	    "if(-not $p){$p=New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name='C:\\pagefile.sys'}}; "
-	    "$p | Set-CimInstance -Property @{InitialSize=[uint32]16384;MaximumSize=[uint32]61440}; "
+	    "$p | Set-CimInstance -Property @{InitialSize=[uint32]61440;MaximumSize=[uint32]61440}; "
 	    "Get-CimInstance Win32_PageFileSetting | Format-Table Name,InitialSize,MaximumSize\"\r\n"
 	    "echo.\r\n"
-	    "echo Si arriba sale C:\\pagefile.sys 16384 61440 esta hecho. Reinicia el PC para aplicarlo.\r\n"
+	    "echo Si arriba sale C:\\pagefile.sys 61440 61440 esta hecho. Reinicia el PC para aplicarlo.\r\n"
 	    "pause\r\n";
 	char dir[MAX_PATH] = {};
 	if (GetTempPathA(MAX_PATH, dir) == 0) return;
