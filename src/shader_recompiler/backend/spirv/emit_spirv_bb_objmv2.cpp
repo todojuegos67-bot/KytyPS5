@@ -160,8 +160,10 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
                                          ctx.u32_zero_value);
     cls = ctx.OpSelect(f32, character, ctx.Constant(f32, 4.0f), cls);
     // bb-fog-mv: opaque draws write weight 0: .w of attachment 7 is the coverage of the blended
-    // draws in front (fog, smoke, particles), accumulated by blending (nothing reads .w else).
-    Id weight = zero;
+    // draws in front (fog, smoke, particles), accumulated by blending. The push word is 0 with
+    // bb-fog-mv off (BB_FOG_MV=0 / no velocity path): weight 1 as before.
+    const Id curve = PushU32(ctx, PushData::ObjMvFogIndex);
+    Id weight = ctx.OpSelect(f32, ctx.OpIEqual(b, curve, ctx.u32_zero_value), one, zero);
     if (ctx.runtime_info.hw.fs.bb_objmv_blend) {
         cls = ctx.Constant(f32, 3.0f);
         const auto& mrt0 = ctx.frag_outputs[0];
@@ -174,7 +176,6 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
             // blends (dx, dy) with this weight and accumulates it in .w (the class is kept).
             const Id fog = ctx.OpINotEqual(
                 b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(8u)), ctx.u32_zero_value);
-            const Id curve = PushU32(ctx, PushData::ObjMvFogIndex);
             const Id inv = ctx.Constant(f32, 1.0f / 65535.0f);
             const Id lo_bits = ctx.OpBitwiseAnd(ctx.U32[1], curve, ctx.ConstU32(0xffffu));
             const Id hi_bits = ctx.OpShiftRightLogical(ctx.U32[1], curve, ctx.ConstU32(16u));
@@ -188,6 +189,8 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
                                          ctx.OpFSub(f32, ctx.Constant(f32, 3.0f), two_t));
             const Id dense = ctx.OpFMul(f32, alpha, smooth);
             weight = ctx.OpSelect(f32, written, ctx.OpSelect(f32, fog, dense, alpha), zero);
+        } else {
+            weight = zero;
         }
     }
     ctx.OpStore(ctx.objmv_frag_out,

@@ -152,6 +152,7 @@ struct State {
     bool velocity = true;
     std::unordered_map<u64, SnapBuf> vel_addr_cur, vel_addr_prev, vel_id_cur, vel_id_prev;
     std::unordered_map<u64, u32> cam_ord; // camera block (address, size) -> ordinal this frame
+    std::unordered_map<u64, u32> cam_ord_blend; // bb-fog-mv: blocks only blended draws used
     std::unordered_map<u64, u64> role_cache; // vs hash -> read-only V# handles
     std::unordered_map<u64, bool> cam_checked; // camera block -> matched by order, similar
     std::unordered_map<u64, BB::NativeMv::DrawId> pal_ids; // palette address -> game identity
@@ -576,8 +577,11 @@ bool Init(const Vulkan::Instance& instance) {
         };
         const float lo = env_f("BB_FOG_MV_LO", 0.02f);
         const float hi = std::max(env_f("BB_FOG_MV_HI", 0.35f), lo + 0.01f);
-        g.fog_curve = u32(std::lround(lo * 65535.0f)) |
-                      (u32(std::lround(std::min(hi, 1.0f) * 65535.0f)) << 16);
+        // 0 with bb-fog-mv off: the fragment then writes weight 1 for opaque draws (as before);
+        // never 0 when on (hi >= 0.01).
+        g.fog_curve = g.fog ? (u32(std::lround(lo * 65535.0f)) |
+                               (u32(std::lround(std::min(hi, 1.0f) * 65535.0f)) << 16))
+                            : 0u;
         g.fog_reactive = g.fog && std::getenv("BB_FOG_REACTIVE") != nullptr &&
                          std::getenv("BB_FOG_REACTIVE")[0] == '1';
         Log(fmt::format("[fog-mv] {} (BB_FOG_MV=0 off): blended scene draws (fog, smoke, "
@@ -1004,6 +1008,22 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             }
             continue;
         }
+        if (blend && role == VelRole::Palette) {
+            // bb-fog-mv: a blended draw with a palette-sized buffer that is no game skin ring
+            // palette (particle / effect data, or translucent skinned parts without an
+            // identity): last frame's copy cannot be trusted, so no vector of its own (the
+            // vector behind stays, as before). Checked before the snapshot copy (no GPU copy).
+            const auto pid = g.pal_ids.find(addr);
+            const auto id = pid != g.pal_ids.end()
+                                ? pid->second
+                                : g.pal_ids.emplace(addr, BB::NativeMv::LookupPalette(addr))
+                                      .first->second;
+            if (id.key == 0) {
+                ++g.sec_fog_skin_skipped;
+                ok = false;
+                break;
+            }
+        }
         SnapBuf cur{0, 0, 0, 0};
         const bool have_cur = VelSnap(buffer_cache, scheduler, addr, size, cur);
         const u64 akey = Mix(addr, size);
@@ -1012,8 +1032,22 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             // The camera block: same address last frame, else the same order among the frame's
             // camera blocks (the game places it anew every frame).
             u32 ord;
+            bool blend_ord = false;
             if (const auto it = g.cam_ord.find(akey); it != g.cam_ord.end()) {
                 ord = it->second;
+            } else if (blend) {
+                // bb-fog-mv: a camera block no opaque draw used (yet) gets an ordinal of its own
+                // (high bit), so blended draws never shift the opaque draws' camera ordinals.
+                blend_ord = true;
+                if (const auto ib = g.cam_ord_blend.find(akey); ib != g.cam_ord_blend.end()) {
+                    ord = ib->second;
+                } else {
+                    ord = 0x80000000u | static_cast<u32>(g.cam_ord_blend.size());
+                    g.cam_ord_blend[akey] = ord;
+                    if (have_cur) g.vel_id_cur[Mix(0x63616d65ull, ord)] = cur;
+                    std::array<float, 216> c;
+                    if (CameraCpuCopy(memory, buffer_cache, addr, c)) g.cam_cpu_cur[ord] = c;
+                }
             } else {
                 ord = static_cast<u32>(g.cam_ord.size());
                 g.cam_ord[akey] = ord;
@@ -1028,7 +1062,8 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             } else if (const auto it2 = g.vel_id_prev.find(Mix(0x63616d65ull, ord));
                        it2 != g.vel_id_prev.end() && it2->second.addr != 0) {
                 // Per address and frame: the similarity check runs once per camera block.
-                const auto chk = g.cam_checked.try_emplace(akey, false);
+                const auto chk =
+                    g.cam_checked.try_emplace(blend_ord ? Mix(akey, 0x666f67ull) : akey, false);
                 if (chk.second) {
                     const auto c = g.cam_cpu_cur.find(ord);
                     const auto p = g.cam_cpu_prev.find(ord);
@@ -1064,15 +1099,6 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                                 ? pid->second
                                 : g.pal_ids.emplace(addr, BB::NativeMv::LookupPalette(addr))
                                       .first->second;
-            if (blend && id.key == 0) {
-                // bb-fog-mv: a blended draw with a palette-sized buffer that is no game skin
-                // ring palette (particle / effect data, or translucent skinned parts without an
-                // identity): last frame's copy cannot be trusted, so no vector of its own (the
-                // vector behind stays, as before).
-                ++g.sec_fog_skin_skipped;
-                ok = false;
-                break;
-            }
             if (!skinned && !blend) ++g.vs_skin_draws_all;
             skinned = true;
             ++pal_bufs;
@@ -1082,7 +1108,13 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 ++g.vs_ring_seen;
                 g.ring_seen_cur[id.key] = 1;
                 const u64 ikey = Mix(Mix(id.key, id.slot_offset), size);
-                if (have_cur) g.vel_id_cur[ikey] = cur;
+                if (have_cur) {
+                    if (blend) {
+                        g.vel_id_cur.try_emplace(ikey, cur); // bb-fog-mv: opaque draws' copy wins
+                    } else {
+                        g.vel_id_cur[ikey] = cur;
+                    }
+                }
                 if (const auto it = g.vel_id_prev.find(ikey);
                     it != g.vel_id_prev.end() && it->second.addr != 0) {
                     found = &it->second;
@@ -1235,10 +1267,10 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 } else if (why == 0) {
                     why = 4;
                 }
-                ++g.vs_why[why];
+                if (!blend) ++g.vs_why[why];
                 ++pal_failed;
                 if (!g.skin_order) {
-                    ++g.vs_no_pal;
+                    if (!blend) ++g.vs_no_pal;
                     ok = false;
                     break;
                 }
@@ -1257,8 +1289,10 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             // current data (use 0) instead of the whole draw losing its vector.
             ++g.vs_pal_partial;
         } else {
-            ++g.vs_no_pal;
-            ++g.w30.no_pal;
+            if (!blend) {
+                ++g.vs_no_pal;
+                ++g.w30.no_pal;
+            }
             ok = false;
         }
     }
@@ -1750,6 +1784,7 @@ void OnFlip() {
     g.vel_addr_cur.clear();
     g.vel_id_cur.clear();
     g.cam_ord.clear();
+    g.cam_ord_blend.clear();
     g.cam_checked.clear();
     g.cam_cpu_cur.clear();
     g.pal_cpu_cur.clear();
