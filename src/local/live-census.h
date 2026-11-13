@@ -33,7 +33,12 @@ enum Kind : uint32_t {
 	Kinds         = 16
 };
 
-// Always on, render thread only: cycles and calls per kind since start (the slow-frame lines print the
+// (ds-native-lean) Collected only for a run that prints them or can ask for them: the SLOW Frame lines
+// (KYTY_HITCH_LOG_MS / KYTY_SLOW_LOG_MS > 0) or a live session (KYTY_LIVE_FILE); set once by LiveControl::Start before
+// the render thread's first scope (LiveCensus::Scope and DrawPhases: two TSC reads and a few adds each, every draw and
+// dispatch). The waits (WaitScope) stay always on: the [fps] line and the black box read them.
+inline bool g_collect = true;
+// Render thread only: cycles and calls per kind since start (the slow-frame lines print the
 // frame's share: where a busy frame went, without a live session).
 inline uint64_t g_kind_cycles[Kinds] {};
 inline uint64_t g_kind_calls[Kinds] {};
@@ -85,7 +90,7 @@ inline void Add(uint32_t kind, uint64_t a, uint64_t b, uint64_t cycles) {
 
 class Scope {
 public:
-	Scope(uint32_t kind, uint64_t a, uint64_t b = 0): m_on(g_render) {
+	Scope(uint32_t kind, uint64_t a, uint64_t b = 0): m_on(g_render && g_collect) {
 		if (m_on) {
 			m_kind  = kind;
 			m_a     = a;
@@ -171,7 +176,7 @@ inline void MarkDrawPhase(uint32_t next) {
 }
 class DrawPhases {
 public:
-	explicit DrawPhases(uint64_t shader): m_on(g_render && !g_draw_phases) {
+	explicit DrawPhases(uint64_t shader): m_on(g_render && g_collect && !g_draw_phases) {
 		if (m_on) {
 			g_draw_phases      = true;
 			g_draw_shader      = shader;

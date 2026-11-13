@@ -1171,7 +1171,11 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Set("KYTY_STATUS_HUD_SECONDS", "6"); // (ds-pc-port37) as the emulator launcher's: shown 6 s, the work goes on behind
 	env.Default("KYTY_SHADER_WARMUP_SECONDS", "60");
 	env.Default("KYTY_TABLE_STORE_BUDGET", "8");
-	env.Default("KYTY_HITCH_LOG_MS", "40");
+	// (ds-native-lean) The run log as a native game's: no SLOW lines (a line per frame over 25 ms, 3700 in a 3-minute log,
+	// and a clock read around every instrumented call), the [fps] line once in 10 s (local/lean-log.h). The metrics
+	// panel reads its numbers from memory. [Avanzado] extra KYTY_HITCH_LOG_MS=40;KYTY_LOG_VERBOSE=1: the old log.
+	env.Set("KYTY_HITCH_LOG_MS", "0");
+	env.Default("KYTY_LOG_PERIOD", "10"); // (the rate lines: [fps], [fsr3] / [dlssg] / [fsr3-mfg], FG particle native)
 	if (s.aspect_fit) env.Set("KYTY_PRESENT_ASPECT", "fit");
 	env.Default("KYTY_ASYNC_DRAW_PIPELINES", "1");
 	// (ds-pc-port47) "Debe funcionar exactamente como en el launcher": every shader default as the emulator's (de604751

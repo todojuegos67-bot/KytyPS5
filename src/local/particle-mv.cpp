@@ -16,6 +16,7 @@
 // Every 10 s "FG particle MV:" stats (particle px, matched px, mean |d|, composed px, GPU ms).
 #include "local/particle-mv.h"
 
+#include "local/lean-log.h"
 #include "local/local-pass-cache.h"
 #include "local/smoke.h" // RtParticlesPreCopy
 
@@ -429,6 +430,9 @@ void NativeLog(GraphicContext& graphics) {
 	g_pn.hits_down += d[8], g_pn.hits_up += d[9];
 	// Which way the screen's y runs: the side whose particle centres land on covered pixels (decided after a few hundred).
 	if (g_pn.hits_down + g_pn.hits_up > 200) g_pn.y_down = g_pn.hits_down >= g_pn.hits_up;
+	// (ds-native-lean) Worked out every second as before (the y direction above), printed once a LeanLog::Period().
+	static LeanLog::Every line;
+	if (line.Due()) {
 	std::printf("FG particle native: %llu frames, %llu particle draws (%llu with native vectors, %llu skipped); particles %u, with a "
 	            "vector %u, recycled slots discarded %u; particle px with a native vector %.1f %% (%u of %u half-res px); y %s "
 	            "(%llu / %llu); GPU %.3f ms (max %.3f)\n",
@@ -446,6 +450,7 @@ void NativeLog(GraphicContext& graphics) {
 	            static_cast<unsigned long long>(g_pn.draws_native - std::min(g_pn.draws_native, g_pn.prev_other + g_pn.prev_none)),
 	            static_cast<unsigned long long>(g_pn.prev_other), static_cast<unsigned long long>(g_pn.prev_none), d[12], d[13]);
 	std::fflush(stdout);
+	}
 	g_pm.sum_ms = 0.0, g_pm.max_ms = 0.0, g_pm.samples = 0;
 	g_pn.why[0] = g_pn.why[1] = g_pn.why[2] = g_pn.why[3] = 0;
 	g_pn.prev_other = g_pn.prev_none = 0;

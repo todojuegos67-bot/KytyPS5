@@ -1,4 +1,5 @@
 #include "local/port-live.h"
+#include "local/lean-log.h"
 #include "frame-gen.h"
 #include "kbm-warp.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -1727,7 +1728,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 				const double want = 0.98 * mean + 0.75 * sd;
 				const double prev = g_pace_adapt.load();
 				g_pace_adapt      = prev <= 0.0 ? want : 0.7 * prev + 0.3 * want;
-				std::printf("[dlssg] present interval sd %.2f ms (mean %.2f, %.0f frames); pacer %.2f ms (%s)\n", sd * 1e3, mean * 1e3,
+				if (LeanLog::Verbose()) std::printf("[dlssg] present interval sd %.2f ms (mean %.2f, %.0f frames); pacer %.2f ms (%s)\n", sd * 1e3, mean * 1e3,
 				            g_pace_n, RealFrameInterval() * 1e3,
 				            DlssgPaceMode() == 0 ? "adaptive" : DlssgPaceMode() == 1 ? "grid" : DlssgPaceMode() == 2 ? "reflex" : "reflexfree");
 			} else {
@@ -1767,9 +1768,14 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 					std::printf("[dyn] x%d (from x%d): real %.1f fps, shown %.1f (target %.0f), free %.1f\n", g_dyn_gen + 1, from_m,
 					            real, std::min(real * from_m, T), T, g_dyn_dm.last_free);
 				}
-				std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
+				if (LeanLog::Verbose()) std::printf("[dlssg] dynamic x%d; real %.1f fps (smoothed %.1f), shown %.1f, target %.0f\n", g_dyn_gen + 1, real,
 				            g_dyn_real_fps, real * (g_dyn_gen + 1), static_cast<double>(g_dlssg_target_fps));
 			}
+			// (ds-native-lean) In memory each second (the metrics panel, the F8 HUD), in the log once a LeanLog::Period().
+			LeanLog::PublishFg(g_stat_real / window, g_stat_real / window * static_cast<double>(PresentedFrames()),
+			                   static_cast<int>(PresentedFrames()));
+			static LeanLog::Every line;
+			if (line.Due())
 			std::printf("[dlssg] %s x%u; real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f); "
 			            "acquire %.2f (max %.1f), record+submit %.2f (max %.1f), gpu wait %.2f (max %.1f), before %.2f (max %.1f), flip present %.2f (max %.1f)\n",
 			            g_dlssg_dynamic ? "dynamic" : "fixed", PresentedFrames(),
@@ -4276,8 +4282,10 @@ void SharpenProbeTick() {
 
 bool SharpenProbeDue() {
 	static const bool on = [] {
+		// (ds-native-lean) Off unless KYTY_SHARPEN_PROBE=1: every 30 s a GPU copy behind two all-commands barriers and a
+		// 256 KiB host-visible buffer, for a log line.
 		const char* v = std::getenv("KYTY_SHARPEN_PROBE");
-		return !(v != nullptr && v[0] == '0');
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
 	}();
 	const uint64_t frame = g_sp.frame;
 	return on && !g_sp.failed && (g_sp.pending == 0 || g_sp.pending == frame) && frame >= 1800 && frame % 1800 == 0 &&

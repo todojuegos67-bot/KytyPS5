@@ -219,7 +219,7 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
                 vk::AccessFlags2 access, vk::PipelineStageFlags2 stage);
 
-// The sharpening's measured effect (KYTY_SHARPEN_PROBE=0: none): on the PS5 Pro path, at frame 1800 and every 1800
+// The sharpening's measured effect (KYTY_SHARPEN_PROBE=1; off by default since ds-native-lean): on the PS5 Pro path, at frame 1800 and every 1800
 // after, the central 128x128 of the image the sharpening reads (slot 0) and writes (slot 1) copied to the host and
 // logged some frames later as "sharpening <upscaler>: strength X, detail before A after B (+P%)", the detail the mean
 // |laplacian| of the tonemapped luma (x1000). SharpenProbeDue: this upscale's frame is one; SharpenProbeCopy: `image`

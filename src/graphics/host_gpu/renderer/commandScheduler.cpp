@@ -121,6 +121,15 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	return m_buffers[*found];
 }
 
+static bool TickMonitorWanted() {
+	static const bool wanted = [] {
+		const char* forced = std::getenv("KYTY_TICK_MONITOR");
+		if (forced != nullptr && *forced != '\0') return *forced != '0';
+		return std::getenv("KYTY_LIVE_FILE") != nullptr;
+	}();
+	return wanted;
+}
+
 bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
@@ -129,7 +138,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this), m_prologue(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
-      m_tick_monitor([this](std::stop_token stop) {
+      // (ds-native-lean) The live trace's GPU tick monitor (and its two timestamp query pools) only for a run that can
+      // trace (KYTY_LIVE_FILE, or KYTY_TICK_MONITOR=1): otherwise a thread that woke every 5 ms for nothing.
+      m_tick_monitor(!TickMonitorWanted() ? std::jthread {} : std::jthread([this](std::stop_token stop) {
 	      LocalPlatform::SetThreadName("Kyty.TickMon");
 	      {
 		      vk::QueryPoolCreateInfo info {};
@@ -194,7 +205,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 			      ++next;
 		      }
 	      }
-      }) {}
+      })) {}
 
 void CommandScheduler::CompleteDispatch() {
 	// Expose command-processor/GPU overlap without a host fence. Bound the

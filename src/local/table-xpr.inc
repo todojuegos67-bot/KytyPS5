@@ -2685,6 +2685,8 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			const auto& plan = program->table_plan;
 			return static_cast<size_t>(std::ranges::count(cpu ? plan.cpu : plan.gpu, uint8_t {1}));
 		};
+		// (ds-native-lean) One line per table program pair only with KYTY_LOG_VERBOSE=1 (1405 in a 3-minute log).
+		if (LeanLog::Verbose())
 		std::printf("Table: VS 0x%llx (0x%016llx) PS 0x%llx (0x%016llx): reads %zu+%zu slots (evaluates %zu+%zu), "
 		            "buffers %zu+%zu, images %zu, samplers %zu\n",
 		            static_cast<unsigned long long>(pair->vs), static_cast<unsigned long long>(vertex->shader_hash),
@@ -2919,6 +2921,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			pair.programs[0] = program;
 			TableRuns(pair);
 		}
+		if (LeanLog::Verbose()) // (ds-native-lean: as the VS/PS pairs' line)
 		std::printf("Table: CS 0x%llx (0x%016llx): reads %zu slots (evaluates %zu), buffers %zu (written %zu), "
 		            "images %zu, samplers %zu\n",
 		            static_cast<unsigned long long>(pair.vs), static_cast<unsigned long long>(program->shader_hash),

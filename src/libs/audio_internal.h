@@ -43,8 +43,10 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking 
 // AudioOut2 ports and objects, the AudioOut devices), each with its peak level, to find where a sound is lost.
 inline bool StatsWanted() {
 	static const bool wanted = [] {
+		// (ds-native-lean) Off unless KYTY_AUDIO_STATS=1: 3700 lines in a 3-minute log, a peak scan of every block
+		// and a lock on every output.
 		const char* value = std::getenv("KYTY_AUDIO_STATS");
-		return value == nullptr || *value != '0';
+		return value != nullptr && *value != '\0' && *value != '0';
 	}();
 	return wanted;
 }

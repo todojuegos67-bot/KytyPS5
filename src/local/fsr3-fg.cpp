@@ -17,6 +17,8 @@
 #include <thread>
 #include <vector>
 
+#include "local/lean-log.h"
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -244,6 +246,8 @@ void MfgUpdate(uint32_t frames, double window, double shown) {
 			            next, from, real, std::min(real * from, T), T, g_mfg.dm.last_free, 1e6 * next / T, next);
 		}
 	}
+	static LeanLog::Every line; // (ds-native-lean: once a LeanLog::Period(); a change of x is its [dyn] line)
+	if (!line.Due()) return;
 	std::printf("[fsr3-mfg] x%d%s; real %.1f fps (free %.1f), shown %.1f fps\n", g_mfg.current, g_mfg.dynamic ? " dynamic" : "",
 	            real, free, shown);
 	if (g_mfg.dynamic) std::printf("[fsr3-mfg] target %.0f, real limit %.1f\n", g_mfg.target, g_mfg.target / g_mfg.current);
@@ -1371,7 +1375,10 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 		        ? g_functions.pOutGetLastPresentCountFFXAPI(static_cast<VkSwapchainKHR>(swapchain))
 		        : 0;
 		const uint64_t shown = presents >= g_stats.presents_at_start ? presents - g_stats.presents_at_start : 0;
-		std::printf("[fsr3] real %.1f fps, shown %.1f fps; generation on %u of %u frames (no TAA %u, movie %u); "
+		// (ds-native-lean) In memory each second (the metrics panel, the F8 HUD), in the log once a LeanLog::Period().
+		LeanLog::PublishFg(g_stats.real / window, static_cast<double>(shown) / window, g_mfg.on ? g_mfg.current : 0);
+		static LeanLog::Every line;
+		if (line.Due()) std::printf("[fsr3] real %.1f fps, shown %.1f fps; generation on %u of %u frames (no TAA %u, movie %u); "
 		            "prepare %.2f ms, present call %.2f ms (max %.1f)\n",
 		            g_stats.real / window, static_cast<double>(shown) / window, g_stats.generated_on, g_stats.real,
 		            g_stats.no_inputs, g_stats.movie, g_stats.real != 0 ? g_stats.prepare_ms / g_stats.real : 0.0,
