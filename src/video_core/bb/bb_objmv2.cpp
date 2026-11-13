@@ -1253,7 +1253,10 @@ bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y) {
     if (!g.ready || !g.image || !g.view || g.width == 0 || g.height == 0 || g.last_render.width == 0) {
         return false;
     }
-    view = g.view;
+    // (11-13) the player mask: .a of this frame's stored colour (bb_objmv2.comp), not the class
+    // (class 1 held the scenery in the centre too: it came from the real frame and flickered).
+    if (!g.prev_valid || !g.prev_view[g.pp]) return false;
+    view = g.prev_view[g.pp];
     scale_x = float(g.last_render.width) / float(g.width);
     scale_y = float(g.last_render.height) / float(g.height);
     return true;

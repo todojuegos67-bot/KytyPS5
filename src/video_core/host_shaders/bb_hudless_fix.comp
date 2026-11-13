@@ -40,8 +40,8 @@ void main() {
         // so FSR 3 takes those pixels from the real frame (as UI).
         const bool centre = abs(uv.x - 0.5) < 0.16 && uv.y > 0.22 && uv.y < 0.97;
         if (centre) {
-            const float cls = textureLod(obj_tex, uv * p.obj.xy, 0.0).z;
-            if (cls > 0.5 && cls < 1.5) {
+            const float m = textureLod(obj_tex, uv * p.obj.xy, 0.0).a;
+            if (m > 0.5) {
                 imageStore(target, c, vec4(0.0));
                 return;
             }

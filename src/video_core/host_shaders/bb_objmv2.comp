@@ -87,6 +87,7 @@ void main() {
         // Normal frame: replace the camera vector on object pixels, nothing else.
         if (!inside || p.size.z == 0u) return;
         const vec4 o = texelFetch(obj_mv, c, 0);
+        bool player = false;
         if ((o.z > 0.5 && o.z < 1.5) || o.z > 2.5) {
             if (!any(isnan(o.xy)) && !any(isinf(o.xy))) {
                 const vec2 camv = imageLoad(mv_out, c).xy;
@@ -96,13 +97,15 @@ void main() {
                 // scenery in the centre took refined vectors and deformed).
                 if ((flags & 16u) != 0u && o.z < 1.5 && PlayerPixel(c, vec2(p.size.xy)) &&
                     length(v - camv) > 0.75) {
+                    player = true;
                     v = Refine(c, v, additive);
                 }
                 imageStore(mv_out, c, vec4(v, 0.0, 0.0));
             }
         }
         if ((flags & 4u) != 0u) {
-            imageStore(next_prev_color, c, texelFetch(cur_color, c, 0));
+            // .a: the player mask (BB_FSR3_PLAYER_REAL reads it: the player from the real frame)
+            imageStore(next_prev_color, c, vec4(texelFetch(cur_color, c, 0).rgb, player ? 1.0 : 0.0));
         }
         return;
     }
@@ -145,7 +148,9 @@ void main() {
             }
         }
         if ((flags & 4u) != 0u) {
-            imageStore(next_prev_color, c, texelFetch(cur_color, c, 0)); // bb-player-mv: every frame
+            const bool pl = finite && o.z > 0.5 && o.z < 1.5 && PlayerPixel(c, vec2(p.size.xy)) &&
+                            length((additive ? o.xy + cam : o.xy) - cam) > 0.75;
+            imageStore(next_prev_color, c, vec4(texelFetch(cur_color, c, 0).rgb, pl ? 1.0 : 0.0));
         }
     }
     barrier();
