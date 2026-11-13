@@ -110,7 +110,7 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void                   SetFlexibleMemorySize(uint64_t size);
-// Demon's Souls allocator clamp (loader/demonsSoulsAllocClamp.cpp, KYTY_DS_ALLOC_PATCH=1), set at load before guest
+// Demon's Souls allocator clamp (loader/demonsSoulsAllocClamp.cpp, KYTY_DS_ALLOC_PATCH (on; =0 off)), set at load before guest
 // code runs: sceKernelAvailableDirectMemorySize answered to the guest call that returns to `return_address` gives at
 // most `limit` bytes; the direct-memory calls returning into [trace_begin, trace_end) are printed (what the game's
 // allocator start-up then takes). `image_base` only for the printed eboot+offset.

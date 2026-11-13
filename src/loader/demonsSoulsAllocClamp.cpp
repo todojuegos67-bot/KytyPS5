@@ -44,7 +44,7 @@ namespace {
 // The allocator's on-demand budget (physicalMemoryToKeepUnmapped = min(allocatorMem, 0x300000000)).
 constexpr uint64_t AllocatorBudget = 0x300000000ull;
 // The answer: 12 GiB + 0x270000. mMemorySystemOverhead for it, roundup64K(((((size >> 16) + 63) >> 2) & ~0xF) + 0x26f437)
-// = roundup64K(0xc010 + 0x26f437) = 0x280000, so allocatorMem = 0x300270000 - 0x280000 = 12 GiB - 64 KiB: below the
+// = roundup64K(0xc010 + 0x26f437) = 0x280000, so allocatorMem = 0x300270000 - 0x280000 = 12 GiB: below the
 // budget whether the engine tests "> 12 GiB" or ">= 12 GiB" (exactly 12 GiB with ">=" would ask for a 0-byte block).
 constexpr uint64_t Limit = AllocatorBudget + 0x270000;
 // Where 01.007.000 has the call (static notes); only printed, the shape above decides.
@@ -162,7 +162,7 @@ std::vector<uint64_t> Between(const std::vector<uint64_t>& calls, uint64_t begin
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
 	const char* v = std::getenv("KYTY_DS_ALLOC_PATCH");
-	if (v == nullptr || v[0] == '\0' || v[0] == '0') return;
+	if (v != nullptr && v[0] == '0') return; // (11-13) on by default (retail base PS5 gives the game 12 GiB too); =0 turns it off
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
 	const auto base     = program->base_vaddr;
@@ -215,7 +215,7 @@ void Install(Program* program) {
 	Libs::LibKernel::Memory::SetAvailableDirectClamp(site + 5, Limit, site - ShapeBefore, allocs[2] + 6, base);
 	std::printf("[port] ds-alloc: allocator clamp applied: the call at eboot+0x%llx is told at most 0x%llx (12 GiB + 2.4 MiB) "
 	            "of available direct memory; expected next: no AllocateDirect/MapDirect from eboot+0x%llx/0x%llx (the "
-	            "block above 12 GiB), an AllocateDirect of 12 GiB - 64 KiB (0x2ffff0000) from eboot+0x%llx\n",
+	            "block above 12 GiB), an AllocateDirect of 12 GiB (0x300000000) from eboot+0x%llx\n",
 	            static_cast<unsigned long long>(site - base), static_cast<unsigned long long>(Limit),
 	            static_cast<unsigned long long>(allocs[1] + 5 - base), static_cast<unsigned long long>(maps[1] + 5 - base),
 	            static_cast<unsigned long long>(allocs[2] + 5 - base));
