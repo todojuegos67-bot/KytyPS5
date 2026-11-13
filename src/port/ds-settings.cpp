@@ -1190,6 +1190,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// release passes). The RAM budget and the RAM guard's release passes are off; memory stays where the game put it.
 	env.Default("KYTY_RAM_BUDGET_MB", "0");
 	env.Default("KYTY_RAM_GUARD", "0");
+	// (11-13) The low-RAM profile turns itself on with 20 GiB or less and would enable runtime releases (soft release,
+	// RAM diet): off, nothing is freed or moved while playing.
+	env.Default("KYTY_SOFT_RELEASE", "0");
+	env.Default("KYTY_RAM_DIET", "0");
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");
