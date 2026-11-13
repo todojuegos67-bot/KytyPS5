@@ -18,13 +18,15 @@
 // already validated skips the normal draw path; here, on GT7's path, two of its steps are taken
 // from tables while what they read is proven unchanged:
 //
-// - programs (PipelineCache::GetGraphicsPrograms: describe, the programs' lookups, permutations):
-//   a table keyed by the draw's registers (the shader registers, the context, the user config,
-//   the export mapping), valid while the program cache made no permutation and the shader map
-//   registered nothing since, and while the bytes every stage's descriptor walk read hold, checked
-//   through the KYTY_MT_PROG GPU-write seal of 36f7cc513 (ReadSet::ValidateFast) as the draw-prep
-//   results are. Only a draw whose every stage was served by the draw-prep scanner (so has a read
-//   set) is stored, and only when its key comes a second time.
+// - programs (PipelineCache::GetGraphicsPrograms: the programs' lookups, permutations): a table
+//   keyed by the draw's registers without the user SGPR values (the shader registers, the
+//   context, the user config, the export mapping), valid while the program cache made no
+//   permutation and the shader map registered nothing since. A hit still describes the draw (its
+//   user data and vertex tables, so vertex shaders that read vertex tables are kept), requires the
+//   code, user data count and static input key of every stage to be the entry's, and takes each
+//   stage's refresh from the draw-prep scanner (TakeScanned: this draw's user data, the read set
+//   validated through the KYTY_MT_PROG seal) with the specialization of the entry's permutation.
+//   Stored the second time its key comes.
 // - bindings (tableBindings.h): per stage slot, the PreparedBindings of the slot's last draw are
 //   used again (no PrepareBindings, RebindImages, FindBuffers nor RebindBuffers; the stage's SRT
 //   and shader data are uploaded again) when the draw's programs came from the table and the
@@ -66,9 +68,10 @@ enum class Counter : uint32_t {
 	ProgramMisses,
 	ProgramMissNew,       // key not in the table (or another key in its slot)
 	ProgramMissStale,     // a permutation or a shader registration since it was stored
-	ProgramMissReads,     // a stage's recorded bytes changed (or are no longer clean)
-	ProgramNotStored,     // a stage walked on the GPU thread (no read set), or vertex tables
-	ProgramFetchTables,   // ... of those: a vertex stage that reads vertex tables in describe
+	ProgramMissInputs,    // describe gave other code, user data count or static input state
+	ProgramMissReads,     // a stage's refresh was not the scanner's, or another specialization
+	ProgramNotStored,     // a stage built, walked here, or without a specialization hash
+	ProgramFetchTables,   // hits whose vertex stage reads vertex tables (described again)
 	ProgramStored,
 	ProgramVerifyChecks,
 	ProgramVerifyMismatches,
@@ -189,15 +192,15 @@ inline void LogIfDue() {
 	const auto all_draws = dh_draws + dm_draws;
 	const auto all_us    = us_per(dh_cycles + dm_cycles, all_draws);
 	LOGF_UNMUTED("Table (%.0f s): hits %llu / misses %llu / %.2f us per draw (programs+targets; hit "
-	     "%.2f, miss %.2f) | programs: misses new %llu, stale %llu, reads %llu, not stored %llu "
-	     "(vertex tables %llu), stored %llu | targets: hits %llu / misses %llu | verify: programs "
+	     "%.2f, miss %.2f) | programs: misses new %llu, stale %llu, inputs %llu, refresh %llu, "
+	     "not stored %llu, stored %llu, hits with vertex tables %llu | targets: hits %llu / misses %llu | verify: programs "
 	     "%llu checks, %llu mismatches; targets %llu checks, %llu mismatches | bindings: hits %llu / "
 	     "misses %llu (program %llu, key %llu, stale %llu, not stored %llu), verify %llu checks, "
 	     "%llu mismatches\n",
 	     seconds, c(Counter::ProgramHits), c(Counter::ProgramMisses), all_us,
 	     us_per(dh_cycles, dh_draws), us_per(dm_cycles, dm_draws), c(Counter::ProgramMissNew),
-	     c(Counter::ProgramMissStale), c(Counter::ProgramMissReads), c(Counter::ProgramNotStored),
-	     c(Counter::ProgramFetchTables), c(Counter::ProgramStored), c(Counter::TargetHits),
+	     c(Counter::ProgramMissStale), c(Counter::ProgramMissInputs), c(Counter::ProgramMissReads),
+	     c(Counter::ProgramNotStored), c(Counter::ProgramStored), c(Counter::ProgramFetchTables), c(Counter::TargetHits),
 	     c(Counter::TargetMisses), c(Counter::ProgramVerifyChecks),
 	     c(Counter::ProgramVerifyMismatches), c(Counter::TargetVerifyChecks),
 	     c(Counter::TargetVerifyMismatches), c(Counter::BindingHits), c(Counter::BindingMisses),
