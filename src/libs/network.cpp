@@ -1889,6 +1889,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 		optname = SO_ERROR;
 	}
 	SocketLength len = static_cast<SocketLength>(*optlen);
+	GuestLazyCommit::Prefault(optval, len > 0 ? static_cast<uint64_t>(len) : 0); // (the system may write it: KYTY_GUEST_LAZY_COMMIT)
 	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(optval),
 	                 &len) != 0) {
 		return SetHostSocketError();
@@ -1935,6 +1936,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 	optname = TCP_NODELAY;
 #endif
 
+	GuestLazyCommit::Prefault(optval, optlen); // (the system may read it: KYTY_GUEST_LAZY_COMMIT)
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,
 	                 static_cast<const char*>(optval), static_cast<SocketLength>(optlen)) != 0) {
 		return SetHostSocketError();

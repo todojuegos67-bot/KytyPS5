@@ -132,6 +132,11 @@ bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t
 const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);
 // The end of the backing mapping `vaddr` is in (0: none): a range up to it has one backing pointer.
 uint64_t               BackingMappingEnd(uint64_t vaddr);
+// KYTY_GUEST_LAZY_COMMIT (local/guest-lazy-commit.h): the never-touched pages of [address, address + size) committed,
+// each with the protection it would have had committed at map, before the system itself reads or writes them (a
+// kernel-mode access to a reserved page fails instead of faulting) or a thread uses them as its stack. Nothing when it
+// is off or the range is committed already. False: a commit refused.
+bool                   PrefaultGuestRange(const void* address, uint64_t size);
 // Windows: the pages of a guest range taken out of the working set later, by Kyty.Trim's thread (as parked ranges: no map
 // or unmap runs in their page-table pages meanwhile). A page touched again faults back in.
 void                   TrimGuestRange(uint64_t vaddr, uint64_t size);

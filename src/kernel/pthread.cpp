@@ -948,6 +948,9 @@ static int CreateGuestStack(PthreadAttr attr) {
 	}
 
 	if (attr->stack_addr != nullptr) {
+		// A stack of the game's own memory (KYTY_GUEST_LAZY_COMMIT): committed now. A fault on a never-touched stack page
+		// could not be handled - the system writes the exception's frame on that stack - and would end the process.
+		(void)Memory::PrefaultGuestRange(attr->stack_addr, attr->stack_size);
 		attr->guard_size     = 0;
 		attr->stack_user     = true;
 		attr->stack_map_addr = 0;

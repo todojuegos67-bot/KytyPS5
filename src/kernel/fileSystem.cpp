@@ -799,6 +799,8 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 	if (d == 1 || d == 2) {
 		auto*      out      = (d == 1 ? stdout : stderr);
+		// (The C runtime may hand the guest buffer to WriteFile itself: KYTY_GUEST_LAZY_COMMIT.)
+		(void)Memory::PrefaultGuestRange(buf, nbytes);
 		const auto written  = std::fwrite(buf, 1, nbytes, out);
 		const auto flush_ok = std::fflush(out) == 0;
 

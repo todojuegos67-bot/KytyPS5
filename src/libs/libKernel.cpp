@@ -2670,6 +2670,9 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 		fiber->context_start = addr_context;
 		fiber->context_end =
 		    (addr_context != nullptr ? static_cast<uint8_t*>(addr_context) + size_context : nullptr);
+		// (The game's memory as the stack, KYTY_GUEST_LAZY_COMMIT: committed now - a fault on a never-touched stack page
+		// cannot be handled, the system writes the exception's frame there.)
+		if (addr_context != nullptr) (void)LibKernel::Memory::PrefaultGuestRange(addr_context, size_context);
 	}
 	std::memset(&fiber->saved_context, 0, sizeof(fiber->saved_context));
 	FiberSetContextValid(fiber, false);
