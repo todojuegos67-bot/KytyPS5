@@ -81,8 +81,16 @@ inline std::atomic<uint32_t> g_render_tid {0};
 // Render-thread stack bounds for the frame-pointer walk.
 inline uint64_t             g_stack_low = 0, g_stack_high = 0;
 constexpr size_t             SampleWords = 16;
-inline uint64_t              g_samples[1u << 23];
-inline uint64_t              g_sample_tsc[(1u << 23) / SampleWords]; // Windows: each sample's TSC
+constexpr size_t             SampleSlots = size_t {1} << 23u; // words of g_samples
+// The samples (64 MiB) and their TSCs (4 MiB): allocated by the first prof (EnsureSamples) and kept, not static arrays:
+// static ones were 68 MiB of the executable's writable image, charged to commit in every session that never profiles.
+inline uint64_t*             g_samples    = nullptr;
+inline uint64_t*             g_sample_tsc = nullptr; // Windows: each sample's TSC (SampleSlots / SampleWords)
+inline bool                  EnsureSamples() {
+	if (g_samples == nullptr) g_samples = static_cast<uint64_t*>(std::calloc(SampleSlots, sizeof(uint64_t)));
+	if (g_sample_tsc == nullptr) g_sample_tsc = static_cast<uint64_t*>(std::calloc(SampleSlots / SampleWords, sizeof(uint64_t)));
+	return g_samples != nullptr && g_sample_tsc != nullptr;
+}
 inline std::atomic<uint32_t> g_sample_count {0};
 inline std::atomic_bool      g_process {false};
 
@@ -286,7 +294,7 @@ inline void ProfSignal(int /*signal*/, siginfo_t* /*info*/, void* context) {
 	const auto  pc  = static_cast<uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
 	const auto  rsp = static_cast<uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
 	const auto  idx = g_sample_count.fetch_add(1, std::memory_order_relaxed);
-	if (SampleWords * (size_t(idx) + 1) <= std::size(g_samples)) {
+	if (g_samples != nullptr && SampleWords * (size_t(idx) + 1) <= SampleSlots) {
 		auto* record = g_samples + SampleWords * size_t(idx);
 		record[0]    = pc;
 		if (g_process.load(std::memory_order_relaxed)) {
@@ -334,6 +342,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 		event.sigev_notify   = SIGEV_THREAD_ID;
 		event._sigev_un._tid = g_render_tid.load();
 	}
+	if (!EnsureSamples()) return;
 	timer_t timer {};
 	if (timer_create(clock, &event, &timer) != 0) return;
 	g_sample_count.store(0);
@@ -344,7 +353,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 	std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
 	timer_delete(timer);
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
-	const auto count = std::min<uint32_t>(g_sample_count.load(), std::size(g_samples) / SampleWords);
+	const auto count = std::min<uint32_t>(g_sample_count.load(), SampleSlots / SampleWords);
 	if (auto* out = std::fopen(path, "wb")) {
 		std::fwrite(g_samples, sizeof(uint64_t), SampleWords * size_t(count), out);
 		std::fclose(out);
@@ -371,6 +380,10 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 		std::printf("LIVE_ERROR id=%" PRIu64 " line=profp (not supported on Windows)\n", id);
 		return;
 	}
+	if (!EnsureSamples()) {
+		std::printf("LIVE_ERROR id=%" PRIu64 " line=prof (no memory for the samples)\n", id);
+		return;
+	}
 	uint64_t thread = g_render_thread, stack_low = g_stack_low, stack_high = g_stack_high;
 	if (tid != 0) {
 		thread    = LocalPlatform::OpenThreadForSampling(tid);
@@ -395,7 +408,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 	auto       next   = begin;
 	while (next < end) {
 		const auto idx = g_sample_count.load(std::memory_order_relaxed);
-		if (SampleWords * (size_t(idx) + 1) > std::size(g_samples)) break;
+		if (SampleWords * (size_t(idx) + 1) > SampleSlots) break;
 		if (LocalPlatform::SampleThread(thread, stack_low, stack_high, g_samples + SampleWords * size_t(idx),
 		                                SampleWords)) {
 			g_sample_tsc[idx] = __rdtsc();
@@ -407,7 +420,7 @@ inline void Profile(uint64_t id, double seconds, const char* path, bool process,
 	const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
 	const double tsc_hz  = static_cast<double>(__rdtsc() - tsc0) / elapsed;
 	if (tid != 0) LocalPlatform::CloseThreadForSampling(thread);
-	const auto count = std::min<uint32_t>(g_sample_count.load(), std::size(g_samples) / SampleWords);
+	const auto count = std::min<uint32_t>(g_sample_count.load(), SampleSlots / SampleWords);
 	if (auto* out = std::fopen(path, "wb")) {
 		std::fwrite(g_samples, sizeof(uint64_t), SampleWords * size_t(count), out);
 		std::fclose(out);
@@ -538,6 +551,7 @@ inline void Run(uint64_t id, const std::string& line) {
 		LiveTrace::g_marks_on.store(cmd == "tracem");
 		const auto tsc0   = __rdtsc();
 		const auto clock0 = std::chrono::steady_clock::now();
+		if (!LiveTrace::EnsureRecords()) std::printf("LIVE_ERROR id=%" PRIu64 " line=trace (no memory for the records)\n", id);
 		LiveTrace::g_on.store(true);
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
 		LiveTrace::g_on.store(false);
