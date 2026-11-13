@@ -3240,10 +3240,10 @@ void SetBigPagefile() {
 	    "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false}; "
 	    "$p=Get-CimInstance Win32_PageFileSetting | Where-Object {$_.Name -like 'C:*'}; "
 	    "if(-not $p){$p=New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name='C:\\pagefile.sys'}}; "
-	    "$p | Set-CimInstance -Property @{InitialSize=[uint32]16384;MaximumSize=[uint32]102400}; "
+	    "$p | Set-CimInstance -Property @{InitialSize=[uint32]16384;MaximumSize=[uint32]61440}; "
 	    "Get-CimInstance Win32_PageFileSetting | Format-Table Name,InitialSize,MaximumSize\"\r\n"
 	    "echo.\r\n"
-	    "echo Si arriba sale C:\\pagefile.sys 16384 102400 esta hecho. Reinicia el PC para aplicarlo.\r\n"
+	    "echo Si arriba sale C:\\pagefile.sys 16384 61440 esta hecho. Reinicia el PC para aplicarlo.\r\n"
 	    "pause\r\n";
 	char dir[MAX_PATH] = {};
 	if (GetTempPathA(MAX_PATH, dir) == 0) return;
@@ -3613,8 +3613,8 @@ void LauncherPerformance(Settings& s) {
 	}
 	{
 		const float y = RowY();
-		if (LButton("Archivo de paginación de 100 GB", {g_lbox.at.x + U(12), y}, {U(396), U(32)}, false, g_font_semi, U(15),
-		            "Pone en el disco C: un archivo de paginación de 16 a 100 GB (Windows pedirá permiso de administrador). Evita que el PC se reinicie al quedarse sin memoria en equipos con poca RAM. Solo ocupa espacio cuando hace falta. Reinicia el PC después."))
+		if (LButton("Archivo de paginación de 60 GB", {g_lbox.at.x + U(12), y}, {U(396), U(32)}, false, g_font_semi, U(15),
+		            "Pone en el disco C: un archivo de paginación de 16 a 60 GB (Windows pedirá permiso de administrador). Evita que el PC se reinicie al quedarse sin memoria en equipos con poca RAM. Solo ocupa espacio cuando hace falta. Reinicia el PC después."))
 			SetBigPagefile();
 		RowEnd(y, 36);
 		const uint64_t limit = CommitLimitGb();
