@@ -311,6 +311,11 @@ void UiCut::OnFrameStart() {
         BB::Upscale::Checkpoint("[hud-seq] draws into scene-size RGBA8 targets (UI: after the "
                                 "cut):" + seq);
     }
+    if (!seq_hdr.empty()) {
+        BB::Upscale::Checkpoint("[fx-seq] draws into scene-size non-RGBA8 targets ([format]vs/ps, rs = reads "
+                                "a scene-size image, d = depth test, B = blend):" + seq_hdr);
+    }
+    seq_hdr.clear();
     seq.clear();
     static auto t_seq = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
@@ -342,6 +347,12 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
     const bool seq_on = seq_frame == 1;
     if (seq_on && color && seq.size() < 1800) {
         const auto& im = texture_cache.GetImage(color);
+        if (!Rgba8(im.info.pixel_format) && !ui_phase && seq_hdr.size() < 4000 &&
+            RenderTarget(im.info.size.width, im.info.size.height)) {
+            seq_hdr += fmt::format(" [{}]{:#x}/{:#x}{}{}{}", u32(im.info.pixel_format), vs_hash,
+                                   info.ps_hash, info.samples_scene ? " rs" : "",
+                                   info.depth_test ? " d" : "", info.blend ? " B" : "");
+        }
         if (Rgba8(im.info.pixel_format) && RenderTarget(im.info.size.width, im.info.size.height)) {
             seq += fmt::format(" {}vs{:#x}/ps{:#x}{}{}{}{}", ui_phase ? "UI:" : "", vs_hash,
                                info.ps_hash, info.samples_scene ? " reads-scene" : "",

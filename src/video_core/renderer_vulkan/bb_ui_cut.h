@@ -204,6 +204,7 @@ private:
     u32 num_bad_vs = 0;
     u32 seq_frame = 0;
     std::string seq;
+    std::string seq_hdr; // (11-13) [fx-seq]: draws into scene-size non-RGBA8 targets (effects layer study)
     VideoCore::ImageId ldr_target{}, ui_color{}, ui_depth{};
     OwnImage ui_image, ui_depth_image;
     // Three copies without the HUD: the presenter reads one a frame later than it was cut.
