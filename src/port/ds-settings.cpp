@@ -1174,6 +1174,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// standby list / page file, in quiet windows, a few hundred MiB a second) and runs the release passes when over it.
 	// KYTY_RESIDENT_MB is a minimum, not a cap: with 64 GB and no pressure nothing held the 15.7 GB working set down.
 	env.Default("KYTY_RAM_BUDGET_MB", "8192");
+	// (11-13) Measurement run for the native memory layout: check that file-loaded pages still match the file.
+	env.Default("KYTY_PROVENANCE_VERIFY", "1");
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");
