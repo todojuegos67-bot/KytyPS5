@@ -27,6 +27,9 @@
 #include <vector>
 
 namespace ReadbackQueue { class Queue; }
+namespace GpuResidency {
+struct Range;
+} // namespace GpuResidency
 
 namespace Libs::Graphics {
 
@@ -63,6 +66,9 @@ public:
 	// page the GPU wrote, those the GPU wrote all of, those with a page the CPU wrote; and their count.
 	void                   GuestUseBreakdown(uint64_t& total, uint64_t& gpu_any, uint64_t& gpu_full, uint64_t& cpu_any,
 	                                         uint64_t& count);
+	// KYTY_GPU_RESIDENCY (gpu-residency.h; the GPU thread): the registered buffers' guest ranges appended to `out`, a
+	// buffer with a page the GPU wrote as GpuWrittenBuffer; their number in `count`.
+	void                   CollectResidencyRanges(std::vector<GpuResidency::Range>& out, uint64_t& count);
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }

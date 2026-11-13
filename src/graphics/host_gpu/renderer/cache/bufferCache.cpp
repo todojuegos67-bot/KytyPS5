@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "gpu-residency.h"
 #include "lane-sync.h"
 #include "slow-log.h"
 
@@ -1771,6 +1772,20 @@ void BufferCache::GuestUseBreakdown(uint64_t& total, uint64_t& gpu_any, uint64_t
 		}
 		if (m_memory_tracker.IsRegionCpuModified(address, size)) cpu_any += size;
 	});
+}
+
+void BufferCache::CollectResidencyRanges(std::vector<GpuResidency::Range>& out, uint64_t& count) {
+	count = 0;
+	for (const auto& entry: m_buffers) {
+		const auto* buffer = m_slot_buffers.try_get(entry.second);
+		if (buffer == nullptr || buffer->is_deleted.load(std::memory_order_relaxed)) continue;
+		const uint64_t address = buffer->CpuAddress(), size = buffer->Size();
+		if (address == 0 || size == 0) continue;
+		const auto kind = m_memory_tracker.IsRegionGpuModified(address, size) ? GpuResidency::GpuWrittenBuffer
+		                                                                      : GpuResidency::GpuBuffer;
+		out.push_back({address, size, kind});
+		count++;
+	}
 }
 
 void BufferCache::PrintSyncState() {

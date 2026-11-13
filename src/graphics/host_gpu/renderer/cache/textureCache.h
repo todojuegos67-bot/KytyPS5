@@ -22,6 +22,10 @@
 #include <mutex>
 #include <vector>
 
+namespace GpuResidency {
+struct Range;
+} // namespace GpuResidency
+
 namespace Libs::Graphics {
 
 struct GraphicContext;
@@ -41,6 +45,9 @@ class TextureCache {
 public:
 	// Every image as a tab-separated row (live "images <path>").
 	void WriteReport(const char* path);
+	// KYTY_GPU_RESIDENCY (gpu-residency.h): the registered images' guest ranges and kinds appended to `out` (under the
+	// lock, briefly), their number in `count`.
+	void CollectResidencyRanges(std::vector<GpuResidency::Range>& out, uint64_t& count);
 
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 

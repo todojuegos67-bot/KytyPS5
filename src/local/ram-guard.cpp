@@ -1,6 +1,7 @@
 #include "ram-guard.h"
 
 #include "fresh-memory.h"
+#include "gpu-residency.h"
 #include "guest-lazy-commit.h"
 #include "local-platform.h"
 #include "mem-guard.h"
@@ -812,3 +813,253 @@ void Start() {
 }
 
 } // namespace RamGuard
+
+namespace GpuResidency {
+
+#if defined(_WIN32)
+namespace {
+
+constexpr uint64_t SampleBits = 16; // one page sampled in each 64 KiB granule of guest address space
+constexpr uint64_t SampleSpan = uint64_t {1} << SampleBits;
+constexpr uint64_t PageSize   = 4096;
+constexpr size_t   MaxSamples = size_t {1} << 21u; // (48 MiB of samples at most; ~13 GiB of ranges is ~220K)
+
+struct Sample {
+	uint64_t page   = 0; // guest address (the game's view)
+	uint64_t alias  = 0; // the same page in the backing store's alias (0: no backing: unmapped)
+	uint32_t weight = 0; // the range's bytes in the sample's 64 KiB granule
+	Kind     kind   = Texture;
+	uint8_t  state  = 0; // StateView | StateAlias | StateWritten | StateKnown
+};
+constexpr uint8_t StateView    = 1; // in the working set through the guest address
+constexpr uint8_t StateAlias   = 2; // in the working set through the alias
+constexpr uint8_t StateWritten = 4; // fresh memory: its 64 KiB granule was ever written (CPU, host or write-back)
+constexpr uint8_t StateKnown   = 8; // fresh memory knows the granule
+
+struct Totals {
+	uint64_t bytes = 0, view_only = 0, alias_only = 0, both = 0, unmapped = 0, resident_unwritten = 0;
+	[[nodiscard]] uint64_t Resident() const { return view_only + alias_only + both; }
+	void Add(const Sample& sample, uint64_t weight) {
+		bytes += weight;
+		const bool view = (sample.state & StateView) != 0, alias = (sample.state & StateAlias) != 0;
+		if (!view && !alias) {
+			if (sample.alias == 0) unmapped += weight; // (no backing under it: nothing to be resident)
+			return;
+		}
+		if (view && alias) both += weight;
+		else if (view) view_only += weight;
+		else alias_only += weight;
+		if ((sample.state & StateKnown) != 0 && (sample.state & StateWritten) == 0) resident_unwritten += weight;
+	}
+};
+
+// The order a granule several kinds share is counted under in the union.
+int UnionRank(Kind kind) {
+	switch (kind) {
+		case Target: return 0;
+		case Storage: return 1;
+		case GpuWrittenBuffer: return 2;
+		case Texture: return 3;
+		case GpuBuffer:
+		default: return 4;
+	}
+}
+
+const char* KindName(Kind kind) {
+	switch (kind) {
+		case Target: return "render targets/depth/video out";
+		case Storage: return "storage/GPU-written images";
+		case GpuWrittenBuffer: return "GPU-written buffers";
+		case GpuBuffer: return "other GPU buffers";
+		case Texture:
+		default: return "sampled textures";
+	}
+}
+
+double ToMiB(uint64_t bytes) {
+	return static_cast<double>(bytes) / 1048576.0;
+}
+
+// The samples of the ranges: one page in each 64 KiB granule a range covers (the page at the pass's offset in the
+// granule, clamped into the range: over passes every 16th page), weighted by the range's bytes in the granule; each
+// with its alias address (the backing pieces of the range: the guest address space's shared map lock, a lookup a
+// range).
+bool MakeSamples(const std::vector<Range>& ranges, uint64_t pass, std::vector<Sample>* samples) {
+	std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
+	const uint64_t                                   offset = (pass % (SampleSpan / PageSize)) * PageSize;
+	for (const auto& range: ranges) {
+		if (range.size == 0 || UINT64_MAX - range.address < range.size) continue;
+		const uint64_t end    = range.address + range.size;
+		const bool     backed = Libs::LibKernel::Memory::TryGetSparseBackingPieces(range.address, range.size, pieces);
+		size_t         piece  = 0;
+		uint64_t       piece_begin = 0; // (offset in the range of pieces[piece])
+		for (uint64_t granule = range.address & ~(SampleSpan - 1); granule < end; granule += SampleSpan) {
+			if (samples->size() >= MaxSamples) return false;
+			const uint64_t lo    = std::max(granule, range.address);
+			const uint64_t hi    = std::min(granule + SampleSpan, end);
+			const uint64_t first = lo & ~(PageSize - 1), last = (hi - 1) & ~(PageSize - 1);
+			Sample         sample;
+			sample.page   = std::clamp(granule + offset, first, last);
+			sample.weight = static_cast<uint32_t>(hi - lo);
+			sample.kind   = range.kind;
+			if (backed) {
+				const uint64_t at = sample.page > range.address ? sample.page - range.address : 0;
+				while (piece < pieces.size() && at >= piece_begin + pieces[piece].second) piece_begin += pieces[piece++].second;
+				if (piece < pieces.size() && pieces[piece].first != nullptr)
+					sample.alias = (reinterpret_cast<uint64_t>(pieces[piece].first) + (at - piece_begin)) & ~(PageSize - 1);
+			}
+			samples->push_back(sample);
+			if (UINT64_MAX - granule < SampleSpan) break;
+		}
+	}
+	return true;
+}
+
+// The working-set state of each sample's two pages (K32QueryWorkingSetEx, in batches); false when it failed.
+bool QuerySamples(std::vector<Sample>* samples) {
+	constexpr size_t                               Batch = 4096; // samples a call (two entries each)
+	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries(Batch * 2);
+	HANDLE                                         process = GetCurrentProcess();
+	const auto*                                    fresh   = FreshMemory::Get();
+	for (size_t begin = 0; begin < samples->size(); begin += Batch) {
+		const size_t count = std::min(Batch, samples->size() - begin);
+		for (size_t i = 0; i < count; i++) {
+			const auto& sample               = (*samples)[begin + i];
+			entries[i * 2]                   = {};
+			entries[i * 2 + 1]               = {};
+			entries[i * 2].VirtualAddress     = reinterpret_cast<PVOID>(sample.page);
+			entries[i * 2 + 1].VirtualAddress = reinterpret_cast<PVOID>(sample.alias != 0 ? sample.alias : sample.page);
+		}
+		if (K32QueryWorkingSetEx(process, entries.data(), static_cast<DWORD>(count * 2 * sizeof(entries[0]))) == 0)
+			return false;
+		for (size_t i = 0; i < count; i++) {
+			auto& sample = (*samples)[begin + i];
+			// (PSAPI_WORKING_SET_EX_BLOCK.Valid, bit 0: the page is in the process's working set at that address.)
+			const bool view  = (entries[i * 2].VirtualAttributes.Flags & 1u) != 0;
+			const bool alias = sample.alias != 0 && (entries[i * 2 + 1].VirtualAttributes.Flags & 1u) != 0;
+			sample.state     = static_cast<uint8_t>((view ? StateView : 0) | (alias ? StateAlias : 0));
+			if (fresh != nullptr && sample.alias != 0) {
+				const uint64_t granule = FreshMemory::GranuleOf(*fresh, sample.alias);
+				if (granule != UINT64_MAX) {
+					sample.state = static_cast<uint8_t>(sample.state | StateKnown |
+					                                    (FreshMemory::IsWritten(*fresh, granule) ? StateWritten : 0));
+				}
+			}
+		}
+	}
+	return true;
+}
+
+// The lines (see the header gpu-residency.h, and the report in the commit): per kind as registered (a granule two
+// kinds share is in both), then the union (each 64 KiB granule once, under the first kind by UnionRank).
+void PrintGpuResidency(std::vector<Range>& ranges, uint64_t images, uint64_t buffers, double copy_ms, uint64_t pass) {
+	const auto          t0 = std::chrono::steady_clock::now();
+	std::vector<Sample> samples;
+	samples.reserve(std::min<size_t>(MaxSamples, 1u << 18u));
+	// (The backing lookups take the address space's shared lock: at normal priority, so the lock is not held by a
+	// descheduled low-priority thread while a map or unmap waits.)
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+	const bool complete = MakeSamples(ranges, pass, &samples);
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	ranges.clear();
+	ranges.shrink_to_fit();
+	const double lookup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	if (!QuerySamples(&samples)) {
+		std::printf("GPU residency (30 s): K32QueryWorkingSetEx failed (0x%08x)\n", static_cast<unsigned>(GetLastError()));
+		std::fflush(stdout);
+		return;
+	}
+	Totals by_kind[Kinds];
+	for (const auto& sample: samples) by_kind[static_cast<size_t>(sample.kind)].Add(sample, sample.weight);
+	// The union: by granule, the first kind by rank; the granule's largest weight; resident through a view where any of
+	// its samples is; written where any of its samples' granules was.
+	std::sort(samples.begin(), samples.end(), [](const Sample& a, const Sample& b) {
+		const uint64_t ga = a.page >> SampleBits, gb = b.page >> SampleBits;
+		return ga != gb ? ga < gb : UnionRank(a.kind) < UnionRank(b.kind);
+	});
+	Totals union_kind[Kinds], union_all;
+	for (size_t i = 0; i < samples.size();) {
+		Sample   merged = samples[i];
+		uint64_t weight = merged.weight;
+		size_t   j      = i + 1;
+		for (; j < samples.size() && (samples[j].page >> SampleBits) == (merged.page >> SampleBits); j++) {
+			weight = std::max<uint64_t>(weight, samples[j].weight);
+			if (merged.alias == 0) merged.alias = samples[j].alias;
+			merged.state = static_cast<uint8_t>(merged.state | samples[j].state); // (any sample's view, any written)
+		}
+		union_kind[static_cast<size_t>(merged.kind)].Add(merged, weight);
+		union_all.Add(merged, weight);
+		i = j;
+	}
+	const auto   ws = LocalPlatform::ProcessMemory().working_set;
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	std::printf("GPU residency (30 s, MiB of guest memory resident in the working set, 1 page in 64 KiB sampled; "
+	            "KYTY_GPU_RESIDENCY=0 off): %llu images and %llu buffers registered (copied on the GPU thread in %.2f ms), "
+	            "%zu samples%s, %.1f ms on this thread (backing lookups %.1f ms); process working set %.0f\n",
+	            static_cast<unsigned long long>(images), static_cast<unsigned long long>(buffers), copy_ms, samples.size(),
+	            complete ? "" : " (capped: the rest not measured)", ms, lookup_ms, ToMiB(ws));
+	const auto print = [](const char* what, const char* name, const Totals& t) {
+		std::printf("GPU residency %s %s: range %.0f, resident %.0f = through the game's view only %.0f + the emulator's "
+		            "alias only %.0f + both %.0f; not resident %.0f, unmapped %.0f; resident but never written %.0f\n",
+		            what, name, ToMiB(t.bytes), ToMiB(t.Resident()), ToMiB(t.view_only), ToMiB(t.alias_only), ToMiB(t.both),
+		            ToMiB(t.bytes - std::min(t.bytes, t.Resident() + t.unmapped)), ToMiB(t.unmapped),
+		            ToMiB(t.resident_unwritten));
+	};
+	for (size_t kind = 0; kind < static_cast<size_t>(Kinds); kind++) print("[by kind]", KindName(static_cast<Kind>(kind)), by_kind[kind]);
+	for (size_t kind = 0; kind < static_cast<size_t>(Kinds); kind++) print("[union]", KindName(static_cast<Kind>(kind)), union_kind[kind]);
+	print("[union]", "all GPU-cached guest memory", union_all);
+	std::fflush(stdout);
+}
+
+void Watch() {
+	SetThreadDescription(GetCurrentThread(), L"Kyty.GpuResidency");
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	std::printf("GPU residency: on (KYTY_GPU_RESIDENCY=0 turns it off): every 30 s, the working set over the guest ranges "
+	            "of the GPU caches' images and buffers, read-only\n");
+	std::fflush(stdout);
+	auto& exchange = Get();
+	for (uint64_t pass = 1;; pass++) {
+		std::this_thread::sleep_for(std::chrono::seconds(30));
+		std::vector<Range> ranges;
+		ranges.reserve(size_t {1} << 16u); // (here, not on the GPU thread)
+		uint64_t images = 0, buffers = 0;
+		double   copy_ms = 0.0;
+		{
+			std::unique_lock lock(exchange.mutex);
+			exchange.ranges.swap(ranges);
+			exchange.ranges.clear();
+			exchange.request = pass;
+			exchange.requested.store(true, std::memory_order_release);
+			// (No flip in 10 s - a loading screen held, the game paused in a debugger: this pass is not measured.)
+			if (!exchange.delivered.wait_for(lock, std::chrono::seconds(10), [&] { return exchange.answer == pass; })) {
+				exchange.requested.store(false, std::memory_order_relaxed);
+				lock.unlock();
+				std::printf("GPU residency (30 s): no flip in 10 s, not measured\n");
+				std::fflush(stdout);
+				continue;
+			}
+			ranges.swap(exchange.ranges);
+			images  = exchange.images;
+			buffers = exchange.buffers;
+			copy_ms = exchange.copy_ms;
+		}
+		PrintGpuResidency(ranges, images, buffers, copy_ms, pass);
+	}
+}
+
+} // namespace
+#endif
+
+void Start() {
+#if defined(_WIN32)
+	if (!Enabled()) {
+		std::printf("GPU residency: off (KYTY_GPU_RESIDENCY=0)\n");
+		std::fflush(stdout);
+		return;
+	}
+	static std::once_flag once;
+	std::call_once(once, [] { std::thread(Watch).detach(); });
+#endif
+}
+
+} // namespace GpuResidency
