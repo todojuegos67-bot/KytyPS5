@@ -92,6 +92,21 @@ void RegisterBudgetFlush(const char* name, FlushClass kind, BudgetFlushFn flush)
 // The periodic flush is on (KYTY_RAM_FLUSH_SECONDS > 0 and the guard on).
 [[nodiscard]] bool PeriodicFlush();
 
+// Commit guard (KYTY_COMMIT_GUARD=0 turns it off; default on, Windows): the system's commit charge is kept away from
+// its limit (a 16 GB PC rebooted with 600-800 MiB of headroom left for minutes). The reserve is
+// max(1.5 GiB, 6% of the limit) (KYTY_COMMIT_RESERVE_MB sets it). Under it, the watcher counts the pressure as critical
+// and runs the release passes every second (caches, pools, MemGuard's releasers, released guest memory); the texture
+// collector lowers its target step by step.
+// The reserve now in bytes (0 before the first sample or when off).
+[[nodiscard]] uint64_t CommitReserve();
+// The commit headroom is under the reserve (one relaxed load).
+[[nodiscard]] bool CommitTight();
+// Before a commit of `bytes` (only 64 MiB or more is checked): true when the headroom keeps the reserve after it.
+// Otherwise a release pass first (MemGuard; waited for, at most every 500 ms, when !can_fail), and then: can_fail
+// (an emulator cache's allocation, re-creatable): false, the caller does without; !can_fail (the game's own memory):
+// true anyway, counted. Any thread; `who` is a string literal. Always true off Windows or with the guard off.
+[[nodiscard]] bool MakeCommitRoom(uint64_t bytes, const char* who, bool can_fail);
+
 } // namespace RamGuard
 
 #endif // EMULATOR_SRC_LOCAL_RAM_GUARD_H_

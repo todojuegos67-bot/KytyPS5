@@ -5731,8 +5731,18 @@ void TextureCache::RunGarbageCollector() {
 	// is held while the pressure lasts: not a collection that follows the use down.
 	static uint64_t ram_target = 0;
 	bool            by_ram     = false;
+	// The commit guard (ram-guard.h, headroom under the reserve): NVIDIA charges video memory to the process's commit, so
+	// the target goes down 512 MiB more every 300 flips while it lasts (not under 2 GiB), images unused for 300 flips.
+	static uint64_t commit_lowered_tick = 0;
+	const bool      commit_tight        = RamGuard::CommitTight();
 	if (RamGuard::PressureLevel() >= RamGuard::Critical && m_total_used_memory != 0) {
 		if (ram_target == 0) ram_target = std::max<uint64_t>(2 * GiB, m_total_used_memory > GiB ? m_total_used_memory - GiB : 0);
+		if (commit_tight && tick >= commit_lowered_tick + 300) {
+			commit_lowered_tick = tick;
+			const uint64_t lower = std::min(ram_target, m_total_used_memory) > 2 * GiB + GiB / 2
+			                           ? std::min(ram_target, m_total_used_memory) - GiB / 2 : 2 * GiB;
+			ram_target = std::max<uint64_t>(2 * GiB, lower);
+		}
 		if (ram_target < collect_above) {
 			by_ram        = m_total_used_memory < normal_above;
 			collect_above = ram_target;
@@ -5741,7 +5751,7 @@ void TextureCache::RunGarbageCollector() {
 		ram_target = 0;
 	}
 	const uint64_t     over          = m_total_used_memory > collect_above ? m_total_used_memory - collect_above : 0;
-	const uint64_t     StaleTicks    = by_ram ? 600 : over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
+	const uint64_t     StaleTicks    = by_ram ? (commit_tight ? 300 : 600) : over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
 	const size_t       MaxDeletions  = by_ram ? 40 : over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
 	// For a while after the GPU could not make an image (InsertImage), images unused for FailedRetryTicks go too: the
 	// superseded ones whose memory it needs (issue #49: a 16 GB GPU full of texture-pool images).

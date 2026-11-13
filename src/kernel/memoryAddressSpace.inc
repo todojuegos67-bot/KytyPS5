@@ -1710,6 +1710,10 @@ private:
 		void* ptr = nullptr;
 		// Committing through the writable alias commits the section's pages for every view of them.
 		// (Refused for lack of memory: a release pass and another try, MemGuard.)
+		// (The commit guard, ram-guard.h: a big commit with the headroom under the reserve makes room first. The game's
+		// memory is never refused here: it is committed anyway.)
+		if (m_on_demand && !m_lazy && size >= (uint64_t {64} << 20u))
+			(void)RamGuard::MakeCommitRoom(size, "direct-memory commit", false);
 		if (m_on_demand && !m_lazy &&
 		    MemGuard::RetryOs("direct-memory commit", size, [&] {
 			    return VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE);

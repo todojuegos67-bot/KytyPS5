@@ -62,6 +62,15 @@ struct BudgetFlush {
 std::vector<BudgetFlush> g_budget_flushes;
 std::atomic<bool>        g_periodic {false};
 
+// The commit guard (ram-guard.h): the reserve the watcher keeps, whether the headroom is under it, and what the
+// allocation gate did (printed with the 30 s line).
+std::atomic<uint64_t> g_commit_reserve {0};
+std::atomic<bool>     g_commit_tight {false};
+std::atomic<uint64_t> g_gate_checks {0}, g_gate_released {0}, g_gate_refused {0}, g_gate_refused_bytes {0};
+std::atomic<uint64_t> g_gate_forced {0}, g_gate_forced_bytes {0};
+std::atomic<int64_t>  g_gate_last_wait_ms {0};
+constexpr uint64_t    CommitGateMin = uint64_t {64} << 20u;
+
 const char* Env(const char* name) {
 	const char* value = std::getenv(name);
 	return value != nullptr && *value != '\0' ? value : nullptr;
@@ -216,6 +225,75 @@ void RegisterBudgetFlush(const char* name, FlushClass kind, BudgetFlushFn flush)
 
 bool PeriodicFlush() {
 	return g_periodic.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+[[maybe_unused]] bool CommitGuardOn() {
+	static const bool on = [] {
+		const char* value = Env("KYTY_COMMIT_GUARD");
+		return !(value != nullptr && value[0] == '0');
+	}();
+	return on;
+}
+
+// max(1.5 GiB, 6% of the limit), or KYTY_COMMIT_RESERVE_MB.
+[[maybe_unused]] uint64_t ReserveFor(uint64_t limit) {
+	static const uint64_t fixed = EnvMiB("KYTY_COMMIT_RESERVE_MB", 0);
+	if (fixed != 0) return fixed;
+	return std::max<uint64_t>(GiB + GiB / 2, limit / 100 * 6);
+}
+
+} // namespace
+
+uint64_t CommitReserve() {
+	return g_commit_reserve.load(std::memory_order_relaxed);
+}
+
+bool CommitTight() {
+	return g_commit_tight.load(std::memory_order_relaxed);
+}
+
+bool MakeCommitRoom(uint64_t bytes, const char* who, bool can_fail) {
+#if defined(_WIN32)
+	if (bytes < CommitGateMin || !CommitGuardOn()) return true;
+	const auto headroom_now = [](uint64_t* limit, uint64_t* headroom) {
+		MEMORYSTATUSEX status {};
+		status.dwLength = sizeof(status);
+		if (GlobalMemoryStatusEx(&status) == 0 || status.ullTotalPageFile == 0) return false;
+		*limit    = status.ullTotalPageFile;
+		*headroom = status.ullAvailPageFile;
+		return true;
+	};
+	uint64_t limit = 0, headroom = 0;
+	if (!headroom_now(&limit, &headroom)) return true;
+	g_gate_checks.fetch_add(1, std::memory_order_relaxed);
+	const uint64_t reserve = ReserveFor(limit);
+	if (headroom >= bytes + reserve) return true;
+	g_gate_released.fetch_add(1, std::memory_order_relaxed);
+	// A cache's allocation does not wait (it is refused at once, a pass asked for); the game's waits for one pass, at
+	// most every 500 ms (a burst of commits does not wait 200 ms each).
+	const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                           std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       last   = g_gate_last_wait_ms.load(std::memory_order_relaxed);
+	const bool    wait   = !can_fail && now_ms - last >= 500 &&
+	                  g_gate_last_wait_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed);
+	(void)MemGuard::ReleaseNow(who, wait ? 200u : 0u);
+	if (wait && headroom_now(&limit, &headroom) && headroom >= bytes + ReserveFor(limit)) return true;
+	if (can_fail) {
+		g_gate_refused.fetch_add(1, std::memory_order_relaxed);
+		g_gate_refused_bytes.fetch_add(bytes, std::memory_order_relaxed);
+		return false;
+	}
+	g_gate_forced.fetch_add(1, std::memory_order_relaxed);
+	g_gate_forced_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	return true;
+#else
+	(void)bytes;
+	(void)who;
+	(void)can_fail;
+	return true;
+#endif
 }
 
 #if defined(_WIN32)
@@ -648,6 +726,20 @@ void Watch() {
 	int      backoff    = 0;
 	int      logged     = None;
 	uint64_t store      = 0, flushes = 0, freed_total = 0;
+	// The commit guard's aggressive passes (every second under the reserve): count, bytes, the next line, the next
+	// discard of released guest memory.
+	uint64_t commit_tight_seconds = 0, tight_passes = 0, tight_freed = 0, tight_freed_line = 0;
+	auto     next_tight_print = Clock::now();
+	auto     next_tight_guest = Clock::now();
+	auto     next_commit_line = Clock::now() + std::chrono::seconds(30);
+	if (CommitGuardOn())
+		std::printf("Commit guard: on (KYTY_COMMIT_GUARD=0 off): commit headroom kept >= %s; under it a release pass "
+		            "every second, the texture collector lowered, emulator cache allocations of 64 MiB or more refused "
+		            "when no room is made\n",
+		            Env("KYTY_COMMIT_RESERVE_MB") != nullptr ? "KYTY_COMMIT_RESERVE_MB" : "max(1536 MiB, 6% of the limit)");
+	else
+		std::printf("Commit guard: off (KYTY_COMMIT_GUARD=0)\n");
+	std::fflush(stdout);
 	for (;;) {
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 		const auto now  = Clock::now();
@@ -673,6 +765,18 @@ void Watch() {
 			seconds_under_512 += sample.available < GiB / 2 ? 1 : 0;
 		}
 		int level = LevelOf(s, sample);
+		// The commit guard: under the reserve the pressure is critical, whatever the RAM, and the passes run every second.
+		bool tight = false;
+		if (CommitGuardOn() && sample.commit_limit != 0) {
+			const uint64_t reserve = ReserveFor(sample.commit_limit);
+			g_commit_reserve.store(reserve, std::memory_order_relaxed);
+			tight = sample.Headroom() < reserve;
+			if (tight) {
+				level = Critical;
+				commit_tight_seconds++;
+			}
+		}
+		g_commit_tight.store(tight, std::memory_order_relaxed);
 		if (s.budget != 0) {
 			budget_ws_max_line = std::max(budget_ws_max_line, sample.working_set);
 			if (sample.working_set > s.budget) {
@@ -720,7 +824,31 @@ void Watch() {
 			backoff = 0;
 		}
 		logged = level;
-		if (level != None && now >= next_flush) {
+		if (tight) {
+			// Under the reserve: every second, MemGuard's releasers (pools, staging, buffer reclaim, image pool) and the
+			// caches' budget sources, and every 5 s the guest memory the game released (no trim). The owners of
+			// pipelines and images act on the critical level themselves.
+			(void)MemGuard::ReleaseNow("commit reserve", 0);
+			std::vector<BudgetFlush> list;
+			{
+				std::lock_guard lock(g_flush_mutex);
+				list = g_budget_flushes;
+			}
+			const bool guest = now >= next_tight_guest;
+			if (guest) next_tight_guest = now + std::chrono::seconds(5);
+			uint64_t got = 0;
+			for (const auto& source: list) {
+				if (source.kind == FlushCaches || (guest && source.kind == FlushGuestFreed)) {
+					uint64_t held = 0;
+					got += source.fn(uint64_t {4} << 30u, &held);
+				}
+			}
+			tight_passes++;
+			tight_freed += got;
+			tight_freed_line += got;
+		}
+		// (Under the commit reserve the pass below runs every second too; its line at most every 30 s.)
+		if (level != None && (now >= next_flush || tight)) {
 			// The safe flush: only free or re-creatable memory (soft-release.h's pass and the registered sources); the
 			// owners of pipelines and images release theirs on their own threads while the level stays up.
 			char           detail[256];
@@ -748,17 +876,43 @@ void Watch() {
 			freed_total += freed;
 			flushes++;
 			const auto after = LocalPlatform::ProcessMemory().private_bytes;
-			std::printf("RAM: pressure %s (%s), freed %llu MB (%s%s%s; private %llu -> %llu MiB); %llu passes, %llu MB in all\n",
-			            LevelName(level), Figures(sample).c_str(), static_cast<unsigned long long>(freed / 1000000u), detail,
-			            sources.c_str(), released.c_str(), static_cast<unsigned long long>(before / MiB),
-			            static_cast<unsigned long long>(after / MiB), static_cast<unsigned long long>(flushes),
-			            static_cast<unsigned long long>(freed_total / 1000000u));
-			std::fflush(stdout);
+			if (!tight || now >= next_tight_print) {
+				if (tight) next_tight_print = now + std::chrono::seconds(30);
+				std::printf("RAM: pressure %s%s (%s), freed %llu MB (%s%s%s; private %llu -> %llu MiB); %llu passes, %llu MB in all\n",
+				            LevelName(level), tight ? " (commit reserve)" : "", Figures(sample).c_str(),
+				            static_cast<unsigned long long>(freed / 1000000u), detail, sources.c_str(), released.c_str(),
+				            static_cast<unsigned long long>(before / MiB), static_cast<unsigned long long>(after / MiB),
+				            static_cast<unsigned long long>(flushes), static_cast<unsigned long long>(freed_total / 1000000u));
+				std::fflush(stdout);
+			}
 			// Again in 5 s (critical) or 15 s (low); a pass that freed little waits twice as long, up to 2 minutes:
 			// nothing left to give is not looked for every few seconds.
 			backoff = freed < 32 * MiB ? std::min(backoff + 1, 4) : 0;
 			const int base = level == Critical ? 5 : 15;
 			next_flush     = now + std::chrono::seconds(std::min(120, base << backoff));
+		}
+		if (CommitGuardOn() && now >= next_commit_line) {
+			next_commit_line = now + std::chrono::seconds(30);
+			std::printf("Commit guard (30 s): commit %llu of %llu MiB, headroom %llu MiB, reserve %llu MiB%s; under it %llu s "
+			            "in all, aggressive passes %llu (%llu MB this period, %llu MB in all); gate: %llu big commits checked, "
+			            "%llu found no room, %llu cache allocations refused (%llu MiB), %llu game commits let through "
+			            "anyway (%llu MiB)\n",
+			            static_cast<unsigned long long>(sample.commit_total / MiB),
+			            static_cast<unsigned long long>(sample.commit_limit / MiB),
+			            static_cast<unsigned long long>(sample.Headroom() / MiB),
+			            static_cast<unsigned long long>(g_commit_reserve.load(std::memory_order_relaxed) / MiB),
+			            tight ? " (UNDER)" : "", static_cast<unsigned long long>(commit_tight_seconds),
+			            static_cast<unsigned long long>(tight_passes),
+			            static_cast<unsigned long long>(tight_freed_line / 1000000u),
+			            static_cast<unsigned long long>(tight_freed / 1000000u),
+			            static_cast<unsigned long long>(g_gate_checks.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(g_gate_released.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(g_gate_refused.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(g_gate_refused_bytes.load(std::memory_order_relaxed) / MiB),
+			            static_cast<unsigned long long>(g_gate_forced.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(g_gate_forced_bytes.load(std::memory_order_relaxed) / MiB));
+			std::fflush(stdout);
+			tight_freed_line = 0;
 		}
 		if (log_period > 0 && now >= next_log) {
 			next_log = now + std::chrono::seconds(log_period);
