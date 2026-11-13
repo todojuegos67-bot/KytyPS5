@@ -436,6 +436,7 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+		FileProvenance::ClearBackingOffset(backing_offset, size); // (bits only)
 		std::lock_guard lock(m_mutex);
 		HoldTimer       hold {LiveCounters::BackingHoldZeroUs};
 		BackingWriteFence fence(*this);

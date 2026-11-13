@@ -32,6 +32,7 @@
 // unmap (normal context); after one by the emulator's own code the fault handler only gives the pages a protection that
 // lets the access through, and the render thread removes them (Drain).
 
+#include "file-provenance.h"
 #include "guest-lazy-commit.h"
 #include "mem-class.h"
 
@@ -252,6 +253,8 @@ inline bool DiscardRange(uint64_t begin) {
 	// protection change of the game's threads waits for (whole ranges: frames of 30-60 ms after each scan).
 	constexpr uint64_t Chunk = uint64_t {1} << 20u;
 	for (const auto& piece: it->second.pieces) {
+		// (Its bytes gone: not the file's any more for the file-provenance census, whose verify must not read them.)
+		FileProvenance::ClearBacking(piece.backing, piece.size);
 		// (A discard is refused on pages without access.)
 		for (uint64_t at = 0; at < piece.size; at += Chunk) {
 			(void)DiscardVirtualMemory(reinterpret_cast<void*>(piece.backing + at), std::min(Chunk, piece.size - at));

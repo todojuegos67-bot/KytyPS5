@@ -5,6 +5,7 @@
 #include "live-trace.h"
 #include "time-census.h"
 #include "writeback-verify.h"
+#include "file-provenance.h"
 #include "fresh-memory.h"
 #include "guest-lazy-commit.h"
 #include "mem-guard.h"
@@ -1619,10 +1620,12 @@ void InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
+	FileProvenance::ClearGuestRange(vaddr, size);
 	(void)GetGpuResources().InvalidateMemoryForWrite(vaddr, size);
 }
 
 bool PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
+	if (size != 0 && UINT64_MAX - vaddr >= size) FileProvenance::ClearGuestRange(vaddr, size);
 	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// From the first page a store would fault on to the end of the last one, of those the trackers protect: by the
@@ -1664,6 +1667,7 @@ bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
 }
 
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
+	FileProvenance::ClearGuestRange(vaddr, size);
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
 }
@@ -2144,6 +2148,7 @@ void PhysicalMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator ran
 
 void PhysicalMemory::AddFreeRange(uint64_t start, uint64_t size) {
 	GuestStoreUsage(-static_cast<int64_t>(size));
+	FileProvenance::ClearBackingOffset(start, size); // (bits only: under the allocator's lock)
 	auto end  = start + size;
 	auto next = m_free.lower_bound(start);
 	if (next != m_free.begin()) {
@@ -2769,6 +2774,7 @@ void FlexibleMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator ran
 
 void FlexibleMemory::AddFreeRange(uint64_t start, uint64_t size) {
 	GuestStoreUsage(-static_cast<int64_t>(size));
+	FileProvenance::ClearBackingOffset(start, size); // (bits only: under the allocator's lock)
 	auto end  = start + size;
 	auto next = m_free.lower_bound(start);
 	if (next != m_free.begin()) {

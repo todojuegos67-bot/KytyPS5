@@ -1020,6 +1020,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/soft-release.cpp"
 	"${KYTY_SOURCE_DIR}/local/ram-guard.h"
 	"${KYTY_SOURCE_DIR}/local/ram-guard.cpp"
+	"${KYTY_SOURCE_DIR}/local/file-provenance.h"
+	"${KYTY_SOURCE_DIR}/local/file-provenance.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.h"

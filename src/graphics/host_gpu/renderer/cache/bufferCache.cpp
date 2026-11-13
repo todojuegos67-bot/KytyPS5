@@ -13,6 +13,7 @@
 #include "parallel-pages.h"
 #include "readback-queue.h"
 #include "sync-stats.h"
+#include "file-provenance.h"
 #include "fresh-memory.h"
 #include "mem-class.h"
 #include "texture-offload.h"
@@ -536,6 +537,7 @@ static void LogGpuWriteWatch(uint64_t vaddr, uint64_t size) {
 // current tick, so its tick is only set at the next point between commands. Every GPU write
 // into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t caller) {
+	FileProvenance::ClearGuestRange(vaddr, size); // (the guest bytes are not the file's any more)
 	if (caller == 0 && SyncStats::Enabled()) caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 	LogGpuWriteWatch(vaddr, size);
 	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
@@ -1171,6 +1173,7 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	DrainGuestReadback(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
+	FileProvenance::NoteRange(FileProvenance::Kind::Buffer, m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size(), insert);
 	m_sync_buffers_valid = false;
 	if (!m_sync_changes_lost) {
 		if (m_sync_changes.size() < 256)

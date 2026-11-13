@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <thread>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "file-provenance.h"
 #include "slow-log.h"
 
 #include "common/assert.h"
@@ -756,6 +757,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	}
 	MarkImageGranules(image.info.data.address, image.info.data.size);
+	FileProvenance::NoteRange(FileProvenance::Kind::Texture, image.info.data.address, image.info.data.size, true);
 	if (m_image_starts[image.info.data.address]++ == 0) {
 		if (const auto bucket = StartBucket(image.info.data.address); m_start_buckets[bucket]++ == 0)
 			m_start_bucket_bits[bucket / 64u] |= uint64_t {1} << (bucket % 64u);
@@ -784,6 +786,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
 	++m_image_granule_releases;
+	FileProvenance::NoteRange(FileProvenance::Kind::Texture, image.info.data.address, image.info.data.size, false);
 	UntrackImage(id, "unregister");
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
