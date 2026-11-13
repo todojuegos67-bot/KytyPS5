@@ -74,6 +74,9 @@ public:
 	// reads: guest memory the GPU thread's translation reads twice in one epoch was not changed by the guest in
 	// between, unless the guest raced its own GPU work.
 	[[nodiscard]] static uint64_t ObservationEpoch() noexcept;
+	// Whether the calling thread defers its read protections now (the GPU thread while it translates guest work):
+	// ObservationEpoch is then the GPU thread's.
+	[[nodiscard]] static bool ReadProtectionDeferred() noexcept;
 	// A write fault on a page no watcher holds: its host protection is not the trackers'. Gives
 	// the page the guest's own protection back (writable if the guest's is) and returns true;
 	// false when the page is watched. Checked and changed under the page's lock, so a watcher

@@ -226,6 +226,7 @@ public:
 	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
 		return m_memory_tracker.DeferredProtectionPending(vaddr);
 	}
+	[[nodiscard]] bool HasKeptPages(uint64_t vaddr) const { return m_memory_tracker.HasKeptPages(vaddr); }
 	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
 		if (!GuestRange {vaddr, size}.Valid()) return 0;
 		constexpr uint64_t MaxRegions = 64;

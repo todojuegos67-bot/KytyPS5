@@ -24,6 +24,7 @@
 #include "fresh-memory.h"
 #include "guest-lazy-commit.h"
 #include "texture-offload.h"
+#include "loader/demonsSoulsNativeMem.h"
 #include "async-upload.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "kernel/pthread.h"
@@ -5772,6 +5773,13 @@ void TextureCache::RunGarbageCollector() {
 		     !(failing && owner->info.data.size <= download_max))) {
 			return false;
 		}
+		// (KYTY_NATIVE_MEM=2: an image the GPU wrote wholly inside a render-target arena stays in video memory, as a
+		// tiled target does above, instead of being downloaded into guest RAM: that memory is GPU-only on a native port.
+		// Not while the GPU cannot make images.)
+		if (owner->IsGpuModified() && !failing &&
+		    ::Loader::DemonsSoulsNativeMem::KeepGpuOnly(owner->info.data.address, owner->info.data.size, 0)) {
+			return false;
+		}
 		candidates.push_back(id);
 		return candidates.size() == MaxDeletions;
 	});
@@ -5808,7 +5816,8 @@ void TextureCache::ProcessDownloadImages() {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
+		if (owner != nullptr && owner->registered && owner->IsGpuModified() &&
+		    !::Loader::DemonsSoulsNativeMem::KeepGpuOnly(owner->info.data.address, owner->info.data.size, 1)) {
 			(void)TryDownloadImage(id);
 		}
 	}

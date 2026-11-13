@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/demonsSoulsNativeMem.h"
 #include "loader/demonsSoulsSkipIntro.h"
 #include "loader/systemContent.h"
 #include "local/fsr3-fg.h"
@@ -2161,6 +2162,9 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	    buffer_index_start + buffer_num > VIDEO_OUT_BUFFER_NUM_MAX) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
+	// (KYTY_NATIVE_MEM: the CRenderDisplay ctor registers its buffers right after RenderTargetManager::InitSharedMemory,
+	// so the render-target arenas exist now. Once; nothing when off.)
+	::Loader::DemonsSoulsNativeMem::OnRegisterBuffers();
 
 	LOGF("\t start_index    = %d\n"
 	     "\t buffer_num     = %d\n"

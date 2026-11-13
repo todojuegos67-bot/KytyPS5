@@ -683,6 +683,10 @@ uint64_t PageManager::ObservationEpoch() noexcept {
 	return g_observation_epoch;
 }
 
+bool PageManager::ReadProtectionDeferred() noexcept {
+	return g_defer_read_protect;
+}
+
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
 	if (base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||

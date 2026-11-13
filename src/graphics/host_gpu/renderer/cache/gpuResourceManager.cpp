@@ -24,6 +24,7 @@
 #include "fresh-memory.h"
 #include "texture-offload.h"
 #include "gpu-residency.h"
+#include "loader/demonsSoulsNativeMem.h"
 
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {0};
@@ -187,11 +188,13 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		if (TryInvalidateCpuWriteWindow(fault_vaddr)) {
 			LiveCounters::Add(LiveCounters::WindowFault);
 			if (FaultStatsOn()) NoteFault(fault_vaddr, 0);
+			::Loader::DemonsSoulsNativeMem::Note(::Loader::DemonsSoulsNativeMem::FaultWindow, fault_vaddr, 1);
 			if (in_remap) LiveCounters::Add(LiveCounters::RemapWindowWrites);
 			return true;
 		}
 		LiveCounters::Add(LiveCounters::WriteFault);
 		if (FaultStatsOn()) NoteFault(fault_vaddr, 1);
+		::Loader::DemonsSoulsNativeMem::Note(::Loader::DemonsSoulsNativeMem::FaultWrite, fault_vaddr, 1);
 		// No watcher holds the page, so no cache expects this fault: the protection outlived its
 		// watchers and would fault forever. It gets the guest's own protection back.
 		if (m_page_manager.RestoreIfUnwatched(fault_vaddr)) {
@@ -204,6 +207,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	} else {
 		LiveCounters::Add(LiveCounters::ReadFault);
 		if (FaultStatsOn()) NoteFault(fault_vaddr, 2);
+		::Loader::DemonsSoulsNativeMem::Note(::Loader::DemonsSoulsNativeMem::FaultRead, fault_vaddr, 1);
 		if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::RenderReadFaults);
 		// A speculative translation's thread read GPU-written memory: the readback is the normal path's (the
 		// scheduler's own command buffers and ticks), as the translation in order would make it there.
@@ -496,7 +500,8 @@ void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 			// A request left unproven by its own uploads' queued write protection needs no other visit:
 			// a write before the protection lands is in the copies taken after it, and a write after it
 			// faults (and marks the region).
-			if (unproven && !m_buffer_cache.DeferredProtectionPending(region_begin))
+			// (A region with UploadHeap pages kept CPU-dirty is written without faults: visited again every time.)
+			if (unproven && (!m_buffer_cache.DeferredProtectionPending(region_begin) || m_buffer_cache.HasKeptPages(region_begin)))
 				BdaDirtyRegions::Mark(region_begin / TRACKER_REGION_SIZE);
 		}
 	}

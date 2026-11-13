@@ -6,9 +6,11 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
+#include "graphics/host_gpu/uploadHeap.h"
 #include "writeback-verify.h"
 
 #include <atomic>
+#include <bit>
 #include <immintrin.h>
 #include <mutex>
 #include <utility>
@@ -148,6 +150,8 @@ public:
 		// Pages marked clean whose write protection is still queued can change unseen:
 		// nothing is provable until the worker applied it (and moved the epoch).
 		if (m_deferred_protects.load(std::memory_order_acquire) != 0) return 0;
+		// Kept pages (UploadHeap) are written without a fault: nothing about them is provable.
+		if (m_has_kept.load(std::memory_order_acquire)) return 0;
 		return m_cpu_epoch.load(std::memory_order_acquire);
 	}
 	// KYTY_ASYNC_REPROTECT: a write protection of pages in this region is queued.
@@ -155,6 +159,8 @@ public:
 	[[nodiscard]] bool DeferredProtectionPending() const noexcept {
 		return m_deferred_protects.load(std::memory_order_acquire) != 0;
 	}
+	// UploadHeap: pages kept CPU-dirty and writable after a copy (written without a fault).
+	[[nodiscard]] bool HasKeptPages() const noexcept { return m_has_kept.load(std::memory_order_acquire); }
 	// The upload worker (or the render thread as a fallback) applies it.
 	void ApplyDeferredProtection(uint64_t vaddr, uint64_t size) {
 		m_page_manager.ReapplyProtection(vaddr, size);
@@ -180,8 +186,25 @@ public:
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
 			if (m_cpu_dirty.AnyInRange(start, end)) {
-				EXIT("GPU dirty state conflicts with CPU dirty state\n");
+				// Kept pages (UploadHeap) are CPU-dirty only because they are never made clean: their bytes went to
+				// the GPU at their last use, as a clean page's had. The GPU's write takes them, as it takes clean
+				// pages: clean and write-watched again. Any other CPU-dirty page is the conflict it always was.
+				RegionBits conflict(m_cpu_dirty, start, end);
+				if ((conflict & ~m_kept).Any()) {
+					EXIT("GPU dirty state conflicts with CPU dirty state\n");
+				}
+				m_cpu_dirty ^= conflict;
+				m_kept ^= conflict;
+				m_kept_done &= ~conflict;
+				m_has_kept.store(m_kept.Any(), std::memory_order_release);
+				UploadHeap::g_gpu_taken_pages.fetch_add(conflict.Count(), std::memory_order_relaxed);
+				UpdateCpuProtection<true>(start, end);
 			}
+		}
+		if constexpr ((source == DirtySource::Cpu && enable) || source == DirtySource::Gpu) {
+			// (A CPU write the trackers saw, or a GPU change: a kept page's copy of this epoch is stale. m_kept_done is
+			// a subset of m_kept, empty whenever m_has_kept is false (both change under the lock): off, one branch.)
+			if (m_has_kept.load(std::memory_order_relaxed)) m_kept_done.UnsetRange(start, end);
 		}
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
@@ -209,7 +232,11 @@ public:
 	// bytes holds no longer (TableXpr::RingCopy's copies of guest-written ranges). The epoch moves as well when pages
 	// become CPU-dirty and when GPU-written pages are given back (their bytes the GPU's): with the guest's writes to
 	// dirty pages it covers every change of the region's bytes the CPU can see but those.
-	void NoteHostWrite() noexcept { m_cpu_epoch.fetch_add(1, std::memory_order_release); }
+	void NoteHostWrite() noexcept {
+		m_cpu_epoch.fetch_add(1, std::memory_order_release);
+		// (Not under the lock in every caller: a stamp change makes the next kept upload forget its copies.)
+		m_kept_stamp_invalid.store(true, std::memory_order_release);
+	}
 
 	// CPU-dirty with the pages' write protection kept: the emulator wrote them through the backing view (no fault
 	// saw it). A page still write-watched stays so (UpdateCpuProtection moves only pages of a change's range, in its
@@ -219,10 +246,73 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if (m_gpu_dirty.AnyInRange(start, end)) return false;
 		m_cpu_dirty.SetRange(start, end);
+		if (m_has_kept.load(std::memory_order_relaxed)) m_kept_done.UnsetRange(start, end);
 		m_cpu_epoch.fetch_add(1, std::memory_order_release);
 		m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
 		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
 		return true;
+	}
+
+	// The upload of the CPU-dirty pages of [vaddr, vaddr + size) (MemoryTracker::ForEachUploadRange): func gets the
+	// ranges to copy, and the pages become clean and write-watched, as ForEachModifiedRange<Cpu, true> makes them; but
+	// with `keep` (a read-only use) the pages UploadHeap marks stay CPU-dirty and writable (kept): copied again at
+	// their next use, never write-protected, never faulting. A kept page already copied in this observation epoch of
+	// the GPU thread is not copied again (uploadHeap.h).
+	template <typename Func>
+	void ForEachCpuUploadRange(uint64_t vaddr, uint64_t size, bool keep, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (!m_cpu_dirty.AnyInRange(start, end)) return;
+		RegionBits     mask(m_cpu_dirty, start, end);
+		const uint64_t granules = keep ? UploadHeap::RegionGranules(m_cpu_addr) : 0;
+		if (granules == 0) {
+			m_cpu_dirty.UnsetRange(start, end);
+			if (m_has_kept.load(std::memory_order_relaxed)) {
+				m_kept &= ~mask;
+				m_kept_done &= ~mask;
+				m_has_kept.store(m_kept.Any(), std::memory_order_release);
+			}
+			UpdateCpuProtection<true>(start, end);
+			ForEachRange(mask, std::forward<Func>(func));
+			return;
+		}
+		if (granules != m_pin_granules) {
+			m_pin_granules = granules;
+			m_pin_mask.Clear();
+			constexpr size_t PagesPerGranule = (size_t {1} << UploadHeap::GranuleBits) / TRACKER_PAGE_SIZE;
+			for (uint64_t bits = granules; bits != 0; bits &= bits - 1) {
+				const auto g = static_cast<size_t>(std::countr_zero(bits));
+				m_pin_mask.SetRange(g * PagesPerGranule, (g + 1) * PagesPerGranule);
+			}
+		}
+		const RegionBits kept  = mask & m_pin_mask;
+		const RegionBits clean = mask & ~m_pin_mask;
+		RegionBits       copy  = mask;
+		m_cpu_dirty &= ~clean;
+		m_kept &= ~clean;
+		m_kept_done &= ~clean;
+		if (kept.Any()) {
+			// The epoch rule only on the GPU thread translating guest work (its ObservationEpoch); 0 = no proof.
+			const uint64_t stamp = PageManager::ReadProtectionDeferred() ? (PageManager::ObservationEpoch() << 1u) | 1u : 0;
+			const bool     host_wrote = m_kept_stamp_invalid.exchange(false, std::memory_order_acq_rel);
+			if (stamp == 0 || stamp != m_kept_stamp || host_wrote) {
+				m_kept_done.Clear();
+				m_kept_stamp = stamp;
+			} else {
+				const RegionBits skip = kept & m_kept_done;
+				copy &= ~skip;
+				UploadHeap::g_deduped_pages.fetch_add(skip.Count(), std::memory_order_relaxed);
+			}
+			if (stamp != 0) m_kept_done |= kept;
+			m_kept |= kept;
+			m_has_kept.store(true, std::memory_order_release);
+			UploadHeap::g_kept_pages.fetch_add(kept.Count(), std::memory_order_relaxed);
+			// Copied now, dirty since: an upload of them later in this command buffer goes in order (UploadPrologue);
+			// what proved the region before proves nothing now.
+			m_cpu_epoch.fetch_add(1, std::memory_order_release);
+			m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+		}
+		if (clean.Any()) UpdateCpuProtection<true>(start, end);
+		if (copy.Any()) ForEachRange(copy, std::forward<Func>(func));
 	}
 
 	template <DirtySource source, bool clear, typename Func>
@@ -335,6 +425,15 @@ private:
 	std::atomic<uint64_t> m_cpu_epoch {1};
 	std::atomic<uint64_t> m_last_dirty {NextCpuDirtyClock()}; // (all pages start CPU-dirty)
 	std::atomic<uint32_t> m_deferred_protects {0};
+	// UploadHeap: kept pages (CPU-dirty, writable, copied at their last use), the kept pages copied in the epoch
+	// m_kept_stamp, the region's marked granules as pages (cached for m_pin_granules).
+	std::atomic<bool>     m_has_kept {false};
+	std::atomic<bool>     m_kept_stamp_invalid {false};
+	uint64_t              m_kept_stamp    = 0;
+	uint64_t              m_pin_granules  = 0;
+	RegionBits            m_kept;
+	RegionBits            m_kept_done;
+	RegionBits            m_pin_mask;
 	RegionBits            m_cpu_dirty;
 	RegionBits            m_gpu_dirty;
 	RegionBits            m_writable;
