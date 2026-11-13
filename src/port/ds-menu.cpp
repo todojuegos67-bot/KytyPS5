@@ -3231,23 +3231,24 @@ bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* fon
 // un PC con poca RAM llegue al limite de memoria comprometida (un PC de 16 GB se reinicio ahi). Hace falta reiniciar.
 void SetBigPagefile() {
 #if defined(_WIN32)
-	// The same script as Archivo-paginacion-100GB.cmd: it raises itself to administrator, sets C:'s page file to
-	// 16-100 GB and shows the result in its window (so a failure is visible, not silent).
+	// A fixed 60 GB page file on C:, written where Windows keeps it (the PagingFiles registry value) with automatic
+	// management turned off; the window shows the value read back. Applied at the next restart.
 	static const char* script =
 	    "@echo off\r\n"
-
-	    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$c=Get-CimInstance Win32_ComputerSystem; "
-	    "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false}; "
-	    "$p=Get-CimInstance Win32_PageFileSetting | Where-Object {$_.Name -like 'C:*'}; "
-	    "if(-not $p){$p=New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name='C:\\pagefile.sys'}}; "
-	    "$p | Set-CimInstance -Property @{InitialSize=[uint32]61440;MaximumSize=[uint32]61440}; "
-	    "Get-CimInstance Win32_PageFileSetting | Format-Table Name,InitialSize,MaximumSize\"\r\n"
+	    "echo Archivo de paginacion fijo de 60 GB en C:\r\n"
+	    "wmic computersystem where name=\"%computername%\" set AutomaticManagedPagefile=False >nul 2>&1\r\n"
+	    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { $c=Get-CimInstance Win32_ComputerSystem; "
+	    "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false} } catch {}\" >nul 2>&1\r\n"
+	    "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v PagingFiles "
+	    "/t REG_MULTI_SZ /d \"C:\\pagefile.sys 61440 61440\" /f\r\n"
 	    "echo.\r\n"
-	    "echo Si arriba sale C:\\pagefile.sys 61440 61440 esta hecho. Reinicia el PC para aplicarlo.\r\n"
+	    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v PagingFiles\r\n"
+	    "echo.\r\n"
+	    "echo Si arriba pone C:\\pagefile.sys 61440 61440 esta hecho. REINICIA EL PC para aplicarlo.\r\n"
 	    "pause\r\n";
 	char dir[MAX_PATH] = {};
 	if (GetTempPathA(MAX_PATH, dir) == 0) return;
-	const std::string path = std::string(dir) + "kyty-pagefile-100gb.cmd";
+	const std::string path = std::string(dir) + "kyty-pagefile-60gb.cmd";
 	if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
 		std::fwrite(script, 1, std::strlen(script), f);
 		std::fclose(f);
@@ -3256,6 +3257,19 @@ void SetBigPagefile() {
 		ShellExecuteA(nullptr, "runas", "cmd.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
 	}
 #endif
+}
+
+// Whether the 60 GB page file is already written in the registry (then only a restart is missing).
+static bool PagefileConfigured() {
+#if defined(_WIN32)
+	char  value[1024] = {};
+	DWORD size        = sizeof(value) - 2;
+	if (RegGetValueA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+	                 "PagingFiles", RRF_RT_REG_MULTI_SZ, nullptr, value, &size) == ERROR_SUCCESS) {
+		return std::strstr(value, "61440") != nullptr;
+	}
+#endif
+	return false;
 }
 
 // The system commit limit (RAM + page file) in GB, 0 when unknown: shown under the page file button.
@@ -3621,8 +3635,10 @@ void LauncherPerformance(Settings& s) {
 		if (limit != 0) {
 			const float ny = RowY();
 			ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), ny});
+			const bool pending = limit < 64 && PagefileConfigured();
 			ImGui::TextColored(limit >= 64 ? kGoldL : kGold, "Memoria total de Windows (RAM + paginación): %llu GB%s",
-			                   static_cast<unsigned long long>(limit), limit >= 64 ? "" : "  -  pulsa el botón y reinicia");
+			                   static_cast<unsigned long long>(limit),
+			                   limit >= 64 ? "" : pending ? "  -  hecho: REINICIA EL PC" : "  -  pulsa el botón y reinicia");
 			RowEnd(ny, 24);
 		}
 	}
@@ -4414,6 +4430,17 @@ void DrawLauncher(float width, float height) {
 		ImGui::SetCursorScreenPos({origin.x + U(8), origin.y});
 		ImGui::BeginGroup();
 		LauncherUpdateBox();
+		{
+			// (11-13) The launcher sets the page file itself: once per start, when Windows' memory limit (RAM + page
+			// file) is under 48 GB and the 60 GB page file is not already set, it asks for administrator permission and
+			// sets it (a 16 GB PC rebooted at that limit). Then the user restarts the PC.
+			static bool asked = false;
+			if (!asked) {
+				asked = true;
+				const uint64_t limit = CommitLimitGb();
+				if (limit != 0 && limit < 48 && !PagefileConfigured()) SetBigPagefile();
+			}
+		}
 		LauncherSoulsModes(s);
 		LauncherImage(s);
 		LauncherFrameGen(s);
