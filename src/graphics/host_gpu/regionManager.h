@@ -201,12 +201,10 @@ public:
 				UpdateCpuProtection<true>(start, end);
 			}
 		}
-		if constexpr (source == DirtySource::Cpu && enable) {
-			// (A CPU write the trackers saw: a kept page's copy of this epoch is stale.)
-			m_kept_done.UnsetRange(start, end);
-		}
-		if constexpr (source == DirtySource::Gpu) {
-			m_kept_done.UnsetRange(start, end);
+		if constexpr ((source == DirtySource::Cpu && enable) || source == DirtySource::Gpu) {
+			// (A CPU write the trackers saw, or a GPU change: a kept page's copy of this epoch is stale. m_kept_done is
+			// a subset of m_kept, empty whenever m_has_kept is false (both change under the lock): off, one branch.)
+			if (m_has_kept.load(std::memory_order_relaxed)) m_kept_done.UnsetRange(start, end);
 		}
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
@@ -248,7 +246,7 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if (m_gpu_dirty.AnyInRange(start, end)) return false;
 		m_cpu_dirty.SetRange(start, end);
-		m_kept_done.UnsetRange(start, end);
+		if (m_has_kept.load(std::memory_order_relaxed)) m_kept_done.UnsetRange(start, end);
 		m_cpu_epoch.fetch_add(1, std::memory_order_release);
 		m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
 		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
