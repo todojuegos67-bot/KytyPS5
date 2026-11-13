@@ -15,6 +15,8 @@
 namespace Libs::Graphics {
 namespace {
 
+HostMemoryPrefaultFn g_prefault = nullptr; // (set once, at the emulator's start)
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool IsAccessible(DWORD protect, HostMemoryAccess access) {
 	constexpr DWORD blocked  = PAGE_NOACCESS | PAGE_GUARD;
@@ -49,6 +51,14 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 		auto       finish = begin + region.RegionSize;
 		if (finish < begin) {
 			finish = UINT64_MAX;
+		}
+		// KYTY_GUEST_LAZY_COMMIT: never-touched pages of a guest view are readable (zeros, with the protection they would
+		// have had committed at map): committed now, and looked at again.
+		if (g_prefault != nullptr && finish > current && region.State == MEM_RESERVE && region.Type == MEM_MAPPED &&
+		    g_prefault(reinterpret_cast<const void*>(static_cast<uintptr_t>(current)), (finish < end ? finish : end) - current) &&
+		    ::VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(current)), &region, sizeof(region)) != 0 &&
+		    region.State == MEM_COMMIT) {
+			continue;
 		}
 		if (finish <= current || (region.State & MEM_COMMIT) == 0 ||
 		    !IsAccessible(region.Protect, access)) {
@@ -86,6 +96,10 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 
 	accessible_size = current - addr;
 	return accessible_size != 0;
+}
+
+void SetHostMemoryPrefault(HostMemoryPrefaultFn prefault) {
+	g_prefault = prefault;
 }
 
 bool HostMemoryQueryReadable(uint64_t addr, uint64_t requested_size, uint64_t& readable_size) {

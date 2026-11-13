@@ -149,8 +149,8 @@ public:
 		// cannot be made or its drive has less than the store's size + 4 GiB free.
 		m_file = OpenBackingFile(m_size);
 		if (m_file != INVALID_HANDLE_VALUE) m_on_demand = false; // (SEC_RESERVE is for page-file sections only)
-		// KYTY_GUEST_LAZY_COMMIT=1 (guest-lazy-commit.h): reserved too, but each granule committed at its first touch
-		// (a fault) or protection change, not when a mapping covers it.
+		// KYTY_GUEST_LAZY_COMMIT (guest-lazy-commit.h, on unless =0): reserved too, but each granule committed at its first
+		// touch (a fault, a kernel-mode access), not when a mapping covers it; nothing decommitted or moved later.
 		m_lazy = m_file == INVALID_HANDLE_VALUE && GuestLazyCommit::Requested();
 		if (m_lazy) m_on_demand = true;
 		m_handle = CreateFileMappingA(
@@ -447,7 +447,7 @@ public:
 		for (uint64_t offset = backing_offset; offset < end;) {
 			const uint64_t granule = offset >> UsedGranuleBits;
 			const uint64_t next    = std::min(end, (granule + 1) << UsedGranuleBits);
-			if (IsUsedGranule(granule)) std::memset(m_backing_base + offset, 0, next - offset);
+			if (IsUsedGranule(granule)) ZeroCommitted(offset, next);
 			offset = next;
 		}
 		NoteUsedUnlocked(backing_offset, size);
@@ -1708,6 +1708,8 @@ private:
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr = nullptr;
+		// (Lazy commit: the view known before it is mapped, so a fault on it finds the protections recorded for its pages.)
+		GuestLazyCommit::Register(vaddr, size, backing_offset);
 		// Committing through the writable alias commits the section's pages for every view of them.
 		// (Refused for lack of memory: a release pass and another try, MemGuard.)
 		if (m_on_demand && !m_lazy &&
@@ -1716,6 +1718,7 @@ private:
 		    }) == nullptr) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: commit of %" PRIu64 " bytes failed: 0x%08" PRIx32 "\n",
 			           size, static_cast<uint32_t>(GetLastError()));
+			GuestLazyCommit::Unregister(vaddr);
 			SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
 			return nullptr;
 		}
@@ -1730,6 +1733,7 @@ private:
 			if (ptr != nullptr) {
 				UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			}
+			GuestLazyCommit::Unregister(vaddr);
 			SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
 			return nullptr;
 		}
@@ -1739,6 +1743,7 @@ private:
 		// view mapped again while protections change and pages are paged), and changed nothing.)
 		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, mode)) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
+			GuestLazyCommit::Unregister(vaddr);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;
 		}
@@ -1749,8 +1754,14 @@ private:
 	}
 
 	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
-		LiveTrace::SlowOsCallScope slow(LiveTrace::OsUnmapView, reinterpret_cast<uint64_t>(vaddr), size);
-		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
+		bool unmapped = false;
+		{
+			LiveTrace::SlowOsCallScope slow(LiveTrace::OsUnmapView, reinterpret_cast<uint64_t>(vaddr), size);
+			unmapped = UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
+		}
+		// (Lazy commit: the view and the protections recorded for it forgotten once it is gone.)
+		if (unmapped) GuestLazyCommit::Unregister(reinterpret_cast<uint64_t>(vaddr));
+		return unmapped;
 	}
 
 	HANDLE m_handle = nullptr;
@@ -1801,8 +1812,27 @@ private:
 		if (size == 0) return;
 		const uint64_t last = (backing_offset + size - 1) >> UsedGranuleBits;
 		if (m_used.size() <= (last >> 6)) m_used.resize((last >> 6) + 1, 0);
+		uint64_t first_covered = 0;
 		for (uint64_t granule = backing_offset >> UsedGranuleBits; granule <= last; ++granule) {
-			m_used[granule >> 6] |= uint64_t {1} << (granule & 63);
+			const uint64_t bit = uint64_t {1} << (granule & 63);
+			if ((m_used[granule >> 6] & bit) == 0) ++first_covered;
+			m_used[granule >> 6] |= bit;
+		}
+		if (first_covered != 0) GuestLazyCommit::NoteMapped(first_covered << UsedGranuleBits);
+	}
+	// Zeroes [offset, end) of the backing (lock held), but not its pages still reserved (KYTY_GUEST_LAZY_COMMIT): those
+	// were never committed, so they read zeros once committed, and a memset would only commit them. Nothing is freed.
+	void ZeroCommitted(uint64_t offset, uint64_t end) {
+		if (!GuestLazyCommit::Enabled()) {
+			std::memset(m_backing_base + offset, 0, end - offset);
+			return;
+		}
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		while (offset < end) {
+			const uint64_t next = GuestLazyCommit::RunEnd(base + offset, base + end) - base;
+			const uint64_t stop = next > offset ? next : end;
+			if (!GuestLazyCommit::IsReservedPage(m_backing_base + offset)) std::memset(m_backing_base + offset, 0, stop - offset);
+			offset = stop;
 		}
 	}
 	std::vector<uint64_t>        m_used; // 1 bit per 64 KiB granule of the backing a mapping has covered

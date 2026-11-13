@@ -1038,6 +1038,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-13) KYTY_GUEST_STORE_MB=12288 removed: later direct allocations (104 MiB, 2 MiB) no longer fit and textures
 	// went black at times. The store stays at the PS5 size.
 	// Guest memory committed only where the game maps it (at map time, not moved later): not all 13.8 GB at boot.
+	// (11-13) Superseded by the emulator's lazy commit (on unless KYTY_GUEST_LAZY_COMMIT=0: each 64 KiB committed at its
+	// first touch, never decommitted or moved); this is what KYTY_GUEST_LAZY_COMMIT=0 falls back to.
 	env.Default("KYTY_BACKING_ON_DEMAND", "1");
 	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
 	// (ds-pc-port12, res-1029) Without an upscaler the 3D is the output (native; the game's rows at their height, never above it).

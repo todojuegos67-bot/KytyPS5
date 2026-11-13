@@ -17,6 +17,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -1336,6 +1337,16 @@ bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
 const uint8_t* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingPointer(vaddr, size) : nullptr;
 }
+
+bool PrefaultGuestRange(const void* address, uint64_t size) {
+	return GuestLazyCommit::Prefault(address, size);
+}
+
+// (KYTY_GUEST_LAZY_COMMIT: the host-memory readability queries commit the never-touched guest pages they look at.)
+[[maybe_unused]] static const bool g_host_memory_prefault_set = [] {
+	Libs::Graphics::SetHostMemoryPrefault(&PrefaultGuestRange);
+	return true;
+}();
 
 uint64_t BackingMappingEnd(uint64_t vaddr) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingMappingEnd(vaddr) : 0;

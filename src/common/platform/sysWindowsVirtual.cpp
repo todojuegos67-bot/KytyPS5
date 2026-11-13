@@ -350,14 +350,11 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
                        VirtualMemory::Mode* old_mode) {
 	DWORD old_protect = 0;
-	// KYTY_GUEST_LAZY_COMMIT: guest views (the page manager's watches, the loader's module pages) may still be reserved
-	// pages of the store, which cannot be protected: committed first, and a protect refused on them retried once so.
-	GuestLazyCommit::Prefault(reinterpret_cast<const void*>(static_cast<uintptr_t>(address)), size);
-	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
-	                   GetProtectionFlag(mode), &old_protect) == 0 &&
-	    !(GuestLazyCommit::Enabled() && GuestLazyCommit::Prefault(reinterpret_cast<const void*>(static_cast<uintptr_t>(address)), size) &&
-	      VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size, GetProtectionFlag(mode),
-	                     &old_protect) != 0)) {
+	// KYTY_GUEST_LAZY_COMMIT: guest views (the page manager's watches, guest mprotect) may still be reserved pages of the
+	// store, which Windows cannot protect: their protection is recorded and given when they are committed, or they are
+	// committed first (aliased pages). Anything else: the plain VirtualProtect.
+	if (!GuestLazyCommit::Protect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size, GetProtectionFlag(mode),
+	                              &old_protect)) {
 		printf("VirtualProtect() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
 		return false;
 	}
