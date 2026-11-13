@@ -660,6 +660,20 @@ public:
 		}
 	}
 
+	void CollectCommitted(std::vector<CommittedRange>* out) {
+		Common::LockGuard lock(m_mutex);
+		out->reserve(m_ranges.size());
+		for (const auto& [key, r]: m_ranges) {
+			if (!IsCommittedRangeType(r.type) || r.size == 0) continue;
+			CommittedRange range;
+			range.start = r.start;
+			range.size  = r.size;
+			range.gpu   = (r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0;
+			std::snprintf(range.name, sizeof(range.name), "%s", r.name);
+			out->push_back(range);
+		}
+	}
+
 	// (11-13) Committed guest bytes by access: [0] CPU only, [1] GPU only, [2] both.
 	void SumByAccess(uint64_t out[3]) {
 		Common::LockGuard lock(m_mutex);
@@ -1294,6 +1308,12 @@ bool WriteGuestRanges(const char* path) {
 	g_virtual_ranges->Dump(file);
 	std::fclose(file);
 	return true;
+}
+
+std::vector<CommittedRange> CommittedRanges() {
+	std::vector<CommittedRange> out;
+	if (g_virtual_ranges != nullptr) g_virtual_ranges->CollectCommitted(&out);
+	return out;
 }
 
 bool BackingView(uint64_t* base, uint64_t* size) {

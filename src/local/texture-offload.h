@@ -33,6 +33,7 @@
 // lets the access through, and the render thread removes them (Drain).
 
 #include "guest-lazy-commit.h"
+#include "mem-class.h"
 
 #include <algorithm>
 #include <atomic>
@@ -520,6 +521,7 @@ inline bool OnFault(uint64_t address, uint64_t rip, const void* native_context, 
 			const Touch touch = backing_hit ? (write ? Touch::BackingWrite : Touch::BackingRead)
 			                    : host      ? (write ? Touch::EmulatorGuestWrite : Touch::EmulatorGuestRead)
 			                                : (write ? Touch::GameWrite : Touch::GameRead);
+			if (!host) MemClass::MarkCpu(write, it->first, range.guest_end - it->first);
 			const auto  can_wait = state.can_wait.load(std::memory_order_acquire);
 			if (range.discarded && state.restore.load(std::memory_order_acquire) != nullptr && can_wait != nullptr && can_wait()) {
 				restore_begin = it->first;

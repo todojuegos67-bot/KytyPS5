@@ -134,6 +134,14 @@ bool                   BackingView(uint64_t* base, uint64_t* size);
 // Diagnostics (live `ranges`): the guest's virtual ranges (start, size, direct memory offset, protection, memory type,
 // kind, the name the game gave them) to `path`.
 bool                   WriteGuestRanges(const char* path);
+// Diagnostics (src/local/mem-class.h): the committed guest ranges in address order, with whether the GPU may access them.
+struct CommittedRange {
+	uint64_t start = 0;
+	uint64_t size  = 0;
+	bool     gpu   = false;
+	char     name[KERNEL_MAXIMUM_NAME_LENGTH] {};
+};
+std::vector<CommittedRange> CommittedRanges();
 // The guest's protection over [vaddr, vaddr + size): whether some of it lets the GPU access it, whether some lets the
 // CPU write it. False when the range is not all mapped.
 bool                   GuestRangeAccess(uint64_t vaddr, uint64_t size, bool* gpu, bool* cpu_write);

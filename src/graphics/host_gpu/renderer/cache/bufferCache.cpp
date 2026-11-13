@@ -14,6 +14,7 @@
 #include "readback-queue.h"
 #include "sync-stats.h"
 #include "fresh-memory.h"
+#include "mem-class.h"
 #include "texture-offload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -2631,6 +2632,7 @@ StreamBuffer& BufferCache::GetTableUploadBuffer() noexcept {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	MemClass::Mark(is_written ? MemClass::GpuWrite : MemClass::Buf, vaddr, size);
 	if (auto* spec = Spec::Current()) {
 		// As below: a small range the guest wrote, read from a copy in the (speculation's) ring, as no GPU work wrote
 		// it (speculation-state.h) and with no guest memory write of the speculation pending over it.

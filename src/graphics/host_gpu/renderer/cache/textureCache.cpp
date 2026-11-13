@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "fresh-memory.h"
+#include "mem-class.h"
 #include "guest-lazy-commit.h"
 #include "texture-offload.h"
 #include "async-upload.h"
@@ -4061,6 +4062,8 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
 	}
+	MemClass::Mark(desc.type == BindingType::Storage ? MemClass::GpuWrite : MemClass::Tex, image.info.data.address,
+	               image.info.data.size);
 	if (!image.info.data.Empty()) {
 		PrepareDccClear(id, desc);
 		if (desc.type != BindingType::Texture || !RefreshTextureLevels(id, desc.view_info)) {
@@ -4098,6 +4101,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.MarkGpuModified();
 	if (!image.usage.render_target) ++image.validity;
 	image.usage.render_target = true;
+	MemClass::Mark(MemClass::GpuWrite, image.info.data.address, image.info.data.size);
 	PrepareDccClear(id, desc);
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -4120,6 +4124,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.MarkGpuModified();
 	if (!image.usage.depth_target) ++image.validity;
 	image.usage.depth_target = true;
+	MemClass::Mark(MemClass::GpuWrite, image.info.data.address, image.info.data.size);
 	const bool scoped = RefreshDepthLayers(id, desc.view_info);
 	if (!scoped) {
 		RefreshImage(id);

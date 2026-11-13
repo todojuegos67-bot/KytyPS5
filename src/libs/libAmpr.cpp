@@ -13,6 +13,7 @@
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 #include "local-platform.h"
+#include "mem-class.h"
 #include "scene-tags.h"
 #include "shader-gate.h"
 #include "slow-log.h"
@@ -1587,6 +1588,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		reading = Clock::now() - start - opening;
 		LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
 		LogAprRead(host_path, destination, *bytes_read, file_offset);
+		MemClass::Mark(MemClass::Disk, destination, *bytes_read);
 		return OK;
 	}
 
@@ -1641,6 +1643,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		}
 		LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
 		LogAprRead(host_path, destination, *bytes_read, file_offset);
+		MemClass::Mark(MemClass::Disk, destination, *bytes_read);
 		return OK;
 	}
 
@@ -1685,6 +1688,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		*bytes_read += read;
 	}
 	LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
+	MemClass::Mark(MemClass::Disk, destination, *bytes_read);
 
 	file.Close();
 	return OK;
