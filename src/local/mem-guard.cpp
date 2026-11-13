@@ -214,7 +214,7 @@ struct BoxArgs {
 BoxArgs g_box;
 DWORD WINAPI BoxThread(LPVOID p) {
 	const auto* a = static_cast<BoxArgs*>(p);
-	a->box(nullptr, a->text, L"KytyPS5 - memoria / memory",
+	a->box(nullptr, a->text, L"Demon's Souls - memoria / memory",
 	       MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL);
 	return 0;
 }
@@ -236,16 +236,16 @@ void ShowBox(const wchar_t* text) {
 }
 
 constexpr const wchar_t* OutOfMemoryText =
-    L"No hay suficiente memoria RAM: el emulador se ha quedado sin memoria.\n"
+    L"No hay suficiente memoria RAM: el juego se ha quedado sin memoria.\n"
     L"Cierra otros programas (navegadores, Discord, launchers) y vuelve a jugar.\n"
     L"En el launcher: marca \"Equipo de 16 GB RAM\" (con 16 GB se marca solo).\n\n"
-    L"Not enough RAM: the emulator ran out of memory.\n"
+    L"Not enough RAM: the game ran out of memory.\n"
     L"Close other programs (browsers, Discord, launchers) and start the game again.\n"
     L"In the launcher: tick \"16 GB RAM PC\" (on 16 GB PCs it is ticked for you).";
 constexpr const wchar_t* NearlyOutText =
-    L"El emulador se ha cerrado con la memoria RAM casi llena: lo mas probable es que falte memoria.\n"
+    L"El juego se ha cerrado con la memoria RAM casi llena: lo mas probable es que falte memoria.\n"
     L"Cierra otros programas (navegadores, Discord, launchers) y vuelve a jugar.\n\n"
-    L"The emulator stopped while RAM was nearly full: most likely it ran out of memory.\n"
+    L"The game stopped while RAM was nearly full: most likely it ran out of memory.\n"
     L"Close other programs (browsers, Discord, launchers) and start the game again.";
 #endif
 

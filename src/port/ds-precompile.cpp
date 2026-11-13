@@ -413,7 +413,7 @@ void Work() {
 	GetTempPathW(MAX_PATH, temp);
 	const auto stamp = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
 	g_logs           = root / L"logs" / fs::u8path(stamp + "-precompile");
-	g_nvidia         = fs::path(temp) / fs::u8path("kyty-precompile-" + stamp);
+	g_nvidia         = fs::path(temp) / fs::u8path("DemonsSouls-precompile-" + stamp);
 	std::error_code ec;
 	fs::create_directories(g_logs, ec);
 	ForgetCachesWarmedUnderAnotherName();
@@ -683,7 +683,7 @@ void Work() {
 			                 true);
 			if (c.process == nullptr) {
 				kill_all();
-				return fail("No se pudo arrancar kyty_shader_precompile.exe.");
+				return fail("No se pudo arrancar el compilador de shaders.");
 			}
 			running.push_back({item, c, name});
 		}

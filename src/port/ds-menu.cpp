@@ -2438,7 +2438,7 @@ void Draw(float width, float height) {
 					}
 					if (s.rt_sun && s.rt_hw_exp && (s.godrays != "0" || s.rt_shadows != "0")) s.rt_sun = false;
 					if (CheckRow("Juego original (sin efectos añadidos)", s.pure_game != l.pure_game, s.pure_game,
-					             "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, humo, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, DLSS 5, frame generation y latencia no cambian."))
+					             "Apaga todos los efectos visuales que añade la versión de PC (ray tracing, luz volumétrica, humo, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, DLSS 5, frame generation y latencia no cambian."))
 						live_changed = true;
 					break;
 				}
@@ -2533,19 +2533,19 @@ void Draw(float width, float height) {
 					ImGui::SameLine();
 					ImGui::TextColored(kGold, "%s", I18n::T("Opciones de rendimiento"));
 					CheckRow("Registros PM4 directos", s.perf_pm4_regfile != g_rt.launched.perf_pm4_regfile, s.perf_pm4_regfile,
-					         "Guarda directamente los registros de la GPU que no necesitan procesarse (comprobado al empezar). Menos trabajo de CPU por dibujo. Experimental (KYTY_PM4_REGFILE).");
+					         "Guarda directamente los registros de la GPU que no necesitan procesarse (comprobado al empezar). Menos trabajo de CPU por dibujo. Experimental.");
 					CheckRow("Subidas a la GPU en dos hilos", s.perf_upload_lanes != g_rt.launched.perf_upload_lanes, s.perf_upload_lanes,
-					         "Reparte la protección de memoria de las subidas a la GPU entre dos hilos. Ayuda en zonas con mucha carga de texturas en CPUs de 8 núcleos o más. Experimental (KYTY_UPLOAD_LANES).");
+					         "Reparte la protección de memoria de las subidas a la GPU entre dos hilos. Ayuda en zonas con mucha carga de texturas en CPUs de 8 núcleos o más. Experimental.");
 					CheckRow("El render ayuda con las subidas", s.perf_upload_help != g_rt.launched.perf_upload_help, s.perf_upload_help,
-					         "Si la CPU va cargada, el hilo de render hace él mismo las subidas pendientes en vez de esperar. Bueno en CPUs de 4-6 núcleos y portátiles (KYTY_UPLOAD_HELP).");
+					         "Si la CPU va cargada, el hilo de render hace él mismo las subidas pendientes en vez de esperar. Bueno en CPUs de 4-6 núcleos y portátiles.");
 					CheckRow("Hilos sin espera activa con CPU cargada", s.perf_spin_gate != g_rt.launched.perf_spin_gate, s.perf_spin_gate,
-					         "Los hilos de ayuda dejan de girar en vacío cuando quedan menos de 3 núcleos libres, dejando la CPU al juego. Para CPUs justas (KYTY_SPIN_GATE).");
+					         "Los hilos de ayuda dejan de girar en vacío cuando quedan menos de 3 núcleos libres, dejando la CPU al juego. Para CPUs justas.");
 					CheckRow("Copias de la GPU anticipadas", s.perf_eager_feedback != g_rt.launched.perf_eager_feedback, s.perf_eager_feedback,
-					         "Devuelve a la memoria del juego las copias ya terminadas de la GPU antes de que las pida, evitando esperas. Puede quitar tirones. Experimental (KYTY_EAGER_FEEDBACK).");
+					         "Devuelve a la memoria del juego las copias ya terminadas de la GPU antes de que las pida, evitando esperas. Puede quitar tirones. Experimental.");
 					CheckRow("Copias de la GPU agrupadas", s.perf_feedback_batch != g_rt.launched.perf_feedback_batch, s.perf_feedback_batch,
-					         "Graba juntas las copias de la GPU de cada bloque de comandos en vez de una a una. Experimental (KYTY_FEEDBACK_BATCH).");
+					         "Graba juntas las copias de la GPU de cada bloque de comandos en vez de una a una. Experimental.");
 					CheckRow("Shaders lane-local ampliados", s.perf_lane_wide != g_rt.launched.perf_lane_wide, s.perf_lane_wide,
-					         "Más shaders de cálculo se traducen en su forma rápida. Cambia esos shaders: la primera vez se vuelven a compilar (algo de carga al empezar). Experimental (KYTY_LANE_LOCAL_WIDE).");
+					         "Más shaders de cálculo se traducen en su forma rápida. Cambia esos shaders: la primera vez se vuelven a compilar (algo de carga al empezar). Experimental.");
 					CheckRow("Carga de shaders al máximo", true, s.shader_turbo,
 					         "La preparación de shaders al empezar la partida con todos los hilos de la CPU (en prioridad baja: el juego va primero). Mucho más rápida; mientras dura pueden bajar algo los FPS. No = pocos hilos, como antes (para portátiles o CPUs justas).");
 					{
@@ -2578,7 +2578,7 @@ void Draw(float width, float height) {
 					{
 						float cam = static_cast<float>(s.kbm_camera);
 						if (SliderRow("Velocidad de cámara (ratón)", cam, 5.0f, 15.0f, "%.0f",
-						              "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10. Sin teclado y ratón se usa la del menú del juego. Con el ratón en modo directo (por defecto, KYTY_KBM_DIRECT) ya no limita al ratón: el ratón gira la cámara exactamente su ángulo, sin tope; solo afecta al stick."))
+						              "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10. Sin teclado y ratón se usa la del menú del juego. Con el ratón en modo directo (por defecto) ya no limita al ratón: el ratón gira la cámara exactamente su ángulo, sin tope; solo afecta al stick."))
 							s.kbm_camera = std::clamp(static_cast<int>(std::lround(cam)), 5, 15);
 						restart_note(s.kbm_camera != l.kbm_camera);
 					}
@@ -3244,7 +3244,7 @@ void SetBigPagefile() {
 	    "pause\r\n";
 	char dir[MAX_PATH] = {};
 	if (GetTempPathA(MAX_PATH, dir) == 0) return;
-	const std::string path = std::string(dir) + "kyty-pagefile-60gb.cmd";
+	const std::string path = std::string(dir) + "DemonsSouls-pagefile-60gb.cmd";
 	if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
 		std::fwrite(script, 1, std::strlen(script), f);
 		std::fclose(f);
@@ -3515,7 +3515,7 @@ void LauncherRayTracing(Settings& s) {
 	}
 	if (s.rt_sun && s.rt_hw_exp && (s.godrays != "0" || s.rt_shadows != "0")) s.rt_sun = false;
 	LCheckRow("Juego original (sin efectos añadidos)", s.pure_game,
-	          "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, humo, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, DLSS 5, frame generation y latencia no cambian.");
+	          "Apaga todos los efectos visuales que añade la versión de PC (ray tracing, luz volumétrica, humo, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, DLSS 5, frame generation y latencia no cambian.");
 	BoxEnd();
 }
 
@@ -3648,7 +3648,7 @@ void LauncherPerformance(Settings& s) {
 	LCheckRow("Ayuda extra si el procesador va justo", s.perf_upload_help,
 	          "Cuando el procesador va muy ocupado, el hilo que dibuja cada imagen hace él mismo los envíos de texturas pendientes en vez de quedarse esperando. En procesadores de 4 a 6 núcleos y portátiles puede dar unos FPS más (en pruebas, hasta un 4 %). Con un procesador sobrado casi nunca actúa: ahí da igual.");
 	LCheckRow("Liberar el procesador cuando va saturado", s.perf_spin_gate,
-	          "Unos hilos de ayuda del emulador esperan trabajo dando vueltas sin parar (gastan procesador sin hacer nada útil). Con esto dejan de hacerlo cuando quedan menos de 3 núcleos libres, y ese procesador vuelve al juego. En procesadores de 4 a 6 núcleos reduce bastante los bajones de FPS y los tirones. Con muchos núcleos casi nunca actúa. Recomendado en portátiles y PCs modestos.");
+	          "Unos hilos de ayuda en segundo plano esperan trabajo dando vueltas sin parar (gastan procesador sin hacer nada útil). Con esto dejan de hacerlo cuando quedan menos de 3 núcleos libres, y ese procesador vuelve al juego. En procesadores de 4 a 6 núcleos reduce bastante los bajones de FPS y los tirones. Con muchos núcleos casi nunca actúa. Recomendado en portátiles y PCs modestos.");
 	LCheckRow("Devolver antes las copias de la gráfica", s.perf_eager_feedback,
 	          "Cuando la gráfica termina una copia de datos que el juego leerá después, se le devuelve en cuanto está lista en vez de esperar a que la pida. Así el juego no se queda esperando: puede quitar algunos tirones. No cambia la imagen. Experimental: si notas fallos, apágalo.");
 	LCheckRow("Agrupar las copias de la gráfica", s.perf_feedback_batch,
@@ -3676,7 +3676,7 @@ void LauncherControls(Settings& s) {
 		const float y   = RowY();
 		float       cam = static_cast<float>(s.kbm_camera);
 		if (LSlider(y, "Velocidad de cámara (ratón)", cam, 5.0f, 15.0f, "%.0f",
-		            "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10. Con el ratón en modo directo (por defecto, KYTY_KBM_DIRECT) ya no limita al ratón: el ratón gira la cámara exactamente su ángulo, sin tope; solo afecta al stick.",
+		            "La velocidad máxima de giro de la cámara del juego con teclado y ratón. 10 = el máximo del menú del juego. 11-15 (extra, experimental): más rápido que el menú; si la cámara hace cosas raras, vuelve a 10. Con el ratón en modo directo (por defecto) ya no limita al ratón: el ratón gira la cámara exactamente su ángulo, sin tope; solo afecta al stick.",
 		            12, 190))
 			s.kbm_camera = std::clamp(static_cast<int>(std::lround(cam)), 5, 15);
 		LCheck(y + U(20), "Cámara instantánea", s.kbm_warp,
@@ -4433,7 +4433,7 @@ void DrawLauncher(float width, float height) {
 			g_lbox.w      = U(420);
 			const float y = RowY();
 			if (LButton(g_show_game_settings ? "Ajustes del juego  ^" : "Ajustes del juego  v", {g_lbox.at.x, y}, {U(420), U(38)}, false,
-			            g_font_semi, U(16), "Los ajustes del propio juego (sombras, niebla, reflejos, distancia...), como en el lanzador del emulador."))
+			            g_font_semi, U(16), "Los ajustes del propio juego (sombras, niebla, reflejos, distancia...), como en el lanzador."))
 				g_show_game_settings = !g_show_game_settings;
 			RowEnd(y, 46);
 		}
