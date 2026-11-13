@@ -704,10 +704,13 @@ struct FaultStats {
 	// By host pc. A search of a list of them was ~4,000 sites long in GT7, a scan of 200 KB for
 	// every one of ~30,000 faults a second, under this lock.
 	std::unordered_map<uint64_t, Site> sites;
+	std::unordered_map<uint64_t, uint64_t> pages; // faults by 16 KB guest page since the last report
 	uint64_t                           total    = 0;
 	uint64_t                           reported = 0;
 };
 FaultStats g_fault_stats;
+// The fault report is written even with the log silenced, like the Perf lines.
+#define KYTY_FAULT_LOG(...) ::Log::WriteUnmuted(fmt::sprintf(__VA_ARGS__))
 
 void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bool gpu_thread,
                         uint64_t micros, bool emulated) {
@@ -716,7 +719,7 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 		// get a full host stack so the command-processor path responsible can be named.
 		static std::atomic<uint32_t> traced = 0;
 		if (traced.fetch_add(1) < 48) {
-			LOGF("TrackedFault on GPU thread: %s vaddr=0x%016" PRIx64 " pc=0x%016" PRIx64 "\n%s",
+			KYTY_FAULT_LOG("TrackedFault on GPU thread: %s vaddr=0x%016" PRIx64 " pc=0x%016" PRIx64 "\n%s",
 			     is_read ? "read" : "write", guest_vaddr, host_pc,
 			     Common::HostBacktrace().c_str());
 		}
@@ -733,12 +736,23 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	site_entry.vaddr = guest_vaddr;
 	site_entry.emulated += emulated ? 1 : 0;
 	site_entry.tid = Common::PerfStats::CurrentOsThreadId();
+	stats.pages[guest_vaddr >> 14]++;
 	// Every 50,000 faults: every 5,000 was five reports a second in races, each three sorts of
 	// the sites under this lock and 33 lines of log.
-	if (stats.total - stats.reported < 50000) {
+	if (stats.total - stats.reported < 500000) {
 		return;
 	}
 	stats.reported = stats.total;
+	{
+		std::vector<std::pair<uint64_t, uint64_t>> pages(stats.pages.begin(), stats.pages.end());
+		std::sort(pages.begin(), pages.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+		std::string line = fmt::format("TrackedFault pages: {} distinct:", pages.size());
+		for (size_t i = 0; i < std::min<size_t>(pages.size(), 16); i++) {
+			line += fmt::format(" 0x{:x}={}", pages[i].first << 14, pages[i].second);
+		}
+		Log::WriteUnmuted(line + "\n");
+		stats.pages.clear();
+	}
 	std::vector<FaultStats::Site> sites;
 	sites.reserve(stats.sites.size());
 	for (const auto& [pc, site]: stats.sites) {
@@ -764,11 +778,11 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 		return fmt::format(" thread={} insn=\"{}\"", Common::PerfStats::ThreadNameOf(site.tid),
 		                   entry.instruction);
 	};
-	LOGF("TrackedFaults: total=%" PRIu64 " gpu_thread=%" PRIu64 " distinct_sites=%zu\n", stats.total,
+	KYTY_FAULT_LOG("TrackedFaults: total=%" PRIu64 " gpu_thread=%" PRIu64 " distinct_sites=%zu\n", stats.total,
 	     gpu_total, stats.sites.size());
 	for (size_t i = 0; i < std::min<size_t>(sites.size(), 12); i++) {
 		const auto& site = sites[i];
-		LOGF("\t pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 " gpu_thread=%" PRIu64
+		KYTY_FAULT_LOG("\t pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 " gpu_thread=%" PRIu64
 		     " emulated=%" PRIu64 "%s\n",
 		     site.address, site.count, site.reads, site.gpu, site.emulated, describe(site).c_str());
 	}
@@ -776,7 +790,7 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.gpu > b.gpu; });
 	for (size_t i = 0; i < std::min<size_t>(sites.size(), 8) && sites[i].gpu != 0; i++) {
 		const auto& site = sites[i];
-		LOGF("\t gpu-thread pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 "\n", site.address,
+		KYTY_FAULT_LOG("\t gpu-thread pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 "\n", site.address,
 		     site.gpu, site.reads);
 	}
 	std::sort(sites.begin(), sites.end(), [](const FaultStats::Site& a, const FaultStats::Site& b) {
@@ -784,7 +798,7 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	});
 	for (size_t i = 0; i < std::min<size_t>(sites.size(), 12); i++) {
 		const auto& site = sites[i];
-		LOGF("\t slow pc=0x%016" PRIx64 " ms=%" PRIu64 " count=%" PRIu64 " reads=%" PRIu64
+		KYTY_FAULT_LOG("\t slow pc=0x%016" PRIx64 " ms=%" PRIu64 " count=%" PRIu64 " reads=%" PRIu64
 		     " emulated=%" PRIu64 " gpu_thread=%" PRIu64 " last_vaddr=0x%016" PRIx64 "%s\n",
 		     site.address, site.micros / 1000, site.count, site.reads, site.emulated, site.gpu,
 		     site.vaddr, describe(site).c_str());
