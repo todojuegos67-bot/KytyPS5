@@ -193,7 +193,7 @@ struct Settings {
 	bool        kbm_calibrate = false; // (10-28) the next start measures the camera into kbm_curve.txt (KYTY_KBM_CALIBRATE), once
 	// [Configurador] (10-28)
 	bool        configured = false;  // the first-start dialog has been shown
-	bool        ram16_boost = true; // (11-13) on by default on every PC: less RAM // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
+	bool        ram16_boost = false; // (11-13) on by default on every PC: less RAM // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
 	// (perfopts-1107) Opciones de rendimiento: upstream's opt-in switches (all off = the behaviour before them).
 	bool        perf_pm4_regfile = false;   // KYTY_PM4_REGFILE=1
 	bool        perf_upload_lanes = false;  // KYTY_UPLOAD_LANES=2

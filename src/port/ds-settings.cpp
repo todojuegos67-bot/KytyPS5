@@ -315,6 +315,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("raton_calibrar", s->kbm_calibrate);
 	boo("configurado", s->configured);
 	boo("ahorro_memoria_v3", s->ram16_boost); // (port28) new key: the old one was on by default
+	s->ram16_boost = false; // (11-13) options removed: Ahorro de memoria RAM and Modo seguro
+	s->safe_gpu    = false;
 	boo("rend_registros_pm4", s->perf_pm4_regfile);
 	boo("rend_subidas_dos_hilos", s->perf_upload_lanes);
 	boo("rend_ayuda_subidas", s->perf_upload_help);
@@ -1629,7 +1631,7 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	s->motion_blur = s->dof = s->vignette = s->bloom = s->eye_adapt = true;
 	s->pure_game = false;
 	// The RAM (16 GB or less: the launcher's 16 GB profile; textures and distance at most Alto).
-	s->ram16_boost = true; // (11-13) memory saving on every PC
+	s->ram16_boost = false; // (11-13) option removed
 	if (s->ram16_boost) {
 		if (s->texture_reduce == "0") s->texture_reduce = "h";
 		if (s->quality == "standard") s->quality = "high";

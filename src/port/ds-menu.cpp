@@ -2525,11 +2525,7 @@ void Draw(float width, float height) {
 					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile, on PCs of 20 GB or less.
 					const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
 					(void)small; // (port28) always shown and usable; off by default
-						CheckRow("Ahorro de memoria RAM", s.ram16_boost != g_rt.launched.ram16_boost, s.ram16_boost,
-						         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Pensado para PCs de 16 GB de RAM. No cambia los gráficos.");
 					s.profile16 = LowRam(s, g_rt.pc);
-					if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
-					CheckRow("Modo GPU seguro", true, s.safe_gpu, "Para gráficas que se cuelgan o dan pantallazo azul: más estable, ~37% menos FPS.");
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.");
 					// (perfopts-1107) Opciones de rendimiento (upstream's opt-in switches; at the next start).
 					ImGui::Spacing();
@@ -3612,19 +3608,6 @@ void LauncherConfigurator(Settings& s) {
 
 void LauncherPerformance(Settings& s) {
 	BoxBegin("Rendimiento / PC");
-	const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
-	{ // (port28) always shown and usable; off by default
-		const float y = RowY();
-		LCheck(y, "Ahorro de memoria RAM", s.ram16_boost,
-		       "Usa la memoria con más cuidado: reserva 6 GB fijos para el juego y la carga anticipada de datos espera si queda poca RAM libre. Evita cierres y tirones fuertes por falta de memoria. No cambia los gráficos y normalmente no cuesta FPS. Actívalo si tu PC tiene 16 GB de RAM o menos; con 32 GB no hace falta.");
-		RowEnd(y);
-		if (small && s.ram16_boost) {
-			const float ny = RowY();
-			ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), ny});
-			ImGui::TextColored(kGoldL, "%s", I18n::T("RAM justa: perfil seguro. Cierra los navegadores mientras juegas."));
-			RowEnd(ny, 24);
-		}
-	}
 	{
 		const float y = RowY();
 		if (LButton("Archivo de paginación de 60 GB", {g_lbox.at.x + U(12), y}, {U(396), U(32)}, false, g_font_semi, U(15),
@@ -3645,7 +3628,6 @@ void LauncherPerformance(Settings& s) {
 	s.profile16 = LowRam(s, g_rt.pc);
 	{
 		const float y = RowY();
-		LCheck(y, "Modo seguro", s.safe_gpu, "Apaga una forma más rápida de mandar trabajo a la gráfica. Es más estable en gráficas o drivers que se cuelgan o dan pantallazo azul, pero cuesta mucho: unos 37 % menos de FPS. Déjalo apagado salvo que el juego se te cuelgue o te dé pantallazos.", 12);
 		LCheck(y, "Todos los núcleos", s.all_ccds, "Solo para Ryzen con dos bloques de núcleos (CCD), como un 7950X3D o un 5900X; en otros procesadores no cambia nada. Apagado: el juego usa solo el bloque con más caché (memoria rápida dentro del procesador), que suele dar más FPS y menos tirones. Encendido: usa todos los núcleos. Déjalo apagado salvo que notes que encendido te va mejor.", 216);
 		RowEnd(y);
 	}
