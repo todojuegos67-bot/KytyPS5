@@ -13,22 +13,43 @@
 // run once every 60 frames.
 // Stats words: 0 object px, 1 blended px, 2 all px, 3 checked px, 4 err obj, 5 err cam,
 // 6 px where obj wins, 7 px where cam wins, 8 static px, 9 sum |obj-cam| (1/16 px),
-// 10 sum |obj| (1/16 px).
+// 10 sum |obj| (1/16 px), 16 fog px (coverage > 0.02), 17 sum coverage (1/1024), 18 dense fog px
+// (coverage > 0.5), 19 fog px over an object's own vector (class 1 / 4).
+// bb-fog-mv (flags bit 6): .w is the coverage of the blended draws (fog, smoke, particles) that
+// wrote their own static-world vector over the one behind ((dx, dy) already weighted by the
+// blending). Where nothing opaque wrote a vector (class 0: sky, backup) the camera vector is what
+// lies behind them: v = (dx, dy) + (1 - coverage) * camera. Bit 7: the coverage also raises the
+// upscaler's reactive mask (binding 6).
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D obj_mv;
 layout(binding = 1, rg16f) uniform image2D mv_out;
 layout(binding = 2, std430) buffer Stats {
-    uint s[16];
+    uint s[20];
 } st;
 layout(binding = 3) uniform sampler2D cur_color;
 layout(binding = 4) uniform sampler2D prev_color;
 layout(binding = 5, rgba16f) uniform writeonly image2D next_prev_color;
+layout(binding = 6, r16f) uniform image2D reactive_io;
 layout(push_constant) uniform Push {
     uvec4 size; // width, height, replace (0 on history resets), flags
 } p;
 
 shared uint g_nz, g_obj, g_blend, g_all, g_chk, g_eo, g_ec, g_wo, g_wc, g_st, g_sa, g_sz;
+shared uint g_fp, g_fw, g_fd, g_fo;
+
+const float kFogMin = 0.02;
+
+// bb-fog-mv: the vector of a pixel with blended coverage `cov` (class o.z of the opaque draw
+// behind: > 0.5 when it wrote a vector, which the blending already weighted).
+vec2 FogVector(vec4 o, vec2 camv, float cov) {
+    return o.z > 0.5 ? o.xy : o.xy + (1.0 - cov) * camv;
+}
+
+void FogReactive(ivec2 c, float cov) {
+    const float r = imageLoad(reactive_io, c).r;
+    imageStore(reactive_io, c, vec4(max(r, smoothstep(0.2, 0.9, cov) * 0.5)));
+}
 
 float Luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
@@ -88,20 +109,27 @@ void main() {
     // bb-native-mv2 (flags bit 5): skinned draws are class 4 and the player mask is them in the
     // centre (else: moving opaque pixels in the centre whose vector differs from the camera's).
     const bool characters = (flags & 32u) != 0u;
+    const bool fog = (flags & 64u) != 0u;
+    const bool fog_rx = (flags & 128u) != 0u;
     if ((flags & 1u) == 0u) {
-        // Normal frame: replace the camera vector on object pixels, nothing else.
+        // Normal frame: replace the camera vector on object pixels (and, bb-fog-mv, under
+        // blended draws with their own vector), nothing else.
         if (!inside || p.size.z == 0u) return;
         const vec4 o = texelFetch(obj_mv, c, 0);
+        const float cov = fog ? clamp(o.w, 0.0, 1.0) : 0.0;
+        const bool object = (o.z > 0.5 && o.z < 1.5) || o.z > 2.5;
+        const bool fogged = cov > kFogMin;
         bool player = false;
-        if ((o.z > 0.5 && o.z < 1.5) || o.z > 2.5) {
+        if (object || fogged) {
             if (!any(isnan(o.xy)) && !any(isinf(o.xy))) {
                 const vec2 camv = imageLoad(mv_out, c).xy;
-                vec2 v = o.xy;
+                vec2 v = fogged ? FogVector(o, camv, cov) : o.xy;
                 if (additive) v += camv;
                 // Only what moves against the world (the player, not the tree behind it: static
                 // scenery in the centre took refined vectors and deformed).
+                // (bb-fog-mv: not under dense fog / smoke, whose vector is no longer the object's.)
                 const bool candidate =
-                    PlayerPixel(c, vec2(p.size.xy)) &&
+                    object && cov <= 0.5 && PlayerPixel(c, vec2(p.size.xy)) &&
                     (characters ? o.z > 3.5 : (o.z < 1.5 && length(v - camv) > 0.75));
                 if (candidate && (characters || (flags & 16u) != 0u)) {
                     player = true;
@@ -109,6 +137,7 @@ void main() {
                     if ((flags & 16u) != 0u) v = Refine(c, v, additive);
                 }
                 imageStore(mv_out, c, vec4(v, 0.0, 0.0));
+                if (fog_rx && fogged) FogReactive(c, cov);
             }
         }
         if ((flags & 4u) != 0u) {
@@ -121,6 +150,7 @@ void main() {
     if (gl_LocalInvocationIndex == 0u) {
         g_nz = 0u; g_obj = 0u; g_blend = 0u; g_all = 0u; g_chk = 0u;
         g_eo = 0u; g_ec = 0u; g_wo = 0u; g_wc = 0u; g_st = 0u; g_sa = 0u; g_sz = 0u;
+        g_fp = 0u; g_fw = 0u; g_fd = 0u; g_fo = 0u;
     }
     barrier();
     if (inside) {
@@ -129,7 +159,27 @@ void main() {
         if (any(notEqual(o, vec4(0.0)))) atomicAdd(g_nz, 1u);
         const vec2 cam = imageLoad(mv_out, c).xy;
         const bool finite = !any(isnan(o.xy)) && !any(isinf(o.xy));
-        if (finite && o.z > 1.5 && o.z < 2.5) {
+        const float cov = fog ? clamp(o.w, 0.0, 1.0) : 0.0;
+        if (cov > kFogMin) {
+            atomicAdd(g_fp, 1u);
+            atomicAdd(g_fw, uint(cov * 1024.0));
+            if (cov > 0.5) atomicAdd(g_fd, 1u);
+            if ((o.z > 0.5 && o.z < 1.5) || o.z > 3.5) atomicAdd(g_fo, 1u);
+        }
+        if (finite && cov > kFogMin && !((o.z > 0.5 && o.z < 1.5) || o.z > 2.5)) {
+            // bb-fog-mv: blended draws over the camera vector (class 0) or a sampled static draw
+            // (class 2: its statistics stay those of the draw).
+            if (o.z > 1.5 && o.z < 2.5) {
+                atomicAdd(g_st, 1u);
+                atomicAdd(g_sa, uint(min(length(o.xy - cam), 64.0) * 16.0));
+                atomicAdd(g_sz, uint(min(length(o.xy), 64.0) * 16.0));
+            }
+            if (p.size.z != 0u) {
+                imageStore(mv_out, c, vec4(FogVector(o, cam, cov) + (additive ? cam : vec2(0.0)),
+                                           0.0, 0.0));
+                if (fog_rx) FogReactive(c, cov);
+            }
+        } else if (finite && o.z > 1.5 && o.z < 2.5) {
             // Static draw: its object vector must equal the camera vector (absolute mode) or
             // be ~0 (additive mode).
             atomicAdd(g_st, 1u);
@@ -152,11 +202,12 @@ void main() {
                 else if (ec + 1e-3 < eo) atomicAdd(g_wc, 1u);
             }
             if (p.size.z != 0u) {
-                imageStore(mv_out, c, vec4(ov, 0.0, 0.0));
+                imageStore(mv_out, c, vec4(ov, 0.0, 0.0)); // (fog already weighted into o.xy)
+                if (fog_rx && cov > kFogMin) FogReactive(c, cov);
             }
         }
         if ((flags & 4u) != 0u) {
-            const bool pl = finite && PlayerPixel(c, vec2(p.size.xy)) &&
+            const bool pl = finite && cov <= 0.5 && PlayerPixel(c, vec2(p.size.xy)) &&
                             (characters ? o.z > 3.5
                                         : (o.z > 0.5 && o.z < 1.5 &&
                                            length((additive ? o.xy + cam : o.xy) - cam) > 0.75));
@@ -175,6 +226,12 @@ void main() {
             atomicAdd(st.s[5], g_ec);
             atomicAdd(st.s[6], g_wo);
             atomicAdd(st.s[7], g_wc);
+        }
+        if (g_fp != 0u) {
+            atomicAdd(st.s[16], g_fp);
+            atomicAdd(st.s[17], g_fw);
+            atomicAdd(st.s[18], g_fd);
+            atomicAdd(st.s[19], g_fo);
         }
         if (g_st != 0u) {
             atomicAdd(st.s[8], g_st);

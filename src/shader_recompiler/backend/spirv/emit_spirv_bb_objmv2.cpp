@@ -142,10 +142,11 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
     const Id written = ctx.OpLogicalAnd(
         b, ctx.OpLogicalAnd(b, ctx.OpLogicalAnd(b, front, ctx.OpLogicalNot(b, bad)), sane),
         ctx.OpFOrdGreaterThan(b, ctx.OpCompositeExtract(f32, previous, 2u), ctx.Constant(f32, 0.5f)));
-    // Attachment 7 is RGBA16F: (dx, dy, class, weight). Opaque draws: weight 1 (written over
-    // whatever was behind, class 0 where no vector: the camera vector stays). Blended draws
-    // (particles, effects; attachment 7 blends with src alpha): weight = their MRT 0 alpha, so
-    // the vector behind is alpha-weighted with theirs; no vector -> weight 0 (nothing changes).
+    // Attachment 7 is RGBA16F: (dx, dy, class, weight). Opaque draws: written over whatever was
+    // behind (class 0 where no vector: the camera vector stays), weight 0. Blended draws
+    // (particles, effects, fog; attachment 7 blends with src alpha): weight from their MRT 0
+    // alpha, so the vector behind is weighted with theirs; no vector -> weight 0 (nothing
+    // changes). With bb-fog-mv the class channel is masked for them and .w accumulates.
     const Id zero = ctx.Constant(f32, 0.0f);
     const Id one = ctx.Constant(f32, 1.0f);
     // Class 1: moving opaque draw; 2: static draw run only for the check (flags bit 1, never
@@ -158,15 +159,35 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
     const Id character = ctx.OpINotEqual(b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(4u)),
                                          ctx.u32_zero_value);
     cls = ctx.OpSelect(f32, character, ctx.Constant(f32, 4.0f), cls);
-    Id weight = one;
+    // bb-fog-mv: opaque draws write weight 0: .w of attachment 7 is the coverage of the blended
+    // draws in front (fog, smoke, particles), accumulated by blending (nothing reads .w else).
+    Id weight = zero;
     if (ctx.runtime_info.hw.fs.bb_objmv_blend) {
         cls = ctx.Constant(f32, 3.0f);
         const auto& mrt0 = ctx.frag_outputs[0];
         if (Sirit::ValidId(mrt0.id) && mrt0.num_components == 4 && !mrt0.is_integer) {
-            const Id alpha = ctx.OpCompositeExtract(f32, ctx.OpLoad(ctx.F32[4], mrt0.id), 3u);
-            weight = ctx.OpSelect(f32, written, ctx.OpFClamp(f32, alpha, zero, one), zero);
-        } else {
-            weight = zero;
+            const Id alpha = ctx.OpFClamp(
+                f32, ctx.OpCompositeExtract(f32, ctx.OpLoad(ctx.F32[4], mrt0.id), 3u), zero, one);
+            // bb-fog-mv (flags bit 3): density weighting, weight = alpha * smoothstep(lo, hi,
+            // alpha) (push word lo | hi << 16, 1/65535): thin wisps leave the vector behind
+            // (characters keep theirs), dense layers weigh by their opacity. Attachment 7 then
+            // blends (dx, dy) with this weight and accumulates it in .w (the class is kept).
+            const Id fog = ctx.OpINotEqual(
+                b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(8u)), ctx.u32_zero_value);
+            const Id curve = PushU32(ctx, PushData::ObjMvFogIndex);
+            const Id inv = ctx.Constant(f32, 1.0f / 65535.0f);
+            const Id lo_bits = ctx.OpBitwiseAnd(ctx.U32[1], curve, ctx.ConstU32(0xffffu));
+            const Id hi_bits = ctx.OpShiftRightLogical(ctx.U32[1], curve, ctx.ConstU32(16u));
+            const Id lo = ctx.OpFMul(f32, ctx.OpConvertUToF(f32, lo_bits), inv);
+            const Id hi = ctx.OpFMul(f32, ctx.OpConvertUToF(f32, hi_bits), inv);
+            const Id span = ctx.OpFMax(f32, ctx.OpFSub(f32, hi, lo), ctx.Constant(f32, 1e-3f));
+            const Id t = ctx.OpFClamp(f32, ctx.OpFDiv(f32, ctx.OpFSub(f32, alpha, lo), span),
+                                      zero, one);
+            const Id two_t = ctx.OpFMul(f32, ctx.Constant(f32, 2.0f), t);
+            const Id smooth = ctx.OpFMul(f32, ctx.OpFMul(f32, t, t),
+                                         ctx.OpFSub(f32, ctx.Constant(f32, 3.0f), two_t));
+            const Id dense = ctx.OpFMul(f32, alpha, smooth);
+            weight = ctx.OpSelect(f32, written, ctx.OpSelect(f32, fog, dense, alpha), zero);
         }
     }
     ctx.OpStore(ctx.objmv_frag_out,

@@ -23,6 +23,12 @@
 //  - After bb_mv.comp, a compute pass (bb_objmv2.comp) puts the object vectors over the camera
 //    vectors in the shared motion image: DLSS, FSR 3.1, FSR 4, XeSS, FSR 3 FG and the DLSS-G
 //    bridge all read that image with their existing scaling.
+//  - bb-fog-mv (BB_FOG_MV=0 off): alpha-blended scene draws (fog sheets, smoke, particles) run
+//    their vertex shader again with last frame's camera block only (a palette only with a game
+//    skin-ring identity): their own surface's motion as if it stood still in the world. The
+//    fragment weights it by alpha * smoothstep(BB_FOG_MV_LO, BB_FOG_MV_HI, alpha); attachment 7
+//    blends (dx, dy) over the vector behind, keeps the class and accumulates the coverage in .w.
+//    BB_FOG_REACTIVE=1 also raises the upscaler's reactive mask with that coverage.
 // BB_OBJMV2=0 turns it off (camera-only vectors as build 344). BB_OBJMV2_CHECK=0 turns off the
 // reprojection check. Log once a second: "[objmv2] ...".
 
@@ -79,8 +85,9 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
             u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase);
 // Presenter (bb_present_sr.cpp), after bb_mv.comp: the object vectors over the camera ones
 // (`mv` RG16F, General); `color` the presented colour (RGBA16F, General) for the check.
+// `reactive_view` the upscaler's reactive mask (R16F, General): bb-fog-mv may raise it.
 void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_view,
-             vk::Extent2D render, bool reset);
+             vk::ImageView reactive_view, vk::Extent2D render, bool reset);
 // (11-13) Presenter, FSR 3 "player from the real frame": attachment 7 (class in .z, 1 = moving
 // opaque) and the part of it this frame's render covers (render / image size). False: none.
 bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y);

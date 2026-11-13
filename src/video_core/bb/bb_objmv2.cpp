@@ -39,7 +39,8 @@ constexpr u64 kArenaBytes = 24ull << 20;        // snapshots a frame
 constexpr u64 kTableBytes = 2ull << 20;         // table entries a frame
 constexpr u64 kHeaderBytes = 4096;              // zero entry + dummy dword
 constexpr u32 kMaxSnapBytes = 64u << 10;        // larger buffers: read the current one
-constexpr u32 kStatWords = 16; // word 11: attachment 7 texels != 0; 12-15: the player mask (bb-player-mv)
+// Word 11: attachment 7 texels != 0; 12-15: the player mask (bb-player-mv); 16-19: bb-fog-mv.
+constexpr u32 kStatWords = 20;
 constexpr u64 kStatPeriod = 60;                 // statistics / check frame: 1 in 60
 constexpr u32 kStaticSample = 4;                // check frames: 1 static draw in 4 checked
 
@@ -204,6 +205,18 @@ struct State {
         u64 static_px = 0, static_abs = 0, player_px = 0, stat_frames = 0;
     } w30;
     std::chrono::steady_clock::time_point w30_t0 = std::chrono::steady_clock::now();
+    // bb-fog-mv (BB_FOG_MV, default on with the velocity path): alpha-blended scene draws (fog
+    // sheets, smoke, particles) run their vertex shader again with last frame's camera block, so
+    // they get the motion of their own surface as if it stood still in the world (the native
+    // "translucent velocity"), density-weighted into attachment 7; before, the vector of the
+    // opaque surface behind them stayed (fog moved with the characters / the far background).
+    bool fog = false;
+    u32 fog_curve = 0;         // push word: lo | hi << 16 (1/65535 of alpha)
+    bool fog_reactive = false; // BB_FOG_REACTIVE=1: the coverage raises the reactive mask too
+    u64 sec_fog_draws = 0, sec_fog_vec = 0, sec_fog_skin = 0, sec_fog_no_cam = 0,
+        sec_fog_skin_skipped = 0, sec_fog_no_block = 0;
+    u64 sec_fog_px = 0, sec_fog_w = 0, sec_fog_dense = 0, sec_fog_obj = 0;
+    std::unordered_map<u64, std::array<u32, 3>> fog_vs; // vs hash -> draws, with vector, no camera
 } g;
 
 void FlushVelocityCopies(vk::CommandBuffer cmd); // bb-velocity (below)
@@ -351,6 +364,12 @@ void ReadStats(u32 slot) {
     g.sec_pl_after += s[15];
     g.w30.player_px += s[12];
     if (g.slot_stat[slot]) {
+        g.sec_fog_px += s[16];
+        g.sec_fog_w += s[17];
+        g.sec_fog_dense += s[18];
+        g.sec_fog_obj += s[19];
+    }
+    if (g.slot_stat[slot]) {
         g.w30.static_px += s[8];
         g.w30.static_abs += s[9];
         ++g.w30.stat_frames;
@@ -481,6 +500,7 @@ bool Init(const Vulkan::Instance& instance) {
         bind(3, vk::DescriptorType::eCombinedImageSampler),
         bind(4, vk::DescriptorType::eCombinedImageSampler),
         bind(5, vk::DescriptorType::eStorageImage),
+        bind(6, vk::DescriptorType::eStorageImage), // bb-fog-mv: the reactive mask (R16F)
     };
     auto [lr, set_layout] = g.device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
         .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
@@ -542,6 +562,31 @@ bool Init(const Vulkan::Instance& instance) {
     if (g.velocity) {
         g.additive = false; // absolute vectors: the previous camera is in the VS
         Vulkan::Scheduler::bb_end_rendering_hook = &FlushVelocityCopies;
+    }
+    // bb-fog-mv: blended draws' own (static-world) vectors, BB_FOG_MV=0 off; density curve
+    // weight = alpha * smoothstep(BB_FOG_MV_LO, BB_FOG_MV_HI, alpha) per layer.
+    g.fog = g.velocity && !EnvOff("BB_FOG_MV");
+    {
+        const auto env_f = [](const char* name, float def) {
+            const char* v = std::getenv(name);
+            if (v == nullptr || v[0] == 0) return def;
+            char* end = nullptr;
+            const float f = std::strtof(v, &end);
+            return end != v && std::isfinite(f) ? std::clamp(f, 0.0f, 1.0f) : def;
+        };
+        const float lo = env_f("BB_FOG_MV_LO", 0.02f);
+        const float hi = std::max(env_f("BB_FOG_MV_HI", 0.35f), lo + 0.01f);
+        g.fog_curve = u32(std::lround(lo * 65535.0f)) |
+                      (u32(std::lround(std::min(hi, 1.0f) * 65535.0f)) << 16);
+        g.fog_reactive = g.fog && std::getenv("BB_FOG_REACTIVE") != nullptr &&
+                         std::getenv("BB_FOG_REACTIVE")[0] == '1';
+        Log(fmt::format("[fog-mv] {} (BB_FOG_MV=0 off): blended scene draws (fog, smoke, "
+                        "particles) write their own static-world vector (last frame's camera "
+                        "block, own palette only with a game skin-ring identity), weight alpha * "
+                        "smoothstep({:.2f}, {:.2f}, alpha) (BB_FOG_MV_LO / _HI); fog coverage in "
+                        "the reactive mask {} (BB_FOG_REACTIVE=1)",
+                        g.fog ? "on" : (g.velocity ? "off" : "off (needs the velocity path)"), lo,
+                        std::min(hi, 1.0f), g.fog_reactive ? "on" : "off"));
     }
     g.ready = true;
     Log(g.velocity ? "[velocity] on (bb-clean-velocity): every opaque G-buffer draw writes its own "
@@ -630,6 +675,14 @@ void FillKey(Kind kind, u32& mrt_mask, u32& num_color_attachments, Shader::PsCol
         bc.alpha_src_factor = F::Zero;
         bc.alpha_dst_factor = F::One;
         bc.alpha_func = AmdGpu::BlendControl::BlendFunc::Add;
+        if (g.fog) {
+            // bb-fog-mv: (dx, dy) weighted over the vector behind, the class behind kept (B not
+            // written), .w = coverage of the blended layers ("over": w + (1 - w) * dst).
+            write_mask7 = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                          vk::ColorComponentFlagBits::eA;
+            bc.alpha_src_factor = F::One;
+            bc.alpha_dst_factor = F::OneMinusSrcAlpha;
+        }
     }
 }
 
@@ -906,10 +959,14 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     ++g.sec_draws;
     ++g.w30.draws;
     if (blend) {
-        // Particles / effects: no vector of their own, bb_mv.comp stays under them.
-        ++g.vs_blend;
-        ++g.w30.blend;
-        return;
+        ++g.sec_fog_draws;
+        if (g.fog) ++g.fog_vs[vs.pgm_hash][0];
+        if (!g.fog) {
+            // Particles / effects: no vector of their own, the vector behind stays under them.
+            ++g.vs_blend;
+            ++g.w30.blend;
+            return;
+        }
     }
     const u32 n = static_cast<u32>(std::min<size_t>(vs.buffers.size(), Shader::NUM_BUFFERS));
     // Shader cache: the handles that are plain read-only V#s (the only ones that take a role).
@@ -989,23 +1046,37 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 }
             }
             if (found == nullptr) {
-                ++g.vs_no_cam;
-                ++g.w30.no_cam;
+                if (blend) {
+                    ++g.sec_fog_no_cam;
+                    ++g.fog_vs[vs.pgm_hash][2];
+                } else {
+                    ++g.vs_no_cam;
+                    ++g.w30.no_cam;
+                }
                 ok = false;
                 break;
             }
             camera = true;
         } else {
-            if (!skinned) ++g.vs_skin_draws_all;
-            skinned = true;
-            ++pal_bufs;
-            u32 why = 0; // index into vs_why when no previous copy is found
             // Game identity of the palette, once per address and frame (no lock per draw).
             const auto pid = g.pal_ids.find(addr);
             const auto id = pid != g.pal_ids.end()
                                 ? pid->second
                                 : g.pal_ids.emplace(addr, BB::NativeMv::LookupPalette(addr))
                                       .first->second;
+            if (blend && id.key == 0) {
+                // bb-fog-mv: a blended draw with a palette-sized buffer that is no game skin
+                // ring palette (particle / effect data, or translucent skinned parts without an
+                // identity): last frame's copy cannot be trusted, so no vector of its own (the
+                // vector behind stays, as before).
+                ++g.sec_fog_skin_skipped;
+                ok = false;
+                break;
+            }
+            if (!skinned && !blend) ++g.vs_skin_draws_all;
+            skinned = true;
+            ++pal_bufs;
+            u32 why = 0; // index into vs_why when no previous copy is found
             u64 rkey = 0;
             if (id.key != 0) {
                 ++g.vs_ring_seen;
@@ -1017,7 +1088,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                     found = &it->second;
                     ring = true;
                 }
-                if (g.skin_order) {
+                if (g.skin_order && !blend) {
                     // Order among this ring's palettes (once per address and frame).
                     if (const auto it = g.ring_ord_of.find(akey); it != g.ring_ord_of.end()) {
                         rkey = it->second;
@@ -1179,7 +1250,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         prev[h] = *found;
         use[h] = true;
     }
-    if (ok && pal_bufs > 1) ++g.vs_multi_pal;
+    if (ok && pal_bufs > 1 && !blend) ++g.vs_multi_pal;
     if (ok && pal_failed != 0) {
         if (pal_matched != 0) {
             // Another palette of this draw has last frame's copy: the unmatched one reads its
@@ -1191,7 +1262,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             ok = false;
         }
     }
-    if (skinned) ++g.w30.skin_all;
+    if (skinned && !blend) ++g.w30.skin_all;
 
     const u64 bytes = u64(n) * 16;
     if (ok && camera && g.history && g.table_used + bytes <= kTableBytes) {
@@ -1208,6 +1279,18 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         g.table_used += bytes;
         const u64 ea = g.base_addr + off;
         push.objmv_entry = {u32(ea), u32(ea >> 32)};
+        if (blend) {
+            // bb-fog-mv: the blended draw's own vector, density-weighted (fragment, flags bit 3).
+            push.objmv_flags = 1u | 8u;
+            ++g.sec_fog_vec;
+            ++g.fog_vs[vs.pgm_hash][1];
+            if (skinned) ++g.sec_fog_skin;
+            ++g.frame_vec_draws;
+            g.vs_cpu_ns += std::chrono::duration<double, std::nano>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+            return;
+        }
         // Static draws: 1 in kStaticSample on statistics frames is class 2 (compared with
         // bb_mv.comp's camera vector: the [velocity] static check), else class 1.
         // bb-native-mv2: a rigid draw whose own buffers moved is not a static draw for the check.
@@ -1238,6 +1321,8 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         }
     } else if (ok && camera && g.history) {
         ++g.sec_overflow;
+    } else if (blend && ok && !camera) {
+        ++g.sec_fog_no_block; // bb-fog-mv: its vertex shader reads no 864 B camera block
     }
     g.vs_cpu_ns +=
         std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
@@ -1282,6 +1367,7 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
             VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler,
             u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase) {
     push.objmv_flags = 0;
+    push.objmv_fog = g.fog_curve;
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
     if (!g.ready || ui_phase) return;
     if (g.velocity) {
@@ -1469,8 +1555,9 @@ bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y) {
 }
 
 void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_view,
-             vk::Extent2D render, bool reset) {
+             vk::ImageView reactive_view, vk::Extent2D render, bool reset) {
     if (!g.ready || g.composed || !g.cleared || !g.image) return;
+    if (!reactive_view) return; // binding 6 must be valid
     if (render.width > g.width || render.height > g.height) return;
     g.composed = true;
     g.last_render = render;
@@ -1560,6 +1647,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     const vk::DescriptorImageInfo cur_info{g.sampler, color_view, vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo prev_info{g.sampler, g.prev_view[rd], vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo next_info{{}, g.prev_view[next], vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo rx_info{{}, reactive_view, vk::ImageLayout::eGeneral};
     const auto w = [](u32 b, vk::DescriptorType t, const vk::DescriptorImageInfo* i,
                       const vk::DescriptorBufferInfo* bi) {
         return vk::WriteDescriptorSet{.dstBinding = b,
@@ -1575,6 +1663,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
         w(3, vk::DescriptorType::eCombinedImageSampler, &cur_info, nullptr),
         w(4, vk::DescriptorType::eCombinedImageSampler, &prev_info, nullptr),
         w(5, vk::DescriptorType::eStorageImage, &next_info, nullptr),
+        w(6, vk::DescriptorType::eStorageImage, &rx_info, nullptr),
     };
     const bool check = stat && g.check && color_view && !reset && g.prev_valid &&
                        g.color_stored + 1 == g.frame;
@@ -1583,7 +1672,8 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     const std::array<u32, 4> push{render.width, render.height, reset ? 0u : 1u,
                                   (stat ? 1u : 0u) | (g.additive ? 2u : 0u) |
                                       (store_color ? 4u : 0u) | (check ? 8u : 0u) |
-                                      (refine_now ? 16u : 0u) | (characters ? 32u : 0u)};
+                                      (refine_now ? 16u : 0u) | (characters ? 32u : 0u) |
+                                      (g.fog ? 64u : 0u) | (g.fog_reactive ? 128u : 0u)};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
@@ -1780,6 +1870,36 @@ void OnFlip() {
             double(g.vs_gpu_copies) / f,
             double(g.vs_bytes) / f,
             g.vs_draws ? g.vs_cpu_ns / 1000.0 / double(g.vs_draws) : 0.0));
+        if (g.fog) {
+            // bb-fog-mv: the blended draws (fog, smoke, particles) and the pixels they cover.
+            std::vector<std::pair<u64, std::array<u32, 3>>> top(g.fog_vs.begin(), g.fog_vs.end());
+            std::sort(top.begin(), top.end(),
+                      [](const auto& a, const auto& b) { return a.second[0] > b.second[0]; });
+            std::string shaders;
+            for (size_t i = 0; i < top.size() && i < 8; ++i) {
+                const auto& cnt = top[i].second;
+                shaders += fmt::format(" {:#x}:{}/{}{}", top[i].first, cnt[1], cnt[0],
+                                       cnt[2] ? fmt::format("(no cam {})", cnt[2]) : std::string{});
+            }
+            Log(fmt::format(
+                "[fog-mv] blended draws {:.1f}/frame: own static-world vector {:.1f} (with a ring "
+                "palette {:.1f}), no previous camera {:.1f}, palette-sized buffer without skin "
+                "ring (kept the vector behind) {:.1f}, no camera block in the vertex shader "
+                "{:.1f} | statistics frames: covered px {:.1f}%, mean coverage {:.2f}, dense "
+                "(> 0.5) {:.1f}%, over an object's own vector {:.1f}% | vs with vector/draws "
+                "(1 s):{}",
+                double(g.sec_fog_draws) / f, double(g.sec_fog_vec) / f,
+                double(g.sec_fog_skin) / f, double(g.sec_fog_no_cam) / f,
+                double(g.sec_fog_skin_skipped) / f, double(g.sec_fog_no_block) / f,
+                Pct(g.sec_fog_px, g.sec_px_all),
+                g.sec_fog_px ? double(g.sec_fog_w) / 1024.0 / double(g.sec_fog_px) : 0.0,
+                Pct(g.sec_fog_dense, g.sec_px_all), Pct(g.sec_fog_obj, g.sec_px_all),
+                shaders.empty() ? " none" : shaders));
+        }
+        g.fog_vs.clear();
+        g.sec_fog_draws = g.sec_fog_vec = g.sec_fog_skin = g.sec_fog_no_cam =
+            g.sec_fog_skin_skipped = g.sec_fog_no_block = 0;
+        g.sec_fog_px = g.sec_fog_w = g.sec_fog_dense = g.sec_fog_obj = 0;
         g.vs_frames = g.vs_draws = g.vs_native = g.vs_static = g.vs_skinned = g.vs_skinned_ring =
             g.vs_skinned_addr = g.vs_no_cam = g.vs_no_pal = g.vs_blend = g.vs_gpu_copies =
                 g.vs_bytes = g.vs_cam_addr = g.vs_cam_ord = g.vs_ring_seen = g.vs_cam_rejected =

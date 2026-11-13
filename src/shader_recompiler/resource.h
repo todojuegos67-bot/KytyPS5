@@ -229,7 +229,10 @@ struct PushData {
     // BB object motion vectors v2 (video_core/bb/bb_objmv2.h): flags (bit 0: this draw has last
     // frame's buffer snapshots) and the device address of its snapshot table entry (lo, hi).
     static constexpr u32 ObjMvFlagsIndex = 7;
-    static constexpr u32 ObjMvEntryIndex = 8;
+    // bb-fog-mv: blended draws' density curve (lo | hi << 16, 1/65535 units of alpha), in what
+    // was padding (members stay in offset order).
+    static constexpr u32 ObjMvFogIndex = 8;
+    static constexpr u32 ObjMvEntryIndex = 9;
 
     float xoffset;
     float yoffset;
@@ -237,7 +240,7 @@ struct PushData {
     float yscale;
     std::array<u8, NUM_BUFFERS> buf_offsets;
     u32 objmv_flags;
-    u32 objmv_pad;
+    u32 objmv_fog;
     std::array<u32, 2> objmv_entry;
 
     void AddOffset(u32 binding, u32 offset) {
@@ -246,6 +249,7 @@ struct PushData {
     }
 };
 static_assert(offsetof(PushData, objmv_flags) == 72);
+static_assert(offsetof(PushData, objmv_fog) == 76);
 static_assert(offsetof(PushData, objmv_entry) == 80);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");

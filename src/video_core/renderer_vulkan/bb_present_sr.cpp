@@ -349,7 +349,7 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
     // bb-velocity: the native per-draw velocity (bb_objmv2.h) over the camera vectors, only where
     // a G-buffer draw wrote its own vector; bb_mv stays everywhere else.
-    BB::ObjMv2::Compose(cmd, motion.view, color.view, in, cam.reset);
+    BB::ObjMv2::Compose(cmd, motion.view, color.view, reactive.view, in, cam.reset);
     lum_index ^= 1;
     lum_valid = true;
     Barrier(cmd, color, vk::ImageLayout::eShaderReadOnlyOptimal);
