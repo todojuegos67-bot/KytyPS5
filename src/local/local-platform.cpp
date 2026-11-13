@@ -2506,15 +2506,17 @@ int WatchdogMain(int argc, char* argv[]) {
 		char when[32];
 		wall(when, sizeof(when), false);
 		add("%s w#%llu", when, static_cast<unsigned long long>(line_number));
-		if (last_line_ns != 0 && now - last_line_ns > 1'500'000'000)
-			add(" late=%lldms", static_cast<long long>((now - last_line_ns - 1'000'000'000) / 1'000'000));
+		// (This process held up too - the whole PC stalled, or it slept: the game's heartbeat gets 5 s again from now,
+		// so a PC-wide stall or a resume from sleep is never taken for a hung game, nor dumped.)
+		const bool late = last_line_ns != 0 && now - last_line_ns > 1'500'000'000;
+		if (late) add(" late=%lldms", static_cast<long long>((now - last_line_ns - 1'000'000'000) / 1'000'000));
 		last_line_ns = now;
 
 		// The game's heartbeat and state, as its black box's 1 Hz thread left them.
 		const uint64_t beat  = shared->beat.load(std::memory_order_acquire);
 		const uint32_t stage = shared->stage.load(std::memory_order_acquire);
 		const uint32_t flags = shared->flags.load(std::memory_order_relaxed);
-		if (beat != last_beat) {
+		if (beat != last_beat || late) {
 			last_beat    = beat;
 			beat_seen_ns = now;
 		}

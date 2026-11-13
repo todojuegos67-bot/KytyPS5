@@ -36,7 +36,7 @@ inline const char* PhaseName(uint32_t code) {
 	static constexpr const char* Names[PhaseCodes] = {"-", "submit", "present", "fence", "pso", "read", "fault", "protect"};
 	return Names[(code & 0xffu) < PhaseCodes ? (code & 0xffu) : 0];
 }
-struct ThreadPhase {
+struct alignas(64) ThreadPhase { // (own cache line: the render thread writes it ~40k times a second)
 	std::atomic<uint32_t> code {0};
 	std::atomic<int64_t>  since {0};
 };
@@ -56,7 +56,7 @@ inline void ClaimThreadRole(Role role) noexcept {
 // first started while none was in flight; steady-clock ns, 0: none in flight). With several in flight the age is the
 // busy period's, not exactly the oldest one's (good enough to see something that never ends). `last`: the last one's
 // start; `left`: the last one's end (steady-clock ns).
-struct InFlight {
+struct alignas(64) InFlight { // (own cache line: faults and protections come from different threads, tens of thousands a second)
 	constexpr explicit InFlight(uint32_t code) noexcept: phase(code) {}
 	const uint32_t        phase;
 	std::atomic<int32_t>  now {0};

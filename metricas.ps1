@@ -495,7 +495,7 @@ $timer.Add_Tick({
 		$rows.Add(@('CPU', ("{0,3} %" -f $cpu), $cOrange))
 		if ($script:clk.cpuMHz) { $rows.Add(@('CPU reloj', ("{0,4} MHz" -f $script:clk.cpuMHz), $cOrange)) }
 		if ($RamGB -gt 0) {
-			$ws = 0; $e2 = $emu | Select-Object -First 1
+			$ws = 0; $e2 = $emuWin | Select-Object -First 1
 			if ($e2) { $ws = $e2.WorkingSet64 / 1GB }
 			$ramSim = [Math]::Min($ws + 4, [double]$RamGB) # (11-12) a 16 GB PC never shows more than 16 GB
 			$rows.Add(@('RAM', ("{0:N1} / {1} GB{2}" -f $ramSim, $RamGB, $(if ($script:limitedPid -and -not $script:limitOk) { ' (sin limite!)' } else { '' })), (Get-UseColor $ramSim $RamGB)))
@@ -511,7 +511,7 @@ $timer.Add_Tick({
 		if ($RamGB -gt 0) {
 			$pageFile = [Math]::Max(0.0, $commitLimit - $ramTotal)
 			$commitLimit = $RamGB + $pageFile
-			$priv = 0; $e3 = $emu | Select-Object -First 1
+			$priv = 0; $e3 = $emuWin | Select-Object -First 1
 			if ($e3) { $priv = $e3.PrivateMemorySize64 / 1GB }
 			$commitUsed = $priv + 4
 			$commitSim = ' (simulado)'
