@@ -39,6 +39,11 @@ uint64_t FlushNow(int64_t scratch_idle_ms, char* detail, size_t detail_size);
 // its largest size for good. With KYTY_SOFT_RELEASE=1 the release thread frees one idle for 10 s or more, under its own
 // lock (try_lock: one in use is skipped), and logs the MiB by source; the heap compaction after gives the pages back.
 // Off: the lock is a no-op.
+// A "Heap (30 s, ...)" line every 30 s (KYTY_HEAP_REPORT=0 off): the process heaps' committed, allocated and free
+// bytes (HeapSummary), and a heap with 256 MiB or more free commit decommitted (HeapOptimizeResources) right then.
+// Started by Start(), with or without KYTY_SOFT_RELEASE.
+void StartHeapReport();
+
 class Scratch {
 public:
 	explicit Scratch(const char* source);
