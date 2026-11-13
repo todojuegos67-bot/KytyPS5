@@ -660,6 +660,18 @@ public:
 		}
 	}
 
+	// (11-13) Committed guest bytes by access: [0] CPU only, [1] GPU only, [2] both.
+	void SumByAccess(uint64_t out[3]) {
+		Common::LockGuard lock(m_mutex);
+		out[0] = out[1] = out[2] = 0;
+		for (const auto& [key, r]: m_ranges) {
+			if (!IsCommittedRangeType(r.type) || r.size == 0) continue;
+			const bool cpu = (r.protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC)) != 0;
+			const bool gpu = (r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0;
+			out[cpu && gpu ? 2 : gpu ? 1 : 0] += r.size;
+		}
+	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 
@@ -1210,6 +1222,22 @@ static std::unique_ptr<PhysicalMemory>    g_physical_memory;
 static std::unique_ptr<FlexibleMemory>    g_flexible_memory;
 static std::unique_ptr<PooledMemory>      g_pooled_memory;
 static std::unique_ptr<VirtualRanges>     g_virtual_ranges;
+
+// (11-13) A "Guest memory by access" line each time the mapped total grows by 512 MiB: how much of the
+// game's memory the CPU never touches (GPU only), the part a PC port keeps in video memory alone.
+static void ReportGuestAccess() {
+	static std::atomic<uint64_t> last {0};
+	if (g_virtual_ranges == nullptr) return;
+	uint64_t sum[3];
+	g_virtual_ranges->SumByAccess(sum);
+	const uint64_t total = sum[0] + sum[1] + sum[2];
+	uint64_t prev = last.load();
+	if (total < prev + (512ull << 20) && !(total + (512ull << 20) < prev)) return;
+	if (!last.compare_exchange_strong(prev, total)) return;
+	LOGF("Guest memory by access: total %llu MiB = CPU only %llu MiB, GPU only %llu MiB, CPU and GPU %llu MiB\n",
+	     (unsigned long long)(total >> 20), (unsigned long long)(sum[0] >> 20), (unsigned long long)(sum[1] >> 20),
+	     (unsigned long long)(sum[2] >> 20));
+}
 static std::unique_ptr<GuestAddressSpace> g_guest_address_space;
 static callback_func_t                    g_alloc_callback        = nullptr;
 static callback_func_t                    g_free_callback         = nullptr;
@@ -3267,6 +3295,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 }
 
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
+	struct AccessReport { ~AccessReport() { ReportGuestAccess(); } } access_report;
 	return KernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
 
@@ -3859,6 +3888,7 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
+	struct AccessReport { ~AccessReport() { ReportGuestAccess(); } } access_report;
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
