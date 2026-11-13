@@ -196,6 +196,7 @@ public:
 			                         : m_lazy                       ? RamGuard::StoreCharge::Lazy
 			                         : m_on_demand                  ? RamGuard::StoreCharge::OnDemand
 			                                                        : RamGuard::StoreCharge::AllCommitted);
+		LeanHostMem::SetStore(m_backing_base, m_size); // (KYTY_LEAN_HOSTMEM: its dropped pages, lean-hostmem.h)
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
 		{
@@ -230,6 +231,7 @@ public:
 			return;
 		}
 		m_backing_base = static_cast<uint8_t*>(backing);
+		LeanHostMem::SetStore(m_backing_base, m_size);
 #endif
 	}
 

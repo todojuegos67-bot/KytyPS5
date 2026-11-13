@@ -1907,8 +1907,11 @@ uint64_t FlushFreed(uint64_t budget, uint64_t* held_us) {
 					const auto t0   = std::chrono::steady_clock::now();
 					const auto drop = [&] {
 						if (DiscardVirtualMemory(base + at, stop - at) != ERROR_SUCCESS &&
-						    VirtualAlloc(base + at, stop - at, MEM_RESET, PAGE_READWRITE) == nullptr)
+						    VirtualAlloc(base + at, stop - at, MEM_RESET, PAGE_READWRITE) == nullptr) {
 							failures++;
+						} else {
+							LeanHostMem::NoteDiscarded(base + at, stop - at); // (KYTY_LEAN_HOSTMEM: written whole next)
+						}
 					};
 					const bool free_now = is_physical ? g_physical_memory->WhileFree(at, stop - at, drop)
 					                                  : g_flexible_memory->WhileFree(at, stop - at, drop);

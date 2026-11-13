@@ -134,6 +134,25 @@ long long M(uint64_t bytes) {
 	return static_cast<long long>(bytes / MiB);
 }
 
+// PROCESS_MEMORY_COUNTERS_EX2's layout (psapi.h has it only in recent SDKs; Windows 10 21H2+ fills it, older ones refuse
+// the size and the census asks again with PROCESS_MEMORY_COUNTERS_EX's).
+struct CountersEx2 {
+	DWORD   cb;
+	DWORD   PageFaultCount;
+	SIZE_T  PeakWorkingSetSize;
+	SIZE_T  WorkingSetSize;
+	SIZE_T  QuotaPeakPagedPoolUsage;
+	SIZE_T  QuotaPagedPoolUsage;
+	SIZE_T  QuotaPeakNonPagedPoolUsage;
+	SIZE_T  QuotaNonPagedPoolUsage;
+	SIZE_T  PagefileUsage;
+	SIZE_T  PeakPagefileUsage;
+	SIZE_T  PrivateUsage;
+	SIZE_T  PrivateWorkingSetSize;
+	ULONG64 SharedCommitUsage;
+};
+static_assert(sizeof(CountersEx2) >= sizeof(PROCESS_MEMORY_COUNTERS_EX));
+
 struct Top {
 	uint64_t ws = 0;
 	char     name[24] {};
@@ -187,7 +206,7 @@ void Run() {
 		const auto pos     = [](int64_t v) { return v > 0 ? v : 0; };
 		const int64_t standby = c[StandbyNormal] < 0 ? -1 : pos(c[StandbyNormal]) + pos(c[StandbyReserve]) + pos(c[StandbyCore]);
 
-		PROCESS_MEMORY_COUNTERS_EX2 self {};
+		CountersEx2 self {};
 		self.cb = sizeof(self);
 		uint64_t self_pws = 0;
 		if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PPROCESS_MEMORY_COUNTERS>(&self), sizeof(self)) != 0) {

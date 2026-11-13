@@ -33,6 +33,7 @@
 // lets the access through, and the render thread removes them (Drain).
 
 #include "guest-lazy-commit.h"
+#include "lean-hostmem.h"
 
 #include <algorithm>
 #include <atomic>
@@ -254,6 +255,7 @@ inline bool DiscardRange(uint64_t begin) {
 		// (A discard is refused on pages without access.)
 		for (uint64_t at = 0; at < piece.size; at += Chunk) {
 			(void)DiscardVirtualMemory(reinterpret_cast<void*>(piece.backing + at), std::min(Chunk, piece.size - at));
+			LeanHostMem::NoteDiscarded(reinterpret_cast<void*>(piece.backing + at), std::min(Chunk, piece.size - at));
 			SwitchToThread();
 		}
 		(void)Protect(piece.backing, piece.size, PAGE_NOACCESS);
