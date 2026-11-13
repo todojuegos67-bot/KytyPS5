@@ -134,7 +134,7 @@ struct Settings {
 	bool        simulate_ram16 = false; // (10-24) "Simular 16 GB RAM": KYTY_SIMULATE_RAM_MB=16384 (and the 16 GB profile)
 	bool        safe_gpu = false;   // KYTY_COMPUTE_CHAIN=0
 	std::string quality = "standard";
-	std::string texture_reduce = "0";
+	std::string texture_reduce = "o"; // (11-13) Optimizado by default: less VRAM
 	bool        simulate_vram8 = false;
 	bool        all_ccds = false;
 	bool        shader_turbo = true; // (ds-pc-port37) carga_shaders_maxima: the in-game shader prefetch and warmup on every CPU thread
@@ -193,7 +193,7 @@ struct Settings {
 	bool        kbm_calibrate = false; // (10-28) the next start measures the camera into kbm_curve.txt (KYTY_KBM_CALIBRATE), once
 	// [Configurador] (10-28)
 	bool        configured = false;  // the first-start dialog has been shown
-	bool        ram16_boost = false; // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
+	bool        ram16_boost = true; // (11-13) on by default on every PC: less RAM // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
 	// (perfopts-1107) Opciones de rendimiento: upstream's opt-in switches (all off = the behaviour before them).
 	bool        perf_pm4_regfile = false;   // KYTY_PM4_REGFILE=1
 	bool        perf_upload_lanes = false;  // KYTY_UPLOAD_LANES=2

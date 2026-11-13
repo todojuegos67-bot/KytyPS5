@@ -314,7 +314,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("raton_camara_instantanea", s->kbm_warp);
 	boo("raton_calibrar", s->kbm_calibrate);
 	boo("configurado", s->configured);
-	boo("mejoras_16gb_v2", s->ram16_boost); // (port28) new key: the old one was on by default
+	boo("ahorro_memoria_v3", s->ram16_boost); // (port28) new key: the old one was on by default
 	boo("rend_registros_pm4", s->perf_pm4_regfile);
 	boo("rend_subidas_dos_hilos", s->perf_upload_lanes);
 	boo("rend_ayuda_subidas", s->perf_upload_help);
@@ -538,7 +538,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; 0: el configurador de hardware se muestra al arrancar\n"
 	  << "configurado=" << b(s.configured) << "\n"
 	  << "; Mejoras para equipos de 16 GB de RAM: perfil de 16 GB (solo en PCs de 20 GB de RAM o menos)\n"
-	  << "mejoras_16gb_v2=" << b(s.ram16_boost) << "\n"
+	  << "ahorro_memoria_v3=" << b(s.ram16_boost) << "\n"
 	  << "; Opciones de rendimiento (0 = como siempre; 1 = la mejora experimental de KytyPS5 upstream)\n"
 	  << "; Registros PM4 directos (KYTY_PM4_REGFILE)\n"
 	  << "rend_registros_pm4=" << b(s.perf_pm4_regfile) << "\n"
@@ -1175,6 +1175,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		env.Default("KYTY_RESIDENT_MB", "6144");
 		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "1536");
 		env.Default("KYTY_BACKING_FILE", "0");
+		// (11-13) The guest copy of GPU-only images is dropped once they are on the card: RAM not held twice.
+		env.Default("KYTY_GPU_ONLY_OFFLOAD", "1");
 	}
 	if (!upscaler.empty()) env.Set("KYTY_UPSCALER", upscaler);
 	for (const auto& [k, v]: sets) env.Set(k, v);
@@ -1596,7 +1598,7 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	s->motion_blur = s->dof = s->vignette = s->bloom = s->eye_adapt = true;
 	s->pure_game = false;
 	// The RAM (16 GB or less: the launcher's 16 GB profile; textures and distance at most Alto).
-	s->ram16_boost = pc.ram_gb > 0 && pc.ram_gb <= 20;
+	s->ram16_boost = true; // (11-13) memory saving on every PC
 	if (s->ram16_boost) {
 		if (s->texture_reduce == "0") s->texture_reduce = "h";
 		if (s->quality == "standard") s->quality = "high";

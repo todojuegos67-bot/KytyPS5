@@ -2525,7 +2525,7 @@ void Draw(float width, float height) {
 					// (10-28) Mejoras para equipos de 16 GB de RAM: the launcher's 16 GB profile, on PCs of 20 GB or less.
 					const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
 					(void)small; // (port28) always shown and usable; off by default
-						CheckRow("Mejoras para equipos de 16 GB de RAM", s.ram16_boost != g_rt.launched.ram16_boost, s.ram16_boost,
+						CheckRow("Ahorro de memoria (RAM y VRAM)", s.ram16_boost != g_rt.launched.ram16_boost, s.ram16_boost,
 						         "Perfil de memoria de 16 GB (6 GB fijos en RAM, la precarga espera si queda poca memoria). Pensado para PCs de 16 GB de RAM. No cambia los gráficos.");
 					s.profile16 = LowRam(s, g_rt.pc);
 					if (s.ram16_boost) ImGui::TextColored(kGold, "RAM %s: mejoras activadas. Cierra los navegadores mientras juegas.", s.simulate_ram16 ? "16 GB (simulado)" : (std::to_string(g_rt.pc.ram_gb) + " GB").c_str());
@@ -3560,7 +3560,7 @@ void LauncherPerformance(Settings& s) {
 	const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
 	{ // (port28) always shown and usable; off by default
 		const float y = RowY();
-		LCheck(y, "Modo para PCs con 16 GB de RAM", s.ram16_boost,
+		LCheck(y, "Ahorro de memoria (RAM y VRAM)", s.ram16_boost,
 		       "Usa la memoria con más cuidado: reserva 6 GB fijos para el juego y la carga anticipada de datos espera si queda poca RAM libre. Evita cierres y tirones fuertes por falta de memoria. No cambia los gráficos y normalmente no cuesta FPS. Actívalo si tu PC tiene 16 GB de RAM o menos; con 32 GB no hace falta.");
 		RowEnd(y);
 		if (small && s.ram16_boost) {
