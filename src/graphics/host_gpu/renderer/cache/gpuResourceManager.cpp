@@ -22,7 +22,6 @@
 #include "kernel/memory.h"
 #include "speculation-state.h"
 #include "fresh-memory.h"
-#include "mem-class.h"
 #include "texture-offload.h"
 
 extern "C" {
@@ -172,7 +171,6 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
-	MemClass::MarkCpu(access == PageFaultAccess::Write, fault_vaddr, fault_size);
 	if (access == PageFaultAccess::Write) {
 		// A never-written granule's first write (fresh memory): unwatched, done unless another watcher holds the page.
 		if (FreshFirstWrite(fault_vaddr)) {

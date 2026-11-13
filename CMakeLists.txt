@@ -1020,8 +1020,6 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/soft-release.cpp"
 	"${KYTY_SOURCE_DIR}/local/ram-guard.h"
 	"${KYTY_SOURCE_DIR}/local/ram-guard.cpp"
-	"${KYTY_SOURCE_DIR}/local/file-provenance.h"
-	"${KYTY_SOURCE_DIR}/local/file-provenance.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.h"
@@ -1496,13 +1494,6 @@ if (KYTY_DS_PORT AND WIN32)
 		target_link_options(kyty_emulator PRIVATE "/ENTRY:mainCRTStartup")
 	endif()
 	target_link_libraries(kyty_emulator ole32 oleaut32 shell32 uuid gdi32 winhttp dxgi advapi32 windowscodecs)
-	# The Segment Heap for the process heap (malloc, operator new): src/port/ds-port.manifest, merged into the
-	# linker's manifest. OFF: the NT heap as before.
-	option(KYTY_SEGMENT_HEAP "Demon's Souls PC port: the Windows Segment Heap (app manifest)" OFF)
-	if (KYTY_SEGMENT_HEAP)
-		target_sources(kyty_emulator PRIVATE "${KYTY_SOURCE_DIR}/port/ds-port.manifest")
-		target_compile_definitions(kyty_emulator PRIVATE KYTY_SEGMENT_HEAP=1)
-	endif()
 	# (10-27) The version stamp the in-game update compares with releases/latest (the CI passes its package name, the tag).
 	set(KYTY_DS_PORT_VERSION "" CACHE STRING "Demon's Souls PC port version (its release tag)")
 	if (KYTY_DS_PORT_VERSION)

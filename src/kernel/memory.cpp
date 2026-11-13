@@ -5,7 +5,6 @@
 #include "live-trace.h"
 #include "time-census.h"
 #include "writeback-verify.h"
-#include "file-provenance.h"
 #include "fresh-memory.h"
 #include "guest-lazy-commit.h"
 #include "mem-guard.h"
@@ -661,20 +660,6 @@ public:
 		}
 	}
 
-	void CollectCommitted(std::vector<CommittedRange>* out) {
-		Common::LockGuard lock(m_mutex);
-		out->reserve(m_ranges.size());
-		for (const auto& [key, r]: m_ranges) {
-			if (!IsCommittedRangeType(r.type) || r.size == 0) continue;
-			CommittedRange range;
-			range.start = r.start;
-			range.size  = r.size;
-			range.gpu   = (r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0;
-			std::snprintf(range.name, sizeof(range.name), "%s", r.name);
-			out->push_back(range);
-		}
-	}
-
 	// (11-13) Committed guest bytes by access: [0] CPU only, [1] GPU only, [2] both.
 	void SumByAccess(uint64_t out[3]) {
 		Common::LockGuard lock(m_mutex);
@@ -1311,12 +1296,6 @@ bool WriteGuestRanges(const char* path) {
 	return true;
 }
 
-std::vector<CommittedRange> CommittedRanges() {
-	std::vector<CommittedRange> out;
-	if (g_virtual_ranges != nullptr) g_virtual_ranges->CollectCommitted(&out);
-	return out;
-}
-
 bool BackingView(uint64_t* base, uint64_t* size) {
 	if (g_guest_address_space == nullptr || base == nullptr || size == nullptr) return false;
 	*base = g_guest_address_space->GetBackingBase();
@@ -1620,12 +1599,10 @@ void InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
-	FileProvenance::ClearGuestRange(vaddr, size);
 	(void)GetGpuResources().InvalidateMemoryForWrite(vaddr, size);
 }
 
 bool PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
-	if (size != 0 && UINT64_MAX - vaddr >= size) FileProvenance::ClearGuestRange(vaddr, size);
 	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// From the first page a store would fault on to the end of the last one, of those the trackers protect: by the
@@ -1667,7 +1644,6 @@ bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
 }
 
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
-	FileProvenance::ClearGuestRange(vaddr, size);
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
 }
@@ -2148,7 +2124,6 @@ void PhysicalMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator ran
 
 void PhysicalMemory::AddFreeRange(uint64_t start, uint64_t size) {
 	GuestStoreUsage(-static_cast<int64_t>(size));
-	FileProvenance::ClearBackingOffset(start, size); // (bits only: under the allocator's lock)
 	auto end  = start + size;
 	auto next = m_free.lower_bound(start);
 	if (next != m_free.begin()) {
@@ -2774,7 +2749,6 @@ void FlexibleMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator ran
 
 void FlexibleMemory::AddFreeRange(uint64_t start, uint64_t size) {
 	GuestStoreUsage(-static_cast<int64_t>(size));
-	FileProvenance::ClearBackingOffset(start, size); // (bits only: under the allocator's lock)
 	auto end  = start + size;
 	auto next = m_free.lower_bound(start);
 	if (next != m_free.begin()) {

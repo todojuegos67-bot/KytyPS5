@@ -489,8 +489,6 @@ private:
 	// it (their handles destroyed; BindPipelineHandle makes one again from the static store when it is bound); and a
 	// while after the game changed its world (SceneTags), those of the worlds it left.
 	void            EvictIdlePipelines();
-	// (EvictIdlePipelines) The 30 s [driver-ram] line.
-	void ReportDriverRam(std::chrono::steady_clock::time_point now);
 	// (EvictIdlePipelines) A graphics pipeline's inputs, as its remake keeps them.
 	struct GraphicsMakeInputs;
 	std::shared_ptr<const std::function<void(Pipeline&)>> GraphicsRemake(GraphicsMakeInputs inputs);
@@ -505,11 +503,6 @@ private:
 	uint32_t                              m_scene_flip       = 0;
 	uint32_t                              m_prev_scene_flip  = 0;
 	std::chrono::steady_clock::time_point m_scene_since {};
-	// (EvictIdlePipelines, ReportDriverRam) The static store's shared binaries released under critical RAM pressure, and
-	// when last; the last [driver-ram] line.
-	std::chrono::steady_clock::time_point m_shared_trim_at {};
-	uint64_t                              m_shared_trimmed = 0;
-	std::chrono::steady_clock::time_point m_driver_ram_logged {};
 	bool                                  m_scene_swept = true;
 	void InitializeDriverCache();
 	vk::PipelineCache LoadDriverCache(const std::filesystem::path& file_path, uint64_t limit, size_t& loaded_size);

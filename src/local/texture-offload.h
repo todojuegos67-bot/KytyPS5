@@ -32,9 +32,7 @@
 // unmap (normal context); after one by the emulator's own code the fault handler only gives the pages a protection that
 // lets the access through, and the render thread removes them (Drain).
 
-#include "file-provenance.h"
 #include "guest-lazy-commit.h"
-#include "mem-class.h"
 
 #include <algorithm>
 #include <atomic>
@@ -253,8 +251,6 @@ inline bool DiscardRange(uint64_t begin) {
 	// protection change of the game's threads waits for (whole ranges: frames of 30-60 ms after each scan).
 	constexpr uint64_t Chunk = uint64_t {1} << 20u;
 	for (const auto& piece: it->second.pieces) {
-		// (Its bytes gone: not the file's any more for the file-provenance census, whose verify must not read them.)
-		FileProvenance::ClearBacking(piece.backing, piece.size);
 		// (A discard is refused on pages without access.)
 		for (uint64_t at = 0; at < piece.size; at += Chunk) {
 			(void)DiscardVirtualMemory(reinterpret_cast<void*>(piece.backing + at), std::min(Chunk, piece.size - at));
@@ -524,7 +520,6 @@ inline bool OnFault(uint64_t address, uint64_t rip, const void* native_context, 
 			const Touch touch = backing_hit ? (write ? Touch::BackingWrite : Touch::BackingRead)
 			                    : host      ? (write ? Touch::EmulatorGuestWrite : Touch::EmulatorGuestRead)
 			                                : (write ? Touch::GameWrite : Touch::GameRead);
-			if (!host) MemClass::MarkCpu(write, it->first, range.guest_end - it->first);
 			const auto  can_wait = state.can_wait.load(std::memory_order_acquire);
 			if (range.discarded && state.restore.load(std::memory_order_acquire) != nullptr && can_wait != nullptr && can_wait()) {
 				restore_begin = it->first;

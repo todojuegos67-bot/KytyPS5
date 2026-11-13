@@ -12,7 +12,6 @@
 // again by a partial unmap). Memory only the GPU may write needs no watch: its guest bytes change only through the
 // backing view (write-backs). A granule once written stays written.
 
-#include "file-provenance.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -78,19 +77,11 @@ inline bool IsWritten(const State& state, uint64_t granule) {
 	       (state.written[granule >> 6u].load(std::memory_order_acquire) & (uint64_t {1} << (granule & 63u))) != 0;
 }
 
-// True when it was not written before. (No file provenance: callers clear theirs.)
-inline bool MarkGranuleBits(State& state, uint64_t granule) {
+// True when it was not written before.
+inline bool MarkGranule(State& state, uint64_t granule) {
 	if (granule >= state.granules) return false;
 	const uint64_t bit = uint64_t {1} << (granule & 63u);
 	return (state.written[granule >> 6u].fetch_or(bit, std::memory_order_acq_rel) & bit) == 0;
-}
-
-// The same for the whole granule written (a first-write fault, a watch dropped): its pages lose their file provenance
-// (file-provenance.h), as its later writes go unseen.
-inline bool MarkGranule(State& state, uint64_t granule) {
-	if (granule >= state.granules) return false;
-	FileProvenance::ClearBacking(state.base + (granule << GranuleBits), Granule);
-	return MarkGranuleBits(state, granule);
 }
 
 // The granules of backing-view bytes [backing, backing + size) written.
@@ -99,9 +90,8 @@ inline void MarkBacking(uint64_t backing, uint64_t size) {
 	if (state == nullptr || size == 0) return;
 	const auto first = GranuleOf(*state, backing), last = GranuleOf(*state, backing + size - 1);
 	if (first == UINT64_MAX || last == UINT64_MAX) return;
-	FileProvenance::ClearBacking(backing, size); // (its pages only)
 	for (auto granule = first; granule <= last; ++granule) {
-		if (MarkGranuleBits(*state, granule)) state->marked.fetch_add(Granule, std::memory_order_relaxed);
+		if (MarkGranule(*state, granule)) state->marked.fetch_add(Granule, std::memory_order_relaxed);
 	}
 }
 
@@ -122,10 +112,8 @@ inline void MarkArmedBacking(uint64_t backing, uint64_t size) {
 	if (first == UINT64_MAX || last == UINT64_MAX) return;
 	for (auto granule = first; granule <= last; ++granule) {
 		const uint64_t bit = uint64_t {1} << (granule & 63u);
-		if ((state->armed[granule >> 6u].load(std::memory_order_acquire) & bit) == 0) continue;
-		// (Its view mapped again: a CPU write may go unseen, whether or not the granule was written before.)
-		FileProvenance::ClearBacking(state->base + (granule << GranuleBits), Granule);
-		if (MarkGranuleBits(*state, granule)) state->marked.fetch_add(Granule, std::memory_order_relaxed);
+		if ((state->armed[granule >> 6u].load(std::memory_order_acquire) & bit) != 0 && MarkGranule(*state, granule))
+			state->marked.fetch_add(Granule, std::memory_order_relaxed);
 	}
 }
 

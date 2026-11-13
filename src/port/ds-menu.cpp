@@ -3227,23 +3227,6 @@ bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* fon
 	return clicked;
 }
 
-// (11-13) Archivo de paginacion de hasta 100 GB en C: (PowerShell como administrador: Windows pide permiso). Evita que
-// un PC con poca RAM llegue al limite de memoria comprometida (un PC de 16 GB se reinicio ahi). Hace falta reiniciar.
-void SetBigPagefile() {
-#if defined(_WIN32)
-	static const char* args =
-	    "-NoProfile -ExecutionPolicy Bypass -Command \""
-	    "$c=Get-CimInstance Win32_ComputerSystem; "
-	    "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false}; "
-	    "$p=Get-CimInstance Win32_PageFileSetting | Where-Object {$_.Name -like 'C:*'}; "
-	    "if(-not $p){$p=New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name='C:\\pagefile.sys'}}; "
-	    "Set-CimInstance -InputObject $p -Property @{InitialSize=[uint32]16384;MaximumSize=[uint32]102400}; "
-	    "Write-Host 'Listo: archivo de paginacion de 16 a 100 GB en C:. Reinicia el PC para aplicarlo.'; "
-	    "Read-Host 'Pulsa Enter para cerrar'\"";
-	ShellExecuteA(nullptr, "runas", "powershell.exe", args, nullptr, SW_SHOWNORMAL);
-#endif
-}
-
 void OpenUrl(const char* url) {
 #if defined(_WIN32)
 	ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
@@ -3586,13 +3569,6 @@ void LauncherPerformance(Settings& s) {
 			ImGui::TextColored(kGoldL, "%s", I18n::T("RAM justa: perfil seguro. Cierra los navegadores mientras juegas."));
 			RowEnd(ny, 24);
 		}
-	}
-	{
-		const float y = RowY();
-		if (LButton("Archivo de paginación de 100 GB", {g_lbox.at.x + U(12), y}, {U(396), U(32)}, false, g_font_semi, U(15),
-		            "Pone en el disco C: un archivo de paginación de 16 a 100 GB (Windows pedirá permiso de administrador). Evita que el PC se reinicie al quedarse sin memoria en equipos con poca RAM. Solo ocupa espacio cuando hace falta. Reinicia el PC después."))
-			SetBigPagefile();
-		RowEnd(y, 36);
 	}
 	s.profile16 = LowRam(s, g_rt.pc);
 	{

@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <thread>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
-#include "file-provenance.h"
 #include "slow-log.h"
 
 #include "common/assert.h"
@@ -22,7 +21,6 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "fresh-memory.h"
-#include "mem-class.h"
 #include "guest-lazy-commit.h"
 #include "texture-offload.h"
 #include "async-upload.h"
@@ -757,7 +755,6 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	}
 	MarkImageGranules(image.info.data.address, image.info.data.size);
-	FileProvenance::NoteRange(FileProvenance::Kind::Texture, image.info.data.address, image.info.data.size, true);
 	if (m_image_starts[image.info.data.address]++ == 0) {
 		if (const auto bucket = StartBucket(image.info.data.address); m_start_buckets[bucket]++ == 0)
 			m_start_bucket_bits[bucket / 64u] |= uint64_t {1} << (bucket % 64u);
@@ -786,7 +783,6 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
 	++m_image_granule_releases;
-	FileProvenance::NoteRange(FileProvenance::Kind::Texture, image.info.data.address, image.info.data.size, false);
 	UntrackImage(id, "unregister");
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
@@ -4065,8 +4061,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
 	}
-	MemClass::Mark(desc.type == BindingType::Storage ? MemClass::GpuWrite : MemClass::Tex, image.info.data.address,
-	               image.info.data.size);
 	if (!image.info.data.Empty()) {
 		PrepareDccClear(id, desc);
 		if (desc.type != BindingType::Texture || !RefreshTextureLevels(id, desc.view_info)) {
@@ -4104,7 +4098,6 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.MarkGpuModified();
 	if (!image.usage.render_target) ++image.validity;
 	image.usage.render_target = true;
-	MemClass::Mark(MemClass::GpuWrite, image.info.data.address, image.info.data.size);
 	PrepareDccClear(id, desc);
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -4127,7 +4120,6 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.MarkGpuModified();
 	if (!image.usage.depth_target) ++image.validity;
 	image.usage.depth_target = true;
-	MemClass::Mark(MemClass::GpuWrite, image.info.data.address, image.info.data.size);
 	const bool scoped = RefreshDepthLayers(id, desc.view_info);
 	if (!scoped) {
 		RefreshImage(id);

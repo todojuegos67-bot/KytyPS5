@@ -436,7 +436,6 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
-		FileProvenance::ClearBackingOffset(backing_offset, size); // (bits only)
 		std::lock_guard lock(m_mutex);
 		HoldTimer       hold {LiveCounters::BackingHoldZeroUs};
 		BackingWriteFence fence(*this);
@@ -1711,10 +1710,6 @@ private:
 		void* ptr = nullptr;
 		// Committing through the writable alias commits the section's pages for every view of them.
 		// (Refused for lack of memory: a release pass and another try, MemGuard.)
-		// (The commit guard, ram-guard.h: a big commit with the headroom under the reserve makes room first. The game's
-		// memory is never refused here: it is committed anyway.)
-		if (m_on_demand && !m_lazy && size >= (uint64_t {64} << 20u))
-			(void)RamGuard::MakeCommitRoom(size, "direct-memory commit", false);
 		if (m_on_demand && !m_lazy &&
 		    MemGuard::RetryOs("direct-memory commit", size, [&] {
 			    return VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE);

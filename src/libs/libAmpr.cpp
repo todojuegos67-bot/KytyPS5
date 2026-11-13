@@ -12,9 +12,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
-#include "file-provenance.h"
 #include "local-platform.h"
-#include "mem-class.h"
 #include "scene-tags.h"
 #include "shader-gate.h"
 #include "slow-log.h"
@@ -1518,32 +1516,6 @@ static void SeedFileRecording(const std::string& recording, const std::string& r
 	std::filesystem::copy_file(released, recording, error);
 }
 
-// The file-provenance id of `host_path` (file-provenance.h) when it is a read-only game file: under /app0 (archives in
-// it too), not save data; 0 otherwise.
-static uint16_t ProvenanceFileId(const std::string& host_path) {
-	const auto normal = [](std::string text) {
-		for (auto& c: text) {
-			if (c == '\\') c = '/';
-			else if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-		}
-		return text;
-	};
-	static const std::string root = [&] {
-		auto text = normal(Common::PathToString(LibKernel::FileSystem::GetRealFilename("/app0")));
-		if (!text.empty() && text.back() != '/') text += '/';
-		return text;
-	}();
-	thread_local std::string last_path;
-	thread_local uint16_t    last_id = 0;
-	if (!last_path.empty() && host_path == last_path) return last_id;
-	const auto path = normal(host_path);
-	last_path       = host_path;
-	last_id         = root.size() > 1 && path.starts_with(root) && path.find("_savedata") == std::string::npos
-	                      ? FileProvenance::FileId(host_path)
-	                      : 0;
-	return last_id;
-}
-
 // A file of a game packed into a ZArchive ("game.zar!/dir/file"), kept open like LocalPlatform::OpenKeptReadFile's:
 // positional reads from any thread. Null: it is not in the archive.
 static const Common::ArchiveFile* KeptArchiveFile(const std::string& host_path) {
@@ -1603,7 +1575,6 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		// Decompressed on the archive's host threads, copied into the guest range on this one (pages may fault). One
 		// call for the whole read keeps its chunks in flight on all the lanes.
 		const auto readable = std::min<uint64_t>(size, archive->Size() - file_offset);
-		const FileProvenance::ReadScope provenance_read;
 		const bool prepared = LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 		while (*bytes_read < readable) {
 			const auto request = static_cast<uint32_t>(std::min<uint64_t>(uint64_t {1} << 30u, readable - *bytes_read));
@@ -1615,9 +1586,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		}
 		reading = Clock::now() - start - opening;
 		LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
-		FileProvenance::Record(destination, *bytes_read, ProvenanceFileId(host_path), file_offset);
 		LogAprRead(host_path, destination, *bytes_read, file_offset);
-		MemClass::Mark(MemClass::Disk, destination, *bytes_read);
 		return OK;
 	}
 
@@ -1656,7 +1625,6 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		const auto                        kept_hold   = kept_scratch.Use();
 		auto&                             kept_buffer = kept_scratch.bytes;
 		kept_buffer.resize(static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
-		const FileProvenance::ReadScope provenance_read;
 		const bool prepared = LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 		while (*bytes_read < readable) {
 			const auto request = static_cast<uint32_t>(std::min<uint64_t>(kept_buffer.size(), readable - *bytes_read));
@@ -1672,9 +1640,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			*bytes_read += read;
 		}
 		LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
-		FileProvenance::Record(destination, *bytes_read, ProvenanceFileId(host_path), file_offset);
 		LogAprRead(host_path, destination, *bytes_read, file_offset);
-		MemClass::Mark(MemClass::Disk, destination, *bytes_read);
 		return OK;
 	}
 
@@ -1702,7 +1668,6 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 
 	std::vector<uint8_t> buffer(
 	    static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
-	const FileProvenance::ReadScope provenance_read;
 	const bool prepared = LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 	while (*bytes_read < readable) {
 		const auto request =
@@ -1720,8 +1685,6 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		*bytes_read += read;
 	}
 	LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
-	MemClass::Mark(MemClass::Disk, destination, *bytes_read);
-	FileProvenance::Record(destination, *bytes_read, ProvenanceFileId(host_path), file_offset);
 
 	file.Close();
 	return OK;

@@ -175,11 +175,6 @@ private:
 [[nodiscard]] bool HoldBufferFrees();
 void               ReleaseBufferFrees();
 
-// KYTY_UPLOAD_VRAM (streamBuffer.cpp): the upload rings in host-visible video memory; their bytes by where they went.
-[[nodiscard]] bool     UploadInVideoMemory();
-[[nodiscard]] uint64_t UploadBytesInVideoMemory();
-[[nodiscard]] uint64_t UploadBytesInSystemMemory();
-
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_

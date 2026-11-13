@@ -2046,8 +2046,6 @@ void StartMemoryBreakdown() {
 }
 
 static std::atomic<void (*)(void (*)())> g_trim_runner {nullptr};
-static std::atomic<uint64_t> g_resident_min {0};
-static std::atomic<bool>     g_resident_released {false};
 
 void KeepResident() {
 	static std::once_flag once;
@@ -2055,43 +2053,15 @@ void KeepResident() {
 		const char* text = std::getenv("KYTY_RESIDENT_MB");
 		const auto  mb   = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
 		if (mb == 0) return;
-		// (11-13, reboot of a 14 GB PC at the commit limit) Never more than a quarter of the RAM: 6144 MiB hard on 14 GB
-		// left Windows ~1 GB it could trim from this process while available RAM sat at 136-800 MiB for minutes.
-		uint64_t     want    = mb << 20u;
-		const uint64_t ram   = PhysicalMemory();
-		if (ram != 0 && want > ram / 4) want = ram / 4;
-		g_resident_min.store(want, std::memory_order_relaxed);
-		const SIZE_T minimum = static_cast<SIZE_T>(want);
+		const SIZE_T minimum = static_cast<SIZE_T>(mb << 20u);
 		// (The maximum soft: the process may grow past it; the minimum hard: Windows keeps that much in RAM.)
 		const SIZE_T maximum = minimum + (SIZE_T {512} << 20u);
 		const bool   ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum, maximum,
 		                                             QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
-		std::printf("Memory: %llu MiB kept in RAM (KYTY_RESIDENT_MB=%llu, at most a quarter of the RAM)%s\n",
-		            static_cast<unsigned long long>(want >> 20u), static_cast<unsigned long long>(mb),
+		std::printf("Memory: %llu MiB kept in RAM (KYTY_RESIDENT_MB)%s\n", static_cast<unsigned long long>(mb),
 		            ok ? "" : ": refused by Windows");
 		std::fflush(stdout);
 	});
-}
-// Under lasting critical pressure the hard minimum is given up for the rest of the run (soft again: Windows may trim
-// the process like any other). Once; false where there was none.
-bool ReleaseResident() {
-	if (g_resident_released.exchange(true)) return false;
-	const bool had = g_resident_min.load(std::memory_order_relaxed) != 0;
-	SIZE_T     wmin = 0, wmax = 0;
-	DWORD      flags = 0;
-	GetProcessWorkingSetSizeEx(GetCurrentProcess(), &wmin, &wmax, &flags);
-	const bool hard = (flags & QUOTA_LIMITS_HARDWS_MIN_ENABLE) != 0;
-	if (!had && !hard) return false;
-	const auto call = [] {
-		SIZE_T wmin2 = 0, wmax2 = 0;
-		DWORD  f     = 0;
-		GetProcessWorkingSetSizeEx(GetCurrentProcess(), &wmin2, &wmax2, &f);
-		SetProcessWorkingSetSizeEx(GetCurrentProcess(), SIZE_T {1} << 20u, wmax2 > (SIZE_T {1} << 20u) ? wmax2 : SIZE_T {64} << 20u,
-		                           QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-	};
-	if (auto* runner = g_trim_runner.load(std::memory_order_acquire); runner != nullptr) runner(call);
-	else call();
-	return true;
 }
 static SIZE_T g_ws_min = 0, g_ws_max = 0; // the working set sizes the process started with
 static std::atomic<uint64_t> g_cap_max {0}, g_cap_min {0};
@@ -2099,7 +2069,7 @@ static std::atomic<bool>     g_cap_ok {false};
 bool TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes) {
 	if (target_bytes == 0 || min_bytes >= target_bytes) return false;
 	g_cap_max.store(target_bytes, std::memory_order_relaxed);
-	g_cap_min.store(g_resident_released.load(std::memory_order_relaxed) ? 0 : min_bytes, std::memory_order_relaxed);
+	g_cap_min.store(min_bytes, std::memory_order_relaxed);
 	const auto call = [] {
 		const auto maximum = static_cast<SIZE_T>(g_cap_max.load(std::memory_order_relaxed));
 		const auto  wanted   = static_cast<SIZE_T>(g_cap_min.load(std::memory_order_relaxed));
@@ -2642,7 +2612,6 @@ MemoryUse ProcessMemory() {
 
 void StartWorkingSetTrim() {}
 void KeepResident() {}
-bool ReleaseResident() { return false; }
 bool TrimWorkingSetTo(uint64_t, uint64_t) { return false; }
 void StartMemoryBreakdown() {}
 void SetSimulationBallast(uint64_t) {}
