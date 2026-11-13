@@ -16,6 +16,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kernel/regionProbe.h"
 #include "kytyGitVersion.h"
 #include "libs/agc.h"
 #include "libs/audio.h"
@@ -144,14 +145,23 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 
 	// Initialization order is explicit; destruction is automatic and reversed.
 	subsystems.Initialize<Loader::Timer::Lifecycle>();
+	RegionProbe::Check("after init Timer");
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
+	RegionProbe::Check("after init Pthread");
 	subsystems.Initialize<Profiler::Lifecycle>();
+	RegionProbe::Check("after init Profiler");
 	subsystems.Initialize<Libs::Network::Lifecycle>();
+	RegionProbe::Check("after init Network");
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+	RegionProbe::Check("after init Memory");
 	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
+	RegionProbe::Check("after init FileSystem");
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
+	RegionProbe::Check("after init Controller");
 	subsystems.Initialize<Libs::Audio::Lifecycle>();
+	RegionProbe::Check("after init Audio");
 	subsystems.Initialize<Libs::Graphics::Lifecycle>();
+	RegionProbe::Check("after init Graphics");
 }
 
 static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,
@@ -216,10 +226,12 @@ void Run(const RunOptions& options) {
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
+	RegionProbe::Check("after Libs::InitAll");
 
 	Libs::Trophy::Preload();
 
 	LoadElf(options.elf);
+	RegionProbe::Check("after LoadElf");
 
 	Execute(options.game_patch);
 }

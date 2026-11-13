@@ -60,6 +60,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
+#include "kernel/regionProbe.h"
 
 #include <tuple>
 #include <algorithm>
@@ -1661,6 +1662,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache), m_resources(resources) {
+	RegionProbe::Check("after the buffer cache's rings (image upload ring, stream, upload, download)");
 	{
 		const auto usage = PageTableUsage(graphics);
 		m_bda_tables.push_back(

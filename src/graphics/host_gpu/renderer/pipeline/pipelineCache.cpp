@@ -23,6 +23,7 @@
 #include "resource-plan-serial.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
+#include "kernel/regionProbe.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 #include "native-preparation-scratch.h"
@@ -4010,6 +4011,7 @@ void PipelineCache::InitializeDriverCache() {
 		return store ? std::min(limit, StoreLimit) : limit;
 	};
 	m_driver_cache = LoadDriverCache(m_driver_cache_path, ram_limit(uint64_t {2} << 30u), m_driver_cache_saved_size);
+	RegionProbe::Check("after the driver pipeline cache load");
 	if (m_driver_cache == nullptr) return;
 #ifndef KYTY_STATIC_PRECOMPILE
 	// Pipelines compiled in play as their binaries beside it, for the sessions after (PlayedPipelines): AMD's Windows
@@ -4029,6 +4031,7 @@ void PipelineCache::InitializeDriverCache() {
 	m_table_cache_path = m_driver_cache_path;
 	m_table_cache_path.replace_extension(".table.bin");
 	m_table_cache = LoadDriverCache(m_table_cache_path, ram_limit(uint64_t {2} << 30u), m_table_cache_saved_size);
+	RegionProbe::Check("after the table pipeline cache load");
 	if (m_table_cache == nullptr) return;
 	m_table_cache_saver = std::jthread([this, store_sized = store](std::stop_token stop) {
 		LocalPlatform::SetThreadName("Kyty.TableCache");

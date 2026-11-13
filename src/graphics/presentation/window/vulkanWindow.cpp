@@ -34,6 +34,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kernel/regionProbe.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "kernel/memory.h"
@@ -1462,6 +1463,7 @@ void WindowContext::CreateVulkan() {
 			EXIT("Unable to find a compatible Vulkan Driver");
 		default: EXIT("Could not create a Vulkan instance (for unknown reasons)");
 	}
+	RegionProbe::Check("after vkCreateInstance");
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
 
 	if (r.enable_validation_layers) {
@@ -1479,6 +1481,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create a Vulkan surface");
 	}
 	surface = native_surface;
+	RegionProbe::Check("after the Vulkan surface");
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
@@ -1659,6 +1662,7 @@ void WindowContext::CreateVulkan() {
 		}
 		EXIT("Could not create device");
 	}
+	RegionProbe::Check("after vkCreateDevice");
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	FrameGen::BypassCommandHooks(graphic_ctx.device);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -1695,14 +1699,18 @@ void WindowContext::CreateVulkan() {
 	Libs::Graphics::Fsr3::OnDevice(graphic_ctx, g_fsr3_plan);
 	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
 	Libs::Graphics::Xess::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
+	RegionProbe::Check("after the FSR3 / frame generation / XeSS device hooks");
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
 	}
+	RegionProbe::Check("after the Vulkan memory allocator");
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
+	RegionProbe::Check("after the RenderContext");
 	LibKernel::Memory::InstallGpuResources(&render_context->GetGpuResources());
 	presenter = std::make_unique<Presenter>(*this);
+	RegionProbe::Check("after the Presenter");
 }
 
 // Offline tools (xpr_replay_tests): the device CreateVulkan builds - same

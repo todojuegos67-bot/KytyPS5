@@ -14,6 +14,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/presentation/window/hostInput.h"
+#include "kernel/regionProbe.h"
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsWarp.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -1134,6 +1135,7 @@ void Swapchain::Create() {
 	std::printf("Swapchain: %ux%u, present mode %d, %u images%s\n", m_extent.width, m_extent.height,
 	            static_cast<int>(create_info.presentMode), image_count, m_fsr3 ? " (FSR 3 frame generation)" : "");
 	std::fflush(stdout);
+	RegionProbe::Check("after a swapchain");
 	Loader::DemonsSoulsRenderSize::g_swapchain_width.store(m_extent.width);
 	Loader::DemonsSoulsRenderSize::g_swapchain_height.store(m_extent.height);
 	if (Config::HdrEnabled()) {
@@ -1653,6 +1655,14 @@ Swapchain::Status Swapchain::Present() {
 		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
+	{
+		static std::atomic<uint32_t> presents {0};
+		const uint32_t               n = presents.fetch_add(1u, std::memory_order_relaxed) + 1u;
+		if (n == 1u) RegionProbe::Check("after the first present");
+		else if (n == 100u) RegionProbe::Check("after 100 presents");
+		else if (n == 1000u) RegionProbe::Check("after 1000 presents");
+		else if (n == 10000u) RegionProbe::Check("after 10000 presents");
+	}
 	return Status::Success;
 }
 
