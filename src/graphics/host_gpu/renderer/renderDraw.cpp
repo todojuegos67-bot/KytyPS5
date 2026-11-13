@@ -45,6 +45,7 @@
 #include "frame-gen.h"
 #include "native-preparation-state.h"
 #include "slow-log.h"
+#include "lean-log.h"
 #include "xpr-capture.h"
 #include "speculation-state.h"
 #include "draw-state-observer.h"

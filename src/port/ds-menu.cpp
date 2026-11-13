@@ -5434,6 +5434,25 @@ void Sample(LogState& L,
 		int64_t key = -1;
 		bool   any = false;
 	} f;
+	// (ds-native-lean) The frame and frame generation numbers from memory (local/lean-log.h), once a second: the run log
+	// carries their lines only once in a while now. The log's lines stay the fallback (an emulator without them).
+	const uint64_t frames_seq = PortLive::frames_seq.load(std::memory_order_acquire);
+	const int64_t  fg_at      = PortLive::fg_at_ns.load(std::memory_order_relaxed);
+	const bool     fg_fresh   = fg_at != 0 && std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - fg_at <
+	                                                  int64_t {3'000'000'000};
+	if (frames_seq != 0) {
+		f.any  = true;
+		f.mean = PortLive::frames_mean_ms.load(std::memory_order_relaxed);
+		f.max  = PortLive::frames_max_ms.load(std::memory_order_relaxed);
+		if (f.mean > 0) f.fps = std::round(1000.0 / f.mean);
+		f.key = static_cast<int64_t>(frames_seq);
+		if (fg_fresh) {
+			const double real = std::round(PortLive::fg_real_fps.load(std::memory_order_relaxed));
+			const double fgs  = std::round(PortLive::fg_shown_fps.load(std::memory_order_relaxed));
+			if (real > 0 && fgs != real) f.fg_shown = fgs, f.fg_real = real;
+		}
+		if (const int m = PortLive::fg_multiplier.load(std::memory_order_relaxed); m > 0) f.fg_mult = m;
+	}
 	if (!text.empty()) {
 		static const std::regex re_fps(R"(\[fps\] \d+ frames: mean ([0-9.]+) ms, max ([0-9.]+))");
 		static const std::regex re_f5(R"(Frames \(5 s\): ([0-9.]+) fps)");
@@ -5441,9 +5460,12 @@ void Sample(LogState& L,
 		static const std::regex re_x(R"(\[(dlssg|fsr3-mfg)\][^\r\n]*?x(\d))");
 		static const std::regex re_lat(R"(\[lat\] input->present mean ([0-9.]+) ms, p95 ([0-9.]+), max ([0-9.]+); \+scanout ([0-9.]+); fg \+([0-9.]+) \(n (\d+)\)(?:; total ([0-9.]+), p95 ([0-9.]+))?)");
 		std::vector<std::smatch> fm;
-		for (std::sregex_iterator it(text.begin(), text.end(), re_fps), end; it != end; ++it) fm.push_back(*it);
+		if (frames_seq == 0)
+			for (std::sregex_iterator it(text.begin(), text.end(), re_fps), end; it != end; ++it) fm.push_back(*it);
 		int64_t prev_idx = -1;
-		if (!fm.empty()) {
+		if (frames_seq != 0) {
+			// (from memory, above)
+		} else if (!fm.empty()) {
 			f.any = true;
 			prev_idx = fm.size() > 1 ? fm[fm.size() - 2].position(0) : -1;
 			f.mean = Num(fm.back()[1]), f.max = Num(fm.back()[2]);
@@ -5456,8 +5478,10 @@ void Sample(LogState& L,
 		}
 		std::smatch mx, mr, ml;
 		bool hx = false, hr = false, hl = false;
-		for (std::sregex_iterator it(text.begin(), text.end(), re_x), end; it != end; ++it) mx = *it, hx = true;
-		for (std::sregex_iterator it(text.begin(), text.end(), re_rs), end; it != end; ++it) mr = *it, hr = true;
+		if (frames_seq == 0) {
+			for (std::sregex_iterator it(text.begin(), text.end(), re_x), end; it != end; ++it) mx = *it, hx = true;
+			for (std::sregex_iterator it(text.begin(), text.end(), re_rs), end; it != end; ++it) mr = *it, hr = true;
+		}
 		for (std::sregex_iterator it(text.begin(), text.end(), re_lat), end; it != end; ++it) ml = *it, hl = true;
 		if (hx) f.fg_mult = std::atoi(mx[2].str().c_str());
 		if (hr && mr.position(0) > prev_idx && mr[2].str() != mr[1].str()) f.fg_shown = std::round(Num(mr[2])), f.fg_real = std::round(Num(mr[1]));

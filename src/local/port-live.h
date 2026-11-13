@@ -6,6 +6,7 @@
 // environment switches): an emulator without the port never writes them, so nothing changes for it.
 
 #include <atomic>
+#include <cstdint>
 
 union SDL_Event;
 struct SDL_Window;
@@ -29,6 +30,17 @@ inline std::atomic<const char*> gfx_line {nullptr}; // the graphics options line
 inline std::atomic<int>         fg_now {0};
 inline std::atomic<int>         fg_measured {0}; // (10-28) the measured multiplier (shown / real), 0: none
 inline std::atomic<bool>        fg_plain {false};   // the label alone (no "FG", no multiplier)         // shown frames per real frame (x2...); 0: unknown
+// (ds-native-lean) The numbers the metrics panel and the F8 HUD read from the run log's rate lines before, in memory
+// (local/lean-log.h): the last second's frames (LiveControl's [fps] window; seq 0: none yet) and frame generation's
+// last second (fsr3-fg.cpp / frame-gen.cpp; fg_at_ns: steady-clock ns of the last one, 0: none).
+inline std::atomic<uint64_t> frames_seq {0};
+inline std::atomic<float>    frames_mean_ms {0.0f};
+inline std::atomic<float>    frames_max_ms {0.0f};
+inline std::atomic<uint64_t> fg_seq {0};
+inline std::atomic<float>    fg_real_fps {0.0f};
+inline std::atomic<float>    fg_shown_fps {0.0f};
+inline std::atomic<int>      fg_multiplier {0};
+inline std::atomic<int64_t>  fg_at_ns {0};
 
 // The port's hooks (null in the emulator): set once by the port's main before the game starts.
 struct Hooks {

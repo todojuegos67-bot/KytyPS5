@@ -32,6 +32,7 @@
 #include "loader/demonsSoulsWarp.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
+#include "lean-log.h"
 #include "slow-log.h"
 #include "time-census.h"
 
@@ -117,7 +118,12 @@ inline void Flip() {
 	g_flips.store(flip + 1, std::memory_order_release);
 	// (KYTY_FPS_HUD's frame-time graph: the frame and the render thread's busy part of it.)
 	PerfOverlay::NoteFlip(flip_ns, g_render_idle_ns);
-	if (SlowLog::HitchThreshold() > 0.0) {
+	// (ds-native-lean) KYTY_FPS_LOG: the [fps] line once a LeanLog::Period() (default 10 s) over that period, its [fps+] /
+	// [acq] lines only with KYTY_LOG_VERBOSE=1 (then every second, as before). The last second's frame times are
+	// published to memory every second either way (the metrics panel: LeanLog::PublishFrames). The SLOW Frame lines only
+	// with KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS) > 0 (the port: 0, off).
+	const bool hitch = SlowLog::HitchThreshold() > 0.0;
+	{
 		using C = LiveCounters::Id;
 		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprStorePending, C::XprRefuseBind,
 		                                     C::XprMissRefused, C::XprMissValidate, C::XprMissUnseen, C::XprMissBudget,
@@ -145,86 +151,100 @@ inline void Flip() {
 		// (the frame less idle) well over cpu is time the thread was ready but not running (preempted).
 		static const uint64_t                            first_tsc  = __rdtsc();
 		static const auto                                first_time = std::chrono::steady_clock::now();
-		static uint64_t                                  last_cycles = 0;
-		const uint64_t                                   cycles      = LocalPlatform::CurrentThreadCycles();
-		const auto                                       now = std::chrono::steady_clock::now();
-		const uint64_t                                   tsc = __rdtsc();
-		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
-		// KYTY_FPS_LOG=1: a line every second with the frames of that second (count, mean and longest), the render
-		// thread's mean run time, idle and waits per frame, and how many frames passed 17 ms (missed 60 fps): what a
-		// frame rate that fluctuates under 60 is made of, below the SLOW Frame threshold.
+		// KYTY_FPS_LOG=1: the frames of the period (count, mean and longest), the render thread's mean run time, idle and
+		// waits per frame, and how many frames passed 17 ms (missed 60 fps): what a frame rate that fluctuates under 60
+		// is made of, below the SLOW Frame threshold.
 		static const bool fps_log = [] {
 			const char* text = std::getenv("KYTY_FPS_LOG");
 			return text != nullptr && *text != '\0' && std::string_view(text) != "0";
 		}();
-		if (fps_log && last != std::chrono::steady_clock::time_point {}) {
-			struct Second {
+		static uint64_t                                  last_cycles = 0;
+		const uint64_t                                   cycles      = fps_log || hitch ? LocalPlatform::CurrentThreadCycles() : 0;
+		const auto                                       now = std::chrono::steady_clock::now();
+		const uint64_t                                   tsc = __rdtsc();
+		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+		if (last != std::chrono::steady_clock::time_point {}) {
+			struct Window {
 				std::chrono::steady_clock::time_point start {};
 				uint32_t frames = 0, missed = 0, slow = 0;
 				double   sum_ms = 0, max_ms = 0, sum_cpu = 0, sum_idle = 0;
 				std::array<double, LiveCensus::Waits> sum_waits {};
 			};
-			static Second second;
+			// second: the last second (published); period: the printed line's (LeanLog::Period() seconds).
+			static Window second, period;
 			if (second.start == std::chrono::steady_clock::time_point {}) second.start = now;
+			if (period.start == std::chrono::steady_clock::time_point {}) period.start = now;
 			const double since_first = std::chrono::duration<double, std::milli>(now - first_time).count();
 			const double cpu_ms      = cycles != 0 && last_cycles != 0 && since_first > 1000.0
 			                               ? static_cast<double>(cycles - last_cycles) * since_first /
 			                                     static_cast<double>(__rdtsc() - first_tsc)
 			                               : 0.0;
-			second.frames++;
-			second.sum_ms += ms;
-			second.max_ms = std::max(second.max_ms, ms);
-			second.sum_cpu += cpu_ms;
-			second.sum_idle += static_cast<double>(g_render_idle_ns - last_idle) / 1e6;
-			for (size_t i = 0; i < LiveCensus::Waits; ++i)
-				second.sum_waits[i] += static_cast<double>(LiveCensus::g_waits_ns[i] - last_waits[i]) / 1e6;
-			if (ms > 17.0) second.missed++;
-			if (ms > 25.0) second.slow++;
+			const double idle_ms = static_cast<double>(g_render_idle_ns - last_idle) / 1e6;
+			for (Window* w: {&second, &period}) {
+				w->frames++;
+				w->sum_ms += ms;
+				w->max_ms = std::max(w->max_ms, ms);
+				if (ms > 17.0) w->missed++;
+				if (ms > 25.0) w->slow++;
+			}
+			if (fps_log) {
+				period.sum_cpu += cpu_ms;
+				period.sum_idle += idle_ms;
+				for (size_t i = 0; i < LiveCensus::Waits; ++i)
+					period.sum_waits[i] += static_cast<double>(LiveCensus::g_waits_ns[i] - last_waits[i]) / 1e6;
+			}
 			if (now - second.start >= std::chrono::seconds(1)) {
-				const double n = static_cast<double>(second.frames);
+				LeanLog::PublishFrames(second.sum_ms / static_cast<double>(second.frames), second.max_ms);
+				second       = {};
+				second.start = now;
+			}
+			if (fps_log && now - period.start >= std::chrono::seconds(LeanLog::Period())) {
+				const double n = static_cast<double>(period.frames);
 				double fp_mean = 0, fp_sd = 0, pi_mean = 0, pi_sd = 0;
 				(void)Libs::VideoOut::TakePresentTiming(fp_mean, fp_sd, pi_mean, pi_sd);
 				std::printf("[fps] %u frames: mean %.1f ms, max %.1f, cpu %.1f, idle %.1f, gpu_wait %.2f, readback %.2f, download %.2f, "
 				            "compile %.2f, record %.2f; over 17 ms: %u, over 25 ms: %u; flip->present mean %.2f sd %.2f ms, "
 				            "present interval mean %.2f sd %.2f ms\n",
-				            second.frames, second.sum_ms / n, second.max_ms, second.sum_cpu / n, second.sum_idle / n,
-				            second.sum_waits[0] / n, second.sum_waits[1] / n, second.sum_waits[2] / n, second.sum_waits[3] / n,
-				            second.sum_waits[4] / n, second.missed, second.slow, fp_mean, fp_sd, pi_mean, pi_sd);
-				// The guest threads' tax that second: their write and read faults, protection re-arms and
-				// synchronous GPU reads (what the game's own thread spends outside its code).
-				using G = LiveCounters::Id;
-				static constexpr std::array guest {G::WindowFault, G::WriteFault, G::ReadFault, G::Reprotect, G::Unprotect,
-				                                   G::ProtectCalls, G::SyncReadsGuest, G::SyncDownloads, G::GuestCommands,
-				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs};
-				static std::array<uint64_t, guest.size()> last_guest {};
-				std::printf("[fps+]");
-				for (size_t i = 0; i < guest.size(); ++i) {
-					const auto value = LiveCounters::Value(guest[i]);
-					std::printf(" %s=%llu", LiveCounters::Names[guest[i]], static_cast<unsigned long long>(value - last_guest[i]));
-					last_guest[i] = value;
-				}
-				std::printf("\n");
-				if (LaneSync::g_on) {
-					static uint64_t last_acq[4] {};
-					const uint64_t  now_acq[4] {LaneSync::g_submits[0].load(), LaneSync::g_submits[1].load(),
-					                            LaneSync::g_waits[0].load(), LaneSync::g_waits[1].load()};
-					std::printf("[acq] submits graphics %llu compute %llu; cross waits on graphics %llu on compute %llu\n",
-					            static_cast<unsigned long long>(now_acq[0] - last_acq[0]), static_cast<unsigned long long>(now_acq[1] - last_acq[1]),
-					            static_cast<unsigned long long>(now_acq[2] - last_acq[2]), static_cast<unsigned long long>(now_acq[3] - last_acq[3]));
-					for (int n = 0; n < 4; ++n) last_acq[n] = now_acq[n];
-					static uint64_t last_why[6] {};
-					std::printf("[acq] compute waited for graphics by: image read %llu, image write %llu, range read %llu, range write %llu, reuse %llu\n",
-					            static_cast<unsigned long long>(LaneSync::g_why[0] - last_why[0]), static_cast<unsigned long long>(LaneSync::g_why[1] - last_why[1]),
-					            static_cast<unsigned long long>(LaneSync::g_why[2] - last_why[2]), static_cast<unsigned long long>(LaneSync::g_why[3] - last_why[3]),
-					            static_cast<unsigned long long>(LaneSync::g_why[4] - last_why[4]));
-					for (int n = 0; n < 6; ++n) last_why[n] = LaneSync::g_why[n];
+				            period.frames, period.sum_ms / n, period.max_ms, period.sum_cpu / n, period.sum_idle / n,
+				            period.sum_waits[0] / n, period.sum_waits[1] / n, period.sum_waits[2] / n, period.sum_waits[3] / n,
+				            period.sum_waits[4] / n, period.missed, period.slow, fp_mean, fp_sd, pi_mean, pi_sd);
+				if (LeanLog::Verbose()) {
+					// The guest threads' tax that period: their write and read faults, protection re-arms and
+					// synchronous GPU reads (what the game's own thread spends outside its code).
+					using G = LiveCounters::Id;
+					static constexpr std::array guest {G::WindowFault, G::WriteFault, G::ReadFault, G::Reprotect, G::Unprotect,
+					                                   G::ProtectCalls, G::SyncReadsGuest, G::SyncDownloads, G::GuestCommands,
+					                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs};
+					static std::array<uint64_t, guest.size()> last_guest {};
+					std::printf("[fps+]");
+					for (size_t i = 0; i < guest.size(); ++i) {
+						const auto value = LiveCounters::Value(guest[i]);
+						std::printf(" %s=%llu", LiveCounters::Names[guest[i]], static_cast<unsigned long long>(value - last_guest[i]));
+						last_guest[i] = value;
+					}
+					std::printf("\n");
+					if (LaneSync::g_on) {
+						static uint64_t last_acq[4] {};
+						const uint64_t  now_acq[4] {LaneSync::g_submits[0].load(), LaneSync::g_submits[1].load(),
+						                            LaneSync::g_waits[0].load(), LaneSync::g_waits[1].load()};
+						std::printf("[acq] submits graphics %llu compute %llu; cross waits on graphics %llu on compute %llu\n",
+						            static_cast<unsigned long long>(now_acq[0] - last_acq[0]), static_cast<unsigned long long>(now_acq[1] - last_acq[1]),
+						            static_cast<unsigned long long>(now_acq[2] - last_acq[2]), static_cast<unsigned long long>(now_acq[3] - last_acq[3]));
+						for (int n = 0; n < 4; ++n) last_acq[n] = now_acq[n];
+						static uint64_t last_why[6] {};
+						std::printf("[acq] compute waited for graphics by: image read %llu, image write %llu, range read %llu, range write %llu, reuse %llu\n",
+						            static_cast<unsigned long long>(LaneSync::g_why[0] - last_why[0]), static_cast<unsigned long long>(LaneSync::g_why[1] - last_why[1]),
+						            static_cast<unsigned long long>(LaneSync::g_why[2] - last_why[2]), static_cast<unsigned long long>(LaneSync::g_why[3] - last_why[3]),
+						            static_cast<unsigned long long>(LaneSync::g_why[4] - last_why[4]));
+						for (int n = 0; n < 6; ++n) last_why[n] = LaneSync::g_why[n];
+					}
 				}
 				std::fflush(stdout);
-				second       = {};
-				second.start = now;
+				period       = {};
+				period.start = now;
 			}
 		}
-		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
+		if (hitch && last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
 			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(tsc), ms,
 			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);
 			if (const double since = std::chrono::duration<double, std::milli>(now - first_time).count();
@@ -264,19 +284,23 @@ inline void Flip() {
 			                                   .count()));
 			std::fflush(stdout);
 		}
-		last      = now;
-		last_tsc  = tsc;
-		last_idle = g_render_idle_ns;
-		last_upload_wait = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed);
-		for (size_t i = 0; i < LiveCensus::Kinds; ++i) last_kind_cycles[i] = LiveCensus::g_kind_cycles[i];
-		for (size_t i = 0; i < LiveCensus::Phases; ++i) {
-			last_dispatch_phases[i] = LiveCensus::g_dispatch_phase_cycles[i];
-			last_draw_phases[i]     = LiveCensus::g_draw_phase_cycles[i];
-		}
-		for (size_t i = 0; i < 4; ++i) last_xpr[i] = LiveCensus::g_xpr_cycles[i];
+		last        = now;
+		last_idle   = g_render_idle_ns;
 		last_cycles = cycles;
-		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
-		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
+		if (fps_log || hitch)
+			for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
+		if (hitch) {
+			// (The SLOW Frame line's per-frame deltas: kept only while those lines are on.)
+			last_tsc         = tsc;
+			last_upload_wait = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed);
+			for (size_t i = 0; i < LiveCensus::Kinds; ++i) last_kind_cycles[i] = LiveCensus::g_kind_cycles[i];
+			for (size_t i = 0; i < LiveCensus::Phases; ++i) {
+				last_dispatch_phases[i] = LiveCensus::g_dispatch_phase_cycles[i];
+				last_draw_phases[i]     = LiveCensus::g_draw_phase_cycles[i];
+			}
+			for (size_t i = 0; i < 4; ++i) last_xpr[i] = LiveCensus::g_xpr_cycles[i];
+			for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
+		}
 	}
 }
 
@@ -862,6 +886,8 @@ inline void StallWatch(int64_t threshold_ns) {
 inline void Start() {
 	g_render_thread = LocalPlatform::CurrentThreadHandle();
 	g_render_tid.store(LocalPlatform::ThreadId());
+	// (ds-native-lean) The per-call census only when something reads it (live-census.h).
+	LiveCensus::g_collect = SlowLog::HitchThreshold() > 0.0 || std::getenv("KYTY_LIVE_FILE") != nullptr;
 	LiveCensus::g_render = true;
 	LiveCounters::g_single_writer = true;
 	(void)LocalPlatform::CurrentThreadStack(&g_stack_low, &g_stack_high);

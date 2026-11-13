@@ -36,6 +36,7 @@
 #include "local-platform.h"
 #include "ram-guard.h"
 #include "slow-log.h"
+#include "lean-log.h"
 #include "startup-progress.h"
 
 #include <algorithm>
@@ -2119,16 +2120,21 @@ struct PipelineCache::ProgramCache {
 		publish_stage(permutation.program);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		// (ds-native-lean) The running count: every translation with KYTY_LOG_VERBOSE=1, else every 256th (it walked every
+		// program for each line: 2084 lines in a 3-minute log).
+		static std::atomic<uint32_t> translations {0};
+		if (const uint32_t n = translations.fetch_add(1, std::memory_order_relaxed) + 1; LeanLog::Verbose() || n % 256 == 0) {
+			std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
+			for (const auto& [key, source]: programs) {
+				counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+			}
+			// Guest geometry shaders are compiled through the host mesh stage.
+			std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
+			            counts[static_cast<size_t>(ShaderType::Vertex)],
+			            counts[static_cast<size_t>(ShaderType::Pixel)],
+			            counts[static_cast<size_t>(ShaderType::Compute)],
+			            counts[static_cast<size_t>(ShaderType::Mesh)]);
 		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)]);
 		return permutation.handle;
 	}
 

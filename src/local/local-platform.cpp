@@ -1979,7 +1979,7 @@ static void PrintMemoryTagSummary(unsigned long seconds) {
 	std::fflush(stdout);
 }
 
-// KYTY_MEMORY_BREAKDOWN_SECONDS (default 60, 0 off): where the process's private commit is, from a walk of its
+// KYTY_MEMORY_BREAKDOWN_SECONDS (default 0: off; 60 the old default): where the process's private commit is, from a walk of its
 // address space on a low-priority thread (a few ms per walk, off the game's threads): private committed by kind
 // (process heaps, executable, read-write), mapped (sections: the guest store), and the largest allocations.
 void StartMemoryBreakdown() {
@@ -1987,7 +1987,8 @@ void StartMemoryBreakdown() {
 	std::call_once(once, [] {
 		const char* text    = std::getenv("KYTY_MEMORY_BREAKDOWN_SECONDS");
 		// (30 s by default with KYTY_MEMORY_TAGS=1, the tagged summary's period.)
-		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : MemoryTagsEnabled() ? 30ul : 60ul;
+		// (ds-native-lean) Off by default (was 60 s): a VirtualQuery walk of the whole address space, a diagnostic line.
+		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : MemoryTagsEnabled() ? 30ul : 0ul;
 		if (seconds == 0) return;
 		std::thread([seconds] {
 			SetThreadDescription(GetCurrentThread(), L"Kyty.MemoryBreakdown");

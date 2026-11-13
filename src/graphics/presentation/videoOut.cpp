@@ -649,7 +649,8 @@ std::mutex     g_pace_mutex;
 PaceSeries     g_pace[2];
 std::chrono::steady_clock::time_point g_pace_report {};
 bool PaceOn() {
-	static const bool on = [] { const char* v = std::getenv("KYTY_PACE_STATS"); return v == nullptr || v[0] != '0'; }();
+	// (ds-native-lean) Off unless KYTY_PACE_STATS=1: a lock, a vector push per flip and a sort every 5 s.
+	static const bool on = [] { const char* v = std::getenv("KYTY_PACE_STATS"); return v != nullptr && v[0] != '\0' && v[0] != '0'; }();
 	return on;
 }
 void PaceLine(const char* name, std::vector<double> v) {
@@ -836,8 +837,9 @@ static std::atomic<uint32_t> g_idle_blank {0};
 static std::atomic<int>      g_last_floor {0};
 static void NoteFlipStats() {
 	static const bool on = [] {
+		// (ds-native-lean) Off unless KYTY_FLIP_STATS=1 (a line a second).
 		const char* value = std::getenv("KYTY_FLIP_STATS");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
 	}();
 	if (!on) return;
 	static auto since = std::chrono::steady_clock::now();
