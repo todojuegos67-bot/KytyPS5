@@ -77,11 +77,12 @@ static const char* WroteWhatItRead(const Spec::EffectsLog::Entry* entry) {
 Speculation::Translator::Translator(RenderContext& renderer, uint32_t number)
     : index(number), draw(std::make_unique<RenderExecutor>(renderer)), compute(std::make_unique<RenderExecutor>(renderer)),
       executors {draw.get(), compute.get()}, cp(std::make_unique<CommandProcessor>(renderer, 0)),
-      table_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(), MemoryUsage::Upload,
+      table_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(),
+                                                  LeanUploadUsage(renderer.GetGraphics()),
                                                   uint64_t {64} << 20u,
                                                   AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress)),
       shader_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(),
-                                                   MemoryUsage::Upload, uint64_t {16} << 20u)) {
+                                                   LeanUploadUsage(renderer.GetGraphics()), uint64_t {16} << 20u)) {
 	draw->ReadCatalogOf(renderer.DefaultRenderExecutor(), 1 + number);
 	compute->ReadCatalogOf(renderer.DefaultComputeRenderExecutor(), 1 + number);
 }

@@ -33,6 +33,8 @@
 #include "local-platform.h"
 #include "soft-release.h"
 #include "ram-guard.h"
+#include "lean-hostmem.h"
+#include "ram-census.h"
 
 #include <cstdio>
 #include "kytyGitVersion.h"
@@ -128,6 +130,25 @@ void InstallMemoryTags(VkPhysicalDevice physical_device) {
 	dispatcher.vkFreeMemory     = TaggedFreeMemory;
 }
 } // namespace
+
+// The RAM census's Vulkan heaps (ram-census.h): VK_EXT_memory_budget through VMA (thread-safe), on the census thread.
+static VmaAllocator g_census_allocator = nullptr;
+static int          CensusHeaps(RamCensus::Heap* heaps, int max) {
+	if (g_census_allocator == nullptr) return 0;
+	const VkPhysicalDeviceMemoryProperties* memory = nullptr;
+	vmaGetMemoryProperties(g_census_allocator, &memory);
+	if (memory == nullptr) return 0;
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(g_census_allocator, budgets);
+	const int count = std::min<int>(max, static_cast<int>(memory->memoryHeapCount));
+	for (int h = 0; h < count; ++h) {
+		heaps[h].usage        = budgets[h].usage;
+		heaps[h].budget       = budgets[h].budget;
+		heaps[h].blocks       = budgets[h].statistics.blockBytes;
+		heaps[h].device_local = (memory->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+	}
+	return count;
+}
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -257,6 +278,10 @@ bool GraphicContext::CreateAllocator() {
 	LogVideoMemory("start");
 	g_report_allocator          = allocator;
 	g_report_context            = this;
+	RamCensus::SetHeapQuery(nullptr);
+	g_census_allocator = allocator;
+	RamCensus::SetHeapQuery(CensusHeaps);
+	RamCensus::Start();
 	LiveCounters::g_vma_report = WriteVmaReport;
 	g_image_pool_limit         = std::min<uint64_t>(LocalPlatform::LowMemVram() ? 256ull << 20 : 1024ull << 20, GetTotalMemoryBudget() / 32);
 	// Out of memory (MemGuard): the freed images kept for reuse go (made again when needed). A system-memory image's
@@ -298,6 +323,8 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	RamCensus::SetHeapQuery(nullptr); // (waits for a census query running meanwhile)
+	g_census_allocator = nullptr;
 	LiveCounters::g_vma_report = nullptr;
 	g_report_allocator         = nullptr;
 	g_report_context           = nullptr;
@@ -690,7 +717,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	// KYTY_LOWMEM_VRAM=1: no redirect. The plain type's allocations are a second pool outside the caches' budget
 	// (2593 MiB of it at 4096 budget on a simulated 8 GB card, the process's private commit +4.6 GB, NVIDIA charging
 	// it to commit); device-local textures stay under the budget the caches collect to.
-	if (texture && small_video_memory && !LocalPlatform::LowMemVram() &&
+	// KYTY_LEAN_HOSTMEM=1: no redirect either (lean-hostmem.h: that type is system RAM the driver holds once video
+	// memory is full, outside the working set).
+	if (texture && small_video_memory && !LocalPlatform::LowMemVram() && !LeanHostMem::Enabled() &&
 	    GetDeviceMemoryUsage() >= GetTotalMemoryBudget(false) / 2) {
 		alloc_info.requiredFlags = 0;
 		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;

@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "device-fault.h"
 #include "local/mem-guard.h"
+#include "local/lean-hostmem.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -197,6 +198,20 @@ std::atomic<uint64_t> g_forced_spill_bytes {[] {
 }
 
 } // namespace
+
+MemoryUsage LeanUploadUsage(const GraphicContext& graphics) {
+	if (!LeanHostMem::Enabled()) return MemoryUsage::Upload;
+	const auto& memory = graphics.physical_device_memory_properties;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+		const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+		constexpr VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+		const uint32_t heap = memory.memoryTypes[i].heapIndex;
+		if ((properties & wanted) == wanted && heap < memory.memoryHeapCount &&
+		    memory.memoryHeaps[heap].size > (uint64_t {1} << 30u))
+			return MemoryUsage::Stream;
+	}
+	return MemoryUsage::Upload;
+}
 
 struct Buffer::Sparse {
 	uint64_t                    page_size   = 0;
