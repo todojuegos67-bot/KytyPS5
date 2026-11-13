@@ -327,11 +327,11 @@ public:
 			            static_cast<unsigned long long>(free_bytes.QuadPart >> 20u));
 			return INVALID_HANDLE_VALUE;
 		}
-		const std::wstring path = folder + L"\\kyty-guest-memory-" + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+		const std::wstring path = folder + L"\\~ds-memory-" + std::to_wstring(GetCurrentProcessId()) + L".tmp";
 		// Temporary + delete on close: Windows keeps its pages in RAM while there is room (no lazy write-back of a
 		// temporary file's pages) and removes the file when the process ends, however it ends.
 		HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE, 0, nullptr, CREATE_ALWAYS,
-		                          FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_DELETE_ON_CLOSE,
+		                          FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_DELETE_ON_CLOSE,
 		                          nullptr);
 		if (file == INVALID_HANDLE_VALUE) {
 			std::printf("Guest memory: KYTY_BACKING_FILE could not create its file (0x%08x): the page file instead\n",

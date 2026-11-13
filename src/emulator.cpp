@@ -87,7 +87,12 @@ static void MountSandboxDirs() {
 	MountOrCreateDir("_DownloadData/" + title_id, "/download0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp");
+#if defined(KYTY_DS_PORT)
+	// (The PC port: the game's development log beside its temporary data, no _DevLog folder of its own.)
+	MountOrCreateDir("_TempData/" + title_id + "/devlog", "/devlog");
+#else
 	MountOrCreateDir("_DevLog/" + title_id, "/devlog");
+#endif
 }
 
 static bool ClearDirectoryContents(const std::filesystem::path& dir) {
@@ -116,7 +121,10 @@ static void ClearDebugTextureFolder() {
 	const std::string debug_texture_folder = "_Textures";
 
 	if (!Common::File::IsDirectoryExisting(debug_texture_folder)) {
+#if !defined(KYTY_DS_PORT)
+		// (The PC port: nothing writes there; no empty debugging folder next to the game.)
 		Common::File::CreateDirectories(debug_texture_folder);
+#endif
 		return;
 	}
 
