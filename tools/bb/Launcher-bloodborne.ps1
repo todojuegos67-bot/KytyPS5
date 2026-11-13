@@ -2255,6 +2255,7 @@ public class BbSmoothScroll {
   [DllImport("dwmapi.dll")] static extern int DwmFlush();
   [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint p);
   [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint p);
+  [DllImport("user32.dll")] static extern short GetKeyState(int vk);
   public static bool ReduceMotion = false;
   public Control Host, Content, MaxRef;
   public int BaseTop = 0, Pad = 0, Slide = 0;
@@ -2341,6 +2342,7 @@ public class BbSmoothScroll {
   public void HookFocus(Control root) { foreach (Control c in root.Controls) { c.Enter += OnEnter; HookFocus(c); } }
   void OnEnter(object s, EventArgs e) {
     if (Control.MouseButtons != MouseButtons.None || Content == null || Host == null) return;
+    try { if ((GetKeyState(0x09) & 0x8000) == 0) return; } catch { return; }  // solo Tab / Mayus+Tab (un clic en la flecha del desplegable enfoca sin raton pulsado)
     Control c = s as Control; if (c == null) return;
     int top = 0; Control p = c;
     while (p != null && p != Content) { top += p.Top; p = p.Parent; }
@@ -2404,7 +2406,7 @@ if ($script:bbx) {
 	if ($script:fam) { Write-Log 'Letra de titulos: Cinzel' } else { Write-Log 'Letra de titulos: Segoe UI (no se encontro menu_assets\fonts\Cinzel-SemiBold.ttf)' }
 }
 function New-DisplayFont([double]$pt, [double]$fallbackPt) {
-	if ($script:fam) { return (New-Object System.Drawing.Font($script:fam, [float]$pt, [System.Drawing.FontStyle]::Regular)) }
+	if ($script:fam) { try { return (New-Object System.Drawing.Font($script:fam, [float]$pt, [System.Drawing.FontStyle]::Regular)) } catch { Write-Log "Cinzel: $_" } }
 	return (New-Object System.Drawing.Font('Segoe UI Semibold', [float]$fallbackPt, [System.Drawing.FontStyle]::Bold))
 }
 if ($script:fam) { $fGroup = New-DisplayFont 12.75 13.5 }
@@ -2727,6 +2729,8 @@ $script:setWheelT.Add_Tick({
 	if ([math]::Abs($d) -lt 0.5) { $script:setPos = $script:setTarget; $script:setWheelT.Stop() } else { $script:setPos += $d * (1 - [math]::Exp(-$dt / $script:setTau)) }
 	Set-SetScrollY $script:setPos
 })
+# (bb-launcher-2) Posicion que se ve ahora (con el motor suave, $script:setY puede ir por detras mientras se mueve o tras moverse).
+function Get-SetYNow { if ($script:smS) { return [double]$script:smS.Y }; return [double]$script:setY }
 function Set-SetNow([double]$y) { $script:setWheelT.Stop(); if ($script:smS) { $script:smS.Stop() }; Set-SetScrollY $y; $script:setPos = $script:setY; $script:setTarget = $script:setY }
 $sbarS.add_Scrolled({
 	if ($reduceMotion) { Set-SetNow $sbarS.Requested; return }
@@ -2735,15 +2739,15 @@ $sbarS.add_Scrolled({
 	$script:setTau = 35.0; $script:setTarget = [math]::Max(0.0, [math]::Min((Get-SetMax), [double]$sbarS.Requested)); $script:setWheelT.Start()
 })
 $sbarS.add_PageRequested({ Add-SetWheel ($sbarS.PageDir * $scroll.ClientSize.Height * 0.9) })
-$scroll.Add_Resize({ Set-SetScrollY $script:setY })
+$scroll.Add_Resize({ Set-SetScrollY (Get-SetYNow) })
 # Entrada de la ventana Opciones: fundido y el contenido sube 18 px (220 ms, ease-out cubico).
 # (launcher134) sin fundido ni Opacity: la ventana Emulador se ve entera desde el primer momento
 $script:setFadeT0 = 0
 $setFadeT = New-Object System.Windows.Forms.Timer; $setFadeT.Interval = 15
 $setFadeT.Add_Tick({
 	$t = [math]::Min(1.0, ([Environment]::TickCount - $script:setFadeT0) / 280.0); $e = 1 - [math]::Pow(1 - $t, 3)
-	$fSet.Opacity = [math]::Max(0.01, [math]::Min(1.0, $e)); $script:setSlide = 34.0 * (1 - $e); Set-SetScrollY $script:setY
-	if ($t -ge 1) { $fSet.Opacity = 1; $script:setSlide = 0.0; Set-SetScrollY $script:setY; $setFadeT.Stop() }
+	$fSet.Opacity = [math]::Max(0.01, [math]::Min(1.0, $e)); $script:setSlide = 34.0 * (1 - $e); Set-SetScrollY (Get-SetYNow)
+	if ($t -ge 1) { $fSet.Opacity = 1; $script:setSlide = 0.0; Set-SetScrollY (Get-SetYNow); $setFadeT.Stop() }
 })
 $fSet.Add_VisibleChanged({
 	$setFadeT.Stop(); $script:setSlide = 0.0
@@ -2823,7 +2827,7 @@ function Fit-Sections {
 	if ($padEnd) { $padEnd.Top = $y }
 	if ($script:setAutoH) { $want = [int][math]::Min(($y + $setBar.Height), ($H - 60)); if ($fSet.ClientSize.Height -ne $want) { $fSet.ClientSize = New-Object System.Drawing.Size($fSet.ClientSize.Width, $want) } }  # (launcher132)
 	$scrollC.Invalidate()
-	Set-SetScrollY $script:setY
+	Set-SetScrollY (Get-SetYNow)
 }
 # (launcher134) Disposicion simple de la ventana Emulador: apila filas y apartados sin depender de nada mas. Se usa si
 # Fit-Sections falla o deja la ventana vacia (apartado sin alto, contenido fuera de la vista, etc.).
