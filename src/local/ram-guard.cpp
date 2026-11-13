@@ -1,5 +1,6 @@
 #include "ram-guard.h"
 
+#include "fresh-memory.h"
 #include "guest-lazy-commit.h"
 #include "local-platform.h"
 #include "mem-guard.h"
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -25,6 +27,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// (After windows.h.)
+#include <psapi.h>
 #endif
 
 namespace Libs::LibKernel::Memory {
@@ -243,6 +247,96 @@ uint64_t StoreCommitted() {
 		case StoreCharge::AllCommitted:
 		default: return size;
 	}
+}
+
+// KYTY_RESIDENCY_LOG=0 turns it off (default on): with the 30 s RAM line, where the working set is, from the process's
+// whole working-set list (K32QueryWorkingSet, one walk on the guard's thread, ~10-40 ms for 4M pages): pages of the guest
+// store's emulator-side alias, pages of the other mapped views (the game's own views of the guest store: direct and
+// flexible memory), private pages (the emulator's own allocations and the driver's), images (DLLs); against what of the
+// store is committed and what of it was ever written (fresh-memory granules: CPU, host or write-back writes). Committed
+// but never touched pages of the store are commit charge only: no RAM. A page touched through both the alias and a game
+// view is in the working set twice (one physical page): the alias and view figures can overlap.
+bool ResidencyLogEnabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_RESIDENCY_LOG");
+		return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+	}();
+	return on;
+}
+
+void PrintResidency(uint64_t store_committed) {
+	if (!ResidencyLogEnabled()) return;
+	const auto t0 = std::chrono::steady_clock::now();
+	// (Freed after each line: ~8 bytes a resident page, not kept.)
+	std::vector<ULONG_PTR> buffer(size_t {1} << 16u);
+	HANDLE                 process = GetCurrentProcess();
+	bool ok = false;
+	for (int attempt = 0; attempt < 4; attempt++) {
+		if (K32QueryWorkingSet(process, buffer.data(), static_cast<DWORD>(buffer.size() * sizeof(ULONG_PTR))) != 0) {
+			ok = true;
+			break;
+		}
+		if (GetLastError() != ERROR_BAD_LENGTH) break;
+		const auto needed = static_cast<size_t>(buffer[0]); // NumberOfEntries
+		buffer.resize(std::max(buffer.size() * 2, needed + needed / 8 + 4096 + 1));
+	}
+	if (!ok) {
+		std::printf("RAM residency (30 s): K32QueryWorkingSet failed (0x%08x)\n", static_cast<unsigned>(GetLastError()));
+		std::fflush(stdout);
+		return;
+	}
+	const size_t count = std::min(static_cast<size_t>(buffer[0]), buffer.size() - 1);
+	uint64_t     shared_pages = 0;
+	// (In place: the entries become page addresses, sorted, so the region walk queries each region once.)
+	for (size_t i = 1; i <= count; i++) {
+		if ((buffer[i] & 0x100u) != 0) shared_pages++; // PSAPI_WORKING_SET_BLOCK.Shared (bit 8)
+		buffer[i] &= ~static_cast<ULONG_PTR>(0xfff);
+	}
+	std::sort(buffer.begin() + 1, buffer.begin() + 1 + static_cast<std::ptrdiff_t>(count));
+	const auto     alias      = reinterpret_cast<uint64_t>(g_store_alias.load(std::memory_order_relaxed));
+	const uint64_t store_size = g_store_size.load(std::memory_order_relaxed);
+	constexpr uint64_t Page   = 4096;
+	uint64_t in_alias = 0, in_views = 0, in_private = 0, in_image = 0, in_other = 0;
+	uint64_t region_begin = 0, region_end = 0;
+	DWORD    region_type  = 0;
+	for (size_t i = 1; i <= count; i++) {
+		const auto page = static_cast<uint64_t>(buffer[i]);
+		if (alias != 0 && page >= alias && page - alias < store_size) {
+			in_alias += Page;
+			continue;
+		}
+		if (page < region_begin || page >= region_end) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) != sizeof(info)) {
+				in_other += Page;
+				region_begin = region_end = 0;
+				continue;
+			}
+			region_begin = reinterpret_cast<uint64_t>(info.BaseAddress);
+			region_end   = region_begin + info.RegionSize;
+			region_type  = info.Type;
+		}
+		(region_type == MEM_MAPPED ? in_views : region_type == MEM_PRIVATE ? in_private : region_type == MEM_IMAGE ? in_image : in_other) += Page;
+	}
+	uint64_t written = 0;
+	if (const auto* fresh = FreshMemory::Get(); fresh != nullptr) {
+		const uint64_t words = (fresh->granules + 63) / 64;
+		for (uint64_t w = 0; w < words; w++)
+			for (uint64_t bits = fresh->written[w].load(std::memory_order_relaxed); bits != 0; bits &= bits - 1) written++;
+		written <<= FreshMemory::GranuleBits;
+	}
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	std::printf("RAM residency (30 s, MiB; KYTY_RESIDENCY_LOG=0 off): working set %llu (shared pages %llu) = guest store "
+	            "through the emulator's alias %llu + other mapped views (the game's views of the guest store) %llu + private "
+	            "%llu + images %llu + other %llu; guest store committed %llu, ever written %s%llu, so committed and never "
+	            "written <= %llu (commit charge, no RAM unless read); %.1f ms\n",
+	            static_cast<unsigned long long>(count * Page / MiB), static_cast<unsigned long long>(shared_pages * Page / MiB),
+	            static_cast<unsigned long long>(in_alias / MiB), static_cast<unsigned long long>(in_views / MiB),
+	            static_cast<unsigned long long>(in_private / MiB), static_cast<unsigned long long>(in_image / MiB),
+	            static_cast<unsigned long long>(in_other / MiB), static_cast<unsigned long long>(store_committed / MiB),
+	            FreshMemory::Enabled() ? "" : "(fresh memory off: unknown) ", static_cast<unsigned long long>(written / MiB),
+	            static_cast<unsigned long long>((store_committed > written ? store_committed - written : 0) / MiB), ms);
+	std::fflush(stdout);
 }
 
 struct Sample {
@@ -661,6 +755,7 @@ void Watch() {
 		if (log_period > 0 && now >= next_log) {
 			next_log = now + std::chrono::seconds(log_period);
 			Libs::LibKernel::Memory::ReportGuestAccess(true);
+			PrintResidency(sample.store_committed);
 			std::printf("RAM (%lld s): %s; pressure %s, real available %llu MiB, real commit headroom %llu MiB; pressure "
 			            "passes %llu (%llu MB), pipelines released %llu, images collected %llu (%llu MiB)\n",
 			            static_cast<long long>(log_period), Figures(sample).c_str(), LevelName(level),
