@@ -4,8 +4,9 @@
 // protection change, nothing written to guest memory.
 //
 // The GPU thread copies the registered images' and buffers' guest ranges at the next flip after a request
-// (GpuResourceManager::AdvanceFrame: the texture cache's lock held for the copy of its images; the buffer cache is the
-// GPU thread's); the measurement's own thread (ram-guard.cpp, low priority) then queries the working set
+// (GpuResourceManager::ServiceGpuResidency, at CPU flips and end-of-pipe flips alike - Demon's Souls makes only the
+// latter, which is why it was never measured before: the texture cache's lock held for the copy of its images; the
+// buffer cache is the GPU thread's); the measurement's own thread (ram-guard.cpp, low priority) then queries the working set
 // (K32QueryWorkingSetEx) at one page in each 64 KiB of every range, through both views of the page: the game's (the
 // guest address) and the emulator's (the backing store's alias, through which the emulator reads uploads and writes
 // GPU results back). See ram-guard.cpp's PrintGpuResidency for the line.
@@ -78,20 +79,25 @@ inline uint64_t Take(std::vector<Range>* out) {
 	return exchange.request;
 }
 
-// The GPU thread: the ranges copied for request `request` (dropped, never waited for, when the mutex is held: that pass
-// then goes unmeasured).
-inline void Deliver(uint64_t request, std::vector<Range>&& ranges, uint64_t images, uint64_t buffers, double copy_ms) {
+// The GPU thread: the ranges copied for request `request`. False (nothing taken: `ranges` left as they were, delivered
+// at a later flip) when the mutex is held - never waited for. True: `ranges` holds the measurement's previous vector
+// (freed by the caller, outside the lock).
+[[nodiscard]] inline bool Deliver(uint64_t request, std::vector<Range>&& ranges, uint64_t images, uint64_t buffers,
+                                  double copy_ms) {
 	auto& exchange = Get();
 	{
 		std::unique_lock<std::mutex> lock(exchange.mutex, std::try_to_lock);
-		if (!lock.owns_lock()) return;
-		exchange.ranges.swap(ranges); // (the previous contents freed by the caller, outside the lock)
-		exchange.answer  = request;
-		exchange.images  = images;
-		exchange.buffers = buffers;
-		exchange.copy_ms = copy_ms;
+		if (!lock.owns_lock()) return false;
+		if (exchange.request == request) { // (a pass already given up on - a later one open - is dropped)
+			exchange.ranges.swap(ranges);
+			exchange.answer  = request;
+			exchange.images  = images;
+			exchange.buffers = buffers;
+			exchange.copy_ms = copy_ms;
+		}
 	}
 	exchange.delivered.notify_all();
+	return true;
 }
 
 // The measurement's thread, once (ram-guard.cpp; nothing off Windows or with KYTY_GPU_RESIDENCY=0).

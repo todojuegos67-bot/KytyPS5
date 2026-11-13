@@ -15,6 +15,15 @@ void SetThreadName(const char* name);
 
 // The OS id of the calling thread (Linux: gettid, Windows: GetCurrentThreadId).
 uint32_t ThreadId();
+uint32_t ProcessId();
+// The black box's block shared with its watchdog process (blackbox.h Shared; Windows: the named mapping
+// Local\KytyBlackbox-<pid>, zeroed, never unmapped; elsewhere this process's memory only); nullptr when none.
+void* CreateBlackboxShared(size_t size);
+// The watchdog (Windows: this exe again, "--kyty-watchdog <pid>", no console, normal priority); false when not started.
+bool StartBlackboxWatchdog();
+// The watchdog process's whole main when the command line asks for it (argv[1] == "--kyty-watchdog"): its exit code,
+// before anything of the emulator is started; -1 otherwise (the caller goes on).
+int WatchdogMain(int argc, char* argv[]);
 
 // Pins the calling thread to a comma-separated CPU list ("1,2,3"); an empty or invalid
 // list leaves the affinity alone.

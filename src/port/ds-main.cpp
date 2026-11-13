@@ -1036,6 +1036,9 @@ void RequestRestart(bool to_launcher) {
 } // namespace Port
 
 int main(int argc, char* argv[]) {
+	// The black box's watchdog process (--kyty-watchdog <pid>, started by the game: local/blackbox-run.h): only that,
+	// before anything else here (no log, no mutex, no crash handlers, no emulator), then out.
+	if (const int watchdog = LocalPlatform::WatchdogMain(argc, argv); watchdog >= 0) return watchdog;
 	// (10-27) The update's helper mode (run elevated when the folder cannot be written): only that, then out.
 	if (const int helper = Port::Update::HelperMain(0, nullptr); helper >= 0) return helper;
 	g_exe               = ExePath();

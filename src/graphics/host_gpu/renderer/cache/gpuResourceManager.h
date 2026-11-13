@@ -85,6 +85,7 @@ public:
 
 private:
 	void                      RunCollectors();
+	void                      ServiceGpuResidency(); // (KYTY_GPU_RESIDENCY: a flip's answer to the measurement)
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
 	// One window of the fault's mapped range: [window_begin, window_begin + window_size) within it.
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_begin, uint64_t window_size);

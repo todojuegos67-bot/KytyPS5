@@ -17,6 +17,18 @@
 // as module+offset; host code as dll+offset), which takes the runtime linker's lock and the loader's (written after,
 // so a lock held by a stuck thread costs only the symbols). At most MaxStalls a session, one per stop.
 //
+// Each second the line is written twice: first a heartbeat (seq, time, flips, presents, the render thread's phase; it
+// ends in HB-ONLY), before any call that could block (GetThreadTimes, the scene tags, K32GetProcessMemoryInfo - which
+// takes the working set's lock -, GlobalMemoryStatusEx), then the full line over it. A newest line still HB-ONLY: that
+// second stopped between the two.
+//
+// The external watchdog (KYTY_BLACKBOX_WATCHDOG=0: none): this exe again as a small process of its own
+// (LocalPlatform::WatchdogMain, --kyty-watchdog <pid>; nothing of the emulator runs in it), reading the block the game
+// shares with it (blackbox.h Shared: the heartbeat, the 1 Hz thread's stage, flips, presents, the render thread's
+// phase) and writing logs/watchdog-<stamp>.txt a line a second, through to the disk. The game's heartbeat stopped >= 5 s
+// while the watchdog's lines go on: "GAME HUNG, PC alive", and once a small minidump (threads, stacks, memory map; no
+// memory contents) in logs/hang-<stamp>.dmp. Both files stopping at the same second: the whole PC (or its disk) froze.
+//
 // It reads only atomics and process / system counters: no guest memory is allocated or freed, nothing touches Vulkan,
 // nothing the game or the renderer does changes.
 
@@ -35,6 +47,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -44,7 +57,7 @@
 namespace Blackbox {
 
 constexpr uint64_t Slot        = 512;
-constexpr uint64_t HeaderSlots = 4;
+constexpr uint64_t HeaderSlots = 5;
 constexpr uint64_t RingSlots   = 600; // 10 minutes
 constexpr uint64_t RingBase    = HeaderSlots * Slot;
 constexpr uint64_t StallBase   = RingBase + RingSlots * Slot;
@@ -64,6 +77,7 @@ struct Box {
 	char                  reason[256] {};
 	char                  line[Slot] {};
 	uint64_t              stall_end = StallBase; // (the dump thread's)
+	Shared*               shared    = nullptr;   // (the watchdog's block: blackbox.h Shared; nullptr without one)
 };
 inline Box g_box;
 
@@ -113,6 +127,41 @@ inline double Gib(uint64_t bytes) {
 
 inline int64_t AgeMs(int64_t now, int64_t since) {
 	return since != 0 && now > since ? (now - since) / 1'000'000 : 0;
+}
+
+// The 1 Hz thread's stage, in the shared block (nothing without one): the watchdog's lines say where it stopped.
+inline void SetStage(Stage stage) {
+	if (Shared* shared = g_box.shared; shared != nullptr) {
+		shared->stage_ns.store(NowNs(), std::memory_order_relaxed);
+		shared->stage.store(stage, std::memory_order_release);
+	}
+}
+
+// A ring slot and the end marker after it: one write when they are next to each other (all but the ring's last slot).
+// No FlushFileBuffers here: the handle writes through already (the data is on the disk when the write returns; the
+// file's size and extents were flushed by Open), and a flush a second would empty a SATA drive's command queue (FLUSH
+// CACHE is not queued) under the game's streaming reads.
+inline void WriteRingLine(uint64_t sequence, const char* line) {
+	static constexpr const char* EndMarker = "#------ (the ring's end: the line above is the newest, older ones follow)";
+	const uint64_t               at        = sequence % RingSlots;
+	char                         slots[Slot * 2];
+	FillSlot(slots, line);
+	FillSlot(slots + Slot, EndMarker);
+	if (at + 1 < RingSlots) {
+		(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase + at * Slot, slots, sizeof(slots));
+	} else {
+		(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase + at * Slot, slots, Slot);
+		(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase, slots + Slot, Slot);
+	}
+}
+
+// A thread's phase for the line: " <label>=<phase>:<age>ms" (in it) or " <label>=after-<phase>:<age>ms" (left it).
+inline void AppendPhase(char* line, size_t size, size_t& used, const char* label, const ThreadPhase& phase, int64_t now) {
+	const uint32_t code  = phase.code.load(std::memory_order_relaxed);
+	const int64_t  since = phase.since.load(std::memory_order_relaxed);
+	if (code == PhaseNone) return;
+	Append(line, size, used, " %s=%s%s:%lldms", label, (code & PhaseAfter) != 0 ? "after-" : "", PhaseName(code),
+	       static_cast<long long>(AgeMs(now, since)));
 }
 
 // The STALL record's text past the record area's end is dropped.
@@ -286,10 +335,49 @@ inline bool Open(const std::string& path) {
 	WriteSlot(Slot * 3, "fields: PAUSED MINIMIZED QUITTING | priv=process commit ws=working set commit=system commit/limit avail=free RAM "
 	                    "| max1s=longest frame of the second | slow=last frames >= 20 ms@age | STALL=flips or presents "
 	                    "stopped > 3 s (a record below)");
+	WriteSlot(Slot * 4, "fields: ph/pph=the render / presenting thread's last phase (submit fence pso read fault protect present; "
+	                    "after-X: left it, nothing since):for | rd .../@-ms=the last read began | flt/prot=guest faults / protection "
+	                    "changes in progress/total(/for) | a newest line ending HB-ONLY: the heartbeat, the second stopped "
+	                    "before its full line (a memory query or the disk: watchdog-*.txt names the stage)");
 	(void)LocalPlatform::FlushWrittenFile(g_box.file);
 	std::printf("[blackbox] %s (a line a second, written through to the disk; KYTY_BLACKBOX=0: off)\n", path.c_str());
 	std::fflush(stdout);
 	return true;
+}
+
+// The external watchdog (KYTY_BLACKBOX_WATCHDOG=0: none): this exe again, as its own small process
+// (LocalPlatform::WatchdogMain, --kyty-watchdog <pid>), which reads the shared block every second and writes
+// logs/watchdog-<stamp>.txt: the game's heartbeat stopping while its own lines go on is a hung game (then, once, a small
+// minidump, logs/hang-<stamp>.dmp); its lines stopping at the same moment is the whole PC.
+inline void StartWatchdog(const std::string& path) {
+	if (const char* value = std::getenv("KYTY_BLACKBOX_WATCHDOG"); value != nullptr && std::strcmp(value, "0") == 0) return;
+	const auto        slash = path.find_last_of("/\\");
+	const std::string dir   = slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
+	std::string       stamp = slash == std::string::npos ? path : path.substr(slash + 1);
+	if (stamp.rfind("blackbox-", 0) == 0) stamp.erase(0, 9);
+	if (const auto dot = stamp.rfind(".txt"); dot != std::string::npos) stamp.resize(dot);
+	const std::string watchdog = dir + "watchdog-" + stamp + ".txt";
+	const std::string dump     = dir + "hang-" + stamp + ".dmp";
+	if (watchdog.size() >= SharedPath || dump.size() >= SharedPath) return;
+	void* memory = LocalPlatform::CreateBlackboxShared(sizeof(Shared));
+	if (memory == nullptr) {
+		std::printf("[blackbox] no watchdog: its shared block could not be made\n");
+		std::fflush(stdout);
+		return;
+	}
+	auto* shared = new (memory) Shared;
+	shared->pid  = LocalPlatform::ProcessId();
+	shared->size = sizeof(Shared);
+	std::memcpy(shared->watchdog_path, watchdog.c_str(), watchdog.size() + 1);
+	std::memcpy(shared->dump_path, dump.c_str(), dump.size() + 1);
+	std::atomic_thread_fence(std::memory_order_release);
+	shared->magic = SharedMagic;
+	g_box.shared  = shared;
+	const bool started = LocalPlatform::StartBlackboxWatchdog();
+	std::printf("[blackbox] watchdog %s: %s (a line a second; the game hung: its heartbeat stops there, the PC froze: "
+	            "those lines stop too; KYTY_BLACKBOX_WATCHDOG=0: none)\n",
+	            started ? "started" : "could not be started", watchdog.c_str());
+	std::fflush(stdout);
 }
 
 inline void WatchLoop(std::string path) {
@@ -298,6 +386,7 @@ inline void WatchLoop(std::string path) {
 	g_box.watch_tid = LocalPlatform::ThreadId();
 	if (!Open(path)) return;
 	std::thread(DumpLoop).detach();
+	StartWatchdog(path);
 	static constexpr const char* WaitNames[] = {"gpu", "readback", "download", "compile", "record"};
 	static_assert(std::size(WaitNames) == LiveCensus::Waits);
 	struct Slow {
@@ -322,11 +411,49 @@ inline void WatchLoop(std::string path) {
 		Append(line, sizeof(line), used, "#%06llu %s up=%llds", static_cast<unsigned long long>(sequence), wall,
 		       static_cast<long long>((now - start) / 1'000'000'000));
 
+		const uint64_t flips        = LiveControl::g_flips.load(std::memory_order_acquire);
+		const int64_t  last_flip    = flips != 0 ? LiveControl::g_flip_times[(flips - 1) % LiveControl::FlipTimes].load(std::memory_order_relaxed) : 0;
+		const int64_t  last_present = g_last_present_ns.load(std::memory_order_relaxed);
+		const bool     paused       = g_paused.load(std::memory_order_relaxed);
+		const bool     minimized    = g_minimized.load(std::memory_order_relaxed);
+		const bool     quitting     = g_quitting.load(std::memory_order_relaxed);
+
+		// The heartbeat, before anything that could block (a memory query under the working set's lock, a write to a
+		// disk the page file keeps busy): the shared block first (memory only), then a short line in this second's slot,
+		// which the full line replaces at the end. A ring whose newest line ends in HB-ONLY: that second stopped between.
+		if (Shared* shared = g_box.shared; shared != nullptr) {
+			shared->flips.store(flips, std::memory_order_relaxed);
+			shared->flip_ns.store(last_flip, std::memory_order_relaxed);
+			shared->presents.store(g_presents.total.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			shared->present_ns.store(last_present, std::memory_order_relaxed);
+			shared->render_phase.store(g_phases[RoleRender].code.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			shared->render_phase_ns.store(g_phases[RoleRender].since.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			shared->flags.store((paused ? SharedPaused : 0u) | (minimized ? SharedMinimized : 0u) | (quitting ? SharedQuitting : 0u),
+			                    std::memory_order_relaxed);
+			shared->reads.store(g_reads.now.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			shared->faults.store(g_faults.now.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			shared->pipelines.store(g_pipelines.now.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			shared->submits.store(g_submits.now.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			shared->beat_ns.store(now, std::memory_order_relaxed);
+			shared->beat.store(sequence + 1, std::memory_order_release);
+		}
+		{
+			char   beat[Slot] {};
+			size_t beat_used = used;
+			std::memcpy(beat, line, used);
+			Append(beat, sizeof(beat), beat_used, " flip=%llu/%lldms pres=%llu/%lldms", static_cast<unsigned long long>(flips),
+			       static_cast<long long>(AgeMs(now, last_flip)),
+			       static_cast<unsigned long long>(g_presents.total.load(std::memory_order_relaxed)),
+			       static_cast<long long>(AgeMs(now, last_present)));
+			AppendPhase(beat, sizeof(beat), beat_used, "ph", g_phases[RoleRender], now);
+			Append(beat, sizeof(beat), beat_used, " HB-ONLY");
+			SetStage(StageBeatWrite);
+			WriteRingLine(sequence, beat);
+		}
+
 		// The guest's flips: how many, the age of the last; the slow ones among the new (>= 20 ms, as SLOW Frame), the
 		// longest of this second.
-		const uint64_t flips    = LiveControl::g_flips.load(std::memory_order_acquire);
-		const int64_t  last_flip = flips != 0 ? LiveControl::g_flip_times[(flips - 1) % LiveControl::FlipTimes].load(std::memory_order_relaxed) : 0;
-		double         longest  = 0;
+		double longest = 0;
 		for (uint64_t i = std::max(scanned, flips > 4096 ? flips - 4096 : uint64_t {0}); i < flips; ++i) {
 			if (i == 0) continue;
 			const int64_t at     = LiveControl::g_flip_times[i % LiveControl::FlipTimes].load(std::memory_order_relaxed);
@@ -344,7 +471,6 @@ inline void WatchLoop(std::string path) {
 		       static_cast<long long>(AgeMs(now, last_flip)));
 
 		// The host's presents: how many, the age of the last; one in progress, and for how long.
-		const int64_t last_present = g_last_present_ns.load(std::memory_order_relaxed);
 		Append(line, sizeof(line), used, " pres=%llu/%lldms", static_cast<unsigned long long>(g_presents.total.load(std::memory_order_relaxed)),
 		       static_cast<long long>(AgeMs(now, last_present)));
 		if (g_presents.now.load(std::memory_order_relaxed) > 0)
@@ -359,7 +485,10 @@ inline void WatchLoop(std::string path) {
 			Append(line, sizeof(line), used, " rt=idle:%lldms", static_cast<long long>(AgeMs(now, idle)));
 		else
 			Append(line, sizeof(line), used, " rt=busy");
+		AppendPhase(line, sizeof(line), used, "ph", g_phases[RoleRender], now);
+		AppendPhase(line, sizeof(line), used, "pph", g_phases[RolePresent], now);
 		if (LiveControl::g_render_known.load(std::memory_order_acquire)) {
+			SetStage(StageCpu);
 			const double cpu = LocalPlatform::ThreadCpuSeconds(LiveControl::g_render_thread);
 			if (last_cpu_at != 0 && now > last_cpu_at)
 				Append(line, sizeof(line), used, " rtcpu=%.0f%%", (cpu - last_cpu) * 1e11 / static_cast<double>(now - last_cpu_at));
@@ -383,8 +512,19 @@ inline void WatchLoop(std::string path) {
 		       static_cast<unsigned long long>(g_read_bytes.load(std::memory_order_relaxed) >> 20u));
 		if (g_reads.now.load(std::memory_order_relaxed) > 0)
 			Append(line, sizeof(line), used, "/%lldms", static_cast<long long>(AgeMs(now, g_reads.since.load(std::memory_order_relaxed))));
+		if (const int64_t began = g_reads.last.load(std::memory_order_relaxed); began != 0)
+			Append(line, sizeof(line), used, "@-%lldms", static_cast<long long>(AgeMs(now, began)));
+		Append(line, sizeof(line), used, " flt=%d/%llu", g_faults.now.load(std::memory_order_relaxed),
+		       static_cast<unsigned long long>(g_faults.total.load(std::memory_order_relaxed)));
+		if (g_faults.now.load(std::memory_order_relaxed) > 0)
+			Append(line, sizeof(line), used, "/%lldms", static_cast<long long>(AgeMs(now, g_faults.since.load(std::memory_order_relaxed))));
+		Append(line, sizeof(line), used, " prot=%d/%llu", g_protects.now.load(std::memory_order_relaxed),
+		       static_cast<unsigned long long>(g_protects.total.load(std::memory_order_relaxed)));
+		if (g_protects.now.load(std::memory_order_relaxed) > 0)
+			Append(line, sizeof(line), used, "/%lldms", static_cast<long long>(AgeMs(now, g_protects.since.load(std::memory_order_relaxed))));
 
 		// The scene (the map the game loaded last), the frames' kind and since when, the last file read.
+		SetStage(StageScene);
 		const uint32_t scene = SceneTags::Current();
 		if (scene != SceneTags::None)
 			Append(line, sizeof(line), used, " scene=m%02x_%02x_%02x_%02x", scene >> 24u, (scene >> 16u) & 0xffu,
@@ -404,9 +544,6 @@ inline void WatchLoop(std::string path) {
 			if (c != '\0' && (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) >= 0x7f || c == ' ')) c = '_';
 		Append(line, sizeof(line), used, " file=%s", file[0] != '\0' ? file : "-");
 
-		const bool paused    = g_paused.load(std::memory_order_relaxed);
-		const bool minimized = g_minimized.load(std::memory_order_relaxed);
-		const bool quitting  = g_quitting.load(std::memory_order_relaxed);
 		if (paused) Append(line, sizeof(line), used, " PAUSED");
 		if (minimized) Append(line, sizeof(line), used, " MINIMIZED");
 		if (quitting) Append(line, sizeof(line), used, " QUITTING");
@@ -420,8 +557,14 @@ inline void WatchLoop(std::string path) {
 		if (stalled) Append(line, sizeof(line), used, " STALL");
 
 		// Memory: the process's commit and working set, the system's commit and available RAM.
+		SetStage(StageProcMem);
 		const auto process = LocalPlatform::ProcessMemory();
+		SetStage(StageSysMem);
 		const auto machine = LocalPlatform::SystemMemoryStatus();
+		if (Shared* shared = g_box.shared; shared != nullptr) {
+			shared->private_bytes.store(process.private_bytes, std::memory_order_relaxed);
+			shared->working_set.store(process.working_set, std::memory_order_relaxed);
+		}
 		Append(line, sizeof(line), used, " priv=%.1fG ws=%.1fG commit=%.1f/%.1fG avail=%.1fG", Gib(process.private_bytes),
 		       Gib(process.working_set), Gib(machine.commit), Gib(machine.commit_limit), Gib(machine.available));
 
@@ -430,23 +573,9 @@ inline void WatchLoop(std::string path) {
 			if (frame.at != 0)
 				Append(line, sizeof(line), used, " slow=%.0fms@-%llds", frame.ms, static_cast<long long>(AgeMs(now, frame.at) / 1000));
 
-		// The line and the end marker after it: one write when they are next to each other (all but the ring's last
-		// slot). No FlushFileBuffers here: the handle writes through already (the data is on the disk when the write
-		// returns; the file's size and extents were flushed by Open), and a flush a second would empty a SATA drive's
-		// command queue (FLUSH CACHE is not queued) under the game's streaming reads.
-		{
-			static constexpr const char* EndMarker = "#------ (the ring's end: the line above is the newest, older ones follow)";
-			const uint64_t               at        = sequence % RingSlots;
-			char                         slots[Slot * 2];
-			FillSlot(slots, line);
-			FillSlot(slots + Slot, EndMarker);
-			if (at + 1 < RingSlots) {
-				(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase + at * Slot, slots, sizeof(slots));
-			} else {
-				(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase + at * Slot, slots, Slot);
-				(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase, slots + Slot, Slot);
-			}
-		}
+		// The full line, over this second's heartbeat line.
+		SetStage(StageLineWrite);
+		WriteRingLine(sequence, line);
 
 		if (stalled && !in_stall && stalls < MaxStalls && !g_box.busy.exchange(true, std::memory_order_acq_rel)) {
 			++stalls;
@@ -467,6 +596,7 @@ inline void WatchLoop(std::string path) {
 		// Once a second, on time (a late wake-up - the PC stalled - does not make up the seconds missed).
 		next += std::chrono::seconds(1);
 		if (const auto wake = std::chrono::steady_clock::now(); next <= wake) next = wake + std::chrono::seconds(1);
+		SetStage(StageSleep);
 		std::this_thread::sleep_until(next);
 	}
 }

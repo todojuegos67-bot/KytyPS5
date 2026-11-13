@@ -525,24 +525,48 @@ void GpuResourceManager::EndSubmission() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	if (std::exchange(m_gpu_flip_pending, false)) RunCollectors();
+	if (std::exchange(m_gpu_flip_pending, false)) {
+		ServiceGpuResidency();
+		RunCollectors();
+	}
+}
+
+// KYTY_GPU_RESIDENCY (gpu-residency.h): at every flip, CPU (AdvanceFrame) or end-of-pipe (EndSubmission after
+// NoteGpuFlip: all of Demon's Souls' flips, which never reach AdvanceFrame - why every pass of 01.005.000 said "no
+// answer from the GPU thread in 10 s"), the registered ranges copied for the measurement's thread once every 30 s
+// (otherwise an atomic load). No cache lock is held here, and the buffer cache is this thread's. Never waits on the
+// exchange's mutex: an answer the mutex refused is kept and delivered at a later flip.
+namespace {
+struct ResidencyAnswer { // (the GPU thread's)
+	std::vector<GpuResidency::Range> ranges;
+	uint64_t                         request = 0, images = 0, buffers = 0;
+	double                           ms      = 0.0;
+};
+ResidencyAnswer g_residency_answer;
+} // namespace
+
+void GpuResourceManager::ServiceGpuResidency() {
+	auto& pending = g_residency_answer;
+	if (pending.request == 0 && GpuResidency::Requested()) {
+		const auto start = std::chrono::steady_clock::now();
+		// (0: the measurement's thread holds the exchange's mutex; never waited for, tried again at the next flip.)
+		if (const uint64_t request = GpuResidency::Take(&pending.ranges); request != 0) {
+			pending.images = pending.buffers = 0;
+			m_texture_cache.CollectResidencyRanges(pending.ranges, pending.images);
+			m_buffer_cache.CollectResidencyRanges(pending.ranges, pending.buffers);
+			pending.ms      = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+			pending.request = request;
+		}
+	}
+	if (pending.request != 0 &&
+	    GpuResidency::Deliver(pending.request, std::move(pending.ranges), pending.images, pending.buffers, pending.ms)) {
+		pending.request = 0;
+		std::vector<GpuResidency::Range>().swap(pending.ranges); // (the previous pass's vector, freed here)
+	}
 }
 
 void GpuResourceManager::AdvanceFrame() {
-	// KYTY_GPU_RESIDENCY (gpu-residency.h): the registered ranges copied for the measurement's thread, once every 30 s
-	// (otherwise an atomic load). Here no cache lock is held, and the buffer cache is this thread's.
-	if (GpuResidency::Requested()) {
-		const auto                       start = std::chrono::steady_clock::now();
-		std::vector<GpuResidency::Range> ranges;
-		// (0: the measurement's thread holds the exchange's mutex; never waited for, tried again at the next flip.)
-		if (const uint64_t request = GpuResidency::Take(&ranges); request != 0) {
-			uint64_t images = 0, buffers = 0;
-			m_texture_cache.CollectResidencyRanges(ranges, images);
-			m_buffer_cache.CollectResidencyRanges(ranges, buffers);
-			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-			GpuResidency::Deliver(request, std::move(ranges), images, buffers, ms);
-		}
-	}
+	ServiceGpuResidency();
 	m_texture_cache.AdvanceFrame();
 	RunCollectors();
 	if (auto* fresh = FreshMemory::Get(); fresh != nullptr && ++m_fresh_report_flip % 3600 == 0) {

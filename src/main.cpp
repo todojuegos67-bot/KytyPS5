@@ -349,6 +349,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 int main(int argc, char* argv[]) {
+	// The black box's watchdog process (--kyty-watchdog <pid>: local/blackbox-run.h): only that, before any emulator init.
+	if (const int watchdog = LocalPlatform::WatchdogMain(argc, argv); watchdog >= 0) return watchdog;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	LocalPlatform::ReleaseRedirectedConsole();
 	LocalPlatform::AsyncStdout();

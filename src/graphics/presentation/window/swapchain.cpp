@@ -1624,6 +1624,7 @@ Swapchain::Status Swapchain::Present() {
 	vk::Result result;
 	{
 		// (The black box: the presents made, and one that does not return - its lock's wait included.)
+		Blackbox::ClaimThreadRole(Blackbox::RolePresent); // (its phase in the black box's line; a TLS check after the first)
 		Blackbox::InFlightScope presenting(Blackbox::g_presents);
 		if (m_fsr3) {
 			// The frame generation swapchain queues it (its threads pace and present; its submissions take the
