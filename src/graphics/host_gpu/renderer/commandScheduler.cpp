@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "async-upload.h"
+#include "blackbox.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #include "device-fault.h"
@@ -669,7 +670,8 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	}
 	VkResult result;
 	{
-		Common::LockGuard lock(*submit.queue_mutex);
+		Common::LockGuard       lock(*submit.queue_mutex);
+		Blackbox::InFlightScope in_submit(Blackbox::g_submits); // (the black box: a submit that does not return)
 		result = dispatch.vkQueueSubmit(submit.queue, 1, &info, VK_NULL_HANDLE);
 	}
 	if (result != VK_SUCCESS) {
@@ -861,7 +863,10 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		                        submit.num_wait_semaphores);
 #endif
 
-		result = (m_lane == 1 ? graphics.compute_queue : graphics.queue).submit(1, &submit_info, nullptr);
+		{
+			Blackbox::InFlightScope in_submit(Blackbox::g_submits); // (the black box: a submit that does not return)
+			result = (m_lane == 1 ? graphics.compute_queue : graphics.queue).submit(1, &submit_info, nullptr);
+		}
 		m_driver_tick.store(tick, std::memory_order_release);
 	}
 

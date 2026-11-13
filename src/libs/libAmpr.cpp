@@ -12,6 +12,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
+#include "blackbox.h"
 #include "local-platform.h"
 #include "scene-tags.h"
 #include "shader-gate.h"
@@ -1542,6 +1543,9 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	if (!AprShared::IsValidGuestRange(destination, size, true)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
+	// (The black box: the reads in flight, the bytes read and the last file.)
+	Blackbox::InFlightScope in_flight(Blackbox::g_reads);
+	Blackbox::NoteRead(host_path.data(), host_path.size(), size);
 
 	// A slow read's phases (a 16 KiB read took 221 ms in play): opening the file, reading it, copying into guest memory
 	// (whose pages may be write-protected: faults).

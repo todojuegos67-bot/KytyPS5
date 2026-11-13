@@ -20,6 +20,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "blackbox.h"
 #include "device-fault.h"
 #include "local-platform.h"
 
@@ -1475,11 +1476,14 @@ void CreatePipelineInternal(
 	                                   static_params, vs_input_info, ps_input_info, native_bindings)
 	        : 0;
 	const auto handle_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build, identity,
-	                              [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
-		                              return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr,
-		                                                                            &pipeline.pipeline);
-	                              });
+	{
+		Blackbox::InFlightScope creating(Blackbox::g_pipelines); // (the black box: pipelines being made)
+		result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build, identity,
+		                              [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
+			                              return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr,
+			                                                                            &pipeline.pipeline);
+		                              });
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -1582,12 +1586,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	        ? ComputePipelineIdentity(ModuleSpirvHash(compute_module), input_info, native_bindings)
 	        : 0;
 	const auto handle_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-	const auto result =
-	    CreatePipelineHandle(graphics, pipeline, info, driver_cache, build, identity,
-	                         [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
-		                         return graphics.device.createComputePipelines(cache, 1, &create, nullptr,
-		                                                                      &pipeline.pipeline);
-	                         });
+	const auto result = [&] {
+		Blackbox::InFlightScope creating(Blackbox::g_pipelines); // (the black box: pipelines being made)
+		return CreatePipelineHandle(graphics, pipeline, info, driver_cache, build, identity,
+		                            [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
+			                            return graphics.device.createComputePipelines(cache, 1, &create, nullptr,
+			                                                                         &pipeline.pipeline);
+		                            });
+	}();
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&

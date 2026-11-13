@@ -124,6 +124,20 @@ bool     ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size
 void     CloseScratchFile(uint64_t file);
 // An existing file (a UTF-8 path) for ReadScratchFile and CloseScratchFile; 0 when it cannot be opened.
 uint64_t OpenFileForReading(const char* path);
+// A file (a UTF-8 path) made empty, whose writes reach the disk before they return (Windows: FILE_FLAG_WRITE_THROUGH;
+// elsewhere O_DSYNC) and which others may read meanwhile (the black box: local/blackbox-run.h); 0 when it cannot be
+// made. Written with WriteScratchFile, its buffers flushed with FlushWrittenFile, closed with CloseScratchFile.
+uint64_t OpenWriteThroughFile(const char* path);
+bool     FlushWrittenFile(uint64_t file);
+
+// The system's commit charge and limit and the physical memory available, from one cheap call (Windows:
+// GlobalMemoryStatusEx; Linux: MemAvailable only). Zeros where unknown.
+struct SystemMemory {
+	uint64_t commit       = 0;
+	uint64_t commit_limit = 0;
+	uint64_t available    = 0;
+};
+SystemMemory SystemMemoryStatus();
 
 // The process's committed private memory and resident working set, and the machine's physical memory, in
 // bytes (0 where the host cannot tell; KYTY_SIMULATE_RAM_MB=<n> reports n MiB of physical memory, for tests).

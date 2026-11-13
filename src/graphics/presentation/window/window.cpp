@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
+#include "blackbox.h"
 #include "debug-snapshot.h"
 #include "perf-overlay.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -292,17 +293,20 @@ static void SetPause(WindowLoopState& game, bool flag) {
 	LOGF("Pause: %s\n", flag ? "true" : "false");
 
 	game.paused.store(flag, std::memory_order_release);
+	Blackbox::g_paused.store(flag, std::memory_order_relaxed);
 }
 
 static void GameEventQuit(WindowLoopState& game) {
 	LOGF("Event: quit\n");
 
+	Blackbox::g_quitting.store(true, std::memory_order_relaxed);
 	game.need_exit = true;
 }
 
 static void GameEventTerminate(WindowLoopState& game) {
 	LOGF("Event: terminate\n");
 
+	Blackbox::g_quitting.store(true, std::memory_order_relaxed);
 	game.need_exit = true;
 }
 
@@ -585,13 +589,16 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 
 		case SDL_WINDOWEVENT_MINIMIZED:
 			ExclusiveFullscreen::g_wanted.store(false);
+			Blackbox::g_minimized.store(true, std::memory_order_relaxed);
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_MAXIMIZED:
+			Blackbox::g_minimized.store(false, std::memory_order_relaxed);
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_RESTORED:
 			if ((SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0) ExclusiveFullscreen::g_wanted.store(true);
+			Blackbox::g_minimized.store(false, std::memory_order_relaxed);
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_ENTER:

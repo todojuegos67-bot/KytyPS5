@@ -25,6 +25,7 @@
 #include "local/kbm-warp.h"
 #include "local/anti-lag.h"
 #include "local/rt-local-lights.h"
+#include "blackbox.h"
 #include "local-platform.h"
 #include "shader-gate.h"
 #include "perf-overlay.h"
@@ -1621,18 +1622,23 @@ Swapchain::Status Swapchain::Present() {
 		next = std::max(next + step, now);
 	}
 	vk::Result result;
-	if (m_fsr3) {
-		// The frame generation swapchain queues it (its threads pace and present; its submissions take the
-		// graphics queue's lock themselves).
-		result = Fsr3::QueuePresent(m_window.graphic_ctx, present);
-	} else if (auto& graphics = m_window.graphic_ctx; graphics.present_queue != nullptr) {
-		// Its own queue: a present blocked in the kernel does not hold up other submissions.
-		Common::LockGuard lock(graphics.present_queue_mutex);
-		result = graphics.present_queue.presentKHR(&present);
-	} else {
-		Common::LockGuard lock(graphics.queue_mutex);
-		result = graphics.queue.presentKHR(&present);
+	{
+		// (The black box: the presents made, and one that does not return - its lock's wait included.)
+		Blackbox::InFlightScope presenting(Blackbox::g_presents);
+		if (m_fsr3) {
+			// The frame generation swapchain queues it (its threads pace and present; its submissions take the
+			// graphics queue's lock themselves).
+			result = Fsr3::QueuePresent(m_window.graphic_ctx, present);
+		} else if (auto& graphics = m_window.graphic_ctx; graphics.present_queue != nullptr) {
+			// Its own queue: a present blocked in the kernel does not hold up other submissions.
+			Common::LockGuard lock(graphics.present_queue_mutex);
+			result = graphics.present_queue.presentKHR(&present);
+		} else {
+			Common::LockGuard lock(graphics.queue_mutex);
+			result = graphics.queue.presentKHR(&present);
+		}
 	}
+	Blackbox::g_last_present_ns.store(Blackbox::NowNs(), std::memory_order_relaxed);
 	VideoOut::NotePace(1);
 	VideoOut::NotePresentDone();
 	switch (result) {

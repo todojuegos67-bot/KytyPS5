@@ -34,6 +34,7 @@
 #include "frame-capture.h"
 #include "hud-anchor.h"
 #include "live-control.h"
+#include "blackbox-run.h"
 #include "performance-switches.h"
 #include "speculation-state.h"
 #include "xpr-capture.h"
@@ -874,6 +875,7 @@ void GuestGpu::ThreadRun(void* data) {
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 	}
 	LiveControl::Start();
+	Blackbox::Start(); // (the crash / freeze black box: logs/blackbox-<stamp>.txt, local/blackbox-run.h)
 	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::ProducerScope recording;
