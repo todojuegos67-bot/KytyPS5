@@ -1026,6 +1026,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Default("KYTY_NATIVE_XPR_KEEP_FRAMES", "600");
 	env.Default("KYTY_NATIVE_XPR_INSTANCES", "1");
 	if (demons) env.Default("KYTY_GAME_CONVARS", "doIndexBufferCulling=false");
+	// (11-13) Native-PC memory budget, set in the game's own engine at boot (no memory moved while playing): the
+	// texture streaming pool (texturePoolSizeMiBs, "Streaming Pool Total Size MiBs") defaults to 8192 MiB of the
+	// PS5's unified memory; on PC the textures live in video memory, so 4096 MiB of guest RAM is the budget.
+	if (demons) env.AppendConvars("texturePoolSizeMiBs=4096");
 	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
 	// (ds-pc-port12, res-1029) Without an upscaler the 3D is the output (native; the game's rows at their height, never above it).
 	if (upscaler.empty()) {
