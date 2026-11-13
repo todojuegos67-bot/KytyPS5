@@ -852,6 +852,35 @@ struct PipelineCache::ProgramCache {
 			                 plans_out, freed->size(), plan_reloads + plan_preloads, plan_preloads, plan_preload_uses);
 		if (push_job) push_job([freed] { freed->clear(); });
 	}
+	// (ram-diet) Every 30 s (ReportDriverRam: render thread, under the pipeline cache's mutex, as SweepPlans): the CPU-side
+	// shader data this cache holds. Plans at ~77 KB each (the estimate SweepPlans budgets with); the prefetch's SPIR-V and
+	// plans are in scratch files on disk (standby cache, not process memory).
+	void ReportRam() const {
+		size_t in_memory = 0, prefetched_modules = 0;
+		for (const auto& [key, source]: programs) {
+			(void)key;
+			in_memory += source.plan_out ? 0u : 1u;
+			prefetched_modules += source.prefetched.size();
+		}
+		uint64_t held = 0, released = 0, recipes = 0, spirv_file = 0, plan_file = 0;
+		size_t   groups = 0;
+		if (const auto* p = prefetch.get(); p != nullptr && p->ready.load(std::memory_order_acquire)) {
+			held       = p->records_held.load(std::memory_order_relaxed);
+			released   = p->records_released.load(std::memory_order_relaxed);
+			recipes    = p->recipes_released;
+			spirv_file = p->spill_end.load(std::memory_order_relaxed);
+			plan_file  = p->spilled_plan_bytes.load(std::memory_order_relaxed);
+			groups     = p->groups.size();
+		}
+		std::printf("[shader-ram] (30 s) programs %zu: plans in memory %zu (~%llu MiB), out of memory %zu (brought back "
+		            "%llu); prefetched modules waiting %zu; prefetch groups %zu: input records held %llu MiB, freed %llu "
+		            "MiB, recipes freed %llu MiB; on disk: SPIR-V %llu MiB, plans %llu MiB (KYTY_PLAN_EVICT=%d)\n",
+		            programs.size(), in_memory, static_cast<unsigned long long>((in_memory * 77u * 1024u) >> 20u),
+		            plans_out, static_cast<unsigned long long>(plan_reloads + plan_preloads), prefetched_modules, groups,
+		            static_cast<unsigned long long>(held >> 20u), static_cast<unsigned long long>(released >> 20u),
+		            static_cast<unsigned long long>(recipes >> 20u), static_cast<unsigned long long>(spirv_file >> 20u),
+		            static_cast<unsigned long long>(plan_file >> 20u), PlanEvictionEnabled() ? 1 : 0);
+	}
 	// Runs a job on the pipeline cache's compile workers (set by PipelineCache).
 	std::function<void(std::function<void()>)> push_job;
 	// The last table mode Get found its permutation still translating (empty, not refused), and that translation's
@@ -996,6 +1025,9 @@ struct PipelineCache::ProgramCache {
 		// Plans written to the scratch file (SpillPlan) and their bytes there; KYTY_PLAN_SPILL_VERIFY: reloads that saved
 		// differently.
 		std::atomic<uint64_t> spilled_plans {0}, spilled_plan_bytes {0}, spill_verify_failures {0};
+		// (ram-diet) Input record bytes still in memory and freed so far; recipe bytes freed at the start (KeepRecordsOnly).
+		std::atomic<uint64_t> records_held {0}, records_released {0};
+		size_t                recipes_released = 0;
 	};
 	std::unique_ptr<Prefetch> prefetch;
 	// `prefetch` for threads without the pipeline cache's lock (GetPrefetchProgress, the live report): a warmup beside
@@ -1098,6 +1130,9 @@ struct PipelineCache::ProgramCache {
 				if (recorded.empty()) return;
 				p.inputs.records.clear();
 			}
+			// (ram-diet) The prefetch reads the inputs' records only: their pipeline recipes (~50 MiB of words for the
+			// seeds' 53K) and dedup indexes stayed in memory all session.
+			p.recipes_released = p.inputs.KeepRecordsOnly();
 			const std::unordered_set<ProgramKey, ProgramKeyHash> skip(warm.begin(), warm.end());
 			for (uint32_t i = 0; i < p.inputs.records.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
 				LocalShaderWarmup::Record record;
@@ -1168,6 +1203,25 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			std::vector<std::vector<uint32_t>>().swap(recorded);
+			// (ram-diet) The records no group translates (the warmup's programs, invalid ones) freed now, the others as
+			// their group is done (ReleaseGroupRecords); before, all of them stayed until every group was done, which a
+			// 16 GB PC waiting for memory (WaitForMemory) might never reach.
+			{
+				std::vector<bool> used(p.inputs.records.size(), false);
+				for (const auto& group: p.groups)
+					for (const auto index: group->records) used[index] = true;
+				uint64_t held = 0;
+				for (size_t i = 0; i < p.inputs.records.size(); ++i) {
+					if (used[i]) {
+						held += p.inputs.records[i].capacity() * sizeof(uint32_t);
+					} else {
+						p.records_released.fetch_add(p.inputs.records[i].capacity() * sizeof(uint32_t),
+						                             std::memory_order_relaxed);
+						std::vector<uint32_t>().swap(p.inputs.records[i]);
+					}
+				}
+				p.records_held.store(held, std::memory_order_relaxed);
+			}
 			std::ranges::stable_sort(p.groups, {}, [](const auto& group) {
 				return std::pair {group->recorded, ~group->code_words};
 			});
@@ -1252,7 +1306,8 @@ struct PipelineCache::ProgramCache {
 				                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - p.started).count(),
 				                 p.disk_hits.load(std::memory_order_relaxed));
 				ShaderGate::prefetch_running.store(false, std::memory_order_release);
-				std::vector<std::vector<uint32_t>>().swap(p.inputs.records); // no longer read
+				// (ram-diet) Not the whole vector freed here any more: a follow helper (FollowWork) may still be inside
+				// RunGroup reading its group's records. Each group frees its own (ReleaseGroupRecords).
 				const auto mib = [&](PrefetchMemoryPart part) { return p.memory[part].load(std::memory_order_relaxed) >> 20u; };
 				PipelineCacheLog("Shader prefetch memory (MiB): plan values {} memory infos {} other {} info {}, modules info {} "
 				                 "table plans {} read plans {} bindings {} specializations {}, groups {}",
@@ -1293,6 +1348,20 @@ struct PipelineCache::ProgramCache {
 		return false;
 	}
 
+	// (ram-diet) The group's input records freed: read only by PrefetchTranslate (and DiskKey within it), by the one
+	// thread that moved the group out of Pending (RunGroup, or the render thread claiming it: PrefetchedGroup). Each record
+	// is one group's; the outer vector keeps its size, so other groups' elements stay where they are.
+	static void ReleaseGroupRecords(Prefetch& p, const Prefetch::Group& group) {
+		uint64_t bytes = 0;
+		for (const auto index: group.records) {
+			auto& words = p.inputs.records[index];
+			bytes += words.capacity() * sizeof(uint32_t);
+			std::vector<uint32_t>().swap(words);
+		}
+		p.records_held.fetch_sub(bytes, std::memory_order_relaxed); // (each record counted in it once: StartPrefetch)
+		p.records_released.fetch_add(bytes, std::memory_order_relaxed);
+	}
+
 	// The group translated here unless another thread took it.
 	bool RunGroup(Prefetch& p, Prefetch::Group& group) {
 		auto expected = static_cast<uint8_t>(Prefetch::Pending);
@@ -1300,6 +1369,7 @@ struct PipelineCache::ProgramCache {
 		const auto self = LocalPlatform::ThreadId();
 		group.worker.store(self, std::memory_order_release);
 		PrefetchTranslate(group);
+		ReleaseGroupRecords(p, group);
 		AddGroupMemory(p, group);
 		SpillPlan(p, group);
 		group.state.store(Prefetch::Done, std::memory_order_release);
@@ -1559,6 +1629,7 @@ struct PipelineCache::ProgramCache {
 		if (state == Prefetch::Pending &&
 		    group.state.compare_exchange_strong(state, Prefetch::Taken, std::memory_order_acq_rel)) {
 			prefetch->claimed++;
+			ReleaseGroupRecords(*prefetch, group); // (the caller translates the live code)
 			return nullptr;
 		}
 		// (ds-pc-port44) The 11-01 log's dispatch.program=870 ms (translate_us=3201: not its own translation): the render
@@ -2926,6 +2997,7 @@ void PipelineCache::ReportDriverRam(std::chrono::steady_clock::time_point now) {
 	            static_cast<unsigned long long>(UploadBytesInVideoMemory() >> 20u),
 	            static_cast<unsigned long long>(UploadBytesInSystemMemory() >> 20u), UploadInVideoMemory() ? 1 : 0,
 	            RamGuard::PressureLevel());
+	m_program_cache->ReportRam();
 	std::fflush(stdout);
 }
 
@@ -3237,7 +3309,10 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			           !m_program_cache->static_warm.pipelines.empty()) {
 				auto& programs = *m_program_cache;
 				programs.warm_records.assign(programs.static_warm.records.begin(), programs.static_warm.records.end());
-				programs.warm_recipes = programs.static_warm.pipelines;
+				// (ram-diet) Moved, not copied (the recipes were held twice through the warmup), and the cache's dedup
+				// indexes freed: nothing is recorded into it.
+				programs.warm_recipes = std::move(programs.static_warm.pipelines);
+				(void)programs.static_warm.KeepRecordsOnly();
 				m_warm_cache_only     = true;
 				PipelineCacheLog("Shader warmup: no recorded play: the static inputs' {} shader inputs and {} pipeline "
 				                 "recipes, into the driver cache beside the game",

@@ -317,6 +317,21 @@ public:
                ReadFile(location, signature, contents) && Parse(contents, out_records, out_pipelines);
     }
 
+    // (ram-diet) A cache read only for its records (the shader prefetch's static inputs): the pipeline recipes and
+    // both dedup indexes freed, and nothing recorded or saved through it any more (Enabled() false). Returns the
+    // bytes of recipe words released.
+    size_t KeepRecordsOnly() {
+        StopWriter();
+        size_t released = 0;
+        for (const auto& words : pipelines) released += words.capacity() * sizeof(uint32_t);
+        std::vector<std::vector<uint32_t>>().swap(pipelines);
+        Index().swap(record_index);
+        Index().swap(pipeline_index);
+        path.clear();
+        changed = false;
+        return released;
+    }
+
 private:
     struct Pending { bool pipeline; std::vector<uint32_t> words; };
     using Index = std::unordered_multimap<uint64_t, uint32_t>;
