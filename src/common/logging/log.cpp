@@ -5,7 +5,9 @@
 #include "common/emulatorConfig.h"
 #include "common/perfStats.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <filesystem>
 #include <fmt/format.h>
@@ -215,6 +217,18 @@ void WriteUnmuted(std::string_view text) {
 		return;
 	}
 	WriteImpl(text);
+}
+
+void PrintfUnmuted(const char* format, ...) {
+	char    buffer[2048];
+	va_list args;
+	va_start(args, format);
+	const int n = std::vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	if (n <= 0) {
+		return;
+	}
+	WriteUnmuted(std::string_view(buffer, std::min<size_t>(static_cast<size_t>(n), sizeof(buffer) - 1)));
 }
 
 bool IsSilent() {

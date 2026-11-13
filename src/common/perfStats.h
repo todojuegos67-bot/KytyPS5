@@ -258,6 +258,11 @@ namespace Log {
 void SetMuted(bool muted);
 // Writes a line even while muted.
 void WriteUnmuted(std::string_view text);
+// printf-style WriteUnmuted: diagnostics that must reach a port's log with printf Silent.
+void PrintfUnmuted(const char* format, ...);
 } // namespace Log
+
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define LOGF_UNMUTED(...) ::Log::PrintfUnmuted(__VA_ARGS__)
 
 #endif // KYTY_COMMON_PERFSTATS_H_

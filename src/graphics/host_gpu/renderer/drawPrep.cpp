@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
 
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "kernel/memory.h"
@@ -502,7 +503,7 @@ void LogCountersIfDue() {
 	     c(Counter::ScanCondStop), c(Counter::GpuCondExec), c(Counter::GpuCondSkip),
 	     c(Counter::VerifyChecks), c(Counter::VerifyMismatches));
 	if (MtProgEnabled()) {
-		LOGF("DrawPrep MT_PROG (10 s): sealed checks %llu, seal broken %llu\n",
+		LOGF_UNMUTED("DrawPrep MT_PROG (10 s): sealed checks %llu, seal broken %llu\n",
 		     c(Counter::SealHits), c(Counter::SealMisses));
 	}
 	for (size_t i = 0; i < delta.size(); i++) {

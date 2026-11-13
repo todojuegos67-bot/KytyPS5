@@ -4230,7 +4230,7 @@ void RenderExecutor::TableBindingsStore(PreparedBindings& prepared, bool verify)
 		if (const char* difference = TableBindingsDifference(*kept, prepared)) {
 			TableMode::Add(TableMode::Counter::BindingVerifyMismatches);
 			if (TableMode::VerifyLogAllowed()) {
-				LOGF("Table verify: bindings slot %u shader %016" PRIx64 ": %s differs (image set "
+				LOGF_UNMUTED("Table verify: bindings slot %u shader %016" PRIx64 ": %s differs (image set "
 				     "generation %" PRIu64 " kept, %" PRIu64 " now; buffer set %" PRIu64
 				     " kept, %" PRIu64 " now)\n",
 				     slot, prepared.runtime->program->shader_hash, difference,

@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -6411,7 +6412,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		if (diff != nullptr) {
 			TableMode::Add(TableMode::Counter::ProgramVerifyMismatches);
 			if (TableMode::VerifyLogAllowed()) {
-				LOGF("Table verify: programs of vs 0x%012" PRIx64 " ps 0x%012" PRIx64
+				LOGF_UNMUTED("Table verify: programs of vs 0x%012" PRIx64 " ps 0x%012" PRIx64
 				     " differ from the normal path: %s (entry dropped)\n",
 				     static_cast<uint64_t>(vertex_regs.es_regs.data_addr),
 				     static_cast<uint64_t>(pixel_regs.ps_regs.data_addr), diff);

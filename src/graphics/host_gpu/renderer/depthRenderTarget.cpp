@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -454,7 +455,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		if (!same) {
 			TableMode::Add(TableMode::Counter::TargetVerifyMismatches);
 			if (TableMode::VerifyLogAllowed()) {
-				LOGF("Table verify: depth target at 0x%012" PRIx64
+				LOGF_UNMUTED("Table verify: depth target at 0x%012" PRIx64
 				     " differs from the normal path (entry dropped)\n",
 				     static_cast<uint64_t>(z.z_read_base_addr));
 			}

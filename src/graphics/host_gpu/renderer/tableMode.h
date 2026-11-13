@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TABLEMODE_H_
 
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "graphics/host_gpu/gpuPhases.h"
 
 #include <array>
@@ -143,7 +144,7 @@ inline void LogIfDue() {
 		r.last_tsc   = tsc;
 		r.last_time  = std::chrono::steady_clock::now();
 		r.next_check = tsc + 50'000'000u;
-		LOGF("Table: KYTY_TABLE=%d (%s): programs, render targets and bindings from tables; a \"Table:\" "
+		LOGF_UNMUTED("Table: KYTY_TABLE=%d (%s): programs, render targets and bindings from tables; a \"Table:\" "
 		     "line every 10 s\n",
 		     Mode(), Verifying() ? "verifier: the normal path draws, differences logged" : "on");
 		return;
@@ -187,7 +188,7 @@ inline void LogIfDue() {
 	};
 	const auto all_draws = dh_draws + dm_draws;
 	const auto all_us    = us_per(dh_cycles + dm_cycles, all_draws);
-	LOGF("Table (%.0f s): hits %llu / misses %llu / %.2f us per draw (programs+targets; hit "
+	LOGF_UNMUTED("Table (%.0f s): hits %llu / misses %llu / %.2f us per draw (programs+targets; hit "
 	     "%.2f, miss %.2f) | programs: misses new %llu, stale %llu, reads %llu, not stored %llu "
 	     "(vertex tables %llu), stored %llu | targets: hits %llu / misses %llu | verify: programs "
 	     "%llu checks, %llu mismatches; targets %llu checks, %llu mismatches | bindings: hits %llu / "

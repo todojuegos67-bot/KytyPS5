@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -429,7 +430,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		    t.export_mapping.packed != r.export_mapping.packed) {
 			TableMode::Add(TableMode::Counter::TargetVerifyMismatches);
 			if (TableMode::VerifyLogAllowed()) {
-				LOGF("Table verify: color target slot %u at 0x%012" PRIx64
+				LOGF_UNMUTED("Table verify: color target slot %u at 0x%012" PRIx64
 				     " differs from the normal path (entry dropped)\n",
 				     rt_slot, static_cast<uint64_t>(rt.base.addr));
 			}
