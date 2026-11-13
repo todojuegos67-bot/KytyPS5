@@ -1,5 +1,5 @@
 #pragma once
-// Guest lazy commit (on by default, KYTY_GUEST_LAZY_COMMIT=0 turns it off; Windows, page-file store only).
+// Guest lazy commit (off by default, KYTY_GUEST_LAZY_COMMIT=1 turns it on; Windows, page-file store only).
 //
 // The guest backing store (one 13824 MiB page-file section) is created SEC_RESERVE instead of SEC_COMMIT, and its
 // pages are committed when first touched, in granules of KYTY_GUEST_LAZY_COMMIT_KB (default 64 KiB, the fresh-memory
@@ -15,8 +15,15 @@
 // The rule that keeps it equal to a store committed at map: whatever commits a page gives every view of it exactly the
 // protection it would have had, committed from the start. So:
 //  - CPU touch (guest or host code, through a guest view or the backing alias): a reserved page faults; the vectored
-//    handler here (first in the chain) commits the granule around it and the instruction runs again. No emulator lock
-//    is taken there.
+//    handler here (first in the chain) commits the granule around it and the instruction runs again. It does so for a
+//    fault on ANY reserved page of ANY mapped view in the process (MEM_RESERVE + MEM_MAPPED), known here or not: the
+//    granule (clipped to that reserved run) is committed through the faulting view - for a known guest view or the
+//    alias, the recorded protections first (below) and the alias's pages checked read-write; for a view not known here,
+//    simply with its mapping protection. A fault on a page that is already committed (another thread committed its
+//    granule between the fault and the handler's look) is resumed when the page is in a known guest view or the alias
+//    and its protection now allows the access (read, write or execute); otherwise, and after 4 such resumptions in a
+//    row at one address on one thread, it is left to the other handlers. Only this module's lock is taken there (no
+//    emulator lock), and nothing is allocated.
 //  - Protection changes of a guest view (the GPU trackers' write/read watches, the fresh-memory watches, guest
 //    mprotect, a no-access view): committed pages are protected at once. For still-reserved pages of a guest view that
 //    is the only guest view of those store pages, the protection is recorded instead (per store offset, with the view
@@ -103,11 +110,11 @@ inline State& Get() {
 	return state;
 }
 
-// Read once: the store's constructor decides SEC_RESERVE with it. On unless KYTY_GUEST_LAZY_COMMIT=0.
+// Read once: the store's constructor decides SEC_RESERVE with it. Off unless KYTY_GUEST_LAZY_COMMIT starts with '1'.
 inline bool Requested() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_GUEST_LAZY_COMMIT");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return on;
 }
@@ -131,8 +138,9 @@ inline double TicksToMs(uint64_t ticks) {
 	return static_cast<double>(ticks) / per_ms;
 }
 
-// A reserved page of a mapped view: the alias or a guest view of the store (any other is not ours, and is left alone
-// when the address is not in a known view - see ViewOffsetLocked).
+// A reserved page of a mapped view: the alias, a guest view of the store, or any other view of a SEC_RESERVE section
+// in the process (not told apart here: the handler and the commits treat them all alike, a view not known here
+// committed with its mapping protection - see CommitPieceLocked).
 inline bool IsMappedReserved(const MEMORY_BASIC_INFORMATION& info) {
 	return info.State == MEM_RESERVE && info.Type == MEM_MAPPED;
 }
@@ -547,16 +555,59 @@ inline void Unregister(uint64_t address) {
 	ReleaseSRWLockExclusive(&state.lock);
 }
 
+// Whether a committed page's protection allows the access of an access violation (ExceptionInformation[0]: 0 read,
+// 1 write, 8 execute; anything else: no).
+inline bool AllowsAccess(DWORD protect, ULONG_PTR access) {
+	if ((protect & PAGE_GUARD) != 0) return false;
+	if (access == 0) return CanRead(protect);
+	if (access == 1) return CanWrite(protect);
+	if (access == 8) return CanExecute(protect);
+	return false;
+}
+
+// Per thread (no allocation: static TLS, constant-initialized): the address of the last fault resumed because its page
+// was found committed already, and how many times in a row it was. Capped, so an access that keeps faulting on a page
+// that looks accessible goes to the other handlers instead of looping.
+constexpr uint32_t MaxCommittedRetries = 4;
+inline thread_local uint64_t g_retry_address = 0;
+inline thread_local uint32_t g_retry_count   = 0;
+
+// A fault on a page found committed: another thread committed its granule between this fault and the handler's look
+// (two threads first-touching one granule). Resumed when the page is in a known guest view or the alias and its
+// protection allows the access, at most MaxCommittedRetries times in a row at one address; else left to the others
+// (a watch's protection: the emulator's handler, as on a committed store).
+inline LONG CommittedMeanwhile(State& state, const MEMORY_BASIC_INFORMATION& info, uint64_t address, ULONG_PTR access) {
+	if (info.State != MEM_COMMIT || info.Type != MEM_MAPPED || !AllowsAccess(info.Protect, access))
+		return EXCEPTION_CONTINUE_SEARCH;
+	uint64_t offset = 0, owner = 0, view_end = 0;
+	AcquireSRWLockShared(&state.lock);
+	const bool known = ViewOffsetLocked(state, address, &offset, &owner, &view_end);
+	ReleaseSRWLockShared(&state.lock);
+	if (!known) return EXCEPTION_CONTINUE_SEARCH;
+	if (g_retry_address != address) {
+		g_retry_address = address;
+		g_retry_count   = 0;
+	}
+	if (++g_retry_count > MaxCommittedRetries) {
+		g_retry_count = 0;
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 inline LONG CALLBACK Handler(EXCEPTION_POINTERS* pointers) {
 	auto& state = Get();
 	if (!state.enabled || pointers == nullptr || pointers->ExceptionRecord == nullptr ||
 	    pointers->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
 	    pointers->ExceptionRecord->NumberParameters < 2)
 		return EXCEPTION_CONTINUE_SEARCH;
+	const auto access  = pointers->ExceptionRecord->ExceptionInformation[0];
 	const auto address = static_cast<uint64_t>(pointers->ExceptionRecord->ExceptionInformation[1]);
 	MEMORY_BASIC_INFORMATION info {};
-	if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info) || !IsMappedReserved(info))
+	if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info))
 		return EXCEPTION_CONTINUE_SEARCH;
+	if (!IsMappedReserved(info)) return CommittedMeanwhile(state, info, address, access);
+	g_retry_count = 0; // (a commit: the run of resumptions without one ends)
 	// The granule around the fault, inside the reserved run and its view.
 	const uint64_t run_begin = reinterpret_cast<uint64_t>(info.BaseAddress);
 	const uint64_t run_end   = run_begin + info.RegionSize;
@@ -621,7 +672,7 @@ inline void Start(uint64_t alias_base, uint64_t store_size) {
 		return;
 	}
 	state.enabled = true;
-	std::printf("Guest lazy commit: on (KYTY_GUEST_LAZY_COMMIT=0 turns it off), %llu MiB store reserved, committed at "
+	std::printf("Guest lazy commit: on (KYTY_GUEST_LAZY_COMMIT=1), %llu MiB store reserved, committed at "
 	            "first touch in %llu KiB granules; nothing is ever decommitted or moved\n",
 	            static_cast<unsigned long long>(store_size >> 20u), static_cast<unsigned long long>(state.granule >> 10u));
 	std::fflush(stdout);

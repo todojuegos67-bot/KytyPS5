@@ -149,8 +149,8 @@ public:
 		// cannot be made or its drive has less than the store's size + 4 GiB free.
 		m_file = OpenBackingFile(m_size);
 		if (m_file != INVALID_HANDLE_VALUE) m_on_demand = false; // (SEC_RESERVE is for page-file sections only)
-		// KYTY_GUEST_LAZY_COMMIT (guest-lazy-commit.h, on unless =0): reserved too, but each granule committed at its first
-		// touch (a fault, a kernel-mode access), not when a mapping covers it; nothing decommitted or moved later.
+		// KYTY_GUEST_LAZY_COMMIT=1 (guest-lazy-commit.h, off by default): reserved too, but each granule committed at its
+		// first touch (a fault, a kernel-mode access), not when a mapping covers it; nothing decommitted or moved later.
 		m_lazy = m_file == INVALID_HANDLE_VALUE && GuestLazyCommit::Requested();
 		if (m_lazy) m_on_demand = true;
 		m_handle = CreateFileMappingA(
