@@ -23,6 +23,7 @@
 #include "speculation-state.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
+#include "gpu-residency.h"
 
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_bda_dirty_regions_mode {0};
@@ -39,7 +40,9 @@ namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, this),
-      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache), m_graphics(graphics) {}
+      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache), m_graphics(graphics) {
+	GpuResidency::Start();
+}
 
 GpuResourceManager::~GpuResourceManager() = default;
 
@@ -526,6 +529,20 @@ void GpuResourceManager::EndSubmission() {
 }
 
 void GpuResourceManager::AdvanceFrame() {
+	// KYTY_GPU_RESIDENCY (gpu-residency.h): the registered ranges copied for the measurement's thread, once every 30 s
+	// (otherwise an atomic load). Here no cache lock is held, and the buffer cache is this thread's.
+	if (GpuResidency::Requested()) {
+		const auto                       start = std::chrono::steady_clock::now();
+		std::vector<GpuResidency::Range> ranges;
+		// (0: the measurement's thread holds the exchange's mutex; never waited for, tried again at the next flip.)
+		if (const uint64_t request = GpuResidency::Take(&ranges); request != 0) {
+			uint64_t images = 0, buffers = 0;
+			m_texture_cache.CollectResidencyRanges(ranges, images);
+			m_buffer_cache.CollectResidencyRanges(ranges, buffers);
+			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+			GpuResidency::Deliver(request, std::move(ranges), images, buffers, ms);
+		}
+	}
 	m_texture_cache.AdvanceFrame();
 	RunCollectors();
 	if (auto* fresh = FreshMemory::Get(); fresh != nullptr && ++m_fresh_report_flip % 3600 == 0) {

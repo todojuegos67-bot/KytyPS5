@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <thread>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "gpu-residency.h"
 #include "slow-log.h"
 
 #include "common/assert.h"
@@ -275,6 +276,20 @@ void TextureCache::WriteReport(const char* path) {
 		             image.backing.allocation != nullptr ? static_cast<int>(allocation.memoryType) : -1);
 	});
 	std::fclose(file);
+}
+
+void TextureCache::CollectResidencyRanges(std::vector<GpuResidency::Range>& out, uint64_t& count) {
+	count = 0;
+	std::scoped_lock lock {m_lock};
+	m_slot_images.ForEach([&](ImageId /*id*/, const Image& image) {
+		if (!image.registered || image.info.data.address == 0 || image.info.data.size == 0) return;
+		const auto& usage = image.usage;
+		const auto  kind  = usage.render_target || usage.depth_target || usage.video_out ? GpuResidency::Target
+		                    : usage.storage || image.IsGpuModified()                    ? GpuResidency::Storage
+		                                                                                : GpuResidency::Texture;
+		out.push_back({image.info.data.address, image.info.data.size, kind});
+		count++;
+	});
 }
 
 // KYTY_TEXTURE_OFFLOAD (texture-offload.h): the cache its restores go to, while it lives.
