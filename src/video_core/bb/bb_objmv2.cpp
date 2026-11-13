@@ -43,6 +43,15 @@ constexpr u32 kStatWords = 16; // word 11: attachment 7 texels != 0; 12-15: the 
 constexpr u64 kStatPeriod = 60;                 // statistics / check frame: 1 in 60
 constexpr u32 kStaticSample = 4;                // check frames: 1 static draw in 4 checked
 
+// bb-native-mv2 (BB_NATIVE_MV2, default off). Bits of State::native2.
+constexpr u32 kN2Buffers = 1;   // other read-only VS buffers: last frame's copy, same mesh draw
+constexpr u32 kN2Character = 2; // skinned draws class 4; the player mask = class 4 in the centre
+constexpr u32 kN2Measure = 4;   // count how often those buffers change between frames
+constexpr u32 kObjBufMax = 4096;     // object buffers up to this size (bytes)
+constexpr u32 kObjCheckFloats = 64;  // CPU check: first 64 floats
+constexpr float kObjAbsTol = 0.5f;   // per float, + 2 % relative: same object one frame later
+constexpr double kW30Period = 30.0;  // seconds between [native-mv2] lines
+
 enum Cat : u32 { CatSkinned = 0, CatSmallSkel, CatRigid, CatBlend, CatCount };
 constexpr const char* kCatName[CatCount] = {"skinned(characters+enemies)",
                                             "small-skeleton(weapons/props)", "rigid",
@@ -176,6 +185,25 @@ struct State {
         vs_skinned_ring = 0, vs_skinned_addr = 0, vs_no_cam = 0, vs_no_pal = 0, vs_blend = 0,
         vs_gpu_copies = 0, vs_bytes = 0, vs_cam_addr = 0, vs_cam_ord = 0, vs_ring_seen = 0;
     double vs_cpu_ns = 0;
+    // bb-native-mv2: read-only VS buffers that are neither the camera block nor a bone palette
+    // (object transforms, small skeletons such as weapons, CPU-animated data) were read with
+    // their current data in the previous-frame pass: such an object got the camera's motion only.
+    u32 native2 = 0;
+    struct ObjCpu {
+        std::array<float, kObjCheckFloats> v{};
+        u32 n = 0;
+    };
+    std::unordered_map<u64, ObjCpu> obj_cpu_cur, obj_cpu_prev; // object buffer key -> first floats
+    std::unordered_map<u64, u32> mesh_cnt_prev; // mesh draw (no occurrence) -> draws last frame
+    struct W30 {
+        u64 frames = 0, draws = 0, native = 0, blend = 0, no_cam = 0, no_pal = 0;
+        u64 skin_all = 0, skin_vec = 0, pal_ring = 0, pal_other = 0;
+        u64 obj_bufs = 0, obj_unchanged = 0, obj_changed = 0, obj_unchecked = 0, obj_no_prev = 0,
+            obj_used_checked = 0, obj_used_unique = 0, obj_rejected = 0, obj_unverifiable = 0,
+            obj_draws_moved = 0;
+        u64 static_px = 0, static_abs = 0, player_px = 0, stat_frames = 0;
+    } w30;
+    std::chrono::steady_clock::time_point w30_t0 = std::chrono::steady_clock::now();
 } g;
 
 void FlushVelocityCopies(vk::CommandBuffer cmd); // bb-velocity (below)
@@ -321,7 +349,11 @@ void ReadStats(u32 slot) {
     g.sec_pl_changed += s[13];
     g.sec_pl_before += s[14];
     g.sec_pl_after += s[15];
+    g.w30.player_px += s[12];
     if (g.slot_stat[slot]) {
+        g.w30.static_px += s[8];
+        g.w30.static_abs += s[9];
+        ++g.w30.stat_frames;
         g.sec_nonzero += s[11];
         ++g.sec_stat_frames;
     }
@@ -488,6 +520,25 @@ bool Init(const Vulkan::Instance& instance) {
     g.dedupe.reserve(8192);
     g.velocity = !EnvOff("BB_VELOCITY");
     g.skin_order = !EnvOff("BB_SKIN_MV");
+    if (const char* n2 = std::getenv("BB_NATIVE_MV2"); n2 != nullptr) {
+        const std::string s = n2;
+        if (s == "1" || s == "on") {
+            g.native2 = kN2Buffers | kN2Character | kN2Measure;
+        } else if (s == "cb") {
+            g.native2 = kN2Buffers | kN2Measure;
+        } else if (s == "player") {
+            g.native2 = kN2Character;
+        } else if (s == "diag") {
+            g.native2 = kN2Measure;
+        }
+    }
+    if (!g.velocity) {
+        // Class 4 is written only by the velocity path (VelocityDraw): with BB_VELOCITY=0 the
+        // character mask would be empty and the class-1 player mask / refine would be lost.
+        g.native2 = 0;
+    } else if (!g.skin_order) {
+        g.native2 &= kN2Character;
+    }
     if (g.velocity) {
         g.additive = false; // absolute vectors: the previous camera is in the VS
         Vulkan::Scheduler::bb_end_rendering_hook = &FlushVelocityCopies;
@@ -497,6 +548,14 @@ bool Init(const Vulkan::Instance& instance) {
                      "velocity in its vertex shader (previous 864 B camera block, previous skin "
                      "ring palette), bb_mv.comp only where none is written; BB_VELOCITY=0 off"
                    : "[velocity] off (BB_VELOCITY=0)");
+    const char* n2_env = std::getenv("BB_NATIVE_MV2");
+    Log(fmt::format("[native-mv2] BB_NATIVE_MV2={} (1: all, cb: object buffers, player: character "
+                    "class, diag: measure only; default off): object buffers' previous copies {}, "
+                    "character class / player mask {}, measure {}",
+                    n2_env != nullptr ? n2_env : "unset",
+                    (g.native2 & kN2Buffers) ? "on" : "off",
+                    (g.native2 & kN2Character) ? "on" : "off",
+                    (g.native2 & kN2Measure) ? "on" : "off"));
     Log(fmt::format("on: scene draws run their vertex shader once more with last frame's buffers "
                     "(GPU), vectors in attachment 7, composed over bb_mv; snapshot arena {} MiB x "
                     "{}, check {}",
@@ -756,15 +815,100 @@ bool CameraSimilar(const std::array<float, 216>& a, const std::array<float, 216>
     return close >= 216 * 3 / 4;
 }
 
+// bb-native-mv2: every float of last frame's copy within 0.5 (+ 2 %) of this frame's: the same
+// object one frame later (another instance of the mesh lies elsewhere and is refused).
+bool ObjectClose(const float* a, const float* b, u32 n) {
+    for (u32 i = 0; i < n; ++i) {
+        if (std::memcmp(a + i, b + i, sizeof(float)) == 0) continue;
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return false;
+        const float tol = kObjAbsTol + 0.02f * std::max(std::fabs(a[i]), std::fabs(b[i]));
+        if (!(std::fabs(a[i] - b[i]) <= tol)) return false;
+    }
+    return true;
+}
+
+// bb-native-mv2: a read-only VS buffer that is neither the camera block nor a bone palette
+// (object transform, weapon / prop skeleton, CPU-animated data). This frame's copy is kept under
+// the mesh draw's identity (vertex program, index buffer, counts, occurrence, handle, size); last
+// frame's copy of that identity is used when its first floats are close to this frame's (CPU
+// copies), or, for a buffer the GPU wrote (no CPU check), when the mesh was drawn exactly once
+// last frame and this is its first draw this frame. `changed`: the checked data differs.
+bool ObjectBufferPrevious(Core::MemoryManager* memory, VideoCore::BufferCache& buffer_cache,
+                          Vulkan::Scheduler& scheduler, u64 addr, u32 size, u64 mesh,
+                          u64 mesh_base, u32 mesh_index, u32 handle, SnapBuf& out, bool& changed) {
+    auto& w = g.w30;
+    ++w.obj_bufs;
+    changed = false;
+    const u64 okey = Mix(Mix(Mix(mesh, handle), size), 0x6f626a6275ull);
+    const u32 floats = std::min<u32>(size / 4, kObjCheckFloats);
+    State::ObjCpu cur_cpu{};
+    if (!buffer_cache.IsRegionGpuModified(addr, size) && memory->IsValidMapping(addr, size)) {
+        std::memcpy(cur_cpu.v.data(), reinterpret_cast<const void*>(addr), floats * 4);
+        cur_cpu.n = floats;
+        g.obj_cpu_cur.insert_or_assign(okey, cur_cpu);
+    }
+    bool checked = false, close = false;
+    if (cur_cpu.n != 0) {
+        if (const auto p = g.obj_cpu_prev.find(okey);
+            p != g.obj_cpu_prev.end() && p->second.n == cur_cpu.n) {
+            checked = true;
+            changed = std::memcmp(cur_cpu.v.data(), p->second.v.data(), cur_cpu.n * 4) != 0;
+            close = !changed || ObjectClose(cur_cpu.v.data(), p->second.v.data(), cur_cpu.n);
+        }
+    }
+    if (!checked) {
+        ++w.obj_unchecked;
+    } else if (changed) {
+        ++w.obj_changed;
+    } else {
+        ++w.obj_unchanged;
+    }
+    if ((g.native2 & kN2Buffers) == 0) return false;
+    SnapBuf cur{0, 0, 0, 0};
+    if (VelSnap(buffer_cache, scheduler, addr, size, cur)) {
+        g.vel_id_cur.insert_or_assign(okey, cur);
+    }
+    const auto pv = g.vel_id_prev.find(okey);
+    if (pv == g.vel_id_prev.end() || pv->second.addr == 0 || pv->second.dwords != size / 4) {
+        ++w.obj_no_prev;
+        return false;
+    }
+    bool accept = false;
+    if (checked) {
+        accept = close;
+        if (accept) {
+            ++w.obj_used_checked;
+        } else {
+            ++w.obj_rejected;
+        }
+    } else {
+        const auto c = g.mesh_cnt_prev.find(mesh_base);
+        accept = mesh_index == 0 && c != g.mesh_cnt_prev.end() && c->second == 1;
+        if (accept) {
+            ++w.obj_used_unique;
+        } else {
+            ++w.obj_unverifiable;
+        }
+    }
+    if (!accept) {
+        changed = false;
+        return false;
+    }
+    out = pv->second;
+    return true;
+}
+
 void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
                   VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler, u64 vs_hash,
-                  bool blend, u64 mesh) {
+                  bool blend, u64 mesh, u64 mesh_base, u32 mesh_index) {
     const auto t0 = std::chrono::steady_clock::now();
     ++g.vs_draws;
     ++g.sec_draws;
+    ++g.w30.draws;
     if (blend) {
         // Particles / effects: no vector of their own, bb_mv.comp stays under them.
         ++g.vs_blend;
+        ++g.w30.blend;
         return;
     }
     const u32 n = static_cast<u32>(std::min<size_t>(vs.buffers.size(), Shader::NUM_BUFFERS));
@@ -780,7 +924,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     }
     std::array<SnapBuf, Shader::NUM_BUFFERS> prev{};
     std::array<bool, Shader::NUM_BUFFERS> use{};
-    bool camera = false, ok = true, skinned = false, ring = false;
+    bool camera = false, ok = true, skinned = false, ring = false, obj_moved = false;
     u32 pal_matched = 0, pal_failed = 0, pal_bufs = 0;
     for (u32 h = 0; h < n && ok; ++h) {
         if ((cand & (1ull << h)) == 0) continue;
@@ -788,7 +932,21 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         const u32 size = sharp.GetSize();
         const u64 addr = sharp.base_address;
         const VelRole role = IdentifyVelocityBuffer(size);
-        if (role == VelRole::Current || addr == 0) continue;
+        if (addr == 0) continue;
+        if (role == VelRole::Current) {
+            if ((g.native2 & (kN2Buffers | kN2Measure)) != 0 && mesh != 0 && size >= 16 &&
+                size <= kObjBufMax) {
+                SnapBuf ob{0, 0, 0, 0};
+                bool changed = false;
+                if (ObjectBufferPrevious(memory, buffer_cache, scheduler, addr, size, mesh,
+                                         mesh_base, mesh_index, h, ob, changed)) {
+                    prev[h] = ob;
+                    use[h] = true;
+                    obj_moved |= changed;
+                }
+            }
+            continue;
+        }
         SnapBuf cur{0, 0, 0, 0};
         const bool have_cur = VelSnap(buffer_cache, scheduler, addr, size, cur);
         const u64 akey = Mix(addr, size);
@@ -832,6 +990,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             }
             if (found == nullptr) {
                 ++g.vs_no_cam;
+                ++g.w30.no_cam;
                 ok = false;
                 break;
             }
@@ -1028,9 +1187,11 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             ++g.vs_pal_partial;
         } else {
             ++g.vs_no_pal;
+            ++g.w30.no_pal;
             ok = false;
         }
     }
+    if (skinned) ++g.w30.skin_all;
 
     const u64 bytes = u64(n) * 16;
     if (ok && camera && g.history && g.table_used + bytes <= kTableBytes) {
@@ -1049,8 +1210,17 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         push.objmv_entry = {u32(ea), u32(ea >> 32)};
         // Static draws: 1 in kStaticSample on statistics frames is class 2 (compared with
         // bb_mv.comp's camera vector: the [velocity] static check), else class 1.
-        const bool diag = !skinned && g.stat_frame && (g.static_seen++ % kStaticSample) == 0;
-        push.objmv_flags = diag ? 3u : 1u;
+        // bb-native-mv2: a rigid draw whose own buffers moved is not a static draw for the check.
+        const bool diag =
+            !skinned && !obj_moved && g.stat_frame && (g.static_seen++ % kStaticSample) == 0;
+        u32 flags = diag ? 3u : 1u;
+        if (skinned && (g.native2 & kN2Character) != 0) flags |= 4u;
+        push.objmv_flags = flags;
+        ++g.w30.native;
+        if (skinned) ++g.w30.skin_vec;
+        if (skinned && ring) ++g.w30.pal_ring;
+        if (skinned && !ring) ++g.w30.pal_other;
+        if (obj_moved) ++g.w30.obj_draws_moved;
         ++g.vs_native;
         ++g.frame_vec_draws;
         ++g.sec_vec_draws;
@@ -1073,6 +1243,39 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
 }
 
+double Pct(u64 part, u64 whole) {
+    return whole != 0 ? 100.0 * double(part) / double(whole) : 0.0;
+}
+
+// bb-native-mv2: match rates over the last 30 s.
+void LogNative2() {
+    const auto& w = g.w30;
+    const double f = double(std::max<u64>(1, w.frames));
+    const u64 obj_used = w.obj_used_checked + w.obj_used_unique;
+    const u64 obj_checked = w.obj_changed + w.obj_unchanged;
+    Log(fmt::format(
+        "[native-mv2] {:.0f} s, {} frames: scene draws {:.1f}/frame, own vectors {:.1f}% (no "
+        "previous camera {:.1f}%, no previous palette {:.1f}%, blended without vector {:.1f}%) | "
+        "skinned with vectors {:.1f}% of {:.1f}/frame (game ring identity {:.1f}%, address / "
+        "mesh / order {:.1f}%) | object buffers {:.1f}/frame: CPU-checked {:.1f}% (data changed "
+        "since last frame {:.1f}% of checked), last frame's copy used {:.1f}% (checked {:.1f}, "
+        "unique mesh {:.1f}/frame), refused as another instance {:.1f}/frame, GPU-written not "
+        "unique {:.1f}/frame, no copy last frame {:.1f}/frame; rigid draws moved by their own "
+        "buffers {:.1f}/frame | static check |native-cam| {:.3f} px over {} px | player mask "
+        "{:.0f} px/frame | mode {}{}{}",
+        kW30Period, w.frames, double(w.draws) / f, Pct(w.native, w.draws), Pct(w.no_cam, w.draws),
+        Pct(w.no_pal, w.draws), Pct(w.blend, w.draws), Pct(w.skin_vec, w.skin_all),
+        double(w.skin_all) / f, Pct(w.pal_ring, w.skin_vec), Pct(w.pal_other, w.skin_vec),
+        double(w.obj_bufs) / f, Pct(obj_checked, w.obj_bufs), Pct(w.obj_changed, obj_checked),
+        Pct(obj_used, w.obj_bufs), double(w.obj_used_checked) / f, double(w.obj_used_unique) / f,
+        double(w.obj_rejected) / f, double(w.obj_unverifiable) / f, double(w.obj_no_prev) / f,
+        double(w.obj_draws_moved) / f,
+        w.static_px != 0 ? double(w.static_abs) / 16.0 / double(w.static_px) : 0.0, w.static_px,
+        double(w.player_px) / f, (g.native2 & kN2Buffers) ? "object-buffers " : "",
+        (g.native2 & kN2Character) ? "character-class " : "",
+        g.native2 == 0 ? "off (BB_NATIVE_MV2=1 / cb / player / diag)" : ""));
+}
+
 } // namespace
 
 void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
@@ -1084,12 +1287,15 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     if (g.velocity) {
         // Mesh identity (vertex program, index buffer, counts, occurrence this frame): palettes
         // whose order / layout moved are matched to last frame's palette of the same mesh draw.
-        u64 mesh = 0;
+        u64 mesh = 0, mesh_base = 0;
+        u32 mesh_index = 0;
         if (!blend && g.skin_order) {
-            const u64 m = Mix(Mix(Mix(vs_hash, identity), count), instances);
-            mesh = Mix(Mix(m, 0x6d657368ull), g.mesh_occ[m]++);
+            mesh_base = Mix(Mix(Mix(vs_hash, identity), count), instances);
+            mesh_index = g.mesh_occ[mesh_base]++;
+            mesh = Mix(Mix(mesh_base, 0x6d657368ull), mesh_index);
         }
-        VelocityDraw(push, vs, memory, buffer_cache, scheduler, vs_hash, blend, mesh);
+        VelocityDraw(push, vs, memory, buffer_cache, scheduler, vs_hash, blend, mesh, mesh_base,
+                     mesh_index);
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -1279,7 +1485,11 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
         const char* v = std::getenv("BB_PLAYER_MV_REFINE");
         return !(v != nullptr && v[0] == '0');
     }();
-    const bool store_color = color_view && ((g.check && IsStatFrame(g.frame + 1)) || refine);
+    // bb-native-mv2: the player mask is the skinned (class 4) pixels in the centre; kept every
+    // frame (ping-pong) as with refine.
+    const bool characters = (g.native2 & kN2Character) != 0;
+    const bool keep = refine || characters;
+    const bool store_color = color_view && ((g.check && IsStatFrame(g.frame + 1)) || keep);
     if (!stat && !store_color && (g.frame_vec_draws == 0 || reset)) {
         // Nothing moving drew this frame: the camera vectors stay as they are.
         ++g.sec_skipped;
@@ -1315,8 +1525,8 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
         .image = g.image,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
-    const u32 rd = refine ? g.pp : 0u; // previous colour read
-    const u32 next = refine ? 1u - g.pp : 0u; // written (single image without refine)
+    const u32 rd = keep ? g.pp : 0u; // previous colour read
+    const u32 next = keep ? 1u - g.pp : 0u; // written (single image without refine)
     const vk::ImageMemoryBarrier2 prev_barriers[2] = {
         {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
          .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
@@ -1373,7 +1583,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     const std::array<u32, 4> push{render.width, render.height, reset ? 0u : 1u,
                                   (stat ? 1u : 0u) | (g.additive ? 2u : 0u) |
                                       (store_color ? 4u : 0u) | (check ? 8u : 0u) |
-                                      (refine_now ? 16u : 0u)};
+                                      (refine_now ? 16u : 0u) | (characters ? 32u : 0u)};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
@@ -1391,7 +1601,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     if (store_color && !reset) {
         g.color_stored = g.frame;
         g.prev_valid = true;
-        if (refine) g.pp = next;
+        if (keep) g.pp = next;
     }
 }
 
@@ -1421,6 +1631,8 @@ void OnFlip() {
         std::swap(g.pal_cpu_prev, g.pal_cpu_cur);
         std::swap(g.pal_rel_prev, g.pal_rel_cur);
         std::swap(g.ring_seen_prev, g.ring_seen_cur);
+        std::swap(g.obj_cpu_prev, g.obj_cpu_cur);
+        std::swap(g.mesh_cnt_prev, g.mesh_occ);
         g.pal_n_prev.clear();
         for (const auto& [grp, cnt] : g.pal_ord_n) g.pal_n_prev[grp] = cnt;
         g.history = true;
@@ -1436,6 +1648,8 @@ void OnFlip() {
         g.pal_rel_prev.clear();
         g.pal_n_prev.clear();
         g.ring_seen_prev.clear();
+        g.obj_cpu_prev.clear();
+        g.mesh_cnt_prev.clear();
         g.history = false;
         if (!had_pass) g.prev_valid = false;
     }
@@ -1457,6 +1671,7 @@ void OnFlip() {
     g.ring_ord_of.clear();
     g.ring_ord_n.clear();
     g.ring_seen_cur.clear();
+    g.obj_cpu_cur.clear();
     g.mesh_occ.clear();
     g.pal_ids.clear();
     if (had_pass) ++g.vs_frames;
@@ -1472,6 +1687,12 @@ void OnFlip() {
     g.table_used = 0;
 
     const auto now = std::chrono::steady_clock::now();
+    if (had_pass) ++g.w30.frames;
+    if (std::chrono::duration<double>(now - g.w30_t0).count() >= kW30Period) {
+        LogNative2();
+        g.w30 = State::W30{};
+        g.w30_t0 = now;
+    }
     const double secs = std::chrono::duration<double>(now - g.t0).count();
     if (secs < 1.0) return;
     {

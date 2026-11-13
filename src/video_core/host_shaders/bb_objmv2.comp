@@ -3,8 +3,9 @@
 // BB object motion vectors v2 (bb_objmv2.h): the G-buffer pass wrote per-object vectors (vertex
 // shader run once more with last frame's buffers, only for skinned / blended draws) into an
 // RGBA16F image: (dx, dy, class, weight); class 1 moving opaque, 2 static draw (check only,
-// never replaces), 3 blended (alpha-weighted). Units and sign as bb_mv.comp: render pixels,
-// previous minus current, y down, no jitter (the guest positions are never jittered).
+// never replaces), 3 blended (alpha-weighted), 4 skinned (BB_NATIVE_MV2; replaces as class 1).
+// Units and sign as bb_mv.comp: render pixels, previous minus current, y down, no jitter (the
+// guest positions are never jittered).
 // Additive mode (flags bit 1): the snapshots do not hold the camera (static draws give ~0),
 // so the vector is the object's own motion and the camera vector is added to it.
 // Every frame the pass is a fetch + store on object pixels only; the statistics (flags bit 0)
@@ -64,14 +65,15 @@ vec2 Refine(ivec2 c, vec2 v, bool additive) {
             const ivec2 n4[4] = ivec2[](ivec2(4, 0), ivec2(-4, 0), ivec2(0, 4), ivec2(0, -4));
             const ivec2 q = clamp(c + n4[i - 8], ivec2(0), ivec2(size) - 1);
             const vec4 o = texelFetch(obj_mv, q, 0);
-            if (!(o.z > 0.5 && o.z < 1.5) || any(isnan(o.xy)) || any(isinf(o.xy))) continue;
+            if (!((o.z > 0.5 && o.z < 1.5) || o.z > 3.5) || any(isnan(o.xy)) || any(isinf(o.xy))) {
+                continue;
+            }
             cand = additive ? o.xy + imageLoad(mv_out, q).xy : o.xy;
         }
         const float e = PatchCost(c, cand, size);
         if (e < best) { best = e; bv = cand; }
     }
     const bool change = best < e0 * 0.85 - 0.002;
-    atomicAdd(st.s[12], 1u);
     if (change) atomicAdd(st.s[13], 1u);
     atomicAdd(st.s[14], uint(clamp(e0, 0.0, 4.0) * 1024.0));
     atomicAdd(st.s[15], uint(clamp(change ? best : e0, 0.0, 4.0) * 1024.0));
@@ -83,6 +85,9 @@ void main() {
     const bool inside = c.x < int(p.size.x) && c.y < int(p.size.y);
     const uint flags = p.size.w;
     const bool additive = (flags & 2u) != 0u;
+    // bb-native-mv2 (flags bit 5): skinned draws are class 4 and the player mask is them in the
+    // centre (else: moving opaque pixels in the centre whose vector differs from the camera's).
+    const bool characters = (flags & 32u) != 0u;
     if ((flags & 1u) == 0u) {
         // Normal frame: replace the camera vector on object pixels, nothing else.
         if (!inside || p.size.z == 0u) return;
@@ -95,10 +100,13 @@ void main() {
                 if (additive) v += camv;
                 // Only what moves against the world (the player, not the tree behind it: static
                 // scenery in the centre took refined vectors and deformed).
-                if ((flags & 16u) != 0u && o.z < 1.5 && PlayerPixel(c, vec2(p.size.xy)) &&
-                    length(v - camv) > 0.75) {
+                const bool candidate =
+                    PlayerPixel(c, vec2(p.size.xy)) &&
+                    (characters ? o.z > 3.5 : (o.z < 1.5 && length(v - camv) > 0.75));
+                if (candidate && (characters || (flags & 16u) != 0u)) {
                     player = true;
-                    v = Refine(c, v, additive);
+                    atomicAdd(st.s[12], 1u);
+                    if ((flags & 16u) != 0u) v = Refine(c, v, additive);
                 }
                 imageStore(mv_out, c, vec4(v, 0.0, 0.0));
             }
@@ -129,7 +137,7 @@ void main() {
             atomicAdd(g_sz, uint(min(length(o.xy), 64.0) * 16.0));
         } else if (finite && ((o.z > 0.5 && o.z < 1.5) || o.z > 2.5)) {
             const vec2 ov = additive ? o.xy + cam : o.xy;
-            if (o.z > 2.5) atomicAdd(g_blend, 1u);
+            if (o.z > 2.5 && o.z < 3.5) atomicAdd(g_blend, 1u);
             atomicAdd(g_obj, 1u);
             if ((flags & 8u) != 0u && length(ov - cam) > 1.0) {
                 const vec2 size = vec2(p.size.xy);
@@ -148,8 +156,10 @@ void main() {
             }
         }
         if ((flags & 4u) != 0u) {
-            const bool pl = finite && o.z > 0.5 && o.z < 1.5 && PlayerPixel(c, vec2(p.size.xy)) &&
-                            length((additive ? o.xy + cam : o.xy) - cam) > 0.75;
+            const bool pl = finite && PlayerPixel(c, vec2(p.size.xy)) &&
+                            (characters ? o.z > 3.5
+                                        : (o.z > 0.5 && o.z < 1.5 &&
+                                           length((additive ? o.xy + cam : o.xy) - cam) > 0.75));
             imageStore(next_prev_color, c, vec4(texelFetch(cur_color, c, 0).rgb, pl ? 1.0 : 0.0));
         }
     }
