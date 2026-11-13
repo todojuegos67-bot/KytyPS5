@@ -1198,6 +1198,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// dropped textures' guest bytes from RAM while playing and gave black textures.
 	env.Default("KYTY_TEXTURE_OFFLOAD", "0");
 	env.Default("KYTY_GPU_ONLY_OFFLOAD", "0");
+	// (11-13) PCs of 20 GB or less: the image upload ring (host-visible memory the driver charges to commit) 128 MiB
+	// instead of 256, set at creation; per-frame uploads are 6-30 MB. Nothing moved at runtime.
+	if (pc.ram_gb > 0 && pc.ram_gb <= 20) env.Default("KYTY_STAGING_RING_MB", "128");
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");
