@@ -229,10 +229,15 @@ struct AddressSpace::Impl {
         BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
                        EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
-        // Allocate backing file that represents the total physical memory.
+        // Allocate backing file that represents the total physical memory. Its pages are
+        // committed when guest memory is first mapped (BB_COMMIT_UPFRONT=1: all of it now).
+        commit_on_map = std::getenv("BB_COMMIT_UPFRONT") == nullptr;
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
-                                            PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
+                                            PAGE_EXECUTE_READWRITE,
+                                            commit_on_map ? SEC_RESERVE : SEC_COMMIT, BackingSize,
                                             nullptr, nullptr, 0);
+        LOG_INFO(Core, "Guest physical memory: {} MiB, committed {}", BackingSize >> 20,
+                 commit_on_map ? "when mapped" : "upfront");
 
         ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
         // Allocate a virtual memory for the backing file map as placeholder
@@ -241,7 +246,7 @@ struct AddressSpace::Impl {
                                                       PAGE_NOACCESS, nullptr, 0));
         ASSERT_MSG(backing_base, "{}", Common::GetLastErrorMsg());
 
-        // Map backing placeholder. This will commit the pages
+        // Map backing placeholder.
         void* const ret =
             MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
                            MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0);
@@ -278,6 +283,12 @@ struct AddressSpace::Impl {
         void* ptr = nullptr;
         if (phys_addr != -1) {
             HANDLE backing = fd != -1 ? reinterpret_cast<HANDLE>(fd) : backing_handle;
+            if (fd == -1 && commit_on_map) {
+                const void* committed = VirtualAlloc(backing_base + phys_addr, size, MEM_COMMIT,
+                                                     PAGE_EXECUTE_READWRITE);
+                ASSERT_MSG(committed, "Committing guest memory {:#x}+{:#x} failed: {}", phys_addr,
+                           size, Common::GetLastErrorMsg());
+            }
             if (fd != -1 && prot == PAGE_READONLY) {
                 // Allocate the memory for the mapping
                 DWORD resultvar;
@@ -650,6 +661,7 @@ struct AddressSpace::Impl {
     HANDLE process{};
     HANDLE backing_handle{};
     u8* backing_base{};
+    bool commit_on_map{};
     u8* virtual_base{};
     u8* system_managed_base{};
     u64 system_managed_size{};
