@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "local-platform.h"
 #include "time-census.h"
 
 #include "common/assert.h"
@@ -886,8 +887,9 @@ static void ArmGuestStackGuard(uint64_t guard_addr, size_t guard_size) {
 
 // Maps stack_size bytes of guest stack above a guard of guard_size that faults (both rounded up to
 // whole stack pages), reusing a released stack of the same shape. Returns the start of the
-// mapping (the guard), 0 when the stack area is exhausted.
-static uint64_t MapGuestStackWithGuard(size_t stack_size, size_t guard_size) {
+// mapping (the guard), 0 when the stack area is exhausted. *fresh (when given): the mapping is new
+// memory, not a released stack reused.
+static uint64_t MapGuestStackWithGuard(size_t stack_size, size_t guard_size, bool* fresh = nullptr) {
 	stack_size          = RoundStackSize(stack_size);
 	guard_size          = RoundStackSize(guard_size);
 	const auto map_size = stack_size + guard_size;
@@ -924,6 +926,10 @@ static uint64_t MapGuestStackWithGuard(size_t stack_size, size_t guard_size) {
 		if (stack_addr == 0) {
 			return 0;
 		}
+		LocalPlatform::NoteGuestStack(map_size);
+	}
+	if (fresh != nullptr) {
+		*fresh = !cached;
 	}
 
 	if (guard_size != 0 &&
@@ -957,7 +963,8 @@ static int CreateGuestStack(PthreadAttr attr) {
 
 	const auto stack_size = RoundStackSize(attr->stack_size);
 	const auto guard_size = RoundStackSize(attr->guard_size);
-	const auto stack_addr = MapGuestStackWithGuard(stack_size, guard_size);
+	bool       fresh      = false;
+	const auto stack_addr = MapGuestStackWithGuard(stack_size, guard_size, &fresh);
 	if (stack_addr == 0) {
 		return KERNEL_ERROR_EAGAIN;
 	}
@@ -968,7 +975,22 @@ static int CreateGuestStack(PthreadAttr attr) {
 	attr->stack_map_addr = stack_addr;
 	attr->stack_map_size = stack_size + guard_size;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// A new stack is zero already, and left untouched: AllocateGuestStackMemory commits it with VirtualAlloc2
+	// (MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, GuestAddressSpace::Commit) over a free placeholder, new
+	// private pages the system zero-fills at their first touch, and nothing writes them before this (the guard below
+	// the stack is only protected). Zeroing it made the whole stack resident at once (game size plus
+	// PTHREAD_STACK_EXTRA, every guest thread) where a thread touches its top. A reused stack (the cache of released
+	// ones) holds its last thread's data: zeroed as before. (Elsewhere a stack may land on memory used before: zeroed.)
+	if (fresh) {
+		LocalPlatform::NoteGuestStackNotZeroed(stack_size);
+	} else {
+		std::memset(attr->stack_addr, 0, stack_size);
+	}
+#else
+	(void)fresh;
 	std::memset(attr->stack_addr, 0, stack_size);
+#endif
 
 	return OK;
 }

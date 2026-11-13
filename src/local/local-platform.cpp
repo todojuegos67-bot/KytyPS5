@@ -2,6 +2,7 @@
 #include "guest-lazy-commit.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -2749,6 +2750,127 @@ size_t ReadableBytes(const void* address, size_t size) noexcept {
 #else
 	return size;
 #endif
+}
+
+static std::atomic<uint64_t> g_guest_stack_bytes {0};     // committed by the guest stacks (never released: reused)
+static std::atomic<uint64_t> g_guest_stack_untouched {0}; // of the stacks' bytes, left as the system gave them
+static std::atomic<uint32_t> g_guest_stacks {0};
+
+void NoteGuestStack(uint64_t bytes) {
+	g_guest_stack_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	g_guest_stacks.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteGuestStackNotZeroed(uint64_t bytes) {
+	g_guest_stack_untouched.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+#if defined(_WIN32)
+// The committed bytes of a thread's host stack: its reservation's committed regions (the TEB's DeallocationStack, the
+// reservation's base, at 0x1478: the stack range at 0x08/0x10 is the guest stack area's while a guest thread runs, and
+// this one is not). Read with ReadProcessMemory and VirtualQuery: a thread that ends meanwhile gives 0, no fault.
+static uint64_t HostStackCommitted(HANDLE thread) {
+	struct BasicInformation {
+		LONG      exit_status;
+		PVOID     teb;
+		HANDLE    process_id, thread_id;
+		ULONG_PTR affinity;
+		LONG      priority, base_priority;
+	};
+	using QueryThread       = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+	static const auto query = reinterpret_cast<QueryThread>(
+	    reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+	if (query == nullptr) return 0;
+	BasicInformation basic {};
+	if (query(thread, 0 /* ThreadBasicInformation */, &basic, sizeof(basic), nullptr) < 0 || basic.teb == nullptr) return 0;
+	void*  base = nullptr;
+	SIZE_T read = 0;
+	if (ReadProcessMemory(GetCurrentProcess(), static_cast<const uint8_t*>(basic.teb) + 0x1478, &base, sizeof(base), &read) == 0 ||
+	    read != sizeof(base) || base == nullptr)
+		return 0;
+	uint64_t                 committed = 0;
+	const auto*              at        = static_cast<const uint8_t*>(base);
+	MEMORY_BASIC_INFORMATION info {};
+	for (int regions = 0; regions < 64 && VirtualQuery(at, &info, sizeof(info)) == sizeof(info) && info.AllocationBase == base;
+	     ++regions) {
+		if (info.State == MEM_COMMIT) committed += info.RegionSize;
+		at = static_cast<const uint8_t*>(info.BaseAddress) + info.RegionSize;
+	}
+	return committed;
+}
+
+// The executable's static TLS block: what the loader allocates (from the process heap) and fills for every thread
+// at its start.
+static uint64_t ExecutableTlsBytes() {
+	const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+	if (base == nullptr) return 0;
+	const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+	const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+	if (dir.VirtualAddress == 0 || dir.Size < sizeof(IMAGE_TLS_DIRECTORY64)) return 0;
+	const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(base + dir.VirtualAddress);
+	return tls->EndAddressOfRawData - tls->StartAddressOfRawData + tls->SizeOfZeroFill;
+}
+#endif
+
+void PrintThreadSummary(const char* when) {
+	constexpr double Mib          = 1024.0 * 1024.0;
+	const double     guest_mib    = static_cast<double>(g_guest_stack_bytes.load(std::memory_order_relaxed)) / Mib;
+	const double     untouched    = static_cast<double>(g_guest_stack_untouched.load(std::memory_order_relaxed)) / Mib;
+	const uint32_t   guest_stacks = g_guest_stacks.load(std::memory_order_relaxed);
+#if defined(_WIN32)
+	uint32_t                        threads = 0;
+	uint64_t                        stacks = 0, largest = 0;
+	std::string                     largest_name;
+	std::map<std::string, uint32_t> names;
+	const DWORD                     process  = GetCurrentProcessId();
+	HANDLE                          snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot != INVALID_HANDLE_VALUE) {
+		THREADENTRY32 entry {};
+		entry.dwSize = sizeof(entry);
+		for (BOOL more = Thread32First(snapshot, &entry); more != 0; more = Thread32Next(snapshot, &entry)) {
+			if (entry.th32OwnerProcessID != process) continue;
+			threads++;
+			HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+			if (thread == nullptr) continue;
+			std::string name;
+			PWSTR       description = nullptr;
+			if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+				for (const wchar_t* c = description; *c != L'\0'; ++c) name.push_back(*c < 128 ? static_cast<char>(*c) : '?');
+				LocalFree(description);
+			}
+			if (name.empty()) name = "(no name)";
+			const uint64_t committed = HostStackCommitted(thread);
+			CloseHandle(thread);
+			stacks += committed;
+			if (committed > largest) {
+				largest      = committed;
+				largest_name = name;
+			}
+			names[name]++;
+		}
+		CloseHandle(snapshot);
+	}
+	std::vector<std::pair<uint32_t, std::string>> most;
+	most.reserve(names.size());
+	for (const auto& [name, count]: names) most.emplace_back(count, name);
+	std::sort(most.begin(), most.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+	std::string listed;
+	for (size_t i = 0; i < most.size() && i < 10; ++i) {
+		if (!listed.empty()) listed += ", ";
+		listed += most[i].second + " x" + std::to_string(most[i].first);
+	}
+	const uint64_t tls = ExecutableTlsBytes();
+	std::printf("Threads (%s): %u in the process; host stacks %.1f MiB committed (largest %.2f MiB, %s); the emulator's "
+	            "static TLS %.1f KiB a thread (%.1f MiB in all); guest stacks %u, %.1f MiB committed (%.1f MiB of it new and "
+	            "left untouched instead of zeroed); most: %s\n",
+	            when, threads, static_cast<double>(stacks) / Mib, static_cast<double>(largest) / Mib,
+	            largest_name.empty() ? "-" : largest_name.c_str(), static_cast<double>(tls) / 1024.0,
+	            static_cast<double>(tls * threads) / Mib, guest_stacks, guest_mib, untouched, listed.c_str());
+#else
+	std::printf("Threads (%s): guest stacks %u, %.1f MiB committed (%.1f MiB of it new and left untouched)\n", when,
+	            guest_stacks, guest_mib, untouched);
+#endif
+	std::fflush(stdout);
 }
 } // namespace LocalPlatform
 

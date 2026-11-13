@@ -10,6 +10,7 @@
 // of the CX/SH/UC spaces). Graphics user-data SGPRs (PS 0x0c-0x2b, GS 0x8c-0xab,
 // HS 0x10c-0x12b) and the compute space (0x200+) never dirty it; dispatches,
 // synchronisation, index state and indirect bases never do either.
+#include "common/threads.h"
 #include "graphics/guest_gpu/pm4.h"
 
 #include <array>
@@ -32,7 +33,11 @@ struct Shadow {
 	bool dirty      = true;  // graphics state changed since that draw
 	bool last_clean = false; // the latest DRAW_INDEX_INDIRECT was clean
 };
-inline thread_local Shadow g_shadow;
+// The thread's shadow (the GPU threads'), on the heap: as a thread_local it was 142 KiB of the static TLS block every
+// thread of the process gets at its start (~150 host threads, the driver's and the system's among them).
+inline Shadow& ThreadShadow() {
+	return Common::ThreadHeap<Shadow>::Get();
+}
 
 [[nodiscard]] inline bool ShFree(uint32_t offset) {
 	return (offset >= 0x0cu && offset <= 0x2bu) || (offset >= 0x8cu && offset <= 0xabu) ||
@@ -41,7 +46,7 @@ inline thread_local Shadow g_shadow;
 
 // space: 0 CX, 1 SH, 2 UC.
 inline void WriteRegister(uint32_t space, uint32_t raw_offset, uint32_t value) {
-	auto&      s      = g_shadow;
+	auto&      s      = ThreadShadow();
 	const auto offset = raw_offset & 0xffffu;
 	const auto update = [&](auto& values) {
 		if (offset >= values.size()) {
@@ -80,7 +85,7 @@ inline void WriteIndirectBlock(uint32_t space, const uint32_t* packet) {
 // The registers changed in bulk (context clear/push/pop, a register reset): nothing the
 // shadow holds is known any more.
 inline void Invalidate() {
-	auto& s = g_shadow;
+	auto& s = ThreadShadow();
 	s.generation += uint64_t {1} << 32u;
 	if (s.generation == 0) { // (wrapped: an entry of the first generation would be taken as known again)
 		s.cx.fill(0);
@@ -95,7 +100,7 @@ inline void Invalidate() {
 
 // Every packet the command processor is about to execute.
 inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw, bool predicated_skip) {
-	auto& s = g_shadow;
+	auto& s = ThreadShadow();
 	if (predicated_skip) {
 		s.dirty       = true;
 		s.key_changes = 7;

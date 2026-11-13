@@ -910,7 +910,7 @@ uint64_t RenderExecutor::NativeXprStateKey(CommandBuffer& buffer) const {
 		uint64_t    ctx_hash = 0, cfg_hash = 0;
 	};
 	thread_local Held held;
-	auto&      shadow  = DrawStateObserver::g_shadow;
+	auto&      shadow  = DrawStateObserver::ThreadShadow();
 	const auto changes = std::exchange(shadow.key_changes, 0u);
 	const auto mode    = kyty_local_state_key_cache.load(std::memory_order_relaxed);
 	if (mode == 0) held = {};

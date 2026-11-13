@@ -54,6 +54,15 @@ double NamedThreadsCpuSeconds(const char* name);
 // The process's threads: (thread id, name; empty when it has none). Windows only (Linux: none).
 std::vector<std::pair<uint32_t, std::string>> ProcessThreads();
 
+// Guest stacks (kernel/pthread.cpp): a new one of `bytes` mapped (committed, guard included), and the bytes of a new
+// one left as the system gave them (zero, not touched) instead of zeroed.
+void NoteGuestStack(uint64_t bytes);
+void NoteGuestStackNotZeroed(uint64_t bytes);
+// One printf line: the process's threads, their host stacks' committed MiB, the emulator's static TLS block (which
+// every thread gets a copy of), the guest stacks, and the most numerous thread names. Windows: measured (Linux: the
+// guest stacks only). `when`: the moment, for the line ("start", ...).
+void PrintThreadSummary(const char* when);
+
 // A read-only host file kept open for the process (opened once a path, never closed) and its size, for positional
 // reads from any thread (ReadOpenFileAt). 0: it cannot be opened, or (Linux) none are kept: open it for each read.
 uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size);
