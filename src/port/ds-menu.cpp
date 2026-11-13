@@ -3235,12 +3235,7 @@ void SetBigPagefile() {
 	// 16-100 GB and shows the result in its window (so a failure is visible, not silent).
 	static const char* script =
 	    "@echo off\r\n"
-	    "net session >nul 2>&1\r\n"
-	    "if errorlevel 1 (\r\n"
-	    "  set \"KYTYPF=%~f0\"\r\n"
-	    "  powershell -NoProfile -Command \"Start-Process -FilePath $env:KYTYPF -Verb RunAs\"\r\n"
-	    "  exit /b\r\n"
-	    ")\r\n"
+
 	    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$c=Get-CimInstance Win32_ComputerSystem; "
 	    "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false}; "
 	    "$p=Get-CimInstance Win32_PageFileSetting | Where-Object {$_.Name -like 'C:*'}; "
@@ -3256,7 +3251,9 @@ void SetBigPagefile() {
 	if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
 		std::fwrite(script, 1, std::strlen(script), f);
 		std::fclose(f);
-		ShellExecuteA(nullptr, "open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+		// "runas": Windows asks for administrator permission (UAC) and runs the script elevated.
+		const std::string args = "/c \"" + path + "\"";
+		ShellExecuteA(nullptr, "runas", "cmd.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
 	}
 #endif
 }
