@@ -65,22 +65,27 @@ inline Exchange& Get() {
 	return Get().requested.load(std::memory_order_acquire);
 }
 
-// The GPU thread: the request's vector (empty, reserved by the measurement) in `out`, and its number.
+// The GPU thread: the request's vector (empty, reserved by the measurement) in `out`, and its number; 0 (nothing taken,
+// the request left open for the next flip) when the measurement's thread holds the mutex: the GPU thread never waits on
+// it (a low-priority holder descheduled under load could otherwise stall a flip).
 inline uint64_t Take(std::vector<Range>* out) {
-	auto&           exchange = Get();
-	std::lock_guard lock(exchange.mutex);
+	auto&                        exchange = Get();
+	std::unique_lock<std::mutex> lock(exchange.mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return 0;
 	out->swap(exchange.ranges);
 	out->clear();
 	exchange.requested.store(false, std::memory_order_relaxed);
 	return exchange.request;
 }
 
-// The GPU thread: the ranges copied for request `request`.
+// The GPU thread: the ranges copied for request `request` (dropped, never waited for, when the mutex is held: that pass
+// then goes unmeasured).
 inline void Deliver(uint64_t request, std::vector<Range>&& ranges, uint64_t images, uint64_t buffers, double copy_ms) {
 	auto& exchange = Get();
 	{
-		std::lock_guard lock(exchange.mutex);
-		exchange.ranges  = std::move(ranges);
+		std::unique_lock<std::mutex> lock(exchange.mutex, std::try_to_lock);
+		if (!lock.owns_lock()) return;
+		exchange.ranges.swap(ranges); // (the previous contents freed by the caller, outside the lock)
 		exchange.answer  = request;
 		exchange.images  = images;
 		exchange.buffers = buffers;

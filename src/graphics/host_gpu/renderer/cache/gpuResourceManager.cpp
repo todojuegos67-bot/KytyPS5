@@ -534,12 +534,14 @@ void GpuResourceManager::AdvanceFrame() {
 	if (GpuResidency::Requested()) {
 		const auto                       start = std::chrono::steady_clock::now();
 		std::vector<GpuResidency::Range> ranges;
-		const uint64_t                   request = GpuResidency::Take(&ranges);
-		uint64_t                         images = 0, buffers = 0;
-		m_texture_cache.CollectResidencyRanges(ranges, images);
-		m_buffer_cache.CollectResidencyRanges(ranges, buffers);
-		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-		GpuResidency::Deliver(request, std::move(ranges), images, buffers, ms);
+		// (0: the measurement's thread holds the exchange's mutex; never waited for, tried again at the next flip.)
+		if (const uint64_t request = GpuResidency::Take(&ranges); request != 0) {
+			uint64_t images = 0, buffers = 0;
+			m_texture_cache.CollectResidencyRanges(ranges, images);
+			m_buffer_cache.CollectResidencyRanges(ranges, buffers);
+			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+			GpuResidency::Deliver(request, std::move(ranges), images, buffers, ms);
+		}
 	}
 	m_texture_cache.AdvanceFrame();
 	RunCollectors();

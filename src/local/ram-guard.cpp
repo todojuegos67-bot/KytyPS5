@@ -917,7 +917,9 @@ bool MakeSamples(const std::vector<Range>& ranges, uint64_t pass, std::vector<Sa
 
 // The working-set state of each sample's two pages (K32QueryWorkingSetEx, in batches); false when it failed.
 bool QuerySamples(std::vector<Sample>* samples) {
-	constexpr size_t                               Batch = 4096; // samples a call (two entries each)
+	// (Samples a call, two entries each: a short call, then the CPU yielded, so the kernel's walk of the working set
+	// never holds it long against the game's page faults.)
+	constexpr size_t                               Batch = 1024;
 	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries(Batch * 2);
 	HANDLE                                         process = GetCurrentProcess();
 	const auto*                                    fresh   = FreshMemory::Get();
@@ -930,6 +932,7 @@ bool QuerySamples(std::vector<Sample>* samples) {
 			entries[i * 2].VirtualAddress     = reinterpret_cast<PVOID>(sample.page);
 			entries[i * 2 + 1].VirtualAddress = reinterpret_cast<PVOID>(sample.alias != 0 ? sample.alias : sample.page);
 		}
+		if (begin != 0) SwitchToThread();
 		if (K32QueryWorkingSetEx(process, entries.data(), static_cast<DWORD>(count * 2 * sizeof(entries[0]))) == 0)
 			return false;
 		for (size_t i = 0; i < count; i++) {
@@ -956,15 +959,17 @@ void PrintGpuResidency(std::vector<Range>& ranges, uint64_t images, uint64_t buf
 	const auto          t0 = std::chrono::steady_clock::now();
 	std::vector<Sample> samples;
 	samples.reserve(std::min<size_t>(MaxSamples, 1u << 18u));
-	// (The backing lookups take the address space's shared lock: at normal priority, so the lock is not held by a
-	// descheduled low-priority thread while a map or unmap waits.)
+	// (The backing lookups take the address space's shared lock, and the working-set queries the kernel's working-set
+	// lock: at normal priority, so neither is held by a descheduled low-priority thread while a map, an unmap or a page
+	// fault waits.)
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
 	const bool complete = MakeSamples(ranges, pass, &samples);
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
 	ranges.clear();
 	ranges.shrink_to_fit();
 	const double lookup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-	if (!QuerySamples(&samples)) {
+	const bool   queried   = QuerySamples(&samples);
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	if (!queried) {
 		std::printf("GPU residency (30 s): K32QueryWorkingSetEx failed (0x%08x)\n", static_cast<unsigned>(GetLastError()));
 		std::fflush(stdout);
 		return;
@@ -1022,19 +1027,22 @@ void Watch() {
 		std::this_thread::sleep_for(std::chrono::seconds(30));
 		std::vector<Range> ranges;
 		ranges.reserve(size_t {1} << 16u); // (here, not on the GPU thread)
-		uint64_t images = 0, buffers = 0;
-		double   copy_ms = 0.0;
+		std::vector<Range> stale;            // (a late answer to a pass not measured: freed outside the lock)
+		uint64_t           images = 0, buffers = 0;
+		double             copy_ms = 0.0;
 		{
+			// (Held only for these swaps and the wait's checks: the GPU thread only tries it, never waits.)
 			std::unique_lock lock(exchange.mutex);
+			stale.swap(exchange.ranges);
 			exchange.ranges.swap(ranges);
-			exchange.ranges.clear();
 			exchange.request = pass;
 			exchange.requested.store(true, std::memory_order_release);
-			// (No flip in 10 s - a loading screen held, the game paused in a debugger: this pass is not measured.)
+			// (No flip in 10 s - a loading screen held, the game paused in a debugger, or the answer dropped: this pass is
+			// not measured.)
 			if (!exchange.delivered.wait_for(lock, std::chrono::seconds(10), [&] { return exchange.answer == pass; })) {
 				exchange.requested.store(false, std::memory_order_relaxed);
 				lock.unlock();
-				std::printf("GPU residency (30 s): no flip in 10 s, not measured\n");
+				std::printf("GPU residency (30 s): no answer from the GPU thread in 10 s, not measured\n");
 				std::fflush(stdout);
 				continue;
 			}
