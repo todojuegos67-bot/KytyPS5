@@ -3231,17 +3231,43 @@ bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* fon
 // un PC con poca RAM llegue al limite de memoria comprometida (un PC de 16 GB se reinicio ahi). Hace falta reiniciar.
 void SetBigPagefile() {
 #if defined(_WIN32)
-	static const char* args =
-	    "-NoProfile -ExecutionPolicy Bypass -Command \""
-	    "$c=Get-CimInstance Win32_ComputerSystem; "
+	// The same script as Archivo-paginacion-100GB.cmd: it raises itself to administrator, sets C:'s page file to
+	// 16-100 GB and shows the result in its window (so a failure is visible, not silent).
+	static const char* script =
+	    "@echo off\r\n"
+	    "net session >nul 2>&1\r\n"
+	    "if errorlevel 1 (\r\n"
+	    "  powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\"\r\n"
+	    "  exit /b\r\n"
+	    ")\r\n"
+	    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$c=Get-CimInstance Win32_ComputerSystem; "
 	    "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false}; "
 	    "$p=Get-CimInstance Win32_PageFileSetting | Where-Object {$_.Name -like 'C:*'}; "
 	    "if(-not $p){$p=New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name='C:\\pagefile.sys'}}; "
-	    "Set-CimInstance -InputObject $p -Property @{InitialSize=[uint32]16384;MaximumSize=[uint32]102400}; "
-	    "Write-Host 'Listo: archivo de paginacion de 16 a 100 GB en C:. Reinicia el PC para aplicarlo.'; "
-	    "Read-Host 'Pulsa Enter para cerrar'\"";
-	ShellExecuteA(nullptr, "runas", "powershell.exe", args, nullptr, SW_SHOWNORMAL);
+	    "$p | Set-CimInstance -Property @{InitialSize=[uint32]16384;MaximumSize=[uint32]102400}; "
+	    "Get-CimInstance Win32_PageFileSetting | Format-Table Name,InitialSize,MaximumSize\"\r\n"
+	    "echo.\r\n"
+	    "echo Si arriba sale C:\\pagefile.sys 16384 102400 esta hecho. Reinicia el PC para aplicarlo.\r\n"
+	    "pause\r\n";
+	char dir[MAX_PATH] = {};
+	if (GetTempPathA(MAX_PATH, dir) == 0) return;
+	const std::string path = std::string(dir) + "kyty-pagefile-100gb.cmd";
+	if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+		std::fwrite(script, 1, std::strlen(script), f);
+		std::fclose(f);
+		ShellExecuteA(nullptr, "open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+	}
 #endif
+}
+
+// The system commit limit (RAM + page file) in GB, 0 when unknown: shown under the page file button.
+static uint64_t CommitLimitGb() {
+#if defined(_WIN32)
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	if (GlobalMemoryStatusEx(&status) != 0) return status.ullTotalPageFile >> 30u;
+#endif
+	return 0;
 }
 
 void OpenUrl(const char* url) {
@@ -3593,6 +3619,14 @@ void LauncherPerformance(Settings& s) {
 		            "Pone en el disco C: un archivo de paginación de 16 a 100 GB (Windows pedirá permiso de administrador). Evita que el PC se reinicie al quedarse sin memoria en equipos con poca RAM. Solo ocupa espacio cuando hace falta. Reinicia el PC después."))
 			SetBigPagefile();
 		RowEnd(y, 36);
+		const uint64_t limit = CommitLimitGb();
+		if (limit != 0) {
+			const float ny = RowY();
+			ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), ny});
+			ImGui::TextColored(limit >= 64 ? kGoldL : kGold, "Memoria total de Windows (RAM + paginación): %llu GB%s",
+			                   static_cast<unsigned long long>(limit), limit >= 64 ? "" : "  -  pulsa el botón y reinicia");
+			RowEnd(ny, 24);
+		}
 	}
 	s.profile16 = LowRam(s, g_rt.pc);
 	{
