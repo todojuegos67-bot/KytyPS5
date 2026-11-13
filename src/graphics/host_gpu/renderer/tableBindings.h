@@ -35,13 +35,44 @@ struct Entry {
 	std::vector<ShaderRecompiler::IR::DescriptorValue> images;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> samplers;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> buffers;
+	uint64_t                                           hash = 0;
+	// The bindings the normal path made from them (copied into the stage's slot on a match).
+	PreparedBindings prepared;
 };
 
+// Entries by a hash of the program and descriptors: a slot's draws alternate between programs,
+// so the slot's last draw alone matched too few ("key" misses).
+constexpr uint32_t Entries = 4096;
+
+[[nodiscard]] inline uint64_t KeyHash(const void* program, bool normalize,
+                                      const ShaderRecompiler::IR::ResourceSnapshot& snapshot);
+
 struct Table {
-	std::array<Entry, Slots> slots {};
+	std::vector<Entry>               entries = std::vector<Entry>(Entries);
+	// The entry each slot's bindings came from (null: none, or not kept).
+	std::array<Entry*, Slots>        current {};
 	// KYTY_TABLE=2: the slot's bindings before the normal path prepared them again.
 	std::array<std::optional<PreparedBindings>, Slots> verify {};
 };
+
+inline uint64_t KeyHash(const void* program, bool normalize,
+                        const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	const auto mix = [](uint64_t h, const void* data, size_t size) {
+		const auto* bytes = static_cast<const uint8_t*>(data);
+		for (size_t i = 0; i < size; i++) {
+			h = (h ^ bytes[i]) * 0x100000001b3ull;
+		}
+		return h;
+	};
+	uint64_t h = reinterpret_cast<uint64_t>(program) * 0x9e3779b97f4a7c15ull ^ (normalize ? 1u : 0u);
+	for (const auto* list: {&snapshot.images, &snapshot.samplers, &snapshot.buffers}) {
+		for (const auto& value: *list) {
+			h = mix(h, value.dwords.data(), value.dword_count * sizeof(uint32_t));
+		}
+		h = mix(h, "|", 1);
+	}
+	return h;
+}
 
 } // namespace Libs::Graphics::TableBindings
 

@@ -328,7 +328,7 @@ private:
 	                                      const ShaderStageRuntime& runtime, bool normalize);
 	// Whether they may be used again now; with `replay`, binds their images as PrepareBindings
 	// would.
-	[[nodiscard]] bool TableBindingsReuse(PreparedBindings& prepared, bool replay);
+	[[nodiscard]] bool TableBindingsReuse(PreparedBindings& prepared, bool replay, uint32_t slot);
 	// A reused stage's per-draw uploads (user data words, flattened SRT, shader data).
 	void TableBindingsUpload(PreparedBindings& prepared);
 	// After the normal path: keep (or drop) the slot's entry; `verify`: compare with the copy.

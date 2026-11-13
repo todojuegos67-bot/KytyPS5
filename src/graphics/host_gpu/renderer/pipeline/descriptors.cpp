@@ -4037,17 +4037,19 @@ bool RenderExecutor::TableBindingsMatch(PreparedBindings& prepared,
 	if (!m_binding_table) {
 		m_binding_table = std::make_shared<TableBindings::Table>();
 	}
-	const auto slot  = TableBindingsSlot(prepared);
-	auto&      entry = m_binding_table->slots[slot];
+	const auto slot = TableBindingsSlot(prepared);
 	m_binding_table->verify[slot].reset();
+	m_binding_table->current[slot] = nullptr;
 	if (!TableMode::ProgramHitFlag()) {
 		TableMode::Add(TableMode::Counter::BindingMisses);
 		TableMode::Add(TableMode::Counter::BindingMissProgram);
 		return false;
 	}
 	const auto& snapshot = *runtime.resources;
-	if (!entry.valid || entry.program != runtime.program || entry.normalize != normalize ||
-	    prepared.runtime == nullptr || entry.images != snapshot.images ||
+	const auto  hash     = TableBindings::KeyHash(runtime.program, normalize, snapshot);
+	auto& entry = m_binding_table->entries[hash & (TableBindings::Entries - 1u)];
+	if (!entry.valid || entry.hash != hash || entry.program != runtime.program ||
+	    entry.normalize != normalize || entry.images != snapshot.images ||
 	    entry.samplers != snapshot.samplers || entry.buffers != snapshot.buffers ||
 	    !snapshot.bindless_heaps.empty() || !snapshot.bindless_sampler_heaps.empty() ||
 	    !TableBindingsAllowed(*runtime.program)) {
@@ -4055,12 +4057,18 @@ bool RenderExecutor::TableBindingsMatch(PreparedBindings& prepared,
 		TableMode::Add(TableMode::Counter::BindingMissKey);
 		return false;
 	}
+	m_binding_table->current[slot] = &entry;
+	if (!TableMode::Verifying()) {
+		// The entry's bindings into the slot (vectors keep their capacity).
+		prepared = entry.prepared;
+	}
 	if (TableMode::Verifying()) {
 		// The normal path prepares the stage; the bindings it would have reused are kept for
 		// TableBindingsStore to compare, when they pass the reuse checks now.
-		if (TableBindingsReuse(prepared, false)) {
+		PreparedBindings candidate = entry.prepared;
+		if (TableBindingsReuse(candidate, false, slot)) {
 			TableMode::Add(TableMode::Counter::BindingHits);
-			m_binding_table->verify[slot] = prepared;
+			m_binding_table->verify[slot] = std::move(candidate);
 		} else {
 			TableMode::Add(TableMode::Counter::BindingMisses);
 			TableMode::Add(TableMode::Counter::BindingMissStale);
@@ -4070,10 +4078,11 @@ bool RenderExecutor::TableBindingsMatch(PreparedBindings& prepared,
 	return true;
 }
 
-bool RenderExecutor::TableBindingsReuse(PreparedBindings& prepared, bool replay) {
-	const auto& entry   = m_binding_table->slots[TableBindingsSlot(prepared)];
+bool RenderExecutor::TableBindingsReuse(PreparedBindings& prepared, bool replay, uint32_t slot) {
+	const auto* entry   = m_binding_table->current[slot];
 	auto&       texture = m_context.GetTextureCache();
-	if (!entry.valid || entry.image_generation != texture.ImageSetGeneration()) {
+	if (entry == nullptr || !entry->valid ||
+	    entry->image_generation != texture.ImageSetGeneration()) {
 		return false;
 	}
 	for (const auto& binding: prepared.images) {
@@ -4222,9 +4231,12 @@ void RenderExecutor::TableBindingsStore(PreparedBindings& prepared, bool verify)
 	if (!m_binding_table) {
 		m_binding_table = std::make_shared<TableBindings::Table>();
 	}
-	const auto slot  = TableBindingsSlot(prepared);
-	auto&      entry = m_binding_table->slots[slot];
-	auto&      kept  = m_binding_table->verify[slot];
+	const auto slot = TableBindingsSlot(prepared);
+	auto&      kept = m_binding_table->verify[slot];
+	const auto& snapshot = *prepared.runtime->resources;
+	const auto  hash     = TableBindings::KeyHash(prepared.runtime->program,
+	                                              prepared.normalize_unnormalized, snapshot);
+	auto& entry = m_binding_table->entries[hash & (TableBindings::Entries - 1u)];
 	if (verify && kept) {
 		TableMode::Add(TableMode::Counter::BindingVerifyChecks);
 		if (const char* difference = TableBindingsDifference(*kept, prepared)) {
@@ -4249,12 +4261,15 @@ void RenderExecutor::TableBindingsStore(PreparedBindings& prepared, bool verify)
 		                              texture.MayReuseTextureBinding(binding.image_id));
 	                      });
 	if (!storable) {
-		entry.valid = false;
+		if (entry.hash == hash) {
+			entry.valid = false;
+		}
 		TableMode::Add(TableMode::Counter::BindingNotStored);
 		return;
 	}
-	const auto& snapshot = *prepared.runtime->resources;
 	entry.valid          = true;
+	entry.hash           = hash;
+	entry.prepared       = prepared;
 	entry.program        = prepared.runtime->program;
 	entry.normalize      = prepared.normalize_unnormalized;
 	entry.images         = snapshot.images;
@@ -4292,7 +4307,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	for (uint32_t i = 0; i < stages.size(); i++) {
 		auto* stage = stages[i];
 		if ((table_reused >> i) & 1u) {
-			if (TableBindingsReuse(*stage, true)) {
+			if (TableBindingsReuse(*stage, true, TableBindingsSlot(*stage))) {
 				TableMode::Add(TableMode::Counter::BindingHits);
 				continue;
 			}
@@ -4338,9 +4353,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		for (uint32_t i = 0; i < stages.size(); i++) {
 			if ((table_reused >> i) & 1u) {
 				// Kept: valid against the generations as the draw leaves them.
-				auto& entry = m_binding_table->slots[TableBindingsSlot(*stages[i])];
-				entry.image_generation  = cache.ImageSetGeneration();
-				entry.buffer_generation = m_context.GetBufferCache().BufferSetGeneration();
+				if (auto* entry = m_binding_table->current[TableBindingsSlot(*stages[i])]) {
+					entry->image_generation  = cache.ImageSetGeneration();
+					entry->buffer_generation = m_context.GetBufferCache().BufferSetGeneration();
+				}
 			} else {
 				TableBindingsStore(*stages[i], TableMode::Verifying());
 			}
