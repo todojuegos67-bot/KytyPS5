@@ -1214,6 +1214,11 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			env.Set(Trim(pair.substr(0, eq)), Trim(pair.substr(eq + 1)));
 		}
 	}
+	// (11-13) The fire and particle blending as before: with KYTY_FG_PARTICLE_MV=1 the native particle vectors always on
+	// (a run came up with KYTY_FG_PARTICLE_NATIVE=0 from outside the settings and ghosting around fire); only an explicit
+	// KYTY_FG_PARTICLE_NATIVE in [Avanzado] extra changes it.
+	if (env.Get("KYTY_FG_PARTICLE_MV") == "1" && s.extra.find("KYTY_FG_PARTICLE_NATIVE") == std::string::npos)
+		env.Set("KYTY_FG_PARTICLE_NATIVE", "1");
 	// (10-21) KYTY_DS_VARIABLE_STEP=1: the game's physics at each frame's real time (run-windows.ps1).
 	if (demons && env.Get("KYTY_DS_VARIABLE_STEP") == "1" && env.Get("KYTY_GAME_CONVARS").find("physicsUseFixedTimestep") == std::string::npos)
 		env.AppendConvars("physicsUseFixedTimestep=false;gameDeltaTimeCorrectionTolorance=0.01");
