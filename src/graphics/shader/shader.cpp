@@ -8,7 +8,6 @@
 #include "common/magicEnum.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
-#include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -110,8 +109,7 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 		uint64_t         addr = 0, generation = UINT64_MAX;
 		ShaderMappedData data {};
 	};
-	// (On the heap: ~56 KiB of every thread's static TLS block as a thread_local, Common::ThreadHeap.)
-	auto& recent = Common::ThreadHeap<std::array<std::array<Recent, 2>, 512>>::Get();
+	thread_local std::array<std::array<Recent, 2>, 512> recent {};
 	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
 	auto&      set        = recent[((addr >> 8u) * 0x9e3779b97f4a7c15ull) >> 55u];
 	if (set[0].addr == addr && set[0].generation == generation) return set[0].data;

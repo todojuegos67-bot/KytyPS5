@@ -407,7 +407,7 @@ public:
 
 private:
 	static void Changed() {
-		auto& shadow = DrawStateObserver::ThreadShadow();
+		auto& shadow = DrawStateObserver::g_shadow;
 		shadow.key_changes |= 1u;
 		shadow.dirty = true;
 	}
@@ -420,7 +420,7 @@ private:
 // For the length of one draw of an area (the GPU thread, around both of its ways): the viewport squeezed around the
 // area's side (the wide output's: moved to it), and with `scissor` the generic scissor around where the area then lies;
 // restored after it. The draw state the table and native ways keep is keyed by the registers: they hash them again
-// (DrawStateObserver::ThreadShadow()) both times.
+// (DrawStateObserver::g_shadow) both times.
 class Scope {
 public:
 	Scope(HW::Context& ctx, const HW::PixelShaderInfo& ps, uint32_t area, bool scissor) {
@@ -490,7 +490,7 @@ public:
 
 private:
 	static void Changed() {
-		auto& shadow = DrawStateObserver::ThreadShadow();
+		auto& shadow = DrawStateObserver::g_shadow;
 		shadow.key_changes |= 1u;
 		shadow.dirty = true;
 	}
@@ -553,7 +553,7 @@ public:
 
 private:
 	static void Changed() {
-		auto& shadow = DrawStateObserver::ThreadShadow();
+		auto& shadow = DrawStateObserver::g_shadow;
 		shadow.key_changes |= 1u;
 		shadow.dirty = true;
 	}

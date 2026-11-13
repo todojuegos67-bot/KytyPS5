@@ -1248,9 +1248,8 @@ public:
 				MapEntry                 entry;
 				bool                     unique;
 			};
-			// (This thread's, on the heap: 64 KiB of every thread's static TLS block as a thread_local, Common::ThreadHeap.)
-			auto&      owners = Common::ThreadHeap<std::array<Owner, 1024>>::Get();
-			auto&      owner  = owners[(vaddr >> 18u) % owners.size()];
+			thread_local std::array<Owner, 1024> owners {};
+			auto&      owner = owners[(vaddr >> 18u) % owners.size()];
 			const auto epoch = RegionEpoch(vaddr);
 			if (owner.store != this || owner.epoch != epoch || owner.alias_epoch != m_alias_epoch ||
 			    !GuestFreeRangeContains(owner.entry.vaddr, owner.entry.size, vaddr, size)) {
@@ -1616,8 +1615,7 @@ private:
 			const GuestBackingStore*               store = nullptr;
 			std::array<HostReadTranslation, 4096> entries {};
 		};
-		// (On the heap: 160 KiB of every thread's static TLS block as a thread_local, Common::ThreadHeap.)
-		auto& translations = Common::ThreadHeap<Translations>::Get();
+		thread_local Translations translations;
 		if (translations.store != this) {
 			translations.store = this;
 			translations.entries.fill({});

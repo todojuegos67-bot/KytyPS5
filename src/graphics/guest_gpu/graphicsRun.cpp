@@ -1529,7 +1529,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				m_renderer.GetRenderExecutor().NativeXprForgetState();
 			if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
 				const auto consumed =
-				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::ThreadShadow().last_clean);
+				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::g_shadow.last_clean);
 				if (consumed) {
 					m_draw_run_skip = 0;
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
@@ -1932,11 +1932,11 @@ uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) 
 	CheckBuffer();
 	const uint64_t element    = m_index_type_and_size == 0 ? 2 : 4;
 	const auto     index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
-	if (DrawStateObserver::ThreadShadow().last_clean &&
+	if (DrawStateObserver::g_shadow.last_clean &&
 	    executor.TableContinue(CurrentBuffer(), {commands.data(), count}, m_index_base_addr,
 	                           uint64_t {m_index_buffer_size} * element, index_type, nullptr))
 		return 10;
-	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::ThreadShadow().last_clean, {commands.data(), count},
+	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {commands.data(), count},
 	                           m_index_base_addr, uint64_t {m_index_buffer_size} * element, index_type))
 		return 0;
 	return 10;
@@ -1983,10 +1983,10 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 	CheckBuffer();
 	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, m_num_instances};
 	const auto index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
-	if (DrawStateObserver::ThreadShadow().last_clean &&
+	if (DrawStateObserver::g_shadow.last_clean &&
 	    executor.TableContinue(CurrentBuffer(), {}, index_address, uint64_t {index_count} * element, index_type, &draw))
 		return size;
-	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::ThreadShadow().last_clean, {}, index_address,
+	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {}, index_address,
 	                           uint64_t {index_count} * element,
 	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))
 		return 0;

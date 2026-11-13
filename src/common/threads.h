@@ -88,39 +88,6 @@ private:
 	std::unique_ptr<CondVarPrivate> m_cond_var;
 };
 
-// A thread's own T on the heap, made at the thread's first Get() and deleted when the thread exits: for a large
-// per-thread cache. A `thread_local T` is part of the static TLS block that the loader allocates and fills for every
-// thread of the process when it starts (the driver's and the system's threads too), whether the thread ever uses it
-// or not; this way the threads that never use it pay a pointer. Get() is a thread-local load and a test.
-template <typename T>
-class ThreadHeap {
-public:
-	static T& Get() {
-		if (T* value = t_value; value != nullptr) [[likely]] {
-			return *value;
-		}
-		return Make();
-	}
-
-private:
-	struct Owner {
-		T* value = nullptr;
-		~Owner() {
-			t_value = nullptr;
-			delete value;
-		}
-	};
-	static T& Make() {
-		thread_local Owner owner;
-		if (owner.value == nullptr) {
-			owner.value = new T();
-		}
-		t_value = owner.value;
-		return *owner.value;
-	}
-	static inline thread_local T* t_value = nullptr;
-};
-
 class LockGuard {
 public:
 	using mutex_type = Mutex;

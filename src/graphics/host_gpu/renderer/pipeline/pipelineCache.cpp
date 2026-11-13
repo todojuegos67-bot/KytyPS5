@@ -1218,14 +1218,9 @@ struct PipelineCache::ProgramCache {
 	// half of a core) slow them however low their priority. An 8-core laptop (16 CPUs) with 8 prefetch threads took
 	// 120+ s instead of 20 s to load 1-1 (start-up to the game 264-300 s; with 4: 107 s), and with a 16-thread warmup
 	// showed the intro after 74-100 s instead of 24 s (2 threads); half the CPUs at most (a 32-CPU desktop keeps 16).
-	// (ds-pc-port47) Every logical CPU of the PC (was CPUs - 12, at most half: 16 of 32). At most 8 (ew-2): each thread
-	// that translates keeps its own scratch while it lives (the decoded program, up to 8 MiB; the SPIR-V sections, up to
-	// 8 MiB each; the definitions' buckets), all of them at once during the start-up; 32 threads on a 32-CPU PC (16
-	// cores) translated the 20137 programs in 15 s, 8 should take about 2.5 times as long (not measured; the game takes
-	// over a program it meets first either way). KYTY_SHADER_PREFETCH_THREADS / KYTY_SHADER_WARMUP_BACKGROUND_THREADS:
-	// other counts.
+	// (ds-pc-port47) Every logical CPU of the PC (was CPUs - 12, at most half: 16 of 32).
 	static uint32_t SpareThreads() {
-		return std::clamp(LocalPlatform::AllCpus(), 1u, 8u);
+		return std::clamp(LocalPlatform::AllCpus(), 1u, 64u);
 	}
 
 	// A recorded record's place in the prefetch's order: the oldest and the newest alternately (0, n-1, 1, n-2, ...).
@@ -1267,7 +1262,6 @@ struct PipelineCache::ProgramCache {
 				                 p.spilled_plans.load(std::memory_order_relaxed),
 				                 p.spilled_plan_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_verify_failures.load(std::memory_order_relaxed));
-				LocalPlatform::PrintThreadSummary("shader prefetch done");
 			}
 		}
 	}
@@ -2478,12 +2472,9 @@ struct PipelineCache::PendingGraphicsPipeline {
 class PipelineCache::CompileWorkers {
 public:
 	// background: below-normal priority off the render CPUs, and jobs still queued at shutdown are dropped.
-	// name: the threads' (static storage; not "Kyty.": the stall dump samples these, live-control.h).
-	explicit CompileWorkers(uint32_t count, bool background = false, const char* name = "Pipeline.Compile")
-	    : m_background(background) {
+	explicit CompileWorkers(uint32_t count, bool background = false): m_background(background) {
 		for (uint32_t i = 0; i < count; i++)
-			m_threads.emplace_back([this, name] {
-				LocalPlatform::SetThreadName(name);
+			m_threads.emplace_back([this] {
 				if (m_background) LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
 				Run();
 			});
@@ -2536,41 +2527,26 @@ PipelineCache::CompileWorkers& PipelineCache::Workers() {
 		// Half the CPUs on a CPU of 24 threads or more (a quarter before): Boletaria brought ~850 variants of ~145 ms
 		// in 10 minutes on a 32-thread CPU, 173 native stores a slow frame waiting for them, while the background
 		// threads left most of the CPU idle. KYTY_COMPILE_WORKERS=<n> sets the count.
-		// At most 8 (ew-2): a thread the driver compiles on keeps what the compile took (its stack's committed pages, the
-		// driver's per-thread state) for the rest of the run; 16 on a 32-CPU PC.
 		const uint32_t cpus  = std::max(1u, std::thread::hardware_concurrency());
-		uint32_t       count = std::clamp(cpus >= 24 ? cpus / 2u : cpus / 4u, 2u, 8u);
+		uint32_t       count = std::max(2u, cpus >= 24 ? cpus / 2u : cpus / 4u);
 		if (const char* value = std::getenv("KYTY_COMPILE_WORKERS"); value != nullptr && *value != '\0')
 			count = static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 64));
-		m_compile_workers = std::make_unique<CompileWorkers>(count, true, "Pipeline.Compile");
+		m_compile_workers = std::make_unique<CompileWorkers>(count, true);
 	}
 	return *m_compile_workers;
 }
 
-// KYTY_<name>=<n> (1-64), or `count`.
-static uint32_t WorkerCount(const char* name, uint32_t count) {
-	if (const char* value = std::getenv(name); value != nullptr && *value != '\0')
-		return static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 64));
-	return count;
-}
-
 PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
 	if (m_table_workers == nullptr) {
-		// Half the CPUs, at most 8 (ew-2: 16 on a 32-CPU PC; they translate programs and the driver compiles on them, and
-		// each keeps that scratch for the rest of the run). Background threads: they take no time the game's threads want.
-		// KYTY_TABLE_WORKERS=<n> sets the count.
-		const uint32_t count = std::clamp(std::thread::hardware_concurrency() / 2u, 2u, 8u);
-		m_table_workers = std::make_unique<CompileWorkers>(WorkerCount("KYTY_TABLE_WORKERS", count), true, "Pipeline.Table");
+		// As many as the shader prefetch's (background threads: they take no time the game's threads want).
+		m_table_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 2u), true);
 	}
 	return *m_table_workers;
 }
 
 PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
 	if (m_optimize_workers == nullptr) {
-		// A quarter of the CPUs, at most 4 (ew-2: 8 on a 32-CPU PC; each keeps what the driver's optimizing compiles took).
-		// The unoptimized pipeline draws meanwhile. KYTY_OPTIMIZE_WORKERS=<n> sets the count.
-		const uint32_t count = std::clamp(std::thread::hardware_concurrency() / 4u, 2u, 4u);
-		m_optimize_workers = std::make_unique<CompileWorkers>(WorkerCount("KYTY_OPTIMIZE_WORKERS", count), true, "Pipeline.Optimize");
+		m_optimize_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 4u), true);
 	}
 	return *m_optimize_workers;
 }
@@ -2968,7 +2944,6 @@ void PipelineCache::ReportSession() {
 	std::printf("Pipeline hitches on the render thread (a frame waited >= %.0f ms for a pipeline made there): %u\n", SlowLog::HitchThreshold(),
 	            g_render_pipeline_hitches.load());
 	std::fflush(stdout);
-	LocalPlatform::PrintThreadSummary("session end");
 	if (m_played != nullptr) m_played->Report();
 	if (const auto kept = g_pipeline_evictions.kept.load(); kept != 0) {
 		PipelineCacheLog("Pipelines out of video memory while idle: {} evicted of {} that could be, {} made again ({:.0f} ms, at "

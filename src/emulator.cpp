@@ -201,7 +201,6 @@ void Run(const RunOptions& options) {
 	PrintSystemInfo();
 	LocalPlatform::ApplyGameCpus(); // (ds-pc-port47: before any worker thread starts)
 	LocalPlatform::AutoVcacheRenderCpus(); // (ds-perf-1031: before any worker thread starts)
-	LocalPlatform::PrintThreadSummary("start");
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
