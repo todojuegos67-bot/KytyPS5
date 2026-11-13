@@ -2064,6 +2064,36 @@ void KeepResident() {
 	});
 }
 static SIZE_T g_ws_min = 0, g_ws_max = 0; // the working set sizes the process started with
+static std::atomic<uint64_t> g_cap_max {0}, g_cap_min {0};
+static std::atomic<bool>     g_cap_ok {false};
+bool TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes) {
+	if (target_bytes == 0 || min_bytes >= target_bytes) return false;
+	g_cap_max.store(target_bytes, std::memory_order_relaxed);
+	g_cap_min.store(min_bytes, std::memory_order_relaxed);
+	const auto call = [] {
+		const auto maximum = static_cast<SIZE_T>(g_cap_max.load(std::memory_order_relaxed));
+		const auto  wanted   = static_cast<SIZE_T>(g_cap_min.load(std::memory_order_relaxed));
+		const DWORD min_flag = wanted != 0 ? QUOTA_LIMITS_HARDWS_MIN_ENABLE : QUOTA_LIMITS_HARDWS_MIN_DISABLE;
+		SIZE_T      minimum  = wanted;
+		if (minimum == 0) {
+			// (No hard minimum: the soft one the process has, under the maximum.)
+			DWORD  flags = 0;
+			SIZE_T wmax  = 0;
+			GetProcessWorkingSetSizeEx(GetCurrentProcess(), &minimum, &wmax, &flags);
+			if (minimum == 0 || minimum >= maximum) minimum = SIZE_T {1} << 20u;
+		}
+		// Hard maximum: Windows trims down to it now, inside the quiet window. Then soft again at once, so that no
+		// page is taken out later while a guest view's protection changes (0x1A, local-platform.h).
+		const BOOL ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum, maximum,
+		                                           QUOTA_LIMITS_HARDWS_MAX_ENABLE | min_flag);
+		SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum, maximum + (SIZE_T {512} << 20u),
+		                           QUOTA_LIMITS_HARDWS_MAX_DISABLE | min_flag);
+		g_cap_ok.store(ok != FALSE, std::memory_order_relaxed);
+	};
+	if (auto* runner = g_trim_runner.load(std::memory_order_acquire); runner != nullptr) runner(call);
+	else call();
+	return g_cap_ok.load(std::memory_order_relaxed);
+}
 void SetTrimRunner(void (*runner)(void (*call)())) {
 	g_trim_runner.store(runner, std::memory_order_release);
 }
@@ -2582,6 +2612,7 @@ MemoryUse ProcessMemory() {
 
 void StartWorkingSetTrim() {}
 void KeepResident() {}
+bool TrimWorkingSetTo(uint64_t, uint64_t) { return false; }
 void StartMemoryBreakdown() {}
 void SetSimulationBallast(uint64_t) {}
 uint64_t SimulationBallast() { return 0; }

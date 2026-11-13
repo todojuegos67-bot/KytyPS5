@@ -172,6 +172,11 @@ void      KeepResident();
 // How the trim runs its system call: set by the guest memory (kernel/memory.cpp) so that no mapping, unmapping or
 // protection change of the guest's views runs meanwhile (Windows' memory manager bug-checked, 0x1A, PCs that trim).
 void      SetTrimRunner(void (*runner)(void (*call)()));
+// The RAM budget (ram-guard.h, KYTY_RAM_BUDGET_MB): the working set trimmed down to target_bytes now (a hard maximum set
+// and made soft again in one call through the trim runner: pages leave only while no guest map, unmap or protection
+// change runs; they go to the standby list / page file and fault back in on use), keeping a hard minimum of min_bytes
+// (0: none). False where refused, min_bytes >= target_bytes, or on other systems.
+bool      TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes);
 // The physical memory the system can still give without paging (free and standby; Linux: MemAvailable). 0: unknown.
 uint64_t AvailablePhysicalMemory();
 // Diagnostics: the process's address space in [begin, end) to stdout, labelled: each allocation of 16 MiB and more (its

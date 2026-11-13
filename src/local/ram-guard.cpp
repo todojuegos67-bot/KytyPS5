@@ -263,6 +263,9 @@ struct Settings {
 	int64_t  flush_seconds = 0;                      // KYTY_RAM_FLUSH_SECONDS: the periodic flush (0 off)
 	uint64_t flush_bytes   = 0;                      // KYTY_RAM_FLUSH_MB
 	bool     flush_trim    = false;                  // KYTY_RAM_FLUSH_TRIM=1: the working set trim too
+	uint64_t budget        = 0;                      // KYTY_RAM_BUDGET_MB: the working set kept under it (0 off)
+	uint64_t budget_step   = 0;                      // KYTY_RAM_BUDGET_STEP_MB: the most trimmed a second
+	uint64_t budget_floor  = 0;                      // the hard working set minimum kept meanwhile (KYTY_RESIDENT_MB)
 };
 
 Settings ReadSettings() {
@@ -288,6 +291,11 @@ Settings ReadSettings() {
 		const char* trim       = Env("KYTY_RAM_FLUSH_TRIM");
 		s.flush_trim           = trim != nullptr && trim[0] == '1';
 	}
+	s.budget      = EnvMiB("KYTY_RAM_BUDGET_MB", 0);
+	if (s.budget != 0) s.budget = std::max<uint64_t>(s.budget, 2 * GiB);
+	s.budget_step = std::clamp<uint64_t>(EnvMiB("KYTY_RAM_BUDGET_STEP_MB", 384 * MiB), 64 * MiB, 2 * GiB);
+	// (KYTY_RESIDENT_MB's hard minimum kept, but under the budget's trim target.)
+	s.budget_floor = s.budget != 0 ? std::min(EnvMiB("KYTY_RESIDENT_MB", 0), s.budget - GiB) : 0;
 	return s;
 }
 
@@ -520,10 +528,22 @@ void Watch() {
 		            static_cast<long long>(s.flush_seconds), static_cast<unsigned long long>(s.flush_bytes / 1000000u),
 		            s.flush_trim ? ", then the working set trim of cold guest pages" : "; no working set trim");
 	std::fflush(stdout);
+	if (s.budget != 0) {
+		std::printf("RAM budget: working set kept under %llu MiB (KYTY_RAM_BUDGET_MB; 0 turns it off): over it, up to %llu "
+		            "MiB a second trimmed to the page file / standby list in quiet windows (hard minimum %llu MiB), the "
+		            "release passes run as under pressure (critical 1 GiB over), released guest memory dropped\n",
+		            static_cast<unsigned long long>(s.budget / MiB), static_cast<unsigned long long>(s.budget_step / MiB),
+		            static_cast<unsigned long long>(s.budget_floor / MiB));
+	}
+	std::fflush(stdout);
 	g_periodic.store(s.flush_seconds > 0, std::memory_order_relaxed);
 	FlushState flush_state;
 	auto       next_periodic = Clock::now() + std::chrono::seconds(std::max<int64_t>(s.flush_seconds, 1));
 	uint64_t   seconds_under_1g = 0, seconds_under_512 = 0;
+	// The RAM budget: what was trimmed (in all and since the last line), the seconds over it, the trims refused.
+	uint64_t   budget_trimmed = 0, budget_trimmed_line = 0, budget_seconds_over = 0, budget_refused = 0;
+	uint64_t   budget_ws_max_line = 0;
+	auto       budget_next_guest = Clock::now();
 	int        sim_exhausted = 0;
 	auto     next_log   = Clock::now() + std::chrono::seconds(std::max<int64_t>(log_period, 1));
 	auto     next_flush = Clock::now();
@@ -555,7 +575,36 @@ void Watch() {
 			seconds_under_1g += sample.available < GiB ? 1 : 0;
 			seconds_under_512 += sample.available < GiB / 2 ? 1 : 0;
 		}
-		const int level = LevelOf(s, sample);
+		int level = LevelOf(s, sample);
+		if (s.budget != 0) {
+			budget_ws_max_line = std::max(budget_ws_max_line, sample.working_set);
+			if (sample.working_set > s.budget) {
+				budget_seconds_over++;
+				// Over the budget: the release passes and the owners (pipelines, images) as under pressure; critical a GiB
+				// over. Then the working set trimmed one step (a few hundred MiB, inside the guest memory's quiet window)
+				// toward 256 MiB under the budget: cold pages first (Windows trims the least recently used).
+				level = std::max(level, sample.working_set > s.budget + GiB ? static_cast<int>(Critical) : static_cast<int>(Low));
+				const uint64_t goal   = s.budget - 256 * MiB;
+				const uint64_t target = std::max(goal, sample.working_set - std::min(sample.working_set, s.budget_step));
+				if (target > s.budget_floor) {
+					if (LocalPlatform::TrimWorkingSetTo(target, s.budget_floor)) {
+						const uint64_t after = LocalPlatform::ProcessMemory().working_set;
+						const uint64_t cut   = sample.working_set > after ? sample.working_set - after : 0;
+						budget_trimmed += cut;
+						budget_trimmed_line += cut;
+					} else {
+						budget_refused++;
+					}
+				}
+				// Guest memory the game released but still in RAM, dropped (no data lost), at most every 30 s.
+				if (now >= budget_next_guest) {
+					budget_next_guest = now + std::chrono::seconds(30);
+					Settings guest  = s;
+					guest.flush_trim = false;
+					FlushPass(guest, low_memory, store, &flush_state);
+				}
+			}
+		}
 		g_level.store(level, std::memory_order_relaxed);
 		if (s.flush_seconds > 0 && now >= next_periodic) {
 			FlushPass(s, low_memory, store, &flush_state);
@@ -621,6 +670,18 @@ void Watch() {
 			            static_cast<unsigned long long>(g_released_count_total[Pipelines].load(std::memory_order_relaxed)),
 			            static_cast<unsigned long long>(g_released_count_total[Images].load(std::memory_order_relaxed)),
 			            static_cast<unsigned long long>(g_released_bytes_total[Images].load(std::memory_order_relaxed) / MiB));
+			if (s.budget != 0) {
+				const uint64_t ws_now = LocalPlatform::ProcessMemory().working_set;
+				std::printf("RAM budget (%lld s): budget %llu MiB, working set %llu MiB now (peak %llu MiB this period), "
+				            "trimmed %llu MiB this period, %llu MiB in all; %llu s over budget in all, %llu trims refused\n",
+				            static_cast<long long>(log_period), static_cast<unsigned long long>(s.budget / MiB),
+				            static_cast<unsigned long long>(ws_now / MiB), static_cast<unsigned long long>(budget_ws_max_line / MiB),
+				            static_cast<unsigned long long>(budget_trimmed_line / MiB),
+				            static_cast<unsigned long long>(budget_trimmed / MiB),
+				            static_cast<unsigned long long>(budget_seconds_over), static_cast<unsigned long long>(budget_refused));
+				budget_trimmed_line = 0;
+				budget_ws_max_line  = 0;
+			}
 			if (s.flush_seconds > 0 || s.sim_ram != 0) {
 				std::printf("RAM (%lld s): flush passes %llu (caches %llu MB, freed guest memory %llu MB, trim %llu MB; %.1f ms "
 				            "a pass on average, at most %.1f ms); simulated PC under 1 GiB available %llu s, under 512 MiB "
