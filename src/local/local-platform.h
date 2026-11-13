@@ -149,9 +149,13 @@ enum MemoryTag : int {
 	MemoryTagVulkanHost,            // host-visible types without device-local (staging rings, readback)
 	MemoryTagVulkanBallast,         // KYTY_SIMULATE_VRAM_MB's ballast
 	MemoryTagLargeNew,              // C++ new >= 1 MiB (by caller in the line)
+	MemoryTagGuestPrivate,          // the guest's private commits (GuestAddressSpace::Commit: game memory, guest stacks)
 	MemoryTagCount
 };
 bool MemoryTagsEnabled();
+// The Vulkan part of the tags alone (vma.cpp's vkAllocateMemory/vkFreeMemory wrapper: a private-commit delta per
+// allocation, no C++ new hooks): on by default, KYTY_MEMORY_TAGS_VK=0 turns it off (KYTY_MEMORY_TAGS=1 turns it on).
+bool MemoryTagsVulkanEnabled();
 // KYTY_LOWMEM_VRAM=1 (default off; the launcher's "Equipo de 16 GB RAM"): less video memory held, for PCs whose
 // commit runs out: VMA blocks of 32 MiB, an upload ring of 256 MiB, the caches' budget at most 6 GB (the GPU's
 // memory less 4 GB), a freed-image pool of at most 256 MiB.

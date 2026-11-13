@@ -2279,6 +2279,7 @@ public:
 			return false;
 		}
 		EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
+		LocalPlatform::MemoryTagAdd(LocalPlatform::MemoryTagGuestPrivate, static_cast<int64_t>(size), static_cast<int64_t>(size));
 		return true;
 #else
 		if (VirtualMemory::Protect(vaddr, size, host_mode)) {
@@ -2315,6 +2316,7 @@ public:
 		}
 		// ReleaseCommitted also publishes the aggregate span as one logical free range.
 		EXIT_IF(regions.size() > 1 && !CoalescePlaceholders(vaddr, size));
+		LocalPlatform::MemoryTagAdd(LocalPlatform::MemoryTagGuestPrivate, -static_cast<int64_t>(size), -static_cast<int64_t>(size));
 #else
 		for (const auto& [region_vaddr, region_size]: regions) {
 			RestorePlaceholder(region_vaddr, region_size);

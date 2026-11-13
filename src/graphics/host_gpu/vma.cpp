@@ -118,7 +118,7 @@ VKAPI_ATTR void VKAPI_CALL TaggedFreeMemory(VkDevice device, VkDeviceMemory memo
 }
 
 void InstallMemoryTags(VkPhysicalDevice physical_device) {
-	if (!LocalPlatform::MemoryTagsEnabled() || g_real_allocate != nullptr) return;
+	if (!LocalPlatform::MemoryTagsVulkanEnabled() || g_real_allocate != nullptr) return;
 	auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
 	if (dispatcher.vkAllocateMemory == nullptr || dispatcher.vkFreeMemory == nullptr) return;
 	dispatcher.vkGetPhysicalDeviceMemoryProperties(physical_device, &g_memory_properties);
@@ -156,8 +156,11 @@ bool GraphicContext::CreateAllocator() {
 	// Memory blocks of 64 MiB (VMA's default is 256): a block stays allocated while any allocation of it lives, so
 	// the game's streaming left 21 blocks of 256 MiB with 2.7 GB free inside them at Boletaria (11.9 GB held of
 	// which 8.9 in use); smaller blocks hold less around each straggler. KYTY_VMA_BLOCK_MB=<n> for an A/B.
+	// The low-RAM profile (20 GiB of RAM or less) takes 32 MiB as KYTY_LOWMEM_VRAM=1 does: NVIDIA's driver charges each
+	// block's whole size to commit, its free room too (396 MiB free inside 64 MiB blocks on a 16 GB PC, 11-13); only
+	// the blocks made from start-up on are smaller, nothing allocated is moved or freed.
 	{
-		uint64_t block_mb = LocalPlatform::LowMemVram() ? 32 : 64;
+		uint64_t block_mb = LocalPlatform::LowMemVram() || RamGuard::LowRam() ? 32 : 64;
 		if (const char* text = std::getenv("KYTY_VMA_BLOCK_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
 			block_mb = std::strtoull(text, nullptr, 10);
 		info.preferredLargeHeapBlockSize = block_mb << 20u;
