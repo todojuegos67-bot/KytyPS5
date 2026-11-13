@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 #include "live-trace.h"
-#include "ram-guard.h"
 #include "speculation-state.h"
 
 #include <algorithm>
@@ -889,11 +888,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0;
 	}();
 	const bool test_fail = test_fail_above != 0 && info.data.size > test_fail_above;
-	// The commit guard (ram-guard.h): a big image (64 MiB or more) with the commit headroom under the reserve makes room
-	// first; one that may fail (a texture, uploaded again at its next use) is not made when no room was made.
-	const bool commit_refused = info.data.size >= (uint64_t {64} << 20u) &&
-	                            !RamGuard::MakeCommitRoom(info.data.size, "a big image", may_fail);
-	if (commit_refused || (may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing)) {
+	if ((may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing)) {
 		m_create_failed = true;
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
