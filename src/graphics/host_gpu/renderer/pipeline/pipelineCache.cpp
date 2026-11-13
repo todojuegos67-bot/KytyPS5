@@ -51,6 +51,7 @@
 #include <cstring>
 #include <type_traits>
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <deque>
 #include <filesystem>
@@ -4957,18 +4958,27 @@ struct PipelineCache::ProgramCache {
 // walks recorded (with the KYTY_MT_PROG seal). GPU thread only.
 struct PipelineCache::ProgramTable {
 	static constexpr uint32_t Slots     = 16384;
+	static constexpr uint32_t Ways      = 4; // slots (hash + way) of one key
 	static constexpr uint32_t SeenSlots = 65536;
+
+	// The key: the stages' code addresses, whether the pixel stage is active and whether the draw
+	// is tessellated. Everything else the programs depend on is checked on a hit, from this draw's
+	// describe: each stage's code, hash, user data count and static input key (what Get's program
+	// key takes), and its refresh's specialization. Registers, context and user config were in
+	// the key before; they held per-frame values (user SGPR pointers first, then others): no key
+	// came twice.
+	struct Ident {
+		std::array<uint64_t, 5> code {};
+		bool                    pixel_active = false;
+		bool                    tess         = false;
+		bool operator==(const Ident&) const = default;
+	};
 
 	struct Entry {
 		uint64_t                                       hash           = 0;
 		uint64_t                                       program_gen    = 0;
 		uint64_t                                       shader_map_gen = 0;
-		HW::VertexShaderInfo                           vertex_regs;
-		HW::PixelShaderInfo                            pixel_regs;
-		HW::Context                                    context;
-		HW::UserConfig                                 user_config;
-		std::array<Prospero::ColorComponentMapping, 8> export_mapping {};
-		bool                                           pixel_active = false;
+		Ident                                          ident;
 		GraphicsPrograms                               programs;
 		uint32_t                                       vertex_count = 0;
 		std::array<ShaderVertexInputInfo, 3>           vertex_info {};
@@ -4984,48 +4994,31 @@ struct PipelineCache::ProgramTable {
 		std::array<uint32_t, 4>                          user_data_count {};
 		std::array<std::vector<uint32_t>, 4>             static_key;
 	};
-	// Stored the second time its key comes (SeenSlots).
 	std::vector<uint32_t> static_key_scratch;
 
 	std::vector<std::unique_ptr<Entry>> slots {Slots};
 	std::vector<uint64_t>               seen = std::vector<uint64_t>(SeenSlots, 0);
+	uint32_t                            next_way = 0;
 
-	static uint64_t Hash(const HW::VertexShaderInfo& vertex_regs,
-	                     const HW::PixelShaderInfo& pixel_regs, const HW::Context& context,
-	                     const HW::UserConfig&                               user_config,
-	                     std::span<const Prospero::ColorComponentMapping, 8> export_mapping,
-	                     bool                                                pixel_active) {
-		uint64_t h = XXH3_64bits(&context, sizeof(context));
-		h          = XXH3_64bits_withSeed(&vertex_regs, sizeof(vertex_regs), h);
-		h          = XXH3_64bits_withSeed(&pixel_regs, sizeof(pixel_regs), h);
-		h          = XXH3_64bits_withSeed(&user_config, sizeof(user_config), h);
-		h          = XXH3_64bits_withSeed(export_mapping.data(), export_mapping.size_bytes(), h);
-		return h ^ (pixel_active ? 0x9e3779b97f4a7c15ull : 0u) ^ 1u; // never 0
+	static Ident MakeIdent(const HW::VertexShaderInfo& vertex_regs,
+	                       const HW::PixelShaderInfo& pixel_regs, bool pixel_active, bool tess) {
+		Ident ident;
+		ident.code         = {vertex_regs.es_regs.data_addr, vertex_regs.ls_regs.data_addr,
+		                      vertex_regs.hs_regs.data_addr, vertex_regs.gs_regs.data_addr,
+		                      pixel_active ? pixel_regs.ps_regs.data_addr : 0u};
+		ident.pixel_active = pixel_active;
+		ident.tess         = tess;
+		return ident;
 	}
 
-	// The key's registers: the user SGPR values left out (their pointers into per-frame memory
-	// differ every frame, so no key came twice: "stored 0"); a hit takes this draw's user data
-	// through describe and the scanner's refresh.
-	static void KeyRegs(const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
-	                    HW::VertexShaderInfo& vertex_key, HW::PixelShaderInfo& pixel_key) {
-		std::memcpy(&vertex_key, &vertex_regs, sizeof(vertex_key));
-		std::memcpy(&pixel_key, &pixel_regs, sizeof(pixel_key));
-		std::memset(vertex_key.hs_user_sgpr.value, 0, sizeof(vertex_key.hs_user_sgpr.value));
-		std::memset(vertex_key.gs_user_sgpr.value, 0, sizeof(vertex_key.gs_user_sgpr.value));
-		std::memset(pixel_key.ps_user_sgpr.value, 0, sizeof(pixel_key.ps_user_sgpr.value));
+	static uint64_t Hash(const Ident& ident) {
+		const uint64_t h = XXH3_64bits(ident.code.data(), sizeof(ident.code));
+		return h ^ (ident.pixel_active ? 0x9e3779b97f4a7c15ull : 0u) ^
+		       (ident.tess ? 0x7f4a7c159e3779b9ull : 0u) ^ 1u; // never 0
 	}
 
-	[[nodiscard]] static bool SameKey(const Entry& e, const HW::VertexShaderInfo& vertex_regs,
-	                                  const HW::PixelShaderInfo& pixel_regs,
-	                                  const HW::Context& context, const HW::UserConfig& user_config,
-	                                  std::span<const Prospero::ColorComponentMapping, 8> mapping,
-	                                  bool pixel_active) {
-		return e.pixel_active == pixel_active &&
-		       std::memcmp(&e.context, &context, sizeof(context)) == 0 &&
-		       std::memcmp(&e.vertex_regs, &vertex_regs, sizeof(vertex_regs)) == 0 &&
-		       std::memcmp(&e.pixel_regs, &pixel_regs, sizeof(pixel_regs)) == 0 &&
-		       std::memcmp(&e.user_config, &user_config, sizeof(user_config)) == 0 &&
-		       std::memcmp(e.export_mapping.data(), mapping.data(), mapping.size_bytes()) == 0;
+	std::unique_ptr<Entry>& Way(uint64_t hash, uint32_t way) {
+		return slots[(hash + way) & (Slots - 1u)];
 	}
 };
 
@@ -6358,6 +6351,120 @@ static uint64_t DrawPrepTessIdentity(const HW::VertexShaderInfo& vertex_regs,
 	return XXH3_64bits(words, sizeof(words));
 }
 
+// KYTY_TABLE (temporary diagnostic, KYTY_TABLE_KEYDIAG=0 turns it off): on a "new" miss, the key
+// of the last draw with the same vs/ps pair is compared with this one's, part by part, and the
+// first differing byte of each part is counted. Every 10 s a "Table keydiag:" line (GPU thread).
+namespace {
+struct TableKeyDiag {
+	struct Key {
+		HW::VertexShaderInfo                           vertex;
+		HW::PixelShaderInfo                            pixel;
+		HW::Context                                    context;
+		HW::UserConfig                                 user_config;
+		std::array<Prospero::ColorComponentMapping, 8> mapping {};
+		bool                                           pixel_active = false;
+	};
+	struct Offset {
+		uint64_t count = 0;
+		uint64_t before = 0;
+		uint64_t after  = 0;
+	};
+	static constexpr const char* Parts[] = {"context", "vertex_regs", "pixel_regs", "user_config",
+	                                        "export_mapping", "pixel_active"};
+	std::unordered_map<uint64_t, std::unique_ptr<Key>>          last;
+	std::array<uint64_t, 6>                                     parts {};
+	std::array<std::map<size_t, Offset>, 6>                     offsets;
+	uint64_t                                                    compared = 0;
+	uint64_t                                                    first    = 0;
+	std::chrono::steady_clock::time_point                       logged = std::chrono::steady_clock::now();
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_TABLE_KEYDIAG");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	void Note(size_t part, const void* a, const void* b, size_t size) {
+		const auto* x = static_cast<const uint8_t*>(a);
+		const auto* y = static_cast<const uint8_t*>(b);
+		for (size_t i = 0; i < size; i++) {
+			if (x[i] != y[i]) {
+				parts[part]++;
+				const size_t at = i & ~size_t {7};
+				auto&        o  = offsets[part][at];
+				o.count++;
+				std::memcpy(&o.before, x + at, std::min<size_t>(8, size - at));
+				std::memcpy(&o.after, y + at, std::min<size_t>(8, size - at));
+				return;
+			}
+		}
+	}
+
+	void Miss(const HW::VertexShaderInfo& vertex, const HW::PixelShaderInfo& pixel,
+	          const HW::Context& context, const HW::UserConfig& user_config,
+	          std::span<const Prospero::ColorComponentMapping, 8> mapping, bool pixel_active) {
+		const uint64_t pair = vertex.es_regs.data_addr ^ (vertex.gs_regs.data_addr << 1u) ^
+		                      (static_cast<uint64_t>(pixel.ps_regs.data_addr) << 7u);
+		auto& slot = last[pair];
+		if (slot == nullptr) {
+			if (last.size() > 16384) {
+				last.clear();
+				return;
+			}
+			slot = std::make_unique<Key>();
+			first++;
+		} else {
+			compared++;
+			auto& k = *slot;
+			Note(0, &k.context, &context, sizeof(context));
+			Note(1, &k.vertex, &vertex, sizeof(vertex));
+			Note(2, &k.pixel, &pixel, sizeof(pixel));
+			Note(3, &k.user_config, &user_config, sizeof(user_config));
+			Note(4, k.mapping.data(), mapping.data(), mapping.size_bytes());
+			if (k.pixel_active != pixel_active) parts[5]++;
+		}
+		auto& k = *slot;
+		std::memcpy(&k.context, &context, sizeof(context));
+		std::memcpy(&k.vertex, &vertex, sizeof(vertex));
+		std::memcpy(&k.pixel, &pixel, sizeof(pixel));
+		std::memcpy(&k.user_config, &user_config, sizeof(user_config));
+		std::memcpy(k.mapping.data(), mapping.data(), mapping.size_bytes());
+		k.pixel_active = pixel_active;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - logged < std::chrono::seconds(10)) {
+			return;
+		}
+		logged = now;
+		std::string text;
+		for (size_t p = 0; p < parts.size(); p++) {
+			text += fmt::format(" | {} {}", Parts[p], parts[p]);
+			std::vector<std::pair<size_t, Offset>> top(offsets[p].begin(), offsets[p].end());
+			std::ranges::sort(top, [](const auto& a, const auto& b) {
+				return a.second.count > b.second.count;
+			});
+			for (size_t i = 0; i < top.size() && i < 6; i++) {
+				text += fmt::format(" [+0x{:x} x{} {:016x}->{:016x}]", top[i].first,
+				                    top[i].second.count, top[i].second.before, top[i].second.after);
+			}
+			offsets[p].clear();
+			parts[p] = 0;
+		}
+		LOGF_UNMUTED("Table keydiag (10 s): new misses %llu with a pair seen before, %llu first; "
+		             "first differing 8 bytes per part (sizes: context 0x%zx, vertex 0x%zx, pixel "
+		             "0x%zx, user config 0x%zx)%s\n",
+		             static_cast<unsigned long long>(compared),
+		             static_cast<unsigned long long>(first), sizeof(HW::Context),
+		             sizeof(HW::VertexShaderInfo), sizeof(HW::PixelShaderInfo),
+		             sizeof(HW::UserConfig), text.c_str());
+		compared = 0;
+		first    = 0;
+	}
+};
+TableKeyDiag g_table_key_diag;
+} // namespace
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -6374,42 +6481,58 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (m_program_table == nullptr) {
 		m_program_table = std::make_unique<ProgramTable>();
 	}
-	auto&                table = *m_program_table;
-	HW::VertexShaderInfo vertex_key;
-	HW::PixelShaderInfo  pixel_key;
-	ProgramTable::KeyRegs(vertex_regs, pixel_regs, vertex_key, pixel_key);
-	const uint64_t hash = ProgramTable::Hash(vertex_key, pixel_key, context, user_config,
-	                                         target_export_mapping, pixel_active);
+	auto&          table       = *m_program_table;
+	const bool     tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	const auto     ident = ProgramTable::MakeIdent(vertex_regs, pixel_regs, pixel_active, tess_active);
+	const uint64_t hash  = ProgramTable::Hash(ident);
 	const uint64_t program_gen    = m_program_cache->next_shader_id;
 	const uint64_t shader_map_gen = ShaderMapGeneration();
-	auto&          slot           = table.slots[hash & (ProgramTable::Slots - 1u)];
-	const bool     tess_active    = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	const auto     same_ident     = [&](const std::unique_ptr<ProgramTable::Entry>& e) {
+        return e != nullptr && e->hash == hash && e->ident == ident;
+	};
 
-	// The table's answer, when the entry holds: this draw is described (its user data, its
-	// vertex tables), what the program keys take from that must be the entry's, and each stage's
-	// refresh must be the scanner's with the specialization of the entry's permutation.
-	ProgramTable::Entry* hit = nullptr;
-	GraphicsPrograms     hit_programs;
-	if (slot != nullptr && slot->hash == hash &&
-	    ProgramTable::SameKey(*slot, vertex_key, pixel_key, context, user_config,
-	                          target_export_mapping, pixel_active)) {
-		auto& e = *slot;
-		if (e.program_gen != program_gen || e.shader_map_gen != shader_map_gen) {
-			TableMode::Add(TableMode::Counter::ProgramMissStale);
-		} else {
-			std::array<ShaderParams, 3> vertex_params;
-			ShaderParams                pixel_params;
-			GpuPhases::Scope            describe_phase(GpuPhases::Phase::Describe);
-			bool ok = DescribeGraphicsStages(vertex_regs, pixel_regs, sh, context, user_config,
-			                                 target_export_mapping, pixel_active, vertex_info,
-			                                 pixel_info, vertex_params, pixel_params);
-			describe_phase.End();
-			const uint32_t vertex_count = tess_active ? 3u : 1u;
-			ok = ok && e.vertex_count == vertex_count &&
-			     e.stage_count == vertex_count + (pixel_active ? 1u : 0u);
-			// The stages in Get's order: pixel first.
-			const auto same_inputs = [&](uint32_t k, const ShaderParams& params,
-			                             const auto& input_info) {
+	// The table's answer, when an entry of the key holds: this draw is described (its user data,
+	// its vertex tables), what the program keys take from that must be the entry's, and each
+	// stage's refresh must be the scanner's with the specialization of the entry's permutation.
+	ProgramTable::Entry*    hit = nullptr;
+	std::unique_ptr<ProgramTable::Entry>* hit_slot = nullptr;
+	GraphicsPrograms        hit_programs;
+	bool                    any = false;
+	bool                    fresh = false;
+	for (uint32_t w = 0; w < ProgramTable::Ways; w++) {
+		auto& e = table.Way(hash, w);
+		if (!same_ident(e)) continue;
+		any = true;
+		if (e->program_gen == program_gen && e->shader_map_gen == shader_map_gen) {
+			fresh = true;
+		}
+	}
+	if (!any) {
+		TableMode::Add(TableMode::Counter::ProgramMissNew);
+		if (TableKeyDiag::Enabled()) {
+			g_table_key_diag.Miss(vertex_regs, pixel_regs, context, user_config,
+			                      target_export_mapping, pixel_active);
+		}
+	} else if (!fresh) {
+		TableMode::Add(TableMode::Counter::ProgramMissStale);
+	} else {
+		std::array<ShaderParams, 3> vertex_params;
+		ShaderParams                pixel_params;
+		GpuPhases::Scope            describe_phase(GpuPhases::Phase::Describe);
+		const bool described = DescribeGraphicsStages(vertex_regs, pixel_regs, sh, context,
+		                                              user_config, target_export_mapping,
+		                                              pixel_active, vertex_info, pixel_info,
+		                                              vertex_params, pixel_params);
+		describe_phase.End();
+		const uint32_t vertex_count = tess_active ? 3u : 1u;
+		// The way whose stages' program key inputs are this draw's (pixel first, as Get).
+		const auto same_inputs = [&](const ProgramTable::Entry& e) {
+			if (e.vertex_count != vertex_count ||
+			    e.stage_count != vertex_count + (pixel_active ? 1u : 0u)) {
+				return false;
+			}
+			const auto stage_same = [&](uint32_t k, const ShaderParams& params,
+			                            const auto& input_info) {
 				if (params.code.data() != e.code[k] || params.hash != e.code_hash[k] ||
 				    params.user_data_count != e.user_data_count[k]) {
 					return false;
@@ -6418,44 +6541,56 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				return table.static_key_scratch == e.static_key[k];
 			};
 			uint32_t k = 0;
-			if (ok && pixel_active) {
-				ok = same_inputs(k++, pixel_params, pixel_info);
+			if (pixel_active && !stage_same(k++, pixel_params, pixel_info)) return false;
+			for (uint32_t i = 0; i < vertex_count; i++) {
+				if (!stage_same(k++, vertex_params[i], vertex_info[i])) return false;
 			}
-			for (uint32_t i = 0; ok && i < vertex_count; i++) {
-				ok = same_inputs(k++, vertex_params[i], vertex_info[i]);
-			}
-			if (!ok) {
-				TableMode::Add(TableMode::Counter::ProgramMissInputs);
-			} else {
-				k = 0;
-				if (pixel_active) {
-					ok = m_program_cache->TableRefresh(*e.sources[k], ShaderType::Pixel,
-					                                   pixel_params, e.specialization[k]);
-					pixel_info.stage = {.program   = e.pixel_info.stage.program,
-					                    .resources = &e.sources[k]->resources};
-					k++;
-				}
-				for (uint32_t i = 0; ok && i < vertex_count; i++, k++) {
-					ok = m_program_cache->TableRefresh(*e.sources[k], vertex_info[i].logical_stage,
-					                                   vertex_params[i], e.specialization[k]);
-					vertex_info[i].stage = {.program   = e.vertex_info[i].stage.program,
-					                        .resources = &e.sources[k]->resources};
-					// The hull shader's normalized copy follows its samplers (GetGraphicsProgramsFull).
-					const auto& program = e.programs.vertex[i];
-					ok = ok && (program.normalized_module != nullptr && UnnormalizedSamplingFix() &&
-					            StageSamplersAllUnnormalized(vertex_info[i].stage)) ==
-					               program.normalized_samplers;
-				}
-				if (ok) {
-					hit          = &e;
-					hit_programs = e.programs;
-				} else {
-					TableMode::Add(TableMode::Counter::ProgramMissReads);
-				}
+			return true;
+		};
+		ProgramTable::Entry* found = nullptr;
+		for (uint32_t w = 0; described && found == nullptr && w < ProgramTable::Ways; w++) {
+			auto& e = table.Way(hash, w);
+			if (same_ident(e) && e->program_gen == program_gen &&
+			    e->shader_map_gen == shader_map_gen && same_inputs(*e)) {
+				found    = e.get();
+				hit_slot = &e;
 			}
 		}
-	} else {
-		TableMode::Add(TableMode::Counter::ProgramMissNew);
+		if (found == nullptr) {
+			TableMode::Add(TableMode::Counter::ProgramMissInputs);
+			if (TableKeyDiag::Enabled()) {
+				g_table_key_diag.Miss(vertex_regs, pixel_regs, context, user_config,
+				                      target_export_mapping, pixel_active);
+			}
+		} else {
+			auto&    e  = *found;
+			bool     ok = true;
+			uint32_t k  = 0;
+			if (pixel_active) {
+				ok = m_program_cache->TableRefresh(*e.sources[k], ShaderType::Pixel, pixel_params,
+				                                   e.specialization[k]);
+				pixel_info.stage = {.program   = e.pixel_info.stage.program,
+				                    .resources = &e.sources[k]->resources};
+				k++;
+			}
+			for (uint32_t i = 0; ok && i < vertex_count; i++, k++) {
+				ok = m_program_cache->TableRefresh(*e.sources[k], vertex_info[i].logical_stage,
+				                                   vertex_params[i], e.specialization[k]);
+				vertex_info[i].stage = {.program   = e.vertex_info[i].stage.program,
+				                        .resources = &e.sources[k]->resources};
+				// The hull shader's normalized copy follows its samplers (GetGraphicsProgramsFull).
+				const auto& program = e.programs.vertex[i];
+				ok = ok && (program.normalized_module != nullptr && UnnormalizedSamplingFix() &&
+				            StageSamplersAllUnnormalized(vertex_info[i].stage)) ==
+				               program.normalized_samplers;
+			}
+			if (ok) {
+				hit          = &e;
+				hit_programs = e.programs;
+			} else {
+				TableMode::Add(TableMode::Counter::ProgramMissReads);
+			}
+		}
 	}
 
 	if (hit != nullptr && !TableMode::Verifying()) {
@@ -6527,7 +6662,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				     static_cast<uint64_t>(vertex_regs.es_regs.data_addr),
 				     static_cast<uint64_t>(pixel_regs.ps_regs.data_addr), diff);
 			}
-			slot.reset();
+			hit_slot->reset();
 		}
 		return result;
 	}
@@ -6565,6 +6700,32 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return result;
 		}
 	}
+	// The way to keep it in: one of the key whose stages' inputs are these, else a free one,
+	// else the ways in turn.
+	const auto inputs_of = [&](const ProgramTable::Entry& e) {
+		uint32_t k   = 0;
+		bool     same = e.stage_count == stage_count;
+		const auto stage_same = [&](const ShaderParams& params) {
+			same = same && params.code.data() == e.code[k] && params.hash == e.code_hash[k];
+			k++;
+		};
+		if (pixel_active) stage_same(pixel_params);
+		for (uint32_t i = 0; i < vertex_count; i++) stage_same(vertex_params[i]);
+		return same;
+	};
+	std::unique_ptr<ProgramTable::Entry>* slot_ptr = nullptr;
+	for (uint32_t w = 0; slot_ptr == nullptr && w < ProgramTable::Ways; w++) {
+		auto& e = table.Way(hash, w);
+		if (same_ident(e) && inputs_of(*e)) slot_ptr = &e;
+	}
+	for (uint32_t w = 0; slot_ptr == nullptr && w < ProgramTable::Ways; w++) {
+		auto& e = table.Way(hash, w);
+		if (e == nullptr || e->hash != hash) slot_ptr = &e;
+	}
+	if (slot_ptr == nullptr) {
+		slot_ptr = &table.Way(hash, table.next_way++ % ProgramTable::Ways);
+	}
+	auto& slot = *slot_ptr;
 	if (slot == nullptr) {
 		slot = std::make_unique<ProgramTable::Entry>();
 	}
@@ -6572,13 +6733,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	e.hash           = hash;
 	e.program_gen    = program_gen;
 	e.shader_map_gen = shader_map_gen;
-	std::memcpy(&e.vertex_regs, &vertex_key, sizeof(vertex_key));
-	std::memcpy(&e.pixel_regs, &pixel_key, sizeof(pixel_key));
-	std::memcpy(&e.context, &context, sizeof(context));
-	std::memcpy(&e.user_config, &user_config, sizeof(user_config));
-	std::memcpy(e.export_mapping.data(), target_export_mapping.data(),
-	            target_export_mapping.size_bytes());
-	e.pixel_active = pixel_active;
+	e.ident          = ident;
 	e.programs     = result;
 	e.vertex_count = vertex_count;
 	e.stage_count  = stage_count;
