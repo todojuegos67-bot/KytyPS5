@@ -1225,18 +1225,20 @@ static std::unique_ptr<VirtualRanges>     g_virtual_ranges;
 
 // (11-13) A "Guest memory by access" line each time the mapped total grows by 512 MiB: how much of the
 // game's memory the CPU never touches (GPU only), the part a PC port keeps in video memory alone.
-static void ReportGuestAccess() {
+void ReportGuestAccess(bool force);
+void ReportGuestAccess(bool force) {
 	static std::atomic<uint64_t> last {0};
 	if (g_virtual_ranges == nullptr) return;
 	uint64_t sum[3];
 	g_virtual_ranges->SumByAccess(sum);
 	const uint64_t total = sum[0] + sum[1] + sum[2];
 	uint64_t prev = last.load();
-	if (total < prev + (512ull << 20) && !(total + (512ull << 20) < prev)) return;
-	if (!last.compare_exchange_strong(prev, total)) return;
-	LOGF("Guest memory by access: total %llu MiB = CPU only %llu MiB, GPU only %llu MiB, CPU and GPU %llu MiB\n",
+	if (!force && total < prev + (512ull << 20) && !(total + (512ull << 20) < prev)) return;
+	if (!last.compare_exchange_strong(prev, total) && !force) return;
+	std::printf("Guest memory by access: total %llu MiB = CPU only %llu MiB, GPU only %llu MiB, CPU and GPU %llu MiB\n",
 	     (unsigned long long)(total >> 20), (unsigned long long)(sum[0] >> 20), (unsigned long long)(sum[1] >> 20),
 	     (unsigned long long)(sum[2] >> 20));
+	std::fflush(stdout);
 }
 static std::unique_ptr<GuestAddressSpace> g_guest_address_space;
 static callback_func_t                    g_alloc_callback        = nullptr;
@@ -3295,7 +3297,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 }
 
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
-	struct AccessReport { ~AccessReport() { ReportGuestAccess(); } } access_report;
+	struct AccessReport { ~AccessReport() { ReportGuestAccess(false); } } access_report;
 	return KernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
 
@@ -3888,7 +3890,7 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
-	struct AccessReport { ~AccessReport() { ReportGuestAccess(); } } access_report;
+	struct AccessReport { ~AccessReport() { ReportGuestAccess(false); } } access_report;
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);

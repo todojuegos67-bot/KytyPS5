@@ -27,6 +27,9 @@
 #include <windows.h>
 #endif
 
+namespace Libs::LibKernel::Memory {
+void ReportGuestAccess(bool force);
+}
 namespace RamGuard {
 
 namespace {
@@ -608,6 +611,7 @@ void Watch() {
 		}
 		if (log_period > 0 && now >= next_log) {
 			next_log = now + std::chrono::seconds(log_period);
+			Libs::LibKernel::Memory::ReportGuestAccess(true);
 			std::printf("RAM (%lld s): %s; pressure %s, real available %llu MiB, real commit headroom %llu MiB; pressure "
 			            "passes %llu (%llu MB), pipelines released %llu, images collected %llu (%llu MiB)\n",
 			            static_cast<long long>(log_period), Figures(sample).c_str(), LevelName(level),
