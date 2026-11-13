@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <x86intrin.h>
 
+#include "blackbox.h"
 #include "sync-stats.h"
 
 namespace LiveCensus {
@@ -123,10 +124,21 @@ inline std::atomic<int64_t> g_upload_wait_ns {0};
 class WaitScope {
 public:
 	explicit WaitScope(Wait wait): m_wait(wait), m_on(g_render) {
-		if (m_on) m_start = std::chrono::steady_clock::now();
+		if (m_on) {
+			m_start = std::chrono::steady_clock::now();
+			// (The black box: what the render thread waits for, and since when. Nested waits: the outer one is kept.)
+			m_outer = Blackbox::g_render_wait.load(std::memory_order_relaxed) == 0;
+			if (m_outer) {
+				Blackbox::g_render_wait_since.store(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(m_start.time_since_epoch()).count(),
+				    std::memory_order_relaxed);
+				Blackbox::g_render_wait.store(static_cast<uint32_t>(wait) + 1u, std::memory_order_relaxed);
+			}
+		}
 	}
 	~WaitScope() {
 		if (m_on) {
+			if (m_outer) Blackbox::g_render_wait.store(0, std::memory_order_relaxed);
 			const int64_t ns = (std::chrono::steady_clock::now() - m_start).count();
 			g_waits_ns[m_wait] += ns;
 			// KYTY_SYNC_STATS: the stacks the GPU waits and synchronous downloads come from.
@@ -140,6 +152,7 @@ public:
 private:
 	Wait                                  m_wait;
 	bool                                  m_on;
+	bool                                  m_outer = false;
 	std::chrono::steady_clock::time_point m_start {};
 };
 

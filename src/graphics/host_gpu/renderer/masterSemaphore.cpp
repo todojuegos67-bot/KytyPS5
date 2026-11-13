@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "blackbox.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "device-fault.h"
@@ -144,6 +145,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	}
 	const auto semaphore = HandleOf(tick);
 
+	Blackbox::InFlightScope fence_wait(Blackbox::g_fence_waits); // (the black box: a wait for the GPU, and since when)
 	LiveCensus::Scope census(LiveCensus::GpuWait, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
 	                         reinterpret_cast<uint64_t>(__builtin_return_address(1)));
 	LiveCensus::WaitScope waiting(LiveCensus::WaitGpu);

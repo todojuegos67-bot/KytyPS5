@@ -1,5 +1,6 @@
 #include <mutex>
 #include "graphics/presentation/videoOut.h"
+#include "blackbox.h"
 #include "live-counters.h"
 #include "live-trace.h"
 #include "time-census.h"
@@ -603,6 +604,7 @@ void NotePlayerInput() noexcept {
 	}
 }
 static void NoteFrameForWorld(bool scene) {
+	Blackbox::NoteSceneFrame(scene); // (the black box: the 3D view or a loading screen / menu / movie, and since when)
 	if (g_world_ready.load(std::memory_order_relaxed) || !g_player_input.load(std::memory_order_relaxed)) return;
 	using namespace std::chrono;
 	static int64_t nonscene_since = 0;

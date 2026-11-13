@@ -273,6 +273,10 @@ struct UnwindImage {
 	size_t                  count = 0;
 };
 std::vector<UnwindImage> g_unwind_images;
+// PrepareSampling and SampleThread from several diagnostics at once (a live prof, KYTY_STALL_DUMP_MS's watch, the scene
+// guard's dump, the black box's stall dump): one at a time, so no walk reads the tables while another rebuilds them.
+// Taken before a thread is suspended and released after it is resumed (never waited for while one is suspended).
+std::mutex g_sampling_mutex;
 
 const RUNTIME_FUNCTION* FindUnwindEntry(uint64_t pc, uint64_t* image_base) {
 	for (const auto& image: g_unwind_images) {
@@ -461,6 +465,7 @@ bool UnwindFrame(uint64_t image_base, const RUNTIME_FUNCTION* entry, CONTEXT* co
 } // namespace
 
 void PrepareSampling() {
+	std::lock_guard lock(g_sampling_mutex);
 	g_unwind_images.clear();
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
 	if (snapshot == INVALID_HANDLE_VALUE) return;
@@ -485,7 +490,9 @@ void PrepareSampling() {
 
 bool SampleThread(uint64_t handle, uint64_t stack_low, uint64_t stack_high, uint64_t* out, size_t words) {
 	auto* thread = reinterpret_cast<HANDLE>(handle);
-	if (thread == nullptr || words < 2 || SuspendThread(thread) == static_cast<DWORD>(-1)) return false;
+	if (thread == nullptr || words < 2) return false;
+	std::lock_guard lock(g_sampling_mutex);
+	if (SuspendThread(thread) == static_cast<DWORD>(-1)) return false;
 	CONTEXT context {};
 	context.ContextFlags = CONTEXT_FULL;
 	const bool got       = GetThreadContext(thread, &context) != 0;
@@ -1206,6 +1213,29 @@ uint64_t OpenFileForReading(const char* path) {
 	HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
 	                          FILE_FLAG_RANDOM_ACCESS, nullptr);
 	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
+}
+
+uint64_t OpenWriteThroughFile(const char* path) {
+	wchar_t wide[MAX_PATH * 2] {};
+	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
+	HANDLE file = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
+	                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
+}
+
+bool FlushWrittenFile(uint64_t file) {
+	return file != 0 && FlushFileBuffers(reinterpret_cast<HANDLE>(file)) != 0;
+}
+
+SystemMemory SystemMemoryStatus() {
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	if (GlobalMemoryStatusEx(&status) == 0) return {};
+	SystemMemory memory;
+	memory.commit_limit = status.ullTotalPageFile;
+	memory.commit       = status.ullTotalPageFile - std::min(status.ullTotalPageFile, status.ullAvailPageFile);
+	memory.available    = status.ullAvailPhys;
+	return memory;
 }
 
 bool WriteHeapHistogram(const char* path) {
@@ -2577,6 +2607,21 @@ void CloseScratchFile(uint64_t file) {
 uint64_t OpenFileForReading(const char* path) {
 	const int fd = open(path, O_RDONLY | O_CLOEXEC);
 	return fd < 0 ? 0 : static_cast<uint64_t>(fd) + 1;
+}
+
+uint64_t OpenWriteThroughFile(const char* path) {
+	const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_DSYNC | O_CLOEXEC, 0644);
+	return fd < 0 ? 0 : static_cast<uint64_t>(fd) + 1;
+}
+
+bool FlushWrittenFile(uint64_t file) {
+	return file != 0 && fsync(static_cast<int>(file - 1)) == 0;
+}
+
+SystemMemory SystemMemoryStatus() {
+	SystemMemory memory;
+	memory.available = AvailablePhysicalMemory();
+	return memory;
 }
 
 bool WriteHeapHistogram(const char*) {
