@@ -875,6 +875,7 @@ void GuestGpu::ThreadRun(void* data) {
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 	}
 	LiveControl::Start();
+	Blackbox::SetThreadRole(Blackbox::RoleRender); // (its last phase - submit, fence, pso, fault, protect - in each line)
 	Blackbox::Start(); // (the crash / freeze black box: logs/blackbox-<stamp>.txt, local/blackbox-run.h)
 	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING

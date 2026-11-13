@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "slow-log.h"
+#include "blackbox.h"
 
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -280,6 +281,7 @@ struct PageManager::Impl {
 	}
 
 	static void ProtectHost(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
+		Blackbox::InFlightScope protecting(Blackbox::g_protects); // (the black box: a protection change that does not return)
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,

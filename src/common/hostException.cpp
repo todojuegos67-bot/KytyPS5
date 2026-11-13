@@ -1,6 +1,7 @@
 #include "common/hostException.h"
 
 #include "common/guardedCopy.h"
+#include "local/blackbox.h"
 #include "local/mem-guard.h"
 
 #include <atomic>
@@ -296,6 +297,8 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.r15 = exception->ContextRecord->R15;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
+	// (The black box: a guest fault being handled, and on the render thread its phase.)
+	Blackbox::InFlightScope handling(Blackbox::g_faults);
 	if (handler != nullptr && handler(info)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}

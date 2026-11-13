@@ -1,9 +1,11 @@
 #include "local-platform.h"
 #include "guest-lazy-commit.h"
+#include "blackbox.h"
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -2315,7 +2317,307 @@ bool IsNvidiaSigned(const std::wstring& path) {
 	return nvidia;
 }
 
+// The black box's watchdog (blackbox.h Shared, blackbox-run.h StartWatchdog).
+uint32_t ProcessId() {
+	return static_cast<uint32_t>(GetCurrentProcessId());
+}
+
+namespace {
+void BlackboxSharedName(uint32_t pid, wchar_t* out, size_t size) {
+	(void)swprintf(out, size, L"Local\\KytyBlackbox-%lu", static_cast<unsigned long>(pid));
+}
+} // namespace
+
+void* CreateBlackboxShared(size_t size) {
+	wchar_t name[64];
+	BlackboxSharedName(ProcessId(), name, std::size(name));
+	HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(size), name);
+	if (mapping == nullptr) return nullptr;
+	void* view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
+	if (view == nullptr) {
+		CloseHandle(mapping);
+		return nullptr;
+	}
+	// (Kept resident when it can be: a heartbeat store must not wait for the page file. The mapping's handle stays
+	// open for the process's life, for the watchdog to open it by name.)
+	(void)VirtualLock(view, size);
+	return view;
+}
+
+bool StartBlackboxWatchdog() {
+	wchar_t     exe[MAX_PATH * 2] {};
+	const DWORD length = GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe)));
+	if (length == 0 || length >= std::size(exe)) return false;
+	std::wstring command = L"\"" + std::wstring(exe) + L"\" --kyty-watchdog " + std::to_wstring(GetCurrentProcessId());
+	STARTUPINFOW        si {};
+	PROCESS_INFORMATION pi {};
+	si.cb = sizeof(si);
+	// No console, no inherited handle, normal priority, the game's working folder (its logs\ paths are relative to it).
+	if (CreateProcessW(exe, command.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS | NORMAL_PRIORITY_CLASS, nullptr,
+	                   nullptr, &si, &pi) == 0)
+		return false;
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return true;
+}
+
+namespace {
+
+struct WatchdogDump {
+	std::atomic<int>      state {0}; // 0 not asked, 1 being written, 2 written, 3 failed
+	std::atomic<uint64_t> bytes {0};
+	std::atomic<int64_t>  ms {0};
+};
+
+// MiniDumpWriteDump of the game (dbghelp.dll from System32, loaded here, not linked): its threads and stacks, the
+// thread info and the memory map, never its memory's contents (a few MB).
+void WriteHangDump(DWORD pid, std::wstring path, WatchdogDump* dump) {
+	const auto start = std::chrono::steady_clock::now();
+	bool       ok    = false;
+	if (HMODULE dbghelp = LoadLibraryExW(L"dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32); dbghelp != nullptr) {
+		using WriteDump = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+		if (auto* write = reinterpret_cast<WriteDump>(reinterpret_cast<void*>(GetProcAddress(dbghelp, "MiniDumpWriteDump")));
+		    write != nullptr) {
+			if (HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid); process != nullptr) {
+				HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+				if (file != INVALID_HANDLE_VALUE) {
+					// MiniDumpNormal (the stacks) | WithUnloadedModules | WithFullMemoryInfo | WithThreadInfo.
+					constexpr int Type = 0x20 | 0x800 | 0x1000;
+					ok = write(process, pid, file, Type, nullptr, nullptr, nullptr) != FALSE;
+					LARGE_INTEGER size {};
+					if (ok && GetFileSizeEx(file, &size) != 0) dump->bytes.store(static_cast<uint64_t>(size.QuadPart));
+					CloseHandle(file);
+					if (!ok) DeleteFileW(path.c_str());
+				}
+				CloseHandle(process);
+			}
+		}
+	}
+	dump->ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+	dump->state.store(ok ? 2 : 3, std::memory_order_release);
+}
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((format(printf, 4, 5)))
+#endif
+void WatchdogAppend(char* out, size_t size, size_t& used, const char* format, ...) {
+	if (used + 1 >= size) return;
+	va_list args;
+	va_start(args, format);
+	const int wrote = std::vsnprintf(out + used, size - used, format, args);
+	va_end(args);
+	if (wrote > 0) used = std::min(size - 1, used + static_cast<size_t>(wrote));
+}
+
+std::wstring WideFromUtf8(const char* text) {
+	wchar_t wide[Blackbox::SharedPath] {};
+	if (MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, static_cast<int>(std::size(wide))) == 0) return {};
+	return wide;
+}
+
+} // namespace
+
+int WatchdogMain(int argc, char* argv[]) {
+	if (argc < 3 || argv == nullptr || argv[1] == nullptr || std::strcmp(argv[1], "--kyty-watchdog") != 0) return -1;
+	const auto pid = static_cast<DWORD>(std::strtoul(argv[2], nullptr, 10));
+	if (pid == 0 || pid == GetCurrentProcessId()) return 2;
+	// The game: only to wait for its end and read its CPU time (no handle that could hold it up).
+	HANDLE game = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (game == nullptr) return 3;
+	wchar_t name[64];
+	BlackboxSharedName(pid, name, std::size(name));
+	HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
+	if (mapping == nullptr) return 4;
+	const auto* shared = static_cast<const Blackbox::Shared*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(Blackbox::Shared)));
+	if (shared == nullptr || shared->magic != Blackbox::SharedMagic || shared->size != sizeof(Blackbox::Shared) ||
+	    shared->pid != pid)
+		return 5;
+	const std::wstring log_path  = WideFromUtf8(shared->watchdog_path);
+	const std::wstring dump_path = WideFromUtf8(shared->dump_path);
+	if (log_path.empty()) return 6;
+	HANDLE file = CreateFileW(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
+	                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+	if (file == INVALID_HANDLE_VALUE) return 7;
+	// Its few pages kept in RAM when the game takes all of it (best effort), and its thread ahead of the game's at the
+	// same (normal) priority class: a line a second costs microseconds.
+	(void)SetProcessWorkingSetSizeEx(GetCurrentProcess(), size_t {8} << 20u, size_t {64} << 20u,
+	                                 QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	(void)SetThreadDescription(GetCurrentThread(), L"Kyty.Watchdog");
+
+	constexpr uint64_t FileLimit = uint64_t {32} << 20u;
+	uint64_t           written   = 0;
+	double             write_ms  = 0;
+	auto               put       = [&](const char* text, size_t size) {
+		if (written + size > FileLimit) return;
+		const auto before = std::chrono::steady_clock::now();
+		DWORD      done   = 0;
+		(void)WriteFile(file, text, static_cast<DWORD>(size), &done, nullptr);
+		written += done;
+		write_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count();
+	};
+	auto wall = [](char* out, size_t size, bool date) {
+		SYSTEMTIME t;
+		GetLocalTime(&t);
+		if (date)
+			(void)std::snprintf(out, size, "%04u-%02u-%02u %02u:%02u:%02u.%03u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
+			                    t.wSecond, t.wMilliseconds);
+		else
+			(void)std::snprintf(out, size, "%02u:%02u:%02u.%03u", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+	};
+	auto game_cpu = [&]() {
+		FILETIME created {}, ended {}, kernel {}, user {};
+		if (GetProcessTimes(game, &created, &ended, &kernel, &user) == 0) return 0.0;
+		const auto ticks = [](const FILETIME& f) { return (static_cast<uint64_t>(f.dwHighDateTime) << 32u) | f.dwLowDateTime; };
+		return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+	};
+	{
+		char when[32];
+		wall(when, sizeof(when), true);
+		char head[1400];
+		const int length = std::snprintf(
+		    head, sizeof(head),
+		    "KYTY WATCHDOG started %s for game pid %lu (its black box: %s). A line a second: this process's time, late=how "
+		    "late this line is (this process was held up too: the PC stalled), the game's black-box heartbeat (beat=its "
+		    "seconds/age; stage=what its 1 Hz thread was doing:for), its flips, presents, render thread phase, work in "
+		    "flight, CPU use; the system's free RAM, commit and load; wr=the last line's write time. GAME HUNG, PC alive: the "
+		    "heartbeat stopped >= 5 s while these lines go on (then once a minidump: %s). These lines stopping as well: the "
+		    "whole PC froze (or its disk).\n",
+		    when, static_cast<unsigned long>(pid), shared->watchdog_path, shared->dump_path);
+		if (length > 0) put(head, std::min(static_cast<size_t>(length), sizeof(head) - 1));
+	}
+
+	static WatchdogDump dump; // (static: its thread is detached, and may outlive this function by a little)
+	uint64_t     last_beat      = 0;
+	int64_t      beat_seen_ns   = Blackbox::NowNs(); // (this process's clock when the beat last changed)
+	bool         hung           = false;
+	int64_t      hung_since     = 0;
+	double       last_cpu       = game_cpu();
+	int64_t      last_cpu_ns    = Blackbox::NowNs();
+	int64_t      last_line_ns   = 0;
+	int          dump_reported  = 0;
+	auto         next           = std::chrono::steady_clock::now();
+	for (uint64_t line_number = 0;; ++line_number) {
+		const int64_t now = Blackbox::NowNs();
+		char          line[1024];
+		size_t        used = 0;
+#define add(...) WatchdogAppend(line, sizeof(line), used, __VA_ARGS__)
+		auto age = [&](int64_t since) -> long long { return since != 0 && now > since ? (now - since) / 1'000'000 : 0; };
+		char when[32];
+		wall(when, sizeof(when), false);
+		add("%s w#%llu", when, static_cast<unsigned long long>(line_number));
+		// (This process held up too - the whole PC stalled, or it slept: the game's heartbeat gets 5 s again from now,
+		// so a PC-wide stall or a resume from sleep is never taken for a hung game, nor dumped.)
+		const bool late = last_line_ns != 0 && now - last_line_ns > 1'500'000'000;
+		if (late) add(" late=%lldms", static_cast<long long>((now - last_line_ns - 1'000'000'000) / 1'000'000));
+		last_line_ns = now;
+
+		// The game's heartbeat and state, as its black box's 1 Hz thread left them.
+		const uint64_t beat  = shared->beat.load(std::memory_order_acquire);
+		const uint32_t stage = shared->stage.load(std::memory_order_acquire);
+		const uint32_t flags = shared->flags.load(std::memory_order_relaxed);
+		if (beat != last_beat || late) {
+			last_beat    = beat;
+			beat_seen_ns = now;
+		}
+		add(" | game: beat=%llu/%lldms stage=%s:%lldms flip=%llu/%lldms pres=%llu/%lldms", static_cast<unsigned long long>(beat),
+		    age(shared->beat_ns.load(std::memory_order_relaxed)), Blackbox::StageName(stage),
+		    age(shared->stage_ns.load(std::memory_order_relaxed)), static_cast<unsigned long long>(shared->flips.load(std::memory_order_relaxed)),
+		    age(shared->flip_ns.load(std::memory_order_relaxed)), static_cast<unsigned long long>(shared->presents.load(std::memory_order_relaxed)),
+		    age(shared->present_ns.load(std::memory_order_relaxed)));
+		if (const uint32_t phase = shared->render_phase.load(std::memory_order_relaxed); phase != 0)
+			add(" ph=%s%s:%lldms", (phase & Blackbox::PhaseAfter) != 0 ? "after-" : "", Blackbox::PhaseName(phase),
+			    age(shared->render_phase_ns.load(std::memory_order_relaxed)));
+		add(" rd=%d flt=%d pso=%d sub=%d priv=%.1fG ws=%.1fG", shared->reads.load(std::memory_order_relaxed),
+		    shared->faults.load(std::memory_order_relaxed), shared->pipelines.load(std::memory_order_relaxed),
+		    shared->submits.load(std::memory_order_relaxed),
+		    static_cast<double>(shared->private_bytes.load(std::memory_order_relaxed)) / 1073741824.0,
+		    static_cast<double>(shared->working_set.load(std::memory_order_relaxed)) / 1073741824.0);
+		if (const double cpu = game_cpu(); now > last_cpu_ns) {
+			add(" cpu=%.0f%%", (cpu - last_cpu) * 1e11 / static_cast<double>(now - last_cpu_ns));
+			last_cpu    = cpu;
+			last_cpu_ns = now;
+		}
+		if ((flags & Blackbox::SharedPaused) != 0) add(" PAUSED");
+		if ((flags & Blackbox::SharedMinimized) != 0) add(" MINIMIZED");
+		if ((flags & Blackbox::SharedQuitting) != 0) add(" QUITTING");
+
+		// The system, from here.
+		MEMORYSTATUSEX status {};
+		status.dwLength = sizeof(status);
+		if (GlobalMemoryStatusEx(&status) != 0)
+			add(" | sys: avail=%.2fG commit=%.1f/%.1fG load=%lu%%", static_cast<double>(status.ullAvailPhys) / 1073741824.0,
+			    static_cast<double>(status.ullTotalPageFile - std::min(status.ullTotalPageFile, status.ullAvailPageFile)) / 1073741824.0,
+			    static_cast<double>(status.ullTotalPageFile) / 1073741824.0, static_cast<unsigned long>(status.dwMemoryLoad));
+		add(" wr=%.0fms", write_ms);
+
+		// The game hung: its heartbeat stopped >= 5 s (not while it quits); once, the minidump, on a thread of its own.
+		const bool quitting = (flags & Blackbox::SharedQuitting) != 0;
+		if (beat != 0 && !quitting && now - beat_seen_ns >= 5'000'000'000) {
+			if (!hung) hung_since = beat_seen_ns;
+			hung = true;
+			add(" GAME HUNG, PC alive: heartbeat stopped %llds ago, its 1 Hz thread in %s for %lldms",
+			    static_cast<long long>((now - beat_seen_ns) / 1'000'000'000), Blackbox::StageName(stage),
+			    age(shared->stage_ns.load(std::memory_order_relaxed)));
+			if (!dump_path.empty() && dump.state.load() == 0) {
+				dump.state.store(1);
+				std::thread(WriteHangDump, pid, dump_path, &dump).detach();
+				add(" (minidump being written)");
+			}
+		} else if (hung && beat != 0) {
+			hung = false;
+			add(" (heartbeat back after %llds)", static_cast<long long>((now - hung_since) / 1'000'000'000));
+		}
+		if (const int state = dump.state.load(std::memory_order_acquire); state >= 2 && dump_reported == 0) {
+			dump_reported = 1;
+			if (state == 2)
+				add(" MINIDUMP written: %llu KB in %lld ms", static_cast<unsigned long long>(dump.bytes.load() >> 10u),
+				    static_cast<long long>(dump.ms.load()));
+			else
+				add(" MINIDUMP failed (after %lld ms)", static_cast<long long>(dump.ms.load()));
+		}
+#undef add
+		line[used++] = '\n';
+		put(line, used);
+
+		// The game's end, waited for until the next second.
+		next += std::chrono::seconds(1);
+		if (const auto wake = std::chrono::steady_clock::now(); next <= wake) next = wake + std::chrono::milliseconds(100);
+		const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(next - std::chrono::steady_clock::now()).count();
+		if (WaitForSingleObject(game, static_cast<DWORD>(std::max<long long>(0, wait))) == WAIT_OBJECT_0) {
+			DWORD code = 0;
+			(void)GetExitCodeProcess(game, &code);
+			char end[160];
+			wall(when, sizeof(when), false);
+			const int length = std::snprintf(end, sizeof(end), "%s the game ended (exit code 0x%08lx); watchdog out\n", when,
+			                                 static_cast<unsigned long>(code));
+			if (length > 0) put(end, std::min(static_cast<size_t>(length), sizeof(end) - 1));
+			// (A minidump being written finishes first: its thread's handle of the game.)
+			for (int i = 0; i < 300 && dump.state.load() == 1; ++i) Sleep(100);
+			CloseHandle(file);
+			return 0;
+		}
+	}
+}
+
 #else
+
+uint32_t ProcessId() {
+	return static_cast<uint32_t>(getpid());
+}
+
+// (No watchdog here: the block is this process's memory only.)
+void* CreateBlackboxShared(size_t size) {
+	return std::calloc(1, size);
+}
+
+bool StartBlackboxWatchdog() {
+	return false;
+}
+
+int WatchdogMain(int /*argc*/, char* /*argv*/[]) {
+	return -1;
+}
 
 void SetThreadName(const char* name) {
 	(void)pthread_setname_np(pthread_self(), name);
