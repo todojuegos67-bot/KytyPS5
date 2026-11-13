@@ -1194,6 +1194,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// RAM diet): off, nothing is freed or moved while playing.
 	env.Default("KYTY_SOFT_RELEASE", "0");
 	env.Default("KYTY_RAM_DIET", "0");
+	// (11-13) Texture offload and GPU-only offload off on every PC: on 20 GiB or less they turned on by themselves,
+	// dropped textures' guest bytes from RAM while playing and gave black textures.
+	env.Default("KYTY_TEXTURE_OFFLOAD", "0");
+	env.Default("KYTY_GPU_ONLY_OFFLOAD", "0");
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");
