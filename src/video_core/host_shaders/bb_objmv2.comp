@@ -18,7 +18,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D obj_mv;
 layout(binding = 1, rg16f) uniform image2D mv_out;
 layout(binding = 2, std430) buffer Stats {
-    uint s[12];
+    uint s[16];
 } st;
 layout(binding = 3) uniform sampler2D cur_color;
 layout(binding = 4) uniform sampler2D prev_color;
@@ -31,6 +31,51 @@ shared uint g_nz, g_obj, g_blend, g_all, g_chk, g_eo, g_ec, g_wo, g_wc, g_st, g_
 
 float Luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// bb-player-mv: refine a player pixel's vector against last frame's colour.
+float PatchCost(ivec2 c, vec2 v, vec2 size) {
+    float e = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const ivec2 q = clamp(c + ivec2(dx, dy), ivec2(0), ivec2(size) - 1);
+            const vec2 uv = (vec2(q) + 0.5 + v) / size;
+            e += abs(Luma(texelFetch(cur_color, q, 0).rgb) - Luma(textureLod(prev_color, uv, 0.0).rgb));
+        }
+    }
+    return e / 9.0;
+}
+bool PlayerPixel(ivec2 c, vec2 size) {
+    const vec2 uv = (vec2(c) + 0.5) / size;
+    return abs(uv.x - 0.5) < 0.16 && uv.y > 0.22 && uv.y < 0.97;
+}
+vec2 Refine(ivec2 c, vec2 v, bool additive) {
+    const vec2 size = vec2(p.size.xy);
+    const float e0 = PatchCost(c, v, size);
+    float best = e0;
+    vec2 bv = v;
+    for (int i = 0; i < 12; ++i) {
+        vec2 cand;
+        if (i < 8) {
+            const ivec2 o8[8] = ivec2[](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1),
+                                        ivec2(1, 1), ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1));
+            cand = v + vec2(o8[i]);
+        } else {
+            const ivec2 n4[4] = ivec2[](ivec2(4, 0), ivec2(-4, 0), ivec2(0, 4), ivec2(0, -4));
+            const ivec2 q = clamp(c + n4[i - 8], ivec2(0), ivec2(size) - 1);
+            const vec4 o = texelFetch(obj_mv, q, 0);
+            if (!(o.z > 0.5 && o.z < 1.5) || any(isnan(o.xy)) || any(isinf(o.xy))) continue;
+            cand = additive ? o.xy + imageLoad(mv_out, q).xy : o.xy;
+        }
+        const float e = PatchCost(c, cand, size);
+        if (e < best) { best = e; bv = cand; }
+    }
+    const bool change = best < e0 * 0.85 - 0.002;
+    atomicAdd(st.s[12], 1u);
+    if (change) atomicAdd(st.s[13], 1u);
+    atomicAdd(st.s[14], uint(clamp(e0, 0.0, 4.0) * 1024.0));
+    atomicAdd(st.s[15], uint(clamp(change ? best : e0, 0.0, 4.0) * 1024.0));
+    return change ? bv : v;
 }
 
 void main() {
@@ -46,6 +91,9 @@ void main() {
             if (!any(isnan(o.xy)) && !any(isinf(o.xy))) {
                 vec2 v = o.xy;
                 if (additive) v += imageLoad(mv_out, c).xy;
+                if ((flags & 16u) != 0u && o.z < 1.5 && PlayerPixel(c, vec2(p.size.xy))) {
+                    v = Refine(c, v, additive);
+                }
                 imageStore(mv_out, c, vec4(v, 0.0, 0.0));
             }
         }
@@ -91,6 +139,9 @@ void main() {
             if (p.size.z != 0u) {
                 imageStore(mv_out, c, vec4(ov, 0.0, 0.0));
             }
+        }
+        if ((flags & 4u) != 0u) {
+            imageStore(next_prev_color, c, texelFetch(cur_color, c, 0)); // bb-player-mv: every frame
         }
     }
     barrier();

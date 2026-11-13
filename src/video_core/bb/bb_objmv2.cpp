@@ -39,7 +39,7 @@ constexpr u64 kArenaBytes = 24ull << 20;        // snapshots a frame
 constexpr u64 kTableBytes = 2ull << 20;         // table entries a frame
 constexpr u64 kHeaderBytes = 4096;              // zero entry + dummy dword
 constexpr u32 kMaxSnapBytes = 64u << 10;        // larger buffers: read the current one
-constexpr u32 kStatWords = 12; // word 11: attachment 7 texels != 0
+constexpr u32 kStatWords = 16; // word 11: attachment 7 texels != 0; 12-15: the player mask (bb-player-mv)
 constexpr u64 kStatPeriod = 60;                 // statistics / check frame: 1 in 60
 constexpr u32 kStaticSample = 4;                // check frames: 1 static draw in 4 checked
 
@@ -129,6 +129,8 @@ struct State {
     bool additive = true;
     bool stat_frame = false;   // this frame: statistics + check
     u64 color_stored = ~0ull;  // frame whose colour is in prev[0]
+    u32 pp = 0;                // (bb-player-mv) prev image read this frame (the other one is written)
+    u64 sec_pl_px = 0, sec_pl_changed = 0, sec_pl_before = 0, sec_pl_after = 0;
     u32 frame_vec_draws = 0, static_seen = 0;
     std::array<bool, kSlots> slot_stat{};
     double ts_period = 1.0;
@@ -315,6 +317,10 @@ void ReadStats(u32 slot) {
     g.sec_static_px += s[8];
     g.sec_static_abs += s[9];
     g.sec_static_zero += s[10];
+    g.sec_pl_px += s[12];
+    g.sec_pl_changed += s[13];
+    g.sec_pl_before += s[14];
+    g.sec_pl_after += s[15];
     if (g.slot_stat[slot]) {
         g.sec_nonzero += s[11];
         ++g.sec_stat_frames;
@@ -1262,7 +1268,15 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     const u32 slot = g.slot;
     ReadStats(slot);
     const bool stat = g.stat_frame;
-    const bool store_color = g.check && color_view && IsStatFrame(g.frame + 1);
+    // bb-player-mv: the player mask (moving opaque pixels in the screen's centre): every
+    // frame its vectors are measured against last frame's colour and refined (own vector,
+    // +-1 px, the neighbours' vectors: the one whose 3x3 patch matches best). Needs last
+    // frame's colour every frame (ping-pong prev[0] / prev[1]). BB_PLAYER_MV_REFINE=0: off.
+    static const bool refine = [] {
+        const char* v = std::getenv("BB_PLAYER_MV_REFINE");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    const bool store_color = color_view && ((g.check && IsStatFrame(g.frame + 1)) || refine);
     if (!stat && !store_color && (g.frame_vec_draws == 0 || reset)) {
         // Nothing moving drew this frame: the camera vectors stay as they are.
         ++g.sec_skipped;
@@ -1298,7 +1312,8 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
         .image = g.image,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
-    const u32 next = 0; // single previous-colour image (written the frame before a check)
+    const u32 rd = refine ? g.pp : 0u; // previous colour read
+    const u32 next = refine ? 1u - g.pp : 0u; // written (single image without refine)
     const vk::ImageMemoryBarrier2 prev_barriers[2] = {
         {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
          .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
@@ -1330,7 +1345,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     const vk::DescriptorImageInfo mv_info{{}, mv_view, vk::ImageLayout::eGeneral};
     const vk::DescriptorBufferInfo stats_info{g.stats, slot * kStatWords * 4, kStatWords * 4};
     const vk::DescriptorImageInfo cur_info{g.sampler, color_view, vk::ImageLayout::eGeneral};
-    const vk::DescriptorImageInfo prev_info{g.sampler, g.prev_view[0], vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo prev_info{g.sampler, g.prev_view[rd], vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo next_info{{}, g.prev_view[next], vk::ImageLayout::eGeneral};
     const auto w = [](u32 b, vk::DescriptorType t, const vk::DescriptorImageInfo* i,
                       const vk::DescriptorBufferInfo* bi) {
@@ -1350,9 +1365,12 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     };
     const bool check = stat && g.check && color_view && !reset && g.prev_valid &&
                        g.color_stored + 1 == g.frame;
+    const bool refine_now = refine && color_view && !reset && g.prev_valid &&
+                            g.color_stored + 1 == g.frame;
     const std::array<u32, 4> push{render.width, render.height, reset ? 0u : 1u,
                                   (stat ? 1u : 0u) | (g.additive ? 2u : 0u) |
-                                      (store_color ? 4u : 0u) | (check ? 8u : 0u)};
+                                      (store_color ? 4u : 0u) | (check ? 8u : 0u) |
+                                      (refine_now ? 16u : 0u)};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
@@ -1367,9 +1385,10 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &done});
     g.slot_used[slot] = true;
     g.slot_stat[slot] = stat;
-    if (store_color) {
+    if (store_color && !reset) {
         g.color_stored = g.frame;
         g.prev_valid = true;
+        if (refine) g.pp = next;
     }
 }
 
@@ -1498,6 +1517,15 @@ void OnFlip() {
         g.sec_wo, g.sec_wc,
         g.sec_stat_frames ? double(g.sec_nonzero) / double(g.sec_stat_frames) : 0.0,
         g.sec_not_composed, g.sec_gpu_bufs));
+    if (g.sec_pl_px > 0) {
+        Log(fmt::format("[player-mv] player mask {:.0f} px/frame, vectors refined {:.1f}%, patch error "
+                        "{:.4f} -> {:.4f} (BB_PLAYER_MV_REFINE=0 off)",
+                        double(g.sec_pl_px) / double(std::max<u64>(1, g.sec_frames)),
+                        100.0 * double(g.sec_pl_changed) / double(g.sec_pl_px),
+                        double(g.sec_pl_before) / 1024.0 / double(g.sec_pl_px),
+                        double(g.sec_pl_after) / 1024.0 / double(g.sec_pl_px)));
+    }
+    g.sec_pl_px = g.sec_pl_changed = g.sec_pl_before = g.sec_pl_after = 0;
     if (g.velocity) {
         // Native share of the G-buffer pixels (statistics frames): pixels written by a draw's own
         // vector (class 1 + the sampled static draws, class 2) over all pixels; the rest keeps
