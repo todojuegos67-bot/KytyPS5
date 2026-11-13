@@ -118,7 +118,7 @@ inline void Flip() {
 	g_flips.store(flip + 1, std::memory_order_release);
 	// (KYTY_FPS_HUD's frame-time graph: the frame and the render thread's busy part of it.)
 	PerfOverlay::NoteFlip(flip_ns, g_render_idle_ns);
-	// (ds-native-lean) KYTY_FPS_LOG: the [fps] line once a LeanLog::Period() (default 10 s) over that period, its [fps+] /
+	// (ds-native-lean) KYTY_FPS_LOG: the [fps] line once a LeanLog::Period() (the port: 10 s) over that period, its [fps+] /
 	// [acq] lines only with KYTY_LOG_VERBOSE=1 (then every second, as before). The last second's frame times are
 	// published to memory every second either way (the metrics panel: LeanLog::PublishFrames). The SLOW Frame lines only
 	// with KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS) > 0 (the port: 0, off).

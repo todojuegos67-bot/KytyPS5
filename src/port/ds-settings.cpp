@@ -1170,6 +1170,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// and a clock read around every instrumented call), the [fps] line once in 10 s (local/lean-log.h). The metrics
 	// panel reads its numbers from memory. [Avanzado] extra KYTY_HITCH_LOG_MS=40;KYTY_LOG_VERBOSE=1: the old log.
 	env.Set("KYTY_HITCH_LOG_MS", "0");
+	env.Default("KYTY_LOG_PERIOD", "10"); // (the rate lines: [fps], [fsr3] / [dlssg] / [fsr3-mfg], FG particle native)
 	if (s.aspect_fit) env.Set("KYTY_PRESENT_ASPECT", "fit");
 	env.Default("KYTY_ASYNC_DRAW_PIPELINES", "1");
 	// (ds-pc-port47) "Debe funcionar exactamente como en el launcher": every shader default as the emulator's (de604751

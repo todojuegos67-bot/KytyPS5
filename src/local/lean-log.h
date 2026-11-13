@@ -4,7 +4,9 @@
 // metrics panel and the F8 HUD take their numbers from memory, PublishFrames / PublishFg below).
 //   KYTY_LOG_VERBOSE=1   every diagnostic line as before: the per-second rate lines ([fsr3], [dlssg], [fsr3-mfg]),
 //                        one line per table program and per shader translation ("Table: ...", "Shaders: ...")
-//   KYTY_LOG_PERIOD=<s>  the period of the rate lines that stay (default 10 s; 1 with KYTY_LOG_VERBOSE=1)
+//   KYTY_LOG_PERIOD=<s>  the period of the rate lines that stay (default 1 s, every second as before: the emulator's
+//                        launcher and its metricas.ps1 window read them each second; always 1 with KYTY_LOG_VERBOSE=1).
+//                        The port sets 10 (ds-settings.cpp), 1 with its own metricas.ps1 window (ds-main.cpp).
 // The numbers behind the lines are still worked out each second (frame generation's dynamic multiplier decides on
 // them): only the printing is rarer.
 
@@ -30,7 +32,7 @@ inline bool Verbose() {
 inline int Period() {
 	static const int seconds = [] {
 		const char* value = std::getenv("KYTY_LOG_PERIOD");
-		const int   n     = value != nullptr ? std::atoi(value) : (Verbose() ? 1 : 10);
+		const int   n     = !Verbose() && value != nullptr && *value != '\0' ? std::atoi(value) : 1;
 		return n >= 1 ? n : 1;
 	}();
 	return seconds;

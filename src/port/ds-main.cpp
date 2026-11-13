@@ -1405,8 +1405,13 @@ int main(int argc, char* argv[]) {
 	// (ds-pc-port41) Metricas is drawn in the game now (ds-menu.cpp MetricsPanel: metricas.ps1's rows, top-centre); the
 	// separate metricas.ps1 window only with KYTY_PORT_METRICS_WINDOW=1.
 	if ((settings.metrics == "1" || settings.metrics == "2") && std::getenv("KYTY_PORT_METRICS_WINDOW") != nullptr &&
-	    std::string(std::getenv("KYTY_PORT_METRICS_WINDOW")) == "1")
+	    std::string(std::getenv("KYTY_PORT_METRICS_WINDOW")) == "1") {
+		// (ds-native-lean) metricas.ps1 reads the run log's [fps] / [fsr3] / [dlssg] lines each second: they stay
+		// every second for it (the port's default period is 10 s, ds-settings.cpp).
+		if (const char* period = std::getenv("KYTY_LOG_PERIOD"); period != nullptr && std::string(period) == "10")
+			SetEnv("KYTY_LOG_PERIOD", "1");
 		StartMetricsWindow(root, settings, pc);
+	}
 	// (ds-pc-port47) The game's threads on its CPUs (the V-Cache CCD) by the process's default CPU sets, the process itself
 	// on every CPU: the shader workers use them all (LocalPlatform::ApplyGameCpus, MakeShaderWorkerThread).
 	if (mask != system_mask) {
