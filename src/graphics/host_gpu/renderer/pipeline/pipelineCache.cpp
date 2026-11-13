@@ -2798,13 +2798,11 @@ void PipelineCache::EvictIdlePipelines() {
 		}
 	}
 	if (m_idle_evict_off) m_evict_pressure = false;
-	// Our RAM guard / RAM diet still evicts under RAM pressure, whatever the idle-evict cut-off above.
-	// RAM pressure (ram-guard.h): pipelines idle 60 s (20 s when critical) leave too, whatever the video memory; each
-	// held ~220 KB of the driver's RAM and is made again from the static store at its next binding.
-	// (Critical only: at low pressure, 10-24, a 16 GB simulation evicted 3552 pipelines and made 1296 again for ~10-30 MB
-	// freed a pass.)
+	// The RAM diet (KYTY_RAM_DIET=1, opt-in) still evicts, whatever the idle-evict cut-off above. RAM pressure
+	// (ram-guard.h) no longer releases pipelines: only the normal idle eviction runs (a mass release under pressure
+	// freed little RAM and made the game stutter remaking them). It still trims the static store's shared bytes.
 	const int ram_pressure = RamGuard::PressureLevel() >= RamGuard::Critical ? RamGuard::Critical : 0;
-	m_evict_pressure = m_evict_pressure || RamDietEnabled() || ram_pressure != 0;
+	m_evict_pressure = m_evict_pressure || RamDietEnabled();
 	if (RamDietEnabled()) {
 		// Replaced unoptimized pipelines past RamDietReplacedSeconds (pushed in time order).
 		const auto old = (now - std::chrono::seconds(RamDietReplacedSeconds)).time_since_epoch().count();
@@ -2833,10 +2831,6 @@ void PipelineCache::EvictIdlePipelines() {
 	uint32_t below = 0; // bound in an earlier flip: idle since then
 	if (m_evict_pressure) {
 		auto idle = settings.idle;
-		// (Critical RAM or commit pressure: idle 20 s, as said above; it was 60 s, and a 16 GB PC at the commit limit
-		// evicted 17 pipelines in 5 minutes. A remake from the static store is ~0.4 ms on an RTX 5080.)
-		if (ram_pressure != 0)
-			idle = std::min<std::chrono::nanoseconds>(idle, std::chrono::seconds(20));
 		const auto horizon = (now - idle).time_since_epoch().count();
 		uint32_t   first   = flip - std::min<uint32_t>(flip - 1, static_cast<uint32_t>(m_flip_times.size() - 1)), last = flip;
 		if (m_flip_times[first % m_flip_times.size()] <= horizon) {
@@ -2868,7 +2862,6 @@ void PipelineCache::EvictIdlePipelines() {
 	for (auto& [key, pipeline]: m_graphics_pipelines) evict(*pipeline);
 	for (auto& [id, pipeline]: m_compute_pipelines) evict(*pipeline);
 	if (scene_left && evicted < MaxEvictions) m_scene_swept = true;
-	if (ram_pressure != 0 && evicted != 0) RamGuard::NoteReleased(RamGuard::Pipelines, evicted, evicted * RamDietPipelineBytes);
 	g_pipeline_evictions.scene.fetch_add(left, std::memory_order_relaxed);
 	if (scene_left && m_scene_swept) {
 		std::printf("Pipelines of the worlds left (%s for %lld s): %llu evicted in all, %llu made again (%.0f ms)\n",

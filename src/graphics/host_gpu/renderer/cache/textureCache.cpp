@@ -5733,34 +5733,13 @@ void TextureCache::RunGarbageCollector() {
 	// Less the room game buffers in use that got system memory need back (BufferCache::MoveSpilledBufferBack).
 	constexpr uint64_t GiB           = uint64_t {1} << 30u;
 	const uint64_t     normal_above  = m_trigger_gc_memory - std::min(m_trigger_gc_memory, m_buffer_cache.SpilledRoom());
-	uint64_t           collect_above = normal_above;
-	// Critical RAM pressure (ram-guard.h): images no draw used for 600 flips go (uploaded again from guest memory at
-	// their next use; GPU-written ones as below) down to 1 GiB under the use when it began, not under 2 GiB. The target
-	// is held while the pressure lasts: not a collection that follows the use down.
-	static uint64_t ram_target = 0;
-	bool            by_ram     = false;
-	// The commit guard (ram-guard.h, headroom under the reserve): NVIDIA charges video memory to the process's commit, so
-	// the target goes down 512 MiB more every 300 flips while it lasts (not under 2 GiB), images unused for 300 flips.
-	static uint64_t commit_lowered_tick = 0;
-	const bool      commit_tight        = RamGuard::CommitTight();
-	if (RamGuard::PressureLevel() >= RamGuard::Critical && m_total_used_memory != 0) {
-		if (ram_target == 0) ram_target = std::max<uint64_t>(2 * GiB, m_total_used_memory > GiB ? m_total_used_memory - GiB : 0);
-		if (commit_tight && tick >= commit_lowered_tick + 300) {
-			commit_lowered_tick = tick;
-			const uint64_t lower = std::min(ram_target, m_total_used_memory) > 2 * GiB + GiB / 2
-			                           ? std::min(ram_target, m_total_used_memory) - GiB / 2 : 2 * GiB;
-			ram_target = std::max<uint64_t>(2 * GiB, lower);
-		}
-		if (ram_target < collect_above) {
-			by_ram        = m_total_used_memory < normal_above;
-			collect_above = ram_target;
-		}
-	} else {
-		ram_target = 0;
-	}
+	const uint64_t     collect_above = normal_above;
+	// RAM / commit pressure (ram-guard.h) no longer lowers this target: images are collected only for the video memory
+	// budget. Under RAM pressure the collector deleted thousands of images in use (black textures) on 16 GB PCs with
+	// half the video memory free, for little RAM back.
 	const uint64_t     over          = m_total_used_memory > collect_above ? m_total_used_memory - collect_above : 0;
-	const uint64_t     StaleTicks    = by_ram ? (commit_tight ? 300 : 600) : over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
-	const size_t       MaxDeletions  = by_ram ? 40 : over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
+	const uint64_t     StaleTicks    = over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
+	const size_t       MaxDeletions  = over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
 	// For a while after the GPU could not make an image (InsertImage), images unused for FailedRetryTicks go too: the
 	// superseded ones whose memory it needs (issue #49: a 16 GB GPU full of texture-pool images).
 	const bool     failing     = m_failed_tick != 0 && tick < m_failed_tick + 600;
@@ -5797,10 +5776,6 @@ void TextureCache::RunGarbageCollector() {
 		if (owner == nullptr || !owner->registered) {
 			continue;
 		}
-		// (For the RAM pressure only images whose bytes are guest memory's: none the GPU wrote.)
-		if (by_ram && owner->IsGpuModified()) {
-			continue;
-		}
 		if (owner->IsGpuModified()) {
 			if (SafeToDownload(*owner) && !TryDownloadImage(id)) {
 				continue;
@@ -5815,7 +5790,6 @@ void TextureCache::RunGarbageCollector() {
 			            static_cast<unsigned long long>(m_total_used_memory));
 			std::fflush(stdout);
 		}
-		if (by_ram) RamGuard::NoteReleased(RamGuard::Images, 1, owner->info.data.size);
 		VramSaverAdd(VramEvicted, 1);
 		VramSaverAdd(VramEvictedBytes, owner->info.data.size);
 		DeleteImage(id);

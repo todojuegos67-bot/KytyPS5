@@ -734,7 +734,7 @@ void Watch() {
 	auto     next_commit_line = Clock::now() + std::chrono::seconds(30);
 	if (CommitGuardOn())
 		std::printf("Commit guard: on (KYTY_COMMIT_GUARD=0 off): commit headroom kept >= %s; under it a release pass "
-		            "every second, the texture collector lowered, emulator cache allocations of 64 MiB or more refused "
+		            "every second (GPU images and pipelines are not released for it), emulator cache allocations of 64 MiB or more refused "
 		            "when no room is made\n",
 		            Env("KYTY_COMMIT_RESERVE_MB") != nullptr ? "KYTY_COMMIT_RESERVE_MB" : "max(1536 MiB, 6% of the limit)");
 	else
@@ -919,7 +919,8 @@ void Watch() {
 			Libs::LibKernel::Memory::ReportGuestAccess(true);
 			PrintResidency(sample.store_committed);
 			std::printf("RAM (%lld s): %s; pressure %s, real available %llu MiB, real commit headroom %llu MiB; pressure "
-			            "passes %llu (%llu MB), pipelines released %llu, images collected %llu (%llu MiB)\n",
+			            "passes %llu (%llu MB), pipelines released %llu, images collected %llu (%llu MiB; RAM pressure no longer "
+			            "collects images or releases pipelines: only the video memory budget collects images)\n",
 			            static_cast<long long>(log_period), Figures(sample).c_str(), LevelName(level),
 			            static_cast<unsigned long long>(sample.real_available / MiB),
 			            static_cast<unsigned long long>(sample.real_headroom / MiB), static_cast<unsigned long long>(flushes),
