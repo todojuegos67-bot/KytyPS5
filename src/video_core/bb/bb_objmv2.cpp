@@ -88,6 +88,7 @@ struct State {
     vk::Image image{};
     VmaAllocation image_alloc{};
     vk::ImageView view{};
+    vk::Extent2D last_render{}; // (11-13) the last composed render size
     std::array<vk::Image, 2> prev{};
     std::array<VmaAllocation, 2> prev_alloc{};
     std::array<vk::ImageView, 2> prev_view{};
@@ -1242,11 +1243,22 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
         std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
 }
 
+bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y) {
+    if (!g.ready || !g.image || !g.view || g.width == 0 || g.height == 0 || g.last_render.width == 0) {
+        return false;
+    }
+    view = g.view;
+    scale_x = float(g.last_render.width) / float(g.width);
+    scale_y = float(g.last_render.height) / float(g.height);
+    return true;
+}
+
 void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_view,
              vk::Extent2D render, bool reset) {
     if (!g.ready || g.composed || !g.cleared || !g.image) return;
     if (render.width > g.width || render.height > g.height) return;
     g.composed = true;
+    g.last_render = render;
     const u32 slot = g.slot;
     ReadStats(slot);
     const bool stat = g.stat_frame;

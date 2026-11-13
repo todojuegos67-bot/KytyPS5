@@ -81,6 +81,9 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
 // (`mv` RG16F, General); `color` the presented colour (RGBA16F, General) for the check.
 void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_view,
              vk::Extent2D render, bool reset);
+// (11-13) Presenter, FSR 3 "player from the real frame": attachment 7 (class in .z, 1 = moving
+// opaque) and the part of it this frame's render covers (render / image size). False: none.
+bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y);
 // Presenter: the guest flip (end of a frame).
 void OnFlip();
 

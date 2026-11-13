@@ -15,8 +15,10 @@ layout(binding = 3, rgba8) uniform image2D target; // the HUD-less image (BGRA v
 layout(std430, binding = 4) buffer Counts {
     uint counts[]; // per slot: [HUD pixels, non-HUD pixels that differed (now fixed)]
 };
+layout(binding = 5) uniform sampler2D obj_tex;     // (11-13) attachment 7 (.z class 1 = moving opaque)
 layout(push_constant) uniform Push {
     uvec4 size; // width, height, 1: the target is BGRA memory viewed as RGBA, counter slot
+    vec4 obj;   // render / image scale x y, 1: player from the real frame
 } p;
 
 void main() {
@@ -32,6 +34,18 @@ void main() {
     if (max(d.r, max(d.g, d.b)) > 0.5 / 255.0) {
         atomicAdd(counts[base], 1u); // the HUD drew here: keep the post-processed HUD-less pixel
         return;
+    }
+    if (p.obj.z > 0.5) {
+        // The player: centre of the screen, moving opaque. The HUD-less image differs there,
+        // so FSR 3 takes those pixels from the real frame (as UI).
+        const bool centre = abs(uv.x - 0.5) < 0.16 && uv.y > 0.22 && uv.y < 0.97;
+        if (centre) {
+            const float cls = textureLod(obj_tex, uv * p.obj.xy, 0.0).z;
+            if (cls > 0.5 && cls < 1.5) {
+                imageStore(target, c, vec4(0.0));
+                return;
+            }
+        }
     }
     vec4 f = texelFetch(final_tex, c, 0);
     vec4 t = imageLoad(target, c);

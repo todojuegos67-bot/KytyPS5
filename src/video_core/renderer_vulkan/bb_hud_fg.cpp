@@ -10,6 +10,8 @@
 #include "video_core/host_shaders/bb_hud_mask_comp.h"
 #include "video_core/host_shaders/bb_hud_over_comp.h"
 #include "video_core/host_shaders/bb_hudless_fix_comp.h"
+#include <cstdlib>
+#include "video_core/bb/bb_objmv2.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -296,12 +298,13 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
     if (!fix_tried) {
         fix_tried = true;
         constexpr auto C = vk::ShaderStageFlagBits::eCompute;
-        const std::array<vk::DescriptorSetLayoutBinding, 5> fb{{
+        const std::array<vk::DescriptorSetLayoutBinding, 6> fb{{
             {0, vk::DescriptorType::eCombinedImageSampler, 1, C},
             {1, vk::DescriptorType::eCombinedImageSampler, 1, C},
             {2, vk::DescriptorType::eCombinedImageSampler, 1, C},
             {3, vk::DescriptorType::eStorageImage, 1, C},
             {4, vk::DescriptorType::eStorageBuffer, 1, C},
+            {5, vk::DescriptorType::eCombinedImageSampler, 1, C},
         }};
         auto [lr, l] = device.createDescriptorSetLayout({
             .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
@@ -405,7 +408,20 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
         return vk::WriteDescriptorSet{
             .dstBinding = b, .descriptorCount = 1, .descriptorType = t, .pImageInfo = i};
     };
+    // (11-13) BB_FSR3_PLAYER_REAL=1: the player (moving opaque pixels of attachment 7 in the
+    // screen's centre) given to FSR 3 as UI: taken from the real frame, no ghost (moves at the
+    // real rate). Only FSR 3 reads this image.
+    static const bool player_real = [] {
+        const char* v = std::getenv("BB_FSR3_PLAYER_REAL");
+        return v != nullptr && v[0] == '1';
+    }();
+    vk::ImageView obj_view{};
+    float osx = 1.0f, osy = 1.0f;
+    const bool use_obj = player_real && BB::ObjMv2::ObjectTarget(obj_view, osx, osy);
+    const vk::DescriptorImageInfo o_info{sampler, use_obj ? obj_view : frame_view,
+                                         vk::ImageLayout::eGeneral};
     const std::array writes{
+        w(5, vk::DescriptorType::eCombinedImageSampler, &o_info),
         w(0, vk::DescriptorType::eCombinedImageSampler, &f_info),
         w(1, vk::DescriptorType::eCombinedImageSampler, &a_info),
         w(2, vk::DescriptorType::eCombinedImageSampler, &b_info),
@@ -415,10 +431,13 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
                                .descriptorType = vk::DescriptorType::eStorageBuffer,
                                .pBufferInfo = &c_info},
     };
-    const u32 push[4] = {extent.width, extent.height, bgra ? 1u : 0u, slot};
+    struct {
+        u32 size[4];
+        float obj[4];
+    } push{{extent.width, extent.height, bgra ? 1u : 0u, slot}, {osx, osy, use_obj ? 1.0f : 0.0f, 0.0f}};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, fix_pipe);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, fix_layout, 0, writes);
-    cmd.pushConstants(fix_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
+    cmd.pushConstants(fix_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
     cmd.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
     const vk::ImageMemoryBarrier2 to_read{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
