@@ -1033,7 +1033,8 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-13) With a 4 GB texture pool the game needs less than the PS5's 12 GiB allocator budget: the guest store is
 	// 12288 MiB (was 13824), so the block the engine maps above 12 GiB and keeps for good (~1.1 GB) no longer exists.
 	// Set once at boot; nothing is moved while playing.
-	if (demons) env.Default("KYTY_GUEST_STORE_MB", "12288");
+	// (11-13) KYTY_GUEST_STORE_MB=12288 removed: later direct allocations (104 MiB, 2 MiB) no longer fit and textures
+	// went black at times. The store stays at the PS5 size.
 	// Guest memory committed only where the game maps it (at map time, not moved later): not all 13.8 GB at boot.
 	env.Default("KYTY_BACKING_ON_DEMAND", "1");
 	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
