@@ -1,5 +1,5 @@
 #pragma once
-// Guest lazy commit (KYTY_GUEST_LAZY_COMMIT=1, default off; Windows, page-file store only).
+// Guest lazy commit (on by default, KYTY_GUEST_LAZY_COMMIT=0 turns it off; Windows, page-file store only).
 //
 // The guest backing store (one 13824 MiB page-file section) is created SEC_RESERVE instead of SEC_COMMIT, and its
 // pages are committed when first touched, in granules of KYTY_GUEST_LAZY_COMMIT_KB (default 64 KiB, the fresh-memory
@@ -17,6 +17,11 @@
 //    (Prefault, called by the file reads).
 // Both commit paths hold one lock and commit only pages still reserved: a commit of a committed page would reset
 // its protection (a watch lost).
+//
+// Nothing here ever decommits, frees, unmaps or moves memory: a page goes from reserved to committed once, at its first
+// touch, and stays committed (and resident only once something writes it) for the rest of the run. Guest pages nobody
+// on the CPU touches - the bulk of them render targets and other GPU-written images, whose bytes live in video memory
+// (fresh-memory.h fills their uploads with zeros instead of reading them) - are never committed at all.
 //
 // Decommit of freed guest memory is not done: a view of a section cannot be decommitted (VirtualFree MEM_DECOMMIT
 // refuses mapped views); only unmapping every view and recreating the section would free it.
@@ -51,6 +56,7 @@ struct State {
 	std::atomic<uint64_t> ticks {0};         // time in the commits (QueryPerformanceCounter ticks)
 	std::atomic<uint64_t> max_ticks {0};     // the longest single commit
 	std::atomic<uint64_t> failures {0};
+	std::atomic<uint64_t> mapped {0};        // bytes of the store a guest mapping has covered (64 KiB granules)
 	std::atomic<uint32_t> last_error {0};   // the last failed commit's GetLastError
 };
 
@@ -63,7 +69,7 @@ inline State& Get() {
 inline bool Requested() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_GUEST_LAZY_COMMIT");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	return on;
 }
@@ -211,6 +217,27 @@ inline LONG CALLBACK Handler(EXCEPTION_POINTERS* pointers) {
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// The store's mapped bytes (what KYTY_BACKING_ON_DEMAND would have committed at map): granules first covered.
+inline void NoteMapped(uint64_t bytes) {
+	Get().mapped.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+// Whether the page at `address` is a reserved (never committed) page of the store: its bytes are zeros once committed,
+// so a zero fill of it is not needed (and would only commit it).
+inline bool IsReservedPage(const void* address) {
+	if (!Get().enabled) return false;
+	MEMORY_BASIC_INFORMATION info {};
+	return VirtualQuery(address, &info, sizeof(info)) == sizeof(info) && IsOurReserved(info);
+}
+
+// The end of the run of pages starting at `address` that share its state (VirtualQuery), at most `end`.
+inline uint64_t RunEnd(uint64_t address, uint64_t end) {
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) != sizeof(info)) return end;
+	const uint64_t run_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+	return run_end > address && run_end < end ? run_end : end;
+}
+
 // Called by the store once its reserved section and alias exist.
 inline void Start(uint64_t alias_base, uint64_t store_size) {
 	auto& state = Get();
@@ -228,7 +255,7 @@ inline void Start(uint64_t alias_base, uint64_t store_size) {
 		return;
 	}
 	state.enabled = true;
-	std::printf("Guest lazy commit: on (KYTY_GUEST_LAZY_COMMIT=1), %llu MiB store reserved, committed at first touch in "
+	std::printf("Guest lazy commit: on (KYTY_GUEST_LAZY_COMMIT=0 turns it off), %llu MiB store reserved, committed at first touch in "
 	            "%llu KiB granules\n",
 	            static_cast<unsigned long long>(store_size >> 20u), static_cast<unsigned long long>(state.granule >> 10u));
 	std::fflush(stdout);
@@ -241,6 +268,12 @@ inline void Report(uint64_t written_bytes, uint64_t watched_bytes) {
 	const auto committed = state.committed.load(std::memory_order_relaxed);
 	const auto calls     = state.calls.load(std::memory_order_relaxed);
 	const auto ticks     = state.ticks.load(std::memory_order_relaxed);
+	const auto mapped    = state.mapped.load(std::memory_order_relaxed);
+	// (Printed with printf: LOGF is silent in the release build.)
+	std::printf("Guest lazy commit (30 s): %llu MiB of guest memory never committed thanks to it (%llu MiB mapped by the "
+	            "game, what commit-at-map would have committed; %llu MiB committed at first touch)\n",
+	            static_cast<unsigned long long>((mapped > committed ? mapped - committed : 0) >> 20u),
+	            static_cast<unsigned long long>(mapped >> 20u), static_cast<unsigned long long>(committed >> 20u));
 	std::printf("Guest lazy commit: %llu of %llu MiB store committed (%llu MiB never committed: the commit saved); "
 	            "%llu commit calls (%llu at a fault, %llu failed), %.1f ms committing (%.3f ms longest, %.1f us average); "
 	            "fresh memory: %llu MiB written, %llu MiB watched (at most %llu MiB can stay uncommitted: the store less "
@@ -266,6 +299,9 @@ namespace GuestLazyCommit {
 inline bool Requested() { return false; }
 inline bool Enabled() { return false; }
 inline bool Prefault(const void*, uint64_t) { return true; }
+inline void NoteMapped(uint64_t) {}
+inline bool IsReservedPage(const void*) { return false; }
+inline uint64_t RunEnd(uint64_t, uint64_t end) { return end; }
 inline void Report(uint64_t, uint64_t) {}
 } // namespace GuestLazyCommit
 

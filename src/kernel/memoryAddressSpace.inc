@@ -149,7 +149,7 @@ public:
 		// cannot be made or its drive has less than the store's size + 4 GiB free.
 		m_file = OpenBackingFile(m_size);
 		if (m_file != INVALID_HANDLE_VALUE) m_on_demand = false; // (SEC_RESERVE is for page-file sections only)
-		// KYTY_GUEST_LAZY_COMMIT=1 (guest-lazy-commit.h): reserved too, but each granule committed at its first touch
+		// KYTY_GUEST_LAZY_COMMIT (guest-lazy-commit.h, on unless =0): reserved too, but each granule committed at its first touch
 		// (a fault) or protection change, not when a mapping covers it.
 		m_lazy = m_file == INVALID_HANDLE_VALUE && GuestLazyCommit::Requested();
 		if (m_lazy) m_on_demand = true;
@@ -447,7 +447,7 @@ public:
 		for (uint64_t offset = backing_offset; offset < end;) {
 			const uint64_t granule = offset >> UsedGranuleBits;
 			const uint64_t next    = std::min(end, (granule + 1) << UsedGranuleBits);
-			if (IsUsedGranule(granule)) std::memset(m_backing_base + offset, 0, next - offset);
+			if (IsUsedGranule(granule)) ZeroCommitted(offset, next);
 			offset = next;
 		}
 		NoteUsedUnlocked(backing_offset, size);
@@ -1801,8 +1801,28 @@ private:
 		if (size == 0) return;
 		const uint64_t last = (backing_offset + size - 1) >> UsedGranuleBits;
 		if (m_used.size() <= (last >> 6)) m_used.resize((last >> 6) + 1, 0);
+		uint64_t first_covered = 0;
 		for (uint64_t granule = backing_offset >> UsedGranuleBits; granule <= last; ++granule) {
-			m_used[granule >> 6] |= uint64_t {1} << (granule & 63);
+			const uint64_t bit = uint64_t {1} << (granule & 63);
+			if ((m_used[granule >> 6] & bit) == 0) ++first_covered;
+			m_used[granule >> 6] |= bit;
+		}
+		if (first_covered != 0) GuestLazyCommit::NoteMapped(first_covered << UsedGranuleBits);
+	}
+	// Zeroes [offset, end) of the backing (lock held), but not its pages still reserved (KYTY_GUEST_LAZY_COMMIT): those
+	// were never committed, so they read zeros once committed, and a memset would only commit them. Nothing is freed.
+	void ZeroCommitted(uint64_t offset, uint64_t end) {
+		if (!GuestLazyCommit::Enabled()) {
+			std::memset(m_backing_base + offset, 0, end - offset);
+			return;
+		}
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		while (offset < end) {
+			const uint64_t next = GuestLazyCommit::RunEnd(base + offset, base + end) - base;
+			const uint64_t stop = next > offset ? next : end;
+			if (!GuestLazyCommit::IsReservedPage(m_backing_base + offset))
+				std::memset(m_backing_base + offset, 0, stop - offset);
+			offset = stop;
 		}
 	}
 	std::vector<uint64_t>        m_used; // 1 bit per 64 KiB granule of the backing a mapping has covered

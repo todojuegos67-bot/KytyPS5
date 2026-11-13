@@ -171,7 +171,8 @@ void ApplyLowRamDefaults() {
 		const bool  in_file  = file != nullptr && !(file[0] == '0' && file[1] == '\0');
 		const char* lazy     = Env("KYTY_GUEST_LAZY_COMMIT");
 		const char* demand   = Env("KYTY_LOWRAM_ON_DEMAND");
-		if (!in_file && !(lazy != nullptr && lazy[0] == '1') && !(demand != nullptr && demand[0] == '0'))
+		// (Lazy commit is on unless KYTY_GUEST_LAZY_COMMIT=0: commit-at-map is its fallback when it is turned off.)
+		if (!in_file && !(lazy == nullptr || lazy[0] != '0') && !(demand != nullptr && demand[0] == '0'))
 			SetDefault("KYTY_BACKING_ON_DEMAND", "1", &set);
 		std::printf("RAM: low-RAM profile on (%llu MiB of RAM%s; KYTY_LOWRAM=0 turns it off): %s\n",
 		            static_cast<unsigned long long>(ram / MiB), forced != nullptr ? ", KYTY_LOWRAM=1" : ", 20 GiB or less",
