@@ -399,6 +399,19 @@ void GraphicContext::LogVideoMemory(const char* label) const {
 		            buffers.allocationBytes >> 20u, buffers.blockBytes >> 20u, pool_bytes >> 20u, other >> 20u,
 		            (local - std::min(local, used_local)) >> 20u, driver >> 20u,
 		            (static_cast<int64_t>(budget) - static_cast<int64_t>(video)) / (1 << 20));
+		// The emulator's private commit split into what NVIDIA's Windows driver charges for video memory and the rest.
+		// The logs show private minus VMA's device-local blocks flat while video memory moves (16 GB run ~4.8 GB,
+		// 64 GB run ~6.1 GB), so the driver is taken to charge each device-local block's full size. An estimate from
+		// totals, not measured per allocation (KYTY_MEMORY_TAGS=1 measures it per vkAllocateMemory).
+		const uint64_t private_bytes = LocalPlatform::ProcessMemory().private_bytes;
+		const uint64_t vulkan_blocks = local + plain + host;
+		std::printf("Private split (30 s): emulator private %" PRIu64 " MiB; video memory in use %" PRIu64
+		            " MiB (VMA device-local blocks %" PRIu64 " MiB, plain type blocks %" PRIu64
+		            " MiB, host-visible blocks %" PRIu64 " MiB); non-driver remainder %" PRIu64
+		            " MiB (private minus VMA blocks), %" PRIu64 " MiB (private minus video memory in use)\n",
+		            private_bytes >> 20u, video >> 20u, local >> 20u, plain >> 20u, host >> 20u,
+		            (private_bytes - std::min(private_bytes, vulkan_blocks)) >> 20u,
+		            (private_bytes - std::min(private_bytes, video)) >> 20u);
 	}
 	std::fflush(stdout);
 }
