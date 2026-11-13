@@ -66,6 +66,8 @@ inline Mode GetMode() {
 		const char* offload = std::getenv("KYTY_TEXTURE_OFFLOAD");
 		if (offload != nullptr && offload[0] != '\0') {
 			if (offload[0] == '1') return Mode::Offload;
+		} else if (const char* low = std::getenv("KYTY_LOWRAM"); low != nullptr && low[0] == '1') {
+			return Mode::Offload; // (11-13) the low-RAM profile (KYTY_LOWRAM=1) on any PC: its 8 GB target needs it
 		} else if (const auto ram = LocalPlatform::PhysicalMemory(); ram != 0 && ram <= (uint64_t {20} << 30u)) {
 			return Mode::Offload;
 		}

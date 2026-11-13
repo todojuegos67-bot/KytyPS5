@@ -1181,6 +1181,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		env.Default("KYTY_BACKING_FILE", "0");
 		// (11-13) The guest copy of GPU-only images is dropped once they are on the card: RAM not held twice.
 		env.Default("KYTY_GPU_ONLY_OFFLOAD", "1");
+		// (11-13) ...which needs the texture offload on: by default only with 20 GiB of RAM or less, so on a 64 GB PC with
+		// the low-RAM profile nothing was dropped (no "Texture offload: on" line, no "Guest RAM by GPU cache" line).
+		env.Default("KYTY_TEXTURE_OFFLOAD", "1");
 	}
 	if (!upscaler.empty()) env.Set("KYTY_UPSCALER", upscaler);
 	for (const auto& [k, v]: sets) env.Set(k, v);
