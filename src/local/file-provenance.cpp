@@ -319,9 +319,9 @@ State* Init() {
 	std::lock_guard   lock(mutex);
 	if (auto* state = g_state.load(std::memory_order_acquire); state != nullptr) return state;
 	if (g_off.load(std::memory_order_relaxed)) return nullptr;
-	if (!EnvOn("KYTY_PROVENANCE", true) || !FreshMemory::Enabled()) {
+	if (!EnvOn("KYTY_PROVENANCE", false) || !FreshMemory::Enabled()) {
 		g_off.store(true, std::memory_order_relaxed);
-		std::printf("File provenance: off (%s)\n", FreshMemory::Enabled() ? "KYTY_PROVENANCE=0" : "needs fresh memory");
+		std::printf("File provenance: off (%s)\n", FreshMemory::Enabled() ? "default; KYTY_PROVENANCE=1 turns it on" : "needs fresh memory");
 		std::fflush(stdout);
 		return nullptr;
 	}

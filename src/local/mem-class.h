@@ -44,7 +44,8 @@ inline void StartReporter();
 inline bool Enabled() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_MEM_CLASS");
-		return value == nullptr || std::string_view(value) != "0";
+		// (11-13 RAM diet: measurement only, off by default; KYTY_MEM_CLASS=1 turns it on.)
+		return value != nullptr && value[0] != '\0' && std::string_view(value) != "0";
 	}();
 	return on;
 }
@@ -205,7 +206,7 @@ inline void Report() {
 	std::printf("Memory classes: %llu MiB committed = texture (sampled) %llu, render targets/GPU-written %llu, GPU buffers "
 	            "%llu, CPU-only %llu, unknown %llu MiB | from disk then GPU only (native-PC candidates) %llu MiB (textures "
 	            "%llu, buffers %llu); GPU-used with no CPU access trapped after %llu MiB, with one %llu MiB; filled from disk "
-	            "%llu MiB, ever written %llu MiB (KYTY_MEM_CLASS=0 turns it off)\n",
+	            "%llu MiB, ever written %llu MiB (KYTY_MEM_CLASS=0 turns it off; off by default)\n",
 	            MiB(all), MiB(total.cat[CatTex]), MiB(total.cat[CatGpuWrite]), MiB(total.cat[CatBuf]), MiB(total.cat[CatCpu]),
 	            MiB(total.cat[CatUnknown]), MiB(total.candidate), MiB(total.candidate_tex), MiB(total.candidate_buf),
 	            MiB(total.gpu_only), MiB(total.cpu_after), MiB(total.disk), MiB(total.written));
