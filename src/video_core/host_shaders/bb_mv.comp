@@ -16,7 +16,7 @@ layout(binding = 2) uniform sampler2D color_tex;
 layout(binding = 3, rgba16f) uniform writeonly image2D color_out;
 layout(binding = 4, r16f) uniform readonly image2D lum_prev;
 layout(binding = 5, r16f) uniform writeonly image2D lum_out;
-layout(binding = 6, r8) uniform writeonly image2D reactive_out;
+layout(binding = 6, r16f) uniform writeonly image2D reactive_out; // (11-13) R16F: DLSS takes it too
 layout(push_constant) uniform Push {
     vec4 r0; // clip_to_prev_clip rows (column vectors)
     vec4 r1;

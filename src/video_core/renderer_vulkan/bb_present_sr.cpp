@@ -252,7 +252,7 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     if (!Ensure(color, in, vk::Format::eR16G16B16A16Sfloat) ||
         !Ensure(motion, in, vk::Format::eR16G16Sfloat) ||
         !Ensure(output, out, vk::Format::eR16G16B16A16Sfloat) ||
-        !Ensure(reactive, in, vk::Format::eR8Unorm) ||
+        !Ensure(reactive, in, vk::Format::eR16Sfloat) ||
         !Ensure(lum[0], in, vk::Format::eR16Sfloat) || !Ensure(lum[1], in, vk::Format::eR16Sfloat)) {
         return {};
     }
@@ -395,7 +395,10 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                      vk::ImageLayout::eShaderReadOnlyOptimal, reactive.usage};
     // bb-clean-3: not for DLSS (Streamline has no R8_UNORM in its format table: "Cannot have
     // undefined format" several times per frame); FSR 3.1 / XeSS take it. BB_REACTIVE=0 off.
-    desc.has_reactive = BB::Upscale::Cfg().kind != BB::SR::Kind::Dlss &&
+    // (11-13) R16F now, which Streamline knows: DLSS gets it as its bias-current-colour hint
+    // (fog / smoke / fire smeared on camera turns without it). BB_REACTIVE_DLSS=0: not for DLSS.
+    const char* rdl = std::getenv("BB_REACTIVE_DLSS");
+    desc.has_reactive = (BB::Upscale::Cfg().kind != BB::SR::Kind::Dlss || rdl == nullptr || rdl[0] != '0') &&
                         (std::getenv("BB_REACTIVE") == nullptr ||
                          std::string_view{std::getenv("BB_REACTIVE")} != "0");
     desc.render = in;
