@@ -15,7 +15,15 @@
 //   wholly inside an arena is never downloaded into guest RAM by the image collector or the linear-image readback (it
 //   stays in video memory, as a tiled render target already does); while the GPU cannot make images (the collector's
 //   "failing" state) the old behaviour comes back. Guest reads of such memory still fault and read the GPU's bytes back.
-// Nothing here frees, decommits, trims or moves memory, and no guest byte is changed.
+// KYTY_NATIVE_MEM=3  level 2, and (after more byte checks; any mismatch: level 2):
+//   - per-frame CPU->GPU arenas as a native port's upload heap (graphics/host_gpu/uploadHeap.h): the page runs of the
+//     GPU "Default TaggedArena" (parent of GameToGPU / RenderSingleFrameGPU) and of the "RenderContextGPU" memory
+//     context's allocators (render-context command and descriptor memory) are marked; the buffer cache never
+//     write-protects their pages and never makes them clean: every GPU use copies what it reads (once per observation
+//     epoch of the GPU thread). No write fault, no unprotect/reprotect for them, no write missed;
+//   - streamed mips: the memcpy of CTexture stream-in (0x901459, from ProcessTextureDataInternal 0xaa4a60) calls a host
+//     copy that tells the trackers once for the whole mip (as a file read does) instead of faulting page by page.
+// Nothing here frees, decommits, trims or moves memory. Level 3 rewrites one guest call (0x901459) to a cave.
 
 #include <atomic>
 #include <cstdint>

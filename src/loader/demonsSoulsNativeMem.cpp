@@ -20,7 +20,10 @@
 // Each fact is checked in the loaded image before anything uses it; any mismatch turns the module off.
 #include "loader/demonsSoulsNativeMem.h"
 
+#include "common/abi.h"
+#include "common/virtualMemory.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/uploadHeap.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/memory.h"
 #include "loader/elf.h"
@@ -105,6 +108,46 @@ constexpr std::array<Rel, 10> Rels {{
     {0x7f8b5a, 7, 3, Registry, 0x48, 0x8d, 0x05},
 }};
 
+// ---- level 3 (upload heaps, streamed mips) ----
+// The GPU "Default TaggedArena" (parent of the per-frame GameToGPU / RenderSingleFrameGPU allocators):
+//   0x7f78e2 lea rsi,"Default TaggedArena" (0x23f49a3); mov edx,2; call 0x8018e0; 0x7f78f9 lea rax,[0x25acde8];
+//   0x7f7927 mov [rbx],rax. Its chunks: 0x7fdcf0 RequestPages (0x801d00) with rdi = the arena (0x7fdd5c, 0x7fde9e), so
+//   they are the arena's own page runs.
+// The memory context "RenderContextGPU" (command buffers and per-context GPU data of the render contexts, CPU-written
+//   every frame): 0x902765 lea rsi,"RenderContextGPU" (0x242d9c1); mov edx,2; call 0x800da0 (context ctor: 0x8018e0,
+//   then vtable 0x25acf58 at 0x800dae). Its allocators: 0x801090 entry i at +0x90+16i = {limit, allocator}, count at
+//   +0x88 (4 entries before the +0xd0 list).
+// A streamed mip (CTexture stream-in, 0x901330, from TextureStreamingChunk::ProcessTextureDataInternal 0xaa4a60):
+//   0x9013cb r12 = [tex+0x98] + [mip+8]; r15d = [mip+4]; Realloc (0x7f9f70) commits the run; 0x901459 call memcpy
+//   (0x1e73d00) rdi = r12, rsi = the chunk's data (0xaa47d0), rdx = r15: the whole of [r12, r12 + r15) is written.
+constexpr uint64_t GpuTaggedArenaVtable = 0x25acde8, TaggedArenaName = 0x23f49a3;
+constexpr uint64_t ContextVtable = 0x25acf58, RenderContextGpuName = 0x242d9c1;
+constexpr uint64_t MipCopyCall = 0x901459, MemcpyStub = 0x1e73d00;
+constexpr uint64_t CaveOffset = 0x8040000, CaveSize = 0x4000; // (Idle 0x8000000, SceneGuard 0x8008000, Camera 0x8020000,
+                                                              // GpuPages 0x8080000)
+constexpr std::array<Window, 9> Level3Exact {{
+    {0x7f78e9, "4889c7ba020000004889c3"},                 // mov rdi,rax; mov edx,2; mov rbx,rax
+    {0x7f7927, "488903"},                                 // mov [rbx],rax (the vtable)
+    {0x902765 + 7, "ba0200000048897d88"},                 // mov edx,2; mov [rbp-0x78],rdi
+    {0x800dae + 7, "c5f857c0"},                           // (after the context vtable lea)
+    {0x801090, "48638788000000448d400148c1e0044889b40798000000488994079000000044898788000000"},
+    {0x9013cb, "4d8ba6980000004d036508458b7d04"},          // r12 = [r14+0x98] + [r13+8]; r15d = [r13+4]
+    {0x9013f4, "4c89fe4c89e7"},                           // Realloc(rdi = r12, rsi = r15)
+    {0x90143a, "41c6456d014180a5a3000000fd498b7d20"},     // ... mov rdi,[r13+0x20]
+    {0x901450, "4c89e74889c64c89fa"},                     // memcpy(rdi = r12, rsi = data, rdx = r15)
+}};
+constexpr std::array<Rel, 9> Level3Rels {{
+    {0x7f78e2, 7, 3, TaggedArenaName, 0x48, 0x8d, 0x35},
+    {0x7f78f4, 5, 1, AllocatorCtor, 0xe8, 0, 0},
+    {0x7f78f9, 7, 3, GpuTaggedArenaVtable, 0x48, 0x8d, 0x05},
+    {0x7fdd5c, 5, 1, RequestPages, 0xe8, 0, 0},
+    {0x7fde9e, 5, 1, RequestPages, 0xe8, 0, 0},
+    {0x902765, 7, 3, RenderContextGpuName, 0x48, 0x8d, 0x35},
+    {0x902775, 5, 1, 0x800da0, 0xe8, 0, 0},
+    {0x800dae, 7, 3, ContextVtable, 0x48, 0x8d, 0x05},
+    {MipCopyCall, 5, 1, MemcpyStub, 0xe8, 0, 0},
+}};
+
 struct Segment {
 	uint64_t begin = 0, end = 0;
 };
@@ -172,6 +215,41 @@ std::vector<uint8_t> Bytes(const char* hex) {
 	return out;
 }
 
+template <size_t W, size_t R>
+const char* CheckWindows(uint64_t base, const std::array<Window, W>& exact, const std::array<Rel, R>& rels, uint64_t* where) {
+	for (const auto& w: exact) {
+		const auto bytes = Bytes(w.hex);
+		*where           = w.offset;
+		if (!InImage(base + w.offset, bytes.size())) return "outside the image";
+		if (std::memcmp(reinterpret_cast<const void*>(base + w.offset), bytes.data(), bytes.size()) != 0)
+			return "instruction bytes differ";
+	}
+	for (const auto& r: rels) {
+		*where = r.at;
+		if (!InImage(base + r.at, r.length)) return "outside the image";
+		const auto* code = reinterpret_cast<const uint8_t*>(base + r.at);
+		if (code[0] != r.opcode0 || (r.opcode1 != 0 && code[1] != r.opcode1) || (r.opcode2 != 0 && code[2] != r.opcode2))
+			return "opcode differs";
+		int32_t disp = 0;
+		std::memcpy(&disp, code + r.disp, sizeof(disp));
+		if (r.at + r.length + static_cast<int64_t>(disp) != r.target) return "operand target differs";
+	}
+	return nullptr;
+}
+
+const char* CheckLevel3(uint64_t base, uint64_t* where) {
+	if (const char* failed = CheckWindows(base, Level3Exact, Level3Rels, where)) return failed;
+	*where = TaggedArenaName;
+	if (!InImage(base + TaggedArenaName, 20) ||
+	    std::memcmp(reinterpret_cast<const void*>(base + TaggedArenaName), "Default TaggedArena", 20) != 0)
+		return "Default TaggedArena name";
+	*where = RenderContextGpuName;
+	if (!InImage(base + RenderContextGpuName, 17) ||
+	    std::memcmp(reinterpret_cast<const void*>(base + RenderContextGpuName), "RenderContextGPU", 17) != 0)
+		return "RenderContextGPU name";
+	return nullptr;
+}
+
 const char* CheckStatic(uint64_t base, uint64_t* where) {
 	for (const auto& w: Exact) {
 		const auto bytes = Bytes(w.hex);
@@ -202,6 +280,9 @@ const char* CheckStatic(uint64_t base, uint64_t* where) {
 	return nullptr;
 }
 
+// Level 3: streamed-mip copies (MipCopy).
+std::atomic<uint64_t> g_mip_copies {0}, g_mip_bytes {0}, g_mip_prepared {0};
+
 // ---- events ----
 constexpr uint64_t RingBits = 17, RingSize = uint64_t {1} << RingBits;
 std::atomic<uint64_t> g_ring[RingSize];
@@ -223,6 +304,7 @@ struct Owner {
 	std::string name;
 	uint64_t    object = 0;
 	uint32_t    type = 0, slot = 0;
+	bool        upload_heap = false; // level 3: its runs are marked (UploadHeap)
 	uint64_t    held = 0; // bytes in its runs
 	uint64_t    runs = 0;
 	// Since the last report (events, pages of protection changes, write-back bytes).
@@ -268,8 +350,61 @@ std::string ReadName(uint64_t pointer) {
 
 // The registry's allocators and their runs (racy reads of lists the game changes under its own lock: every pointer is
 // checked against the list's shape, a walk stops at the first mismatch; a run misattributed for 10 s is the cost).
+// One allocator's page runs (FindPages' list), added to `runs` under `owner`; marked as an upload heap when `mark`.
+void WalkRuns(Census& c, std::vector<Run>& runs, uint64_t allocator, uint32_t owner, bool mark) {
+	uint64_t first = 0;
+	bool     ok    = true;
+	first          = ReadU64(allocator + 0x60, &ok);
+	if (!ok) return;
+	const uint64_t sentinel = allocator + 0x50;
+	uint64_t       node     = first;
+	for (uint32_t steps = 0; node != sentinel && node != 0 && steps < 65536; steps++) {
+		uint8_t info[0x68] {};
+		if (!ReadGuest(node, info, sizeof(info))) break;
+		uint64_t self = 0, next = 0, list = 0, size = 0, va = 0;
+		std::memcpy(&self, info, 8);
+		std::memcpy(&next, info + 0x10, 8);
+		std::memcpy(&list, info + 0x18, 8);
+		std::memcpy(&size, info + 0x58, 8);
+		std::memcpy(&va, info + 0x60, 8);
+		if (self != node || list != sentinel || size == 0 || (va & 0xffffu) != 0 || UINT64_MAX - va < size) {
+			c.walk_errors++;
+			break;
+		}
+		runs.push_back({va, va + size, owner});
+		c.owners[owner].held += size;
+		c.owners[owner].runs++;
+		if (mark) Libs::Graphics::UploadHeap::Mark(va, size);
+		node = next;
+	}
+}
+
+struct Header {
+	uint64_t    vtable = 0, name_pointer = 0, sentinel_value = 0;
+	uint32_t    type = 0;
+	std::string name;
+};
+
+bool ReadHeader(uint64_t allocator, Header* h) {
+	uint8_t header[0x88] {};
+	if (allocator == 0 || (allocator & 7u) != 0 || !ReadGuest(allocator, header, sizeof(header))) return false;
+	std::memcpy(&h->vtable, header, 8);
+	std::memcpy(&h->name_pointer, header + 0x10, 8);
+	std::memcpy(&h->type, header + 0x18, 4);
+	std::memcpy(&h->sentinel_value, header + 0x50, 8);
+	if (!InImage(h->vtable, 8) || h->type > 2 || h->sentinel_value != 0) return false;
+	h->name = ReadName(h->name_pointer);
+	if (h->name.empty()) h->name = "?";
+	return true;
+}
+
+// The registry's allocators and their runs (racy reads of lists the game changes under its own lock: every pointer is
+// checked against the list's shape, a walk stops at the first mismatch; a run misattributed for 10 s is the cost).
+// Level 3 marks the per-frame upload arenas' runs (UploadHeap): the GPU Default TaggedArena (by its vtable, name and
+// type) and the allocators of the RenderContextGPU memory context.
 void Walk(Census& c) {
-	const uint64_t base = g_state.base;
+	const uint64_t base   = g_state.base;
+	const bool     level3 = g_level.load(std::memory_order_relaxed) >= 3;
 	for (auto& owner: c.owners) {
 		owner.held = 0;
 		owner.runs = 0;
@@ -278,42 +413,33 @@ void Walk(Census& c) {
 	for (uint64_t slot = 1; slot < RegistrySlots; slot++) {
 		bool           ok        = true;
 		const uint64_t allocator = ReadU64(base + Registry + slot * 8, &ok);
-		if (!ok || allocator == 0 || (allocator & 7u) != 0) continue;
-		uint8_t header[0x88] {};
-		if (!ReadGuest(allocator, header, sizeof(header))) continue;
-		uint64_t vtable = 0, name_pointer = 0, sentinel_value = 0, first = 0;
-		uint32_t type   = 0;
-		std::memcpy(&vtable, header, 8);
-		std::memcpy(&name_pointer, header + 0x10, 8);
-		std::memcpy(&type, header + 0x18, 4);
-		std::memcpy(&sentinel_value, header + 0x50, 8);
-		std::memcpy(&first, header + 0x60, 8);
-		if (!InImage(vtable, 8) || type > 2 || sentinel_value != 0) {
+		if (!ok || allocator == 0) continue;
+		Header h;
+		if (!ReadHeader(allocator, &h)) {
 			c.walk_errors++;
 			continue;
 		}
-		std::string name = ReadName(name_pointer);
-		if (name.empty()) name = "?";
-		const uint32_t owner    = OwnerIndex(c, allocator, static_cast<uint32_t>(slot), type, name);
-		const uint64_t sentinel = allocator + 0x50;
-		uint64_t       node     = first;
-		for (uint32_t steps = 0; node != sentinel && node != 0 && steps < 65536; steps++) {
-			uint8_t info[0x68] {};
-			if (!ReadGuest(node, info, sizeof(info))) break;
-			uint64_t self = 0, next = 0, list = 0, size = 0, va = 0;
-			std::memcpy(&self, info, 8);
-			std::memcpy(&next, info + 0x10, 8);
-			std::memcpy(&list, info + 0x18, 8);
-			std::memcpy(&size, info + 0x58, 8);
-			std::memcpy(&va, info + 0x60, 8);
-			if (self != node || list != sentinel || size == 0 || (va & 0xffffu) != 0 || UINT64_MAX - va < size) {
-				c.walk_errors++;
-				break;
+		const uint32_t owner = OwnerIndex(c, allocator, static_cast<uint32_t>(slot), h.type, h.name);
+		const bool     arena = level3 && h.vtable == base + GpuTaggedArenaVtable && h.type == 2 &&
+		                   h.name_pointer == base + TaggedArenaName;
+		c.owners[owner].upload_heap = arena;
+		WalkRuns(c, runs, allocator, owner, arena);
+		if (h.vtable == base + ContextVtable && h.type == 2 && h.name_pointer == base + RenderContextGpuName) {
+			// The context's allocators (0x801090): count at +0x88, {limit, allocator} at +0x90 + 16 i.
+			uint32_t count = 0;
+			if (!ReadGuest(allocator + 0x88, &count, sizeof(count))) continue;
+			for (uint32_t i = 0; i < std::min<uint32_t>(count, 4); i++) {
+				const uint64_t sub = ReadU64(allocator + 0x98 + 16ull * i, &ok);
+				Header         sh;
+				if (!ok || !ReadHeader(sub, &sh)) {
+					c.walk_errors++;
+					continue;
+				}
+				const uint32_t sub_owner = OwnerIndex(c, sub, static_cast<uint32_t>(1000 + slot * 4 + i), sh.type,
+				                                      "RenderContextGPU/" + sh.name);
+				c.owners[sub_owner].upload_heap = level3;
+				WalkRuns(c, runs, sub, sub_owner, level3);
 			}
-			runs.push_back({va, va + size, owner});
-			c.owners[owner].held += size;
-			c.owners[owner].runs++;
-			node = next;
 		}
 	}
 	std::sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) { return a.begin < b.begin; });
@@ -442,18 +568,33 @@ void Report(Census& c, double seconds, bool residency) {
 	for (const auto i: order) {
 		const auto& o = c.owners[i];
 		const bool  rt = o.name == "RTSharedAllocator" || o.name == "RTPersistAllocator";
-		if (shown >= 12 && !rt && i != 0) continue;
+		if (shown >= 12 && !rt && !o.upload_heap && i != 0) continue;
 		shown++;
 		char resident[64] = "";
 		if (residency && o.sampled != 0)
 			std::snprintf(resident, sizeof(resident), " resident %llu MiB", static_cast<unsigned long long>(o.resident / MiB));
-		std::printf("[native-mem]   %-22s #%-3u %-3s held %5llu MiB in %4llu runs%s: per s fw %llu fwr %llu fr %llu prot %llu "
+		std::printf("[native-mem]   %-22s #%-3u %-3s%s held %5llu MiB in %4llu runs%s: per s fw %llu fwr %llu fr %llu prot %llu "
 		            "(%llu MiB) wb %llu MiB\n",
 		            i == 0 ? "(no engine run)" : o.name.c_str(), o.slot, i == 0 ? "-" : Types[std::min<uint32_t>(o.type, 2)],
+		            o.upload_heap ? " [upload heap]" : "",
 		            static_cast<unsigned long long>(o.held / MiB), static_cast<unsigned long long>(o.runs), resident,
 		            per(o.events[FaultWindow]), per(o.events[FaultWrite]), per(o.events[FaultRead]), per(o.events[Protect]),
 		            static_cast<unsigned long long>((o.protect_pages << 12u) / MiB),
 		            static_cast<unsigned long long>(o.writeback_bytes / MiB));
+	}
+	if (g_level.load(std::memory_order_relaxed) >= 3) {
+		namespace U = Libs::Graphics::UploadHeap;
+		static uint64_t last[7] {};
+		const uint64_t  now[7] = {U::g_kept_pages.load(), U::g_deduped_pages.load(), U::g_gpu_taken_pages.load(),
+		                          g_mip_copies.load(), g_mip_bytes.load(), g_mip_prepared.load(), U::g_marked_bytes.load()};
+		std::printf("[native-mem]   upload heaps: %llu MiB marked; per s %llu pages kept CPU-dirty after a copy (no write "
+		            "protection), %llu copies skipped in the same epoch, %llu handed to a GPU write; streamed mips per s %llu "
+		            "(%llu MiB, %llu told to the trackers at once)\n",
+		            static_cast<unsigned long long>(now[6] / MiB), per(now[0] - last[0]), per(now[1] - last[1]),
+		            per(now[2] - last[2]), per(now[3] - last[3]),
+		            static_cast<unsigned long long>(static_cast<double>(now[4] - last[4]) / seconds / static_cast<double>(MiB)),
+		            per(now[5] - last[5]));
+		std::copy(std::begin(now), std::end(now), std::begin(last));
 	}
 	if (g_level.load(std::memory_order_relaxed) >= 2) {
 		std::printf("[native-mem]   GPU-only arenas, kept in video memory instead of downloaded into guest RAM (since "
@@ -496,6 +637,53 @@ void CensusThread() {
 	}
 }
 
+// The streamed mip's memcpy (0x901459): the whole destination is written, so the trackers are told once (as a file
+// read's copy tells them, fileSystem.cpp ReadIntoGuest) instead of faulting on each watched page; then the images over
+// it are refreshed from the new bytes.
+void* KYTY_SYSV_ABI MipCopy(void* destination, const void* source, size_t size) {
+	const auto to       = reinterpret_cast<uint64_t>(destination);
+	const bool prepared = size != 0 && Libs::LibKernel::Memory::PrepareHostOverwrite(to, size);
+	std::memcpy(destination, source, size);
+	if (size != 0) Libs::LibKernel::Memory::FinishHostOverwrite(to, size, prepared);
+	g_mip_copies.fetch_add(1, std::memory_order_relaxed);
+	g_mip_bytes.fetch_add(size, std::memory_order_relaxed);
+	if (prepared) g_mip_prepared.fetch_add(1, std::memory_order_relaxed);
+	return destination;
+}
+
+// A cave (mov rax, MipCopy; jmp rax) and the call at 0x901459 pointed at it. Null when installed.
+const char* InstallMipCopy(uint64_t base) {
+	const uint64_t site = base + MipCopyCall;
+	const uint64_t cave = Libs::LibKernel::Memory::AllocateRuntimeMemory(base + CaveOffset, CaveSize,
+	                                                                     Common::VirtualMemory::Mode::ExecuteReadWrite,
+	                                                                     "demons_souls_native_mem", true);
+	if (cave != base + CaveOffset) {
+		if (cave != 0) Libs::LibKernel::Memory::FreeGuestMemory(cave, CaveSize);
+		return "no cave memory at its address";
+	}
+	const int64_t displacement = static_cast<int64_t>(cave) - static_cast<int64_t>(site + 5);
+	if (displacement != static_cast<int32_t>(displacement)) {
+		Libs::LibKernel::Memory::FreeGuestMemory(cave, CaveSize);
+		return "cave out of rel32 reach";
+	}
+	std::array<uint8_t, 12> stub {0x48, 0xb8}; // mov rax, imm64; jmp rax
+	const auto              function = reinterpret_cast<uint64_t>(&MipCopy);
+	std::memcpy(stub.data() + 2, &function, sizeof(function));
+	stub[10] = 0xff;
+	stub[11] = 0xe0;
+	std::memcpy(reinterpret_cast<void*>(cave), stub.data(), stub.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(cave, stub.size())) {
+		Libs::LibKernel::Memory::FreeGuestMemory(cave, CaveSize);
+		return "instruction cache flush failed";
+	}
+	std::array<uint8_t, 5> call {0xe8};
+	const auto             rel = static_cast<int32_t>(displacement);
+	std::memcpy(call.data() + 1, &rel, sizeof(rel));
+	std::memcpy(reinterpret_cast<void*>(site), call.data(), call.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(site, call.size())) return "instruction cache flush failed (site)";
+	return nullptr;
+}
+
 } // namespace
 
 void Record(Event kind, uint64_t vaddr, uint64_t size) noexcept {
@@ -523,7 +711,7 @@ bool KeepGpuOnly(uint64_t vaddr, uint64_t size, int why) noexcept {
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
 	const char* v     = std::getenv("KYTY_NATIVE_MEM");
-	const int   level = v != nullptr && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+	const int   level = v != nullptr && v[0] >= '1' && v[0] <= '3' ? v[0] - '0' : 0;
 	if (level == 0) return;
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
@@ -547,12 +735,31 @@ void Install(Program* program) {
 		std::fflush(stdout);
 		return;
 	}
-	g_level.store(level, std::memory_order_release);
+	int applied = level;
+	if (level >= 3) {
+		failed = CheckLevel3(g_state.base, &where);
+		if (failed != nullptr) {
+			std::printf("[native-mem] KYTY_NATIVE_MEM=3 NOT applied (level 2 instead): eboot+0x%llx: %s\n",
+			            static_cast<unsigned long long>(where), failed);
+			applied = 2;
+		} else {
+			if (const char* why = InstallMipCopy(g_state.base)) {
+				std::printf("[native-mem] streamed mips: hook NOT installed (%s); they fault page by page as before\n", why);
+			} else {
+				std::printf("[native-mem] streamed mips: the copy at eboot+0x%llx (CTexture stream-in, from "
+				            "ProcessTextureDataInternal) tells the trackers once per mip instead of faulting page by page\n",
+				            static_cast<unsigned long long>(MipCopyCall));
+			}
+			Libs::Graphics::UploadHeap::g_on.store(1, std::memory_order_release);
+		}
+	}
+	g_level.store(applied, std::memory_order_release);
 	std::printf("[native-mem] KYTY_NATIVE_MEM=%d: engine code checked (version %s: render-target arenas, allocator registry, "
-	            "page-run lists); %s\n",
-	            level, version.c_str(),
-	            level >= 2 ? "census, and render-target arenas kept GPU-only once found"
-	                       : "census only (nothing in the emulator's behaviour changes)");
+	            "page-run lists%s); %s\n",
+	            applied, version.c_str(), applied >= 3 ? ", per-frame arenas, mip stream-in" : "",
+	            applied >= 3   ? "census, GPU-only render-target arenas, per-frame arenas as upload heaps (no write tracking)"
+	            : applied >= 2 ? "census, and render-target arenas kept GPU-only once found"
+	                           : "census only (nothing in the emulator's behaviour changes)");
 	std::fflush(stdout);
 #else
 	(void)program;

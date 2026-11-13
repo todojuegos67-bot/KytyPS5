@@ -42,6 +42,12 @@ public:
 		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
 		return manager != nullptr && manager->DeferredProtectionPending();
 	}
+	// UploadHeap: the region holds kept pages (written without faults).
+	[[nodiscard]] bool HasKeptPages(uint64_t vaddr) const {
+		if (vaddr >= TRACKER_ADDRESS_SIZE) return false;
+		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager != nullptr && manager->HasKeptPages();
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	// Every page CPU-dirty (untracked memory is): none is write-protected for the tracker.
 	[[nodiscard]] bool IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size);
@@ -151,8 +157,8 @@ public:
 			manager->lock.lock();
 			if (last_dirty != nullptr) *last_dirty = std::max(*last_dirty, manager->LastDirtyClock());
 			if (defer) PageManager::SetDeferredWriteProtectSink(&ranges);
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			// (A read-only use keeps the UploadHeap's pages CPU-dirty; a written range's pages become GPU-owned.)
+			manager->ForEachCpuUploadRange(manager->GetCpuAddr() + offset, bytes, !is_written, range_func);
 			if (defer) {
 				PageManager::SetDeferredWriteProtectSink(nullptr);
 				for (const auto& range: ranges) {

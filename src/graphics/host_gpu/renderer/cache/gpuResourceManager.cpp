@@ -500,7 +500,8 @@ void GpuResourceManager::SynchronizeDirtyBdaRegions(GuestRange range) {
 			// A request left unproven by its own uploads' queued write protection needs no other visit:
 			// a write before the protection lands is in the copies taken after it, and a write after it
 			// faults (and marks the region).
-			if (unproven && !m_buffer_cache.DeferredProtectionPending(region_begin))
+			// (A region with UploadHeap pages kept CPU-dirty is written without faults: visited again every time.)
+			if (unproven && (!m_buffer_cache.DeferredProtectionPending(region_begin) || m_buffer_cache.HasKeptPages(region_begin)))
 				BdaDirtyRegions::Mark(region_begin / TRACKER_REGION_SIZE);
 		}
 	}
