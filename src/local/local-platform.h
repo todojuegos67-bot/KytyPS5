@@ -169,6 +169,9 @@ void      StartWorkingSetTrim();
 // KYTY_RESIDENT_MB=<n>: the process keeps at least n MiB in RAM (a hard working set minimum): Windows does not page the
 // game's memory out below it (bug check 0x1A/0x41202 needs guest pages paged while their protections change). Once.
 void      KeepResident();
+// The KYTY_RESIDENT_MB hard minimum (and the RAM budget's) given up for the rest of the run, once: under lasting
+// critical RAM pressure a hard minimum starves the rest of the system (drivers included). False where none was set.
+bool      ReleaseResident();
 // How the trim runs its system call: set by the guest memory (kernel/memory.cpp) so that no mapping, unmapping or
 // protection change of the guest's views runs meanwhile (Windows' memory manager bug-checked, 0x1A, PCs that trim).
 void      SetTrimRunner(void (*runner)(void (*call)()));

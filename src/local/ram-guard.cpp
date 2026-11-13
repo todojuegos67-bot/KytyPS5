@@ -390,6 +390,8 @@ Settings ReadSettings() {
 	s.budget_step = std::clamp<uint64_t>(EnvMiB("KYTY_RAM_BUDGET_STEP_MB", 384 * MiB), 64 * MiB, 2 * GiB);
 	// (KYTY_RESIDENT_MB's hard minimum kept, but under the budget's trim target.)
 	s.budget_floor = s.budget != 0 ? std::min(EnvMiB("KYTY_RESIDENT_MB", 0), s.budget - GiB) : 0;
+	// (As KeepResident: never a hard minimum over a quarter of the RAM.)
+	if (const uint64_t ram = LocalPlatform::PhysicalMemory(); ram != 0) s.budget_floor = std::min(s.budget_floor, ram / 4);
 	return s;
 }
 
@@ -639,6 +641,7 @@ void Watch() {
 	uint64_t   budget_ws_max_line = 0;
 	auto       budget_next_guest = Clock::now();
 	int        sim_exhausted = 0;
+	int        critical_seconds = 0; // consecutive seconds at critical (the hard working set minimum given up at 5)
 	auto     next_log   = Clock::now() + std::chrono::seconds(std::max<int64_t>(log_period, 1));
 	auto     next_flush = Clock::now();
 	auto     next_walk  = Clock::now();
@@ -698,6 +701,11 @@ void Watch() {
 					FlushPass(guest, low_memory, store, &flush_state);
 				}
 			}
+		}
+		critical_seconds = level == Critical ? critical_seconds + 1 : 0;
+		if (critical_seconds == 5 && LocalPlatform::ReleaseResident()) {
+			std::printf("RAM: hard working set minimum given up (critical 5 s; KYTY_RESIDENT_MB): %s\n", Figures(sample).c_str());
+			std::fflush(stdout);
 		}
 		g_level.store(level, std::memory_order_relaxed);
 		if (s.flush_seconds > 0 && now >= next_periodic) {
