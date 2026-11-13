@@ -15,6 +15,7 @@
 #include "readback-queue.h"
 #include "sync-stats.h"
 #include "fresh-memory.h"
+#include "lean-hostmem.h"
 #include "texture-offload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -1551,6 +1552,9 @@ uint64_t BufferCacheStagingRingSize() {
 			const uint64_t value = std::strtoull(mb, nullptr, 10);
 			if (value >= 64 && value <= 2048) return value * MiB;
 		}
+		// KYTY_LEAN_HOSTMEM=1 (lean-hostmem.h): 128 MiB (per-frame uploads are 6-30 MB; a streaming frame waits on the
+		// GPU for the ring's reuse sooner).
+		if (LeanHostMem::Enabled()) return 128 * MiB;
 		const char* diet = std::getenv("KYTY_RAM_DIET_STAGING");
 		const bool  off  = diet != nullptr && diet[0] == '0';
 		if (LocalPlatform::LowMemVram() || !off) return 256 * MiB; // KYTY_LOWMEM_VRAM=1 or the RAM diet
@@ -1654,8 +1658,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, StagingRingSize(),
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_host_shader_upload(graphics, scheduler, MemoryUsage::Upload, 64 * MiB),
-      m_table_upload(graphics, scheduler, MemoryUsage::Upload, 32 * MiB,
+      // (KYTY_LEAN_HOSTMEM: device-local host-visible memory with ReBAR, LeanUploadUsage.)
+      m_host_shader_upload(graphics, scheduler, LeanUploadUsage(graphics), 64 * MiB),
+      m_table_upload(graphics, scheduler, LeanUploadUsage(graphics), 32 * MiB,
                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_staging_device(graphics, scheduler, MemoryUsage::Stream, 64 * MiB,
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),

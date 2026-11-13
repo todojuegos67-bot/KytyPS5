@@ -170,6 +170,11 @@ private:
 	uint64_t              m_wait_bound  = 0;
 };
 
+// KYTY_LEAN_HOSTMEM=1 (lean-hostmem.h): the usage of an upload ring the CPU only writes in order - Stream (device-local
+// host-visible memory) where the GPU has a large BAR (ReBAR / SAM: a device-local host-visible heap over 1 GiB), else
+// Upload (system memory) as before. Decided once from the memory properties.
+[[nodiscard]] MemoryUsage LeanUploadUsage(const GraphicContext& graphics);
+
 // The buffer reclaimer frees no memory from HoldBufferFrees (false: a free runs now) to ReleaseBufferFrees: a defragmentation
 // pass's moves must stay allocated until it ends (BufferCache::Defragment; streamBuffer.cpp).
 [[nodiscard]] bool HoldBufferFrees();

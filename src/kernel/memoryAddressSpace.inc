@@ -469,7 +469,7 @@ public:
 		const auto* source = static_cast<const uint8_t*>(data);
 		return TryTransferBacking<true>(vaddr, size,
 		                          [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
-			                          std::memcpy(backing, source + data_offset, bytes);
+			                          LeanHostMem::BackingCopy(backing, source + data_offset, bytes); // (KYTY_LEAN_HOSTMEM)
 			                          FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(backing), bytes);
 		                          });
 	}
@@ -495,7 +495,7 @@ public:
 			return false;
 		}
 		DataWriteFence fence(*this, begin, begin + size, m_cpu_write_pages);
-		std::memcpy(m_backing_base + begin, data, size);
+		LeanHostMem::BackingCopy(m_backing_base + begin, data, size); // (KYTY_LEAN_HOSTMEM)
 		FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(m_backing_base + begin), size);
 		return true;
 	}
@@ -1823,15 +1823,16 @@ private:
 	// Zeroes [offset, end) of the backing (lock held), but not its pages still reserved (KYTY_GUEST_LAZY_COMMIT): those
 	// were never committed, so they read zeros once committed, and a memset would only commit them. Nothing is freed.
 	void ZeroCommitted(uint64_t offset, uint64_t end) {
+		// (KYTY_LEAN_HOSTMEM: pages already zero are left alone - not dirtied - lean-hostmem.h.)
 		if (!GuestLazyCommit::Enabled()) {
-			std::memset(m_backing_base + offset, 0, end - offset);
+			LeanHostMem::BackingZero(m_backing_base + offset, end - offset);
 			return;
 		}
 		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
 		while (offset < end) {
 			const uint64_t next = GuestLazyCommit::RunEnd(base + offset, base + end) - base;
 			const uint64_t stop = next > offset ? next : end;
-			if (!GuestLazyCommit::IsReservedPage(m_backing_base + offset)) std::memset(m_backing_base + offset, 0, stop - offset);
+			if (!GuestLazyCommit::IsReservedPage(m_backing_base + offset)) LeanHostMem::BackingZero(m_backing_base + offset, stop - offset);
 			offset = stop;
 		}
 	}
