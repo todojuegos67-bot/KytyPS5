@@ -123,6 +123,34 @@ static int NoMemory(const char* function, int line) {
 	return KERNEL_ERROR_ENOMEM;
 }
 
+// SetAvailableDirectClamp (memory.h): written once at load, before any guest thread runs.
+namespace AvailableClamp {
+std::atomic<uint64_t> g_return {0};
+uint64_t              g_limit = 0, g_trace_begin = 0, g_trace_end = 0, g_base = 0;
+std::atomic<uint32_t> g_printed {0};
+
+bool Traced(uint64_t caller) {
+	return caller >= g_trace_begin && caller < g_trace_end;
+}
+
+void Print(const char* what, uint64_t caller, uint64_t len, uint64_t phys, const char* outcome) {
+	if (g_printed.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+	std::printf("[port] ds-alloc: eboot+0x%llx %s len=0x%llx (%llu MiB) phys=0x%llx: %s\n",
+	            static_cast<unsigned long long>(caller - g_base), what, static_cast<unsigned long long>(len),
+	            static_cast<unsigned long long>(len >> 20u), static_cast<unsigned long long>(phys), outcome);
+	std::fflush(stdout);
+}
+} // namespace AvailableClamp
+
+void SetAvailableDirectClamp(uint64_t return_address, uint64_t limit, uint64_t trace_begin, uint64_t trace_end,
+                             uint64_t image_base) {
+	AvailableClamp::g_limit       = limit;
+	AvailableClamp::g_trace_begin = trace_begin;
+	AvailableClamp::g_trace_end   = trace_end;
+	AvailableClamp::g_base        = image_base;
+	AvailableClamp::g_return.store(return_address, std::memory_order_release);
+}
+
 // The latest GPU write-backs into guest memory, for crash reports: a pointer a game structure lost could
 // have been overwritten by one.
 struct WriteBackRecord {
@@ -3586,6 +3614,23 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 		return NoMemory(__func__, __LINE__);
 	}
 
+	// KYTY_DS_ALLOC_PATCH: the one call in the game's page-allocator start-up is told at most the clamp (the rest of
+	// direct memory stays free for later allocations; loader/demonsSoulsAllocClamp.cpp).
+	if (const auto clamp_return = AvailableClamp::g_return.load(std::memory_order_acquire);
+	    clamp_return != 0 && reinterpret_cast<uint64_t>(__builtin_return_address(0)) == clamp_return) {
+		const uint64_t told = std::min(size, AvailableClamp::g_limit);
+		std::printf("[port] ds-alloc: eboot+0x%llx sceKernelAvailableDirectMemorySize(0x%llx, 0x%llx, 0x%llx) = base "
+		            "0x%llx size 0x%llx (%llu MiB) -> told 0x%llx (%llu MiB)%s\n",
+		            static_cast<unsigned long long>(clamp_return - AvailableClamp::g_base),
+		            static_cast<unsigned long long>(search_start), static_cast<unsigned long long>(search_end),
+		            static_cast<unsigned long long>(alignment), static_cast<unsigned long long>(phys_addr),
+		            static_cast<unsigned long long>(size), static_cast<unsigned long long>(size >> 20u),
+		            static_cast<unsigned long long>(told), static_cast<unsigned long long>(told >> 20u),
+		            told < size ? "" : " (not above the clamp: unchanged)");
+		std::fflush(stdout);
+		size = told;
+	}
+
 	*phys_addr_out = static_cast<int64_t>(phys_addr);
 	*size_out      = static_cast<size_t>(size);
 
@@ -3729,8 +3774,21 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	uint64_t addr = 0;
-	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type)) {
+	uint64_t   addr      = 0;
+	const bool allocated = g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type);
+	if (const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0)); AvailableClamp::Traced(caller)) {
+		AvailableClamp::Print("sceKernelAllocateDirectMemory", caller, len,
+		                      allocated ? addr : static_cast<uint64_t>(search_start),
+		                      allocated ? "allocated" : "FAILED (EAGAIN; phys = search start)");
+	}
+	if (!allocated && AvailableClamp::g_return.load(std::memory_order_relaxed) != 0) {
+		std::printf("[port] ds-alloc: a direct allocation of 0x%llx (%llu MiB) in [0x%llx, 0x%llx) FAILED with the "
+		            "allocator clamp on\n",
+		            static_cast<unsigned long long>(len), static_cast<unsigned long long>(len >> 20u),
+		            static_cast<unsigned long long>(search_start), static_cast<unsigned long long>(search_end));
+		std::fflush(stdout);
+	}
+	if (!allocated) {
 		GuestStoreTooSmall("direct memory", len);
 		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
 		return KERNEL_ERROR_EAGAIN;
@@ -3892,6 +3950,11 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
                                         int64_t direct_memory_start, size_t alignment) {
 	struct AccessReport { ~AccessReport() { ReportGuestAccess(false); } } access_report;
 	PRINT_NAME();
+
+	if (const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0)); AvailableClamp::Traced(caller)) {
+		AvailableClamp::Print("sceKernelMapDirectMemory", caller, len, static_cast<uint64_t>(direct_memory_start),
+		                      "map requested");
+	}
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 

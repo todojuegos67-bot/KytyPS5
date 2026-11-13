@@ -110,6 +110,12 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void                   SetFlexibleMemorySize(uint64_t size);
+// Demon's Souls allocator clamp (loader/demonsSoulsAllocClamp.cpp, KYTY_DS_ALLOC_PATCH=1), set at load before guest
+// code runs: sceKernelAvailableDirectMemorySize answered to the guest call that returns to `return_address` gives at
+// most `limit` bytes; the direct-memory calls returning into [trace_begin, trace_end) are printed (what the game's
+// allocator start-up then takes). `image_base` only for the printed eboot+offset.
+void                   SetAvailableDirectClamp(uint64_t return_address, uint64_t limit, uint64_t trace_begin,
+                                               uint64_t trace_end, uint64_t image_base);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 // With frame generation: the address range held free above the guest since start-up, released right before the
 // Vulkan device is made (ReserveGuestRegions, issue #45). Nothing without it.
