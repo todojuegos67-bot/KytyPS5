@@ -532,7 +532,11 @@ bool Init(const Vulkan::Instance& instance) {
             g.native2 = kN2Measure;
         }
     }
-    if (!g.velocity || !g.skin_order) {
+    if (!g.velocity) {
+        // Class 4 is written only by the velocity path (VelocityDraw): with BB_VELOCITY=0 the
+        // character mask would be empty and the class-1 player mask / refine would be lost.
+        g.native2 = 0;
+    } else if (!g.skin_order) {
         g.native2 &= kN2Character;
     }
     if (g.velocity) {

@@ -65,7 +65,9 @@ vec2 Refine(ivec2 c, vec2 v, bool additive) {
             const ivec2 n4[4] = ivec2[](ivec2(4, 0), ivec2(-4, 0), ivec2(0, 4), ivec2(0, -4));
             const ivec2 q = clamp(c + n4[i - 8], ivec2(0), ivec2(size) - 1);
             const vec4 o = texelFetch(obj_mv, q, 0);
-            if (!(o.z > 0.5 && o.z < 1.5) || any(isnan(o.xy)) || any(isinf(o.xy))) continue;
+            if (!((o.z > 0.5 && o.z < 1.5) || o.z > 3.5) || any(isnan(o.xy)) || any(isinf(o.xy))) {
+                continue;
+            }
             cand = additive ? o.xy + imageLoad(mv_out, q).xy : o.xy;
         }
         const float e = PatchCost(c, cand, size);
