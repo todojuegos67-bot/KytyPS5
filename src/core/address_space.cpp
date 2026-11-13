@@ -888,6 +888,17 @@ AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
 AddressSpace::~AddressSpace() = default;
 
 void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_exec) {
+#if ARCH_X86_64
+    const auto prot = is_exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+#else
+    // On non-native architectures, we can simplify things by ignoring the execute flag for the
+    // canonical copy of the memory and rely on the JIT to map translated code as executable.
+    constexpr auto prot = PAGE_READWRITE;
+#endif
+    void* const ret = impl->Map(virtual_addr, phys_addr, size, prot);
+    // Publish the backing pointers only after the mapping exists (and, on Windows, its physical
+    // pages are committed): CopySparseMemory and the texture hash read this table without the
+    // memory manager lock, and an uncommitted backing page would be an access violation.
     const VAddr end_addr = virtual_addr + size - 1;
     if (phys_addr != -1 && std::bit_width(end_addr) <= Traits::ADDRESS_SPACE_BITS) {
         const u64 base_page = virtual_addr >> Traits::PAGE_BITS;
@@ -896,14 +907,7 @@ void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_e
                 backing_base + phys_addr + offset;
         }
     }
-#if ARCH_X86_64
-    const auto prot = is_exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
-#else
-    // On non-native architectures, we can simplify things by ignoring the execute flag for the
-    // canonical copy of the memory and rely on the JIT to map translated code as executable.
-    constexpr auto prot = PAGE_READWRITE;
-#endif
-    return impl->Map(virtual_addr, phys_addr, size, prot);
+    return ret;
 }
 
 void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd) {
