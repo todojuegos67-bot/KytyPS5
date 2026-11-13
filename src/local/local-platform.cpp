@@ -1759,15 +1759,6 @@ bool MemoryTagsEnabled() {
 	return on;
 }
 
-bool MemoryTagsVulkanEnabled() {
-	static const bool on = [] {
-		if (MemoryTagsEnabled()) return true;
-		const char* text = std::getenv("KYTY_MEMORY_TAGS_VK");
-		return text == nullptr || text[0] != '0';
-	}();
-	return on;
-}
-
 void MemoryTagAdd(int tag, int64_t requested, int64_t committed) {
 	if (tag < 0 || tag >= MemoryTagCount) return;
 	MemoryTags::g_requested[tag].fetch_add(requested, std::memory_order_relaxed);
@@ -1926,8 +1917,7 @@ static int FormatMemoryTags(char* out, size_t room, const std::set<uint64_t>& to
 // bytes). "untagged" is the rest: the driver's own pools (pipelines), heap blocks under 1 MiB, malloc/VirtualAlloc.
 static void PrintMemoryTagSummary(unsigned long seconds) {
 	using namespace MemoryTags;
-	static const char* const names[MemoryTagCount] = {"vulkan-device-local", "vulkan-host", "vulkan-ballast", "new>=1MiB",
-	                                                                 "guest-private"};
+	static const char* const names[MemoryTagCount] = {"vulkan-device-local", "vulkan-host", "vulkan-ballast", "new>=1MiB"};
 	const uint64_t private_bytes = ProcessMemory().private_bytes;
 	std::vector<std::pair<uint64_t, std::string>> top; // bytes, name
 	int64_t tagged = 0;
@@ -1959,67 +1949,7 @@ static void PrintMemoryTagSummary(unsigned long seconds) {
 	std::fflush(stdout);
 }
 
-// "Memory attribution (30 s):" - the process's private commit by owner, from measurements that hook nothing but
-// vkAllocateMemory/vkFreeMemory (MemoryTagsVulkanEnabled) and the guest's private commits (GuestAddressSpace), and a
-// read-only look at the address-space walk's allocations: thread stacks (a guard page), heap segments (the NT heap's
-// 0xffeeffee or the segment heap's 0xddeeddee signature at +0x10, read with ReadProcessMemory: an allocation freed
-// meanwhile fails the read, never faults). "rest" is what none of them names: large malloc blocks (each its own
-// allocation), the driver's own pools (pipelines, command buffers) and the emulator's direct VirtualAllocs.
-static void PrintMemoryAttribution(unsigned long seconds, const std::map<uint64_t, std::pair<uint64_t, DWORD>>& bases,
-                                   const std::set<uint64_t>& guard_bases, const std::set<uint64_t>& heaps) {
-	using namespace MemoryTags;
-	const auto     private_bytes = static_cast<int64_t>(ProcessMemory().private_bytes);
-	const auto     tagged_bytes  = [](int t) { return std::max<int64_t>(g_committed[t].load(std::memory_order_relaxed), 0); };
-	const int64_t  vk_device     = tagged_bytes(MemoryTagVulkanDeviceLocal) + tagged_bytes(MemoryTagVulkanBallast);
-	const int64_t  vk_host       = tagged_bytes(MemoryTagVulkanHost);
-	const int64_t  guest         = tagged_bytes(MemoryTagGuestPrivate);
-	const int64_t  large_new     = MemoryTagsEnabled() ? tagged_bytes(MemoryTagLargeNew) : 0;
-	int64_t        stacks = 0, heap_bytes = 0, heap_count = 0, stack_count = 0, other_max = 0;
-	uint64_t       other_max_base = 0;
-	for (const auto& [base, entry]: bases) {
-		const auto bytes = static_cast<int64_t>(entry.first);
-		if (guard_bases.count(base) != 0) {
-			stacks += bytes;
-			stack_count++;
-			continue;
-		}
-		// (Only above the guest's range, 0xfc00000000: the guest's own pages are never read, whatever their protection.)
-		uint32_t signature = 0;
-		SIZE_T   got       = 0;
-		if (heaps.count(base) != 0 ||
-		    (base >= 0xfc00000000ull &&
-		     ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(base + 0x10), &signature, sizeof(signature),
-		                       &got) != 0 &&
-		     got == sizeof(signature) && (signature == 0xffeeffeeu || signature == 0xddeeddeeu))) {
-			heap_bytes += bytes;
-			heap_count++;
-			continue;
-		}
-		if (bytes > other_max) {
-			other_max      = bytes;
-			other_max_base = base;
-		}
-	}
-	const int64_t rest = private_bytes - vk_device - vk_host - guest - stacks - heap_bytes - large_new;
-	std::printf("Memory attribution (%lu s): private %lld MiB = vulkan device-local %lld MiB (driver's commit for video "
-	            "memory, %lld allocations, %lld MiB asked) + vulkan host-visible %lld MiB (%lld allocations, %lld MiB asked) + "
-	            "guest private %lld MiB (game memory and guest stacks) + thread stacks %lld MiB (%lld stacks) + heap segments "
-	            "%lld MiB (%lld) + new>=1MiB %lld MiB%s + rest %lld MiB (large malloc blocks, driver pools, emulator "
-	            "VirtualAllocs; its largest allocation 0x%llx=%lldMiB)%s\n",
-	            seconds, static_cast<long long>(private_bytes >> 20), static_cast<long long>(vk_device >> 20),
-	            static_cast<long long>(g_count[MemoryTagVulkanDeviceLocal].load() + g_count[MemoryTagVulkanBallast].load()),
-	            static_cast<long long>((g_requested[MemoryTagVulkanDeviceLocal].load() + g_requested[MemoryTagVulkanBallast].load()) >> 20),
-	            static_cast<long long>(vk_host >> 20), static_cast<long long>(g_count[MemoryTagVulkanHost].load()),
-	            static_cast<long long>(g_requested[MemoryTagVulkanHost].load() >> 20), static_cast<long long>(guest >> 20),
-	            static_cast<long long>(stacks >> 20), static_cast<long long>(stack_count), static_cast<long long>(heap_bytes >> 20),
-	            static_cast<long long>(heap_count), static_cast<long long>(large_new >> 20),
-	            MemoryTagsEnabled() ? "" : " (KYTY_MEMORY_TAGS=1 measures it)", static_cast<long long>(rest / (1 << 20)),
-	            static_cast<unsigned long long>(other_max_base), static_cast<long long>(other_max >> 20),
-	            MemoryTagsVulkanEnabled() ? "" : "; Vulkan not measured (KYTY_MEMORY_TAGS_VK=0)");
-	std::fflush(stdout);
-}
-
-// KYTY_MEMORY_BREAKDOWN_SECONDS (default 30, 0 off): where the process's private commit is, from a walk of its
+// KYTY_MEMORY_BREAKDOWN_SECONDS (default 60, 0 off): where the process's private commit is, from a walk of its
 // address space on a low-priority thread (a few ms per walk, off the game's threads): private committed by kind
 // (process heaps, executable, read-write), mapped (sections: the guest store), and the largest allocations.
 void StartMemoryBreakdown() {
@@ -2027,7 +1957,7 @@ void StartMemoryBreakdown() {
 	std::call_once(once, [] {
 		const char* text    = std::getenv("KYTY_MEMORY_BREAKDOWN_SECONDS");
 		// (30 s by default with KYTY_MEMORY_TAGS=1, the tagged summary's period.)
-		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : 30ul;
+		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : MemoryTagsEnabled() ? 30ul : 60ul;
 		if (seconds == 0) return;
 		std::thread([seconds] {
 			SetThreadDescription(GetCurrentThread(), L"Kyty.MemoryBreakdown");
@@ -2045,7 +1975,6 @@ void StartMemoryBreakdown() {
 					}
 				}
 				std::map<uint64_t, std::pair<uint64_t, DWORD>> bases; // allocation base -> committed private, its protection
-				std::set<uint64_t> guard_bases; // allocations with a guard page: thread stacks
 				uint64_t heap = 0, exec = 0, rw = 0, other = 0, mapped = 0, image = 0, regions = 0;
 				MEMORY_BASIC_INFORMATION info {};
 				for (uint64_t at = 0x10000; VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info);) {
@@ -2057,7 +1986,6 @@ void StartMemoryBreakdown() {
 							auto&      entry = bases[base];
 							entry.first += size;
 							entry.second = info.AllocationProtect;
-							if ((info.Protect & PAGE_GUARD) != 0) guard_bases.insert(base);
 							if (heaps.count(base) != 0) heap += size;
 							else if ((info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) exec += size;
 							else if ((info.Protect & PAGE_READWRITE) != 0) rw += size;
@@ -2111,7 +2039,6 @@ void StartMemoryBreakdown() {
 				            static_cast<unsigned long long>(large_b >> 20u), tags,
 				            annotations.empty() ? "" : "; largest that are new:", annotations.c_str());
 				std::fflush(stdout);
-				PrintMemoryAttribution(seconds, bases, guard_bases, heaps);
 				if (MemoryTagsEnabled()) PrintMemoryTagSummary(seconds);
 			}
 		}).detach();
@@ -2690,7 +2617,6 @@ void StartMemoryBreakdown() {}
 void SetSimulationBallast(uint64_t) {}
 uint64_t SimulationBallast() { return 0; }
 bool MemoryTagsEnabled() { return false; }
-bool MemoryTagsVulkanEnabled() { return false; }
 void MemoryTagAdd(int, int64_t, int64_t) {}
 void SetTrimRunner(void (*)(void (*)())) {}
 

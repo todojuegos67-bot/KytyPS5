@@ -61,17 +61,7 @@ struct Record {
 constexpr size_t           Capacity = 1u << 22;
 inline std::atomic_bool     g_on {false};
 inline std::atomic<uint64_t> g_count {0};
-// The records (128 MiB): allocated by the first `trace` (EnsureRecords) and kept, not a static array: a static one was
-// 128 MiB of the executable's writable image, charged to commit in every session that never traces.
-inline std::atomic<Record*> g_records {nullptr};
-inline bool                 EnsureRecords() {
-	if (g_records.load(std::memory_order_acquire) != nullptr) return true;
-	auto* records = static_cast<Record*>(std::calloc(Capacity, sizeof(Record)));
-	if (records == nullptr) return false;
-	Record* expected = nullptr;
-	if (!g_records.compare_exchange_strong(expected, records, std::memory_order_acq_rel)) std::free(records);
-	return true;
-}
+inline Record               g_records[Capacity];
 
 // GPU buffer writes and readback ranges as events (live `tracew`): producers are matched offline.
 inline std::atomic_bool g_writes_on {false};
@@ -97,10 +87,8 @@ inline thread_local uint64_t g_mark_tag = 0;
 inline void (*g_read_marks)(uint32_t count) = nullptr;
 
 inline void Append(uint32_t type, uint64_t a, uint64_t b) {
-	Record* const records = g_records.load(std::memory_order_acquire);
-	if (records == nullptr) return;
 	const auto index = g_count.fetch_add(1, std::memory_order_relaxed);
-	if (index < Capacity) records[index] = {__rdtsc(), 0, type, a, b};
+	if (index < Capacity) g_records[index] = {__rdtsc(), 0, type, a, b};
 }
 
 inline uint32_t ThreadId() {
@@ -110,11 +98,9 @@ inline uint32_t ThreadId() {
 
 inline void Event(uint32_t type, uint64_t a = 0, uint64_t b = 0) {
 	if (!g_on.load(std::memory_order_relaxed)) return;
-	Record* const records = g_records.load(std::memory_order_acquire);
-	if (records == nullptr) return;
 	const auto index = g_count.fetch_add(1, std::memory_order_relaxed);
 	if (index >= Capacity) return;
-	records[index] = {__rdtsc(), ThreadId(), type, a, b};
+	g_records[index] = {__rdtsc(), ThreadId(), type, a, b};
 }
 
 // Records the call when it took at least ~0.25 ms (and tracing is on).
@@ -133,8 +119,7 @@ struct SlowOsCallScope {
 inline void Dump(const char* path) {
 	const auto count = std::min<uint64_t>(g_count.load(), Capacity);
 	if (auto* out = std::fopen(path, "wb")) {
-		if (const Record* records = g_records.load(std::memory_order_acquire); records != nullptr)
-			std::fwrite(records, sizeof(Record), count, out);
+		std::fwrite(g_records, sizeof(Record), count, out);
 		std::fclose(out);
 	}
 }
