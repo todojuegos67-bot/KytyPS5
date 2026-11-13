@@ -154,6 +154,10 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
     const Id diag = ctx.OpINotEqual(b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(2u)),
                                     ctx.u32_zero_value);
     Id cls = ctx.OpSelect(f32, diag, ctx.Constant(f32, 2.0f), one);
+    // Class 4 (flags bit 2, BB_NATIVE_MV2): a skinned draw (characters), the player mask's source.
+    const Id character = ctx.OpINotEqual(b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(4u)),
+                                         ctx.u32_zero_value);
+    cls = ctx.OpSelect(f32, character, ctx.Constant(f32, 4.0f), cls);
     Id weight = one;
     if (ctx.runtime_info.hw.fs.bb_objmv_blend) {
         cls = ctx.Constant(f32, 3.0f);
