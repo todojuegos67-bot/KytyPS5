@@ -4037,9 +4037,10 @@ bool RenderExecutor::TableBindingsMatch(PreparedBindings& prepared,
 	if (!m_binding_table) {
 		m_binding_table = std::make_shared<TableBindings::Table>();
 	}
-	const auto slot = TableBindingsSlot(prepared);
-	m_binding_table->verify[slot].reset();
-	m_binding_table->current[slot] = nullptr;
+	auto&      table = *m_binding_table;
+	const auto slot  = TableBindingsSlot(prepared);
+	table.verify[slot].reset();
+	table.current[slot] = nullptr;
 	if (!TableMode::ProgramHitFlag()) {
 		TableMode::Add(TableMode::Counter::BindingMisses);
 		TableMode::Add(TableMode::Counter::BindingMissProgram);
@@ -4047,34 +4048,44 @@ bool RenderExecutor::TableBindingsMatch(PreparedBindings& prepared,
 	}
 	const auto& snapshot = *runtime.resources;
 	const auto  hash     = TableBindings::KeyHash(runtime.program, normalize, snapshot);
-	auto& entry = m_binding_table->entries[hash & (TableBindings::Entries - 1u)];
+	auto&       entry    = table.entries[hash & (TableBindings::Entries - 1u)];
 	if (!entry.valid || entry.hash != hash || entry.program != runtime.program ||
 	    entry.normalize != normalize || entry.images != snapshot.images ||
-	    entry.samplers != snapshot.samplers || entry.buffers != snapshot.buffers ||
-	    !snapshot.bindless_heaps.empty() || !snapshot.bindless_sampler_heaps.empty() ||
-	    !TableBindingsAllowed(*runtime.program)) {
+	    entry.samplers != snapshot.samplers || !snapshot.bindless_heaps.empty() ||
+	    !snapshot.bindless_sampler_heaps.empty() || !TableBindingsAllowed(*runtime.program)) {
 		TableMode::Add(TableMode::Counter::BindingMisses);
 		TableMode::Add(TableMode::Counter::BindingMissKey);
+		// Which part of the key the program's last stored entry had otherwise.
+		const auto last = table.last_by_program.find(runtime.program);
+		if (last == table.last_by_program.end()) {
+			TableMode::Add(TableMode::Counter::BindingKeyNew);
+		} else {
+			if (last->second.first != TableBindings::ListHash(snapshot.images)) {
+				TableMode::Add(TableMode::Counter::BindingKeyImages);
+			}
+			if (last->second.second != TableBindings::ListHash(snapshot.samplers)) {
+				TableMode::Add(TableMode::Counter::BindingKeySamplers);
+			}
+		}
 		return false;
 	}
-	m_binding_table->current[slot] = &entry;
-	if (!TableMode::Verifying()) {
-		// The entry's bindings into the slot (vectors keep their capacity).
-		prepared = entry.prepared;
-	}
+	table.current[slot] = &entry;
 	if (TableMode::Verifying()) {
-		// The normal path prepares the stage; the bindings it would have reused are kept for
+		// The normal path prepares the stage; the entry's bindings are kept for
 		// TableBindingsStore to compare, when they pass the reuse checks now.
 		PreparedBindings candidate = entry.prepared;
 		if (TableBindingsReuse(candidate, false, slot)) {
 			TableMode::Add(TableMode::Counter::BindingHits);
-			m_binding_table->verify[slot] = std::move(candidate);
+			table.verify[slot] = std::move(candidate);
 		} else {
 			TableMode::Add(TableMode::Counter::BindingMisses);
 			TableMode::Add(TableMode::Counter::BindingMissStale);
 		}
 		return false;
 	}
+	// The entry's bindings into the slot (vectors keep their capacity); the buffers are found
+	// and bound again by the normal path (FindBuffers, RebindBuffers).
+	prepared = entry.prepared;
 	return true;
 }
 
@@ -4094,20 +4105,6 @@ bool RenderExecutor::TableBindingsReuse(PreparedBindings& prepared, bool replay,
 			return false;
 		}
 	}
-	auto& buffers = m_context.GetBufferCache();
-	if (prepared.buffers.size() != prepared.buffer_sources.size()) {
-		return false;
-	}
-	for (size_t i = 0; i < prepared.buffer_sources.size(); i++) {
-		const auto& source = prepared.buffer_sources[i];
-		if (source.address < BufferCache::CACHING_PAGESIZE || source.size == 0) {
-			continue;
-		}
-		if (!buffers.ReuseReadBinding(source.id, prepared.buffers[i].buffer, source.address,
-		                              source.size)) {
-			return false;
-		}
-	}
 	if (replay) {
 		// PrepareBindings' BindImage (its flags were cleared by the last draw's ResetBindings)
 		// and the texture use FindTexture records; the layouts are CommitBindings' as always.
@@ -4122,45 +4119,28 @@ bool RenderExecutor::TableBindingsReuse(PreparedBindings& prepared, bool replay,
 	return true;
 }
 
-void RenderExecutor::TableBindingsUpload(PreparedBindings& prepared) {
+void RenderExecutor::TableBindingsUserData(PreparedBindings& prepared) {
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
-	// The user data words, as PrepareBindings copies them (the rest, buffer offsets and lengths,
-	// is the same buffers' as before).
+	// This draw's user data words, as PrepareBindings copies them (RebindBuffers writes the rest).
 	for (size_t i = 0; i < layout.user_data_registers.size(); i++) {
 		prepared.shader_data[i] = snapshot.user_data[layout.user_data_registers[i] -
 		                                             program.user_data_base];
 	}
-	if (ShaderRecompiler::IR::FindBinding(
-	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
-		FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
-	}
-	if (ShaderRecompiler::IR::FindBinding(
-	        layout, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
-		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
-	}
 }
 
-// Whether the normal path's bindings of a stage may be kept: read-only images and buffers the
-// reuse checks can vouch for, no per-draw work PrepareBindings or RebindBuffers would redo.
-static bool TableBindingsStorable(RenderContext& context, const PreparedBindings& prepared) {
+// Whether the normal path's bindings of a stage may be kept: read-only images the reuse checks
+// can vouch for, no per-draw work PrepareBindings would redo. (Buffers are always bound again.)
+static bool TableBindingsStorable(const PreparedBindings& prepared) {
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
-	const auto& layout   = program.bindings;
-	if (!TableBindingsAllowed(program) || program.info.uses_dma || layout.write_tracking ||
-	    !snapshot.bindless_heaps.empty() || !snapshot.bindless_sampler_heaps.empty() ||
-	    !prepared.bindless_patches.empty() || !prepared.bindless_heaps.empty() ||
-	    prepared.buffers.size() != prepared.buffer_sources.size() ||
+	if (!TableBindingsAllowed(program) || !snapshot.bindless_heaps.empty() ||
+	    !snapshot.bindless_sampler_heaps.empty() || !prepared.bindless_patches.empty() ||
+	    !prepared.bindless_heaps.empty() ||
 	    prepared.images.size() != program.info.images.size()) {
 		return false;
-	}
-	for (const auto& buffer: program.info.buffers) {
-		if (buffer.written || buffer.formatted) {
-			return false;
-		}
 	}
 	for (size_t i = 0; i < prepared.images.size(); i++) {
 		const auto& binding  = prepared.images[i];
@@ -4175,25 +4155,12 @@ static bool TableBindingsStorable(RenderContext& context, const PreparedBindings
 		if (program.stage == ShaderType::Pixel && IsLightGridBinding(resource, binding)) {
 			return false;
 		}
-		// (The image itself: TableBindingsStore.)
-	}
-	auto& buffers = context.GetBufferCache();
-	for (size_t i = 0; i < prepared.buffer_sources.size(); i++) {
-		const auto& source = prepared.buffer_sources[i];
-		if (source.address < BufferCache::CACHING_PAGESIZE || source.size == 0) {
-			continue;
-		}
-		// Not the stream copy of CPU-dirty bytes (ObtainBuffer's small reads), nor a buffer
-		// found again by ObtainBuffer: the cached buffer of the source, clean.
-		if (!buffers.ReuseReadBinding(source.id, prepared.buffers[i].buffer, source.address,
-		                              source.size)) {
-			return false;
-		}
 	}
 	return true;
 }
 
-// KYTY_TABLE=2: the first field in which the kept bindings differ from the normal path's.
+// KYTY_TABLE=2: the first field in which the kept bindings differ from the normal path's (what
+// the table reuses: images, samplers, GDS).
 static const char* TableBindingsDifference(const PreparedBindings& kept,
                                            const PreparedBindings& now) {
 	if (kept.images.size() != now.images.size()) return "image count";
@@ -4208,22 +4175,9 @@ static const char* TableBindingsDifference(const PreparedBindings& kept,
 		if (a.mip_views != b.mip_views) return "mip views";
 	}
 	if (kept.samplers != now.samplers) return "samplers";
-	if (kept.buffer_sources.size() != now.buffer_sources.size()) return "buffer count";
-	for (size_t i = 0; i < kept.buffer_sources.size(); i++) {
-		const auto& a = kept.buffer_sources[i];
-		const auto& b = now.buffer_sources[i];
-		if (a.address != b.address || a.size != b.size || !(a.id == b.id)) return "buffer source";
-	}
-	if (kept.buffers != now.buffers) return "buffer views";
 	if (kept.gds != now.gds) return "gds";
 	if (kept.normalize_unnormalized != now.normalize_unnormalized) return "normalization";
-	// The kept shader data's user data words are this draw's after TableBindingsUpload; compare
-	// the rest (buffer offsets and lengths).
-	const auto& layout = now.runtime->program->bindings;
 	if (kept.shader_data.size() != now.shader_data.size()) return "shader data size";
-	for (size_t i = layout.user_data_registers.size(); i < now.shader_data.size(); i++) {
-		if (kept.shader_data[i] != now.shader_data[i]) return "shader data";
-	}
 	return nullptr;
 }
 
@@ -4231,29 +4185,30 @@ void RenderExecutor::TableBindingsStore(PreparedBindings& prepared, bool verify)
 	if (!m_binding_table) {
 		m_binding_table = std::make_shared<TableBindings::Table>();
 	}
-	const auto slot = TableBindingsSlot(prepared);
-	auto&      kept = m_binding_table->verify[slot];
+	auto&       table    = *m_binding_table;
+	const auto  slot     = TableBindingsSlot(prepared);
+	auto&       kept     = table.verify[slot];
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto  hash     = TableBindings::KeyHash(prepared.runtime->program,
 	                                              prepared.normalize_unnormalized, snapshot);
-	auto& entry = m_binding_table->entries[hash & (TableBindings::Entries - 1u)];
+	auto&       entry    = table.entries[hash & (TableBindings::Entries - 1u)];
 	if (verify && kept) {
 		TableMode::Add(TableMode::Counter::BindingVerifyChecks);
 		if (const char* difference = TableBindingsDifference(*kept, prepared)) {
 			TableMode::Add(TableMode::Counter::BindingVerifyMismatches);
 			if (TableMode::VerifyLogAllowed()) {
-				LOGF_UNMUTED("Table verify: bindings slot %u shader %016" PRIx64 ": %s differs (image set "
-				     "generation %" PRIu64 " kept, %" PRIu64 " now; buffer set %" PRIu64
-				     " kept, %" PRIu64 " now)\n",
-				     slot, prepared.runtime->program->shader_hash, difference,
-				     entry.image_generation, m_context.GetTextureCache().ImageSetGeneration(),
-				     entry.buffer_generation, m_context.GetBufferCache().BufferSetGeneration());
+				LOGF_UNMUTED("Table verify: bindings slot %u shader %016" PRIx64
+				             ": %s differs (image set generation %" PRIu64 " kept, %" PRIu64
+				             " now)\n",
+				             slot, prepared.runtime->program->shader_hash, difference,
+				             entry.image_generation,
+				             m_context.GetTextureCache().ImageSetGeneration());
 			}
 		}
 	}
 	kept.reset();
 	auto&      texture  = m_context.GetTextureCache();
-	const bool storable = TableBindingsStorable(m_context, prepared) &&
+	const bool storable = TableBindingsStorable(prepared) &&
 	                      std::ranges::all_of(prepared.images, [&](const TextureBinding& binding) {
 		                      const auto* image = texture.m_slot_images.try_get(binding.image_id);
 		                      return image != nullptr &&
@@ -4267,16 +4222,19 @@ void RenderExecutor::TableBindingsStore(PreparedBindings& prepared, bool verify)
 		TableMode::Add(TableMode::Counter::BindingNotStored);
 		return;
 	}
-	entry.valid          = true;
-	entry.hash           = hash;
-	entry.prepared       = prepared;
-	entry.program        = prepared.runtime->program;
-	entry.normalize      = prepared.normalize_unnormalized;
-	entry.images         = snapshot.images;
-	entry.samplers       = snapshot.samplers;
-	entry.buffers        = snapshot.buffers;
-	entry.image_generation  = m_context.GetTextureCache().ImageSetGeneration();
-	entry.buffer_generation = m_context.GetBufferCache().BufferSetGeneration();
+	entry.valid            = true;
+	entry.hash             = hash;
+	entry.prepared         = prepared;
+	entry.program          = prepared.runtime->program;
+	entry.normalize        = prepared.normalize_unnormalized;
+	entry.images           = snapshot.images;
+	entry.samplers         = snapshot.samplers;
+	entry.image_generation = texture.ImageSetGeneration();
+	if (table.last_by_program.size() > 65536) {
+		table.last_by_program.clear();
+	}
+	table.last_by_program[entry.program] = {TableBindings::ListHash(snapshot.images),
+	                                        TableBindings::ListHash(snapshot.samplers)};
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
@@ -4290,11 +4248,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawFind);
-		for (uint32_t i = 0; i < stages.size(); i++) {
-			auto* stage = stages[i];
-			if ((table_reused >> i) & 1u) {
-				continue; // the slot's buffer sources, as they are
-			}
+		for (auto* stage: stages) {
 			FindBuffers(*stage);
 			uses_dma |= stage->runtime->program->info.uses_dma;
 		}
@@ -4344,18 +4298,16 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	const GpuPhases::Scope buffers_phase(GpuPhases::Phase::DrawBuffers);
 	for (uint32_t i = 0; i < stages.size(); i++) {
 		if ((table_reused >> i) & 1u) {
-			TableBindingsUpload(*stages[i]);
-		} else {
-			RebindBuffers(*stages[i]);
+			TableBindingsUserData(*stages[i]);
 		}
+		RebindBuffers(*stages[i]);
 	}
 	if (TableMode::Enabled()) {
 		for (uint32_t i = 0; i < stages.size(); i++) {
 			if ((table_reused >> i) & 1u) {
-				// Kept: valid against the generations as the draw leaves them.
+				// Kept: valid against the image set generation as the draw leaves it.
 				if (auto* entry = m_binding_table->current[TableBindingsSlot(*stages[i])]) {
-					entry->image_generation  = cache.ImageSetGeneration();
-					entry->buffer_generation = m_context.GetBufferCache().BufferSetGeneration();
+					entry->image_generation = cache.ImageSetGeneration();
 				}
 			} else {
 				TableBindingsStore(*stages[i], TableMode::Verifying());

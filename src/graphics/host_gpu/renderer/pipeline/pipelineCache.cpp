@@ -6351,7 +6351,7 @@ static uint64_t DrawPrepTessIdentity(const HW::VertexShaderInfo& vertex_regs,
 	return XXH3_64bits(words, sizeof(words));
 }
 
-// KYTY_TABLE (temporary diagnostic, KYTY_TABLE_KEYDIAG=0 turns it off): on a "new" miss, the key
+// KYTY_TABLE (temporary diagnostic, off by default; KYTY_TABLE_KEYDIAG=1 turns it on): on a "new" miss, the key
 // of the last draw with the same vs/ps pair is compared with this one's, part by part, and the
 // first differing byte of each part is counted. Every 10 s a "Table keydiag:" line (GPU thread).
 namespace {
@@ -6381,7 +6381,7 @@ struct TableKeyDiag {
 	static bool Enabled() {
 		static const bool enabled = [] {
 			const char* value = std::getenv("KYTY_TABLE_KEYDIAG");
-			return value == nullptr || value[0] != '0';
+			return value != nullptr && value[0] == '1';
 		}();
 		return enabled;
 	}

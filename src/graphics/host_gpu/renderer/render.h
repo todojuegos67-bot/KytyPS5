@@ -329,8 +329,8 @@ private:
 	// Whether they may be used again now; with `replay`, binds their images as PrepareBindings
 	// would.
 	[[nodiscard]] bool TableBindingsReuse(PreparedBindings& prepared, bool replay, uint32_t slot);
-	// A reused stage's per-draw uploads (user data words, flattened SRT, shader data).
-	void TableBindingsUpload(PreparedBindings& prepared);
+	// A reused stage's user data words in its shader data (RebindBuffers does the rest).
+	void TableBindingsUserData(PreparedBindings& prepared);
 	// After the normal path: keep (or drop) the slot's entry; `verify`: compare with the copy.
 	void TableBindingsStore(PreparedBindings& prepared, bool verify);
 	// `table_reused`: bit i, stage i's bindings are the slot's last (TableBindingsMatch), not

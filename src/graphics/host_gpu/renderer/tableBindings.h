@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 // KYTY_TABLE (tableMode.h): the bindings table, after chenxiao07's table sets
@@ -14,8 +15,9 @@
 // 10-11 October, 17542a12f's memo of a pair's last set). There a table draw takes the descriptor
 // set its pair and state used last while the set's validation holds. Here, per graphics stage
 // slot (vertex 0-2, pixel), the slot's PreparedBindings stay as the last draw left them, and this
-// remembers what they were prepared from: the program and the image, sampler and buffer
-// descriptors. A draw whose programs came from the programs table and whose stage repeats them
+// remembers what they were prepared from: the program and the image and sampler descriptors
+// (entries by their hash). Buffers are not part of it: FindBuffers and RebindBuffers run for every
+// stage (V#s of per-frame memory made the key miss, and reused buffer views went stale). A draw whose programs came from the programs table and whose stage repeats them
 // takes the slot's bindings as they are, once every image passes ReuseTextureBinding (registered,
 // not CPU-dirty nor buffer-written, all pages tracked) under the same image set generation and
 // every buffer passes BufferCache::ReuseReadBinding (alive, same handle, no CPU-dirty page). Only
@@ -31,10 +33,8 @@ struct Entry {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program   = nullptr;
 	bool                                            normalize = false;
 	uint64_t                                        image_generation  = 0;
-	uint64_t                                        buffer_generation = 0;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> images;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> samplers;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> buffers;
 	uint64_t                                           hash = 0;
 	// The bindings the normal path made from them (copied into the stage's slot on a match).
 	PreparedBindings prepared;
@@ -51,6 +51,9 @@ struct Table {
 	std::vector<Entry>               entries = std::vector<Entry>(Entries);
 	// The entry each slot's bindings came from (null: none, or not kept).
 	std::array<Entry*, Slots>        current {};
+	// Diagnostics of "key" misses: per program, the image and sampler list hashes of its last
+	// stored entry.
+	std::unordered_map<const void*, std::pair<uint64_t, uint64_t>> last_by_program;
 	// KYTY_TABLE=2: the slot's bindings before the normal path prepared them again.
 	std::array<std::optional<PreparedBindings>, Slots> verify {};
 };
@@ -65,11 +68,22 @@ inline uint64_t KeyHash(const void* program, bool normalize,
 		return h;
 	};
 	uint64_t h = reinterpret_cast<uint64_t>(program) * 0x9e3779b97f4a7c15ull ^ (normalize ? 1u : 0u);
-	for (const auto* list: {&snapshot.images, &snapshot.samplers, &snapshot.buffers}) {
+	for (const auto* list: {&snapshot.images, &snapshot.samplers}) {
 		for (const auto& value: *list) {
 			h = mix(h, value.dwords.data(), value.dword_count * sizeof(uint32_t));
 		}
 		h = mix(h, "|", 1);
+	}
+	return h;
+}
+
+[[nodiscard]] inline uint64_t
+ListHash(const std::vector<ShaderRecompiler::IR::DescriptorValue>& list) {
+	uint64_t h = 0xcbf29ce484222325ull;
+	for (const auto& value: list) {
+		for (uint32_t i = 0; i < value.dword_count; i++) {
+			h = (h ^ value.dwords[i]) * 0x100000001b3ull;
+		}
 	}
 	return h;
 }

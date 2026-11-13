@@ -83,7 +83,10 @@ enum class Counter : uint32_t {
 	BindingHits,
 	BindingMisses,
 	BindingMissProgram,   // the draw's programs did not come from the table
-	BindingMissKey,       // another program or resource snapshot than the slot's last
+	BindingMissKey,       // no entry of this program with these image and sampler descriptors
+	BindingKeyNew,        // ... of those: the program had no entry
+	BindingKeyImages,     // ... the images differ from the program's last entry
+	BindingKeySamplers,   // ... the samplers differ from it
 	BindingMissStale,     // image or buffer set generation moved, or an image or buffer refused
 	BindingNotStored,     // a stage the table does not keep (storage, written, bindless, DMA...)
 	BindingVerifyChecks,
@@ -195,7 +198,8 @@ inline void LogIfDue() {
 	     "%.2f, miss %.2f) | programs: misses new %llu, stale %llu, inputs %llu, refresh %llu, "
 	     "not stored %llu, stored %llu, hits with vertex tables %llu | targets: hits %llu / misses %llu | verify: programs "
 	     "%llu checks, %llu mismatches; targets %llu checks, %llu mismatches | bindings: hits %llu / "
-	     "misses %llu (program %llu, key %llu, stale %llu, not stored %llu), verify %llu checks, "
+	     "misses %llu (program %llu, key %llu [new %llu, images %llu, samplers %llu], stale %llu, "
+	     "not stored %llu), verify %llu checks, "
 	     "%llu mismatches\n",
 	     seconds, c(Counter::ProgramHits), c(Counter::ProgramMisses), all_us,
 	     us_per(dh_cycles, dh_draws), us_per(dm_cycles, dm_draws), c(Counter::ProgramMissNew),
@@ -204,7 +208,8 @@ inline void LogIfDue() {
 	     c(Counter::TargetMisses), c(Counter::ProgramVerifyChecks),
 	     c(Counter::ProgramVerifyMismatches), c(Counter::TargetVerifyChecks),
 	     c(Counter::TargetVerifyMismatches), c(Counter::BindingHits), c(Counter::BindingMisses),
-	     c(Counter::BindingMissProgram), c(Counter::BindingMissKey), c(Counter::BindingMissStale),
+	     c(Counter::BindingMissProgram), c(Counter::BindingMissKey), c(Counter::BindingKeyNew),
+	     c(Counter::BindingKeyImages), c(Counter::BindingKeySamplers), c(Counter::BindingMissStale),
 	     c(Counter::BindingNotStored), c(Counter::BindingVerifyChecks),
 	     c(Counter::BindingVerifyMismatches));
 	r.last_tsc  = tsc;
