@@ -286,7 +286,11 @@ std::unique_ptr<WindowContext> g_window;
 
 } // namespace
 
+#if defined(KYTY_DS_PORT)
+constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Demon's Souls"; // (the PC port: never a placeholder title)
+#else
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
+#endif
 constexpr int KYTY_SDL_WINDOWPOS_CENTERED = SDL_WINDOWPOS_CENTERED; /*NOLINT(hicpp-signed-bitwise)*/
 
 static void SetPause(WindowLoopState& game, bool flag) {
@@ -343,7 +347,11 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				if (!HostInputKbmEnabled()) SetPause(game, !game.paused.load(std::memory_order_acquire));
 				break;
 			// F9: a debug snapshot of the picture shown (src/local/debug-snapshot.h), the game paused; F9 again resumes.
+			// (The PC port: only with KYTY_DEBUG_SNAPSHOT=1, a debugging switch; otherwise F9 is an ordinary key.)
 			case SDLK_F9:
+#if defined(KYTY_DS_PORT)
+				if (const char* v = std::getenv("KYTY_DEBUG_SNAPSHOT"); v == nullptr || v[0] != '1') break;
+#endif
 				if (!key.repeat) {
 					if (!game.paused.load(std::memory_order_acquire)) {
 						const auto folder = DebugSnapshot::Take(g_window != nullptr ? g_window->window : nullptr);

@@ -17,7 +17,7 @@ BEGIN
 	BEGIN
 		BLOCK "040A04B0"
 		BEGIN
-			VALUE "FileDescription", "Demon's Souls PC (KytyPS5)"
+			VALUE "FileDescription", "Demon's Souls PC"
 			VALUE "ProductName", "Demon's Souls PC"
 			VALUE "OriginalFilename", "Demon's Souls.exe"
 			VALUE "FileVersion", "1.0"
