@@ -1029,7 +1029,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-13) Native-PC memory budget, set in the game's own engine at boot (no memory moved while playing): the
 	// texture streaming pool (texturePoolSizeMiBs, "Streaming Pool Total Size MiBs") defaults to 8192 MiB of the
 	// PS5's unified memory; on PC the textures live in video memory, so 4096 MiB of guest RAM is the budget.
-	if (demons) env.AppendConvars("texturePoolSizeMiBs=4096");
+	// (11-13) texturePoolSizeMiBs left at the game default (the user: textures for the graphics are not touched).
 	// (11-13) With a 4 GB texture pool the game needs less than the PS5's 12 GiB allocator budget: the guest store is
 	// 12288 MiB (was 13824), so the block the engine maps above 12 GiB and keeps for good (~1.1 GB) no longer exists.
 	// Set once at boot; nothing is moved while playing.
