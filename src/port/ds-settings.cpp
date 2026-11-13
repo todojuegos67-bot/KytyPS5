@@ -1041,6 +1041,11 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-13) KYTY_GUEST_LAZY_COMMIT=1 (off by default) replaces it with the emulator's lazy commit (each 64 KiB committed
 	// at its first touch, never decommitted or moved).
 	env.Default("KYTY_BACKING_ON_DEMAND", "1");
+	// (native port) Native memory model: per-frame CPU->GPU arenas as an upload heap (no page-protection tracking),
+	// streamed mips reported once per mip, render-target arenas GPU-only. Byte-checked; falls back if the eboot differs.
+	env.Default("KYTY_NATIVE_MEM", "3");
+	// (native port) Guest memory written only where bytes change (no needless dirty pages); ReBAR upload rings.
+	env.Default("KYTY_LEAN_HOSTMEM", "1");
 	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
 	// (ds-pc-port12, res-1029) Without an upscaler the 3D is the output (native; the game's rows at their height, never above it).
 	if (upscaler.empty()) {
