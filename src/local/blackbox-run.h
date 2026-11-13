@@ -2,8 +2,9 @@
 // The crash / freeze black box (default on; KYTY_BLACKBOX=0: off). A PC that froze so hard it had to be restarted left
 // an .out.log that stops in the middle of a line: what the process was doing then was lost. Here a watchdog thread
 // (Kyty.Blackbox, THREAD_PRIORITY_HIGHEST, started with the GPU thread) writes one line a second to
-// logs/blackbox-<the run's log stamp>.txt, each write through to the disk (FILE_FLAG_WRITE_THROUGH, then
-// FlushFileBuffers), so the last second before a freeze is on the disk after the restart.
+// logs/blackbox-<the run's log stamp>.txt, each write through to the disk (FILE_FLAG_WRITE_THROUGH; FlushFileBuffers only
+// after the file is made and after a STALL record's parts), so the last second before a freeze is on the disk after the
+// restart.
 //
 // The file: a header (HeaderSlots slots), a ring of RingSlots one-line slots (Slot bytes each, padded with spaces; the
 // newest line is the one before the "#------" end marker, or sort by the #sequence), then the STALL records (at most
@@ -94,12 +95,15 @@ inline void WallTime(char* out, size_t size, bool date) {
 }
 
 // One slot: the text padded with spaces, a newline last.
-inline void WriteSlot(uint64_t offset, const char* text) {
-	char         slot[Slot];
+inline void FillSlot(char* slot, const char* text) {
 	const size_t length = std::min(std::strlen(text), static_cast<size_t>(Slot - 1));
-	std::memset(slot, ' ', sizeof(slot));
+	std::memset(slot, ' ', Slot);
 	std::memcpy(slot, text, length);
 	slot[Slot - 1] = '\n';
+}
+inline void WriteSlot(uint64_t offset, const char* text) {
+	char slot[Slot];
+	FillSlot(slot, text);
 	(void)LocalPlatform::WriteScratchFile(g_box.file, offset, slot, sizeof(slot));
 }
 
@@ -426,9 +430,23 @@ inline void WatchLoop(std::string path) {
 			if (frame.at != 0)
 				Append(line, sizeof(line), used, " slow=%.0fms@-%llds", frame.ms, static_cast<long long>(AgeMs(now, frame.at) / 1000));
 
-		WriteSlot(RingBase + (sequence % RingSlots) * Slot, line);
-		WriteSlot(RingBase + ((sequence + 1) % RingSlots) * Slot, "#------ (the ring's end: the line above is the newest, older ones follow)");
-		(void)LocalPlatform::FlushWrittenFile(g_box.file);
+		// The line and the end marker after it: one write when they are next to each other (all but the ring's last
+		// slot). No FlushFileBuffers here: the handle writes through already (the data is on the disk when the write
+		// returns; the file's size and extents were flushed by Open), and a flush a second would empty a SATA drive's
+		// command queue (FLUSH CACHE is not queued) under the game's streaming reads.
+		{
+			static constexpr const char* EndMarker = "#------ (the ring's end: the line above is the newest, older ones follow)";
+			const uint64_t               at        = sequence % RingSlots;
+			char                         slots[Slot * 2];
+			FillSlot(slots, line);
+			FillSlot(slots + Slot, EndMarker);
+			if (at + 1 < RingSlots) {
+				(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase + at * Slot, slots, sizeof(slots));
+			} else {
+				(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase + at * Slot, slots, Slot);
+				(void)LocalPlatform::WriteScratchFile(g_box.file, RingBase, slots + Slot, Slot);
+			}
+		}
 
 		if (stalled && !in_stall && stalls < MaxStalls && !g_box.busy.exchange(true, std::memory_order_acq_rel)) {
 			++stalls;
