@@ -1498,7 +1498,7 @@ if (KYTY_DS_PORT AND WIN32)
 	target_link_libraries(kyty_emulator ole32 oleaut32 shell32 uuid gdi32 winhttp dxgi advapi32 windowscodecs)
 	# The Segment Heap for the process heap (malloc, operator new): src/port/ds-port.manifest, merged into the
 	# linker's manifest. OFF: the NT heap as before.
-	option(KYTY_SEGMENT_HEAP "Demon's Souls PC port: the Windows Segment Heap (app manifest)" ON)
+	option(KYTY_SEGMENT_HEAP "Demon's Souls PC port: the Windows Segment Heap (app manifest)" OFF)
 	if (KYTY_SEGMENT_HEAP)
 		target_sources(kyty_emulator PRIVATE "${KYTY_SOURCE_DIR}/port/ds-port.manifest")
 		target_compile_definitions(kyty_emulator PRIVATE KYTY_SEGMENT_HEAP=1)

@@ -1174,6 +1174,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// standby list / page file, in quiet windows, a few hundred MiB a second) and runs the release passes when over it.
 	// KYTY_RESIDENT_MB is a minimum, not a cap: with 64 GB and no pressure nothing held the 15.7 GB working set down.
 	env.Default("KYTY_RAM_BUDGET_MB", "8192");
+	// (11-13) The guest store (13.3 GB) always in a sparse file on disk, not the page file, like a native game's data
+	// files: no commit charge for it, so 16 GB PCs no longer reach the commit limit (they rebooted there). Falls back to
+	// the page file by itself when the drive lacks the store's size + 4 GiB free.
+	env.Default("KYTY_BACKING_FILE", "1");
 	// (11-13) Measurement for the native memory layout, finished: off by default (its tables, its thread and its 16 MiB
 	// file reads every 30 s are the emulator's own RAM). KYTY_MEM_CLASS=1 / KYTY_PROVENANCE=1 [KYTY_PROVENANCE_VERIFY=1].
 	env.Default("KYTY_PROVENANCE_VERIFY", "0");
@@ -1181,10 +1185,6 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "6144");
 		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "1536");
-		// (11-13) The guest store (13.3 GB) in a sparse file on disk, not the page file: no commit charge for it, so a
-		// 16 GB PC no longer reaches the commit limit (one rebooted there). Falls back to the page file by itself when
-		// the drive lacks the store's size + 4 GiB free.
-		env.Default("KYTY_BACKING_FILE", "1");
 		// (11-13) The guest copy of GPU-only images is dropped once they are on the card: RAM not held twice.
 		env.Default("KYTY_GPU_ONLY_OFFLOAD", "0");
 		// (11-13) ...which needs the texture offload on: by default only with 20 GiB of RAM or less, so on a 64 GB PC with
