@@ -12,6 +12,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -135,6 +137,21 @@ BufferReclaimer& Reclaimer() {
 constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 
+// KYTY_UPLOAD_VRAM (default 1; 0: system memory as before): the upload rings (MemoryUsage::Upload: the 256 MiB image upload
+// ring, the 64 MiB host shader and 32 MiB table rings, the temporary buffers of uploads past the ring) prefer memory that
+// is video memory and host-visible (resizable BAR), as the Stream rings already do. In system memory they were the
+// driver's host-visible allocations, all of them commit charge of the process (a 16 GB PC rebooted at the commit limit:
+// "GPU system memory 564 MiB (host-visible 448 MiB)"); in video memory they are not (16 GB of it, 6.5 GB used). The CPU
+// only writes them (StreamBuffer: Map/Copy, write-combined sequential writes) and the GPU reads them: no CPU read over the
+// bus. Without such a memory type, or over its budget (a BAR of 256 MiB), VMA places them in system memory as before.
+bool UploadVramSetting() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_VRAM");
+		return !(value != nullptr && value[0] == '0');
+	}();
+	return on;
+}
+
 [[nodiscard]] VmaAllocationCreateFlags AllocationFlags(MemoryUsage usage) {
 	switch (usage) {
 		case MemoryUsage::Upload:
@@ -154,11 +171,14 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 		case MemoryUsage::DeviceLocal:
 		case MemoryUsage::SparseDeviceLocal:
 		case MemoryUsage::Stream: return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-		case MemoryUsage::Upload:
+		case MemoryUsage::Upload: return UploadVramSetting() ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 		case MemoryUsage::Download: return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
 	return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 }
+
+// The upload rings' bytes by where VMA placed them (UploadInVideoMemory; the 30 s [driver-ram] line).
+std::atomic<uint64_t> g_upload_video_bytes {0}, g_upload_system_bytes {0};
 
 [[nodiscard]] bool AlignUp(uint64_t value, uint64_t alignment, uint64_t& result) {
 	if (alignment == 0) {
@@ -355,6 +375,27 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
 	}
+	if (usage == MemoryUsage::Upload) {
+		const bool video = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+		(video ? g_upload_video_bytes : g_upload_system_bytes).fetch_add(size, std::memory_order_relaxed);
+		static std::atomic<uint32_t> logged {0}; // (the rings, then a few of the temporary buffers past the ring)
+		if (size >= (uint64_t {16} << 20u) && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("Upload ring: %llu MiB in %s (KYTY_UPLOAD_VRAM=%d)\n", static_cast<unsigned long long>(size >> 20u),
+			            video ? "video memory (host-visible, no commit charge)" : "system memory (commit charge)",
+			            UploadInVideoMemory() ? 1 : 0);
+			std::fflush(stdout);
+		}
+	}
+}
+
+bool UploadInVideoMemory() {
+	return UploadVramSetting();
+}
+uint64_t UploadBytesInVideoMemory() {
+	return g_upload_video_bytes.load(std::memory_order_relaxed);
+}
+uint64_t UploadBytesInSystemMemory() {
+	return g_upload_system_bytes.load(std::memory_order_relaxed);
 }
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
@@ -396,6 +437,12 @@ Buffer::~Buffer() {
 		for (const auto chunk: m_sparse->chunks) VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(native_device, chunk, nullptr);
 		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroySemaphore(native_device, m_sparse->timeline, nullptr);
 		return;
+	}
+	if (m_buffer != nullptr && m_usage == MemoryUsage::Upload && m_allocation != nullptr) {
+		VkMemoryPropertyFlags properties = 0;
+		vmaGetAllocationMemoryProperties(m_graphics->allocator, m_allocation, &properties);
+		auto& bytes = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? g_upload_video_bytes : g_upload_system_bytes;
+		bytes.fetch_sub(std::min<uint64_t>(bytes.load(std::memory_order_relaxed), m_size), std::memory_order_relaxed);
 	}
 	if (m_buffer != nullptr) {
 		if (kyty_local_buffer_reclaim_mode.load(std::memory_order_relaxed) != 0) {

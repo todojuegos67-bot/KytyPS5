@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
@@ -2770,6 +2771,7 @@ void PipelineCache::EvictIdlePipelines() {
 		m_scene_since      = now;
 		m_scene_swept      = false;
 	}
+	ReportDriverRam(now);
 	if (!settings.on || flip % CheckFlips != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
 	const bool scene_left = SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	uint64_t video = 0, budget = 0;
@@ -2819,13 +2821,22 @@ void PipelineCache::EvictIdlePipelines() {
 		}
 		RamDietReport();
 	}
+	if (ram_pressure != 0 && m_static_binaries != nullptr && now - m_shared_trim_at >= std::chrono::seconds(30)) {
+		m_shared_trim_at = now;
+		if (const auto bytes = m_static_binaries->TrimShared(); bytes != 0) {
+			m_shared_trimmed += bytes;
+			RamGuard::NoteReleased(RamGuard::Pipelines, 0, bytes);
+		}
+	}
 	if (!m_evict_pressure && !scene_left) return;
 	// The newest flip that began by the horizon among those the ring holds; none when even the oldest began after it.
 	uint32_t below = 0; // bound in an earlier flip: idle since then
 	if (m_evict_pressure) {
 		auto idle = settings.idle;
+		// (Critical RAM or commit pressure: idle 20 s, as said above; it was 60 s, and a 16 GB PC at the commit limit
+		// evicted 17 pipelines in 5 minutes. A remake from the static store is ~0.4 ms on an RTX 5080.)
 		if (ram_pressure != 0)
-			idle = std::min<std::chrono::nanoseconds>(idle, std::chrono::seconds(60));
+			idle = std::min<std::chrono::nanoseconds>(idle, std::chrono::seconds(20));
 		const auto horizon = (now - idle).time_since_epoch().count();
 		uint32_t   first   = flip - std::min<uint32_t>(flip - 1, static_cast<uint32_t>(m_flip_times.size() - 1)), last = flip;
 		if (m_flip_times[first % m_flip_times.size()] <= horizon) {
@@ -2883,6 +2894,45 @@ void PipelineCache::EvictIdlePipelines() {
 	            static_cast<unsigned long long>(g_pipeline_evictions.remade.load(std::memory_order_relaxed)),
 	            static_cast<double>(g_pipeline_evictions.remake_us.load(std::memory_order_relaxed)) / 1000.0,
 	            static_cast<unsigned long long>(video >> 20u), static_cast<unsigned long long>(budget >> 20u));
+	std::fflush(stdout);
+}
+
+// Every 30 s (render thread, under m_mutex): what of the process's memory the GPU driver holds for this cache, as far as it
+// is known here: live pipelines (~220 KB of the NVIDIA driver's RAM each, RamDietPipelineBytes, an estimate), those that
+// could be evicted (made of the static store), unoptimized ones kept after their optimized build replaced them, the static
+// store's shared binaries, the driver caches' data loaded (the driver copies it into the process), and the upload rings
+// by where they went (KYTY_UPLOAD_VRAM: video memory is no commit charge).
+void PipelineCache::ReportDriverRam(std::chrono::steady_clock::time_point now) {
+	if (now - m_driver_ram_logged < std::chrono::seconds(30)) return;
+	m_driver_ram_logged = now;
+	uint64_t live = 0, evictable = 0, dropped = 0;
+	const auto count = [&](const Pipeline& pipeline) {
+		if (pipeline.pipeline == nullptr) {
+			dropped += pipeline.remake != nullptr ? 1 : 0;
+			return;
+		}
+		live++;
+		evictable += pipeline.remake != nullptr ? 1 : 0;
+	};
+	for (const auto& [key, pipeline]: m_graphics_pipelines) count(*pipeline);
+	for (const auto& [id, pipeline]: m_compute_pipelines) count(*pipeline);
+	const uint64_t replaced = m_replaced_pipelines.size();
+	const uint64_t shared   = m_static_binaries != nullptr ? m_static_binaries->SharedBytes() : 0;
+	std::printf("[driver-ram] (30 s) pipelines live %llu (~%llu MiB of driver RAM), of them evictable %llu, evicted now "
+	            "%llu; unoptimized kept %llu (~%llu MiB); store shared binaries %llu MiB (released %llu MiB in all); driver "
+	            "caches loaded %llu + %llu MiB; upload rings %llu MiB in video memory, %llu MiB in system memory "
+	            "(KYTY_UPLOAD_VRAM=%d); RAM pressure %d\n",
+	            static_cast<unsigned long long>(live),
+	            static_cast<unsigned long long>((live * RamDietPipelineBytes) >> 20u),
+	            static_cast<unsigned long long>(evictable), static_cast<unsigned long long>(dropped),
+	            static_cast<unsigned long long>(replaced),
+	            static_cast<unsigned long long>((replaced * RamDietPipelineBytes) >> 20u),
+	            static_cast<unsigned long long>(shared >> 20u), static_cast<unsigned long long>(m_shared_trimmed >> 20u),
+	            static_cast<unsigned long long>(m_driver_cache_saved_size >> 20u),
+	            static_cast<unsigned long long>(m_table_cache_saved_size >> 20u),
+	            static_cast<unsigned long long>(UploadBytesInVideoMemory() >> 20u),
+	            static_cast<unsigned long long>(UploadBytesInSystemMemory() >> 20u), UploadInVideoMemory() ? 1 : 0,
+	            RamGuard::PressureLevel());
 	std::fflush(stdout);
 }
 

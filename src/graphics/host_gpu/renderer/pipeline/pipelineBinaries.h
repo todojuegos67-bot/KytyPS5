@@ -39,9 +39,12 @@ public:
 		vk::Device                       device;
 		std::vector<VkPipelineBinaryKHR> binaries;
 		std::vector<VkPipelineBinaryKHR> owned;
+		// The shared binaries among `binaries` stay made while this is held (TrimShared waits for none).
+		std::shared_lock<std::shared_mutex> hold;
 		Handles() = default;
 		Handles(Handles&& other) noexcept
-		    : device(other.device), binaries(std::move(other.binaries)), owned(std::move(other.owned)) {}
+		    : device(other.device), binaries(std::move(other.binaries)), owned(std::move(other.owned)),
+		      hold(std::move(other.hold)) {}
 		Handles& operator=(Handles&&) = delete;
 		Handles(const Handles&)       = delete;
 		~Handles();
@@ -65,6 +68,11 @@ public:
 	[[nodiscard]] size_t  Pipelines() const { return m_pipelines.size(); }
 	[[nodiscard]] size_t  Binaries() const { return m_binaries.size(); }
 	[[nodiscard]] uint64_t DataBytes() const;
+	// The binaries many pipelines share, made once and kept (driver memory in the process: commit charge): their bytes,
+	// and their release (made again from the file at their next use). Releases none while a Load's handles are held
+	// (never waits); returns the bytes released.
+	[[nodiscard]] uint64_t SharedBytes() const { return m_shared_bytes.load(std::memory_order_relaxed); }
+	uint64_t               TrimShared() const;
 
 private:
 	friend class PipelineBinaryWriter;
@@ -92,6 +100,8 @@ private:
 	std::unordered_map<Key, Pipeline, KeyHash>       m_pipelines;
 	mutable std::mutex                               m_shared_mutex;
 	mutable std::vector<VkPipelineBinaryKHR>         m_shared; // made binaries of SharedUsers or more
+	mutable std::shared_mutex                        m_trim_mutex; // shared: a Load's handles in use; unique: TrimShared
+	mutable std::atomic<uint64_t>                    m_shared_bytes {0};
 };
 
 // The static precompile's output: pipelines' binaries, captured from pipelines created with

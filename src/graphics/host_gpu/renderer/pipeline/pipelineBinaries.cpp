@@ -265,6 +265,8 @@ PipelineBinaries::Handles PipelineBinaries::Load(const Key& key) const {
 	const auto found = m_pipelines.find(key);
 	if (found == m_pipelines.end() || found->second.count == 0) return handles;
 	const auto [first, count] = found->second;
+	// (Held by the handles returned: TrimShared destroys no shared binary they hold.)
+	std::shared_lock<std::shared_mutex> hold(m_trim_mutex);
 	// Binaries many pipelines share (the driver puts one of 2 MiB into every pipeline) are made once.
 	std::vector<VkPipelineBinaryKHR> binaries(count, VK_NULL_HANDLE);
 	std::vector<uint32_t>            fresh, fresh_indices;
@@ -276,7 +278,10 @@ PipelineBinaries::Handles PipelineBinaries::Load(const Key& key) const {
 			continue;
 		}
 		std::lock_guard lock(m_shared_mutex);
-		if (m_shared[index] == VK_NULL_HANDLE && !CreateBinaries({&index, 1}, &m_shared[index])) return handles;
+		if (m_shared[index] == VK_NULL_HANDLE) {
+			if (!CreateBinaries({&index, 1}, &m_shared[index])) return handles;
+			m_shared_bytes.fetch_add(m_binaries[index].size, std::memory_order_relaxed);
+		}
 		binaries[i] = m_shared[index];
 	}
 	handles.owned.resize(fresh.size());
@@ -286,7 +291,23 @@ PipelineBinaries::Handles PipelineBinaries::Load(const Key& key) const {
 	}
 	for (size_t j = 0; j < fresh.size(); j++) binaries[fresh[j]] = handles.owned[j];
 	handles.binaries = std::move(binaries);
+	handles.hold     = std::move(hold);
 	return handles;
+}
+
+uint64_t PipelineBinaries::TrimShared() const {
+	std::unique_lock<std::shared_mutex> trim(m_trim_mutex, std::try_to_lock);
+	if (!trim.owns_lock()) return 0;
+	std::lock_guard lock(m_shared_mutex);
+	uint64_t        bytes = 0;
+	for (size_t index = 0; index < m_shared.size(); index++) {
+		if (m_shared[index] == VK_NULL_HANDLE) continue;
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyPipelineBinaryKHR(m_device, m_shared[index], nullptr);
+		m_shared[index] = VK_NULL_HANDLE;
+		bytes += m_binaries[index].size;
+	}
+	m_shared_bytes.store(0, std::memory_order_relaxed);
+	return bytes;
 }
 
 // Kept once per key and content: a key alone is not unique (NVIDIA's compression dictionary has one key
