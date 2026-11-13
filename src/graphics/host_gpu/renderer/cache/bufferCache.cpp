@@ -1540,10 +1540,31 @@ static BufferCache* g_sync_cache = nullptr;
 // The image upload ring: 1 GiB on a PC with 32 GB of RAM or more (512 MiB before). A frame where the game streams
 // in an area uploads 0.8-1.4 GB of textures; past the ring's size the render thread waited for the GPU to finish
 // the first copies before it could reuse the ring (60-80 ms of gpu_wait in those frames, Boletaria).
+// RAM diet (port default): the ring is host-visible memory the driver keeps in the process's private commit (the
+// 1024 MiB private region of the RAM breakdown; GPU system memory host-visible 1216 MiB = this ring + 64 + 64 + 32 +
+// 32 MiB of the other rings): 256 MiB, as KYTY_LOWMEM_VRAM=1 already had. KYTY_STAGING_RING_MB=<n> (64-2048) sets it;
+// KYTY_RAM_DIET_STAGING=0 gives the size before (1 GiB with 32 GB of RAM).
+uint64_t BufferCacheStagingRingSize() {
+	static const uint64_t size = [] {
+		if (const char* mb = std::getenv("KYTY_STAGING_RING_MB"); mb != nullptr && mb[0] != '\0') {
+			const uint64_t value = std::strtoull(mb, nullptr, 10);
+			if (value >= 64 && value <= 2048) return value * MiB;
+		}
+		const char* diet = std::getenv("KYTY_RAM_DIET_STAGING");
+		const bool  off  = diet != nullptr && diet[0] == '0';
+		if (LocalPlatform::LowMemVram() || !off) return 256 * MiB; // KYTY_LOWMEM_VRAM=1 or the RAM diet
+		const uint64_t ram = LocalPlatform::PhysicalMemory();
+		return ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
+	}();
+	return size;
+}
 static uint64_t StagingRingSize() {
-	const uint64_t     ram = LocalPlatform::PhysicalMemory();
-	if (LocalPlatform::LowMemVram()) return 256 * MiB; // KYTY_LOWMEM_VRAM=1
-	return ram >= (uint64_t {32} << 30u) ? 1024 * MiB : 512 * MiB;
+	const uint64_t size = BufferCacheStagingRingSize();
+	std::printf("RAM diet: image upload ring %llu MiB of host-visible memory (KYTY_STAGING_RING_MB, "
+	            "KYTY_RAM_DIET_STAGING=0: 1 GiB as before)\n",
+	            static_cast<unsigned long long>(size / MiB));
+	std::fflush(stdout);
+	return size;
 }
 
 // KYTY_BDA_SPARSE=1 (where the device has strict sparse residency buffers; off by default while a GPU hang in 2-2's

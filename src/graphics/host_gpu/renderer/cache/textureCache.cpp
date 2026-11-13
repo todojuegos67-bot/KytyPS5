@@ -74,6 +74,8 @@
 
 namespace Libs::Graphics {
 
+uint64_t BufferCacheStagingRingSize(); // bufferCache.cpp
+
 namespace {
 
 // Guest frames an overlapping image must stay unused before a lookup of another image may delete
@@ -5628,6 +5630,10 @@ void TextureCache::RunGarbageCollector() {
 		// Where the video memory goes (VMA's allocations by memory kind, the driver's own) and the buffer cache's
 		// share: on a 16 GB card the use climbed past the 10 GB budget while the texture collector deleted images.
 		std::printf("Buffer cache: %llu MiB registered\n", static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u));
+		// RAM diet: the emulator's own host-visible rings (driver memory in the process's private commit).
+		std::printf("RAM diet (30 s): image upload ring %llu MiB (KYTY_STAGING_RING_MB), Vulkan system RAM %llu MiB\n",
+		            static_cast<unsigned long long>(BufferCacheStagingRingSize() >> 20u),
+		            static_cast<unsigned long long>(m_graphics.GetHostMemoryUsage() >> 20u));
 		// The commit side (16 GB PCs rebooted at the commit limit, not at full RAM): the system's charge and limit,
 		// and the guest backing store's share of it (0 when it is file-backed: KYTY_BACKING_FILE).
 		{
