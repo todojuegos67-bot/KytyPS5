@@ -2533,14 +2533,29 @@ struct TextureCache::NativeTexHost {
 void TextureCache::InitNativeTex() {
 	g_native_cache = this;
 	NativeTex::Host host {};
+	host.thread_class = +[]() -> int {
+		// Neither inside a deferred operation (it runs inside a wait) nor in the async upload worker (the render thread
+		// waits for it) nor holding the texture cache's lock off the render thread (the render thread would wait for it).
+		if (AsyncUpload::t_worker || CommandScheduler::InDeferredOperation()) return NativeTex::ThreadRestricted;
+		if (GuestGpu::IsGpuThread()) return NativeTex::ThreadNormal;
+		if (g_native_cache->m_lock.OwnedByCurrentThread()) return NativeTex::ThreadRestricted;
+		if (Spec::t_state != nullptr || CommandScheduler::ThreadRecorder() != nullptr) return NativeTex::ThreadSpeculation;
+		return NativeTex::ThreadNormal;
+	};
+	host.refuse_speculation = +[] { Spec::Refuse("native-tex bytes"); };
 	host.run_render = +[](void (*fn)(void*), void* arg) {
 		auto* cache = g_native_cache;
-		// Neither inside a deferred operation (it runs inside a wait) nor in the async upload worker (the render thread
-		// waits for it).
 		if (AsyncUpload::t_worker || CommandScheduler::InDeferredOperation()) return false;
+		if (GuestGpu::IsGpuThread()) {
+			fn(arg);
+			return true;
+		}
+		// Another thread holding the texture cache's lock would deadlock the render thread.
+		if (cache->m_lock.OwnedByCurrentThread()) return false;
 		if (Spec::t_state != nullptr || CommandScheduler::ThreadRecorder() != nullptr) {
-			// A speculation's thread: its translation refused (redone in order), the write-back made here on the normal
-			// path - its recorder and speculation state set aside - as GpuResourceManager::HandleFault's read path does.
+			// A speculation's thread: its translation refused (redone in order); the write-back is the normal path's, on
+			// the render thread (the scheduler's command buffers are the render thread's alone), its recorder and
+			// speculation state set aside meanwhile - as GpuResourceManager::HandleFault's read path does.
 			Spec::Refuse("native-tex bytes");
 			struct NormalPath {
 				Spec::State*                state    = std::exchange(Spec::t_state, nullptr);
@@ -2551,15 +2566,9 @@ void TextureCache::InitNativeTex() {
 					CommandScheduler::SetThreadRecorder(recorder);
 				}
 			} normal_path;
-			fn(arg);
+			cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
 			return true;
 		}
-		if (GuestGpu::IsGpuThread()) {
-			fn(arg);
-			return true;
-		}
-		// Another thread holding the texture cache's lock would deadlock the render thread.
-		if (cache->m_lock.OwnedByCurrentThread()) return false;
 		cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
 		return true;
 	};

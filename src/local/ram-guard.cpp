@@ -885,6 +885,8 @@ double ToMiB(uint64_t bytes) {
 // with its alias address (the backing pieces of the range: the guest address space's shared map lock, a lookup a
 // range).
 bool MakeSamples(const std::vector<Range>& ranges, uint64_t pass, std::vector<Sample>* samples) {
+	// (Addresses only, for the working-set queries: KYTY_NATIVE_TEX's GPU-held texture bytes stay where they are.)
+	const Libs::LibKernel::Memory::BackingLookupOnly lookup_only;
 	std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
 	const uint64_t                                   offset = (pass % (SampleSpan / PageSize)) * PageSize;
 	for (const auto& range: ranges) {

@@ -503,6 +503,8 @@ void SampleResidency(Census& c) {
 		owners.clear();
 		SwitchToThread();
 	};
+	// (Addresses only, for the working-set queries: KYTY_NATIVE_TEX's GPU-held texture bytes stay where they are.)
+	const Libs::LibKernel::Memory::BackingLookupOnly lookup_only;
 	for (const auto& run: c.runs) {
 		pieces.clear();
 		const bool backed = Libs::LibKernel::Memory::TryGetSparseBackingPieces(run.begin, run.end - run.begin, pieces);

@@ -35,11 +35,21 @@
 // page manager's locks, neither of which is ever held while waiting for a game lock), a move shares ring bytes or records
 // "bytes of image X" for the destination (the GPU copy is made when an image needs them: Rehome).
 //
-// Who writes authoritative bytes back (MaterializeAny): Host::run_render's thread classes. The one class that can do it
-// neither inline nor through the render thread - the async upload worker, a deferred operation, a thread holding the
-// texture cache's lock off the render thread - only ever reads guest memory through host pointers the render thread
-// resolved (and guarded: BeforeGuestRead) for it; a touch of bytes an image holds by one of them is a broken invariant
-// and stops the emulator with a message (never stale bytes). Bytes in the ring it gets at once (a CPU copy).
+// Who writes authoritative bytes back (MaterializeAny), by Host::thread_class:
+//  - the render (GPU) thread: inline; a game thread: through the render thread (SendCommandSync);
+//  - a speculation's thread: its translation is refused (redone in order, where the read is guarded again) and the read
+//    goes on with the guest's bytes (as SyncGpuCleanBacking does for GPU-written memory); a fault there (it must make
+//    progress) is handed to the render thread, its speculation state set aside (GpuResourceManager::HandleFault);
+//  - a restricted thread (the async upload worker, a deferred operation, a thread holding the texture cache's lock off the
+//    render thread), which may neither wait for the render thread nor record GPU work: bytes in the ring (or undefined)
+//    are written back here when no write-back is in flight over them; otherwise nothing is done and the read takes the
+//    guest's bytes ("snapshot" read, counted). That is correct for the reads such threads make: the worker's only guarded
+//    read (TryReadMappedOrZero in ReadMappedOrZeroCall) is of a range the render thread guarded when it queued the job
+//    (PushImageStagingCopies / StageImagePieces call TryGetBackingPointer first), so authoritative bytes there are newer
+//    than that upload: a load or move (host-write notified: the images over it are dirty and upload them again, later in
+//    the command stream) or a commit (undefined content). Deferred operations read no guest memory (all DeferOperation
+//    bodies), and a holder of the texture cache's (non-recursive) lock never reaches a host write (InvalidateMemory takes
+//    it). Nothing here aborts the emulator.
 
 namespace Libs::Graphics::NativeTex {
 
@@ -49,6 +59,7 @@ constexpr uint64_t Page       = 4096; // TRACKER_PAGE_SIZE
 constexpr uint64_t MinPiece   = 4096; // smaller loads go to guest memory as before
 constexpr uint64_t RingAlign  = 256;  // the tiler's source alignment
 constexpr size_t   MaxEntries = size_t {1} << 18u;
+constexpr uint64_t SpillPerFlip = uint64_t {16} << 20u; // (Pump)
 constexpr uint64_t GranuleBits = 21, GranuleSpace = uint64_t {1} << 40u;
 constexpr size_t   GranuleWords = (GranuleSpace >> GranuleBits) / 64;
 
@@ -96,6 +107,7 @@ struct State {
 	std::atomic<uint64_t> moves_shared {0}, moves_guest {0}, releases_count {0}, release_bytes {0};
 	std::atomic<uint64_t> fallback[WhyCount] {};
 	std::atomic<uint64_t> fallback_bytes[WhyCount] {};
+	std::atomic<uint64_t> snapshots {0}, snapshot_bytes {0}; // (reads left with the guest's bytes: MaterializeAny)
 	std::atomic<uint64_t> lost {0}, lost_bytes {0}, commits {0}, commit_bytes {0}, decommits {0}, declined {0}, declined_bytes {0};
 	std::chrono::steady_clock::time_point last_log {};
 };
@@ -379,11 +391,12 @@ void EraseWrittenLocked(State& s, const std::vector<Piece>& pieces) {
 // Every entry intersecting [addr, addr + size) (whole entries; `serial` != 0: owned by that image only) written into
 // guest memory and dropped. Not `render` (a thread that may not record GPU work): false, and nothing done, when some of
 // them need the GPU (bytes an image holds, a GPU copy into the ring in flight).
-bool MaterializeHere(uint64_t addr, uint64_t size, Why why, uint64_t serial, bool render) {
+bool MaterializeHere(uint64_t addr, uint64_t size, Why why, uint64_t serial, bool render, bool wait = true) {
 	auto&              s = S();
 	std::vector<Piece> pieces;
 	{
 		Lock lock(s.m);
+		if (!wait && InflightLocked(s, addr, addr + size)) return false; // (a restricted thread: never waits)
 		WaitInflight(s, lock, addr, addr + size);
 		for (auto it = FirstOverLocked(s, addr); it != s.entries.end() && it->first < addr + size; ++it) {
 			if (serial != 0 && (!it->second.owned || it->second.serial != serial)) continue;
@@ -417,19 +430,33 @@ void MaterializeTrampoline(void* arg) {
 	(void)MaterializeHere(job->addr, job->size, job->why, 0, true);
 }
 
-// From any thread: where GPU work can be recorded and waited for (Host::run_render), else here (ring bytes only).
-void MaterializeAny(uint64_t addr, uint64_t size, Why why) {
-	auto& s = S();
+// From any thread (see the top of this file). `must`: the caller cannot go on without the bytes (a fault, a host write
+// over them); else a read that may take the guest's bytes when this thread may not get them (restricted, speculation).
+// True when nothing authoritative is left over the range.
+bool MaterializeAny(uint64_t addr, uint64_t size, Why why, bool must) {
+	auto&     s     = S();
+	const int klass = s.host.thread_class != nullptr ? s.host.thread_class() : ThreadNormal;
 	// Bytes in the ring (written) or none (undefined): a CPU copy or nothing, on this thread - no wait for the render
 	// thread (a loader on a fiber, a game thread in the engine's allocator lock).
-	if (MaterializeHere(addr, size, why, 0, false)) return;
+	if (MaterializeHere(addr, size, why, 0, false, klass != ThreadRestricted)) return true;
+	if (klass == ThreadRestricted || (klass == ThreadSpeculation && !must)) {
+		if (klass == ThreadSpeculation && s.host.refuse_speculation != nullptr) s.host.refuse_speculation();
+		s.snapshots.fetch_add(1, std::memory_order_relaxed);
+		s.snapshot_bytes.fetch_add(size, std::memory_order_relaxed);
+		if (klass == ThreadRestricted && must) {
+			// (Not reached: see the top of this file. The access is not handled here, nothing is changed.)
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+				std::printf("NativeTex: 0x%llx..0x%llx needs the GPU on a thread that may not wait for it (left as it is)\n",
+				            static_cast<unsigned long long>(addr), static_cast<unsigned long long>(addr + size));
+		}
+		return false;
+	}
 	MaterializeJob job {addr, size, why};
-	if (s.host.run_render != nullptr && s.host.run_render(&MaterializeTrampoline, &job)) return;
-	// (A thread that can do neither: see the top of this file.)
-	std::printf("NativeTex: 0x%llx..0x%llx needs the GPU, touched by a thread that can neither record GPU work nor wait for "
-	            "the render thread\n", static_cast<unsigned long long>(addr), static_cast<unsigned long long>(addr + size));
-	std::fflush(stdout);
-	std::abort();
+	if (s.host.run_render != nullptr && s.host.run_render(&MaterializeTrampoline, &job)) return true;
+	s.snapshots.fetch_add(1, std::memory_order_relaxed);
+	s.snapshot_bytes.fetch_add(size, std::memory_order_relaxed);
+	return false;
 }
 
 // Render thread: the owned entries over [addr, end) selected by `pick` copied by the GPU into the ring (one copy of each
@@ -530,6 +557,8 @@ void Log(bool force) {
 	for (uint32_t i = 0; i < WhyCount; i++)
 		std::printf(" %s %llu (%.1f MiB)", WhyNames[i], static_cast<unsigned long long>(s.fallback[i].load()),
 		            static_cast<double>(s.fallback_bytes[i].load()) / MiB);
+	std::printf("; snapshot reads %llu (%.1f MiB)", static_cast<unsigned long long>(s.snapshots.load()),
+	            static_cast<double>(s.snapshot_bytes.load()) / MiB);
 	std::printf("; lost %llu (%.1f MiB); commits %llu (%.1f MiB undefined until written), decommits %llu; loads declined (not "
 	            "committed texture memory) %llu (%.1f MiB)\n",
 	            static_cast<unsigned long long>(s.lost.load()), static_cast<double>(s.lost_bytes.load()) / MiB,
@@ -558,7 +587,7 @@ bool Enabled() noexcept {
 #if defined(_WIN32)
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_NATIVE_TEX");
-		return value != nullptr && value[0] == '1';
+		return value != nullptr && std::strcmp(value, "1") == 0; // (as the streaming hooks' Install: both or neither)
 	}();
 	return on;
 #else
@@ -653,8 +682,8 @@ bool OnTextureBytes(uint64_t guest_dst, const void* src, uint64_t size) {
 	const bool prepared   = LibKernel::Memory::PrepareHostOverwrite(full_dst, full_size);
 	t_suppress_host_write = false;
 	// (An older range over an edge page: its bytes back first, the page is then the guest's.)
-	if (head != 0 && Overlaps(PageDown(full_dst), Page)) MaterializeAny(PageDown(full_dst), Page, WhyHostWrite);
-	if (tail != 0 && Overlaps(whole_end, Page)) MaterializeAny(whole_end, Page, WhyHostWrite);
+	if (head != 0 && Overlaps(PageDown(full_dst), Page)) (void)MaterializeAny(PageDown(full_dst), Page, WhyHostWrite, true);
+	if (tail != 0 && Overlaps(whole_end, Page)) (void)MaterializeAny(whole_end, Page, WhyHostWrite, true);
 	if (head != 0) LibKernel::Memory::WriteBacking(full_dst, bytes, head, "native-tex edge");
 	if (tail != 0) LibKernel::Memory::WriteBacking(whole_end, bytes + (whole_end - full_dst), tail, "native-tex edge");
 	{
@@ -860,12 +889,12 @@ void BeforeGuestRead(uint64_t addr, uint64_t size) {
 	if (addr + size <= s.lo.load(std::memory_order_relaxed) || addr >= s.hi.load(std::memory_order_relaxed)) return;
 	if (!MaybeGranules(s, addr, addr + size) || t_suppress_host_write) return;
 	if (!Overlaps(addr, size)) return;
-	MaterializeAny(addr, size, WhyRead);
+	(void)MaterializeAny(addr, size, WhyRead, false);
 }
 
 void BeforeHostWrite(uint64_t addr, uint64_t size) {
 	if (t_suppress_host_write || !Overlaps(addr, size)) return;
-	MaterializeAny(addr, size, WhyHostWrite);
+	(void)MaterializeAny(addr, size, WhyHostWrite, true);
 }
 
 void Forget(uint64_t addr, uint64_t size) {
@@ -898,8 +927,9 @@ bool OnFault(uint64_t address, uint64_t /*rip*/, const void* /*native_context*/,
 	}
 	// The bytes of every range touching the page into guest memory, its watchers gone: the access goes again and the page
 	// is tracked as any other from then on.
-	MaterializeAny(page, Page, WhyTouch);
-	return true;
+	// (False only on a thread that may not wait for the GPU, which never touches guest memory directly: then the fault is
+	// not taken here and goes on as any other.)
+	return MaterializeAny(page, Page, WhyTouch, true);
 }
 
 void Pump() {
@@ -931,10 +961,15 @@ void Pump() {
 			for (const auto& [b, e]: s.entries)
 				if (!e.owned && !e.undef && !e.inflight && e.flip + 2 <= s.flip) ring.emplace_back(e.alloc, b, e.end);
 			std::sort(ring.begin(), ring.end());
-			uint64_t projected = s.used;
+			uint64_t projected = s.used, spilled = 0;
 			size_t   count     = s.entries.size();
 			for (const auto& [alloc, b, e]: ring) {
 				if (projected <= s.capacity / 2 && count <= MaxEntries / 2) break;
+				// (At most SpillPerFlip a flip: the write-back is a CPU copy on the render thread, and the guest pages it
+				// commits fault in; 64 MiB at once was a hitch of its own. A load that finds no room meanwhile is refused:
+				// the old path, correct.)
+				if (spilled >= SpillPerFlip) break;
+				spilled += e - b;
 				spill.emplace_back(b, e - b);
 				projected -= std::min(projected, e - b);
 				count--;

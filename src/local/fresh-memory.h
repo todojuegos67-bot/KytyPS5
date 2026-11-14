@@ -120,6 +120,7 @@ inline void MarkArmedBacking(uint64_t backing, uint64_t size) {
 // The granules of guest range [vaddr, vaddr + size) written (its bytes in the backing store; bits only).
 inline void MarkGuestRange(uint64_t vaddr, uint64_t size) {
 	if (Get() == nullptr || size == 0) return;
+	const Libs::LibKernel::Memory::BackingLookupOnly lookup_only; // (addresses only: bits are marked)
 	for (uint64_t done = 0; done < size;) {
 		const uint64_t at  = vaddr + done;
 		const auto     end = Libs::LibKernel::Memory::BackingMappingEnd(at);

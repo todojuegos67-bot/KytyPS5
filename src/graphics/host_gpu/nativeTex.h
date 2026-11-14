@@ -19,8 +19,9 @@
 //  - A load's first and last partial pages are written into guest memory (they may share a page with other data);
 //    only its whole pages become authoritative.
 //  - Bounded memory: the ring is fixed. Bytes no image took stay in the ring until the ring passes 75% full; then the
-//    oldest are written to guest memory (the old behavior for those textures) until it is below 50%. A load that finds no
-//    room is refused (the caller stores to guest memory, as without this). The range metadata is capped (MaxEntries).
+//    oldest are written to guest memory (the old behavior for those textures), at most 16 MiB a flip, until it is below
+//    50%. A load that finds no room is refused (the caller stores to guest memory, as without this). The range metadata
+//    is capped (MaxEntries).
 //
 // Logged every 30 s: "NativeTex: ..." (MiB routed, ranges, uploads from the ring, fallbacks by reason, ring use).
 
@@ -78,13 +79,24 @@ struct Piece {
 	uint32_t alloc = 0;             // (internal: the ring allocation)
 };
 
+// Host::thread_class: who is asking (nativeTex.cpp, top: who writes bytes back).
+enum ThreadClass : int {
+	ThreadNormal      = 0, // the render (GPU) thread, a game thread, any other thread that may wait for the render thread
+	ThreadSpeculation = 1, // a speculative translation's thread
+	ThreadRestricted  = 2, // may neither wait for the render thread nor record GPU work (async upload worker, a deferred
+	                       // operation, a holder of the texture cache's lock off the render thread)
+};
+
 // What the texture cache provides (render thread functions; set once in its constructor).
 struct Host {
+	// The calling thread's ThreadClass (any thread).
+	int (*thread_class)() = nullptr;
+	// A speculation's thread: its translation refused (redone in order).
+	void (*refuse_speculation)() = nullptr;
 	// Runs fn(arg) where it may record GPU work and wait for the GPU, and returns when done: inline on the render thread;
-	// on a speculation thread inline on the normal path (its recorder set aside and its speculation refused, as
-	// GpuResourceManager::HandleFault's read path does); from a game thread through the render thread (SendCommandSync).
-	// False (fn not run): a thread that can do none of these (the async upload worker, a deferred operation, a thread
-	// holding the texture cache's lock off the render thread).
+	// from any other thread through the render thread (SendCommandSync; a speculation's thread with its recorder and
+	// speculation state set aside and its speculation refused, as GpuResourceManager::HandleFault's read path does).
+	// False (fn not run): a ThreadRestricted thread.
 	bool (*run_render)(void (*fn)(void*), void* arg) = nullptr;
 	// The page manager's read watchers (no access) of [vaddr, vaddr + size).
 	void (*watch)(uint64_t vaddr, uint64_t size, bool on) = nullptr;

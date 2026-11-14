@@ -1366,8 +1366,17 @@ bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+// (BackingLookupOnly: the scopes alive on this thread.)
+static thread_local uint32_t t_backing_lookup_only = 0;
+BackingLookupOnly::BackingLookupOnly() noexcept {
+	++t_backing_lookup_only;
+}
+BackingLookupOnly::~BackingLookupOnly() {
+	--t_backing_lookup_only;
+}
+
 const uint8_t* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
-	Graphics::NativeTex::BeforeGuestRead(vaddr, size);
+	if (t_backing_lookup_only == 0) Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingPointer(vaddr, size) : nullptr;
 }
 
@@ -1394,12 +1403,12 @@ void TrimGuestRange(uint64_t vaddr, uint64_t size) {
 }
 
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
-	Graphics::NativeTex::BeforeGuestRead(vaddr, size);
+	if (t_backing_lookup_only == 0) Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr && g_guest_address_space->BackingPieces(vaddr, size, pieces);
 }
 
 bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
-	Graphics::NativeTex::BeforeGuestRead(vaddr, size);
+	if (t_backing_lookup_only == 0) Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr && g_guest_address_space->SparseBackingPieces(vaddr, size, pieces);
 }
 
