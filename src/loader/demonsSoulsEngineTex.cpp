@@ -24,6 +24,7 @@
 #include "common/abi.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/engineTexRegistry.h"
+#include "graphics/host_gpu/nativeTexturePc.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/memory.h"
@@ -84,6 +85,10 @@ struct State {
 	std::vector<std::pair<uint64_t, uint64_t>> segments;
 };
 State g_state;
+bool  g_registry = false; // KYTY_ENGINE_TEX_REGISTRY=1 (else the hooks serve KYTY_NATIVE_TEXTURE_PC only)
+bool  g_hooks    = false;
+namespace Pc = Libs::Graphics::NativeTexturePc;
+constexpr uint64_t TexArraySlot = 0x65, TexArrayId = 0x66;
 
 bool InImage(uint64_t address, uint64_t size) {
 	for (const auto& s: g_state.segments) {
@@ -193,6 +198,22 @@ KYTY_SYSV_ABI void OnFactory(uint64_t tex) {
 		e.size   = Load<uint32_t>(tex + TexLoadedBytes);
 		e.source = Reg::Source::Factory;
 	}
+	if (Pc::Enabled()) {
+		Pc::Texture t;
+		t.owner  = tex;
+		t.base   = alloc; // (= the T# base: 0x8fed56 stores alloc >> 8)
+		t.size   = e.size;
+		t.width  = e.width;
+		t.height = e.height;
+		t.depth  = e.depth;
+		t.mips   = e.mips;
+		t.format = e.engine_format;
+		t.kind   = e.source == Reg::Source::FactoryStreamed ? Pc::Kind::Streamed : Pc::Kind::Loaded;
+		// AddTexture 0xac4b9c: [+0x65] = 1 - an array texture loaded into its own memory, copied into the pool later.
+		t.slice_copy_candidate = Load<uint16_t>(tex + TexArrayId) != 0xffff && Load<uint8_t>(tex + TexArraySlot) == 1;
+		Pc::OnTexture(t);
+	}
+	if (!g_registry) return;
 	// The layers of the engine's own T#: DEPTH (dword 4, bits 0..12) is the last layer of an array type (12 1D array,
 	// 13 2D array, 15 MSAA array); 1 otherwise (the engine records no slice count for a loaded texture: +0x26c is 1).
 	const uint32_t type = e.tsharp[3] >> 28u;
@@ -210,11 +231,28 @@ KYTY_SYSV_ABI void OnCreate(uint64_t tex) {
 	e.layers              = (e.flags & 3u) == 1u ? slices * 6u : slices;
 	e.size                = 0; // the declaration (w, h, slices, mips) bounds it, not a byte count
 	e.source              = Reg::Source::Create;
+	if (Pc::Enabled()) {
+		Pc::Texture t;
+		t.owner  = tex;
+		t.base   = e.base;
+		t.width  = e.width;
+		t.height = e.height;
+		t.depth  = e.depth;
+		t.layers = e.layers;
+		t.mips   = e.mips;
+		t.format = e.engine_format;
+		t.kind   = Pc::Kind::Created;
+		Pc::OnTexture(t);
+	}
+	if (!g_registry) return;
 	Reg::Insert(e);
 }
 
 // Before the engine's deferred free of [tex+0x98].
-KYTY_SYSV_ABI void OnRelease(uint64_t tex, uint64_t pointer) { Reg::Release(tex, pointer); }
+KYTY_SYSV_ABI void OnRelease(uint64_t tex, uint64_t pointer) {
+	Pc::OnRelease(tex, pointer);
+	if (g_registry) Reg::Release(tex, pointer);
+}
 
 void Put(std::vector<uint8_t>& code, std::initializer_list<uint8_t> bytes) { code.insert(code.end(), bytes); }
 void Put64(std::vector<uint8_t>& code, uint64_t v) {
@@ -312,7 +350,8 @@ const char* InstallHooks(uint64_t base) {
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
 	const char* v = std::getenv("KYTY_ENGINE_TEX_REGISTRY");
-	if (v == nullptr || v[0] != '1') return;
+	g_registry    = v != nullptr && v[0] == '1';
+	if (!g_registry && !Pc::Requested()) return;
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
 	const auto* elf = program->elf.get();
@@ -331,9 +370,17 @@ void Install(Program* program) {
 	const char* failed = CheckStatic(g_state.base, &where);
 	if (failed == nullptr) failed = InstallHooks(g_state.base);
 	if (failed != nullptr) {
-		std::printf("[engine-tex] KYTY_ENGINE_TEX_REGISTRY=1 NOT applied: eboot+0x%llx: %s (version %s; checked for "
+		std::printf("[engine-tex] %s NOT applied: eboot+0x%llx: %s (version %s; checked for "
 		            "01.007.000); textures are sized as before\n",
+		            g_registry ? "KYTY_ENGINE_TEX_REGISTRY=1" : "the CTexture hooks of KYTY_NATIVE_TEXTURE_PC=1",
 		            static_cast<unsigned long long>(where), failed, version.c_str());
+		std::fflush(stdout);
+		return;
+	}
+	g_hooks = true;
+	if (!g_registry) {
+		std::printf("[engine-tex] CTexture create/factory/release hooks in for KYTY_NATIVE_TEXTURE_PC=1 (the registry "
+		            "itself stays off)\n");
 		std::fflush(stdout);
 		return;
 	}
@@ -349,5 +396,7 @@ void Install(Program* program) {
 	(void)program;
 #endif
 }
+
+bool HooksInstalled() noexcept { return g_hooks; }
 
 } // namespace Loader::DemonsSoulsEngineTex

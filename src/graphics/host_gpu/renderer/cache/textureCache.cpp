@@ -5,6 +5,7 @@
 #include <thread>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/nativeTex.h"
+#include "graphics/host_gpu/nativeTexturePc.h"
 #include "gpu-residency.h"
 #include "slow-log.h"
 
@@ -6018,6 +6019,7 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 void TextureCache::RunGarbageCollector() {
 	EraseRetired();
 	NativeTex::Pump();
+	NativeTexturePc::Pump();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	// Parked images not taken back since the flip before: the game left that use of the memory.

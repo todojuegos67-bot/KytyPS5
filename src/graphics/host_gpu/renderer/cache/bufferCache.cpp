@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/nativeTex.h"
+#include "graphics/host_gpu/nativeTexturePc.h"
 #include "gpu-residency.h"
 #include "lane-sync.h"
 #include "slow-log.h"
@@ -2786,6 +2787,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	marks[1] = Clock::now();
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
+	}
+	// KYTY_NATIVE_TEXTURE_PC: an engine texture's bytes come from its host staging (graphics/host_gpu/nativeTexturePc.h),
+	// never from its guest pages (left unwritten). Too large for the staging ring, or a buffer over it: the paths below
+	// read guest memory, and BeforeGuestRead writes the staged bytes there first (a counted CPU fallback).
+	if (NativeTexturePc::Overlaps(vaddr, size) && size <= m_staging_buffer.Size() && !IsRegionGpuModified(vaddr, size)) {
+		const auto* holder = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		if (holder == nullptr || !*holder) {
+			auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
+			if (staging != nullptr) {
+				path = "native-texture-pc";
+				ApplyImageProtects();
+				(void)NativeTexturePc::Fill(vaddr, size, staging, [](uint64_t at, void* to, uint64_t n) {
+					return Libs::LibKernel::Memory::TryReadBackingToHost(at, to, n);
+				});
+				m_staging_buffer.Commit();
+				return {&m_staging_buffer, stage_offset};
+			}
+		}
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {

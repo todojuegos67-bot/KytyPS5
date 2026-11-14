@@ -306,7 +306,7 @@ void ReportThread() {
 
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
-	if (!::Loader::NativeTex::Requested()) return;
+	if (!::Loader::NativeTex::HooksRequested()) return;
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin" ||
 	    program->mapped_size > CaveOffset || program->base_vaddr > UINT64_MAX - CaveOffset - CaveSize)
 		return;
