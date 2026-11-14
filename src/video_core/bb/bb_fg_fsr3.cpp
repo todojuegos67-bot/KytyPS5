@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 #include "video_core/bb/bb_fg_internal.h"
+#include "video_core/bb/bb_smooth.h"
 #include "video_core/bb/bb_kyty_compat.h"
 
 #if defined(_WIN32)
@@ -773,7 +774,11 @@ void NoteSlept(double) {}
 
 int Generated() {
     if (!Active() || !g_generating) return 0;
-    return 1;
+    // bb-smooth: x3 / x4 / dynamic generate 2-3 frames per real one (was always 1: the planned
+    // grid stats assumed x2). The DLL reads the same variable on every present.
+    const char* v = std::getenv("KYTY_FSR3_FG_ACTIVE");
+    const int n = v != nullptr ? std::atoi(v) : 1;
+    return std::clamp(n, 1, 3);
 }
 
 // 1.51 (bb-fgmv-151): present watchdog. r149_0459: presents stopped completing ("source=none
@@ -959,6 +964,15 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
             // The step: the guest pacer's (the real flips are held on it), else a held mean of
             // the real present intervals (moves only when the mean leaves it by 0.5 ms).
             double step = CapInterval();
+            // bb-smooth: the held rung's exact interval; a new rung starts a new grid.
+            static uint32_t smooth_epoch = 0;
+            if (const double sg = BB::Smooth::GridInterval(); sg > 0.0) {
+                step = sg;
+                if (BB::Smooth::Epoch() != smooth_epoch) {
+                    smooth_epoch = BB::Smooth::Epoch();
+                    h.last_slot = 0.0;
+                }
+            }
             if (!(step > 0.0 && step < 0.1) && h.count >= 16) {
                 const int n = std::min(h.count, 32);
                 double sum = 0.0;
@@ -991,6 +1005,7 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
                     const double t = s + step * i / (gen + 1);
                     if (prev > 0.0 && t - prev > 0.0 && t - prev < 0.1) {
                         g_ft.shown.push_back((t - prev) * 1e3);
+                        BB::Smooth::NoteShown((t - prev) * 1e3);
                     }
                     prev = t;
                 }
