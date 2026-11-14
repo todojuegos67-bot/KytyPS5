@@ -861,6 +861,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/memory_patcher.cpp
            src/core/bb_native_mv_hook.cpp
            src/core/bb_native_mv_hook.h
+           src/core/bb_hud_native_hook.cpp
+           src/core/bb_hud_native_hook.h
            src/common/multi_level_page_table.h
            ${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp
            src/common/scm_rev.h

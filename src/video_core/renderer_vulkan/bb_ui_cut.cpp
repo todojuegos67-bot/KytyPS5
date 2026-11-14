@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 #include <fmt/format.h>
+#include "core/bb_hud_native_hook.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_hud_layer_comp.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
@@ -146,7 +147,64 @@ void FlushLayer() {
     g_layer.t0 = now;
 }
 
+// bb-hud-native: per second (GPU thread), with the guest wrappers' counters as deltas.
+struct NativeWhy {
+    u64 begins = 0, ends = 0, frames = 0, unbalanced = 0, ui_draws = 0, redirected = 0,
+        depth_redirected = 0, scene_cuts = 0, heuristic_refused = 0, layer_frames = 0,
+        composited = 0, lost = 0, not_ready = 0, clears = 0;
+    u64 g_begins = 0, g_failed = 0, g_written = 0, g_no_space = 0, g_no_dcb = 0;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+} g_native;
+
+void FlushNative(u32 ow, u32 oh, VAddr layer, u32 lw, u32 lh) {
+    if (!BB::HudNativeHook::Enabled()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_native.t0 < std::chrono::seconds(1)) return;
+    using S = BB::HudNativeHook::Stats;
+    const u64 gb = S::begins.load(), gf = S::begin_failed.load(), gw = S::written.load(),
+              gn = S::no_space.load(), gd = S::no_dcb.load();
+    BB::Upscale::Checkpoint(fmt::format(
+        "[hud-native] 1 s: frames {}, markers begin {} / end {} (unbalanced frames {}); guest "
+        "BeginScene {} (failed {}), markers written {}, no room {}, no context {}; UI draws {}, "
+        "redirected to the {}x{} layer {} (+{} depth-only), layer {:#x} {}x{}, layer frames {}, "
+        "composited at output size {}, lost {}, not ready {}, clears {}; scene cuts at the UI "
+        "start {}, heuristic HUD starts refused {}{}",
+        g_native.frames, g_native.begins, g_native.ends, g_native.unbalanced,
+        gb - g_native.g_begins, gf - g_native.g_failed, gw - g_native.g_written,
+        gn - g_native.g_no_space, gd - g_native.g_no_dcb, g_native.ui_draws, ow, oh,
+        g_native.redirected, g_native.depth_redirected, layer, lw, lh, g_native.layer_frames,
+        g_native.composited, g_native.lost, g_native.not_ready, g_native.clears,
+        g_native.scene_cuts, g_native.heuristic_refused,
+        BB::HudNativeHook::Installed() ? "" : " (guest wrappers NOT installed: heuristic cut)"));
+    g_native = NativeWhy{};
+    g_native.t0 = now;
+    g_native.g_begins = gb;
+    g_native.g_failed = gf;
+    g_native.g_written = gw;
+    g_native.g_no_space = gn;
+    g_native.g_no_dcb = gd;
+}
+
 } // namespace
+
+void UiCut::OnNativeMarker(bool begin, u32 seq) {
+    (void)seq;
+    native_seen = true;
+    if (begin) {
+        ++native_depth;
+        ++g_native.begins;
+    } else {
+        if (native_depth > 0) --native_depth;
+        ++g_native.ends;
+    }
+    native_draw = NativeLive() && native_depth > 0;
+    native_color_redirected = false;
+    native_cb0_layer = false;
+}
+
+bool UiCut::NativeLive() const {
+    return native_seen && BB::HudNativeHook::Enabled() && BB::HudNativeHook::Installed();
+}
 
 void UiCut::NoteDisplayBuffer(VAddr address) {
     const u32 count = g_display_count.load(std::memory_order_acquire);
@@ -262,6 +320,27 @@ bool UiCut::RenderTarget(u32 w, u32 h) const {
 }
 
 void UiCut::OnFrameStart() {
+    if (BB::HudNativeHook::Enabled()) {
+        ++g_native.frames;
+        if (native_depth != 0) {
+            ++g_native.unbalanced; // a BeginScene marker without its EndScene: closed here
+            native_depth = 0;
+        }
+        if (native_layer_drawn) {
+            ++g_native.layer_frames;
+            // UI drawn only into the output-size layer and never composited: not on screen
+            if (!native_composited) ++g_native.lost;
+        }
+        last_layer_ok = layer_ok_frame;
+        layer_ok_frame = false;
+        native_composited = false;
+        native_layer_drawn = false;
+        native_layer_cleared = false;
+        native_depth_cleared = false;
+        u32 ow = 0, oh = 0;
+        OutputSize(ow, oh);
+        FlushNative(ow, oh, native_layer_addr, native_layer_w, native_layer_h);
+    }
     // The display pass of an upscaled frame reads the upscaled UI image.
     display_redirect = ui_phase;
     display_fg = display_redirect ? cut_fg : BB::FG::Inputs{};
@@ -344,6 +423,13 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
     layer_pending = false; // armed by this draw only (a skipped draw never reached AfterDraw)
     layer_substituted = false;
     const u64 vs_hash = info.vs_hash;
+    // bb-hud-native: between the game's Scaleform HAL BeginScene / EndScene markers.
+    const bool native = NativeLive();
+    native_draw = native && native_depth > 0;
+    native_color_redirected = false;
+    native_cb0_layer =
+        native_draw && native_layer_addr != 0 && info.cb0_address == native_layer_addr;
+    if (native_draw) ++g_native.ui_draws;
     // bb-gpu6 [hud-seq]: once a second, one frame's draws into scene-size RGBA8 targets.
     const bool seq_on = seq_frame == 1;
     if (seq_on && color && seq.size() < 1800) {
@@ -380,7 +466,8 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
     // the cut on the scene target, and its stencil goes into the UI's output-size depth.
     bool mask_cut = false;
     if (!ui_phase && !color && depth && ldr_target && !done_this_frame && sr != nullptr &&
-        info.cb0_address != 0 && Vulkan::UiComposition::MovieShader(vs_hash) &&
+        info.cb0_address != 0 &&
+        (native ? native_draw : Vulkan::UiComposition::MovieShader(vs_hash)) &&
         texture_cache.GetImage(ldr_target).info.guest_address == info.cb0_address) {
         color = ldr_target;
         mask_cut = true;
@@ -443,8 +530,10 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
                                f == vk::Format::eB8G8R8A8Srgb;
         const bool full_size = sw != 0 && sh != 0 && im.info.size.width + 8 >= sw &&
                                im.info.size.height + 8 >= sh;
+        // bb-hud-native: exactly the draws between the markers.
         const bool layer_like =
-            (movie_shader || (info.blend && !info.depth_test && !info.samples_scene)) &&
+            (native ? native_draw
+                    : (movie_shader || (info.blend && !info.depth_test && !info.samples_scene))) &&
             eight_bit && full_size;
         if (layer_like && !scene_target && !IsDisplayBuffer(im.info.guest_address) &&
             im.info.guest_address != 0) {
@@ -462,7 +551,8 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
             g_layer.layer_h = im.info.size.height;
             g_layer.layer_format = f;
         }
-        if (info.samples_hud_layer && info.layer_read != 0 && !movie_shader && scene_target &&
+        if (info.samples_hud_layer && info.layer_read != 0 &&
+            (native ? !native_draw : !movie_shader) && scene_target &&
             color == ldr_target && !IsDisplayBuffer(im.info.guest_address)) {
             for (u32 i = 0; i < num_cand; ++i) {
                 if (cand[i].address == info.layer_read) {
@@ -503,8 +593,8 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
         return hash ? std::strtoull(hash, nullptr, 16) : 0ull;
     }();
     const auto& image = texture_cache.GetImage(color);
-    const bool listed_movie = (ui_trigger_vs && vs_hash == ui_trigger_vs) ||
-                              Vulkan::UiComposition::MovieShader(vs_hash);
+    const bool listed_movie = !native && ((ui_trigger_vs && vs_hash == ui_trigger_vs) ||
+                                          Vulkan::UiComposition::MovieShader(vs_hash));
     // bb-gpu6 (BB_HUD_TRIGGER): the in-game HUD draws with none of the UI-movie shaders (369 log:
     // "UI-movie shader on a non-scene target 0, scene-size RGBA8 draws by other shaders 210 (vs:
     // 0x1ea5a07e 0x0b0acf50 0x061fbbf6)"). After the scene, a draw into the UI target that reads
@@ -548,10 +638,14 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
     const bool refused = std::find(bad_vs.begin(), bad_vs.begin() + num_bad_vs, vs_hash) !=
                          bad_vs.begin() + num_bad_vs;
     const bool flat = !info.samples_scene && !info.depth_test;
-    const bool hud_start =
+    const bool heuristic_start =
         !listed_movie && trigger_mode != 0 && flat && !refused &&
         (std::find(hud_list.begin(), hud_list.end(), vs_hash) != hud_list.end() ||
          (trigger_mode == 2 && info.blend));
+    // bb-hud-native: the first draw after the game's BeginScene marker starts the UI; nothing
+    // else does (no shader lists, no blend rule).
+    if (native && heuristic_start && !native_draw) ++g_native.heuristic_refused;
+    const bool hud_start = native ? native_draw : heuristic_start;
     const bool movie = listed_movie || hud_start;
     (void)native_viewport; // Supermedo: only for his live resolution path (guest targets 1080p)
     const bool ui_draw = movie && Rgba8(image.info.pixel_format) &&
@@ -593,7 +687,8 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
         return;
     case Vulkan::UiComposition::Background::Temporal:
         if (native_fg ? RunNativeFg(scene, color, depth) : RunScaled(scene)) {
-            cut_vs = trigger_vs;
+            cut_vs = native ? 0 : trigger_vs;
+            if (native_draw) ++g_native.scene_cuts;
             CaptureHudlessUi();
             mask_depth();
             return;
@@ -606,7 +701,8 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
         [[fallthrough]];
     case Vulkan::UiComposition::Background::Copy:
         RunUiOnly(color, depth);
-        cut_vs = trigger_vs;
+        cut_vs = native ? 0 : trigger_vs;
+        if (native_draw && ui_phase) ++g_native.scene_cuts;
         CaptureHudlessUi();
         mask_depth();
         return;
@@ -952,6 +1048,27 @@ bool UiCut::RedirectColor(VideoCore::ImageId color, const VideoCore::ImageViewIn
     }
     const auto& image = texture_cache.GetImage(color);
     const VAddr address = image.info.guest_address;
+    // bb-hud-native: a UI draw (between the markers) into last frame's HUD layer goes to an
+    // output-size copy of the layer (viewport / scissor scaled by the rasterizer's UI pass), which
+    // AfterDraw draws over the upscaled scene after the game's own (render-size) composite.
+    if (native_draw && address != 0 && address == native_layer_addr &&
+        image.info.size.width == native_layer_w && image.info.size.height == native_layer_h) {
+        u32 ow = 0, oh = 0;
+        if (!NativeLayerReady() || !OutputSize(ow, oh) ||
+            !EnsureNativeLayer(image.info.pixel_format, ow, oh)) {
+            ++g_native.not_ready;
+            return false;
+        }
+        if (!native_layer_cleared) ClearNative(true, false);
+        const vk::ImageView v =
+            Mirror(native_layer, view_info.format, vk::ImageAspectFlagBits::eColor);
+        if (!v) return false;
+        target = {v, vk::ImageLayout::eGeneral, ow, oh, true};
+        native_color_redirected = true;
+        native_layer_drawn = true;
+        ++g_native.redirected;
+        return true;
+    }
     if (!IsDisplayBuffer(address)) {
         display_redirect = false;
         return false;
@@ -1002,6 +1119,20 @@ bool UiCut::RedirectColor(VideoCore::ImageId color, const VideoCore::ImageViewIn
 }
 
 bool UiCut::RedirectDepth(VideoCore::ImageId depth, Target& target) {
+    // bb-hud-native: the stencil of the UI draws into the output-size layer (Scaleform masks);
+    // a mask draw with no colour target goes there too while the layer is redirected this frame.
+    if (native_draw && depth &&
+        (native_color_redirected || (native_cb0_layer && NativeLayerReady()))) {
+        const auto& im = texture_cache.GetImage(depth);
+        u32 ow = 0, oh = 0;
+        if (im.info.size.width == native_layer_w && im.info.size.height == native_layer_h &&
+            OutputSize(ow, oh) && EnsureNativeDepth(im.info.pixel_format, ow, oh)) {
+            if (!native_depth_cleared) ClearNative(false, true);
+            target = {native_depth_view, vk::ImageLayout::eGeneral, ow, oh, true};
+            if (!native_color_redirected) ++g_native.depth_redirected;
+            return true;
+        }
+    }
     if (!ui_phase || depth != ui_depth || !ui_depth_view) return false;
     target = {ui_depth_view, vk::ImageLayout::eGeneral, ui_width, ui_height, true};
     return true;
@@ -1318,6 +1449,33 @@ void UiCut::AfterDraw(SceneDepth& scene) {
     CaptureHudlessUi(); // the picture without the HUD for frame generation
     const bool drawn = CompositeLayer(layer);
     if (drawn) ++g_layer.composited;
+    if (drawn && NativeLive()) {
+        // bb-hud-native: the layer that the next frame's UI draws go to at output size.
+        layer_ok_frame = true;
+        const auto& li = texture_cache.GetImage(layer);
+        native_layer_addr = li.info.guest_address;
+        native_layer_w = li.info.size.width;
+        native_layer_h = li.info.size.height;
+        // This frame's UI (drawn into native_layer): over the scene and the game's layer (what
+        // is left in it was not drawn between the markers).
+        if (native_layer_drawn && native_layer.image) {
+            const vk::ImageView v = Mirror(native_layer, native_layer.format,
+                                           vk::ImageAspectFlagBits::eColor);
+            scheduler.EndRendering();
+            const vk::MemoryBarrier2 mb{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            };
+            scheduler.CommandBuffer().pipelineBarrier2(
+                {.memoryBarrierCount = 1, .pMemoryBarriers = &mb});
+            if (v && CompositeView(v, vk::ImageLayout::eGeneral, native_layer.format)) {
+                native_composited = true;
+                ++g_native.composited;
+            }
+        }
+    }
     std::scoped_lock lock{counter_mutex};
     ++counters.layer_cuts;
     if (drawn) {
@@ -1340,11 +1498,6 @@ bool UiCut::CompositeLayer(VideoCore::ImageId layer_id) {
             return false;
         }
     }
-    const vk::ImageView scene_view =
-        Mirror(ui_image, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor);
-    const vk::ImageView out_view =
-        Mirror(layer_tmp, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor);
-    if (!scene_view || !out_view) return false;
     scheduler.EndRendering();
     auto& layer = texture_cache.GetImage(layer_id);
     VideoCore::ImageViewInfo li{};
@@ -1354,6 +1507,21 @@ bool UiCut::CompositeLayer(VideoCore::ImageId layer_id) {
     runtime.Transit(&layer, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
+    return CompositeView(layer_view, vk::ImageLayout::eShaderReadOnlyOptimal, li.format);
+}
+
+bool UiCut::CompositeView(vk::ImageView layer_view, vk::ImageLayout layer_image_layout,
+                          vk::Format layer_format) {
+    if (!layer_pipe_ok || !layer_view || !ui_image.image || !layer_tmp.image ||
+        layer_tmp.width != ui_width || layer_tmp.height != ui_height) {
+        return false;
+    }
+    const vk::ImageView scene_view =
+        Mirror(ui_image, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor);
+    const vk::ImageView out_view =
+        Mirror(layer_tmp, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor);
+    if (!scene_view || !out_view) return false;
+    scheduler.EndRendering();
     const auto cmd = scheduler.CommandBuffer();
     const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
     vk::ImageMemoryBarrier2 b[2]{
@@ -1380,8 +1548,7 @@ bool UiCut::CompositeLayer(VideoCore::ImageId layer_id) {
     cmd.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = b});
     const vk::DescriptorImageInfo scene_info{layer_sampler_nearest, scene_view,
                                              vk::ImageLayout::eGeneral};
-    const vk::DescriptorImageInfo hud_info{layer_sampler_linear, layer_view,
-                                           vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo hud_info{layer_sampler_linear, layer_view, layer_image_layout};
     const vk::DescriptorImageInfo out_info{{}, out_view, vk::ImageLayout::eGeneral};
     const std::array writes{
         vk::WriteDescriptorSet{.dstBinding = 0,
@@ -1397,7 +1564,7 @@ bool UiCut::CompositeLayer(VideoCore::ImageId layer_id) {
                                .descriptorType = vk::DescriptorType::eStorageImage,
                                .pImageInfo = &out_info},
     };
-    const u32 flags = (LayerStraightAlpha() ? 1u : 0u) | (IsSrgb(li.format) ? 2u : 0u);
+    const u32 flags = (LayerStraightAlpha() ? 1u : 0u) | (IsSrgb(layer_format) ? 2u : 0u);
     const u32 push[4] = {ui_width, ui_height, flags, 0u};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, layer_pipe);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layer_layout, 0, writes);
@@ -1447,6 +1614,95 @@ bool UiCut::CompositeLayer(VideoCore::ImageId layer_id) {
     cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = b});
     scheduler.GetDynamicState().Invalidate();
     return true;
+}
+
+bool UiCut::NativeLayerReady() const {
+    // Only with an upscaler (native size: the layer already has the output's pixels), after a
+    // frame whose layer composite ran (so this frame's composite will draw what goes there).
+    return NativeLive() && LayerCutEnabled() && last_layer_ok && layer_pipe_ok &&
+           BB::Upscale::Enabled() && BB::Upscale::BackendReady() && native_layer_addr != 0;
+}
+
+bool UiCut::EnsureNativeLayer(vk::Format color, u32 w, u32 h) {
+    if (native_layer.image && native_layer.format == color && native_layer.width == w &&
+        native_layer.height == h) {
+        return true;
+    }
+    if (native_layer.image) scheduler.Finish();
+    if (!Create(native_layer, w, h, color,
+                vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                    vk::ImageUsageFlagBits::eTransferDst,
+                true)) {
+        return false;
+    }
+    native_layer_cleared = false;
+    BB::Upscale::Checkpoint(fmt::format("[hud-native] output-size HUD layer {}x{} ({})", w, h,
+                                        vk::to_string(color)));
+    return true;
+}
+
+bool UiCut::EnsureNativeDepth(vk::Format depth, u32 w, u32 h) {
+    if (native_depth_image.image && native_depth_format == depth && native_depth_image.width == w &&
+        native_depth_image.height == h) {
+        return native_depth_view != vk::ImageView{};
+    }
+    if (native_depth_image.image) scheduler.Finish();
+    native_depth_view = vk::ImageView{};
+    if (!Create(native_depth_image, w, h, depth,
+                vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                    vk::ImageUsageFlagBits::eTransferDst,
+                false)) {
+        return false;
+    }
+    native_depth_format = depth;
+    native_depth_view = Mirror(native_depth_image, depth, DepthAspect(depth));
+    native_depth_cleared = false;
+    return native_depth_view != vk::ImageView{};
+}
+
+void UiCut::ClearNative(bool color, bool depth) {
+    // Once a frame, at the first redirected UI draw: transparent colour, depth 1, stencil 0.
+    // (Scaleform clears its own stencil with mask-clear draws, which are redirected too.)
+    scheduler.EndRendering();
+    const auto cmd = scheduler.CommandBuffer();
+    const auto run = [&](vk::Image image, vk::ImageAspectFlags aspect, bool is_color) {
+        const vk::ImageSubresourceRange range{aspect, 0, 1, 0, 1};
+        vk::ImageMemoryBarrier2 b{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = image,
+            .subresourceRange = range,
+        };
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+        if (is_color) {
+            cmd.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal,
+                                vk::ClearColorValue{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}},
+                                range);
+        } else {
+            cmd.clearDepthStencilImage(image, vk::ImageLayout::eTransferDstOptimal,
+                                       vk::ClearDepthStencilValue{1.0f, 0}, range);
+        }
+        b.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+        b.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        b.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+        b.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+        b.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+        b.newLayout = vk::ImageLayout::eGeneral;
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+    };
+    if (color && native_layer.image) {
+        run(native_layer.image, vk::ImageAspectFlagBits::eColor, true);
+        native_layer_cleared = true;
+        ++g_native.clears;
+    }
+    if (depth && native_depth_image.image) {
+        run(native_depth_image.image, DepthAspect(native_depth_format), false);
+        native_depth_cleared = true;
+    }
 }
 
 void UiCut::TraceDraw(std::string&& line) {

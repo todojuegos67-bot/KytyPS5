@@ -135,6 +135,17 @@ public:
     };
     bool DisplayOverride(VAddr address, vk::Format format, Display& display);
 
+    // bb-hud-native (BB_HUD_NATIVE=1, core/bb_hud_native_hook): the game's Scaleform HAL
+    // BeginScene / EndScene markers, in order with the draws. Between them every draw is UI.
+    void OnNativeMarker(bool begin, u32 seq);
+    // BB_HUD_NATIVE=1, the guest wrappers installed and a marker seen: the UI is known exactly
+    // (the heuristic HUD start / layer rules are off).
+    [[nodiscard]] bool NativeLive() const;
+    // This draw is between the markers (UI): never jittered.
+    [[nodiscard]] bool NativeUiDraw() const {
+        return native_draw;
+    }
+
     // Per-second log of the presenter: frames cut, HUD-less copies made.
     struct Counters {
         u32 cuts = 0, ui_only = 0, hudless = 0, displays = 0;
@@ -172,6 +183,13 @@ private:
     bool EnsureClearLayer(u32 w, u32 h);
     bool CompositeLayer(VideoCore::ImageId layer);
     [[nodiscard]] bool RenderTarget(u32 w, u32 h) const;
+    // bb-hud-native: the output-size copy of the HUD layer the UI draws are redirected to.
+    bool CompositeView(vk::ImageView layer_view, vk::ImageLayout layer_image_layout,
+                       vk::Format format);
+    bool EnsureNativeLayer(vk::Format color, u32 w, u32 h);
+    bool EnsureNativeDepth(vk::Format depth, u32 w, u32 h);
+    void ClearNative(bool color, bool depth);
+    [[nodiscard]] bool NativeLayerReady() const;
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -202,6 +220,22 @@ private:
     std::vector<std::string> trace_ring;
     std::vector<std::string> trace_head;
     u32 trace_next = 0, trace_total = 0;
+    // bb-hud-native state (GPU thread).
+    u32 native_depth = 0;          // open BeginScene markers
+    bool native_seen = false;      // a marker arrived since start
+    bool native_draw = false;      // this draw is between the markers
+    bool native_color_redirected = false; // this draw's colour went to native_layer
+    bool native_cb0_layer = false;  // this draw's colour buffer 0 register is the HUD layer
+    bool native_layer_drawn = false;      // native_layer got UI draws this frame
+    bool native_layer_cleared = false, native_depth_cleared = false;
+    bool last_layer_ok = false;    // the previous frame's layer composite ran
+    bool layer_ok_frame = false;   // this frame's layer composite ran (AfterDraw)
+    bool native_composited = false; // this frame's native layer was drawn over the output
+    VAddr native_layer_addr = 0;   // the HUD layer of the previous frame
+    u32 native_layer_w = 0, native_layer_h = 0; // the guest layer's size
+    OwnImage native_layer, native_depth_image;
+    vk::ImageView native_depth_view{};
+    vk::Format native_depth_format{};
     bool ui_phase = false, display_redirect = false, done_this_frame = false;
     bool ui_read_barrier = false, hudless_taken = false;
     // bb-gpu6: the trigger of this frame's cut (0: a UI-movie shader or none) and the vertex

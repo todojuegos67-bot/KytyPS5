@@ -239,6 +239,8 @@ struct PM4CmdNop {
         SetTsharpInUdata = 0x68750005u,     ///< Indicates that T# will be set in the next packet
         SetSsharpInUdata = 0x68750006u,     ///< Indicates that S# will be set in the next packet
         DebugColorMarkerPush = 0x6875000eu, ///< Begin of GPU event scope with color
+        BbHudBegin = 0x6875B0B0u, ///< bb-hud-native: the game's Scaleform HAL BeginScene
+        BbHudEnd = 0x6875B0B1u,   ///< bb-hud-native: the game's Scaleform HAL EndScene
         PatchedFlip = 0x68750776u,          ///< Patched flip marker
         PrepareFlip = 0x68750777u,          ///< Flip marker
         PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
