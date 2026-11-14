@@ -286,6 +286,18 @@ public:
 				m_pin_mask.SetRange(g * PagesPerGranule, (g + 1) * PagesPerGranule);
 			}
 		}
+		// KYTY_ARENA_NATIVE (uploadHeap.h): the frame arena's granules, a subset of the marked ones (MarkArena marks both).
+		const bool     native = UploadHeap::ArenaOn();
+		const uint64_t arena  = granules != 0 ? UploadHeap::RegionArenaGranules(m_cpu_addr) & granules : 0;
+		if (arena != m_arena_granules) {
+			m_arena_granules = arena;
+			m_arena_mask.Clear();
+			constexpr size_t PagesPerGranule = (size_t {1} << UploadHeap::GranuleBits) / TRACKER_PAGE_SIZE;
+			for (uint64_t bits = arena; bits != 0; bits &= bits - 1) {
+				const auto g = static_cast<size_t>(std::countr_zero(bits));
+				m_arena_mask.SetRange(g * PagesPerGranule, (g + 1) * PagesPerGranule);
+			}
+		}
 		const uint64_t publish = UploadHeap::g_publish.load(std::memory_order_acquire);
 		const uint32_t frame   = static_cast<uint32_t>(UploadHeap::g_frame.load(std::memory_order_acquire));
 		const bool     host_wrote = m_kept_stamp_invalid.exchange(false, std::memory_order_acq_rel);
@@ -302,12 +314,14 @@ public:
 			clean = mask;
 			copy  = mask & ~(m_kept & m_kept_done);
 		}
-		uint64_t kept_copies = 0, deduped = 0, promoted = 0, demoted = 0;
+		uint64_t kept_copies = 0, deduped = 0, promoted = 0, demoted = 0, arena_promoted = 0, budget_kept = 0,
+		         budget_demoted = 0;
 		if (granules != 0) {
 			const RegionBits candidates = mask & m_pin_mask;
 			for (const auto [first, last]: candidates) {
 				for (size_t page = first; page < last; page++) {
-					auto& info = m_page_info[page];
+					auto&      info     = m_page_info[page];
+					const bool in_arena = arena != 0 && m_arena_mask.Get(page);
 					if (m_kept.Get(page)) {
 						if (!gpu_thread) { // (another thread's use: copied, kept as it is)
 							copy.Set(page);
@@ -321,6 +335,37 @@ public:
 						copy.Set(page);
 						m_kept_done.Set(page);
 						kept_copies++;
+						if (native) {
+							// KYTY_ARENA_NATIVE: a copy budget per frame instead of the write-period rule; in the frame
+							// arena KeepFrames counts the frames it was copied in (uploadHeap.h).
+							if (info.copies_frame != frame) {
+								info.copies_frame = frame;
+								info.frame_copies = 0;
+								if (info.use_frames < UINT16_MAX) info.use_frames++;
+							}
+							if (info.frame_copies < UINT16_MAX) info.frame_copies++;
+							const bool second = frame - info.kept_copy_frame < info.period;
+							const bool expired =
+							    in_arena ? info.use_frames > UploadHeap::KeepFrames : frame - info.kept_since >= UploadHeap::KeepFrames;
+							if (info.frame_copies > UploadHeap::ArenaCopiesPerFrame) {
+								clean.Set(page);
+								m_kept.Unset(page);
+								m_kept_done.Unset(page);
+								info.no_keep_before = frame + UploadHeap::CoolFrames;
+								demoted++;
+								budget_demoted++;
+							} else if (expired) {
+								clean.Set(page);
+								m_kept.Unset(page);
+								m_kept_done.Unset(page);
+								info.dirty_frame = frame + 1;
+								demoted++;
+							} else {
+								if (second) budget_kept++; // (the rule below would have tracked it again)
+								info.kept_copy_frame = frame;
+							}
+							continue;
+						}
 						if (frame - info.kept_copy_frame < info.period) {
 							// Read again sooner than the guest rewrites it (in a later publish epoch of the frame, or in
 							// a later frame of its write period: tracking would not copy it again): tracked from here on.
@@ -349,15 +394,22 @@ public:
 						kept_copies++;
 						continue;
 					}
-					const bool hot = info.dirty_frame != 0 && info.dirty_frame != frame + 1 &&
-					                 frame + 1 - info.dirty_frame <= UploadHeap::HotFrames &&
-					                 static_cast<int32_t>(frame - info.no_keep_before) >= 0;
-					if (hot) {
+					const bool cooled = static_cast<int32_t>(frame - info.no_keep_before) >= 0;
+					const bool hot    = info.dirty_frame != 0 && info.dirty_frame != frame + 1 &&
+					                 frame + 1 - info.dirty_frame <= UploadHeap::HotFrames && cooled;
+					// KYTY_ARENA_NATIVE: a frame-arena page is kept at its first upload (its chunk's next reuse is many
+					// frames away: the hot rule never saw it twice).
+					const bool arena_keep = in_arena && cooled && !hot;
+					if (hot || arena_keep) {
+						if (arena_keep) arena_promoted++;
+						info.copies_frame = frame;
+						info.frame_copies = 1;
+						info.use_frames   = 1;
 						m_kept.Set(page);
 						m_kept_done.Set(page);
 						info.kept_copy_frame = frame;
 						info.kept_since      = frame;
-						info.period          = frame + 1 - info.dirty_frame; // (1..HotFrames: its write period)
+						info.period          = hot ? frame + 1 - info.dirty_frame : 1; // (1..HotFrames: its write period)
 						promoted++;
 					} else {
 						clean.Set(page);
@@ -383,6 +435,9 @@ public:
 			UploadHeap::g_promoted_pages.fetch_add(promoted, std::memory_order_relaxed);
 			UploadHeap::g_demoted_pages.fetch_add(demoted, std::memory_order_relaxed);
 			UploadHeap::g_kept_pages.fetch_add(kept_copies + promoted, std::memory_order_relaxed);
+			if (arena_promoted != 0) UploadHeap::g_arena_promoted.fetch_add(arena_promoted, std::memory_order_relaxed);
+			if (budget_kept != 0) UploadHeap::g_budget_kept.fetch_add(budget_kept, std::memory_order_relaxed);
+			if (budget_demoted != 0) UploadHeap::g_budget_demoted.fetch_add(budget_demoted, std::memory_order_relaxed);
 		}
 		if (clean.Any()) UpdateCpuProtection<true>(start, end);
 		if (copy.Any()) ForEachRange(copy, std::forward<Func>(func));
@@ -507,6 +562,8 @@ private:
 	RegionBits            m_kept;
 	RegionBits            m_kept_done;
 	RegionBits            m_pin_mask;
+	uint64_t              m_arena_granules = 0; // KYTY_ARENA_NATIVE: the frame arena's granules (cached for m_arena_mask)
+	RegionBits            m_arena_mask;
 	std::unique_ptr<UploadHeap::PageInfo[]> m_page_info; // (marked regions only)
 	RegionBits            m_cpu_dirty;
 	RegionBits            m_gpu_dirty;

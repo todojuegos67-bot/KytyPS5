@@ -317,6 +317,7 @@ struct Owner {
 	uint64_t    object = 0;
 	uint32_t    type = 0, slot = 0;
 	bool        upload_heap = false; // level 3: its runs are marked (UploadHeap)
+	bool        frame_arena = false; // KYTY_ARENA_NATIVE: the GPU Default TaggedArena, its runs marked as the frame arena
 	uint64_t    held = 0; // bytes in its runs
 	uint64_t    runs = 0;
 	// Since the last report (events, pages of protection changes, write-back bytes).
@@ -388,6 +389,7 @@ void WalkRuns(Census& c, std::vector<Run>& runs, uint64_t allocator, uint32_t ow
 		c.owners[owner].held += size;
 		c.owners[owner].runs++;
 		if (mark) Libs::Graphics::UploadHeap::Mark(va, size);
+		if (mark && c.owners[owner].frame_arena) Libs::Graphics::UploadHeap::MarkArena(va, size); // (KYTY_ARENA_NATIVE)
 		node = next;
 	}
 }
@@ -436,6 +438,7 @@ void Walk(Census& c) {
 		const bool     arena = level3 && h.vtable == base + GpuTaggedArenaVtable && h.type == 2 &&
 		                   h.name_pointer == base + TaggedArenaName;
 		c.owners[owner].upload_heap = arena;
+		c.owners[owner].frame_arena = arena && Libs::Graphics::UploadHeap::ArenaOn();
 		WalkRuns(c, runs, allocator, owner, arena);
 		if (h.vtable == base + ContextVtable && h.type == 2 && h.name_pointer == base + RenderContextGpuName) {
 			// The context's allocators (0x801090): count at +0x88, {limit, allocator} at +0x90 + 16 i.
@@ -679,6 +682,17 @@ void Report(Census& c, double seconds, bool residency) {
 		            static_cast<unsigned long long>(static_cast<double>(now[4] - last[4]) / seconds / static_cast<double>(MiB)),
 		            per(now[5] - last[5]));
 		std::copy(std::begin(now), std::end(now), std::begin(last));
+		if (U::ArenaOn()) {
+			static uint64_t last_arena[3] {};
+			const uint64_t  arena[3] = {U::g_arena_promoted.load(), U::g_budget_kept.load(), U::g_budget_demoted.load()};
+			std::printf("[native-mem]   arena-native (KYTY_ARENA_NATIVE): GPU frame arena %llu MiB marked; per s %llu "
+			            "frame-arena pages kept at first upload, %llu kept-page copies in a further epoch of a frame kept "
+			            "(within %u a frame), %llu tracked again over that budget; readback window there %llu KiB\n",
+			            static_cast<unsigned long long>(U::g_arena_bytes.load() / MiB), per(arena[0] - last_arena[0]),
+			            per(arena[1] - last_arena[1]), U::ArenaCopiesPerFrame, per(arena[2] - last_arena[2]),
+			            static_cast<unsigned long long>(U::ArenaWindow >> 10u));
+			std::copy(std::begin(arena), std::end(arena), std::begin(last_arena));
+		}
 	}
 	{
 		// Write-backs by source (all census levels), and KYTY_GPU_ONLY_WRITES's work (gpu-only-writes.h).
@@ -879,8 +893,18 @@ void Install(Program* program) {
 				            static_cast<unsigned long long>(MipCopyCall));
 			}
 			Libs::Graphics::UploadHeap::g_on.store(1, std::memory_order_release);
+			if (Libs::Graphics::UploadHeap::ArenaNativeRequested()) {
+				Libs::Graphics::UploadHeap::g_arena_on.store(1, std::memory_order_release);
+				std::printf("[native-mem] KYTY_ARENA_NATIVE=1: the GPU frame arena (Default TaggedArena, vtable eboot+0x%llx) "
+				            "as an upload heap (pages kept at first upload), up to %u copies a frame of a kept page, "
+				            "readbacks there cut to %llu KiB\n",
+				            static_cast<unsigned long long>(GpuTaggedArenaVtable), Libs::Graphics::UploadHeap::ArenaCopiesPerFrame,
+				            static_cast<unsigned long long>(Libs::Graphics::UploadHeap::ArenaWindow >> 10u));
+			}
 		}
 	}
+	if (applied < 3 && Libs::Graphics::UploadHeap::ArenaNativeRequested())
+		std::printf("[native-mem] KYTY_ARENA_NATIVE=1 NOT applied: it needs KYTY_NATIVE_MEM=3 (applied: %d)\n", applied);
 	g_level.store(applied, std::memory_order_release);
 	std::printf("[native-mem] KYTY_NATIVE_MEM=%d: engine code checked (version %s: render-target arenas, allocator registry, "
 	            "page-run lists%s); %s\n",

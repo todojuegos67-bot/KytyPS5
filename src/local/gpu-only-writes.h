@@ -32,6 +32,8 @@
 // Needs the engine census (KYTY_NATIVE_MEM, which this turns on at level 1 when unset) for the GPU-class runs; until the
 // first walk nothing is narrowed. Logged with the census every 10 s ("[native-mem]   GPU-only writes ...").
 
+#include "graphics/host_gpu/uploadHeap.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -125,8 +127,12 @@ inline bool IsGpuClass(uint64_t vaddr, uint64_t size) {
 // access's pages and stays inside [lo, hi) and the old window's union with the access's pages. `page`: the trackers'
 // page size (a power of two). True when it was cut.
 inline bool Narrow(uint64_t address, uint64_t size, uint64_t lo, uint64_t hi, uint64_t page, uint64_t& begin, uint64_t& end) {
-	if (!Enabled() || size == 0 || begin >= end || !IsGpuClass(address, size)) return false;
-	const uint64_t window = std::max(WindowBytes(), page);
+	if (size == 0 || begin >= end) return false;
+	// KYTY_ARENA_NATIVE: the GPU frame arena (uploadHeap.h) on its own, with its own window.
+	const bool gpu   = Enabled() && IsGpuClass(address, size);
+	const bool arena = !gpu && Libs::Graphics::UploadHeap::InArena(address, size);
+	if (!gpu && !arena) return false;
+	const uint64_t window = std::max(gpu ? WindowBytes() : Libs::Graphics::UploadHeap::ArenaWindow, page);
 	uint64_t       first  = std::max(address & ~(window - 1), lo);
 	uint64_t       last   = std::min(((address + size + window - 1) & ~(window - 1)), hi);
 	// (Never more than the old window, never less than the access's own pages.)
