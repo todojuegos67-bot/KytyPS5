@@ -151,7 +151,7 @@ void FlushLayer() {
 struct NativeWhy {
     u64 begins = 0, ends = 0, frames = 0, unbalanced = 0, ui_draws = 0, redirected = 0,
         depth_redirected = 0, scene_cuts = 0, heuristic_refused = 0, layer_frames = 0,
-        composited = 0, lost = 0, not_ready = 0, clears = 0;
+        composited = 0, lost = 0, not_ready = 0, clears = 0, retries_refused = 0;
     u64 g_begins = 0, g_failed = 0, g_written = 0, g_no_space = 0, g_no_dcb = 0;
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 } g_native;
@@ -168,13 +168,13 @@ void FlushNative(u32 ow, u32 oh, VAddr layer, u32 lw, u32 lh) {
         "BeginScene {} (failed {}), markers written {}, no room {}, no context {}; UI draws {}, "
         "redirected to the {}x{} layer {} (+{} depth-only), layer {:#x} {}x{}, layer frames {}, "
         "composited at output size {}, lost {}, not ready {}, clears {}; scene cuts at the UI "
-        "start {}, heuristic HUD starts refused {}{}",
+        "start {} (repeat attempts refused {}), heuristic HUD starts refused {}{}",
         g_native.frames, g_native.begins, g_native.ends, g_native.unbalanced,
         gb - g_native.g_begins, gf - g_native.g_failed, gw - g_native.g_written,
         gn - g_native.g_no_space, gd - g_native.g_no_dcb, g_native.ui_draws, ow, oh,
         g_native.redirected, g_native.depth_redirected, layer, lw, lh, g_native.layer_frames,
         g_native.composited, g_native.lost, g_native.not_ready, g_native.clears,
-        g_native.scene_cuts, g_native.heuristic_refused,
+        g_native.scene_cuts, g_native.retries_refused, g_native.heuristic_refused,
         BB::HudNativeHook::Installed() ? "" : " (guest wrappers NOT installed: heuristic cut)"));
     g_native = NativeWhy{};
     g_native.t0 = now;
@@ -342,6 +342,7 @@ void UiCut::OnFrameStart() {
         layer_ok_frame = false;
         native_composited = false;
         native_layer_drawn = false;
+        native_cut_tried = false;
         native_layer_cleared = false;
         native_depth_cleared = false;
         u32 ow = 0, oh = 0;
@@ -683,11 +684,22 @@ void UiCut::OnDraw(const DrawInfo& info, VideoCore::ImageId color, VideoCore::Im
         if (said < 4) {
             ++said;
             BB::Upscale::Checkpoint(fmt::format(
-                "[hud-cut] HUD start by vs {:#x} ps {:#x} (not a UI-movie shader){}", vs_hash,
-                info.ps_hash, info.blend ? ", blended" : ""));
+                "[hud-cut] HUD start by vs {:#x} ps {:#x} ({}){}", vs_hash, info.ps_hash,
+                native ? "first draw after the Scaleform BeginScene marker"
+                       : "not a UI-movie shader",
+                info.blend ? ", blended" : ""));
         }
     }
     const u64 trigger_vs = hud_start ? vs_hash : 0;
+    // bb-hud-native fail-safe: at most one cut attempt a frame from the markers (a frame has ~3
+    // Scaleform scenes; a failed attempt must not be retried on every later UI draw).
+    if (native && ui_draw && hud_start && scene.valid && ldr_target == color && active) {
+        if (native_cut_tried) {
+            ++g_native.retries_refused;
+            return;
+        }
+        native_cut_tried = true;
+    }
     switch (Vulkan::UiComposition::Choose(scaled || native_fg, ui_draw,
                                           scene.valid && ldr_target == color, active)) {
     case Vulkan::UiComposition::Background::None:

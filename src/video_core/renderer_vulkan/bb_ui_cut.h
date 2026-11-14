@@ -228,6 +228,7 @@ private:
     bool native_color_redirected = false; // this draw's colour went to native_layer
     bool native_cb0_layer = false;  // this draw's colour buffer 0 register is the HUD layer
     bool native_layer_drawn = false;      // native_layer got UI draws this frame
+    bool native_cut_tried = false;  // the markers started (or tried) this frame's cut
     bool native_layer_cleared = false, native_depth_cleared = false;
     bool last_layer_ok = false;    // the previous frame's layer composite ran
     bool layer_ok_frame = false;   // this frame's layer composite ran (AfterDraw)
