@@ -174,7 +174,7 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void MapMemory(uint64_t address, uint64_t size);
-	void UnmapMemory(uint64_t address, uint64_t size);
+	void UnmapMemory(uint64_t address, uint64_t size, bool into_reservation = false);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 	// KYTY_TEXTURE_OFFLOAD(_PROBE) (texture-offload.h): the guest bytes of clean sampled textures probed for touches, or

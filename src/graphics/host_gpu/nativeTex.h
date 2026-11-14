@@ -142,6 +142,9 @@ void Rehome(uint64_t addr, uint64_t size, uint64_t keep_serial);
 void BeforeGuestRead(uint64_t addr, uint64_t size);
 // GPU work wrote [addr, addr + size) (a buffer over it holds the bytes now): the pieces there dropped.
 void Forget(uint64_t addr, uint64_t size);
+// An unmap of guest memory (TextureCache::UnmapMemory). `into_reservation`: the span is wholly reserved and a map follows
+// at once (memory.cpp): the commit-declared (undefined) ranges there are kept, others dropped; else all are forgotten.
+void OnGpuUnmap(uint64_t addr, uint64_t size, bool into_reservation);
 // The exception filter's probe (any thread): a touch of an authoritative page. True: handled (the access goes again).
 [[nodiscard]] bool OnFault(uint64_t address, uint64_t rip, const void* native_context, bool write);
 // Render thread, once a flip: ring reclaim, spill policy, the 30 s log.

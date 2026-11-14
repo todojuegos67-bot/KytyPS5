@@ -292,14 +292,14 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing) {
+void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing, bool into_reservation) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
 	TextureOffload::OnHostAccess(vaddr, size, true, false);
-	const auto unmap = [this, vaddr, size, releasing] {
+	const auto unmap = [this, vaddr, size, releasing, into_reservation] {
 		// Released memory loses its host protection with the mapping: the watchers removed
 		// below need not restore it page run by page run first.
 		struct UnmappingRange {
@@ -340,7 +340,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 			m_buffer_cache.DeleteUnmappedBuffers(vaddr, size);
 			m_buffer_cache.SplitUnmappedBuffers(vaddr, size);
 		}
-		m_texture_cache.UnmapMemory(vaddr, size);
+		m_texture_cache.UnmapMemory(vaddr, size, into_reservation);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		const auto epoch = ++m_mapping_epoch;
