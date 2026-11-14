@@ -5799,6 +5799,9 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
     float startPx = f.SizeInPoints * dpi / 72f, minPx = Math.Max(7f, 10f * dpi / 96f);
     bool single = t.IndexOf('\n') < 0;
     bool fits = false, useTrack = false; Font use = null; float px = startPx;
+    string ck = t + "|" + f.FontFamily.Name + "|" + (int)f.Style + "|" + startPx + "|" + track + "|" + left + "|" + r.Width + "x" + r.Height;
+    float[] hit;
+    if (fitCache.TryGetValue(ck, out hit)) { use = Fnt(f, hit[0]); fits = hit[1] > 0f; useTrack = hit[2] > 0f; if (useTrack) track = (int)hit[3]; px = minPx - 1f; }
     for (; px >= minPx - 0.01f; px -= 0.5f) {
       Font ft = Fnt(f, px);
       int trk = track > 0 ? Math.Max(1, (int)Math.Round(track * px / startPx)) : 0;
@@ -5808,6 +5811,7 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
       if (sz.Width <= r.Width && sz.Height <= r.Height && lines <= 2) { use = ft; fits = true; break; }
     }
     if (use == null) use = Fnt(f, minPx);
+    if (!fitCache.ContainsKey(ck)) { if (fitCache.Count > 256) fitCache.Clear(); fitCache[ck] = new float[] { use.Size, fits ? 1f : 0f, useTrack ? 1f : 0f, track }; }
     if (!fits && draw && !warned) { warned = true; BbOLog.Write("TEXTO CORTADO: boton '" + t.Replace("\n", " ") + "' (" + r.Width + "x" + r.Height + " px)"); }
     if (!draw) return fits;
     if (useTrack) { DrawTracked(g, t, use, r, tc, sc, track); return fits; }
@@ -5818,12 +5822,16 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
     return fits;
   }
   bool warned = false;
-  Font fcache = null; Font fbase = null; float fpx = 0f;
-  Font Fnt(Font f, float px) {
+  // (bb-launcher-3) Ajuste cacheado por texto/letra/tamano; letras compartidas y acotadas (pasos de 0,5 px), nunca una nueva por pintado.
+  Dictionary<string, float[]> fitCache = new Dictionary<string, float[]>();
+  static Dictionary<string, Font> fonts = new Dictionary<string, Font>();
+  static Font Fnt(Font f, float px) {
     px = (float)Math.Round(px * 2f) / 2f;
-    if (fcache != null && ReferenceEquals(fbase, f) && fpx == px) return fcache;
-    Font n = new Font(f.FontFamily, px, f.Style, GraphicsUnit.Pixel);
-    fcache = n; fbase = f; fpx = px;
+    string k = f.FontFamily.Name + "|" + (int)f.Style + "|" + px;
+    Font n;
+    if (fonts.TryGetValue(k, out n)) return n;
+    n = new Font(f.FontFamily, px, f.Style, GraphicsUnit.Pixel);
+    fonts[k] = n;
     return n;
   }
   static int TrackedW(Graphics g, string s, Font f, int tracking) {
