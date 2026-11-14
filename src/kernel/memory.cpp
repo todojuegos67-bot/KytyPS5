@@ -187,12 +187,14 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 }
 
 // `releasing`: the range is unmapped or decommitted right after (GpuResourceManager::UnmapMemory).
-static void UnmapGpuRange(uint64_t vaddr, uint64_t size, bool releasing = false) {
+// `into_reservation`: the span is wholly reserved (nothing mapped) and a map follows at once (KYTY_NATIVE_TEX: the texture
+// ranges the engine's commit hook declared just before that map are kept).
+static void UnmapGpuRange(uint64_t vaddr, uint64_t size, bool releasing = false, bool into_reservation = false) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
 	const auto start = __rdtsc();
-	GetGpuResources().UnmapMemory(vaddr, size, releasing);
+	GetGpuResources().UnmapMemory(vaddr, size, releasing, into_reservation);
 	LiveCounters::Add(LiveCounters::GpuUnmapKt, (__rdtsc() - start) >> 10u);
 }
 
@@ -3283,7 +3285,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			UnmapGpuRange(in_addr, len, false, true);
 			residency_lock.lock();
 			consumed_range = reserved_ranges.front();
 			if (g_virtual_ranges->ConsumeReservedSpan(in_addr, len)) {
@@ -4058,7 +4060,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			UnmapGpuRange(in_addr, len, false, true);
 			residency_lock.lock();
 			consumed_range = reserved_ranges.front();
 			if (g_virtual_ranges->ConsumeReservedSpan(in_addr, len)) {
@@ -4087,7 +4089,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			UnmapGpuRange(in_addr, len, false, true);
 			residency_lock.lock();
 			consumed_range = reserved_ranges.front();
 			if (g_virtual_ranges->ConsumeReservedSpan(in_addr, len)) {

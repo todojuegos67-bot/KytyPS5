@@ -5843,11 +5843,15 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
-void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
+void TextureCache::UnmapMemory(uint64_t address, uint64_t size, bool into_reservation) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
-	NativeTex::Forget(address, size); // (released: nothing to write back)
+	// KYTY_NATIVE_TEX: a map into a wholly reserved span (sceKernelBatchMap / MapDirectMemory FIXED, memory.cpp) unmaps it
+	// first; nothing was mapped there, and the only ranges over it are the ones the engine's commit hook declared just
+	// before this map (ResizePages op 0 runs after the notification). Forgetting them here emptied the set: every load
+	// was then declined (field log 20261114-042602: commits 5212, "maps under ranges 0", declined 5379, routed 0).
+	NativeTex::OnGpuUnmap(address, size, into_reservation); // (released: nothing to write back)
 	uint32_t       slow_deleted = 0, slow_partial = 0;
 	uint64_t       slow_bytes   = 0, slow_largest = 0, slow_largest_address = 0;
 	struct Count {

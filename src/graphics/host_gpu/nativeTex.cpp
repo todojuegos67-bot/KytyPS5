@@ -109,6 +109,9 @@ struct State {
 	std::atomic<uint64_t> fallback_bytes[WhyCount] {};
 	std::atomic<uint64_t> snapshots {0}, snapshot_bytes {0}; // (reads left with the guest's bytes: MaterializeAny)
 	std::atomic<uint64_t> lost {0}, lost_bytes {0}, commits {0}, commit_bytes {0}, decommits {0}, declined {0}, declined_bytes {0}, mapped_under {0}, mapped_under_bytes {0};
+	std::atomic<uint64_t> kept_reserved {0}, kept_reserved_bytes {0}, dropped_reserved_bytes {0}; // (OnGpuUnmap)
+	std::atomic<uint64_t> route_ns {0}, flips {0}; // (CPU time of the routed loads' ring copies; Pump calls)
+	uint64_t log_route_ns = 0, log_flips = 0; // (at the last Log)
 	std::chrono::steady_clock::time_point last_log {};
 };
 
@@ -566,6 +569,24 @@ void Log(bool force) {
 	            static_cast<unsigned long long>(s.decommits.load()), static_cast<unsigned long long>(s.declined.load()),
 	            static_cast<double>(s.declined_bytes.load()) / MiB, static_cast<unsigned long long>(s.mapped_under.load()),
 	            static_cast<double>(s.mapped_under_bytes.load()) / MiB);
+	// The field summary: guest pages never written = routed bytes not (yet) written back to guest memory.
+	uint64_t written_back = 0;
+	for (uint32_t i = 0; i < WhyCount; i++) written_back += s.fallback_bytes[i].load();
+	const uint64_t routed = s.routed_bytes.load(), never = routed > written_back ? routed - written_back : 0;
+	const uint64_t ns = s.route_ns.load(), flips = s.flips.load();
+	const uint64_t dns = ns - s.log_route_ns, dflips = flips - s.log_flips;
+	s.log_route_ns = ns;
+	s.log_flips    = flips;
+	std::printf("EngineGpuNative: textures staged natively %llu (%.1f MiB), uploaded from the ring %llu (%.1f MiB); guest pages never "
+	            "written %.1f MiB (written back %.1f MiB); commit ranges kept across reserved-span maps %llu (%.1f MiB, %.1f MiB of "
+	            "loaded bytes dropped there); routing CPU %.3f ms per frame (last period, %llu frames)\n",
+	            static_cast<unsigned long long>(s.routed_ranges.load()), static_cast<double>(routed) / MiB,
+	            static_cast<unsigned long long>(s.uploads.load()), static_cast<double>(s.upload_bytes.load()) / MiB,
+	            static_cast<double>(never) / MiB, static_cast<double>(written_back) / MiB,
+	            static_cast<unsigned long long>(s.kept_reserved.load()), static_cast<double>(s.kept_reserved_bytes.load()) / MiB,
+	            static_cast<double>(s.dropped_reserved_bytes.load()) / MiB,
+	            dflips != 0 ? static_cast<double>(dns) / 1e6 / static_cast<double>(dflips) : 0.0, static_cast<unsigned long long>(dflips));
+	std::fflush(stdout);
 }
 
 // Loader::NativeTex stream callbacks (demonsSoulsNativeTexStream.h).
@@ -585,11 +606,8 @@ void StreamDecommit(uint64_t addr, uint64_t size) noexcept {
 } // namespace
 
 bool Enabled() noexcept {
-#if defined(_WIN32)
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_NATIVE_TEX");
-		return value != nullptr && std::strcmp(value, "1") == 0; // (as the streaming hooks' Install: both or neither)
-	}();
+#if defined(_WIN32) || defined(KYTY_NATIVE_TEX_LAB)
+	static const bool on = ::Loader::NativeTex::Requested(); // (as the hooks' Install: both or neither)
 	return on;
 #else
 	return false; // (the touch fallback needs the Windows probe handler)
@@ -642,9 +660,15 @@ void Init(GraphicContext& graphics, CommandScheduler& scheduler, const Host& hos
 		return OnTextureBytes(bytes.guest_dst, bytes.host_src, bytes.size);
 	});
 	::Loader::NativeTex::SetStreamConsumer(&StreamRelease, &StreamMove, &StreamCommit, &StreamDecommit);
-	std::printf("NativeTex: on (KYTY_NATIVE_TEX=1): texture loads staged in a %llu MiB %s ring and uploaded to their images; "
+	{
+		const char* mem = std::getenv("KYTY_NATIVE_MEM");
+		if (mem == nullptr || mem[0] != '3')
+			std::printf("EngineGpuNative: note: KYTY_NATIVE_MEM=3 is not set, so streamed mips (eboot+0x901459) still go through "
+			            "guest memory; only the texture-file and pool-layer loads are staged\n");
+	}
+	std::printf("NativeTex: on (%s): texture loads staged in a %llu MiB %s ring and uploaded to their images; "
 	            "their guest pages are left unwritten\n",
-	            static_cast<unsigned long long>(s.capacity >> 20u), usage == MemoryUsage::Stream ? "device-local host-visible (ReBAR)" : "host-visible");
+	            ::Loader::NativeTex::RequestedName(), static_cast<unsigned long long>(s.capacity >> 20u), usage == MemoryUsage::Stream ? "device-local host-visible (ReBAR)" : "host-visible");
 }
 
 bool OnTextureBytes(uint64_t guest_dst, const void* src, uint64_t size) {
@@ -660,8 +684,9 @@ bool OnTextureBytes(uint64_t guest_dst, const void* src, uint64_t size) {
 	const uint64_t full_dst = guest_dst, full_size = size;
 	guest_dst = whole_begin;
 	size      = whole_end - whole_begin;
-	uint32_t alloc  = 0;
-	uint64_t offset = 0;
+	uint32_t   alloc  = 0;
+	uint64_t   offset = 0;
+	const auto start  = std::chrono::steady_clock::now();
 	{
 		Lock lock(s.m);
 		if (!CoveredLocked(s, guest_dst, guest_dst + size)) {
@@ -706,6 +731,8 @@ bool OnTextureBytes(uint64_t guest_dst, const void* src, uint64_t size) {
 	t_suppress_host_write = false;
 	s.routed_bytes.fetch_add(size, std::memory_order_relaxed);
 	s.routed_ranges.fetch_add(1, std::memory_order_relaxed);
+	s.route_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
+	                     std::memory_order_relaxed);
 	return true;
 }
 
@@ -910,6 +937,43 @@ void Forget(uint64_t addr, uint64_t size) {
 	ReclaimLocked(s);
 }
 
+// TextureCache::UnmapMemory. `into_reservation`: a map into a wholly reserved span (memory.cpp: sceKernelBatchMap /
+// MapDirectMemory FIXED) unmaps it first. Nothing was mapped there: the only ranges over it that are still valid are the
+// undefined ones B's commit hook declared just before this map (ResizePages op 0 notifies, then maps). They stay (dropping
+// them emptied the set: field log 20261114-042602, commits 5212, maps under ranges 0, every load declined); any other
+// range there is dropped as before. Otherwise (a real unmap or release): everything over it is forgotten.
+void OnGpuUnmap(uint64_t addr, uint64_t size, bool into_reservation) {
+	auto& s = S();
+	if (!Active() || size == 0) return;
+	if (!into_reservation) {
+		Forget(addr, size);
+		return;
+	}
+	if (addr + size <= s.lo.load(std::memory_order_relaxed) || addr >= s.hi.load(std::memory_order_relaxed)) return;
+	Lock lock(s.m);
+	WaitInflight(s, lock, addr, addr + size);
+	std::vector<std::pair<uint64_t, uint64_t>> defined;
+	uint64_t                                   kept = 0;
+	for (auto it = FirstOverLocked(s, addr); it != s.entries.end() && it->first < addr + size; ++it) {
+		const uint64_t b = std::max(it->first, addr), e = std::min(it->second.end, addr + size);
+		if (it->second.undef) kept += e - b;
+		else defined.emplace_back(b, e);
+	}
+	Delta    d;
+	uint64_t dropped = 0;
+	for (const auto& [b, e]: defined) {
+		DropLocked(s, b, e, d);
+		dropped += e - b;
+	}
+	ApplyLocked(s, d);
+	ReclaimLocked(s);
+	if (kept != 0) {
+		s.kept_reserved.fetch_add(1, std::memory_order_relaxed);
+		s.kept_reserved_bytes.fetch_add(kept, std::memory_order_relaxed);
+	}
+	s.dropped_reserved_bytes.fetch_add(dropped, std::memory_order_relaxed);
+}
+
 bool OnFault(uint64_t address, uint64_t /*rip*/, const void* /*native_context*/, bool /*write*/) {
 	auto& s = S();
 	if (!Active() || address < PageDown(s.lo.load(std::memory_order_relaxed)) ||
@@ -940,6 +1004,7 @@ void Pump() {
 	{
 		Lock lock(s.m);
 		s.flip++;
+		s.flips.fetch_add(1, std::memory_order_relaxed);
 		if (s.host.tick_done != nullptr) {
 			for (auto& a: s.allocs)
 				if (a.free_tick != 0 && s.host.tick_done(a.free_tick)) a.free_tick = 0;

@@ -16,6 +16,7 @@
 //   Free 0xaa3430          0xaa34bf FindPages(this, ptr) -> r12 = the run; 0xaa353d ReleasePages 0x801a10(this, run)
 //   PageAllocationInfo     VA [+0x60], size [+0x58] (FindPages 0x801b80 compares against them)
 #include "loader/demonsSoulsNativeTexStream.h"
+#include "loader/demonsSoulsNativeTex.h"
 
 #include "common/abi.h"
 #include "common/virtualMemory.h"
@@ -305,8 +306,7 @@ void ReportThread() {
 
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
-	const char* v = std::getenv("KYTY_NATIVE_TEX");
-	if (v == nullptr || std::strcmp(v, "1") != 0) return;
+	if (!::Loader::NativeTex::Requested()) return;
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin" ||
 	    program->mapped_size > CaveOffset || program->base_vaddr > UINT64_MAX - CaveOffset - CaveSize)
 		return;

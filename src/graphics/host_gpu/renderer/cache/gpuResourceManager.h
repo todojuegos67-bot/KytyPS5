@@ -58,7 +58,7 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	// `releasing`: the caller unmaps or decommits the range right after (munmap, free,
 	// memory pool decommit), not a range about to receive a mapping.
-	void               UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing = false);
+	void               UnmapMemory(uint64_t vaddr, uint64_t size, bool releasing = false, bool into_reservation = false);
 	void               PrepareBda();
 	void BeginAliasWrite() noexcept;
 	void EndAliasWrite() noexcept;

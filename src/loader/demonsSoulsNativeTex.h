@@ -22,10 +22,27 @@
 // block -> its staging buffer) instead of heap block -> guest texture memory -> upload.
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <initializer_list>
 
 namespace Loader {
 struct Program;
 namespace NativeTex {
+
+// KYTY_NATIVE_TEX=1 or KYTY_ENGINE_GPU_NATIVE=1 (both default off): the engine's texture memory (VirtualMemoryGPU runs, the
+// texture loads and streamed mips the hooks see) is staged on the GPU and its guest pages are left unwritten.
+inline bool Requested() noexcept {
+	for (const char* name: {"KYTY_ENGINE_GPU_NATIVE", "KYTY_NATIVE_TEX"}) {
+		const char* v = std::getenv(name);
+		if (v != nullptr && std::strcmp(v, "1") == 0) return true;
+	}
+	return false;
+}
+inline const char* RequestedName() noexcept {
+	const char* v = std::getenv("KYTY_ENGINE_GPU_NATIVE");
+	return v != nullptr && std::strcmp(v, "1") == 0 ? "KYTY_ENGINE_GPU_NATIVE=1" : "KYTY_NATIVE_TEX=1";
+}
 
 enum class Site : uint32_t {
 	TextureFile = 0, // 0x8fed17
