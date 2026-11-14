@@ -71,9 +71,11 @@ struct RigidRec {
     u64 prev = 0;
     u64 key = 0; // the ring object
     u64 stamp = 0;
+    u64 size = 0; // the slot buffer's size ([obj+0x2c]: descriptor +0x14)
 };
 std::mutex g_rmx;
 std::map<u64, RigidRec> g_rigid;
+std::atomic<u64> g_dm_accept{0}, g_dm_reject{0};
 std::atomic<u64> g_dm_override{0}, g_dm_same{0}, g_dm_single{0};
 std::atomic<u64> g_dm_calls{0}, g_dm_rigid{0}, g_dm_skinned{0}, g_dm_palette{0};
 std::atomic<u32> g_hook_dm{0}, g_hook_cam{0};
@@ -90,6 +92,11 @@ struct CamRec {
 std::mutex g_cmx;
 std::array<CamRec, 8> g_cam{};
 u64 g_cam_seq = 0;
+std::atomic<u64> g_frame_seq{0}; // render frames (the SSAO camera site runs once a frame)
+struct RingUpd {
+    u64 last = 0, before = 0;
+};
+std::unordered_map<u64, RingUpd> g_ring_upd; // under g_rmx
 std::atomic<u64> g_cam_calls{0};
 u32 g_cam_layout_hits[2]{}; // row-major / transposed matches (GPU thread)
 std::array<u32, 216> g_delta_n{};
@@ -223,12 +230,11 @@ void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance) {
     // GX constant slot 5 / 6 ([[sink+8]]+0x6a8 / +0x6b0; flushed to state +0xc148+slot*8 at
     // 0x21a04e0). The shader's V# is the object's V# at +0x18 (bb_native_mv.cpp, 1.09
     // 0x2168a20). +0x30 binds [sink+0x1c8] instead when it is set and [sink+0x108] == 1.
-    u64 cur_obj = slot(idx);
+    const u64 cur_obj = slot(idx);
     const u64 prev_obj = slot(pidx);
-    if (rd64(sink + 0x1c8) != 0 && rd32(sink + 0x108) == 1) {
+    const bool overridden = rd64(sink + 0x1c8) != 0 && rd32(sink + 0x108) == 1;
+    if (overridden)
         g_dm_override.fetch_add(1, std::memory_order_relaxed);
-        cur_obj = rd64(sink + 0x1c8);
-    }
     if (cur_obj == 0 || prev_obj == 0)
         return;
     // GX buffer object: descriptor at +0x18 whose +8 is the GPU address (+0x14 size): the slot
@@ -243,8 +249,49 @@ void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance) {
     g_dm_rigid.fetch_add(1, std::memory_order_relaxed);
     if (cur == prev)
         g_dm_same.fetch_add(1, std::memory_order_relaxed);
+    // The previous slot holds last frame's matrices only when SkinRingUpdate 0x21c8c50 wrote the
+    // ring in this render frame and in the one before (consecutive): otherwise the "previous"
+    // slot is older (object not updated every frame: static props, 30 Hz logic) and the record
+    // would give a static object a vector. Rejected (and any earlier record of the slot
+    // dropped): 1-slot rings, cur == prev, the [sink+0x1c8] override (+0x30 binds another
+    // buffer), rings not updated in two consecutive frames.
+    const u64 F = g_frame_seq.load(std::memory_order_relaxed);
+    bool consecutive = false;
+    {
+        std::scoped_lock lk{g_rmx};
+        if (const auto it = g_ring_upd.find(ring); it != g_ring_upd.end()) {
+            consecutive = it->second.last + 1 >= F && it->second.last == it->second.before + 1;
+        }
+        if (overridden || cur == prev || rd32(ring + 0x9c) < 2 || !consecutive) {
+            g_rigid.erase(cur);
+            g_dm_reject.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // Size of both slots: a V# inside a neighbouring buffer (slots are allocated next to each
+        // other) must never resolve to this record.
+        const u64 size = *reinterpret_cast<const u32*>(cur_obj + 0x2c);
+        if (size == 0 || size != *reinterpret_cast<const u32*>(prev_obj + 0x2c)) {
+            g_rigid.erase(cur);
+            g_dm_reject.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        g_rigid[cur] = {prev, Mix(ring, bone), g_stamp.load(std::memory_order_relaxed), size};
+    }
+    g_dm_accept.fetch_add(1, std::memory_order_relaxed);
+}
+
+void GuestRingUpdate(u64 ring) {
+    if (ring == 0)
+        return;
+    const u64 F = g_frame_seq.load(std::memory_order_relaxed);
     std::scoped_lock lk{g_rmx};
-    g_rigid[cur] = {prev, Mix(ring, bone), g_stamp.load(std::memory_order_relaxed)};
+    RingUpd& u = g_ring_upd[ring];
+    if (u.last != F) {
+        u.before = u.last;
+        u.last = F;
+    }
+    if (g_ring_upd.size() > 65536)
+        g_ring_upd.clear();
 }
 
 void GuestCamera(const u64* regs, u64 rbp, const u8* xmm) {
@@ -263,6 +310,7 @@ void GuestCamera(const u64* regs, u64 rbp, const u8* xmm) {
     r.prev_valid = *reinterpret_cast<const u8*>(obj + 0x240) != 0;
     std::scoped_lock lk{g_cmx};
     r.seq = ++g_cam_seq;
+    g_frame_seq.store(r.seq, std::memory_order_relaxed);
     g_cam[r.seq % g_cam.size()] = r;
 }
 
@@ -351,7 +399,7 @@ bool LookupRigid(u64 addr, u64& prev_addr, u64& offset, u64& key) {
     if (it == g_rigid.begin())
         return false;
     --it;
-    if (addr - it->first >= kRigidMaxOffset)
+    if (addr - it->first >= std::min(kRigidMaxOffset, it->second.size))
         return false;
     // Only records of the last few frames: an older slot address may have been freed and reused
     // by another object, whose "previous" would then be unrelated memory.
@@ -503,14 +551,15 @@ void OnFrame() {
                     "{:.1f}, BonePalette {:.1f}; {} slot records | lookups {:.1f}/frame: engine "
                     "previous world {:.1f}%, no copy {:.1f}/frame (hook {}) | sink+0x1c8 "
                     "override {:.1f}/frame, previous slot == current {:.1f}/frame, ring of 1 slot "
-                    "{:.1f}/frame",
+                    "{:.1f}/frame | records accepted {:.1f}/frame, rejected {:.1f}/frame",
                     double(g_dm_calls.exchange(0)) / f, double(g_dm_rigid.exchange(0)) / f,
                     double(g_dm_skinned.exchange(0)) / f, double(g_dm_palette.exchange(0)) / f,
                     rigid_addrs, double(S(Stat::RigidLookups)) / f,
                     Pct(S(Stat::RigidFound), S(Stat::RigidLookups)),
                     double(S(Stat::RigidNoSnap)) / f, g_hook_dm.load() ? "on" : "off",
                     double(g_dm_override.exchange(0)) / f, double(g_dm_same.exchange(0)) / f,
-                    double(g_dm_single.exchange(0)) / f));
+                    double(g_dm_single.exchange(0)) / f, double(g_dm_accept.exchange(0)) / f,
+                    double(g_dm_reject.exchange(0)) / f));
     const u64 cl = S(Stat::CamEngLookups);
     Log(fmt::format("[mv-engine-cam2] engine camera {:.1f}/frame (hook {}) | blocks {:.1f}/frame: "
                     "engine previous used {:.1f}%, fallback: no CPU copy {:.1f}%, not the engine "

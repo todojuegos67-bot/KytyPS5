@@ -54,6 +54,7 @@ bool Enabled(); // BB_MV_ENGINE=1
 void GuestPaletteBegin(u64 model, u64 sink, u64 mesh, u64 bones, u32 consumer);
 void GuestPaletteSet(u64 palette, u32 consumer);
 void SetHooks(bool installed, const char* detail);
+void GuestRingUpdate(u64 ring); // SkinRingUpdate 0x21c8c50 entry
 void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance);
 // regs: the cave's register block; rbp the guest frame; xmm the saved xmm0..7 (16 B each).
 void GuestCamera(const u64* regs, u64 rbp, const u8* xmm);

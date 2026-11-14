@@ -78,6 +78,8 @@ void PS4_SYSV_ABI HookDrawMesh(const u64* regs) {
 }
 
 void PS4_SYSV_ABI HookSkinRing(const u64* regs) {
+    if (MvEngine::Enabled())
+        MvEngine::GuestRingUpdate(regs[5]);
     NativeMv::GuestSkinRing(regs[5], regs[6]);
 }
 
