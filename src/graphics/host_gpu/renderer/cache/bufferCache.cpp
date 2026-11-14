@@ -15,6 +15,7 @@
 #include "readback-queue.h"
 #include "sync-stats.h"
 #include "fresh-memory.h"
+#include "native-guestmem.h"
 #include "lean-hostmem.h"
 #include "texture-offload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -2465,7 +2466,8 @@ void BufferCache::FlushPrologueCopies(vk::CommandBuffer command) {
 // An async upload of `size` backing-view bytes from `source` into staging `target` (guest `vaddr`): the fresh memory
 // in it (src/local/fresh-memory.h, bytes nobody wrote) filled with zeros here instead of read by the worker, whose read
 // made those pages resident.
-static void PushUploadCopy(uint8_t* target, const uint8_t* source, uint64_t size, uint64_t vaddr) {
+static void PushUploadCopy(uint8_t* target, const uint8_t* source, uint64_t size, uint64_t vaddr,
+                           NativeGuestMem::Site site = NativeGuestMem::Sites) {
 	thread_local std::vector<std::tuple<uint64_t, uint64_t, bool>> runs;
 	runs.clear();
 	bool any_fresh = false;
@@ -2479,6 +2481,7 @@ static void PushUploadCopy(uint8_t* target, const uint8_t* source, uint64_t size
 			if (fresh) {
 				std::memset(target + offset, 0, bytes);
 				FreshMemory::Get()->zero_upload_bytes.fetch_add(bytes, std::memory_order_relaxed);
+				NativeGuestMem::Count(site, bytes, 0);
 			} else {
 				AsyncUpload::Get().Push(target + offset, source + offset, bytes, vaddr + offset);
 			}
@@ -2489,7 +2492,10 @@ static void PushUploadCopy(uint8_t* target, const uint8_t* source, uint64_t size
 }
 
 static void ReadUploadSource(uint8_t* destination, uint64_t address, uint64_t size) {
-	if (Libs::LibKernel::Memory::TryReadBackingToHost(address, destination, size)) return;
+	// (KYTY_NATIVE_GUESTMEM=1: never-written granules of 64 KiB reads given as zeros, not read: not paged in.)
+	if (NativeGuestMem::Read(address, destination, size, NativeGuestMem::BufferRead,
+	                         [](uint64_t at, void* to, uint64_t n) { return Libs::LibKernel::Memory::TryReadBackingToHost(at, to, n); }))
+		return;
 #if defined(_WIN32)
 	if (const auto missed = Common::GuardedCopy(destination, reinterpret_cast<const void*>(address), size); missed != 0) {
 		std::memset(destination + (size - missed), 0, missed);
@@ -2810,7 +2816,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 	const char* prt_failure = "not-attempted";
 	ApplyImageProtects();
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	if (staging == nullptr || (!NativeGuestMem::Read(vaddr, staging, size, NativeGuestMem::ImageRead,
+	                                                 [](uint64_t at, void* to, uint64_t n) {
+		                                                 return Libs::LibKernel::Memory::TryReadBacking(at, to, n);
+	                                                 }) &&
 	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size, &prt_failure))) {
 		EXIT("BufferCache: failed to read mapped guest image backing: "
 		     "address=0x%016" PRIx64 " size=0x%016" PRIx64
@@ -2870,7 +2879,10 @@ bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint6
 	if (SparseUploadPieces() && Libs::LibKernel::Memory::TryGetSparseBackingPieces(vaddr, size, m_backing_pieces)) {
 		uint64_t offset = 0;
 		for (const auto& [piece, bytes]: m_backing_pieces) {
-			AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
+			// (KYTY_NATIVE_GUESTMEM=1: the mapped pieces' never-written granules as zeros, as PushUploadCopy does.)
+			if (piece != nullptr && NativeGuestMem::Enabled())
+				PushUploadCopy(staging + offset, piece, bytes, vaddr + offset, NativeGuestMem::SparseUpload);
+			else AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
 			offset += bytes;
 		}
 		LiveCounters::Add(LiveCounters::SparseUploadPieces, m_backing_pieces.size());
@@ -2963,7 +2975,9 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 			    Libs::LibKernel::Memory::TryGetSparseBackingPieces(piece.vaddr, piece.size, m_backing_pieces)) {
 				uint64_t offset = 0;
 				for (const auto& [source, bytes]: m_backing_pieces) {
-					AsyncUpload::Get().Push(target + offset, source, bytes, piece.vaddr + offset);
+					if (source != nullptr && NativeGuestMem::Enabled())
+						PushUploadCopy(target + offset, source, bytes, piece.vaddr + offset, NativeGuestMem::SparseUpload);
+					else AsyncUpload::Get().Push(target + offset, source, bytes, piece.vaddr + offset);
 					offset += bytes;
 				}
 				LiveCounters::Add(LiveCounters::SparseUploadPieces, m_backing_pieces.size());

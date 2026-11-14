@@ -29,6 +29,7 @@
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
+#include "local/fresh-memory.h"
 
 #include <algorithm>
 #include <array>
@@ -319,8 +320,9 @@ struct Owner {
 	// Since the last report (events, pages of protection changes, write-back bytes).
 	uint64_t events[EventKinds] {};
 	uint64_t protect_pages = 0, writeback_bytes = 0;
-	// Last resident sample.
-	uint64_t resident = 0, sampled = 0;
+	// Last resident sample. Of `resident`: through the backing alias only (the game's view not resident: in RAM because the
+	// emulator touched it there), and in a granule nothing ever wrote (fresh memory: zeros a native port would not hold).
+	uint64_t resident = 0, sampled = 0, alias_only = 0, never_written = 0;
 };
 
 struct Census {
@@ -513,25 +515,32 @@ void Drain(Census& c) {
 // One page in each 64 KiB of each run, through the game's view and the backing alias (Windows; Linux: the view).
 void SampleResidency(Census& c) {
 	constexpr uint64_t Step = 0x10000, MaxSamples = uint64_t {1} << 20u;
-	for (auto& owner: c.owners) owner.resident = owner.sampled = 0;
+	for (auto& owner: c.owners) owner.resident = owner.sampled = owner.alias_only = owner.never_written = 0;
 	uint64_t total = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries;
 	std::vector<uint32_t>                         owners;
+	std::vector<uint8_t>                          fresh; // per sample: 1 = its alias granule never written
 	std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
+	const auto* fresh_state = FreshMemory::Get();
 	const auto flush = [&] {
 		if (entries.empty()) return;
 		if (K32QueryWorkingSetEx(GetCurrentProcess(), entries.data(), static_cast<DWORD>(entries.size() * sizeof(entries[0]))) != 0) {
 			for (size_t i = 0; i + 1 < entries.size(); i += 2) {
-				const bool resident = (entries[i].VirtualAttributes.Flags & 1u) != 0 ||
+				const bool view     = (entries[i].VirtualAttributes.Flags & 1u) != 0;
+				const bool alias    = entries[i + 1].VirtualAddress != entries[i].VirtualAddress &&
 				                      (entries[i + 1].VirtualAttributes.Flags & 1u) != 0;
+				const bool resident = view || alias;
 				auto& owner = c.owners[owners[i / 2]];
 				owner.sampled += Step;
 				if (resident) owner.resident += Step;
+				if (alias && !view) owner.alias_only += Step;
+				if (resident && fresh[i / 2] != 0) owner.never_written += Step;
 			}
 		}
 		entries.clear();
 		owners.clear();
+		fresh.clear();
 		SwitchToThread();
 	};
 	for (const auto& run: c.runs) {
@@ -553,6 +562,12 @@ void SampleResidency(Census& c) {
 			entries.push_back(view);
 			entries.push_back(other);
 			owners.push_back(run.owner);
+			bool never = false;
+			if (fresh_state != nullptr && alias != 0) {
+				const uint64_t granule = FreshMemory::GranuleOf(*fresh_state, alias);
+				never                  = granule != UINT64_MAX && !FreshMemory::IsWritten(*fresh_state, granule);
+			}
+			fresh.push_back(never ? 1 : 0);
 			if (entries.size() >= 2048) flush();
 		}
 	}
@@ -602,9 +617,11 @@ void Report(Census& c, double seconds, bool residency) {
 		const bool  rt = o.name == "RTSharedAllocator" || o.name == "RTPersistAllocator";
 		if (shown >= 12 && !rt && !o.upload_heap && i != 0) continue;
 		shown++;
-		char resident[64] = "";
+		char resident[128] = "";
 		if (residency && o.sampled != 0)
-			std::snprintf(resident, sizeof(resident), " resident %llu MiB", static_cast<unsigned long long>(o.resident / MiB));
+			std::snprintf(resident, sizeof(resident), " resident %llu MiB (alias only %llu, never written %llu)",
+			              static_cast<unsigned long long>(o.resident / MiB), static_cast<unsigned long long>(o.alias_only / MiB),
+			              static_cast<unsigned long long>(o.never_written / MiB));
 		std::printf("[native-mem]   %-22s #%-3u %-3s%s held %5llu MiB in %4llu runs%s: per s fw %llu fwr %llu fr %llu prot %llu "
 		            "(%llu MiB) wb %llu MiB\n",
 		            i == 0 ? "(no engine run)" : o.name.c_str(), o.slot, i == 0 ? "-" : Types[std::min<uint32_t>(o.type, 2)],
@@ -613,6 +630,23 @@ void Report(Census& c, double seconds, bool residency) {
 		            per(o.events[FaultWindow]), per(o.events[FaultWrite]), per(o.events[FaultRead]), per(o.events[Protect]),
 		            static_cast<unsigned long long>((o.protect_pages << 12u) / MiB),
 		            static_cast<unsigned long long>(o.writeback_bytes / MiB));
+	}
+	if (residency) {
+		// Every allocator's runs (not only the rows above), by the engine's EMemoryType.
+		uint64_t sum[3][4] {}; // [?, cpu, gpu][held, resident, alias only, never written]
+		for (uint32_t i = 1; i < c.owners.size(); i++) {
+			const auto& o = c.owners[i];
+			auto&       t = sum[std::min<uint32_t>(o.type, 2)];
+			t[0] += o.held, t[1] += o.resident, t[2] += o.alias_only, t[3] += o.never_written;
+		}
+		std::printf("[native-mem]   all engine runs (MiB held / resident / of it alias only / never written): cpu %llu / %llu / "
+		            "%llu / %llu, gpu %llu / %llu / %llu / %llu, other %llu / %llu / %llu / %llu\n",
+		            static_cast<unsigned long long>(sum[1][0] / MiB), static_cast<unsigned long long>(sum[1][1] / MiB),
+		            static_cast<unsigned long long>(sum[1][2] / MiB), static_cast<unsigned long long>(sum[1][3] / MiB),
+		            static_cast<unsigned long long>(sum[2][0] / MiB), static_cast<unsigned long long>(sum[2][1] / MiB),
+		            static_cast<unsigned long long>(sum[2][2] / MiB), static_cast<unsigned long long>(sum[2][3] / MiB),
+		            static_cast<unsigned long long>(sum[0][0] / MiB), static_cast<unsigned long long>(sum[0][1] / MiB),
+		            static_cast<unsigned long long>(sum[0][2] / MiB), static_cast<unsigned long long>(sum[0][3] / MiB));
 	}
 	if (g_level.load(std::memory_order_relaxed) >= 3) {
 		namespace U = Libs::Graphics::UploadHeap;

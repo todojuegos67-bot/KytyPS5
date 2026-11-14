@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "fresh-memory.h"
+#include "native-guestmem.h"
 #include "guest-lazy-commit.h"
 #include "texture-offload.h"
 #include "loader/demonsSoulsNativeMem.h"
@@ -2646,14 +2647,16 @@ void DirtyRowBands(const std::vector<std::pair<uint64_t, uint64_t>>& dirty, uint
 
 [[nodiscard]] uint64_t HashGuestRange(uint64_t vaddr, uint64_t size) {
 	if (const auto* data = LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
-		return XXH3_64bits(data, static_cast<size_t>(size));
+		// (KYTY_NATIVE_GUESTMEM=1: never-written granules hashed as their zeros, not read: not paged in.)
+		return NativeGuestMem::HashBacking(data, size, NativeGuestMem::HashImage);
 	}
 	// (A copy of the texture's guest bytes, up to hundreds of MiB, kept by the thread: KYTY_SOFT_RELEASE frees it idle.)
 	thread_local SoftRelease::Scratch scratch("texture hash copy");
 	const auto                        hold  = scratch.Use();
 	auto&                             bytes = scratch.bytes;
 	bytes.resize(size);
-	if (!LibKernel::Memory::TryReadBacking(vaddr, bytes.data(), size) &&
+	if (!NativeGuestMem::Read(vaddr, bytes.data(), size, NativeGuestMem::HashImage,
+	                          [](uint64_t at, void* to, uint64_t n) { return LibKernel::Memory::TryReadBacking(at, to, n); }) &&
 	    !LibKernel::Memory::TryReadPrtBacking(vaddr, bytes.data(), size)) {
 		// Unreadable (unbacked sparse pages): equal to itself until the pages become readable.
 		return 0x5ca1ab1e0ddba11ull;
@@ -5595,6 +5598,7 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 		            static_cast<unsigned long long>(fresh->watched_bytes.load() >> 20u),
 		            static_cast<unsigned long long>(fresh->faults.load() >> 20u),
 		            static_cast<unsigned long long>(fresh->marked.load() >> 20u));
+	NativeGuestMem::Report();
 	std::fflush(stdout);
 }
 
