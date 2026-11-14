@@ -100,6 +100,66 @@ void PS4_SYSV_ABI HookPalSet1(const u64* regs) {
     MvEngine::GuestPaletteSet(regs[9], 1);
 }
 
+// bb-mv-engine engine transforms: DrawMesh entry (rdi model, rsi sink, rdx mesh, rcx material,
+// r8 instance) and the SSAO reprojection site (rbx object, rbp frame, xmm4..7 current view).
+bool g_dm_native = false; // BB_NATIVE_MV_DRAWMESH=1 wants the DrawMesh entry too
+void PS4_SYSV_ABI HookDrawMeshEngine(const u64* regs) {
+    MvEngine::GuestDrawMesh(regs[5], regs[6], regs[7], regs[8], regs[4]);
+    if (g_dm_native)
+        NativeMv::GuestDrawMesh(regs[5], regs[7], regs[4]);
+}
+void PS4_SYSV_ABI HookCamera(const u64* regs, u64 rbp, const u8* xmm) {
+    MvEngine::GuestCamera(regs, rbp, xmm);
+}
+
+// DrawMesh body (0x21d0640, size < DrawMeshSize): the instructions GuestDrawMesh mirrors.
+struct BodyCheck {
+    const char* what;
+    std::vector<u8> bytes;
+    u32 count;
+};
+const std::vector<BodyCheck>& DrawMeshChecks() {
+    static const std::vector<BodyCheck> c = {
+        // mov rcx,[rcx+0x30]; mov rsi,[rax+0xb0]; cmp byte [rsi+0x200],0; movsxd rsi,[rax+0x98]
+        {"rigid current slot",
+         {0x48, 0x8b, 0x49, 0x30, 0x48, 0x8b, 0xb0, 0xb0, 0x00, 0x00, 0x00, 0x80, 0xbe,
+          0x00, 0x02, 0x00, 0x00, 0x00, 0x48, 0x63, 0xb0, 0x98, 0x00, 0x00, 0x00},
+         2},
+        // mov rax,[rax+0x38]; mov rcx,[rbp-0x78]; mov rdx,[rcx+8]; movzx ecx,word [rbx+2];
+        // mov edi,[rdx+0x98]; lea esi,[rdi-1]
+        {"rigid previous slot",
+         {0x48, 0x8b, 0x40, 0x38, 0x48, 0x8b, 0x4d, 0x88, 0x48, 0x8b, 0x51, 0x08, 0x0f,
+          0xb7, 0x4b, 0x02, 0x8b, 0xba, 0x98, 0x00, 0x00, 0x00, 0x8d, 0x77, 0xff},
+         2},
+        // mov rax,[rax]; lea rdi,[rsi+rsi*4]; movzx esi,word [rdx+2]; shl rsi,3;
+        // add rsi,[rax+rdi*8+8]
+        {"slot table",
+         {0x48, 0x8b, 0x00, 0x48, 0x8d, 0x3c, 0xb6, 0x0f, 0xb7, 0x72,
+          0x02, 0x48, 0xc1, 0xe6, 0x03, 0x48, 0x03, 0x74, 0xf8, 0x08},
+         2},
+        {"material +0x2c", {0x41, 0x80, 0x7e, 0x2c, 0x00}, 1},
+        {"sink +0x171", {0x41, 0xf6, 0x84, 0x24, 0x71, 0x01, 0x00, 0x00, 0x01}, 1},
+        {"material +0x1d", {0x41, 0x80, 0x7e, 0x1d, 0x00}, 1},
+        {"ring +0xa4", {0x80, 0xb8, 0xa4, 0x00, 0x00, 0x00, 0x00}, 1},
+    };
+    return c;
+}
+
+// SSAO reprojection (0xe67073): 4 x vmovaps [r12+0x10..0x40] (relocated, 28 bytes); mov byte
+// [rbx+0x240],1; cmp byte [rip+flag],0; jne; the stores of the current projection
+// ([rbp-0x1f0..-0x220] -> [rbx+0x200..0x230]) and view (xmm4..7 -> [rbx+0x1c0..0x1f0]).
+constexpr int SigCamera[] = {
+    0xc4, 0xc1, 0x78, 0x29, 0x44, 0x24, 0x10, 0xc4, 0xc1, 0x78, 0x29, 0x4c, 0x24, 0x20, 0xc4, 0xc1,
+    0x78, 0x29, 0x54, 0x24, 0x30, 0xc4, 0xc1, 0x78, 0x29, 0x5c, 0x24, 0x40, 0xc6, 0x83, 0x40, 0x02,
+    0x00, 0x00, 0x01, 0x80, 0x3d, W,    W,    W,    W,    0x00, 0x75, 0x60, 0xc5, 0xf8, 0x28, 0x85,
+    0x10, 0xfe, 0xff, 0xff, 0xc5, 0xf8, 0x29, 0x83, 0x00, 0x02, 0x00, 0x00, 0xc5, 0xf8, 0x28, 0x85,
+    0x00, 0xfe, 0xff, 0xff, 0xc5, 0xf8, 0x29, 0x83, 0x10, 0x02, 0x00, 0x00, 0xc5, 0xf8, 0x28, 0x85,
+    0xf0, 0xfd, 0xff, 0xff, 0xc5, 0xf8, 0x29, 0x83, 0x20, 0x02, 0x00, 0x00, 0xc5, 0xf8, 0x28, 0x85,
+    0xe0, 0xfd, 0xff, 0xff, 0xc5, 0xf8, 0x29, 0x83, 0x30, 0x02, 0x00, 0x00, 0xc5, 0xf8, 0x29, 0xa3,
+    0xc0, 0x01, 0x00, 0x00, 0xc5, 0xf8, 0x29, 0xab, 0xd0, 0x01, 0x00, 0x00, 0xc5, 0xf8, 0x29, 0xb3,
+    0xe0, 0x01, 0x00, 0x00, 0xc5, 0xf8, 0x29, 0xbb, 0xf0, 0x01, 0x00, 0x00};
+constexpr u32 CameraRelocLen = 28;
+
 // BonePalette entry: PrologueA + mov rbx,rcx; mov r12,rdx; mov r14,rsi; mov r15,rdi;
 // cmp byte [r15+0x200],0 (two functions: 1.09 0x21d1080 / 0x21d1650).
 constexpr u8 SigPalEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41,
@@ -160,7 +220,8 @@ struct Emitter {
 
 // Saves the caller-saved registers, calls host(regs) (sysv), restores them, runs the relocated
 // prologue and jumps back after it.
-std::vector<u8> BuildCave(u64 host, const u8* prologue, u32 len, u64 back) {
+std::vector<u8> BuildCave(u64 host, const u8* prologue, u32 len, u64 back,
+                          bool pass_frame = false) {
     Emitter e;
     e.Put({0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x53});
     e.Put({0x48, 0x89, 0xe3});                         // mov rbx, rsp
@@ -174,6 +235,10 @@ std::vector<u8> BuildCave(u64 host, const u8* prologue, u32 len, u64 back) {
         }
     }
     e.Put({0x48, 0x89, 0xdf}); // mov rdi, rbx
+    if (pass_frame) {
+        e.Put({0x48, 0x89, 0xee}); // mov rsi, rbp (the guest frame)
+        e.Put({0x48, 0x89, 0xe2}); // mov rdx, rsp (saved xmm0..7)
+    }
     e.Put({0x48, 0xb8});       // mov rax, host
     e.Put64(host);
     e.Put({0xff, 0xd0}); // call rax
@@ -208,7 +273,8 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
     }
     const u8* img = reinterpret_cast<const u8*>(eboot_base);
     const u64 code = std::min<u64>(image_size, 0x4000000);
-    u8* cave = static_cast<u8*>(AllocExec(4096));
+    constexpr size_t kCaveBytes = 8192;
+    u8* cave = static_cast<u8*>(AllocExec(kCaveBytes));
     if (cave == nullptr) {
         NativeMv::SetHooksInstalled(false, "no executable memory for the caves");
         return;
@@ -254,7 +320,7 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
                 if (in.size() != 3) ok = false;
             }
         }
-        if (ok && (next - cave) + 8 * 0x100 <= 4096) {
+        if (ok && (next - cave) + 8 * 0x100 <= ptrdiff_t(kCaveBytes)) {
             for (u32 f = 0; f < 2; ++f) {
                 u8* at = reinterpret_cast<u8*>(eboot_base + entries[f]);
                 u8* p = place(BuildCave(reinterpret_cast<u64>(f == 0 ? &HookPalBegin0
@@ -279,6 +345,51 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         }
     }
 
+    // bb-mv-engine engine transforms: DrawMesh rigid ring branch and the engine camera. The
+    // relocated bytes and every instruction mirrored on the host are compared first.
+    bool dm_engine = false;
+    std::optional<u64> dm_off; // DrawMesh, found before its entry is patched
+    if (MvEngine::Enabled()) {
+        std::string ed;
+        u32 dm_ok = 0, cam_ok = 0;
+        const auto dm = Find(img, code, SigDrawMesh, std::size(SigDrawMesh));
+        std::string bad;
+        if (dm) {
+            for (const auto& c : DrawMeshChecks()) {
+                const auto hits =
+                    FindAll(img + *dm, DrawMeshSize, c.bytes.data(), u32(c.bytes.size()));
+                if (hits.size() != c.count) {
+                    bad += fmt::format(" {} x{} (want {})", c.what, hits.size(), c.count);
+                }
+            }
+        }
+        if (dm && bad.empty() && (next - cave) + 0x200 <= ptrdiff_t(kCaveBytes)) {
+            u8* at = reinterpret_cast<u8*>(eboot_base + *dm);
+            u8* p =
+                place(BuildCave(reinterpret_cast<u64>(&HookDrawMeshEngine), at, DrawMeshPrologue,
+                                reinterpret_cast<u64>(at + DrawMeshPrologue)));
+            Detour(at, p);
+            dm_engine = true;
+            dm_off = dm;
+            dm_ok = 1;
+            ed += fmt::format("DrawMesh eboot+0x{:x} (7 body checks ok)", *dm);
+        } else {
+            ed += dm ? fmt::format("DrawMesh body differs:{}", bad) : "DrawMesh not found";
+        }
+        const auto cs = Find(img, code, SigCamera, std::size(SigCamera));
+        if (cs && (next - cave) + 0x200 <= ptrdiff_t(kCaveBytes)) {
+            u8* at = reinterpret_cast<u8*>(eboot_base + *cs);
+            u8* p = place(BuildCave(reinterpret_cast<u64>(&HookCamera), at, CameraRelocLen,
+                                    reinterpret_cast<u64>(at + CameraRelocLen), true));
+            Detour(at, p);
+            cam_ok = 1;
+            ed += fmt::format(", SSAO reprojection eboot+0x{:x}", *cs);
+        } else {
+            ed += ", SSAO reprojection site not found (unique)";
+        }
+        MvEngine::SetEngineHooks(dm_ok, cam_ok, ed.c_str());
+    }
+
     // FLVER DrawMesh and its two GX draw calls: per-mesh CPU work on the guest thread, not used
     // by the velocity buffer (bb-clean-velocity: only the skin ring). BB_NATIVE_MV_DRAWMESH=1.
     const char* dm_env = std::getenv("BB_NATIVE_MV_DRAWMESH");
@@ -287,9 +398,9 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         NativeMv::SetHooksInstalled(any, detail.c_str());
         return;
     }
-    const auto dm = Find(img, code, SigDrawMesh, std::size(SigDrawMesh));
-    const auto calls = dm ? Find(img + *dm, DrawMeshSize, SigDrawCalls, std::size(SigDrawCalls))
-                          : std::nullopt;
+    const auto dm = dm_engine ? dm_off : Find(img, code, SigDrawMesh, std::size(SigDrawMesh));
+    const auto calls =
+        dm ? Find(img + *dm, DrawMeshSize, SigDrawCalls, std::size(SigDrawCalls)) : std::nullopt;
     if (dm && calls) {
         const u64 site = *dm + *calls;
         const auto target = [&](u32 off) {
@@ -305,9 +416,11 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
             u8* at_wa = reinterpret_cast<u8*>(eboot_base + wa);
             u8* at_wb = reinterpret_cast<u8*>(eboot_base + wb);
             const u32 len_b = sizeof(PrologueB) + 1; // sub rsp, imm8
-            u8* p1 = place(BuildCave(reinterpret_cast<u64>(&HookDrawMesh), at_dm,
-                                     DrawMeshPrologue,
-                                     reinterpret_cast<u64>(at_dm + DrawMeshPrologue)));
+            u8* p1 =
+                dm_engine
+                    ? nullptr
+                    : place(BuildCave(reinterpret_cast<u64>(&HookDrawMesh), at_dm, DrawMeshPrologue,
+                                      reinterpret_cast<u64>(at_dm + DrawMeshPrologue)));
             u8* p2 = place(BuildCave(reinterpret_cast<u64>(&HookEmit), at_wa, sizeof(PrologueA),
                                      reinterpret_cast<u64>(at_wa + sizeof(PrologueA))));
             u8* p3 = place(BuildCave(reinterpret_cast<u64>(&HookEmit), at_wb, len_b,
@@ -315,7 +428,11 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
             NativeMv::SetDrawMeshRange(eboot_base + *dm, eboot_base + *dm + DrawMeshSize);
             Detour(at_wa, p2);
             Detour(at_wb, p3);
-            Detour(at_dm, p1);
+            if (dm_engine) {
+                g_dm_native = true; // the engine detour calls NativeMv too
+            } else {
+                Detour(at_dm, p1);
+            }
             any = true;
             detail += fmt::format(", DrawMesh eboot+0x{:x}, GX draw eboot+0x{:x} / +0x{:x}, "
                                   "draw calls at eboot+0x{:x}",

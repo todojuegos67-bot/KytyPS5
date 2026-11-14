@@ -826,6 +826,9 @@ struct PendingCopy {
     u64 src_off, dst_off, size;
 };
 std::vector<PendingCopy> g_pending;
+// bb-mv-engine: camera block (address, size) -> last frame's block chosen by the engine camera
+// (addr 0: none), this frame.
+std::unordered_map<u64, SnapBuf> g_cam_engine;
 
 void FlushVelocityCopies(vk::CommandBuffer cmd) {
     if (g_pending.empty()) return;
@@ -1080,6 +1083,24 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             BB::MvEngine::CountMiss(why);
             if (role == VelRole::Palette) BB::MvEngine::Count(BB::MvEngine::Stat::FallbackOld);
         }
+        if (role == VelRole::Current && eng && !blend && size >= 16) {
+            // bb-mv-engine: a world transform the rigid ring branch of DrawMesh bound as the
+            // current slot: the engine's own previous slot (vtable+0x38), nothing guessed.
+            BB::MvEngine::Count(BB::MvEngine::Stat::RigidLookups);
+            u64 paddr = 0, poff = 0, rkey = 0;
+            if (BB::MvEngine::LookupRigid(addr, paddr, poff, rkey)) {
+                SnapBuf ps{0, 0, 0, 0};
+                if (VelSnap(buffer_cache, scheduler, paddr, size, ps)) {
+                    BB::MvEngine::Count(BB::MvEngine::Stat::RigidFound);
+                    engine_draw = true;
+                    prev[h] = ps;
+                    use[h] = true;
+                    obj_moved = true;
+                    continue;
+                }
+                BB::MvEngine::Count(BB::MvEngine::Stat::RigidNoSnap);
+            }
+        }
         if (role == VelRole::Current) {
             if ((g.native2 & (kN2Buffers | kN2Measure)) != 0 && mesh != 0 && size >= 16 &&
                 size <= kObjBufMax) {
@@ -1141,6 +1162,42 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 std::array<float, 216> c;
                 if (CameraCpuCopy(memory, buffer_cache, addr, c)) g.cam_cpu_cur[ord] = c;
             }
+            if (BB::MvEngine::Enabled() && !blend && (ord & 0x80000000u) == 0) {
+                // bb-mv-engine (engine camera, authoritative): the block whose view is the
+                // engine's current view takes last frame's block holding the engine's previous
+                // view (SSAO reprojection's own previous camera). Once per block and frame.
+                auto [ce, fresh] = g_cam_engine.try_emplace(akey, SnapBuf{0, 0, 0, 0});
+                if (fresh) {
+                    BB::MvEngine::Count(BB::MvEngine::Stat::CamEngLookups);
+                    const auto c = g.cam_cpu_cur.find(ord);
+                    float pv[12];
+                    if (c == g.cam_cpu_cur.end()) {
+                        BB::MvEngine::Count(BB::MvEngine::Stat::CamEngNoCpu);
+                    } else if (const u32 r = BB::MvEngine::EngineCameraPrev(c->second.data(), pv);
+                               r == 0) {
+                        BB::MvEngine::Count(BB::MvEngine::Stat::CamEngNoMatch);
+                    } else if (r == 2) {
+                        BB::MvEngine::Count(BB::MvEngine::Stat::CamEngNoPrev);
+                    } else {
+                        bool got = false;
+                        for (const auto& [pord, pb] : g.cam_cpu_prev) {
+                            if ((pord & 0x80000000u) != 0 ||
+                                !BB::MvEngine::ViewEqual(pb.data() + 8, pv)) {
+                                continue;
+                            }
+                            const auto ps = g.vel_id_prev.find(Mix(0x63616d65ull, pord));
+                            if (ps == g.vel_id_prev.end() || ps->second.addr == 0) continue;
+                            ce->second = ps->second;
+                            BB::MvEngine::BlockDelta(c->second.data(), pb.data());
+                            got = true;
+                            break;
+                        }
+                        BB::MvEngine::Count(got ? BB::MvEngine::Stat::CamEngUsed
+                                                : BB::MvEngine::Stat::CamEngNoBlock);
+                    }
+                }
+                if (ce->second.addr != 0) found = &ce->second;
+            }
             if (BB::MvEngine::Enabled() && !blend) {
                 // bb-mv-engine: the block of this pass (depth target + viewport) and its order
                 // inside the pass; order 0 is taken without the similarity test (large camera
@@ -1152,7 +1209,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                     BB::MvEngine::Count(BB::MvEngine::Stat::CamPass);
                     if (have_cur) g.vel_id_cur.try_emplace(ckey, cur);
                     if (const auto it = g.vel_id_prev.find(ckey);
-                        it != g.vel_id_prev.end() && it->second.addr != 0) {
+                        found == nullptr && it != g.vel_id_prev.end() && it->second.addr != 0) {
                         found = &it->second;
                         BB::MvEngine::Count(BB::MvEngine::Stat::CamPassPrev);
                     }
@@ -1901,6 +1958,7 @@ void OnFlip() {
     g.cam_ord.clear();
     g.cam_ord_blend.clear();
     g.cam_checked.clear();
+    g_cam_engine.clear();
     g.cam_cpu_cur.clear();
     g.pal_cpu_cur.clear();
     g.pal_ord_of.clear();

@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -15,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "core/memory.h"
@@ -63,6 +65,35 @@ std::array<u64, size_t(Stat::Count)> g_st{};
 std::array<u64, size_t(Miss::Count)> g_miss{};
 u64 g_frames = 0, g_passes_sum = 0, g_sinks_sum = 0;
 Clock::time_point g_t0 = Clock::now();
+
+// Rigid ring records (DrawMesh, guest threads): bound current slot -> previous slot.
+struct RigidRec {
+    u64 prev = 0;
+    u64 key = 0; // the ring object
+    u64 stamp = 0;
+};
+std::mutex g_rmx;
+std::map<u64, RigidRec> g_rigid;
+std::atomic<u64> g_dm_calls{0}, g_dm_rigid{0}, g_dm_skinned{0}, g_dm_palette{0};
+std::atomic<u32> g_hook_dm{0}, g_hook_cam{0};
+std::string g_eng_detail;
+constexpr u64 kRigidMaxOffset = 0x100;
+
+// Engine camera records (SSAO reprojection site, render thread).
+struct CamRec {
+    std::array<float, 16> cur_view{}, cur_proj{}, prev_view{}, prev_proj{};
+    bool prev_valid = false;
+    u64 seq = 0;
+};
+std::mutex g_cmx;
+std::array<CamRec, 8> g_cam{};
+u64 g_cam_seq = 0;
+std::atomic<u64> g_cam_calls{0};
+u32 g_cam_layout_hits[2]{}; // row-major / transposed matches (GPU thread)
+std::array<u32, 216> g_delta_n{};
+std::array<float, 216> g_delta_v{};
+u64 g_delta_blocks = 0;
+bool g_dumped_nomatch = false;
 
 u64 Mix(u64 a, u64 b) {
     u64 h = a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2));
@@ -128,6 +159,165 @@ void GuestPaletteSet(u64 palette, u32 consumer) {
     s.r[s.next % kHist] = {h, key, t_cur.sink, g_stamp.load(std::memory_order_relaxed)};
     ++s.next;
     g_recorded.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SetEngineHooks(u32 drawmesh, u32 camera, const char* detail) {
+    g_hook_dm = drawmesh;
+    g_hook_cam = camera;
+    {
+        std::scoped_lock lk{g_mx};
+        g_eng_detail = detail != nullptr ? detail : "";
+    }
+    Log(fmt::format("[mv-engine] engine-transform hooks: DrawMesh rigid ring {}, engine camera "
+                    "{}: {}",
+                    drawmesh != 0 ? "in place" : "NOT installed",
+                    camera != 0 ? "in place" : "NOT installed", detail != nullptr ? detail : ""));
+}
+
+// Mirrors DrawMesh 0x21d0640 up to the sink calls (only the reads the game itself makes on the
+// branch it takes): the rigid ring branch's current / previous slot pointers.
+void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance) {
+    (void)model;
+    g_dm_calls.fetch_add(1, std::memory_order_relaxed);
+    if (instance == 0 || sink == 0 || mesh == 0 || material == 0)
+        return;
+    const auto rd8 = [](u64 a) { return *reinterpret_cast<const u8*>(a); };
+    const auto rd64 = [](u64 a) { return *reinterpret_cast<const u64*>(a); };
+    const auto rd32 = [](u64 a) { return *reinterpret_cast<const s32*>(a); };
+    const u64 ring = rd64(instance + 8);
+    if (ring == 0) {
+        g_dm_palette.fetch_add(1, std::memory_order_relaxed); // BonePalette branch (0x21d083a)
+        return;
+    }
+    bool rigid;
+    if (rd8(material + 0x2c) != 0) {
+        rigid = false; // 0x21d0700 -> skinned branch 0x21d0759
+    } else if ((rd8(sink + 0x171) & 1) == 0 || rd8(material + 0x1d) == 0) {
+        rigid = true; // 0x21d0809
+    } else {
+        rigid = rd8(ring + 0xa4) == 0; // 0x21d0749: 0 -> 0x21d0ff9 (rigid)
+    }
+    if (!rigid) {
+        g_dm_skinned.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const u64 rmodel = rd64(ring + 0xb0);
+    const bool full = rd8(rmodel + 0x200) != 0;
+    const s32 idx = rd32(ring + 0x98);
+    s32 pidx = idx - 1;
+    if (idx < 1)
+        pidx += rd32(ring + 0x9c);
+    const u64 bone = *reinterpret_cast<const u16*>(mesh + 2);
+    const auto slot = [&](s32 i) -> u64 {
+        if (full)
+            return rd64(rd64(ring + 8) + u64(s64(i)) * 8);
+        return rd64(rd64(rd64(ring) + u64(s64(i)) * 0x28 + 8) + bone * 8);
+    };
+    const u64 cur = slot(idx), prev = slot(pidx);
+    if (cur == 0 || prev == 0)
+        return;
+    g_dm_rigid.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lk{g_rmx};
+    g_rigid[cur] = {prev, Mix(ring, bone), g_stamp.load(std::memory_order_relaxed)};
+}
+
+void GuestCamera(const u64* regs, u64 rbp, const u8* xmm) {
+    const u64 obj = regs[0]; // rbx
+    if (obj == 0 || rbp == 0 || xmm == nullptr)
+        return;
+    g_cam_calls.fetch_add(1, std::memory_order_relaxed);
+    CamRec r;
+    std::memcpy(r.cur_view.data(), xmm + 0x40, 64); // xmm4..7 -> [obj+0x1c0] (0xe670df)
+    for (u32 i = 0; i < 4; ++i) {                   // [rbp-0x1f0-i*0x10] -> [obj+0x200+i*0x10]
+        std::memcpy(r.cur_proj.data() + i * 4,
+                    reinterpret_cast<const void*>(rbp - 0x1f0 - u64(i) * 0x10), 16);
+    }
+    std::memcpy(r.prev_view.data(), reinterpret_cast<const void*>(obj + 0x1c0), 64);
+    std::memcpy(r.prev_proj.data(), reinterpret_cast<const void*>(obj + 0x200), 64);
+    r.prev_valid = *reinterpret_cast<const u8*>(obj + 0x240) != 0;
+    std::scoped_lock lk{g_cmx};
+    r.seq = ++g_cam_seq;
+    g_cam[r.seq % g_cam.size()] = r;
+}
+
+bool ViewEqual(const float* a, const float* b) {
+    for (u32 i = 0; i < 12; ++i) {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i]))
+            return false;
+        if (std::fabs(a[i] - b[i]) > 1e-4f * std::max(1.0f, std::fabs(a[i])))
+            return false;
+    }
+    return true;
+}
+
+u32 EngineCameraPrev(const float* block, float prev_view[12]) {
+    std::array<CamRec, 8> recs;
+    {
+        std::scoped_lock lk{g_cmx};
+        recs = g_cam;
+    }
+    std::sort(recs.begin(), recs.end(),
+              [](const CamRec& a, const CamRec& b) { return a.seq > b.seq; });
+    const float* v = block + 8;
+    for (const CamRec& r : recs) {
+        if (r.seq == 0)
+            break;
+        for (u32 layout = 0; layout < 2; ++layout) {
+            float c[12], p[12];
+            for (u32 row = 0; row < 3; ++row) {
+                for (u32 col = 0; col < 4; ++col) {
+                    const u32 src = layout == 0 ? row * 4 + col : col * 4 + row;
+                    c[row * 4 + col] = r.cur_view[src];
+                    p[row * 4 + col] = r.prev_view[src];
+                }
+            }
+            if (!ViewEqual(v, c))
+                continue;
+            ++g_cam_layout_hits[layout];
+            if (!r.prev_valid)
+                return 2;
+            std::memcpy(prev_view, p, sizeof(p));
+            return 1;
+        }
+    }
+    if (!g_dumped_nomatch && recs[0].seq != 0) {
+        g_dumped_nomatch = true;
+        std::string a, b;
+        for (u32 i = 0; i < 12; ++i)
+            a += fmt::format(" {:.5g}", v[i]);
+        for (u32 i = 0; i < 16; ++i)
+            b += fmt::format(" {:.5g}", recs[0].cur_view[i]);
+        Log(fmt::format("[mv-engine-cam] first unmatched block view (floats 8..19){} | engine "
+                        "view 4x4{}",
+                        a, b));
+    }
+    return 0;
+}
+
+void BlockDelta(const float* cur, const float* prev) {
+    ++g_delta_blocks;
+    for (u32 i = 0; i < 216; ++i) {
+        if ((i >= 8 && i < 20) || (i >= 52 && i < 68))
+            continue;
+        if (std::memcmp(cur + i, prev + i, 4) != 0) {
+            ++g_delta_n[i];
+            g_delta_v[i] = cur[i];
+        }
+    }
+}
+
+bool LookupRigid(u64 addr, u64& prev_addr, u64& offset, u64& key) {
+    std::scoped_lock lk{g_rmx};
+    auto it = g_rigid.upper_bound(addr);
+    if (it == g_rigid.begin())
+        return false;
+    --it;
+    if (addr - it->first >= kRigidMaxOffset)
+        return false;
+    offset = addr - it->first;
+    prev_addr = it->second.prev + offset;
+    key = it->second.key;
+    return true;
 }
 
 bool LookupPalette(Core::MemoryManager* memory, bool gpu_modified, u64 addr, ObjId& out,
@@ -226,6 +416,18 @@ void OnFrame() {
         }
         addrs = g_pal.size();
     }
+    size_t rigid_addrs = 0;
+    {
+        std::scoped_lock lk{g_rmx};
+        for (auto it = g_rigid.begin(); it != g_rigid.end();) {
+            if (it->second.stamp + kKeepFrames < stamp) {
+                it = g_rigid.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        rigid_addrs = g_rigid.size();
+    }
     const auto S = [](Stat s) { return g_st[size_t(s)]; };
     const auto M = [](Miss m) { return g_miss[size_t(m)]; };
     const double f = double(std::max<u64>(1, g_frames));
@@ -253,6 +455,44 @@ void OnFrame() {
                     Pct(S(Stat::CamPassPrev), S(Stat::CamPass)),
                     Pct(S(Stat::CamFallback), S(Stat::CamLookups)), double(g_passes_sum) / f,
                     double(g_sinks_sum) / f));
+    // bb-mv-engine (engine transforms): coverage of the rigid ring records and the engine camera.
+    Log(fmt::format("[mv-engine-rigid] DrawMesh {:.1f}/frame: rigid ring {:.1f}, skinned ring "
+                    "{:.1f}, BonePalette {:.1f}; {} slot records | lookups {:.1f}/frame: engine "
+                    "previous world {:.1f}%, no copy {:.1f}/frame (hook {})",
+                    double(g_dm_calls.exchange(0)) / f, double(g_dm_rigid.exchange(0)) / f,
+                    double(g_dm_skinned.exchange(0)) / f, double(g_dm_palette.exchange(0)) / f,
+                    rigid_addrs, double(S(Stat::RigidLookups)) / f,
+                    Pct(S(Stat::RigidFound), S(Stat::RigidLookups)),
+                    double(S(Stat::RigidNoSnap)) / f, g_hook_dm.load() ? "on" : "off"));
+    const u64 cl = S(Stat::CamEngLookups);
+    Log(fmt::format("[mv-engine-cam2] engine camera {:.1f}/frame (hook {}) | blocks {:.1f}/frame: "
+                    "engine previous used {:.1f}%, fallback: no CPU copy {:.1f}%, not the engine "
+                    "view {:.1f}%, no engine previous {:.1f}%, previous view not among last "
+                    "frame's blocks {:.1f}% | view layout row {} / transposed {}",
+                    double(g_cam_calls.exchange(0)) / f, g_hook_cam.load() ? "on" : "off",
+                    double(cl) / f, Pct(S(Stat::CamEngUsed), cl), Pct(S(Stat::CamEngNoCpu), cl),
+                    Pct(S(Stat::CamEngNoMatch), cl), Pct(S(Stat::CamEngNoPrev), cl),
+                    Pct(S(Stat::CamEngNoBlock), cl), g_cam_layout_hits[0], g_cam_layout_hits[1]));
+    g_cam_layout_hits[0] = g_cam_layout_hits[1] = 0;
+    if (g_delta_blocks != 0) {
+        // Floats (besides view / projection) that change between the engine-paired blocks: time /
+        // wind / jitter constants the vertex animation can read (reproduced by last frame's block).
+        std::vector<u32> idx;
+        for (u32 i = 0; i < 216; ++i) {
+            if (g_delta_n[i] != 0)
+                idx.push_back(i);
+        }
+        std::sort(idx.begin(), idx.end(), [](u32 a, u32 b) { return g_delta_n[a] > g_delta_n[b]; });
+        std::string t;
+        for (size_t k = 0; k < std::min<size_t>(idx.size(), 12); ++k) {
+            t += fmt::format(" d[{}]={:.5g}({:.0f}%)", idx[k], g_delta_v[idx[k]],
+                             Pct(g_delta_n[idx[k]], g_delta_blocks));
+        }
+        Log(fmt::format("[mv-engine-wind] {} paired blocks, {} other floats change:{}",
+                        g_delta_blocks, idx.size(), t));
+        g_delta_n.fill(0);
+        g_delta_blocks = 0;
+    }
     g_st.fill(0);
     g_miss.fill(0);
     g_frames = g_passes_sum = g_sinks_sum = 0;
