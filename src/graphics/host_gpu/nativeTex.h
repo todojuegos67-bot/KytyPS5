@@ -16,6 +16,8 @@
 //    over part of it, an image over it that cannot be uploaded from the ring (format/layout the native path does not take,
 //    a subresource only partly in the ring), the owning image going away (collector, unmap of a view), another image over
 //    the bytes another image owns.
+//  - A load's first and last partial pages are written into guest memory (they may share a page with other data);
+//    only its whole pages become authoritative.
 //  - Bounded memory: the ring is fixed. Bytes no image took stay in the ring until the ring passes 75% full; then the
 //    oldest are written to guest memory (the old behavior for those textures) until it is below 50%. A load that finds no
 //    room is refused (the caller stores to guest memory, as without this). The range metadata is capped (MaxEntries).
@@ -39,7 +41,9 @@ namespace NativeTex {
 [[nodiscard]] bool Enabled() noexcept;
 
 // The game would store `size` bytes from `src` (host-readable) at guest `guest_dst`. True: taken; the caller must NOT
-// write guest memory. False: the caller stores them as usual (disabled, not ready yet, too small, ring full...).
+// write guest memory. False: the caller stores them as usual (disabled, not ready yet, too small, ring full, or not
+// texture memory B's VirtualMemoryGPU hooks declared: OnTextureCommit - the GPU-context heap's textures, whose frees
+// are not hooked, stay in guest memory).
 [[nodiscard]] bool OnTextureBytes(uint64_t guest_dst, const void* src, uint64_t size);
 
 // The game would move `size` bytes from guest `src` to guest `dst` (memmove semantics, the source keeps its bytes).
@@ -51,12 +55,21 @@ namespace NativeTex {
 // The game released the texture memory [addr, addr + size): its authoritative bytes are dropped (nothing written back).
 void OnTextureRelease(uint64_t addr, uint64_t size);
 
+// The game committed [addr, addr + size) for texture data (B's VirtualMemoryGPU hook): until something writes it, its
+// content is undefined, so an image over it uploads zeros there instead of reading (and committing) guest memory.
+void OnTextureCommit(uint64_t addr, uint64_t size);
+// Pages of a texture's run given back inside the run (a streamed-out mip, B's ResizePages op 2): the texture keeps the
+// memory, its content is undefined again (as OnTextureCommit). Unlike a release, no other allocator gets these pages.
+void OnTextureDecommit(uint64_t addr, uint64_t size);
+
 // ---- Emulator side (the texture cache) -------------------------------------------------------------------------------
 
 // A range whose bytes are not in guest memory.
 struct Piece {
 	uint64_t begin = 0, end = 0;
 	bool     owned = false;  // the bytes are in the image `image` (serial `serial`), else in the ring at `ring_offset`
+	bool     undefined = false; // (not owned) no bytes at all: committed texture memory nothing wrote yet (its content is
+	                            // undefined: an upload may take zeros, a touch takes the guest's bytes as they are)
 	uint64_t ring_offset = 0;
 	uint64_t image = 0, serial = 0; // (owned: ImageId as (generation << 32) | index)
 	uint64_t src = 0;               // (owned: the guest address in that image whose bytes `begin` holds; == begin unless
@@ -67,10 +80,12 @@ struct Piece {
 
 // What the texture cache provides (render thread functions; set once in its constructor).
 struct Host {
-	// Runs fn(arg) on the render thread and returns when done (inline on it).
-	void (*render_sync)(void (*fn)(void*), void* arg) = nullptr;
-	// Whether the calling thread may wait for the render thread.
-	bool (*can_wait)() = nullptr;
+	// Runs fn(arg) where it may record GPU work and wait for the GPU, and returns when done: inline on the render thread;
+	// on a speculation thread inline on the normal path (its recorder set aside and its speculation refused, as
+	// GpuResourceManager::HandleFault's read path does); from a game thread through the render thread (SendCommandSync).
+	// False (fn not run): a thread that can do none of these (the async upload worker, a deferred operation, a thread
+	// holding the texture cache's lock off the render thread).
+	bool (*run_render)(void (*fn)(void*), void* arg) = nullptr;
 	// The page manager's read watchers (no access) of [vaddr, vaddr + size).
 	void (*watch)(uint64_t vaddr, uint64_t size, bool on) = nullptr;
 	// Render thread: the bytes of the owned pieces written into guest memory (from their images); returns those done.
@@ -96,8 +111,9 @@ void Init(GraphicContext& graphics, CommandScheduler& scheduler, const Host& hos
 [[nodiscard]] bool Overlaps(uint64_t addr, uint64_t size);
 // The pieces intersecting [addr, addr + size), clipped to it, by address.
 [[nodiscard]] std::vector<Piece> Collect(uint64_t addr, uint64_t size);
-// The ring pieces inside [begin, end) now hold their bytes in image `image`/`serial` (uploaded by work at `tick`).
-void MarkOwned(uint64_t begin, uint64_t end, uint64_t image, uint64_t serial, uint64_t tick);
+// The ring/undefined pieces `uploaded` (as Collect returned them, clipped to the image) now hold their bytes in image
+// `image`/`serial` (uploaded by work at `tick`). A range replaced since Collect (a newer load) is left as it is.
+void MarkOwned(const std::vector<Piece>& uploaded, uint64_t image, uint64_t serial, uint64_t tick);
 // Render thread: every piece intersecting [addr, addr + size) (whole pieces; `serial` != 0: only those owned by that
 // image) written into guest memory and dropped; their pages tracked normally again. `why` counts the fallback.
 void Materialize(uint64_t addr, uint64_t size, const char* why, uint64_t serial = 0);
@@ -109,9 +125,9 @@ void BeforeHostWrite(uint64_t addr, uint64_t size);
 void ImageGone(uint64_t image, uint64_t serial);
 // Render thread: the pieces over [addr, addr + size) held by images other than `keep_serial`, back into the ring.
 void Rehome(uint64_t addr, uint64_t size, uint64_t keep_serial);
-// Render thread, before the texture cache's lock: the host-write notifications of moves (images over the destination
-// refreshed), queued by game threads that may not take the texture cache's lock.
-void DrainNotifications();
+// Before the emulator reads guest memory [addr, addr + size) (the backing-read functions of kernel/memory.cpp, the
+// buffer cache's synchronization): authoritative bytes there written into guest memory first. Any thread.
+void BeforeGuestRead(uint64_t addr, uint64_t size);
 // GPU work wrote [addr, addr + size) (a buffer over it holds the bytes now): the pieces there dropped.
 void Forget(uint64_t addr, uint64_t size);
 // The exception filter's probe (any thread): a touch of an authoritative page. True: handled (the access goes again).

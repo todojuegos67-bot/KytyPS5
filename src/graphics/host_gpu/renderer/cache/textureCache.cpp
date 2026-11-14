@@ -2464,10 +2464,10 @@ struct TextureCache::NativeTexHost {
 			if (index == downloads.size()) {
 				auto plan = image != nullptr ? cache.BuildDownload(*image) : DownloadPlan {};
 				if (!plan.valid || plan.depth_target) {
-					NativeTex::NoteFallback("lost", piece.end - piece.begin);
-					std::printf("NativeTex: LOST 0x%llx..0x%llx (its image gone or not downloadable)\n",
-					            static_cast<unsigned long long>(piece.begin), static_cast<unsigned long long>(piece.end));
-					continue;
+					// (Owned ranges exist only for images whose download is supported, and leave them before the image goes
+					// (ImageGone): a broken invariant - stop rather than leave stale bytes.)
+					EXIT("NativeTex: 0x%llx..0x%llx held by an image that is gone or cannot be downloaded\n",
+					     static_cast<unsigned long long>(piece.begin), static_cast<unsigned long long>(piece.end));
 				}
 				downloads.emplace_back(image, std::move(plan));
 				offsets.push_back(total);
@@ -2533,18 +2533,35 @@ struct TextureCache::NativeTexHost {
 void TextureCache::InitNativeTex() {
 	g_native_cache = this;
 	NativeTex::Host host {};
-	host.render_sync = +[](void (*fn)(void*), void* arg) {
+	host.run_render = +[](void (*fn)(void*), void* arg) {
+		auto* cache = g_native_cache;
+		// Neither inside a deferred operation (it runs inside a wait) nor in the async upload worker (the render thread
+		// waits for it).
+		if (AsyncUpload::t_worker || CommandScheduler::InDeferredOperation()) return false;
+		if (Spec::t_state != nullptr || CommandScheduler::ThreadRecorder() != nullptr) {
+			// A speculation's thread: its translation refused (redone in order), the write-back made here on the normal
+			// path - its recorder and speculation state set aside - as GpuResourceManager::HandleFault's read path does.
+			Spec::Refuse("native-tex bytes");
+			struct NormalPath {
+				Spec::State*                state    = std::exchange(Spec::t_state, nullptr);
+				CommandScheduler::Recorder* recorder = CommandScheduler::ThreadRecorder();
+				NormalPath() { CommandScheduler::SetThreadRecorder(nullptr); }
+				~NormalPath() {
+					Spec::t_state = state;
+					CommandScheduler::SetThreadRecorder(recorder);
+				}
+			} normal_path;
+			fn(arg);
+			return true;
+		}
 		if (GuestGpu::IsGpuThread()) {
 			fn(arg);
-			return;
+			return true;
 		}
-		g_native_cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
-	};
-	// As the texture offload's restores: not the upload worker, deferred GPU work or a speculation's recorder.
-	host.can_wait = +[] {
-		if (AsyncUpload::t_worker || CommandScheduler::InDeferredOperation() || CommandScheduler::ThreadRecorder() != nullptr)
-			return false;
-		return GuestGpu::IsGpuThread() || LibKernel::PthreadSelfOrNull() != nullptr;
+		// Another thread holding the texture cache's lock would deadlock the render thread.
+		if (cache->m_lock.OwnedByCurrentThread()) return false;
+		cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
+		return true;
 	};
 	host.watch = +[](uint64_t vaddr, uint64_t size, bool on) {
 		if (on) g_native_cache->m_page_manager.UpdateReadWatchers<true>(vaddr, size);
@@ -2580,11 +2597,14 @@ void TextureCache::NativeTexPrepare(ImageId id) {
 	          binding != BindingType::DepthTarget && !info.IsVolume() && !image.depth_id &&
 	          info.metadata.compression == VideoOutCompression::Uncompressed && info.samples == 1 &&
 	          image.backing.samples == 1 && image.backing.image != nullptr && base % 256 == 0 && SafeToDownload(image);
-	std::vector<std::pair<uint64_t, uint64_t>> ring, own;
+	// (ring: ranges whose bytes are in the ring; zero: committed texture memory nothing wrote: zeros are uploaded there.
+	// `ring` covers both for the coverage rules below.)
+	std::vector<std::pair<uint64_t, uint64_t>> ring, own, zero;
 	for (const auto& p: pieces) {
 		if (p.owned && p.serial != image.serial) ok = false; // (another image's bytes the ring had no room for)
 		if (p.owned) Image::AddRange(own, p.begin, p.end);
 		else Image::AddRange(ring, p.begin, p.end);
+		if (p.undefined) Image::AddRange(zero, p.begin, p.end);
 	}
 	if (ok) {
 		const auto download = BuildDownload(image); // (a later fallback must be able to get the bytes back)
@@ -2616,18 +2636,46 @@ void TextureCache::NativeTexPrepare(ImageId id) {
 		std::vector<std::pair<uint64_t, uint64_t>> dirty;
 		if (image.IsPartiallyCpuDirty()) dirty = image.CpuDirtyRanges();
 		else dirty.emplace_back(base, info.data.End());
+		// A subresource is current when all of it is this image's own bytes; else it is uploaded when the ring has bytes of
+		// it or it is CPU-dirty, from the ring where the ring has them and from guest memory elsewhere (bytes that never
+		// were authoritative: a load's partial edge pages, data written by the CPU), unless some of it is held by this
+		// image (then neither source is complete: fallback).
 		for (size_t i = 0; i < plan->tiles.size() && ok; i++) {
 			const auto& tile = plan->tiles[i];
 			const auto  b = base + tile.tiled_offset, e = b + tile.tiled_size;
 			if (plan->regions[i].bufferOffset < tile.linear_offset) ok = false;
-			const bool in_ring = covers(ring, b, e);
-			if (!in_ring && intersects(ring, b, e)) ok = false; // (a subresource partly in the ring)
-			if (!in_ring && !covers(own, b, e) && intersects(dirty, b, e)) ok = false; // (needs guest bytes)
-			if (in_ring) {
-				selected.push_back(i);
-				lo = std::min(lo, b);
-				hi = std::max(hi, e);
+			if (covers(own, b, e)) continue;
+			const bool wanted = intersects(ring, b, e) || intersects(dirty, b, e);
+			if (!wanted) continue;
+			if (intersects(own, b, e)) {
+				ok = false;
+				break;
 			}
+			selected.push_back(i);
+			lo = std::min(lo, b);
+			hi = std::max(hi, e);
+		}
+	}
+	// The guest-memory parts of the selected subresources (outside the ring), read now: before anything is recorded.
+	std::vector<std::pair<uint64_t, uint64_t>> gaps;
+	std::unique_ptr<Buffer>                    guest_bytes;
+	if (ok && !selected.empty()) {
+		for (const auto index: selected) {
+			const auto b = base + plan->tiles[index].tiled_offset, e = b + plan->tiles[index].tiled_size;
+			std::vector<std::pair<uint64_t, uint64_t>> part {{b, e}};
+			for (const auto& [rb, re]: ring) Image::SubtractRange(part, rb, re);
+			for (const auto& [gb, ge]: part) Image::AddRange(gaps, gb, ge);
+		}
+		uint64_t total = 0;
+		for (const auto& [gb, ge]: gaps) total += ge - gb;
+		if (total != 0) {
+			guest_bytes = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0, AllFlags, total);
+			uint64_t at = 0;
+			for (const auto& [gb, ge]: gaps) {
+				if (!LibKernel::Memory::TryReadMappedOrZero(gb, guest_bytes->Mapped().data() + at, ge - gb)) ok = false;
+				at += ge - gb;
+			}
+			guest_bytes->Flush(0, total);
 		}
 	}
 	if (!ok) {
@@ -2641,16 +2689,22 @@ void TextureCache::NativeTexPrepare(ImageId id) {
 		std::unique_ptr<Buffer> gathered;
 		const NativeTex::Piece* single        = nullptr;
 		for (const auto& p: pieces)
-			if (!p.owned && p.begin <= lo && hi <= p.end) single = &p;
+			if (!p.owned && !p.undefined && p.begin <= lo && hi <= p.end) single = &p;
 		m_scheduler.EndRendering();
-		if (single != nullptr) {
+		if (single != nullptr && gaps.empty()) {
 			source_offset = single->ring_offset + (lo - single->begin);
 		} else {
 			gathered = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, hi - lo);
+			if (!zero.empty()) gathered->Fill(0, hi - lo, 0); // (the undefined ranges: zeros)
 			for (const auto& p: pieces) {
-				if (p.owned) continue;
+				if (p.owned || p.undefined) continue;
 				const auto b = std::max(p.begin, lo), e = std::min(p.end, hi);
 				if (b < e) gathered->CopyFrom(m_scheduler.Current(), *source, p.ring_offset + (b - p.begin), b - lo, e - b);
+			}
+			uint64_t at = 0;
+			for (const auto& [gb, ge]: gaps) {
+				gathered->CopyFrom(m_scheduler.Current(), *guest_bytes, at, gb - lo, ge - gb);
+				at += ge - gb;
 			}
 			source = gathered.get();
 		}
@@ -2673,11 +2727,9 @@ void TextureCache::NativeTexPrepare(ImageId id) {
 		for (auto& region: regions) region.bufferOffset += linear.offset;
 		image.Upload(regions, linear.buffer, linear.offset, linear.size);
 		if (gathered != nullptr) m_scheduler.DeferOperation([buffer = std::move(gathered)]() mutable { buffer.reset(); });
-		const auto tick = m_scheduler.CurrentTick();
-		for (const auto& [b, e]: ring) {
-			const auto cb = std::max(b, base), ce = std::min(e, info.data.End());
-			if (cb < ce) NativeTex::MarkOwned(cb, ce, PackImageId(id), image.serial, tick);
-		}
+		if (guest_bytes != nullptr) m_scheduler.DeferOperation([buffer = std::move(guest_bytes)]() mutable { buffer.reset(); });
+		// (The pieces Collect gave, not whatever is there now: a load landing meanwhile stays the ring's.)
+		NativeTex::MarkOwned(pieces, PackImageId(id), image.serial, m_scheduler.CurrentTick());
 		NativeTex::NoteNativeUpload(hi - lo);
 	}
 	// Every subresource it needs is current now.
@@ -3975,8 +4027,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fai
 		            desc.info.extent.depth, desc.info.resources.levels, desc.info.resources.layers,
 		            static_cast<uint32_t>(desc.info.tile_mode), slow_candidates);
 	});
-	// (KYTY_NATIVE_TEX: moves into texture memory told to the trackers; not under the lock, not by a speculation)
-	if (!m_lock.OwnedByCurrentThread() && CommandScheduler::ThreadRecorder() == nullptr) NativeTex::DrainNotifications();
 	if (desc.info.data.size) m_buffer_cache.DrainGuestReadback(desc.info.data.address, desc.info.data.size);
 	if (desc.info.stencil.size) m_buffer_cache.DrainGuestReadback(desc.info.stencil.address, desc.info.stencil.size);
 	auto& command = m_scheduler.Current();
@@ -5883,7 +5933,6 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 
 void TextureCache::RunGarbageCollector() {
 	EraseRetired();
-	NativeTex::DrainNotifications();
 	NativeTex::Pump();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;

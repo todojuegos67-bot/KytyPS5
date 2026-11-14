@@ -38,17 +38,25 @@ namespace Loader {
 namespace NativeTex {
 static std::atomic<StreamRelease> g_stream_release {nullptr};
 static std::atomic<StreamMove>    g_stream_move {nullptr};
-void SetStreamConsumer(StreamRelease release, StreamMove move) noexcept {
+static std::atomic<StreamCommit>  g_stream_commit {nullptr};
+static std::atomic<StreamCommit>  g_stream_decommit {nullptr};
+void SetStreamConsumer(StreamRelease release, StreamMove move, StreamCommit commit, StreamCommit decommit) noexcept {
 	g_stream_release.store(release, std::memory_order_release);
 	g_stream_move.store(move, std::memory_order_release);
+	g_stream_commit.store(commit, std::memory_order_release);
+	g_stream_decommit.store(decommit, std::memory_order_release);
+}
+// (op 2: to the emulator's decommit consumer, else as a release.)
+static void OnTextureDecommit(uint64_t addr, uint64_t size) noexcept {
+	if (const auto decommit = g_stream_decommit.load(std::memory_order_acquire); decommit != nullptr) decommit(addr, size);
+	else OnTextureRelease(addr, size);
 }
 // Defaults: the original behaviour (the engine's own code runs right after each notification).
 void OnTextureRelease(uint64_t addr, uint64_t size) noexcept {
 	if (const auto release = g_stream_release.load(std::memory_order_acquire); release != nullptr) release(addr, size);
 }
 void OnTextureCommit(uint64_t addr, uint64_t size) noexcept {
-	(void)addr;
-	(void)size;
+	if (const auto commit = g_stream_commit.load(std::memory_order_acquire); commit != nullptr) commit(addr, size);
 }
 // The game's own copy, told to the trackers once for the whole destination (as KYTY_NATIVE_MEM=3's MipCopy and a file
 // read do); the source is read as the game's memcpy reads it (a GPU-written source faults its bytes back).
@@ -190,7 +198,7 @@ void KYTY_SYSV_ABI OnResizePages(uint64_t run, uint64_t start, uint64_t length, 
 	} else if (op == 2 && length != 0) {
 		g_releases.fetch_add(1, std::memory_order_relaxed);
 		g_release_bytes.fetch_add(length, std::memory_order_relaxed);
-		NativeTex::OnTextureRelease(start, length);
+		NativeTex::OnTextureDecommit(start, length);
 	} else if (op == 1 && run != 0) {
 		// The new size is already rounded to 64 KiB (0xaa2bb3); the run keeps its VA (Realloc returns ptr, 0xaa3375).
 		const uint64_t va = ReadInfo(run, InfoVa), old_size = ReadInfo(run, InfoSize);

@@ -36,7 +36,10 @@ void OnTextureMove(uint64_t dst, uint64_t src, uint64_t size) noexcept;
 // returning true did the move (the guest copy is not made). Unset: the defaults above.
 using StreamRelease = void (*)(uint64_t addr, uint64_t size) noexcept;
 using StreamMove    = bool (*)(uint64_t dst, uint64_t src, uint64_t size) noexcept;
-void SetStreamConsumer(StreamRelease release, StreamMove move) noexcept;
+using StreamCommit  = void (*)(uint64_t addr, uint64_t size) noexcept;
+// `decommit`: op 2 (pages of a run given back inside the run; the texture keeps the run) - told to `release` when unset.
+void SetStreamConsumer(StreamRelease release, StreamMove move, StreamCommit commit = nullptr,
+                       StreamCommit decommit = nullptr) noexcept;
 } // namespace NativeTex
 
 namespace DemonsSoulsNativeTexStream {

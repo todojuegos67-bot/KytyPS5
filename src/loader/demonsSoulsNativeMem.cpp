@@ -19,6 +19,7 @@
 //                         stores the IAllocator* there (every allocator, the arenas included: 0x91c7f7)
 // Each fact is checked in the loaded image before anything uses it; any mismatch turns the module off.
 #include "loader/demonsSoulsNativeMem.h"
+#include "graphics/host_gpu/nativeTex.h"
 
 #include "common/abi.h"
 #include "common/virtualMemory.h"
@@ -640,8 +641,20 @@ void CensusThread() {
 // The streamed mip's memcpy (0x901459): the whole destination is written, so the trackers are told once (as a file
 // read's copy tells them, fileSystem.cpp ReadIntoGuest) instead of faulting on each watched page; then the images over
 // it are refreshed from the new bytes.
+//
+// KYTY_NATIVE_TEX=1 (graphics/host_gpu/nativeTex.h): the mip's bytes go to the staging ring instead (its whole pages; the
+// guest pages are not written). Ordering: OnTextureBytes returns only after the ring holds the bytes and the images over
+// the range are marked dirty (FinishHostOverwrite, under the texture cache's lock). The engine publishes the new mip
+// after this call returns (the T# BASE_LEVEL store at 0x901540, B-streaming.md), so any draw that can sample it is
+// translated later; the render thread's FindTexture for it sees the dirty image and InitializeImage records the upload
+// from the ring into the same command stream, before that draw. The ring bytes stay until that upload's work is done.
 void* KYTY_SYSV_ABI MipCopy(void* destination, const void* source, size_t size) {
 	const auto to       = reinterpret_cast<uint64_t>(destination);
+	if (size != 0 && Libs::Graphics::NativeTex::OnTextureBytes(to, source, size)) {
+		g_mip_copies.fetch_add(1, std::memory_order_relaxed);
+		g_mip_bytes.fetch_add(size, std::memory_order_relaxed);
+		return destination;
+	}
 	const bool prepared = size != 0 && Libs::LibKernel::Memory::PrepareHostOverwrite(to, size);
 	std::memcpy(destination, source, size);
 	if (size != 0) Libs::LibKernel::Memory::FinishHostOverwrite(to, size, prepared);

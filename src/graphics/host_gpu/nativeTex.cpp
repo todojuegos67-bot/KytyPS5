@@ -31,9 +31,15 @@
 // waits for `done` first.
 //
 // Game-thread callbacks that may run inside the engine's allocator lock (OnTextureRelease, OnTextureMove: Loader's
-// demonsSoulsNativeTexStream.h) never wait for the render thread: a release is queued (applied by the next operation
-// under `m`), a move shares ring bytes or records "bytes of image X" for the destination (the GPU copy is made when an
-// image needs them: Rehome), and its host-write notification is queued for the render thread (DrainNotifications).
+// demonsSoulsNativeTexStream.h) never wait for the render thread: a release drops the ranges at once (only `m` and the
+// page manager's locks, neither of which is ever held while waiting for a game lock), a move shares ring bytes or records
+// "bytes of image X" for the destination (the GPU copy is made when an image needs them: Rehome).
+//
+// Who writes authoritative bytes back (MaterializeAny): Host::run_render's thread classes. The one class that can do it
+// neither inline nor through the render thread - the async upload worker, a deferred operation, a thread holding the
+// texture cache's lock off the render thread - only ever reads guest memory through host pointers the render thread
+// resolved (and guarded: BeforeGuestRead) for it; a touch of bytes an image holds by one of them is a broken invariant
+// and stops the emulator with a message (never stale bytes). Bytes in the ring it gets at once (a CPU copy).
 
 namespace Libs::Graphics::NativeTex {
 
@@ -43,10 +49,13 @@ constexpr uint64_t Page       = 4096; // TRACKER_PAGE_SIZE
 constexpr uint64_t MinPiece   = 4096; // smaller loads go to guest memory as before
 constexpr uint64_t RingAlign  = 256;  // the tiler's source alignment
 constexpr size_t   MaxEntries = size_t {1} << 18u;
+constexpr uint64_t GranuleBits = 21, GranuleSpace = uint64_t {1} << 40u;
+constexpr size_t   GranuleWords = (GranuleSpace >> GranuleBits) / 64;
 
 struct Entry {
 	uint64_t end         = 0;
 	bool     owned       = false;
+	bool     undef       = false; // (not owned: no bytes; nativeTex.h Piece::undefined)
 	bool     inflight    = false;
 	uint64_t ring_offset = 0;
 	uint64_t image = 0, serial = 0, src = 0;
@@ -61,8 +70,8 @@ struct Alloc {
 	uint64_t free_tick = 0; // GPU work reading or writing it (0: none pending)
 };
 
-enum Why : uint32_t { WhyTouch, WhyHostWrite, WhyImage, WhyGone, WhySpill, WhyMove, WhyOther, WhyCount };
-constexpr const char* WhyNames[WhyCount] = {"touch", "host-write", "image", "image-gone", "spill", "move", "other"};
+enum Why : uint32_t { WhyTouch, WhyHostWrite, WhyRead, WhyImage, WhyGone, WhySpill, WhyMove, WhyOther, WhyCount };
+constexpr const char* WhyNames[WhyCount] = {"touch", "host-write", "emulator-read", "image", "image-gone", "spill", "move", "other"};
 
 struct State {
 	bool                      active = false;
@@ -77,18 +86,17 @@ struct State {
 	std::deque<Alloc>         allocs;  // FIFO, front = oldest
 	uint32_t                  alloc_first = 0;
 	uint64_t                  tail = 0, used = 0, owned_bytes = 0, flip = 0;
+	uint64_t                  ready_entries = 0; // entries a GPU copy still writes (ready_tick != 0): Pump's walk
 	std::atomic<uint64_t>     lo {~uint64_t {0}}, hi {0};
-	// Queued by game threads (own small lock).
-	std::mutex                                 queue_m;
-	std::vector<std::pair<uint64_t, uint64_t>> releases, notifications;
-	std::atomic<bool>                          has_releases {false}, has_notifications {false};
+	// 2 MiB granules any range ever touched (a lock-free filter for BeforeGuestRead; never cleared, 2^40 bytes).
+	std::unique_ptr<std::atomic<uint64_t>[]> granules = std::make_unique<std::atomic<uint64_t>[]>(GranuleWords);
 	// Counters (cumulative).
 	std::atomic<uint64_t> routed_bytes {0}, routed_ranges {0}, refused {0}, refused_bytes {0};
 	std::atomic<uint64_t> uploads {0}, upload_bytes {0}, rehomes {0}, rehome_bytes {0};
 	std::atomic<uint64_t> moves_shared {0}, moves_guest {0}, releases_count {0}, release_bytes {0};
 	std::atomic<uint64_t> fallback[WhyCount] {};
 	std::atomic<uint64_t> fallback_bytes[WhyCount] {};
-	std::atomic<uint64_t> lost {0}, lost_bytes {0};
+	std::atomic<uint64_t> lost {0}, lost_bytes {0}, commits {0}, commit_bytes {0}, decommits {0}, declined {0}, declined_bytes {0};
 	std::chrono::steady_clock::time_point last_log {};
 };
 
@@ -133,6 +141,16 @@ bool InflightLocked(State& s, uint64_t begin, uint64_t end) {
 
 void WaitInflight(State& s, Lock& lock, uint64_t begin, uint64_t end) {
 	s.done.wait(lock, [&] { return !InflightLocked(s, begin, end); });
+}
+
+// Whether entries cover all of [begin, end) (texture memory: committed, loaded or held by an image).
+bool CoveredLocked(State& s, uint64_t begin, uint64_t end) {
+	uint64_t at = begin;
+	for (auto it = FirstOverLocked(s, begin); it != s.entries.end() && it->first < end && at < end; ++it) {
+		if (it->first > at) return false;
+		at = std::max(at, it->second.end);
+	}
+	return at >= end;
 }
 
 Alloc* AllocLocked(State& s, uint32_t id) {
@@ -236,7 +254,7 @@ void SplitAtLocked(State& s, uint64_t x) {
 	if (right.owned) {
 		right.src += x - it->first;
 		s.owned_count[right.serial]++;
-	} else {
+	} else if (!right.undef) {
 		right.ring_offset += x - it->first;
 		AddRefLocked(s, right.alloc);
 	}
@@ -244,7 +262,23 @@ void SplitAtLocked(State& s, uint64_t x) {
 	s.entries.emplace(x, right);
 }
 
+void MarkGranules(State& s, uint64_t begin, uint64_t end) {
+	if (begin >= GranuleSpace) return;
+	const uint64_t last = (std::min(end, GranuleSpace) - 1) >> GranuleBits;
+	for (uint64_t g = begin >> GranuleBits; g <= last; g++)
+		s.granules[g / 64].fetch_or(uint64_t {1} << (g % 64), std::memory_order_release);
+}
+
+bool MaybeGranules(const State& s, uint64_t begin, uint64_t end) {
+	if (end > GranuleSpace) return true;
+	const uint64_t last = (end - 1) >> GranuleBits;
+	for (uint64_t g = begin >> GranuleBits; g <= last; g++)
+		if ((s.granules[g / 64].load(std::memory_order_acquire) >> (g % 64)) & 1u) return true;
+	return false;
+}
+
 void InsertLocked(State& s, uint64_t begin, const Entry& e) {
+	MarkGranules(s, begin, e.end);
 	s.entries.emplace(begin, e);
 	NoteOwnedLocked(s, e, begin, true);
 	if (begin < s.lo.load(std::memory_order_relaxed)) s.lo.store(begin, std::memory_order_relaxed);
@@ -258,29 +292,11 @@ void DropLocked(State& s, uint64_t begin, uint64_t end, Delta& d) {
 	std::vector<std::pair<uint64_t, uint64_t>> removed;
 	for (auto it = FirstOverLocked(s, begin); it != s.entries.end() && it->first < end;) {
 		NoteOwnedLocked(s, it->second, it->first, false);
-		if (!it->second.owned) ReleaseRefLocked(s, it->second.alloc, it->second.ready_tick);
+		if (!it->second.owned && !it->second.undef) ReleaseRefLocked(s, it->second.alloc, it->second.ready_tick);
 		removed.emplace_back(it->first, it->second.end);
 		it = s.entries.erase(it);
 	}
 	RemoveCoverageLocked(s, removed, d);
-}
-
-// The queued releases applied (released texture memory: its bytes are nobody's).
-void DrainReleasesLocked(State& s, Lock& lock) {
-	if (!s.has_releases.load(std::memory_order_acquire)) return;
-	std::vector<std::pair<uint64_t, uint64_t>> releases;
-	{
-		std::lock_guard queue(s.queue_m);
-		releases.swap(s.releases);
-		s.has_releases.store(false, std::memory_order_release);
-	}
-	for (const auto& [b, n]: releases) {
-		WaitInflight(s, lock, b, b + n);
-		Delta d;
-		DropLocked(s, b, b + n, d);
-		ApplyLocked(s, d);
-	}
-	ReclaimLocked(s);
 }
 
 Piece PieceOf(uint64_t begin, const Entry& e) {
@@ -288,6 +304,7 @@ Piece PieceOf(uint64_t begin, const Entry& e) {
 	p.begin       = begin;
 	p.end         = e.end;
 	p.owned       = e.owned;
+	p.undefined   = e.undef;
 	p.ring_offset = e.ring_offset;
 	p.image       = e.image;
 	p.serial      = e.serial;
@@ -295,10 +312,6 @@ Piece PieceOf(uint64_t begin, const Entry& e) {
 	p.ready_tick  = e.ready_tick;
 	p.alloc       = e.alloc;
 	return p;
-}
-
-bool CanWaitHere(const State& s) {
-	return s.host.render_sync != nullptr && s.host.can_wait != nullptr && s.host.can_wait();
 }
 
 void NoteLost(State& s, uint64_t begin, uint64_t end, const char* why) {
@@ -318,10 +331,12 @@ uint64_t WriteBack(State& s, const std::vector<Piece>& pieces, bool render) {
 			owned.push_back(p);
 			continue;
 		}
+		if (p.undefined) continue; // (no bytes: the guest's, whatever they are, are as good)
 		if (p.ready_tick != 0) {
 			if (!render) {
-				NoteLost(s, p.begin, p.end, "a GPU copy in flight, off the render thread");
-				continue;
+				NoteLost(s, p.begin, p.end, "a GPU copy in flight; touched by a thread that cannot wait for the GPU");
+				std::fflush(stdout);
+				std::abort();
 			}
 			if (s.host.tick_done != nullptr && !s.host.tick_done(p.ready_tick) && s.host.wait_tick != nullptr)
 				s.host.wait_tick(p.ready_tick);
@@ -335,7 +350,10 @@ uint64_t WriteBack(State& s, const std::vector<Piece>& pieces, bool render) {
 		s.host.materialize_owned(owned);
 		for (const auto& p: owned) bytes += p.end - p.begin;
 	} else {
-		for (const auto& p: owned) NoteLost(s, p.begin, p.end, "its image holds it; a thread that cannot wait for the render thread");
+		// (A broken invariant, see the top of this file: stop rather than let stale bytes be read.)
+		for (const auto& p: owned) NoteLost(s, p.begin, p.end, "its image holds it; touched by a thread that can neither record GPU work nor wait for the render thread");
+		std::fflush(stdout);
+		std::abort();
 	}
 	return bytes;
 }
@@ -348,7 +366,7 @@ void EraseWrittenLocked(State& s, const std::vector<Piece>& pieces) {
 		auto it = s.entries.find(p.begin);
 		if (it == s.entries.end()) continue;
 		NoteOwnedLocked(s, it->second, it->first, false);
-		if (!it->second.owned) ReleaseRefLocked(s, it->second.alloc, 0);
+		if (!it->second.owned && !it->second.undef) ReleaseRefLocked(s, it->second.alloc, 0);
 		removed.emplace_back(it->first, it->second.end);
 		s.entries.erase(it);
 	}
@@ -359,21 +377,25 @@ void EraseWrittenLocked(State& s, const std::vector<Piece>& pieces) {
 }
 
 // Every entry intersecting [addr, addr + size) (whole entries; `serial` != 0: owned by that image only) written into
-// guest memory and dropped.
-void MaterializeHere(uint64_t addr, uint64_t size, Why why, uint64_t serial, bool render) {
+// guest memory and dropped. Not `render` (a thread that may not record GPU work): false, and nothing done, when some of
+// them need the GPU (bytes an image holds, a GPU copy into the ring in flight).
+bool MaterializeHere(uint64_t addr, uint64_t size, Why why, uint64_t serial, bool render) {
 	auto&              s = S();
 	std::vector<Piece> pieces;
 	{
 		Lock lock(s.m);
-		DrainReleasesLocked(s, lock);
 		WaitInflight(s, lock, addr, addr + size);
+		for (auto it = FirstOverLocked(s, addr); it != s.entries.end() && it->first < addr + size; ++it) {
+			if (serial != 0 && (!it->second.owned || it->second.serial != serial)) continue;
+			if (!render && (it->second.owned || (!it->second.undef && it->second.ready_tick != 0))) return false;
+		}
 		for (auto it = FirstOverLocked(s, addr); it != s.entries.end() && it->first < addr + size; ++it) {
 			if (serial != 0 && (!it->second.owned || it->second.serial != serial)) continue;
 			it->second.inflight = true;
 			pieces.push_back(PieceOf(it->first, it->second));
 		}
 	}
-	if (pieces.empty()) return;
+	if (pieces.empty()) return true;
 	const uint64_t bytes = WriteBack(s, pieces, render);
 	{
 		Lock lock(s.m);
@@ -382,6 +404,7 @@ void MaterializeHere(uint64_t addr, uint64_t size, Why why, uint64_t serial, boo
 	s.done.notify_all();
 	s.fallback[why].fetch_add(1, std::memory_order_relaxed);
 	s.fallback_bytes[why].fetch_add(bytes, std::memory_order_relaxed);
+	return true;
 }
 
 struct MaterializeJob {
@@ -391,18 +414,22 @@ struct MaterializeJob {
 
 void MaterializeTrampoline(void* arg) {
 	const auto* job = static_cast<const MaterializeJob*>(arg);
-	MaterializeHere(job->addr, job->size, job->why, 0, true);
+	(void)MaterializeHere(job->addr, job->size, job->why, 0, true);
 }
 
-// From any thread: through the render thread when this thread may wait for it, else here (ring bytes only).
+// From any thread: where GPU work can be recorded and waited for (Host::run_render), else here (ring bytes only).
 void MaterializeAny(uint64_t addr, uint64_t size, Why why) {
 	auto& s = S();
-	if (CanWaitHere(s)) {
-		MaterializeJob job {addr, size, why};
-		s.host.render_sync(&MaterializeTrampoline, &job);
-		return;
-	}
-	MaterializeHere(addr, size, why, 0, false);
+	// Bytes in the ring (written) or none (undefined): a CPU copy or nothing, on this thread - no wait for the render
+	// thread (a loader on a fiber, a game thread in the engine's allocator lock).
+	if (MaterializeHere(addr, size, why, 0, false)) return;
+	MaterializeJob job {addr, size, why};
+	if (s.host.run_render != nullptr && s.host.run_render(&MaterializeTrampoline, &job)) return;
+	// (A thread that can do neither: see the top of this file.)
+	std::printf("NativeTex: 0x%llx..0x%llx needs the GPU, touched by a thread that can neither record GPU work nor wait for "
+	            "the render thread\n", static_cast<unsigned long long>(addr), static_cast<unsigned long long>(addr + size));
+	std::fflush(stdout);
+	std::abort();
 }
 
 // Render thread: the owned entries over [addr, end) selected by `pick` copied by the GPU into the ring (one copy of each
@@ -417,7 +444,6 @@ void RehomeHere(uint64_t addr, uint64_t end, Pick pick) {
 	std::vector<Group> groups;
 	{
 		Lock lock(s.m);
-		DrainReleasesLocked(s, lock);
 		WaitInflight(s, lock, addr, end);
 		for (auto it = FirstOverLocked(s, addr); it != s.entries.end() && it->first < end; ++it) {
 			auto& e = it->second;
@@ -458,6 +484,7 @@ void RehomeHere(uint64_t addr, uint64_t end, Pick pick) {
 			e.ring_offset = offset + (p.src - ib);
 			e.alloc       = alloc;
 			e.ready_tick  = tick;
+			s.ready_entries++;
 			AddRefLocked(s, alloc);
 			s.rehomes.fetch_add(1, std::memory_order_relaxed);
 			s.rehome_bytes.fetch_add(p.end - p.begin, std::memory_order_relaxed);
@@ -503,8 +530,12 @@ void Log(bool force) {
 	for (uint32_t i = 0; i < WhyCount; i++)
 		std::printf(" %s %llu (%.1f MiB)", WhyNames[i], static_cast<unsigned long long>(s.fallback[i].load()),
 		            static_cast<double>(s.fallback_bytes[i].load()) / MiB);
-	std::printf("; lost %llu (%.1f MiB)\n", static_cast<unsigned long long>(s.lost.load()),
-	            static_cast<double>(s.lost_bytes.load()) / MiB);
+	std::printf("; lost %llu (%.1f MiB); commits %llu (%.1f MiB undefined until written), decommits %llu; loads declined (not "
+	            "committed texture memory) %llu (%.1f MiB)\n",
+	            static_cast<unsigned long long>(s.lost.load()), static_cast<double>(s.lost_bytes.load()) / MiB,
+	            static_cast<unsigned long long>(s.commits.load()), static_cast<double>(s.commit_bytes.load()) / MiB,
+	            static_cast<unsigned long long>(s.decommits.load()), static_cast<unsigned long long>(s.declined.load()),
+	            static_cast<double>(s.declined_bytes.load()) / MiB);
 }
 
 // Loader::NativeTex stream callbacks (demonsSoulsNativeTexStream.h).
@@ -513,6 +544,12 @@ void StreamRelease(uint64_t addr, uint64_t size) noexcept {
 }
 bool StreamMove(uint64_t dst, uint64_t src, uint64_t size) noexcept {
 	return OnTextureMove(dst, src, size);
+}
+void StreamCommit(uint64_t addr, uint64_t size) noexcept {
+	OnTextureCommit(addr, size);
+}
+void StreamDecommit(uint64_t addr, uint64_t size) noexcept {
+	OnTextureDecommit(addr, size);
 }
 
 } // namespace
@@ -543,6 +580,9 @@ void Init(GraphicContext& graphics, CommandScheduler& scheduler, const Host& hos
 	uint64_t mb = 256;
 	if (const char* value = std::getenv("KYTY_NATIVE_TEX_RING_MB"); value != nullptr && value[0] != '\0')
 		mb = std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 32, 4096);
+	s.capacity = mb << 20u;
+	if (const char* value = std::getenv("KYTY_NATIVE_TEX_RING_KB"); value != nullptr && value[0] != '\0') // (tests)
+		s.capacity = std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 64, 4u << 20u) << 10u;
 	// Device-local and host-visible with ReBAR (a heap over 1 GiB of such memory), else host-visible.
 	MemoryUsage usage  = MemoryUsage::Upload;
 	const auto& memory = graphics.physical_device_memory_properties;
@@ -555,7 +595,6 @@ void Init(GraphicContext& graphics, CommandScheduler& scheduler, const Host& hos
 			break;
 		}
 	}
-	s.capacity = mb << 20u;
 	s.ring     = std::make_unique<Buffer>(graphics, scheduler, usage, 0, AllFlags, s.capacity);
 	s.mapped   = s.ring->Mapped().data();
 	if (s.mapped == nullptr || s.ring->Mapped().size() < s.capacity) {
@@ -572,19 +611,34 @@ void Init(GraphicContext& graphics, CommandScheduler& scheduler, const Host& hos
 	::Loader::NativeTex::SetConsumer(+[](const ::Loader::NativeTex::TextureBytes& bytes) noexcept {
 		return OnTextureBytes(bytes.guest_dst, bytes.host_src, bytes.size);
 	});
-	::Loader::NativeTex::SetStreamConsumer(&StreamRelease, &StreamMove);
+	::Loader::NativeTex::SetStreamConsumer(&StreamRelease, &StreamMove, &StreamCommit, &StreamDecommit);
 	std::printf("NativeTex: on (KYTY_NATIVE_TEX=1): texture loads staged in a %llu MiB %s ring and uploaded to their images; "
 	            "their guest pages are left unwritten\n",
-	            static_cast<unsigned long long>(mb), usage == MemoryUsage::Stream ? "device-local host-visible (ReBAR)" : "host-visible");
+	            static_cast<unsigned long long>(s.capacity >> 20u), usage == MemoryUsage::Stream ? "device-local host-visible (ReBAR)" : "host-visible");
 }
 
 bool OnTextureBytes(uint64_t guest_dst, const void* src, uint64_t size) {
 	auto& s = S();
 	if (!Active() || src == nullptr || size < MinPiece || guest_dst + size < guest_dst) return false;
+	// Whole pages only: the partial first and last pages (shared with whatever else lives there) get their bytes in
+	// guest memory, tracked as any host write.
+	const uint64_t whole_begin = PageUp(guest_dst), whole_end = PageDown(guest_dst + size);
+	if (whole_end <= whole_begin || whole_end - whole_begin < MinPiece) return false;
+	const auto* bytes = static_cast<const uint8_t*>(src);
+	src               = bytes + (whole_begin - guest_dst);
+	const uint64_t head = whole_begin - guest_dst, tail = guest_dst + size - whole_end;
+	const uint64_t full_dst = guest_dst, full_size = size;
+	guest_dst = whole_begin;
+	size      = whole_end - whole_begin;
 	uint32_t alloc  = 0;
 	uint64_t offset = 0;
 	{
 		Lock lock(s.m);
+		if (!CoveredLocked(s, guest_dst, guest_dst + size)) {
+			s.declined.fetch_add(1, std::memory_order_relaxed);
+			s.declined_bytes.fetch_add(full_size, std::memory_order_relaxed);
+			return false; // (not committed texture memory: OnTextureCommit)
+		}
 		if (s.entries.size() >= MaxEntries || !AllocateLocked(s, size, &alloc, &offset)) {
 			s.refused.fetch_add(1, std::memory_order_relaxed);
 			s.refused_bytes.fetch_add(size, std::memory_order_relaxed);
@@ -596,12 +650,16 @@ bool OnTextureBytes(uint64_t guest_dst, const void* src, uint64_t size) {
 	// As a file read's host write: the trackers told before (images and buffers over the range CPU-dirty) and after (the
 	// images refreshed - from the ring now: InitializeImage - closing the window of an upload from stale guest bytes).
 	t_suppress_host_write = true;
-	const bool prepared   = LibKernel::Memory::PrepareHostOverwrite(guest_dst, size);
+	const bool prepared   = LibKernel::Memory::PrepareHostOverwrite(full_dst, full_size);
 	t_suppress_host_write = false;
+	// (An older range over an edge page: its bytes back first, the page is then the guest's.)
+	if (head != 0 && Overlaps(PageDown(full_dst), Page)) MaterializeAny(PageDown(full_dst), Page, WhyHostWrite);
+	if (tail != 0 && Overlaps(whole_end, Page)) MaterializeAny(whole_end, Page, WhyHostWrite);
+	if (head != 0) LibKernel::Memory::WriteBacking(full_dst, bytes, head, "native-tex edge");
+	if (tail != 0) LibKernel::Memory::WriteBacking(whole_end, bytes + (whole_end - full_dst), tail, "native-tex edge");
 	{
 		Lock  lock(s.m);
 		Delta d;
-		DrainReleasesLocked(s, lock);
 		WaitInflight(s, lock, guest_dst, guest_dst + size);
 		DropLocked(s, guest_dst, guest_dst + size, d); // (newer bytes replace them)
 		AddCoverageLocked(s, guest_dst, guest_dst + size, d);
@@ -614,7 +672,7 @@ bool OnTextureBytes(uint64_t guest_dst, const void* src, uint64_t size) {
 		ApplyLocked(s, d);
 	}
 	t_suppress_host_write = true;
-	LibKernel::Memory::FinishHostOverwrite(guest_dst, size, prepared);
+	LibKernel::Memory::FinishHostOverwrite(full_dst, full_size, prepared);
 	t_suppress_host_write = false;
 	s.routed_bytes.fetch_add(size, std::memory_order_relaxed);
 	s.routed_ranges.fetch_add(1, std::memory_order_relaxed);
@@ -627,7 +685,6 @@ bool OnTextureMove(uint64_t dst, uint64_t src, uint64_t size) {
 	bool shared = false;
 	{
 		Lock lock(s.m);
-		DrainReleasesLocked(s, lock);
 		const uint64_t lo = std::min(dst, src), hi = std::max(dst, src) + size;
 		WaitInflight(s, lock, lo, hi);
 		// All of the source ours: the destination gets the same bytes without a copy (ring bytes shared; bytes an image
@@ -641,17 +698,20 @@ bool OnTextureMove(uint64_t dst, uint64_t src, uint64_t size) {
 			copy.end   = e - src + dst;
 			copy.flip  = s.flip;
 			if (copy.owned) copy.src += b - it->first;
-			else copy.ring_offset += b - it->first;
+			else if (!copy.undef) copy.ring_offset += b - it->first;
 			moved.emplace_back(b - src + dst, copy);
 			at = e;
 		}
 		if (at == src + size && !moved.empty()) {
 			for (const auto& [b, e]: moved)
-				if (!e.owned) AddRefLocked(s, e.alloc); // (before the drop: dst may overlap src)
+				if (!e.owned && !e.undef) AddRefLocked(s, e.alloc); // (before the drop: dst may overlap src)
 			Delta d;
 			DropLocked(s, dst, dst + size, d);
 			AddCoverageLocked(s, dst, dst + size, d);
-			for (const auto& [b, e]: moved) InsertLocked(s, b, e);
+			for (const auto& [b, e]: moved) {
+				InsertLocked(s, b, e);
+				if (e.ready_tick != 0) s.ready_entries++;
+			}
 			ApplyLocked(s, d);
 			shared = true;
 		} else if (TouchedLocked(s, dst, dst + size)) {
@@ -661,13 +721,10 @@ bool OnTextureMove(uint64_t dst, uint64_t src, uint64_t size) {
 		}
 	}
 	if (shared) {
-		// The images over the destination refreshed by the render thread (this thread may hold the engine's allocator
-		// lock: no texture cache lock here).
-		{
-			std::lock_guard queue(s.queue_m);
-			s.notifications.emplace_back(dst, size);
-			s.has_notifications.store(true, std::memory_order_release);
-		}
+		// The images over the destination refreshed (as the default move tells the trackers: B's OnTextureMove).
+		t_suppress_host_write = true;
+		(void)LibKernel::Memory::TryPrepareHostOverwrite(dst, size);
+		t_suppress_host_write = false;
 		s.moves_shared.fetch_add(1, std::memory_order_relaxed);
 		return true;
 	}
@@ -680,13 +737,38 @@ void OnTextureRelease(uint64_t addr, uint64_t size) {
 	auto& s = S();
 	if (!Active() || size == 0) return;
 	if (addr + size <= s.lo.load(std::memory_order_relaxed) || addr >= s.hi.load(std::memory_order_relaxed)) return;
-	{
-		std::lock_guard queue(s.queue_m);
-		s.releases.emplace_back(addr, size);
-		s.has_releases.store(true, std::memory_order_release);
-	}
+	// At once: the pages may be reused by any allocator as soon as the engine's call returns. (Under the engine's
+	// allocator lock: `m` and the page manager's locks only, and no holder of either waits for a game lock.)
+	Forget(addr, size);
 	s.releases_count.fetch_add(1, std::memory_order_relaxed);
 	s.release_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+void OnTextureCommit(uint64_t addr, uint64_t size) {
+	auto& s = S();
+	if (!Active() || size == 0 || addr + size < addr) return;
+	const uint64_t begin = PageUp(addr), end = PageDown(addr + size);
+	if (end <= begin) return;
+	// (Under the engine's allocator lock: `m` and the page manager's locks only, as OnTextureRelease.)
+	Lock  lock(s.m);
+	Delta d;
+	WaitInflight(s, lock, begin, end);
+	DropLocked(s, begin, end, d);
+	AddCoverageLocked(s, begin, end, d);
+	Entry e {};
+	e.end   = end;
+	e.undef = true;
+	e.flip  = s.flip;
+	InsertLocked(s, begin, e);
+	ApplyLocked(s, d);
+	ReclaimLocked(s);
+	s.commits.fetch_add(1, std::memory_order_relaxed);
+	s.commit_bytes.fetch_add(end - begin, std::memory_order_relaxed);
+}
+
+void OnTextureDecommit(uint64_t addr, uint64_t size) {
+	OnTextureCommit(addr, size); // (the same: undefined content, the texture keeps the pages)
+	S().decommits.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool Overlaps(uint64_t addr, uint64_t size) {
@@ -702,13 +784,12 @@ std::vector<Piece> Collect(uint64_t addr, uint64_t size) {
 	std::vector<Piece> out;
 	if (!Active() || size == 0) return out;
 	Lock lock(s.m);
-	DrainReleasesLocked(s, lock);
 	WaitInflight(s, lock, addr, addr + size);
 	for (auto it = FirstOverLocked(s, addr); it != s.entries.end() && it->first < addr + size; ++it) {
 		const uint64_t b = std::max(it->first, addr), e = std::min(it->second.end, addr + size);
 		auto           p = PieceOf(it->first, it->second);
 		if (p.owned) p.src += b - it->first;
-		else p.ring_offset += b - it->first;
+		else if (!p.undefined) p.ring_offset += b - it->first;
 		p.begin = b;
 		p.end   = e;
 		out.push_back(p);
@@ -716,29 +797,38 @@ std::vector<Piece> Collect(uint64_t addr, uint64_t size) {
 	return out;
 }
 
-void MarkOwned(uint64_t begin, uint64_t end, uint64_t image, uint64_t serial, uint64_t tick) {
+void MarkOwned(const std::vector<Piece>& uploaded, uint64_t image, uint64_t serial, uint64_t tick) {
 	auto& s = S();
 	Lock  lock(s.m);
-	WaitInflight(s, lock, begin, end);
-	SplitAtLocked(s, begin);
-	SplitAtLocked(s, end);
-	for (auto it = s.entries.lower_bound(begin); it != s.entries.end() && it->first < end; ++it) {
-		auto& e = it->second;
-		if (e.owned) continue;
-		ReleaseRefLocked(s, e.alloc, std::max(tick, e.ready_tick));
-		e.owned       = true;
-		e.image       = image;
-		e.serial      = serial;
-		e.src         = it->first;
-		e.ring_offset = 0;
-		e.ready_tick  = 0;
-		NoteOwnedLocked(s, e, it->first, true);
+	for (const auto& p: uploaded) {
+		if (p.owned || p.begin >= p.end) continue;
+		WaitInflight(s, lock, p.begin, p.end);
+		SplitAtLocked(s, p.begin);
+		SplitAtLocked(s, p.end);
+		for (auto it = s.entries.lower_bound(p.begin); it != s.entries.end() && it->first < p.end; ++it) {
+			auto& e = it->second;
+			// Only the bytes the upload took: the same allocation at the same place (a load since replaced them: its
+			// own Finish made the image dirty again, the next refresh takes them).
+			const bool same = !e.owned && e.undef == p.undefined &&
+			                  (e.undef || (e.alloc == p.alloc && e.ring_offset == p.ring_offset + (it->first - p.begin)));
+			if (!same) continue;
+			if (!e.undef) ReleaseRefLocked(s, e.alloc, std::max(tick, e.ready_tick));
+			if (e.ready_tick != 0 && s.ready_entries != 0) s.ready_entries--;
+			e.undef       = false;
+			e.owned       = true;
+			e.image       = image;
+			e.serial      = serial;
+			e.src         = it->first;
+			e.ring_offset = 0;
+			e.ready_tick  = 0;
+			NoteOwnedLocked(s, e, it->first, true);
+		}
 	}
 }
 
 void Materialize(uint64_t addr, uint64_t size, const char* why, uint64_t serial) {
 	if (!Active() || size == 0) return;
-	MaterializeHere(addr, size, WhyOf(why), serial, true);
+	(void)MaterializeHere(addr, size, WhyOf(why), serial, true);
 }
 
 void ImageGone(uint64_t image, uint64_t serial) {
@@ -748,8 +838,15 @@ void ImageGone(uint64_t image, uint64_t serial) {
 		Lock lock(s.m);
 		if (s.owned_count.find(serial) == s.owned_count.end()) return;
 	}
-	(void)image;
-	RehomeHere(0, ~uint64_t {0}, [serial](const Entry& e) { return e.serial == serial; });
+	const auto pick = [serial](const Entry& e) { return e.serial == serial; };
+	// Its own range first (a lookup), the whole map only when bytes it holds were moved elsewhere (OnTextureMove).
+	uint64_t begin = 0, size = 0;
+	if (s.host.owned_extent != nullptr && s.host.owned_extent(image, serial, &begin, &size)) RehomeHere(begin, begin + size, pick);
+	{
+		Lock lock(s.m);
+		if (s.owned_count.find(serial) == s.owned_count.end()) return;
+	}
+	RehomeHere(0, ~uint64_t {0}, pick);
 }
 
 void Rehome(uint64_t addr, uint64_t size, uint64_t keep_serial) {
@@ -757,18 +854,13 @@ void Rehome(uint64_t addr, uint64_t size, uint64_t keep_serial) {
 	RehomeHere(addr, addr + size, [keep_serial](const Entry& e) { return e.serial != keep_serial; });
 }
 
-void DrainNotifications() {
+void BeforeGuestRead(uint64_t addr, uint64_t size) {
 	auto& s = S();
-	if (!Active() || !s.has_notifications.load(std::memory_order_acquire)) return;
-	std::vector<std::pair<uint64_t, uint64_t>> notifications;
-	{
-		std::lock_guard queue(s.queue_m);
-		notifications.swap(s.notifications);
-		s.has_notifications.store(false, std::memory_order_release);
-	}
-	t_suppress_host_write = true;
-	for (const auto& [b, n]: notifications) (void)LibKernel::Memory::TryPrepareHostOverwrite(b, n);
-	t_suppress_host_write = false;
+	if (!Active() || size == 0 || addr + size < addr) return;
+	if (addr + size <= s.lo.load(std::memory_order_relaxed) || addr >= s.hi.load(std::memory_order_relaxed)) return;
+	if (!MaybeGranules(s, addr, addr + size) || t_suppress_host_write) return;
+	if (!Overlaps(addr, size)) return;
+	MaterializeAny(addr, size, WhyRead);
 }
 
 void BeforeHostWrite(uint64_t addr, uint64_t size) {
@@ -782,7 +874,6 @@ void Forget(uint64_t addr, uint64_t size) {
 	if (addr + size <= s.lo.load(std::memory_order_relaxed) || addr >= s.hi.load(std::memory_order_relaxed)) return;
 	Lock  lock(s.m);
 	Delta d;
-	DrainReleasesLocked(s, lock);
 	WaitInflight(s, lock, addr, addr + size);
 	DropLocked(s, addr, addr + size, d);
 	ApplyLocked(s, d);
@@ -796,15 +887,14 @@ bool OnFault(uint64_t address, uint64_t /*rip*/, const void* /*native_context*/,
 		return false;
 	const uint64_t page = PageDown(address);
 	{
-		Lock       lock(s.m);
-		const bool ours_before = TouchedLocked(s, page, page + Page);
-		DrainReleasesLocked(s, lock); // (released memory the game reuses: no bytes to bring back, the watchers go)
+		Lock lock(s.m);
 		if (InflightLocked(s, page, page + Page)) {
 			WaitInflight(s, lock, page, page + Page);
 			return true; // (written back by another thread meanwhile: the access goes again)
 		}
-		// Nothing of ours there (now): ours if a release just took our watchers off it (the access goes again).
-		if (!TouchedLocked(s, page, page + Page)) return ours_before;
+		// Nothing of ours there (now): if a release or write-back just took our watchers off it, the page's protection is
+		// no longer ours and the access goes again; else not our fault.
+		if (!TouchedLocked(s, page, page + Page)) return false;
 	}
 	// The bytes of every range touching the page into guest memory, its watchers gone: the access goes again and the page
 	// is tracked as any other from then on.
@@ -818,13 +908,20 @@ void Pump() {
 	std::vector<std::pair<uint64_t, uint64_t>> spill;
 	{
 		Lock lock(s.m);
-		DrainReleasesLocked(s, lock);
 		s.flip++;
 		if (s.host.tick_done != nullptr) {
 			for (auto& a: s.allocs)
 				if (a.free_tick != 0 && s.host.tick_done(a.free_tick)) a.free_tick = 0;
-			for (auto& [b, e]: s.entries)
-				if (e.ready_tick != 0 && !e.inflight && s.host.tick_done(e.ready_tick)) e.ready_tick = 0;
+			// (Only while GPU copies are pending: no walk of the ranges per flip otherwise - nothing per frame grows with
+			// the MiB routed.)
+			if (s.ready_entries != 0) {
+				uint64_t pending = 0;
+				for (auto& [b, e]: s.entries) {
+					if (e.ready_tick != 0 && !e.inflight && s.host.tick_done(e.ready_tick)) e.ready_tick = 0;
+					pending += e.ready_tick != 0 ? 1 : 0;
+				}
+				s.ready_entries = pending;
+			}
 		}
 		ReclaimLocked(s);
 		// Spill policy: past 75% of the ring (or of the range cap), the oldest ring bytes no image took go to guest memory
@@ -832,7 +929,7 @@ void Pump() {
 		if (s.used > s.capacity / 4 * 3 || s.entries.size() > MaxEntries / 4 * 3) {
 			std::vector<std::tuple<uint32_t, uint64_t, uint64_t>> ring;
 			for (const auto& [b, e]: s.entries)
-				if (!e.owned && !e.inflight && e.flip + 2 <= s.flip) ring.emplace_back(e.alloc, b, e.end);
+				if (!e.owned && !e.undef && !e.inflight && e.flip + 2 <= s.flip) ring.emplace_back(e.alloc, b, e.end);
 			std::sort(ring.begin(), ring.end());
 			uint64_t projected = s.used;
 			size_t   count     = s.entries.size();
@@ -844,7 +941,7 @@ void Pump() {
 			}
 		}
 	}
-	for (const auto& [b, n]: spill) MaterializeHere(b, n, WhySpill, 0, true);
+	for (const auto& [b, n]: spill) (void)MaterializeHere(b, n, WhySpill, 0, true);
 	Log(false);
 }
 
