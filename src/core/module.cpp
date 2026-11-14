@@ -13,6 +13,7 @@
 #include "core/bb_kbmcam.h"
 #include "core/bb_native_mv_hook.h"
 #include "core/bb_respatch.h"
+#include "core/bb_vardt.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
@@ -381,6 +382,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             // After the XML patches: the upscaler's render size (bb-clean-021).
             BB::ResPatch::OnEbootLoaded(base_virtual_addr, base_size);
             BB::KbmCam::OnEbootLoaded(base_virtual_addr, base_size);
+            BB::VarDt::OnEbootLoaded(base_virtual_addr, base_size); // BB_VARIABLE_DT=1
         }
     }
 

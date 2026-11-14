@@ -7,6 +7,7 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -111,11 +112,15 @@ private:
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
+    // bb-vardt (BB_VARIABLE_DT=1, BB_VRR_PRESENT != 0): each flip is presented as soon as it is
+    // submitted; vblank events still tick at the vblank rate for the guest.
+    void PresentThreadImmediate(std::stop_token token, std::chrono::nanoseconds vblank_period);
 
     std::mutex mutex;
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
+    std::condition_variable request_cv; // bb-vardt: wakes the immediate present loop
 };
 
 } // namespace Libraries::VideoOut

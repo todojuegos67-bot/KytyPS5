@@ -1012,6 +1012,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/bb_kbmcam.cpp
          src/core/bb_kbmcam.h
          src/core/bb_respatch.h
+         src/core/bb_vardt.cpp
+         src/core/bb_vardt.h
          src/core/module.h
          src/core/platform.h
          src/core/signals.cpp

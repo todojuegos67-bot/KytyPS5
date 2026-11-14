@@ -1,10 +1,12 @@
 #include <cstdlib>
+#include <thread>
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
+#include "core/bb_vardt.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
@@ -337,6 +339,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .eop = is_eop,
         .submit_s = BB::Smooth::Enabled() ? BB::Smooth::Now() : 0.0,
     });
+    request_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -355,6 +358,19 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
+
+    if (BB::VarDt::ImmediatePresent()) {
+        if (BB::Smooth::Enabled()) {
+            LOG_INFO(Lib_VideoOut, "[vardt] BB_SMOOTH=1 paces the flips: immediate present off");
+        } else {
+            LOG_INFO(Lib_VideoOut,
+                     "[vardt] immediate present: each guest flip is shown when it arrives (no "
+                     "vblank quantization); vblank events at {} Hz, guest flip rate {} ignored",
+                     vblank_hz, main_port.flip_rate);
+            PresentThreadImmediate(token, vblank_period);
+            return;
+        }
+    }
 
     Common::AccurateTimer timer{vblank_period};
 
@@ -446,6 +462,74 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         if (!smooth_tick) timer.End();
+    }
+}
+
+void VideoOutDriver::PresentThreadImmediate(std::stop_token token,
+                                            std::chrono::nanoseconds vblank_period) {
+    using Clock = std::chrono::steady_clock;
+    auto next_vblank = Clock::now() + vblank_period;
+    bool flipped_since_vblank = false;
+    auto& vblank_status = main_port.vblank_status;
+    while (!token.stop_requested()) {
+        if (DebugState.IsGuestThreadsPaused()) {
+            std::this_thread::sleep_until(next_vblank);
+            next_vblank = Clock::now() + vblank_period;
+            DrawLastFrame();
+            continue;
+        }
+
+        Request request{};
+        {
+            std::unique_lock lk{mutex};
+            request_cv.wait_until(lk, next_vblank, [this] { return !requests.empty(); });
+            if (!requests.empty()) {
+                request = requests.front();
+                requests.pop();
+            }
+        }
+        if (request) {
+            Flip(request);
+            FRAME_END;
+            BB::VarDt::OnPresent();
+            flipped_since_vblank = true;
+        }
+
+        const auto now = Clock::now();
+        if (now < next_vblank) {
+            continue;
+        }
+        if (!flipped_since_vblank) {
+            if (!main_port.is_open) {
+                DrawBlankFrame();
+            } else if (ImGui::Core::MustKeepDrawing()) {
+                DrawLastFrame();
+            }
+        }
+        flipped_since_vblank = false;
+        {
+            // Same as PresentThread: vblank events / status for the guest.
+            std::scoped_lock lock{main_port.vo_mutex};
+            for (auto event : main_port.vblank_events) {
+                auto equeue = Kernel::GetEqueue(event);
+                if (equeue != nullptr) {
+                    equeue->TriggerEvent(
+                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
+                        Kernel::OrbisKernelEvent::Filter::VideoOut,
+                        reinterpret_cast<void*>(
+                            static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
+                            (vblank_status.count << 16)));
+                }
+            }
+            vblank_status.count++;
+            vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
+            vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
+            main_port.vblank_cv.notify_all();
+        }
+        next_vblank += vblank_period;
+        if (now - next_vblank > vblank_period) {
+            next_vblank = now + vblank_period; // late by more than a tick: resync
+        }
     }
 }
 
