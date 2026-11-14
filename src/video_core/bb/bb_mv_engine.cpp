@@ -50,7 +50,7 @@ thread_local Tls t_cur;
 std::mutex g_mx;
 std::map<u64, Slot> g_pal; // palette start -> records
 std::atomic<u64> g_stamp{1};
-std::atomic<u64> g_guest_sets{0}, g_guest_begins{0}, g_guest_nobegin{0};
+std::atomic<u64> g_guest_sets{0}, g_guest_begins{0}, g_guest_nobegin{0}, g_recorded{0};
 std::atomic<bool> g_hooks{false};
 std::string g_hook_detail;
 
@@ -127,6 +127,7 @@ void GuestPaletteSet(u64 palette, u32 consumer) {
     Slot& s = g_pal[palette];
     s.r[s.next % kHist] = {h, key, t_cur.sink, g_stamp.load(std::memory_order_relaxed)};
     ++s.next;
+    g_recorded.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool LookupPalette(Core::MemoryManager* memory, bool gpu_modified, u64 addr, ObjId& out,
@@ -229,14 +230,17 @@ void OnFrame() {
     const auto M = [](Miss m) { return g_miss[size_t(m)]; };
     const double f = double(std::max<u64>(1, g_frames));
     Log(fmt::format(
-        "[mv-engine] {:.1f} s {} frames | hooks {} | guest palettes {:.0f}/frame (no entry "
-        "record {}), {} addresses | draws {:.0f}/frame, engine identity {:.1f}% | palettes "
+        "[mv-engine] {:.1f} s {} frames | hooks {} | caves entered: BonePalette entry {:.1f}/frame, "
+        "SetPalette site {:.1f}/frame; recorded {:.1f}/frame (site without entry record {}), {} "
+        "addresses (0 entries: the game never took BonePalette, every instance drawn has a GPU "
+        "skin ring: DrawMesh eboot+0x21d0740 test [instance+8]) | draws {:.0f}/frame, engine identity {:.1f}% | palettes "
         "{:.0f}/frame: identity {:.1f}%, previous transform found {:.1f}% of identified, new "
         "object {:.1f}/frame | fallbacks: no record {:.1f}/frame, GPU-written {:.1f}/frame, "
         "stale {:.1f}/frame, unmapped {:.1f}/frame, old path used {:.1f}/frame | camera blocks "
         "{:.0f}/frame: pass key {:.1f}% (previous found {:.1f}%), fallback {:.1f}% | passes "
         "recognized {:.1f}/frame, engine sinks {:.1f}/frame",
-        secs, g_frames, g_hooks.load() ? "on" : "off", double(g_guest_sets.exchange(0)) / f,
+        secs, g_frames, g_hooks.load() ? "on" : "off", double(g_guest_begins.exchange(0)) / f,
+        double(g_guest_sets.exchange(0)) / f, double(g_recorded.exchange(0)) / f,
         g_guest_nobegin.exchange(0), addrs, double(S(Stat::Draws)) / f,
         Pct(S(Stat::EngineDraws), S(Stat::Draws)), double(S(Stat::PalLookups)) / f,
         Pct(S(Stat::PalFound), S(Stat::PalLookups)), Pct(S(Stat::PalPrev), S(Stat::PalFound)),
@@ -246,7 +250,6 @@ void OnFrame() {
         double(S(Stat::CamLookups)) / f, Pct(S(Stat::CamPass), S(Stat::CamLookups)),
         Pct(S(Stat::CamPassPrev), S(Stat::CamPass)), Pct(S(Stat::CamFallback), S(Stat::CamLookups)),
         double(g_passes_sum) / f, double(g_sinks_sum) / f));
-    g_guest_begins = 0;
     g_st.fill(0);
     g_miss.fill(0);
     g_frames = g_passes_sum = g_sinks_sum = 0;
