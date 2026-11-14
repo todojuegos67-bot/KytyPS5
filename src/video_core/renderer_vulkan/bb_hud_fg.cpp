@@ -337,7 +337,7 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
         }
         if (fix_pipe) {
             const VkBufferCreateInfo ci = vk::BufferCreateInfo{
-                .size = FixSlots * 2 * sizeof(u32),
+                .size = FixSlots * 3 * sizeof(u32),
                 .usage = vk::BufferUsageFlagBits::eStorageBuffer |
                          vk::BufferUsageFlagBits::eTransferDst,
                 .sharingMode = vk::SharingMode::eExclusive,
@@ -376,12 +376,13 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
     const u32 slot = fix_slot;
     fix_slot = (fix_slot + 1) % FixSlots;
     if (fix_frames >= FixSlots) {
-        sec_hud_px += fix_counts_map[slot * 2];
-        sec_fixed_px += fix_counts_map[slot * 2 + 1];
+        sec_hud_px += fix_counts_map[slot * 3];
+        sec_fixed_px += fix_counts_map[slot * 3 + 1];
+        sec_spark_px += fix_counts_map[slot * 3 + 2];
     }
     ++fix_frames;
     sec_px += static_cast<u64>(extent.width) * extent.height;
-    cmd.fillBuffer(fix_counts, slot * 2 * sizeof(u32), 2 * sizeof(u32), 0u);
+    cmd.fillBuffer(fix_counts, slot * 3 * sizeof(u32), 3 * sizeof(u32), 0u);
     const vk::MemoryBarrier2 mem{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -420,9 +421,13 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
         const char* v = std::getenv("BB_FSR3_PLAYER_REAL");
         return v != nullptr && v[0] == '1';
     }();
+    // bb-mv-fill (BB_FG_SPARKS=1): effect pixels (sparks, embers, glows) get the background
+    // around them in this image, so frame generation shows them as in the real frame instead of
+    // interpolating them with the vectors behind them (doubled sparks).
+    const bool sparks = BB::ObjMv2::SparksOn();
     vk::ImageView obj_view{};
     float osx = 1.0f, osy = 1.0f;
-    const bool use_obj = player_real && BB::ObjMv2::ObjectTarget(obj_view, osx, osy);
+    const bool use_obj = (player_real || sparks) && BB::ObjMv2::ObjectTarget(obj_view, osx, osy);
     const vk::DescriptorImageInfo o_info{sampler, use_obj ? obj_view : frame_view,
                                          vk::ImageLayout::eGeneral};
     const std::array writes{
@@ -451,7 +456,9 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
         u32 size[4];
         float obj[4];
     } push{{extent.width, extent.height, bgra ? 1u : 0u, slot},
-           {osx, osy, use_obj ? 1.0f : 0.0f, grade_hud ? 1.0f : 0.0f}};
+           {osx, osy,
+            (use_obj && player_real ? 1.0f : 0.0f) + (use_obj && sparks ? 2.0f : 0.0f),
+            grade_hud ? 1.0f : 0.0f}};
     static_assert(sizeof(push) == 32);
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, fix_pipe);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, fix_layout, 0, writes);
@@ -476,15 +483,16 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
 void HudFg::LogHudlessSecond(double seconds) {
     const u32 fixed = sec_fix.exchange(0), skipped = sec_fix_skipped.exchange(0);
     const u64 hud = sec_hud_px.exchange(0), mism = sec_fixed_px.exchange(0),
-              px = sec_px.exchange(0);
+              px = sec_px.exchange(0), spark = sec_spark_px.exchange(0);
     if (fixed == 0 && skipped == 0) return;
     const double total = px > 0 ? static_cast<double>(px) : 1.0;
     BB::Upscale::Checkpoint(fmt::format(
         "[fsr3-hudless] 1 s: HUD-less matched in {} frames (skipped {}) | HUD pixels {:.2f}% | "
         "outside the HUD, post-processed copy != finished frame on {:.2f}% (now replaced by the "
-        "frame's pixels) | {:.2f} s",
+        "frame's pixels) | sparks given to FG as real-frame pixels {:.3f}% ({}) | {:.2f} s",
         fixed, skipped, 100.0 * static_cast<double>(hud) / total,
-        100.0 * static_cast<double>(mism) / total, seconds));
+        100.0 * static_cast<double>(mism) / total, 100.0 * static_cast<double>(spark) / total,
+        BB::ObjMv2::SparksOn() ? "BB_FG_SPARKS on" : "off", seconds));
 }
 
 void HudFg::NoteFrame(bool fg_frame, const char* fg_kind, bool fsr3_layer) {

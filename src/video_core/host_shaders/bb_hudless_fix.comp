@@ -13,13 +13,44 @@ layout(binding = 1) uniform sampler2D hud_tex;     // UI target, HUD drawn (raw 
 layout(binding = 2) uniform sampler2D hudless_tex; // UI target before the HUD (raw copy)
 layout(binding = 3, rgba8) uniform image2D target; // the HUD-less image (BGRA viewed as RGBA)
 layout(std430, binding = 4) buffer Counts {
-    uint counts[]; // per slot: [HUD pixels, non-HUD pixels that differed (now fixed)]
+    uint counts[]; // per slot: [HUD pixels, non-HUD pixels that differed (now fixed), sparks]
 };
-layout(binding = 5) uniform sampler2D obj_tex;     // (11-13) attachment 7 (.z class 1 = moving opaque)
+// (11-13) the stored colour of bb_objmv2.comp: .a bit 0 the player, bit 1 an effect pixel
+// (bb-mv-fill: sparks, embers, glows of additive / premultiplied draws, class 5).
+layout(binding = 5) uniform sampler2D obj_tex;
 layout(push_constant) uniform Push {
     uvec4 size; // width, height, 1: the target is BGRA memory viewed as RGBA, counter slot
-    vec4 obj;   // render / image scale x y, 1: player from the real frame, 1: HUD pixels graded
+    vec4 obj;   // render / image scale x y, z: 1 player from the real frame + 2 sparks,
+                // w: 1 HUD pixels graded
 } p;
+
+// bb-mv-fill: frame generation (FSR 3.1: ffx_frameinterpolation_inpainting.h, HUD-less attached)
+// interpolates the HUD-less images and replaces a generated pixel by the real frame's wherever the
+// HUD-less image differs from it (fully at >= 10 % per channel, CalculateStaticContentFactor).
+// An effect pixel is given the background around it (no spark) in the HUD-less image: the spark
+// is never interpolated (no displaced copy from last frame's HUD-less image, which has no spark
+// either) and is shown as in the real frame. Sampled on rings of 4 / 8 / 16 / 32 px around it.
+bool SparkAt(vec2 uv) {
+    return textureLod(obj_tex, uv * p.obj.xy, 0.0).a > 1.5;
+}
+vec3 Background(ivec2 c, vec3 fallback) {
+    const ivec2 dirs[8] = ivec2[](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1),
+                                  ivec2(1, 1), ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1));
+    const ivec2 lim = ivec2(p.size.xy) - 1;
+    vec3 sum = vec3(0.0);
+    float n = 0.0;
+    for (int r = 4; r <= 32 && n < 3.0; r *= 2) {
+        for (int i = 0; i < 8; ++i) {
+            const ivec2 q = clamp(c + dirs[i] * r, ivec2(0), lim);
+            if (SparkAt((vec2(q) + 0.5) / vec2(p.size.xy))) {
+                continue;
+            }
+            sum += texelFetch(final_tex, q, 0).rgb;
+            n += 1.0;
+        }
+    }
+    return n > 0.0 ? sum / n : fallback;
+}
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
@@ -30,7 +61,7 @@ void main() {
     vec4 a = textureLod(hud_tex, uv, 0.0);
     vec4 b = textureLod(hudless_tex, uv, 0.0);
     vec3 d = abs(a.rgb - b.rgb);
-    uint base = p.size.w * 2u;
+    uint base = p.size.w * 3u;
     if (max(d.r, max(d.g, d.b)) > 0.5 / 255.0) {
         atomicAdd(counts[base], 1u); // the HUD drew here
         if (p.obj.w > 0.5) {
@@ -59,19 +90,38 @@ void main() {
         }
         return;
     }
-    if (p.obj.z > 0.5) {
+    if (mod(p.obj.z, 2.0) > 0.5) {
         // The player: centre of the screen, moving opaque. The HUD-less image differs there,
         // so FSR 3 takes those pixels from the real frame (as UI).
         const bool centre = abs(uv.x - 0.5) < 0.16 && uv.y > 0.22 && uv.y < 0.97;
         if (centre) {
             const float m = textureLod(obj_tex, uv * p.obj.xy, 0.0).a;
-            if (m > 0.5) {
+            if (mod(m, 2.0) > 0.5) {
                 imageStore(target, c, vec4(0.0));
                 return;
             }
         }
     }
     vec4 f = texelFetch(final_tex, c, 0);
+    if (p.obj.z > 1.5 && SparkAt(uv)) {
+        // bb-mv-fill: an effect pixel (see Background): only where the background differs
+        // clearly from it (a faint glow stays a normal, interpolated pixel).
+        const vec3 bg = Background(c, f.rgb);
+        const vec3 lo = min(bg, f.rgb), hi = max(max(bg, f.rgb), vec3(1.0 / 255.0));
+        if (any(lessThan(lo / hi, vec3(0.88)))) {
+            atomicAdd(counts[base + 2u], 1u);
+            vec4 t = imageLoad(target, c);
+            if (p.size.z != 0u) {
+                t = t.bgra;
+            }
+            vec4 r = vec4(bg, t.a);
+            if (p.size.z != 0u) {
+                r = r.bgra;
+            }
+            imageStore(target, c, r);
+            return;
+        }
+    }
     vec4 t = imageLoad(target, c);
     if (p.size.z != 0u) {
         t = t.bgra;

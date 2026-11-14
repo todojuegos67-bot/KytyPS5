@@ -40,6 +40,7 @@
 //   records both: the engine's own previous camera.
 #pragma once
 
+#include <vector>
 #include "common/types.h"
 
 namespace Core {
@@ -52,6 +53,19 @@ bool Enabled(); // BB_MV_ENGINE=1
 // bb-mv-skin: engine ring-slot previous transforms for every DrawMesh ring draw (skinned and
 // rigid), BB_MV_ENGINE=1 and BB_MV_ENGINE_SLOTS != 0 (BB_MV_ENGINE_SLOTS=0: the e1228687 path).
 bool SlotsEnabled();
+// bb-mv-fill (BB_MV_ENGINE=1, BB_MV_ENGINE_STRICT != 0): no address / order / similarity guess
+// is left for the velocity draws: engine records (ring slots, DMA source of the shared palette
+// buffers, engine camera) or camera-only. BB_MV_ENGINE_STRICT=0: the old fallbacks stay.
+bool StrictEnabled();
+// bb-mv-fill: DrawMesh 0x21d0640 rigid branch with [sink+0x108] == 1 and [sink+0x1c8] set: sink
+// vtable+0x30 (0x224d880) binds the GX buffer object [sink+0x1c8] instead of the ring slot.
+// BB_MV_ENGINE_OVERRIDE=1: that buffer gets our own last-frame copy (keyed by the buffer object,
+// refused when it is rewritten by more than one DMA in a frame). Default off: measured only.
+bool OverrideEnabled();
+// bb-mv-fill: additive / premultiplied effect draws (sparks, embers, glows) write a class-5 mask
+// and their static-world vector into attachment 7; FG gets them as "UI" through the HUD-less
+// image and the upscaler as reactive. BB_MV_ENGINE=1 and BB_FG_SPARKS=1 (default off).
+bool SparksEnabled();
 // Guest frame boundary (sceGnmSubmitAndFlip / sceVideoOutSubmitFlip).
 void OnGuestFlip();
 
@@ -64,6 +78,33 @@ void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance);
 // regs: the cave's register block; rbp the guest frame; xmm the saved xmm0..7 (16 B each).
 void GuestCamera(const u64* regs, u64 rbp, const u8* xmm);
 void SetEngineHooks(u32 drawmesh, u32 camera, const char* detail);
+
+// bb-mv-fill: CP DMA memory -> memory of the graphics queue (GPU command thread, in stream
+// order). BonePalette's sink vtable+0x20 (0x224d620) does not bind the palette: it picks one of
+// five shared GX buffer objects by bone count ([[G+0x6070]+0x310+i*8], i = n<=2,4,16,64,>64) and
+// 0x2568a20 DMAs the CPU palette into it before every draw. The DMA source is the object's data.
+void OnGpuDma(u64 dst, u64 src, u64 bytes);
+// The last DMA of this frame covering [addr, addr+size): its source (+ the offset of addr) and
+// how many DMAs wrote that destination this frame. False: none.
+bool DmaSource(u64 addr, u64 size, u64& src, u32& writes);
+// bb-mv-fill: guest hook after the GX buffer update copied `bytes` from `src` into transient
+// memory and rebuilt the object's V# at `dst` (0x26b1c40, type-1 objects). Recorded only when
+// `src` is the palette BonePalette just handed to the sink on this thread.
+void GuestPalCopy(u64 src, u64 dst, u64 bytes);
+// The V# [addr, addr+size) lies in such a copy whose memory still holds what was copied: its
+// source (+ offset). False: none.
+bool CopySource(Core::MemoryManager* memory, u64 addr, u64 size, u64& src);
+// The engine object whose BonePalette source (CPU palette or the instance's own bone matrices,
+// recorded at the BonePalette entry) starts at `src`. False: no record.
+bool LookupPaletteSource(Core::MemoryManager* memory, u64 src, u64& key);
+
+// bb-mv-fill: the 1-slot ring slots (and, BB_MV_ENGINE_OVERRIDE=1, override buffers) recorded in
+// the last two GPU frames: copied at the end of every frame (compose) so that last frame's copy
+// exists whenever the object was drawn, in any pass.
+struct OwnSlot {
+    u64 addr = 0, size = 0, key = 0;
+};
+void RecentOwnSlots(std::vector<OwnSlot>& out);
 
 // GPU thread: the engine's previous world transform for a buffer the rigid ring branch bound as
 // the current one (V# base within the slot). `key`: the ring object (identity).
@@ -88,6 +129,8 @@ enum class SlotMode : u8 {
 struct SlotHit {
     SlotMode mode = SlotMode::None;
     bool skinned = false;
+    bool override = false;   // bb-mv-fill: an [sink+0x1c8] override buffer
+    bool drawn_prev = false; // bb-mv-fill: the ring was drawn in the previous guest frame
     u64 prev_addr = 0; // Engine: previous slot + offset
     u64 key = 0;       // ring object x kind (x bone for per-bone rigid tables)
     u64 offset = 0;    // V# base minus the slot's base
@@ -156,6 +199,22 @@ enum class Stat : u8 {
     PalNoRecordCamOnly, // palette-sized GPU-written V# without any engine record: camera-only
     SkinDraws,         // velocity draws with a skinned slot buffer
     SkinDrawsPrev,     // ... all of whose skinned slot buffers had a true previous
+    // bb-mv-fill
+    SlotOwnEnd,        // own copy taken from the end-of-frame copy of the whole slot
+    SlotOwnMissNew,    // 1-slot ring without a copy: not drawn last guest frame (new / culled)
+    SlotOwnMissDrawn,  // ... drawn last guest frame, still no copy (should be ~0)
+    OwnEndCopies,      // whole-slot copies made at the end of the frame
+    OwnEndSkipped,     // ... not made (not in the GPU buffer cache / arena full)
+    OvrSeen,           // override-buffer V#s in velocity draws
+    OvrPrev,           // ... with last frame's copy (BB_MV_ENGINE_OVERRIDE=1)
+    OvrShared,         // ... rewritten by 2+ DMAs this frame: camera-only
+    PalDma,            // palette-sized V#s in a DMA-written shared buffer
+    PalDmaId,          // ... whose DMA source has an engine record
+    PalDmaPrev,        // ... and last frame's copy of that object
+    PalDmaNoRecord,    // ... DMA source without a BonePalette record: camera-only
+    StrictCamOnly,     // buffers left at their current data (no engine previous): camera-only
+    StrictNoCam,       // camera blocks without the engine camera: no vector (bb_mv backup)
+    CamEngBlend,       // blended draws' camera blocks given the engine previous
     Count
 };
 void Count(Stat s, u64 n = 1);

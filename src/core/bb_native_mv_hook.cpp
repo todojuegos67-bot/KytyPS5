@@ -113,6 +113,14 @@ void PS4_SYSV_ABI HookDrawMeshEngine(const u64* regs) {
 void PS4_SYSV_ABI HookCamera(const u64* regs, u64 rbp, const u8* xmm) {
     MvEngine::GuestCamera(regs, rbp, xmm);
 }
+void PS4_SYSV_ABI HookPalCopy(const u64* regs, u64 rbp, const u8* xmm) {
+    (void)regs;
+    (void)xmm;
+    const u64 src = *reinterpret_cast<const u64*>(rbp - 0x70);
+    const u64 bytes = *reinterpret_cast<const u64*>(rbp - 0x88) & 0xffffffffull;
+    const u64 vsharp = *reinterpret_cast<const u64*>(rbp - 0x40);
+    MvEngine::GuestPalCopy(src, vsharp & ((1ull << 44) - 1), bytes);
+}
 
 // DrawMesh body (0x21d0640, size < DrawMeshSize): the instructions GuestDrawMesh mirrors.
 struct BodyCheck {
@@ -180,6 +188,24 @@ constexpr int SigCamera[] = {
     0xc0, 0x01, 0x00, 0x00, 0xc5, 0xf8, 0x29, 0xab, 0xd0, 0x01, 0x00, 0x00, 0xc5, 0xf8, 0x29, 0xb3,
     0xe0, 0x01, 0x00, 0x00, 0xc5, 0xf8, 0x29, 0xbb, 0xf0, 0x01, 0x00, 0x00};
 constexpr u32 CameraRelocLen = 28;
+
+// bb-mv-fill: GX buffer update, type-1 objects (0x2168a20 -> 0x26b3560 -> 0x26b1c40): the data
+// (rsi = [rbp-0x70], rdx = [rbp-0x88] bytes) is memcpy'd (0x2bbe578) into a fresh transient
+// allocation (r15) and the object's V# is rebuilt over it (0x10707c0, [rbp-0x40]). Hooked after
+// that (mov rax,[rbp-0x40]; mov rcx,[rbp-0x38]; mov rdx,[rbp-0x98]: 15 bytes, no rip-relative):
+// the V# base the GPU reads -> the CPU source (a BonePalette palette: the object).
+constexpr int SigPalCopy[] = {
+    0x4c, 0x89, 0xff, 0x48, 0x8b, 0x75, 0x90, 0xe8, W, W, W, W, 0xc1, 0xeb, 0x02, 0xba,
+    0x04, 0x44, 0x00, 0x00, 0x4c, 0x8d, 0x65, 0xc0, 0x4c, 0x89, 0xe7, 0x4c, 0x89, 0xfe, 0x89, 0xd9,
+    0xe8, W, W, W, W, 0xbe, 0x6e, 0x00, 0x00, 0x00, 0x31, 0xd2, 0xb9, 0x01, 0x00, 0x00,
+    0x00, 0x4c, 0x89, 0xe7, 0xe8, W, W, W, W, 0xba, 0x04, 0x44, 0x00, 0x00, 0x4c, 0x8d,
+    0x65, 0xb0, 0x4c, 0x89, 0xe7, 0x48, 0x8b, 0x75, 0x88, 0x89, 0xd9, 0xe8, W, W, W, W,
+    0x4c, 0x89, 0xe7, 0x8b, 0xb5, 0x74, 0xff, 0xff, 0xff, 0x8b, 0x95, 0x2c, 0xff, 0xff, 0xff, 0x8b,
+    0x8d, 0x28, 0xff, 0xff, 0xff, 0xe8, W, W, W, W, 0x48, 0x8b, 0x45, 0xc0, 0x48, 0x8b,
+    0x4d, 0xc8, 0x48, 0x8b, 0x95, 0x68, 0xff, 0xff, 0xff,
+};
+constexpr u32 PalCopyAt = 0x6a;
+constexpr u32 PalCopyLen = 15;
 
 // BonePalette entry: PrologueA + mov rbx,rcx; mov r12,rdx; mov r14,rsi; mov r15,rdi;
 // cmp byte [r15+0x200],0 (two functions: 1.09 0x21d1080 / 0x21d1650).
@@ -408,6 +434,19 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
             ed += fmt::format(", SSAO reprojection eboot+0x{:x}", *cs);
         } else {
             ed += ", SSAO reprojection site not found (unique)";
+        }
+        // bb-mv-fill: palette copies into transient GPU memory (BB_MV_ENGINE_SLOTS on).
+        if (MvEngine::SlotsEnabled()) {
+            const auto pc = Find(img, code, SigPalCopy, std::size(SigPalCopy));
+            if (pc && (next - cave) + 0x200 <= ptrdiff_t(kCaveBytes)) {
+                u8* at = reinterpret_cast<u8*>(eboot_base + *pc + PalCopyAt);
+                u8* p = place(BuildCave(reinterpret_cast<u64>(&HookPalCopy), at, PalCopyLen,
+                                        reinterpret_cast<u64>(at + PalCopyLen), true));
+                Detour(at, p);
+                ed += fmt::format(", GX palette copy eboot+0x{:x}", *pc + PalCopyAt);
+            } else {
+                ed += ", GX palette copy site not found (unique)";
+            }
         }
         MvEngine::SetEngineHooks(dm_ok, cam_ok, ed.c_str());
     }

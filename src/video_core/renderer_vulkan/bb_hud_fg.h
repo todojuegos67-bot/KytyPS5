@@ -89,7 +89,7 @@ private:
     static constexpr u32 FixSlots = 8; // read back FixSlots - 1 frames later
     u32 fix_slot = 0, fix_frames = 0;
     std::atomic<u32> sec_fix{0}, sec_fix_skipped{0};
-    std::atomic<u64> sec_hud_px{0}, sec_fixed_px{0}, sec_px{0};
+    std::atomic<u64> sec_hud_px{0}, sec_fixed_px{0}, sec_px{0}, sec_spark_px{0};
 
     // Per-second counters (the GPU thread builds, the present thread logs).
     std::atomic<u32> sec_fg{0}, sec_layer{0}, sec_hudless{0}, sec_static{0}, sec_overlaid{0},

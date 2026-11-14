@@ -193,6 +193,43 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
             weight = zero;
         }
     }
+    if (ctx.runtime_info.hw.fs.bb_objmv_add) {
+        // bb-mv-fill: an additive / premultiplied effect (sparks, embers, glows). Attachment 7
+        // blends with this weight as src alpha (RGB only), so weight 1 replaces (dx, dy) and the
+        // class with the effect's own static-world vector and class 5, weight 0 keeps what was
+        // behind. Weight 1 only where the colour it adds is bright: luminance of MRT 0 (x its
+        // alpha when the game's blend uses src alpha: push word bit 16) > threshold (bits 0-15,
+        // 1/4096). The push word is objmv_fog (unused by these draws).
+        cls = ctx.Constant(f32, 5.0f);
+        weight = zero;
+        const auto& mrt0 = ctx.frag_outputs[0];
+        if (Sirit::ValidId(mrt0.id) && mrt0.num_components >= 3 && !mrt0.is_integer) {
+            const Id col = ctx.OpLoad(ctx.F32[mrt0.num_components], mrt0.id);
+            const Id r = ctx.OpCompositeExtract(f32, col, 0u);
+            const Id g = ctx.OpCompositeExtract(f32, col, 1u);
+            const Id bl = ctx.OpCompositeExtract(f32, col, 2u);
+            Id lum = ctx.OpFAdd(f32,
+                                ctx.OpFAdd(f32, ctx.OpFMul(f32, r, ctx.Constant(f32, 0.2126f)),
+                                           ctx.OpFMul(f32, g, ctx.Constant(f32, 0.7152f))),
+                                ctx.OpFMul(f32, bl, ctx.Constant(f32, 0.0722f)));
+            const Id word = PushU32(ctx, PushData::ObjMvFogIndex);
+            if (mrt0.num_components == 4) {
+                const Id a = ctx.OpFClamp(f32, ctx.OpCompositeExtract(f32, col, 3u), zero, one);
+                const Id mul = ctx.OpINotEqual(
+                    b, ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.ConstU32(0x10000u)),
+                    ctx.u32_zero_value);
+                lum = ctx.OpSelect(f32, mul, ctx.OpFMul(f32, lum, a), lum);
+            }
+            const Id thr = ctx.OpFMul(
+                f32,
+                ctx.OpConvertUToF(f32, ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.ConstU32(0xffffu))),
+                ctx.Constant(f32, 1.0f / 4096.0f));
+            // NaN / Inf colours never count (OpFOrdGreaterThan is false for NaN).
+            const Id bright = ctx.OpLogicalAnd(b, ctx.OpFOrdGreaterThan(b, lum, thr),
+                                               ctx.OpLogicalNot(b, ctx.OpIsInf(b, lum)));
+            weight = ctx.OpSelect(f32, ctx.OpLogicalAnd(b, written, bright), one, zero);
+        }
+    }
     ctx.OpStore(ctx.objmv_frag_out,
                 ctx.OpCompositeConstruct(ctx.F32[4], std::array<Id, 4>{
                                              ctx.OpSelect(f32, written, dx, zero),
