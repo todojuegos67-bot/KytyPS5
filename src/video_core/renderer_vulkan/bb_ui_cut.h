@@ -222,7 +222,8 @@ private:
     u32 trace_next = 0, trace_total = 0;
     // bb-hud-native state (GPU thread).
     u32 native_depth = 0;          // open BeginScene markers
-    bool native_seen = false;      // a marker arrived since start
+    bool native_seen = false;      // a marker arrived recently (within 120 frames)
+    u32 native_quiet_frames = 0;   // frames since the last marker
     bool native_draw = false;      // this draw is between the markers
     bool native_color_redirected = false; // this draw's colour went to native_layer
     bool native_cb0_layer = false;  // this draw's colour buffer 0 register is the HUD layer

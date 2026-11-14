@@ -190,6 +190,7 @@ void FlushNative(u32 ow, u32 oh, VAddr layer, u32 lw, u32 lh) {
 void UiCut::OnNativeMarker(bool begin, u32 seq) {
     (void)seq;
     native_seen = true;
+    native_quiet_frames = 0;
     if (begin) {
         ++native_depth;
         ++g_native.begins;
@@ -322,6 +323,12 @@ bool UiCut::RenderTarget(u32 w, u32 h) const {
 void UiCut::OnFrameStart() {
     if (BB::HudNativeHook::Enabled()) {
         ++g_native.frames;
+        // Markers stopped (no room in the dcb for long, another UI path): back to the heuristic
+        // cut instead of a frame with no UI start at all. The next marker re-arms it.
+        if (native_seen && ++native_quiet_frames > 120) {
+            native_seen = false;
+            last_layer_ok = layer_ok_frame = false;
+        }
         if (native_depth != 0) {
             ++g_native.unbalanced; // a BeginScene marker without its EndScene: closed here
             native_depth = 0;
