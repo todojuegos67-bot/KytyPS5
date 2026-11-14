@@ -1515,7 +1515,7 @@ if ($Play) {
 # ================================================================ ventana
 try {
 	Add-Type -Namespace BbDpi -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(System.IntPtr v); [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr SetThreadDpiAwarenessContext(System.IntPtr v); [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetProcessDPIAware();' -ErrorAction Stop
-	$dpiOk = $false; try { $dpiOk = [BbDpi.Native]::SetProcessDpiAwarenessContext([System.IntPtr](-4))  # (bb-launcher-3) -4 = PER_MONITOR_AWARE_V2; antes -5 = UNAWARE_GDISCALED (Windows estiraba la ventana: letra borrosa) } catch { }
+	$dpiOk = $false; try { $dpiOk = [BbDpi.Native]::SetProcessDpiAwarenessContext([System.IntPtr](-4)) } catch { }  # (bb-launcher-3) -4 = PER_MONITOR_AWARE_V2; antes -5 = UNAWARE_GDISCALED (Windows estiraba la ventana: letra borrosa)
 	# (bb-launcher-3) si el proceso ya tenia modo DPI (manifiesto de powershell.exe), el del hilo hace que las ventanas nuevas
 	# sean per-monitor v2 igualmente: sin el estirado de mapa de bits de Windows (letra borrosa)
 	if (-not $dpiOk) { try { $dpiOk = ([BbDpi.Native]::SetThreadDpiAwarenessContext([System.IntPtr](-4)) -ne [System.IntPtr]::Zero) } catch { } }
