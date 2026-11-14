@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <filesystem>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -125,6 +127,12 @@ private:
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
+    // bb-perf-2 (BB_PERF2=1): the driver's VkPipelineCache kept on disk between runs.
+    void MaybeSaveDriverCache(bool force = false);
+    std::filesystem::path driver_cache_path{};
+    u32 driver_cache_saved_at{};
+    u32 driver_cache_new{};
+    std::chrono::steady_clock::time_point driver_cache_save_time{};
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;

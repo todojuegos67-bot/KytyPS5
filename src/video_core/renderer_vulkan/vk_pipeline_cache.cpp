@@ -15,6 +15,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/bb/bb_objmv2.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -341,13 +342,82 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     };
     WarmUp();
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
+    // bb-perf-2 (BB_PERF2=1): seed the driver pipeline cache from the last run, so pipelines the
+    // game already used skip the driver's SPIR-V -> ISA step (the driver validates the header and
+    // ignores data from another GPU/driver version).
+    std::vector<u8> initial_data;
+    if (BBPerf2::Enabled()) {
+        const auto props = instance.GetPhysicalDevice().getProperties();
+        driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                            fmt::format("bb-driver-cache-{:08x}-{:08x}.bin", props.deviceID,
+                                        props.driverVersion);
+        std::error_code ec;
+        if (std::filesystem::exists(driver_cache_path, ec)) {
+            Common::FS::IOFile file{driver_cache_path, Common::FS::FileAccessMode::Read};
+            if (file.IsOpen()) {
+                initial_data.resize(file.GetSize());
+                if (file.Read(initial_data) != initial_data.size()) {
+                    initial_data.clear();
+                }
+            }
+        }
+        LOG_INFO(Render_Vulkan, "[perf2] driver pipeline cache {}: {} KiB loaded",
+                 driver_cache_path.filename().string(), initial_data.size() / 1024);
+    }
+    vk::PipelineCacheCreateInfo cache_ci{};
+    cache_ci.initialDataSize = initial_data.size();
+    cache_ci.pInitialData = initial_data.empty() ? nullptr : initial_data.data();
+    auto created = instance.GetDevice().createPipelineCacheUnique(cache_ci);
+    if (created.result != vk::Result::eSuccess && !initial_data.empty()) {
+        LOG_WARNING(Render_Vulkan, "[perf2] driver pipeline cache rejected ({}), starting empty",
+                    vk::to_string(created.result));
+        created = instance.GetDevice().createPipelineCacheUnique({});
+    }
+    ASSERT_MSG(created.result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+               vk::to_string(created.result));
+    pipeline_cache = std::move(created.value);
+    driver_cache_save_time = std::chrono::steady_clock::now();
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    MaybeSaveDriverCache(true);
+}
+
+void PipelineCache::MaybeSaveDriverCache(bool force) {
+    if (!BBPerf2::Enabled() || driver_cache_path.empty() || !pipeline_cache) {
+        return;
+    }
+    if (!force) {
+        ++driver_cache_new;
+    }
+    // Save after a burst of new pipelines, at most every 20 s (getPipelineCacheData copies the
+    // whole blob), and on shutdown when there is anything new.
+    const auto now = std::chrono::steady_clock::now();
+    const u32 pending = driver_cache_new - driver_cache_saved_at;
+    if (pending == 0 ||
+        (!force && (pending < 16 || now - driver_cache_save_time < std::chrono::seconds(20)))) {
+        return;
+    }
+    auto [res, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    driver_cache_saved_at = driver_cache_new;
+    driver_cache_save_time = now;
+    if (res != vk::Result::eSuccess || data.empty()) {
+        return;
+    }
+    // Write to a temp file and rename, so a crash mid-write never leaves a torn cache.
+    auto tmp = driver_cache_path;
+    tmp += ".tmp";
+    {
+        Common::FS::IOFile file{tmp, Common::FS::FileAccessMode::Create};
+        if (!file.IsOpen() || file.Write(data) != data.size()) {
+            return;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, driver_cache_path, ec);
+    LOG_INFO(Render_Vulkan, "[perf2] driver pipeline cache saved: {} KiB, {} new pipelines",
+             data.size() / 1024, pending);
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
@@ -359,10 +429,17 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        const auto t0 = std::chrono::steady_clock::now();
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
+        BBPerf2::Add(BBPerf2::Get().gfx_pipelines, 1);
+        BBPerf2::Add(BBPerf2::Get().compile_us,
+                     std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
+        MaybeSaveDriverCache();
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -388,10 +465,17 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
+        const auto t0 = std::chrono::steady_clock::now();
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
+        BBPerf2::Add(BBPerf2::Get().cs_pipelines, 1);
+        BBPerf2::Add(BBPerf2::Get().compile_us,
+                     std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
+        MaybeSaveDriverCache();
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
@@ -645,6 +729,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
                                               Shader::Backend::Bindings& binding) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
+    BBPerf2::Add(BBPerf2::Get().shaders, 1);
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);

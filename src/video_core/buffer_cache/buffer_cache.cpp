@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb/bb_perf2.h"
 #include <algorithm>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
@@ -121,6 +122,7 @@ void BufferCache::TickFrame() {
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    BBPerf2::Add(BBPerf2::Get().cpu_writes, 1);
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, false, assume_locks);
     });
@@ -182,6 +184,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return;
     }
+    BBPerf2::Add(BBPerf2::Get().buf_down_bytes, total_size_bytes);
     const auto download =
         staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 16, async);
     for (auto& copy : copies) {
@@ -420,7 +423,9 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.offset = memory_offset >> block_shift;
         resident_ranges.Add(backing);
 
-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+        // bb-perf-2: was LOG_INFO per range (hundreds of lines a second during streaming).
+        LOG_DEBUG(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+        BBPerf2::Add(BBPerf2::Get().sparse_binds, 1);
 
         const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
@@ -456,6 +461,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         total_size_bytes += size;
     });
     if (!copies.empty()) {
+        BBPerf2::Add(BBPerf2::Get().buf_up_bytes, total_size_bytes);
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);

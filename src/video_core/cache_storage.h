@@ -32,6 +32,8 @@ public:
         return opened;
     }
     void FinishPreload();
+    // bb-perf-2: close, move the current cache aside (<name>.stale) and open an empty one.
+    void Reset();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);

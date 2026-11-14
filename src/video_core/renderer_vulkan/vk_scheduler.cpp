@@ -5,6 +5,7 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -131,7 +132,15 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    if (work_semaphore.IsFree(tick)) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
     work_semaphore.Wait(tick);
+    BBPerf2::Add(BBPerf2::Get().waits, 1);
+    BBPerf2::Add(BBPerf2::Get().wait_us, std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - t0)
+                                             .count());
 }
 
 void Scheduler::PopPendingOperations() {

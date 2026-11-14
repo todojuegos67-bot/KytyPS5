@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb/bb_perf2.h"
 #include <algorithm>
 #include <limits>
 #include <xxhash.h>
@@ -910,6 +911,8 @@ void TextureCache::RefreshImage(Image& image) {
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }
+    BBPerf2::Add(BBPerf2::Get().tex_up_bytes, image.info.guest_size);
+    BBPerf2::Add(BBPerf2::Get().tex_uploads, 1);
 
     runtime.UploadImage(&image, buffer, image_copies);
 }

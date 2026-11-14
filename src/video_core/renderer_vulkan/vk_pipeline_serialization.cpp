@@ -311,6 +311,24 @@ void PipelineCache::WarmUp() {
     // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
+    // bb-perf-2 bug fix: a cache written by another build (profile size/contents differ) used to
+    // be ignored AND kept open-closed forever, so the pipeline cache was never rebuilt and every
+    // run recompiled every shader/pipeline ("Pipeline cache profile has unexpected size (72 !=
+    // 64)" on every start). Now the stale cache is set aside and a new one is started.
+    bool stale = !profile_data.empty() && profile_data.size() != sizeof(Shader::Profile);
+    if (!profile_data.empty() && !stale) {
+        Shader::Profile cached{};
+        std::memcpy(&cached, profile_data.data(), sizeof(cached));
+        stale = cached != profile;
+    }
+    if (stale) {
+        LOG_WARNING(Render,
+                    "Pipeline cache was made by another build/system (profile {} B, now {} B): "
+                    "set aside, starting a new cache",
+                    profile_data.size(), sizeof(Shader::Profile));
+        Storage::DataBase::Instance().Reset();
+        profile_data.clear();
+    }
     if (profile_data.empty()) {
         Storage::DataBase::Instance().FinishPreload();
 

@@ -259,6 +259,37 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
     }
 }
 
+void DataBase::Reset() {
+    if (opened) {
+        io_worker.request_stop();
+        io_worker.join();
+        if (EmulatorSettings.IsPipelineCacheArchived()) {
+            // Opened for reading only (FinishPreload not called yet): just release the file.
+            if (ar_is_read_only) {
+                mz_zip_reader_end(&zip_ar);
+            } else {
+                mz_zip_writer_finalize_archive(&zip_ar);
+                mz_zip_writer_end(&zip_ar);
+            }
+        }
+        opened = false;
+    }
+    std::error_code ec;
+    if (!cache_path.empty() && std::filesystem::exists(cache_path, ec)) {
+        auto stale = cache_path;
+        stale += ".stale";
+        std::filesystem::remove_all(stale, ec);
+        std::filesystem::rename(cache_path, stale, ec);
+        if (ec) {
+            LOG_WARNING(Render, "Could not move the old cache aside ({}); removing it",
+                        ec.message());
+            std::filesystem::remove_all(cache_path, ec);
+        }
+    }
+    ar_is_read_only = true;
+    Open();
+}
+
 void DataBase::FinishPreload() {
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());

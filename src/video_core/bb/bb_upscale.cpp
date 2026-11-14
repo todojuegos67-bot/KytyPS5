@@ -3,6 +3,7 @@
 // bb-clean-021: see bb_upscale.h. Config, back end set-up (from bb-combo-159), the camera from
 // Bloodborne's scene constant block, jitter and the once-per-second performance line.
 
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/bb/bb_dlss5.h"
 #include "video_core/bb/bb_fg.h"
@@ -773,9 +774,61 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
     return cam;
 }
 
+// bb-perf-2: one "[perf2]" line every 10 s: frame pacing (mean / worst / frames over 50 ms),
+// CPU and GPU frame ms, pipeline compiles and their cost, CPU write faults on GPU-tracked memory,
+// buffer/texture upload and readback MiB/s, sparse binds and blocking GPU waits.
+static void NotePerf2(std::chrono::steady_clock::time_point now, double cpu_ms, double wait_ms,
+                      double gpu_ms) {
+    static struct {
+        std::chrono::steady_clock::time_point start{};
+        u64 frames{}, gpu_n{}, slow{};
+        double cpu{}, gpu{}, wait{}, worst{};
+    } a;
+    if (a.start.time_since_epoch().count() == 0) {
+        a.start = now;
+    }
+    const double f = cpu_ms + wait_ms;
+    a.cpu += cpu_ms;
+    a.wait += wait_ms;
+    a.worst = std::max(a.worst, f);
+    a.slow += f > 50.0 ? 1 : 0;
+    if (gpu_ms > 0) {
+        a.gpu += gpu_ms;
+        ++a.gpu_n;
+    }
+    ++a.frames;
+    const double el = std::chrono::duration<double>(now - a.start).count();
+    if (el < 10.0) {
+        return;
+    }
+    auto& c = BBPerf2::Get();
+    const auto take = [](std::atomic<u64>& v) { return v.exchange(0, std::memory_order_relaxed); };
+    const u64 gp = take(c.gfx_pipelines), cp = take(c.cs_pipelines), sh = take(c.shaders);
+    const double comp_ms = take(c.compile_us) / 1000.0;
+    const u64 faults = take(c.cpu_writes), binds = take(c.sparse_binds);
+    const double mib = 1024.0 * 1024.0 * el;
+    const double up = take(c.buf_up_bytes) / mib, down = take(c.buf_down_bytes) / mib;
+    const u64 tex_n = take(c.tex_uploads);
+    const double tex = take(c.tex_up_bytes) / mib;
+    const u64 waits = take(c.waits);
+    const double wait_total = take(c.wait_us) / 1000.0;
+    LOG_INFO(Render_Vulkan,
+             "[perf2] 10s: fps {:.1f} frame {:.2f} ms (worst {:.1f}, >50ms {}) cpu {:.2f} gpu "
+             "{:.2f} fence {:.2f} | compiles {} gfx {} cs {} shaders ({:.0f} ms) | cpu-write "
+             "faults {:.0f}/s | uploads buf {:.1f} tex {:.1f} MiB/s ({:.0f} img/s) readback {:.2f} "
+             "MiB/s | sparse binds {} | gpu waits {:.0f}/s {:.1f} ms/s | BB_PERF2={}",
+             a.frames / el, el * 1000.0 / a.frames, a.worst, a.slow, a.cpu / a.frames,
+             a.gpu_n ? a.gpu / a.gpu_n : 0.0, a.wait / a.frames, gp, cp, sh, comp_ms,
+             faults / el, up, tex, tex_n / el, down, binds, waits / el, wait_total / el,
+             BBPerf2::Enabled() ? 1 : 0);
+    a = {};
+    a.start = now;
+}
+
 void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, double mv_ms,
                u32 in_w, u32 in_h, u32 sr_w, u32 sr_h, u32 out_w, u32 out_h, bool upscaled) {
     const auto now = std::chrono::steady_clock::now();
+    NotePerf2(now, cpu_ms, wait_ms, gpu_ms);
     if (g_acc.frames == 0 && g_acc.start.time_since_epoch().count() == 0) {
         g_acc.start = now;
     }
