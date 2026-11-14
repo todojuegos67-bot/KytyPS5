@@ -2450,7 +2450,7 @@ function Draw-ComboItem($combo, $e) {
 		if ($text -match 'DLSS|NVIDIA') { $color = [System.Drawing.Color]::FromArgb(118, 185, 0) } elseif ($text -match 'XeSS') { $color = [System.Drawing.Color]::FromArgb(70, 160, 255) } elseif ($text -match 'FSR|AMD') { $color = [System.Drawing.Color]::FromArgb(237, 70, 70) }
 	}
 	$r = New-Object System.Drawing.Rectangle(($e.Bounds.X + 8), $e.Bounds.Y, ($e.Bounds.Width - 8), $e.Bounds.Height)
-	[System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $combo.Font, $r, $color, ([System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis))
+	[System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $combo.Font, $r, $color, ([System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::WordBreak))
 }
 function Set-ComboStyle($c) {
 	$c.DrawMode = 'OwnerDrawFixed'; $c.ItemHeight = 24; $c.BackColor = $field; $c.ForeColor = $ink
@@ -3195,7 +3195,7 @@ $btnSteam2.Add_Paint({ param($s, $e)
 	$f = New-Object System.Drawing.Font('Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold)
 	$tc = $(if ($hot) { [System.Drawing.Color]::FromArgb(255, 245, 215, 140) } else { [System.Drawing.Color]::FromArgb(255, 226, 196, 120) })
 	$tr = New-Object System.Drawing.Rectangle(32, 0, ($s.Width - 40), $s.Height)
-	[System.Windows.Forms.TextRenderer]::DrawText($g, (T 'Añadir a la biblioteca de Steam' 'Add to Steam library'), $f, $tr, $tc, ([System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis))
+	[System.Windows.Forms.TextRenderer]::DrawText($g, (T 'Añadir a la biblioteca de Steam' 'Add to Steam library'), $f, $tr, $tc, ([System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::WordBreak))
 	$f.Dispose()
 })
 $btnSteam2.Add_MouseEnter({ $this.Tag = $true; $this.Invalidate() })
@@ -4059,10 +4059,10 @@ public static class BbOGfx {
   static BbOGfx() {
     Typo = new StringFormat(StringFormat.GenericTypographic); Typo.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces | StringFormatFlags.NoWrap | StringFormatFlags.NoClip;
     TypoVC = new StringFormat(StringFormat.GenericTypographic); TypoVC.FormatFlags |= StringFormatFlags.NoWrap | StringFormatFlags.NoClip; TypoVC.LineAlignment = StringAlignment.Center;
-    Line = new StringFormat(StringFormatFlags.NoWrap); Line.Trimming = StringTrimming.EllipsisCharacter; Line.LineAlignment = StringAlignment.Center; Line.Alignment = StringAlignment.Near;
-    LineCenter = new StringFormat(StringFormatFlags.NoWrap); LineCenter.Trimming = StringTrimming.EllipsisCharacter; LineCenter.LineAlignment = StringAlignment.Center; LineCenter.Alignment = StringAlignment.Center;
-    Wrap = new StringFormat(); Wrap.Trimming = StringTrimming.Word; Wrap.LineAlignment = StringAlignment.Near; Wrap.Alignment = StringAlignment.Near;
-    WrapCenter = new StringFormat(); WrapCenter.Trimming = StringTrimming.EllipsisWord; WrapCenter.LineAlignment = StringAlignment.Center; WrapCenter.Alignment = StringAlignment.Near;
+    Line = new StringFormat(); Line.Trimming = StringTrimming.None; Line.LineAlignment = StringAlignment.Center; Line.Alignment = StringAlignment.Near;
+    LineCenter = new StringFormat(); LineCenter.Trimming = StringTrimming.None; LineCenter.LineAlignment = StringAlignment.Center; LineCenter.Alignment = StringAlignment.Center;
+    Wrap = new StringFormat(); Wrap.Trimming = StringTrimming.None; Wrap.LineAlignment = StringAlignment.Near; Wrap.Alignment = StringAlignment.Near;
+    WrapCenter = new StringFormat(); WrapCenter.Trimming = StringTrimming.None; WrapCenter.LineAlignment = StringAlignment.Center; WrapCenter.Alignment = StringAlignment.Near;
   }
   public static Color A(Color c, float a) { int v = (int)(c.A * Math.Max(0f, Math.Min(1f, a)) + 0.5f); return Color.FromArgb(v, c.R, c.G, c.B); }
   public static Color Lerp(Color a, Color b, float t) {
@@ -4387,14 +4387,21 @@ public class BbOPopup : BbOLayer, IBbOAnim {
         if (w > maxW) maxW = w;
       }
     }
+    Rectangle wa = Screen.FromRectangle(anchor).WorkingArea;
+    frameW = (int)Math.Ceiling(Math.Max(anchor.Width, maxW + R(64)));
+    frameW = Math.Min(frameW, wa.Width - 16);
+    using (Bitmap mb2 = new Bitmap(1, 1)) using (Graphics mg2 = Graphics.FromImage(mb2)) {
+      BbOGfx.Hq(mg2); y = 0f;
+      for (int i = 0; i < count; i++) {
+        if (!head[i]) { float th = mg2.MeasureString(text[i], F.PopItem, Math.Max(10, frameW - R(52)), BbOGfx.Wrap).Height; hts[i] = Math.Max(R(30), (float)Math.Ceiling(th) + R(10)); }
+        tops[i] = y; y += hts[i];
+      }
+    }
     contentH = (int)Math.Ceiling(y);
     cur = cb.SelectedIndex; hl = cur;
     int rows = Math.Max(10, cb.MaxDropDownItems);
     float vh = 0f; for (int i = 0; i < count && i < rows; i++) vh += hts[i];
     viewH = (int)Math.Ceiling(Math.Min(contentH, Math.Max(vh, R(60))));
-    Rectangle wa = Screen.FromRectangle(anchor).WorkingArea;
-    frameW = (int)Math.Max(anchor.Width, maxW + R(64));
-    frameW = Math.Min(frameW, Math.Min(R(620), wa.Width - 16));
     frameH = viewH + 2 * padY;
     int below = wa.Bottom - (anchor.Bottom + R(4)) - 8, up = anchor.Top - R(4) - wa.Top - 8;
     if (frameH > below && up > below) { above = true; if (frameH > up) { viewH = Math.Max(R(60), up - 2 * padY); frameH = viewH + 2 * padY; } }
@@ -4897,6 +4904,10 @@ public class BbOptionsPanel : Control, IBbOAnim {
     }
     s.Dirty = Rectangle.Empty;
   }
+  int TH(string t, Font f, float w) {
+    if (String.IsNullOrEmpty(t)) return 0;
+    return (int)Math.Ceiling(measureG.MeasureString(t, f, Math.Max(10, (int)Math.Floor(w)), BbOGfx.Wrap).Height);
+  }
   int AddLine(Sec s, List<Control> line, int gw, int y) {
     Control label = null, value = null; List<Control> checks = new List<Control>(); int others = 0; Control single = line.Count == 1 ? line[0] : null;
     foreach (Control c in line) {
@@ -4907,18 +4918,25 @@ public class BbOptionsPanel : Control, IBbOAnim {
     }
     int padX = R(18), valX = (int)(cardW * 0.385f), valR = cardW - R(14);
     if (value != null && label != null && label.Left < value.Left && checks.Count == 0 && others == 0) {
-      Row r = new Row(); r.Y = y; r.H = R(38);
+      Row r = new Row(); r.Y = y;
       Cell c = new Cell(); c.Kind = (value is ComboBox) ? K.Field : K.Action; c.Ctl = value; c.Label = label;
+      string vt = (value is ComboBox) ? ValueText((ComboBox)value) : value.Text;
+      int lh = TH(label.Text, F.Label, valX - padX - R(8)), vh = TH(vt, F.Value, valR - valX - R(40));
+      int bh = Math.Max(R(28), vh + R(10));
+      r.H = Math.Max(R(38), Math.Max(lh + R(12), bh + R(10)));
       c.R = new RectangleF(padX, y, valX - padX - R(8), r.H);
-      c.Box = new RectangleF(valX, y + (r.H - R(28)) / 2, valR - valX, R(28));
+      c.Box = new RectangleF(valX, y + (r.H - bh) / 2, valR - valX, bh);
       r.Cells.Add(c); s.Rows.Add(r); tracked.Add(value);
       AddHit(s, value, new RectangleF(R(6), y + 1, cardW - R(12), r.H - 2), c);
       return y + r.H;
     }
     if (single != null && (single is ComboBox || (single is Panel && !(single is GroupBox)))) {
-      Row r = new Row(); r.Y = y; r.H = R(38);
+      Row r = new Row(); r.Y = y;
       Cell c = new Cell(); c.Kind = (single is ComboBox) ? K.Field : K.Action; c.Ctl = single;
-      c.Box = new RectangleF(padX, y + (r.H - R(28)) / 2, valR - padX, R(28)); c.R = c.Box;
+      string vt = (single is ComboBox) ? ValueText((ComboBox)single) : single.Text;
+      int bh = Math.Max(R(28), TH(vt, F.Value, valR - padX - R(40)) + R(10));
+      r.H = Math.Max(R(38), bh + R(10));
+      c.Box = new RectangleF(padX, y + (r.H - bh) / 2, valR - padX, bh); c.R = c.Box;
       r.Cells.Add(c); s.Rows.Add(r);
       AddHit(s, single, new RectangleF(R(6), y + 1, cardW - R(12), r.H - 2), c);
       return y + r.H;
@@ -4926,34 +4944,38 @@ public class BbOptionsPanel : Control, IBbOAnim {
     if (checks.Count > 0 && checks.Count == line.Count) {
       Row r = new Row(); r.Y = y; r.H = R(32);
       float inner = cardW - 2 * padX;
-      if (checks.Count == 1) {
-        Control k = checks[0];
-        float tw = inner - R(28);
-        float th = measureG.MeasureString(k.Text, F.Check, (int)Math.Max(10, tw), BbOGfx.Wrap).Height;
-        r.H = Math.Max(R(32), (int)Math.Ceiling(th) + R(10));
+      float[] cxs = new float[checks.Count], cws = new float[checks.Count];
+      for (int ci = 0; ci < checks.Count; ci++) {
+        Control k = checks[ci];
+        float fx = (k.Left - 12f) / Math.Max(1f, gw - 24f);
+        cxs[ci] = padX + Math.Max(0f, Math.Min(0.95f, fx)) * inner;
       }
+      for (int ci = 0; ci < checks.Count; ci++) {
+        float nx = ci + 1 < checks.Count ? cxs[ci + 1] - R(8) : padX + inner;
+        cws[ci] = Math.Max(R(40), nx - cxs[ci]);
+        r.H = Math.Max(r.H, TH(checks[ci].Text, F.Check, cws[ci] - R(28)) + R(10));
+      }
+      int ki = 0;
       foreach (Control k in checks) {
-        Cell c = new Cell(); c.Kind = K.Check; c.Ctl = k; c.Wrap = checks.Count == 1;
-        float fx = (k.Left - 12f) / Math.Max(1f, gw - 24f), fw = k.Width / Math.Max(1f, gw - 24f);
-        float x = padX + Math.Max(0f, Math.Min(0.95f, fx)) * inner;
-        float w = Math.Min(padX + inner - x, Math.Max(R(60), fw * inner));
-        if (checks.Count == 1) w = padX + inner - x;
+        Cell c = new Cell(); c.Kind = K.Check; c.Ctl = k; c.Wrap = true;
+        float x = cxs[ki], w = cws[ki]; ki++;
         float bx = R(16);
         c.Box = new RectangleF(x, y + Math.Min(R(8), (r.H - bx) / 2f), bx, bx);
         c.R = new RectangleF(x, y, w, r.H);
         r.Cells.Add(c);
         St sa = Get(k); float want = IsOn(k) ? 1f : 0f;
         if (!sa.Init) { sa.Init = true; sa.Check = want; sa.CheckT = want; } else if (sa.CheckT != want) { sa.CheckT = want; Kick(); }
-        float tx = measureG.MeasureString(k.Text, F.Check).Width;
-        AddHit(s, k, new RectangleF(x - R(4), y + 1, Math.Min(w, bx + R(10) + tx) + R(8), r.H - 2), c);
+        AddHit(s, k, new RectangleF(x - R(4), y + 1, w + R(4), r.H - 2), c);
       }
       s.Rows.Add(r);
       return y + r.H;
     }
     if (single is ButtonBase) {
-      Row r = new Row(); r.Y = y; r.H = R(46);
+      Row r = new Row(); r.Y = y;
       Cell c = new Cell(); c.Kind = K.Button; c.Ctl = single;
-      c.Box = new RectangleF(padX, y + R(7), cardW - 2 * padX, R(32)); c.R = c.Box;
+      int bh = BtnH(single.Text, cardW - 2 * padX, R(32));
+      r.H = bh + R(14);
+      c.Box = new RectangleF(padX, y + R(7), cardW - 2 * padX, bh); c.R = c.Box;
       r.Cells.Add(c); s.Rows.Add(r);
       AddHit(s, single, c.Box, c);
       return y + r.H;
@@ -4971,7 +4993,7 @@ public class BbOptionsPanel : Control, IBbOAnim {
         r.H = (int)Math.Ceiling(th) + R(8);
         c.R = new RectangleF(padX, y + R(2), tw, r.H - R(2));
       } else {
-        c.Kind = K.Text; r.H = R(28);
+        c.Kind = K.Text; r.H = Math.Max(R(28), TH(t, F.Label, cardW - 2 * padX) + R(8));
         c.R = new RectangleF(padX, y, cardW - 2 * padX, r.H);
       }
       r.Cells.Add(c); s.Rows.Add(r);
@@ -4982,6 +5004,11 @@ public class BbOptionsPanel : Control, IBbOAnim {
       foreach (Control c in line) { List<Control> one = new List<Control>(); one.Add(c); y = AddLine(s, one, gw, y); }
     }
     return y;
+  }
+  int BtnH(string t, float w, int min) {
+    t = (t ?? "").Replace("\r", "").Replace("\n", " ");
+    if (BbOGfx.MeasureTracked(measureG, t.ToUpperInvariant(), F.Button, 1.1f * S) <= w - R(24)) return min;
+    return Math.Max(min, TH(t, F.Value, w - R(20)) + R(12));
   }
   int AddFooter(Sec s, Control[] fr, int y) {
     List<Control> vis = new List<Control>();
@@ -5000,10 +5027,12 @@ public class BbOptionsPanel : Control, IBbOAnim {
       AddHit(s, vis[0], c.R, c);
     } else {
       int n = vis.Count; float g2 = R(8); float w = (cardW - g2 * (n - 1)) / n;
-      r.H = R(56);
+      int bh = R(44);
+      for (int i = 0; i < n; i++) bh = Math.Max(bh, BtnH(vis[i].Text, w, R(44)));
+      r.H = bh + R(12);
       for (int i = 0; i < n; i++) {
         Cell c = new Cell(); c.Kind = K.Button; c.Ctl = vis[i];
-        c.Box = new RectangleF(i * (w + g2), y + R(6), w, R(44)); c.R = c.Box;
+        c.Box = new RectangleF(i * (w + g2), y + R(6), w, bh); c.R = c.Box;
         r.Cells.Add(c);
         AddHit(s, vis[i], c.Box, c);
       }
@@ -5765,7 +5794,7 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
     FieldInfo fi = c.GetType().GetField("Tracking");
     if (fi != null) { try { track = (int)fi.GetValue(c); } catch { } }
     TextFormatFlags fl = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | (left ? TextFormatFlags.Left : TextFormatFlags.HorizontalCenter);
-    if (t.IndexOf('\n') >= 0) fl |= TextFormatFlags.WordBreak; else fl |= TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis;
+    if (t.IndexOf('\n') >= 0) fl |= TextFormatFlags.WordBreak; else if (TextRenderer.MeasureText(t, f).Width > r.Width) fl |= TextFormatFlags.WordBreak; else fl |= TextFormatFlags.SingleLine;
     if (track > 0 && !left && t.IndexOf('\n') < 0) { DrawTracked(g, t, f, r, tc, sc, track); return; }
     Rectangle sr = r; sr.Offset(0, 1);
     TextRenderer.DrawText(g, t, f, sr, sc, fl);
