@@ -4,7 +4,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -28,6 +30,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/nativeTexturePc.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "live-counters.h"
 #include "local-platform.h"
@@ -475,6 +478,26 @@ static void CreateFixedPools(GraphicContext& graphics) {
 	}
 	uint64_t total = std::min<uint64_t>(graphics.GetTotalMemoryBudget(), local / 100 * 55);
 	if (const uint64_t forced = EnvMiB("KYTY_VK_FIXED_POOL_MB"); forced != 0) total = std::min<uint64_t>(forced, local * 3 / 4);
+	// KYTY_VRAM_BUDGET auto (graphics/host_gpu/nativeTexturePc.h; on by default below 12 GiB): the pools at most 45% of
+	// the device-local heap's budget (VK_EXT_memory_budget), so that the engine textures' buffers, the images outside the
+	// pools and the driver fit under it too (field log 20261114-063159-577: pools 5632 + other device-local ~5400 MiB).
+	if (::Libs::Graphics::NativeTexturePc::VramBudgetMode() == 1 ||
+	    (::Libs::Graphics::NativeTexturePc::VramBudgetMode() < 0 && graphics.small_video_memory)) {
+		VmaBudget heap_budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(graphics.allocator, heap_budgets);
+		uint64_t heap_budget = 0;
+		for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++)
+			if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+				heap_budget = std::max<uint64_t>(heap_budget, heap_budgets[heap].budget);
+		if (heap_budget == 0) heap_budget = local;
+		const uint64_t cap = heap_budget / 100 * 45;
+		if (cap < total) {
+			std::printf("[vk-pool] KYTY_VRAM_BUDGET auto: fixed pools %" PRIu64 " MiB instead of %" PRIu64
+			            " MiB (45%% of the device-local budget %" PRIu64 " MiB)\n",
+			            cap / FpMiB, total / FpMiB, heap_budget / FpMiB);
+			total = cap;
+		}
+	}
 	// The memory type: VMA's for a device-local image (as CreateImage asks) and for a game buffer.
 	uint32_t image_type = UINT32_MAX, buffer_type = UINT32_MAX;
 	{
@@ -857,6 +880,22 @@ void GraphicContext::LogVideoMemory(const char* label) const {
 	            label, video >> 20u, budget >> 20u, local >> 20u, plain_in_video >> 20u, driver >> 20u, shared >> 20u,
 	            plain_in_system >> 20u, host >> 20u);
 	if (std::strcmp(label, "30 s") == 0) {
+		// VK_EXT_memory_budget per heap (VMA's view: its usage estimate between budget refreshes), next to the OS's above.
+		VmaBudget heap_budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(allocator, heap_budgets);
+		std::string heaps;
+		for (uint32_t h = 0; h < properties.memoryHeapCount; h++) {
+			char one[192];
+			std::snprintf(one, sizeof(one), "%sheap %u%s: usage %" PRIu64 " / budget %" PRIu64 " MiB (VMA blocks %" PRIu64
+			              ", allocations %" PRIu64 " MiB)",
+			              h == 0 ? "" : " | ", h,
+			              (properties.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal) ? " device-local" : "",
+			              heap_budgets[h].usage >> 20u, heap_budgets[h].budget >> 20u,
+			              heap_budgets[h].statistics.blockBytes >> 20u, heap_budgets[h].statistics.allocationBytes >> 20u);
+			heaps += one;
+		}
+		std::printf("[vk-budget] 30 s (%s): %s\n",
+		            memory_budget_ext_enabled ? "VK_EXT_memory_budget" : "no VK_EXT_memory_budget: heap sizes", heaps.c_str());
 		// By category: the freed images kept for reuse, the game buffers' own pool, the rest of VMA's device-local
 		// memory (textures and render targets of the texture cache, effect and upscaler images, stream rings).
 		uint64_t pool_bytes = 0;

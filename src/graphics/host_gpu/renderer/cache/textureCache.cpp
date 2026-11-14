@@ -2806,8 +2806,13 @@ void TextureCache::InitNativeTexturePc() {
 		std::memcpy(out, host_copy.Mapped().data(), size);
 		return true;
 	};
+	host.vram = +[](uint64_t* usage, uint64_t* budget) -> bool { return g_pc_cache->m_graphics.QueryLocalVideoMemory(usage, budget); };
+	NativeTexturePc::SetVramBudgetDefault(m_graphics.small_video_memory);
 	NativeTexturePc::SetHost(host);
 	NativeTexturePc::HostReady();
+	std::printf("NativeTexturePC: VRAM budget %s (KYTY_VRAM_BUDGET=%s; default on below 12 GiB of video memory)\n",
+	            NativeTexturePc::VramBudgetOn() ? "auto: idle engine textures demoted to guest memory near the budget" : "off",
+	            NativeTexturePc::VramBudgetMode() < 0 ? "unset" : NativeTexturePc::VramBudgetMode() == 1 ? "auto" : "off");
 	Common::HostException::SetProbeHandler(&NativeTexturePcProbe);
 	std::printf("NativeTexturePC: device side ready (page %llu bytes): engine texture bytes live in device-local buffers\n",
 	            static_cast<unsigned long long>(host.page_size));

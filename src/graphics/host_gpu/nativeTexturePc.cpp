@@ -29,6 +29,7 @@ struct Counters {
 	std::atomic<uint64_t> fills {0}, fill_bytes {0}, fill_ns {0}, gathered {0}, frames {0};
 	std::atomic<uint64_t> fallbacks {0}, fallback_bytes {0}, faults {0}, fallback_refused {0}, declined {0},
 	    watched_bytes {0}, guest_writes {0}, guest_write_bytes {0};
+	std::atomic<uint64_t> demoted {0}, demoted_bytes {0}, demote_passes {0};
 };
 Counters g_c;
 
@@ -78,6 +79,7 @@ struct Chunk {
 	uint64_t offset = 0;    // of the chunk's begin in host / dev
 	uint64_t owner  = 0;
 	bool     materialized = false; // its bytes are in guest memory too (a fallback): its pages are not watched
+	uint64_t used = 0;             // KYTY_VRAM_BUDGET: the frame of its last image upload (Plan) or of its load
 };
 
 struct Record {
@@ -238,6 +240,7 @@ void InsertLocked(State& s, uint64_t begin, Chunk c) {
 		r.lo    = std::min(r.lo, begin);
 		r.hi    = std::max(r.hi, c.end);
 	}
+	if (c.used == 0) c.used = g_c.frames.load(std::memory_order_relaxed) + 1;
 	s.chunks.emplace(begin, std::move(c));
 	Recount(s);
 }
@@ -371,7 +374,7 @@ void WriteEdges(State& s, uint64_t b, uint64_t e) {
 }
 
 // The non-materialized chunks over [b, e) written into guest memory and unwatched. False: some could not be read here.
-bool Materialize(uint64_t b, uint64_t e) {
+bool Materialize(uint64_t b, uint64_t e, bool demote = false) {
 	auto&                                   s = S();
 	std::vector<std::pair<uint64_t, Chunk>> todo;
 	{
@@ -379,7 +382,8 @@ bool Materialize(uint64_t b, uint64_t e) {
 		auto                  it = s.chunks.upper_bound(b);
 		if (it != s.chunks.begin()) --it;
 		for (; it != s.chunks.end() && it->first < e; ++it)
-			if (it->second.end > b && !it->second.materialized) todo.emplace_back(it->first, it->second);
+			if (it->second.end > b && !it->second.materialized && (!demote || it->second.dev))
+				todo.emplace_back(it->first, it->second);
 	}
 	if (todo.empty()) return true;
 	bool all = true;
@@ -399,17 +403,29 @@ bool Materialize(uint64_t b, uint64_t e) {
 			}
 			data = bytes.data();
 		}
-		t_inside++;
-		if (s.host.write_guest != nullptr) s.host.write_guest(cb, data, n);
-		t_inside--;
+		// (Level 1 demotion: guest memory already holds these bytes.)
+		if (!(demote && KeepGuest())) {
+			t_inside++;
+			if (s.host.write_guest != nullptr) s.host.write_guest(cb, data, n);
+			t_inside--;
+		}
 		std::unique_lock lock(s.m);
 		auto             it = s.chunks.find(cb);
 		// (Only if it is still the same chunk: a newer load replaced it meanwhile - its own pages stay watched.)
 		if (it == s.chunks.end() || it->second.end != c.end || it->second.dev != c.dev || it->second.host != c.host)
 			continue;
 		it->second.materialized = true;
-		g_c.fallbacks.fetch_add(1, std::memory_order_relaxed);
-		g_c.fallback_bytes.fetch_add(n, std::memory_order_relaxed);
+		if (demote) {
+			// KYTY_VRAM_BUDGET: guest memory holds the bytes now; the device buffer goes when no other range shares it.
+			// The texture cache's image stays the only video memory copy; a re-created image is uploaded from guest.
+			it->second.dev.reset();
+			it->second.offset = 0;
+			g_c.demoted.fetch_add(1, std::memory_order_relaxed);
+			g_c.demoted_bytes.fetch_add(n, std::memory_order_relaxed);
+		} else {
+			g_c.fallbacks.fetch_add(1, std::memory_order_relaxed);
+			g_c.fallback_bytes.fetch_add(n, std::memory_order_relaxed);
+		}
 		std::vector<Op> ops;
 		RewatchLocked(s, cb, c.end, ops);
 		ApplyOps(s, lock, ops);
@@ -719,6 +735,11 @@ void Flush() noexcept {
 std::vector<Part> Plan(uint64_t addr, uint64_t size) noexcept {
 	auto&                 s = S();
 	const std::lock_guard lock(s.m);
+	const uint64_t        frame = g_c.frames.load(std::memory_order_relaxed) + 1;
+	auto                  it    = s.chunks.upper_bound(addr);
+	if (it != s.chunks.begin()) --it;
+	for (; it != s.chunks.end() && it->first < addr + size; ++it)
+		if (it->second.end > addr) it->second.used = frame;
 	return PartsLocked(s, addr, addr + size);
 }
 
@@ -790,10 +811,91 @@ bool OnFault(uint64_t address) noexcept {
 	return Materialize(page, page_end);
 }
 
+// ---- KYTY_VRAM_BUDGET -------------------------------------------------------------------------------------------------
+
+std::atomic<int> g_budget_default {0};
+
+int VramBudgetMode() noexcept {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_VRAM_BUDGET");
+		if (v == nullptr || *v == 0) return -1;
+		if (std::strcmp(v, "auto") == 0 || std::strcmp(v, "1") == 0) return 1;
+		return 0;
+	}();
+	return mode;
+}
+void SetVramBudgetDefault(bool on) noexcept { g_budget_default.store(on ? 1 : 0, std::memory_order_relaxed); }
+bool VramBudgetOn() noexcept {
+	const int m = VramBudgetMode();
+	return m >= 0 ? m == 1 : g_budget_default.load(std::memory_order_relaxed) == 1;
+}
+
+namespace {
+uint64_t EnvPercent(const char* name, uint64_t fallback, uint64_t lo, uint64_t hi) {
+	const char* v = std::getenv(name);
+	if (v == nullptr || *v == 0) return fallback;
+	return std::clamp<uint64_t>(std::strtoull(v, nullptr, 10), lo, hi);
+}
+struct BudgetLog {
+	uint64_t usage = 0, budget = 0, target = 0, passes = 0;
+};
+BudgetLog g_budget_log;
+
+// Once a second: over KYTY_VRAM_BUDGET_HIGH_PCT (default 90) of the device-local budget (the OS's: DXGI on Windows),
+// the least recently used engine textures' device buffers (no image upload for at least 2 s) are demoted: their bytes
+// to guest memory (as level 1 keeps them), their buffers freed, until the estimate is at KYTY_VRAM_BUDGET_LOW_PCT
+// (default 82); at most 256 MiB a pass (one wait per buffer read back on this path's own queue).
+void BudgetPass() {
+	auto& s = S();
+	Host  host;
+	{
+		const std::lock_guard lock(s.m);
+		host = s.host;
+	}
+	uint64_t usage = 0, budget = 0;
+	if (host.vram == nullptr || !host.vram(&usage, &budget) || budget == 0) return;
+	static const uint64_t high = EnvPercent("KYTY_VRAM_BUDGET_HIGH_PCT", 90, 50, 98);
+	static const uint64_t low  = std::min(high, EnvPercent("KYTY_VRAM_BUDGET_LOW_PCT", 82, 40, 98));
+	g_budget_log.usage         = usage;
+	g_budget_log.budget        = budget;
+	g_budget_log.target        = budget / 100 * low;
+	if (usage <= budget / 100 * high) return;
+	const uint64_t want  = std::min<uint64_t>(usage - budget / 100 * low, 256ull << 20);
+	const uint64_t frame = g_c.frames.load(std::memory_order_relaxed);
+	struct Cand {
+		uint64_t b, e, used;
+		DevRef   dev; // (held: alive while this pass looks at it)
+	};
+	std::vector<Cand> cand;
+	{
+		const std::lock_guard lock(s.m);
+		for (const auto& [b, c]: s.chunks)
+			if (c.dev && !c.materialized && c.used + 120 <= frame) cand.push_back({b, c.end, c.used, c.dev});
+	}
+	std::stable_sort(cand.begin(), cand.end(), [](const Cand& x, const Cand& y) { return x.used < y.used; });
+	std::unordered_set<Dev*> counted;
+	uint64_t                 freed = 0;
+	std::vector<Cand>        pick;
+	for (const auto& c: cand) {
+		if (freed >= want) break;
+		if (counted.insert(c.dev.get()).second) freed += c.dev->size; // (an estimate: a buffer a slice still shares stays)
+		pick.push_back(c);
+	}
+	// (Every range sharing a picked buffer, so that the buffer is really freed.)
+	for (const auto& c: cand)
+		if (counted.count(c.dev.get()) != 0 && std::none_of(pick.begin(), pick.end(), [&](const Cand& p) { return p.b == c.b; }))
+			pick.push_back(c);
+	for (const auto& c: pick) (void)Materialize(c.b, c.e, true);
+	g_c.demote_passes.fetch_add(1, std::memory_order_relaxed);
+	g_budget_log.passes++;
+}
+} // namespace
+
 void Pump() noexcept {
 	if (!Enabled()) return;
 	Flush();
 	g_c.frames.fetch_add(1, std::memory_order_relaxed);
+	if (VramBudgetOn() && g_c.frames.load(std::memory_order_relaxed) % 60 == 0) BudgetPass();
 	using Clock = std::chrono::steady_clock;
 	static Clock::time_point last = Clock::now();
 	static Stats             prev {};
@@ -822,6 +924,13 @@ void Pump() noexcept {
 	            static_cast<unsigned long long>(c.faults), static_cast<unsigned long long>(c.fallback_refused),
 	            static_cast<unsigned long long>(c.declined), static_cast<unsigned long long>(c.guest_writes),
 	            MiB(c.guest_write_bytes));
+	if (VramBudgetOn())
+		std::printf("NativeTexturePC VRAM budget (KYTY_VRAM_BUDGET auto): device-local %.0f MiB in use of a %.0f MiB budget "
+		            "(target %.0f) | engine texture buffers %.1f MiB | demoted to guest memory %llu ranges (%.1f MiB; %llu "
+		            "passes)\n",
+		            MiB(g_budget_log.usage), MiB(g_budget_log.budget), MiB(g_budget_log.target), MiB(c.vram_bytes),
+		            static_cast<unsigned long long>(g_c.demoted.load()), MiB(g_c.demoted_bytes.load()),
+		            static_cast<unsigned long long>(g_c.demote_passes.load()));
 	std::fflush(stdout);
 	prev = c;
 }
@@ -885,7 +994,7 @@ void ResetForTests() noexcept {
 	               &g_c.dropped_bytes, &g_c.to_vram, &g_c.to_vram_bytes, &g_c.upload_fail, &g_c.fills, &g_c.fill_bytes,
 	               &g_c.fill_ns, &g_c.gathered, &g_c.frames, &g_c.fallbacks, &g_c.fallback_bytes, &g_c.faults,
 	               &g_c.fallback_refused, &g_c.declined, &g_c.watched_bytes, &g_c.guest_writes,
-	               &g_c.guest_write_bytes})
+	               &g_c.guest_write_bytes, &g_c.demoted, &g_c.demoted_bytes, &g_c.demote_passes})
 		a->store(0);
 }
 

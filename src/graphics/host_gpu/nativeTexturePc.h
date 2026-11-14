@@ -68,6 +68,8 @@ struct Host {
 	// Any thread: `size` bytes at `offset` of device buffer `handle` read back into `out` (waits for the GPU). False:
 	// not possible on this thread.
 	bool (*read_device)(uint64_t handle, uint64_t offset, void* out, uint64_t size) = nullptr;
+	// Any thread: the device-local video memory in use and the budget (the OS's), bytes. False: unknown.
+	bool (*vram)(uint64_t* usage, uint64_t* budget) = nullptr;
 	uint64_t page_size = 4096;
 };
 // Sets the non-null members (the loader sets the guest side, the texture cache the device side).
@@ -134,6 +136,13 @@ void BeforeGuestRead(uint64_t addr, uint64_t size) noexcept;
 [[nodiscard]] bool OnFault(uint64_t address) noexcept;
 // Once a flip (render thread): Flush, frame count, the 30 s log line.
 void Pump() noexcept;
+
+// KYTY_VRAM_BUDGET (read once): "auto"/"1" on, "0"/"off" off; unset: the device's default (SetVramBudgetDefault: on
+// for a GPU short of video memory, < 12 GiB). On: near the device-local budget, least recently used engine textures'
+// device buffers are demoted to guest memory (level 1 style), so the images are their only video memory copy (Pump).
+[[nodiscard]] int  VramBudgetMode() noexcept; // -1 unset, 0 off, 1 auto
+void               SetVramBudgetDefault(bool on) noexcept;
+[[nodiscard]] bool VramBudgetOn() noexcept;
 
 struct Stats {
 	uint64_t textures = 0, textures_loaded = 0, textures_created = 0, released = 0;
