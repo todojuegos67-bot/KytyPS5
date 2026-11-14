@@ -123,6 +123,13 @@ void Staged(uint64_t addr, uint64_t size) {
 	(void)Libs::LibKernel::Memory::TryPrepareHostImageWrite(addr, size);
 }
 void WriteGuest(uint64_t addr, const void* data, uint64_t size) {
+	if (Pc::Level() == 1) {
+		// The guest's copy of a load, as a file read's host write: the trackers told before and after.
+		const bool prepared = Libs::LibKernel::Memory::PrepareHostOverwrite(addr, size);
+		Libs::LibKernel::Memory::WriteBacking(addr, data, size, "native-texture-pc");
+		Libs::LibKernel::Memory::FinishHostOverwrite(addr, size, prepared);
+		return;
+	}
 	Libs::LibKernel::Memory::WriteBacking(addr, data, size, "native-texture-pc fallback");
 }
 

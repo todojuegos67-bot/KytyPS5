@@ -4834,6 +4834,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
 	NativeTex::BeforeHostWrite(address, size); // (authoritative bytes there back to guest memory first)
+	NativeTexturePc::OnGuestWrite(address, size); // (KYTY_NATIVE_TEXTURE_PC: the guest's bytes are newer there)
 	std::scoped_lock lock {m_lock};
 	ReleaseDownloadPages(address, size);
 	InvalidateCpuAliases(address, size);

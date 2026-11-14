@@ -36,8 +36,14 @@
 
 namespace Libs::Graphics::NativeTexturePc {
 
-// KYTY_NATIVE_TEXTURE_PC=1 (read once).
-[[nodiscard]] bool Requested() noexcept;
+// KYTY_NATIVE_TEXTURE_PC (read once): 0 off; 1 = KEEP-GUEST (safe): the bytes go to VRAM for the images AND are
+// written into guest memory once (no host copy kept, no page watching, nothing ever read back); a CPU/host write over a
+// staged range (TextureCache::InvalidateMemory -> OnGuestWrite) drops the staged bytes there (the guest's are newer);
+// slice copies run in guest memory (declined). 2 = VRAM-ONLY (experimental): guest pages never written and kept
+// no-access, read back from the GPU on a touch; a read-back a thread cannot do (async upload worker, deferred
+// operation, a texture-cache lock holder off the render thread) EXITs with a message instead of returning wrong bytes.
+[[nodiscard]] int  Level() noexcept;
+[[nodiscard]] bool Requested() noexcept; // Level() != 0
 // The hooks are in and the path is live.
 [[nodiscard]] bool Enabled() noexcept;
 void               SetEnabled(bool on) noexcept;
@@ -113,6 +119,11 @@ void                            NoteUpload(uint64_t bytes, uint64_t ns, bool gat
 [[nodiscard]] bool Fill(uint64_t addr, uint64_t size, void* out,
                         const std::function<bool(uint64_t, void*, uint64_t)>& read_guest) noexcept;
 
+// A CPU or host write over [addr, addr + size) (TextureCache::InvalidateMemory): level 1: staged bytes there dropped
+// (guest memory is authoritative there now). Level 2: the bytes there into guest memory first (then dropped).
+void OnGuestWrite(uint64_t addr, uint64_t size) noexcept;
+// Tests: the level as if from the environment.
+void SetLevelForTests(int level) noexcept;
 // Before the emulator reads guest memory [addr, addr + size) another way: the bytes there into guest memory once.
 void BeforeGuestRead(uint64_t addr, uint64_t size) noexcept;
 // The exception filter's probe: a CPU touch of a no-access page of ours. True: handled (the access goes again).
@@ -127,6 +138,7 @@ struct Stats {
 	uint64_t to_vram = 0, to_vram_bytes = 0, upload_fail = 0;
 	uint64_t fills = 0, fill_bytes = 0, fill_ns = 0, gathered = 0, frames = 0;
 	uint64_t fallbacks = 0, fallback_bytes = 0, faults = 0, fallback_refused = 0, declined = 0, watched_bytes = 0;
+	uint64_t guest_writes = 0, guest_write_bytes = 0;
 };
 [[nodiscard]] Stats GetStats() noexcept;
 void                ResetForTests() noexcept;

@@ -48,7 +48,7 @@ inline const char* RequestedName() noexcept {
 inline bool HooksRequested() noexcept {
 	if (Requested()) return true;
 	const char* v = std::getenv("KYTY_NATIVE_TEXTURE_PC");
-	return v != nullptr && v[0] == '1';
+	return v != nullptr && (v[0] == '1' || v[0] == '2');
 }
 
 enum class Site : uint32_t {

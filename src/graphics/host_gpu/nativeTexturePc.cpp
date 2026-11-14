@@ -28,7 +28,7 @@ struct Counters {
 	std::atomic<uint64_t> to_vram {0}, to_vram_bytes {0}, upload_fail {0};
 	std::atomic<uint64_t> fills {0}, fill_bytes {0}, fill_ns {0}, gathered {0}, frames {0};
 	std::atomic<uint64_t> fallbacks {0}, fallback_bytes {0}, faults {0}, fallback_refused {0}, declined {0},
-	    watched_bytes {0};
+	    watched_bytes {0}, guest_writes {0}, guest_write_bytes {0};
 };
 Counters g_c;
 
@@ -113,6 +113,8 @@ State& S() {
 }
 std::atomic<bool>     g_enabled {false};
 std::atomic<uint64_t> g_any {0};
+std::atomic<int>      g_level_override {-1};
+bool                  KeepGuest() noexcept;
 thread_local int      t_inside = 0; // our own guest reads/writes: BeforeGuestRead does nothing
 
 uint64_t PD(const State& s, uint64_t a) { return a / s.host.page_size * s.host.page_size; }
@@ -139,7 +141,7 @@ Ranges Subtract(const Ranges& a, const Ranges& b) {
 // The watchers over the pages of [b, e) made what the chunks there want: the whole pages of each run of adjacent
 // non-materialized chunks. The calls are appended to `ops`.
 void RewatchLocked(State& s, uint64_t b, uint64_t e, std::vector<Op>& ops) {
-	if (s.host.watch == nullptr) return;
+	if (s.host.watch == nullptr || KeepGuest()) return;
 	const uint64_t wb = PD(s, b), we = PU(s, e);
 	// Runs of chunks touching the window (extended by whole runs so a page is judged with all its chunks).
 	Ranges runs;
@@ -335,6 +337,15 @@ bool Assemble(const State& s, const std::vector<Part>& parts, uint64_t b, uint8_
 	return ok;
 }
 
+// Level 2: a read-back this thread cannot do would leave wrong bytes: stop instead (never wrong bytes silently).
+[[noreturn]] void Refused(const char* what, uint64_t addr, uint64_t size) {
+	std::printf("NativeTexturePC: FATAL: KYTY_NATIVE_TEXTURE_PC=2 could not read back %s 0x%llx+0x%llx from the GPU on this "
+	            "thread (async upload worker / deferred operation / texture-cache lock holder); use KYTY_NATIVE_TEXTURE_PC=1\n",
+	            what, static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
+	std::fflush(stdout);
+	std::abort();
+}
+
 // Edge pages of [b, e) shared with other data: the chunk's bytes written into guest memory there (they are never watched).
 void WriteEdges(State& s, uint64_t b, uint64_t e) {
 	if (s.host.write_guest == nullptr || s.host.watch == nullptr) return;
@@ -354,6 +365,7 @@ void WriteEdges(State& s, uint64_t b, uint64_t e) {
 			t_inside--;
 		} else {
 			g_c.fallback_refused.fetch_add(1, std::memory_order_relaxed);
+			Refused("an edge page", eb, ee - eb);
 		}
 	}
 }
@@ -381,6 +393,7 @@ bool Materialize(uint64_t b, uint64_t e) {
 			bytes.resize(n); // (zero chunks: zeros)
 			if (c.dev && (s.host.read_device == nullptr || !s.host.read_device(c.dev->handle, c.offset, bytes.data(), n))) {
 				g_c.fallback_refused.fetch_add(1, std::memory_order_relaxed);
+				Refused("a guest read/touch", cb, n);
 				all = false;
 				continue;
 			}
@@ -408,13 +421,20 @@ double MiB(uint64_t v) { return static_cast<double>(v) / (1024.0 * 1024.0); }
 
 } // namespace
 
-bool Requested() noexcept {
-	static const bool on = [] {
+int Level() noexcept {
+	const int forced = g_level_override.load(std::memory_order_relaxed);
+	if (forced >= 0) return forced;
+	static const int level = [] {
 		const char* v = std::getenv("KYTY_NATIVE_TEXTURE_PC");
-		return v != nullptr && v[0] == '1';
+		return v != nullptr && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
 	}();
-	return on;
+	return level;
 }
+bool Requested() noexcept { return Level() != 0; }
+namespace {
+bool KeepGuest() noexcept { return Level() != 2; }
+} // namespace
+void SetLevelForTests(int level) noexcept { g_level_override.store(level, std::memory_order_relaxed); }
 
 bool Enabled() noexcept { return g_enabled.load(std::memory_order_acquire); }
 void SetEnabled(bool on) noexcept { g_enabled.store(on, std::memory_order_release); }
@@ -482,10 +502,19 @@ bool OnLoad(uint64_t owner, uint64_t owner_base, uint64_t dst, const void* src, 
 		RewatchLocked(s, dst, dst + size, ops);
 		ApplyOps(s, lock, ops);
 	}
-	WriteEdges(s, dst, dst + size);
+	if (KeepGuest()) {
+		// The guest's copy, written once (the host's write_guest tells the trackers); our own invalidation ignored.
+		t_inside++;
+		if (host.write_guest != nullptr) host.write_guest(dst, src, size);
+		t_inside--;
+	} else {
+		WriteEdges(s, dst, dst + size);
+	}
 	(mip ? g_c.mips : g_c.loads).fetch_add(1, std::memory_order_relaxed);
 	(mip ? g_c.mip_bytes : g_c.load_bytes).fetch_add(size, std::memory_order_relaxed);
+	t_inside++; // (the images' invalidation is ours: OnGuestWrite must not drop what was just staged)
 	if (host.staged != nullptr) host.staged(dst, size); // (after the bytes are here: an upload racing it re-runs)
+	t_inside--;
 	return true;
 }
 
@@ -509,7 +538,7 @@ bool OnSliceCopy(uint64_t dst, uint64_t src, uint64_t size,
 	{
 		std::unique_lock lock(s.m);
 		parts           = PartsLocked(s, src, src + size);
-		const bool ours = std::any_of(parts.begin(), parts.end(), [](const Part& p) { return p.kind != Part::Guest; });
+		const bool ours = !KeepGuest() && std::any_of(parts.begin(), parts.end(), [](const Part& p) { return p.kind != Part::Guest; });
 		if (!ours) {
 			// Not engine texture memory this path holds: guest memory is authoritative for both (the caller copies).
 			(void)CutLocked(s, dst, dst + size);
@@ -565,7 +594,9 @@ bool OnSliceCopy(uint64_t dst, uint64_t src, uint64_t size,
 	g_c.slice_copies.fetch_add(1, std::memory_order_relaxed);
 	g_c.slice_bytes.fetch_add(size, std::memory_order_relaxed);
 	g_c.slice_guest_reads.fetch_add(guest_reads, std::memory_order_relaxed);
+	t_inside++;
 	if (host.staged != nullptr) host.staged(dst, size);
+	t_inside--;
 	return true;
 }
 
@@ -672,12 +703,39 @@ bool Fill(uint64_t addr, uint64_t size, void* out, const std::function<bool(uint
 }
 
 void BeforeGuestRead(uint64_t addr, uint64_t size) noexcept {
+	if (t_inside != 0 || !Enabled() || KeepGuest() || size == 0 || g_any.load(std::memory_order_relaxed) == 0) return;
+	(void)Materialize(addr, addr + size); // (a refusal stops the process: Refused)
+}
+
+void OnGuestWrite(uint64_t addr, uint64_t size) noexcept {
 	if (t_inside != 0 || !Enabled() || size == 0 || g_any.load(std::memory_order_relaxed) == 0) return;
-	(void)Materialize(addr, addr + size);
+	auto& s = S();
+	if (!KeepGuest()) (void)Materialize(addr, addr + size); // (the parts the write leaves alone stay right)
+	std::unique_lock lock(s.m);
+	const uint64_t   cut = CutLocked(s, addr, addr + size);
+	if (cut != 0) {
+		g_c.guest_writes.fetch_add(1, std::memory_order_relaxed);
+		g_c.guest_write_bytes.fetch_add(cut, std::memory_order_relaxed);
+	}
+	uint64_t xend = 0;
+	if (cut != 0 || InExtentLocked(s, addr, &xend)) {
+		// The range is the guest's now (written): a guest-marked chunk, so an engine texture's memory there is read from
+		// the guest instead of taken as undefined (zeros).
+		Chunk g;
+		g.end          = addr + size;
+		g.materialized = true;
+		auto b         = s.bases.upper_bound(addr);
+		if (b != s.bases.begin()) g.owner = std::prev(b)->second;
+		InsertLocked(s, addr, std::move(g));
+	}
+	Recount(s);
+	std::vector<Op> ops;
+	RewatchLocked(s, addr, addr + size, ops);
+	ApplyOps(s, lock, ops);
 }
 
 bool OnFault(uint64_t address) noexcept {
-	if (t_inside != 0 || !Enabled() || g_any.load(std::memory_order_relaxed) == 0) return false;
+	if (t_inside != 0 || !Enabled() || KeepGuest() || g_any.load(std::memory_order_relaxed) == 0) return false;
 	auto&    s = S();
 	uint64_t page = 0, page_end = 0;
 	{
@@ -705,13 +763,13 @@ void Pump() noexcept {
 	last                  = now;
 	const Stats    c      = GetStats();
 	const uint64_t frames = c.frames - prev.frames;
-	std::printf("NativeTexturePC: textures created natively %llu (loaded %llu, engine-made %llu, destroyed %llu) | file loads "
+	std::printf("NativeTexturePC (level %d, %s): textures created natively %llu (loaded %llu, engine-made %llu, destroyed %llu) | file loads "
 	            "%llu (%.1f MiB) | mips streamed natively %llu (%.1f MiB) | slice copies shared %llu (%.1f MiB, %llu guest "
 	            "reads) | streamed out/freed %.1f MiB | host MiB held %.1f (%llu blocks) | VRAM MiB %.1f (%llu buffers; to VRAM "
 	            "%llu, %.1f MiB, failed %llu) | guest pages no-access %.1f MiB | image uploads from VRAM %llu (%.1f MiB, "
 	            "%llu gathered; %.2f ms/frame over %llu frames) | CPU fallbacks %llu (%.1f MiB; faults %llu, refused %llu) | "
-	            "declined %llu\n",
-	            static_cast<unsigned long long>(c.textures), static_cast<unsigned long long>(c.textures_loaded),
+	            "declined %llu | CPU/host writes over staged bytes %llu (%.1f MiB dropped)\n",
+	            Level(), KeepGuest() ? "VRAM + guest copy" : "VRAM only, guest no-access", static_cast<unsigned long long>(c.textures), static_cast<unsigned long long>(c.textures_loaded),
 	            static_cast<unsigned long long>(c.textures_created), static_cast<unsigned long long>(c.released),
 	            static_cast<unsigned long long>(c.loads), MiB(c.load_bytes), static_cast<unsigned long long>(c.mips),
 	            MiB(c.mip_bytes), static_cast<unsigned long long>(c.slice_copies), MiB(c.slice_bytes),
@@ -723,7 +781,8 @@ void Pump() noexcept {
 	            frames != 0 ? static_cast<double>(c.fill_ns - prev.fill_ns) / 1e6 / static_cast<double>(frames) : 0.0,
 	            static_cast<unsigned long long>(frames), static_cast<unsigned long long>(c.fallbacks), MiB(c.fallback_bytes),
 	            static_cast<unsigned long long>(c.faults), static_cast<unsigned long long>(c.fallback_refused),
-	            static_cast<unsigned long long>(c.declined));
+	            static_cast<unsigned long long>(c.declined), static_cast<unsigned long long>(c.guest_writes),
+	            MiB(c.guest_write_bytes));
 	std::fflush(stdout);
 	prev = c;
 }
@@ -760,6 +819,8 @@ Stats GetStats() noexcept {
 	r.fallback_refused  = g_c.fallback_refused.load();
 	r.declined          = g_c.declined.load();
 	r.watched_bytes     = g_c.watched_bytes.load();
+	r.guest_writes      = g_c.guest_writes.load();
+	r.guest_write_bytes = g_c.guest_write_bytes.load();
 	return r;
 }
 
@@ -784,7 +845,8 @@ void ResetForTests() noexcept {
 	               &g_c.mips, &g_c.mip_bytes, &g_c.slice_copies, &g_c.slice_bytes, &g_c.slice_guest_reads,
 	               &g_c.dropped_bytes, &g_c.to_vram, &g_c.to_vram_bytes, &g_c.upload_fail, &g_c.fills, &g_c.fill_bytes,
 	               &g_c.fill_ns, &g_c.gathered, &g_c.frames, &g_c.fallbacks, &g_c.fallback_bytes, &g_c.faults,
-	               &g_c.fallback_refused, &g_c.declined, &g_c.watched_bytes})
+	               &g_c.fallback_refused, &g_c.declined, &g_c.watched_bytes, &g_c.guest_writes,
+	               &g_c.guest_write_bytes})
 		a->store(0);
 }
 

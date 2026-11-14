@@ -2804,9 +2804,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
                     size, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()),
                     gathered);
 			};
-			if (parts.size() == 1 && parts[0].kind == NativeTexturePc::Part::Device) {
+			// The plan's references (device buffers, host blocks) held until the GPU work recorded now is done: a release
+			// meanwhile (stream-out, destroy) cannot free a buffer the upload still reads.
+			const auto hold = [&] { m_scheduler.DeferOperation([keep = parts]() mutable { keep.clear(); }); };
+			// (Directly only at a 256-aligned offset: a buffer->image copy's bufferOffset must be a multiple of 4 and of
+			// the texel block size, and the detiler's source offsets are kept 256-aligned (NativeTexPrepare); a slice or
+			// mip at another offset is gathered to offset 0.)
+			if (parts.size() == 1 && parts[0].kind == NativeTexturePc::Part::Device && parts[0].offset % 256 == 0) {
+				hold();
 				done(false);
-				// (Released only by a later Flush, deferred until the GPU is done: alive for this frame's work.)
 				return {reinterpret_cast<Buffer*>(parts[0].handle), parts[0].offset};
 			}
 			m_scheduler.EndRendering();
@@ -2844,6 +2850,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 					at += n;
 				}
 			}
+			hold();
 			auto* result = gathered.get();
 			m_scheduler.DeferOperation([buffer = std::move(gathered), more = std::move(staging)]() mutable {
 				buffer.reset();
