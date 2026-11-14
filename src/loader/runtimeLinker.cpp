@@ -30,6 +30,7 @@
 #include "loader/demonsSoulsAllocClamp.h"
 #include "loader/demonsSoulsNativeMem.h"
 #include "loader/demonsSoulsNativeTex.h"
+#include "loader/demonsSoulsNativeTexStream.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -1633,6 +1634,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsAllocClamp::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsNativeMem::Install(m_programs.empty() ? nullptr : m_programs.front());
 	NativeTex::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsNativeTexStream::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSuperResolution::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsRenderSize::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsRenderSize::InstallForcedMode(m_programs.empty() ? nullptr : m_programs.front());
