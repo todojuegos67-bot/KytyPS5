@@ -3033,6 +3033,7 @@ Set-DoubleBuffer $view; $panel.Controls.Add($view)
 $cont.Top = -$script:hd
 Set-DoubleBuffer $cont; $view.Controls.Add($cont)
 $script:scrollY = 0
+$script:opt = $null  # (bb-launcher-3) panel de opciones dibujado (BbOptionsPanel), si compila
 # (ui055) Barra de desplazamiento de verdad: carril + barra que se arrastra; clic en el carril = salto de pagina.
 # (launcher112) Barra fina dibujada (BbScrollBar): redondeada, se ensancha al pasar el raton, arrastre 1:1 sin saltos.
 $sbar = New-Object BbScrollBar; $sbar.Size = New-Object System.Drawing.Size($sbW, $H); $sbar.Visible = $false
@@ -3040,6 +3041,8 @@ $panel.Controls.Add($sbar); $sbar.BringToFront()
 # Doble bbufer en el panel y su contenido: el desplazamiento se dibuja sin parpadeo ni trompicones.
 try { $dbp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic'); $dbp.SetValue($panel, $true, $null); $dbp.SetValue($cont, $true, $null); $dbp.SetValue($view, $true, $null) } catch { }
 function Set-ScrollY([double]$y) {
+	# (bb-launcher-3) con el panel dibujado solo hay que darle el sitio de la vista (el se desplaza solo)
+	if ($script:opt) { $vh0 = [int][math]::Max(1, $panel.ClientSize.Height - $script:hd); if ($script:opt.Top -ne $script:hd -or $script:opt.Height -ne $vh0 -or $script:opt.Width -ne $panelW) { $script:opt.SetBounds(0, $script:hd, $panelW, $vh0) }; return }
 	$ph = $panel.ClientSize.Height; $ch = 0
 	foreach ($c in $cont.Controls) { if ($c.Visible -and $c.Bottom -gt $ch) { $ch = $c.Bottom } }
 	$total = $ch + 24; $max = [math]::Max(0, $total - $ph)
@@ -3075,6 +3078,7 @@ $script:scrollTarget = 0.0; $script:scrollPos = 0.0; $script:wheelLast = 0; $scr
 $script:wheelT = New-Object System.Windows.Forms.Timer; $script:wheelT.Interval = 15
 function Get-ScrollMax { $ch = 0; foreach ($c in $cont.Controls) { if ($c.Visible -and $c.Bottom -gt $ch) { $ch = $c.Bottom } }; return [double][math]::Max(0, ($ch + 24) - $panel.ClientSize.Height) }
 function Add-WheelStep([double]$px) {
+	if ($script:opt) { $script:opt.Wheel($px); return }
 	if ($script:sm) { $script:scrollAnim = $null; $script:sm.Wheel($px); return }
 	if (-not $script:wheelT.Enabled) { $script:scrollPos = [double]$script:scrollY; $script:scrollTarget = [double]$script:scrollY; $script:wheelLast = [Environment]::TickCount - 16 }
 	$script:scrollAnim = $null; $script:wheelTau = 90.0
@@ -3366,12 +3370,12 @@ function New-PcCard([int]$cw, [int]$ch, [double]$fs) {
 	$gc = [System.Drawing.Graphics]::FromImage($bmp)
 	$gc.SmoothingMode = 'AntiAlias'; $gc.TextRenderingHint = 'AntiAliasGridFit'; $gc.TextContrast = 0
 	$path = New-RoundPath 0 0 ($cw - 1) ($ch - 1) 28
-	$fill = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point($cw, $ch)), [System.Drawing.Color]::FromArgb(215, 30, 26, 20), [System.Drawing.Color]::FromArgb(215, 12, 13, 18))
+	$fill = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point($cw, $ch)), [System.Drawing.Color]::FromArgb(220, 27, 22, 19), [System.Drawing.Color]::FromArgb(220, 13, 11, 10))  # (bb-launcher-3) carbon calido
 	$gc.FillPath($fill, $path)
-	$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 222, 196, 140), 1.5); $gc.DrawPath($pen, $path)
+	$pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(170, 140, 108, 62), 1.2); $gc.DrawPath($pen, $path)
 	$goldB = New-Object System.Drawing.SolidBrush($gold); $inkB = New-Object System.Drawing.SolidBrush($ink)
 	$dimB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(205, 195, 180))
-	$fHead = New-Object System.Drawing.Font('Segoe UI Black', (Snap-Px (16 * $fs)), [System.Drawing.FontStyle]::Bold)
+	$fHead = $(if ($script:fam) { New-Object System.Drawing.Font($script:fam, [float](Snap-Px (15 * $fs)), [System.Drawing.FontStyle]::Regular) } else { New-Object System.Drawing.Font('Segoe UI Black', (Snap-Px (16 * $fs)), [System.Drawing.FontStyle]::Bold) })  # (bb-launcher-3) Cinzel
 	$fCap = New-Object System.Drawing.Font('Segoe UI Semibold', (Snap-Px (10.5 * $fs))); $fVal = New-Object System.Drawing.Font('Segoe UI Semibold', (Snap-Px (13 * $fs)), [System.Drawing.FontStyle]::Bold)
 	$fTxt = New-Object System.Drawing.Font('Segoe UI', (Snap-Px (12 * $fs)))
 	$tw = $cw - 32; $x = 16; $y = [int](12 * $fs)
@@ -3862,6 +3866,1972 @@ foreach ($pair in $script:qCombos) { $pair[0].Add_SelectionChangeCommitted({ if 
 $cmbCal.Add_SelectionChangeCommitted({ if ($cmbCal.SelectedIndex -le 3 -or $cmbCal.SelectedIndex -eq 5) { $script:applying = $true; try { Set-CalPreset $cmbCal.SelectedIndex } finally { $script:applying = $false } } })
 $cmbWin.Add_SelectedIndexChanged({ Update-CalStatus })  # la rejilla de luz sigue a la resolucion de salida
 
+# ---- (bb-launcher-3) Panel de opciones dibujado (BbOptionsPanel, C#) y botones con estilo Bloodborne.
+# Antes la columna movia decenas de controles nativos (ComboBox, CheckBox, Label) en cada fotograma del desplazamiento:
+# con invalidacion incompleta salian apartados duplicados y filas a medio dibujar. Ahora el panel es UN solo control
+# dibujado: cada apartado se pinta una vez en su mapa de bits y desplazarse es solo copiarlos (muelle por tiempo,
+# sincronizado con el monitor). Los desplegables / casillas / botones de siempre siguen existiendo (ocultos) y son el
+# modelo: el panel lee su estado y escribe en ellos (SelectedIndex + SelectionChangeCommitted, OnClick), asi que
+# opciones, valores, dependencias, ayudas y launcher.ini son exactamente los mismos.
+# Si algo falla (compilacion o dibujo), se vuelve al panel de siempre y se anota en launcher.log.
+$script:opt = $null
+try {
+	if (-not ('BbOptionsPanel' -as [type])) {
+Add-Type -IgnoreWarnings -ReferencedAssemblies System.Windows.Forms,System.Drawing -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public static class BbOLog {
+  public static Action<string> Sink;
+  static int count = 0;
+  public static void Write(string s) {
+    if (count > 60) return;
+    count++;
+    try { if (Sink != null) Sink(s); } catch { }
+  }
+}
+
+public interface IBbOAnim { bool Tick(double now); }
+
+[StructLayout(LayoutKind.Sequential)]
+public struct BbOMsg { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; }
+
+// Fotogramas: bucle en Application.Idle sincronizado con el compositor (DwmFlush = al ritmo del monitor, 60-144 Hz) y un
+// temporizador de 10 ms de respaldo. Solo corre mientras algo se anima.
+public static class BbOPump {
+  [DllImport("user32.dll")] static extern bool PeekMessage(out BbOMsg m, IntPtr h, uint min, uint max, uint remove);
+  [DllImport("dwmapi.dll")] static extern int DwmFlush();
+  [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint p);
+  [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint p);
+  public static bool ReduceMotion = false;
+  static Stopwatch clock = Stopwatch.StartNew();
+  static List<IBbOAnim> list = new List<IBbOAnim>();
+  static Timer timer = null;
+  static bool idleHooked = false, period = false;
+  static double last = 0;
+  public static double Now { get { return clock.Elapsed.TotalSeconds; } }
+  public static bool Add(IBbOAnim a) {
+    bool added = false;
+    if (!list.Contains(a)) { list.Add(a); added = true; }
+    if (!idleHooked) { Application.Idle += OnIdle; idleHooked = true; }
+    if (timer == null) { timer = new Timer(); timer.Interval = 10; timer.Tick += OnTimer; }
+    if (!timer.Enabled) timer.Start();
+    if (!period) { try { timeBeginPeriod(1); period = true; } catch { } }
+    return added;
+  }
+  static void OnTimer(object s, EventArgs e) { if (Now - last > 0.012) StepAll(); }
+  static void StepAll() {
+    last = Now;
+    IBbOAnim[] arr = list.ToArray();
+    foreach (IBbOAnim a in arr) {
+      bool more = false;
+      try { more = a.Tick(last); } catch (Exception ex) { more = false; BbOLog.Write("animacion: " + ex.Message); }
+      if (!more) list.Remove(a);
+    }
+    if (list.Count == 0) {
+      if (timer != null) timer.Stop();
+      if (period) { try { timeEndPeriod(1); } catch { } period = false; }
+    }
+  }
+  static void OnIdle(object sender, EventArgs e) {
+    int guard = 0;
+    while (list.Count > 0 && guard < 4000) {
+      guard++;
+      BbOMsg m;
+      if (PeekMessage(out m, IntPtr.Zero, 0, 0, 0)) break;
+      StepAll();
+      if (list.Count == 0) break;
+      bool synced = false;
+      try { synced = DwmFlush() == 0; } catch { }
+      if (!synced) System.Threading.Thread.Sleep(4);
+    }
+  }
+}
+
+// Muelle criticamente amortiguado integrado con el tiempo real: mismo recorrido a cualquier fps, sin rebote.
+public sealed class BbOSpring {
+  public double Pos = 0, Vel = 0, Target = 0, Omega = 22;
+  public bool Active = false;
+  public void Wheel(double px, double max, double omega) {
+    double b = Active ? Target : Pos;
+    if (b > max) b = max; if (b < 0) b = 0;
+    double nt = Math.Max(0.0, Math.Min(max, b + px));
+    Omega = omega; Vel += 0.5 * omega * (nt - b); Target = nt; Active = true;
+  }
+  public void To(double y, double omega) { Target = y; Omega = omega; Active = true; }
+  public void Jump(double y) { Pos = y; Target = y; Vel = 0; Active = false; }
+  public void Step(double dt, double max) {
+    double t = Target; if (t > max) t = max; if (t < 0) t = 0;
+    double w = Omega, d = Pos - t, e = Math.Exp(-w * dt), k = (Vel + w * d) * dt;
+    Pos = t + (d + k) * e;
+    Vel = (Vel - w * k) * e;
+    if (Pos <= 0) { Pos = 0; if (Vel < 0) Vel = 0; }
+    if (Pos >= max) { Pos = max; if (Vel > 0) Vel = 0; }
+    if (Math.Abs(Pos - t) < 0.2 && Math.Abs(Vel) < 5.0) { Pos = t; Vel = 0; Target = t; Active = false; } else Active = true;
+  }
+}
+
+public sealed class BbOFonts : IDisposable {
+  [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] static extern int AddFontResourceEx(string name, uint fl, IntPtr res);
+  static PrivateFontCollection pfc = new PrivateFontCollection();
+  static List<string> loaded = new List<string>();
+  public static FontFamily Cinzel = null, Cormorant = null, Inter = null;
+  public Font Title, Label, Check, Value, Help, Button, Small, PopItem, PopHead, TipTitle, TipBody;
+  public float S = 1f;
+  public static int LoadDir(string dir) {
+    int n = 0;
+    string[] files = new string[] { "Cinzel-SemiBold.ttf", "CormorantGaramond-Medium.ttf", "CormorantGaramond-MediumItalic.ttf", "Inter-Medium.ttf" };
+    foreach (string f in files) {
+      try {
+        string p = System.IO.Path.Combine(dir, f);
+        string key = f.ToLowerInvariant();
+        if (loaded.Contains(key) || !System.IO.File.Exists(p)) continue;
+        try { AddFontResourceEx(p, 0x10, IntPtr.Zero); } catch { }
+        pfc.AddFontFile(p); loaded.Add(key); n++;
+      } catch (Exception ex) { BbOLog.Write("letra " + f + ": " + ex.Message); }
+    }
+    foreach (FontFamily ff in pfc.Families) {
+      string nm = ff.Name.ToLowerInvariant();
+      if (nm.StartsWith("cinzel")) { if (Cinzel == null) Cinzel = ff; }
+      else if (nm.StartsWith("cormorant")) { if (Cormorant == null) Cormorant = ff; }
+      else if (nm.StartsWith("inter")) { if (Inter == null) Inter = ff; }
+    }
+    return n;
+  }
+  public static string Describe() {
+    return "Cinzel=" + (Cinzel != null ? Cinzel.Name : "-") + ", Cormorant=" + (Cormorant != null ? Cormorant.Name : "-") + ", Inter=" + (Inter != null ? Inter.Name : "-");
+  }
+  public BbOFonts(float s) {
+    S = s;
+    Title = Make(Cinzel, 15.5f, FontStyle.Regular, "Segoe UI Semibold", 14f, FontStyle.Regular);
+    Label = Make(Cormorant, 17.5f, FontStyle.Regular, "Segoe UI", 13.5f, FontStyle.Regular);
+    Check = Make(Cormorant, 17f, FontStyle.Regular, "Segoe UI", 13.5f, FontStyle.Regular);
+    Value = Make(Inter, 13f, FontStyle.Regular, "Segoe UI", 13.5f, FontStyle.Regular);
+    Help = Make(Cormorant, 15.5f, FontStyle.Italic, "Segoe UI", 12f, FontStyle.Italic);
+    Button = Make(Cinzel, 13f, FontStyle.Regular, "Segoe UI Semibold", 13f, FontStyle.Regular);
+    Small = Make(Inter, 11.5f, FontStyle.Regular, "Segoe UI", 12f, FontStyle.Regular);
+    PopItem = Make(Inter, 13f, FontStyle.Regular, "Segoe UI", 13.5f, FontStyle.Regular);
+    PopHead = Make(Cinzel, 11.5f, FontStyle.Regular, "Segoe UI Semibold", 11f, FontStyle.Regular);
+    TipTitle = Make(Cinzel, 13.5f, FontStyle.Regular, "Segoe UI Semibold", 13f, FontStyle.Regular);
+    TipBody = Make(Inter, 12.5f, FontStyle.Regular, "Segoe UI", 12.5f, FontStyle.Regular);
+  }
+  Font Make(FontFamily fam, float px, FontStyle st, string fb, float fbPx, FontStyle fbSt) {
+    if (fam != null) { try { if (fam.IsStyleAvailable(st)) return new Font(fam, px * S, st, GraphicsUnit.Pixel); } catch { } }
+    try { return new Font(fb, fbPx * S, fbSt, GraphicsUnit.Pixel); } catch { }
+    return new Font(FontFamily.GenericSansSerif, fbPx * S, FontStyle.Regular, GraphicsUnit.Pixel);
+  }
+  public void Dispose() {
+    Font[] all = new Font[] { Title, Label, Check, Value, Help, Button, Small, PopItem, PopHead, TipTitle, TipBody };
+    foreach (Font f in all) { if (f != null) { try { f.Dispose(); } catch { } } }
+  }
+}
+
+// Paleta y dibujo comun (gotico victoriano: carbon calido, bronce envejecido, carmesi).
+public static class BbOGfx {
+  public static readonly Color Ink = Color.FromArgb(234, 226, 212);
+  public static readonly Color Bone = Color.FromArgb(214, 203, 182);
+  public static readonly Color Dim = Color.FromArgb(150, 140, 124);
+  public static readonly Color Off = Color.FromArgb(112, 104, 92);
+  public static readonly Color Gold = Color.FromArgb(201, 163, 96);
+  public static readonly Color Candle = Color.FromArgb(242, 214, 156);
+  public static readonly Color Bronze = Color.FromArgb(140, 108, 62);
+  public static readonly Color BronzeDim = Color.FromArgb(104, 82, 54);
+  public static readonly Color Crimson = Color.FromArgb(163, 22, 27);
+  public static readonly Color CrimsonDeep = Color.FromArgb(122, 15, 18);
+  sealed class Helper : Control {
+    public void Bg(Control p, PaintEventArgs pe) { InvokePaintBackground(p, pe); InvokePaint(p, pe); }
+    public void Deco(Control p, PaintEventArgs pe) { InvokePaint(p, pe); }
+  }
+  static Helper helper = null;
+  public static StringFormat Typo, TypoVC, Line, LineCenter, Wrap, WrapCenter;
+  static BbOGfx() {
+    Typo = new StringFormat(StringFormat.GenericTypographic); Typo.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces | StringFormatFlags.NoWrap | StringFormatFlags.NoClip;
+    TypoVC = new StringFormat(StringFormat.GenericTypographic); TypoVC.FormatFlags |= StringFormatFlags.NoWrap | StringFormatFlags.NoClip; TypoVC.LineAlignment = StringAlignment.Center;
+    Line = new StringFormat(StringFormatFlags.NoWrap); Line.Trimming = StringTrimming.EllipsisCharacter; Line.LineAlignment = StringAlignment.Center; Line.Alignment = StringAlignment.Near;
+    LineCenter = new StringFormat(StringFormatFlags.NoWrap); LineCenter.Trimming = StringTrimming.EllipsisCharacter; LineCenter.LineAlignment = StringAlignment.Center; LineCenter.Alignment = StringAlignment.Center;
+    Wrap = new StringFormat(); Wrap.Trimming = StringTrimming.Word; Wrap.LineAlignment = StringAlignment.Near; Wrap.Alignment = StringAlignment.Near;
+    WrapCenter = new StringFormat(); WrapCenter.Trimming = StringTrimming.EllipsisWord; WrapCenter.LineAlignment = StringAlignment.Center; WrapCenter.Alignment = StringAlignment.Near;
+  }
+  public static Color A(Color c, float a) { int v = (int)(c.A * Math.Max(0f, Math.Min(1f, a)) + 0.5f); return Color.FromArgb(v, c.R, c.G, c.B); }
+  public static Color Lerp(Color a, Color b, float t) {
+    if (t <= 0f) return a; if (t >= 1f) return b;
+    return Color.FromArgb((int)(a.A + (b.A - a.A) * t), (int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
+  }
+  public static void Hq(Graphics g) {
+    g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+    g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit; g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+  }
+  public static GraphicsPath Round(RectangleF r, float rad) {
+    GraphicsPath p = new GraphicsPath(); float d = Math.Max(1f, Math.Min(rad * 2f, Math.Min(r.Width, r.Height)));
+    p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90); p.CloseFigure(); return p;
+  }
+  public static void Lozenge(Graphics g, Brush b, float cx, float cy, float r) {
+    PointF[] p = new PointF[] { new PointF(cx, cy - r), new PointF(cx + r, cy), new PointF(cx, cy + r), new PointF(cx - r, cy) };
+    g.FillPolygon(b, p);
+  }
+  public static void Lozenge(Graphics g, float cx, float cy, float r, Color c) { using (SolidBrush b = new SolidBrush(c)) Lozenge(g, b, cx, cy, r); }
+  // Filete que se desvanece en los dos extremos (pico en "peak", 0..1).
+  public static void FadeLine(Graphics g, float x0, float x1, float y, float h, Color c, float peak) {
+    if (x1 - x0 < 2f || h <= 0f) return;
+    using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(x0 - 1f, y - 1f, x1 - x0 + 2f, h + 2f), Color.Transparent, Color.Transparent, 0f)) {
+      ColorBlend cb = new ColorBlend(3);
+      cb.Colors = new Color[] { Color.FromArgb(0, c), c, Color.FromArgb(0, c) };
+      cb.Positions = new float[] { 0f, Math.Max(0.02f, Math.Min(0.98f, peak)), 1f };
+      b.InterpolationColors = cb;
+      g.FillRectangle(b, x0, y, x1 - x0, h);
+    }
+  }
+  public static void Chevron(Graphics g, float cx, float cy, float a, float deg, Color col, float w) {
+    double r = deg * Math.PI / 180.0, cs = Math.Cos(r), sn = Math.Sin(r);
+    float[] px = new float[] { -0.55f * a, 0.45f * a, -0.55f * a }; float[] py = new float[] { -a, 0f, a };
+    PointF[] pts = new PointF[3];
+    for (int i = 0; i < 3; i++) pts[i] = new PointF((float)(cx + px[i] * cs - py[i] * sn), (float)(cy + px[i] * sn + py[i] * cs));
+    using (Pen p = new Pen(col, w)) { p.StartCap = LineCap.Round; p.EndCap = LineCap.Round; p.LineJoin = LineJoin.Round; g.DrawLines(p, pts); }
+  }
+  // Escuadras de esquina con rombo (filigrana).
+  public static void Corners(Graphics g, RectangleF r, float inset, float len, float s, Color c) {
+    using (Pen p = new Pen(c, Math.Max(1f, 1.1f * s))) using (SolidBrush b = new SolidBrush(c)) {
+      float[] xs = new float[] { r.Left + inset, r.Right - inset }; float[] ys = new float[] { r.Top + inset, r.Bottom - inset };
+      for (int ix = 0; ix < 2; ix++) {
+        for (int iy = 0; iy < 2; iy++) {
+          float x = xs[ix], y = ys[iy]; float dx = ix == 0 ? 1f : -1f, dy = iy == 0 ? 1f : -1f;
+          g.DrawLine(p, x + dx * 3f * s, y, x + dx * len, y);
+          g.DrawLine(p, x, y + dy * 3f * s, x, y + dy * len);
+          Lozenge(g, b, x, y, 2.3f * s);
+          g.FillEllipse(b, x + dx * len - 1f * s, y - 1f * s, 2f * s, 2f * s);
+          g.FillEllipse(b, x - 1f * s, y + dy * len - 1f * s, 2f * s, 2f * s);
+        }
+      }
+    }
+  }
+  public static void Glow(Graphics g, RectangleF r, Color c) {
+    if (c.A <= 0 || r.Width < 2 || r.Height < 2) return;
+    using (GraphicsPath ep = new GraphicsPath()) {
+      ep.AddEllipse(r);
+      using (PathGradientBrush pb = new PathGradientBrush(ep)) {
+        pb.CenterColor = c; pb.SurroundColors = new Color[] { Color.FromArgb(0, c) };
+        g.FillPath(pb, ep);
+      }
+    }
+  }
+  public static float CharW(Graphics g, string ch, Font f) {
+    if (ch == " ") return f.Size * 0.3f;
+    return g.MeasureString(ch, f, PointF.Empty, Typo).Width;
+  }
+  public static float MeasureTracked(Graphics g, string s, Font f, float tr) {
+    if (String.IsNullOrEmpty(s)) return 0f;
+    float w = 0f;
+    for (int i = 0; i < s.Length; i++) w += CharW(g, s.Substring(i, 1), f) + tr;
+    return w - tr;
+  }
+  public static float DrawTracked(Graphics g, string s, Font f, Color c, float x, float cy, float tr) {
+    if (String.IsNullOrEmpty(s)) return x;
+    float h = f.GetHeight(g);
+    using (SolidBrush b = new SolidBrush(c)) {
+      for (int i = 0; i < s.Length; i++) {
+        string ch = s.Substring(i, 1);
+        if (ch != " ") g.DrawString(ch, f, b, new RectangleF(x, cy - h, 4f * h, 2f * h), TypoVC);
+        x += CharW(g, ch, f) + tr;
+      }
+    }
+    return x;
+  }
+  public static void Text(Graphics g, string s, Font f, Color c, RectangleF r, StringFormat sf) {
+    if (String.IsNullOrEmpty(s) || r.Width < 2 || r.Height < 2) return;
+    using (SolidBrush b = new SolidBrush(c)) g.DrawString(s, f, b, r, sf);
+  }
+  public static void Blit(Graphics g, Image img, int x, int y) {
+    g.DrawImage(img, new Rectangle(x, y, img.Width, img.Height), 0, 0, img.Width, img.Height, GraphicsUnit.Pixel);
+  }
+  public static Point OffsetInForm(Control c) {
+    int x = 0, y = 0;
+    for (Control p = c; p != null && !(p is Form); p = p.Parent) { x += p.Left; y += p.Top; }
+    return new Point(x, y);
+  }
+  // Lo que hay detras del control: el formulario (imagen, niebla, brasas) y cada contenedor con su color y su adorno.
+  public static void PaintParent(Control c, Graphics g) {
+    if (helper == null) helper = new Helper();
+    if (c.Parent == null) { g.Clear(Color.FromArgb(14, 12, 12)); return; }
+    List<Control> chain = new List<Control>(); List<Point> offs = new List<Point>();
+    int ox = c.Left, oy = c.Top;
+    for (Control p = c.Parent; p != null; p = p.Parent) {
+      chain.Add(p); offs.Add(new Point(ox, oy));
+      if (p is Form || p.Parent == null) break;
+      ox += p.Left; oy += p.Top;
+    }
+    for (int i = chain.Count - 1; i >= 0; i--) {
+      Control a = chain[i]; Point o = offs[i];
+      GraphicsState st = g.Save();
+      try {
+        g.TranslateTransform(-o.X, -o.Y);
+        Rectangle r = new Rectangle(o.X, o.Y, c.Width, c.Height);
+        if (i == chain.Count - 1) { helper.Bg(a, new PaintEventArgs(g, r)); }
+        else {
+          g.IntersectClip(new Rectangle(0, 0, a.Width, a.Height));
+          if (a.Region != null) g.SetClip(a.Region, CombineMode.Intersect);
+          Color bc = a.BackColor;
+          if (bc.A > 0) { using (SolidBrush b = new SolidBrush(bc)) g.FillRectangle(b, r); }
+          helper.Deco(a, new PaintEventArgs(g, r));
+        }
+      } catch { } finally { g.Restore(st); }
+    }
+  }
+  // Marco de metal grabado (botones): relleno, bisel, doble filete; carmesi para el boton principal.
+  public static void Metal(Graphics g, RectangleF b, float s, float hv, float pr, bool en, bool crimson) {
+    if (b.Width < 6 || b.Height < 6) return;
+    float rad = 3f * s;
+    Color top, bot;
+    if (crimson) {
+      top = Lerp(Color.FromArgb(246, 146, 22, 27), Color.FromArgb(250, 178, 34, 36), hv);
+      bot = Lerp(Color.FromArgb(246, 70, 9, 12), Color.FromArgb(250, 96, 14, 17), hv);
+    } else {
+      top = Lerp(Color.FromArgb(238, 45, 37, 31), Color.FromArgb(242, 60, 48, 38), hv);
+      bot = Lerp(Color.FromArgb(238, 22, 18, 15), Color.FromArgb(242, 30, 24, 19), hv);
+    }
+    if (pr > 0f) { top = Lerp(top, Color.FromArgb(top.A, bot), 0.45f * pr); }
+    if (!en) { top = Color.FromArgb(150, 34, 30, 28); bot = Color.FromArgb(150, 22, 19, 18); }
+    using (GraphicsPath p = Round(b, rad)) {
+      using (LinearGradientBrush lb = new LinearGradientBrush(new RectangleF(b.X, b.Y - 1f, b.Width, b.Height + 2f), top, bot, 90f)) g.FillPath(lb, p);
+      GraphicsState st = g.Save();
+      try {
+        g.SetClip(p, CombineMode.Intersect);
+        if (en && hv > 0.01f) Glow(g, new RectangleF(b.X + b.Width * 0.1f, b.Y + b.Height * 0.35f, b.Width * 0.8f, b.Height * 1.3f), crimson ? Color.FromArgb((int)(70 * hv), 255, 140, 70) : Color.FromArgb((int)(52 * hv), 210, 130, 56));
+        using (SolidBrush hl = new SolidBrush(Color.FromArgb(en ? (int)(26 + 26 * hv) : 12, 255, 226, 186))) g.FillRectangle(hl, b.X + 3f * s, b.Y + 1f, b.Width - 6f * s, 1f);
+        using (SolidBrush sh = new SolidBrush(Color.FromArgb(110, 0, 0, 0))) g.FillRectangle(sh, b.X + 3f * s, b.Bottom - 2f, b.Width - 6f * s, 1f);
+      } finally { g.Restore(st); }
+      Color oc = crimson ? Lerp(Color.FromArgb(230, 176, 140, 82), Color.FromArgb(255, 236, 200, 132), hv) : Lerp(Color.FromArgb(220, 122, 96, 60), Color.FromArgb(255, 214, 178, 112), hv);
+      if (!en) oc = Color.FromArgb(120, 90, 76, 58);
+      using (Pen pen = new Pen(oc, 1f)) g.DrawPath(pen, p);
+    }
+    RectangleF inn = RectangleF.Inflate(b, -3.5f * s, -3.5f * s);
+    if (inn.Width > 8 && inn.Height > 8) {
+      Color ic = crimson ? Color.FromArgb(en ? (int)(70 + 60 * hv) : 30, 236, 196, 130) : Color.FromArgb(en ? (int)(34 + 44 * hv) : 18, 201, 163, 96);
+      using (GraphicsPath ip = Round(inn, Math.Max(1f, rad - 1.5f * s))) using (Pen pen = new Pen(ic, 1f)) g.DrawPath(pen, ip);
+      Color lc = crimson ? Color.FromArgb(en ? (int)(150 + 80 * hv) : 50, 236, 200, 140) : Color.FromArgb(en ? (int)(110 + 90 * hv) : 40, 201, 163, 96);
+      Lozenge(g, inn.Left, inn.Top + inn.Height / 2f, 2f * s, lc);
+      Lozenge(g, inn.Right, inn.Top + inn.Height / 2f, 2f * s, lc);
+    }
+  }
+  public static void DecoratePanel(Control panel) {
+    panel.Paint += delegate(object o, PaintEventArgs e) {
+      Control k = (Control)o; Graphics g = e.Graphics;
+      GraphicsState st = g.Save();
+      try {
+        g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        RectangleF r = new RectangleF(4.5f, 4.5f, k.Width - 9f, k.Height - 9f);
+        if (r.Width > 40 && r.Height > 40) {
+          using (GraphicsPath p = Round(r, 14f)) using (Pen pen = new Pen(Color.FromArgb(46, 176, 140, 82), 1f)) g.DrawPath(pen, p);
+          Corners(g, new RectangleF(0f, 0f, k.Width, k.Height), 5.5f, 12f, 1f, Color.FromArgb(170, 176, 140, 82));
+        }
+      } catch { } finally { g.Restore(st); }
+    };
+    panel.Invalidate();
+  }
+  // Filete bajo JUGAR: bronce que se desvanece a los lados, con una linea oscura debajo (grabado).
+  public static void StyleRule(Control rule) {
+    rule.BackColor = Color.Transparent;
+    rule.Paint += delegate(object o, PaintEventArgs e) {
+      Control k = (Control)o;
+      try {
+        FadeLine(e.Graphics, 0f, k.Width, 0f, 1f, Color.FromArgb(210, 190, 150, 90), 0.5f);
+        if (k.Height > 1) FadeLine(e.Graphics, 0f, k.Width, 1f, 1f, Color.FromArgb(150, 0, 0, 0), 0.5f);
+      } catch { }
+    };
+    rule.Invalidate();
+  }
+  static Font tipFont = null;
+  // Globos de ayuda de todo el lanzador: fondo carbon, filete de bronce, texto marfil con ajuste de linea.
+  public static void StyleToolTip(ToolTip t) {
+    if (tipFont == null) tipFont = new Font("Segoe UI", 9.75f);
+    t.OwnerDraw = true;
+    t.Popup += delegate(object o, PopupEventArgs e) {
+      try {
+        ToolTip tt = (ToolTip)o; string txt = e.AssociatedControl != null ? tt.GetToolTip(e.AssociatedControl) : "";
+        if (String.IsNullOrEmpty(txt)) return;
+        Size sz = TextRenderer.MeasureText(txt, tipFont, new Size(420, 4000), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+        e.ToolTipSize = new Size(Math.Min(460, sz.Width + 24), sz.Height + 16);
+      } catch { }
+    };
+    t.Draw += delegate(object o, DrawToolTipEventArgs e) {
+      try {
+        Graphics g = e.Graphics; Rectangle r = e.Bounds;
+        using (LinearGradientBrush b = new LinearGradientBrush(new Rectangle(r.X, r.Y - 1, r.Width, r.Height + 2), Color.FromArgb(28, 22, 19), Color.FromArgb(16, 13, 12), 90f)) g.FillRectangle(b, r);
+        using (Pen p = new Pen(Color.FromArgb(140, 108, 62))) g.DrawRectangle(p, r.X, r.Y, r.Width - 1, r.Height - 1);
+        using (Pen p = new Pen(Color.FromArgb(60, 140, 108, 62))) g.DrawRectangle(p, r.X + 2, r.Y + 2, r.Width - 5, r.Height - 5);
+        TextRenderer.DrawText(g, e.ToolTipText, tipFont, new Rectangle(r.X + 12, r.Y + 8, r.Width - 24, r.Height - 16), Color.FromArgb(230, 222, 206), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+      } catch { }
+    };
+  }
+}
+
+// Ventana superpuesta (WS_EX_LAYERED + UpdateLayeredWindow): alfa por pixel, sombra suave, sin activarse (no quita el foco
+// al lanzador). El contenido se dibuja con GDI+ directamente en una seccion DIB premultiplicada.
+public class BbOLayer : Form {
+  [StructLayout(LayoutKind.Sequential)] struct PT { public int X, Y; public PT(int x, int y) { X = x; Y = y; } }
+  [StructLayout(LayoutKind.Sequential)] struct SZ { public int W, H; public SZ(int w, int h) { W = w; H = h; } }
+  [StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLEND { public byte Op, Flags, Alpha, Format; }
+  [StructLayout(LayoutKind.Sequential)] struct BIH { public int biSize, biWidth, biHeight; public short biPlanes, biBitCount; public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant; }
+  [DllImport("user32.dll", SetLastError = true)] static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref PT pptDst, ref SZ psize, IntPtr hdcSrc, ref PT pprSrc, int crKey, ref BLEND pblend, int dwFlags);
+  [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+  [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+  [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+  [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+  [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
+  [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr h);
+  [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr hdc, ref BIH bmi, uint usage, out IntPtr bits, IntPtr hSection, uint offset);
+  [DllImport("gdi32.dll")] static extern bool GdiFlush();
+  IntPtr memDC = IntPtr.Zero, hbmp = IntPtr.Zero, oldBmp = IntPtr.Zero;
+  Bitmap surf = null; int sw = 0, sh = 0;
+  protected bool ClickThrough = false;
+  public BbOLayer() {
+    FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false; StartPosition = FormStartPosition.Manual;
+    ControlBox = false; MinimizeBox = false; MaximizeBox = false; Text = ""; AutoScaleMode = AutoScaleMode.None;
+  }
+  protected override CreateParams CreateParams {
+    get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x00080000 | 0x08000000 | 0x00000080; if (ClickThrough) cp.ExStyle |= 0x00000020; return cp; }
+  }
+  protected override bool ShowWithoutActivation { get { return true; } }
+  protected override void WndProc(ref Message m) {
+    if (m.Msg == 0x0021) { m.Result = new IntPtr(3); return; }  // WM_MOUSEACTIVATE -> MA_NOACTIVATE
+    base.WndProc(ref m);
+  }
+  protected override void OnPaintBackground(PaintEventArgs e) { }
+  protected override void OnPaint(PaintEventArgs e) { }
+  protected virtual void OnRender(Graphics g) { }
+  void Free() {
+    if (surf != null) { surf.Dispose(); surf = null; }
+    if (memDC != IntPtr.Zero) { if (oldBmp != IntPtr.Zero) SelectObject(memDC, oldBmp); DeleteDC(memDC); }
+    if (hbmp != IntPtr.Zero) DeleteObject(hbmp);
+    memDC = IntPtr.Zero; hbmp = IntPtr.Zero; oldBmp = IntPtr.Zero; sw = 0; sh = 0;
+  }
+  void Alloc(int w, int h) {
+    Free();
+    BIH bi = new BIH(); bi.biSize = Marshal.SizeOf(typeof(BIH)); bi.biWidth = w; bi.biHeight = -h; bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0;
+    IntPtr screen = GetDC(IntPtr.Zero);
+    try { memDC = CreateCompatibleDC(screen); } finally { ReleaseDC(IntPtr.Zero, screen); }
+    IntPtr bits;
+    hbmp = CreateDIBSection(memDC, ref bi, 0, out bits, IntPtr.Zero, 0);
+    if (hbmp == IntPtr.Zero || bits == IntPtr.Zero) { Free(); throw new InvalidOperationException("CreateDIBSection"); }
+    oldBmp = SelectObject(memDC, hbmp);
+    surf = new Bitmap(w, h, w * 4, PixelFormat.Format32bppPArgb, bits);
+    sw = w; sh = h;
+  }
+  protected void Present(Rectangle bounds, float opacity) {
+    int w = Math.Max(1, bounds.Width), h = Math.Max(1, bounds.Height);
+    if (surf == null || w != sw || h != sh) Alloc(w, h);
+    using (Graphics g = Graphics.FromImage(surf)) { g.Clear(Color.Transparent); BbOGfx.Hq(g); OnRender(g); }
+    GdiFlush();
+    PT dst = new PT(bounds.X, bounds.Y); SZ size = new SZ(w, h); PT src = new PT(0, 0);
+    BLEND bl = new BLEND(); bl.Op = 0; bl.Flags = 0; bl.Format = 1;
+    bl.Alpha = (byte)Math.Max(0, Math.Min(255, (int)(opacity * 255f + 0.5f)));
+    IntPtr screen = GetDC(IntPtr.Zero);
+    try { UpdateLayeredWindow(Handle, screen, ref dst, ref size, memDC, ref src, 0, ref bl, 2); }
+    finally { ReleaseDC(IntPtr.Zero, screen); }
+  }
+  protected override void Dispose(bool disposing) { try { Free(); } catch { } base.Dispose(disposing); }
+}
+
+// Lista de valores (sustituye al desplegable nativo): marco grabado, cabeceras de grupo, hover, rueda suave, teclado.
+public class BbOPopup : BbOLayer, IBbOAnim {
+  public ComboBox Combo; public int Result = -1;
+  public event EventHandler Committed; public event EventHandler Dismissed;
+  BbOptionsPanel host; BbOFonts F; float S; bool brand;
+  string[] text; bool[] head; float[] tops, hts, hov; int count;
+  int cur = -1, hl = -1, pressed = -1;
+  int M, padY, frameW, frameH, viewH, contentH; bool above = false;
+  Rectangle frame;
+  BbOSpring sp = new BbOSpring();
+  double lastT = 0, t0 = 0; bool kicked = false, inPump = false;
+  int phase = 0; float alpha = 0f, slide = 0f;
+  ClickFilter filter = null; Form owner = null; EventHandler deact = null;
+
+  sealed class ClickFilter : IMessageFilter {
+    BbOPopup p; public ClickFilter(BbOPopup p) { this.p = p; }
+    public bool PreFilterMessage(ref Message m) {
+      int msg = m.Msg;
+      if (msg == 0x201 || msg == 0x204 || msg == 0x207 || msg == 0xA1 || msg == 0xA4 || msg == 0xA7) {
+        if (m.HWnd != p.Handle) return p.OutsideClick(m.HWnd);
+      }
+      return false;
+    }
+  }
+
+  public BbOPopup(BbOptionsPanel host, ComboBox cb, Rectangle anchor, BbOFonts f, float s, bool brand) {
+    this.host = host; Combo = cb; F = f; S = s; this.brand = brand;
+    count = cb.Items.Count; text = new string[count]; head = new bool[count]; tops = new float[count]; hts = new float[count]; hov = new float[count];
+    M = R(16); padY = R(6);
+    float y = 0f, maxW = 0f;
+    using (Bitmap mb = new Bitmap(1, 1)) using (Graphics mg = Graphics.FromImage(mb)) {
+      BbOGfx.Hq(mg);
+      for (int i = 0; i < count; i++) {
+        string t = cb.GetItemText(cb.Items[i]);
+        bool h = t != null && t.StartsWith("----");
+        if (h) t = t.Trim(new char[] { '-', ' ' });
+        text[i] = t == null ? "" : t; head[i] = h;
+        tops[i] = y; hts[i] = h ? R(28) : R(30); y += hts[i];
+        float w = h ? BbOGfx.MeasureTracked(mg, text[i].ToUpperInvariant(), F.PopHead, 1.2f * S) + R(70) : mg.MeasureString(text[i], F.PopItem).Width;
+        if (w > maxW) maxW = w;
+      }
+    }
+    contentH = (int)Math.Ceiling(y);
+    cur = cb.SelectedIndex; hl = cur;
+    int rows = Math.Max(10, cb.MaxDropDownItems);
+    float vh = 0f; for (int i = 0; i < count && i < rows; i++) vh += hts[i];
+    viewH = (int)Math.Ceiling(Math.Min(contentH, Math.Max(vh, R(60))));
+    Rectangle wa = Screen.FromRectangle(anchor).WorkingArea;
+    frameW = (int)Math.Max(anchor.Width, maxW + R(64));
+    frameW = Math.Min(frameW, Math.Min(R(620), wa.Width - 16));
+    frameH = viewH + 2 * padY;
+    int below = wa.Bottom - (anchor.Bottom + R(4)) - 8, up = anchor.Top - R(4) - wa.Top - 8;
+    if (frameH > below && up > below) { above = true; if (frameH > up) { viewH = Math.Max(R(60), up - 2 * padY); frameH = viewH + 2 * padY; } }
+    else if (frameH > below) { viewH = Math.Max(R(60), below - 2 * padY); frameH = viewH + 2 * padY; }
+    int fx = anchor.Right - frameW; if (fx < wa.Left + 8) fx = wa.Left + 8;
+    int fy = above ? anchor.Top - R(4) - frameH : anchor.Bottom + R(4);
+    frame = new Rectangle(fx, fy, frameW, frameH);
+    if (cur >= 0 && cur < count) {
+      double t = tops[cur] - (viewH - hts[cur]) / 2.0;
+      sp.Jump(Math.Max(0.0, Math.Min(MaxScroll(), t)));
+    }
+  }
+  int R(float v) { return (int)Math.Round(v * S); }
+  double MaxScroll() { return Math.Max(0, contentH - viewH); }
+  Rectangle WinRect() { return new Rectangle(frame.X - M, frame.Y - M + (int)Math.Round(slide), frame.Width + 2 * M, frame.Height + 2 * M); }
+  public bool IsClosing { get { return phase == 2; } }
+  public void Open(Form own) {
+    owner = own;
+    IntPtr h = Handle;
+    Bounds = WinRect();
+    slide = BbOPump.ReduceMotion ? 0f : (above ? R(6) : -R(6));
+    alpha = BbOPump.ReduceMotion ? 1f : 0f;
+    Present(WinRect(), alpha);
+    if (own != null) Show(own); else Show();
+    filter = new ClickFilter(this); Application.AddMessageFilter(filter);
+    if (own != null) { deact = delegate(object s, EventArgs e) { Close2(); }; own.Deactivate += deact; }
+    phase = 1; t0 = BbOPump.Now; Kick();
+  }
+  void Kick() { kicked = true; if (BbOPump.Add(this)) lastT = BbOPump.Now - 0.016; }
+  public bool Tick(double now) {
+    kicked = false;
+    if (IsDisposed) { inPump = false; return false; }
+    double dt = now - lastT; if (dt < 0.0005) dt = 0.0005; if (dt > 0.05) dt = 0.05; lastT = now;
+    if (BbOPump.ReduceMotion) dt = 10;
+    bool more = false;
+    if (phase == 1) {
+      double t = BbOPump.ReduceMotion ? 1 : (now - t0) / 0.15; if (t > 1) t = 1;
+      float e = 1f - (float)Math.Pow(1 - t, 3);
+      alpha = e; slide = (above ? R(6) : -R(6)) * (1f - e);
+      if (t < 1) more = true;
+    } else if (phase == 2) {
+      double t = BbOPump.ReduceMotion ? 1 : (now - t0) / 0.09; if (t > 1) t = 1;
+      alpha = 1f - (float)t;
+      if (t >= 1) { Finish(); inPump = false; return false; }
+      more = true;
+    }
+    if (sp.Active) { sp.Step(dt, MaxScroll()); if (sp.Active) more = true; }
+    float kin = (float)(1 - Math.Exp(-dt / 0.05)), kout = (float)(1 - Math.Exp(-dt / 0.11));
+    for (int i = 0; i < count; i++) {
+      float tg = (i == hl && !head[i]) ? 1f : 0f;
+      if (Math.Abs(hov[i] - tg) > 0.003f) { hov[i] += (tg - hov[i]) * (tg > hov[i] ? kin : kout); more = true; } else hov[i] = tg;
+    }
+    try { Present(WinRect(), alpha); } catch (Exception ex) { BbOLog.Write("lista: " + ex.Message); Finish(); inPump = false; return false; }
+    bool r = more || kicked; if (!r) inPump = false; return r;
+  }
+  protected override void OnRender(Graphics g) {
+    float s = S;
+    RectangleF fr = new RectangleF(M + 0.5f, M + 0.5f, frame.Width - 1f, frame.Height - 1f);
+    for (int i = 6; i >= 1; i--) {
+      using (GraphicsPath sp2 = BbOGfx.Round(new RectangleF(fr.X - i * 1.8f * s, fr.Y - i * 1.4f * s + 3f * s, fr.Width + i * 3.6f * s, fr.Height + i * 2.8f * s), 6f * s + i * 1.8f * s))
+      using (SolidBrush b = new SolidBrush(Color.FromArgb(14, 0, 0, 0))) g.FillPath(b, sp2);
+    }
+    using (GraphicsPath p = BbOGfx.Round(fr, 5f * s)) {
+      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(fr.X, fr.Y - 1, fr.Width, fr.Height + 2), Color.FromArgb(252, 27, 21, 19), Color.FromArgb(252, 14, 11, 10), 90f)) g.FillPath(b, p);
+      GraphicsState st0 = g.Save();
+      try { g.SetClip(p, CombineMode.Intersect); BbOGfx.Glow(g, new RectangleF(fr.X - fr.Width * 0.2f, fr.Y - R(50), fr.Width * 0.9f, R(120)), Color.FromArgb(26, 150, 96, 40)); } finally { g.Restore(st0); }
+      using (Pen pen = new Pen(Color.FromArgb(200, 140, 108, 62), 1f)) g.DrawPath(pen, p);
+    }
+    using (GraphicsPath ip = BbOGfx.Round(RectangleF.Inflate(fr, -3f * s, -3f * s), 3f * s)) using (Pen pen = new Pen(Color.FromArgb(46, 140, 108, 62), 1f)) g.DrawPath(pen, ip);
+    BbOGfx.Corners(g, fr, 4f * s, 9f * s, s, Color.FromArgb(190, 176, 140, 82));
+    RectangleF view = new RectangleF(M, M + padY, frame.Width, viewH);
+    bool bar = contentH > viewH + 0.5;
+    float rowR = view.Right - R(bar ? 16 : 8);
+    GraphicsState st = g.Save();
+    try {
+      g.SetClip(view, CombineMode.Intersect);
+      float pos = (float)sp.Pos;
+      for (int i = 0; i < count; i++) {
+        float y = view.Y + tops[i] - pos; float h = hts[i];
+        if (y + h < view.Y || y > view.Bottom) continue;
+        RectangleF rr = new RectangleF(view.X + R(6), y, rowR - view.X - R(6), h);
+        if (head[i]) {
+          string t = text[i].ToUpperInvariant();
+          float tw = BbOGfx.MeasureTracked(g, t, F.PopHead, 1.2f * s);
+          float cx = rr.X + rr.Width / 2f, ty = y + h / 2f + 1f * s;
+          BbOGfx.DrawTracked(g, t, F.PopHead, Color.FromArgb(210, 201, 163, 96), cx - tw / 2f, ty, 1.2f * s);
+          BbOGfx.FadeLine(g, rr.X + R(8), cx - tw / 2f - R(8), (float)Math.Round(ty), 1f, Color.FromArgb(140, 140, 108, 62), 0.85f);
+          BbOGfx.FadeLine(g, cx + tw / 2f + R(8), rr.Right - R(8), (float)Math.Round(ty), 1f, Color.FromArgb(140, 140, 108, 62), 0.15f);
+          continue;
+        }
+        float hv = hov[i];
+        if (i == cur) {
+          using (GraphicsPath rp = BbOGfx.Round(rr, 2f * s))
+          using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(rr.X - 1, rr.Y, rr.Width + 2, rr.Height), Color.FromArgb(150, 122, 15, 18), Color.FromArgb(30, 122, 15, 18), 0f)) g.FillPath(b, rp);
+          using (SolidBrush b = new SolidBrush(BbOGfx.Crimson)) g.FillRectangle(b, rr.X, rr.Y + 3f * s, 2f * s, rr.Height - 6f * s);
+          BbOGfx.Lozenge(g, rr.Right - R(10), rr.Y + rr.Height / 2f, 2.6f * s, Color.FromArgb(220, 214, 178, 112));
+        }
+        if (hv > 0.01f) {
+          using (GraphicsPath rp = BbOGfx.Round(rr, 2f * s))
+          using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(rr.X - 1, rr.Y, rr.Width + 2, rr.Height), Color.FromArgb((int)(70 * hv), 170, 110, 50), Color.FromArgb((int)(10 * hv), 170, 110, 50), 0f)) g.FillPath(b, rp);
+          if (i != cur) using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(200 * hv), 201, 163, 96))) g.FillRectangle(b, rr.X, rr.Y + 4f * s, 1.5f * s, rr.Height - 8f * s);
+        }
+        Color tc = i == cur ? BbOGfx.Candle : (brand ? BbOptionsPanel.Brand(text[i]) : BbOGfx.Ink);
+        if (i != cur && hv > 0f) tc = BbOGfx.Lerp(tc, BbOGfx.Candle, hv * 0.5f);
+        BbOGfx.Text(g, text[i], F.PopItem, tc, new RectangleF(rr.X + R(14), rr.Y, rr.Width - R(30), rr.Height), BbOGfx.Line);
+      }
+    } finally { g.Restore(st); }
+    float fh = R(10);
+    using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(view.X, view.Y - 1, view.Width, fh + 2), Color.FromArgb(sp.Pos > 0.5 ? 240 : 0, 26, 21, 19), Color.FromArgb(0, 26, 21, 19), 90f)) g.FillRectangle(b, view.X + R(4), view.Y, view.Width - R(8), fh);
+    using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(view.X, view.Bottom - fh - 1, view.Width, fh + 2), Color.FromArgb(0, 14, 11, 10), Color.FromArgb(sp.Pos < MaxScroll() - 0.5 ? 240 : 0, 14, 11, 10), 90f)) g.FillRectangle(b, view.X + R(4), view.Bottom - fh, view.Width - R(8), fh);
+    if (bar) {
+      float trackX = view.Right - R(9), trackT = view.Y + R(4), trackH = view.Height - R(8);
+      using (SolidBrush b = new SolidBrush(Color.FromArgb(50, 140, 108, 62))) g.FillRectangle(b, trackX - 0.5f, trackT, 1f, trackH);
+      float th = (float)Math.Max(R(28), trackH * viewH / Math.Max(1.0, contentH));
+      float ty = trackT + (float)((trackH - th) * (MaxScroll() > 0 ? sp.Pos / MaxScroll() : 0));
+      using (GraphicsPath tp = BbOGfx.Round(new RectangleF(trackX - 2f * s, ty, 4f * s, th), 2f * s)) using (SolidBrush b = new SolidBrush(Color.FromArgb(190, 160, 126, 74))) g.FillPath(b, tp);
+    }
+  }
+  int ItemAt(Point p) {
+    if (p.X < M || p.X > M + frame.Width) return -1;
+    float y = p.Y - (M + padY) + (float)sp.Pos;
+    if (p.Y < M + padY || p.Y > M + padY + viewH) return -1;
+    for (int i = 0; i < count; i++) if (y >= tops[i] && y < tops[i] + hts[i]) return head[i] ? -1 : i;
+    return -1;
+  }
+  protected override void OnMouseMove(MouseEventArgs e) {
+    base.OnMouseMove(e);
+    if (phase == 2) return;
+    int i = ItemAt(e.Location);
+    if (i >= 0 && i != hl) { hl = i; Kick(); }
+    Cursor = i >= 0 ? Cursors.Hand : Cursors.Default;
+  }
+  protected override void OnMouseDown(MouseEventArgs e) {
+    base.OnMouseDown(e);
+    if (phase == 2) return;
+    if (!new Rectangle(M, M, frame.Width, frame.Height).Contains(e.Location)) { Close2(); return; }
+    pressed = ItemAt(e.Location);
+  }
+  protected override void OnMouseUp(MouseEventArgs e) {
+    base.OnMouseUp(e);
+    if (phase == 2) return;
+    int i = ItemAt(e.Location);
+    if (e.Button == MouseButtons.Left && i >= 0 && i == pressed) Commit(i);
+    pressed = -1;
+  }
+  protected override void OnMouseWheel(MouseEventArgs e) {
+    HandledMouseEventArgs he = e as HandledMouseEventArgs; if (he != null) he.Handled = true;
+    WheelBy(-e.Delta * 0.5);
+  }
+  public void WheelBy(double px) { if (phase == 2 || MaxScroll() <= 0) return; sp.Wheel(px, MaxScroll(), 24); Kick(); }
+  int NextSel(int i, int dir) {
+    for (int k = i + dir; k >= 0 && k < count; k += dir) if (!head[k]) return k;
+    return i;
+  }
+  void EnsureRow(int i) {
+    if (i < 0 || i >= count) return;
+    double t = sp.Active ? sp.Target : sp.Pos;
+    if (tops[i] < t) sp.To(tops[i], 30);
+    else if (tops[i] + hts[i] > t + viewH) sp.To(tops[i] + hts[i] - viewH, 30);
+  }
+  public bool HandleKey(Keys k) {
+    if (phase == 2) return false;
+    Keys code = k & Keys.KeyCode;
+    int start = hl >= 0 ? hl : cur;
+    int page = Math.Max(1, (int)(viewH / Math.Max(1f, (float)R(30))) - 1);
+    if (code == Keys.Escape || code == Keys.Tab) { Close2(); return true; }
+    if (code == Keys.Enter || code == Keys.Space) { if (hl >= 0 && !head[hl]) Commit(hl); else Close2(); return true; }
+    if (code == Keys.Down) { hl = NextSel(start < 0 ? -1 : start, 1); }
+    else if (code == Keys.Up) { hl = NextSel(start < 0 ? count : start, -1); }
+    else if (code == Keys.PageDown) { int i = start; for (int n = 0; n < page; n++) i = NextSel(i, 1); hl = i; }
+    else if (code == Keys.PageUp) { int i = start; for (int n = 0; n < page; n++) i = NextSel(i, -1); hl = i; }
+    else if (code == Keys.Home) { hl = NextSel(-1, 1); }
+    else if (code == Keys.End) { hl = NextSel(count, -1); }
+    else if (code == Keys.Left || code == Keys.Right) { return true; }
+    else return false;
+    if (hl >= count || hl < 0 || head[hl]) hl = start;
+    EnsureRow(hl); Kick();
+    return true;
+  }
+  void Commit(int i) {
+    if (phase == 2) return;
+    Result = i;
+    if (Committed != null) { try { Committed(this, EventArgs.Empty); } catch (Exception ex) { BbOLog.Write("seleccion: " + ex.Message); } }
+    Close2();
+  }
+  public bool OutsideClick(IntPtr hwnd) {
+    bool eat = false;
+    try { if (host != null && host.IsHandleCreated && hwnd == host.Handle) eat = ReferenceEquals(host.KeyAtScreen(Cursor.Position), Combo); } catch { }
+    Close2();
+    return eat;
+  }
+  public void Close2() {
+    if (phase == 2) return;
+    phase = 2; t0 = BbOPump.Now;
+    if (filter != null) { Application.RemoveMessageFilter(filter); filter = null; }
+    if (owner != null && deact != null) { owner.Deactivate -= deact; deact = null; }
+    if (Dismissed != null) { try { Dismissed(this, EventArgs.Empty); } catch { } }
+    Kick();
+  }
+  void Finish() {
+    phase = 3;
+    try { Hide(); } catch { }
+    try { if (IsHandleCreated) BeginInvoke(new MethodInvoker(Dispose)); else Dispose(); } catch { }
+  }
+}
+
+// Nota de ayuda (globo) a la izquierda del panel, sobre la ilustracion: titulo en Cinzel y texto con ajuste de linea.
+public class BbOTip : BbOLayer, IBbOAnim {
+  string title = "", body = ""; BbOFonts F; float S = 1f;
+  Rectangle frame; int M; float alpha = 0f; int phase = 0; double t0 = 0, lastT = 0; bool kicked = false, inPump = false;
+  float titleH, bodyH; int padX, padY, textW;
+  public BbOTip() { ClickThrough = true; }
+  int R(float v) { return (int)Math.Round(v * S); }
+  Rectangle WinRect() { return new Rectangle(frame.X - M, frame.Y - M, frame.Width + 2 * M, frame.Height + 2 * M); }
+  public void ShowTip(Form owner, string t, string b, Rectangle row, Rectangle panel, BbOFonts f, float s) {
+    F = f; S = s; title = t == null ? "" : t; body = b == null ? "" : b;
+    M = R(14); padX = R(16); padY = R(12); textW = R(330);
+    using (Bitmap mb = new Bitmap(1, 1)) using (Graphics mg = Graphics.FromImage(mb)) {
+      BbOGfx.Hq(mg);
+      titleH = title.Length > 0 ? F.TipTitle.GetHeight(mg) + R(10) : 0f;
+      SizeF bs = mg.MeasureString(body, F.TipBody, textW, BbOGfx.Wrap);
+      bodyH = (float)Math.Ceiling(bs.Height);
+      float tw = title.Length > 0 ? BbOGfx.MeasureTracked(mg, title.ToUpperInvariant(), F.TipTitle, 1.2f * S) : 0f;
+      if (tw > textW) textW = (int)Math.Ceiling(Math.Min(tw, R(460)));
+    }
+    int w = textW + 2 * padX, h = (int)Math.Ceiling(titleH + bodyH) + 2 * padY;
+    Rectangle wa = Screen.FromRectangle(row).WorkingArea;
+    int x = panel.Left - w - R(16), y = row.Top - R(4);
+    if (x < wa.Left + 8) { x = Math.Max(wa.Left + 8, panel.Left + R(10)); y = row.Bottom + R(6); }
+    if (y + h > wa.Bottom - 8) y = Math.Max(wa.Top + 8, wa.Bottom - 8 - h);
+    frame = new Rectangle(x, y, w, h);
+    IntPtr hh = Handle;
+    Bounds = WinRect();
+    if (phase == 0 || phase == 2 || !Visible) alpha = BbOPump.ReduceMotion ? 1f : 0f;
+    Present(WinRect(), alpha);
+    if (!Visible) { if (owner != null) Show(owner); else Show(); }
+    phase = 1; t0 = BbOPump.Now - (alpha * 0.12); Kick();
+  }
+  public void HideTip() { if (phase == 1) { phase = 2; t0 = BbOPump.Now; Kick(); } }
+  void Kick() { kicked = true; if (BbOPump.Add(this)) lastT = BbOPump.Now - 0.016; }
+  public bool Tick(double now) {
+    kicked = false;
+    if (IsDisposed) { inPump = false; return false; }
+    bool more = false;
+    if (phase == 1) {
+      double t = BbOPump.ReduceMotion ? 1 : (now - t0) / 0.12; if (t > 1) t = 1;
+      alpha = 1f - (float)Math.Pow(1 - t, 3); if (t < 1) more = true;
+    } else if (phase == 2) {
+      double t = BbOPump.ReduceMotion ? 1 : (now - t0) / 0.08; if (t > 1) t = 1;
+      alpha = 1f - (float)t;
+      if (t >= 1) { phase = 0; alpha = 0f; try { Hide(); } catch { } inPump = false; return false; }
+      more = true;
+    }
+    try { Present(WinRect(), alpha); } catch (Exception ex) { BbOLog.Write("ayuda: " + ex.Message); phase = 0; try { Hide(); } catch { } inPump = false; return false; }
+    bool r = more || kicked; if (!r) inPump = false; return r;
+  }
+  protected override void OnRender(Graphics g) {
+    if (F == null) return;
+    float s = S;
+    RectangleF fr = new RectangleF(M + 0.5f, M + 0.5f, frame.Width - 1f, frame.Height - 1f);
+    for (int i = 5; i >= 1; i--) {
+      using (GraphicsPath p0 = BbOGfx.Round(new RectangleF(fr.X - i * 1.8f * s, fr.Y - i * 1.4f * s + 3f * s, fr.Width + i * 3.6f * s, fr.Height + i * 2.8f * s), 6f * s + i * 1.8f * s))
+      using (SolidBrush b = new SolidBrush(Color.FromArgb(14, 0, 0, 0))) g.FillPath(b, p0);
+    }
+    using (GraphicsPath p = BbOGfx.Round(fr, 5f * s)) {
+      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(fr.X, fr.Y - 1, fr.Width, fr.Height + 2), Color.FromArgb(250, 29, 23, 20), Color.FromArgb(250, 15, 12, 11), 90f)) g.FillPath(b, p);
+      using (Pen pen = new Pen(Color.FromArgb(200, 140, 108, 62), 1f)) g.DrawPath(pen, p);
+    }
+    BbOGfx.Corners(g, fr, 4f * s, 8f * s, s, Color.FromArgb(180, 176, 140, 82));
+    float x = M + padX, y = M + padY;
+    if (title.Length > 0) {
+      float h = F.TipTitle.GetHeight(g);
+      BbOGfx.DrawTracked(g, title.ToUpperInvariant(), F.TipTitle, BbOGfx.Gold, x, y + h / 2f, 1.2f * s);
+      BbOGfx.FadeLine(g, x, x + textW, (float)Math.Round(y + h + R(4)), 1f, Color.FromArgb(150, 140, 108, 62), 0.2f);
+      y += titleH;
+    }
+    BbOGfx.Text(g, body, F.TipBody, Color.FromArgb(226, 218, 202), new RectangleF(x, y, textW + 1, bodyH + R(4)), BbOGfx.Wrap);
+  }
+}
+
+// Panel de opciones dibujado: UN solo control (sin controles nativos dentro). Los ComboBox / CheckBox / botones de
+// siempre siguen existiendo (ocultos) y son el modelo: el panel lee su estado y escribe en ellos (SelectedIndex, OnClick,
+// OnSelectionChangeCommitted), asi que los manejadores, dependencias y el guardado en launcher.ini no cambian.
+public class BbOptionsPanel : Control, IBbOAnim {
+  public ToolTip Tips = null;
+  public object Backdrop = null;
+  public event EventHandler Failed;
+
+  enum K { Field, Action, Check, Button, Hint, Text, Image, Progress }
+  sealed class Cell { public K Kind; public Control Ctl, Label; public RectangleF R, Box; public bool Wrap; }
+  sealed class Row { public int Y, H; public List<Cell> Cells = new List<Cell>(); }
+  sealed class Sec {
+    public Control Group, Header; public string Title = ""; public bool Open = true, Footer = false;
+    public float P = 1f, P0 = 1f, P1 = 1f; public double T0 = -1;
+    public List<Row> Rows = new List<Row>(); public List<Control[]> FooterRows = new List<Control[]>();
+    public List<Hit> Hits = new List<Hit>();
+    public int FullH = 0; public Bitmap Bmp = null; public Rectangle Dirty = Rectangle.Empty;
+    public float Y = 0f, DispH = 0f;
+  }
+  sealed class Hit { public Sec S; public RectangleF R; public Cell C; public object Key; }
+  sealed class St { public float Hover, HoverT, Press, PressT, Check, CheckT, Open, OpenT, Focus, FocusT; public bool Init; }
+
+  static MethodInfo miClick = typeof(Control).GetMethod("OnClick", BindingFlags.Instance | BindingFlags.NonPublic, null, new Type[] { typeof(EventArgs) }, null);
+  static MethodInfo miCommitted = typeof(ComboBox).GetMethod("OnSelectionChangeCommitted", BindingFlags.Instance | BindingFlags.NonPublic, null, new Type[] { typeof(EventArgs) }, null);
+  static MethodInfo miState = typeof(Control).GetMethod("GetState", BindingFlags.Instance | BindingFlags.NonPublic, null, new Type[] { typeof(int) }, null);
+  static St none = new St();
+
+  List<Sec> secs = new List<Sec>();
+  Sec footer = null;
+  Dictionary<Control, bool> hintSet = new Dictionary<Control, bool>();
+  Dictionary<Control, bool> brandSet = new Dictionary<Control, bool>();
+  Dictionary<Control, bool> hooked = new Dictionary<Control, bool>();
+  Dictionary<object, Hit> map = new Dictionary<object, Hit>();
+  Dictionary<object, St> st = new Dictionary<object, St>();
+  List<Control> tracked = new List<Control>();
+  BbOFonts F = null; float S = 1f; bool scaleDirty = true;
+  int cardX = 10, cardW = 100, headerH = 46, gap = 12, topPad = 6, bottomPad = 16, bStrip = 15;
+  bool layoutDirty = true;
+  float totalH = 0f;
+  object hoverKey = null, pressKey = null, focusKey = null, openKey = null; bool kbFocus = false;
+  BbOSpring sp = new BbOSpring(); double lastT = 0; bool kicked = false, inPump = false;
+  Rectangle viewDirty = Rectangle.Empty; bool fullDirty = false;
+  Bitmap bg = null, fadeTop = null, fadeBot = null; Point bgOff = Point.Empty; object bgRef = null; float bgZoom = 1f; bool bgDirty = true;
+  FieldInfo fiBmp = null, fiZoom = null; Type bdType = null;
+  bool barDrag = false; int barDragY0 = 0; double barDragPos0 = 0; float barHover = 0f, barHoverT = 0f;
+  BbOPopup popup = null; double popupClosedT = -10; object popupClosedKey = null;
+  BbOTip tip = null; Timer tipTimer = null; object tipKey = null;
+  Timer poll = null; long sig = 0;
+  double paintEma = 0; bool subPixel = true;
+  int failures = 0; bool failedRaised = false;
+  Bitmap measureBmp = null; Graphics measureG = null;
+  ImageAttributes wrapIa = null;
+
+  public BbOptionsPanel() {
+    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Opaque | ControlStyles.Selectable | ControlStyles.ResizeRedraw, true);
+    TabStop = true;
+    wrapIa = new ImageAttributes(); wrapIa.SetWrapMode(WrapMode.TileFlipXY);
+    tipTimer = new Timer(); tipTimer.Interval = 650; tipTimer.Tick += OnTipTimer;
+    poll = new Timer(); poll.Interval = 300; poll.Tick += OnPoll;
+  }
+  // ---------------------------------------------------------------- modelo
+  public void AddGroup(Control group, string title, bool collapsed, Control header) {
+    Sec s = new Sec(); s.Group = group; s.Header = header; s.Title = title == null ? "" : title;
+    s.Open = !collapsed; s.P = s.P0 = s.P1 = s.Open ? 1f : 0f;
+    secs.Add(s);
+    foreach (Control c in group.Controls) Hook(c);
+    group.ControlAdded += delegate(object o, ControlEventArgs e) { Hook(e.Control); Dirty(); };
+    Dirty();
+  }
+  public void MarkHint(Control c) { if (c != null) hintSet[c] = true; Dirty(); }
+  public void SetBrandTint(Control c) { if (c != null) brandSet[c] = true; Dirty(); }
+  public void AddFooterRow(Control[] ctls) {
+    if (ctls == null || ctls.Length == 0) return;
+    if (footer == null) { footer = new Sec(); footer.Footer = true; }
+    footer.FooterRows.Add(ctls);
+    foreach (Control c in ctls) Hook(c);
+    Dirty();
+  }
+  public void InvalidateBackground() { bgDirty = true; Invalidate(); }
+  public void Wheel(double px) {
+    if (popup != null && !popup.IsClosing) { popup.WheelBy(px); return; }
+    HideTip();
+    sp.Wheel(px, MaxScroll(), 22); Kick();
+  }
+  void Dirty() { layoutDirty = true; if (IsHandleCreated) Invalidate(); }
+  void Hook(Control c) {
+    if (c == null || hooked.ContainsKey(c)) return;
+    hooked[c] = true;
+    c.VisibleChanged += OnModel; c.EnabledChanged += OnModel; c.TextChanged += OnModel; c.ForeColorChanged += OnModel;
+    ComboBox cb = c as ComboBox; if (cb != null) cb.SelectedIndexChanged += OnModel;
+    CheckBox ck = c as CheckBox; if (ck != null) ck.CheckedChanged += OnModel;
+  }
+  void OnModel(object s, EventArgs e) { Dirty(); }
+  static bool OwnVis(Control c) {
+    if (miState != null) { try { return (bool)miState.Invoke(c, new object[] { 2 }); } catch { } }
+    return c.Visible;
+  }
+  static bool IsOn(Control c) { CheckBox k = c as CheckBox; if (k != null) return k.Checked; RadioButton rb = c as RadioButton; return rb != null && rb.Checked; }
+  static bool IsOverlay(Control c) { return (c is Panel) && (c.Tag is ComboBox); }
+  public static Color Brand(string t) {
+    if (t == null) return BbOGfx.Ink;
+    if (t.IndexOf("DLSS", StringComparison.OrdinalIgnoreCase) >= 0 || t.IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) >= 0) return Color.FromArgb(160, 198, 100);
+    if (t.IndexOf("XeSS", StringComparison.OrdinalIgnoreCase) >= 0) return Color.FromArgb(124, 170, 226);
+    if (t.IndexOf("FSR", StringComparison.OrdinalIgnoreCase) >= 0 || t.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0) return Color.FromArgb(228, 112, 98);
+    return BbOGfx.Ink;
+  }
+  static string ValueText(ComboBox cb) {
+    int i = cb.SelectedIndex;
+    if (i >= 0 && i < cb.Items.Count) return cb.GetItemText(cb.Items[i]);
+    return cb.Text;
+  }
+  // ---------------------------------------------------------------- escala, letras, fondo
+  int R(float v) { return (int)Math.Round(v * S); }
+  void EnsureScale() {
+    if (!scaleDirty && F != null) return;
+    scaleDirty = false;
+    float dpi = 96f;
+    try { using (Graphics g = CreateGraphics()) dpi = g.DpiY; } catch { }
+    S = Math.Max(1f, Math.Min(2.5f, dpi / 96f));
+    if (popup != null) popup.Close2();
+    if (F != null) F.Dispose();
+    F = new BbOFonts(S);
+    headerH = R(46); gap = R(12); topPad = R(6); bottomPad = R(16); bStrip = R(15);
+    if (measureG == null) { measureBmp = new Bitmap(1, 1); measureG = Graphics.FromImage(measureBmp); BbOGfx.Hq(measureG); }
+    layoutDirty = true;
+  }
+  void EnsureBg() {
+    Size sz = ClientSize; if (sz.Width < 1 || sz.Height < 1) return;
+    Point off = BbOGfx.OffsetInForm(this);
+    object bref = null; float zoom = 1f;
+    if (Backdrop != null) {
+      try {
+        if (bdType != Backdrop.GetType()) { bdType = Backdrop.GetType(); fiBmp = bdType.GetField("Bmp"); fiZoom = bdType.GetField("Zoom"); }
+        if (fiBmp != null) bref = fiBmp.GetValue(Backdrop);
+        if (fiZoom != null) zoom = (float)fiZoom.GetValue(Backdrop);
+      } catch { }
+    }
+    if (!bgDirty && bg != null && bg.Width == sz.Width && bg.Height == sz.Height && off == bgOff && ReferenceEquals(bref, bgRef) && zoom == bgZoom) return;
+    bgDirty = false; bgOff = off; bgRef = bref; bgZoom = zoom;
+    if (bg == null || bg.Width != sz.Width || bg.Height != sz.Height) { if (bg != null) bg.Dispose(); bg = new Bitmap(sz.Width, sz.Height, PixelFormat.Format32bppPArgb); }
+    using (Graphics g = Graphics.FromImage(bg)) { g.Clear(Color.FromArgb(255, 12, 10, 10)); BbOGfx.PaintParent(this, g); }
+    int fh = Math.Max(1, Math.Min(R(16), sz.Height / 4));
+    if (fadeTop != null) fadeTop.Dispose(); if (fadeBot != null) fadeBot.Dispose();
+    fadeTop = Strip(0, fh, true); fadeBot = Strip(sz.Height - fh, fh, false);
+  }
+  Bitmap Strip(int y0, int h, bool top) {
+    int w = bg.Width;
+    Bitmap s = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+    using (Graphics g = Graphics.FromImage(s)) { g.CompositingMode = CompositingMode.SourceCopy; g.DrawImage(bg, new Rectangle(0, 0, w, h), 0, y0, w, h, GraphicsUnit.Pixel); }
+    BitmapData bd = s.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadWrite, PixelFormat.Format32bppPArgb);
+    try {
+      byte[] row = new byte[w * 4];
+      for (int y = 0; y < h; y++) {
+        float t = (y + 0.5f) / h; float a = top ? 1f - t : t; a = a * a * (3f - 2f * a);
+        IntPtr p = new IntPtr(bd.Scan0.ToInt64() + (long)y * bd.Stride);
+        Marshal.Copy(p, row, 0, row.Length);
+        for (int i = 0; i < row.Length; i++) row[i] = (byte)(row[i] * a + 0.5f);
+        Marshal.Copy(row, 0, p, row.Length);
+      }
+    } finally { s.UnlockBits(bd); }
+    return s;
+  }
+  // ---------------------------------------------------------------- disposicion
+  void Relayout() {
+    layoutDirty = false;
+    cardX = 10; cardW = Width - cardX - 16;
+    map.Clear(); tracked.Clear();
+    if (cardW < 120) return;
+    foreach (Sec s in secs) { Build(s); RenderSec(s, Rectangle.Empty); }
+    if (footer != null) { Build(footer); RenderSec(footer, Rectangle.Empty); }
+    sig = Signature();
+    if (focusKey != null && !map.ContainsKey(focusKey)) focusKey = null;
+    if (hoverKey != null && !map.ContainsKey(hoverKey)) hoverKey = null;
+    Place();
+    if (sp.Pos > MaxScroll()) { sp.Pos = MaxScroll(); if (!sp.Active) sp.Target = sp.Pos; }
+  }
+  void AddHit(Sec s, object key, RectangleF r, Cell c) {
+    Hit h = new Hit(); h.S = s; h.R = r; h.C = c; h.Key = key; s.Hits.Add(h); map[key] = h;
+  }
+  void Build(Sec s) {
+    s.Rows.Clear(); s.Hits.Clear();
+    int y;
+    if (!s.Footer) {
+      y = headerH + R(2);
+      AddHit(s, s, new RectangleF(0, 0, cardW, headerH), null);
+      List<Control> kids = new List<Control>();
+      foreach (Control c in s.Group.Controls) { tracked.Add(c); if (c == s.Header || IsOverlay(c) || !OwnVis(c)) continue; kids.Add(c); }
+      kids.Sort(delegate(Control a, Control b) { int d = a.Top.CompareTo(b.Top); if (d == 0) d = a.Left.CompareTo(b.Left); return d; });
+      List<List<Control>> lines = new List<List<Control>>();
+      List<Control> cur = null; int top0 = 0;
+      foreach (Control c in kids) {
+        if (cur == null || c.Top - top0 > 8) { cur = new List<Control>(); lines.Add(cur); top0 = c.Top; }
+        cur.Add(c);
+      }
+      int gw = Math.Max(60, s.Group.Width);
+      foreach (List<Control> line in lines) {
+        line.Sort(delegate(Control a, Control b) { return a.Left.CompareTo(b.Left); });
+        y = AddLine(s, line, gw, y);
+      }
+      s.FullH = y + bottomPad;
+    } else {
+      y = R(2);
+      foreach (Control[] fr in s.FooterRows) {
+        foreach (Control c in fr) tracked.Add(c);
+        y = AddFooter(s, fr, y);
+      }
+      s.FullH = Math.Max(1, y + R(8));
+    }
+    if (s.Bmp == null || s.Bmp.Width != cardW || s.Bmp.Height != s.FullH) {
+      if (s.Bmp != null) s.Bmp.Dispose();
+      s.Bmp = new Bitmap(cardW, Math.Max(1, s.FullH), PixelFormat.Format32bppPArgb);
+    }
+    s.Dirty = Rectangle.Empty;
+  }
+  int AddLine(Sec s, List<Control> line, int gw, int y) {
+    Control label = null, value = null; List<Control> checks = new List<Control>(); int others = 0; Control single = line.Count == 1 ? line[0] : null;
+    foreach (Control c in line) {
+      if (c is CheckBox || c is RadioButton) checks.Add(c);
+      else if (c is ComboBox || c is ButtonBase || (c is Panel && !(c is GroupBox))) { if (value == null) value = c; else others++; }
+      else if (c is Label) { if (label == null) label = c; else others++; }
+      else others++;
+    }
+    int padX = R(18), valX = (int)(cardW * 0.385f), valR = cardW - R(14);
+    if (value != null && label != null && label.Left < value.Left && checks.Count == 0 && others == 0) {
+      Row r = new Row(); r.Y = y; r.H = R(38);
+      Cell c = new Cell(); c.Kind = (value is ComboBox) ? K.Field : K.Action; c.Ctl = value; c.Label = label;
+      c.R = new RectangleF(padX, y, valX - padX - R(8), r.H);
+      c.Box = new RectangleF(valX, y + (r.H - R(28)) / 2, valR - valX, R(28));
+      r.Cells.Add(c); s.Rows.Add(r); tracked.Add(value);
+      AddHit(s, value, new RectangleF(R(6), y + 1, cardW - R(12), r.H - 2), c);
+      return y + r.H;
+    }
+    if (single != null && (single is ComboBox || (single is Panel && !(single is GroupBox)))) {
+      Row r = new Row(); r.Y = y; r.H = R(38);
+      Cell c = new Cell(); c.Kind = (single is ComboBox) ? K.Field : K.Action; c.Ctl = single;
+      c.Box = new RectangleF(padX, y + (r.H - R(28)) / 2, valR - padX, R(28)); c.R = c.Box;
+      r.Cells.Add(c); s.Rows.Add(r);
+      AddHit(s, single, new RectangleF(R(6), y + 1, cardW - R(12), r.H - 2), c);
+      return y + r.H;
+    }
+    if (checks.Count > 0 && checks.Count == line.Count) {
+      Row r = new Row(); r.Y = y; r.H = R(32);
+      float inner = cardW - 2 * padX;
+      if (checks.Count == 1) {
+        Control k = checks[0];
+        float tw = inner - R(28);
+        float th = measureG.MeasureString(k.Text, F.Check, (int)Math.Max(10, tw), BbOGfx.Wrap).Height;
+        r.H = Math.Max(R(32), (int)Math.Ceiling(th) + R(10));
+      }
+      foreach (Control k in checks) {
+        Cell c = new Cell(); c.Kind = K.Check; c.Ctl = k; c.Wrap = checks.Count == 1;
+        float fx = (k.Left - 12f) / Math.Max(1f, gw - 24f), fw = k.Width / Math.Max(1f, gw - 24f);
+        float x = padX + Math.Max(0f, Math.Min(0.95f, fx)) * inner;
+        float w = Math.Min(padX + inner - x, Math.Max(R(60), fw * inner));
+        if (checks.Count == 1) w = padX + inner - x;
+        float bx = R(16);
+        c.Box = new RectangleF(x, y + Math.Min(R(8), (r.H - bx) / 2f), bx, bx);
+        c.R = new RectangleF(x, y, w, r.H);
+        r.Cells.Add(c);
+        St sa = Get(k); float want = IsOn(k) ? 1f : 0f;
+        if (!sa.Init) { sa.Init = true; sa.Check = want; sa.CheckT = want; } else if (sa.CheckT != want) { sa.CheckT = want; Kick(); }
+        float tx = measureG.MeasureString(k.Text, F.Check).Width;
+        AddHit(s, k, new RectangleF(x - R(4), y + 1, Math.Min(w, bx + R(10) + tx) + R(8), r.H - 2), c);
+      }
+      s.Rows.Add(r);
+      return y + r.H;
+    }
+    if (single is ButtonBase) {
+      Row r = new Row(); r.Y = y; r.H = R(46);
+      Cell c = new Cell(); c.Kind = K.Button; c.Ctl = single;
+      c.Box = new RectangleF(padX, y + R(7), cardW - 2 * padX, R(32)); c.R = c.Box;
+      r.Cells.Add(c); s.Rows.Add(r);
+      AddHit(s, single, c.Box, c);
+      return y + r.H;
+    }
+    if (single is Label) {
+      Cell c = new Cell(); c.Ctl = single;
+      string t = single.Text;
+      bool hint = hintSet.ContainsKey(single) || single.Width >= gw * 0.5f;
+      if (String.IsNullOrEmpty(t)) return y;
+      Row r = new Row(); r.Y = y;
+      if (hint) {
+        c.Kind = K.Hint;
+        float tw = cardW - 2 * padX;
+        float th = measureG.MeasureString(t, F.Help, (int)tw, BbOGfx.Wrap).Height;
+        r.H = (int)Math.Ceiling(th) + R(8);
+        c.R = new RectangleF(padX, y + R(2), tw, r.H - R(2));
+      } else {
+        c.Kind = K.Text; r.H = R(28);
+        c.R = new RectangleF(padX, y, cardW - 2 * padX, r.H);
+      }
+      r.Cells.Add(c); s.Rows.Add(r);
+      AddHit(s, single, c.R, c);
+      return y + r.H;
+    }
+    if (line.Count > 1) {
+      foreach (Control c in line) { List<Control> one = new List<Control>(); one.Add(c); y = AddLine(s, one, gw, y); }
+    }
+    return y;
+  }
+  int AddFooter(Sec s, Control[] fr, int y) {
+    List<Control> vis = new List<Control>();
+    foreach (Control c in fr) if (c != null && OwnVis(c)) vis.Add(c);
+    if (vis.Count == 0) return y;
+    Row r = new Row(); r.Y = y;
+    if (vis.Count == 1 && vis[0] is PictureBox) {
+      Image img = ((PictureBox)vis[0]).Image; if (img == null) return y;
+      float w = Math.Min((float)cardW, (float)img.Width), h = img.Height * w / Math.Max(1f, (float)img.Width);
+      Cell c = new Cell(); c.Kind = K.Image; c.Ctl = vis[0]; c.R = new RectangleF((cardW - w) / 2f, y + R(4), w, h);
+      r.H = (int)Math.Ceiling(h) + R(8); r.Cells.Add(c);
+      AddHit(s, vis[0], c.R, c);
+    } else if (vis.Count == 1 && vis[0] is ProgressBar) {
+      Cell c = new Cell(); c.Kind = K.Progress; c.Ctl = vis[0]; c.R = new RectangleF(R(4), y + R(4), cardW - R(8), R(4));
+      r.H = R(12); r.Cells.Add(c);
+      AddHit(s, vis[0], c.R, c);
+    } else {
+      int n = vis.Count; float g2 = R(8); float w = (cardW - g2 * (n - 1)) / n;
+      r.H = R(56);
+      for (int i = 0; i < n; i++) {
+        Cell c = new Cell(); c.Kind = K.Button; c.Ctl = vis[i];
+        c.Box = new RectangleF(i * (w + g2), y + R(6), w, R(44)); c.R = c.Box;
+        r.Cells.Add(c);
+        AddHit(s, vis[i], c.Box, c);
+      }
+    }
+    s.Rows.Add(r);
+    return y + r.H;
+  }
+  void Place() {
+    float y = topPad;
+    foreach (Sec s in secs) {
+      s.DispH = headerH + (s.FullH - headerH) * Math.Max(0f, Math.Min(1f, s.P));
+      s.Y = y; y += s.DispH + gap;
+    }
+    if (footer != null) { footer.DispH = footer.FullH; footer.Y = y; y += footer.FullH; }
+    totalH = y + R(10);
+  }
+  double MaxScroll() { return Math.Max(0.0, totalH - Height); }
+  long Signature() {
+    long h = 17;
+    foreach (Control c in tracked) {
+      unchecked {
+        h = h * 31 + (OwnVis(c) ? 1 : 0) + (c.Enabled ? 2 : 0) + c.Top * 5;
+        h = h * 31 + (c.Text == null ? 0 : c.Text.GetHashCode());
+        h = h * 31 + c.ForeColor.ToArgb();
+        ComboBox cb = c as ComboBox; if (cb != null) { h = h * 31 + cb.SelectedIndex; string v = ValueText(cb); h = h * 31 + (v == null ? 0 : v.GetHashCode()); }
+        CheckBox ck = c as CheckBox; if (ck != null) h = h * 31 + (ck.Checked ? 7 : 3);
+        ProgressBar pb = c as ProgressBar; if (pb != null) h = h * 31 + pb.Value;
+      }
+    }
+    return h;
+  }
+  void OnPoll(object s, EventArgs e) {
+    try {
+      if (!Visible || layoutDirty) return;
+      Form f = FindForm(); if (f != null && f.WindowState == FormWindowState.Minimized) return;
+      long n = Signature(); if (n != sig) { sig = n; Dirty(); }
+    } catch { }
+  }
+  // ---------------------------------------------------------------- dibujo de cada apartado (en su mapa de bits)
+  St Get(object k) { St a; if (!st.TryGetValue(k, out a)) { a = new St(); st[k] = a; } return a; }
+  St Peek(object k) { St a; if (k != null && st.TryGetValue(k, out a)) return a; return none; }
+  void MarkDirty(object key) {
+    Hit h; if (key == null || !map.TryGetValue(key, out h)) return;
+    Sec s = h.S;
+    Rectangle r = Rectangle.Inflate(Rectangle.Round(h.R), R(6), R(4));
+    r.Intersect(new Rectangle(0, 0, cardW, s.FullH));
+    if (r.IsEmpty) return;
+    s.Dirty = s.Dirty.IsEmpty ? r : Rectangle.Union(s.Dirty, r);
+    Rectangle v = new Rectangle(cardX + r.X, (int)Math.Floor(s.Y + r.Y - sp.Pos) - 1, r.Width, r.Height + 2);
+    viewDirty = viewDirty.IsEmpty ? v : Rectangle.Union(viewDirty, v);
+  }
+  void RenderSec(Sec s, Rectangle clip) {
+    if (s.Bmp == null) return;
+    if (clip.IsEmpty) clip = new Rectangle(0, 0, s.Bmp.Width, s.Bmp.Height);
+    using (Graphics g = Graphics.FromImage(s.Bmp)) {
+      BbOGfx.Hq(g);
+      g.SetClip(clip);
+      g.CompositingMode = CompositingMode.SourceCopy;
+      using (SolidBrush cl = new SolidBrush(Color.Transparent)) g.FillRectangle(cl, clip);
+      g.CompositingMode = CompositingMode.SourceOver;
+      if (!s.Footer) { DrawCard(g, s); DrawHeader(g, s); }
+      RectangleF cf = clip;
+      foreach (Row r in s.Rows) {
+        if (r.Y > cf.Bottom || r.Y + r.H < cf.Top) continue;
+        foreach (Cell c in r.Cells) DrawCell(g, s, r, c);
+      }
+    }
+  }
+  void DrawCard(Graphics g, Sec s) {
+    float sc = S;
+    RectangleF r = new RectangleF(0.5f, 0.5f, cardW - 1f, s.FullH - 1f);
+    using (GraphicsPath p = BbOGfx.Round(r, 5f * sc)) {
+      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(0, -1, cardW, s.FullH + 2), Color.FromArgb(214, 26, 21, 19), Color.FromArgb(220, 15, 12, 11), 90f)) g.FillPath(b, p);
+      GraphicsState st0 = g.Save();
+      try {
+        g.SetClip(p, CombineMode.Intersect);
+        BbOGfx.Glow(g, new RectangleF(-cardW * 0.25f, -R(70), cardW * 0.95f, R(160)), Color.FromArgb(30, 160, 100, 42));
+      } finally { g.Restore(st0); }
+      using (Pen pen = new Pen(Color.FromArgb(160, 140, 108, 62), 1f)) g.DrawPath(pen, p);
+    }
+    using (GraphicsPath ip = BbOGfx.Round(RectangleF.Inflate(r, -3f * sc, -3f * sc), 3f * sc)) using (Pen pen = new Pen(Color.FromArgb(40, 140, 108, 62), 1f)) g.DrawPath(pen, ip);
+    BbOGfx.Corners(g, r, 4.5f * sc, 9f * sc, sc, Color.FromArgb(200, 176, 140, 82));
+  }
+  void DrawHeader(Graphics g, Sec s) {
+    St a = Peek(s);
+    float hv = a.Hover, fc = a.Focus, sc = S;
+    float cy = R(22);
+    Color tc = BbOGfx.Lerp(Color.FromArgb(214, 184, 128), BbOGfx.Candle, Math.Max(hv, fc));
+    string t = s.Title.ToUpperInvariant();
+    float tx = R(36);
+    float tw = BbOGfx.MeasureTracked(g, t, F.Title, 1.8f * sc);
+    if (hv > 0.01f || fc > 0.01f) BbOGfx.Glow(g, new RectangleF(tx - R(30), cy - R(18), tw + R(60), R(36)), Color.FromArgb((int)(46 * Math.Max(hv, fc)), 210, 130, 56));
+    if (fc > 0.01f) using (SolidBrush b = new SolidBrush(BbOGfx.A(BbOGfx.Crimson, fc))) g.FillRectangle(b, R(6), cy - R(9), 2f * sc, R(18));
+    BbOGfx.Chevron(g, R(20), cy, 4.2f * sc, 90f * Math.Max(0f, Math.Min(1f, s.P)), tc, 1.6f * sc);
+    BbOGfx.DrawTracked(g, t, F.Title, Color.FromArgb(160, 0, 0, 0), tx, cy + 1f * sc, 1.8f * sc);
+    BbOGfx.DrawTracked(g, t, F.Title, tc, tx, cy, 1.8f * sc);
+    float ry = headerH - R(7);
+    BbOGfx.Lozenge(g, R(20), ry + 0.5f, 2.4f * sc, Color.FromArgb(200, 176, 140, 82));
+    BbOGfx.FadeLine(g, R(26), cardW - R(16), ry, 1f, Color.FromArgb(170, 150, 116, 66), 0.12f);
+  }
+  void RowGlow(Graphics g, RectangleF rr, float hv, float fc) {
+    float sc = S;
+    if (hv > 0.01f) {
+      using (GraphicsPath p = BbOGfx.Round(rr, 3f * sc))
+      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(rr.X - 1, rr.Y, rr.Width + 2, rr.Height), Color.FromArgb((int)(34 * hv), 176, 112, 50), Color.FromArgb(0, 176, 112, 50), 0f)) g.FillPath(b, p);
+      using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(150 * hv), 176, 140, 82))) g.FillRectangle(b, rr.X, rr.Y + R(7), 1f * sc, rr.Height - R(14));
+    }
+    if (fc > 0.01f) {
+      using (GraphicsPath p = BbOGfx.Round(rr, 3f * sc))
+      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(rr.X - 1, rr.Y, rr.Width + 2, rr.Height), Color.FromArgb((int)(64 * fc), 122, 15, 18), Color.FromArgb(0, 122, 15, 18), 0f)) g.FillPath(b, p);
+      using (SolidBrush b = new SolidBrush(BbOGfx.A(BbOGfx.Crimson, fc))) g.FillRectangle(b, rr.X, rr.Y + R(5), 2f * sc, rr.Height - R(10));
+    }
+  }
+  void DrawCell(Graphics g, Sec s, Row r, Cell c) {
+    float sc = S;
+    St a = Peek(c.Ctl);
+    float hv = a.Hover, pr = a.Press, fc = a.Focus, op = a.Open;
+    bool en = c.Ctl.Enabled;
+    if (!en) { hv = 0f; pr = 0f; }
+    RectangleF rr = new RectangleF(R(6), r.Y + 1, cardW - R(12), r.H - 2);
+    switch (c.Kind) {
+      case K.Field:
+      case K.Action: {
+        RowGlow(g, rr, hv, fc);
+        if (c.Label != null) BbOGfx.Text(g, c.Label.Text, F.Label, en ? BbOGfx.Lerp(BbOGfx.Bone, BbOGfx.Candle, hv * 0.55f) : BbOGfx.Off, c.R, BbOGfx.Line);
+        RectangleF b = c.Box;
+        if (c.Kind == K.Action) {
+          BbOGfx.Metal(g, b, sc, hv, pr, en, false);
+          float icx = b.X + R(16), icy = b.Y + b.Height / 2f;
+          Color ic = en ? BbOGfx.Lerp(BbOGfx.Gold, BbOGfx.Candle, hv) : BbOGfx.Off;
+          using (Pen p = new Pen(ic, 1.4f * sc)) g.DrawEllipse(p, icx - R(6), icy - R(6), R(12), R(12));
+          using (SolidBrush br = new SolidBrush(ic)) g.FillEllipse(br, icx - R(2.5f), icy - R(2.5f), R(5), R(5));
+          string at = c.Ctl.Text; if (String.IsNullOrEmpty(at)) at = c.Label != null ? c.Label.Text : "";
+          BbOGfx.Text(g, at, F.Value, en ? BbOGfx.Lerp(Color.FromArgb(226, 200, 140), BbOGfx.Candle, hv) : BbOGfx.Off, new RectangleF(b.X + R(30), b.Y, b.Width - R(40), b.Height), BbOGfx.Line);
+          break;
+        }
+        ComboBox cb = (ComboBox)c.Ctl;
+        if (pr > 0f) b = RectangleF.Inflate(b, -0.6f * pr * sc, -0.6f * pr * sc);
+        using (GraphicsPath p = BbOGfx.Round(b, 3f * sc)) {
+          using (LinearGradientBrush lb = new LinearGradientBrush(new RectangleF(b.X, b.Y - 1, b.Width, b.Height + 2), Color.FromArgb(en ? 240 : 150, 36, 29, 25), Color.FromArgb(en ? 240 : 150, 20, 16, 14), 90f)) g.FillPath(lb, p);
+          GraphicsState st0 = g.Save();
+          try {
+            g.SetClip(p, CombineMode.Intersect);
+            float gl = Math.Max(hv, op);
+            if (gl > 0.01f) using (LinearGradientBrush lb = new LinearGradientBrush(new RectangleF(b.X - 1, b.Y, b.Width * 0.7f + 2, b.Height), Color.FromArgb((int)(48 * gl), 200, 124, 52), Color.FromArgb(0, 200, 124, 52), 0f)) g.FillRectangle(lb, b.X, b.Y, b.Width * 0.7f, b.Height);
+            using (SolidBrush hl = new SolidBrush(Color.FromArgb(en ? 18 : 8, 255, 230, 180))) g.FillRectangle(hl, b.X + R(3), b.Y + 1f, b.Width - R(6), 1f);
+            float acc = Math.Max(op, fc);
+            if (acc > 0.01f) using (SolidBrush ab = new SolidBrush(BbOGfx.A(BbOGfx.Crimson, acc))) g.FillRectangle(ab, b.X, b.Y, 2f * sc, b.Height);
+          } finally { g.Restore(st0); }
+          Color bc = en ? BbOGfx.Lerp(Color.FromArgb(200, 110, 86, 56), Color.FromArgb(255, 206, 168, 100), hv) : Color.FromArgb(110, 80, 66, 50);
+          if (op > 0.01f) bc = BbOGfx.Lerp(bc, Color.FromArgb(255, 186, 52, 48), op * 0.8f);
+          using (Pen pen = new Pen(bc, 1f)) g.DrawPath(pen, p);
+        }
+        float sepX = b.Right - R(26);
+        using (SolidBrush sb = new SolidBrush(Color.FromArgb(en ? 70 : 30, 140, 108, 62))) g.FillRectangle(sb, (float)Math.Round(sepX), b.Y + R(6), 1f, b.Height - R(12));
+        Color cc = en ? BbOGfx.Lerp(BbOGfx.Gold, BbOGfx.Candle, Math.Max(hv, op)) : BbOGfx.Off;
+        BbOGfx.Chevron(g, b.Right - R(13), b.Y + b.Height / 2f, 3.6f * sc, 90f + 180f * op, cc, 1.5f * sc);
+        string v = ValueText(cb);
+        Color vc = en ? (brandSet.ContainsKey(cb) ? Brand(v) : BbOGfx.Ink) : BbOGfx.Off;
+        if (en && hv > 0f) vc = BbOGfx.Lerp(vc, Color.White, hv * 0.15f);
+        BbOGfx.Text(g, v, F.Value, vc, new RectangleF(b.X + R(11), b.Y, sepX - b.X - R(14), b.Height), BbOGfx.Line);
+        break;
+      }
+      case K.Check: {
+        float cv = a.Init ? a.Check : (IsOn(c.Ctl) ? 1f : 0f);
+        if (fc > 0.01f) RowGlow(g, new RectangleF(c.R.X - R(10), c.R.Y + 1, c.R.Width + R(12), c.R.Height - 2), 0f, fc);
+        RectangleF b = c.Box;
+        if (hv > 0.01f) using (GraphicsPath gp = BbOGfx.Round(RectangleF.Inflate(b, 2.5f * sc, 2.5f * sc), 4.5f * sc)) using (Pen pen = new Pen(Color.FromArgb((int)(70 * hv), 214, 178, 112), 1f)) g.DrawPath(pen, gp);
+        using (GraphicsPath p = BbOGfx.Round(b, 2.5f * sc)) {
+          using (SolidBrush fb = new SolidBrush(Color.FromArgb(en ? 235 : 140, 16, 13, 12))) g.FillPath(fb, p);
+          if (cv > 0.01f) {
+            float k2 = 0.55f + 0.45f * cv;
+            RectangleF inn = RectangleF.Inflate(b, -2.5f * sc, -2.5f * sc);
+            inn = new RectangleF(inn.X + inn.Width * (1 - k2) / 2f, inn.Y + inn.Height * (1 - k2) / 2f, inn.Width * k2, inn.Height * k2);
+            using (GraphicsPath ip = BbOGfx.Round(inn, 1.5f * sc))
+            using (LinearGradientBrush lb = new LinearGradientBrush(new RectangleF(inn.X, inn.Y - 1, inn.Width, inn.Height + 2), Color.FromArgb((int)(255 * cv), en ? 176 : 90, en ? 30 : 40, en ? 34 : 40), Color.FromArgb((int)(255 * cv), en ? 104 : 60, en ? 12 : 30, en ? 16 : 30), 90f)) g.FillPath(lb, ip);
+          }
+          Color bc = en ? BbOGfx.Lerp(Color.FromArgb(220, 122, 96, 60), Color.FromArgb(255, 214, 178, 112), Math.Max(hv, cv * 0.6f)) : Color.FromArgb(110, 80, 66, 50);
+          using (Pen pen = new Pen(bc, 1f)) g.DrawPath(pen, p);
+        }
+        if (cv > 0.01f) {
+          PointF p0 = new PointF(b.X + b.Width * 0.24f, b.Y + b.Height * 0.53f), p1 = new PointF(b.X + b.Width * 0.43f, b.Y + b.Height * 0.71f), p2 = new PointF(b.X + b.Width * 0.78f, b.Y + b.Height * 0.31f);
+          float l1 = 0.4f, t = Math.Min(1f, cv);
+          List<PointF> pts = new List<PointF>(); pts.Add(p0);
+          if (t <= l1) { float u = t / l1; pts.Add(new PointF(p0.X + (p1.X - p0.X) * u, p0.Y + (p1.Y - p0.Y) * u)); }
+          else { float u = (t - l1) / (1 - l1); pts.Add(p1); pts.Add(new PointF(p1.X + (p2.X - p1.X) * u, p1.Y + (p2.Y - p1.Y) * u)); }
+          using (Pen pen = new Pen(en ? Color.FromArgb(244, 226, 180) : BbOGfx.Off, 1.7f * sc)) { pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round; pen.LineJoin = LineJoin.Round; g.DrawLines(pen, pts.ToArray()); }
+        }
+        Color fcol = c.Ctl.ForeColor;
+        Color tc = (fcol.R > 228 && fcol.G > 222 && fcol.B > 210) ? BbOGfx.Bone : fcol;
+        tc = en ? BbOGfx.Lerp(tc, BbOGfx.Candle, hv * 0.55f) : BbOGfx.Off;
+        RectangleF tr = new RectangleF(b.Right + R(10), c.R.Y, c.R.Right - b.Right - R(10), c.R.Height);
+        if (c.Wrap) { tr = new RectangleF(tr.X, c.R.Y + R(5), tr.Width, c.R.Height - R(5)); BbOGfx.Text(g, c.Ctl.Text, F.Check, tc, tr, BbOGfx.Wrap); }
+        else BbOGfx.Text(g, c.Ctl.Text, F.Check, tc, new RectangleF(tr.X, b.Y + b.Height / 2f - R(14), tr.Width, R(28)), BbOGfx.Line);
+        break;
+      }
+      case K.Button: {
+        if (fc > 0.01f) RowGlow(g, new RectangleF(c.Box.X - R(10), c.Box.Y - R(3), c.Box.Width + R(14), c.Box.Height + R(6)), 0f, fc);
+        RectangleF b = c.Box;
+        BbOGfx.Metal(g, b, sc, hv, pr, en, false);
+        string t = (c.Ctl.Text ?? "").Replace("\r", "").Replace("\n", " ");
+        Color tc = en ? BbOGfx.Lerp(Color.FromArgb(224, 204, 160), BbOGfx.Candle, hv) : BbOGfx.Off;
+        float tw = BbOGfx.MeasureTracked(g, t.ToUpperInvariant(), F.Button, 1.1f * sc);
+        if (tw <= b.Width - R(24)) {
+          float x0 = b.X + (b.Width - tw) / 2f, cy = b.Y + b.Height / 2f + pr * sc;
+          BbOGfx.DrawTracked(g, t.ToUpperInvariant(), F.Button, Color.FromArgb(150, 0, 0, 0), x0, cy + 1f * sc, 1.1f * sc);
+          BbOGfx.DrawTracked(g, t.ToUpperInvariant(), F.Button, tc, x0, cy, 1.1f * sc);
+        } else BbOGfx.Text(g, t, F.Value, tc, new RectangleF(b.X + R(10), b.Y + pr * sc, b.Width - R(20), b.Height), BbOGfx.LineCenter);
+        break;
+      }
+      case K.Hint: {
+        Color fcol = c.Ctl.ForeColor;
+        Color tc = (Math.Abs(fcol.R - fcol.G) < 12 && Math.Abs(fcol.G - fcol.B) < 18) ? BbOGfx.Dim : BbOGfx.Lerp(fcol, Color.FromArgb(200, 170, 120), 0.25f);
+        BbOGfx.Text(g, c.Ctl.Text, F.Help, tc, new RectangleF(c.R.X, c.R.Y, c.R.Width + 1, c.R.Height + R(4)), BbOGfx.Wrap);
+        break;
+      }
+      case K.Text:
+        BbOGfx.Text(g, c.Ctl.Text, F.Label, BbOGfx.Bone, c.R, BbOGfx.Line);
+        break;
+      case K.Image: {
+        Image img = ((PictureBox)c.Ctl).Image;
+        if (img != null) g.DrawImage(img, c.R, new RectangleF(0, 0, img.Width, img.Height), GraphicsUnit.Pixel);
+        break;
+      }
+      case K.Progress: {
+        ProgressBar pb = (ProgressBar)c.Ctl;
+        float f = pb.Maximum > pb.Minimum ? (pb.Value - pb.Minimum) / (float)(pb.Maximum - pb.Minimum) : 0f;
+        using (SolidBrush b = new SolidBrush(Color.FromArgb(70, 140, 108, 62))) g.FillRectangle(b, c.R);
+        if (f > 0.001f) {
+          RectangleF fr = new RectangleF(c.R.X, c.R.Y, c.R.Width * Math.Min(1f, f), c.R.Height);
+          using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(fr.X - 1, fr.Y, fr.Width + 2, fr.Height), BbOGfx.CrimsonDeep, BbOGfx.Gold, 0f)) g.FillRectangle(b, fr);
+        }
+        break;
+      }
+    }
+  }
+  // ---------------------------------------------------------------- composicion por fotograma
+  protected override void OnPaintBackground(PaintEventArgs e) { }
+  protected override void OnPaint(PaintEventArgs e) {
+    long t0 = Stopwatch.GetTimestamp();
+    try {
+      PaintAll(e.Graphics, e.ClipRectangle);
+      failures = 0;
+    } catch (Exception ex) {
+      failures++;
+      BbOLog.Write("dibujo: " + ex.GetType().Name + ": " + ex.Message);
+      try { e.Graphics.Clear(Color.FromArgb(14, 12, 12)); } catch { }
+      if (failures >= 3 && !failedRaised) { failedRaised = true; try { BeginInvoke(new MethodInvoker(RaiseFailed)); } catch { } }
+    }
+    double ms = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
+    paintEma = paintEma * 0.85 + ms * 0.15;
+    subPixel = paintEma < 5.0;
+  }
+  void RaiseFailed() {
+    try { if (popup != null) popup.Close2(); HideTip(); } catch { }
+    if (Failed != null) { try { Failed(this, EventArgs.Empty); } catch { } }
+  }
+  void PaintAll(Graphics g, Rectangle clip) {
+    EnsureScale();
+    if (layoutDirty) Relayout();
+    EnsureBg();
+    if (bg == null) return;
+    g.SetClip(clip, CombineMode.Intersect);
+    g.CompositingMode = CompositingMode.SourceCopy;
+    g.DrawImage(bg, clip, clip, GraphicsUnit.Pixel);
+    g.CompositingMode = CompositingMode.SourceOver;
+    if (cardW < 120) return;
+    foreach (Sec s in secs) if (!s.Dirty.IsEmpty) { RenderSec(s, s.Dirty); s.Dirty = Rectangle.Empty; }
+    if (footer != null && !footer.Dirty.IsEmpty) { RenderSec(footer, footer.Dirty); footer.Dirty = Rectangle.Empty; }
+    Place();
+    bool frac = sp.Active && subPixel && !BbOPump.ReduceMotion;
+    double pos = frac ? sp.Pos : Math.Round(sp.Pos);
+    g.InterpolationMode = frac ? InterpolationMode.Bilinear : InterpolationMode.NearestNeighbor;
+    g.PixelOffsetMode = PixelOffsetMode.Half;
+    foreach (Sec s in secs) DrawSec(g, s, s.Y - pos, frac, clip);
+    if (footer != null) DrawSec(g, footer, footer.Y - pos, frac, clip);
+    if (fadeTop != null) g.DrawImage(fadeTop, new Rectangle(0, 0, fadeTop.Width, fadeTop.Height), 0, 0, fadeTop.Width, fadeTop.Height, GraphicsUnit.Pixel);
+    if (fadeBot != null) g.DrawImage(fadeBot, new Rectangle(0, Height - fadeBot.Height, fadeBot.Width, fadeBot.Height), 0, 0, fadeBot.Width, fadeBot.Height, GraphicsUnit.Pixel);
+    DrawBar(g);
+  }
+  void DrawSec(Graphics g, Sec s, double y, bool frac, Rectangle clip) {
+    if (s.Bmp == null) return;
+    int H = s.Bmp.Height;
+    float h = s.Footer ? H : Math.Min(H, s.DispH);
+    if (y + h < clip.Top || y > clip.Bottom) return;
+    if (h >= H - 0.5f) Part(g, s.Bmp, 0, H, y, frac);
+    else {
+      int top = (int)Math.Max(0, Math.Round(h) - bStrip);
+      Part(g, s.Bmp, 0, top, y, frac);
+      Part(g, s.Bmp, H - bStrip, H, y + top, frac);
+    }
+  }
+  void Part(Graphics g, Bitmap b, int sy0, int sy1, double y, bool frac) {
+    double d0 = y, d1 = y + (sy1 - sy0);
+    double v0 = Math.Max(d0, -2), v1 = Math.Min(d1, Height + 2);
+    if (v1 <= v0) return;
+    int a = sy0 + (int)Math.Floor(v0 - d0), z = sy0 + (int)Math.Ceiling(v1 - d0);
+    if (a < sy0) a = sy0; if (z > sy1) z = sy1; if (z <= a) return;
+    if (frac) {
+      float dy = (float)(y + (a - sy0));
+      PointF[] pts = new PointF[] { new PointF(cardX, dy), new PointF(cardX + b.Width, dy), new PointF(cardX, dy + (z - a)) };
+      g.DrawImage(b, pts, new RectangleF(0, a, b.Width, z - a), GraphicsUnit.Pixel, wrapIa);
+    } else {
+      int dy = (int)Math.Round(y) + (a - sy0);
+      g.DrawImage(b, new Rectangle(cardX, dy, b.Width, z - a), 0, a, b.Width, z - a, GraphicsUnit.Pixel);
+    }
+  }
+  void BarGeom(out float trackX, out float trackT, out float trackH, out float th, out float ty) {
+    double max = MaxScroll();
+    trackX = Width - 8f; trackT = R(8); trackH = Math.Max(10f, Height - 2 * R(8));
+    th = (float)Math.Max(R(36), trackH * Height / Math.Max(1.0, max + Height)); if (th > trackH) th = trackH;
+    double p = barDrag ? (sp.Active ? sp.Target : sp.Pos) : sp.Pos;
+    ty = trackT + (float)((trackH - th) * (max > 0 ? Math.Max(0, Math.Min(1, p / max)) : 0));
+  }
+  void DrawBar(Graphics g) {
+    if (MaxScroll() <= 0.5) return;
+    float trackX, trackT, trackH, th, ty; BarGeom(out trackX, out trackT, out trackH, out th, out ty);
+    float hv = barDrag ? 1f : barHover;
+    g.SmoothingMode = SmoothingMode.AntiAlias;
+    using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(40 + 30 * hv), 140, 108, 62))) g.FillRectangle(b, trackX - 0.5f, trackT, 1f, trackH);
+    float w = (3f + 3f * hv) * S;
+    RectangleF tr = new RectangleF(trackX - w / 2f, ty, w, th);
+    using (GraphicsPath p = BbOGfx.Round(tr, w / 2f))
+    using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(tr.X - 1, tr.Y, tr.Width + 2, tr.Height), BbOGfx.Lerp(Color.FromArgb(190, 150, 118, 70), Color.FromArgb(240, 220, 184, 118), hv), BbOGfx.Lerp(Color.FromArgb(190, 110, 84, 50), Color.FromArgb(240, 176, 140, 82), hv), 90f)) g.FillPath(b, p);
+    Color lc = Color.FromArgb((int)(150 + 90 * hv), 214, 178, 112);
+    BbOGfx.Lozenge(g, trackX, ty - 3f * S, 2f * S, lc);
+    BbOGfx.Lozenge(g, trackX, ty + th + 3f * S, 2f * S, lc);
+  }
+  // ---------------------------------------------------------------- animacion
+  void Kick() { kicked = true; if (BbOPump.Add(this)) lastT = BbOPump.Now - 0.016; }
+  static bool Approach(ref float v, float t, float k) {
+    if (Math.Abs(t - v) < 0.003f) { if (v != t) { v = t; return true; } return false; }
+    v += (t - v) * k; return true;
+  }
+  public bool Tick(double now) {
+    kicked = false;
+    if (IsDisposed || !IsHandleCreated) { inPump = false; return false; }
+    double dt = now - lastT; if (dt < 0.0005) dt = 0.0005; if (dt > 0.05) dt = 0.05; lastT = now;
+    if (BbOPump.ReduceMotion) dt = 10;
+    bool more = false;
+    if (sp.Active) { sp.Step(dt, MaxScroll()); fullDirty = true; if (sp.Active) more = true; }
+    foreach (Sec s in secs) {
+      if (s.T0 < 0) continue;
+      double t = BbOPump.ReduceMotion ? 1 : (now - s.T0) / 0.26; if (t > 1) t = 1;
+      float e = 1f - (float)Math.Pow(1 - t, 4);
+      s.P = s.P0 + (s.P1 - s.P0) * e; MarkDirty(s); fullDirty = true;
+      if (t >= 1) s.T0 = -1; else more = true;
+    }
+    float kin = (float)(1 - Math.Exp(-dt / 0.07)), kout = (float)(1 - Math.Exp(-dt / 0.13)), kp = (float)(1 - Math.Exp(-dt / 0.035)), kc = (float)(1 - Math.Exp(-dt / 0.08));
+    foreach (KeyValuePair<object, St> kv in st) {
+      St a = kv.Value; bool ch = false;
+      if (Approach(ref a.Hover, a.HoverT, a.HoverT > a.Hover ? kin : kout)) ch = true;
+      if (Approach(ref a.Press, a.PressT, kp)) ch = true;
+      if (Approach(ref a.Check, a.CheckT, kc)) ch = true;
+      if (Approach(ref a.Open, a.OpenT, kin)) ch = true;
+      if (Approach(ref a.Focus, a.FocusT, kin)) ch = true;
+      if (ch) { more = true; MarkDirty(kv.Key); }
+    }
+    if (Approach(ref barHover, barHoverT, barHoverT > barHover ? kin : kout)) { more = true; fullDirty = true; }
+    if (fullDirty) { fullDirty = false; viewDirty = Rectangle.Empty; Invalidate(); }
+    else if (!viewDirty.IsEmpty) { Invalidate(viewDirty); viewDirty = Rectangle.Empty; }
+    try { Update(); } catch { }
+    bool r = more || kicked; if (!r) inPump = false; return r;
+  }
+  void Toggle(Sec s) {
+    s.Open = !s.Open; s.P0 = s.P; s.P1 = s.Open ? 1f : 0f; s.T0 = BbOPump.Now;
+    if (s.Open) {
+      Place();
+      double want = s.Y + s.FullH - Height + R(16);
+      double cur = sp.Active ? sp.Target : sp.Pos;
+      if (want > cur) sp.To(Math.Min(want, s.Y - topPad), 15);
+    }
+    MarkDirty(s); fullDirty = true; Kick();
+  }
+  // ---------------------------------------------------------------- raton
+  object KeyAt(Point p) {
+    if (p.X < cardX || p.X >= cardX + cardW || OnBar(p)) return null;
+    double cy = p.Y + sp.Pos; float lx = p.X - cardX;
+    List<Sec> all = new List<Sec>(secs); if (footer != null) all.Add(footer);
+    foreach (Sec s in all) {
+      if (cy < s.Y || cy >= s.Y + s.DispH) continue;
+      float ly = (float)(cy - s.Y);
+      if (!s.Footer && s.DispH < s.FullH - 0.5f && ly > s.DispH - bStrip) return null;
+      foreach (Hit h in s.Hits) {
+        if (!h.R.Contains(lx, ly)) continue;
+        if (h.C != null && (h.C.Kind == K.Hint || h.C.Kind == K.Text || h.C.Kind == K.Image || h.C.Kind == K.Progress)) continue;
+        return h.Key;
+      }
+      return null;
+    }
+    return null;
+  }
+  public object KeyAtScreen(Point screen) { return KeyAt(PointToClient(screen)); }
+  bool OnBar(Point p) { return MaxScroll() > 0.5 && p.X >= Width - R(16); }
+  void SetHover(object k) {
+    if (ReferenceEquals(hoverKey, k)) return;
+    if (hoverKey != null) Get(hoverKey).HoverT = 0f;
+    hoverKey = k;
+    if (k != null) Get(k).HoverT = 1f;
+    HideTip(); tipTimer.Stop(); tipKey = null;
+    if (k != null && !(k is Sec)) tipTimer.Start();
+    Kick();
+  }
+  protected override void OnMouseMove(MouseEventArgs e) {
+    base.OnMouseMove(e);
+    try {
+      if (barDrag) {
+        float trackX, trackT, trackH, th, ty; BarGeom(out trackX, out trackT, out trackH, out th, out ty);
+        double max = MaxScroll(); double room = Math.Max(1.0, trackH - th);
+        double y = Math.Max(0.0, Math.Min(max, barDragPos0 + (e.Y - barDragY0) * max / room));
+        sp.To(y, 44); Kick(); return;
+      }
+      bool ob = OnBar(e.Location);
+      float bt = ob ? 1f : 0f; if (bt != barHoverT) { barHoverT = bt; Kick(); }
+      object k = ob ? null : KeyAt(e.Location);
+      if (!ReferenceEquals(k, hoverKey)) SetHover(k);
+      Cursor want = (k != null || ob) ? Cursors.Hand : Cursors.Default;
+      if (Cursor != want) Cursor = want;
+    } catch (Exception ex) { BbOLog.Write("raton: " + ex.Message); }
+  }
+  protected override void OnMouseLeave(EventArgs e) {
+    base.OnMouseLeave(e);
+    if (!barDrag) { barHoverT = 0f; }
+    SetHover(null); tipTimer.Stop(); HideTip(); Kick();
+  }
+  protected override void OnMouseDown(MouseEventArgs e) {
+    base.OnMouseDown(e);
+    try {
+      if (e.Button != MouseButtons.Left) return;
+      if (!Focused) Focus();
+      if (kbFocus) { kbFocus = false; if (focusKey != null) { Get(focusKey).FocusT = 0f; Kick(); } }
+      tipTimer.Stop(); HideTip();
+      if (OnBar(e.Location)) {
+        float trackX, trackT, trackH, th, ty; BarGeom(out trackX, out trackT, out trackH, out th, out ty);
+        if (e.Y >= ty && e.Y <= ty + th) { barDrag = true; barDragY0 = e.Y; barDragPos0 = sp.Active ? sp.Target : sp.Pos; Kick(); }
+        else Wheel((e.Y < ty ? -1 : 1) * Height * 0.9);
+        return;
+      }
+      object k = KeyAt(e.Location);
+      pressKey = k;
+      if (k != null) { Get(k).PressT = 1f; Kick(); }
+    } catch (Exception ex) { BbOLog.Write("raton: " + ex.Message); }
+  }
+  protected override void OnMouseUp(MouseEventArgs e) {
+    base.OnMouseUp(e);
+    try {
+      if (barDrag) { barDrag = false; if (!OnBar(e.Location)) barHoverT = 0f; Kick(); return; }
+      object k = pressKey; pressKey = null;
+      if (k != null) { Get(k).PressT = 0f; Kick(); }
+      if (k != null && e.Button == MouseButtons.Left && ReferenceEquals(KeyAt(e.Location), k)) { SetFocusKey(k, false); Activate(k); }
+    } catch (Exception ex) { BbOLog.Write("raton: " + ex.Message); }
+  }
+  protected override void OnMouseCaptureChanged(EventArgs e) { if (barDrag && !Capture) { barDrag = false; barHoverT = 0f; Kick(); } base.OnMouseCaptureChanged(e); }
+  protected override void OnMouseWheel(MouseEventArgs e) {
+    HandledMouseEventArgs he = e as HandledMouseEventArgs; if (he != null) he.Handled = true;
+    Wheel(-e.Delta * 0.6);
+  }
+  protected override void OnSizeChanged(EventArgs e) {
+    base.OnSizeChanged(e);
+    if (popup != null) popup.Close2();
+    HideTip(); bgDirty = true; layoutDirty = true; Invalidate();
+  }
+  protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); scaleDirty = true; poll.Start(); }
+  protected override void WndProc(ref Message m) {
+    if (m.Msg == 0x02E3) { scaleDirty = true; bgDirty = true; layoutDirty = true; Invalidate(); }
+    base.WndProc(ref m);
+  }
+  // ---------------------------------------------------------------- acciones (las mismas que un clic en el control de siempre)
+  void Activate(object k) {
+    Sec s = k as Sec; if (s != null) { Toggle(s); return; }
+    Control c = k as Control; if (c == null || !c.Enabled) return;
+    HideTip();
+    ComboBox cb = c as ComboBox; if (cb != null) { OpenPopup(cb); return; }
+    try { if (miClick != null) miClick.Invoke(c, new object[] { EventArgs.Empty }); }
+    catch (TargetInvocationException ex) { BbOLog.Write("clic: " + (ex.InnerException != null ? ex.InnerException.Message : ex.Message)); }
+    catch (Exception ex) { BbOLog.Write("clic: " + ex.Message); }
+    Dirty(); Kick();
+  }
+  void Commit(ComboBox cb, int idx) {
+    if (idx < 0 || idx >= cb.Items.Count) return;
+    try { if (cb.SelectedIndex != idx) cb.SelectedIndex = idx; }
+    catch (Exception ex) { BbOLog.Write("valor: " + (ex.InnerException != null ? ex.InnerException.Message : ex.Message)); Dirty(); return; }
+    try { if (miCommitted != null) miCommitted.Invoke(cb, new object[] { EventArgs.Empty }); }
+    catch (TargetInvocationException ex) { BbOLog.Write("valor: " + (ex.InnerException != null ? ex.InnerException.Message : ex.Message)); }
+    catch (Exception ex) { BbOLog.Write("valor: " + ex.Message); }
+    Dirty();
+  }
+  static bool IsHeadItem(ComboBox cb, int i) { string t = cb.GetItemText(cb.Items[i]); return t != null && t.StartsWith("----"); }
+  void StepValue(ComboBox cb, int dir) {
+    if (!cb.Enabled) return;
+    for (int k = cb.SelectedIndex + dir; k >= 0 && k < cb.Items.Count; k += dir) { if (!IsHeadItem(cb, k)) { Commit(cb, k); return; } }
+  }
+  void OpenPopup(ComboBox cb) {
+    if (popup != null) { popup.Close2(); popup = null; }
+    if (BbOPump.Now - popupClosedT < 0.3 && ReferenceEquals(popupClosedKey, cb)) return;
+    Hit h; if (!map.TryGetValue(cb, out h) || h.C == null) return;
+    Place();
+    RectangleF b = h.C.Box;
+    double vy = h.S.Y + b.Y - sp.Pos;
+    if (vy < R(4) || vy + b.Height > Height - R(4)) {
+      double want = vy < R(4) ? h.S.Y + b.Y - R(40) : h.S.Y + b.Bottom - Height + R(40);
+      sp.Jump(Math.Max(0.0, Math.Min(MaxScroll(), want))); fullDirty = true;
+      vy = h.S.Y + b.Y - sp.Pos;
+    }
+    Rectangle scr = RectangleToScreen(Rectangle.Round(new RectangleF(cardX + b.X, (float)vy, b.Width, b.Height)));
+    BbOPopup p = new BbOPopup(this, cb, scr, F, S, brandSet.ContainsKey(cb));
+    p.Committed += OnPopupCommit; p.Dismissed += OnPopupClosing;
+    popup = p; openKey = cb; Get(cb).OpenT = 1f; Kick();
+    try { p.Open(FindForm()); } catch (Exception ex) { BbOLog.Write("lista: " + ex.Message); popup = null; openKey = null; Get(cb).OpenT = 0f; try { p.Dispose(); } catch { } }
+  }
+  void OnPopupCommit(object s, EventArgs e) { BbOPopup p = (BbOPopup)s; Commit(p.Combo, p.Result); }
+  void OnPopupClosing(object s, EventArgs e) {
+    BbOPopup p = (BbOPopup)s;
+    popupClosedT = BbOPump.Now; popupClosedKey = p.Combo;
+    if (ReferenceEquals(popup, p)) popup = null;
+    if (p.Combo != null) Get(p.Combo).OpenT = 0f;
+    if (ReferenceEquals(openKey, p.Combo)) openKey = null;
+    Kick();
+  }
+  // ---------------------------------------------------------------- ayuda (globo)
+  void OnTipTimer(object s, EventArgs e) {
+    tipTimer.Stop();
+    try {
+      object k = hoverKey; if (k == null || popup != null || barDrag || pressKey != null) return;
+      Control c = k as Control; if (c == null) return;
+      Hit h; if (!map.TryGetValue(k, out h)) return;
+      string body = Tips != null ? Tips.GetToolTip(c) : "";
+      string title = "";
+      if (h.C != null && h.C.Label != null) { title = h.C.Label.Text; if (String.IsNullOrEmpty(body) && Tips != null) body = Tips.GetToolTip(h.C.Label); }
+      else if (c is ButtonBase) title = (c.Text ?? "").Replace("\n", " ");
+      if (String.IsNullOrEmpty(body)) return;
+      if (title.Length > 48) title = "";
+      Place();
+      RectangleF rr = h.R; double vy = h.S.Y + rr.Y - sp.Pos;
+      Rectangle row = RectangleToScreen(new Rectangle(cardX + (int)rr.X, (int)vy, (int)rr.Width, (int)rr.Height));
+      Rectangle pan = RectangleToScreen(ClientRectangle);
+      Control top = Parent != null ? Parent : this; pan = top.RectangleToScreen(top.ClientRectangle);
+      if (tip == null || tip.IsDisposed) tip = new BbOTip();
+      tipKey = k;
+      tip.ShowTip(FindForm(), title, body, row, pan, F, S);
+    } catch (Exception ex) { BbOLog.Write("ayuda: " + ex.Message); }
+  }
+  void HideTip() { if (tip != null && !tip.IsDisposed) tip.HideTip(); tipKey = null; }
+  // ---------------------------------------------------------------- teclado
+  protected override bool IsInputKey(Keys k) {
+    Keys code = k & Keys.KeyCode;
+    if (code == Keys.Up || code == Keys.Down || code == Keys.Left || code == Keys.Right || code == Keys.PageUp || code == Keys.PageDown || code == Keys.Home || code == Keys.End || code == Keys.Enter || code == Keys.Space) return true;
+    if (code == Keys.Tab && (k & (Keys.Control | Keys.Alt)) == Keys.None) return true;
+    return base.IsInputKey(k);
+  }
+  protected override bool ProcessCmdKey(ref Message msg, Keys k) {
+    try { if (popup != null && !popup.IsClosing && popup.HandleKey(k)) return true; } catch (Exception ex) { BbOLog.Write("teclado: " + ex.Message); }
+    return base.ProcessCmdKey(ref msg, k);
+  }
+  List<object> FocusList() {
+    List<object> l = new List<object>();
+    foreach (Sec s in secs) {
+      l.Add(s);
+      if (!s.Open) continue;
+      foreach (Row r in s.Rows) foreach (Cell c in r.Cells) if (c.Kind == K.Field || c.Kind == K.Action || c.Kind == K.Check || c.Kind == K.Button) l.Add(c.Ctl);
+    }
+    if (footer != null) foreach (Row r in footer.Rows) foreach (Cell c in r.Cells) if (c.Kind == K.Button) l.Add(c.Ctl);
+    return l;
+  }
+  void SetFocusKey(object k, bool keyboard) {
+    if (focusKey != null && !ReferenceEquals(focusKey, k)) Get(focusKey).FocusT = 0f;
+    focusKey = k;
+    if (k != null) { Get(k).FocusT = (keyboard && kbFocus) ? 1f : 0f; if (keyboard) EnsureVisible(k); }
+    Kick();
+  }
+  void EnsureVisible(object k) {
+    Hit h; if (!map.TryGetValue(k, out h)) return;
+    Place();
+    double top = h.S.Y + h.R.Y - R(14), bot = h.S.Y + h.R.Bottom + R(14);
+    if (k is Sec) { Sec s = (Sec)k; bot = Math.Max(bot, s.Y + Math.Min(s.DispH, R(160))); }
+    double cur = sp.Active ? sp.Target : sp.Pos;
+    if (top < cur) sp.To(Math.Max(0, top), 24);
+    else if (bot > cur + Height) sp.To(Math.Min(MaxScroll(), bot - Height), 24);
+  }
+  protected override void OnGotFocus(EventArgs e) {
+    base.OnGotFocus(e);
+    if (Control.MouseButtons == MouseButtons.None) {
+      kbFocus = true;
+      List<object> fl = FocusList();
+      if (focusKey == null || !fl.Contains(focusKey)) focusKey = fl.Count > 0 ? fl[0] : null;
+      if (focusKey != null) SetFocusKey(focusKey, true);
+    }
+  }
+  protected override void OnLostFocus(EventArgs e) {
+    base.OnLostFocus(e);
+    if (focusKey != null) { Get(focusKey).FocusT = 0f; Kick(); }
+  }
+  protected override void OnKeyDown(KeyEventArgs e) {
+    base.OnKeyDown(e);
+    try {
+      Keys code = e.KeyCode;
+      kbFocus = true; HideTip();
+      List<object> fl = FocusList();
+      int i = focusKey != null ? fl.IndexOf(focusKey) : -1;
+      bool shift = e.Shift;
+      if (code == Keys.Tab || code == Keys.Down || code == Keys.Up) {
+        int dir = (code == Keys.Up || (code == Keys.Tab && shift)) ? -1 : 1;
+        int n = i < 0 ? (dir > 0 ? 0 : fl.Count - 1) : i + dir;
+        if (n < 0 || n >= fl.Count) {
+          if (code == Keys.Tab) { Form f = FindForm(); if (f != null) f.SelectNextControl(this, dir > 0, true, true, true); }
+        } else SetFocusKey(fl[n], true);
+        e.Handled = true; return;
+      }
+      if (code == Keys.Enter || code == Keys.Space) { if (focusKey != null) Activate(focusKey); e.Handled = true; return; }
+      if (code == Keys.Left || code == Keys.Right) {
+        int dir = code == Keys.Left ? -1 : 1;
+        ComboBox cb = focusKey as ComboBox; Sec s = focusKey as Sec;
+        if (cb != null) StepValue(cb, dir);
+        else if (s != null && s.Open != (dir > 0)) Toggle(s);
+        e.Handled = true; return;
+      }
+      if (code == Keys.PageDown || code == Keys.PageUp) { Wheel((code == Keys.PageUp ? -1 : 1) * Height * 0.9); e.Handled = true; return; }
+      if (code == Keys.Home) { sp.To(0, 22); Kick(); e.Handled = true; return; }
+      if (code == Keys.End) { sp.To(MaxScroll(), 22); Kick(); e.Handled = true; return; }
+    } catch (Exception ex) { BbOLog.Write("teclado: " + ex.Message); }
+  }
+  protected override void Dispose(bool disposing) {
+    if (disposing) {
+      try { poll.Stop(); poll.Dispose(); tipTimer.Stop(); tipTimer.Dispose(); } catch { }
+      try { if (popup != null) popup.Dispose(); if (tip != null) tip.Dispose(); } catch { }
+      foreach (Sec s in secs) if (s.Bmp != null) s.Bmp.Dispose();
+      if (footer != null && footer.Bmp != null) footer.Bmp.Dispose();
+      if (bg != null) bg.Dispose(); if (fadeTop != null) fadeTop.Dispose(); if (fadeBot != null) fadeBot.Dispose();
+      if (F != null) F.Dispose();
+      if (measureG != null) measureG.Dispose(); if (measureBmp != null) measureBmp.Dispose();
+      if (wrapIa != null) wrapIa.Dispose();
+    }
+    base.Dispose(disposing);
+  }
+}
+
+// Aspecto de los botones de siempre (JUGAR, Carpeta del juego, Trofeos, Clave de trofeos, X...): se pinta encima de su
+// ventana (WM_PAINT) sin tocar el boton: texto, clic, Enabled, tooltip y posicion siguen siendo los suyos.
+public sealed class BbOSkin : NativeWindow, IBbOAnim {
+  [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] struct PAINTSTRUCT { public IntPtr hdc; public int fErase; public RECT rc; public int fRestore; public int fIncUpdate; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] reserved; }
+  [DllImport("user32.dll")] static extern IntPtr BeginPaint(IntPtr h, out PAINTSTRUCT ps);
+  [DllImport("user32.dll")] static extern bool EndPaint(IntPtr h, ref PAINTSTRUCT ps);
+  static List<BbOSkin> all = new List<BbOSkin>();
+  static PropertyInfo piCues = typeof(Control).GetProperty("ShowFocusCues", BindingFlags.Instance | BindingFlags.NonPublic);
+  Control c; string variant; float hover = 0f, hoverT = 0f, press = 0f, pressT = 0f; double lastT = 0; bool kicked = false, inPump = false, failed = false;
+  public static void Attach(Control c, string variant) {
+    if (c == null) return;
+    foreach (BbOSkin o in all) if (ReferenceEquals(o.c, c)) return;
+    BbOSkin s = new BbOSkin(); s.c = c; s.variant = variant == null ? "metal" : variant;
+    all.Add(s);
+    c.HandleCreated += s.OnHC; c.HandleDestroyed += s.OnHD;
+    c.MouseEnter += delegate(object o, EventArgs e) { s.hoverT = 1f; s.Kick(); };
+    c.MouseLeave += delegate(object o, EventArgs e) { s.hoverT = 0f; s.pressT = 0f; s.Kick(); };
+    c.MouseDown += delegate(object o, MouseEventArgs e) { if (e.Button == MouseButtons.Left) { s.pressT = 1f; s.Kick(); } };
+    c.MouseUp += delegate(object o, MouseEventArgs e) { s.pressT = 0f; s.Kick(); };
+    c.EnabledChanged += delegate(object o, EventArgs e) { s.hoverT = 0f; s.pressT = 0f; s.hover = 0f; s.press = 0f; c.Invalidate(); };
+    c.TextChanged += delegate(object o, EventArgs e) { c.Invalidate(); };
+    if (c.IsHandleCreated) s.AssignHandle(c.Handle);
+    c.Invalidate();
+  }
+  void OnHC(object o, EventArgs e) { try { if (Handle == IntPtr.Zero) AssignHandle(c.Handle); } catch { } }
+  void OnHD(object o, EventArgs e) { try { ReleaseHandle(); } catch { } }
+  void Kick() { kicked = true; if (BbOPump.ReduceMotion) { hover = hoverT; press = pressT; c.Invalidate(); return; } if (BbOPump.Add(this)) lastT = BbOPump.Now - 0.016; }
+  public bool Tick(double now) {
+    kicked = false;
+    if (c.IsDisposed) { inPump = false; return false; }
+    double dt = now - lastT; if (dt < 0.0005) dt = 0.0005; if (dt > 0.05) dt = 0.05; lastT = now;
+    float kh = (float)(1 - Math.Exp(-dt / (hoverT > hover ? 0.07 : 0.12))), kp = (float)(1 - Math.Exp(-dt / (pressT > press ? 0.028 : 0.06)));
+    hover += (hoverT - hover) * kh; press += (pressT - press) * kp;
+    bool done = Math.Abs(hoverT - hover) < 0.004f && Math.Abs(pressT - press) < 0.004f;
+    if (done) { hover = hoverT; press = pressT; }
+    c.Invalidate();
+    bool r = !done || kicked; if (!r) inPump = false; return r;
+  }
+  protected override void WndProc(ref Message m) {
+    if (!failed) {
+      if (m.Msg == 0x000F && m.WParam == IntPtr.Zero) { DoPaint(m.HWnd); return; }
+      if (m.Msg == 0x0014) { m.Result = new IntPtr(1); return; }
+    }
+    base.WndProc(ref m);
+  }
+  void DoPaint(IntPtr hwnd) {
+    PAINTSTRUCT ps;
+    IntPtr hdc = BeginPaint(hwnd, out ps);
+    try {
+      Rectangle rc = new Rectangle(0, 0, Math.Max(1, c.Width), Math.Max(1, c.Height));
+      using (BufferedGraphics buf = BufferedGraphicsManager.Current.Allocate(hdc, rc)) {
+        Paint(buf.Graphics);
+        buf.Render(hdc);
+      }
+    } catch (Exception ex) {
+      failed = true; BbOLog.Write("boton " + c.Name + ": " + ex.Message);
+    } finally { EndPaint(hwnd, ref ps); }
+    if (failed) { try { c.Invalidate(); } catch { } }
+  }
+  void Paint(Graphics g) {
+    BbOGfx.PaintParent(c, g);
+    g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+    float s = Math.Max(1f, g.DpiY / 96f);
+    RectangleF area = new RectangleF(0, 0, c.Width, c.Height);
+    if (c.Region != null) { try { area = c.Region.GetBounds(g); } catch { } }
+    bool en = c.Enabled;
+    float hv = en ? hover : 0f, pr = en ? press : 0f;
+    if (variant == "close") { PaintClose(g, area, s, hv, pr, en); return; }
+    bool crimson = variant == "play";
+    RectangleF b = new RectangleF(area.X + 2.5f, area.Y + 2.5f, area.Width - 5f, area.Height - 5f);
+    if (pr > 0f) b = RectangleF.Inflate(b, -0.8f * pr, -0.8f * pr);
+    if (hv > 0.02f && en) {
+      for (int i = 1; i <= 2; i++) {
+        using (GraphicsPath gp = BbOGfx.Round(RectangleF.Inflate(b, i * 1f, i * 1f), 3f * s + i))
+        using (Pen gpn = new Pen(Color.FromArgb((int)(40 * hv / i), 246, 200, 130), 1f)) g.DrawPath(gpn, gp);
+      }
+    }
+    BbOGfx.Metal(g, b, s, hv, pr, en, crimson);
+    if (c.Focused && piCues != null) {
+      bool cues = false; try { cues = (bool)piCues.GetValue(c, null); } catch { }
+      if (cues) using (GraphicsPath fp = BbOGfx.Round(RectangleF.Inflate(b, -6f * s, -6f * s), 2f * s)) using (Pen pen = new Pen(Color.FromArgb(150, 242, 214, 156), 1f)) { pen.DashStyle = DashStyle.Dot; g.DrawPath(pen, fp); }
+    }
+    PaintText(g, b, s, hv, pr, en, crimson);
+  }
+  void PaintClose(Graphics g, RectangleF area, float s, float hv, float pr, bool en) {
+    float d = Math.Min(area.Width, area.Height) - 6f;
+    RectangleF b = new RectangleF(area.X + (area.Width - d) / 2f, area.Y + (area.Height - d) / 2f, d, d);
+    using (GraphicsPath p = BbOGfx.Round(b, 3f * s)) {
+      Color f1 = BbOGfx.Lerp(Color.FromArgb(210, 22, 18, 16), Color.FromArgb(240, 150, 22, 27), hv), f2 = BbOGfx.Lerp(Color.FromArgb(210, 12, 10, 9), Color.FromArgb(240, 92, 12, 15), hv);
+      if (pr > 0f) f1 = BbOGfx.Lerp(f1, f2, pr);
+      using (LinearGradientBrush lb = new LinearGradientBrush(new RectangleF(b.X, b.Y - 1, b.Width, b.Height + 2), f1, f2, 90f)) g.FillPath(lb, p);
+      using (Pen pen = new Pen(BbOGfx.Lerp(Color.FromArgb(200, 140, 108, 62), Color.FromArgb(255, 226, 190, 124), hv), 1f)) g.DrawPath(pen, p);
+    }
+    using (GraphicsPath ip = BbOGfx.Round(RectangleF.Inflate(b, -3f * s, -3f * s), 2f * s)) using (Pen pen = new Pen(Color.FromArgb((int)(36 + 50 * hv), 201, 163, 96), 1f)) g.DrawPath(pen, ip);
+    float cx = b.X + b.Width / 2f, cy = b.Y + b.Height / 2f + pr * 0.6f, a = d * 0.2f;
+    Color xc = en ? BbOGfx.Lerp(BbOGfx.Gold, Color.FromArgb(250, 238, 220), hv) : BbOGfx.Off;
+    using (Pen pen = new Pen(xc, 1.7f * s)) { pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round; g.DrawLine(pen, cx - a, cy - a, cx + a, cy + a); g.DrawLine(pen, cx + a, cy - a, cx - a, cy + a); }
+  }
+  void PaintText(Graphics g, RectangleF b, float s, float hv, float pr, bool en, bool crimson) {
+    string t = c.Text ?? "";
+    Font f = c.Font;
+    Color tc = crimson ? (en ? BbOGfx.Lerp(Color.FromArgb(246, 234, 212), Color.White, hv * 0.4f) : Color.FromArgb(176, 150, 140)) : (en ? BbOGfx.Lerp(Color.FromArgb(224, 204, 160), Color.FromArgb(248, 230, 192), hv) : BbOGfx.Off);
+    Color sc = crimson ? Color.FromArgb(46, 5, 7) : Color.FromArgb(8, 6, 5);
+    Rectangle r = Rectangle.Round(b); r.Offset(0, (int)Math.Round(pr));
+    int chevron = 0;
+    if (t.EndsWith("  v")) { chevron = 1; t = t.Substring(0, t.Length - 3).TrimEnd(); }
+    else if (t.EndsWith("  ^")) { chevron = -1; t = t.Substring(0, t.Length - 3).TrimEnd(); }
+    ButtonBase bb = c as ButtonBase;
+    Image img = bb != null ? bb.Image : null;
+    bool left = bb != null && (bb.TextAlign == ContentAlignment.MiddleLeft || bb.TextAlign == ContentAlignment.TopLeft || bb.TextAlign == ContentAlignment.BottomLeft);
+    if (chevron != 0) {
+      BbOGfx.Chevron(g, r.Right - 16f * s, r.Y + r.Height / 2f, 3.6f * s, chevron > 0 ? 90f : 270f, en ? BbOGfx.Lerp(BbOGfx.Gold, BbOGfx.Candle, hv) : BbOGfx.Off, 1.6f * s);
+      r.Width -= (int)(26 * s);
+    }
+    if (img != null) {
+      int ix = r.X + (int)(10 * s), iy = r.Y + (r.Height - img.Height) / 2;
+      g.DrawImage(img, new Rectangle(ix, iy, img.Width, img.Height));
+      r = new Rectangle(ix + img.Width + (int)(8 * s), r.Y, Math.Max(1, r.Right - (ix + img.Width + (int)(8 * s))), r.Height);
+      left = true;
+    } else if (left) r.Inflate(-(int)(12 * s), 0);
+    int track = 0;
+    FieldInfo fi = c.GetType().GetField("Tracking");
+    if (fi != null) { try { track = (int)fi.GetValue(c); } catch { } }
+    TextFormatFlags fl = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | (left ? TextFormatFlags.Left : TextFormatFlags.HorizontalCenter);
+    if (t.IndexOf('\n') >= 0) fl |= TextFormatFlags.WordBreak; else fl |= TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis;
+    if (track > 0 && !left && t.IndexOf('\n') < 0) { DrawTracked(g, t, f, r, tc, sc, track); return; }
+    Rectangle sr = r; sr.Offset(0, 1);
+    TextRenderer.DrawText(g, t, f, sr, sc, fl);
+    TextRenderer.DrawText(g, t, f, r, tc, fl);
+  }
+  static void DrawTracked(Graphics g, string s, Font f, Rectangle tr, Color fc, Color sc, int tracking) {
+    TextFormatFlags mf = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+    int[] w = new int[s.Length]; int total = 0;
+    for (int i = 0; i < s.Length; i++) {
+      w[i] = s[i] == ' ' ? Math.Max(2, f.Height / 3) : TextRenderer.MeasureText(g, s[i].ToString(), f, new Size(10000, 1000), mf).Width;
+      total += w[i];
+    }
+    total += tracking * (s.Length - 1);
+    int x = tr.X + (tr.Width - total) / 2;
+    TextFormatFlags df = mf | TextFormatFlags.VerticalCenter | TextFormatFlags.Left;
+    for (int i = 0; i < s.Length; i++) {
+      if (s[i] != ' ') {
+        Rectangle cr = new Rectangle(x, tr.Y, w[i] + 4, tr.Height);
+        Rectangle sr = cr; sr.Offset(0, 1);
+        TextRenderer.DrawText(g, s[i].ToString(), f, sr, sc, df);
+        TextRenderer.DrawText(g, s[i].ToString(), f, cr, fc, df);
+      }
+      x += w[i] + tracking;
+    }
+  }
+}
+'@
+	}
+	[BbOLog]::Sink = [Action[string]]{ param($m) Write-Log "Panel de opciones: $m" }
+	[BbOPump]::ReduceMotion = [bool]$reduceMotion
+	if ($script:fam) { [BbOFonts]::Cinzel = $script:fam }
+	$bboDirs = @((Join-Path $root 'menu_assets\fonts')); try { if ($script:S.emu) { $bboDirs += (Join-Path (Split-Path -Parent $script:S.emu) 'menu_assets\fonts') } } catch { }
+	foreach ($bboD in $bboDirs) { if (Test-Path -LiteralPath $bboD) { try { [void][BbOFonts]::LoadDir($bboD) } catch { Write-Log "Letras del panel: $_" } } }
+	Write-Log ('Letras del panel: ' + [BbOFonts]::Describe())
+	$bboO = New-Object BbOptionsPanel
+	$bboO.Tips = $tips; $bboO.Backdrop = $script:bd
+	$btnSteam2.Text = (T 'Añadir a la biblioteca de Steam' 'Add to Steam library')  # texto del boton dibujado (el Panel no lo pinta)
+	foreach ($bboH in $script:hintLabels) { $bboO.MarkHint($bboH) }
+	$bboO.SetBrandTint($cmbUp); $bboO.SetBrandTint($cmbFg)
+	foreach ($bboG in $script:stackGroups) { $bboO.AddGroup($bboG, [string]$bboG.Tag.Title, [bool]$bboG.Tag.Collapsed, $bboG.Tag.Header) }
+	# TU EQUIPO al ancho exacto de los apartados (sin reescalar la imagen)
+	try {
+		$bboCW = $panelW - 26
+		foreach ($bboFs in 1.0, 0.9, 0.8, 0.7, 0.6) {
+			$bboOld = $pcCard.Image; $pcCard.Image = New-PcCard $bboCW $cardH $bboFs; if ($bboOld) { $bboOld.Dispose() }
+			if ($script:pcEndY -le $cardH - 6) { break }
+		}
+	} catch { Write-Log "Tarjeta TU EQUIPO (panel): $_" }
+	$bboO.AddFooterRow([System.Windows.Forms.Control[]]@($pcCard))
+	$bboO.AddFooterRow([System.Windows.Forms.Control[]]@($btnUpd, $btnSettings))
+	$bboO.AddFooterRow([System.Windows.Forms.Control[]]@($pbUpd))
+	$bboO.add_Failed({
+		try {
+			Write-Log 'Panel de opciones: fallo al dibujar; se vuelve al panel de siempre'
+			$bboF = $script:opt; $script:opt = $null
+			if ($bboF) { $bboF.Visible = $false }
+			$view.Visible = $true; Set-ScrollY 0
+		} catch { }
+	})
+	$bboO.SetBounds(0, $script:hd, $panelW, [math]::Max(1, $panel.ClientSize.Height - $script:hd))
+	$panel.Controls.Add($bboO); $bboO.BringToFront()
+	$view.Visible = $false; $sbar.Visible = $false
+	$script:opt = $bboO
+	Write-Log 'Panel de opciones: dibujado (BbOptionsPanel)'
+} catch {
+	Write-Log "Panel de opciones (C#): $_ ; se usa el panel de siempre"
+	try { if ($bboO -and $bboO.Parent) { $bboO.Parent.Controls.Remove($bboO) } } catch { }
+	$script:opt = $null; $view.Visible = $true
+}
+# Botones de siempre con marco de metal grabado (JUGAR carmesi); filigrana del panel; globos de ayuda oscuros.
+if ('BbOSkin' -as [type]) {
+	try {
+		if ($script:fam) { $btnFolder.Font = New-DisplayFont 10.5 10 }
+		[BbOSkin]::Attach($btnPlay, 'play'); [BbOSkin]::Attach($btnSetOk, 'play'); [BbOSkin]::Attach($btnX, 'close')
+		foreach ($bboB in @($btnFolder, $btnTrophy, $btnTKey, $btnEmu, $btnEmuUpd, $btnRollback, $btnLogs, $btnUserDir, $btnPatches, $btnInput)) { [BbOSkin]::Attach($bboB, 'metal') }
+	} catch { Write-Log "Botones (estilo): $_" }
+	try { [BbOGfx]::DecoratePanel($panel); [BbOGfx]::StyleRule($filete) } catch { Write-Log "Panel (filigrana): $_" }
+	try { [BbOGfx]::StyleToolTip($tips) } catch { Write-Log "Globos de ayuda: $_" }
+}
 Fill-Lists; Update-Up; Update-ModeInfo; Update-LatBox; Update-VerLabel; Update-TrophyButton
 Write-SharpLive
 $panel.ResumeLayout($true); $form.ResumeLayout($true)
@@ -3994,7 +5964,7 @@ $fxT.Add_Tick({
 	if ($form.WindowState -eq 'Minimized' -or -not $form.Visible) { return }
 	if ($script:bgZoom -gt 1.0) {
 		$z = 1.0 + 0.03 * (1 - (Ease 0 3200 ($now - $script:fxT0)))
-		if ($z -le 1.0005) { Set-BgZoom 1.0; $form.Invalidate($true) } else { Set-BgZoom $z; $form.Invalidate($false); $panel.Invalidate($true) }
+		if ($z -le 1.0005) { Set-BgZoom 1.0; $form.Invalidate($true) } else { Set-BgZoom $z; $form.Invalidate($false); if ($script:opt) { $script:opt.InvalidateBackground() }; $panel.Invalidate($true) }
 	}
 	$fs = [float]($dt / 1000.0)
 	if ($script:fog) {
