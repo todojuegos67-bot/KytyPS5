@@ -415,6 +415,11 @@ void PipelineCache::MaybeSaveDriverCache(bool force) {
     }
     std::error_code ec;
     std::filesystem::rename(tmp, driver_cache_path, ec);
+    if (ec) {
+        LOG_WARNING(Render_Vulkan, "[perf2] driver pipeline cache not saved: {}", ec.message());
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
     LOG_INFO(Render_Vulkan, "[perf2] driver pipeline cache saved: {} KiB, {} new pipelines",
              data.size() / 1024, pending);
 }
