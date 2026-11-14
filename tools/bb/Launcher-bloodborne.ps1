@@ -3013,7 +3013,7 @@ Invoke-SetLayout
 $fSet.Add_Shown({ Invoke-SetLayout })  # (launcher131) medidas con la letra real
 
 # ---------------------------------------------------------------- panel derecho (como Demon's Souls)
-$panelW = [math]::Min(520, $W)
+$panelW = [int][math]::Min($W, [math]::Max(520, [math]::Min(820, [math]::Round($W * 0.32))))  # (bb-launcher-3) columna mas ancha: ~32 % de la ventana
 # (launcher119) Columna pegada a la derecha: los apartados acaban 2 px antes de la barra (10 px de ancho, a 2 px del
 # borde) y los desplegables a $rowR px del borde del apartado (8 px hasta la barra). Nada se cruza con la barra.
 $sbW = 10; $rowR = 6
@@ -3113,7 +3113,7 @@ function Drag-ScrollTo([double]$y) {
 $sbar.add_Scrolled({ Drag-ScrollTo $sbar.Requested })
 $sbar.add_PageRequested({ Add-WheelStep ($sbar.PageDir * $view.ClientSize.Height * 0.9) })  # clic en el carril: salto de pagina animado
 # Fila de arriba: JUGAR grande; Precompilar / Actualizar / Settings / Salir a su lado.
-$fgW = 118  # (launcher121) boton Carpeta del juego a la derecha de JUGAR
+$fgW = [int][math]::Max(150, [math]::Round($panelW * 0.25))  # (launcher121) boton Carpeta del juego a la derecha de JUGAR
 $btnPlay = New-Btn (T 'JUGAR' 'PLAY') 10 12 ($gwTop - $fgW - 6) 74 $true
 # (ui055) JUGAR: fondo rojo y letra gotica blanca (la primera gotica instalada; si no hay, Segoe UI Black).
 $fams = @([System.Drawing.FontFamily]::Families | ForEach-Object { $_.Name })
@@ -3450,7 +3450,7 @@ try {
 $tips.SetToolTip($btnTrophy, (T 'Trofeos de shadPS4 para este juego (grado y nombre) y el % completado.' 'shadPS4 trophies for this game (grade and name) and the completion %.'))
 $form.Controls.Add($btnTrophy)
 # (launcher129) Boton "Clave de trofeos" a la derecha de Trofeos: abre siempre el cuadro de la clave (aunque ya haya una).
-$tkeyW = 176
+$tkeyW = 210
 $btnTKey = New-Btn (T 'Clave de trofeos' 'Trophy key') (24 + $trophyW + 8) ($H - 70) $tkeyW 46
 $btnTKey.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11, [System.Drawing.FontStyle]::Bold)
 if ($script:fam) { $btnTKey.Font = New-DisplayFont 10.5 11 }
@@ -5752,7 +5752,7 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
       bool cues = false; try { cues = (bool)piCues.GetValue(c, null); } catch { }
       if (cues) using (GraphicsPath fp = BbOGfx.Round(RectangleF.Inflate(b, -6f * s, -6f * s), 2f * s)) using (Pen pen = new Pen(Color.FromArgb(150, 242, 214, 156), 1f)) { pen.DashStyle = DashStyle.Dot; g.DrawPath(pen, fp); }
     }
-    PaintText(g, b, s, hv, pr, en, crimson);
+    PaintText(g, b, s, hv, pr, en, crimson, g.DpiY, true);
   }
   void PaintClose(Graphics g, RectangleF area, float s, float hv, float pr, bool en) {
     float d = Math.Min(area.Width, area.Height) - 6f;
@@ -5768,7 +5768,7 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
     Color xc = en ? BbOGfx.Lerp(BbOGfx.Gold, Color.FromArgb(250, 238, 220), hv) : BbOGfx.Off;
     using (Pen pen = new Pen(xc, 1.7f * s)) { pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round; g.DrawLine(pen, cx - a, cy - a, cx + a, cy + a); g.DrawLine(pen, cx + a, cy - a, cx - a, cy + a); }
   }
-  void PaintText(Graphics g, RectangleF b, float s, float hv, float pr, bool en, bool crimson) {
+  bool PaintText(Graphics g, RectangleF b, float s, float hv, float pr, bool en, bool crimson, float dpi, bool draw) {
     string t = c.Text ?? "";
     Font f = c.Font;
     Color tc = crimson ? (en ? BbOGfx.Lerp(Color.FromArgb(246, 234, 212), Color.White, hv * 0.4f) : Color.FromArgb(176, 150, 140)) : (en ? BbOGfx.Lerp(Color.FromArgb(224, 204, 160), Color.FromArgb(248, 230, 192), hv) : BbOGfx.Off);
@@ -5781,24 +5781,73 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
     Image img = bb != null ? bb.Image : null;
     bool left = bb != null && (bb.TextAlign == ContentAlignment.MiddleLeft || bb.TextAlign == ContentAlignment.TopLeft || bb.TextAlign == ContentAlignment.BottomLeft);
     if (chevron != 0) {
-      BbOGfx.Chevron(g, r.Right - 16f * s, r.Y + r.Height / 2f, 3.6f * s, chevron > 0 ? 90f : 270f, en ? BbOGfx.Lerp(BbOGfx.Gold, BbOGfx.Candle, hv) : BbOGfx.Off, 1.6f * s);
+      if (draw) BbOGfx.Chevron(g, r.Right - 16f * s, r.Y + r.Height / 2f, 3.6f * s, chevron > 0 ? 90f : 270f, en ? BbOGfx.Lerp(BbOGfx.Gold, BbOGfx.Candle, hv) : BbOGfx.Off, 1.6f * s);
       r.Width -= (int)(26 * s);
     }
     if (img != null) {
       int ix = r.X + (int)(10 * s), iy = r.Y + (r.Height - img.Height) / 2;
-      g.DrawImage(img, new Rectangle(ix, iy, img.Width, img.Height));
+      if (draw) g.DrawImage(img, new Rectangle(ix, iy, img.Width, img.Height));
       r = new Rectangle(ix + img.Width + (int)(8 * s), r.Y, Math.Max(1, r.Right - (ix + img.Width + (int)(8 * s))), r.Height);
       left = true;
     } else if (left) r.Inflate(-(int)(12 * s), 0);
     int track = 0;
     FieldInfo fi = c.GetType().GetField("Tracking");
     if (fi != null) { try { track = (int)fi.GetValue(c); } catch { } }
-    TextFormatFlags fl = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | (left ? TextFormatFlags.Left : TextFormatFlags.HorizontalCenter);
-    if (t.IndexOf('\n') >= 0) fl |= TextFormatFlags.WordBreak; else if (TextRenderer.MeasureText(t, f).Width > r.Width) fl |= TextFormatFlags.WordBreak; else fl |= TextFormatFlags.SingleLine;
-    if (track > 0 && !left && t.IndexOf('\n') < 0) { DrawTracked(g, t, f, r, tc, sc, track); return; }
+    r.Inflate(-(int)Math.Round(4 * s), -(int)Math.Round(3 * s));
+    if (r.Width < 4 || r.Height < 4) return false;
+    // Letra que cabe entera (como mucho 2 lineas) en el boton: desde la suya hacia abajo hasta 10 px (a 100 %).
+    float startPx = f.SizeInPoints * dpi / 72f, minPx = Math.Max(7f, 10f * dpi / 96f);
+    bool single = t.IndexOf('\n') < 0;
+    bool fits = false, useTrack = false; Font use = null; float px = startPx;
+    for (; px >= minPx - 0.01f; px -= 0.5f) {
+      Font ft = Fnt(f, px);
+      int trk = track > 0 ? Math.Max(1, (int)Math.Round(track * px / startPx)) : 0;
+      if (trk > 0 && !left && single && ft.Height <= r.Height && TrackedW(g, t, ft, trk) <= r.Width) { use = ft; useTrack = true; track = trk; fits = true; break; }
+      Size sz = TextRenderer.MeasureText(g, t, ft, new Size(r.Width, 100000), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+      int lines = (int)Math.Round(sz.Height / (double)Math.Max(1, ft.Height));
+      if (sz.Width <= r.Width && sz.Height <= r.Height && lines <= 2) { use = ft; fits = true; break; }
+    }
+    if (use == null) use = Fnt(f, minPx);
+    if (!fits && draw && !warned) { warned = true; BbOLog.Write("TEXTO CORTADO: boton '" + t.Replace("\n", " ") + "' (" + r.Width + "x" + r.Height + " px)"); }
+    if (!draw) return fits;
+    if (useTrack) { DrawTracked(g, t, use, r, tc, sc, track); return fits; }
+    TextFormatFlags fl = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak | (left ? TextFormatFlags.Left : TextFormatFlags.HorizontalCenter);
     Rectangle sr = r; sr.Offset(0, 1);
-    TextRenderer.DrawText(g, t, f, sr, sc, fl);
-    TextRenderer.DrawText(g, t, f, r, tc, fl);
+    TextRenderer.DrawText(g, t, use, sr, sc, fl);
+    TextRenderer.DrawText(g, t, use, r, tc, fl);
+    return fits;
+  }
+  bool warned = false;
+  Font fcache = null; Font fbase = null; float fpx = 0f;
+  Font Fnt(Font f, float px) {
+    px = (float)Math.Round(px * 2f) / 2f;
+    if (fcache != null && ReferenceEquals(fbase, f) && fpx == px) return fcache;
+    Font n = new Font(f.FontFamily, px, f.Style, GraphicsUnit.Pixel);
+    fcache = n; fbase = f; fpx = px;
+    return n;
+  }
+  static int TrackedW(Graphics g, string s, Font f, int tracking) {
+    TextFormatFlags mf = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+    int total = 0;
+    for (int i = 0; i < s.Length; i++) total += s[i] == ' ' ? Math.Max(2, f.Height / 3) : TextRenderer.MeasureText(g, s[i].ToString(), f, new Size(10000, 1000), mf).Width;
+    return total + tracking * (s.Length - 1);
+  }
+  // Comprobacion: el texto de cada boton cabe entero a 100 %, 125 % y 150 %; si no, "TEXTO CORTADO" en launcher.log.
+  public static void CheckAll() {
+    foreach (BbOSkin k in all) {
+      if (k.variant == "close" || k.c.IsDisposed) continue;
+      foreach (float sc in new float[] { 1f, 1.25f, 1.5f }) {
+        try {
+          using (Bitmap bm = new Bitmap(Math.Max(1, k.c.Width), Math.Max(1, k.c.Height))) using (Graphics g = Graphics.FromImage(bm)) {
+            RectangleF area = new RectangleF(0, 0, k.c.Width, k.c.Height);
+            if (k.c.Region != null) { try { area = k.c.Region.GetBounds(g); } catch { } }
+            RectangleF b = new RectangleF(area.X + 2.5f, area.Y + 2.5f, area.Width - 5f, area.Height - 5f);
+            if (!k.PaintText(g, b, sc, 0f, 0f, true, k.variant == "play", 96f * sc, false))
+              BbOLog.Write("TEXTO CORTADO: boton '" + (k.c.Text ?? "").Replace("\n", " ") + "' a " + (int)(sc * 100) + " % (" + k.c.Width + "x" + k.c.Height + " px)");
+          }
+        } catch (Exception ex) { BbOLog.Write("comprobacion de botones: " + ex.Message); }
+      }
+    }
   }
   static void DrawTracked(Graphics g, string s, Font f, Rectangle tr, Color fc, Color sc, int tracking) {
     TextFormatFlags mf = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
@@ -5871,8 +5920,9 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
 if ('BbOSkin' -as [type]) {
 	try {
 		if ($script:fam) { $btnFolder.Font = New-DisplayFont 10.5 10 }
-		[BbOSkin]::Attach($btnPlay, 'play'); [BbOSkin]::Attach($btnSetOk, 'play'); [BbOSkin]::Attach($btnX, 'close')
+		[BbOSkin]::Attach($btnPlay, 'play'); [BbOSkin]::Attach($btnSetOk, 'play'); [BbOSkin]::Attach($btnX, 'close'); $btnFolder.Text = (T 'Carpeta del juego' 'Game folder')
 		foreach ($bboB in @($btnFolder, $btnTrophy, $btnTKey, $btnEmu, $btnEmuUpd, $btnRollback, $btnLogs, $btnUserDir, $btnPatches, $btnInput)) { [BbOSkin]::Attach($bboB, 'metal') }
+		$form.Add_Shown({ try { [BbOSkin]::CheckAll() } catch { Write-Log "Comprobacion de botones: $_" } })  # TEXTO CORTADO en launcher.log si algo no cabe
 	} catch { Write-Log "Botones (estilo): $_" }
 	try { [BbOGfx]::DecoratePanel($panel); [BbOGfx]::StyleRule($filete) } catch { Write-Log "Panel (filigrana): $_" }
 	try { [BbOGfx]::StyleToolTip($tips) } catch { Write-Log "Globos de ayuda: $_" }
