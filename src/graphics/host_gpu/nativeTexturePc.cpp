@@ -35,7 +35,7 @@ struct Counters {
 	// KYTY_NATIVE_TEXTURE_PC_SINGLE=2
 	std::atomic<uint64_t> s2_freed {0}, s2_freed_bytes {0}, s2_image_only_bytes {0}, s2_passes {0}, s2_verified {0};
 	std::atomic<uint64_t> s2_keep_shared {0}, s2_keep_slice {0}, s2_keep_no_image {0}, s2_keep_mismatch {0},
-	    s2_keep_restore_fail {0}, s2_lost {0}, s2_pins {0}, s2_unpins {0};
+	    s2_keep_restore_fail {0}, s2_keep_cpu {0}, s2_lost {0}, s2_pins {0}, s2_unpins {0};
 	std::atomic<uint64_t> s2_restores[6] {}, s2_restore_bytes[6] {}, s2_restore_fail[6] {};
 };
 Counters g_c;
@@ -335,6 +335,9 @@ enum RestorePath : int { RpPlan = 0, RpCpuRead = 1, RpSlice = 2, RpImageGone = 3
 const char* const kRestorePath[6] = {"image-build", "cpu-read", "slice-copy", "image-gone", "edge-page", "fill"};
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_pinned; // token -> (image base, image size); under State::m
 void (*g_single_host_log)() = nullptr;
+// Owners any of whose bytes a CPU read/write needed (Materialize, not a demotion): their buffers are never dropped
+// (SINGLE=2): such a read can come from a thread that cannot wait for the render thread. Under State::m.
+std::unordered_set<uint64_t> g_cpu_owners;
 
 [[noreturn]] void Lost(const char* path, uint64_t b, uint64_t e, const char* why) {
 	std::printf("NativeTexturePC single-copy: FATAL: the bytes of 0x%llx+0x%llx are only in a texture cache image and could "
@@ -350,6 +353,7 @@ bool RestoreToken(uint64_t token, bool wait, int path, const char** why) {
 	auto&    s = S();
 	Host     host;
 	uint64_t base = 0, size = 0;
+	bool stale = true;
 	{
 		const std::lock_guard lock(s.m);
 		auto                  p = g_pinned.find(token);
@@ -357,6 +361,23 @@ bool RestoreToken(uint64_t token, bool wait, int path, const char** why) {
 		base = p->second.first;
 		size = p->second.second;
 		host = s.host;
+		for (const auto& [cb, c]: s.chunks)
+			if (c.img == token && ImageOnly(c)) {
+				stale = false;
+				break;
+			}
+		if (stale) {
+			// (No chunk needs the image's bytes any more (released / overwritten): only the pin is left - never a
+			// read-back, which could fail on an image the GPU has written since.)
+			for (auto& [cb, c]: s.chunks)
+				if (c.img == token) c.img = 0;
+			g_pinned.erase(p);
+		}
+	}
+	if (stale) {
+		if (host.pin != nullptr) host.pin(token, false);
+		g_c.s2_unpins.fetch_add(1, std::memory_order_relaxed);
+		return true;
 	}
 	const uint64_t handle = host.restore != nullptr ? host.restore(token, size, wait, why) : 0;
 	if (handle == 0) {
@@ -496,6 +517,13 @@ void WriteEdges(State& s, uint64_t b, uint64_t e) {
 // The non-materialized chunks over [b, e) written into guest memory and unwatched. False: some could not be read here.
 bool Materialize(uint64_t b, uint64_t e, bool demote = false) {
 	auto&                                   s = S();
+	if (!demote && SingleMode() == 2) {
+		const std::lock_guard lock(s.m);
+		auto                  it = s.chunks.upper_bound(b);
+		if (it != s.chunks.begin()) --it;
+		for (; it != s.chunks.end() && it->first < e; ++it)
+			if (it->second.end > b && it->second.owner != 0) g_cpu_owners.insert(it->second.owner);
+	}
 	if (const char* why = nullptr; !demote && !Ensure(b, e, true, RpCpuRead, &why)) Lost("cpu-read", b, e, why);
 	std::vector<std::pair<uint64_t, Chunk>> todo;
 	std::pair<uint64_t, uint64_t>           mine {};
@@ -618,6 +646,10 @@ void SetHost(const Host& host) noexcept {
 	if (host.upload_commit != nullptr) s.host.upload_commit = host.upload_commit;
 	if (host.release != nullptr) s.host.release = host.release;
 	if (host.read_device != nullptr) s.host.read_device = host.read_device;
+	// (KYTY_VRAM_BUDGET's BudgetPass needs it: only when the budget was asked for (KYTY_VRAM_BUDGET set, or the
+	// KYTY_VRAM_BUDGET_MB cap), so nothing else changes.)
+	if (host.vram != nullptr && (std::getenv("KYTY_VRAM_BUDGET") != nullptr || std::getenv("KYTY_VRAM_BUDGET_MB") != nullptr))
+		s.host.vram = host.vram;
 	if (host.pick_image != nullptr) s.host.pick_image = host.pick_image;
 	if (host.restore != nullptr) s.host.restore = host.restore;
 	if (host.pin != nullptr) s.host.pin = host.pin;
@@ -1133,6 +1165,11 @@ void Single2Pass() {
 				}
 				continue;
 			}
+			if (g_cpu_owners.count(c.owner) != 0) {
+				g_c.s2_keep_cpu.fetch_add(1, std::memory_order_relaxed);
+				c.single_keep = true;
+				continue;
+			}
 			if (auto o = s.owners.find(c.owner); o != s.owners.end() && o->second.texture.slice_copy_candidate) {
 				g_c.s2_keep_slice.fetch_add(1, std::memory_order_relaxed);
 				c.single_keep = true;
@@ -1310,7 +1347,7 @@ void Pump() noexcept {
 	if (SingleMode() == 2) {
 		std::printf("NativeTexturePC single-copy=2: engine buffers VRAM MiB %.1f (%llu buffers) | image-only MiB %.1f (%zu "
 		            "images pinned; pins %llu, unpins %llu) | buffers freed %llu (%.1f MiB; verified %llu, %llu passes) | kept: "
-		            "shared %llu, slice source %llu, no image %llu, bytes differ %llu, read-back failed %llu | lost 0 (else FATAL)\n",
+		            "shared %llu, CPU-read owner %llu, slice source %llu, no image %llu, bytes differ %llu, read-back failed %llu | lost 0 (else FATAL)\n",
 		            MiB(c.vram_bytes), static_cast<unsigned long long>(c.vram_buffers), MiB([] {
 			            uint64_t              n = 0;
 			            const std::lock_guard lock(S().m);
@@ -1325,7 +1362,8 @@ void Pump() noexcept {
 		            static_cast<unsigned long long>(g_c.s2_pins.load()), static_cast<unsigned long long>(g_c.s2_unpins.load()),
 		            static_cast<unsigned long long>(g_c.s2_freed.load()), MiB(g_c.s2_freed_bytes.load()),
 		            static_cast<unsigned long long>(g_c.s2_verified.load()), static_cast<unsigned long long>(g_c.s2_passes.load()),
-		            static_cast<unsigned long long>(g_c.s2_keep_shared.load()), static_cast<unsigned long long>(g_c.s2_keep_slice.load()),
+		            static_cast<unsigned long long>(g_c.s2_keep_shared.load()), static_cast<unsigned long long>(g_c.s2_keep_cpu.load()),
+		            static_cast<unsigned long long>(g_c.s2_keep_slice.load()),
 		            static_cast<unsigned long long>(g_c.s2_keep_no_image.load()),
 		            static_cast<unsigned long long>(g_c.s2_keep_mismatch.load()),
 		            static_cast<unsigned long long>(g_c.s2_keep_restore_fail.load()));
