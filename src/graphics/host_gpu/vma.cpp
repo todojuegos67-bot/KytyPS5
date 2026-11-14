@@ -398,6 +398,10 @@ bool FixedPoolEnabled() {
 	return g_fp.enabled;
 }
 
+uint64_t FixedPoolFree(const GraphicContext& graphics) {
+	return PoolFree(graphics.allocator);
+}
+
 bool FixedPoolCreateBuffer(GraphicContext& graphics, const VkBufferCreateInfo& info, VkBuffer* out,
                            VmaAllocation* allocation, VmaAllocationInfo* allocation_info, const char* source) {
 	if (!g_fp.enabled || !g_fp.buffers || graphics.allocator == nullptr) return false;
@@ -934,8 +938,9 @@ uint64_t GraphicContext::GetVideoMemoryRoom() const {
 	}
 	// (The driver's usage holds KYTY_SIMULATE_VRAM_MB's ballast: the room left is the same.)
 	const auto& budget = budgets[video];
-	// (KYTY_VK_FIXED_POOL: room in the pools is room too.)
-	return (budget.budget > budget.usage ? budget.budget - budget.usage : 0) + PoolFree(allocator);
+	// (KYTY_VK_FIXED_POOL: room in the pools is room too, for a game buffer (this figure's use) only when the pools hold
+	// game buffers: otherwise a spilled buffer moved back on room it cannot take lands in system memory again.)
+	return (budget.budget > budget.usage ? budget.budget - budget.usage : 0) + (g_fp.buffers ? PoolFree(allocator) : 0);
 }
 
 // Allocations in the heaps that are not device-local (system RAM the driver maps for the GPU): staging and

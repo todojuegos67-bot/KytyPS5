@@ -258,6 +258,8 @@ uint64_t VramSaverGet(int counter);
 // Not on GPUs of 8 GB or less (as before there). The caches' images (CreateImage's cache_source) and game buffers go
 // there; past a full pool, or what a pool cannot hold, VMA's default pools as before (logged).
 [[nodiscard]] bool FixedPoolEnabled();
+// The pools' room not taken yet (0 when off): reserved video memory the driver counts as in use.
+[[nodiscard]] uint64_t FixedPoolFree(const GraphicContext& graphics);
 // A game buffer in the fixed pools: true with the buffer bound to its memory there; false (nothing created): the caller
 // makes it as before.
 [[nodiscard]] bool FixedPoolCreateBuffer(GraphicContext& graphics, const VkBufferCreateInfo& info, VkBuffer* buffer,

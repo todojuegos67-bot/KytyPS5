@@ -3227,7 +3227,9 @@ void BufferCache::RetireStaleBuffers(uint64_t tick) {
 	m_tick_times[tick % m_tick_times.size()] = now.time_since_epoch().count();
 	if (tick % 30 == 0) {
 		uint64_t video = 0, budget = 0;
-		m_retire_pressure = m_graphics.QueryLocalVideoMemory(&video, &budget) && video >= m_critical_gc_memory;
+		// (KYTY_VK_FIXED_POOL: the pools' unused room, reserved at start-up, is not pressure; else always over critical.)
+		m_retire_pressure = m_graphics.QueryLocalVideoMemory(&video, &budget) &&
+		                    video - std::min(video, FixedPoolFree(m_graphics)) >= m_critical_gc_memory;
 	}
 	if (tick <= MinTicks) return;
 	const bool pressure = m_retire_pressure;
