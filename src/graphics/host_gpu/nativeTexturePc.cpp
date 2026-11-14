@@ -10,6 +10,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <new>
 #include <unordered_map>
@@ -96,7 +97,9 @@ struct Op {
 
 struct State {
 	std::mutex                           m;
-	std::mutex                           watch_m; // the watch calls in the order the state changed
+	std::mutex                           watch_m;
+	std::condition_variable              materializing_cv; // a materialization over a range ended
+	std::vector<std::pair<uint64_t, uint64_t>> materializing; // [b, e) being read back + written to guest (no lock held) // the watch calls in the order the state changed
 	std::map<uint64_t, Chunk>            chunks;  // by begin; never overlapping
 	std::map<uint64_t, Extent>           extents; // factory textures' memory, by base
 	std::map<uint64_t, uint64_t>         bases;   // registered texture base -> owner
@@ -377,15 +380,44 @@ void WriteEdges(State& s, uint64_t b, uint64_t e) {
 bool Materialize(uint64_t b, uint64_t e, bool demote = false) {
 	auto&                                   s = S();
 	std::vector<std::pair<uint64_t, Chunk>> todo;
+	std::pair<uint64_t, uint64_t>           mine {};
 	{
-		const std::lock_guard lock(s.m);
-		auto                  it = s.chunks.upper_bound(b);
+		// One materialization at a time over any range: a second one (another fault, an emulator read) waits for the
+		// first to end and then finds its chunks materialized - it never writes older bytes over what the game wrote
+		// after the first. (No lock is held across the read-back itself.)
+		std::unique_lock lock(s.m);
+		const auto       busy = [&] {
+            for (const auto& [mb, me]: s.materializing)
+                if (mb < e && b < me) return true;
+            return false;
+		};
+		s.materializing_cv.wait(lock, [&] { return !busy(); });
+		auto it = s.chunks.upper_bound(b);
 		if (it != s.chunks.begin()) --it;
+		uint64_t lo = UINT64_MAX, hi = 0;
 		for (; it != s.chunks.end() && it->first < e; ++it)
-			if (it->second.end > b && !it->second.materialized && (!demote || it->second.dev))
+			if (it->second.end > b && !it->second.materialized && (!demote || it->second.dev)) {
 				todo.emplace_back(it->first, it->second);
+				lo = std::min(lo, it->first);
+				hi = std::max(hi, it->second.end);
+			}
+		if (todo.empty()) return true;
+		// (The whole chunks' span: a materialization of a neighbouring range touching them waits too.)
+		mine = {std::min(lo, b), std::max(hi, e)};
+		s.materializing.push_back(mine);
 	}
-	if (todo.empty()) return true;
+	struct Done {
+		State&                         s;
+		std::pair<uint64_t, uint64_t>  range;
+		~Done() {
+			{
+				const std::lock_guard lock(s.m);
+				auto it = std::find(s.materializing.begin(), s.materializing.end(), range);
+				if (it != s.materializing.end()) s.materializing.erase(it);
+			}
+			s.materializing_cv.notify_all();
+		}
+	} done {s, mine};
 	bool all = true;
 	for (const auto& [cb, c]: todo) {
 		const uint64_t n = c.end - cb;
