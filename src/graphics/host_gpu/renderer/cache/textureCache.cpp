@@ -2667,7 +2667,12 @@ void TextureCache::NativeTexPrepare(ImageId id) {
 	bool       ok      = image.IsDefinitelyCpuDirty() && !image.IsMaybeCpuDirty() && !image.IsBufferModified() &&
 	          binding != BindingType::DepthTarget && !info.IsVolume() && !image.depth_id &&
 	          info.metadata.compression == VideoOutCompression::Uncompressed && info.samples == 1 &&
-	          image.backing.samples == 1 && image.backing.image != nullptr && base % 256 == 0 && SafeToDownload(image);
+	          image.backing.samples == 1 && image.backing.image != nullptr && base % 256 == 0 &&
+	          !m_buffer_cache.HasGpuDirtyBytes(base, info.data.size);
+	// (Not SafeToDownload(image): that needs IsGpuModified() && !IsCpuDirty(), which no loaded texture is - it is CPU-dirty
+	// by definition here and the GPU never wrote it - so every upload fell back: field log 20261114-051845, "ring uploads 0",
+	// "image 979". What a later fallback needs is a download plan, checked below (BuildDownload), and no GPU-written
+	// buffer bytes over the range.)
 	// (ring: ranges whose bytes are in the ring; zero: committed texture memory nothing wrote: zeros are uploaded there.
 	// `ring` covers both for the coverage rules below.)
 	std::vector<std::pair<uint64_t, uint64_t>> ring, own, zero;
