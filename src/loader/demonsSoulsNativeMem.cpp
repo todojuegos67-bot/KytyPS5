@@ -123,20 +123,29 @@ constexpr std::array<Rel, 10> Rels {{
 constexpr uint64_t GpuTaggedArenaVtable = 0x25acde8, TaggedArenaName = 0x23f49a3;
 constexpr uint64_t ContextVtable = 0x25acf58, RenderContextGpuName = 0x242d9c1;
 constexpr uint64_t MipCopyCall = 0x901459, MemcpyStub = 0x1e73d00;
+// The CPU memory context "CPUMemory" (static at 0x2ee2900: 0x7fb8fc lea rbx; 0x7fb903 lea rsi,"CPUMemory" (0x23fdeff);
+// mov edx,1; call 0x800da0): its HeapAllocator (allocations of 1 KiB..1 MiB, grown 2 MiB at a time) holds most of the CPU
+// data the GPU reads every frame (in the field log the hottest write-tracking allocator by far: 2.5-4.3k window
+// faults/s, 10-14k protection calls/s). Marked too; only its hot pages are kept (uploadHeap.h).
+constexpr uint64_t CpuContext = 0x2ee2900, CpuContextName = 0x23fdeff;
 constexpr uint64_t CaveOffset = 0x8040000, CaveSize = 0x4000; // (Idle 0x8000000, SceneGuard 0x8008000, Camera 0x8020000,
                                                               // GpuPages 0x8080000)
-constexpr std::array<Window, 9> Level3Exact {{
+constexpr std::array<Window, 10> Level3Exact {{
     {0x7f78e9, "4889c7ba020000004889c3"},                 // mov rdi,rax; mov edx,2; mov rbx,rax
     {0x7f7927, "488903"},                                 // mov [rbx],rax (the vtable)
     {0x902765 + 7, "ba0200000048897d88"},                 // mov edx,2; mov [rbp-0x78],rdi
     {0x800dae + 7, "c5f857c0"},                           // (after the context vtable lea)
     {0x801090, "48638788000000448d400148c1e0044889b40798000000488994079000000044898788000000"},
     {0x9013cb, "4d8ba6980000004d036508458b7d04"},          // r12 = [r14+0x98] + [r13+8]; r15d = [r13+4]
+    {0x7fb90a, "ba010000004889df"},                       // mov edx,1 (CPUMemory); mov rdi,rbx
     {0x9013f4, "4c89fe4c89e7"},                           // Realloc(rdi = r12, rsi = r15)
     {0x90143a, "41c6456d014180a5a3000000fd498b7d20"},     // ... mov rdi,[r13+0x20]
     {0x901450, "4c89e74889c64c89fa"},                     // memcpy(rdi = r12, rsi = data, rdx = r15)
 }};
-constexpr std::array<Rel, 9> Level3Rels {{
+constexpr std::array<Rel, 12> Level3Rels {{
+    {0x7fb8fc, 7, 3, CpuContext, 0x48, 0x8d, 0x1d},
+    {0x7fb903, 7, 3, CpuContextName, 0x48, 0x8d, 0x35},
+    {0x7fb912, 5, 1, 0x800da0, 0xe8, 0, 0},
     {0x7f78e2, 7, 3, TaggedArenaName, 0x48, 0x8d, 0x35},
     {0x7f78f4, 5, 1, AllocatorCtor, 0xe8, 0, 0},
     {0x7f78f9, 7, 3, GpuTaggedArenaVtable, 0x48, 0x8d, 0x05},
@@ -442,6 +451,29 @@ void Walk(Census& c) {
 			}
 		}
 	}
+	// The CPUMemory context's HeapAllocator (static context in the eboot): its runs marked (level 3). (Also found in the
+	// registry above, under its own owner row: the marking is what this adds.)
+	Header ch;
+	if (level3 && ReadHeader(base + CpuContext, &ch) && ch.vtable == base + ContextVtable && ch.type == 1 &&
+	    ch.name_pointer == base + CpuContextName) {
+		uint32_t count = 0;
+		if (ReadGuest(base + CpuContext + 0x88, &count, sizeof(count))) {
+			for (uint32_t i = 0; i < std::min<uint32_t>(count, 4); i++) {
+				bool           ok  = true;
+				const uint64_t sub = ReadU64(base + CpuContext + 0x98 + 16ull * i, &ok);
+				Header         sh;
+				if (!ok || !ReadHeader(sub, &sh) || sh.type != 1 || sh.name != "HeapAllocator") continue;
+				std::vector<Run> marked;
+				const uint32_t   owner = OwnerIndex(c, sub, 2000 + i, sh.type, "CPUMemory/HeapAllocator");
+				c.owners[owner].upload_heap = true;
+				WalkRuns(c, marked, sub, owner, true);
+				c.owners[owner].held = c.owners[owner].runs = 0; // (its runs are counted under its registry row)
+				for (auto& o: c.owners) {
+					if (o.object == sub) o.upload_heap = true;
+				}
+			}
+		}
+	}
 	std::sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) { return a.begin < b.begin; });
 	c.runs = std::move(runs);
 }
@@ -584,14 +616,19 @@ void Report(Census& c, double seconds, bool residency) {
 	}
 	if (g_level.load(std::memory_order_relaxed) >= 3) {
 		namespace U = Libs::Graphics::UploadHeap;
-		static uint64_t last[7] {};
-		const uint64_t  now[7] = {U::g_kept_pages.load(), U::g_deduped_pages.load(), U::g_gpu_taken_pages.load(),
-		                          g_mip_copies.load(), g_mip_bytes.load(), g_mip_prepared.load(), U::g_marked_bytes.load()};
-		std::printf("[native-mem]   upload heaps: %llu MiB marked; per s %llu pages kept CPU-dirty after a copy (no write "
-		            "protection), %llu copies skipped in the same epoch, %llu handed to a GPU write; streamed mips per s %llu "
-		            "(%llu MiB, %llu told to the trackers at once)\n",
-		            static_cast<unsigned long long>(now[6] / MiB), per(now[0] - last[0]), per(now[1] - last[1]),
-		            per(now[2] - last[2]), per(now[3] - last[3]),
+		static uint64_t last[11] {};
+		const uint64_t  now[11] = {U::g_kept_copies.load(),   U::g_deduped_pages.load(), U::g_gpu_taken_pages.load(),
+		                           g_mip_copies.load(),       g_mip_bytes.load(),        g_mip_prepared.load(),
+		                           U::g_marked_bytes.load(),  U::g_promoted_pages.load(), U::g_demoted_pages.load(),
+		                           U::g_publish.load(),       U::g_frame.load()};
+		std::printf("[native-mem]   upload heaps: %llu MiB marked; per s %llu kept-page copies (%llu MiB), %llu skipped (copied "
+		            "in the same publish epoch), %llu pages kept (hot), %llu tracked again (read in 2 epochs of a frame), "
+		            "%llu handed to a GPU write; %llu publish epochs and %llu frames per s; streamed mips per s %llu (%llu MiB, "
+		            "%llu told to the trackers at once)\n",
+		            static_cast<unsigned long long>(now[6] / MiB), per(now[0] - last[0]),
+		            static_cast<unsigned long long>(static_cast<double>((now[0] - last[0]) << 12u) / seconds / static_cast<double>(MiB)),
+		            per(now[1] - last[1]), per(now[7] - last[7]), per(now[8] - last[8]), per(now[2] - last[2]),
+		            per(now[9] - last[9]), per(now[10] - last[10]), per(now[3] - last[3]),
 		            static_cast<unsigned long long>(static_cast<double>(now[4] - last[4]) / seconds / static_cast<double>(MiB)),
 		            per(now[5] - last[5]));
 		std::copy(std::begin(now), std::end(now), std::begin(last));
@@ -626,7 +663,12 @@ void CensusThread() {
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 		++second;
 		Drain(c);
-		if (second % 10 != 0) continue;
+		// (The runs every 2 s: during a load the heaps grow by hundreds of runs, which a 10 s walk left in "(no engine
+		// run)" and unmarked meanwhile.)
+		if (second % 10 != 0) {
+			if (second % 2 == 0) Walk(c);
+			continue;
+		}
 		const bool residency = second % 30 == 0;
 		if (residency) SampleResidency(c);
 		const auto   now     = std::chrono::steady_clock::now();

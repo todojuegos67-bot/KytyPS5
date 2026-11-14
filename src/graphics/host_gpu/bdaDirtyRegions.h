@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_BDADIRTYREGIONS_H_
 
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/uploadHeap.h"
 
 #include <atomic>
 #include <bit>
@@ -45,6 +46,7 @@ inline void Mark(uint64_t region) {
 // The translating thread when it takes a submission and when a WAIT_REG_MEM is satisfied: the guest
 // writes made before the submission or the awaited label become visible to the commands after it.
 inline void Publish() {
+	UploadHeap::Publish(); // (kept pages: copies of the epoch before are stale from here)
 	if (g_pending_groups.load(std::memory_order_acquire) == 0) return;
 	for (auto groups = g_pending_groups.exchange(0, std::memory_order_acq_rel); groups != 0; groups &= groups - 1) {
 		const auto group = static_cast<uint64_t>(std::countr_zero(groups));
@@ -54,6 +56,15 @@ inline void Publish() {
 				g_bits[word].fetch_or(bits, std::memory_order_release);
 		}
 	}
+}
+
+// Set at the next Publish (whatever thread): a region whose kept pages (UploadHeap) the guest can change unseen, visited
+// again once guest writes can reach the commands after it, not at every BDA preparation of the same epoch.
+inline void MarkAfterPublish(uint64_t region) {
+	const auto word = region / 64;
+	g_pending[word].fetch_or(uint64_t {1} << (region % 64), std::memory_order_acq_rel);
+	g_pending_words[word / 64].fetch_or(uint64_t {1} << (word % 64), std::memory_order_acq_rel);
+	g_pending_groups.fetch_or(uint64_t {1} << (word / 64), std::memory_order_release);
 }
 
 inline void MarkAll() {

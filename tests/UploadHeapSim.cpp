@@ -2,7 +2,8 @@
 //   clang++ -std=c++20 -O2 -mavx2 -mbmi2 -DKYTY_PLATFORM=KYTY_PLATFORM_LINUX -DKYTY_COMPILER=KYTY_COMPILER_CLANG \
 //     -DKYTY_BUILD=KYTY_BUILD_RELEASE -Isrc -Isrc/local -I3rdparty/fmt/include -I3rdparty/magic_enum/include/magic_enum \
 //     -I<dir with cmake_config.h> -DFMT_HEADER_ONLY tests/UploadHeapSim.cpp -o upload-heap-sim -lpthread
-//   ./upload-heap-sim marked; ./upload-heap-sim unmarked; SIM_BROKEN=1 ./upload-heap-sim marked (must report mismatches)
+//   ./upload-heap-sim marked; ./upload-heap-sim unmarked (random ranges: with the hot-page rule few pages are kept here,
+//   so SIM_BROKEN no longer fails; the protocol tests are UploadHeapAdversarial.cpp and lab membench/*-adversarial)
 // Simulation of the UploadHeap tracking change (RegionManager::ForEachCpuUploadRange) with real page protection:
 // writers store into a 4 MiB tracker region while an uploader copies CPU-dirty pages to a "GPU" shadow; a write fault
 // (SIGSEGV on a write-protected page) marks the page CPU-dirty as GpuResourceManager::HandleFault does. At each
@@ -121,7 +122,11 @@ int main(int argc, char** argv) {
 	for (int round = 0; round < 60; round++) {
 		// Concurrent phase: uploads of random ranges, a few epochs.
 		for (int i = 0; i < 4000; i++) {
-			if (i % 500 == 0) t_epoch++;
+			if (i % 500 == 0) {
+				t_epoch++;
+				UploadHeap::Publish(); // (a submission taken)
+			}
+			if (i % 1000 == 0) UploadHeap::g_frame.fetch_add(1); // (a frame boundary)
 			const uint64_t first = rng() % (TRACKER_REGION_SIZE / TRACKER_PAGE_SIZE);
 			const uint64_t count = 1 + rng() % std::min<uint64_t>(64, TRACKER_REGION_SIZE / TRACKER_PAGE_SIZE - first);
 			upload(first * TRACKER_PAGE_SIZE, count * TRACKER_PAGE_SIZE, true);
@@ -129,7 +134,10 @@ int main(int argc, char** argv) {
 		// Checkpoint: writers quiet, a new epoch, one full upload; the shadow must equal memory.
 		g_pause = true;
 		while (g_paused.load() != Writers) std::this_thread::yield();
-		if (std::getenv("SIM_BROKEN") == nullptr) t_epoch++; // (negative control: no new epoch -> stale copies kept)
+		if (std::getenv("SIM_BROKEN") == nullptr) { // (negative control: no new epoch -> stale copies kept)
+			t_epoch++;
+			UploadHeap::Publish();
+		}
 		upload(0, TRACKER_REGION_SIZE, true);
 		for (uint64_t page = 0; page < TRACKER_REGION_SIZE; page += TRACKER_PAGE_SIZE)
 			if (std::memcmp(gpu.data() + page, reinterpret_cast<const void*>(g_base + page), TRACKER_PAGE_SIZE) != 0) mismatches++;
@@ -179,7 +187,7 @@ int main(int argc, char** argv) {
 	            marked ? "marked" : "unmarked", (unsigned long long)uploads, (unsigned long long)copied_pages,
 	            (unsigned long long)g_faults[0].load(), (unsigned long long)g_faults[1].load(),
 	            (unsigned long long)g_protect_calls[0].load(), (unsigned long long)g_protect_calls[1].load(),
-	            (unsigned long long)UploadHeap::g_kept_pages.load(), (unsigned long long)UploadHeap::g_deduped_pages.load(),
+	            (unsigned long long)UploadHeap::g_kept_copies.load(), (unsigned long long)UploadHeap::g_deduped_pages.load(),
 	            (unsigned long long)UploadHeap::g_gpu_taken_pages.load(), (unsigned long long)gpu_writes,
 	            (unsigned long long)mismatches);
 	return mismatches == 0 ? 0 : 1;

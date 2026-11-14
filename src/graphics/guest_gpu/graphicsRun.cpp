@@ -586,6 +586,10 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4();
+	} else if (Spec::Current() == nullptr) { // (a speculation's commit publishes)
+		// Found valid: the guest released the packet, as a satisfied WAIT_REG_MEM; what it wrote before (the commands
+		// after it and their data, in pages the commands before it read) reaches the commands after it.
+		BdaDirtyRegions::Publish();
 	}
 }
 
@@ -1023,6 +1027,7 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	BdaDirtyRegions::Publish();
 	if (submission.type == SubmissionType::FrameBoundary) {
+		UploadHeap::g_frame.fetch_add(1, std::memory_order_acq_rel); // (KYTY_NATIVE_MEM=3: kept pages' frames)
 		EXIT_IF(submission.started || submission.queue_id != 0);
 		Common::LockGuard lock(m_queue_mutex);
 		EXIT_IF(submission.frame_epoch != m_consumed_frame);
