@@ -44,6 +44,18 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
     SetSurfaceProperties();
 
+    // bb-alttab: a minimized window (Alt+Tab out of fullscreen) has a 0x0 surface. A swapchain
+    // made then (the FSR 3 FG one accepted it) stayed 0x0 after the window came back, because the
+    // window's own size never changed: black screen with sound. Make none now; the presenter
+    // skips frames until the surface has a size again and then makes it (SurfaceChanged()).
+    if (extent.width == 0 || extent.height == 0) {
+        needs_recreation = true;
+        LOG_INFO(Render_Vulkan, "Swapchain not made: the surface is 0x0 (window minimized), "
+                                "waiting for it to come back ({}x{} window)",
+                 width, height);
+        return;
+    }
+
     const std::array queue_family_indices = {
         instance.GetGraphicsQueueFamilyIndex(),
         instance.GetPresentQueueFamilyIndex(),
@@ -93,6 +105,25 @@ void Swapchain::Recreate(u32 width_, u32 height_) {
     LOG_DEBUG(Render_Vulkan, "Recreate the swapchain: width={} height={} HDR={}", width_, height_,
               needs_hdr);
     Create(width_, height_);
+    if (swapchain) {
+        LOG_INFO(Render_Vulkan, "Swapchain made {}x{} (window {}x{}, HDR {}, FSR 3 FG {})",
+                 extent.width, extent.height, width_, height_, needs_hdr, BB::FG::Fsr3Active());
+    }
+}
+
+bool Swapchain::SurfaceChanged() const {
+    const auto [result, caps] = instance.GetPhysicalDevice().getSurfaceCapabilitiesKHR(surface);
+    if (result != vk::Result::eSuccess) {
+        return !swapchain;
+    }
+    const vk::Extent2D cur = caps.currentExtent;
+    if (cur.width == std::numeric_limits<u32>::max()) {
+        return !swapchain; // the surface takes the swapchain's size
+    }
+    if (cur.width == 0 || cur.height == 0) {
+        return false; // still minimized: nothing to make yet
+    }
+    return !swapchain || cur.width != extent.width || cur.height != extent.height;
 }
 
 void Swapchain::SetHDR(bool hdr) {
@@ -113,6 +144,10 @@ void Swapchain::SetHDR(bool hdr) {
 }
 
 bool Swapchain::AcquireNextImage() {
+    if (!swapchain) {
+        needs_recreation = true;
+        return false;
+    }
     vk::Device device = instance.GetDevice();
     vk::Result result =
         BB::FG::Fsr3Active()
@@ -141,6 +176,10 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
+    if (!swapchain) {
+        needs_recreation = true;
+        return false;
+    }
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],

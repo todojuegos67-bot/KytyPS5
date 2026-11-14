@@ -1574,9 +1574,27 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     };
 
-    // Recreate the swapchain if the window was resized.
-    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+    // Recreate the swapchain if the window was resized, or (bb-alttab) if the surface changed
+    // size without the window doing so: minimized and back (Alt+Tab), exclusive fullscreen lost.
+    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight() ||
+        swapchain.SurfaceChanged()) {
+        const bool was_usable = swapchain.IsUsable();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        if (!was_usable && swapchain.IsUsable()) {
+            BB::Upscale::Checkpoint(fmt::format(
+                "[alttab] window back: swapchain made again {}x{} after {} frames skipped",
+                swapchain.GetExtent().width, swapchain.GetExtent().height, bb_minimized_skips));
+            bb_minimized_skips = 0;
+        }
+    }
+    if (!swapchain.IsUsable()) {
+        // bb-alttab: minimized (0x0 surface): no swapchain to present to; the game keeps running.
+        if (bb_minimized_skips++ == 0) {
+            BB::Upscale::Checkpoint("[alttab] window minimized (0x0 surface): frames not shown "
+                                    "until it is back");
+        }
+        free_frame();
+        return;
     }
 
     // bb-clean-021-bbport: Supermedo's frame generation present loop (DLSS-G): the generated

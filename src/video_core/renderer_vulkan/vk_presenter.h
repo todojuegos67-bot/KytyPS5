@@ -181,6 +181,7 @@ private:
     std::atomic<u32> bb_sec_cut{0}, bb_sec_hudless{0}, bb_sec_hudless_failed{0};
     std::atomic<u32> bb_sec_game{0}, bb_sec_generated_made{0}, bb_sec_generated_shown{0},
         bb_sec_presents{0};
+    u32 bb_minimized_skips = 0; // bb-alttab: frames not shown while minimized
     std::chrono::steady_clock::time_point bb_sec_start{};
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;

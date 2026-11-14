@@ -75,6 +75,14 @@ public:
         return frame_index;
     }
 
+    /// bb-alttab: true when a swapchain exists (none while the window is minimized)
+    bool IsUsable() const {
+        return static_cast<bool>(swapchain);
+    }
+
+    /// bb-alttab: true when the surface has a size and the swapchain is missing or of another size
+    bool SurfaceChanged() const;
+
     vk::Extent2D GetExtent() const {
         return extent;
     }
