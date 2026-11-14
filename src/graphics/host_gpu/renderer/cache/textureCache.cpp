@@ -643,6 +643,56 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
 	return id;
 }
 
+// KYTY_CUBE_SHADOW_FIX (on unless 0): a layered shadow pool the GPU rendered (the 384x384x360 D16 cube pool, written as
+// R16 storage by a compute pass and then sampled with a depth compare again) switches depth <-> colour with a full copy
+// both ways (bit-exact: D16 and R16 through a buffer). The image it leaves stayed parked one flip only: the next switch,
+// seconds later in a burst of them, made a new 135 MiB image (and its views) each time. Now the one it leaves stays
+// parked as its twin for CubeTwinKeep collector runs (taken back at the next switch, copied over whole as before;
+// freed first when video memory runs short). Contents are handled as before: only the image's lifetime changes.
+static bool CubeShadowFixOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CUBE_SHADOW_FIX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+static constexpr uint64_t CubeTwinKeep = 1800;
+
+// KYTY_SHADOW_ARRAY_ONCE (off unless 1; needs KYTY_CUBE_SHADOW_FIX): the twin of a depth <-> colour shadow pool never
+// expires. Field logs: the same pool address got a new 135 MiB twin (and its views) again after each idle gap longer
+// than CubeTwinKeep collector runs (e.g. 0x3e9f00000: twin made at flip ~1119, made again at 4619). With this, each
+// pool address gets its two Vulkan images once; the twin goes only with its guest memory (UnmapMemory) or when video
+// memory runs short (ReclaimImageMemory), as before. Contents are handled exactly as before (the whole copy at each
+// switch stays: a D16 image has no R16 view in Vulkan, a depth format is view-compatible only with itself).
+static bool ShadowArrayOnceOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SHADOW_ARRAY_ONCE");
+		const bool  set   = value != nullptr && value[0] == '1';
+		std::printf("Shadow array once: %s\n", set ? (CubeShadowFixOn() ? "on (KYTY_SHADOW_ARRAY_ONCE=1: a depth <-> colour "
+		                                                                  "shadow pool's twin never expires)"
+		                                                                : "off (needs KYTY_CUBE_SHADOW_FIX)")
+		                                       : "off (KYTY_SHADOW_ARRAY_ONCE=1: on)");
+		std::fflush(stdout);
+		return set && CubeShadowFixOn();
+	}();
+	return on;
+}
+// (Far from overflowing RunGarbageCollector's tick + keep.)
+static constexpr uint64_t ShadowOnceKeep = UINT64_MAX >> 2u;
+namespace ShadowOnceStats {
+static std::atomic<uint64_t> made {0};     // twins made new (the first switch at an address, or after a reclaim)
+static std::atomic<uint64_t> reused {0};   // switches that took the parked twin back
+static std::atomic<uint64_t> avoided {0};  // of those, twins older than CubeTwinKeep: a new image without the flag
+static std::atomic<uint64_t> reclaimed {0}; // twins freed for video memory (ReclaimImageMemory)
+static void Report(const char* why) {
+	std::printf("Shadow array once: %s; twins made %llu, reused %llu, recreations avoided %llu, freed for video memory "
+	            "%llu\n",
+	            why, static_cast<unsigned long long>(made.load()), static_cast<unsigned long long>(reused.load()),
+	            static_cast<unsigned long long>(avoided.load()), static_cast<unsigned long long>(reclaimed.load()));
+	std::fflush(stdout);
+}
+} // namespace ShadowOnceStats
+
 // The images no draw or dispatch used for 16 flips whose bytes guest memory holds (none the GPU wrote: one used again is
 // made again from them) go at once, least recently used first, until twice the room asked for (at least 256 MiB) is
 // freed (`all`: every one, and those the GPU wrote, their bytes downloaded to guest memory first, as the collector takes
@@ -665,6 +715,10 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 		if (item.second.keep <= 1 || freed >= goal) return false;
 		if (const auto* twin = m_slot_images.try_get(item.second.id)) freed += twin->AccountedSize();
 		twins.push_back(item.second.id);
+		if (item.second.keep == ShadowOnceKeep) {
+			ShadowOnceStats::reclaimed.fetch_add(1, std::memory_order_relaxed);
+			ShadowOnceStats::Report("a twin was freed for video memory");
+		}
 		return true;
 	});
 	if (m_gc_tick >= UnusedTicks) {
@@ -1608,20 +1662,6 @@ bool TextureCache::R32DepthCompareSupported() const {
 	return supported;
 }
 
-// KYTY_CUBE_SHADOW_FIX (on unless 0): a layered shadow pool the GPU rendered (the 384x384x360 D16 cube pool, written as
-// R16 storage by a compute pass and then sampled with a depth compare again) switches depth <-> colour with a full copy
-// both ways (bit-exact: D16 and R16 through a buffer). The image it leaves stayed parked one flip only: the next switch,
-// seconds later in a burst of them, made a new 135 MiB image (and its views) each time. Now the one it leaves stays
-// parked as its twin for CubeTwinKeep collector runs (taken back at the next switch, copied over whole as before;
-// freed first when video memory runs short). Contents are handled as before: only the image's lifetime changes.
-static bool CubeShadowFixOn() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_CUBE_SHADOW_FIX");
-		return value == nullptr || value[0] != '0';
-	}();
-	return on;
-}
-static constexpr uint64_t CubeTwinKeep = 1800;
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
@@ -1724,6 +1764,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		(void)GrowImageToLayers(info, cached.info.resources.layers);
 	}
 	info.htile_clear_mask = 0;
+	// (KYTY_SHADOW_ARRAY_ONCE: how long the twin at this address has been parked, before TakeParkedImage drops it.)
+	uint64_t parked_for = 0;
+	bool     twin_held  = false;
+	if (const auto held = m_parked.find(info.data.address); held != m_parked.end() && held->second.keep > 1) {
+		twin_held  = true;
+		parked_for = m_gc_tick >= held->second.tick ? m_gc_tick - held->second.tick : 0;
+	}
 	auto replacement_id   = TakeParkedImage(info);
 	const bool from_parked = static_cast<bool>(replacement_id);
 	if (!replacement_id) replacement_id = InsertImage(info);
@@ -1816,7 +1863,21 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			std::fflush(stdout);
 		}
 	}
-	ParkImage(cached_id, keep_twin ? CubeTwinKeep : 1);
+	const bool once = keep_twin && ShadowArrayOnceOn();
+	if (once) {
+		if (!from_parked) {
+			ShadowOnceStats::made.fetch_add(1, std::memory_order_relaxed);
+		} else if (twin_held) {
+			ShadowOnceStats::reused.fetch_add(1, std::memory_order_relaxed);
+			// (Without the flag the collector retired it once tick > parked tick + CubeTwinKeep.)
+			if (parked_for > CubeTwinKeep) {
+				ShadowOnceStats::avoided.fetch_add(1, std::memory_order_relaxed);
+				ShadowOnceStats::Report("a twin parked longer than the old limit was taken back");
+			}
+		}
+		if (!from_parked) ShadowOnceStats::Report("a twin was made");
+	}
+	ParkImage(cached_id, once ? ShadowOnceKeep : keep_twin ? CubeTwinKeep : 1);
 	return replacement_id;
 }
 
