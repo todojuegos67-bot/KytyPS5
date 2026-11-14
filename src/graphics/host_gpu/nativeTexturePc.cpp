@@ -391,7 +391,9 @@ bool Materialize(uint64_t b, uint64_t e, bool demote = false) {
 		const uint64_t n = c.end - cb;
 		std::vector<uint8_t> bytes;
 		const uint8_t*       data = nullptr;
-		if (c.host) {
+		if (demote && KeepGuest()) {
+			// (Level 1 demotion: guest memory already holds these bytes; no read-back, no write.)
+		} else if (c.host) {
 			data = c.host->data() + c.offset;
 		} else {
 			bytes.resize(n); // (zero chunks: zeros)
