@@ -288,7 +288,7 @@ void HudFg::Overlay(vk::CommandBuffer cmd, vk::ImageView rgba_view, vk::Extent2D
 
 bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::ImageView raw_hud,
                        vk::ImageView raw_hudless, vk::Image target, vk::ImageView target_rgba,
-                       vk::Extent2D extent, bool bgra) {
+                       vk::Extent2D extent, bool bgra, bool raw_swapped) {
     if (!frame_view || !raw_hud || !raw_hudless || !target || !target_rgba || extent.width == 0 ||
         extent.height == 0 || !Init()) {
         ++sec_fix_skipped;
@@ -360,15 +360,12 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
             }
         }
         fix_ok = fix_pipe && fix_counts;
-        const char* grade_env = std::getenv("BB_HUDLESS_GRADE");
-        const bool grade_on = grade_env == nullptr || grade_env[0] != '0';
         BB::Upscale::Checkpoint(
-            fix_ok ? (grade_on ? "[fsr3-hudless] HUD-less image matched to the finished frame "
-                                 "outside the HUD (bb_hudless_fix.comp); under the HUD the finished "
-                                 "frame's colours with the HUD taken out (BB_HUDLESS_GRADE=0 off)"
-                               : "[fsr3-hudless] HUD-less image matched to the finished frame "
-                                 "outside the HUD (bb_hudless_fix.comp); under the HUD the "
-                                 "post-processed copy (BB_HUDLESS_GRADE=0)")
+            fix_ok ? "[fsr3-hudless] HUD-less image matched to the finished frame outside the HUD "
+                     "(bb_hudless_fix.comp); under the HUD: the post-processed copy when its red / "
+                     "blue order was corrected (BB_HUDLESS_SWAP), else the finished frame's "
+                     "colours with the HUD taken out (BB_HUDLESS_GRADE: unset auto, 1 always, 0 "
+                     "never)"
                    : "[fsr3-hudless] fix pass unavailable: HUD-less image as post-processed");
     }
     if (!fix_ok) {
@@ -439,13 +436,17 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
                                .descriptorType = vk::DescriptorType::eStorageBuffer,
                                .pBufferInfo = &c_info},
     };
-    // bb-artifact-fix: BB_HUDLESS_GRADE (default on): under the HUD the HUD-less image gets the
-    // finished frame's colours (bb_hudless_fix.comp) instead of the un-graded copy, which FSR 3
-    // moved with the scene into orange HUD-shaped patches in the generated frames.
-    static const bool grade_hud = [] {
+    // bb-artifact-fix: BB_HUDLESS_GRADE: under the HUD the HUD-less image gets the finished
+    // frame's colours scaled by raw without / with the HUD (bb_hudless_fix.comp) instead of the
+    // post-processed copy. Unset (auto): only when the copy's red / blue order was not corrected
+    // (`raw_swapped`: the copy itself then has the frame's colours, exactly); 1 always; 0 never.
+    static const int grade_mode = [] {
         const char* v = std::getenv("BB_HUDLESS_GRADE");
-        return v == nullptr || v[0] != '0';
+        if (v != nullptr && v[0] == '0') return 0;
+        if (v != nullptr && v[0] == '1') return 1;
+        return 2;
     }();
+    const bool grade_hud = grade_mode == 1 || (grade_mode == 2 && !raw_swapped);
     struct {
         u32 size[4];
         float obj[4];

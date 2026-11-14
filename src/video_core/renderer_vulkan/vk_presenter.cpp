@@ -1167,6 +1167,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     vk::Extent2D bb_sr_size{};
     vk::ImageView bb_hudless_scene{};
     vk::ImageView bb_hud_raw{}; // bb-fsr3-hudless: the UI target with the HUD (raw copy)
+    bool bb_hudless_swapped = false; // bb-artifact-fix: both raw views swap red and blue
     frame->fg = {};
     // bb-clean-021-bbport: Supermedo's HUD cut (bb_ui_cut.h). A frame upscaled at its first UI
     // draw has an output-size host copy of this display buffer (the game's display pass drew it,
@@ -1196,6 +1197,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         frame->fg = bb_display.fg;
         bb_hudless_scene = bb_display.hudless_view;
         bb_hud_raw = bb_display.hud_view;
+        bb_hudless_swapped = bb_display.hudless_swapped;
         bb_upscaled = true;
         ++bb_sec_cut;
     } else if (BB::Upscale::Capture()) {
@@ -1335,7 +1337,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &written});
         bb_hud_fg->FixHudless(cmdbuf, frame->image_view, bb_hud_raw, bb_hudless_scene,
                               frame->hudless_image, frame->hudless_rgba_view,
-                              {frame->width, frame->height}, fmt == vk::Format::eB8G8R8A8Unorm);
+                              {frame->width, frame->height}, fmt == vk::Format::eB8G8R8A8Unorm,
+                              bb_hudless_swapped);
     }
 
     // bb-clean: the HUD as a separate UI layer for frame generation (bb_hud_fg.h): built from the

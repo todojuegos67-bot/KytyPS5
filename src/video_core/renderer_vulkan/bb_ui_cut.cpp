@@ -227,21 +227,22 @@ void UiCut::Destroy(OwnImage& img) {
 }
 
 vk::ImageView UiCut::Mirror(OwnImage& img, vk::Format format, vk::ImageAspectFlags aspect,
-                            bool alpha_one) {
+                            bool alpha_one, bool swap_rb) {
     for (const auto& v : img.views) {
-        if (v.format == format && v.alpha_one == alpha_one) return v.view;
+        if (v.format == format && v.alpha_one == alpha_one && v.swap_rb == swap_rb) return v.view;
     }
     auto [r, view] = instance.GetDevice().createImageView({
         .image = img.image,
         .viewType = vk::ImageViewType::e2D,
         .format = format,
-        .components = {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
+        .components = {swap_rb ? vk::ComponentSwizzle::eB : vk::ComponentSwizzle::eIdentity,
                        vk::ComponentSwizzle::eIdentity,
+                       swap_rb ? vk::ComponentSwizzle::eR : vk::ComponentSwizzle::eIdentity,
                        alpha_one ? vk::ComponentSwizzle::eOne : vk::ComponentSwizzle::eIdentity},
         .subresourceRange = {aspect, 0, 1, 0, 1},
     });
     if (r != vk::Result::eSuccess) return {};
-    img.views.push_back({format, alpha_one, view});
+    img.views.push_back({format, alpha_one, view, swap_rb});
     return view;
 }
 
@@ -881,6 +882,7 @@ void UiCut::CaptureHudlessUi() {
     }
     // bb-fsr3-hudless: its partner, the UI target once the HUD is drawn (RedirectSampled).
     hud_ok[hudless_next].store(false, std::memory_order_relaxed);
+    raw_swap[hudless_next].store(false, std::memory_order_relaxed);
     if (auto& hs = hud_images[hudless_next];
         hs.width != ui_width || hs.height != ui_height || hs.format != ui_format) {
         scheduler.Finish();
@@ -1005,12 +1007,43 @@ bool UiCut::RedirectDepth(VideoCore::ImageId depth, Target& target) {
     return true;
 }
 
-bool UiCut::RedirectSampled(VideoCore::ImageId image, vk::Format format, vk::ImageView& view,
+bool UiCut::RedirectSampled(VideoCore::ImageId image, vk::Format format,
+                            const AmdGpu::CompMapping& mapping, vk::ImageView& view,
                             vk::ImageLayout& layout) {
     if (!display_redirect || image != ui_color) return false;
     if (!ui_read_barrier) {
         ui_read_barrier = true;
         scheduler.EndRendering();
+        // bb-artifact-fix: the game's display pass reads the UI target through its T#'s dst_sel
+        // (the texture cache's view applies it). The HUD-less copies are the UI target's raw
+        // memory, viewed with identity: when that mapping swaps red and blue, the HUD-less image
+        // FSR 3 / DLSS-G got had red and blue swapped against the back buffer (orange where the
+        // graded scene is blue; the "[fsr3-hudless]" mismatch on ~97% of the pixels). FSR 3
+        // warped those pixels under the HUD (and under effects drawn after the cut) with the
+        // scene: orange HUD-shaped bars / smears in generated frames. BB_HUDLESS_SWAP: auto
+        // (default: from that mapping), 1 always, 0 never (as before).
+        static const int swap_mode = [] {
+            const char* v = std::getenv("BB_HUDLESS_SWAP");
+            if (v != nullptr && v[0] == '0') return 0;
+            if (v != nullptr && v[0] == '1') return 1;
+            return 2;
+        }();
+        const bool mapped_swap = mapping.r == AmdGpu::CompSwizzle::Blue &&
+                                 mapping.b == AmdGpu::CompSwizzle::Red;
+        const bool swap = swap_mode == 1 || (swap_mode == 2 && mapped_swap);
+        if (display_hudless >= 0 && display_hudless < int(HudlessSlots)) {
+            raw_swap[static_cast<u32>(display_hudless)].store(swap, std::memory_order_release);
+        }
+        static bool said = false;
+        if (!said) {
+            said = true;
+            BB::Upscale::Checkpoint(fmt::format(
+                "[fsr3-hudless] display pass reads the UI target with dst_sel {} {} {} {} "
+                "(4 R 5 G 6 B 7 A, 0/1 zero/one): HUD-less copies viewed {} (BB_HUDLESS_SWAP={})",
+                u32(mapping.r), u32(mapping.g), u32(mapping.b), u32(mapping.a),
+                swap ? "with red and blue swapped" : "as stored",
+                swap_mode == 0 ? "0" : swap_mode == 1 ? "1" : "auto"));
+        }
         // bb-fsr3-hudless: the UI target as the display pass first reads it (HUD drawn), copied
         // beside this frame's HUD-less copy: the presenter matches the HUD-less image to the
         // finished frame wherever the two copies are equal (bb_hudless_fix.comp).
@@ -1109,14 +1142,16 @@ bool UiCut::DisplayOverride(VAddr address, vk::Format format, Display& out) {
     out.fg = d.fg;
     if (d.hudless >= 0 && hudless_images[d.hudless].image) {
         auto& h = hudless_images[d.hudless];
+        const bool swap = raw_swap[d.hudless].load(std::memory_order_acquire);
         out.hudless = h.image;
         out.hudless_view = Mirror(h, WithSrgb(h.format, IsSrgb(format)),
-                                  vk::ImageAspectFlagBits::eColor, true);
+                                  vk::ImageAspectFlagBits::eColor, true, swap);
+        out.hudless_swapped = swap;
         auto& hh = hud_images[d.hudless];
         if (hud_ok[d.hudless].load(std::memory_order_acquire) && hh.image &&
             hh.width == h.width && hh.height == h.height && hh.format == h.format) {
             out.hud_view = Mirror(hh, WithSrgb(hh.format, IsSrgb(format)),
-                                  vk::ImageAspectFlagBits::eColor, true);
+                                  vk::ImageAspectFlagBits::eColor, true, swap);
         }
     }
     // Shown once: the next display pass decides again.

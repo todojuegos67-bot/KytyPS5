@@ -1040,7 +1040,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // bb-clean-021-bbport (Supermedo's RedirectSampled): the display pass reads the
             // upscaled UI image instead of the render-size UI target.
             if (BB::UiCut::Active() && !is_storage && bb_cut.RedirectsSampled(image_id)) {
-                bb_cut.RedirectSampled(image_id, image_view.info.format, bb_view, bb_layout);
+                bb_cut.RedirectSampled(image_id, image_view.info.format, image_view.info.mapping,
+                                       bb_view, bb_layout);
             } else if (BB::UiCut::Active() && !is_storage) {
                 // bb-hud-layer: the HUD composite pass reads a transparent layer (AfterDraw).
                 bb_cut.SubstituteLayer(image_id, bb_view, bb_layout);

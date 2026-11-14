@@ -37,9 +37,11 @@ public:
     // R8G8B8A8 storage view `target_rgba` of it) equal to the finished frame (`frame_view`,
     // GENERAL, UNORM 8-bit) wherever the raw UI target with the HUD (`raw_hud`) equals the raw
     // copy without it (`raw_hudless`), both SHADER_READ_ONLY. Leaves `target` SHADER_READ_ONLY.
+    // `raw_swapped`: the raw views swap red and blue (bb-artifact-fix, BB_HUDLESS_SWAP); the
+    // ratio grade under the HUD (BB_HUDLESS_GRADE) then defaults off.
     bool FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::ImageView raw_hud,
                     vk::ImageView raw_hudless, vk::Image target, vk::ImageView target_rgba,
-                    vk::Extent2D extent, bool bgra);
+                    vk::Extent2D extent, bool bgra, bool raw_swapped = false);
     // Once a second (presenter): "[fsr3-hudless] ..." (HUD pixels, mismatching pixels fixed).
     void LogHudlessSecond(double seconds);
 

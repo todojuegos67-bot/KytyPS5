@@ -104,7 +104,10 @@ public:
     [[nodiscard]] bool RedirectsSampled(VideoCore::ImageId image) const {
         return display_redirect && image == ui_color;
     }
-    bool RedirectSampled(VideoCore::ImageId image, vk::Format format, vk::ImageView& view,
+    // `mapping`: the component mapping of the game's own view (its T# dst_sel), which the
+    // redirected view does not apply (bb-artifact-fix: the HUD-less copies are viewed with it).
+    bool RedirectSampled(VideoCore::ImageId image, vk::Format format,
+                         const AmdGpu::CompMapping& mapping, vk::ImageView& view,
                          vk::ImageLayout& layout);
     // The UI is not jittered.
     [[nodiscard]] bool UiPhase() const {
@@ -126,6 +129,9 @@ public:
         // bb-fsr3-hudless: the UI target with the HUD drawn, copied as the display pass started
         // (same size, format and view as `hudless_view`; SHADER_READ_ONLY), null when none.
         vk::ImageView hud_view{};
+        // bb-artifact-fix: `hudless_view` / `hud_view` swap red and blue (the display pass's
+        // view of the UI target does: BB_HUDLESS_SWAP).
+        bool hudless_swapped = false;
     };
     bool DisplayOverride(VAddr address, vk::Format format, Display& display);
 
@@ -146,6 +152,7 @@ private:
             vk::Format format;
             bool alpha_one;
             vk::ImageView view;
+            bool swap_rb = false;
         };
         std::vector<View> views;
     };
@@ -153,7 +160,7 @@ private:
                 bool mutable_format);
     void Destroy(OwnImage& img);
     vk::ImageView Mirror(OwnImage& img, vk::Format format, vk::ImageAspectFlags aspect,
-                         bool alpha_one = false);
+                         bool alpha_one = false, bool swap_rb = false);
     bool RunScaled(SceneDepth& scene);
     bool RunNativeFg(SceneDepth& scene, VideoCore::ImageId color, VideoCore::ImageId depth);
     void RunUiOnly(VideoCore::ImageId color, VideoCore::ImageId depth);
@@ -213,6 +220,9 @@ private:
     // bb-fsr3-hudless: per slot, the UI target with the HUD (copied at the display pass).
     OwnImage hud_images[HudlessSlots];
     std::array<std::atomic<bool>, HudlessSlots> hud_ok{};
+    // bb-artifact-fix: per slot, the display pass's view of the UI target swaps red and blue
+    // (its T# dst_sel; the copies are raw memory order, so they are viewed swapped too).
+    std::array<std::atomic<bool>, HudlessSlots> raw_swap{};
     u32 hudless_next = 0;
     vk::ImageView ui_depth_view{};
     u32 ui_width = 0, ui_height = 0;
