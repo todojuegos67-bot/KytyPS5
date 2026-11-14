@@ -1,5 +1,6 @@
 #include "local/skip-shader.h"
 #include "local/sync-stats.h"
+#include "local/write-watch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "local/anti-lag.h"
 
@@ -1027,7 +1028,7 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	BdaDirtyRegions::Publish();
 	if (submission.type == SubmissionType::FrameBoundary) {
-		UploadHeap::g_frame.fetch_add(1, std::memory_order_acq_rel); // (KYTY_NATIVE_MEM=3: kept pages' frames)
+		WriteWatch::Tick(UploadHeap::g_frame.fetch_add(1, std::memory_order_acq_rel) + 1); // (KYTY_NATIVE_MEM=3: kept pages' frames; KYTY_WRITE_WATCH log)
 		EXIT_IF(submission.started || submission.queue_id != 0);
 		Common::LockGuard lock(m_queue_mutex);
 		EXIT_IF(submission.frame_epoch != m_consumed_frame);

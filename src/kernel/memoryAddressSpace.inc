@@ -1163,6 +1163,14 @@ public:
 #endif
 	}
 
+	// KYTY_WRITE_WATCH (local/write-watch.h): the backing offset of the view `vaddr` is in, or UINT64_MAX when no view
+	// of the section maps it (private memory, unmapped).
+	uint64_t BackingOffsetOf(uint64_t vaddr) {
+		auto     lock = MapReadLock();
+		MapEntry entry {};
+		return FindContainingUnlocked(vaddr, 1, &entry) ? entry.backing_offset + (vaddr - entry.vaddr) : UINT64_MAX;
+	}
+
 	bool Contains(uint64_t vaddr, uint64_t size) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -2072,6 +2080,7 @@ public:
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+	uint64_t BackingOffsetOf(uint64_t vaddr) { return m_backing->BackingOffsetOf(vaddr); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		GuestBackingMutation mutation;

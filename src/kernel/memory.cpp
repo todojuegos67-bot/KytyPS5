@@ -281,6 +281,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
 
+#include "local/write-watch.h"
 #include "memoryAddressSpace.inc"
 
 void ReleaseFrameGenAddressHole() {
@@ -4793,6 +4794,14 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	// KYTY_WRITE_WATCH (local/write-watch.h): which memory the change is on (a view of the section: the 0x1A risk).
+	if (WriteWatch::Requested() && g_guest_address_space != nullptr) {
+		const uint64_t offset = g_guest_address_space->BackingOffsetOf(vaddr);
+		WriteWatch::Note(offset == UINT64_MAX              ? WriteWatch::Private
+		                 : offset >= PhysicalMemory::Size() ? WriteWatch::SectionFlexible
+		                                                    : WriteWatch::SectionDirect,
+		                 size);
+	}
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
