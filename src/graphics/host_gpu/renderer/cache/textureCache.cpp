@@ -5756,7 +5756,13 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid map range\n");
 	}
-	NativeTex::Forget(address, size); // (new memory there)
+	// KYTY_NATIVE_TEX: B's commit hook declares texture memory BEFORE the engine maps it (ResizePages op 0 runs after the
+	// notification): the ranges stay (dropping them here emptied the set - nothing was ever routed, field log
+	// 20261114-035638); their no-access watchers are applied to the new mapping instead.
+	if (NativeTex::Overlaps(address, size)) {
+		m_page_manager.SyncProtection(address, size);
+		NativeTex::NoteMapped(size);
+	}
 	std::scoped_lock lock {m_lock};
 	// Memory mapped under a cached image replaces its contents without a CPU write through the
 	// watched pages (the new pages may have been filled through another mapping).

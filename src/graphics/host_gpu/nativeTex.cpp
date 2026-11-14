@@ -108,7 +108,7 @@ struct State {
 	std::atomic<uint64_t> fallback[WhyCount] {};
 	std::atomic<uint64_t> fallback_bytes[WhyCount] {};
 	std::atomic<uint64_t> snapshots {0}, snapshot_bytes {0}; // (reads left with the guest's bytes: MaterializeAny)
-	std::atomic<uint64_t> lost {0}, lost_bytes {0}, commits {0}, commit_bytes {0}, decommits {0}, declined {0}, declined_bytes {0};
+	std::atomic<uint64_t> lost {0}, lost_bytes {0}, commits {0}, commit_bytes {0}, decommits {0}, declined {0}, declined_bytes {0}, mapped_under {0}, mapped_under_bytes {0};
 	std::chrono::steady_clock::time_point last_log {};
 };
 
@@ -560,11 +560,12 @@ void Log(bool force) {
 	std::printf("; snapshot reads %llu (%.1f MiB)", static_cast<unsigned long long>(s.snapshots.load()),
 	            static_cast<double>(s.snapshot_bytes.load()) / MiB);
 	std::printf("; lost %llu (%.1f MiB); commits %llu (%.1f MiB undefined until written), decommits %llu; loads declined (not "
-	            "committed texture memory) %llu (%.1f MiB)\n",
+	            "committed texture memory) %llu (%.1f MiB); maps under ranges %llu (%.1f MiB)\n",
 	            static_cast<unsigned long long>(s.lost.load()), static_cast<double>(s.lost_bytes.load()) / MiB,
 	            static_cast<unsigned long long>(s.commits.load()), static_cast<double>(s.commit_bytes.load()) / MiB,
 	            static_cast<unsigned long long>(s.decommits.load()), static_cast<unsigned long long>(s.declined.load()),
-	            static_cast<double>(s.declined_bytes.load()) / MiB);
+	            static_cast<double>(s.declined_bytes.load()) / MiB, static_cast<unsigned long long>(s.mapped_under.load()),
+	            static_cast<double>(s.mapped_under_bytes.load()) / MiB);
 }
 
 // Loader::NativeTex stream callbacks (demonsSoulsNativeTexStream.h).
@@ -978,6 +979,11 @@ void Pump() {
 	}
 	for (const auto& [b, n]: spill) (void)MaterializeHere(b, n, WhySpill, 0, true);
 	Log(false);
+}
+
+void NoteMapped(uint64_t bytes) {
+	S().mapped_under.fetch_add(1, std::memory_order_relaxed);
+	S().mapped_under_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void NoteNativeUpload(uint64_t bytes) {

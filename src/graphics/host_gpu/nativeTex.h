@@ -148,6 +148,8 @@ void Forget(uint64_t addr, uint64_t size);
 void Pump();
 // Counters (the texture cache's native uploads).
 void NoteNativeUpload(uint64_t bytes);
+// A guest mapping made under ranges (their protection applied to it): counted for the log.
+void NoteMapped(uint64_t bytes);
 void NoteFallback(const char* why, uint64_t bytes);
 
 } // namespace NativeTex
