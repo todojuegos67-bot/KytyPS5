@@ -233,6 +233,7 @@ struct State {
     std::unordered_map<u64, std::array<u32, 2>> spark_vs; // vs hash -> draws, with vector
     // bb-mv-fill: end-of-frame copies of the 1-slot ring slots (compose time).
     VideoCore::BufferCache* bc = nullptr;
+    Core::MemoryManager* mem = nullptr; // (review) the slot must still be mapped
     std::vector<BB::MvEngine::OwnSlot> own_tmp;
     // bb-tree-mv (BB_PLAYER_MASK): where the player mask (refine, FSR 3 "player from the real
     // frame") comes from. Vector: class-1 pixels in the centre whose vector differs from
@@ -953,7 +954,7 @@ bool VelSnap(VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler,
 // frame's draws find last frame's transform whenever the object was drawn, in any pass (also a
 // shadow-only draw, or a draw whose V# lookup failed that frame).
 void SnapshotOwnSlots(vk::CommandBuffer cmd) {
-    if (g.bc == nullptr || !BB::MvEngine::SlotsEnabled()) return;
+    if (g.bc == nullptr || g.mem == nullptr || !BB::MvEngine::SlotsEnabled()) return;
     BB::MvEngine::RecentOwnSlots(g.own_tmp);
     u64 made = 0, skipped = 0;
     for (const auto& o : g.own_tmp) {
@@ -962,7 +963,10 @@ void SnapshotOwnSlots(vk::CommandBuffer cmd) {
         const u64 bytes = (o.size + 15) & ~u64(15);
         // (The slot changes only through the ring's DMA, which the GPU thread executes in stream
         // order: at this point its contents, GPU-side or in guest memory, are this frame's.)
-        if (o.size == 0 || o.size > 0x10000 || g.arena_used + bytes > kArenaBytes) {
+        // (review) a ring recorded last frame may since have been unmapped: never let the buffer
+        // cache upload from guest memory that is gone.
+        if (o.size == 0 || o.size > 0x10000 || g.arena_used + bytes > kArenaBytes ||
+            !g.mem->IsValidMapping(o.addr, o.size)) {
             ++skipped;
             continue;
         }
@@ -1101,6 +1105,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                   bool blend, u64 mesh, u64 mesh_base, u32 mesh_index) {
     const auto t0 = std::chrono::steady_clock::now();
     g.bc = &buffer_cache;
+    g.mem = memory;
     const bool effect = blend && g.cur_effect; // bb-mv-fill: additive / premultiplied effect
     const bool strict = BB::MvEngine::StrictEnabled();
     ++g.vs_draws;

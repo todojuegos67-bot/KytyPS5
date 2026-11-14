@@ -240,6 +240,7 @@ void SetHooks(bool installed, const char* detail) {
 void GuestPaletteBegin(u64 model, u64 sink, u64 mesh, u64 bones, u32 consumer) {
     t_cur = {model, sink, mesh, bones, consumer, bones != 0};
     g_guest_begins.fetch_add(1, std::memory_order_relaxed);
+    t_last_pal = 0; // (review) never a previous BonePalette call's palette
     if (bones == 0 || model == 0 || mesh == 0)
         return;
     // bb-mv-fill: the two direct paths of BonePalette 0x21d1080 (twin 0x21d1650 identical) that
