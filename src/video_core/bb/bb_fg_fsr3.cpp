@@ -124,6 +124,23 @@ struct AmdSecond {
     double dt_sum = 0, dt_max = 0;
     uint32_t hudless_given = 0;
 } g_amd;
+
+// bb-trunk-fix: FSR 3 FG depth/camera overrides for A/B (defaults keep the old behaviour).
+// BB_FSR3_DEPTH_INV=0|1|auto (auto = the scene's depth test, as before), BB_FSR3_FAR_INF=1
+// (infinite far: create flag + far FLT_MAX), BB_FSR3_NEARFAR_SWAP=1 (swap the near/far given to
+// prepare), BB_FSR3_VSM=<float> (viewSpaceToMetersFactor, default 1).
+int Fsr3DepthInvOverride() { // -1 auto, 0 forward, 1 inverted
+    static const int v = [] {
+        const char* e = std::getenv("BB_FSR3_DEPTH_INV");
+        if (e == nullptr || std::string(e) == "auto" || *e == 0) return -1;
+        return std::string(e) == "0" ? 0 : 1;
+    }();
+    return v;
+}
+bool Fsr3EnvFlag(const char* name) {
+    const char* e = std::getenv(name);
+    return e != nullptr && *e != 0 && std::string(e) != "0";
+}
 // The frame-generation dispatches the swapchain made (frames interpolated) and how many of them
 // came with FSR's own history reset (its frameID chain broken, or the first after a gap).
 std::atomic<uint32_t> g_amd_dispatches{0}, g_amd_ffx_resets{0};
@@ -350,12 +367,23 @@ bool CreateFrameGeneration(vk::Extent2D display, vk::Extent2D render, vk::Format
     const char* depth = Env("KYTY_FSR3_DEPTH");
     const bool force_inv = depth != nullptr && std::string(depth) == "inverted";
     const bool normal = !force_inv && ((depth != nullptr && std::string(depth) == "normal") || !depth_inverted);
-    create.flags = normal ? 0u
+    const int inv_ovr = Fsr3DepthInvOverride();
+    const bool far_inf_ovr = Fsr3EnvFlag("BB_FSR3_FAR_INF");
+    create.flags = inv_ovr >= 0 ? ((inv_ovr == 1 ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED : 0u) |
+                                   (far_inf_ovr ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE : 0u))
+                   : far_inf_ovr ? ((normal ? 0u : FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED) |
+                                    FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE)
+                   : normal ? 0u
                    : force_inv ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED
                                : (FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
                                   FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE);
     Printf("FSR3 FG: depth %s (KYTY_FSR3_DEPTH=%s)", normal ? "forward" : force_inv ? "inverted (forced, finite far)" : "inverted + infinite",
            depth != nullptr ? depth : "");
+    Printf("FSR3 FG: create flags depth: inverted %d infinite %d (BB_FSR3_DEPTH_INV=%s "
+           "BB_FSR3_FAR_INF=%d)",
+           (create.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED) ? 1 : 0,
+           (create.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE) ? 1 : 0,
+           inv_ovr < 0 ? "auto" : inv_ovr ? "1" : "0", far_inf_ovr ? 1 : 0);
     if (EnvOn("KYTY_FSR3_DEBUG", false)) create.flags |= FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING;
     if (format == vk::Format::eA2B10G10R10UnormPack32 ||
         format == vk::Format::eA2R10G10B10UnormPack32) {
@@ -1120,6 +1148,19 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    ffx_resets, g_amd.restarts, g_amd.gaps, g_amd.input_resets, g_amd.jitter[0],
                    g_amd.jitter[1], g_amd.near_v, g_amd.far_v, g_amd.fov,
                    g_amd.depth_inverted ? "inverted" : "forward");
+            // bb-trunk-fix: the 1.41 pairing counters (guest frame of colour vs depth / camera
+            // vectors / object vectors / HUD-less for each prepare), and frameTimeDelta.
+            Printf("[fg-amd] pairing: prepared %u paired %u off_depth %u off_mv %u off_obj %u "
+                   "off_hudless %u | last c %lld d %lld mv %lld obj %lld hl %lld | dt avg %.2f "
+                   "max %.2f ms | vsm %.3g",
+                   g_amd.prepared, g_amd.paired, g_amd.off_depth, g_amd.off_mv, g_amd.off_obj,
+                   g_amd.off_hudless, static_cast<long long>(g_amd.last_ids[0]),
+                   static_cast<long long>(g_amd.last_ids[1]),
+                   static_cast<long long>(g_amd.last_ids[2]),
+                   static_cast<long long>(g_amd.last_ids[3]),
+                   static_cast<long long>(g_amd.last_ids[4]),
+                   g_amd.prepared ? g_amd.dt_sum / g_amd.prepared : 0.0, g_amd.dt_max,
+                   static_cast<double>(EnvFloat("BB_FSR3_VSM", 1.0f)));
             // (11-12) amd-dyn: the largest multiplier with real x N within the display's target
             // (refresh - refresh^2/3600, as Demon's Souls), changed after 2 seconds agreeing.
             if (Cfg().kind == Kind::Amd && Cfg().dynamic && window > 0.5) {
@@ -1331,7 +1372,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     // 0.92: the game's own far plane when known (as the FSR 3.1 upscaler gets it); Bloodborne's
     // projection is not infinite, and an infinite far linearised FG's depth wrongly
     // (KYTY_FSR3_FAR_INF=1: the old infinite far).
-    static const bool far_inf = EnvOn("KYTY_FSR3_FAR_INF", false);
+    static const bool far_inf = EnvOn("KYTY_FSR3_FAR_INF", false) || Fsr3EnvFlag("BB_FSR3_FAR_INF");
     const float z_far = !far_inf && std::isfinite(inputs->z_far) && inputs->z_far > z_near * 2.0f
                             ? inputs->z_far
                             : FLT_MAX;
@@ -1339,7 +1380,9 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         const char* d = Env("KYTY_FSR3_DEPTH");
         return d != nullptr && std::string(d) == "inverted";
     }();
-    if (inputs->depth_inverted || depth_forced_inv) {
+    const int inv_ovr = Fsr3DepthInvOverride();
+    const bool inv_now = inv_ovr >= 0 ? inv_ovr == 1 : (inputs->depth_inverted || depth_forced_inv);
+    if (inv_now) {
         prepare.cameraNear = z_far;
         prepare.cameraFar = z_near;
     } else {
@@ -1348,7 +1391,10 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     }
     prepare.cameraFovAngleVertical =
         EnvFloat("KYTY_FSR3_FOV", inputs->fov_y > 0.0f ? inputs->fov_y : camera.fov);
-    prepare.viewSpaceToMetersFactor = 1.0f;
+    static const bool nf_swap = Fsr3EnvFlag("BB_FSR3_NEARFAR_SWAP");
+    if (nf_swap) std::swap(prepare.cameraNear, prepare.cameraFar);
+    static const float vsm = EnvFloat("BB_FSR3_VSM", 1.0f);
+    prepare.viewSpaceToMetersFactor = vsm > 0.0f ? vsm : 1.0f;
     {
         // bb-dlssg-077: once, what FSR 3 is given, to set beside "[dlssg] constants" (DLSS-G).
         static bool said = false;
