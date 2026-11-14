@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/engineTexRegistry.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -846,6 +847,11 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
+	// KYTY_ENGINE_TEX_REGISTRY=1 (engineTexRegistry.h): the engine's own texture at this T#'s base; when the T# is the
+	// engine's, its words 4..7 (DEPTH / BASE_ARRAY / MAX_MIP ...) are the engine's declaration.
+	EngineTexRegistry::Entry engine_tex {};
+	const bool engine_hit = !storage && !resource.r128 && !descriptor.IsNull() && EngineTexRegistry::Enabled() &&
+	                        EngineTexRegistry::Resolve(descriptor.fields, &engine_tex);
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
@@ -924,7 +930,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	const bool    layered      = type == Prospero::ImageType::kColor1DArray ||
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
-	const auto    image_layers = layered ? depth : 1u;
+	auto          image_layers = layered ? depth : 1u;
 	uint32_t      pitch        = 0;
 	TileSizeAlign size {};
 	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -974,6 +980,32 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		    descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 		    descriptor.fields[6], descriptor.fields[7]);
 		return bind_null(report);
+	}
+	// KYTY_ENGINE_TEX_REGISTRY=1: no image past the engine's texture: the layers the engine declared (its slice count or
+	// its own T#), and the bytes it allocated for it. A view whose first layer is outside them is reported and left as
+	// before (counted as a conflict).
+	if (engine_hit && layered && !multisampled && !volume && image_layers > 1u && size.size != 0) {
+		uint32_t allowed = engine_tex.layers != 0 ? std::min(image_layers, engine_tex.layers) : image_layers;
+		if (engine_tex.size != 0) {
+			const uint64_t room  = engine_tex.base + engine_tex.size - address; // Find: address lies inside
+			const uint64_t slice = size.size / image_layers;
+			if (slice != 0) allowed = static_cast<uint32_t>(std::min<uint64_t>(allowed, std::max<uint64_t>(room / slice, 1u)));
+		}
+		if (allowed < image_layers) {
+			const uint32_t base_layer = descriptor.BaseArray5();
+			TileSizeAlign  clamped {};
+			if (base_layer < allowed &&
+			    TileGetTextureTotalSize(format, width, height, allowed, levels, tile, false, clamped) && clamped.size != 0 &&
+			    (engine_tex.size == 0 || clamped.size <= engine_tex.base + engine_tex.size - address)) {
+				image_layers = allowed;
+				size         = clamped;
+				EngineTexRegistry::Note(EngineTexRegistry::Count::Clamp);
+			} else {
+				EngineTexRegistry::Note(EngineTexRegistry::Count::Conflict);
+				EngineTexRegistry::Report("view past the engine texture", address, descriptor.fields, engine_tex,
+				                          image_layers - std::min(base_layer, image_layers), base_layer);
+			}
+		}
 	}
 	if (tile == Prospero::TileMode::kDepth && m_depth_tiled_reports.insert(address).second) {
 		LOGF("TextureCache: depth-tiled sampled view: addr=0x%016" PRIx64 " size=0x%016" PRIx64
@@ -1187,6 +1219,11 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// (A texture or storage image the GPU cannot make, its memory full: a null image, not the end of the emulator; a
 	// storage view loses its writes until the collector made room. Issue #53: a 320x180x61 storage image of the cinematic
 	// mode on a 16 GB RX 7800 XT whose video memory the 4K targets had filled.)
+	if (EngineTexRegistry::Enabled()) {
+		EngineTexRegistry::NoteImage(desc.info.data.size, desc.info.extent.width, desc.info.extent.height,
+		                             desc.info.resources.layers, desc.info.resources.levels);
+		EngineTexRegistry::MaybeLog();
+	}
 	auto id = texture_cache.FindImage(desc, shader_conversion, true);
 	if (!id) {
 		return bind_null(fmt::format("no image could be made for the texture: {}x{} layers={} levels={} format={} "
