@@ -13,6 +13,23 @@ param([string]$Lang = '', [switch]$Play, [switch]$NoUi, [switch]$Menu, [switch]$
 $ErrorActionPreference = 'Stop'
 $root    = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+# (bb-env) Variables extra para pruebas: bb-env.txt junto al lanzador, una KEY=VALOR por linea (# comenta). Sin el archivo, nada cambia.
+function Apply-ExtraEnv {
+	try {
+		$f = Join-Path $root 'bb-env.txt'
+		if (-not (Test-Path -LiteralPath $f)) { return }
+		foreach ($ln in (Get-Content -LiteralPath $f -ErrorAction Stop)) {
+			$t = "$ln".Trim()
+			if ($t -eq '' -or $t.StartsWith('#')) { continue }
+			$i = $t.IndexOf('=')
+			if ($i -lt 1) { continue }
+			$k = $t.Substring(0, $i).Trim(); $v = $t.Substring($i + 1).Trim()
+			if ($k -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { continue }
+			Set-Item "Env:$k" $v
+			Write-Log "bb-env.txt: $k=$v"
+		}
+	} catch { try { Write-Log "bb-env.txt: no se pudo leer: $_" } catch { } }
+}
 $iniFile = Join-Path $root 'launcher.ini'
 $logFile = Join-Path $root 'launcher.log'
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
@@ -1089,6 +1106,7 @@ function Start-Game {
 		Write-SharpLive
 		Write-Log "Variables: $(($fge.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')"
 		$fpsLog = Join-Path $root 'logs\bb-fps.log'; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $fpsLog) | Out-Null; $env:BB_METRICS_OUT = $fpsLog
+		Apply-ExtraEnv
 		$eargs = @('-g', ('"' + $eboot + '"'))
 		Write-Log "Modo seguro: sin cambios. Arranque: `"$emu`" $($eargs -join ' ') (trabajo: $workDir)"
 		try { $p = Start-Process -FilePath $emu -ArgumentList $eargs -WorkingDirectory $workDir -PassThru } catch { Show-Msg ((T 'No se pudo arrancar shadPS4:' 'Could not start shadPS4:') + "`n$_") 'Bloodborne' 'Error' | Out-Null; return $false }
@@ -1160,6 +1178,7 @@ function Start-Game {
 	foreach ($k in $bb.Keys) { Set-Item "Env:$k" $bb[$k] }
 	Write-Log "Variables: $(($bb.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')"
 	# 4) Arranque. Rutas entre comillas (carpetas con espacios).
+	Apply-ExtraEnv
 	$eargs = @('-g', ('"' + $eboot + '"'))
 	if ($script:chg['fsmode']) { $eargs += @('-f', $(if ($all.full) { 'true' } else { 'false' })) }  # solo si el usuario eligio el modo de pantalla
 	if ($script:S.showfps -eq '1') { $eargs += '--show-fps' }
