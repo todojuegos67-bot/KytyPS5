@@ -118,9 +118,10 @@ private:
 
     std::mutex mutex;
     VideoOutPort main_port{};
-    std::jthread present_thread;
     std::queue<Request> requests;
     std::condition_variable request_cv; // bb-vardt: wakes the immediate present loop
+    // Last member: destroyed (stop + join) first, before the mutex / queue / cv it waits on.
+    std::jthread present_thread;
 };
 
 } // namespace Libraries::VideoOut

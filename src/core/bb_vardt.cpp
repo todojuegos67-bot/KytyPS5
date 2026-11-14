@@ -21,8 +21,9 @@
 //    60 fps (1/60, 0.5, 0.95^0.5) value: they are right only at that frame rate.
 // What this does: the upper clamp becomes BB_VARIABLE_DT_MAX_MS (default 50 ms = 1/20 s) and
 // the frozen constants are evaluated every frame at the live dt with the same law the patch
-// used (linear: orig * dt * 30; decay: 0.95^(dt*30)), so at dt = 0.01 they are byte-identical
-// to the patch. The Havok world keeps "PC sin limite 3" (semi-fixed steps h = min(acc, 1/60),
+// used (linear: orig * dt * 30, the 1.0 sites capped at 1.0; decay: 0.95^(dt*30)), so the
+// 0.01 sites are byte-identical to the patch at dt = 0.01 and the 1/60, 0.5, 0.95^0.5 sites at
+// dt = 1/60. The Havok world keeps "PC sin limite 3" (semi-fixed steps h = min(acc, 1/60),
 // acc += live dt, acc capped at 1/15 s), so a 1/20 s frame runs 3 physics substeps.
 #include "core/bb_vardt.h"
 
@@ -167,7 +168,14 @@ void MakeWritable(u64 lo, u64 hi) {
 
 float Value(const Site& s, float dt) {
     const float f = dt * 30.0f;
-    return s.law == Law::Decay ? std::pow(s.orig, f) : s.orig * f;
+    if (s.law == Law::Decay) {
+        return std::pow(s.orig, f);
+    }
+    // The orig-1.0 sites are Havok cloth "Stiffness" defaults (0x7e45be, 0x7f706d, 0x805898,
+    // 0x809d62: vmovss xmm1 -> call 0x80d800 with "Stiffness"): a [0, 1] factor, never above
+    // the unpatched 30 fps value when a frame is longer than 1/30 s.
+    const float v = s.orig * f;
+    return s.orig == 1.0f ? std::min(v, 1.0f) : v;
 }
 
 bool ReadFrame(float* measured, float* period) {
@@ -221,7 +229,8 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
     }
     const bool havok = std::memcmp(At(HavokHook), HavokHookBytes, sizeof(HavokHookBytes)) == 0;
     if (const char* m = std::getenv("BB_VARIABLE_DT_MAX_MS"); m != nullptr && *m) {
-        g_max_dt = std::clamp(static_cast<float>(std::atof(m)), 17.0f, 100.0f) / 1000.0f;
+        const float ms = static_cast<float>(std::atof(m));
+        g_max_dt = (std::isfinite(ms) ? std::clamp(ms, 17.0f, 100.0f) : 50.0f) / 1000.0f;
     }
     float old_max = 0;
     std::memcpy(&old_max, At(DtImm), 4);
