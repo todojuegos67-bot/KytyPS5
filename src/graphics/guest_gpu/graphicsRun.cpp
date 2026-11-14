@@ -586,6 +586,10 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4();
+	} else if (Spec::Current() == nullptr) { // (a speculation's commit publishes)
+		// Found valid: the guest released the packet, as a satisfied WAIT_REG_MEM; what it wrote before (the commands
+		// after it and their data, in pages the commands before it read) reaches the commands after it.
+		BdaDirtyRegions::Publish();
 	}
 }
 

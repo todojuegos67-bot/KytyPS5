@@ -260,9 +260,9 @@ public:
 	// marks that is hot - written in consecutive frames (it faulted and was copied in an earlier frame, at most
 	// UploadHeap::HotFrames before) - stays CPU-dirty and writable instead (kept): no protection change, no fault at the
 	// guest's next write; it is copied at its uses, at most once per publish epoch (uploadHeap.h). A kept page used
-	// again in a later publish epoch of the same frame (read by several submissions: tracking would copy it once) is
-	// made clean and write-watched after that copy and not kept again for UploadHeap::CoolFrames frames. So a kept
-	// page costs one copy a frame where tracking costs a fault, two protection changes and the same copy.
+	// again sooner than its write period (a later publish epoch of the same frame - read by several submissions - or a
+	// later frame of the period: tracking would copy it once) is made clean and write-watched after that copy and not kept again for UploadHeap::CoolFrames frames. So a kept
+	// page costs one copy a write period where tracking costs a fault, two protection changes and the same copy.
 	template <typename Func>
 	void ForEachCpuUploadRange(uint64_t vaddr, uint64_t size, bool keep, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
@@ -321,8 +321,9 @@ public:
 						copy.Set(page);
 						m_kept_done.Set(page);
 						kept_copies++;
-						if (info.kept_copy_frame == frame) {
-							// Read again in a later publish epoch of the frame: tracked from here on.
+						if (frame - info.kept_copy_frame < info.period) {
+							// Read again sooner than the guest rewrites it (in a later publish epoch of the frame, or in
+							// a later frame of its write period: tracking would not copy it again): tracked from here on.
 							clean.Set(page);
 							m_kept.Unset(page);
 							m_kept_done.Unset(page);
@@ -356,6 +357,7 @@ public:
 						m_kept_done.Set(page);
 						info.kept_copy_frame = frame;
 						info.kept_since      = frame;
+						info.period          = frame + 1 - info.dirty_frame; // (1..HotFrames: its write period)
 						promoted++;
 					} else {
 						clean.Set(page);

@@ -7,8 +7,9 @@
 // its copy it stays CPU-dirty and writable instead of write-protected, so the guest's next write costs no fault and no
 // protection change. A kept page is copied at its uses, at most once per publish epoch (BdaDirtyRegions::Publish: a
 // submission taken, a WAIT_REG_MEM satisfied, a speculation committed - guest writes reach GPU work only after one).
-// It is tracked again (clean, write-watched) when it is read in a second publish epoch of a frame (tracking would copy
-// it once; it is not kept again for CoolFrames frames) or after KeepFrames frames (still hot, it faults once and is kept
+// It is tracked again (clean, write-watched) when it is copied again sooner than its write period (in a second publish
+// epoch of a frame, or a later frame before the guest rewrites it: tracking would copy it once; it is not kept again for
+// CoolFrames frames) or after KeepFrames frames (still hot, it faults once and is kept
 // again). Never more copies than tracking makes, beyond a bounded learning cost; correctness never depends on what is
 // marked: a kept page is only "CPU-dirty, copied at every use of a new publish epoch".
 //
@@ -31,8 +32,8 @@ inline std::atomic<uint32_t> g_on {0};
 inline std::atomic<uint64_t> g_publish {1};
 inline std::atomic<uint64_t> g_frame {1};
 // A marked page is kept once it was dirty at uploads of two different frames at most HotFrames apart (the engine's
-// per-frame memory is rewritten every frame of its ring); one read in two publish epochs of a frame is tracked again,
-// and not kept for CoolFrames frames.
+// per-frame memory is rewritten every frame of its ring); one copied again sooner than that period (read in two publish
+// epochs of a frame, or in two frames of one write period) is tracked again, and not kept for CoolFrames frames.
 // A kept page is tracked again after KeepFrames frames (at its next copy): one still written every frame faults once and
 // is kept again at once; one the guest stopped writing is copied at most KeepFrames more times.
 inline constexpr uint32_t HotFrames = 4, CoolFrames = 64, KeepFrames = 8;
@@ -41,6 +42,7 @@ struct PageInfo {
 	uint32_t kept_copy_frame = 0; // frame of its last copy while kept
 	uint32_t no_keep_before  = 0; // frame from which it may be kept again
 	uint32_t kept_since      = 0; // frame it was kept
+	uint32_t period          = 1; // frames between its last two tracked copies when it was kept (its write period)
 };
 inline std::atomic<uint64_t> g_granules[Regions] = {};
 // Statistics (relaxed): pages kept CPU-dirty after a copy, kept pages whose copy the epoch rule skipped, kept pages
