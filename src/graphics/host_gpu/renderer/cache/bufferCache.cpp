@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/nativeTex.h"
 #include "gpu-residency.h"
 #include "lane-sync.h"
 #include "slow-log.h"
@@ -2289,6 +2290,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// CPU cleanliness does not prove that an aliased image is current.
 		return is_texel_buffer && SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
+	NativeTex::BeforeGuestRead(vaddr, size); // (KYTY_NATIVE_TEX: texture bytes held on the GPU into guest memory first)
 	LiveCounters::ScopedUs timed(LiveCounters::BufferSyncUs);
 	bool fully_gpu_modified = false;
 	if (is_written && kyty_local_buffer_residency_mode.load(std::memory_order_relaxed) != 0 &&

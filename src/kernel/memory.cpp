@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "graphics/host_gpu/nativeTex.h" // (KYTY_NATIVE_TEX: guest reads of texture bytes held on the GPU)
 #include "local-platform.h"
 #include "live-census.h"
 #include "live-counters.h"
@@ -1360,11 +1361,22 @@ bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
 [[gnu::noinline]] bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	// Diagnostic (live timecensus, source BackingRead): which code reads the backing, how much.
 	if (size >= 0x10000) KYTY_TIME_CENSUS(BackingRead, size);
+	Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+// (BackingLookupOnly: the scopes alive on this thread.)
+static thread_local uint32_t t_backing_lookup_only = 0;
+BackingLookupOnly::BackingLookupOnly() noexcept {
+	++t_backing_lookup_only;
+}
+BackingLookupOnly::~BackingLookupOnly() {
+	--t_backing_lookup_only;
+}
+
 const uint8_t* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
+	if (t_backing_lookup_only == 0) Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingPointer(vaddr, size) : nullptr;
 }
 
@@ -1391,14 +1403,17 @@ void TrimGuestRange(uint64_t vaddr, uint64_t size) {
 }
 
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+	if (t_backing_lookup_only == 0) Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr && g_guest_address_space->BackingPieces(vaddr, size, pieces);
 }
 
 bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+	if (t_backing_lookup_only == 0) Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr && g_guest_address_space->SparseBackingPieces(vaddr, size, pieces);
 }
 
 bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBackingToHost(vaddr, data, size);
 }
@@ -1756,10 +1771,12 @@ bool RestoreGuestWritable(uint64_t vaddr, uint64_t size) {
 }
 
 bool TryReadMappedOrZero(uint64_t vaddr, void* data, uint64_t size) {
+	Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	return g_guest_address_space != nullptr && g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
 }
 
 bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size, const char** failure_reason) {
+	Graphics::NativeTex::BeforeGuestRead(vaddr, size);
 	const auto fail = [failure_reason](const char* reason) {
 		if (failure_reason != nullptr) *failure_reason = reason;
 		return false;
