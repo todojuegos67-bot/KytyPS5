@@ -1030,6 +1030,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     bool camera = false, ok = true, skinned = false, ring = false, obj_moved = false;
     bool game_skin = false, engine_draw = false;
     u32 pal_matched = 0, pal_failed = 0, pal_bufs = 0;
+    u32 skin_slot_bufs = 0, skin_slot_prev = 0; // bb-mv-skin
     if (BB::MvEngine::Enabled() && !blend) BB::MvEngine::Count(BB::MvEngine::Stat::Draws);
     for (u32 h = 0; h < n && ok; ++h) {
         if ((cand & (1ull << h)) == 0) continue;
@@ -1039,6 +1040,74 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         const VelRole role = IdentifyVelocityBuffer(size);
         if (addr == 0) continue;
         const bool eng = BB::MvEngine::Enabled();
+        const bool slots = eng && BB::MvEngine::SlotsEnabled();
+        if (slots && !blend && role != VelRole::Camera && size >= 16) {
+            // bb-mv-skin: a slot buffer DrawMesh bound as the current one (skinned A / B or the
+            // rigid world): the previous is the engine's previous slot (live, the CP DMA of last
+            // frame), the same slot when the ring did not advance, or our copy of last frame's
+            // slot for rings of one slot. Nothing else (no address / mesh / order match): without
+            // a valid previous the draw reads its current data with last frame's camera, i.e.
+            // camera-only motion.
+            BB::MvEngine::SlotHit sh;
+            if (BB::MvEngine::LookupSlot(addr, size, sh)) {
+                namespace E = BB::MvEngine;
+                engine_draw = true;
+                E::Count(sh.skinned ? E::Stat::SlotSkin : E::Stat::SlotRigid);
+                if (sh.skinned) {
+                    if (!skinned) ++g.vs_skin_draws_all;
+                    skinned = true;
+                    game_skin = true;
+                    ++skin_slot_bufs;
+                }
+                bool have_prev = false;
+                switch (sh.mode) {
+                case E::SlotMode::Engine: {
+                    const auto [pbuf, poff] = buffer_cache.ObtainBuffer(sh.prev_addr, size);
+                    if (pbuf != nullptr && pbuf->buffer.bda_addr != 0) {
+                        prev[h] = SnapBuf{pbuf->buffer.bda_addr + poff, size / 4, size, 0};
+                        use[h] = true;
+                        obj_moved = true;
+                        have_prev = true;
+                        E::Count(E::Stat::SlotEngine);
+                    } else {
+                        E::Count(E::Stat::SlotLiveFail);
+                    }
+                    break;
+                }
+                case E::SlotMode::Unchanged:
+                    have_prev = true; // previous == current: the draw's own data
+                    E::Count(E::Stat::SlotUnchanged);
+                    break;
+                case E::SlotMode::Own: {
+                    const u64 okey = Mix(Mix(Mix(sh.key, sh.offset), size), 0x6f776e736cull);
+                    SnapBuf ocur{0, 0, 0, 0};
+                    if (VelSnap(buffer_cache, scheduler, addr, size, ocur)) {
+                        g.vel_id_cur.try_emplace(okey, ocur);
+                    }
+                    if (const auto it = g.vel_id_prev.find(okey); it != g.vel_id_prev.end() &&
+                                                                  it->second.addr != 0 &&
+                                                                  it->second.dwords == size / 4) {
+                        prev[h] = it->second;
+                        use[h] = true;
+                        obj_moved = true;
+                        have_prev = true;
+                        E::Count(E::Stat::SlotOwn);
+                    } else {
+                        E::Count(E::Stat::SlotOwnMissing);
+                    }
+                    break;
+                }
+                default:
+                    E::Count(E::Stat::SlotNone);
+                    break;
+                }
+                if (have_prev) {
+                    E::Count(sh.skinned ? E::Stat::SlotSkinPrev : E::Stat::SlotRigidPrev);
+                    if (sh.skinned) ++skin_slot_prev;
+                }
+                continue;
+            }
+        }
         if (eng && !blend && (role == VelRole::Current || role == VelRole::Palette) &&
             size >= 48 && size <= 16384) {
             // bb-mv-engine: the game's own object (BonePalette hook) owns this buffer: last
@@ -1081,9 +1150,16 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 continue;
             }
             BB::MvEngine::CountMiss(why);
+            if (slots && role == VelRole::Palette && why == BB::MvEngine::Miss::GpuWritten) {
+                // bb-mv-skin: a GPU-written palette-sized buffer no DrawMesh slot record covers:
+                // its last-frame copy cannot be checked (by address / order / mesh it may be
+                // another object's or the same ring's other buffer): camera-only.
+                BB::MvEngine::Count(BB::MvEngine::Stat::PalNoRecordCamOnly);
+                continue;
+            }
             if (role == VelRole::Palette) BB::MvEngine::Count(BB::MvEngine::Stat::FallbackOld);
         }
-        if (role == VelRole::Current && eng && !blend && size >= 16) {
+        if (role == VelRole::Current && eng && !slots && !blend && size >= 16) {
             // bb-mv-engine: a world transform the rigid ring branch of DrawMesh bound as the
             // current slot: the engine's own previous slot (vtable+0x38), nothing guessed.
             BB::MvEngine::Count(BB::MvEngine::Stat::RigidLookups);
@@ -1452,6 +1528,10 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         use[h] = true;
     }
     if (engine_draw) BB::MvEngine::Count(BB::MvEngine::Stat::EngineDraws);
+    if (skin_slot_bufs != 0) {
+        BB::MvEngine::Count(BB::MvEngine::Stat::SkinDraws);
+        if (skin_slot_prev == skin_slot_bufs) BB::MvEngine::Count(BB::MvEngine::Stat::SkinDrawsPrev);
+    }
     if (ok && pal_bufs > 1 && !blend) ++g.vs_multi_pal;
     if (ok && pal_failed != 0) {
         if (pal_matched != 0) {
@@ -1763,12 +1843,19 @@ bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y) {
     return true;
 }
 
+static u64 g_composed_count = 0; // presenter thread only
+
+u64 ComposedCount() {
+    return g_composed_count;
+}
+
 void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_view,
              vk::ImageView reactive_view, vk::Extent2D render, bool reset) {
     if (!g.ready || g.composed || !g.cleared || !g.image) return;
     if (!reactive_view) return; // binding 6 must be valid
     if (render.width > g.width || render.height > g.height) return;
     g.composed = true;
+    ++g_composed_count;
     g.last_render = render;
     const u32 slot = g.slot;
     ReadStats(slot);

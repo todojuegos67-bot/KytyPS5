@@ -49,6 +49,11 @@ class MemoryManager;
 namespace BB::MvEngine {
 
 bool Enabled(); // BB_MV_ENGINE=1
+// bb-mv-skin: engine ring-slot previous transforms for every DrawMesh ring draw (skinned and
+// rigid), BB_MV_ENGINE=1 and BB_MV_ENGINE_SLOTS != 0 (BB_MV_ENGINE_SLOTS=0: the e1228687 path).
+bool SlotsEnabled();
+// Guest frame boundary (sceGnmSubmitAndFlip / sceVideoOutSubmitFlip).
+void OnGuestFlip();
 
 // Guest threads (detours).
 void GuestPaletteBegin(u64 model, u64 sink, u64 mesh, u64 bones, u32 consumer);
@@ -63,6 +68,33 @@ void SetEngineHooks(u32 drawmesh, u32 camera, const char* detail);
 // GPU thread: the engine's previous world transform for a buffer the rigid ring branch bound as
 // the current one (V# base within the slot). `key`: the ring object (identity).
 bool LookupRigid(u64 addr, u64& prev_addr, u64& offset, u64& key);
+
+// bb-mv-skin. DrawMesh 0x21d0640 binds a ring object's slot buffers (GX buffer objects, GPU
+// address [obj+0x20], size [obj+0x2c]) to the sink:
+//   rigid   (0x21d0809 / 0x21d0ff9): vtable+0x30(cur) -> GX const slot 5, +0x38(prev) -> slot 6
+//   skinned (0x21d0759): vtable+0x40(A[idx], B[idx]) -> slots 5 / 12 (0x224da70),
+//                        vtable+0x48(A[idx-1], B[idx-1]) -> slots 6 / 13 (0x224dbc0)
+//   A = [[ring+0x10]+i*8], B = [[ring+0x18]+i*8] (full skeleton [[ring+0xb0]+0x200] != 0 only;
+//   else 0, 0), both n*48 bytes written by SkinRingUpdate 0x21c8c50 through a CP DMA
+//   (0x2168a20 -> 0x26b3560 -> 0x26b1c40): B = bones x inverse bind (0x21c90d0 loop), A a second
+//   per-bone 3x4 set (0x21c8df0 loop). Same size, same ring: the native-mv ring key could not tell
+//   A from B nor the current slot from the previous one.
+enum class SlotMode : u8 {
+    None = 0,  // no valid previous: camera-only
+    Engine,    // the engine's previous slot holds last frame's transform (read live on the GPU)
+    Unchanged, // the ring did not advance since last frame: previous == current (camera-only exact)
+    Own,       // ring of one slot: our GPU copy of last frame's slot, keyed by the ring object
+};
+struct SlotHit {
+    SlotMode mode = SlotMode::None;
+    bool skinned = false;
+    u64 prev_addr = 0; // Engine: previous slot + offset
+    u64 key = 0;       // ring object x kind (x bone for per-bone rigid tables)
+    u64 offset = 0;    // V# base minus the slot's base
+};
+// A V# [addr, addr+size) inside a slot buffer DrawMesh bound as a current slot (records of the
+// last few frames). False: no record.
+bool LookupSlot(u64 addr, u64 size, SlotHit& out);
 // The engine camera whose current view equals the block's (floats 8..19, the 864 B block):
 // writes the engine's previous view in the block's layout (12 floats). 0: no record matches,
 // 1: matched, 2: matched but the engine had no previous camera (first frame / cut).
@@ -110,6 +142,20 @@ enum class Stat : u8 {
     CamEngNoPrev,  // engine camera, no previous (first frame / cut)
     CamEngNoBlock, // engine previous view not among last frame's blocks: fallback
     CamEngUsed,    // last frame's block chosen by the engine's previous view
+    // bb-mv-skin (per V# of a velocity draw)
+    SlotSkin,          // skinned ring slot buffers (A / B) looked up
+    SlotSkinPrev,      // ... with a true previous (engine slot, unchanged or own copy)
+    SlotRigid,         // rigid ring slot buffers looked up
+    SlotRigidPrev,     // ... with a true previous
+    SlotEngine,        // previous = the engine's previous slot (live)
+    SlotUnchanged,     // ring not advanced: previous == current
+    SlotOwn,           // previous = our copy of last frame (1-slot ring)
+    SlotOwnMissing,    // 1-slot ring without a copy last frame (new / not drawn): camera-only
+    SlotNone,          // record without valid previous (see guest reasons): camera-only
+    SlotLiveFail,      // previous slot not in the buffer cache: camera-only
+    PalNoRecordCamOnly, // palette-sized GPU-written V# without any engine record: camera-only
+    SkinDraws,         // velocity draws with a skinned slot buffer
+    SkinDrawsPrev,     // ... all of whose skinned slot buffers had a true previous
     Count
 };
 void Count(Stat s, u64 n = 1);

@@ -97,5 +97,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
 bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y);
 // Presenter: the guest flip (end of a frame).
 void OnFlip();
+// Compose calls that composed the object vectors (FG pairing stamp, bb_present_sr.cpp).
+u64 ComposedCount();
 
 } // namespace BB::ObjMv2

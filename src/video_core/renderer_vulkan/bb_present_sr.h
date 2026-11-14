@@ -17,6 +17,9 @@ namespace BB {
 
 // The scene depth target of the frame, recorded by the rasterizer (one size compare per
 // depth target bind, only with an upscaler on).
+// bb-mv-skin: scene frames run through PresentSr::Run (the FG inputs' pairing stamps).
+u64 SceneFrameNumber();
+
 struct SceneDepth {
     bool valid = false;
     VideoCore::TextureCache::ImageDesc desc;

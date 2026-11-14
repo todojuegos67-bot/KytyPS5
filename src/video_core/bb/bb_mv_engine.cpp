@@ -107,6 +107,31 @@ std::array<float, 216> g_sdelta_v{}, g_sdelta_p{};
 u64 g_sdelta_blocks = 0;
 bool g_dumped_nomatch = false;
 
+// bb-mv-skin: ring slot records (guest DrawMesh, under g_rmx).
+struct SlotRec {
+    u64 prev = 0;   // previous slot base (Engine)
+    u64 key = 0;    // ring object x kind (x bone)
+    u64 stamp = 0;  // GPU frame stamp when recorded
+    u64 size = 0;   // slot buffer size ([obj+0x2c])
+    SlotMode mode = SlotMode::None;
+    bool skinned = false;
+};
+std::map<u64, SlotRec> g_slots;
+struct RingSeen {
+    u64 period = 0, pperiod = 0;
+    s32 idx = -1, pidx = -1;
+    bool mixed = false;
+};
+std::unordered_map<u64, RingSeen> g_seen;
+std::atomic<u64> g_flip{1};
+enum class SlotWhy : u8 {
+    Engine = 0, Unchanged, Own, NotLastFrame, Mixed, Advanced, SizeDiffers, Override,
+    Count
+};
+std::array<std::atomic<u64>, size_t(SlotWhy::Count)> g_slot_why_skin{}, g_slot_why_rigid{};
+std::atomic<u64> g_slot_rings1{0}, g_slot_rings2{0};
+constexpr u64 kSlotMaxAge = 4; // GPU frames
+
 u64 Mix(u64 a, u64 b) {
     u64 h = a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2));
     h ^= h >> 33;
@@ -140,6 +165,18 @@ bool Enabled() {
         return v != nullptr && v[0] == '1';
     }();
     return on;
+}
+
+bool SlotsEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_MV_ENGINE_SLOTS");
+        return Enabled() && !(v != nullptr && v[0] == '0');
+    }();
+    return on;
+}
+
+void OnGuestFlip() {
+    g_flip.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SetHooks(bool installed, const char* detail) {
@@ -186,6 +223,75 @@ void SetEngineHooks(u32 drawmesh, u32 camera, const char* detail) {
                     camera != 0 ? "in place" : "NOT installed", detail != nullptr ? detail : ""));
 }
 
+namespace {
+// bb-mv-skin: records the slot buffers DrawMesh binds as current (both branches) and what their
+// previous is. Which slot was displayed last frame comes from DrawMesh itself: the ring index the
+// object was drawn with in the previous guest frame (flip period). Called with g_rmx held.
+void RecordSlots(u64 ring, bool skinned, u64 key_base, s32 idx, s32 pidx, s32 slots,
+                 const u64* cur_objs, const u64* prev_objs, u32 n, bool overridden) {
+    auto& why = skinned ? g_slot_why_skin : g_slot_why_rigid;
+    const u64 P = g_flip.load(std::memory_order_relaxed);
+    RingSeen& r = g_seen[ring];
+    if (r.period != P) {
+        r.pperiod = r.period;
+        r.pidx = r.idx;
+        r.period = P;
+        r.idx = idx;
+        r.mixed = false;
+    } else if (r.idx != idx) {
+        r.mixed = true; // the ring advanced inside one guest frame: no single "last frame"
+    }
+    (slots <= 1 ? g_slot_rings1 : g_slot_rings2).fetch_add(1, std::memory_order_relaxed);
+    const u64 stamp = g_stamp.load(std::memory_order_relaxed);
+    for (u32 k = 0; k < n; ++k) {
+        const u64 cur_obj = cur_objs[k];
+        if (cur_obj == 0)
+            continue;
+        const u64 cur = *reinterpret_cast<const u64*>(cur_obj + 0x20);
+        const u64 size = *reinterpret_cast<const u32*>(cur_obj + 0x2c);
+        if (cur == 0 || size == 0)
+            continue;
+        SlotRec rec{};
+        rec.key = Mix(Mix(key_base, k), skinned ? 0x736b696eull : 0x72696764ull);
+        rec.stamp = stamp;
+        rec.size = size;
+        rec.skinned = skinned;
+        SlotWhy w;
+        if (overridden) {
+            // +0x30 binds [sink+0x1c8] instead of the slot: this slot is not what the VS reads.
+            g_slots.erase(cur);
+            why[size_t(SlotWhy::Override)].fetch_add(1, std::memory_order_relaxed);
+            continue;
+        } else if (slots <= 1) {
+            rec.mode = SlotMode::Own; // one slot: rewritten in place, keep our own copy
+            w = SlotWhy::Own;
+        } else if (r.mixed) {
+            w = SlotWhy::Mixed;
+        } else if (r.pperiod == 0 || r.pperiod + 1 != P) {
+            w = SlotWhy::NotLastFrame; // not drawn in the previous guest frame
+        } else if (r.pidx == idx) {
+            rec.mode = SlotMode::Unchanged; // not advanced: last frame showed this same slot
+            w = SlotWhy::Unchanged;
+        } else if (r.pidx != pidx) {
+            w = SlotWhy::Advanced; // advanced twice or more: the previous slot is not last frame's
+        } else {
+            const u64 prev_obj = prev_objs[k];
+            const u64 prev = prev_obj != 0 ? *reinterpret_cast<const u64*>(prev_obj + 0x20) : 0;
+            const u64 psize = prev_obj != 0 ? *reinterpret_cast<const u32*>(prev_obj + 0x2c) : 0;
+            if (prev == 0 || prev == cur || psize != size) {
+                w = SlotWhy::SizeDiffers;
+            } else {
+                rec.mode = SlotMode::Engine;
+                rec.prev = prev;
+                w = SlotWhy::Engine;
+            }
+        }
+        why[size_t(w)].fetch_add(1, std::memory_order_relaxed);
+        g_slots[cur] = rec;
+    }
+}
+} // namespace
+
 // Mirrors DrawMesh 0x21d0640 up to the sink calls (only the reads the game itself makes on the
 // branch it takes): the rigid ring branch's current / previous slot pointers.
 void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance) {
@@ -193,6 +299,61 @@ void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance) {
     g_dm_calls.fetch_add(1, std::memory_order_relaxed);
     if (instance == 0 || sink == 0 || mesh == 0 || material == 0)
         return;
+    if (SlotsEnabled()) {
+        const auto rd8s = [](u64 a) { return *reinterpret_cast<const u8*>(a); };
+        const auto rd64s = [](u64 a) { return *reinterpret_cast<const u64*>(a); };
+        const auto rd32s = [](u64 a) { return *reinterpret_cast<const s32*>(a); };
+        const u64 ring = rd64s(instance + 8);
+        if (ring == 0) {
+            g_dm_palette.fetch_add(1, std::memory_order_relaxed); // BonePalette (0x21d083a)
+            return;
+        }
+        bool rigid;
+        if (rd8s(material + 0x2c) != 0) {
+            rigid = false; // 0x21d0700 -> 0x21d0759
+        } else if ((rd8s(sink + 0x171) & 1) == 0 || rd8s(material + 0x1d) == 0) {
+            rigid = true; // 0x21d0809
+        } else {
+            rigid = rd8s(ring + 0xa4) == 0; // 0x21d0749
+        }
+        const u64 rmodel = rd64s(ring + 0xb0);
+        const bool full = rd8s(rmodel + 0x200) != 0;
+        const s32 idx = rd32s(ring + 0x98);
+        const s32 slots = rd32s(ring + 0x9c);
+        s32 pidx = idx - 1; // 0x21d07b1 / 0x21d08fb: idx - 1, + [ring+0x9c] when idx <= 0
+        if (idx < 1)
+            pidx += slots;
+        if (!rigid) {
+            g_dm_skinned.fetch_add(1, std::memory_order_relaxed);
+            if (!full)
+                return; // 0x21d077d: the sink gets 0, 0 (no ring slot bound)
+            // 0x21d077f..0x21d0792 (current) / 0x21d07d5..0x21d07f7 (previous)
+            const u64 a = rd64s(ring + 0x10), b = rd64s(ring + 0x18);
+            const u64 cur[2] = {rd64s(a + u64(s64(idx)) * 8), rd64s(b + u64(s64(idx)) * 8)};
+            const u64 prv[2] = {rd64s(a + u64(s64(pidx)) * 8), rd64s(b + u64(s64(pidx)) * 8)};
+            std::scoped_lock lk{g_rmx};
+            RecordSlots(ring, true, Mix(ring, 0x736b), idx, pidx, slots, cur, prv, 2, false);
+            return;
+        }
+        const u64 bone = *reinterpret_cast<const u16*>(mesh + 2);
+        const auto slot = [&](s32 i) -> u64 {
+            if (full)
+                return rd64s(rd64s(ring + 8) + u64(s64(i)) * 8);
+            return rd64s(rd64s(rd64s(ring) + u64(s64(i)) * 0x28 + 8) + bone * 8);
+        };
+        const bool overridden = rd64s(sink + 0x1c8) != 0 && rd32s(sink + 0x108) == 1;
+        if (overridden)
+            g_dm_override.fetch_add(1, std::memory_order_relaxed);
+        g_dm_rigid.fetch_add(1, std::memory_order_relaxed);
+        if (slots <= 1)
+            g_dm_single.fetch_add(1, std::memory_order_relaxed);
+        const u64 cur[1] = {slot(idx)};
+        const u64 prv[1] = {slot(pidx)};
+        std::scoped_lock lk{g_rmx};
+        RecordSlots(ring, false, full ? Mix(ring, 0x66756c6c) : Mix(ring, bone), idx, pidx, slots,
+                    cur, prv, 1, overridden);
+        return;
+    }
     const auto rd8 = [](u64 a) { return *reinterpret_cast<const u8*>(a); };
     const auto rd64 = [](u64 a) { return *reinterpret_cast<const u64*>(a); };
     const auto rd32 = [](u64 a) { return *reinterpret_cast<const s32*>(a); };
@@ -411,6 +572,30 @@ bool LookupRigid(u64 addr, u64& prev_addr, u64& offset, u64& key) {
     return true;
 }
 
+bool LookupSlot(u64 addr, u64 size, SlotHit& out) {
+    std::scoped_lock lk{g_rmx};
+    auto it = g_slots.upper_bound(addr);
+    if (it == g_slots.begin())
+        return false;
+    --it;
+    const SlotRec& r = it->second;
+    const u64 off = addr - it->first;
+    if (off >= r.size)
+        return false;
+    // Old records: the slot's memory may belong to another object by now.
+    if (r.stamp + kSlotMaxAge < g_stamp.load(std::memory_order_relaxed))
+        return false;
+    out = {};
+    out.skinned = r.skinned;
+    out.key = r.key;
+    out.offset = off;
+    // A V# running past the slot's end would read past the previous slot too.
+    out.mode = off + size <= r.size ? r.mode : SlotMode::None;
+    if (out.mode == SlotMode::Engine)
+        out.prev_addr = r.prev + off;
+    return true;
+}
+
 bool LookupPalette(Core::MemoryManager* memory, bool gpu_modified, u64 addr, ObjId& out,
                    Miss& why) {
     why = Miss::None;
@@ -518,6 +703,15 @@ void OnFrame() {
             }
         }
         rigid_addrs = g_rigid.size();
+        for (auto it = g_slots.begin(); it != g_slots.end();) {
+            if (it->second.stamp + kKeepFrames < stamp) {
+                it = g_slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (g_seen.size() > 65536)
+            g_seen.clear();
     }
     const auto S = [](Stat s) { return g_st[size_t(s)]; };
     const auto M = [](Miss m) { return g_miss[size_t(m)]; };
@@ -560,6 +754,43 @@ void OnFrame() {
                     double(g_dm_override.exchange(0)) / f, double(g_dm_same.exchange(0)) / f,
                     double(g_dm_single.exchange(0)) / f, double(g_dm_accept.exchange(0)) / f,
                     double(g_dm_reject.exchange(0)) / f));
+    if (SlotsEnabled()) {
+        // bb-mv-skin: what the velocity pass got for the engine's ring slots.
+        const u64 sl = S(Stat::SlotSkin), rl = S(Stat::SlotRigid);
+        const u64 found = S(Stat::SlotEngine) + S(Stat::SlotUnchanged) + S(Stat::SlotOwn);
+        const u64 camonly = S(Stat::SlotOwnMissing) + S(Stat::SlotNone) + S(Stat::SlotLiveFail) +
+                            S(Stat::PalNoRecordCamOnly);
+        Log(fmt::format(
+            "[mv-engine-slots] skinned previous found {:.1f}% of {:.1f} buffers/frame (draws "
+            "{:.1f}/frame, all buffers with previous {:.1f}%) | rigid previous found {:.1f}% of "
+            "{:.1f} buffers/frame | camera-only fallback {:.1f}/frame (no previous {:.1f}, 1-slot "
+            "ring without last frame's copy {:.1f}, previous slot not cached {:.1f}, palette "
+            "without engine record {:.1f}) | previous from: engine slot {:.1f}%, unchanged ring "
+            "{:.1f}%, own copy {:.1f}%",
+            Pct(S(Stat::SlotSkinPrev), sl), double(sl) / f, double(S(Stat::SkinDraws)) / f,
+            Pct(S(Stat::SkinDrawsPrev), S(Stat::SkinDraws)), Pct(S(Stat::SlotRigidPrev), rl),
+            double(rl) / f, double(camonly) / f, double(S(Stat::SlotNone)) / f,
+            double(S(Stat::SlotOwnMissing)) / f, double(S(Stat::SlotLiveFail)) / f,
+            double(S(Stat::PalNoRecordCamOnly)) / f, Pct(S(Stat::SlotEngine), found),
+            Pct(S(Stat::SlotUnchanged), found), Pct(S(Stat::SlotOwn), found)));
+        const auto W = [&](std::array<std::atomic<u64>, size_t(SlotWhy::Count)>& a) {
+            std::array<u64, size_t(SlotWhy::Count)> v{};
+            for (size_t i = 0; i < v.size(); ++i)
+                v[i] = a[i].exchange(0);
+            return fmt::format("engine slot {:.1f}, unchanged {:.1f}, 1-slot own copy {:.1f}, "
+                               "not drawn last frame {:.1f}, advanced inside a frame {:.1f}, "
+                               "advanced 2+ {:.1f}, previous slot other size {:.1f}, "
+                               "sink+0x1c8 override {:.1f}",
+                               double(v[0]) / f, double(v[1]) / f, double(v[2]) / f,
+                               double(v[3]) / f, double(v[4]) / f, double(v[5]) / f,
+                               double(v[6]) / f, double(v[7]) / f);
+        };
+        const std::string ws = W(g_slot_why_skin), wr = W(g_slot_why_rigid);
+        Log(fmt::format("[mv-engine-slots] guest records/frame: skinned {} | rigid {} | rings "
+                        "drawn with 1 slot {:.1f}, 2+ slots {:.1f}, flip {}",
+                        ws, wr, double(g_slot_rings1.exchange(0)) / f,
+                        double(g_slot_rings2.exchange(0)) / f, g_flip.load()));
+    }
     const u64 cl = S(Stat::CamEngLookups);
     Log(fmt::format("[mv-engine-cam2] engine camera {:.1f}/frame (hook {}) | blocks {:.1f}/frame: "
                     "engine previous used {:.1f}%, fallback: no CPU copy {:.1f}%, not the engine "

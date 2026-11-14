@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -219,11 +220,22 @@ bool PresentSr::Poll(double& gpu_ms, double& sr_ms, double& mv_ms) {
     return true;
 }
 
+namespace {
+std::atomic<u64> g_scene_frame{0};
+}
+
+u64 SceneFrameNumber() {
+    return g_scene_frame.load(std::memory_order_relaxed);
+}
+
 vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& texture_cache,
                              Vulkan::Runtime& runtime, VideoCore::Image& flip,
                              vk::ImageView flip_view, vk::Extent2D in, vk::Extent2D out,
                              SceneDepth& scene, bool srgb_decode, BB::FG::Inputs* fg,
                              VideoCore::ImageId* depth_out) {
+    // bb-mv-skin: this scene frame's number (FG pairing: depth / vectors / object vectors are
+    // stamped with it where they are made; the presenter stamps the colour it presents).
+    const u64 scene_no = g_scene_frame.fetch_add(1, std::memory_order_relaxed) + 1;
     // The jitter this frame was drawn with, then the frame's camera (and the next jitter).
     float jx = 0, jy = 0;
     BB::Upscale::Jitter(jx, jy);
@@ -349,7 +361,10 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
     // bb-velocity: the native per-draw velocity (bb_objmv2.h) over the camera vectors, only where
     // a G-buffer draw wrote its own vector; bb_mv stays everywhere else.
+    const u64 composed_before = BB::ObjMv2::ComposedCount();
     BB::ObjMv2::Compose(cmd, motion.view, color.view, reactive.view, in, cam.reset);
+    const bool obj_composed =
+        !BB::ObjMv2::Active() || BB::ObjMv2::ComposedCount() != composed_before;
     lum_index ^= 1;
     lum_valid = true;
     Barrier(cmd, color, vk::ImageLayout::eShaderReadOnlyOptimal);
@@ -371,6 +386,12 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         fg->z_near = cam.z_near;
         fg->z_far = cam.z_far;
         fg->camera_valid = cam.valid;
+        // Pairing stamps (bb_fg_fsr3.cpp "[fg-amd] pairing"): depth copied above from this
+        // frame's scene depth; camera vectors only with this frame's camera (else zero); object
+        // vectors only when composed this frame.
+        fg->depth_frame = scene_no;
+        fg->mv_frame = cam.valid ? scene_no : 0;
+        fg->obj_frame = obj_composed ? scene_no : 0;
         std::memcpy(fg->view_to_clip, cam.view_to_clip, sizeof(fg->view_to_clip));
         std::memcpy(fg->clip_to_prev_clip, cam.clip_to_prev_clip, sizeof(fg->clip_to_prev_clip));
         // A 3D frame is one with the scene depth (movies and 2D flips have none); without the

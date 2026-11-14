@@ -3,6 +3,7 @@
 // BB native motion vectors: see bb_native_mv.h.
 
 #include "video_core/bb/bb_native_mv.h"
+#include "video_core/bb/bb_mv_engine.h"
 
 #include <algorithm>
 #include <array>
@@ -396,6 +397,7 @@ void SetDrawMeshRange(u64 begin, u64 end) {
 
 void OnGuestFlip() {
     g_frame.fetch_add(1, std::memory_order_relaxed);
+    BB::MvEngine::OnGuestFlip(); // bb-mv-skin: guest frame periods of the ring slot records
 }
 
 void GuestDrawMesh(u64 model, u64 mesh, u64 instance) {

@@ -1218,6 +1218,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
     }
 
+    // bb-mv-skin: the scene frame of the colour presented (FG pairing; the inputs carry the
+    // stamps of where they were made).
+    if (frame->fg.valid) frame->fg.color_frame = BB::SceneFrameNumber();
+
     // bb-clean-021-scene: a frame the upscaler did not take (title screen, menus, loading: no
     // scene depth) is still drawn at the resolution patch's reduced size; it is scaled to the
     // window with FSR 1 EASU + RCAS instead of the bilinear stretch (BB_MENU_SHARP=0: as before).
@@ -1310,6 +1314,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                      vk::ImageUsageFlagBits::eColorAttachment |
                                          vk::ImageUsageFlagBits::eSampled};
                 frame->fg.has_hudless = true;
+                frame->fg.hudless_frame = frame->fg.color_frame; // rendered from this frame
                 ok = true;
             } else {
                 ++failed;
