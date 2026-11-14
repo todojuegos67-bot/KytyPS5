@@ -4359,6 +4359,7 @@ public class BbOPopup : BbOLayer, IBbOAnim {
     public bool PreFilterMessage(ref Message m) {
       int msg = m.Msg;
       if (msg == 0x201 || msg == 0x204 || msg == 0x207 || msg == 0xA1 || msg == 0xA4 || msg == 0xA7) {
+        if (p.IsDisposed || !p.IsHandleCreated) return false;
         if (m.HWnd != p.Handle) return p.OutsideClick(m.HWnd);
       }
       return false;
@@ -4572,8 +4573,8 @@ public class BbOPopup : BbOLayer, IBbOAnim {
   void Commit(int i) {
     if (phase == 2) return;
     Result = i;
-    if (Committed != null) { try { Committed(this, EventArgs.Empty); } catch (Exception ex) { BbOLog.Write("seleccion: " + ex.Message); } }
     Close2();
+    if (Committed != null) { try { Committed(this, EventArgs.Empty); } catch (Exception ex) { BbOLog.Write("seleccion: " + ex.Message); } }
   }
   public bool OutsideClick(IntPtr hwnd) {
     bool eat = false;
@@ -4584,15 +4585,23 @@ public class BbOPopup : BbOLayer, IBbOAnim {
   public void Close2() {
     if (phase == 2) return;
     phase = 2; t0 = BbOPump.Now;
-    if (filter != null) { Application.RemoveMessageFilter(filter); filter = null; }
-    if (owner != null && deact != null) { owner.Deactivate -= deact; deact = null; }
+    Unhook();
     if (Dismissed != null) { try { Dismissed(this, EventArgs.Empty); } catch { } }
     Kick();
   }
+  void Unhook() {
+    if (filter != null) { try { Application.RemoveMessageFilter(filter); } catch { } filter = null; }
+    if (owner != null && deact != null) { try { owner.Deactivate -= deact; } catch { } deact = null; }
+  }
   void Finish() {
+    if (phase != 2) Close2();
     phase = 3;
     try { Hide(); } catch { }
     try { if (IsHandleCreated) BeginInvoke(new MethodInvoker(Dispose)); else Dispose(); } catch { }
+  }
+  protected override void Dispose(bool disposing) {
+    if (disposing) Unhook();
+    base.Dispose(disposing);
   }
 }
 
@@ -5809,7 +5818,10 @@ public sealed class BbOSkin : NativeWindow, IBbOAnim {
 			Write-Log 'Panel de opciones: fallo al dibujar; se vuelve al panel de siempre'
 			$bboF = $script:opt; $script:opt = $null
 			if ($bboF) { $bboF.Visible = $false }
-			$view.Visible = $true; Set-ScrollY 0
+			$view.Visible = $true
+			# las flechas de los desplegables copiaron Visible=$false mientras la vista estaba oculta
+			foreach ($bboG in $script:stackGroups) { foreach ($bboC in @($bboG.Controls)) { if ($bboC -is [System.Windows.Forms.Panel] -and $bboC.Tag -is [System.Windows.Forms.ComboBox]) { $bboC.Visible = [bool](Test-OwnVisible $bboC.Tag) } } }
+			Set-ScrollY 0
 		} catch { }
 	})
 	$bboO.SetBounds(0, $script:hd, $panelW, [math]::Max(1, $panel.ClientSize.Height - $script:hd))
