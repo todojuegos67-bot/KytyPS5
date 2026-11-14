@@ -99,6 +99,7 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        double submit_s = 0.0; // bb-smooth: steady clock when the game submitted it
 
         operator bool() const noexcept {
             return frame != nullptr;

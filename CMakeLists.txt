@@ -1216,6 +1216,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_fg.h
                src/video_core/bb/bb_fg_fsr3.cpp
                src/video_core/bb/bb_fg_dlssg.cpp
+               src/video_core/bb/bb_smooth.cpp
+               src/video_core/bb/bb_smooth.h
                src/video_core/bb/bb_fg_internal.h
                src/video_core/bb/bb_native_mv.cpp
                src/video_core/bb/bb_native_mv.h

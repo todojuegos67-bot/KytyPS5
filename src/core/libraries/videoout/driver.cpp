@@ -12,6 +12,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/bb/bb_smooth.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -334,6 +335,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .submit_s = BB::Smooth::Enabled() ? BB::Smooth::Now() : 0.0,
     });
 }
 
@@ -366,21 +368,42 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    // bb-smooth (BB_SMOOTH=1): while it governs, the vblank ticks on absolute deadlines at the
+    // held rung (high resolution timer + spin) instead of AccurateTimer.
+    double smooth_next = 0.0;
+    bool smooth_tick = false;
     while (!token.stop_requested()) {
-        timer.Start();
+        const double smooth_iv =
+            BB::Smooth::VblankInterval(double(vblank_hz), int(main_port.flip_rate));
+        smooth_tick = smooth_iv > 0.0;
+        if (smooth_tick) {
+            const double now = BB::Smooth::Now();
+            if (smooth_next <= 0.0) {
+                smooth_next = now;
+            } else {
+                smooth_next += smooth_iv;
+                if (now - smooth_next > smooth_iv) smooth_next = now; // late by a whole tick: resync
+            }
+            BB::Smooth::WaitUntil(smooth_next);
+        } else {
+            smooth_next = 0.0;
+            timer.Start();
+        }
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
-            timer.End();
+            if (!smooth_tick) timer.End();
             continue;
         }
+        bool smooth_took = false;
+        double smooth_submit = 0.0;
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (!request) {
-                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                if (smooth_tick || timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
                     } else if (ImGui::Core::MustKeepDrawing()) {
@@ -388,9 +411,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
+                smooth_took = true;
+                smooth_submit = request.submit_s;
                 Flip(request);
                 FRAME_END;
             }
+        }
+        if (smooth_tick) {
+            BB::Smooth::OnTick(smooth_next, smooth_took, smooth_submit, BB::Smooth::Now());
         }
 
         {
@@ -417,7 +445,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
-        timer.End();
+        if (!smooth_tick) timer.End();
     }
 }
 
