@@ -11,7 +11,10 @@ namespace Libs::Graphics::ShadowLayerRange {
 // pool views are T#s of thousands of layers (0x1021400000: BC7, 2353 layers of 1 MiB, base 754, a shader bound of 256)
 // over memory the GPU also renders into: kept whole they were a 1599-layer (1.6 GiB) image, one allocation and a 262 ms
 // upload, before a crash on a 16 GB PC. With `fix` (KYTY_LAYER_RANGE_FIX, default on) an array kept whole only for the
-// GPU-written memory keeps the shader's bound when its layers from the base pass `max_layers` or `max_bytes`.
+// GPU-written memory keeps the shader's bound when its layers from the base pass `max_layers` or `max_bytes`, and so
+// does a block-compressed array at any size: the GPU renders no BC texture, so its memory is GPU-written only through
+// another image over it (the pool lies over the shadow-map pool's lent layers), never a shadow map. `max_layers` (512)
+// keeps the 384x384x360 cube shadow pool (colour after its compute pass: 360 R32 layers of 576 KiB, 202 MiB) whole.
 struct Input {
 	uint32_t image_layers   = 0;     // the T#'s layers (DEPTH + 1)
 	uint32_t base_layer     = 0;     // the T#'s BASE_ARRAY
@@ -19,8 +22,9 @@ struct Input {
 	uint64_t layer_bytes    = 0;     // the guest bytes of one layer (all its levels)
 	bool     shadow_sample  = false; // a depth-compare sample or a depth image
 	bool     gpu_written    = false; // memory the GPU wrote, or under a GPU-written image
+	bool     block          = false; // a block-compressed format (BC1-7)
 	bool     fix            = true;
-	uint32_t max_layers     = 256;
+	uint32_t max_layers     = 512;
 	uint64_t max_bytes      = uint64_t {512} << 20u;
 };
 
@@ -36,7 +40,7 @@ inline Result ViewLayers(const Input& in) {
 	}
 	const uint32_t full = in.image_layers - in.base_layer;
 	if (in.fix && !in.shadow_sample &&
-	    (full > in.max_layers || static_cast<uint64_t>(full) * in.layer_bytes > in.max_bytes)) {
+	    (in.block || full > in.max_layers || static_cast<uint64_t>(full) * in.layer_bytes > in.max_bytes)) {
 		r.capped = full > in.bound_count;
 		return r;
 	}

@@ -1078,9 +1078,10 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// shadow pool) keep every layer to the T#'s last: the layer bound solved from the shader can miss the light's layer,
 	// which then reads a clamped, wrong layer (spot-shadow artifacts, as with the depth-array full re-upload).
 	// KYTY_LAYER_RANGE_FIX=1|0 (default: on): an array kept whole only because the GPU wrote its memory keeps the
-	// shader's bound past 256 layers or 512 MiB (shadowLayerRange.h): the streamed texture pool's T#s (2353 BC7 layers
-	// at 0x1021400000, base 754, a bound of 256) lie over GPU-written memory and became a 1599-layer, 1.6 GiB image.
-	// The spot-shadow pool (80 R32 layers, 320 MiB) and depth / depth-compare views are kept whole as before.
+	// shader's bound if block-compressed or past 512 layers or 512 MiB (shadowLayerRange.h): the streamed texture
+	// pool's T#s (2353 BC7 layers at 0x1021400000, base 754, a bound of 256) lie over GPU-written memory and became a
+	// 1599-layer, 1.6 GiB image. The spot-shadow pool (80 R32 layers, 320 MiB), the cube pool as colour (360 layers,
+	// 202 MiB) and depth / depth-compare views are kept whole as before.
 	if (desc.info.resources.layers > 1 && desc.view_info.base_layer < desc.info.resources.layers &&
 	    (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
 	     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray)) {
@@ -1094,6 +1095,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		in.bound_count   = desc.view_info.layer_count;
 		in.layer_bytes   = desc.info.data.size / desc.info.resources.layers;
 		in.shadow_sample = resource.depth_compare || desc.info.IsDepth();
+		in.block         = desc.info.IsBlock();
 		in.gpu_written   = !in.shadow_sample &&
 		                 (texture_cache.IsRegionGpuModified(desc.info.data.address, desc.info.data.size) ||
 		                  texture_cache.HasGpuWrittenImageOverlap(desc.info.data.address, desc.info.data.size));

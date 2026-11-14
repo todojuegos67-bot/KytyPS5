@@ -20,6 +20,14 @@ int main() {
 	Input b = s; b.fix = true; b.image_layers = 200; assert(ViewLayers(b).layer_count == 4);
 	// Huge T#, base near its end: few layers left -> whole range is fine.
 	Input e = in; e.fix = true; e.base_layer = 2300; e.bound_count = 53; assert(ViewLayers(e).layer_count == 53);
+	// Block-compressed, GPU-written (aliased) and small: still the bound.
+	Input c = in; c.fix = true; c.block = true; c.base_layer = 2200; c.layer_bytes = 1u << 20;
+	c.bound_count = 100; r = ViewLayers(c); assert(r.layer_count == 100 && r.capped);
+	// Cube shadow pool as colour: 360 R32 layers of 576 KiB, GPU-written, not depth-compare here -> whole.
+	Input q; q.image_layers = 360; q.bound_count = 256; q.layer_bytes = 576u << 10; q.gpu_written = true;
+	r = ViewLayers(q); assert(r.layer_count == 360 && !r.capped);
+	// 600 small layers: past max_layers -> bound.
+	q.image_layers = 600; assert(ViewLayers(q).layer_count == 256 && ViewLayers(q).capped);
 	// base out of range / single layer: the bound.
 	Input o = in; o.fix = true; o.base_layer = 2353; assert(ViewLayers(o).layer_count == 256);
 	std::puts("ok");
