@@ -216,11 +216,22 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
         pk = pk * 0x9e3779b97f4a7c15ull ^ regs.color_buffers[0].Address();
         BB::MvEngine::SetPass(pk);
     }
+    // bb-mv-fill: an Effect draw writes R, G, B of attachment 7 only (Blend: R, G, A or RGBA).
+    u32 effect = 0;
+    if (key.blend_controls[BB::ObjMv2::Attachment].enable != 0 &&
+        !(key.write_masks[BB::ObjMv2::Attachment] & vk::ColorComponentFlagBits::eA) &&
+        (key.write_masks[BB::ObjMv2::Attachment] & vk::ColorComponentFlagBits::eB)) {
+        effect = BB::ObjMv2::EffectDraw;
+        const auto& bc0 = liverpool->regs.blend_control[0];
+        if (bc0.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcAlpha) {
+            effect |= BB::ObjMv2::EffectSrcAlpha;
+        }
+    }
     BB::ObjMv2::OnDraw(push_data, pipeline->GetStage(Shader::SwStage::Vertex), memory,
                        buffer_cache, scheduler,
                        key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)], identity,
                        count, instances, key.blend_controls[BB::ObjMv2::Attachment].enable != 0,
-                       bb_cut.UiPhase());
+                       bb_cut.UiPhase(), effect);
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {

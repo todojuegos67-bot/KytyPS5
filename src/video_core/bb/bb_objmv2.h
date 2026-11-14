@@ -67,7 +67,10 @@ constexpr u32 Attachment = 7;
 
 // Mask: another draw of the scene pass; attachment 7 bound with write mask 0, stock shaders, so
 // switching between motion and other pipelines never restarts the render pass.
-enum class Kind : u8 { None = 0, Opaque = 1, Blend = 2, Mask = 3 };
+// Effect (bb-mv-fill, BB_MV_ENGINE=1 + BB_FG_SPARKS=1): additive / premultiplied effect draws
+// (sparks, embers, glows): class 5 and their static-world vector where their contribution is
+// bright (weight 0 / 1), the fog coverage (.w) kept.
+enum class Kind : u8 { None = 0, Opaque = 1, Blend = 2, Mask = 3, Effect = 4 };
 
 // Rasterizer: once, with the instance (creates buffers and the compose pass; false: off).
 bool Init(const Vulkan::Instance& instance);
@@ -86,7 +89,14 @@ void Attach(Vulkan::Scheduler& scheduler, Vulkan::RenderState& state);
 // `identity`: index buffer address or indirect argument address.
 void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
             VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler,
-            u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase);
+            u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase,
+            u32 effect = 0);
+// bb-mv-fill: `effect` of OnDraw: bit 0 an Effect draw (attachment 7 written R, G, B only),
+// bit 1 the game's own blend multiplies the colour by its src alpha.
+constexpr u32 EffectDraw = 1, EffectSrcAlpha = 2;
+// bb-mv-fill (BB_FG_SPARKS=1): the presenter's HUD-less pass marks the effect pixels (bit 1 of
+// .a of ObjectTarget) as "UI" for frame generation (taken from the real frame).
+bool SparksOn();
 // Presenter (bb_present_sr.cpp), after bb_mv.comp: the object vectors over the camera ones
 // (`mv` RG16F, General); `color` the presented colour (RGBA16F, General) for the check.
 // `reactive_view` the upscaler's reactive mask (R16F, General): bb-fog-mv may raise it.

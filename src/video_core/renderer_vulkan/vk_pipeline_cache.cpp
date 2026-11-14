@@ -168,7 +168,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
         info.hw.vs.bb_objmv = g_bb_objmv2 == BB::ObjMv2::Kind::Opaque ||
-                              g_bb_objmv2 == BB::ObjMv2::Kind::Blend;
+                              g_bb_objmv2 == BB::ObjMv2::Kind::Blend ||
+                              g_bb_objmv2 == BB::ObjMv2::Kind::Effect;
         break;
     }
     case HwStage::Fragment: {
@@ -184,8 +185,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
         info.hw.fs.bb_objmv = g_bb_objmv2 == BB::ObjMv2::Kind::Opaque ||
-                              g_bb_objmv2 == BB::ObjMv2::Kind::Blend;
+                              g_bb_objmv2 == BB::ObjMv2::Kind::Blend ||
+                              g_bb_objmv2 == BB::ObjMv2::Kind::Effect;
         info.hw.fs.bb_objmv_blend = g_bb_objmv2 == BB::ObjMv2::Kind::Blend;
+        info.hw.fs.bb_objmv_add = g_bb_objmv2 == BB::ObjMv2::Kind::Effect; // bb-mv-fill
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |

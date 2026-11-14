@@ -17,6 +17,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -811,6 +812,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                             dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    if (BB::MvEngine::Enabled()) {
+                        // bb-mv-fill: DMA source of the shared palette / slot buffers (identity).
+                        BB::MvEngine::OnGpuDma(dma_data->DstAddress<VAddr>(),
+                                               dma_data->SrcAddress<VAddr>(),
+                                               dma_data->NumBytes());
+                    }
                     rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
                                            dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
                                            false, false);

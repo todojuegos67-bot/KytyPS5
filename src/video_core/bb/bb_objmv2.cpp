@@ -221,6 +221,19 @@ struct State {
     u64 sec_keep_px = 0, sec_keep_dense = 0;
     bool fog_keepobj = false; // BB_FOG_KEEPOBJ=1
     std::unordered_map<u64, std::array<u32, 3>> fog_vs; // vs hash -> draws, with vector, no camera
+    // bb-mv-fill (BB_MV_ENGINE=1 + BB_FG_SPARKS=1): additive / premultiplied effect draws (Kind::
+    // Effect): class 5 + their static-world vector where their own contribution is bright.
+    bool sparks = false;
+    bool cur_effect = false; // the draw being processed is an effect draw
+    bool cur_effect_alpha = false; // ... whose game blend multiplies by src alpha
+    u32 spark_word = 0;      // push word: threshold (1/4096) | bit 16: contribution x src alpha
+    u32 spark_word_alpha = 0;
+    u64 sec_spark_draws = 0, sec_spark_vec = 0, sec_spark_no_cam = 0, sec_spark_px = 0,
+        sec_spark_frames = 0;
+    std::unordered_map<u64, std::array<u32, 2>> spark_vs; // vs hash -> draws, with vector
+    // bb-mv-fill: end-of-frame copies of the 1-slot ring slots (compose time).
+    VideoCore::BufferCache* bc = nullptr;
+    std::vector<BB::MvEngine::OwnSlot> own_tmp;
     // bb-tree-mv (BB_PLAYER_MASK): where the player mask (refine, FSR 3 "player from the real
     // frame") comes from. Vector: class-1 pixels in the centre whose vector differs from
     // bb_mv.comp's by > 0.75 px (bb_mv is off by several px on static scenery while the camera
@@ -383,6 +396,8 @@ void ReadStats(u32 slot) {
         g.sec_fog_obj += s[19];
         g.sec_keep_px += s[20];
         g.sec_keep_dense += s[21];
+        g.sec_spark_px += s[22];
+        ++g.sec_spark_frames;
     }
     if (g.slot_stat[slot]) {
         g.w30.static_px += s[8];
@@ -621,6 +636,29 @@ bool Init(const Vulkan::Instance& instance) {
             Log("[fog-keepobj] on: blended layers no longer pull object / character vectors "
                 "toward the static world (recovered where coverage <= 0.9), those pixels reactive");
         }
+        // bb-mv-fill: effect draws (BB_MV_ENGINE=1 + BB_FG_SPARKS=1); BB_FG_SPARKS_LUM: their
+        // own contribution (luminance of the colour they add, x src alpha when their blend
+        // does) above which a pixel is "spark" (default 0.25, scene-linear units).
+        g.sparks = g.velocity && BB::MvEngine::SparksEnabled();
+        {
+            const char* lv = std::getenv("BB_FG_SPARKS_LUM");
+            float lum = 0.25f;
+            if (lv != nullptr && lv[0] != 0) {
+                char* end = nullptr;
+                const float f = std::strtof(lv, &end);
+                if (end != lv && std::isfinite(f) && f > 0.0f) lum = std::min(f, 15.0f);
+            }
+            g.spark_word = std::clamp<u32>(u32(std::lround(lum * 4096.0f)), 1u, 0xffffu);
+            g.spark_word_alpha = g.spark_word | 0x10000u;
+            if (g.sparks || BB::MvEngine::Enabled()) {
+                Log(fmt::format("[sparks] {} (BB_FG_SPARKS=1 with BB_MV_ENGINE=1): additive / "
+                                "premultiplied effect draws write their static-world vector and "
+                                "class 5 where their own contribution > {:.3f} (BB_FG_SPARKS_LUM); "
+                                "those pixels: reactive for the upscaler, \"UI\" in the HUD-less "
+                                "image for frame generation (taken from the real frame)",
+                                g.sparks ? "on" : "off", lum));
+            }
+        }
         g.fog_reactive = g.fog && std::getenv("BB_FOG_REACTIVE") != nullptr &&
                          std::getenv("BB_FOG_REACTIVE")[0] == '1';
         Log(fmt::format("[fog-mv] {} (BB_FOG_MV=0 off): blended scene draws (fog, smoke, "
@@ -688,6 +726,15 @@ Kind Want(const AmdGpu::Regs& regs) {
     if (bc.color_src_factor == F::SrcAlpha && bc.color_dst_factor == F::OneMinusSrcAlpha) {
         return Kind::Blend;
     }
+    // bb-mv-fill (BB_FG_SPARKS=1): additive (dst One: sparks, embers, glows) and premultiplied
+    // (One, 1 - SrcAlpha) effects: they had no entry here, so the vector of whatever lies behind
+    // (the character hit, the floor) moved them in the generated frames (doubled sparks).
+    if (g.sparks && bc.color_func == AmdGpu::BlendControl::BlendFunc::Add &&
+        (bc.color_dst_factor == F::One ||
+         (bc.color_src_factor == F::One && bc.color_dst_factor == F::OneMinusSrcAlpha)) &&
+        (bc.color_src_factor == F::One || bc.color_src_factor == F::SrcAlpha)) {
+        return Kind::Effect;
+    }
     return Kind::Mask;
 }
 
@@ -708,6 +755,22 @@ void FillKey(Kind kind, u32& mrt_mask, u32& num_color_attachments, Shader::PsCol
     write_mask7 = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                   vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
     cb_shader_mask_raw |= 0xFu << (Attachment * 4);
+    if (kind == Kind::Effect) {
+        // bb-mv-fill: weight 0 / 1 (the fragment decides): (dx, dy) and class 5 replace what
+        // was behind where the effect's own contribution is bright; .w (fog coverage) kept.
+        using F = AmdGpu::BlendControl::BlendFactor;
+        write_mask7 = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                      vk::ColorComponentFlagBits::eB;
+        bc.enable = 1;
+        bc.color_src_factor = F::SrcAlpha;
+        bc.color_dst_factor = F::OneMinusSrcAlpha;
+        bc.color_func = AmdGpu::BlendControl::BlendFunc::Add;
+        bc.separate_alpha_blend = 1;
+        bc.alpha_src_factor = F::Zero;
+        bc.alpha_dst_factor = F::One;
+        bc.alpha_func = AmdGpu::BlendControl::BlendFunc::Add;
+        return;
+    }
     if (kind == Kind::Blend) {
         using F = AmdGpu::BlendControl::BlendFactor;
         bc.enable = 1;
@@ -855,9 +918,9 @@ void FlushVelocityCopies(vk::CommandBuffer cmd) {
 }
 
 bool VelSnap(VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler, u64 addr,
-             u32 size, SnapBuf& out) {
+             u32 size, SnapBuf& out, bool force = false) {
     const u64 key = Mix(addr, size);
-    if (const auto it = g.vel_addr_cur.find(key); it != g.vel_addr_cur.end()) {
+    if (const auto it = g.vel_addr_cur.find(key); !force && it != g.vel_addr_cur.end()) {
         out = it->second;
         return out.addr != 0;
     }
@@ -878,9 +941,45 @@ bool VelSnap(VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler,
             FlushVelocityCopies(scheduler.CommandBuffer());
         }
     }
-    g.vel_addr_cur[key] = sb;
+    // bb-mv-fill: a forced copy (a shared buffer the game rewrites before every draw) is never
+    // handed to another V# of the same address.
+    if (!force) g.vel_addr_cur[key] = sb;
     out = sb;
     return sb.addr != 0;
+}
+
+// bb-mv-fill: end of the frame (compose, before the next frame's ring DMAs): a copy of every
+// 1-slot ring slot recorded in the last two frames, keyed by the ring (whole slot), so that next
+// frame's draws find last frame's transform whenever the object was drawn, in any pass (also a
+// shadow-only draw, or a draw whose V# lookup failed that frame).
+void SnapshotOwnSlots(vk::CommandBuffer cmd) {
+    if (g.bc == nullptr || !BB::MvEngine::SlotsEnabled()) return;
+    BB::MvEngine::RecentOwnSlots(g.own_tmp);
+    u64 made = 0, skipped = 0;
+    for (const auto& o : g.own_tmp) {
+        const u64 okey = Mix(o.key, 0x656e64736cull);
+        if (g.vel_id_cur.count(okey) != 0) continue;
+        const u64 bytes = (o.size + 15) & ~u64(15);
+        // (The slot changes only through the ring's DMA, which the GPU thread executes in stream
+        // order: at this point its contents, GPU-side or in guest memory, are this frame's.)
+        if (o.size == 0 || o.size > 0x10000 || g.arena_used + bytes > kArenaBytes) {
+            ++skipped;
+            continue;
+        }
+        const auto [buffer, buffer_off] = g.bc->ObtainBuffer(o.addr, u32(o.size));
+        if (buffer == nullptr) {
+            ++skipped;
+            continue;
+        }
+        const u64 off = SlotArenaOffset(g.slot) + g.arena_used;
+        g_pending.push_back({buffer->Handle(), buffer_off, off, o.size});
+        g.arena_used += bytes;
+        g.vel_id_cur[okey] = SnapBuf{g.base_addr + off, u32(o.size / 4), u32(o.size), 0};
+        ++made;
+    }
+    FlushVelocityCopies(cmd);
+    BB::MvEngine::Count(BB::MvEngine::Stat::OwnEndCopies, made);
+    BB::MvEngine::Count(BB::MvEngine::Stat::OwnEndSkipped, skipped);
 }
 
 // Camera blocks matched by their order in the frame (not by address): accepted only when the
@@ -1001,10 +1100,17 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                   VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler, u64 vs_hash,
                   bool blend, u64 mesh, u64 mesh_base, u32 mesh_index) {
     const auto t0 = std::chrono::steady_clock::now();
+    g.bc = &buffer_cache;
+    const bool effect = blend && g.cur_effect; // bb-mv-fill: additive / premultiplied effect
+    const bool strict = BB::MvEngine::StrictEnabled();
     ++g.vs_draws;
     ++g.sec_draws;
     ++g.w30.draws;
-    if (blend) {
+    if (effect) {
+        ++g.sec_spark_draws;
+        ++g.spark_vs[vs.pgm_hash][0];
+        if (!g.fog) return; // the static-world vector needs the bb-fog-mv path
+    } else if (blend) {
         ++g.sec_fog_draws;
         if (g.fog) ++g.fog_vs[vs.pgm_hash][0];
         if (!g.fog) {
@@ -1052,7 +1158,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             if (BB::MvEngine::LookupSlot(addr, size, sh)) {
                 namespace E = BB::MvEngine;
                 engine_draw = true;
-                E::Count(sh.skinned ? E::Stat::SlotSkin : E::Stat::SlotRigid);
+                if (!sh.override) E::Count(sh.skinned ? E::Stat::SlotSkin : E::Stat::SlotRigid);
                 if (sh.skinned) {
                     if (!skinned) ++g.vs_skin_draws_all;
                     skinned = true;
@@ -1079,11 +1185,25 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                     E::Count(E::Stat::SlotUnchanged);
                     break;
                 case E::SlotMode::Own: {
+                    if (sh.override) {
+                        E::Count(E::Stat::OvrSeen);
+                        // bb-mv-fill: an override buffer the game rewrites (DMA) for several draws
+                        // of one frame holds no single object's transform: camera-only.
+                        u64 dsrc = 0;
+                        u32 dwr = 0;
+                        if (E::DmaSource(addr, size, dsrc, dwr) && dwr >= 2) {
+                            E::Count(E::Stat::OvrShared);
+                            break;
+                        }
+                    }
                     const u64 okey = Mix(Mix(Mix(sh.key, sh.offset), size), 0x6f776e736cull);
                     SnapBuf ocur{0, 0, 0, 0};
                     if (VelSnap(buffer_cache, scheduler, addr, size, ocur)) {
                         g.vel_id_cur.try_emplace(okey, ocur);
                     }
+                    // bb-mv-fill: the end-of-frame copy of the whole slot (made for every 1-slot
+                    // ring drawn, in any pass) when this V# had no copy of its own last frame.
+                    const u64 ekey = Mix(sh.key, 0x656e64736cull);
                     if (const auto it = g.vel_id_prev.find(okey); it != g.vel_id_prev.end() &&
                                                                   it->second.addr != 0 &&
                                                                   it->second.dwords == size / 4) {
@@ -1092,16 +1212,30 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                         obj_moved = true;
                         have_prev = true;
                         E::Count(E::Stat::SlotOwn);
+                        if (sh.override) E::Count(E::Stat::OvrPrev);
+                    } else if (const auto ie = g.vel_id_prev.find(ekey);
+                               ie != g.vel_id_prev.end() && ie->second.addr != 0 &&
+                               u64(ie->second.dwords) * 4 >= sh.offset + size) {
+                        prev[h] = SnapBuf{ie->second.addr + sh.offset, size / 4, size, 0};
+                        use[h] = true;
+                        obj_moved = true;
+                        have_prev = true;
+                        E::Count(E::Stat::SlotOwn);
+                        E::Count(E::Stat::SlotOwnEnd);
+                        if (sh.override) E::Count(E::Stat::OvrPrev);
                     } else {
                         E::Count(E::Stat::SlotOwnMissing);
+                        E::Count(sh.drawn_prev ? E::Stat::SlotOwnMissDrawn
+                                               : E::Stat::SlotOwnMissNew);
                     }
                     break;
                 }
                 default:
+                    if (sh.override) E::Count(E::Stat::OvrSeen);
                     E::Count(E::Stat::SlotNone);
                     break;
                 }
-                if (have_prev) {
+                if (have_prev && !sh.override) {
                     E::Count(sh.skinned ? E::Stat::SlotSkinPrev : E::Stat::SlotRigidPrev);
                     if (sh.skinned) ++skin_slot_prev;
                 }
@@ -1110,6 +1244,60 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         }
         if (eng && !blend && (role == VelRole::Current || role == VelRole::Palette) &&
             size >= 48 && size <= 16384) {
+            // bb-mv-fill: BonePalette's palettes reach the GPU through one of five shared buffers
+            // that the sink DMAs the CPU palette into before every draw (0x224d620 ->
+            // 0x2568a20): the DMA source (the instance's bone matrices or its frame copy) is the
+            // object. Its copy is taken now (forced: the same address holds another object's
+            // palette at the next draw) and last frame's copy of that object is the previous.
+            if (slots) {
+                namespace E = BB::MvEngine;
+                u64 dsrc = 0, dkey = 0;
+                u32 dwr = 0;
+                const bool pal = role == VelRole::Palette;
+                // (the CP DMA of this frame into that address, or the GX buffer update's copy
+                // into transient memory whose V# the draw reads: 0x26b1c40)
+                const bool dma = E::DmaSource(addr, size, dsrc, dwr) ||
+                                 E::CopySource(memory, addr, size, dsrc);
+                const bool rec = dma && E::LookupPaletteSource(memory, dsrc, dkey);
+                if (dma && pal && !rec) E::Count(E::Stat::PalDmaNoRecord);
+                // (A small V# (1-2 bones: weapons, props on a bone) counts only with a
+                // BonePalette record; a palette-sized one without a record is camera-only in
+                // strict mode, else it keeps the old path.)
+                if (rec || (dma && pal && strict)) {
+                    E::Count(E::Stat::PalDma);
+                    if (pal) {
+                        if (!skinned && !blend) ++g.vs_skin_draws_all;
+                        skinned = true;
+                        ++pal_bufs;
+                    }
+                    if (!rec) {
+                        if (pal) ++pal_matched; // its current data (camera-only), not a failure
+                        continue;
+                    }
+                    E::Count(E::Stat::PalDmaId);
+                    engine_draw = true;
+                    if (pal) game_skin = true;
+                    const u64 pkey = Mix(Mix(dkey, size), 0x646d61ull);
+                    SnapBuf pcur{0, 0, 0, 0};
+                    if (VelSnap(buffer_cache, scheduler, addr, size, pcur, true)) {
+                        if (blend) {
+                            g.vel_id_cur.try_emplace(pkey, pcur);
+                        } else {
+                            g.vel_id_cur.insert_or_assign(pkey, pcur);
+                        }
+                    }
+                    if (const auto it = g.vel_id_prev.find(pkey); it != g.vel_id_prev.end() &&
+                                                                  it->second.addr != 0 &&
+                                                                  it->second.dwords == size / 4) {
+                        E::Count(E::Stat::PalDmaPrev);
+                        prev[h] = it->second;
+                        use[h] = true;
+                        if (!pal) obj_moved = true;
+                    }
+                    if (pal) ++pal_matched; // without last frame's copy: camera-only
+                    continue;
+                }
+            }
             // bb-mv-engine: the game's own object (BonePalette hook) owns this buffer: last
             // frame's copy of the same object, nothing else (no address / mesh / order match).
             BB::MvEngine::Count(BB::MvEngine::Stat::PalLookups);
@@ -1157,6 +1345,16 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 BB::MvEngine::Count(BB::MvEngine::Stat::PalNoRecordCamOnly);
                 continue;
             }
+            if (strict && role == VelRole::Palette) {
+                // bb-mv-fill (strict): no engine record: the draw reads this buffer's current
+                // data with last frame's camera (camera-only), never a guessed copy.
+                BB::MvEngine::Count(BB::MvEngine::Stat::StrictCamOnly);
+                if (!skinned && !blend) ++g.vs_skin_draws_all;
+                skinned = true;
+                ++pal_bufs;
+                ++pal_matched;
+                continue;
+            }
             if (role == VelRole::Palette) BB::MvEngine::Count(BB::MvEngine::Stat::FallbackOld);
         }
         if (role == VelRole::Current && eng && !slots && !blend && size >= 16) {
@@ -1202,7 +1400,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                                 : g.pal_ids.emplace(addr, BB::NativeMv::LookupPalette(addr))
                                       .first->second;
             if (id.key == 0) {
-                ++g.sec_fog_skin_skipped;
+                if (!effect) ++g.sec_fog_skin_skipped;
                 ok = false;
                 break;
             }
@@ -1238,7 +1436,9 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 std::array<float, 216> c;
                 if (CameraCpuCopy(memory, buffer_cache, addr, c)) g.cam_cpu_cur[ord] = c;
             }
-            if (BB::MvEngine::Enabled() && !blend && (ord & 0x80000000u) == 0) {
+            // bb-mv-fill: blended draws too (they read the same camera block; before, their
+            // camera came by order: "previous camera by order" ~13/frame).
+            if (BB::MvEngine::Enabled() && (!blend || BB::MvEngine::StrictEnabled())) {
                 // bb-mv-engine (engine camera, authoritative): the block whose view is the
                 // engine's current view takes last frame's block holding the engine's previous
                 // view (SSAO reprojection's own previous camera). Once per block and frame.
@@ -1277,9 +1477,12 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                                                 : BB::MvEngine::Stat::CamEngNoBlock);
                     }
                 }
-                if (ce->second.addr != 0) found = &ce->second;
+                if (ce->second.addr != 0) {
+                    found = &ce->second;
+                    if (blend) BB::MvEngine::Count(BB::MvEngine::Stat::CamEngBlend);
+                }
             }
-            if (BB::MvEngine::Enabled() && !blend) {
+            if (BB::MvEngine::Enabled() && !blend && !strict) {
                 // bb-mv-engine: the block of this pass (depth target + viewport) and its order
                 // inside the pass; order 0 is taken without the similarity test (large camera
                 // moves at 30 fps failed it), later blocks of a pass use the old path.
@@ -1299,6 +1502,10 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             }
             if (found != nullptr) {
                 // bb-mv-engine: found by pass
+            } else if (strict) {
+                // bb-mv-fill (strict): no engine camera: no previous camera of any kind (address
+                // reuse and block order are guesses); the draw keeps bb_mv's camera vector.
+                BB::MvEngine::Count(BB::MvEngine::Stat::StrictNoCam);
             } else if (const auto it = g.vel_addr_prev.find(akey);
                 it != g.vel_addr_prev.end() && it->second.addr != 0) {
                 found = &it->second;
@@ -1325,7 +1532,9 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 }
             }
             if (found == nullptr) {
-                if (blend) {
+                if (effect) {
+                    ++g.sec_spark_no_cam;
+                } else if (blend) {
                     ++g.sec_fog_no_cam;
                     ++g.fog_vs[vs.pgm_hash][2];
                 } else {
@@ -1375,6 +1584,13 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                         if (have_cur) g.vel_id_cur[rkey] = cur;
                     }
                 }
+            }
+            if (found == nullptr && strict) {
+                // bb-mv-fill (strict): only the game ring identity above; no address / ring order /
+                // mesh / draw order guess: this buffer is read with its current data (camera-only).
+                BB::MvEngine::Count(BB::MvEngine::Stat::StrictCamOnly);
+                ++pal_matched;
+                continue;
             }
             if (found == nullptr) {
                 if (const auto it = g.vel_addr_prev.find(akey);
@@ -1563,6 +1779,19 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         g.table_used += bytes;
         const u64 ea = g.base_addr + off;
         push.objmv_entry = {u32(ea), u32(ea >> 32)};
+        if (effect) {
+            // bb-mv-fill: the effect's static-world vector and class 5 where its contribution is
+            // bright (fragment: weight 0 / 1, push word = threshold).
+            push.objmv_flags = 1u;
+            push.objmv_fog = g.cur_effect_alpha ? g.spark_word_alpha : g.spark_word;
+            ++g.sec_spark_vec;
+            ++g.spark_vs[vs.pgm_hash][1];
+            ++g.frame_vec_draws;
+            g.vs_cpu_ns += std::chrono::duration<double, std::nano>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+            return;
+        }
         if (blend) {
             // bb-fog-mv: the blended draw's own vector, density-weighted (fragment, flags bit 3).
             push.objmv_flags = 1u | 8u;
@@ -1610,7 +1839,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         }
     } else if (ok && camera && g.history) {
         ++g.sec_overflow;
-    } else if (blend && ok && !camera) {
+    } else if (blend && !effect && ok && !camera) {
         ++g.sec_fog_no_block; // bb-fog-mv: its vertex shader reads no 864 B camera block
     }
     g.vs_cpu_ns +=
@@ -1654,9 +1883,12 @@ void LogNative2() {
 
 void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager* memory,
             VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler,
-            u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase) {
+            u64 vs_hash, u64 identity, u32 count, u32 instances, bool blend, bool ui_phase,
+            u32 effect) {
     push.objmv_flags = 0;
     push.objmv_fog = g.fog_curve;
+    g.cur_effect = g.sparks && (effect & EffectDraw) != 0;
+    g.cur_effect_alpha = (effect & EffectSrcAlpha) != 0;
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
     if (!g.ready || ui_phase) return;
     if (g.velocity) {
@@ -1830,6 +2062,10 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
         std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
 }
 
+bool SparksOn() {
+    return g.ready && g.sparks;
+}
+
 bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y) {
     if (!g.ready || !g.image || !g.view || g.width == 0 || g.height == 0 || g.last_render.width == 0) {
         return false;
@@ -1856,6 +2092,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     if (render.width > g.width || render.height > g.height) return;
     g.composed = true;
     ++g_composed_count;
+    SnapshotOwnSlots(cmd); // bb-mv-fill: last frame's copy of every 1-slot ring drawn
     g.last_render = render;
     const u32 slot = g.slot;
     ReadStats(slot);
@@ -1871,7 +2108,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     // bb-native-mv2: the player mask is the skinned (class 4) pixels in the centre; kept every
     // frame (ping-pong) as with refine.
     const bool characters = g.player_mask != State::PlayerMask::Vector;
-    const bool keep = refine || characters;
+    const bool keep = refine || characters || g.sparks; // bb-mv-fill: the spark mask (.a)
     const bool store_color = color_view && ((g.check && IsStatFrame(g.frame + 1)) || keep);
     if (!stat && !store_color && (g.frame_vec_draws == 0 || reset)) {
         // Nothing moving drew this frame: the camera vectors stay as they are.
@@ -1970,7 +2207,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
                                       (store_color ? 4u : 0u) | (check ? 8u : 0u) |
                                       (refine_now ? 16u : 0u) | (characters ? 32u : 0u) |
                                       (g.fog ? 64u : 0u) | (g.fog_reactive ? 128u : 0u) |
-                                      (g.fog_keepobj ? 256u : 0u)};
+                                      (g.fog_keepobj ? 256u : 0u) | (g.sparks ? 512u : 0u)};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
@@ -2204,6 +2441,28 @@ void OnFlip() {
                 g.fog_keepobj ? "on" : "off", g.sec_keep_px, g.sec_keep_dense,
                 shaders.empty() ? " none" : shaders));
         }
+        if (g.sparks) {
+            // bb-mv-fill: effect draws (sparks, embers, glows) and their class-5 pixels.
+            std::vector<std::pair<u64, std::array<u32, 2>>> top(g.spark_vs.begin(),
+                                                                g.spark_vs.end());
+            std::sort(top.begin(), top.end(),
+                      [](const auto& a, const auto& b) { return a.second[0] > b.second[0]; });
+            std::string shaders;
+            for (size_t i = 0; i < top.size() && i < 8; ++i) {
+                shaders += fmt::format(" {:#x}:{}/{}", top[i].first, top[i].second[1],
+                                       top[i].second[0]);
+            }
+            Log(fmt::format(
+                "[sparks] effect draws {:.1f}/frame: with their static-world vector {:.1f}, no "
+                "previous camera {:.1f} | spark px (class 5) {:.2f}% of the frame on statistics "
+                "frames | vs with vector/draws (1 s):{}",
+                double(g.sec_spark_draws) / f, double(g.sec_spark_vec) / f,
+                double(g.sec_spark_no_cam) / f, Pct(g.sec_spark_px, g.sec_px_all),
+                shaders.empty() ? " none" : shaders));
+        }
+        g.spark_vs.clear();
+        g.sec_spark_draws = g.sec_spark_vec = g.sec_spark_no_cam = g.sec_spark_px =
+            g.sec_spark_frames = 0;
         g.fog_vs.clear();
         g.sec_fog_draws = g.sec_fog_vec = g.sec_fog_skin = g.sec_fog_no_cam =
             g.sec_fog_skin_skipped = g.sec_fog_no_block = 0;

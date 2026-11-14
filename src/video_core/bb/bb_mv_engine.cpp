@@ -36,6 +36,9 @@ struct Rec {
     u64 key = 0;
     u64 sink = 0;
     u64 stamp = 0;
+    // bb-mv-fill: BonePalette's direct paths (0x21d1115 / 0x21d1501): the palette is the
+    // instance's own bone matrices (stable, rewritten in place), not a frame-allocator copy.
+    bool direct = false;
 };
 struct Slot {
     std::array<Rec, kHist> r{};
@@ -48,6 +51,14 @@ struct Tls {
     bool valid = false;
 };
 thread_local Tls t_cur;
+thread_local u64 t_last_pal = 0; // bb-mv-fill: the palette last handed to the sink (this thread)
+
+// bb-mv-fill: transient copies of BonePalette palettes (GX buffer update 0x26b1c40), under g_mx.
+struct CopyRec {
+    u64 src = 0, bytes = 0, hash = 0, stamp = 0;
+};
+std::map<u64, CopyRec> g_copy;
+std::atomic<u64> g_copy_rec{0};
 
 std::mutex g_mx;
 std::map<u64, Slot> g_pal; // palette start -> records
@@ -115,6 +126,8 @@ struct SlotRec {
     u64 size = 0;   // slot buffer size ([obj+0x2c])
     SlotMode mode = SlotMode::None;
     bool skinned = false;
+    bool override = false;   // bb-mv-fill: [sink+0x1c8] override buffer
+    bool drawn_prev = false; // bb-mv-fill: ring drawn in the previous guest frame
 };
 std::map<u64, SlotRec> g_slots;
 struct RingSeen {
@@ -131,6 +144,17 @@ enum class SlotWhy : u8 {
 std::array<std::atomic<u64>, size_t(SlotWhy::Count)> g_slot_why_skin{}, g_slot_why_rigid{};
 std::atomic<u64> g_slot_rings1{0}, g_slot_rings2{0};
 constexpr u64 kSlotMaxAge = 4; // GPU frames
+
+// bb-mv-fill: CP DMA memory -> memory of this GPU frame (GPU command thread only).
+struct DmaRec {
+    u64 src = 0, bytes = 0;
+    u32 writes = 0;
+};
+std::map<u64, DmaRec> g_dma;
+u64 g_dma_count = 0; // GPU command thread
+std::atomic<u64> g_pal_direct{0}, g_pal_direct_bad{0}, g_dm_ovr_rec{0};
+std::unordered_set<u64> g_ovr_objs_frame; // under g_rmx
+u64 g_ovr_objs_sum = 0;
 
 u64 Mix(u64 a, u64 b) {
     u64 h = a ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2));
@@ -167,6 +191,30 @@ bool Enabled() {
     return on;
 }
 
+bool StrictEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_MV_ENGINE_STRICT");
+        return Enabled() && !(v != nullptr && v[0] == '0');
+    }();
+    return on;
+}
+
+bool OverrideEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_MV_ENGINE_OVERRIDE");
+        return Enabled() && v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
+bool SparksEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_FG_SPARKS");
+        return Enabled() && v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
 bool SlotsEnabled() {
     static const bool on = [] {
         const char* v = std::getenv("BB_MV_ENGINE_SLOTS");
@@ -192,6 +240,33 @@ void SetHooks(bool installed, const char* detail) {
 void GuestPaletteBegin(u64 model, u64 sink, u64 mesh, u64 bones, u32 consumer) {
     t_cur = {model, sink, mesh, bones, consumer, bones != 0};
     g_guest_begins.fetch_add(1, std::memory_order_relaxed);
+    if (bones == 0 || model == 0 || mesh == 0)
+        return;
+    // bb-mv-fill: the two direct paths of BonePalette 0x21d1080 (twin 0x21d1650 identical) that
+    // tail-call sink vtable+0x20 / +0x28 without the SetPalette sites (log: entries 4.7/frame,
+    // sites 0): [model+0x200] != 0, n = [model+0x1c] > 0, [mesh+4] == 0 -> 0x21d1115: the palette
+    // is `bones` itself (n matrices); [model+0x200] == 0, [mesh+4] == 0, u16 [mesh+0x18] == 0 ->
+    // 0x21d1501: one matrix, bones + u16 [mesh+0x16] * 48. The sink then DMAs it into a shared
+    // buffer (0x224d620 -> 0x2568a20): the source address is this object's identity.
+    const auto rd8 = [](u64 a) { return *reinterpret_cast<const u8*>(a); };
+    u64 pal = 0;
+    if (rd8(model + 0x200) != 0) {
+        const s32 n = *reinterpret_cast<const s32*>(model + 0x1c);
+        if (n > 0 && rd8(mesh + 4) == 0)
+            pal = bones;
+    } else if (rd8(mesh + 4) == 0 && *reinterpret_cast<const u16*>(mesh + 0x18) == 0) {
+        pal = bones + u64(*reinterpret_cast<const u16*>(mesh + 0x16)) * 48;
+    }
+    if (pal == 0)
+        return;
+    const u64 h = Hash48(reinterpret_cast<const void*>(pal));
+    const u64 key = Mix(Mix(Mix(bones, mesh), consumer), 0x6f626a);
+    std::scoped_lock lk{g_mx};
+    Slot& s = g_pal[pal];
+    s.r[s.next % kHist] = {h, key, sink, g_stamp.load(std::memory_order_relaxed), true};
+    ++s.next;
+    t_last_pal = pal;
+    g_pal_direct.fetch_add(1, std::memory_order_relaxed);
 }
 
 void GuestPaletteSet(u64 palette, u32 consumer) {
@@ -205,7 +280,8 @@ void GuestPaletteSet(u64 palette, u32 consumer) {
     const u64 key = Mix(Mix(Mix(t_cur.bones, t_cur.mesh), consumer), 0x6f626a);
     std::scoped_lock lk{g_mx};
     Slot& s = g_pal[palette];
-    s.r[s.next % kHist] = {h, key, t_cur.sink, g_stamp.load(std::memory_order_relaxed)};
+    s.r[s.next % kHist] = {h, key, t_cur.sink, g_stamp.load(std::memory_order_relaxed), false};
+    t_last_pal = palette;
     ++s.next;
     g_recorded.fetch_add(1, std::memory_order_relaxed);
 }
@@ -256,6 +332,7 @@ void RecordSlots(u64 ring, bool skinned, u64 key_base, s32 idx, s32 pidx, s32 sl
         rec.stamp = stamp;
         rec.size = size;
         rec.skinned = skinned;
+        rec.drawn_prev = r.pperiod != 0 && r.pperiod + 1 == P;
         SlotWhy w;
         if (overridden) {
             // +0x30 binds [sink+0x1c8] instead of the slot: this slot is not what the VS reads.
@@ -341,9 +418,30 @@ void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance) {
                 return rd64s(rd64s(ring + 8) + u64(s64(i)) * 8);
             return rd64s(rd64s(rd64s(ring) + u64(s64(i)) * 0x28 + 8) + bone * 8);
         };
-        const bool overridden = rd64s(sink + 0x1c8) != 0 && rd32s(sink + 0x108) == 1;
-        if (overridden)
+        const u64 ovr_obj = rd64s(sink + 0x1c8);
+        const bool overridden = ovr_obj != 0 && rd32s(sink + 0x108) == 1;
+        if (overridden) {
             g_dm_override.fetch_add(1, std::memory_order_relaxed);
+            // bb-mv-fill: sink vtable+0x30 (0x224d880) binds this GX buffer object (GPU address
+            // [obj+0x20], size [obj+0x2c], as the ring slots) as GX const slot 5 instead of the
+            // ring slot. Recorded by its own address: camera-only, or (BB_MV_ENGINE_OVERRIDE=1)
+            // our own copy of last frame's contents keyed by the buffer object.
+            const u64 oa = rd64s(ovr_obj + 0x20);
+            const u64 os = *reinterpret_cast<const u32*>(ovr_obj + 0x2c);
+            if (oa != 0 && os != 0 && os <= 0x100000) {
+                SlotRec rec{};
+                rec.key = Mix(ovr_obj, 0x6f7672ull);
+                rec.stamp = g_stamp.load(std::memory_order_relaxed);
+                rec.size = os;
+                rec.mode = OverrideEnabled() ? SlotMode::Own : SlotMode::None;
+                rec.override = true;
+                rec.drawn_prev = true;
+                std::scoped_lock lk{g_rmx};
+                g_slots[oa] = rec;
+                g_ovr_objs_frame.insert(ovr_obj);
+                g_dm_ovr_rec.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         g_dm_rigid.fetch_add(1, std::memory_order_relaxed);
         if (slots <= 1)
             g_dm_single.fetch_add(1, std::memory_order_relaxed);
@@ -587,6 +685,8 @@ bool LookupSlot(u64 addr, u64 size, SlotHit& out) {
         return false;
     out = {};
     out.skinned = r.skinned;
+    out.override = r.override;
+    out.drawn_prev = r.drawn_prev;
     out.key = r.key;
     out.offset = off;
     // A V# running past the slot's end would read past the previous slot too.
@@ -639,6 +739,122 @@ bool LookupPalette(Core::MemoryManager* memory, bool gpu_modified, u64 addr, Obj
     return true;
 }
 
+void OnGpuDma(u64 dst, u64 src, u64 bytes) {
+    if (dst == 0 || bytes == 0 || bytes > 0x100000)
+        return;
+    ++g_dma_count;
+    DmaRec& d = g_dma[dst];
+    d.src = src;
+    d.bytes = bytes;
+    ++d.writes;
+    if (g_dma.size() > 65536)
+        g_dma.clear();
+}
+
+bool DmaSource(u64 addr, u64 size, u64& src, u32& writes) {
+    auto it = g_dma.upper_bound(addr);
+    if (it == g_dma.begin())
+        return false;
+    --it;
+    const u64 off = addr - it->first;
+    if (off + size > it->second.bytes)
+        return false;
+    src = it->second.src + off;
+    writes = it->second.writes;
+    return true;
+}
+
+bool LookupPaletteSource(Core::MemoryManager* memory, u64 src, u64& key) {
+    u64 start = 0;
+    Slot slot;
+    {
+        std::scoped_lock lk{g_mx};
+        auto it = g_pal.upper_bound(src);
+        if (it == g_pal.begin())
+            return false;
+        --it;
+        if (src - it->first >= kMaxOffset)
+            return false;
+        start = it->first;
+        slot = it->second;
+    }
+    const u64 now = g_stamp.load(std::memory_order_relaxed);
+    const Rec* best = nullptr;
+    bool hashed = false;
+    u64 h = 0;
+    for (const Rec& r : slot.r) {
+        if (r.key == 0 || r.stamp + kKeepFrames < now)
+            continue;
+        if (!r.direct) {
+            // A frame-allocator palette: only while guest memory still holds what was recorded.
+            if (!hashed) {
+                if (memory == nullptr || !memory->IsValidMapping(start, 48))
+                    return false;
+                h = Hash48(reinterpret_cast<const void*>(start));
+                hashed = true;
+            }
+            if (r.hash != h)
+                continue;
+        }
+        // The instance's own bone matrices (direct): rewritten in place every frame, the address
+        // is the instance's for as long as it lives.
+        if (best == nullptr || r.stamp > best->stamp)
+            best = &r;
+    }
+    if (best == nullptr)
+        return false;
+    key = Mix(best->key, src - start);
+    return true;
+}
+
+void GuestPalCopy(u64 src, u64 dst, u64 bytes) {
+    const u64 pal = t_last_pal;
+    if (pal == 0 || src < pal || src - pal >= kMaxOffset || dst == 0 || bytes < 48 ||
+        bytes > 0x10000) {
+        return;
+    }
+    t_last_pal = 0; // one copy per palette handed over
+    const u64 h = Hash48(reinterpret_cast<const void*>(dst));
+    std::scoped_lock lk{g_mx};
+    g_copy[dst] = {src, bytes, h, g_stamp.load(std::memory_order_relaxed)};
+    g_copy_rec.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool CopySource(Core::MemoryManager* memory, u64 addr, u64 size, u64& src) {
+    u64 start = 0;
+    CopyRec r;
+    {
+        std::scoped_lock lk{g_mx};
+        auto it = g_copy.upper_bound(addr);
+        if (it == g_copy.begin())
+            return false;
+        --it;
+        start = it->first;
+        r = it->second;
+    }
+    if (addr - start + size > r.bytes ||
+        r.stamp + kKeepFrames < g_stamp.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    // Transient memory is reused: only while it still holds what was copied into it.
+    if (memory == nullptr || !memory->IsValidMapping(start, 48) ||
+        Hash48(reinterpret_cast<const void*>(start)) != r.hash) {
+        return false;
+    }
+    src = r.src + (addr - start);
+    return true;
+}
+
+void RecentOwnSlots(std::vector<OwnSlot>& out) {
+    out.clear();
+    const u64 now = g_stamp.load(std::memory_order_relaxed);
+    std::scoped_lock lk{g_rmx};
+    for (const auto& [addr, r] : g_slots) {
+        if (r.mode == SlotMode::Own && !r.override && r.stamp + 1 >= now)
+            out.push_back({addr, r.size, r.key});
+    }
+}
+
 void SetPass(u64 pass_key) {
     g_pass = pass_key;
 }
@@ -673,6 +889,12 @@ void OnFrame() {
     g_pass_n.clear();
     g_passes_frame.clear();
     g_sinks_frame.clear();
+    g_dma.clear();
+    {
+        std::scoped_lock lk{g_rmx};
+        g_ovr_objs_sum += g_ovr_objs_frame.size();
+        g_ovr_objs_frame.clear();
+    }
     const u64 stamp = g_stamp.fetch_add(1) + 1;
     const auto now = Clock::now();
     if (now - g_t0 < std::chrono::seconds(1)) return;
@@ -691,6 +913,13 @@ void OnFrame() {
             }
         }
         addrs = g_pal.size();
+        for (auto it = g_copy.begin(); it != g_copy.end();) {
+            if (it->second.stamp + kKeepFrames < stamp) {
+                it = g_copy.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     size_t rigid_addrs = 0;
     {
@@ -790,6 +1019,34 @@ void OnFrame() {
                         "drawn with 1 slot {:.1f}, 2+ slots {:.1f}, flip {}",
                         ws, wr, double(g_slot_rings1.exchange(0)) / f,
                         double(g_slot_rings2.exchange(0)) / f, g_flip.load()));
+        // bb-mv-fill: 1-slot ring copies, the [sink+0x1c8] override buffers, the DMA-sourced
+        // BonePalette identities and what strict mode left camera-only.
+        Log(fmt::format(
+            "[mv-engine-fill] 1-slot own copy: at draw {:.1f}/frame, end-of-frame copy {:.1f}/frame "
+            "(copies made {:.1f}/frame, not made {:.1f}); missing: not drawn last guest frame "
+            "{:.1f}/frame, drawn last frame {:.1f}/frame | sink+0x1c8 override: {:.1f} records/"
+            "frame, {:.1f} buffer objects/frame, V#s in velocity draws {:.1f}/frame, own previous "
+            "{:.1f}, rewritten by 2+ DMAs {:.1f} (BB_MV_ENGINE_OVERRIDE={}) | BonePalette direct "
+            "records {:.1f}/frame, GX copies recorded {:.1f}/frame; V#s with a DMA / copy "
+            "source {:.1f}/frame: BonePalette object {:.1f}, previous {:.1f}, palette-sized "
+            "without record {:.1f} | strict {}: camera-only buffers "
+            "{:.1f}/frame, camera blocks without engine camera {:.1f}/frame; blended draws' "
+            "engine camera {:.1f}/frame | CP DMA memory->memory {:.1f}/frame",
+            double(S(Stat::SlotOwn) - std::min(S(Stat::SlotOwn), S(Stat::SlotOwnEnd))) / f,
+            double(S(Stat::SlotOwnEnd)) / f, double(S(Stat::OwnEndCopies)) / f,
+            double(S(Stat::OwnEndSkipped)) / f, double(S(Stat::SlotOwnMissNew)) / f,
+            double(S(Stat::SlotOwnMissDrawn)) / f, double(g_dm_ovr_rec.exchange(0)) / f,
+            double(g_ovr_objs_sum) / f, double(S(Stat::OvrSeen)) / f,
+            double(S(Stat::OvrPrev)) / f, double(S(Stat::OvrShared)) / f,
+            OverrideEnabled() ? 1 : 0, double(g_pal_direct.exchange(0)) / f,
+            double(g_copy_rec.exchange(0)) / f,
+            double(S(Stat::PalDma)) / f, double(S(Stat::PalDmaId)) / f,
+            double(S(Stat::PalDmaPrev)) / f, double(S(Stat::PalDmaNoRecord)) / f,
+            StrictEnabled() ? "on" : "off (BB_MV_ENGINE_STRICT=0)",
+            double(S(Stat::StrictCamOnly)) / f, double(S(Stat::StrictNoCam)) / f,
+            double(S(Stat::CamEngBlend)) / f, double(g_dma_count) / f));
+        g_ovr_objs_sum = 0;
+        g_dma_count = 0;
     }
     const u64 cl = S(Stat::CamEngLookups);
     Log(fmt::format("[mv-engine-cam2] engine camera {:.1f}/frame (hook {}) | blocks {:.1f}/frame: "
