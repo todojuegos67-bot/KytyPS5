@@ -1514,8 +1514,12 @@ if ($Play) {
 
 # ================================================================ ventana
 try {
-	Add-Type -Namespace BbDpi -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(System.IntPtr v);' -ErrorAction Stop
-	[void][BbDpi.Native]::SetProcessDpiAwarenessContext([System.IntPtr](-5))
+	Add-Type -Namespace BbDpi -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(System.IntPtr v); [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr SetThreadDpiAwarenessContext(System.IntPtr v); [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetProcessDPIAware();' -ErrorAction Stop
+	$dpiOk = $false; try { $dpiOk = [BbDpi.Native]::SetProcessDpiAwarenessContext([System.IntPtr](-4))  # (bb-launcher-3) -4 = PER_MONITOR_AWARE_V2; antes -5 = UNAWARE_GDISCALED (Windows estiraba la ventana: letra borrosa) } catch { }
+	# (bb-launcher-3) si el proceso ya tenia modo DPI (manifiesto de powershell.exe), el del hilo hace que las ventanas nuevas
+	# sean per-monitor v2 igualmente: sin el estirado de mapa de bits de Windows (letra borrosa)
+	if (-not $dpiOk) { try { $dpiOk = ([BbDpi.Native]::SetThreadDpiAwarenessContext([System.IntPtr](-4)) -ne [System.IntPtr]::Zero) } catch { } }
+	if (-not $dpiOk) { try { [void][BbDpi.Native]::SetProcessDPIAware() } catch { } }
 } catch { }
 [System.Windows.Forms.Application]::EnableVisualStyles()
 try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }  # etiquetas con GDI (ClearType), como Demon's Souls
@@ -4012,20 +4016,20 @@ public sealed class BbOFonts : IDisposable {
   public BbOFonts(float s) {
     S = s;
     Title = Make(Cinzel, 15.5f, FontStyle.Regular, "Segoe UI Semibold", 14f, FontStyle.Regular);
-    Label = Make(Cormorant, 17.5f, FontStyle.Regular, "Segoe UI", 13.5f, FontStyle.Regular);
-    Check = Make(Cormorant, 17f, FontStyle.Regular, "Segoe UI", 13.5f, FontStyle.Regular);
-    Value = Make(Inter, 13f, FontStyle.Regular, "Segoe UI", 13.5f, FontStyle.Regular);
-    Help = Make(Cormorant, 15.5f, FontStyle.Italic, "Segoe UI", 12f, FontStyle.Italic);
-    Button = Make(Cinzel, 13f, FontStyle.Regular, "Segoe UI Semibold", 13f, FontStyle.Regular);
-    Small = Make(Inter, 11.5f, FontStyle.Regular, "Segoe UI", 12f, FontStyle.Regular);
-    PopItem = Make(Inter, 13f, FontStyle.Regular, "Segoe UI", 13.5f, FontStyle.Regular);
-    PopHead = Make(Cinzel, 11.5f, FontStyle.Regular, "Segoe UI Semibold", 11f, FontStyle.Regular);
+    Label = Make(null, 0f, FontStyle.Regular, "Segoe UI Semibold", 14f, FontStyle.Regular);
+    Check = Make(null, 0f, FontStyle.Regular, "Segoe UI", 14f, FontStyle.Regular);
+    Value = Make(null, 0f, FontStyle.Regular, "Segoe UI", 14f, FontStyle.Regular);
+    Help = Make(null, 0f, FontStyle.Regular, "Segoe UI", 13f, FontStyle.Regular);
+    Button = Make(Cinzel, 14f, FontStyle.Regular, "Segoe UI Semibold", 13f, FontStyle.Regular);
+    Small = Make(null, 0f, FontStyle.Regular, "Segoe UI", 13f, FontStyle.Regular);
+    PopItem = Make(null, 0f, FontStyle.Regular, "Segoe UI", 14f, FontStyle.Regular);
+    PopHead = Make(Cinzel, 12f, FontStyle.Regular, "Segoe UI Semibold", 11f, FontStyle.Regular);
     TipTitle = Make(Cinzel, 13.5f, FontStyle.Regular, "Segoe UI Semibold", 13f, FontStyle.Regular);
-    TipBody = Make(Inter, 12.5f, FontStyle.Regular, "Segoe UI", 12.5f, FontStyle.Regular);
+    TipBody = Make(null, 0f, FontStyle.Regular, "Segoe UI", 13f, FontStyle.Regular);
   }
   Font Make(FontFamily fam, float px, FontStyle st, string fb, float fbPx, FontStyle fbSt) {
-    if (fam != null) { try { if (fam.IsStyleAvailable(st)) return new Font(fam, px * S, st, GraphicsUnit.Pixel); } catch { } }
-    try { return new Font(fb, fbPx * S, fbSt, GraphicsUnit.Pixel); } catch { }
+    if (fam != null) { try { if (fam.IsStyleAvailable(st)) return new Font(fam, (float)Math.Round(px * S), st, GraphicsUnit.Pixel); } catch { } }
+    try { return new Font(fb, (float)Math.Round(fbPx * S), fbSt, GraphicsUnit.Pixel); } catch { }
     return new Font(FontFamily.GenericSansSerif, fbPx * S, FontStyle.Regular, GraphicsUnit.Pixel);
   }
   public void Dispose() {
@@ -4038,8 +4042,8 @@ public sealed class BbOFonts : IDisposable {
 public static class BbOGfx {
   public static readonly Color Ink = Color.FromArgb(234, 226, 212);
   public static readonly Color Bone = Color.FromArgb(214, 203, 182);
-  public static readonly Color Dim = Color.FromArgb(150, 140, 124);
-  public static readonly Color Off = Color.FromArgb(112, 104, 92);
+  public static readonly Color Dim = Color.FromArgb(182, 172, 154);
+  public static readonly Color Off = Color.FromArgb(128, 120, 108);
   public static readonly Color Gold = Color.FromArgb(201, 163, 96);
   public static readonly Color Candle = Color.FromArgb(242, 214, 156);
   public static readonly Color Bronze = Color.FromArgb(140, 108, 62);
@@ -4067,7 +4071,7 @@ public static class BbOGfx {
   }
   public static void Hq(Graphics g) {
     g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-    g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit; g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+    g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit; g.InterpolationMode = InterpolationMode.HighQualityBicubic;
   }
   public static GraphicsPath Round(RectangleF r, float rad) {
     GraphicsPath p = new GraphicsPath(); float d = Math.Max(1f, Math.Min(rad * 2f, Math.Min(r.Width, r.Height)));
@@ -4191,14 +4195,14 @@ public static class BbOGfx {
     float rad = 3f * s;
     Color top, bot;
     if (crimson) {
-      top = Lerp(Color.FromArgb(246, 146, 22, 27), Color.FromArgb(250, 178, 34, 36), hv);
-      bot = Lerp(Color.FromArgb(246, 70, 9, 12), Color.FromArgb(250, 96, 14, 17), hv);
+      top = Lerp(Color.FromArgb(255, 146, 22, 27), Color.FromArgb(255, 178, 34, 36), hv);
+      bot = Lerp(Color.FromArgb(255, 70, 9, 12), Color.FromArgb(255, 96, 14, 17), hv);
     } else {
-      top = Lerp(Color.FromArgb(238, 45, 37, 31), Color.FromArgb(242, 60, 48, 38), hv);
-      bot = Lerp(Color.FromArgb(238, 22, 18, 15), Color.FromArgb(242, 30, 24, 19), hv);
+      top = Lerp(Color.FromArgb(255, 45, 37, 31), Color.FromArgb(255, 60, 48, 38), hv);
+      bot = Lerp(Color.FromArgb(255, 22, 18, 15), Color.FromArgb(255, 30, 24, 19), hv);
     }
     if (pr > 0f) { top = Lerp(top, Color.FromArgb(top.A, bot), 0.45f * pr); }
-    if (!en) { top = Color.FromArgb(150, 34, 30, 28); bot = Color.FromArgb(150, 22, 19, 18); }
+    if (!en) { top = Color.FromArgb(255, 30, 26, 24); bot = Color.FromArgb(255, 20, 17, 16); }
     using (GraphicsPath p = Round(b, rad)) {
       using (LinearGradientBrush lb = new LinearGradientBrush(new RectangleF(b.X, b.Y - 1f, b.Width, b.Height + 2f), top, bot, 90f)) g.FillPath(lb, p);
       GraphicsState st = g.Save();
@@ -4454,7 +4458,7 @@ public class BbOPopup : BbOLayer, IBbOAnim {
       using (SolidBrush b = new SolidBrush(Color.FromArgb(14, 0, 0, 0))) g.FillPath(b, sp2);
     }
     using (GraphicsPath p = BbOGfx.Round(fr, 5f * s)) {
-      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(fr.X, fr.Y - 1, fr.Width, fr.Height + 2), Color.FromArgb(252, 27, 21, 19), Color.FromArgb(252, 14, 11, 10), 90f)) g.FillPath(b, p);
+      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(fr.X, fr.Y - 1, fr.Width, fr.Height + 2), Color.FromArgb(255, 27, 21, 19), Color.FromArgb(255, 14, 11, 10), 90f)) g.FillPath(b, p);
       GraphicsState st0 = g.Save();
       try { g.SetClip(p, CombineMode.Intersect); BbOGfx.Glow(g, new RectangleF(fr.X - fr.Width * 0.2f, fr.Y - R(50), fr.Width * 0.9f, R(120)), Color.FromArgb(26, 150, 96, 40)); } finally { g.Restore(st0); }
       using (Pen pen = new Pen(Color.FromArgb(200, 140, 108, 62), 1f)) g.DrawPath(pen, p);
@@ -4664,7 +4668,7 @@ public class BbOTip : BbOLayer, IBbOAnim {
       using (SolidBrush b = new SolidBrush(Color.FromArgb(14, 0, 0, 0))) g.FillPath(b, p0);
     }
     using (GraphicsPath p = BbOGfx.Round(fr, 5f * s)) {
-      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(fr.X, fr.Y - 1, fr.Width, fr.Height + 2), Color.FromArgb(250, 29, 23, 20), Color.FromArgb(250, 15, 12, 11), 90f)) g.FillPath(b, p);
+      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(fr.X, fr.Y - 1, fr.Width, fr.Height + 2), Color.FromArgb(255, 29, 23, 20), Color.FromArgb(255, 15, 12, 11), 90f)) g.FillPath(b, p);
       using (Pen pen = new Pen(Color.FromArgb(200, 140, 108, 62), 1f)) g.DrawPath(pen, p);
     }
     BbOGfx.Corners(g, fr, 4f * s, 8f * s, s, Color.FromArgb(180, 176, 140, 82));
@@ -5072,7 +5076,7 @@ public class BbOptionsPanel : Control, IBbOAnim {
     float sc = S;
     RectangleF r = new RectangleF(0.5f, 0.5f, cardW - 1f, s.FullH - 1f);
     using (GraphicsPath p = BbOGfx.Round(r, 5f * sc)) {
-      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(0, -1, cardW, s.FullH + 2), Color.FromArgb(214, 26, 21, 19), Color.FromArgb(220, 15, 12, 11), 90f)) g.FillPath(b, p);
+      using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(0, -1, cardW, s.FullH + 2), Color.FromArgb(255, 25, 20, 18), Color.FromArgb(255, 15, 12, 11), 90f)) g.FillPath(b, p);
       GraphicsState st0 = g.Save();
       try {
         g.SetClip(p, CombineMode.Intersect);
@@ -5270,7 +5274,7 @@ public class BbOptionsPanel : Control, IBbOAnim {
     foreach (Sec s in secs) if (!s.Dirty.IsEmpty) { RenderSec(s, s.Dirty); s.Dirty = Rectangle.Empty; }
     if (footer != null && !footer.Dirty.IsEmpty) { RenderSec(footer, footer.Dirty); footer.Dirty = Rectangle.Empty; }
     Place();
-    bool frac = sp.Active && subPixel && !BbOPump.ReduceMotion;
+    bool frac = false;
     double pos = frac ? sp.Pos : Math.Round(sp.Pos);
     g.InterpolationMode = frac ? InterpolationMode.Bilinear : InterpolationMode.NearestNeighbor;
     g.PixelOffsetMode = PixelOffsetMode.Half;
