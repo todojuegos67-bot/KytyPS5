@@ -407,6 +407,10 @@ bool MaterializeHere(uint64_t addr, uint64_t size, Why why, uint64_t serial, boo
 		}
 		for (auto it = FirstOverLocked(s, addr); it != s.entries.end() && it->first < addr + size; ++it) {
 			if (serial != 0 && (!it->second.owned || it->second.serial != serial)) continue;
+			// (An emulator read of an undefined range - committed texture memory nothing wrote yet - needs no write-back:
+			// the guest's bytes are as good. The range stays declared, else the load that follows is declined: field log
+			// 20261114-050844, MapMemory -> FreshWatch -> TryGetBackingPointer -> BeforeGuestRead emptied the set.)
+			if (why == WhyRead && it->second.undef) continue;
 			it->second.inflight = true;
 			pieces.push_back(PieceOf(it->first, it->second));
 		}

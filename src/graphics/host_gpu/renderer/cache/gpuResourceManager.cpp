@@ -606,6 +606,8 @@ void GpuResourceManager::FreshWatch(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	std::lock_guard lock(m_fresh_mutex);
+	// (Backing addresses only: nothing here reads guest bytes, so KYTY_NATIVE_TEX's ranges are not written back.)
+	const LibKernel::Memory::BackingLookupOnly lookup_only;
 	uint64_t        run_begin = 0, run_end = 0;
 	const auto      flush     = [&] {
 		if (run_end > run_begin) m_page_manager.UpdatePageWatchers<true>(run_begin, run_end - run_begin);
