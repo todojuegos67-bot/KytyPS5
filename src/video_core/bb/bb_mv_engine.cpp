@@ -74,6 +74,7 @@ struct RigidRec {
 };
 std::mutex g_rmx;
 std::map<u64, RigidRec> g_rigid;
+std::atomic<u64> g_dm_override{0}, g_dm_same{0};
 std::atomic<u64> g_dm_calls{0}, g_dm_rigid{0}, g_dm_skinned{0}, g_dm_palette{0};
 std::atomic<u32> g_hook_dm{0}, g_hook_cam{0};
 std::string g_eng_detail;
@@ -94,6 +95,9 @@ u32 g_cam_layout_hits[2]{}; // row-major / transposed matches (GPU thread)
 std::array<u32, 216> g_delta_n{};
 std::array<float, 216> g_delta_v{};
 u64 g_delta_blocks = 0;
+std::array<u32, 216> g_sdelta_n{};
+std::array<float, 216> g_sdelta_v{}, g_sdelta_p{};
+u64 g_sdelta_blocks = 0;
 bool g_dumped_nomatch = false;
 
 u64 Mix(u64 a, u64 b) {
@@ -214,10 +218,29 @@ void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance) {
             return rd64(rd64(ring + 8) + u64(s64(i)) * 8);
         return rd64(rd64(rd64(ring) + u64(s64(i)) * 0x28 + 8) + bone * 8);
     };
-    const u64 cur = slot(idx), prev = slot(pidx);
+    // The slots are GX buffer objects, not memory: sink vtable +0x30 = 0x224d880 / +0x38 =
+    // 0x224d9d0 (vtable 0x53b7880, set by the sink constructor 0x224c940) store the object in
+    // GX constant slot 5 / 6 ([[sink+8]]+0x6a8 / +0x6b0; flushed to state +0xc148+slot*8 at
+    // 0x21a04e0). The shader's V# is the object's V# at +0x18 (bb_native_mv.cpp, 1.09
+    // 0x2168a20). +0x30 binds [sink+0x1c8] instead when it is set and [sink+0x108] == 1.
+    u64 cur_obj = slot(idx);
+    const u64 prev_obj = slot(pidx);
+    if (rd64(sink + 0x1c8) != 0 && rd32(sink + 0x108) == 1) {
+        g_dm_override.fetch_add(1, std::memory_order_relaxed);
+        cur_obj = rd64(sink + 0x1c8);
+    }
+    if (cur_obj == 0 || prev_obj == 0)
+        return;
+    const auto base = [&](u64 obj) {
+        const u64 v = rd64(obj + 0x18);
+        return (v & 0xffffffffull) | (((v >> 32) & 0xfffull) << 32);
+    };
+    const u64 cur = base(cur_obj), prev = base(prev_obj);
     if (cur == 0 || prev == 0)
         return;
     g_dm_rigid.fetch_add(1, std::memory_order_relaxed);
+    if (cur == prev)
+        g_dm_same.fetch_add(1, std::memory_order_relaxed);
     std::scoped_lock lk{g_rmx};
     g_rigid[cur] = {prev, Mix(ring, bone), g_stamp.load(std::memory_order_relaxed)};
 }
@@ -297,6 +320,19 @@ u32 EngineCameraPrev(const float* block, float prev_view[12]) {
 
 void BlockDelta(const float* cur, const float* prev) {
     ++g_delta_blocks;
+    // Camera standing still (view bit-identical): what still changes is time / wind / jitter.
+    if (std::memcmp(cur + 8, prev + 8, 48) == 0) {
+        ++g_sdelta_blocks;
+        for (u32 i = 0; i < 216; ++i) {
+            if ((i >= 8 && i < 20) || (i >= 52 && i < 68))
+                continue;
+            if (std::memcmp(cur + i, prev + i, 4) != 0) {
+                ++g_sdelta_n[i];
+                g_sdelta_v[i] = cur[i];
+                g_sdelta_p[i] = prev[i];
+            }
+        }
+    }
     for (u32 i = 0; i < 216; ++i) {
         if ((i >= 8 && i < 20) || (i >= 52 && i < 68))
             continue;
@@ -463,12 +499,14 @@ void OnFrame() {
     // bb-mv-engine (engine transforms): coverage of the rigid ring records and the engine camera.
     Log(fmt::format("[mv-engine-rigid] DrawMesh {:.1f}/frame: rigid ring {:.1f}, skinned ring "
                     "{:.1f}, BonePalette {:.1f}; {} slot records | lookups {:.1f}/frame: engine "
-                    "previous world {:.1f}%, no copy {:.1f}/frame (hook {})",
+                    "previous world {:.1f}%, no copy {:.1f}/frame (hook {}) | sink+0x1c8 "
+                    "override {:.1f}/frame, previous slot == current {:.1f}/frame",
                     double(g_dm_calls.exchange(0)) / f, double(g_dm_rigid.exchange(0)) / f,
                     double(g_dm_skinned.exchange(0)) / f, double(g_dm_palette.exchange(0)) / f,
                     rigid_addrs, double(S(Stat::RigidLookups)) / f,
                     Pct(S(Stat::RigidFound), S(Stat::RigidLookups)),
-                    double(S(Stat::RigidNoSnap)) / f, g_hook_dm.load() ? "on" : "off"));
+                    double(S(Stat::RigidNoSnap)) / f, g_hook_dm.load() ? "on" : "off",
+                    double(g_dm_override.exchange(0)) / f, double(g_dm_same.exchange(0)) / f));
     const u64 cl = S(Stat::CamEngLookups);
     Log(fmt::format("[mv-engine-cam2] engine camera {:.1f}/frame (hook {}) | blocks {:.1f}/frame: "
                     "engine previous used {:.1f}%, fallback: no CPU copy {:.1f}%, not the engine "
@@ -497,6 +535,23 @@ void OnFrame() {
                         g_delta_blocks, idx.size(), t));
         g_delta_n.fill(0);
         g_delta_blocks = 0;
+    }
+    {
+        std::string t;
+        u32 nchg = 0;
+        for (u32 i = 0; i < 216; ++i) {
+            if (g_sdelta_n[i] == 0)
+                continue;
+            ++nchg;
+            if (nchg <= 24)
+                t += fmt::format(" d[{}]={:.6g}<-{:.6g}({:.0f}%)", i, g_sdelta_v[i],
+                                 g_sdelta_p[i], Pct(g_sdelta_n[i], g_sdelta_blocks));
+        }
+        Log(fmt::format("[mv-engine-wind-static] {} paired blocks with the camera still, {} "
+                        "floats change:{}",
+                        g_sdelta_blocks, nchg, t));
+        g_sdelta_n.fill(0);
+        g_sdelta_blocks = 0;
     }
     g_st.fill(0);
     g_miss.fill(0);
