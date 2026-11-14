@@ -137,6 +137,10 @@ int Fsr3DepthInvOverride() { // -1 auto, 0 forward, 1 inverted
     }();
     return v;
 }
+bool Fsr3EnvOff(const char* name) {
+    const char* e = std::getenv(name);
+    return e != nullptr && (e[0] == '0' || std::string(e) == "off");
+}
 bool Fsr3EnvFlag(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && *e != 0 && std::string(e) != "0";
@@ -1152,7 +1156,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
             // vectors / object vectors / HUD-less for each prepare), and frameTimeDelta.
             Printf("[fg-amd] pairing: prepared %u paired %u off_depth %u off_mv %u off_obj %u "
                    "off_hudless %u | last c %lld d %lld mv %lld obj %lld hl %lld | dt avg %.2f "
-                   "max %.2f ms | vsm %.3g",
+                   "max %.2f ms | vsm %.3g | fog vectors %s, hudless %s",
                    g_amd.prepared, g_amd.paired, g_amd.off_depth, g_amd.off_mv, g_amd.off_obj,
                    g_amd.off_hudless, static_cast<long long>(g_amd.last_ids[0]),
                    static_cast<long long>(g_amd.last_ids[1]),
@@ -1160,7 +1164,10 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    static_cast<long long>(g_amd.last_ids[3]),
                    static_cast<long long>(g_amd.last_ids[4]),
                    g_amd.prepared ? g_amd.dt_sum / g_amd.prepared : 0.0, g_amd.dt_max,
-                   static_cast<double>(EnvFloat("BB_FSR3_VSM", 1.0f)));
+                   static_cast<double>(EnvFloat("BB_FSR3_VSM", 1.0f)),
+                   // same rule as bb_objmv2.cpp:597 (fog vectors need the velocity path)
+                   (!Fsr3EnvOff("BB_VELOCITY") && !Fsr3EnvOff("BB_FOG_MV")) ? "on" : "off",
+                   g_amd.hudless_given ? "given" : "none");
             // (11-12) amd-dyn: the largest multiplier with real x N within the display's target
             // (refresh - refresh^2/3600, as Demon's Souls), changed after 2 seconds agreeing.
             if (Cfg().kind == Kind::Amd && Cfg().dynamic && window > 0.5) {
