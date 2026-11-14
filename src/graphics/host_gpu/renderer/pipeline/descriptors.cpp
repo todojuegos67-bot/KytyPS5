@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/pipeline/shadowLayerRange.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -1076,13 +1077,42 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// Shadow-map arrays (a depth-compare sample, a depth image, or memory the GPU renders into: the 80-layer spot-light
 	// shadow pool) keep every layer to the T#'s last: the layer bound solved from the shader can miss the light's layer,
 	// which then reads a clamped, wrong layer (spot-shadow artifacts, as with the depth-array full re-upload).
+	// KYTY_LAYER_RANGE_FIX=1|0 (default: on): an array kept whole only because the GPU wrote its memory keeps the
+	// shader's bound if block-compressed or past 512 layers or 512 MiB (shadowLayerRange.h): the streamed texture
+	// pool's T#s (2353 BC7 layers at 0x1021400000, base 754, a bound of 256) lie over GPU-written memory and became a
+	// 1599-layer, 1.6 GiB image. The spot-shadow pool (80 R32 layers, 320 MiB), the cube pool as colour (360 layers,
+	// 202 MiB) and depth / depth-compare views are kept whole as before.
 	if (desc.info.resources.layers > 1 && desc.view_info.base_layer < desc.info.resources.layers &&
 	    (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
-	     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray) &&
-	    (resource.depth_compare || desc.info.IsDepth() ||
-	     texture_cache.IsRegionGpuModified(desc.info.data.address, desc.info.data.size) ||
-	     texture_cache.HasGpuWrittenImageOverlap(desc.info.data.address, desc.info.data.size))) {
-		desc.view_info.layer_count = desc.info.resources.layers - desc.view_info.base_layer;
+	     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray)) {
+		static const bool layer_range_fix = [] {
+			const char* value = std::getenv("KYTY_LAYER_RANGE_FIX");
+			return value == nullptr || value[0] != '0';
+		}();
+		ShadowLayerRange::Input in {};
+		in.image_layers  = desc.info.resources.layers;
+		in.base_layer    = desc.view_info.base_layer;
+		in.bound_count   = desc.view_info.layer_count;
+		in.layer_bytes   = desc.info.data.size / desc.info.resources.layers;
+		in.shadow_sample = resource.depth_compare || desc.info.IsDepth();
+		in.block         = desc.info.IsBlock();
+		in.gpu_written   = !in.shadow_sample &&
+		                 (texture_cache.IsRegionGpuModified(desc.info.data.address, desc.info.data.size) ||
+		                  texture_cache.HasGpuWrittenImageOverlap(desc.info.data.address, desc.info.data.size));
+		in.fix                     = layer_range_fix;
+		const auto range           = ShadowLayerRange::ViewLayers(in);
+		desc.view_info.layer_count = range.layer_count;
+		if (range.capped) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("TextureCache: GPU-written array view kept to the shader's layers %u..%u of %u (not to %u: "
+				            "addr=0x%llx, %llu KiB a layer; KYTY_LAYER_RANGE_FIX=0 for every layer)\n",
+				            in.base_layer, in.base_layer + range.layer_count - 1u, in.image_layers, in.image_layers - 1u,
+				            static_cast<unsigned long long>(desc.info.data.address),
+				            static_cast<unsigned long long>(in.layer_bytes >> 10u));
+				std::fflush(stdout);
+			}
+		}
 	}
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	if (static const bool log_views = std::getenv("KYTY_UPLOAD_LOG") != nullptr; log_views && levels > 1 && !storage) {
