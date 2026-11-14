@@ -31,6 +31,7 @@ struct Counters {
 	std::atomic<uint64_t> fallbacks {0}, fallback_bytes {0}, faults {0}, fallback_refused {0}, declined {0},
 	    watched_bytes {0}, guest_writes {0}, guest_write_bytes {0};
 	std::atomic<uint64_t> demoted {0}, demoted_bytes {0}, demote_passes {0};
+	std::atomic<uint64_t> single_ranges {0}, single_bytes {0}, single_passes {0};
 };
 Counters g_c;
 
@@ -81,6 +82,7 @@ struct Chunk {
 	uint64_t owner  = 0;
 	bool     materialized = false; // its bytes are in guest memory too (a fallback): its pages are not watched
 	uint64_t used = 0;             // KYTY_VRAM_BUDGET: the frame of its last image upload (Plan) or of its load
+	bool     imaged = false;       // an image was built from it (Plan): KYTY_NATIVE_TEXTURE_PC_SINGLE may drop its buffer
 };
 
 struct Record {
@@ -773,7 +775,10 @@ std::vector<Part> Plan(uint64_t addr, uint64_t size) noexcept {
 	auto                  it    = s.chunks.upper_bound(addr);
 	if (it != s.chunks.begin()) --it;
 	for (; it != s.chunks.end() && it->first < addr + size; ++it)
-		if (it->second.end > addr) it->second.used = frame;
+		if (it->second.end > addr) {
+			it->second.used   = frame;
+			it->second.imaged = true;
+		}
 	return PartsLocked(s, addr, addr + size);
 }
 
@@ -931,13 +936,63 @@ void BudgetPass() {
 	g_c.demote_passes.fetch_add(1, std::memory_order_relaxed);
 	g_budget_log.passes++;
 }
+// KYTY_NATIVE_TEXTURE_PC_SINGLE=1 (level 2 only): once an engine texture's image has been built from its device buffer
+// (Plan) and no image upload touched it for 30 frames, the buffer is released. The bytes are first read back into guest
+// memory through the dedicated NativeTexturePcQueue (Materialize demote: never the render thread, own fence), so a
+// re-created image, a slice copy, a streamed mip over it and a CPU read all find correct bytes in guest memory (level-1
+// style). Limits per pass keep the read-back off the frame's critical path.
+void SinglePass() {
+	auto&          s     = S();
+	const uint64_t frame = g_c.frames.load(std::memory_order_relaxed);
+	struct Cand {
+		uint64_t b, e;
+		DevRef   dev;
+	};
+	std::vector<Cand> cand;
+	{
+		const std::lock_guard lock(s.m);
+		for (const auto& [b, c]: s.chunks)
+			if (c.dev && !c.materialized && c.imaged && c.used + 30 <= frame) cand.push_back({b, c.end, c.dev});
+	}
+	static const uint64_t per_pass = EnvPercent("KYTY_NATIVE_TEXTURE_PC_SINGLE_MB", 64, 8, 1024) << 20u;
+	std::unordered_set<Dev*> picked;
+	uint64_t                 bytes = 0;
+	for (const auto& c: cand) {
+		if (bytes >= per_pass) break;
+		if (picked.insert(c.dev.get()).second) bytes += c.dev->size;
+	}
+	// (Every range sharing a picked buffer: only then is the buffer really freed.)
+	for (const auto& c: cand)
+		if (picked.count(c.dev.get()) != 0 && Materialize(c.b, c.e, true)) {
+			g_c.single_ranges.fetch_add(1, std::memory_order_relaxed);
+			g_c.single_bytes.fetch_add(c.e - c.b, std::memory_order_relaxed);
+		}
+	g_c.single_passes.fetch_add(1, std::memory_order_relaxed);
+}
 } // namespace
+
+bool SingleCopy() noexcept {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_TEXTURE_PC_SINGLE");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (on && Level() != 2) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			std::printf("NativeTexturePC: KYTY_NATIVE_TEXTURE_PC_SINGLE=1 ignored (needs KYTY_NATIVE_TEXTURE_PC=2)\n");
+		}
+		return false;
+	}
+	return on;
+}
 
 void Pump() noexcept {
 	if (!Enabled()) return;
 	Flush();
 	g_c.frames.fetch_add(1, std::memory_order_relaxed);
 	if (VramBudgetOn() && g_c.frames.load(std::memory_order_relaxed) % 60 == 0) BudgetPass();
+	if (SingleCopy() && g_c.frames.load(std::memory_order_relaxed) % 15 == 0) SinglePass();
 	using Clock = std::chrono::steady_clock;
 	static Clock::time_point last = Clock::now();
 	static Stats             prev {};
@@ -973,6 +1028,14 @@ void Pump() noexcept {
 		            MiB(g_budget_log.usage), MiB(g_budget_log.budget), MiB(g_budget_log.target), MiB(c.vram_bytes),
 		            static_cast<unsigned long long>(g_c.demoted.load()), MiB(g_c.demoted_bytes.load()),
 		            static_cast<unsigned long long>(g_c.demote_passes.load()));
+	if (SingleCopy())
+		std::printf("NativeTexturePC single-copy: engine buffers VRAM MiB %.1f (%llu buffers) | buffers dropped after image "
+		            "build %llu ranges (%.1f MiB, %llu passes; bytes kept in guest memory) | CPU read-backs %llu (%.1f MiB) | "
+		            "read-back refused %llu | retile fallbacks 0 (no image read-back path: guest copy used)\n",
+		            MiB(c.vram_bytes), static_cast<unsigned long long>(c.vram_buffers),
+		            static_cast<unsigned long long>(g_c.single_ranges.load()), MiB(g_c.single_bytes.load()),
+		            static_cast<unsigned long long>(g_c.single_passes.load()), static_cast<unsigned long long>(c.fallbacks),
+		            MiB(c.fallback_bytes), static_cast<unsigned long long>(c.fallback_refused));
 	std::fflush(stdout);
 	prev = c;
 }
@@ -1036,7 +1099,7 @@ void ResetForTests() noexcept {
 	               &g_c.dropped_bytes, &g_c.to_vram, &g_c.to_vram_bytes, &g_c.upload_fail, &g_c.fills, &g_c.fill_bytes,
 	               &g_c.fill_ns, &g_c.gathered, &g_c.frames, &g_c.fallbacks, &g_c.fallback_bytes, &g_c.faults,
 	               &g_c.fallback_refused, &g_c.declined, &g_c.watched_bytes, &g_c.guest_writes,
-	               &g_c.guest_write_bytes, &g_c.demoted, &g_c.demoted_bytes, &g_c.demote_passes})
+	               &g_c.guest_write_bytes, &g_c.demoted, &g_c.demoted_bytes, &g_c.demote_passes, &g_c.single_ranges, &g_c.single_bytes, &g_c.single_passes})
 		a->store(0);
 }
 

@@ -144,6 +144,9 @@ void Pump() noexcept;
 void               SetVramBudgetDefault(bool on) noexcept;
 [[nodiscard]] bool VramBudgetOn() noexcept;
 
+// KYTY_NATIVE_TEXTURE_PC_SINGLE=1 (read once; needs level 2): device buffers released once their image is built (Pump).
+[[nodiscard]] bool SingleCopy() noexcept;
+
 struct Stats {
 	uint64_t textures = 0, textures_loaded = 0, textures_created = 0, released = 0;
 	uint64_t loads = 0, load_bytes = 0, mips = 0, mip_bytes = 0, slice_copies = 0, slice_bytes = 0, slice_guest_reads = 0;
