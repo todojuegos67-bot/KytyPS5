@@ -39,9 +39,10 @@ namespace Libs::Graphics::NativeTexturePc {
 // KYTY_NATIVE_TEXTURE_PC (read once): 0 off; 1 = KEEP-GUEST (safe): the bytes go to VRAM for the images AND are
 // written into guest memory once (no host copy kept, no page watching, nothing ever read back); a CPU/host write over a
 // staged range (TextureCache::InvalidateMemory -> OnGuestWrite) drops the staged bytes there (the guest's are newer);
-// slice copies run in guest memory (declined). 2 = VRAM-ONLY (experimental): guest pages never written and kept
-// no-access, read back from the GPU on a touch; a read-back a thread cannot do (async upload worker, deferred
-// operation, a texture-cache lock holder off the render thread) EXITs with a message instead of returning wrong bytes.
+// slice copies run in guest memory (declined). 2 = VRAM-ONLY (the native goal): guest pages never written and kept
+// no-access, read back from the GPU on a touch by the texture cache's own copy queue (textureCache.cpp
+// NativeTexturePcQueue: own command pool + fence, graphics queue under queue_mutex, never the render thread), so any
+// thread can read back; a failed read-back (device error) is an impossible case that stops with a FATAL line.
 [[nodiscard]] int  Level() noexcept;
 [[nodiscard]] bool Requested() noexcept; // Level() != 0
 // The hooks are in and the path is live.

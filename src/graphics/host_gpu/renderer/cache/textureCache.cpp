@@ -2653,7 +2653,75 @@ void TextureCache::InitNativeTex() {
 // ---- KYTY_NATIVE_TEXTURE_PC=1 (host_gpu/nativeTexturePc.h): the engine textures' device buffers ------------------------
 
 static TextureCache* g_pc_cache = nullptr;
-static bool (*g_pc_run_render)(void (*fn)(void*), void* arg) = nullptr;
+
+// The engine textures' own copy path, independent of the render thread: every write of their device buffers (the
+// uploads, Flush) and every read-back (a CPU touch, an emulator read: any thread, also the async upload worker, deferred
+// operations and texture-cache lock holders) is one buffer copy on the graphics queue, recorded in this path's own
+// command pool and submitted under GraphicContext::queue_mutex (held only for vkQueueSubmit), then waited for with its
+// own fence. Ordering: the device buffers are written only here and each write is waited for before Flush returns, so
+// a read-back never waits on the render thread's ticks; the barrier after each copy (transfer write -> all commands,
+// same queue) makes an upload visible to the render thread's later submissions (they are recorded after the wait).
+// Never takes m_lock, never records into the scheduler's command buffers, never waits for the render thread.
+class NativeTexturePcQueue {
+public:
+	bool Init(GraphicContext& graphics) {
+		m_graphics = &graphics;
+		vk::CommandPoolCreateInfo pool {};
+		pool.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool.queueFamilyIndex = graphics.queue_family;
+		if (graphics.device.createCommandPool(&pool, nullptr, &m_pool) != vk::Result::eSuccess) return false;
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		if (graphics.device.allocateCommandBuffers(&allocate, &m_command) != vk::Result::eSuccess) return false;
+		vk::FenceCreateInfo fence {};
+		return graphics.device.createFence(&fence, nullptr, &m_fence) == vk::Result::eSuccess;
+	}
+	// size bytes from source+source_offset to destination+destination_offset, done when it returns. Any thread.
+	bool Copy(const Buffer& source, uint64_t source_offset, const Buffer& destination, uint64_t destination_offset,
+	          uint64_t size) {
+		std::lock_guard lock(m_mutex);
+		auto&           device = m_graphics->device;
+		if (m_command.reset({}) != vk::Result::eSuccess) return false;
+		vk::CommandBufferBeginInfo begin {};
+		begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		if (m_command.begin(&begin) != vk::Result::eSuccess) return false;
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		m_command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+		                          &before, 0, nullptr, 0, nullptr);
+		vk::BufferCopy region {source_offset, destination_offset, size};
+		m_command.copyBuffer(source.Handle(), destination.Handle(), 1, &region);
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		m_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+		                          &after, 0, nullptr, 0, nullptr);
+		if (m_command.end() != vk::Result::eSuccess) return false;
+		if (device.resetFences(1, &m_fence) != vk::Result::eSuccess) return false;
+		vk::SubmitInfo submit {};
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers    = &m_command;
+		vk::Result result {};
+		{
+			Common::LockGuard queue_lock(m_graphics->queue_mutex);
+			result = m_graphics->queue.submit(1, &submit, m_fence);
+		}
+		if (result != vk::Result::eSuccess) return false;
+		return device.waitForFences(1, &m_fence, VK_TRUE, UINT64_MAX) == vk::Result::eSuccess;
+	}
+	std::atomic<uint64_t> copies {0};
+
+private:
+	GraphicContext*   m_graphics = nullptr;
+	std::mutex        m_mutex;
+	vk::CommandPool   m_pool    = nullptr;
+	vk::CommandBuffer m_command = nullptr;
+	vk::Fence         m_fence   = nullptr;
+};
+static NativeTexturePcQueue g_pc_queue;
 
 static bool NativeTexturePcProbe(uint64_t address, uint64_t rip, const void* context, bool write) {
 	if (NativeTexturePc::OnFault(address)) return true;
@@ -2667,74 +2735,43 @@ static bool NativeTexturePcProbe(uint64_t address, uint64_t rip, const void* con
 
 void TextureCache::InitNativeTexturePc() {
 	g_pc_cache = this;
-	// Runs fn where GPU work may be recorded and waited for (as InitNativeTex's run_render): inline on the render thread,
-	// else through it; refused (false) on threads that must not wait for it.
-	g_pc_run_render = +[](void (*fn)(void*), void* arg) {
-		auto* cache = g_pc_cache;
-		if (AsyncUpload::t_worker || CommandScheduler::InDeferredOperation()) return false;
-		if (GuestGpu::IsGpuThread()) {
-			fn(arg);
-			return true;
-		}
-		if (cache->m_lock.OwnedByCurrentThread()) return false;
-		if (Spec::t_state != nullptr || CommandScheduler::ThreadRecorder() != nullptr) {
-			Spec::Refuse("native-texture-pc bytes");
-			struct NormalPath {
-				Spec::State*                state    = std::exchange(Spec::t_state, nullptr);
-				CommandScheduler::Recorder* recorder = CommandScheduler::ThreadRecorder();
-				NormalPath() { CommandScheduler::SetThreadRecorder(nullptr); }
-				~NormalPath() {
-					Spec::t_state = state;
-					CommandScheduler::SetThreadRecorder(recorder);
-				}
-			} normal_path;
-			cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
-			return true;
-		}
-		cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
-		return true;
-	};
+	if (!g_pc_queue.Init(m_graphics)) {
+		std::printf("NativeTexturePC: FATAL: its copy queue could not be made (command pool / fence)\n");
+		std::fflush(stdout);
+		std::abort();
+	}
 	NativeTexturePc::Host host {};
 	host.page_size = m_page_manager.GetPageSize();
 	host.watch     = +[](uint64_t vaddr, uint64_t size, bool on) {
         if (on) g_pc_cache->m_page_manager.UpdateReadWatchers<true>(vaddr, size);
         else g_pc_cache->m_page_manager.UpdateReadWatchers<false>(vaddr, size);
 	};
-	// Render thread (Flush): a device-local buffer filled from the host block by one recorded copy.
+	// Render thread (Flush): a device-local buffer filled from the host block by this path's own queue, waited for.
 	host.upload = +[](const void* data, uint64_t size) -> uint64_t {
-		auto& cache = *g_pc_cache;
-		cache.m_scheduler.EndRendering();
-		auto staging = std::make_unique<Buffer>(cache.m_graphics, cache.m_scheduler, MemoryUsage::Upload, 0, AllFlags, size);
+		auto& cache   = *g_pc_cache;
+		auto  staging = std::make_unique<Buffer>(cache.m_graphics, cache.m_scheduler, MemoryUsage::Upload, 0, AllFlags, size);
 		if (staging->Mapped().size() < size) return 0;
 		std::memcpy(staging->Mapped().data(), data, size);
 		staging->Flush(0, size);
-		auto* device = new Buffer(cache.m_graphics, cache.m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, size);
-		device->CopyFrom(cache.m_scheduler.Current(), *staging, 0, 0, size);
-		cache.m_scheduler.DeferOperation([buffer = std::move(staging)]() mutable { buffer.reset(); });
-		return reinterpret_cast<uint64_t>(device);
+		auto device = std::make_unique<Buffer>(cache.m_graphics, cache.m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, size);
+		if (!g_pc_queue.Copy(*staging, 0, *device, 0, size)) return 0;
+		g_pc_queue.copies.fetch_add(1, std::memory_order_relaxed);
+		return reinterpret_cast<uint64_t>(device.release());
 	};
 	host.release = +[](uint64_t handle) {
 		g_pc_cache->m_scheduler.DeferOperation(
 		    [buffer = std::unique_ptr<Buffer>(reinterpret_cast<Buffer*>(handle))]() mutable { buffer.reset(); });
 	};
-	// Any thread: GPU copy into a download buffer, waited for (a CPU fallback: counted by the core).
+	// Any thread: one copy into a host-visible buffer on this path's own queue, waited for (its writes were all waited
+	// for when made: nothing of the render thread's is waited on).
 	host.read_device = +[](uint64_t handle, uint64_t offset, void* out, uint64_t size) -> bool {
-		struct Job {
-			uint64_t handle, offset, size;
-			void*    out;
-		} job {handle, offset, size, out};
-		return g_pc_run_render(
-		    +[](void* arg) {
-			    auto& j     = *static_cast<Job*>(arg);
-			    auto& cache = *g_pc_cache;
-			    cache.m_scheduler.EndRendering();
-			    Buffer host_copy(cache.m_graphics, cache.m_scheduler, MemoryUsage::Download, 0, AllFlags, j.size);
-			    host_copy.CopyFrom(cache.m_scheduler.Current(), *reinterpret_cast<Buffer*>(j.handle), j.offset, 0, j.size);
-			    cache.m_scheduler.Wait(cache.m_scheduler.CurrentTick());
-			    host_copy.Invalidate(0, j.size);
-			    std::memcpy(j.out, host_copy.Mapped().data(), j.size);
-		    },
-		    &job);
+		auto&  cache = *g_pc_cache;
+		Buffer host_copy(cache.m_graphics, cache.m_scheduler, MemoryUsage::Download, 0, AllFlags, size);
+		if (host_copy.Mapped().size() < size) return false;
+		if (!g_pc_queue.Copy(*reinterpret_cast<const Buffer*>(handle), offset, host_copy, 0, size)) return false;
+		host_copy.Invalidate(0, size);
+		std::memcpy(out, host_copy.Mapped().data(), size);
+		return true;
 	};
 	NativeTexturePc::SetHost(host);
 	NativeTexturePc::HostReady();

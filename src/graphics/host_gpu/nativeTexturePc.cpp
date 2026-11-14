@@ -339,8 +339,8 @@ bool Assemble(const State& s, const std::vector<Part>& parts, uint64_t b, uint8_
 
 // Level 2: a read-back this thread cannot do would leave wrong bytes: stop instead (never wrong bytes silently).
 [[noreturn]] void Refused(const char* what, uint64_t addr, uint64_t size) {
-	std::printf("NativeTexturePC: FATAL: KYTY_NATIVE_TEXTURE_PC=2 could not read back %s 0x%llx+0x%llx from the GPU on this "
-	            "thread (async upload worker / deferred operation / texture-cache lock holder); use KYTY_NATIVE_TEXTURE_PC=1\n",
+	std::printf("NativeTexturePC: FATAL: KYTY_NATIVE_TEXTURE_PC=2 could not read back %s 0x%llx+0x%llx through its own "
+	            "copy queue (device error: should not happen); use KYTY_NATIVE_TEXTURE_PC=1\n",
 	            what, static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
 	std::fflush(stdout);
 	std::abort();

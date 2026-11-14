@@ -159,6 +159,11 @@ void Install(Program* program) {
 	::Loader::NativeTex::SetConsumer(&LoadConsumer);
 	::Loader::NativeTex::SetStreamConsumer(&StreamRelease, &StreamMove, nullptr, &StreamRelease);
 	Pc::SetEnabled(true);
+	if (Pc::Level() == 2)
+		std::printf("[native-texture-pc] WARNING: KYTY_NATIVE_TEXTURE_PC=2 (VRAM only, first field test): engine texture "
+		            "pages are not written and are no-access; a CPU touch reads them back from the GPU (counted as CPU "
+		            "fallbacks). If textures look wrong or the game stops with 'NativeTexturePC: FATAL', use "
+		            "KYTY_NATIVE_TEXTURE_PC=1 and send the log.\n");
 	std::printf("[native-texture-pc] KYTY_NATIVE_TEXTURE_PC=1: engine textures registered at CTexture::Create/FTextureFactory, "
 	            "file bytes (eboot+0x8fed17/0x8fef15) and streamed mips (eboot+0x%llx) staged on the host and uploaded to the "
 	            "images from there; guest texture pages are not written; slice copies (0x900f26) done host-side; stream-out "
