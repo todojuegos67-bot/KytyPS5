@@ -191,6 +191,11 @@ struct State {
     // (object transforms, small skeletons such as weapons, CPU-animated data) were read with
     // their current data in the previous-frame pass: such an object got the camera's motion only.
     u32 native2 = 0;
+    // bb-mv-native (BB_MV_NATIVE=1): object buffers' previous copies for every opaque draw
+    // (wind-animated trunks / foliage: their sway constants live in a per-draw buffer the
+    // velocity path read as current data) + fog coverage in the reactive mask.
+    bool mv_native = false;
+    u64 sec_nat_draws = 0, sec_nat_prev = 0, sec_nat_moved = 0, sec_nat_frames = 0;
     struct ObjCpu {
         std::array<float, kObjCheckFloats> v{};
         u32 n = 0;
@@ -562,6 +567,10 @@ bool Init(const Vulkan::Instance& instance) {
             g.native2 = kN2Measure;
         }
     }
+    if (const char* mn = std::getenv("BB_MV_NATIVE"); mn != nullptr && mn[0] == '1') {
+        g.mv_native = true;
+        g.native2 |= kN2Buffers | kN2Measure;
+    }
     if (!g.velocity) {
         // Class 4 is written only by the velocity path (VelocityDraw): with BB_VELOCITY=0 the
         // character mask would be empty and the class-1 player mask / refine would be lost.
@@ -610,8 +619,10 @@ bool Init(const Vulkan::Instance& instance) {
         g.fog_curve = g.fog ? (u32(std::lround(lo * 65535.0f)) |
                                (u32(std::lround(std::min(hi, 1.0f) * 65535.0f)) << 16))
                             : 0u;
-        g.fog_reactive = g.fog && std::getenv("BB_FOG_REACTIVE") != nullptr &&
-                         std::getenv("BB_FOG_REACTIVE")[0] == '1';
+        const char* fr = std::getenv("BB_FOG_REACTIVE");
+        // bb-mv-native: on by default with BB_MV_NATIVE=1 (BB_FOG_REACTIVE=0 still turns it off).
+        g.fog_reactive = g.fog && ((fr != nullptr && fr[0] == '1') ||
+                                   (g.mv_native && !(fr != nullptr && fr[0] == '0')));
         Log(fmt::format("[fog-mv] {} (BB_FOG_MV=0 off): blended scene draws (fog, smoke, "
                         "particles) write their own static-world vector (last frame's camera "
                         "block, own palette only with a game skin-ring identity), weight alpha * "
@@ -621,6 +632,11 @@ bool Init(const Vulkan::Instance& instance) {
                         std::min(hi, 1.0f), g.fog_reactive ? "on" : "off"));
     }
     g.ready = true;
+    Log(fmt::format("[mv-native] BB_MV_NATIVE={}: opaque draws' object buffers (wind / sway "
+                    "constants, transforms) from last frame {}, fog coverage as reactive {}",
+                    g.mv_native ? "1" : "off", (g.mv_native && (g.native2 & kN2Buffers) &&
+                    g.velocity && g.skin_order) ? "on" : "off (needs BB_VELOCITY and BB_SKIN_MV)",
+                    g.fog_reactive ? "on" : "off"));
     Log(g.velocity ? "[velocity] on (bb-clean-velocity): every opaque G-buffer draw writes its own "
                      "velocity in its vertex shader (previous 864 B camera block, previous skin "
                      "ring palette), bb_mv.comp only where none is written; BB_VELOCITY=0 off"
@@ -1373,6 +1389,17 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         if (skinned && ring) ++g.w30.pal_ring;
         if (skinned && !ring) ++g.w30.pal_other;
         if (obj_moved) ++g.w30.obj_draws_moved;
+        if (g.mv_native && !skinned) {
+            ++g.sec_nat_draws;
+            bool any_prev_obj = false;
+            for (u32 h = 0; h < n; ++h) {
+                any_prev_obj |= use[h] && (cand & (1ull << h)) != 0 &&
+                                IdentifyVelocityBuffer(vs.buffers[h].GetSharp(vs).GetSize()) ==
+                                    VelRole::Current;
+            }
+            if (any_prev_obj) ++g.sec_nat_prev;
+            if (obj_moved) ++g.sec_nat_moved;
+        }
         ++g.vs_native;
         ++g.frame_vec_draws;
         ++g.sec_vec_draws;
@@ -1947,6 +1974,19 @@ void OnFlip() {
             double(g.vs_gpu_copies) / f,
             double(g.vs_bytes) / f,
             g.vs_draws ? g.vs_cpu_ns / 1000.0 / double(g.vs_draws) : 0.0));
+        if (g.mv_native) {
+            const double nf = double(std::max<u64>(1, g.vs_frames));
+            Log(fmt::format(
+                "[mv-native] rigid opaque draws {:.1f}/frame: with last frame's object buffers "
+                "{:.1f}/frame, own data changed (wind / animated) {:.1f}/frame | px native "
+                "{:.1f}%, blended (fog / smoke) {:.1f}% of G-buffer px, fog draws with own "
+                "vector {:.1f}/frame, fog px as reactive {}",
+                double(g.sec_nat_draws) / nf, double(g.sec_nat_prev) / nf,
+                double(g.sec_nat_moved) / nf, native_px,
+                g.sec_px_all ? 100.0 * double(g.sec_px_blend) / double(g.sec_px_all) : 0.0,
+                double(g.sec_fog_vec) / nf, g.fog_reactive ? "on" : "off"));
+            g.sec_nat_draws = g.sec_nat_prev = g.sec_nat_moved = 0;
+        }
         if (g.fog) {
             // bb-fog-mv: the blended draws (fog, smoke, particles) and the pixels they cover.
             std::vector<std::pair<u64, std::array<u32, 3>>> top(g.fog_vs.begin(), g.fog_vs.end());
