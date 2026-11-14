@@ -26,6 +26,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include "common/logging/log.h"
+#include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_native_mv.h"
 
 #ifdef _WIN32
@@ -82,6 +83,44 @@ void PS4_SYSV_ABI HookSkinRing(const u64* regs) {
 
 void PS4_SYSV_ABI HookEmit(const u64* regs) {
     NativeMv::GuestDrawEmit(regs[5], regs[10]);
+}
+
+// bb-mv-engine (bb_mv_engine.h): BonePalette / its twin entry (rdi model, rsi sink, rdx mesh,
+// rcx bones) and their SetPalette call sites (rax = the palette just written).
+void PS4_SYSV_ABI HookPalBegin0(const u64* regs) {
+    MvEngine::GuestPaletteBegin(regs[5], regs[6], regs[7], regs[8], 0);
+}
+void PS4_SYSV_ABI HookPalBegin1(const u64* regs) {
+    MvEngine::GuestPaletteBegin(regs[5], regs[6], regs[7], regs[8], 1);
+}
+void PS4_SYSV_ABI HookPalSet0(const u64* regs) {
+    MvEngine::GuestPaletteSet(regs[9], 0);
+}
+void PS4_SYSV_ABI HookPalSet1(const u64* regs) {
+    MvEngine::GuestPaletteSet(regs[9], 1);
+}
+
+// BonePalette entry: PrologueA + mov rbx,rcx; mov r12,rdx; mov r14,rsi; mov r15,rdi;
+// cmp byte [r15+0x200],0 (two functions: 1.09 0x21d1080 / 0x21d1650).
+constexpr u8 SigPalEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41,
+                              0x54, 0x53, 0x50, 0x48, 0x89, 0xcb, 0x49, 0x89, 0xd4, 0x49, 0x89,
+                              0xf6, 0x49, 0x89, 0xff, 0x41, 0x80, 0xbf, 0x00, 0x02, 0x00, 0x00,
+                              0x00};
+constexpr u32 PalEntryPrologue = 14; // push rbp .. push rax (no rip-relative bytes)
+// mov rbx,[r14]; xor esi,esi; mov rdi,r14; mov edx,r13d; mov rcx,rax (14 bytes, relocated)
+// followed by call [rbx+0x20] (first function) / call [rbx+0x28] (twin).
+constexpr u8 SigPalSet[] = {0x49, 0x8b, 0x1e, 0x31, 0xf6, 0x4c, 0x89, 0xf7, 0x44,
+                            0x89, 0xea, 0x48, 0x89, 0xc1, 0xff, 0x53};
+constexpr u32 PalSetLen = 14;
+constexpr u64 PalFuncSize = 0x5d0;
+
+// All occurrences of an exact byte string.
+std::vector<u64> FindAll(const u8* data, u64 size, const u8* sig, u32 n) {
+    std::vector<u64> out;
+    for (u64 i = 0; i + n <= size; ++i) {
+        if (data[i] == sig[0] && std::memcmp(data + i, sig, n) == 0) out.push_back(i);
+    }
+    return out;
 }
 
 std::optional<u64> Find(const u8* data, u64 size, const int* sig, u32 n) {
@@ -194,6 +233,50 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         detail += fmt::format("SkinRingUpdate eboot+0x{:x}", *sr);
     } else {
         detail += "SkinRingUpdate not found";
+    }
+
+    // bb-mv-engine (BB_MV_ENGINE=1): palette -> engine object (bones x mesh). Every byte that
+    // is relocated is compared first; any mismatch: nothing is patched.
+    if (MvEngine::Enabled()) {
+        std::string md;
+        const auto entries = FindAll(img, code, SigPalEntry, sizeof(SigPalEntry));
+        bool ok = entries.size() == 2;
+        std::vector<std::pair<u64, u32>> sites; // (offset, consumer)
+        if (ok) {
+            for (u32 f = 0; f < 2 && ok; ++f) {
+                const auto in = FindAll(img + entries[f], PalFuncSize, SigPalSet, sizeof(SigPalSet));
+                // consumer from the call's vtable slot: 0x20 first function, 0x28 the twin
+                for (u64 o : in) {
+                    const u8 slot = img[entries[f] + o + sizeof(SigPalSet)];
+                    if (slot != (f == 0 ? 0x20 : 0x28)) ok = false;
+                    sites.emplace_back(entries[f] + o, f);
+                }
+                if (in.size() != 3) ok = false;
+            }
+        }
+        if (ok && (next - cave) + 8 * 0x100 <= 4096) {
+            for (u32 f = 0; f < 2; ++f) {
+                u8* at = reinterpret_cast<u8*>(eboot_base + entries[f]);
+                u8* p = place(BuildCave(reinterpret_cast<u64>(f == 0 ? &HookPalBegin0
+                                                                     : &HookPalBegin1),
+                                        at, PalEntryPrologue,
+                                        reinterpret_cast<u64>(at + PalEntryPrologue)));
+                Detour(at, p);
+            }
+            for (const auto& [off, f] : sites) {
+                u8* at = reinterpret_cast<u8*>(eboot_base + off);
+                u8* p = place(BuildCave(reinterpret_cast<u64>(f == 0 ? &HookPalSet0 : &HookPalSet1),
+                                        at, PalSetLen, reinterpret_cast<u64>(at + PalSetLen)));
+                Detour(at, p);
+            }
+            md = fmt::format("BonePalette eboot+0x{:x} / twin eboot+0x{:x}, {} SetPalette sites",
+                             entries[0], entries[1], sites.size());
+            MvEngine::SetHooks(true, md.c_str());
+        } else {
+            md = fmt::format("signatures differ (entries {}, sites {}): game code untouched",
+                             entries.size(), sites.size());
+            MvEngine::SetHooks(false, md.c_str());
+        }
     }
 
     // FLVER DrawMesh and its two GX draw calls: per-mesh CPU work on the guest thread, not used

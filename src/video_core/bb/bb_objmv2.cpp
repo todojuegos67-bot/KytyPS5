@@ -21,6 +21,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_objmv2_comp.h"
@@ -1014,8 +1015,9 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     std::array<SnapBuf, Shader::NUM_BUFFERS> prev{};
     std::array<bool, Shader::NUM_BUFFERS> use{};
     bool camera = false, ok = true, skinned = false, ring = false, obj_moved = false;
-    bool game_skin = false;
+    bool game_skin = false, engine_draw = false;
     u32 pal_matched = 0, pal_failed = 0, pal_bufs = 0;
+    if (BB::MvEngine::Enabled() && !blend) BB::MvEngine::Count(BB::MvEngine::Stat::Draws);
     for (u32 h = 0; h < n && ok; ++h) {
         if ((cand & (1ull << h)) == 0) continue;
         const auto sharp = vs.buffers[h].GetSharp(vs);
@@ -1023,6 +1025,51 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         const u64 addr = sharp.base_address;
         const VelRole role = IdentifyVelocityBuffer(size);
         if (addr == 0) continue;
+        const bool eng = BB::MvEngine::Enabled();
+        if (eng && !blend && (role == VelRole::Current || role == VelRole::Palette) &&
+            size >= 48 && size <= 16384) {
+            // bb-mv-engine: the game's own object (BonePalette hook) owns this buffer: last
+            // frame's copy of the same object, nothing else (no address / mesh / order match).
+            BB::MvEngine::Count(BB::MvEngine::Stat::PalLookups);
+            BB::MvEngine::ObjId oid;
+            BB::MvEngine::Miss why = BB::MvEngine::Miss::None;
+            if (BB::MvEngine::LookupPalette(memory, buffer_cache.IsRegionGpuModified(addr, 48),
+                                            addr, oid, why)) {
+                BB::MvEngine::Count(BB::MvEngine::Stat::PalFound);
+                engine_draw = true;
+                SnapBuf ecur{0, 0, 0, 0};
+                const u64 ekey = Mix(Mix(Mix(oid.key, oid.offset), size), 0x656e67ull);
+                if (VelSnap(buffer_cache, scheduler, addr, size, ecur)) {
+                    g.vel_id_cur.insert_or_assign(ekey, ecur);
+                }
+                if (role == VelRole::Palette) {
+                    if (!skinned && !blend) ++g.vs_skin_draws_all;
+                    skinned = true;
+                    ++pal_bufs;
+                }
+                if (const auto it = g.vel_id_prev.find(ekey); it != g.vel_id_prev.end() &&
+                                                              it->second.addr != 0 &&
+                                                              it->second.dwords == size / 4) {
+                    BB::MvEngine::Count(BB::MvEngine::Stat::PalPrev);
+                    prev[h] = it->second;
+                    use[h] = true;
+                    if (role == VelRole::Palette) {
+                        ++pal_matched;
+                        game_skin = true;
+                    } else {
+                        obj_moved = true;
+                    }
+                } else {
+                    // A new object (or first frame): no previous transform of its own; it is
+                    // never given another object's (the draw keeps the camera vector).
+                    BB::MvEngine::Count(BB::MvEngine::Stat::PalNew);
+                    if (role == VelRole::Palette) ++pal_failed;
+                }
+                continue;
+            }
+            BB::MvEngine::CountMiss(why);
+            if (role == VelRole::Palette) BB::MvEngine::Count(BB::MvEngine::Stat::FallbackOld);
+        }
         if (role == VelRole::Current) {
             if ((g.native2 & (kN2Buffers | kN2Measure)) != 0 && mesh != 0 && size >= 16 &&
                 size <= kObjBufMax) {
@@ -1084,7 +1131,27 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                 std::array<float, 216> c;
                 if (CameraCpuCopy(memory, buffer_cache, addr, c)) g.cam_cpu_cur[ord] = c;
             }
-            if (const auto it = g.vel_addr_prev.find(akey);
+            if (BB::MvEngine::Enabled() && !blend) {
+                // bb-mv-engine: the block of this pass (depth target + viewport) and its order
+                // inside the pass; order 0 is taken without the similarity test (large camera
+                // moves at 30 fps failed it), later blocks of a pass use the old path.
+                BB::MvEngine::Count(BB::MvEngine::Stat::CamLookups);
+                u32 pord = 0;
+                const u64 ckey = BB::MvEngine::CameraKey(akey, pord);
+                if (pord == 0) {
+                    BB::MvEngine::Count(BB::MvEngine::Stat::CamPass);
+                    if (have_cur) g.vel_id_cur.try_emplace(ckey, cur);
+                    if (const auto it = g.vel_id_prev.find(ckey);
+                        it != g.vel_id_prev.end() && it->second.addr != 0) {
+                        found = &it->second;
+                        BB::MvEngine::Count(BB::MvEngine::Stat::CamPassPrev);
+                    }
+                }
+                if (found == nullptr) BB::MvEngine::Count(BB::MvEngine::Stat::CamFallback);
+            }
+            if (found != nullptr) {
+                // bb-mv-engine: found by pass
+            } else if (const auto it = g.vel_addr_prev.find(akey);
                 it != g.vel_addr_prev.end() && it->second.addr != 0) {
                 found = &it->second;
                 ++g.vs_cam_addr;
@@ -1312,6 +1379,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         prev[h] = *found;
         use[h] = true;
     }
+    if (engine_draw) BB::MvEngine::Count(BB::MvEngine::Stat::EngineDraws);
     if (ok && pal_bufs > 1 && !blend) ++g.vs_multi_pal;
     if (ok && pal_failed != 0) {
         if (pal_matched != 0) {
@@ -1766,6 +1834,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
 
 void OnFlip() {
     if (!g.ready) return;
+    if (!(g.velocity && !g.cleared)) BB::MvEngine::OnFrame();
     // bb-velocity: a flip without a G-buffer motion pass since the last one (a re-presented or
     // repeated guest image) is not a frame: history and snapshots stay as they are.
     if (g.velocity && !g.cleared) return;

@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_objmv2.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
@@ -199,6 +200,21 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
     if (!BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment]) ||
         !key.write_masks[BB::ObjMv2::Attachment]) {
         return; // not a motion draw, or a Mask draw (attachment 7 only keeps the pass going)
+    }
+    if (BB::MvEngine::Enabled()) {
+        // bb-mv-engine: the pass of this draw (depth target, viewport 0, color target 0).
+        const auto& regs = liverpool->regs;
+        const auto& vp = regs.viewports[0];
+        u32 f[4];
+        std::memcpy(&f[0], &vp.xscale, 4);
+        std::memcpy(&f[1], &vp.xoffset, 4);
+        std::memcpy(&f[2], &vp.yscale, 4);
+        std::memcpy(&f[3], &vp.yoffset, 4);
+        u64 pk = regs.depth_buffer.DepthAddress();
+        pk = pk * 0x9e3779b97f4a7c15ull ^ (u64(f[0]) << 32 | f[1]);
+        pk = pk * 0x9e3779b97f4a7c15ull ^ (u64(f[2]) << 32 | f[3]);
+        pk = pk * 0x9e3779b97f4a7c15ull ^ regs.color_buffers[0].Address();
+        BB::MvEngine::SetPass(pk);
     }
     BB::ObjMv2::OnDraw(push_data, pipeline->GetStage(Shader::SwStage::Vertex), memory,
                        buffer_cache, scheduler,
