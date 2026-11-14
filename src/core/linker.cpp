@@ -26,6 +26,7 @@
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/tls.h"
+#include "core/bb_hud_native_hook.h"
 #include "ipc/ipc.h"
 
 #ifndef _WIN32
@@ -92,6 +93,18 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
     // Relocate all modules
     RelocateAllImports();
+
+    // bb-hud-native (BB_HUD_NATIVE=1): the Scaleform HAL vtable wrappers need the relocated
+    // vtable of the eboot (module 0).
+    if (BB::HudNativeHook::Enabled() && module->IsValid()) {
+        std::vector<std::pair<u64, u64>> segments; // loaded (vaddr, size): only these are mapped
+        for (const auto& ph : module->elf.GetProgramHeader()) {
+            if ((ph.p_type == PT_LOAD || ph.p_type == PT_SCE_RELRO) && ph.p_memsz != 0) {
+                segments.emplace_back(ph.p_vaddr, ph.p_memsz);
+            }
+        }
+        BB::HudNativeHook::OnEbootRelocated(module->GetBaseAddress(), segments);
+    }
 
     // libkernel entry is responsible for initializing malloc-related elements of libSceLibcInternal
     // this is done through calling _malloc_init, and sceLibcInternalMemoryMutexEnable.

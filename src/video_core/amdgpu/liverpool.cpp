@@ -359,6 +359,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     }
                     break;
                 }
+                case PM4CmdNop::PayloadType::BbHudBegin:
+                case PM4CmdNop::PayloadType::BbHudEnd: {
+                    // bb-hud-native: written by the Scaleform HAL wrappers (bb_hud_native_hook)
+                    if (rasterizer) {
+                        rasterizer->BbHudNativeMarker(
+                            nop->data_block[0] == PM4CmdNop::PayloadType::BbHudBegin,
+                            nop->header.count.Value() >= 1 ? nop->data_block[1] : 0u);
+                    }
+                    break;
+                }
                 default:
                     break;
                 }

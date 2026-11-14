@@ -1260,6 +1260,11 @@ void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
     }
 }
 
+void Rasterizer::BbHudNativeMarker(bool begin, u32 seq) {
+    // bb-hud-native: the game's Scaleform HAL BeginScene / EndScene, in command stream order.
+    bb_cut.OnNativeMarker(begin, seq);
+}
+
 void Rasterizer::BbUpdateUiTransform() {
     // Supermedo's UpdateUiTransform: a native viewport (or native window-space UI vertices) must
     // not be doubled again; the display copy uses the guest render-size coordinates.
@@ -1384,7 +1389,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                      image.info.size.width == BB::Upscale::g_scene_w &&
                                      image.info.size.height == BB::Upscale::g_scene_h;
             // Supermedo: the UI is not jittered (after the HUD cut).
-            bb_jitter_draw = scene_sized && !bb_cut.UiPhase();
+            bb_jitter_draw = scene_sized && !bb_cut.UiPhase() && !bb_cut.NativeUiDraw();
             BB::Upscale::NoteJitterDraw(bb_jitter_draw, scene_sized && !bb_jitter_draw,
                                         image.info.size.width,
                                         image.info.size.height);

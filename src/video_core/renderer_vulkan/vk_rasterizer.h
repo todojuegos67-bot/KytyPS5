@@ -133,6 +133,12 @@ private:
     // bb-clean-021-bbport: Supermedo's HUD cut (bb_ui_cut.h): his OnFrameStart / OnColorTarget /
     // OnDraw before the draw's resources are bound.
     void BbUiDraw(const GraphicsPipeline* pipeline);
+
+public:
+    // bb-hud-native: a Scaleform HAL BeginScene / EndScene marker in the command stream.
+    void BbHudNativeMarker(bool begin, u32 seq);
+
+private:
     bool BbUiSingleTarget(const GraphicsPipeline* pipeline) const;
     void BbLodBias();
     // Supermedo's UpdateUiTransform: the scale of a draw into the output-size UI images.
