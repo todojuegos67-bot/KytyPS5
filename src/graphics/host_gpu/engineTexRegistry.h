@@ -49,7 +49,8 @@ int16_t PoolOf(uint64_t owner) noexcept;
 // Texture-cache side. Called with the bound T# (8 dwords) of a sampled texture. On a hit (an engine texture at the
 // T#'s base) and when the T#'s dwords 0..3 are the engine T#'s (ignoring MIN_LOD and BASE/LAST_LEVEL, which the engine
 // changes while streaming), dwords 4..7 are replaced by the engine T#'s own: the extent the engine declared for that
-// texture. Returns whether there was a hit (entry filled).
+// texture. Not when the T# is a layer view of it the engine made (BASE_ARRAY..DEPTH inside the engine's layers, words
+// 5..7 the engine's): that view is the game's. Returns whether there was a hit (entry filled).
 bool Resolve(uint32_t fields[8], Entry* entry) noexcept;
 
 // Counters for the 30 s line.

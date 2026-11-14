@@ -141,7 +141,13 @@ bool Resolve(uint32_t fields[8], Entry* entry) noexcept {
 		                  fields[2] == entry->tsharp[2] &&
 		                  (fields[3] & ~0x000FF000u) == (entry->tsharp[3] & ~0x000FF000u);
 		const bool upper_differs = std::memcmp(fields + 4, entry->tsharp + 4, 16) != 0;
-		if (same && upper_differs) {
+		// A layer view the engine made of this texture (0x8ff4e0 copies the 32-byte T# and rewrites only DEPTH /
+		// BASE_ARRAY in word 4, same base): a layer range inside the engine's own with words 5..7 unchanged is the
+		// game's view and is kept (adopting the engine's words would reset its BASE_ARRAY to layer 0).
+		const uint32_t own_last = entry->tsharp[4] & 0x1fffu, last = fields[4] & 0x1fffu,
+		               first = (fields[4] >> 16u) & 0x1fffu;
+		const bool engine_view = first <= last && last <= own_last && std::memcmp(fields + 5, entry->tsharp + 5, 12) == 0;
+		if (same && upper_differs && !engine_view) {
 			Report("engine T# words 4..7 used", base, fields, *entry, 0, 0);
 			std::memcpy(fields + 4, entry->tsharp + 4, 16);
 			Note(Count::Adopted);
