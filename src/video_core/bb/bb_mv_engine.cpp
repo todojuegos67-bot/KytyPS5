@@ -74,7 +74,7 @@ struct RigidRec {
 };
 std::mutex g_rmx;
 std::map<u64, RigidRec> g_rigid;
-std::atomic<u64> g_dm_override{0}, g_dm_same{0};
+std::atomic<u64> g_dm_override{0}, g_dm_same{0}, g_dm_single{0};
 std::atomic<u64> g_dm_calls{0}, g_dm_rigid{0}, g_dm_skinned{0}, g_dm_palette{0};
 std::atomic<u32> g_hook_dm{0}, g_hook_cam{0};
 std::string g_eng_detail;
@@ -231,10 +231,12 @@ void GuestDrawMesh(u64 model, u64 sink, u64 mesh, u64 material, u64 instance) {
     }
     if (cur_obj == 0 || prev_obj == 0)
         return;
-    const auto base = [&](u64 obj) {
-        const u64 v = rd64(obj + 0x18);
-        return (v & 0xffffffffull) | (((v >> 32) & 0xfffull) << 32);
-    };
+    // GX buffer object: descriptor at +0x18 whose +8 is the GPU address (+0x14 size): the slot
+    // update 0x2568a20 -> 0x26b3560 writes at (offset + [desc+8]) = [obj+0x20]. (+0x18 itself is
+    // not a V#: b9a295b0c collapsed every slot onto 2 values.)
+    const auto base = [&](u64 obj) { return rd64(obj + 0x20); };
+    if (rd32(ring + 0x9c) <= 1)
+        g_dm_single.fetch_add(1, std::memory_order_relaxed);
     const u64 cur = base(cur_obj), prev = base(prev_obj);
     if (cur == 0 || prev == 0)
         return;
@@ -500,13 +502,15 @@ void OnFrame() {
     Log(fmt::format("[mv-engine-rigid] DrawMesh {:.1f}/frame: rigid ring {:.1f}, skinned ring "
                     "{:.1f}, BonePalette {:.1f}; {} slot records | lookups {:.1f}/frame: engine "
                     "previous world {:.1f}%, no copy {:.1f}/frame (hook {}) | sink+0x1c8 "
-                    "override {:.1f}/frame, previous slot == current {:.1f}/frame",
+                    "override {:.1f}/frame, previous slot == current {:.1f}/frame, ring of 1 slot "
+                    "{:.1f}/frame",
                     double(g_dm_calls.exchange(0)) / f, double(g_dm_rigid.exchange(0)) / f,
                     double(g_dm_skinned.exchange(0)) / f, double(g_dm_palette.exchange(0)) / f,
                     rigid_addrs, double(S(Stat::RigidLookups)) / f,
                     Pct(S(Stat::RigidFound), S(Stat::RigidLookups)),
                     double(S(Stat::RigidNoSnap)) / f, g_hook_dm.load() ? "on" : "off",
-                    double(g_dm_override.exchange(0)) / f, double(g_dm_same.exchange(0)) / f));
+                    double(g_dm_override.exchange(0)) / f, double(g_dm_same.exchange(0)) / f,
+                    double(g_dm_single.exchange(0)) / f));
     const u64 cl = S(Stat::CamEngLookups);
     Log(fmt::format("[mv-engine-cam2] engine camera {:.1f}/frame (hook {}) | blocks {:.1f}/frame: "
                     "engine previous used {:.1f}%, fallback: no CPU copy {:.1f}%, not the engine "
