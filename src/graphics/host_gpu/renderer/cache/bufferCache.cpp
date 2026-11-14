@@ -17,6 +17,7 @@
 #include "sync-stats.h"
 #include "fresh-memory.h"
 #include "native-guestmem.h"
+#include "gpu-only-writes.h"
 #include "lean-hostmem.h"
 #include "texture-offload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -104,7 +105,9 @@ bool SparseUploadPieces() {
 
 void ReadMappedOrZeroCall(void* context, uint64_t destination, uint64_t size) {
 	auto* target = reinterpret_cast<uint8_t*>(destination);
-	if (!Libs::LibKernel::Memory::TryReadMappedOrZero(reinterpret_cast<uint64_t>(context), target, size)) {
+	// (KYTY_NATIVE_GUESTMEM=1: never-written granules of 64 KiB reads given as zeros, not read: native-guestmem.h.)
+	if (!NativeGuestMem::Read(reinterpret_cast<uint64_t>(context), target, size, NativeGuestMem::ImageRead,
+	                          [](uint64_t at, void* to, uint64_t n) { return Libs::LibKernel::Memory::TryReadMappedOrZero(at, to, n); })) {
 		std::memset(target, 0, size);
 	}
 }
@@ -215,6 +218,10 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	auto begin = std::max(address & ~(WindowSize - 1), buffer.CpuAddress());
 	auto end = std::min(std::max(begin + WindowSize, address + size),
 	                          buffer.CpuAddress() + buffer.Size());
+	// KYTY_GPU_ONLY_WRITES: in the engine's GPU memory, only the pages of the access (gpu-only-writes.h); the rest stay
+	// GPU-owned and fault on their own first touch.
+	(void)GpuOnlyWrites::Narrow(address, size, buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size(), TRACKER_PAGE_SIZE,
+	                            begin, end);
 	if (!m_resources->IsMapped(begin, end - begin) ||
 	    !LibKernel::Memory::IsUniqueGuestBackingRange(begin, end - begin)) {
 		// The widening is speculative: a buffer registered over memory the game has since unmapped in part (or maps
@@ -1135,7 +1142,9 @@ bool BufferCache::TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool i
 	auto& feedback = *m_copy_feedback;
 	if (!feedback.MayOverlap(vaddr, size) || !IsRegionRegistered(vaddr, size)) return false;
 	auto first = vaddr, last = vaddr + size;
-	if (auto it = feedback.UpperBound(vaddr); it != feedback.index.begin()) {
+	// (KYTY_GPU_ONLY_WRITES: in the engine's GPU memory not widened to the whole snapshot: gpu-only-writes.h.)
+	const bool widen = !(GpuOnlyWrites::Enabled() && GpuOnlyWrites::IsGpuClass(vaddr, size));
+	if (auto it = feedback.UpperBound(vaddr); widen && it != feedback.index.begin()) {
 		const auto& slot = feedback.slots[std::prev(it)->second];
 		if (slot.address <= vaddr && vaddr < slot.address + slot.size) {
 			first = std::min(first, slot.address);
@@ -2123,8 +2132,10 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	constexpr uint64_t WindowSize   = 512 * 1024;
 	const auto         buffer_begin = buffer.CpuAddress();
 	const auto         buffer_end   = buffer_begin + buffer.Size();
-	const auto         window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
-	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	auto               window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
+	auto               window_end   = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	// (KYTY_GPU_ONLY_WRITES: the pages of the access only, in the engine's GPU memory: gpu-only-writes.h.)
+	(void)GpuOnlyWrites::Narrow(vaddr, size, buffer_begin, buffer_end, TRACKER_PAGE_SIZE, window_begin, window_end);
 	DrainGuestReadback(window_begin, window_end - window_begin);
 
 	std::vector<DownloadCopy> copies;
