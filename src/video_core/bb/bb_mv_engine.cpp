@@ -236,9 +236,7 @@ void OnFrame() {
         "skin ring: DrawMesh eboot+0x21d0740 test [instance+8]) | draws {:.0f}/frame, engine identity {:.1f}% | palettes "
         "{:.0f}/frame: identity {:.1f}%, previous transform found {:.1f}% of identified, new "
         "object {:.1f}/frame | fallbacks: no record {:.1f}/frame, GPU-written {:.1f}/frame, "
-        "stale {:.1f}/frame, unmapped {:.1f}/frame, old path used {:.1f}/frame | camera blocks "
-        "{:.0f}/frame: pass key {:.1f}% (previous found {:.1f}%), fallback {:.1f}% | passes "
-        "recognized {:.1f}/frame, engine sinks {:.1f}/frame",
+        "stale {:.1f}/frame, unmapped {:.1f}/frame, old path used {:.1f}/frame",
         secs, g_frames, g_hooks.load() ? "on" : "off", double(g_guest_begins.exchange(0)) / f,
         double(g_guest_sets.exchange(0)) / f, double(g_recorded.exchange(0)) / f,
         g_guest_nobegin.exchange(0), addrs, double(S(Stat::Draws)) / f,
@@ -246,10 +244,15 @@ void OnFrame() {
         Pct(S(Stat::PalFound), S(Stat::PalLookups)), Pct(S(Stat::PalPrev), S(Stat::PalFound)),
         double(S(Stat::PalNew)) / f, double(M(Miss::NoRecord)) / f,
         double(M(Miss::GpuWritten)) / f, double(M(Miss::Stale)) / f,
-        double(M(Miss::Unmapped)) / f, double(S(Stat::FallbackOld)) / f,
-        double(S(Stat::CamLookups)) / f, Pct(S(Stat::CamPass), S(Stat::CamLookups)),
-        Pct(S(Stat::CamPassPrev), S(Stat::CamPass)), Pct(S(Stat::CamFallback), S(Stat::CamLookups)),
-        double(g_passes_sum) / f, double(g_sinks_sum) / f));
+        double(M(Miss::Unmapped)) / f, double(S(Stat::FallbackOld)) / f));
+    // Short line of its own (the long line above is cut by some log viewers).
+    Log(fmt::format("[mv-engine-cam] camera blocks {:.1f}/frame: pass key {:.1f}%, previous "
+                    "found {:.1f}%, fallback {:.1f}% | passes {:.1f}/frame, engine sinks "
+                    "{:.1f}/frame",
+                    double(S(Stat::CamLookups)) / f, Pct(S(Stat::CamPass), S(Stat::CamLookups)),
+                    Pct(S(Stat::CamPassPrev), S(Stat::CamPass)),
+                    Pct(S(Stat::CamFallback), S(Stat::CamLookups)), double(g_passes_sum) / f,
+                    double(g_sinks_sum) / f));
     g_st.fill(0);
     g_miss.fill(0);
     g_frames = g_passes_sum = g_sinks_sum = 0;

@@ -41,7 +41,7 @@ constexpr u64 kTableBytes = 2ull << 20;         // table entries a frame
 constexpr u64 kHeaderBytes = 4096;              // zero entry + dummy dword
 constexpr u32 kMaxSnapBytes = 64u << 10;        // larger buffers: read the current one
 // Word 11: attachment 7 texels != 0; 12-15: the player mask (bb-player-mv); 16-19: bb-fog-mv.
-constexpr u32 kStatWords = 20;
+constexpr u32 kStatWords = 24; // bb-fog-keepobj: 20 kept px, 21 dense (not recovered)
 constexpr u64 kStatPeriod = 60;                 // statistics / check frame: 1 in 60
 constexpr u32 kStaticSample = 4;                // check frames: 1 static draw in 4 checked
 
@@ -218,6 +218,8 @@ struct State {
     u64 sec_fog_draws = 0, sec_fog_vec = 0, sec_fog_skin = 0, sec_fog_no_cam = 0,
         sec_fog_skin_skipped = 0, sec_fog_no_block = 0;
     u64 sec_fog_px = 0, sec_fog_w = 0, sec_fog_dense = 0, sec_fog_obj = 0;
+    u64 sec_keep_px = 0, sec_keep_dense = 0;
+    bool fog_keepobj = false; // BB_FOG_KEEPOBJ=1
     std::unordered_map<u64, std::array<u32, 3>> fog_vs; // vs hash -> draws, with vector, no camera
     // bb-tree-mv (BB_PLAYER_MASK): where the player mask (refine, FSR 3 "player from the real
     // frame") comes from. Vector: class-1 pixels in the centre whose vector differs from
@@ -379,6 +381,8 @@ void ReadStats(u32 slot) {
         g.sec_fog_w += s[17];
         g.sec_fog_dense += s[18];
         g.sec_fog_obj += s[19];
+        g.sec_keep_px += s[20];
+        g.sec_keep_dense += s[21];
     }
     if (g.slot_stat[slot]) {
         g.w30.static_px += s[8];
@@ -611,6 +615,12 @@ bool Init(const Vulkan::Instance& instance) {
         g.fog_curve = g.fog ? (u32(std::lround(lo * 65535.0f)) |
                                (u32(std::lround(std::min(hi, 1.0f) * 65535.0f)) << 16))
                             : 0u;
+        g.fog_keepobj = g.fog && std::getenv("BB_FOG_KEEPOBJ") != nullptr &&
+                        std::getenv("BB_FOG_KEEPOBJ")[0] == '1';
+        if (g.fog_keepobj) {
+            Log("[fog-keepobj] on: blended layers no longer pull object / character vectors "
+                "toward the static world (recovered where coverage <= 0.9), those pixels reactive");
+        }
         g.fog_reactive = g.fog && std::getenv("BB_FOG_REACTIVE") != nullptr &&
                          std::getenv("BB_FOG_REACTIVE")[0] == '1';
         Log(fmt::format("[fog-mv] {} (BB_FOG_MV=0 off): blended scene draws (fog, smoke, "
@@ -1810,7 +1820,8 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
                                   (stat ? 1u : 0u) | (g.additive ? 2u : 0u) |
                                       (store_color ? 4u : 0u) | (check ? 8u : 0u) |
                                       (refine_now ? 16u : 0u) | (characters ? 32u : 0u) |
-                                      (g.fog ? 64u : 0u) | (g.fog_reactive ? 128u : 0u)};
+                                      (g.fog ? 64u : 0u) | (g.fog_reactive ? 128u : 0u) |
+                                      (g.fog_keepobj ? 256u : 0u)};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
@@ -2032,20 +2043,22 @@ void OnFlip() {
                 "palette {:.1f}), no previous camera {:.1f}, palette-sized buffer without skin "
                 "ring (kept the vector behind) {:.1f}, no camera block in the vertex shader "
                 "{:.1f} | statistics frames: covered px {:.1f}%, mean coverage {:.2f}, dense "
-                "(> 0.5) {:.1f}%, over an object's own vector {:.1f}% | vs with vector/draws "
-                "(1 s):{}",
+                "(> 0.5) {:.1f}%, over an object's own vector {:.1f}% | keep-object {}: kept "
+                "{} px, dense (blended vector kept) {} px | vs with vector/draws (1 s):{}",
                 double(g.sec_fog_draws) / f, double(g.sec_fog_vec) / f,
                 double(g.sec_fog_skin) / f, double(g.sec_fog_no_cam) / f,
                 double(g.sec_fog_skin_skipped) / f, double(g.sec_fog_no_block) / f,
                 Pct(g.sec_fog_px, g.sec_px_all),
                 g.sec_fog_px ? double(g.sec_fog_w) / 1024.0 / double(g.sec_fog_px) : 0.0,
                 Pct(g.sec_fog_dense, g.sec_px_all), Pct(g.sec_fog_obj, g.sec_px_all),
+                g.fog_keepobj ? "on" : "off", g.sec_keep_px, g.sec_keep_dense,
                 shaders.empty() ? " none" : shaders));
         }
         g.fog_vs.clear();
         g.sec_fog_draws = g.sec_fog_vec = g.sec_fog_skin = g.sec_fog_no_cam =
             g.sec_fog_skin_skipped = g.sec_fog_no_block = 0;
         g.sec_fog_px = g.sec_fog_w = g.sec_fog_dense = g.sec_fog_obj = 0;
+        g.sec_keep_px = g.sec_keep_dense = 0;
         g.vs_frames = g.vs_draws = g.vs_native = g.vs_static = g.vs_skinned = g.vs_skinned_ring =
             g.vs_skinned_addr = g.vs_no_cam = g.vs_no_pal = g.vs_blend = g.vs_gpu_copies =
                 g.vs_bytes = g.vs_cam_addr = g.vs_cam_ord = g.vs_ring_seen = g.vs_cam_rejected =
