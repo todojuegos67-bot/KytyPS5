@@ -78,6 +78,7 @@ std::atomic<u64> g_dm_calls{0}, g_dm_rigid{0}, g_dm_skinned{0}, g_dm_palette{0};
 std::atomic<u32> g_hook_dm{0}, g_hook_cam{0};
 std::string g_eng_detail;
 constexpr u64 kRigidMaxOffset = 0x100;
+constexpr u64 kRigidMaxAge = 4; // GPU frames
 
 // Engine camera records (SSAO reprojection site, render thread).
 struct CamRec {
@@ -313,6 +314,10 @@ bool LookupRigid(u64 addr, u64& prev_addr, u64& offset, u64& key) {
         return false;
     --it;
     if (addr - it->first >= kRigidMaxOffset)
+        return false;
+    // Only records of the last few frames: an older slot address may have been freed and reused
+    // by another object, whose "previous" would then be unrelated memory.
+    if (it->second.stamp + kRigidMaxAge < g_stamp.load(std::memory_order_relaxed))
         return false;
     offset = addr - it->first;
     prev_addr = it->second.prev + offset;

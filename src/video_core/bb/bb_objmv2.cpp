@@ -1180,6 +1180,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                         BB::MvEngine::Count(BB::MvEngine::Stat::CamEngNoPrev);
                     } else {
                         bool got = false;
+                        const float* pick = nullptr;
                         for (const auto& [pord, pb] : g.cam_cpu_prev) {
                             if ((pord & 0x80000000u) != 0 ||
                                 !BB::MvEngine::ViewEqual(pb.data() + 8, pv)) {
@@ -1187,11 +1188,15 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
                             }
                             const auto ps = g.vel_id_prev.find(Mix(0x63616d65ull, pord));
                             if (ps == g.vel_id_prev.end() || ps->second.addr == 0) continue;
+                            // Several of last frame's blocks can share the view (other
+                            // passes, other projection): prefer the one at the same order.
+                            if (got && pord != ord) continue;
                             ce->second = ps->second;
-                            BB::MvEngine::BlockDelta(c->second.data(), pb.data());
+                            pick = pb.data();
                             got = true;
-                            break;
+                            if (pord == ord) break;
                         }
+                        if (got) BB::MvEngine::BlockDelta(c->second.data(), pick);
                         BB::MvEngine::Count(got ? BB::MvEngine::Stat::CamEngUsed
                                                 : BB::MvEngine::Stat::CamEngNoBlock);
                     }
