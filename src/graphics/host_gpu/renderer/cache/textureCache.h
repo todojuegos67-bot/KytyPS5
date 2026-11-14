@@ -184,6 +184,10 @@ public:
 	// `touch`: TextureOffload::Touch; `async`: written back by the offload worker when the GPU is done, touches waiting
 	// till then). Takes m_lock unless the caller holds it.
 	void RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch, bool async = false);
+	// KYTY_NATIVE_TEX=1 (host_gpu/nativeTex.h): the host side of the ring of texture loads.
+	struct NativeTexHost;
+	void InitNativeTex();
+	void NativeTexPrepare(ImageId id); // (InitializeImage: an image over ring bytes uploads from the ring)
 	struct OffloadCheck;
 	struct OffloadRestore;
 	std::vector<std::unique_ptr<OffloadRestore>> m_offload_restores;   // asynchronous restores (until done)

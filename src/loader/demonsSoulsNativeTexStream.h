@@ -32,6 +32,11 @@ void OnTextureCommit(uint64_t addr, uint64_t size) noexcept;
 // size bytes of texture data are copied from src to dst (0x900f26, in place of the game's memcpy). Default: the copy
 // in guest memory, told to the trackers once (PrepareHostOverwrite / FinishHostOverwrite, as MipCopy).
 void OnTextureMove(uint64_t dst, uint64_t src, uint64_t size) noexcept;
+// The emulator's side (graphics/host_gpu/nativeTex.h, set once at start-up): `release` is told of every release; `move`
+// returning true did the move (the guest copy is not made). Unset: the defaults above.
+using StreamRelease = void (*)(uint64_t addr, uint64_t size) noexcept;
+using StreamMove    = bool (*)(uint64_t dst, uint64_t src, uint64_t size) noexcept;
+void SetStreamConsumer(StreamRelease release, StreamMove move) noexcept;
 } // namespace NativeTex
 
 namespace DemonsSoulsNativeTexStream {

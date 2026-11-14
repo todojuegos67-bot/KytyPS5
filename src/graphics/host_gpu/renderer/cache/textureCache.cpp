@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <thread>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/nativeTex.h"
 #include "gpu-residency.h"
 #include "slow-log.h"
 
@@ -451,6 +452,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		                      "clean; nothing discarded)\n");
 	}
 #endif
+	if (NativeTex::Enabled()) InitNativeTex();
 }
 
 void KytyTextureGcThresholds(uint64_t total_budget, uint64_t& trigger, uint64_t& pressure, uint64_t& critical) {
@@ -757,6 +759,11 @@ bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t 
 	return false;
 }
 
+// KYTY_NATIVE_TEX: an ImageId as nativeTex.h keeps it.
+static uint64_t PackImageId(ImageId id) {
+	return (static_cast<uint64_t>(id.generation) << 32u) | id.index;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -789,6 +796,13 @@ void TextureCache::UnregisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
+	}
+	// KYTY_NATIVE_TEX: the bytes only it holds back to guest memory first.
+	if (NativeTex::Active()) {
+#if defined(_WIN32)
+		if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"native-tex image gone"};
+#endif
+		NativeTex::ImageGone(PackImageId(id), image.serial); // (back into the ring by a GPU copy)
 	}
 	// Its dropped guest bytes back first (texture-offload.h).
 	if (TextureOffload::GetMode() == TextureOffload::Mode::Offload && g_offload_alive.load(std::memory_order_relaxed) &&
@@ -2411,6 +2425,266 @@ bool TextureCache::RefillUpload(Image& image) {
 	return true;
 }
 
+// ---- KYTY_NATIVE_TEX=1 (host_gpu/nativeTex.h) ------------------------------------------------------------------------
+
+static TextureCache* g_native_cache = nullptr;
+
+// The exception filter's probe: native-tex first (its ranges are disjoint from the offload's), then the offload's.
+static bool NativeTexProbe(uint64_t address, uint64_t rip, const void* context, bool write) {
+	if (NativeTex::OnFault(address, rip, context, write)) return true;
+#if defined(_WIN32)
+	if (TextureOffload::Enabled()) return TextureOffload::OnFault(address, rip, context, write);
+#endif
+	return false;
+}
+
+struct TextureCache::NativeTexHost {
+	static Image* Find(uint64_t packed, uint64_t serial) {
+		auto* image = g_native_cache->m_slot_images.try_get(
+		    ImageId {static_cast<uint32_t>(packed), static_cast<uint32_t>(packed >> 32u)});
+		return image != nullptr && image->serial == serial && image->backing.image != nullptr ? image : nullptr;
+	}
+	// The owned pieces' bytes downloaded from their images and written into guest memory (render thread, waits).
+	static void WriteOwned(const std::vector<NativeTex::Piece>& pieces) {
+		auto& cache = *g_native_cache;
+#if defined(_WIN32)
+		if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"native-tex download"};
+#endif
+		std::unique_lock<TrackingSpinLock> lock(cache.m_lock, std::defer_lock);
+		if (!cache.m_lock.OwnedByCurrentThread()) lock.lock();
+		std::vector<std::pair<Image*, DownloadPlan>> downloads;
+		std::vector<uint64_t>                        offsets;
+		std::vector<std::pair<size_t, const NativeTex::Piece*>> copies; // (download index, piece)
+		uint64_t total = 0;
+		for (const auto& piece: pieces) {
+			auto* image = Find(piece.image, piece.serial);
+			size_t index = downloads.size();
+			for (size_t i = 0; i < downloads.size(); i++)
+				if (downloads[i].first == image) index = i;
+			if (index == downloads.size()) {
+				auto plan = image != nullptr ? cache.BuildDownload(*image) : DownloadPlan {};
+				if (!plan.valid || plan.depth_target) {
+					NativeTex::NoteFallback("lost", piece.end - piece.begin);
+					std::printf("NativeTex: LOST 0x%llx..0x%llx (its image gone or not downloadable)\n",
+					            static_cast<unsigned long long>(piece.begin), static_cast<unsigned long long>(piece.end));
+					continue;
+				}
+				downloads.emplace_back(image, std::move(plan));
+				offsets.push_back(total);
+				total += (image->info.data.size + 255) & ~uint64_t {255};
+			}
+			copies.emplace_back(index, &piece);
+		}
+		if (downloads.empty()) return;
+		Buffer host(cache.m_graphics, cache.m_scheduler, MemoryUsage::Download, 0, AllFlags, total);
+		auto   scratch = cache.StageOffloadDownloads(downloads, offsets, total, host);
+		cache.m_scheduler.Wait(cache.m_scheduler.CurrentTick());
+		host.Invalidate(0, total);
+		const auto* mapped = host.Mapped().data();
+		for (const auto& [index, piece]: copies) {
+			const auto* image = downloads[index].first;
+			const auto  from  = offsets[index] + (piece->src - image->info.data.address);
+			LibKernel::Memory::WriteBacking(piece->begin, mapped + from, piece->end - piece->begin, "native-tex");
+		}
+	}
+	static bool OwnedExtent(uint64_t packed, uint64_t serial, uint64_t* begin, uint64_t* size) {
+		auto& cache = *g_native_cache;
+		std::unique_lock<TrackingSpinLock> lock(cache.m_lock, std::defer_lock);
+		if (!cache.m_lock.OwnedByCurrentThread()) lock.lock();
+		const auto* image = Find(packed, serial);
+		if (image == nullptr) return false;
+		const auto plan = cache.BuildDownload(*image);
+		if (!plan.valid || plan.depth_target) return false;
+		*begin = image->info.data.address;
+		*size  = image->info.data.size;
+		return true;
+	}
+	// A move of bytes an image holds: the GPU copies all of its guest bytes into the ring (no wait).
+	static bool CopyOwned(uint64_t packed, uint64_t serial, uint64_t ring_offset, uint64_t* ready_tick) {
+		auto& cache = *g_native_cache;
+		if (CommandScheduler::ThreadRecorder() != nullptr) return false;
+		std::unique_lock<TrackingSpinLock> lock(cache.m_lock, std::defer_lock);
+		if (!cache.m_lock.OwnedByCurrentThread()) lock.lock();
+		auto* image = Find(packed, serial);
+		auto* ring  = NativeTex::Ring();
+		if (image == nullptr || ring == nullptr || ring_offset + image->info.data.size > ring->Size()) return false;
+		auto plan = cache.BuildDownload(*image);
+		if (!plan.valid || plan.depth_target) return false;
+		cache.m_scheduler.EndRendering();
+		cache.DownloadImageData(*image, *ring, ring_offset, image->info.data.size, std::move(plan));
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eShaderRead |
+		                              vk::AccessFlagBits::eTransferRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = ring->Handle();
+		barrier.offset              = ring_offset;
+		barrier.size                = image->info.data.size;
+		cache.m_scheduler.EndRendering();
+		cache.m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                                     vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+		                                                     {}, 0, nullptr, 1, &barrier, 0, nullptr);
+		*ready_tick = cache.m_scheduler.CurrentTick();
+		return true;
+	}
+};
+
+void TextureCache::InitNativeTex() {
+	g_native_cache = this;
+	NativeTex::Host host {};
+	host.render_sync = +[](void (*fn)(void*), void* arg) {
+		if (GuestGpu::IsGpuThread()) {
+			fn(arg);
+			return;
+		}
+		g_native_cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
+	};
+	// As the texture offload's restores: not the upload worker, deferred GPU work or a speculation's recorder.
+	host.can_wait = +[] {
+		if (AsyncUpload::t_worker || CommandScheduler::InDeferredOperation() || CommandScheduler::ThreadRecorder() != nullptr)
+			return false;
+		return GuestGpu::IsGpuThread() || LibKernel::PthreadSelfOrNull() != nullptr;
+	};
+	host.watch = +[](uint64_t vaddr, uint64_t size, bool on) {
+		if (on) g_native_cache->m_page_manager.UpdateReadWatchers<true>(vaddr, size);
+		else g_native_cache->m_page_manager.UpdateReadWatchers<false>(vaddr, size);
+	};
+	host.materialize_owned = &NativeTexHost::WriteOwned;
+	host.owned_extent      = &NativeTexHost::OwnedExtent;
+	host.copy_owned        = &NativeTexHost::CopyOwned;
+	host.current_tick      = +[] { return g_native_cache->m_scheduler.CurrentTick(); };
+	host.tick_done         = +[](uint64_t tick) { return g_native_cache->m_scheduler.IsFree(tick); };
+	host.wait_tick         = +[](uint64_t tick) { g_native_cache->m_scheduler.Wait(tick); };
+	NativeTex::Init(m_graphics, m_scheduler, host);
+	if (NativeTex::Active()) Common::HostException::SetProbeHandler(&NativeTexProbe);
+}
+
+// InitializeImage, before any upload: the ring bytes over the image uploaded from the ring (its subresources over them,
+// one detile), when every subresource the image needs is then current (from the ring, or already in this image); else
+// every authoritative byte over it goes to guest memory first and the normal upload reads it there.
+void TextureCache::NativeTexPrepare(ImageId id) {
+	auto&       image = m_slot_images[id];
+	const auto& info  = image.info;
+	const auto  base  = info.data.address;
+	if (!NativeTex::Active() || info.data.Empty() || !NativeTex::Overlaps(base, info.data.size)) return;
+	if (!image.IsCpuDirty() && !image.IsBufferModified()) return; // (no upload reads guest bytes)
+	// (A speculation's recorder cannot wait for downloads or GPU copies: the translation is redone in order.)
+#if defined(_WIN32)
+	if (CommandScheduler::ThreadRecorder() != nullptr) throw CommandScheduler::RecorderRefusal {"native-tex upload"};
+#endif
+	NativeTex::Rehome(base, info.data.size, image.serial); // (bytes other images hold: GPU-copied into the ring first)
+	const auto pieces  = NativeTex::Collect(base, info.data.size);
+	const auto binding = UploadBinding(image);
+	bool       ok      = image.IsDefinitelyCpuDirty() && !image.IsMaybeCpuDirty() && !image.IsBufferModified() &&
+	          binding != BindingType::DepthTarget && !info.IsVolume() && !image.depth_id &&
+	          info.metadata.compression == VideoOutCompression::Uncompressed && info.samples == 1 &&
+	          image.backing.samples == 1 && image.backing.image != nullptr && base % 256 == 0 && SafeToDownload(image);
+	std::vector<std::pair<uint64_t, uint64_t>> ring, own;
+	for (const auto& p: pieces) {
+		if (p.owned && p.serial != image.serial) ok = false; // (another image's bytes the ring had no room for)
+		if (p.owned) Image::AddRange(own, p.begin, p.end);
+		else Image::AddRange(ring, p.begin, p.end);
+	}
+	if (ok) {
+		const auto download = BuildDownload(image); // (a later fallback must be able to get the bytes back)
+		ok                  = download.valid && !download.depth_target;
+	}
+	const TextureTransferPlan* plan = nullptr;
+	if (ok) {
+		auto& cached = m_partial_plans[image.serial];
+		if (cached.plan == nullptr || cached.binding != binding) {
+			cached.plan    = std::make_shared<TextureTransferPlan>(BuildTextureTransfer(image, binding, TransferDirection::Upload));
+			cached.binding = binding;
+		}
+		plan = cached.plan.get();
+		ok   = plan->valid && !plan->swap_bgra16 && !plan->tiles.empty() && plan->tiles.size() == plan->regions.size();
+	}
+	const auto covers = [](const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t b, uint64_t e) {
+		for (const auto& [rb, re]: ranges)
+			if (rb <= b && e <= re) return true;
+		return false;
+	};
+	const auto intersects = [](const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t b, uint64_t e) {
+		for (const auto& [rb, re]: ranges)
+			if (rb < e && b < re) return true;
+		return false;
+	};
+	std::vector<size_t> selected;
+	uint64_t            lo = UINT64_MAX, hi = 0;
+	if (ok) {
+		std::vector<std::pair<uint64_t, uint64_t>> dirty;
+		if (image.IsPartiallyCpuDirty()) dirty = image.CpuDirtyRanges();
+		else dirty.emplace_back(base, info.data.End());
+		for (size_t i = 0; i < plan->tiles.size() && ok; i++) {
+			const auto& tile = plan->tiles[i];
+			const auto  b = base + tile.tiled_offset, e = b + tile.tiled_size;
+			if (plan->regions[i].bufferOffset < tile.linear_offset) ok = false;
+			const bool in_ring = covers(ring, b, e);
+			if (!in_ring && intersects(ring, b, e)) ok = false; // (a subresource partly in the ring)
+			if (!in_ring && !covers(own, b, e) && intersects(dirty, b, e)) ok = false; // (needs guest bytes)
+			if (in_ring) {
+				selected.push_back(i);
+				lo = std::min(lo, b);
+				hi = std::max(hi, e);
+			}
+		}
+	}
+	if (!ok) {
+		NativeTex::Materialize(base, info.data.size, "image");
+		return;
+	}
+	if (!selected.empty()) {
+		// The source: the ring itself when one ring piece holds [lo, hi), else the pieces gathered by the GPU.
+		Buffer*                 source        = NativeTex::Ring();
+		uint64_t                source_offset = 0;
+		std::unique_ptr<Buffer> gathered;
+		const NativeTex::Piece* single        = nullptr;
+		for (const auto& p: pieces)
+			if (!p.owned && p.begin <= lo && hi <= p.end) single = &p;
+		m_scheduler.EndRendering();
+		if (single != nullptr) {
+			source_offset = single->ring_offset + (lo - single->begin);
+		} else {
+			gathered = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, hi - lo);
+			for (const auto& p: pieces) {
+				if (p.owned) continue;
+				const auto b = std::max(p.begin, lo), e = std::min(p.end, hi);
+				if (b < e) gathered->CopyFrom(m_scheduler.Current(), *source, p.ring_offset + (b - p.begin), b - lo, e - b);
+			}
+			source = gathered.get();
+		}
+		std::vector<GpuTileInfo>         tiles;
+		std::vector<vk::BufferImageCopy> regions;
+		uint64_t                         linear_total = 0;
+		for (const auto index: selected) {
+			auto       tile          = plan->tiles[index];
+			auto       region        = plan->regions[index];
+			const auto linear_offset = (linear_total + 255) & ~uint64_t {255};
+			region.bufferOffset      = linear_offset + (region.bufferOffset - tile.linear_offset);
+			tile.linear_offset       = linear_offset;
+			tile.tiled_offset        = base + tile.tiled_offset - lo;
+			linear_total             = linear_offset + tile.linear_size;
+			tiles.push_back(tile);
+			regions.push_back(region);
+		}
+		const auto linear = m_tiler.Detile(source->Handle(), source_offset, hi - lo, linear_total, tiles,
+		                                   source->Usage() == MemoryUsage::Upload, true);
+		for (auto& region: regions) region.bufferOffset += linear.offset;
+		image.Upload(regions, linear.buffer, linear.offset, linear.size);
+		if (gathered != nullptr) m_scheduler.DeferOperation([buffer = std::move(gathered)]() mutable { buffer.reset(); });
+		const auto tick = m_scheduler.CurrentTick();
+		for (const auto& [b, e]: ring) {
+			const auto cb = std::max(b, base), ce = std::min(e, info.data.End());
+			if (cb < ce) NativeTex::MarkOwned(cb, ce, PackImageId(id), image.serial, tick);
+		}
+		NativeTex::NoteNativeUpload(hi - lo);
+	}
+	// Every subresource it needs is current now.
+	image.staged_ring = nullptr;
+	FinishRefresh(image);
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	using Clock = std::chrono::steady_clock;
 	LiveCounters::ScopedUs timed(LiveCounters::ImageInitUs);
@@ -2453,6 +2727,7 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	DeferredImageProtects protects {m_buffer_cache, m_page_manager};
 	protects.Track([&] { TrackImage(id); });
+	NativeTexPrepare(id); // (KYTY_NATIVE_TEX: ring bytes over it)
 	marks[1] = Clock::now();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (image.IsCpuDirty()) {
@@ -3385,6 +3660,7 @@ void TextureCache::RefreshImage(ImageId id) {
 bool TextureCache::RefreshDepthLayers(ImageId id, const ImageViewInfo& view) {
 	auto&       image  = m_slot_images[id];
 	const auto& info   = image.info;
+	if (NativeTex::Overlaps(info.data.address, info.data.size)) return false; // (InitializeImage takes them)
 	const auto  layers = info.resources.layers;
 	if (!image.IsPartiallyCpuDirty() || image.IsBufferModified() || image.IsStencilModified() ||
 	    image.IsMaybeCpuDirty() || image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
@@ -3486,6 +3762,7 @@ bool TextureCache::DirtyForView(const Image& image, const ImageDesc& desc) {
 bool TextureCache::RefreshTextureLevels(ImageId id, const ImageViewInfo& view) {
 	auto&       image = m_slot_images[id];
 	const auto& info  = image.info;
+	if (NativeTex::Overlaps(info.data.address, info.data.size)) return false; // (InitializeImage takes them)
 	uint64_t    begin = 0, end = 0;
 	if (!image.IsDefinitelyCpuDirty() || image.IsMaybeCpuDirty() || !LevelRefreshCandidate(image) ||
 	    !ViewLevelBytes(image, view, begin, end)) {
@@ -3698,6 +3975,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fai
 		            desc.info.extent.depth, desc.info.resources.levels, desc.info.resources.layers,
 		            static_cast<uint32_t>(desc.info.tile_mode), slow_candidates);
 	});
+	// (KYTY_NATIVE_TEX: moves into texture memory told to the trackers; not under the lock, not by a speculation)
+	if (!m_lock.OwnedByCurrentThread() && CommandScheduler::ThreadRecorder() == nullptr) NativeTex::DrainNotifications();
 	if (desc.info.data.size) m_buffer_cache.DrainGuestReadback(desc.info.data.address, desc.info.data.size);
 	if (desc.info.stencil.size) m_buffer_cache.DrainGuestReadback(desc.info.stencil.address, desc.info.stencil.size);
 	auto& command = m_scheduler.Current();
@@ -4336,6 +4615,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	NativeTex::BeforeHostWrite(address, size); // (authoritative bytes there back to guest memory first)
 	std::scoped_lock lock {m_lock};
 	ReleaseDownloadPages(address, size);
 	InvalidateCpuAliases(address, size);
@@ -5111,6 +5391,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, cons
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
+	NativeTex::Forget(address, size); // (GPU work wrote it: a buffer over it holds the bytes)
 	if (auto* spec = Spec::Current()) {
 		spec->NoteInvalidated(address, size); // (when it is committed)
 		return;
@@ -5413,6 +5694,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid map range\n");
 	}
+	NativeTex::Forget(address, size); // (new memory there)
 	std::scoped_lock lock {m_lock};
 	// Memory mapped under a cached image replaces its contents without a CPU write through the
 	// watched pages (the new pages may have been filled through another mapping).
@@ -5436,6 +5718,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
+	NativeTex::Forget(address, size); // (released: nothing to write back)
 	uint32_t       slow_deleted = 0, slow_partial = 0;
 	uint64_t       slow_bytes   = 0, slow_largest = 0, slow_largest_address = 0;
 	struct Count {
@@ -5600,6 +5883,8 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 
 void TextureCache::RunGarbageCollector() {
 	EraseRetired();
+	NativeTex::DrainNotifications();
+	NativeTex::Pump();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	// Parked images not taken back since the flip before: the game left that use of the memory.

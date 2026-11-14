@@ -36,10 +36,15 @@
 namespace Loader {
 
 namespace NativeTex {
+static std::atomic<StreamRelease> g_stream_release {nullptr};
+static std::atomic<StreamMove>    g_stream_move {nullptr};
+void SetStreamConsumer(StreamRelease release, StreamMove move) noexcept {
+	g_stream_release.store(release, std::memory_order_release);
+	g_stream_move.store(move, std::memory_order_release);
+}
 // Defaults: the original behaviour (the engine's own code runs right after each notification).
 void OnTextureRelease(uint64_t addr, uint64_t size) noexcept {
-	(void)addr;
-	(void)size;
+	if (const auto release = g_stream_release.load(std::memory_order_acquire); release != nullptr) release(addr, size);
 }
 void OnTextureCommit(uint64_t addr, uint64_t size) noexcept {
 	(void)addr;
@@ -49,6 +54,7 @@ void OnTextureCommit(uint64_t addr, uint64_t size) noexcept {
 // read do); the source is read as the game's memcpy reads it (a GPU-written source faults its bytes back).
 void OnTextureMove(uint64_t dst, uint64_t src, uint64_t size) noexcept {
 	if (size == 0 || dst == src) return;
+	if (const auto move = g_stream_move.load(std::memory_order_acquire); move != nullptr && move(dst, src, size)) return;
 	const bool prepared = Libs::LibKernel::Memory::PrepareHostOverwrite(dst, size);
 	std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), size);
 	Libs::LibKernel::Memory::FinishHostOverwrite(dst, size, prepared);
