@@ -218,6 +218,15 @@ struct State {
         sec_fog_skin_skipped = 0, sec_fog_no_block = 0;
     u64 sec_fog_px = 0, sec_fog_w = 0, sec_fog_dense = 0, sec_fog_obj = 0;
     std::unordered_map<u64, std::array<u32, 3>> fog_vs; // vs hash -> draws, with vector, no camera
+    // bb-tree-mv (BB_PLAYER_MASK): where the player mask (refine, FSR 3 "player from the real
+    // frame") comes from. Vector: class-1 pixels in the centre whose vector differs from
+    // bb_mv.comp's by > 0.75 px (bb_mv is off by several px on static scenery while the camera
+    // moves: tree trunks next to the player were refined and taken from the real frame). Ring:
+    // draws whose bone palette is one of the game's skin rings (the engine's own characters),
+    // class 4. Skin: every draw with a palette-sized buffer, class 4 (BB_NATIVE_MV2=player).
+    enum class PlayerMask : u8 { Vector = 0, Ring = 1, Skin = 2 };
+    PlayerMask player_mask = PlayerMask::Vector;
+    u64 sec_char_draws = 0;
 } g;
 
 void FlushVelocityCopies(vk::CommandBuffer cmd); // bb-velocity (below)
@@ -559,6 +568,25 @@ bool Init(const Vulkan::Instance& instance) {
         g.native2 = 0;
     } else if (!g.skin_order) {
         g.native2 &= kN2Character;
+    }
+    if (g.velocity) {
+        const char* pm = std::getenv("BB_PLAYER_MASK");
+        const std::string pms = pm != nullptr ? pm : "";
+        if ((g.native2 & kN2Character) != 0 || pms == "skin") {
+            g.player_mask = State::PlayerMask::Skin;
+        } else if (pms == "vector" || pms == "0") {
+            g.player_mask = State::PlayerMask::Vector;
+        } else {
+            g.player_mask = State::PlayerMask::Ring;
+        }
+        Log(fmt::format("[player-mask] BB_PLAYER_MASK={} ({}; ring: default, skin, vector: the "
+                        "pixels whose vector differs from bb_mv's)",
+                        pm != nullptr ? pm : "unset",
+                        g.player_mask == State::PlayerMask::Ring
+                            ? "draws with a game skin-ring palette"
+                            : (g.player_mask == State::PlayerMask::Skin
+                                   ? "draws with a palette-sized buffer"
+                                   : "vector against bb_mv")));
     }
     if (g.velocity) {
         g.additive = false; // absolute vectors: the previous camera is in the VS
@@ -986,6 +1014,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     std::array<SnapBuf, Shader::NUM_BUFFERS> prev{};
     std::array<bool, Shader::NUM_BUFFERS> use{};
     bool camera = false, ok = true, skinned = false, ring = false, obj_moved = false;
+    bool game_skin = false;
     u32 pal_matched = 0, pal_failed = 0, pal_bufs = 0;
     for (u32 h = 0; h < n && ok; ++h) {
         if ((cand & (1ull << h)) == 0) continue;
@@ -1105,6 +1134,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             u32 why = 0; // index into vs_why when no previous copy is found
             u64 rkey = 0;
             if (id.key != 0) {
+                game_skin = true;
                 ++g.vs_ring_seen;
                 g.ring_seen_cur[id.key] = 1;
                 const u64 ikey = Mix(Mix(id.key, id.slot_offset), size);
@@ -1331,7 +1361,12 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         const bool diag =
             !skinned && !obj_moved && g.stat_frame && (g.static_seen++ % kStaticSample) == 0;
         u32 flags = diag ? 3u : 1u;
-        if (skinned && (g.native2 & kN2Character) != 0) flags |= 4u;
+        const bool character = (g.player_mask == State::PlayerMask::Ring && game_skin) ||
+                               (g.player_mask == State::PlayerMask::Skin && skinned);
+        if (character) {
+            flags |= 4u;
+            ++g.sec_char_draws;
+        }
         push.objmv_flags = flags;
         ++g.w30.native;
         if (skinned) ++g.w30.skin_vec;
@@ -1608,7 +1643,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     }();
     // bb-native-mv2: the player mask is the skinned (class 4) pixels in the centre; kept every
     // frame (ping-pong) as with refine.
-    const bool characters = (g.native2 & kN2Character) != 0;
+    const bool characters = g.player_mask != State::PlayerMask::Vector;
     const bool keep = refine || characters;
     const bool store_color = color_view && ((g.check && IsStatFrame(g.frame + 1)) || keep);
     if (!stat && !store_color && (g.frame_vec_draws == 0 || reset)) {
@@ -1866,15 +1901,22 @@ void OnFlip() {
         g.sec_wo, g.sec_wc,
         g.sec_stat_frames ? double(g.sec_nonzero) / double(g.sec_stat_frames) : 0.0,
         g.sec_not_composed, g.sec_gpu_bufs));
-    if (g.sec_pl_px > 0) {
-        Log(fmt::format("[player-mv] player mask {:.0f} px/frame, vectors refined {:.1f}%, patch error "
-                        "{:.4f} -> {:.4f} (BB_PLAYER_MV_REFINE=0 off)",
-                        double(g.sec_pl_px) / double(std::max<u64>(1, g.sec_frames)),
-                        100.0 * double(g.sec_pl_changed) / double(g.sec_pl_px),
-                        double(g.sec_pl_before) / 1024.0 / double(g.sec_pl_px),
-                        double(g.sec_pl_after) / 1024.0 / double(g.sec_pl_px)));
+    if (g.sec_pl_px > 0 || g.sec_char_draws > 0) {
+        Log(fmt::format(
+            "[player-mv] player mask {:.0f} px/frame ({}, character draws {:.1f}/frame), "
+            "vectors refined {:.1f}%, patch error {:.4f} -> {:.4f} "
+            "(BB_PLAYER_MV_REFINE=0 off)",
+            double(g.sec_pl_px) / double(std::max<u64>(1, g.sec_frames)),
+            g.player_mask == State::PlayerMask::Ring
+                ? "game skin rings"
+                : (g.player_mask == State::PlayerMask::Skin ? "palette draws" : "vector vs bb_mv"),
+            double(g.sec_char_draws) / double(std::max<u64>(1, g.sec_frames)),
+            Pct(g.sec_pl_changed, g.sec_pl_px),
+            double(g.sec_pl_before) / 1024.0 / double(std::max<u64>(1, g.sec_pl_px)),
+            double(g.sec_pl_after) / 1024.0 / double(std::max<u64>(1, g.sec_pl_px))));
     }
     g.sec_pl_px = g.sec_pl_changed = g.sec_pl_before = g.sec_pl_after = 0;
+    g.sec_char_draws = 0;
     if (g.velocity) {
         // Native share of the G-buffer pixels (statistics frames): pixels written by a draw's own
         // vector (class 1 + the sampled static draws, class 2) over all pixels; the rest keeps

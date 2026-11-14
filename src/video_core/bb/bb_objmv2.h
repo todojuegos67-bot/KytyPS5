@@ -29,6 +29,10 @@
 //    fragment weights it by alpha * smoothstep(BB_FOG_MV_LO, BB_FOG_MV_HI, alpha); attachment 7
 //    blends (dx, dy) over the vector behind, keeps the class and accumulates the coverage in .w.
 //    BB_FOG_REACTIVE=1 also raises the upscaler's reactive mask with that coverage.
+//  - bb-tree-mv (BB_PLAYER_MASK=ring default / skin / vector): the player mask (refine, FSR 3
+//    "player from the real frame") is the draws whose bone palette is a game skin-ring palette
+//    (class 4), no longer every centre pixel whose vector differs from bb_mv.comp's (that held
+//    the static scenery next to the player: tree trunks were refined and not interpolated).
 // BB_OBJMV2=0 turns it off (camera-only vectors as build 344). BB_OBJMV2_CHECK=0 turns off the
 // reprojection check. Log once a second: "[objmv2] ...".
 
