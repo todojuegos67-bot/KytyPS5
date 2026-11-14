@@ -131,6 +131,449 @@ void InstallMemoryTags(VkPhysicalDevice physical_device) {
 }
 } // namespace
 
+// KYTY_VK_FIXED_POOL=1 (graphicContext.h): the caches' video memory as fixed VMA pools, allocated at start-up and never
+// freed until shutdown. Field evidence (RTX 5080 16 GB, 16 GB of RAM, 01:36:17): one texture-cache image of 1599 MiB
+// (the streamed 1024x1024 pool's array view from layer 754, held whole to the T#'s last layer because it overlaps the
+// GPU-written shadow-map layers) was a dedicated vkAllocateMemory of 1.6 GB: the process's private bytes 10.8 -> 12.7 GB
+// and the system's commit 30.7 -> 32.6 GB in one second, Windows trimmed the working set, and the PC rebooted 11 s later.
+// VMA makes any allocation past half its block size (32 MiB of 64) its own device memory, freed with it, and frees an
+// empty block as soon as another one is empty: GB-sized allocations and frees in play. In the pools an image or buffer
+// takes and returns room inside blocks allocated once.
+//  - KYTY_VK_FIXED_POOL_MB=<n>: the pools' size (default: the caches' budget, at most 55% of the GPU's memory).
+//  - KYTY_VK_FIXED_POOL_LARGE_MB=<n>: of it, the pool for allocations of 128 MiB or more (default 2048, at most a quarter),
+//    one block, so that a big texture array finds room the small ones did not cut up.
+//  - Not on a GPU of 9 GiB or less, an integrated one, or with KYTY_SIMULATE_VRAM_MB: as before there.
+// Every 30 s a "[vk-pool]" line: the pools' size and use, the fallbacks to the default pools, the largest allocation, and
+// the device memory VMA allocated and freed (whether the pools are on or not); each device-local vkAllocateMemory past
+// 128 MiB is logged when it happens, with what asked for it.
+namespace {
+constexpr uint64_t FpMiB          = uint64_t {1} << 20u;
+constexpr uint64_t FpGiB          = uint64_t {1} << 30u;
+constexpr uint64_t LargeThreshold = 128 * FpMiB;
+
+struct FixedPoolState {
+	bool     enabled          = false;
+	bool     buffers          = false; // game buffers too (their memory type is the pools')
+	VmaPool  general          = nullptr;
+	VmaPool  large            = nullptr;
+	uint32_t memory_type      = UINT32_MAX;
+	uint64_t general_block    = 0;
+	uint64_t general_blocks   = 0;
+	uint64_t large_block      = 0;
+	uint64_t total            = 0;
+};
+FixedPoolState                   g_fp;
+VkPhysicalDeviceMemoryProperties g_fp_memory {};
+
+// This period's figures (reset by the 30 s report) and the totals since start.
+std::atomic<uint64_t> g_fp_served {0}, g_fp_served_bytes {0};
+std::atomic<uint64_t> g_fp_fallback {0}, g_fp_fallback_bytes {0}, g_fp_fallback_full {0};
+std::atomic<uint64_t> g_fp_fallback_total {0}, g_fp_fallback_total_bytes {0};
+std::atomic<uint64_t> g_fp_largest {0};
+std::atomic<uint64_t> g_dm_alloc {0}, g_dm_alloc_bytes {0}, g_dm_free {0}, g_dm_free_bytes {0};
+std::atomic<uint64_t> g_dm_big {0}, g_dm_big_bytes {0}, g_dm_largest {0};
+std::atomic<uint32_t> g_fp_reports {0};
+
+// What this thread is allocating for (VkAllocationScope, CreateImage): named in the log of a big device allocation.
+thread_local const char*              t_source_tag   = nullptr;
+thread_local uint64_t                 t_source_bytes = 0;
+thread_local const VkImageCreateInfo* t_source_image = nullptr;
+
+void RaiseMax(std::atomic<uint64_t>& max, uint64_t value) {
+	uint64_t seen = max.load(std::memory_order_relaxed);
+	while (value > seen && !max.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+	}
+}
+
+void DescribeSource(char* text, size_t size) {
+	if (t_source_image != nullptr) {
+		std::snprintf(text, size, "%s, image %ux%ux%u layers=%u levels=%u fmt=%d usage=0x%x",
+		              t_source_tag != nullptr ? t_source_tag : "an image", t_source_image->extent.width,
+		              t_source_image->extent.height, t_source_image->extent.depth, t_source_image->arrayLayers,
+		              t_source_image->mipLevels, static_cast<int>(t_source_image->format),
+		              static_cast<unsigned>(t_source_image->usage));
+	} else if (t_source_tag != nullptr) {
+		std::snprintf(text, size, "%s (%" PRIu64 " MiB asked)", t_source_tag, t_source_bytes / FpMiB);
+	} else {
+		std::snprintf(text, size, "not named (a VMA block, an effect, an upscaler, a staging buffer)");
+	}
+}
+
+bool DeviceLocalType(uint32_t type) {
+	return type < g_fp_memory.memoryTypeCount &&
+	       (g_fp_memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+}
+
+// VMA's device memory callbacks: every vkAllocateMemory / vkFreeMemory it makes (blocks and dedicated allocations).
+void VKAPI_PTR OnDeviceMemoryAllocate(VmaAllocator /*allocator*/, uint32_t type, VkDeviceMemory /*memory*/,
+                                      VkDeviceSize size, void* /*user*/) {
+	if (!DeviceLocalType(type)) return;
+	g_dm_alloc.fetch_add(1, std::memory_order_relaxed);
+	g_dm_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+	RaiseMax(g_dm_largest, size);
+	if (size > LargeThreshold) {
+		g_dm_big.fetch_add(1, std::memory_order_relaxed);
+		g_dm_big_bytes.fetch_add(size, std::memory_order_relaxed);
+		if (g_fp_reports.fetch_add(1, std::memory_order_relaxed) < 256) {
+			char source[256];
+			DescribeSource(source, sizeof(source));
+			std::printf("[vk-pool] device-local vkAllocateMemory of %" PRIu64 " MiB (memory type %u): %s\n", size / FpMiB,
+			            type, source);
+			std::fflush(stdout);
+		}
+	}
+}
+
+void VKAPI_PTR OnDeviceMemoryFree(VmaAllocator /*allocator*/, uint32_t type, VkDeviceMemory /*memory*/, VkDeviceSize size,
+                                  void* /*user*/) {
+	if (!DeviceLocalType(type)) return;
+	g_dm_free.fetch_add(1, std::memory_order_relaxed);
+	g_dm_free_bytes.fetch_add(size, std::memory_order_relaxed);
+	if (size > LargeThreshold && g_fp_reports.fetch_add(1, std::memory_order_relaxed) < 256) {
+		std::printf("[vk-pool] device-local vkFreeMemory of %" PRIu64 " MiB (memory type %u)\n", size / FpMiB, type);
+		std::fflush(stdout);
+	}
+}
+
+const VmaDeviceMemoryCallbacks g_device_memory_callbacks {OnDeviceMemoryAllocate, OnDeviceMemoryFree, nullptr};
+
+bool FixedPoolRequested() {
+	static const bool requested = [] {
+		const char* value = std::getenv("KYTY_VK_FIXED_POOL");
+		return value != nullptr && value[0] == '1';
+	}();
+	return requested;
+}
+
+uint64_t EnvMiB(const char* name) {
+	const char* text = std::getenv(name);
+	return text != nullptr ? std::strtoull(text, nullptr, 10) * FpMiB : 0;
+}
+
+uint64_t PoolFree(VmaAllocator allocator) {
+	if (!g_fp.enabled || allocator == nullptr) return 0;
+	uint64_t free = 0;
+	for (const auto pool: {g_fp.general, g_fp.large}) {
+		if (pool == nullptr) continue;
+		VmaStatistics statistics {};
+		vmaGetPoolStatistics(allocator, pool, &statistics);
+		free += statistics.blockBytes - std::min(statistics.blockBytes, statistics.allocationBytes);
+	}
+	return free;
+}
+
+// The pools an allocation of these requirements may go to, in order (none: it cannot be held there).
+int CandidatePools(const VkMemoryRequirements& requirements, bool dedicated_required, VmaPool* pools) {
+	if (!g_fp.enabled || dedicated_required || (requirements.memoryTypeBits & (1u << g_fp.memory_type)) == 0) return 0;
+	int count = 0;
+	if (requirements.size >= LargeThreshold && g_fp.large != nullptr && requirements.size <= g_fp.large_block)
+		pools[count++] = g_fp.large;
+	if (g_fp.general != nullptr && requirements.size <= g_fp.general_block) pools[count++] = g_fp.general;
+	return count;
+}
+
+void NoteFallback(const char* what, const char* source, uint64_t size, bool full) {
+	g_fp_fallback.fetch_add(1, std::memory_order_relaxed);
+	g_fp_fallback_bytes.fetch_add(size, std::memory_order_relaxed);
+	g_fp_fallback_total.fetch_add(1, std::memory_order_relaxed);
+	g_fp_fallback_total_bytes.fetch_add(size, std::memory_order_relaxed);
+	if (full) g_fp_fallback_full.fetch_add(1, std::memory_order_relaxed);
+	RaiseMax(g_fp_largest, size);
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+		std::printf("[vk-pool] fallback to the default allocator: %s of %" PRIu64 " KiB (%s): %s\n", what, size >> 10u,
+		            source != nullptr ? source : "?",
+		            full ? "the fixed pools have no room for it" : "the fixed pools cannot hold it (memory type, size or dedicated)");
+		std::fflush(stdout);
+	}
+}
+
+void NoteServed(uint64_t size) {
+	g_fp_served.fetch_add(1, std::memory_order_relaxed);
+	g_fp_served_bytes.fetch_add(size, std::memory_order_relaxed);
+	RaiseMax(g_fp_largest, size);
+}
+
+// An image of the caches in the pools: created, its memory taken there, bound. False: nothing left behind.
+bool FixedPoolCreateImage(VmaAllocator allocator, VkDevice device, const VkImageCreateInfo& info, const char* source,
+                          VkImage* out, VmaAllocation* allocation) {
+	auto&   dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	VkImage image      = VK_NULL_HANDLE;
+	if (dispatcher.vkCreateImage(device, &info, nullptr, &image) != VK_SUCCESS) return false;
+	VkMemoryRequirements requirements {};
+	bool                 dedicated_required = false;
+	if (dispatcher.vkGetImageMemoryRequirements2 != nullptr) {
+		VkMemoryDedicatedRequirements  dedicated {};
+		dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
+		VkMemoryRequirements2          result {};
+		result.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+		VkImageMemoryRequirementsInfo2 query {};
+		query.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
+		result.pNext = &dedicated;
+		query.image  = image;
+		dispatcher.vkGetImageMemoryRequirements2(device, &query, &result);
+		requirements       = result.memoryRequirements;
+		dedicated_required = dedicated.requiresDedicatedAllocation == VK_TRUE;
+	} else {
+		dispatcher.vkGetImageMemoryRequirements(device, image, &requirements);
+	}
+	VmaPool   pools[2] {};
+	const int count = CandidatePools(requirements, dedicated_required, pools);
+	for (int i = 0; i < count; i++) {
+		VmaAllocationCreateInfo create {};
+		create.pool = pools[i];
+		if (vmaAllocateMemoryForImage(allocator, image, &create, allocation, nullptr) != VK_SUCCESS) continue;
+		if (vmaBindImageMemory(allocator, *allocation, image) == VK_SUCCESS) {
+			*out = image;
+			NoteServed(requirements.size);
+			return true;
+		}
+		vmaFreeMemory(allocator, *allocation);
+	}
+	*allocation = nullptr;
+	dispatcher.vkDestroyImage(device, image, nullptr);
+	NoteFallback("an image", source, requirements.size, count > 0);
+	return false;
+}
+
+// The 30 s line (GraphicContext::LogVideoMemory "30 s").
+void FixedPoolReport(VmaAllocator allocator) {
+	if (allocator == nullptr) return;
+	const uint64_t served         = g_fp_served.exchange(0), served_bytes = g_fp_served_bytes.exchange(0);
+	const uint64_t fallback       = g_fp_fallback.exchange(0), fallback_bytes = g_fp_fallback_bytes.exchange(0);
+	const uint64_t fallback_full  = g_fp_fallback_full.exchange(0);
+	const uint64_t largest        = g_fp_largest.exchange(0);
+	const uint64_t dm_alloc       = g_dm_alloc.exchange(0), dm_alloc_bytes = g_dm_alloc_bytes.exchange(0);
+	const uint64_t dm_free        = g_dm_free.exchange(0), dm_free_bytes = g_dm_free_bytes.exchange(0);
+	const uint64_t dm_big         = g_dm_big.exchange(0), dm_big_bytes = g_dm_big_bytes.exchange(0);
+	const uint64_t dm_largest     = g_dm_largest.exchange(0);
+	const auto     largest_resource = std::max(largest, dm_largest);
+	if (!g_fp.enabled) {
+		std::printf("[vk-pool] 30 s: fixed pools off (KYTY_VK_FIXED_POOL=1 turns them on); device-local device memory "
+		            "allocated %" PRIu64 " (%" PRIu64 " MiB), freed %" PRIu64 " (%" PRIu64 " MiB); largest %" PRIu64
+		            " MiB; allocations past 128 MiB %" PRIu64 " (%" PRIu64 " MiB)\n",
+		            dm_alloc, dm_alloc_bytes / FpMiB, dm_free, dm_free_bytes / FpMiB, dm_largest / FpMiB, dm_big,
+		            dm_big_bytes / FpMiB);
+		std::fflush(stdout);
+		return;
+	}
+	VmaStatistics general {}, large {};
+	if (g_fp.general != nullptr) vmaGetPoolStatistics(allocator, g_fp.general, &general);
+	if (g_fp.large != nullptr) vmaGetPoolStatistics(allocator, g_fp.large, &large);
+	VmaDetailedStatistics large_detail {};
+	if (g_fp.large != nullptr) vmaCalculatePoolStatistics(allocator, g_fp.large, &large_detail);
+	const uint64_t size = general.blockBytes + large.blockBytes;
+	const uint64_t used = general.allocationBytes + large.allocationBytes;
+	std::printf("[vk-pool] 30 s: fixed pools %" PRIu64 " MiB (general %" PRIu64 " MiB in %" PRIu32 " blocks, large %" PRIu64
+	            " MiB), used %" PRIu64 " MiB (general %" PRIu64 ", large %" PRIu64 " in %" PRIu32
+	            " allocations; largest free range in the large pool %" PRIu64 " MiB), free %" PRIu64
+	            " MiB; placed there %" PRIu64 " (%" PRIu64 " MiB); fallbacks to the default allocator %" PRIu64 " (%" PRIu64
+	            " MiB, %" PRIu64 " for want of room; since start %" PRIu64 ", %" PRIu64 " MiB); largest single allocation %" PRIu64
+	            " MiB; device-local device memory allocated %" PRIu64 " (%" PRIu64 " MiB), freed %" PRIu64 " (%" PRIu64
+	            " MiB); allocations past 128 MiB %" PRIu64 " (%" PRIu64 " MiB)\n",
+	            size / FpMiB, general.blockBytes / FpMiB, general.blockCount, large.blockBytes / FpMiB, used / FpMiB,
+	            general.allocationBytes / FpMiB, large.allocationBytes / FpMiB, large.allocationCount,
+	            large_detail.unusedRangeSizeMax / FpMiB, (size - std::min(size, used)) / FpMiB, served, served_bytes / FpMiB,
+	            fallback, fallback_bytes / FpMiB, fallback_full, g_fp_fallback_total.load() ,
+	            g_fp_fallback_total_bytes.load() / FpMiB, largest_resource / FpMiB, dm_alloc, dm_alloc_bytes / FpMiB, dm_free,
+	            dm_free_bytes / FpMiB, dm_big, dm_big_bytes / FpMiB);
+	std::fflush(stdout);
+}
+} // namespace
+
+VkAllocationScope::VkAllocationScope(const char* tag, uint64_t bytes)
+    : m_previous_tag(t_source_tag), m_previous_bytes(t_source_bytes), m_previous_image(t_source_image) {
+	t_source_tag   = tag;
+	t_source_bytes = bytes;
+	t_source_image = nullptr;
+}
+
+VkAllocationScope::~VkAllocationScope() {
+	t_source_tag   = m_previous_tag;
+	t_source_bytes = m_previous_bytes;
+	t_source_image = static_cast<const VkImageCreateInfo*>(m_previous_image);
+}
+
+bool FixedPoolEnabled() {
+	return g_fp.enabled;
+}
+
+uint64_t FixedPoolFree(const GraphicContext& graphics) {
+	return PoolFree(graphics.allocator);
+}
+
+bool FixedPoolCreateBuffer(GraphicContext& graphics, const VkBufferCreateInfo& info, VkBuffer* out,
+                           VmaAllocation* allocation, VmaAllocationInfo* allocation_info, const char* source) {
+	if (!g_fp.enabled || !g_fp.buffers || graphics.allocator == nullptr) return false;
+	auto&      dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto device     = static_cast<VkDevice>(graphics.device);
+	VkBuffer   buffer     = VK_NULL_HANDLE;
+	if (dispatcher.vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS) return false;
+	VkMemoryRequirements requirements {};
+	bool                 dedicated_required = false;
+	if (dispatcher.vkGetBufferMemoryRequirements2 != nullptr) {
+		VkMemoryDedicatedRequirements   dedicated {};
+		dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
+		VkMemoryRequirements2           result {};
+		result.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+		VkBufferMemoryRequirementsInfo2 query {};
+		query.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2;
+		result.pNext = &dedicated;
+		query.buffer = buffer;
+		dispatcher.vkGetBufferMemoryRequirements2(device, &query, &result);
+		requirements       = result.memoryRequirements;
+		dedicated_required = dedicated.requiresDedicatedAllocation == VK_TRUE;
+	} else {
+		dispatcher.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+	}
+	VmaPool   pools[2] {};
+	const int count = CandidatePools(requirements, dedicated_required, pools);
+	for (int i = 0; i < count; i++) {
+		VmaAllocationCreateInfo create {};
+		create.pool = pools[i];
+		if (vmaAllocateMemoryForBuffer(graphics.allocator, buffer, &create, allocation, allocation_info) != VK_SUCCESS)
+			continue;
+		if (vmaBindBufferMemory(graphics.allocator, *allocation, buffer) == VK_SUCCESS) {
+			*out = buffer;
+			NoteServed(requirements.size);
+			return true;
+		}
+		vmaFreeMemory(graphics.allocator, *allocation);
+	}
+	*allocation = nullptr;
+	dispatcher.vkDestroyBuffer(device, buffer, nullptr);
+	NoteFallback("a game buffer", source, requirements.size, count > 0);
+	return false;
+}
+
+// At start-up (CreateAllocator): the pools, their blocks allocated now and kept (minBlockCount = maxBlockCount).
+static void CreateFixedPools(GraphicContext& graphics) {
+	if (!FixedPoolRequested()) return;
+	const auto& memory   = graphics.physical_device_memory_properties;
+	uint64_t    local    = 0;
+	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++)
+		if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+			local = std::max<uint64_t>(local, memory.memoryHeaps[heap].size);
+	const bool discrete = graphics.physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+	if (!discrete || local <= 9 * FpGiB || !graphics.simulation_ballast.empty()) {
+		std::printf("[vk-pool] KYTY_VK_FIXED_POOL=1 ignored: %s (%" PRIu64 " MiB of video memory); the default allocator as "
+		            "before\n",
+		            !discrete ? "not a discrete GPU" : !graphics.simulation_ballast.empty() ? "KYTY_SIMULATE_VRAM_MB"
+		                                                                                    : "a GPU of 9 GiB or less",
+		            local / FpMiB);
+		std::fflush(stdout);
+		return;
+	}
+	// The largest block the driver allows (VkPhysicalDeviceMaintenance3Properties).
+	uint64_t max_allocation = 4 * FpGiB;
+	{
+		vk::PhysicalDeviceMaintenance3Properties maintenance3 {};
+		vk::PhysicalDeviceProperties2            properties {};
+		properties.pNext = &maintenance3;
+		graphics.physical_device.getProperties2(&properties);
+		if (maintenance3.maxMemoryAllocationSize != 0) max_allocation = std::min(max_allocation, maintenance3.maxMemoryAllocationSize);
+	}
+	uint64_t total = std::min<uint64_t>(graphics.GetTotalMemoryBudget(), local / 100 * 55);
+	if (const uint64_t forced = EnvMiB("KYTY_VK_FIXED_POOL_MB"); forced != 0) total = std::min<uint64_t>(forced, local * 3 / 4);
+	// The memory type: VMA's for a device-local image (as CreateImage asks) and for a game buffer.
+	uint32_t image_type = UINT32_MAX, buffer_type = UINT32_MAX;
+	{
+		VkImageCreateInfo image {};
+		image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		image.imageType   = VK_IMAGE_TYPE_2D;
+		image.format      = VK_FORMAT_R8G8B8A8_UNORM;
+		image.extent      = {256, 256, 1};
+		image.mipLevels   = 1;
+		image.arrayLayers = 1;
+		image.samples     = VK_SAMPLE_COUNT_1_BIT;
+		image.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		image.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		VmaAllocationCreateInfo allocation {};
+		allocation.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		if (vmaFindMemoryTypeIndexForImageInfo(graphics.allocator, &image, &allocation, &image_type) != VK_SUCCESS)
+			image_type = UINT32_MAX;
+		VkBufferCreateInfo buffer {};
+		buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		buffer.size  = uint64_t {64} << 10u;
+		buffer.usage = static_cast<VkBufferUsageFlags>(AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress);
+		VmaAllocationCreateInfo device {};
+		device.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		if (vmaFindMemoryTypeIndexForBufferInfo(graphics.allocator, &buffer, &device, &buffer_type) != VK_SUCCESS)
+			buffer_type = UINT32_MAX;
+	}
+	if (image_type == UINT32_MAX) {
+		std::printf("[vk-pool] KYTY_VK_FIXED_POOL=1 ignored: no device-local memory type for images\n");
+		std::fflush(stdout);
+		return;
+	}
+	t_source_tag   = "fixed pool reserve (start-up)";
+	t_source_bytes = total;
+	// Halved until the driver gives it (not below 2 GiB).
+	for (; total >= 2 * FpGiB; total /= 2) {
+		uint64_t large = std::min<uint64_t>(std::min<uint64_t>(EnvMiB("KYTY_VK_FIXED_POOL_LARGE_MB") != 0
+		                                                           ? EnvMiB("KYTY_VK_FIXED_POOL_LARGE_MB")
+		                                                           : 2 * FpGiB,
+		                                                       total / 4),
+		                                    max_allocation);
+		large &= ~(FpMiB - 1);
+		const uint64_t block  = std::min<uint64_t>(FpGiB, max_allocation) & ~(FpMiB - 1);
+		const uint64_t blocks = (total - large) / block;
+		if (blocks == 0) continue;
+		VmaPoolCreateInfo general {};
+		general.memoryTypeIndex = image_type;
+		general.blockSize       = block;
+		general.minBlockCount   = static_cast<size_t>(blocks);
+		general.maxBlockCount   = static_cast<size_t>(blocks);
+		VmaPool general_pool    = nullptr;
+		if (vmaCreatePool(graphics.allocator, &general, &general_pool) != VK_SUCCESS) continue;
+		VmaPool large_pool = nullptr;
+		if (large >= LargeThreshold) {
+			VmaPoolCreateInfo big {};
+			big.memoryTypeIndex = image_type;
+			big.blockSize       = large;
+			big.minBlockCount   = 1;
+			big.maxBlockCount   = 1;
+			if (vmaCreatePool(graphics.allocator, &big, &large_pool) != VK_SUCCESS) large_pool = nullptr;
+		}
+		g_fp.general        = general_pool;
+		g_fp.large          = large_pool;
+		g_fp.memory_type    = image_type;
+		g_fp.general_block  = block;
+		g_fp.general_blocks = blocks;
+		g_fp.large_block    = large_pool != nullptr ? large : 0;
+		g_fp.total          = block * blocks + g_fp.large_block;
+		g_fp.buffers        = buffer_type == image_type;
+		g_fp.enabled        = true;
+		break;
+	}
+	t_source_tag   = nullptr;
+	t_source_bytes = 0;
+	if (!g_fp.enabled) {
+		std::printf("[vk-pool] KYTY_VK_FIXED_POOL=1: the driver refused the pools; the default allocator as before\n");
+	} else {
+		std::printf("[vk-pool] fixed video memory pools: %" PRIu64 " MiB allocated at start-up and kept until exit (general %" PRIu64
+		            " x %" PRIu64 " MiB, large %" PRIu64 " MiB for allocations of 128 MiB or more; memory type %u; game "
+		            "buffers %s; GPU %" PRIu64 " MiB, the caches' budget %" PRIu64 " MiB)\n",
+		            g_fp.total / FpMiB, g_fp.general_blocks, g_fp.general_block / FpMiB, g_fp.large_block / FpMiB,
+		            g_fp.memory_type, g_fp.buffers ? "too" : "not (another memory type)", local / FpMiB,
+		            graphics.GetTotalMemoryBudget() / FpMiB);
+	}
+	std::fflush(stdout);
+}
+
+static void DestroyFixedPools(VmaAllocator allocator) {
+	if (!g_fp.enabled) return;
+	g_fp.enabled = false;
+	for (auto* pool: {&g_fp.general, &g_fp.large}) {
+		if (*pool == nullptr) continue;
+		// (Only empty: an image or buffer still alive frees its memory into it later.)
+		VmaStatistics statistics {};
+		vmaGetPoolStatistics(allocator, *pool, &statistics);
+		if (statistics.allocationCount == 0) vmaDestroyPool(allocator, *pool);
+		*pool = nullptr;
+	}
+}
+
 // The RAM census's Vulkan heaps (ram-census.h): VK_EXT_memory_budget through VMA (thread-safe), on the census thread.
 static VmaAllocator g_census_allocator = nullptr;
 static int          CensusHeaps(RamCensus::Heap* heaps, int max) {
@@ -164,7 +607,10 @@ bool GraphicContext::CreateAllocator() {
 		functions.vkFreeMemory     = TaggedFreeMemory;
 	}
 
+	std::memcpy(&g_fp_memory, &physical_device_memory_properties, sizeof(g_fp_memory));
 	VmaAllocatorCreateInfo info {};
+	// (Counts every device memory allocation and free VMA makes: the "[vk-pool]" lines.)
+	info.pDeviceMemoryCallbacks = &g_device_memory_callbacks;
 	info.instance         = instance;
 	info.physicalDevice   = physical_device;
 	info.device           = device;
@@ -257,11 +703,18 @@ bool GraphicContext::CreateAllocator() {
 	RamGuard::Start();
 	LocalPlatform::KeepResident();
 	LocalPlatform::StartMemoryBreakdown();
+	// KYTY_VK_FIXED_POOL=1: the caches' fixed pools, before anything else takes video memory.
+	CreateFixedPools(*this);
 	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
-	// for big ones, as in the default pools).
-	if (const char* defrag = std::getenv("KYTY_BUFFER_DEFRAG");
-	    defrag == nullptr ? small_video_memory : std::strcmp(defrag, "0") != 0) {
-		VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+	// for big ones, as in the default pools). Not with the fixed pools holding the game buffers: its compaction moves
+	// memory and frees blocks.
+	const char* defrag     = std::getenv("KYTY_BUFFER_DEFRAG");
+	const bool  defrag_on  = defrag == nullptr ? small_video_memory : std::strcmp(defrag, "0") != 0;
+	if (defrag_on && g_fp.buffers) {
+		std::printf("Game buffers: in the fixed pools (KYTY_VK_FIXED_POOL=1), not compacted (KYTY_BUFFER_DEFRAG off)\n");
+	} else if (defrag_on) {
+		VkBufferCreateInfo buffer {};
+		buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 		buffer.size  = uint64_t {64} << 10u;
 		buffer.usage = static_cast<VkBufferUsageFlags>(AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress);
 		VmaAllocationCreateInfo allocation {};
@@ -332,6 +785,7 @@ void GraphicContext::DestroyAllocator() {
 	if (g_image_pool_releaser != 0) MemGuard::UnregisterReleaser(g_image_pool_releaser);
 	g_image_pool_releaser = 0;
 	DestroyImagePool(allocator);
+	DestroyFixedPools(allocator);
 	if (game_buffer_pool != nullptr) {
 		// (Only empty: a buffer still alive frees its memory into it later.)
 		VmaStatistics statistics {};
@@ -376,6 +830,7 @@ bool GraphicContext::QueryLocalVideoMemory(uint64_t* usage, uint64_t* budget) co
 }
 
 void GraphicContext::LogVideoMemory(const char* label) const {
+	if (std::strcmp(label, "30 s") == 0) FixedPoolReport(allocator);
 	uint64_t video = 0, budget = 0, shared = 0;
 	if (allocator == nullptr || !QueryLocalVideoMemory(&video, &budget) || !LocalPlatform::QuerySharedGpuMemory(&shared)) return;
 	// VMA's memory by kind of memory type: device-local (video memory), the driver's system memory type without
@@ -460,7 +915,9 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 			usage += budgets[heap].usage;
 		}
 	}
-	return usage - std::min(usage, simulation_ballast_bytes);
+	usage -= std::min(usage, simulation_ballast_bytes);
+	// (KYTY_VK_FIXED_POOL: the pools' room not taken yet is not in use; the caches collect by what they hold.)
+	return usage - std::min(usage, PoolFree(allocator));
 }
 
 uint64_t GraphicContext::GetVideoMemoryRoom() const {
@@ -481,7 +938,9 @@ uint64_t GraphicContext::GetVideoMemoryRoom() const {
 	}
 	// (The driver's usage holds KYTY_SIMULATE_VRAM_MB's ballast: the room left is the same.)
 	const auto& budget = budgets[video];
-	return budget.budget > budget.usage ? budget.budget - budget.usage : 0;
+	// (KYTY_VK_FIXED_POOL: room in the pools is room too, for a game buffer (this figure's use) only when the pools hold
+	// game buffers: otherwise a spilled buffer moved back on room it cannot take lands in system memory again.)
+	return (budget.budget > budget.usage ? budget.budget - budget.usage : 0) + (g_fp.buffers ? PoolFree(allocator) : 0);
 }
 
 // Allocations in the heaps that are not device-local (system RAM the driver maps for the GPU): staging and
@@ -673,7 +1132,7 @@ void GraphicContext::ReportMemoryFallback(const char* what, uint64_t bytes) cons
 	std::fflush(stdout);
 }
 
-bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image, const char* cache_source) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
@@ -724,6 +1183,18 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		alloc_info.requiredFlags = 0;
 		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
+	// (Names this image in the log of a device allocation past 128 MiB.)
+	const auto* native_info = static_cast<const VkImageCreateInfo*>(static_cast<const vk::ImageCreateInfo::NativeType*>(image_info));
+	VkAllocationScope scope(cache_source != nullptr ? cache_source : "an image (CreateImage)", 0);
+	t_source_image = native_info;
+	// KYTY_VK_FIXED_POOL=1: a cache image in video memory goes to the fixed pools; without room there, as before.
+	bool pooled = false;
+	if (cache_source != nullptr && g_fp.enabled && alloc_info.requiredFlags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+		VkImage native_image = VK_NULL_HANDLE;
+		pooled = FixedPoolCreateImage(allocator, static_cast<VkDevice>(device), *native_info, cache_source, &native_image,
+		                              &image.allocation);
+		if (pooled) image.image = native_image;
+	}
 	vk::Result result = vk::Result::eSuccess;
 	const auto create = [&] {
 		vk::Image::CType native_image = VK_NULL_HANDLE;
@@ -735,7 +1206,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	};
 	// Out of video memory: without the freed images kept for reuse, then in system memory (slower
 	// to sample, but the game goes on).
-	if (!create()) {
+	if (!pooled && !create()) {
 		TrimImagePool();
 		if (!create()) {
 			alloc_info.requiredFlags  = 0;

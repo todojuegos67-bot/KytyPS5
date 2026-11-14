@@ -888,7 +888,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0;
 	}();
 	const bool test_fail = test_fail_above != 0 && info.data.size > test_fail_above;
-	if ((may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing)) {
+	if ((may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing, "texture cache")) {
 		m_create_failed = true;
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
