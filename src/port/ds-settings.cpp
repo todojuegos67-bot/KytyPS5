@@ -1043,7 +1043,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	env.Default("KYTY_BACKING_ON_DEMAND", "1");
 	// (native port) Native memory model: per-frame CPU->GPU arenas as an upload heap (no page-protection tracking),
 	// streamed mips reported once per mip, render-target arenas GPU-only. Byte-checked; falls back if the eboot differs.
-	env.Default("KYTY_NATIVE_MEM", "3");
+	env.Default("KYTY_NATIVE_MEM", "2"); // 3 (upload heap) only when the user turns it on: the first build cost 40 ms of CPU per frame
 	// (native port) Guest memory written only where bytes change (no needless dirty pages); ReBAR upload rings.
 	env.Default("KYTY_LEAN_HOSTMEM", "1");
 	if (ratio > 0) env.Set("KYTY_UPSCALE_RATIO", Num(ratio));
