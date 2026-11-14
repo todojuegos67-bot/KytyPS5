@@ -325,7 +325,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		return vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
 		                       &allocation_info, &native_buffer, &m_allocation, &allocation_result) == VK_SUCCESS;
 	};
-	bool created = create();
+	// KYTY_VK_FIXED_POOL=1: a game buffer in the caches' fixed pools; without room there, as before.
+	const bool game_buffer = usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 && !forced_spill;
+	VkAllocationScope scope(game_buffer ? "a game buffer (buffer cache)" : "a GPU buffer (stream buffer)", size);
+	bool created = game_buffer && FixedPoolEnabled() &&
+	               FixedPoolCreateBuffer(graphics, *static_cast<const VkBufferCreateInfo*>(buffer_info), &native_buffer,
+	                                     &m_allocation, &allocation_result, "buffer cache");
+	if (!created) created = create();
 	if (!created && allocation_info.pool != nullptr) {
 		allocation_info.pool = nullptr;
 		created              = create();

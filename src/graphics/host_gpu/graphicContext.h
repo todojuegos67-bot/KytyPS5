@@ -174,7 +174,10 @@ struct GraphicContext {
 	void                   LogVideoMemory(const char* label) const;
 	// capped: the caches' budget (KYTY_VRAM_BUDGET_MB, room kept for Windows); false: what the driver allows.
 	[[nodiscard]] uint64_t GetTotalMemoryBudget(bool capped = true) const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// cache_source: an image of the texture cache (its name in the log), which KYTY_VK_FIXED_POOL=1 places in the fixed
+	// video memory pools (vma.cpp); null: any other image (effects, upscalers, frame generation, the swapchain's).
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
+	                                   const char* cache_source = nullptr);
 	void                   DeleteImage(VulkanImage& image);
 	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
 	void                   TrimImagePool();
@@ -248,6 +251,30 @@ struct VulkanImage {
 enum VramSaverCounter { VramEvicted = 0, VramEvictedBytes, VramFallbackHost, VramFailed, VramRescued, VramCounterCount };
 void     VramSaverAdd(int counter, uint64_t value);
 uint64_t VramSaverGet(int counter);
+
+// KYTY_VK_FIXED_POOL=1 (vma.cpp; default off): the caches' video memory is allocated once at start-up as VMA pools whose
+// blocks are never freed (as a native game's memory pools), so that the process's commit charge (NVIDIA's Windows driver
+// charges device-local memory to it) rises once at boot and stays flat, instead of GB-sized allocations and frees in play.
+// Not on GPUs of 8 GB or less (as before there). The caches' images (CreateImage's cache_source) and game buffers go
+// there; past a full pool, or what a pool cannot hold, VMA's default pools as before (logged).
+[[nodiscard]] bool FixedPoolEnabled();
+// A game buffer in the fixed pools: true with the buffer bound to its memory there; false (nothing created): the caller
+// makes it as before.
+[[nodiscard]] bool FixedPoolCreateBuffer(GraphicContext& graphics, const VkBufferCreateInfo& info, VkBuffer* buffer,
+                                         VmaAllocation* allocation, VmaAllocationInfo* allocation_info, const char* source);
+// Names the allocations VMA makes on this thread meanwhile (the "[vk-pool]" log's device-local allocations past 128 MiB).
+class VkAllocationScope {
+public:
+	VkAllocationScope(const char* tag, uint64_t bytes);
+	~VkAllocationScope();
+	VkAllocationScope(const VkAllocationScope&)            = delete;
+	VkAllocationScope& operator=(const VkAllocationScope&) = delete;
+
+private:
+	const char* m_previous_tag;
+	uint64_t    m_previous_bytes;
+	const void* m_previous_image;
+};
 
 // Offline tools: the emulator's device without a window (vulkanWindow.cpp).
 bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx);
