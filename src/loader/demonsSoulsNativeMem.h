@@ -24,6 +24,9 @@
 //   - streamed mips: the memcpy of CTexture stream-in (0x901459, from ProcessTextureDataInternal 0xaa4a60) calls a host
 //     copy that tells the trackers once for the whole mip (as a file read does) instead of faulting page by page.
 // Nothing here frees, decommits, trims or moves memory. Level 3 rewrites one guest call (0x901459) to a cave.
+// KYTY_GPU_ONLY_WRITES=1 (any level; level 1 when KYTY_NATIVE_MEM is unset): the census publishes the runs of the GPU
+//   allocators (EMemoryType 2) to src/local/gpu-only-writes.h, which cuts the buffer cache's readback windows there to the
+//   pages the CPU touches; see that header. Every census report also gives the write-backs by source.
 
 #include <atomic>
 #include <cstdint>

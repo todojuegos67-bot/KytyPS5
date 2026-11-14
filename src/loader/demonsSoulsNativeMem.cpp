@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/uploadHeap.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
+#include "gpu-only-writes.h"
 #include "kernel/memory.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
@@ -475,6 +476,15 @@ void Walk(Census& c) {
 		}
 	}
 	std::sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) { return a.begin < b.begin; });
+	// KYTY_GPU_ONLY_WRITES: the runs of the GPU allocators (EMemoryType 2, GPUMemory) for the readback policy
+	// (gpu-only-writes.h). A walk that met a changed list publishes what it read: a run misclassified until the next walk
+	// costs only a wider or narrower readback, never a wrong byte.
+	if (GpuOnlyWrites::Enabled()) {
+		std::vector<std::pair<uint64_t, uint64_t>> gpu;
+		for (const auto& run: runs)
+			if (c.owners[run.owner].type == 2) gpu.emplace_back(run.begin, run.end);
+		GpuOnlyWrites::Publish(gpu);
+	}
 	c.runs = std::move(runs);
 }
 
@@ -633,6 +643,34 @@ void Report(Census& c, double seconds, bool residency) {
 		            per(now[5] - last[5]));
 		std::copy(std::begin(now), std::end(now), std::begin(last));
 	}
+	{
+		// Write-backs by source (all census levels), and KYTY_GPU_ONLY_WRITES's work (gpu-only-writes.h).
+		auto&           g = GpuOnlyWrites::Get();
+		static uint64_t last_wb[5] {}, last_narrowed = 0, last_skipped = 0, last_zero = 0;
+		uint64_t        wb[5];
+		for (int i = 0; i < 5; i++) wb[i] = g.written_back[i].load(std::memory_order_relaxed);
+		const uint64_t narrowed = g.narrowed.load(), skipped = g.skipped_bytes.load(), zero = g.fresh_zero_bytes.load();
+		const auto mib_s = [&](uint64_t bytes) {
+			return static_cast<unsigned long long>(static_cast<double>(bytes) / seconds / static_cast<double>(MiB) + 0.5);
+		};
+		std::printf("[native-mem]   write-backs by source, MiB/s: readback %llu, download %llu, feedback %llu, image %llu, "
+		            "other %llu",
+		            mib_s(wb[0] - last_wb[0]), mib_s(wb[1] - last_wb[1]), mib_s(wb[2] - last_wb[2]),
+		            mib_s(wb[3] - last_wb[3]), mib_s(wb[4] - last_wb[4]));
+		if (GpuOnlyWrites::Enabled()) {
+			std::printf("; GPU-only writes (KYTY_GPU_ONLY_WRITES, window %llu KiB): GPU-class runs %llu MiB, per s %llu "
+			            "readbacks cut to the pages touched (%llu MiB of window not taken), never-written bytes zero-filled "
+			            "instead of read %llu MiB/s",
+			            static_cast<unsigned long long>(GpuOnlyWrites::WindowBytes() >> 10u),
+			            static_cast<unsigned long long>(g.gpu_bytes.load() / MiB), per(narrowed - last_narrowed),
+			            mib_s(skipped - last_skipped), mib_s(zero - last_zero));
+		}
+		std::printf("\n");
+		std::copy(std::begin(wb), std::end(wb), std::begin(last_wb));
+		last_narrowed = narrowed;
+		last_skipped  = skipped;
+		last_zero     = zero;
+	}
 	if (g_level.load(std::memory_order_relaxed) >= 2) {
 		std::printf("[native-mem]   GPU-only arenas, kept in video memory instead of downloaded into guest RAM (since "
 		            "start): image collector %llu passes (%llu MiB summed over them), linear readback %llu (%llu MiB)\n",
@@ -753,7 +791,8 @@ bool KeepGpuOnly(uint64_t vaddr, uint64_t size, int why) noexcept {
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
 	const char* v     = std::getenv("KYTY_NATIVE_MEM");
-	const int   level = v != nullptr && v[0] >= '1' && v[0] <= '3' ? v[0] - '0' : 0;
+	// (KYTY_GPU_ONLY_WRITES needs the census's GPU-class runs: level 1 at least.)
+	const int   level = v != nullptr && v[0] >= '1' && v[0] <= '3' ? v[0] - '0' : GpuOnlyWrites::Enabled() ? 1 : 0;
 	if (level == 0) return;
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
@@ -802,6 +841,12 @@ void Install(Program* program) {
 	            applied >= 3   ? "census, GPU-only render-target arenas, per-frame arenas as upload heaps (no write tracking)"
 	            : applied >= 2 ? "census, and render-target arenas kept GPU-only once found"
 	                           : "census only (nothing in the emulator's behaviour changes)");
+	if (GpuOnlyWrites::Enabled()) {
+		std::printf("[native-mem] KYTY_GPU_ONLY_WRITES=1: in the engine's GPU memory a CPU access reads back only its own "
+		            "pages (window %llu KiB; the rest stay GPU-owned, no-access, and fault on their own first touch); "
+		            "never-written guest bytes are zero-filled instead of read on every upload path\n",
+		            static_cast<unsigned long long>(GpuOnlyWrites::WindowBytes() >> 10u));
+	}
 	std::fflush(stdout);
 #else
 	(void)program;

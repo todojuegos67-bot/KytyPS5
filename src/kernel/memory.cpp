@@ -6,6 +6,7 @@
 #include "time-census.h"
 #include "writeback-verify.h"
 #include "fresh-memory.h"
+#include "gpu-only-writes.h"
 #include "guest-lazy-commit.h"
 #include "lean-hostmem.h"
 #include "mem-guard.h"
@@ -1586,6 +1587,7 @@ bool PrintWriteBacksOverlapping(uint64_t vaddr, uint64_t size) {
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* source) noexcept {
 	const auto index = g_write_back_count.fetch_add(1, std::memory_order_relaxed);
 	::Loader::DemonsSoulsNativeMem::Note(::Loader::DemonsSoulsNativeMem::WriteBack, vaddr, size);
+	if (::Loader::DemonsSoulsNativeMem::On()) GpuOnlyWrites::NoteWriteBack(source, size); // (by source, for the census)
 	g_write_backs[index % WriteBackRecords] = {std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                          vaddr, size, source};
 	// (Diagnostic, KYTY_WRITEBACK_VERIFY: the GPU-owned pages checked before, hashed again after.)

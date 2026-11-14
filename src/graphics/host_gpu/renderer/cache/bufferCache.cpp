@@ -15,6 +15,7 @@
 #include "readback-queue.h"
 #include "sync-stats.h"
 #include "fresh-memory.h"
+#include "gpu-only-writes.h"
 #include "lean-hostmem.h"
 #include "texture-offload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -102,7 +103,13 @@ bool SparseUploadPieces() {
 
 void ReadMappedOrZeroCall(void* context, uint64_t destination, uint64_t size) {
 	auto* target = reinterpret_cast<uint8_t*>(destination);
-	if (!Libs::LibKernel::Memory::TryReadMappedOrZero(reinterpret_cast<uint64_t>(context), target, size)) {
+	// (KYTY_GPU_ONLY_WRITES: never-written granules zero-filled, not read: gpu-only-writes.h.)
+	if (!GpuOnlyWrites::ReadSkippingFresh(
+	        target, reinterpret_cast<uint64_t>(context), size,
+	        [](uint64_t vaddr, uint64_t bytes, auto&& run) { return FreshMemory::ForEachRun(vaddr, bytes, run); },
+	        [](uint8_t* to, uint64_t vaddr, uint64_t bytes) {
+		        return Libs::LibKernel::Memory::TryReadMappedOrZero(vaddr, to, bytes);
+	        })) {
 		std::memset(target, 0, size);
 	}
 }
@@ -213,6 +220,10 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	auto begin = std::max(address & ~(WindowSize - 1), buffer.CpuAddress());
 	auto end = std::min(std::max(begin + WindowSize, address + size),
 	                          buffer.CpuAddress() + buffer.Size());
+	// KYTY_GPU_ONLY_WRITES: in the engine's GPU memory, only the pages of the access (gpu-only-writes.h); the rest stay
+	// GPU-owned and fault on their own first touch.
+	(void)GpuOnlyWrites::Narrow(address, size, buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size(), TRACKER_PAGE_SIZE,
+	                            begin, end);
 	if (!m_resources->IsMapped(begin, end - begin) ||
 	    !LibKernel::Memory::IsUniqueGuestBackingRange(begin, end - begin)) {
 		// The widening is speculative: a buffer registered over memory the game has since unmapped in part (or maps
@@ -1133,7 +1144,9 @@ bool BufferCache::TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool i
 	auto& feedback = *m_copy_feedback;
 	if (!feedback.MayOverlap(vaddr, size) || !IsRegionRegistered(vaddr, size)) return false;
 	auto first = vaddr, last = vaddr + size;
-	if (auto it = feedback.UpperBound(vaddr); it != feedback.index.begin()) {
+	// (KYTY_GPU_ONLY_WRITES: in the engine's GPU memory not widened to the whole snapshot: gpu-only-writes.h.)
+	const bool widen = !(GpuOnlyWrites::Enabled() && GpuOnlyWrites::IsGpuClass(vaddr, size));
+	if (auto it = feedback.UpperBound(vaddr); widen && it != feedback.index.begin()) {
 		const auto& slot = feedback.slots[std::prev(it)->second];
 		if (slot.address <= vaddr && vaddr < slot.address + slot.size) {
 			first = std::min(first, slot.address);
@@ -2121,8 +2134,10 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	constexpr uint64_t WindowSize   = 512 * 1024;
 	const auto         buffer_begin = buffer.CpuAddress();
 	const auto         buffer_end   = buffer_begin + buffer.Size();
-	const auto         window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
-	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	auto               window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
+	auto               window_end   = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	// (KYTY_GPU_ONLY_WRITES: the pages of the access only, in the engine's GPU memory: gpu-only-writes.h.)
+	(void)GpuOnlyWrites::Narrow(vaddr, size, buffer_begin, buffer_end, TRACKER_PAGE_SIZE, window_begin, window_end);
 	DrainGuestReadback(window_begin, window_end - window_begin);
 
 	std::vector<DownloadCopy> copies;
@@ -2488,7 +2503,19 @@ static void PushUploadCopy(uint8_t* target, const uint8_t* source, uint64_t size
 	AsyncUpload::Get().Push(target, source, size, vaddr);
 }
 
+static void ReadUploadSourceAll(uint8_t* destination, uint64_t address, uint64_t size);
+// (KYTY_GPU_ONLY_WRITES: never-written granules zero-filled instead of read through the alias: gpu-only-writes.h.)
 static void ReadUploadSource(uint8_t* destination, uint64_t address, uint64_t size) {
+	(void)GpuOnlyWrites::ReadSkippingFresh(
+	    destination, address, size,
+	    [](uint64_t vaddr, uint64_t bytes, auto&& run) { return FreshMemory::ForEachRun(vaddr, bytes, run); },
+	    [](uint8_t* to, uint64_t vaddr, uint64_t bytes) {
+		    ReadUploadSourceAll(to, vaddr, bytes);
+		    return true;
+	    });
+}
+
+static void ReadUploadSourceAll(uint8_t* destination, uint64_t address, uint64_t size) {
 	if (Libs::LibKernel::Memory::TryReadBackingToHost(address, destination, size)) return;
 #if defined(_WIN32)
 	if (const auto missed = Common::GuardedCopy(destination, reinterpret_cast<const void*>(address), size); missed != 0) {
@@ -2810,8 +2837,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 	const char* prt_failure = "not-attempted";
 	ApplyImageProtects();
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size, &prt_failure))) {
+	// (KYTY_GPU_ONLY_WRITES: never-written granules zero-filled, not read: gpu-only-writes.h.)
+	const auto read_image = [&](uint8_t* to, uint64_t from, uint64_t bytes) {
+		return Libs::LibKernel::Memory::TryReadBacking(from, to, bytes) ||
+		       Libs::LibKernel::Memory::TryReadPrtBacking(from, to, bytes, &prt_failure);
+	};
+	if (staging == nullptr ||
+	    !GpuOnlyWrites::ReadSkippingFresh(
+	        staging, vaddr, size,
+	        [](uint64_t from, uint64_t bytes, auto&& run) { return FreshMemory::ForEachRun(from, bytes, run); },
+	        read_image)) {
 		EXIT("BufferCache: failed to read mapped guest image backing: "
 		     "address=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " staging=%p staging_capacity=0x%016" PRIx64 " mapped=%u prt_failure=%s\n",
@@ -2870,7 +2905,9 @@ bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint6
 	if (SparseUploadPieces() && Libs::LibKernel::Memory::TryGetSparseBackingPieces(vaddr, size, m_backing_pieces)) {
 		uint64_t offset = 0;
 		for (const auto& [piece, bytes]: m_backing_pieces) {
-			AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
+			// (KYTY_GPU_ONLY_WRITES: through PushUploadCopy, whose never-written granules are zeros, not read.)
+			if (GpuOnlyWrites::Enabled()) PushUploadCopy(staging + offset, piece, bytes, vaddr + offset);
+			else AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
 			offset += bytes;
 		}
 		LiveCounters::Add(LiveCounters::SparseUploadPieces, m_backing_pieces.size());
@@ -2963,7 +3000,8 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 			    Libs::LibKernel::Memory::TryGetSparseBackingPieces(piece.vaddr, piece.size, m_backing_pieces)) {
 				uint64_t offset = 0;
 				for (const auto& [source, bytes]: m_backing_pieces) {
-					AsyncUpload::Get().Push(target + offset, source, bytes, piece.vaddr + offset);
+					if (GpuOnlyWrites::Enabled()) PushUploadCopy(target + offset, source, bytes, piece.vaddr + offset);
+					else AsyncUpload::Get().Push(target + offset, source, bytes, piece.vaddr + offset);
 					offset += bytes;
 				}
 				LiveCounters::Add(LiveCounters::SparseUploadPieces, m_backing_pieces.size());
