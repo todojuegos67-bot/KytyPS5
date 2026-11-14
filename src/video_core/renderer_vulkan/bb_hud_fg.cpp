@@ -313,7 +313,9 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
         });
         if (lr == vk::Result::eSuccess) {
             fix_set = l;
-            const vk::PushConstantRange range{C, 0, 16};
+            // bb-artifact-fix: the shader's push block is 32 bytes (uvec4 size + vec4 obj) and
+            // 32 are pushed below; the range said 16 (invalid: obj was outside the layout).
+            const vk::PushConstantRange range{C, 0, 32};
             auto [pr, pl] = device.createPipelineLayout({
                 .setLayoutCount = 1,
                 .pSetLayouts = &fix_set,
@@ -358,10 +360,16 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
             }
         }
         fix_ok = fix_pipe && fix_counts;
-        BB::Upscale::Checkpoint(fix_ok ? "[fsr3-hudless] HUD-less image matched to the finished "
-                                         "frame outside the HUD (bb_hudless_fix.comp)"
-                                       : "[fsr3-hudless] fix pass unavailable: HUD-less image "
-                                         "as post-processed");
+        const char* grade_env = std::getenv("BB_HUDLESS_GRADE");
+        const bool grade_on = grade_env == nullptr || grade_env[0] != '0';
+        BB::Upscale::Checkpoint(
+            fix_ok ? (grade_on ? "[fsr3-hudless] HUD-less image matched to the finished frame "
+                                 "outside the HUD (bb_hudless_fix.comp); under the HUD the finished "
+                                 "frame's colours with the HUD taken out (BB_HUDLESS_GRADE=0 off)"
+                               : "[fsr3-hudless] HUD-less image matched to the finished frame "
+                                 "outside the HUD (bb_hudless_fix.comp); under the HUD the "
+                                 "post-processed copy (BB_HUDLESS_GRADE=0)")
+                   : "[fsr3-hudless] fix pass unavailable: HUD-less image as post-processed");
     }
     if (!fix_ok) {
         ++sec_fix_skipped;
@@ -431,10 +439,19 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
                                .descriptorType = vk::DescriptorType::eStorageBuffer,
                                .pBufferInfo = &c_info},
     };
+    // bb-artifact-fix: BB_HUDLESS_GRADE (default on): under the HUD the HUD-less image gets the
+    // finished frame's colours (bb_hudless_fix.comp) instead of the un-graded copy, which FSR 3
+    // moved with the scene into orange HUD-shaped patches in the generated frames.
+    static const bool grade_hud = [] {
+        const char* v = std::getenv("BB_HUDLESS_GRADE");
+        return v == nullptr || v[0] != '0';
+    }();
     struct {
         u32 size[4];
         float obj[4];
-    } push{{extent.width, extent.height, bgra ? 1u : 0u, slot}, {osx, osy, use_obj ? 1.0f : 0.0f, 0.0f}};
+    } push{{extent.width, extent.height, bgra ? 1u : 0u, slot},
+           {osx, osy, use_obj ? 1.0f : 0.0f, grade_hud ? 1.0f : 0.0f}};
+    static_assert(sizeof(push) == 32);
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, fix_pipe);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, fix_layout, 0, writes);
     cmd.pushConstants(fix_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
