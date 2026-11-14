@@ -50,7 +50,8 @@ constexpr u32 kN2Character = 2; // skinned draws class 4; the player mask = clas
 constexpr u32 kN2Measure = 4;   // count how often those buffers change between frames
 constexpr u32 kObjBufMax = 4096;     // object buffers up to this size (bytes)
 constexpr u32 kObjCheckFloats = 64;  // CPU check: first 64 floats
-constexpr float kObjAbsTol = 0.5f;   // per float, + 2 % relative: same object one frame later
+constexpr float kObjAbsTol = 0.5f;
+constexpr float kObjNativeTol = 0.05f; // bb-mv-native: per float, absolute only   // per float, + 2 % relative: same object one frame later
 constexpr double kW30Period = 30.0;  // seconds between [native-mv2] lines
 
 enum Cat : u32 { CatSkinned = 0, CatSmallSkel, CatRigid, CatBlend, CatCount };
@@ -922,7 +923,12 @@ bool ObjectClose(const float* a, const float* b, u32 n) {
     for (u32 i = 0; i < n; ++i) {
         if (std::memcmp(a + i, b + i, sizeof(float)) == 0) continue;
         if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return false;
-        const float tol = kObjAbsTol + 0.02f * std::max(std::fabs(a[i]), std::fabs(b[i]));
+        // bb-mv-native: absolute tolerance only. The 2 % relative term let a neighbouring
+        // instance of a repeated prop pass (world coordinates ~100-1000: 2-20 units), giving it
+        // another instance's previous transform (ghost images in Hunter's Dream).
+        const float tol = g.mv_native ? kObjNativeTol
+                                      : kObjAbsTol + 0.02f * std::max(std::fabs(a[i]),
+                                                                      std::fabs(b[i]));
         if (!(std::fabs(a[i] - b[i]) <= tol)) return false;
     }
     return true;
