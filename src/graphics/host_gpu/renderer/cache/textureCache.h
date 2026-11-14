@@ -187,6 +187,7 @@ public:
 	// KYTY_NATIVE_TEX=1 (host_gpu/nativeTex.h): the host side of the ring of texture loads.
 	struct NativeTexHost;
 	void InitNativeTex();
+	void InitNativeTexturePc(); // KYTY_NATIVE_TEXTURE_PC (host_gpu/nativeTexturePc.h): its device side
 	void NativeTexPrepare(ImageId id); // (InitializeImage: an image over ring bytes uploads from the ring)
 	struct OffloadCheck;
 	struct OffloadRestore;

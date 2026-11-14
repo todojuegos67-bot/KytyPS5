@@ -12,24 +12,27 @@
 //   slice copy   TextureArrayManager texture -> pool layer memcpy 0x900f26         OnSliceCopy
 //   destroyed    CTexture deferred free 0x903460 (0x900c03 / 0x900cc9 / 0x900fa4)  OnRelease
 //
-// The bytes the game would have stored into guest texture memory are copied ONCE (the resource heap block -> a host
-// staging block owned here) and the guest store is skipped: the guest pages are reserved/committed by the engine's own
-// allocator calls as before, but never written, so with lazy commit they never take RAM. The GPU never reads texture
-// memory directly: the engine copies the 32-byte T# (base = [CTexture+0x98] >> 8) by value into its descriptor tables
-// (e.g. 0x905fa1.., 0x91dafb.., 0x995..), so the renderer resolves a bound T# by its base address and fills the image
-// from here (Fill: host staging -> Vulkan staging -> detile -> VkImage), never from guest memory.
+// Where the bytes live:
+//   1. a load copies them ONCE into a host block (resource heap block -> host; the guest store is skipped);
+//   2. the render thread (Flush: every image upload and every flip) moves each host block into its own device-local
+//      buffer (one upload) and frees the host block: video memory holds the only copy from then on;
+//   3. images are filled from those buffers by the GPU (BufferCache::ObtainBufferForImage hands the device buffer to the
+//      detiler, or gathers several by GPU copies), so an image the texture cache drops and re-creates comes back from
+//      VRAM, never from RAM; a streamed mip is its own device buffer at its own range;
+//   4. a slice copy (0x900f26) makes the destination range share the source's device buffer (or host block): no byte is
+//      moved at all, and the source's release keeps what the slice shares alive (reference counted);
+//   5. the guest pages wholly inside a staged range are kept no-access (the page manager's read watchers). A CPU touch
+//      faults (OnFault, the exception filter's probe) and any other emulator read calls BeforeGuestRead: the bytes are
+//      read back from the GPU into guest memory once, the pages unwatched, counted as a CPU fallback. The partial edge
+//      pages of a range (shared with other data) get their bytes written into guest memory at once.
 //
-// The host block of a texture is kept until the engine streams that range out or destroys the texture (a PC game's
-// "managed" copy): the texture cache may drop and re-create an image at any time, and 0x900f26 copies a loaded texture
-// into a pool layer on the CPU after load (slice copies are done here, from the host blocks, never from guest memory).
-// Any other emulator read of the guest bytes (BeforeGuestRead) writes them into guest memory first: a counted CPU
-// fallback.
-//
-// Every 30 s: "NativeTexturePC: ..." (textures, MiB loaded/streamed natively, guest MiB never written, uploads served,
+// Every 30 s: "NativeTexturePC: ..." (textures, MiB loaded/streamed natively, host MiB held, VRAM MiB, uploads,
 // upload ms/frame, CPU fallbacks).
 
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <vector>
 
 namespace Libs::Graphics::NativeTexturePc {
 
@@ -39,15 +42,28 @@ namespace Libs::Graphics::NativeTexturePc {
 [[nodiscard]] bool Enabled() noexcept;
 void               SetEnabled(bool on) noexcept;
 
-// What the core needs from the emulator (set once, before SetEnabled(true)). Null members: not called.
+// What the core needs from the emulator. Null members: not called (tests run with a fake device).
 struct Host {
-	// Bytes for [addr, addr + size) are now staged here (a load, a mip, a slice copy): images over the range must be
-	// refreshed (the texture cache's dirty marking). Called on the game's thread, outside the core's lock.
+	// Game threads, after bytes for [addr, addr + size) are staged: the images over the range refreshed at next use.
 	void (*staged)(uint64_t addr, uint64_t size) = nullptr;
-	// CPU fallback: write `size` bytes at guest `addr` (the guest backing; the trackers' notifications are the host's).
+	// Write `size` bytes at guest `addr` (the guest backing; any thread).
 	void (*write_guest)(uint64_t addr, const void* data, uint64_t size) = nullptr;
+	// Page manager read watchers of [addr, addr + size) on/off (page-aligned; any thread).
+	void (*watch)(uint64_t addr, uint64_t size, bool on) = nullptr;
+	// Render thread: a device-local buffer of `size` bytes filled with `data` (recorded upload). Returns its handle (0:
+	// none: the block stays on the host).
+	uint64_t (*upload)(const void* data, uint64_t size) = nullptr;
+	// Render thread, deferred until the GPU is done with it: the buffer gone.
+	void (*release)(uint64_t handle) = nullptr;
+	// Any thread: `size` bytes at `offset` of device buffer `handle` read back into `out` (waits for the GPU). False:
+	// not possible on this thread.
+	bool (*read_device)(uint64_t handle, uint64_t offset, void* out, uint64_t size) = nullptr;
+	uint64_t page_size = 4096;
 };
+// Sets the non-null members (the loader sets the guest side, the texture cache the device side).
 void SetHost(const Host& host) noexcept;
+// The device side is set: the pages of everything staged before are watched now.
+void HostReady() noexcept;
 
 enum class Kind : uint8_t { Loaded = 0, Streamed = 1, Created = 2 };
 
@@ -63,47 +79,57 @@ struct Texture {
 
 // ---- Game threads (the hooks) --------------------------------------------------------------------------------------
 
-// The engine finished making a texture (factory or Create epilogue).
 void OnTexture(const Texture& texture) noexcept;
-// The game would store `size` bytes from host-readable `src` at guest `dst` (inside the texture `owner` whose memory
-// starts at `owner_base`; 0 when not known). True: staged here, the caller must NOT write guest memory.
+// True: staged here, the caller must NOT write guest memory.
 [[nodiscard]] bool OnLoad(uint64_t owner, uint64_t owner_base, uint64_t dst, const void* src, uint64_t size,
                           bool mip) noexcept;
-// The engine gave [addr, addr + size) of texture memory back (stream-out, run shrink, run free): staged bytes dropped.
 void OnDrop(uint64_t addr, uint64_t size) noexcept;
-// The engine copies `size` bytes from guest `src` to guest `dst` (0x900f26). True: done here (dst staged from src's
-// host bytes; guest bytes of src read only where nothing is staged and src is not an engine texture's memory).
-// False: not ours (nothing staged near src or dst): the caller copies guest memory as before.
+// True: done here (dst shares src's bytes; guest bytes of src read only outside engine texture memory). False: not
+// ours, the caller copies guest memory.
 [[nodiscard]] bool OnSliceCopy(uint64_t dst, uint64_t src, uint64_t size,
                                const std::function<bool(uint64_t, void*, uint64_t)>& read_guest) noexcept;
-// The engine destroys the texture (deferred free of [tex+0x98]).
 void OnRelease(uint64_t owner, uint64_t base) noexcept;
 
 // ---- Emulator side ---------------------------------------------------------------------------------------------------
 
-// Cheap: whether [addr, addr + size) touches staged bytes or an engine texture's memory this path owns.
 [[nodiscard]] bool Overlaps(uint64_t addr, uint64_t size) noexcept;
-// The image bytes of [addr, addr + size) into host memory `out`: staged bytes where staged; zeros where it is the memory
-// of an engine texture with nothing staged (undefined content: a streamed-out mip, a reserved run); elsewhere
-// read_guest(at, to, n) (memory this path does not own). False when read_guest failed. Counts an upload served.
+
+// Render thread: every host block moved into its device buffer (host blocks freed), device buffers no one uses any more
+// released.
+void Flush() noexcept;
+
+// How [addr, addr + size) is made, for an image upload (after Flush).
+struct Part {
+	uint64_t begin = 0, end = 0;
+	enum : uint8_t { Device, Host, Zero, Guest } kind = Guest;
+	uint64_t       handle = 0, offset = 0; // Device: the buffer and the offset of `begin` in it
+	const uint8_t* host   = nullptr;       // Host: the bytes (alive while the plan is: `keep`)
+	std::shared_ptr<const void> keep;      // holds the buffer / block for the plan's life
+};
+[[nodiscard]] std::vector<Part> Plan(uint64_t addr, uint64_t size) noexcept;
+void                            NoteUpload(uint64_t bytes, uint64_t ns, bool gathered) noexcept;
+
+// Tests and the CPU path: the bytes of [addr, addr + size) into `out` (device parts read back with read_device).
 [[nodiscard]] bool Fill(uint64_t addr, uint64_t size, void* out,
                         const std::function<bool(uint64_t, void*, uint64_t)>& read_guest) noexcept;
-// Before the emulator reads guest memory [addr, addr + size) some other way (a buffer over it, a hash): staged bytes
-// there written into guest memory once (counted as a CPU fallback).
+
+// Before the emulator reads guest memory [addr, addr + size) another way: the bytes there into guest memory once.
 void BeforeGuestRead(uint64_t addr, uint64_t size) noexcept;
-// Once a flip (render thread): frame count for ms/frame, and the 30 s log line.
+// The exception filter's probe: a CPU touch of a no-access page of ours. True: handled (the access goes again).
+[[nodiscard]] bool OnFault(uint64_t address) noexcept;
+// Once a flip (render thread): Flush, frame count, the 30 s log line.
 void Pump() noexcept;
 
 struct Stats {
 	uint64_t textures = 0, textures_loaded = 0, textures_created = 0, released = 0;
 	uint64_t loads = 0, load_bytes = 0, mips = 0, mip_bytes = 0, slice_copies = 0, slice_bytes = 0, slice_guest_reads = 0;
-	uint64_t dropped_bytes = 0, held_bytes = 0, held_chunks = 0;
-	uint64_t fills = 0, fill_bytes = 0, fill_ns = 0, frames = 0;
-	uint64_t fallbacks = 0, fallback_bytes = 0, declined = 0;
+	uint64_t dropped_bytes = 0, host_bytes = 0, host_blocks = 0, vram_bytes = 0, vram_buffers = 0;
+	uint64_t to_vram = 0, to_vram_bytes = 0, upload_fail = 0;
+	uint64_t fills = 0, fill_bytes = 0, fill_ns = 0, gathered = 0, frames = 0;
+	uint64_t fallbacks = 0, fallback_bytes = 0, faults = 0, fallback_refused = 0, declined = 0, watched_bytes = 0;
 };
 [[nodiscard]] Stats GetStats() noexcept;
-// Tests: everything forgotten (not thread-safe against hooks).
-void ResetForTests() noexcept;
+void                ResetForTests() noexcept;
 
 } // namespace Libs::Graphics::NativeTexturePc
 

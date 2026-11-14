@@ -2788,22 +2788,69 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
-	// KYTY_NATIVE_TEXTURE_PC: an engine texture's bytes come from its host staging (graphics/host_gpu/nativeTexturePc.h),
-	// never from its guest pages (left unwritten). Too large for the staging ring, or a buffer over it: the paths below
-	// read guest memory, and BeforeGuestRead writes the staged bytes there first (a counted CPU fallback).
-	if (NativeTexturePc::Overlaps(vaddr, size) && size <= m_staging_buffer.Size() && !IsRegionGpuModified(vaddr, size)) {
+	// KYTY_NATIVE_TEXTURE_PC: an engine texture's bytes come from its device-local buffers (graphics/host_gpu/
+	// nativeTexturePc.h), never from its guest pages: the buffer itself when one holds the whole range, else a GPU gather
+	// (device buffers copied, zeros where the engine texture's memory holds nothing, host/guest parts uploaded).
+	if (NativeTexturePc::Overlaps(vaddr, size) && !IsRegionGpuModified(vaddr, size)) {
 		const auto* holder = m_page_table.Find(vaddr >> PageTable::kPageBits);
 		if (holder == nullptr || !*holder) {
-			auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-			if (staging != nullptr) {
-				path = "native-texture-pc";
-				ApplyImageProtects();
-				(void)NativeTexturePc::Fill(vaddr, size, staging, [](uint64_t at, void* to, uint64_t n) {
-					return Libs::LibKernel::Memory::TryReadBackingToHost(at, to, n);
-				});
-				m_staging_buffer.Commit();
-				return {&m_staging_buffer, stage_offset};
+			const auto start = Clock::now();
+			path             = "native-texture-pc";
+			ApplyImageProtects();
+			NativeTexturePc::Flush(); // (host blocks to the device first)
+			const auto parts = NativeTexturePc::Plan(vaddr, size);
+			const auto done  = [&](bool gathered) {
+                NativeTexturePc::NoteUpload(
+                    size, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()),
+                    gathered);
+			};
+			if (parts.size() == 1 && parts[0].kind == NativeTexturePc::Part::Device) {
+				done(false);
+				// (Released only by a later Flush, deferred until the GPU is done: alive for this frame's work.)
+				return {reinterpret_cast<Buffer*>(parts[0].handle), parts[0].offset};
 			}
+			m_scheduler.EndRendering();
+			auto     gathered = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, size);
+			uint64_t upload   = 0;
+			for (const auto& p: parts)
+				if (p.kind == NativeTexturePc::Part::Host || p.kind == NativeTexturePc::Part::Guest) upload += p.end - p.begin;
+			gathered->Fill(0, size, 0); // (the zero parts)
+			std::unique_ptr<Buffer> staging;
+			if (upload != 0) {
+				staging   = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0, AllFlags, upload);
+				uint64_t at = 0;
+				for (const auto& p: parts) {
+					const uint64_t n = p.end - p.begin;
+					if (p.kind == NativeTexturePc::Part::Host) {
+						std::memcpy(staging->Mapped().data() + at, p.host, n);
+					} else if (p.kind == NativeTexturePc::Part::Guest) {
+						if (!Libs::LibKernel::Memory::TryReadBackingToHost(p.begin, staging->Mapped().data() + at, n))
+							std::memset(staging->Mapped().data() + at, 0, n);
+					} else {
+						continue;
+					}
+					at += n;
+				}
+				staging->Flush(0, upload);
+			}
+			uint64_t at = 0;
+			for (const auto& p: parts) {
+				const uint64_t n = p.end - p.begin;
+				if (p.kind == NativeTexturePc::Part::Device) {
+					gathered->CopyFrom(m_scheduler.Current(), *reinterpret_cast<const Buffer*>(p.handle), p.offset,
+					                   p.begin - vaddr, n);
+				} else if (p.kind == NativeTexturePc::Part::Host || p.kind == NativeTexturePc::Part::Guest) {
+					gathered->CopyFrom(m_scheduler.Current(), *staging, at, p.begin - vaddr, n);
+					at += n;
+				}
+			}
+			auto* result = gathered.get();
+			m_scheduler.DeferOperation([buffer = std::move(gathered), more = std::move(staging)]() mutable {
+				buffer.reset();
+				more.reset();
+			});
+			done(true);
+			return {result, 0};
 		}
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);

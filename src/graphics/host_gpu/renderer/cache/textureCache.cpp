@@ -455,6 +455,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	}
 #endif
 	if (NativeTex::Enabled()) InitNativeTex();
+	if (NativeTexturePc::Requested() && !NativeTex::Enabled()) InitNativeTexturePc();
 }
 
 void KytyTextureGcThresholds(uint64_t total_budget, uint64_t& trigger, uint64_t& pressure, uint64_t& critical) {
@@ -2647,6 +2648,99 @@ void TextureCache::InitNativeTex() {
 	host.wait_tick         = +[](uint64_t tick) { g_native_cache->m_scheduler.Wait(tick); };
 	NativeTex::Init(m_graphics, m_scheduler, host);
 	if (NativeTex::Active()) Common::HostException::SetProbeHandler(&NativeTexProbe);
+}
+
+// ---- KYTY_NATIVE_TEXTURE_PC=1 (host_gpu/nativeTexturePc.h): the engine textures' device buffers ------------------------
+
+static TextureCache* g_pc_cache = nullptr;
+static bool (*g_pc_run_render)(void (*fn)(void*), void* arg) = nullptr;
+
+static bool NativeTexturePcProbe(uint64_t address, uint64_t rip, const void* context, bool write) {
+	if (NativeTexturePc::OnFault(address)) return true;
+#if defined(_WIN32)
+	if (TextureOffload::Enabled()) return TextureOffload::OnFault(address, rip, context, write);
+#else
+	(void)rip, (void)context, (void)write;
+#endif
+	return false;
+}
+
+void TextureCache::InitNativeTexturePc() {
+	g_pc_cache = this;
+	// Runs fn where GPU work may be recorded and waited for (as InitNativeTex's run_render): inline on the render thread,
+	// else through it; refused (false) on threads that must not wait for it.
+	g_pc_run_render = +[](void (*fn)(void*), void* arg) {
+		auto* cache = g_pc_cache;
+		if (AsyncUpload::t_worker || CommandScheduler::InDeferredOperation()) return false;
+		if (GuestGpu::IsGpuThread()) {
+			fn(arg);
+			return true;
+		}
+		if (cache->m_lock.OwnedByCurrentThread()) return false;
+		if (Spec::t_state != nullptr || CommandScheduler::ThreadRecorder() != nullptr) {
+			Spec::Refuse("native-texture-pc bytes");
+			struct NormalPath {
+				Spec::State*                state    = std::exchange(Spec::t_state, nullptr);
+				CommandScheduler::Recorder* recorder = CommandScheduler::ThreadRecorder();
+				NormalPath() { CommandScheduler::SetThreadRecorder(nullptr); }
+				~NormalPath() {
+					Spec::t_state = state;
+					CommandScheduler::SetThreadRecorder(recorder);
+				}
+			} normal_path;
+			cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
+			return true;
+		}
+		cache->m_scheduler.Context().GetGpu().SendCommandSync([fn, arg] { fn(arg); });
+		return true;
+	};
+	NativeTexturePc::Host host {};
+	host.page_size = m_page_manager.GetPageSize();
+	host.watch     = +[](uint64_t vaddr, uint64_t size, bool on) {
+        if (on) g_pc_cache->m_page_manager.UpdateReadWatchers<true>(vaddr, size);
+        else g_pc_cache->m_page_manager.UpdateReadWatchers<false>(vaddr, size);
+	};
+	// Render thread (Flush): a device-local buffer filled from the host block by one recorded copy.
+	host.upload = +[](const void* data, uint64_t size) -> uint64_t {
+		auto& cache = *g_pc_cache;
+		cache.m_scheduler.EndRendering();
+		auto staging = std::make_unique<Buffer>(cache.m_graphics, cache.m_scheduler, MemoryUsage::Upload, 0, AllFlags, size);
+		if (staging->Mapped().size() < size) return 0;
+		std::memcpy(staging->Mapped().data(), data, size);
+		staging->Flush(0, size);
+		auto* device = new Buffer(cache.m_graphics, cache.m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, size);
+		device->CopyFrom(cache.m_scheduler.Current(), *staging, 0, 0, size);
+		cache.m_scheduler.DeferOperation([buffer = std::move(staging)]() mutable { buffer.reset(); });
+		return reinterpret_cast<uint64_t>(device);
+	};
+	host.release = +[](uint64_t handle) {
+		g_pc_cache->m_scheduler.DeferOperation(
+		    [buffer = std::unique_ptr<Buffer>(reinterpret_cast<Buffer*>(handle))]() mutable { buffer.reset(); });
+	};
+	// Any thread: GPU copy into a download buffer, waited for (a CPU fallback: counted by the core).
+	host.read_device = +[](uint64_t handle, uint64_t offset, void* out, uint64_t size) -> bool {
+		struct Job {
+			uint64_t handle, offset, size;
+			void*    out;
+		} job {handle, offset, size, out};
+		return g_pc_run_render(
+		    +[](void* arg) {
+			    auto& j     = *static_cast<Job*>(arg);
+			    auto& cache = *g_pc_cache;
+			    cache.m_scheduler.EndRendering();
+			    Buffer host_copy(cache.m_graphics, cache.m_scheduler, MemoryUsage::Download, 0, AllFlags, j.size);
+			    host_copy.CopyFrom(cache.m_scheduler.Current(), *reinterpret_cast<Buffer*>(j.handle), j.offset, 0, j.size);
+			    cache.m_scheduler.Wait(cache.m_scheduler.CurrentTick());
+			    host_copy.Invalidate(0, j.size);
+			    std::memcpy(j.out, host_copy.Mapped().data(), j.size);
+		    },
+		    &job);
+	};
+	NativeTexturePc::SetHost(host);
+	NativeTexturePc::HostReady();
+	Common::HostException::SetProbeHandler(&NativeTexturePcProbe);
+	std::printf("NativeTexturePC: device side ready (page %llu bytes): engine texture bytes live in device-local buffers\n",
+	            static_cast<unsigned long long>(host.page_size));
 }
 
 // InitializeImage, before any upload: the ring bytes over the image uploaded from the ring (its subresources over them,
