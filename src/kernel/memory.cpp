@@ -9,6 +9,7 @@
 #include "fresh-memory.h"
 #include "gpu-only-writes.h"
 #include "guest-lazy-commit.h"
+#include "pin-watched.h"
 #include "lean-hostmem.h"
 #include "mem-guard.h"
 #include "ram-guard.h"
@@ -1700,6 +1701,10 @@ bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	       g_gpu_resources->InvalidateMemory(vaddr, size);
 }
 
+void NoteUnprotectedWrite(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && size != 0) g_gpu_resources->InvalidateUnprotected(vaddr, size);
+}
+
 bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->InvalidateImages(vaddr, size);
 }
@@ -1971,6 +1976,12 @@ uint64_t FlushFreed(uint64_t budget, uint64_t* held_us) {
 uint64_t FlushTrim(uint64_t budget, uint64_t* held_us) {
 	static uint64_t cursor = 0;
 	if (g_guest_address_space == nullptr) return 0;
+	// KYTY_PIN_WATCHED: off (a trim of guest pages; its VirtualUnlock would also unlock pinned pages of the alias).
+	if (PinWatched::Enabled()) {
+		static std::once_flag noted;
+		std::call_once(noted, [] { PinWatched::NoteTrimSkipped("RAM flush trim of the guest store alias (KYTY_RAM_FLUSH_TRIM)"); });
+		return 0;
+	}
 	auto* base = reinterpret_cast<uint8_t*>(g_guest_address_space->GetBackingBase());
 	if (base == nullptr) return 0;
 	constexpr uint64_t Piece = uint64_t {4} << 20u;

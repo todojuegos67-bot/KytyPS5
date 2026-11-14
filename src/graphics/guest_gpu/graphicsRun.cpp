@@ -253,6 +253,7 @@ void GuestGpu::ProcessCommands() {
 		}
 		// Fault, readback and mapping callbacks cannot overtake a queued draw.
 		PageManager::FlushDeferredProtection();
+		PageManager::DrainUnprotectedWrites(); // (KYTY_PIN_WATCHED: write watches left unprotected, as written)
 		LiveCounters::Add(LiveCounters::GuestCommands);
 		LiveTrace::Event(LiveTrace::GuestCommand, 1, 0);
 		command();
@@ -888,6 +889,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 	for (;;) {
 		PageManager::FlushDeferredProtection(); // (before a guest command, an idle wait, another queue's turn)
+		PageManager::DrainUnprotectedWrites(); // (KYTY_PIN_WATCHED: write watches left unprotected, as written)
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -1506,7 +1508,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 
 		// Only state, draws and dispatches keep the deferred read protections pending: before a label, a memory write,
 		// a wait or anything else the pages GPU work writes are protected (PageManager::DeferReadProtection).
-		if (!KeepsDeferredProtection(opcode)) PageManager::FlushDeferredProtection();
+		if (!KeepsDeferredProtection(opcode)) {
+			PageManager::FlushDeferredProtection();
+			PageManager::DrainUnprotectedWrites(); // (KYTY_PIN_WATCHED: before a wait the guest's writes end)
+		}
 		auto handler = g_cp_op_func[opcode];
 		LiveCounters::AddPm4(opcode);
 		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, remaining_dw);

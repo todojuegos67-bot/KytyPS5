@@ -237,6 +237,22 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+void GpuResourceManager::InvalidateUnprotected(uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t Page  = TRACKER_PAGE_SIZE;
+	const uint64_t     begin = vaddr & ~(Page - 1), end = (vaddr + size + Page - 1) & ~(Page - 1);
+	uint64_t           run = begin;
+	const auto         flush = [&](uint64_t to) {
+		if (to > run) (void)InvalidateMemory(run, to - run);
+	};
+	for (uint64_t page = begin; page < end; page += Page) {
+		if (m_page_manager.HasReadWatchers(page, Page)) {
+			flush(page);
+			run = page + Page;
+		}
+	}
+	flush(end);
+}
+
 bool GpuResourceManager::InvalidateImages(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) return false;
 	TextureOffload::OnHostAccess(vaddr, size, false, true); // (its caller writes all of it: CompareMove)

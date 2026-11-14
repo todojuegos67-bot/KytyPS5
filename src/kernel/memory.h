@@ -216,6 +216,9 @@ bool PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 void FinishHostOverwrite(uint64_t vaddr, uint64_t size, bool prepared);
 // Prepare a host write using normal coherent invalidation; false means use guest faults.
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
+// KYTY_PIN_WATCHED: a write watch the page manager left unprotected (its pages could not be pinned in RAM), handled as a
+// write of its pages that no read watch holds (the caches drop their copies and upload again on use).
+void NoteUnprotectedWrite(uint64_t vaddr, uint64_t size);
 // The same for a write of all of the range that reads none of it (InvalidateMemoryForWrite).
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 // The images over the range only (a GPU-written image's bytes here are stale: they are rewritten as InvalidateMemory

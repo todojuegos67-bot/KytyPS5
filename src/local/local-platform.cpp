@@ -1,4 +1,5 @@
 #include "local-platform.h"
+#include "pin-watched.h"
 #include "guest-lazy-commit.h"
 #include "blackbox.h"
 
@@ -2086,7 +2087,14 @@ void KeepResident() {
 		const char* text = std::getenv("KYTY_RESIDENT_MB");
 		const auto  mb   = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
 		if (mb == 0) return;
-		const SIZE_T minimum = static_cast<SIZE_T>(mb << 20u);
+		SIZE_T minimum = static_cast<SIZE_T>(mb << 20u);
+		// (KYTY_PIN_WATCHED: never below the minimum the pins raised it to: VirtualLock's quota.)
+		if (PinWatched::Enabled()) {
+			SIZE_T current_min = 0, current_max = 0;
+			DWORD  current_flags = 0;
+			GetProcessWorkingSetSizeEx(GetCurrentProcess(), &current_min, &current_max, &current_flags);
+			minimum = std::max(minimum, current_min);
+		}
 		// (The maximum soft: the process may grow past it; the minimum hard: Windows keeps that much in RAM.)
 		const SIZE_T maximum = minimum + (SIZE_T {512} << 20u);
 		const bool   ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum, maximum,
@@ -2101,6 +2109,12 @@ static std::atomic<uint64_t> g_cap_max {0}, g_cap_min {0};
 static std::atomic<bool>     g_cap_ok {false};
 bool TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes) {
 	if (target_bytes == 0 || min_bytes >= target_bytes) return false;
+	// KYTY_PIN_WATCHED: no emulator trim (it pages guest memory; its lowered minimum is VirtualLock's quota).
+	if (PinWatched::Enabled()) {
+		static std::once_flag noted;
+		std::call_once(noted, [] { PinWatched::NoteTrimSkipped("RAM budget working-set trim (TrimWorkingSetTo)"); });
+		return false;
+	}
 	g_cap_max.store(target_bytes, std::memory_order_relaxed);
 	g_cap_min.store(min_bytes, std::memory_order_relaxed);
 	const auto call = [] {
@@ -2137,6 +2151,10 @@ void StartWorkingSetTrim() {
 		const char* text    = std::getenv("KYTY_TRIM_RAM_SECONDS");
 		const auto  seconds = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
 		if (seconds == 0) return;
+		if (PinWatched::Enabled()) {
+			PinWatched::NoteTrimSkipped("RAM trim (KYTY_TRIM_RAM_SECONDS)");
+			return;
+		}
 		// KYTY_SOFT_RELEASE=1: no working set trim at all (it pages out; soft-release.cpp gives RAM back without it).
 		if (const char* soft = std::getenv("KYTY_SOFT_RELEASE"); soft != nullptr && soft[0] == '1') {
 			std::printf("RAM trim: off (KYTY_SOFT_RELEASE=1)\n");

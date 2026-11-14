@@ -46,6 +46,12 @@ static void TrimParkedRange(uint64_t vaddr, uint64_t size);
 class ParkedRangeTrimmer {
 public:
 	static void Trim(uint64_t vaddr, uint64_t size) {
+		// KYTY_PIN_WATCHED: off (a trim of guest pages while protections change; its VirtualUnlock would unlock pins).
+		if (PinWatched::Enabled()) {
+			static std::once_flag noted;
+			std::call_once(noted, [] { PinWatched::NoteTrimSkipped("Kyty.Trim of parked guest ranges"); });
+			return;
+		}
 		static auto* trimmer = new ParkedRangeTrimmer; // (never destroyed: its thread may outlive static destructors)
 		{
 			std::lock_guard lock(trimmer->m_mutex);
@@ -1763,6 +1769,8 @@ private:
 		}
 		// (Lazy commit: the view and the protections recorded for it forgotten once it is gone.)
 		if (unmapped) GuestLazyCommit::Unregister(reinterpret_cast<uint64_t>(vaddr));
+		// (KYTY_PIN_WATCHED: its pages' locks went with the view.)
+		if (unmapped) PinWatched::Forget(reinterpret_cast<uint64_t>(vaddr), size);
 		return unmapped;
 	}
 

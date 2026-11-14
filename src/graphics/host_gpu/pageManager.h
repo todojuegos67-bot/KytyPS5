@@ -69,6 +69,9 @@ public:
 	// after a submission, a label or a guest command of the GPU thread: it flushes before each of them.
 	static void DeferReadProtection(bool on) noexcept;
 	static void FlushDeferredProtection() noexcept;
+	// KYTY_PIN_WATCHED: the write watches left unprotected (their pages could not be pinned in RAM) handled as written
+	// (the caches drop their copies). On the GPU thread before each guest command / submission, with no lock held.
+	static void DrainUnprotectedWrites();
 	// Moves with each flush of the calling thread's deferred read protections: on the GPU thread, before each point at
 	// which the guest can learn that work it submitted ran (above). Until then the guest writes no memory that work
 	// reads: guest memory the GPU thread's translation reads twice in one epoch was not changed by the guest in

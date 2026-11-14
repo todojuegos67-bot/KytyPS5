@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "slow-log.h"
 #include "blackbox.h"
+#include "pin-watched.h"
 
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -282,11 +283,24 @@ struct PageManager::Impl {
 
 	static void ProtectHost(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
 		Blackbox::InFlightScope protecting(Blackbox::g_protects); // (the black box: a protection change that does not return)
+		// KYTY_PIN_WATCHED (pin-watched.h): a write watch whose pages cannot be locked in RAM (the pin budget) is not
+		// made: the range is queued as written instead (PageManager::DrainUnprotectedWrites: the caches drop their
+		// copies, always CPU-dirty). Read watches and the rest are pinned in GuestLazyCommit::Protect.
+		PinWatched::Token pin;
+		if (protection == READ_ONLY_PROTECTION && PinWatched::Enabled()) {
+			pin = PinWatched::Begin(vaddr, size, protection, true);
+			if (pin.fallback) {
+				PinWatched::Finish(pin, false);
+				PinWatched::QueueUnprotectedWrite(vaddr, size);
+				return;
+			}
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,
 			      protection);
 		}
+		if (pin.active) PinWatched::Finish(pin, true);
 	}
 
 	static void FlushReadProtect() noexcept {
@@ -677,6 +691,13 @@ void PageManager::DeferReadProtection(bool on) noexcept {
 void PageManager::FlushDeferredProtection() noexcept {
 	Impl::FlushReadProtect();
 	++g_observation_epoch;
+}
+
+void PageManager::DrainUnprotectedWrites() {
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	if (!PinWatched::TakeUnprotectedWrites(&ranges)) return;
+	for (const auto& [vaddr, size]: ranges) Libs::LibKernel::Memory::NoteUnprotectedWrite(vaddr, size);
+	ranges.clear();
 }
 
 uint64_t PageManager::ObservationEpoch() noexcept {

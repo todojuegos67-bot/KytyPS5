@@ -1018,6 +1018,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
 	"${KYTY_SOURCE_DIR}/local/soft-release.h"
 	"${KYTY_SOURCE_DIR}/local/soft-release.cpp"
+	"${KYTY_SOURCE_DIR}/local/pin-watched.h"
+	"${KYTY_SOURCE_DIR}/local/pin-watched.cpp"
 	"${KYTY_SOURCE_DIR}/local/ram-guard.h"
 	"${KYTY_SOURCE_DIR}/local/ram-guard.cpp"
 	"${KYTY_SOURCE_DIR}/local/ram-census.h"

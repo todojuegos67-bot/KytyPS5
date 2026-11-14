@@ -54,6 +54,7 @@
 #include <intrin.h>
 
 #include "mem-guard.h"
+#include "pin-watched.h"
 
 #include <atomic>
 #include <cstdint>
@@ -482,7 +483,15 @@ inline bool ProtectLocked(State& state, uint64_t begin, uint64_t end, DWORD prot
 
 // A VirtualProtect for guest memory (SysVirtualProtect, the store's views, the texture offload's alias pages): see the
 // top. *old_protect: the first page's (for a reserved page, what it would have had).
+inline bool ProtectUnpinned(void* address, uint64_t size, DWORD protect, DWORD* old_protect);
+// KYTY_PIN_WATCHED (pin-watched.h): the section pages of the range locked in RAM before their protection changes, and
+// unlocked after a protection back to read-write (bug check 0x1A/0x41202: a page paged while its protection changes).
 inline bool Protect(void* address, uint64_t size, DWORD protect, DWORD* old_protect) {
+	PinWatched::Scope pin(reinterpret_cast<uint64_t>(address), size, protect);
+	pin.applied = ProtectUnpinned(address, size, protect, old_protect);
+	return pin.applied;
+}
+inline bool ProtectUnpinned(void* address, uint64_t size, DWORD protect, DWORD* old_protect) {
 	auto& state = Get();
 	if (!state.enabled || size == 0) return VirtualProtect(address, size, protect, old_protect) != 0;
 	uint64_t begin = 0, end = 0;

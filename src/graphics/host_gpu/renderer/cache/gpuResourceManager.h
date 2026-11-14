@@ -48,6 +48,9 @@ public:
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// KYTY_PIN_WATCHED: a write watch left unprotected, as a CPU write of its pages that have no read watcher (a page
+	// GPU work wrote keeps its GPU copy: it is read back on access, its protection was made).
+	void               InvalidateUnprotected(uint64_t vaddr, uint64_t size);
 	// Before a host write of the whole range: GPU-written bytes it replaces are dropped (BufferCache::InvalidateMemoryForWrite).
 	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	// Before a host write of the range: the images over it only (their bytes are rewritten, as InvalidateMemory does).
