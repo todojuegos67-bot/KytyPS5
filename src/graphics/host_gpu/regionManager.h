@@ -12,6 +12,7 @@
 #include <atomic>
 #include <bit>
 #include <immintrin.h>
+#include <memory>
 #include <mutex>
 #include <utility>
 
@@ -254,23 +255,24 @@ public:
 	}
 
 	// The upload of the CPU-dirty pages of [vaddr, vaddr + size) (MemoryTracker::ForEachUploadRange): func gets the
-	// ranges to copy, and the pages become clean and write-watched, as ForEachModifiedRange<Cpu, true> makes them; but
-	// with `keep` (a read-only use) the pages UploadHeap marks stay CPU-dirty and writable (kept): copied again at
-	// their next use, never write-protected, never faulting. A kept page already copied in this observation epoch of
-	// the GPU thread is not copied again (uploadHeap.h).
+	// ranges to copy (contiguous pages as one range), and the pages become clean and write-watched, as
+	// ForEachModifiedRange<Cpu, true> makes them. With `keep` (a read-only use on the GPU thread), a page UploadHeap
+	// marks that is hot - written in consecutive frames (it faulted and was copied in an earlier frame, at most
+	// UploadHeap::HotFrames before) - stays CPU-dirty and writable instead (kept): no protection change, no fault at the
+	// guest's next write; it is copied at its uses, at most once per publish epoch (uploadHeap.h). A kept page used
+	// again in a later publish epoch of the same frame (read by several submissions: tracking would copy it once) is
+	// made clean and write-watched after that copy and not kept again for UploadHeap::CoolFrames frames. So a kept
+	// page costs one copy a frame where tracking costs a fault, two protection changes and the same copy.
 	template <typename Func>
 	void ForEachCpuUploadRange(uint64_t vaddr, uint64_t size, bool keep, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if (!m_cpu_dirty.AnyInRange(start, end)) return;
 		RegionBits     mask(m_cpu_dirty, start, end);
-		const uint64_t granules = keep ? UploadHeap::RegionGranules(m_cpu_addr) : 0;
-		if (granules == 0) {
+		// (Only on the GPU thread translating guest work: the publish epoch and frame are its own.)
+		const bool     gpu_thread = PageManager::ReadProtectionDeferred();
+		const uint64_t granules   = keep ? UploadHeap::RegionGranules(m_cpu_addr) : 0;
+		if (granules == 0 && !m_has_kept.load(std::memory_order_relaxed)) {
 			m_cpu_dirty.UnsetRange(start, end);
-			if (m_has_kept.load(std::memory_order_relaxed)) {
-				m_kept &= ~mask;
-				m_kept_done &= ~mask;
-				m_has_kept.store(m_kept.Any(), std::memory_order_release);
-			}
 			UpdateCpuProtection<true>(start, end);
 			ForEachRange(mask, std::forward<Func>(func));
 			return;
@@ -284,32 +286,101 @@ public:
 				m_pin_mask.SetRange(g * PagesPerGranule, (g + 1) * PagesPerGranule);
 			}
 		}
-		const RegionBits kept  = mask & m_pin_mask;
-		const RegionBits clean = mask & ~m_pin_mask;
-		RegionBits       copy  = mask;
+		const uint64_t publish = UploadHeap::g_publish.load(std::memory_order_acquire);
+		const uint32_t frame   = static_cast<uint32_t>(UploadHeap::g_frame.load(std::memory_order_acquire));
+		const bool     host_wrote = m_kept_stamp_invalid.exchange(false, std::memory_order_acq_rel);
+		if (!gpu_thread || publish != m_kept_stamp || host_wrote) {
+			m_kept_done.Clear();
+			m_kept_stamp = gpu_thread ? publish : 0;
+		}
+		if (granules != 0 && m_page_info == nullptr) m_page_info = std::make_unique<UploadHeap::PageInfo[]>(TRACKER_REGION_PAGES);
+		// clean: dirty pages made clean now (write-watched); copy: pages copied now.
+		RegionBits clean = mask & ~m_pin_mask;
+		RegionBits copy  = clean;
+		// A kept page that is not marked any more for this use (a written use, another thread): as before, clean.
+		if (granules == 0) {
+			clean = mask;
+			copy  = mask & ~(m_kept & m_kept_done);
+		}
+		uint64_t kept_copies = 0, deduped = 0, promoted = 0, demoted = 0;
+		if (granules != 0) {
+			const RegionBits candidates = mask & m_pin_mask;
+			for (const auto [first, last]: candidates) {
+				for (size_t page = first; page < last; page++) {
+					auto& info = m_page_info[page];
+					if (m_kept.Get(page)) {
+						if (!gpu_thread) { // (another thread's use: copied, kept as it is)
+							copy.Set(page);
+							kept_copies++;
+							continue;
+						}
+						if (m_kept_done.Get(page)) { // (copied in this publish epoch)
+							deduped++;
+							continue;
+						}
+						copy.Set(page);
+						m_kept_done.Set(page);
+						kept_copies++;
+						if (info.kept_copy_frame == frame) {
+							// Read again in a later publish epoch of the frame: tracked from here on.
+							clean.Set(page);
+							m_kept.Unset(page);
+							m_kept_done.Unset(page);
+							info.no_keep_before = frame + UploadHeap::CoolFrames;
+							demoted++;
+						} else if (frame - info.kept_since >= UploadHeap::KeepFrames) {
+							// Kept long enough: tracked again (written next frame, it faults once and is kept again).
+							clean.Set(page);
+							m_kept.Unset(page);
+							m_kept_done.Unset(page);
+							info.dirty_frame = frame + 1;
+							demoted++;
+						} else {
+							info.kept_copy_frame = frame;
+						}
+						continue;
+					}
+					copy.Set(page);
+					if (!gpu_thread) {
+						// (Another thread's use: kept as the upload heap was before the hot rule, so its copy, which may
+						// be another buffer's, leaves the page CPU-dirty; the GPU thread's next use decides.)
+						m_kept.Set(page);
+						kept_copies++;
+						continue;
+					}
+					const bool hot = info.dirty_frame != 0 && info.dirty_frame != frame + 1 &&
+					                 frame + 1 - info.dirty_frame <= UploadHeap::HotFrames &&
+					                 static_cast<int32_t>(frame - info.no_keep_before) >= 0;
+					if (hot) {
+						m_kept.Set(page);
+						m_kept_done.Set(page);
+						info.kept_copy_frame = frame;
+						info.kept_since      = frame;
+						promoted++;
+					} else {
+						clean.Set(page);
+						if (gpu_thread) info.dirty_frame = frame + 1; // (0 = never)
+					}
+				}
+			}
+		}
 		m_cpu_dirty &= ~clean;
 		m_kept &= ~clean;
 		m_kept_done &= ~clean;
-		if (kept.Any()) {
-			// The epoch rule only on the GPU thread translating guest work (its ObservationEpoch); 0 = no proof.
-			const uint64_t stamp = PageManager::ReadProtectionDeferred() ? (PageManager::ObservationEpoch() << 1u) | 1u : 0;
-			const bool     host_wrote = m_kept_stamp_invalid.exchange(false, std::memory_order_acq_rel);
-			if (stamp == 0 || stamp != m_kept_stamp || host_wrote) {
-				m_kept_done.Clear();
-				m_kept_stamp = stamp;
-			} else {
-				const RegionBits skip = kept & m_kept_done;
-				copy &= ~skip;
-				UploadHeap::g_deduped_pages.fetch_add(skip.Count(), std::memory_order_relaxed);
-			}
-			if (stamp != 0) m_kept_done |= kept;
-			m_kept |= kept;
-			m_has_kept.store(true, std::memory_order_release);
-			UploadHeap::g_kept_pages.fetch_add(kept.Count(), std::memory_order_relaxed);
-			// Copied now, dirty since: an upload of them later in this command buffer goes in order (UploadPrologue);
-			// what proved the region before proves nothing now.
+		const bool has_kept = m_kept.Any();
+		m_has_kept.store(has_kept, std::memory_order_release);
+		if (kept_copies + promoted != 0) {
+			// Kept pages copied now and dirty since: an upload of them later in this command buffer goes in order
+			// (UploadPrologue); what proved the region before proves nothing now.
 			m_cpu_epoch.fetch_add(1, std::memory_order_release);
 			m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+		}
+		if (granules != 0) {
+			UploadHeap::g_kept_copies.fetch_add(kept_copies, std::memory_order_relaxed);
+			UploadHeap::g_deduped_pages.fetch_add(deduped, std::memory_order_relaxed);
+			UploadHeap::g_promoted_pages.fetch_add(promoted, std::memory_order_relaxed);
+			UploadHeap::g_demoted_pages.fetch_add(demoted, std::memory_order_relaxed);
+			UploadHeap::g_kept_pages.fetch_add(kept_copies + promoted, std::memory_order_relaxed);
 		}
 		if (clean.Any()) UpdateCpuProtection<true>(start, end);
 		if (copy.Any()) ForEachRange(copy, std::forward<Func>(func));
@@ -434,6 +505,7 @@ private:
 	RegionBits            m_kept;
 	RegionBits            m_kept_done;
 	RegionBits            m_pin_mask;
+	std::unique_ptr<UploadHeap::PageInfo[]> m_page_info; // (marked regions only)
 	RegionBits            m_cpu_dirty;
 	RegionBits            m_gpu_dirty;
 	RegionBits            m_writable;
