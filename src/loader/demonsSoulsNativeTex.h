@@ -44,6 +44,13 @@ inline const char* RequestedName() noexcept {
 	return v != nullptr && std::strcmp(v, "1") == 0 ? "KYTY_ENGINE_GPU_NATIVE=1" : "KYTY_NATIVE_TEX=1";
 }
 
+// The hooks themselves: also for KYTY_NATIVE_TEXTURE_PC=1 (graphics/host_gpu/nativeTexturePc.h, its own consumers).
+inline bool HooksRequested() noexcept {
+	if (Requested()) return true;
+	const char* v = std::getenv("KYTY_NATIVE_TEXTURE_PC");
+	return v != nullptr && (v[0] == '1' || v[0] == '2');
+}
+
 enum class Site : uint32_t {
 	TextureFile = 0, // 0x8fed17
 	PoolLayer   = 1, // 0x8fef15

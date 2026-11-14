@@ -14,6 +14,8 @@ struct Program;
 namespace DemonsSoulsEngineTex {
 
 void Install(Program* program);
+// The CTexture hooks are in (for KYTY_ENGINE_TEX_REGISTRY=1 or KYTY_NATIVE_TEXTURE_PC=1).
+[[nodiscard]] bool HooksInstalled() noexcept;
 
 } // namespace DemonsSoulsEngineTex
 } // namespace Loader

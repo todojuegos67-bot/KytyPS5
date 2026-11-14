@@ -255,7 +255,7 @@ Stats GetStats() noexcept {
 
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
-	if (!Requested()) return;
+	if (!HooksRequested()) return;
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
 	const auto* elf = program->elf.get();

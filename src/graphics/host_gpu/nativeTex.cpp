@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/nativeTex.h"
+#include "graphics/host_gpu/nativeTexturePc.h"
 
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -916,6 +917,7 @@ void Rehome(uint64_t addr, uint64_t size, uint64_t keep_serial) {
 }
 
 void BeforeGuestRead(uint64_t addr, uint64_t size) {
+	NativeTexturePc::BeforeGuestRead(addr, size); // (KYTY_NATIVE_TEXTURE_PC: staged bytes into guest memory first)
 	auto& s = S();
 	if (!Active() || size == 0 || addr + size < addr) return;
 	if (addr + size <= s.lo.load(std::memory_order_relaxed) || addr >= s.hi.load(std::memory_order_relaxed)) return;

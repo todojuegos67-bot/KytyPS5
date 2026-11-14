@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/nativeTex.h"
+#include "graphics/host_gpu/nativeTexturePc.h"
 #include "gpu-residency.h"
 #include "lane-sync.h"
 #include "slow-log.h"
@@ -2786,6 +2787,78 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	marks[1] = Clock::now();
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
+	}
+	// KYTY_NATIVE_TEXTURE_PC: an engine texture's bytes come from its device-local buffers (graphics/host_gpu/
+	// nativeTexturePc.h), never from its guest pages: the buffer itself when one holds the whole range, else a GPU gather
+	// (device buffers copied, zeros where the engine texture's memory holds nothing, host/guest parts uploaded).
+	if (NativeTexturePc::Overlaps(vaddr, size) && !IsRegionGpuModified(vaddr, size)) {
+		const auto* holder = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		if (holder == nullptr || !*holder) {
+			const auto start = Clock::now();
+			path             = "native-texture-pc";
+			ApplyImageProtects();
+			NativeTexturePc::Flush(); // (host blocks to the device first)
+			const auto parts = NativeTexturePc::Plan(vaddr, size);
+			const auto done  = [&](bool gathered) {
+                NativeTexturePc::NoteUpload(
+                    size, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()),
+                    gathered);
+			};
+			// The plan's references (device buffers, host blocks) held until the GPU work recorded now is done: a release
+			// meanwhile (stream-out, destroy) cannot free a buffer the upload still reads.
+			const auto hold = [&] { m_scheduler.DeferOperation([keep = parts]() mutable { keep.clear(); }); };
+			// (Directly only at a 256-aligned offset: a buffer->image copy's bufferOffset must be a multiple of 4 and of
+			// the texel block size, and the detiler's source offsets are kept 256-aligned (NativeTexPrepare); a slice or
+			// mip at another offset is gathered to offset 0.)
+			if (parts.size() == 1 && parts[0].kind == NativeTexturePc::Part::Device && parts[0].offset % 256 == 0) {
+				hold();
+				done(false);
+				return {reinterpret_cast<Buffer*>(parts[0].handle), parts[0].offset};
+			}
+			m_scheduler.EndRendering();
+			auto     gathered = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, size);
+			uint64_t upload   = 0;
+			for (const auto& p: parts)
+				if (p.kind == NativeTexturePc::Part::Host || p.kind == NativeTexturePc::Part::Guest) upload += p.end - p.begin;
+			gathered->Fill(0, size, 0); // (the zero parts)
+			std::unique_ptr<Buffer> staging;
+			if (upload != 0) {
+				staging   = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0, AllFlags, upload);
+				uint64_t at = 0;
+				for (const auto& p: parts) {
+					const uint64_t n = p.end - p.begin;
+					if (p.kind == NativeTexturePc::Part::Host) {
+						std::memcpy(staging->Mapped().data() + at, p.host, n);
+					} else if (p.kind == NativeTexturePc::Part::Guest) {
+						if (!Libs::LibKernel::Memory::TryReadBackingToHost(p.begin, staging->Mapped().data() + at, n))
+							std::memset(staging->Mapped().data() + at, 0, n);
+					} else {
+						continue;
+					}
+					at += n;
+				}
+				staging->Flush(0, upload);
+			}
+			uint64_t at = 0;
+			for (const auto& p: parts) {
+				const uint64_t n = p.end - p.begin;
+				if (p.kind == NativeTexturePc::Part::Device) {
+					gathered->CopyFrom(m_scheduler.Current(), *reinterpret_cast<const Buffer*>(p.handle), p.offset,
+					                   p.begin - vaddr, n);
+				} else if (p.kind == NativeTexturePc::Part::Host || p.kind == NativeTexturePc::Part::Guest) {
+					gathered->CopyFrom(m_scheduler.Current(), *staging, at, p.begin - vaddr, n);
+					at += n;
+				}
+			}
+			hold();
+			auto* result = gathered.get();
+			m_scheduler.DeferOperation([buffer = std::move(gathered), more = std::move(staging)]() mutable {
+				buffer.reset();
+				more.reset();
+			});
+			done(true);
+			return {result, 0};
+		}
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {

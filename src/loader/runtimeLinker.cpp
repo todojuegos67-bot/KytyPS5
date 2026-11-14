@@ -19,6 +19,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsNativeTexturePc.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsGpuPages.h"
 #include "loader/demonsSoulsRenderSize.h"
@@ -1637,6 +1638,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsEngineTex::Install(m_programs.empty() ? nullptr : m_programs.front());
 	NativeTex::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsNativeTexStream::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsNativeTexturePc::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSuperResolution::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsRenderSize::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsRenderSize::InstallForcedMode(m_programs.empty() ? nullptr : m_programs.front());
