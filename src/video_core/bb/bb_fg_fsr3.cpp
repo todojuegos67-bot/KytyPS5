@@ -1154,6 +1154,13 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    g_amd.depth_inverted ? "inverted" : "forward");
             // bb-trunk-fix: the 1.41 pairing counters (guest frame of colour vs depth / camera
             // vectors / object vectors / HUD-less for each prepare), and frameTimeDelta.
+            // The Inputs frame numbers (bb_fg.h) are never stamped by the capture
+            // (bb_present_sr.cpp CaptureFg copies depth + vectors in the same command buffer as
+            // the colour): all -1 means "not measured", not a mismatch.
+            if (g_amd.last_ids[0] == ~0ull) {
+                Printf("[fg-amd] pairing: not measured (frame ids not stamped; depth and vectors "
+                       "are copied with the colour in one command buffer)");
+            }
             Printf("[fg-amd] pairing: prepared %u paired %u off_depth %u off_mv %u off_obj %u "
                    "off_hudless %u | last c %lld d %lld mv %lld obj %lld hl %lld | dt avg %.2f "
                    "max %.2f ms | vsm %.3g | fog vectors %s, hudless %s",
