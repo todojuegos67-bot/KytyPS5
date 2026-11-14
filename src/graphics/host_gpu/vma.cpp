@@ -253,6 +253,18 @@ uint64_t EnvMiB(const char* name) {
 	return text != nullptr ? std::strtoull(text, nullptr, 10) * FpMiB : 0;
 }
 
+// KYTY_VRAM_BUDGET_MB=<n> (launcher "Limitar VRAM a 8 GB": 8192): a pure cap, the device's video memory size and
+// budget read as min(real, n MiB) by the fixed pools' sizing, the caches' budget, QueryLocalVideoMemory (NativeTexturePC
+// BudgetPass, [vk-budget] log). NOT small_video_memory or any texture-quality policy. 0 = unset (as before).
+// Values below 6144 keep their old meaning only (the caches' budget: run-windows.ps1 -Turbo).
+uint64_t VramCapBytes() {
+	static const uint64_t cap = [] {
+		const uint64_t v = EnvMiB("KYTY_VRAM_BUDGET_MB");
+		return v >= 6144 * FpMiB ? v : uint64_t {0};
+	}();
+	return cap;
+}
+
 uint64_t PoolFree(VmaAllocator allocator) {
 	if (!g_fp.enabled || allocator == nullptr) return 0;
 	uint64_t free = 0;
@@ -457,6 +469,7 @@ static void CreateFixedPools(GraphicContext& graphics) {
 	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++)
 		if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
 			local = std::max<uint64_t>(local, memory.memoryHeaps[heap].size);
+	if (VramCapBytes() != 0) local = std::min(local, VramCapBytes()); // KYTY_VRAM_BUDGET_MB: as a card of that size
 	const bool discrete = graphics.physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
 	if (!discrete || local <= 9 * FpGiB || !graphics.simulation_ballast.empty()) {
 		std::printf("[vk-pool] KYTY_VK_FIXED_POOL=1 ignored: %s (%" PRIu64 " MiB of video memory); the default allocator as "
@@ -490,6 +503,7 @@ static void CreateFixedPools(GraphicContext& graphics) {
 			if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
 				heap_budget = std::max<uint64_t>(heap_budget, heap_budgets[heap].budget);
 		if (heap_budget == 0) heap_budget = local;
+		if (VramCapBytes() != 0) heap_budget = std::min(heap_budget, VramCapBytes());
 		const uint64_t cap = heap_budget / 100 * 45;
 		if (cap < total) {
 			std::printf("[vk-pool] KYTY_VRAM_BUDGET auto: fixed pools %" PRIu64 " MiB instead of %" PRIu64
@@ -721,6 +735,13 @@ bool GraphicContext::CreateAllocator() {
 	// KYTY_SMALL_VRAM=1 (run-windows.ps1 -Turbo): as on a small GPU whatever this one has (textures yield, no warmup).
 	const char* small_env = std::getenv("KYTY_SMALL_VRAM");
 	small_video_memory = GetTotalMemoryBudget(false) < (uint64_t {12} << 30u) || (small_env != nullptr && *small_env == '1');
+	if (VramCapBytes() != 0) {
+		std::printf("VRAM cap (KYTY_VRAM_BUDGET_MB=%llu): video memory read as min(real, cap); caches' budget %llu MiB "
+		            "(real driver budget %llu MiB), small_video_memory=%d (from the real budget, unchanged)\n",
+		            static_cast<unsigned long long>(VramCapBytes() >> 20u), static_cast<unsigned long long>(GetTotalMemoryBudget() >> 20u),
+		            static_cast<unsigned long long>(GetTotalMemoryBudget(false) >> 20u), small_video_memory ? 1 : 0);
+		std::fflush(stdout);
+	}
 	LocalPlatform::StartWorkingSetTrim();
 	SoftRelease::Start();
 	RamGuard::Start();
@@ -849,6 +870,7 @@ bool GraphicContext::QueryLocalVideoMemory(uint64_t* usage, uint64_t* budget) co
 	if (!LocalPlatform::QueryVideoMemory(usage, budget)) return false;
 	*usage -= std::min(*usage, simulation_ballast_bytes);
 	*budget -= std::min(*budget, simulation_ballast_bytes);
+	if (VramCapBytes() != 0) *budget = std::min(*budget, VramCapBytes()); // KYTY_VRAM_BUDGET_MB: min(real, cap)
 	return true;
 }
 
@@ -1026,6 +1048,12 @@ uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 	budget -= std::min(budget, simulation_ballast_bytes);
 	usage -= std::min(usage, simulation_ballast_bytes);
 	local -= std::min(local, simulation_ballast_bytes);
+	// KYTY_VRAM_BUDGET_MB (a cap, >= 6144): the caches' budget from min(real, cap); not the uncapped reading
+	// (capped == false) that small_video_memory uses.
+	if (const uint64_t vram_cap = VramCapBytes(); vram_cap != 0 && capped && discrete) {
+		budget = std::min(budget, vram_cap);
+		local  = std::min(local, vram_cap);
+	}
 	if (discrete) {
 		uint64_t result = budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
 		if (!capped) return result;
@@ -1034,7 +1062,7 @@ uint64_t GraphicContext::GetTotalMemoryBudget(bool capped) const {
 			const char* text = std::getenv("KYTY_VRAM_BUDGET_MB");
 			return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : uint64_t {0};
 		}();
-		if (forced != 0) return std::min(result, forced);
+		if (forced != 0 && VramCapBytes() == 0) return std::min(result, forced);
 		// The caches collect from the GPU's memory less 3 GB, at most 8 GB: 8 GB on a 12 GB card and up
 		// one, so the whole process (pipelines and the driver's own allocations on top) stays near 11-12 GB with
 		// room for Windows, the desktop and a browser. (13.4 GB on a 16 GB card: 13.3 GB in use after 8 minutes,

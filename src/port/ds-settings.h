@@ -202,6 +202,7 @@ struct Settings {
 	bool        perf_eager_feedback = false; // KYTY_EAGER_FEEDBACK=1
 	bool        perf_feedback_batch = false; // KYTY_FEEDBACK_BATCH=1
 	bool        perf_lane_wide = false;     // KYTY_LANE_LOCAL_WIDE=1
+	bool        vram8 = false;              // limitar_vram_8gb: KYTY_VRAM_BUDGET_MB=8192 only
 	// [Interfaz]
 	std::string metrics = "0"; // KYTY_FPS_HUD 0/1/2
 	bool        skip_intro        = false; // (11-10) saltar_intro: the PlayStation logo and the opening cinematic skipped

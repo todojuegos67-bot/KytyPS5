@@ -888,6 +888,14 @@ void BudgetPass() {
 	}
 	uint64_t usage = 0, budget = 0;
 	if (host.vram == nullptr || !host.vram(&usage, &budget) || budget == 0) return;
+	// KYTY_VRAM_BUDGET_MB=<n>: the budget at most n MiB (min(OS budget, cap)); host.vram (QueryLocalVideoMemory)
+	// already caps it, this keeps the model tests' hosts the same.
+	static const uint64_t cap = [] {
+		const char* v = std::getenv("KYTY_VRAM_BUDGET_MB");
+		const uint64_t mib = v != nullptr ? std::strtoull(v, nullptr, 10) : 0;
+		return mib >= 6144 ? mib << 20u : uint64_t {0}; // (below: the caches' budget only, as vma.cpp)
+	}();
+	if (cap != 0) budget = std::min(budget, cap);
 	static const uint64_t high = EnvPercent("KYTY_VRAM_BUDGET_HIGH_PCT", 90, 50, 98);
 	static const uint64_t low  = std::min(high, EnvPercent("KYTY_VRAM_BUDGET_LOW_PCT", 82, 40, 98));
 	g_budget_log.usage         = usage;

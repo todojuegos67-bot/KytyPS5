@@ -3655,6 +3655,8 @@ void LauncherPerformance(Settings& s) {
 	          "Esas mismas copias de datos de la gráfica se preparan juntas, por bloques, en vez de una a una. Un poco menos de trabajo para el procesador; la ganancia es pequeña. No cambia la imagen. Experimental: si notas fallos, apágalo.");
 	LCheckRow("Traducción rápida para más efectos", s.perf_lane_wide,
 	          "Más programas de efectos del juego (shaders: los pequeños programas que usa la gráfica para calcular y dibujar) se traducen a una versión más rápida. Puede dar algo más de FPS en la gráfica. La primera vez que lo actives esos shaders se vuelven a preparar: más carga y algún tirón al empezar. Experimental: si ves fallos gráficos, apágalo.");
+	LCheckRow("Limitar VRAM a 8 GB", s.vram8,
+	          "El juego usa como m\xC3\xA1ximo 8 GB de la memoria de tu gr\xC3\xA1" "fica, aunque tenga m\xC3\xA1s. Solo limita la memoria: no cambia la calidad ni otros ajustes. Sirve para probar c\xC3\xB3mo ir\xC3\xAD" "a en una gr\xC3\xA1" "fica de 8 GB. Se aplica al iniciar el juego.");
 	// (11-12) "Simular 16 GB RAM" removed too (the owner).
 	// (11-12) "Simular grafica de 8 GB" removed (the owner: black textures with it).
 	BoxEnd();
