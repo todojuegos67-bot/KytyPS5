@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -81,6 +82,12 @@ struct State {
 } g;
 
 std::atomic<double> g_grid{0.0};
+// NoteShown runs on the FSR 3 present path, which may not be the vblank thread: the shown
+// samples and the governing flag it reads are kept apart from g under their own lock.
+std::mutex g_shown_mu;
+std::vector<double> g_shown;
+uint32_t g_shown_count = 0;
+std::atomic<bool> g_governing{false};
 std::atomic<uint32_t> g_epoch{0};
 
 void BuildRungs() {
@@ -162,6 +169,13 @@ void Change(int to, double now, const char* why) {
 void EndWindow(double now) {
     auto& w = g.w;
     double rm, rsd, rp99, sm, ssd, sp99;
+    {
+        std::scoped_lock lk{g_shown_mu};
+        w.shown.swap(g_shown);
+        w.shown_count = g_shown_count;
+        g_shown.clear();
+        g_shown_count = 0;
+    }
     Stats(w.real, rm, rsd, rp99);
     Stats(w.shown, sm, ssd, sp99);
     const double work95 = P95(w.work);
@@ -228,6 +242,7 @@ double VblankInterval(double configured_hz, int flip_rate) {
             g.logged_off = true;
         }
         g.governing = false;
+        g_governing.store(false);
         g_grid.store(0.0);
         return 0.0;
     }
@@ -240,6 +255,12 @@ double VblankInterval(double configured_hz, int flip_rate) {
         g_grid.store(RungInterval(g.idx));
         g_epoch.fetch_add(1);
         g.w.Clear(Now());
+        {
+            std::scoped_lock lk{g_shown_mu};
+            g_shown.clear();
+            g_shown_count = 0;
+        }
+        g_governing.store(true);
     }
     return RungInterval(g.idx);
 }
@@ -310,9 +331,10 @@ double GridInterval() {
 }
 
 void NoteShown(double ms) {
-    if (!g.governing) return;
-    ++g.w.shown_count;
-    g.w.shown.push_back(ms);
+    if (!g_governing.load(std::memory_order_relaxed)) return;
+    std::scoped_lock lk{g_shown_mu};
+    ++g_shown_count;
+    g_shown.push_back(ms);
 }
 
 } // namespace BB::Smooth
