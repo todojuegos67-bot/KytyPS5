@@ -253,6 +253,23 @@ constexpr uint64_t ImageGranuleSpace = uint64_t {1} << 40; // the image page tab
 
 static TextureCache* g_report_cache = nullptr;
 
+// KYTY_NATIVE_TEXTURE_PC_SINGLE=2: the images that are the only copy of an engine texture's bytes (token = generation <<
+// 32 | index). DetachImage of one gives the bytes back to NativeTexturePc first (OnImageGone); RetireStaleImages keeps
+// them (pinned against stale retirement while the engine texture lives).
+static std::mutex                   g_pc_pin_m;
+static std::unordered_set<uint64_t> g_pc_pinned;
+static std::atomic<uint64_t>        g_pc_pinned_n {0};
+static std::atomic<uint64_t>        g_pc_gone {0}, g_pc_gone_bytes {0}, g_pc_retire_kept {0}, g_pc_inline {0}, g_pc_sent {0},
+    g_pc_stalls {0}, g_pc_refused {0}, g_pc_pending_waits {0};
+static thread_local const char*     t_pc_site = "delete";
+static uint64_t PcToken(ImageId id) { return (static_cast<uint64_t>(id.generation) << 32u) | id.index; }
+static ImageId  PcImageId(uint64_t token) { return ImageId(static_cast<uint32_t>(token), static_cast<uint32_t>(token >> 32u)); }
+static bool     PcPinned(ImageId id) {
+    if (g_pc_pinned_n.load(std::memory_order_relaxed) == 0) return false;
+    const std::lock_guard lock(g_pc_pin_m);
+    return g_pc_pinned.count(PcToken(id)) != 0;
+}
+
 void TextureCache::WriteReport(const char* path) {
 	FILE* file = std::fopen(path, "wb");
 	if (file == nullptr) return;
@@ -907,6 +924,24 @@ bool TextureCache::DetachImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return false;
 	}
+	if (PcPinned(id)) {
+		// (KYTY_NATIVE_TEXTURE_PC_SINGLE=2: the engine texture's bytes are only in this image: back into a buffer first,
+		// recorded before the image goes; RetireImage frees it only after the GPU is past this.)
+		const auto n = g_pc_gone.fetch_add(1, std::memory_order_relaxed);
+		g_pc_gone_bytes.fetch_add(image->info.data.size, std::memory_order_relaxed);
+		if (n < 64) {
+			std::printf("NativeTexturePC single-copy: pinned image dropped by the texture cache (%s): addr=0x%llx size=0x%llx "
+			            "fmt=%u %ux%u layers=%u levels=%u tile=%u -> restoring its engine bytes into a buffer\n",
+			            t_pc_site, static_cast<unsigned long long>(image->info.data.address),
+			            static_cast<unsigned long long>(image->info.data.size), static_cast<uint32_t>(image->info.guest_format),
+			            image->info.extent.width, image->info.extent.height, image->info.resources.layers,
+			            image->info.resources.levels, static_cast<uint32_t>(image->info.tile_mode));
+			std::fflush(stdout);
+		}
+		NativeTexturePc::OnImageGone(PcToken(id));
+		image = m_slot_images.try_get(id);
+		if (image == nullptr) return false;
+	}
 	m_partial_plans.erase(image->serial);
 	m_layer_owners.erase(image->serial);
 	if (!image->depth_id) {
@@ -978,7 +1013,9 @@ void TextureCache::RetireImage(ImageId id) {
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
+	t_pc_site = site;
 	DeleteImage(id);
+	t_pc_site = "delete";
 }
 
 // The guest's bytes are all of the image: only sampled (no GPU write, target, storage or video-out use), without
@@ -2654,6 +2691,107 @@ void TextureCache::InitNativeTex() {
 
 static TextureCache* g_pc_cache = nullptr;
 
+// ---- KYTY_NATIVE_TEXTURE_PC_SINGLE=2: read-backs from the image ----------------------------------------------------
+// Every image -> buffer restore is recorded on the render thread's own command stream (TileImage / image download, the
+// path GPU-written images are read back by), so the image's layout transitions are the texture cache's usual ones on
+// its usual queue: nothing touches an image from another queue or thread. A caller on the render thread (or on one of
+// its recording threads) records inline; any other thread sends the work to the render thread (GuestGpu::SendCommand)
+// and waits for it, only where it may (a guest thread: the render thread never waits for one; not the upload worker,
+// not deferred GPU work); a STALL line every 2 s, FATAL after KYTY_NATIVE_TEXTURE_PC_SINGLE_TIMEOUT_S (20) - a
+// stop with a reason, never a silent hang or wrong bytes. Buffers restored without a wait are remembered with their
+// tick: read_device (the copy queue) waits for the GPU to be past it first.
+static CommandScheduler*                      g_pc_scheduler = nullptr;
+static std::mutex                             g_pc_pending_m;
+static std::unordered_map<uint64_t, uint64_t> g_pc_pending; // restored buffer -> tick (0: unknown: a recorder's)
+
+static bool PcMayRecordInline() { return GuestGpu::IsGpuThread() || CommandScheduler::ThreadRecorder() != nullptr; }
+static bool PcMayWaitInline() {
+	return GuestGpu::IsGpuThread() && CommandScheduler::ThreadRecorder() == nullptr && !CommandScheduler::InDeferredOperation();
+}
+static bool PcMaySend() {
+	return !GuestGpu::IsGpuThread() && CommandScheduler::ThreadRecorder() == nullptr && !AsyncUpload::t_worker &&
+	       !CommandScheduler::InDeferredOperation() && LibKernel::PthreadSelfOrNull() != nullptr;
+}
+
+// `work` on the render thread, waited for. False: this thread may not wait for it (`why`).
+static bool PcRunOnRenderThread(const std::function<void()>& work, const char* what, const char** why) {
+	if (PcMayWaitInline()) {
+		g_pc_inline.fetch_add(1, std::memory_order_relaxed);
+		work();
+		return true;
+	}
+	if (!PcMaySend()) {
+		g_pc_refused.fetch_add(1, std::memory_order_relaxed);
+		if (why != nullptr)
+			*why = GuestGpu::IsGpuThread() ? "render thread inside a recorder / deferred operation (cannot wait)"
+			                               : "a host thread the render thread may wait for (cannot send)";
+		return false;
+	}
+	struct Request {
+		std::mutex              m;
+		std::condition_variable cv;
+		bool                    done = false;
+	};
+	auto request = std::make_shared<Request>();
+	g_pc_sent.fetch_add(1, std::memory_order_relaxed);
+	g_pc_scheduler->Context().GetGpu().SendCommand([request, &work]() mutable {
+		work();
+		{
+			const std::lock_guard lock(request->m);
+			request->done = true;
+		}
+		request->cv.notify_all();
+	});
+	static const int timeout = [] {
+		const char* v = std::getenv("KYTY_NATIVE_TEXTURE_PC_SINGLE_TIMEOUT_S");
+		const int   t = v != nullptr ? std::atoi(v) : 20;
+		return t < 2 ? 2 : t;
+	}();
+	std::unique_lock lock(request->m);
+	for (int waited = 0; !request->cv.wait_for(lock, std::chrono::seconds(2), [&] { return request->done; });) {
+		waited += 2;
+		g_pc_stalls.fetch_add(1, std::memory_order_relaxed);
+		std::printf("NativeTexturePC single-copy: STALL %s: waited %d s for the render thread\n", what, waited);
+		std::fflush(stdout);
+		if (waited >= timeout) {
+			// (`work` refers to this frame: it may still run - stopping is the only safe end.)
+			std::printf("NativeTexturePC single-copy: FATAL: the render thread did not run the %s read-back in %d s (it may be "
+			            "waiting for this thread); use KYTY_NATIVE_TEXTURE_PC_SINGLE=0\n",
+			            what, waited);
+			std::fflush(stdout);
+			std::abort();
+		}
+	}
+	return true;
+}
+
+static void PcForgetRestored(uint64_t handle) {
+	const std::lock_guard lock(g_pc_pending_m);
+	g_pc_pending.erase(handle);
+}
+
+static bool PcWaitRestored(uint64_t handle) {
+	uint64_t tick = 0;
+	{
+		const std::lock_guard lock(g_pc_pending_m);
+		auto                  it = g_pc_pending.find(handle);
+		if (it == g_pc_pending.end()) return true;
+		tick = it->second;
+	}
+	auto& scheduler = *g_pc_scheduler;
+	if (tick == 0 || !scheduler.IsFree(tick)) {
+		g_pc_pending_waits.fetch_add(1, std::memory_order_relaxed);
+		const char* why = nullptr;
+		if (!PcRunOnRenderThread([&] { scheduler.Finish(); }, "restored-buffer", &why)) {
+			std::printf("NativeTexturePC single-copy: a restored buffer cannot be waited for on this thread (%s)\n", why);
+			std::fflush(stdout);
+			return false;
+		}
+	}
+	PcForgetRestored(handle);
+	return true;
+}
+
 // The engine textures' own copy path, independent of the render thread: every write of their device buffers (the
 // uploads, Flush) and every read-back (a CPU touch, an emulator read: any thread, also the async upload worker, deferred
 // operations and texture-cache lock holders) is one buffer copy on the graphics queue, recorded in this path's own
@@ -2756,6 +2894,136 @@ static bool NativeTexturePcProbe(uint64_t address, uint64_t rip, const void* con
 	return false;
 }
 
+void TextureCache::InitNativeTexturePcSingle(NativeTexturePc::Host& host) {
+	g_pc_scheduler = &m_scheduler;
+	// Render thread or one of its recorders: the image's guest bytes into a new device buffer, recorded.
+	static const auto restore_now = [](uint64_t token, uint64_t size, bool wait, const char** why) -> uint64_t {
+		auto&      cache = *g_pc_cache;
+		const auto id    = PcImageId(token);
+		auto*      image = cache.m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			*why = "the pinned image is gone";
+			return 0;
+		}
+		// (CPU-dirty is fine: every CPU write over engine texture bytes went through NativeTexturePc first (OnGuestWrite /
+		// OnFault), which restored and cut those chunks; the bytes still image-only are the image's own.)
+		if (image->IsGpuModified() || image->IsBufferModified()) {
+			*why = "the image was written by the GPU since";
+			return 0;
+		}
+		if (image->info.data.size != size) {
+			*why = "the image's size changed";
+			return 0;
+		}
+		if (wait && !PcMayWaitInline()) {
+			*why = "a recorder thread cannot wait for the GPU";
+			return 0;
+		}
+		auto plan = cache.BuildDownload(*image);
+		if (!plan.valid || plan.depth_target) {
+			*why = "no download plan for the image";
+			return 0;
+		}
+		auto buffer = std::make_unique<Buffer>(cache.m_graphics, cache.m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, size);
+		cache.m_scheduler.EndRendering();
+		cache.DownloadImageData(*image, *buffer, 0, size, std::move(plan));
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		cache.m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                                     vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0,
+		                                                     nullptr, 0, nullptr);
+		const uint64_t handle = reinterpret_cast<uint64_t>(buffer.release());
+		if (wait) {
+			cache.m_scheduler.Finish();
+		} else {
+			const std::lock_guard lock(g_pc_pending_m);
+			g_pc_pending[handle] = CommandScheduler::ThreadRecorder() == nullptr ? cache.m_scheduler.CurrentTick() : 0;
+		}
+		return handle;
+	};
+	host.restore = +[](uint64_t token, uint64_t size, bool wait, const char** why) -> uint64_t {
+		if (PcMayRecordInline() && (!wait || PcMayWaitInline())) {
+			g_pc_inline.fetch_add(1, std::memory_order_relaxed);
+			return restore_now(token, size, wait, why);
+		}
+		uint64_t handle = 0;
+		// (Sent: always waited for on the render thread - the caller reads it next, from another thread.)
+		if (!PcRunOnRenderThread([&] { handle = restore_now(token, size, true, why); }, "image", why)) return 0;
+		return handle;
+	};
+	host.pick_image = +[](uint64_t b, uint64_t e, uint64_t* base, uint64_t* size, const char** why) -> uint64_t {
+		auto& cache = *g_pc_cache;
+		if (!PcMayWaitInline()) {
+			*why = "not the render thread";
+			return 0;
+		}
+		std::scoped_lock lock {cache.m_lock};
+		ImageId          best {};
+		uint64_t         best_size = UINT64_MAX;
+		const char*      reason    = "no image over it";
+		for (const auto id: cache.FindImagesInRegion(b, e - b, false)) {
+			const auto* image = cache.m_slot_images.try_get(id);
+			if (image == nullptr || !image->registered) continue;
+			const auto range = image->info.data;
+			if (range.address > b || range.address + range.size < e) {
+				reason = "the images over it do not hold it whole";
+				continue;
+			}
+			if (!cache.GuestTexture(*image)) {
+				reason = "the image is not sampled-only (target / storage / depth / metadata / GPU-written)";
+				continue;
+			}
+			if (image->IsCpuDirty() || image->IsBufferModified()) {
+				reason = "the image is not clean";
+				continue;
+			}
+			if (range.size > (uint64_t {512} << 20u)) {
+				reason = "the image is larger than 512 MiB";
+				continue;
+			}
+			if (range.size < best_size) {
+				best      = id;
+				best_size = range.size;
+			}
+		}
+		if (!best) {
+			*why = reason;
+			return 0;
+		}
+		const auto plan = cache.BuildDownload(cache.m_slot_images[best]);
+		if (!plan.valid || plan.depth_target) {
+			*why = "no download plan for the image";
+			return 0;
+		}
+		*base = cache.m_slot_images[best].info.data.address;
+		*size = cache.m_slot_images[best].info.data.size;
+		return PcToken(best);
+	};
+	host.pin = +[](uint64_t token, bool on) {
+		const std::lock_guard lock(g_pc_pin_m);
+		if (on)
+			g_pc_pinned.insert(token);
+		else
+			g_pc_pinned.erase(token);
+		g_pc_pinned_n.store(g_pc_pinned.size(), std::memory_order_relaxed);
+	};
+	host.sync = +[] {
+		if (PcMayWaitInline()) g_pc_cache->m_scheduler.Finish();
+	};
+	host.log = +[] {
+		std::printf("NativeTexturePC single-copy=2 texture cache: pinned images %llu | pinned images dropped %llu (%.1f MiB; "
+		            "bytes restored first) | kept from stale retirement %llu | read-backs inline on the render thread %llu, "
+		            "sent to it %llu (stalls %llu, refused %llu) | waits for restored buffers %llu\n",
+		            static_cast<unsigned long long>(g_pc_pinned_n.load()), static_cast<unsigned long long>(g_pc_gone.load()),
+		            static_cast<double>(g_pc_gone_bytes.load()) / 1048576.0,
+		            static_cast<unsigned long long>(g_pc_retire_kept.load()), static_cast<unsigned long long>(g_pc_inline.load()),
+		            static_cast<unsigned long long>(g_pc_sent.load()), static_cast<unsigned long long>(g_pc_stalls.load()),
+		            static_cast<unsigned long long>(g_pc_refused.load()),
+		            static_cast<unsigned long long>(g_pc_pending_waits.load()));
+	};
+}
+
 void TextureCache::InitNativeTexturePc() {
 	g_pc_cache = this;
 	if (!g_pc_queue.Init(m_graphics)) {
@@ -2792,6 +3060,7 @@ void TextureCache::InitNativeTexturePc() {
 		return ok;
 	};
 	host.release = +[](uint64_t handle) {
+		PcForgetRestored(handle);
 		g_pc_cache->m_scheduler.DeferOperation(
 		    [buffer = std::unique_ptr<Buffer>(reinterpret_cast<Buffer*>(handle))]() mutable { buffer.reset(); });
 	};
@@ -2799,6 +3068,7 @@ void TextureCache::InitNativeTexturePc() {
 	// for when made: nothing of the render thread's is waited on).
 	host.read_device = +[](uint64_t handle, uint64_t offset, void* out, uint64_t size) -> bool {
 		auto&  cache = *g_pc_cache;
+		if (!PcWaitRestored(handle)) return false; // (SINGLE=2: a buffer made from an image: the GPU past that first)
 		Buffer host_copy(cache.m_graphics, cache.m_scheduler, MemoryUsage::Download, 0, AllFlags, size);
 		if (host_copy.Mapped().size() < size) return false;
 		if (!g_pc_queue.Copy(*reinterpret_cast<const Buffer*>(handle), offset, host_copy, 0, size)) return false;
@@ -2807,6 +3077,7 @@ void TextureCache::InitNativeTexturePc() {
 		return true;
 	};
 	host.vram = +[](uint64_t* usage, uint64_t* budget) -> bool { return g_pc_cache->m_graphics.QueryLocalVideoMemory(usage, budget); };
+	if (NativeTexturePc::SingleMode() == 2) InitNativeTexturePcSingle(host);
 	NativeTexturePc::SetVramBudgetDefault(m_graphics.small_video_memory);
 	NativeTexturePc::SetHost(host);
 	NativeTexturePc::HostReady();
@@ -6149,7 +6420,10 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 		    owner->info.data.size >= ChunkedUploadMin && GuestTexture(*owner) &&
 		    m_lru_cache.TickOf(owner->lru_id) >= m_scene_tick)
 			return false;
-		if (owner->depth_id || owner->IsGpuModified())
+		if (PcPinned(id)) {
+			g_pc_retire_kept.fetch_add(1, std::memory_order_relaxed);
+			kept.push_back(id);
+		} else if (owner->depth_id || owner->IsGpuModified())
 			kept.push_back(id);
 		else
 			stale.push_back(id);

@@ -70,6 +70,20 @@ struct Host {
 	bool (*read_device)(uint64_t handle, uint64_t offset, void* out, uint64_t size) = nullptr;
 	// Any thread: the device-local video memory in use and the budget (the OS's), bytes. False: unknown.
 	bool (*vram)(uint64_t* usage, uint64_t* budget) = nullptr;
+	// KYTY_NATIVE_TEXTURE_PC_SINGLE=2 (texture cache side):
+	// Render thread: the one image whose guest bytes hold [b, e) exactly (sampled-only, clean, downloadable): its token
+	// (0: none, `why`), its guest base and size.
+	uint64_t (*pick_image)(uint64_t b, uint64_t e, uint64_t* base, uint64_t* size, const char** why) = nullptr;
+	// Any thread: a new device buffer of `size` bytes with the image's guest (tiled) bytes, made from the image on the
+	// render thread (inline there, else sent to it and waited for). `wait`: done on the GPU when it returns (else ordered
+	// before the render thread's later work; read_device waits for it). 0: not possible (`why`).
+	uint64_t (*restore)(uint64_t token, uint64_t size, bool wait, const char** why) = nullptr;
+	// The texture cache's pin of the image (no stale retirement; OnImageGone before it is ever dropped).
+	void (*pin)(uint64_t token, bool on) = nullptr;
+	// Render thread: everything recorded so far done on the GPU.
+	void (*sync)() = nullptr;
+	// Pump's 30 s log: the texture cache's own single-copy counters.
+	void (*log)() = nullptr;
 	uint64_t page_size = 4096;
 };
 // Sets the non-null members (the loader sets the guest side, the texture cache the device side).
@@ -146,6 +160,10 @@ void               SetVramBudgetDefault(bool on) noexcept;
 
 // KYTY_NATIVE_TEXTURE_PC_SINGLE=1 (read once; needs level 2): device buffers released once their image is built (Pump).
 [[nodiscard]] bool SingleCopy() noexcept;
+// KYTY_NATIVE_TEXTURE_PC_SINGLE: 0 off, 1 (buffers dropped into guest memory), 2 (image-only, see Host::pick_image).
+[[nodiscard]] int SingleMode() noexcept;
+// SINGLE=2: the texture cache drops a pinned image (render thread): its engine bytes back into a device buffer first.
+void OnImageGone(uint64_t token) noexcept;
 
 struct Stats {
 	uint64_t textures = 0, textures_loaded = 0, textures_created = 0, released = 0;

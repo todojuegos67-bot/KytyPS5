@@ -32,6 +32,11 @@ struct Counters {
 	    watched_bytes {0}, guest_writes {0}, guest_write_bytes {0};
 	std::atomic<uint64_t> demoted {0}, demoted_bytes {0}, demote_passes {0};
 	std::atomic<uint64_t> single_ranges {0}, single_bytes {0}, single_passes {0};
+	// KYTY_NATIVE_TEXTURE_PC_SINGLE=2
+	std::atomic<uint64_t> s2_freed {0}, s2_freed_bytes {0}, s2_image_only_bytes {0}, s2_passes {0}, s2_verified {0};
+	std::atomic<uint64_t> s2_keep_shared {0}, s2_keep_slice {0}, s2_keep_no_image {0}, s2_keep_mismatch {0},
+	    s2_keep_restore_fail {0}, s2_lost {0}, s2_pins {0}, s2_unpins {0};
+	std::atomic<uint64_t> s2_restores[6] {}, s2_restore_bytes[6] {}, s2_restore_fail[6] {};
 };
 Counters g_c;
 
@@ -83,7 +88,14 @@ struct Chunk {
 	bool     materialized = false; // its bytes are in guest memory too (a fallback): its pages are not watched
 	uint64_t used = 0;             // KYTY_VRAM_BUDGET: the frame of its last image upload (Plan) or of its load
 	bool     imaged = false;       // an image was built from it (Plan): KYTY_NATIVE_TEXTURE_PC_SINGLE may drop its buffer
+	// KYTY_NATIVE_TEXTURE_PC_SINGLE=2: image-only (no dev, no host, not materialized): `img` is the pinned texture cache
+	// image (token) that holds the bytes; they are its guest (tiled) bytes at (chunk begin - img_base). Restored into a
+	// device buffer (Ensure) before anything needs them.
+	uint64_t img = 0, img_base = 0;
+	bool     single_keep  = false; // never dropped again (shared buffer, slice source, verify mismatch, no image)
+	uint8_t  single_tries = 0;     // passes that found no image for it
 };
+bool ImageOnly(const Chunk& c) { return c.img != 0 && !c.dev && !c.host && !c.materialized; }
 
 struct Record {
 	Texture  texture;
@@ -318,6 +330,108 @@ std::vector<Part> PartsLocked(const State& s, uint64_t b, uint64_t e) {
 	return parts;
 }
 
+// ---- KYTY_NATIVE_TEXTURE_PC_SINGLE=2: image-only chunks -------------------------------------------------------------
+enum RestorePath : int { RpPlan = 0, RpCpuRead = 1, RpSlice = 2, RpImageGone = 3, RpEdge = 4, RpFill = 5 };
+const char* const kRestorePath[6] = {"image-build", "cpu-read", "slice-copy", "image-gone", "edge-page", "fill"};
+std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_pinned; // token -> (image base, image size); under State::m
+void (*g_single_host_log)() = nullptr;
+
+[[noreturn]] void Lost(const char* path, uint64_t b, uint64_t e, const char* why) {
+	std::printf("NativeTexturePC single-copy: FATAL: the bytes of 0x%llx+0x%llx are only in a texture cache image and could "
+	            "not be read back (%s: %s); never returned wrong bytes: stopping. Use KYTY_NATIVE_TEXTURE_PC_SINGLE=0\n",
+	            static_cast<unsigned long long>(b), static_cast<unsigned long long>(e - b), path, why != nullptr ? why : "?");
+	std::fflush(stdout);
+	std::abort();
+}
+
+// Restores every image-only chunk of `token` (all of its image's chunks: one download of the whole image) into one new
+// device buffer. No lock held while the host works. False: not restored (`why`).
+bool RestoreToken(uint64_t token, bool wait, int path, const char** why) {
+	auto&    s = S();
+	Host     host;
+	uint64_t base = 0, size = 0;
+	{
+		const std::lock_guard lock(s.m);
+		auto                  p = g_pinned.find(token);
+		if (p == g_pinned.end()) return true; // (restored meanwhile)
+		base = p->second.first;
+		size = p->second.second;
+		host = s.host;
+	}
+	const uint64_t handle = host.restore != nullptr ? host.restore(token, size, wait, why) : 0;
+	if (handle == 0) {
+		g_c.s2_restore_fail[path].fetch_add(1, std::memory_order_relaxed);
+		std::printf("NativeTexturePC single-copy: restore FAILED path=%s image=0x%llx+0x%llx token=0x%llx: %s\n",
+		            kRestorePath[path], static_cast<unsigned long long>(base), static_cast<unsigned long long>(size),
+		            static_cast<unsigned long long>(token), why != nullptr && *why != nullptr ? *why : "no host");
+		std::fflush(stdout);
+		return false;
+	}
+	auto     dev   = std::make_shared<Dev>(handle, size);
+	uint64_t bytes = 0;
+	{
+		const std::lock_guard lock(s.m);
+		for (auto& [cb, c]: s.chunks)
+			if (c.img == token) {
+				if (ImageOnly(c)) {
+					c.dev    = dev;
+					c.offset = cb - c.img_base;
+					bytes += c.end - cb;
+					g_c.s2_image_only_bytes.fetch_sub(c.end - cb, std::memory_order_relaxed);
+				}
+				c.img = 0;
+			}
+		g_pinned.erase(token);
+	}
+	if (host.pin != nullptr) host.pin(token, false);
+	g_c.s2_unpins.fetch_add(1, std::memory_order_relaxed);
+	g_c.s2_restores[path].fetch_add(1, std::memory_order_relaxed);
+	g_c.s2_restore_bytes[path].fetch_add(bytes, std::memory_order_relaxed);
+	static std::atomic<int> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+		std::printf("NativeTexturePC single-copy: restored path=%s image=0x%llx+0x%llx (%.1f KiB of engine bytes)%s\n",
+		            kRestorePath[path], static_cast<unsigned long long>(base), static_cast<unsigned long long>(size),
+		            static_cast<double>(bytes) / 1024.0, wait ? " waited" : "");
+		std::fflush(stdout);
+	}
+	return true;
+}
+
+bool Ensure(uint64_t b, uint64_t e, bool wait, int path, const char** why) {
+	if (SingleMode() != 2 || b >= e) return true;
+	auto& s = S();
+	for (int round = 0; round < 3; ++round) {
+		std::vector<uint64_t> tokens;
+		{
+			const std::lock_guard lock(s.m);
+			if (g_pinned.empty()) return true;
+			auto it = s.chunks.upper_bound(b);
+			if (it != s.chunks.begin()) --it;
+			for (; it != s.chunks.end() && it->first < e; ++it)
+				if (it->second.end > b && ImageOnly(it->second) &&
+				    std::find(tokens.begin(), tokens.end(), it->second.img) == tokens.end())
+					tokens.push_back(it->second.img);
+		}
+		if (tokens.empty()) return true;
+		for (const auto t: tokens)
+			if (!RestoreToken(t, wait, path, why)) return false;
+	}
+	if (why != nullptr) *why = "image-only chunks still there after 3 rounds";
+	return false;
+}
+} // namespace
+
+// The texture cache: a pinned image is about to go (DetachImage, render thread): its engine bytes back to a buffer first.
+void OnImageGone(uint64_t token) noexcept {
+	if (SingleMode() != 2) return;
+	const char* why = nullptr;
+	if (!RestoreToken(token, false, RpImageGone, &why)) {
+		g_c.s2_lost.fetch_add(1, std::memory_order_relaxed);
+		Lost("image-gone", token, token, why);
+	}
+}
+
+namespace {
 // The bytes of `parts` into out (out[0] = byte `b`). Device parts read back. False: something could not be read.
 bool Assemble(const State& s, const std::vector<Part>& parts, uint64_t b, uint8_t* out,
               const std::function<bool(uint64_t, void*, uint64_t)>& read_guest, uint64_t* guest_reads) {
@@ -357,6 +471,7 @@ bool Assemble(const State& s, const std::vector<Part>& parts, uint64_t b, uint8_
 // Edge pages of [b, e) shared with other data: the chunk's bytes written into guest memory there (they are never watched).
 void WriteEdges(State& s, uint64_t b, uint64_t e) {
 	if (s.host.write_guest == nullptr || s.host.watch == nullptr) return;
+	if (const char* why = nullptr; !Ensure(b, e, true, RpEdge, &why)) Lost("edge-page", b, e, why);
 	Ranges edges;
 	if (b % s.host.page_size != 0) edges.emplace_back(b, std::min(e, PU(s, b)));
 	if (e % s.host.page_size != 0 && PD(s, e) >= PU(s, b)) edges.emplace_back(std::max(b, PD(s, e)), e);
@@ -381,6 +496,7 @@ void WriteEdges(State& s, uint64_t b, uint64_t e) {
 // The non-materialized chunks over [b, e) written into guest memory and unwatched. False: some could not be read here.
 bool Materialize(uint64_t b, uint64_t e, bool demote = false) {
 	auto&                                   s = S();
+	if (const char* why = nullptr; !demote && !Ensure(b, e, true, RpCpuRead, &why)) Lost("cpu-read", b, e, why);
 	std::vector<std::pair<uint64_t, Chunk>> todo;
 	std::pair<uint64_t, uint64_t>           mine {};
 	{
@@ -502,6 +618,11 @@ void SetHost(const Host& host) noexcept {
 	if (host.upload_commit != nullptr) s.host.upload_commit = host.upload_commit;
 	if (host.release != nullptr) s.host.release = host.release;
 	if (host.read_device != nullptr) s.host.read_device = host.read_device;
+	if (host.pick_image != nullptr) s.host.pick_image = host.pick_image;
+	if (host.restore != nullptr) s.host.restore = host.restore;
+	if (host.pin != nullptr) s.host.pin = host.pin;
+	if (host.sync != nullptr) s.host.sync = host.sync;
+	if (host.log != nullptr) g_single_host_log = host.log;
 	if (host.page_size != 0 && host.page_size != 4096) s.host.page_size = host.page_size;
 	if (s.host.page_size == 0) s.host.page_size = 4096;
 }
@@ -588,6 +709,7 @@ bool OnSliceCopy(uint64_t dst, uint64_t src, uint64_t size,
 	auto&             s = S();
 	std::vector<Part> parts;
 	uint64_t          dst_owner = 0;
+	if (const char* why = nullptr; !Ensure(src, src + size, false, RpSlice, &why)) Lost("slice-copy", src, src + size, why);
 	{
 		std::unique_lock lock(s.m);
 		parts           = PartsLocked(s, src, src + size);
@@ -768,8 +890,10 @@ void Flush() noexcept {
 		for (const auto h: gone) host.release(h);
 }
 
-std::vector<Part> Plan(uint64_t addr, uint64_t size) noexcept {
-	auto&                 s = S();
+namespace {
+std::vector<Part> PlanImpl(uint64_t addr, uint64_t size, bool wait, int path) noexcept {
+	auto& s = S();
+	if (const char* why = nullptr; !Ensure(addr, addr + size, wait, path, &why)) Lost(kRestorePath[path], addr, addr + size, why);
 	const std::lock_guard lock(s.m);
 	const uint64_t        frame = g_c.frames.load(std::memory_order_relaxed) + 1;
 	auto                  it    = s.chunks.upper_bound(addr);
@@ -781,6 +905,9 @@ std::vector<Part> Plan(uint64_t addr, uint64_t size) noexcept {
 		}
 	return PartsLocked(s, addr, addr + size);
 }
+} // namespace
+
+std::vector<Part> Plan(uint64_t addr, uint64_t size) noexcept { return PlanImpl(addr, size, false, RpPlan); }
 
 void NoteUpload(uint64_t bytes, uint64_t ns, bool gathered) noexcept {
 	g_c.fills.fetch_add(1, std::memory_order_relaxed);
@@ -792,7 +919,7 @@ void NoteUpload(uint64_t bytes, uint64_t ns, bool gathered) noexcept {
 bool Fill(uint64_t addr, uint64_t size, void* out, const std::function<bool(uint64_t, void*, uint64_t)>& read_guest) noexcept {
 	const auto start = std::chrono::steady_clock::now();
 	auto&      s     = S();
-	const auto parts = Plan(addr, size);
+	const auto parts = PlanImpl(addr, size, true, RpFill);
 	const bool ok    = Assemble(s, parts, addr, static_cast<uint8_t*>(out), read_guest, nullptr);
 	NoteUpload(size,
 	           static_cast<uint64_t>(
@@ -969,23 +1096,166 @@ void SinglePass() {
 		}
 	g_c.single_passes.fetch_add(1, std::memory_order_relaxed);
 }
+
+// KYTY_NATIVE_TEXTURE_PC_SINGLE=2 (render thread, Pump): engine textures whose image was built from their device buffer
+// and not rebuilt for 30 frames: the texture cache names the one image holding their bytes (pick_image: sampled-only,
+// clean, downloadable), the image's guest bytes are made again from it on the GPU (restore: TileImage, the same path a
+// GPU-written image's read-back takes) and compared byte for byte with the buffer (verify). Equal: the buffer is
+// released and the image pinned (the texture cache restores the bytes into a buffer before it ever drops it,
+// OnImageGone). Different / no image / shared buffer / slice source: the buffer stays (counted).
+void Single2Pass() {
+	auto&          s     = S();
+	const uint64_t frame = g_c.frames.load(std::memory_order_relaxed);
+	Host           host;
+	struct Cand {
+		uint64_t b, e, offset;
+		DevRef   dev;
+		uint64_t token = 0, img_base = 0, img_size = 0;
+	};
+	std::vector<Cand> cand;
+	static const uint64_t per_pass = EnvPercent("KYTY_NATIVE_TEXTURE_PC_SINGLE_MB", 32, 4, 512) << 20u;
+	{
+		const std::lock_guard lock(s.m);
+		host = s.host;
+		if (host.pick_image == nullptr || host.restore == nullptr || host.read_device == nullptr || host.sync == nullptr)
+			return;
+		std::unordered_map<const Dev*, uint32_t> refs;
+		for (const auto& [b, c]: s.chunks)
+			if (c.dev) refs[c.dev.get()]++;
+		uint64_t bytes = 0;
+		for (auto& [b, c]: s.chunks) {
+			if (!c.dev || c.host || c.materialized || !c.imaged || c.single_keep || c.used + 30 > frame) continue;
+			if (refs[c.dev.get()] > 1 || c.dev.use_count() > 1 + static_cast<long>(refs[c.dev.get()])) {
+				// (Shared by a slice copy, or held by a plan in flight: a later pass, once alone.)
+				if (refs[c.dev.get()] > 1) {
+					g_c.s2_keep_shared.fetch_add(1, std::memory_order_relaxed);
+					c.single_keep = true;
+				}
+				continue;
+			}
+			if (auto o = s.owners.find(c.owner); o != s.owners.end() && o->second.texture.slice_copy_candidate) {
+				g_c.s2_keep_slice.fetch_add(1, std::memory_order_relaxed);
+				c.single_keep = true;
+				continue;
+			}
+			if (bytes >= per_pass) break;
+			bytes += c.end - b;
+			cand.push_back({b, c.end, c.offset, c.dev});
+		}
+	}
+	if (cand.empty()) return;
+	g_c.s2_passes.fetch_add(1, std::memory_order_relaxed);
+	static std::atomic<int> logged_no_image {0}, logged_mismatch {0};
+	// The images, then one restore per image (recorded), then one wait.
+	std::map<uint64_t, uint64_t> restored; // token -> scratch handle
+	for (auto& c: cand) {
+		const char* why = nullptr;
+		c.token         = host.pick_image(c.b, c.e, &c.img_base, &c.img_size, &why);
+		if (c.token == 0) {
+			g_c.s2_keep_no_image.fetch_add(1, std::memory_order_relaxed);
+			if (logged_no_image.fetch_add(1, std::memory_order_relaxed) < 32)
+				std::printf("NativeTexturePC single-copy: keep 0x%llx+0x%llx: no image to hold it (%s)\n",
+				            static_cast<unsigned long long>(c.b), static_cast<unsigned long long>(c.e - c.b),
+				            why != nullptr ? why : "?");
+			const std::lock_guard lock(s.m);
+			if (auto it = s.chunks.find(c.b); it != s.chunks.end() && ++it->second.single_tries >= 3)
+				it->second.single_keep = true;
+			continue;
+		}
+		if (restored.count(c.token) != 0) continue;
+		const uint64_t h = host.restore(c.token, c.img_size, false, &why);
+		restored[c.token] = h;
+		if (h == 0) {
+			g_c.s2_keep_restore_fail.fetch_add(1, std::memory_order_relaxed);
+			std::printf("NativeTexturePC single-copy: keep 0x%llx+0x%llx: the image could not be read back (%s)\n",
+			            static_cast<unsigned long long>(c.b), static_cast<unsigned long long>(c.e - c.b),
+			            why != nullptr ? why : "?");
+		}
+	}
+	if (restored.empty()) return;
+	host.sync();
+	std::vector<uint8_t> a, v;
+	std::vector<uint64_t> pins;
+	for (const auto& c: cand) {
+		if (c.token == 0 || restored[c.token] == 0) continue;
+		const uint64_t n = c.e - c.b;
+		a.resize(n);
+		v.resize(n);
+		const bool read = host.read_device(c.dev->handle, c.offset, a.data(), n) &&
+		                  host.read_device(restored[c.token], c.b - c.img_base, v.data(), n);
+		if (!read || std::memcmp(a.data(), v.data(), n) != 0) {
+			g_c.s2_keep_mismatch.fetch_add(1, std::memory_order_relaxed);
+			uint64_t first = 0;
+			while (read && first < n && a[first] == v[first]) ++first;
+			if (logged_mismatch.fetch_add(1, std::memory_order_relaxed) < 32)
+				std::printf("NativeTexturePC single-copy: keep 0x%llx+0x%llx: the image's bytes differ (%s; first at +0x%llx; "
+				            "image 0x%llx+0x%llx)\n",
+				            static_cast<unsigned long long>(c.b), static_cast<unsigned long long>(n),
+				            read ? "compared" : "read-back failed", static_cast<unsigned long long>(first),
+				            static_cast<unsigned long long>(c.img_base), static_cast<unsigned long long>(c.img_size));
+			const std::lock_guard lock(s.m);
+			if (auto it = s.chunks.find(c.b); it != s.chunks.end()) it->second.single_keep = true;
+			continue;
+		}
+		g_c.s2_verified.fetch_add(1, std::memory_order_relaxed);
+		const std::lock_guard lock(s.m);
+		auto                  it = s.chunks.find(c.b);
+		// (Still the same chunk: a load or a release meanwhile replaced it.)
+		if (it == s.chunks.end() || it->second.end != c.e || it->second.dev != c.dev || it->second.materialized) continue;
+		it->second.dev.reset();
+		it->second.offset   = 0;
+		it->second.img      = c.token;
+		it->second.img_base = c.img_base;
+		if (g_pinned.emplace(c.token, std::make_pair(c.img_base, c.img_size)).second) pins.push_back(c.token);
+		g_c.s2_freed.fetch_add(1, std::memory_order_relaxed);
+		g_c.s2_freed_bytes.fetch_add(n, std::memory_order_relaxed);
+		g_c.s2_image_only_bytes.fetch_add(n, std::memory_order_relaxed);
+	}
+	for (const auto [token, h]: restored)
+		if (h != 0 && host.release != nullptr) host.release(h);
+	for (const auto t: pins) {
+		if (host.pin != nullptr) host.pin(t, true);
+		g_c.s2_pins.fetch_add(1, std::memory_order_relaxed);
+	}
+	// Pins no chunk uses any more (released / streamed out / overwritten): let go.
+	std::vector<uint64_t> unpin;
+	{
+		const std::lock_guard          lock(s.m);
+		std::unordered_set<uint64_t> live;
+		for (const auto& [b, c]: s.chunks)
+			if (ImageOnly(c)) live.insert(c.img);
+		for (auto it = g_pinned.begin(); it != g_pinned.end();)
+			if (live.count(it->first) == 0) {
+				unpin.push_back(it->first);
+				it = g_pinned.erase(it);
+			} else {
+				++it;
+			}
+	}
+	for (const auto t: unpin) {
+		if (host.pin != nullptr) host.pin(t, false);
+		g_c.s2_unpins.fetch_add(1, std::memory_order_relaxed);
+	}
+}
 } // namespace
 
-bool SingleCopy() noexcept {
-	static const bool on = [] {
+int SingleMode() noexcept {
+	static const int mode = [] {
 		const char* v = std::getenv("KYTY_NATIVE_TEXTURE_PC_SINGLE");
-		return v != nullptr && v[0] == '1';
-	}();
-	if (on && Level() != 2) {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			std::printf("NativeTexturePC: KYTY_NATIVE_TEXTURE_PC_SINGLE=1 ignored (needs KYTY_NATIVE_TEXTURE_PC=2)\n");
+		const int   m = v != nullptr && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+		if (m != 0 && Level() != 2) {
+			std::printf("NativeTexturePC: KYTY_NATIVE_TEXTURE_PC_SINGLE=%d ignored (needs KYTY_NATIVE_TEXTURE_PC=2)\n", m);
+			return 0;
 		}
-		return false;
-	}
-	return on;
+		if (m == 2)
+			std::printf("NativeTexturePC: KYTY_NATIVE_TEXTURE_PC_SINGLE=2: an engine texture's image is its only copy once "
+			            "verified (device buffer released, no RAM copy; read-backs from the image on the render thread)\n");
+		return m;
+	}();
+	return mode;
 }
+
+bool SingleCopy() noexcept { return SingleMode() == 1; }
 
 void Pump() noexcept {
 	if (!Enabled()) return;
@@ -993,6 +1263,7 @@ void Pump() noexcept {
 	g_c.frames.fetch_add(1, std::memory_order_relaxed);
 	if (VramBudgetOn() && g_c.frames.load(std::memory_order_relaxed) % 60 == 0) BudgetPass();
 	if (SingleCopy() && g_c.frames.load(std::memory_order_relaxed) % 15 == 0) SinglePass();
+	if (SingleMode() == 2 && g_c.frames.load(std::memory_order_relaxed) % 15 == 0) Single2Pass();
 	using Clock = std::chrono::steady_clock;
 	static Clock::time_point last = Clock::now();
 	static Stats             prev {};
@@ -1036,6 +1307,37 @@ void Pump() noexcept {
 		            static_cast<unsigned long long>(g_c.single_ranges.load()), MiB(g_c.single_bytes.load()),
 		            static_cast<unsigned long long>(g_c.single_passes.load()), static_cast<unsigned long long>(c.fallbacks),
 		            MiB(c.fallback_bytes), static_cast<unsigned long long>(c.fallback_refused));
+	if (SingleMode() == 2) {
+		std::printf("NativeTexturePC single-copy=2: engine buffers VRAM MiB %.1f (%llu buffers) | image-only MiB %.1f (%zu "
+		            "images pinned; pins %llu, unpins %llu) | buffers freed %llu (%.1f MiB; verified %llu, %llu passes) | kept: "
+		            "shared %llu, slice source %llu, no image %llu, bytes differ %llu, read-back failed %llu | lost 0 (else FATAL)\n",
+		            MiB(c.vram_bytes), static_cast<unsigned long long>(c.vram_buffers), MiB([] {
+			            uint64_t              n = 0;
+			            const std::lock_guard lock(S().m);
+			            for (const auto& [b, ch]: S().chunks)
+				            if (ImageOnly(ch)) n += ch.end - b;
+			            return n;
+		            }()),
+		            [] {
+			            const std::lock_guard lock(S().m);
+			            return g_pinned.size();
+		            }(),
+		            static_cast<unsigned long long>(g_c.s2_pins.load()), static_cast<unsigned long long>(g_c.s2_unpins.load()),
+		            static_cast<unsigned long long>(g_c.s2_freed.load()), MiB(g_c.s2_freed_bytes.load()),
+		            static_cast<unsigned long long>(g_c.s2_verified.load()), static_cast<unsigned long long>(g_c.s2_passes.load()),
+		            static_cast<unsigned long long>(g_c.s2_keep_shared.load()), static_cast<unsigned long long>(g_c.s2_keep_slice.load()),
+		            static_cast<unsigned long long>(g_c.s2_keep_no_image.load()),
+		            static_cast<unsigned long long>(g_c.s2_keep_mismatch.load()),
+		            static_cast<unsigned long long>(g_c.s2_keep_restore_fail.load()));
+		std::printf("NativeTexturePC single-copy=2 restores (image -> buffer, render thread):");
+		for (int i = 0; i < 6; ++i)
+			std::printf(" %s %llu (%.1f MiB, failed %llu)%s", kRestorePath[i],
+			            static_cast<unsigned long long>(g_c.s2_restores[i].load()), MiB(g_c.s2_restore_bytes[i].load()),
+			            static_cast<unsigned long long>(g_c.s2_restore_fail[i].load()), i < 5 ? " |" : "");
+		std::printf(" | CPU read-backs %llu (%.1f MiB) | faults %llu\n", static_cast<unsigned long long>(c.fallbacks),
+		            MiB(c.fallback_bytes), static_cast<unsigned long long>(c.faults));
+		if (g_single_host_log != nullptr) g_single_host_log();
+	}
 	std::fflush(stdout);
 	prev = c;
 }

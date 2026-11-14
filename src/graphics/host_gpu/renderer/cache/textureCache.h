@@ -41,6 +41,10 @@ void                   KytyTextureGcThresholds(uint64_t total_budget, uint64_t& 
 [[nodiscard]] bool     KytyGcLiveBudget();
 [[nodiscard]] uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics);
 
+namespace NativeTexturePc {
+struct Host;
+} // namespace NativeTexturePc
+
 class TextureCache {
 public:
 	// Every image as a tab-separated row (live "images <path>").
@@ -187,6 +191,7 @@ public:
 	// KYTY_NATIVE_TEX=1 (host_gpu/nativeTex.h): the host side of the ring of texture loads.
 	struct NativeTexHost;
 	void InitNativeTex();
+	void InitNativeTexturePcSingle(NativeTexturePc::Host& host);
 	void InitNativeTexturePc(); // KYTY_NATIVE_TEXTURE_PC (host_gpu/nativeTexturePc.h): its device side
 	void NativeTexPrepare(ImageId id); // (InitializeImage: an image over ring bytes uploads from the ring)
 	struct OffloadCheck;
