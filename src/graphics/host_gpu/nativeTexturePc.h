@@ -57,9 +57,12 @@ struct Host {
 	void (*write_guest)(uint64_t addr, const void* data, uint64_t size) = nullptr;
 	// Page manager read watchers of [addr, addr + size) on/off (page-aligned; any thread).
 	void (*watch)(uint64_t addr, uint64_t size, bool on) = nullptr;
-	// Render thread: a device-local buffer of `size` bytes filled with `data` (recorded upload). Returns its handle (0:
-	// none: the block stays on the host).
+	// Render thread: a device-local buffer of `size` bytes, its fill from `data` recorded (done by upload_commit). Returns
+	// its handle (0: none: the block stays on the host).
 	uint64_t (*upload)(const void* data, uint64_t size) = nullptr;
+	// Render thread: the uploads recorded since the last commit submitted together and waited for. False: none done (the
+	// caller releases their buffers).
+	bool (*upload_commit)() = nullptr;
 	// Render thread, deferred until the GPU is done with it: the buffer gone.
 	void (*release)(uint64_t handle) = nullptr;
 	// Any thread: `size` bytes at `offset` of device buffer `handle` read back into `out` (waits for the GPU). False:

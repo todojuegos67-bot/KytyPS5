@@ -2678,9 +2678,22 @@ public:
 		vk::FenceCreateInfo fence {};
 		return graphics.device.createFence(&fence, nullptr, &m_fence) == vk::Result::eSuccess;
 	}
+	struct Region {
+		const Buffer* source;
+		uint64_t      source_offset;
+		const Buffer* destination;
+		uint64_t      destination_offset;
+		uint64_t      size;
+	};
 	// size bytes from source+source_offset to destination+destination_offset, done when it returns. Any thread.
 	bool Copy(const Buffer& source, uint64_t source_offset, const Buffer& destination, uint64_t destination_offset,
 	          uint64_t size) {
+		const Region region {&source, source_offset, &destination, destination_offset, size};
+		return CopyMany(&region, 1);
+	}
+	// All the regions in one command buffer, one submit, one wait. Any thread.
+	bool CopyMany(const Region* regions, size_t count) {
+		if (count == 0) return true;
 		std::lock_guard lock(m_mutex);
 		auto&           device = m_graphics->device;
 		if (m_command.reset({}) != vk::Result::eSuccess) return false;
@@ -2692,8 +2705,11 @@ public:
 		before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
 		m_command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
 		                          &before, 0, nullptr, 0, nullptr);
-		vk::BufferCopy region {source_offset, destination_offset, size};
-		m_command.copyBuffer(source.Handle(), destination.Handle(), 1, &region);
+		for (size_t i = 0; i < count; ++i) {
+			const auto&    r = regions[i];
+			vk::BufferCopy region {r.source_offset, r.destination_offset, r.size};
+			m_command.copyBuffer(r.source->Handle(), r.destination->Handle(), 1, &region);
+		}
 		vk::MemoryBarrier after {};
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -2722,6 +2738,13 @@ private:
 	vk::Fence         m_fence   = nullptr;
 };
 static NativeTexturePcQueue g_pc_queue;
+// The fills recorded by host.upload since the last host.upload_commit (render thread only: Flush).
+struct NativeTexturePcUpload {
+	std::unique_ptr<Buffer> staging;
+	const Buffer*           device;
+	uint64_t                size;
+};
+static std::vector<NativeTexturePcUpload> g_pc_uploads;
 
 static bool NativeTexturePcProbe(uint64_t address, uint64_t rip, const void* context, bool write) {
 	if (NativeTexturePc::OnFault(address)) return true;
@@ -2746,7 +2769,8 @@ void TextureCache::InitNativeTexturePc() {
         if (on) g_pc_cache->m_page_manager.UpdateReadWatchers<true>(vaddr, size);
         else g_pc_cache->m_page_manager.UpdateReadWatchers<false>(vaddr, size);
 	};
-	// Render thread (Flush): a device-local buffer filled from the host block by this path's own queue, waited for.
+	// Render thread (Flush): a device-local buffer whose fill from the host block is recorded; upload_commit makes all
+	// the recorded fills in one submit on this path's own queue and waits for it (one wait per Flush batch, not per block).
 	host.upload = +[](const void* data, uint64_t size) -> uint64_t {
 		auto& cache   = *g_pc_cache;
 		auto  staging = std::make_unique<Buffer>(cache.m_graphics, cache.m_scheduler, MemoryUsage::Upload, 0, AllFlags, size);
@@ -2754,9 +2778,18 @@ void TextureCache::InitNativeTexturePc() {
 		std::memcpy(staging->Mapped().data(), data, size);
 		staging->Flush(0, size);
 		auto device = std::make_unique<Buffer>(cache.m_graphics, cache.m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, size);
-		if (!g_pc_queue.Copy(*staging, 0, *device, 0, size)) return 0;
-		g_pc_queue.copies.fetch_add(1, std::memory_order_relaxed);
-		return reinterpret_cast<uint64_t>(device.release());
+		auto* handle = device.release();
+		g_pc_uploads.push_back({std::move(staging), handle, size});
+		return reinterpret_cast<uint64_t>(handle);
+	};
+	host.upload_commit = +[]() -> bool {
+		std::vector<NativeTexturePcQueue::Region> regions;
+		regions.reserve(g_pc_uploads.size());
+		for (const auto& u: g_pc_uploads) regions.push_back({u.staging.get(), 0, u.device, 0, u.size});
+		const bool ok = g_pc_queue.CopyMany(regions.data(), regions.size());
+		if (ok) g_pc_queue.copies.fetch_add(regions.size(), std::memory_order_relaxed);
+		g_pc_uploads.clear(); // (the staging buffers: the copies are done, or never ran)
+		return ok;
 	};
 	host.release = +[](uint64_t handle) {
 		g_pc_cache->m_scheduler.DeferOperation(

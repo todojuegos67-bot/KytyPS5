@@ -447,6 +447,7 @@ void SetHost(const Host& host) noexcept {
 	if (host.write_guest != nullptr) s.host.write_guest = host.write_guest;
 	if (host.watch != nullptr) s.host.watch = host.watch;
 	if (host.upload != nullptr) s.host.upload = host.upload;
+	if (host.upload_commit != nullptr) s.host.upload_commit = host.upload_commit;
 	if (host.release != nullptr) s.host.release = host.release;
 	if (host.read_device != nullptr) s.host.read_device = host.read_device;
 	if (host.page_size != 0 && host.page_size != 4096) s.host.page_size = host.page_size;
@@ -630,6 +631,8 @@ bool Overlaps(uint64_t addr, uint64_t size) noexcept {
 
 void Flush() noexcept {
 	if (!Enabled()) return;
+	static std::mutex     flush_m; // (the host's recorded uploads are one list: one Flush at a time)
+	const std::lock_guard flush_lock(flush_m);
 	auto&                     s = S();
 	std::vector<State::Pending> pending;
 	Host                      host;
@@ -638,34 +641,70 @@ void Flush() noexcept {
 		host = s.host;
 		if (host.upload != nullptr) pending.swap(s.pending);
 	}
-	// One upload per host block (a block shared by a slice copy is listed once per range).
-	std::unordered_map<const void*, DevRef> done;
+	// One upload per host block (a block shared by a slice copy is listed once per range). The uploads are recorded and
+	// submitted together (host.upload_commit: one submit and one wait per batch of up to kBatch bytes), and a batch's
+	// buffers are published to the chunks only after its wait: a read-back never sees a buffer not yet written.
+	constexpr uint64_t                        kBatch = 64ull << 20;
+	std::unordered_map<const void*, DevRef>   done;
+	std::vector<std::pair<Bytes, uint64_t>>   batch; // block, handle (recorded, not yet committed)
+	std::vector<const State::Pending*>        users; // the pending ranges of this batch
+	uint64_t                                  batch_bytes = 0;
+	const auto commit = [&] {
+		if (users.empty()) return;
+		const bool ok = batch.empty() || host.upload_commit == nullptr || host.upload_commit();
+		if (!ok) {
+			g_c.upload_fail.fetch_add(batch.size(), std::memory_order_relaxed);
+			for (const auto& [block, handle]: batch) {
+				done.erase(block.get());
+				if (host.release != nullptr) host.release(handle);
+			}
+		} else {
+			for (const auto& [block, handle]: batch) {
+				done[block.get()] = std::make_shared<Dev>(handle, block->size());
+				g_c.to_vram.fetch_add(1, std::memory_order_relaxed);
+				g_c.to_vram_bytes.fetch_add(block->size(), std::memory_order_relaxed);
+			}
+		}
+		const std::lock_guard lock(s.m);
+		for (const auto* p: users) {
+			Bytes block = p->block.lock();
+			if (!block) continue;
+			const auto d = done.find(block.get());
+			if (d == done.end() || !d->second) {
+				s.pending.push_back(*p); // (again next time)
+				continue;
+			}
+			auto it = s.chunks.upper_bound(p->b);
+			if (it != s.chunks.begin()) --it;
+			for (; it != s.chunks.end() && it->first < p->e; ++it) {
+				if (it->second.host != block) continue;
+				it->second.dev = d->second; // (same layout: offsets stay)
+				it->second.host.reset();
+			}
+		}
+		batch.clear();
+		users.clear();
+		batch_bytes = 0;
+	};
 	for (auto& p: pending) {
 		Bytes block = p.block.lock();
 		if (!block) continue; // (cut or replaced meanwhile: nothing to move)
-		DevRef& dev = done[block.get()];
-		if (!dev) {
+		if (done.find(block.get()) == done.end()) {
+			if (batch_bytes != 0 && batch_bytes + block->size() > kBatch) commit();
 			const uint64_t handle = host.upload(block->data(), block->size());
 			if (handle == 0) {
 				g_c.upload_fail.fetch_add(1, std::memory_order_relaxed);
 				const std::lock_guard lock(s.m);
 				s.pending.push_back(p); // (again next time)
-				done.erase(block.get());
 				continue;
 			}
-			dev = std::make_shared<Dev>(handle, block->size());
-			g_c.to_vram.fetch_add(1, std::memory_order_relaxed);
-			g_c.to_vram_bytes.fetch_add(block->size(), std::memory_order_relaxed);
+			done[block.get()] = nullptr; // (recorded; set when its batch is committed)
+			batch.emplace_back(block, handle);
+			batch_bytes += block->size();
 		}
-		const std::lock_guard lock(s.m);
-		auto                  it = s.chunks.upper_bound(p.b);
-		if (it != s.chunks.begin()) --it;
-		for (; it != s.chunks.end() && it->first < p.e; ++it) {
-			if (it->second.host != block) continue;
-			it->second.dev = dev; // (same layout: offsets stay)
-			it->second.host.reset();
-		}
+		users.push_back(&p);
 	}
+	commit();
 	pending.clear();
 	done.clear(); // (host blocks are freed as their last chunk lets go; device buffers nobody took are released below)
 	std::vector<uint64_t> gone;
