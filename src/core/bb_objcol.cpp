@@ -69,7 +69,13 @@ bool ReadEnv() {
     return v != nullptr && v[0] == '1';
 }
 
-const bool g_enabled = ReadEnv();
+bool ReadFix() {
+    const char* v = std::getenv("BB_OBJCOL_FIX");
+    return v != nullptr && v[0] == '1';
+}
+
+const bool g_fix = ReadFix();
+const bool g_enabled = ReadEnv() || g_fix;
 
 // Copies guest memory without faulting on unmapped / protected pages.
 bool SafeCopy(void* dst, u64 src, u64 len) {
@@ -594,6 +600,12 @@ size_t Count(const std::set<std::string>& a, char kind) {
         std::count_if(a.begin(), a.end(), [&](const std::string& x) { return x[0] == kind; }));
 }
 
+struct MsbPart;
+std::vector<MsbPart> MsbParts(const std::vector<u8>& d);
+void StoreMsbParts(const std::string& map, const std::vector<u8>& mod_msb,
+                   const std::set<std::string>& vanilla_parts, bool have_vanilla,
+                   const std::vector<u8>& vanilla_msb);
+
 void AnalyseMsb(const Job& job) {
     const std::string& host = job.host;
     std::vector<u8> raw, msb;
@@ -624,6 +636,7 @@ void AnalyseMsb(const Job& job) {
             found = true;
             std::set<std::string> vparts, vmodels;
             MsbNames(vmsb, vparts, vmodels);
+            StoreMsbParts(MapOf(job.guest), msb, vparts, true, vmsb);
             text += fmt::format(
                 " | vanilla {} {} bytes crc {:08x}{}: object parts {}, collision parts {} | "
                 "object parts only in vanilla: {} | only in the mod: {} | collision parts only in "
@@ -638,9 +651,104 @@ void AnalyseMsb(const Job& job) {
         }
         if (!found) {
             text += " | no vanilla copy found next to the mods folder (-patch / -UPDATE / base)";
+            StoreMsbParts(MapOf(job.guest), msb, {}, false, {});
         }
+    } else {
+        StoreMsbParts(MapOf(job.guest), msb, {}, false, {});
     }
     LOG_INFO(Core, "{}", text);
+}
+
+// MSB part records (MSBB / MSB3 family): +0x00 name offset (i64, from the record), +0x08 type,
+// +0x0c index, +0x10 model index, +0x18 sib offset, +0x20 position, +0x2c rotation, +0x38 scale.
+// Records are found from their UTF-16 names and kept only when the scale is plausible.
+struct MsbPart {
+    std::string name;
+    float pos[3];
+    s32 type, index, model;
+    bool mod_only = false;
+};
+
+std::vector<MsbPart> MsbParts(const std::vector<u8>& d) {
+    std::vector<MsbPart> out;
+    const size_t n = d.size();
+    for (size_t i = 0; i + 26 <= n; i += 2) {
+        if (d[i] != 'o' || d[i + 1] != 0 || (i >= 2 && d[i - 2] != 0)) {
+            continue;
+        }
+        std::string t;
+        for (size_t k = i; k + 1 < n && t.size() < 13; k += 2) {
+            if (d[k + 1] != 0 || d[k] == 0) {
+                break;
+            }
+            t.push_back(char(d[k]));
+        }
+        if (t.size() != 12 || t[7] != '_') {
+            continue;
+        }
+        for (size_t back = 8; back <= 0x800 && back <= i; back += 4) {
+            const size_t r = i - back;
+            if (r + 0x44 > n || Le64(d.data() + r) != back) {
+                continue;
+            }
+            float f[9];
+            std::memcpy(f, d.data() + r + 0x20, sizeof(f));
+            bool ok = true;
+            for (int k = 0; k < 3; ++k) {
+                ok = ok && std::isfinite(f[k]) && std::fabs(f[k]) < 1e5f && f[6 + k] > 0.001f &&
+                     f[6 + k] < 1000.f;
+            }
+            if (!ok) {
+                continue;
+            }
+            MsbPart p;
+            p.name = t;
+            std::copy(f, f + 3, p.pos);
+            p.type = s32(Le32(d.data() + r + 8));
+            p.index = s32(Le32(d.data() + r + 0xc));
+            p.model = s32(Le32(d.data() + r + 0x10));
+            out.push_back(std::move(p));
+            break;
+        }
+    }
+    return out;
+}
+
+std::map<std::string, std::vector<MsbPart>> g_msb_parts; // by map, under g_mutex
+
+void StoreMsbParts(const std::string& map, const std::vector<u8>& mod_msb,
+                   const std::set<std::string>& vanilla_parts, bool have_vanilla,
+                   const std::vector<u8>& vanilla_msb) {
+    auto parts = MsbParts(mod_msb);
+    std::map<s32, std::string> vanilla_index;
+    if (have_vanilla) {
+        for (const auto& v : MsbParts(vanilla_msb)) {
+            vanilla_index.emplace(v.index, v.name);
+        }
+    }
+    std::string mods;
+    u32 listed = 0;
+    for (auto& p : parts) {
+        p.mod_only = have_vanilla && !vanilla_parts.contains(p.name);
+        if (p.mod_only && ++listed > 60) {
+            if (listed == 61) {
+                mods += " (more not listed)";
+            }
+        } else if (p.mod_only) {
+            const auto it = vanilla_index.find(p.index);
+            mods += fmt::format("{}{} index {} type {} model {} at ({:.1f}, {:.1f}, {:.1f}){}",
+                                mods.empty() ? "" : "; ", p.name, p.index, p.type, p.model,
+                                p.pos[0], p.pos[1], p.pos[2],
+                                it != vanilla_index.end()
+                                    ? " (vanilla index " + std::to_string(p.index) + " is " +
+                                          it->second + ")"
+                                    : "");
+        }
+    }
+    LOG_INFO(Core, "[objcol] msb {} object part records {} (with position){}", map, parts.size(),
+             mods.empty() ? std::string() : " | mod-only parts: " + mods);
+    std::scoped_lock lk{g_mutex};
+    g_msb_parts[map] = std::move(parts);
 }
 
 void CompareJob(const Job& job);
@@ -771,7 +879,7 @@ void Census(u64 world, World& w) {
         const auto prev = w.unadded_since.find(u32(id));
         const double since = prev != w.unadded_since.end() ? prev->second : now;
         still[u32(id)] = since;
-        if (now - since < 10.0 || (flags & 1) == 0) {
+        if (now - since < 10.0) {
             continue;
         }
         if (owner >= 0) {
@@ -784,9 +892,10 @@ void Census(u64 world, World& w) {
             u64 vt = 0;
             Rd(shape, vt);
             LOG_INFO(Core,
-                     "[objcol] static body {} (shape vtable eboot+{:#x}) layer {} filter {:#x} at "
+                     "[objcol] {} body {} (shape vtable eboot+{:#x}) layer {} filter {:#x} at "
                      "({:.1f}, {:.1f}, {:.1f}) exists but is not in the world ({})",
-                     id, vt - g_eboot, bb.Layer(), bb.Filter(), bb.Pos(0), bb.Pos(1), bb.Pos(2),
+                     Motion(flags), id, vt - g_eboot, bb.Layer(), bb.Filter(), bb.Pos(0), bb.Pos(1),
+                     bb.Pos(2),
                      it == w.bodies.end() || it->second.shape != shape ? "never added"
                      : it->second.state == State::Removed              ? "removed"
                      : it->second.state == State::Deferred ? "add deferred, not committed"
@@ -897,6 +1006,13 @@ void Summary(bool force) {
 double g_map_open = -1.0, g_map_tick = 0.0;
 int g_map_visit = 0;
 bool g_cmp30 = false, g_cmp90 = false;
+struct PendingCmp {
+    std::string map;
+    int visit;
+    double open;
+    bool done[2];
+};
+std::vector<PendingCmp> g_pending_cmp;
 std::map<std::string, int> g_visits;
 u32 g_deferred_lines = 0;
 u32 g_world_lines = 0;
@@ -1111,6 +1227,499 @@ void CompareJob(const Job& job) {
     }
 }
 
+// ---------------------------------------------------------------- object physics systems
+// Decompiled (1.09):
+//   0xb36780 hknpPhysicsSystem::addToWorld(system, mode, flags): collects the system's body ids
+//            ([system+0x20], count [system+0x28]) that are not yet added and calls
+//            addBodies([system+0x18] world, ids, n, mode, flags).
+//   0xb368e0 hknpPhysicsSystem::removeFromWorld(system).
+//   The game's physics-system wrapper (vtable 0x52978a0, system at wrapper+0x18, "in world" byte
+//   at wrapper+0x40): slot +0x78 0xa7f2d0 = addToWorld(mode 1, flags 0) and wrapper+0x40 = 1;
+//   slot +0x80 0xa7f300 = removeFromWorld and wrapper+0x40 = 0; slot +0x38 0xa7ed70 rebuilds
+//   the system and re-adds it only when wrapper+0x40 is already set.
+
+struct SysRec {
+    u32 adds = 0, removes = 0, rebuilds = 0;
+    bool in_world = false;
+    u32 n = 0, flags = 0;
+    float pos[3] = {};
+    double t = 0.0;
+    std::string map;
+};
+std::unordered_map<u64, SysRec> g_systems;  // by hknpPhysicsSystem
+std::unordered_map<u64, SysRec> g_wrappers; // by the game's wrapper (rebuild calls)
+u64 st_sys_add = 0, st_sys_add_mode = 0, st_sys_remove = 0, st_rebuild = 0;
+
+void SysInfo(u64 sys, SysRec& r) {
+    u8 h[0x30];
+    if (!SafeCopy(h, sys, sizeof(h))) {
+        return;
+    }
+    const u64 world = Le64(h + 0x18), ids = Le64(h + 0x20);
+    r.n = Le32(h + 0x28);
+    u32 id0 = 0;
+    u64 data;
+    s32 size;
+    BodyBytes bb;
+    if (r.n == 0 || r.n > 4096 || !Rd(ids, id0) || !BodyArray(world, data, size) ||
+        id0 >= u32(size) || !SafeCopy(bb.b, data + u64(id0) * 0x90, 0x90)) {
+        return;
+    }
+    r.flags = bb.Flags();
+    for (int k = 0; k < 3; ++k) {
+        r.pos[k] = bb.Pos(k);
+    }
+}
+
+void OnSysAdd(u64 sys, s32 mode) {
+    std::scoped_lock lk{g_mutex};
+    auto& r = g_systems[sys];
+    ++r.adds;
+    ++st_sys_add;
+    st_sys_add_mode += mode != 1;
+    r.in_world = true;
+    r.t = Now();
+    r.map = g_map;
+    SysInfo(sys, r);
+}
+
+void OnSysRemove(u64 sys) {
+    std::scoped_lock lk{g_mutex};
+    auto& r = g_systems[sys];
+    ++r.removes;
+    ++st_sys_remove;
+    r.in_world = false;
+    r.t = Now();
+    r.map = g_map;
+    SysInfo(sys, r);
+}
+
+void OnRebuild(u64 wrapper) {
+    std::scoped_lock lk{g_mutex};
+    auto& r = g_wrappers[wrapper];
+    ++r.rebuilds;
+    ++st_rebuild;
+    r.t = Now();
+    r.map = g_map;
+}
+
+std::string SysText(const SysRec& r) {
+    return fmt::format("({:.1f}, {:.1f}, {:.1f}) {} bodies {} [{}]", r.pos[0], r.pos[1], r.pos[2],
+                       r.n, Motion(r.flags), r.map);
+}
+
+// The game's wrappers seen rebuilding a system whose "in world" byte is still 0, and systems
+// removed and not added again.
+void SystemsReport(double now) {
+    std::vector<std::string> removed, idle;
+    u32 in_world = 0;
+    for (const auto& [sys, r] : g_systems) {
+        if (r.in_world) {
+            ++in_world;
+        } else {
+            removed.push_back(SysText(r) + fmt::format(" removed {:.0f} s ago", now - r.t));
+        }
+    }
+    for (auto& [wrapper, r] : g_wrappers) {
+        u8 flag = 1;
+        u64 sys = 0;
+        if (!Rd(wrapper + 0x40, flag) || !Rd(wrapper + 0x18, sys) || flag != 0 || sys == 0) {
+            continue;
+        }
+        const auto it = g_systems.find(sys);
+        if (it != g_systems.end() && it->second.in_world) {
+            continue;
+        }
+        SysInfo(sys, r);
+        idle.push_back(SysText(r) + fmt::format(" (rebuilt {} times, never added)", r.rebuilds));
+    }
+    LOG_INFO(Core,
+             "[objcol] map {} visit #{} (+{:.0f} s): physics systems addToWorld {} (mode != 1: "
+             "{}), removeFromWorld {}, in the world now {} | removed and not added again {}: {} "
+             "| game wrappers rebuilt but not in the world {}: {}",
+             g_map, g_map_visit, now - g_map_open, st_sys_add, st_sys_add_mode, st_sys_remove,
+             in_world, removed.size(), Join(removed, 30), idle.size(), Join(idle, 30));
+}
+
+// ---------------------------------------------------------------- BB_OBJCOL_FIX
+// The world step (0xb597d0, timer "StAddBodies") commits the pending (mode 2) adds of
+// [world+0xb8]/[world+0xc0] and [world+0xc8]/[world+0xd0] unconditionally (field run 3: always
+// committed), so pending adds are only watched and logged here.
+
+bool IsPtr(u64 v);
+void FixPass(double now, u64 world);
+
+struct PendingWatch {
+    u32 c0 = 0, d0 = 0;
+    double since = -1.0;
+    bool logged = false;
+};
+std::unordered_map<u64, PendingWatch> g_pending_watch;
+u64 st_flush = 0;
+
+void OnFlush(u64 fd4) {
+    const double now = Now();
+    u64 world = 0;
+    u32 counts[5];
+    if (!Rd(fd4 + 8, world) || !IsPtr(world)) {
+        return;
+    }
+    if (SafeCopy(counts, world + 0xc0, sizeof(counts))) {
+        const u32 c0 = counts[0], d0 = counts[4];
+        std::scoped_lock lk{g_mutex};
+        ++st_flush;
+        auto& pw = g_pending_watch[world];
+        if (c0 == 0 && d0 == 0) {
+            pw = PendingWatch{};
+        } else if (pw.since < 0.0 || pw.c0 != c0 || pw.d0 != d0) {
+            pw = PendingWatch{c0, d0, now, false};
+        } else if (now - pw.since >= 2.0 && !pw.logged) {
+            pw.logged = true;
+            LOG_INFO(Core, "[objcol] world {:#x}: {} + {} pending body adds unchanged for {:.1f} s",
+                     world, c0, d0, now - pw.since);
+        }
+    }
+    if (g_fix) {
+        FixPass(now, world);
+    }
+}
+
+// ---------------------------------------------------------------- object physics wrappers
+// Decompiled (1.09): every object physics system is built by the game's wrapper (ctor 0xa7d4a0,
+// vtable 0x52978a0, system at +0x18, "in world" byte at +0x40) through 0x6e8700 ->
+// hknpPhysicsSystem ctor 0xb359c0 with r8 = r9 = 0 (all four call sites 0xa7d592, 0xa7dcae,
+// 0xa7efcd, 0x180c374: "xor r8d,r8d; xor r9d,r9d"). r8 is the addition mode the ctor passes to
+// hknpWorld::createBody 0xb564a0 (0xb35e4a "mov edx,[rbp-0x11c]"), and addBodies with mode 0
+// returns at once: the bodies are created outside the world. Only the wrapper's slot +0x78
+// (0xa7f2d0: addToWorld(sys, 1, 0); [w+0x40] = 1) puts them in; slot +0x80 (0xa7f300) takes them
+// out and clears +0x40; the rebuild slot +0x38 (0xa7ed70) re-adds only when +0x40 is set.
+
+struct Wrapper {
+    double since;
+    bool fixed;
+};
+std::unordered_map<u64, Wrapper> g_wrap; // under g_mutex
+std::recursive_mutex g_wrap_call;        // held while the game's addToWorld runs on a wrapper
+u64 g_add_wrap = 0, g_wrap_vt = 0, g_sys_vt = 0;
+std::unordered_map<u64, double> g_fix_pass; // by world, under g_mutex
+std::map<std::string, u32> g_fixed_by_map;
+
+void OnWrapCtor(u64 w) {
+    std::scoped_lock lk{g_mutex};
+    g_wrap[w] = Wrapper{Now(), false};
+}
+
+void OnWrapDtor(u64 w) {
+    std::scoped_lock call{g_wrap_call};
+    std::scoped_lock lk{g_mutex};
+    g_wrap.erase(w);
+}
+
+// MSB object parts against the bodies in the world: the MSB-to-world offset is voted from the
+// parts and the in-world static / keyframed bodies (0.5 m bins), then every mod-only part gets
+// its nearest body (any motion, any state) and the vanilla parts' match rate is the baseline.
+const char* StateName(const World* w, u32 id, u64 shape);
+
+void PartsReport(double now) {
+    const auto pit = g_msb_parts.find(g_map);
+    if (pit == g_msb_parts.end() || pit->second.empty()) {
+        return;
+    }
+    const auto& parts = pit->second;
+    struct B {
+        float p[3];
+        u32 id, flags, filter, layer;
+        const char* state;
+    };
+    std::vector<B> bodies;
+    for (auto& [world, w] : g_worlds) {
+        u64 data;
+        s32 size;
+        if (now - w.last_call > 300.0 || !BodyArray(world, data, size)) {
+            continue;
+        }
+        const s32 n = std::min(size, 1 << 16);
+        std::vector<u8> all(size_t(n) * 0x90);
+        if (!SafeCopy(all.data(), data, all.size())) {
+            continue;
+        }
+        for (s32 id = 0; id < n; ++id) {
+            BodyBytes bb;
+            std::memcpy(bb.b, all.data() + size_t(id) * 0x90, 0x90);
+            if ((bb.Flags() & 7) == 0 || bb.Shape() == 0) {
+                continue;
+            }
+            bodies.push_back({{bb.Pos(0), bb.Pos(1), bb.Pos(2)},
+                              u32(id),
+                              bb.Flags(),
+                              bb.Filter(),
+                              bb.Layer(),
+                              StateName(&w, u32(id), bb.Shape())});
+        }
+    }
+    std::map<std::tuple<int, int, int>, int> votes;
+    size_t used = 0;
+    for (const auto& p : parts) {
+        if (p.mod_only || used >= 400) {
+            continue;
+        }
+        ++used;
+        for (const auto& b : bodies) {
+            if ((b.flags & 5) == 0 || std::strcmp(b.state, "in-world") != 0) {
+                continue;
+            }
+            ++votes[{int(std::lround((b.p[0] - p.pos[0]) * 2.f)),
+                     int(std::lround((b.p[1] - p.pos[1]) * 2.f)),
+                     int(std::lround((b.p[2] - p.pos[2]) * 2.f))}];
+        }
+    }
+    float off[3] = {};
+    int top = 0;
+    for (const auto& [k, v] : votes) {
+        if (v > top) {
+            top = v;
+            off[0] = std::get<0>(k) * 0.5f;
+            off[1] = std::get<1>(k) * 0.5f;
+            off[2] = std::get<2>(k) * 0.5f;
+        }
+    }
+    const auto nearest = [&](const MsbPart& p, float& d) -> const B* {
+        const B* best = nullptr;
+        d = 1e30f;
+        for (const auto& b : bodies) {
+            float e = 0.f;
+            for (int k = 0; k < 3; ++k) {
+                const float t = b.p[k] - p.pos[k] - off[k];
+                e += t * t;
+            }
+            if (e < d) {
+                d = e;
+                best = &b;
+            }
+        }
+        d = std::sqrt(d);
+        return best;
+    };
+    u32 vanilla = 0, vanilla_hit = 0, vanilla_hit_world = 0;
+    std::string mods;
+    u32 mod_n = 0, mod_hit_world = 0;
+    for (const auto& p : parts) {
+        float d;
+        const B* b = nearest(p, d);
+        const bool hit = b != nullptr && d < 0.6f;
+        const bool in_world = hit && std::strcmp(b->state, "in-world") == 0;
+        if (!p.mod_only) {
+            ++vanilla;
+            vanilla_hit += hit;
+            vanilla_hit_world += in_world;
+            continue;
+        }
+        ++mod_n;
+        mod_hit_world += in_world;
+        if (mod_n > 60) {
+            continue;
+        }
+        mods += fmt::format(
+            "{}{} ({:.1f}, {:.1f}, {:.1f}): {}", mods.empty() ? "" : "; ", p.name, p.pos[0],
+            p.pos[1], p.pos[2],
+            b == nullptr ? std::string("no body")
+                         : fmt::format("nearest body #{} {} {} layer {} filter {:#x} at {:.2f} m",
+                                       b->id, Motion(b->flags), b->state, b->layer, b->filter, d));
+    }
+    LOG_INFO(Core,
+             "[objcol] map {} visit #{} (+{:.0f} s): MSB object parts {} | MSB->world offset "
+             "({:.1f}, {:.1f}, {:.1f}) ({} votes) | parts in the vanilla MSB with a body within "
+             "0.6 m: {} of {} ({} in the world) | mod-only parts {} ({} with an in-world body "
+             "within 0.6 m; added by BB_OBJCOL_FIX so far {}): {}",
+             g_map, g_map_visit, now - g_map_open, parts.size(), off[0], off[1], off[2], top,
+             vanilla_hit, vanilla, vanilla_hit_world, mod_n, mod_hit_world,
+             g_fixed_by_map.contains(g_map) ? g_fixed_by_map[g_map] : 0u,
+             mods.empty() ? "none"
+             : mod_n > 60 ? mods + " (more not listed)"
+                          : mods);
+}
+
+// BB_OBJCOL_FIX: for the parts of a served MSB that the vanilla MSB of the same map does not
+// have (found per map from the two files, no list of names), an intact object physics system
+// (static or keyframed bodies, at most 8; fragment systems are dynamic) that the game built
+// but never added, never removed, whose wrapper's "in world" byte is 0, at the part's position
+// (MSB->world offset voted from the vanilla parts) is added the way a map reload adds it: the
+// game's own wrapper addToWorld 0xa7f2d0, on the game thread, at the entry of the physics command
+// flush of the system's own world (the flush adds bodies to that world itself at +0x242). Only
+// wrappers whose bodies were all never added (or added with mode 0) qualify, and the offset vote
+// runs only when such a wrapper exists, for the maps opened in the last 90 s.
+// Vanilla parts are never touched; a mod object that was added and later broken or removed is
+// never re-added.
+void FixPass(double now, u64 world) {
+    if (g_add_wrap == 0) {
+        return;
+    }
+    std::vector<std::pair<u64, std::string>> todo;
+    {
+        std::scoped_lock lk{g_mutex};
+        double& last = g_fix_pass[world];
+        if (now - last < 5.0) {
+            return;
+        }
+        last = now;
+        std::set<std::string> maps;
+        for (const auto& pc : g_pending_cmp) {
+            if (now - pc.open < 180.0) {
+                maps.insert(pc.map);
+            }
+        }
+        if (maps.empty() || g_wrap.empty()) {
+            return;
+        }
+        // Wrappers of this flush's world that were built, never added and never removed (system
+        // and every body), intact (static / keyframed, at most 8 bodies).
+        struct Cand {
+            u64 w;
+            SysRec r;
+            Wrapper* rec;
+        };
+        std::vector<Cand> cands;
+        const auto wit = g_worlds.find(world);
+        u64 data = 0;
+        s32 size = 0;
+        if (!BodyArray(world, data, size)) {
+            return;
+        }
+        for (auto& [w, rec] : g_wrap) {
+            if (rec.fixed || now - rec.since < 3.0) {
+                continue;
+            }
+            u64 vt = 0, sys = 0, svt = 0;
+            u8 in = 1;
+            if (!Rd(w, vt) || vt != g_wrap_vt || !Rd(w + 0x40, in) || in != 0 ||
+                !Rd(w + 0x18, sys) || !IsPtr(sys) || !Rd(sys, svt) || svt != g_sys_vt) {
+                continue;
+            }
+            u8 h[0x30];
+            if (!SafeCopy(h, sys, sizeof(h)) || Le64(h + 0x18) != world) {
+                continue;
+            }
+            if (const auto it = g_systems.find(sys);
+                it != g_systems.end() && (it->second.adds || it->second.removes)) {
+                continue;
+            }
+            SysRec r;
+            SysInfo(sys, r);
+            if (r.n == 0 || r.n > 8 || (r.flags & 5) == 0) {
+                continue;
+            }
+            u32 ids[8];
+            bool fresh = SafeCopy(ids, Le64(h + 0x20), r.n * 4);
+            for (u32 k = 0; k < r.n && fresh; ++k) {
+                BodyBytes bb;
+                fresh = ids[k] < u32(size) && SafeCopy(bb.b, data + u64(ids[k]) * 0x90, 0x90);
+                if (fresh && wit != g_worlds.end()) {
+                    const char* st = StateName(&wit->second, ids[k], bb.Shape());
+                    fresh =
+                        std::strcmp(st, "never-added") == 0 || std::strcmp(st, "add-ignored") == 0;
+                }
+            }
+            if (fresh) {
+                cands.push_back({w, r, &rec});
+            }
+        }
+        if (cands.empty()) {
+            return;
+        }
+        const auto inworld = Snapshot();
+        for (const auto& [map, parts] : g_msb_parts) {
+            if (!maps.contains(map)) {
+                continue;
+            }
+            std::vector<const MsbPart*> mods;
+            for (const auto& p : parts) {
+                if (p.mod_only) {
+                    mods.push_back(&p);
+                }
+            }
+            if (mods.empty()) {
+                continue;
+            }
+            std::unordered_map<u64, int> votes;
+            size_t used = 0;
+            for (const auto& p : parts) {
+                if (p.mod_only || used >= 400) {
+                    continue;
+                }
+                ++used;
+                for (const auto& b : inworld) {
+                    u64 key = 0;
+                    for (int k = 0; k < 3; ++k) {
+                        key = (key << 21) |
+                              (u64(u32(std::lround((b.p[k] - p.pos[k]) * 2.f)) + (1u << 20)) &
+                               0x1fffff);
+                    }
+                    ++votes[key];
+                }
+            }
+            float off[3] = {};
+            int top = 0;
+            for (const auto& [k, v] : votes) {
+                if (v > top) {
+                    top = v;
+                    for (int i = 0; i < 3; ++i) {
+                        off[i] = float(s64((k >> (42 - 21 * i)) & 0x1fffff) - (1 << 20)) * 0.5f;
+                    }
+                }
+            }
+            if (top < 20) {
+                continue; // offset not established
+            }
+            for (auto& c : cands) {
+                if (c.rec->fixed) {
+                    continue;
+                }
+                for (const MsbPart* p : mods) {
+                    float d2 = 0.f;
+                    for (int k = 0; k < 3; ++k) {
+                        const float t = c.r.pos[k] - p->pos[k] - off[k];
+                        d2 += t * t;
+                    }
+                    if (d2 < 0.36f) {
+                        todo.emplace_back(c.w, fmt::format("{} {} at ({:.1f}, {:.1f}, {:.1f}) {} "
+                                                           "bodies {}",
+                                                           map, p->name, c.r.pos[0], c.r.pos[1],
+                                                           c.r.pos[2], c.r.n, Motion(c.r.flags)));
+                        c.rec->fixed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (todo.empty()) {
+        return;
+    }
+    using AddFn = void(PS4_SYSV_ABI*)(u64);
+    u32 done = 0;
+    std::string list;
+    for (const auto& [w, what] : todo) {
+        std::scoped_lock call{g_wrap_call};
+        {
+            std::scoped_lock lk{g_mutex};
+            u64 vt = 0;
+            u8 in = 1;
+            if (!g_wrap.contains(w) || !Rd(w, vt) || vt != g_wrap_vt || !Rd(w + 0x40, in) ||
+                in != 0) {
+                continue;
+            }
+            ++g_fixed_by_map[what.substr(0, what.find(' '))];
+        }
+        reinterpret_cast<AddFn>(g_add_wrap)(w);
+        ++done;
+        list += (list.empty() ? "" : "; ") + what;
+    }
+    LOG_INFO(Core,
+             "[objcol-fix] {} mod-added object(s) whose collision the game built but never added "
+             "now added with the game's wrapper addToWorld eboot+{:#x}: {}",
+             done, g_add_wrap - g_eboot, list.empty() ? "none" : list);
+}
+
 void MapTick(double now) {
     if (now - g_map_tick < 1.0) {
         return;
@@ -1141,14 +1750,30 @@ void MapTick(double now) {
                 d.t, now - d.t, g_map, g_first_step < 0.0 ? "not started" : "running");
         }
     }
-    if (g_map_open >= 0.0 && !g_cmp30 && now - g_map_open >= 30.0) {
-        g_cmp30 = true;
-        CompareMap(now);
+    // Every map open gets its +30 s and +90 s reports, also when another map block opened since
+    // (Yharnam opens m24_01 and m27_00 within seconds of each other).
+    for (auto& pc : g_pending_cmp) {
+        for (int stage = 0; stage < 2; ++stage) {
+            const double at = stage == 0 ? 30.0 : 90.0;
+            if (pc.done[stage] || now - pc.open < at) {
+                continue;
+            }
+            pc.done[stage] = true;
+            const std::string map = g_map;
+            const int visit = g_map_visit;
+            const double open = g_map_open;
+            g_map = pc.map;
+            g_map_visit = pc.visit;
+            g_map_open = pc.open;
+            CompareMap(now);
+            SystemsReport(now);
+            PartsReport(now);
+            g_map = map;
+            g_map_visit = visit;
+            g_map_open = open;
+        }
     }
-    if (g_map_open >= 0.0 && !g_cmp90 && now - g_map_open >= 90.0) {
-        g_cmp90 = true;
-        CompareMap(now);
-    }
+    std::erase_if(g_pending_cmp, [](const PendingCmp& pc) { return pc.done[0] && pc.done[1]; });
 }
 
 void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
@@ -1486,7 +2111,16 @@ void NearPlayer(const ProxyBytes& pb, double now) {
         SafeCopy(q, world + 0x180, sizeof(q)) && q[8] > 0.f && q[9] > 0.f && q[10] > 0.f;
     const auto wit = g_worlds.find(world);
     const World* w = wit == g_worlds.end() ? nullptr : &wit->second;
-    const float P[3] = {pb.Pos(0), pb.Pos(1), pb.Pos(2)};
+    // Field run 2: proxy+0x40 reads (1, 0, 0) for every character; the position is the
+    // translation of the proxy's own body (+0x30).
+    float P[3] = {pb.Pos(0), pb.Pos(1), pb.Pos(2)};
+    if (pb.BodyId() >= 0 && pb.BodyId() < n) {
+        BodyBytes own;
+        std::memcpy(own.b, all.data() + size_t(pb.BodyId()) * 0x90, 0x90);
+        for (int k = 0; k < 3; ++k) {
+            P[k] = own.Pos(k);
+        }
+    }
     struct Near {
         float d;
         std::string text;
@@ -1669,6 +2303,48 @@ void PS4_SYSV_ABI HookProxy(const u64* regs) {
     GuardedProxy(regs);
 }
 
+void PS4_SYSV_ABI HookSysAdd(const u64* regs) {
+    try {
+        OnSysAdd(regs[5], s32(regs[6]));
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookSysRemove(const u64* regs) {
+    try {
+        OnSysRemove(regs[5]);
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookRebuild(const u64* regs) {
+    try {
+        OnRebuild(regs[5]);
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookWrapCtor(const u64* regs) {
+    try {
+        OnWrapCtor(regs[5]);
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookWrapDtor(const u64* regs) {
+    try {
+        OnWrapDtor(regs[5]);
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookFlush(const u64* regs) {
+    try {
+        OnFlush(regs[5]);
+    } catch (...) {
+    }
+}
+
 // ---------------------------------------------------------------- detours
 
 // addBodies: prologue (20 bytes relocated), argument spills, test edx / test ecx, the
@@ -1701,6 +2377,58 @@ constexpr int SigProxy[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41
                             0xff, 0xff, 0x49, 0x89, 0xfc, 0x48, 0x8b, 0x05, W,    W,    W,    W,
                             0x48, 0x8b, 0x00, 0x48, 0x89, 0x45, 0xd0};
 constexpr u32 ProxyPrologue = 20;
+
+// hknpPhysicsSystem::addToWorld (14 relocated) / removeFromWorld (18 relocated).
+constexpr int SigSysAdd[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                             0x41, 0x54, 0x53, 0x50, 0x41, 0x89, 0xd7, 0x89, 0x75, 0xd4,
+                             0x49, 0x89, 0xfd, 0x45, 0x8b, 0x75, 0x28, 0x31, 0xdb, 0x41,
+                             0xbc, 0x00, 0x00, 0x00, 0x00, 0x45, 0x85, 0xf6, 0x0f, 0x84};
+constexpr u32 SysAddPrologue = 14;
+constexpr int SigSysRemove[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                0x41, 0x54, 0x53, 0x49, 0x89, 0xff, 0x45, 0x8b,
+                                0x67, 0x28, 0x31, 0xdb, 0x45, 0x85, 0xe4, 0x74};
+constexpr u32 SysRemovePrologue = 18;
+// The game's physics-system wrapper: rebuild (slot +0x38, 17 relocated), addToWorld (+0x78),
+// removeFromWorld (+0x80); vtable 0x52978a0 in 1.09.
+constexpr int SigRebuild[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec,
+    0x38, 0xc5, 0xfa, 0x11, 0x45, 0xac, 0x49, 0x89, 0xfd, 0x48, 0x8b, 0x05, W,    W,    W,    W,
+    0x48, 0x8b, 0x00, 0x48, 0x89, 0x45, 0xd0, 0x48, 0xc7, 0x45, 0xc0, 0x00, 0x00, 0x00, 0x00};
+constexpr u32 RebuildPrologue = 17;
+constexpr int SigAddWrap[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb,
+                              0x48, 0x8b, 0x7b, 0x18, 0xbe, 0x01, 0x00, 0x00, 0x00,
+                              0x31, 0xd2, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, W,
+                              W,    W,    W,    0xc6, 0x43, 0x40, 0x01};
+constexpr int SigRemoveWrap[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b,
+                                 0x7b, 0x18, 0xe8, W,    W,    W,    W,    0xc6, 0x43, 0x40, 0x00};
+constexpr u64 WrapperVtable = 0x52978a0;
+constexpr u64 SystemVtable = 0x5261c40; // the game's hknpPhysicsSystem subclass (0x6e8700)
+// Wrapper ctor 0xa7d4a0 (15 relocated; lea of the vtable at +30) and dtor 0xa7d930 (14
+// relocated; lea of the vtable at +14).
+constexpr int SigWrapCtor[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x10,
+    0x49, 0x89, 0xd6, 0x49, 0x89, 0xfc, 0x41, 0xc7, 0x44, 0x24, 0x08, 0x01, 0x00, 0xff, 0xff,
+    0x48, 0x8d, 0x05, W,    W,    W,    W,    0x48, 0x83, 0xc0, 0x10, 0x49, 0x89, 0x04, 0x24};
+constexpr u32 WrapCtorPrologue = 15;
+constexpr int SigWrapDtor[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53,
+                               0x49, 0x89, 0xfe, 0x48, 0x8d, 0x05, W,    W,    W,    W,    0x48,
+                               0x83, 0xc0, 0x10, 0x49, 0x89, 0x06, 0x49, 0x8b, 0x7e, 0x18};
+constexpr u32 WrapDtorPrologue = 14;
+// The game's physics command flush (20 relocated); its addBodies call at +0x242.
+constexpr int SigFlush[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+                            0x53, 0x48, 0x81, 0xec, 0xe8, 0x00, 0x00, 0x00, 0x49, 0x89, 0xfc, 0x48,
+                            0x8b, 0x1d, W,    W,    W,    W,    0x48, 0x8b, 0x03, 0x48, 0x89, 0x45,
+                            0xd0, 0x49, 0x83, 0x7c, 0x24, 0x08, 0x00, 0x0f, 0x84, W,    W,    W,
+                            W,    0x48, 0xc7, 0x85, 0xf8, 0xfe, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
+constexpr u32 FlushPrologue = 20, FlushAddCall = 0x242;
+s64 CallTarget(const u8* img, u64 at) {
+    if (img[at] != 0xe8) {
+        return -1;
+    }
+    s32 d;
+    std::memcpy(&d, img + at + 1, 4);
+    return s64(at) + 5 + d;
+}
 
 // lea rax,[rip+d] within [from, to) of the image whose target is the given string.
 bool LeaToString(const u8* img, u64 size, u64 from, u64 to, const char* str) {
@@ -1836,6 +2564,7 @@ void FileOpened(const std::string& p, const char* host, u64 size) {
         g_map_open = Now();
         g_cmp30 = g_cmp90 = false;
         g_map_visit = ++g_visits[g_map];
+        g_pending_cmp.push_back({g_map, g_map_visit, g_map_open, {false, false}});
         u64 pending = 0, in_world = 0;
         for (const auto& [world, w] : g_worlds) {
             pending += w.deferred.size();
@@ -1974,6 +2703,83 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
              "map' (per map), '[objcol] player' (position and bodies within 3 m)",
              *add, *rem, player, WorldChrManVaddr,
              g_wcm ? "validated" : "not validated (no player position)");
+
+    // Object physics systems, the game's wrapper and its command flush (every relocated byte and
+    // every call target compared first; any mismatch: that part is not hooked).
+    u8* cave_b = static_cast<u8*>(AllocExec(4096));
+    u8* next = cave_b;
+    const auto place = [&](const std::vector<u8>& c) {
+        u8* at = next;
+        std::memcpy(at, c.data(), c.size());
+        next += (c.size() + 15) & ~size_t(15);
+        return at;
+    };
+    const auto hook = [&](u64 off, u64 host, u32 len) {
+        u8* at = reinterpret_cast<u8*>(eboot_base + off);
+        Detour(at, place(BuildCave(host, at, len, reinterpret_cast<u64>(at + len))));
+    };
+    const auto sys_add = Find(img, code, SigSysAdd, std::size(SigSysAdd));
+    const auto sys_rem = Find(img, code, SigSysRemove, std::size(SigSysRemove));
+    const auto rebuild = Find(img, code, SigRebuild, std::size(SigRebuild));
+    const auto add_wrap = Find(img, code, SigAddWrap, std::size(SigAddWrap));
+    const auto rem_wrap = Find(img, code, SigRemoveWrap, std::size(SigRemoveWrap));
+    const auto flush = Find(img, code, SigFlush, std::size(SigFlush));
+    // Called before the relocations: a slot holds 0 (RELA), the offset or the address.
+    const auto slot_is = [&](u32 off, std::optional<u64> fn) {
+        u64 v = 1;
+        if (fn && WrapperVtable + off + 8 <= image_size) {
+            std::memcpy(&v, img + WrapperVtable + off, 8);
+        }
+        return fn && (v == 0 || v == *fn || v == eboot_base + *fn);
+    };
+    std::string objs;
+    const bool sys_ok = cave_b && sys_add && sys_rem && rebuild && add_wrap && rem_wrap &&
+                        CallTarget(img, *add_wrap + 25) == s64(*sys_add) &&
+                        CallTarget(img, *rem_wrap + 13) == s64(*sys_rem) &&
+                        slot_is(0x38, rebuild) && slot_is(0x78, add_wrap) &&
+                        slot_is(0x80, rem_wrap);
+    if (sys_ok) {
+        hook(*sys_add, reinterpret_cast<u64>(&HookSysAdd), SysAddPrologue);
+        hook(*sys_rem, reinterpret_cast<u64>(&HookSysRemove), SysRemovePrologue);
+        hook(*rebuild, reinterpret_cast<u64>(&HookRebuild), RebuildPrologue);
+        objs = fmt::format("hknpPhysicsSystem::addToWorld eboot+{:#x} / removeFromWorld "
+                           "eboot+{:#x}, wrapper rebuild eboot+{:#x} hooked",
+                           *sys_add, *sys_rem, *rebuild);
+    } else {
+        objs = "physics-system hooks off (signature, call target or vtable check failed)";
+    }
+    const bool flush_ok = cave_b && flush && CallTarget(img, *flush + FlushAddCall) == s64(*add);
+    if (flush_ok) {
+        hook(*flush, reinterpret_cast<u64>(&HookFlush), FlushPrologue);
+    }
+    // Wrapper ctor (sets the vtable 0x5297890 + 0x10) and dtor (0xa7d930, slot 0's callee).
+    const auto wctor = Find(img, code, SigWrapCtor, std::size(SigWrapCtor));
+    const auto wdtor = Find(img, code, SigWrapDtor, std::size(SigWrapDtor));
+    const auto lea_vt = [&](std::optional<u64> f, u32 at) {
+        if (!f || img[*f + at] != 0x48 || img[*f + at + 1] != 0x8d) {
+            return false;
+        }
+        s32 d;
+        std::memcpy(&d, img + *f + at + 3, 4);
+        return s64(*f) + at + 7 + d == s64(WrapperVtable - 0x10);
+    };
+    const bool fix_ok = sys_ok && flush_ok && lea_vt(wctor, 30) && lea_vt(wdtor, 14) &&
+                        slot_is(0x00, wdtor) && CallTarget(img, *add_wrap + 25) == s64(*sys_add);
+    if (fix_ok) {
+        hook(*wctor, reinterpret_cast<u64>(&HookWrapCtor), WrapCtorPrologue);
+        hook(*wdtor, reinterpret_cast<u64>(&HookWrapDtor), WrapDtorPrologue);
+        g_add_wrap = eboot_base + *add_wrap;
+        g_wrap_vt = eboot_base + WrapperVtable;
+        g_sys_vt = eboot_base + SystemVtable;
+    }
+    LOG_INFO(Core, "[objcol] {}; physics command flush {}; wrapper ctor/dtor {}; BB_OBJCOL_FIX {}",
+             objs, flush_ok ? fmt::format("eboot+{:#x} hooked", *flush) : std::string("not hooked"),
+             fix_ok ? fmt::format("eboot+{:#x} / eboot+{:#x} hooked", *wctor, *wdtor)
+                    : std::string("checks failed"),
+             g_fix ? (fix_ok ? "on (mod-added objects' built-but-never-added collision is added "
+                               "with the game's wrapper addToWorld)"
+                             : "requested but a check failed: off")
+                   : "off");
 }
 
 } // namespace BB::ObjCol
