@@ -234,6 +234,10 @@ struct State {
     bool cur_additive = false;     // bb-mv-fire: the game's blend adds (dst One)
     u32 spark_word_add = 0;        // bb-mv-fire: threshold for additive draws
     u64 sec_add_draws = 0, sec_add_vec = 0, sec_ui_skip = 0, sec_composite = 0;
+    // bb-mv-fire3: class 6 (mark-only composites) is opt-in, BB_FG_SPARKS_COMPOSITE=1. On
+    // 3a8f4fe it marked every effect draw without a camera block (the additive light volumes
+    // 0x8747a367 / 0x41ae600f, 178-231/frame): large areas taken from the real frame (aliasing).
+    bool spark_composite = false;
     std::unordered_map<u64, std::array<u32, 2>> skipped_vs; // vs -> no motion key, write mask 0
     u64 sec_solid_draws = 0, sec_solid_vec = 0;
     u32 spark_word = 0;      // push word: threshold (1/4096) | bit 16: contribution x src alpha
@@ -699,6 +703,10 @@ bool Init(const Vulkan::Instance& instance) {
         // does) above which a pixel is "spark" (default 0.25, scene-linear units).
         g.sparks = g.velocity && BB::MvEngine::SparksEnabled();
         {
+            const char* cv = std::getenv("BB_FG_SPARKS_COMPOSITE");
+            g.spark_composite = g.sparks && cv != nullptr && cv[0] == '1';
+        }
+        {
             const char* lv = std::getenv("BB_FG_SPARKS_LUM");
             float lum = 0.25f;
             if (lv != nullptr && lv[0] != 0) {
@@ -855,7 +863,7 @@ Kind WantImpl(const AmdGpu::Regs& regs, u32& why) {
     // bb-mv-fire: the game composites its offscreen effect buffer (fire, flames: [sparks-fire]
     // listed vs 0x81d5812bbeb, 1/frame, motion key with write mask 0) onto the scene with a
     // screen-space blended draw: Effect too, marked by brightness only (class 6, no vector).
-    if (g.sparks && g.fog && regs.IsClipDisabled() && regs.color_buffers[0] &&
+    if (g.sparks && g.fog && g.spark_composite && regs.IsClipDisabled() && regs.color_buffers[0] &&
         regs.color_target_mask.GetMask(0) && effect_blend) {
         return Kind::Effect;
     }
@@ -2078,7 +2086,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         }
     } else if (ok && camera && g.history) {
         ++g.sec_overflow;
-    } else if (effect && !camera && g.history) {
+    } else if (effect && !camera && g.history && g.spark_composite) {
         // bb-mv-fire: an effect draw without a camera block (screen-space composite of the
         // game's effect buffer): the zero entry (current data, no motion) and class 6 where it
         // adds something bright: HUD-less marking only, the vector behind stays.
