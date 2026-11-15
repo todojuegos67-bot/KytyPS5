@@ -778,6 +778,13 @@ void BufferCache::CollectUploads(Buffer& buffer, uint64_t vaddr, uint64_t size, 
 		    // pool, session 60).
 		    if (source != nullptr && batch.total_size <= m_staging_buffer.Size() / 2) {
 			    *source = UploadCopies(batch.uploads, batch.copies, batch.total_size);
+		    } else if (source != nullptr && is_written && !buffer.IsSparse()) {
+			    // A written range's pages are marked GPU-modified (protected) right after this: read them now, or the
+			    // reads after the walk fault and the fault reads back the stale GPU copy over the CPU's data.
+			    // shortcut: a sparse buffer still reads after the walk (its pages are backed there), when one is seen.
+			    UploadInParts(batch);
+			    batch.uploads.clear();
+			    batch.copies.clear();
 		    }
 	    });
 	// Never data onto the zero page: back the copies' pages first (their fills are recorded before the copy below).
