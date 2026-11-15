@@ -404,10 +404,23 @@ int ModelFor(const std::string& id) {
 
 // ---------------------------------------------------------------- file side worker
 
+struct SnapBody {
+    float p[3];
+    u64 vt;
+    u32 flags, filter, id;
+    u32 layer;
+};
+
 struct Job {
     std::string guest;
     int model;
     std::string host; // set: MSB comparison job
+    // set: boot/reload body comparison (file I/O off the hooked guest threads)
+    std::vector<SnapBody> snap;
+    std::string map;
+    int visit = 0;
+    double since = 0.0;
+    bool compare = false;
 };
 std::mutex g_job_mutex;
 std::condition_variable g_job_cv;
@@ -630,6 +643,8 @@ void AnalyseMsb(const Job& job) {
     LOG_INFO(Core, "{}", text);
 }
 
+void CompareJob(const Job& job);
+
 void Worker() {
     for (;;) {
         Job job;
@@ -640,7 +655,9 @@ void Worker() {
             g_jobs.pop_front();
         }
         try {
-            if (job.host.empty()) {
+            if (job.compare) {
+                CompareJob(job);
+            } else if (job.host.empty()) {
                 Analyse(job);
             } else {
                 AnalyseMsb(job);
@@ -877,18 +894,12 @@ void Summary(bool force) {
 // for that map in any session), by shape class and position: a cold boot that loses object
 // collision shows the missing bodies against a session where they were there.
 
-struct SnapBody {
-    float p[3];
-    u64 vt;
-    u32 flags, filter, id;
-    u32 layer;
-};
-
 double g_map_open = -1.0, g_map_tick = 0.0;
 int g_map_visit = 0;
 bool g_cmp30 = false, g_cmp90 = false;
 std::map<std::string, int> g_visits;
 u32 g_deferred_lines = 0;
+u32 g_world_lines = 0;
 
 std::vector<SnapBody> Snapshot() {
     std::vector<SnapBody> out;
@@ -926,9 +937,15 @@ std::vector<SnapBody> Snapshot() {
     return out;
 }
 
-std::filesystem::path SnapPath(const char* kind) {
+std::filesystem::path SnapPath(const char* kind, const std::string& map) {
+    std::string name = map;
+    for (char& c : name) {
+        if (!std::isalnum(u8(c)) && c != '_' && c != '-') {
+            c = '_';
+        }
+    }
     return Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
-           fmt::format("objcol_{}_{}.txt", kind, g_map);
+           fmt::format("objcol_{}_{}.txt", kind, name);
 }
 
 void WriteSnap(const std::filesystem::path& path, const std::vector<SnapBody>& snap,
@@ -946,8 +963,11 @@ bool ReadSnap(const std::filesystem::path& path, std::vector<SnapBody>& snap, st
     if (!f || !std::getline(f, header)) {
         return false;
     }
+    if (header.size() > 200) {
+        header.resize(200);
+    }
     std::string line;
-    while (std::getline(f, line)) {
+    while (snap.size() < (1u << 17) && std::getline(f, line)) {
         SnapBody b{};
         unsigned long long vt = 0;
         unsigned flags = 0, layer = 0, filter = 0, id = 0;
@@ -994,10 +1014,20 @@ std::array<float, 3> CommonOffset(const std::vector<SnapBody>& a, const std::vec
 std::vector<const SnapBody*> Unmatched(const std::vector<SnapBody>& a,
                                        const std::vector<SnapBody>& b,
                                        const std::array<float, 3>& off) {
+    std::unordered_map<u64, std::vector<const SnapBody*>> by_shape;
+    for (const auto& y : b) {
+        by_shape[y.vt].push_back(&y);
+    }
     std::vector<const SnapBody*> out;
     for (const auto& x : a) {
         bool hit = false;
-        for (const auto& y : b) {
+        const auto it = by_shape.find(x.vt);
+        if (it == by_shape.end()) {
+            out.push_back(&x);
+            continue;
+        }
+        for (const SnapBody* yp : it->second) {
+            const auto& y = *yp;
             const float dx = x.p[0] - y.p[0] - off[0], dy = x.p[1] - y.p[1] - off[1],
                         dz = x.p[2] - y.p[2] - off[2];
             if (x.vt == y.vt && dx * dx + dy * dy + dz * dz < 0.36f) {
@@ -1026,16 +1056,37 @@ std::string ListSnap(const std::vector<const SnapBody*>& v, size_t max) {
     return s.empty() ? "none" : s;
 }
 
+// Under g_mutex on a hooked guest thread: only the snapshot; the files and the comparison run on
+// the worker.
 void CompareMap(double now) {
-    const auto cur = Snapshot();
+    Job job;
+    job.compare = true;
+    job.snap = Snapshot();
+    job.map = g_map;
+    job.visit = g_map_visit;
+    job.since = now - g_map_open;
+    std::scoped_lock jl{g_job_mutex};
+    if (g_jobs.size() >= 64) {
+        return;
+    }
+    g_jobs.push_back(std::move(job));
+    if (!g_worker_started) {
+        g_worker_started = true;
+        std::thread(Worker).detach();
+    }
+    g_job_cv.notify_one();
+}
+
+void CompareJob(const Job& job) {
+    const auto& cur = job.snap;
     const std::string header =
-        fmt::format("map {} session {} visit {} at +{:.0f} s: {} static/keyframed bodies", g_map,
-                    std::time(nullptr), g_map_visit, now - g_map_open, cur.size());
+        fmt::format("map {} session {} visit {} at +{:.0f} s: {} static/keyframed bodies", job.map,
+                    std::time(nullptr), job.visit, job.since, cur.size());
     try {
-        WriteSnap(SnapPath("last"), cur, header);
+        WriteSnap(SnapPath("last", job.map), cur, header);
         std::vector<SnapBody> ref;
         std::string ref_header;
-        const bool have_ref = ReadSnap(SnapPath("ref"), ref, ref_header);
+        const bool have_ref = ReadSnap(SnapPath("ref", job.map), ref, ref_header);
         if (have_ref) {
             const auto off = CommonOffset(ref, cur);
             const auto missing = Unmatched(ref, cur, off);
@@ -1044,17 +1095,17 @@ void CompareMap(double now) {
                      "[objcol] map {} visit #{} (+{:.0f} s): {} static/keyframed bodies in the "
                      "world vs {} in the reference ({}), world offset reference-now ({:.1f}, "
                      "{:.1f}, {:.1f}) | MISSING now {} (reference positions): {} | only now {}: {}",
-                     g_map, g_map_visit, now - g_map_open, cur.size(), ref.size(), ref_header,
-                     off[0], off[1], off[2], missing.size(), ListSnap(missing, 40), extra.size(),
+                     job.map, job.visit, job.since, cur.size(), ref.size(), ref_header, off[0],
+                     off[1], off[2], missing.size(), ListSnap(missing, 40), extra.size(),
                      ListSnap(extra, 20));
         } else {
             LOG_INFO(Core,
                      "[objcol] map {} visit #{} (+{:.0f} s): {} static/keyframed bodies in the "
                      "world; first reference written",
-                     g_map, g_map_visit, now - g_map_open, cur.size());
+                     job.map, job.visit, job.since, cur.size());
         }
         if (!have_ref || cur.size() > ref.size()) {
-            WriteSnap(SnapPath("ref"), cur, header);
+            WriteSnap(SnapPath("ref", job.map), cur, header);
         }
     } catch (...) {
     }
@@ -1105,7 +1156,8 @@ void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
         return;
     }
     std::scoped_lock lk{g_mutex};
-    if (!g_worlds.contains(world)) {
+    if (!g_worlds.contains(world) && g_world_lines < 64) {
+        ++g_world_lines;
         LOG_INFO(Core,
                  "[objcol] world {:#x} first addBodies at {:.2f} s (mode {}, {} bodies, by "
                  "eboot+{:#x}), map {}, character steps {}",
