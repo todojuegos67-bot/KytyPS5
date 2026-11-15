@@ -867,6 +867,8 @@ double g_player_tick = 0.0, g_player_search = -100.0, g_player_line = -100.0, g_
 float g_last_pos[3] = {1e9f, 1e9f, 1e9f};
 std::string g_last_near;
 bool g_proxy_logged = false;
+u32 g_player_lines = 0;
+constexpr u32 MaxPlayerLines = 6000;
 u64 st_proxy_calls = 0;
 u32 g_search_fails = 0;
 
@@ -896,8 +898,10 @@ bool SearchPath(u64 root, u32 lo, u32 hi, std::vector<u32>& path, u64& found) {
     std::deque<Node> q;
     std::unordered_set<u64> seen{root};
     q.push_back({root, {}});
+    constexpr u32 Budget = 12000;
+    u32 queued = 1;
     std::vector<u8> buf(hi - lo > 0x400 ? hi - lo : 0x400);
-    for (u32 budget = 12000; !q.empty() && budget > 0; --budget) {
+    for (u32 budget = Budget; !q.empty() && budget > 0; --budget) {
         Node node = std::move(q.front());
         q.pop_front();
         const u32 first = node.path.empty() ? lo : 0;
@@ -919,7 +923,9 @@ bool SearchPath(u64 root, u32 lo, u32 hi, std::vector<u32>& path, u64& found) {
                 found = v;
                 return true;
             }
-            if (node.path.size() < 3 && seen.insert(v).second) {
+            // Breadth first: a node queued past the budget would never be read.
+            if (node.path.size() < 3 && queued < Budget && seen.insert(v).second) {
+                ++queued;
                 auto next = node.path;
                 next.push_back(first + off);
                 q.push_back({v, std::move(next)});
@@ -1057,7 +1063,7 @@ void NearPlayer(const ProxyBytes& pb, double now) {
             d2 += (P[k] - c) * (P[k] - c);
         }
         const float d = std::sqrt(d2);
-        if (d > (box ? 3.f : 4.f)) {
+        if (!(d <= (box ? 3.f : 4.f))) { // NaN positions too
             continue;
         }
         const bool inside = box && d == 0.f;
@@ -1087,6 +1093,13 @@ void NearPlayer(const ProxyBytes& pb, double now) {
     moved = std::sqrt(moved);
     if (key == g_last_near && !(moved > 1.f && now - g_player_line >= 5.0)) {
         return;
+    }
+    if (g_player_lines >= MaxPlayerLines) {
+        return;
+    }
+    if (++g_player_lines == MaxPlayerLines) {
+        LOG_INFO(Core, "[objcol] player: line cap ({}) reached, no further player lines",
+                 MaxPlayerLines);
     }
     g_last_near = key;
     g_player_line = now;
@@ -1128,7 +1141,8 @@ void PlayerTick(double now) {
         }
     }
     if (proxy == 0) {
-        if (now - g_proxy_list >= 10.0) {
+        if (now - g_proxy_list >= 10.0 && g_player_lines < MaxPlayerLines) {
+            ++g_player_lines;
             g_proxy_list = now;
             std::string list;
             int k = 0;
@@ -1163,7 +1177,11 @@ void OnProxy(u64 proxy) {
     if (!IsPtr(proxy)) {
         return;
     }
-    std::scoped_lock lk{g_mutex};
+    // Never waits: a physics thread skips this call while the census or a search holds the lock.
+    std::unique_lock lk{g_mutex, std::try_to_lock};
+    if (!lk.owns_lock()) {
+        return;
+    }
     ++st_proxy_calls;
     const double now = Now();
     g_proxies[proxy] = now;
@@ -1174,11 +1192,15 @@ void OnProxy(u64 proxy) {
     PlayerTick(now);
 }
 
-void PS4_SYSV_ABI HookProxy(const u64* regs) {
+void GuardedProxy(const u64* regs) {
     try {
-        OnProxy(regs[5]);
+        OnProxy(regs[5]); // rdi: the proxy
     } catch (...) {
     }
+}
+
+void PS4_SYSV_ABI HookProxy(const u64* regs) {
+    GuardedProxy(regs);
 }
 
 // ---------------------------------------------------------------- detours

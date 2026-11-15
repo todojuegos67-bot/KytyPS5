@@ -24,6 +24,7 @@
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "core/file_sys/devices/console_device.h"
@@ -358,10 +359,21 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
 
     file->is_opened = true;
     if (BB::ObjCol::Enabled() && file->type == Core::FileSys::FileType::Regular) {
-        const auto host = file->handle ? file->handle->GetHostPath() : std::nullopt;
-        BB::ObjCol::OnGuestFileOpen(file->m_guest_name.c_str(),
-                                    host ? host->string().c_str() : nullptr,
-                                    file->handle ? file->handle->Size() : 0);
+        // Diagnostics only: nothing may throw out of the open() HLE (path::string() can throw
+        // on Windows for paths outside the ANSI code page).
+        try {
+            std::string host;
+            u64 size = 0;
+            if (file->handle) {
+                if (const auto h = file->handle->GetHostPath(); h.has_value()) {
+                    host = Common::FS::PathToUTF8String(*h);
+                }
+                size = file->handle->Size();
+            }
+            BB::ObjCol::OnGuestFileOpen(file->m_guest_name.c_str(),
+                                        host.empty() ? nullptr : host.c_str(), size);
+        } catch (...) {
+        }
     }
     return handle;
 }
