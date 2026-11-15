@@ -840,6 +840,12 @@ Kind WantImpl(const AmdGpu::Regs& regs, u32& why) {
     // completely: foliage the game fades near the camera (arbol2.mp4 340-347: ferns as a ghostly
     // layer over the sky and branches, vs@0x2d33c0400 "depth tws") moved the sky and the
     // branches behind with its own near-camera vectors in the generated frames.
+    // (review) without bb-fog-mv (BB_FOG_MV=0) the Blend path gives these draws no vector at all
+    // (VelocityDraw returns before any lookup): there they keep candles2's Opaque kind.
+    if (g.sparks && !g.fog && regs.depth_control.depth_write_enable &&
+        bc.color_src_factor == F::SrcAlpha && bc.color_dst_factor == F::OneMinusSrcAlpha) {
+        return Kind::Opaque;
+    }
     // Alpha-blended (particles, effects) only: additive / multiplicative passes (lights, glow)
     // have no surface of their own.
     if (bc.color_src_factor == F::SrcAlpha && bc.color_dst_factor == F::OneMinusSrcAlpha) {
@@ -1993,7 +1999,9 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         if (solid) {
             // Blend fragment: weight = alpha (no fog curve: bit 3 off), class channel written as 0
             // (spark threshold 0xffff = never bright; compose decodes B / (1 - .w)).
-            push.objmv_flags = 1u | (0xffffu << 16);
+            // (review) bit 4 ("large": never bright) makes "never class 5" hold for any colour
+            // (an HDR MRT 0 could exceed the 16.0 threshold).
+            push.objmv_flags = 1u | 16u | (0xffffu << 16);
             ++g.sec_solid_vec;
         }
         ++g.w30.native;
@@ -2077,7 +2085,10 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
         // whose order / layout moved are matched to last frame's palette of the same mesh draw.
         u64 mesh = 0, mesh_base = 0;
         u32 mesh_index = 0;
-        if (!blend && g.skin_order) {
+        // (review) bb-mv-layer: translucent solids take the opaque lookups, mesh identity too
+        // (palette mesh fallback, object buffers), as candles2's Opaque kind had.
+        const bool solid = blend && g.cur_solid && !g.cur_effect && g.sparks && g.fog;
+        if ((!blend || solid) && g.skin_order) {
             mesh_base = Mix(Mix(Mix(vs_hash, identity), count), instances);
             mesh_index = g.mesh_occ[mesh_base]++;
             mesh = Mix(Mix(mesh_base, 0x6d657368ull), mesh_index);
