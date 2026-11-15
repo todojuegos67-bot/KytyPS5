@@ -2545,6 +2545,20 @@ constexpr u8 SigSaveApply[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0
                                0x00, 0x00, 0x3d, 0x00, 0x12, 0x05, 0x10, 0x0f, 0x85};
 
 std::mutex g_save_mutex;
+// Objects whose save-record bit was set at 0x15b22e0. 0x15a6840 -> 0x15a13a0 only stores the
+// state there ([obj+0x1fc] bits 3..5 = 1, bit 0x1000 destroyed) while the model is not built
+// ([obj+0x270] == 0); the build 0x15a2a00 runs later, right after the object's state table
+// [obj+0x238] = [[[obj+0x1d0]+0x110]+0x88] is filled (0x15a32e9 / 0x15a33b1 / 0x15a3490 /
+// 0x15a4124 / 0x15a41af, each followed by call 0x15a2a00), and builds state (0x1fc >> 3) & 7.
+struct PendingRestore {
+    u32 map_id = 0;
+    u32 index = 0;
+    std::string entity;
+    bool applied = false;
+    double t = 0.0;
+};
+std::unordered_map<u64, PendingRestore> g_pending_restore;
+std::atomic<u32> g_pending_n{0};
 u32 g_save_lines = 0;
 u32 g_dup_reports = 0;
 
@@ -2579,7 +2593,7 @@ void EntityTables(std::unordered_map<u32, s32>& by_handle,
                 const s32 id = e[k * 2];
                 const u32 h = u32(e[k * 2 + 1]);
                 if (s32(h) >= 0) {
-                    by_handle.emplace(h, id);
+                    by_handle.emplace(h & 0xfffffff, id);
                 }
                 if (dups && k > 0 && e[(k - 1) * 2] == id && dups->size() < 200) {
                     dups->emplace_back(id, u32(e[(k - 1) * 2 + 1]), h, u32(g) << 16 | u32(j));
@@ -2692,7 +2706,7 @@ void OnSaveApply(u64 block) {
         empty_n += empty == 1;
         std::string ent = "?";
         if (bidx >= 0) {
-            const auto it = by_handle.find(u32(bidx) << 20 | i);
+            const auto it = by_handle.find((u32(bidx) << 20 | i) & 0xfffffff);
             if (it != by_handle.end()) {
                 ent = std::to_string(it->second);
             }
@@ -2701,6 +2715,13 @@ void OnSaveApply(u64 block) {
             set_list += fmt::format("{}{} obj {:#x} entity {} state-1 collision {}",
                                     set_list.empty() ? "" : "; ", i, obj, ent,
                                     empty == 1 ? "EMPTY" : empty == 0 ? "present" : "?");
+        }
+        if (i < n) {
+            std::scoped_lock lk{g_save_mutex};
+            if (g_pending_restore.size() < 4096) {
+                g_pending_restore[obj] = PendingRestore{map_id, i, ent, ver == 0x15091700 && match, Now()};
+                g_pending_n.store(u32(g_pending_restore.size()));
+            }
         }
         if (fix && empty == 1) {
             // The record is the game's heap copy owned by this block; clear only this bit.
@@ -2737,6 +2758,137 @@ void OnSaveApply(u64 block) {
              set_n, empty_n, set_n > 120 ? " (list capped at 120)" : "",
              g_fix ? fmt::format(", BB_OBJCOL_FIX cleared {}", cleared_n) : std::string(),
              set_list.empty() ? "none" : set_list);
+}
+
+// Entry of the object build 0x15a2a00 (rdi = object): the state table is ready here.
+constexpr u64 ObjBuildVaddr = 0x15a2a00;
+constexpr u32 ObjBuildPrologue = 20;
+// push rbp; mov rbp,rsp; push r15..rbx; sub rsp,0xc8
+constexpr u8 SigObjBuild[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                              0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xc8, 0x00, 0x00, 0x00};
+// +0x79: mov r11d,[rdi+0x1fc]; mov eax,0x303; bextr eax,r11d,eax (state = bits 3..5)
+constexpr u8 SigObjBuildState[] = {0x44, 0x8b, 0x9f, 0xfc, 0x01, 0x00, 0x00, 0xb8, 0x03,
+                                   0x03, 0x00, 0x00, 0xc4, 0xc2, 0x78, 0xf7, 0xc3};
+
+// A printable name near the object's resource [obj+0x1d0] (UTF-16 or ASCII), for the log only.
+std::string ResName(u64 res) {
+    if (!IsPtr(res)) {
+        return "?";
+    }
+    u64 q[32] = {};
+    if (!SafeCopy(q, res, sizeof(q))) {
+        return "?";
+    }
+    for (const u64 p : q) {
+        if (!IsPtr(p)) {
+            continue;
+        }
+        u8 b[96] = {};
+        if (!SafeCopy(b, p, sizeof(b))) {
+            continue;
+        }
+        std::string w, a;
+        for (size_t k = 0; k + 1 < sizeof(b); k += 2) {
+            if (b[k] == 0 && b[k + 1] == 0) {
+                break;
+            }
+            if (b[k + 1] != 0 || b[k] < 0x20 || b[k] > 0x7e) {
+                w.clear();
+                break;
+            }
+            w += char(b[k]);
+        }
+        if (w.size() >= 4) {
+            return w;
+        }
+        for (const u8 c : b) {
+            if (c == 0) {
+                break;
+            }
+            if (c < 0x20 || c > 0x7e) {
+                a.clear();
+                break;
+            }
+            a += char(c);
+        }
+        if (a.size() >= 4) {
+            return a;
+        }
+    }
+    return "?";
+}
+
+void OnObjBuild(u64 obj) {
+    PendingRestore pr;
+    {
+        std::scoped_lock lk{g_save_mutex};
+        const auto it = g_pending_restore.find(obj);
+        if (it == g_pending_restore.end()) {
+            return;
+        }
+        pr = it->second;
+        g_pending_restore.erase(it);
+        // A stale entry (object memory reused after a later map load) is ignored.
+        if (Now() - pr.t > 120.0) {
+            g_pending_n.store(u32(g_pending_restore.size()));
+            return;
+        }
+        g_pending_n.store(u32(g_pending_restore.size()));
+    }
+    u32 flags = 0;
+    u64 res = 0, tab = 0;
+    float pos[3] = {};
+    if (!Rd(obj + 0x1fc, flags)) {
+        return;
+    }
+    Rd(obj + 0x1d0, res);
+    Rd(obj + 0x238, tab);
+    Rd(obj + 0x24c, pos[0]);
+    Rd(obj + 0x25c, pos[1]);
+    Rd(obj + 0x26c, pos[2]);
+    const u32 state = (flags >> 3) & 7;
+    const int empty = State1Empty(obj);
+    u64 model1 = 0, col0 = 0;
+    if (IsPtr(tab)) {
+        Rd(tab + 0x88 + 8, model1);
+        Rd(tab + 0xa8, col0);
+    }
+    const bool act = g_fix && pr.applied && state == 1 && (flags & 0x1000) != 0 && empty == 1;
+    if (act) {
+        // Build it in state 0 (intact, with its state-0 collision) and not destroyed, which is
+        // what the game builds when no save record applies (the Dream round trip).
+        u32* f = reinterpret_cast<u32*>(obj + 0x1fc);
+        *f = (*f & ~0x38u) & ~0x1000u;
+    }
+    std::scoped_lock lk{g_save_mutex};
+    if (g_save_lines >= 600) {
+        return;
+    }
+    ++g_save_lines;
+    LOG_INFO(Core,
+             "[objcol] save restore build: map id {:#x} obj {} ({:#x}) entity {} resource {:#x} "
+             "'{}' at ({:.1f}, {:.1f}, {:.1f}): flags {:#x} state {} destroyed {} | state table "
+             "{:#x}: state-1 model {:#x}, state-1 collision {}, state-0 collision {:#x}{}",
+             pr.map_id, pr.index, obj, pr.entity, res, ResName(res), pos[0], pos[1], pos[2], flags,
+             state, (flags & 0x1000) ? "yes" : "no", tab, model1,
+             empty == 1   ? "EMPTY"
+             : empty == 0 ? "present"
+                          : "?",
+             col0,
+             act ? " -> BB_OBJCOL_FIX: built in state 0, destroyed flag cleared"
+             : g_fix && empty == 1 && pr.applied
+                 ? " -> BB_OBJCOL_FIX: not changed (state or flag differs)"
+                 : "");
+}
+
+void PS4_SYSV_ABI HookObjBuild(const u64* regs) {
+    if (g_pending_n.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    try {
+        OnObjBuild(regs[5]); // rdi: the object
+    } catch (...) {
+    }
 }
 
 void PS4_SYSV_ABI HookSaveApply(const u64* regs) {
@@ -3184,6 +3336,16 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         if (ok) {
             hook(SaveApplyVaddr, reinterpret_cast<u64>(&HookSaveApply), SaveApplyPrologue);
         }
+        const bool bok =
+            ok && ObjBuildVaddr + 0x79 + sizeof(SigObjBuildState) <= image_size &&
+            std::memcmp(img + ObjBuildVaddr, SigObjBuild, sizeof(SigObjBuild)) == 0 &&
+            std::memcmp(img + ObjBuildVaddr + 0x79, SigObjBuildState, sizeof(SigObjBuildState)) ==
+                0;
+        if (bok) {
+            hook(ObjBuildVaddr, reinterpret_cast<u64>(&HookObjBuild), ObjBuildPrologue);
+        }
+        LOG_INFO(Core, "[objcol] object build eboot+{:#x} {}; lines '[objcol] save restore build'",
+                 ObjBuildVaddr, bok ? "hooked" : "check failed: not hooked");
         LOG_INFO(Core,
                  "[objcol] OBJ save restore eboot+{:#x} {}; lines '[objcol] save restore', "
                  "'[objcol] entity-id duplicates'{}",
