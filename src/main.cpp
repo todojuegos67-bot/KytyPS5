@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
+#include "loader/wolverineRenderStep.h"
 
 #include <algorithm>
 #include <charconv>
@@ -52,10 +53,11 @@ static void PrintUsage() {
 	    "  --stretch                            Stretch the image to the window. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --trinity                            Enable experimental PS5 Pro mode for\n"
-	         "                                       supported titles. Default: off.\n");
+	::printf("  --trinity [true|false]               PS5 Pro mode for supported titles, with FSR 3.1\n"
+	         "                                       and frame generation. Default: on; false for base mode.\n");
 	::printf("  --pssr-upscaler <value>              With --trinity, upscale PSSR with Linear,\n"
-	         "                                       DLSS, or FSR. Default: Linear.\n");
+	         "                                       DLSS, or FSR. Default: FSR (built-in FSR 3.1\n"
+	         "                                       unless --fsr-folder is set).\n");
 	::printf("  --dlss-folder <folder>               DLSS model folder.\n");
 	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
 	::printf("  --fsr-folder <folder>                FidelityFX DLL folder (Windows).\n");
@@ -96,6 +98,13 @@ static void PrintUsage() {
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --render-resolution <auto|WxH>       Marvel's Wolverine 1.05: render the 3D at this step of the\n"
+	         "                                       game's dynamic resolution (1664x936 ... 3328x1872).\n"
+	         "                                       Default: auto (the game's own choice).\n");
+	::printf("  --precompile-only                    Compile the recorded shaders and pipelines, then exit.\n");
+	::printf("  --precompile-threads <1-64>          Threads for --precompile-only.\n");
+	::printf("  --export-hints <file>                Write the recorded shaders as hints, without game code.\n");
+	::printf("  --import-hints <file>                Restore hints from the game files, then precompile.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -222,6 +231,7 @@ static constexpr Flag FLAGS[] = {
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
+    {"--precompile-only", &ConfigOptions::precompile_only},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif
@@ -240,7 +250,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 
 		if (const auto* flag = std::ranges::find(FLAGS, arg, &Flag::name); flag != std::end(FLAGS)) {
-			options.config.*flag->field = flag->value;
+			// The older `--flag true|false` form still works: run scripts pass it to builds of both kinds.
+			bool on = true;
+			if (i + 1 < argc && (std::string_view(argv[i + 1]) == "true" || std::string_view(argv[i + 1]) == "false")) {
+				on = std::string_view(argv[++i]) == "true";
+			}
+			options.config.*flag->field = on == flag->value;
 			continue;
 		}
 
@@ -330,6 +345,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid screen height: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--render-resolution") {
+			uint32_t   width = 0, height = 0;
+			const auto x     = value.find('x');
+			if (value != "auto" &&
+			    (x == std::string::npos || !ParseUint32(value.substr(0, x), width) ||
+			     !ParseUint32(value.substr(x + 1), height) || Loader::WolverineRenderStep::FindStep(width, height) < 0)) {
+				::printf("invalid render resolution (auto or one of the game's steps, 1664x936 ... 3328x1872): %s\n",
+				         value.c_str());
+				return false;
+			}
+			options.config.render_width  = width;
+			options.config.render_height = height;
 		} else if (arg == "--user-name") {
 			if (value.empty() || value.size() > Config::MAX_USER_NAME_LENGTH) {
 				::printf("invalid user name: must contain 1-%zu bytes\n",
@@ -430,6 +457,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--precompile-threads") {
+			if (!ParseUint32(value, options.config.precompile_threads) || options.config.precompile_threads == 0 ||
+			    options.config.precompile_threads > 64) {
+				::printf("invalid precompile threads: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--export-hints" || arg == "--import-hints") {
+			(arg == "--export-hints" ? options.config.precompile_export_hints : options.config.precompile_import_hints) =
+			    Common::PathFromUtf8(Common::FixFilenameSlash(value));
+			options.config.precompile_only = true;
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
@@ -446,11 +483,54 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	if (options.config.gpu_assisted_validation_enabled) {
 		options.config.vulkan_validation_enabled = true;
 	}
+	if (!options.config.precompile_export_hints.empty() && !options.config.precompile_import_hints.empty()) {
+		::printf("--export-hints and --import-hints cannot be combined\n");
+		return false;
+	}
+	options.config.game_dir = options.app0_dir;
 
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if defined(KYTY_PGO_GENERATE)
+#include <chrono>
+#include <cstdlib>
+#include <system_error>
+#include <thread>
+
+// compiler-rt profile runtime (instrumented builds, CMake KYTY_PGO_GENERATE).
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int  __llvm_profile_write_file(void);
+
+// The profile runtime writes its counters only at a normal exit; the emulator ends with quick_exit
+// or is stopped. With KYTY_PGO_FILE=<file.profraw> a thread writes them every KYTY_PGO_DUMP_SECONDS
+// (default 20) to <file>.tmp and renames that over <file>, which always holds the last complete dump.
+// As in Jetsku's fork (main.cpp, StartPgoDumps).
+static void StartPgoDumps() {
+	const char* file = std::getenv("KYTY_PGO_FILE");
+	if (file == nullptr || *file == '\0') {
+		::printf("PGO: instrumented build without KYTY_PGO_FILE: no profile is written\n");
+		return;
+	}
+	const char* seconds_text = std::getenv("KYTY_PGO_DUMP_SECONDS");
+	const int   seconds = seconds_text != nullptr && std::atoi(seconds_text) > 0 ? std::atoi(seconds_text) : 20;
+	static const std::string target = file;
+	static const std::string temp   = target + ".tmp";
+	std::thread([seconds]() {
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(seconds));
+			__llvm_profile_set_filename(temp.c_str());
+			std::error_code error;
+			if (__llvm_profile_write_file() == 0) std::filesystem::rename(temp, target, error);
+		}
+	}).detach();
+}
+#endif
+
 static int Main(int argc, char* argv[]) {
+#if defined(KYTY_PGO_GENERATE)
+	StartPgoDumps();
+#endif
 	InitializeThreads();
 
 	RunOptions options;

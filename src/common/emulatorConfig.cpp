@@ -269,6 +269,34 @@ bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }
 
+uint32_t GetRenderWidth() {
+	return g_config->render_width;
+}
+
+uint32_t GetRenderHeight() {
+	return g_config->render_height;
+}
+
+bool PrecompileOnly() {
+	return g_config->precompile_only;
+}
+
+uint32_t GetPrecompileThreads() {
+	return g_config->precompile_threads;
+}
+
+const std::filesystem::path& GetPrecompileExportHints() {
+	return g_config->precompile_export_hints;
+}
+
+const std::filesystem::path& GetPrecompileImportHints() {
+	return g_config->precompile_import_hints;
+}
+
+const std::filesystem::path& GetGameDir() {
+	return g_config->game_dir;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

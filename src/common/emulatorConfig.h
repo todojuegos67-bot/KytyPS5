@@ -67,8 +67,9 @@ struct ConfigOptions {
 	bool                   stretch_enabled             = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
-	bool                   pro_enabled                 = false;
-	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
+	bool                   pro_enabled                 = true; // Wolverine build: Pro mode by default; --trinity false for base
+	// Wolverine build: FSR by default, AMD's DLLs with --fsr-folder, else the built-in FSR 3.1 (with frame generation).
+	PssrUpscaler           pssr_upscaler               = PssrUpscaler::FSR;
 	std::filesystem::path  dlss_folder;
 	uint32_t               dlss_preset                 = 0; // 0 is the model default
 	std::filesystem::path  fsr_folder;
@@ -107,6 +108,17 @@ struct ConfigOptions {
 	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
+	// --render-resolution: Marvel's Wolverine's 3D render size, one of its dynamic-resolution steps; 0x0 leaves the
+	// game's own controller (loader/wolverineRenderStep.h).
+	uint32_t               render_width                = 0;
+	uint32_t               render_height               = 0;
+	// --precompile-only: the window, device and renderer as for the game, no guest; compiles the journal's shaders and
+	// pipelines into the driver cache and exits. The hints options imply it.
+	bool                   precompile_only             = false;
+	uint32_t               precompile_threads          = 0; // 0: the default
+	std::filesystem::path  precompile_export_hints;
+	std::filesystem::path  precompile_import_hints;
+	std::filesystem::path  game_dir; // --game's folder, which a hints import scans
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -186,6 +198,13 @@ bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
+uint32_t GetRenderWidth();
+uint32_t GetRenderHeight();
+bool PrecompileOnly();
+uint32_t GetPrecompileThreads();
+const std::filesystem::path& GetPrecompileExportHints();
+const std::filesystem::path& GetPrecompileImportHints();
+const std::filesystem::path& GetGameDir();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

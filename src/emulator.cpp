@@ -26,6 +26,7 @@
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <thread>
@@ -107,6 +108,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();
+	Libs::LibKernel::Memory::EnableFirstTouchCommit();
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
@@ -177,6 +179,12 @@ void Run(const RunOptions& options) {
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
 
 	MountSandboxDirs();
+
+	// The precompile needs the device and the renderer only: no guest is loaded.
+	if (Config::PrecompileOnly()) {
+		std::fflush(stdout);
+		std::quick_exit(Libs::Graphics::WindowPrecompileOnly());
+	}
 
 	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
