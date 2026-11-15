@@ -4,7 +4,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <unordered_map>
+#include <xxhash.h>
 #include "common/debug.h"
 #include "core/bb_hud_native_hook.h"
 #include "core/debug_state.h"
@@ -31,6 +34,10 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+namespace {
+void DmaForget(VAddr addr, u64 size); // bb-dma-dedup (below Rasterizer::FillBuffer)
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -958,6 +965,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
                 if (desc.is_written) {
+                    DmaForget(vsharp.base_address, size); // bb-dma-dedup: a shader writes it
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
@@ -1734,6 +1742,9 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
+        DmaForget(address, num_bytes); // bb-dma-dedup
+    }
+    if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
@@ -1751,7 +1762,167 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
+// bb-dma-dedup: the game's CP DMAs (memory -> memory, Rasterizer::CopyBuffer). Bloodborne DMAs a
+// CPU bone palette into one of five shared GX buffers before every skinned draw (0x2568a20, see
+// bb_mv_engine.h) and its skin rings through 0x2168a20 -> 0x26b3560 -> 0x26b1c40. Each GPU-side
+// copy ends the render pass and waits on a barrier. A copy is redundant when the destination still
+// holds exactly what the same copy wrote last time: same destination, same size, the same source
+// bytes (hash and byte compare of guest memory, which is what the GPU copy reads when the source is not
+// GPU-modified; the source address may differ), and nothing has written the destination since (DMA / fill to an
+// overlapping range, a shader's storage write, a CPU write to its pages, an unmap all forget it).
+// BB_DMA_DEDUP=1 skips such copies (default off). "[dma]" once a second with BB_GPU_PROFILE=1,
+// BB_DMA_DEDUP=1 or BB_DMA_STATS=1.
+namespace {
+struct DmaEntry {
+    VAddr src;
+    u32 size;
+    u64 hash;
+    std::vector<u8> bytes; // what was copied (compared byte for byte, not only by hash)
+};
+struct DmaState {
+    std::recursive_mutex m; // (a fault while hashing must not deadlock the forget path)
+    std::map<VAddr, DmaEntry> last; // by destination
+    // per second
+    u64 calls = 0, host = 0, gpu = 0, gds = 0, gpu_bytes = 0, in_pass = 0, dup = 0, skipped = 0;
+    u64 sz[4]{};
+    std::unordered_map<VAddr, std::array<u64, 4>> by_dst; // gpu copies, dups, last src, size
+    std::chrono::steady_clock::time_point start{};
+};
+constexpr u32 kDmaMaxBytes = 64u << 10;  // size buckets; overlap search window
+constexpr u32 kDmaKeepBytes = 16u << 10; // copies remembered (byte compare): up to 16 KiB each
+DmaState& Dma() {
+    static DmaState d;
+    return d;
+}
+bool DmaDedupOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_DMA_DEDUP");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+bool DmaStatsOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_DMA_STATS");
+        return DmaDedupOn() || BB::GpuProf::On() || (v != nullptr && v[0] == '1');
+    }();
+    return on;
+}
+// Forget every entry overlapping [addr, addr + size) (caller holds the lock).
+void DmaForgetLocked(DmaState& d, VAddr addr, u64 size) {
+    if (d.last.empty()) return;
+    const VAddr from = addr > kDmaMaxBytes ? addr - kDmaMaxBytes : 0;
+    for (auto it = d.last.lower_bound(from); it != d.last.end() && it->first < addr + size;) {
+        if (it->first + it->second.size > addr) {
+            it = d.last.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+void DmaForget(VAddr addr, u64 size) {
+    if (!DmaStatsOn()) return;
+    auto& d = Dma();
+    std::scoped_lock lk{d.m};
+    DmaForgetLocked(d, addr, size);
+}
+void DmaLogSecond(DmaState& d) {
+    const auto now = std::chrono::steady_clock::now();
+    if (d.start.time_since_epoch().count() == 0) d.start = now;
+    const double el = std::chrono::duration<double>(now - d.start).count();
+    if (el < 1.0) return;
+    std::vector<std::pair<VAddr, std::array<u64, 4>>> top(d.by_dst.begin(), d.by_dst.end());
+    std::sort(top.begin(), top.end(),
+              [](const auto& a, const auto& b) { return a.second[0] > b.second[0]; });
+    std::string t;
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+        const auto& [dst, v] = top[i];
+        t += fmt::format("{}{:#x}<-{:#x} {} B x{:.1f} (dup {:.1f})", t.empty() ? "" : ", ", dst,
+                         v[2], v[3], double(v[0]) / el, double(v[1]) / el);
+    }
+    LOG_INFO(Render_Vulkan,
+             "[dma] {:.1f} s: CP DMA copies {:.1f}/s: host memcpy {:.1f}, GPU {:.1f} ({:.0f} KiB/s, "
+             "{:.1f} ended a render pass), GDS {:.1f} | sizes <=256 B {:.1f}, <=4 KiB {:.1f}, "
+             "<=64 KiB {:.1f}, larger {:.1f} | exact repeats of the destination's last copy "
+             "{:.1f}/s, skipped {:.1f}/s (BB_DMA_DEDUP={}) | top destinations: {}",
+             el, d.calls / el, d.host / el, d.gpu / el, d.gpu_bytes / 1024.0 / el, d.in_pass / el,
+             d.gds / el, d.sz[0] / el, d.sz[1] / el, d.sz[2] / el, d.sz[3] / el, d.dup / el,
+             d.skipped / el, DmaDedupOn() ? 1 : 0, t);
+    d.calls = d.host = d.gpu = d.gds = d.gpu_bytes = d.in_pass = d.dup = d.skipped = 0;
+    d.sz[0] = d.sz[1] = d.sz[2] = d.sz[3] = 0;
+    d.by_dst.clear();
+    d.start = now;
+}
+} // namespace
+
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (!DmaStatsOn()) {
+        CopyBufferImpl(dst, src, num_bytes, dst_gds, src_gds);
+        return;
+    }
+    auto& d = Dma();
+    std::unique_lock lk{d.m};
+    DmaLogSecond(d);
+    ++d.calls;
+    if (dst_gds || src_gds) {
+        ++d.gds;
+        if (!dst_gds) DmaForgetLocked(d, dst, num_bytes);
+        lk.unlock();
+        CopyBufferImpl(dst, src, num_bytes, dst_gds, src_gds);
+        return;
+    }
+    d.sz[num_bytes <= 256 ? 0 : num_bytes <= 4096 ? 1 : num_bytes <= kDmaMaxBytes ? 2 : 3]++;
+    const bool dst_gpu = buffer_cache.IsRegionGpuModified(dst, num_bytes);
+    const bool src_cpu = !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
+                         !texture_cache.FindImageFromRange(src, num_bytes);
+    if (!dst_gpu && src_cpu) {
+        ++d.host; // the host memcpy path below
+        DmaForgetLocked(d, dst, num_bytes);
+        lk.unlock();
+        CopyBufferImpl(dst, src, num_bytes, dst_gds, src_gds);
+        return;
+    }
+    // A GPU copy. Repeat of the destination's last copy with the same source bytes?
+    const bool hashable = src_cpu && num_bytes <= kDmaKeepBytes && dst_gpu &&
+                          !texture_cache.FindImageFromRange(dst, num_bytes) &&
+                          memory->IsValidMapping(src, num_bytes);
+    const u64 h = hashable ? XXH3_64bits(std::bit_cast<const void*>(src), num_bytes) : 0;
+    auto& top = d.by_dst[dst];
+    ++top[0];
+    top[2] = src;
+    top[3] = num_bytes;
+    if (hashable) {
+        // (Not the source address: the game's GX buffer update 0x26b3560 -> 0x26b1c40 copies the
+        // CPU data into fresh transient command-buffer memory every time and DMAs from there.)
+        if (const auto it = d.last.find(dst);
+            it != d.last.end() && it->second.size == num_bytes && it->second.hash == h &&
+            std::memcmp(it->second.bytes.data(), std::bit_cast<const void*>(src), num_bytes) ==
+                0) {
+            ++d.dup;
+            ++top[1];
+            if (DmaDedupOn()) {
+                ++d.skipped;
+                return; // the destination already holds these bytes
+            }
+        }
+    }
+    ++d.gpu;
+    d.gpu_bytes += num_bytes;
+    d.in_pass += scheduler.IsRendering() ? 1 : 0;
+    DmaForgetLocked(d, dst, num_bytes);
+    if (hashable) {
+        if (d.last.size() > 2048) d.last.clear(); // (at most 2048 x 16 KiB kept)
+        auto& e = d.last[dst];
+        e.src = src;
+        e.size = num_bytes;
+        e.hash = h;
+        e.bytes.assign(std::bit_cast<const u8*>(src), std::bit_cast<const u8*>(src) + num_bytes);
+    }
+    lk.unlock();
+    CopyBufferImpl(dst, src, num_bytes, dst_gds, src_gds);
+}
+
+void Rasterizer::CopyBufferImpl(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -1797,6 +1968,8 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    // bb-dma-dedup: a CPU write (the page around it: the tracker works on whole pages).
+    DmaForget(addr & ~VAddr(0xffff), size + 0x20000);
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     return true;
@@ -1838,6 +2011,7 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    DmaForget(addr, size); // bb-dma-dedup
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     {

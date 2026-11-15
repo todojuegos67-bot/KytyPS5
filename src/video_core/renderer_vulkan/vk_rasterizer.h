@@ -74,6 +74,8 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// The copy itself (CopyBuffer adds bb-dma-dedup's statistics and skip).
+    void CopyBufferImpl(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
