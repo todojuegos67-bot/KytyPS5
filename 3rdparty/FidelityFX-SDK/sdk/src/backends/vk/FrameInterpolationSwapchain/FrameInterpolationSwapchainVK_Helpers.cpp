@@ -26,6 +26,65 @@
 #include <dwmapi.h>
 #endif  // #ifdef _WIN32
 
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <unordered_map>
+
+// Kyty: no submit waits for a timeline value whose signal no submit has sent yet. The interpolation
+// work goes on the game queue and waits for a composition the presenter thread submits later; while
+// that wait sat in the queue, the presenter's vkQueuePresentKHR blocked in the kernel
+// (NtDxgkSubmitPresentToHwQueue) and nothing moved again (NVIDIA, Windows: frames stopped at places
+// 44, 90 and 94). The sparse binds in commandScheduler.cpp follow the same rule.
+// shortcut: keyed by handle, so a semaphore recreated under an old handle may pass early (the old
+// behaviour); key by creation if the log ever shows the guard missing a wait.
+namespace
+{
+std::mutex                                   g_sentMutex;
+std::condition_variable                      g_sentChanged;
+std::unordered_map<VkSemaphore, uint64_t>    g_sent;  // highest value each timeline semaphore was sent to signal
+unsigned long long                           g_guardWaits    = 0;
+unsigned long long                           g_guardTimeouts = 0;
+
+void waitUntilSent(const SubmissionSemaphores& waits)
+{
+    std::unique_lock<std::mutex> lock(g_sentMutex);
+    for (uint32_t i = 0; i < waits.count; ++i)
+    {
+        const uint64_t value = waits.values[i];  // 0 for a binary semaphore
+        const auto     sent  = [&] { return g_sent[waits.semaphores[i]] >= value; };
+        if (value == 0 || sent())
+            continue;
+        ++g_guardWaits;
+        // The signal comes from another thread that needs nothing from this one; the timeout only keeps
+        // a lost signal from hanging the caller, which then submits as before.
+        if (!g_sentChanged.wait_for(lock, std::chrono::seconds(1), sent))
+            ++g_guardTimeouts;
+    }
+}
+
+void recordSent(const SubmissionSemaphores& signals)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_sentMutex);
+        for (uint32_t i = 0; i < signals.count; ++i)
+        {
+            uint64_t& sent = g_sent[signals.semaphores[i]];
+            sent           = (std::max)(sent, signals.values[i]);
+        }
+    }
+    g_sentChanged.notify_all();
+}
+}  // namespace
+
+extern "C" void kyty_fi_GetSendGuardStats(unsigned long long* waits, unsigned long long* timeouts)
+{
+    std::lock_guard<std::mutex> lock(g_sentMutex);
+    *waits    = g_guardWaits;
+    *timeouts = g_guardTimeouts;
+}
+
 void waitForPerformanceCount(const int64_t targetCount)
 {
     int64_t currentCount = 0;
@@ -73,11 +132,16 @@ VkResult VulkanQueue::submit(VkCommandBuffer commandBuffer, SubmissionSemaphores
         submitInfo.pNext = &timelineSemaphoreSubmitInfo;
     }
 
+    waitUntilSent(semaphoresToWait);
+
     VkResult res = VK_SUCCESS;
     if (submitFunc != nullptr)
         res = submitFunc(1, &submitInfo, fence);
     else
         res = vkQueueSubmit(queue, 1, &submitInfo, fence);
+
+    if (res == VK_SUCCESS)
+        recordSent(semaphoresToSignal);
 
     semaphoresToWait.reset();
     semaphoresToSignal.reset();

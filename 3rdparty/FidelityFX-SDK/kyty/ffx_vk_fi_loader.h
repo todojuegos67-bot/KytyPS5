@@ -1,0 +1,85 @@
+// Kyty: force-included into FidelityFX's frame interpolation swapchain sources. Their direct
+// Vulkan calls go through pointers Kyty fills (ffx_vk_fi_functions.h), as Kyty links no Vulkan
+// import library. No prototypes: each name below is a pointer, not a function.
+#pragma once
+
+#ifndef VK_NO_PROTOTYPES
+#define VK_NO_PROTOTYPES
+#endif
+// The swapchain uses VK_EXT_full_screen_exclusive's Win32 structures.
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
+#include <vulkan/vulkan.h>
+
+#include "ffx_vk_fi_functions.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+#define KYTY_FFX_FI_DECLARE(name) extern PFN_##name kyty_fi_##name;
+KYTY_FFX_FI_VK_FUNCTIONS(KYTY_FFX_FI_DECLARE)
+#undef KYTY_FFX_FI_DECLARE
+#ifdef __cplusplus
+}
+#endif
+
+#define vkAcquireNextImageKHR kyty_fi_vkAcquireNextImageKHR
+#define vkAllocateCommandBuffers kyty_fi_vkAllocateCommandBuffers
+#define vkAllocateDescriptorSets kyty_fi_vkAllocateDescriptorSets
+#define vkAllocateMemory kyty_fi_vkAllocateMemory
+#define vkBeginCommandBuffer kyty_fi_vkBeginCommandBuffer
+#define vkBindImageMemory kyty_fi_vkBindImageMemory
+#define vkCmdBeginRenderPass kyty_fi_vkCmdBeginRenderPass
+#define vkCmdBindDescriptorSets kyty_fi_vkCmdBindDescriptorSets
+#define vkCmdBindPipeline kyty_fi_vkCmdBindPipeline
+#define vkCmdCopyImage kyty_fi_vkCmdCopyImage
+#define vkCmdDraw kyty_fi_vkCmdDraw
+#define vkCmdEndRenderPass kyty_fi_vkCmdEndRenderPass
+#define vkCmdPipelineBarrier kyty_fi_vkCmdPipelineBarrier
+#define vkCmdPushConstants kyty_fi_vkCmdPushConstants
+#define vkCmdSetScissor kyty_fi_vkCmdSetScissor
+#define vkCmdSetViewport kyty_fi_vkCmdSetViewport
+#define vkCreateCommandPool kyty_fi_vkCreateCommandPool
+#define vkCreateDescriptorPool kyty_fi_vkCreateDescriptorPool
+#define vkCreateDescriptorSetLayout kyty_fi_vkCreateDescriptorSetLayout
+#define vkCreateFramebuffer kyty_fi_vkCreateFramebuffer
+#define vkCreateGraphicsPipelines kyty_fi_vkCreateGraphicsPipelines
+#define vkCreateImage kyty_fi_vkCreateImage
+#define vkCreateImageView kyty_fi_vkCreateImageView
+#define vkCreatePipelineLayout kyty_fi_vkCreatePipelineLayout
+#define vkCreateRenderPass kyty_fi_vkCreateRenderPass
+#define vkCreateSemaphore kyty_fi_vkCreateSemaphore
+#define vkCreateShaderModule kyty_fi_vkCreateShaderModule
+#define vkCreateSwapchainKHR kyty_fi_vkCreateSwapchainKHR
+#define vkDestroyCommandPool kyty_fi_vkDestroyCommandPool
+#define vkDestroyDescriptorPool kyty_fi_vkDestroyDescriptorPool
+#define vkDestroyDescriptorSetLayout kyty_fi_vkDestroyDescriptorSetLayout
+#define vkDestroyFramebuffer kyty_fi_vkDestroyFramebuffer
+#define vkDestroyImage kyty_fi_vkDestroyImage
+#define vkDestroyImageView kyty_fi_vkDestroyImageView
+#define vkDestroyPipeline kyty_fi_vkDestroyPipeline
+#define vkDestroyPipelineLayout kyty_fi_vkDestroyPipelineLayout
+#define vkDestroyRenderPass kyty_fi_vkDestroyRenderPass
+#define vkDestroySemaphore kyty_fi_vkDestroySemaphore
+#define vkDestroyShaderModule kyty_fi_vkDestroyShaderModule
+#define vkDestroySwapchainKHR kyty_fi_vkDestroySwapchainKHR
+#define vkDeviceWaitIdle kyty_fi_vkDeviceWaitIdle
+#define vkEndCommandBuffer kyty_fi_vkEndCommandBuffer
+#define vkFreeCommandBuffers kyty_fi_vkFreeCommandBuffers
+#define vkFreeDescriptorSets kyty_fi_vkFreeDescriptorSets
+#define vkFreeMemory kyty_fi_vkFreeMemory
+#define vkGetDeviceProcAddr kyty_fi_vkGetDeviceProcAddr
+#define vkGetImageMemoryRequirements kyty_fi_vkGetImageMemoryRequirements
+#define vkGetPhysicalDeviceMemoryProperties kyty_fi_vkGetPhysicalDeviceMemoryProperties
+#define vkGetPhysicalDeviceQueueFamilyProperties kyty_fi_vkGetPhysicalDeviceQueueFamilyProperties
+#define vkGetPhysicalDeviceSurfaceSupportKHR kyty_fi_vkGetPhysicalDeviceSurfaceSupportKHR
+#define vkGetSemaphoreCounterValue kyty_fi_vkGetSemaphoreCounterValue
+#define vkGetSwapchainImagesKHR kyty_fi_vkGetSwapchainImagesKHR
+#define vkQueuePresentKHR kyty_fi_vkQueuePresentKHR
+#define vkQueueSubmit kyty_fi_vkQueueSubmit
+#define vkQueueWaitIdle kyty_fi_vkQueueWaitIdle
+#define vkResetCommandBuffer kyty_fi_vkResetCommandBuffer
+#define vkResetCommandPool kyty_fi_vkResetCommandPool
+#define vkUpdateDescriptorSets kyty_fi_vkUpdateDescriptorSets
+#define vkWaitSemaphores kyty_fi_vkWaitSemaphores
