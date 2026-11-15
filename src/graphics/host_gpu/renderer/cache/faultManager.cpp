@@ -148,7 +148,19 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 128; // Four words per invocation.
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
-	dependency.pBufferMemoryBarriers = &post_barrier;
+	// The host reads the parser's list after the tick: a device->host dependency makes it visible there (Vulkan
+	// spec, host access; CloseTrackedWrites in bufferCache.cpp does the same for its readback).
+	vk::BufferMemoryBarrier2 host_barrier {};
+	host_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	host_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	host_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	host_barrier.buffer        = reader.download.Handle();
+	host_barrier.offset        = offset;
+	host_barrier.size          = area_size;
+	const std::array post_barriers {post_barrier, host_barrier};
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(post_barriers.size());
+	dependency.pBufferMemoryBarriers    = post_barriers.data();
 	command.pipelineBarrier2(dependency);
 
 	const auto area = reader.current;
