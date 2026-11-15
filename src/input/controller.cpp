@@ -302,6 +302,9 @@ void SetVibrationSettings(bool on, int percent) {
 // once-only log was spent on that call. The last state is kept and re-sent when the gamepad
 // connects; the log reports the first non-zero command.
 static std::atomic<bool> g_vib_nz_logged{false};
+// (bb-rumble-hits) pulse state (RumblePulse), shared by all pads
+static std::atomic<float> g_pulse_large{0.0f}, g_pulse_small{0.0f};
+static std::atomic<Uint64> g_pulse_until_ms{0};
 
 // (bb-rumble-hits) Bloodborne drives the small motor as a 1-bit PWM, not as a 0-255 level
 // (eboot, Ghidra = vaddr+0x400000):
@@ -355,6 +358,10 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
 }
 
 bool GameController::ApplyVibration() {
+    // (bb-rumble-hits) called from the scePad thread, the hit detour (game thread) and the pad
+    // thread: serialize the m_vib_* state and the SDL call.
+    static std::mutex apply_mutex;
+    std::lock_guard apply_lock{apply_mutex};
     SDL_Gamepad* pad = m_sdl_gamepad;
     if (pad == nullptr) {
         return true;
@@ -363,7 +370,22 @@ bool GameController::ApplyVibration() {
     const auto scale = [k](u8 v) {
         return static_cast<Uint16>(std::clamp(v / 255.0f * k, 0.0f, 1.0f) * 0xFFFF);
     };
-    const Uint16 lo = scale(m_vib_large), hi = scale(m_vib_small_eff);
+    Uint16 lo = scale(m_vib_large), hi = scale(m_vib_small_eff);
+    // (bb-rumble-hits) a pulse in progress (RumblePulse) is mixed in with max(); its levels
+    // already carry the game's own vibration option, the F1 percentage applies on top.
+    Uint32 dur = 0xFFFFu;
+    const Uint64 now_ms = SDL_GetTicks();
+    const Uint64 until = g_pulse_until_ms.load();
+    if (now_ms < until) {
+        const auto pscale = [k](float v) {
+            return static_cast<Uint16>(std::clamp(v * k, 0.0f, 1.0f) * 0xFFFF);
+        };
+        const Uint16 plo = pscale(g_pulse_large.load()), phi = pscale(g_pulse_small.load());
+        if (lo == 0 && hi == 0) {
+            dur = static_cast<Uint32>(until - now_ms); // ends by itself if no new command comes
+        }
+        lo = std::max(lo, plo), hi = std::max(hi, phi);
+    }
     // (bb-rumble-143) the game streams stop (0/0) commands: re-sending a stop every frame to SDL
     // cut any rumble started elsewhere (the F1 test lasted < 1 frame: "felt nothing"). A stop is
     // sent once, after a non-zero command only.
@@ -376,12 +398,24 @@ bool GameController::ApplyVibration() {
         m_vib_sent_zero = false;
     }
     // SDL: low_frequency = the large motor. SDL caps the duration at 0xFFFF ms; 0/0 stops.
-    const bool ok = SDL_RumbleGamepad(pad, lo, hi, (lo || hi) ? 0xFFFFu : 0u);
+    const bool ok = SDL_RumbleGamepad(pad, lo, hi, (lo || hi) ? dur : 0u);
     static std::atomic<bool> fail_logged{false};
     if (!ok && !fail_logged.exchange(true)) {
         LOG_WARNING(Input, "[pad] SDL_RumbleGamepad failed: {}", SDL_GetError());
     }
     return ok;
+}
+
+void RumblePulse(float large01, float small01, u32 ms) {
+    g_pulse_large = std::clamp(large01, 0.0f, 1.0f);
+    g_pulse_small = std::clamp(small01, 0.0f, 1.0f);
+    g_pulse_until_ms = SDL_GetTicks() + ms;
+    auto& cs = *Common::Singleton<GameControllers>::Instance();
+    for (int i = 0; i < 4; i++) {
+        if (cs[i]->m_sdl_gamepad != nullptr) {
+            cs[i]->ApplyVibration();
+        }
+    }
 }
 
 void TestRumble() {

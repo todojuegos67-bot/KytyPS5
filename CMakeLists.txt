@@ -864,6 +864,8 @@ set(COMMON src/common/logging/classes.cpp
            src/core/bb_objcol.cpp
            src/core/bb_game_gfx.cpp
            src/core/bb_game_gfx.h
+           src/core/bb_rumble_hits.cpp
+           src/core/bb_rumble_hits.h
            src/core/bb_objcol.h
            src/core/bb_hud_native_hook.cpp
            src/core/bb_hud_native_hook.h
