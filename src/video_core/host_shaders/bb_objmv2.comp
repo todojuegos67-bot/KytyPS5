@@ -78,8 +78,7 @@ vec4 Fetch(ivec2 q) {
         const float cov = clamp(o.w, 0.0, 1.0);
         // (review) below .995 class 5 cannot occur (its .w is 1): cap the decode at 4 so fp16
         // rounding of a dense stack over a character (class 4) never reads as a spark.
-        o.z = cov > 0.995 ? (o.z > 5.5 ? 6.0 : (o.z > 0.5 ? 5.0 : 0.0))
-                          : min(o.z / (1.0 - cov), 4.0);
+        o.z = cov > 0.995 ? (o.z > 0.5 ? 5.0 : 0.0) : min(o.z / (1.0 - cov), 4.0);
     }
     return o;
 }
@@ -94,12 +93,7 @@ bool SkyAt(ivec2 c) {
     return p.sky.y > 0.5 ? d <= p.sky.x : d >= p.sky.x;
 }
 bool IsSparkRaw(vec4 o, bool sparks) {
-    return sparks && o.z > 4.5 && o.z < 6.5;
-}
-// bb-mv-fire: class 6 = an effect composited from the game's own effect buffer (screen-space
-// draw, no vector of its own): marked for the HUD-less image only, the vector behind it stays.
-bool MarkOnly(vec4 o) {
-    return o.z > 5.5;
+    return sparks && o.z > 4.5 && o.z < 5.5;
 }
 bool IsSpark(vec4 o, bool sparks, ivec2 c) {
     return IsSparkRaw(o, sparks) && !SkyAt(c);
@@ -182,7 +176,7 @@ void main() {
         const vec4 o = Fetch(c);
         if (IsSpark(o, sparks, c)) {
             // bb-mv-fill: the effect's own static-world vector (not the surface behind it).
-            if (!MarkOnly(o) && !any(isnan(o.xy)) && !any(isinf(o.xy))) {
+            if (!any(isnan(o.xy)) && !any(isinf(o.xy))) {
                 const vec2 camv = imageLoad(mv_out, c).xy;
                 imageStore(mv_out, c, vec4(additive ? o.xy + camv : o.xy, 0.0, 0.0));
             }
@@ -249,7 +243,7 @@ void main() {
         if (!spark && IsSparkRaw(o, sparks)) atomicAdd(g_ss, 1u);
         if (spark) {
             atomicAdd(g_sp, 1u);
-            if (p.size.z != 0u && finite && !MarkOnly(o)) {
+            if (p.size.z != 0u && finite) {
                 imageStore(mv_out, c, vec4(additive ? o.xy + cam : o.xy, 0.0, 0.0));
             }
         } else if (cov > kFogMin) {

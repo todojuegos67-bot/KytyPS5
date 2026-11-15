@@ -233,7 +233,7 @@ struct State {
     bool cur_solid = false;        // bb-mv-layer: a blended draw that writes depth
     bool cur_additive = false;     // bb-mv-fire: the game's blend adds (dst One)
     u32 spark_word_add = 0;        // bb-mv-fire: threshold for additive draws
-    u64 sec_add_draws = 0, sec_add_vec = 0, sec_ui_skip = 0, sec_composite = 0;
+    u64 sec_add_draws = 0, sec_add_vec = 0, sec_ui_skip = 0;
     std::unordered_map<u64, std::array<u32, 2>> skipped_vs; // vs -> no motion key, write mask 0
     u64 sec_solid_draws = 0, sec_solid_vec = 0;
     u32 spark_word = 0;      // push word: threshold (1/4096) | bit 16: contribution x src alpha
@@ -850,13 +850,6 @@ Kind WantImpl(const AmdGpu::Regs& regs, u32& why) {
          bc.color_dst_factor == F::OneMinusSrcAlpha);
     if (g.sparks && g.fog && !regs.depth_control.depth_enable && !regs.IsClipDisabled() &&
         regs.color_buffers[0] && regs.color_target_mask.GetMask(0) && effect_blend) {
-        return Kind::Effect;
-    }
-    // bb-mv-fire: the game composites its offscreen effect buffer (fire, flames: [sparks-fire]
-    // listed vs 0x81d5812bbeb, 1/frame, motion key with write mask 0) onto the scene with a
-    // screen-space blended draw: Effect too, marked by brightness only (class 6, no vector).
-    if (g.sparks && g.fog && regs.IsClipDisabled() && regs.color_buffers[0] &&
-        regs.color_target_mask.GetMask(0) && effect_blend) {
         return Kind::Effect;
     }
     // Other draws of the scene pass: attachment 7 kept bound, not written (no pass restart).
@@ -2078,15 +2071,6 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         }
     } else if (ok && camera && g.history) {
         ++g.sec_overflow;
-    } else if (effect && !camera && g.history) {
-        // bb-mv-fire: an effect draw without a camera block (screen-space composite of the
-        // game's effect buffer): the zero entry (current data, no motion) and class 6 where it
-        // adds something bright: HUD-less marking only, the vector behind stays.
-        push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)};
-        push.objmv_flags = 1u | 64u;
-        push.objmv_fog = g.cur_effect_alpha ? (g.spark_word | 0x10000u) : g.spark_word;
-        ++g.sec_composite;
-        ++g.frame_vec_draws;
     } else if (blend && !effect && ok && !camera) {
         ++g.sec_fog_no_block; // bb-fog-mv: its vertex shader reads no 864 B camera block
     }
@@ -2781,15 +2765,13 @@ void OnFlip() {
             }
             Log(fmt::format("[sparks-fire] additive effect draws {:.1f}/frame, with vector "
                             "{:.1f}/frame (threshold BB_FG_SPARKS_ADD_LUM, never held as large) | "
-                            "screen-space effect composites marked {:.1f}/frame | "
                             "effect draws in the UI phase (skipped) {:.1f}/frame | blended draws "
                             "without a motion pipeline (vs: no attachment 7 / write mask 0, 1 s):{}",
                             double(g.sec_add_draws) / f, double(g.sec_add_vec) / f,
-                            double(g.sec_composite) / f,
                             double(g.sec_ui_skip) / f, t.empty() ? " none" : t));
         }
         g.skipped_vs.clear();
-        g.sec_add_draws = g.sec_add_vec = g.sec_ui_skip = g.sec_composite = 0;
+        g.sec_add_draws = g.sec_add_vec = g.sec_ui_skip = 0;
         g.spark_vs.clear();
         g.sec_spark_draws = g.sec_spark_vec = g.sec_spark_no_cam = g.sec_spark_px =
             g.sec_spark_frames = g.sec_spark_sky = 0;
