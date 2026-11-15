@@ -528,7 +528,10 @@ uint64_t Origin() {
 		// The ctest precompile_env_guard reads this list: a new switch must be here or in its output-only list. Of the
 		// options only the debug dump changes SPIR-V (debug info); the shader log direction only logs.
 		std::string text = KYTY_GIT_REVISION;
-		for (const char* name: {"KYTY_GPL", "KYTY_IMAGE_HEAP", "KYTY_IMAGE_FORMS", "KYTY_NULL_IMAGE_DIMS"}) {
+		// KYTY_UPSTREAM_PATHS and KYTY_LEAN_PATHS (common/upstreamPaths.h) pick between upstream's and lean's code,
+		// some of it in the recompiler.
+		for (const char* name: {"KYTY_GPL", "KYTY_IMAGE_HEAP", "KYTY_IMAGE_FORMS", "KYTY_NULL_IMAGE_DIMS",
+		                         "KYTY_UPSTREAM_PATHS", "KYTY_LEAN_PATHS"}) {
 			const char* value = std::getenv(name);
 			text += fmt::format("|{}={}", name, value != nullptr ? value : "");
 		}

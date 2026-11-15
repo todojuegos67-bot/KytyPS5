@@ -19,6 +19,14 @@ set(output_only
 	KYTY_PRECOMPILE_PREDICT   # adds predicted jobs; their SPIR-V and pipelines are what a draw of that record would make
 )
 file(READ "${SRC}/graphics/host_gpu/renderer/pipeline/shaderPrecompile.cpp" origin)
+# Only Origin()'s own list counts: a name merely mentioned elsewhere in the file is not fingerprinted.
+string(FIND "${origin}" "uint64_t Origin()" origin_begin)
+if(origin_begin EQUAL -1)
+	message(FATAL_ERROR "no Origin() in shaderPrecompile.cpp")
+endif()
+string(SUBSTRING "${origin}" ${origin_begin} -1 origin)
+string(FIND "${origin}" "return origin;" origin_end)
+string(SUBSTRING "${origin}" 0 ${origin_end} origin)
 string(REGEX MATCHALL "\"KYTY_[A-Z0-9_]+\"" fingerprint "${origin}")
 string(REPLACE "\"" "" fingerprint "${fingerprint}")
 if(NOT fingerprint)
