@@ -141,6 +141,9 @@ struct GraphicContext {
 		return graphics_pipeline_library_enabled && guest_image_heap_layout != nullptr;
 	}
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
+		// Where compute can require 32 (AMD), wave64 compute runs as two 32-wide subgroups, as on NVIDIA. AMD's
+		// driver (32.0.21045) crashed compiling chained DPP-row shuffles at subgroup size 64.
+		if (compute_subgroup_size_control_enabled && min_subgroup_size <= 32u) return false;
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
 	}
 

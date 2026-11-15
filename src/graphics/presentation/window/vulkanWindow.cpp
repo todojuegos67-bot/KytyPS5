@@ -20,6 +20,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -1688,6 +1689,8 @@ void WindowContext::CreateVulkan() {
 	physical_device_properties.pNext = &push_descriptor_properties;
 	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
+	// NVIDIA reloads coherent loads without a barrier; AMD's drivers need one (SpirvEmitter.h).
+	ShaderRecompiler::Spirv::SetCoherentLoadAcquire(graphic_ctx.physical_device_properties.vendorID != 0x10deu);
 	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();

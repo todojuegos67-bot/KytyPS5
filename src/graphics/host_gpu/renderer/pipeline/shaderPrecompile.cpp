@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 
+#include "common/archive.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -857,6 +858,30 @@ namespace {
 // (where the rest of its shaders are), then every other file, smallest first.
 std::vector<std::filesystem::path> ScanOrder(const std::filesystem::path& game_dir) {
 	std::vector<std::pair<int, std::pair<uintmax_t, std::filesystem::path>>> files;
+	const auto rank_of = [](const std::string& name) {
+		return name == "eboot.bin" ? 0 : (name == "material" || name == "materialgraph") ? 1 : 2;
+	};
+	// A game loaded from a ZArchive: its files are virtual paths inside the archive.
+	if (Common::IsArchivePath(game_dir)) {
+		std::vector<std::filesystem::path> folders {game_dir};
+		while (!folders.empty()) {
+			const auto folder = std::move(folders.back());
+			folders.pop_back();
+			for (const auto& entry: Common::File::GetDirEntries(folder)) {
+				const auto path = folder / entry.name;
+				if (!entry.is_file) {
+					folders.push_back(path);
+					continue;
+				}
+				const auto info = Common::File::GetInfo(path);
+				files.push_back({rank_of(entry.name), {info ? info->size : 0u, path}});
+			}
+		}
+		std::ranges::sort(files);
+		std::vector<std::filesystem::path> order;
+		for (auto& [rank, file]: files) order.push_back(std::move(file.second));
+		return order;
+	}
 	std::error_code error;
 	for (auto it = std::filesystem::recursive_directory_iterator(
 	         game_dir, std::filesystem::directory_options::follow_directory_symlink |
@@ -979,9 +1004,14 @@ ImportResult ImportHints(const std::filesystem::path& path, const std::filesyste
 	// footer, each of the first three from a 16-byte boundary. All 14,586 Marvel's Wolverine binaries are laid out so.
 	constexpr size_t ProgramMetadataMax = 1u << 20u; // the metadata a chunk's kept tail allows for
 	const auto       align16            = [](uint64_t value) { return (value + 15u) & ~uint64_t {15u}; };
-	const auto files = ScanOrder(game_dir);
-	uint64_t   total = 0;
+	const auto files   = ScanOrder(game_dir);
+	const bool archive = Common::IsArchivePath(game_dir);
+	uint64_t   total   = 0;
 	for (const auto& file: files) {
+		if (archive) {
+			total += Common::File::Size(file);
+			continue;
+		}
 		std::error_code error;
 		total += std::filesystem::file_size(file, error);
 	}
@@ -992,14 +1022,25 @@ ImportResult ImportHints(const std::filesystem::path& path, const std::filesyste
 	const std::boyer_moore_horspool_searcher searcher(marker, marker + FooterMarker.size());
 	for (const auto& file: files) {
 		if (found.size() == distinct.size()) break;
-		std::ifstream stream(file, std::ios::binary);
-		if (!stream) continue;
+		std::ifstream stream;
+		Common::File  archived;
+		if (archive ? !archived.Open(file, Common::File::Mode::Read)
+		            : (stream.open(file, std::ios::binary), !stream)) {
+			continue;
+		}
 		buffer.clear();
 		for (;;) {
 			const auto kept = buffer.size();
 			buffer.resize(kept + Chunk);
-			stream.read(reinterpret_cast<char*>(buffer.data() + kept), static_cast<std::streamsize>(Chunk));
-			const auto read = static_cast<size_t>(stream.gcount());
+			size_t read = 0;
+			if (archive) {
+				uint32_t got = 0;
+				archived.Read(buffer.data() + kept, static_cast<uint32_t>(Chunk), &got);
+				read = got;
+			} else {
+				stream.read(reinterpret_cast<char*>(buffer.data() + kept), static_cast<std::streamsize>(Chunk));
+				read = static_cast<size_t>(stream.gcount());
+			}
 			buffer.resize(kept + read);
 			result.bytes_read += read;
 			if (progress) progress(result.bytes_read, total);

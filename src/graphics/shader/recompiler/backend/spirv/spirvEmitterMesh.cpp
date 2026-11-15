@@ -139,6 +139,21 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.builder.AllocateId());
+	// Workgroup memory starts undefined (AMD hands over the previous workgroup's LDS). A guest wave that skips
+	// GS_ALLOC_REQ must allocate nothing rather than a stale count.
+	state.lane_half   = 0;
+	const auto leader = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), leader, EmitLocalInvocationIndex(state),
+	                          ConstantU32(state, 0));
+	EmitIfCondition(state, leader, [&] {
+		for (uint32_t field = 0; field < 2; field++) {
+			state.builder.AddFunction(spv::OpStore,
+			                          MeshElement(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+			                                      TypeU32(state), ConstantU32(state, field)),
+			                          ConstantU32(state, 0));
+		}
+	});
+	EmitBarrier(state);
 	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
 	                          state.mesh_guest_func);
 	// All guest waves finish before the uniform Vulkan allocation and output stores.

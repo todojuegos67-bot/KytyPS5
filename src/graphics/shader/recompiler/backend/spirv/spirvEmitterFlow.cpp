@@ -120,7 +120,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lane) {
 	auto&      state  = ctx.state;
 	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
-	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(state, scope, exec);
+	const auto ballot = EmitSubgroupBallot(state, exec);
 	if (ctx.half != 0) {
 		lane = EmitAndConstant(state, lane, 31);
 	}
@@ -862,6 +862,14 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
 	}
+	if (ctx.state.split_subgroup) {
+		// All: no active lane of the half fails. Any: some active lane of the half holds.
+		auto&      state = ctx.state;
+		const auto voted = zero ? EmitLogicalNotBool(state, predicate) : predicate;
+		const auto word  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, EmitSubgroupBallot(state, voted), 0);
+		return Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), word, ConstantU32(state, 0));
+	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
 	                              TypeBool(ctx.state), result,
@@ -876,8 +884,7 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 uint32_t EmitLiveMask(EmitterState& state) {
 	const auto helper =
 	    EmitNative<spv::OpLoad, IR::Type::U1>(state, state.helper_invocation_variable);
-	return EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(
-	    state, ConstantU32(state, spv::ScopeSubgroup), EmitLogicalNotBool(state, helper));
+	return EmitSubgroupBallot(state, EmitLogicalNotBool(state, helper));
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -920,8 +927,7 @@ uint32_t EmitLaneReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    ctx.other_half != nullptr ? ctx.HalfArg(inst, 0, half) : ctx.Arg(inst, 0),
 		    ConstantU32(state, identity));
 		const auto reduced = state.builder.AllocateId();
-		state.builder.AddFunction(group, TypeU32(state), reduced, ConstantU32(state, spv::ScopeSubgroup),
-		                          static_cast<uint32_t>(spv::GroupOperationReduce), taken);
+		EmitSubgroupReduce(state, group, TypeU32(state), reduced, taken);
 		if (half == 0u) result = reduced;
 		else if (join != spv::OpNop) result = Binary(state, join, TypeU32(state), result, reduced);
 		else result = identity == 0u ? EmitUMax32(state, result, reduced) : EmitUMin32(state, result, reduced);
@@ -969,8 +975,7 @@ uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = Select(state, TypeU32(state), helper, ConstantU32(state, identity), value);
 	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(group, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup),
-	                          spv::GroupOperationReduce, value);
+	EmitSubgroupReduce(state, group, TypeU32(state), result, value);
 	if (state.wave_split) {
 		const auto [low, high] = EmitWaveExchange(state, result);
 		return join(state, low, high);

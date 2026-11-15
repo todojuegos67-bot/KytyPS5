@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,8 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
+
+std::atomic_bool g_coherent_load_acquire {false};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -215,6 +218,14 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage, bool bu
 
 } // namespace
 
+void SetCoherentLoadAcquire(bool enabled) {
+	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
+}
+
+bool GetCoherentLoadAcquire() {
+	return g_coherent_load_acquire.load(std::memory_order_relaxed);
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
                                   bool emit_debug_info, uint32_t descriptor_set) {
@@ -243,6 +254,9 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	                       : 1u;
 	// A split program emitted again for a 64-wide host is ordinary there (its votes are per lane).
 	state.wave_split = program.wave_split && workgroup != nullptr && workgroup->host_subgroup_size == 32u;
+	// A mesh shader's host subgroup is the device default where the stage cannot require one (AMD: 64).
+	state.split_subgroup = program.stage == ShaderType::Mesh && workgroup != nullptr && program.wave_size == 32u &&
+	                       workgroup->host_subgroup_size == 64u;
 	DefineModule(state);
 	if (!KYTY_UPSTREAM_PATH("45b35fafb")) ValidateNativeProgram(program,
 	                      program.stage == ShaderType::Compute && input_info.compute->lds_storage,

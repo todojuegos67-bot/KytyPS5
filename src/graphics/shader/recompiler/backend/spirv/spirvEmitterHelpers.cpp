@@ -174,7 +174,59 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
 	                          state.subgroup_local_invocation_id_variable);
+	if (state.split_subgroup) {
+		return EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, 31));
+	}
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+}
+
+namespace {
+
+uint32_t EmitSplitSubgroupBase(EmitterState& state) {
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, EmitHostSubgroupInvocationId(state), ConstantU32(state, 32));
+}
+
+} // namespace
+
+uint32_t EmitSubgroupBallot(EmitterState& state, uint32_t predicate) {
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+	if (!state.split_subgroup) {
+		return ballot;
+	}
+	// The caller's half by a select of the two words: AMD's compiler (32.0.21045) crashed on a dynamic extract here.
+	const auto in_high = Binary(state, spv::OpINotEqual, TypeBool(state), EmitSplitSubgroupBase(state),
+	                            ConstantU32(state, 0));
+	const auto low_word  = state.builder.AllocateId();
+	const auto high_word = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, ballot, 1);
+	const auto own = Select(state, TypeU32(state), in_high, high_word, low_word);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result, own, ConstantU32(state, 0),
+	                          ConstantU32(state, 0), ConstantU32(state, 0));
+	return result;
+}
+
+uint32_t EmitSubgroupShuffleLane(EmitterState& state, uint32_t lane) {
+	if (!state.split_subgroup) {
+		return lane;
+	}
+	return EmitBinaryU32(state, spv::OpBitwiseOr, EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31)),
+	                     EmitSplitSubgroupBase(state));
+}
+
+void EmitSubgroupReduce(EmitterState& state, spv::Op op, uint32_t type, uint32_t result, uint32_t value) {
+	if (state.split_subgroup) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformClustered);
+		state.builder.AddFunction(op, type, result, ConstantU32(state, spv::ScopeSubgroup),
+		                          static_cast<uint32_t>(spv::GroupOperationClusteredReduce), value,
+		                          ConstantU32(state, 32));
+		return;
+	}
+	state.builder.AddFunction(op, type, result, ConstantU32(state, spv::ScopeSubgroup),
+	                          static_cast<uint32_t>(spv::GroupOperationReduce), value);
 }
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
@@ -254,9 +306,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
-	const auto active_ballot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+	const auto active_ballot = EmitSubgroupBallot(state, ConstantBool(state, true));
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
