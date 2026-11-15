@@ -316,6 +316,8 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	uint32_t                       m_image_index         = 0;
 	uint32_t                       m_frame_index         = 0;
+	// A suboptimal acquire or present still shows the frame; the swapchain is made again before the next one.
+	bool                           m_suboptimal          = false;
 };
 
 struct Presenter::Impl {
@@ -590,6 +592,7 @@ void Swapchain::Destroy() {
 	m_extent        = {};
 	m_window_extent = {};
 	m_frame_index   = 0;
+	m_suboptimal    = false;
 	m_images.clear();
 	m_image_views.clear();
 	m_image_acquired.clear();
@@ -614,6 +617,9 @@ void Swapchain::Recreate(bool surface_lost) {
 }
 
 bool Swapchain::NeedsResize() const {
+	if (m_suboptimal) {
+		return true;
+	}
 	Common::LockGuard lock(m_window.mutex);
 	return m_window_extent.width != m_window.graphic_ctx.screen_width ||
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
@@ -632,8 +638,10 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
+			// The image is acquired and presentable: dropping it here lost the frame.
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			m_suboptimal = true;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -998,8 +1006,10 @@ Swapchain::Status Swapchain::Present() {
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
+			// The frame was shown: a Recreate here made the presenter show it a second time.
 			LOGF("vkQueuePresentKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			m_suboptimal = true;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
