@@ -409,10 +409,21 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
+		WaitSent(tick);
 		m_master.Wait(tick);
 		BeginNext();
 	} else {
+		WaitSent(tick);
 		m_master.Wait(tick);
+	}
+}
+
+// A driver wait for a value no submit has sent yet is legal and silent: it would park behind the recording thread with
+// nothing in a stack to say so. Wait for the send first; a blocked recording thread then shows here.
+void CommandScheduler::WaitSent(uint64_t tick) {
+	for (auto sent = m_sent_tick.load(std::memory_order_acquire); sent < tick;
+	     sent      = m_sent_tick.load(std::memory_order_acquire)) {
+		m_sent_tick.wait(sent, std::memory_order_acquire);
 	}
 }
 
@@ -640,6 +651,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			(void)SendSparse(m_sparse_unbinds, m_master.Handle(), tick);
 		}
 	}
+	m_sent_tick.store(tick, std::memory_order_release);
+	m_sent_tick.notify_all();
 	FreeSparse();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
@@ -727,6 +740,8 @@ uint64_t CommandScheduler::SubmitThreaded(SubmitInfo& submit) {
 				self.DispatchSparse(std::move(*job.unbinds));
 			}
 		}
+		self.m_sent_tick.store(job.tick, std::memory_order_release);
+		self.m_sent_tick.notify_all();
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 		if (result != vk::Result::eSuccess) {
 			ReportVulkanFatal("vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit_id, job.debug_arg0,

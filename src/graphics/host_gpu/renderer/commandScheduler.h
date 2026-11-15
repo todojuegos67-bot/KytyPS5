@@ -49,6 +49,8 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	// Waits until the submit of `tick` has gone to the queue (the recording thread sends threaded ones).
+	void                      WaitSent(uint64_t tick);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
@@ -221,6 +223,7 @@ private:
 	// Recording thread (Threaded()): m_back belongs to it, the rest to the GPU thread.
 	CmdBack                      m_back;
 	std::atomic<bool>            m_threaded {false}; // the current command buffer goes through m_stream
+	std::atomic<uint64_t>        m_sent_tick {0};    // the last tick whose submit went to the queue
 	bool                         m_threaded_wanted = false;
 	uint64_t                     m_recording_switches = 0;
 	std::deque<uint64_t>         m_submit_marks; // the packets queued up to each submit not yet recorded
