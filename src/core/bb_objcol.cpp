@@ -23,6 +23,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -370,6 +373,8 @@ std::atomic<bool> g_hooked{false};
 u64 st_calls[3] = {}, st_bodies = 0, st_owned = 0, st_bad_id = 0, st_removed = 0;
 double g_last_summary = 0.0;
 std::string g_last_summary_text;
+std::set<std::string> g_mod_logged;
+u32 g_mod_lines = 0;
 
 int ModelFor(const std::string& id) {
     if (auto it = g_model_index.find(id); it != g_model_index.end()) {
@@ -388,6 +393,7 @@ int ModelFor(const std::string& id) {
 struct Job {
     std::string guest;
     int model;
+    std::string host; // set: MSB comparison job
 };
 std::mutex g_job_mutex;
 std::condition_variable g_job_cv;
@@ -480,6 +486,136 @@ void Analyse(const Job& job) {
              why.empty() ? files : " " + why);
 }
 
+// ---------------------------------------------------------------- MSB (map layout) source check
+
+std::string Join(const std::vector<std::string>& v, size_t max);
+std::string MapOf(const std::string& path);
+
+const char* SourceOf(const std::string& host) {
+    if (host.find("-mods") != std::string::npos) {
+        return "MODS folder";
+    }
+    if (host.find("-patch") != std::string::npos || host.find("-UPDATE") != std::string::npos) {
+        return "update/patch";
+    }
+    return host.empty() ? "unknown" : "base game";
+}
+
+bool ReadHost(const std::string& utf8, std::vector<u8>& out) {
+    std::ifstream f(std::filesystem::path(reinterpret_cast<const char8_t*>(utf8.c_str())),
+                    std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return !out.empty() && out.size() < (256ull << 20);
+}
+
+// UTF-16 / ASCII tokens "<letter><6 digits>_<4 digits>" (MSB part names: o = object,
+// h = collision, m = map piece, c = character...) and "<letter><6 digits>" (model names).
+void MsbNames(const std::vector<u8>& d, std::set<std::string>& parts,
+              std::set<std::string>& models) {
+    const auto take = [&](const std::string& t) {
+        if (t.size() == 12 && t[7] == '_' && std::isalpha(u8(t[0]))) {
+            bool ok = true;
+            for (size_t i = 1; i < 12 && ok; ++i) {
+                ok = i == 7 || (t[i] >= '0' && t[i] <= '9');
+            }
+            if (ok) {
+                parts.insert(t);
+            }
+        } else if (t.size() == 7 && std::isalpha(u8(t[0]))) {
+            bool ok = true;
+            for (size_t i = 1; i < 7 && ok; ++i) {
+                ok = t[i] >= '0' && t[i] <= '9';
+            }
+            if (ok) {
+                models.insert(t);
+            }
+        }
+    };
+    for (int step = 1; step <= 2; ++step) {
+        for (size_t start = 0; start < size_t(step); ++start) {
+            std::string cur;
+            for (size_t i = start; i + step <= d.size(); i += step) {
+                const u16 c = step == 1 ? d[i] : u16(d[i] | (d[i + 1] << 8));
+                if (c >= 0x21 && c < 0x7f) {
+                    cur.push_back(char(c));
+                    continue;
+                }
+                take(cur);
+                cur.clear();
+            }
+            take(cur);
+        }
+    }
+}
+
+std::string Diff(const std::set<std::string>& a, const std::set<std::string>& b, char kind,
+                 size_t max) {
+    std::vector<std::string> v;
+    for (const auto& x : a) {
+        if ((kind == 0 || x[0] == kind) && !b.contains(x)) {
+            v.push_back(x);
+        }
+    }
+    return Join(v, max);
+}
+
+size_t Count(const std::set<std::string>& a, char kind) {
+    return size_t(
+        std::count_if(a.begin(), a.end(), [&](const std::string& x) { return x[0] == kind; }));
+}
+
+void AnalyseMsb(const Job& job) {
+    const std::string& host = job.host;
+    std::vector<u8> raw, msb;
+    std::string why;
+    if (!ReadHost(host, raw) || !Undcx(raw, msb, why)) {
+        LOG_INFO(Core, "[objcol] msb {} served from {} ({}): not readable {}", job.guest, host,
+                 SourceOf(host), why);
+        return;
+    }
+    std::set<std::string> parts, models;
+    MsbNames(msb, parts, models);
+    std::string text = fmt::format(
+        "[objcol] msb {} served from {} ({}), {} bytes crc {:08x}: object parts {}, collision "
+        "parts {}, object models {}",
+        MapOf(job.guest), host, SourceOf(host), raw.size(),
+        u32(crc32(0, raw.data(), uInt(raw.size()))), Count(parts, 'o'), Count(parts, 'h'),
+        Count(models, 'o'));
+    const auto at = host.find("-mods");
+    if (at != std::string::npos) {
+        bool found = false;
+        for (const char* repl : {"-patch", "-UPDATE", ""}) {
+            const std::string van = host.substr(0, at) + repl + host.substr(at + 5);
+            std::vector<u8> vraw, vmsb;
+            std::string vwhy;
+            if (!ReadHost(van, vraw) || !Undcx(vraw, vmsb, vwhy)) {
+                continue;
+            }
+            found = true;
+            std::set<std::string> vparts, vmodels;
+            MsbNames(vmsb, vparts, vmodels);
+            text += fmt::format(
+                " | vanilla {} {} bytes crc {:08x}{}: object parts {}, collision parts {} | "
+                "object parts only in vanilla: {} | only in the mod: {} | collision parts only in "
+                "vanilla: {} | only in the mod: {} | object models only in vanilla: {} | only in "
+                "the mod: {}",
+                van, vraw.size(), u32(crc32(0, vraw.data(), uInt(vraw.size()))),
+                vraw == raw ? " (identical)" : "", Count(vparts, 'o'), Count(vparts, 'h'),
+                Diff(vparts, parts, 'o', 60), Diff(parts, vparts, 'o', 60),
+                Diff(vparts, parts, 'h', 60), Diff(parts, vparts, 'h', 60),
+                Diff(vmodels, models, 'o', 40), Diff(models, vmodels, 'o', 40));
+            break;
+        }
+        if (!found) {
+            text += " | no vanilla copy found next to the mods folder (-patch / -UPDATE / base)";
+        }
+    }
+    LOG_INFO(Core, "{}", text);
+}
+
 void Worker() {
     for (;;) {
         Job job;
@@ -490,7 +626,11 @@ void Worker() {
             g_jobs.pop_front();
         }
         try {
-            Analyse(job);
+            if (job.host.empty()) {
+                Analyse(job);
+            } else {
+                AnalyseMsb(job);
+            }
         } catch (...) {
         }
     }
@@ -1345,6 +1485,13 @@ bool Enabled() {
 
 namespace {
 void FileOpened(const std::string& p, const char* host, u64 size) {
+    if (host != nullptr && std::strstr(host, "-mods") != nullptr) {
+        std::scoped_lock lk{g_mutex};
+        if (g_mod_lines < 400 && g_mod_logged.insert(p).second) {
+            ++g_mod_lines;
+            LOG_INFO(Core, "[objcol] mod file {} served from {} ({} bytes)", p, host, size);
+        }
+    }
     if (p.find(".hkxbhd") != std::string::npos || p.find(".hkxbdt") != std::string::npos) {
         LOG_INFO(Core, "[objcol] collision file {} served from {} ({} bytes)", p, host ? host : "?",
                  size);
@@ -1360,7 +1507,17 @@ void FileOpened(const std::string& p, const char* host, u64 size) {
         g_map_models.clear();
         g_last_summary_text.clear();
         g_last_summary = Now();
-        LOG_INFO(Core, "[objcol] map {} loading (hooks {})", g_map, g_hooked.load() ? "on" : "off");
+        LOG_INFO(Core, "[objcol] map {} loading (hooks {}), layout served from {} ({})", g_map,
+                 g_hooked.load() ? "on" : "off", host ? host : "?", SourceOf(host ? host : ""));
+        if (host != nullptr) {
+            std::scoped_lock jl{g_job_mutex};
+            g_jobs.push_back({p, -1, host});
+            if (!g_worker_started) {
+                g_worker_started = true;
+                std::thread(Worker).detach();
+            }
+            g_job_cv.notify_one();
+        }
         return;
     }
     if (p.find("/obj/") == std::string::npos || !p.ends_with(".objbnd.dcx")) {
@@ -1386,7 +1543,7 @@ void FileOpened(const std::string& p, const char* host, u64 size) {
         }
     }
     std::scoped_lock lk{g_job_mutex};
-    g_jobs.push_back({p, model});
+    g_jobs.push_back({p, model, {}});
     if (!g_worker_started) {
         g_worker_started = true;
         std::thread(Worker).detach();
