@@ -89,6 +89,25 @@ static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions,
 	                   [name](const auto& ext) { return strcmp(ext.extensionName, name) == 0; });
 }
 
+// A compute shader that queries an image's LOD (ImageQueryLod) declares ComputeDerivativeGroupQuadsKHR
+// (spirvEmitterModule.cpp): the device enables the feature when it has it. Without it the SPIR-V is invalid for the
+// device, as it always was; most drivers accept it.
+static bool HasExtension(const std::vector<const char*>& extensions, const char* name);
+static void ChainComputeDerivatives(vk::PhysicalDevice physical_device, const std::vector<const char*>& extensions,
+                                    vk::DeviceCreateInfo& create_info,
+                                    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR& derivatives) {
+	if (!HasExtension(extensions, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) return;
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR supported {};
+	vk::PhysicalDeviceFeatures2                           features {};
+	features.pNext = &supported;
+	physical_device.getFeatures2(&features);
+	if (!supported.computeDerivativeGroupQuads) return;
+	derivatives                             = {};
+	derivatives.computeDerivativeGroupQuads = VK_TRUE;
+	derivatives.pNext                       = const_cast<void*>(create_info.pNext);
+	create_info.pNext                       = &derivatives;
+}
+
 static bool HasExtension(const std::vector<const char*>& extensions, const char* name) {
 	return std::any_of(extensions.begin(), extensions.end(),
 	                   [name](const char* ext) { return strcmp(ext, name) == 0; });
@@ -949,6 +968,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics, vk::SurfaceKHR su
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives {};
+	ChainComputeDerivatives(physical_device, device_extensions, create_info, derivatives);
 
 	vk::Device device = nullptr;
 
@@ -1359,6 +1380,8 @@ static vk::Device VulkanCreateDeviceChains(GraphicContext& graphics, vk::Surface
 		create.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
 	}
 
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives {};
+	ChainComputeDerivatives(physical_device, device_extensions, create.get(), derivatives);
 	vk::Device device = nullptr;
 	const auto result = physical_device.createDevice(&create.get(), nullptr, &device);
 	if (result != vk::Result::eSuccess) {
@@ -1731,7 +1754,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
 		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
-		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME}) {
+		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+		                             VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
