@@ -856,14 +856,15 @@ private:
 			auto* inst = value.TryInstruction();
 			if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
 			if (m_srt_visited.contains(inst)) return;
-			const auto cycle = std::ranges::find(m_srt_visiting, inst);
-			if (cycle != m_srt_visiting.end()) {
+			if (m_srt_on_path.contains(inst)) { // a cycle: the path is searched only then
+				const auto cycle = std::ranges::find(m_srt_visiting, inst);
 				if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
 					return value->GetOpcode() == ValueOpcode::Phi;
 				})) return;
 				Fail(use_pc, "cyclic typed planning value without a phi");
 			}
 			m_srt_visiting.push_back(inst);
+			m_srt_on_path.insert(inst);
 			uint32_t memory_index = 0;
 			const auto* memory = ScalarReadMemory(*inst, memory_index);
 			Visit visit {.inst = inst, .memory = memory != nullptr};
@@ -894,6 +895,7 @@ private:
 			const bool memory = visits.back().memory;
 			visits.pop_back();
 			m_srt_visiting.pop_back();
+			m_srt_on_path.erase(inst);
 			m_srt_visited.insert(inst);
 			if (!memory) continue;
 			const auto offset = inst->Arg(1).Resolve();
@@ -4563,6 +4565,7 @@ private:
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
+	std::unordered_set<const Inst*>            m_srt_on_path; // m_srt_visiting's members
 	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
