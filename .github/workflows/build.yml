@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, wolverine ]
   pull_request:
 
 concurrency:
@@ -93,13 +93,19 @@ jobs:
           glslangValidator --version
           echo Qt6_DIR=%Qt6_DIR%
 
+      - name: Map the source to the profile's path
+        shell: cmd
+        run: |
+          subst K: "%GITHUB_WORKSPACE%"
+
       - name: Configure
         shell: cmd
         run: |
-          cmake -S . -B _Build/windows ^
+          cmake -S K:/ -B K:/_Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_PGO_USE=K:/pgo/PPSA03671.profdata ^
             -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
             -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
@@ -112,7 +118,7 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher ^
+          cmake --build K:/_Build/windows --target launcher ^
             audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
@@ -124,12 +130,12 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml)$"
+          ctest --test-dir K:/_Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml)$"
 
       - name: Install
         shell: cmd
         run: |
-          cmake --install _Build/windows --prefix _Build/windows/install
+          cmake --install K:/_Build/windows --prefix K:/_Build/windows/install
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -443,7 +449,9 @@ jobs:
     if: >-
       always() &&
       github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      (github.repository == 'KytyPS5/KytyPS5' ||
+       (github.repository == 'Senaxx/KytyPS5' && github.ref == 'refs/heads/wolverine') ||
+       (github.repository == 'Senaxx/KytyPS5-Wolverine' && github.ref == 'refs/heads/main')) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
@@ -482,6 +490,7 @@ jobs:
         run: |
           windows_dir="artifacts/KytyPS5-Windows-x64"
           test -d "$windows_dir"
+          test -s "$windows_dir/hints/PPSA03671.kyhints"
           (
             cd "$windows_dir"
             zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
