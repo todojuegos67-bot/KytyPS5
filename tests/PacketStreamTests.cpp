@@ -43,7 +43,11 @@ void Run(const std::byte* data, void* context) {
 		}
 	}
 	seen.order.push_back(number);
-	if (seen.slow_us != 0) std::this_thread::sleep_for(std::chrono::microseconds(seen.slow_us));
+	if (seen.slow_us != 0) { // spins: a sleep this short lasts a whole timer tick on Windows
+		const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(seen.slow_us);
+		while (std::chrono::steady_clock::now() < until) {
+		}
+	}
 }
 
 std::byte* Put(Common::PacketStream& stream, uint32_t number, uint32_t size) {
