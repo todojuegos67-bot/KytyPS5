@@ -189,6 +189,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                               g_bb_objmv2 == BB::ObjMv2::Kind::Effect;
         info.hw.fs.bb_objmv_blend = g_bb_objmv2 == BB::ObjMv2::Kind::Blend;
         info.hw.fs.bb_objmv_add = g_bb_objmv2 == BB::ObjMv2::Kind::Effect; // bb-mv-fill
+        // bb-mv-gate (review): the bright-pixel counter only with BB_FG_SPARKS=1 (the blended
+        // variants of BB_FOG_MV alone stay as they were: no atomics, same memory model).
+        info.hw.fs.bb_objmv_count =
+            (info.hw.fs.bb_objmv_blend || info.hw.fs.bb_objmv_add) && BB::ObjMv2::SparksOn();
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |

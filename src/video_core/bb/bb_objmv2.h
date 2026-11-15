@@ -100,8 +100,11 @@ bool SparksOn();
 // Presenter (bb_present_sr.cpp), after bb_mv.comp: the object vectors over the camera ones
 // (`mv` RG16F, General); `color` the presented colour (RGBA16F, General) for the check.
 // `reactive_view` the upscaler's reactive mask (R16F, General): bb-fog-mv may raise it.
+// bb-mv-sky: `depth_view` the scene depth (read-only), `sky_depth` the depth from which a pixel
+// counts as sky (view distance >= half the far plane; 0: off), `depth_greater` reversed depth.
 void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_view,
-             vk::ImageView reactive_view, vk::Extent2D render, bool reset);
+             vk::ImageView reactive_view, vk::Extent2D render, bool reset,
+             vk::ImageView depth_view = {}, float sky_depth = 0.0f, bool depth_greater = false);
 // (11-13) Presenter, FSR 3 "player from the real frame": attachment 7 (class in .z, 1 = moving
 // opaque) and the part of it this frame's render covers (render / image size). False: none.
 bool ObjectTarget(vk::ImageView& view, float& scale_x, float& scale_y);

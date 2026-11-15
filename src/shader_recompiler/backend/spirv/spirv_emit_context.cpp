@@ -72,7 +72,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma || ObjMvVertex()) {
+    if (info.uses_dma || ObjMvVertex() || ObjMvFragmentCounts()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -754,6 +754,11 @@ void EmitContext::DefineOutputs() {
         }
         if (ObjMvFragment() && !Sirit::ValidId(frag_outputs[ObjMvOutput].id)) {
             objmv_frag_out = DefineOutput(F32[4], ObjMvOutput);
+            // bb-mv-gate: blended / effect draws count their bright pixels (1 in 16 by position).
+            if (ObjMvFragmentCounts() && !Sirit::ValidId(frag_coord)) {
+                frag_coord =
+                    DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
+            }
             objmv_in_cur = DefineInput(F32[4], ObjMvCurLocation);
             objmv_in_prev = DefineInput(F32[4], ObjMvPrevLocation);
             Name(objmv_frag_out, "bb_objmv_vector");

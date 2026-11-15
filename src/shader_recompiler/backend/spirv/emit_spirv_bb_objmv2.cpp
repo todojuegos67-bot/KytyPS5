@@ -37,6 +37,38 @@ Id PushF32(EmitContext& ctx, u32 member) {
                       ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[1]),
                                         ctx.push_data_block, ctx.ConstU32(member)));
 }
+// bb-mv-gate: count this draw's bright pixels (1 in 16: x and y multiples of 4) in the u32 the host
+// reserved 16 bytes before the draw's table entry (push flags bit 5). Read back a few frames
+// later: a draw whose bright pixels cover a large area (fog gate, mist wall, moon) is never
+// marked (bit 4), on every frame and every tile alike.
+void CountBright(EmitContext& ctx, Id flags, Id bright) {
+    if (!ctx.ObjMvFragmentCounts() || !Sirit::ValidId(ctx.frag_coord)) {
+        return;
+    }
+    const Id b = ctx.U1[1];
+    const Id has = ctx.OpINotEqual(b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(32u)),
+                                   ctx.u32_zero_value);
+    const Id fc = ctx.OpLoad(ctx.F32[4], ctx.frag_coord);
+    const Id x = ctx.OpConvertFToU(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], fc, 0u));
+    const Id y = ctx.OpConvertFToU(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], fc, 1u));
+    const Id sample = ctx.OpIEqual(
+        b, ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpBitwiseOr(ctx.U32[1], x, y), ctx.ConstU32(3u)),
+        ctx.u32_zero_value);
+    const Id cond = ctx.OpLogicalAnd(b, ctx.OpLogicalAnd(b, has, bright), sample);
+    const Id count_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(cond, count_label, merge_label);
+    ctx.AddLabel(count_label);
+    const Id addr = ctx.OpISub(ctx.U64, PushAddress(ctx, PushData::ObjMvEntryIndex),
+                               ctx.Constant(ctx.U64, u64(16)));
+    const Id ptr = ctx.OpConvertUToPtr(
+        ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, ctx.U32[1]), addr);
+    ctx.OpAtomicIAdd(ctx.U32[1], ptr, ctx.ConstU32(u32(spv::Scope::Device)),
+                     ctx.u32_zero_value, ctx.u32_one_value);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
 } // namespace
 
 bool EmitContext::ObjMvPrevPass() const {
@@ -208,10 +240,15 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
             const Id added = ctx.OpFMul(f32, lum, alpha);
             const Id sthr = ctx.OpFMul(f32, ctx.OpConvertUToF(f32, sbits),
                                        ctx.Constant(f32, 1.0f / 4096.0f));
-            const Id bright = ctx.OpLogicalAnd(
+            const Id measured = ctx.OpLogicalAnd(
                 b, ctx.OpLogicalAnd(b, spark_on, written),
                 ctx.OpLogicalAnd(b, ctx.OpFOrdGreaterThan(b, added, sthr),
                                  ctx.OpLogicalNot(b, ctx.OpIsInf(b, added))));
+            CountBright(ctx, flags, measured);
+            // bb-mv-gate: flags bit 4: a large draw (measured): never marked, on any pixel.
+            const Id large = ctx.OpINotEqual(
+                b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(16u)), ctx.u32_zero_value);
+            const Id bright = ctx.OpLogicalAnd(b, measured, ctx.OpLogicalNot(b, large));
             weight = ctx.OpSelect(f32, bright, one, weight);
             cls = ctx.OpSelect(f32, spark_on,
                                ctx.OpSelect(f32, bright, ctx.Constant(f32, 5.0f), zero), cls);
@@ -251,9 +288,14 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
                 ctx.OpConvertUToF(f32, ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.ConstU32(0xffffu))),
                 ctx.Constant(f32, 1.0f / 4096.0f));
             // NaN / Inf colours never count (OpFOrdGreaterThan is false for NaN).
-            const Id bright = ctx.OpLogicalAnd(b, ctx.OpFOrdGreaterThan(b, lum, thr),
-                                               ctx.OpLogicalNot(b, ctx.OpIsInf(b, lum)));
-            weight = ctx.OpSelect(f32, ctx.OpLogicalAnd(b, written, bright), one, zero);
+            const Id measured = ctx.OpLogicalAnd(
+                b, written, ctx.OpLogicalAnd(b, ctx.OpFOrdGreaterThan(b, lum, thr),
+                                             ctx.OpLogicalNot(b, ctx.OpIsInf(b, lum))));
+            CountBright(ctx, flags, measured);
+            const Id large = ctx.OpINotEqual(
+                b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(16u)), ctx.u32_zero_value);
+            weight = ctx.OpSelect(f32, ctx.OpLogicalAnd(b, measured, ctx.OpLogicalNot(b, large)),
+                                  one, zero);
         }
     }
     ctx.OpStore(ctx.objmv_frag_out,
