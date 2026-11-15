@@ -1405,7 +1405,7 @@ std::map<u64, u64> g_producers; // producer vtable (eboot offset) -> times seen 
 void CountProducers(u64 fd4) {
     u64 range[2];
     if (!SafeCopy(range, fd4 + 0x30, sizeof(range)) || range[1] < range[0] ||
-        range[1] - range[0] > 0x8000) {
+        range[1] - range[0] > 0x8000 || ((range[0] | range[1]) & 7) != 0) {
         return;
     }
     std::vector<u64> list((range[1] - range[0]) / 8);
