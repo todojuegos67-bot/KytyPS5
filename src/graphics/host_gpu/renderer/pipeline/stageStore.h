@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_STAGESTORE_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_STAGESTORE_H_
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -56,7 +57,7 @@ private:
 	std::fstream                        m_file;
 	std::unordered_map<uint64_t, Entry> m_index;
 	uint64_t                            m_end     = 0;
-	bool                                m_writing = false;
+	std::atomic<bool>                   m_writing = false; // Append reads it before taking the lock
 };
 
 } // namespace Libs::Graphics::Precompile

@@ -717,6 +717,13 @@ add_executable(packet_stream_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(packet_stream_tests PRIVATE ${inc_headers})
 
+add_executable(stage_store_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/StageStoreTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/stageStore.cpp"
+)
+target_include_directories(stage_store_tests PRIVATE ${inc_headers})
+target_link_libraries(stage_store_tests xxhash libzstd_static)
+
 add_executable(pipeline_ahead_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineAheadTests.cpp"
 )
@@ -999,6 +1006,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_read_check COMMAND $<TARGET_FILE:scalar_read_check_tests>)
 	add_test(NAME hash_memo COMMAND $<TARGET_FILE:hash_memo_tests>)
 	add_test(NAME packet_stream COMMAND $<TARGET_FILE:packet_stream_tests>)
+	add_test(NAME stage_store COMMAND $<TARGET_FILE:stage_store_tests>)
 	add_test(NAME pipeline_ahead COMMAND $<TARGET_FILE:pipeline_ahead_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -1140,6 +1148,7 @@ if(BUILD_TESTING)
 		scalar_read_check_tests
 		hash_memo_tests
 		packet_stream_tests
+		stage_store_tests
 		pipeline_ahead_tests
 		common_tests
 		shader_vertex_metadata_tests
