@@ -1,0 +1,58 @@
+// mesh_indirect_args.comp for a list of draws, one per workgroup: RenderExecutor::BatchMeshArguments records one dispatch
+// before a pass, and the pass's mesh draws add their records until the command buffer is submitted.
+
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+	uint words[];
+};
+
+// MeshArgumentsRecord in renderDraw.cpp.
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Records {
+	uint64_t arguments; // the guest's four dwords
+	uint64_t output_;   // the task command (three dwords), then the five draw dwords at +16 bytes
+	uint     primitive_size;
+	uint     primitive_step;
+	uint     primitives_per_group;
+	uint     native; // nonzero: the shader takes no first vertex from the draw
+};
+
+layout(push_constant) uniform Parameters {
+	uint64_t records;
+	uint     max_groups_x;
+	uint     max_groups_y;
+	uint     max_groups_total;
+	uint     unused;
+} parameters;
+
+void main() {
+	Records record   = Records(parameters.records + uint64_t(gl_WorkGroupID.x) * 32ul);
+	Words arguments  = Words(record.arguments);
+	Words result     = Words(record.output_);
+	const uint vertices   = arguments.words[0];
+	const uint instances  = arguments.words[1];
+	const uint primitives = vertices < record.primitive_size
+	                            ? 0u
+	                            : (vertices - record.primitive_size) / record.primitive_step + 1u;
+	uint groups = primitives == 0u || instances == 0u
+	                  ? 0u
+	                  : (primitives - 1u) / record.primitives_per_group + 1u;
+	// Over the host's limits nothing is drawn (the CPU path stops with an error there).
+	if (groups > parameters.max_groups_x || instances > parameters.max_groups_y ||
+	    uint64_t(groups) * uint64_t(instances) > uint64_t(parameters.max_groups_total)) {
+		groups = 0u;
+	}
+	result.words[0] = groups;
+	result.words[1] = groups == 0u ? 0u : instances;
+	result.words[2] = 1u;
+	result.words[4] = vertices;
+	result.words[5] = record.native != 0u ? 0u : arguments.words[2];
+	// Instance IDs exclude the start instance (shaders add it from user data), as on the CPU path.
+	result.words[6] = 0u;
+	result.words[7] = 0u;
+	result.words[8] = 0u;
+}

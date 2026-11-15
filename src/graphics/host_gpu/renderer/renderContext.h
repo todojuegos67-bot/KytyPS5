@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/indirectWriteTables.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
@@ -31,8 +32,7 @@ class GuestGpu;
 
 class RenderContext {
 public:
-	explicit RenderContext(GraphicContext&              graphics,
-	                       const std::filesystem::path& shader_store = ShaderStorePath());
+	explicit RenderContext(GraphicContext& graphics);
 	~RenderContext();
 	KYTY_CLASS_NO_COPY(RenderContext);
 
@@ -46,18 +46,29 @@ public:
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
+	GuestImageHeap&     GetGuestImageHeap() { return m_guest_image_heap; }
 	ImageHeap&          GetImageHeap() { return m_image_heap; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
+	IndirectWriteTables& GetIndirectWriteTables() { return m_indirect_write_tables; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// Advances whenever a range is mapped or unmapped.
+	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
+	// Where the mapping that holds vaddr ends, at most size bytes on; vaddr if it is not mapped.
+	[[nodiscard]] uint64_t MappedEnd(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void               ResyncHostProtection(uint64_t vaddr, uint64_t size) { m_page_manager.ResyncHostProtection(vaddr, size); }
+	void               ApplyHostProtection(uint64_t vaddr, uint64_t size,
+	                                   Common::VirtualMemory::Mode (*guest_mode)(uint64_t, void*), void* context) {
+		m_page_manager.ApplyHostProtection(vaddr, size, guest_mode, context);
+	}
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
@@ -79,6 +90,7 @@ private:
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
+	GuestImageHeap            m_guest_image_heap;
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	PageManager               m_page_manager;
@@ -86,11 +98,14 @@ private:
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
 	OcclusionQueries          m_occlusion_queries;
+	IndirectWriteTables       m_indirect_write_tables {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	uint64_t                  m_mapped_ranges_version = 0;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

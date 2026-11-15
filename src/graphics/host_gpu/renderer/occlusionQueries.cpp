@@ -32,7 +32,7 @@ OcclusionQueries::~OcclusionQueries() {
 	}
 }
 
-int32_t OcclusionQueries::BeginQuery(vk::CommandBuffer command) {
+int32_t OcclusionQueries::BeginQuery(Cmd command) {
 	if (m_begun - m_read == QUERY_COUNT) {
 		m_uncounted++;
 		return -1;

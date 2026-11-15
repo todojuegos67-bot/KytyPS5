@@ -7,6 +7,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <cstdint>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -29,6 +30,14 @@ public:
 	// Caches every target of the table of V#s at [address, address + size) that a store can
 	// write. Returns whether the table names any.
 	bool Prepare(uint64_t address, uint64_t size);
+	// Caches the memory after a pointer that a shader's computed store V#s derive from. Only the
+	// shader knows the offsets, so it covers MaxRootBytes or up to the end of the mapping; a store
+	// past that reaches a cached buffer or is reported by NoteDroppedStores.
+	void PrepareRoot(uint64_t address);
+	// A dispatch with stores through runtime V#s was recorded.
+	void NotePendingWrites() noexcept { m_pending_writes = true; }
+	// Logs the caching pages where such a store found no cached buffer and was lost.
+	void NoteDroppedStores(std::span<const uint64_t> pages);
 	// Whether a table was prepared since the last call.
 	[[nodiscard]] bool TakePendingWrites() noexcept {
 		const bool pending = m_pending_writes;
@@ -46,6 +55,9 @@ public:
 	[[nodiscard]] static std::vector<GuestRange> CoalesceTargets(std::vector<GuestRange> ranges);
 
 private:
+	static constexpr uint64_t MaxRootBytes = 256ull * 1024ull * 1024ull;
+	static constexpr uint64_t RootEndGranule = 64ull * 1024ull * 1024ull; // see PrepareRoot
+
 	// A game binds few tables; the least recently prepared one beyond this is forgotten.
 	static constexpr size_t MaxTables = 8;
 
@@ -70,6 +82,9 @@ private:
 	RangeSet m_targets;
 	uint64_t m_use_count      = 0;
 	bool     m_pending_writes = false;
+	// The pointers logged so far, and the pages where stores were lost.
+	std::set<uint64_t> m_roots;
+	uint64_t           m_dropped_pages = 0;
 };
 
 } // namespace Libs::Graphics

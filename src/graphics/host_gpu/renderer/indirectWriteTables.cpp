@@ -126,13 +126,25 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 	}
 	std::vector<GuestRange> targets;
 	// Pages the CPU did not write since the last scan still hold the snapshot's entries.
+	// The written state is per page and goes with this call: a table sharing the page scans now too.
 	buffer_cache.ConsumeCpuWrites(address, bytes, [&](uint64_t run, uint64_t run_size) {
-		if (!full) {
-			const auto first = (run - address) / EntrySize;
-			const auto last  = std::min(Common::AlignUp(run + run_size - address, EntrySize) /
-			                                EntrySize,
-			                            count);
-			Scan(*table, first, last, true, targets);
+		const auto run_begin = Common::AlignDown(run, TRACKER_PAGE_SIZE);
+		const auto run_end   = Common::AlignUp(run + run_size, TRACKER_PAGE_SIZE);
+		for (auto& other: m_tables) {
+			const auto begin = std::max(run_begin, other.address);
+			const auto end   = std::min(run_end, other.address + other.size);
+			if (begin >= end || (&other == &*table && full)) {
+				continue;
+			}
+			const auto first = (begin - other.address) / EntrySize;
+			const auto last  = Common::AlignUp(end - other.address, EntrySize) / EntrySize;
+			if (&other == &*table) {
+				Scan(other, first, last, true, targets);
+			} else {
+				std::vector<GuestRange> found;
+				Scan(other, first, last, true, found);
+				if (!found.empty()) Cover(other, found);
+			}
 		}
 	});
 	if (full) {
@@ -160,6 +172,32 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 	}
 	m_pending_writes = true;
 	return true;
+}
+
+void IndirectWriteTables::PrepareRoot(uint64_t address) {
+	const auto begin = Common::AlignDown(address, BufferCache::CACHING_PAGESIZE);
+	// The window ends on a RootEndGranule boundary. A stream's roots step a few KiB at a time: an end that moved with each
+	// root made the buffer cache rebuild a buffer of hundreds of MiB per root, all of them held until the GPU was done
+	// (Marvel's Wolverine, Pro mode, the load into Trask: 21 GB in one frame, session 60). The roots of one granule share
+	// one buffer now; the window still covers MaxRootBytes or more after the root.
+	const auto end = m_context.MappedEnd(begin, Common::AlignUp(begin + MaxRootBytes, RootEndGranule) - begin);
+	if (end <= begin || !GuestRange {begin, end - begin}.Valid()) {
+		return;
+	}
+	(void)m_context.GetBufferCache().FindBuffer(begin, end - begin);
+	m_targets.Add(begin, end - begin); // the garbage collector may release it (Prepare caches it again)
+	if (m_roots.insert(address).second) {
+		LOGF("Compute: runtime V# stores from 0x%016" PRIx64 ": cached %" PRIu64 " KiB after it\n", address,
+		     (end - begin) / 1024u);
+	}
+}
+
+void IndirectWriteTables::NoteDroppedStores(std::span<const uint64_t> pages) {
+	m_dropped_pages += pages.size();
+	for (const auto page: pages) {
+		LOGF("Compute: runtime V# stores lost on uncached page 0x%016" PRIx64 " (%" PRIu64 " such pages so far)\n",
+		     page, m_dropped_pages);
+	}
 }
 
 void IndirectWriteTables::NoteWrites(std::span<const uint64_t> pages) {

@@ -1,0 +1,53 @@
+// Turns the arguments of a non-indexed draw that a guest shader wrote (vertex count, instance count,
+// first vertex, first instance) into a mesh-task command and the draw dwords a mesh shader reads,
+// as RenderExecutor::ExecutePreparedDraw computes them on the CPU when it has the arguments.
+
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+	uint words[];
+};
+
+layout(push_constant) uniform Parameters {
+	uint64_t arguments; // the guest's four dwords
+	uint64_t output_;   // the task command (three dwords), then the five draw dwords at +16 bytes
+	uint     primitive_size;
+	uint     primitive_step;
+	uint     primitives_per_group;
+	uint     native; // nonzero: the shader takes no first vertex from the draw
+	uint     max_groups_x;
+	uint     max_groups_y;
+	uint     max_groups_total;
+	uint     unused;
+} parameters;
+
+void main() {
+	Words arguments = Words(parameters.arguments);
+	Words result    = Words(parameters.output_);
+	const uint vertices   = arguments.words[0];
+	const uint instances  = arguments.words[1];
+	const uint primitives = vertices < parameters.primitive_size
+	                            ? 0u
+	                            : (vertices - parameters.primitive_size) / parameters.primitive_step + 1u;
+	uint groups = primitives == 0u || instances == 0u
+	                  ? 0u
+	                  : (primitives - 1u) / parameters.primitives_per_group + 1u;
+	// Over the host's limits nothing is drawn (the CPU path stops with an error there).
+	if (groups > parameters.max_groups_x || instances > parameters.max_groups_y ||
+	    uint64_t(groups) * uint64_t(instances) > uint64_t(parameters.max_groups_total)) {
+		groups = 0u;
+	}
+	result.words[0] = groups;
+	result.words[1] = groups == 0u ? 0u : instances;
+	result.words[2] = 1u;
+	result.words[4] = vertices;
+	result.words[5] = parameters.native != 0u ? 0u : arguments.words[2];
+	// Instance IDs exclude the start instance (shaders add it from user data), as on the CPU path.
+	result.words[6] = 0u;
+	result.words[7] = 0u;
+	result.words[8] = 0u;
+}

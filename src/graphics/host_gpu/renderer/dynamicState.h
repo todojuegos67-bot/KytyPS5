@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/cmdRecorder.h"
 
 #include <algorithm>
 #include <array>
@@ -90,15 +91,27 @@ struct DynamicState {
 	vk::CullModeFlags cull_mode {};
 	vk::FrontFace     front_face {};
 
-	std::array<float, 4> blend_constants {};
-	float                line_width {};
-	vk::ImageAspectFlags feedback_loop_aspects {};
+	std::array<float, 4>                               blend_constants {};
+	float                                              line_width {};
+	vk::ImageAspectFlags                               feedback_loop_aspects {};
+	vk::Pipeline                                       bound_graphics_pipeline = nullptr;
 
 	/// Commits the dynamic state to the provided command buffer.
-	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
+	void Commit(const GraphicContext& graphics, Cmd cmdbuf);
 
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
-	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
+	void Invalidate() {
+		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+		bound_graphics_pipeline = nullptr;
+	}
+
+	/// Binds a graphics pipeline unless it is bound already: most draws use the pipeline of the draw before. A binding
+	/// lasts until another one, or the end of the command buffer; both invalidate this state.
+	void BindGraphicsPipeline(Cmd cmdbuf, vk::Pipeline pipeline) {
+		if (pipeline == bound_graphics_pipeline) return;
+		bound_graphics_pipeline = pipeline;
+		cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+	}
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());

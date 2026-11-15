@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/cmdRecorder.h"
 
 #include <cstdint>
 #include <vector>
@@ -38,10 +39,10 @@ public:
 	[[nodiscard]] bool Enabled() const { return m_pool != nullptr; }
 
 	// In the draw's rendering: the query that counts its samples, or -1.
-	[[nodiscard]] int32_t Begin(vk::CommandBuffer command) {
+	[[nodiscard]] int32_t Begin(Cmd command) {
 		return m_open == 0 ? -1 : BeginQuery(command);
 	}
-	void End(vk::CommandBuffer command, int32_t query) const {
+	void End(Cmd command, int32_t query) const {
 		if (query >= 0) {
 			command.endQuery(m_pool, static_cast<uint32_t>(query));
 		}
@@ -64,7 +65,7 @@ private:
 		uint64_t uncounted;
 	};
 
-	int32_t BeginQuery(vk::CommandBuffer command);
+	int32_t BeginQuery(Cmd command);
 	void    PublishDumps();
 
 	CommandScheduler&        m_scheduler;

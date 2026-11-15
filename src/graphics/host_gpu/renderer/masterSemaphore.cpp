@@ -2,7 +2,14 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -19,7 +26,9 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics)
 }
 
 MasterSemaphore::~MasterSemaphore() {
-	m_graphics.device.destroySemaphore(m_semaphore, nullptr);
+	if (m_semaphore != nullptr) {
+		m_graphics.device.destroySemaphore(m_semaphore, nullptr);
+	}
 }
 
 void MasterSemaphore::Refresh() {

@@ -1,9 +1,11 @@
 #include "common/assert.h"
+#include "common/upstreamPaths.h"
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -17,11 +19,24 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()), m_scheduler(scheduler) {}
+
+vk::CommandBuffer CommandBuffer::Handle(std::source_location where) const {
+	EXIT_IF(IsInvalid());
+	if (m_scheduler.Threaded()) {
+		return m_scheduler.DrainRecording(where.file_name(), where.line());
+	}
+	return m_buffer;
+}
+
+Cmd CommandBuffer::Recorder() const {
+	EXIT_IF(IsInvalid());
+	return m_scheduler.Recorder();
+}
 
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	EXIT_IF(m_rendering || IsInvalid() || m_scheduler.Threaded());
+	auto buffer = m_buffer;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -33,18 +48,41 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	auto buffer = Handle();
+	if (m_scheduler.Threaded()) {
+		return; // the recording thread ends it before it submits it
+	}
+	auto buffer = m_buffer;
 
 	auto result = buffer.end();
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
+void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
+                                 uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	// Upstream 348789de4 drops these stores; with it named, a device-loss report has no last operation.
+	if (KYTY_UPSTREAM_PATH("348789de4")) {
+		return;
+	}
+	m_debug_op        = op;
+	m_debug_submit_id = submit_id;
+	m_debug_arg0      = arg0;
+	m_debug_arg1      = arg1;
+	m_debug_arg2      = arg2;
+	m_debug_arg3      = arg3;
+	m_debug_arg4      = arg4;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (m_rendering && m_render_state == state) {
 		return;
 	}
-	EndRendering();
+	EXIT_IF((state.width == 0 || state.height == 0 || state.num_layers == 0 ||
+	         state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX) &&
+	        !KYTY_UPSTREAM_PATH("e827c92a2"));
+	if (m_rendering) {
+		EndRendering();
+	}
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -79,7 +117,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	Recorder().beginRendering(rendering);
 	m_render_state = state;
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
@@ -88,10 +126,11 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 }
 
 void CommandBuffer::EndRendering() const {
+	++m_end_rendering_calls;
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	Recorder().endRendering();
 	m_rendering = false;
 }
 
