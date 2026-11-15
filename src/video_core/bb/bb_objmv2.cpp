@@ -772,19 +772,45 @@ Kind WantImpl(const AmdGpu::Regs& regs, u32& why) {
         }
     }
     if (bound == 0) return Kind::None;
+    const auto& bc = regs.blend_control[0];
+    using F = AmdGpu::BlendControl::BlendFactor;
+    using Fn = AmdGpu::BlendControl::BlendFunc;
+    // bb-mv-candles2 (BB_FG_SPARKS=1): the game's soft particles (SFX: candle flames, embers,
+    // smoke; [sparks-diag] "mask (no depth test)" Sa*src add 1 / 1-Sa *dst) test depth in their
+    // pixel shader against a copy of the scene depth, with the depth test off. In the scene pass
+    // (scene depth target, clipping on) they take the Effect kind: class 5 and their own
+    // static-world vector only where their own contribution is bright (weight 0 / 1, never the
+    // density-weighted fog vector). Full-screen passes read no camera block: never written.
+    const bool effect_blend =
+        bc.enable && (bc.color_func == Fn::Add || bc.color_func == Fn::Max) &&
+        (bc.color_src_factor == F::One || bc.color_src_factor == F::SrcAlpha ||
+         bc.color_src_factor == F::OneMinusDstColor) &&
+        (bc.color_dst_factor == F::One || bc.color_dst_factor == F::OneMinusSrcColor ||
+         bc.color_dst_factor == F::OneMinusSrcAlpha);
+    if (g.sparks && g.fog && !regs.depth_control.depth_enable && !regs.IsClipDisabled() &&
+        regs.color_buffers[0] && regs.color_target_mask.GetMask(0) && effect_blend) {
+        return Kind::Effect;
+    }
     // Other draws of the scene pass: attachment 7 kept bound, not written (no pass restart).
     if (!regs.depth_control.depth_enable || regs.IsClipDisabled() || !regs.color_buffers[0] ||
         !regs.color_target_mask.GetMask(0)) {
         why = 2;
         return Kind::Mask;
     }
-    const auto& bc = regs.blend_control[0];
     if (!bc.enable) {
         return regs.depth_control.depth_write_enable ? Kind::Opaque : Kind::Mask;
     }
+    // bb-mv-candles2 (BB_FG_SPARKS=1): a blended draw that writes depth (translucent solids:
+    // the messengers, wax; [sparks-diag] "blend ... depth tws") is in the depth buffer FG reads,
+    // so it takes its own vector like an opaque draw: the engine's ring-slot / palette previous
+    // (the Blend path never looked those up, it gave a static-world vector: the messengers'
+    // limbs and the candles came out doubled).
+    if (g.sparks && regs.depth_control.depth_write_enable &&
+        bc.color_src_factor == F::SrcAlpha && bc.color_dst_factor == F::OneMinusSrcAlpha) {
+        return Kind::Opaque;
+    }
     // Alpha-blended (particles, effects) only: additive / multiplicative passes (lights, glow)
     // have no surface of their own.
-    using F = AmdGpu::BlendControl::BlendFactor;
     if (bc.color_src_factor == F::SrcAlpha && bc.color_dst_factor == F::OneMinusSrcAlpha) {
         return Kind::Blend;
     }
@@ -792,7 +818,6 @@ Kind WantImpl(const AmdGpu::Regs& regs, u32& why) {
     // (One, 1 - SrcAlpha) effects: they had no entry here, so the vector of whatever lies behind
     // (the character hit, the floor) moved them in the generated frames (doubled sparks).
     // bb-mv-candles: also "screen" (dst 1 - SrcColor, src 1 - DstColor) and Max glows.
-    using Fn = AmdGpu::BlendControl::BlendFunc;
     const bool src_ok = bc.color_src_factor == F::One || bc.color_src_factor == F::SrcAlpha ||
                         bc.color_src_factor == F::OneMinusDstColor;
     const bool dst_ok = bc.color_dst_factor == F::One ||
@@ -840,9 +865,12 @@ void FillKey(Kind kind, u32& mrt_mask, u32& num_color_attachments, Shader::PsCol
         if (g.fog) {
             // bb-mv-candles: .w = 1 where the effect replaced the pixel (as a dense blended
             // layer), so compose can tell class 5 from the blended layers' class encoding.
+            // Max: .w = max(w, .w) (w is 0 or 1: the same as "over"); it also tells the
+            // rasterizer this is an Effect pipeline (Blend never uses Max).
             write_mask7 |= vk::ColorComponentFlagBits::eA;
             bc.alpha_src_factor = F::One;
-            bc.alpha_dst_factor = F::OneMinusSrcAlpha;
+            bc.alpha_dst_factor = F::One;
+            bc.alpha_func = AmdGpu::BlendControl::BlendFunc::Max;
         }
         return;
     }

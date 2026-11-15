@@ -219,9 +219,13 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
     }
     // bb-mv-fill: an Effect draw writes R, G, B of attachment 7 only (Blend: R, G, A or RGBA).
     u32 effect = 0;
+    // bb-mv-candles2: with bb-fog-mv the Effect pipeline writes .w too (alpha func Max, which
+    // no Blend pipeline uses): before, those draws were taken for Blend draws.
     if (key.blend_controls[BB::ObjMv2::Attachment].enable != 0 &&
-        !(key.write_masks[BB::ObjMv2::Attachment] & vk::ColorComponentFlagBits::eA) &&
-        (key.write_masks[BB::ObjMv2::Attachment] & vk::ColorComponentFlagBits::eB)) {
+        ((!(key.write_masks[BB::ObjMv2::Attachment] & vk::ColorComponentFlagBits::eA) &&
+          (key.write_masks[BB::ObjMv2::Attachment] & vk::ColorComponentFlagBits::eB)) ||
+         key.blend_controls[BB::ObjMv2::Attachment].alpha_func ==
+             AmdGpu::BlendControl::BlendFunc::Max)) {
         effect = BB::ObjMv2::EffectDraw;
         const auto& bc0 = liverpool->regs.blend_control[0];
         if (bc0.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcAlpha) {
