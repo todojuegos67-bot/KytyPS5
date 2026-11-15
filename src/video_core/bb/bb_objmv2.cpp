@@ -190,7 +190,7 @@ struct State {
         vs_skinned_ring = 0, vs_skinned_addr = 0, vs_no_cam = 0, vs_no_pal = 0, vs_blend = 0,
         vs_gpu_copies = 0, vs_bytes = 0, vs_cam_addr = 0, vs_cam_ord = 0, vs_ring_seen = 0,
         vs_flushes = 0; // bb-velsnap-batch: FlushVelocityCopies calls (2 full barriers each)
-    bool velsnap_batch = false; // BB_VELSNAP_BATCH=1: no copy flushed outside a pass on its own
+    bool velsnap_batch = false; // set in Init: on unless BB_VELSNAP_BATCH=0
     double vs_cpu_ns = 0;
     // bb-native-mv2: read-only VS buffers that are neither the camera block nor a bone palette
     // (object transforms, small skeletons such as weapons, CPU-animated data) were read with
@@ -653,16 +653,18 @@ bool Init(const Vulkan::Instance& instance) {
         g.additive = false; // absolute vectors: the previous camera is in the VS
         Vulkan::Scheduler::bb_end_rendering_hook = &FlushVelocityCopies;
         g.velsnap_batch = [] {
+            // Default on (gpu-prof run 0dcf07f0: 174 copies in 37.6 flushes a frame, each flush
+            // two full barriers). BB_VELSNAP_BATCH=0: one flush per buffer, as before.
             const char* v = std::getenv("BB_VELSNAP_BATCH");
-            return v != nullptr && v[0] == '1';
+            return !(v != nullptr && v[0] == '0');
         }();
         if (g.velsnap_batch) {
             Vulkan::Scheduler::bb_begin_rendering_hook = &FlushVelocityCopies;
         }
         Log(fmt::format("[velsnap] snapshot copies outside a pass: {}",
                         g.velsnap_batch ? "batched until the draw's pass begins "
-                                          "(BB_VELSNAP_BATCH=1)"
-                                        : "flushed per buffer (BB_VELSNAP_BATCH=1 batches them)"));
+                                          "(default; BB_VELSNAP_BATCH=0: per buffer)"
+                                        : "flushed per buffer (BB_VELSNAP_BATCH=0)"));
     }
     // bb-fog-mv: blended draws' own (static-world) vectors, BB_FOG_MV=0 off; density curve
     // weight = alpha * smoothstep(BB_FOG_MV_LO, BB_FOG_MV_HI, alpha) per layer.
@@ -1100,7 +1102,7 @@ bool VelSnap(VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler,
         sb.bytes = size;
         g.arena_used += bytes;
         g.vs_bytes += size;
-        // bb-velsnap-batch (BB_VELSNAP_BATCH=1): outside a pass the copies wait for the pass
+        // bb-velsnap-batch (default; BB_VELSNAP_BATCH=0 off): outside a pass the copies wait for the pass
         // this draw opens right after (Scheduler::bb_begin_rendering_hook flushes them first,
         // outside it): one barrier pair for all the draw's buffers instead of one per buffer.
         // (Between OnDraw and that BeginRendering the rasterizer records nothing that writes a

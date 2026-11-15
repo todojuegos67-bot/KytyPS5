@@ -18,6 +18,7 @@ layout(std430, binding = 4) buffer Counts {
 // (11-13) the stored colour of bb_objmv2.comp: .a bit 0 the player, bit 1 an effect pixel
 // (bb-mv-fill: sparks, embers, glows of additive / premultiplied draws, class 5).
 layout(binding = 5) uniform sampler2D obj_tex;
+shared uint s_counts[3]; // per workgroup: HUD, fixed, sparks (see main)
 layout(push_constant) uniform Push {
     uvec4 size; // width, height, 1: the target is BGRA memory viewed as RGBA, counter slot
     vec4 obj;   // render / image scale x y, z: 1 player from the real frame + 2 sparks,
@@ -52,18 +53,13 @@ vec3 Background(ivec2 c, vec3 fallback) {
     return n > 0.0 ? sum / n : fallback;
 }
 
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    if (c.x >= int(p.size.x) || c.y >= int(p.size.y)) {
-        return;
-    }
+void Work(ivec2 c) {
     vec2 uv = (vec2(c) + 0.5) / vec2(p.size.xy);
     vec4 a = textureLod(hud_tex, uv, 0.0);
     vec4 b = textureLod(hudless_tex, uv, 0.0);
     vec3 d = abs(a.rgb - b.rgb);
-    uint base = p.size.w * 3u;
     if (max(d.r, max(d.g, d.b)) > 0.5 / 255.0) {
-        atomicAdd(counts[base], 1u); // the HUD drew here
+        atomicAdd(s_counts[0], 1u); // the HUD drew here
         if (p.obj.w > 0.5) {
             // bb-artifact-fix: the post-processed HUD-less pixel has not been through the game's
             // display pass (the "[fsr3-hudless]" line: it differs from the finished frame on ~97%
@@ -109,7 +105,7 @@ void main() {
         const vec3 bg = Background(c, f.rgb);
         const vec3 lo = min(bg, f.rgb), hi = max(max(bg, f.rgb), vec3(1.0 / 255.0));
         if (any(lessThan(lo / hi, vec3(0.88)))) {
-            atomicAdd(counts[base + 2u], 1u);
+            atomicAdd(s_counts[2], 1u);
             vec4 t = imageLoad(target, c);
             if (p.size.z != 0u) {
                 t = t.bgra;
@@ -128,11 +124,32 @@ void main() {
     }
     vec3 e = abs(f.rgb - t.rgb);
     if (max(e.r, max(e.g, e.b)) > 0.5 / 255.0) {
-        atomicAdd(counts[base + 1u], 1u);
+        atomicAdd(s_counts[1], 1u);
     }
     vec4 r = vec4(f.rgb, t.a);
     if (p.size.z != 0u) {
         r = r.bgra;
     }
     imageStore(target, c, r);
+}
+
+// bb-gpu-cut: the three counters were global atomics on the same three words from every pixel
+// (~2 M contended atomics a frame at 1920x1080: 2.4 ms of GPU, BB_GPU_PROFILE). They are summed
+// per workgroup in shared memory and added once per workgroup: the same totals, the same image.
+void main() {
+    if (gl_LocalInvocationIndex < 3u) {
+        s_counts[gl_LocalInvocationIndex] = 0u;
+    }
+    barrier();
+    const ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x < int(p.size.x) && c.y < int(p.size.y)) {
+        Work(c);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex < 3u) {
+        const uint v = s_counts[gl_LocalInvocationIndex];
+        if (v != 0u) {
+            atomicAdd(counts[p.size.w * 3u + gl_LocalInvocationIndex], v);
+        }
+    }
 }
