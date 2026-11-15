@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <unordered_set>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -832,6 +833,82 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+namespace ReplayStats {
+// KYTY_REPLAY_STATS=1: how much of each frame's graphics command stream repeats the previous
+// frame. The stream is cut at every draw/dispatch packet; each piece (the state packets plus the
+// draw) is hashed twice: its exact bytes, and its opcode sequence only. Every 10 s one line says
+// which share of pieces of a submission existed, exactly or by shape, in the previous one.
+[[nodiscard]] inline bool Enabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_REPLAY_STATS");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+struct State {
+	uint64_t                     seq        = 0;
+	uint64_t                     exact_h    = 1469598103934665603ull;
+	uint64_t                     shape_h    = 1469598103934665603ull;
+	uint64_t                     piece_dw   = 0;
+	std::unordered_set<uint64_t> prev_exact, cur_exact, prev_shape, cur_shape;
+	uint64_t pieces = 0, exact_hits = 0, shape_hits = 0, dwords = 0, exact_hit_dw = 0, frames = 0;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+inline State& Get() {
+	static State s;
+	return s;
+}
+inline uint64_t Mix(uint64_t h, uint64_t v) {
+	h ^= v + 0x9e3779b97f4a7c15ull + (h << 6u) + (h >> 2u);
+	return h * 1099511628211ull;
+}
+inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32_t opcode, bool is_draw) {
+	auto& s = Get();
+	if (seq != s.seq) {
+		s.seq = seq;
+		s.prev_exact.swap(s.cur_exact);
+		s.cur_exact.clear();
+		s.prev_shape.swap(s.cur_shape);
+		s.cur_shape.clear();
+		s.frames++;
+	}
+	for (uint32_t i = 0; i < len_dw; i++) {
+		s.exact_h = Mix(s.exact_h, packet[i]);
+	}
+	s.shape_h = Mix(s.shape_h, opcode | (static_cast<uint64_t>(len_dw) << 8u));
+	s.piece_dw += len_dw;
+	if (!is_draw) {
+		return;
+	}
+	s.pieces++;
+	s.dwords += s.piece_dw;
+	if (s.prev_exact.count(s.exact_h) != 0) {
+		s.exact_hits++;
+		s.exact_hit_dw += s.piece_dw;
+	}
+	if (s.prev_shape.count(s.shape_h) != 0) {
+		s.shape_hits++;
+	}
+	s.cur_exact.insert(s.exact_h);
+	s.cur_shape.insert(s.shape_h);
+	s.exact_h  = 1469598103934665603ull;
+	s.shape_h  = 1469598103934665603ull;
+	s.piece_dw = 0;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.last >= std::chrono::seconds(10) && s.pieces > 0) {
+		s.last = now;
+		LOGF_UNMUTED("Replay stats (10 s): %" PRIu64 " submissions, %" PRIu64
+		             " draw/dispatch pieces, exact repeat of previous submission %.1f%% (%.1f%% of dwords), "
+		             "same shape %.1f%%, %.0f dwords per piece\n",
+		             s.frames, s.pieces, 100.0 * static_cast<double>(s.exact_hits) / static_cast<double>(s.pieces),
+		             100.0 * static_cast<double>(s.exact_hit_dw) / static_cast<double>(std::max<uint64_t>(s.dwords, 1)),
+		             100.0 * static_cast<double>(s.shape_hits) / static_cast<double>(s.pieces),
+		             static_cast<double>(s.dwords) / static_cast<double>(s.pieces));
+		s.pieces = s.exact_hits = s.shape_hits = s.dwords = s.exact_hit_dw = s.frames = 0;
+	}
+}
+} // namespace ReplayStats
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -1274,6 +1351,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+
+		if (ReplayStats::Enabled() && execution.m_prep_seq != 0 && execution.m_prep_queue == 0) {
+			const auto len_dw = std::min<uint32_t>(KYTY_PM4_LEN(packet_header), remaining_dw);
+			ReplayStats::Packet(execution.m_prep_seq, packet, len_dw, opcode,
+			                    DrawPrep::CountsAsDrawOrDispatch(opcode));
+		}
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
