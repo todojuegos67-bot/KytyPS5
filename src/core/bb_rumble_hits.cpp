@@ -86,7 +86,8 @@ T Read(u64 addr) {
 }
 
 void PS4_SYSV_ABI OnHit(u64 kind, u64 ret, u64 attacker) {
-    if (static_cast<u32>(ret) == 0 || attacker == 0 || g_base == 0) {
+    // the hit functions return bool: only al is defined (the dispatcher itself sets only al)
+    if (static_cast<u8>(ret) == 0 || attacker == 0 || g_base == 0) {
         return;
     }
     const u64 holder = Read<u64>(g_base + PlayerHolderVaddr);

@@ -162,8 +162,8 @@ public:
 };
 
 void SetVibrationSettings(bool on, int percent); // (bb-input-135)
-void TestRumble();
+void TestRumble(); // (bb-input-137) 0.5 s rumble on every opened pad, F1 Opciones
 // (bb-rumble-hits) a short pulse mixed (max) over the game's own rumble; levels 0..1.
-void RumblePulse(float large01, float small01, u32 ms); // (bb-input-137) 0.5 s rumble on every opened pad, F1 Opciones
+void RumblePulse(float large01, float small01, u32 ms);
 
 } // namespace Input

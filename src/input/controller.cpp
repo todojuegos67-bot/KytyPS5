@@ -358,6 +358,10 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
 }
 
 bool GameController::ApplyVibration() {
+    // (bb-rumble-hits) called from the scePad thread, the hit detour (game thread) and the pad
+    // thread: serialize the m_vib_* state and the SDL call.
+    static std::mutex apply_mutex;
+    std::lock_guard apply_lock{apply_mutex};
     SDL_Gamepad* pad = m_sdl_gamepad;
     if (pad == nullptr) {
         return true;
