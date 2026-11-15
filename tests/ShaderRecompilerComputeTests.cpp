@@ -1400,7 +1400,8 @@ void ExpectFatal(const char *name, Function function) {
 // The driver cache file a worker writes reads back the same, and a foreign or damaged one is refused.
 void CheckDriverCacheFileRoundTrip() {
   constexpr const char *name = "DriverCacheFileRoundTrip";
-  const auto folder = std::filesystem::temp_directory_path() / "kyty_driver_cache_test";
+  const auto folder = std::filesystem::temp_directory_path() /
+                      ("kyty_driver_cache_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   const auto path = folder / "PPSA00000.bin";
   std::vector<uint8_t> payload(100003);
   for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<uint8_t>(i * 131u + 7u);
