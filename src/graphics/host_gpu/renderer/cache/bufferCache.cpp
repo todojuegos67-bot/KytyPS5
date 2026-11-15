@@ -1373,6 +1373,7 @@ void BufferCache::RunGarbageCollector() {
 		if (m_record_released) {
 			m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());
 		}
+		std::erase(m_sparse_buffers, id); // as DeleteBuffer: BackPendingMaps walks these ids
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}
