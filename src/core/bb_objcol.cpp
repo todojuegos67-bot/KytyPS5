@@ -43,7 +43,9 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#if defined(__linux__)
 #include <sys/uio.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -72,10 +74,13 @@ bool SafeCopy(void* dst, u64 src, u64 len) {
     return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(src), dst, len, &got) !=
                0 &&
            got == len;
-#else
+#elif defined(__linux__)
     iovec local{dst, len};
     iovec remote{reinterpret_cast<void*>(src), len};
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(len);
+#else
+    (void)dst;
+    return false;
 #endif
 }
 
@@ -396,7 +401,14 @@ void Analyse(const Job& job) {
     if (!file || !file->IsOpen()) {
         why = "host open failed";
     } else {
-        raw.resize(file->Size());
+        const u64 fsize = file->Size();
+        if (fsize > (256ull << 20)) {
+            why = fmt::format("file too large ({} bytes)", fsize);
+        } else {
+            raw.resize(fsize);
+        }
+    }
+    if (why.empty() && file) {
         const s64 got = raw.empty() ? 0 : file->Read(raw.data(), raw.size());
         if (got != s64(raw.size())) {
             why = fmt::format("short read {} of {} bytes", got, raw.size());
@@ -476,7 +488,10 @@ void Worker() {
             job = std::move(g_jobs.front());
             g_jobs.pop_front();
         }
-        Analyse(job);
+        try {
+            Analyse(job);
+        } catch (...) {
+        }
     }
 }
 
@@ -644,7 +659,7 @@ void Census(u64 world, World& w) {
             continue;
         }
         int owner = it != w.bodies.end() && it->second.shape == shape ? it->second.owner : -1;
-        if (owner < 0 && (flags & 1) && scans < 64) {
+        if (owner < 0 && (flags & 1) && scans < 16) {
             owner = LookupRange(shape);
             if (owner < 0 && !g_no_owner_blocks.contains(shape >> 18)) {
                 ++scans;
@@ -871,13 +886,28 @@ void OnRemove(u64 world, u64 ids_ptr, s32 n, u64 ret) {
     }
 }
 
+// No exception may unwind into the guest frames.
+void GuardedAdd(const u64* regs) {
+    try {
+        OnAdd(regs[5], regs[6], s32(regs[7]), s32(regs[8]), regs[10]);
+    } catch (...) {
+    }
+}
+
+void GuardedRemove(const u64* regs) {
+    try {
+        OnRemove(regs[5], regs[6], s32(regs[7]), regs[10]);
+    } catch (...) {
+    }
+}
+
 void PS4_SYSV_ABI HookAdd(const u64* regs) {
     // regs: rbx r11 r10 r9 r8 rdi rsi rdx rcx rax, return address
-    OnAdd(regs[5], regs[6], s32(regs[7]), s32(regs[8]), regs[10]);
+    GuardedAdd(regs);
 }
 
 void PS4_SYSV_ABI HookRemove(const u64* regs) {
-    OnRemove(regs[5], regs[6], s32(regs[7]), regs[10]);
+    GuardedRemove(regs);
 }
 
 // ---------------------------------------------------------------- detours
@@ -993,11 +1023,8 @@ bool Enabled() {
     return g_enabled;
 }
 
-void OnGuestFileOpen(const char* guest_path, const char* /*host_path*/) {
-    if (!g_enabled || guest_path == nullptr) {
-        return;
-    }
-    const std::string p = guest_path;
+namespace {
+void FileOpened(const std::string& p) {
     if (p.find("/mapstudio/") != std::string::npos && p.find(".msb") != std::string::npos) {
         std::scoped_lock lk{g_mutex};
         if (!g_map_models.empty()) {
@@ -1006,6 +1033,7 @@ void OnGuestFileOpen(const char* guest_path, const char* /*host_path*/) {
         }
         g_map = MapOf(p);
         g_map_models.clear();
+        g_no_owner_blocks.clear();
         g_last_summary_text.clear();
         g_last_summary = Now();
         LOG_INFO(Core, "[objcol] map {} loading (hooks {})", g_map, g_hooked.load() ? "on" : "off");
@@ -1040,6 +1068,17 @@ void OnGuestFileOpen(const char* guest_path, const char* /*host_path*/) {
         std::thread(Worker).detach();
     }
     g_job_cv.notify_one();
+}
+} // namespace
+
+void OnGuestFileOpen(const char* guest_path, const char* /*host_path*/) {
+    if (!g_enabled || guest_path == nullptr) {
+        return;
+    }
+    try {
+        FileOpened(guest_path);
+    } catch (...) {
+    }
 }
 
 void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
