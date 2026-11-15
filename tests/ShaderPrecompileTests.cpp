@@ -105,11 +105,10 @@ Precompile::PipelineRecord Pipeline(uint64_t vertex, uint64_t pixel) {
 	return record;
 }
 
-// A stage with buffers moves to the variant this run draws with (the table unless KYTY_TABLE_OFF=1), its pipeline
-// follows its new key, a stage without buffers stays, and a second migration changes nothing.
+// A stage with buffers moves to the variant this run draws with (the table), its pipeline follows its new key, a
+// stage without buffers stays, and a second migration changes nothing.
 void TestBufferTableMigration() {
-	const char* off   = std::getenv("KYTY_TABLE_OFF");
-	const bool  table = !(off != nullptr && off[0] == '1');
+	constexpr bool table = true;
 	Precompile::Journal journal;
 	journal.stages = {PixelRecord(5), ComputeRecord(6)};
 	journal.stages[0].specialization.buffer_table = !table;

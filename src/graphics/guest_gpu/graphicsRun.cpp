@@ -734,7 +734,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
-		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
 			cursor.offset_dw++;

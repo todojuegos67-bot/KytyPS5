@@ -22,8 +22,7 @@ struct BranchResult {
 
 void RemoveIdentities(Program& program);
 void EliminateDeadCode(const BlockList& blocks);
-// Makes EXEC branches test each invocation's own condition where that is exact (KYTY_EXEC_BRANCH=0
-// leaves them votes). Only for programs emitted one guest lane per invocation.
+// Makes EXEC branches test each invocation's own condition where that is exact. Only for programs emitted one guest lane per invocation.
 BranchResult BranchPerInvocation(Program& program);
 // Replaces a use of a select of a lane's new or old value by the new value where that use needs
 // it only in lanes where the select's condition holds, and by the old value where it needs it

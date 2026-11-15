@@ -74,8 +74,7 @@ void MarkTrackedWrites(Program& program);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           const std::vector<uint32_t>* walked = nullptr);
-// Whether a program takes the buffer table variant: it has storage buffers, and KYTY_TABLE_OFF=1 is not set (the way
-// back to buffers by descriptor).
+// Whether a program takes the buffer table variant: it has storage buffers.
 bool BufferTableWanted(const ResourcePlan& program);
 // Tests: this thread computes a per-lane store's ranges with the per-lane interpreter (the reference) instead of the
 // fast path. Both give the same ranges from the same reads.

@@ -578,7 +578,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 		command.Recorder().clearDepthStencilImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                                        vk::ClearDepthStencilValue {}, range);
 	} else {
-		vk::ClearColorValue color {};
+		const vk::ClearColorValue color {};
 		command.Recorder().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                                 color, range);
 	}

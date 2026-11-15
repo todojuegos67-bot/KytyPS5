@@ -143,11 +143,6 @@ static bool ReadStoredStage(Precompile::StageStore& store, uint64_t key, ShaderT
 	       !out.spirv.empty();
 }
 
-// Whether the Ahead workers take stages from the stage store (34 cut 8).
-static bool AheadFromStore() {
-	return true;
-}
-
 // What a stage store record (stageStore.h) depends on besides its stage record: the layout, the code and switches
 // (Origin), this build of them, the GPU and driver, and the device's SPIR-V profile. Empty: no store.
 std::vector<uint8_t> StageStoreHeader(const vk::PhysicalDeviceProperties& properties,
@@ -3077,7 +3072,7 @@ void PipelineCache::NoteReady(ShaderType stage, uint64_t hash, std::vector<uint3
 bool PipelineCache::StorePlan(ShaderType stage, const ShaderParams& params, const std::vector<uint32_t>& static_key,
                               [[maybe_unused]] const ShaderRecompiler::CompileOptions& options,
                               ShaderRecompiler::IR::ResourcePlan& plan) {
-	if (!m_stage_index_ready.load(std::memory_order_acquire) || !AheadFromStore()) return false;
+	if (!m_stage_index_ready.load(std::memory_order_acquire)) return false;
 	const auto found = m_stage_index.find(StageProgramKey(stage, params.hash, params.user_data_count, params.code.size(),
 	                                                      params.back_code.size(), static_key));
 	if (found == m_stage_index.end()) return false;
@@ -3097,7 +3092,7 @@ bool PipelineCache::StoreModule(ShaderType stage, const ShaderParams& params, co
                                 [[maybe_unused]] const ShaderRecompiler::CompileOptions& options, uint32_t push_data_cursor,
                                 const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                                 std::vector<uint32_t>& spirv, ShaderRecompiler::IR::CompiledShaderInfo& info) {
-	if (!m_stage_index_ready.load(std::memory_order_acquire) || !AheadFromStore()) return false;
+	if (!m_stage_index_ready.load(std::memory_order_acquire)) return false;
 	using ShaderRecompiler::IR::PushData;
 	const auto key_at = [&](uint32_t cursor) {
 		return Precompile::StageKey(stage, params.hash, params.user_data_count, params.code.size(), params.back_code.size(),

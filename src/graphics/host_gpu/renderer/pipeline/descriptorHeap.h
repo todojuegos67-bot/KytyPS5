@@ -91,8 +91,7 @@ public:
 	// so that the work sees the heap as the game left it, as on the PS5.
 	[[nodiscard]] std::vector<ImageHeapChange> Diff();
 	// Any thread: the CPU or the host wrote [address, address + size) (a write fault, host I/O, a backing write). The next
-	// Diff compares those pages again: it compares only pages written since it last read them, which it watches
-	// (KYTY_HEAP_WATCH: 1 or unset on, 0 off, 2 verify against the whole diff).
+	// Diff compares those pages again: it compares only pages written since it last read them, which it watches.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	// GPU thread, when it starts that work.
 	void Queue(std::vector<ImageHeapChange>&& changes);
@@ -173,7 +172,7 @@ private:
 	std::mutex                                          m_stale_mutex; // Stale comes from write faults too
 	std::vector<Common::SlotId>                         m_stale;
 	uint32_t                                            m_retried = 0;
-	uint64_t                                            m_frame   = 0;
+	uint64_t                                            m_frame = 0;
 	// The game thread's copy of the heap, and where the GPU thread found the heap.
 	std::mutex                                          m_guest_mutex;
 	std::vector<uint32_t>                               m_guest;
@@ -183,7 +182,6 @@ private:
 	// The heap's pages by tracker page from m_watch_origin: 1 = not watched, compared by the next Diff; 0 = watched, unchanged.
 	void                                                Unwatch();
 	PageManager&                                        m_page_manager;
-	int                                                 m_watch_mode = 1;
 	bool                                                m_watching   = false;
 	std::atomic<bool>                                   m_mappable {false}; // a write fault there reaches HandleFault
 	std::mutex                                          m_watch_mutex; // the page bytes: Diff and write faults
@@ -193,7 +191,7 @@ private:
 	uint64_t                                            m_watched_bytes = 0; // the heap's size at the last diff
 	std::atomic<uint64_t>                               m_watch_begin {0}, m_watch_end {0}; // for a check without the lock
 	std::atomic<uint64_t>                               m_stat_faults {0};
-	uint64_t m_stat_start = 0, m_stat_diffs = 0, m_stat_pages = 0, m_stat_of = 0, m_stat_late = 0, m_stat_misses = 0;
+	uint64_t m_stat_start = 0, m_stat_diffs = 0, m_stat_pages = 0, m_stat_of = 0;
 	uint64_t                                            m_sampler_base = 0;
 	std::vector<uint32_t>                               m_samplers; // the game's sampler heap, as shown
 };

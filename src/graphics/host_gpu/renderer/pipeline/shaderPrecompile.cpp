@@ -528,7 +528,7 @@ uint64_t Origin() {
 		// The ctest precompile_env_guard reads this list: a new switch must be here or in its output-only list. Of the
 		// options only the debug dump changes SPIR-V (debug info); the shader log direction only logs.
 		std::string text = KYTY_GIT_REVISION;
-		for (const char* name: {"KYTY_GPL", "KYTY_IMAGE_HEAP", "KYTY_EXEC_BRANCH", "KYTY_IMAGE_FORMS", "KYTY_NULL_IMAGE_DIMS"}) {
+		for (const char* name: {"KYTY_GPL", "KYTY_IMAGE_HEAP", "KYTY_IMAGE_FORMS", "KYTY_NULL_IMAGE_DIMS"}) {
 			const char* value = std::getenv(name);
 			text += fmt::format("|{}={}", name, value != nullptr ? value : "");
 		}
@@ -612,18 +612,14 @@ void Journal::Dedupe() {
 	std::erase_if(templates, [&](const TemplateRecord& record) { return !seen.insert(record.Key()).second; });
 }
 
-// A recorded stage in the variant this run draws with: the buffer table for a stage with buffers unless
-// KYTY_TABLE_OFF=1. Records of the other variant are rewritten (the shipped hints are recorded in the normal one), and
+// A recorded stage in the variant this run draws with: the buffer table for a stage with buffers. Records of the
+// other variant are rewritten (the shipped hints are recorded in the normal one), and
 // the pipeline and template records that name them follow the new keys.
 bool MigrateBufferTable(Journal& journal) {
-	static const bool off = [] {
-		const char* v = std::getenv("KYTY_TABLE_OFF");
-		return v != nullptr && v[0] == '1';
-	}();
 	// Old stage key -> its key in this run's variant, for the stages that moved.
 	std::unordered_map<uint64_t, uint64_t> keys;
 	for (auto& record: journal.stages) {
-		const bool want = !off && !record.specialization.buffers.empty();
+		const bool want = !record.specialization.buffers.empty();
 		if (record.specialization.buffer_table == want) continue;
 		const auto key                    = record.Key();
 		record.specialization.buffer_table = want;

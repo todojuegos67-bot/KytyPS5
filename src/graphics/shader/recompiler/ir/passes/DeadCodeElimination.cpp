@@ -589,14 +589,6 @@ const char* RegionProblem(const Program& program, const ExecRegion& region,
 	return nullptr;
 }
 
-bool ExecBranchEnabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_EXEC_BRANCH");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
-}
-
 } // namespace
 
 BranchResult BranchPerInvocation(Program& program) {
@@ -607,7 +599,7 @@ BranchResult BranchPerInvocation(Program& program) {
 	// every value they hand to the merge is the one the skip edge carries. Inside, every select
 	// on a condition the branch now guarantees is its new value (EliminateMaskedSelects).
 	BranchResult result;
-	if (!ExecBranchEnabled() || program.dispatcher_fallback) {
+	if (program.dispatcher_fallback) {
 		return result;
 	}
 	const auto uniform = UniformConditions(program.blocks);

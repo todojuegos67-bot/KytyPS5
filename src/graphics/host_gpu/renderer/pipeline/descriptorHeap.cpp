@@ -69,11 +69,7 @@ uint64_t NowMs() {
 GuestImageHeap::GuestImageHeap(GraphicContext& graphics, PageManager& page_manager)
     : m_graphics(graphics), m_page_manager(page_manager) {
 	namespace IR = ShaderRecompiler::IR;
-	if (const char* mode = std::getenv("KYTY_HEAP_WATCH"); mode != nullptr && mode[0] >= '0' && mode[0] <= '2') {
-		m_watch_mode = mode[0] - '0';
-	}
 	if (!graphics.guest_image_heap_enabled) return;
-	LOGF("Image heap: page watch %s\n", m_watch_mode == 0 ? "off" : m_watch_mode == 2 ? "on, verify" : "on");
 	std::vector<vk::DescriptorSetLayoutBinding> bindings;
 	std::vector<vk::DescriptorBindingFlags>     flags;
 	for (const auto numeric_class: {Prospero::TextureNumericClass::Float, Prospero::TextureNumericClass::Uint,
@@ -210,7 +206,7 @@ std::vector<ImageHeapChange> GuestImageHeap::Diff() {
 		m_guest.resize(words, 0u); // the heap grew: its new entries are reported, the others kept
 	}
 	const std::span<const uint32_t> guest {reinterpret_cast<const uint32_t*>(base), m_guest.size()};
-	if (m_watch_mode == 0 || !m_mappable.load(std::memory_order_acquire)) {
+	if (!m_mappable.load(std::memory_order_acquire)) {
 		Unwatch();
 		return ShaderRecompiler::IR::DiffImageHeap(guest, m_guest);
 	}
@@ -256,31 +252,14 @@ std::vector<ImageHeapChange> GuestImageHeap::Diff() {
 	}
 	++m_stat_diffs;
 	m_stat_of += pages;
-	if (m_watch_mode == 2) {
-		// Verify: what the whole diff still finds was written without a fault (a miss) or after the watch (late).
-		const auto extra = ShaderRecompiler::IR::DiffImageHeap(guest, m_guest);
-		std::lock_guard watch(m_watch_mutex);
-		for (const auto& change: extra) {
-			const auto address = base + change.slot * 32ull;
-			const auto page    = (address - origin) / TRACKER_PAGE_SIZE;
-			const auto page2   = (address + 31u - origin) / TRACKER_PAGE_SIZE;
-			const bool late    = m_dirty_pages[page] != 0u || (page2 < m_dirty_pages.size() && m_dirty_pages[page2] != 0u);
-			if (!late && m_stat_misses < 8u) {
-				LOGF("Image heap watch: miss at slot %u (0x%016" PRIx64 ")\n", change.slot, address);
-			}
-			++(late ? m_stat_late : m_stat_misses);
-			changes.push_back(change);
-		}
-	}
 	if (const auto now = NowMs(); m_stat_start == 0) {
 		m_stat_start = now;
 	} else if (now - m_stat_start >= 5000u) {
 		LOGF("Image heap watch (5 s): %" PRIu64 " diffs, %" PRIu64 " pages compared of %" PRIu64 ", %" PRIu64
-		     " faults, %" PRIu64 " late, %" PRIu64 " misses\n",
-		     m_stat_diffs, m_stat_pages, m_stat_of, m_stat_faults.exchange(0, std::memory_order_relaxed), m_stat_late,
-		     m_stat_misses);
+		     " faults\n",
+		     m_stat_diffs, m_stat_pages, m_stat_of, m_stat_faults.exchange(0, std::memory_order_relaxed));
 		m_stat_start = now;
-		m_stat_diffs = m_stat_pages = m_stat_of = m_stat_late = 0; // misses stay summed
+		m_stat_diffs = m_stat_pages = m_stat_of = 0;
 	}
 	return changes;
 }
@@ -534,12 +513,6 @@ void GuestImageHeap::Forget(Common::SlotId image) {
 }
 
 void GuestImageHeap::RetryLost() {
-	// KYTY_HEAP_WAIT_ANY: slots wait as before the fire-light fix (only an image registered at their address retries).
-	static const bool wait_any = std::getenv("KYTY_HEAP_WAIT_ANY") != nullptr;
-	if (wait_any) {
-		m_lost.clear();
-		return;
-	}
 	for (auto it = m_lost.begin(); it != m_lost.end();) {
 		const auto& record = m_images[it->first];
 		if (record.image || !record.waiting || ++it->second > 40u) {

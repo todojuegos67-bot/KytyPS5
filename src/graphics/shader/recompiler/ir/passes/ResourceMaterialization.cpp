@@ -2862,11 +2862,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
                                      const std::vector<uint32_t>* walked);
 
 bool BufferTableWanted(const ResourcePlan& program) {
-	static const bool off = [] {
-		const char* v = std::getenv("KYTY_TABLE_OFF");
-		return v != nullptr && v[0] == '1';
-	}();
-	return !off && !program.info.buffers.empty();
+	return !program.info.buffers.empty();
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,

@@ -1345,10 +1345,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				// any kind lies, nothing else makes one, and the slot stayed empty until the game wrote it again:
 				// Marvel's Wolverine's fire lights (8x8 textures) went black after a checkpoint reload. It is made
 				// from memory, as its first lookup was. Over memory another slot's or the GPU's image covers (the
-				// dynamic-resolution steps, render targets) it still waits. KYTY_HEAP_WAIT_ANY: off switch.
-				static const bool wait_any = std::getenv("KYTY_HEAP_WAIT_ANY") != nullptr;
+				// dynamic-resolution steps, render targets) it still waits.
 				// shortcut: the mapped check covers the first byte only; the game maps a texture whole.
-				if (!image.texture.image_id && !create && !wait_any && m_context.IsMapped(address, 1u) &&
+				if (!image.texture.image_id && !create && m_context.IsMapped(address, 1u) &&
 				    !m_context.GetTextureCache().HasAnyImageAt(address)) {
 					create        = true; // the slot's other dimensions too
 					image.texture = ResolveTexture(image.resource, image.descriptor, true);
