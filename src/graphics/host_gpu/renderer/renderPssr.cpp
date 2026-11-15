@@ -71,12 +71,15 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 		context->feature  = Upscaler::Create(command, *creation);
 		reset             = true;
 	}
+	// A failed create or evaluate forgets the context, so the next frame creates it again (as UpscaleFsr).
 	if (context->feature == nullptr) {
+		m_upscaler_contexts.erase(context);
 		return false;
 	}
 	MemoryBarrier(command);
 	if (!context->feature->Evaluate(command, request, inputs, reset)) {
 		release(context->feature);
+		m_upscaler_contexts.erase(context);
 		return false;
 	}
 	MemoryBarrier(command);
