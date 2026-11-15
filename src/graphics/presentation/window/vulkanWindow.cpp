@@ -343,6 +343,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
 		check_feature(device_features2.features.fragmentStoresAndAtomics,
 		              "fragmentStoresAndAtomics");
+		// Device creation requires these too (EXIT_NOT_IMPLEMENTED there): skip a device without them here.
+		check_feature(device_features2.features.shaderInt64, "shaderInt64");
+		check_feature(device_features2.features.vertexPipelineStoresAndAtomics, "vertexPipelineStoresAndAtomics");
+		check_feature(device_features2.features.dualSrcBlend, "dualSrcBlend");
 
 		check_feature(device_features2.features.samplerAnisotropy, "samplerAnisotropy");
 		check_feature(device_features2.features.robustBufferAccess, "robustBufferAccess");
