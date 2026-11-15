@@ -362,7 +362,15 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     // bb-velocity: the native per-draw velocity (bb_objmv2.h) over the camera vectors, only where
     // a G-buffer draw wrote its own vector; bb_mv stays everywhere else.
     const u64 composed_before = BB::ObjMv2::ComposedCount();
-    BB::ObjMv2::Compose(cmd, motion.view, color.view, reactive.view, in, cam.reset);
+    // bb-mv-sky: depth of a pixel at half the far plane (perspective depth in [0, 1], 1 = far,
+    // or 0 = far with the greater-is-nearer depth); beyond it the opaque behind is the sky.
+    float sky_depth = 0.0f;
+    if (cam.valid && cam.z_far > cam.z_near && cam.z_near > 0.0f) {
+        const float t = (cam.z_far - 2.0f * cam.z_near) / (cam.z_far - cam.z_near);
+        sky_depth = scene.greater ? 1.0f - t : t;
+    }
+    BB::ObjMv2::Compose(cmd, motion.view, color.view, reactive.view, in, cam.reset, depth_view,
+                        sky_depth, scene.greater);
     const bool obj_composed =
         !BB::ObjMv2::Active() || BB::ObjMv2::ComposedCount() != composed_before;
     lum_index ^= 1;

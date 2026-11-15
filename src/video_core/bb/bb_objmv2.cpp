@@ -36,6 +36,7 @@ namespace BB::ObjMv2 {
 namespace {
 
 constexpr u32 kSlots = 4;                       // frames in flight (snapshots, tables, stats)
+constexpr u64 kLargeHold = 90; // bb-mv-gate: frames a large draw stays unmarked after measured
 constexpr u64 kArenaBytes = 24ull << 20;        // snapshots a frame
 constexpr u64 kTableBytes = 2ull << 20;         // table entries a frame
 constexpr u64 kHeaderBytes = 4096;              // zero entry + dummy dword
@@ -240,9 +241,23 @@ struct State {
     std::unordered_map<u64, BlendDiag> blend_diag;
     // bb-mv-candles: limit of the marked area (statistics frames): above it the HUD-less pass
     // gets no spark pixels (a light pass / big smoke taken from the real frame would judder).
-    float spark_max = 0.02f;
+    float spark_max = 1.0f; // bb-mv-gate: off by default (the per-draw limit replaces it)
     bool spark_over = false;
     u64 sec_spark_over = 0, sec_spark_stat = 0;
+    // bb-mv-gate: per-draw bright-pixel counts (fragment atomics 16 bytes before the draw's table
+    // entry, 1 in 16 pixels), read back when the slot comes round again. A draw whose bright area
+    // exceeds spark_draw_px is "large" (fog gate, mist wall, moon) for kLargeHold frames: never
+    // marked. Draw key: vertex program x index / argument buffer x count.
+    struct DrawCnt {
+        u64 off = 0, key = 0, vs = 0;
+    };
+    std::array<std::vector<DrawCnt>, kSlots> cnt_list{};
+    std::unordered_map<u64, u64> large_until; // draw key -> last frame it is large
+    std::unordered_map<u64, u64> large_vs_px; // vs hash -> bright px (this second, large draws)
+    u64 cur_draw_key = 0;
+    float spark_draw_pct = 0.003f; // BB_FG_SPARKS_DRAWPCT (percent of the render area)
+    u64 sec_cnt_draws = 0, sec_cnt_large = 0, sec_marked_draws = 0, sec_held_draws = 0;
+    u64 sec_spark_sky = 0; // bb-mv-sky: bright blended pixels over the sky (the moon): not sparks
     // bb-mv-fill: end-of-frame copies of the 1-slot ring slots (compose time).
     VideoCore::BufferCache* bc = nullptr;
     Core::MemoryManager* mem = nullptr; // (review) the slot must still be mapped
@@ -410,6 +425,7 @@ void ReadStats(u32 slot) {
         g.sec_keep_px += s[20];
         g.sec_keep_dense += s[21];
         g.sec_spark_px += s[22];
+        g.sec_spark_sky += s[23];
         ++g.sec_spark_frames;
         // bb-mv-candles: the marked area of this frame decides the next frames' HUD-less marking.
         g.spark_over = s[2] != 0 && double(s[22]) > double(g.spark_max) * double(s[2]);
@@ -548,6 +564,7 @@ bool Init(const Vulkan::Instance& instance) {
         bind(4, vk::DescriptorType::eCombinedImageSampler),
         bind(5, vk::DescriptorType::eStorageImage),
         bind(6, vk::DescriptorType::eStorageImage), // bb-fog-mv: the reactive mask (R16F)
+        bind(7, vk::DescriptorType::eCombinedImageSampler), // bb-mv-sky: the scene depth
     };
     auto [lr, set_layout] = g.device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
         .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
@@ -555,7 +572,7 @@ bool Init(const Vulkan::Instance& instance) {
         .pBindings = bindings.data(),
     });
     const vk::PushConstantRange push{
-        .stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = 16};
+        .stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = 32};
     auto [plr, layout] = g.device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
         .setLayoutCount = 1,
         .pSetLayouts = &set_layout,
@@ -666,6 +683,12 @@ bool Init(const Vulkan::Instance& instance) {
                 if (end != lv && std::isfinite(f) && f > 0.0f) lum = std::min(f, 15.0f);
             }
             g.spark_word = std::clamp<u32>(u32(std::lround(lum * 4096.0f)), 1u, 0xffffu);
+            if (const char* dv = std::getenv("BB_FG_SPARKS_DRAWPCT"); dv != nullptr && dv[0]) {
+                char* end = nullptr;
+                const float f = std::strtof(dv, &end);
+                if (end != dv && std::isfinite(f) && f > 0.0f)
+                    g.spark_draw_pct = std::min(f, 100.0f) / 100.0f;
+            }
             if (const char* mv = std::getenv("BB_FG_SPARKS_MAXPCT"); mv != nullptr && mv[0]) {
                 char* end = nullptr;
                 const float f = std::strtof(mv, &end);
@@ -679,8 +702,10 @@ bool Init(const Vulkan::Instance& instance) {
                                 "class 5 where their own contribution > {:.3f} (BB_FG_SPARKS_LUM); "
                                 "those pixels: reactive for the upscaler, \"UI\" in the HUD-less "
                                 "image for frame generation (taken from the real frame) while the marked area "
-                                "stays under {:.1f}% (BB_FG_SPARKS_MAXPCT)",
-                                g.sparks ? "on" : "off", lum, g.spark_max * 100.0f));
+                                "stays under {:.1f}% (BB_FG_SPARKS_MAXPCT); a draw whose bright "
+                                "area exceeds {:.2f}% (BB_FG_SPARKS_DRAWPCT) is never marked",
+                                g.sparks ? "on" : "off", lum, g.spark_max * 100.0f,
+                                g.spark_draw_pct * 100.0f));
             }
         }
         g.fog_reactive = g.fog && std::getenv("BB_FOG_REACTIVE") != nullptr &&
@@ -1851,6 +1876,20 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     if (skinned && !blend) ++g.w30.skin_all;
 
     const u64 bytes = u64(n) * 16;
+    // bb-mv-gate: blended / effect draws (sparks on): a bright-pixel counter before the entry.
+    const bool counted = g.sparks && g.fog && blend && ok && camera && g.history &&
+                         g.table_used + bytes + 16 <= kTableBytes;
+    bool large = false;
+    if (counted) {
+        const u64 coff = SlotTableOffset(g.slot) + g.table_used;
+        *reinterpret_cast<u32*>(g.mapped + coff) = 0u;
+        g.table_used += 16;
+        g.cnt_list[g.slot].push_back({coff, g.cur_draw_key, vs.pgm_hash});
+        const auto it = g.large_until.find(g.cur_draw_key);
+        large = it != g.large_until.end() && it->second + kLargeHold >= g.frame;
+        ++(large ? g.sec_held_draws : g.sec_marked_draws);
+    }
+    const u32 gate_bits = counted ? (32u | (large ? 16u : 0u)) : 0u;
     if (ok && camera && g.history && g.table_used + bytes <= kTableBytes) {
         const u64 off = SlotTableOffset(g.slot) + g.table_used;
         u32* e = reinterpret_cast<u32*>(g.mapped + off);
@@ -1868,7 +1907,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         if (effect) {
             // bb-mv-fill: the effect's static-world vector and class 5 where its contribution is
             // bright (fragment: weight 0 / 1, push word = threshold).
-            push.objmv_flags = 1u;
+            push.objmv_flags = 1u | gate_bits;
             push.objmv_fog = g.cur_effect_alpha ? g.spark_word_alpha : g.spark_word;
             ++g.sec_spark_vec;
             ++g.spark_vs[vs.pgm_hash][1];
@@ -1882,7 +1921,8 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             // bb-fog-mv: the blended draw's own vector, density-weighted (fragment, flags bit 3).
             // (review) the class encoding needs the fog path (B blended, compose decode): without
             // it B is written unblended-by-.w and the class-3 meaning must stay (BB_FOG_MV=0).
-            push.objmv_flags = 1u | 8u | (g.sparks && g.fog ? (g.spark_word << 16) : 0u);
+            push.objmv_flags =
+                1u | 8u | gate_bits | (g.sparks && g.fog ? (g.spark_word << 16) : 0u);
             ++g.sec_fog_vec;
             ++g.fog_vs[vs.pgm_hash][1];
             if (skinned) ++g.sec_fog_skin;
@@ -1976,6 +2016,7 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     push.objmv_flags = 0;
     push.objmv_fog = g.fog_curve;
     g.cur_effect = g.sparks && (effect & EffectDraw) != 0;
+    g.cur_draw_key = Mix(Mix(Mix(vs_hash, identity), count), 0x67617465ull);
     g.cur_effect_alpha = (effect & EffectSrcAlpha) != 0;
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
     if (!g.ready || ui_phase) return;
@@ -2174,7 +2215,8 @@ u64 ComposedCount() {
 }
 
 void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_view,
-             vk::ImageView reactive_view, vk::Extent2D render, bool reset) {
+             vk::ImageView reactive_view, vk::Extent2D render, bool reset,
+             vk::ImageView depth_view, float sky_depth, bool depth_greater) {
     if (!g.ready || g.composed || !g.cleared || !g.image) return;
     if (!reactive_view) return; // binding 6 must be valid
     if (render.width > g.width || render.height > g.height) return;
@@ -2277,6 +2319,13 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
                                       .pImageInfo = i,
                                       .pBufferInfo = bi};
     };
+    // bb-mv-sky: the scene depth (read-only, as bb_mv.comp just read it); without one the sky
+    // test is off (binding 7 then holds attachment 7, never read).
+    const bool sky_on = depth_view && sky_depth > 0.0f && sky_depth < 1.0f;
+    const vk::DescriptorImageInfo depth_info =
+        sky_on ? vk::DescriptorImageInfo{g.sampler, depth_view,
+                                         vk::ImageLayout::eDepthStencilReadOnlyOptimal}
+               : vk::DescriptorImageInfo{g.sampler, g.view, vk::ImageLayout::eGeneral};
     const std::array writes{
         w(0, vk::DescriptorType::eCombinedImageSampler, &obj_info, nullptr),
         w(1, vk::DescriptorType::eStorageImage, &mv_info, nullptr),
@@ -2285,21 +2334,27 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
         w(4, vk::DescriptorType::eCombinedImageSampler, &prev_info, nullptr),
         w(5, vk::DescriptorType::eStorageImage, &next_info, nullptr),
         w(6, vk::DescriptorType::eStorageImage, &rx_info, nullptr),
+        w(7, vk::DescriptorType::eCombinedImageSampler, &depth_info, nullptr),
     };
     const bool check = stat && g.check && color_view && !reset && g.prev_valid &&
                        g.color_stored + 1 == g.frame;
     const bool refine_now = refine && color_view && !reset && g.prev_valid &&
                             g.color_stored + 1 == g.frame;
-    const std::array<u32, 4> push{render.width, render.height, reset ? 0u : 1u,
+    struct {
+        u32 size[4];
+        float sky[4]; // bb-mv-sky: depth threshold, 1: greater-is-nearer depth, 1: on
+    } push{{render.width, render.height, reset ? 0u : 1u,
                                   (stat ? 1u : 0u) | (g.additive ? 2u : 0u) |
                                       (store_color ? 4u : 0u) | (check ? 8u : 0u) |
                                       (refine_now ? 16u : 0u) | (characters ? 32u : 0u) |
                                       (g.fog ? 64u : 0u) | (g.fog_reactive ? 128u : 0u) |
                                       (g.fog_keepobj ? 256u : 0u) | (g.sparks ? 512u : 0u) |
-                                      (g.sparks && !g.spark_over ? 1024u : 0u)};
+                                      (g.sparks && !g.spark_over ? 1024u : 0u)},
+           {sky_depth, depth_greater ? 1.0f : 0.0f, sky_on ? 1.0f : 0.0f, 0.0f}};
+    static_assert(sizeof(push) == 32);
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
-    cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
+    cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
     cmd.dispatch((render.width + 7) / 8, (render.height + 7) / 8, 1);
     cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, g.queries, slot * 2 + 1);
     const vk::MemoryBarrier2 done{
@@ -2401,6 +2456,27 @@ void OnFlip() {
     g.slot = (g.slot + 1) % kSlots;
     g.arena_used = 0;
     g.table_used = 0;
+    // bb-mv-gate: the counters of this slot's last use (kSlots frames ago, long finished).
+    const u64 draw_limit =
+        g.last_render.width != 0
+            ? u64(double(g.spark_draw_pct) * double(g.last_render.width) *
+                  double(g.last_render.height))
+            : ~0ull;
+    for (const auto& c : g.cnt_list[g.slot]) {
+        const u64 px = u64(*reinterpret_cast<const u32*>(g.mapped + c.off)) * 16u;
+        ++g.sec_cnt_draws;
+        if (px > draw_limit) {
+            g.large_until[c.key] = g.frame;
+            g.large_vs_px[c.vs] += px;
+            ++g.sec_cnt_large;
+        }
+    }
+    g.cnt_list[g.slot].clear();
+    if (g.large_until.size() > 8192) {
+        for (auto it = g.large_until.begin(); it != g.large_until.end();) {
+            it = it->second + kLargeHold < g.frame ? g.large_until.erase(it) : std::next(it);
+        }
+    }
 
     const auto now = std::chrono::steady_clock::now();
     if (had_pass) ++g.w30.frames;
@@ -2544,14 +2620,16 @@ void OnFlip() {
             Log(fmt::format(
                 "[sparks] effect draws {:.1f}/frame: with their static-world vector {:.1f}, no "
                 "previous camera {:.1f} | spark px (class 5) {:.2f}% of the frame on statistics "
-                "frames | vs with vector/draws (1 s):{}",
+                "frames, over the sky (moon, lit clouds: not marked) {:.2f}% | vs with "
+                "vector/draws (1 s):{}",
                 double(g.sec_spark_draws) / f, double(g.sec_spark_vec) / f,
                 double(g.sec_spark_no_cam) / f, Pct(g.sec_spark_px, g.sec_px_all),
+                Pct(g.sec_spark_sky, g.sec_px_all),
                 shaders.empty() ? " none" : shaders));
         }
         g.spark_vs.clear();
         g.sec_spark_draws = g.sec_spark_vec = g.sec_spark_no_cam = g.sec_spark_px =
-            g.sec_spark_frames = 0;
+            g.sec_spark_frames = g.sec_spark_sky = 0;
         if (g.sparks) {
             // bb-mv-candles: blended draws of the scene by blend state and what Want made of them
             // (Blend: alpha-blended, own vector + bright pixels class 5; Effect: additive /
@@ -2578,6 +2656,27 @@ void OnFlip() {
                                  d.dst < 21 ? kF[d.dst] : "?", (d.depth & 1) ? "t" : "-",
                                  (d.depth & 2) ? "w" : "-", (d.depth & 4) ? "s" : "-",
                                  double(d.count) / f);
+            }
+            {
+                std::vector<std::pair<u64, u64>> lv(g.large_vs_px.begin(), g.large_vs_px.end());
+                std::sort(lv.begin(), lv.end(),
+                          [](const auto& a, const auto& b) { return a.second > b.second; });
+                std::string ls;
+                for (size_t i = 0; i < lv.size() && i < 6; ++i) {
+                    ls += fmt::format(" {:#x}:{:.0f}px", lv[i].first,
+                                      double(lv[i].second) / std::max<u64>(1, u64(f)));
+                }
+                Log(fmt::format("[sparks-gate] blended / effect draws counted {:.1f}/frame: marked "
+                                "{:.1f}/frame, held as large {:.1f}/frame (bright area > {:.2f}% "
+                                "of the frame in one draw: never marked for {} frames; "
+                                "BB_FG_SPARKS_DRAWPCT) | measured large {:.1f}/frame | large "
+                                "draws' vs (bright px/frame):{}",
+                                double(g.sec_cnt_draws) / f,
+                                double(g.sec_marked_draws) / f, double(g.sec_held_draws) / f,
+                                g.spark_draw_pct * 100.0f, kLargeHold,
+                                double(g.sec_cnt_large) / f, ls.empty() ? " none" : ls));
+                g.large_vs_px.clear();
+                g.sec_cnt_draws = g.sec_cnt_large = g.sec_marked_draws = g.sec_held_draws = 0;
             }
             Log(fmt::format("[sparks-diag] blended draws by state (depth t test, w write, s scene "
                             "target):{} | marked area over {:.1f}% (BB_FG_SPARKS_MAXPCT) on {} of "
