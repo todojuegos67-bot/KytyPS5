@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/renderer_vulkan/bb_present_sr.h"
 
 #include <algorithm>
@@ -355,10 +356,13 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         storage(5, &lum_info),
         storage(6, &rx_info),
     };
-    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
-    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
-    cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-    cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
+    {
+        BB_GPU_SCOPE(cmd, "ours: bb_mv camera vectors + reactive (bb_mv.comp)");
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+        cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+        cmd.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
+    }
     // bb-velocity: the native per-draw velocity (bb_objmv2.h) over the camera vectors, only where
     // a G-buffer draw wrote its own vector; bb_mv stays everywhere else.
     const u64 composed_before = BB::ObjMv2::ComposedCount();
@@ -385,7 +389,12 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         slot_sr[slot] = true;
     }
 
-    if (want_fg && CaptureFg(cmd, runtime, depth, in, *fg)) {
+    bool fg_captured = false;
+    if (want_fg) {
+        BB_GPU_SCOPE(cmd, "ours: FG inputs copy (depth + vectors)");
+        fg_captured = CaptureFg(cmd, runtime, depth, in, *fg);
+    }
+    if (fg_captured) {
         fg->jitter[0] = jx;
         fg->jitter[1] = jy;
         fg->reset = cam.reset;
@@ -487,12 +496,24 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
 #endif
     last_in = in;
     last_out = out;
-    const bool ok = BB::Upscale::RunBackend(desc);
+    bool ok = false;
+    {
+        // bb-gpu-prof: the upscaler itself (DLSS / FSR 3.1 / FSR 4 / XeSS / TAA dispatches).
+        static u32 named[8] = {};
+        const u32 k = std::min<u32>(static_cast<u32>(BB::Upscale::Cfg().kind), 7u);
+        if (BB::GpuProf::On() && named[k] == 0) {
+            named[k] = BB::GpuProf::Label(
+                fmt::format("ours: upscaler {}", BB::SR::KindName(BB::Upscale::Cfg().kind)));
+        }
+        const BB::GpuProf::Scope sr_scope(cmd, named[k]);
+        ok = BB::Upscale::RunBackend(desc);
+    }
     if (!ok) {
         return {};
     }
     if (BB::Dlss5::Wanted()) {
         // DLSS 5 (BB_DLSS5 1..3, from 1.59): Neural Rendering on the upscaled output, in place.
+        BB_GPU_SCOPE(cmd, "ours: DLSS 5 neural rendering");
         (void)BB::Dlss5::Apply(desc);
     }
     Barrier(cmd, output, vk::ImageLayout::eShaderReadOnlyOptimal);

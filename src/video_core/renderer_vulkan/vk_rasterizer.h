@@ -176,6 +176,8 @@ private:
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
     mutable bool bb_jitter_draw = false;
+    u32 bb_prof_label = 0; // bb-gpu-prof: the label of the pass BeginRendering set up
+    u32 BbProfPassLabel(const RenderState& state, const GraphicsPipeline* pipeline);
     // bb-gpu6 (BB_LOD_BIAS): extra texture LOD bias of this draw's samplers (scene draws while
     // upscaling), and the one BindResources applies (0 for compute).
     float bb_lod_bias = 0.0f, bb_bind_lod_bias = 0.0f;

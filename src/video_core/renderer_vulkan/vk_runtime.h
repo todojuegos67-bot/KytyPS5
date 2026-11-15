@@ -34,6 +34,9 @@ public:
 
     void TickFrame();
 
+    /// bb-gpu-prof: the label of the next CopyBuffer (0: "buffer copy").
+    u32 bb_prof_copy_label = 0;
+
     void CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                     std::span<const vk::BufferCopy> copies);
 

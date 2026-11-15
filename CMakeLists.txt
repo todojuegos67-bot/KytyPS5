@@ -862,6 +862,8 @@ set(COMMON src/common/logging/classes.cpp
            src/core/bb_native_mv_hook.cpp
            src/core/bb_native_mv_hook.h
            src/core/bb_objcol.cpp
+           src/core/bb_game_gfx.cpp
+           src/core/bb_game_gfx.h
            src/core/bb_objcol.h
            src/core/bb_hud_native_hook.cpp
            src/core/bb_hud_native_hook.h
@@ -1241,6 +1243,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/fsr411/fsr411_vk.h
                src/video_core/bb/bb_upscale.cpp
                src/video_core/bb/bb_perf2.h
+               src/video_core/bb/bb_gpu_profile.cpp
+               src/video_core/bb/bb_gpu_profile.h
                src/video_core/bb/bb_objmv2.cpp
                src/video_core/bb/bb_objmv2.h
                src/video_core/bb/bb_upscale.h

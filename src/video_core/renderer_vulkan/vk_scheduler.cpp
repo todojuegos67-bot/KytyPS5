@@ -5,6 +5,7 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_perf2.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -31,11 +32,23 @@ Scheduler::~Scheduler() {
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
+        bb_prof_next_label = 0;
         return;
     }
     EndRendering();
+    if (bb_begin_rendering_hook != nullptr) {
+        bb_begin_rendering_hook(CommandBuffer());
+    }
     is_rendering = true;
     render_state = new_state;
+    if (BB::GpuProf::On()) {
+        // bb-gpu-prof: one scope per rendering scope (the game's pass, labelled by its targets
+        // and first pixel shader; emulator blits and the like as "other rendering").
+        static const u32 other = BB::GpuProf::Label("emu: other rendering (blit/MSAA copy)");
+        bb_prof_pass_token = BB::GpuProf::Begin(
+            CommandBuffer(), bb_prof_next_label != 0 ? bb_prof_next_label : other);
+    }
+    bb_prof_next_label = 0;
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -90,6 +103,10 @@ void Scheduler::EndRendering() {
     }
     is_rendering = false;
     CommandBuffer().endRendering();
+    if (bb_prof_pass_token != 0) {
+        BB::GpuProf::End(CommandBuffer(), bb_prof_pass_token);
+        bb_prof_pass_token = 0;
+    }
     if (bb_end_rendering_hook != nullptr) {
         bb_end_rendering_hook(CommandBuffer());
     }
@@ -166,6 +183,11 @@ void Scheduler::BeginSession() {
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
 
+    // bb-gpu-prof: the whole command buffer (the GPU's busy time for this submit).
+    bb_prof_env_token = BB::GpuProf::On() && bb_prof_env_label != 0
+                            ? BB::GpuProf::Begin(session.primary, bb_prof_env_label)
+                            : 0u;
+
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
     if (profiler_ctx) {
@@ -191,6 +213,10 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
+    if (bb_prof_env_token != 0) {
+        BB::GpuProf::End(session.primary, bb_prof_env_token);
+        bb_prof_env_token = 0;
+    }
     Check(session.primary.end());
 }
 
