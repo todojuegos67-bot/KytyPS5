@@ -125,12 +125,13 @@ jobs:
             resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests ^
             memory_tracker_tests page_manager_tests image_page_table_tests bit_array_tests build_flags_tests ^
             event_queue_lifetime_tests sync_on_address_tests save_data_memory_tests trophy_system_tests ^
-            audio_out_timing_tests ajm_resample_tests png_enc_tests jpeg_dec_tests jpeg_enc_tests occlusion_queries_tests ces_tests save_data_dialog_tests psml_tests --parallel
+            audio_out_timing_tests ajm_resample_tests png_enc_tests jpeg_dec_tests jpeg_enc_tests occlusion_queries_tests ces_tests save_data_dialog_tests psml_tests ^
+            hash_memo_tests packet_stream_tests stage_store_tests pipeline_ahead_tests group_notices_tests group_reuse_tests scalar_read_check_tests wolverine_stores_tests wolverine_render_step_tests wolverine_physics_step_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir K:/_Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml)$"
+          ctest --test-dir K:/_Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml|hash_memo|packet_stream|stage_store|pipeline_ahead|group_notices|group_reuse|scalar_read_check|wolverine_stores|wolverine_render_step|wolverine_physics_step|precompile_env_guard)$"
 
       - name: Install
         shell: cmd
