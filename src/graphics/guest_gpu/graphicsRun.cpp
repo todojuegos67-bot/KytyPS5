@@ -1157,7 +1157,6 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
-	CountWork();
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		// Reading the counts waits for the GPU when a shader wrote them, and a skipped shader needs
@@ -1169,9 +1168,10 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		}
 		vk::DispatchIndirectCommand args;
 		m_renderer.GetBufferCache().ReadGuestBytes(args_addr, &args, sizeof(args));
-		DispatchDirect(args.x, args.y, args.z, mode);
+		DispatchDirect(args.x, args.y, args.z, mode); // counts its work
 		return;
 	}
+	CountWork();
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
