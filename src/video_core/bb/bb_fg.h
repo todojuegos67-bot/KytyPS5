@@ -115,5 +115,10 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
 
 // F8 panel: FSR 3 FG's last per-second real / shown fps and its state ("on", or why off).
 bool PanelInfo(float& real, float& shown, const char*& state);
+// bb-menu-ui: the presenter's measured game / shown frame rates with DLSS-G (once a second), for
+// the F8 panel (it showed "FSR 3 x2 · DLSS-G (NGX)" and no shown rate, as if FG were off).
+void NoteDlssPanel(float real, float shown);
+// The panel row's name: "DLSS-G" or "FSR 3 x2".
+const char* PanelName();
 
 } // namespace BB::FG

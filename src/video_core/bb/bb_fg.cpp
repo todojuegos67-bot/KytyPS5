@@ -4,6 +4,7 @@
 // build's bb_fg.cpp reduced to AMD FSR 3 x2.
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
@@ -174,12 +175,29 @@ bool Fsr3Active() {
     return Cfg().kind == Kind::Amd && Amd::Active();
 }
 
+static std::atomic<float> g_dlss_real{0.0f}, g_dlss_shown{0.0f};
+
+void NoteDlssPanel(float real, float shown) {
+    g_dlss_real.store(real, std::memory_order_relaxed);
+    g_dlss_shown.store(shown, std::memory_order_relaxed);
+}
+
+const char* PanelName() {
+    return Cfg().kind == Kind::Dlss ? "DLSS-G" : "FSR 3 x2";
+}
+
 bool PanelInfo(float& real, float& shown, const char*& state) {
     real = shown = 0;
     state = "off";
     if (!On()) return false;
     if (Cfg().kind == Kind::Dlss) {
-        state = Dlss::Ready() ? "DLSS-G (NGX)" : "DLSS-G unavailable";
+        if (!Dlss::Ready()) {
+            state = "DLSS-G unavailable";
+            return true;
+        }
+        real = g_dlss_real.load(std::memory_order_relaxed);
+        shown = g_dlss_shown.load(std::memory_order_relaxed);
+        state = shown > real * 1.2f ? "on" : "idle";
         return true;
     }
     if (!Fsr3Requested()) {

@@ -1075,6 +1075,12 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     // closes. r149_0451 / r149_0459: opening the menu with FG on toggled generation off / on every
     // other present until presents stopped completing. BB_FG_OVERLAY_BYPASS=0: old.
     static const bool overlay_bypass = EnvOn("BB_FG_OVERLAY_BYPASS", true);
+    // bb-menu-ui: presents bypassed only for the overlay (3D inputs fine) do not restart the
+    // BB_FG_HOLDOFF count: generation resumes on the first present after the menu / toast is
+    // gone instead of 30 real-only presents later (a step from x1 to x2 half a second after
+    // closing). BB_FG_OVERLAY_HOLDOFF=1: the hold-off after an overlay as before.
+    static const bool overlay_holdoff = EnvOn("BB_FG_OVERLAY_HOLDOFF", false);
+    bool overlay_only = false;
     {
         static bool was = false;
         const bool overlay = overlay_bypass && ImGui::Core::MustKeepDrawing();
@@ -1083,7 +1089,13 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
             Printf("[fg-ui] 1.51 overlay %s: FSR 3 frame generation %s", overlay ? "open" : "closed",
                    overlay ? "bypassed (real frames presented directly)" : "resumes");
         }
-        if (overlay) usable = false;
+        if (overlay) {
+            // (only a present whose 3D inputs were good: a repeat of the last frame or a movie /
+            // loading flip has none and restarts the count, as without the overlay; with
+            // BB_MENU_REPEAT_ALWAYS off repeats only come once the game stopped flipping)
+            overlay_only = usable && !overlay_holdoff;
+            usable = false;
+        }
     }
     static int first_steps = 0; // 0.41: the first 3D frames' steps, logged (a crash shows the last)
     if (usable) {
@@ -1258,7 +1270,9 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     bool held = false;
     {
         auto& h = g_holdoff;
-        if (!usable) {
+        if (!usable && overlay_only) {
+            // (bb-menu-ui) the count is kept, see overlay_holdoff
+        } else if (!usable) {
             if (h.waiting) ++h.aborted;
             h.run = 0;
             h.waiting = false;

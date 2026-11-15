@@ -49,6 +49,9 @@ struct AtlasTexture {
     vk::ImageView view{};
 };
 
+// One game frame's presents at most: its own and 3 generated (DLSS-G x4).
+constexpr uint32_t kPresentsPerFrameMax = 4;
+
 // Vulkan data
 struct VkData {
     const InitInfo init_info;
@@ -74,7 +77,12 @@ struct VkData {
     bool enabled_blending{true};
 
     VkData(const InitInfo init_info) : init_info(init_info) {
-        render_buffers.count = init_info.image_count;
+        // bb-menu-ui: RenderDrawData also runs for each DLSS-G generated frame (up to 3 per game
+        // frame, vk_presenter.cpp BbPresentGenerated) with no fence of its own, while only the
+        // game frames' fences (one per swapchain image) bound what the GPU still reads. With one
+        // slot per image the CPU rewrote, or freed on a resize, the vertex / index buffers of a
+        // present still in flight once the F1 menu or F8 panel was up: torn or stray UI triangles.
+        render_buffers.count = init_info.image_count * kPresentsPerFrameMax;
         render_buffers.frame_render_buffers.resize(render_buffers.count);
         upload_buffers.resize(render_buffers.count);
     }

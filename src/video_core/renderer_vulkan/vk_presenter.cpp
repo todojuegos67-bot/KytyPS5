@@ -866,8 +866,16 @@ bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
         for (int l = 0; l < dd->CmdListsCount; ++l) {
             ImDrawList* list = dd->CmdLists[l];
             bool game = false;
+            // bb-menu-ui: the draw data is the previous Present's, whose game image was that
+            // Present's frame (bb_imgui_game_tex), never this one: comparing with
+            // frame->imgui_texture matched nothing, so every generated frame got the previous
+            // real frame drawn over it (DLSS-G looked off with F8 / F1 up) from a frame image the
+            // GPU thread may already be rendering the next frame into (the menu glitches).
             for (const ImDrawCmd& c : list->CmdBuffer) {
-                if (c.UserCallback == nullptr && c.GetTexID() == frame->imgui_texture) game = true;
+                if (c.UserCallback == nullptr && bb_imgui_game_tex != nullptr &&
+                    c.GetTexID() == bb_imgui_game_tex) {
+                    game = true;
+                }
             }
             if (!game) continue;
             for (ImDrawCmd& c : list->CmdBuffer) {
@@ -893,6 +901,7 @@ bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
         cmdbuf.endRendering();
         for (auto& [c, n] : hidden) c->ElemCount = n;
         ui_drawn = true;
+        ++bb_menu_sec.generated_ui;
     }
     const std::array post{
         vk::ImageMemoryBarrier2{
@@ -1005,6 +1014,26 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
 
     frame->imgui_texture = ImGui::Vulkan::AddTexture(view, vk::ImageLayout::eShaderReadOnlyOptimal);
     frame->is_hdr = swapchain.GetHDR();
+}
+
+void Presenter::PresentLastFrame() {
+    // bb-menu-ui: with frame generation on and the game still flipping, the overlay is redrawn
+    // with every game frame anyway: a repeat of the last real frame between them only breaks
+    // the generated frames' spacing (DLSS-G) or FSR 3's present pacing. Repeats stay for a game
+    // that stopped flipping (pause, loading). BB_MENU_REPEAT_ALWAYS=1: every repeat as before.
+    static const bool repeat_always = [] {
+        const char* v = std::getenv("BB_MENU_REPEAT_ALWAYS");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!repeat_always && (BB::FG::Dlss::Ready() || BB::FG::Fsr3Active()) &&
+        std::chrono::steady_clock::now() - bb_last_game_present < std::chrono::milliseconds(100)) {
+        ++bb_menu_sec.repeats_skipped;
+        return;
+    }
+    std::scoped_lock lock{bb_reuse_mutex};
+    if (Frame* frame = PrepareLastFrame(); frame != nullptr) {
+        Present(frame, true);
+    }
 }
 
 Frame* Presenter::PrepareLastFrame() {
@@ -1574,7 +1603,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
-            last_submit_frame = frame;
+            {
+                std::scoped_lock rl{bb_reuse_mutex};
+                last_submit_frame = frame;
+            }
             std::scoped_lock fl{free_mutex};
             free_queue.push(frame);
             free_cv.notify_one();
@@ -1677,6 +1709,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
     BB::Upscale::DrawOverlay(); // bb-clean-021 F8 (nothing while hidden)
+    bb_imgui_game_tex = nullptr;
 
     const vk::Image swapchain_image = swapchain.Image();
     const vk::ImageView swapchain_image_view = swapchain.ImageView();
@@ -1793,6 +1826,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
                 ImGui::Image(game_texture, size);
+                bb_imgui_game_tex = game_texture;
 
                 if (EmulatorSettings.IsNullGPU()) {
                     Core::Devtools::Layer::DrawNullGpuNotice();
@@ -1959,14 +1993,92 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 cut.layer_cuts, cut.layer_composites, cut.layer_failed, hudless ? "yes" : "no", cut.hudless, hudless, hudless_failed,
                 BB::FG::Dlss::Ready() ? (shown ? "on" : "idle") : "off", made, shown,
                 bb_frame_gen_limit.load(), game / sec, (presents + shown) / sec));
+            if (BB::FG::Dlss::Ready()) {
+                BB::FG::NoteDlssPanel(float(game / sec), float((presents + shown) / sec));
+            }
             bb_hud_fg->LogSecond(sec);
             bb_hud_fg->LogHudlessSecond(sec);
             bb_sec_start = now;
         }
     }
+    BbNoteMenuPresent(is_reusing_frame, is_game_frame,
+                      is_reusing_frame ? 0 : frame->generated_count, bb_shown);
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+    }
+}
+
+// bb-menu-ui: how the emulator's overlay (F1 menu, toasts, F8 metrics) reached the screen. With
+// DLSS-G it is drawn over every generated frame after generation (BbPresentGenerated); with FSR 3
+// frame generation is passed through (real frames only) while the menu or a toast is up
+// (bb_fg_fsr3.cpp, BB_FG_OVERLAY_BYPASS) and the F8 panel is drawn into the real frames.
+void Presenter::BbNoteMenuPresent(bool is_reusing_frame, bool is_game_frame, u32 generated_wanted,
+                                  u32 generated_shown) {
+    const bool menu = ImGui::Core::MustKeepDrawing();
+    const bool up = menu || bb_imgui_ui_shown;
+    const char* how = BB::FG::Dlss::Ready()
+                          ? "DLSS-G: UI composited after frame generation on every generated frame"
+                      : BB::FG::Fsr3Active()
+                          ? (menu ? "FSR 3: frame generation passed through (real frames only)"
+                                  : "FSR 3: drawn into the real frame (F8 only)")
+                          : "no frame generation: drawn into the real frame";
+    const auto now = std::chrono::steady_clock::now();
+    if (!up && !bb_menu_up) {
+        bb_menu_sec = {};
+        return;
+    }
+    if (up) {
+        if (!bb_menu_up) {
+            bb_menu_up = true;
+            bb_menu_session = {};
+            bb_menu_sec = {.generated_ui = bb_menu_sec.generated_ui,
+                           .repeats_skipped = bb_menu_sec.repeats_skipped};
+            bb_menu_sec_start = now;
+            BB::Upscale::Checkpoint(fmt::format("[menu-ui] overlay up ({}{}): {}",
+                                                menu ? "menu/toast" : "",
+                                                bb_imgui_ui_shown ? (menu ? " + ImGui" : "ImGui")
+                                                                  : "",
+                                                how));
+        }
+        auto& c = bb_menu_sec;
+        ++c.presents;
+        c.game += !is_reusing_frame && is_game_frame ? 1 : 0;
+        c.repeats += is_reusing_frame ? 1 : 0;
+        c.generated_dropped += generated_wanted > generated_shown ? generated_wanted - generated_shown
+                                                                  : 0;
+        c.fsr3_bypassed += menu && BB::FG::Fsr3Active() ? 1 : 0;
+    }
+    const auto add = [](BbMenuUi& to, const BbMenuUi& from) {
+        to.presents += from.presents;
+        to.game += from.game;
+        to.repeats += from.repeats;
+        to.generated_ui += from.generated_ui;
+        to.generated_dropped += from.generated_dropped;
+        to.fsr3_bypassed += from.fsr3_bypassed;
+        to.repeats_skipped += from.repeats_skipped;
+    };
+    if (bb_menu_up && (!up || now - bb_menu_sec_start >= std::chrono::seconds(1))) {
+        const auto& c = bb_menu_sec;
+        BB::Upscale::Checkpoint(fmt::format(
+            "[menu-ui] 1 s: overlay frames {} (game {}, shown again {}, repeats skipped {}), "
+            "generated with the UI drawn over {}, generated dropped {}, FSR 3 passed through {} | "
+            "{}",
+            c.presents, c.game, c.repeats, c.repeats_skipped, c.generated_ui, c.generated_dropped,
+            c.fsr3_bypassed, how));
+        add(bb_menu_session, c);
+        bb_menu_sec = {};
+        bb_menu_sec_start = now;
+    }
+    if (bb_menu_up && !up) {
+        bb_menu_up = false;
+        const auto& c = bb_menu_session;
+        BB::Upscale::Checkpoint(fmt::format(
+            "[menu-ui] overlay closed: {} overlay frames (game {}, shown again {}, repeats skipped "
+            "{}), generated with the UI drawn over {}, generated dropped {}, FSR 3 passed through "
+            "{}",
+            c.presents, c.game, c.repeats, c.repeats_skipped, c.generated_ui, c.generated_dropped,
+            c.fsr3_bypassed));
     }
 }
 
@@ -1981,6 +2093,16 @@ Frame* Presenter::GetRenderFrame() {
         // Take the frame from the queue
         frame = free_queue.front();
         free_queue.pop();
+    }
+    {
+        // bb-menu-ui: the frame shown last goes back to the free queue at once, and while an
+        // overlay is up (F1 menu, toasts) the video-out thread shows it again on vblanks without a
+        // flip (DrawLastFrame). Without this the fence below could be waited before that repeat
+        // reset it, and the new frame was rendered into the image the repeat was presenting.
+        std::scoped_lock lock{bb_reuse_mutex};
+        if (last_submit_frame == frame) {
+            last_submit_frame = nullptr;
+        }
     }
 
     const vk::Device device = instance.GetDevice();
