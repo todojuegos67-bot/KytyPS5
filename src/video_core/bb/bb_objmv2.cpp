@@ -21,6 +21,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_upscale.h"
@@ -187,7 +188,9 @@ struct State {
     bool skin_order = true; // BB_SKIN_MV=0: off (previous behaviour)
     u64 vs_frames = 0, vs_draws = 0, vs_native = 0, vs_static = 0, vs_skinned = 0,
         vs_skinned_ring = 0, vs_skinned_addr = 0, vs_no_cam = 0, vs_no_pal = 0, vs_blend = 0,
-        vs_gpu_copies = 0, vs_bytes = 0, vs_cam_addr = 0, vs_cam_ord = 0, vs_ring_seen = 0;
+        vs_gpu_copies = 0, vs_bytes = 0, vs_cam_addr = 0, vs_cam_ord = 0, vs_ring_seen = 0,
+        vs_flushes = 0; // bb-velsnap-batch: FlushVelocityCopies calls (2 full barriers each)
+    bool velsnap_batch = false; // BB_VELSNAP_BATCH=1: no copy flushed outside a pass on its own
     double vs_cpu_ns = 0;
     // bb-native-mv2: read-only VS buffers that are neither the camera block nor a bone palette
     // (object transforms, small skeletons such as weapons, CPU-animated data) were read with
@@ -649,6 +652,17 @@ bool Init(const Vulkan::Instance& instance) {
     if (g.velocity) {
         g.additive = false; // absolute vectors: the previous camera is in the VS
         Vulkan::Scheduler::bb_end_rendering_hook = &FlushVelocityCopies;
+        g.velsnap_batch = [] {
+            const char* v = std::getenv("BB_VELSNAP_BATCH");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (g.velsnap_batch) {
+            Vulkan::Scheduler::bb_begin_rendering_hook = &FlushVelocityCopies;
+        }
+        Log(fmt::format("[velsnap] snapshot copies outside a pass: {}",
+                        g.velsnap_batch ? "batched until the draw's pass begins "
+                                          "(BB_VELSNAP_BATCH=1)"
+                                        : "flushed per buffer (BB_VELSNAP_BATCH=1 batches them)"));
     }
     // bb-fog-mv: blended draws' own (static-world) vectors, BB_FOG_MV=0 off; density curve
     // weight = alpha * smoothstep(BB_FOG_MV_LO, BB_FOG_MV_HI, alpha) per layer.
@@ -1042,6 +1056,7 @@ std::unordered_map<u64, SnapBuf> g_cam_engine;
 
 void FlushVelocityCopies(vk::CommandBuffer cmd) {
     if (g_pending.empty()) return;
+    BB_GPU_SCOPE(cmd, "ours: objmv2 VelSnap buffer snapshots (copies)");
     const vk::MemoryBarrier2 before{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -1061,6 +1076,7 @@ void FlushVelocityCopies(vk::CommandBuffer cmd) {
     };
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &after});
     g.vs_gpu_copies += g_pending.size();
+    ++g.vs_flushes;
     g_pending.clear();
 }
 
@@ -1084,7 +1100,12 @@ bool VelSnap(VideoCore::BufferCache& buffer_cache, Vulkan::Scheduler& scheduler,
         sb.bytes = size;
         g.arena_used += bytes;
         g.vs_bytes += size;
-        if (!scheduler.IsRendering()) {
+        // bb-velsnap-batch (BB_VELSNAP_BATCH=1): outside a pass the copies wait for the pass
+        // this draw opens right after (Scheduler::bb_begin_rendering_hook flushes them first,
+        // outside it): one barrier pair for all the draw's buffers instead of one per buffer.
+        // (Between OnDraw and that BeginRendering the rasterizer records nothing that writes a
+        // buffer: the draw's uploads were made in BindResources, before.)
+        if (!scheduler.IsRendering() && !g.velsnap_batch) {
             FlushVelocityCopies(scheduler.CommandBuffer());
         }
     }
@@ -2316,6 +2337,7 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
         ++g.sec_resets;
         g.reset_pending = true; // next frame: no history (camera cut)
     }
+    BB_GPU_SCOPE(cmd, "ours: objmv2 compose (bb_objmv2.comp)");
     cmd.fillBuffer(g.stats, slot * kStatWords * 4, kStatWords * 4, 0);
     cmd.resetQueryPool(g.queries, slot * 2, 2);
     // The stats clear and bb_mv.comp's camera vectors (compute) before this pass.
@@ -2626,8 +2648,8 @@ void OnFlip() {
             "{:.3f} px over {} px ({}) | previous camera by address {:.1f} / by order {:.1f} "
             "(rejected as different {:.1f}, uncheckable {:.1f}), without {:.1f}/frame; without previous palette {:.1f}/frame; blended (backup) "
             "{:.1f}/frame | palettes without identity matched by order {:.1f}/frame (rejected as "
-            "different {:.1f}, uncheckable {:.1f}) | GPU copies {:.1f}/frame, snapshot {:.0f} "
-            "B/frame, CPU {:.3f} us/draw",
+            "different {:.1f}, uncheckable {:.1f}) | GPU copies {:.1f}/frame in {:.1f} flushes/frame "
+            "(BB_VELSNAP_BATCH={}), snapshot {:.0f} B/frame, CPU {:.3f} us/draw",
             double(g.vs_native) / f, double(g.vs_draws) / f, double(g.vs_static) / f,
             double(g.vs_skinned) / f, double(g.vs_skinned_ring) / f,
             double(g.vs_skinned_addr) / f, double(g.vs_ring_seen) / f, native_px,
@@ -2637,7 +2659,7 @@ void OnFlip() {
             double(g.vs_cam_unchecked) / f, double(g.vs_no_cam) / f,
             double(g.vs_no_pal) / f, double(g.vs_blend) / f, double(g.vs_pal_ord) / f,
             double(g.vs_pal_rejected) / f, double(g.vs_pal_unchecked) / f,
-            double(g.vs_gpu_copies) / f,
+            double(g.vs_gpu_copies) / f, double(g.vs_flushes) / f, g.velsnap_batch ? 1 : 0,
             double(g.vs_bytes) / f,
             g.vs_draws ? g.vs_cpu_ns / 1000.0 / double(g.vs_draws) : 0.0));
         if (g.fog) {
@@ -2758,6 +2780,7 @@ void OnFlip() {
         g.sec_keep_px = g.sec_keep_dense = 0;
         g.vs_frames = g.vs_draws = g.vs_native = g.vs_static = g.vs_skinned = g.vs_skinned_ring =
             g.vs_skinned_addr = g.vs_no_cam = g.vs_no_pal = g.vs_blend = g.vs_gpu_copies =
+                g.vs_flushes =
                 g.vs_bytes = g.vs_cam_addr = g.vs_cam_ord = g.vs_ring_seen = g.vs_cam_rejected =
                     g.vs_cam_unchecked = g.vs_pal_ord = g.vs_pal_rejected =
                         g.vs_pal_unchecked = 0;

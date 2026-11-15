@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include "common/debug.h"
 #include "core/bb_hud_native_hook.h"
 #include "core/debug_state.h"
@@ -18,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_objmv2.h"
 #include "video_core/bb/bb_upscale.h"
@@ -285,6 +287,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                 regs.num_indices, regs.num_instances.NumInstances());
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
+    scheduler.bb_prof_next_label = bb_prof_label;
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -369,6 +372,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     BbObjMvDraw(pipeline, arg_address + offset, max_count, 0);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
+    scheduler.bb_prof_next_label = bb_prof_label;
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -402,6 +406,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ResetBindings(false);
 }
 
+// bb-gpu-prof: one label per game compute shader.
+static u32 BbProfComputeLabel(u64 hash) {
+    return BB::GpuProf::KeyLabel(
+        hash ^ 0x6373000000000000ull, [&] { return fmt::format("game compute cs {:#x}", hash); },
+        0);
+}
+
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
@@ -415,7 +426,7 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
-        return;
+        return; // (bb-gpu-prof: its copies are timed in the runtime)
     }
 
     if (!BindResources(pipeline)) {
@@ -430,8 +441,10 @@ void Rasterizer::DispatchDirect() {
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    const u32 bb_prof = BB::GpuProf::On() ? BB::GpuProf::Begin(cmdbuf, BbProfComputeLabel(cs.pgm_hash)) : 0u;
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    BB::GpuProf::End(cmdbuf, bb_prof);
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -464,8 +477,14 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    const u32 bb_prof =
+        BB::GpuProf::On()
+            ? BB::GpuProf::Begin(cmdbuf, BbProfComputeLabel(
+                                             pipeline->GetStage(Shader::SwStage::Compute).pgm_hash))
+            : 0u;
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    BB::GpuProf::End(cmdbuf, bb_prof);
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -1622,7 +1641,47 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
     }
 
+    bb_prof_label = BB::GpuProf::On() ? BbProfPassLabel(state, pipeline) : 0u;
     return state;
+}
+
+// bb-gpu-prof: "pass WxH <colour formats> <depth format> ps <hash>" (a scope per game pass),
+// summed also by "target WxH <formats>" (every pass into the same targets).
+u32 Rasterizer::BbProfPassLabel(const RenderState& state, const GraphicsPipeline* pipeline) {
+    const auto& key = pipeline->GetGraphicsKey();
+    const u64 ps = key.stage_hashes[static_cast<u32>(Shader::SwStage::Fragment)];
+    const auto mix = [](u64 h, u64 v) { return (h ^ v) * 0x100000001b3ull + 0x9e3779b97f4a7c15ull; };
+    u64 tk = mix(0xcbf29ce484222325ull, u64(state.width) << 32 | state.height);
+    std::array<vk::Format, 8> formats{};
+    u32 host_targets = 0;
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        if (cb_descs[cb].image_id) {
+            formats[cb] = texture_cache.GetImage(cb_descs[cb].image_id).info.pixel_format;
+        } else if (state.color_attachments[cb].image_view) {
+            ++host_targets; // our own attachment (objmv2's motion target)
+        }
+        tk = mix(tk, u64(formats[cb]) << 8 | cb);
+    }
+    vk::Format depth{};
+    if (db_desc.image_id && state.depth_stencil_attachment.image_view) {
+        depth = texture_cache.GetImage(db_desc.image_id).info.pixel_format;
+    }
+    tk = mix(tk, u64(depth) << 4 | host_targets << 1 | (bb_ui_pass.active ? 1 : 0));
+    const auto target_name = [&] {
+        std::string n = fmt::format("{}x{}", state.width, state.height);
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            if (formats[cb] != vk::Format::eUndefined) n += " " + vk::to_string(formats[cb]);
+        }
+        if (host_targets) n += fmt::format(" +{} own", host_targets);
+        if (depth != vk::Format::eUndefined) n += " depth " + vk::to_string(depth);
+        if (bb_ui_pass.active) n += " (UI, output size)";
+        return n;
+    };
+    static std::unordered_map<u64, u32> groups; // GPU thread only
+    u32& gid = groups[tk];
+    if (gid == 0) gid = BB::GpuProf::Label("target " + target_name(), BB::GpuProf::Kind::Group);
+    return BB::GpuProf::KeyLabel(
+        mix(tk, ps), [&] { return fmt::format("pass {} ps {:#x}", target_name(), ps); }, gid);
 }
 
 void Rasterizer::Resolve() {

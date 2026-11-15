@@ -8,6 +8,7 @@
 // into an RGBA16F image, blitted into the UI image as his RunScaled does for FSR 4, DLSS and TAA).
 
 #include "video_core/renderer_vulkan/bb_ui_cut.h"
+#include "video_core/bb/bb_gpu_profile.h"
 
 #include <algorithm>
 #include <atomic>
@@ -851,6 +852,7 @@ void UiCut::EnsureUiResources(u32 w, u32 h, vk::Format color, vk::Format depth) 
 
 void UiCut::PrepareUiDepth(VideoCore::ImageId depth_id) {
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "ours: HUD cut UI depth (clear + blit)");
     const auto aspect = DepthAspect(ui_depth_format);
     // Copy depth if blit is supported; otherwise just clear it (UI depth test still works).
     const auto props = instance.GetPhysicalDevice().getFormatProperties(ui_depth_format);
@@ -931,6 +933,7 @@ void UiCut::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId depth_id) 
                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
     runtime.FlushBarriers();
     const auto cmd = scheduler.CommandBuffer();
+    BB_GPU_SCOPE(cmd, "ours: HUD cut UI-only background blit");
     vk::ImageMemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
@@ -993,6 +996,7 @@ bool UiCut::RunScaled(SceneDepth& scene) {
     EnsureUiResources(out.width, out.height, color.info.pixel_format, depth.info.pixel_format);
     PrepareUiDepth(depth_id);
     cmd = scheduler.CommandBuffer();
+    BB_GPU_SCOPE(cmd, "ours: HUD cut upscaled scene -> UI image blit");
     const auto all = vk::PipelineStageFlagBits2::eAllCommands;
     const auto barrier = [&](vk::Image image, vk::ImageLayout old_layout,
                              vk::ImageLayout new_layout, vk::PipelineStageFlags2 dst_stage,
@@ -1068,6 +1072,7 @@ void UiCut::CaptureHudlessUi() {
     }
     scheduler.EndRendering();
     const auto cmd = scheduler.CommandBuffer();
+    BB_GPU_SCOPE(cmd, "ours: HUD-less copy at the cut");
     vk::ImageMemoryBarrier2 b[2]{
         {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1262,6 +1267,7 @@ bool UiCut::RedirectSampled(VideoCore::ImageId image, vk::Format format,
             if (hs.image && ui_image.image && hs.width == ui_width && hs.height == ui_height &&
                 hs.format == ui_format) {
                 const auto cmd = scheduler.CommandBuffer();
+                BB_GPU_SCOPE(cmd, "ours: HUD image raw copy (display pass)");
                 vk::ImageMemoryBarrier2 hb[2]{
                     {
                         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1603,6 +1609,7 @@ bool UiCut::CompositeView(vk::ImageView layer_view, vk::ImageLayout layer_image_
     if (!scene_view || !out_view) return false;
     scheduler.EndRendering();
     const auto cmd = scheduler.CommandBuffer();
+    BB_GPU_SCOPE(cmd, "ours: HUD layer composite (compute + copy)");
     const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
     vk::ImageMemoryBarrier2 b[2]{
         {

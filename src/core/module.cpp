@@ -12,6 +12,7 @@
 #include "core/aerolib/aerolib.h"
 #include "core/bb_kbmcam.h"
 #include "core/bb_native_mv_hook.h"
+#include "core/bb_game_gfx.h"
 #include "core/bb_objcol.h"
 #include "core/bb_respatch.h"
 #include "core/bb_vardt.h"
@@ -453,6 +454,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         // After the static patching: the detours are the code that runs.
         BB::NativeMvHook::OnEbootPatched(base_virtual_addr, base_size);
         BB::ObjCol::OnEbootPatched(base_virtual_addr, base_size);
+        BB::GameGfx::OnEbootPatched(base_virtual_addr, base_size);
     }
 #endif
 }

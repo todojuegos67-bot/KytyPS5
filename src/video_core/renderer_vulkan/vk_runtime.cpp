@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/alignment.h"
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -111,6 +112,11 @@ void Runtime::TickFrame() {
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
     scheduler.EndRendering();
+    // bb-gpu-prof: the caller's label (buffer cache upload / readback), else a GPU copy.
+    static const u32 bb_copy = BB::GpuProf::Label("emu: buffer copy (DMA/CP)");
+    const BB::GpuProf::Scope bb_scope(scheduler.CommandBuffer(),
+                                      bb_prof_copy_label != 0 ? bb_prof_copy_label : bb_copy);
+    bb_prof_copy_label = 0;
 
     bool needs_flush{};
     for (const auto& copy : copies) {
@@ -134,6 +140,7 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 
 void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "emu: buffer fill");
 
     if (IsBufferAccessed(dst, offset, size, true)) {
         FlushBarriers();
@@ -172,6 +179,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "tc: image upload (staging->image)");
 
     bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -201,6 +209,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                             std::span<const vk::BufferImageCopy> download_copies) {
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "tc: image readback (image->buffer)");
 
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -304,6 +313,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     }
 
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "tc: image copy (alias/format)");
 
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -359,6 +369,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     }
 
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "tc: image copy through a buffer");
 
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -430,6 +441,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     SetBackingSamples(src, src->info.num_samples);
 
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "tc: mip merge copy");
 
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -486,6 +498,7 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
 void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                                const VideoCore::SubresourceRange& sub_range) {
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "rt: depth/stencil copy");
 
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -529,6 +542,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                            const VideoCore::SubresourceRange& dst_range) {
     SetBackingSamples(dst, 1, false);
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "rt: resolve (MSAA/copy)");
 
     const bool needs_resolve = src->backing->num_samples != 1;
     const auto dst_stage =
@@ -593,6 +607,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                          const vk::ClearValue& clear_value) {
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "emu: image clear");
 
     const bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,

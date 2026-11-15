@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -222,6 +223,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
                                                           256, false, true);
 
     scheduler.EndRendering();
+    BB_GPU_SCOPE(scheduler.CommandBuffer(), "tc: detile (compute)");
     runtime.FlushBarriers();
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -317,6 +319,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.FlushBarriers();
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    BB_GPU_SCOPE(cmdbuf, "tc: retile for readback (compute)");
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{

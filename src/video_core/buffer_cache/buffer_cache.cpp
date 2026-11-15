@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_perf2.h"
 #include <algorithm>
 #include <magic_enum/magic_enum.hpp>
@@ -190,6 +191,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
+    if (BB::GpuProf::On()) {
+        static const u32 l = BB::GpuProf::Label("bc: readback (GPU->guest)");
+        runtime.bb_prof_copy_label = l;
+    }
     runtime.CopyBuffer(arena, download.buffer, copies);
 
     const auto write_data = [this, arena_base, device_addr, size, download, async,
@@ -305,6 +310,10 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
         copy.dstOffset += download.offset;
     }
     scheduler.EndRendering();
+    if (BB::GpuProf::On()) {
+        static const u32 l = BB::GpuProf::Label("bc: readback (GPU->guest)");
+        runtime.bb_prof_copy_label = l;
+    }
     runtime.CopyBuffer(buffer, download.buffer, copies);
     scheduler.DeferOperation(
         [this, base = buffer->CpuAddr(), download, copies = std::move(copies)]() {
@@ -448,6 +457,10 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     if (has_bda) {
         staging.Flush();
+        if (BB::GpuProf::On()) {
+            static const u32 l = BB::GpuProf::Label("bc: BDA page table upload");
+            runtime.bb_prof_copy_label = l;
+        }
         runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
     }
 }
@@ -469,6 +482,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copy.dstOffset -= arena->cpu_addr;
         }
         staging.Flush();
+        if (BB::GpuProf::On()) {
+            static const u32 l = BB::GpuProf::Label("bc: upload (guest->GPU)");
+            runtime.bb_prof_copy_label = l;
+        }
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {

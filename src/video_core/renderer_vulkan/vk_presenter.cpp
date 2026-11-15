@@ -18,6 +18,7 @@
 #include "imgui/renderer/imgui_impl_vulkan.h"
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_objmv2.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -479,6 +480,19 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       texture_cache{rasterizer->GetTextureCache()} {
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
+
+    // bb-gpu-prof (BB_GPU_PROFILE=1): GPU timestamps per pass; each scheduler's submits are timed
+    // whole as well (the GPU's busy time).
+    if (BB::GpuProf::On()) {
+        BB::GpuProf::Init(instance);
+        using BB::GpuProf::Kind;
+        // (review) only the draw scheduler: it is flushed every guest frame. The present and
+        // flip schedulers can stay idle for many frames (flip: PrepareLastFrame only; present:
+        // while the window does not present), and an envelope begun at BeginSession would sit
+        // in an unsubmitted command buffer past the profiler's timeout, which then host-resets
+        // and reuses its query while the write is still pending.
+        draw_scheduler.BbProfSetName(BB::GpuProf::Label("draw", Kind::Envelope));
+    }
 
     // Create presentation frames.
     present_frames.resize(num_images);
@@ -1303,8 +1317,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             sec_start = now;
         }
     }
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 bb_fsr, frame->is_hdr);
+    {
+        BB_GPU_SCOPE(cmdbuf, "ours: presenter FSR 1 pass (menus / scaling)");
+        image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
+                                     {frame->width, frame->height}, bb_fsr, frame->is_hdr);
+    }
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
@@ -1338,6 +1355,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 };
                 cmdbuf.pipelineBarrier2(
                     vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_att});
+                BB_GPU_SCOPE(cmdbuf, "ours: HUD-less post-process copy (FG input)");
                 Frame target = *frame;
                 target.image = frame->hudless_image;
                 target.image_view = frame->hudless_view;
@@ -1370,7 +1388,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         bb_sec_hudless += ok ? 1u : 0u;
         bb_sec_hudless_failed += failed;
     }
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    {
+        BB_GPU_SCOPE(cmdbuf, "ours: presenter post-process (to the backbuffer)");
+        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    }
 
     // bb-fsr3-hudless: FSR 3 FG takes every pixel where the back buffer and the HUD-less image
     // differ as UI (the real frame's pixel in generated frames). The HUD-less copy went through
@@ -1387,6 +1408,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         };
         cmdbuf.pipelineBarrier2(
             vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &written});
+        BB_GPU_SCOPE(cmdbuf, "ours: HUD-less fix + sparks (bb_hudless_fix.comp)");
         bb_hud_fg->FixHudless(cmdbuf, frame->image_view, bb_hud_raw, bb_hudless_scene,
                               frame->hudless_image, frame->hudless_rgba_view,
                               {frame->width, frame->height}, fmt == vk::Format::eB8G8R8A8Unorm,
@@ -1410,6 +1432,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         return v != nullptr && v[0] == '1';
     }();
     if (bb_fg_on && hud_fg) {
+        BB_GPU_SCOPE(cmdbuf, "ours: HUD layer build (BB_HUD_FG)");
         bb_ui_layer = bb_hud_fg->Build(cmdbuf, frame->image, frame->image_view,
                                        swapchain.GetSurfaceFormat().format,
                                        {frame->width, frame->height},
@@ -1473,6 +1496,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             const BB::FG::Image backbuffer{frame->image, frame->unorm_view, frame->unorm_format,
                                            {frame->width, frame->height},
                                            vk::ImageUsageFlagBits::eSampled};
+            // bb-gpu-prof: DLSS-G may continue in another command buffer: its time is in the
+            // "draw" envelope only.
             frame->generated_count = BB::FG::Dlss::Generate(cmdbuf, backbuffer, frame->fg,
                                                             outputs.data(), count,
                                                             instance.GetDevice());
@@ -1523,6 +1548,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    BB::GpuProf::Frame(); // bb-gpu-prof: one guest frame (results read, a line a second)
     {
         // bb-clean-021 [perf]: frame begin stamp of the next frame (top of its command buffer),
         // the GPU times of a frame four flips back (no wait), and the CPU side of this one.

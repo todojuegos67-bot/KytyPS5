@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 #include "video_core/bb/bb_fg_internal.h"
+#include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_smooth.h"
 #include "video_core/bb/bb_kyty_compat.h"
 
@@ -1299,7 +1300,21 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                                         void* context) -> ffxReturnCode_t {
         g_amd_dispatches.fetch_add(1, std::memory_order_relaxed);
         if (params->reset) g_amd_ffx_resets.fetch_add(1, std::memory_order_relaxed);
-        return g_ffx.Dispatch(reinterpret_cast<ffxContext*>(context), &params->header);
+        // bb-gpu-prof: the generated frame's GPU time (FFX's own command list).
+        static const uint32_t prof_label =
+            BB::GpuProf::Label("ours: FSR 3 FG frame generation (FFX dispatch)");
+        const vk::CommandBuffer prof_cmd{static_cast<VkCommandBuffer>(params->commandList)};
+        // (review) with KYTY_FSR3_ASYNC=1 FFX may record this list for its async compute
+        // queue: timestamps only when that family supports them.
+        const uint32_t prof =
+            BB::GpuProf::On() && params->commandList &&
+                    (!EnvOn("KYTY_FSR3_ASYNC", false) ||
+                     BB::GpuProf::FamilyHasTimestamps(g_compute_family))
+                ? BB::GpuProf::Begin(prof_cmd, prof_label)
+                : 0u;
+        const auto r = g_ffx.Dispatch(reinterpret_cast<ffxContext*>(context), &params->header);
+        BB::GpuProf::End(prof_cmd, prof);
+        return r;
     };
     config.frameGenerationCallbackUserContext = &g_fg_context;
     config.frameGenerationEnabled = generate;
@@ -1506,7 +1521,12 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                static_cast<void*>(slot.command), camera.valid ? "chained" : "none",
                prepare.cameraNear, prepare.cameraFar, prepare.cameraFovAngleVertical);
     }
+    static const uint32_t prof_label =
+        BB::GpuProf::Label("ours: FSR 3 FG prepare (FFX dispatch)");
+    const vk::CommandBuffer prof_cmd{slot.command};
+    const uint32_t prof = BB::GpuProf::On() ? BB::GpuProf::Begin(prof_cmd, prof_label) : 0u;
     const auto result = g_ffx.Dispatch(&g_fg_context, &prepare.header);
+    BB::GpuProf::End(prof_cmd, prof);
     if (first_steps < 3) {
         Printf("FSR3 FG: prepare dispatch returned %u", result);
         ++first_steps;

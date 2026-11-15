@@ -385,6 +385,16 @@ public:
     /// bb-velocity: called right after a rendering scope ends (the velocity buffer's deferred
     /// snapshot copies go there, so no render pass is ever cut for them).
     static inline void (*bb_end_rendering_hook)(vk::CommandBuffer) = nullptr;
+    /// bb-velsnap-batch: called right before a rendering scope begins (outside it).
+    static inline void (*bb_begin_rendering_hook)(vk::CommandBuffer) = nullptr;
+
+    /// bb-gpu-prof (BB_GPU_PROFILE=1): the label of this scheduler's command buffers (one
+    /// envelope scope a submit) and of the next rendering scope that begins (set by the
+    /// rasterizer right before its BeginRendering; 0: "other rendering").
+    void BbProfSetName(u32 envelope_label) {
+        bb_prof_env_label = envelope_label;
+    }
+    u32 bb_prof_next_label = 0;
 
     /// Starts a new session.
     void BeginSession();
@@ -487,6 +497,9 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    u32 bb_prof_env_label = 0;  // bb-gpu-prof: envelope label (0: not timed)
+    u32 bb_prof_env_token = 0;  // the open envelope scope of the current session
+    u32 bb_prof_pass_token = 0; // the open rendering scope
     tracy::VkCtxScope* profiler_scope{};
 };
 
