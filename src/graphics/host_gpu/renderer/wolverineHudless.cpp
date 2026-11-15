@@ -113,12 +113,22 @@ void ReadTimer(GraphicContext& graphics) {
 } // namespace
 
 void Ensure(GraphicContext& graphics, VulkanImage& image, vk::Extent2D extent, vk::Format format,
-            vk::ImageUsageFlags usage) {
+            vk::ImageUsageFlags usage, CommandScheduler* scheduler) {
 	if (image.image != nullptr && image.extent.width == extent.width && image.extent.height == extent.height &&
 	    image.format == format && image.usage == usage) {
 		return;
 	}
-	if (image.image != nullptr) {
+	if (image.image != nullptr && scheduler != nullptr) {
+		scheduler->DeferOperation([&graphics, handle = image.image, allocation = image.allocation] {
+			VulkanImage old;
+			old.image      = handle;
+			old.allocation = allocation;
+			graphics.DeleteImage(old);
+		});
+		image.image      = nullptr;
+		image.allocation = nullptr;
+		image.state      = {};
+	} else if (image.image != nullptr) {
 		graphics.DeleteImage(image);
 		image.state = {};
 	}
@@ -180,10 +190,11 @@ static void MergeWithoutUi(CommandBuffer& buffer, GraphicContext& graphics, Imag
 	auto&      capture     = g_captures[flip.info.data.address];
 	const auto ui_extent   = vk::Extent2D {ui.backing.extent.width, ui.backing.extent.height};
 	const auto flip_extent = vk::Extent2D {flip.backing.extent.width, flip.backing.extent.height};
+	auto* scheduler = &buffer.GetContext().GetCommandScheduler();
 	Ensure(graphics, g_ui_saved, ui_extent, ui.backing.format,
-	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst);
+	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst, scheduler);
 	Ensure(graphics, capture.image, flip_extent, flip.backing.format,
-	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst);
+	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst, scheduler);
 	if (g_timer.pool == nullptr) {
 		vk::QueryPoolCreateInfo info {};
 		info.sType      = vk::StructureType::eQueryPoolCreateInfo;

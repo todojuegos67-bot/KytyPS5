@@ -18,6 +18,7 @@
 // and frame generation takes it as the HUD-less colour, so the HUD comes from the real frame (59-fsr-framegen.md).
 namespace Libs::Graphics {
 class CommandBuffer;
+class CommandScheduler;
 struct RenderColorInfo;
 struct TextureBinding;
 } // namespace Libs::Graphics
@@ -38,9 +39,10 @@ void BeforeDispatch(CommandBuffer& buffer, uint64_t hash, std::span<const Shader
 // into `into`, made its size and format. False when there is none.
 [[nodiscard]] bool TakeFor(Cmd command, GraphicContext& graphics, const Image& surface, VulkanImage& into);
 
-// Makes `image` a 2D colour image of that size, format and usage (again when they differ).
+// Makes `image` a 2D colour image of that size, format and usage (again when they differ). With `scheduler`, an image
+// replaced goes once the GPU is past the work recorded so far, which may still read it; without, at once.
 void Ensure(GraphicContext& graphics, VulkanImage& image, vk::Extent2D extent, vk::Format format,
-            vk::ImageUsageFlags usage);
+            vk::ImageUsageFlags usage, CommandScheduler* scheduler = nullptr);
 // One barrier from the image's tracked state.
 void Transit(Cmd command, VulkanImage& image, vk::ImageLayout layout, vk::AccessFlags2 access);
 
