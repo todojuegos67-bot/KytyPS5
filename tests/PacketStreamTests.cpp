@@ -92,6 +92,27 @@ void TestBackpressure() {
 	Check(stream.BackpressureWaits() > 0, "the producer waited for blocks");
 }
 
+// A consumer as fast as the producer, so that it often runs everything while the producer waits for a block (it
+// waited for one packet more than was appended, and hung). Probabilistic: a hang shows as the watchdog's abort.
+void TestBackpressureFastConsumer() {
+	std::atomic<bool> done {false};
+	std::thread       watchdog([&] {
+		for (int i = 0; i < 600 && !done.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		Check(done.load(), "backpressure with a fast consumer finished within a minute");
+	});
+	for (int round = 0; round < 20; round++) {
+		Seen                 seen;
+		Common::PacketStream stream(&seen, false, 2);
+		stream.Start();
+		constexpr uint32_t count = 5000;
+		for (uint32_t i = 0; i < count; i++) Put(stream, i, 1000);
+		stream.Stop();
+		Check(seen.order.size() == count, "a fast consumer runs everything");
+	}
+	done.store(true);
+	watchdog.join();
+}
+
 void TestVerifyCatchesChange() {
 	Seen seen;
 	seen.gate.store(false);
@@ -127,6 +148,7 @@ void TestNothingRunsUnpublished() {
 int main() {
 	TestOrderAndContents();
 	TestBackpressure();
+	TestBackpressureFastConsumer();
 	TestVerifyCatchesChange();
 	TestNothingRunsUnpublished();
 	std::printf("PacketStreamTests: ok\n");

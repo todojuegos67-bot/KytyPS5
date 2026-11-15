@@ -205,7 +205,11 @@ private:
 			}
 			m_backpressure_waits++;
 			Publish();
-			WaitExecuted(m_executed.load(std::memory_order_acquire) + 1u);
+			// The consumer may have run everything (and freed a block) since the free list was read: then waiting for one
+			// more packet would never return.
+			if (const auto executed = m_executed.load(std::memory_order_acquire); executed < m_appended) {
+				WaitExecuted(executed + 1u);
+			}
 		}
 		block->committed.store(0, std::memory_order_relaxed);
 		block->next.store(nullptr, std::memory_order_relaxed);
