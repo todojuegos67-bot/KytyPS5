@@ -20,6 +20,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "imgui/bb_menu.h"
+#include "core/bb_objcol.h"
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
@@ -356,6 +357,9 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     }
 
     file->is_opened = true;
+    if (BB::ObjCol::Enabled() && file->type == Core::FileSys::FileType::Regular) {
+        BB::ObjCol::OnGuestFileOpen(file->m_guest_name.c_str(), nullptr);
+    }
     return handle;
 }
 
