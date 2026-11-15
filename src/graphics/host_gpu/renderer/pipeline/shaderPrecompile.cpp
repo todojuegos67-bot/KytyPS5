@@ -552,18 +552,35 @@ InputInfo RecordedInput(const ShaderVertexInputInfo& input) { return Cleared(inp
 InputInfo RecordedInput(const ShaderPixelInputInfo& input) { return Cleared(input); }
 InputInfo RecordedInput(const ShaderComputeInputInfo& input) { return Cleared(input); }
 
-uint64_t StageRecord::Key() const {
-	Writer key;
+static void WriteStageKey(Writer& key, ShaderType stage, uint64_t shader_hash, uint32_t user_data_count, size_t code_size,
+                          size_t back_code_size, std::span<const uint32_t> static_key, uint32_t push_data_cursor,
+                          const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
 	key.U32(static_cast<uint32_t>(stage));
 	key.U64(shader_hash);
 	key.U32(user_data_count);
-	key.U32(static_cast<uint32_t>(code.size()));
-	key.U32(static_cast<uint32_t>(back_code.size()));
-	std::vector<uint32_t> static_key;
-	std::visit([&](const auto& info) { BuildStageStaticKey(info, static_key); }, input);
+	key.U32(static_cast<uint32_t>(code_size));
+	key.U32(static_cast<uint32_t>(back_code_size));
 	key.Words(static_key);
 	key.U32(push_data_cursor);
 	WriteSpecialization(key, specialization);
+}
+
+uint64_t StageKey(ShaderType stage, uint64_t shader_hash, uint32_t user_data_count, size_t code_size, size_t back_code_size,
+                  std::span<const uint32_t> static_key, uint32_t push_data_cursor,
+                  const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	Writer key;
+	WriteStageKey(key, stage, shader_hash, user_data_count, code_size, back_code_size, static_key, push_data_cursor,
+	              specialization);
+	const auto hash = XXH3_64bits(key.Data().data(), key.Data().size() * sizeof(uint32_t));
+	return hash != 0 ? hash : 1;
+}
+
+uint64_t StageRecord::Key() const {
+	Writer                key;
+	std::vector<uint32_t> static_key;
+	std::visit([&](const auto& info) { BuildStageStaticKey(info, static_key); }, input);
+	WriteStageKey(key, stage, shader_hash, user_data_count, code.size(), back_code.size(), static_key, push_data_cursor,
+	              specialization);
 	if (!callees.empty()) {
 		key.U32(static_cast<uint32_t>(callees.size()));
 		for (const auto& callee: callees) key.U64(XXH3_64bits(callee.data(), callee.size() * sizeof(uint32_t)));

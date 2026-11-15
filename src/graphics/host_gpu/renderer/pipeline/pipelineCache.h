@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <map>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -35,6 +36,10 @@ struct ResourceSpecialization;
 struct ResourcePlan;
 struct Program;
 } // namespace ShaderRecompiler::IR
+
+namespace ShaderRecompiler {
+struct CompileOptions;
+} // namespace ShaderRecompiler
 
 struct GraphicContext;
 struct RenderColorInfo;
@@ -283,6 +288,14 @@ private:
 	                   std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> plan);
 	std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> TakeReadyPlan(ShaderType stage, uint64_t hash,
 	                                                                  const std::vector<uint32_t>& static_key);
+	// The Ahead workers' takes from the stage store, in place of a translation: a program's resource plan (any record
+	// of it), and one permutation's SPIR-V and compiled info, its plan noted for the GPU thread as a translation's is.
+	bool StorePlan(ShaderType stage, const ShaderParams& params, const std::vector<uint32_t>& static_key,
+	               const ShaderRecompiler::CompileOptions& options, ShaderRecompiler::IR::ResourcePlan& plan);
+	bool StoreModule(ShaderType stage, const ShaderParams& params, const std::vector<uint32_t>& static_key,
+	                 const ShaderRecompiler::CompileOptions& options, uint32_t push_data_cursor,
+	                 const ShaderRecompiler::IR::ResourceSpecialization& specialization, std::vector<uint32_t>& spirv,
+	                 ShaderRecompiler::IR::CompiledShaderInfo& info);
 	bool TakeReadyModule(ShaderType stage, uint64_t hash, const std::vector<uint32_t>& static_key,
 	                     const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_cursor,
 	                     std::vector<uint32_t>& spirv, ShaderRecompiler::IR::CompiledShaderInfo& info);
@@ -326,6 +339,10 @@ private:
 	std::unique_ptr<Precompile::WarmList>                   m_warm;
 	std::unique_ptr<Precompile::Precompiler>                m_precompiler;
 	std::unique_ptr<Precompile::StageStore>                 m_stage_store; // translated stages (stageStore.h)
+	// The journal's stage records without callees by program (StageProgramKey): one record's key each, for the Ahead
+	// workers' plan. Written once at start, before m_stage_index_ready; the workers start before it.
+	std::map<std::vector<uint32_t>, uint64_t>               m_stage_index;
+	std::atomic<bool>                                       m_stage_index_ready {false};
 	std::unordered_set<uint64_t>                            m_recorded_pipelines; // pipeline record keys in the journal
 	// Pipelines the precompile created in this process, by pipeline record key, with their stages' SPIR-V hashes
 	// (vertex stages, then pixel): the GPU thread takes one whose stages are its own instead of creating it again.

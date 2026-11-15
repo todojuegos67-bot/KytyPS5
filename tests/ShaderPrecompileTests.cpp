@@ -1,5 +1,6 @@
 #include "common/emulatorConfig.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
+#include "graphics/shader/shaderCompiler.h"
 
 #include <array>
 #include <atomic>
@@ -648,8 +649,31 @@ void TestSuspectLines(const std::filesystem::path& dir) {
 	      "suspects stay for later runs");
 }
 
+// StageKey (the Ahead workers' lookup of a stage store record) is StageRecord::Key() for a record without callees.
+void TestStageKey() {
+	for (const auto& record: {PixelRecord(5), ComputeRecord(6)}) {
+		std::vector<uint32_t> static_key;
+		std::visit([&](const auto& info) { Libs::Graphics::BuildStageStaticKey(info, static_key); }, record.input);
+		Check(Precompile::StageKey(record.stage, record.shader_hash, record.user_data_count, record.code.size(),
+		                           record.back_code.size(), static_key, record.push_data_cursor,
+		                           record.specialization) == record.Key(),
+		      "StageKey is the record's key");
+	}
+	auto back = PixelRecord(7);
+	back.back_code = MakeCode(8, 32);
+	std::vector<uint32_t> static_key;
+	std::visit([&](const auto& info) { Libs::Graphics::BuildStageStaticKey(info, static_key); }, back.input);
+	Check(Precompile::StageKey(back.stage, back.shader_hash, back.user_data_count, back.code.size(), back.back_code.size(),
+	                           static_key, back.push_data_cursor, back.specialization) == back.Key(),
+	      "StageKey counts a back half");
+	Check(Precompile::StageKey(back.stage, back.shader_hash, back.user_data_count, back.code.size(), 0, static_key,
+	                           back.push_data_cursor, back.specialization) != back.Key(),
+	      "StageKey of another back half is another key");
+}
+
 int main() {
 	Config::Initialize(); // Origin() reads the options
+	TestStageKey();
 	const auto dir = std::filesystem::temp_directory_path() / "kyty_shader_precompile_tests";
 	std::error_code error;
 	std::filesystem::remove_all(dir, error);

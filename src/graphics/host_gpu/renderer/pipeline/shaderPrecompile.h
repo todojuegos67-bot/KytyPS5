@@ -58,6 +58,12 @@ struct StageRecord {
 	[[nodiscard]] uint64_t Key() const;
 };
 
+// StageRecord::Key() of a record without callees, from its fields: the Ahead workers know a job's inputs but have no
+// record, and find the stage store's record of the permutation by it.
+uint64_t StageKey(ShaderType stage, uint64_t shader_hash, uint32_t user_data_count, size_t code_size, size_t back_code_size,
+                  std::span<const uint32_t> static_key, uint32_t push_data_cursor,
+                  const ShaderRecompiler::IR::ResourceSpecialization& specialization);
+
 // One graphics pipeline, by its stages' record keys and its state. A compute record is its own pipeline.
 struct PipelineRecord {
 	std::array<uint64_t, 3>  vertex {}; // VS, mesh or LS; then HS and DS when tessellated

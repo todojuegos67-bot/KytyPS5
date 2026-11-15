@@ -114,6 +114,40 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
+// The stage store's records by program, for the Ahead workers (m_stage_index): the inputs a translation depends on
+// before its specialization is known.
+static std::vector<uint32_t> StageProgramKey(ShaderType stage, uint64_t hash, uint32_t user_data_count, size_t code_size,
+                                             size_t back_code_size, std::span<const uint32_t> static_key) {
+	std::vector<uint32_t> key {static_cast<uint32_t>(stage), static_cast<uint32_t>(hash), static_cast<uint32_t>(hash >> 32u),
+	                           user_data_count, static_cast<uint32_t>(code_size), static_cast<uint32_t>(back_code_size)};
+	key.insert(key.end(), static_key.begin(), static_key.end());
+	return key;
+}
+
+// A stage store record of this program: its plan bytes, SPIR-V and compiled info. False: none, or another program's.
+struct StoredStage {
+	std::vector<uint8_t>                     plan;
+	std::vector<uint32_t>                    spirv;
+	ShaderRecompiler::IR::CompiledShaderInfo info;
+};
+static bool ReadStoredStage(Precompile::StageStore& store, uint64_t key, ShaderType stage, uint64_t hash,
+                            const std::vector<uint32_t>& static_key, StoredStage& out) {
+	auto bytes = store.Find(key);
+	if (!bytes.has_value()) return false;
+	ShaderRecompiler::IR::Reader reader {*bytes};
+	ShaderType                   stored_stage {};
+	uint64_t                     stored_hash = 0;
+	std::vector<uint32_t>        stored_key;
+	ShaderRecompiler::IR::IoAll(reader, stored_stage, stored_hash, stored_key, out.plan, out.spirv, out.info);
+	return reader.ok && reader.bytes.empty() && stored_stage == stage && stored_hash == hash && stored_key == static_key &&
+	       !out.spirv.empty();
+}
+
+// Whether the Ahead workers take stages from the stage store (34 cut 8).
+static bool AheadFromStore() {
+	return true;
+}
+
 // What a stage store record (stageStore.h) depends on besides its stage record: the layout, the code and switches
 // (Origin), this build of them, the GPU and driver, and the device's SPIR-V profile. Empty: no store.
 std::vector<uint8_t> StageStoreHeader(const vk::PhysicalDeviceProperties& properties,
@@ -1533,6 +1567,20 @@ void PipelineCache::InitializePrecompile() {
 	}
 	m_program_cache->journal = m_journal.get();
 	for (const auto& record: journal.stages) m_program_cache->recorded.insert(record.Key());
+	// The Ahead workers take what the launcher's precompile translated (StorePlan, StoreModule) instead of translating
+	// it in play. Records with callees aren't built ahead.
+	if (m_stage_store != nullptr && !m_stage_store->Writing()) {
+		for (const auto& record: journal.stages) {
+			if (!record.callees.empty() || record.code.empty()) continue;
+			std::vector<uint32_t> static_key;
+			std::visit([&](const auto& info) { BuildStageStaticKey(info, static_key); }, record.input);
+			m_stage_index.try_emplace(StageProgramKey(record.stage, record.shader_hash, record.user_data_count,
+			                                          record.code.size(), record.back_code.size(), static_key),
+			                          record.Key());
+		}
+		m_stage_index_ready.store(true, std::memory_order_release);
+		PipelineCacheLog("SHADER_PRECOMPILE stage store: {} programs for the Ahead workers", m_stage_index.size());
+	}
 	for (const auto& record: journal.pipelines) m_recorded_pipelines.insert(record.Key());
 	PipelineCacheLog("SHADER_PRECOMPILE journal: {} stages, {} pipelines{}{}{}", journal.stages.size(), journal.pipelines.size(),
 	                 journal.torn ? ", torn tail dropped" : "",
@@ -2618,6 +2666,7 @@ uint32_t PipelineCache::PrepareExactVertex(const AheadRegisters& draw, const HW:
 	}
 	auto options = VertexOptions(params, vertex_info[0], m_program_cache->profile);
 	switch (m_ahead->TakeProgram(*program, handed, params.hash, [&](auto& plan, auto& translated) {
+		if (StorePlan(vertex_info[0].logical_stage, params, job.vertex_static_key, options, plan)) return true;
 		auto source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		if (!source.calls.empty()) return false;
 		translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(source.decoded, options));
@@ -2707,6 +2756,7 @@ PipelineCache::AheadStep PipelineCache::PrepareGraphicsAhead(const AheadRegister
 		};
 		auto options = PixelOptions(params, pixel_info, m_program_cache->profile, m_graphics.SplitsFragmentSet());
 		switch (m_ahead->TakeProgram(program, handed, params.hash, [&](auto& plan, auto& translated) {
+			if (StorePlan(ShaderType::Pixel, params, pixel_key, options, plan)) return true;
 			auto source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 			if (!source.calls.empty()) return false;
 			translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(source.decoded, options));
@@ -2885,6 +2935,7 @@ PipelineCache::AheadStep PipelineCache::PrepareComputeAhead(const AheadRegisters
 		auto& program = *current;
 		auto  options = ComputeOptions(params, input_info, m_program_cache->profile);
 		switch (m_ahead->TakeProgram(program, handed, params.hash, [&](auto& plan, auto& translated) {
+			if (StorePlan(ShaderType::Compute, params, static_key, options, plan)) return true;
 			auto source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 			// shortcut: shaders with calls link their leaves at run time; not built ahead, add them
 			// when the Pipelines tab shows them stalling.
@@ -3007,6 +3058,57 @@ void PipelineCache::NoteReady(ShaderType stage, uint64_t hash, std::vector<uint3
 	m_ahead->ready_words += spirv.size();
 }
 
+// A program's resource plan from any stage store record of it: TakeProgram's translation is only for the plan, which
+// doesn't depend on the specialization the plan is then used to find.
+bool PipelineCache::StorePlan(ShaderType stage, const ShaderParams& params, const std::vector<uint32_t>& static_key,
+                              [[maybe_unused]] const ShaderRecompiler::CompileOptions& options,
+                              ShaderRecompiler::IR::ResourcePlan& plan) {
+	if (!m_stage_index_ready.load(std::memory_order_acquire) || !AheadFromStore()) return false;
+	const auto found = m_stage_index.find(StageProgramKey(stage, params.hash, params.user_data_count, params.code.size(),
+	                                                      params.back_code.size(), static_key));
+	if (found == m_stage_index.end()) return false;
+	StoredStage stored;
+	if (!ReadStoredStage(*m_stage_store, found->second, stage, params.hash, static_key, stored)) return false;
+	try {
+		Common::ScopedExitThrows throws;
+		return ShaderRecompiler::IR::LoadResourcePlan(stored.plan, plan);
+	} catch (const Common::ExitException&) {
+		return false;
+	}
+}
+
+// A permutation's SPIR-V and compiled info from its stage store record (the job's own record key), and its plan for
+// the GPU thread (NoteReadyPlan) unless the program has one. False: not recorded; the caller translates.
+bool PipelineCache::StoreModule(ShaderType stage, const ShaderParams& params, const std::vector<uint32_t>& static_key,
+                                [[maybe_unused]] const ShaderRecompiler::CompileOptions& options, uint32_t push_data_cursor,
+                                const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                                std::vector<uint32_t>& spirv, ShaderRecompiler::IR::CompiledShaderInfo& info) {
+	if (!m_stage_index_ready.load(std::memory_order_acquire) || !AheadFromStore()) return false;
+	const auto  key = Precompile::StageKey(stage, params.hash, params.user_data_count, params.code.size(),
+	                                       params.back_code.size(), static_key, push_data_cursor, specialization);
+	StoredStage stored;
+	if (!ReadStoredStage(*m_stage_store, key, stage, params.hash, static_key, stored)) return false;
+	bool planned = false;
+	{
+		std::lock_guard lock(m_ahead->mutex);
+		const auto      found = m_ahead->ready.find({stage, params.hash, static_key});
+		planned               = found != m_ahead->ready.end() && found->second.planned;
+	}
+	if (!planned) {
+		auto plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>();
+		try {
+			Common::ScopedExitThrows throws;
+			if (!ShaderRecompiler::IR::LoadResourcePlan(stored.plan, *plan)) return false;
+		} catch (const Common::ExitException&) {
+			return false;
+		}
+		NoteReadyPlan(stage, params.hash, static_key, std::move(plan));
+	}
+	spirv = std::move(stored.spirv);
+	info  = std::move(stored.info);
+	return true;
+}
+
 // The program's resource plan, once, from the worker's translation: a plan owns compiled code, so it is
 // moved to the GPU thread, not copied.
 void PipelineCache::NoteReadyPlan(ShaderType stage, uint64_t hash, const std::vector<uint32_t>& static_key,
@@ -3100,18 +3202,24 @@ void PipelineCache::RunComputeAhead() {
 		if (step == AheadStep::Build && job->pixel) RunGraphicsAhead(*job);
 		if (step == AheadStep::Build && !job->pixel) {
 		auto options = ComputeOptions(job->params, job->input_info, m_program_cache->profile);
-		if (job->translated == nullptr) {
-			job->translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
-			    ShaderRecompiler::PrepareShaderSource(job->params.code, options).decoded, options));
-		}
 		std::vector<uint32_t> key;
 		BuildStageStaticKey(job->input_info, key);
-		NoteReadyPlan(ShaderType::Compute, job->params.hash, key, job->translated->program);
-		auto result = ShaderRecompiler::CompileProgram(std::move(*job->translated), options, job->specialization, 0);
-		const auto module = CompileSPV(result.spirv, m_graphics.device);
+		std::vector<uint32_t>                    spirv;
+		ShaderRecompiler::IR::CompiledShaderInfo info;
+		if (job->translated != nullptr ||
+		    !StoreModule(ShaderType::Compute, job->params, key, options, 0, job->specialization, spirv, info)) {
+			if (job->translated == nullptr) {
+				job->translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
+				    ShaderRecompiler::PrepareShaderSource(job->params.code, options).decoded, options));
+			}
+			NoteReadyPlan(ShaderType::Compute, job->params.hash, key, job->translated->program);
+			auto result = ShaderRecompiler::CompileProgram(std::move(*job->translated), options, job->specialization, 0);
+			spirv       = std::move(result.spirv);
+			info        = std::move(result.program).TakeCompiledInfo();
+		}
+		const auto module = CompileSPV(spirv, m_graphics.device);
 		if (module != nullptr) {
-			auto info = std::move(result.program).TakeCompiledInfo();
-			NoteReady(ShaderType::Compute, job->params.hash, std::move(key), job->specialization, result.spirv, info);
+			NoteReady(ShaderType::Compute, job->params.hash, std::move(key), job->specialization, spirv, info);
 			ShaderRecompiler::IR::ResourceSnapshot resources; // the stage must have one; layouts read the program only
 			job->input_info.stage = {.program = &info, .resources = &resources};
 			Pipeline   pipeline;
@@ -3145,20 +3253,27 @@ void PipelineCache::RunComputeAhead() {
 // A worker: the pixel shader's module, then a pipeline with each template of its vertex shader.
 void PipelineCache::RunGraphicsAhead(AheadJob& job) {
 	auto options = PixelOptions(job.params, job.pixel_info, m_program_cache->profile, m_graphics.SplitsFragmentSet());
-	if (job.translated == nullptr) {
-		job.translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
-		    ShaderRecompiler::PrepareShaderSource(job.params.code, options).decoded, options));
-	}
 	std::vector<uint32_t> key;
 	BuildStageStaticKey(job.pixel_info, key);
-	NoteReadyPlan(ShaderType::Pixel, job.params.hash, key, job.translated->program);
+	std::vector<uint32_t>                    spirv;
+	ShaderRecompiler::IR::CompiledShaderInfo info;
 	// The pixel stage's push data starts where GetGraphicsPrograms puts it.
-	auto result = ShaderRecompiler::CompileProgram(std::move(*job.translated), options, job.specialization,
-	                                               ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-	const auto module = CompileSPV(result.spirv, m_graphics.device);
+	if (job.translated != nullptr || !StoreModule(ShaderType::Pixel, job.params, key, options,
+	                                              ShaderRecompiler::IR::PushData::MeshDrawDwordCount, job.specialization,
+	                                              spirv, info)) {
+		if (job.translated == nullptr) {
+			job.translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
+			    ShaderRecompiler::PrepareShaderSource(job.params.code, options).decoded, options));
+		}
+		NoteReadyPlan(ShaderType::Pixel, job.params.hash, key, job.translated->program);
+		auto result = ShaderRecompiler::CompileProgram(std::move(*job.translated), options, job.specialization,
+		                                               ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		spirv       = std::move(result.spirv);
+		info        = std::move(result.program).TakeCompiledInfo();
+	}
+	const auto module = CompileSPV(spirv, m_graphics.device);
 	if (module == nullptr) return;
-	auto                                   info = std::move(result.program).TakeCompiledInfo();
-	NoteReady(ShaderType::Pixel, job.params.hash, std::move(key), job.specialization, result.spirv, info);
+	NoteReady(ShaderType::Pixel, job.params.hash, std::move(key), job.specialization, spirv, info);
 	ShaderRecompiler::IR::ResourceSnapshot resources;
 	job.pixel_info.stage = {.program = &info, .resources = &resources};
 	std::vector<std::shared_ptr<const Ahead::GraphicsTemplate>> list;
@@ -3199,26 +3314,34 @@ void PipelineCache::RunGraphicsAhead(AheadJob& job) {
 		// (the same translation, specialization and push data place, so the same SPIR-V).
 		std::optional<Ahead::GraphicsTemplate> own;
 		if (match == list.end()) {
-			auto voptions = VertexOptions(job.vertex_params, job.vertex_info, m_program_cache->profile);
-			if (job.vertex_translated == nullptr) {
-				job.vertex_translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
-				    ShaderRecompiler::PrepareShaderSource(job.vertex_params.code, voptions).decoded, voptions));
+			auto       voptions = VertexOptions(job.vertex_params, job.vertex_info, m_program_cache->profile);
+			const auto stage    = job.vertex_info.logical_stage;
+			std::vector<uint32_t>                    vertex_spirv;
+			ShaderRecompiler::IR::CompiledShaderInfo vertex_compiled;
+			if (job.vertex_translated != nullptr ||
+			    !StoreModule(stage, job.vertex_params, job.vertex_static_key, voptions, vertex_cursor,
+			                 job.vertex_specialization, vertex_spirv, vertex_compiled)) {
+				if (job.vertex_translated == nullptr) {
+					job.vertex_translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
+					    ShaderRecompiler::PrepareShaderSource(job.vertex_params.code, voptions).decoded, voptions));
+				}
+				NoteReadyPlan(stage, job.vertex_params.hash, job.vertex_static_key, job.vertex_translated->program);
+				auto vertex     = ShaderRecompiler::CompileProgram(std::move(*job.vertex_translated), voptions,
+				                                                   job.vertex_specialization, vertex_cursor);
+				vertex_spirv    = std::move(vertex.spirv);
+				vertex_compiled = std::move(vertex.program).TakeCompiledInfo();
 			}
-			const auto stage = job.vertex_info.logical_stage;
-			NoteReadyPlan(stage, job.vertex_params.hash, job.vertex_static_key, job.vertex_translated->program);
-			auto vertex = ShaderRecompiler::CompileProgram(std::move(*job.vertex_translated), voptions,
-			                                               job.vertex_specialization, vertex_cursor);
-			vertex_module = CompileSPV(vertex.spirv, m_graphics.device);
+			vertex_module = CompileSPV(vertex_spirv, m_graphics.device);
 			if (vertex_module != nullptr) {
 				own.emplace();
-				own->vertex_programs[0]   = std::move(vertex.program).TakeCompiledInfo();
-				NoteReady(stage, job.vertex_params.hash, job.vertex_static_key, job.vertex_specialization, vertex.spirv,
+				own->vertex_programs[0]   = std::move(vertex_compiled);
+				NoteReady(stage, job.vertex_params.hash, job.vertex_static_key, job.vertex_specialization, vertex_spirv,
 				          own->vertex_programs[0]);
 				own->vertex_info[0]       = job.vertex_info;
 				own->vertex_info[0].stage = {.program = &own->vertex_programs[0], .resources = &own->resources};
 				own->programs.vertex[0]   = {.id         = OwnVertexModuleId,
 				                             .module     = vertex_module,
-				                             .spirv_hash = XXH3_64bits(vertex.spirv.data(), vertex.spirv.size() * sizeof(uint32_t))};
+				                             .spirv_hash = XXH3_64bits(vertex_spirv.data(), vertex_spirv.size() * sizeof(uint32_t))};
 				own->stages               = 1;
 				own->mesh                 = job.mesh;
 			}
@@ -3338,7 +3461,7 @@ void PipelineCache::RunGraphicsAhead(AheadJob& job) {
 		auto programs  = tmpl->programs;
 		programs.pixel = {.id         = UINT64_MAX,
 		                  .module     = module,
-		                  .spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t))};
+		                  .spirv_hash = XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t))};
 		Pipeline   pipeline;
 		CreatePipelineInternal(m_graphics, pipeline, with->rendering, tmpl->vertex_input,
 		                       std::span(tmpl->vertex_info.data(), tmpl->stages), &job.pixel_info, programs,
