@@ -9,6 +9,7 @@
 #include <QEvent>
 #include <QImage>
 #include <QScrollBar>
+#include <QSettings>
 #include <QTemporaryDir>
 
 #include <cstdio>
@@ -72,6 +73,32 @@ int main(int argc, char **argv) {
               config.command_buffer_dump_folder == dump,
           "an imported config chose an output file or the elf");
     Check(config.user_name == QStringLiteral("Imported"), "the rest of the config did not import");
+  }
+
+  // Audit 2026-11-15, 43-44: an upstream export's pro_enabled imports as Pro mode; a render size the emulator would
+  // refuse does not import.
+  {
+    Configuration config;
+    QString       error;
+    Check(config.SetGameSettings(QJsonObject {{"pro_enabled", "false"}}, error) && !config.pro_enabled,
+          "an upstream export's pro_enabled did not import");
+    Check(!config.SetGameSettings(QJsonObject {{"render_resolution", "1000x1000"}}, error),
+          "a render size the emulator refuses imported");
+    Check(config.SetGameSettings(QJsonObject {{"render_resolution", "2560x1440"}}, error) &&
+              config.render_resolution == QStringLiteral("2560x1440"),
+          "a render step did not import");
+  }
+  // An ini from before pro_mode moves the old default upscaler, Linear, to FSR once; with pro_mode it stays.
+  {
+    QTemporaryDir dir;
+    QSettings     old_ini(dir.filePath(QStringLiteral("old.ini")), QSettings::IniFormat);
+    old_ini.setValue(QStringLiteral("pssr_upscaler"), QStringLiteral("Linear"));
+    Configuration config;
+    config.ReadSettings(&old_ini);
+    Check(config.pssr_upscaler == Configuration::PssrUpscaler::FSR && config.pro_enabled, "an old ini kept Linear in Pro mode");
+    old_ini.setValue(QStringLiteral("pro_mode"), QStringLiteral("true"));
+    config.ReadSettings(&old_ini);
+    Check(config.pssr_upscaler == Configuration::PssrUpscaler::Linear, "a chosen Linear did not stay");
   }
 
   QTemporaryDir game;

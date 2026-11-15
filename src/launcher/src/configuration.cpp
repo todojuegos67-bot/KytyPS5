@@ -1,6 +1,7 @@
 #include "configuration.h"
 
 #include <QRegularExpression>
+#include <QStringList>
 
 QString Configuration::NormalizeResolution(const QString& text) {
 	// Older settings stored the enum key, e.g. "R1920X1080".
@@ -108,6 +109,13 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);
 	KYTY_CFG_GET(render_resolution);
+	// The emulator exits on any other value (main.cpp, WolverineRenderStep::FindStep, the base table); an import with
+	// one then fails the canonical check in SetGameSettings.
+	if (!QStringList {"auto", "1664x936", "1792x1008", "1920x1080", "2048x1152", "2304x1296", "2560x1440", "2816x1584",
+	                  "3072x1728", "3328x1872"}
+	         .contains(render_resolution)) {
+		render_resolution = QStringLiteral("auto");
+	}
 	KYTY_CFG_GET(network_connected);
 	KYTY_CFG_GET(psn_emulation_enabled);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
@@ -129,6 +137,12 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(pssr_upscaler);
 	KYTY_CFG_GET(dlss_folder);
 	KYTY_CFG_GET(fsr_folder);
+	// An ini from before pro_mode (2026-11-11) keeps the old default upscaler, Linear, which in Pro mode gives no FSR
+	// and no frame generation. The old pro_enabled is not read: every launcher copy writes false to the shared
+	// Kyty.ini (e40ec3af3). Once: the next save writes pro_mode.
+	if (!s.contains("pro_mode") && pssr_upscaler == PssrUpscaler::Linear) {
+		pssr_upscaler = PssrUpscaler::FSR;
+	}
 	pro_enabled     = s.value("pro_mode", true).toBool();
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
@@ -170,26 +184,29 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	const auto machine_path = [](const QString& key) {
 		return key == "printf_output_file" || key == "shader_log_folder" || key == "command_buffer_dump_folder" || key == "elf";
 	};
+	// An upstream export names Pro mode pro_enabled; this build stores it as pro_mode.
+	const auto key_of = [](const QString& key) { return key == "pro_enabled" ? QStringLiteral("pro_mode") : key; };
 	auto values = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
-		if (machine_path(it.key())) {
+		const auto key = key_of(it.key());
+		if (machine_path(key)) {
 			continue;
 		}
-		if (!values.contains(it.key())) {
+		if (!values.contains(key)) {
 			return fail(tr("Unknown game setting: %1").arg(it.key()));
 		}
 		if (!it.value().isString()) {
 			return fail(tr("Game setting %1 must be a string.").arg(it.key()));
 		}
 		const auto value = it.value().toString();
-		values.insert(it.key(), it.key() == "screen_resolution" ? NormalizeResolution(value)
-		                                                       : value);
+		values.insert(key, key == "screen_resolution" ? NormalizeResolution(value) : value);
 	}
 
 	ReadGameSettingsValues(values);
 	const auto canonical = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
-		if (!machine_path(it.key()) && canonical.value(it.key()) != values.value(it.key())) {
+		const auto key = key_of(it.key());
+		if (!machine_path(key) && canonical.value(key) != values.value(key)) {
 			return fail(tr("Invalid value for game setting: %1").arg(it.key()));
 		}
 	}
