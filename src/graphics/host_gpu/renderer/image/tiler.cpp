@@ -68,20 +68,28 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 
 TileManager::~TileManager() {
 	for (auto pipeline: m_pipelines) {
-		m_graphics.device.destroyPipeline(pipeline, nullptr);
+		if (pipeline != nullptr) {
+			m_graphics.device.destroyPipeline(pipeline, nullptr);
+		}
 	}
 	for (auto pipeline: {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform,
 	                     m_color_clear}) {
-		m_graphics.device.destroyPipeline(pipeline, nullptr);
+		if (pipeline != nullptr) {
+			m_graphics.device.destroyPipeline(pipeline, nullptr);
+		}
 	}
-	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
-	m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
+	if (m_pipeline_layout != nullptr) {
+		m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
+	}
+	if (m_descriptor_layout != nullptr) {
+		m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
+	}
 }
 
 TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
                                          uint64_t linear_capacity, const ImageInfo& info,
-                                         uint32_t levels, uint64_t source_offset,
-                                         uint64_t target_offset) {
+                                         uint32_t levels, uint64_t source_base,
+                                         uint64_t target_base) {
 	levels = levels != 0 ? levels : info.resources.levels;
 	EXIT_IF(levels == 0 || levels > MaxMipLevels || levels > info.resources.levels ||
 	        tiled_capacity == 0 || linear_capacity == 0);
@@ -107,11 +115,6 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	const auto valid_range = [](uint64_t offset, uint64_t size, uint64_t capacity) {
 		return size != 0 && offset <= capacity && size <= capacity - offset;
 	};
-	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
-	const uint64_t descriptor_alignment =
-	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_base = source_offset & (descriptor_alignment - 1);
-	const uint64_t target_base = target_offset & (descriptor_alignment - 1);
 
 	// ImageInfo owns the layout. Upload only the header and active mip records.
 	TilingParams params;
@@ -193,7 +196,8 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		params.num_texels += static_cast<uint32_t>(texels);
 	}
 
-	const auto params_size =
+	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const auto  params_size =
 	    static_cast<uint16_t>(offsetof(TilingParams, mips) + levels * sizeof(Mip));
 	const auto offset = m_stream_buffer.Copy(
 	    &params, params_size,
@@ -259,7 +263,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	                     target_capacity % 4 != 0);
 
 	m_scheduler.EndRendering();
-	auto                    command = m_scheduler.Current().Handle();
+	auto                    command = m_scheduler.Current().Recorder();
 	vk::BufferMemoryBarrier barriers[3] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
@@ -326,15 +330,19 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 }
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
-                                        const ImageInfo& info) {
+                                        const ImageInfo& info, uint32_t levels) {
 	if (!info.IsTiled()) {
 		const Result source {tiled, tiled_offset, info.data.size};
 		return info.GetColorTransform() == ColorTransform::None
 		           ? source
 		           : TransformColor(source, info.GetColorTransform(), true);
 	}
-	const auto linear_capacity = info.LinearSize();
-	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, tiled_offset, 0);
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t source_base     = tiled_offset & (descriptor_alignment - 1);
+	const auto     linear_capacity = info.LinearSize(levels);
+	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, levels, source_base, 0);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
@@ -343,8 +351,13 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                        const ImageInfo& info, uint32_t levels) {
-	const auto tiling =
-	    Prepare(true, tiled_capacity, linear_capacity, info, levels, linear_offset, tiled_offset);
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t source_base = linear_offset & (descriptor_alignment - 1);
+	const uint64_t target_base = tiled_offset & (descriptor_alignment - 1);
+	const auto     tiling =
+	    Prepare(true, tiled_capacity, linear_capacity, info, levels, source_base, target_base);
 	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling,
 	       false);
 }
@@ -353,10 +366,14 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                             uint32_t levels) {
 	EXIT_IF(regions.empty());
-	const auto linear_capacity = image.info.LinearSize(levels);
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t target_base     = tiled_offset & (descriptor_alignment - 1);
+	const auto     linear_capacity = image.info.LinearSize(levels);
 	// Reserve stream parameters before recording the image download.
 	const auto tiling =
-	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, tiled_offset);
+	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, target_base);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling, false);
@@ -448,7 +465,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	EXIT_IF(source.size < source_barrier_size || target.size < target_barrier_size);
 
 	m_scheduler.EndRendering();
-	auto                    command = m_scheduler.Current().Handle();
+	auto                    command = m_scheduler.Current().Recorder();
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -583,7 +600,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Recorder();
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
@@ -650,7 +667,7 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32
 	    .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
 	    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Recorder();
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr,
 	                        0, nullptr);

@@ -12,6 +12,7 @@ namespace ImageViewOps {
 
 [[nodiscard]] vk::ImageAspectFlags DepthAspectMask(vk::Format format);
 [[nodiscard]] bool                 FormatsCompatible(vk::Format base, vk::Format view) noexcept;
+[[nodiscard]] bool                 IsBlockFormat(vk::Format format) noexcept;
 
 [[nodiscard]] inline bool IsFormatDepthCompatible(vk::Format format) noexcept {
 	switch (format) {

@@ -1,12 +1,29 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 
 #include "common/assert.h"
+#include "common/upstreamPaths.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+
+#include <atomic>
 
 namespace Libs::Graphics {
 
 namespace {
+
+[[nodiscard]] bool IsComponentSwizzle(vk::ComponentSwizzle swizzle) {
+	switch (swizzle) {
+		case vk::ComponentSwizzle::eIdentity:
+		case vk::ComponentSwizzle::eZero:
+		case vk::ComponentSwizzle::eOne:
+		case vk::ComponentSwizzle::eR:
+		case vk::ComponentSwizzle::eG:
+		case vk::ComponentSwizzle::eB:
+		case vk::ComponentSwizzle::eA: return true;
+		default: return false;
+	}
+}
 
 [[nodiscard]] bool IsStencilViewFormat(vk::Format format) {
 	switch (format) {
@@ -23,13 +40,31 @@ namespace {
 			switch (info.type) {
 				case vk::ImageViewType::e2D: return info.layer_count == 1;
 				case vk::ImageViewType::e2DArray: return true;
+				case vk::ImageViewType::eCube:
+					return (static_cast<bool>(image.flags &
+					                          vk::ImageCreateFlagBits::eCubeCompatible) ||
+					        KYTY_UPSTREAM_PATH("ef8a6d5f6")) &&
+					       info.base_layer % 6 == 0 && info.layer_count == 6;
+				case vk::ImageViewType::eCubeArray:
+					return (static_cast<bool>(image.flags &
+					                          vk::ImageCreateFlagBits::eCubeCompatible) ||
+					        KYTY_UPSTREAM_PATH("ef8a6d5f6")) &&
+					       info.base_layer % 6 == 0 && info.layer_count % 6 == 0;
 				default: return false;
 			}
 		case vk::ImageType::e3D:
 			switch (info.type) {
 				case vk::ImageViewType::e3D: return info.base_layer == 0 && info.layer_count == 1;
-				case vk::ImageViewType::e2D: return info.level_count == 1 && info.layer_count == 1;
-				case vk::ImageViewType::e2DArray: return info.level_count == 1;
+				case vk::ImageViewType::e2D:
+					return (static_cast<bool>(image.flags &
+					                          vk::ImageCreateFlagBits::e2DArrayCompatible) ||
+					        KYTY_UPSTREAM_PATH("ef8a6d5f6")) &&
+					       info.level_count == 1 && info.layer_count == 1;
+				case vk::ImageViewType::e2DArray:
+					return (static_cast<bool>(image.flags &
+					                          vk::ImageCreateFlagBits::e2DArrayCompatible) ||
+					        KYTY_UPSTREAM_PATH("ef8a6d5f6")) &&
+					       info.level_count == 1;
 				default: return false;
 			}
 		default: return false;
@@ -272,6 +307,10 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 	return view_class != None && (base_class & view_class) == view_class;
 }
 
+bool IsBlockFormat(vk::Format format) noexcept {
+	return (FormatClass(format) & (Bc1Rgb | Bc1Rgba | Bc2 | Bc3 | Bc4 | Bc5 | Bc6h | Bc7)) != 0;
+}
+
 } // namespace ImageViewOps
 
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
@@ -310,8 +349,12 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const bool ranges_valid = levels_valid && normalized.layer_count != 0 &&
 	                          normalized.base_layer < view_layers &&
 	                          normalized.layer_count <= view_layers - normalized.base_layer;
-	if (!format_compatible || !ranges_valid || !IsValidViewType(image, normalized) ||
-	    !IsValidAspect(image, normalized.aspect)) {
+	const bool mapping_valid =
+	    IsComponentSwizzle(normalized.mapping.r) && IsComponentSwizzle(normalized.mapping.g) &&
+	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
+	if ((image.image == nullptr && !KYTY_UPSTREAM_PATH("ef8a6d5f6")) || !format_compatible || !ranges_valid ||
+	    (!mapping_valid && !KYTY_UPSTREAM_PATH("ef8a6d5f6")) ||
+	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
 		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),
@@ -320,6 +363,21 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     normalized.level_count, normalized.base_layer, normalized.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
 		     image.layers);
+	}
+
+	// The host has no valid view for these (VUID-VkImageViewCreateInfo-image-07072 and -09487); it makes the
+	// view the guest asks for, as it did before, and says so once.
+	if ((image.flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) &&
+	    !ImageViewOps::IsBlockFormat(normalized.format) &&
+	    (normalized.level_count > 1 ||
+	     (normalized.layer_count > 1 && !m_graphics.block_texel_view_multiple_layers))) {
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			LOGF("Warning: uncompressed view of a block-compressed image with %u levels and %u layers, "
+			     "which Vulkan does not allow: image_format=%d view_format=%d\n",
+			     normalized.level_count, normalized.layer_count, static_cast<int>(image.format),
+			     static_cast<int>(normalized.format));
+		}
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};

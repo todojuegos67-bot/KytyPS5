@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 namespace Libs::Graphics {
@@ -16,7 +17,16 @@ SamplerCache::~SamplerCache() {
 
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
 	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
+	GpuThreadMemo*   memo = nullptr;
+	if (GuestGpu::IsGpuThread()) {
+		memo = &m_gpu_thread_memo[SamplerKeyHash {}(key) % m_gpu_thread_memo.size()];
+		if (memo->sampler && memo->key == key) return memo->sampler;
+	}
+
+	Common::LockGuard lock(m_mutex);
+
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
+		if (memo != nullptr) *memo = {key, iter->second};
 		return iter->second;
 	}
 

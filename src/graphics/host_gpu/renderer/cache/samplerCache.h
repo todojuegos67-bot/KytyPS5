@@ -42,7 +42,15 @@ private:
 	};
 
 	GraphicContext&                                             m_graphics;
+	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
+	// What the GPU thread last found, by the key's hash, read without the lock: thousands of lookups a frame, and a
+	// sampler lives as long as this cache.
+	struct GpuThreadMemo {
+		SamplerKey  key {};
+		vk::Sampler sampler;
+	};
+	std::array<GpuThreadMemo, 256> m_gpu_thread_memo;
 };
 
 } // namespace Libs::Graphics

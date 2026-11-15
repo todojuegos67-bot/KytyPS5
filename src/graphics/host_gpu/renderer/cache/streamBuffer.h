@@ -39,8 +39,11 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 
 class Buffer {
 public:
+	// sparse_residency: device-local pages bound by Back() only (GraphicContext::sparse_page_table). zero_page: the pages not
+	// backed are all bound to one shared page of zeros (sparse aliased) instead of unbound.
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool sparse_residency = false,
+	       bool zero_page = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -68,11 +71,24 @@ public:
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
 	              uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	// A sparse buffer: binds (out before the next submit) and zeroes the pages of [offset, offset + size) not bound yet.
+	// Nothing for an ordinary one.
+	void Back(uint64_t offset, uint64_t size);
+	[[nodiscard]] bool IsSparse() const noexcept { return m_page_size != 0; }
+	[[nodiscard]] uint64_t PageSize() const noexcept { return m_page_size; }
+	[[nodiscard]] bool IsBacked(uint64_t offset) const noexcept { return !IsSparse() || m_pages[offset / m_page_size] != nullptr; }
+	[[nodiscard]] uint64_t BackedBytes() const noexcept { return m_backed_pages * m_page_size; }
 
 	// BufferCache state lives directly on the resource.
+	// The guest range last found to have no CPU-dirty page, and RegionManager's count for it.
+	uint64_t clean_begin = 0;
+	uint64_t clean_end   = 0;
+	uint64_t clean_count = 0;
+	uint64_t read_back   = UINT64_MAX; // the megabyte of guest addresses last read back from it
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	mutable uint64_t lru_tick = 0; // of its last touch of the LRU list, so that a repeated touch needn't read the list's entry
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -93,6 +109,12 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
+	uint64_t                      m_page_size = 0; // a sparse buffer's bind granularity
+	uint64_t                      m_sparse_size = 0; // a sparse buffer's Vulkan size: m_size up to a whole sparse block
+	vk::MemoryRequirements        m_page_requirements;
+	std::vector<VmaAllocation>    m_pages; // a sparse buffer's bound pages (null: not bound)
+	uint64_t                      m_backed_pages = 0;
+	VmaAllocation                 m_zero_page    = nullptr; // under every page not backed (zero_page)
 };
 
 class StreamBuffer final: public Buffer {

@@ -43,7 +43,9 @@ public:
 	KYTY_CLASS_NO_COPY(TileManager);
 
 	// Consume scratch results before the next acquisition, or pass their buffer as input.
-	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info);
+	// `levels` nonzero: only that many levels from level 0.
+	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info,
+	                            uint32_t levels = 0);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
 	          uint32_t levels = 0);
@@ -118,8 +120,8 @@ private:
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
-	                             const ImageInfo& info, uint32_t levels, uint64_t source_offset,
-	                             uint64_t target_offset);
+	                             const ImageInfo& info, uint32_t levels, uint64_t source_base,
+	                             uint64_t target_base);
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling, bool clear_target);

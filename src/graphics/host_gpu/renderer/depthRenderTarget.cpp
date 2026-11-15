@@ -18,6 +18,11 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <bit>
+#include <chrono>
+#include <cinttypes>
+#include <cstring>
+#include <type_traits>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -105,11 +110,10 @@ static vk::StencilOpState ConvertStencilState(
 	        state.compareMask, state.writeMask, reference};
 }
 
-[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
+[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(GraphicContext&          graphics,
                                                                  const DepthFormatPolicy& policy,
                                                                  bool     has_stencil,
                                                                  uint32_t samples) {
-	auto&      graphics         = buffer.GetGraphics();
 	const auto required_samples = vulkan_sample_count(samples);
 	const auto supports         = [&](vk::Format format) {
 		vk::ImageFormatProperties properties {};
@@ -149,11 +153,14 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (samples == 0) {
 		DepthFatal("unsupported depth fragment count: %u", z.z_info.num_samples);
 	}
-	if (z.depth_view.slice_start > z.depth_view.slice_max) {
-		DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
-		           z.depth_view.slice_max);
-	}
 	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
+	switch (view.type) {
+		case TargetViewType::Image2D:
+		case TargetViewType::Image2DArray: break;
+		case TargetViewType::Unsupported:
+			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
+			           z.depth_view.slice_max);
+	}
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
 	if (z.z_info.max_mip_level != 0 || unsupported_shading_rate_encoding || depth_address == 0 ||
 	    (depth_address & 0xffffu) != 0) {
@@ -187,7 +194,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 		DepthFatal("unsupported depth/stencil format pair");
 	}
 	const auto ideal_format = DepthAttachmentFormat(*policy, has_stencil);
-	const auto format = ResolveHostDepthAttachmentFormat(buffer, *policy, has_stencil, samples);
+	const auto format = ResolveHostDepthAttachmentFormat(buffer.GetGraphics(), *policy, has_stencil, samples);
 	if (format == vk::Format::eUndefined) {
 		DepthFatal("no host depth/stencil format supports required usage for %s",
 		           vk::to_string(ideal_format).c_str());
@@ -250,17 +257,11 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	return desc;
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
-	KYTY_PROFILER_FUNCTION();
-	r = {};
-
-	const auto& hw          = buffer.GetRegisters();
+// Whether a draw with these registers has a depth or stencil attachment (ResolveRenderDepthTarget).
+static bool DepthTargetBound(const HW::Context& hw) {
 	const auto& z           = hw.GetDepthRenderTarget();
 	const auto& rc          = hw.GetRenderControl();
 	const auto& dc          = hw.GetDepthControl();
-	const auto& sc          = hw.GetStencilControl();
-	const auto& sm          = hw.GetStencilMask();
 	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
 	// With HTile, DEPTH_COMPRESS_DISABLE expands touched tiles even with depth/stencil tests off.
 	// PPSA32236 fast-clears HTile each frame, runs this pass, then samples the depth as raw memory.
@@ -271,7 +272,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
 	if (!depth_active && !stencil_active) {
-		return;
+		return false;
 	}
 	const bool attachment_unbound =
 	    z.z_info.format == Prospero::DepthFormat::kInvalid &&
@@ -295,7 +296,113 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
 			LOGF("DepthTarget: ignoring enabled depth/stencil state without a bound attachment\n");
 		}
+		return false;
+	}
+	return true;
+}
+
+bool DrawDepthTargetFormat(GraphicContext& graphics, const HW::Context& hw, vk::Format& format, uint32_t& samples) {
+	if (!DepthTargetBound(hw)) return false;
+	const auto& z       = hw.GetDepthRenderTarget();
+	const auto* policy  = FindDepthFormatPolicy(z.z_info.format);
+	samples             = render_sample_count(z.z_info.num_samples);
+	if (policy == nullptr || samples == 0) return false;
+	format = ResolveHostDepthAttachmentFormat(
+	    graphics, *policy, z.stencil_info.format != Prospero::StencilFormat::kInvalid, samples);
+	return format != vk::Format::eUndefined;
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// The fields ResolveRenderDepthTarget sets (it leaves the others, and the stencil states while the stencil test is off).
+static void AssignDepthTarget(RenderDepthInfo& r, const RenderDepthInfo& from) {
+	r.desc                     = from.desc;
+	r.depth_clear_enable       = from.depth_clear_enable;
+	r.depth_clear_value        = from.depth_clear_value;
+	r.depth_test_enable        = from.depth_test_enable;
+	r.depth_write_enable       = from.depth_write_enable;
+	r.depth_compare_op         = from.depth_compare_op;
+	r.depth_bounds_test_enable = from.depth_bounds_test_enable;
+	r.stencil_clear_enable     = from.stencil_clear_enable;
+	r.stencil_clear_value      = from.stencil_clear_value;
+	r.stencil_test_enable      = from.stencil_test_enable;
+	if (from.stencil_test_enable) {
+		r.stencil_front = from.stencil_front;
+		r.stencil_back  = from.stencil_back;
+	}
+	r.image_id = from.image_id;
+}
+
+// Mode 2's check, field by field; the clear value by its bits.
+static bool SameDepthTarget(const RenderDepthInfo& a, const RenderDepthInfo& b) {
+	const auto& x = a.desc.info;
+	const auto& y = b.desc.info;
+	return a.image_id == b.image_id && a.desc.view_info == b.desc.view_info && a.desc.type == b.desc.type &&
+	       x.data.address == y.data.address && x.data.size == y.data.size && x.stencil.address == y.stencil.address &&
+	       x.stencil.size == y.stencil.size && x.pixel_format == y.pixel_format && x.extent.width == y.extent.width &&
+	       x.extent.height == y.extent.height && x.resources.layers == y.resources.layers && x.pitch == y.pitch &&
+	       x.samples == y.samples && x.metadata.kind == y.metadata.kind &&
+	       x.metadata.range.address == y.metadata.range.address && x.metadata.range.size == y.metadata.range.size &&
+	       x.metadata.stencil_compressed == y.metadata.stencil_compressed &&
+	       a.depth_clear_enable == b.depth_clear_enable &&
+	       std::bit_cast<uint32_t>(a.depth_clear_value) == std::bit_cast<uint32_t>(b.depth_clear_value) &&
+	       a.depth_test_enable == b.depth_test_enable && a.depth_write_enable == b.depth_write_enable &&
+	       a.depth_compare_op == b.depth_compare_op && a.depth_bounds_test_enable == b.depth_bounds_test_enable &&
+	       a.stencil_clear_enable == b.stencil_clear_enable && a.stencil_clear_value == b.stencil_clear_value &&
+	       a.stencil_test_enable == b.stencil_test_enable &&
+	       (!a.stencil_test_enable || (a.stencil_front == b.stencil_front && a.stencil_back == b.stencil_back));
+}
+
+void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+	KYTY_PROFILER_FUNCTION();
+	r = {};
+
+	const auto& hw          = buffer.GetRegisters();
+	const auto& z           = hw.GetDepthRenderTarget();
+	const auto& rc          = hw.GetRenderControl();
+	const auto& dc          = hw.GetDepthControl();
+	const auto& sc          = hw.GetStencilControl();
+	const auto& sm          = hw.GetStencilMask();
+	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const int   target_memo = TargetMemoMode();
+	if (target_memo != 0 && (++m_target_calls & 4095u) == 0u) {
+		const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                                           std::chrono::steady_clock::now().time_since_epoch())
+		                                           .count());
+		if (m_target_stat_start == 0) {
+			m_target_stat_start = now;
+		} else if (now - m_target_stat_start >= 5000u) {
+			LOGF("Target memo (5 s): %" PRIu64 " hits, %" PRIu64 " misses, %" PRIu64 " wrong\n", m_target_hits, m_target_misses,
+			     m_target_wrong);
+			m_target_hits = m_target_misses = m_target_wrong = 0;
+			m_target_stat_start                              = now;
+		}
+	}
+	if (!DepthTargetBound(hw)) {
 		return;
+	}
+	// The memo, as for a color slot: copies of the registers read here, the clear value by its bits.
+	static_assert(std::is_trivially_copyable_v<HW::DepthRenderTarget> && std::is_trivially_copyable_v<HW::RenderControl> &&
+	              std::is_trivially_copyable_v<HW::DepthControl> && std::is_trivially_copyable_v<HW::StencilControl> &&
+	              std::is_trivially_copyable_v<HW::StencilMask>);
+	auto&          memo          = m_depth_memo;
+	const uint32_t clear_bits    = std::bit_cast<uint32_t>(hw.GetDepthClearValue());
+	const uint32_t stencil_clear = hw.GetStencilClearValue();
+	bool           hit           = false;
+	if (target_memo != 0 && memo.stamp != 0 && memo.clear_bits == clear_bits && memo.stencil_clear == stencil_clear &&
+	    std::memcmp(&memo.z, &z, sizeof(z)) == 0 && std::memcmp(&memo.rc, &rc, sizeof(rc)) == 0 &&
+	    std::memcmp(&memo.dc, &dc, sizeof(dc)) == 0 && std::memcmp(&memo.sc, &sc, sizeof(sc)) == 0 &&
+	    std::memcmp(&memo.sm, &sm, sizeof(sm)) == 0 &&
+	    m_context.GetTextureCache().RepeatLookup(memo.info.image_id, memo.stamp, memo.info.desc,
+	                                             memo.info.desc.view_info.base_layer)) {
+		hit = true;
+		++m_target_hits;
+		if (target_memo != 2) {
+			AssignDepthTarget(r, memo.info);
+			BindRenderTarget(r.image_id);
+			return;
+		}
+	} else if (target_memo != 0) {
+		++m_target_misses;
 	}
 	if (rc.copy_stencil_to_color ||
 	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
@@ -348,9 +455,25 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	auto&    cache = m_context.GetTextureCache();
+	uint64_t plain = 0;
+	r.image_id     = cache.FindImage(r.desc, false, true, target_memo != 0 ? &plain : nullptr);
 	BindRenderTarget(r.image_id);
+	if (target_memo != 0) {
+		if (hit && !SameDepthTarget(memo.info, r)) {
+			++m_target_wrong;
+			LOGF("Target memo: a depth hit was wrong at 0x%010" PRIx64 "\n", z.z_read_base_addr);
+		}
+		memo.z             = z;
+		memo.rc            = rc;
+		memo.dc            = dc;
+		memo.sc            = sc;
+		memo.sm            = sm;
+		memo.clear_bits    = clear_bits;
+		memo.stencil_clear = stencil_clear;
+		AssignDepthTarget(memo.info, r);
+		memo.stamp = plain;
+	}
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
@@ -386,9 +509,9 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	auto& destination = cache.GetImage(write_id);
 	EXIT_IF(read_id == write_id || source.backing.format != destination.backing.format);
 
-	buffer.EndRendering();
-	const auto command = buffer.Handle();
-
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.EndRendering();
+	const auto command = scheduler.Current().Recorder();
 	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
 	                                  read_desc.view_info.base_layer,
 	                                  read_desc.view_info.layer_count};

@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
+#include <cstring>
+#include <type_traits>
 
 namespace Libs::Graphics {
 
@@ -38,8 +41,34 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	       info.channel_order == Prospero::ChannelOrder::kAlt;
 }
 
+int RenderExecutor::TargetMemoMode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_TARGET_MEMO");
+		return v == nullptr ? 1 : std::atoi(v);
+	}();
+	return mode;
+}
+
+// What a full resolve gives, field by field (mode 2's check).
+static bool SameColorTarget(const RenderColorInfo& a, const RenderColorInfo& b) {
+	const auto& x = a.desc.info;
+	const auto& y = b.desc.info;
+	return a.image_id == b.image_id && a.target_slot == b.target_slot && a.guest_mip_level == b.guest_mip_level &&
+	       a.guest_array_layer == b.guest_array_layer &&
+	       std::memcmp(&a.export_mapping, &b.export_mapping, sizeof(a.export_mapping)) == 0 &&
+	       a.desc.view_info == b.desc.view_info && a.desc.type == b.desc.type && x.data.address == y.data.address &&
+	       x.data.size == y.data.size && x.pixel_format == y.pixel_format && x.guest_format == y.guest_format &&
+	       x.type == y.type && x.extent.width == y.extent.width && x.extent.height == y.extent.height &&
+	       x.extent.depth == y.extent.depth && x.resources.levels == y.resources.levels &&
+	       x.resources.layers == y.resources.layers && x.bytes_per_block == y.bytes_per_block && x.samples == y.samples &&
+	       x.tile_mode == y.tile_mode && x.metadata.kind == y.metadata.kind &&
+	       x.metadata.range.address == y.metadata.range.address && x.metadata.range.size == y.metadata.range.size &&
+	       x.metadata.clear_word == y.metadata.clear_word;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
+                                              uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
@@ -60,12 +89,37 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
 			if (log_id < 128) {
 				LOGF("RenderColorTarget: no color output slot=%" PRIu32 " base=0x%010" PRIx64
-				     " slot_mask=0x%01" PRIx32 " target_mask=0x%08" PRIx32 "\n",
-				     rt_slot, rt.base.addr, mask, hw.GetRenderTargetMask());
+				     " slot_mask=0x%01" PRIx32 " target_mask=0x%08" PRIx32
+				     " rt_slice_offset=%" PRIu32 "\n",
+				     rt_slot, rt.base.addr, mask, hw.GetRenderTargetMask(),
+				     render_target_slice_offset);
 			}
 		}
 
 		return;
+	}
+	// The memo: a copy of the slot's registers, compared bytewise (unequal padding can only cost a hit). On a hit the
+	// lookup's touch and any pending color clear repeat (RepeatLookup) and the target is bound as a resolve binds it.
+	static_assert(std::is_trivially_copyable_v<HW::RenderTarget>);
+	const int        target_memo = TargetMemoMode();
+	ColorTargetMemo* memo        = target_memo != 0 && !exact_format && rt_slot < m_color_memo.size() &&
+	                                     !graphics_debug_dump_enabled()
+	                                   ? &m_color_memo[rt_slot]
+	                                   : nullptr;
+	bool             hit         = false;
+	if (memo != nullptr && memo->stamp != 0 && memo->mask == mask && memo->slice_offset == render_target_slice_offset &&
+	    std::memcmp(&memo->rt, &rt, sizeof(rt)) == 0 &&
+	    m_context.GetTextureCache().RepeatLookup(memo->info.image_id, memo->stamp, memo->info.desc,
+	                                             memo->info.desc.view_info.base_layer)) {
+		hit = true;
+		++m_target_hits;
+		if (target_memo != 2) {
+			r = memo->info;
+			BindRenderTarget(r.image_id);
+			return;
+		}
+	} else if (memo != nullptr) {
+		++m_target_misses;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
@@ -107,11 +161,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	                                ? std::min(rt.view.last_array_slice_index,
 	                                           std::max(depth >> rt.view.current_mip_level, 1u) - 1u)
 	                                : rt.view.last_array_slice_index;
-	if (rt.view.base_array_slice_index > last_layer) {
-		EXIT("invalid render-target view: base=%u last=%u\n", rt.view.base_array_slice_index,
-		     last_layer);
+	const auto view = ResolveTargetViewInfo(
+	    rt.view.base_array_slice_index, last_layer, render_target_slice_offset);
+	switch (view.type) {
+		case TargetViewType::Image2D:
+		case TargetViewType::Image2DArray: break;
+		case TargetViewType::Unsupported:
+			EXIT("invalid render-target view: base=%u last=%u draw_offset=%u\n",
+			     rt.view.base_array_slice_index, rt.view.last_array_slice_index,
+			     render_target_slice_offset);
 	}
-	const auto view = ResolveTargetViewInfo(rt.view.base_array_slice_index, last_layer);
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic_uint log_count = 0;
 		const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
@@ -127,16 +186,28 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 	}
 
-	const bool tile         = rt.attrib3.tile_mode != Prospero::TileMode::kLinear;
-	const bool depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	bool       texture_tile = false;
+	// Color-control state selects the color-buffer operation and logical blend operation.
+	// The normal copy operation is a regular color write, not an attachment clear.
+	// Nonlinear clear values are still stored as normalized components.
+	// Metadata clears are materialized during image discovery; render-pass loads preserve contents.
+	uint32_t   width  = 0;
+	uint32_t       height       = 0;
+	bool       tile   = false;
+	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
+	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
+	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
+	const bool     standard256  = rt.attrib3.tile_mode == Prospero::TileMode::kStandard256B;
+	const bool     texture_tile = standard256 || standard4 || standard64 || depth_tile;
+
 	switch (rt.attrib3.tile_mode) {
+		case Prospero::TileMode::kLinear:
 		case Prospero::TileMode::kStandard256B:
 		case Prospero::TileMode::kStandard4KB:
 		case Prospero::TileMode::kStandard64KB:
-		case Prospero::TileMode::kDepth: texture_tile = true; break;
-		case Prospero::TileMode::kLinear:
-		case Prospero::TileMode::kRenderTarget: break;
+		case Prospero::TileMode::kDepth:
+		case Prospero::TileMode::kRenderTarget:
+			tile = !RenderIsColorTileModeLinear(rt.attrib3.tile_mode);
+			break;
 		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
 	}
 	if (samples > 1 && (!tile || levels != 1)) {
@@ -149,8 +220,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		EXIT("linear 3D render targets are unsupported\n");
 	}
 
-	const uint32_t width  = rt.attrib2.width + 1;
-	const uint32_t height = rt.attrib2.height + 1;
+	width  = rt.attrib2.width + 1;
+	height = rt.attrib2.height + 1;
 	const auto target_format =
 	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
 	// A surface with one stored level starts every MIP_LEVEL at the base address, so a level with
@@ -192,6 +263,13 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		EXIT("unsupported depth-tiled color render-target view: dimension=%u depth=%u"
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
+	}
+	if (standard256) {
+		static std::atomic_uint log_count = 0;
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32u) {
+			LOGF("RenderColorTarget: Standard256B slot=%" PRIu32 " base=0x%010" PRIx64 " %ux%u bpe=%u levels=%u layers=%u\n",
+			     rt_slot, rt.base.addr, width, height, bytes_per_element, levels, view.image_layers);
+		}
 	}
 	auto& desc = r.desc;
 	desc.type              = TextureCache::BindingType::RenderTarget;
@@ -245,9 +323,21 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = mip;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	uint64_t plain             = 0;
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format, true, memo != nullptr ? &plain : nullptr);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	if (memo != nullptr) {
+		if (hit && !SameColorTarget(memo->info, r)) {
+			++m_target_wrong;
+			LOGF("Target memo: a color hit was wrong at slot %" PRIu32 " 0x%010" PRIx64 "\n", rt_slot, rt.base.addr);
+		}
+		memo->rt           = rt;
+		memo->mask         = mask;
+		memo->slice_offset = render_target_slice_offset;
+		memo->info         = r;
+		memo->stamp        = plain;
+	}
 }
 
 } // namespace Libs::Graphics

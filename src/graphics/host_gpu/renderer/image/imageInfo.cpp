@@ -2,6 +2,8 @@
 
 #include "common/alignment.h"
 
+#include <unordered_map>
+
 namespace Libs::Graphics {
 namespace {
 
@@ -68,6 +70,45 @@ uint32_t CompactMipSize(const ImageInfo& info) {
 	           : 0;
 }
 
+// Every field ComputeSize reads (data.address's offset in a block and metadata.kind through CompactMipSize,
+// pixel_format through IsDepthPlane), and what it writes.
+struct SizeKey {
+	uint64_t               address;
+	uint64_t               size;
+	vk::Format             pixel_format;
+	Prospero::BufferFormat guest_format;
+	Prospero::ImageType    type;
+	Prospero::TileMode     tile_mode;
+	ImageMetadataKind      metadata;
+	uint32_t               width, height, depth, levels, layers, pitch, bytes_per_block, samples;
+
+	bool operator==(const SizeKey&) const = default;
+};
+
+struct SizeKeyHash {
+	size_t operator()(const SizeKey& key) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull;
+		for (const uint64_t value:
+		     {key.address, key.size, uint64_t {static_cast<uint32_t>(key.pixel_format)},
+		      uint64_t {static_cast<uint32_t>(key.guest_format)}, uint64_t {static_cast<uint32_t>(key.type)},
+		      uint64_t {static_cast<uint32_t>(key.tile_mode)}, uint64_t {static_cast<uint8_t>(key.metadata)},
+		      uint64_t {key.width} | uint64_t {key.height} << 32u, uint64_t {key.depth} | uint64_t {key.levels} << 32u,
+		      uint64_t {key.layers} | uint64_t {key.pitch} << 32u,
+		      uint64_t {key.bytes_per_block} | uint64_t {key.samples} << 32u}) {
+			hash = (hash ^ value) * 0x100000001b3ull;
+		}
+		return static_cast<size_t>(hash ^ (hash >> 32u));
+	}
+};
+
+struct SizeResult {
+	uint64_t                     size;
+	uint32_t                     pitch, bytes_per_block, first_tail_level;
+	std::array<ImageMipInfo, 16> mip_layout;
+	TileTextureBlockLayout       tiling;
+	uint64_t                     tiled_slice_stride, linear_slice_stride;
+};
+
 } // namespace
 
 vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
@@ -77,6 +118,32 @@ vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
 }
 
 void ImageInfo::UpdateSize() {
+	// Per thread, so no lock; cleared when full (a frame of Marvel's Wolverine binds a few thousand textures).
+	thread_local std::unordered_map<SizeKey, SizeResult, SizeKeyHash> memo;
+	// Only the address's offset within a tile block matters (CompactMipSize; blocks are at most 64 KB): textures of one
+	// shape share an entry. Keyed whole, a draw's ~12.8k storage candidates emptied the memo before it hit.
+	const SizeKey key {data.address & 0xffffu, data.size, pixel_format, guest_format, type, tile_mode, metadata.kind,
+	                   extent.width, extent.height, extent.depth, resources.levels, resources.layers, pitch,
+	                   bytes_per_block, samples};
+	if (const auto found = memo.find(key); found != memo.end()) {
+		const auto& result  = found->second;
+		data.size           = result.size;
+		pitch               = result.pitch;
+		bytes_per_block     = result.bytes_per_block;
+		first_tail_level    = result.first_tail_level;
+		mip_layout          = result.mip_layout;
+		tiling              = result.tiling;
+		tiled_slice_stride  = result.tiled_slice_stride;
+		linear_slice_stride = result.linear_slice_stride;
+		return;
+	}
+	ComputeSize();
+	if (memo.size() >= 8192u) memo.clear();
+	memo.emplace(key, SizeResult {data.size, pitch, bytes_per_block, first_tail_level, mip_layout, tiling,
+	                              tiled_slice_stride, linear_slice_stride});
+}
+
+void ImageInfo::ComputeSize() {
 	EXIT_IF(guest_format == Prospero::BufferFormat::kInvalid || extent.width == 0 ||
 	        extent.height == 0 || extent.depth == 0 || resources.levels == 0 ||
 	        resources.levels > mip_layout.size() || resources.layers == 0 || samples == 0 ||
@@ -290,6 +357,24 @@ int32_t ImageInfo::SliceOf(const ImageInfo& container, int32_t mip) const noexce
 	return static_cast<int32_t>(layer);
 }
 
+ImageInfo ImageInfo::LevelsFrom(uint32_t first) const {
+	const auto mip          = MipExtent(first);
+	auto       levels       = *this;
+	levels.extent           = {mip.width, mip.height, IsVolume() ? mip.depth : 1u};
+	levels.resources.levels = resources.levels - first;
+	levels.pitch            = 0;
+	levels.data.size        = 0;
+	levels.UpdateSize();
+	return levels;
+}
+
+uint32_t ImageInfo::LevelsBefore(uint32_t first, uint64_t offset) const {
+	for (; first < resources.levels; ++first) {
+		if (LevelsFrom(first).data.size <= offset) return first;
+	}
+	return resources.levels;
+}
+
 uint64_t ImageInfo::LinearSize(uint32_t levels) const {
 	levels = levels == 0 ? resources.levels : levels;
 	EXIT_IF(levels == 0 || levels > resources.levels || levels > mip_layout.size());
@@ -301,8 +386,9 @@ uint64_t ImageInfo::LinearSize(uint32_t levels) const {
 	for (uint32_t level = 0; level < levels; ++level) {
 		const auto& mip    = mip_layout[level];
 		const auto  slices = MipExtent(level).depth;
-		const auto  last   = Add(mip.linear_offset, Multiply(slices - 1u, linear_slice_stride));
-		size               = std::max(size, Add(last, mip.linear_size));
+		const auto  stride = linear_slice_stride != 0 ? linear_slice_stride : mip.linear_size;
+		size               = std::max(
+		    size, Add(Add(mip.linear_offset, Multiply(slices - 1u, stride)), mip.linear_size));
 	}
 	return size;
 }

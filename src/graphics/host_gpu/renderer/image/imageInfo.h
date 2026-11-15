@@ -31,6 +31,7 @@ enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
 struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
+	uint32_t            control              = 0;
 	uint64_t            clear_word           = 0;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
@@ -91,12 +92,21 @@ struct ImageInfo {
 	uint64_t linear_slice_stride = 0;
 	uint32_t first_tail_level    = 16;
 
+	// Fills the layout from the fields it reads, memoized per thread: draws bind the same textures again and again.
 	void                                           UpdateSize();
+	// UpdateSize without the memo.
+	void                                           ComputeSize();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
 	                                                            uint32_t levels        = 0) const;
+	// The levels from `first` on, laid out as a texture of that size of its own: they lie at the
+	// start of the guest range, the finer levels after them (Wolverine Engine.md 4.7).
+	[[nodiscard]] ImageInfo                        LevelsFrom(uint32_t first) const;
+	// The first level from `first` on whose LevelsFrom ends at or before `offset` bytes into the
+	// range, resources.levels when none does: what is left when the bytes from `offset` go.
+	[[nodiscard]] uint32_t                         LevelsBefore(uint32_t first, uint64_t offset) const;
 
 	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
 		if (bgra16) return ColorTransform::SwapBgra16;
@@ -158,7 +168,14 @@ struct ImageViewInfo {
 	vk::ComponentMapping mapping     = {};
 	vk::ImageUsageFlags  usage       = vk::ImageUsageFlagBits::eSampled;
 
-	[[nodiscard]] bool operator==(const ImageViewInfo&) const noexcept = default;
+	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
+		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
+		       base_level == rhs.base_level && level_count == rhs.level_count &&
+		       min_lod == rhs.min_lod && base_layer == rhs.base_layer &&
+		       layer_count == rhs.layer_count && mapping.r == rhs.mapping.r &&
+		       mapping.g == rhs.mapping.g && mapping.b == rhs.mapping.b &&
+		       mapping.a == rhs.mapping.a && usage == rhs.usage;
+	}
 };
 
 struct DepthFormatPolicy {
@@ -506,6 +523,15 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
 		clear = vk::ClearColorValue {};
 		return true;
 	}
+	// Four pixels a word: uniform only when the word repeats its byte.
+	if (format == vk::Format::eR8Unorm) {
+		if (packed != (packed & 0xffu) * 0x01010101u) {
+			return false;
+		}
+		clear            = vk::ClearColorValue {};
+		clear.float32[0] = static_cast<float>(packed & 0xffu) / 255.0f;
+		return true;
+	}
 	return DecodePackedColorClear(format, uint64_t {packed} | (uint64_t {packed} << 32u), clear);
 }
 
@@ -541,6 +567,19 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
 
 [[nodiscard]] inline bool ImageRangeOverlaps(GuestRange left, GuestRange right) {
 	return ImageRangeOverlaps(left.address, left.size, right.address, right.size);
+}
+
+[[nodiscard]] inline bool ImagePageRangesOverlap(uint64_t left, uint64_t left_size, uint64_t right,
+                                                 uint64_t right_size) {
+	if (left_size == 0 || right_size == 0 || left > UINT64_MAX - left_size ||
+	    right > UINT64_MAX - right_size) {
+		EXIT("invalid image page-overlap range\n");
+	}
+	const auto left_first  = left / TRACKER_PAGE_SIZE;
+	const auto left_last   = (left + left_size - 1) / TRACKER_PAGE_SIZE;
+	const auto right_first = right / TRACKER_PAGE_SIZE;
+	const auto right_last  = (right + right_size - 1) / TRACKER_PAGE_SIZE;
+	return left_first <= right_last && right_first <= left_last;
 }
 
 } // namespace Libs::Graphics

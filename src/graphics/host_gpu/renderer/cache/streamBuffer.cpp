@@ -2,10 +2,12 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <algorithm>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -59,11 +61,97 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool sparse_residency, bool zero_page)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
+	if (sparse_residency) {
+		EXIT_IF(usage != MemoryUsage::DeviceLocal);
+		// A device that offers sparse buffers but fails here gets the dense buffer: page 0 is bound and unbound once.
+		VmaAllocation probe = nullptr;
+		const auto    sparse_works = [&] {
+			vk::BufferCreateInfo sparse_info {};
+			sparse_info.flags = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+			if (zero_page) sparse_info.flags |= vk::BufferCreateFlagBits::eSparseAliased;
+			sparse_info.size  = size;
+			sparse_info.usage = flags;
+			if (graphics.device.createBuffer(&sparse_info, nullptr, &m_buffer) != vk::Result::eSuccess) return false;
+			graphics.device.getBufferMemoryRequirements(m_buffer, &m_page_requirements);
+			m_page_size = m_page_requirements.alignment;
+			if (m_page_size == 0) return false;
+			// A buffer's sparse binds are whole blocks, its last one too (VUID-VkSparseMemoryBind-resourceOffset-09491): a guest
+			// range that ends inside a block (a 1075 MiB buffer at 0x1184b58000, 59-fg-trask2) gets a Vulkan buffer to the block's end.
+			m_sparse_size = Common::AlignUp(size, m_page_size);
+			if (m_sparse_size != size) {
+				graphics.device.destroyBuffer(m_buffer, nullptr);
+				m_buffer         = nullptr;
+				sparse_info.size = m_sparse_size;
+				if (graphics.device.createBuffer(&sparse_info, nullptr, &m_buffer) != vk::Result::eSuccess) return false;
+				graphics.device.getBufferMemoryRequirements(m_buffer, &m_page_requirements);
+				if (m_page_requirements.alignment != m_page_size) return false;
+			}
+			// A game buffer (zero page) is backed in 2 MiB units: Marvel's Wolverine's geometry pool commits 2 MiB-aligned 2 MiB
+			// pages, so it costs the same memory as 64 KiB units with 32 times fewer allocations and binds (43,776 binds of the
+			// zero page at 64 KiB held the title back by ~9 s).
+			if (zero_page) m_page_size = Common::AlignUp(std::max<uint64_t>(m_page_size, uint64_t {2} << 20u), m_page_size);
+			vk::DeviceMemory memory;
+			uint64_t         memory_offset = 0;
+			probe = graphics.AllocateSparse(m_page_requirements, m_page_size, memory, memory_offset);
+			if (probe == nullptr) return false;
+			vk::Fence           fence;
+			vk::FenceCreateInfo fence_info {};
+			if (graphics.device.createFence(&fence_info, nullptr, &fence) != vk::Result::eSuccess) return false;
+			bool ok = true;
+			for (const vk::DeviceMemory bound: {memory, vk::DeviceMemory {}}) { // bind, then unbind
+				const vk::SparseMemoryBind bind {0, std::min(m_page_size, m_sparse_size), bound, bound ? memory_offset : 0};
+				const vk::SparseBufferMemoryBindInfo buffer_bind {m_buffer, 1, &bind};
+				vk::BindSparseInfo                   info {};
+				info.bufferBindCount = 1;
+				info.pBufferBinds    = &buffer_bind;
+				{
+					Common::LockGuard lock(graphics.queue_mutex);
+					ok = graphics.queue.bindSparse(1, &info, fence) == vk::Result::eSuccess;
+				}
+				ok = ok && graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX) == vk::Result::eSuccess &&
+				     graphics.device.resetFences(1, &fence) == vk::Result::eSuccess;
+				if (!ok) break;
+			}
+			graphics.device.destroyFence(fence, nullptr);
+			return ok;
+		};
+		const bool sparse = sparse_works();
+		if (!sparse && m_buffer != nullptr) {
+			graphics.device.destroyBuffer(m_buffer, nullptr); // before its probe page goes: that may still be bound
+			m_buffer = nullptr;
+		}
+		if (probe != nullptr) vmaFreeMemory(graphics.allocator, probe);
+		if (sparse) {
+			m_pages.assign((size + m_page_size - 1) / m_page_size, nullptr);
+			if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+				vk::BufferDeviceAddressInfo address_info {};
+				address_info.buffer = m_buffer;
+				m_device_address    = graphics.device.getBufferAddress(address_info);
+				EXIT_IF(m_device_address == 0);
+			}
+			if (zero_page) {
+				// Every page on the one zero page (binds out before the next submit), then zeroed through page 0, which
+				// reaches it: the page stays zero as long as nothing writes outside the backed pages.
+				vk::DeviceMemory memory;
+				uint64_t         memory_offset = 0;
+				m_zero_page = graphics.AllocateSparse(m_page_requirements, m_page_size, memory, memory_offset);
+				EXIT_NOT_IMPLEMENTED(m_zero_page == nullptr);
+				for (uint64_t begin = 0; begin < m_sparse_size; begin += m_page_size) {
+					m_scheduler->BindSparseBuffer(m_buffer,
+					                             {begin, std::min(m_page_size, m_sparse_size - begin), memory, memory_offset});
+				}
+				Fill(0, std::min(m_page_size, size), 0);
+			}
+			return;
+		}
+		m_page_size = 0;
+		LOGF("Sparse page table: a test bind failed, the table is a dense buffer\n");
+	}
 
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
@@ -106,9 +194,40 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (m_buffer != nullptr && IsSparse()) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+		for (auto* page: m_pages) {
+			if (page != nullptr) vmaFreeMemory(m_graphics->allocator, page);
+		}
+		if (m_zero_page != nullptr) vmaFreeMemory(m_graphics->allocator, m_zero_page);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
+}
+
+void Buffer::Back(uint64_t offset, uint64_t size) {
+	if (!IsSparse() || size == 0) return;
+	EXIT_IF(offset > m_size || size > m_size - offset);
+	// Bound memory starts undefined; this submit waits for the binds. One fill per run of new pages.
+	uint64_t run_begin = 0;
+	uint64_t run_end   = 0;
+	for (uint64_t page = offset / m_page_size, last = (offset + size - 1) / m_page_size; page <= last; ++page) {
+		if (m_pages[page] != nullptr) continue;
+		const uint64_t   begin = page * m_page_size;
+		const uint64_t   bytes = std::min(m_page_size, m_sparse_size - begin); // whole blocks: the last page may be shorter
+		vk::DeviceMemory memory;
+		uint64_t         memory_offset = 0;
+		m_pages[page] = m_graphics->AllocateSparse(m_page_requirements, m_page_size, memory, memory_offset);
+		EXIT_NOT_IMPLEMENTED(m_pages[page] == nullptr);
+		m_backed_pages++;
+		m_scheduler->BindSparseBuffer(m_buffer, {begin, bytes, memory, memory_offset});
+		if (run_end != begin) {
+			if (run_end != run_begin) Fill(run_begin, run_end - run_begin, 0);
+			run_begin = begin;
+		}
+		run_end = begin + std::min(bytes, m_size - begin); // the fill stays in the guest range
+	}
+	if (run_end != run_begin) Fill(run_begin, run_end - run_begin, 0);
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {
@@ -163,7 +282,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	                   vk::AccessFlagBits::eTransferRead),
 	    Barrier(destination_offset, size, MEMORY_ACCESS, vk::AccessFlagBits::eTransferWrite),
 	};
-	const auto native = command.Handle();
+	const auto native = command.Recorder();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 2, before, 0, nullptr);
@@ -185,7 +304,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	auto& command = Scheduler().Current();
 	command.EndRendering();
 	const auto before = Barrier(offset, size, MEMORY_ACCESS, vk::AccessFlagBits::eTransferWrite);
-	const auto native = command.Handle();
+	const auto native = command.Recorder();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
@@ -199,7 +318,10 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
     : Buffer(graphics, scheduler, usage, 0,
-             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
+             // A mesh draw's draw dwords are read by device address from the stream ring.
+             usage == MemoryUsage::Stream ? AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress
+                                          : AllFlags,
+             size),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

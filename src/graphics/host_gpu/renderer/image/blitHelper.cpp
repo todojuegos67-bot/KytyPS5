@@ -44,10 +44,18 @@ BlitHelper::~BlitHelper() {
 	for (const auto& pipeline: m_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline.handle, nullptr);
 	}
-	m_graphics.device.destroyShaderModule(m_fragment_shader, nullptr);
-	m_graphics.device.destroyShaderModule(m_vertex_shader, nullptr);
-	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
-	m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
+	if (m_fragment_shader != nullptr) {
+		m_graphics.device.destroyShaderModule(m_fragment_shader, nullptr);
+	}
+	if (m_vertex_shader != nullptr) {
+		m_graphics.device.destroyShaderModule(m_vertex_shader, nullptr);
+	}
+	if (m_pipeline_layout != nullptr) {
+		m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
+	}
+	if (m_descriptor_layout != nullptr) {
+		m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
+	}
 }
 
 vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
@@ -141,7 +149,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	const auto destination_view  = destination.FindView(destination_view_info);
 
 	auto& command_buffer = m_scheduler.Current();
-	auto  command        = command_buffer.Handle();
+	auto  command        = command_buffer.Recorder();
 	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
 	               command);
 	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
