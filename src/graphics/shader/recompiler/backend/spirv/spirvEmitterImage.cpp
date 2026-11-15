@@ -10,10 +10,6 @@
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
-namespace {
-
-// Steps a step function emits as compares and selects; more become a table search (EmitStepTable).
-constexpr size_t MaxStepChain = 16;
 
 // The offset of these words in the program's read-only ProgramConstants buffer, which it defines at its first use.
 // Not Private arrays: indexed at run time, NVIDIA backs those with local memory for every resident thread
@@ -38,6 +34,11 @@ uint32_t ProgramConstantOffset(EmitterState& state, const std::vector<uint32_t>&
 	if (added) constants.insert(constants.end(), words.begin(), words.end());
 	return found->second;
 }
+
+namespace {
+
+// Steps a step function emits as compares and selects; more become a table search (EmitStepTable).
+constexpr size_t MaxStepChain = 16;
 
 // LookupStep's arithmetic as shader instructions; the starts and values are words of ProgramConstants.
 struct StepOps {

@@ -454,6 +454,8 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
+// The word offset of these words in the program's read-only ProgramConstants buffer (defined at its first use).
+uint32_t ProgramConstantOffset(EmitterState& state, const std::vector<uint32_t>& words);
 
 void EmitMemoryBindings(EmitterState& state);
 

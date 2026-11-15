@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <functional>
+#include <optional>
 #include <algorithm>
 #include <bit>
 #include <utility>
@@ -348,6 +349,9 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits);
 
+// Roots of up to this many candidates keep one case per candidate (EmitBufferAccess).
+constexpr size_t MaxIndirectBufferCases = 16;
+
 template <typename Fn>
 auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
                       uint32_t components, Fn&& emit) {
@@ -378,6 +382,70 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	const auto representative = SharedIndirectBufferResource(state, root_resource);
 	const auto shared = representative != UINT32_MAX;
 	const auto empty_root = shared && buffer.packed_stride == 0u;
+	// A root of many candidates: those that read alike (stride, format, swizzle, bounds; untracked, as the shared
+	// root above) share one access at their own slot, the rest keep a case each. A case per candidate copied every
+	// access of the root ~1,300 times (place 103's MS 0x07d7b1d0db8d2aa9: 8 loads, 1.9M words of SPIR-V that
+	// NVIDIA's compiler never finished, its memory growing until the commit limit).
+	const auto grouped_access = [&]() {
+		const auto& buffers    = state.program.info.buffers;
+		const auto& candidates = buffer.indirect_resources;
+		const auto& sources    = state.program.descriptor_sources;
+		const auto  indexed    = [&](const IR::BufferResource& b) {
+			return b.source < sources.size() && sources[b.source].indirect_descriptor &&
+			       sources[b.source].indirect_descriptor->indexed;
+		};
+		const auto groupable = [](const IR::BufferResource& b) {
+			return b.packed_stride != 0u && !b.tracked && b.descriptor_index != UINT32_MAX;
+		};
+		struct Group { uint32_t resource; uint32_t count; };
+		std::vector<Group>    groups;
+		std::vector<uint32_t> group_of(candidates.size());
+		std::vector<uint32_t> slot_of(candidates.size());
+		bool                  contiguous = true; // every grouped candidate's slot is ordinal + bias
+		std::optional<uint32_t> bias;
+		for (uint32_t ordinal = 0; ordinal < candidates.size(); ++ordinal) {
+			const auto& candidate = buffers[candidates[ordinal]];
+			auto found = groups.end();
+			if (groupable(candidate)) {
+				found = std::ranges::find_if(groups, [&](const Group& group) {
+					const auto& other = buffers[group.resource];
+					return groupable(other) && other.packed_stride == candidate.packed_stride &&
+					       other.descriptor_format == candidate.descriptor_format &&
+					       other.descriptor_swizzle == candidate.descriptor_swizzle &&
+					       indexed(other) == indexed(candidate);
+				});
+				const auto own = candidate.descriptor_index - ordinal;
+				if (!bias) bias = own;
+				contiguous = contiguous && own == *bias;
+			}
+			group_of[ordinal] = static_cast<uint32_t>(found - groups.begin());
+			slot_of[ordinal]  = candidate.descriptor_index;
+			if (found == groups.end()) groups.push_back({candidates[ordinal], 1u});
+			else ++found->count;
+		}
+		// selected is below candidates.size() here: the result's valid check, or the store's below.
+		const auto table = [&](const std::vector<uint32_t>& words) {
+			const auto offset  = ProgramConstantOffset(state, words);
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+			                          state.program_constants_variable, ConstantU32(state, 0u),
+			                          EmitAddU32(state, selected, ConstantU32(state, offset)));
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+			return value;
+		};
+		const bool shares = std::ranges::any_of(groups, [](const Group& group) { return group.count > 1u; });
+		const auto slot   = !shares ? 0u : contiguous ? EmitAddU32(state, selected, ConstantU32(state, *bias)) : table(slot_of);
+		const auto emit_group = [&](uint32_t index) {
+			const auto& group = groups[index];
+			if (group.count == 1u) return access(group.resource);
+			mem.resource = group.resource;
+			return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
+		};
+		if (groups.size() == 1u) return emit_group(0u);
+		return EmitIndexSwitch(state, table(group_of), static_cast<uint32_t>(groups.size()),
+		                       has_result ? TypeU32Composite(state, components) : 0u, emit_group);
+	};
 	const auto selected_access = [&]() {
 		if (shared) {
 			const auto root_slot = buffer.descriptor_index;
@@ -390,6 +458,16 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 			}
 			mem.resource = representative;
 			return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
+		}
+		if (buffer.indirect_resources.size() > MaxIndirectBufferCases) {
+			if constexpr (has_result) {
+				return grouped_access();
+			} else {
+				EmitIfCondition(state, Binary(state, spv::OpULessThan, TypeBool(state), selected,
+				                              ConstantU32(state, buffer.indirect_resources.size())),
+				                grouped_access);
+				return;
+			}
 		}
 		return EmitIndexSwitch(state, selected, buffer.indirect_resources.size(),
 		                       has_result ? TypeU32Composite(state, components) : 0u,
