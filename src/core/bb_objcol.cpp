@@ -1367,7 +1367,8 @@ void SystemsReport(double now) {
         idle.push_back(SysText(r) + fmt::format(" (rebuilt {} times, never added)", r.rebuilds));
     }
     // Class 0x538d440 (slot +0x18 0x180d670, decompiled): system at +0x38 (ids +0x20, count
-    // +0x28), per-body desired byte at [+0x70] + 10 + i*4: in the world when bit 0 is set and
+    // +0x28), per-body desired byte at [+0x70] + 0xa + i*0x10 (16-byte records, see 0x180db90 /
+    // 0x180dd24): in the world when bit 0 is set and
     // bit 1 clear. Producers seen in a flush whose bodies are all "out":
     std::string out_list;
     u32 out_n = 0;
@@ -1383,7 +1384,7 @@ void SystemsReport(double now) {
         bool any_in = false;
         for (u32 i = 0; i < n; ++i) {
             u8 b = 0;
-            Rd(desired + 10 + i * 4, b);
+            Rd(desired + 0xa + u64(i) * 0x10, b);
             any_in = any_in || ((b & 2) == 0 && (b & 1));
             bytes += fmt::format("{:02x}", b);
         }
@@ -1834,6 +1835,8 @@ void FixPass(double now, u64 world) {
              done, g_add_wrap - g_eboot, list.empty() ? "none" : list);
 }
 
+void DupReport(const char* when);
+
 void MapTick(double now) {
     if (now - g_map_tick < 1.0) {
         return;
@@ -1882,6 +1885,9 @@ void MapTick(double now) {
             CompareMap(now);
             SystemsReport(now);
             PartsReport(now);
+            if (stage == 0) {
+                DupReport("map +30 s");
+            }
             g_map = map;
             g_map_visit = visit;
             g_map_open = open;
@@ -2522,6 +2528,225 @@ void PS4_SYSV_ABI HookFlush(const u64* regs) {
     }
 }
 
+// ---------------------------------------------------------------- OBJ save restore (0x15b22e0)
+// 0x15b22e0 (rdi = map block) applies the "OBJ " save record copied to block+0x188 (version at
+// block+0x190): for version 0x15091700 only when map id, byte size ((n+7)>>3)+0xc and object
+// count n match; bit i of the bitmap at rec+0xc calls 0x15a6840(objs + i*0x2e0, 1) (broken state).
+// Object manager [0x553b168]: block array [+0x28] (0x1f8 a block, count [+0x20]); entity tables
+// per group [+0x18] (0x20 a group, count [+0x10]) -> +0x18 sub-blocks 0x1f8 apart (count +0x10),
+// each with a sorted (entityId, handle) array at +0xf8, count +0xf0; handle = (block << 20) | i.
+constexpr u64 ObjMgrVaddr = 0x553b168;
+constexpr u64 SaveApplyVaddr = 0x15b22e0;
+constexpr u32 SaveApplyPrologue = 14;
+// push rbp; mov rbp,rsp; push r15..r12; push rbx; push rax; mov r13,rdi;
+// mov eax,[r13+0x190]; cmp eax,0x10051200; jne
+constexpr u8 SigSaveApply[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41,
+                               0x54, 0x53, 0x50, 0x49, 0x89, 0xfd, 0x41, 0x8b, 0x85, 0x90, 0x01,
+                               0x00, 0x00, 0x3d, 0x00, 0x12, 0x05, 0x10, 0x0f, 0x85};
+
+std::mutex g_save_mutex;
+u32 g_save_lines = 0;
+u32 g_dup_reports = 0;
+
+// handle -> entity id over every entity table (bounded).
+void EntityTables(std::unordered_map<u32, s32>& by_handle,
+                  std::vector<std::tuple<s32, u32, u32, u32>>* dups) {
+    u64 mgr = 0, groups = 0;
+    s32 ng = 0;
+    if (!Rd(g_eboot + ObjMgrVaddr, mgr) || !IsPtr(mgr) || !Rd(mgr + 0x10, ng) ||
+        !Rd(mgr + 0x18, groups) || !IsPtr(groups) || ng <= 0 || ng > 64) {
+        return;
+    }
+    for (s32 g = 0; g < ng; ++g) {
+        s32 nb = 0;
+        u64 blocks = 0;
+        if (!Rd(groups + u64(g) * 0x20 + 0x10, nb) || !Rd(groups + u64(g) * 0x20 + 0x18, blocks) ||
+            !IsPtr(blocks) || nb <= 0 || nb > 256) {
+            continue;
+        }
+        for (s32 j = 0; j < nb; ++j) {
+            s32 n = 0;
+            u64 arr = 0;
+            const u64 b = blocks + u64(j) * 0x1f8;
+            if (!Rd(b + 0xf0, n) || !Rd(b + 0xf8, arr) || !IsPtr(arr) || n <= 0 || n > 65536) {
+                continue;
+            }
+            std::vector<s32> e(size_t(n) * 2);
+            if (!SafeCopy(e.data(), arr, e.size() * 4)) {
+                continue;
+            }
+            for (s32 k = 0; k < n; ++k) {
+                const s32 id = e[k * 2];
+                const u32 h = u32(e[k * 2 + 1]);
+                if (s32(h) >= 0) {
+                    by_handle.emplace(h, id);
+                }
+                if (dups && k > 0 && e[(k - 1) * 2] == id && dups->size() < 200) {
+                    dups->emplace_back(id, u32(e[(k - 1) * 2 + 1]), h, u32(g) << 16 | u32(j));
+                }
+            }
+        }
+    }
+}
+
+void DupReport(const char* when) {
+    if (g_eboot == 0) {
+        return;
+    }
+    {
+        std::scoped_lock lk{g_save_mutex};
+        if (g_dup_reports >= 40) {
+            return;
+        }
+        ++g_dup_reports;
+    }
+    std::unordered_map<u32, s32> by_handle;
+    std::vector<std::tuple<s32, u32, u32, u32>> dups;
+    EntityTables(by_handle, &dups);
+    std::string list;
+    for (const auto& [id, h0, h1, gj] : dups) {
+        list += fmt::format("{}entity {} handles {:#x} (block {} obj {}) / {:#x} (block {} obj {}) "
+                            "table {}.{}",
+                            list.empty() ? "" : "; ", id, h0, (h0 >> 20) & 0xff, h0 & 0xfffff, h1,
+                            (h1 >> 20) & 0xff, h1 & 0xfffff, gj >> 16, gj & 0xffff);
+    }
+    LOG_INFO(Core,
+             "[objcol] entity-id duplicates ({}, map {}): {} handles indexed, {} adjacent equal "
+             "ids{}: {}",
+             when, g_map, by_handle.size(), dups.size(), dups.size() >= 200 ? " (capped)" : "",
+             list.empty() ? "none" : list);
+}
+
+// State-1 collision slot of an object: [[obj+0x238]+0xa8+8], empty when 0 or its +0xb0 is 0.
+// Returns 1 empty, 0 present, -1 unreadable.
+int State1Empty(u64 obj) {
+    u64 tab = 0, slot = 0, res = 0;
+    if (!Rd(obj + 0x238, tab) || !IsPtr(tab) || !Rd(tab + 0xa8 + 8, slot)) {
+        return -1;
+    }
+    if (slot == 0) {
+        return 1;
+    }
+    if (!IsPtr(slot) || !Rd(slot + 0xb0, res)) {
+        return -1;
+    }
+    return res == 0 ? 1 : 0;
+}
+
+void OnSaveApply(u64 block) {
+    u32 ver = 0, n = 0;
+    u64 info = 0, rec = 0, objs = 0;
+    u32 map_id = 0;
+    if (!Rd(block + 0x190, ver) || !Rd(block + 0xc8, n) || !Rd(block + 0x188, rec) ||
+        !Rd(block + 0xd0, objs)) {
+        return;
+    }
+    const bool have_map = Rd(block + 8, info) && IsPtr(info) && Rd(info + 8, map_id);
+    if (rec == 0 || !IsPtr(rec)) {
+        std::scoped_lock lk{g_save_mutex};
+        if (g_save_lines < 200) {
+            ++g_save_lines;
+            LOG_INFO(Core,
+                     "[objcol] save restore: block {:#x} map id {:#x} objects {} version {:#x}: "
+                     "no record",
+                     block, map_id, n, ver);
+        }
+        return;
+    }
+    u32 hdr[3] = {};
+    if (!SafeCopy(hdr, rec, sizeof(hdr))) {
+        return;
+    }
+    const u32 cnt = hdr[2];
+    const u32 want_size = ((n + 7) >> 3) + 0xc;
+    const bool match = have_map && hdr[0] == map_id && hdr[1] == want_size && cnt == n && n > 0;
+    // Bitmap over the record's own count (old format: block count), bounded by the record size.
+    const u32 bits = std::min<u32>(ver == 0x15091700 ? cnt : n,
+                                   hdr[1] > 0xc ? (hdr[1] - 0xc) * 8 : 0);
+    std::vector<u8> bm((std::min<u32>(bits, 1u << 16) + 7) >> 3);
+    if (!bm.empty() && !SafeCopy(bm.data(), rec + 0xc, bm.size())) {
+        bm.clear();
+    }
+    std::unordered_map<u32, s32> by_handle;
+    EntityTables(by_handle, nullptr);
+    s64 bidx = -1;
+    {
+        u64 mgr = 0, arr = 0;
+        s32 nb = 0;
+        if (Rd(g_eboot + ObjMgrVaddr, mgr) && IsPtr(mgr) && Rd(mgr + 0x28, arr) &&
+            Rd(mgr + 0x20, nb) && block >= arr && (block - arr) % 0x1f8 == 0 &&
+            (block - arr) / 0x1f8 < u64(std::max(nb, 0))) {
+            bidx = s64((block - arr) / 0x1f8);
+        }
+    }
+    const bool fix = g_fix && ver == 0x15091700 && match;
+    std::string set_list, cleared;
+    u32 set_n = 0, empty_n = 0, cleared_n = 0;
+    for (u32 i = 0; i < u32(bm.size()) * 8 && i < bits; ++i) {
+        if (!((bm[i >> 3] >> (i & 7)) & 1)) {
+            continue;
+        }
+        ++set_n;
+        const u64 obj = objs + u64(i) * 0x2e0;
+        const int empty = i < n ? State1Empty(obj) : -1;
+        empty_n += empty == 1;
+        std::string ent = "?";
+        if (bidx >= 0) {
+            const auto it = by_handle.find(u32(bidx) << 20 | i);
+            if (it != by_handle.end()) {
+                ent = std::to_string(it->second);
+            }
+        }
+        if (set_n <= 120) {
+            set_list += fmt::format("{}{} obj {:#x} entity {} state-1 collision {}",
+                                    set_list.empty() ? "" : "; ", i, obj, ent,
+                                    empty == 1 ? "EMPTY" : empty == 0 ? "present" : "?");
+        }
+        if (fix && empty == 1) {
+            // The record is the game's heap copy owned by this block; clear only this bit.
+            u8* byte = reinterpret_cast<u8*>(rec + 0xc + (i >> 3));
+            *byte = u8(*byte & ~(1u << (i & 7)));
+            ++cleared_n;
+            std::scoped_lock lk{g_save_mutex};
+            if (g_save_lines < 400) {
+                ++g_save_lines;
+                LOG_INFO(Core,
+                         "[objcol] save restore fix: map id {:#x} cleared bit {} (obj {:#x} entity "
+                         "{}): no state-1 collision, object stays in state 0",
+                         map_id, i, obj, ent);
+            }
+        }
+    }
+    std::scoped_lock lk{g_save_mutex};
+    if (g_save_lines >= 400) {
+        return;
+    }
+    ++g_save_lines;
+    LOG_INFO(Core,
+             "[objcol] save restore: block {:#x} (index {}) map id {:#x} objects {} version {:#x} "
+             "({}) | record {:#x}: map id {:#x} size {:#x} (expected {:#x}) count {} -> {} | set "
+             "bits {} (state-1 collision empty {}){}{}: {}",
+             block, bidx, map_id, n, ver,
+             ver == 0x15091700   ? "current"
+             : ver == 0x10051200 ? "old, no count check"
+                                 : "unknown",
+             rec, hdr[0], hdr[1], want_size, cnt,
+             ver == 0x10051200 ? "applied without checks"
+             : match           ? "MATCH, will be applied"
+                               : "MISMATCH, game drops it",
+             set_n, empty_n, set_n > 120 ? " (list capped at 120)" : "",
+             g_fix ? fmt::format(", BB_OBJCOL_FIX cleared {}", cleared_n) : std::string(),
+             set_list.empty() ? "none" : set_list);
+}
+
+void PS4_SYSV_ABI HookSaveApply(const u64* regs) {
+    try {
+        OnSaveApply(regs[5]); // rdi: the map block
+        DupReport("save restore 0x15b22e0");
+    } catch (...) {
+    }
+}
+
 // ---------------------------------------------------------------- detours
 
 // addBodies: prologue (20 bytes relocated), argument spills, test edx / test ecx, the
@@ -2951,6 +3176,21 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         g_add_wrap = eboot_base + *add_wrap;
         g_wrap_vt = eboot_base + WrapperVtable;
         g_sys_vt = eboot_base + SystemVtable;
+    }
+    // OBJ save restore apply 0x15b22e0: every relocated byte and the version compare checked.
+    {
+        const bool ok = cave_b && SaveApplyVaddr + sizeof(SigSaveApply) <= image_size &&
+                        std::memcmp(img + SaveApplyVaddr, SigSaveApply, sizeof(SigSaveApply)) == 0;
+        if (ok) {
+            hook(SaveApplyVaddr, reinterpret_cast<u64>(&HookSaveApply), SaveApplyPrologue);
+        }
+        LOG_INFO(Core,
+                 "[objcol] OBJ save restore eboot+{:#x} {}; lines '[objcol] save restore', "
+                 "'[objcol] entity-id duplicates'{}",
+                 SaveApplyVaddr, ok ? "hooked" : "prologue differs: not hooked",
+                 g_fix && ok ? "; BB_OBJCOL_FIX clears record bits of objects without state-1 "
+                               "collision ('[objcol] save restore fix')"
+                             : "");
     }
     LOG_INFO(Core, "[objcol] {}; physics command flush {}; wrapper ctor/dtor {}; BB_OBJCOL_FIX {}",
              objs, flush_ok ? fmt::format("eboot+{:#x} hooked", *flush) : std::string("not hooked"),
