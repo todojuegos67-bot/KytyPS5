@@ -231,6 +231,18 @@ struct State {
     u64 sec_spark_draws = 0, sec_spark_vec = 0, sec_spark_no_cam = 0, sec_spark_px = 0,
         sec_spark_frames = 0;
     std::unordered_map<u64, std::array<u32, 2>> spark_vs; // vs hash -> draws, with vector
+    // bb-mv-candles: every blended scene-size draw seen by Want (blend state, depth, result):
+    // which effects never reached the spark path (log [sparks-diag]).
+    struct BlendDiag {
+        u64 count = 0, vs = 0;
+        u32 kind = 0, why = 0, src = 0, dst = 0, func = 0, depth = 0;
+    };
+    std::unordered_map<u64, BlendDiag> blend_diag;
+    // bb-mv-candles: limit of the marked area (statistics frames): above it the HUD-less pass
+    // gets no spark pixels (a light pass / big smoke taken from the real frame would judder).
+    float spark_max = 0.02f;
+    bool spark_over = false;
+    u64 sec_spark_over = 0, sec_spark_stat = 0;
     // bb-mv-fill: end-of-frame copies of the 1-slot ring slots (compose time).
     VideoCore::BufferCache* bc = nullptr;
     Core::MemoryManager* mem = nullptr; // (review) the slot must still be mapped
@@ -399,6 +411,10 @@ void ReadStats(u32 slot) {
         g.sec_keep_dense += s[21];
         g.sec_spark_px += s[22];
         ++g.sec_spark_frames;
+        // bb-mv-candles: the marked area of this frame decides the next frames' HUD-less marking.
+        g.spark_over = s[2] != 0 && double(s[22]) > double(g.spark_max) * double(s[2]);
+        ++g.sec_spark_stat;
+        if (g.spark_over) ++g.sec_spark_over;
     }
     if (g.slot_stat[slot]) {
         g.w30.static_px += s[8];
@@ -650,14 +666,21 @@ bool Init(const Vulkan::Instance& instance) {
                 if (end != lv && std::isfinite(f) && f > 0.0f) lum = std::min(f, 15.0f);
             }
             g.spark_word = std::clamp<u32>(u32(std::lround(lum * 4096.0f)), 1u, 0xffffu);
+            if (const char* mv = std::getenv("BB_FG_SPARKS_MAXPCT"); mv != nullptr && mv[0]) {
+                char* end = nullptr;
+                const float f = std::strtof(mv, &end);
+                if (end != mv && std::isfinite(f) && f > 0.0f) g.spark_max = std::min(f, 100.0f) / 100.0f;
+            }
             g.spark_word_alpha = g.spark_word | 0x10000u;
             if (g.sparks || BB::MvEngine::Enabled()) {
                 Log(fmt::format("[sparks] {} (BB_FG_SPARKS=1 with BB_MV_ENGINE=1): additive / "
-                                "premultiplied effect draws write their static-world vector and "
+                                "premultiplied / screen effect draws, and the bright pixels of alpha-blended draws "
+                                "(candle flames), write their static-world vector and "
                                 "class 5 where their own contribution > {:.3f} (BB_FG_SPARKS_LUM); "
                                 "those pixels: reactive for the upscaler, \"UI\" in the HUD-less "
-                                "image for frame generation (taken from the real frame)",
-                                g.sparks ? "on" : "off", lum));
+                                "image for frame generation (taken from the real frame) while the marked area "
+                                "stays under {:.1f}% (BB_FG_SPARKS_MAXPCT)",
+                                g.sparks ? "on" : "off", lum, g.spark_max * 100.0f));
             }
         }
         g.fog_reactive = g.fog && std::getenv("BB_FOG_REACTIVE") != nullptr &&
@@ -698,11 +721,48 @@ void NoteSceneDepth(u64 depth_address) {
     g.scene_depth = depth_address;
 }
 
+void NoteBlend(const AmdGpu::Regs& regs, Kind kind, u32 why) {
+    // bb-mv-candles: why = 1 not the scene depth target, 2 no depth test / clip off / no MRT 0,
+    // 3 blend not handled, 0 handled (kind).
+    const auto& bc = regs.blend_control[0];
+    const u32 depth = (regs.depth_control.depth_enable ? 1u : 0u) |
+                      (regs.depth_control.depth_write_enable ? 2u : 0u) |
+                      (regs.depth_buffer.DepthValid() &&
+                               regs.depth_buffer.DepthAddress() == g.scene_depth
+                           ? 4u
+                           : 0u);
+    const u64 vs = u64(regs.vs_program.address) << 8;
+    const u64 key = Mix(Mix(Mix(vs, u64(kind) | u64(why) << 8 | u64(depth) << 16),
+                            u64(static_cast<u32>(bc.color_src_factor)) | u64(static_cast<u32>(bc.color_dst_factor)) << 8),
+                        u64(static_cast<u32>(bc.color_func)));
+    auto& d = g.blend_diag[key];
+    if (d.count++ == 0) {
+        d = {1, vs, u32(kind), why, u32(static_cast<u32>(bc.color_src_factor)),
+             u32(static_cast<u32>(bc.color_dst_factor)), u32(static_cast<u32>(bc.color_func)), depth};
+    }
+    if (g.blend_diag.size() > 4096) g.blend_diag.clear();
+}
+
+Kind WantImpl(const AmdGpu::Regs& regs, u32& why);
+
 Kind Want(const AmdGpu::Regs& regs) {
+    u32 why = 0;
+    const Kind k = WantImpl(regs, why);
+    if (g.sparks && regs.blend_control[0].enable && regs.color_buffers[0] &&
+        regs.color_target_mask.GetMask(0) && (k != Kind::None || why == 1)) {
+        NoteBlend(regs, k, why);
+    }
+    return k;
+}
+
+Kind WantImpl(const AmdGpu::Regs& regs, u32& why) {
     if (!g.ready || g.scene_depth == 0) return Kind::None;
     if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) return Kind::None;
     if (!regs.depth_buffer.DepthValid() || regs.depth_buffer.NumSamples() != 1) return Kind::None;
-    if (regs.depth_buffer.DepthAddress() != g.scene_depth) return Kind::None;
+    if (regs.depth_buffer.DepthAddress() != g.scene_depth) {
+        why = 1;
+        return Kind::None;
+    }
     if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal) return Kind::None;
     u32 bound = 0;
     for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
@@ -715,6 +775,7 @@ Kind Want(const AmdGpu::Regs& regs) {
     // Other draws of the scene pass: attachment 7 kept bound, not written (no pass restart).
     if (!regs.depth_control.depth_enable || regs.IsClipDisabled() || !regs.color_buffers[0] ||
         !regs.color_target_mask.GetMask(0)) {
+        why = 2;
         return Kind::Mask;
     }
     const auto& bc = regs.blend_control[0];
@@ -730,12 +791,18 @@ Kind Want(const AmdGpu::Regs& regs) {
     // bb-mv-fill (BB_FG_SPARKS=1): additive (dst One: sparks, embers, glows) and premultiplied
     // (One, 1 - SrcAlpha) effects: they had no entry here, so the vector of whatever lies behind
     // (the character hit, the floor) moved them in the generated frames (doubled sparks).
-    if (g.sparks && bc.color_func == AmdGpu::BlendControl::BlendFunc::Add &&
-        (bc.color_dst_factor == F::One ||
-         (bc.color_src_factor == F::One && bc.color_dst_factor == F::OneMinusSrcAlpha)) &&
-        (bc.color_src_factor == F::One || bc.color_src_factor == F::SrcAlpha)) {
+    // bb-mv-candles: also "screen" (dst 1 - SrcColor, src 1 - DstColor) and Max glows.
+    using Fn = AmdGpu::BlendControl::BlendFunc;
+    const bool src_ok = bc.color_src_factor == F::One || bc.color_src_factor == F::SrcAlpha ||
+                        bc.color_src_factor == F::OneMinusDstColor;
+    const bool dst_ok = bc.color_dst_factor == F::One ||
+                        bc.color_dst_factor == F::OneMinusSrcColor ||
+                        (bc.color_src_factor == F::One &&
+                         bc.color_dst_factor == F::OneMinusSrcAlpha);
+    if (g.sparks && (bc.color_func == Fn::Add || bc.color_func == Fn::Max) && src_ok && dst_ok) {
         return Kind::Effect;
     }
+    why = 3;
     return Kind::Mask;
 }
 
@@ -770,6 +837,13 @@ void FillKey(Kind kind, u32& mrt_mask, u32& num_color_attachments, Shader::PsCol
         bc.alpha_src_factor = F::Zero;
         bc.alpha_dst_factor = F::One;
         bc.alpha_func = AmdGpu::BlendControl::BlendFunc::Add;
+        if (g.fog) {
+            // bb-mv-candles: .w = 1 where the effect replaced the pixel (as a dense blended
+            // layer), so compose can tell class 5 from the blended layers' class encoding.
+            write_mask7 |= vk::ColorComponentFlagBits::eA;
+            bc.alpha_src_factor = F::One;
+            bc.alpha_dst_factor = F::OneMinusSrcAlpha;
+        }
         return;
     }
     if (kind == Kind::Blend) {
@@ -789,6 +863,13 @@ void FillKey(Kind kind, u32& mrt_mask, u32& num_color_attachments, Shader::PsCol
                           vk::ColorComponentFlagBits::eA;
             bc.alpha_src_factor = F::One;
             bc.alpha_dst_factor = F::OneMinusSrcAlpha;
+            if (g.sparks) {
+                // bb-mv-candles (BB_FG_SPARKS=1): the class channel blends too: the fragment
+                // writes 0 (B = class * prod(1 - w) = class * (1 - .w), decoded by compose) or,
+                // where its own contribution is bright (candle flames, glowing effects drawn
+                // alpha-blended), 5 with weight 1.
+                write_mask7 |= vk::ColorComponentFlagBits::eB;
+            }
         }
     }
 }
@@ -1799,7 +1880,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         }
         if (blend) {
             // bb-fog-mv: the blended draw's own vector, density-weighted (fragment, flags bit 3).
-            push.objmv_flags = 1u | 8u;
+            push.objmv_flags = 1u | 8u | (g.sparks ? (g.spark_word << 16) : 0u);
             ++g.sec_fog_vec;
             ++g.fog_vs[vs.pgm_hash][1];
             if (skinned) ++g.sec_fog_skin;
@@ -2212,7 +2293,8 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
                                       (store_color ? 4u : 0u) | (check ? 8u : 0u) |
                                       (refine_now ? 16u : 0u) | (characters ? 32u : 0u) |
                                       (g.fog ? 64u : 0u) | (g.fog_reactive ? 128u : 0u) |
-                                      (g.fog_keepobj ? 256u : 0u) | (g.sparks ? 512u : 0u)};
+                                      (g.fog_keepobj ? 256u : 0u) | (g.sparks ? 512u : 0u) |
+                                      (g.sparks && !g.spark_over ? 1024u : 0u)};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, writes);
     cmd.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
@@ -2468,6 +2550,42 @@ void OnFlip() {
         g.spark_vs.clear();
         g.sec_spark_draws = g.sec_spark_vec = g.sec_spark_no_cam = g.sec_spark_px =
             g.sec_spark_frames = 0;
+        if (g.sparks) {
+            // bb-mv-candles: blended draws of the scene by blend state and what Want made of them
+            // (Blend: alpha-blended, own vector + bright pixels class 5; Effect: additive /
+            // screen; Mask: not handled; None: not the scene depth target).
+            static constexpr const char* kF[] = {"0", "1", "Sc", "1-Sc", "Sa", "1-Sa", "Da",
+                                                 "1-Da", "Dc", "1-Dc", "SaSat", "?", "?", "K",
+                                                 "1-K", "S1c", "1-S1c", "S1a", "1-S1a", "Ka",
+                                                 "1-Ka"};
+            static constexpr const char* kFn[] = {"add", "sub", "min", "max", "rsub"};
+            static constexpr const char* kK[] = {"none", "opaque", "blend", "mask", "effect"};
+            static constexpr const char* kW[] = {"", " (not scene depth)",
+                                                 " (no depth test/clip/MRT0)",
+                                                 " (blend not handled)"};
+            std::vector<State::BlendDiag> top;
+            for (const auto& [k, d] : g.blend_diag) top.push_back(d);
+            std::sort(top.begin(), top.end(),
+                      [](const auto& a, const auto& b) { return a.count > b.count; });
+            std::string t;
+            for (size_t i = 0; i < top.size() && i < 10; ++i) {
+                const auto& d = top[i];
+                t += fmt::format(" vs@{:#x} {}{} {}*src {} {}*dst depth {}{}{} {:.1f} binds/frame;",
+                                 d.vs, kK[std::min<u32>(d.kind, 4)], kW[std::min<u32>(d.why, 3)],
+                                 d.src < 21 ? kF[d.src] : "?", kFn[std::min<u32>(d.func, 4)],
+                                 d.dst < 21 ? kF[d.dst] : "?", (d.depth & 1) ? "t" : "-",
+                                 (d.depth & 2) ? "w" : "-", (d.depth & 4) ? "s" : "-",
+                                 double(d.count) / f);
+            }
+            Log(fmt::format("[sparks-diag] blended draws by state (depth t test, w write, s scene "
+                            "target):{} | marked area over {:.1f}% (BB_FG_SPARKS_MAXPCT) on {} of "
+                            "{} statistics frames: HUD-less marking held",
+                            t.empty() ? " none" : t, g.spark_max * 100.0f, g.sec_spark_over,
+                            g.sec_spark_stat));
+        }
+        g.blend_diag.clear();
+        g.sec_spark_over = g.sec_spark_stat = 0;
+
         g.fog_vs.clear();
         g.sec_fog_draws = g.sec_fog_vec = g.sec_fog_skin = g.sec_fog_no_cam =
             g.sec_fog_skin_skipped = g.sec_fog_no_block = 0;

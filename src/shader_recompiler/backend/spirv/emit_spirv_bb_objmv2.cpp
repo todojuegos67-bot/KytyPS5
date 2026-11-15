@@ -189,6 +189,32 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
                                          ctx.OpFSub(f32, ctx.Constant(f32, 3.0f), two_t));
             const Id dense = ctx.OpFMul(f32, alpha, smooth);
             weight = ctx.OpSelect(f32, written, ctx.OpSelect(f32, fog, dense, alpha), zero);
+            // bb-mv-candles (BB_FG_SPARKS=1: flags bits 16-31 = threshold in 1/4096, 0 = off):
+            // the class channel blends with the same weight; the fragment writes 0 there (so B is
+            // class * (1 - .w), decoded by compose) or, where the colour it adds (MRT 0 rgb x
+            // alpha) is bright (candle flames, glowing effects drawn alpha-blended), 5 with
+            // weight 1: its own static-world vector replaces the one behind.
+            const Id sbits = ctx.OpShiftRightLogical(ctx.U32[1], flags, ctx.ConstU32(16u));
+            const Id spark_on = ctx.OpINotEqual(b, sbits, ctx.u32_zero_value);
+            const Id col = ctx.OpLoad(ctx.F32[4], mrt0.id);
+            const Id lum = ctx.OpFAdd(
+                f32,
+                ctx.OpFAdd(f32,
+                           ctx.OpFMul(f32, ctx.OpCompositeExtract(f32, col, 0u),
+                                      ctx.Constant(f32, 0.2126f)),
+                           ctx.OpFMul(f32, ctx.OpCompositeExtract(f32, col, 1u),
+                                      ctx.Constant(f32, 0.7152f))),
+                ctx.OpFMul(f32, ctx.OpCompositeExtract(f32, col, 2u), ctx.Constant(f32, 0.0722f)));
+            const Id added = ctx.OpFMul(f32, lum, alpha);
+            const Id sthr = ctx.OpFMul(f32, ctx.OpConvertUToF(f32, sbits),
+                                       ctx.Constant(f32, 1.0f / 4096.0f));
+            const Id bright = ctx.OpLogicalAnd(
+                b, ctx.OpLogicalAnd(b, spark_on, written),
+                ctx.OpLogicalAnd(b, ctx.OpFOrdGreaterThan(b, added, sthr),
+                                 ctx.OpLogicalNot(b, ctx.OpIsInf(b, added))));
+            weight = ctx.OpSelect(f32, bright, one, weight);
+            cls = ctx.OpSelect(f32, spark_on,
+                               ctx.OpSelect(f32, bright, ctx.Constant(f32, 5.0f), zero), cls);
         } else {
             weight = zero;
         }
