@@ -2347,9 +2347,18 @@ void Compose(vk::CommandBuffer cmd, vk::ImageView mv_view, vk::ImageView color_v
     // frame its vectors are measured against last frame's colour and refined (own vector,
     // +-1 px, the neighbours' vectors: the one whose 3x3 patch matches best). Needs last
     // frame's colour every frame (ping-pong prev[0] / prev[1]). BB_PLAYER_MV_REFINE=0: off.
+    // bb-mv-tremble: with BB_MV_ENGINE=1 the character's vectors come from the engine's own
+    // previous ring slots / palettes (exact: [mv-engine-slots] skinned previous 100%); the patch
+    // search then only replaces them with a +-1 px / neighbour guess picked from noisy colour
+    // (jitter, FSR4 input), ~50% of the player's pixels every frame ("vectors refined 49.8%"):
+    // FG places the idle character up to half a pixel off in each generated frame, which reads as
+    // trembling (tiembla.mp4: background static, character shifting back and forth). Default off
+    // with BB_MV_ENGINE=1; BB_PLAYER_MV_REFINE=1 forces it on, =0 off.
     static const bool refine = [] {
         const char* v = std::getenv("BB_PLAYER_MV_REFINE");
-        return !(v != nullptr && v[0] == '0');
+        if (v != nullptr && v[0] == '1') return true;
+        if (v != nullptr && v[0] == '0') return false;
+        return !BB::MvEngine::Enabled();
     }();
     // bb-native-mv2: the player mask is the skinned (class 4) pixels in the centre; kept every
     // frame (ping-pong) as with refine.
@@ -2652,7 +2661,7 @@ void OnFlip() {
         Log(fmt::format(
             "[player-mv] player mask {:.0f} px/frame ({}, character draws {:.1f}/frame), "
             "vectors refined {:.1f}%, patch error {:.4f} -> {:.4f} "
-            "(BB_PLAYER_MV_REFINE=0 off)",
+            "(BB_PLAYER_MV_REFINE: 1 on, 0 off; default off with BB_MV_ENGINE=1)",
             double(g.sec_pl_px) / double(std::max<u64>(1, g.sec_frames)),
             g.player_mask == State::PlayerMask::Ring
                 ? "game skin rings"
