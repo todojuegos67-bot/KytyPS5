@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 
 #include <array>
 #include <atomic>
@@ -20,6 +21,7 @@
 namespace Libs::Graphics {
 
 class RenderContext;
+class ComputeAheadScanner;
 
 class GuestGpu final {
 public:
@@ -31,6 +33,8 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// SendCommandSync for a read back of guest memory, which RunReadBacks may also run.
+	void               SendReadBackSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> commands);
@@ -43,8 +47,14 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// The GPU thread, in a wait for a thread that may be waiting for a read back: runs the read backs queued and no
+	// other command, as the draw in progress is half prepared. An unmap queued before one hasn't run yet, so what the
+	// read back reaches is still mapped.
+	static void RunReadBacks();
 
 private:
+	struct ReadBack;
+
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
@@ -59,7 +69,11 @@ private:
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
 		bool                      blocked         = false;
+		bool                      started         = false;
 		uint64_t                  flip_request_id = 0;
+		// The game's heap entries it changed before it submitted this (GuestImageHeap::Diff).
+		std::vector<ImageHeapChange> heap_changes;
+		uint64_t                  seq             = 0; // order of Enqueue, for compute ahead
 	};
 
 	void              Enqueue(Submission submission);
@@ -76,6 +90,7 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::vector<std::shared_ptr<ReadBack>>         m_read_backs;
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
@@ -86,10 +101,13 @@ private:
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);
 
+	std::unique_ptr<ComputeAheadScanner>                             m_ahead; // null when off
+	uint64_t                                                         m_enqueue_seq = 0;
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
-	std::atomic_int m_done_num = 0;
+	uint64_t        m_submit_id = 0;
+	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;
