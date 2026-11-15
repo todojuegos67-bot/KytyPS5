@@ -229,12 +229,13 @@ public:
 	// driver cache and saves it. The process's exit code: 0 done, 2 unavailable, 3 stopped, 4 save failed, 5 export
 	// failed, 6 import failed.
 	int RunPrecompileOnly();
-	// Restores the hints' records from the game files with this GPU's host fields; a successful import of a file
-	// stamps it (m_hints_path), so the precompile on start does not import the same file again.
+	// Restores the hints' records from the game files with this GPU's host fields. Its callers stamp the file
+	// (StampHints, m_hints_path) once the journal holding them is written, so a start does not import it again.
 	Precompile::ImportResult ImportHintsFile(const std::filesystem::path&                         path,
 	                                         const std::function<void(uint64_t done, uint64_t total)>& progress = {});
 
 private:
+	void StampHints(const std::filesystem::path& path);
 	struct ProgramCache;
 	class PrecompileCompiler;
 	struct Ahead;

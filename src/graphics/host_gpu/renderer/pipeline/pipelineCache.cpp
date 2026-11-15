@@ -1543,6 +1543,7 @@ void PipelineCache::InitializePrecompile() {
 	// The shipped hints, on the first start after they appear or change: without them a first session's precompile on
 	// start has nothing to compile unless the launcher's Precompile ran (one import reads ~1.5 GB of game files, ~1.5 s
 	// warm). The records this PC has come first, as in RunPrecompileOnly.
+	std::filesystem::path imported; // stamped once the journal is written
 	if (const auto hints = Precompile::ShippedHints(title_id); !hints.empty()) {
 		std::string done;
 		if (std::ifstream stamp(m_hints_path); stamp) std::getline(stamp, done);
@@ -1554,6 +1555,7 @@ void PipelineCache::InitializePrecompile() {
 			                           : "not imported (" + result.reason + ")");
 			std::ranges::move(result.journal.stages, std::back_inserter(journal.stages));
 			std::ranges::move(result.journal.pipelines, std::back_inserter(journal.pipelines));
+			if (result.ok) imported = hints;
 		}
 	}
 	const bool migrated = Precompile::MigrateBufferTable(journal); // after the hints, recorded in the normal variant
@@ -1564,6 +1566,8 @@ void PipelineCache::InitializePrecompile() {
 	if (!m_journal->Open(m_journal_path, device, journal, rewrite)) {
 		PipelineCacheLog("SHADER_PRECOMPILE journal: cannot write {}", Common::PathToString(m_journal_path));
 		m_journal.reset();
+	} else if (!imported.empty()) {
+		StampHints(imported);
 	}
 	m_program_cache->journal = m_journal.get();
 	for (const auto& record: journal.stages) m_program_cache->recorded.insert(record.Key());
@@ -1698,11 +1702,12 @@ Precompile::ImportResult PipelineCache::ImportHintsFile(const std::filesystem::p
 			}
 		}
 	};
-	auto result = Precompile::ImportHints(path, Config::GetGameDir(), info, adjust, progress);
-	if (result.ok && !m_hints_path.empty()) {
-		std::ofstream(m_hints_path, std::ios::trunc) << Precompile::HintsStamp(path) << '\n';
-	}
-	return result;
+	return Precompile::ImportHints(path, Config::GetGameDir(), info, adjust, progress);
+}
+
+// After the journal holding a hints file's records is written: the next start need not import it again.
+void PipelineCache::StampHints(const std::filesystem::path& path) {
+	if (!m_hints_path.empty()) std::ofstream(m_hints_path, std::ios::trunc) << Precompile::HintsStamp(path) << '\n';
 }
 
 void PipelineCache::AheadSubmission(uint64_t seq) {
@@ -1759,6 +1764,7 @@ int PipelineCache::RunPrecompileOnly() {
 			line("PRECOMPILE_DONE status=import_failed");
 			return 6;
 		}
+		StampHints(path);
 		line(fmt::format("PRECOMPILE_HINTS kind=import status=ok stages={} pipelines={} missing={} read_mb={} seconds={:.1f}",
 		                 result.stages, result.pipelines, result.missing, result.bytes_read >> 20u, result.seconds));
 	}
