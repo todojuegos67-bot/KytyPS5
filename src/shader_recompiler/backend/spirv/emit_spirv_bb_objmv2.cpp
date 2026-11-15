@@ -299,7 +299,12 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
         // behind. Weight 1 only where the colour it adds is bright: luminance of MRT 0 (x its
         // alpha when the game's blend uses src alpha: push word bit 16) > threshold (bits 0-15,
         // 1/4096). The push word is objmv_fog (unused by these draws).
-        cls = ctx.Constant(f32, 5.0f);
+        // bb-mv-fire: flags bit 6: a screen-space composite of the game's effect buffer: class 6
+        // (mark only, compose keeps the vector behind).
+        cls = ctx.OpSelect(f32,
+                           ctx.OpINotEqual(b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(64u)),
+                                           ctx.u32_zero_value),
+                           ctx.Constant(f32, 6.0f), ctx.Constant(f32, 5.0f));
         weight = zero;
         const auto& mrt0 = ctx.frag_outputs[0];
         if (Sirit::ValidId(mrt0.id) && mrt0.num_components >= 3 && !mrt0.is_integer) {
