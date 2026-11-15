@@ -1,8 +1,11 @@
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/upstreamPaths.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/fsr3FrameGen.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -35,13 +38,6 @@ void MemoryBarrier(vk::CommandBuffer command) {
 }
 
 } // namespace
-
-RenderExecutor::~RenderExecutor() {
-	const auto device = m_context.GetGraphics().device;
-	device.destroyPipeline(m_pssr_pipeline, nullptr);
-	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);
-	device.destroyDescriptorSetLayout(m_pssr_descriptor_layout, nullptr);
-}
 
 bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& request,
                              Dlss::Inputs& inputs) {
@@ -87,7 +83,58 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 	return true;
 }
 
+bool RenderExecutor::UpscaleFsr(vk::CommandBuffer command, const Pssr::Request& request,
+                                const Fsr3::Inputs& inputs) {
+	const auto release = [&](Fsr3::Context* fsr) {
+		if (fsr != nullptr) {
+			m_context.GetCommandScheduler().DeferOperation([fsr] { Fsr3::Destroy(fsr); });
+		}
+	};
+	auto creation = Fsr3::CreationFor(request, inputs);
+	auto context  = std::ranges::find(m_fsr_contexts, request.context, &FsrContext::context);
+	bool reset    = (request.flags & Pssr::kReset) != 0;
+	// The game's dynamic resolution swaps between input images of different sizes (1664x936 and
+	// 1792x1008 at the Pro title, ~6 times a second): a context made for the larger serves both.
+	const auto fits = [&](const Fsr3::Creation& have) {
+		return have.max_width >= creation.max_width && have.max_height >= creation.max_height &&
+		       have.output_width == creation.output_width &&
+		       have.output_height == creation.output_height && have.flags == creation.flags;
+	};
+	if (context == m_fsr_contexts.end() || !fits(context->creation)) {
+		if (context != m_fsr_contexts.end()) {
+			creation.max_width  = std::max(creation.max_width, context->creation.max_width);
+			creation.max_height = std::max(creation.max_height, context->creation.max_height);
+			release(context->fsr);
+		} else {
+			// A library has at most four contexts.
+			if (m_fsr_contexts.size() == 4) {
+				release(m_fsr_contexts.front().fsr);
+				m_fsr_contexts.erase(m_fsr_contexts.begin());
+			}
+			context = m_fsr_contexts.insert(m_fsr_contexts.end(), {request.context, {}, nullptr});
+		}
+		context->creation = creation;
+		context->fsr      = Fsr3::Create(m_context.GetGraphics(), creation);
+		reset             = true;
+	}
+	if (context->fsr == nullptr) {
+		return false;
+	}
+	MemoryBarrier(command);
+	if (!Fsr3::Dispatch(context->fsr, command, request, inputs, reset)) {
+		release(context->fsr);
+		context->fsr = nullptr;
+		return false;
+	}
+	if (Fsr3::FrameGen::Active()) {
+		Fsr3::FrameGen::Prepare(command, request, inputs, reset);
+	}
+	MemoryBarrier(command);
+	return true;
+}
+
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
+	EXIT_IF(buffer.IsInvalid() && !KYTY_UPSTREAM_PATH("45b35fafb"));
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	ShaderTextureResource input_descriptor {}, output_descriptor {};
@@ -149,7 +196,11 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	const std::array<const uint32_t*, 3>         dlss_words {request.depth, request.motion,
 	                                                         request.exposure};
 	std::array<std::optional<TextureBinding>, 3> dlss_bindings;
-	if (Upscaler::Enabled() && Dlss::Accepts(request) && parameters.output_channels[0] == 0 &&
+	// Upstream's upscaler (DLSS, or FSR from AMD's DLLs) when one is up; else the built-in FSR 3.1 when FSR is chosen.
+	const bool dlss = Upscaler::Enabled() && Dlss::Accepts(request);
+	const bool fsr  = !Upscaler::Enabled() && Config::GetPssrUpscaler() == Config::PssrUpscaler::FSR &&
+	                 Fsr3::Accepts(request);
+	if ((dlss || fsr) && parameters.output_channels[0] == 0 &&
 	    parameters.output_channels[1] == 1 && parameters.output_channels[2] == 2) {
 		for (size_t i = 0; i < dlss_words.size(); ++i) {
 			ShaderTextureResource descriptor {};
@@ -195,7 +246,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	               command);
 	destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
 	                    range(destination_view), command);
-	if (dlss_bindings[0]) {
+	if (dlss_bindings[0] && dlss) {
 		// Whether a binding is a whole one-level, one-layer image, unswizzled in its channels.
 		const auto raw = [&](const TextureBinding& binding, uint32_t channels) {
 			const auto&      image  = cache.GetImage(binding.image_id);
@@ -248,6 +299,56 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		if (readable && Upscale(command, request, inputs)) {
 			ResetBindings();
 			return;
+		}
+	}
+	if (dlss_bindings[0] && fsr) {
+		// FSR's backend views and transitions whole images from level 0: one layer, one sample, the
+		// view's format the image's own or one it can take.
+		const auto whole = [&](const TextureBinding& binding, uint32_t width,
+		                       uint32_t height) -> std::optional<Fsr3::Image> {
+			const auto& image = cache.GetImage(binding.image_id);
+			const auto& view  = binding.desc.view_info;
+			const bool  depth = image.info.IsDepth();
+			const auto  format = depth ? image.backing.format : view.format;
+			if (view.base_level != 0 || view.base_layer != 0 || image.backing.layers != 1 ||
+			    image.backing.samples != 1 || image.held != nullptr ||
+			    (format != image.backing.format &&
+			     !(image.backing.flags & vk::ImageCreateFlagBits::eMutableFormat)) ||
+			    !Fsr3::Supports(static_cast<VkFormat>(format))) {
+				return std::nullopt;
+			}
+			return Fsr3::Image {
+			    .image   = static_cast<VkImage>(image.backing.image),
+			    .format  = static_cast<VkFormat>(format),
+			    .width   = width != 0 ? width : image.backing.extent.width,
+			    .height  = height != 0 ? height : image.backing.extent.height,
+			    .depth   = depth,
+			    .stencil = depth && image.backing.format != vk::Format::eD32Sfloat &&
+			               image.backing.format != vk::Format::eD16Unorm};
+		};
+		const auto color    = whole(input, 0, 0);
+		const auto depth    = whole(*dlss_bindings[0], 0, 0);
+		const auto motion   = whole(*dlss_bindings[1], 0, 0);
+		const auto exposure = dlss_bindings[2] ? whole(*dlss_bindings[2], 0, 0) : std::nullopt;
+		const auto upscaled = whole(output, parameters.output_size[0], parameters.output_size[1]);
+		if (color && depth && motion && upscaled && (!dlss_bindings[2] || exposure)) {
+			for (const auto& binding: dlss_bindings) {
+				if (binding) {
+					cache.GetImage(binding->image_id)
+					    .Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
+					             std::nullopt, command);
+				}
+			}
+			source.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
+			               std::nullopt, command);
+			destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+			                    std::nullopt, command);
+			const Fsr3::Inputs inputs {*color, *depth, *motion, exposure ? &*exposure : nullptr,
+			                           *upscaled};
+			if (UpscaleFsr(command, request, inputs)) {
+				ResetBindings();
+				return;
+			}
 		}
 	}
 	auto& graphics = m_context.GetGraphics();

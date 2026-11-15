@@ -141,8 +141,7 @@ void Load() {
 	}
 	const auto& folder = Config::GetFsrFolder();
 	if (folder.empty()) {
-		Warn("no folder is set");
-		return;
+		return; // Wolverine build: without AMD's DLLs the built-in FSR 3.1 upscales (fsr3.cpp)
 	}
 	g_module =
 	    SDL_LoadObject(Common::PathToString(folder / "amd_fidelityfx_loader_vk.dll").c_str());
