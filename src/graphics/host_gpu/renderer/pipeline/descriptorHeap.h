@@ -31,10 +31,13 @@ public:
 	KYTY_CLASS_NO_COPY(DescriptorHeap);
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
-	// A set kept from draw to draw (image groups, RenderExecutor::CommitBindings), from a pool of its own: nullptr when
-	// that is full. A released set is freed once the GPU is past the work recorded so far.
+	// A set kept from draw to draw (image groups, RenderExecutor::CommitBindings), from a pool of its own. When that is
+	// full it is replaced, and KeptPoolGeneration changes: every set allocated before is gone (the old pool is destroyed
+	// once the GPU is past the work recorded so far) and must be neither bound nor released again. A released set is
+	// freed once the GPU is past the work recorded so far.
 	[[nodiscard]] vk::DescriptorSet AllocateKept(vk::DescriptorSetLayout layout);
 	void                            ReleaseKept(vk::DescriptorSet set);
+	[[nodiscard]] uint64_t          KeptPoolGeneration() const { return m_kept_generation; }
 
 private:
 	static constexpr uint32_t DescriptorSetBatch = 32;
@@ -47,6 +50,7 @@ private:
 
 	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
 	void               CreateDescriptorPool();
+	void               CreateKeptPool();
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;
@@ -55,6 +59,8 @@ private:
 	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
 	vk::DescriptorPool                                  m_kept_pool = nullptr;
 	std::deque<std::pair<vk::DescriptorSet, uint64_t>>  m_kept_released;
+	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_kept_retired;
+	uint64_t                                            m_kept_generation = 0;
 };
 
 using ShaderRecompiler::IR::ImageHeapChange;

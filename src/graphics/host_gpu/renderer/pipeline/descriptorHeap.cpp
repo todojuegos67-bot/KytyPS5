@@ -542,6 +542,10 @@ void GuestImageHeap::RetryLost() {
 DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master_semaphore)
     : m_graphics(graphics), m_master_semaphore(master_semaphore) {
 	CreateDescriptorPool();
+	CreateKeptPool();
+}
+
+void DescriptorHeap::CreateKeptPool() {
 	// Kept group sets: an effect program's stage holds up to about 25,000 candidates (Marvel's Wolverine, 2026-11-07);
 	// the sets in use, one a program and stage, and those released while the GPU may still read them.
 	constexpr uint32_t                  KeptDescriptors = 1u << 18u;
@@ -559,6 +563,10 @@ DescriptorHeap::~DescriptorHeap() {
 	m_graphics.device.destroyDescriptorPool(m_current_pool, nullptr);
 	if (!m_kept_released.empty()) m_master_semaphore.Wait(m_kept_released.back().second);
 	m_graphics.device.destroyDescriptorPool(m_kept_pool, nullptr);
+	for (const auto& [pool, tick]: m_kept_retired) {
+		m_master_semaphore.Wait(tick);
+		m_graphics.device.destroyDescriptorPool(pool, nullptr);
+	}
 	m_graphics.device.destroyDescriptorSetLayout(m_graphics.empty_set_layout, nullptr);
 	m_graphics.empty_set_layout = nullptr;
 	for (const auto& [pool, tick]: m_pending_pools) {
@@ -619,6 +627,10 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 }
 
 vk::DescriptorSet DescriptorHeap::AllocateKept(vk::DescriptorSetLayout layout) {
+	while (!m_kept_retired.empty() && m_master_semaphore.IsFree(m_kept_retired.front().second)) {
+		m_graphics.device.destroyDescriptorPool(m_kept_retired.front().first, nullptr);
+		m_kept_retired.pop_front();
+	}
 	while (!m_kept_released.empty() && m_master_semaphore.IsFree(m_kept_released.front().second)) {
 		const auto set = m_kept_released.front().first;
 		EXIT_IF(m_graphics.device.freeDescriptorSets(m_kept_pool, 1, &set) != vk::Result::eSuccess);
@@ -632,7 +644,14 @@ vk::DescriptorSet DescriptorHeap::AllocateKept(vk::DescriptorSetLayout layout) {
 	const auto        result    = m_graphics.device.allocateDescriptorSets(&allocate, &set);
 	if (result == vk::Result::eSuccess) return set;
 	EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory && result != vk::Result::eErrorFragmentedPool);
-	return nullptr;
+	// Full: the pool goes with every set in it once the GPU is past the work recorded so far; its released sets go too.
+	m_kept_retired.emplace_back(m_kept_pool, m_master_semaphore.CurrentTick());
+	m_kept_released.clear();
+	CreateKeptPool();
+	++m_kept_generation;
+	allocate.descriptorPool = m_kept_pool;
+	EXIT_IF(m_graphics.device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
+	return set;
 }
 
 void DescriptorHeap::ReleaseKept(vk::DescriptorSet set) {

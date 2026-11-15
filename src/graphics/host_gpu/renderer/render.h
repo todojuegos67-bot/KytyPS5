@@ -394,14 +394,16 @@ private:
 		bool operator<(const DescriptorRun& other) const { return begin < other.begin; }
 	};
 	std::vector<DescriptorRun> m_descriptor_runs;
-	// The image groups' kept sets (IR::GroupSetFor), by program: the set, the image epoch and the groups' generations it
-	// was written at (nullptr while the last was a per-frame set).
+	// The image groups' kept sets (IR::GroupSetFor), by set layout: the set, its pool's generation, the program, the image
+	// epoch and the groups' generations it was written at.
 	struct KeptGroupSet {
-		vk::DescriptorSet     set   = nullptr;
-		uint64_t              epoch = 0;
+		vk::DescriptorSet     set             = nullptr;
+		uint64_t              pool_generation = 0;
+		const void*           program         = nullptr;
+		uint64_t              epoch           = 0;
 		std::vector<uint64_t> generations;
 	};
-	std::unordered_map<const void*, KeptGroupSet> m_kept_group_sets;
+	std::unordered_map<vk::DescriptorSetLayout, KeptGroupSet> m_kept_group_sets;
 	std::vector<uint64_t>                         m_group_generations;
 	std::vector<vk::WriteDescriptorSet>           m_group_writes;
 	// CommitBindings' scalar-read check: the written images' ranges by start, and the furthest end up to each.

@@ -2274,15 +2274,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (program.info.images[i].indirect_capacity != 0u) m_group_generations.push_back(prepared->groups[i].generation);
 		}
 		const auto epoch = Image::group_set_epoch.load(std::memory_order_relaxed);
-		auto&      kept  = m_kept_group_sets[&program];
-		auto       set   = kept.set;
-		if (set == nullptr || kept.epoch != epoch || kept.generations != m_group_generations) {
-			auto& heap = m_context.GetDescriptorHeap();
-			if (kept.set != nullptr) heap.ReleaseKept(kept.set);
-			kept.set         = heap.AllocateKept(layout);
-			kept.epoch       = epoch;
-			kept.generations = m_group_generations;
-			set              = kept.set != nullptr ? kept.set : heap.Commit(layout); // the pool full: a per-frame set
+		auto&      heap  = m_context.GetDescriptorHeap();
+		// By layout, which lives as long as its pipeline; a program's address can be another program's later.
+		auto&      kept  = m_kept_group_sets[layout];
+		const bool alive = kept.set != nullptr && kept.pool_generation == heap.KeptPoolGeneration();
+		if (!alive || kept.program != &program || kept.epoch != epoch || kept.generations != m_group_generations) {
+			if (alive) heap.ReleaseKept(kept.set);
+			kept.set             = heap.AllocateKept(layout);
+			kept.pool_generation = heap.KeptPoolGeneration();
+			kept.program         = &program;
+			kept.epoch           = epoch;
+			kept.generations     = m_group_generations;
 			m_group_writes.clear();
 			for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 				const auto& resource = program.info.images[i];
@@ -2292,14 +2294,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				EXIT_IF(infos.size() != members.size());
 				const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 				vk::WriteDescriptorSet write {};
-				write.dstSet          = set;
+				write.dstSet          = kept.set;
 				write.dstBinding      = ShaderRecompiler::IR::NativeBinding(program.stage, kind);
 				write.dstArrayElement = resource.descriptor_index;
 				write.descriptorCount = static_cast<uint32_t>(members.size());
 				write.descriptorType  = NativeDescriptorType(kind);
 				write.pImageInfo      = infos.data();
 				m_group_writes.push_back(write);
-				if (kept.set == nullptr) continue;
 				for (const auto& member: members) {
 					if (member.image_id) m_context.GetTextureCache().GetImage(member.image_id).in_group_set = true;
 				}
@@ -2307,7 +2308,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(m_group_writes.size()),
 			                                                    m_group_writes.data(), 0, nullptr);
 		}
-		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, set_index, 1, &set, 0, nullptr);
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, set_index, 1, &kept.set, 0, nullptr);
 	}
 }
 

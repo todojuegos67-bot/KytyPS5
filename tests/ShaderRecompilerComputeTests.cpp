@@ -2575,6 +2575,40 @@ public:
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
   }
 
+  // A full kept-set pool is replaced (its generation changes) instead of the
+  // emulator exiting. Its 256 sets are the limit every driver keeps (drivers
+  // may hand out more descriptors than a pool's sizes).
+  void CheckDescriptorHeapKeptFull() {
+    constexpr const char *name = "DescriptorHeapKeptFull";
+    EnsureRuntimeContext();
+    vk::DescriptorSetLayoutBinding binding{};
+    binding.descriptorType = vk::DescriptorType::eSampledImage;
+    binding.descriptorCount = 1;
+    binding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+    vk::DescriptorSetLayoutCreateInfo create{};
+    create.bindingCount = 1;
+    create.pBindings = &binding;
+    vk::DescriptorSetLayout layout = nullptr;
+    RequireVk(name, "layout",
+              m_device.createDescriptorSetLayout(&create, nullptr, &layout),
+              "vkCreateDescriptorSetLayout");
+    {
+      RenderContext context(m_runtime_context);
+      auto &heap = context.GetDescriptorHeap();
+      const auto start = heap.KeptPoolGeneration();
+      for (uint32_t i = 0; i < 256; i++) {
+        Require(name, "fits", heap.AllocateKept(layout) != nullptr &&
+                                  heap.KeptPoolGeneration() == start,
+                "a set the pool holds needed a new pool");
+      }
+      Require(name, "renew", heap.AllocateKept(layout) != nullptr &&
+                                 heap.KeptPoolGeneration() == start + 1,
+              "a full pool was not replaced");
+    }
+    m_device.destroyDescriptorSetLayout(layout, nullptr);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckGraphicsPushConstantBank() {
     constexpr const char *name = "GraphicsPushConstantStages";
     EnsureRuntimeContext();
@@ -58740,6 +58774,7 @@ int main(int argc, char **argv) {
   vulkan.CheckHostImageAllocation();
   vulkan.CheckVideoOutHdr10ToSdr();
   vulkan.CheckDescriptorHeapLargeSet();
+  vulkan.CheckDescriptorHeapKeptFull();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
