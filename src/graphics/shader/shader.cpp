@@ -118,6 +118,23 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		     addr, data.code_size_bytes);
 	}
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
+	// KYTY_DUMP_SHADER_CODE=<folder>: each registered shader's guest code once, as
+	// <hash>.bin, to compare the same shader between runs (diagnostic).
+	if (static const char* dump = std::getenv("KYTY_DUMP_SHADER_CODE"); dump != nullptr && dump[0] != '\0') {
+		static std::mutex dump_mutex;
+		std::scoped_lock  dump_lock(dump_mutex);
+		std::error_code   ec;
+		std::filesystem::create_directories(dump, ec);
+		char name[64];
+		(void)std::snprintf(name, sizeof(name), "%016" PRIx64 ".bin", hash);
+		const auto path = std::filesystem::path(dump) / name;
+		if (!std::filesystem::exists(path, ec)) {
+			if (FILE* f = std::fopen(path.string().c_str(), "wb"); f != nullptr) {
+				(void)std::fwrite(reinterpret_cast<const void*>(addr), 1, data.code_size_bytes, f);
+				(void)std::fclose(f);
+			}
+		}
+	}
 	// Draws read the input semantics from this copy, not from the header: the header can share a
 	// page with memory the GPU writes each frame, and reading it per draw faults and drains the
 	// pipeline. Copied before taking the lock, as the read itself can fault.
