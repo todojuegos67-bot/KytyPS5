@@ -1034,7 +1034,7 @@ void NearPlayer(const ProxyBytes& pb, double now) {
         std::string text;
         std::string key;
     };
-    std::vector<Near> near;
+    std::vector<Near> nearby;
     bool inside_any = false;
     for (s32 id = 0; id < n; ++id) {
         BodyBytes bb;
@@ -1071,18 +1071,18 @@ void NearPlayer(const ProxyBytes& pb, double now) {
         const std::string size_text = box ? fmt::format(" box {:.1f}x{:.1f}x{:.1f}", mx[0] - mn[0],
                                                         mx[1] - mn[1], mx[2] - mn[2])
                                           : " (origin)";
-        near.push_back(
+        nearby.push_back(
             {d,
              fmt::format("#{} {} layer {} filter {:#x} {}{} d {:.1f}{}", id, Motion(flags),
                          bb.Layer(), bb.Filter(), state, size_text, d, inside ? " INSIDE" : ""),
              fmt::format("{}:{}:{}", id, state, inside)});
     }
-    std::sort(near.begin(), near.end(), [](const Near& a, const Near& b) { return a.d < b.d; });
-    if (near.size() > 10) {
-        near.resize(10);
+    std::sort(nearby.begin(), nearby.end(), [](const Near& a, const Near& b) { return a.d < b.d; });
+    if (nearby.size() > 10) {
+        nearby.resize(10);
     }
     std::string key, list;
-    for (const auto& e : near) {
+    for (const auto& e : nearby) {
         key += e.key + ";";
         list += (list.empty() ? "" : " | ") + e.text;
     }
