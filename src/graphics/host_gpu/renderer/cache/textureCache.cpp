@@ -2518,13 +2518,13 @@ void TextureCache::RunGarbageCollector() {
 		// 5-7 MB a frame (chenxiao07's fork). Only more pressure reaches younger images.
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 300 : 600, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
-		// Stencil associations go with their depth image, GPU-written tiled images have no
-		// download for their contents, and the image heap's textures are freed by the game
-		// through its heap entries (nothing draws them by name, so they would look unused), as are
-		// the resident image heap's.
+		// Stencil associations go with their depth image, GPU-written tiled images (render targets) stay
+		// until memory is critical, when they are downloaded (re-tiled) and freed, and the image heap's
+		// textures are freed by the game through its heap entries (nothing draws them by name, so they
+		// would look unused), as are the resident image heap's.
 		const auto never = [&](const Image& image) {
 			return image.depth_id ||
-			       (image.IsGpuModified() && image.SafeToDownload() && image.info.IsTiled()) ||
+			       (!aggressive && image.IsGpuModified() && image.SafeToDownload() && image.info.IsTiled()) ||
 			       (image.heap_id && m_graphics.guest_image_heap != nullptr &&
 			        m_graphics.guest_image_heap->Holds(image.heap_id)) ||
 			       image.heap_refs.load(std::memory_order_relaxed) != 0u; // resident heaps sample it untouched
