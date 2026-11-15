@@ -60,10 +60,20 @@ void ScreenBounds(EmitContext& ctx, Id position) {
     const Id front = ctx.OpFOrdGreaterThan(b, w, ctx.Constant(f32, 1e-6f));
     const Id neg = ctx.Constant(f32, -1.0f);
     const Id pos1 = ctx.Constant(f32, 1.0f);
-    const auto ndc = [&](std::uint32_t c) {
-        const Id v = ctx.OpFDiv(f32, ctx.OpCompositeExtract(f32, position, c), w);
-        return ctx.OpFClamp(f32, v, neg, pos1);
-    };
+    const Id ndc_x = ctx.OpFDiv(f32, ctx.OpCompositeExtract(f32, position, 0u), w);
+    const Id ndc_y = ctx.OpFDiv(f32, ctx.OpCompositeExtract(f32, position, 1u), w);
+    // (review) a NaN position (culled vertex: its triangles are not rasterized) or a NaN
+    // projection (inf / inf) adds nothing; NClamp keeps the conversion below defined.
+    const Id nan_vtx = ctx.OpLogicalOr(
+        b, ctx.OpIsNan(b, w),
+        ctx.OpLogicalAnd(b, front,
+                         ctx.OpLogicalOr(b, ctx.OpIsNan(b, ndc_x), ctx.OpIsNan(b, ndc_y))));
+    const Id write_label = ctx.OpLabel();
+    const Id write_merge = ctx.OpLabel();
+    ctx.OpSelectionMerge(write_merge, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(nan_vtx, write_merge, write_label);
+    ctx.AddLabel(write_label);
+    const auto ndc = [&](Id v) { return ctx.OpNClamp(f32, v, neg, pos1); };
     const auto fixed = [&](Id v) {
         return ctx.OpConvertFToU(
             ut, ctx.OpFMul(f32, ctx.OpFAdd(f32, ctx.OpFMul(f32, v, ctx.Constant(f32, 0.5f)),
@@ -71,8 +81,8 @@ void ScreenBounds(EmitContext& ctx, Id position) {
                             ctx.Constant(f32, 65535.0f)));
     };
     // A vertex behind the camera: the draw may cover anything (whole viewport).
-    const Id x = fixed(ndc(0u));
-    const Id y = fixed(ndc(1u));
+    const Id x = fixed(ndc(ndc_x));
+    const Id y = fixed(ndc(ndc_y));
     const Id zero = ctx.u32_zero_value;
     const Id full = ctx.ConstU32(65535u);
     const Id lo_x = ctx.OpSelect(ut, front, x, zero);
@@ -90,6 +100,8 @@ void ScreenBounds(EmitContext& ctx, Id position) {
     ctx.OpAtomicUMin(ut, at(4), scope, zero, lo_y);
     ctx.OpAtomicUMax(ut, at(8), scope, zero, hi_x);
     ctx.OpAtomicUMax(ut, at(12), scope, zero, hi_y);
+    ctx.OpBranch(write_merge);
+    ctx.AddLabel(write_merge);
     ctx.OpBranch(merge_label);
     ctx.AddLabel(merge_label);
 }
