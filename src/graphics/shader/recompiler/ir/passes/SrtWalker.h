@@ -196,9 +196,11 @@ void SetSrtCleanReader(SrtCleanReader reader);
 // The exception handler, for a faulting walker load (SrtWalkerLoadLength, SrtPointerLoadLength): the word from the
 // clean reader, if it serves it.
 bool SrtWalkerCleanLoad(uint64_t address, uint32_t& value);
-// Length of the interpreter's guest load (mov eax, [r10]) if rip is it, else 0. Unlike the walker's loads, a fault
-// there that the clean reader does not serve stays the fault it is (a read back, or a crash).
+// Length of the interpreter's guest load (mov eax, [r10]) if rip is it, else 0. A fault there that the clean reader
+// does not serve is read back like any other; on unmapped memory the handler completes it as 0 and reports it
+// (SrtPointerFaultedLoad), and the read fails past the null-pointer range, as the walker's loads do.
 uint32_t SrtPointerLoadLength(uint64_t rip);
+void     SrtPointerFaultedLoad(uint64_t address);
 
 // The x86 walk against the interpreter's refresh of the same plan and runtime (tests). The interpreter refreshes
 // first, with a clean evaluator, then the walker walks.

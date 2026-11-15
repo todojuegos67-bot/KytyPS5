@@ -708,10 +708,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 		// An SRT walker load of unmapped memory (upstream bdf48dcf3): a zero read; the walk then fails unless
-		// it read through a null pointer.
+		// it read through a null pointer. The interpreter's load the same (its read then fails): it repeats a walk
+		// the walker gave up on, so it meets the same memory.
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
 			Libs::Graphics::ShaderRecompiler::IR::SrtWalkerFaultedLoad(info->access_violation_vaddr);
+			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
+			return true;
+		}
+		if (const auto length =
+		        Libs::Graphics::ShaderRecompiler::IR::SrtPointerLoadLength(info->exception_address)) {
+			Libs::Graphics::ShaderRecompiler::IR::SrtPointerFaultedLoad(info->access_violation_vaddr);
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}

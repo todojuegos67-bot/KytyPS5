@@ -25,9 +25,15 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Lean's first walker read a pointer below 64 KB (and its levels below) as zero tables (c527c28ba); a load
+// there through such a pointer stays a zero read. Any other fault fails the walk: the readers fail there.
+constexpr uint64_t NullPointerLoads = 0x20000;
+
 namespace {
 
 std::atomic<SrtCleanReader> g_clean_reader = nullptr;
+// An interpreter load the exception handler completed as 0 (SrtPointerFaultedLoad): its read fails.
+thread_local bool t_pointer_faulted = false;
 
 // The interpreter's guest loads, as the x86 walker's: mov eax, [r10] (41 8b 02), which the exception handler completes
 // from the clean reader when it faults (SrtPointerLoadLength). No check costs anything on a page no shader wrote.
@@ -51,15 +57,18 @@ const PointerLoad& PointerLoader() {
 	return loader;
 }
 
-// A walk's read by pointer (no reader). Up to 16 words load one by one through PointerLoad; a longer read (a whole
-// descriptor table) is copied, and a fault there reads its page back, as before.
-void ReadByPointer(uint64_t address, std::span<uint32_t> values) {
-	if (values.size() > 16u) {
+// A walk's read by pointer (no reader). Up to 16 words, or any read below NullPointerLoads, load one by one through
+// PointerLoad, whose faults on unmapped memory read zero (false past NullPointerLoads, as the x86 walker's); a longer
+// read (a whole descriptor table) is copied, and a fault there reads its page back, as before.
+[[nodiscard]] bool ReadByPointer(uint64_t address, std::span<uint32_t> values) {
+	if (values.size() > 16u && address >= NullPointerLoads) {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
-		return;
+		return true;
 	}
-	const auto load = PointerLoader().function;
+	const auto load   = PointerLoader().function;
+	t_pointer_faulted = false;
 	for (size_t i = 0; i < values.size(); i++) values[i] = load(address + 4u * i);
+	return !t_pointer_faulted;
 }
 
 } // namespace
@@ -72,6 +81,10 @@ void SetSrtCleanReader(SrtCleanReader reader) {
 bool SrtWalkerCleanLoad(uint64_t address, uint32_t& value) {
 	const auto reader = g_clean_reader.load(std::memory_order_relaxed);
 	return reader != nullptr && reader(address, {&value, 1});
+}
+
+void SrtPointerFaultedLoad(uint64_t address) {
+	if (address >= NullPointerLoads) t_pointer_faulted = true;
 }
 
 uint32_t SrtPointerLoadLength(uint64_t rip) {
@@ -101,8 +114,8 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
-	} else {
-		ReadByPointer(address, values);
+	} else if (!ReadByPointer(address, values)) {
+		return false;
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -127,8 +140,7 @@ SrtRuntime SrtReadLog::Recording(const SrtRuntime& source, size_t max_words) {
 bool SrtReadLog::Read(const SrtRuntime& via, bool strict, uint64_t address, std::span<uint32_t> values) {
 	if (strict) return via.read_specialization_memory(via.userdata, address, values);
 	if (via.read_memory != nullptr) return via.read_memory(via.userdata, address, values);
-	ReadByPointer(address, values);
-	return true;
+	return ReadByPointer(address, values);
 }
 
 bool SrtReadLog::Record(bool strict, uint64_t address, std::span<uint32_t> values) {
@@ -618,8 +630,7 @@ bool ReadRawSlot(const MemoryInfo& mem, ValueOpcode op, const uint64_t* args, co
 			return false;
 		}
 	} else {
-		if (vector) return false;
-		ReadByPointer(address, {&word, 1});
+		if (vector || !ReadByPointer(address, {&word, 1})) return false;
 	}
 	result = word;
 	return true;
@@ -1174,9 +1185,6 @@ thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 thread_local std::vector<uint64_t>*        t_fill_loads = nullptr;
 std::atomic<SrtFillGate>                   g_fill_gate  = nullptr;
 thread_local bool                         t_walker_faulted = false;
-// Lean's first walker read a pointer below 64 KB (and its levels below) as zero tables (c527c28ba); a load
-// there through such a pointer stays a zero read. Any other fault fails the walk: the readers fail there.
-constexpr uint64_t NullPointerLoads = 0x20000;
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, bool shader_only = false) {
