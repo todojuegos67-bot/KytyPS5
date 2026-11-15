@@ -19,7 +19,7 @@
 namespace BB::ObjCol {
 
 bool Enabled();
-void OnGuestFileOpen(const char* guest_path, const char* host_path);
+void OnGuestFileOpen(const char* guest_path, const char* host_path, u64 size);
 void OnEbootPatched(uintptr_t eboot_base, u64 image_size);
 
 } // namespace BB::ObjCol
