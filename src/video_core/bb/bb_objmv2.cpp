@@ -227,6 +227,8 @@ struct State {
     bool sparks = false;
     bool cur_effect = false; // the draw being processed is an effect draw
     bool cur_effect_alpha = false; // ... whose game blend multiplies by src alpha
+    bool cur_solid = false;        // bb-mv-layer: a blended draw that writes depth
+    u64 sec_solid_draws = 0, sec_solid_vec = 0;
     u32 spark_word = 0;      // push word: threshold (1/4096) | bit 16: contribution x src alpha
     u32 spark_word_alpha = 0;
     u64 sec_spark_draws = 0, sec_spark_vec = 0, sec_spark_no_cam = 0, sec_spark_px = 0,
@@ -832,10 +834,12 @@ Kind WantImpl(const AmdGpu::Regs& regs, u32& why) {
     // so it takes its own vector like an opaque draw: the engine's ring-slot / palette previous
     // (the Blend path never looked those up, it gave a static-world vector: the messengers'
     // limbs and the candles came out doubled).
-    if (g.sparks && regs.depth_control.depth_write_enable &&
-        bc.color_src_factor == F::SrcAlpha && bc.color_dst_factor == F::OneMinusSrcAlpha) {
-        return Kind::Opaque;
-    }
+    // bb-mv-layer: they stay Blend pipelines (their vector weighted by their alpha) and the
+    // rasterizer flags them (EffectSolid) so VelocityDraw looks up their engine previous like an
+    // opaque draw. As Opaque (candles2) a nearly transparent layer replaced the vector behind it
+    // completely: foliage the game fades near the camera (arbol2.mp4 340-347: ferns as a ghostly
+    // layer over the sky and branches, vs@0x2d33c0400 "depth tws") moved the sky and the
+    // branches behind with its own near-camera vectors in the generated frames.
     // Alpha-blended (particles, effects) only: additive / multiplicative passes (lights, glow)
     // have no surface of their own.
     if (bc.color_src_factor == F::SrcAlpha && bc.color_dst_factor == F::OneMinusSrcAlpha) {
@@ -1243,6 +1247,15 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     g.bc = &buffer_cache;
     g.mem = memory;
     const bool effect = blend && g.cur_effect; // bb-mv-fill: additive / premultiplied effect
+    // bb-mv-layer (BB_FG_SPARKS=1 with bb-fog-mv): a depth-writing alpha-blended draw (translucent
+    // solids: messengers, near-camera faded foliage) takes the opaque path for its buffers (engine
+    // ring slots / palettes, engine camera) and keeps the Blend fragment: its vector weighted by
+    // its alpha over the vector behind, never class 5.
+    const bool solid = blend && !effect && g.cur_solid && g.sparks && g.fog;
+    if (solid) {
+        blend = false;
+        ++g.sec_solid_draws;
+    }
     const bool strict = BB::MvEngine::StrictEnabled();
     ++g.vs_draws;
     ++g.sec_draws;
@@ -1977,6 +1990,12 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             ++g.sec_char_draws;
         }
         push.objmv_flags = flags;
+        if (solid) {
+            // Blend fragment: weight = alpha (no fog curve: bit 3 off), class channel written as 0
+            // (spark threshold 0xffff = never bright; compose decodes B / (1 - .w)).
+            push.objmv_flags = 1u | (0xffffu << 16);
+            ++g.sec_solid_vec;
+        }
         ++g.w30.native;
         if (skinned) ++g.w30.skin_vec;
         if (skinned && ring) ++g.w30.pal_ring;
@@ -2050,6 +2069,7 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     g.cur_effect = g.sparks && (effect & EffectDraw) != 0;
     g.cur_draw_key = Mix(Mix(Mix(vs_hash, identity), count), 0x67617465ull);
     g.cur_effect_alpha = (effect & EffectSrcAlpha) != 0;
+    g.cur_solid = (effect & EffectSolid) != 0 && (effect & EffectDraw) == 0;
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
     if (!g.ready || ui_phase) return;
     if (g.velocity) {
@@ -2650,16 +2670,19 @@ void OnFlip() {
             Log(fmt::format(
                 "[sparks] effect draws {:.1f}/frame: with their static-world vector {:.1f}, no "
                 "previous camera {:.1f} | spark px (class 5) {:.2f}% of the frame on statistics "
-                "frames, over the sky (moon, lit clouds: not marked) {:.2f}% | vs with "
-                "vector/draws (1 s):{}",
+                "frames, over the sky (moon, lit clouds: not marked) {:.2f}% | translucent "
+                "depth-writing draws (alpha-weighted, engine previous) {:.1f}/frame, with vector "
+                "{:.1f} | vs with vector/draws (1 s):{}",
                 double(g.sec_spark_draws) / f, double(g.sec_spark_vec) / f,
                 double(g.sec_spark_no_cam) / f, Pct(g.sec_spark_px, g.sec_px_all),
-                Pct(g.sec_spark_sky, g.sec_px_all),
+                Pct(g.sec_spark_sky, g.sec_px_all), double(g.sec_solid_draws) / f,
+                double(g.sec_solid_vec) / f,
                 shaders.empty() ? " none" : shaders));
         }
         g.spark_vs.clear();
         g.sec_spark_draws = g.sec_spark_vec = g.sec_spark_no_cam = g.sec_spark_px =
             g.sec_spark_frames = g.sec_spark_sky = 0;
+        g.sec_solid_draws = g.sec_solid_vec = 0;
         if (g.sparks) {
             // bb-mv-candles: blended draws of the scene by blend state and what Want made of them
             // (Blend: alpha-blended, own vector + bright pixels class 5; Effect: additive /

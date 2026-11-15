@@ -232,6 +232,10 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
             effect |= BB::ObjMv2::EffectSrcAlpha;
         }
     }
+    if (key.blend_controls[BB::ObjMv2::Attachment].enable != 0 &&
+        liverpool->regs.depth_control.depth_write_enable) {
+        effect |= BB::ObjMv2::EffectSolid; // bb-mv-layer
+    }
     BB::ObjMv2::OnDraw(push_data, pipeline->GetStage(Shader::SwStage::Vertex), memory,
                        buffer_cache, scheduler,
                        key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)], identity,

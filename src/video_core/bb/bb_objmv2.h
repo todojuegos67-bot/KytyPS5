@@ -94,6 +94,8 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
 // bb-mv-fill: `effect` of OnDraw: bit 0 an Effect draw (attachment 7 written R, G, B only),
 // bit 1 the game's own blend multiplies the colour by its src alpha.
 constexpr u32 EffectDraw = 1, EffectSrcAlpha = 2;
+// bb-mv-layer: bit 2: a blended draw that writes depth (translucent solid).
+constexpr u32 EffectSolid = 4;
 // bb-mv-fill (BB_FG_SPARKS=1): the presenter's HUD-less pass marks the effect pixels (bit 1 of
 // .a of ObjectTarget) as "UI" for frame generation (taken from the real frame).
 bool SparksOn();
