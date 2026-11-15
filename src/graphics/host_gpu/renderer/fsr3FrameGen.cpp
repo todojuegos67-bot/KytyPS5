@@ -316,6 +316,21 @@ VkResult SubmitToGameQueue(uint32_t count, const VkSubmitInfo* submits, VkFence 
 	                                                    fence);
 }
 
+// The swapchain's idle waits need the game queue to themselves; they take queue_mutex only for the call. The swapchain's
+// semaphore waits around them run without it, so the recording thread can still send what they wait for.
+VKAPI_ATTR VkResult VKAPI_CALL LockedQueueWaitIdle(VkQueue queue) {
+	if (queue != static_cast<VkQueue>(g_graphics->queue)) {
+		return VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueWaitIdle(queue);
+	}
+	Common::LockGuard lock(g_graphics->queue_mutex);
+	return VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueWaitIdle(queue);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedDeviceWaitIdle(VkDevice device) {
+	Common::LockGuard lock(g_graphics->queue_mutex);
+	return VULKAN_HPP_DEFAULT_DISPATCHER.vkDeviceWaitIdle(device);
+}
+
 // The swapchain's present thread: every real and generated present, for the pacing numbers.
 VKAPI_ATTR VkResult VKAPI_CALL CountedPresent(VkQueue queue, const VkPresentInfoKHR* info) {
 	const auto result = VULKAN_HPP_DEFAULT_DISPATCHER.vkQueuePresentKHR(queue, info);
@@ -447,6 +462,8 @@ void Start(GraphicContext& graphics) {
 	KYTY_FFX_FI_VK_FUNCTIONS(KYTY_FFX_FI_LOAD)
 #undef KYTY_FFX_FI_LOAD
 	kyty_fi_vkQueuePresentKHR = CountedPresent;
+	kyty_fi_vkQueueWaitIdle   = LockedQueueWaitIdle;
+	kyty_fi_vkDeviceWaitIdle  = LockedDeviceWaitIdle;
 	const auto queue          = [&](const QueueSlot& slot) {
         VkQueueInfoFFX info {};
         info.queue       = static_cast<VkQueue>(graphics.device.getQueue(slot.family, slot.index));
@@ -556,8 +573,8 @@ vk::Result CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::Swapchain
 }
 
 void DestroySwapchain(vk::SwapchainKHR swapchain) {
-	// It waits for the game queue to go idle; only the game thread submits there, so no deadlock.
-	Common::LockGuard lock(g_graphics->queue_mutex);
+	// Not under queue_mutex: it waits for the swapchain's presents, which may need the recording thread's submits;
+	// its idle waits lock the game queue themselves (LockedQueueWaitIdle).
 	g_functions.destroySwapchainKHR(g_device.vkDevice, static_cast<VkSwapchainKHR>(swapchain), nullptr);
 }
 
@@ -606,8 +623,8 @@ void Configure(vk::SwapchainKHR swapchain, uint64_t frame, vk::Rect2D rect, vk::
 	config.interpolationRect       = {rect.offset.x, rect.offset.y, static_cast<int32_t>(rect.extent.width),
 	                                  static_cast<int32_t>(rect.extent.height)};
 	config.frameID                 = frame;
-	// The swapchain may wait for the game queue to go idle here.
-	Common::LockGuard queue_lock(g_graphics->queue_mutex);
+	// Not under queue_mutex: a change of the enable waits for the swapchain's presents, and the recording thread needs
+	// queue_mutex to send the game's submits. Its idle waits lock the game queue themselves (LockedQueueWaitIdle).
 	if (const auto error = ffxSetFrameGenerationConfigToSwapchainVK(&config); error != FFX_OK) {
 		Warn("the swapchain refused its configuration", error);
 	}
