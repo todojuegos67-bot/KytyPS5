@@ -1,12 +1,81 @@
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/shader/recompiler/backend/spirv/StepLookup.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
 #include <bit>
+#include <optional>
+#include <type_traits>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+// Steps a step function emits as compares and selects; more become a table search (EmitStepTable).
+constexpr size_t MaxStepChain = 16;
+
+// The offset of these words in the program's read-only ProgramConstants buffer, which it defines at its first use.
+// Not Private arrays: indexed at run time, NVIDIA backs those with local memory for every resident thread
+// (2464e975d88b7f15: 15,840 bytes a thread, gigabytes of video memory).
+uint32_t ProgramConstantOffset(EmitterState& state, const std::vector<uint32_t>& words) {
+	if (state.program_constants_variable == 0) {
+		constexpr auto kind = IR::DescriptorBindingKind::ProgramConstants;
+		const auto     type = StorageBufferType(state, state.storage_buffers[2]);
+		state.program_constants_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, type), spv::StorageClassStorageBuffer);
+		state.builder.AddName(state.program_constants_variable, "program_constants");
+		state.builder.AddAnnotation(spv::OpDecorate, state.program_constants_variable, spv::DecorationDescriptorSet, 0);
+		state.builder.AddAnnotation(spv::OpDecorate, state.program_constants_variable, spv::DecorationBinding,
+		                            IR::NativeBinding(state.program.stage, kind));
+		state.builder.AddAnnotation(spv::OpDecorate, state.program_constants_variable, spv::DecorationNonWritable);
+		state.program.bindings.descriptor_counts[static_cast<size_t>(kind)] = 1u;
+		state.program.bindings.descriptor_mask |= uint64_t {1} << static_cast<uint32_t>(kind);
+	}
+	auto& constants      = state.program.program_constants;
+	const auto [found, added] =
+	    state.program_constant_offsets.try_emplace(words, static_cast<uint32_t>(constants.size()));
+	if (added) constants.insert(constants.end(), words.begin(), words.end());
+	return found->second;
+}
+
+// LookupStep's arithmetic as shader instructions; the starts and values are words of ProgramConstants.
+struct StepOps {
+	EmitterState& state;
+	uint32_t      starts = 0; // word offsets
+	uint32_t      values = 0;
+
+	uint32_t Constant(uint32_t value) { return ConstantU32(state, value); }
+	uint32_t Add(uint32_t a, uint32_t b) { return Binary(state, spv::OpIAdd, TypeU32(state), a, b); }
+	uint32_t Sub(uint32_t a, uint32_t b) { return Binary(state, spv::OpISub, TypeU32(state), a, b); }
+	uint32_t LessEqual(uint32_t a, uint32_t b) { return Binary(state, spv::OpULessThanEqual, TypeBool(state), a, b); }
+	uint32_t And(uint32_t a, uint32_t b) { return Binary(state, spv::OpLogicalAnd, TypeBool(state), a, b); }
+	uint32_t Select(uint32_t condition, uint32_t a, uint32_t b) {
+		return Emitter::Select(state, TypeU32(state), condition, a, b);
+	}
+	uint32_t NotZero(uint32_t a) { return Binary(state, spv::OpINotEqual, TypeBool(state), a, Constant(0u)); }
+	uint32_t Load(uint32_t offset, uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                          state.program_constants_variable, Constant(0u), Add(Constant(offset), index));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	}
+	uint32_t Start(uint32_t index) { return Load(starts, index); }
+	uint32_t StepValue(uint32_t index) { return Load(values, index); }
+};
+
+// The value of the last step starting at or below the key (starts ascend), or initial below the first.
+uint32_t EmitStepTable(EmitterState& state, uint32_t key, const std::vector<uint32_t>& starts,
+                       const std::vector<uint32_t>& values, uint32_t initial) {
+	if (starts.empty()) return initial;
+	auto words = starts;
+	words.insert(words.end(), values.begin(), values.end());
+	const auto offset = ProgramConstantOffset(state, words);
+	StepOps ops {.state = state, .starts = offset, .values = offset + static_cast<uint32_t>(starts.size())};
+	return LookupStep(ops, key, static_cast<uint32_t>(starts.size()), initial);
+}
 
 uint32_t DmaskComponentIndex(uint32_t dmask, uint32_t component) {
 	uint32_t index = 0;
@@ -160,10 +229,20 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 		                      ? AddressF32(ctx, mem, address, first + index)
 		                      : ZeroF32(state);
 	}
+	if (count == 1u) return values[0];
+	// A heap slot is a cube or not at run time.
+	const auto heap_cube = components == 3u ? state.heap_cube : 0u;
+	const auto if_cube   = [&](uint32_t plain, uint32_t as_cube) {
+		return Select(state, TypeF32(state), heap_cube, as_cube, plain);
+	};
 	if (cube) {
 		values[0] = CubeAxis(state, values[0]);
 		values[1] = CubeAxis(state, values[1]);
 		if (count == 3u) values[2] = CubeLayer(state, values[2]);
+	} else if (heap_cube != 0u) {
+		values[0] = if_cube(values[0], CubeAxis(state, values[0]));
+		values[1] = if_cube(values[1], CubeAxis(state, values[1]));
+		values[2] = if_cube(values[2], CubeLayer(state, values[2]));
 	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, count), result,
@@ -190,6 +269,25 @@ uint32_t CoordU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, count),
 	                              result, std::span(values).first(count));
+	return result;
+}
+
+// A 2D-array fetch's layer, clamped to the view's last layer as a sample's is: a 2D texture under an array
+// instruction is specialized as a one-layer array (ResourceMaterialization), and the hardware reads its one layer
+// whatever the layer coordinate.
+static uint32_t ClampFetchLayer(EmitterState& state, uint32_t image, uint32_t coord) {
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto size = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 3), size, image, ConstantU32(state, 0));
+	const auto layers = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), layers, size, 2u);
+	const auto layer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), layer, coord, 2u);
+	const auto last    = Binary(state, spv::OpISub, TypeU32(state), layers, ConstantU32(state, 1));
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), clamped, GlslStd450(state), GLSLstd450UMin, layer, last);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeInsert, TypeU32Vector(state, 3), result, clamped, coord, 2u);
 	return result;
 }
 
@@ -386,12 +484,13 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto info = Format::GetFormatInfo(format);
 	if (IR::ReadsDepthBits(image)) return info;
 	const bool raw_signed = IR::RawSignedStorageFormat(image, format) != Prospero::BufferFormat::kInvalid;
-	EXIT_IF((Prospero::RemapTextureFormat(format) == format && !raw_signed) || info.component_count == 0u ||
-	        info.component_count > 4u);
+	const bool packed16   = IR::PackedStorageFormat(image, format) != Prospero::BufferFormat::kInvalid;
+	EXIT_IF((Prospero::RemapTextureFormat(format) == format && !raw_signed && !packed16) ||
+	        info.component_count == 0u || info.component_count > 4u);
 	EXIT_IF(!raw_signed && info.type != Format::ComponentType::Uscaled &&
 	        ((info.type != Format::ComponentType::Uint &&
 	          info.type != Format::ComponentType::Unorm) || !info.packed_bitfield ||
-	         info.byte_size != sizeof(uint32_t)));
+	         info.byte_size != (packed16 ? sizeof(uint16_t) : sizeof(uint32_t))));
 	return info;
 }
 
@@ -661,13 +760,89 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return texel;
 }
 
-template <typename Emit>
+struct NoImagePrelude {
+	void operator()() const {}
+};
+
+// `texel` says the result is a texel, which a candidate of another numeric class hands over as
+// raw bits. `prelude` runs once ahead of a guest heap image's numeric-class switch, after the
+// slot's level and cube flag are known, for what its classes would otherwise each compute.
+template <typename Emit, typename Prelude = NoImagePrelude>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
-                     const Emit& emit) {
+                     const Emit& emit, bool texel = true, const Prelude& prelude = {}) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
 	if (image.indirect_root != mem.resource) return emit(mem.resource, 0u);
+	if (image.form_slot != IR::ImageResource::NoFormSlot) {
+		// A form slot (ImageForms.h): the dispatch's form, from the shader data, picks the binding that holds its
+		// descriptor. A candidate of another numeric class hands over register bits (EmitImageResult).
+		const auto forms = EmitShaderDataDwordLoad(state, state.program.bindings.ImageFormDword());
+		const auto form  = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		                          Binary(state, spv::OpShiftRightLogical, TypeU32(state), forms,
+		                                 ConstantU32(state, IR::ImageFormBits * image.form_slot)),
+		                          ConstantU32(state, (1u << IR::ImageFormBits) - 1u));
+		prelude();
+		return EmitIndexSwitch(state, form, static_cast<uint32_t>(image.indirect_resources.size()), result_type,
+		                       [&](uint32_t ordinal) { return emit(image.indirect_resources[ordinal], 0u); });
+	}
+	if (image.guest_heap) {
+		// A guest heap image is sampled, never written (MaterializeHeapImage).
+		if constexpr (std::is_void_v<std::invoke_result_t<const Emit&, uint32_t, uint32_t>>) {
+			ctx.Fail(inst, "writes an image heap texture");
+		} else {
+			const auto* key_handle = inst.Arg(0).ResolveInstruction();
+			if (key_handle == nullptr || key_handle->NumArgs() == 0u || state.heap_info_variable == 0) {
+				ctx.Fail(inst, "has no image heap key");
+			}
+			// The key is the byte offset of the T# in the game's heap: 32 bytes a slot.
+			const auto key_slot = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+			                             ctx.Def(key_handle->Arg(0)), ConstantU32(state, 5u));
+			const auto in_heap  = Binary(state, spv::OpULessThan, TypeBool(state), key_slot,
+			                             ConstantU32(state, IR::ImageHeapSlots));
+			const auto pointer  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+			                          state.heap_info_variable, ConstantU32(state, 0),
+			                          Select(state, TypeU32(state), in_heap, key_slot, ConstantU32(state, 0u)));
+			const auto info = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), info, pointer);
+			const auto has = [&](uint32_t bits) {
+				return Binary(state, spv::OpINotEqual, TypeBool(state),
+				              Binary(state, spv::OpBitwiseAnd, TypeU32(state), info, ConstantU32(state, bits)),
+				              ConstantU32(state, 0u));
+			};
+			// A slot the host has not filled for this dimension reads slot 0, the null image.
+			const auto filled = Binary(state, spv::OpLogicalAnd, TypeBool(state), in_heap,
+			                           has(IR::ImageHeapFilled(image.dimension)));
+			const auto slot   = Select(state, TypeU32(state), filled, key_slot, ConstantU32(state, 0u));
+			const auto numeric =
+			    Select(state, TypeU32(state), filled,
+			           Binary(state, spv::OpBitwiseAnd, TypeU32(state), info, ConstantU32(state, 3u)),
+			           ConstantU32(state, 0u));
+			if (image.dimension == ImageDimension::Dim2DArray) {
+				state.heap_cube = Binary(state, spv::OpLogicalAnd, TypeBool(state), filled, has(IR::ImageHeapCube));
+			}
+			state.heap_level = Select(
+			    state, TypeU32(state), filled,
+			    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+			           Binary(state, spv::OpShiftRightLogical, TypeU32(state), info,
+			                  ConstantU32(state, IR::ImageHeapLevelShift)), ConstantU32(state, 15u)),
+			    ConstantU32(state, 0u));
+			prelude();
+			// One image a numeric class, in the order of the info dword's class bits.
+			const auto result = EmitIndexSwitch(
+			    state, numeric, static_cast<uint32_t>(image.indirect_resources.size()), result_type,
+			    [&](uint32_t ordinal) {
+				    const auto resource = image.indirect_resources[ordinal];
+				    const auto value    = emit(resource, slot);
+				    return !texel || state.program.info.images[resource].numeric_class == image.numeric_class
+				               ? value : Unary(state, spv::OpBitcast, result_type, value);
+			    });
+			state.heap_cube  = 0;
+			state.heap_level = 0;
+			return result;
+		}
+	}
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	const auto* source = image.source < state.program.descriptor_sources.size()
 	                         ? &state.program.descriptor_sources[image.source]
@@ -698,6 +873,24 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	}
 	const auto selected = EmitIndirectResourceIndex(
 	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+	// Grouped candidates (GroupIndirectImages): the mapping is the group and the rank in its array.
+	if (std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
+		    return state.program.info.images[resource].indirect_capacity != 0u;
+	    })) {
+		const auto rank = Binary(state, spv::OpBitwiseAnd, TypeU32(state), selected,
+		                         ConstantU32(state, (1u << IR::IndirectImageGroupShift) - 1u));
+		const auto EmitGroup = [&](uint32_t group) {
+			const auto  resource = image.indirect_resources[group];
+			const auto& member   = state.program.info.images[resource];
+			if (member.indirect_capacity == 0u) return emit(resource, 0u);
+			return emit(resource, Binary(state, spv::OpIAdd, TypeU32(state),
+			                             ConstantU32(state, member.descriptor_index), rank));
+		};
+		return EmitIndexSwitch(state,
+		                       Binary(state, spv::OpShiftRightLogical, TypeU32(state), selected,
+		                              ConstantU32(state, IR::IndirectImageGroupShift)),
+		                       static_cast<uint32_t>(image.indirect_resources.size()), result_type, EmitGroup);
+	}
 	const auto SameType = [&](uint32_t lhs, uint32_t rhs) {
 		const auto& first = state.program.info.images[lhs];
 		const auto& second = state.program.info.images[rhs];
@@ -725,8 +918,34 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	});
 	auto group_index = ConstantU32(state, 0u);
 	auto slot_bias = ConstantU32(state, image.descriptor_index);
+	// Each ordinal's group and slot bias are step functions of the ordinal. Past a few steps they are a binary
+	// search over constant tables (LookupStep): one compare and select per step costs the driver more than the
+	// rest of a shader (2464e975d88b7f15: ~1,900 steps each, 72 % of its compile time).
+	std::vector<uint32_t> group_starts, group_values, slot_starts, slot_values;
 	auto previous_bias = image.descriptor_index;
 	for (uint32_t ordinal = 1; ordinal < image.indirect_resources.size(); ++ordinal) {
+		const auto bias = state.program.info.images[image.indirect_resources[ordinal]].descriptor_index - ordinal;
+		if (ordinal_groups[ordinal] != ordinal_groups[ordinal - 1u]) {
+			group_starts.push_back(ordinal);
+			group_values.push_back(ordinal_groups[ordinal]);
+		}
+		if (dynamic_slot && bias != previous_bias) {
+			slot_starts.push_back(ordinal);
+			slot_values.push_back(bias);
+		}
+		previous_bias = bias;
+	}
+	// Pixel stage only: NVIDIA compiled the same tables slower than the chains in a vertex stage, as Private arrays
+	// (fc94abf5b9e0e8e4: VS tables + PS tables 2.4 s, VS chains + PS tables 1.2 s, chains in both 1.6 s). Compute is not
+	// measured yet.
+	const bool tables = state.program.stage == ShaderType::Pixel &&
+	                    std::max(group_starts.size(), slot_starts.size()) > MaxStepChain;
+	if (tables) {
+		group_index = EmitStepTable(state, selected, group_starts, group_values, group_index);
+		slot_bias   = EmitStepTable(state, selected, slot_starts, slot_values, slot_bias);
+	}
+	previous_bias = image.descriptor_index;
+	for (uint32_t ordinal = 1; !tables && ordinal < image.indirect_resources.size(); ++ordinal) {
 		const auto& candidate = state.program.info.images[image.indirect_resources[ordinal]];
 		const auto bias = candidate.descriptor_index - ordinal;
 		const bool select_group = ordinal_groups[ordinal] != ordinal_groups[ordinal - 1u];
@@ -752,8 +971,9 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	                             result_type, EmitGroup);
 }
 
-template <typename Emit>
-uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit) {
+template <typename Emit, typename Prelude = NoImagePrelude>
+uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit,
+                         const Prelude& prelude = {}) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images[mem.resource];
@@ -787,7 +1007,7 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	    [&](uint32_t resource, uint32_t array_index) {
 		    const auto native = emit(resource, array_index, native_type(resource));
 		    return mixed ? result_bits(resource, native) : native;
-	    });
+	    }, true, prelude);
 	return mixed ? value : result_bits(mem.resource, value);
 }
 
@@ -834,6 +1054,14 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 			if (found == samplers.end()) ctx.Fail(inst, "has no typed sampler variant");
 			index = static_cast<uint32_t>(found - samplers.begin());
 		}
+		if (samplers[index].guest_heap) {
+			const auto* handle = inst.Arg(1).ResolveInstruction();
+			if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource ||
+			    handle->NumArgs() == 0u)
+				ctx.Fail(inst, "has no sampler heap key");
+			sampler = {LoadHeapSampler(state, samplers[index], integer, ctx.Def(handle->Arg(0))), true};
+			return;
+		}
 		uint32_t array_index = 0;
 		const auto& candidates = samplers[index].indirect_resources;
 		if (!candidates.empty()) {
@@ -841,10 +1069,13 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 			if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource)
 				ctx.Fail(inst, "has invalid finite sampler key provenance");
 			auto selected = ctx.Def(handle->Arg(0));
-			if (samplers[index].indirect_root != IR::SamplerResource::NoIndirectSampler)
+			if (samplers[index].indirect_root != IR::SamplerResource::NoIndirectSampler) {
+				if (state.flattened_srt_variable == 0)
+					ctx.Fail(inst, "has no indirect sampler runtime mapping");
 				selected = EmitIndirectResourceIndex(state, selected,
 				    samplers[index].indirect_mapping_offset,
 				    samplers[index].indirect_search_iterations, 0u);
+			}
 			array_index = SamplerArrayIndex(state, selected, candidates);
 		}
 		sampler = {LoadSamplerDescriptor(state, index, array_index), array_index != 0u};
@@ -869,9 +1100,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		ctx.Define(inst, EmitImageAccess(ctx, inst, TypeU32Vector(state, 4),
-		    [&](uint32_t resource, uint32_t array_index) {
-			    return QueryDimensions(ctx, mem, *address, resource, array_index);
-		    }));
+		                                 [&](uint32_t resource, uint32_t array_index) {
+			                                 return QueryDimensions(ctx, mem, *address, resource,
+			                                                        array_index);
+		                                 }, false));
 		return;
 	}
 	if (image_info.needs_sampler &&
@@ -933,7 +1165,17 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				        const auto& dimension_info = ImageDimensionInfoFor(dimension);
 				        const auto descriptor = LoadImageDescriptor(state, resource, 0u, array_index);
 				        const auto fetched = state.builder.AllocateId();
-				        const auto coord = CoordU32(ctx, mem, *address, dimension);
+				        auto       coord = CoordU32(ctx, mem, *address, dimension);
+				        if (dimension == ImageDimension::Dim2DArray) coord = ClampFetchLayer(state, descriptor, coord);
+				        auto lod = LodU32(ctx, mem, *address, mem.image_dimension);
+				        if (state.heap_level != 0u) {
+					        // shortcut: a fetch below the first level the host holds reads that
+					        // level with the finer level's coordinates; scale them when a game does.
+					        lod = Select(state, TypeU32(state),
+					                     Binary(state, spv::OpUGreaterThan, TypeBool(state), lod, state.heap_level),
+					                     Binary(state, spv::OpISub, TypeU32(state), lod, state.heap_level),
+					                     ConstantU32(state, 0u));
+				        }
 				        if (dimension_info.multisampled != 0u) {
 					        state.builder.AddFunction(
 					            spv::OpImageFetch, result_type, fetched,
@@ -942,8 +1184,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				        } else {
 					        state.builder.AddFunction(
 					            spv::OpImageFetch, result_type, fetched,
-					            descriptor, coord, spv::ImageOperandsLodMask,
-					            LodU32(ctx, mem, *address, mem.image_dimension));
+					            descriptor, coord, spv::ImageOperandsLodMask, lod);
 				        }
 				        return fetched;
 			            });
@@ -1098,52 +1339,94 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "requires maintenance8 for a dynamic sample texel offset");
 		}
 		const auto samplers = LoadImageSamplers(ctx, inst);
-		const auto EmitSample = [&](uint32_t resource, uint32_t array_index, uint32_t result_type) {
-			const auto& candidate = state.program.info.images[resource];
-			const auto sampler = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
-			auto sample_operands = operands;
-			auto sample_operand_count = operand_count;
+		struct SampleInputs {
+			uint32_t                coord = 0;
+			std::array<uint32_t, 5> operands {};
+			size_t                  operand_count = 0;
+		};
+		const auto PrepareSample = [&](const IR::ImageResource& candidate) {
+			SampleInputs inputs {.operands = operands, .operand_count = operand_count};
+			if (state.heap_level != 0u && operand_count == 2u && operands[0] == spv::ImageOperandsLodMask) {
+				// An explicit level counts from the texture's level 0; the host's image starts later.
+				const auto level = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), level, state.heap_level);
+				const auto lod = Binary(state, spv::OpFSub, TypeF32(state), operands[1], level);
+				inputs.operands[1] = Select(state, TypeF32(state),
+				                            Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), lod, ZeroF32(state)),
+				                            lod, ZeroF32(state));
+			}
 			if (layout.offset != NoImageComponent) {
-				sample_operand_count = std::max(size_t{1}, sample_operand_count);
-				sample_operands[sample_operand_count++] = PackedOffset(
-				    ctx, offset_value, candidate.dimension, sample_operands[0]);
+				inputs.operand_count = std::max(size_t{1}, inputs.operand_count);
+				inputs.operands[inputs.operand_count++] = PackedOffset(
+				    ctx, offset_value, candidate.dimension, inputs.operands[0]);
 			}
 			// MinLod follows the offset in operand order.
 			if (min_lod != 0) {
 				state.builder.RequireCapability(spv::CapabilityMinLod);
-				sample_operand_count = std::max(size_t{1}, sample_operand_count);
-				sample_operands[0] |= spv::ImageOperandsMinLodMask;
-				sample_operands[sample_operand_count++] = min_lod;
+				inputs.operand_count = std::max(size_t{1}, inputs.operand_count);
+				inputs.operands[0] |= spv::ImageOperandsMinLodMask;
+				inputs.operands[inputs.operand_count++] = min_lod;
 			}
-			const auto coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube, RowCenter(state, candidate.dimension));
+			inputs.coord = CoordF32(ctx, mem, *address, layout.coord,
+			                        ImageDimensionInfoFor(candidate.dimension).coordinate_components,
+			                        candidate.cube, RowCenter(state, candidate.dimension));
+			return inputs;
+		};
+		// A guest heap image's classes share its dimension and cube flag, so its coordinates and
+		// operands are made once ahead of the class switch, not once a class: the driver
+		// compiled each copy (6637473fe2240da5: 17k of 365k words).
+		std::optional<SampleInputs> shared;
+		const auto PrepareShared = [&]() {
+			const bool same = std::ranges::all_of(image.indirect_resources, [&](uint32_t resource) {
+				const auto& candidate = state.program.info.images[resource];
+				return candidate.dimension == image.dimension && candidate.cube == image.cube;
+			});
+			if (same) shared = PrepareSample(image);
+		};
+		const auto EmitSample = [&](uint32_t resource, uint32_t array_index, uint32_t result_type) {
+			const auto& candidate = state.program.info.images[resource];
+			const auto sampler = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
+			const auto inputs = shared.has_value() ? *shared : PrepareSample(candidate);
 			const auto sampled = MakeSampledImage(state, resource, sampler.id, 0u, array_index,
 			                                      sampler.dynamic);
 			const auto sample = state.builder.AllocateId();
-			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
+			state.builder.AddFunction(opcode, result_type, sample, sampled, inputs.coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
-			                          std::span<const uint32_t>(sample_operands).first(sample_operand_count));
+			                          std::span<const uint32_t>(inputs.operands).first(inputs.operand_count));
 			return sample;
 		};
-		ctx.Define(inst, EmitImageResult(ctx, inst, EmitSample));
+		ctx.Define(inst, EmitImageResult(ctx, inst, EmitSample, PrepareShared));
 		return;
 	}
 	if (image_info.access == IR::ImageAccess::Atomic) {
 		const auto dimension = image.dimension;
 		const auto result_type = TypeId(state, inst.GetType());
 		const auto zero = image.atomic64 ? ConstantU64(state, 0) : ConstantU32(state, 0);
+		// A texel pointer outside the image is undefined, and robust image access does not
+		// cover it. The console drops such an access, as it drops a store.
+		const auto  coord = CoordU32(ctx, mem, *address, dimension);
+		const auto& info  = ImageDimensionInfoFor(dimension);
+		// Host components: a 1D image is a 2D image one texel high.
+		const auto components = info.coordinate_components + (info.one_dimensional ? 1u : 0u);
+		const auto size       = state.builder.AllocateId();
+		state.builder.RequireCapability(spv::CapabilityImageQuery);
+		state.builder.AddFunction(spv::OpImageQuerySize, ImageViewSizeType(state, dimension), size,
+		                          LoadImageDescriptor(state, mem.resource, 0u, 0u));
+		auto inside = Binary(state, spv::OpULessThan,
+		                     components == 1u ? TypeBool(state) : TypeBoolVector(state, components),
+		                     coord, size);
+		if (components != 1u) inside = Unary(state, spv::OpAll, TypeBool(state), inside);
+		const auto reached = Binary(state, spv::OpLogicalAnd, TypeBool(state),
+		                            ctx.Arg(inst, inst.NumArgs() - 1), inside);
 		ctx.Define(inst, EmitValueOrDefaultIfCondition(
-		                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
+		                     state, reached, result_type, zero, [&]() {
 			           const auto pointer      = state.builder.AllocateId();
 			           const auto pointer_type =
 			               state.builder.Type(spv::OpTypePointer, spv::StorageClassImage,
 			                                  image.atomic64 ? TypeU64(state) : TypeU32(state));
 			           state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
 			                                     ImageDescriptorPointer(state, mem.resource),
-			                                     CoordU32(ctx, mem, *address, dimension),
-			                                     ConstantU32(state, 0));
+			                                     coord, ConstantU32(state, 0));
 			           if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
 			               op == IR::ValueOpcode::ImageAtomicFMax32) {
 				           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,

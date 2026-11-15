@@ -70,6 +70,10 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 	}
 }
 
+bool IsRegister(const Decoder::Operand& operand, Decoder::OperandKind kind, uint32_t reg) {
+	return operand.kind == kind && operand.reg == reg;
+}
+
 bool IsScalarCode(const Decoder::Operand& operand, uint32_t code) {
 	uint32_t operand_code = 0;
 	return ScalarOperandCode(operand, operand_code) && operand_code == code;
@@ -1696,7 +1700,8 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uin
 
 std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
                                              uint32_t before, uint32_t code, uint32_t wave_size,
-                                             std::vector<uint32_t>& crossed_calls) {
+                                             std::vector<uint32_t>& crossed_calls,
+                                             const std::function<bool(uint32_t)>& writes) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
@@ -1719,7 +1724,7 @@ std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, co
 				crossed_calls.push_back(i);
 				continue;
 			}
-			if (MayWriteScalarRegister(inst, code, wave_size)) { index = i; break; }
+			if (writes(i)) { index = i; break; }
 		}
 		if (index != UINT32_MAX || block->id == graph.entry_block) {
 			if (definition && *definition != index) return std::nullopt;
@@ -1733,6 +1738,318 @@ std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, co
 	}
 	EXIT_IF(!definition);
 	return definition;
+}
+
+namespace {
+
+constexpr uint32_t M0Code   = 124u;
+constexpr uint32_t ExecCode = 126u;
+
+// The loops are wave32 code, where a vector instruction's scalar destination is one SGPR.
+bool WritesScalarCode32(const Instruction& inst, uint32_t code) {
+	const auto name = magic_enum::enum_name(inst.opcode);
+	if (code == ExecCode && (name.find("CMPX") != std::string_view::npos ||
+	                         name.find("SAVEEXEC") != std::string_view::npos)) {
+		return true;
+	}
+	switch (inst.family) {
+		case Decoder::Family::VOP1:
+		case Decoder::Family::VOP2:
+		case Decoder::Family::VOPC:
+		case Decoder::Family::VOP3:
+		case Decoder::Family::VOP3P: return IsScalarCode(inst.dst, code) || IsScalarCode(inst.dst2, code);
+		default: return InstructionWritesScalarCode(inst, code);
+	}
+}
+
+// Whether an instruction's scalar destination is written whole, without reading it first.
+bool OverwritesScalarDestination(const Instruction& inst) {
+	switch (inst.family) {
+		case Decoder::Family::VOP1:
+		case Decoder::Family::VOP2:
+		case Decoder::Family::VOPC:
+		case Decoder::Family::VOP3:
+		case Decoder::Family::VOP3P:
+		case Decoder::Family::SMEM: return true;
+		case Decoder::Family::SOP1:
+		case Decoder::Family::SOP2:
+			return inst.opcode != Opcode::S_CMOV_B64 && inst.opcode != Opcode::S_BITSET0_B32 &&
+			       inst.opcode != Opcode::S_BITSET1_B32 && inst.opcode != Opcode::S_BITSET0_B64 &&
+			       inst.opcode != Opcode::S_BITSET1_B64;
+		case Decoder::Family::SOPK: return inst.opcode == Opcode::S_MOVK_I32;
+		default: return false;
+	}
+}
+
+uint32_t ScalarSourceWidth(const Instruction& inst, const Decoder::Operand& source) {
+	switch (inst.family) {
+		case Decoder::Family::MUBUF:
+		case Decoder::Family::MTBUF: return &source == &inst.src1 ? 4u : 1u;
+		case Decoder::Family::MIMG: return &source == &inst.src1 ? 8u : 4u;
+		case Decoder::Family::SMEM: return &source == &inst.src0 ? 4u : 1u;
+		case Decoder::Family::SOP1:
+		case Decoder::Family::SOP2:
+		case Decoder::Family::SOPK:
+		case Decoder::Family::SOPC:
+		case Decoder::Family::SOPP:
+		case Decoder::Family::VOP1:
+		case Decoder::Family::VOP2:
+		case Decoder::Family::VOPC:
+		case Decoder::Family::VOP3:
+		case Decoder::Family::VOP3P:
+			// In wave32 lane masks are one SGPR; only 64-bit operations read pairs.
+			return magic_enum::enum_name(inst.opcode).find("64") != std::string_view::npos ? 2u : 1u;
+		default: return 8u;
+	}
+}
+
+uint32_t VectorDestinationWidth(const Instruction& inst) {
+	switch (inst.family) {
+		case Decoder::Family::VOP1:
+		case Decoder::Family::VOP2:
+		case Decoder::Family::VOPC:
+		case Decoder::Family::VOP3:
+		case Decoder::Family::VOP3P:
+			return magic_enum::enum_name(inst.opcode).find("64") != std::string_view::npos ? 2u : 1u;
+		case Decoder::Family::MUBUF:
+		case Decoder::Family::MTBUF: return std::max(inst.data_dwords, 1u);
+		default: return 8u;
+	}
+}
+
+// Conservative: memory descriptors read whole, a destination not written whole, and the instructions
+// the translator reads M0 for.
+bool MayReadScalarCode(const Instruction& inst, uint32_t code) {
+	uint32_t base = 0;
+	for (const auto* source: {&inst.src0, &inst.src1, &inst.src2, &inst.src3}) {
+		if (ScalarOperandCode(*source, base) && code >= base &&
+		    code < base + ScalarSourceWidth(inst, *source)) {
+			return true;
+		}
+	}
+	if (code == M0Code &&
+	    (inst.family == Decoder::Family::DS || inst.opcode == Opcode::V_MOVRELD_B32 ||
+	     inst.opcode == Opcode::S_SENDMSG ||
+	     (inst.opcode == Opcode::V_MOVRELS_B32 && inst.movrel_index_vgpr == UINT32_MAX))) {
+		return true;
+	}
+	return WritesScalarCode32(inst, code) && !OverwritesScalarDestination(inst);
+}
+
+bool WritesScalarCode(const Instruction& inst, uint32_t code) {
+	return !MayReadScalarCode(inst, code) && WritesScalarCode32(inst, code);
+}
+
+// Whether `code` is written before it is read on every path from instruction `from`.
+bool ScalarCodeDeadAt(const Decoder::Program& program, const Graph& graph, uint32_t from,
+                      uint32_t code) {
+	const auto found = std::ranges::find_if(graph.blocks, [from](const auto& block) {
+		return block.inst_begin <= from && from < block.inst_end;
+	});
+	if (found == graph.blocks.end()) return false;
+	std::vector<std::pair<uint32_t, uint32_t>> pending {{found->id, from}};
+	std::set<std::pair<uint32_t, uint32_t>>    visited;
+	while (!pending.empty()) {
+		const auto point = pending.back();
+		pending.pop_back();
+		if (!visited.insert(point).second) continue;
+		const auto& block   = graph.blocks[point.first];
+		bool        written = false;
+		for (uint32_t i = point.second; i < block.inst_end && !written; i++) {
+			const auto& inst = program.instructions[i];
+			if (MayReadScalarCode(inst, code)) return false;
+			written = WritesScalarCode(inst, code);
+		}
+		if (written) continue;
+		if (block.terminator.kind != TerminatorKind::Branch &&
+		    block.terminator.kind != TerminatorKind::ConditionalBranch &&
+		    block.terminator.kind != TerminatorKind::Return) {
+			return false;
+		}
+		for (const auto successor: block.successors) {
+			pending.emplace_back(successor, graph.blocks[successor].inst_begin);
+		}
+	}
+	return true;
+}
+
+struct WaterfallLoop {
+	uint32_t head      = 0; // v_readfirstlane_b32 sX, vI
+	uint32_t latch     = 0; // s_cbranch_scc1 head
+	uint32_t index     = 0; // vI
+	uint32_t lane      = 0; // sX
+	uint32_t remaining = 0; // sR
+	uint32_t index_zero_bits = 0; // vI's bits clear in every lane that runs the loop
+};
+
+// L: v_readfirstlane_b32 sX, vI; v_cmpx_eq_u32 exec_lo, sX, vI; s_mov_b32 m0, sX; [s_waitcnt];
+// v_movrels_b32 ...; s_andn2_b32 sR, sR, exec_lo; s_mov_b32 exec_lo, sR; s_cbranch_scc1 L
+std::optional<WaterfallLoop> MatchWaterfallLoop(const Decoder::Program& program, uint32_t head) {
+	const auto& insts = program.instructions;
+	const auto  at    = [&](uint32_t i) { return i < insts.size() ? &insts[i] : nullptr; };
+	const auto* read = at(head);
+	const auto* cmpx = at(head + 1u);
+	const auto* m0   = at(head + 2u);
+	if (read == nullptr || cmpx == nullptr || m0 == nullptr ||
+	    read->opcode != Opcode::V_READFIRSTLANE_B32 ||
+	    read->dst.kind != Decoder::OperandKind::Sgpr ||
+	    read->src0.kind != Decoder::OperandKind::Vgpr || read->src0.dpp || read->src0.sdwa_sel != 6u) {
+		return std::nullopt;
+	}
+	WaterfallLoop loop {.head = head, .index = read->src0.reg, .lane = read->dst.reg};
+	const auto is_lane = [&](const Decoder::Operand& op) {
+		return IsRegister(op, Decoder::OperandKind::Sgpr, loop.lane);
+	};
+	const auto is_index = [&](const Decoder::Operand& op) {
+		return IsRegister(op, Decoder::OperandKind::Vgpr, loop.index) && !op.dpp &&
+		       op.sdwa_sel == 6u && !op.negate && !op.absolute;
+	};
+	if (cmpx->opcode != Opcode::V_CMPX_EQ_U32 ||
+	    !((is_lane(cmpx->src0) && is_index(cmpx->src1)) ||
+	      (is_index(cmpx->src0) && is_lane(cmpx->src1))) ||
+	    m0->opcode != Opcode::S_MOV_B32 || m0->dst.kind != Decoder::OperandKind::M0 ||
+	    !is_lane(m0->src0)) {
+		return std::nullopt;
+	}
+	uint32_t i = head + 3u;
+	if (at(i) != nullptr && at(i)->opcode == Opcode::S_WAITCNT) i++;
+	const uint32_t first_movrel = i;
+	for (; at(i) != nullptr && at(i)->opcode == Opcode::V_MOVRELS_B32; i++) {
+		// The guest's index is M0, fixed for the iteration: no earlier v_movrels may change vI.
+		if (at(i + 1u) != nullptr && at(i + 1u)->opcode == Opcode::V_MOVRELS_B32 &&
+		    IsRegister(at(i)->dst, Decoder::OperandKind::Vgpr, loop.index)) {
+			return std::nullopt;
+		}
+	}
+	const auto* andn2  = at(i);
+	const auto* exec   = at(i + 1u);
+	const auto* branch = at(i + 2u);
+	if (i == first_movrel || andn2 == nullptr || exec == nullptr || branch == nullptr ||
+	    andn2->opcode != Opcode::S_ANDN2_B32 || andn2->dst.kind != Decoder::OperandKind::Sgpr ||
+	    andn2->dst.reg == loop.lane ||
+	    !IsRegister(andn2->src0, Decoder::OperandKind::Sgpr, andn2->dst.reg) ||
+	    andn2->src1.kind != Decoder::OperandKind::ExecLo || exec->opcode != Opcode::S_MOV_B32 ||
+	    exec->dst.kind != Decoder::OperandKind::ExecLo ||
+	    !IsRegister(exec->src0, Decoder::OperandKind::Sgpr, andn2->dst.reg) ||
+	    branch->opcode != Opcode::S_CBRANCH_SCC1 || branch->branch_target != read->pc) {
+		return std::nullopt;
+	}
+	loop.remaining = andn2->dst.reg;
+	loop.latch     = i + 2u;
+	return loop;
+}
+
+// sR equals EXEC where the loop is entered. Over the straight-line code that falls into it, each
+// scalar register holds a value: s_mov_b32 copies it, any other write makes a new one. Also finds
+// the low bits of vI that are clear: written by v_lshlrev_b32 vI, k, x under the same EXEC.
+bool RemainingIsExecOnEntry(const Decoder::Program&            program,
+                            const std::map<uint32_t, uint32_t>& targets, WaterfallLoop& loop) {
+	const auto& insts = program.instructions;
+	uint32_t    start = loop.head;
+	while (start > 0 && (start == loop.head || !targets.contains(insts[start].pc))) {
+		const auto opcode = insts[start - 1u].opcode;
+		if (opcode == Opcode::S_BRANCH || opcode == Opcode::S_ENDPGM ||
+		    opcode == Opcode::S_SETPC_B64 || opcode == Opcode::S_SWAPPC_B64) {
+			break;
+		}
+		start--;
+	}
+	std::map<uint32_t, uint32_t> value;
+	uint32_t                     next = 0;
+	const auto get = [&](uint32_t code) { return value.try_emplace(code, next++).first->second; };
+	uint32_t   index_exec = UINT32_MAX;
+	for (uint32_t i = start; i < loop.head; i++) {
+		const auto& inst = insts[i];
+		// v_movreld writes any VGPR.
+		if ((inst.dst.kind == Decoder::OperandKind::Vgpr && loop.index >= inst.dst.reg &&
+		     loop.index < inst.dst.reg + VectorDestinationWidth(inst)) ||
+		    inst.opcode == Opcode::V_MOVRELD_B32) {
+			const bool shift = inst.opcode == Opcode::V_LSHLREV_B32 &&
+			                   inst.dst.reg == loop.index &&
+			                   inst.dst.sdwa_sel == 6u && !inst.dst.clamp && inst.dst.omod == 0u &&
+			                   !inst.src0.dpp &&
+			                   (inst.src0.kind == Decoder::OperandKind::IntegerInlineConstant ||
+			                    inst.src0.kind == Decoder::OperandKind::LiteralConstant);
+			loop.index_zero_bits = shift ? (1u << (inst.src0.value & 31u)) - 1u : 0u;
+			index_exec           = get(ExecCode);
+		}
+		uint32_t    dst = 0, src = 0;
+		const bool  copy = inst.opcode == Opcode::S_MOV_B32 && ScalarOperandCode(inst.dst, dst) &&
+		                  ScalarOperandCode(inst.src0, src);
+		const auto copied = copy ? get(src) : 0u;
+		for (auto& [code, known]: value) {
+			if (WritesScalarCode32(inst, code)) known = next++;
+		}
+		if (copy) value[dst] = copied;
+	}
+	if (index_exec != get(ExecCode)) loop.index_zero_bits = 0;
+	return get(loop.remaining) == get(ExecCode);
+}
+
+Instruction Nop(const Instruction& inst) {
+	Instruction nop;
+	nop.pc         = inst.pc;
+	nop.word_count = inst.word_count;
+	nop.family     = Decoder::Family::SOPP;
+	nop.opcode     = Opcode::S_NOP;
+	return nop;
+}
+
+} // namespace
+
+uint32_t CollapseWaterfallLoops(Decoder::Program& program) {
+	if (program.has_swap_pc) return 0;
+	std::map<uint32_t, uint32_t> targets;
+	for (const auto& inst: program.instructions) {
+		if (ConditionForOpcode(inst.opcode) != BranchCondition::Unknown) targets[inst.branch_target]++;
+	}
+	std::vector<WaterfallLoop> loops;
+	for (uint32_t i = 0; i < program.instructions.size(); i++) {
+		// Entered only by falling into it: its own back edge is the one branch to it.
+		if (auto loop = MatchWaterfallLoop(program, i);
+		    loop && targets.find(program.instructions[i].pc)->second == 1u &&
+		    RemainingIsExecOnEntry(program, targets, *loop)) {
+			loops.push_back(*loop);
+		}
+	}
+	if (loops.empty()) return 0;
+	const auto original = program.instructions;
+	const auto rewrite  = [&](const WaterfallLoop& loop) {
+		auto& insts = program.instructions;
+		for (const auto i: {loop.head, loop.head + 1u, loop.head + 2u, loop.latch}) {
+			insts[i] = Nop(insts[i]);
+		}
+		for (uint32_t i = loop.head + 3u; i < loop.latch; i++) {
+			if (insts[i].opcode != Opcode::V_MOVRELS_B32) continue;
+			insts[i].movrel_index_vgpr      = loop.index;
+			insts[i].movrel_index_zero_bits = loop.index_zero_bits;
+		}
+	};
+	const auto restore = [&](const WaterfallLoop& loop) {
+		std::copy(original.begin() + loop.head, original.begin() + loop.latch + 1u,
+		          program.instructions.begin() + loop.head);
+	};
+	std::ranges::for_each(loops, rewrite);
+	// The collapsed loops no longer write sX and M0; they must be dead after each. Restoring a
+	// loop only adds writes before its own reads, so the others are checked again until none fails.
+	for (bool changed = true; changed;) {
+		changed          = false;
+		const auto graph = BuildGraph(program);
+		if (graph.unsupported || graph.irreducible) {
+			std::ranges::for_each(loops, restore);
+			return 0;
+		}
+		std::erase_if(loops, [&](const WaterfallLoop& loop) {
+			if (ScalarCodeDeadAt(program, graph, loop.latch, M0Code) &&
+			    ScalarCodeDeadAt(program, graph, loop.latch, loop.lane)) {
+				return false;
+			}
+			restore(loop);
+			changed = true;
+			return true;
+		});
+	}
+	return static_cast<uint32_t>(loops.size());
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

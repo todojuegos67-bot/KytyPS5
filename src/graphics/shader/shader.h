@@ -20,12 +20,14 @@ struct VertexShaderInfo;
 struct PixelShaderInfo;
 struct ComputeShaderInfo;
 struct ShaderRegisters;
+class Context;
 } // namespace HW
 
 enum class ShaderType {
 	Unknown,
 	Vertex,
 	Pixel,
+	Fetch,
 	Compute,
 	Mesh,
 	Local,
@@ -33,14 +35,16 @@ enum class ShaderType {
 	TessellationEvaluation
 };
 
-struct ShaderModule;
+namespace ShaderRecompiler::IR {
+struct CompiledShaderInfo;
+} // namespace ShaderRecompiler::IR
 
 struct ShaderStageRuntime {
-	const ShaderModule*                           module    = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
+	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
+	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
-		return module != nullptr && resources != nullptr;
+		return program != nullptr && resources != nullptr;
 	}
 };
 
@@ -220,6 +224,7 @@ struct ShaderPixelInputInfo {
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
+	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
@@ -342,6 +347,14 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// True when the game has created a shader at addr (PrepareProgram exits for any other).
+[[nodiscard]] bool ShaderIsMapped(uint64_t addr);
+// Its code's hash, 0 for none.
+[[nodiscard]] uint64_t ShaderMappedHash(uint64_t addr);
+// The code size in bytes of the shader the game created at exactly addr; 0 when none starts there.
+[[nodiscard]] uint32_t ShaderMappedCodeSize(uint64_t addr);
+// The draw's vertex stage runs as a mesh shader (merged or native NGG, as ShaderGetInputInfoVS).
+[[nodiscard]] bool ShaderVertexIsMesh(const HW::Context& context, const HW::VertexShaderInfo& regs);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

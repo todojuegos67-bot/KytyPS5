@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <bit>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
@@ -157,12 +159,35 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 void EmitMemoryBindings(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
-	state.memory_byte_sizes.resize(count);
+	state.memory_byte_lengths.resize(count);
+	state.memory_track_pointers.resize(count);
+	for (const auto& buffer: state.program.info.buffers) {
+		if (!buffer.tracked || buffer.descriptor_index >= count || !state.program.bindings.write_tracking) continue;
+		const auto dword = state.program.bindings.TrackDword() + 2u * buffer.descriptor_index;
+		const auto low   = Unary(state, spv::OpUConvert, TypeU64(state), EmitShaderDataDwordLoad(state, dword));
+		const auto high  = Unary(state, spv::OpUConvert, TypeU64(state), EmitShaderDataDwordLoad(state, dword + 1u));
+		state.memory_track_pointers[buffer.descriptor_index] = Binary(
+		    state, spv::OpBitwiseOr, TypeU64(state), low,
+		    Binary(state, spv::OpShiftLeftLogical, TypeU64(state), high, ConstantU32(state, 32u)));
+	}
 	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
 		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
 		for (const auto candidate: state.program.info.buffers[resource].indirect_resources) {
 			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
+		}
+	}
+	// the table variant's base address of each static slot.
+	state.memory_base_addresses.assign(count, 0u);
+	if (state.profile.buffer_table) {
+		for (uint32_t slot = 0; slot < count; ++slot) {
+			if (dynamic_offsets[slot]) continue;
+			const auto dword = state.program.bindings.TableDword() + 2u * slot;
+			const auto low   = Unary(state, spv::OpUConvert, TypeU64(state), EmitShaderDataDwordLoad(state, dword));
+			const auto high  = Unary(state, spv::OpUConvert, TypeU64(state), EmitShaderDataDwordLoad(state, dword + 1u));
+			state.memory_base_addresses[slot] = Binary(
+			    state, spv::OpBitwiseOr, TypeU64(state), low,
+			    Binary(state, spv::OpShiftLeftLogical, TypeU64(state), high, ConstantU32(state, 32u)));
 		}
 	}
 	for (uint32_t i = 0; i < count; i += 4u) {
@@ -175,8 +200,8 @@ void EmitMemoryBindings(EmitterState& state) {
 			if (dynamic_offsets[i + lane]) continue;
 			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
-			state.memory_byte_sizes[i + lane] =
-			    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySizeDword() + i + lane);
+			state.memory_byte_lengths[i + lane] =
+			    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i + lane);
 		}
 	}
 }
@@ -193,13 +218,20 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	if (const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		return workgroup->lds_size_dwords;
 	}
+	// What the shader's accesses can reach (a wave's ds_*_addtid spill slots); where they gave no bound
+	// (8192, ShaderInfoCollection's MaxLdsDwords), what the stage can address.
+	auto dwords = state.program.info.function_lds_dwords;
+	if (dwords < 8192u) {
+		return std::max(dwords, 1u);
+	}
 	if (state.program.stage == ShaderType::Pixel) {
-		return std::max(state.input_info.pixel->lds_size_dwords, 1u);
+		dwords = std::min(dwords, std::max(state.input_info.pixel->lds_size_dwords, 1u));
+	} else if (state.program.stage == ShaderType::Vertex) {
+		dwords = std::min(dwords, std::max(state.input_info.vertex->lds_size_dwords, 1u));
+	} else {
+		dwords = std::min(dwords, FUNCTION_LDS_DWORDS);
 	}
-	if (state.program.stage == ShaderType::Vertex) {
-		return std::max(state.input_info.vertex->lds_size_dwords, 1u);
-	}
-	return FUNCTION_LDS_DWORDS;
+	return std::max(dwords, 1u);
 }
 
 void EnsureLdsStorage(EmitterState& state) {
@@ -237,11 +269,12 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          BufferDefinition& buffer,
                                                          uint32_t array_index) {
-	if (buffer.variable == 0) {
+	const bool table = state.profile.buffer_table;
+	if (buffer.variable == 0 && !table) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
 	}
-	if (buffer.pointer_type == 0) {
+	if (buffer.pointer_type == 0 && !table) {
 		buffer.pointer_type = TypePointer(state, spv::StorageClassStorageBuffer, buffer.type);
 	}
 	const bool non_uniform = array_index != 0u;
@@ -252,37 +285,99 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	                             .non_uniform      = non_uniform,
 	                             .memory_access    = mem.coherent ? spv::MemoryAccessVolatileMask
 	                                                              : spv::MemoryAccessMaskNone};
-	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
-	                          buffer.variable, array_index);
+	access.table = table;
+	if (table && non_uniform) {
+		// a dynamic slot's base address, two dwords at the table's slot.
+		const auto first = EmitAddU32(
+		    state,
+		    ConstantU32(state, state.program.bindings.TableDword() +
+		                           (state.program.bindings.UsesPushData() ? state.program.bindings.push_data_start_dword : 0u)),
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), array_index, ConstantU32(state, 1)));
+		const auto low  = Unary(state, spv::OpUConvert, TypeU64(state), EmitShaderDataDwordLoadAt(state, first));
+		const auto high = Unary(state, spv::OpUConvert, TypeU64(state),
+		                        EmitShaderDataDwordLoadAt(state, EmitAddU32(state, first, ConstantU32(state, 1))));
+		access.object_pointer = Binary(state, spv::OpBitwiseOr, TypeU64(state), low,
+		                               Binary(state, spv::OpShiftLeftLogical, TypeU64(state), high, ConstantU32(state, 32u)));
+	} else if (table) {
+		EXIT_IF(static_index >= state.memory_base_addresses.size() || state.memory_base_addresses[static_index] == 0u);
+		access.object_pointer = state.memory_base_addresses[static_index];
+	} else {
+		access.object_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
+		                          buffer.variable, array_index);
+	}
 	if (non_uniform) {
-		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
-		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
-		state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexing);
-		state.builder.AddAnnotation(spv::OpDecorate, access.object_pointer, spv::DecorationNonUniform);
-		const auto& bindings   = state.program.bindings;
-		const auto  data_start = bindings.UsesPushData() ? bindings.push_data_start_dword : 0u;
+		if (!table) {
+			state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+			state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+			state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexing);
+			state.builder.AddAnnotation(spv::OpDecorate, access.object_pointer, spv::DecorationNonUniform);
+		}
+		const auto offsets_start = state.program.bindings.memory_offset_dword +
+		    (state.program.bindings.UsesPushData() ? state.program.bindings.push_data_start_dword : 0u);
 		const auto word = EmitShaderDataDwordLoadAt(state, EmitAddU32(
-		    state, ConstantU32(state, bindings.memory_offset_dword + data_start),
+		    state, ConstantU32(state, offsets_start),
 		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))));
 		const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), array_index, ConstantU32(state, 3)),
 		    ConstantU32(state, 3));
 		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 		    state, word, shift, ConstantU32(state, 8));
-		access.length = EmitShaderDataDwordLoadAt(state, EmitAddU32(
-		    state, ConstantU32(state, bindings.MemorySizeDword() + data_start), array_index));
 	} else {
 		access.byte_offset = state.memory_byte_offsets[static_index];
-		access.length      = state.memory_byte_sizes[static_index];
 	}
-	// storage_buffers[i] views the binding as 1 << i byte elements.
-	const auto shift = static_cast<uint32_t>(&buffer - state.storage_buffers.data());
-	if (shift != 0u) {
-		access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.length,
-		                       ConstantU32(state, shift));
+	// The bound range in bytes from the shader data (loaded at entry for a static buffer, as its
+	// byte offset is), in elements of this view: storage_buffers[0..3] are the 8-, 16-, 32- and
+	// 64-bit views.
+	const auto range = non_uniform
+	                       ? EmitShaderDataDwordLoadAt(state, EmitAddU32(state,
+	                             ConstantU32(state, state.program.bindings.BufferLengthDword() +
+	                                                    (state.program.bindings.UsesPushData()
+	                                                         ? state.program.bindings.push_data_start_dword
+	                                                         : 0u)),
+	                             array_index))
+	                       : state.memory_byte_lengths[static_index];
+	const auto element_shift = static_cast<uint32_t>(&buffer - state.storage_buffers.data());
+	EXIT_IF(element_shift >= state.storage_buffers.size());
+	access.length = element_shift == 0u ? range
+	                                    : Binary(state, spv::OpShiftRightLogical, TypeU32(state), range,
+	                                             ConstantU32(state, element_shift));
+	if (!non_uniform && state.program.info.buffers.at(mem.resource).tracked &&
+	    static_index < state.memory_track_pointers.size()) {
+		access.track_pointer = state.memory_track_pointers[static_index];
 	}
 	return access;
+}
+
+// The write bitmap of a tracked buffer (BufferResource::tracked) has a bit for each 4 KiB of the bound range;
+// its address comes with the dispatch (0: not tracked this time). A bit already set costs a load, not an atomic.
+void RecordTrackedWrite(EmitterState& state, const MemoryResourceAccess& resource, uint32_t index) {
+	if (resource.track_pointer == 0u) return;
+	const auto shift = 12u - static_cast<uint32_t>(std::countr_zero(resource.element_bits / 8u));
+	const auto page  = Binary(state, spv::OpShiftRightLogical, TypeU32(state), index, ConstantU32(state, shift));
+	const auto bit   = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	const auto enabled =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), resource.track_pointer, ConstantU64(state, 0));
+	EmitIfCondition(state, enabled, [&]() {
+		const auto byte    = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                            Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5)),
+		                            ConstantU32(state, 2));
+		const auto address = Binary(state, spv::OpIAdd, TypeU64(state), resource.track_pointer,
+		                            Unary(state, spv::OpUConvert, TypeU64(state), byte));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+		const auto word = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), word, pointer, spv::MemoryAccessAlignedMask,
+		                          static_cast<uint32_t>(sizeof(uint32_t)));
+		const auto unset = Binary(state, spv::OpIEqual, TypeBool(state),
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), word, bit), ConstantU32(state, 0));
+		EmitIfCondition(state, unset, [&]() {
+			const auto old = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), old, pointer, ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+		});
+	});
 }
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
@@ -341,16 +436,6 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 	return in_bounds;
 }
 
-uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
-                                    uint32_t index) {
-	// The descriptor range ends where access.length does.
-	if (state.profile.robust_buffer_access && (access.kind == IR::ResourceKind::Buffer ||
-	                                           access.kind == IR::ResourceKind::ScalarBuffer)) {
-		return ConstantBool(state, true);
-	}
-	return EmitMemoryElementInBounds(state, access, index);
-}
-
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
@@ -378,6 +463,35 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type) {
+	if (access.table) {
+		// the base address plus the element's bytes, by address. The view is the one
+		// whose descriptor pointer type was asked for: views 0-3 are 8-, 16-, 32- and 64-bit.
+		uint32_t alias = 0;
+		while (alias < state.storage_buffers.size() && state.storage_buffers[alias].element_pointer_type != pointer_type) ++alias;
+		EXIT_IF(alias == state.storage_buffers.size());
+		const auto element = state.storage_buffers[alias].element_type;
+		if (state.table_element_pointer[alias] == 0u) {
+			const auto block = state.program.info.coherent_buffers
+			                       ? state.builder.DecoratedType(
+			                             spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+			                                                 {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+			                                                 {spv::OpDecorate, {spv::DecorationBlock}}}, element)
+			                       : state.builder.DecoratedType(
+			                             spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+			                                                 {spv::OpDecorate, {spv::DecorationBlock}}}, element);
+			state.table_block_pointer[alias]   = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block);
+			state.table_element_pointer[alias] = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, element);
+		}
+		const auto bytes   = Binary(state, spv::OpShiftLeftLogical, TypeU64(state),
+		                          Unary(state, spv::OpUConvert, TypeU64(state), index), ConstantU32(state, alias));
+		const auto address = Binary(state, spv::OpIAdd, TypeU64(state), access.object_pointer, bytes);
+		const auto block_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, state.table_block_pointer[alias], block_pointer, address);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, state.table_element_pointer[alias], pointer, block_pointer,
+		                          ConstantU32(state, 0));
+		return pointer;
+	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                          ConstantU32(state, 0), index);

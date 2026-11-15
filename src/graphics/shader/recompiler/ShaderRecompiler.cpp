@@ -21,13 +21,20 @@
 #include <array>
 #include <chrono>
 #include <fmt/format.h>
+#include <functional>
 #include <map>
+#include <set>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
+
+const char* GetDumpLabel(const CompileOptions& options) {
+	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
+}
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
@@ -39,17 +46,30 @@ std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	return dump;
 }
 
+const char* StageName(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Compute: return "CS";
+		case ShaderType::Vertex: return "VS";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "TES";
+		case ShaderType::Mesh: return "MS";
+		case ShaderType::Pixel: return "PS";
+		default: return "unknown";
+	}
+}
+
 void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
 	const auto* block        = cfg.FindBlock(cfg.failure_block);
 	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
 	const auto  predecessors = block != nullptr ? block->predecessors.size() : 0u;
 	const auto  successors   = block != nullptr ? block->successors.size() : 0u;
-	LOGF("ShaderRecompiler %s CFG dispatcher fallback: hash=0x%016" PRIx64
+	LOGF("%s CFG dispatcher fallback: stage=%s hash=0x%016" PRIx64
 	     " phase=%s failure=%s block=%" PRIu32 " pc=0x%08" PRIx32 "..0x%08" PRIx32 " preds=%" PRIu64
 	     " succs=%" PRIu64 " blocks=%" PRIu64 " loops=%" PRIu64 " back_edges=%" PRIu64
 	     " reason=%s\n",
-	     StageName(options.stage), options.shader_hash, phase,
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase,
 	     CFG::FailureKindToString(cfg.failure_kind).c_str(), cfg.failure_block, start, end,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
@@ -465,19 +485,6 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
-const char* StageName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Compute: return "CS";
-		case ShaderType::Vertex: return "VS";
-		case ShaderType::Local: return "LS";
-		case ShaderType::TessellationControl: return "HS";
-		case ShaderType::TessellationEvaluation: return "TES";
-		case ShaderType::Mesh: return "MS";
-		case ShaderType::Pixel: return "PS";
-		default: return "unknown";
-	}
-}
-
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
 	ShaderSource source;
@@ -504,8 +511,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return TranslateProgram(source.decoded, options);
 }
 
-TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
-	EXIT_IF(decoded.instructions.empty());
+TranslateResult TranslateProgram(const Decoder::Program& source, const CompileOptions& options) {
+	EXIT_IF(source.instructions.empty());
+	// The loops are wave32 code (s_andn2_b32 on exec_lo); a copy only for a program that has them.
+	Decoder::Program collapsed;
+	uint32_t         waterfalls = 0;
+	if (options.wave_size == 32u && std::ranges::any_of(source.instructions, [](const auto& inst) {
+		    return inst.opcode == Decoder::Opcode::V_MOVRELS_B32;
+	    })) {
+		collapsed  = source;
+		waterfalls = CFG::CollapseWaterfallLoops(collapsed);
+		LOGF("%s waterfall loops collapsed: %" PRIu32 "\n", GetDumpLabel(options), waterfalls);
+	}
+	const auto& decoded = waterfalls != 0 ? collapsed : source;
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
 			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
@@ -513,7 +531,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 
-	const auto* stage        = StageName(options.stage);
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms = [&compile_begin]() {
 		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -523,25 +540,27 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
-		LOGF("ShaderRecompiler %s decoded RDNA2:\n%s", stage, decoded_dump.c_str());
+		if (options.early_dump) {
+			LOGF("%s decoded RDNA2 (early):\n%s", GetDumpLabel(options), decoded_dump.c_str());
+		}
 	}
 
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG BuildGraph\n", stage,
-	     options.shader_hash);
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+	     StageName(options.stage), options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
 	CFG::Graph structured_cfg;
 	auto* selected_cfg = &native_cfg;
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-	     stage, options.shader_hash,
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
 	if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
-		LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG Structurize\n", stage,
-		     options.shader_hash);
+		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		structured_cfg = CFG::Structurize(native_cfg);
 		if (structured_cfg.unsupported) {
 			native_cfg.unsupported = true;
@@ -551,12 +570,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			LogDispatcherFallback(options, native_cfg, "structurize");
 		} else {
 			selected_cfg = &structured_cfg;
-			LOGF("ShaderRecompiler %s structured CFG success: blocks=%" PRIu64 "\n", stage,
+			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(selected_cfg->blocks.size()));
 		}
-		LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-		     stage, options.shader_hash,
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 		     static_cast<uint64_t>(selected_cfg->blocks.size()),
 		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
 	}
@@ -569,7 +588,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		    decoded, *options.input_info.vertex, options.user_data_base,
 		    static_cast<uint32_t>(options.user_data.size()), options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
-			LOGF("ShaderRecompiler %s embedded vertex fetch plan: detected=%" PRIu64 "\n", stage,
+			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(embedded_fetch.loads.size()));
 		}
 	}
@@ -582,12 +601,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
-	     options.shader_hash);
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
-	     stage, options.shader_hash,
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
 	const auto simplify = [&ir] {
@@ -598,9 +617,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	simplify();
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
-		LOGF("ShaderRecompiler %s read-lane elimination: reads=%" PRIu32
-		     " reductions=%" PRIu32 "\n",
-		     stage, read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
+		LOGF("%s read-lane elimination: reads=%" PRIu32 " reductions=%" PRIu32 "\n",
+		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
@@ -614,8 +632,10 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	std::string cfg_dump;
 	if (options.dump_ir) {
 		cfg_dump = CFG::GraphToString(cfg);
-		LOGF("ShaderRecompiler %s native IR before resource tracking:\n%s", stage,
-		     MakeIrDump(cfg_dump, ir).c_str());
+		if (options.early_dump) {
+			LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+			     MakeIrDump(cfg_dump, ir).c_str());
+		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
 	TranslateResult result;
@@ -627,68 +647,195 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	return result;
 }
 
+// Why a wave64 compute program on 32-wide host subgroups keeps its halves, or nullptr: it can then
+// run one guest lane per invocation, its wave over two full subgroups, and each operation that
+// needs the whole wave exchanges the two subgroups' parts through shared memory between two
+// workgroup barriers. That is exact where every such exchange runs in workgroup-uniform control
+// flow: a workgroup of one wave, no LDS or GDS (a wave's lanes would no longer run in lockstep),
+// cross-lane operations only of the kinds the emitter exchanges, and every branch condition a guest
+// vote or scalar test or logic over them, so that both subgroups take the same branches.
+// BranchPerInvocation keeps every exchange out of the regions it lets diverge (RegionProblem:
+// cross-lane, vote, barrier and side effect). shadPS4 runs wave64 on wave32 hosts the same way
+// (lower_wave64_pass.cpp, PRs #4995 and #5116).
+static const char* WaveSplitProblem(const IR::Program& ir, const CompileOptions& options) {
+	const auto* workgroup = ShaderWorkgroupInput(ir.stage, options.input_info);
+	if (ir.stage != ShaderType::Compute || workgroup == nullptr || ir.wave_size != 64u ||
+	    workgroup->host_subgroup_size != 32u) {
+		return "not a wave64 compute program on 32-wide subgroups";
+	}
+	if (options.profile == nullptr || !options.profile->wave64_split) {
+		return "device";
+	}
+	const auto threads = uint64_t {std::max(workgroup->threads_num[0], 1u)} *
+	                     std::max(workgroup->threads_num[1], 1u) * std::max(workgroup->threads_num[2], 1u);
+	if (threads > 64u) {
+		return "workgroup of several waves";
+	}
+	if (ir.dispatcher_fallback) {
+		return "dispatcher";
+	}
+	// U1 values both subgroups hold alike once the emitter exchanges the conditions.
+	std::unordered_set<const IR::Inst*> uniform;
+	std::function<bool(IR::Value)>      is_uniform = [&](IR::Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			return true;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return false;
+		}
+		if (uniform.contains(inst)) {
+			return true;
+		}
+		switch (inst->GetOpcode()) {
+			case IR::ValueOpcode::ConditionRef: break;
+			case IR::ValueOpcode::LogicalAnd:
+			case IR::ValueOpcode::LogicalOr:
+			case IR::ValueOpcode::LogicalXor:
+			case IR::ValueOpcode::LogicalNot:
+			case IR::ValueOpcode::SelectU1:
+			case IR::ValueOpcode::Phi:
+				if (inst->GetType() != IR::Type::U1) {
+					return false;
+				}
+				uniform.insert(inst); // a phi may reach itself
+				for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+					if (!is_uniform(inst->Arg(arg))) {
+						uniform.erase(inst);
+						return false;
+					}
+				}
+				return true;
+			default: return false;
+		}
+		uniform.insert(inst);
+		return true;
+	};
+	for (const auto* block: ir.blocks) {
+		if (!block->indirect_target.IsEmpty()) {
+			return "indirect branch";
+		}
+		if (!block->condition.IsEmpty() && !is_uniform(block->condition)) {
+			return "branch condition";
+		}
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				// Exchanged by the emitter.
+				case IR::ValueOpcode::ConditionRef:
+				case IR::ValueOpcode::Ballot:
+				case IR::ValueOpcode::ReadFirstLane:
+				case IR::ValueOpcode::ReadLane:
+				case IR::ValueOpcode::SubgroupReduceU32:
+				case IR::ValueOpcode::LaneReduceU32:
+				// A lane's own: its lane number, a workgroup rendezvous.
+				case IR::ValueOpcode::LaneId:
+				case IR::ValueOpcode::StoreCompletion:
+				case IR::ValueOpcode::Barrier: break;
+				case IR::ValueOpcode::WriteLane:
+				case IR::ValueOpcode::Permlane16U32:
+				case IR::ValueOpcode::PermuteU32:
+				case IR::ValueOpcode::BpermuteU32:
+				case IR::ValueOpcode::SwizzleU32:
+				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::DppUpdateU32:
+				case IR::ValueOpcode::WqmU64:
+				case IR::ValueOpcode::ImageQueryLod: return "cross-lane operation";
+				case IR::ValueOpcode::DataAppend:
+				case IR::ValueOpcode::DataConsume: return "GDS";
+				// Per invocation, so the two subgroups may read different values.
+				case IR::ValueOpcode::ReadRealtimeClock: return "clock";
+				case IR::ValueOpcode::GetExecLo:
+				case IR::ValueOpcode::GetExecHi:
+				case IR::ValueOpcode::SetExecLo:
+				case IR::ValueOpcode::SetExecHi:
+				case IR::ValueOpcode::GetVccLo:
+				case IR::ValueOpcode::GetVccHi:
+				case IR::ValueOpcode::SetVccLo:
+				case IR::ValueOpcode::SetVccHi:
+				case IR::ValueOpcode::GetThreadBitScalarRegister:
+				case IR::ValueOpcode::SetThreadBitScalarRegister: return "wave mask register";
+				default:
+					if (IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::None) {
+						return "LDS";
+					}
+					break;
+			}
+		}
+	}
+	return nullptr;
+}
+
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
-	const auto* stage = StageName(ir.stage);
 	IR::ApplyResourceSpecialization(ir, specialization);
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
 	for (auto& inst: ir.value_storage) {
 		inst.Invalidate();
 	}
-	for (auto* block: ir.blocks) {
-		for (auto& inst: *block) {
-			const auto op = inst.GetOpcode();
-			uint32_t first = 0;
-			if (op == IR::ValueOpcode::GetBufferResource) {
-				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
-					       IR::ResourceKind::IndirectBuffer;
-				})) {
-					continue;
-				}
-				const auto resource = inst.Flags<uint32_t>();
-				first               = resource < ir.info.buffers.size() &&
-				                              ir.info.buffers[resource].indirect_root == resource
-				                          ? 1u
-				                          : 0u;
-			} else if (op == IR::ValueOpcode::GetImageResource) {
-				const auto resource = inst.Flags<uint32_t>();
-				first = resource < ir.info.images.size() &&
-				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
-			} else if (op == IR::ValueOpcode::GetSamplerResource) {
-				const auto resource = inst.Flags<uint32_t>();
-				first = resource < ir.info.samplers.size() &&
-				                !ir.info.samplers[resource].indirect_resources.empty() ? 1u : 0u;
-			} else {
-				continue;
-			}
-			for (size_t index = first; index < inst.NumArgs(); index++) {
-				inst.SetArg(index, IR::Value(0u));
+	IR::DropBoundDescriptorWords(ir);
+	ir.value_storage.clear();
+	IR::RemoveIdentities(ir);
+	IR::EliminateDeadCode(ir.blocks);
+	IR::BranchResult branches;
+	const auto*      workgroup = ShaderWorkgroupInput(ir.stage, options.input_info);
+	const bool halves = workgroup != nullptr && ir.wave_size == 64u && workgroup->host_subgroup_size == 32u;
+	if (halves) {
+		const auto* problem = WaveSplitProblem(ir, options);
+		ir.wave_split       = problem == nullptr;
+		LOGF("%s wave64 on 32-wide subgroups: %s%s\n", GetDumpLabel(options),
+		     ir.wave_split ? "one lane per invocation" : "halves, ", ir.wave_split ? "" : problem);
+	}
+	// A wave64 program on 32-wide host subgroups is otherwise emitted in halves, whose votes stay.
+	if (!halves || ir.wave_split) {
+		branches = IR::BranchPerInvocation(ir);
+		IR::RemoveIdentities(ir);
+		std::string problems;
+		for (const auto& [problem, count]: branches.problems) {
+			problems += fmt::format(" {}={}", problem, count);
+		}
+		LOGF("%s per-invocation branches=%" PRIu32 " kept:%s\n", GetDumpLabel(options),
+		     branches.branches, problems.c_str());
+		if (ir.wave_split) {
+			for (const auto& [block, conditions]: branches.block_conditions) {
+				(void)conditions;
+				ir.wave_split_divergent_blocks.insert(block);
 			}
 		}
 	}
-	ir.value_storage.clear();
+	if (const auto selects = IR::EliminateMaskedSelects(ir.blocks, branches.block_conditions);
+	    selects != 0) {
+		LOGF("%s masked select elimination: selects=%" PRIu32 "\n", GetDumpLabel(options), selects);
+	}
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
+	IR::MarkTrackedWrites(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
-		LOGF("ShaderRecompiler %s native IR:\n%s", stage, ir_dump.c_str());
+		if (options.early_dump) {
+			LOGF("%s native IR (early):\n%s", GetDumpLabel(options), ir_dump.c_str());
+		}
 	}
 
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
-	     ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info);
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
-	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
-	     stage, ir.shader_hash, static_cast<uint64_t>(spirv.size()), ir.wave_size,
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
+	// the table variant reads buffers by address, which no robustness clamps.
+	auto profile         = *options.profile;
+	profile.buffer_table = specialization.buffer_table;
+	if (profile.buffer_table) profile.robust_buffers = false;
+	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, profile,
+	                                options.emit_debug_info, options.descriptor_set);
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
+	     static_cast<uint64_t>(spirv.size()),
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));

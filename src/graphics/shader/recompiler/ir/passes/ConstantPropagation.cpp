@@ -309,6 +309,18 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				                      : ((uint32_t {1} << count.U32()) - 1u) << offset.U32();
 				Replace(inst,
 				        Value((base.U32() & ~mask) | ((insert.U32() << offset.U32()) & mask)));
+				return;
+			}
+			// Inserting zero clears the field: an AND, the form descriptor and material-key matchers
+			// recognize (s_pack_ll_b32_b16 x, 0 became BitFieldInsert in upstream 10a852c2).
+			if (IsImmediate(insert, Type::U32) && insert.U32() == 0u && IsImmediate(offset, Type::U32) &&
+			    IsImmediate(count, Type::U32) && count.U32() != 0u && offset.U32() < 32u &&
+			    count.U32() <= 32u - offset.U32()) {
+				const auto mask = count.U32() == 32u
+				                      ? UINT32_MAX
+				                      : ((uint32_t {1} << count.U32()) - 1u) << offset.U32();
+				Replace(inst, Value(&*worklist.Prepend(block, instruction, ValueOpcode::BitwiseAnd32,
+				                                       {base, Value(~mask)})));
 			}
 			return;
 		}

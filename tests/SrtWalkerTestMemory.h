@@ -103,20 +103,23 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
                              const Libs::Graphics::ShaderRecompiler::IR::SrtRuntime &runtime,
                              Libs::Graphics::ShaderRecompiler::IR::Value value, uint32_t &result) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  const auto *inst = value.Resolve().TryInstruction();
-  const auto output = inst != nullptr ? inst->WalkOutput() : UINT32_MAX;
   auto code = std::move(plan.srt_code);
   auto scratch = std::move(plan.srt_scratch);
+  auto outputs = std::move(plan.srt_output_index);
   const auto user_data = plan.srt_user_data;
   const auto captures = plan.srt_captures;
+  const auto output_bytes = plan.srt_outputs;
+  const auto reach = plan.srt_reach;
   CompileSrtWalker(plan, {&value, 1});
   std::vector<uint32_t> flat;
   const bool known = WalkSrt(plan, runtime, flat, nullptr) && WalkedValue(plan, value, result);
   plan.srt_code = std::move(code);
   plan.srt_scratch = std::move(scratch);
+  plan.srt_output_index = std::move(outputs);
   plan.srt_user_data = user_data;
   plan.srt_captures = captures;
-  if (inst != nullptr) inst->SetWalkOutput(output);
+  plan.srt_outputs = output_bytes;
+  plan.srt_reach = reach;
   return known;
 }
 

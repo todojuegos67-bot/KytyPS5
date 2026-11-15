@@ -92,7 +92,11 @@ constexpr ComponentType GetFormatComponentType(Prospero::BufferFormat format) {
 		case Prospero::BufferFormat::k2_10_10_10UNorm:
 		case Prospero::BufferFormat::k10_10_10_2UNorm:
 		case Prospero::BufferFormat::k8_8_8_8UNorm:
-		case Prospero::BufferFormat::k16_16_16_16UNorm: return ComponentType::Unorm;
+		case Prospero::BufferFormat::k16_16_16_16UNorm:
+		// Image formats only (above a V#'s 7 format bits): packed storage (IR::PackedStorageFormat).
+		case Prospero::BufferFormat::k5_6_5UNorm:
+		case Prospero::BufferFormat::k5_5_5_1UNorm:
+		case Prospero::BufferFormat::k4_4_4_4UNorm: return ComponentType::Unorm;
 		case Prospero::BufferFormat::k8SNorm:
 		case Prospero::BufferFormat::k16SNorm:
 		case Prospero::BufferFormat::k8_8SNorm:
@@ -214,6 +218,14 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 		case Prospero::BufferFormat::k8_8_8_8UInt:
 		case Prospero::BufferFormat::k8_8_8_8SInt:
 			return {format, type, 4, 4, {8, 8, 8, 8}, {0, 8, 16, 24}, false};
+		// Component 0 in the low bits, as the texture units read them (vulkanCommon.cpp and
+		// textureCommon.cpp map them to the host formats with the same bits).
+		case Prospero::BufferFormat::k5_6_5UNorm:
+			return {format, type, 3, 2, {5, 6, 5, 0}, {0, 5, 11, 0}, true};
+		case Prospero::BufferFormat::k5_5_5_1UNorm:
+			return {format, type, 4, 2, {5, 5, 5, 1}, {0, 5, 10, 15}, true};
+		case Prospero::BufferFormat::k4_4_4_4UNorm:
+			return {format, type, 4, 2, {4, 4, 4, 4}, {0, 4, 8, 12}, true};
 		case Prospero::BufferFormat::k32_32UInt:
 		case Prospero::BufferFormat::k32_32SInt:
 		case Prospero::BufferFormat::k32_32Float:

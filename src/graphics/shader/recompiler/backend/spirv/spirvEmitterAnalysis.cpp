@@ -155,6 +155,10 @@ void DecorateNonUniformDescriptor(EmitterState& state, uint32_t id, spv::Capabil
 
 ImageDefinition& ImageDescriptorDefinition(EmitterState& state, const IR::ImageResource& image,
                                            IR::DescriptorBindingKind kind) {
+	if (!image.heap && !image.guest_heap && image.indirect_capacity != 0u &&
+	    IR::GroupSetFor(state.program.stage) != IR::NoGroupSet) { // as DefineDescriptors counts it
+		return state.group_images[IR::ImageBindingIndex(kind)];
+	}
 	return (image.heap ? state.heap_images : state.images)[IR::ImageBindingIndex(kind)];
 }
 } // namespace
@@ -192,6 +196,32 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t a
 	return sampler_id;
 }
 
+uint32_t LoadHeapSampler(EmitterState& state, const IR::SamplerResource& sampler, bool integer, uint32_t key) {
+	// The key names the S#'s record in the game's sampler heap (16 bytes a record) as HeapSamplerRecordOf says.
+	const auto& source = state.program.descriptor_sources.at(sampler.source);
+	const auto  record = source.indirect_descriptor ? IR::HeapSamplerRecordOf(*source.indirect_descriptor)
+	                                                : std::nullopt;
+	EXIT_IF(!record);
+	auto selector = key;
+	if (record->selector_shift != 0u) {
+		selector = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key, ConstantU32(state, record->selector_shift));
+	}
+	const auto offset = Binary(state, spv::OpIAdd, TypeU32(state),
+	                           Binary(state, spv::OpIMul, TypeU32(state), selector, ConstantU32(state, record->stride)),
+	                           ConstantU32(state, record->base));
+	auto slot = Binary(state, spv::OpShiftRightLogical, TypeU32(state), offset, ConstantU32(state, 4u));
+	slot      = Select(state, TypeU32(state),
+	                   Binary(state, spv::OpULessThan, TypeBool(state), slot, ConstantU32(state, IR::ImageHeapSamplerSlots)),
+	                   slot, ConstantU32(state, 0u));
+	const auto pointer = DescriptorElementPointer(
+	    state, state.sampler_pointer_type, state.heap_sampler_variables[integer ? 1u : 0u], slot,
+	    IR::DescriptorBindingKind::Samplers, 0u, "sampler heap array was not emitted");
+	const auto sampler_id = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, state.sampler_type, sampler_id, pointer);
+	DecorateNonUniformDescriptor(state, sampler_id, spv::CapabilitySampledImageArrayNonUniformIndexing);
+	return sampler_id;
+}
+
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id, uint32_t mip,
                           uint32_t array_index, bool sampler_dynamic) {
 	const auto& image_resource = state.program.info.images.at(resource);
@@ -217,6 +247,15 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	EXIT_IF(mip >= image.mip_count);
 	const auto kind = IR::DescriptorBindingForImage(image);
 	EXIT_IF(!kind.has_value() || (image.heap && array_index == 0u));
+	if (image.guest_heap) {
+		// shortcut: an access that brings no slot (a LOD query) reads slot 0, the null image; pass
+		// its key through EmitImageAccess when a game needs the query's result.
+		return DescriptorElementPointer(
+		    state, state.images[IR::ImageBindingIndex(*kind)].pointer_type,
+		    state.heap_image_variables[IR::ImageBindingIndex(*kind)],
+		    array_index == 0u ? ConstantU32(state, 0u) : array_index, *kind, resource,
+		    "image heap array was not emitted");
+	}
 	if (array_index == 0u) {
 		array_index = ConstantU32(state, image.descriptor_index + mip);
 	}

@@ -8,10 +8,10 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/StepLookup.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -25,13 +25,13 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
 #include "xxhash.h"
-#include "SrtWalkerTestMemory.h"
 
 #include <algorithm>
 #include <array>
@@ -137,7 +137,9 @@ struct TestCompileResult {
 TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
-    uint32_t push_data_start_dword = 0) {
+    ShaderRecompiler::IR::SrtMemoryReader read_memory = nullptr,
+    void *read_memory_data = nullptr, uint32_t push_data_start_dword = 0,
+    bool buffer_table = false) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -145,11 +147,15 @@ TestCompileResult RecompileForTest(
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = read_memory,
+      .userdata = read_memory_data,
       .read_specialization_memory = ReadHostTestMemory,
   };
   Check(ShaderRecompiler::IR::MaterializeResources(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
+  // These checks read the descriptor variant's SPIR-V unless a test asks for the buffer table's.
+  specialization.buffer_table = buffer_table && !plan.info.buffers.empty();
   auto compiled = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization, push_data_start_dword);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
@@ -165,10 +171,10 @@ void CompilePixelRuntime(const ShaderParams &params,
 
   options.input_info.pixel = &input_info;
   auto result = RecompileForTest(params.code, options);
-  static std::deque<ShaderModule> modules;
+  static std::deque<ShaderRecompiler::IR::CompiledShaderInfo> programs;
   static std::deque<ShaderRecompiler::IR::ResourceSnapshot> resources;
-  modules.push_back({.info = std::move(result.program).TakeCompiledInfo()});
-  input_info.stage.module = &modules.back();
+  programs.push_back(std::move(result.program).TakeCompiledInfo());
+  input_info.stage.program = &programs.back();
   resources.push_back(std::move(result.resources));
   input_info.stage.resources = &resources.back();
 }
@@ -755,6 +761,26 @@ uint32_t SpirvExtInstCount(const std::vector<uint32_t> &binary,
   return count;
 }
 
+bool SpirvContainsTypeImage(const std::vector<uint32_t> &binary, uint32_t dim,
+                            uint32_t arrayed, uint32_t sampled,
+                            uint32_t multisampled = 0) {
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word = binary[i];
+    const uint32_t opcode = word & 0xffffu;
+    const uint32_t word_count = word >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return false;
+    }
+    if (opcode == 25u && word_count >= 9u && binary[i + 3] == dim &&
+        binary[i + 5] == arrayed && binary[i + 6] == multisampled &&
+        binary[i + 7] == sampled) {
+      return true;
+    }
+    i += word_count;
+  }
+  return false;
+}
+
 uint32_t SpirvDecorationValueCount(const std::vector<uint32_t> &binary,
                                    uint32_t decoration, uint32_t value) {
   uint32_t count = 0;
@@ -1106,15 +1132,15 @@ void TestNativeShaderResourceDependencies() {
   set_buffer(0, 0x1000, 16, 3);
   set_buffer(1, 0x1800, 4, 7);
   set_buffer(2, 0x2000, 0, 64);
-  const ShaderModule compiled{.info = {
+  const ShaderRecompiler::IR::CompiledShaderInfo compiled{
       .stage = program.stage,
       .shader_hash = program.shader_hash,
       .wave_size = program.wave_size,
       .user_data_base = program.user_data_base,
       .info = program.info,
       .bindings = program.bindings,
-  }};
-  ShaderStageRuntime runtime{.module = &compiled, .resources = &resources};
+  };
+  ShaderStageRuntime runtime{.program = &compiled, .resources = &resources};
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost nonempty written buffers");
   set_buffer(0, 0, 16, 3);
@@ -1383,6 +1409,90 @@ void TestRebasedTextureMipViews() {
         "sparse view accepted a different mip-tail origin");
 }
 
+// UpdateSize's memo gives what a fresh ComputeSize gives, on a miss and on a hit, across formats, tilings,
+// mip and array counts, and for neighbours that differ in one field it reads.
+void TestUpdateSizeMemo() {
+  using Prospero::BufferFormat;
+  using Prospero::TileMode;
+  struct Case {
+    BufferFormat guest;
+    vk::Format pixel;
+    TileMode tile;
+    vk::Extent3D extent;
+    uint32_t levels, layers;
+    Prospero::ImageType type = Prospero::ImageType::kColor2D;
+    uint32_t samples = 1;
+    uint64_t address = 0x200000000;
+    uint64_t size = 0;
+    uint32_t pitch = 0;
+    ImageMetadataKind metadata = ImageMetadataKind::None;
+  };
+  const std::vector<Case> cases{
+      {BufferFormat::k8_8_8_8UNorm, vk::Format::eR8G8B8A8Unorm, TileMode::kStandard64KB, {1920, 1080, 1}, 11, 1},
+      {BufferFormat::k8_8_8_8UNorm, vk::Format::eR8G8B8A8Unorm, TileMode::kStandard64KB, {1920, 1080, 1}, 1, 1},
+      {BufferFormat::k8_8_8_8UNorm, vk::Format::eR8G8B8A8Unorm, TileMode::kStandard4KB, {256, 256, 1}, 9, 100},
+      {BufferFormat::k8_8_8_8UNorm, vk::Format::eR8G8B8A8Unorm, TileMode::kStandard4KB, {256, 256, 1}, 9, 6},
+      {BufferFormat::k16_16_16_16Float, vk::Format::eR16G16B16A16Sfloat, TileMode::kStandard4KB, {256, 256, 1}, 9, 2},
+      {BufferFormat::k16_16_16_16Float, vk::Format::eR16G16B16A16Sfloat, TileMode::kStandard4KB, {16, 16, 1}, 1, 1},
+      {BufferFormat::k16_16_16_16Float, vk::Format::eR16G16B16A16Sfloat, TileMode::kStandard4KB, {16, 16, 1}, 1, 1,
+       Prospero::ImageType::kColor2D, 1, 0x200000800},
+      {BufferFormat::k16_16_16_16Float, vk::Format::eR16G16B16A16Sfloat, TileMode::kStandard4KB, {16, 16, 1}, 1, 1,
+       Prospero::ImageType::kColor2D, 1, 0x200000900},
+      // Same offset in its block at another address: shares the memo entry.
+      {BufferFormat::k16_16_16_16Float, vk::Format::eR16G16B16A16Sfloat, TileMode::kStandard4KB, {16, 16, 1}, 1, 1,
+       Prospero::ImageType::kColor2D, 1, 0x7aa00800},
+      {BufferFormat::k8_8_8_8UNorm, vk::Format::eR8G8B8A8Unorm, TileMode::kStandard64KB, {1920, 1080, 1}, 11, 1,
+       Prospero::ImageType::kColor2D, 1, 0x7bb0000000},
+      {BufferFormat::k16_16_16_16Float, vk::Format::eR16G16B16A16Sfloat, TileMode::kStandard4KB, {16, 16, 1}, 1, 1,
+       Prospero::ImageType::kColor2D, 1, 0x200000800, 0, 0, ImageMetadataKind::Dcc},
+      {BufferFormat::k32Float, vk::Format::eR32Sfloat, TileMode::kLinear, {640, 360, 1}, 1, 1},
+      {BufferFormat::k32Float, vk::Format::eD32Sfloat, TileMode::kLinear, {640, 360, 1}, 1, 1},
+      {BufferFormat::k32Float, vk::Format::eD32Sfloat, TileMode::kDepth, {1920, 1080, 1}, 1, 1},
+      {BufferFormat::k32Float, vk::Format::eD32Sfloat, TileMode::kDepth, {1920, 1080, 1}, 1, 1,
+       Prospero::ImageType::kColor2D, 4},
+      {BufferFormat::k8_8_8_8UNorm, vk::Format::eR8G8B8A8Unorm, TileMode::kRenderTarget, {1920, 1080, 1}, 1, 1,
+       Prospero::ImageType::kColor2D, 4},
+      {BufferFormat::k8UNorm, vk::Format::eR8Unorm, TileMode::kLinear, {7, 16, 1}, 3, 1},
+      {BufferFormat::k8UNorm, vk::Format::eR8Unorm, TileMode::kLinear, {7, 16, 1}, 3, 1,
+       Prospero::ImageType::kColor2D, 1, 0x200000000, 0, 64},
+      {BufferFormat::k10_11_11Float, vk::Format::eB10G11R11UfloatPack32, TileMode::kStandard64KB, {512, 288, 1}, 10,
+       1},
+      {BufferFormat::kBc1UNorm, vk::Format::eBc1RgbaUnormBlock, TileMode::kStandard64KB, {1024, 1024, 1}, 11, 1},
+      {BufferFormat::kBc7UNorm, vk::Format::eBc7UnormBlock, TileMode::kStandard4KB, {256, 128, 1}, 9, 4},
+      {BufferFormat::kBc7UNorm, vk::Format::eBc7UnormBlock, TileMode::kStandard4KB, {256, 128, 1}, 9, 4,
+       Prospero::ImageType::kColor2D, 1, 0x200000000, 0x200000},
+      {BufferFormat::k8_8_8_8UNorm, vk::Format::eR8G8B8A8Unorm, TileMode::kStandard64KB, {64, 64, 8}, 7, 1,
+       Prospero::ImageType::kColor3D},
+  };
+  const auto same = [](const ImageInfo &a, const ImageInfo &b) {
+    return a.data.size == b.data.size && a.pitch == b.pitch && a.bytes_per_block == b.bytes_per_block &&
+           a.first_tail_level == b.first_tail_level && a.mip_layout == b.mip_layout &&
+           std::memcmp(&a.tiling, &b.tiling, sizeof(a.tiling)) == 0 &&
+           a.tiled_slice_stride == b.tiled_slice_stride && a.linear_slice_stride == b.linear_slice_stride;
+  };
+  // Twice through: the second pass meets every key already in the memo, after all its neighbours.
+  for (int pass = 0; pass < 2; ++pass) {
+    for (const auto &c : cases) {
+      ImageInfo info{};
+      info.data = {c.address, c.size};
+      info.pixel_format = c.pixel;
+      info.guest_format = c.guest;
+      info.type = c.type;
+      info.extent = c.extent;
+      info.resources = {c.levels, c.layers};
+      info.pitch = c.pitch;
+      info.samples = c.samples;
+      info.tile_mode = c.tile;
+      info.metadata.kind = c.metadata;
+      auto fresh = info;
+      fresh.ComputeSize();
+      auto memoized = info;
+      memoized.UpdateSize();
+      Check(same(memoized, fresh), "UpdateSize's memo gave a layout a fresh computation does not");
+    }
+  }
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -1516,12 +1626,25 @@ ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
   return data;
 }
 
+void SetImageTestType(std::array<uint32_t, 64> *data, uint32_t srsrc,
+                      Prospero::ImageType type) {
+  const auto type_dword = srsrc * 4u + 3u;
+  Check(data != nullptr && type_dword < data->size(),
+        "invalid image test descriptor source");
+  (*data)[type_dword] = static_cast<uint32_t>(type) << 28u;
+}
+
 void SetImageTestFormat(std::array<uint32_t, 64> *data, uint32_t srsrc,
                         Prospero::BufferFormat format) {
   const auto format_dword = srsrc * 4u + 1u;
   Check(data != nullptr && format_dword < data->size(),
         "invalid image test descriptor source");
   (*data)[format_dword] = static_cast<uint32_t>(format) << 20u;
+}
+
+bool ReadZeroTestMemory(void *, uint64_t, std::span<uint32_t> values) {
+  std::ranges::fill(values, 0u);
+  return true;
 }
 
 constexpr uint32_t EncodeVop2(uint32_t opcode, uint32_t dst, uint32_t src0,
@@ -1535,11 +1658,36 @@ constexpr uint32_t EncodeVop1(uint32_t opcode, uint32_t dst, uint32_t src0) {
          (src0 & 0x1ffu);
 }
 
+constexpr uint32_t EncodeVop1Sdwa(uint32_t src0, uint32_t dst_sel = 6,
+                                  uint32_t dst_u = 0, uint32_t src0_sel = 6,
+                                  uint32_t src0_sext = 0, uint32_t src0_neg = 0,
+                                  uint32_t src0_abs = 0, uint32_t s0 = 0) {
+  return (src0 & 0xffu) | ((dst_sel & 0x7u) << 8u) | ((dst_u & 0x3u) << 11u) |
+         ((src0_sel & 0x7u) << 16u) | ((src0_sext & 0x1u) << 19u) |
+         ((src0_neg & 0x1u) << 20u) | ((src0_abs & 0x1u) << 21u) |
+         ((s0 & 0x1u) << 23u);
+}
+
 constexpr uint32_t EncodeVop1Dpp(uint32_t src0, uint32_t dpp_ctrl = 0,
                                  uint32_t row_mask = 0xf,
                                  uint32_t bank_mask = 0xf) {
   return (src0 & 0xffu) | ((dpp_ctrl & 0x1ffu) << 8u) |
          ((bank_mask & 0xfu) << 24u) | ((row_mask & 0xfu) << 28u);
+}
+
+constexpr uint32_t EncodeVop2Sdwa(uint32_t src0, uint32_t dst_sel = 6,
+                                  uint32_t dst_u = 0, uint32_t src0_sel = 6,
+                                  uint32_t src1_sel = 6, uint32_t src0_sext = 0,
+                                  uint32_t src1_sext = 0, uint32_t src0_neg = 0,
+                                  uint32_t src0_abs = 0, uint32_t src1_neg = 0,
+                                  uint32_t src1_abs = 0, uint32_t s0 = 0,
+                                  uint32_t s1 = 0) {
+  return (src0 & 0xffu) | ((dst_sel & 0x7u) << 8u) | ((dst_u & 0x3u) << 11u) |
+         ((src0_sel & 0x7u) << 16u) | ((src0_sext & 0x1u) << 19u) |
+         ((src0_neg & 0x1u) << 20u) | ((src0_abs & 0x1u) << 21u) |
+         ((s0 & 0x1u) << 23u) | ((src1_sel & 0x7u) << 24u) |
+         ((src1_sext & 0x1u) << 27u) | ((src1_neg & 0x1u) << 28u) |
+         ((src1_abs & 0x1u) << 29u) | ((s1 & 0x1u) << 31u);
 }
 
 constexpr uint32_t EncodeVop2Dpp(uint32_t src0, uint32_t dpp_ctrl = 0,
@@ -1590,6 +1738,20 @@ constexpr uint32_t EncodeVop3Word0Sdst(uint32_t opcode, uint32_t dst,
 constexpr uint32_t EncodeVop3Word1(uint32_t src0, uint32_t src1,
                                    uint32_t src2) {
   return (src0 & 0x1ffu) | ((src1 & 0x1ffu) << 9u) | ((src2 & 0x1ffu) << 18u);
+}
+
+constexpr uint32_t EncodeVop3pWord0(uint32_t opcode, uint32_t dst,
+                                    uint32_t op_sel = 0, uint32_t op_sel_hi = 0,
+                                    uint32_t neg_hi = 0, bool clamp = false) {
+  return (0x33u << 26u) | ((opcode & 0x7fu) << 16u) | (dst & 0xffu) |
+         ((neg_hi & 0x7u) << 8u) | ((op_sel & 0x7u) << 11u) |
+         (((op_sel_hi >> 2u) & 0x1u) << 14u) | (clamp ? (1u << 15u) : 0u);
+}
+
+constexpr uint32_t EncodeVop3pWord1(uint32_t src0, uint32_t src1, uint32_t src2,
+                                    uint32_t op_sel_hi = 0, uint32_t neg = 0) {
+  return (src0 & 0x1ffu) | ((src1 & 0x1ffu) << 9u) | ((src2 & 0x1ffu) << 18u) |
+         ((op_sel_hi & 0x3u) << 27u) | ((neg & 0x7u) << 29u);
 }
 
 constexpr uint32_t EncodeSmem0(uint32_t opcode, uint32_t dst, uint32_t sbase) {
@@ -1713,6 +1875,11 @@ void TestNewShaderRecompilerSMovB32() {
         "new decoder did not decode literal S_MOV_B32 operand");
   Check((result.decoded_dump.find("S_MOV_B32 s2, s1") != std::string::npos),
         "new decoder did not decode register S_MOV_B32 operand");
+  const uint32_t abs_code[] = {EncodeSop1(0x34, 4, 2)}; // s_abs_i32 s4, s2
+  ShaderRecompiler::Decoder::Instruction inst;
+  ShaderRecompiler::Decoder::DecodeInstruction(abs_code, 0, inst);
+  Check(ShaderRecompiler::Decoder::InstructionToString(inst) == "0x00000000: S_ABS_I32 s4, s2",
+        "scalar unary dump did not print its destination and source");
   Check((result.ir_dump.find("StoreBufferU32") != std::string::npos) &&
             (result.ir_dump.find("0x00000001") != std::string::npos) &&
             (result.ir_dump.find("0x12345678") != std::string::npos),
@@ -1867,8 +2034,9 @@ void TestShaderProgramHash() {
     HW::ComputeShaderInfo regs{};
     regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(binary.data());
     ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+    HW::ShaderRegisters sh{};
     ShaderComputeInputInfo input{};
-    return PrepareProgram(regs, input);
+    return PrepareProgram(regs, sh, input);
   };
   Check(Map(Make(7, 1)).hash == Map(Make(7, 2)).hash,
         "binaries differing only in metadata got different programs");
@@ -1934,6 +2102,36 @@ void TestNggVertexEntryState() {
     Check(result.program.wave_size == wave_size,
           "NGG wave size was lost during translation");
     CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestBodyAfterEndpgm() {
+  using namespace ShaderRecompiler;
+  // The shape of the PS5 Pro (trinity) ray-tracing shaders (f687ff30ac856e49:0x8, 0x15f0, 0x1854, 0x1d58): a
+  // debugger-trap branch to a block after S_ENDPGM, and a forward branch to the rest of the body, also after
+  // S_ENDPGM, which ends in an S_BRANCH back and is followed by data. The decoder must take the body and stop
+  // before the data; the trap block is never reached.
+  const std::array shader = {
+      EncodeSopp(0x19, 4),       // 0x00 s_cbranch_cdbgsys_or_user 0x14
+      EncodeSopp(0x04, 5),       // 0x04 s_cbranch_scc0 0x1c
+      EncodeSopp(0x00),          // 0x08 s_nop
+      EncodeSopp(0x00),          // 0x0c s_nop (the body rejoins here)
+      EncodeSopp(0x01),          // 0x10 s_endpgm
+      EncodeSopp(0x00),          // 0x14 s_nop (trap block)
+      EncodeSopp(0x02, 0xfffau), // 0x18 s_branch 0x04
+      EncodeSopp(0x00),          // 0x1c s_nop (rest of the body)
+      EncodeSopp(0x02, 0xfffau), // 0x20 s_branch 0x0c
+      0xffffffffu,               // 0x24 data: no instruction family, would end the decode
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.size() == 9 && decoded.instructions.back().pc == 0x20u &&
+            decoded.instructions.back().opcode == Decoder::Opcode::S_BRANCH,
+        "the decoder stopped at S_ENDPGM before the body after it, or ran into the data");
+  const auto graph = CFG::BuildGraph(decoded);
+  Check(!graph.unsupported, "the CFG rejected a body after S_ENDPGM");
+  for (const auto& block : graph.blocks) {
+    Check(block.start_pc != 0x14u, "the never-taken debugger-trap block stayed in the CFG");
   }
 }
 
@@ -2158,6 +2356,172 @@ void TestOrderedPsDoneEndsProgram() {
         "s_endpgm_ordered_ps_done did not end the program");
 }
 
+void TestNewShaderRecompilerRdna2ScalarOpcodes() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(2, 135),         // s2 = 7
+      EncodeSMovB32(106, 144),       // vcc_lo = 16
+      EncodeSop1(0x1d, 106, 128),    // s_bitset1_b32 vcc_lo, 0
+      EncodeSopk(0x13, 106, 0x1019), // s_setreg_b32 vcc_lo, 0x1019
+      EncodeSop2(0x02, 106, 2,
+                 239),     // s_add_i32 vcc_lo, s2, pops_exiting_wave_id
+      EncodeSopp(0x0e, 0), // s_sleep 0
+      EncodeSop2(0x02, 106, 239,
+                 2),       // s_add_i32 vcc_lo, pops_exiting_wave_id, s2
+      EncodeSopp(0x01, 0), // s_endpgm
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_bitset1_b32 vcc_lo, 0") != std::string::npos),
+        "new decoder did not decode RDNA2 S_BITSET1_B32");
+  Check((result.decoded_dump.find("s_setreg_b32 vcc_lo, 0x00001019") != std::string::npos),
+        "new decoder did not decode S_SETREG_B32");
+  Check((result.decoded_dump.find("s_add_i32 vcc_lo, s2, pops_exiting_wave_id") != std::string::npos),
+        "new decoder did not decode pops_exiting_wave_id as RHS scalar source");
+  Check((result.decoded_dump.find("s_add_i32 vcc_lo, pops_exiting_wave_id, s2") != std::string::npos),
+        "new decoder did not decode pops_exiting_wave_id as LHS scalar source");
+  Check((result.decoded_dump.find("s_sleep 0x00000000") != std::string::npos),
+        "new decoder did not decode S_SLEEP");
+  Check((result.ir_dump.find("BitSetU32 vcc_lo, vcc_lo, 0x00000000") != std::string::npos),
+        "S_BITSET1_B32 did not lower to bit-set IR using the destination as "
+        "input");
+  Check(
+      (result.ir_dump.find("ScalarSignedAddOverflowI32 vcc_lo, s2, 0x00000000") != std::string::npos),
+      "pops_exiting_wave_id RHS did not lower to a deterministic zero value");
+  Check(
+      (result.ir_dump.find("ScalarSignedAddOverflowI32 vcc_lo, 0x00000000, s2") != std::string::npos),
+      "pops_exiting_wave_id LHS did not lower to a deterministic zero value");
+  Check((result.ir_dump.find("ControlNop null, vcc_lo") != std::string::npos),
+        "S_SETREG_B32 did not lower to an explicit control marker");
+  Check((result.ir_dump.find("ControlNop null, 0x00000000") != std::string::npos),
+        "S_SLEEP did not lower to an explicit control marker");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical for S_BITSET1_B32");
+  Check(SpirvContainsOpcode(result.spirv, 197),
+        "SPIR-V binary does not contain OpBitwiseOr for S_BITSET1_B32");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerScalarVectorAlu() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),           // s0 = 1
+      EncodeSMovB32(1, 130),           // s1 = 2
+      EncodeSop2(0x00, 2, 0, 1),       // s_add_u32 s2, s0, s1
+      EncodeSop2(0x01, 3, 2, 129),     // s_sub_u32 s3, s2, 1
+      EncodeSop2(0x0e, 4, 2, 3),       // s_and_b32 s4, s2, s3
+      EncodeSop2(0x10, 5, 2, 3),       // s_or_b32 s5, s2, s3
+      EncodeSop2(0x12, 6, 2, 3),       // s_xor_b32 s6, s2, s3
+      EncodeSop2(0x1e, 7, 2, 129),     // s_lshl_b32 s7, s2, 1
+      EncodeSop2(0x20, 8, 7, 129),     // s_lshr_b32 s8, s7, 1
+      EncodeSop2(0x2e, 9, 2, 1),       // s_lshl1_add_u32 s9, s2, s1
+      EncodeSop2(0x2f, 10, 9, 1),      // s_lshl2_add_u32 s10, s9, s1
+      EncodeSop2(0x30, 11, 10, 1),     // s_lshl3_add_u32 s11, s10, s1
+      EncodeSop2(0x31, 12, 11, 1),     // s_lshl4_add_u32 s12, s11, s1
+      EncodeSop2(0x35, 13, 12, 1),     // s_mul_hi_u32 s13, s12, s1
+      EncodeSop2(0x36, 15, 12, 1),     // s_mul_hi_i32 s15, s12, s1
+      EncodeSopc(0x08, 8, 1),          // s_cmp_gt_u32 s8, s1
+      EncodeSop2(0x04, 14, 13, 129),   // s_addc_u32 s14, s13, 1
+      EncodeVop2(0x03, 1, 242, 0),     // v_add_f32 v1, 1.0, v0
+      EncodeVop2(0x08, 2, 1 + 256, 1), // v_mul_f32 v2, v1, v1
+      EncodeVop2(0x25, 3, 1 + 256, 2), // v_add_nc_u32 v3, v1, v2
+      EncodeVop2(0x1b, 4, 3 + 256, 2), // v_and_b32 v4, v3, v2
+      EncodeVop2(0x0b, 6, 3 + 256, 4), // v_mul_u32_u24 v6, v3, v4
+      EncodeVop2(0x09, 8, 4 + 256, 6), // v_mul_i32_i24 v8, v4, v6
+      EncodeVop2(0x22, 7, 4 + 256, 6), // v_bcnt_u32_b32 v7, v4, v6
+      EncodeVopc(0xc4, 3 + 256, 2),    // v_cmp_gt_u32 v3, v2
+      EncodeVop2(0x01, 5, 1 + 256, 2), // v_cndmask_b32 v5, v1, v2
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_add_u32 s2, s0, s1") != std::string::npos),
+        "new decoder did not decode SOP2 add");
+  Check((result.decoded_dump.find("s_addc_u32 s14, s13, 1") != std::string::npos),
+        "new decoder did not decode old-backed S_ADD_C_U32");
+  Check((result.decoded_dump.find("s_cmp_gt_u32 s8, s1") != std::string::npos),
+        "new decoder did not decode SOPC compare");
+  Check((result.decoded_dump.find("s_lshl1_add_u32 s9, s2, s1") != std::string::npos),
+        "new decoder did not decode old-backed S_LSHL1_ADD_U32");
+  Check((result.decoded_dump.find("s_lshl2_add_u32 s10, s9, s1") != std::string::npos),
+        "new decoder did not decode old-backed S_LSHL2_ADD_U32");
+  Check(
+      (result.decoded_dump.find("s_lshl3_add_u32 s11, s10, s1") != std::string::npos),
+      "new decoder did not decode old-backed S_LSHL3_ADD_U32");
+  Check(
+      (result.decoded_dump.find("s_lshl4_add_u32 s12, s11, s1") != std::string::npos),
+      "new decoder did not decode old-backed S_LSHL4_ADD_U32");
+  Check((result.decoded_dump.find("s_mul_hi_u32 s13, s12, s1") != std::string::npos),
+        "new decoder did not decode old-backed S_MUL_HI_U32");
+  Check((result.decoded_dump.find("s_mul_hi_i32 s15, s12, s1") != std::string::npos),
+        "new decoder did not decode old-backed S_MUL_HI_I32");
+  Check((result.decoded_dump.find("v_add_f32 v1") != std::string::npos),
+        "new decoder did not decode VOP2 float add");
+  Check((result.decoded_dump.find("v_cndmask_b32 v5") != std::string::npos),
+        "new decoder did not decode VOP2 conditional mask select");
+  Check((result.decoded_dump.find("v_mul_u32_u24 v6") != std::string::npos),
+        "new decoder did not decode VOP2 24-bit multiply");
+  Check((result.decoded_dump.find("v_mul_i32_i24 v8") != std::string::npos),
+        "new decoder did not decode VOP2 signed 24-bit multiply");
+  Check((result.decoded_dump.find("v_bcnt_u32_b32 v7") != std::string::npos),
+        "new decoder did not decode old-backed V_BCNT_U32_B32");
+  Check((result.ir_dump.find("ScalarAddCarryU32 s2, s0, s1, 0x00000000") != std::string::npos),
+        "SOP2 add did not lower to scalar carry-writing IR");
+  Check((result.ir_dump.find("ScalarAddCarryU32 s14, s13, 0x00000001, scc") != std::string::npos),
+        "S_ADD_C_U32 did not lower to scalar carry IR");
+  Check(
+      (result.ir_dump.find("ScalarShiftLeftAddCarryU32 s9, s2, 0x00000001, s1") != std::string::npos),
+      "S_LSHL1_ADD_U32 did not lower through carry-writing shift-left-add IR");
+  Check(
+      (result.ir_dump.find("ScalarShiftLeftAddCarryU32 s10, s9, 0x00000002, s1") != std::string::npos),
+      "S_LSHL2_ADD_U32 did not lower through carry-writing shift-left-add IR");
+  Check(
+      (result.ir_dump.find("ScalarShiftLeftAddCarryU32 s11, s10, 0x00000003, s1") != std::string::npos),
+      "S_LSHL3_ADD_U32 did not lower through carry-writing shift-left-add IR");
+  Check(
+      (result.ir_dump.find("ScalarShiftLeftAddCarryU32 s12, s11, 0x00000004, s1") != std::string::npos),
+      "S_LSHL4_ADD_U32 did not lower through carry-writing shift-left-add IR");
+  Check((result.ir_dump.find("UMulHighU32 s13, s12, s1") != std::string::npos),
+        "S_MUL_HI_U32 did not lower to unsigned high-multiply IR");
+  Check((result.ir_dump.find("SMulHighI32 s15, s12, s1") != std::string::npos),
+        "S_MUL_HI_I32 did not lower to signed high-multiply IR");
+  Check((result.ir_dump.find("CompareGtU32") != std::string::npos),
+        "SOPC compare did not lower to IR");
+  Check((result.ir_dump.find("FAddF32 v1") != std::string::npos),
+        "VOP2 float add did not lower to IR");
+  Check((result.ir_dump.find("BitwiseAndU32 v4") != std::string::npos),
+        "VOP2 bitwise op did not lower to IR");
+  Check((result.ir_dump.find("SelectMaskU32 v5, vcc_lo, v2, v1") != std::string::npos),
+        "VOP2 conditional mask did not lower through lane-mask select IR");
+  Check((result.ir_dump.find("UMulU24U32 v6") != std::string::npos),
+        "VOP2 24-bit multiply did not lower to IR");
+  Check((result.ir_dump.find("IMulI24U32 v8") != std::string::npos),
+        "VOP2 signed 24-bit multiply did not lower to IR");
+  Check((result.ir_dump.find("BitCountAddU32 v7, v4, v6") != std::string::npos),
+        "V_BCNT_U32_B32 did not lower to bit-count-add IR");
+  Check(SpirvContainsOpcode(result.spirv, 128),
+        "SPIR-V binary does not contain OpIAdd");
+  Check(SpirvContainsOpcode(result.spirv, 149),
+        "SPIR-V binary does not contain OpIAddCarry");
+  Check(SpirvContainsOpcode(result.spirv, 129),
+        "SPIR-V binary does not contain OpFAdd");
+  Check(SpirvContainsOpcode(result.spirv, 132),
+        "SPIR-V binary does not contain OpIMul");
+  Check(SpirvContainsOpcode(result.spirv, 151),
+        "SPIR-V binary does not contain OpUMulExtended");
+  Check(SpirvContainsOpcode(result.spirv, 205),
+        "SPIR-V binary does not contain OpBitCount");
+  Check(SpirvContainsOpcode(result.spirv, 169),
+        "SPIR-V binary does not contain OpSelect");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
   // Lane-read instructions have scalar results, but their VOP3A destination is
   // encoded in VDST [7:0], not the VOP3B SDST field [14:8].
@@ -2222,6 +2586,1387 @@ void TestVop3FloatConversionDecode() {
             "VOP3 conversion accepted unsupported OP_SEL bits");
     }
   }
+}
+
+void TestNewShaderRecompilerMoreAluFamilies() {
+  const uint32_t shader[] = {
+      EncodeSopk(0x00, 9, 7), // s_movk_i32 s9, 7
+      EncodeSopk(0x0b, 9, 3), // s_cmp_gt_u32 s9, 3
+      EncodeVop1(0x00, 0, 0), // v_nop
+      EncodeVop1(0x01, 5, 9), // v_mov_b32 v5, s9
+      EncodeVop1(0x01, 103, 249),
+      EncodeVop1Sdwa(5, 6, 0, 4), // v_mov_b32 v103, v5 word0
+      EncodeVop1(0x06, 104, 249),
+      EncodeVop1Sdwa(103, 6, 0, 4), // v_cvt_f32_u32 v104, v103 word0
+      EncodeVop1(0x0a, 105, 249),
+      EncodeVop1Sdwa(6, 5, 2, 6), // v_cvt_f16_f32 v105.hi, v6
+      EncodeVop1(0x01, 106, 250),
+      EncodeVop1Dpp(5),                // v_mov_b32 v106, v5 dpp
+      EncodeVop1(0x02, 24, 5 + 256),   // v_readfirstlane_b32 s24, v5
+      EncodeVop1(0x06, 6, 5 + 256),    // v_cvt_f32_u32 v6, v5
+      EncodeVop1(0x07, 7, 6 + 256),    // v_cvt_u32_f32 v7, v6
+      EncodeVop1(0x05, 9, 5 + 256),    // v_cvt_f32_i32 v9, v5
+      EncodeVop1(0x08, 10, 6 + 256),   // v_cvt_i32_f32 v10, v6
+      EncodeVop1(0x0a, 99, 6 + 256),   // v_cvt_f16_f32 v99, v6
+      EncodeVop1(0x0b, 100, 99 + 256), // v_cvt_f32_f16 v100, v99
+      0x7e1016f9u,
+      0x00250602u,                      // v_cvt_f32_f16 v8, abs(v2.hi)
+      EncodeVop1(0x0d, 64, 6 + 256),    // v_cvt_flr_i32_f32 v64, v6
+      EncodeVop1(0x0e, 81, 5 + 256),    // v_cvt_off_f32_i4 v81, v5
+      EncodeVop1(0x11, 65, 5 + 256),    // v_cvt_f32_ubyte0 v65, v5
+      EncodeVop1(0x12, 66, 5 + 256),    // v_cvt_f32_ubyte1 v66, v5
+      EncodeVop1(0x13, 67, 5 + 256),    // v_cvt_f32_ubyte2 v67, v5
+      EncodeVop1(0x14, 68, 5 + 256),    // v_cvt_f32_ubyte3 v68, v5
+      EncodeVop1(0x2a, 11, 6 + 256),    // v_rcp_f32 v11, v6
+      EncodeVop1(0x20, 12, 6 + 256),    // v_fract_f32 v12, v6
+      EncodeVop1(0x21, 13, 6 + 256),    // v_trunc_f32 v13, v6
+      EncodeVop1(0x22, 14, 6 + 256),    // v_ceil_f32 v14, v6
+      EncodeVop1(0x23, 15, 6 + 256),    // v_rndne_f32 v15, v6
+      EncodeVop1(0x24, 16, 6 + 256),    // v_floor_f32 v16, v6
+      EncodeVop1(0x25, 17, 6 + 256),    // v_exp_f32 v17, v6
+      EncodeVop1(0x27, 18, 6 + 256),    // v_log_f32 v18, v6
+      EncodeVop1(0x2e, 19, 6 + 256),    // v_rsq_f32 v19, v6
+      EncodeVop1(0x33, 20, 6 + 256),    // v_sqrt_f32 v20, v6
+      EncodeVop1(0x35, 21, 6 + 256),    // v_sin_f32 v21, v6
+      EncodeVop1(0x36, 22, 6 + 256),    // v_cos_f32 v22, v6
+      EncodeVop1(0x37, 27, 5 + 256),    // v_not_b32 v27, v5
+      EncodeVop1(0x38, 28, 5 + 256),    // v_bfrev_b32 v28, v5
+      EncodeVop1(0x39, 31, 5 + 256),    // v_ffbh_u32 v31, v5
+      EncodeVop1(0x3a, 32, 5 + 256),    // v_ffbl_b32 v32, v5
+      0x7e6e870cu,                      // v_movrels_b32 v55, v12
+      EncodeVop2(0x1e, 83, 5 + 256, 6), // v_xnor_b32 v83, v5, v6
+      EncodeVop2(0x23, 84, 5 + 256, 6), // v_mbcnt_lo_u32_b32 v84, v5, v6
+      EncodeVop2(0x24, 85, 5 + 256, 6), // v_mbcnt_hi_u32_b32 v85, v5, v6
+      EncodeVop2(0x1f, 89, 6 + 256, 6), // v_mac_f32 v89, v6, v6
+      EncodeVop2(0x20, 90, 6 + 256, 5),
+      0x3f800000u, // v_madmk_f32 v90, v6, 1.0, v5
+      EncodeVop2(0x21, 91, 6 + 256, 5),
+      0x40000000u,                      // v_madak_f32 v91, v6, v5, 2.0
+      EncodeVop2(0x2b, 92, 6 + 256, 6), // v_mac_f32 v92, v6, v6
+      EncodeVop2(0x2c, 93, 6 + 256, 5),
+      0x3f000000u, // v_madmk_f32 v93, v6, 0.5, v5
+      EncodeVop2(0x2d, 94, 6 + 256, 5),
+      0x40400000u,                         // v_madak_f32 v94, v6, v5, 3.0
+      EncodeVop2(0x2f, 95, 6 + 256, 6),    // v_cvt_pkrtz_f16_f32 v95, v6, v6
+      EncodeVop2(0x02, 102, 95 + 256, 95), // v_dot2c_f32_f16 v102, v95, v95
+      EncodeVop2(0x28, 97, 5 + 256, 6),    // v_addc_u32 v97, vcc, v5, v6, vcc
+      EncodeVop2(0x25, 123, 249, 6),
+      EncodeVop2Sdwa(5, 6, 0, 4, 6),
+      EncodeVop2(0x1b, 124, 249, 6),
+      EncodeVop2Sdwa(5, 6, 0, 4, 5),
+      0x025e6af9u,
+      0x16060635u, // v_cndmask_b32 v47, v53, -v53
+      0x020e02f9u,
+      0x06040600u, // v_cndmask_b32 v7, v0.lo, v1; full-width destination
+      0x100490f9u,
+      0x86860600u, // v_mul_f32 v2, s0, s72 (SDWA full)
+      EncodeVop2(0x35, 9, 249, 1),
+      EncodeVop2Sdwa(0, 4, 2, 4, 4),
+      0x660000f9u,
+      EncodeVop2Sdwa(0, 4, 2, 4, 4),
+      EncodeVop2(0x03, 125, 250, 6),
+      EncodeVop2Dpp(5),
+      EncodeVop3Word0(0x103, 35),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x10b, 36),
+      EncodeVop3Word1(5 + 256, 5 + 256, 0),
+      EncodeVop3Word0(0x11e, 86),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x11f, 96),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      EncodeVop3Word0Sdst(0x128, 98, 30),
+      EncodeVop3Word1(5 + 256, 6 + 256, 106),
+      EncodeVop3Word0(0x123, 87),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x124, 88),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x180, 0),
+      EncodeVop3Word1(0, 0, 0),
+      EncodeVop3Word0(0x181, 23),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x182, 25),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x185, 24),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x18a, 101),
+      EncodeVop3Word1(6 + 256, 0, 0),
+      EncodeVop3Word0(0x18d, 74),
+      EncodeVop3Word1(6 + 256, 0, 0),
+      EncodeVop3Word0(0x18e, 82),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x1a0, 25),
+      EncodeVop3Word1(6 + 256, 0, 0),
+      EncodeVop3Word0(0x1aa, 26),
+      EncodeVop3Word1(6 + 256, 0, 0),
+      EncodeVop3Word0(0x1b7, 29),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x1b8, 30),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x1b9, 33),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x1ba, 34),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVopc(0x04, 6 + 256, 6), // v_cmp_gt_f32 v6, v6
+      EncodeVopc(0xc4, 7 + 256, 5), // v_cmp_gt_u32 v7, v5
+      EncodeVopc(0x14, 6 + 256, 6), // v_cmpx_gt_f32 v6, v6
+      EncodeVopc(0xd4, 7 + 256, 5), // v_cmpx_gt_u32 v7, v5
+      EncodeVopc(0x00, 6 + 256, 6), // v_cmp_f_f32 v6, v6
+      EncodeVopc(0x0f, 6 + 256, 6), // v_cmp_tru_f32 v6, v6
+      EncodeVopc(0x07, 6 + 256, 6), // v_cmp_o_f32 v6, v6
+      EncodeVopc(0x08, 6 + 256, 6), // v_cmp_u_f32 v6, v6
+      EncodeVopc(0x09, 6 + 256, 6), // v_cmp_nge_f32 v6, v6
+      EncodeVopc(0x0a, 6 + 256, 6), // v_cmp_nlg_f32 v6, v6
+      EncodeVopc(0x0b, 6 + 256, 6), // v_cmp_ngt_f32 v6, v6
+      EncodeVopc(0x0c, 6 + 256, 6), // v_cmp_nle_f32 v6, v6
+      EncodeVopc(0x0d, 6 + 256, 6), // v_cmp_neq_f32 v6, v6
+      0x7c1a02f9u,
+      0x068680f0u, // v_cmp_neq_f32 s0, 0.5, v1 (SDWA)
+      EncodeVopc(0xd1, 249, 6),
+      EncodeVopcSdwa(5, 0, 0, 4),   // v_cmpx_lt_u32 exec, v5, v6 (SDWA)
+      EncodeVopc(0x0e, 6 + 256, 6), // v_cmp_nlt_f32 v6, v6
+      EncodeVopc(0x19, 6 + 256, 6), // v_cmpx_nge_f32 v6, v6
+      EncodeVopc(0x1a, 6 + 256, 6), // v_cmpx_nlg_f32 v6, v6
+      EncodeVopc(0x1b, 6 + 256, 6), // v_cmpx_ngt_f32 v6, v6
+      EncodeVopc(0x1c, 6 + 256, 6), // v_cmpx_nle_f32 v6, v6
+      EncodeVopc(0x1d, 6 + 256, 6), // v_cmpx_neq_f32 v6, v6
+      EncodeVopc(0x1e, 6 + 256, 6), // v_cmpx_nlt_f32 v6, v6
+      EncodeVopc(0x80, 5 + 256, 5), // v_cmp_f_i32 v5, v5
+      EncodeVopc(0x87, 5 + 256, 5), // v_cmp_t_i32 v5, v5
+      EncodeVopc(0xc0, 5 + 256, 5), // v_cmp_f_u32 v5, v5
+      EncodeVopc(0xc7, 5 + 256, 5), // v_cmp_t_u32 v5, v5
+      0xd4e5006au,
+      0x0000d47eu, // v_cmp_ne_u64 vcc, exec, vcc
+      EncodeVop3Word0(0x141, 8),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      0xd5410004u,
+      0x20121301u, // v_mad_f32 v4, -v1, v9, s4
+      EncodeVop3Word0(0x144, 110),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x145, 111),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x146, 112),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x147, 113),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      0xd5470005u,
+      0x841a0102u, // v_cubema_f32 v5, v2, v0, -v6
+      EncodeVop3Word0(0x14b, 37),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      EncodeVop3Word0(0x151, 38),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      EncodeVop3Word0(0x154, 39),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      EncodeVop3Word0(0x157, 40),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      EncodeVop3Word0(0x152, 41),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x153, 42),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x155, 43),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x156, 44),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x158, 45),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x159, 46),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x148, 47),
+      EncodeVop3Word1(5 + 256, 129, 132),
+      EncodeVop3Word0(0x149, 48),
+      EncodeVop3Word1(5 + 256, 129, 132),
+      EncodeVop3Word0(0x14a, 49),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x14e, 50),
+      EncodeVop3Word1(5 + 256, 6 + 256, 129),
+      EncodeVop3Word0(0x14f, 115),
+      EncodeVop3Word1(5 + 256, 6 + 256, 129),
+      EncodeVop3Word0(0x36d, 51),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x169, 52),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x16a, 53),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x16c, 114),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x371, 54),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x372, 55),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x178, 56),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x346, 57),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x347, 58),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x345, 59),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x36f, 60),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x15d, 61),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x142, 62),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x143, 63),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x16b, 69),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x30f, 70),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x310, 71),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x319, 72),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      0xd70a1007u,
+      0x00020affu,
+      0x0000ffffu, // v_max_i16 v7, 0xffff, v5.hi
+      0xd70c5007u,
+      0x00020882u, // v_min_i16 v7, 2, v4.hi
+      EncodeVop3Word0(0x363, 73),
+      EncodeVop3Word1(129, 132, 0),
+      EncodeVop3Word0(0x360, 26),
+      EncodeVop3Word1(5 + 256, 130, 0),
+      EncodeVop3Word0(0x361, 107),
+      EncodeVop3Word1(5 + 256, 130, 0),
+      EncodeVop3Word0(0x377, 108),
+      EncodeVop3Word1(5 + 256, 128, 128),
+      EncodeVop3Word0(0x378, 109),
+      EncodeVop3Word1(5 + 256, 128, 128),
+      EncodeVop3Word0(0x12f, 75),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      0xd52f0000u,
+      0x60020300u, // v_cvt_pkrtz_f16_f32 v0, -v0, -v1
+      EncodeVop3Word0(0x362, 76),
+      EncodeVop3Word1(6 + 256, 129, 0),
+      0xd7620107u,
+      0x00018509u, // v_ldexp_f32 v7, abs(v9), -2
+      0xd762800du,
+      0x00018906u, // v_ldexp_f32 clamp v13, v6, -4
+      EncodeVop3Word0(0x364, 77),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x368, 78),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x369, 79),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x36a, 80),
+      EncodeVop3Word1(5 + 256, 7 + 256, 0),
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_movk_i32 s9") != std::string::npos),
+        "new decoder did not decode SOPK mov");
+  Check((result.decoded_dump.find("s_cmp_gt_u32") != std::string::npos),
+        "new decoder did not decode SOPK compare");
+  Check((result.decoded_dump.find("v_nop") != std::string::npos),
+        "new decoder did not decode old-backed VOP1 no-op");
+  Check((result.decoded_dump.find("v_mov_b32 v5") != std::string::npos),
+        "new decoder did not decode VOP1 mov");
+  Check((result.decoded_dump.find("v_movrels_b32 v55, v12") != std::string::npos),
+        "new decoder did not decode VOP1 V_MOVRELS_B32");
+  Check(
+      (result.decoded_dump.find("v_mov_b32 v103, v5.sdwa(sel=4") != std::string::npos),
+      "new decoder did not decode VOP1 SDWA source selector");
+  Check(
+      (result.decoded_dump.find("v_cvt_f16_f32 v105.sdwa(sel=5") != std::string::npos),
+      "new decoder did not decode VOP1 SDWA destination selector");
+  Check((result.decoded_dump.find("v_mov_b32 v106, v5.dpp") != std::string::npos),
+        "new decoder did not decode VOP1 DPP source metadata");
+  Check((result.decoded_dump.find("VOP1 SDWA/DPP modifiers are not implemented") == std::string::npos),
+        "new decoder still reports blanket VOP1 SDWA/DPP unsupported reason");
+  Check((result.decoded_dump.find("v_add_nc_u32 v123, v5.sdwa(sel=4") != std::string::npos),
+        "new decoder did not decode VOP2 SDWA source selector");
+  Check(
+      (result.decoded_dump.find("v_and_b32 v124, v5.sdwa(sel=4") != std::string::npos),
+      "new decoder did not decode VOP2 SDWA first source selector");
+  Check((result.decoded_dump.find("v6.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode VOP2 SDWA second source selector");
+  Check((result.decoded_dump.find("v_cndmask_b32 v47, v53,") != std::string::npos) &&
+            (result.decoded_dump.find("v53.neg") != std::string::npos),
+        "new decoder did not decode V_CNDMASK_B32 SDWA source modifier");
+  Check((result.decoded_dump.find("v_cndmask_b32 v7, v0.sdwa(sel=4") != std::string::npos) &&
+            (result.decoded_dump.find("v1") != std::string::npos),
+        "new decoder did not decode full-destination V_CNDMASK_B32 with SDWA "
+        "source");
+  Check((result.decoded_dump.find("v_add_f32 v125, v5.dpp") != std::string::npos),
+        "new decoder did not decode VOP2 DPP source metadata");
+  Check((result.decoded_dump.find("VOP2 SDWA/DPP modifiers are not implemented") == std::string::npos),
+        "new decoder still reports blanket VOP2 SDWA/DPP unsupported reason");
+  Check((result.decoded_dump.find("v_readfirstlane_b32 s24, v5") != std::string::npos),
+        "new decoder did not decode old-backed V_READFIRSTLANE_B32");
+  Check((result.decoded_dump.find("v_cvt_f32_u32 v6") != std::string::npos),
+        "new decoder did not decode VOP1 conversion");
+  Check((result.decoded_dump.find("v_cvt_f32_i32 v9") != std::string::npos),
+        "new decoder did not decode VOP1 signed int-to-float conversion");
+  Check((result.decoded_dump.find("v_cvt_i32_f32 v10") != std::string::npos),
+        "new decoder did not decode VOP1 float-to-signed-int conversion");
+  Check((result.decoded_dump.find("v_cvt_f16_f32 v99") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_F16_F32");
+  Check((result.decoded_dump.find("v_cvt_f32_f16 v100") != std::string::npos),
+        "new decoder did not decode old-backed native V_CVT_F32_F16");
+  Check(
+      (result.decoded_dump.find("v_cvt_f32_f16 v8, v2.sdwa(sel=5") != std::string::npos) &&
+          (result.decoded_dump.find("v2.sdwa(sel=5,sext=0).abs") != std::string::npos),
+      "new decoder did not decode V_CVT_F32_F16 SDWA source selector modifier");
+  Check((result.decoded_dump.find("v_cvt_flr_i32_f32 v64") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_FLR_I32_F32");
+  Check((result.decoded_dump.find("v_cvt_off_f32_i4 v81") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_OFF_F32_I4");
+  Check((result.decoded_dump.find("v_cvt_f32_ubyte0 v65") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_F32_UBYTE0");
+  Check((result.decoded_dump.find("v_cvt_f32_ubyte1 v66") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_F32_UBYTE1");
+  Check((result.decoded_dump.find("v_cvt_f32_ubyte2 v67") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_F32_UBYTE2");
+  Check((result.decoded_dump.find("v_cvt_f32_ubyte3 v68") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_F32_UBYTE3");
+  Check((result.decoded_dump.find("v_rcp_f32 v11") != std::string::npos),
+        "new decoder did not decode VOP1 reciprocal");
+  Check((result.decoded_dump.find("v_fract_f32 v12") != std::string::npos),
+        "new decoder did not decode VOP1 fract");
+  Check((result.decoded_dump.find("v_cos_f32 v22") != std::string::npos),
+        "new decoder did not decode VOP1 cosine");
+  Check((result.decoded_dump.find("v_not_b32 v27") != std::string::npos),
+        "new decoder did not decode VOP1 not");
+  Check((result.decoded_dump.find("v_bfrev_b32 v28") != std::string::npos),
+        "new decoder did not decode VOP1 bit reverse");
+  Check((result.decoded_dump.find("v_ffbh_u32 v31") != std::string::npos),
+        "new decoder did not decode VOP1 find-first-bit-high");
+  Check((result.decoded_dump.find("v_ffbl_b32 v32") != std::string::npos),
+        "new decoder did not decode VOP1 find-first-bit-low");
+  Check((result.decoded_dump.find("v_xnor_b32 v83, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_XNOR_B32");
+  Check((result.decoded_dump.find("v_mbcnt_lo_u32_b32 v84, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_MBCNT_LO_U32_B32");
+  Check((result.decoded_dump.find("v_mbcnt_hi_u32_b32 v85, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_MBCNT_HI_U32_B32");
+  Check((result.decoded_dump.find("v_mac_f32 v89, v6, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_MAC_F32");
+  Check((result.decoded_dump.find("v_madmk_f32 v90, v6, 0x3f800000, v5") != std::string::npos),
+        "new decoder did not decode old-backed V_MADMK_F32 literal form");
+  Check((result.decoded_dump.find("v_madak_f32 v91, v6, v5, 0x40000000") != std::string::npos),
+        "new decoder did not decode old-backed V_MADAK_F32 literal form");
+  Check((result.decoded_dump.find("v_mac_f32 v92, v6, v6") != std::string::npos),
+        "new decoder did not decode old-backed alternate V_MAC_F32");
+  Check((result.decoded_dump.find("v_madmk_f32 v93, v6, 0x3f000000, v5") != std::string::npos),
+        "new decoder did not decode old-backed alternate V_MADMK_F32");
+  Check((result.decoded_dump.find("v_madak_f32 v94, v6, v5, 0x40400000") != std::string::npos),
+        "new decoder did not decode old-backed alternate V_MADAK_F32");
+  Check((result.decoded_dump.find("v_cvt_pkrtz_f16_f32 v95, v6, v6") != std::string::npos),
+        "new decoder did not decode old-backed native V_CVT_PKRTZ_F16_F32");
+  Check((result.decoded_dump.find("v_dot2c_f32_f16 v102, v95, v95") != std::string::npos),
+        "new decoder did not decode old-backed V_DOT2C_F32_F16");
+  Check((result.decoded_dump.find("v_addc_u32 v97, vcc_lo, v5, v6, vcc_lo") != std::string::npos),
+        "new decoder did not decode old-backed V_ADD_CO_U32 carry form");
+  Check((result.decoded_dump.find("v_add_f32 v35") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP2 float add");
+  Check((result.decoded_dump.find("v_mul_u32_u24 v36") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP2 24-bit multiply");
+  Check((result.decoded_dump.find("v_xnor_b32 v86, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed VOP3-encoded V_XNOR_B32");
+  Check((result.decoded_dump.find("v_mac_f32 v96, v6, v6") != std::string::npos),
+        "new decoder did not decode old-backed VOP3-encoded V_MAC_F32");
+  Check((result.decoded_dump.find("v_addc_u32 v98, s30, v5, v6, vcc_lo") != std::string::npos),
+        "new decoder did not decode old-backed VOP3 V_ADD_CO_U32 carry form");
+  Check(
+      (result.decoded_dump.find("v_mbcnt_lo_u32_b32 v87, v5, v6") != std::string::npos),
+      "new decoder did not decode old-backed VOP3-encoded V_MBCNT_LO_U32_B32");
+  Check(
+      (result.decoded_dump.find("v_mbcnt_hi_u32_b32 v88, v5, v6") != std::string::npos),
+      "new decoder did not decode old-backed VOP3-encoded V_MBCNT_HI_U32_B32");
+  Check((result.decoded_dump.find("v_mov_b32 v23") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP1 move");
+  Check(
+      (result.decoded_dump.find("v_readfirstlane_b32 s25, v5") != std::string::npos),
+      "new decoder did not decode old-backed VOP3-encoded V_READFIRSTLANE_B32");
+  Check((result.decoded_dump.find("v_cvt_f32_i32 v24") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP1 signed conversion");
+  Check((result.decoded_dump.find("v_cvt_f16_f32 v101") != std::string::npos),
+        "new decoder did not decode old-backed VOP3-encoded V_CVT_F16_F32");
+  Check((result.decoded_dump.find("v_cvt_flr_i32_f32 v74") != std::string::npos),
+        "new decoder did not decode old-backed VOP3-encoded V_CVT_FLR_I32_F32");
+  Check((result.decoded_dump.find("v_cvt_off_f32_i4 v82") != std::string::npos),
+        "new decoder did not decode old-backed VOP3-encoded V_CVT_OFF_F32_I4");
+  Check((result.decoded_dump.find("v_fract_f32 v25") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP1 fract");
+  Check((result.decoded_dump.find("v_rcp_f32 v26") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP1 reciprocal");
+  Check((result.decoded_dump.find("v_not_b32 v29") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP1 not");
+  Check((result.decoded_dump.find("v_bfrev_b32 v30") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP1 bit reverse");
+  Check((result.decoded_dump.find("v_ffbh_u32 v33") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP1 find-first-bit-high");
+  Check((result.decoded_dump.find("v_ffbl_b32 v34") != std::string::npos),
+        "new decoder did not decode VOP3-encoded VOP1 find-first-bit-low");
+  Check((result.decoded_dump.find("v_cmp_gt_f32") != std::string::npos),
+        "new decoder did not decode VOPC float compare");
+  Check((result.decoded_dump.find("v_cmpx_gt_f32") != std::string::npos),
+        "new decoder did not decode VOPC float compare-and-mask");
+  Check((result.decoded_dump.find("v_cmpx_gt_u32") != std::string::npos),
+        "new decoder did not decode VOPC uint compare-and-mask");
+  Check((result.decoded_dump.find("v_cmp_f_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_F_F32");
+  Check((result.decoded_dump.find("v_cmp_tru_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_TRU_F32");
+  Check((result.decoded_dump.find("v_cmp_o_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_O_F32");
+  Check((result.decoded_dump.find("v_cmp_u_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_U_F32");
+  Check((result.decoded_dump.find("v_cmp_nge_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_NGE_F32");
+  Check((result.decoded_dump.find("v_cmp_nlg_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_NLG_F32");
+  Check((result.decoded_dump.find("v_cmp_ngt_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_NGT_F32");
+  Check((result.decoded_dump.find("v_cmp_nle_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_NLE_F32");
+  Check((result.decoded_dump.find("v_cmp_neq_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_NEQ_F32");
+  Check((result.decoded_dump.find("v_cmp_neq_f32 s0, 0.500000, v1") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_NEQ_F32 SDWA scalar "
+        "destination");
+  Check((result.decoded_dump.find("v_cmpx_lt_u32 exec_lo, v5.sdwa(sel=4") != std::string::npos) &&
+            (result.ir_dump.find("CompareMaskLtU32 exec_lo") != std::string::npos),
+        "new decoder did not route V_CMPX SDWA destination to exec");
+  Check((result.decoded_dump.find("v_cmp_nlt_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_NLT_F32");
+  Check((result.decoded_dump.find("v_cmpx_nge_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMPX_NGE_F32");
+  Check((result.decoded_dump.find("v_cmpx_nlg_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMPX_NLG_F32");
+  Check((result.decoded_dump.find("v_cmpx_ngt_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMPX_NGT_F32");
+  Check((result.decoded_dump.find("v_cmpx_nle_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMPX_NLE_F32");
+  Check((result.decoded_dump.find("v_cmpx_neq_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMPX_NEQ_F32");
+  Check((result.decoded_dump.find("v_cmpx_nlt_f32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMPX_NLT_F32");
+  Check((result.decoded_dump.find("v_cmp_f_i32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_F_I32");
+  Check((result.decoded_dump.find("v_cmp_t_i32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_T_I32");
+  Check((result.decoded_dump.find("v_cmp_f_u32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_F_U32");
+  Check((result.decoded_dump.find("v_cmp_t_u32") != std::string::npos),
+        "new decoder did not decode old-backed V_CMP_T_U32");
+  Check((result.decoded_dump.find("v_cmp_ne_u64 vcc_lo, exec_lo, vcc_lo") != std::string::npos),
+        "new decoder did not decode VOP3-encoded V_CMP_NE_U64");
+  Check((result.ir_dump.find("CompareNeU64 vcc_lo, exec_lo, vcc_lo") != std::string::npos),
+        "V_CMP_NE_U64 did not lower to 64-bit compare IR");
+  Check((result.decoded_dump.find("v_mad_f32 v8") != std::string::npos),
+        "new decoder did not decode VOP3 mad");
+  Check(
+      (result.decoded_dump.find("v_mad_f32 v4, v1.neg, v9, s4") != std::string::npos),
+      "new decoder did not decode VOP3 mad source modifiers");
+  Check(
+      (result.decoded_dump.find("v_cubeid_f32 v110, v5, v6, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_CUBEID_F32");
+  Check(
+      (result.decoded_dump.find("v_cubesc_f32 v111, v5, v6, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_CUBESC_F32");
+  Check(
+      (result.decoded_dump.find("v_cubetc_f32 v112, v5, v6, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_CUBETC_F32");
+  Check(
+      (result.decoded_dump.find("v_cubema_f32 v113, v5, v6, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_CUBEMA_F32");
+  Check((result.decoded_dump.find("v_cubema_f32 v5, v2, v0, v6.neg") != std::string::npos),
+        "new decoder did not decode V_CUBEMA_F32 source modifier");
+  Check((result.decoded_dump.find("v_fma_f32 v37") != std::string::npos),
+        "new decoder did not decode VOP3 fma");
+  Check((result.decoded_dump.find("v_min3_f32 v38") != std::string::npos),
+        "new decoder did not decode VOP3 min3");
+  Check((result.decoded_dump.find("v_max3_f32 v39") != std::string::npos),
+        "new decoder did not decode VOP3 max3");
+  Check((result.decoded_dump.find("v_med3_f32 v40") != std::string::npos),
+        "new decoder did not decode VOP3 med3");
+  Check((result.decoded_dump.find("v_min3_i32 v41") != std::string::npos),
+        "new decoder did not decode VOP3 signed min3");
+  Check((result.decoded_dump.find("v_min3_u32 v42") != std::string::npos),
+        "new decoder did not decode VOP3 unsigned min3");
+  Check((result.decoded_dump.find("v_max3_i32 v43") != std::string::npos),
+        "new decoder did not decode VOP3 signed max3");
+  Check((result.decoded_dump.find("v_max3_u32 v44") != std::string::npos),
+        "new decoder did not decode VOP3 unsigned max3");
+  Check((result.decoded_dump.find("v_med3_i32 v45") != std::string::npos),
+        "new decoder did not decode VOP3 signed med3");
+  Check((result.decoded_dump.find("v_med3_u32 v46") != std::string::npos),
+        "new decoder did not decode VOP3 unsigned med3");
+  Check((result.decoded_dump.find("v_bfe_u32 v47") != std::string::npos),
+        "new decoder did not decode VOP3 unsigned bitfield extract");
+  Check((result.decoded_dump.find("v_bfe_i32 v48") != std::string::npos),
+        "new decoder did not decode VOP3 signed bitfield extract");
+  Check((result.decoded_dump.find("v_bfi_b32 v49") != std::string::npos),
+        "new decoder did not decode VOP3 bitfield insert-select");
+  Check((result.decoded_dump.find("v_alignbit_b32 v50") != std::string::npos),
+        "new decoder did not decode VOP3 alignbit");
+  Check((result.decoded_dump.find("v_alignbyte_b32 v115") != std::string::npos),
+        "new decoder did not decode VOP3 alignbyte");
+  Check((result.decoded_dump.find("v_add3_u32 v51") != std::string::npos),
+        "new decoder did not decode VOP3 add3");
+  Check((result.decoded_dump.find("v_mul_lo_u32 v52, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_MUL_LO_U32");
+  Check((result.decoded_dump.find("v_mul_hi_u32 v53, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_MUL_HI_U32");
+  Check((result.decoded_dump.find("v_mul_hi_i32 v114, v5, v6") != std::string::npos),
+        "new decoder did not decode RDNA2 V_MUL_HI_I32");
+  Check(
+      (result.decoded_dump.find("v_and_or_b32 v54, v5, v6, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_AND_OR_B32");
+  Check((result.decoded_dump.find("v_or3_b32 v55, v5, v6, v7") != std::string::npos),
+        "new decoder did not decode old-backed V_OR3_B32");
+  Check((result.decoded_dump.find("v_xor3_b32 v56, v5, v6, v7") != std::string::npos),
+        "new decoder did not decode old-backed V_XOR3_B32");
+  Check((result.decoded_dump.find("v_lshl_add_u32 v57, v5, v6, v7") != std::string::npos),
+        "new decoder did not decode old-backed V_LSHL_ADD_U32");
+  Check((result.decoded_dump.find("v_add_lshl_u32 v58, v5, v6, v7") != std::string::npos),
+        "new decoder did not decode old-backed V_ADD_LSHL_U32");
+  Check((result.decoded_dump.find("v_xad_u32 v59, v5, v6, v7") != std::string::npos),
+        "new decoder did not decode old-backed V_XAD_U32");
+  Check(
+      (result.decoded_dump.find("v_lshl_or_b32 v60, v5, v6, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_LSHL_OR_B32");
+  Check((result.decoded_dump.find("v_sad_u32 v61, v5, v6, v7") != std::string::npos),
+        "new decoder did not decode old-backed V_SAD_U32");
+  Check(
+      (result.decoded_dump.find("v_mad_i32_i24 v62, v5, v6, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_MAD_I32_I24");
+  Check(
+      (result.decoded_dump.find("v_mad_u32_u24 v63, v5, v6, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_MAD_U32_U24");
+  Check((result.decoded_dump.find("v_mul_lo_i32 v69, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_MUL_LO_I32");
+  Check((result.decoded_dump.find("v_add_i32 v70, s0, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_ADD_I32");
+  Check((result.decoded_dump.find("v_sub_i32 v71, s0, v5, v6") != std::string::npos),
+        "new decoder did not decode RDNA2 V_SUB_CO_U32");
+  Check(
+      (result.decoded_dump.find("v_subrev_i32 v72, s0, v5, v6") != std::string::npos),
+      "new decoder did not decode old-backed V_SUBREV_I32");
+  Check((result.decoded_dump.find("v_max_i16 v7.sdwa(sel=4,sext=0), 0x0000ffff, "
+                            "v5.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
+        "new decoder did not decode RDNA2 V_MAX_I16 literal/op_sel form");
+  Check((result.decoded_dump.find("v_min_i16 v7.sdwa(sel=5,sext=0), 2, v4.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
+        "new decoder did not decode RDNA2 V_MIN_I16 op_sel form");
+  Check((result.decoded_dump.find("v_bfm_b32 v73, 1, 4") != std::string::npos),
+        "new decoder did not decode old-backed V_BFM_B32");
+  Check((result.decoded_dump.find("v_readlane_b32 s26, v5, 2") != std::string::npos),
+        "new decoder did not decode old-backed V_READLANE_B32");
+  Check((result.decoded_dump.find("v_writelane_b32 v107, v5, 2") != std::string::npos),
+        "new decoder did not decode old-backed V_WRITELANE_B32");
+  Check((result.decoded_dump.find("v_permlane16_b32 v108, v5, 0, 0") != std::string::npos),
+        "new decoder did not decode old-backed V_PERMLANE16_B32");
+  Check((result.decoded_dump.find("v_permlanex16_b32 v109, v5, 0, 0") != std::string::npos),
+        "new decoder did not decode old-backed V_PERMLANEX16_B32");
+  Check((result.decoded_dump.find("v_cvt_pkrtz_f16_f32 v75, v6, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_PKRTZ_F16_F32");
+  Check((result.decoded_dump.find("v_cvt_pkrtz_f16_f32 v0, v0.neg, v1.neg") != std::string::npos),
+        "new decoder did not decode V_CVT_PKRTZ_F16_F32 source modifiers");
+  Check((result.decoded_dump.find("v_ldexp_f32 v76, v6, 1") != std::string::npos),
+        "new decoder did not decode old-backed V_LDEXP_F32");
+  Check((result.decoded_dump.find("v_ldexp_f32 v7, v9.abs, -2") != std::string::npos),
+        "new decoder did not decode V_LDEXP_F32 source modifier");
+  Check(
+      (result.decoded_dump.find("v_ldexp_f32 v13.clamp, v6, -4") != std::string::npos),
+      "new decoder did not decode V_LDEXP_F32 clamp modifier");
+  Check((result.decoded_dump.find("v_bcnt_u32_b32 v77, v5, v6") != std::string::npos),
+        "new decoder did not decode old-backed VOP3 V_BCNT_U32_B32");
+  Check((result.decoded_dump.find("v_cvt_pknorm_i16_f32 v78, v6, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_PKNORM_I16_F32");
+  Check((result.decoded_dump.find("v_cvt_pknorm_u16_f32 v79, v6, v6") != std::string::npos),
+        "new decoder did not decode old-backed V_CVT_PKNORM_U16_F32");
+  Check(
+      (result.decoded_dump.find("v_cvt_pk_u16_u32 v80, v5, v7") != std::string::npos),
+      "new decoder did not decode old-backed V_CVT_PK_U16_U32");
+  Check((result.decoded_dump.find("v_mul_f32 v2, s0, s72") != std::string::npos),
+        "new decoder did not decode old-backed V_MUL_F32 SDWA full-width form");
+  Check((result.decoded_dump.find("v_mul_f16 v9.sdwa(sel=4") != std::string::npos) &&
+            (result.decoded_dump.find("v0.sdwa(sel=4") != std::string::npos) &&
+            (result.decoded_dump.find("v1.sdwa(sel=4") != std::string::npos),
+        "new decoder did not decode V_MUL_F16 SDWA low-half form");
+  Check((result.decoded_dump.find("v_sub_f16 v0.sdwa(sel=4") != std::string::npos) &&
+            (result.decoded_dump.find("v0.sdwa(sel=4") != std::string::npos),
+        "new decoder did not decode V_SUB_F16 SDWA low-half form");
+  Check((result.ir_dump.find("ConvertU32ToF32 v6") != std::string::npos),
+        "VOP1 uint-to-float conversion did not lower to IR");
+  Check((result.ir_dump.find("MoveU32 v103, v5.sdwa(sel=4") != std::string::npos),
+        "VOP1 SDWA source selector did not lower to IR metadata");
+  Check((result.ir_dump.find("ConvertF32ToF16 v105.sdwa(sel=5") != std::string::npos),
+        "VOP1 SDWA destination selector did not lower to IR metadata");
+  Check((result.ir_dump.find("MoveU32 v106.dpp") != std::string::npos) &&
+            (result.ir_dump.find("v5.dpp") != std::string::npos),
+        "VOP1 DPP source/destination did not lower to IR metadata");
+  Check((result.ir_dump.find("MoveRelSourceU32 v55, v12, m0") != std::string::npos),
+        "V_MOVRELS_B32 did not lower to indexed VGPR-source IR");
+  Check((result.ir_dump.find("IAddU32 v123, v5.sdwa(sel=4") != std::string::npos),
+        "VOP2 SDWA did not lower first source metadata to IR");
+  Check(
+      (result.ir_dump.find("BitwiseAndU32 v124, v5.sdwa(sel=4") != std::string::npos),
+      "VOP2 SDWA bitwise op did not lower first source metadata to IR");
+  Check((result.ir_dump.find("v6.sdwa(sel=5") != std::string::npos),
+        "VOP2 SDWA bitwise op did not lower second source metadata to IR");
+  Check((result.ir_dump.find("SelectMaskF32Bits v47, vcc_lo, v53.neg, v53") != std::string::npos) &&
+            (result.ir_dump.find("v53.neg") != std::string::npos),
+        "V_CNDMASK_B32 SDWA source modifier did not lower to float-bit select "
+        "IR");
+  Check((result.ir_dump.find("SelectMaskU32 v7, vcc_lo, v1, v0.sdwa(sel=4") != std::string::npos),
+        "full-destination V_CNDMASK_B32 with SDWA source did not lower to "
+        "integer select IR");
+  Check((result.ir_dump.find("FAddF32 v125.dpp") != std::string::npos) &&
+            (result.ir_dump.find("v5.dpp") != std::string::npos),
+        "VOP2 DPP source/destination did not lower to IR metadata");
+  Check((result.ir_dump.find("FMulF32 v2, s0, s72") != std::string::npos),
+        "V_MUL_F32 SDWA full-width form did not lower to IR");
+  Check((result.ir_dump.find("MulF16 v9.sdwa(sel=4") != std::string::npos) &&
+            (result.ir_dump.find("v0.sdwa(sel=4") != std::string::npos) &&
+            (result.ir_dump.find("v1.sdwa(sel=4") != std::string::npos),
+        "V_MUL_F16 SDWA low-half form did not lower to IR");
+  Check((result.ir_dump.find("SubF16 v0.sdwa(sel=4") != std::string::npos) &&
+            (result.ir_dump.find("v0.sdwa(sel=4") != std::string::npos),
+        "V_SUB_F16 SDWA low-half form did not lower to IR");
+  Check((result.ir_dump.find("ConvertF32ToU32 v7") != std::string::npos),
+        "VOP1 float-to-uint conversion did not lower to IR");
+  Check((result.ir_dump.find("ConvertI32ToF32 v9") != std::string::npos),
+        "VOP1 signed int-to-float conversion did not lower to IR");
+  Check((result.ir_dump.find("ConvertF32ToI32 v10") != std::string::npos),
+        "VOP1 float-to-signed-int conversion did not lower to IR");
+  Check((result.ir_dump.find("ConvertF32ToF16 v99, v6") != std::string::npos),
+        "V_CVT_F16_F32 did not lower to shared half-pack IR");
+  Check((result.ir_dump.find("ConvertF16ToF32 v100, v99") != std::string::npos),
+        "V_CVT_F32_F16 did not lower to shared half-unpack IR");
+  Check((result.ir_dump.find("ConvertF16ToF32 v8, v2.sdwa(sel=5") != std::string::npos) &&
+            (result.ir_dump.find("v2.sdwa(sel=5,sext=0).abs") != std::string::npos),
+        "V_CVT_F32_F16 SDWA source selector modifier did not lower to IR");
+  Check((result.ir_dump.find("ReadFirstLaneU32 s24, v5") != std::string::npos),
+        "V_READFIRSTLANE_B32 did not lower to subgroup IR");
+  Check((result.ir_dump.find("ConvertFloorF32ToI32 v64, v6") != std::string::npos),
+        "V_CVT_FLR_I32_F32 did not lower to shared IR");
+  Check((result.ir_dump.find("ConvertI4ToOffsetF32 v81, v5") != std::string::npos),
+        "V_CVT_OFF_F32_I4 did not lower to shared offset-convert IR");
+  Check((result.ir_dump.find("ConvertByteU32ToF32 v65, v5, 0x00000000") != std::string::npos),
+        "V_CVT_F32_UBYTE0 did not lower to shared byte-convert IR");
+  Check((result.ir_dump.find("ConvertByteU32ToF32 v66, v5, 0x00000001") != std::string::npos),
+        "V_CVT_F32_UBYTE1 did not lower to shared byte-convert IR");
+  Check((result.ir_dump.find("ConvertByteU32ToF32 v67, v5, 0x00000002") != std::string::npos),
+        "V_CVT_F32_UBYTE2 did not lower to shared byte-convert IR");
+  Check((result.ir_dump.find("ConvertByteU32ToF32 v68, v5, 0x00000003") != std::string::npos),
+        "V_CVT_F32_UBYTE3 did not lower to shared byte-convert IR");
+  Check((result.ir_dump.find("RcpF32 v11") != std::string::npos),
+        "VOP1 reciprocal did not lower to IR");
+  Check((result.ir_dump.find("FractF32 v12") != std::string::npos),
+        "VOP1 fract did not lower to IR");
+  Check((result.ir_dump.find("TruncF32 v13") != std::string::npos),
+        "VOP1 trunc did not lower to IR");
+  Check((result.ir_dump.find("CeilF32 v14") != std::string::npos),
+        "VOP1 ceil did not lower to IR");
+  Check((result.ir_dump.find("RoundEvenF32 v15") != std::string::npos),
+        "VOP1 round-even did not lower to IR");
+  Check((result.ir_dump.find("FloorF32 v16") != std::string::npos),
+        "VOP1 floor did not lower to IR");
+  Check((result.ir_dump.find("Exp2F32 v17") != std::string::npos),
+        "VOP1 exp2 did not lower to IR");
+  Check((result.ir_dump.find("Log2F32 v18") != std::string::npos),
+        "VOP1 log2 did not lower to IR");
+  Check((result.ir_dump.find("InverseSqrtF32 v19") != std::string::npos),
+        "VOP1 inverse-sqrt did not lower to IR");
+  Check((result.ir_dump.find("SqrtF32 v20") != std::string::npos),
+        "VOP1 sqrt did not lower to IR");
+  Check((result.ir_dump.find("SinF32 v21") != std::string::npos),
+        "VOP1 sin did not lower to IR");
+  Check((result.ir_dump.find("CosF32 v22") != std::string::npos),
+        "VOP1 cos did not lower to IR");
+  Check((result.ir_dump.find("BitwiseNotU32 v27") != std::string::npos),
+        "VOP1 not did not lower to IR");
+  Check((result.ir_dump.find("BitReverseU32 v28") != std::string::npos),
+        "VOP1 bit reverse did not lower to IR");
+  Check((result.ir_dump.find("FindMsbFromHighU32 v31") != std::string::npos),
+        "VOP1 find-first-bit-high did not lower to IR");
+  Check((result.ir_dump.find("FindLsbU32 v32") != std::string::npos),
+        "VOP1 find-first-bit-low did not lower to IR");
+  Check((result.ir_dump.find("BitwiseXnorU32 v83, v5, v6") != std::string::npos),
+        "V_XNOR_B32 did not lower to shared xnor IR");
+  Check((result.ir_dump.find("MaskedBitCountLowU32 v84, v5, v6") != std::string::npos),
+        "V_MBCNT_LO_U32_B32 did not lower to shared masked bit-count IR");
+  Check(
+      (result.ir_dump.find("MaskedBitCountHighU32 v85, v5, v6") != std::string::npos),
+      "V_MBCNT_HI_U32_B32 did not lower to shared masked bit-count IR");
+  Check((result.ir_dump.find("FMadF32 v89, v6, v6, v89") != std::string::npos),
+        "V_MAC_F32 did not lower with the destination register as addend");
+  Check((result.ir_dump.find("FMadF32 v90, v6, 0x3f800000, v5") != std::string::npos),
+        "V_MADMK_F32 did not lower with the literal in source 1");
+  Check((result.ir_dump.find("FMadF32 v91, v6, v5, 0x40000000") != std::string::npos),
+        "V_MADAK_F32 did not lower with the literal in source 2");
+  Check((result.ir_dump.find("FMadF32 v92, v6, v6, v92") != std::string::npos),
+        "alternate V_MAC_F32 did not lower with the destination register as "
+        "addend");
+  Check((result.ir_dump.find("FMadF32 v93, v6, 0x3f000000, v5") != std::string::npos),
+        "alternate V_MADMK_F32 did not lower with the literal in source 1");
+  Check((result.ir_dump.find("FMadF32 v94, v6, v5, 0x40400000") != std::string::npos),
+        "alternate V_MADAK_F32 did not lower with the literal in source 2");
+  Check((result.ir_dump.find("PackF32ToF16Rtz v95, v6, v6") != std::string::npos),
+        "native V_CVT_PKRTZ_F16_F32 did not lower to shared pack IR");
+  Check(
+      (result.ir_dump.find("Dot2AccF32F16 v102, v95, v95, v102") != std::string::npos),
+      "V_DOT2C_F32_F16 did not lower to explicit dot-accumulate IR");
+  Check((result.ir_dump.find("IAddCarryU32 v97, vcc_lo, v5, v6, vcc_lo") != std::string::npos),
+        "V_ADD_CO_U32 did not lower to carry-add IR");
+  Check((result.ir_dump.find("FAddF32 v35") != std::string::npos),
+        "VOP3-encoded VOP2 float add did not lower through shared IR");
+  Check((result.ir_dump.find("UMulU24U32 v36") != std::string::npos),
+        "VOP3-encoded VOP2 24-bit multiply did not lower through shared IR");
+  Check((result.ir_dump.find("BitwiseXnorU32 v86, v5, v6") != std::string::npos),
+        "VOP3-encoded V_XNOR_B32 did not lower through shared IR");
+  Check((result.ir_dump.find("FMadF32 v96, v6, v6, v96") != std::string::npos),
+        "VOP3-encoded V_MAC_F32 did not lower with the destination register as "
+        "addend");
+  Check((result.ir_dump.find("IAddCarryU32 v98, s30, v5, v6, vcc_lo") != std::string::npos),
+        "VOP3-encoded V_ADD_CO_U32 did not lower to carry-add IR");
+  Check((result.ir_dump.find("MaskedBitCountLowU32 v87, v5, v6") != std::string::npos),
+        "VOP3-encoded V_MBCNT_LO_U32_B32 did not lower through shared IR");
+  Check(
+      (result.ir_dump.find("MaskedBitCountHighU32 v88, v5, v6") != std::string::npos),
+      "VOP3-encoded V_MBCNT_HI_U32_B32 did not lower through shared IR");
+  Check((result.ir_dump.find("MoveU32 v23") != std::string::npos),
+        "VOP3-encoded VOP1 move did not lower through shared IR");
+  Check((result.ir_dump.find("ReadFirstLaneU32 s25, v5") != std::string::npos),
+        "VOP3-encoded V_READFIRSTLANE_B32 did not lower through shared IR");
+  Check((result.ir_dump.find("ReadLaneU32 s26, v5, 0x00000002") != std::string::npos),
+        "V_READLANE_B32 did not lower to subgroup lane IR");
+  Check(
+      (result.ir_dump.find("WriteLaneU32 v107, v5, 0x00000002") != std::string::npos),
+      "V_WRITELANE_B32 did not lower to subgroup lane IR");
+  Check((result.ir_dump.find("Permlane16B32 v108, v5, 0x00000000, 0x00000000") != std::string::npos),
+        "V_PERMLANE16_B32 did not lower to subgroup perm-lane IR");
+  Check((result.ir_dump.find("Permlanex16B32 v109, v5, 0x00000000, 0x00000000") != std::string::npos),
+        "V_PERMLANEX16_B32 did not lower to subgroup perm-lane IR");
+  Check((result.ir_dump.find("ConvertI32ToF32 v24") != std::string::npos),
+        "VOP3-encoded VOP1 signed conversion did not lower through shared IR");
+  Check((result.ir_dump.find("ConvertFloorF32ToI32 v74, v6") != std::string::npos),
+        "VOP3-encoded V_CVT_FLR_I32_F32 did not lower through shared IR");
+  Check((result.ir_dump.find("ConvertI4ToOffsetF32 v82, v5") != std::string::npos),
+        "VOP3-encoded V_CVT_OFF_F32_I4 did not lower through shared IR");
+  Check((result.ir_dump.find("FractF32 v25") != std::string::npos),
+        "VOP3-encoded VOP1 fract did not lower through shared IR");
+  Check((result.ir_dump.find("RcpF32 v26") != std::string::npos),
+        "VOP3-encoded VOP1 reciprocal did not lower through shared IR");
+  Check((result.ir_dump.find("BitwiseNotU32 v29") != std::string::npos),
+        "VOP3-encoded VOP1 not did not lower through shared IR");
+  Check((result.ir_dump.find("BitReverseU32 v30") != std::string::npos),
+        "VOP3-encoded VOP1 bit reverse did not lower through shared IR");
+  Check(
+      (result.ir_dump.find("FindMsbFromHighU32 v33") != std::string::npos),
+      "VOP3-encoded VOP1 find-first-bit-high did not lower through shared IR");
+  Check((result.ir_dump.find("FindLsbU32 v34") != std::string::npos),
+        "VOP3-encoded VOP1 find-first-bit-low did not lower through shared IR");
+  Check((result.ir_dump.find("CompareGtF32") != std::string::npos),
+        "VOPC float compare did not lower to IR");
+  Check((result.ir_dump.find("CompareMaskGtF32 exec_lo") != std::string::npos),
+        "VOPC float compare-and-mask did not lower to exec mask IR");
+  Check((result.ir_dump.find("CompareMaskGtU32 exec_lo") != std::string::npos),
+        "VOPC uint compare-and-mask did not lower to exec mask IR");
+  Check((result.ir_dump.find("CompareFalse vcc_lo, v6, v6") != std::string::npos),
+        "VOPC false compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareTrue vcc_lo, v6, v6") != std::string::npos),
+        "VOPC true compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareOrderedF32 vcc_lo, v6, v6") != std::string::npos),
+        "VOPC ordered compare did not lower to shared IR");
+  Check(
+      (result.ir_dump.find("CompareUnorderedF32 vcc_lo, v6, v6") != std::string::npos),
+      "VOPC unordered compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareUnordLtF32 vcc_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-less compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareUnordEqF32 vcc_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-equal compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareUnordLeF32 vcc_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-less-equal compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareUnordGtF32 vcc_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-greater compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareUnordNeF32 vcc_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-not-equal compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareUnordNeF32 s0, 0x3f000000, v1") != std::string::npos),
+        "VOPC SDWA unordered-not-equal compare did not lower to "
+        "scalar-destination IR");
+  Check((result.ir_dump.find("CompareUnordGeF32 vcc_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-greater-equal compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareMaskUnordLtF32 exec_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-less compare-and-mask did not lower to shared IR");
+  Check((result.ir_dump.find("CompareMaskUnordEqF32 exec_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-equal compare-and-mask did not lower to shared IR");
+  Check(
+      (result.ir_dump.find("CompareMaskUnordLeF32 exec_lo, v6, v6") != std::string::npos),
+      "VOPC unordered-less-equal compare-and-mask did not lower to shared IR");
+  Check((result.ir_dump.find("CompareMaskUnordGtF32 exec_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-greater compare-and-mask did not lower to shared IR");
+  Check((result.ir_dump.find("CompareMaskUnordNeF32 exec_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-not-equal compare-and-mask did not lower to shared IR");
+  Check((result.ir_dump.find("CompareMaskUnordGeF32 exec_lo, v6, v6") != std::string::npos),
+        "VOPC unordered-greater-equal compare-and-mask did not lower to shared "
+        "IR");
+  Check((result.ir_dump.find("CompareFalse vcc_lo, v5, v5") != std::string::npos),
+        "VOPC integer false compare did not lower to shared IR");
+  Check((result.ir_dump.find("CompareTrue vcc_lo, v5, v5") != std::string::npos),
+        "VOPC integer true compare did not lower to shared IR");
+  Check((result.ir_dump.find("FMadF32 v8") != std::string::npos),
+        "VOP3 mad did not lower to IR");
+  Check((result.ir_dump.find("FMadF32 v4, v1.neg, v9, s4") != std::string::npos),
+        "VOP3 mad source modifiers did not lower to IR metadata");
+  Check((result.ir_dump.find("CubeIdF32 v110, v5, v6, v7") != std::string::npos),
+        "V_CUBEID_F32 did not lower to cube IR");
+  Check((result.ir_dump.find("CubeScF32 v111, v5, v6, v7") != std::string::npos),
+        "V_CUBESC_F32 did not lower to cube IR");
+  Check((result.ir_dump.find("CubeTcF32 v112, v5, v6, v7") != std::string::npos),
+        "V_CUBETC_F32 did not lower to cube IR");
+  Check((result.ir_dump.find("CubeMaF32 v113, v5, v6, v7") != std::string::npos),
+        "V_CUBEMA_F32 did not lower to cube IR");
+  Check((result.ir_dump.find("CubeMaF32 v5, v2, v0, v6.neg") != std::string::npos),
+        "V_CUBEMA_F32 source modifier did not lower to cube IR");
+  Check((result.ir_dump.find("FMadF32 v37") != std::string::npos),
+        "VOP3 fma did not lower to IR");
+  Check((result.ir_dump.find("FMin3F32 v38") != std::string::npos),
+        "VOP3 min3 did not lower to IR");
+  Check((result.ir_dump.find("FMax3F32 v39") != std::string::npos),
+        "VOP3 max3 did not lower to IR");
+  Check((result.ir_dump.find("FMed3F32 v40") != std::string::npos),
+        "VOP3 med3 did not lower to IR");
+  Check((result.ir_dump.find("IMin3I32 v41") != std::string::npos),
+        "VOP3 signed min3 did not lower to IR");
+  Check((result.ir_dump.find("UMin3U32 v42") != std::string::npos),
+        "VOP3 unsigned min3 did not lower to IR");
+  Check((result.ir_dump.find("IMax3I32 v43") != std::string::npos),
+        "VOP3 signed max3 did not lower to IR");
+  Check((result.ir_dump.find("UMax3U32 v44") != std::string::npos),
+        "VOP3 unsigned max3 did not lower to IR");
+  Check((result.ir_dump.find("IMed3I32 v45") != std::string::npos),
+        "VOP3 signed med3 did not lower to IR");
+  Check((result.ir_dump.find("UMed3U32 v46") != std::string::npos),
+        "VOP3 unsigned med3 did not lower to IR");
+  Check((result.ir_dump.find("BitFieldExtract3U32 v47") != std::string::npos),
+        "VOP3 unsigned bitfield extract did not lower to IR");
+  Check((result.ir_dump.find("BitFieldExtract3I32 v48") != std::string::npos),
+        "VOP3 signed bitfield extract did not lower to IR");
+  Check((result.ir_dump.find("BitFieldInsertSelectU32 v49") != std::string::npos),
+        "VOP3 bitfield insert-select did not lower to IR");
+  Check((result.ir_dump.find("AlignBitU32 v50") != std::string::npos),
+        "VOP3 alignbit did not lower to IR");
+  Check((result.ir_dump.find("AlignByteU32 v115") != std::string::npos),
+        "VOP3 alignbyte did not lower to IR");
+  Check((result.ir_dump.find("IAdd3U32 v51") != std::string::npos),
+        "VOP3 add3 did not lower to IR");
+  Check((result.ir_dump.find("IMulU32 v52, v5, v6") != std::string::npos),
+        "V_MUL_LO_U32 did not lower to multiply IR");
+  Check((result.ir_dump.find("UMulHighU32 v53, v5, v6") != std::string::npos),
+        "V_MUL_HI_U32 did not lower to high-multiply IR");
+  Check((result.ir_dump.find("SMulHighI32 v114, v5, v6") != std::string::npos),
+        "V_MUL_HI_I32 did not lower to signed high-multiply IR");
+  Check((result.ir_dump.find("BitwiseAndOrU32 v54, v5, v6, v7") != std::string::npos),
+        "V_AND_OR_B32 did not lower to ternary bitwise IR");
+  Check((result.ir_dump.find("BitwiseOr3U32 v55, v5, v6, v7") != std::string::npos),
+        "V_OR3_B32 did not lower to ternary bitwise IR");
+  Check((result.ir_dump.find("BitwiseXor3U32 v56, v5, v6, v7") != std::string::npos),
+        "V_XOR3_B32 did not lower to ternary bitwise IR");
+  Check((result.ir_dump.find("ShiftLeftAddU32 v57, v5, v6, v7") != std::string::npos),
+        "V_LSHL_ADD_U32 did not lower to shared shift-left-add IR");
+  Check((result.ir_dump.find("AddShiftLeftU32 v58, v5, v6, v7") != std::string::npos),
+        "V_ADD_LSHL_U32 did not lower to add-shift-left IR");
+  Check((result.ir_dump.find("XorAddU32 v59, v5, v6, v7") != std::string::npos),
+        "V_XAD_U32 did not lower to xor-add IR");
+  Check((result.ir_dump.find("ShiftLeftOrU32 v60, v5, v6, v7") != std::string::npos),
+        "V_LSHL_OR_B32 did not lower to shift-left-or IR");
+  Check((result.ir_dump.find("SadU32 v61, v5, v6, v7") != std::string::npos),
+        "V_SAD_U32 did not lower to sad IR");
+  Check((result.ir_dump.find("IMadI24U32 v62, v5, v6, v7") != std::string::npos),
+        "V_MAD_I32_I24 did not lower to signed 24-bit mad IR");
+  Check((result.ir_dump.find("UMadU24U32 v63, v5, v6, v7") != std::string::npos),
+        "V_MAD_U32_U24 did not lower to unsigned 24-bit mad IR");
+  Check((result.ir_dump.find("IMulU32 v69, v5, v6") != std::string::npos),
+        "V_MUL_LO_I32 did not lower to multiply IR");
+  Check((result.ir_dump.find("IAddCarryU32 v70, s0, v5, v6, 0x00000000") != std::string::npos),
+        "V_ADD_I32 did not lower to carry-out add IR");
+  Check((result.ir_dump.find("ISubBorrowU32 v71, s0, v5, v6") != std::string::npos),
+        "V_SUB_I32 did not lower to borrow-out subtract IR");
+  Check((result.ir_dump.find("ISubBorrowU32 v72, s0, v6, v5") != std::string::npos),
+        "V_SUBREV_I32 did not reverse source order in borrow-out IR");
+  Check((result.ir_dump.find("IMaxI16 v7.sdwa(sel=4,sext=0), 0x0000ffff, "
+                            "v5.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
+        "V_MAX_I16 did not lower to signed halfword max IR");
+  Check((result.ir_dump.find("IMinI16 v7.sdwa(sel=5,sext=0), 0x00000002, "
+                            "v4.opsel(lo=1,hi=0,neghi=0)") != std::string::npos),
+        "V_MIN_I16 did not lower to signed halfword min IR");
+  Check((result.ir_dump.find("BitFieldMaskU32 v73, 0x00000001, 0x00000004") != std::string::npos),
+        "V_BFM_B32 did not lower to shared bitfield-mask IR");
+  Check((result.ir_dump.find("PackF32ToF16Rtz v75, v6, v6") != std::string::npos),
+        "V_CVT_PKRTZ_F16_F32 did not lower to shared pack IR");
+  Check(
+      (result.ir_dump.find("PackF32ToF16Rtz v0, v0.neg, v1.neg") != std::string::npos),
+      "V_CVT_PKRTZ_F16_F32 source modifiers did not lower to shared pack IR");
+  Check((result.ir_dump.find("LdexpF32 v76, v6, 0x00000001") != std::string::npos),
+        "V_LDEXP_F32 did not lower to ldexp IR");
+  Check((result.ir_dump.find("LdexpF32 v7, v9.abs, 0xfffffffe") != std::string::npos),
+        "V_LDEXP_F32 source modifier did not lower to IR");
+  Check(
+      (result.ir_dump.find("LdexpF32 v13.clamp, v6, 0xfffffffc") != std::string::npos),
+      "V_LDEXP_F32 clamp modifier did not lower to IR");
+  Check((result.ir_dump.find("BitCountAddU32 v77, v5, v6") != std::string::npos),
+        "VOP3 V_BCNT_U32_B32 did not lower to bit-count-add IR");
+  Check((result.ir_dump.find("PackSnorm2x16F32 v78, v6, v6") != std::string::npos),
+        "V_CVT_PKNORM_I16_F32 did not lower to shared pack IR");
+  Check((result.ir_dump.find("PackUnorm2x16F32 v79, v6, v6") != std::string::npos),
+        "V_CVT_PKNORM_U16_F32 did not lower to shared pack IR");
+  Check((result.ir_dump.find("PackU16U32 v80, v5, v7") != std::string::npos),
+        "V_CVT_PK_U16_U32 did not lower to shared pack IR");
+  Check(SpirvContainsOpcode(result.spirv, 112),
+        "SPIR-V binary does not contain OpConvertUToF");
+  Check(SpirvContainsOpcode(result.spirv, 109),
+        "SPIR-V binary does not contain OpConvertFToU");
+  Check(SpirvContainsOpcode(result.spirv, 111),
+        "SPIR-V binary does not contain OpConvertSToF");
+  Check(SpirvContainsOpcode(result.spirv, 110),
+        "SPIR-V binary does not contain OpConvertFToS");
+  Check(SpirvContainsOpcode(result.spirv, 136),
+        "SPIR-V binary does not contain OpFDiv");
+  Check(SpirvContainsOpcode(result.spirv, 127),
+        "SPIR-V binary does not contain OpFNegate");
+  Check(SpirvContainsOpcode(result.spirv, 12),
+        "SPIR-V binary does not contain OpExtInst");
+  Check(SpirvContainsExtInst(result.spirv, 58),
+        "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16");
+  Check(SpirvContainsExtInst(result.spirv, 62),
+        "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16");
+  Check(SpirvContainsExtInst(result.spirv, 50),
+        "SPIR-V binary does not contain GLSL.std.450 Fma");
+  Check(SpirvContainsExtInst(result.spirv, 43),
+        "SPIR-V binary does not contain GLSL.std.450 FClamp");
+  Check(SpirvContainsExtInst(result.spirv, 53),
+        "SPIR-V binary does not contain GLSL.std.450 Ldexp");
+  Check(SpirvContainsOpcode(result.spirv, 128),
+        "SPIR-V binary does not contain OpIAdd");
+  Check(SpirvContainsOpcode(result.spirv, 149),
+        "SPIR-V binary does not contain OpIAddCarry");
+  Check(SpirvContainsOpcode(result.spirv, 130),
+        "SPIR-V binary does not contain OpISub");
+  Check(SpirvContainsOpcode(result.spirv, 132),
+        "SPIR-V binary does not contain OpIMul");
+  Check(SpirvContainsOpcode(result.spirv, 171),
+        "SPIR-V binary does not contain OpINotEqual");
+  Check(SpirvContainsOpcode(result.spirv, 200),
+        "SPIR-V binary does not contain OpNot");
+  Check(SpirvContainsOpcode(result.spirv, 204),
+        "SPIR-V binary does not contain OpBitReverse");
+  Check(SpirvContainsOpcode(result.spirv, 205),
+        "SPIR-V binary does not contain OpBitCount");
+  Check(SpirvContainsOpcode(result.spirv, 166),
+        "SPIR-V binary does not contain OpLogicalOr");
+  Check(SpirvContainsOpcode(result.spirv, 167),
+        "SPIR-V binary does not contain OpLogicalAnd");
+  Check(SpirvContainsOpcode(result.spirv, 186),
+        "SPIR-V binary does not contain OpFOrdGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 181),
+        "SPIR-V binary does not contain OpFUnordEqual");
+  Check(SpirvContainsOpcode(result.spirv, 183),
+        "SPIR-V binary does not contain OpFUnordNotEqual");
+  Check(SpirvContainsOpcode(result.spirv, 185),
+        "SPIR-V binary does not contain OpFUnordLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 187),
+        "SPIR-V binary does not contain OpFUnordGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 189),
+        "SPIR-V binary does not contain OpFUnordLessThanEqual");
+  Check(SpirvContainsOpcode(result.spirv, 191),
+        "SPIR-V binary does not contain OpFUnordGreaterThanEqual");
+  Check(SpirvContainsOpcode(result.spirv, 190),
+        "SPIR-V binary does not contain OpFOrdGreaterThanEqual");
+  Check(SpirvContainsOpcode(result.spirv, 184),
+        "SPIR-V binary does not contain OpFOrdLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 173),
+        "SPIR-V binary does not contain OpSGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 174),
+        "SPIR-V binary does not contain OpUGreaterThanEqual");
+  Check(SpirvContainsOpcode(result.spirv, 177),
+        "SPIR-V binary does not contain OpSLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "SPIR-V binary does not contain OpBitFieldUExtract");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "SPIR-V binary does not contain OpShiftRightLogical");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad for cmpx old exec mask");
+  Check(SpirvContainsOpcode(result.spirv, 133),
+        "SPIR-V binary does not contain OpFMul");
+  Check(SpirvContainsOpcode(result.spirv, 129),
+        "SPIR-V binary does not contain OpFAdd");
+  Check(SpirvContainsOpcode(result.spirv, 151),
+        "SPIR-V binary does not contain OpUMulExtended");
+  Check(SpirvContainsOpcode(result.spirv, 152),
+        "SPIR-V binary does not contain OpSMulExtended");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical");
+  Check(SpirvContainsOpcode(result.spirv, 197),
+        "SPIR-V binary does not contain OpBitwiseOr");
+  Check(SpirvContainsOpcode(result.spirv, 198),
+        "SPIR-V binary does not contain OpBitwiseXor");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  Check(SpirvContainsOpcode(result.spirv, 80),
+        "SPIR-V binary does not contain OpCompositeConstruct");
+  Check(SpirvContainsOpcode(result.spirv, 81),
+        "SPIR-V binary does not contain OpCompositeExtract");
+  Check(SpirvContainsOpcode(result.spirv, 339),
+        "SPIR-V binary does not contain OpGroupNonUniformBallot");
+  Check(SpirvContainsOpcode(result.spirv, 343),
+        "SPIR-V binary does not contain OpGroupNonUniformBallotFindLSB");
+  Check(SpirvContainsOpcode(result.spirv, 345),
+        "SPIR-V binary does not contain OpGroupNonUniformShuffle");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerExpandedAluBatch() {
+  const uint32_t shader[] = {
+      EncodeSopk(0x00, 9, 7),          // s_movk_i32 s9, 7
+      EncodeSopk(0x0f, 9, 2),          // s_add_i32 s9, s9, 2
+      EncodeSopk(0x10, 9, 3),          // s_mulk_i32 s9, s9, 3
+      EncodeSop2(0x07, 10, 9, 128),    // s_min_u32 s10, s9, 0
+      EncodeSop2(0x09, 11, 10, 130),   // s_max_u32 s11, s10, 2
+      EncodeSop2(0x26, 12, 11, 130),   // s_mul_i32 s12, s11, 2
+      EncodeVop2(0x05, 1, 242, 0),     // v_subrev_f32 v1, 1.0, v0
+      EncodeVop2(0x0f, 2, 1 + 256, 0), // v_min_f32 v2, v1, v0
+      EncodeVop2(0x10, 3, 1 + 256, 2), // v_max_f32 v3, v1, v2
+      EncodeVop2(0x27, 4, 130, 3),     // v_subrev_nc_u32 v4, 2, v3
+      EncodeVop2(0x16, 5, 129, 4),     // v_lshrrev_b32 v5, 1, v4
+      EncodeVop2(0x1a, 6, 129, 5),     // v_lshlrev_b32 v6, 1, v5
+      EncodeVop2(0x13, 7, 6 + 256, 5), // v_min_u32 v7, v6, v5
+      EncodeVop2(0x14, 8, 7 + 256, 6), // v_max_u32 v8, v7, v6
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_min_u32") != std::string::npos),
+        "new decoder did not decode S_MIN_U32");
+  Check((result.decoded_dump.find("s_mulk_i32") != std::string::npos),
+        "new decoder did not decode S_MULK_I32");
+  Check((result.decoded_dump.find("v_subrev_f32") != std::string::npos),
+        "new decoder did not decode V_SUBREV_F32");
+  Check((result.decoded_dump.find("v_lshlrev_b32") != std::string::npos),
+        "new decoder did not decode V_LSHLREV_B32");
+  Check((result.ir_dump.find("IMulU32 s9, s9, 0x00000003") != std::string::npos),
+        "SOPK multiply did not lower to self-multiply IR");
+  Check((result.ir_dump.find("UMinU32 s10") != std::string::npos),
+        "S_MIN_U32 did not lower to IR");
+  Check((result.ir_dump.find("UMaxU32 s11") != std::string::npos),
+        "S_MAX_U32 did not lower to IR");
+  Check((result.ir_dump.find("FSubF32 v1, v0, 0x3f800000") != std::string::npos),
+        "V_SUBREV_F32 did not reverse source order in IR");
+  Check((result.ir_dump.find("FMinF32 v2") != std::string::npos),
+        "V_MIN_F32 did not lower to IR");
+  Check((result.ir_dump.find("FMaxF32 v3") != std::string::npos),
+        "V_MAX_F32 did not lower to IR");
+  Check((result.ir_dump.find("ISubU32 v4, v3, 0x00000002") != std::string::npos),
+        "V_SUBREV_NC_U32 did not reverse source order in IR");
+  Check((result.ir_dump.find("ShiftLeftLogicalU32 v6, v5, 0x00000001") != std::string::npos),
+        "V_LSHLREV_B32 did not reverse source order in IR");
+  Check((result.ir_dump.find("UMinU32 v7") != std::string::npos),
+        "V_MIN_U32 did not lower to IR");
+  Check((result.ir_dump.find("UMaxU32 v8") != std::string::npos),
+        "V_MAX_U32 did not lower to IR");
+  Check(SpirvContainsOpcode(result.spirv, 132),
+        "SPIR-V binary does not contain OpIMul");
+  Check(SpirvContainsOpcode(result.spirv, 169),
+        "SPIR-V binary does not contain OpSelect");
+  Check(SpirvContainsOpcode(result.spirv, 172),
+        "SPIR-V binary does not contain OpUGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 176),
+        "SPIR-V binary does not contain OpULessThan");
+  Check(SpirvContainsOpcode(result.spirv, 184),
+        "SPIR-V binary does not contain OpFOrdLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 186),
+        "SPIR-V binary does not contain OpFOrdGreaterThan");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerVop3pPackedF16() {
+  const uint32_t shader[] = {
+      EncodeVop3pWord0(0x0f, 114, 0, 7),
+      EncodeVop3pWord1(5 + 256, 6 + 256, 0, 7), // v_pk_add_f16 v114, v5, v6
+      EncodeVop3pWord0(0x10, 115, 0, 7),
+      EncodeVop3pWord1(5 + 256, 6 + 256, 0, 7), // v_pk_mul_f16 v115, v5, v6
+      EncodeVop3pWord0(0x11, 116, 0, 7),
+      EncodeVop3pWord1(5 + 256, 6 + 256, 0, 7), // v_pk_min_f16 v116, v5, v6
+      EncodeVop3pWord0(0x12, 117, 0, 7),
+      EncodeVop3pWord1(5 + 256, 6 + 256, 0, 7), // v_pk_max_f16 v117, v5, v6
+      EncodeVop3pWord0(0x0e, 118, 0, 7, 2),
+      EncodeVop3pWord1(5 + 256, 6 + 256, 7 + 256, 7, 1),
+      EncodeVop3pWord0(0x20, 119),
+      EncodeVop3pWord1(6 + 256, 6 + 256, 6 + 256), // v_fma_f32 via VOP3P
+      0xcc204044u,
+      0x1a022110u, // v_fma_mix_f32 v68, v16.lo, v16.lo, 0.lo
+      EncodeVop3pWord0(0x21, 120, 0, 7),
+      EncodeVop3pWord1(5 + 256, 6 + 256, 7 + 256, 7), // v_mad_mixlo_f16
+      EncodeVop3pWord0(0x22, 121, 0, 7, 1),
+      EncodeVop3pWord1(5 + 256, 6 + 256, 7 + 256, 7, 2), // v_mad_mixhi_f16
+      EncodeVop3Word0(0x34b, 122, 0x0f),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256), // native v_fma_f16
+      EncodeVop3pWord0(0x22, 126, 0, 1, 0, true),
+      EncodeVop3pWord1(242, 243, 3 + 256, 1), // clamped v_mad_mixhi_f16
+      EncodeVop3Word0(0x34b, 127, 0x8, 0, true),
+      EncodeVop3Word1(240, 4 + 256, 241), // clamped native high-half v_fma_f16
+      0xd711001au,
+      0x0002170au, // v_pack_b32_f16 v26, v10, v11
+      0xd711182bu,
+      0x0002170au, // v_pack_b32_f16 v43, v10.hi, v11.hi
+      0x78765714u, // v_pk_fmac_f16 from boot shader 0x0000001c00f5c000
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("v_pk_add_f16 v114") != std::string::npos),
+        "new decoder did not decode old-backed V_PK_ADD_F16");
+  Check((result.decoded_dump.find("v_pk_mul_f16 v115") != std::string::npos),
+        "new decoder did not decode old-backed V_PK_MUL_F16");
+  Check((result.decoded_dump.find("v_pk_min_f16 v116") != std::string::npos),
+        "new decoder did not decode old-backed V_PK_MIN_F16");
+  Check((result.decoded_dump.find("v_pk_max_f16 v117") != std::string::npos),
+        "new decoder did not decode old-backed V_PK_MAX_F16");
+  Check((result.decoded_dump.find("v_pk_fma_f16 v118") != std::string::npos),
+        "new decoder did not decode old-backed V_PK_FMA_F16");
+  Check((result.decoded_dump.find("v_fma_f32 v119") != std::string::npos),
+        "new decoder did not decode old-backed VOP3P V_FMA_F32");
+  Check((result.decoded_dump.find("v_fma_f32 v68, v16.opsel(lo=0,hi=1,neghi=0)") != std::string::npos),
+        "new decoder did not decode VOP3P V_FMA_MIX_F32 source selectors");
+  Check((result.decoded_dump.find("v_mad_mixlo_f16 v120") != std::string::npos),
+        "new decoder did not decode old-backed V_MAD_MIXLO_F16");
+  Check((result.decoded_dump.find("v_mad_mixhi_f16 v121") != std::string::npos),
+        "new decoder did not decode old-backed V_MAD_MIXHI_F16");
+  Check((result.decoded_dump.find("v_fma_f16 v122") != std::string::npos),
+        "new decoder did not decode native VOP3 V_FMA_F16");
+  Check((result.decoded_dump.find("v_mad_mixhi_f16 v126.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode clamped V_MAD_MIXHI_F16 high-half "
+        "destination");
+  Check((result.decoded_dump.find("v_fma_f16 v127.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode clamped native high-half V_FMA_F16");
+  Check((result.decoded_dump.find("v_pack_b32_f16 v26") != std::string::npos),
+        "new decoder did not decode native V_PACK_B32_F16");
+  Check((result.decoded_dump.find("v_pack_b32_f16 v43") != std::string::npos) &&
+            (result.decoded_dump.find("v10.opsel(lo=1") != std::string::npos),
+        "new decoder did not decode V_PACK_B32_F16 source lane selectors");
+  Check((result.decoded_dump.find("v_pk_fmac_f16 v59") != std::string::npos),
+        "new decoder did not decode VOP2 V_PK_FMAC_F16");
+  Check((result.decoded_dump.find("v6.opsel(lo=0,hi=1,neghi=1)") != std::string::npos),
+        "VOP3P high-lane source modifier was not dumped");
+  Check((result.decoded_dump.find("v120.sdwa(sel=4") != std::string::npos),
+        "V_MAD_MIXLO_F16 did not expose low-half destination merge");
+  Check((result.decoded_dump.find("v121.sdwa(sel=5") != std::string::npos),
+        "V_MAD_MIXHI_F16 did not expose high-half destination merge");
+  Check((result.ir_dump.find("PackedAddF16 v114") != std::string::npos),
+        "V_PK_ADD_F16 did not lower to packed f16 IR");
+  Check((result.ir_dump.find("PackedMulF16 v115") != std::string::npos),
+        "V_PK_MUL_F16 did not lower to packed f16 IR");
+  Check((result.ir_dump.find("PackedMinF16 v116") != std::string::npos),
+        "V_PK_MIN_F16 did not lower to packed f16 IR");
+  Check((result.ir_dump.find("PackedMaxF16 v117") != std::string::npos),
+        "V_PK_MAX_F16 did not lower to packed f16 IR");
+  Check((result.ir_dump.find("PackedFmaF16 v118") != std::string::npos),
+        "V_PK_FMA_F16 did not lower to packed f16 IR");
+  Check((result.ir_dump.find("FMadF32 v119") != std::string::npos),
+        "VOP3P V_FMA_F32 did not lower through shared fma IR");
+  Check((result.ir_dump.find("FMadF32 v68, v16.opsel(lo=0,hi=1,neghi=0)") != std::string::npos),
+        "VOP3P V_FMA_MIX_F32 source selectors did not lower to IR");
+  Check((result.ir_dump.find("MadMixF16 v120.sdwa(sel=4") != std::string::npos),
+        "V_MAD_MIXLO_F16 did not lower to shared mad-mix IR");
+  Check((result.ir_dump.find("MadMixF16 v121.sdwa(sel=5") != std::string::npos),
+        "V_MAD_MIXHI_F16 did not lower to shared mad-mix IR");
+  Check((result.ir_dump.find("FmaF16 v122") != std::string::npos),
+        "native VOP3 V_FMA_F16 did not lower to native f16 fma IR");
+  Check((result.ir_dump.find("MadMixF16 v126.sdwa(sel=5") != std::string::npos),
+        "clamped V_MAD_MIXHI_F16 did not lower to shared mad-mix IR");
+  Check((result.ir_dump.find("FmaF16 v127.sdwa(sel=5") != std::string::npos),
+        "clamped native V_FMA_F16 did not lower to native f16 fma IR");
+  Check((result.ir_dump.find("PackB32F16 v26") != std::string::npos),
+        "V_PACK_B32_F16 did not lower to packed-bit IR");
+  Check((result.ir_dump.find("PackB32F16 v43") != std::string::npos) &&
+            (result.ir_dump.find("v10.opsel(lo=1") != std::string::npos),
+        "V_PACK_B32_F16 source selectors did not lower to IR");
+  Check((result.ir_dump.find("PackedFmaF16 v59, v20, v43, v59") != std::string::npos),
+        "V_PK_FMAC_F16 did not lower using destination as packed FMA "
+        "accumulator");
+  Check(SpirvContainsExtInst(result.spirv, 62),
+        "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16 for VOP3P");
+  Check(SpirvContainsExtInst(result.spirv, 58),
+        "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16 for VOP3P");
+  Check(SpirvContainsExtInst(result.spirv, 50),
+        "SPIR-V binary does not contain GLSL.std.450 Fma for VOP3P");
+  Check(
+      SpirvContainsExtInst(result.spirv, 43),
+      "SPIR-V binary does not contain GLSL.std.450 FClamp for clamped f16 ops");
+  Check(!SpirvContainsExtInst(result.spirv, 37),
+        "SPIR-V binary still contains GLSL.std.450 FMin for VOP3P packed min");
+  Check(!SpirvContainsExtInst(result.spirv, 40),
+        "SPIR-V binary still contains GLSL.std.450 FMax for VOP3P packed max");
+  Check(SpirvContainsOpcode(result.spirv, 169),
+        "SPIR-V binary does not contain OpSelect for VOP3P packed min/max");
+  Check(SpirvContainsOpcode(result.spirv, 184),
+        "SPIR-V binary does not contain OpFOrdLessThan for VOP3P packed min");
+  Check(SpirvContainsOpcode(result.spirv, 190),
+        "SPIR-V binary does not contain OpFOrdGreaterThanEqual for VOP3P "
+        "packed max");
+  Check(SpirvContainsOpcode(result.spirv, 197),
+        "SPIR-V binary does not contain OpBitwiseOr for VOP3P packed min/max");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd for VOP3P packed min/max");
+  Check(SpirvContainsOpcode(result.spirv, 129),
+        "SPIR-V binary does not contain OpFAdd");
+  Check(SpirvContainsOpcode(result.spirv, 133),
+        "SPIR-V binary does not contain OpFMul");
+  Check(SpirvContainsOpcode(result.spirv, 81),
+        "SPIR-V binary does not contain OpCompositeExtract");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerStagedShaderOps() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 132),            // s0 = 4
+      EncodeSMovB32(1, 129),            // s1 = 1
+      EncodeSop2(0x05, 2, 0, 1),        // s_subb_u32 s2, s0, s1
+      EncodeSop1(0x1b, 3, 1),           // s_bitset0_b32 s3, s1
+      EncodeVop2(0x36, 70, 5 + 256, 6), // v_fmac_f16 v70, v5, v6
+      EncodeVop2(0x37, 71, 7 + 256, 8),
+      0x3c003c00u, // v_fmamk_f16
+      EncodeVop2(0x38, 72, 9 + 256, 10),
+      0x40004000u, // v_fmaak_f16
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_subb_u32 s2, s0, s1") != std::string::npos),
+        "new decoder did not decode RDNA2 S_SUBB_U32");
+  Check((result.decoded_dump.find("s_bitset0_b32 s3, s1") != std::string::npos),
+        "new decoder did not decode RDNA2 S_BITSET0_B32");
+  Check((result.decoded_dump.find("v_fmac_f16 v70, v5, v6") != std::string::npos),
+        "new decoder did not decode RDNA2 V_FMAC_F16");
+  Check(
+      (result.decoded_dump.find("v_fmamk_f16 v71, v7, 0x3c003c00, v8") != std::string::npos),
+      "new decoder did not consume V_FMAMK_F16 literal as the multiply source");
+  Check((result.decoded_dump.find("v_fmaak_f16 v72, v9, v10, 0x40004000") != std::string::npos),
+        "new decoder did not consume V_FMAAK_F16 literal as the add source");
+  Check((result.ir_dump.find("ScalarSubBorrowCarryU32 s2, s0, s1, scc") != std::string::npos),
+        "S_SUBB_U32 did not lower to scalar subtract-with-borrow IR");
+  Check((result.ir_dump.find("BitClearU32 s3, s3, s1") != std::string::npos),
+        "S_BITSET0_B32 did not lower to bit-clear IR using the destination as "
+        "input");
+  Check(
+      (result.ir_dump.find("FmaF16 v70, v5, v6, v70") != std::string::npos),
+      "V_FMAC_F16 did not lower using the destination as the FMA accumulator");
+  Check(
+      (result.ir_dump.find("FmaF16 v71, v7, 0x3c003c00, v8") != std::string::npos),
+      "V_FMAMK_F16 did not lower with the literal in source 1");
+  Check(
+      (result.ir_dump.find("FmaF16 v72, v9, v10, 0x40004000") != std::string::npos),
+      "V_FMAAK_F16 did not lower with the literal in source 2");
+  Check(SpirvContainsOpcode(result.spirv, 130),
+        "SPIR-V binary does not contain OpISub for S_SUBB_U32");
+  Check(SpirvContainsOpcode(result.spirv, 166),
+        "SPIR-V binary does not contain OpLogicalOr for S_SUBB_U32 borrow-out");
+  Check(SpirvContainsOpcode(result.spirv, 172),
+        "SPIR-V binary does not contain OpUGreaterThan for S_SUBB_U32 "
+        "borrow-out");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical for S_BITSET0_B32");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd for S_BITSET0_B32");
+  Check(SpirvContainsOpcode(result.spirv, 200),
+        "SPIR-V binary does not contain OpNot for S_BITSET0_B32");
+  Check(SpirvContainsExtInst(result.spirv, 50),
+        "SPIR-V binary does not contain GLSL.std.450 Fma for VOP2 F16 FMA ops");
+  Check(SpirvContainsExtInst(result.spirv, 58),
+        "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16 for VOP2 F16 "
+        "FMA ops");
+  Check(SpirvContainsExtInst(result.spirv, 62),
+        "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16 for VOP2 "
+        "F16 FMA ops");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerBootF16UnaryOpcodes() {
+  const uint32_t shader[] = {
+      EncodeVop1(0x55, 4, 249),
+      EncodeVop1Sdwa(3, 5, 2, 6),
+      EncodeVop1(0x5b, 5, 4 + 256),
+      0x7e12b8f9u,
+      0x0006150bu,
+      0x7e12b90cu,
+      EncodeVop1(0x5d, 6, 5 + 256),
+      0x7e0e02f9u,
+      0x008616c1u,
+      0x7e1002f9u,
+      0x008616c1u,
+      EncodeVop1(0x5e, 3, 3 + 256),
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("v_sqrt_f16 v4.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode V_SQRT_F16 SDWA high-half destination");
+  Check((result.decoded_dump.find("v_rndne_f16 v3") != std::string::npos),
+        "new decoder did not decode V_RNDNE_F16");
+  Check((result.decoded_dump.find("v_floor_f16 v5") != std::string::npos),
+        "new decoder did not decode V_FLOOR_F16");
+  Check(
+      (result.decoded_dump.find("v_ceil_f16 v9.sdwa(sel=5") != std::string::npos),
+      "new decoder did not decode boot V_CEIL_F16 SDWA high-half destination");
+  Check((result.decoded_dump.find("v_ceil_f16 v9") != std::string::npos),
+        "new decoder did not decode boot V_CEIL_F16");
+  Check((result.decoded_dump.find("v_trunc_f16 v6") != std::string::npos),
+        "new decoder did not decode V_TRUNC_F16");
+  Check((result.decoded_dump.find("v_mov_b32 v7, -1") != std::string::npos) &&
+            (result.decoded_dump.find("v_mov_b32 v8, -1") != std::string::npos),
+        "new decoder did not accept full-width V_MOV_B32 SDWA with "
+        "DST_U=PRESERVE");
+  Check((result.decoded_dump.find("VOP1 SDWA destination selector is not supported") == std::string::npos),
+        "full-width V_MOV_B32 SDWA with DST_U=PRESERVE was rejected");
+  Check((result.decoded_dump.find("unsupported family=VOP2 opcode=0x00") == std::string::npos),
+        "VOP1 SDWA extension word was decoded as a phantom VOP2 instruction");
+  Check((result.ir_dump.find("SqrtF16 v4.sdwa(sel=5") != std::string::npos),
+        "V_SQRT_F16 did not lower to f16 sqrt IR");
+  Check((result.ir_dump.find("FloorF16 v5") != std::string::npos),
+        "V_FLOOR_F16 did not lower to f16 floor IR");
+  Check((result.ir_dump.find("CeilF16 v9.sdwa(sel=5") != std::string::npos),
+        "boot V_CEIL_F16 SDWA did not lower to f16 ceil IR");
+  Check((result.ir_dump.find("CeilF16 v9") != std::string::npos),
+        "V_CEIL_F16 did not lower to f16 ceil IR");
+  Check((result.ir_dump.find("TruncF16 v6") != std::string::npos),
+        "V_TRUNC_F16 did not lower to f16 trunc IR");
+  Check(
+      (result.ir_dump.find("MoveU32 v7, 0xffffffff") != std::string::npos) &&
+          (result.ir_dump.find("MoveU32 v8, 0xffffffff") != std::string::npos),
+      "full-width V_MOV_B32 SDWA with DST_U=PRESERVE did not lower to move IR");
+  Check((result.ir_dump.find("RoundEvenF16 v3") != std::string::npos),
+        "V_RNDNE_F16 did not lower to f16 round-even IR");
+  Check(SpirvContainsExtInst(result.spirv, 31),
+        "SPIR-V binary does not contain GLSL.std.450 Sqrt for V_SQRT_F16");
+  Check(SpirvContainsExtInst(result.spirv, 8),
+        "SPIR-V binary does not contain GLSL.std.450 Floor for V_FLOOR_F16");
+  Check(SpirvContainsExtInst(result.spirv, 9),
+        "SPIR-V binary does not contain GLSL.std.450 Ceil for V_CEIL_F16");
+  Check(SpirvContainsExtInst(result.spirv, 3),
+        "SPIR-V binary does not contain GLSL.std.450 Trunc for V_TRUNC_F16");
+  Check(
+      SpirvContainsExtInst(result.spirv, 2),
+      "SPIR-V binary does not contain GLSL.std.450 RoundEven for V_RNDNE_F16");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
@@ -2445,6 +4190,363 @@ void TestNewShaderRecompilerVop1SdwaNotDestination() {
   check_rejected(0x00064400u, "V_NOT_B32 SDWA accepted output modifier");
 }
 
+void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
+  const uint32_t shader[] = {
+      0xd7070001u,
+      0x00020081u, // v_lshrrev_b16 v1.lo, 1, v0.lo
+      0xd7071008u,
+      0x0002128fu, // v_lshrrev_b16 with selected high source lane
+      0xd7144005u,
+      0x00020481u, // v_lshlrev_b16 v5.hi, 1, v2.lo
+      0xd7034001u,
+      0x0002066au, // v_add_nc_u16 v1.hi, v106.lo, v3.lo
+      0xd70e4011u,
+      0x00020e80u, // v_sub_nc_i16 v17.hi, 0, v7.lo
+      0xcc03400eu,
+      0x10020e80u, // v_pk_sub_i16 from boot shader 0x0000001980eb0000
+      0xcc0a4104u,
+      0x300202ffu,
+      0x00007fffu, // v_pk_add_u16 with literal
+      0x360e04f9u,
+      0x04861482u, // v_and_b32 SDWA partial low-half destination
+      0x381212f9u,
+      0x04041508u, // v_or_b32 SDWA partial high-half destination
+      0xcc10c00cu,
+      0x18021d0du, // clamped v_pk_mul_f16
+      0x7e08a0f9u,
+      0x00061500u, // v_cvt_f16_u16 v4.hi, v0 from boot shader
+      EncodeVop1(0x50, 16, 10 + 256), // v_cvt_f16_u16 v16, v10
+      0x7e1ca307u,                    // v_cvt_f16_i16 v14, v7
+      0x7e1ca2f9u,
+      0x00051511u,                   // v_cvt_f16_i16 v14.hi, v17.hi
+      0x7e08a704u,                   // v_cvt_i16_f16 v4, v4 from boot shader
+      EncodeVop1(0x52, 15, 4 + 256), // v_cvt_u16_f16 v15, v4
+      0x4a0a08f9u,
+      0x0c860688u, // v_add_nc_u32 v5, 8, sign-extended v4.lo
+      0x4a0c0cf9u,
+      0x0d860688u, // v_add_nc_u32 v6, 8, sign-extended v6.hi
+      0x4a08c2f9u,
+      0x0686156au, // captured v_add_nc_u32 v4.word1, vcc_lo, v97; preserve
+                   // word0
+      0x4c1616f9u,
+      0x0686128du, // v_sub_nc_u32 v11.byte2, 13, v11; preserve other
+                   // destination bytes
+      0x261418f9u,
+      0x0686149fu, // v_min_u32 v10.word0, 31, v12; preserve upper destination
+                   // word
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("v_lshrrev_b16 v1.sdwa(sel=4") != std::string::npos),
+        "new decoder did not decode low-half V_LSHRREV_B16");
+  Check((result.decoded_dump.find("v_lshlrev_b16 v5.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode high-half V_LSHLREV_B16");
+  Check((result.decoded_dump.find("v_add_nc_u16 v1.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode V_ADD_NC_U16 op_sel destination");
+  Check((result.decoded_dump.find("v_sub_nc_i16 v17.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode V_SUB_NC_I16 op_sel destination");
+  Check((result.decoded_dump.find("v_pk_sub_i16 v14") != std::string::npos),
+        "new decoder did not decode V_PK_SUB_I16");
+  Check((result.decoded_dump.find("v_pk_add_u16 v4") != std::string::npos),
+        "new decoder did not decode V_PK_ADD_U16");
+  Check((result.decoded_dump.find("v_pk_add_u16 v4, 0x00007fff") != std::string::npos),
+        "V_PK_ADD_U16 literal was not consumed as a source operand");
+  Check((result.decoded_dump.find("v_and_b32 v7.sdwa(sel=4") != std::string::npos),
+        "new decoder did not decode partial-destination V_AND_B32 SDWA");
+  Check((result.decoded_dump.find("v_or_b32 v9.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode partial-destination V_OR_B32 SDWA");
+  Check((result.decoded_dump.find("v_pk_mul_f16 v12") != std::string::npos),
+        "new decoder did not decode clamped V_PK_MUL_F16");
+  Check((result.decoded_dump.find("v_cvt_f16_u16 v4.sdwa(sel=5") != std::string::npos),
+        "new decoder did not decode/consume SDWA V_CVT_F16_U16");
+  Check((result.decoded_dump.find("v_cvt_f16_u16 v16") != std::string::npos),
+        "new decoder did not decode plain V_CVT_F16_U16");
+  Check((result.decoded_dump.find("v_cvt_f16_i16 v14") != std::string::npos),
+        "new decoder did not decode plain V_CVT_F16_I16");
+  Check(
+      (result.decoded_dump.find("v_cvt_f16_i16 v14.sdwa(sel=5") != std::string::npos),
+      "new decoder did not decode V_CVT_F16_I16 SDWA high-half destination");
+  Check((result.decoded_dump.find("v_cvt_i16_f16 v4") != std::string::npos),
+        "new decoder did not decode plain V_CVT_I16_F16");
+  Check((result.decoded_dump.find("v_cvt_u16_f16 v15") != std::string::npos),
+        "new decoder still rejects plain V_CVT_U16_F16");
+  Check((result.decoded_dump.find("v_add_nc_u32 v5") != std::string::npos) &&
+            (result.decoded_dump.find("v4.sdwa(sel=4,sext=1") != std::string::npos),
+        "new decoder did not decode V_ADD_NC_U32 SDWA sign-extended low word");
+  Check((result.decoded_dump.find("v_add_nc_u32 v6") != std::string::npos) &&
+            (result.decoded_dump.find("v6.sdwa(sel=5,sext=1") != std::string::npos),
+        "new decoder did not decode V_ADD_NC_U32 SDWA sign-extended high word");
+  Check(
+      (result.decoded_dump.find("v_add_nc_u32 v4.sdwa(sel=5,sext=0), vcc_lo, v97") != std::string::npos),
+      "new decoder did not decode captured V_ADD_NC_U32 high-word destination");
+  Check((result.decoded_dump.find("v_sub_nc_u32 v11.sdwa(sel=2") != std::string::npos),
+        "new decoder did not decode V_SUB_NC_U32 SDWA byte-2 destination");
+  Check((result.decoded_dump.find("v_min_u32 v10.sdwa(sel=4") != std::string::npos),
+        "new decoder did not decode V_MIN_U32 SDWA low-word destination");
+  Check(
+      (result.decoded_dump.find("unsupported family=VOP2 opcode=0x00") == std::string::npos),
+      "literal/SDWA extension words were decoded as phantom VOP2 instructions");
+  Check((result.decoded_dump.find("VOP2 SDWA destination selector is not supported") == std::string::npos),
+        "partial bitwise SDWA destination is still rejected");
+  Check((result.ir_dump.find("ShiftRightLogicalU16") != std::string::npos),
+        "V_LSHRREV_B16 did not lower to 16-bit logical right shift IR");
+  Check((result.ir_dump.find("ShiftLeftLogicalU16") != std::string::npos),
+        "V_LSHLREV_B16 did not lower to 16-bit logical left shift IR");
+  Check((result.ir_dump.find("IAddU16 v1.sdwa(sel=5") != std::string::npos),
+        "V_ADD_NC_U16 did not lower to 16-bit add IR");
+  Check((result.ir_dump.find("ISubI16 v17.sdwa(sel=5") != std::string::npos),
+        "V_SUB_NC_I16 did not lower to 16-bit subtract IR");
+  Check((result.ir_dump.find("PackedSubI16 v14") != std::string::npos),
+        "V_PK_SUB_I16 did not lower to packed I16 subtract IR");
+  Check((result.ir_dump.find("PackedAddU16 v4") != std::string::npos),
+        "V_PK_ADD_U16 did not lower to packed U16 add IR");
+  Check((result.ir_dump.find("ConvertI16ToF16 v14") != std::string::npos),
+        "V_CVT_F16_I16 did not lower to signed I16-to-F16 conversion IR");
+  Check(
+      (result.ir_dump.find("ConvertU16ToF16 v4.sdwa(sel=5") != std::string::npos),
+      "V_CVT_F16_U16 SDWA did not lower to unsigned U16-to-F16 conversion IR");
+  Check((result.ir_dump.find("ConvertU16ToF16 v16") != std::string::npos),
+        "V_CVT_F16_U16 plain form did not lower to unsigned U16-to-F16 "
+        "conversion IR");
+  Check((result.ir_dump.find("ConvertF16ToI16 v4") != std::string::npos),
+        "V_CVT_I16_F16 did not lower to signed F16-to-I16 conversion IR");
+  Check((result.ir_dump.find("ConvertF16ToU16 v15") != std::string::npos),
+        "V_CVT_U16_F16 did not lower to unsigned F16-to-U16 conversion IR");
+  Check((result.ir_dump.find("IAddU32 v5") != std::string::npos) &&
+            (result.ir_dump.find("v4.sdwa(sel=4,sext=1") != std::string::npos),
+        "V_ADD_NC_U32 SDWA sign-extended low word did not lower to IR");
+  Check((result.ir_dump.find("IAddU32 v6") != std::string::npos) &&
+            (result.ir_dump.find("v6.sdwa(sel=5,sext=1") != std::string::npos),
+        "V_ADD_NC_U32 SDWA sign-extended high word did not lower to IR");
+  Check((result.ir_dump.find("IAddU32 v4.sdwa(sel=5,sext=0), vcc_lo, v97") != std::string::npos),
+        "captured V_ADD_NC_U32 high-word destination did not lower to IR");
+  Check((result.ir_dump.find("ISubU32 v11.sdwa(sel=2") != std::string::npos),
+        "V_SUB_NC_U32 SDWA byte-2 destination did not lower to IR");
+  Check((result.ir_dump.find("UMinU32 v10.sdwa(sel=4") != std::string::npos),
+        "V_MIN_U32 SDWA low-word destination did not lower to IR");
+  Check(SpirvContainsOpcode(result.spirv, 128),
+        "SPIR-V binary does not contain OpIAdd for U16 operations");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract for SDWA sign "
+        "extension");
+  Check(SpirvContainsOpcode(result.spirv, 130),
+        "SPIR-V binary does not contain OpISub for I16 operations");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "SPIR-V binary does not contain OpShiftRightLogical for B16 shift");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical for B16 shift");
+  Check(SpirvContainsOpcode(result.spirv, 197),
+        "SPIR-V binary does not contain OpBitwiseOr for packed U16 result");
+  Check(SpirvContainsOpcode(result.spirv, 124),
+        "SPIR-V binary does not contain OpConvertSToF for V_CVT_F16_I16");
+  Check(SpirvContainsOpcode(result.spirv, 109),
+        "SPIR-V binary does not contain OpConvertFToU for V_CVT_U16_F16");
+  Check(SpirvContainsOpcode(result.spirv, 110),
+        "SPIR-V binary does not contain OpConvertFToS for V_CVT_I16_F16");
+  Check(SpirvContainsOpcode(result.spirv, 112),
+        "SPIR-V binary does not contain OpConvertUToF for V_CVT_F16_U16");
+  Check(SpirvContainsExtInst(result.spirv, 43),
+        "SPIR-V binary does not contain GLSL.std.450 FClamp for clamped "
+        "V_PK_MUL_F16");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerScalarB64Alu() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),        // s0 = 1
+      EncodeSMovB32(1, 130),        // s1 = 2
+      EncodeSop1(0x07, 41, 0),      // s_not_b32 s41, s0
+      EncodeSop1(0x04, 2, 0),       // s_mov_b64 s[2:3], s[0:1]
+      EncodeSop1(0x08, 4, 2),       // s_not_b64 s[4:5], s[2:3]
+      EncodeSop2(0x0f, 6, 2, 4),    // s_and_b64 s[6:7], s[2:3], s[4:5]
+      EncodeSop2(0x11, 8, 6, 2),    // s_or_b64 s[8:9], s[6:7], s[2:3]
+      EncodeSop2(0x13, 10, 8, 4),   // s_xor_b64 s[10:11], s[8:9], s[4:5]
+      EncodeSop2(0x14, 36, 0, 1),   // s_andn2_b32 s36, s0, s1
+      EncodeSop2(0x16, 37, 0, 1),   // s_orn2_b32 s37, s0, s1
+      EncodeSop2(0x18, 38, 0, 1),   // s_nand_b32 s38, s0, s1
+      EncodeSop2(0x1a, 39, 0, 1),   // s_nor_b32 s39, s0, s1
+      EncodeSop2(0x1c, 40, 0, 1),   // s_xnor_b32 s40, s0, s1
+      EncodeSopc(0x06, 0, 0),       // s_cmp_eq_u32 s0, s0
+      EncodeSop2(0x0b, 12, 10, 2),  // s_cselect_b64 s[12:13], s[10:11], s[2:3]
+      EncodeSop2(0x15, 14, 10, 4),  // s_andn2_b64 s[14:15], s[10:11], s[4:5]
+      EncodeSop2(0x17, 16, 14, 6),  // s_orn2_b64 s[16:17], s[14:15], s[6:7]
+      EncodeSop2(0x19, 18, 16, 8),  // s_nand_b64 s[18:19], s[16:17], s[8:9]
+      EncodeSop2(0x1b, 20, 18, 10), // s_nor_b64 s[20:21], s[18:19], s[10:11]
+      EncodeSop2(0x1d, 22, 20, 12), // s_xnor_b64 s[22:23], s[20:21], s[12:13]
+      EncodeSop2(0x1f, 24, 22, 1),  // s_lshl_b64 s[24:25], s[22:23], s1
+      EncodeSop2(0x21, 26, 24, 0),  // s_lshr_b64 s[26:27], s[24:25], s0
+      EncodeSop2(0x25, 28, 132, 130), // s_bfm_b64 s[28:29], 4, 2
+      EncodeSop1(0x10, 30, 26),       // s_bcnt1_i32_b64 s30, s[26:27]
+      EncodeSop1(0x14, 31, 26),       // s_ff1_i32_b64 s31, s[26:27]
+      EncodeSop1(0x16, 106, 26),      // s_flbit_i32_b64 vcc_lo, s[26:27]
+      EncodeSop1(0x3b, 32, 30),       // s_bitreplicate_b64_b32 s[32:33], s30
+      EncodeSop2(0x29, 34, 32, 255), // s_bfe_u64 s[34:35], s[32:33], 0x00040002
+      0x00040002u,
+      EncodeSop1(0x0a, 126, 126), // s_wqm_b64 exec, exec
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_mov_b64 s2, s0") != std::string::npos),
+        "new decoder did not decode old-backed S_MOV_B64");
+  Check((result.decoded_dump.find("s_not_b32 s41, s0") != std::string::npos),
+        "new decoder did not decode RDNA2 S_NOT_B32");
+  Check((result.decoded_dump.find("s_not_b64 s4, s2") != std::string::npos),
+        "new decoder did not decode old-backed S_NOT_B64");
+  Check((result.decoded_dump.find("s_and_b64 s6, s2, s4") != std::string::npos),
+        "new decoder did not decode old-backed S_AND_B64");
+  Check((result.decoded_dump.find("s_or_b64 s8, s6, s2") != std::string::npos),
+        "new decoder did not decode old-backed S_OR_B64");
+  Check((result.decoded_dump.find("s_xor_b64 s10, s8, s4") != std::string::npos),
+        "new decoder did not decode old-backed S_XOR_B64");
+  Check((result.decoded_dump.find("s_andn2_b32 s36, s0, s1") != std::string::npos),
+        "new decoder did not decode RDNA2 S_ANDN2_B32");
+  Check((result.decoded_dump.find("s_orn2_b32 s37, s0, s1") != std::string::npos),
+        "new decoder did not decode RDNA2 S_ORN2_B32");
+  Check((result.decoded_dump.find("s_nand_b32 s38, s0, s1") != std::string::npos),
+        "new decoder did not decode RDNA2 S_NAND_B32");
+  Check((result.decoded_dump.find("s_nor_b32 s39, s0, s1") != std::string::npos),
+        "new decoder did not decode RDNA2 S_NOR_B32");
+  Check((result.decoded_dump.find("s_xnor_b32 s40, s0, s1") != std::string::npos),
+        "new decoder did not decode RDNA2 S_XNOR_B32");
+  Check((result.decoded_dump.find("s_cselect_b64 s12, s10, s2") != std::string::npos),
+        "new decoder did not decode old-backed S_CSELECT_B64");
+  Check((result.decoded_dump.find("s_andn2_b64 s14, s10, s4") != std::string::npos),
+        "new decoder did not decode old-backed S_ANDN2_B64");
+  Check((result.decoded_dump.find("s_orn2_b64 s16, s14, s6") != std::string::npos),
+        "new decoder did not decode old-backed S_ORN2_B64");
+  Check((result.decoded_dump.find("s_nand_b64 s18, s16, s8") != std::string::npos),
+        "new decoder did not decode old-backed S_NAND_B64");
+  Check((result.decoded_dump.find("s_nor_b64 s20, s18, s10") != std::string::npos),
+        "new decoder did not decode old-backed S_NOR_B64");
+  Check((result.decoded_dump.find("s_xnor_b64 s22, s20, s12") != std::string::npos),
+        "new decoder did not decode old-backed S_XNOR_B64");
+  Check((result.decoded_dump.find("s_lshl_b64 s24, s22, s1") != std::string::npos),
+        "new decoder did not decode old-backed S_LSHL_B64");
+  Check((result.decoded_dump.find("s_lshr_b64 s26, s24, s0") != std::string::npos),
+        "new decoder did not decode old-backed S_LSHR_B64");
+  Check((result.decoded_dump.find("s_bfm_b64 s28, 4, 2") != std::string::npos),
+        "new decoder did not decode old-backed S_BFM_B64");
+  Check((result.decoded_dump.find("s_bcnt1_i32_b64 s30, s26") != std::string::npos),
+        "new decoder did not decode old-backed S_BCNT1_I32_B64");
+  Check((result.decoded_dump.find("s_ff1_i32_b64 s31, s26") != std::string::npos),
+        "new decoder did not decode RDNA2 S_FF1_I32_B64");
+  Check((result.decoded_dump.find("s_flbit_i32_b64 vcc_lo, s26") != std::string::npos),
+        "new decoder did not decode RDNA2 S_FLBIT_I32_B64");
+  Check((result.decoded_dump.find("s_bitreplicate_b64_b32 s32, s30") != std::string::npos),
+        "new decoder did not decode old-backed S_BITREPLICATE_B64_B32");
+  Check((result.decoded_dump.find("s_bfe_u64 s34, s32, 0x00040002") != std::string::npos),
+        "new decoder did not decode old-backed S_BFE_U64");
+  Check((result.decoded_dump.find("s_wqm_b64 exec_lo, exec_lo") != std::string::npos),
+        "new decoder did not decode old-backed S_WQM_B64");
+  Check((result.ir_dump.find("MoveU64 s2, s0") != std::string::npos),
+        "S_MOV_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseNotU32 s41, s0") != std::string::npos),
+        "S_NOT_B32 did not lower to scalar bitwise-not IR");
+  Check((result.ir_dump.find("BitwiseNotU64 s4, s2") != std::string::npos),
+        "S_NOT_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseAndU64 s6, s2, s4") != std::string::npos),
+        "S_AND_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseOrU64 s8, s6, s2") != std::string::npos),
+        "S_OR_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseXorU64 s10, s8, s4") != std::string::npos),
+        "S_XOR_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseAndNotU32 s36, s0, s1") != std::string::npos),
+        "S_ANDN2_B32 did not lower to scalar bitwise-and-not IR");
+  Check((result.ir_dump.find("BitwiseOrNotU32 s37, s0, s1") != std::string::npos),
+        "S_ORN2_B32 did not lower to scalar bitwise-or-not IR");
+  Check((result.ir_dump.find("BitwiseNandU32 s38, s0, s1") != std::string::npos),
+        "S_NAND_B32 did not lower to scalar bitwise-nand IR");
+  Check((result.ir_dump.find("BitwiseNorU32 s39, s0, s1") != std::string::npos),
+        "S_NOR_B32 did not lower to scalar bitwise-nor IR");
+  Check((result.ir_dump.find("BitwiseXnorU32 s40, s0, s1") != std::string::npos),
+        "S_XNOR_B32 did not lower to scalar bitwise-xnor IR");
+  Check((result.ir_dump.find("SelectU64 s12") != std::string::npos),
+        "S_CSELECT_B64 did not lower to paired-dword select IR");
+  Check((result.ir_dump.find("BitwiseAndNotU64 s14, s10, s4") != std::string::npos),
+        "S_ANDN2_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseOrNotU64 s16, s14, s6") != std::string::npos),
+        "S_ORN2_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseNandU64 s18, s16, s8") != std::string::npos),
+        "S_NAND_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseNorU64 s20, s18, s10") != std::string::npos),
+        "S_NOR_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitwiseXnorU64 s22, s20, s12") != std::string::npos),
+        "S_XNOR_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("ShiftLeftLogicalU64 s24, s22, s1") != std::string::npos),
+        "S_LSHL_B64 did not lower to paired-dword IR");
+  Check(
+      (result.ir_dump.find("ShiftRightLogicalU64 s26, s24, s0") != std::string::npos),
+      "S_LSHR_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitFieldMaskU64 s28") != std::string::npos),
+        "S_BFM_B64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitCountU64 s30, s26") != std::string::npos),
+        "S_BCNT1_I32_B64 did not lower to paired-source bit count IR");
+  Check((result.ir_dump.find("FindLsbU64 s31, s26") != std::string::npos),
+        "S_FF1_I32_B64 did not lower to paired-source bit search IR");
+  Check((result.ir_dump.find("FindMsbFromHighU64 vcc_lo, s26") != std::string::npos),
+        "S_FLBIT_I32_B64 did not lower to paired-source leading-zero IR");
+  Check((result.ir_dump.find("BitReplicateB64B32 s32, s30") != std::string::npos),
+        "S_BITREPLICATE_B64_B32 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("BitFieldExtractU64 s34, s32, 0x00040002") != std::string::npos),
+        "S_BFE_U64 did not lower to paired-dword IR");
+  Check((result.ir_dump.find("WqmB64 exec_lo, exec_lo") != std::string::npos),
+        "S_WQM_B64 did not lower to whole-quad-mask IR");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad for scalar B64 ops");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "SPIR-V binary does not contain OpStore for scalar B64 ops");
+  Check(SpirvContainsOpcode(result.spirv, 197),
+        "SPIR-V binary does not contain OpBitwiseOr for scalar B64 ops");
+  Check(SpirvContainsOpcode(result.spirv, 198),
+        "SPIR-V binary does not contain OpBitwiseXor for scalar B64 ops");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd for scalar B64 ops");
+  Check(SpirvContainsOpcode(result.spirv, 200),
+        "SPIR-V binary does not contain OpNot for scalar B64 ops");
+  Check(SpirvContainsOpcode(result.spirv, 169),
+        "SPIR-V binary does not contain OpSelect for scalar B64 select");
+  Check(SpirvContainsOpcode(result.spirv, 171),
+        "SPIR-V binary does not contain OpINotEqual for scalar B64 whole-quad "
+        "mask");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical for scalar B64 "
+        "shifts");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "SPIR-V binary does not contain OpShiftRightLogical for scalar B64 "
+        "shifts");
+  Check(SpirvContainsOpcode(result.spirv, 201),
+        "SPIR-V binary does not contain OpBitFieldInsert for scalar B64 mask");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "SPIR-V binary does not contain OpBitFieldUExtract for scalar B64 "
+        "extract");
+  Check(SpirvContainsOpcode(result.spirv, 205),
+        "SPIR-V binary does not contain OpBitCount for scalar B64 bit count");
+  uint32_t componentwise_u64_values = 0;
+  for (const auto *block : result.program.blocks) {
+    for (const auto &value : *block) {
+      switch (value.GetOpcode()) {
+      case ShaderRecompiler::IR::ValueOpcode::BitwiseAnd64:
+        componentwise_u64_values++;
+        break;
+      default:
+        break;
+      }
+    }
+  }
+  Check(
+      componentwise_u64_values == 0u,
+      "architectural B64 lane operations retained vector pack/unpack traffic");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerScalarB64LaneTranslation() {
   const uint32_t shader[] = {
       EncodeSop1(0x04, 2, 0),      // s_mov_b64 s[2:3], s[0:1]
@@ -2509,6 +4611,193 @@ void TestFloatComparisonInputModes() {
     }
     Check(comparisons == 2, "comparison input-mode fixture did not translate both precisions");
   }
+}
+
+void TestNewShaderRecompilerSignedCompareAlu() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 193),   // s0 = -1
+      EncodeSMovB32(1, 129),   // s1 = 1
+      EncodeSopc(0x02, 0, 1),  // s_cmp_gt_i32 s0, s1
+      EncodeSopk(0x07, 0, -2), // s_cmp_lt_i32 s0, -2
+      EncodeVopc(0x84, 0, 1),  // v_cmp_gt_i32 s0, v1
+      EncodeVopc(0x81, 0, 1),  // v_cmp_lt_i32 s0, v1
+      0x7d130ef9u,
+      0x86068413u, // v_cmp_lt_i16 vcc_lo.sdwa, v19.word0, v7.word1
+      0x7d1d02f9u,
+      0x86068213u,            // v_cmp_ge_i16 vcc_lo.sdwa, v19.word0, v1.word1
+      EncodeVopc(0xa9, 0, 1), // v_cmp_lt_u16 s0, v1
+      EncodeVopc(0x94, 0, 1), // v_cmpx_gt_i32 s0, v1
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_cmp_gt_i32") != std::string::npos),
+        "new decoder did not decode SOPC signed compare");
+  Check((result.decoded_dump.find("s_cmp_lt_i32") != std::string::npos),
+        "new decoder did not decode SOPK signed compare");
+  Check((result.decoded_dump.find("v_cmp_gt_i32") != std::string::npos),
+        "new decoder did not decode VOPC signed greater-than compare");
+  Check((result.decoded_dump.find("v_cmp_lt_i32") != std::string::npos),
+        "new decoder did not decode VOPC signed less-than compare");
+  Check((result.decoded_dump.find("v_cmp_lt_i16") != std::string::npos),
+        "new decoder did not decode VOPC signed halfword less-than compare");
+  Check((result.decoded_dump.find("v_cmp_ge_i16") != std::string::npos),
+        "new decoder did not decode VOPC signed halfword greater-or-equal "
+        "compare");
+  Check((result.decoded_dump.find("v_cmp_lt_u16") != std::string::npos),
+        "new decoder did not decode VOPC unsigned halfword less-than compare");
+  Check((result.decoded_dump.find("v_cmpx_gt_i32") != std::string::npos),
+        "new decoder did not decode VOPC signed compare-and-mask");
+  Check((result.ir_dump.find("CompareGtI32") != std::string::npos),
+        "signed greater-than compare did not lower to IR");
+  Check((result.ir_dump.find("CompareLtI32") != std::string::npos),
+        "signed less-than compare did not lower to IR");
+  Check((result.ir_dump.find("CompareLtI16") != std::string::npos),
+        "signed halfword less-than compare did not lower to IR");
+  Check((result.ir_dump.find("CompareGeI16") != std::string::npos),
+        "signed halfword greater-or-equal compare did not lower to IR");
+  Check((result.ir_dump.find("CompareLtU16") != std::string::npos),
+        "unsigned halfword less-than compare did not lower to IR");
+  Check((result.ir_dump.find("CompareMaskGtI32 exec_lo") != std::string::npos),
+        "signed compare-and-mask did not lower to exec mask IR");
+  Check(SpirvContainsOpcode(result.spirv, 173),
+        "SPIR-V binary does not contain OpSGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 177),
+        "SPIR-V binary does not contain OpSLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract for I16 compare");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerSignedMinShiftAlu() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 193),           // s0 = -1
+      EncodeSMovB32(1, 130),           // s1 = 2
+      EncodeSop2(0x06, 2, 0, 1),       // s_min_i32 s2, s0, s1
+      EncodeSop2(0x08, 3, 0, 1),       // s_max_i32 s3, s0, s1
+      EncodeSop2(0x22, 4, 0, 129),     // s_ashr_i32 s4, s0, 1
+      EncodeVop2(0x11, 1, 0, 0),       // v_min_i32 v1, s0, v0
+      EncodeVop2(0x12, 2, 1, 1),       // v_max_i32 v2, s1, v1
+      EncodeVop2(0x17, 3, 1 + 256, 1), // v_ashr_i32 v3, v1, v1
+      EncodeVop2(0x18, 4, 129, 3),     // v_ashrrev_i32 v4, 1, v3
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_min_i32") != std::string::npos),
+        "new decoder did not decode S_MIN_I32");
+  Check((result.decoded_dump.find("s_ashr_i32") != std::string::npos),
+        "new decoder did not decode S_ASHR_I32");
+  Check((result.decoded_dump.find("v_min_i32") != std::string::npos),
+        "new decoder did not decode V_MIN_I32");
+  Check((result.decoded_dump.find("v_ashrrev_i32") != std::string::npos),
+        "new decoder did not decode V_ASHRREV_I32");
+  Check((result.ir_dump.find("IMinI32 s2") != std::string::npos),
+        "S_MIN_I32 did not lower to IR");
+  Check((result.ir_dump.find("IMaxI32 s3") != std::string::npos),
+        "S_MAX_I32 did not lower to IR");
+  Check((result.ir_dump.find("ShiftRightArithmeticI32 s4") != std::string::npos),
+        "S_ASHR_I32 did not lower to IR");
+  Check((result.ir_dump.find("IMinI32 v1") != std::string::npos),
+        "V_MIN_I32 did not lower to IR");
+  Check((result.ir_dump.find("IMaxI32 v2") != std::string::npos),
+        "V_MAX_I32 did not lower to IR");
+  Check((result.ir_dump.find("ShiftRightArithmeticI32 v4, v3, 0x00000001") != std::string::npos),
+        "V_ASHRREV_I32 did not reverse source order in IR");
+  Check(SpirvContainsOpcode(result.spirv, 173),
+        "SPIR-V binary does not contain OpSGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 177),
+        "SPIR-V binary does not contain OpSLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 195),
+        "SPIR-V binary does not contain OpShiftRightArithmetic");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerScalarBitfieldAlu() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 193),         // s0 = -1
+      EncodeSMovB32(1, 129),         // s1 = 1
+      EncodeSopc(0x02, 1, 0),        // s_cmp_gt_i32 s1, s0
+      EncodeSop2(0x0a, 2, 1, 0),     // s_cselect_b32 s2, s1, s0
+      EncodeSop1(0x34, 3, 0),        // s_abs_i32 s3, s0
+      EncodeSop1(0x0b, 4, 1),        // s_brev_b32 s4, s1
+      EncodeSop2(0x24, 5, 132, 129), // s_bfm_b32 s5, 4, 1
+      EncodeSop2(0x27, 6, 4, 255),   // s_bfe_u32 s6, s4, literal
+      0x00080004u,
+      EncodeSop2(0x32, 7, 0, 1), // s_pack_ll_b32_b16 s7, s0, s1
+      EncodeSop2(0x33, 8, 0, 1), // s_pack_lh_b32_b16 s8, s0, s1
+      EncodeSop2(0x34, 9, 0, 1), // s_pack_hh_b32_b16 s9, s0, s1
+      EncodeSopc(0x0c, 0, 1),    // s_bitcmp0_b32 s0, s1
+      EncodeSopc(0x0d, 1, 0),    // s_bitcmp1_b32 s1, s0
+      EncodeSopc(0x13, 0, 2),    // s_cmp_lg_u64 s[0:1], s[2:3]
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_cselect_b32") != std::string::npos),
+        "new decoder did not decode S_CSELECT_B32");
+  Check((result.decoded_dump.find("s_abs_i32") != std::string::npos),
+        "new decoder did not decode S_ABS_I32");
+  Check((result.decoded_dump.find("s_brev_b32") != std::string::npos),
+        "new decoder did not decode S_BREV_B32");
+  Check((result.decoded_dump.find("s_bfm_b32") != std::string::npos),
+        "new decoder did not decode S_BFM_B32");
+  Check((result.decoded_dump.find("s_bfe_u32") != std::string::npos),
+        "new decoder did not decode S_BFE_U32");
+  Check((result.decoded_dump.find("s_pack_hh_b32_b16") != std::string::npos),
+        "new decoder did not decode S_PACK_HH_B32_B16");
+  Check((result.decoded_dump.find("s_bitcmp0_b32") != std::string::npos),
+        "new decoder did not decode S_BITCMP0_B32");
+  Check((result.decoded_dump.find("s_bitcmp1_b32") != std::string::npos),
+        "new decoder did not decode S_BITCMP1_B32");
+  Check((result.decoded_dump.find("s_cmp_lg_u64") != std::string::npos),
+        "new decoder did not decode S_CMP_LG_U64");
+  Check((result.ir_dump.find("SelectU32 s2") != std::string::npos),
+        "S_CSELECT_B32 did not lower to IR");
+  Check((result.ir_dump.find("AbsI32 s3") != std::string::npos),
+        "S_ABS_I32 did not lower to IR");
+  Check((result.ir_dump.find("BitReverseU32 s4") != std::string::npos),
+        "S_BREV_B32 did not lower to IR");
+  Check((result.ir_dump.find("BitFieldMaskU32 s5") != std::string::npos),
+        "S_BFM_B32 did not lower to IR");
+  Check((result.ir_dump.find("BitFieldExtractU32 s6") != std::string::npos),
+        "S_BFE_U32 did not lower to IR");
+  Check((result.ir_dump.find("PackLowLowU16 s7") != std::string::npos),
+        "S_PACK_LL_B32_B16 did not lower to IR");
+  Check((result.ir_dump.find("PackLowHighU16 s8") != std::string::npos),
+        "S_PACK_LH_B32_B16 did not lower to IR");
+  Check((result.ir_dump.find("PackHighHighU16 s9") != std::string::npos),
+        "S_PACK_HH_B32_B16 did not lower to IR");
+  Check((result.ir_dump.find("BitCompare0B32") != std::string::npos),
+        "S_BITCMP0_B32 did not lower to IR");
+  Check((result.ir_dump.find("BitCompare1B32") != std::string::npos),
+        "S_BITCMP1_B32 did not lower to IR");
+  Check((result.ir_dump.find("CompareNeU64") != std::string::npos),
+        "S_CMP_LG_U64 did not lower to IR");
+  Check(SpirvContainsOpcode(result.spirv, 126),
+        "SPIR-V binary does not contain OpSNegate");
+  Check(SpirvContainsOpcode(result.spirv, 169),
+        "SPIR-V binary does not contain OpSelect");
+  Check(SpirvContainsOpcode(result.spirv, 201),
+        "SPIR-V binary does not contain OpBitFieldInsert");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "SPIR-V binary does not contain OpBitFieldUExtract");
+  Check(SpirvContainsOpcode(result.spirv, 171),
+        "SPIR-V binary does not contain OpINotEqual");
+  Check(SpirvContainsOpcode(result.spirv, 166),
+        "SPIR-V binary does not contain OpLogicalOr");
+  Check(SpirvContainsOpcode(result.spirv, 204),
+        "SPIR-V binary does not contain OpBitReverse");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
@@ -3377,6 +5666,87 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   }
 }
 
+void TestNewShaderRecompilerMemoryFamilyTranslation() {
+  const uint32_t shader[] = {
+      EncodeSmem0(0x00, 0, 4),
+      0u, // s_load_dword s0
+      EncodeSmem0(0x08, 1, 4),
+      0u, // s_buffer_load_dword s1
+      EncodeMubuf0(0x0c, 4),
+      EncodeMubuf1(0, 0, 1), // buffer_load_dword v0
+      EncodeMubuf0(0x1c, 8),
+      EncodeMubuf1(0, 0, 1), // buffer_store_dword v0
+      EncodeDs0(0x0d),
+      EncodeDs1(0, 0, 1), // ds_write_b32 v0, v1
+      EncodeDs0(0x36),
+      EncodeDs1(2, 0, 1), // ds_read_b32 v2, v1
+      EncodeMimg0(0x0e, 0x1),
+      EncodeMimg1(5, 0, 0, 1), // image_get_resinfo v5
+      EncodeMimg0(0x00, 0xf),
+      EncodeMimg1(4, 0, 0, 1), // image_load v4
+      EncodeMimg0(0x20, 0xf),
+      EncodeMimg1(3, 0, 0, 1), // image_sample v3
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options, ReadZeroTestMemory);
+  Check((result.decoded_dump.find("s_load_dword") != std::string::npos),
+        "new decoder did not decode SMEM dword load");
+  Check((result.decoded_dump.find("s_buffer_load_dword") != std::string::npos),
+        "new decoder did not decode SMEM scalar-buffer dword load");
+  Check((result.decoded_dump.find("s_buffer_load_dword s1, s8") != std::string::npos),
+        "SMEM scalar-buffer SBASE was not decoded as an SGPR-pair index");
+  Check((result.decoded_dump.find("buffer_load_dword") != std::string::npos),
+        "new decoder did not decode MUBUF dword load");
+  Check((result.decoded_dump.find("buffer_store_dword") != std::string::npos),
+        "new decoder did not decode MUBUF dword store");
+  Check((result.decoded_dump.find("ds_read_b32") != std::string::npos),
+        "new decoder did not decode DS dword read");
+  Check((result.decoded_dump.find("image_get_resinfo") != std::string::npos),
+        "new decoder did not decode MIMG resinfo query");
+  Check((result.decoded_dump.find("image_load") != std::string::npos),
+        "new decoder did not decode MIMG load");
+  Check((result.decoded_dump.find("image_sample") != std::string::npos),
+        "new decoder did not decode MIMG sample");
+  Check(
+      (result.decoded_dump.find("translation is not implemented") == std::string::npos),
+      "implemented memory decode still reports unsupported translation");
+  Check((result.ir_dump.find("SLoadDword s0") != std::string::npos),
+        "SMEM load did not lower to IR");
+  Check((result.ir_dump.find("SBufferLoadDword s1") != std::string::npos),
+        "SMEM scalar-buffer load did not lower to IR");
+  Check((result.ir_dump.find("BufferLoadDword v0") != std::string::npos),
+        "MUBUF load did not lower to IR");
+  Check((result.ir_dump.find("BufferStoreDword null, v0") != std::string::npos),
+        "MUBUF store did not lower to IR");
+  Check((result.ir_dump.find("DsWriteB32 null, v0") != std::string::npos),
+        "DS write did not lower to IR");
+  Check((result.ir_dump.find("DsReadB32 v2") != std::string::npos),
+        "DS read did not lower to IR");
+  Check((result.ir_dump.find("ImageGetResinfo v5") != std::string::npos),
+        "MIMG resinfo query did not lower to IR");
+  Check((result.ir_dump.find("ImageLoad v4") != std::string::npos),
+        "MIMG load did not lower to IR");
+  Check((result.ir_dump.find("ImageSample v3") != std::string::npos),
+        "MIMG sample did not lower to IR");
+  Check(SpirvContainsOpcode(result.spirv, 65),
+        "SPIR-V binary does not contain OpAccessChain");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "SPIR-V binary does not contain OpStore");
+  Check(SpirvContainsOpcode(result.spirv, 95),
+        "SPIR-V binary does not contain OpImageFetch");
+  Check(SpirvContainsOpcode(result.spirv, 103),
+        "SPIR-V binary does not contain OpImageQuerySizeLod");
+  Check(SpirvContainsOpcode(result.spirv, 88),
+        "SPIR-V binary does not contain OpImageSampleExplicitLod");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   const auto count_live_memory_ops =
       [](const ShaderRecompiler::IR::Program &program,
@@ -3503,6 +5873,78 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   CheckSpirvBinaryValidates(dynamic.spirv);
 }
 
+void TestNewShaderRecompilerImageQueryTranslation() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x60, 0x3),
+      EncodeMimg1(6, 0, 0, 1), // image_get_lod
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_get_lod") != std::string::npos),
+        "new decoder did not decode MIMG image get-lod query");
+  Check((result.decoded_dump.find("dmask=0x3") != std::string::npos),
+        "image_get_lod decode did not preserve dmask metadata");
+  Check((result.ir_dump.find("ImageGetLod v6") != std::string::npos),
+        "image_get_lod did not lower to explicit query IR");
+  Check((result.ir_dump.find("data_dwords=2") != std::string::npos),
+        "image_get_lod did not preserve two-component result metadata");
+  Check((result.ir_dump.find("image_addr=2") != std::string::npos),
+        "image_get_lod did not preserve address component metadata");
+  Check(SpirvContainsOpcode(result.spirv, 105),
+        "SPIR-V binary does not contain OpImageQueryLod");
+  Check(
+      SpirvContainsOpcode(result.spirv, 80),
+      "SPIR-V binary does not contain coordinate composite for image_get_lod");
+  Check(SpirvContainsOpcode(result.spirv, 81),
+        "SPIR-V binary does not contain dmask extraction for image_get_lod");
+  Check(SpirvContainsOpcode(result.spirv, 124),
+        "SPIR-V binary does not contain result bitcast for image_get_lod");
+  Check(std::find(result.spirv.begin(), result.spirv.end(), 5288u) !=
+            result.spirv.end(),
+        "SPIR-V binary does not request compute derivative group capability");
+  Check(
+      std::find(result.spirv.begin(), result.spirv.end(), 5289u) !=
+          result.spirv.end(),
+      "SPIR-V binary does not request compute derivative group execution mode");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCubeSampleCoordinates() {
+  constexpr uint32_t MimgDimCube = 3;
+  const uint32_t shader[] = {
+      EncodeMimg0(0x20, 0xf, false, MimgDimCube),
+      EncodeMimg1(0, 0, 1, 0), // image_sample cube
+      EncodeMimg0(0x60, 0x3, false, MimgDimCube),
+      EncodeMimg1(8, 0, 1, 4), // image_get_lod cube
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData(Prospero::ImageType::kCube);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.program.info.images.size() == 1 &&
+            result.program.info.images[0].cube,
+        "cube descriptor identity was not preserved through compilation");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 131) == 4,
+        "cube sample/get-lod did not remove the RDNA2 S/T bias");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 109) == 1 &&
+            SpirvInstructionOpcodeCount(result.spirv, 112) == 1 &&
+            SpirvInstructionOpcodeCount(result.spirv, 194) == 1 &&
+            SpirvInstructionOpcodeCount(result.spirv, 196) == 1 &&
+            SpirvInstructionOpcodeCount(result.spirv, 130) == 1,
+        "cube sample did not repack its face ID exactly once, or get-lod used "
+        "an array layer");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestImageAddressOperands() {
   using namespace ShaderRecompiler;
   // Captured at PC 0x10cc in compute shader 0041b6a03db7472d.
@@ -3591,6 +6033,260 @@ void TestImageAddressOperands() {
   }
 }
 
+void TestNewShaderRecompilerImageSampleVariants() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x24, 0xf),
+      EncodeMimg1(8, 0, 0, 1), // image_sample_l
+      EncodeMimg0(0x25, 0xf),
+      EncodeMimg1(12, 0, 0, 1), // image_sample_b
+      EncodeMimg0(0x27, 0xf),
+      EncodeMimg1(16, 0, 0, 1), // image_sample_lz
+      EncodeMimg0(0x28, 0xf),
+      EncodeMimg1(20, 0, 0, 1), // image_sample_c
+      EncodeMimg0(0x30, 0xf),
+      EncodeMimg1(24, 0, 0, 1), // image_sample_o
+      EncodeMimg0(0x22, 0xf),
+      EncodeMimg1(28, 0, 0, 1), // image_sample_d
+      EncodeMimg0(0x2f, 0x1),
+      EncodeMimg1(32, 0, 0, 1), // image_sample_c_lz
+      EncodeMimg0(0x38, 0x1),
+      EncodeMimg1(36, 0, 0, 1), // image_sample_c_o
+      EncodeMimg0(0x2a, 0x1),
+      EncodeMimg1(40, 0, 0, 1), // image_sample_c_d
+      EncodeMimg0(0x20, 0x7),
+      EncodeMimg1(48, 0, 0, 1, true), // image_sample with A16 bit
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_sample_l") != std::string::npos),
+        "new decoder did not decode IMAGE_SAMPLE_L through shared MIMG path");
+  Check((result.decoded_dump.find("image_sample_b") != std::string::npos),
+        "new decoder did not decode IMAGE_SAMPLE_B through shared MIMG path");
+  Check((result.decoded_dump.find("image_sample_lz") != std::string::npos),
+        "new decoder did not decode IMAGE_SAMPLE_LZ through shared MIMG path");
+  Check((result.decoded_dump.find("image_sample_c") != std::string::npos),
+        "new decoder did not decode IMAGE_SAMPLE_C through shared MIMG path");
+  Check((result.decoded_dump.find("image_sample_o") != std::string::npos),
+        "new decoder did not decode IMAGE_SAMPLE_O through shared MIMG path");
+  Check((result.decoded_dump.find("image_sample_d") != std::string::npos),
+        "new decoder did not decode IMAGE_SAMPLE_D through shared MIMG path");
+  Check(
+      (result.decoded_dump.find("image_sample_c_lz") != std::string::npos),
+      "new decoder did not decode IMAGE_SAMPLE_C_LZ through shared MIMG path");
+  Check((result.decoded_dump.find("image_sample_c_o") != std::string::npos),
+        "new decoder did not decode IMAGE_SAMPLE_C_O through shared MIMG path");
+  Check((result.decoded_dump.find("image_sample_c_d") != std::string::npos),
+        "new decoder did not decode IMAGE_SAMPLE_C_D through shared MIMG path");
+  Check((result.decoded_dump.find("sample_flags=a16") != std::string::npos),
+        "IMAGE_SAMPLE with MIMG A16 bit did not expose A16 sample flag");
+  Check((result.decoded_dump.find("sample_flags=lod") != std::string::npos),
+        "IMAGE_SAMPLE_L did not expose lod sample flag");
+  Check((result.decoded_dump.find("sample_flags=bias") != std::string::npos),
+        "IMAGE_SAMPLE_B did not expose bias sample flag");
+  Check((result.decoded_dump.find("sample_flags=level_zero") != std::string::npos),
+        "IMAGE_SAMPLE_LZ did not expose level-zero sample flag");
+  Check((result.decoded_dump.find("sample_flags=compare") != std::string::npos),
+        "IMAGE_SAMPLE_C did not expose compare sample flag");
+  Check((result.decoded_dump.find("sample_flags=offset addr_components=3") != std::string::npos),
+        "IMAGE_SAMPLE_O did not expose offset sample flag/address width");
+  Check((result.decoded_dump.find("sample_flags=derivative addr_components=6") != std::string::npos),
+        "IMAGE_SAMPLE_D did not expose derivative sample flag/address width");
+  Check((result.decoded_dump.find("sample_flags=compare|level_zero") != std::string::npos),
+        "IMAGE_SAMPLE_C_LZ did not expose compare+level-zero flags");
+  Check((result.decoded_dump.find("sample_flags=compare|offset addr_components=4") != std::string::npos),
+        "IMAGE_SAMPLE_C_O did not expose compare+offset flags/address width");
+  Check(
+      (result.decoded_dump.find("sample_flags=derivative|compare addr_components=7") != std::string::npos),
+      "IMAGE_SAMPLE_C_D did not expose compare+derivative address width");
+  Check((result.ir_dump.find("ImageSample v8") != std::string::npos),
+        "IMAGE_SAMPLE_L did not lower to shared IR ImageSample");
+  Check((result.ir_dump.find("ImageSample v28") != std::string::npos),
+        "IMAGE_SAMPLE_D did not lower to shared IR ImageSample");
+  Check((result.ir_dump.find("image_flags=0x4") != std::string::npos),
+        "derivative sample flag did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_addr=6") != std::string::npos),
+        "derivative sample address width did not survive into IR memory "
+        "metadata");
+  Check((result.ir_dump.find("image_addr=7") != std::string::npos),
+        "compare+derivative sample address width did not survive into IR "
+        "memory metadata");
+  Check((result.ir_dump.find("image_flags=0x80") != std::string::npos),
+        "MIMG A16 bit did not survive into IR memory metadata");
+  Check(SpirvContainsOpcode(result.spirv, 88),
+        "SPIR-V binary does not contain shared OpImageSampleExplicitLod "
+        "emission");
+  Check(SpirvContainsOpcode(result.spirv, 90),
+        "SPIR-V binary does not contain shared OpImageSampleDrefExplicitLod "
+        "emission");
+  Check(SpirvContainsOpcode(result.spirv, 80),
+        "SPIR-V binary does not contain coordinate/gradient composite "
+        "construction");
+  Check(SpirvContainsExtInst(result.spirv, 62),
+        "SPIR-V binary does not unpack A16 image address halves");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerImageSampleA16SamplerCoords() {
+  constexpr uint32_t MimgDim3D = 2;
+
+  const uint32_t shader[] = {
+      EncodeMimg0(0x20, 0x7, false, MimgDim3D),
+      EncodeMimg1(8, 0, 0, 4, true), // image_sample, A16 bit, 3D xyz coords
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData(Prospero::ImageType::kColor3D);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_dim=3d sample_flags=a16 addr_components=3") != std::string::npos),
+        "3D IMAGE_SAMPLE with MIMG A16 bit did not decode as three A16 sampler "
+        "coords");
+  Check((result.ir_dump.find("ImageSample v8") != std::string::npos),
+        "3D A16 IMAGE_SAMPLE did not lower to sample IR");
+  Check((result.ir_dump.find("image_flags=0x80") != std::string::npos),
+        "3D A16 IMAGE_SAMPLE did not preserve A16 memory metadata");
+  Check((result.ir_dump.find("image_dim=3d") != std::string::npos),
+        "3D A16 IMAGE_SAMPLE did not preserve image dimension metadata");
+  Check(
+      (result.ir_dump.find("image_addr=3") != std::string::npos),
+      "3D A16 IMAGE_SAMPLE did not preserve three logical address components");
+  Check(SpirvExtInstCount(result.spirv, 62) == 3,
+        "sampler A16 xyz coordinates should be converted from three packed f16 "
+        "components");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "sampler A16 high-half coordinate extraction is missing");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "sampler A16 low-half coordinate masking is missing");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerImageSampleOpcodeAliases() {
+  const uint32_t shader[] = {
+      0xf0800109u,
+      0x00c00602u, // observed image_sample_a v6, v2, s0, s24
+      EncodeMimg0(0xa5, 0xf),
+      EncodeMimg1(12, 0, 0, 4), // image_sample_b_a
+      EncodeMimg0(0xa8, 0x1),
+      EncodeMimg1(16, 0, 0, 4), // image_sample_c_a
+      EncodeMimg0(0xad, 0x1),
+      EncodeMimg1(20, 0, 0, 4), // image_sample_c_b_a
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_sample_a") != std::string::npos),
+        "MIMG opcode 0xa0 should decode as image_sample_a alias");
+  Check((result.decoded_dump.find("image_sample_b_a") != std::string::npos),
+        "MIMG opcode 0xa5 should decode as image_sample_b_a alias");
+  Check((result.decoded_dump.find("image_sample_c_a") != std::string::npos),
+        "MIMG opcode 0xa8 should decode as image_sample_c_a alias");
+  Check((result.decoded_dump.find("image_sample_c_b_a") != std::string::npos),
+        "MIMG opcode 0xad should decode as image_sample_c_b_a alias");
+  Check((result.decoded_dump.find("sample_flags=adjust") != std::string::npos),
+        "opcode 0xa0 alias should expose SampleAdjust with normal 32-bit "
+        "coordinates");
+  Check((result.decoded_dump.find("sample_flags=bias|compare|adjust") != std::string::npos),
+        "compare+bias opcode alias did not expose expected sample flags");
+  Check((result.decoded_dump.find("a16") == std::string::npos),
+        "A16 must come from MIMG bit 62, not from the opcode alias");
+  Check(!SpirvContainsExtInst(result.spirv, 62),
+        "opcode aliases without bit 62 must not unpack sampled f16 address "
+        "halves");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {
+  auto compile = [](uint32_t opcode, uint32_t dmask, uint32_t vdata) {
+    const uint32_t shader[] = {
+        EncodeMimg0(opcode, dmask),
+        EncodeMimg1(vdata, 0, 0, 4, true),
+        0xbf810000u,
+    };
+
+    auto user_data = ImageTestUserData();
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    options.user_data = user_data;
+
+    auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return result;
+  };
+
+  {
+    const auto result = compile(0x28, 0x1, 12); // image_sample_c with A16 bit
+    Check((result.decoded_dump.find("sample_flags=compare|a16 addr_components=3") != std::string::npos),
+          "A16 IMAGE_SAMPLE_C did not preserve compare+A16 metadata");
+    Check((result.ir_dump.find("image_flags=0x88") != std::string::npos),
+          "A16 IMAGE_SAMPLE_C did not preserve compare+A16 IR flags");
+    Check(SpirvInstructionOpcodeCount(result.spirv, 90) == 1,
+          "A16 IMAGE_SAMPLE_C should emit one dref sample");
+    Check(SpirvExtInstCount(result.spirv, 62) == 2,
+          "PCF reference must remain 32-bit while only xy sampler coords use "
+          "A16");
+  }
+
+  {
+    const auto result = compile(0x30, 0xf, 16); // image_sample_o with A16 bit
+    Check((result.decoded_dump.find("sample_flags=offset|a16 addr_components=3") != std::string::npos),
+          "A16 IMAGE_SAMPLE_O did not preserve offset+A16 metadata");
+    Check((result.ir_dump.find("image_flags=0x90") != std::string::npos),
+          "A16 IMAGE_SAMPLE_O did not preserve offset+A16 IR flags");
+    Check(SpirvContainsOpcode(result.spirv, 202),
+          "texel offset should still be decoded from its packed 6-bit fields");
+    Check(
+        SpirvExtInstCount(result.spirv, 62) == 2,
+        "texel offset must remain 32-bit while only xy sampler coords use A16");
+  }
+}
+
+void TestNewShaderRecompilerImageLoadA16UintCoords() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x00, 0x3),
+      EncodeMimg1(20, 0, 0, 4, true), // image_load, A16 bit
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_load") != std::string::npos),
+        "A16 IMAGE_LOAD did not decode");
+  Check((result.ir_dump.find("ImageLoad v20") != std::string::npos),
+        "A16 IMAGE_LOAD did not lower to image-load IR");
+  Check((result.ir_dump.find("image_flags=0x80") != std::string::npos),
+        "A16 IMAGE_LOAD did not preserve A16 memory metadata");
+  Check((result.ir_dump.find("image_addr=2") != std::string::npos),
+        "A16 IMAGE_LOAD did not preserve logical address component count");
+  Check(!SpirvContainsExtInst(result.spirv, 62),
+        "image ops without sampler use u16 A16 addresses and must not unpack "
+        "f16");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "u16 A16 high-half coordinate extraction is missing");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "u16 A16 low-half coordinate masking is missing");
+  Check(SpirvContainsOpcode(result.spirv, 95),
+        "A16 IMAGE_LOAD did not emit an image fetch");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   constexpr uint32_t OpImageSampleImplicitLod = 87;
   constexpr uint32_t OpImageSampleExplicitLod = 88;
@@ -3671,6 +6367,729 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
                                       OpImageSampleDrefExplicitLod) == 1,
           "pixel IMAGE_SAMPLE_C_LZ must use explicit dref lod");
   }
+}
+
+void TestNewShaderRecompilerImageViewDimensions() {
+  constexpr uint32_t MimgDim1D = 0;
+  constexpr uint32_t MimgDim3D = 2;
+  constexpr uint32_t MimgDim1DArray = 4;
+  constexpr uint32_t MimgDim2DArray = 5;
+  constexpr uint32_t SpirvDim1D = 0;
+  constexpr uint32_t SpirvDim2D = 1;
+  constexpr uint32_t SpirvDim3D = 2;
+
+  const uint32_t shader[] = {
+      EncodeMimg0(0x20, 0xf, false, MimgDim2DArray),
+      EncodeMimg1(0, 0, 1, 0), // image_sample 2D array
+      EncodeMimg0(0x24, 0xf, false, MimgDim2DArray),
+      EncodeMimg1(4, 1, 1, 4), // image_sample_l 2D array
+      EncodeMimg0(0x20, 0xf, false, MimgDim3D),
+      EncodeMimg1(8, 2, 1, 8), // image_sample 3D
+      EncodeMimg0(0x01, 0xf, false, MimgDim2DArray),
+      EncodeMimg1(12, 3, 0, 12), // image_load_mip 2D array
+      EncodeMimg0(0x20, 0xf, false, MimgDim1D),
+      EncodeMimg1(16, 4, 1, 16), // image_sample 1D
+      EncodeMimg0(0x20, 0xf, false, MimgDim1DArray),
+      EncodeMimg1(20, 5, 1, 20), // image_sample 1D array
+      EncodeMimg0(0x22, 0xf, false, MimgDim1D),
+      EncodeMimg1(24, 6, 1, 24), // image_sample_d 1D
+      EncodeMimg0(0x01, 0xf, false, MimgDim1D),
+      EncodeMimg1(28, 7, 0, 28), // image_load_mip 1D
+      EncodeMimg0(0x0e, 0xf, false, MimgDim1D),
+      EncodeMimg1(32, 8, 0, 32), // image_get_resinfo 1D
+      EncodeMimg0(0x00, 0xf, false, MimgDim1D),
+      EncodeMimg1(36, 9, 0, 36), // integer image_load 1D
+      0xbf810000u,
+  };
+
+  auto ps_info = RegressionPixelInputInfo();
+  auto user_data = ImageTestUserData();
+  SetImageTestType(&user_data, 0, Prospero::ImageType::kColor2DArray);
+  SetImageTestType(&user_data, 1, Prospero::ImageType::kColor2DArray);
+  SetImageTestType(&user_data, 2, Prospero::ImageType::kColor3D);
+  SetImageTestType(&user_data, 3, Prospero::ImageType::kColor2DArray);
+  SetImageTestType(&user_data, 4, Prospero::ImageType::kColor1D);
+  SetImageTestType(&user_data, 5, Prospero::ImageType::kColor1DArray);
+  SetImageTestType(&user_data, 6, Prospero::ImageType::kColor1D);
+  SetImageTestType(&user_data, 7, Prospero::ImageType::kColor1D);
+  SetImageTestType(&user_data, 8, Prospero::ImageType::kColor1D);
+  SetImageTestType(&user_data, 9, Prospero::ImageType::kColor1D);
+  SetImageTestFormat(&user_data, 9, Prospero::BufferFormat::k32UInt);
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_dim=2d_array") != std::string::npos),
+        "MIMG DIM did not decode 2D-array image view");
+  Check((result.decoded_dump.find("image_dim=3d") != std::string::npos),
+        "MIMG DIM did not decode 3D image view");
+  Check((result.decoded_dump.find("image_dim=1d sample_flags=none addr_components=1") != std::string::npos),
+        "1D sample did not preserve its scalar coordinate");
+  Check((result.decoded_dump.find("image_dim=1d_array sample_flags=none addr_components=2") != std::string::npos),
+        "1D-array sample did not preserve coordinate plus layer");
+  Check((result.decoded_dump.find("image_dim=1d sample_flags=derivative addr_components=3") != std::string::npos),
+        "1D derivative sample did not preserve scalar gradients");
+  Check((result.decoded_dump.find("image_sample_l") != std::string::npos),
+        "2D-array LOD sample did not decode");
+  Check(
+      (result.decoded_dump.find("image_dim=2d_array sample_flags=lod addr_components=4") != std::string::npos),
+      "2D-array LOD sample did not include slice plus LOD address components");
+  Check((result.ir_dump.find("image_dim=2d_array") != std::string::npos),
+        "2D-array image view did not survive into IR metadata");
+  Check((result.ir_dump.find("image_dim=3d") != std::string::npos),
+        "3D image view did not survive into IR metadata");
+  Check((result.ir_dump.find("image_dim=1d") != std::string::npos),
+        "1D image view did not survive into IR metadata");
+  Check((result.ir_dump.find("image_dim=1d_array") != std::string::npos),
+        "1D-array image view did not survive into IR metadata");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 0, 1),
+        "SPIR-V binary does not contain sampled 1D image type");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 1, 1),
+        "SPIR-V binary does not contain sampled 1D-array image type");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim2D, 1, 1),
+        "SPIR-V binary does not contain sampled 2D-array image type");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim3D, 0, 1),
+        "SPIR-V binary does not contain sampled 3D image type");
+  Check(SpirvContainsCapability(result.spirv, 43),
+        "SPIR-V binary does not request Sampled1D");
+  Check(SpirvContainsCapability(result.spirv, 44),
+        "SPIR-V binary does not request Image1D");
+  Check(SpirvContainsOpcode(result.spirv, 95),
+        "SPIR-V binary does not contain array image fetch");
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check((source.find(" Grad ") != std::string::npos),
+        "1D derivative sample did not emit scalar SPIR-V gradients");
+  Check((source.find("OpImageQuerySizeLod") != std::string::npos),
+        "1D resource query did not emit a scalar size query");
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_8 "),
+        "integer 1D load did not access the uint 1D descriptor binding");
+}
+
+void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
+  constexpr uint32_t MimgDim1D = 0;
+  constexpr uint32_t MimgDim1DArray = 4;
+  constexpr uint32_t SpirvDim1D = 0;
+
+  const uint32_t shader[] = {
+      EncodeMimg0(0x08, 0xf, false, MimgDim1D),
+      EncodeMimg1(20, 4, 0, 4), // image_store 1D
+      EncodeMimg0(0x08, 0xf, false, MimgDim1DArray),
+      EncodeMimg1(24, 5, 0, 8), // image_store 1D array
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  SetImageTestType(&user_data, 4, Prospero::ImageType::kColor1D);
+  SetImageTestType(&user_data, 5, Prospero::ImageType::kColor1DArray);
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.ir_dump.find("image_dim=1d") != std::string::npos),
+        "1D storage dimension did not survive into IR metadata");
+  Check((result.ir_dump.find("image_dim=1d_array") != std::string::npos),
+        "1D-array storage dimension did not survive into IR metadata");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 0, 2),
+        "SPIR-V binary does not contain storage 1D image type");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 1, 2),
+        "SPIR-V binary does not contain storage 1D-array image type");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_22 "),
+        "1D store did not access the 1D storage descriptor binding");
+  Check(
+      SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_23 "),
+      "1D-array store did not access the 1D-array storage descriptor binding");
+}
+
+void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x20, 0xf, false, 0),
+      EncodeMimg1(0, 0, 1, 0), // 1D instruction with a null image descriptor
+      0xbf810000u,
+  };
+  std::array<uint32_t, 64> user_data{};
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_3 "),
+        "null image did not use the canonical 2D sampled descriptor binding");
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_1 "),
+        "null image retained the decoded 1D descriptor binding");
+}
+
+void TestNewShaderRecompilerImageGatherVariants() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x47, 0x1),
+      EncodeMimg1(60, 0, 1, 4), // image_gather4_lz
+      EncodeMimg0(0x48, 0x2),
+      EncodeMimg1(64, 0, 1, 8), // image_gather4_c
+      EncodeMimg0(0x4f, 0x1),
+      EncodeMimg1(68, 0, 1, 12), // image_gather4_c_lz
+      EncodeMimg0(0x57, 0x4),
+      EncodeMimg1(72, 0, 1, 16), // image_gather4_lz_o
+      EncodeMimg0(0x58, 0x1),
+      EncodeMimg1(76, 0, 1, 20), // image_gather4_c_o
+      EncodeMimg0(0x5f, 0x1),
+      EncodeMimg1(80, 0, 1, 24), // image_gather4_c_lz_o
+      EncodeMimg0(0xc8, 0x1),
+      EncodeMimg1(84, 0, 1, 28), // image_gather4_c_a
+      EncodeMimg0(0xd8, 0x1),
+      EncodeMimg1(88, 0, 1, 32), // image_gather4_c_o_a
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_gather4_lz") != std::string::npos),
+        "new decoder did not decode IMAGE_GATHER4_LZ");
+  Check((result.decoded_dump.find("image_gather4_lz_o") != std::string::npos),
+        "new decoder did not decode IMAGE_GATHER4_LZ_O");
+  Check((result.decoded_dump.find("image_gather4_c") != std::string::npos),
+        "new decoder did not decode IMAGE_GATHER4_C");
+  Check((result.decoded_dump.find("image_gather4_c_lz") != std::string::npos),
+        "new decoder did not decode IMAGE_GATHER4_C_LZ");
+  Check((result.decoded_dump.find("image_gather4_c_o") != std::string::npos),
+        "new decoder did not decode IMAGE_GATHER4_C_O");
+  Check((result.decoded_dump.find("image_gather4_c_lz_o") != std::string::npos),
+        "new decoder did not decode IMAGE_GATHER4_C_LZ_O");
+  Check((result.decoded_dump.find("dmask=0x4") != std::string::npos),
+        "IMAGE_GATHER4_LZ_O did not preserve gather component dmask");
+  Check((result.decoded_dump.find("sample_flags=offset|level_zero addr_components=3") != std::string::npos),
+        "IMAGE_GATHER4_LZ_O did not expose shared offset sample metadata");
+  Check((result.decoded_dump.find("sample_flags=compare addr_components=3") != std::string::npos),
+        "IMAGE_GATHER4_C did not expose compare sample metadata");
+  Check(
+      (result.decoded_dump.find("sample_flags=compare|level_zero addr_components=3") != std::string::npos),
+      "IMAGE_GATHER4_C_LZ did not expose compare+level-zero sample metadata");
+  Check((result.decoded_dump.find("sample_flags=compare|offset addr_components=4") != std::string::npos),
+        "IMAGE_GATHER4_C_O did not expose compare+offset sample metadata");
+  Check((result.decoded_dump.find("sample_flags=compare|offset|level_zero addr_components=4") != std::string::npos),
+        "IMAGE_GATHER4_C_LZ_O did not expose compare+offset+level-zero sample "
+        "metadata");
+  Check((result.decoded_dump.find("sample_flags=compare|adjust addr_components=3") != std::string::npos),
+        "PS5 IMAGE_GATHER4_C_A did not expose compare+adjust sample metadata");
+  Check((result.decoded_dump.find("sample_flags=compare|offset|adjust addr_components=4") != std::string::npos),
+        "PS5 IMAGE_GATHER4_C_O_A did not expose compare+offset+adjust sample metadata");
+  Check((result.ir_dump.find("ImageGather4 v60") != std::string::npos),
+        "IMAGE_GATHER4_LZ did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v64") != std::string::npos),
+        "IMAGE_GATHER4_C did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v68") != std::string::npos),
+        "IMAGE_GATHER4_C_LZ did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v72") != std::string::npos),
+        "IMAGE_GATHER4_LZ_O did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v76") != std::string::npos),
+        "IMAGE_GATHER4_C_O did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v80") != std::string::npos),
+        "IMAGE_GATHER4_C_LZ_O did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v84") != std::string::npos),
+        "IMAGE_GATHER4_C_A did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v88") != std::string::npos),
+        "IMAGE_GATHER4_C_O_A did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("data_dwords=4") != std::string::npos),
+        "IMAGE_GATHER4 did not preserve four-component result metadata");
+  Check((result.ir_dump.find("image_flags=0x30") != std::string::npos),
+        "IMAGE_GATHER4_LZ_O flags did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_flags=0x8") != std::string::npos),
+        "IMAGE_GATHER4_C flags did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_flags=0x28") != std::string::npos),
+        "IMAGE_GATHER4_C_LZ flags did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_flags=0x18") != std::string::npos),
+        "IMAGE_GATHER4_C_O flags did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_flags=0x38") != std::string::npos),
+        "IMAGE_GATHER4_C_LZ_O flags did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_flags=0x408") != std::string::npos),
+        "IMAGE_GATHER4_C_A flags did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_flags=0x418") != std::string::npos),
+        "IMAGE_GATHER4_C_O_A flags did not survive into IR memory metadata");
+  Check(SpirvContainsCapability(result.spirv, 25),
+        "SPIR-V binary does not request ImageGatherExtended");
+  Check(SpirvContainsOpcode(result.spirv, 96),
+        "SPIR-V binary does not contain OpImageGather");
+  Check(SpirvContainsOpcode(result.spirv, 97),
+        "SPIR-V binary does not contain OpImageDrefGather");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain packed gather offset extraction");
+  Check(SpirvContainsOpcode(result.spirv, 81),
+        "SPIR-V binary does not contain gather result extraction");
+  Check(SpirvContainsOpcode(result.spirv, 124),
+        "SPIR-V binary does not contain gather result bitcast");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerImageLoadVariants() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x00, 0x3),
+      EncodeMimg1(8, 0, 0, 1), // image_load dmask xy
+      EncodeMimg0(0x01, 0xf),
+      EncodeMimg1(12, 1, 0, 4), // image_load_mip dmask xyzw
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_load") != std::string::npos),
+        "new decoder did not decode MIMG image load");
+  Check((result.decoded_dump.find("image_load_mip") != std::string::npos),
+        "new decoder did not decode MIMG image load mip");
+  Check((result.decoded_dump.find("dmask=0x3") != std::string::npos),
+        "image_load decode did not preserve partial dmask");
+  Check((result.decoded_dump.find("dmask=0xf") != std::string::npos),
+        "image_load_mip decode did not preserve full dmask");
+  Check((result.ir_dump.find("ImageLoad v8") != std::string::npos),
+        "image_load did not lower through shared image-load IR");
+  Check((result.ir_dump.find("ImageLoad v12") != std::string::npos),
+        "image_load_mip did not lower through shared image-load IR");
+  Check((result.ir_dump.find("data_dwords=2") != std::string::npos),
+        "image_load dmask xy did not preserve two-component result metadata");
+  Check((result.ir_dump.find("data_dwords=4") != std::string::npos),
+        "image_load_mip dmask xyzw did not preserve four-component result "
+        "metadata");
+  Check((result.ir_dump.find("image_addr=3 image_mip=1") != std::string::npos),
+        "image_load_mip did not preserve mip address component metadata");
+  Check(SpirvContainsOpcode(result.spirv, 95),
+        "SPIR-V binary does not contain OpImageFetch");
+  Check(
+      SpirvContainsOpcode(result.spirv, 81),
+      "SPIR-V binary does not contain OpCompositeExtract for image-load dmask");
+  Check(SpirvContainsOpcode(result.spirv, 124),
+        "SPIR-V binary does not contain OpBitcast for image-load result bits");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerImageLoad2DMsaa() {
+  const uint32_t shader[] = {
+      0xf0000130u, // image_load v3, v[5:7], s[0:7] dmask:x dim:2d_msaa
+      0x00000305u,
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData(Prospero::ImageType::kColor2DMsaa);
+  user_data[3] |= 2u << 16u;
+  user_data[5] |= 2u << 4u;
+  user_data[6] |= 1u << 10u;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_dim=2d_msaa") != std::string::npos) &&
+            (result.ir_dump.find("image_dim=2d_msaa") != std::string::npos) &&
+            (result.ir_dump.find("image_addr=3 image_mip=0") != std::string::npos),
+        "RDNA2 2D-MSAA load did not preserve x, y, and fragment ID");
+  Check(result.program.info.images.size() == 1 &&
+            result.program.info.images[0].dimension ==
+                ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa,
+        "2D-MSAA descriptor specialization lost the multisample dimension");
+  const auto binding_kind = ShaderRecompiler::IR::DescriptorBindingForImage(
+      result.program.info.images[0]);
+  Check(binding_kind.has_value() &&
+            result.program.bindings.descriptor_counts[static_cast<size_t>(*binding_kind)] != 0,
+        "2D-MSAA image did not receive a multisampled descriptor binding");
+  Check(SpirvContainsTypeImage(result.spirv, 1, 0, 1, 1),
+        "SPIR-V binary does not contain a multisampled 2D image type");
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_5 "),
+        "2D-MSAA load did not access its multisampled descriptor");
+  Check(SpirvSourceHasInstructionUsing(source, "OpImageFetch", " Sample "),
+        "2D-MSAA load did not emit the fragment ID as a SPIR-V Sample operand");
+  Check(!SpirvSourceHasInstructionUsing(source, "OpImageFetch", " Lod "),
+        "2D-MSAA load incorrectly emitted its fragment ID as a mip level");
+}
+
+void TestNewShaderRecompilerImageStoreTranslation() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x08, 0xf),
+      EncodeMimg1(20, 0, 0, 4), // image_store
+      EncodeMimg0(0x09, 0x3),
+      EncodeMimg1(24, 1, 0, 8), // image_store_mip
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_store") != std::string::npos),
+        "new decoder did not decode MIMG image store");
+  Check((result.decoded_dump.find("image_store_mip") != std::string::npos),
+        "new decoder did not decode MIMG image store mip");
+  Check((result.decoded_dump.find("dmask=0xf") != std::string::npos),
+        "image store decode did not preserve full dmask");
+  Check((result.decoded_dump.find("dmask=0x3") != std::string::npos),
+        "image store mip decode did not preserve partial dmask");
+  Check((result.ir_dump.find("ImageStore null, v20, v4") != std::string::npos),
+        "image_store did not lower to shared image-store IR");
+  Check((result.ir_dump.find("ImageStore null, v24, v8") != std::string::npos),
+        "image_store_mip did not lower to shared image-store IR");
+  Check((result.ir_dump.find("storage_image") != std::string::npos),
+        "image store IR did not use storage-image resource metadata");
+  Check((result.ir_dump.find("data_dwords=4") != std::string::npos),
+        "full-dmask image store did not preserve data component count");
+  Check((result.ir_dump.find("image_addr=3 image_mip=1") != std::string::npos),
+        "mip image store did not preserve mip address component count");
+  Check(SpirvContainsOpcode(result.spirv, 99),
+        "SPIR-V binary does not contain OpImageWrite");
+  Check(SpirvContainsOpcode(result.spirv, 80),
+        "SPIR-V binary does not contain image texel/coordinate composites");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
+  constexpr uint32_t ImageTypeColor3D = 10;
+  constexpr uint32_t ImageFormatRgba16f = 71;
+  constexpr uint32_t SpirvDim3D = 2;
+
+  constexpr uint32_t MimgDim3D = 2;
+
+  const uint32_t shader[] = {
+      EncodeMimg0(0x08, 0xf, false, MimgDim3D),
+      EncodeMimg1(20, 5, 0, 4), // image_store 3D
+      0xbf810000u,
+  };
+
+  ShaderComputeInputInfo input_info = RegressionComputeInputInfo();
+  std::array<uint32_t, 64> user_data{};
+  user_data[20] = 0x1000u;
+  user_data[21] = ImageFormatRgba16f << 20u;
+  user_data[22] = 255u | (255u << 14u);
+  user_data[23] = ImageTypeColor3D << 28u;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.input_info.compute = &input_info;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_dim=3d") != std::string::npos),
+        "MIMG store did not decode the RDNA2 3D instruction dimension");
+  const auto has_3d_store = std::ranges::any_of(
+      result.program.blocks, [&](const auto *block) {
+        return std::ranges::any_of(*block, [&](const auto &inst) {
+          if (inst.GetOpcode() !=
+              ShaderRecompiler::IR::ValueOpcode::ImageWrite) {
+            return false;
+          }
+          const auto index =
+              inst.template Flags<ShaderRecompiler::IR::MemoryFlags>().index;
+          return index < result.program.memory_info.size() &&
+                 result.program.memory_info[index].image_dimension ==
+                     ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
+                 result.program.memory_info[index].image_address_components ==
+                     3u;
+        });
+      });
+  Check(has_3d_store,
+        "3D storage image store did not preserve three address components");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim3D, 0, 2),
+        "SPIR-V binary does not contain storage 3D image type");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
+        "storage image store did not access the 3D storage descriptor binding");
+}
+
+// A group of indirect candidates (GroupIndirectImages) is an array of its capacity in its kind's binding of the group
+// set (IR::GroupSetFor): the module declares it, the topology check counts it there, and an image after it keeps its
+// own index in the stage's set.
+void TestGroupedImageArrayTopology() {
+  constexpr uint32_t ImageTypeColor2D = 9;
+  constexpr uint32_t ImageFormatR32f = 22; // k32Float
+  const uint32_t shader[] = {
+      EncodeMimg0(0x08, 0x1, false, 1),
+      EncodeMimg1(20, 5, 0, 4), // image_store 2D
+      0xbf810000u,
+  };
+  ShaderComputeInputInfo input_info = RegressionComputeInputInfo();
+  std::array<uint32_t, 64> user_data{};
+  user_data[20] = 0x1000u;
+  user_data[21] = ImageFormatR32f << 20u;
+  user_data[22] = 255u | (255u << 14u);
+  user_data[23] = ImageTypeColor2D << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &input_info;
+  options.user_data = user_data;
+  auto result = RecompileForTest(shader, options);
+  auto program = std::move(result.program);
+  Check(program.info.images.size() == 1u, "grouped topology fixture did not translate one storage image");
+  auto group = program.info.images[0];
+  group.indirect_capacity = 64u;
+  program.info.images.push_back(group);                  // the group's array
+  program.info.images.push_back(program.info.images[0]); // an image after it
+  const auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, options.input_info);
+  CheckSpirvBinaryValidates(spirv);
+  const auto kind = static_cast<size_t>(*ShaderRecompiler::IR::DescriptorBindingForImage(program.info.images[0]));
+  const auto group_index = ShaderRecompiler::IR::ImageBindingIndex(
+      static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(kind));
+  Check(program.info.images[1].descriptor_index == 0u && program.info.images[2].descriptor_index == 1u &&
+            program.bindings.descriptor_counts[kind] == 2u && program.bindings.group_counts[group_index] == 64u,
+        "a grouped image array did not take its capacity in its binding");
+}
+
+void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
+  constexpr uint32_t ImageTypeColor2D = 9;
+  constexpr uint32_t ImageFormatRgba16f = 71;
+  constexpr uint32_t MimgDim3D = 2;
+  constexpr uint32_t SpirvDim2D = 1;
+
+  const uint32_t shader[] = {
+      EncodeMimg0(0x08, 0xf, false, MimgDim3D),
+      EncodeMimg1(20, 5, 0, 4),
+      0xbf810000u,
+  };
+
+  ShaderComputeInputInfo input_info = RegressionComputeInputInfo();
+  std::array<uint32_t, 64> user_data{};
+  user_data[20] = 0x1000u;
+  user_data[21] = ImageFormatRgba16f << 20u;
+  user_data[22] = 255u | (255u << 14u);
+  user_data[23] = ImageTypeColor2D << 28u;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.input_info.compute = &input_info;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_dim=3d") != std::string::npos),
+        "test MIMG store should decode as a 3D instruction");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim2D, 0, 2),
+        "SPIR-V binary does not contain storage 2D image type");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_24 "),
+        "2D descriptor storage image store did not access the base storage "
+        "binding");
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_25 "),
+        "2D descriptor storage image store unexpectedly used the array storage "
+        "binding");
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
+        "2D descriptor storage image store unexpectedly used the 3D storage "
+        "binding");
+}
+
+void TestNewShaderRecompilerImageAtomicTranslation() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x11, 0x1, true),
+      EncodeMimg1(52, 0, 0, 1), // image_atomic_add
+      EncodeMimg0(0x15, 0x1, true),
+      EncodeMimg1(53, 0, 0, 1), // image_atomic_umin
+      EncodeMimg0(0x17, 0x1, true),
+      EncodeMimg1(57, 0, 0, 1), // image_atomic_umax
+      EncodeMimg0(0x18, 0x1, true),
+      EncodeMimg1(54, 0, 0, 1), // image_atomic_and
+      EncodeMimg0(0x19, 0x1, true),
+      EncodeMimg1(55, 0, 0, 1), // image_atomic_or
+      EncodeMimg0(0x1a, 0x1, true),
+      EncodeMimg1(56, 0, 0, 1), // image_atomic_xor
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("image_atomic_add") != std::string::npos),
+        "new decoder did not decode MIMG image atomic add");
+  Check((result.decoded_dump.find("image_atomic_umin") != std::string::npos),
+        "new decoder did not decode MIMG image atomic umin");
+  Check((result.decoded_dump.find("image_atomic_umax") != std::string::npos),
+        "new decoder did not decode MIMG image atomic umax");
+  Check((result.decoded_dump.find("image_atomic_and") != std::string::npos),
+        "new decoder did not decode MIMG image atomic and");
+  Check((result.decoded_dump.find("image_atomic_or") != std::string::npos),
+        "new decoder did not decode MIMG image atomic or");
+  Check((result.decoded_dump.find("image_atomic_xor") != std::string::npos),
+        "new decoder did not decode MIMG image atomic xor");
+  Check((result.decoded_dump.find("dmask=0x1") != std::string::npos),
+        "image atomic decode did not preserve dmask metadata");
+  Check((result.ir_dump.find("AtomicAddU32 v52, v52, v1") != std::string::npos),
+        "image_atomic_add did not lower through shared atomic IR");
+  Check((result.ir_dump.find("AtomicUMinU32 v53, v53, v1") != std::string::npos),
+        "image_atomic_umin did not lower through shared atomic IR");
+  Check((result.ir_dump.find("AtomicUMaxU32 v57, v57, v1") != std::string::npos),
+        "image_atomic_umax did not lower through shared atomic IR");
+  Check((result.ir_dump.find("AtomicAndU32 v54, v54, v1") != std::string::npos),
+        "image_atomic_and did not lower through shared atomic IR");
+  Check((result.ir_dump.find("AtomicOrU32 v55, v55, v1") != std::string::npos),
+        "image_atomic_or did not lower through shared atomic IR");
+  Check((result.ir_dump.find("AtomicXorU32 v56, v56, v1") != std::string::npos),
+        "image_atomic_xor did not lower through shared atomic IR");
+  Check((result.ir_dump.find("storage_image_uint") != std::string::npos),
+        "image atomic IR did not use uint storage-image metadata");
+  Check(SpirvContainsOpcode(result.spirv, 60),
+        "SPIR-V binary does not contain OpImageTexelPointer");
+  Check(SpirvContainsOpcode(result.spirv, 234),
+        "SPIR-V binary does not contain OpAtomicIAdd");
+  Check(SpirvContainsOpcode(result.spirv, 237),
+        "SPIR-V binary does not contain OpAtomicUMin");
+  Check(SpirvContainsOpcode(result.spirv, 239),
+        "SPIR-V binary does not contain OpAtomicUMax");
+  Check(SpirvContainsOpcode(result.spirv, 240),
+        "SPIR-V binary does not contain OpAtomicAnd");
+  Check(SpirvContainsOpcode(result.spirv, 241),
+        "SPIR-V binary does not contain OpAtomicOr");
+  Check(SpirvContainsOpcode(result.spirv, 242),
+        "SPIR-V binary does not contain OpAtomicXor");
+  Check(SpirvContainsOpcode(result.spirv, 225),
+        "image atomic SPIR-V binary does not contain OpMemoryBarrier");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerVintrpTranslation() {
+  const uint32_t shader[] = {
+      EncodeVintrp(0, 10, 1, 2, 4), // v_interp_p1_f32 v10, v4, attr1.z
+      EncodeVintrp(1, 11, 1, 2, 4), // v_interp_p2_f32 v11, v4, attr1.z
+      EncodeVintrp(2, 12, 0, 3, 2), // v_interp_mov_f32 v12, p0, attr0.w
+      0xbf810000u,
+  };
+
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 2;
+  SetIdentityInterpolatorSettings(&ps_info);
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("v_interp_p1_f32") != std::string::npos),
+        "new decoder did not decode VINTRP P1");
+  Check((result.decoded_dump.find("v_interp_p2_f32") != std::string::npos),
+        "new decoder did not decode VINTRP P2");
+  Check((result.decoded_dump.find("v_interp_mov_f32") != std::string::npos),
+        "new decoder did not decode VINTRP MOV");
+  Check((result.ir_dump.find("ControlNop") != std::string::npos),
+        "VINTRP P1 did not lower to an explicit no-op marker");
+  Check((result.ir_dump.find("LoadInputF32 v11") != std::string::npos),
+        "VINTRP P2 did not lower to input-load IR");
+  Check((result.ir_dump.find("input_attr=1 input_chan=2") != std::string::npos),
+        "VINTRP P2 did not preserve attr/channel metadata");
+  Check((result.ir_dump.find("LoadInputF32 v12") != std::string::npos),
+        "VINTRP MOV did not lower to input-load IR");
+  Check((result.ir_dump.find("input_attr=0 input_chan=3") != std::string::npos),
+        "VINTRP MOV did not preserve attr/channel metadata");
+  Check(ProgramInputCount(result.program,
+                          ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
+        "VINTRP pixel shader did not reflect parameter inputs");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "SPIR-V binary does not contain OpStore");
+  Check(SpirvContainsOpcode(result.spirv, 81),
+        "SPIR-V binary does not contain input component extraction");
+  Check(SpirvContainsOpcode(result.spirv, 124),
+        "SPIR-V binary does not contain input bitcast");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t remapped_shader[] = {
+      EncodeVintrp(1, 11, 2, 0, 4), // v_interp_p2_f32 v11, v4, attr2.x
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo remapped_ps_info{};
+  remapped_ps_info.input_num = 3;
+  SetIdentityInterpolatorSettings(&remapped_ps_info);
+  remapped_ps_info.interpolator_settings[2] = 3;
+
+  options.input_info.pixel = &remapped_ps_info;
+
+  auto remapped_result = RecompileForTest(remapped_shader, options);
+  Check(
+      (remapped_result.ir_dump.find("input_attr=2 input_chan=0") != std::string::npos),
+      "remapped VINTRP did not preserve raw pixel attribute metadata");
+  Check(
+      SpirvHasDecorationValue(remapped_result.spirv, 30u, 3u),
+      "remapped VINTRP did not use SPI_PS_INPUT_CNTL input offset as Location");
+  Check(!SpirvHasDecorationValue(remapped_result.spirv, 30u, 2u),
+        "remapped VINTRP still emitted the raw attribute as Location");
+  CheckSpirvBinaryValidates(remapped_result.spirv);
+
+  const uint32_t duplicate_location_shader[] = {
+      EncodeVintrp(0, 6, 1, 0, 4),  // v_interp_p1_f32 v6, v4, attr1.x
+      EncodeVintrp(0, 10, 0, 0, 4), // v_interp_p1_f32 v10, v4, attr0.x
+      EncodeVintrp(1, 6, 1, 0, 4),  // v_interp_p2_f32 v6, v4, attr1.x
+      EncodeVintrp(1, 10, 0, 0, 4), // v_interp_p2_f32 v10, v4, attr0.x
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo duplicate_ps_info{};
+  duplicate_ps_info.input_num = 2;
+
+  options.input_info.pixel = &duplicate_ps_info;
+
+  auto duplicate_result =
+      RecompileForTest(duplicate_location_shader, options);
+  Check(ProgramInputCount(duplicate_result.program,
+                          ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
+        "duplicate-location VINTRP shader did not reflect both raw parameter "
+        "attrs");
+  Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 0u) == 1,
+        "duplicate-location VINTRP emitted more than one Location 0 input");
+  Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 1u) == 1,
+        "duplicate-location VINTRP did not fall back attr1 to Location 1");
+  CheckSpirvBinaryValidates(duplicate_result.spirv);
+
+  const uint32_t flat_shader[] = {
+      EncodeVintrp(2, 12, 0, 0, 2), // v_interp_mov_f32 v12, p0, attr0.x
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo flat_ps_info{};
+  flat_ps_info.input_num = 1;
+  SetIdentityInterpolatorSettings(&flat_ps_info);
+  flat_ps_info.interpolator_settings[0] = 0x00000400u;
+
+  options.input_info.pixel = &flat_ps_info;
+
+  auto flat_result = RecompileForTest(flat_shader, options);
+  Check(SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 14u),
+        "flat VINTRP input did not emit a Flat decoration");
+  Check(!SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 13u),
+        "flat VINTRP input should not also emit NoPerspective");
+  Check(SpirvHasDecorationValue(flat_result.spirv, 30u, 0u),
+        "flat VINTRP input did not preserve Location 0");
+  CheckSpirvBinaryValidates(flat_result.spirv);
+
+  ShaderPixelInputInfo no_perspective_ps_info{};
+  no_perspective_ps_info.input_num = 1;
+  no_perspective_ps_info.ps_no_perspective = true;
+  SetIdentityInterpolatorSettings(&no_perspective_ps_info);
+
+  options.input_info.pixel = &no_perspective_ps_info;
+
+  auto no_perspective_result =
+      RecompileForTest(flat_shader, options);
+  Check(SpirvHasDecorationValueWithDecoration(no_perspective_result.spirv, 30u,
+                                              0u, 13u),
+        "no-perspective VINTRP input did not emit a NoPerspective decoration");
+  Check(!SpirvHasDecorationValueWithDecoration(no_perspective_result.spirv, 30u,
+                                               0u, 14u),
+        "non-flat no-perspective VINTRP input should not emit Flat");
+  CheckSpirvBinaryValidates(no_perspective_result.spirv);
 }
 
 void TestCustomVintrpMovTranslation() {
@@ -4280,6 +7699,81 @@ void TestNewShaderRecompilerNativeWideBufferIr() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerBufferSignedLoadTranslation() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x09, 3), EncodeMubuf1(46, 0, 1), // buffer_load_sbyte
+      EncodeMubuf0(0x0b, 6), EncodeMubuf1(47, 0, 1), // buffer_load_sshort
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("buffer_load_sbyte") != std::string::npos),
+        "new decoder did not decode buffer signed byte load");
+  Check((result.decoded_dump.find("buffer_load_sshort") != std::string::npos),
+        "new decoder did not decode buffer signed short load");
+  Check((result.decoded_dump.find("bits=8") != std::string::npos),
+        "signed byte buffer load did not preserve bit width metadata");
+  Check((result.decoded_dump.find("bits=16") != std::string::npos),
+        "signed short buffer load did not preserve bit width metadata");
+  Check((result.decoded_dump.find("signed=1") != std::string::npos),
+        "signed buffer loads did not preserve signed metadata");
+  Check((result.ir_dump.find("BufferLoadSbyte v46") != std::string::npos),
+        "buffer_load_sbyte did not lower to signed byte IR load");
+  Check((result.ir_dump.find("BufferLoadSshort v47") != std::string::npos),
+        "buffer_load_sshort did not lower to signed short IR load");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad");
+  Check(SpirvContainsOpcode(result.spirv, 195),
+        "SPIR-V binary does not contain OpShiftRightArithmetic for sign "
+        "extension");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical for sign extension");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerBufferSubDwordStoreTranslation() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x18, 2), EncodeMubuf1(48, 0, 1), // buffer_store_byte
+      EncodeMubuf0(0x1a, 4), EncodeMubuf1(49, 0, 1), // buffer_store_short
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("buffer_store_byte") != std::string::npos),
+        "new decoder did not decode buffer byte store");
+  Check((result.decoded_dump.find("buffer_store_short") != std::string::npos),
+        "new decoder did not decode buffer short store");
+  Check((result.decoded_dump.find("bits=8") != std::string::npos),
+        "buffer byte store did not preserve bit width metadata");
+  Check((result.decoded_dump.find("bits=16") != std::string::npos),
+        "buffer short store did not preserve bit width metadata");
+  Check((result.ir_dump.find("BufferStoreByte null, v48") != std::string::npos),
+        "buffer_store_byte did not lower to byte store IR");
+  Check((result.ir_dump.find("BufferStoreShort null, v49") != std::string::npos),
+        "buffer_store_short did not lower to short store IR");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad for sub-dword store RMW");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "SPIR-V binary does not contain OpStore for sub-dword store RMW");
+  Check(SpirvContainsOpcode(result.spirv, 197),
+        "SPIR-V binary does not contain OpBitwiseOr");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  Check(SpirvContainsOpcode(result.spirv, 200),
+        "SPIR-V binary does not contain OpNot");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerMubufFormatTranslation() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x00, 4),
@@ -4358,7 +7852,7 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeBindingSizeOnly() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check(source.find("OpULessThan") != std::string::npos &&
             source.find("OpArrayLength") == std::string::npos,
-        "formatted store SPIR-V lacks a bounds check against its pushed binding size");
+        "formatted store SPIR-V lacks its bounds check against the bound length in shader data");
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
       "formatted store SPIR-V baked descriptor NumRecords into a store guard");
@@ -4431,6 +7925,34 @@ void TestNewShaderRecompilerTypedBufferTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerFlatOldBackedTranslation() {
+  const uint32_t shader[] = {
+      EncodeFlat0(0x08, 0, 4),
+      EncodeFlat1(9, 0x7d, 0, 1), // flat_load_ubyte
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("flat_load_ubyte") != std::string::npos),
+        "new decoder did not decode old-backed FLAT ubyte load");
+  Check((result.ir_dump.find("FlatLoadUbyte v9") != std::string::npos),
+        "old-backed FLAT ubyte load did not lower to IR");
+  Check(SpirvContainsOpcode(result.spirv, 65),
+        "SPIR-V binary does not contain OpAccessChain");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "SPIR-V binary does not contain OpShiftRightLogical");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerUnbasedFlatUsesBda() {
   const uint32_t shader[] = {
       EncodeFlat0(0x0c, 0, 0),
@@ -4447,6 +7969,302 @@ void TestNewShaderRecompilerUnbasedFlatUsesBda() {
             result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable)] != 0 &&
             result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer)] != 0,
         "unbased FLAT did not compile through BDA");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerFlatSignedLoadTranslation() {
+  const uint32_t shader[] = {
+      EncodeFlat0(0x09, 0, 4),
+      EncodeFlat1(10, 0x7d, 0, 1), // flat_load_sbyte
+      EncodeFlat0(0x0b, 1, 8),
+      EncodeFlat1(11, 0x7d, 0, 1), // scratch_load_sshort
+      EncodeFlat0(0x09, 2, 12),
+      EncodeFlat1(12, 0x7d, 0, 1), // global_load_sbyte
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("flat_load_sbyte") != std::string::npos),
+        "new decoder did not decode flat signed byte load");
+  Check((result.decoded_dump.find("flat_load_sshort") != std::string::npos),
+        "new decoder did not decode flat signed short load");
+  Check((result.decoded_dump.find("bits=8") != std::string::npos),
+        "signed byte flat load did not preserve bit width metadata");
+  Check((result.decoded_dump.find("bits=16") != std::string::npos),
+        "signed short flat load did not preserve bit width metadata");
+  Check((result.decoded_dump.find("signed=1") != std::string::npos),
+        "signed flat loads did not preserve signed metadata");
+  Check((result.ir_dump.find("FlatLoadSbyte v10") != std::string::npos),
+        "flat_load_sbyte did not lower to signed byte IR load");
+  Check((result.ir_dump.find("FlatLoadSshort v11") != std::string::npos),
+        "flat_load_sshort did not lower to signed short IR load");
+  Check((result.ir_dump.find("scratch") != std::string::npos),
+        "signed scratch load did not preserve scratch metadata");
+  Check((result.ir_dump.find("global") != std::string::npos),
+        "signed global load did not preserve global metadata");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad");
+  Check(SpirvContainsOpcode(result.spirv, 195),
+        "SPIR-V binary does not contain OpShiftRightArithmetic for sign "
+        "extension");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical for sign extension");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerFlatStoreTranslation() {
+  const uint32_t shader[] = {
+      EncodeFlat0(0x18, 0, 2),
+      EncodeFlat1(0, 0x7d, 72, 1), // flat_store_byte
+      EncodeFlat0(0x1a, 1, 6),
+      EncodeFlat1(0, 0x7d, 73, 1), // scratch_store_short
+      EncodeFlat0(0x1c, 0, 4),
+      EncodeFlat1(0, 0x7d, 60, 1), // flat_store_dword
+      EncodeFlat0(0x1d, 1, 8),
+      EncodeFlat1(0, 0x7d, 61, 1), // scratch_store_dwordx2
+      EncodeFlat0(0x1f, 2, 12),
+      EncodeFlat1(0, 0x7d, 64, 1), // global_store_dwordx3
+      EncodeFlat0(0x1e, 2, 16),
+      EncodeFlat1(0, 0x7d, 68, 1), // global_store_dwordx4
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("flat_store_byte") != std::string::npos),
+        "new decoder did not decode flat byte store");
+  Check((result.decoded_dump.find("flat_store_short") != std::string::npos),
+        "new decoder did not decode flat short store");
+  Check((result.decoded_dump.find("flat_store_dword") != std::string::npos),
+        "new decoder did not decode flat dword store");
+  Check((result.decoded_dump.find("flat_store_dwordx2") != std::string::npos),
+        "new decoder did not decode flat dwordx2 store");
+  Check((result.decoded_dump.find("flat_store_dwordx3") != std::string::npos),
+        "new decoder did not decode flat dwordx3 store");
+  Check((result.decoded_dump.find("flat_store_dwordx4") != std::string::npos),
+        "new decoder did not decode flat dwordx4 store");
+  Check((result.decoded_dump.find("segment=1") != std::string::npos),
+        "flat store decode did not preserve scratch segment metadata");
+  Check((result.decoded_dump.find("segment=2") != std::string::npos),
+        "flat store decode did not preserve global segment metadata");
+  Check((result.decoded_dump.find("dwords=1 bits=8") != std::string::npos),
+        "flat byte store decode did not expose byte-width metadata");
+  Check((result.decoded_dump.find("dwords=1 bits=16") != std::string::npos),
+        "flat short store decode did not expose short-width metadata");
+  Check((result.decoded_dump.find("dwords=4 bits=32") != std::string::npos),
+        "flat store decode did not expose wide width metadata");
+  Check((result.ir_dump.find("FlatStoreByte null, v72") != std::string::npos),
+        "flat_store_byte did not lower through shared flat store IR");
+  Check((result.ir_dump.find("FlatStoreShort null, v73") != std::string::npos),
+        "flat_store_short did not lower through shared flat store IR");
+  Check((result.ir_dump.find("FlatStoreDword null, v60") != std::string::npos),
+        "flat_store_dword did not lower through shared flat store IR");
+  Check((result.ir_dump.find("FlatStoreDword null, v62") != std::string::npos),
+        "scratch_store_dwordx2 did not expand to the last dword store");
+  Check((result.ir_dump.find("FlatStoreDword null, v66") != std::string::npos),
+        "global_store_dwordx3 did not expand to the last dword store");
+  Check((result.ir_dump.find("FlatStoreDword null, v71") != std::string::npos),
+        "global_store_dwordx4 did not expand to the last dword store");
+  Check((result.ir_dump.find("flat") != std::string::npos),
+        "flat store IR did not preserve flat resource metadata");
+  Check((result.ir_dump.find("scratch") != std::string::npos),
+        "flat store IR did not preserve scratch resource metadata");
+  Check((result.ir_dump.find("global") != std::string::npos),
+        "flat store IR did not preserve global resource metadata");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad for sub-dword flat store merge");
+  Check(SpirvContainsOpcode(result.spirv, 65),
+        "SPIR-V binary does not contain OpAccessChain");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "SPIR-V binary does not contain OpStore");
+  Check(SpirvContainsOpcode(result.spirv, 197),
+        "SPIR-V binary does not contain OpBitwiseOr for sub-dword flat store "
+        "merge");
+  Check(SpirvContainsOpcode(result.spirv, 200),
+        "SPIR-V binary does not contain OpNot for sub-dword flat store mask");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerAtomicTranslation() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x30, 4, true, true),
+      EncodeMubuf1(0, 0, 1), // buffer_atomic_swap
+      EncodeMubuf0(0x32, 8, true, true),
+      EncodeMubuf1(1, 0, 1), // buffer_atomic_add
+      EncodeMubuf0(0x33, 12, true, true),
+      EncodeMubuf1(7, 0, 1), // buffer_atomic_sub
+      EncodeMubuf0(0x35, 16, true, true),
+      EncodeMubuf1(8, 0, 1), // buffer_atomic_smin
+      EncodeMubuf0(0x36, 20, true, true),
+      EncodeMubuf1(2, 0, 1), // buffer_atomic_umin
+      EncodeMubuf0(0x37, 24, true, true),
+      EncodeMubuf1(9, 0, 1), // buffer_atomic_smax
+      EncodeMubuf0(0x38, 28, true, true),
+      EncodeMubuf1(3, 0, 1), // buffer_atomic_umax
+      EncodeMubuf0(0x39, 32, true, true),
+      EncodeMubuf1(4, 0, 1), // buffer_atomic_and
+      EncodeMubuf0(0x3a, 36, true, true),
+      EncodeMubuf1(5, 0, 1), // buffer_atomic_or
+      EncodeMubuf0(0x3b, 40, true, true),
+      EncodeMubuf1(6, 0, 1), // buffer_atomic_xor
+      0xe0fc0000u,
+      0x80010000u, // exact buffer_atomic_fmin v0, s[4:7], 0 (GLC=0)
+      0xe100000cu,
+      0x80010300u, // exact failing buffer_atomic_fmax v3, s[4:7], 12 (GLC=0)
+      EncodeDs0(0x00),
+      EncodeDs1(0, 2, 1), // ds_add_u32
+      EncodeDs0(0x01),
+      EncodeDs1(0, 10, 1), // ds_sub_u32
+      EncodeDs0(0x05),
+      EncodeDs1(0, 11, 1), // ds_min_i32
+      EncodeDs0(0x06),
+      EncodeDs1(0, 12, 1), // ds_max_i32
+      EncodeDs0(0x09),
+      EncodeDs1(0, 13, 1), // ds_and_b32
+      EncodeDs0(0x0b),
+      EncodeDs1(0, 14, 1), // ds_xor_b32
+      EncodeDs0(0x20),
+      EncodeDs1(15, 2, 1), // ds_add_rtn_u32
+      EncodeDs0(0x21),
+      EncodeDs1(16, 10, 1), // ds_sub_rtn_u32
+      EncodeDs0(0x25),
+      EncodeDs1(17, 11, 1), // ds_min_rtn_i32
+      EncodeDs0(0x26),
+      EncodeDs1(18, 12, 1), // ds_max_rtn_i32
+      EncodeDs0(0x27),
+      EncodeDs1(19, 2, 1), // ds_min_rtn_u32
+      EncodeDs0(0x28),
+      EncodeDs1(20, 2, 1), // ds_max_rtn_u32
+      EncodeDs0(0x29),
+      EncodeDs1(21, 13, 1), // ds_and_rtn_b32
+      EncodeDs0(0x2a),
+      EncodeDs1(22, 2, 1), // ds_or_rtn_b32
+      EncodeDs0(0x2b),
+      EncodeDs1(23, 14, 1), // ds_xor_rtn_b32
+      EncodeDs0(0x2d),
+      EncodeDs1(24, 15, 1), // ds_wrxchg_rtn_b32
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("buffer_atomic_swap") != std::string::npos),
+        "new decoder did not decode buffer atomic swap");
+  Check((result.decoded_dump.find("buffer_atomic_add") != std::string::npos),
+        "new decoder did not decode buffer atomic add");
+  Check((result.decoded_dump.find("buffer_atomic_sub") != std::string::npos),
+        "new decoder did not decode buffer atomic sub");
+  Check((result.decoded_dump.find("buffer_atomic_smin") != std::string::npos),
+        "new decoder did not decode buffer atomic signed min");
+  Check((result.decoded_dump.find("buffer_atomic_smax") != std::string::npos),
+        "new decoder did not decode buffer atomic signed max");
+  Check((result.decoded_dump.find("buffer_atomic_xor") != std::string::npos),
+        "new decoder did not decode buffer atomic xor");
+  Check((result.decoded_dump.find("buffer_atomic_fmin") != std::string::npos),
+        "new decoder did not decode buffer atomic float min");
+  Check((result.decoded_dump.find("buffer_atomic_fmax") != std::string::npos),
+        "new decoder did not decode buffer atomic float max");
+  Check((result.decoded_dump.find("ds_add_u32") != std::string::npos),
+        "new decoder did not decode DS atomic add");
+  Check((result.decoded_dump.find("ds_sub_u32") != std::string::npos),
+        "new decoder did not decode DS atomic sub");
+  Check((result.decoded_dump.find("ds_min_i32") != std::string::npos),
+        "new decoder did not decode DS signed min");
+  Check((result.decoded_dump.find("ds_xor_rtn_b32") != std::string::npos),
+        "new decoder did not decode DS xor-return");
+  Check((result.decoded_dump.find("ds_wrxchg_rtn_b32") != std::string::npos),
+        "new decoder did not decode DS write-exchange-return");
+  Check((result.decoded_dump.find("ds_add_rtn_u32") != std::string::npos),
+        "new decoder did not decode DS atomic add-return");
+  Check((result.ir_dump.find("AtomicSwapU32 v0") != std::string::npos),
+        "buffer atomic swap did not lower to IR");
+  Check((result.ir_dump.find("AtomicAddU32 v1") != std::string::npos),
+        "buffer atomic add did not lower to IR");
+  Check((result.ir_dump.find("AtomicSubU32 v7") != std::string::npos),
+        "buffer atomic sub did not lower to IR");
+  Check((result.ir_dump.find("AtomicSMinI32 v8") != std::string::npos),
+        "buffer atomic signed min did not lower to IR");
+  Check((result.ir_dump.find("AtomicUMinU32 v2") != std::string::npos),
+        "buffer atomic umin did not lower to IR");
+  Check((result.ir_dump.find("AtomicSMaxI32 v9") != std::string::npos),
+        "buffer atomic signed max did not lower to IR");
+  Check((result.ir_dump.find("AtomicUMaxU32 v3") != std::string::npos),
+        "buffer atomic umax did not lower to IR");
+  Check((result.ir_dump.find("AtomicAndU32 v4") != std::string::npos),
+        "buffer atomic and did not lower to IR");
+  Check((result.ir_dump.find("AtomicOrU32 v5") != std::string::npos),
+        "buffer atomic or did not lower to IR");
+  Check((result.ir_dump.find("AtomicXorU32 v6") != std::string::npos),
+        "buffer atomic xor did not lower to IR");
+  Check((result.ir_dump.find("AtomicFMinF32 null, v0") != std::string::npos),
+        "buffer atomic float min did not lower to IR without a GLC return");
+  Check((result.ir_dump.find("AtomicFMaxF32 null, v3") != std::string::npos),
+        "buffer atomic float max did not lower to IR without a GLC return");
+  Check((result.ir_dump.find("AtomicAddU32 null, v2") != std::string::npos),
+        "DS no-return atomic add did not lower to IR");
+  Check((result.ir_dump.find("AtomicSubU32 null, v10") != std::string::npos),
+        "DS no-return atomic sub did not lower to IR");
+  Check((result.ir_dump.find("AtomicSMinI32 null, v11") != std::string::npos),
+        "DS no-return signed min did not lower to IR");
+  Check((result.ir_dump.find("AtomicSMaxI32 null, v12") != std::string::npos),
+        "DS no-return signed max did not lower to IR");
+  Check((result.ir_dump.find("AtomicAndU32 null, v13") != std::string::npos),
+        "DS no-return and did not lower to IR");
+  Check((result.ir_dump.find("AtomicXorU32 null, v14") != std::string::npos),
+        "DS no-return xor did not lower to IR");
+  Check((result.ir_dump.find("AtomicAddU32 v15") != std::string::npos),
+        "DS add-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicSubU32 v16") != std::string::npos),
+        "DS sub-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicSMinI32 v17") != std::string::npos),
+        "DS signed min-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicSMaxI32 v18") != std::string::npos),
+        "DS signed max-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicUMinU32 v19") != std::string::npos),
+        "DS unsigned min-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicUMaxU32 v20") != std::string::npos),
+        "DS unsigned max-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicAndU32 v21") != std::string::npos),
+        "DS and-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicOrU32 v22") != std::string::npos),
+        "DS or-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicXorU32 v23") != std::string::npos),
+        "DS xor-return did not lower to IR");
+  Check((result.ir_dump.find("AtomicSwapU32 v24") != std::string::npos),
+        "DS write-exchange-return did not lower to shared atomic swap IR");
+  Check(SpirvContainsOpcode(result.spirv, 229),
+        "SPIR-V binary does not contain OpAtomicExchange");
+  Check(SpirvContainsOpcode(result.spirv, 234),
+        "SPIR-V binary does not contain OpAtomicIAdd");
+  Check(SpirvContainsOpcode(result.spirv, 235),
+        "SPIR-V binary does not contain OpAtomicISub");
+  Check(SpirvContainsOpcode(result.spirv, 236),
+        "SPIR-V binary does not contain OpAtomicSMin");
+  Check(SpirvContainsOpcode(result.spirv, 237),
+        "SPIR-V binary does not contain OpAtomicUMin");
+  Check(SpirvContainsOpcode(result.spirv, 238),
+        "SPIR-V binary does not contain OpAtomicSMax");
+  Check(SpirvContainsOpcode(result.spirv, 239),
+        "SPIR-V binary does not contain OpAtomicUMax");
+  Check(SpirvContainsOpcode(result.spirv, 240),
+        "SPIR-V binary does not contain OpAtomicAnd");
+  Check(SpirvContainsOpcode(result.spirv, 241),
+        "SPIR-V binary does not contain OpAtomicOr");
+  Check(SpirvContainsOpcode(result.spirv, 242),
+        "SPIR-V binary does not contain OpAtomicXor");
+  Check(SpirvContainsOpcode(result.spirv, 230),
+        "SPIR-V binary does not contain OpAtomicCompareExchange for float min");
+  Check(SpirvContainsOpcode(result.spirv, 225),
+        "buffer atomic SPIR-V binary does not contain OpMemoryBarrier");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -4527,6 +8345,73 @@ void TestNewShaderRecompilerDsReadWrite2Translation() {
         "SPIR-V binary does not contain OpStore");
   Check(SpirvContainsOpcode(result.spirv, 65),
         "SPIR-V binary does not contain OpAccessChain");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerDsSubDwordTranslation() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x1e, 1), EncodeDs1(0, 40, 1), // ds_write_b8 v40, v1
+      EncodeDs0(0x1f, 2), EncodeDs1(0, 41, 1), // ds_write_b16 v41, v1
+      EncodeDs0(0x39, 3), EncodeDs1(42, 0, 1), // ds_read_i8 v42, v1
+      EncodeDs0(0x3a, 4), EncodeDs1(43, 0, 1), // ds_read_u8 v43, v1
+      EncodeDs0(0x3b, 6), EncodeDs1(44, 0, 1), // ds_read_i16 v44, v1
+      EncodeDs0(0x3c, 8), EncodeDs1(45, 0, 1), // ds_read_u16 v45, v1
+      0xda980000u, 0x07000007u, // ds_read_u16_d16 v7, v7
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("ds_write_b8") != std::string::npos),
+        "new decoder did not decode DS byte write");
+  Check((result.decoded_dump.find("ds_write_b16") != std::string::npos),
+        "new decoder did not decode DS short write");
+  Check((result.decoded_dump.find("ds_read_i8") != std::string::npos),
+        "new decoder did not decode DS signed byte read");
+  Check((result.decoded_dump.find("ds_read_u8") != std::string::npos),
+        "new decoder did not decode DS unsigned byte read");
+  Check((result.decoded_dump.find("ds_read_i16") != std::string::npos),
+        "new decoder did not decode DS signed short read");
+  Check((result.decoded_dump.find("ds_read_u16") != std::string::npos),
+        "new decoder did not decode DS unsigned short read");
+  Check((result.decoded_dump.find("DS_READ_U16_D16 v7.sdwa(sel=4") != std::string::npos),
+        "new decoder did not decode captured DS masked short read");
+  Check((result.decoded_dump.find("dwords=1 bits=8") != std::string::npos),
+        "DS byte decode did not preserve byte-width metadata");
+  Check((result.decoded_dump.find("dwords=1 bits=16") != std::string::npos),
+        "DS short decode did not preserve short-width metadata");
+  Check((result.ir_dump.find("DsWriteByte null, v40") != std::string::npos),
+        "DS byte write did not lower to explicit IR");
+  Check((result.ir_dump.find("DsWriteShort null, v41") != std::string::npos),
+        "DS short write did not lower to explicit IR");
+  Check((result.ir_dump.find("DsReadSbyte v42") != std::string::npos),
+        "DS signed byte read did not lower to explicit IR");
+  Check((result.ir_dump.find("DsReadUbyte v43") != std::string::npos),
+        "DS unsigned byte read did not lower to explicit IR");
+  Check((result.ir_dump.find("DsReadSshort v44") != std::string::npos),
+        "DS signed short read did not lower to explicit IR");
+  Check((result.ir_dump.find("DsReadUshort v45") != std::string::npos),
+        "DS unsigned short read did not lower to explicit IR");
+  Check((result.ir_dump.find("DsReadUshort v7.sdwa(sel=4") != std::string::npos),
+        "DS masked short read did not preserve its partial destination");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "SPIR-V binary does not contain OpStore");
+  Check(SpirvContainsOpcode(result.spirv, 65),
+        "SPIR-V binary does not contain OpAccessChain");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "SPIR-V binary does not contain OpShiftRightLogical");
+  Check(SpirvContainsOpcode(result.spirv, 195),
+        "SPIR-V binary does not contain OpShiftRightArithmetic");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  Check(SpirvContainsOpcode(result.spirv, 200),
+        "SPIR-V binary does not contain OpNot");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -4611,6 +8496,98 @@ void TestNewShaderRecompilerDsWideAndAtomicTranslation() {
         "SPIR-V binary does not contain OpAtomicUMax");
   Check(SpirvContainsOpcode(result.spirv, 241),
         "SPIR-V binary does not contain OpAtomicOr");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerDsSwizzleTranslation() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x35, 0x001f),
+      EncodeDs1(8, 0, 5), // ds_swizzle_b32 v8, v5
+      EncodeDs0(0x35, 0x801b),
+      EncodeDs1(9, 0, 6), // ds_swizzle_b32 v9, v6
+      0xd8d4c480u,
+      0x45000045u, // ds_swizzle_b32 rotate mode from boot shader
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("ds_swizzle_b32") != std::string::npos),
+        "new decoder did not decode DS swizzle");
+  Check((result.decoded_dump.find("offset=31") != std::string::npos),
+        "new decoder did not expose DS swizzle control");
+  Check((result.decoded_dump.find("offset=32795") != std::string::npos),
+        "new decoder did not expose DS swizzle quad control");
+  Check((result.decoded_dump.find("offset=50304") != std::string::npos),
+        "new decoder did not expose DS swizzle rotate control");
+  Check((result.ir_dump.find("DsSwizzleB32 v8, v5, 0x0000001f") != std::string::npos),
+        "DS swizzle did not lower to explicit IR");
+  Check((result.ir_dump.find("DsSwizzleB32 v9, v6, 0x0000801b") != std::string::npos),
+        "DS quad swizzle did not lower to explicit IR");
+  Check(
+      (result.ir_dump.find("DsSwizzleB32 v69, v69, 0x0000c480") != std::string::npos),
+      "DS rotate swizzle did not lower to explicit IR");
+  Check(SpirvContainsOpcode(result.spirv, 345),
+        "SPIR-V binary does not contain OpGroupNonUniformShuffle");
+  Check(SpirvContainsOpcode(result.spirv, 128),
+        "SPIR-V binary does not contain OpIAdd for DS rotate swizzle");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "SPIR-V binary does not contain OpStore");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical");
+  Check(SpirvContainsOpcode(result.spirv, 198),
+        "SPIR-V binary does not contain OpBitwiseOr");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerDsAddtidTranslation() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(124, 132), // m0 = 4
+      EncodeDs0(0xb0, 8),
+      EncodeDs1(0, 7, 0), // ds_write_addtid_b32 v7
+      EncodeDs0(0xb1, 12),
+      EncodeDs1(8, 0, 0), // ds_read_addtid_b32 v8
+      0xbf810000u,
+  };
+
+  ShaderComputeInputInfo input_info = RegressionComputeInputInfo();
+  input_info.thread_ids_num = 1;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.input_info.compute = &input_info;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("ds_write_addtid_b32") != std::string::npos),
+        "new decoder did not decode DS write addtid");
+  Check((result.decoded_dump.find("ds_read_addtid_b32") != std::string::npos),
+        "new decoder did not decode DS read addtid");
+  Check((result.ir_dump.find("DsWriteAddtidB32 null, v7, m0") != std::string::npos),
+        "DS write addtid did not lower to explicit IR");
+  Check((result.ir_dump.find("DsReadAddtidB32 v8, m0") != std::string::npos),
+        "DS read addtid did not lower to explicit IR");
+  Check(ProgramHasInput(
+            result.program,
+            ShaderRecompiler::IR::StageInputKind::LocalInvocationIndex),
+        "DS addtid did not request LocalInvocationIndex input");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "SPIR-V binary does not contain OpStore");
+  Check(SpirvContainsOpcode(result.spirv, 65),
+        "SPIR-V binary does not contain OpAccessChain");
+  Check(SpirvContainsOpcode(result.spirv, 128),
+        "SPIR-V binary does not contain OpIAdd");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -5607,7 +9584,7 @@ void TestSharedReturnPreservesDescriptorDominance() {
   user_data[29] = static_cast<uint32_t>(address >> 32u);
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.user_data = user_data;
-  auto result = RecompileForTest(shader, options);
+  auto result = RecompileForTest(shader, options, ReadHostTestMemory);
   Check(!result.program.dispatcher_fallback &&
             result.resources.buffers.size() == 1u &&
             result.resources.buffers[0].dwords[0] == 0x2000u,
@@ -5667,7 +9644,7 @@ void TestNestedSelectionPreservesDescriptorSources() {
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.user_data_base = 8;
     options.user_data = user_data;
-    const auto result = RecompileForTest(shader, options);
+    const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
     Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 4u,
           "nested descriptor selection lost its structured resource bindings");
     for (size_t i = 0; i < result.program.info.buffers.size(); ++i) {
@@ -5743,7 +9720,7 @@ void TestSharedExitPreservesNativeDescriptorSources() {
     user_data[2] = arm;
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.user_data = user_data;
-    const auto result = RecompileForTest(shader, options);
+    const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
     Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 2u,
           "shared-exit descriptor selection lost its structured resource bindings");
     for (size_t i = 0; i < result.program.info.buffers.size(); ++i) {
@@ -5789,7 +9766,7 @@ void TestNativeScalarReadDescriptorPlanning() {
     user_data[8] = mode;
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.user_data = user_data;
-    const auto result = RecompileForTest(shader, options);
+    const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
     const auto expected = mode == 2u ? table : std::array<uint32_t, 4>{};
     Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 1u &&
               std::ranges::equal(result.resources.flattened_srt, expected),
@@ -5891,7 +9868,7 @@ void TestNativeGuardedSamplerSource(bool inline_constants) {
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.user_data_base = 8;
     options.user_data = user_data;
-    const auto result = RecompileForTest(code, options);
+    const auto result = RecompileForTest(code, options, ReadHostTestMemory);
     const auto expected = mode == 2u ? sampler : std::array<uint32_t, 4>{};
     Check(!result.program.dispatcher_fallback && result.resources.samplers.size() == 1u &&
               result.resources.samplers[0].dword_count == expected.size() &&
@@ -5963,8 +9940,16 @@ void TestNullImageTakesDeclaredCube() {
   const auto cube = specialize({0x100u, static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u,
                                 0u, DstSel(4, 5, 6, 7) |
                                     (static_cast<uint32_t>(Prospero::ImageType::kCube) << 28u)});
-  Check(cube.images.size() == 1u && cube.images[0].cube && specialize({}) == cube,
-        "a null T# sampled as a cube specialized as another image type");
+  // Lean keeps a null T# a plain 2D image unless KYTY_NULL_IMAGE_DIMS=1 (Wolverine's hint keys).
+  if (NullImageInstructionDims()) {
+    Check(cube.images.size() == 1u && cube.images[0].cube && specialize({}) == cube,
+          "a null T# sampled as a cube specialized as another image type");
+  } else {
+    const auto null_image = specialize({});
+    Check(cube.images.size() == 1u && cube.images[0].cube && null_image.images.size() == 1u &&
+              !null_image.images[0].cube,
+          "a null T# took the cube of its instruction with KYTY_NULL_IMAGE_DIMS off");
+  }
 }
 
 void TestPackedZeroHighSamplerTableKey() {
@@ -6052,7 +10037,8 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   ShaderRecompiler::IR::ResourceSnapshot snapshot;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const ShaderRecompiler::IR::SrtRuntime runtime{
-      .user_data = user_data, .read_specialization_memory = ReadHostTestMemory};
+      .user_data = user_data, .read_memory = ReadHostTestMemory,
+      .read_specialization_memory = ReadHostTestMemory};
   const auto materialize = [&] {
     return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
   };
@@ -6137,7 +10123,7 @@ void TestNativeDescriptorProvenanceKeepsGpuSelection() {
   options.input_info.compute = &input_info;
   options.user_data = user_data;
   for (const auto &shader : {selected, partial, loop}) {
-    const auto result = RecompileForTest(shader, options);
+    const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
     Check(result.program.info.uses_dma && result.program.info.buffers.size() == 1u &&
               result.program.info.buffers[0].written,
           "GPU-selected scalar descriptor was materialized as a host binding");
@@ -7105,7 +11091,9 @@ void TestComputeDispatchWaveSize() {
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
-      EncodeVopc(0xd4, 0 + 256, 1), // v_cmpx_gt_u32 v0, v1
+      // v_cmpx_gt_u32 s0, v1: user data (the descriptor's first word), so the guard cannot be
+      // folded; with v0, v1 (both thread IDs of one invocation) it folds to false and the load goes.
+      EncodeVopc(0xd4, 0, 1),
       EncodeMubuf0(0x0c),
       EncodeMubuf1(0, 0, 1), // buffer_load_dword
                              // v0
@@ -7125,21 +11113,128 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       source.find("OpBranchConditional", 0);
-  const auto bounds = source.find("OpULessThan", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", bounds);
+  const auto array_length =
+      source.find("OpULessThan", 0); // the bounds compare, against the bound length
+  const auto bounds_branch = source.find("OpBranchConditional", array_length);
   const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
   Check(exec_branch != std::string::npos,
         "buffer load SPIR-V lacks EXEC guard branch");
-  Check(bounds != std::string::npos,
+  Check(array_length != std::string::npos,
         "buffer load SPIR-V lacks storage buffer bounds check");
   Check(bounds_branch != std::string::npos,
         "buffer load SPIR-V lacks storage buffer bounds branch");
   Check(element_access != std::string::npos,
         "buffer load SPIR-V lacks storage element access");
-  Check(exec_branch < bounds,
+  Check(exec_branch < array_length,
         "buffer load bounds check was emitted outside EXEC guard");
   Check(bounds_branch < element_access,
         "buffer load storage element pointer was formed before bounds guard");
+
+  // The buffer table variant: the same guards, the element read through the buffer's address.
+  const auto table = RecompileForTest(shader, options, nullptr, nullptr, 0, true);
+  CheckSpirvBinaryValidates(table.spirv);
+  const auto table_source = DisassembleSpirvBinary(table.spirv);
+  const auto table_exec = table_source.find("OpBranchConditional");
+  const auto table_length = table_source.find("OpULessThan");
+  const auto table_bounds = table_source.find("OpBranchConditional", table_length);
+  const auto table_element = table_source.find("OpAccessChain %_ptr_PhysicalStorageBuffer_uint");
+  Check(table_source.find("OpAccessChain %_ptr_StorageBuffer_uint") == std::string::npos &&
+            table_exec != std::string::npos && table_length != std::string::npos &&
+            table_bounds != std::string::npos && table_element != std::string::npos &&
+            table_exec < table_length && table_bounds < table_element,
+        "the buffer table load lost its EXEC or bounds guard, or still reads by descriptor");
+
+  // On a robustBufferAccess2 device the load's bounds branch goes (the device reads 0 past the
+  // range); the store keeps its guard, and so does EXEC.
+  const auto branches = [](const std::string &text) {
+    size_t count = 0;
+    for (auto at = text.find("OpBranchConditional"); at != std::string::npos;
+         at = text.find("OpBranchConditional", at + 1))
+      ++count;
+    return count;
+  };
+  static constexpr ShaderRecompiler::Spirv::Profile RobustProfile{.robust_buffers = true};
+  options.profile = &RobustProfile;
+  const auto robust = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(robust.spirv);
+  const auto robust_source = DisassembleSpirvBinary(robust.spirv);
+  Check(branches(robust_source) + 1u == branches(source) &&
+            robust_source.find("OpAccessChain %_ptr_StorageBuffer_uint") != std::string::npos,
+        "a robust device's buffer load kept its bounds branch, or the store lost its guard");
+
+  // A vector load on a robust device selects its inactive-invocation zero instead of branching.
+  const uint32_t vector_load[] = {
+      EncodeVopc(0xd4, 0, 1), // v_cmpx_gt_u32 s0, v1: an EXEC the compiler cannot know
+      EncodeMubuf0(0x0f), EncodeMubuf1(0, 0, 1), // buffer_load_dwordx3 v[0:2]
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 12, 0), EncodeSopp(0x01),
+  };
+  options.profile = &ShaderRecompiler::Spirv::DefaultProfile;
+  const auto guarded = DisassembleSpirvBinary(RecompileForTest(vector_load, options).spirv);
+  options.profile = &RobustProfile;
+  const auto robust_vector = RecompileForTest(vector_load, options);
+  CheckSpirvBinaryValidates(robust_vector.spirv);
+  const auto selected = DisassembleSpirvBinary(robust_vector.spirv);
+  Check(guarded.find("OpPhi %v3uint") != std::string::npos &&
+            selected.find("OpPhi %v3uint") == std::string::npos &&
+            selected.find("OpSelect %v3uint") != std::string::npos,
+        "a robust device's vector buffer load still branches on EXEC");
+}
+
+// On a robustBufferAccess2 device a scalar-buffer read and a byte or short read have no bounds branch
+// (the device reads 0 past the range); without it, or where the device rounds the range up past the
+// element (robustStorageBufferAccessSizeAlignment 4), they keep it. The stores keep theirs.
+void TestRobustBufferReadsHaveNoBoundsBranch() {
+  const uint32_t shader[] = {
+      EncodeVop1(0x02, 20, 256),                // v_readfirstlane_b32 s20, v0
+      EncodeSmem0(0x08, 16, 4), 20u << 25u,     // s_buffer_load_dword s16, s[8:11], s20
+      EncodeVop1(0x01, 3, 16),                  // v_mov_b32 v3, s16
+      EncodeMubuf0(0x08), EncodeMubuf1(4, 2, 1), // buffer_load_ubyte v4, v1, s[8:11]
+      EncodeMubuf0(0x0a), EncodeMubuf1(5, 2, 1), // buffer_load_ushort v5, v1, s[8:11]
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(3, 3, 0), // buffer_store_dword v3, s[12:15]
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(4, 3, 0),
+      EncodeMubuf0(0x1c, 8, false), EncodeMubuf1(5, 3, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 16> user_data{};
+  user_data[8] = 0x2000u; // the read buffer, s[8:11]
+  user_data[10] = 64u;
+  user_data[11] = 3u << 28u; // raw offset bounds, as MakeCompileOptions's fixture buffer
+  user_data[12] = 0x3000u; // the written buffer, s[12:15]
+  user_data[14] = 16u;
+  user_data[15] = 3u << 28u;
+  const auto count = [](const std::string &text, const char *what) {
+    size_t n = 0;
+    for (auto at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) ++n;
+    return n;
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto emit = [&](const ShaderRecompiler::Spirv::Profile &profile) {
+    options.profile = &profile;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return DisassembleSpirvBinary(result.spirv);
+  };
+  static constexpr ShaderRecompiler::Spirv::Profile Robust1{.robust_buffers = true,
+                                                            .robust_buffer_alignment = 1};
+  static constexpr ShaderRecompiler::Spirv::Profile Robust4{.robust_buffers = true,
+                                                            .robust_buffer_alignment = 4};
+  const auto guarded = emit(ShaderRecompiler::Spirv::DefaultProfile);
+  const auto robust1 = emit(Robust1);
+  const auto robust4 = emit(Robust4);
+  const auto views = [](const std::string &text) {
+    return text.find("OpLoad %uchar") != std::string::npos &&
+           text.find("OpLoad %ushort") != std::string::npos;
+  };
+  Check(views(guarded) && views(robust1) && views(robust4),
+        "robust-read fixture lost its byte or short view loads");
+  // Three reads and three stores, each with its bounds compare and branch.
+  Check(count(guarded, "OpULessThan") == 6u && count(guarded, "OpBranchConditional") == 6u,
+        "a device without robustBufferAccess2 lost a read or store bounds guard");
+  Check(count(robust1, "OpULessThan") == 3u && count(robust1, "OpBranchConditional") == 3u,
+        "a robust device's scalar, byte or short read kept its bounds branch, or a store lost its guard");
+  Check(count(robust4, "OpULessThan") == 5u && count(robust4, "OpBranchConditional") == 5u,
+        "with a 4-byte robust alignment the byte and short reads must keep their guard, the scalar read not");
 }
 
 void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
@@ -7169,12 +11264,13 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
     CheckSpirvBinaryValidates(result.spirv);
 
     const auto source = DisassembleSpirvBinary(result.spirv);
-    const auto bounds = source.find("OpULessThan", 0);
-    const auto bounds_branch = source.find("OpBranchConditional", bounds);
+    const auto array_length =
+        source.find("OpULessThan", 0); // the bounds compare, against the bound length
+    const auto bounds_branch = source.find("OpBranchConditional", array_length);
     const auto atomic = source.find(test.spirv, 0);
     const auto memory_barrier =
         source.find("OpMemoryBarrier", atomic);
-    Check(bounds != std::string::npos &&
+    Check(array_length != std::string::npos &&
               bounds_branch != std::string::npos &&
               atomic != std::string::npos &&
               memory_barrier != std::string::npos,
@@ -7225,13 +11321,14 @@ void TestCapturedBufferAtomicsX2() {
           "64-bit buffer atomic storage view does not use eight-byte elements");
     Check(CountSourceOccurrences(source, "Aliased") == 2u,
           "both storage-buffer views must declare that they alias");
-    const auto bounds = source.find("OpULessThan", 0);
-    const auto bounds_branch = source.find("OpBranchConditional", bounds);
+    const auto array_length =
+        source.find("OpULessThan", 0); // the bounds compare, against the bound length
+    const auto bounds_branch = source.find("OpBranchConditional", array_length);
     const auto atomic =
         source.find(test.spirv_name, 0);
     const auto memory_barrier =
         source.find("OpMemoryBarrier", atomic);
-    Check(bounds != std::string::npos &&
+    Check(array_length != std::string::npos &&
               bounds_branch != std::string::npos &&
               atomic != std::string::npos && bounds_branch < atomic,
           "64-bit buffer atomic was not guarded by storage-buffer bounds");
@@ -7326,10 +11423,11 @@ void TestGraphicsComputeGetreg() {
   ShaderMappedData mapped{};
   mapped.code_size_bytes = sizeof(shader);
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
   ShaderComputeInputInfo graphics{}, async{};
   async.async_compute = true;
-  (void)PrepareProgram(regs, graphics);
-  (void)PrepareProgram(regs, async);
+  (void)PrepareProgram(regs, sh, graphics);
+  (void)PrepareProgram(regs, sh, async);
   Check(!graphics.async_compute && async.async_compute &&
             MakeStageStaticKey(graphics) != MakeStageStaticKey(async) &&
             MakeStageStaticKey(graphics).size() == MakeStageStaticKey(async).size(),
@@ -7371,7 +11469,7 @@ void TestMemoryFedScalarLeafCall() {
   struct Memory {
     std::array<uint32_t, 128> words{};
     uint64_t end = base + 0x10c;
-    bool readable = true;
+    bool clean = true;
   } memory;
   std::copy_n(std::array{0xe0040060u, 0x0010000fu, 8u, 0x5204u}.begin(),
               4, memory.words.begin());
@@ -7382,14 +11480,13 @@ void TestMemoryFedScalarLeafCall() {
   memory.words[66] = EncodeSop1(0x21, 125, 14);
   const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
     const auto& m = *static_cast<Memory*>(data);
-    if (!m.readable || address < base || address > m.end || out.size_bytes() > m.end - address)
+    if (!m.clean || address < base || address > m.end || out.size_bytes() > m.end - address)
       return false;
     std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
                 out.size_bytes());
     return true;
   };
-  FakeGuestMemory fake(read, &memory);
-  IR::SrtRuntime runtime{.userdata = &memory, .read_specialization_memory = read};
+  IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
   const auto options = MakeCompileOptions(ShaderType::Compute);
   const uint32_t gpu_callable[] = {EncodeVop1(0x02, 4, 256),
       EncodeSmem0(0x09, 14, 0), 4u << 25u, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
@@ -7481,14 +11578,14 @@ void TestMemoryFedScalarLeafCall() {
   Check(source.revision == 3 && source.reads.back().second == 8,
         "shorter exact-boundary leaf was not decoded after a failed old-span read");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  memory.readable = false;
+  memory.clean = false;
   ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
               "unreadable call dependencies reused stale linked code");
-  memory.readable = true;
-  auto no_reader = runtime;
-  no_reader.read_specialization_memory = nullptr;
-  ExpectFatal([&] { (void)RefreshShaderSource(source, no_reader); },
-              "leaf code was linked without a specialization memory reader");
+  memory.clean = true;
+  auto ordinary = runtime;
+  ordinary.read_specialization_memory = nullptr;
+  ExpectFatal([&] { (void)RefreshShaderSource(source, ordinary); },
+              "call target query accepted an ordinary non-strict memory reader");
   std::vector<uint32_t> escaping(std::begin(shader), std::end(shader) - 1);
   escaping.insert(escaping.end(), {EncodeVop1(0x01, 1, 14),
       EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0), EncodeSopp(0x01)});
@@ -7504,10 +11601,9 @@ void TestMemoryFedScalarLeafCall() {
       EncodeSMovB32(15, 129), EncodeSop2(0x0f, 14, 128, 128),
       EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   auto pair_source = PrepareShaderSource(high_writer, options);
-  std::vector<uint32_t> flat;
+  IR::SrtWalker pair_walker(pair_source.call_targets, runtime);
   uint32_t high = 1;
-  Check(IR::WalkSrt(pair_source.call_targets, runtime, flat, nullptr) &&
-            IR::WalkedValue(pair_source.call_targets, pair_source.calls.front().target[1], high) && high == 0,
+  Check(pair_walker.Evaluate(pair_source.calls.front().target[1], high) && high == 0,
         "scalar pair producer used a stale preceding high-half definition");
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
@@ -7688,7 +11784,7 @@ void TestMeshExportStorage() {
     options.back_code = split ? std::span{back} : std::span<const uint32_t>{};
     const auto result = RecompileForTest(
         split ? std::span{front} : std::span<const uint32_t>{monolithic},
-        options, push_data_start);
+        options, nullptr, nullptr, push_data_start);
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
     Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
@@ -7838,11 +11934,13 @@ void TestMergedShaderUserDataSnapshot() {
   const auto plan = IR::ExtractResourcePlan(program);
   for (const auto *params : {&first, &second}) {
     const auto user_data = std::span(params->user_data).first(params->user_data_count);
-    const IR::SrtRuntime runtime{.user_data = user_data};
+    const IR::SrtRuntime runtime{.user_data = user_data,
+                                 .read_memory = ReadHostTestMemory};
+    IR::SrtWalker walker(plan, runtime);
     IR::DescriptorValue front_descriptor, back_descriptor;
     const auto &table = params == &first ? first_table : second_table;
-    Check(EvaluateSrtDescriptor(plan, runtime, program.info.buffers[0].source, front_descriptor) &&
-              EvaluateSrtDescriptor(plan, runtime, program.info.buffers[1].source, back_descriptor) &&
+    Check(walker.EvaluateDescriptor(program.info.buffers[0].source, front_descriptor) &&
+              walker.EvaluateDescriptor(program.info.buffers[1].source, back_descriptor) &&
               std::equal(user_data.begin() + 8, user_data.end(),
                          front_descriptor.dwords.begin()) &&
               std::equal(table.begin(), table.end(), back_descriptor.dwords.begin()),
@@ -8485,6 +12583,35 @@ void TestNewShaderRecompilerSetpcDwordJumpTable(uint32_t offset_sgpr) {
         "subtractive S_SETPC_B64 table load reached normal IR");
   Check(SpirvContainsOpcode(result.spirv, 251),
         "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerExpVertexOutputs() {
+  const uint32_t shader[] = {
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), // POS0
+      EncodeExp0(0x20, 0xf), EncodeExp1(4, 5, 6, 7), // PARAM0
+      EncodeExp0(0x14, 0x1), EncodeExp1(8, 0, 0, 0), // PRIM
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("target=0x0c") != std::string::npos),
+        "POS export was not decoded");
+  Check((result.decoded_dump.find("target=0x20") != std::string::npos),
+        "PARAM export was not decoded");
+  Check((result.decoded_dump.find("target=0x14") != std::string::npos),
+        "PRIM export was not decoded");
+  Check((result.ir_dump.find("position") != std::string::npos),
+        "POS export did not reach IR");
+  Check((result.ir_dump.find("parameter") != std::string::npos),
+        "PARAM export did not reach IR");
+  Check((result.ir_dump.find("primitive") != std::string::npos),
+        "PRIM export did not reach IR");
+  Check(SpirvContainsOpcode(result.spirv, 62),
+        "vertex export SPIR-V lacks OpStore");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -9442,6 +13569,426 @@ void TestValuePhiValidation() {
                    "validation");
   }
 #endif
+}
+
+void TestMaskedSelectElimination() {
+  using namespace ShaderRecompiler::IR;
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.blocks.push_back(program.block_storage.back().get());
+  auto *block = program.blocks.front();
+  block->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+  IREmitter e(block);
+  const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+  const auto other = e.GetUserData(static_cast<ScalarReg>(1));
+  const auto exec = e.INotEqual(raw, U32(Value(0u)));
+  const auto selected = e.IEqual(other, U32(Value(7u)));
+  const auto active = e.LogicalAnd(exec, selected);
+  const auto sum = e.IAdd(raw, U32(Value(1u)));
+  // Masked again by its own consumer: only the active lanes' value is ever stored.
+  const auto masked = e.Select(exec, sum, raw);
+  const auto doubled = e.IAdd(masked, masked);
+  e.Emit(ValueOpcode::WriteSharedU32, {other, doubled, active});
+  // The same select reaching every lane keeps the inactive lanes' old value.
+  const auto kept = e.Select(exec, sum, other);
+  e.Emit(ValueOpcode::WriteSharedU32, {raw, kept, U1(Value(true))});
+  const auto partial = e.Select(selected, sum, other);
+  e.Emit(ValueOpcode::WriteSharedU32, {other, partial, exec});
+  Check(EliminateMaskedSelects(program.blocks) == 1,
+        "masked select elimination replaced the wrong number of selects");
+  Check(doubled.Resolve().TryInstruction()->Arg(0).Resolve() == sum.Resolve(),
+        "a select read only in its own lanes kept the old value");
+  Check(kept.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::SelectU32 &&
+            partial.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::SelectU32,
+        "masked select elimination dropped an old value another lane reads");
+}
+
+void TestStepLookupMatchesChain() {
+  // The indirect-image group and slot bias: a chain applies "key >= start ? value : previous" for every step in
+  // order; LookupStep's table search must give the same value for every key, at and around every start.
+  struct Ops {
+    const std::vector<uint32_t> &starts;
+    const std::vector<uint32_t> &values;
+    uint32_t Constant(uint32_t value) { return value; }
+    uint32_t Add(uint32_t a, uint32_t b) { return a + b; }
+    uint32_t Sub(uint32_t a, uint32_t b) { return a - b; }
+    bool LessEqual(uint32_t a, uint32_t b) { return a <= b; }
+    bool And(bool a, bool b) { return a && b; }
+    uint32_t Select(bool condition, uint32_t a, uint32_t b) { return condition ? a : b; }
+    bool NotZero(uint32_t a) { return a != 0u; }
+    uint32_t Start(uint32_t index) { return starts.at(index); }
+    uint32_t StepValue(uint32_t index) { return values.at(index); }
+  };
+  uint32_t seed = 12345u;
+  const auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+  // Step counts around the powers of two and the chain limit, and one as long as 2464e975d88b7f15's (12,500
+  // candidate ordinals, ~1,900 steps), with biases that wrap below zero as unsigned values.
+  for (const uint32_t candidates : {2u, 3u, 4u, 17u, 18u, 40u, 12500u}) {
+    for (const uint32_t every : {1u, 2u, 7u}) {
+      std::vector<uint32_t> starts, values;
+      for (uint32_t ordinal = 1; ordinal < candidates; ++ordinal) {
+        if (ordinal % every == 0u || next() % 5u == 0u) {
+          starts.push_back(ordinal);
+          values.push_back(next() % 3u == 0u ? 0u - (next() % 100u) : next() % 1000u);
+        }
+      }
+      if (starts.empty()) continue;
+      const uint32_t initial = 777u;
+      Ops ops{starts, values};
+      for (uint32_t key = 0; key <= candidates + 1u; ++key) {
+        uint32_t chain = initial;
+        for (size_t step = 0; step < starts.size(); ++step) {
+          if (key >= starts[step]) chain = values[step];
+        }
+        const auto table = ShaderRecompiler::Spirv::LookupStep(ops, key, static_cast<uint32_t>(starts.size()), initial);
+        if (table != chain) {
+          std::fprintf(stderr, "candidates %u, %zu steps, key %u: table %u, chain %u\n", candidates,
+                       starts.size(), key, table, chain);
+          Check(false, "the step table search differs from the compare-select chain");
+        }
+      }
+    }
+  }
+  // Exactly a power of two steps, every start a key.
+  std::vector<uint32_t> starts(64), values(64);
+  for (uint32_t i = 0; i < 64u; ++i) {
+    starts[i] = 1u + i;
+    values[i] = 1000u + i;
+  }
+  Ops ops{starts, values};
+  for (uint32_t key = 0; key <= 66u; ++key) {
+    const uint32_t expected = key == 0u ? 5u : 1000u + std::min(key, 64u) - 1u;
+    Check(ShaderRecompiler::Spirv::LookupStep(ops, key, 64u, 5u) == expected, "the step table search misses a power-of-two table");
+  }
+}
+
+void TestExecBranchPerInvocation() {
+  using namespace ShaderRecompiler::IR;
+  using K = ShaderRecompiler::CFG::BranchCondition;
+  enum class Body { Plain, CrossLane, Barrier, UniformAfter };
+  for (const auto body : {Body::Plain, Body::CrossLane, Body::Barrier, Body::UniformAfter}) {
+    // s_cbranch_execz over a block that writes one vector register, then a store after the merge.
+    Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 32;
+    for (uint32_t id = 0; id < 3; ++id) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.blocks.back()->id = id;
+    }
+    auto *entry = program.blocks[0];
+    auto *then = program.blocks[1];
+    auto *merge = program.blocks[2];
+    entry->AddBranch(then);
+    entry->AddBranch(merge);
+    then->AddBranch(merge);
+    entry->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    entry->terminator.true_block = then;
+    entry->terminator.false_block = merge;
+    entry->terminator.merge_block = merge;
+    then->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    then->terminator.true_block = merge;
+    merge->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+
+    IREmitter e(entry);
+    const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+    const auto other = e.GetUserData(static_cast<ScalarReg>(1));
+    const auto exec = e.INotEqual(raw, U32(Value(0u)));
+    // Not(All(Not exec)): the block runs once any lane has EXEC set.
+    const auto vote = e.Emit(ValueOpcode::ConditionRef, {e.LogicalNot(exec)}, K::ExecZero);
+    const auto condition = e.LogicalNot(U1(vote));
+    e.Emit(ValueOpcode::Reference, {condition});
+    entry->condition = condition;
+
+    IREmitter t(then);
+    auto written = t.IAdd(raw, U32(Value(1u)));
+    if (body == Body::CrossLane) {
+      written = U32(t.Emit(ValueOpcode::ReadFirstLane, {written, U1(Value(true))}));
+    } else if (body == Body::Barrier) {
+      t.Emit(ValueOpcode::Barrier, {});
+    }
+    const auto selected = t.Select(exec, written, other);
+    // A scalar register written in the block: every invocation of the wave holds it after.
+    const auto scalar = t.IAdd(other, U32(Value(5u)));
+
+    IREmitter m(merge);
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    phi.AddPhiOperand(then, selected);
+    phi.AddPhiOperand(entry, other);
+    Value stored(&phi);
+    if (body == Body::UniformAfter) {
+      auto &uniform = merge->AppendNewInst(ValueOpcode::Phi);
+      uniform.SetFlags(Type::U32);
+      uniform.AddPhiOperand(then, scalar);
+      uniform.AddPhiOperand(entry, other);
+      stored = m.IAdd(U32(Value(&phi)), U32(Value(&uniform)));
+    }
+    m.Emit(ValueOpcode::WriteSharedU32, {raw, stored, U1(Value(true))});
+
+    const auto result = BranchPerInvocation(program);
+    RemoveIdentities(program);
+    const auto replaced = EliminateMaskedSelects(program.blocks, result.block_conditions);
+    if (body == Body::Plain) {
+      Check(result.branches == 1, "an EXEC branch over lane-local code stayed a vote");
+      Check(std::ranges::none_of(*entry, [](const Inst &inst) {
+              return inst.GetOpcode() == ValueOpcode::ConditionRef;
+            }),
+            "a per-invocation EXEC branch still tests a vote");
+      Check(replaced == 1 && phi.Arg(0).Resolve() == written.Resolve(),
+            "a select inside a per-invocation EXEC branch kept the old value");
+    } else {
+      const char *expected = body == Body::CrossLane ? "cross-lane"
+                             : body == Body::Barrier ? "barrier"
+                                                     : "live-out";
+      Check(result.branches == 0 && result.problems.contains(expected),
+            "an EXEC branch made per invocation although inactive lanes take part in it");
+      Check(replaced == 0, "a select kept by an EXEC vote was replaced");
+    }
+  }
+}
+
+void TestMaskedSelectFalseSide() {
+  using namespace ShaderRecompiler::IR;
+  using K = ShaderRecompiler::CFG::BranchCondition;
+  struct Fixture {
+    Program program;
+    Block *block = nullptr;
+    U32 raw, other, third;
+    U1 exec;
+    explicit Fixture(uint32_t blocks = 1, ShaderType stage = ShaderType::Compute) {
+      program.stage = stage;
+      for (uint32_t id = 0; id < blocks; ++id) {
+        program.block_storage.push_back(std::make_unique<Block>());
+        program.blocks.push_back(program.block_storage.back().get());
+        program.blocks.back()->id = id;
+        program.blocks.back()->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+      }
+      block = program.blocks.front();
+      IREmitter e(block);
+      raw = e.GetUserData(static_cast<ScalarReg>(0));
+      other = e.GetUserData(static_cast<ScalarReg>(1));
+      third = e.GetUserData(static_cast<ScalarReg>(2));
+      exec = e.INotEqual(raw, U32(Value(0u)));
+    }
+    // Every lane reads it.
+    static void Store(IREmitter &e, U32 value, U32 address) {
+      e.Emit(ValueOpcode::WriteSharedU32, {address, value, U1(Value(true))});
+    }
+  };
+  const auto arg = [](U32 value, size_t index) { return value.Resolve().TryInstruction()->Arg(index).Resolve(); };
+  const auto is_select = [](Value value) {
+    const auto *inst = value.Resolve().TryInstruction();
+    return inst != nullptr && inst->GetOpcode() == ValueOpcode::SelectU32;
+  };
+  {
+    // A chain of writes under one EXEC: x2 = sel(c, g(x1), x1), x1 = sel(c, f(x0), x0), x0 = sel(c, x, y).
+    Fixture s;
+    IREmitter e(s.block);
+    const auto x = e.IAdd(s.raw, U32(Value(1u)));
+    const auto x0 = e.Select(s.exec, x, s.other);
+    const auto f = e.IAdd(x0, U32(Value(3u)));
+    const auto x1 = e.Select(s.exec, f, x0);
+    const auto g = e.IMul(x1, U32(Value(5u)));
+    const auto x2 = e.Select(s.exec, g, x1);
+    Fixture::Store(e, x2, s.third);
+    Check(EliminateMaskedSelects(s.program.blocks) == 2, "a chain of selects on one condition was not folded");
+    Check(arg(f, 0) == x.Resolve() && arg(g, 0) == f.Resolve(),
+          "a value read only where its select's condition holds kept the select");
+    Check(arg(x2, 2) == s.other.Resolve(), "a select's old value kept the selects of the same condition");
+    EliminateDeadCode(s.program.blocks);
+    Check(std::ranges::count_if(*s.block, [](const Inst &inst) { return inst.GetOpcode() == ValueOpcode::SelectU32; }) ==
+              1,
+          "a folded chain kept more than its last select");
+  }
+  {
+    // A value shared by two selects on the same condition.
+    Fixture s;
+    IREmitter e(s.block);
+    const auto x = e.IAdd(s.raw, U32(Value(1u)));
+    const auto x0 = e.Select(s.exec, x, s.other);
+    const auto a = e.IAdd(x0, U32(Value(2u)));
+    const auto b = e.IMul(x0, U32(Value(3u)));
+    Fixture::Store(e, e.Select(s.exec, a, s.other), s.raw);
+    Fixture::Store(e, e.Select(s.exec, b, s.third), s.third);
+    Check(EliminateMaskedSelects(s.program.blocks) == 1 && arg(a, 0) == x.Resolve() && arg(b, 0) == x.Resolve(),
+          "a value shared by selects on one condition kept its select");
+  }
+  enum class Reader { Store, ReadFirstLane, ReadLane, Ballot, Derivative };
+  for (const auto reader : {Reader::Store, Reader::ReadFirstLane, Reader::ReadLane, Reader::Ballot, Reader::Derivative}) {
+    // Read by another lane or by every lane, besides a select on its condition: it stays for that reader.
+    Fixture s(1, reader == Reader::Derivative ? ShaderType::Pixel : ShaderType::Compute);
+    IREmitter e(s.block);
+    const auto x = e.IAdd(s.raw, U32(Value(1u)));
+    const auto x0 = e.Select(s.exec, x, s.other);
+    Value read;
+    Inst *reading = nullptr;
+    switch (reader) {
+      case Reader::Store:
+        Fixture::Store(e, x0, s.third);
+        reading = &s.block->Instructions().back();
+        read = x0;
+        break;
+      case Reader::ReadFirstLane: read = e.Emit(ValueOpcode::ReadFirstLane, {x0, U1(Value(true))}); break;
+      case Reader::ReadLane: read = e.Emit(ValueOpcode::ReadLane, {x0, s.third}); break;
+      case Reader::Ballot: {
+        const auto ballot = e.Emit(ValueOpcode::Ballot, {e.INotEqual(x0, U32(Value(4u)))});
+        reading = ballot.Resolve().TryInstruction()->Arg(0).Resolve().TryInstruction();
+        read = e.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+        break;
+      }
+      case Reader::Derivative: {
+        // An implicit-LOD sample: its coordinate also feeds the derivatives of the quad's other lanes.
+        auto &address = s.block->AppendNewInst(ValueOpcode::MakeImageAddress,
+                                               {x0, Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                                                Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+        reading = &address;
+        const auto sample =
+            e.Emit(ValueOpcode::ImageSampleRaw, {Value(0u), Value(0u), Value(&address), U1(Value(true))});
+        read = e.Emit(ValueOpcode::CompositeExtractU32x4, {sample, Value(0u)});
+        break;
+      }
+    }
+    if (reading == nullptr) reading = read.Resolve().TryInstruction();
+    const auto inside = e.IAdd(reader == Reader::Store ? x0 : U32(read), U32(Value(6u)));
+    Fixture::Store(e, e.Select(s.exec, inside, s.other), s.raw);
+    EliminateMaskedSelects(s.program.blocks);
+    // A store's value is its second operand, after the address.
+    Check(is_select(x0) && reading->Arg(reader == Reader::Store ? 1 : 0).Resolve() == x0.Resolve(),
+          "a select read by another lane or by every lane lost its old value");
+  }
+  {
+    // The same value under two different conditions.
+    Fixture s;
+    IREmitter e(s.block);
+    const auto x0 = e.Select(s.exec, e.IAdd(s.raw, U32(Value(1u))), s.other);
+    const auto other_exec = e.INotEqual(s.other, U32(Value(0u)));
+    const auto a = e.IAdd(x0, U32(Value(2u)));
+    Fixture::Store(e, e.Select(other_exec, a, s.third), s.raw);
+    Check(EliminateMaskedSelects(s.program.blocks) == 0 && arg(a, 0) == x0.Resolve(),
+          "a select was folded under another condition");
+  }
+  {
+    // A phi between the select and the one masked by its condition: the phi needs it in every lane.
+    Fixture s(2);
+    auto *next = s.program.blocks[1];
+    s.block->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    s.block->terminator.true_block = next;
+    s.block->AddBranch(next);
+    IREmitter e(s.block);
+    const auto x0 = e.Select(s.exec, e.IAdd(s.raw, U32(Value(1u))), s.other);
+    auto &phi = next->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    phi.AddPhiOperand(s.block, x0);
+    IREmitter n(next);
+    const auto a = n.IAdd(U32(Value(&phi)), U32(Value(2u)));
+    Fixture::Store(n, n.Select(s.exec, a, U32(Value(&phi))), s.raw);
+    Check(EliminateMaskedSelects(s.program.blocks) == 0 && phi.Arg(0).Resolve() == x0.Resolve() &&
+              arg(a, 0) == Value(&phi),
+          "a select was folded through a phi");
+  }
+  {
+    // A negated vote: the block runs where the condition is clear. A select on it there is its old
+    // value, one on its negation its new value.
+    Fixture s(3);
+    s.program.wave_size = 32;
+    auto *entry = s.program.blocks[0];
+    auto *then = s.program.blocks[1];
+    auto *merge = s.program.blocks[2];
+    entry->AddBranch(then);
+    entry->AddBranch(merge);
+    then->AddBranch(merge);
+    entry->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    entry->terminator.true_block = then;
+    entry->terminator.false_block = merge;
+    entry->terminator.merge_block = merge;
+    then->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    then->terminator.true_block = merge;
+    IREmitter e(entry);
+    // Not(All(exec)): the block runs once any lane has it clear.
+    const auto vote = e.Emit(ValueOpcode::ConditionRef, {s.exec}, K::ExecZero);
+    const auto condition = e.LogicalNot(U1(vote));
+    e.Emit(ValueOpcode::Reference, {condition});
+    entry->condition = condition;
+    IREmitter t(then);
+    const auto x0 = t.Select(s.exec, t.IAdd(s.raw, U32(Value(1u))), s.other);
+    const auto w = t.IAdd(x0, U32(Value(2u)));
+    const auto selected = t.Select(t.LogicalNot(s.exec), w, s.third);
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    phi.AddPhiOperand(then, selected);
+    phi.AddPhiOperand(entry, s.third);
+    IREmitter m(merge);
+    Fixture::Store(m, U32(Value(&phi)), s.raw);
+    const auto result = BranchPerInvocation(s.program);
+    RemoveIdentities(s.program);
+    Check(result.branches == 1, "a negated EXEC vote over lane-local code stayed a vote");
+    Check(EliminateMaskedSelects(s.program.blocks, result.block_conditions) == 2 &&
+              phi.Arg(0).Resolve() == w.Resolve() && arg(w, 0) == s.other.Resolve(),
+          "a select inside a negated per-invocation EXEC branch kept the side it never takes");
+  }
+}
+
+void TestWaterfallMovrelsLoopCollapsed() {
+  using namespace ShaderRecompiler;
+  // CS_ModelSkinning's (0xdec083415ec94cc6) v_movrels waterfall loop at 0x685c with the EXEC saves
+  // and index before it: one iteration per distinct v28 among the lanes, each reading v[1 + v28]...
+  const uint32_t loop[] = {
+      0x34383e82u, // v_lshlrev_b32 v28, 2, v31
+      0xbe96037eu, // s_mov_b32 s22, exec_lo
+      0xbe97037eu, // s_mov_b32 s23, exec_lo
+      0x7e3c051cu, // v_readfirstlane_b32 s30, v28
+      0x7da4381eu, // v_cmpx_eq_u32 exec_lo, s30, v28
+      0xbefc031eu, // s_mov_b32 m0, s30
+      0x7e428701u, // v_movrels_b32 v33, v1
+      0x7e448702u, // v_movrels_b32 v34, v2
+      0x7e408703u, // v_movrels_b32 v32, v3
+      0x7e3e8704u, // v_movrels_b32 v31, v4
+      0x8a177e17u, // s_andn2_b32 s23, s23, exec_lo
+      0xbefe0317u, // s_mov_b32 exec_lo, s23
+      0xbf85fff6u, // s_cbranch_scc1 0x8
+      0xbefe0316u, // s_mov_b32 exec_lo, s22
+  };
+  enum class Variant { Collapsed, RemainingNotExec, M0ReadAfter };
+  for (const auto variant : {Variant::Collapsed, Variant::RemainingNotExec, Variant::M0ReadAfter}) {
+    std::vector<uint32_t> shader(std::begin(loop), std::end(loop));
+    if (variant == Variant::RemainingNotExec) {
+      shader[2] = 0xbe970318u; // s_mov_b32 s23, s24
+    } else if (variant == Variant::M0ReadAfter) {
+      shader.push_back(0x7e0a8701u); // v_movrels_b32 v5, v1
+    }
+    shader.push_back(EncodeMubuf0(0x1c, 0, false)); // buffer_store_dword v33
+    shader.push_back(EncodeMubuf1(33, 0, 0));
+    shader.push_back(EncodeSopp(0x01));
+
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(shader, decoded);
+    const bool expected = variant == Variant::Collapsed;
+    Check(CFG::CollapseWaterfallLoops(decoded) == (expected ? 1u : 0u),
+          "a v_movrels waterfall loop was collapsed where that is not exact, or kept where it is");
+    if (expected) {
+      const auto &insts = decoded.instructions;
+      Check(insts[3].opcode == Decoder::Opcode::S_NOP && insts[4].opcode == Decoder::Opcode::S_NOP &&
+                insts[5].opcode == Decoder::Opcode::S_NOP && insts[12].opcode == Decoder::Opcode::S_NOP &&
+                insts[6].movrel_index_vgpr == 28u && insts[9].movrel_index_vgpr == 28u &&
+                insts[10].opcode == Decoder::Opcode::S_ANDN2_B32 &&
+                insts[11].opcode == Decoder::Opcode::S_MOV_B32,
+            "a collapsed waterfall loop kept its vote or lost its EXEC bookkeeping");
+      // v28 = v31 << 2 under the same EXEC: only every fourth register can be read.
+      Check(insts[6].movrel_index_zero_bits == 3u && insts[9].movrel_index_zero_bits == 3u,
+            "a collapsed waterfall loop lost its index's clear low bits");
+      Check(CFG::BuildGraph(decoded).natural_loops.empty(), "a collapsed waterfall loop still loops");
+    }
+
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = 32;
+    options.dump_ir = true;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check((result.ir_dump.find("ReadFirstLane") == std::string::npos) == expected,
+          "a collapsed waterfall loop still reads the first lane");
+  }
 }
 
 void TestLaneMaskProjection() {
@@ -10488,7 +15035,7 @@ void TestAutomaticObjectPrimitiveId() {
             PushData::GraphicsDrawDwords(true, false) == PushData::MeshDrawDwordCount,
         "graphics draw data reserved an incorrect prefix");
   for (const uint32_t start : {prefix, PushData::DwordCount}) {
-    const auto result = RecompileForTest(shader, options, start);
+    const auto result = RecompileForTest(shader, options, nullptr, nullptr, start);
     Check(result.program.bindings.UsesPushData() == (start == prefix),
           "object ID changed shader-data push/spill selection");
     Check(std::ranges::any_of(result.program.info.outputs, [](const StageOutput& output) {
@@ -10505,7 +15052,7 @@ void TestAutomaticObjectPrimitiveId() {
   }
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   pixel.target_shader_mask = 0xf0000000u;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options, prefix); },
+  ExpectFatal([&] { (void)RecompileForTest(shader, options, nullptr, nullptr, prefix); },
               "automatic RT7 silently overlapped an explicit MRT7 export");
 #endif
 }
@@ -11047,6 +15594,29 @@ void TestNewShaderRecompilerNativeBindingPlan() {
             result.program.bindings == bindings &&
             result.program.info.buffers[0].descriptor_index == 0,
         "repeated emission did not rebuild descriptor slots deterministically");
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ShaderRecompiler::IR::Inst *buffer_handle = nullptr;
+  for (auto *block : result.program.blocks) {
+    const auto found = std::ranges::find_if(*block, [](const auto &inst) {
+      return inst.GetOpcode() ==
+             ShaderRecompiler::IR::ValueOpcode::GetBufferResource;
+    });
+    if (found != block->end()) {
+      buffer_handle = &*found;
+      break;
+    }
+  }
+  Check(buffer_handle != nullptr,
+        "native validation fixture lacks a buffer handle");
+  ExpectFatal(
+      [&] {
+        buffer_handle->SetFlags(UINT32_MAX);
+        (void)ShaderRecompiler::Spirv::EmitProgram(result.program,
+                                                   options.input_info);
+      },
+      "invalid dense buffer resource did not terminate SPIR-V emission");
+#endif
 }
 
 void BuildTypedPlan(const uint32_t *code, uint32_t words,
@@ -11133,6 +15703,33 @@ void CheckFlattenedReadSlots(const ShaderRecompiler::IR::Program &program,
   }
 }
 
+bool ReadSrtHostDword(void *, uint64_t address, std::span<uint32_t> values) {
+  if (address == 0 || values.empty()) {
+    return false;
+  }
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+  return true;
+}
+
+struct SrtHostRange {
+  const uint32_t *data;
+  size_t count;
+};
+
+bool ReadSrtHostRangeDword(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  const auto *range = static_cast<const SrtHostRange *>(userdata);
+  if (range == nullptr || range->data == nullptr || range->count == 0 || values.empty()) {
+    return false;
+  }
+  const auto base = reinterpret_cast<uint64_t>(range->data);
+  const auto size = range->count * sizeof(uint32_t);
+  if (address < base || values.size_bytes() > size || address - base > size - values.size_bytes()) {
+    return false;
+  }
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+  return true;
+}
+
 void TestTypedDescriptorRealWideMoveTranslation() {
   const uint32_t shader[] = {
       EncodeSop1(0x04, 0, 20), // s_mov_b64 s[0:1], s[20:21]
@@ -11198,7 +15795,7 @@ void TestComputeImageFill() {
   options.input_info.compute = &compute;
   options.user_data = userdata;
   enum class Mutation { None, Offset, WrongAxis, VaryingValue, Predicate, ExtraStore, A16 };
-  const auto Run = [&](Mutation mutation) {
+  const auto Run = [&](Mutation mutation, bool clean = true) {
     auto translated = ShaderRecompiler::TranslateProgram(shader, options);
     auto &program = translated.program;
     for (auto *block : program.blocks) {
@@ -11235,11 +15832,13 @@ void TestComputeImageFill() {
     auto plan = ExtractResourcePlan(program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    // The fill value is a walker load, so it needs no specialization memory reader.
-    Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
+    Check(MaterializeResources(plan,
+              {.user_data = userdata, .read_memory = ReadHostTestMemory,
+               .read_specialization_memory = clean ? ReadHostTestMemory : nullptr},
+              snapshot, specialization),
           "captured stencil clear did not materialize");
     const auto &fill = snapshot.uniform_fill;
-    const bool expected = mutation == Mutation::None;
+    const bool expected = mutation == Mutation::None && clean;
     Check((fill.kind == UniformFillKind::Image) == expected,
           "image fill proof accepted an unsafe store or missed the captured clear");
     if (expected) {
@@ -11249,6 +15848,7 @@ void TestComputeImageFill() {
     }
   };
   Run(Mutation::None);
+  Run(Mutation::None, false);
   for (const auto mutation : {Mutation::Offset, Mutation::WrongAxis, Mutation::VaryingValue,
                               Mutation::Predicate, Mutation::ExtraStore, Mutation::A16})
     Run(mutation);
@@ -11423,6 +16023,62 @@ void TestPatternFill() {
   }
 }
 
+void TestLoadedPatternFill() {
+  using namespace ShaderRecompiler::IR;
+  // Marvel's Wolverine CS 1bd19fe3e986f08e: if (id < cb[1]) dst[id] = pattern[id & cb[0]], through S_ENDPGM.
+  const uint32_t shader[] = {
+      0xbfa00001u, 0xd7460000u, 0x04010c0cu, 0xf4201a84u, 0xfa000004u, 0xbf8cc07fu,
+      0x7da8006au, 0xbf880009u, 0xf4201a84u, 0xfa000000u, 0xbf8cc07fu, 0x3602006au,
+      0xe0002000u, 0x80000101u, 0xbf8c3f70u, 0xe0102000u, 0x80010100u, 0xbf810000u,
+  };
+  alignas(16) static const uint32_t pattern[4] = {0u, 0u, 0u, 0u};
+  alignas(16) static const uint32_t constants[4] = {3u, 64u, 0u, 0u};
+  const auto words = [](const void *base, uint32_t stride, uint32_t records) {
+    const auto address = reinterpret_cast<uint64_t>(base);
+    return std::array<uint32_t, 4>{static_cast<uint32_t>(address),
+                                   static_cast<uint32_t>(address >> 32) | (stride << 16), records, 0x14204u};
+  };
+  std::array<uint32_t, 12> userdata{};
+  std::ranges::copy(words(pattern, 4, 4), userdata.begin());
+  std::ranges::copy(std::array<uint32_t, 4>{0x00300000u, 4u << 16, 64u, 0x14204u}, userdata.begin() + 4);
+  std::ranges::copy(words(constants, 16, 1), userdata.begin() + 8);
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.workgroup_register = 12;
+  compute.thread_ids_num = 1;
+  compute.group_id[0] = true;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = userdata;
+  const auto Build = [&](std::span<const uint32_t> code) {
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    return ExtractResourcePlan(translated.program);
+  };
+  const auto plan = Build(shader);
+  const auto &fill = plan.uniform_fill.fill;
+  Check(fill.kind == UniformFillKind::Pattern && plan.info.buffers.size() == 3 &&
+            fill.resource < 3 && plan.info.buffers[fill.resource].written &&
+            fill.group_stride == std::array<uint32_t, 3>{64, 0, 0} && fill.words == 0,
+        "the loaded pattern fill was not recognised with its destination");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  // The renderer tries a fill only for a snapshot with no specialization reads.
+  Check(MaterializeResources(plan,
+                             {.user_data = userdata, .read_memory = ReadHostTestMemory,
+                              .read_specialization_memory = ReadHostTestMemory},
+                             snapshot, specialization) &&
+            snapshot.uniform_fill == fill && snapshot.specialization_reads.empty(),
+        "the snapshot lost the pattern fill the renderer reads");
+  auto changed = std::to_array(shader);
+  changed[11] ^= 1u; // a different VALU operand
+  Check(Build(changed).uniform_fill.fill.kind == UniformFillKind::None,
+        "pattern recognition accepted modified executable instructions");
+  compute.workgroup_register = 11;
+  Check(Build(shader).uniform_fill.fill.kind == UniformFillKind::None,
+        "pattern recognition accepted another workgroup register");
+}
+
 void TestGpuProducedWritableDescriptor() {
   using namespace ShaderRecompiler::IR;
   // Reduced from 994af59d50bedca8: the GPU-built BVH header supplies a relative
@@ -11449,22 +16105,27 @@ void TestGpuProducedWritableDescriptor() {
         "native GPU-built writable descriptor acquired an unnecessary alias proof");
   struct Reads {
     std::array<uint32_t, 3> header{0x26c0u, 0u, 151u};
-    uint32_t count = 0;
+    uint32_t ordinary = 0;
+    uint32_t strict = 0;
   } reads;
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        if (words.size() != 1) return false;
         auto &reads = *static_cast<Reads *>(data);
-        uint32_t index = 0;
-        switch (address) {
-        case 0x300315028ull: index = 0u; break;
-        case 0x30031502cull: index = 1u; break;
-        case 0x300315074ull: index = 2u; break;
-        default: return false;
-        }
-        ++reads.count;
+        const uint32_t index = address == 0x300315028ull ? 0u
+                             : address == 0x30031502cull ? 1u
+                             : address == 0x300315074ull ? 2u : 3u;
+        if (index == 3u) return false;
+        ++reads.ordinary;
         words[0] = reads.header[index];
         return true;
-      }, &reads);
-  const SrtRuntime runtime{.user_data = user_data};
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+        ++static_cast<Reads *>(data)->strict;
+        return false; // Current GPU bytes are available only through the ordinary reader.
+      }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto check = [&](uint32_t low, uint32_t high, uint32_t count, uint32_t reads_expected) {
@@ -11475,7 +16136,8 @@ void TestGpuProducedWritableDescriptor() {
               snapshot.buffers[0].dwords[1] == high &&
               snapshot.buffers[0].dwords[2] == count &&
               snapshot.buffers[0].dwords[3] == 0x16204u &&
-              snapshot.specialization_reads.empty() && reads.count == reads_expected,
+              snapshot.specialization_reads.empty() && reads.strict == 0 &&
+              reads.ordinary == reads_expected,
           "GPU-produced descriptor lost current scalar data or repeated its reads");
   };
   check(0x003176c0u, 0x00800003u, 151u, 3u);
@@ -11537,29 +16199,25 @@ void TestUniformSelectedWritableDescriptor() {
   auto plan = ExtractResourcePlan(translated.program);
   Check(plan.info.buffers.size() == 1 && plan.info.buffers[0].written,
         "uniform address selection lost its writable buffer");
-  // An unavailable read would complete as zero, so the reader counts them.
-  struct Memory { const uint32_t *flag; uint32_t unavailable = 0; } memory{&user_data[2]};
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
-    auto &memory = *static_cast<Memory *>(data);
-    const bool alternate = *memory.flag == 0;
-    bool available = false;
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    const bool alternate = *static_cast<uint32_t *>(data) == 0;
+    if (words.size() != 1) return false;
     switch (address) {
-    case 0x1040: words[0] = 8u; available = alternate; break;
-    case 0x1044: words[0] = 1u; available = alternate; break;
-    case 0x1080: words[0] = 3u; available = !alternate; break;
-    case 0x109c: words[0] = 2u; available = !alternate; break;
-    case 0x1084: words[0] = 10u; available = true; break;
-    default: break;
+    case 0x1040: words[0] = 8u; return alternate;
+    case 0x1044: words[0] = 1u; return alternate;
+    case 0x1080: words[0] = 3u; return !alternate;
+    case 0x109c: words[0] = 2u; return !alternate;
+    case 0x1084: words[0] = 10u; return true;
+    default: return false;
     }
-    memory.unavailable += !available;
-    return available;
-  }, &memory);
-  const SrtRuntime runtime{.user_data = user_data};
+  };
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = read,
+                           .userdata = &user_data[2], .read_specialization_memory = read};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   for (const uint32_t flag : {1u, 0u, 1u}) {
     user_data[2] = flag;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.unavailable == 0,
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
           "uniform selection evaluated an unavailable untaken scalar source");
     const auto &descriptor = snapshot.buffers[0].dwords;
     Check(descriptor[0] == (flag ? 0xe0u : 4u) &&
@@ -11589,16 +16247,18 @@ void TestUniformSelectedDescriptorLoadAddress() {
   Check(plan.srt_reads.size() == 4u && plan.info.buffers.size() == 1u &&
             plan.info.buffers[0].written && !plan.capture_specialization_reads,
         "conditional scalar address duplicated or detached descriptor reads");
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
     const auto flag = *static_cast<uint32_t *>(data);
     const uint64_t base = flag ? 0x2000u : 0x1000u;
     const std::array<uint32_t, 4> descriptor{0x3000u + flag * 0x1000u,
                                             4u << 16u, 16u, 0x16204u};
-    if (address < base || address >= base + 16u || (address & 3u) != 0u) return false;
+    if (words.size() != 1u || address < base || address >= base + 16u ||
+        (address & 3u) != 0u) return false;
     words[0] = descriptor[(address - base) / 4u];
     return true;
-  }, &user_data[0]);
-  const SrtRuntime runtime{.user_data = user_data};
+  };
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = read,
+                           .userdata = &user_data[0]};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   for (const uint32_t flag : {0u, 1u, 0u}) {
@@ -11668,7 +16328,7 @@ void TestBoundedScalarMaterialImageKeys() {
     uint32_t stride = 160;
     uint32_t records = 409;
     uint64_t unavailable = 0;
-    bool readable = true;
+    bool clean = true;
     bool mixed = false;
     bool same_key = false;
     uint32_t key_reads = 0;
@@ -11676,7 +16336,7 @@ void TestBoundedScalarMaterialImageKeys() {
   } memory;
   const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
     auto &m = *static_cast<Memory *>(data);
-    if (!m.readable || (m.unavailable >= address &&
+    if (!m.clean || (m.unavailable >= address &&
         m.unavailable - address < words.size_bytes())) return false;
     if (words.size() == 1 && address >= 0x10a0u && address < 0x10c0u) {
       const uint32_t descriptors[] = {0x2000u, m.stride << 16u, m.records, 0x5204u,
@@ -11711,7 +16371,6 @@ void TestBoundedScalarMaterialImageKeys() {
     }
     return false;
   };
-  FakeGuestMemory fake(read, &memory);
   const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
                            .read_specialization_memory = read};
   ResourceSnapshot snapshot;
@@ -11749,11 +16408,9 @@ void TestBoundedScalarMaterialImageKeys() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.key_reads == 0 && memory.images == 0 && snapshot.images.size() == 2,
         "empty scalar material loop retained image probes");
-  // Unreadable descriptor and count reads are zero, which leaves the loop empty.
-  memory = {.readable = false};
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.key_reads == 0 && memory.images == 0 && snapshot.images.size() == 2,
-        "unreadable scalar material count did not read as zero");
+  memory = {.clean = false};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "dirty scalar material proof was accepted");
   for (const uint64_t unavailable : {0x2094u, 0x211cu}) {
     memory = {.unavailable = unavailable};
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -11839,14 +16496,12 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   std::array<uint32_t, 64> carry_user_data{};
   const uint64_t shader_base = 0x00000012fffffffbull;
   const uint64_t expected_pc = shader_base + 5u;
-  const ShaderRecompiler::IR::SrtRuntime carry_runtime{carry_user_data, shader_base};
-  auto carry_plan = ShaderRecompiler::IR::ExtractResourcePlan(carry_ir);
-  const auto &carry_words = carry_plan.descriptor_sources[carry_source_index].dwords;
-  uint32_t carry_low = 0, carry_high = 0;
-  Check(EvaluateSrtValue(carry_plan, carry_runtime, carry_words[0], carry_low) &&
-            EvaluateSrtValue(carry_plan, carry_runtime, carry_words[1], carry_high) &&
-            carry_low == static_cast<uint32_t>(expected_pc) &&
-            carry_high == static_cast<uint32_t>(expected_pc >> 32u),
+  ShaderRecompiler::IR::SrtRuntime carry_runtime{carry_user_data, shader_base,
+                                                 nullptr, nullptr};
+  ShaderRecompiler::IR::DescriptorValue carry_value;
+  Check(ShaderRecompiler::IR::SrtWalker(ShaderRecompiler::IR::ExtractResourcePlan(carry_ir), carry_runtime).EvaluateDescriptor(carry_source_index, carry_value) &&
+            carry_value.dwords[0] == static_cast<uint32_t>(expected_pc) &&
+            carry_value.dwords[1] == static_cast<uint32_t>(expected_pc >> 32u),
         "S_GETPC shader-base or add/addc carry evaluation was incorrect");
 
   const uint32_t load_shader[] = {
@@ -11908,21 +16563,19 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   BuildTypedPlan(inline_sampler_shader,
                  static_cast<uint32_t>(std::size(inline_sampler_shader)),
                  inline_sampler_ir);
-  // The walk also reads the sampled image's user-data descriptor.
-  auto user_data = ImageTestUserData();
   ShaderRecompiler::IR::DescriptorValue sampler;
-  const ShaderRecompiler::IR::SrtRuntime runtime{user_data};
+  ShaderRecompiler::IR::SrtRuntime runtime;
   Check(inline_sampler_ir.info.samplers.size() == 1 &&
             TypedDescriptorSource(inline_sampler_ir,
                                   inline_sampler_ir.info.samplers[0].source) !=
                 nullptr &&
-            EvaluateSrtDescriptor(ShaderRecompiler::IR::ExtractResourcePlan(inline_sampler_ir), runtime,
-                                  inline_sampler_ir.info.samplers[0].source, sampler) &&
+            ShaderRecompiler::IR::SrtWalker(ShaderRecompiler::IR::ExtractResourcePlan(inline_sampler_ir), runtime).EvaluateDescriptor(inline_sampler_ir.info.samplers[0].source, sampler) &&
             sampler.dwords[0] == 0 && sampler.dwords[1] == 0x00fff000u &&
             sampler.dwords[2] == 0x09500000u && sampler.dwords[3] == 0,
         "real inline sampler construction was unresolved or evaluated "
         "incorrectly");
 
+  auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.user_data = user_data;
   auto result = RecompileForTest(inline_sampler_shader, options);
@@ -11950,8 +16603,9 @@ void TestSrtWalkerRealSmemTranslation() {
   user_data[8] = static_cast<uint32_t>(address);
   user_data[9] = static_cast<uint32_t>(address >> 32u);
   std::vector<uint32_t> flat;
-  const ShaderRecompiler::IR::SrtRuntime runtime{user_data};
-  const auto walked = ShaderRecompiler::IR::WalkSrt(ShaderRecompiler::IR::ExtractResourcePlan(ir), runtime, flat, nullptr);
+  const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
+                                                 nullptr};
+  const auto walked = ShaderRecompiler::IR::SrtWalker(ShaderRecompiler::IR::ExtractResourcePlan(ir), runtime).RefreshFlatBuffer(flat);
   Check(walked, "SRT walk failed");
   Check(flat.size() == table.size() &&
             std::equal(flat.begin(), flat.end(), table.begin()),
@@ -11977,9 +16631,10 @@ void TestSrtWalkerVccBaseTranslation() {
   const auto address = reinterpret_cast<uint64_t>(table.data());
   user_data[27] = static_cast<uint32_t>(address);
   user_data[28] = static_cast<uint32_t>(address >> 32u);
-  const ShaderRecompiler::IR::SrtRuntime runtime{user_data};
+  const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
+                                                 nullptr};
   std::vector<uint32_t> flat;
-  Check(ShaderRecompiler::IR::WalkSrt(ShaderRecompiler::IR::ExtractResourcePlan(ir), runtime, flat, nullptr), "SRT walk failed");
+  Check(ShaderRecompiler::IR::SrtWalker(ShaderRecompiler::IR::ExtractResourcePlan(ir), runtime).RefreshFlatBuffer(flat), "SRT walk failed");
   Check(flat.size() == table.size() &&
             std::equal(flat.begin(), flat.end(), table.begin()),
         "typed SSA lost an SMEM base copied through VCC");
@@ -12005,16 +16660,17 @@ void TestSrtWalkerRealSBufferTranslation() {
   user_data[9] = static_cast<uint32_t>(address >> 32u);
   user_data[10] = sizeof(table);
   std::vector<uint32_t> flat;
-  const ShaderRecompiler::IR::SrtRuntime runtime{user_data};
+  const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
+                                                 nullptr};
   const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(ir);
-  const auto walked = ShaderRecompiler::IR::WalkSrt(plan, runtime, flat, nullptr);
+  const auto walked = ShaderRecompiler::IR::SrtWalker(plan, runtime).RefreshFlatBuffer(flat);
   Check(walked, "SRT walk failed");
   Check(flat.size() == 4 &&
             std::equal(flat.begin(), flat.end(), table.begin()),
         "real S_BUFFER_LOAD walk did not align offset components independently");
 
   user_data[10] = 3 * sizeof(uint32_t);
-  const auto bounds_walked = ShaderRecompiler::IR::WalkSrt(plan, runtime, flat, nullptr);
+  const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(plan, runtime).RefreshFlatBuffer(flat);
   Check(bounds_walked && flat == std::vector<uint32_t>{table[0], table[1], table[2], 0u},
         "real S_BUFFER_LOAD walk did not zero only the out-of-bounds DWORD");
   CheckFlattenedReadSlots(
@@ -12030,7 +16686,7 @@ void TestSrtWalkerRealSBufferTranslation() {
                  static_cast<uint32_t>(std::size(negative_shader)),
                  negative_ir);
   user_data[10] = sizeof(table);
-  Check(!ShaderRecompiler::IR::WalkSrt(ShaderRecompiler::IR::ExtractResourcePlan(negative_ir), runtime, flat, nullptr),
+  Check(!ShaderRecompiler::IR::SrtWalker(ShaderRecompiler::IR::ExtractResourcePlan(negative_ir), runtime).RefreshFlatBuffer(flat),
         "real S_BUFFER_LOAD walk accepted a negative immediate");
 }
 
@@ -12065,9 +16721,11 @@ void TestScalarMemorySourcesCapturedBeforeWrites() {
     if (opcode == 0x0a) {
       user_data[base + 2u] = sizeof(table);
     }
-    const ShaderRecompiler::IR::SrtRuntime runtime{user_data};
+    SrtHostRange range{table.data(), table.size()};
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        user_data, 0, ReadSrtHostRangeDword, &range};
     std::vector<uint32_t> flat;
-    Check(ShaderRecompiler::IR::WalkSrt(ShaderRecompiler::IR::ExtractResourcePlan(ir), runtime, flat, nullptr), "SRT walk failed");
+    Check(ShaderRecompiler::IR::SrtWalker(ShaderRecompiler::IR::ExtractResourcePlan(ir), runtime).RefreshFlatBuffer(flat), "SRT walk failed");
     Check(flat.size() == table.size() &&
               std::equal(flat.begin(), flat.end(), table.begin()),
           "overlapping scalar-memory load did not capture its sources before "
@@ -12442,12 +17100,13 @@ void TestComputeLdsAllocationIdentity() {
   ShaderMappedData mapped{};
   mapped.code_size_bytes = sizeof(shader);
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
 
   const auto compile = [&](uint16_t encoded_lds_size,
                            uint32_t expected_dwords) {
     regs.cs_regs.lds_size = encoded_lds_size;
     ShaderComputeInputInfo input_info{};
-    const auto params = PrepareProgram(regs, input_info);
+    const auto params = PrepareProgram(regs, sh, input_info);
     Check(input_info.lds_size_dwords == expected_dwords,
           "COMPUTE_PGM_RSRC2 LDS allocation units were not decoded");
     auto options = MakeCompileOptions(ShaderType::Compute);
@@ -12513,7 +17172,7 @@ void TestComputeLdsAllocationIdentity() {
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
   regs.cs_regs.lds_size = decode_lds_field(lds_896_rsrc2);
   ShaderComputeInputInfo scratch_info{};
-  const auto scratch_params = PrepareProgram(regs, scratch_info);
+  const auto scratch_params = PrepareProgram(regs, sh, scratch_info);
   Check(scratch_info.scratch_size_dwords == 7,
         "per-thread scratch size was not propagated");
   auto scratch_options = MakeCompileOptions(ShaderType::Compute);
@@ -12579,8 +17238,8 @@ void TestPixelProgramCacheBindingIdentity() {
         first_params.hash == XXH3_64bits(shader.data(), shader.size_bytes()) &&
             first_params.hash == second_params.hash &&
             first_key == MakeStageStaticKey(second_info) &&
-            first_info.stage.module != nullptr &&
-            second_info.stage.module != nullptr,
+            first_info.stage.program != nullptr &&
+            second_info.stage.program != nullptr,
         "pixel program matching did not preserve an identical source/static identity");
     return std::pair {first_params.hash, first_key};
   };
@@ -12626,7 +17285,7 @@ void TestGraphicsPushConstantPlacement() {
 
   constexpr uint32_t PushDataStart = 7;
   auto placed =
-      RecompileForTest(shader, options, PushDataStart);
+      RecompileForTest(shader, options, nullptr, nullptr, PushDataStart);
   Check(placed.program.bindings.UsesPushData() &&
             placed.program.bindings.push_data_start_dword == PushDataStart &&
             placed.program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] == 0,
@@ -12635,7 +17294,7 @@ void TestGraphicsPushConstantPlacement() {
         "SPIR-V push-data block did not use the canonical zero base");
   CheckSpirvBinaryValidates(placed.spirv);
 
-  auto exact = RecompileForTest(shader, options, 28);
+  auto exact = RecompileForTest(shader, options, nullptr, nullptr, 28);
   Check(exact.program.bindings.UsesPushData() &&
             exact.program.bindings.push_data_start_dword == 28 &&
             exact.program.bindings.ShaderDataDwords() == 4,
@@ -12645,8 +17304,8 @@ void TestGraphicsPushConstantPlacement() {
   Check(cursor == 32, "exact-fit shader data advanced the cursor incorrectly");
   CheckSpirvBinaryValidates(exact.spirv);
 
-  auto spill = RecompileForTest(shader, options, 29);
-  auto full = RecompileForTest(shader, options, 32);
+  auto spill = RecompileForTest(shader, options, nullptr, nullptr, 29);
+  auto full = RecompileForTest(shader, options, nullptr, nullptr, 32);
   Check(!spill.program.bindings.UsesPushData() &&
             spill.program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] == 1 &&
             spill.program.bindings == full.program.bindings && spill.spirv == full.spirv,
@@ -13336,18 +17995,19 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeMubuf1(0, 0, 1), // buffer_store_dwordx4 v[0:3]
       EncodeSopp(0x01),
   };
+  // Its store has no bound, so each dword also records its page (BufferResource::tracked).
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 807,
-                                    .instructions = 211,
+                                   {.words = 1224,
+                                    .instructions = 298,
                                     .runtime_arrays = 1,
                                     .variables = 2,
-                                    .loads = 9,
+                                    .loads = 12,
                                     .stores = 4,
                                     .phis = 5,
-                                    .labels = 34,
-                                    .selection_merges = 10,
+                                    .labels = 39,
+                                    .selection_merges = 18,
                                     .branches = 23,
-                                    .conditional_branches = 10});
+                                    .conditional_branches = 18});
   Check((wide_result.decoded_dump.find("BUFFER_LOAD_DWORDX4") != std::string::npos),
         "wide buffer size fixture no longer decodes its x4 load");
   Check((wide_result.decoded_dump.find("BUFFER_STORE_DWORDX4") != std::string::npos),
@@ -13524,6 +18184,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestRebasedTextureMipViews();
+  TestUpdateSizeMemo();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
@@ -13567,6 +18228,7 @@ int main() {
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
+  TestBodyAfterEndpgm();
   TestNativeDataCacheInvalidation();
   TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
@@ -13642,6 +18304,7 @@ int main() {
   TestVertexMadU64UsesPortableProduct();
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
+  TestRobustBufferReadsHaveNoBoundsBranch();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestDisabledDebugBranches();
@@ -13670,6 +18333,12 @@ int main() {
   TestSsaRewriteSealsFilledBlocks();
   TestValuePhiValidation();
   TestLaneMaskProjection();
+  TestMaskedSelectElimination();
+  TestExecBranchPerInvocation();
+  TestMaskedSelectFalseSide();
+  TestStepLookupMatchesChain();
+  TestGroupedImageArrayTopology();
+  TestWaterfallMovrelsLoopCollapsed();
   TestLateConstantPropagation();
   TestRepeatedBitcastPropagation();
   TestMaskedShiftConstantPropagation();
@@ -13692,6 +18361,7 @@ int main() {
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();
   TestPatternFill();
+  TestLoadedPatternFill();
   TestGpuProducedWritableDescriptor();
   TestUniformSelectedWritableDescriptor();
   TestUniformSelectedDescriptorLoadAddress();

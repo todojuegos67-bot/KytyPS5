@@ -399,11 +399,16 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	    inst.src0.dpp) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
-	const auto base     = inst.src0.reg;
-	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                    IR::U32(IR::Value(0xffu)));
+	const auto base   = inst.src0.reg;
+	auto       offset = ConditionOperand(Decoder::OperandKind::M0);
+	if (inst.movrel_index_vgpr != UINT32_MAX) {
+		offset     = ConditionOperand(Decoder::OperandKind::Vgpr);
+		offset.reg = inst.movrel_index_vgpr;
+	}
+	const auto m0       = ir.BitwiseAnd(ReadU32(offset), IR::U32(IR::Value(0xffu)));
 	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
 	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
+		if (((index - base) & inst.movrel_index_zero_bits) != 0u) continue;
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
 	}

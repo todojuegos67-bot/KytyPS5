@@ -92,6 +92,7 @@ struct EmitterState {
 	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
 	const Profile&                                      profile;
+	uint32_t                                            descriptor_set = 0; // CompileOptions::descriptor_set
 	uint32_t                                        debug_source = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
@@ -112,9 +113,20 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// IR::Program::wave_split: a wave64 program one guest lane per invocation, its wave over two
+	// full subgroups; the wave-wide operations exchange through wave_exchange_variable (u32[2]).
+	bool                                             wave_split              = false;
+	uint32_t                                         subgroup_id_variable    = 0;
+	uint32_t                                         wave_exchange_variable  = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
-	std::vector<uint32_t>                           memory_byte_sizes;
+	// the buffer table variant's base addresses (U64) of the static slots, and the
+	// PhysicalStorageBuffer pointer types of each view: to its Block{T} and to its element.
+	std::vector<uint32_t>                           memory_base_addresses;
+	std::array<uint32_t, 4>                         table_block_pointer {};
+	std::array<uint32_t, 4>                         table_element_pointer {};
+	std::vector<uint32_t>                           memory_byte_lengths; // Bindings::BufferLengthDword
+	std::vector<uint32_t>                           memory_track_pointers; // Bindings::TrackDword, U64
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -130,12 +142,27 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// The ProgramConstants buffer, defined at its first use, and the word offset of each table put in it.
+	uint32_t                                         program_constants_variable = 0;
+	std::map<std::vector<uint32_t>, uint32_t>        program_constant_offsets;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
+	// Image groups' arrays in the group set (IR::GroupSetFor), by image binding index.
+	std::array<ImageDefinition, IR::ImageBindingCount> group_images {};
+	// The guest image heap's arrays by image binding index, its info buffer, and while a heap image
+	// is emitted the condition that its slot holds a cube.
+	std::array<uint32_t, IR::ImageBindingCount> heap_image_variables {};
+	uint32_t                                    heap_info_variable = 0;
+	uint32_t                                    heap_cube          = 0;
+	// The guest image heap's sampler arrays: float, integer.
+	std::array<uint32_t, 2>                     heap_sampler_variables {};
+	// While a guest heap image is emitted: the level of the texture that the host holds as level 0.
+	uint32_t                                    heap_level         = 0;
+	// The resident image heap's arrays by image binding index (ImageResource::heap).
 	std::array<ImageDefinition, IR::ImageBindingCount> heap_images {};
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   sampler_type                          = 0;
@@ -188,6 +215,8 @@ uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
+// The block of a storage buffer of `bits`-wide words.
+uint32_t StorageBufferType(EmitterState& state, BufferDefinition& buffer, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePhysicalU32BufferPointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
@@ -339,6 +368,8 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
                              uint32_t array_index = 0);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t array_index = 0);
+// The image heap's sampler for a key into the game's sampler heap (ShaderIR.h).
+uint32_t LoadHeapSampler(EmitterState& state, const IR::SamplerResource& sampler, bool integer, uint32_t key);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
                           uint32_t mip = 0, uint32_t array_index = 0,
@@ -385,6 +416,15 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component);
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state);
+// A split wave (EmitterState::wave_split): the host subgroup's own invocation number (0-31), the
+// subgroup's number in the workgroup (0 for guest lanes 0-31, 1 for 32-63), and both subgroups'
+// values of a u32 that is the same in every invocation of its subgroup. The exchange runs two
+// workgroup barriers, so only in workgroup-uniform control flow (WaveSplitProblem).
+uint32_t                      EmitHostSubgroupInvocationId(EmitterState& state);
+uint32_t                      EmitSubgroupId(EmitterState& state);
+std::pair<uint32_t, uint32_t> EmitWaveExchange(EmitterState& state, uint32_t value);
+// Whether the block being emitted may run with its invocations diverged (BranchPerInvocation).
+bool                          InDivergentBlock(const EmitterState& state);
 
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 
@@ -417,7 +457,11 @@ struct MemoryResourceAccess {
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	uint32_t              track_pointer    = 0; // a tracked buffer's write bitmap address (U64), else 0
+	bool                  table            = false; // object_pointer is the buffer's base address (U64)
 };
+// A store or atomic at `index` (in elements of `resource`) into a tracked buffer records its page.
+void RecordTrackedWrite(EmitterState& state, const MemoryResourceAccess& resource, uint32_t index);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
@@ -433,10 +477,6 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
-// EmitMemoryElementInBounds, or true for storage buffers the device bounds-checks; only
-// loads and plain stores may use it.
-uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
-                                    uint32_t index);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);

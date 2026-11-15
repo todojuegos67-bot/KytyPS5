@@ -143,10 +143,16 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	                          state.mesh_guest_func);
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
 	EmitBarrier(state);
-	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 0));
-	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 1));
+	// The guest's allocation, at most the declared outputs: a larger count is undefined in Vulkan.
+	const auto clamped = [&](uint32_t field, uint32_t declared) {
+		const auto count = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+		                            TypeU32(state), ConstantU32(state, field));
+		const auto limit = ConstantU32(state, declared);
+		return Select(state, TypeU32(state),
+		              Binary(state, spv::OpULessThan, TypeBool(state), count, limit), count, limit);
+	};
+	const auto vertices   = clamped(0, state.input_info.vertex->mesh.max_vertices);
+	const auto primitives = clamped(1, state.input_info.vertex->mesh.max_primitives);
 	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
 	                          primitives); // OpSetMeshOutputsEXT
 	for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -182,12 +188,22 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		EmitIfCondition(state, is_primitive, [&] {
 			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
 			                             TypeU32(state), ConstantU32(state, half));
-			uint32_t   vertex[3] {};
+			// NGG packs v0 | edge0 << 9 | v1 << 10 | edge1 << 19 | v2 << 20 | edge2 << 29 | null << 31
+			// (Mesa's ac_pack_prim_export): an index is the low 9 bits of its field. A primitive
+			// naming a vertex past the allocation is culled, its indices kept in range.
+			uint32_t vertex[3] {};
+			auto     culled = Binary(state, spv::OpINotEqual, TypeBool(state),
+			                         EmitBinaryU32(state, spv::OpBitwiseAnd, packed,
+			                                       ConstantU32(state, 0x80000000u)),
+			                         ConstantU32(state, 0));
 			for (uint32_t component = 0; component < 3; component++) {
-				vertex[component] = state.builder.AllocateId();
-				state.builder.AddFunction(
-				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
-				    ConstantU32(state, component * 10u), ConstantU32(state, 9));
+				const auto field = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), field, packed,
+				                          ConstantU32(state, component * 10u), ConstantU32(state, 9));
+				const auto past =
+				    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), field, vertices);
+				vertex[component] = Select(state, TypeU32(state), past, ConstantU32(state, 0), field);
+				culled = Binary(state, spv::OpLogicalOr, TypeBool(state), culled, past);
 			}
 			const auto triangle = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,
@@ -196,11 +212,6 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			    MeshElement(state, state.mesh_primitives, spv::StorageClassOutput,
 			                TypeU32Vector(state, 3), index);
 			state.builder.AddFunction(spv::OpStore, triangle_pointer, triangle);
-			const auto null_bit =
-			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
-			const auto culled = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), culled, null_bit,
-			                          ConstantU32(state, 0));
 			state.builder.AddFunction(spv::OpStore,
 			                          MeshElement(state, state.mesh_cull, spv::StorageClassOutput,
 			                                      TypeBool(state), index),

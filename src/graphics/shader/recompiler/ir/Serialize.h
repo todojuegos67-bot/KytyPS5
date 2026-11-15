@@ -1,14 +1,12 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SERIALIZE_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SERIALIZE_H_
 
-#include "common/assert.h"
-#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "graphics/shader/rectListShader.h"
 
 #include <algorithm>
 #include <bit>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -17,13 +15,15 @@
 #include <unordered_map>
 #include <vector>
 
-// Shader cache records. Io(io, value) appends value to a Writer or reads it back from a Reader
-// field by field, so padding never reaches the bytes; instructions travel as plan-local indices.
+// The precompile's stage store records (upstream 181600435, with lean's fields). Io(io, value) appends value to a
+// Writer or reads it back from a Reader field by field, so padding never reaches the bytes; instructions travel as
+// plan-local indices.
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 struct Writer {
 	std::vector<uint8_t>                      bytes;
-	std::unordered_map<const Inst*, uint32_t> index; // Instructions that values may refer to.
+	std::unordered_map<const Inst*, uint32_t> index;     // Instructions that values may refer to.
+	bool                                      ok = true; // False once a value had no encoding.
 
 	void Raw(const void* data, size_t size) {
 		const auto* begin = static_cast<const uint8_t*>(data);
@@ -60,13 +60,14 @@ template <class S, class... T> void IoAll(S& io, T&&... values) {
 	(Io(io, values), ...);
 }
 
-// The value's Type, Opaque for an instruction, then the instruction index or the zero-extended
-// immediate.
+// The value's Type, Opaque for an instruction, then the instruction index or the zero-extended immediate.
 inline void IoValue(Writer& writer, const Value& value) {
 	auto     type = Type::Opaque;
 	uint64_t bits = 0;
 	if (const auto* inst = value.TryInstruction()) {
-		bits = writer.index.at(inst);
+		const auto found = writer.index.find(inst);
+		writer.ok        = writer.ok && found != writer.index.end();
+		if (found != writer.index.end()) bits = found->second;
 	} else {
 		type = value.GetType();
 		switch (type) {
@@ -80,7 +81,7 @@ inline void IoValue(Writer& writer, const Value& value) {
 			case Type::U64: bits = value.U64(); break;
 			case Type::F16: bits = value.F16Bits(); break;
 			case Type::F32: bits = std::bit_cast<uint32_t>(value.F32Value()); break;
-			default: EXIT("value type %u has no cache encoding\n", static_cast<uint32_t>(type));
+			default: writer.ok = false; break; // the record is not stored
 		}
 	}
 	IoAll(writer, type, bits);
@@ -142,43 +143,58 @@ template <class S, class T> void Io(S& io, T& value) {
 }
 
 // Binds every field, so that a field added later fails to compile until it is listed.
-#define KYTY_IO_FIELDS(Struct, ...)                                                                \
-	template <class S, Is<Struct> T> void Io(S& io, T& object) {                                   \
-		auto& [__VA_ARGS__] = object;                                                              \
-		IoAll(io, __VA_ARGS__);                                                                    \
+#define KYTY_IO_FIELDS(Struct, ...)                                                                                    \
+	template <class S, Is<Struct> T> void Io(S& io, T& object) {                                                       \
+		auto& [__VA_ARGS__] = object;                                                                                  \
+		IoAll(io, __VA_ARGS__);                                                                                        \
 	}
-KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x,
-               y, z)
-KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
-KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y)
-KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
-KYTY_IO_FIELDS(SampledResourcePair, a, b, c)
-KYTY_IO_FIELDS(StageInput, a, b, c, d, e)
-KYTY_IO_FIELDS(StageOutput, a, b, c, d)
-KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O)
-KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
-KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
-KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,
-               l, m, n, o)
-KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::PointerTable, a, b, c, d)
-KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p,
-               q, r)
-KYTY_IO_FIELDS(DescriptorSource, a, b, c)
-KYTY_IO_FIELDS(SrtRead, a, b)
-KYTY_IO_FIELDS(ResourceBlock, a, b, c, d, e)
-KYTY_IO_FIELDS(UniformFill, a, b, c, d, e, f)
-KYTY_IO_FIELDS(UniformFillPlan, a, b, c, d)
-KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
-KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m)
-KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
-KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
-KYTY_IO_FIELDS(Bindings, a, b, c, d, e)
-KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h)
-KYTY_IO_FIELDS(Spirv::Profile, a, b, c, d, e, f, g)
-KYTY_IO_FIELDS(ShaderTessellationInputInfo, a, b, c, d, e, f, g, h, i)
-KYTY_IO_FIELDS(RectListParameter, a, b, c)
+KYTY_IO_FIELDS(MemoryInfo, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19,
+               f20, f21, f22, f23, f24, f25)
+KYTY_IO_FIELDS(BufferResource, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18,
+               f19, f20, f21)
+KYTY_IO_FIELDS(ImageResource, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18,
+               f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30)
+KYTY_IO_FIELDS(SamplerResource, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11)
+KYTY_IO_FIELDS(SampledResourcePair, f0, f1, f2)
+KYTY_IO_FIELDS(StageInput, f0, f1, f2, f3, f4)
+KYTY_IO_FIELDS(StageOutput, f0, f1, f2, f3)
+KYTY_IO_FIELDS(ShaderInfo, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19,
+               f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30, f31, f32, f33, f34, f35, f36, f37, f38, f39,
+               f40, f41, f42, f43)
+KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, f0, f1)
+KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, f0, f1, f2)
+KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14)
+KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::PointerTable, f0, f1, f2, f3)
+KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14,
+               f15, f16, f17)
+KYTY_IO_FIELDS(DescriptorSource, f0, f1, f2)
+KYTY_IO_FIELDS(SrtRead, f0, f1)
+KYTY_IO_FIELDS(ResourceBlock, f0, f1, f2, f3, f4)
+KYTY_IO_FIELDS(UniformFill, f0, f1, f2, f3, f4, f5)
+KYTY_IO_FIELDS(UniformFillPlan, f0, f1, f2, f3)
+KYTY_IO_FIELDS(ResourcePlan::BufferStore, f0, f1, f2, f3, f4, f5)
+KYTY_IO_FIELDS(Bindings, f0, f1, f2, f3, f4, f5, f6, f7)
+KYTY_IO_FIELDS(ResourceSpecialization::Buffer, f0, f1, f2, f3, f4, f5, f6, f7)
+KYTY_IO_FIELDS(ResourceSpecialization::Image, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14)
+KYTY_IO_FIELDS(ResourceSpecialization::Sampler, f0, f1, f2, f3)
+KYTY_IO_FIELDS(ResourceSpecialization, f0, f1, f2, f3)
 #undef KYTY_IO_FIELDS
+
+// Its program constants are shared (BufferCache::GetProgramConstants knows them by address): stored as words, and a
+// loaded record gets its own.
+template <class S, Is<CompiledShaderInfo> T> void Io(S& io, T& object) {
+	auto& [stage, shader_hash, wave_size, user_data_base, param_export_mask, has_address_writes, wave_split, info,
+	       bindings, program_constants] = object;
+	IoAll(io, stage, shader_hash, wave_size, user_data_base, param_export_mask, has_address_writes, wave_split, info,
+	      bindings);
+	bool                  has = program_constants != nullptr;
+	std::vector<uint32_t> words;
+	if (has) words = *program_constants;
+	IoAll(io, has, words);
+	if constexpr (Reading<S>) {
+		program_constants = has ? std::make_shared<const std::vector<uint32_t>>(std::move(words)) : nullptr;
+	}
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

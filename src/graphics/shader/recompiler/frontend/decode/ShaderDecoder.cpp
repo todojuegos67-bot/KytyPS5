@@ -393,6 +393,11 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.has_swap_pc = false;
 
 	std::vector<bool> branch_targets;
+	// The furthest branch target seen so far. PS5 Pro (trinity) shaders place part of their body after an S_ENDPGM,
+	// behind a debugger-trap block (S_CBRANCH_CDBG*, never taken here), and reach it by a forward branch; that part
+	// ends in an S_BRANCH back, followed by data.
+	uint32_t furthest_target = 0;
+	bool     past_endpgm     = false;
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
@@ -407,9 +412,15 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 				branch_targets.resize(code.size());
 			}
 			branch_targets[target_index] = true;
+			furthest_target              = std::max(furthest_target, static_cast<uint32_t>(target_index));
 		}
-		if (inst.opcode == Opcode::S_ENDPGM &&
-		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
+		const bool more_code = furthest_target >= word_index && word_index < code.size();
+		if (inst.opcode == Opcode::S_ENDPGM) {
+			if (!more_code) {
+				return;
+			}
+			past_endpgm = true;
+		} else if (past_endpgm && inst.opcode == Opcode::S_BRANCH && !more_code) {
 			return;
 		}
 	}

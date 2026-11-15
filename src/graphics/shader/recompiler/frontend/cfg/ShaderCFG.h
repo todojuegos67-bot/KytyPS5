@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -118,9 +119,15 @@ bool        ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size);
 // Returns the one instruction defining `code` that reaches `before` (UINT32_MAX: the entry value),
 // or nullopt if several do.
+// `writes` says whether instruction i writes `code`: MayWriteScalarRegister is conservative about
+// a destination's width, the caller can be exact.
 std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
                                              uint32_t before, uint32_t code, uint32_t wave_size,
-                                             std::vector<uint32_t>& crossed_calls);
+                                             std::vector<uint32_t>& crossed_calls,
+                                             const std::function<bool(uint32_t)>& writes);
+// Rewrites v_movrels waterfall loops (one v_readfirstlane'd index value per iteration) into one
+// pass where each lane reads with its own index, where that is exact. Returns how many.
+uint32_t CollapseWaterfallLoops(Decoder::Program& program);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);

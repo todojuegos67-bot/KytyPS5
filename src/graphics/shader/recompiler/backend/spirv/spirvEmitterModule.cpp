@@ -120,7 +120,7 @@ uint32_t TypeFunction(EmitterState& state) {
 	return state.function_type;
 }
 
-uint32_t StorageBufferType(EmitterState& state, BufferDefinition& buffer, uint32_t bits = 32) {
+uint32_t StorageBufferType(EmitterState& state, BufferDefinition& buffer, uint32_t bits) {
 	if (buffer.type == 0) {
 		if (bits == 32u) {
 			buffer.element_type = TypeU32(state);
@@ -232,11 +232,18 @@ void DefineDescriptors(EmitterState& state) {
 		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
+	std::array<const IR::ImageResource*, IR::ImageBindingCount> heap_types {};
+	std::array<const IR::ImageResource*, IR::ImageBindingCount> group_types {};
+	const auto group_set = IR::GroupSetFor(state.program.stage);
 	for (auto& image: info.images) {
 		const auto kind = IR::DescriptorBindingForImage(image);
 		if (!kind.has_value() || image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
 			EXIT("shader image has an invalid descriptor type or mip count");
+		}
+		if (image.guest_heap) {
+			heap_types[IR::ImageBindingIndex(*kind)] = &image;
+			continue;
 		}
 		if (image.heap) {
 			// Heap kinds alias one array; the root itself is never accessed.
@@ -246,10 +253,17 @@ void DefineDescriptors(EmitterState& state) {
 			}
 			continue;
 		}
+		if (image.indirect_capacity != 0u && group_set != IR::NoGroupSet) {
+			auto& count = bindings.group_counts[IR::ImageBindingIndex(*kind)];
+			image.descriptor_index = count;
+			if (count == 0) group_types[IR::ImageBindingIndex(*kind)] = &image;
+			count += image.indirect_capacity;
+			continue;
+		}
 		auto& count = counts[static_cast<size_t>(*kind)];
 		image.descriptor_index = count;
 		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
-		count += image.mip_count;
+		count += image.indirect_capacity != 0u ? image.indirect_capacity : image.mip_count;
 	}
 	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
@@ -262,6 +276,16 @@ void DefineDescriptors(EmitterState& state) {
 	if (info.uses_dispatch_threads) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
+	}
+	bindings.write_tracking = std::ranges::any_of(info.buffers, [](const IR::BufferResource& buffer) {
+		return buffer.tracked && buffer.descriptor_index != UINT32_MAX;
+	});
+	bindings.image_forms = std::ranges::any_of(info.images, [](const IR::ImageResource& image) {
+		return image.form_slot != IR::ImageResource::NoFormSlot;
+	});
+	// Bindings::BufferTable() reads the Buffers bit, so it is known before the layout.
+	if (!state.profile.buffer_table && buffer_count != 0) {
+		bindings.descriptor_mask |= uint64_t {1} << static_cast<uint32_t>(Kind::Buffers);
 	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
@@ -277,14 +301,22 @@ void DefineDescriptors(EmitterState& state) {
 	}
 	for (uint32_t index = 0; index < counts.size(); ++index) {
 		if (counts[index] == 0) continue;
-		bindings.descriptor_mask |= uint64_t{1} << index;
 		const auto kind = static_cast<Kind>(index);
+		if (kind == Kind::Buffers && state.profile.buffer_table) {
+			// read by address, no binding; only its views' element types.
+			const std::array used {info.buffer_u8, info.buffer_u16, true, info.buffer_int64_atomics};
+			for (uint32_t alias = 0; alias < used.size(); ++alias) {
+				if (used[alias]) StorageBufferType(state, state.storage_buffers[alias], 8u << alias);
+			}
+			continue;
+		}
+		bindings.descriptor_mask |= uint64_t{1} << index;
 		const auto Define = [&](uint32_t type, const char* name,
 		                        spv::StorageClass storage = spv::StorageClassStorageBuffer) {
 			const auto variable =
 			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 			state.builder.AddName(variable, name);
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, state.descriptor_set);
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
@@ -357,12 +389,54 @@ void DefineDescriptors(EmitterState& state) {
 				        IR::ImageResourceClass::None);
 				auto& definition = state.images[IR::ImageBindingIndex(kind)];
 				DefineImageArray(state, definition, *image_types[IR::ImageBindingIndex(kind)],
-				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
+				                 counts[index], state.descriptor_set, IR::NativeBinding(state.program.stage, kind));
 				state.builder.AddName(definition.variable,
 				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
 				break;
 			}
 		}
+	}
+	for (uint32_t index = 0; index < group_types.size(); ++index) {
+		if (group_types[index] == nullptr) continue;
+		const auto kind       = static_cast<Kind>(index + IR::FirstImageBinding);
+		auto&      definition = state.group_images[index];
+		DefineImageArray(state, definition, *group_types[index], bindings.group_counts[index], group_set,
+		                 IR::NativeBinding(state.program.stage, kind));
+		state.builder.AddName(definition.variable, ("group_image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+	}
+	const auto DefineHeap = [&](uint32_t type, spv::StorageClass storage, uint32_t binding,
+	                            const std::string& name) {
+		const auto variable = state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+		state.builder.AddName(variable, name.c_str());
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, IR::ImageHeapSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+		return variable;
+	};
+	for (uint32_t index = 0; index < heap_types.size(); ++index) {
+		if (heap_types[index] == nullptr) continue;
+		auto& definition = state.images[index];
+		if (definition.type == 0) {
+			definition.type         = ImageType(state, *heap_types[index]);
+			definition.pointer_type = TypePointer(state, spv::StorageClassUniformConstant, definition.type);
+		}
+		// Heap images are sampled; a 1D one is a host 2D image one texel high.
+		state.heap_image_variables[index] = DefineHeap(
+		    state.builder.Type(spv::OpTypeArray, definition.type, ConstantU32(state, IR::ImageHeapSlots)),
+		    spv::StorageClassUniformConstant, index, "heap_image_" + std::to_string(index));
+		if (state.heap_info_variable == 0) {
+			state.heap_info_variable = DefineHeap(StorageBufferType(state, state.storage_buffers[2]),
+			                                      spv::StorageClassStorageBuffer, IR::ImageHeapInfoBinding,
+			                                      "heap_info");
+		}
+	}
+	if (std::ranges::any_of(info.samplers, [](const IR::SamplerResource& sampler) { return sampler.guest_heap; })) {
+		EXIT_IF(state.sampler_type == 0);
+		const auto array = state.builder.Type(spv::OpTypeArray, state.sampler_type,
+		                                      ConstantU32(state, IR::ImageHeapSamplerSlots));
+		state.heap_sampler_variables[0] = DefineHeap(array, spv::StorageClassUniformConstant,
+		                                             IR::ImageHeapFloatSamplerBinding, "heap_samplers");
+		state.heap_sampler_variables[1] = DefineHeap(array, spv::StorageClassUniformConstant,
+		                                             IR::ImageHeapIntegerSamplerBinding, "heap_samplers_integer");
 	}
 }
 
@@ -480,6 +554,12 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
+	if (state.wave_split &&
+	    std::ranges::any_of(state.inputs, [](const InputBinding& input) {
+		    return input.kind == IR::StageInputKind::GlobalInvocationId;
+	    })) {
+		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
@@ -570,7 +650,17 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.program.info.subgroup_local_invocation_id) {
+	if (state.wave_split) {
+		const auto variable =
+		    DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput, "gl_SubgroupID");
+		state.subgroup_id_variable = variable;
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            spv::BuiltInSubgroupId);
+		state.wave_exchange_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, 2), spv::StorageClassWorkgroup);
+		state.builder.AddName(state.wave_exchange_variable, "wave_exchange");
+	}
+	if (state.program.info.subgroup_local_invocation_id || state.wave_split) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -740,7 +830,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
 		                               state.input_info.vertex->mesh.max_primitives);
 		if (state.input_info.vertex->indirect_draw) {
-			// The task shader's payload (gpu_mesh_indirect.task).
+			// The task shader's payload (gpu_mesh_indirect.task), upstream abc509d33.
 			const auto count   = ConstantU32(state, IR::PushData::MeshTaskPayloadDwordCount);
 			state.mesh_payload = DefineInterfaceVariable(
 			    state, state.builder.Type(spv::OpTypeArray, TypeU32(state), count),
@@ -762,9 +852,11 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	const bool physical_addresses = state.program.info.uses_dma ||
-	                                state.program.info.uses_image_heap ||
-	                                state.program.info.uses_device_address;
+	// A mesh shader reads its draw dwords by device address; a tracked buffer's write bitmap is one too.
+	const bool physical_addresses = state.program.info.uses_dma || state.program.info.uses_image_heap ||
+	                                state.program.info.uses_device_address ||
+	                                state.program.stage == ShaderType::Mesh ||
+	                                state.program.bindings.write_tracking || state.program.bindings.BufferTable();
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -804,13 +896,13 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
+	if (state.lane_count == 2 || state.wave_split || state.program.info.subgroup_barrier ||
 	    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
 	    state.program.info.subgroup_shuffle ||
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+	if (state.lane_count == 2 || state.wave_split || state.program.info.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.program.info.subgroup_vote) {
@@ -820,6 +912,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
 	if (state.program.info.subgroup_arithmetic) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
@@ -862,7 +955,12 @@ void DefineModule(EmitterState& state) {
 		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
 		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
-		if (state.lane_count == 2) {
+		if (state.wave_split) {
+			// One wave of 64 invocations, two full subgroups; lanes past the workgroup's threads
+			// start with EXEC clear (Translate.cpp).
+			local_x = 64u;
+			local_y = local_z = 1u;
+		} else if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;
 			if (state.program.info.compute_derivatives) {

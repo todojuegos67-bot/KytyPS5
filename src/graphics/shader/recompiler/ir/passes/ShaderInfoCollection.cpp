@@ -278,6 +278,25 @@ struct InputUsage {
 	}
 };
 
+// The most LDS a thread group can have.
+constexpr uint32_t MaxLdsDwords = 8192;
+
+// Dwords an LDS of one invocation needs for this access. A wave that spills to LDS gives each
+// lane its own dword (ds_*_addtid): a slot is 64 dwords. Any other address can be anywhere.
+uint32_t FunctionLdsDwords(const Inst& inst, const MemoryInfo& memory) {
+	const auto* shift = inst.Arg(0).Resolve().TryInstruction();
+	if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+	    !shift->Arg(1).Resolve().IsImmediate() || shift->Arg(1).Resolve().U32() != 2u) {
+		return MaxLdsDwords;
+	}
+	const auto* lane = shift->Arg(0).Resolve().TryInstruction();
+	if (lane == nullptr || lane->GetOpcode() != ValueOpcode::LaneId) {
+		return MaxLdsDwords;
+	}
+	return static_cast<uint32_t>(
+	    std::min<uint64_t>(MaxLdsDwords, (uint64_t {memory.offset} + 3u) / 4u + 64u));
+}
+
 void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs,
            const Inst& inst) {
 	auto& info = program.info;
@@ -320,8 +339,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					return Fail("scratch operation has no per-thread storage");
 				}
 				info.function_scratch = true;
-				info.function_lds |= kind == ResourceKind::FlatLocal &&
-				                     program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
+				if (kind == ResourceKind::FlatLocal && program.stage != ShaderType::Compute &&
+				    program.stage != ShaderType::Mesh) {
+					info.function_lds        = true;
+					info.function_lds_dwords = MaxLdsDwords;
+				}
 			} else if (address_access == AddressAccess::Write) {
 				return Fail("writable FLAT/GLOBAL addresses require GPU ownership tracking");
 			} else {
@@ -368,8 +390,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				}
 				info.shared_int64_atomics = true;
 			}
-			info.function_lds |= kind == ResourceKind::Lds &&
-			                     program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
+			if (kind == ResourceKind::Lds && program.stage != ShaderType::Compute &&
+			    program.stage != ShaderType::Mesh) {
+				info.function_lds        = true;
+				info.function_lds_dwords =
+				    std::max(info.function_lds_dwords, FunctionLdsDwords(inst, memory));
+			}
 			if (shared_access == SharedAccess::Append || shared_access == SharedAccess::Consume) {
 				info.subgroup_shuffle = true;
 				info.subgroup_local_invocation_id = true;
@@ -526,10 +552,13 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
+		case ValueOpcode::SubgroupReduceU32:
+			info.subgroup_arithmetic = true;
+			// A pixel shader's helper lanes give the fold's identity (EmitSubgroupReduceU32).
+			info.helper_invocation |= program.stage == ShaderType::Pixel;
+			break;
+		case ValueOpcode::LaneReduceU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
-		case ValueOpcode::SubgroupUMinU32:
-		case ValueOpcode::SubgroupUMaxU32:
-		case ValueOpcode::SubgroupOrU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -593,6 +622,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
+	info.function_lds_dwords = 0;
 	InputUsage inputs;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {

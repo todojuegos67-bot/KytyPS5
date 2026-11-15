@@ -25,8 +25,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}
-	if (state.lane_count == 2 && (kind == IR::StageInputKind::LocalInvocationId ||
-	                              kind == IR::StageInputKind::GlobalInvocationId)) {
+	if ((state.lane_count == 2 || state.wave_split) &&
+	    (kind == IR::StageInputKind::LocalInvocationId ||
+	     kind == IR::StageInputKind::GlobalInvocationId)) {
 		const auto* cs      = ShaderWorkgroupInput(state.program.stage, state.input_info);
 		uint32_t    divisor = 1;
 		for (uint32_t axis = 0; axis < component; axis++) {
@@ -692,7 +693,7 @@ void EmitVoid(ValueEmitContext&) {}
 
 void EmitStoreCompletion(EmitterState& state) {
 	state.builder.AddFunction(
-	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
+	    spv::OpControlBarrier, ConstantU32(state, state.wave_split ? spv::ScopeWorkgroup : spv::ScopeSubgroup),
 	    ConstantU32(state, spv::ScopeDevice),
 	    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
 	                          spv::MemorySemanticsImageMemoryMask));
@@ -743,16 +744,32 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.program.stage != ShaderType::Mesh || index >= count) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	if (state.mesh_payload == 0) {
-		return EmitPushDataLoad(state, ConstantU32(state, index));
+	if (state.mesh_payload != 0) {
+		// An indirect draw's parameters come from the task shader's payload (upstream abc509d33).
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassTaskPayloadWorkgroupEXT),
+		    pointer, state.mesh_payload, ConstantU32(state, index));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
 	}
-	const auto pointer = state.builder.AllocateId();
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassTaskPayloadWorkgroupEXT),
-	    pointer, state.mesh_payload, ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	return value;
+	// The draw dwords are in memory, at the address in the first two push constant dwords, so
+	// that a draw whose arguments a guest shader wrote can have them written on the GPU.
+	const auto word = [&](uint32_t dword) {
+		return Unary(state, spv::OpUConvert, TypeU64(state),
+		             EmitPushDataLoad(state, ConstantU32(state, dword)));
+	};
+	const auto block   = Binary(state, spv::OpBitwiseOr, TypeU64(state), word(0),
+	                            Binary(state, spv::OpShiftLeftLogical, TypeU64(state), word(1),
+	                                   ConstantU64(state, 32)));
+	const auto address = Binary(state, spv::OpIAdd, TypeU64(state), block,
+	                            ConstantU64(state, uint64_t {index} * sizeof(uint32_t)));
+	const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address);
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer,
+	                          spv::MemoryAccessAlignedMask, static_cast<uint32_t>(sizeof(uint32_t)));
+	return result;
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
@@ -811,7 +828,32 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// Scalar branches include lanes disabled by EXEC, which the branch body may restore.
 	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Result(inst);
 	const auto kind = inst.Flags<CFG::BranchCondition>();
+	if (ctx.state.wave_split && !InDivergentBlock(ctx.state)) {
+		// A split wave: the vote over both subgroups, and a scalar test as subgroup 0 has it, so
+		// that both subgroups branch alike and every later exchange is workgroup-uniform.
+		auto&      state = ctx.state;
+		const bool zero  = kind == CFG::BranchCondition::ExecZero ||
+		                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
+		auto own = ctx.Arg(inst, 0);
+		if (kind != CFG::BranchCondition::ScalarInstruction) {
+			const auto vote = state.builder.AllocateId();
+			state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
+			                          TypeBool(state), vote, ConstantU32(state, spv::ScopeSubgroup), own);
+			own = vote;
+		}
+		const auto [low, high] = EmitWaveExchange(
+		    state, Select(state, TypeU32(state), own, ConstantU32(state, 1), ConstantU32(state, 0)));
+		const auto is_set = [&](uint32_t word) {
+			return Binary(state, spv::OpINotEqual, TypeBool(state), word, ConstantU32(state, 0));
+		};
+		if (kind == CFG::BranchCondition::ScalarInstruction) return is_set(low);
+		return Binary(state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr, TypeBool(state),
+		              is_set(low), is_set(high));
+	}
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
+	if (ctx.state.wave_split) {
+		ctx.Fail(inst, "is a wave vote where a split wave's invocations may diverge");
+	}
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
 	// Zero-kind predicates are already inverted by translation.
@@ -844,34 +886,96 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, lane);
 }
 
+// The reduction of the value over the subgroup's lanes that the predicate takes, the same for
+// every lane: both emulated halves go into it.
+uint32_t EmitLaneReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&    state = ctx.state;
+	spv::Op  group, join;
+	uint32_t identity = 0;
+	switch (inst.Flags<IR::ValueOpcode>()) {
+		case IR::ValueOpcode::UMax32: group = spv::OpGroupNonUniformUMax; join = spv::OpNop; break;
+		case IR::ValueOpcode::UMin32:
+			group = spv::OpGroupNonUniformUMin; join = spv::OpNop; identity = UINT32_MAX; break;
+		case IR::ValueOpcode::IAdd32: group = spv::OpGroupNonUniformIAdd; join = spv::OpIAdd; break;
+		case IR::ValueOpcode::BitwiseOr32:
+			group = spv::OpGroupNonUniformBitwiseOr; join = spv::OpBitwiseOr; break;
+		case IR::ValueOpcode::BitwiseAnd32:
+			group = spv::OpGroupNonUniformBitwiseAnd; join = spv::OpBitwiseAnd; identity = UINT32_MAX; break;
+		default: ctx.Fail(inst, "has an unsupported lane reduction");
+	}
+	uint32_t result = 0;
+	if (state.wave_split) {
+		const auto taken   = Select(state, TypeU32(state), ctx.Arg(inst, 1), ctx.Arg(inst, 0),
+		                            ConstantU32(state, identity));
+		const auto reduced = state.builder.AllocateId();
+		state.builder.AddFunction(group, TypeU32(state), reduced, ConstantU32(state, spv::ScopeSubgroup),
+		                          static_cast<uint32_t>(spv::GroupOperationReduce), taken);
+		const auto [low, high] = EmitWaveExchange(state, reduced);
+		if (join != spv::OpNop) return Binary(state, join, TypeU32(state), low, high);
+		return identity == 0u ? EmitUMax32(state, low, high) : EmitUMin32(state, low, high);
+	}
+	for (uint32_t half = 0; half < (ctx.other_half != nullptr ? 2u : 1u); ++half) {
+		const auto taken = Select(state, TypeU32(state),
+		    ctx.other_half != nullptr ? ctx.HalfArg(inst, 1, half) : ctx.Arg(inst, 1),
+		    ctx.other_half != nullptr ? ctx.HalfArg(inst, 0, half) : ctx.Arg(inst, 0),
+		    ConstantU32(state, identity));
+		const auto reduced = state.builder.AllocateId();
+		state.builder.AddFunction(group, TypeU32(state), reduced, ConstantU32(state, spv::ScopeSubgroup),
+		                          static_cast<uint32_t>(spv::GroupOperationReduce), taken);
+		if (half == 0u) result = reduced;
+		else if (join != spv::OpNop) result = Binary(state, join, TypeU32(state), result, reduced);
+		else result = identity == 0u ? EmitUMax32(state, result, reduced) : EmitUMin32(state, result, reduced);
+	}
+	return result;
+}
+
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 
-template <spv::Op Reduce, auto Combine>
-static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto& state = ctx.state;
+// The whole-wave fold (the flags) of the value: both emulated halves go into it.
+uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&   state = ctx.state;
+	spv::Op group {};
+	uint32_t (*join)(EmitterState&, uint32_t, uint32_t) = nullptr;
+	uint32_t identity = 0u;
+	switch (inst.Flags<IR::ValueOpcode>()) {
+		case IR::ValueOpcode::IAdd32: group = spv::OpGroupNonUniformIAdd; join = EmitIAdd32; break;
+		case IR::ValueOpcode::UMin32:
+			group = spv::OpGroupNonUniformUMin; join = EmitUMin32; identity = UINT32_MAX; break;
+		case IR::ValueOpcode::UMax32: group = spv::OpGroupNonUniformUMax; join = EmitUMax32; break;
+		case IR::ValueOpcode::SMin32:
+			group = spv::OpGroupNonUniformSMin; join = EmitSMin32; identity = 0x7fffffffu; break;
+		case IR::ValueOpcode::SMax32:
+			group = spv::OpGroupNonUniformSMax; join = EmitSMax32; identity = 0x80000000u; break;
+		case IR::ValueOpcode::BitwiseAnd32:
+			group = spv::OpGroupNonUniformBitwiseAnd; join = EmitBitwiseAnd32; identity = UINT32_MAX; break;
+		case IR::ValueOpcode::BitwiseOr32:
+			group = spv::OpGroupNonUniformBitwiseOr; join = EmitBitwiseOr32; break;
+		case IR::ValueOpcode::BitwiseXor32:
+			group = spv::OpGroupNonUniformBitwiseXor; join = EmitBitwiseXor32; break;
+		default: ctx.Fail(inst, "has an unsupported subgroup reduction");
+	}
 	auto value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
-		value = Combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+		value = join(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	}
+	// Helper lanes are out of the guest's EXEC word (5429888d4) but take part in host subgroup operations,
+	// and the per-lane projection of the live mask keeps them executing: they give the fold's identity, as
+	// lanes outside EXEC do in the guest's scan.
+	if (state.program.stage == ShaderType::Pixel && state.helper_invocation_variable != 0) {
+		const auto helper =
+		    EmitNative<spv::OpLoad, IR::Type::U1>(state, state.helper_invocation_variable);
+		value = Select(state, TypeU32(state), helper, ConstantU32(state, identity), value);
 	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(Reduce, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
-	                          value);
+	state.builder.AddFunction(group, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup),
+	                          spv::GroupOperationReduce, value);
+	if (state.wave_split) {
+		const auto [low, high] = EmitWaveExchange(state, result);
+		return join(state, low, high);
+	}
 	return result;
-}
-
-uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMin, EmitUMin32>(ctx, inst);
-}
-
-uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMax, EmitUMax32>(ctx, inst);
-}
-
-uint32_t EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformBitwiseOr, EmitOrU32>(ctx, inst);
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {

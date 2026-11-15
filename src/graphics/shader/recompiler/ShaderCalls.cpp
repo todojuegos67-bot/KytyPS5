@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <span>
 #include <utility>
 #include <vector>
@@ -60,10 +61,38 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		for (size_t i = 0; i < inst->NumArgs(); ++i) inst->SetArg(i, Resolve(before, inst->Arg(i)));
 		return value;
 	};
+	// The scalar registers an instruction writes, as its translation says: the decoder does not give
+	// every destination its width (Marvel's Wolverine CS 0x65730dab35e283f7: s_bitset0_b32 s7 taken
+	// for a writer of s8, a call target, which made two definitions reach the call).
+	std::map<uint32_t, std::set<uint32_t>> written;
+	const auto Writes = [&](uint32_t index, uint32_t code) {
+		if (!CFG::MayWriteScalarRegister(source.decoded.instructions[index], code, source.wave_size))
+			return false;
+		auto [entry, inserted] = written.try_emplace(index);
+		if (inserted) {
+			Block translated;
+			Frontend::Translator translator(query, &translated, 1u, Frontend::NoLaneSpills,
+			    (options.input_info.compute->float_mode & 0x10u) == 0u,
+			    !options.input_info.compute->async_compute);
+			translator.TranslateInstruction(source.decoded.instructions[index]);
+			for (const auto& inst: translated) {
+				switch (inst.GetOpcode()) {
+					case ValueOpcode::SetScalarRegister:
+						entry->second.insert(static_cast<uint32_t>(inst.Arg(0).ScalarRegister()));
+						break;
+					case ValueOpcode::SetVccLo: entry->second.insert(106u); break;
+					case ValueOpcode::SetVccHi: entry->second.insert(107u); break;
+					default: break;
+				}
+			}
+		}
+		return entry->second.contains(code);
+	};
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
 		const auto definition = CFG::FindScalarDefinition(source.decoded, graph, before, code,
-		                                                  source.wave_size, crossed_calls);
+		                                                  source.wave_size, crossed_calls,
+		                                                  [&](uint32_t i) { return Writes(i, code); });
 		// Several reaching definitions select the value on the GPU, so no SRT walk evaluates it.
 		if (!definition) return Value(&block.AppendNewInst(ValueOpcode::UndefU32));
 		const auto index = *definition;
@@ -130,38 +159,18 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	for (auto& inst: block) {
 		inst.SetParent(nullptr);
 		if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 || inst.GetOpcode() == ValueOpcode::ReadConstBuffer)
-			inst.SetFlags(MemoryFlags {.index = inst.Flags<MemoryFlags>().index});
+			inst.SetFlags(SrtReadFlags {.index = inst.Flags<MemoryFlags>().index});
 	}
 	query.value_storage.splice(query.value_storage.end(), block.Instructions());
 	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
-	std::vector<Value> targets;
-	for (const auto& site: source.calls) targets.insert(targets.end(), site.target.begin(), site.target.end());
-	CompileSrtWalker(source.call_targets, targets);
 }
 
-const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
-	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
+namespace {
+
+// The calls of source linked: each site's leaf function read through read(address, words) at its address.
+const Decoder::Program& LinkCalls(ShaderSource& source,
+                                  const std::function<bool(uint64_t, std::span<uint32_t>)>& read) {
 	auto& reads = source.reads;
-	reads.clear();
-	std::vector<uint32_t> flat;
-	const bool walked = IR::WalkSrt(source.call_targets, runtime, flat, &reads);
-	const auto read_code = [&](uint64_t address, std::span<uint32_t> words) {
-		if (runtime.read_specialization_memory == nullptr ||
-		    !runtime.read_specialization_memory(runtime.userdata, address, words)) return false;
-		reads.emplace_back(address, words.size_bytes());
-		return true;
-	};
-	for (auto& site: source.calls) {
-		uint32_t low = 0, high = 0;
-		if (!walked || !IR::WalkedValue(source.call_targets, site.target[0], low) ||
-		    !IR::WalkedValue(source.call_targets, site.target[1], high))
-			EXIT("shader call at pc 0x%08x has an unavailable scalar target",
-			     source.decoded.instructions[site.instruction].pc);
-		// SWAPPC reads the old aliased pair and ignores the target's low two bits.
-		const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
-		EXIT_IF(address == 0u);
-		site.address = address;
-	}
 	const auto query_reads = reads.size();
 	if (source.linked) {
 		auto& linked = *source.linked;
@@ -178,7 +187,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				break;
 			}
 			linked.observed_function.resize(function.size);
-			if (!read_code(source.calls[i].address, linked.observed_function) ||
+			if (!read(source.calls[i].address, linked.observed_function) ||
 			    !std::ranges::equal(expected, linked.observed_function)) {
 				unchanged = false;
 				break;
@@ -208,7 +217,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				uint32_t count = 1;
 				Decoder::Instruction inst;
 				for (;;) {
-					if (!read_code(address + uint64_t {index} * sizeof(uint32_t), std::span(words).first(count)))
+					if (!read(address + uint64_t {index} * sizeof(uint32_t), std::span(words).first(count)))
 						EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
 					inst = {};
 					Decoder::DecodeInstruction(words, 0u, inst);
@@ -265,6 +274,58 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	source.linked = std::move(linked);
 	++source.revision;
 	return source.linked->decoded;
+}
+
+
+} // namespace
+
+const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
+	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
+	auto& reads = source.reads;
+	reads.clear();
+	IR::SrtReadCapture capture(runtime, reads);
+	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
+	IR::SrtWalker walker(source.call_targets, clean);
+	for (auto& site: source.calls) {
+		uint32_t low = 0, high = 0;
+		if (!walker.Evaluate(site.target[0], low) || !walker.Evaluate(site.target[1], high))
+			EXIT("shader call at pc 0x%08x has an unavailable scalar target",
+			     source.decoded.instructions[site.instruction].pc);
+		// SWAPPC reads the old aliased pair and ignores the target's low two bits.
+		const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
+		EXIT_IF(address == 0u);
+		site.address = address;
+	}
+	return LinkCalls(source, [&](uint64_t address, std::span<uint32_t> words) {
+		return clean.read_memory(clean.userdata, address, words);
+	});
+}
+
+const Decoder::Program& LinkShaderSource(ShaderSource& source, std::span<const std::vector<uint32_t>> callees) {
+	EXIT_IF(source.unsupported_call_pc != UINT32_MAX || callees.size() != source.calls.size());
+	// One stand-in address per distinct callee: the linker shares a leaf between the sites that call it.
+	for (size_t i = 0; i < source.calls.size(); ++i) {
+		size_t first = i;
+		for (size_t k = 0; k < i; ++k) {
+			if (std::ranges::equal(callees[k], callees[i])) {
+				first = k;
+				break;
+			}
+		}
+		source.calls[i].address = uint64_t {first + 1u} << 32u;
+	}
+	source.reads.clear();
+	source.linked.reset();
+	return LinkCalls(source, [&](uint64_t address, std::span<uint32_t> words) {
+		const auto  index  = static_cast<size_t>(address >> 32u) - 1u;
+		const auto  offset = static_cast<size_t>(address & 0xffffffffu) / sizeof(uint32_t);
+		if (index >= callees.size() || offset > callees[index].size() ||
+		    words.size() > callees[index].size() - offset) {
+			return false;
+		}
+		std::copy_n(callees[index].begin() + static_cast<ptrdiff_t>(offset), words.size(), words.begin());
+		return true;
+	});
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

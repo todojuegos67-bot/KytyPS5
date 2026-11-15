@@ -1251,8 +1251,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
 			// Instance IDs exclude the start instance, which shaders add from user data. An
-			// indirect record's bases reach only the user SGPRs its packet patches; NGG user
-			// SGPRs start at s8.
+			// indirect record's bases (upstream abc509d33's task shader) reach only the user SGPRs its
+			// packet patches; NGG user SGPRs start at s8.
 			const bool  indirect = options.input_info.vertex->indirect_draw;
 			const auto& offsets  = options.input_info.vertex->indirect_offsets;
 			for (const auto [slot, parameter]:

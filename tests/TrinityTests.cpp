@@ -92,7 +92,7 @@ TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 	using namespace Libs::LibKernel::Memory;
 	subsystems.Initialize<Lifecycle>();
 	constexpr uint64_t mib = 1024 * 1024;
-	constexpr uint64_t backing = (12800 + 1216 - 64 - 96) * mib;
+	constexpr uint64_t backing = (12800 + 1536 - 64 - 96) * mib;
 	constexpr uint64_t flexible = 3072 * mib;
 	EXPECT_EQ(TestGuestBackingSize(), backing);
 	EXPECT_EQ(KernelGetDirectMemorySize(), backing - flexible);

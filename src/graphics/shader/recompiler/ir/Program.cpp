@@ -141,14 +141,18 @@ Program& Program::operator=(Program&& other) noexcept {
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
 	CompiledShaderInfo result {
-	    .stage              = stage,
-	    .shader_hash        = shader_hash,
-	    .wave_size          = wave_size,
-	    .user_data_base     = user_data_base,
+	    .stage           = stage,
+	    .shader_hash     = shader_hash,
+	    .wave_size       = wave_size,
+	    .user_data_base  = user_data_base,
 	    .has_address_writes = has_address_writes,
-	    .info               = std::move(info),
-	    .bindings           = std::move(bindings),
+	    .wave_split      = wave_split,
+	    .info            = std::move(info),
+	    .bindings        = std::move(bindings),
 	};
+	if (!program_constants.empty()) {
+		result.program_constants = std::make_shared<const std::vector<uint32_t>>(std::move(program_constants));
+	}
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
 			result.param_export_mask |= 1u << output.index;
@@ -480,9 +484,9 @@ void ValidateProgram(const Program& program) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+				    !memory.SupportsIndirectBufferAccess(inst.GetOpcode())) {
 					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
-					            "or formatted X load");
+					            "or formatted X load or a raw DWORD store or atomic");
 				}
 				const auto access = BufferAccessOf(inst.GetOpcode());
 				const bool packed_formatted =

@@ -13,13 +13,21 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
+	bool robust_buffers       = false; // robustBufferAccess2: a storage-buffer read past its range is 0.
+	// robustStorageBufferAccessSizeAlignment (1 or 4): the bound range is rounded up to it for the
+	// check, so an 8- or 16-bit read is 0 past the range only when it is no larger than the element.
+	uint32_t robust_buffer_alignment = 4;
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
-	// Storage buffer elements past the descriptor range, to the byte, read zero and drop writes.
-	bool robust_buffer_access = false;
+	// Compute pipelines can require full subgroups of exactly 32 invocations (computeFullSubgroups,
+	// subgroup size 32 fixed). A wave64 program can then run one guest lane per invocation, its
+	// wave over two subgroups (ShaderRecompiler.cpp, WaveSplitProblem).
+	bool wave64_split = false;
 	// 8 and 8_8 sRGB textures sample through sRGB views; without one the shader decodes them.
 	bool r8_srgb_views   = false;
 	bool r8g8_srgb_views = false;
+	// the buffer table variant (ResourceSpecialization::buffer_table), set per program.
+	bool buffer_table = false;
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
 };
@@ -30,7 +38,8 @@ inline constexpr Profile DefaultProfile {};
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t       push_data_start_dword = 0,
                                   const Profile& profile               = DefaultProfile,
-                                  bool           emit_debug_info       = false);
+                                  bool           emit_debug_info       = false,
+                                  uint32_t       descriptor_set        = 0);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

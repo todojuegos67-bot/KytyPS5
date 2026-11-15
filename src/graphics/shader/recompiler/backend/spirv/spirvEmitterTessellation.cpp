@@ -29,14 +29,14 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
 		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
-		const auto index       = inst.Arg(1).U32() / 4u;
-		const bool quad        = tess.domain == 2u;
-		const auto outer_count = quad ? 4u : 3u;
-		const bool outer       = index < outer_count;
-		EXIT_NOT_IMPLEMENTED(index >= (quad ? 6u : 4u));
+		// The guest stores the outer factors, then the inner: 3 + 1 for triangles, 4 + 2 for quads.
+		const auto outers = tess.domain == 2u ? 4u : 3u;
+		const auto index  = inst.Arg(1).U32() / 4u;
+		const auto outer  = index < outers;
+		EXIT_NOT_IMPLEMENTED(index >= outers + outers / 2u);
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
 		                          pointer, outer ? variable : state.tess_inner_variable,
-		                          ConstantU32(state, outer ? index : index - outer_count));
+		                          ConstantU32(state, outer ? index : index - outers));
 		return pointer;
 	}
 	auto address = ctx.Arg(inst, 1);
@@ -136,25 +136,26 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	// Triangle or quad domain, integer or fractional partitioning, triangle output.
-	EXIT_NOT_IMPLEMENTED((tess.domain != 1u && tess.domain != 2u) ||
-	                     (tess.partitioning != 0u && tess.partitioning != 2u && tess.partitioning != 3u) ||
-	                     (tess.output_topology != 2u && tess.output_topology != 3u));
+	// VGT_TF_PARAM: domain 1 triangles, 2 quads (Marvel's Wolverine's engine HS); partitioning
+	// 0 integer, 2 fractional odd, 3 fractional even; topology 2 clockwise, 3 counter-clockwise.
+	EXIT_NOT_IMPLEMENTED((tess.domain != 1u && tess.domain != 2u) || tess.partitioning == 1u ||
+	                     tess.output_topology < 2u);
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               tess.output_control_points);
 	} else {
-		state.builder.AddExecutionMode(state.main_func, tess.domain == 1u
-		                                                   ? spv::ExecutionModeTriangles
-		                                                   : spv::ExecutionModeQuads);
-		state.builder.AddExecutionMode(
-		    state.main_func, tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual
-		                     : tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd
-		                                                : spv::ExecutionModeSpacingFractionalEven);
+		state.builder.AddExecutionMode(state.main_func, tess.domain == 2u
+		                                                    ? spv::ExecutionModeQuads
+		                                                    : spv::ExecutionModeTriangles);
+		state.builder.AddExecutionMode(state.main_func,
+		                               tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual
+		                               : tess.partitioning == 2u
+		                                   ? spv::ExecutionModeSpacingFractionalOdd
+		                                   : spv::ExecutionModeSpacingFractionalEven);
 		state.builder.AddExecutionMode(state.main_func, tess.output_topology == 2u
-		                                                   ? spv::ExecutionModeVertexOrderCw
-		                                                   : spv::ExecutionModeVertexOrderCcw);
+		                                                    ? spv::ExecutionModeVertexOrderCw
+		                                                    : spv::ExecutionModeVertexOrderCcw);
 	}
 }
 

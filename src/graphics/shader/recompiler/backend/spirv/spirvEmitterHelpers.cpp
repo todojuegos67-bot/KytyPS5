@@ -102,7 +102,72 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	return {subid, ConstantBool(state, true)};
 }
 
+uint32_t EmitHostSubgroupInvocationId(EmitterState& state) {
+	if (state.subgroup_local_invocation_id_variable == 0) {
+		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
+	                          state.subgroup_local_invocation_id_variable);
+	return value;
+}
+
+uint32_t EmitSubgroupId(EmitterState& state) {
+	if (state.subgroup_id_variable == 0) {
+		EXIT("SubgroupId was not declared before SPIR-V function emission\n");
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, state.subgroup_id_variable);
+	return value;
+}
+
+bool InDivergentBlock(const EmitterState& state) {
+	return state.current_block != nullptr &&
+	       state.program.wave_split_divergent_blocks.contains(state.current_block);
+}
+
+std::pair<uint32_t, uint32_t> EmitWaveExchange(EmitterState& state, uint32_t value) {
+	if (!state.wave_split || state.wave_exchange_variable == 0 || InDivergentBlock(state)) {
+		EXIT("wave exchange outside a split wave64 program's uniform control flow: hash=0x%016" PRIx64 "\n",
+		     state.program.shader_hash);
+	}
+	const auto pointer_type = TypePointer(state, spv::StorageClassWorkgroup, TypeU32(state));
+	const auto slot         = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer,
+		                          state.wave_exchange_variable, index);
+		return pointer;
+	};
+	const auto workgroup = ConstantU32(state, spv::ScopeWorkgroup);
+	const auto barrier   = [&] {
+		state.builder.AddFunction(
+		    spv::OpControlBarrier, workgroup, workgroup,
+		    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+		                           spv::MemorySemanticsWorkgroupMemoryMask));
+	};
+	// Every invocation of the subgroup stores the same value, atomically so that it is no race.
+	state.builder.AddFunction(spv::OpAtomicStore, slot(EmitSubgroupId(state)), workgroup,
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+	barrier();
+	const auto load = [&](uint32_t index) {
+		const auto loaded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), loaded,
+		                          slot(ConstantU32(state, index)));
+		return loaded;
+	};
+	const auto low  = load(0);
+	const auto high = load(1);
+	barrier(); // the next exchange's stores come after both loads
+	return {low, high};
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (state.wave_split) {
+		// The guest lane: the subgroup's 32 invocations are lanes 0-31 or 32-63 of the wave.
+		return EmitAddU32(state, EmitHostSubgroupInvocationId(state),
+		                  EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitSubgroupId(state),
+		                                ConstantU32(state, 5)));
+	}
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -145,6 +210,9 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 }
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+	if (state.wave_split) {
+		return EmitSubgroupLocalInvocationId(state); // a workgroup of one wave
+	}
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);

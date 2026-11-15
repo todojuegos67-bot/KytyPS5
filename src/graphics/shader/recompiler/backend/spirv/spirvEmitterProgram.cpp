@@ -235,9 +235,8 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	using Op = IR::ValueOpcode;
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
-	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
-	     op == Op::SubgroupUMaxU32 || op == Op::SubgroupOrU32 || op == Op::ReadConstBuffer ||
-	     op == Op::ReadRealtimeClock ||
+	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::LaneReduceU32 ||
+	     op == Op::SubgroupReduceU32 || op == Op::ReadConstBuffer || op == Op::ReadRealtimeClock ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
@@ -479,6 +478,16 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
 	                          other_half == nullptr || half == 0 ? Def(predicate)
 	                                                             : other_half->Def(predicate));
+	if (state.wave_split) {
+		// Each subgroup's 32 bits are its lanes' part of the wave's mask.
+		const auto own = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), own, low, 0);
+		const auto [low_word, high_word] = EmitWaveExchange(state, own);
+		const auto ballot                = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
+		                          ConstantU32(state, 0), ConstantU32(state, 0));
+		return ballot;
+	}
 	if (other_half == nullptr) {
 		return low;
 	}
@@ -520,6 +529,19 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
+	if (state.wave_split) {
+		// The lane (the same in every invocation) is in one subgroup: that one's shuffle, exchanged.
+		if (type != TypeU32(state)) {
+			Fail(inst, "has a lane read of a type the split wave cannot exchange");
+		}
+		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
+		                          EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31)));
+		const auto [from_low, from_high] = EmitWaveExchange(state, low);
+		const auto in_high = Binary(state, spv::OpINotEqual, TypeBool(state),
+		                            EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32)),
+		                            ConstantU32(state, 0));
+		return Select(state, type, in_high, from_high, from_low);
+	}
 	if (other_half == nullptr) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
 		                          lane);

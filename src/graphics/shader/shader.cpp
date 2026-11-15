@@ -7,11 +7,13 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/upstreamPaths.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -21,10 +23,12 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -49,6 +53,8 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+static std::unordered_map<uint64_t, ShaderTessellationInputInfo>       g_tess_layouts;
+static std::mutex                                                      g_tess_layouts_mutex;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -87,6 +93,33 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {mapped, hash};
+}
+
+bool ShaderIsMapped(uint64_t addr) {
+	return ShaderMappedHash(addr) != 0;
+}
+
+uint32_t ShaderMappedCodeSize(uint64_t addr) {
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (g_shader_map == nullptr) return 0;
+	const auto found = g_shader_map->find(addr);
+	return found != g_shader_map->end() ? found->second.data.code_size_bytes : 0;
+}
+
+uint64_t ShaderMappedHash(uint64_t addr) {
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (g_shader_map == nullptr) return 0;
+	const auto found = g_shader_map->find(addr);
+	return found != g_shader_map->end() ? found->second.hash : 0;
+}
+
+bool ShaderVertexIsMesh(const HW::Context& context, const HW::VertexShaderInfo& regs) {
+	if ((context.GetShaderStages() & 0x20u) != 0) return true;
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (g_shader_map == nullptr) return false;
+	const auto found = g_shader_map->find(regs.es_regs.data_addr);
+	return found != g_shader_map->end() && found->second.data.type == Prospero::ShaderBinaryType::kGs &&
+	       regs.gs_regs.rsrc2.lds_size != 0;
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -286,6 +319,10 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
                                            ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 
+	// Upstream 8c1db95cd drops this reset: its callers value-initialize. Lean's draw state is reset only in part
+	// (TakeDrawRenderState) and the ahead scanner default-initializes, so lean keeps it unless the commit is named.
+	if (!KYTY_UPSTREAM_PATH("8c1db95cd")) info = {};
+
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
 	EXIT_NOT_IMPLEMENTED(shader_addr == 0);
@@ -332,6 +369,7 @@ static void ShaderGetStaticInputInfoPS(
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
+	if (!KYTY_UPSTREAM_PATH("8c1db95cd")) ps_info = {}; // see ShaderGetStaticVertexInputInfo
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 	ps_info.lds_size_dwords     = static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u;
 
@@ -376,6 +414,7 @@ static void ShaderGetStaticInputInfoPS(
 	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
 	     !sh.db_shader_control.shader_z_export_enable &&
 	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
+	ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
@@ -392,17 +431,29 @@ static void ShaderGetStaticInputInfoPS(
 }
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
+                                       const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
-	info.threads_num[0]      = regs.cs_regs.num_thread_x;
-	info.threads_num[1]      = regs.cs_regs.num_thread_y;
-	info.threads_num[2]      = regs.cs_regs.num_thread_z;
-	info.lds_size_dwords     = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
-	info.scratch_size_dwords = data.scratch_size_dwords;
-	info.float_mode          = regs.cs_regs.float_mode;
-	info.group_id[0]         = regs.cs_regs.tgid_x_en != 0;
-	info.group_id[1]         = regs.cs_regs.tgid_y_en != 0;
-	info.group_id[2]         = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size           = regs.cs_regs.wave_size;
+	const bool async_compute             = info.async_compute;
+	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
+	const auto host_subgroup_size         = info.host_subgroup_size;
+	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
+	const auto indirect_args_address      = info.indirect_args_address;
+	info                                  = {};
+	info.async_compute                    = async_compute;
+	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
+	info.host_subgroup_size               = host_subgroup_size;
+	std::ranges::copy(workgroup_counts, info.workgroup_counts);
+	info.indirect_args_address            = indirect_args_address;
+	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
+	info.threads_num[1]                   = regs.cs_regs.num_thread_y;
+	info.threads_num[2]                   = regs.cs_regs.num_thread_z;
+	info.lds_size_dwords                  = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
+	info.scratch_size_dwords              = data.scratch_size_dwords;
+	info.float_mode                       = regs.cs_regs.float_mode;
+	info.group_id[0]                      = regs.cs_regs.tgid_x_en != 0;
+	info.group_id[1]                      = regs.cs_regs.tgid_y_en != 0;
+	info.group_id[2]                      = regs.cs_regs.tgid_z_en != 0;
+	info.wave_size                        = regs.cs_regs.wave_size;
 	info.thread_ids_num      = regs.cs_regs.tidig_comp_cnt + 1;
 	info.tg_size_en          = regs.cs_regs.tg_size_en != 0;
 
@@ -548,6 +599,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
+	if (!KYTY_UPSTREAM_PATH("8c1db95cd")) info = {}; // see ShaderGetStaticVertexInputInfo
 	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
@@ -640,6 +692,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
+	if (!KYTY_UPSTREAM_PATH("8c1db95cd")) input_info = {}; // see ShaderGetStaticVertexInputInfo
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
 	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
@@ -664,6 +717,18 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
+	// Reflection decodes both programs; the key also covers the VGT fields cached in tess.
+	const uint64_t key[] = {local_hash, control_hash,
+	                        uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u | sh.m_vgtTfParam};
+	{
+		std::scoped_lock lock(g_tess_layouts_mutex);
+		auto [entry, inserted] = g_tess_layouts.try_emplace(XXH3_64bits(key, sizeof(key)), tess);
+		if (inserted) {
+			ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code,
+			                                              entry->second);
+		}
+		tess = entry->second;
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}
@@ -681,9 +746,10 @@ ShaderParams PrepareProgram(
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
 }
 
-ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& info) {
+ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+                            ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
-	ShaderGetStaticInputInfoCS(regs, data, info);
+	ShaderGetStaticInputInfoCS(regs, sh, data, info);
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
@@ -760,6 +826,7 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_no_perspective    = %s\n"
 	     "\t ps_pixel_kill_enable = %s\n"
 	     "\t ps_early_z           = %s\n"
+	     "\t ps_execute_on_noop   = %s\n"
 	     "\t lds_size_dwords      = %u\n",
 	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
 	     info.ps_perspective_center_vgpr, info.ps_perspective_sample_vgpr,
@@ -769,7 +836,7 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     info.ps_front_face_all_bits ? "true" : "false", info.ps_ancillary ? "true" : "false",
 	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
 	     info.ps_pixel_kill_enable ? "true" : "false", info.ps_early_z ? "true" : "false",
-	     info.lds_size_dwords);
+	     info.ps_execute_on_noop ? "true" : "false", info.lds_size_dwords);
 
 	for (uint32_t i = 0; i < info.input_num; i++) {
 		LOGF("\t interpolator_settings[%u] = %u\n", i, info.interpolator_settings[i]);

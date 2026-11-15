@@ -881,6 +881,11 @@ struct Instruction {
 	bool           image_r128                                   = false;
 	bool           image_cube                                   = false; // DIM is CUBE.
 	uint32_t       branch_target                                = 0;
+	// A V_MOVRELS_B32 whose waterfall loop was collapsed (CFG::CollapseWaterfallLoops) takes its
+	// register index from this VGPR of its own lane instead of M0. The index has these bits clear
+	// in every lane whose result is kept.
+	uint32_t movrel_index_vgpr      = UINT32_MAX;
+	uint32_t movrel_index_zero_bits = 0;
 	struct {
 		uint32_t target = 0;
 		uint32_t en     = 0;

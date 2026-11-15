@@ -113,14 +113,35 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	const auto native = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), native, GlslStd450(state),
+	                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
 	if (state.profile.native_float_min_max || state.profile.relaxed_float) {
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
-		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
-		return result;
+		return native;
 	}
-	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
-	                     EmitBitcastF32ToU32(state, rhs), max_value);
+	// NMin/NMax return the other source for one NaN source, as the guest does. What they leave open
+	// is set with integer operations, not the compares and selects of EmitMinMaxF32, which compile
+	// slower in a cold run: min(-0, +0) is -0, max(-0, +0) is +0, and two NaNs give S0's bits.
+	const auto lhs_bits = EmitBitcastF32ToU32(state, lhs);
+	const auto rhs_bits = EmitBitcastF32ToU32(state, rhs);
+	const auto bits     = EmitBitcastF32ToU32(state, native);
+	const auto either   = EmitOrU32(state, lhs_bits, rhs_bits);
+	// The sign bit when both are zeros, else 0: (|lhs| | |rhs|) - 1 has its top bit set only for 0.
+	const auto both_zero = EmitAndConstant(
+	    state, Binary(state, spv::OpISub, TypeU32(state), EmitAndConstant(state, either, 0x7fffffffu),
+	                  ConstantU32(state, 1)),
+	    0x80000000u);
+	const auto zero_bits = max_value
+	    // bits & ~(both_zero & ~(lhs & rhs)): +0 unless both are -0
+	    ? EmitAndU32(state, bits,
+	                 EmitOrU32(state, Binary(state, spv::OpBitwiseXor, TypeU32(state), both_zero,
+	                                         ConstantU32(state, 0xffffffffu)),
+	                           EmitAndU32(state, lhs_bits, rhs_bits)))
+	    // bits | (both_zero & (lhs | rhs)): -0 if either is
+	    : EmitOrU32(state, bits, EmitAndU32(state, both_zero, either));
+	// NMin/NMax give a NaN only when both sources are one.
+	const auto both_nan = Unary(state, spv::OpIsNan, TypeBool(state), native);
+	return EmitBitcastU32ToF32(state, EmitSelectValueU32(state, both_nan, lhs_bits, zero_bits));
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -148,7 +169,9 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto x        = Select(state, TypeF32(state), a_is_max, b, a);
 	const auto y =
 	    Select(state, TypeF32(state), EmitLogicalOrBool(state, a_is_max, b_is_max), c, b);
-	const auto median = EmitMinMaxF32Value(state, x, y, true);
+	// The compare-select form: the median keeps a denormal's exact bits, which NMax need not.
+	const auto median = EmitMinMaxF32(state, x, y, EmitBitcastF32ToU32(state, x),
+	                                  EmitBitcastF32ToU32(state, y), true);
 	const auto is_nan = [&](uint32_t value) {
 		return Unary(state, spv::OpIsNan, TypeBool(state), value);
 	};
