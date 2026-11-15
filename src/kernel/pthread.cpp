@@ -452,6 +452,7 @@ struct PthreadCondPrivate {
 	std::mutex              m;
 	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
 	std::vector<Pthread>    waiters;
+	std::atomic<uint32_t>   in_flight {0}; // waits still touching this: a signal takes them off `waiters` first
 };
 
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -505,6 +506,48 @@ static void SchedulerBackoffOnce() {
 #else
 	std::this_thread::yield();
 #endif
+}
+
+// Waits on cv until ready() or the deadline, dispatching pending signals. Windows ends
+// condition-variable waits on the system tick, up to ~1 ms late, which slowed a thread pacing
+// 5.33 ms audio grains with timed waits below real time (Bink video sound crackled). So the last
+// 2.5 ms are slept on the high-resolution timer in slices of at most 0.5 ms (a wake-up is seen
+// within a slice), and the last 0.3 ms yielded.
+template <class Ready>
+static void CondWaitUntil(std::unique_lock<std::mutex>& lock, std::condition_variable& cv,
+                          const Ready& ready, std::chrono::steady_clock::time_point deadline) {
+	constexpr auto coarse_margin = std::chrono::microseconds(2500);
+	constexpr auto yield_margin  = std::chrono::microseconds(300);
+	constexpr auto fine_slice    = std::chrono::microseconds(500);
+	while (!ready()) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			break;
+		}
+		const auto remaining = deadline - now;
+		if (remaining <= coarse_margin) {
+			lock.unlock();
+			if (remaining > yield_margin) {
+				Common::Thread::SleepMicro(static_cast<uint32_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(
+				        std::min<std::chrono::steady_clock::duration>(remaining - yield_margin,
+				                                                      fine_slice))
+				        .count()));
+			} else {
+				std::this_thread::yield();
+			}
+			lock.lock();
+			continue;
+		}
+		cv.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
+		                      remaining - coarse_margin,
+		                      std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		if (!ready()) {
+			lock.unlock();
+			KernelDispatchPendingSignalForCurrentThread();
+			lock.lock();
+		}
+	}
 }
 
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
@@ -2748,6 +2791,16 @@ int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
 
 	LOGF("\tcond destroy: %s, %d\n", (*cond)->name.c_str(), result);
 
+	{
+		std::lock_guard lock((*cond)->m);
+		if (!(*cond)->waiters.empty()) {
+			LOGF("\tcond destroy refused: waiters\n");
+			return KERNEL_ERROR_EBUSY;
+		}
+	}
+	while ((*cond)->in_flight.load() != 0) {
+		std::this_thread::yield();
+	}
 	delete *cond;
 	*cond = nullptr;
 
@@ -2866,6 +2919,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
+	cond_value->in_flight++;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -2874,6 +2928,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
 	if (result != OK) {
 		CondRemoveWaiter(cond_value, thread);
+		cond_lock.unlock();
+		cond_value->in_flight--;
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
@@ -2883,30 +2939,12 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	if (usec == 0) {
 		result = ETIMEDOUT;
 	} else {
-		while (!ready()) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				break;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			thread->cond_cv.wait_for(cond_lock, poll);
-
-			if (!ready()) {
-				cond_lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				cond_lock.lock();
-			}
-		}
-
+		CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 		result = (ready() ? OK : ETIMEDOUT);
 	}
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
+	cond_value->in_flight--; // before the guest mutex: a thread holding it may be destroying this
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
 	if (result == OK) {
@@ -2955,6 +2993,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
+	cond_value->in_flight++;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -2963,34 +3002,18 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
 	if (result != OK) {
 		CondRemoveWaiter(cond_value, thread);
+		cond_lock.unlock();
+		cond_value->in_flight--;
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
-	while (!ready()) {
-		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			break;
-		}
-
-		const auto remaining = deadline - now;
-		const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-		                            ? remaining
-		                            : std::chrono::steady_clock::duration(
-		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		thread->cond_cv.wait_for(cond_lock, poll);
-
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
-		}
-	}
-
+	CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 	result = (ready() ? OK : ETIMEDOUT);
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
+	cond_value->in_flight--; // before the guest mutex: a thread holding it may be destroying this
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
 	if (result == OK) {
@@ -3031,6 +3054,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
+	cond_value->in_flight++;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3039,6 +3063,8 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
 	if (result != OK) {
 		CondRemoveWaiter(cond_value, thread);
+		cond_lock.unlock();
+		cond_value->in_flight--;
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
@@ -3054,6 +3080,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
+	cond_value->in_flight--; // before the guest mutex: a thread holding it may be destroying this
 
 	result = NativeMutexLockRecurse(mutex_value, recurse);
 

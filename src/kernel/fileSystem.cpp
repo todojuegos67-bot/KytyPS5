@@ -102,6 +102,61 @@ private:
 static MountPoints*     g_mount_points = nullptr;
 static FileDescriptors* g_files        = nullptr;
 
+static bool IsAppPath(std::string_view path) {
+	path.remove_prefix(std::min(path.find_first_not_of('/'), path.size()));
+	return path == "app0" || path.starts_with("app0/");
+}
+
+static constexpr std::string_view SaveBackupSuffix = ".kybak";
+
+static std::vector<std::filesystem::path> FindSaveBackups(const std::filesystem::path& folder) {
+	std::vector<std::filesystem::path> backups;
+	std::error_code                    error;
+	for (const auto& entry: std::filesystem::recursive_directory_iterator(folder, error)) {
+		if (entry.path().extension() == SaveBackupSuffix) backups.push_back(entry.path());
+	}
+	return backups;
+}
+
+// Taken whole before it counts: a copy cut short must not replace the save at the next mount.
+static bool BackUpSaveFile(const std::filesystem::path& file) {
+	auto backup = file;
+	backup += SaveBackupSuffix;
+	std::error_code error;
+	if (std::filesystem::exists(backup, error)) return true; // the last committed contents
+	if (std::filesystem::file_size(file, error) == 0 || error) return !error;
+	auto part = backup;
+	part += ".part";
+	if (!std::filesystem::copy_file(file, part, std::filesystem::copy_options::overwrite_existing, error)) return false;
+	std::filesystem::rename(part, backup, error);
+	return !error;
+}
+
+void RestoreSaveBackups(const std::filesystem::path& folder) {
+	for (const auto& backup: FindSaveBackups(folder)) {
+		auto file = backup;
+		file.replace_extension();
+		std::error_code error;
+		std::filesystem::rename(backup, file, error);
+		LOGF("\tRestore save: %s, %s\n", Common::PathToString(file).c_str(), error ? "[fail]" : "[ok]");
+	}
+}
+
+void CommitSaveBackups(const std::filesystem::path& folder) {
+	for (const auto& backup: FindSaveBackups(folder)) {
+		auto file = backup;
+		file.replace_extension();
+		// shortcut: flushes only files that replaced earlier contents; a new file has nothing to lose yet.
+		Common::File saved;
+		if (saved.Open(file, Common::File::Mode::ReadWrite)) {
+			saved.Flush();
+			saved.Close();
+		}
+		std::error_code error;
+		std::filesystem::remove(backup, error);
+	}
+}
+
 static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
 }
@@ -150,6 +205,7 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 	uint64_t             last_reclen_offset = 0;
 	for (const auto& entry: entries) {
 		const auto& name = entry.name;
+		if (name.ends_with(SaveBackupSuffix) || name.ends_with(".kybak.part")) continue; // ours, not the guest's
 		EXIT_NOT_IMPLEMENTED(name.size() > 255);
 		const auto reclen = AlignUp(8 + name.size() + 1, 4);
 		if (offset + reclen > dirents.size()) {
@@ -388,6 +444,11 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		}
 
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
+		// A guest path never leaves its mount: callers answer an empty path with ENOENT.
+		const auto normal = native_rel_path.lexically_normal();
+		if (normal.is_absolute() || normal.has_root_name() || (!normal.empty() && *normal.begin() == "..")) {
+			return {};
+		}
 		if (Common::IsArchivePath(p.dir)) {
 			return p.dir / native_rel_path;
 		}
@@ -516,7 +577,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
 	}
-	if (Common::IsArchivePath(file->real_name) &&
+	if ((Common::IsArchivePath(file->real_name) || IsAppPath(file->name)) &&
 	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_EROFS;
@@ -564,6 +625,11 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		if (excl && creat && file_exist) {
 			g_files->DeleteDescriptor(descriptor);
 			return KERNEL_ERROR_EEXIST;
+		}
+
+		if (trunc && file_exist && file->name.starts_with("/savedata") && !BackUpSaveFile(file->real_name)) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_ENOSPC;
 		}
 
 		if (creat && (!file_exist || trunc)) {
@@ -728,6 +794,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 	if (d == 1 || d == 2) {
 		auto*      out      = (d == 1 ? stdout : stderr);
+		Memory::CommitGuestRange(reinterpret_cast<uint64_t>(buf), nbytes);
 		const auto written  = std::fwrite(buf, 1, nbytes, out);
 		const auto flush_ok = std::fflush(out) == 0;
 
@@ -767,6 +834,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (file->append) {
 		file->f.Seek(file->f.Size());
 	}
+	Memory::CommitGuestRange(reinterpret_cast<uint64_t>(buf), nbytes); // WriteFile fails on a reserved page
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
 	if (file->sync_writes) {
@@ -778,6 +846,10 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");
 		return KERNEL_ERROR_EIO;
+	}
+	if (bytes_written == 0 && nbytes != 0) {
+		LOGF("\tnothing written to: %s\n", Common::PathToString(file->real_name).c_str());
+		return KERNEL_ERROR_ENOSPC;
 	}
 
 	LOGF("\tWrite %u bytes to: %s\n", bytes_written, Common::PathToString(file->real_name).c_str());
@@ -984,6 +1056,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	auto     pos           = file->f.Tell();
 	uint32_t bytes_written = 0;
 	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
+	Memory::CommitGuestRange(reinterpret_cast<uint64_t>(buf), nbytes); // WriteFile fails on a reserved page
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
 	if (file->sync_writes) {
@@ -1056,6 +1129,7 @@ static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<i
 			continue;
 		}
 		uint32_t bytes = 0;
+		Memory::CommitGuestRange(reinterpret_cast<uint64_t>(buffer.iov_base), buffer.iov_len);
 		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes);
 		bytes_written += bytes;

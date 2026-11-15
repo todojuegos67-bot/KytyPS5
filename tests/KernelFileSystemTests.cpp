@@ -156,6 +156,51 @@ void *KYTY_SYSV_ABI RunMutexWaiter(void *arg) {
   return nullptr;
 }
 
+struct CondWaiter {
+  Libs::LibKernel::PthreadCond cond = nullptr;
+  Libs::LibKernel::PthreadMutex mutex = nullptr;
+  Libs::LibKernel::Pthread thread = nullptr;
+  std::vector<uint8_t> stack = std::vector<uint8_t>(1024 * 1024);
+  std::atomic<bool> waiting{false}, finished{false};
+};
+
+void *KYTY_SYSV_ABI RunCondWaiter(void *arg) {
+  using namespace Libs::LibKernel;
+  auto &waiter = *static_cast<CondWaiter *>(arg);
+  Check(PthreadMutexLock(&waiter.mutex) == OK, "condition waiter locks the mutex");
+  waiter.waiting = true;
+  Check(PthreadCondWait(&waiter.cond, &waiter.mutex) == OK, "condition wait ends in a signal");
+  Check(PthreadMutexUnlock(&waiter.mutex) == OK, "condition waiter unlocks the mutex");
+  waiter.finished = true;
+  return nullptr;
+}
+
+// Destroying a condition variable with a waiter still on it is refused; right after the signal, even with the
+// mutex the waiter needs next held, it waits for the waiter to have left.
+void TestCondDestroy() {
+  using namespace Libs::LibKernel;
+  CondWaiter waiter;
+  PthreadAttr attr = nullptr;
+  Check(PthreadCondInit(&waiter.cond, nullptr, "CondDestroy") == OK &&
+            PthreadMutexInit(&waiter.mutex, nullptr, "CondDestroy") == OK &&
+            PthreadAttrInit(&attr) == OK &&
+            PthreadAttrSetstack(&attr, waiter.stack.data(), waiter.stack.size()) == OK &&
+            PthreadCreate(&waiter.thread, &attr, RunCondWaiter, &waiter, "CondTest") == OK &&
+            PthreadAttrDestroy(&attr) == OK,
+        "create condition waiter");
+  WaitForMutexTest([&] { return waiter.waiting.load(); });
+  // It lets the mutex go only inside the wait.
+  Check(PthreadMutexLock(&waiter.mutex) == OK, "the waiter is in its wait");
+  Check(PthreadCondDestroy(&waiter.cond) == Libs::LibKernel::KERNEL_ERROR_EBUSY && waiter.cond != nullptr,
+        "destroy with a waiter on the condition variable is refused");
+  Check(PthreadCondSignal(&waiter.cond) == OK && PthreadCondDestroy(&waiter.cond) == OK &&
+            waiter.cond == nullptr,
+        "destroy right after the signal succeeds");
+  Check(PthreadMutexUnlock(&waiter.mutex) == OK && PthreadJoin(waiter.thread, nullptr) == OK &&
+            waiter.finished.load() && PthreadMutexDestroy(&waiter.mutex) == OK,
+        "the waiter leaves a destroyed condition variable cleanly");
+}
+
 void QueueMutexWaiter(MutexWaiter &waiter) {
   using namespace Libs::LibKernel;
   PthreadAttr attr = nullptr;
@@ -225,6 +270,7 @@ void TestMutexHandoff() {
   }
   Check(PthreadMutexattrDestroy(&attr) == OK, "destroy recursive mutex attributes");
 
+#if !defined(_WIN32) // winpthread's pthread_exit unwinds, and Windows refuses that on a stack it didn't allocate
   PthreadMutex mutex = nullptr;
   Check(PthreadMutexInit(&mutex, nullptr, "MutexCancel") == OK &&
             PthreadMutexLock(&mutex) == OK &&
@@ -249,6 +295,9 @@ void TestMutexHandoff() {
   Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
             PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
         "mutex remains usable after waiter cancellation");
+#else
+  Check(remove(30) == OK, "remove mutex test signal");
+#endif
 }
 
 int dispatched_signals = 0;
@@ -743,6 +792,45 @@ void TestStatTimes() {
   Check(FileSystem::KernelClose(fd) == OK, "close stat time fixture");
 }
 
+void TestSaveBackup(const std::filesystem::path &root) {
+  constexpr char Path[] = "/savedata0/backed-up.dat";
+  const auto file = root / "backed-up.dat";
+  const auto backup = root / "backed-up.dat.kybak";
+  const auto write = [&](int flags, std::string_view text) {
+    const int fd = FileSystem::KernelOpen(Path, flags, 0777);
+    Check(fd >= 3 && FileSystem::KernelWrite(fd, text.data(), text.size()) == text.size() &&
+              FileSystem::KernelClose(fd) == OK,
+          "write a save file");
+  };
+  const auto contents = [&] {
+    Common::File saved;
+    Check(saved.Open(file, Common::File::Mode::Read), "open the save file");
+    const auto bytes = saved.ReadWholeBuffer();
+    return std::string(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+  };
+  const auto listed = [&](std::string_view name) {
+    const int fd = FileSystem::KernelOpen("/savedata0", 0x00020000, 0);
+    std::vector<char> entries(65536);
+    const int size = FileSystem::KernelGetdents(fd, entries.data(), entries.size());
+    Check(size > 0 && FileSystem::KernelClose(fd) == OK, "list the save folder");
+    return std::string_view(entries.data(), size).find(name) != std::string_view::npos;
+  };
+  write(0x601, "committed");
+  Check(!std::filesystem::exists(backup), "a new save file has nothing to keep");
+  write(0x601, "half");
+  Check(std::filesystem::exists(backup) && contents() == "half" && listed("backed-up.dat") && !listed(".kybak"),
+        "a truncated save file is kept, out of the guest's sight");
+  write(0x601, "again");
+  FileSystem::RestoreSaveBackups(root);
+  Check(contents() == "committed" && !std::filesystem::exists(backup),
+        "a mount after a run that ended within a save restores the last committed contents");
+  write(0x601, "next");
+  FileSystem::CommitSaveBackups(root);
+  Check(contents() == "next" && !std::filesystem::exists(backup), "a commit keeps the new contents");
+  FileSystem::RestoreSaveBackups(root);
+  Check(contents() == "next", "a mount after a commit changes nothing");
+}
+
 void TestFsync() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
@@ -1134,6 +1222,21 @@ void CheckMountRoot(const std::filesystem::path &root) {
         "resolve mount descendant");
   Check(FileSystem::GetRealFilename("/app01/rpf.cache").empty(),
         "mount prefix must end at a path component");
+  std::vector<std::string> outside {"/app0/../outside.bin", "/app0/sub/../../outside.bin"};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  outside.push_back("/app0/" + (root.parent_path() / "outside.bin").string()); // a drive letter
+#endif
+  for (const auto &path : outside) {
+    Check(FileSystem::GetRealFilename(path).empty() &&
+              FileSystem::KernelOpen(path.c_str(), 0, 0) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+          "a folder mount's guest path stays inside it");
+  }
+  Check(FileSystem::GetRealFilename("/app0/sub/../rpf.cache") == root / "sub/../rpf.cache",
+        "a path that stays inside the mount still resolves");
+  Check(FileSystem::KernelOpen("/app0/new.bin", 0x601, 0777) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelOpen("/app0/rpf.cache", 0x2, 0) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelOpen("//app0/new.bin", 0x201, 0777) == Libs::LibKernel::KERNEL_ERROR_EROFS,
+        "/app0 is read-only");
 
   for (const char *path : {"/app0", "/app0/"}) {
     for (const int flags : {0, 0x00020000}) {
@@ -1577,6 +1680,32 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
     std::array<uint64_t, 5> header {};
     std::array<uint32_t, 256> data {};
   };
+  // A batch that waits for nothing has run when its submission returns, also while another thread runs one inline.
+  {
+    std::atomic<bool> stop{false};
+    const auto submit_write = [&](Buffer &buffer, volatile uint64_t *fence, uint64_t value) {
+      uint32_t id = 0;
+      construct(buffer.header.data());
+      construct_amm(buffer.header.data());
+      Check(set_buffer(buffer.header.data(), buffer.data.data(), sizeof(Buffer::data)) == OK &&
+                write_address(buffer.header.data(), fence, value) == OK &&
+                submit_amm(buffer.data.data(), static_cast<uint32_t>(offset(buffer.header.data())), 0, &id) == OK,
+            "submit a wait-free AMM batch");
+    };
+    std::thread other([&] {
+      Buffer buffer;
+      volatile uint64_t fence = 0;
+      for (uint64_t value = 1; !stop.load(); value++) submit_write(buffer, &fence, value);
+    });
+    Buffer buffer;
+    for (uint64_t value = 1; value <= 20000; value++) {
+      volatile uint64_t fence = 0;
+      submit_write(buffer, &fence, value);
+      Check(fence == value, "a wait-free AMM batch ran before its submission returned");
+    }
+    stop = true;
+    other.join();
+  }
   std::array<Buffer, 4> buffers;
   const auto reset = [&](size_t apr_count, uint32_t data_size = sizeof(Buffer::data)) {
     for (size_t i = 0; i < buffers.size(); ++i) {
@@ -1796,6 +1925,29 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   for (auto &buffer : buffers) {
     destroy(buffer.header.data());
   }
+}
+
+// CheckAmprOrdering without the path checks before it.
+void CheckAmprOrderingAlone(const std::filesystem::path &root) {
+  Loader::SymbolDatabase symbols;
+  Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
+  const auto *resolve_symbol = symbols.FindByNid("w5fcCG+t31g", Loader::SymbolType::Func);
+  Check(resolve_symbol != nullptr, "APR path exports are registered");
+  using Resolve = int (KYTY_SYSV_ABI *)(const char *, const char *const *, uint32_t,
+                                      uint32_t *, uint64_t *, uint32_t *);
+  Common::File fixture;
+  Check(fixture.Create(root / "ampr-alone.dat"), "create APR fixture");
+  fixture.Write("APR", 3);
+  fixture.Close();
+  FileSystem::Mount(root, "/app0");
+  const char *path = "ampr-alone.dat";
+  uint32_t    id = 0xffffffffu, error_index = 0;
+  uint64_t    size = 0;
+  Check(reinterpret_cast<Resolve>(resolve_symbol->vaddr)("/app0/", &path, 1, &id, &size, &error_index) == OK && size == 3,
+        "APR resolves its fixture");
+  SetUnixWriteTime(root / "ampr-alone.dat", 1700000000123456700);
+  CheckAmprOrdering(symbols, id);
+  FileSystem::Umount("/app0");
 }
 
 void CheckAprPaths(const std::filesystem::path &root) {
@@ -2827,6 +2979,7 @@ int main(int argc, char** argv) {
   }
 
   TestMutexHandoff();
+  TestCondDestroy();
   TestStaticRwlockDestroy();
   TestPendingSignalDispatch();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
@@ -2845,6 +2998,19 @@ int main(int argc, char** argv) {
   graphics->CreateVulkan();
 
   TempDirectory temporary;
+  // What runs on Windows today, in ctest there (kernel_fs_core): the full list stops at the next line, on an exception.
+  if (argc == 2 && std::string_view(argv[1]) == "--core-cases") {
+    FileSystem::Initialize();
+    CheckMountRoot(temporary.Path());
+    FileSystem::Mount(temporary.Path(), "/savedata0");
+    TestSaveBackup(temporary.Path());
+    FileSystem::Umount("/savedata0");
+    CheckAmprOrderingAlone(temporary.Path());
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: core cases passed\n");
+    return 0;
+  }
   CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
   TestSysmoduleReferences();
@@ -2861,6 +3027,7 @@ int main(int argc, char** argv) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestSaveBackup(temporary.Path());
   TestStatTimes();
   TestFsync();
   TestSaveTruncate();

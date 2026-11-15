@@ -62,6 +62,10 @@ int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb);
 bool                  IsOpenDescriptor(int d);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
+// Save data is overwritten in place, so opening a save file to truncate it first keeps it as <name>.kybak. The copy
+// lasts until the save's commit or unmount; one still there at a mount means the run ended within a save.
+void RestoreSaveBackups(const std::filesystem::path& folder);
+void CommitSaveBackups(const std::filesystem::path& folder);
 int KYTY_SYSV_ABI     KernelClose(int d);
 int KYTY_SYSV_ABI     KernelFcntl(int d, int command, int arg);
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes);
