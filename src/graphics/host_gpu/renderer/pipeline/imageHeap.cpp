@@ -267,6 +267,7 @@ void ImageHeap::Unwatch(const Memory& memory) {
 }
 
 void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
+	g_caches_touched.fetch_add(1, std::memory_order_relaxed);
 	std::scoped_lock lock {m_mutex};
 	for (auto& memory: m_memories) {
 		// Watches cover whole pages, so a write next to the table must unwatch its page too.
@@ -369,7 +370,7 @@ void ImageHeap::Release(View& view, uint32_t entry) {
 void ImageHeap::Unreference(Element& element) {
 	if (auto* image = ImageOf(element)) {
 		image->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
-		image->tick_accessed_last = m_context.GetTextureCache().m_gc_tick;
+		image->tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
 	}
 }
 
@@ -542,8 +543,9 @@ void ImageHeap::WriteDescriptors() {
 		writes[write].descriptorType  = vk::DescriptorType::eSampledImage;
 		writes[write].pImageInfo      = &infos.back();
 	}
-	m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
-	                                                    writes.data(), 0, nullptr);
+	// In the command order with the recording thread (design rule 5).
+	m_context.GetCommandScheduler().Recorder().UpdateDescriptorSets(
+	    m_context.GetGraphics().device, static_cast<uint32_t>(writes.size()), writes.data());
 	m_writes.clear();
 }
 
@@ -581,13 +583,18 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead,
 			               ImageSubresourceRange {view_info.base_level, view_info.level_count,
 			                                      view_info.base_layer, view_info.layer_count},
-			               buffer.Handle());
+			               buffer.Recorder());
 			return true;
 		});
 	}
 	m_active.clear();
-	buffer.Handle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
+	buffer.Recorder().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
 	                                   nullptr);
+}
+
+bool ImageHeap::Empty() {
+	std::scoped_lock lock {m_mutex};
+	return m_memories.empty();
 }
 
 void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {

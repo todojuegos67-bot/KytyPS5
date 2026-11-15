@@ -47,6 +47,8 @@ public:
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// No table: an unmap has nothing to drop or bury. From any thread.
+	[[nodiscard]] bool Empty();
 	// At a suspend point.
 	void RunGarbageCollector();
 

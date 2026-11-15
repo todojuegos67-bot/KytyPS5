@@ -10,13 +10,15 @@ struct ShaderStageRuntime;
 
 vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
+vk::MemoryBarrier       MakeShaderAccessDependency();
+vk::MemoryBarrier       MakeShaderWriteHazardDependency();
 vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+void ShaderAccessBarrier(Cmd vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteHazardBarrier(Cmd                    vk_buffer,
                               vk::PipelineStageFlags destination_stages);
-void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteBarrier(Cmd vk_buffer, vk::PipelineStageFlags source_stages);
 
 } // namespace Libs::Graphics
 
