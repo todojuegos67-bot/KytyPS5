@@ -35,3 +35,6 @@ Kyty's additions and changes:
   `<cwchar>`, `<locale>`, `<bit>`), so FSR 3.1 builds on Linux and macOS.
 - `sdk/include/FidelityFX/host/ffx_types.h`: `FFX_SDK_DEFAULT_CONTEXT_SIZE` is twice as large outside Windows, where
   `wchar_t` is 4 bytes and the upscaler and frame interpolation contexts outgrow 128 Ki `uint32_t` (marked "Kyty:").
+- `sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp`, `queuePresent`: a present that
+  acquired no image (out of date while the window is minimised) also signals `presentSemaphore`, as the presenter
+  thread does; else `waitForPresents` waits forever at the next frame generation switch (marked "Kyty:").

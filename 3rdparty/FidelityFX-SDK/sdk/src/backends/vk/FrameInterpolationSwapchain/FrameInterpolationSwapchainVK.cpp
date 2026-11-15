@@ -2685,6 +2685,11 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
         {
             // no image was acquired. Skip present. Just signal the replacement buffer semaphore for it to be used at a later point
             gameQueueSignal.add(presentInfo.replacementBufferSemaphore, ++framesSentForPresentation);
+            // Kyty: and the present semaphore, as the presenter thread does for a skipped present. waitForPresents
+            // waits for it to reach framesSentForPresentation; left behind, it never does (a minimised window's
+            // acquire fails out of date on every present, then the first frame generation enable hangs).
+            gameQueueSignal.add(presentInfo.presentSemaphore, framesSentForPresentation);
+            presentInfo.lastPresentSemaphoreValue = framesSentForPresentation;
             presentInfo.gameQueue.submit(VK_NULL_HANDLE, gameQueueWait, gameQueueSignal);
         }
     }
