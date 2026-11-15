@@ -77,7 +77,13 @@
 #define FFX_API __declspec(dllexport)
 #endif // #if defined (FFX_GCC)
 
+// Kyty: wchar_t is 4 bytes outside Windows, which makes the contexts' wchar_t names twice as large; the FSR 3.1
+// upscaler and frame interpolation contexts then pass 128 Ki uint32_t (837,848 and 768,072 bytes on Linux).
+#if defined(_WIN32)
 #define FFX_SDK_DEFAULT_CONTEXT_SIZE (1024 * 128)
+#else
+#define FFX_SDK_DEFAULT_CONTEXT_SIZE (1024 * 256)
+#endif
 
 /// Maximum supported number of simultaneously bound SRVs.
 ///

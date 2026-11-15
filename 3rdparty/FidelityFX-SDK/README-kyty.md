@@ -30,3 +30,8 @@ Kyty's additions and changes:
 - `sdk/src/backends/vk/ffx_vk.cpp`, `CreateBackendContextVK`: loads `vkGetBufferMemoryRequirements2` by its core name. The
   breadcrumbs setup calls it on every backend context, and the KHR name is null on a device that doesn't enable
   `VK_KHR_get_memory_requirements2`, as Kyty's doesn't (marked "Kyty:").
+- `kyty/ffx_portable.h`, force-included into every FidelityFX source outside MSVC: the MSVC CRT names the SDK's
+  portable code calls (`_countof`, `wcscpy_s`, `strcpy_s`, `sprintf_s`) and the headers it leaves out (`<cstring>`,
+  `<cwchar>`, `<locale>`, `<bit>`), so FSR 3.1 builds on Linux and macOS.
+- `sdk/include/FidelityFX/host/ffx_types.h`: `FFX_SDK_DEFAULT_CONTEXT_SIZE` is twice as large outside Windows, where
+  `wchar_t` is 4 bytes and the upscaler and frame interpolation contexts outgrow 128 Ki `uint32_t` (marked "Kyty:").

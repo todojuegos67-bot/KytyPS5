@@ -210,7 +210,8 @@ if(MSVC)
 	set_source_files_properties(${ffx_fi_swapchain_src} PROPERTIES
 		COMPILE_OPTIONS "/FI${ffx_dir}/kyty/ffx_vk_fi_loader.h")
 else()
-	target_compile_options(fidelityfx_fsr3 PRIVATE -w -include bit)
+	# ffx_portable.h: <bit>, plus the MSVC CRT names (_countof, wcscpy_s, ...) the SDK's portable code calls.
+	target_compile_options(fidelityfx_fsr3 PRIVATE -w -include "${ffx_dir}/kyty/ffx_portable.h")
 	set_source_files_properties("${ffx_dir}/sdk/src/backends/vk/ffx_vk.cpp" PROPERTIES
 		COMPILE_OPTIONS "-include;${ffx_dir}/kyty/ffx_vk_loader.h")
 endif()
