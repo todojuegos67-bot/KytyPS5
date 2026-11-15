@@ -38,7 +38,8 @@ enum class Kind : u8 {
 
 /// BB_GPU_PROFILE >= 1 (read once).
 bool On();
-/// BB_GPU_PROFILE value (0 off, 1 on).
+/// BB_GPU_PROFILE value: 0 off, 1 per pass, 2 submits only, 3 per pass with a drain barrier
+/// before each scope (exact own cost, serialized GPU).
 int Level();
 
 /// Creates the query pool (once; needs hostQueryReset). Safe to call repeatedly.
