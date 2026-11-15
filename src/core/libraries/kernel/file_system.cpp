@@ -358,7 +358,10 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
 
     file->is_opened = true;
     if (BB::ObjCol::Enabled() && file->type == Core::FileSys::FileType::Regular) {
-        BB::ObjCol::OnGuestFileOpen(file->m_guest_name.c_str(), nullptr);
+        const auto host = file->handle ? file->handle->GetHostPath() : std::nullopt;
+        BB::ObjCol::OnGuestFileOpen(file->m_guest_name.c_str(),
+                                    host ? host->string().c_str() : nullptr,
+                                    file->handle ? file->handle->Size() : 0);
     }
     return handle;
 }

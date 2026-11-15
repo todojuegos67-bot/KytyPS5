@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <fmt/format.h>
 #include <zlib.h>
@@ -312,9 +314,9 @@ const char* KindName(Kind k) {
     case Kind::NoPhysics:
         return "no collision data";
     case Kind::Solid:
-        return "static-solid";
+        return "solid (no fragment hkx)";
     case Kind::Destructible:
-        return "destructible/physics";
+        return "breakable (_1.hkx fragments)";
     case Kind::Failed:
         return "not parsed";
     default:
@@ -362,11 +364,10 @@ std::string g_map = "(boot)";
 std::vector<int> g_map_models;
 std::unordered_map<u64, World> g_worlds;
 std::vector<Range> g_ranges;
-std::set<u64> g_no_owner_blocks;
 u64 g_eboot = 0;
 u32 g_body_lines = 0;
 std::atomic<bool> g_hooked{false};
-u64 st_calls[3] = {}, st_bodies = 0, st_owned = 0, st_bad_id = 0, st_removed = 0, st_scans = 0;
+u64 st_calls[3] = {}, st_bodies = 0, st_owned = 0, st_bad_id = 0, st_removed = 0;
 double g_last_summary = 0.0;
 std::string g_last_summary_text;
 
@@ -459,7 +460,7 @@ void Analyse(const Job& job) {
                                   : "other";
             files += fmt::format(" {}({} {} KB)", e.name, cls, (n + 1023) / 1024);
             physics = physics || phys;
-            breakable = breakable || brk;
+            breakable = breakable || brk || (phys && lower.ends_with("_1.hkx"));
         }
         kind = !physics ? Kind::NoPhysics : breakable ? Kind::Destructible : Kind::Solid;
         if (files.empty()) {
@@ -497,22 +498,6 @@ void Worker() {
 
 // ---------------------------------------------------------------- owner of a shape
 
-void AddRanges(u64 base, const std::vector<BndEntry>& entries) {
-    std::string id;
-    for (const auto& e : entries) {
-        if (id.empty()) {
-            id = ModelId(e.name);
-        }
-    }
-    if (id.empty()) {
-        return;
-    }
-    const int model = ModelFor(id);
-    for (const auto& e : entries) {
-        g_ranges.push_back({base + e.offset, base + e.offset + e.size, model});
-    }
-}
-
 int LookupRange(u64 addr) {
     for (auto it = g_ranges.rbegin(); it != g_ranges.rend(); ++it) {
         if (addr >= it->lo && addr < it->hi) {
@@ -522,59 +507,10 @@ int LookupRange(u64 addr) {
     return -1;
 }
 
-// The game keeps each objbnd in memory and loads its .hkx in place: the shape lies inside a
-// binder entry. Scans back from the shape for a BND4 header whose entry contains it.
+// Field run 1 (ba42d5e98): no shape lay inside an in-memory binder (the .hkx is not loaded in
+// place), so binder attribution is off; '[objcol] player' lines attribute by position instead.
 int OwnerOf(u64 shape) {
-    if (shape == 0) {
-        return -1;
-    }
-    if (const int m = LookupRange(shape); m >= 0) {
-        return m;
-    }
-    const u64 block = shape >> 18;
-    if (g_no_owner_blocks.contains(block)) {
-        return -1;
-    }
-    ++st_scans;
-    constexpr u64 Chunk = 0x40000, Window = 0x1000000;
-    static std::vector<u8> buf(Chunk);
-    static std::vector<u8> head(0x10000);
-    u64 top = shape & ~u64(15);
-    int candidates = 0;
-    for (u64 scanned = 0; scanned < Window && top > Chunk && candidates < 6;) {
-        const u64 lo = top - Chunk;
-        if (!SafeCopy(buf.data(), lo, Chunk)) {
-            break;
-        }
-        for (s64 off = s64(Chunk) - 16; off >= 0; off -= 16) {
-            if (std::memcmp(buf.data() + off, "BND4", 4) != 0) {
-                continue;
-            }
-            const u64 b = lo + u64(off);
-            ++candidates;
-            const u64 n = std::min<u64>(head.size(), shape - b);
-            std::vector<BndEntry> entries;
-            if (n >= 0x40 && SafeCopy(head.data(), b, n) && ParseBnd4(head.data(), n, entries)) {
-                for (const auto& e : entries) {
-                    if (shape >= b + e.offset && shape < b + e.offset + e.size) {
-                        AddRanges(b, entries);
-                        const int m = LookupRange(shape);
-                        if (m < 0) {
-                            g_no_owner_blocks.insert(block);
-                        }
-                        return m;
-                    }
-                }
-            }
-            if (candidates >= 6) {
-                break;
-            }
-        }
-        top = lo;
-        scanned += Chunk;
-    }
-    g_no_owner_blocks.insert(block);
-    return -1;
+    return shape == 0 ? -1 : LookupRange(shape);
 }
 
 // ---------------------------------------------------------------- bodies
@@ -633,7 +569,6 @@ void Census(u64 world, World& w) {
     }
     const double now = Now();
     std::unordered_map<u32, double> still;
-    int scans = 0;
     for (s32 id = 0; id < n; ++id) {
         BodyBytes bb;
         std::memcpy(bb.b, all.data() + size_t(id) * 0x90, 0x90);
@@ -659,12 +594,8 @@ void Census(u64 world, World& w) {
             continue;
         }
         int owner = it != w.bodies.end() && it->second.shape == shape ? it->second.owner : -1;
-        if (owner < 0 && (flags & 1) && scans < 16) {
-            owner = LookupRange(shape);
-            if (owner < 0 && !g_no_owner_blocks.contains(shape >> 18)) {
-                ++scans;
-                owner = OwnerOf(shape);
-            }
+        if (owner < 0 && (flags & 1)) {
+            owner = OwnerOf(shape);
         }
         const auto prev = w.unadded_since.find(u32(id));
         const double since = prev != w.unadded_since.end() ? prev->second : now;
@@ -682,9 +613,13 @@ void Census(u64 world, World& w) {
             u64 vt = 0;
             Rd(shape, vt);
             LOG_INFO(Core,
-                     "[objcol] static body {} (no objbnd owner, shape vtable eboot+{:#x}) layer {} "
-                     "filter {:#x} at ({:.1f}, {:.1f}, {:.1f}) exists but is not in the world",
-                     id, vt - g_eboot, bb.Layer(), bb.Filter(), bb.Pos(0), bb.Pos(1), bb.Pos(2));
+                     "[objcol] static body {} (shape vtable eboot+{:#x}) layer {} filter {:#x} at "
+                     "({:.1f}, {:.1f}, {:.1f}) exists but is not in the world ({})",
+                     id, vt - g_eboot, bb.Layer(), bb.Filter(), bb.Pos(0), bb.Pos(1), bb.Pos(2),
+                     it == w.bodies.end() || it->second.shape != shape ? "never added"
+                     : it->second.state == State::Removed              ? "removed"
+                     : it->second.state == State::Deferred ? "add deferred, not committed"
+                                                           : "add ignored");
         }
     }
     w.unadded_since = std::move(still);
@@ -757,19 +692,22 @@ void Summary(bool force) {
             ignored.push_back(fmt::format("{}x{}", tag, m.noop));
         }
     }
+    const std::string per_object =
+        st_owned == 0
+            ? std::string("per-object body attribution unavailable (see '[objcol] player' lines)")
+            : fmt::format("in the Havok world: solid {}/{}, breakable {}/{} | MISSING: no body "
+                          "ever added: {} | created but not in the world (10 s+): {} | added "
+                          "then removed: {} | add ignored (mode 0): {}",
+                          solid_ok, solid, destr_ok, destr, Join(never, 40), Join(unadded, 40),
+                          Join(removed, 40), Join(ignored, 20));
     const std::string text = fmt::format(
-        "[objcol] map {}: objbnds {} (static-solid {}, destructible {}, no collision data {}, "
-        "not parsed {}) | in the Havok world: static-solid {}/{}, destructible {}/{} | MISSING "
-        "solid objects: no body ever added: {} | created but not in the world (10 s+): {} | "
-        "added then removed by the game: {} | add ignored (mode 0): {} | not parsed: {} | static "
-        "bodies without an objbnd owner not in the world: {} | bodies added {} (binder known {}), "
-        "add calls immediate {} deferred {} ignored {}, removes {}, bad ids {}, owner scans {}, "
-        "worlds {}, hooks {}",
-        g_map, objbnds, solid, destr, nophys, failed, solid_ok, solid, destr_ok, destr,
-        Join(never, 40), Join(unadded, 40), Join(removed, 40), Join(ignored, 20),
-        Join(failed_ids, 20), g_unowned_unadded, st_bodies, st_owned, st_calls[1], st_calls[2],
-        st_calls[0], st_removed, st_bad_id, st_scans, g_worlds.size(),
-        g_hooked.load() ? "on" : "off");
+        "[objcol] map {}: objbnds {} (solid {}, breakable {}, no collision data {}, not parsed "
+        "{}: {}) | {} | static bodies created but not in the world (10 s+): {} | bodies added {} "
+        "(binder known {}), add calls immediate {} deferred {} ignored {}, removes {}, bad ids "
+        "{}, worlds {}, hooks {}",
+        g_map, objbnds, solid, destr, nophys, failed, Join(failed_ids, 20), per_object,
+        g_unowned_unadded, st_bodies, st_owned, st_calls[1], st_calls[2], st_calls[0], st_removed,
+        st_bad_id, g_worlds.size(), g_hooked.load() ? "on" : "off");
     const std::string key = text.substr(0, text.find(" | bodies added"));
     if (!force && key == g_last_summary_text) {
         return;
@@ -910,6 +848,339 @@ void PS4_SYSV_ABI HookRemove(const u64* regs) {
     GuardedRemove(regs);
 }
 
+// ---------------------------------------------------------------- player proximity
+//   0xb2f010 hknpCharacterProxy::integrate(proxy, ...) (Havok timer "LtCharacterProxyIntegrate"):
+//            proxy+0x30 body id, +0x34 collision filter info of its queries, +0x38 world,
+//            +0x40 position; its shape casts use the filter object [[world+0x150]+0x5e8].
+//   0x553e878 WorldChrMan (1.09, checked against the code that names it); [WorldChrMan+0x60]
+//            is its most used member (109 of ~600 sampled uses) and is taken as the local
+//            player: the player's proxy is found from it by a bounded pointer search.
+
+constexpr u64 WorldChrManVaddr = 0x553e878;
+constexpr u64 WorldChrManUse = 0x1222ee3; // lea r15,[rip+WorldChrMan]; ...; lea rcx,"WorldChrMan"
+
+u64 g_wcm = 0;
+std::unordered_map<u64, double> g_proxies;
+std::vector<u32> g_player_path;
+u64 g_player_proxy = 0;
+double g_player_tick = 0.0, g_player_search = -100.0, g_player_line = -100.0, g_proxy_list = -100.0;
+float g_last_pos[3] = {1e9f, 1e9f, 1e9f};
+std::string g_last_near;
+bool g_proxy_logged = false;
+u64 st_proxy_calls = 0;
+u32 g_search_fails = 0;
+
+bool IsPtr(u64 v) {
+    return v > 0x10000 && v < (1ull << 47) && (v & 7) == 0;
+}
+
+u64 Follow(u64 root, const std::vector<u32>& path) {
+    u64 p = root;
+    for (const u32 off : path) {
+        u64 v;
+        if (!Rd(p + off, v) || !IsPtr(v)) {
+            return 0;
+        }
+        p = v;
+    }
+    return p;
+}
+
+// Breadth first from root (first level [lo, hi), then 0x400 per object, depth <= 4): the
+// shallowest pointer to a live character proxy.
+bool SearchPath(u64 root, u32 lo, u32 hi, std::vector<u32>& path, u64& found) {
+    struct Node {
+        u64 addr;
+        std::vector<u32> path;
+    };
+    std::deque<Node> q;
+    std::unordered_set<u64> seen{root};
+    q.push_back({root, {}});
+    std::vector<u8> buf(hi - lo > 0x400 ? hi - lo : 0x400);
+    for (u32 budget = 12000; !q.empty() && budget > 0; --budget) {
+        Node node = std::move(q.front());
+        q.pop_front();
+        const u32 first = node.path.empty() ? lo : 0;
+        u32 len = node.path.empty() ? hi - lo : 0x400;
+        while (len >= 0x40 && !SafeCopy(buf.data(), node.addr + first, len)) {
+            len /= 2;
+        }
+        if (len < 0x40) {
+            continue;
+        }
+        for (u32 off = 0; off + 8 <= len; off += 8) {
+            const u64 v = Le64(buf.data() + off);
+            if (!IsPtr(v)) {
+                continue;
+            }
+            if (g_proxies.contains(v)) {
+                path = node.path;
+                path.push_back(first + off);
+                found = v;
+                return true;
+            }
+            if (node.path.size() < 3 && seen.insert(v).second) {
+                auto next = node.path;
+                next.push_back(first + off);
+                q.push_back({v, std::move(next)});
+            }
+        }
+    }
+    return false;
+}
+
+struct ProxyBytes {
+    u8 b[0x50];
+    s32 BodyId() const {
+        return s32(Le32(b + 0x30));
+    }
+    u32 Filter() const {
+        return Le32(b + 0x34);
+    }
+    u64 World() const {
+        return Le64(b + 0x38);
+    }
+    float Pos(int i) const {
+        float f;
+        std::memcpy(&f, b + 0x40 + i * 4, 4);
+        return f;
+    }
+};
+
+const char* StateName(const World* w, u32 id, u64 shape) {
+    if (w == nullptr) {
+        return "untracked";
+    }
+    const auto it = w->bodies.find(id);
+    if (it == w->bodies.end() || it->second.shape != shape) {
+        return "never-added";
+    }
+    switch (it->second.state) {
+    case State::InWorld:
+        return "in-world";
+    case State::Removed:
+        return "removed";
+    case State::Deferred:
+        return "deferred";
+    case State::Ignored:
+        return "add-ignored";
+    default:
+        return "never-added";
+    }
+}
+
+void LogPlayerProxy(u64 proxy, const ProxyBytes& pb) {
+    std::string body = "none";
+    const u64 world = pb.World();
+    u64 data;
+    s32 size;
+    if (pb.BodyId() >= 0 && BodyArray(world, data, size) && pb.BodyId() < size) {
+        BodyBytes bb;
+        if (SafeCopy(bb.b, data + u64(pb.BodyId()) * 0x90, 0x90)) {
+            body =
+                fmt::format("#{} {} flags {:#x} layer {} filter {:#x} at ({:.1f}, {:.1f}, {:.1f})",
+                            pb.BodyId(), Motion(bb.Flags()), bb.Flags(), bb.Layer(), bb.Filter(),
+                            bb.Pos(0), bb.Pos(1), bb.Pos(2));
+        }
+    }
+    std::string filter = "n/a";
+    u64 mgr = 0, fo = 0, vt = 0;
+    u32 words[64];
+    if (Rd(world + 0x150, mgr) && IsPtr(mgr) && Rd(mgr + 0x5e8, fo) && IsPtr(fo) && Rd(fo, vt) &&
+        SafeCopy(words, fo, sizeof(words))) {
+        filter = fmt::format("{:#x} vtable eboot+{:#x}:", fo, vt - g_eboot);
+        for (int i = 0; i < 64; ++i) {
+            filter += fmt::format(" {:08x}", words[i]);
+        }
+    }
+    std::string path;
+    for (const u32 off : g_player_path) {
+        path += fmt::format(" +{:#x}", off);
+    }
+    LOG_INFO(Core,
+             "[objcol] player proxy {:#x} (path from [WorldChrMan+0x60]:{}): query filter "
+             "info {:#x} (layer {}), world {:#x}, position ({:.1f}, {:.1f}, {:.1f}), own body {} | "
+             "world collision filter {}",
+             proxy, path, pb.Filter(), pb.Filter() & 0x1f, world, pb.Pos(0), pb.Pos(1), pb.Pos(2),
+             body, filter);
+}
+
+void NearPlayer(const ProxyBytes& pb, double now) {
+    const u64 world = pb.World();
+    u64 data;
+    s32 size;
+    if (!BodyArray(world, data, size)) {
+        return;
+    }
+    const s32 n = std::min(size, 1 << 16);
+    std::vector<u8> all(size_t(n) * 0x90);
+    if (!SafeCopy(all.data(), data, all.size())) {
+        return;
+    }
+    float q[12] = {};
+    const bool have_q =
+        SafeCopy(q, world + 0x180, sizeof(q)) && q[8] > 0.f && q[9] > 0.f && q[10] > 0.f;
+    const auto wit = g_worlds.find(world);
+    const World* w = wit == g_worlds.end() ? nullptr : &wit->second;
+    const float P[3] = {pb.Pos(0), pb.Pos(1), pb.Pos(2)};
+    struct Near {
+        float d;
+        std::string text;
+        std::string key;
+    };
+    std::vector<Near> near;
+    bool inside_any = false;
+    for (s32 id = 0; id < n; ++id) {
+        BodyBytes bb;
+        std::memcpy(bb.b, all.data() + size_t(id) * 0x90, 0x90);
+        const u32 flags = bb.Flags();
+        const u64 shape = bb.Shape();
+        if ((flags & 3) == 0 || shape == 0 || id == pb.BodyId()) {
+            continue;
+        }
+        const char* state = StateName(w, u32(id), shape);
+        float mn[3], mx[3];
+        bool box = false;
+        if ((flags & 1) && have_q && std::strcmp(state, "in-world") == 0) {
+            s16 qa[8];
+            std::memcpy(qa, bb.b + 0x50, sizeof(qa));
+            box = true;
+            for (int k = 0; k < 3; ++k) {
+                mn[k] = float(qa[k]) / q[8 + k] - q[k];
+                mx[k] = float(qa[k + 4]) / q[8 + k] - q[k];
+                box = box && mn[k] <= mx[k];
+            }
+        }
+        float d2 = 0.f;
+        for (int k = 0; k < 3; ++k) {
+            const float c = box ? std::clamp(P[k], mn[k], mx[k]) : bb.Pos(k);
+            d2 += (P[k] - c) * (P[k] - c);
+        }
+        const float d = std::sqrt(d2);
+        if (d > (box ? 3.f : 4.f)) {
+            continue;
+        }
+        const bool inside = box && d == 0.f;
+        inside_any = inside_any || inside;
+        const std::string size_text = box ? fmt::format(" box {:.1f}x{:.1f}x{:.1f}", mx[0] - mn[0],
+                                                        mx[1] - mn[1], mx[2] - mn[2])
+                                          : " (origin)";
+        near.push_back(
+            {d,
+             fmt::format("#{} {} layer {} filter {:#x} {}{} d {:.1f}{}", id, Motion(flags),
+                         bb.Layer(), bb.Filter(), state, size_text, d, inside ? " INSIDE" : ""),
+             fmt::format("{}:{}:{}", id, state, inside)});
+    }
+    std::sort(near.begin(), near.end(), [](const Near& a, const Near& b) { return a.d < b.d; });
+    if (near.size() > 10) {
+        near.resize(10);
+    }
+    std::string key, list;
+    for (const auto& e : near) {
+        key += e.key + ";";
+        list += (list.empty() ? "" : " | ") + e.text;
+    }
+    float moved = 0.f;
+    for (int k = 0; k < 3; ++k) {
+        moved += (P[k] - g_last_pos[k]) * (P[k] - g_last_pos[k]);
+    }
+    moved = std::sqrt(moved);
+    if (key == g_last_near && !(moved > 1.f && now - g_player_line >= 5.0)) {
+        return;
+    }
+    g_last_near = key;
+    g_player_line = now;
+    std::copy(P, P + 3, g_last_pos);
+    LOG_INFO(Core,
+             "[objcol] player ({:.1f}, {:.1f}, {:.1f}) query filter {:#x}{}: bodies within 3 m: {}",
+             P[0], P[1], P[2], pb.Filter(), inside_any ? " [inside a static box]" : "",
+             list.empty() ? "none" : list);
+}
+
+void PlayerTick(double now) {
+    for (auto it = g_proxies.begin(); it != g_proxies.end();) {
+        it = now - it->second > 2.0 ? g_proxies.erase(it) : std::next(it);
+    }
+    u64 pins = 0;
+    if (g_wcm != 0) {
+        u64 wcm, v;
+        if (Rd(g_wcm, wcm) && IsPtr(wcm) && Rd(wcm + 0x60, v) && IsPtr(v)) {
+            pins = v;
+        }
+    }
+    u64 proxy = 0;
+    if (pins != 0 && !g_player_path.empty()) {
+        proxy = Follow(pins, g_player_path);
+        if (!g_proxies.contains(proxy)) {
+            proxy = 0;
+        }
+    }
+    if (proxy == 0 && pins != 0 && now - g_player_search >= (g_search_fails < 3 ? 5.0 : 60.0)) {
+        g_player_search = now;
+        ++g_search_fails;
+        std::vector<u32> path;
+        u64 found = 0;
+        if (SearchPath(pins, 0, 0x2000, path, found)) {
+            g_player_path = path;
+            proxy = found;
+            g_search_fails = 0;
+            g_proxy_logged = false;
+        }
+    }
+    if (proxy == 0) {
+        if (now - g_proxy_list >= 10.0) {
+            g_proxy_list = now;
+            std::string list;
+            int k = 0;
+            for (const auto& [pp, t] : g_proxies) {
+                ProxyBytes pb;
+                if (k++ < 8 && SafeCopy(pb.b, pp, sizeof(pb.b))) {
+                    list += fmt::format(" ({:.1f}, {:.1f}, {:.1f}) filter {:#x};", pb.Pos(0),
+                                        pb.Pos(1), pb.Pos(2), pb.Filter());
+                }
+            }
+            LOG_INFO(Core,
+                     "[objcol] player proxy not found (WorldChrMan {}, PlayerIns {:#x}); "
+                     "character proxies {} (integrate calls {}):{}",
+                     g_wcm ? "ok" : "not validated", pins, g_proxies.size(), st_proxy_calls,
+                     list.empty() ? " none" : list);
+        }
+        return;
+    }
+    ProxyBytes pb;
+    if (!SafeCopy(pb.b, proxy, sizeof(pb.b))) {
+        return;
+    }
+    g_player_proxy = proxy;
+    if (!g_proxy_logged) {
+        g_proxy_logged = true;
+        LogPlayerProxy(proxy, pb);
+    }
+    NearPlayer(pb, now);
+}
+
+void OnProxy(u64 proxy) {
+    if (!IsPtr(proxy)) {
+        return;
+    }
+    std::scoped_lock lk{g_mutex};
+    ++st_proxy_calls;
+    const double now = Now();
+    g_proxies[proxy] = now;
+    if (now - g_player_tick < 0.5) {
+        return;
+    }
+    g_player_tick = now;
+    PlayerTick(now);
+}
+
+void PS4_SYSV_ABI HookProxy(const u64* regs) {
+    try {
+        OnProxy(regs[5]);
+    } catch (...) {
+    }
+}
+
 // ---------------------------------------------------------------- detours
 
 // addBodies: prologue (20 bytes relocated), argument spills, test edx / test ecx, the
@@ -932,6 +1203,33 @@ constexpr int SigRemove[] = {
     0x8d, 0x87, 0xe0, 0x04, 0x00, 0x00, 0x48, 0x89, 0x45, 0xc8, 0x48, 0x8d, 0x87, 0xb8,
     0x00, 0x00, 0x00, 0x48, 0x89, 0x45, 0x98, 0x48, 0x8d, 0x87, 0xc8, 0x00, 0x00, 0x00};
 constexpr u32 RemovePrologue = 17;
+
+// hknpCharacterProxy::integrate: prologue (20 bytes relocated) and the argument moves up to the
+// stack guard load (the Windows TLS patch may rewrite what follows).
+constexpr int SigProxy[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+                            0x53, 0x48, 0x81, 0xec, 0x38, 0x03, 0x00, 0x00, 0x4c, 0x89, 0xc3, 0x49,
+                            0x89, 0xce, 0x4c, 0x89, 0xb5, 0x80, 0xfd, 0xff, 0xff, 0x48, 0x89, 0x95,
+                            0x20, 0xfd, 0xff, 0xff, 0x49, 0x89, 0xf7, 0x4c, 0x89, 0xbd, 0x18, 0xfd,
+                            0xff, 0xff, 0x49, 0x89, 0xfc, 0x48, 0x8b, 0x05, W,    W,    W,    W,
+                            0x48, 0x8b, 0x00, 0x48, 0x89, 0x45, 0xd0};
+constexpr u32 ProxyPrologue = 20;
+
+// lea rax,[rip+d] within [from, to) of the image whose target is the given string.
+bool LeaToString(const u8* img, u64 size, u64 from, u64 to, const char* str) {
+    const size_t k = std::strlen(str) + 1;
+    for (u64 i = from; i + 7 <= to && i + 7 <= size; ++i) {
+        if (img[i] != 0x48 || img[i + 1] != 0x8d || (img[i + 2] & 0xc7) != 0x05) {
+            continue;
+        }
+        s32 d;
+        std::memcpy(&d, img + i + 3, 4);
+        const s64 t = s64(i) + 7 + d;
+        if (t > 0 && u64(t) + k <= size && std::memcmp(img + t, str, k) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 std::optional<u64> Find(const u8* data, u64 size, const int* sig, u32 n) {
     std::optional<u64> found;
@@ -1024,7 +1322,12 @@ bool Enabled() {
 }
 
 namespace {
-void FileOpened(const std::string& p) {
+void FileOpened(const std::string& p, const char* host, u64 size) {
+    if (p.find(".hkxbhd") != std::string::npos || p.find(".hkxbdt") != std::string::npos) {
+        LOG_INFO(Core, "[objcol] collision file {} served from {} ({} bytes)", p, host ? host : "?",
+                 size);
+        return;
+    }
     if (p.find("/mapstudio/") != std::string::npos && p.find(".msb") != std::string::npos) {
         std::scoped_lock lk{g_mutex};
         if (!g_map_models.empty()) {
@@ -1033,7 +1336,6 @@ void FileOpened(const std::string& p) {
         }
         g_map = MapOf(p);
         g_map_models.clear();
-        g_no_owner_blocks.clear();
         g_last_summary_text.clear();
         g_last_summary = Now();
         LOG_INFO(Core, "[objcol] map {} loading (hooks {})", g_map, g_hooked.load() ? "on" : "off");
@@ -1071,12 +1373,12 @@ void FileOpened(const std::string& p) {
 }
 } // namespace
 
-void OnGuestFileOpen(const char* guest_path, const char* /*host_path*/) {
+void OnGuestFileOpen(const char* guest_path, const char* host_path, u64 size) {
     if (!g_enabled || guest_path == nullptr) {
         return;
     }
     try {
-        FileOpened(guest_path);
+        FileOpened(guest_path, host_path, size);
     } catch (...) {
     }
 }
@@ -1115,10 +1417,39 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
     Detour(at_add, cave);
     Detour(at_rem, cave2);
     g_hooked = true;
+
+    // Player proximity: the character proxy integrate entry and the WorldChrMan global.
+    std::string player = "character proxy hook off";
+    const auto prx = Find(img, code, SigProxy, std::size(SigProxy));
+    if (prx &&
+        LeaToString(img, image_size, *prx + 0x40, *prx + 0xa0, "LtCharacterProxyIntegrate")) {
+        u8* at_prx = reinterpret_cast<u8*>(eboot_base + *prx);
+        const auto c3 = BuildCave(reinterpret_cast<u64>(&HookProxy), at_prx, ProxyPrologue,
+                                  reinterpret_cast<u64>(at_prx + ProxyPrologue));
+        u8* cave3 = cave2 + ((c2.size() + 15) & ~size_t(15));
+        std::memcpy(cave3, c3.data(), c3.size());
+        Detour(at_prx, cave3);
+        player = fmt::format("hknpCharacterProxy::integrate eboot+{:#x} hooked", *prx);
+    } else {
+        player = prx ? "hknpCharacterProxy::integrate timer string differs: not hooked"
+                     : "hknpCharacterProxy::integrate not found (unique): not hooked";
+    }
+    const u64 use = WorldChrManUse;
+    if (use + 0x30 < image_size && img[use] == 0x4c && img[use + 1] == 0x8d &&
+        img[use + 2] == 0x3d) {
+        s32 d;
+        std::memcpy(&d, img + use + 3, 4);
+        if (u64(s64(use) + 7 + d) == WorldChrManVaddr &&
+            LeaToString(img, image_size, use, use + 0x30, "WorldChrMan")) {
+            g_wcm = eboot_base + WorldChrManVaddr;
+        }
+    }
     LOG_INFO(Core,
-             "[objcol] on: hknpWorld::addBodies eboot+{:#x}, removeBodies eboot+{:#x} hooked; "
-             "objbnd analysis on a worker thread; per-map summary lines '[objcol] map'",
-             *add, *rem);
+             "[objcol] on: hknpWorld::addBodies eboot+{:#x}, removeBodies eboot+{:#x} hooked; {}; "
+             "WorldChrMan eboot+{:#x} {}; objbnd analysis on a worker thread; lines '[objcol] "
+             "map' (per map), '[objcol] player' (position and bodies within 3 m)",
+             *add, *rem, player, WorldChrManVaddr,
+             g_wcm ? "validated" : "not validated (no player position)");
 }
 
 } // namespace BB::ObjCol
