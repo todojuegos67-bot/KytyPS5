@@ -702,6 +702,10 @@ add_executable(group_notices_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GroupNoticesTests.cpp"
 )
 target_include_directories(group_notices_tests PRIVATE ${inc_headers})
+add_executable(scalar_read_check_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ScalarReadCheckTests.cpp"
+)
+target_include_directories(scalar_read_check_tests PRIVATE ${inc_headers})
 
 add_executable(hash_memo_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/HashMemoTests.cpp"
@@ -992,6 +996,7 @@ if(BUILD_TESTING)
 	add_test(NAME group_reuse COMMAND $<TARGET_FILE:group_reuse_tests>)
 	add_test(NAME wolverine_stores COMMAND $<TARGET_FILE:wolverine_stores_tests>)
 	add_test(NAME group_notices COMMAND $<TARGET_FILE:group_notices_tests>)
+	add_test(NAME scalar_read_check COMMAND $<TARGET_FILE:scalar_read_check_tests>)
 	add_test(NAME hash_memo COMMAND $<TARGET_FILE:hash_memo_tests>)
 	add_test(NAME packet_stream COMMAND $<TARGET_FILE:packet_stream_tests>)
 	add_test(NAME pipeline_ahead COMMAND $<TARGET_FILE:pipeline_ahead_tests>)
@@ -1132,6 +1137,7 @@ if(BUILD_TESTING)
 		group_reuse_tests
 		wolverine_stores_tests
 		group_notices_tests
+		scalar_read_check_tests
 		hash_memo_tests
 		packet_stream_tests
 		pipeline_ahead_tests

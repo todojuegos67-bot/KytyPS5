@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/scalarReadCheck.h"
 #include "graphics/host_gpu/renderer/pipeline/wolverineStores.h"
 
 #include "common/alignment.h"
@@ -1790,7 +1791,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	std::vector<std::pair<uint64_t, uint64_t>> written_buffers;
 	written_images.clear();
 	bool                                       written_images_known = false;
+	// An assertion that changes no draw; checking runs turn it on (scalarReadCheck.h).
+	const bool check_scalar_reads = ScalarReadCheck::Enabled();
 	for (const auto* reader: prepared_bindings) {
+		if (!check_scalar_reads) break;
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
 		for (const auto* writer: prepared_bindings) {
@@ -1833,11 +1837,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (const auto [address, size]: reads) {
 			if (!written_images.empty()) {
 				if (size == 0 || address > UINT64_MAX - size) EXIT("invalid image overlap range\n");
-				// The ranges that start before the read ends: one overlaps it when the furthest end is past its start.
-				const auto before = std::lower_bound(written_images.begin(), written_images.end(),
-				                                     std::pair {address + size, uint64_t {0}}) -
-				                    written_images.begin();
-				if (before != 0 && written_ends[static_cast<size_t>(before) - 1u] > address) {
+				if (ScalarReadCheck::OverlapsWritten(written_images, written_ends, address, size)) {
 					EXIT("scalar resource reads overlap an image or attachment write\n");
 				}
 			}

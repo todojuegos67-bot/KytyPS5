@@ -10,6 +10,7 @@ set(output_only
 	KYTY_RT                  # runs ray-tracing dispatches that are skipped otherwise; the SPIR-V of the others is the same
 	KYTY_HEAP_WAIT_ANY       # heap slots wait as before the fire-light fix (no shader change)
 	KYTY_TARGET_MEMO         # whether a render target's resolve repeats from its memo (no shader change)
+	KYTY_CHECK_SCALAR_READS  # checks scalar reads against a draw's writes; stops or warns, changes no draw
 	KYTY_HEAP_WATCH          # which heap pages the diff compares; the SPIR-V and pipelines are the same
 	KYTY_PRECOMPILE          # the precompile on start and the recording
 	KYTY_PRECOMPILE_THREADS
