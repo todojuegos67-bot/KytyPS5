@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "kernel/memory.h"
+#include "loader/wolverineRenderStep.h"
 
 #include <algorithm>
 #include <array>
@@ -123,6 +124,7 @@ struct Snapshot {
 	double                              stalled_s    = 0.0;
 	uint32_t                            guest_width  = 0;
 	uint32_t                            guest_height = 0;
+	std::optional<Loader::WolverineRenderStep::ActiveStep> render_step;
 	std::array<double, COUNTER_COUNT>   rates {};
 	std::array<uint64_t, COUNTER_COUNT> totals {};
 	CounterTotals                       deltas {};
@@ -372,6 +374,22 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 	    Throughput(Rate(shown, upload)) + " up / " + Throughput(Rate(shown, download)) + " down");
 }
 
+// The game's own active step (Wolverine Engine.md 8.3), not the --render-resolution setting.
+void ResolutionRows(const Snapshot& shown) {
+	if (!Loader::WolverineRenderStep::CanReadActiveStep()) {
+		Row("3D render", "n/a (needs Wolverine 1.05)", NEUTRAL);
+	} else if (shown.render_step) {
+		const auto& step = *shown.render_step;
+		Row("3D render", Fmt("%ux%u  (step %u, %s)", step.size.width, step.size.height, step.index,
+		                     Config::GetRenderWidth() != 0 ? "pinned" : "auto"));
+	} else {
+		Row("3D render", "n/a (no step yet)", NEUTRAL);
+	}
+	Row("Guest output", shown.guest_width != 0
+	                        ? Fmt("%ux%u", shown.guest_width, shown.guest_height)
+	                        : std::string("n/a"));
+}
+
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
@@ -480,6 +498,7 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 	shown.shader_compile_peak_ns  = Common::DebugCounters::Get(Peak::ShaderCompileNs);
 	shown.pipeline_create_peak_ns = Common::DebugCounters::Get(Peak::PipelineCreateNs);
 	shown.sample_time             = now;
+	shown.render_step             = Loader::WolverineRenderStep::ReadActiveStep();
 	{
 		std::scoped_lock lock(g_host_mutex);
 		if (g_host_generation == generation) {
@@ -512,6 +531,7 @@ void DrawCompact(const Snapshot& shown) {
 	if (shown.max_frame_ms > 0.0) {
 		Row("Worst frame", Fmt("%.1f ms", shown.max_frame_ms), FrameTimeColor(shown.max_frame_ms));
 	}
+	ResolutionRows(shown);
 	Row("CPU", host.process_cpu_percent
 	               ? Fmt("%.0f%%  of %u threads", *host.process_cpu_percent, host.logical_cores)
 	               : std::string("n/a"));
@@ -540,6 +560,7 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 			Row("1% low", Fmt("%.1f FPS", shown.low_fps), FrameTimeColor(1000.0 / shown.low_fps));
 		}
 		Row("Worst frame", Fmt("%.1f ms", shown.max_frame_ms), FrameTimeColor(shown.max_frame_ms));
+		ResolutionRows(shown);
 		Row("Hitches (10 s)", Fmt("%zu", shown.recent_hitches),
 		    shown.recent_hitches > 0 ? MEDIUM : GOOD);
 		if (shown.last_hitch.ms > 0.0f) {
@@ -548,9 +569,6 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 			                                                   shown.last_hitch.time).count()));
 			Row("  Activity", shown.hitch_activity);
 		}
-		Row("Guest output", shown.guest_width != 0
-		                        ? Fmt("%ux%u", shown.guest_width, shown.guest_height)
-		                        : std::string("n/a"));
 		Row("Window", Fmt("%ux%u  %s  %u Hz", extent.width, extent.height,
 		                  PresentModeName(Config::GetPresentMode()), Config::GetVblankFrequency()));
 		Row("Flips", Fmt("%.0f/s requested", Rate(shown, Counter::FlipsRequested)));
@@ -588,8 +606,11 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 			Row("Context switches", Fmt("%.0f/s", *host.context_switches_per_s));
 		}
 		if (host.page_faults_per_s) {
-			Row("Page faults", Fmt("%.0f/s  (%.0f from disk)", *host.page_faults_per_s,
-			                       host.page_ins_per_s.value_or(0.0)));
+			// Windows has no per-process count of faults that read from disk.
+			Row("Page faults", host.page_ins_per_s
+			                       ? Fmt("%.0f/s  (%.0f from disk)", *host.page_faults_per_s,
+			                             *host.page_ins_per_s)
+			                       : Fmt("%.0f/s", *host.page_faults_per_s));
 		}
 		Row("Thermal", ThermalName(host.thermal_pressure), ThermalColor(host.thermal_pressure));
 		const auto emulated = Rate(shown, Counter::EmulatedInstructions);

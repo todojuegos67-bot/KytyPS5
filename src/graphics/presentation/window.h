@@ -11,6 +11,8 @@ class Presenter;
 [[nodiscard]] Presenter& WindowInit(uint32_t width, uint32_t height);
 void                     WindowRun();
 void                     WindowShutdown();
+// --precompile-only: a hidden window, the device and the renderer as for the game, then the precompile; its exit code.
+int                      WindowPrecompileOnly();
 
 // Nits of the display showing the game window; the defaults apply when the host reports none.
 struct DisplayLuminance {

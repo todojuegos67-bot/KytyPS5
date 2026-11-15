@@ -17,6 +17,7 @@ std::array<Sint16, 2> physical_stick {};
 std::array<int, 2>    guest_stick {128, 128};
 uint32_t              guest_buttons = 0;
 bool                  guest_touch   = false;
+float                 guest_click_x = 0.0f;
 Uint64                now           = 1000;
 Sint32                wait_timeout  = 0;
 
@@ -75,18 +76,22 @@ SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
 
 namespace Libs::Controller {
 void SetButton(int id, uint32_t button, bool down) {
-	if (id == 1) {
+	if (id == 1 || id == HOST_INPUT_CONTROLLER_ID) {
 		guest_buttons = down ? guest_buttons | button : guest_buttons & ~button;
 	}
 }
 void SetAxis(int id, Axis axis, int value) {
-	if (id == 1 && (axis == Axis::LeftX || axis == Axis::LeftY)) {
+	if ((id == 1 || id == HOST_INPUT_CONTROLLER_ID) &&
+	    (axis == Axis::LeftX || axis == Axis::LeftY)) {
 		guest_stick[axis == Axis::LeftY ? 1 : 0] = value;
 	}
 }
 void SetTouchPad(int id, int finger, bool down, float x, float y, bool click) {
 	if (id == 1 && finger == 1) {
 		guest_touch = down;
+	}
+	if (id == 1 && finger == 0) {
+		guest_click_x = down ? x : 0.0f;
 	}
 	if (id == HOST_INPUT_CONTROLLER_ID && finger == 1) {
 		host_touches.push_back({down, x, y, click});
@@ -107,6 +112,7 @@ struct Inputs {
 		guest_stick    = {128, 128};
 		guest_buttons  = 0;
 		guest_touch    = false;
+		guest_click_x  = 0.0f;
 		HostInputInit(nullptr);
 	}
 	~Inputs() { HostInputShutdown(); }
@@ -147,6 +153,27 @@ void TestKeyboardSwitchesFromGamepadTouchPad() {
 	Check(!GetHostInputTouchPadVisualState().enabled, "F6 failed to disable mouse touchpad mode");
 }
 
+void TestTouchPadVisualState() {
+	Inputs inputs;
+	HostInputSetTouchPadMode(true);
+	HostInputMouseMotion(0.0f, 0.0f);
+	const auto mouse = GetHostInputTouchPadVisualState();
+	Check(mouse.enabled && mouse.position_valid && !mouse.drawing && mouse.x == 0.5f &&
+	          mouse.y == 0.5f,
+	      "mouse touchpad state was not reported");
+	physical_stick = {SDL_JOYSTICK_AXIS_MAX, SDL_JOYSTICK_AXIS_MIN};
+	HostInputToggleGamepadTouchPad(1);
+	PollGamepadTouchPad(1008);
+	const auto pad = GetHostInputTouchPadVisualState();
+	Check(pad.enabled && pad.position_valid && pad.x > 0.5f && pad.y < 0.5f &&
+	          pad.revision > mouse.revision && pad.gesture > mouse.gesture,
+	      "gamepad touchpad state did not replace the mouse position");
+	HostInputToggleGamepadTouchPad(1);
+	const auto off = GetHostInputTouchPadVisualState();
+	Check(!off.enabled && !off.position_valid && off.revision > pad.revision,
+	      "leaving gamepad touchpad mode kept a visible cursor");
+}
+
 void TestIndependentTriggerEdges() {
 	Inputs inputs;
 	HostInputPadTrigger(2, true, 255);
@@ -177,6 +204,35 @@ void TestTriggerLifecycleReset() {
 	Check(guest_buttons == PAD_BUTTON_CROSS, "shutdown retained a previous trigger press");
 }
 
+void TestDefaultKeyboardControls() {
+	Inputs inputs;
+	HostInputKey(SDLK_J, true);
+	HostInputKey(SDLK_A, true);
+	HostInputKey(SDLK_S, true);
+	Check(guest_buttons == PAD_BUTTON_CROSS && guest_stick == std::array {0, 255},
+	      "default keys did not press Cross and move the left stick");
+	HostInputKey(SDLK_D, true);
+	HostInputKey(SDLK_W, true);
+	Check(guest_stick == std::array {128, 128}, "opposite default stick keys did not cancel");
+	HostInputKey(SDLK_J, false);
+	HostInputKey(SDLK_A, false);
+	HostInputKey(SDLK_S, false);
+	HostInputKey(SDLK_D, false);
+	HostInputKey(SDLK_W, false);
+	Check(guest_buttons == 0 && guest_stick == std::array {128, 128},
+	      "released default keys left the guest pad pressed");
+}
+
+void TestPadTouchPadClick() {
+	Inputs inputs;
+	HostInputPadButton(1, SDL_GAMEPAD_BUTTON_SOUTH, true);
+	Check(guest_click_x == 0.75f && guest_buttons == PAD_BUTTON_TOUCH_PAD,
+	      "a pad button mapped to TouchPadRight did not click the right touchpad half");
+	HostInputPadButton(1, SDL_GAMEPAD_BUTTON_SOUTH, false);
+	Check(guest_click_x == 0.0f && guest_buttons == 0,
+	      "the mapped touchpad click was not released");
+}
+
 // Runs one window loop iteration at time_ms and returns its event wait.
 Sint32 WaitAt(Uint64 time_ms) {
 	now = time_ms;
@@ -191,14 +247,17 @@ bool Near(float a, float b) {
 
 void TestTouchPadSwipes() {
 	Inputs               inputs;
-	constexpr std::array keys = {SDLK_U, SDLK_N, SDLK_B, SDLK_M};
+	// The swipe controls themselves: binding keys to them would make the keymap custom and turn off the default
+	// keys lean's default-key test checks (the key map is built once per process).
+	const std::array keys = {ControlFromName("TouchPadSwipeUp"), ControlFromName("TouchPadSwipeDown"),
+	                         ControlFromName("TouchPadSwipeLeft"), ControlFromName("TouchPadSwipeRight")};
 	constexpr std::array dx   = {0.0f, 0.0f, -0.3f, 0.3f};
 	constexpr std::array dy   = {-0.3f, 0.3f, 0.0f, 0.0f};
 	for (std::size_t i = 0; i < keys.size(); i++) {
 		host_touches.clear();
 		now = 1000;
-		HostInputKey(keys[i], true);
-		HostInputKey(keys[i], false);
+		SetControl(keys[i], true);
+		SetControl(keys[i], false);
 		Check(WaitAt(1000) == 8 && WaitAt(1200) == 8 && WaitAt(1201) == 1000,
 		      "a swipe did not poll every 8 ms for 200 ms");
 		const auto& t = host_touches;
@@ -211,9 +270,9 @@ void TestTouchPadSwipes() {
 	}
 	host_touches.clear();
 	now = 1000;
-	HostInputKey(SDLK_U, true);
+	SetControl(keys[0], true);
 	WaitAt(1100);
-	HostInputKey(SDLK_M, true);
+	SetControl(keys[3], true);
 	WaitAt(1100);
 	Check(host_touches.size() == 3 && !host_touches[1].down && !host_touches[1].click &&
 	          host_touches[2].down && Near(host_touches[2].x, 0.2f),
@@ -257,14 +316,15 @@ void TestDisabledMappingTabs() {
 int main() {
 	Config::Initialize();
 	Config::ConfigOptions options;
-	options.keymap = {"Pad:Cross=LeftTrigger", "Pad:Circle=RightTrigger", "TouchPadMode=F6",
-	                  "TouchPadSwipeUp=U",     "TouchPadSwipeDown=N",     "TouchPadSwipeLeft=B",
-	                  "TouchPadSwipeRight=M"};
+	options.keymap = {"Pad:Cross=LeftTrigger", "Pad:Circle=RightTrigger", "Pad:TouchPadRight=South"};
 	Config::Load(options);
 	TestTouchPadStickHandoff();
 	TestKeyboardSwitchesFromGamepadTouchPad();
+	TestTouchPadVisualState();
 	TestIndependentTriggerEdges();
 	TestTriggerLifecycleReset();
+	TestDefaultKeyboardControls();
+	TestPadTouchPadClick();
 	TestTouchPadSwipes();
 	TestDisabledMappingTabs();
 	Config::Shutdown();

@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/fsr3FrameGen.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -759,19 +760,25 @@ void WindowContext::Run() {
 	constexpr uint64_t title_interval_ms = 1000;
 	auto               title_time        = SDL_GetTicks();
 	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
+	auto               title_presents    = Fsr3::FrameGen::Presents();
 
 	while (!loop.need_exit) {
 		// Refresh the title on the main thread without making presentation wait for it.
 		const auto now     = SDL_GetTicks();
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
-			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			const auto frames   = loop.presented_frames.load(std::memory_order_relaxed);
+			const auto presents = Fsr3::FrameGen::Presents();
 			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+				const auto per_second = [&](uint64_t count) {
+					return static_cast<double>(count) * 1000.0 / static_cast<double>(elapsed);
+				};
+				UpdateTitle(frames, per_second(frames - title_frames),
+				            Fsr3::FrameGen::Active() ? per_second(presents - title_presents) : -1.0);
 			}
-			title_time   = now;
-			title_frames = frames;
+			title_time     = now;
+			title_frames   = frames;
+			title_presents = presents;
 		}
 		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
 		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
@@ -842,7 +849,9 @@ static void WindowCreate(WindowContext& context) {
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
 	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-	if (fullscreen) {
+	if (Config::PrecompileOnly()) {
+		flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	} else if (fullscreen) {
 		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
 	}
 	return flags;
@@ -871,6 +880,12 @@ void WindowRun() {
 	g_window->Run();
 	Common::LockGuard lock(g_window->render_context->GetMutex());
 	g_window->render_context->GetPipelineCache().Save();
+}
+
+int WindowPrecompileOnly() {
+	// The graphics lifecycle made the window (hidden), the device and the renderer already.
+	EXIT_IF(g_window == nullptr);
+	return g_window->render_context->GetPipelineCache().RunPrecompileOnly();
 }
 
 void WindowShutdown() {
@@ -962,7 +977,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
+void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps, double shown_fps) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -976,11 +991,14 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static constexpr auto build_type = KYTY_BUILD == KYTY_BUILD_DEBUG ? "Debug" : "Release";
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	// With frame generation: the rate shown (real and generated presents), then the game's own.
+	const auto fps = shown_fps >= 0.0 ? fmt::format("{:.0f} (game {:.0f})", shown_fps, current_fps)
+	                                  : fmt::format("{:.0f}", current_fps);
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, fps);
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

@@ -18,6 +18,7 @@
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -28,6 +29,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <utility>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -579,6 +583,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 		}
 		info.metadata.range       = {buffer.metadata_address, dcc_size.size};
 		info.metadata.kind        = Graphics::ImageMetadataKind::Dcc;
+		info.metadata.control     = attribute.dcc_control;
 		info.metadata.compression = compression;
 	}
 	Graphics::ImageOps::Validate(info);

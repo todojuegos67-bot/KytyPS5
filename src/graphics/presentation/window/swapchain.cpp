@@ -8,8 +8,10 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/fsr3FrameGen.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/wolverineHudless.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
@@ -21,8 +23,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -37,9 +46,14 @@ struct Presenter::Frame {
 	bool          busy         = false;
 	bool          hdr          = false;
 	bool          blank        = false;
+	// Frame generation's newest prepared frame when this flip was made (0: none, no motion).
+	uint64_t      fg_frame     = 0;
+	// Frame generation: the flip buffer before the game drew its HUD (WolverineHudless), when taken.
+	VulkanImage   hudless;
+	bool          has_hudless = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
-	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
+	void Transit(Cmd command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
@@ -54,6 +68,9 @@ public:
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
+			}
+			if (frame->hudless.image != nullptr) {
+				m_window.graphic_ctx.DeleteImage(frame->hudless);
 			}
 		}
 	}
@@ -171,7 +188,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 }
 
-void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
+void Presenter::Frame::Transit(Cmd command, vk::ImageLayout layout,
                                vk::AccessFlags2 access) {
 	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
 	                                access == vk::AccessFlagBits2::eTransferWrite
@@ -207,7 +224,7 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	command_buffer.EndRendering();
-	auto command = command_buffer.Handle();
+	auto command = command_buffer.Recorder();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
@@ -218,12 +235,12 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
 	command_buffer.EndRendering();
-	auto command = command_buffer.Handle();
+	auto command = command_buffer.Recorder();
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
 	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 	command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
@@ -251,6 +268,12 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] bool       FrameGeneration() const noexcept { return m_frame_generation; }
+	[[nodiscard]] vk::SwapchainKHR Handle() const noexcept { return m_handle; }
+	// Where RecordPresentCommands put the game image.
+	[[nodiscard]] vk::Rect2D GameRect() const noexcept { return m_game_rect; }
+	// The HUD-less image RecordPresentCommands made for this present (shader-read), or null.
+	[[nodiscard]] vk::Image Hudless() const noexcept { return m_hudless_ready ? m_hudless.image : nullptr; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
 	bool SetHdr(bool hdr) {
 		const bool changed = m_hdr_active != (hdr && IsHdrSupported());
@@ -261,12 +284,20 @@ public:
 private:
 	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
+	// Frame generation's swapchain takes images to present in SHADER_READ_ONLY_OPTIMAL.
+	[[nodiscard]] vk::ImageLayout PresentLayout() const noexcept {
+		return m_frame_generation ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::ePresentSrcKHR;
+	}
 	void DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
 	               const vk::Rect2D& rect);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
 	vk::Format       m_format = vk::Format::eUndefined;
+	bool             m_frame_generation = false;
+	vk::Rect2D       m_game_rect {};
+	VulkanImage      m_hudless;
+	bool             m_hudless_ready = false;
 	std::atomic_bool m_hdr_supported {false};
 	bool             m_hdr_requested = false;
 	bool             m_hdr_active    = false;
@@ -300,6 +331,10 @@ struct Presenter::Impl {
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
+		if (swapchain.Handle() == nullptr) {
+			LOGF("Vulkan swapchain: the window has no area (minimised); presenting waits until it has\n");
+			return;
+		}
 		frames.SetFormat(swapchain.Format());
 	}
 
@@ -385,6 +420,11 @@ void Swapchain::Create() {
 	m_window.RefreshSurfaceCapabilities();
 	const auto& surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
+	// A minimised Win32 window reports a 0x0 extent, and no swapchain may be created for it
+	// (VUID-VkSwapchainCreateInfoKHR-imageExtent-01689). Presenting creates it once the window has an area.
+	if (surface.capabilities.currentExtent.width == 0 || surface.capabilities.currentExtent.height == 0) {
+		return;
+	}
 
 	m_extent = surface.capabilities.currentExtent;
 	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
@@ -445,14 +485,17 @@ void Swapchain::Create() {
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped = VK_TRUE;
-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+	m_frame_generation  = Fsr3::FrameGen::Active();
+	RequireVulkanSuccess(m_frame_generation ? Fsr3::FrameGen::CreateSwapchain(create_info, &m_handle)
+	                                        : graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
 	LOGF("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
-		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
+		    return m_frame_generation ? Fsr3::FrameGen::GetSwapchainImages(m_handle, count, images)
+		                              : graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
 
@@ -531,7 +574,14 @@ void Swapchain::Destroy() {
 			graphics.device.destroyImageView(view, nullptr);
 		}
 	}
-	if (m_handle != nullptr) {
+	if (m_hudless.image != nullptr) {
+		graphics.DeleteImage(m_hudless);
+		m_hudless.state = {};
+	}
+	m_hudless_ready = false;
+	if (m_handle != nullptr && m_frame_generation) {
+		Fsr3::FrameGen::DestroySwapchain(m_handle);
+	} else if (m_handle != nullptr) {
 		graphics.device.destroySwapchainKHR(m_handle, nullptr);
 	}
 
@@ -573,9 +623,12 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
 	// Wait for the submission that consumed this slot before signaling it again.
 	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result =
+	    m_frame_generation
+	        ? Fsr3::FrameGen::AcquireNextImage(m_handle, m_image_acquired[m_frame_index], &m_image_index)
+	        : m_window.graphic_ctx.device.acquireNextImageKHR(m_handle, std::numeric_limits<uint64_t>::max(),
+	                                                          m_image_acquired[m_frame_index], nullptr,
+	                                                          &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -793,6 +846,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
 	                               ? FitAspect(aspect_source->image.extent, m_extent)
 	                               : vk::Rect2D {{0, 0}, m_extent};
+	m_game_rect = game_rect;
 	if (source == nullptr || game_rect.extent != m_extent) {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
@@ -828,6 +882,32 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
+		// Frame generation's HUD-less colour: the flip's pre-HUD copy, placed as the game image is. A minimised window
+		// has a 0x0 extent, and no image can be made at that size: that frame goes without a HUD-less colour.
+		m_hudless_ready = m_frame_generation && source->has_hudless && m_extent.width != 0 && m_extent.height != 0 &&
+		                  source->hudless.extent.width == source->image.extent.width &&
+		                  source->hudless.extent.height == source->image.extent.height;
+		if (m_hudless_ready) {
+			WolverineHudless::Ensure(m_window.graphic_ctx, m_hudless, m_extent, m_format,
+			                         vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled);
+			WolverineHudless::Transit(vk_command, source->hudless, vk::ImageLayout::eTransferSrcOptimal,
+			                          vk::AccessFlagBits2::eTransferRead);
+			WolverineHudless::Transit(vk_command, m_hudless, vk::ImageLayout::eTransferDstOptimal,
+			                          vk::AccessFlagBits2::eTransferWrite);
+			if (game_rect.extent != m_extent) {
+				const vk::ClearColorValue       black {};
+				const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+				vk_command.clearColorImage(m_hudless.image, vk::ImageLayout::eTransferDstOptimal, &black, 1, &range);
+				WolverineHudless::Transit(vk_command, m_hudless, vk::ImageLayout::eTransferDstOptimal,
+				                          vk::AccessFlagBits2::eTransferWrite);
+			}
+			vk_command.blitImage(source->hudless.image, vk::ImageLayout::eTransferSrcOptimal, m_hudless.image,
+			                     vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+			WolverineHudless::Transit(vk_command, m_hudless, vk::ImageLayout::eShaderReadOnlyOptimal,
+			                          vk::AccessFlagBits2::eShaderRead);
+		}
+	} else {
+		m_hudless_ready = false;
 	}
 
 	vk::ImageMemoryBarrier to_present {};
@@ -838,7 +918,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                                                 : vk::AccessFlagBits::eMemoryRead;
 	to_present.oldLayout           = vk::ImageLayout::eTransferDstOptimal;
 	to_present.newLayout           = draw_attachment ? vk::ImageLayout::eColorAttachmentOptimal
-	                                                 : vk::ImageLayout::ePresentSrcKHR;
+	                                                 : PresentLayout();
 	to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	to_present.image               = m_images[m_image_index];
@@ -878,7 +958,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
 		}
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
-		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
+		to_present.newLayout     = PresentLayout();
 		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                           vk::PipelineStageFlagBits::eAllCommands,
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
@@ -906,7 +986,10 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
-	{
+	if (m_frame_generation) {
+		// Not under queue_mutex: the swapchain's submissions to the queue take it themselves.
+		result = Fsr3::FrameGen::Present(m_window.graphic_ctx.queue, present);
+	} else {
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
@@ -942,8 +1025,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	frame->hdr   = hdr;
-	frame->blank = false;
+	frame->hdr      = hdr;
+	frame->blank    = false;
+	frame->fg_frame = Fsr3::FrameGen::LatestFrame();
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -952,9 +1036,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	frame->has_hudless = Fsr3::FrameGen::Active() &&
+	                     WolverineHudless::TakeFor(buffer.Recorder(), m_impl->window.graphic_ctx, image, frame->hudless);
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
-		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+		frame->Transit(buffer.Recorder(), vk::ImageLayout::eTransferSrcOptimal,
 		               vk::AccessFlagBits2::eTransferRead);
 		Vr::OpenXrQueueEyeSource(buffer, frame->image);
 	}
@@ -966,8 +1052,10 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	frame->hdr   = false;
-	frame->blank = true;
+	frame->hdr      = false;
+	frame->blank    = true;
+	frame->fg_frame    = 0;
+	frame->has_hudless = false;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1047,11 +1135,22 @@ void Presenter::Impl::Present() {
 	const auto* main_frame = layers[0].frame;
 	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
 	                         swapchain.SetHdr(main_frame->hdr);
+	if (swapchain.Handle() == nullptr) {
+		swapchain.Create();
+		if (swapchain.Handle() == nullptr) {
+			return; // still no area: nothing can be shown
+		}
+		LOGF("Vulkan swapchain: created again now the window has an area\n");
+		frames.SetFormat(swapchain.Format());
+	}
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		if (swapchain.Handle() == nullptr) {
+			return; // a recovery found the window without area
+		}
 		auto status = [&] {
 			ScopedTimer acquire_time(Counter::PresentAcquireNs);
 			return swapchain.AcquireNextImage(present_scheduler);
@@ -1075,6 +1174,12 @@ void Presenter::Impl::Present() {
 			if (layer.frame != nullptr) {
 				layer.frame->present_tick = tick;
 			}
+		}
+		const Fsr3::FrameGen::DumpGenerated dump_generated; // none (no frame dump); lives until swapchain.Present returns
+		if (swapchain.FrameGeneration()) {
+			const auto* shown = layers[0].frame;
+			Fsr3::FrameGen::Configure(swapchain.Handle(), shown != nullptr && !shown->blank ? shown->fg_frame : 0,
+			                          swapchain.GameRect(), swapchain.Hudless(), dump_generated);
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
