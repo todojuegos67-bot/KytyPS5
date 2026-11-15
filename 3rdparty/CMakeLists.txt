@@ -277,6 +277,14 @@ if(MSVC)
 	target_compile_options(LibAtrac9 PRIVATE /W0)
 endif()
 
+# ATRAC9 v3 vibration blocks (configs 6/7), which LibAtrac9 lacks; see vgmstream-atrac9/README.txt
+add_library(vgmstream_atrac9 STATIC vgmstream-atrac9/src/coding/libs/atrac9_dec.c vgmstream-atrac9/src/coding/libs/atrac9_internal.c)
+target_include_directories(vgmstream_atrac9 PUBLIC vgmstream-atrac9/src/coding/libs)
+if(MSVC)
+	target_compile_options(vgmstream_atrac9 PRIVATE /W0)
+endif()
+target_link_libraries(LibAtrac9 PUBLIC vgmstream_atrac9)
+
 set(TRACY_STATIC ON CACHE BOOL "" FORCE)
 set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
 set(TRACY_NO_CRASH_HANDLER ON CACHE BOOL "" FORCE)
