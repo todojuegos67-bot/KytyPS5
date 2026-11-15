@@ -42,6 +42,8 @@ void Umount(const std::string& point) { g_test_mounts.erase(point); }
 std::filesystem::path GetRealFilename(const std::string& point) {
 	return g_test_mounts.at(point);
 }
+void RestoreSaveBackups(const std::filesystem::path&) {}
+void CommitSaveBackups(const std::filesystem::path&) {}
 } // namespace Libs::LibKernel::FileSystem
 
 namespace {
@@ -731,8 +733,10 @@ void TestSearchSortKeys() {
 
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
-	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
-	              static_cast<char*>(nullptr)) == 0);
+	// _spawn joins its arguments with spaces and quotes nothing: a path with a space must be quoted.
+	const auto quoted = L"\"" + executable.wstring() + L"\"";
+	CHECK(_wspawnl(_P_WAIT, executable.c_str(), quoted.c_str(), fs::path(mode).c_str(),
+	               static_cast<wchar_t*>(nullptr)) == 0);
 #else
 	const pid_t pid = fork();
 	CHECK(pid >= 0);

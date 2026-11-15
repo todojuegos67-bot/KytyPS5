@@ -531,6 +531,7 @@ static bool dir_name_match(const char* str, const char* pattern) {
 static int mount_save_data(int slot, const std::filesystem::path& directory,
                            uint32_t status, SaveDataMountResult* result) {
 	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
+	LibKernel::FileSystem::RestoreSaveBackups(directory);
 	LibKernel::FileSystem::Mount(directory, mount_point);
 	g_mount_slots.Mount(static_cast<size_t>(slot), directory);
 	std::snprintf(result->mount_point.data, sizeof(result->mount_point.data), "%s",
@@ -990,6 +991,7 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 	if ((mode & SAVE_DATA_UMOUNT_MODE_BACKUP_ASYNC) != 0) {
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END, 0, nullptr, nullptr);
 	}
+	LibKernel::FileSystem::CommitSaveBackups(g_mount_slots.Directory(static_cast<size_t>(slot)));
 	LibKernel::FileSystem::Umount(point);
 	g_mount_slots.Release(static_cast<size_t>(slot));
 
@@ -1022,6 +1024,14 @@ int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 	LOGF("\t resource    = %" PRId32 "\n"
 	     "\t commit_mode = %" PRIu32 "\n",
 	     param->resource, param->commit_mode);
+
+	// shortcut: every mount's, not just the resource's; another mount in mid-save loses its copy, which the game hasn't done.
+	Common::LockGuard lock(g_mount_mutex);
+	for (size_t slot = 0; slot < SaveDataMountSlots::COUNT; slot++) {
+		if (g_mount_slots.Find(SaveDataMountSlots::MountPoint(slot)) == static_cast<int>(slot)) {
+			LibKernel::FileSystem::CommitSaveBackups(g_mount_slots.Directory(slot));
+		}
+	}
 
 	if ((param->commit_mode & SAVE_DATA_COMMIT_MODE_BACKUP_ASYNC) != 0) {
 		Common::LockGuard lock(g_mount_mutex);
@@ -1254,7 +1264,10 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 			return SAVE_DATA_ERROR_BLOCKS_FEWER_THAN_SRC;
 		}
 	}
-	EXIT("save data conversion of %s is not implemented\n", convert->src_dir_name->data);
+	// Kyty only writes save data in the current format: there is nothing to convert. Unanswered,
+	// Marvel's Wolverine waits for a conversion event that never comes.
+	LOGF("\t conversion of %s answered as not needed\n", convert->src_dir_name->data);
+	return SAVE_DATA_ERROR_NO_NEED_CONVERT;
 }
 
 int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {

@@ -1216,18 +1216,60 @@ public:
 		m_cv.notify_all();
 	}
 
-	void Submit(uint32_t priority, Submission submission) {
-		std::scoped_lock lock(m_mutex);
+	// A game may use memory as soon as it has submitted the maps for it (Marvel's Wolverine
+	// submits ~230 batches of ~90 maps in a burst and writes into them within the frame), so a
+	// submission that waits for nothing runs on the caller's thread when none is ahead of it.
+	void Submit(uint32_t priority, Submission submission, bool run_if_idle = false) {
+		std::unique_lock lock(m_mutex);
+		const auto       idle = [&] { return std::ranges::all_of(m_queues, [](const auto& queue) { return queue.empty(); }); };
+		// Another thread's inline run is short and waits for nothing: queued behind it, this batch's memory would
+		// be used before its maps ran. Not on a queue: a Wait command in it could depend on this caller.
+		if (run_if_idle) {
+			m_cv.wait(lock, [&] { return !m_running_inline || !idle(); });
+		}
+		if (run_if_idle && !m_running_inline && idle()) {
+			m_running_inline = true;
+			lock.unlock();
+			while (!Step(submission)) {
+			}
+			lock.lock();
+			m_running_inline = false;
+			m_cv.notify_all(); // the worker and any waiting submitter
+			return;
+		}
 		m_queues[priority].push_back(std::move(submission));
 		m_cv.notify_one();
 	}
 
 private:
+	// Executes the submission's next command. True once the submission is finished.
+	static bool Step(Submission& submission) {
+		int      result       = OK;
+		uint32_t error_offset = 0;
+		if (submission.cursor < submission.commands.size()) {
+			const auto& command = submission.commands[submission.cursor++];
+			result              = ExecuteCommand(command);
+			if (result != OK) {
+				error_offset = static_cast<uint32_t>(command.record_offset);
+			}
+		}
+		const bool complete = result != OK || submission.cursor == submission.commands.size();
+		if (complete) {
+			AprShared::WriteResult(submission.result, result, error_offset);
+			AprShared::SetSubmissionComplete(submission.id);
+		}
+		return complete;
+	}
+
 	void Run(std::stop_token stop) {
 		std::unique_lock lock(m_mutex);
 		while (!stop.stop_requested()) {
 			std::deque<Submission>* ready   = nullptr;
 			bool                    pending = false;
+			if (m_running_inline) {
+				m_cv.wait(lock);
+				continue;
+			}
 			for (auto& queue: m_queues) {
 				if (queue.empty()) {
 					continue;
@@ -1256,20 +1298,7 @@ private:
 
 			auto& submission = ready->front();
 			lock.unlock();
-			int      result       = OK;
-			uint32_t error_offset = 0;
-			if (submission.cursor < submission.commands.size()) {
-				const auto& command = submission.commands[submission.cursor++];
-				result              = ExecuteCommand(command);
-				if (result != OK) {
-					error_offset = static_cast<uint32_t>(command.record_offset);
-				}
-			}
-			const bool complete = result != OK || submission.cursor == submission.commands.size();
-			if (complete) {
-				AprShared::WriteResult(submission.result, result, error_offset);
-				AprShared::SetSubmissionComplete(submission.id);
-			}
+			const bool complete = Step(submission);
 			lock.lock();
 			if (complete) {
 				ready->pop_front();
@@ -1280,6 +1309,7 @@ private:
 	std::mutex                          m_mutex;
 	std::condition_variable             m_cv;
 	std::vector<std::deque<Submission>> m_queues;
+	bool                                m_running_inline = false;
 	std::jthread                        m_worker;
 };
 
@@ -1316,8 +1346,11 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	}
 	static CommandEngine apr_engine(7);
 	static CommandEngine amm_engine(3);
+	const bool waits = std::ranges::any_of(state.commands, [](const auto& command) {
+		return std::holds_alternative<CommandBufferState::WaitCommand>(command.data);
+	});
 	(amm ? amm_engine : apr_engine)
-	    .Submit(priority, {std::move(state.commands), 0, result, id});
+	    .Submit(priority, {std::move(state.commands), 0, result, id}, amm && !waits);
 	return OK;
 }
 
@@ -1352,24 +1385,34 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
-		LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
-		return LibKernel::KERNEL_ERROR_ENOENT;
+	// The files stay open on the thread that reads them: a scene's streaming opened and closed a file for each of
+	// thousands of requests, and the opens were a quarter of the command engine's time (sampled, session 14).
+	// shortcut: 64 files a thread, all closed when one more is needed.
+	static thread_local std::unordered_map<std::string, std::unique_ptr<Common::File>> open_files;
+	auto& slot = open_files[Common::PathToString(host_path)];
+	if (slot == nullptr) {
+		if (open_files.size() > 64u) {
+			open_files.clear();
+			return ReadHostFileToGuest(host_path, file_offset, destination, size, bytes_read);
+		}
+		slot = std::make_unique<Common::File>();
+		if (!slot->Open(host_path, Common::File::Mode::Read)) {
+			open_files.erase(Common::PathToString(host_path));
+			LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
+			return LibKernel::KERNEL_ERROR_ENOENT;
+		}
 	}
+	auto&      file      = *slot;
 	const auto file_size = file.Size();
 	if (file_offset >= file_size) {
-		file.Close();
 		return OK;
 	}
 	if (!file.Seek(file_offset)) {
-		file.Close();
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const auto readable = std::min<uint64_t>(size, file_size - file_offset);
 	if (readable == 0) {
-		file.Close();
 		return OK;
 	}
 
@@ -1389,8 +1432,6 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
 		*bytes_read += read;
 	}
-
-	file.Close();
 	return OK;
 }
 

@@ -28,6 +28,7 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/fileSystem.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -2401,6 +2402,7 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
+	Libs::LibKernel::Memory::CommitGuestRange(reinterpret_cast<uint64_t>(buf), host_len); // send fails on a reserved page
 	int64_t result = 0;
 	if (addr == nullptr) {
 		result = ::send(socket, static_cast<const char*>(buf), host_len, host_flags);
@@ -2541,6 +2543,7 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
+	Libs::LibKernel::Memory::CommitGuestRange(reinterpret_cast<uint64_t>(buf), host_len); // recv fails on a reserved page
 	sockaddr_storage host_addr {};
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;
