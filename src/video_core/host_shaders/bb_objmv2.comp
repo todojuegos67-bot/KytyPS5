@@ -66,6 +66,21 @@ void KeepReactive(ivec2 c, float cov) {
     imageStore(reactive_io, c, vec4(max(r, smoothstep(0.05, 0.9, cov) * 0.7)));
 }
 
+// bb-mv-candles (flags bit 9 with bit 6): with BB_FG_SPARKS the blended draws write the class
+// channel too: 0 (B = class * (1 - .w)) or 5 with weight 1 where their own contribution is bright
+// (.w then 1). Effect draws set .w = 1 where they write 5. Decoded here to the opaque class, or 5.
+vec4 Fetch(ivec2 q) {
+    vec4 o = texelFetch(obj_mv, q, 0);
+    const uint fl = p.size.w;
+    if ((fl & 512u) != 0u && (fl & 64u) != 0u) {
+        const float cov = clamp(o.w, 0.0, 1.0);
+        // (review) below .995 class 5 cannot occur (its .w is 1): cap the decode at 4 so fp16
+        // rounding of a dense stack over a character (class 4) never reads as a spark.
+        o.z = cov > 0.995 ? (o.z > 0.5 ? 5.0 : 0.0) : min(o.z / (1.0 - cov), 4.0);
+    }
+    return o;
+}
+
 bool IsSpark(vec4 o, bool sparks) {
     return sparks && o.z > 4.5 && o.z < 5.5;
 }
@@ -113,7 +128,7 @@ vec2 Refine(ivec2 c, vec2 v, bool additive) {
         } else {
             const ivec2 n4[4] = ivec2[](ivec2(4, 0), ivec2(-4, 0), ivec2(0, 4), ivec2(0, -4));
             const ivec2 q = clamp(c + n4[i - 8], ivec2(0), ivec2(size) - 1);
-            const vec4 o = texelFetch(obj_mv, q, 0);
+            const vec4 o = Fetch(q);
             if (!((o.z > 0.5 && o.z < 1.5) || o.z > 3.5) || any(isnan(o.xy)) || any(isinf(o.xy))) {
                 continue;
             }
@@ -145,7 +160,7 @@ void main() {
         // Normal frame: replace the camera vector on object pixels (and, bb-fog-mv, under
         // blended draws with their own vector), nothing else.
         if (!inside || p.size.z == 0u) return;
-        const vec4 o = texelFetch(obj_mv, c, 0);
+        const vec4 o = Fetch(c);
         if (IsSpark(o, sparks)) {
             // bb-mv-fill: the effect's own static-world vector (not the surface behind it).
             if (!any(isnan(o.xy)) && !any(isinf(o.xy))) {
@@ -154,7 +169,9 @@ void main() {
             }
             SparkReactive(c);
             if ((flags & 4u) != 0u) {
-                imageStore(next_prev_color, c, vec4(texelFetch(cur_color, c, 0).rgb, 2.0));
+                // bit 10: the marked area is under BB_FG_SPARKS_MAXPCT (else no HUD-less marking)
+                imageStore(next_prev_color, c, vec4(texelFetch(cur_color, c, 0).rgb,
+                                                    (flags & 1024u) != 0u ? 2.0 : 0.0));
             }
             return;
         }
@@ -205,7 +222,7 @@ void main() {
     barrier();
     if (inside) {
         atomicAdd(g_all, 1u);
-        const vec4 o = texelFetch(obj_mv, c, 0);
+        const vec4 o = Fetch(c);
         if (any(notEqual(o, vec4(0.0)))) atomicAdd(g_nz, 1u);
         const vec2 cam = imageLoad(mv_out, c).xy;
         const bool finite = !any(isnan(o.xy)) && !any(isinf(o.xy));
@@ -282,7 +299,8 @@ void main() {
                                         : (o.z > 0.5 && o.z < 1.5 &&
                                            length((additive ? o.xy + cam : o.xy) - cam) > 0.75));
             imageStore(next_prev_color, c,
-                       vec4(texelFetch(cur_color, c, 0).rgb, pl ? 1.0 : (spark ? 2.0 : 0.0)));
+                       vec4(texelFetch(cur_color, c, 0).rgb,
+                            pl ? 1.0 : (spark && (flags & 1024u) != 0u ? 2.0 : 0.0)));
         }
     }
     barrier();
