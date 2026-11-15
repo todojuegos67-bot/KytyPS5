@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -192,7 +193,7 @@ void GameController::ConnectController(SDL_Gamepad* pad) {
                  SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false),
                  SDL_GetGamepadPlayerIndex(pad));
     }
-    if (pad != nullptr && (m_vib_small || m_vib_large)) {
+    if (pad != nullptr && (m_vib_small_eff || m_vib_large)) {
         ApplyVibration(); // (bb-input-137) a rumble sent before the gamepad was opened
     }
 }
@@ -302,8 +303,44 @@ void SetVibrationSettings(bool on, int percent) {
 // connects; the log reports the first non-zero command.
 static std::atomic<bool> g_vib_nz_logged{false};
 
+// (bb-rumble-hits) Bloodborne drives the small motor as a 1-bit PWM, not as a 0-255 level
+// (eboot, Ghidra = vaddr+0x400000):
+//  - 0x1be0e20 samples the rumble resource: two keyframe tracks, 0-255 each (large, small).
+//  - 0x19715f0 sums the active rumble entries (0x1be05d0) and calls 0x1391940(pad, small,
+//    large) with floats 0..1, which stores large at pad+0x14 and small at pad+0x18.
+//  - 0x1395be0 (per pad, per frame): large = pad+0x14 * 255 -> 0..255, but small:
+//      level = (int)(pad+0x18 * 8 + 0.5) clamped 0..8,
+//      bit   = table_0x4b2b8a8[level] >> phase & 1   (table 00 01 11 55 55 77 77 7f ff),
+//    phase = (phase + 1) & 7, then 0x2a9c790 -> scePadSetVibration{large, small = bit}.
+// So the game only ever sends smallMotor 0 or 1. Mapped linearly (1/255 -> 257/65535) that is
+// no vibration at all on a PC pad: every rumble authored on the small track (light ones)
+// was lost. With BB_RUMBLE_HITS (default 1) a 0/1 small value is read as the game's on/off
+// bit and the duty cycle of the last 8 bits becomes the small motor level (inertia of the
+// real motor). Values > 1 (other titles) pass through unchanged. BB_RUMBLE_HITS=0: old path.
+static bool RumbleHitsEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_RUMBLE_HITS");
+        const bool r = !(v != nullptr && v[0] == '0');
+        LOG_INFO(Input, "[pad] BB_RUMBLE_HITS={} (small motor 0/1 = game PWM bit -> duty level)",
+                 r ? 1 : 0);
+        return r;
+    }();
+    return on;
+}
+
 bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
     m_vib_small = smallMotor, m_vib_large = largeMotor;
+    m_vib_small_eff = smallMotor;
+    if (smallMotor <= 1 && RumbleHitsEnabled()) {
+        m_vib_small_hist = static_cast<u8>((m_vib_small_hist << 1) | (smallMotor & 1));
+        const int bits = std::popcount(static_cast<unsigned>(m_vib_small_hist));
+        m_vib_small_eff = static_cast<u8>(bits * 255 / 8);
+        static std::atomic<bool> pwm_logged{false};
+        if (smallMotor == 1 && !pwm_logged.exchange(true)) {
+            LOG_INFO(Input, "[pad] small-motor PWM first on-bit: large {} -> small level {}",
+                     largeMotor, m_vib_small_eff);
+        }
+    }
     if (!g_vib_logged.exchange(true)) {
         LOG_INFO(Input, "[pad] vibration first call: large {} small {} (pad {}, on {}, {}%)",
                  largeMotor, smallMotor, m_sdl_gamepad != nullptr ? "yes" : "no",
@@ -326,7 +363,7 @@ bool GameController::ApplyVibration() {
     const auto scale = [k](u8 v) {
         return static_cast<Uint16>(std::clamp(v / 255.0f * k, 0.0f, 1.0f) * 0xFFFF);
     };
-    const Uint16 lo = scale(m_vib_large), hi = scale(m_vib_small);
+    const Uint16 lo = scale(m_vib_large), hi = scale(m_vib_small_eff);
     // (bb-rumble-143) the game streams stop (0/0) commands: re-sending a stop every frame to SDL
     // cut any rumble started elsewhere (the F1 test lasted < 1 frame: "felt nothing"). A stop is
     // sent once, after a non-zero command only.

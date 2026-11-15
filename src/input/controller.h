@@ -106,6 +106,8 @@ public:
     bool SetVibration(u8 smallMotor, u8 largeMotor);
     bool ApplyVibration(); // (bb-input-137)
     u8 m_vib_small = 0, m_vib_large = 0;
+    u8 m_vib_small_hist = 0; // (bb-rumble-hits) last 8 small-motor on/off bits (game PWM)
+    u8 m_vib_small_eff = 0;  // (bb-rumble-hits) small motor value actually sent (duty * 255)
     bool m_vib_sent_zero = true; // (bb-rumble-143) last command sent to SDL was a stop
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
 
