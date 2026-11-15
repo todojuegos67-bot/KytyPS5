@@ -8,8 +8,9 @@
 // emulator at eboot load with byte checks against the original 1.09 code (no XML patch needed;
 // the "PC sin limite" entries 1/2x/3/4/5/6 are recognised and kept, any other FPS patch turns
 // this off). Game dt = measured frame time clamped to [frame period, BB_VARIABLE_DT_MAX_MS
-// (default 50 ms)]; frame cap = BB_FPS_CAP (0 / unset = unlimited) in the game's own limiter;
-// per-frame time-step reads use the live dt, frame-count -> seconds conversions stay 1/30;
+// (default 50 ms)]; frame cap = BB_GAME_FPS_CAP (0 / unset = unlimited) in the game's own
+// limiter (BB_FPS_CAP keeps its vblank / pacer meaning and is not read here); per-frame
+// time-step reads use the live dt, frame-count -> seconds conversions stay 1/30;
 // Havok semi-fixed substeps; the presenter flips each frame as soon as it arrives
 // (BB_VRR_PRESENT, on by default with BB_VARIABLE_DT=1).
 namespace BB::VarDt {

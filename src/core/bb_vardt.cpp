@@ -18,8 +18,9 @@
 // What BB_VARIABLE_DT installs (byte-checked against the original 1.09 code; groups that an XML
 // patch already wrote identically are left as they are; any other FPS patch => nothing written):
 //  1. limiter uncap (Lance McDonald / Kyo structure, as "PC sin limite 1"): one frame per period,
-//     no vsync-count waits; period = 1 / BB_FPS_CAP (0 or unset = unlimited, 1 ms);
-//  2. dt hook at 0x2018E3D: dt = clamp(measured this+0x264, period this+0x18, BB_VARIABLE_DT_MAX_MS)
+//     no vsync-count waits; period = 1 / BB_GAME_FPS_CAP (0 or unset = unlimited, 1 ms);
+//  2. dt hook at 0x2018E3D: dt = clamp(measured this+0x264, period this+0x18,
+//     BB_VARIABLE_DT_MAX_MS)
 //     also stored to LiveDt (vaddr 0x56D3FC4, bss page slack);
 //  3. guest flips requested as immediate (0x21B3271: flip mode argument 0);
 //  4. Havok semi-fixed step (cave at 0x17F9C76, as "PC sin limite 3"): acc += LiveDt (cap 1/15 s),
@@ -471,6 +472,9 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
     if (st_dt == St::Orig) Apply(kDtHook, true);
     if (st_lim == St::Orig) Apply(kLimiter, true);
     if (st_flip == St::Orig) Apply(kFlip, true);
+    // LiveDt is bss slack (0 at load); the redirected readers must not see dt = 0 before the
+    // first frame passes the dt hook.
+    Write32(LiveDtVa, Bits(T30));
     if (st_havok == St::Orig) {
         Write32(HavokAccVa, 0);
         Apply(kHavok, true);
@@ -479,9 +483,8 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
 
     // 3) Max dt (upper clamp) and the frame cap (the limiter's own period, this+0x18).
     g_max_dt = EnvFloat("BB_VARIABLE_DT_MAX_MS", 50.0f, 17.0f, 100.0f) / 1000.0f;
-    Write32(DtMovVa + 3, Bits(g_max_dt));
     bool cap_set = false;
-    const float cap = EnvFloat("BB_FPS_CAP", 0.0f, 0.0f, 1000.0f, &cap_set);
+    const float cap = EnvFloat("BB_GAME_FPS_CAP", 0.0f, 0.0f, 1000.0f, &cap_set);
     const bool write_period = cap_set || st_lim == St::Orig;
     if (write_period) {
         g_period = cap >= 10.0f ? 1.0f / cap : 0.001f; // 0 / unset = unlimited (1 ms)
@@ -489,6 +492,10 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
     } else {
         g_period = Float(Read32(PeriodImmVa[1] + 5));
     }
+    // dt = min(max(measured, period), max dt): a cap below 1000 / BB_VARIABLE_DT_MAX_MS fps
+    // would otherwise slow the game down.
+    if (std::isfinite(g_period) && g_period > g_max_dt) g_max_dt = std::min(g_period, 0.1f);
+    Write32(DtMovVa + 3, Bits(g_max_dt));
 
     // 4) XML lines that are wrong with a real dt: put the original code back (exact match only).
     std::string restored;
@@ -577,8 +584,8 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
 
     LOG_INFO(Lib_VideoOut,
              "[vardt] on ({}): game dt = clamp(measured frame+0x264, period, {:.1f} ms); frame cap "
-             "{} (period {:.3f} ms, BB_FPS_CAP{}); Havok semi-fixed steps h <= 1/60 s; pad dt = "
-             "live dt; flips immediate; presenter {}",
+             "{} (period {:.3f} ms, BB_GAME_FPS_CAP{}); Havok semi-fixed steps h <= 1/60 s; pad dt "
+             "= live dt; flips immediate; presenter {}",
              g_mode, g_max_dt * 1000.0f,
              g_period > 0.0015f ? std::to_string(static_cast<int>(std::lround(1.0f / g_period)))
                                 : std::string("unlimited"),
