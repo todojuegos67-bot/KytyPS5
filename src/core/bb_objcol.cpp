@@ -1461,7 +1461,7 @@ void CountProducers(u64 fd4) {
     for (const u64 obj : list) {
         u64 vt = 0;
         if (IsPtr(obj) && Rd(obj, vt)) {
-            if (vt == g_eboot + 0x538d440) {
+            if (vt == g_eboot + 0x538d440 && g_obj_producers.size() < 4096) {
                 g_obj_producers.insert(obj);
             }
             ++g_producers[vt >= g_eboot ? vt - g_eboot : vt];
