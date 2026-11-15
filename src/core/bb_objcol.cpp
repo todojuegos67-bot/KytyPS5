@@ -15,26 +15,34 @@
 #include "core/bb_objcol.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <fmt/format.h>
 #include <zlib.h>
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/singleton.h"
 #include "core/file_sys/fs.h"
 
@@ -350,6 +358,12 @@ struct World {
     std::unordered_map<u32, double> unadded_since; // census: body slots never added
     double last_census = 0.0;
     double last_call = 0.0;
+    struct Pending {
+        double t;
+        u64 ret;
+        bool logged;
+    };
+    std::unordered_map<u32, Pending> deferred; // mode-2 adds waiting for the commit
 };
 
 struct Range {
@@ -368,8 +382,13 @@ u64 g_eboot = 0;
 u32 g_body_lines = 0;
 std::atomic<bool> g_hooked{false};
 u64 st_calls[3] = {}, st_bodies = 0, st_owned = 0, st_bad_id = 0, st_removed = 0;
+u64 st_deferred_bodies = 0, st_committed_bodies = 0, st_deferred_removed = 0;
+u64 st_deferred_before_step = 0, st_added_before_step = 0;
+double g_first_step = -1.0;
 double g_last_summary = 0.0;
 std::string g_last_summary_text;
+std::set<std::string> g_mod_logged;
+u32 g_mod_lines = 0;
 
 int ModelFor(const std::string& id) {
     if (auto it = g_model_index.find(id); it != g_model_index.end()) {
@@ -385,9 +404,23 @@ int ModelFor(const std::string& id) {
 
 // ---------------------------------------------------------------- file side worker
 
+struct SnapBody {
+    float p[3];
+    u64 vt;
+    u32 flags, filter, id;
+    u32 layer;
+};
+
 struct Job {
     std::string guest;
     int model;
+    std::string host; // set: MSB comparison job
+    // set: boot/reload body comparison (file I/O off the hooked guest threads)
+    std::vector<SnapBody> snap;
+    std::string map;
+    int visit = 0;
+    double since = 0.0;
+    bool compare = false;
 };
 std::mutex g_job_mutex;
 std::condition_variable g_job_cv;
@@ -480,6 +513,138 @@ void Analyse(const Job& job) {
              why.empty() ? files : " " + why);
 }
 
+// ---------------------------------------------------------------- MSB (map layout) source check
+
+std::string Join(const std::vector<std::string>& v, size_t max);
+std::string MapOf(const std::string& path);
+
+const char* SourceOf(const std::string& host) {
+    if (host.find("-mods") != std::string::npos) {
+        return "MODS folder";
+    }
+    if (host.find("-patch") != std::string::npos || host.find("-UPDATE") != std::string::npos) {
+        return "update/patch";
+    }
+    return host.empty() ? "unknown" : "base game";
+}
+
+bool ReadHost(const std::string& utf8, std::vector<u8>& out) {
+    std::ifstream f(std::filesystem::path(reinterpret_cast<const char8_t*>(utf8.c_str())),
+                    std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return !out.empty() && out.size() < (256ull << 20);
+}
+
+// UTF-16 / ASCII tokens "<letter><6 digits>_<4 digits>" (MSB part names: o = object,
+// h = collision, m = map piece, c = character...) and "<letter><6 digits>" (model names).
+void MsbNames(const std::vector<u8>& d, std::set<std::string>& parts,
+              std::set<std::string>& models) {
+    const auto take = [&](const std::string& t) {
+        if (t.size() == 12 && t[7] == '_' && std::isalpha(u8(t[0]))) {
+            bool ok = true;
+            for (size_t i = 1; i < 12 && ok; ++i) {
+                ok = i == 7 || (t[i] >= '0' && t[i] <= '9');
+            }
+            if (ok) {
+                parts.insert(t);
+            }
+        } else if (t.size() == 7 && std::isalpha(u8(t[0]))) {
+            bool ok = true;
+            for (size_t i = 1; i < 7 && ok; ++i) {
+                ok = t[i] >= '0' && t[i] <= '9';
+            }
+            if (ok) {
+                models.insert(t);
+            }
+        }
+    };
+    for (int step = 1; step <= 2; ++step) {
+        for (size_t start = 0; start < size_t(step); ++start) {
+            std::string cur;
+            for (size_t i = start; i + step <= d.size(); i += step) {
+                const u16 c = step == 1 ? d[i] : u16(d[i] | (d[i + 1] << 8));
+                if (c >= 0x21 && c < 0x7f) {
+                    cur.push_back(char(c));
+                    continue;
+                }
+                take(cur);
+                cur.clear();
+            }
+            take(cur);
+        }
+    }
+}
+
+std::string Diff(const std::set<std::string>& a, const std::set<std::string>& b, char kind,
+                 size_t max) {
+    std::vector<std::string> v;
+    for (const auto& x : a) {
+        if ((kind == 0 || x[0] == kind) && !b.contains(x)) {
+            v.push_back(x);
+        }
+    }
+    return Join(v, max);
+}
+
+size_t Count(const std::set<std::string>& a, char kind) {
+    return size_t(
+        std::count_if(a.begin(), a.end(), [&](const std::string& x) { return x[0] == kind; }));
+}
+
+void AnalyseMsb(const Job& job) {
+    const std::string& host = job.host;
+    std::vector<u8> raw, msb;
+    std::string why;
+    if (!ReadHost(host, raw) || !Undcx(raw, msb, why)) {
+        LOG_INFO(Core, "[objcol] msb {} served from {} ({}): not readable {}", job.guest, host,
+                 SourceOf(host), why);
+        return;
+    }
+    std::set<std::string> parts, models;
+    MsbNames(msb, parts, models);
+    std::string text = fmt::format(
+        "[objcol] msb {} served from {} ({}), {} bytes crc {:08x}: object parts {}, collision "
+        "parts {}, object models {}",
+        MapOf(job.guest), host, SourceOf(host), raw.size(),
+        u32(crc32(0, raw.data(), uInt(raw.size()))), Count(parts, 'o'), Count(parts, 'h'),
+        Count(models, 'o'));
+    const auto at = host.find("-mods");
+    if (at != std::string::npos) {
+        bool found = false;
+        for (const char* repl : {"-patch", "-UPDATE", ""}) {
+            const std::string van = host.substr(0, at) + repl + host.substr(at + 5);
+            std::vector<u8> vraw, vmsb;
+            std::string vwhy;
+            if (!ReadHost(van, vraw) || !Undcx(vraw, vmsb, vwhy)) {
+                continue;
+            }
+            found = true;
+            std::set<std::string> vparts, vmodels;
+            MsbNames(vmsb, vparts, vmodels);
+            text += fmt::format(
+                " | vanilla {} {} bytes crc {:08x}{}: object parts {}, collision parts {} | "
+                "object parts only in vanilla: {} | only in the mod: {} | collision parts only in "
+                "vanilla: {} | only in the mod: {} | object models only in vanilla: {} | only in "
+                "the mod: {}",
+                van, vraw.size(), u32(crc32(0, vraw.data(), uInt(vraw.size()))),
+                vraw == raw ? " (identical)" : "", Count(vparts, 'o'), Count(vparts, 'h'),
+                Diff(vparts, parts, 'o', 60), Diff(parts, vparts, 'o', 60),
+                Diff(vparts, parts, 'h', 60), Diff(parts, vparts, 'h', 60),
+                Diff(vmodels, models, 'o', 40), Diff(models, vmodels, 'o', 40));
+            break;
+        }
+        if (!found) {
+            text += " | no vanilla copy found next to the mods folder (-patch / -UPDATE / base)";
+        }
+    }
+    LOG_INFO(Core, "{}", text);
+}
+
+void CompareJob(const Job& job);
+
 void Worker() {
     for (;;) {
         Job job;
@@ -490,7 +655,13 @@ void Worker() {
             g_jobs.pop_front();
         }
         try {
-            Analyse(job);
+            if (job.compare) {
+                CompareJob(job);
+            } else if (job.host.empty()) {
+                Analyse(job);
+            } else {
+                AnalyseMsb(job);
+            }
         } catch (...) {
         }
     }
@@ -717,11 +888,283 @@ void Summary(bool force) {
     LOG_INFO(Core, "{}", text);
 }
 
+// ---------------------------------------------------------------- boot / reload checks
+// Static and keyframed bodies in the world 30 s and 90 s after each map layout opens are written
+// to user/log/objcol_last_<map>.txt and compared with objcol_ref_<map>.txt (the largest set seen
+// for that map in any session), by shape class and position: a cold boot that loses object
+// collision shows the missing bodies against a session where they were there.
+
+double g_map_open = -1.0, g_map_tick = 0.0;
+int g_map_visit = 0;
+bool g_cmp30 = false, g_cmp90 = false;
+std::map<std::string, int> g_visits;
+u32 g_deferred_lines = 0;
+u32 g_world_lines = 0;
+
+std::vector<SnapBody> Snapshot() {
+    std::vector<SnapBody> out;
+    const double now = Now();
+    for (auto& [world, w] : g_worlds) {
+        u64 data;
+        s32 size;
+        if (now - w.last_call > 300.0 || !BodyArray(world, data, size)) {
+            continue;
+        }
+        const s32 n = std::min(size, 1 << 16);
+        std::vector<u8> all(size_t(n) * 0x90);
+        if (!SafeCopy(all.data(), data, all.size())) {
+            continue;
+        }
+        for (const auto& [id, b] : w.bodies) {
+            if (b.state != State::InWorld || id >= u32(n)) {
+                continue;
+            }
+            BodyBytes bb;
+            std::memcpy(bb.b, all.data() + size_t(id) * 0x90, 0x90);
+            if (bb.Shape() != b.shape || (bb.Flags() & 5) == 0) {
+                continue;
+            }
+            u64 vt = 0;
+            Rd(b.shape, vt);
+            out.push_back({{bb.Pos(0), bb.Pos(1), bb.Pos(2)},
+                           vt - g_eboot,
+                           bb.Flags(),
+                           bb.Filter(),
+                           id,
+                           bb.Layer()});
+        }
+    }
+    return out;
+}
+
+std::filesystem::path SnapPath(const char* kind, const std::string& map) {
+    std::string name = map;
+    for (char& c : name) {
+        if (!std::isalnum(u8(c)) && c != '_' && c != '-') {
+            c = '_';
+        }
+    }
+    return Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+           fmt::format("objcol_{}_{}.txt", kind, name);
+}
+
+void WriteSnap(const std::filesystem::path& path, const std::vector<SnapBody>& snap,
+               const std::string& header) {
+    std::ofstream f(path, std::ios::trunc);
+    f << header << '\n';
+    for (const auto& b : snap) {
+        f << fmt::format("{:.2f} {:.2f} {:.2f} {:x} {:x} {} {:x} {}\n", b.p[0], b.p[1], b.p[2],
+                         b.vt, b.flags, b.layer, b.filter, b.id);
+    }
+}
+
+bool ReadSnap(const std::filesystem::path& path, std::vector<SnapBody>& snap, std::string& header) {
+    std::ifstream f(path);
+    if (!f || !std::getline(f, header)) {
+        return false;
+    }
+    if (header.size() > 200) {
+        header.resize(200);
+    }
+    std::string line;
+    while (snap.size() < (1u << 17) && std::getline(f, line)) {
+        SnapBody b{};
+        unsigned long long vt = 0;
+        unsigned flags = 0, layer = 0, filter = 0, id = 0;
+        if (std::sscanf(line.c_str(), "%f %f %f %llx %x %u %x %u", &b.p[0], &b.p[1], &b.p[2], &vt,
+                        &flags, &layer, &filter, &id) == 8) {
+            b.vt = vt;
+            b.flags = flags;
+            b.layer = layer;
+            b.filter = filter;
+            b.id = id;
+            snap.push_back(b);
+        }
+    }
+    return true;
+}
+
+// The game shifts the Havok world origin (hknpWorld::shiftWorld 0xb95c60, called from the
+// FD4 command flush 0x1806e90), so two sessions can differ by a constant offset: the most common
+// offset between bodies of the same shape class (0.5 m bins).
+std::array<float, 3> CommonOffset(const std::vector<SnapBody>& a, const std::vector<SnapBody>& b) {
+    std::map<std::tuple<int, int, int>, int> votes;
+    for (size_t i = 0; i < a.size() && i < 300; ++i) {
+        for (const auto& y : b) {
+            if (a[i].vt != y.vt) {
+                continue;
+            }
+            ++votes[{int(std::lround((a[i].p[0] - y.p[0]) * 2.f)),
+                     int(std::lround((a[i].p[1] - y.p[1]) * 2.f)),
+                     int(std::lround((a[i].p[2] - y.p[2]) * 2.f))}];
+        }
+    }
+    std::array<float, 3> best{0.f, 0.f, 0.f};
+    int top = 0;
+    for (const auto& [k, v] : votes) {
+        if (v > top) {
+            top = v;
+            best = {std::get<0>(k) * 0.5f, std::get<1>(k) * 0.5f, std::get<2>(k) * 0.5f};
+        }
+    }
+    return best;
+}
+
+// Bodies of a with no body of the same shape class within 0.6 m in b (b shifted by off).
+std::vector<const SnapBody*> Unmatched(const std::vector<SnapBody>& a,
+                                       const std::vector<SnapBody>& b,
+                                       const std::array<float, 3>& off) {
+    std::unordered_map<u64, std::vector<const SnapBody*>> by_shape;
+    for (const auto& y : b) {
+        by_shape[y.vt].push_back(&y);
+    }
+    std::vector<const SnapBody*> out;
+    for (const auto& x : a) {
+        bool hit = false;
+        const auto it = by_shape.find(x.vt);
+        if (it == by_shape.end()) {
+            out.push_back(&x);
+            continue;
+        }
+        for (const SnapBody* yp : it->second) {
+            const auto& y = *yp;
+            const float dx = x.p[0] - y.p[0] - off[0], dy = x.p[1] - y.p[1] - off[1],
+                        dz = x.p[2] - y.p[2] - off[2];
+            if (x.vt == y.vt && dx * dx + dy * dy + dz * dz < 0.36f) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            out.push_back(&x);
+        }
+    }
+    return out;
+}
+
+std::string ListSnap(const std::vector<const SnapBody*>& v, size_t max) {
+    std::string s;
+    for (size_t i = 0; i < v.size() && i < max; ++i) {
+        const auto& b = *v[i];
+        s += fmt::format("{}({:.1f}, {:.1f}, {:.1f}) {} layer {} filter {:#x} shape eboot+{:#x}",
+                         i ? "; " : "", b.p[0], b.p[1], b.p[2], Motion(b.flags), b.layer, b.filter,
+                         b.vt);
+    }
+    if (v.size() > max) {
+        s += fmt::format(" (+{} more)", v.size() - max);
+    }
+    return s.empty() ? "none" : s;
+}
+
+// Under g_mutex on a hooked guest thread: only the snapshot; the files and the comparison run on
+// the worker.
+void CompareMap(double now) {
+    Job job;
+    job.compare = true;
+    job.snap = Snapshot();
+    job.map = g_map;
+    job.visit = g_map_visit;
+    job.since = now - g_map_open;
+    std::scoped_lock jl{g_job_mutex};
+    if (g_jobs.size() >= 64) {
+        return;
+    }
+    g_jobs.push_back(std::move(job));
+    if (!g_worker_started) {
+        g_worker_started = true;
+        std::thread(Worker).detach();
+    }
+    g_job_cv.notify_one();
+}
+
+void CompareJob(const Job& job) {
+    const auto& cur = job.snap;
+    const std::string header =
+        fmt::format("map {} session {} visit {} at +{:.0f} s: {} static/keyframed bodies", job.map,
+                    std::time(nullptr), job.visit, job.since, cur.size());
+    try {
+        WriteSnap(SnapPath("last", job.map), cur, header);
+        std::vector<SnapBody> ref;
+        std::string ref_header;
+        const bool have_ref = ReadSnap(SnapPath("ref", job.map), ref, ref_header);
+        if (have_ref) {
+            const auto off = CommonOffset(ref, cur);
+            const auto missing = Unmatched(ref, cur, off);
+            const auto extra = Unmatched(cur, ref, {-off[0], -off[1], -off[2]});
+            LOG_INFO(Core,
+                     "[objcol] map {} visit #{} (+{:.0f} s): {} static/keyframed bodies in the "
+                     "world vs {} in the reference ({}), world offset reference-now ({:.1f}, "
+                     "{:.1f}, {:.1f}) | MISSING now {} (reference positions): {} | only now {}: {}",
+                     job.map, job.visit, job.since, cur.size(), ref.size(), ref_header, off[0],
+                     off[1], off[2], missing.size(), ListSnap(missing, 40), extra.size(),
+                     ListSnap(extra, 20));
+        } else {
+            LOG_INFO(Core,
+                     "[objcol] map {} visit #{} (+{:.0f} s): {} static/keyframed bodies in the "
+                     "world; first reference written",
+                     job.map, job.visit, job.since, cur.size());
+        }
+        if (!have_ref || cur.size() > ref.size()) {
+            WriteSnap(SnapPath("ref", job.map), cur, header);
+        }
+    } catch (...) {
+    }
+}
+
+void MapTick(double now) {
+    if (now - g_map_tick < 1.0) {
+        return;
+    }
+    g_map_tick = now;
+    for (auto& [world, w] : g_worlds) {
+        u64 data;
+        s32 size;
+        const bool arr = BodyArray(world, data, size);
+        for (auto& [id, d] : w.deferred) {
+            if (now - d.t < 5.0) {
+                continue;
+            }
+            if (d.logged || g_deferred_lines >= 100) {
+                continue;
+            }
+            d.logged = true;
+            ++g_deferred_lines;
+            BodyBytes bb{};
+            const bool ok = arr && id < u32(size) && SafeCopy(bb.b, data + u64(id) * 0x90, 0x90);
+            LOG_INFO(
+                Core,
+                "[objcol] deferred add of body {} ({} layer {} filter {:#x} at ({:.1f}, "
+                "{:.1f}, {:.1f})) queued by eboot+{:#x} at {:.2f} s not committed after {:.0f} "
+                "s (map {}, character steps {})",
+                id, ok ? Motion(bb.Flags()) : "?", ok ? bb.Layer() : 0, ok ? bb.Filter() : 0,
+                ok ? bb.Pos(0) : 0.f, ok ? bb.Pos(1) : 0.f, ok ? bb.Pos(2) : 0.f, d.ret - g_eboot,
+                d.t, now - d.t, g_map, g_first_step < 0.0 ? "not started" : "running");
+        }
+    }
+    if (g_map_open >= 0.0 && !g_cmp30 && now - g_map_open >= 30.0) {
+        g_cmp30 = true;
+        CompareMap(now);
+    }
+    if (g_map_open >= 0.0 && !g_cmp90 && now - g_map_open >= 90.0) {
+        g_cmp90 = true;
+        CompareMap(now);
+    }
+}
+
 void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
     if (n <= 0 || n > (1 << 16)) {
         return;
     }
     std::scoped_lock lk{g_mutex};
+    if (!g_worlds.contains(world) && g_world_lines < 64) {
+        ++g_world_lines;
+        LOG_INFO(Core,
+                 "[objcol] world {:#x} first addBodies at {:.2f} s (mode {}, {} bodies, by "
+                 "eboot+{:#x}), map {}, character steps {}",
+                 world, Now(), mode, n, ret - g_eboot, g_map,
+                 g_first_step < 0.0 ? std::string("not started")
+                                    : fmt::format("since {:.2f} s", g_first_step));
+    }
     ++st_calls[mode == 0 ? 0 : mode == 2 ? 2 : 1];
     u64 data;
     s32 size;
@@ -762,7 +1205,18 @@ void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
             if (b.state != State::InWorld) {
                 b.state = State::Deferred;
             }
+            ++st_deferred_bodies;
+            if (g_first_step < 0.0) {
+                ++st_deferred_before_step;
+            }
+            w.deferred.try_emplace(id, World::Pending{Now(), ret, false});
             continue;
+        }
+        if (w.deferred.erase(id) != 0) {
+            ++st_committed_bodies;
+        }
+        if (g_first_step < 0.0) {
+            ++st_added_before_step;
         }
         const bool first = b.state != State::InWorld && b.state != State::Removed;
         b.state = State::InWorld;
@@ -790,6 +1244,7 @@ void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
         CensusAll();
         Summary(false);
     }
+    MapTick(Now());
 }
 
 void OnRemove(u64 world, u64 ids_ptr, s32 n, u64 ret) {
@@ -804,6 +1259,9 @@ void OnRemove(u64 world, u64 ids_ptr, s32 n, u64 ret) {
     auto& w = g_worlds[world];
     w.last_call = Now();
     for (const u32 id : ids) {
+        if (w.deferred.erase(id) != 0) {
+            ++st_deferred_removed;
+        }
         auto it = w.bodies.find(id);
         if (it == w.bodies.end() || it->second.state == State::Removed) {
             continue;
@@ -1184,7 +1642,15 @@ void OnProxy(u64 proxy) {
     }
     ++st_proxy_calls;
     const double now = Now();
+    if (g_first_step < 0.0) {
+        g_first_step = now;
+        LOG_INFO(Core,
+                 "[objcol] first character step at {:.2f} s (map {}): before it {} bodies added "
+                 "immediately, {} queued deferred",
+                 now, g_map, st_added_before_step, st_deferred_before_step);
+    }
     g_proxies[proxy] = now;
+    MapTick(now);
     if (now - g_player_tick < 0.5) {
         return;
     }
@@ -1345,6 +1811,13 @@ bool Enabled() {
 
 namespace {
 void FileOpened(const std::string& p, const char* host, u64 size) {
+    if (host != nullptr && std::strstr(host, "-mods") != nullptr) {
+        std::scoped_lock lk{g_mutex};
+        if (g_mod_lines < 400 && g_mod_logged.insert(p).second) {
+            ++g_mod_lines;
+            LOG_INFO(Core, "[objcol] mod file {} served from {} ({} bytes)", p, host, size);
+        }
+    }
     if (p.find(".hkxbhd") != std::string::npos || p.find(".hkxbdt") != std::string::npos) {
         LOG_INFO(Core, "[objcol] collision file {} served from {} ({} bytes)", p, host ? host : "?",
                  size);
@@ -1360,7 +1833,36 @@ void FileOpened(const std::string& p, const char* host, u64 size) {
         g_map_models.clear();
         g_last_summary_text.clear();
         g_last_summary = Now();
-        LOG_INFO(Core, "[objcol] map {} loading (hooks {})", g_map, g_hooked.load() ? "on" : "off");
+        g_map_open = Now();
+        g_cmp30 = g_cmp90 = false;
+        g_map_visit = ++g_visits[g_map];
+        u64 pending = 0, in_world = 0;
+        for (const auto& [world, w] : g_worlds) {
+            pending += w.deferred.size();
+            for (const auto& [id, b] : w.bodies) {
+                in_world += b.state == State::InWorld;
+            }
+        }
+        LOG_INFO(Core,
+                 "[objcol] map {} loading (visit #{} this session, {:.1f} s after boot, character "
+                 "steps {}; worlds {}, bodies in the world {}, deferred adds pending {}; deferred "
+                 "so far {} queued / {} committed / {} removed before commit) (hooks {}), layout "
+                 "served from {} ({})",
+                 g_map, g_map_visit, g_map_open,
+                 g_first_step < 0.0 ? std::string("not started")
+                                    : fmt::format("since {:.1f} s", g_first_step),
+                 g_worlds.size(), in_world, pending, st_deferred_bodies, st_committed_bodies,
+                 st_deferred_removed, g_hooked.load() ? "on" : "off", host ? host : "?",
+                 SourceOf(host ? host : ""));
+        if (host != nullptr) {
+            std::scoped_lock jl{g_job_mutex};
+            g_jobs.push_back({p, -1, host});
+            if (!g_worker_started) {
+                g_worker_started = true;
+                std::thread(Worker).detach();
+            }
+            g_job_cv.notify_one();
+        }
         return;
     }
     if (p.find("/obj/") == std::string::npos || !p.ends_with(".objbnd.dcx")) {
@@ -1386,7 +1888,7 @@ void FileOpened(const std::string& p, const char* host, u64 size) {
         }
     }
     std::scoped_lock lk{g_job_mutex};
-    g_jobs.push_back({p, model});
+    g_jobs.push_back({p, model, {}});
     if (!g_worker_started) {
         g_worker_started = true;
         std::thread(Worker).detach();
