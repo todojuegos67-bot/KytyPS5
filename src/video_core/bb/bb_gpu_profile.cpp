@@ -303,6 +303,8 @@ u32 Begin(vk::CommandBuffer cmd, u32 label) {
     auto& s = S();
     std::scoped_lock lk{s.m};
     if (!s.ok) return 0;
+    // BB_GPU_PROFILE=2: submits only (no per-pass stamps: the busy time without their distortion).
+    if (Level() == 2 && s.labels[label].kind != Kind::Envelope) return 0;
     if (s.head - s.tail >= kPairs) {
         ++s.sec_dropped;
         return 0;
@@ -310,6 +312,18 @@ u32 Begin(vk::CommandBuffer cmd, u32 label) {
     const u32 i = static_cast<u32>(s.head % kPairs);
     ++s.head;
     s.recs[i] = {label, s.frame, 1};
+    // BB_GPU_PROFILE=3: a full barrier before each scope's begin stamp, so no earlier work still
+    // draining can be counted in the scope (every scope is called outside a render pass). It
+    // serializes the GPU (busy time goes up) but each scope's own cost is then exact.
+    if (Level() == 3 && s.labels[label].kind != Kind::Envelope) {
+        const vk::MemoryBarrier2 drain{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &drain});
+    }
     cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, s.pool, i * 2);
     return i + 1;
 }
