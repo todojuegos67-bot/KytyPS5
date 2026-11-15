@@ -3029,6 +3029,20 @@ void PipelineCache::BuildComputeAhead(const HW::ComputeShaderInfo& regs, const H
 void PipelineCache::NoteReady(ShaderType stage, uint64_t hash, std::vector<uint32_t> static_key,
                               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                               const std::vector<uint32_t>& spirv, const ShaderRecompiler::IR::CompiledShaderInfo& info) {
+	// A module is the one TakeReadyModule wants by its specialization and its push-data place: another place of the
+	// same specialization is another module, not a duplicate. A taken module stays as a marker (no packed words): the
+	// GPU thread has it, and a copy noted again would never be taken.
+	const auto noted = [&](const Ahead::ReadyProgram& program) {
+		return std::ranges::any_of(program.modules, [&](const auto& module) {
+			return module.specialization == specialization &&
+			       module.info.bindings.push_data_start_dword == info.bindings.push_data_start_dword;
+		});
+	};
+	{
+		std::lock_guard lock(m_ahead->mutex);
+		const auto      found = m_ahead->ready.find({stage, hash, static_key});
+		if (found != m_ahead->ready.end() && noted(found->second)) return;
+	}
 	std::vector<uint8_t> packed(ZSTD_compressBound(spirv.size() * sizeof(uint32_t)));
 	const auto packed_size = ZSTD_compress(packed.data(), packed.size(), spirv.data(), spirv.size() * sizeof(uint32_t), 1);
 	if (ZSTD_isError(packed_size)) return;
@@ -3047,15 +3061,7 @@ void PipelineCache::NoteReady(ShaderType stage, uint64_t hash, std::vector<uint3
 	// shortcut: 32 modules a program. The precompile's 453 seeds of one compute shader's image variants filled the
 	// store, and the pixel shaders after them were translated again on the GPU thread in the fight (session 14).
 	// A variant past them is still in the driver cache; only its translation is done again.
-	if (program.modules.size() >= 32u) return;
-	// A module is the one TakeReadyModule wants by its specialization and its push-data place: another place of the
-	// same specialization is another module, not a duplicate.
-	if (std::ranges::any_of(program.modules, [&](const auto& module) {
-		    return module.specialization == specialization &&
-		           module.info.bindings.push_data_start_dword == info.bindings.push_data_start_dword;
-	    })) {
-		return;
-	}
+	if (program.modules.size() >= 32u || noted(program)) return;
 	program.modules.push_back({specialization, std::move(packed), static_cast<uint32_t>(spirv.size()), info});
 	m_ahead->ready_words += spirv.size();
 }
@@ -3179,7 +3185,7 @@ bool PipelineCache::TakeReadyModule(ShaderType stage, uint64_t hash, const std::
 		auto& modules = found->second.modules;
 		const auto module = std::ranges::find_if(modules, [&](const auto& candidate) {
 			const auto& bindings = candidate.info.bindings;
-			return candidate.specialization == specialization &&
+			return !candidate.packed.empty() && candidate.specialization == specialization &&
 			       bindings.push_data_start_dword ==
 			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, bindings.ShaderDataDwords());
 		});
@@ -3190,9 +3196,9 @@ bool PipelineCache::TakeReadyModule(ShaderType stage, uint64_t hash, const std::
 			info   = module->info;
 		} else {
 			packed = std::move(module->packed);
-			info   = std::move(module->info);
+			info   = module->info;
+			module->packed = {}; // the marker NoteReady checks
 			m_ahead->ready_words -= words;
-			modules.erase(module);
 		}
 	}
 	spirv.resize(words);
