@@ -13,6 +13,7 @@
 #include "core/bb_kbmcam.h"
 #include "core/bb_native_mv_hook.h"
 #include "core/bb_game_gfx.h"
+#include "core/bb_rumble_hits.h"
 #include "core/bb_objcol.h"
 #include "core/bb_respatch.h"
 #include "core/bb_vardt.h"
@@ -455,6 +456,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         BB::NativeMvHook::OnEbootPatched(base_virtual_addr, base_size);
         BB::ObjCol::OnEbootPatched(base_virtual_addr, base_size);
         BB::GameGfx::OnEbootPatched(base_virtual_addr, base_size);
+        BB::RumbleHits::OnEbootPatched(base_virtual_addr, base_size);
     }
 #endif
 }
