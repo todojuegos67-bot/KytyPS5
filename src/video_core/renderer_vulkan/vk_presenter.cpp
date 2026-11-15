@@ -878,6 +878,15 @@ bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
             // only the image's list left that full-screen black quad over every generated frame
             // (black + UI with F8 / F1 / toasts up, the DLSS-G image gone).
             game = std::ranges::find(bb_imgui_game_lists, list) != bb_imgui_game_lists.end();
+            // bb-menu-ui2 review: the viewport's background list (F1 backdrop) is drawn before
+            // every window (imgui.cpp Render), so on real frames the docked game window's opaque
+            // black WindowBg covers it completely; drawing it over generated frames only would
+            // flicker (dimmed / not dimmed) at the generated rate. Left out the same way.
+            if (bb_imgui_game_lists[1] != nullptr && bb_imgui_game_tex != nullptr &&
+                list == static_cast<const ImGuiViewportP*>(ImGui::GetMainViewport())
+                            ->BgFgDrawLists[0]) {
+                game = true;
+            }
             for (const ImDrawCmd& c : list->CmdBuffer) {
                 if (c.UserCallback == nullptr && bb_imgui_game_tex != nullptr &&
                     c.GetTexID() == bb_imgui_game_tex) {
