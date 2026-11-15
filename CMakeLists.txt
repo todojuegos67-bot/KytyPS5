@@ -190,6 +190,61 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+
+# Profile-guided optimization (clang/clang-cl; as in Jetsku's fork), a separate build folder each:
+# 1. KYTY_PGO_GENERATE=ON: an instrumented emulator; run it with KYTY_PGO_FILE=<x.profraw>
+#    (main.cpp writes the counters every KYTY_PGO_DUMP_SECONDS, default 20).
+# 2. llvm-profdata merge -o <x.profdata> <dumps> (the llvm-profdata next to the compiler).
+# 3. KYTY_PGO_USE=<x.profdata>: the optimized emulator.
+# Both builds must be configured from the same source path: clang-cl names functions in anonymous
+# namespaces after a hash of the source file's path. The stored profile (pgo/README.md) is made and
+# used from K:/, whichever folder the checkout is in. Only Kyty's own targets (below) get the flags.
+option(KYTY_PGO_GENERATE "Instrumented build for profile-guided optimization (clang)" OFF)
+set(KYTY_PGO_SOURCE_ROOT "K:/" CACHE PATH "The source path the stored profile belongs to")
+set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (clang; empty: none)")
+if(KYTY_PGO_GENERATE AND KYTY_PGO_USE)
+	message(FATAL_ERROR "KYTY_PGO_GENERATE and KYTY_PGO_USE are separate builds")
+endif()
+if((KYTY_PGO_GENERATE OR KYTY_PGO_USE) AND NOT CLANG)
+	message(FATAL_ERROR "KYTY_PGO_GENERATE/KYTY_PGO_USE need clang or clang-cl")
+endif()
+if(KYTY_CLANG_CL AND (KYTY_PGO_GENERATE OR KYTY_PGO_USE) AND NOT CMAKE_SOURCE_DIR STREQUAL KYTY_PGO_SOURCE_ROOT)
+	message(WARNING "PGO from ${CMAKE_SOURCE_DIR}, not ${KYTY_PGO_SOURCE_ROOT}: functions in anonymous namespaces will not match the profile")
+endif()
+if(KYTY_PGO_GENERATE)
+	add_compile_options(-fprofile-instr-generate)
+	add_compile_definitions(KYTY_PGO_GENERATE=1)
+	if(KYTY_CLANG_CL)
+		# lld-link is called directly, so the profile runtime has to be named; KYTY_PGO_RUNTIME names
+		# it when the compiler has none beside it (the same LLVM major version).
+		set(KYTY_PGO_RUNTIME "" CACHE FILEPATH "clang_rt.profile-x86_64.lib (empty: next to the compiler)")
+		cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH kyty_llvm_bin)
+		file(GLOB kyty_profile_runtime "${kyty_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+		if(KYTY_PGO_RUNTIME)
+			set(kyty_profile_runtime "${KYTY_PGO_RUNTIME}")
+		endif()
+		if(NOT kyty_profile_runtime)
+			message(FATAL_ERROR "KYTY_PGO_GENERATE: clang_rt.profile-x86_64.lib not found next to ${CMAKE_CXX_COMPILER}; set KYTY_PGO_RUNTIME")
+		endif()
+		list(GET kyty_profile_runtime 0 kyty_profile_runtime)
+		link_libraries("${kyty_profile_runtime}")
+		# The objects ask for clang_rt.profile.lib by its unsuffixed name; the runtime named above is it.
+		add_link_options(/nodefaultlib:clang_rt.profile.lib)
+	else()
+		add_link_options(-fprofile-instr-generate)
+	endif()
+elseif(KYTY_PGO_USE)
+	if(NOT EXISTS "${KYTY_PGO_USE}")
+		message(FATAL_ERROR "KYTY_PGO_USE: ${KYTY_PGO_USE} does not exist")
+	endif()
+	add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled -Wno-backend-plugin)
+	# The compiler caches (sccache in CI, ccache here) hash this flag's path and not the file, so a retrained
+	# profile has to change the command line, or they hand back objects optimized with the old one.
+	file(SHA256 "${KYTY_PGO_USE}" kyty_pgo_hash)
+	add_compile_definitions(KYTY_PGO_PROFILE=${kyty_pgo_hash})
+	set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${KYTY_PGO_USE}")
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
@@ -286,7 +341,7 @@ add_custom_command(
 	OUTPUT "${fault_buffer_shader_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -DCACHING_PAGEBITS=14
 	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
 	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -294,6 +349,35 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(mesh_indirect_shader_source "${gpu_tiler_shader_dir}/mesh_indirect_args.comp")
+set(mesh_indirect_shader_spv "${gpu_tiler_generated_dir}/mesh_indirect_args.spv")
+set(mesh_indirect_shader_header "${gpu_tiler_generated_dir}/mesh_indirect_args_spv.h")
+add_custom_command(
+	OUTPUT "${mesh_indirect_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${mesh_indirect_shader_spv}" "${mesh_indirect_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${mesh_indirect_shader_spv} -DOUTPUT=${mesh_indirect_shader_header}
+	        -DSYMBOL=MESH_INDIRECT_ARGS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${mesh_indirect_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${mesh_indirect_shader_header}")
+set(mesh_batch_shader_source "${gpu_tiler_shader_dir}/mesh_indirect_args_batch.comp")
+set(mesh_batch_shader_spv "${gpu_tiler_generated_dir}/mesh_indirect_args_batch.spv")
+set(mesh_batch_shader_header "${gpu_tiler_generated_dir}/mesh_indirect_args_batch_spv.h")
+add_custom_command(
+	OUTPUT "${mesh_batch_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${mesh_batch_shader_spv}" "${mesh_batch_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${mesh_batch_shader_spv} -DOUTPUT=${mesh_batch_shader_header}
+	        -DSYMBOL=MESH_INDIRECT_ARGS_BATCH_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${mesh_batch_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${mesh_batch_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -325,6 +409,149 @@ add_gpu_blit_shader(gpu_bvh_walk gpu_bvh_mirror.comp -DWALK=1)
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+# FSR 3.1's passes (3rdparty/FidelityFX-SDK), one SPIR-V per permutation Kyty's contexts ask for:
+# HDR colour and render-size motion vectors without jitter; inverted depth and the Lanczos LUT vary.
+set(fsr3_shader_dir "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/fsr3upscaler")
+set(fsr3_gpu_dir "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/include/FidelityFX/gpu")
+set(fsr3_generated_dir "${PROJECT_BINARY_DIR}/fsr3_shaders")
+file(GLOB_RECURSE fsr3_shader_includes CONFIGURE_DEPENDS "${fsr3_gpu_dir}/*.h")
+set(fsr3_headers "")
+set(fsr3_includes "")
+set(fsr3_table "")
+# FfxFsr3UpscalerPass ids and their shaders; 7 is the accumulate pass with sharpening.
+foreach(entry "0:prepare_inputs" "1:luma_pyramid" "2:shading_change_pyramid" "3:shading_change"
+              "4:prepare_reactivity" "5:luma_instability" "6:accumulate" "7:accumulate" "8:rcas"
+              "9:debug_view" "10:autogen_reactive")
+	string(REPLACE ":" ";" entry "${entry}")
+	list(GET entry 0 pass)
+	list(GET entry 1 pass_file)
+	set(sharpen 0)
+	if(pass EQUAL 7)
+		set(sharpen 1)
+	endif()
+	foreach(inverted 0 1)
+		foreach(lut 0 1)
+			# FSR3UPSCALER_SHADER_PERMUTATION_*: LUT 1, HDR 2, low-res motion 4, inverted depth 16, sharpening 32.
+			math(EXPR bits "${lut} + 2 + 4 + ${inverted} * 16 + ${sharpen} * 32")
+			set(symbol "FSR3_${pass}_${bits}")
+			set(header "${fsr3_generated_dir}/fsr3_${pass}_${bits}.h")
+			set(source "${fsr3_shader_dir}/ffx_fsr3upscaler_${pass_file}_pass.glsl")
+			# The defines the SDK's own build passes (CMakeCompileFSR3UpscalerShaders.txt), then the permutation's.
+			add_custom_command(
+				OUTPUT "${header}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${fsr3_generated_dir}"
+				COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -S comp -e main -Os
+				        -DFFX_GLSL=1 -DFFX_GPU=1
+				        -DFFX_FSR3UPSCALER_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0
+				        -DFFX_FSR3UPSCALER_OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0
+				        -DFFX_FSR3UPSCALER_OPTION_REPROJECT_SAMPLERS_USE_DATA_HALF=1
+				        -DFFX_FSR3UPSCALER_OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF=0
+				        -DFFX_FSR3UPSCALER_OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2
+				        -DFFX_FSR3UPSCALER_OPTION_REPROJECT_USE_LANCZOS_TYPE=${lut}
+				        -DFFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT=1
+				        -DFFX_FSR3UPSCALER_OPTION_LOW_RESOLUTION_MOTION_VECTORS=1
+				        -DFFX_FSR3UPSCALER_OPTION_JITTERED_MOTION_VECTORS=0
+				        -DFFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH=${inverted}
+				        -DFFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING=${sharpen}
+				        "-I${fsr3_gpu_dir}" "-I${fsr3_gpu_dir}/fsr3upscaler" --vn ${symbol}
+				        -o "${header}" "${source}"
+				DEPENDS "${source}" ${fsr3_shader_includes}
+				VERBATIM
+			)
+			list(APPEND fsr3_headers "${header}")
+			string(APPEND fsr3_includes "#include \"fsr3_${pass}_${bits}.h\"\n")
+			string(APPEND fsr3_table "\t{${pass}, ${bits}, ${symbol}, sizeof(${symbol})},\n")
+		endforeach()
+	endforeach()
+endforeach()
+file(CONFIGURE OUTPUT "${fsr3_generated_dir}/fsr3_permutations.h" @ONLY CONTENT
+"#pragma once\n#include <cstddef>\n#include <cstdint>\n${fsr3_includes}
+struct Fsr3Permutation {\n\tuint32_t pass;\n\tuint32_t bits;\n\tconst uint32_t* code;\n\tsize_t size;\n};
+static const Fsr3Permutation FSR3_PERMUTATIONS[] = {\n${fsr3_table}};\n")
+list(APPEND kyty_emulator_src ${fsr3_headers})
+
+# Frame generation's passes (3rdparty/FidelityFX-SDK, FSR 3.1): frame interpolation with
+# render-size motion vectors without jitter, inverted depth varying; optical flow with SDR input
+# bits (its colour is read through a transfer function at run time).
+set(fsr3_fg_headers "")
+set(fsr3_fg_includes "")
+set(fsr3_fi_table "")
+set(fsr3_of_table "")
+# FfxFrameInterpolationPass ids and their shaders.
+foreach(entry "0:reconstruct_and_dilate" "1:setup" "2:reconstruct_previous_depth" "3:game_motion_vector_field"
+              "4:optical_flow_vector_field" "5:disocclusion_mask" "6:-" "7:compute_inpainting_pyramid" "8:inpainting"
+              "9:compute_game_vector_field_inpainting_pyramid" "10:debug_view")
+	string(REPLACE ":" ";" entry "${entry}")
+	list(GET entry 0 pass)
+	list(GET entry 1 pass_file)
+	if(NOT pass_file STREQUAL "-") # pass 6, interpolation itself, is ffx_frameinterpolation_pass.glsl
+		set(source "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/frameinterpolation/ffx_frameinterpolation_${pass_file}_pass.glsl")
+	else()
+		set(source "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/frameinterpolation/ffx_frameinterpolation_pass.glsl")
+	endif()
+	foreach(inverted 0 1)
+		# FRAMEINTERPOLATION_SHADER_PERMUTATION_*: low-res motion 1, jittered motion 2, inverted depth 4.
+		math(EXPR bits "1 + ${inverted} * 4")
+		set(symbol "FSR3_FI_${pass}_${bits}")
+		set(header "${fsr3_generated_dir}/fsr3_fi_${pass}_${bits}.h")
+		# The defines of the SDK's build (CMakeCompileFrameinterpolationShaders.txt), then the permutation's.
+		add_custom_command(
+			OUTPUT "${header}"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${fsr3_generated_dir}"
+			COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -S comp -e main -Os
+			        -DFFX_GLSL=1 -DFFX_GPU=1
+			        -DFFX_FRAMEINTERPOLATION_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0
+			        -DFFX_FRAMEINTERPOLATION_OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0
+			        -DFFX_FRAMEINTERPOLATION_OPTION_REPROJECT_SAMPLERS_USE_DATA_HALF=1
+			        -DFFX_FRAMEINTERPOLATION_OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF=0
+			        -DFFX_FRAMEINTERPOLATION_OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2
+			        -DFFX_FRAMEINTERPOLATION_OPTION_LOW_RES_MOTION_VECTORS=1
+			        -DFFX_FRAMEINTERPOLATION_OPTION_JITTER_MOTION_VECTORS=0
+			        -DFFX_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH=${inverted}
+			        "-I${fsr3_gpu_dir}" "-I${fsr3_gpu_dir}/frameinterpolation" --vn ${symbol}
+			        -o "${header}" "${source}"
+			DEPENDS "${source}" ${fsr3_shader_includes}
+			VERBATIM
+		)
+		list(APPEND fsr3_fg_headers "${header}")
+		string(APPEND fsr3_fg_includes "#include \"fsr3_fi_${pass}_${bits}.h\"\n")
+		string(APPEND fsr3_fi_table "\t{${pass}, ${bits}, ${symbol}, sizeof(${symbol})},\n")
+	endforeach()
+endforeach()
+# FfxOpticalflowPass ids and their shaders.
+foreach(entry "0:prepare_luma" "1:compute_luminance_pyramid" "2:generate_scd_histogram" "3:compute_scd_divergence"
+              "4:compute_optical_flow_advanced_pass_v5" "5:filter_optical_flow_pass_v5" "6:scale_optical_flow_advanced_pass_v5")
+	string(REPLACE ":" ";" entry "${entry}")
+	list(GET entry 0 pass)
+	list(GET entry 1 pass_file)
+	string(REGEX REPLACE "_pass_v5$" "" pass_stem "${pass_file}")
+	if(pass_stem STREQUAL pass_file)
+		set(source "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/opticalflow/ffx_opticalflow_${pass_file}_pass.glsl")
+	else()
+		set(source "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/opticalflow/ffx_opticalflow_${pass_file}.glsl")
+	endif()
+	set(symbol "FSR3_OF_${pass}_0")
+	set(header "${fsr3_generated_dir}/fsr3_of_${pass}_0.h")
+	add_custom_command(
+		OUTPUT "${header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${fsr3_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -S comp -e main -Os
+		        -DFFX_GLSL=1 -DFFX_GPU=1 -DFFX_OPTICALFLOW_OPTION_HDR_COLOR_INPUT=0
+		        "-I${fsr3_gpu_dir}" "-I${fsr3_gpu_dir}/opticalflow" --vn ${symbol}
+		        -o "${header}" "${source}"
+		DEPENDS "${source}" ${fsr3_shader_includes}
+		VERBATIM
+	)
+	list(APPEND fsr3_fg_headers "${header}")
+	string(APPEND fsr3_fg_includes "#include \"fsr3_of_${pass}_0.h\"\n")
+	string(APPEND fsr3_of_table "\t{${pass}, 0, ${symbol}, sizeof(${symbol})},\n")
+endforeach()
+file(CONFIGURE OUTPUT "${fsr3_generated_dir}/fsr3_fg_permutations.h" @ONLY CONTENT
+"#pragma once\n#include \"fsr3_permutations.h\"\n${fsr3_fg_includes}
+static const Fsr3Permutation FSR3_FI_PERMUTATIONS[] = {\n${fsr3_fi_table}};
+static const Fsr3Permutation FSR3_OF_PERMUTATIONS[] = {\n${fsr3_of_table}};\n")
+list(APPEND kyty_emulator_src ${fsr3_fg_headers})
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
@@ -335,7 +562,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
+set(kyty_emulator_link_libraries common Vulkan::Headers fidelityfx_fsr3 spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
 
 # Linux system libraries.
 if(LINUX)
@@ -398,6 +625,7 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
@@ -446,11 +674,49 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(wolverine_render_step_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WolverineRenderStepTests.cpp"
+)
+target_include_directories(wolverine_render_step_tests PRIVATE ${inc_headers})
+
+add_executable(wolverine_physics_step_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WolverinePhysicsStepTests.cpp"
+)
+target_include_directories(wolverine_physics_step_tests PRIVATE ${inc_headers})
+target_link_libraries(wolverine_physics_step_tests xbyak::xbyak)
+
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+add_executable(wolverine_stores_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WolverineStoresTests.cpp"
+)
+target_include_directories(wolverine_stores_tests PRIVATE ${inc_headers})
+add_executable(group_reuse_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GroupReuseTests.cpp"
+)
+target_include_directories(group_reuse_tests PRIVATE ${inc_headers})
+add_executable(group_notices_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GroupNoticesTests.cpp"
+)
+target_include_directories(group_notices_tests PRIVATE ${inc_headers})
+
+add_executable(hash_memo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/HashMemoTests.cpp"
+)
+target_include_directories(hash_memo_tests PRIVATE ${inc_headers})
+
+add_executable(packet_stream_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PacketStreamTests.cpp"
+)
+target_include_directories(packet_stream_tests PRIVATE ${inc_headers})
+
+add_executable(pipeline_ahead_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineAheadTests.cpp"
+)
+target_include_directories(pipeline_ahead_tests PRIVATE ${inc_headers})
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -476,6 +742,7 @@ target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderVertexMetadata.cpp"
 )
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
@@ -483,6 +750,7 @@ target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
@@ -492,6 +760,7 @@ target_include_directories(resource_materialization_tests PRIVATE ${inc_headers}
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
@@ -566,6 +835,9 @@ add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
 target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(occlusion_queries_tests PRIVATE ${inc_headers})
 
+add_executable(gpl_per_vertex_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GplPerVertexTests.cpp")
+target_link_libraries(gpl_per_vertex_tests Vulkan::Headers ${CMAKE_DL_LIBS})
+
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -580,6 +852,8 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
+add_kyty_full_emulator_test(shader_precompile_tests
+	"${KYTY_TESTS_DIR}/ShaderPrecompileTests.cpp")
 add_executable(rtc_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/RtcTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libRtc.cpp"
@@ -650,6 +924,12 @@ add_executable(dlss_tests EXCLUDE_FROM_ALL
 target_link_libraries(dlss_tests common Vulkan::Headers SDL3::SDL3-static kyty_test_gtest)
 target_include_directories(dlss_tests PRIVATE ${inc_headers})
 
+add_executable(fsr3_blob_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Fsr3BlobTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/fsr3Blobs.cpp"
+	${fsr3_headers} ${fsr3_fg_headers})
+target_link_libraries(fsr3_blob_tests fidelityfx_fsr3 kyty_test_gtest)
+target_include_directories(fsr3_blob_tests PRIVATE ${inc_headers})
 if (WIN32)
 	add_executable(fsr_tests EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/FsrTests.cpp"
@@ -666,14 +946,14 @@ add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
 target_link_libraries(psml_tests common kyty_test_gtest)
 target_include_directories(psml_tests PRIVATE ${inc_headers})
-target_compile_definitions(virtual_memory_allocation_tests PRIVATE
-	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
 target_link_libraries(gpu_blit_shader_tests kyty_test_gtest)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
+target_compile_definitions(virtual_memory_allocation_tests PRIVATE
+	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
@@ -707,12 +987,21 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME wolverine_render_step COMMAND $<TARGET_FILE:wolverine_render_step_tests>)
+	add_test(NAME wolverine_physics_step COMMAND $<TARGET_FILE:wolverine_physics_step_tests>)
+	add_test(NAME group_reuse COMMAND $<TARGET_FILE:group_reuse_tests>)
+	add_test(NAME wolverine_stores COMMAND $<TARGET_FILE:wolverine_stores_tests>)
+	add_test(NAME group_notices COMMAND $<TARGET_FILE:group_notices_tests>)
+	add_test(NAME hash_memo COMMAND $<TARGET_FILE:hash_memo_tests>)
+	add_test(NAME packet_stream COMMAND $<TARGET_FILE:packet_stream_tests>)
+	add_test(NAME pipeline_ahead COMMAND $<TARGET_FILE:pipeline_ahead_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME kernel_fs_core COMMAND $<TARGET_FILE:kernel_file_system_tests> --core-cases)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
@@ -726,9 +1015,13 @@ if(BUILD_TESTING)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
 	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
+	add_test(NAME gpl_per_vertex COMMAND $<TARGET_FILE:gpl_per_vertex_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
+	add_test(NAME shader_precompile COMMAND $<TARGET_FILE:shader_precompile_tests>)
+	add_test(NAME precompile_env_guard
+		COMMAND ${CMAKE_COMMAND} -DSRC=${KYTY_SOURCE_DIR} -P "${KYTY_TESTS_DIR}/PrecompileEnvGuard.cmake")
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
@@ -758,6 +1051,8 @@ if(BUILD_TESTING)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
+	add_test(NAME fsr3_blobs COMMAND $<TARGET_FILE:fsr3_blob_tests>)
+	add_test(NAME gpu_blit_shaders COMMAND $<TARGET_FILE:gpu_blit_shader_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
@@ -769,6 +1064,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_flip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
+	add_test(NAME device_creation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --device-creation-only)
+	# The same with lean's own device creation instead of upstream 8810d3869's structure chains (the default).
+	add_test(NAME device_creation_lean
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --device-creation-only)
+	set_tests_properties(device_creation_lean PROPERTIES ENVIRONMENT "KYTY_LEAN_PATHS=8810d3869")
 	add_test(NAME video_out_flip_rate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-rate-only)
 	add_test(NAME video_out_hdr10_to_sdr
@@ -777,8 +1078,6 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME srgb_texture
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
-	add_test(NAME device_creation
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --device-creation-only)
 	add_test(NAME msaa_storage
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME pm4_context_state
@@ -802,6 +1101,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME indirect_write_tables
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-write-tables-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -825,7 +1126,15 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests
+		wolverine_render_step_tests
+		wolverine_physics_step_tests
 		lru_cache_tests
+		group_reuse_tests
+		wolverine_stores_tests
+		group_notices_tests
+		hash_memo_tests
+		packet_stream_tests
+		pipeline_ahead_tests
 		common_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
@@ -839,6 +1148,9 @@ if(BUILD_TESTING)
 		audio_out_timing_tests
 		ngs2_sampler_tests
 		ajm_resample_tests
+		psml_tests
+		fsr3_blob_tests
+		gpu_blit_shader_tests
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests
@@ -847,9 +1159,11 @@ if(BUILD_TESTING)
 		jpeg_dec_tests
 		jpeg_enc_tests
 		occlusion_queries_tests
+		gpl_per_vertex_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		shader_precompile_tests
 		rtc_tests
 	)
 endif()
@@ -932,7 +1246,10 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
+	# 16 MiB stacks (reserved, committed as used): the driver compiles a pipeline on the thread that
+	# creates it, and NVIDIA 566.07 overflowed Windows' default 1 MiB on a big compute shader.
 	target_link_options(kyty_emulator PRIVATE
+		"/STACK:16777216"
 		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
@@ -967,6 +1284,8 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+	# Marvel's Wolverine's own start window with the shader precompile (session 12); the launcher above is upstream's.
+	add_subdirectory("${KYTY_SOURCE_DIR}/wolverine_launcher" "${CMAKE_CURRENT_BINARY_DIR}/wolverine_launcher")
 
 	if(LINUX)
 		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
