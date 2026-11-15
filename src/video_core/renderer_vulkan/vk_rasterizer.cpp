@@ -1,12 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 #include <unordered_map>
+#include <vector>
 #include <xxhash.h>
 #include "common/debug.h"
 #include "core/bb_hud_native_hook.h"
@@ -37,6 +42,7 @@ namespace Vulkan {
 
 namespace {
 void DmaForget(VAddr addr, u64 size); // bb-dma-dedup (below Rasterizer::FillBuffer)
+void DmaForgetAll();                  // (a shader writing guest memory through flat addresses)
 }
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
@@ -548,6 +554,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
+        DmaForgetAll(); // bb-dma-dedup: writes anywhere (no V#), nothing can be trusted
         buffer_cache.SynchronizeDmaBuffers();
     }
 
@@ -1826,6 +1833,12 @@ void DmaForget(VAddr addr, u64 size) {
     std::scoped_lock lk{d.m};
     DmaForgetLocked(d, addr, size);
 }
+void DmaForgetAll() {
+    if (!DmaStatsOn()) return;
+    auto& d = Dma();
+    std::scoped_lock lk{d.m};
+    d.last.clear();
+}
 void DmaLogSecond(DmaState& d) {
     const auto now = std::chrono::steady_clock::now();
     if (d.start.time_since_epoch().count() == 0) d.start = now;
@@ -1860,11 +1873,22 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         CopyBufferImpl(dst, src, num_bytes, dst_gds, src_gds);
         return;
     }
+    // (review) The buffer / texture cache queries and the hash run before the lock: the lock is
+    // also taken from the write-fault path (InvalidateMemory), so it never waits on another lock.
+    const bool gds = dst_gds || src_gds;
+    const bool dst_gpu = !gds && buffer_cache.IsRegionGpuModified(dst, num_bytes);
+    const bool src_cpu = !gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
+                         !texture_cache.FindImageFromRange(src, num_bytes);
+    // A GPU copy that may repeat the destination's last copy with the same source bytes?
+    const bool hashable = !gds && src_cpu && num_bytes <= kDmaKeepBytes && dst_gpu &&
+                          !texture_cache.FindImageFromRange(dst, num_bytes) &&
+                          memory->IsValidMapping(src, num_bytes);
+    const u64 h = hashable ? XXH3_64bits(std::bit_cast<const void*>(src), num_bytes) : 0;
     auto& d = Dma();
     std::unique_lock lk{d.m};
     DmaLogSecond(d);
     ++d.calls;
-    if (dst_gds || src_gds) {
+    if (gds) {
         ++d.gds;
         if (!dst_gds) DmaForgetLocked(d, dst, num_bytes);
         lk.unlock();
@@ -1872,9 +1896,6 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         return;
     }
     d.sz[num_bytes <= 256 ? 0 : num_bytes <= 4096 ? 1 : num_bytes <= kDmaMaxBytes ? 2 : 3]++;
-    const bool dst_gpu = buffer_cache.IsRegionGpuModified(dst, num_bytes);
-    const bool src_cpu = !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
-                         !texture_cache.FindImageFromRange(src, num_bytes);
     if (!dst_gpu && src_cpu) {
         ++d.host; // the host memcpy path below
         DmaForgetLocked(d, dst, num_bytes);
@@ -1882,11 +1903,6 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         CopyBufferImpl(dst, src, num_bytes, dst_gds, src_gds);
         return;
     }
-    // A GPU copy. Repeat of the destination's last copy with the same source bytes?
-    const bool hashable = src_cpu && num_bytes <= kDmaKeepBytes && dst_gpu &&
-                          !texture_cache.FindImageFromRange(dst, num_bytes) &&
-                          memory->IsValidMapping(src, num_bytes);
-    const u64 h = hashable ? XXH3_64bits(std::bit_cast<const void*>(src), num_bytes) : 0;
     auto& top = d.by_dst[dst];
     ++top[0];
     top[2] = src;
