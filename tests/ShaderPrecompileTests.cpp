@@ -608,7 +608,7 @@ void TestStop() {
 	precompiler.Start();
 	compiler.WaitHeld();
 	std::thread stopper([&] { precompiler.Stop(); });
-	std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Stop has asked the worker to end
+	while (!precompiler.StopRequested()) std::this_thread::yield(); // Stop has asked the worker to end
 	compiler.Release();
 	stopper.join();
 	Check(compiler.created.size() <= 1 && !precompiler.GetProgress().done.load(),
@@ -673,7 +673,9 @@ void TestStageKey() {
 int main() {
 	Config::Initialize(); // Origin() reads the options
 	TestStageKey();
-	const auto dir = std::filesystem::temp_directory_path() / "kyty_shader_precompile_tests";
+	const auto dir = std::filesystem::temp_directory_path() /
+	                 ("kyty_shader_precompile_tests_" +
+	                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	std::error_code error;
 	std::filesystem::remove_all(dir, error);
 	std::filesystem::create_directories(dir);

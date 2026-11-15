@@ -265,6 +265,11 @@ public:
 	void Start();
 	// Lets the running jobs finish and keeps the rest queued; joins the workers.
 	void Stop();
+	// Stop was called (it may still be joining the workers).
+	[[nodiscard]] bool StopRequested() {
+		std::lock_guard lock(m_mutex);
+		return m_stop;
+	}
 	// Until every job is done or Stop was called.
 	void Wait();
 	// No worker runs: every job is done, or Stop was called, or none was started.
