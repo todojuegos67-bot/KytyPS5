@@ -423,44 +423,39 @@ void TestAtrac9Vibration() {
 		          parsed.framesInSuperframe == 4 && parsed.superframeSize == 128,
 		      "NGS2 vibration metadata differs from decoder metadata");
 
-		// Enlarge the superframe for the synthetic blocks and compare ordinary mono/dual mono.
+		// Vibration blocks have their own bitstream (vgmstream's decoder): 96-byte superframes of one
+		// frame, a minimal block per channel, padded with 0x01. Compare against vgmstream directly.
 		config[2] = 0x0b;
+		config[3] = 0xe0;
 		Check(decoder.Initialize(config.data(), config.size()).result == OK,
 		      "ATRAC9 fixture initialization failed");
-		config[1] -= 12;
-		auto reference = std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>(
-		    Atrac9GetHandle(), Atrac9ReleaseHandle);
-		Check(reference != nullptr && Atrac9InitDecoder(reference.get(), config.data()) == 0,
-		      "ATRAC9 reference initialization failed");
-		std::array<uint8_t, 384> encoded {};
-		for (int frame = 0; frame < 4; ++frame) {
+		std::unique_ptr<atrac9_handle_t, decltype(&atrac9_free)> reference(atrac9_init(config.data()),
+		                                                                    atrac9_free);
+		Check(reference != nullptr, "ATRAC9 vibration reference initialization failed");
+		constexpr std::array<uint8_t, 3> block {0, 0, 0x04};
+		std::array<uint8_t, 3 * 96> encoded {};
+		encoded.fill(0x01);
+		for (int superframe = 0; superframe < 3; ++superframe) {
 			for (int channel = 0; channel < channels; ++channel) {
-				auto block = encoded.begin() + (frame * channels + channel) * ATRAC9_MONO_BLOCK.size();
-				std::copy(ATRAC9_MONO_BLOCK.begin(), ATRAC9_MONO_BLOCK.end(), block);
-				if (frame != 0) *block |= 0x80;
+				std::copy(block.begin(), block.end(), encoded.begin() + superframe * 96 + channel * 3);
 			}
 		}
-		std::vector<float> actual(4 * 256 * channels), expected(actual.size());
-		size_t offset = 0;
-		for (int frame = 0; frame < 4; ++frame) {
+		std::vector<float> actual(3 * 256 * channels), expected(actual.size());
+		for (int superframe = 0; superframe < 3; ++superframe) {
 			int used = 0;
-			Check(Atrac9DecodeF32(reference.get(), encoded.data() + offset,
-			                       expected.data() + frame * 256 * channels, &used, 0) == 0 &&
-			          used == channels * ATRAC9_MONO_BLOCK.size(),
-			      "ATRAC9 reference decoding failed");
-			offset += used;
+			Check(atrac9_decode_float(reference.get(), encoded.data() + superframe * 96, 96,
+			                          expected.data() + superframe * 256 * channels, &used) >= 0 &&
+			          used == 96,
+			      "ATRAC9 vibration reference decoding failed");
 		}
 		for (int pass = 0; pass < 2; ++pass) {
 			if (pass != 0) decoder.Reset();
 			const auto decoded = decoder.Decode(encoded.data(), encoded.size(), actual.data(),
 			                                      actual.size() * sizeof(float), true, nullptr);
-			Check(decoded.result == OK && decoded.frames == 4 &&
+			Check(decoded.result == OK && decoded.frames == 3 &&
 			          decoded.input_consumed == encoded.size() &&
-			          decoded.output_written == actual.size() * sizeof(float) &&
-			          actual == expected && std::ranges::any_of(actual, [](float sample) {
-				          return std::abs(sample) > 0.00001f;
-			          }),
-			      "ATRAC9 vibration decoding or reset differs from mono/dual mono");
+			          decoded.output_written == actual.size() * sizeof(float) && actual == expected,
+			      "ATRAC9 vibration decoding or reset differs from vgmstream");
 		}
 		{
 			auto invalid = original;

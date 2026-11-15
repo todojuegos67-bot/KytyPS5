@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include <vector>
 
 extern "C" {
+#include "atrac9_dec.h"
 #include "error_codes.h"
 #include "libatrac9.h"
 }
@@ -28,6 +30,12 @@ struct AjmAt9Config {
 };
 
 using AjmAt9Handle = std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>;
+using AjmAt9VibHandle = std::unique_ptr<atrac9_handle_t, decltype(&atrac9_free)>;
+
+// Channel configs 6/7: ATRAC9 v3 vibration (DualSense haptics) blocks, with their own bitstream.
+inline bool AjmAt9IsVibration(const uint8_t* config_data) {
+	return config_data[0] == 0xfe && ((config_data[1] >> 1u) & 7u) >= 6u;
+}
 
 inline int AjmAt9InitDecoder(void* handle, const uint8_t* config_data, AjmAt9Config& config) {
 	config = {};
@@ -51,8 +59,8 @@ inline int AjmAt9InitDecoder(void* handle, const uint8_t* config_data, AjmAt9Con
 			config.decoder_data[i] = static_cast<uint8_t>(mono >> ((3u - i) * 8u));
 		}
 	} else if (config_data[0] == 0xfe && ((config_data[1] >> 1u) & 7u) >= 6u) {
-		// LibAtrac9 lacks vibration layouts; their blocks match ordinary mono/dual-mono.
-		// Translate only the channel field, preserving the other configuration bits.
+		// LibAtrac9 lacks ATRAC9 v3 vibration layouts. Mono/dual-mono give the same codec info;
+		// the frames themselves are decoded by vgmstream's decoder (AjmAt9IsVibration).
 		config.decoder_data[1] -= 6u << 1u;
 	}
 	const int initialized = Atrac9InitDecoder(handle, config.decoder_data.data());
@@ -342,6 +350,11 @@ private:
 			result->internal_result = init_ret;
 			return false;
 		}
+		m_vibration.reset(AjmAt9IsVibration(m_config_data) ? atrac9_init(m_config_data) : nullptr);
+		if (AjmAt9IsVibration(m_config_data) && m_vibration == nullptr) {
+			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
+			return false;
+		}
 		m_streams.resize(config.stream_count);
 		for (size_t i = 1; i < m_streams.size(); ++i) {
 			m_streams[i].handle.reset(Atrac9GetHandle());
@@ -401,7 +414,39 @@ private:
 		}
 	}
 
+	// vgmstream's decoder: bytes_used includes the superframe padding after the last frame.
+	int DecodeVibrationFrame(const uint8_t* input, int* bytes_used) {
+		const auto size = static_cast<int>(m_superframe_bytes_remain);
+		int        ret  = 0;
+		switch (m_sample_encoding) {
+			case AjmSampleEncoding::S16:
+				ret = atrac9_decode_pcm16(m_vibration.get(), input, size,
+				                          reinterpret_cast<int16_t*>(m_pcm_buffer.data()), bytes_used);
+				break;
+			case AjmSampleEncoding::Float:
+				ret = atrac9_decode_float(m_vibration.get(), input, size,
+				                          reinterpret_cast<float*>(m_pcm_buffer.data()), bytes_used);
+				break;
+			case AjmSampleEncoding::S32: {
+				// LibAtrac9's S32 is the rounded PCM16-scale sample; match it.
+				m_vibration_pcm.resize(m_pcm_buffer.size() / sizeof(int32_t));
+				ret = atrac9_decode(m_vibration.get(), input, size, m_vibration_pcm.data(), bytes_used);
+				auto* out = reinterpret_cast<int32_t*>(m_pcm_buffer.data());
+				for (size_t i = 0; ret >= 0 && i < m_vibration_pcm.size(); ++i) {
+					out[i] = static_cast<int32_t>(std::lround(m_vibration_pcm[i]));
+				}
+				break;
+			}
+			default:
+				EXIT("unsupported AJM PCM sample encoding %u\n", static_cast<uint32_t>(m_sample_encoding));
+		}
+		return ret < 0 ? ret : 0;
+	}
+
 	int DecodeFrame(const uint8_t* input, int* bytes_used) {
+		if (m_vibration != nullptr) {
+			return DecodeVibrationFrame(input, bytes_used);
+		}
 		if (m_streams.size() == 1) {
 			return DecodeStream(m_streams[0].handle.get(), input, m_pcm_buffer.data(), bytes_used);
 		}
@@ -638,6 +683,8 @@ private:
 	Atrac9CodecInfo      m_codec_info {};
 	std::vector<uint8_t> m_pcm_buffer;
 	std::vector<uint8_t> m_stream_pcm;
+	AjmAt9VibHandle      m_vibration {nullptr, atrac9_free};
+	std::vector<float>   m_vibration_pcm;
 };
 
 } // namespace Libs::Audio::Ajm
