@@ -669,45 +669,68 @@ struct MsbPart {
     bool mod_only = false;
 };
 
+u32 st_msb_names = 0, st_msb_backref = 0;
+std::string g_msb_sample;
+
+// Names in UTF-16 or single-byte; the record is the 4-aligned position up to 0x2000 bytes
+// before the name whose first i64 is the distance to it. Field run 4: the first version (UTF-16
+// only, 0x800 back, scale check) matched 0 of 1731 parts, so only the position and rotation are
+// checked now and the first record found is dumped.
 std::vector<MsbPart> MsbParts(const std::vector<u8>& d) {
     std::vector<MsbPart> out;
     const size_t n = d.size();
-    for (size_t i = 0; i + 26 <= n; i += 2) {
-        if (d[i] != 'o' || d[i + 1] != 0 || (i >= 2 && d[i - 2] != 0)) {
-            continue;
-        }
-        std::string t;
-        for (size_t k = i; k + 1 < n && t.size() < 13; k += 2) {
-            if (d[k + 1] != 0 || d[k] == 0) {
+    st_msb_names = st_msb_backref = 0;
+    for (int wide = 1; wide >= 0; --wide) {
+        const size_t step = wide ? 2 : 1;
+        for (size_t i = 0; i + 13 * step <= n; i += step) {
+            if (d[i] != 'o' || (wide && d[i + 1] != 0) || (i >= step && d[i - step] != 0)) {
+                continue;
+            }
+            std::string t;
+            for (size_t k = i; k + step <= n && t.size() < 13; k += step) {
+                if (d[k] == 0 || (wide && d[k + 1] != 0)) {
+                    break;
+                }
+                t.push_back(char(d[k]));
+            }
+            if (t.size() != 12 || t[7] != '_' || (d[i + 12 * step] != 0)) {
+                continue;
+            }
+            ++st_msb_names;
+            for (size_t back = 8; back <= 0x2000 && back <= i; back += 1) {
+                const size_t r = i - back;
+                if ((r & 3) != 0 || r + 0x50 > n || Le64(d.data() + r) != back) {
+                    continue;
+                }
+                ++st_msb_backref;
+                float f[6];
+                std::memcpy(f, d.data() + r + 0x20, sizeof(f));
+                bool ok = true;
+                for (int k = 0; k < 3; ++k) {
+                    ok = ok && std::isfinite(f[k]) && std::fabs(f[k]) < 1e5f &&
+                         std::isfinite(f[3 + k]) && std::fabs(f[3 + k]) <= 1000.f;
+                }
+                if (g_msb_sample.empty()) {
+                    for (size_t k = 0; k < 0x50; k += 4) {
+                        g_msb_sample += fmt::format("{:08x} ", Le32(d.data() + r + k));
+                    }
+                    g_msb_sample += fmt::format("(name {} at +{:#x}, {})", t, back,
+                                                wide ? "UTF-16" : "single-byte");
+                }
+                if (!ok) {
+                    break;
+                }
+                MsbPart p;
+                p.name = t;
+                std::copy(f, f + 3, p.pos);
+                p.type = s32(Le32(d.data() + r + 8));
+                p.index = s32(Le32(d.data() + r + 0xc));
+                p.model = s32(Le32(d.data() + r + 0x10));
+                out.push_back(std::move(p));
                 break;
             }
-            t.push_back(char(d[k]));
         }
-        if (t.size() != 12 || t[7] != '_') {
-            continue;
-        }
-        for (size_t back = 8; back <= 0x800 && back <= i; back += 4) {
-            const size_t r = i - back;
-            if (r + 0x44 > n || Le64(d.data() + r) != back) {
-                continue;
-            }
-            float f[9];
-            std::memcpy(f, d.data() + r + 0x20, sizeof(f));
-            bool ok = true;
-            for (int k = 0; k < 3; ++k) {
-                ok = ok && std::isfinite(f[k]) && std::fabs(f[k]) < 1e5f && f[6 + k] > 0.001f &&
-                     f[6 + k] < 1000.f;
-            }
-            if (!ok) {
-                continue;
-            }
-            MsbPart p;
-            p.name = t;
-            std::copy(f, f + 3, p.pos);
-            p.type = s32(Le32(d.data() + r + 8));
-            p.index = s32(Le32(d.data() + r + 0xc));
-            p.model = s32(Le32(d.data() + r + 0x10));
-            out.push_back(std::move(p));
+        if (!out.empty()) {
             break;
         }
     }
@@ -720,6 +743,7 @@ void StoreMsbParts(const std::string& map, const std::vector<u8>& mod_msb,
                    const std::set<std::string>& vanilla_parts, bool have_vanilla,
                    const std::vector<u8>& vanilla_msb) {
     auto parts = MsbParts(mod_msb);
+    const u32 names = st_msb_names, backrefs = st_msb_backref;
     std::map<s32, std::string> vanilla_index;
     if (have_vanilla) {
         for (const auto& v : MsbParts(vanilla_msb)) {
@@ -745,7 +769,11 @@ void StoreMsbParts(const std::string& map, const std::vector<u8>& mod_msb,
                                     : "");
         }
     }
-    LOG_INFO(Core, "[objcol] msb {} object part records {} (with position){}", map, parts.size(),
+    LOG_INFO(Core,
+             "[objcol] msb {} object part records {} (with position; names {}, records "
+             "pointing at a name {}; first record: {}){}",
+             map, parts.size(), names, backrefs,
+             g_msb_sample.empty() ? std::string("none") : g_msb_sample,
              mods.empty() ? std::string() : " | mod-only parts: " + mods);
     std::scoped_lock lk{g_mutex};
     g_msb_parts[map] = std::move(parts);
@@ -1776,6 +1804,49 @@ void MapTick(double now) {
     std::erase_if(g_pending_cmp, [](const PendingCmp& pc) { return pc.done[0] && pc.done[1]; });
 }
 
+thread_local u64 t_caller_rbp = 0;
+std::set<std::string> g_paths;
+u32 g_path_lines = 0;
+
+// The game's functions keep rbp frames (push rbp; mov rbp,rsp): from addBodies' entry, the
+// return address and then [rbp+8] of each caller frame give the call path.
+u64 ShapeVt(u64 shape) {
+    u64 vt = 0;
+    Rd(shape, vt);
+    return vt;
+}
+
+// body+0x88 holds the game's owner of the body (0x1e3fc70 stores "param_1 + 0x20" there):
+// its address and the vtable of the object it points into.
+std::string OwnerText(u64 owner) {
+    u64 vt = 0;
+    if (!IsPtr(owner) || !Rd(owner, vt)) {
+        return owner ? fmt::format("{:#x}", owner) : std::string("none");
+    }
+    return fmt::format("{:#x} vtable {}", owner,
+                       vt >= g_eboot && vt < g_eboot + 0x6000000
+                           ? fmt::format("eboot+{:#x}", vt - g_eboot)
+                           : fmt::format("{:#x}", vt));
+}
+
+std::string CallPath(u64 ret) {
+    std::string s = fmt::format("eboot+{:#x}", ret - g_eboot);
+    u64 fp = t_caller_rbp;
+    for (int k = 0; k < 6 && IsPtr(fp); ++k) {
+        u64 frame[2];
+        if (!SafeCopy(frame, fp, sizeof(frame)) || frame[1] < g_eboot ||
+            frame[1] >= g_eboot + 0x5000000) {
+            break;
+        }
+        s += fmt::format(" <- eboot+{:#x}", frame[1] - g_eboot);
+        if (frame[0] <= fp) {
+            break;
+        }
+        fp = frame[0];
+    }
+    return s;
+}
+
 void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
     if (n <= 0 || n > (1 << 16)) {
         return;
@@ -1816,6 +1887,19 @@ void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
             b.owner = OwnerOf(shape);
         }
         b.flags = bb.Flags();
+        if ((b.flags & 5) && g_path_lines < 120) {
+            const std::string path = CallPath(ret);
+            const std::string key = fmt::format("{} {:#x} {}", Motion(b.flags), bb.Filter(), path);
+            if (g_paths.insert(key).second) {
+                ++g_path_lines;
+                LOG_INFO(Core,
+                         "[objcol] add path: {} body #{} filter {:#x} layer {} shape eboot+{:#x} "
+                         "at ({:.1f}, {:.1f}, {:.1f}), mode {}, owner (body+0x88) {}, map {}: {}",
+                         Motion(b.flags), id, bb.Filter(), bb.Layer(), ShapeVt(shape) - g_eboot,
+                         bb.Pos(0), bb.Pos(1), bb.Pos(2), mode, OwnerText(Le64(bb.b + 0x88)), g_map,
+                         path);
+            }
+        }
         if (mode == 0) {
             if (b.state == State::InWorld) {
                 continue;
@@ -1922,8 +2006,9 @@ void GuardedRemove(const u64* regs) {
     }
 }
 
-void PS4_SYSV_ABI HookAdd(const u64* regs) {
-    // regs: rbx r11 r10 r9 r8 rdi rsi rdx rcx rax, return address
+void PS4_SYSV_ABI HookAdd(const u64* regs, u64 rbp) {
+    // regs: rbx r11 r10 r9 r8 rdi rsi rdx rcx rax, return address; rbp: the caller's frame
+    t_caller_rbp = rbp;
     GuardedAdd(regs);
 }
 
@@ -2479,7 +2564,7 @@ void* AllocExec(size_t n) {
 
 // Saves the caller-saved registers and xmm0..7, calls host(regs), restores them, runs the
 // relocated prologue and jumps back after it (same cave as bb_native_mv_hook.cpp).
-std::vector<u8> BuildCave(u64 host, const u8* prologue, u32 len, u64 back) {
+std::vector<u8> BuildCave(u64 host, const u8* prologue, u32 len, u64 back, bool pass_rbp = false) {
     std::vector<u8> e;
     const auto put = [&](std::initializer_list<u8> v) { e.insert(e.end(), v); };
     const auto put64 = [&](u64 v) {
@@ -2499,6 +2584,9 @@ std::vector<u8> BuildCave(u64 host, const u8* prologue, u32 len, u64 back) {
         }
     }
     put({0x48, 0x89, 0xdf});
+    if (pass_rbp) {
+        put({0x48, 0x89, 0xee}); // mov rsi, rbp (the caller's frame at a function entry)
+    }
     put({0x48, 0xb8});
     put64(host);
     put({0xff, 0xd0});
@@ -2661,7 +2749,7 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
     u8* at_add = reinterpret_cast<u8*>(eboot_base + *add);
     u8* at_rem = reinterpret_cast<u8*>(eboot_base + *rem);
     const auto c1 = BuildCave(reinterpret_cast<u64>(&HookAdd), at_add, AddPrologue,
-                              reinterpret_cast<u64>(at_add + AddPrologue));
+                              reinterpret_cast<u64>(at_add + AddPrologue), true);
     const auto c2 = BuildCave(reinterpret_cast<u64>(&HookRemove), at_rem, RemovePrologue,
                               reinterpret_cast<u64>(at_rem + RemovePrologue));
     std::memcpy(cave, c1.data(), c1.size());
