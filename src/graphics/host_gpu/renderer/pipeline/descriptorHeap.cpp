@@ -325,8 +325,8 @@ void GuestImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 void GuestImageHeap::Queue(std::vector<ImageHeapChange>&& changes) {
 	// The game wrote the entry again: it is resolved as new.
 	for (const auto& change: changes) {
-		m_images.at(change.slot).waiting = false;
-		m_images.at(change.slot).misses  = 0;
+		Unwait(change.slot);
+		m_images.at(change.slot).misses = 0;
 	}
 	if (m_pending.empty()) {
 		m_pending = std::move(changes);
@@ -343,9 +343,21 @@ void GuestImageHeap::Stale(Common::SlotId image) {
 
 void GuestImageHeap::Wait(uint32_t slot, uint64_t address) {
 	Clear(slot);
+	Unwait(slot); // a slot waits at one address: its last
 	m_images.at(slot).waiting = true;
+	m_images.at(slot).awaited = address;
 	auto& slots = m_waiting[address];
 	if (std::ranges::find(slots, slot) == slots.end()) slots.push_back(slot);
+}
+
+void GuestImageHeap::Unwait(uint32_t slot) {
+	auto& record = m_images.at(slot);
+	if (!record.waiting) return;
+	record.waiting = false;
+	if (const auto found = m_waiting.find(record.awaited); found != m_waiting.end()) {
+		std::erase(found->second, slot);
+		if (found->second.empty()) m_waiting.erase(found);
+	}
 }
 
 void GuestImageHeap::Arrived(uint64_t address) {
@@ -353,7 +365,7 @@ void GuestImageHeap::Arrived(uint64_t address) {
 	if (found == m_waiting.end()) return;
 	for (const auto slot: found->second) {
 		// A slot whose entry changed since is resolved by that change.
-		if (m_images[slot].waiting && m_images[slot].misses < 4u) {
+		if (m_images[slot].waiting && m_images[slot].awaited == address && m_images[slot].misses < 4u) {
 			++m_images[slot].misses;
 			Retry(slot);
 		}

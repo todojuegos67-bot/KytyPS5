@@ -148,9 +148,12 @@ private:
 		Descriptor     descriptor {};
 		bool           waiting = false;
 		uint8_t        misses  = 0; // retries since it last showed an image
+		uint64_t       awaited = 0; // the address it is listed under in m_waiting while waiting
 	};
 
 	void WriteInfo(uint32_t slot, uint32_t info);
+	// The slot stops waiting and leaves m_waiting (its address goes when no slot waits there).
+	void Unwait(uint32_t slot);
 	void WriteDescriptor(const vk::WriteDescriptorSet* writes, uint32_t count);
 
 	GraphicContext&                                     m_graphics;
