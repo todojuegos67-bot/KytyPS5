@@ -57,7 +57,13 @@ public:
 
 	constexpr BitArray() = default;
 	BitArray(const BitArray& other): BitArray(other, 0, N) {}
-	BitArray& operator=(const BitArray&) = delete;
+	// Word by word, each word atomic as the rest (lean's region manager keeps the protection last applied).
+	BitArray& operator=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, other.Load(word));
+		}
+		return *this;
+	}
 
 	BitArray(const BitArray& other, size_t start, size_t end) {
 		ForEachWord(start, end, [&](size_t word, uint64_t mask) {
@@ -189,6 +195,45 @@ public:
 
 	[[nodiscard]] const_iterator begin() const { return Iterator(*this, 0); }
 	[[nodiscard]] const_iterator end() const { return Iterator(*this, N); }
+
+	BitArray& operator^=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, Load(word) ^ other.Load(word));
+		}
+		return *this;
+	}
+
+	[[nodiscard]] BitArray operator^(const BitArray& other) const {
+		BitArray result(*this);
+		result ^= other;
+		return result;
+	}
+
+	BitArray& operator|=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, Load(word) | other.Load(word));
+		}
+		return *this;
+	}
+
+	[[nodiscard]] BitArray operator|(const BitArray& other) const {
+		BitArray result(*this);
+		result |= other;
+		return result;
+	}
+
+	BitArray& operator&=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, Load(word) & other.Load(word));
+		}
+		return *this;
+	}
+
+	[[nodiscard]] BitArray operator&(const BitArray& other) const {
+		BitArray result(*this);
+		result &= other;
+		return result;
+	}
 
 	[[nodiscard]] BitArray operator~() const {
 		BitArray result;

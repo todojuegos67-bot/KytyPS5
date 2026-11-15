@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 
+#include <string>
 #include <string_view>
 
 namespace Common {
@@ -11,6 +12,22 @@ namespace Common {
 [[noreturn]] void DbgExitHandler(char const* file, int line, std::string_view text);
 [[noreturn]] void DbgExitIfHandler(char const* expr, char const* file, int line);
 [[noreturn]] void DbgNotImplementedHandler(char const* expr, char const* file, int line);
+
+// While one lives on a thread, a fatal condition there throws ExitException instead of ending the
+// process: for work whose failure only loses a guess (compute ahead's translations).
+struct ExitException {
+	std::string message;
+};
+class ScopedExitThrows {
+public:
+	ScopedExitThrows();
+	~ScopedExitThrows();
+	ScopedExitThrows(const ScopedExitThrows&)            = delete;
+	ScopedExitThrows& operator=(const ScopedExitThrows&) = delete;
+
+private:
+	bool m_previous;
+};
 
 } // namespace Common
 

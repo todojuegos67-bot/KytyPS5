@@ -35,6 +35,8 @@ enum class Counter {
 	BufferUploadBytes,
 	BufferDownloadBytes,
 	BufferEvictions,
+	BufferPreflushHits,  // Read backs served from pre-flushed copies (BufferCache::PublishPreflushed).
+	BufferPreflushBytes, // Copied by pre-flushes at the end of command buffers.
 	// Presentation.
 	FlipsRequested,
 	FlipsRejected, // Guest flip queue was full.
