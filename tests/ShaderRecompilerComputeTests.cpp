@@ -55121,13 +55121,13 @@ void CheckPm4Predication(RenderContext &renderer) {
 }
 
 void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
+  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
-  constexpr std::array<uint32_t, 2> payload{0x00100801u, 0x28000000u};
-  const auto consumed = HwCtxSetStencilInfo(
-      processor, 0xC0016900u, Pm4::DB_STENCIL_INFO, payload.data(), 1);
+  g_hw_ctx_indirect_func[Pm4::DB_STENCIL_INFO](processor, Pm4::DB_STENCIL_INFO,
+                                               0x00100801u);
   const auto &stencil = processor.GetCtx().GetDepthRenderTarget().stencil_info;
   Require("Pm4StencilInfoValueLane", "standalone register value",
-          consumed == 1 && stencil.format == Prospero::StencilFormat::k8UInt &&
+          stencil.format == Prospero::StencilFormat::k8UInt &&
               stencil.texture_compatibility ==
                   Prospero::TextureCompatibleStencil::kEnable &&
               !stencil.expclear_enabled && !stencil.htile_stencil_disabled,
@@ -55212,8 +55212,7 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
         Pm4::CB_COLOR0_FMASK + stride + 1u,
     };
     for (const auto offset : legacy_color_slots) {
-      legacy_slots_are_unhandled &= g_hw_ctx_func[offset] == nullptr &&
-                                    g_hw_ctx_indirect_func[offset] == nullptr;
+      legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[offset] == nullptr;
     }
   }
   // These offsets are the removed GCN DB_DEPTH_INFO, DB_DEPTH_SIZE, and
@@ -55222,12 +55221,10 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
   constexpr std::array<uint32_t, 3> legacy_depth_slots{0x000fu, 0x0016u,
                                                        0x0017u};
   for (const auto offset : legacy_depth_slots) {
-    legacy_slots_are_unhandled &= g_hw_ctx_func[offset] == nullptr &&
-                                  g_hw_ctx_indirect_func[offset] == nullptr;
+    legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[offset] == nullptr;
   }
   // Removed GCN PA_SC_NGG_MODE_CNTL.
-  legacy_slots_are_unhandled &= g_hw_ctx_func[0x0314u] == nullptr &&
-                                g_hw_ctx_indirect_func[0x0314u] == nullptr;
+  legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[0x0314u] == nullptr;
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
@@ -55262,14 +55259,10 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
   const bool native_index_size_packet_complete =
       packet.Process(index_size_execution, index_size_packet) ==
           Pm4ProcessResult::Complete &&
-      g_hw_uc_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
       g_hw_uc_indirect_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
-      g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr &&
       g_hw_uc_indirect_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr;
 
   const bool native_ps_address_slots_are_handled =
-      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
-      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr;
   const bool native_pace_slots_are_handled =
@@ -55522,12 +55515,16 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
                                             std::bit_cast<uint32_t>(-3.25f),
                                             std::bit_cast<uint32_t>(32.0f),
                                             std::bit_cast<uint32_t>(4.5f)};
-  const auto consumed = HwCtxSetPolyOffsetRegisters(
-      processor, KYTY_PM4(8, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
-      Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL, payload.data(), 0);
+  std::array<uint32_t, 2 + payload.size()> packet{
+      KYTY_PM4(8, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL};
+  std::copy(payload.begin(), payload.end(), packet.begin() + 2);
+  Pm4Execution execution;
+  const bool complete =
+      processor.Process(execution, packet) == Pm4ProcessResult::Complete;
   const auto &direct = processor.GetCtx().GetPolyOffset();
   Require("Pm4PolygonOffset", "direct registers",
-          consumed == payload.size() && direct.neg_num_db_bits == -16 &&
+          complete && direct.neg_num_db_bits == -16 &&
               !direct.db_is_float_fmt && direct.clamp == 2.5f &&
               direct.front_scale == 16.0f && direct.front_offset == -3.25f &&
               direct.back_scale == 32.0f && direct.back_offset == 4.5f,

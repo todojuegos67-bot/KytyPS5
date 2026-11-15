@@ -15,9 +15,8 @@ inline bool PathListHas(const char* variable, const char* hash) {
 }
 
 inline bool UpstreamPathOn(const char* hash) {
-	// Measured equal or better in Pro (session 65, 2026-11-13): 21b44f121 PM4 register tables, 8810d3869 device
-	// creation from structure chains.
-	static constexpr const char* default_on = "21b44f121,8810d3869";
+	// Measured equal or better in Pro (session 65, 2026-11-13): 8810d3869 device creation from structure chains.
+	static constexpr const char* default_on = "8810d3869";
 	return PathListHas("KYTY_UPSTREAM_PATHS", hash) ||
 	       (std::strstr(default_on, hash) != nullptr && !PathListHas("KYTY_LEAN_PATHS", hash));
 }

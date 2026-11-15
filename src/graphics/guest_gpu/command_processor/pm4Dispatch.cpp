@@ -8,96 +8,6 @@ hw_uc_indirect_func_t  g_hw_uc_indirect_func[Pm4::UC_NUM]  = {};
 
 namespace {
 
-constexpr auto MakeContextDispatchTable() {
-	std::array<hw_ctx_parser_func_t, Pm4::CX_NUM> g_hw_ctx_func {};
-
-	g_hw_ctx_func[Pm4::DB_RENDER_CONTROL]            = HwCtxSetRenderControl;
-	g_hw_ctx_func[Pm4::DB_COUNT_CONTROL]             = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_RENDER_OVERRIDE]           = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_RENDER_OVERRIDE2]          = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_DFSM_CONTROL]              = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_RMI_L2_CACHE_CONTROL]      = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::CB_RMI_GL2_CACHE_CONTROL]     = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::TA_BC_BASE_ADDR]              = HwCtxSetBorderColorTableAddr;
-	g_hw_ctx_func[Pm4::TA_BC_BASE_ADDR_HI]           = HwCtxSetBorderColorTableAddr;
-	g_hw_ctx_func[Pm4::DB_STENCIL_CLEAR]             = HwCtxSetStencilClear;
-	g_hw_ctx_func[Pm4::DB_DEPTH_CLEAR]               = HwCtxSetDepthClear;
-	g_hw_ctx_func[Pm4::PA_SC_SCREEN_SCISSOR_TL]      = HwCtxSetScreenScissor;
-	g_hw_ctx_func[Pm4::DB_STENCIL_INFO]              = HwCtxSetStencilInfo;
-	g_hw_ctx_func[Pm4::PA_SU_HARDWARE_SCREEN_OFFSET] = HwCtxSetHardwareScreenOffset;
-	g_hw_ctx_func[Pm4::PA_SC_WINDOW_OFFSET]          = HwCtxSetWindowOffset;
-	g_hw_ctx_func[Pm4::PA_SC_WINDOW_SCISSOR_TL]      = HwCtxSetWindowScissor;
-	for (auto cmd_offset = Pm4::PA_SC_CLIPRECT_RULE; cmd_offset < Pm4::PA_SC_CLIPRECT_0_TL + 8u;
-	     cmd_offset++) {
-		g_hw_ctx_func[cmd_offset] = HwCtxSetClipRect;
-	}
-	g_hw_ctx_func[Pm4::CB_TARGET_MASK]                 = HwCtxSetRenderTargetMask;
-	g_hw_ctx_func[Pm4::PA_SC_GENERIC_SCISSOR_TL]       = HwCtxSetGenericScissor;
-	g_hw_ctx_func[Pm4::CB_DCC_CONTROL]                 = HwCtxSetCbDccControl;
-	g_hw_ctx_func[Pm4::DB_STENCIL_CONTROL]             = HwCtxSetStencilControl;
-	g_hw_ctx_func[Pm4::DB_STENCILREFMASK]              = HwCtxSetStencilMask;
-	g_hw_ctx_func[Pm4::SPI_PS_INPUT_CNTL_0]            = HwCtxSetPsInput;
-	g_hw_ctx_func[Pm4::SPI_TMPRING_SIZE]               = HwCtxSetSpiTmpringSize;
-	g_hw_ctx_func[Pm4::DB_DEPTH_CONTROL]               = HwCtxSetDepthControl;
-	g_hw_ctx_func[Pm4::DB_EQAA]                        = HwCtxSetEqaaControl;
-	g_hw_ctx_func[Pm4::CB_COLOR_CONTROL]               = HwCtxSetColorControl;
-	g_hw_ctx_func[Pm4::DB_DEPTH_BOUNDS_MIN]            = HwCtxSetDepthBounds;
-	g_hw_ctx_func[Pm4::DB_DEPTH_BOUNDS_MAX]            = HwCtxSetDepthBounds;
-	g_hw_ctx_func[Pm4::PA_SU_POINT_SIZE]               = HwCtxSetPointState;
-	g_hw_ctx_func[Pm4::PA_SU_POINT_MINMAX]             = HwCtxSetPointState;
-	g_hw_ctx_func[Pm4::PA_CL_CLIP_CNTL]                = HwCtxSetClipControl;
-	g_hw_ctx_func[Pm4::PA_SU_SC_MODE_CNTL]             = HwCtxSetModeControl;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL]  = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_CLAMP]        = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE]  = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_FRONT_OFFSET] = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_BACK_SCALE]   = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET]  = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_CL_VTE_CNTL]                 = HwCtxSetViewportTransformControl;
-	g_hw_ctx_func[Pm4::PA_SU_LINE_CNTL]                = HwCtxSetLineControl;
-	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_LR]            = HwCtxSetFovWindow;
-	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_TB]            = HwCtxSetFovWindow;
-	g_hw_ctx_func[Pm4::PA_SC_MODE_CNTL_0]              = HwCtxSetScanModeControl;
-	g_hw_ctx_func[Pm4::PA_SC_MODE_CNTL_1]              = HwCtxSetScanModeControl1;
-	g_hw_ctx_func[Pm4::PA_SC_AA_CONFIG]                = HwCtxSetAaConfig;
-	for (auto cmd_offset = Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0;
-	     cmd_offset < Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 + 16; cmd_offset++) {
-		g_hw_ctx_func[cmd_offset] = HwCtxSetAaSampleControl;
-	}
-	g_hw_ctx_func[Pm4::PA_SC_CENTROID_PRIORITY_0]             = HwCtxSetCentroidPriority;
-	g_hw_ctx_func[Pm4::PA_SC_CENTROID_PRIORITY_1]             = HwCtxSetCentroidPriority;
-	g_hw_ctx_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0]               = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1]               = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SU_VTX_CNTL]                        = HwCtxSetVtxControl;
-	g_hw_ctx_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK]       = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_0]                   = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_1]                   = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::VGT_DRAW_PAYLOAD_CNTL]                 = HwCtxSetDrawPayloadControl;
-	g_hw_ctx_func[Pm4::VGT_PRIMITIVEID_RESET]                 = HwCtxSetPrimitiveIdReset;
-	g_hw_ctx_func[Pm4::PA_CL_OBJPRIM_ID_CNTL]                 = HwCtxSetObjprimIdControl;
-	g_hw_ctx_func[Pm4::VGT_SHADER_STAGES_EN]                  = HwCtxSetShaderStages;
-
-	for (uint32_t slot = 0; slot < 8; slot++) {
-		g_hw_ctx_func[Pm4::CB_COLOR0_INFO + slot * 15] = HwCtxSetColorInfo;
-
-		g_hw_ctx_func[Pm4::CB_BLEND0_CONTROL + slot * 1] = HwCtxSetBlendControl;
-	}
-
-	for (uint32_t viewport = 0; viewport < 16; viewport++) {
-		g_hw_ctx_func[Pm4::PA_SC_VPORT_SCISSOR_0_TL + viewport * 2] = HwCtxSetViewportScissor;
-		g_hw_ctx_func[Pm4::PA_SC_VPORT_SCISSOR_0_BR + viewport * 2] = HwCtxSetViewportScissor;
-		g_hw_ctx_func[Pm4::PA_SC_VPORT_ZMIN_0 + viewport * 2]       = HwCtxSetViewportZ;
-		g_hw_ctx_func[Pm4::PA_SC_VPORT_ZMAX_0 + viewport * 2]       = HwCtxSetViewportZ;
-		for (uint32_t field = 0; field < 6; field++) {
-			g_hw_ctx_func[Pm4::PA_CL_VPORT_XSCALE + viewport * 6 + field] =
-			    HwCtxSetViewportScaleOffset;
-		}
-	}
-
-	return g_hw_ctx_func;
-}
-
 constexpr auto MakeShaderDispatchTable() {
 	std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func {};
 
@@ -138,37 +48,8 @@ constexpr auto MakeShaderDispatchTable() {
 	g_hw_sh_func[Pm4::COMPUTE_TMPRING_SIZE]            = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC3]               = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PACE_ID]                 = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS]  = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS]  = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS]  = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = HwShSetRegisters;
 
 	return g_hw_sh_func;
-}
-
-constexpr auto MakeUconfigDispatchTable() {
-	std::array<hw_uc_parser_func_t, Pm4::UC_NUM> g_hw_uc_func {};
-
-	g_hw_uc_func[Pm4::VGT_PRIMITIVE_TYPE]        = HwUcSetPrimitiveType;
-	g_hw_uc_func[Pm4::VGT_INDEX_TYPE]            = HwUcSetIndexType;
-	g_hw_uc_func[Pm4::VGT_OBJECT_ID]             = HwUcSetObjectId;
-	g_hw_uc_func[Pm4::TEXTURE_GRADIENT_FACTORS]  = HwUcSetTextureGradientFactors;
-	g_hw_uc_func[Pm4::TEXTURE_GRADIENT_CONTROL]  = HwUcSetTextureGradientFactors;
-	g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM]        = HwUcSetIaMultiVgtParam;
-	g_hw_uc_func[Pm4::GE_MULTI_PRIM_IB_RESET_EN] = HwUcSetMultiPrimIbReset;
-	g_hw_uc_func[Pm4::TA_CS_BC_BASE_ADDR]        = HwUcSetBorderColorTableAddr;
-	g_hw_uc_func[Pm4::TA_CS_BC_BASE_ADDR_HI]     = HwUcSetBorderColorTableAddr;
-	g_hw_uc_func[Pm4::GE_INDX_OFFSET]            = HwUcSetGeIndexOffset;
-	g_hw_uc_func[Pm4::GDS_OA_CNTL]               = HwUcSetGdsOaRegisters;
-	g_hw_uc_func[Pm4::GDS_OA_COUNTER]            = HwUcSetGdsOaRegisters;
-	g_hw_uc_func[Pm4::GDS_OA_ADDRESS]            = HwUcSetGdsOaRegisters;
-
-	return g_hw_uc_func;
 }
 
 constexpr auto MakeOpcodeDispatchTable() {
@@ -233,12 +114,8 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 
 } // namespace
 
-constinit const std::array<hw_ctx_parser_func_t, Pm4::CX_NUM> g_hw_ctx_func =
-    MakeContextDispatchTable();
 constinit const std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func =
     MakeShaderDispatchTable();
-constinit const std::array<hw_uc_parser_func_t, Pm4::UC_NUM> g_hw_uc_func =
-    MakeUconfigDispatchTable();
 constinit const std::array<cp_op_parser_func_t, 256> g_cp_op_func = MakeOpcodeDispatchTable();
 constinit const std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func =
     MakeCustomOpcodeDispatchTable();
