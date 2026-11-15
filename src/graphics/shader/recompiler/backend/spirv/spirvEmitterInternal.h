@@ -113,6 +113,11 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// A wave32 program whose host subgroup is 64 wide holds two guest waves per subgroup (mesh shaders on AMD,
+	// which cannot require a subgroup size for the stage). Lanes are guest lanes (0-31) everywhere; ballots give
+	// the caller's own 32-bit half, shuffles add the half's base, votes and reductions stay within the half
+	// (EmitSubgroupBallot, EmitSubgroupShuffleLane).
+	bool                                             split_subgroup          = false;
 	// IR::Program::wave_split: a wave64 program one guest lane per invocation, its wave over two
 	// full subgroups; the wave-wide operations exchange through wave_exchange_variable (u32[2]).
 	bool                                             wave_split              = false;
@@ -347,6 +352,13 @@ uint32_t MrtOutputType(EmitterState& state, uint32_t index);
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+// OpGroupNonUniformBallot of a guest wave: in split-subgroup mode the caller's 32-bit half is returned in the
+// first word and the others are zero.
+uint32_t EmitSubgroupBallot(EmitterState& state, uint32_t predicate);
+// The host subgroup lane of a guest lane (split-subgroup mode adds the caller's half).
+uint32_t EmitSubgroupShuffleLane(EmitterState& state, uint32_t lane);
+// The group operation of a subgroup reduction: within 32-lane clusters in split-subgroup mode.
+void     EmitSubgroupReduce(EmitterState& state, spv::Op op, uint32_t type, uint32_t result, uint32_t value);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

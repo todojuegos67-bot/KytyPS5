@@ -474,6 +474,9 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
+	if (state.split_subgroup && other_half == nullptr) {
+		return EmitSubgroupBallot(state, Def(predicate));
+	}
 	const auto low         = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
 	                          other_half == nullptr || half == 0 ? Def(predicate)
@@ -544,7 +547,7 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	}
 	if (other_half == nullptr) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
-		                          lane);
+		                          EmitSubgroupShuffleLane(state, lane));
 		return low;
 	}
 	const auto physical_lane =

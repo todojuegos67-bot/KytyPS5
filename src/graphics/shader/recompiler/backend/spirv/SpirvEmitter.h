@@ -41,6 +41,12 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   bool           emit_debug_info       = false,
                                   uint32_t       descriptor_set        = 0);
 
+// A coherent (GLC) buffer load is followed by a device-scope acquire barrier, so that a load polling for another
+// workgroup's write sees it. Without one, AMD's drivers keep serving the cached value; NVIDIA reloads anyway. The
+// device layer enables it on every vendor but NVIDIA.
+void SetCoherentLoadAcquire(bool enabled);
+bool GetCoherentLoadAcquire();
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_H_ */

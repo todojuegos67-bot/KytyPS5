@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -20,12 +21,13 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 	if (state.lane_count == 2) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
-	const auto shuffled = state.builder.AllocateId();
+	const auto host_target = EmitSubgroupShuffleLane(state, target);
+	const auto shuffled    = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-	                          ConstantU32(state, spv::ScopeSubgroup), source, target);
+	                          ConstantU32(state, spv::ScopeSubgroup), source, host_target);
 	const auto source_exec = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-	                          ConstantU32(state, spv::ScopeSubgroup), exec, target);
+	                          ConstantU32(state, spv::ScopeSubgroup), exec, host_target);
 	const auto source_active =
 	    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
 	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
@@ -200,8 +202,11 @@ void RecordBdaStore(EmitterState& state, uint32_t page, uint64_t bitmap_offset) 
 	const auto pointer = FaultElementPointer(state, word);
 	const auto scope   = ConstantU32(state, spv::ScopeDevice);
 	const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer, scope, relaxed);
+	// A plain load: it only spares the atomic when the bit is set already, so a stale word costs one more
+	// atomic at most. AMD's Windows driver (32.0.21045) crashed compiling an atomic load followed by an
+	// atomic or on the same word.
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 	const auto missing =
 	    Binary(state, spv::OpIEqual, TypeBool(state),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, bit), ConstantU32(state, 0));
@@ -262,6 +267,10 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 		                          spv::MemoryAccessAlignedMask |
 		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
 		                          alignment);
+		// A coherent load polls another workgroup's write: AMD serves it from cache without an acquire.
+		if (coherent && GetCoherentLoadAcquire()) {
+			EmitAtomicMemoryBarrier(state, IR::ResourceKind::Buffer);
+		}
 		return value;
 	});
 }
@@ -444,6 +453,10 @@ static uint32_t LoadResourceElement(EmitterState& state, uint32_t type, uint32_t
 		                          resource.element_bits / 8u);
 	} else {
 		state.builder.AddFunction(spv::OpLoad, type, value, pointer, resource.memory_access);
+	}
+	// A coherent load polls another workgroup's write: AMD serves it from cache without an acquire.
+	if ((resource.memory_access & spv::MemoryAccessVolatileMask) != 0 && GetCoherentLoadAcquire()) {
+		EmitAtomicMemoryBarrier(state, IR::ResourceKind::Buffer);
 	}
 	return value;
 }
@@ -1750,7 +1763,8 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
+	                          ConstantU32(state, spv::ScopeSubgroup), atomic,
+	                          EmitSubgroupShuffleLane(state, source_lane));
 	return result;
 }
 
@@ -1910,10 +1924,8 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto word    = Binary(state, spv::OpShiftRightLogical, TypeU32(state), lane,
 	                            ConstantU32(state, 5));
 	const auto ballot_word = [&](uint32_t predicate) {
-		const auto ballot = state.builder.AllocateId();
+		const auto ballot = EmitSubgroupBallot(state, predicate);
 		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-		                          ConstantU32(state, spv::ScopeSubgroup), predicate);
 		state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), result, ballot, word);
 		return result;
 	};
@@ -1942,7 +1954,8 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                  EmitFindUMsb32(state, writers)), lane);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), source);
+	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0),
+	                          EmitSubgroupShuffleLane(state, source));
 	return Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
 }
 
