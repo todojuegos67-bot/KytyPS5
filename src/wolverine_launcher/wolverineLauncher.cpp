@@ -1183,7 +1183,9 @@ void WolverineLauncher::closeEvent(QCloseEvent* event) {
 	if (m_precompile != nullptr) {
 		m_precompile->disconnect(this);
 		m_precompile->write("quit\n");
-		m_precompile->waitForFinished(120000);
+		// A save still running after 2 minutes finishes on its own: destroyed with the window, the QProcess would
+		// kill it mid-write.
+		if (!m_precompile->waitForFinished(120000)) m_precompile->setParent(nullptr);
 	}
 	Save();
 	event->accept();
