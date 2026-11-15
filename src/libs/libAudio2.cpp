@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -201,6 +202,8 @@ struct AudioOut2ContextState {
 	uint32_t               num_grains          = 512;
 	uint64_t               last_update         = 0;
 	int                    object_audio_handle = 0;
+	// The device handle the last push gave a grain to (audioout2_context_device_handle_locked).
+	int                    last_device_handle  = 0;
 	uint32_t               max_ports           = 0;
 	// Channel slots precede object slots; each partition has its own creation limit.
 	std::vector<AudioOut2PortStateEntry> ports;
@@ -390,18 +393,73 @@ static size_t audioout2_pcm_size(const AudioOut2PortStateEntry& state) {
 	       audioout2_data_format_channels(state.data_format) * bytes_per_sample;
 }
 
-static bool audioout2_context_has_queueable_device(const AudioOut2ContextState& context) {
+// The audio handle of the context's first port with PCM and a device; between pushes, which consume the
+// ports' PCM, the device the last push fed; or 0.
+static int audioout2_context_device_handle_locked(const AudioOut2ContextState& context) {
 	for (const auto& state: context.ports) {
 		if (state.used && !state.pcm_data.empty()) {
 			const int handle = audioout2_port_type_is_object(state.port_type)
 			                       ? context.object_audio_handle
 			                       : state.audio_handle;
 			if (AudioInternal::AudioOutHasDevice(handle)) {
-				return true;
+				return handle;
 			}
 		}
 	}
-	return false;
+	return context.last_device_handle > 0 && AudioInternal::AudioOutHasDevice(context.last_device_handle)
+	           ? context.last_device_handle
+	           : 0;
+}
+
+static bool audioout2_context_has_queueable_device(const AudioOut2ContextState& context) {
+	return audioout2_context_device_handle_locked(context) != 0;
+}
+
+// The queue as the hardware reports it: grains pushed and not yet played. With a real device, that
+// is what SDL still holds for the context. A push returns at once while the queue has room and
+// blocks only while it is full; the level falls as the device plays.
+//
+// The game's mixer thread renders a grain into one buffer whenever the level shows room, and
+// another thread pushes it. When the push instead slept to pace SDL with the level held at 0-1,
+// the mixer rendered three grains per push into the same buffer: two of three were lost (the
+// menu music at several times the tempo, normal pitch, crackling).
+// KYTY_AUDIOOUT2_DEVICE_QUEUE=0 restores the timer model with the device pacing a sync push.
+static const bool g_audioout2_device_queue = [] {
+	const char* value = std::getenv("KYTY_AUDIOOUT2_DEVICE_QUEUE");
+	return value == nullptr || value[0] != '0';
+}();
+
+// SDL may hold this much beyond the queue depth before it counts: the depth alone (4 grains, 21 ms
+// with 256-sample grains) does not cover Windows scheduling, and the device ran dry.
+static constexpr uint64_t AUDIOOUT2_DEVICE_CUSHION_US = 20000;
+
+// Microseconds the context's device still has to play, or -1 when it has none: then the timer
+// model applies.
+static int64_t audioout2_device_queued_us_locked(const AudioOut2ContextState& context) {
+	const int handle = audioout2_context_device_handle_locked(context);
+	return handle > 0 ? AudioInternal::AudioOutQueuedUs(handle) : -1;
+}
+
+static int64_t audioout2_device_queued_us(AudioOut2ContextHandle ctx) {
+	Common::LockGuard lock(g_audioout2_state_mutex);
+	const auto*       context = audioout2_find_context_locked(ctx);
+	return context != nullptr ? audioout2_device_queued_us_locked(*context) : -1;
+}
+
+// The level from the device's queue, or from the timer.
+static uint32_t audioout2_level_locked(AudioOut2ContextState* state, int64_t device_queued_us) {
+	if (device_queued_us < 0) {
+		audioout2_update_context_locked(state);
+		return state->queued;
+	}
+	const auto grain_us = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+	const auto beyond   = static_cast<uint64_t>(device_queued_us) > AUDIOOUT2_DEVICE_CUSHION_US
+	                          ? static_cast<uint64_t>(device_queued_us) - AUDIOOUT2_DEVICE_CUSHION_US
+	                          : 0;
+	state->queued =
+	    static_cast<uint32_t>(std::min<uint64_t>((beyond + grain_us - 1) / grain_us, state->queue_depth));
+	state->last_update = audioout2_clock();
+	return state->queued;
 }
 
 static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
@@ -444,6 +502,9 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2S
 		return;
 	}
 	out.object_mix.clear();
+	if (const int handle = audioout2_context_device_handle_locked(*context); handle > 0) {
+		context->last_device_handle = handle;
+	}
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
 	// A port's PCM covers one grain: the push consumes it, so a port the game stops feeding
@@ -625,7 +686,54 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	return OK;
 }
 
+static int audioout2_push_device_queue(AudioOut2ContextHandle ctx, uint32_t blocking) {
+	for (;;) {
+		g_audioout2_state_mutex.Lock();
+		auto* state = audioout2_find_context_locked(ctx);
+		if (state == nullptr) {
+			g_audioout2_state_mutex.Unlock();
+			return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		}
+		const auto device_us = audioout2_device_queued_us_locked(*state);
+		if (audioout2_level_locked(state, device_us) < state->queue_depth) {
+			if (device_us < 0 && state->queued == 0) {
+				state->last_update = audioout2_clock();
+			}
+			state->queued++;
+			const auto depth      = state->queue_depth;
+			const auto grain_us   = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+			auto&      submission = audioout2_submission(*state);
+			g_audioout2_state_mutex.Unlock();
+			// The level paces the pushes: the device takes the grain at once.
+			audioout2_queue_context_audio(ctx, submission, device_us < 0 && blocking != 0);
+			// A blocking push returns once the queue has room for the next grain. The game's pushing
+			// thread wakes the mixer right after each push, and the mixer renders only when it sees
+			// room: returning with the queue full left the mixer asleep until the next frame woke
+			// it (300-500 ms at ~9 fps; the gameplay sound skipped).
+			if (blocking != 0 && device_us >= 0) {
+				const auto full_us = AUDIOOUT2_DEVICE_CUSHION_US + (depth - 1) * grain_us;
+				for (int64_t queued_us = audioout2_device_queued_us(ctx);
+				     queued_us >= 0 && static_cast<uint64_t>(queued_us) > full_us;
+				     queued_us = audioout2_device_queued_us(ctx)) {
+					Common::Thread::SleepMicro(500);
+				}
+			}
+			return OK;
+		}
+		g_audioout2_state_mutex.Unlock();
+
+		if (blocking == 0) {
+			return AUDIO_OUT2_ERROR_NOT_READY;
+		}
+		Common::Thread::SleepMicro(1000);
+	}
+}
+
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
+	if (g_audioout2_device_queue) {
+		return audioout2_push_device_queue(ctx, blocking);
+	}
+
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
@@ -672,7 +780,8 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
+		(void)audioout2_level_locked(
+		    state, g_audioout2_device_queue ? audioout2_device_queued_us_locked(*state) : -1);
 		if (queue_level != nullptr) {
 			*queue_level = state->queued;
 		}
