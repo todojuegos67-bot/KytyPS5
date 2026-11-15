@@ -1341,6 +1341,8 @@ std::string SysText(const SysRec& r) {
 // removed and not added again.
 extern std::map<std::string, u32> g_path_counts;
 extern std::map<u64, u64> g_producers;
+extern std::set<u64> g_obj_producers;
+bool IsPtr(u64 v);
 void SystemsReport(double now) {
     std::vector<std::string> removed, idle;
     u32 in_world = 0;
@@ -1364,6 +1366,49 @@ void SystemsReport(double now) {
         SysInfo(sys, r);
         idle.push_back(SysText(r) + fmt::format(" (rebuilt {} times, never added)", r.rebuilds));
     }
+    // Class 0x538d440 (slot +0x18 0x180d670, decompiled): system at +0x38 (ids +0x20, count
+    // +0x28), per-body desired byte at [+0x70] + 10 + i*4: in the world when bit 0 is set and
+    // bit 1 clear. Producers seen in a flush whose bodies are all "out":
+    std::string out_list;
+    u32 out_n = 0;
+    for (const u64 obj : g_obj_producers) {
+        u64 vt = 0, sys = 0, desired = 0, ids = 0;
+        u32 n = 0;
+        if (!Rd(obj, vt) || vt != g_eboot + 0x538d440 || !Rd(obj + 0x38, sys) || !IsPtr(sys) ||
+            !Rd(obj + 0x70, desired) || !IsPtr(desired) || !Rd(sys + 0x28, n) || n == 0 || n > 64 ||
+            !Rd(sys + 0x20, ids)) {
+            continue;
+        }
+        std::string bytes;
+        bool any_in = false;
+        for (u32 i = 0; i < n; ++i) {
+            u8 b = 0;
+            Rd(desired + 10 + i * 4, b);
+            any_in = any_in || ((b & 2) == 0 && (b & 1));
+            bytes += fmt::format("{:02x}", b);
+        }
+        if (any_in) {
+            continue;
+        }
+        ++out_n;
+        SysRec r;
+        SysInfo(sys, r);
+        if (out_n <= 40) {
+            out_list += fmt::format("{}{:#x} ({:.1f}, {:.1f}, {:.1f}) {} bodies {} desired {} "
+                                    "flags {:#x}",
+                                    out_list.empty() ? "" : "; ", obj, r.pos[0], r.pos[1], r.pos[2],
+                                    n, Motion(r.flags), bytes, [&] {
+                                        u8 f = 0;
+                                        Rd(obj + 0xa, f);
+                                        return f;
+                                    }());
+        }
+    }
+    LOG_INFO(Core,
+             "[objcol] map {} visit #{} (+{:.0f} s): object producers (0x538d440) seen {}, with "
+             "every body out of the world {}: {}",
+             g_map, g_map_visit, now - g_map_open, g_obj_producers.size(), out_n,
+             out_list.empty() ? "none" : out_list);
     std::string counts;
     for (const auto& [vt, v] : g_producers) {
         counts +=
@@ -1398,6 +1443,7 @@ struct PendingWatch {
 std::unordered_map<u64, PendingWatch> g_pending_watch;
 u64 st_flush = 0;
 
+std::set<u64> g_obj_producers;
 std::map<u64, u64> g_producers; // producer vtable (eboot offset) -> times seen in a flush
 
 // 0x1806e90 (decompiled): for (p = [fd4+0x30]; p != [fd4+0x38]; p += 8) if (*p) (*(*p)+0x18)(*p,
@@ -1416,6 +1462,9 @@ void CountProducers(u64 fd4) {
     for (const u64 obj : list) {
         u64 vt = 0;
         if (IsPtr(obj) && Rd(obj, vt)) {
+            if (vt == g_eboot + 0x538d440 && g_obj_producers.size() < 4096) {
+                g_obj_producers.insert(obj);
+            }
             ++g_producers[vt >= g_eboot ? vt - g_eboot : vt];
         }
     }
