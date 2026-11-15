@@ -66,8 +66,9 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               ResyncHostProtection(uint64_t vaddr, uint64_t size) { m_page_manager.ResyncHostProtection(vaddr, size); }
 	void               ApplyHostProtection(uint64_t vaddr, uint64_t size,
-	                                   Common::VirtualMemory::Mode (*guest_mode)(uint64_t, void*), void* context) {
-		m_page_manager.ApplyHostProtection(vaddr, size, guest_mode, context);
+	                                   Common::VirtualMemory::Mode (*guest_mode)(uint64_t, void*), void* context,
+	                                   bool guest_space = false) {
+		m_page_manager.ApplyHostProtection(vaddr, size, guest_mode, context, guest_space);
 	}
 	void               PrepareBda();
 	void               RunGarbageCollector();

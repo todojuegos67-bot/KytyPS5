@@ -35,8 +35,10 @@ public:
 	// protect per run, under the region lock, so no tracker change is lost and no page is opened for a moment: the tracker's
 	// where it watches the page, else the guest's (guest_mode, per page; its NoAccess wins). Protects directly, not through
 	// the guest address space, whose lock the caller may not take. guest_mode must take no lock the tracker holds.
+	// guest_space: protect through the guest address space instead (a guest mprotect, whose range can hold first-touch
+	// views' reserved granules), as the tracker's own protections do; the caller holds no state lock.
 	void ApplyHostProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode (*guest_mode)(uint64_t, void*),
-	                         void* context);
+	                         void* context, bool guest_space = false);
 
 private:
 	struct Impl;

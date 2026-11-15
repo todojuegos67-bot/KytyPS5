@@ -2979,11 +2979,18 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	g_virtual_ranges->QueryFragments(aligned_addr, aligned_len, &ranges);
 	// Lean (c7f883880): against make-ready (lazy protection), which must not apply the old mode after this protect.
 	std::lock_guard guest_protect(g_guest_protect_mutex);
+	// Pages the tracker may watch get their final mode in one protect under its region lock, below: protecting them
+	// with the guest's mode here and resyncing later opened them for a moment, and a CPU write then went unseen
+	// (audit 2026-11-15, 46).
+	const auto tracked = [&](const VirtualRanges::Range& range) {
+		return g_gpu_resources != nullptr && IsGpuAddressRange(range.start, range.size) && range.start % 4096u == 0 &&
+		       range.size % 4096u == 0;
+	};
 	{
 		std::lock_guard state(g_memory_state_mutex);
 		for (const auto& range: ranges) {
 			if (!IsCommittedRangeType(range.type)) continue;
-			if (!g_guest_address_space->Protect(range.start, range.size, mode)) {
+			if (!tracked(range) && !g_guest_address_space->Protect(range.start, range.size, mode)) {
 				EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
 				     " prot=0x%08x\n",
 				     range.start, range.size, prot);
@@ -2998,7 +3005,13 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 		for (const auto& range: ranges) {
 			if (IsCommittedRangeType(range.type) && IsGpuAddressRange(range.start, range.size)) {
 				GetGpuResources().GetBufferCache().UnmarkMemoryZero(range.start, range.size);
-				if (mode != VirtualMemory::Mode::NoAccess) {
+				if (tracked(range)) {
+					auto guest_mode = mode;
+					GetGpuResources().ApplyHostProtection(
+					    range.start, range.size,
+					    [](uint64_t, void* context) { return *static_cast<VirtualMemory::Mode*>(context); },
+					    &guest_mode, true);
+				} else if (mode != VirtualMemory::Mode::NoAccess) {
 					GetGpuResources().ResyncHostProtection(range.start, range.size);
 				}
 			}

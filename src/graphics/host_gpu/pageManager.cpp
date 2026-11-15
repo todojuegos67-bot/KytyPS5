@@ -362,7 +362,8 @@ void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 }
 
 void PageManager::ApplyHostProtection(uint64_t vaddr, uint64_t size,
-                                      Common::VirtualMemory::Mode (*guest_mode)(uint64_t, void*), void* context) {
+                                      Common::VirtualMemory::Mode (*guest_mode)(uint64_t, void*), void* context,
+                                      bool guest_space) {
 	using Mode = Common::VirtualMemory::Mode;
 	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE || vaddr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0) {
 		return;
@@ -384,7 +385,11 @@ void PageManager::ApplyHostProtection(uint64_t vaddr, uint64_t size,
 		for (auto page = chunk_begin + PAGE_SIZE; page <= chunk_end; page += PAGE_SIZE) {
 			const auto mode = page < chunk_end ? final_mode(page) : run_mode;
 			if (page == chunk_end || mode != run_mode) {
-				Common::VirtualMemory::Protect(run_begin, page - run_begin, run_mode);
+				if (guest_space) {
+					m_impl->Protect(run_begin, page - run_begin, run_mode);
+				} else {
+					Common::VirtualMemory::Protect(run_begin, page - run_begin, run_mode);
+				}
 				run_begin = page;
 				run_mode  = mode;
 			}
