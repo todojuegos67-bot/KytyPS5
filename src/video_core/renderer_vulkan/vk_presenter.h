@@ -132,6 +132,9 @@ public:
 
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
+    // bb-menu-ui: PrepareLastFrame + Present(frame, true) under bb_reuse_mutex, so the frame shown
+    // again is never one GetRenderFrame has already handed to the GPU thread for a new frame.
+    void PresentLastFrame();
 
 private:
     Frame* GetRenderFrame();
@@ -171,6 +174,20 @@ private:
     std::atomic<double> bb_game_frame_ms{16.6};
     std::chrono::steady_clock::time_point bb_last_game_present{};
     bool bb_imgui_ui_shown = false; // bb-dlssg-ui
+    // bb-menu-ui: the texture of the game image ImGui drew in the last Present (the draw data
+    // BbPresentGenerated draws again belongs to that Present, not to the frame being presented).
+    ImTextureID bb_imgui_game_tex{};
+    // bb-menu-ui: presents while an overlay is up (F1 menu / toasts: MustKeepDrawing; F8 or any
+    // ImGui UI: bb_imgui_ui_shown), for the "[menu-ui]" lines.
+    struct BbMenuUi {
+        u32 presents = 0, game = 0, repeats = 0, generated_ui = 0, generated_dropped = 0,
+            fsr3_bypassed = 0, repeats_skipped = 0;
+    };
+    BbMenuUi bb_menu_sec{}, bb_menu_session{};
+    bool bb_menu_up = false;
+    std::chrono::steady_clock::time_point bb_menu_sec_start{};
+    void BbNoteMenuPresent(bool is_reusing_frame, bool is_game_frame, u32 generated_wanted,
+                           u32 generated_ui);
     std::atomic<u32> bb_frame_gen_limit{3};
     std::chrono::steady_clock::time_point bb_limit_window{};
     u32 bb_limit_frames = 0, bb_limit_up_seconds = 0;
@@ -187,7 +204,8 @@ private:
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
     std::queue<Frame*> free_queue;
-    Frame* last_submit_frame;
+    Frame* last_submit_frame = nullptr;
+    std::mutex bb_reuse_mutex; // bb-menu-ui: guards last_submit_frame (see PresentLastFrame)
     std::mutex free_mutex;
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
