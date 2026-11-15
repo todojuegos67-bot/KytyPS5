@@ -215,8 +215,7 @@ struct HwFragmentRuntimeInfo {
     u32 bb_objmv : 1;       ///< BB object motion vectors v2 (bb_objmv2.h): MRT 7 output
     u32 bb_objmv_blend : 1; ///< ... of a blended (transparent) draw: written where alpha >= 0.5
     u32 bb_objmv_add : 1;   ///< ... of an additive / premultiplied effect (bb-mv-fill): class 5
-    u32 bb_objmv_count : 1; ///< bb-mv-gate (BB_FG_SPARKS=1): count bright pixels (BDA atomics)
-    u32 : 8;
+    u32 : 9;
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -228,7 +227,7 @@ struct HwFragmentRuntimeInfo {
                clip_distance_emulation == other.clip_distance_emulation &&
                depth_before_shader == other.depth_before_shader &&
                bb_objmv == other.bb_objmv && bb_objmv_blend == other.bb_objmv_blend &&
-               bb_objmv_add == other.bb_objmv_add && bb_objmv_count == other.bb_objmv_count &&
+               bb_objmv_add == other.bb_objmv_add &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

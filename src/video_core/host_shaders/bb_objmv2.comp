@@ -22,7 +22,7 @@
 // upscaler's reactive mask (binding 6).
 // bb-mv-fill (flags bit 9, BB_FG_SPARKS=1): class 5 = an additive / premultiplied effect (sparks,
 // embers, glows) wrote its own static-world vector there (weight 1 where its contribution was
-// bright): that vector replaces the one behind, the pixel is reactive for the upscaler, and bit 1
+// bright): that vector replaces the one behind, (not reactive for the upscaler), and bit 1
 // of .a of the stored colour marks it for the HUD-less pass (FG takes it from the real frame).
 // Stats word 22: class-5 px (statistics frames).
 #version 450
@@ -98,10 +98,9 @@ bool IsSparkRaw(vec4 o, bool sparks) {
 bool IsSpark(vec4 o, bool sparks, ivec2 c) {
     return IsSparkRaw(o, sparks) && !SkyAt(c);
 }
-void SparkReactive(ivec2 c) {
-    const float r = imageLoad(reactive_io, c).r;
-    imageStore(reactive_io, c, vec4(max(r, 0.9)));
-}
+// bb-mv-dots: spark pixels no longer raise the upscaler's reactive mask (0.9 made DLSS / FSR drop
+// their history there: aliasing on anything marked, e.g. bright rims on the character). Only frame
+// generation needs them (the HUD-less marking).
 
 void FogReactive(ivec2 c, float cov) {
     const float r = imageLoad(reactive_io, c).r;
@@ -181,7 +180,6 @@ void main() {
                 const vec2 camv = imageLoad(mv_out, c).xy;
                 imageStore(mv_out, c, vec4(additive ? o.xy + camv : o.xy, 0.0, 0.0));
             }
-            SparkReactive(c);
             if ((flags & 4u) != 0u) {
                 // bit 10: the marked area is under BB_FG_SPARKS_MAXPCT (else no HUD-less marking)
                 imageStore(next_prev_color, c, vec4(texelFetch(cur_color, c, 0).rgb,
@@ -248,7 +246,6 @@ void main() {
             if (p.size.z != 0u && finite) {
                 imageStore(mv_out, c, vec4(additive ? o.xy + cam : o.xy, 0.0, 0.0));
             }
-            SparkReactive(c);
         } else if (cov > kFogMin) {
             atomicAdd(g_fp, 1u);
             atomicAdd(g_fw, uint(cov * 1024.0));
