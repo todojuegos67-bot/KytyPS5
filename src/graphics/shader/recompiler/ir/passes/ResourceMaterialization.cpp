@@ -2582,6 +2582,47 @@ static void BuildDescriptorFetch(ResourcePlan& plan) {
 	}
 }
 
+// The reads the host's own values depend on (509f7a346); every other read only fills the flat buffer, and a walk may
+// leave it for the GPU to copy (SetSrtGpuFills).
+static void MarkSrtHostReads(ResourcePlan& plan) {
+	std::unordered_set<const Inst*> host_values;
+	std::vector<Value>              pending;
+	for (const auto& source: plan.descriptor_sources) {
+		pending.insert(pending.end(), source.dwords.begin(), source.dwords.begin() + source.dword_count);
+		if (!source.indirect_descriptor.has_value()) continue;
+		const auto& indirect = *source.indirect_descriptor;
+		pending.insert(pending.end(), {indirect.key_count, indirect.selector_first, indirect.selector_mask});
+	}
+	for (const auto& block: plan.control_flow) pending.push_back(block.condition);
+	const auto& fill = plan.uniform_fill;
+	pending.insert(pending.end(), fill.values.begin(), fill.values.end());
+	pending.insert(pending.end(), {fill.pattern_size, fill.element_count});
+	for (const auto& store: plan.buffer_stores) {
+		pending.insert(pending.end(), store.address.begin(), store.address.end());
+		pending.insert(pending.end(), store.values.begin(), store.values.end());
+		pending.push_back(store.guard);
+	}
+	for (const auto& read: plan.srt_reads) {
+		const auto* inst = read.value.ResolveInstruction();
+		for (size_t i = 0; inst != nullptr && i < inst->NumArgs(); ++i) pending.push_back(inst->Arg(i));
+	}
+	while (!pending.empty()) {
+		const auto value = pending.back();
+		pending.pop_back();
+		const auto* inst = value.IsEmpty() ? nullptr : value.Resolve().TryInstruction();
+		if (inst == nullptr || !host_values.insert(inst).second) continue;
+		for (size_t i = 0; i < inst->NumArgs(); ++i) pending.push_back(inst->Arg(i));
+	}
+	plan.srt_read_host.resize(plan.srt_reads.size());
+	for (size_t slot = 0; slot < plan.srt_reads.size(); ++slot) {
+		const auto offset = plan.srt_reads[slot].flat_offset;
+		// A global base: the renderer reads it from the flat buffer to back its pages (BackAddressBases).
+		const bool base = std::ranges::any_of(plan.info.address_bases,
+		                                      [&](const auto& pair) { return pair[0] == offset || pair[1] == offset; });
+		plan.srt_read_host[slot] = base || host_values.contains(plan.srt_reads[slot].value.ResolveInstruction()) ? 1u : 0u;
+	}
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -2811,6 +2852,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
 	BuildDescriptorFetch(plan);
+	MarkSrtHostReads(plan);
 	CompileSrtWalker(plan);
 	return plan;
 }
@@ -2873,6 +2915,9 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		program.srt_walked = runtime.direct_reads &&
 		                     WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr);
 	}
+	// The walk that gave the flat buffer (this one, or the repeat check's) left its GPU copies on the plan.
+	snapshot.gpu_fills.clear();
+	if (program.srt_walked) snapshot.gpu_fills = program.srt_fills;
 	if (program.srt_walked) {
 		walker.AdoptWalk(snapshot.flattened_srt);
 	} else if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
@@ -3475,12 +3520,13 @@ void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
 template <class S, class P> void IoPlan(S& io, P& plan) {
 	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info, descriptor_sources,
 	       selector_groups, control_flow, control_phis, srt_reads,
+	       srt_read_host, // derived on load (MarkSrtHostReads)
 	       descriptor_fetch, // derived on load (BuildDescriptorFetch)
 	       requires_specialization_memory, source_reads, capture_specialization_reads, srt_plan_complete,
 	       resource_tracking_complete, info, uniform_fill, buffer_stores,
 	       // Derived on load (CompileSrtWalker).
 	       srt_code, srt_user_data, srt_captures, srt_outputs, srt_reach, srt_scratch, srt_output_index, srt_loads,
-	       srt_walked,
+	       srt_walked, srt_fill_address, srt_fills,
 	       // The GPU thread's scratch, and the selector keys derived on load.
 	       evaluation_contexts, evaluation_value_count, active_sources, active_images, visited_blocks,
 	       reachable_blocks, pending_blocks, material_keys, selector_keys, srt_trace, trace, trace_misses, trace_skip,
@@ -3500,6 +3546,7 @@ bool DerivePlanState(ResourcePlan& plan) {
 		if (group != UINT32_MAX && group >= plan.selector_keys.size()) return false;
 	}
 	BuildDescriptorFetch(plan);
+	MarkSrtHostReads(plan);
 	CompileSrtWalker(plan);
 	return true;
 }

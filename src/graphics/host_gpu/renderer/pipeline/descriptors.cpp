@@ -970,6 +970,37 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// The flat words a shader wrote and only the shader reads (ResourceSnapshot::gpu_fills): copied from the buffer cache
+// into the uploaded flat buffer on the GPU, after every earlier write and before the dispatch reads them, so that the
+// walk did not wait for the shader that wrote them (509f7a346).
+static void CopyGpuFills(RenderContext& context, const vk::DescriptorBufferInfo& flat,
+                         std::span<const std::pair<uint64_t, uint32_t>> fills) {
+	auto& cache     = context.GetBufferCache();
+	auto& scheduler = context.GetCommandScheduler();
+	scheduler.EndRendering();
+	const auto      command = scheduler.Current().Recorder();
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	for (const auto& [address, word]: fills) {
+		const auto [source, offset] = cache.ObtainBuffer(address, sizeof(uint32_t), false);
+		EXIT_IF(source == nullptr);
+		const vk::BufferCopy copy {offset, flat.offset + word * sizeof(uint32_t), sizeof(uint32_t)};
+		command.copyBuffer(source->Handle(), flat.buffer, 1, &copy);
+	}
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead;
+	command.pipelineBarrier2(dependency);
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (!id) {
 		return;
@@ -1539,6 +1570,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (layout.image_forms) prepared.shader_data[layout.ImageFormDword()] = snapshot.image_forms;
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		if (!snapshot.gpu_fills.empty()) CopyGpuFills(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ProgramConstants)] != 0) {
 		const auto& buffer = m_context.GetBufferCache().GetProgramConstants(program.program_constants);

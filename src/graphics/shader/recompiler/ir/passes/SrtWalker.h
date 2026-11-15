@@ -137,6 +137,7 @@ private:
 	// The recorded walk: scratch outputs and reach bytes, then the loaded addresses; its flat buffer.
 	std::vector<uint64_t>                              m_walk;
 	std::vector<uint32_t>                              m_walk_flat;
+	std::vector<std::pair<uint64_t, uint32_t>>         m_walk_fills; // the recorded walk's GPU copies
 	bool                                               m_walked = false;
 	mutable std::vector<uint32_t>                      m_check_flat;
 };
@@ -178,6 +179,14 @@ void     SetWalkOutput(const ResourcePlan& plan, const Inst& inst, uint32_t inde
 // The exception handler completes such a load as a zero read (bdf48dcf3) and reports its address.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 void     SrtWalkerFaultedLoad(uint64_t address);
+// A compute plan's walk loads a word only the shader reads (ResourcePlan::srt_read_host 0) with its own encoding. When
+// a shader wrote that word, the walk need not wait for it: the exception handler completes the load as 0
+// (SrtWalkerFillLoad true) and the renderer copies the word on the GPU (ResourceSnapshot::gpu_fills). Without a gate,
+// or while it says false, such a load reads the page back as any other.
+using SrtFillGate = bool (*)();
+void SetSrtGpuFills(SrtFillGate gate);
+bool SrtWalkerShaderOnlyLoad(uint64_t rip);
+bool SrtWalkerFillLoad(uint64_t address);
 // A walk without a reader reads guest words by pointer. On a page a shader wrote, that read faults, and the fault reads
 // the page back: a submit and a wait for all GPU work. Most such reads are of words no shader wrote (Marvel's
 // Wolverine's GPU-driven tables: 68-100 % of the GPU thread's faults), which are current in the backing. The renderer's

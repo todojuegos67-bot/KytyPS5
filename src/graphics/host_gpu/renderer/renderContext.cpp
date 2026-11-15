@@ -25,11 +25,13 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	ShaderRecompiler::IR::SetSrtCleanReader([](uint64_t address, std::span<uint32_t> values) {
 		return Libs::LibKernel::Memory::TryReadGpuCleanBytes(address, values.data(), values.size_bytes());
 	});
+	ShaderRecompiler::IR::SetSrtGpuFills([] { return true; });
 	m_guest_image_heap.UseScheduler(m_command_scheduler);
 }
 
 RenderContext::~RenderContext() {
 	ShaderRecompiler::IR::SetSrtCleanReader(nullptr);
+	ShaderRecompiler::IR::SetSrtGpuFills(nullptr);
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }

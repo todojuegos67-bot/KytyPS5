@@ -177,6 +177,7 @@ void SrtReadLog::RecordWalk(const ResourcePlan& plan, std::span<const uint32_t> 
 	m_walk.insert(m_walk.end(), scratch + plan.srt_captures / 8u, scratch + plan.srt_captures / 8u + plan.srt_loads);
 	// MaterializeResources appends indirect mappings after the walk's words.
 	m_walk_flat.assign(flat.begin(), flat.begin() + std::min(flat.size(), plan.srt_reads.size()));
+	m_walk_fills = plan.srt_fills;
 }
 
 namespace {
@@ -214,7 +215,8 @@ bool SrtReadLog::Repeats(const SrtRuntime& runtime, const ResourcePlan& plan,
 		// The walk reads first, as in MaterializeResources; what it gave decides the reads after it.
 		if (!runtime.direct_reads || !WalkSrt(plan, runtime, m_check_flat, nullptr)) return false;
 		if (walked != nullptr) *walked = &m_check_flat;
-		if (m_check_flat != m_walk_flat) return false;
+		// A word left to the GPU reads 0: the same flat buffer repeats only with the same words left to the GPU.
+		if (m_check_flat != m_walk_flat || plan.srt_fills != m_walk_fills) return false;
 		const auto* scratch  = plan.srt_scratch.data();
 		const auto  outputs  = plan.srt_outputs / 8u;
 		const auto  reach    = (plan.control_flow.size() + 7u) / 8u;
@@ -1168,14 +1170,25 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+// The running walk's shader-only loads the exception handler completed as 0 (null: it completes none).
+thread_local std::vector<uint64_t>*        t_fill_loads = nullptr;
+std::atomic<SrtFillGate>                   g_fill_gate  = nullptr;
 thread_local bool                         t_walker_faulted = false;
 // Lean's first walker read a pointer below 64 KB (and its levels below) as zero tables (c527c28ba); a load
 // there through such a pointer stays a zero read. Any other fault fails the walk: the readers fail there.
 constexpr uint64_t NullPointerLoads = 0x20000;
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, bool shader_only = false) {
 	code.lea(code.r10, code.ptr[address]);
+	if (shader_only) {
+		// mov eax, [r10+0] (41 8b 42 00): the same load, which the exception handler tells apart (SrtWalkerShaderOnlyLoad).
+		code.db(0x41);
+		code.db(0x8b);
+		code.db(0x42);
+		code.db(0x00);
+		return;
+	}
 	code.mov(code.eax, code.dword[code.r10]);
 }
 
@@ -1210,6 +1223,7 @@ private:
 		Operand              result;
 		std::vector<Operand> args;
 		uint32_t             slot = 0, state = 0;
+		uint32_t             address = UINT32_MAX; // a shader-only read's: scratch offset of its loaded address
 		Xbyak::Label         label;
 		bool                 pending = true, referenced = false, masked = false;
 	};
@@ -1256,6 +1270,7 @@ private:
 	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
+	std::unordered_set<const Inst*>                   m_shader_only; // a compute plan's reads only the shader uses
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
@@ -1506,6 +1521,11 @@ void WalkerCompiler::Layout() {
 		if (!Thunk(index)) continue;
 		m_nodes[index].slot = offset;
 		offset += 8u;
+		// Only the root context's node: a read in another EXEC context feeds a value the host evaluates.
+		if (m_nodes[index].context == 0 && m_shader_only.contains(m_nodes[index].inst)) {
+			m_nodes[index].address = offset;
+			offset += 8u;
+		}
 	}
 	m_reach = offset;
 	m_plan.srt_outputs = m_shader_base;
@@ -1751,7 +1771,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax);
+			LoadGuest(c, c.rax, node.address != UINT32_MAX);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -1781,8 +1801,9 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), node.address != UINT32_MAX);
 		}
+		if (node.address != UINT32_MAX) c.mov(c.qword[c.rdx + node.address], c.r10);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.add(c.r8, 8);
@@ -2024,6 +2045,11 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	// Analyze every root first, so thunk bodies only reuse finished operands.
 	std::vector<Operand>              conditions, reads, outputs;
 	std::vector<std::vector<Operand>> descriptors(sources.size());
+	if (resources && m_plan.stage == ShaderType::Compute) {
+		for (size_t slot = 0; slot < m_plan.srt_reads.size() && slot < m_plan.srt_read_host.size(); ++slot) {
+			if (m_plan.srt_read_host[slot] == 0u) m_shader_only.insert(m_plan.srt_reads[slot].value.ResolveInstruction());
+		}
+	}
 	if (resources) {
 		for (const auto& block: blocks) conditions.push_back(Evaluate(block.condition, 0).operand);
 		for (const auto& read: m_plan.srt_reads) reads.push_back(Evaluate(read.value, 0).operand);
@@ -2035,6 +2061,12 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
 	Layout();
+	m_plan.srt_fill_address.assign(reads.size(), UINT32_MAX);
+	for (size_t slot = 0; slot < reads.size(); ++slot) {
+		if (reads[slot].kind != Kind::Node) continue;
+		const auto& node = m_nodes[reads[slot].value];
+		if (m_shader_only.contains(node.inst)) m_plan.srt_fill_address[slot] = node.address;
+	}
 
 	Xbyak::Label pass, fail, reset;
 	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
@@ -2196,12 +2228,30 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+	thread_local std::vector<uint64_t> fill_loads;
+	fill_loads.clear();
+	plan.srt_fills.clear();
+	const auto gate = g_fill_gate.load(std::memory_order_relaxed);
+	t_fill_loads     = !plan.srt_fill_address.empty() && gate != nullptr && gate() ? &fill_loads : nullptr;
+	// A read the walk skips (out of bounds, or not reached) keeps no address from an earlier walk: 0 is never filled.
+	for (const auto offset: plan.srt_fill_address) {
+		if (offset != UINT32_MAX) plan.srt_scratch[offset / 8u] = 0;
+	}
 	t_running_walker = plan.srt_code.get();
 	t_walker_faulted = false;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
+	t_fill_loads     = nullptr;
 	if (end == nullptr || t_walker_faulted) return false;
+	// A load completed as 0 is the word of each read whose address the walk kept there.
+	for (size_t slot = 0; !fill_loads.empty() && slot < plan.srt_fill_address.size(); ++slot) {
+		const auto offset = plan.srt_fill_address[slot];
+		if (offset == UINT32_MAX) continue;
+		const auto address = plan.srt_scratch[offset / 8u];
+		if (std::ranges::find(fill_loads, address) != fill_loads.end())
+			plan.srt_fills.emplace_back(address, plan.srt_reads[slot].flat_offset);
+	}
 	plan.srt_loads = static_cast<uint32_t>(end - (plan.srt_scratch.data() + plan.srt_captures / 8u));
 	if (reads != nullptr) WalkedLoads(plan, *reads);
 	return true;
@@ -2268,7 +2318,23 @@ uint32_t SrtWalkerLoadLength(uint64_t rip) {
 	    rip - reinterpret_cast<uint64_t>(t_running_walker->getCode()) >= t_running_walker->getSize())
 		return 0;
 	const auto* code = reinterpret_cast<const uint8_t*>(rip);
-	return code[0] == 0x41u && code[1] == 0x8bu && code[2] == 0x02u ? 3 : 0;
+	if (code[0] != 0x41u || code[1] != 0x8bu) return 0;
+	if (code[2] == 0x02u) return 3;
+	return code[2] == 0x42u && code[3] == 0x00u ? 4 : 0;
+}
+
+void SetSrtGpuFills(SrtFillGate gate) {
+	g_fill_gate.store(gate, std::memory_order_relaxed);
+}
+
+bool SrtWalkerShaderOnlyLoad(uint64_t rip) {
+	return SrtWalkerLoadLength(rip) == 4u;
+}
+
+bool SrtWalkerFillLoad(uint64_t address) {
+	if (t_fill_loads == nullptr) return false;
+	t_fill_loads->push_back(address);
+	return true;
 }
 
 void SrtWalkerFaultedLoad(uint64_t address) {

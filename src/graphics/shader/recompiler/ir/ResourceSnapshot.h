@@ -38,6 +38,9 @@ struct ResourceSnapshot {
 	std::vector<std::vector<DescriptorValue>> image_groups;
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
+	// Words of flattened_srt that a shader wrote and only the shader reads: the guest address and the word's index.
+	// flattened_srt holds 0 there; the host copies them on the GPU after uploading it (CopyGpuFills).
+	std::vector<std::pair<uint64_t, uint32_t>> gpu_fills;
 	// The game's descriptor heap this draw reads images from by slot (base 0: none); the host
 	// mirrors it into the image heap.
 	struct ImageHeapTable {

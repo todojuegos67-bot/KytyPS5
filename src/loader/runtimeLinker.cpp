@@ -686,9 +686,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (length == 0) length = Libs::Graphics::ShaderRecompiler::IR::SrtPointerLoadLength(info->exception_address);
 			if (length != 0) {
 				uint32_t value = 0;
-				if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerCleanLoad(
-				        Loader::X64InstructionEmulator::SavedGpr(info->native_context, 10), value)) {
+				const auto address = Loader::X64InstructionEmulator::SavedGpr(info->native_context, 10);
+				if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerCleanLoad(address, value)) {
 					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
+					return true;
+				}
+				// A word a shader wrote that only the shader reads: 0 now, copied on the GPU before the dispatch.
+				if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerShaderOnlyLoad(info->exception_address) &&
+				    Libs::Graphics::ShaderRecompiler::IR::SrtWalkerFillLoad(address)) {
+					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, 0);
 					return true;
 				}
 			}

@@ -963,6 +963,10 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
+	// Per SRT read: 1 when a value the host evaluates depends on it (a descriptor word, a branch condition, the
+	// uniform fill, a buffer store's bound, a global base, another read's address); 0 when only the shader reads it,
+	// from the flat buffer. Derived on load (MarkSrtHostReads).
+	std::vector<uint8_t>                srt_read_host;
 	// How SrtWalker::EvaluateDescriptor fetches a descriptor dword after the refresh instead of evaluating it: the
 	// flattened slot of the SRT read it is, a user-data word, or an immediate. shadPS4 (SharpFetch, PR #5112) fixes
 	// each sharp's dwords to flat-buffer slots when it compiles a shader; ExtractResourcePlan does the same. Empty, or
@@ -1009,6 +1013,11 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           srt_output_index;
 	mutable uint32_t                        srt_loads  = 0;
 	mutable bool                            srt_walked = false;
+	// Per SRT read of a compute plan: the scratch offset where the walk keeps its shader-only load's address
+	// (UINT32_MAX: none). Derived on load (CompileSrtWalker).
+	std::vector<uint32_t>                   srt_fill_address;
+	// The last walk's flat words left for the GPU to copy (SetSrtGpuFills): guest address, flat index.
+	mutable std::vector<std::pair<uint64_t, uint32_t>> srt_fills;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;

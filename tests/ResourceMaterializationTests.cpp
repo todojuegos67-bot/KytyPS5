@@ -284,6 +284,9 @@ void TestNativeNestedSrtRefresh() {
   read(leaf->Arg(0), 11u);
   auto plan = Extract(program);
   Check(plan.srt_code != nullptr, "nested user-data tree did not compile an x86 walker");
+  // The descriptor uses the first leaf word and the pointer words address the leaves; only the shader reads the last.
+  Check(plan.srt_read_host == std::vector<uint8_t>{1u, 1u, 1u, 0u},
+        "pointer words not told apart from shader-only words");
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const SrtRuntime runtime{.user_data = user_data};
