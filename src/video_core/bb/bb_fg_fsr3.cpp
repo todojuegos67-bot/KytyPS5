@@ -1304,9 +1304,14 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
         static const uint32_t prof_label =
             BB::GpuProf::Label("ours: FSR 3 FG frame generation (FFX dispatch)");
         const vk::CommandBuffer prof_cmd{static_cast<VkCommandBuffer>(params->commandList)};
-        const uint32_t prof = BB::GpuProf::On() && params->commandList
-                                  ? BB::GpuProf::Begin(prof_cmd, prof_label)
-                                  : 0u;
+        // (review) with KYTY_FSR3_ASYNC=1 FFX may record this list for its async compute
+        // queue: timestamps only when that family supports them.
+        const uint32_t prof =
+            BB::GpuProf::On() && params->commandList &&
+                    (!EnvOn("KYTY_FSR3_ASYNC", false) ||
+                     BB::GpuProf::FamilyHasTimestamps(g_compute_family))
+                ? BB::GpuProf::Begin(prof_cmd, prof_label)
+                : 0u;
         const auto r = g_ffx.Dispatch(reinterpret_cast<ffxContext*>(context), &params->header);
         BB::GpuProf::End(prof_cmd, prof);
         return r;

@@ -486,9 +486,12 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     if (BB::GpuProf::On()) {
         BB::GpuProf::Init(instance);
         using BB::GpuProf::Kind;
+        // (review) only the draw scheduler: it is flushed every guest frame. The present and
+        // flip schedulers can stay idle for many frames (flip: PrepareLastFrame only; present:
+        // while the window does not present), and an envelope begun at BeginSession would sit
+        // in an unsubmitted command buffer past the profiler's timeout, which then host-resets
+        // and reuses its query while the write is still pending.
         draw_scheduler.BbProfSetName(BB::GpuProf::Label("draw", Kind::Envelope));
-        present_scheduler.BbProfSetName(BB::GpuProf::Label("present", Kind::Envelope));
-        flip_scheduler.BbProfSetName(BB::GpuProf::Label("flip", Kind::Envelope));
     }
 
     // Create presentation frames.

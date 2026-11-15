@@ -43,6 +43,9 @@ int Level();
 
 /// Creates the query pool (once; needs hostQueryReset). Safe to call repeatedly.
 void Init(const Vulkan::Instance& instance);
+/// True when profiling is active and queue family `family` supports timestamps (a command
+/// buffer submitted to another queue than the graphics one, e.g. FFX's async compute queue).
+bool FamilyHasTimestamps(u32 family);
 
 /// A label id for a fixed name (cache it in a function-local static at the call site).
 u32 Label(std::string_view name, Kind kind = Kind::Pass);

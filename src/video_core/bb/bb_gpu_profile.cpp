@@ -53,6 +53,7 @@ struct State {
     vk::QueryPool pool{};
     double ns_per_tick = 1.0;
     u64 mask = ~0ull;
+    std::vector<u32> family_bits; // timestampValidBits per queue family
     std::vector<LabelInfo> labels{{"(none)", Kind::Pass, 0}};
     std::unordered_map<std::string, u32> by_name;
     std::unordered_map<u64, u32> by_key;
@@ -239,6 +240,8 @@ void Init(const Vulkan::Instance& instance) {
                     !host_reset ? "hostQueryReset" : "timestamps");
         return;
     }
+    s.family_bits.clear();
+    for (const auto& f : families) s.family_bits.push_back(f.timestampValidBits);
     s.device = instance.GetDevice();
     auto [r, pool] = s.device.createQueryPool(vk::QueryPoolCreateInfo{
         .queryType = vk::QueryType::eTimestamp,
@@ -260,6 +263,13 @@ void Init(const Vulkan::Instance& instance) {
              "bits; one '[gpu-prof]' summary a second (ms per guest frame, serialized timings: "
              "the stamps add a little GPU time of their own)",
              Level(), kPairs, s.ns_per_tick, bits);
+}
+
+bool FamilyHasTimestamps(u32 family) {
+    if (!On()) return false;
+    auto& s = S();
+    std::scoped_lock lk{s.m};
+    return s.ok && family < s.family_bits.size() && s.family_bits[family] != 0;
 }
 
 u32 Label(std::string_view name, Kind kind) {
