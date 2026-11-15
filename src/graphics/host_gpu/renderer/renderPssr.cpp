@@ -117,13 +117,16 @@ bool RenderExecutor::UpscaleFsr(vk::CommandBuffer command, const Pssr::Request& 
 		context->fsr      = Fsr3::Create(m_context.GetGraphics(), creation);
 		reset             = true;
 	}
+	// A failed context is forgotten: its creation would still fit the next request, which would then scale linearly
+	// without trying again.
 	if (context->fsr == nullptr) {
+		m_fsr_contexts.erase(context);
 		return false;
 	}
 	MemoryBarrier(command);
 	if (!Fsr3::Dispatch(context->fsr, command, request, inputs, reset)) {
 		release(context->fsr);
-		context->fsr = nullptr;
+		m_fsr_contexts.erase(context);
 		return false;
 	}
 	if (Fsr3::FrameGen::Active()) {
