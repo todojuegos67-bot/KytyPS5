@@ -298,7 +298,7 @@ private:
 	                 ShaderRecompiler::IR::CompiledShaderInfo& info);
 	bool TakeReadyModule(ShaderType stage, uint64_t hash, const std::vector<uint32_t>& static_key,
 	                     const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_cursor,
-	                     std::vector<uint32_t>& spirv, ShaderRecompiler::IR::CompiledShaderInfo& info);
+	                     std::vector<uint32_t>& spirv, ShaderRecompiler::IR::CompiledShaderInfo& info, bool take = true);
 	void RecordGraphicsTemplate(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
 	                            const GraphicsPrograms& programs, uint64_t state_signature);
 	void WaitForGraphicsAhead(uint64_t pixel_hash, uint64_t identity, const GraphicsPipelineKey& key);

@@ -3144,10 +3144,11 @@ std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> PipelineCache::TakeReadyPlan
 	return found != m_ahead->ready.end() ? std::move(found->second.plan) : nullptr;
 }
 
+// take = false (a worker): a copy, and the module stays for the GPU thread.
 bool PipelineCache::TakeReadyModule(ShaderType stage, uint64_t hash, const std::vector<uint32_t>& static_key,
                                     const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                                     uint32_t push_data_cursor, std::vector<uint32_t>& spirv,
-                                    ShaderRecompiler::IR::CompiledShaderInfo& info) {
+                                    ShaderRecompiler::IR::CompiledShaderInfo& info, bool take) {
 	if (m_ahead == nullptr) return false;
 	std::vector<uint8_t> packed;
 	uint32_t             words = 0;
@@ -3163,11 +3164,16 @@ bool PipelineCache::TakeReadyModule(ShaderType stage, uint64_t hash, const std::
 			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, bindings.ShaderDataDwords());
 		});
 		if (module == modules.end()) return false;
-		packed = std::move(module->packed);
-		words  = module->words;
-		info   = std::move(module->info);
-		m_ahead->ready_words -= words;
-		modules.erase(module);
+		words = module->words;
+		if (!take) {
+			packed = module->packed;
+			info   = module->info;
+		} else {
+			packed = std::move(module->packed);
+			info   = std::move(module->info);
+			m_ahead->ready_words -= words;
+			modules.erase(module);
+		}
 	}
 	spirv.resize(words);
 	const auto size = ZSTD_decompress(spirv.data(), spirv.size() * sizeof(uint32_t), packed.data(), packed.size());
@@ -3206,8 +3212,10 @@ void PipelineCache::RunComputeAhead() {
 		BuildStageStaticKey(job->input_info, key);
 		std::vector<uint32_t>                    spirv;
 		ShaderRecompiler::IR::CompiledShaderInfo info;
+		// A miss in the stage store: another worker may have compiled this module already (the ready store).
 		if (job->translated != nullptr ||
-		    !StoreModule(ShaderType::Compute, job->params, key, options, 0, job->specialization, spirv, info)) {
+		    (!StoreModule(ShaderType::Compute, job->params, key, options, 0, job->specialization, spirv, info) &&
+		     !TakeReadyModule(ShaderType::Compute, job->params.hash, key, job->specialization, 0, spirv, info, false))) {
 			if (job->translated == nullptr) {
 				job->translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
 				    ShaderRecompiler::PrepareShaderSource(job->params.code, options).decoded, options));
@@ -3258,9 +3266,11 @@ void PipelineCache::RunGraphicsAhead(AheadJob& job) {
 	std::vector<uint32_t>                    spirv;
 	ShaderRecompiler::IR::CompiledShaderInfo info;
 	// The pixel stage's push data starts where GetGraphicsPrograms puts it.
-	if (job.translated != nullptr || !StoreModule(ShaderType::Pixel, job.params, key, options,
-	                                              ShaderRecompiler::IR::PushData::MeshDrawDwordCount, job.specialization,
-	                                              spirv, info)) {
+	if (job.translated != nullptr ||
+	    (!StoreModule(ShaderType::Pixel, job.params, key, options, ShaderRecompiler::IR::PushData::MeshDrawDwordCount,
+	                  job.specialization, spirv, info) &&
+	     !TakeReadyModule(ShaderType::Pixel, job.params.hash, key, job.specialization,
+	                      ShaderRecompiler::IR::PushData::MeshDrawDwordCount, spirv, info, false))) {
 		if (job.translated == nullptr) {
 			job.translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
 			    ShaderRecompiler::PrepareShaderSource(job.params.code, options).decoded, options));
@@ -3318,9 +3328,14 @@ void PipelineCache::RunGraphicsAhead(AheadJob& job) {
 			const auto stage    = job.vertex_info.logical_stage;
 			std::vector<uint32_t>                    vertex_spirv;
 			ShaderRecompiler::IR::CompiledShaderInfo vertex_compiled;
+			// The module is noted only for the GPU thread and no template has it until the GPU thread draws with
+			// it, so each job of this vertex shader compiled it again (a mesh shader of the japan title scene
+			// 316 times in the boot): a copy from the ready store first.
 			if (job.vertex_translated != nullptr ||
-			    !StoreModule(stage, job.vertex_params, job.vertex_static_key, voptions, vertex_cursor,
-			                 job.vertex_specialization, vertex_spirv, vertex_compiled)) {
+			    (!StoreModule(stage, job.vertex_params, job.vertex_static_key, voptions, vertex_cursor,
+			                  job.vertex_specialization, vertex_spirv, vertex_compiled) &&
+			     !TakeReadyModule(stage, job.vertex_params.hash, job.vertex_static_key, job.vertex_specialization,
+			                      vertex_cursor, vertex_spirv, vertex_compiled, false))) {
 				if (job.vertex_translated == nullptr) {
 					job.vertex_translated = std::make_shared<ShaderRecompiler::TranslateResult>(ShaderRecompiler::TranslateProgram(
 					    ShaderRecompiler::PrepareShaderSource(job.vertex_params.code, voptions).decoded, voptions));
