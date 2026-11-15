@@ -2332,6 +2332,8 @@ struct PipelineCache::Ahead {
 	bool                                       stop = false;
 	std::vector<std::thread>                   workers;
 	uint64_t                                   built = 0, waits = 0, waited_ms = 0, handed = 0, dropped = 0;
+	// StoreModule's lookups: found at the job's cursor, found as a stage without push data (NoStart), not found.
+	uint64_t store_hits = 0, store_hits_nostart = 0, store_misses = 0;
 	// Graphics jobs built exactly, and why the others were built with the guesses.
 	enum ExactCount : uint32_t { Exact, Tessellation, Restart, Prepare, Unsupported, Materialize, NoTemplate, OwnVertex, ExactCounts };
 	std::array<uint64_t, ExactCounts> exact {};
@@ -3084,10 +3086,28 @@ bool PipelineCache::StoreModule(ShaderType stage, const ShaderParams& params, co
                                 const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                                 std::vector<uint32_t>& spirv, ShaderRecompiler::IR::CompiledShaderInfo& info) {
 	if (!m_stage_index_ready.load(std::memory_order_acquire) || !AheadFromStore()) return false;
-	const auto  key = Precompile::StageKey(stage, params.hash, params.user_data_count, params.code.size(),
-	                                       params.back_code.size(), static_key, push_data_cursor, specialization);
+	using ShaderRecompiler::IR::PushData;
+	const auto key_at = [&](uint32_t cursor) {
+		return Precompile::StageKey(stage, params.hash, params.user_data_count, params.code.size(), params.back_code.size(),
+		                            static_key, cursor, specialization);
+	};
 	StoredStage stored;
-	if (!ReadStoredStage(*m_stage_store, key, stage, params.hash, static_key, stored)) return false;
+	const bool  at_cursor = ReadStoredStage(*m_stage_store, key_at(push_data_cursor), stage, params.hash, static_key, stored);
+	// A stage without push data is recorded at NoStart (Record): it serves this cursor when it has none here either.
+	const bool nostart = !at_cursor && push_data_cursor != PushData::NoStart &&
+	                     ReadStoredStage(*m_stage_store, key_at(PushData::NoStart), stage, params.hash, static_key, stored) &&
+	                     stored.info.bindings.push_data_start_dword ==
+	                         PushData::StartFor(push_data_cursor, stored.info.bindings.ShaderDataDwords());
+	{
+		std::lock_guard lock(m_ahead->mutex);
+		(at_cursor ? m_ahead->store_hits : nostart ? m_ahead->store_hits_nostart : m_ahead->store_misses)++;
+		if ((m_ahead->store_hits + m_ahead->store_hits_nostart + m_ahead->store_misses) % 256 == 0) {
+			LOGF("Stage store: %" PRIu64 " stages found at their cursor, %" PRIu64 " without push data, %" PRIu64
+			     " not found\n",
+			     m_ahead->store_hits, m_ahead->store_hits_nostart, m_ahead->store_misses);
+		}
+	}
+	if (!at_cursor && !nostart) return false;
 	bool planned = false;
 	{
 		std::lock_guard lock(m_ahead->mutex);
