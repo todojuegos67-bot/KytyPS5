@@ -1338,6 +1338,7 @@ std::string SysText(const SysRec& r) {
 
 // The game's wrappers seen rebuilding a system whose "in world" byte is still 0, and systems
 // removed and not added again.
+extern std::map<std::string, u32> g_path_counts;
 void SystemsReport(double now) {
     std::vector<std::string> removed, idle;
     u32 in_world = 0;
@@ -1361,6 +1362,12 @@ void SystemsReport(double now) {
         SysInfo(sys, r);
         idle.push_back(SysText(r) + fmt::format(" (rebuilt {} times, never added)", r.rebuilds));
     }
+    std::string counts;
+    for (const auto& [k, v] : g_path_counts) {
+        counts += fmt::format("{}{}: {}", counts.empty() ? "" : "; ", k, v);
+    }
+    LOG_INFO(Core, "[objcol] map {} visit #{} (+{:.0f} s): body adds by kind and caller: {}", g_map,
+             g_map_visit, now - g_map_open, counts.empty() ? "none" : counts);
     LOG_INFO(Core,
              "[objcol] map {} visit #{} (+{:.0f} s): physics systems addToWorld {} (mode != 1: "
              "{}), removeFromWorld {}, in the world now {} | removed and not added again {}: {} "
@@ -1806,6 +1813,7 @@ void MapTick(double now) {
 
 thread_local u64 t_caller_rbp = 0;
 std::set<std::string> g_paths;
+std::map<std::string, u32> g_path_counts;
 u32 g_path_lines = 0;
 
 // The game's functions keep rbp frames (push rbp; mov rbp,rsp): from addBodies' entry, the
@@ -1890,6 +1898,8 @@ void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
         if ((b.flags & 5) && g_path_lines < 120) {
             const std::string path = CallPath(ret);
             const std::string key = fmt::format("{} {:#x} {}", Motion(b.flags), bb.Filter(), path);
+            ++g_path_counts[fmt::format("{} {:#x} mode {} via eboot+{:#x}", Motion(b.flags),
+                                        bb.Filter(), mode, ret - g_eboot)];
             if (g_paths.insert(key).second) {
                 ++g_path_lines;
                 LOG_INFO(Core,
