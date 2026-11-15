@@ -215,6 +215,14 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
     const auto& key = pipeline->GetGraphicsKey();
     if (!BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment]) ||
         !key.write_masks[BB::ObjMv2::Attachment]) {
+        // bb-mv-fire: blended scene-target draws that got no motion pipeline (diagnostic).
+        if (liverpool->regs.blend_control[0].enable && liverpool->regs.color_buffers[0]) {
+            BB::ObjMv2::NoteSkippedBlend(
+                key.stage_hashes[static_cast<u32>(Shader::SwStage::Vertex)],
+                BB::ObjMv2::IsMotionKey(key.mrt_mask, key.color_buffers[BB::ObjMv2::Attachment])
+                    ? 1u
+                    : 0u);
+        }
         return; // not a motion draw, or a Mask draw (attachment 7 only keeps the pass going)
     }
     if (BB::MvEngine::Enabled()) {
@@ -245,6 +253,9 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
         const auto& bc0 = liverpool->regs.blend_control[0];
         if (bc0.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcAlpha) {
             effect |= BB::ObjMv2::EffectSrcAlpha;
+        }
+        if (bc0.color_dst_factor == AmdGpu::BlendControl::BlendFactor::One) {
+            effect |= BB::ObjMv2::EffectAdditive; // bb-mv-fire
         }
     }
     if (key.blend_controls[BB::ObjMv2::Attachment].enable != 0 &&
