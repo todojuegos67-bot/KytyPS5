@@ -602,6 +602,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (m_end_hook) {
 		m_end_hook();
 	}
+	m_recorded_work = 0;
 	m_command.End();
 	if (Threaded()) {
 		return SubmitThreaded(submit);

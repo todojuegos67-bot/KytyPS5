@@ -40,6 +40,8 @@ public:
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
 	void           Finish();
+	// Counts a draw or dispatch recorded since the last submit; returns the count.
+	uint32_t NoteWork() noexcept { return ++m_recorded_work; }
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Runs at the end of each command buffer, before it is submitted, with its tick still current: the last
@@ -207,6 +209,7 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::function<void()>        m_end_hook;
+	uint32_t                     m_recorded_work = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::atomic_uint32_t         m_pending_count {0}; // of m_pending_operations, read without the lock
 	std::queue<PendingOperation> m_priority_operations;

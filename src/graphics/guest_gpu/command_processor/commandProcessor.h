@@ -129,6 +129,7 @@ private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	void                CountDraw();
+	void                CountWork();
 	uint32_t            NumInstances();
 	// The guest address of NUM_INSTANCES when a shader wrote it, else 0.
 	uint64_t            GpuNumInstances();
