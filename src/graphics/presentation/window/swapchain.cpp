@@ -259,7 +259,7 @@ public:
 	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
-	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
+	void     RecordPresentCommands(CommandScheduler& scheduler, CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
 	uint64_t Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
@@ -804,7 +804,7 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	command.endRendering();
 }
 
-void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
+void Swapchain::RecordPresentCommands(CommandScheduler& scheduler, CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	auto       vk_command      = command.Handle();
 	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
@@ -888,8 +888,10 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		                  source->hudless.extent.width == source->image.extent.width &&
 		                  source->hudless.extent.height == source->image.extent.height;
 		if (m_hudless_ready) {
+			// The previous present's frame generation may still read the old image: free it after this tick.
 			WolverineHudless::Ensure(m_window.graphic_ctx, m_hudless, m_extent, m_format,
-			                         vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled);
+			                         vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+			                         &scheduler);
 			WolverineHudless::Transit(vk_command, source->hudless, vk::ImageLayout::eTransferSrcOptimal,
 			                          vk::AccessFlagBits2::eTransferRead);
 			WolverineHudless::Transit(vk_command, m_hudless, vk::ImageLayout::eTransferDstOptimal,
@@ -1036,6 +1038,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	// TakeFor may replace frame->hudless at once: Acquire waited for this frame's last present, the only reader.
 	frame->has_hudless = Fsr3::FrameGen::Active() &&
 	                     WolverineHudless::TakeFor(buffer.Recorder(), m_impl->window.graphic_ctx, image, frame->hudless);
 	if (headset) {
@@ -1167,7 +1170,7 @@ void Presenter::Impl::Present() {
 			return (overlay_visual.active || PerformanceOverlayEnabled()) &&
 			       swapchain.PrepareSystemOverlay();
 		}();
-		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+		swapchain.RecordPresentCommands(present_scheduler, command, layers[0].frame, layers[1],
 		                                draw_system_overlay);
 		const auto tick = swapchain.Submit(present_scheduler);
 		for (const auto& layer: layers) {
