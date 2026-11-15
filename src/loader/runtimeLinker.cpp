@@ -692,7 +692,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					return true;
 				}
 				// A word a shader wrote that only the shader reads: 0 now, copied on the GPU before the dispatch.
+				// Only over committed memory: the GPU copies from there (CopyGpuFills); an unmapped load reads 0 below.
 				if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerShaderOnlyLoad(info->exception_address) &&
+				    Libs::LibKernel::Memory::IsCommittedRange(address, sizeof(uint32_t)) &&
 				    Libs::Graphics::ShaderRecompiler::IR::SrtWalkerFillLoad(address)) {
 					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, 0);
 					return true;

@@ -2340,7 +2340,8 @@ bool SrtWalkerShaderOnlyLoad(uint64_t rip) {
 }
 
 bool SrtWalkerFillLoad(uint64_t address) {
-	if (t_fill_loads == nullptr) return false;
+	// A null pointer's load reads zero (SrtWalkerFaultedLoad), never a GPU copy from that address.
+	if (t_fill_loads == nullptr || address < NullPointerLoads) return false;
 	t_fill_loads->push_back(address);
 	return true;
 }
