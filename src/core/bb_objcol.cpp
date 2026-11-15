@@ -2848,15 +2848,20 @@ void OnObjBuild(u64 obj) {
     Rd(obj + 0x26c, pos[2]);
     const u32 state = (flags >> 3) & 7;
     const int empty = State1Empty(obj);
-    u64 model1 = 0, col0 = 0;
+    u64 model0 = 0, model1 = 0, col0 = 0, col1 = 0;
     if (IsPtr(tab)) {
+        Rd(tab + 0x88, model0);
         Rd(tab + 0x88 + 8, model1);
         Rd(tab + 0xa8, col0);
+        Rd(tab + 0xa8 + 8, col1);
     }
-    const bool act = g_fix && pr.applied && state == 1 && (flags & 0x1000) != 0 && empty == 1;
+    // Field run 3a8f4fe1: every restored m24_01 object at the walk-through spots had a state-1
+    // model and collision, so the state tables cannot tell "really broken" from "drawn intact but
+    // physically broken". BB_OBJCOL_FIX therefore builds every object restored from a matching
+    // current-format record in state 0 and not destroyed: what the Dream round trip builds
+    // (no record applies there). Genuinely broken breakables in that block come back intact.
+    const bool act = g_fix && pr.applied && state != 0 && (flags & 0x1000) != 0;
     if (act) {
-        // Build it in state 0 (intact, with its state-0 collision) and not destroyed, which is
-        // what the game builds when no save record applies (the Dream round trip).
         u32* f = reinterpret_cast<u32*>(obj + 0x1fc);
         *f = (*f & ~0x38u) & ~0x1000u;
     }
@@ -2868,17 +2873,18 @@ void OnObjBuild(u64 obj) {
     LOG_INFO(Core,
              "[objcol] save restore build: map id {:#x} obj {} ({:#x}) entity {} resource {:#x} "
              "'{}' at ({:.1f}, {:.1f}, {:.1f}): flags {:#x} state {} destroyed {} | state table "
-             "{:#x}: state-1 model {:#x}, state-1 collision {}, state-0 collision {:#x}{}",
+             "{:#x}: model state 0 {:#x} / state 1 {:#x}{}, collision state 0 {:#x} / state 1 {:#x} "
+             "({}){}",
              pr.map_id, pr.index, obj, pr.entity, res, ResName(res), pos[0], pos[1], pos[2], flags,
-             state, (flags & 0x1000) ? "yes" : "no", tab, model1,
-             empty == 1   ? "EMPTY"
-             : empty == 0 ? "present"
+             state, (flags & 0x1000) ? "yes" : "no", tab, model0, model1,
+             model0 == model1 ? " (same)" : "", col0, col1,
+             empty == 1   ? "state 1 EMPTY"
+             : empty == 0 ? "state 1 present"
                           : "?",
-             col0,
              act ? " -> BB_OBJCOL_FIX: built in state 0, destroyed flag cleared"
-             : g_fix && empty == 1 && pr.applied
-                 ? " -> BB_OBJCOL_FIX: not changed (state or flag differs)"
-                 : "");
+             : g_fix && pr.applied ? " -> BB_OBJCOL_FIX: not changed (state 0 or not destroyed)"
+             : g_fix               ? " -> BB_OBJCOL_FIX: not changed (record did not match)"
+                                   : "");
 }
 
 void PS4_SYSV_ABI HookObjBuild(const u64* regs) {
