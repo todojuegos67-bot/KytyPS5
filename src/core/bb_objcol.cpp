@@ -600,6 +600,12 @@ size_t Count(const std::set<std::string>& a, char kind) {
         std::count_if(a.begin(), a.end(), [&](const std::string& x) { return x[0] == kind; }));
 }
 
+struct MsbPart;
+std::vector<MsbPart> MsbParts(const std::vector<u8>& d);
+void StoreMsbParts(const std::string& map, const std::vector<u8>& mod_msb,
+                   const std::set<std::string>& vanilla_parts, bool have_vanilla,
+                   const std::vector<u8>& vanilla_msb);
+
 void AnalyseMsb(const Job& job) {
     const std::string& host = job.host;
     std::vector<u8> raw, msb;
@@ -630,6 +636,7 @@ void AnalyseMsb(const Job& job) {
             found = true;
             std::set<std::string> vparts, vmodels;
             MsbNames(vmsb, vparts, vmodels);
+            StoreMsbParts(MapOf(job.guest), msb, vparts, true, vmsb);
             text += fmt::format(
                 " | vanilla {} {} bytes crc {:08x}{}: object parts {}, collision parts {} | "
                 "object parts only in vanilla: {} | only in the mod: {} | collision parts only in "
@@ -644,9 +651,99 @@ void AnalyseMsb(const Job& job) {
         }
         if (!found) {
             text += " | no vanilla copy found next to the mods folder (-patch / -UPDATE / base)";
+            StoreMsbParts(MapOf(job.guest), msb, {}, false, {});
         }
+    } else {
+        StoreMsbParts(MapOf(job.guest), msb, {}, false, {});
     }
     LOG_INFO(Core, "{}", text);
+}
+
+// MSB part records (MSBB / MSB3 family): +0x00 name offset (i64, from the record), +0x08 type,
+// +0x0c index, +0x10 model index, +0x18 sib offset, +0x20 position, +0x2c rotation, +0x38 scale.
+// Records are found from their UTF-16 names and kept only when the scale is plausible.
+struct MsbPart {
+    std::string name;
+    float pos[3];
+    s32 type, index, model;
+    bool mod_only = false;
+};
+
+std::vector<MsbPart> MsbParts(const std::vector<u8>& d) {
+    std::vector<MsbPart> out;
+    const size_t n = d.size();
+    for (size_t i = 0; i + 26 <= n; i += 2) {
+        if (d[i] != 'o' || d[i + 1] != 0 || (i >= 2 && d[i - 2] != 0)) {
+            continue;
+        }
+        std::string t;
+        for (size_t k = i; k + 1 < n && t.size() < 13; k += 2) {
+            if (d[k + 1] != 0 || d[k] == 0) {
+                break;
+            }
+            t.push_back(char(d[k]));
+        }
+        if (t.size() != 12 || t[7] != '_') {
+            continue;
+        }
+        for (size_t back = 8; back <= 0x800 && back <= i; back += 4) {
+            const size_t r = i - back;
+            if (r + 0x44 > n || Le64(d.data() + r) != back) {
+                continue;
+            }
+            float f[9];
+            std::memcpy(f, d.data() + r + 0x20, sizeof(f));
+            bool ok = true;
+            for (int k = 0; k < 3; ++k) {
+                ok = ok && std::isfinite(f[k]) && std::fabs(f[k]) < 1e5f && f[6 + k] > 0.001f &&
+                     f[6 + k] < 1000.f;
+            }
+            if (!ok) {
+                continue;
+            }
+            MsbPart p;
+            p.name = t;
+            std::copy(f, f + 3, p.pos);
+            p.type = s32(Le32(d.data() + r + 8));
+            p.index = s32(Le32(d.data() + r + 0xc));
+            p.model = s32(Le32(d.data() + r + 0x10));
+            out.push_back(std::move(p));
+            break;
+        }
+    }
+    return out;
+}
+
+std::map<std::string, std::vector<MsbPart>> g_msb_parts; // by map, under g_mutex
+
+void StoreMsbParts(const std::string& map, const std::vector<u8>& mod_msb,
+                   const std::set<std::string>& vanilla_parts, bool have_vanilla,
+                   const std::vector<u8>& vanilla_msb) {
+    auto parts = MsbParts(mod_msb);
+    std::map<s32, std::string> vanilla_index;
+    if (have_vanilla) {
+        for (const auto& v : MsbParts(vanilla_msb)) {
+            vanilla_index.emplace(v.index, v.name);
+        }
+    }
+    std::string mods;
+    for (auto& p : parts) {
+        p.mod_only = have_vanilla && !vanilla_parts.contains(p.name);
+        if (p.mod_only) {
+            const auto it = vanilla_index.find(p.index);
+            mods += fmt::format("{}{} index {} type {} model {} at ({:.1f}, {:.1f}, {:.1f}){}",
+                                mods.empty() ? "" : "; ", p.name, p.index, p.type, p.model,
+                                p.pos[0], p.pos[1], p.pos[2],
+                                it != vanilla_index.end()
+                                    ? " (vanilla index " + std::to_string(p.index) + " is " +
+                                          it->second + ")"
+                                    : "");
+        }
+    }
+    LOG_INFO(Core, "[objcol] msb {} object part records {} (with position){}", map, parts.size(),
+             mods.empty() ? std::string() : " | mod-only parts: " + mods);
+    std::scoped_lock lk{g_mutex};
+    g_msb_parts[map] = std::move(parts);
 }
 
 void CompareJob(const Job& job);
@@ -904,6 +1001,13 @@ void Summary(bool force) {
 double g_map_open = -1.0, g_map_tick = 0.0;
 int g_map_visit = 0;
 bool g_cmp30 = false, g_cmp90 = false;
+struct PendingCmp {
+    std::string map;
+    int visit;
+    double open;
+    bool done[2];
+};
+std::vector<PendingCmp> g_pending_cmp;
 std::map<std::string, int> g_visits;
 u32 g_deferred_lines = 0;
 u32 g_world_lines = 0;
@@ -1293,6 +1397,124 @@ void OnFlush(u64 fd4) {
     }
 }
 
+// MSB object parts against the bodies in the world: the MSB-to-world offset is voted from the
+// parts and the in-world static / keyframed bodies (0.5 m bins), then every mod-only part gets
+// its nearest body (any motion, any state) and the vanilla parts' match rate is the baseline.
+const char* StateName(const World* w, u32 id, u64 shape);
+
+void PartsReport(double now) {
+    const auto pit = g_msb_parts.find(g_map);
+    if (pit == g_msb_parts.end() || pit->second.empty()) {
+        return;
+    }
+    const auto& parts = pit->second;
+    struct B {
+        float p[3];
+        u32 id, flags, filter, layer;
+        const char* state;
+    };
+    std::vector<B> bodies;
+    for (auto& [world, w] : g_worlds) {
+        u64 data;
+        s32 size;
+        if (now - w.last_call > 300.0 || !BodyArray(world, data, size)) {
+            continue;
+        }
+        const s32 n = std::min(size, 1 << 16);
+        std::vector<u8> all(size_t(n) * 0x90);
+        if (!SafeCopy(all.data(), data, all.size())) {
+            continue;
+        }
+        for (s32 id = 0; id < n; ++id) {
+            BodyBytes bb;
+            std::memcpy(bb.b, all.data() + size_t(id) * 0x90, 0x90);
+            if ((bb.Flags() & 7) == 0 || bb.Shape() == 0) {
+                continue;
+            }
+            bodies.push_back({{bb.Pos(0), bb.Pos(1), bb.Pos(2)},
+                              u32(id),
+                              bb.Flags(),
+                              bb.Filter(),
+                              bb.Layer(),
+                              StateName(&w, u32(id), bb.Shape())});
+        }
+    }
+    std::map<std::tuple<int, int, int>, int> votes;
+    size_t used = 0;
+    for (const auto& p : parts) {
+        if (p.mod_only || used >= 400) {
+            continue;
+        }
+        ++used;
+        for (const auto& b : bodies) {
+            if ((b.flags & 5) == 0 || std::strcmp(b.state, "in-world") != 0) {
+                continue;
+            }
+            ++votes[{int(std::lround((b.p[0] - p.pos[0]) * 2.f)),
+                     int(std::lround((b.p[1] - p.pos[1]) * 2.f)),
+                     int(std::lround((b.p[2] - p.pos[2]) * 2.f))}];
+        }
+    }
+    float off[3] = {};
+    int top = 0;
+    for (const auto& [k, v] : votes) {
+        if (v > top) {
+            top = v;
+            off[0] = std::get<0>(k) * 0.5f;
+            off[1] = std::get<1>(k) * 0.5f;
+            off[2] = std::get<2>(k) * 0.5f;
+        }
+    }
+    const auto nearest = [&](const MsbPart& p, float& d) -> const B* {
+        const B* best = nullptr;
+        d = 1e30f;
+        for (const auto& b : bodies) {
+            float e = 0.f;
+            for (int k = 0; k < 3; ++k) {
+                const float t = b.p[k] - p.pos[k] - off[k];
+                e += t * t;
+            }
+            if (e < d) {
+                d = e;
+                best = &b;
+            }
+        }
+        d = std::sqrt(d);
+        return best;
+    };
+    u32 vanilla = 0, vanilla_hit = 0, vanilla_hit_world = 0;
+    std::string mods;
+    u32 mod_n = 0, mod_hit_world = 0;
+    for (const auto& p : parts) {
+        float d;
+        const B* b = nearest(p, d);
+        const bool hit = b != nullptr && d < 0.6f;
+        const bool in_world = hit && std::strcmp(b->state, "in-world") == 0;
+        if (!p.mod_only) {
+            ++vanilla;
+            vanilla_hit += hit;
+            vanilla_hit_world += in_world;
+            continue;
+        }
+        ++mod_n;
+        mod_hit_world += in_world;
+        mods += fmt::format(
+            "{}{} ({:.1f}, {:.1f}, {:.1f}): {}", mods.empty() ? "" : "; ", p.name, p.pos[0],
+            p.pos[1], p.pos[2],
+            b == nullptr ? std::string("no body")
+                         : fmt::format("nearest body #{} {} {} layer {} filter {:#x} at {:.2f} m",
+                                       b->id, Motion(b->flags), b->state, b->layer, b->filter, d));
+    }
+    LOG_INFO(Core,
+             "[objcol] map {} visit #{} (+{:.0f} s): MSB object parts {} | MSB->world offset "
+             "({:.1f}, {:.1f}, {:.1f}) ({} votes) | parts in the vanilla MSB with a body within "
+             "0.6 m: {} of {} ({} in the world) | mod-only parts {} ({} with an in-world body "
+             "within 0.6 m): {}",
+             g_map, g_map_visit, now - g_map_open, parts.size(), off[0], off[1], off[2], top,
+             vanilla_hit, vanilla, vanilla_hit_world, mod_n, mod_hit_world,
+             mods.empty() ? "none" : mods);
+}
+
 void MapTick(double now) {
     if (now - g_map_tick < 1.0) {
         return;
@@ -1323,16 +1545,30 @@ void MapTick(double now) {
                 d.t, now - d.t, g_map, g_first_step < 0.0 ? "not started" : "running");
         }
     }
-    if (g_map_open >= 0.0 && !g_cmp30 && now - g_map_open >= 30.0) {
-        g_cmp30 = true;
-        CompareMap(now);
-        SystemsReport(now);
+    // Every map open gets its +30 s and +90 s reports, also when another map block opened since
+    // (Yharnam opens m24_01 and m27_00 within seconds of each other).
+    for (auto& pc : g_pending_cmp) {
+        for (int stage = 0; stage < 2; ++stage) {
+            const double at = stage == 0 ? 30.0 : 90.0;
+            if (pc.done[stage] || now - pc.open < at) {
+                continue;
+            }
+            pc.done[stage] = true;
+            const std::string map = g_map;
+            const int visit = g_map_visit;
+            const double open = g_map_open;
+            g_map = pc.map;
+            g_map_visit = pc.visit;
+            g_map_open = pc.open;
+            CompareMap(now);
+            SystemsReport(now);
+            PartsReport(now);
+            g_map = map;
+            g_map_visit = visit;
+            g_map_open = open;
+        }
     }
-    if (g_map_open >= 0.0 && !g_cmp90 && now - g_map_open >= 90.0) {
-        g_cmp90 = true;
-        CompareMap(now);
-        SystemsReport(now);
-    }
+    std::erase_if(g_pending_cmp, [](const PendingCmp& pc) { return pc.done[0] && pc.done[1]; });
 }
 
 void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret) {
@@ -1670,7 +1906,16 @@ void NearPlayer(const ProxyBytes& pb, double now) {
         SafeCopy(q, world + 0x180, sizeof(q)) && q[8] > 0.f && q[9] > 0.f && q[10] > 0.f;
     const auto wit = g_worlds.find(world);
     const World* w = wit == g_worlds.end() ? nullptr : &wit->second;
-    const float P[3] = {pb.Pos(0), pb.Pos(1), pb.Pos(2)};
+    // Field run 2: proxy+0x40 reads (1, 0, 0) for every character; the position is the
+    // translation of the proxy's own body (+0x30).
+    float P[3] = {pb.Pos(0), pb.Pos(1), pb.Pos(2)};
+    if (pb.BodyId() >= 0 && pb.BodyId() < n) {
+        BodyBytes own;
+        std::memcpy(own.b, all.data() + size_t(pb.BodyId()) * 0x90, 0x90);
+        for (int k = 0; k < 3; ++k) {
+            P[k] = own.Pos(k);
+        }
+    }
     struct Near {
         float d;
         std::string text;
@@ -2097,6 +2342,7 @@ void FileOpened(const std::string& p, const char* host, u64 size) {
         g_map_open = Now();
         g_cmp30 = g_cmp90 = false;
         g_map_visit = ++g_visits[g_map];
+        g_pending_cmp.push_back({g_map, g_map_visit, g_map_open, {false, false}});
         u64 pending = 0, in_world = 0;
         for (const auto& [world, w] : g_worlds) {
             pending += w.deferred.size();
