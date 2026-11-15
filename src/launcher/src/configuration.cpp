@@ -44,6 +44,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(trophy_duration_seconds);
 	KYTY_CFG_SET(perf_overlay_enabled);
 	KYTY_CFG_SET(skip_notice_screen);
+	KYTY_CFG_SET(render_resolution);
 	KYTY_CFG_SET(network_connected);
 	KYTY_CFG_SET(psn_emulation_enabled);
 	KYTY_CFG_SET(vblank_frequency);
@@ -58,7 +59,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(printf_output_file);
 	KYTY_CFG_SET(profiler_enabled);
 	KYTY_CFG_SET(renderdoc_enabled);
-	KYTY_CFG_SET(pro_enabled);
+	values.insert(QStringLiteral("pro_mode"), QVariant::fromValue(pro_enabled).toString());
 	KYTY_CFG_SET(pssr_upscaler);
 	KYTY_CFG_SET(dlss_folder);
 	KYTY_CFG_SET(fsr_folder);
@@ -106,6 +107,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);
+	KYTY_CFG_GET(render_resolution);
 	KYTY_CFG_GET(network_connected);
 	KYTY_CFG_GET(psn_emulation_enabled);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
@@ -127,7 +129,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(pssr_upscaler);
 	KYTY_CFG_GET(dlss_folder);
 	KYTY_CFG_GET(fsr_folder);
-	pro_enabled     = s.value("pro_enabled", false).toBool();
+	pro_enabled     = s.value("pro_mode", true).toBool();
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
 	red_zone_protection_enabled =
@@ -163,8 +165,16 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 		error = message;
 		return false;
 	};
+	// A config from elsewhere doesn't choose which files the emulator writes or runs. Export writes them, so
+	// a config exported here still imports: they keep this machine's values.
+	const auto machine_path = [](const QString& key) {
+		return key == "printf_output_file" || key == "shader_log_folder" || key == "command_buffer_dump_folder" || key == "elf";
+	};
 	auto values = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
+		if (machine_path(it.key())) {
+			continue;
+		}
 		if (!values.contains(it.key())) {
 			return fail(tr("Unknown game setting: %1").arg(it.key()));
 		}
@@ -179,7 +189,7 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	ReadGameSettingsValues(values);
 	const auto canonical = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
-		if (canonical.value(it.key()) != values.value(it.key())) {
+		if (!machine_path(it.key()) && canonical.value(it.key()) != values.value(it.key())) {
 			return fail(tr("Invalid value for game setting: %1").arg(it.key()));
 		}
 	}

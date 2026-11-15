@@ -39,13 +39,15 @@ set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
 
 add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LauncherGameViewsTests.cpp"
+	src/configuration.cpp
+	include/configuration.h
 	src/gameContent.cpp
 	src/launcherTheme.cpp
 	resources.qrc
 )
 target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
+set_target_properties(launcher_game_views_tests PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")

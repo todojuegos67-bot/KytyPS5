@@ -277,6 +277,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
+	if (info.render_resolution != QStringLiteral("auto")) {
+		args << "--render-resolution" << info.render_resolution;
+	}
 	AddFlag(args, info.network_connected, "--network-connected");
 	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
@@ -294,12 +297,13 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
-	AddFlag(args, info.pro_enabled, "--trinity");
+	args << "--trinity" << (info.pro_enabled ? "true" : "false");
 	if (info.pro_enabled) {
 		args << "--pssr-upscaler" << EnumToText(info.pssr_upscaler);
 		if (info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
 			args << "--dlss-folder" << info.dlss_folder;
-		} else if (info.pssr_upscaler == Configuration::PssrUpscaler::FSR) {
+		} else if (info.pssr_upscaler == Configuration::PssrUpscaler::FSR && !info.fsr_folder.isEmpty()) {
+			// Without a folder FSR is the built-in FSR 3.1.
 			args << "--fsr-folder" << info.fsr_folder;
 		}
 	}

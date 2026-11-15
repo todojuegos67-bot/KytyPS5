@@ -169,7 +169,11 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		    TextToEnum<Configuration::PssrUpscaler>(m_ui->comboBox_pssr_upscaler->currentText());
 		m_ui->pssrLayout->setRowVisible(0, pro);
 		m_ui->pssrLayout->setRowVisible(1, pro && upscaler == Configuration::PssrUpscaler::DLSS);
+#if defined(_WIN32)
 		m_ui->pssrLayout->setRowVisible(2, pro && upscaler == Configuration::PssrUpscaler::FSR);
+#else
+		m_ui->pssrLayout->setRowVisible(2, false); // AMD's DLLs are Windows only
+#endif
 	};
 	connect(m_ui->checkBox_pro, &QCheckBox::toggled, this, show_pssr);
 	connect(m_ui->comboBox_pssr_upscaler, &QComboBox::currentTextChanged, this, show_pssr);
@@ -311,6 +315,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
 	m_ui->checkBox_shader_cache->setChecked(info.shader_cache_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
+	m_ui->comboBox_render_resolution->setCurrentIndex(
+	    qMax(0, m_ui->comboBox_render_resolution->findText(info.render_resolution)));
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_psn_emulation->setChecked(info.psn_emulation_enabled);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
@@ -332,13 +338,11 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_fsr_folder->setText(info.fsr_folder);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
 	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
-#if !defined(_WIN32)
-	// Unsupported upscalers are hidden; their saved choice falls back to Linear.
-	auto* upscaler = m_ui->comboBox_pssr_upscaler;
-	upscaler->removeItem(upscaler->findText(EnumToText(Configuration::PssrUpscaler::FSR)));
 #if defined(__APPLE__)
+	// Unsupported upscalers are hidden; their saved choice falls back to Linear. FSR stays: without AMD's DLLs
+	// (Windows only) it is the built-in FSR 3.1.
+	auto* upscaler = m_ui->comboBox_pssr_upscaler;
 	upscaler->removeItem(upscaler->findText(EnumToText(Configuration::PssrUpscaler::DLSS)));
-#endif
 	upscaler->setCurrentIndex(qMax(0, upscaler->findText(EnumToText(info.pssr_upscaler))));
 #endif
 #if defined(__APPLE__)
@@ -563,6 +567,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
 	info.shader_cache_enabled      = ui.checkBox_shader_cache->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
+	info.render_resolution         = ui.comboBox_render_resolution->currentText();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
@@ -596,7 +601,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 
 void ConfigurationEditDialog::save() {
 	for (auto* field:
-	     {m_ui->lineEdit_dlss_folder, m_ui->lineEdit_fsr_folder, m_ui->lineEdit_shader_log_folder,
+	     {m_ui->lineEdit_dlss_folder, m_ui->lineEdit_shader_log_folder,
 	      m_ui->lineEdit_printf_file, m_ui->lineEdit_cmd_dump_folder}) {
 		if (field->isEnabled() && !field->isHidden() && field->text().isEmpty()) {
 			ShowTab(field);

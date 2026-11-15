@@ -256,8 +256,8 @@
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
              <widget class="QCheckBox" name="checkBox_pro">
-              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. Disabled by default.</string></property>
-              <property name="text"><string>PS5 Pro mode (experimental)</string></property>
+              <property name="toolTip"><string>PS5 Pro mode for supported games, with FSR 3.1 and frame generation (KYTY_FSR3_FG=0 turns frame generation off). On by default; off runs the base PS5 mode.</string></property>
+              <property name="text"><string>PS5 Pro mode (FSR 3.1 + frame generation)</string></property>
              </widget>
             </item>
             <item>
@@ -269,7 +269,7 @@
               </item>
               <item row="0" column="1">
                <widget class="QComboBox" name="comboBox_pssr_upscaler">
-                <property name="toolTip"><string>DLSS needs an NVIDIA RTX GPU</string></property>
+                <property name="toolTip"><string>Linear: FSR 3.1 on this build (KYTY_FSR3=0 for linear). DLSS needs an NVIDIA RTX GPU</string></property>
                </widget>
               </item>
               <item row="1" column="0">
@@ -289,8 +289,8 @@
                </widget>
               </item>
               <item row="2" column="1">
-               <widget class="MandatoryLineEdit" name="lineEdit_fsr_folder">
-                <property name="toolTip"><string>Folder with amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll (AMD FidelityFX SDK 2.4 or later)</string></property>
+               <widget class="QLineEdit" name="lineEdit_fsr_folder">
+                <property name="toolTip"><string>Optional: folder with amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll (AMD FidelityFX SDK 2.4 or later). Empty: the built-in FSR 3.1 with frame generation.</string></property>
                 <property name="clearButtonEnabled"><bool>true</bool></property>
                </widget>
               </item>
@@ -325,6 +325,35 @@
               <property name="toolTip"><string>Skip startup logos and notices in supported games.</string></property>
               <property name="text"><string>Skip boot logos</string></property>
              </widget>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="renderResolutionLayout">
+              <item>
+               <widget class="QLabel" name="label_render_resolution">
+                <property name="text"><string>Render resolution:</string></property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QComboBox" name="comboBox_render_resolution">
+                <property name="toolTip"><string>Marvel's Wolverine 1.05: the size its 3D renders at before the game's own upscale. auto keeps the game's dynamic resolution, which sits at its lowest step, 1664x936, below 60 fps.</string></property>
+                <item><property name="text"><string>auto</string></property></item>
+                <item><property name="text"><string>1664x936</string></property></item>
+                <item><property name="text"><string>1792x1008</string></property></item>
+                <item><property name="text"><string>1920x1080</string></property></item>
+                <item><property name="text"><string>2048x1152</string></property></item>
+                <item><property name="text"><string>2304x1296</string></property></item>
+                <item><property name="text"><string>2560x1440</string></property></item>
+                <item><property name="text"><string>2816x1584</string></property></item>
+                <item><property name="text"><string>3072x1728</string></property></item>
+                <item><property name="text"><string>3328x1872</string></property></item>
+               </widget>
+              </item>
+              <item>
+               <spacer name="renderResolutionSpacer">
+                <property name="orientation"><enum>Qt::Horizontal</enum></property>
+               </spacer>
+              </item>
+             </layout>
             </item>
            </layout>
           </widget>

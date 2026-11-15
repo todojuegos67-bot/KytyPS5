@@ -1,3 +1,4 @@
+#include "configuration.h"
 #include "gameViews.h"
 #include "launcherTheme.h"
 #include "ui_configuration_list_widget.h"
@@ -54,6 +55,24 @@ int main(int argc, char **argv) {
   // A fixed light palette, whatever the desktop colors: a black panel then stands out.
   QApplication::setPalette(QPalette(Qt::white));
   LauncherTheme::Initialize(application);
+
+  // An imported config doesn't choose which files the emulator writes or runs.
+  {
+    Configuration config;
+    const auto    elf = config.elf, printf_file = config.printf_output_file;
+    const auto    shader_log = config.shader_log_folder, dump = config.command_buffer_dump_folder;
+    QString       error;
+    QJsonObject   imported;
+    for (const auto *key : {"elf", "printf_output_file", "shader_log_folder", "command_buffer_dump_folder"}) {
+      imported.insert(QLatin1String(key), QStringLiteral("C:/elsewhere/file"));
+    }
+    imported.insert(QStringLiteral("user_name"), QStringLiteral("Imported"));
+    Check(config.SetGameSettings(imported, error), "the config with paths did not import");
+    Check(config.elf == elf && config.printf_output_file == printf_file && config.shader_log_folder == shader_log &&
+              config.command_buffer_dump_folder == dump,
+          "an imported config chose an output file or the elf");
+    Check(config.user_name == QStringLiteral("Imported"), "the rest of the config did not import");
+  }
 
   QTemporaryDir game;
   Check(QDir(game.path()).mkpath(QStringLiteral("sce_sys")), "cannot create sce_sys");

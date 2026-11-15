@@ -131,6 +131,7 @@ public:
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
 	bool                   skip_notice_screen          = false;
+	QString                render_resolution           = QStringLiteral("auto"); // Marvel's Wolverine 1.05
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
 	int                    vblank_frequency            = 60;
@@ -145,8 +146,8 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   pro_enabled                 = false;
-	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
+	bool                   pro_enabled                 = true; // stored as pro_mode
+	PssrUpscaler           pssr_upscaler               = PssrUpscaler::FSR; // built-in FSR 3.1 without a folder
 	QString                dlss_folder;
 	QString                fsr_folder;
 	bool                   amd_cpu_enabled             = false;
@@ -182,6 +183,7 @@ public:
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
+		render_resolution           = other.render_resolution;
 		network_connected           = other.network_connected;
 		psn_emulation_enabled       = other.psn_emulation_enabled;
 		vblank_frequency            = other.vblank_frequency;
