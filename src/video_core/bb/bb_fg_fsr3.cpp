@@ -1090,9 +1090,10 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    overlay ? "bypassed (real frames presented directly)" : "resumes");
         }
         if (overlay) {
-            // (a repeat of the last frame, shown on vblanks while the overlay is up, has no
-            // inputs and keeps the count too)
-            overlay_only = (usable || inputs == nullptr) && !overlay_holdoff;
+            // (only a present whose 3D inputs were good: a repeat of the last frame or a movie /
+            // loading flip has none and restarts the count, as without the overlay; with
+            // BB_MENU_REPEAT_ALWAYS off repeats only come once the game stopped flipping)
+            overlay_only = usable && !overlay_holdoff;
             usable = false;
         }
     }
