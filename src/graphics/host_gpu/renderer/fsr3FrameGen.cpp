@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -65,7 +66,8 @@ struct Contexts {
 	bool                               inverted  = false;
 };
 
-constexpr uint32_t BackendContexts = 3; // frame interpolation, optical flow, the shared images
+// Frame interpolation, optical flow, the shared images; twice, as retired contexts live until the next present.
+constexpr uint32_t BackendContexts = 6;
 
 std::mutex                     g_mutex; // contexts, prepared frames, the backend
 std::optional<QueueSlot>       g_present_slot, g_acquire_slot;
@@ -76,7 +78,10 @@ FfxInterface                   g_interface {};
 std::vector<uint8_t>           g_scratch;
 FfxSwapchainReplacementFunctions g_functions {};
 VkFrameInterpolationInfoFFX    g_info {};
-std::optional<Contexts>        g_contexts;
+std::unique_ptr<Contexts>      g_contexts;
+// Replaced contexts: a present's interpolation is recorded under g_mutex but submitted later inside queuePresentKHR,
+// so they go only after the next present has returned (Present).
+std::vector<std::unique_ptr<Contexts>> g_retired;
 std::array<Prepared, 4>        g_prepared {};
 uint64_t                       g_latest = 0;
 FfxDimensions2D                g_display {}; // the swapchain's
@@ -118,11 +123,11 @@ FfxResource Shared(const Contexts& contexts, size_t index) {
 	return g_interface.fpGetResource(&g_interface, contexts.shared[index]);
 }
 
-void DestroyLocked() {
-	if (!g_contexts) {
+void DestroyLocked(std::unique_ptr<Contexts>& contexts) {
+	if (!contexts) {
 		return;
 	}
-	auto& c = *g_contexts;
+	auto& c = *contexts;
 	for (size_t i = 0; i < c.shared_count; ++i) {
 		g_interface.fpDestroyResource(&g_interface, c.shared[i], c.shared_id);
 	}
@@ -135,7 +140,7 @@ void DestroyLocked() {
 	if (c.has_of) {
 		ffxOpticalflowContextDestroy(&c.of);
 	}
-	g_contexts.reset();
+	contexts.reset();
 }
 
 // Waits for the GPU before contexts it may still read go: rare (a resize, a larger render size).
@@ -156,7 +161,8 @@ bool CreateLocked(FfxDimensions2D max_render, bool inverted) {
 		}
 		g_scratch = std::move(scratch);
 	}
-	auto& c      = g_contexts.emplace();
+	g_contexts  = std::make_unique<Contexts>();
+	auto& c      = *g_contexts;
 	c.display    = g_display;
 	c.max_render = max_render;
 	c.format     = g_format;
@@ -202,7 +208,7 @@ bool CreateLocked(FfxDimensions2D max_render, bool inverted) {
 	}
 	if (error != FFX_OK) {
 		Warn("the contexts weren't created", error);
-		DestroyLocked();
+		DestroyLocked(g_contexts);
 		return false;
 	}
 	FfxEffectMemoryUsage fi_use {}, of_use {}, shared_use {};
@@ -224,7 +230,8 @@ FfxErrorCode Generate(const FfxFrameGenerationDispatchDescription* desc, void* /
 	const auto&     prepared = g_prepared[desc->frameID % g_prepared.size()];
 	const bool      usable   = g_contexts && prepared.id == desc->frameID &&
 	                    desc->presentColor.description.width == g_contexts->display.width &&
-	                    desc->presentColor.description.height == g_contexts->display.height;
+	                    desc->presentColor.description.height == g_contexts->display.height &&
+	                    desc->presentColor.description.format == g_contexts->format;
 	if (!usable) {
 		// The swapchain presents the output only when a frame was generated.
 		const_cast<FfxFrameGenerationDispatchDescription*>(desc)->numInterpolatedFrames = 0;
@@ -508,8 +515,8 @@ void Prepare(vk::CommandBuffer command, const Pssr::Request& request, const Inpu
 		if (g_contexts) {
 			max_render = {std::max(render.width, g_contexts->max_render.width),
 			              std::max(render.height, g_contexts->max_render.height)};
-			WaitIdleLocked();
-			DestroyLocked();
+			g_retired.push_back(std::move(g_contexts));
+			g_prepared = {}; // prepared with the old contexts
 		}
 		if (!CreateLocked(max_render, inverted)) {
 			return;
@@ -598,6 +605,11 @@ vk::Result Present(vk::Queue queue, const vk::PresentInfoKHR& present) {
 	std::lock_guard lock(g_mutex);
 	g_dump    = nullptr;
 	g_hudless = nullptr;
+	if (!g_retired.empty()) {
+		WaitIdleLocked();
+		for (auto& contexts: g_retired) DestroyLocked(contexts);
+		g_retired.clear();
+	}
 	return static_cast<vk::Result>(result);
 }
 
