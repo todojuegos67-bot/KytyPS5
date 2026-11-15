@@ -343,7 +343,8 @@ TEST_F(PsmlTest, DispatchCarriesTemporalInputs) {
   EXPECT_EQ(std::to_array(request.motion), motion);
   EXPECT_EQ(std::to_array(request.depth), depth);
   EXPECT_EQ(std::to_array(request.exposure), exposure);
-  EXPECT_EQ(request.context, reinterpret_cast<uintptr_t>(context));
+  EXPECT_NE(request.context, 0u);
+  EXPECT_EQ(dispatch().context, request.context);
   EXPECT_EQ(request.x, 16u);
   EXPECT_EQ(request.y, 8u);
   EXPECT_EQ(std::to_array(request.jitter), std::to_array(params.jitter));
@@ -708,9 +709,20 @@ TEST_F(PsmlMfsr2Test, DispatchFillsTheReservedSpaceWithOnePacket) {
   output = Texture(3840, 2159, 0x10000);
   expect_nop(context, MFSR2_INVALID_TEXTURE);
   expect_nop(nullptr, MFSR2_INVALID_CONTEXT);
+  expect_nop(&params, MFSR2_INVALID_CONTEXT); // not one of the four slots
   EXPECT_EQ(command.front(), 0xdeadbeefu);
   EXPECT_EQ(command.back(), 0xdeadbeefu);
+  // Audit 2026-11-15, 49: no space, or less than GetDispatchDwords gives, writes nothing.
+  output = Texture(3840, 2160, 0x10000);
+  EXPECT_EQ(Function<Dispatch>("lrJwpLjKXRc")(context, nullptr, &params), MFSR2_NULL_ARGUMENT);
+  const CommandSpace small{command.data() + 1, 4};
+  command[1] = 0xdeadbeef;
+  EXPECT_EQ(Function<Dispatch>("lrJwpLjKXRc")(context, &small, &params), MFSR2_INVALID_PARAMETER);
+  EXPECT_EQ(command[1], 0xdeadbeefu);
+  EXPECT_EQ(Function<GetSize>("ZLL31lzzxr4")(context, nullptr), MFSR2_NULL_ARGUMENT);
   EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), MFSR2_INVALID_CONTEXT);
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(nullptr), MFSR2_INVALID_CONTEXT);
 }
 
 TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
@@ -746,7 +758,8 @@ TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
   EXPECT_EQ(std::to_array(request.motion), motion);
   EXPECT_EQ(std::to_array(request.depth), depth);
   EXPECT_EQ(std::to_array(request.exposure), exposure);
-  EXPECT_EQ(request.context, reinterpret_cast<uintptr_t>(context));
+  const auto first_id = request.context;
+  EXPECT_NE(first_id, 0u);
   EXPECT_EQ(request.x, 32u);
   EXPECT_EQ(request.y, 24u);
   EXPECT_EQ(std::to_array(request.jitter), std::to_array(params.jitter));
@@ -770,6 +783,16 @@ TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
   params.flags = 0;
   params.motion_offset[0] = 1.0f;
   EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  params.motion_offset[0] = 0.0f;
+  // Audit 2026-11-15, 48: a pre-exposure of 0 reaches the upscaler as 1, as PSSR's does.
+  params.pre_exposure = 0.0f;
+  EXPECT_EQ(dispatch().pre_exposure, 1.0f);
+  // 50: the released slot comes back for the next context, which owns a new history.
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
+  void *again = NewContext(3840, 2160, 32);
+  EXPECT_EQ(again, context);
+  context = again;
+  EXPECT_NE(dispatch().context, first_id);
   EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
 }
 

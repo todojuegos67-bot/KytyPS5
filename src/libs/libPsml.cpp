@@ -7,6 +7,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -127,6 +128,7 @@ struct Context {
 	uint32_t         width;
 	uint32_t         height;
 	SharedResources* shared;
+	uint64_t         id; // NextContextId: owns the upscaler's history (Pssr::Request::context)
 };
 
 struct CommandSpace {
@@ -157,13 +159,19 @@ void CopyDescriptor(uint32_t (&out)[8], const uint32_t* descriptor) {
 	}
 }
 
+// A released context's address or slot comes back for the next one, which must not inherit the old one's upscaler
+// history (renderPssr.cpp keys its contexts by Request::context): every create, PSSR or MFSR2, takes a new number.
+uint64_t NextContextId() {
+	static std::atomic<uint64_t> next {1};
+	return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 // Both dispatch parameter structs name their common fields alike.
 template <typename Parameters>
-Pssr::Request MakeRequest(const void* context, const Parameters& params, uint32_t flags,
-                          float pre_exposure) {
+Pssr::Request MakeRequest(uint64_t context_id, const Parameters& params, uint32_t flags, float pre_exposure) {
 	Pssr::Request request {.width        = params.width,
 	                       .height       = params.height,
-	                       .context      = reinterpret_cast<uintptr_t>(context),
+	                       .context      = context_id,
 	                       .x            = params.x,
 	                       .y            = params.y,
 	                       .jitter       = {params.jitter[0], params.jitter[1]},
@@ -293,7 +301,7 @@ int CreateContext(void** out, const MemoryParameters* memory, uint32_t width, ui
 		return TOO_MANY_CONTEXTS;
 	}
 	auto record =
-	    std::make_unique<Context>(Context {width, height, use_shared ? g_shared.get() : nullptr});
+	    std::make_unique<Context>(Context {width, height, use_shared ? g_shared.get() : nullptr, NextContextId()});
 	auto* handle = record.get();
 	g_contexts.emplace(handle, std::move(record));
 	if (handle->shared != nullptr) {
@@ -402,7 +410,7 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 	    (params->motion_gamma != 0.0f && params->motion_gamma != 1.0f)) {
 		flags |= Pssr::kSpatialOnly;
 	}
-	WritePacket(*space, MakeRequest(context, *params, flags,
+	WritePacket(*space, MakeRequest(record.id, *params, flags,
 	                                params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure));
 	return OK;
 }
@@ -513,11 +521,17 @@ struct Context {
 	bool     used;
 	uint32_t width;
 	uint32_t height;
+	uint64_t id;
 };
 
 bool    g_initialized = false;
 bool    g_shared      = false;
 Context g_contexts[4] {};
+
+// One of the four slots, in use: anything else (null, a stale or foreign pointer) is not a context.
+bool IsContext(const Context* context) {
+	return std::ranges::any_of(g_contexts, [&](const Context& slot) { return &slot == context && slot.used; });
+}
 
 int CheckSharedParameters(const void* out, const SharedParameters* params) {
 	if (out == nullptr || params == nullptr) {
@@ -555,7 +569,7 @@ uint64_t ContextBlockCount(const ContextParameters& params) {
 }
 
 int CheckDispatch(const Context* context, const DispatchParameters* params) {
-	if (context == nullptr) {
+	if (!IsContext(context)) {
 		return INVALID_CONTEXT;
 	}
 	if (params == nullptr) {
@@ -670,7 +684,7 @@ int KYTY_SYSV_ABI CreateContext(Context** out, const ContextParameters* params) 
 	if (params->block_count != ContextBlockCount(*params)) {
 		return INVALID_PARAMETER;
 	}
-	*slot = {true, params->width, params->height};
+	*slot = {true, params->width, params->height, NextContextId()};
 	*out  = slot;
 	return OK;
 }
@@ -680,6 +694,9 @@ int KYTY_SYSV_ABI ReleaseContext(Context* context) {
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
 	}
+	if (!IsContext(context)) {
+		return INVALID_CONTEXT;
+	}
 	context->used = false;
 	return OK;
 }
@@ -688,6 +705,9 @@ int KYTY_SYSV_ABI GetDispatchDwords(const Context* /*context*/, uint32_t* out) {
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
+	}
+	if (out == nullptr) {
+		return ARGUMENT_NULL;
 	}
 	*out = DISPATCH_DWORDS;
 	return OK;
@@ -699,6 +719,13 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
 	}
+	// As PSSR's Dispatch: the packet needs the space it fills (WritePacket clears dwords - PACKET_DWORDS).
+	if (space == nullptr || space->cmd == nullptr) {
+		return ARGUMENT_NULL;
+	}
+	if (space->dwords < DISPATCH_DWORDS || space->dwords > 0x4001) {
+		return INVALID_PARAMETER;
+	}
 	if (const int error = CheckDispatch(context, params); error != OK) {
 		space->cmd[0] = KYTY_PM4(space->dwords, Pm4::IT_NOP, Pm4::R_ZERO);
 		return error;
@@ -709,7 +736,8 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
 		flags |= Pssr::kSpatialOnly;
 	}
-	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
+	WritePacket(*space, MakeRequest(context->id, *params, flags,
+	                                params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure));
 	return OK;
 }
 
