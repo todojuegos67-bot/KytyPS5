@@ -96,6 +96,10 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
 constexpr u32 EffectDraw = 1, EffectSrcAlpha = 2;
 // bb-mv-layer: bit 2: a blended draw that writes depth (translucent solid).
 constexpr u32 EffectSolid = 4;
+// bb-mv-fire: bit 3: the game's blend adds (dst One): emissive FXR particles (fire, sparks).
+constexpr u32 EffectAdditive = 8;
+// bb-mv-fire: rasterizer diagnostics: a blended draw of the scene that never reached OnDraw.
+void NoteSkippedBlend(u64 vs_hash, u32 why);
 // bb-mv-fill (BB_FG_SPARKS=1): the presenter's HUD-less pass marks the effect pixels (bit 1 of
 // .a of ObjectTarget) as "UI" for frame generation (taken from the real frame).
 bool SparksOn();

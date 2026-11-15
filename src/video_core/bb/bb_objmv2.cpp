@@ -231,6 +231,10 @@ struct State {
     bool cur_effect = false; // the draw being processed is an effect draw
     bool cur_effect_alpha = false; // ... whose game blend multiplies by src alpha
     bool cur_solid = false;        // bb-mv-layer: a blended draw that writes depth
+    bool cur_additive = false;     // bb-mv-fire: the game's blend adds (dst One)
+    u32 spark_word_add = 0;        // bb-mv-fire: threshold for additive draws
+    u64 sec_add_draws = 0, sec_add_vec = 0, sec_ui_skip = 0;
+    std::unordered_map<u64, std::array<u32, 2>> skipped_vs; // vs -> no motion key, write mask 0
     u64 sec_solid_draws = 0, sec_solid_vec = 0;
     u32 spark_word = 0;      // push word: threshold (1/4096) | bit 16: contribution x src alpha
     u32 spark_word_alpha = 0;
@@ -715,6 +719,18 @@ bool Init(const Vulkan::Instance& instance) {
                 if (end != mv && std::isfinite(f) && f > 0.0f) g.spark_max = std::min(f, 100.0f) / 100.0f;
             }
             g.spark_word_alpha = g.spark_word | 0x10000u;
+            {
+                // bb-mv-fire: additive (dst One) FXR draws are emissive by the game's own blend
+                // state (fire, embers, sparks): their visible texels count, BB_FG_SPARKS_ADD_LUM
+                // (default 0.03) only skips the (near) black ones.
+                float al = 0.03f;
+                if (const char* av = std::getenv("BB_FG_SPARKS_ADD_LUM"); av != nullptr && av[0]) {
+                    char* end = nullptr;
+                    const float f = std::strtof(av, &end);
+                    if (end != av && std::isfinite(f) && f > 0.0f) al = std::min(f, 15.0f);
+                }
+                g.spark_word_add = std::clamp<u32>(u32(std::lround(al * 4096.0f)), 1u, 0xffffu);
+            }
             if (g.sparks || BB::MvEngine::Enabled()) {
                 Log(fmt::format("[sparks] {} (BB_FG_SPARKS=1 with BB_MV_ENGINE=1): additive / "
                                 "premultiplied / screen effect draws, and the bright pixels of alpha-blended draws "
@@ -1291,6 +1307,7 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     ++g.w30.draws;
     if (effect) {
         ++g.sec_spark_draws;
+        if (g.cur_additive) ++g.sec_add_draws;
         ++g.spark_vs[vs.pgm_hash][0];
         if (!g.fog) return; // the static-world vector needs the bb-fog-mv path
     } else if (blend) {
@@ -1960,7 +1977,10 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         g.table_used += 16;
         g.cnt_list[g.slot].push_back({coff, g.cur_draw_key, vs.pgm_hash});
         const auto it = g.large_until.find(g.cur_draw_key);
-        large = it != g.large_until.end() && it->second + kLargeHold >= g.frame;
+        // bb-mv-fire: an additive (emissive) draw is never held: a big fire must come from the
+        // real frame as a whole (the hold is for alpha-blended surfaces: fog gate, moon).
+        large = !(effect && g.cur_additive) && it != g.large_until.end() &&
+                it->second + kLargeHold >= g.frame;
         ++(large ? g.sec_held_draws : g.sec_marked_draws);
     }
     const u32 gate_bits = counted ? (32u | (large ? 16u : 0u)) : 0u;
@@ -1982,7 +2002,9 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
             // bb-mv-fill: the effect's static-world vector and class 5 where its contribution is
             // bright (fragment: weight 0 / 1, push word = threshold).
             push.objmv_flags = 1u | gate_bits;
-            push.objmv_fog = g.cur_effect_alpha ? g.spark_word_alpha : g.spark_word;
+            const u32 thr = g.cur_additive ? g.spark_word_add : g.spark_word;
+            push.objmv_fog = g.cur_effect_alpha ? (thr | 0x10000u) : thr;
+            if (g.cur_additive) ++g.sec_add_vec;
             ++g.sec_spark_vec;
             ++g.spark_vs[vs.pgm_hash][1];
             ++g.frame_vec_draws;
@@ -2101,6 +2123,8 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     g.cur_draw_key = Mix(Mix(Mix(vs_hash, identity), count), 0x67617465ull);
     g.cur_effect_alpha = (effect & EffectSrcAlpha) != 0;
     g.cur_solid = (effect & EffectSolid) != 0 && (effect & EffectDraw) == 0;
+    g.cur_additive = (effect & EffectAdditive) != 0;
+    if (ui_phase && g.ready && g.cur_effect) ++g.sec_ui_skip;
     push.objmv_entry = {u32(g.base_addr), u32(g.base_addr >> 32)}; // zero entry
     if (!g.ready || ui_phase) return;
     if (g.velocity) {
@@ -2275,6 +2299,12 @@ void OnDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryManager*
     }
     g.sec_cpu_ns +=
         std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void NoteSkippedBlend(u64 vs_hash, u32 why) {
+    if (!g.ready || !g.sparks) return;
+    ++g.skipped_vs[vs_hash][why & 1u];
+    if (g.skipped_vs.size() > 1024) g.skipped_vs.clear();
 }
 
 bool SparksOn() {
@@ -2714,6 +2744,25 @@ void OnFlip() {
                 double(g.sec_solid_vec) / f,
                 shaders.empty() ? " none" : shaders));
         }
+        if (g.sparks) {
+            std::vector<std::pair<u64, std::array<u32, 2>>> sk(g.skipped_vs.begin(),
+                                                               g.skipped_vs.end());
+            std::sort(sk.begin(), sk.end(), [](const auto& a, const auto& b) {
+                return a.second[0] + a.second[1] > b.second[0] + b.second[1];
+            });
+            std::string t;
+            for (size_t i = 0; i < sk.size() && i < 8; ++i) {
+                t += fmt::format(" {:#x}:{}/{}", sk[i].first, sk[i].second[0], sk[i].second[1]);
+            }
+            Log(fmt::format("[sparks-fire] additive effect draws {:.1f}/frame, with vector "
+                            "{:.1f}/frame (threshold BB_FG_SPARKS_ADD_LUM, never held as large) | "
+                            "effect draws in the UI phase (skipped) {:.1f}/frame | blended draws "
+                            "without a motion pipeline (vs: no attachment 7 / write mask 0, 1 s):{}",
+                            double(g.sec_add_draws) / f, double(g.sec_add_vec) / f,
+                            double(g.sec_ui_skip) / f, t.empty() ? " none" : t));
+        }
+        g.skipped_vs.clear();
+        g.sec_add_draws = g.sec_add_vec = g.sec_ui_skip = 0;
         g.spark_vs.clear();
         g.sec_spark_draws = g.sec_spark_vec = g.sec_spark_no_cam = g.sec_spark_px =
             g.sec_spark_frames = g.sec_spark_sky = 0;
