@@ -229,7 +229,7 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
 void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
   g_protection_calls = 0;
   PageManager manager;
-  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  const auto page_size = manager.GetPageSize();
   auto *memory = Allocate(page_size * 2, PAGE_READWRITE, base);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -245,7 +245,7 @@ void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
 
 void TestSharedWatcherCounts() {
   PageManager manager;
-  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  const auto page_size = manager.GetPageSize();
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -261,7 +261,7 @@ void TestSharedWatcherCounts() {
 
 void TestCrossRegionRange() {
   PageManager manager;
-  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  const auto page_size = manager.GetPageSize();
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   auto *memory = Allocate(region_size * 2);
   const auto base = reinterpret_cast<uint64_t>(memory);
@@ -299,7 +299,7 @@ void TestCrossRegionRange() {
 
 void TestBatchedWatcherRanges() {
   PageManager manager;
-  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  const auto page_size = manager.GetPageSize();
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   constexpr uint64_t allocation_size = region_size * 3;
   auto *memory = Allocate(allocation_size);
@@ -549,6 +549,36 @@ void TestReadWriteWatcherInteractions() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestResyncHostProtection() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  const auto address = 0x0000000300000000ull;
+  auto *memory = Allocate(region_size, PAGE_READWRITE, address);
+
+  RegionBits read_mask;
+  read_mask.Set(2);
+  manager.UpdatePageWatchers<true>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<true, true>(address, read_mask);
+  // A view mapped again with its own access: every page writable behind the tracker.
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size * 4, PAGE_READWRITE, &old_protection) != 0,
+        "VirtualProtect failed");
+  // A page the tracker doesn't watch keeps the protection it was given (a guest's read-only).
+  Check(VirtualProtect(memory + page_size * 3, page_size, PAGE_READONLY, &old_protection) != 0,
+        "VirtualProtect failed");
+  manager.ResyncHostProtection(address, page_size * 4);
+  Check(IsWritable(memory) && Protection(memory + page_size) == PAGE_READONLY &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 3) == PAGE_READONLY,
+        "resync did not restore the watched pages' protection only");
+  manager.UpdatePageWatchers<false>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(address, read_mask);
+  Check(IsWritable(memory + page_size) && IsWritable(memory + page_size * 2),
+        "unwatch after a resync did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestConcurrentSharedWatchers() {
   constexpr size_t worker_count = 8;
   PageManager manager;
@@ -579,7 +609,7 @@ void TestConcurrentSharedWatchers() {
 
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
-  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  const auto page_size = manager.GetPageSize();
   if (std::strcmp(name, "invalid-range") == 0) {
     manager.UpdatePageWatchers<true>((1ull << 40u) - 1, 2);
   } else if (std::strcmp(name, "unknown-untrack") == 0) {
@@ -700,6 +730,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+  TestResyncHostProtection();
   TestConcurrentSharedWatchers();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "common/upstreamPaths.h"
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
@@ -36,6 +37,17 @@ constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
+
+[[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
+	std::fputs("PageManager fail-fast: ", stderr);
+	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
+	std::fputc('\n', stderr);
+	std::fflush(stderr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
+#endif
+	std::_Exit(322);
+}
 
 [[noreturn]] void Fatal(const char* format, ...) {
 	std::fputs("PageManager fatal: ", stderr);
@@ -159,14 +171,16 @@ struct PageManager::Impl {
 			SpinGuard lock(region->lock);
 			for (auto& page: region->pages) {
 				if (page.write_watchers != 0 || page.access_watchers != 0) {
-					Fatal("destroyed with live page state");
+					FailFast("PageManager destroyed with live page state");
 				}
 			}
 		}
 	}
 
 	Region* FindRegion(uint64_t vaddr) const noexcept {
-		return regions[vaddr / REGION_SIZE].load(std::memory_order_acquire);
+		return vaddr >= ADDRESS_SIZE && !KYTY_UPSTREAM_PATH("e31a8f552")
+		           ? nullptr
+		           : regions[vaddr / REGION_SIZE].load(std::memory_order_acquire);
 	}
 
 	Region* GetOrCreateRegion(uint64_t vaddr) {
@@ -209,14 +223,13 @@ struct PageManager::Impl {
 			}
 		};
 
-		constexpr int delta = track ? 1 : -1;
 		for (size_t page_index = first; page_index < last; page_index++) {
 			auto&      page    = region.pages[page_index];
 			const auto address = base_addr + page_index * PAGE_SIZE;
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<delta, is_read>(address)
+			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
 
@@ -274,6 +287,10 @@ PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
 
+uint64_t PageManager::GetPageSize() const {
+	return PAGE_SIZE;
+}
+
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);
@@ -286,10 +303,19 @@ template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t);
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+	if ((base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||
+	     REGION_SIZE > ADDRESS_SIZE - base_addr) &&
+	    !KYTY_UPSTREAM_PATH("25fb20e53")) {
+		Fatal("invalid tracking region base 0x%016" PRIx64, base_addr);
+	}
+
 	const auto start_range = mask.FirstRange();
 	const auto end_range   = mask.LastRange();
-	const auto first       = start_range.first;
-	const auto last        = end_range.second;
+	if (start_range.first == REGION_PAGES && !KYTY_UPSTREAM_PATH("25fb20e53")) {
+		FailFast("empty region watcher mask");
+	}
+	const auto first = start_range.first;
+	const auto last  = end_range.second;
 	if (start_range.second == end_range.second) {
 		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
 		                                           (last - first) * PAGE_SIZE);
@@ -307,5 +333,64 @@ template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, Reg
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+
+void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE) {
+		return;
+	}
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = std::min(Common::AlignUp(vaddr + size, PAGE_SIZE), ADDRESS_SIZE);
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		auto*      region      = m_impl->FindRegion(chunk_begin);
+		if (region != nullptr) { // never watched: the host protection is not the tracker's
+			SpinGuard  lock(region->lock);
+			const auto last = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+			for (auto page = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE); page < last;) {
+				const auto perms = region->pages[page].Perms();
+				auto       next  = page + 1;
+				while (next < last && region->pages[next].Perms() == perms) next++;
+				if (perms != Common::VirtualMemory::Mode::ReadWrite) {
+					m_impl->Protect(region_base + page * PAGE_SIZE, (next - page) * PAGE_SIZE, perms);
+				}
+				page = next;
+			}
+		}
+		chunk_begin = chunk_end;
+	}
+}
+
+void PageManager::ApplyHostProtection(uint64_t vaddr, uint64_t size,
+                                      Common::VirtualMemory::Mode (*guest_mode)(uint64_t, void*), void* context) {
+	using Mode = Common::VirtualMemory::Mode;
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE || vaddr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0) {
+		return;
+	}
+	const auto end = std::min(vaddr + size, ADDRESS_SIZE);
+	for (auto chunk_begin = vaddr; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		// Created if missing: a watch added after this check must find this lock held or this protect done.
+		auto*      region      = m_impl->GetOrCreateRegion(chunk_begin);
+		SpinGuard  lock(region->lock);
+		const auto final_mode = [&](uint64_t page_vaddr) {
+			const auto guest   = guest_mode(page_vaddr, context);
+			const auto tracker = region->pages[(page_vaddr - region_base) / PAGE_SIZE].Perms();
+			return guest == Mode::NoAccess || tracker == Mode::ReadWrite ? guest : tracker;
+		};
+		auto run_begin = chunk_begin;
+		auto run_mode  = final_mode(chunk_begin);
+		for (auto page = chunk_begin + PAGE_SIZE; page <= chunk_end; page += PAGE_SIZE) {
+			const auto mode = page < chunk_end ? final_mode(page) : run_mode;
+			if (page == chunk_end || mode != run_mode) {
+				Common::VirtualMemory::Protect(run_begin, page - run_begin, run_mode);
+				run_begin = page;
+				run_mode  = mode;
+			}
+		}
+		chunk_begin = chunk_end;
+	}
+}
 
 } // namespace Libs::Graphics

@@ -1,6 +1,9 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 
+#include "common/assert.h"
+#include "common/upstreamPaths.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +13,7 @@
 namespace Libs::Graphics {
 
 // Sparse two-level lookup for texture-cache page ownership.
-// Entries are selected by guest page number below kPageCount; queries never allocate L1 buckets.
+// Entries are selected by guest page number; queries never allocate L1 buckets.
 template <typename EntryT, size_t PageBits = 20, size_t AddressSpaceBits = 40,
           size_t FirstLevelBits = 10>
 class MultiLevelPageTable final {
@@ -38,22 +41,34 @@ public:
 	MultiLevelPageTable(): m_first_level(kFirstLevelEntries) {}
 
 	[[nodiscard]] Entry* Find(size_t page) {
+		if (!IsValidPage(page) && !KYTY_UPSTREAM_PATH("e31a8f552")) {
+			return nullptr;
+		}
 		auto& bucket = m_first_level[FirstLevelIndex(page)];
 		return bucket == nullptr ? nullptr : &(*bucket)[SecondLevelIndex(page)];
 	}
 
 	[[nodiscard]] const Entry* Find(size_t page) const {
+		if (!IsValidPage(page) && !KYTY_UPSTREAM_PATH("e31a8f552")) {
+			return nullptr;
+		}
 		const auto& bucket = m_first_level[FirstLevelIndex(page)];
 		return bucket == nullptr ? nullptr : &(*bucket)[SecondLevelIndex(page)];
 	}
 
 	[[nodiscard]] Entry& operator[](size_t page) {
+		if (!IsValidPage(page) && !KYTY_UPSTREAM_PATH("e31a8f552")) {
+			EXIT("MultiLevelPageTable page is outside the guest address space");
+		}
 		auto& bucket = m_first_level[FirstLevelIndex(page)];
 		if (bucket == nullptr) {
 			bucket = std::make_unique<Bucket>();
+			++m_allocated_buckets;
 		}
 		return (*bucket)[SecondLevelIndex(page)];
 	}
+
+	[[nodiscard]] static constexpr bool IsValidPage(size_t page) { return page < kPageCount; }
 
 	// Returns the half-open page interval touched by a non-empty byte range.
 	// An end exactly at 2^AddressSpaceBits is valid; wrapping or crossing it is not.
@@ -68,6 +83,8 @@ public:
 		return true;
 	}
 
+	[[nodiscard]] size_t AllocatedBucketCount() const { return m_allocated_buckets; }
+
 private:
 	using Bucket = std::array<Entry, kBucketEntries>;
 
@@ -79,6 +96,7 @@ private:
 	}
 
 	std::vector<std::unique_ptr<Bucket>> m_first_level;
+	size_t                               m_allocated_buckets = 0;
 };
 
 } // namespace Libs::Graphics

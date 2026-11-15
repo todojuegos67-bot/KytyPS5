@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/upstreamPaths.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -10,7 +11,9 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -25,11 +28,48 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
+	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// As UnmarkRegionAsGpuModified, but the pages stay read-protected (RegionManager::KeepGpuProtection).
+	void               KeepGpuProtection(uint64_t vaddr, uint64_t size);
+	// The same for each [begin, end) run, with one lock and one pass per region instead of one per run.
+	void               KeepGpuProtection(std::span<const std::pair<uint64_t, uint64_t>> runs);
+	// A read fault on a kept page lifts the kept protection of the aligned `window` around it; false if the
+	// page is not kept. Needs no GPU thread: a kept page has no GPU-written byte to read back.
+	[[nodiscard]] bool ReleaseKept(uint64_t vaddr, uint64_t window);
+	// Lifts the kept protection of every page in the range (before guest memory is read under a lock that a
+	// protection change needs).
+	void               ReleaseKeptRange(uint64_t vaddr, uint64_t size);
+	// Every region of the range is tracked and has no CPU-dirty page: an upload walk of it would find nothing. Takes
+	// no lock (RegionManager::CpuClean).
+	[[nodiscard]] bool IsRangeCpuClean(uint64_t vaddr, uint64_t size) const {
+		if (size == 0) return false;
+		const auto last = (vaddr + size - 1u) / TRACKER_REGION_SIZE;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index <= last; ++index) {
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr || !manager->CpuClean()) return false;
+		}
+		return true;
+	}
+	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Known zero (RegionManager::MarkZero): guest memory nothing has written since its first mapping.
+	void MarkRegionAsZero(uint64_t vaddr, uint64_t size);
+	void UnmarkRegionAsZero(uint64_t vaddr, uint64_t size);
+	// Calls func(address, bytes) for each known-zero run in the range.
+	template <typename Func>
+	void ForEachZeroRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->ForEachZeroRange(manager->GetCpuAddr() + offset, bytes, func);
+		});
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
+		CheckNotInUploadCallback();
+
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
@@ -39,7 +79,7 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				manager->ChangeState<DirtySource::Cpu, true>(offset, bytes);
+				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
 			if (should_flush) {
@@ -60,23 +100,77 @@ public:
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
+		CheckNotInUploadCallback();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
-			manager->ForEachModifiedRange<DirtySource::Gpu, false>(offset, bytes, func);
+			const auto       address = manager->GetCpuAddr() + offset;
+			manager->template ForEachModifiedRange<DirtySource::Gpu, false>(address, bytes, func);
 			if constexpr (clear) {
-				manager->ChangeState<DirtySource::Gpu, false>(offset, bytes);
+				manager->template ChangeState<DirtySource::Gpu, false>(address, bytes);
 			}
 		});
 	}
 
+	// Calls func(address, size) for the runs of pages of [vaddr, vaddr + size) that the CPU may
+	// have written since the previous call over them: pages that became CPU dirty since then, or
+	// are still CPU dirty. Untracked pages start tracking as written. A single consumer owns the
+	// written state.
+	template <typename Func>
+	void ConsumeCpuWrites(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->ConsumeCpuWritten(manager->GetCpuAddr() + offset, bytes,
+			                           [&](uint64_t address, uint64_t length) {
+				                           if (!runs.empty() &&
+				                               runs.back().first + runs.back().second == address) {
+					                           runs.back().second += length;
+				                           } else {
+					                           runs.emplace_back(address, length);
+				                           }
+			                           });
+		});
+		const auto end = vaddr + size;
+		for (const auto& [address, length]: runs) {
+			const auto begin  = std::max(address, vaddr);
+			const auto finish = std::min(address + length, end);
+			if (begin < finish) {
+				func(begin, finish - begin);
+			}
+		}
+	}
+
+	// Marks the pages of [vaddr, vaddr + size) GPU modified, except those that are CPU dirty, and
+	// calls func(address, size) for the page runs it marked.
+	template <typename Func>
+	void MarkRegionAsGpuModifiedUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->MarkGpuDirtyUnlessCpuDirty(
+			    manager->GetCpuAddr() + offset, bytes,
+			    [&](uint64_t address, uint64_t length) { runs.emplace_back(address, length); });
+		});
+		for (const auto& [address, length]: runs) {
+			func(address, length);
+		}
+	}
+
+	// range_func(address, bytes) or range_func(address, bytes, zero): zero runs need no guest read.
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
-		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t> ||
+		              std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t, bool>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		CheckNotInUploadCallback();
+		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
+			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
+			                                                      bytes, range_func);
 			if (!is_written) {
 				manager->lock.unlock();
 			}
@@ -85,14 +179,23 @@ public:
 		if (is_written) {
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				               manager->ChangeState<DirtySource::Gpu, true>(offset, bytes);
+				               manager->template ChangeState<DirtySource::Gpu, true>(
+				                   manager->GetCpuAddr() + offset, bytes);
 				               manager->lock.unlock();
 			               });
 		}
+		s_upload_owner = previous_upload_owner;
 	}
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+
+	void CheckNotInUploadCallback() const noexcept {
+		if (s_upload_owner == this && !KYTY_UPSTREAM_PATH("25fb20e53")) {
+			EXIT("memory tracker re-entered from upload callback\n");
+		}
+	}
 
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {

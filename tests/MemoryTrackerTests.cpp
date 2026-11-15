@@ -1,8 +1,11 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
+#include "graphics/host_gpu/preflushTable.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -13,6 +16,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -260,8 +264,8 @@ uint8_t *AllocateFixedGuestRange(uint64_t size, uintptr_t offset) {
   return nullptr;
 }
 
-uint8_t *Allocate(uint64_t pages) {
-  const auto size = Libs::Graphics::TRACKER_PAGE_SIZE * pages;
+uint8_t *Allocate(PageManager &manager, uint64_t pages) {
+  const auto size = manager.GetPageSize() * pages;
   return AllocateFixedGuestRange(size, 0x10000);
 }
 
@@ -305,6 +309,193 @@ void TestRangeSet() {
         "range set subtraction did not preserve both exact tails");
 }
 
+void TestResolveWriteBitmap() {
+  // A binding of six pages whose bitmap starts 0x80 before it (the descriptor's alignment); the
+  // dispatch wrote its third bitmap page only.
+  constexpr uint64_t base = 0x10000 - 0x80, vaddr = 0x10000, size = 0x6000;
+  const std::array<uint32_t, 1> bits{1u << 2};
+  RangeSet dirty, known, keep;
+  dirty.Add(0xf000, 0x1000); // outside the binding
+  dirty.Add(vaddr, size);
+  known.Add(0x14100, 0x100); // an untracked writer's bytes
+  keep.Add(0x15000, 0x800);  // a later tracked dispatch's binding
+  std::vector<std::pair<uint64_t, uint64_t>> cleared, left, written;
+  Libs::Graphics::ResolveWriteBitmap(dirty, known, keep, base, vaddr, size, bits,
+                                     [&](uint64_t begin, uint64_t end) { cleared.emplace_back(begin, end); });
+  dirty.ForEach([&](uint64_t begin, uint64_t end) { left.emplace_back(begin, end); });
+  known.ForEach([&](uint64_t begin, uint64_t end) { written.emplace_back(begin, end); });
+  using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
+  Check(cleared == Ranges{{0x10000, 0x11f80}, {0x12f80, 0x14100}, {0x14200, 0x15000}, {0x15800, 0x16000}},
+        "a write bitmap cleared the wrong bytes");
+  Check(left == Ranges{{0xf000, 0x10000}, {0x11f80, 0x12f80}, {0x14100, 0x14200}, {0x15000, 0x15800}},
+        "a write bitmap left the wrong bytes GPU-written");
+  Check(written == Ranges{{0x11f80, 0x12f80}, {0x14100, 0x14200}},
+        "a write bitmap did not make the bytes it showed known written");
+
+  // keep's ranges outside the binding, touching its ends or not, change nothing (the buffer cache
+  // passes only the later writes that overlap the binding).
+  RangeSet dirty2, known2, keep2;
+  dirty2.Add(0xf000, 0x1000);
+  dirty2.Add(vaddr, size);
+  known2.Add(0x14100, 0x100);
+  keep2.Add(0x15000, 0x800);
+  keep2.Add(0x8000, vaddr - 0x8000);  // ends where the binding starts
+  keep2.Add(vaddr + size, 0x2000);    // starts where it ends
+  keep2.Add(0x40000, 0x1000);         // far away
+  std::vector<std::pair<uint64_t, uint64_t>> cleared2, left2, written2;
+  Libs::Graphics::ResolveWriteBitmap(dirty2, known2, keep2, base, vaddr, size, bits,
+                                     [&](uint64_t begin, uint64_t end) { cleared2.emplace_back(begin, end); });
+  dirty2.ForEach([&](uint64_t begin, uint64_t end) { left2.emplace_back(begin, end); });
+  known2.ForEach([&](uint64_t begin, uint64_t end) { written2.emplace_back(begin, end); });
+  Check(cleared2 == cleared && left2 == left && written2 == written,
+        "keep's ranges outside the binding changed a write bitmap's result");
+
+  // Runs across words: bitmap pages 0, 33-35 and 95 of a 96-page binding were written.
+  constexpr uint64_t wide = 96 * 0x1000;
+  const std::array<uint32_t, 3> wide_bits{1u, 0b111u << 1, 1u << 31};
+  RangeSet wide_dirty, wide_known;
+  wide_dirty.Add(0x100000, wide);
+  cleared.clear();
+  written.clear();
+  Libs::Graphics::ResolveWriteBitmap(wide_dirty, wide_known, {}, 0x100000, 0x100000, wide, wide_bits,
+                                     [&](uint64_t begin, uint64_t end) { cleared.emplace_back(begin, end); });
+  wide_known.ForEach([&](uint64_t begin, uint64_t end) { written.emplace_back(begin, end); });
+  Check(cleared == Ranges{{0x101000, 0x121000}, {0x124000, 0x15f000}},
+        "a write bitmap's runs across words cleared the wrong bytes");
+  Check(written == Ranges{{0x100000, 0x101000}, {0x121000, 0x124000}, {0x15f000, 0x160000}},
+        "a write bitmap's runs across words made the wrong bytes known written");
+}
+
+// Maximal runs of the set bytes of a byte model, from `origin`.
+std::vector<std::pair<uint64_t, uint64_t>> Runs(const std::vector<uint8_t> &model, uint64_t origin) {
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  for (size_t i = 0; i < model.size();) {
+    if (model[i] == 0u) {
+      i++;
+      continue;
+    }
+    auto end = i;
+    while (end < model.size() && model[end] != 0u) end++;
+    runs.emplace_back(origin + i, origin + end);
+    i = end;
+  }
+  return runs;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> Runs(const RangeSet &set) {
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  set.ForEach([&](uint64_t begin, uint64_t end) { runs.emplace_back(begin, end); });
+  return runs;
+}
+
+uint64_t NextRandom(uint64_t &state) {
+  state ^= state << 13u;
+  state ^= state >> 7u;
+  state ^= state << 17u;
+  return state;
+}
+
+// Add and Subtract against a byte model: Subtract splits ranges in place.
+void TestRangeSetModel() {
+  constexpr uint64_t origin = 0x10000, span = 2048;
+  uint64_t state = 0x9e3779b97f4a7c15ull;
+  RangeSet set;
+  std::vector<uint8_t> model(span, 0u);
+  for (int step = 0; step < 20000; step++) {
+    const auto at = NextRandom(state) % span;
+    const auto size = 1 + NextRandom(state) % std::min<uint64_t>(span - at, (step % 7 == 0) ? span : 64);
+    const bool add = NextRandom(state) % 3 != 0;
+    if (add) {
+      set.Add(origin + at, size);
+    } else {
+      set.Subtract(origin + at, size);
+    }
+    std::fill(model.begin() + static_cast<ptrdiff_t>(at), model.begin() + static_cast<ptrdiff_t>(at + size),
+              add ? 1u : 0u);
+    Check(Runs(set) == Runs(model, origin), "range set differs from its byte model");
+  }
+}
+
+// ResolveWriteBitmap against a byte model, with many small known ranges (a fragmented binding).
+void TestResolveWriteBitmapModel() {
+  constexpr uint64_t page = 0x1000, origin = 0x100000 - 0x8000, span = 0x48000;
+  uint64_t state = 0x2545f4914f6cdd1dull;
+  for (int round = 0; round < 3000; round++) {
+    const uint64_t base = 0x100000 - (NextRandom(state) % 2) * 0x80;
+    const uint64_t vaddr = 0x100000 + NextRandom(state) % 0x3000;
+    const uint64_t size = 1 + NextRandom(state) % (40 * page - (vaddr - 0x100000));
+    std::array<uint32_t, 2> bits{static_cast<uint32_t>(NextRandom(state)), static_cast<uint32_t>(NextRandom(state))};
+    if (round % 4 == 0) bits[0] &= static_cast<uint32_t>(NextRandom(state)); // longer clear runs
+    std::vector<uint8_t> dirty_model(span, 0u), known_model(span, 0u), keep_model(span, 0u);
+    RangeSet dirty, known, keep;
+    const auto add = [&](RangeSet &set, std::vector<uint8_t> &model, int count, uint64_t max_size) {
+      for (int i = 0; i < count; i++) {
+        const auto at = NextRandom(state) % (span - max_size);
+        const auto bytes = 1 + NextRandom(state) % max_size;
+        set.Add(origin + at, bytes);
+        std::fill(model.begin() + static_cast<ptrdiff_t>(at), model.begin() + static_cast<ptrdiff_t>(at + bytes), 1u);
+      }
+    };
+    add(dirty, dirty_model, 3, 0x30000);
+    add(known, known_model, static_cast<int>(NextRandom(state) % 60), 0x800);
+    add(keep, keep_model, static_cast<int>(NextRandom(state) % 4), 0x3000);
+    std::vector<uint8_t> cleared_model(span, 0u);
+    for (uint64_t address = vaddr; address < vaddr + size; address++) {
+      const auto i = address - origin;
+      const auto bit_index = (address - base) / page;
+      const bool set = ((bits[bit_index / 32u] >> (bit_index % 32u)) & 1u) != 0u;
+      if (dirty_model[i] == 0u) continue;
+      if (set) {
+        known_model[i] = 1u;
+      } else if (known_model[i] == 0u && keep_model[i] == 0u) {
+        dirty_model[i] = 0u;
+        cleared_model[i] = 1u;
+      }
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> cleared;
+    Libs::Graphics::ResolveWriteBitmap(dirty, known, keep, base, vaddr, size, bits,
+                                       [&](uint64_t begin, uint64_t end) { cleared.emplace_back(begin, end); });
+    Check(cleared == Runs(cleared_model, origin), "a write bitmap cleared other bytes than its byte model");
+    Check(Runs(dirty) == Runs(dirty_model, origin), "a write bitmap left other GPU-written bytes than its byte model");
+    Check(Runs(known) == Runs(known_model, origin), "a write bitmap made other bytes known than its byte model");
+  }
+}
+
+// Kept runs in one call, across a region boundary: as the call per run, with no protection change.
+void TestKeptGpuProtectionRuns() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 3 * region / harness.page_manager.GetPageSize());
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto base = (allocation_base + region - 1) & ~(region - 1);
+  const auto boundary = base + region;
+  tracker.ForEachUploadRange(base, 2 * region, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  tracker.MarkRegionAsGpuModified(base, 2 * region);
+  const std::vector<std::pair<uint64_t, uint64_t>> runs{{base + page_size, base + 3 * page_size},
+                                                        {boundary - 3 * page_size, boundary + 2 * page_size},
+                                                        {boundary + 5 * page_size, boundary + 6 * page_size}};
+  ResetProtectionLog();
+  tracker.KeepGpuProtection(runs);
+  Check(g_protection_calls == 0, "keeping runs changed protection");
+  const auto check_page = [&](uint64_t address) {
+    const bool in_run = std::any_of(runs.begin(), runs.end(), [&](const auto &run) {
+      return address >= run.first && address < run.second;
+    });
+    Check(tracker.IsRegionGpuModified(address, page_size) == !in_run, "kept runs left the wrong pages GPU-written");
+  };
+  for (uint64_t i = 0; i < 8; i++) check_page(base + i * page_size);
+  for (uint64_t i = 0; i < 16; i++) check_page(boundary - 8 * page_size + i * page_size);
+  Check(tracker.ReleaseKept(boundary + 5 * page_size, page_size) &&
+            !tracker.ReleaseKept(boundary + 4 * page_size, page_size) &&
+            tracker.ReleaseKept(boundary - 2 * page_size, page_size),
+        "a page of a kept run was not kept, or one between runs was");
+  tracker.UnmarkRegionAsGpuModified(base, 2 * region);
+  tracker.UntrackMemory(allocation_base, 3 * region);
+  Release(memory);
+}
+
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
@@ -336,7 +527,7 @@ void TestGuestRange() {
 void TestQueriesDoNotRequireMappedOwnership() {
   constexpr uint64_t address = 0x0000000203000000ull;
   TrackerHarness harness;
-  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  const auto page_size = harness.page_manager.GetPageSize();
   Check(harness.tracker.IsRegionCpuModified(address, page_size) &&
             !harness.tracker.IsRegionGpuModified(address, page_size),
         "unowned tracker range did not expose its initial CPU-dirty state");
@@ -345,8 +536,9 @@ void TestQueriesDoNotRequireMappedOwnership() {
 void TestConcurrentRegionPublication() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
-  auto *memory = Allocate(1);
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   std::binary_semaphore start_first{0};
@@ -369,7 +561,7 @@ void TestConcurrentRegionPublication() {
   first.join();
   second.join();
 
-  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size);
   Release(memory);
   Check(cpu_dirty_results.load(std::memory_order_relaxed) == 2,
         "concurrent region publication lost initial CPU ownership");
@@ -378,8 +570,9 @@ void TestConcurrentRegionPublication() {
 void TestCpuDirtyUpload() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
-  auto *memory = Allocate(2);
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
   Check(tracker.IsRegionCpuModified(address + 16, 32),
         "new region was not CPU dirty");
@@ -402,7 +595,200 @@ void TestCpuDirtyUpload() {
   tracker.MarkRegionAsCpuModified(address + 16, 32);
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "explicit CPU dirtiness did not release write protection");
-  tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
+void TestPreflushCopyLimit() {
+  // At most two copies between two read backs: a third write leaves the page missing until it is read back again.
+  Libs::Graphics::PreflushTable table(4);
+  uint32_t copies = 0;
+  const auto take = [&](uint64_t tick) {
+    table.TakeCopies(tick, [&](uint64_t, uint32_t) {
+      copies++;
+      return true;
+    });
+  };
+  table.OnReadBack(7, 1);
+  for (uint64_t tick = 1; tick <= 2; tick++) {
+    table.OnWrite(7, 7, tick);
+    take(tick);
+    Check(table.Lookup(7) && table.Lookup(7)->second == tick, "a copy within the limit does not serve the page");
+  }
+  table.OnWrite(7, 7, 3);
+  take(3);
+  Check(copies == 2 && !table.Lookup(7), "a page past its copy limit hit with an older copy");
+  table.OnReadBack(7, 1);
+  table.OnWrite(7, 7, 4);
+  take(4);
+  Check(copies == 3 && table.Lookup(7) && table.Lookup(7)->second == 4, "a read back did not reset the copy limit");
+}
+
+void TestPreflushTable() {
+  Libs::Graphics::PreflushTable table(2, 100);
+  std::vector<std::pair<uint64_t, uint32_t>> copied;
+  const auto take = [&](uint64_t tick, bool record = true) {
+    copied.clear();
+    table.TakeCopies(tick, [&](uint64_t page, uint32_t slot) {
+      copied.emplace_back(page, slot);
+      return record;
+    });
+  };
+  const auto hit_tick = [&](uint64_t page) {
+    const auto found = table.Lookup(page);
+    return found ? found->second : 0;
+  };
+
+  // Pages never read back are not tracked.
+  table.OnWrite(10, 10, 5);
+  take(5);
+  Check(copied.empty() && !table.Lookup(10), "a page with no read back was pre-flushed");
+
+  // Read back, then written in command buffer 6: a miss until 6's end copies it.
+  table.OnReadBack(10, 1);
+  Check(!table.Lookup(10), "an unwritten page hit");
+  table.OnWrite(9, 11, 6);
+  Check(!table.Lookup(10), "a page written in the recording command buffer hit");
+  take(6);
+  Check(copied.size() == 1 && copied[0].first == 10, "the written page was not copied");
+  Check(hit_tick(10) == 6, "the copy at the writer's end does not serve the page");
+  take(7);
+  Check(copied.empty(), "an unwritten page was copied again");
+
+  // A write after the pre-copy: a miss until that command buffer's own copy.
+  table.OnWrite(10, 10, 8);
+  Check(!table.Lookup(10), "a page written after its pre-copy hit (stale slot)");
+  take(8);
+  Check(hit_tick(10) == 8, "the newer copy does not serve the page");
+
+  // Two writes in one command buffer: one copy, after both.
+  table.OnWrite(10, 10, 9);
+  table.OnWrite(10, 10, 9);
+  take(9);
+  Check(copied.size() == 1 && hit_tick(10) == 9, "a page written twice in a command buffer");
+
+  // A copy that could not be recorded leaves the page missing; a later command buffer's copy serves it.
+  table.OnWrite(10, 10, 10);
+  take(10, false);
+  Check(!table.Lookup(10), "a page whose copy was not recorded hit");
+  table.OnWrite(10, 10, 11);
+  take(12);
+  Check(hit_tick(10) == 12, "a later command buffer's copy does not serve the page");
+
+  // A read back (or a publish from the slot) starts over.
+  table.OnReadBack(10, 2);
+  Check(!table.Lookup(10), "a page read back again hit without a new write");
+
+  // A write in the command buffer that also reads the page back, after the read back: copied at its end.
+  table.OnWrite(10, 10, 13);
+  table.OnReadBack(10, 2);
+  table.OnWrite(10, 10, 13);
+  take(13);
+  Check(hit_tick(10) == 13, "a write after a read back in one command buffer");
+
+  // Slots run out: a third page is not tracked.
+  table.OnReadBack(20, 2);
+  table.OnReadBack(30, 2);
+  Check(table.Pages() == 2, "a page took a slot beyond the limit");
+  table.OnWrite(30, 30, 14);
+  take(14);
+  Check(copied.empty() && !table.Lookup(30), "an untracked page was pre-flushed");
+
+  // Expiry: pages not read back in this frame or the previous one give their slots back; a page written before
+  // it expired is not copied into a slot that another page has taken since.
+  table.OnWrite(20, 20, 15);
+  table.Expire(3);
+  Check(table.Pages() == 2, "a page read back in the previous frame expired");
+  table.Expire(4);
+  Check(table.Pages() == 0 && !table.Lookup(10), "expired pages kept their slots");
+  table.OnReadBack(40, 4);
+  take(15);
+  Check(copied.empty(), "a page that expired while pending was copied");
+  Check(table.SlotsUsed() == 2, "an expired slot was not reused");
+  table.OnWrite(40, 40, 16);
+  take(16);
+  Check(copied.size() == 1 && copied[0].first == 40 && hit_tick(40) == 16, "a reused slot does not serve its page");
+
+  // A command buffer whose end was not seen: its writes count, and the next end copies them.
+  table.OnReadBack(41, 4);
+  table.OnWrite(40, 41, 17);
+  table.OnWrite(50, 50, 18);
+  Check(!table.Lookup(40) && !table.Lookup(41), "a page written in an unseen command buffer hit");
+  take(18);
+  Check(copied.size() == 2 && hit_tick(40) == 18 && hit_tick(41) == 18,
+        "the next end did not copy the pages of an unseen command buffer");
+}
+
+void TestKnownZero() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto zeros = [&] {
+    std::vector<std::pair<uint64_t, uint64_t>> runs;
+    tracker.ForEachZeroRange(address, page_size * 4,
+                             [&](uint64_t run, uint64_t bytes) {
+                               runs.emplace_back(run, bytes);
+                             });
+    return runs;
+  };
+
+  // New memory is CPU-dirty and writable; known zero keeps it write-protected.
+  tracker.MarkRegionAsZero(address, page_size * 4);
+  Check(tracker.IsRegionCpuModified(address, page_size * 4) &&
+            Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size * 3) == PAGE_READONLY,
+        "known-zero CPU-dirty pages were not write-protected");
+
+  // A CPU write (the fault's invalidation) on page 1 ends its zero state and
+  // opens it; the others stay zero and protected.
+  tracker.InvalidateRegion(address + page_size + 16, 32, [] {});
+  Check(IsWritable(memory + page_size) && Protection(memory) == PAGE_READONLY &&
+            zeros() == std::vector<std::pair<uint64_t, uint64_t>>{
+                           {address, page_size},
+                           {address + page_size * 2, page_size * 2}},
+        "a CPU write did not end the zero state of only its page");
+
+  // The upload reads page 1 and fills the zero runs.
+  std::vector<std::tuple<uint64_t, uint64_t, bool>> runs;
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false,
+      [&](uint64_t run, uint64_t bytes, bool zero) noexcept {
+        runs.emplace_back(run, bytes, zero);
+      },
+      []() noexcept {});
+  Check(runs == std::vector<std::tuple<uint64_t, uint64_t, bool>>{
+                    {address + page_size, page_size, false},
+                    {address, page_size, true},
+                    {address + page_size * 2, page_size * 2, true}} &&
+            !tracker.IsRegionCpuModified(address, page_size * 4) &&
+            Protection(memory + page_size) == PAGE_READONLY &&
+            zeros().size() == 2,
+        "upload did not split zero runs or lost the zero state");
+
+  // A GPU write ends the zero state of its page.
+  tracker.MarkRegionAsGpuModified(address + page_size * 2 + 16, 32);
+  Check(zeros() == std::vector<std::pair<uint64_t, uint64_t>>{
+                       {address, page_size}, {address + page_size * 3, page_size}},
+        "a GPU write did not end the zero state");
+  tracker.UnmarkRegionAsGpuModified(address + page_size * 2, page_size);
+
+  // Unmarking (an alias appeared) releases the write protection a CPU-dirty
+  // page kept only for the zero state.
+  tracker.MarkRegionAsCpuModified(address + page_size * 3, page_size);
+  tracker.MarkRegionAsZero(address + page_size * 3, page_size);
+  Check(Protection(memory + page_size * 3) == PAGE_READONLY,
+        "re-marking a CPU-dirty page zero did not protect it");
+  tracker.UnmarkRegionAsZero(address, page_size * 4);
+  Check(zeros().empty() && IsWritable(memory + page_size * 3) &&
+            Protection(memory) == PAGE_READONLY,
+        "unmarking did not end the zero state or changed clean pages");
+
+  tracker.UntrackMemory(address, page_size * 4);
+  Check(IsWritable(memory) && IsWritable(memory + page_size * 3),
+        "untracking left protection");
   Release(memory);
 }
 
@@ -453,7 +839,7 @@ void TestCleanUploadPreservesOwnership() {
           "clean written upload lost GPU ownership or changed dirty neighbors");
     tracker.UnmarkRegionAsGpuModified(start, 2 * page_size);
   }
-  tracker.MarkRegionAsCpuModified(address, region_size * 2);
+  tracker.UntrackMemory(address, region_size * 2);
   Release(memory);
 }
 
@@ -496,7 +882,108 @@ void BenchmarkCleanUploads() {
                 static_cast<double>(elapsed.count()) / sweeps,
                 static_cast<double>(elapsed.count()) / completions);
   }
-  tracker.MarkRegionAsCpuModified(address, size);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>>
+ConsumeCpuWrites(MemoryTracker &tracker, uint64_t address, uint64_t size) {
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  tracker.ConsumeCpuWrites(address, size, [&](uint64_t run, uint64_t bytes) {
+    runs.emplace_back(run, bytes);
+  });
+  return runs;
+}
+
+void TestConsumeCpuWrites() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto upload = [&] {
+    tracker.ForEachUploadRange(
+        address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  };
+
+  // A region the tracker never saw counts as written, clamped to the query.
+  auto runs = ConsumeCpuWrites(tracker, address + 16, page_size * 4 - 32);
+  Check(runs.size() == 1 && runs[0].first == address + 16 &&
+            runs[0].second == page_size * 4 - 32,
+        "untracked pages were not reported as CPU written");
+  // Pages still CPU dirty keep being reported: writes to them do not fault.
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.size() == 1 && runs[0].second == page_size * 4,
+        "CPU-dirty pages were not reported again");
+  upload();
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.empty(), "clean pages were reported as CPU written");
+
+  // A write after the upload is reported once the page is clean again.
+  tracker.MarkRegionAsCpuModified(address + page_size, 8);
+  upload();
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.size() == 1 && runs[0].first == address + page_size &&
+            runs[0].second == page_size,
+        "a CPU write between uploads was not reported");
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.empty(), "a consumed CPU write was reported twice");
+
+  // A write outside the query stays pending for a later query over it.
+  tracker.MarkRegionAsCpuModified(address + page_size * 3, 8);
+  upload();
+  runs = ConsumeCpuWrites(tracker, address, page_size * 2);
+  Check(runs.empty(), "a CPU write outside the query was reported");
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.size() == 1 && runs[0].first == address + page_size * 3,
+        "a CPU write outside an earlier query was forgotten");
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
+void TestGpuMarkingSkipsCpuDirtyPages() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(
+      address, page_size * 3, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  // The CPU wrote the middle page after the GPU work was recorded.
+  tracker.MarkRegionAsCpuModified(address + page_size, 8);
+
+  std::vector<std::pair<uint64_t, uint64_t>> marked;
+  tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
+      address + 16, page_size * 3 - 32, [&](uint64_t run, uint64_t bytes) {
+        marked.emplace_back(run, bytes);
+      });
+  Check(marked.size() == 2 && marked[0].first == address &&
+            marked[0].second == page_size &&
+            marked[1].first == address + page_size * 2 &&
+            marked[1].second == page_size,
+        "GPU marking did not skip exactly the CPU-dirty page");
+  Check(tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.IsRegionGpuModified(address + page_size, page_size) &&
+            tracker.IsRegionGpuModified(address + page_size * 2, page_size) &&
+            tracker.IsRegionCpuModified(address + page_size, page_size),
+        "GPU marking changed the wrong pages");
+  Check(Protection(memory) == PAGE_NOACCESS && IsWritable(memory + page_size) &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS,
+        "GPU marking did not protect the marked pages only");
+
+  marked.clear();
+  tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
+      address + page_size, page_size, [&](uint64_t run, uint64_t bytes) {
+        marked.emplace_back(run, bytes);
+      });
+  Check(marked.empty(), "a CPU-dirty page alone was marked GPU modified");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  tracker.UntrackMemory(address, page_size * 3);
   Release(memory);
 }
 
@@ -526,15 +1013,16 @@ void TestRangeInvalidation() {
   tracker.InvalidateRegion(address + 16, size - 32, [&] { flushes++; });
   Check(flushes == 1,
         "clean range invalidation unnecessarily requested a GPU flush");
-  tracker.MarkRegionAsCpuModified(address, size);
+  tracker.UntrackMemory(address, size);
   Release(memory);
 }
 
 void TestGpuReacquisitionAfterInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
-  auto *memory = Allocate(1);
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
@@ -572,14 +1060,16 @@ void TestGpuReacquisitionAfterInvalidation() {
 
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size);
   Release(memory);
 }
 
 void TestGpuDirtyBits() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
-  auto *memory = Allocate(2);
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
@@ -596,18 +1086,22 @@ void TestGpuDirtyBits() {
             Protection(memory) == PAGE_READONLY,
         "GPU dirty state did not restore write-only tracking");
   // Nor does CPU-dirtying the previous page.
-  MarkGpuModified(tracker, address + page_size, page_size);
+  tracker.ForEachUploadRange(
+      address + page_size, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
-  tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size * 2);
   Release(memory);
 }
 
 void TestExactDirtyIntervalsSharingTrackerPage() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
-  auto *memory = Allocate(1);
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
@@ -618,8 +1112,8 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
   exact_dirty.Add(address + 192, 32);
 
   ResetProtectionLog();
-  MarkGpuModified(tracker, address + 64, 16);
-  MarkGpuModified(tracker, address + 192, 32);
+  tracker.MarkRegionAsGpuModified(address + 64, 16);
+  tracker.MarkRegionAsGpuModified(address + 192, 32);
   Check(g_protection_calls == 1 &&
             tracker.IsRegionGpuModified(address, page_size) &&
             Protection(memory) == PAGE_NOACCESS,
@@ -643,22 +1137,23 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
             Protection(memory) == PAGE_READONLY,
         "draining the final exact interval did not release its tracker page");
 
-  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size);
   Release(memory);
 }
 
 void TestGpuDownloadProtectionMirrors() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
-  auto *memory = Allocate(4);
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
       address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
       []() noexcept {});
-  MarkGpuModified(tracker, address + 16, 32);
-  MarkGpuModified(tracker, address + page_size * 2 + 16, 32);
+  tracker.MarkRegionAsGpuModified(address + 16, 32);
+  tracker.MarkRegionAsGpuModified(address + page_size * 2 + 16, 32);
 
   std::vector<std::pair<uint64_t, uint64_t>> visited;
   ResetProtectionLog();
@@ -718,7 +1213,7 @@ void TestGpuDownloadProtectionMirrors() {
           IsWritable(memory) && !IsWritable(memory + page_size),
       "CPU-dirty transition did not release only its write watcher");
 
-  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  tracker.UntrackMemory(address, page_size * 4);
   Release(memory);
 }
 
@@ -758,7 +1253,7 @@ void TestCrossRegionUpload() {
               IsWritable(reinterpret_cast<void *>(boundary + page_size)),
           "cross-region upload changed neighboring pages");
     tracker.UnmarkRegionAsGpuModified(boundary - page_size, 2 * page_size);
-    tracker.MarkRegionAsCpuModified(address, region_size * 2);
+    tracker.UntrackMemory(address, region_size * 2);
   }
   Release(memory);
 }
@@ -808,7 +1303,7 @@ void TestConcurrentColdUploads() {
           "concurrent cold upload did not retain GPU ownership");
     tracker.UnmarkRegionAsGpuModified(page, page_size);
   }
-  tracker.MarkRegionAsCpuModified(address, region_size * 2);
+  tracker.UntrackMemory(address, region_size * 2);
   Release(memory);
 }
 
@@ -847,7 +1342,8 @@ void TestUploadDoesNotSerializeDisjointRegion() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  auto *memory = Allocate(region_size * 2 / page_size);
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
   const auto allocation_base = reinterpret_cast<uint64_t>(memory);
   const auto second_region =
       (allocation_base & ~(region_size - 1)) + region_size;
@@ -869,7 +1365,8 @@ void TestUploadDoesNotSerializeDisjointRegion() {
 
   tracker.UnmarkRegionAsGpuModified(allocation_base, page_size);
   tracker.UnmarkRegionAsGpuModified(second_region, page_size);
-  tracker.MarkRegionAsCpuModified(allocation_base, region_size * 2);
+  tracker.MarkRegionAsCpuModified(allocation_base, page_size);
+  tracker.UntrackMemory(allocation_base, region_size * 2);
   Release(memory);
   Check(completed_while_upload_blocked && second_marked,
         "upload callback serialized an unrelated tracker region");
@@ -879,7 +1376,7 @@ void TestQueriesSkipRegionLock() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  auto *memory = Allocate(1);
+  auto *memory = Allocate(harness.page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   bool cpu_modified = true;
@@ -894,6 +1391,7 @@ void TestQueriesSkipRegionLock() {
   const bool marked = tracker.IsRegionGpuModified(address, page_size);
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size);
   Release(memory);
   Check(completed_while_upload_blocked && !cpu_modified && !gpu_modified &&
             marked,
@@ -905,7 +1403,8 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  auto *memory = Allocate(region_size * 2 / page_size);
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
   const auto allocation_base = reinterpret_cast<uint64_t>(memory);
   const auto second_region =
       (allocation_base & ~(region_size - 1)) + region_size;
@@ -934,7 +1433,7 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
   });
   download_entered.acquire();
   std::jthread mutation([&] {
-    MarkGpuModified(tracker, second_region, page_size);
+    tracker.MarkRegionAsGpuModified(second_region, page_size);
     mutation_finished.release();
   });
 
@@ -949,7 +1448,9 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
       tracker.IsRegionGpuModified(second_region, page_size);
   tracker.UnmarkRegionAsGpuModified(allocation_base, page_size);
   tracker.UnmarkRegionAsGpuModified(second_region, page_size);
-  tracker.MarkRegionAsCpuModified(allocation_base, region_size * 2);
+  tracker.MarkRegionAsCpuModified(allocation_base, page_size);
+  tracker.MarkRegionAsCpuModified(second_region, page_size);
+  tracker.UntrackMemory(allocation_base, region_size * 2);
   Release(memory);
   Check(completed_while_download_blocked && both_gpu_owned,
         "download callback serialized an unrelated tracker region");
@@ -960,7 +1461,8 @@ void TestGpuUnmarkUsesRegionMask() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  auto *memory = Allocate(region_size * 2 / page_size);
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
   const auto allocation_base = reinterpret_cast<uint64_t>(memory);
   const auto region_base =
       (allocation_base + region_size - 1) & ~(region_size - 1);
@@ -972,8 +1474,8 @@ void TestGpuUnmarkUsesRegionMask() {
   tracker.ForEachUploadRange(
       sparse_begin, page_size * 3, false, [](uint64_t, uint64_t) noexcept {},
       []() noexcept {});
-  MarkGpuModified(tracker, sparse_begin, page_size);
-  MarkGpuModified(tracker, sparse_begin + page_size * 2, page_size);
+  tracker.MarkRegionAsGpuModified(sparse_begin, page_size);
+  tracker.MarkRegionAsGpuModified(sparse_begin + page_size * 2, page_size);
   ResetProtectionLog();
   tracker.UnmarkRegionAsGpuModified(sparse_begin, page_size * 3);
   Check(
@@ -998,7 +1500,7 @@ void TestGpuUnmarkUsesRegionMask() {
   tracker.ForEachUploadRange(
       cross_begin, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
       []() noexcept {});
-  MarkGpuModified(tracker, cross_begin, page_size * 2);
+  tracker.MarkRegionAsGpuModified(cross_begin, page_size * 2);
   ResetProtectionLog();
   tracker.UnmarkRegionAsGpuModified(cross_begin, page_size * 2);
   Check(g_protection_calls == 2 && g_protection_log.size() == 2 &&
@@ -1011,7 +1513,7 @@ void TestGpuUnmarkUsesRegionMask() {
             !tracker.IsRegionGpuModified(cross_begin, page_size * 2),
         "cross-region GPU unmark did not use one update per 4 MiB region");
 
-  tracker.MarkRegionAsCpuModified(allocation_base, region_size * 2);
+  tracker.UntrackMemory(allocation_base, region_size * 2);
   Release(memory);
 }
 
@@ -1020,7 +1522,8 @@ void TestFullRegionGpuUnmarkBatching() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  auto *memory = Allocate(region_size * 2 / page_size);
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
   const auto allocation_base = reinterpret_cast<uint64_t>(memory);
   const auto region_base =
       (allocation_base + region_size - 1) & ~(region_size - 1);
@@ -1030,7 +1533,7 @@ void TestFullRegionGpuUnmarkBatching() {
   tracker.ForEachUploadRange(
       region_base, region_size, false, [](uint64_t, uint64_t) noexcept {},
       []() noexcept {});
-  MarkGpuModified(tracker, region_base, region_size);
+  tracker.MarkRegionAsGpuModified(region_base, region_size);
   Check(tracker.IsRegionGpuModified(region_base, region_size) &&
             Protection(reinterpret_cast<void *>(region_base)) ==
                 PAGE_NOACCESS &&
@@ -1051,15 +1554,212 @@ void TestFullRegionGpuUnmarkBatching() {
                                               page_size)) == PAGE_READONLY,
       "full-region GPU unmark did not use one exact 4 MiB protection request");
 
-  tracker.MarkRegionAsCpuModified(allocation_base, region_size * 2);
+  tracker.UntrackMemory(allocation_base, region_size * 2);
+  Release(memory);
+}
+
+// A tracked dispatch's unwritten pages stay read-protected after its resolve, so that the next
+// dispatch's mark changes no protection; the CPU's first touch lifts them in one change, and pages
+// the CPU has touched are kept again at later resolves, so its next touch faults again.
+void TestKeptGpuProtection() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr uint64_t window = 0x40000;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 3 * window / page_size);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto base = (allocation_base + window - 1) & ~(window - 1);
+  const auto next = base + window;
+  const auto *page = reinterpret_cast<const void *>(base + page_size);
+  const auto at = [](uint64_t address) { return reinterpret_cast<const void *>(address); };
+
+  tracker.ForEachUploadRange(base, 2 * window, false, [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  tracker.MarkRegionAsGpuModified(base, window);
+  ResetProtectionLog();
+  tracker.KeepGpuProtection(base, window);
+  Check(g_protection_calls == 0 && !tracker.IsRegionGpuModified(base, window) &&
+            Protection(page) == PAGE_NOACCESS,
+        "kept pages changed protection or stayed GPU-written");
+  tracker.MarkRegionAsGpuModified(base, window);
+  Check(g_protection_calls == 0 && tracker.IsRegionGpuModified(base, window),
+        "marking kept pages again changed their protection");
+
+  // A CPU write on a kept page: read-write in one change, no read back, the others stay kept.
+  tracker.KeepGpuProtection(base, window);
+  bool flushed = false;
+  ResetProtectionLog();
+  tracker.InvalidateRegion(base + page_size, page_size, [&] { flushed = true; });
+  Check(!flushed && g_protection_calls == 1 &&
+            g_protection_log[0].mode == Common::VirtualMemory::Mode::ReadWrite && IsWritable(page) &&
+            Protection(at(base)) == PAGE_NOACCESS && tracker.IsRegionCpuModified(base + page_size, page_size),
+        "a CPU write on a kept page did not make it read-write in one change");
+
+  // A read fault on a kept page lifts the kept pages of its window (the written page is a run of its own).
+  ResetProtectionLog();
+  Check(tracker.ReleaseKept(base + 5 * page_size + 8, window) && g_protection_calls == 2 &&
+            Protection(at(base)) == PAGE_READONLY && IsWritable(page) &&
+            Protection(at(base + window - page_size)) == PAGE_READONLY,
+        "a fault on a kept page did not lift its window");
+  ResetProtectionLog();
+  Check(!tracker.ReleaseKept(base + 5 * page_size, window) && g_protection_calls == 0,
+        "a page that is not kept was released");
+
+  // The range release (before a copy under the address-space lock) lifts only what is kept.
+  tracker.MarkRegionAsGpuModified(next, 2 * page_size);
+  tracker.KeepGpuProtection(next, page_size);
+  ResetProtectionLog();
+  tracker.ReleaseKeptRange(next, 4 * page_size);
+  Check(g_protection_calls == 1 && Protection(at(next)) == PAGE_READONLY &&
+            Protection(at(next + page_size)) == PAGE_NOACCESS && tracker.IsRegionGpuModified(next + page_size, page_size),
+        "the range release lifted a GPU-written page or missed a kept one");
+  ResetProtectionLog();
+  tracker.ReleaseKeptRange(next, 4 * page_size);
+  Check(g_protection_calls == 0, "a range release with nothing kept changed protection");
+  tracker.UnmarkRegionAsGpuModified(next + page_size, page_size);
+
+  // The CPU touched every page of the first window while it was kept: the next resolve keeps them
+  // with no protection change, and the next touch lifts them again.
+  tracker.ForEachUploadRange(base, window, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  tracker.MarkRegionAsGpuModified(base, window);
+  ResetProtectionLog();
+  tracker.KeepGpuProtection(base, window);
+  Check(g_protection_calls == 0 && !tracker.IsRegionGpuModified(base, window) &&
+            Protection(at(base)) == PAGE_NOACCESS && Protection(at(base + window - page_size)) == PAGE_NOACCESS,
+        "pages the CPU touched were not kept again");
+  Check(tracker.ReleaseKept(base + 8, window) && Protection(at(base)) == PAGE_READONLY &&
+            Protection(at(base + window - page_size)) == PAGE_READONLY,
+        "a fault on a page kept again did not lift its window");
+
+  tracker.UntrackMemory(allocation_base, 3 * window);
+  Check(IsWritable(at(base)) && IsWritable(at(next)), "untracking left a kept page protected");
+  Release(memory);
+}
+
+// A written binding marked again over pages that are already GPU-written keeps exactly their protection (no call at all),
+// and a CPU write after the GPU write still faults: the page stays no-access, the fault reads the GPU bytes back, and the
+// write is then uploaded. A lift window narrower than 256 KB lifts only the kept pages inside it: a read of a kept page
+// past it still faults.
+void TestGpuRemarkKeepsProtection() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr uint64_t window = 0x40000;
+  constexpr uint64_t narrow = 0x4000;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 2 * window / page_size);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto base = (allocation_base + window - 1) & ~(window - 1);
+  const auto at = [](uint64_t address) { return reinterpret_cast<const void *>(address); };
+  const auto all_no_access = [&](uint64_t begin, uint64_t end) {
+    for (auto address = begin; address < end; address += page_size) {
+      if (Protection(at(address)) != PAGE_NOACCESS) return false;
+    }
+    return true;
+  };
+
+  tracker.ForEachUploadRange(base, window, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  MarkGpuModified(tracker, base, 4 * page_size);
+  Check(all_no_access(base, base + 4 * page_size) && Protection(at(base + 4 * page_size)) == PAGE_READONLY,
+        "a written binding did not protect exactly its pages");
+  ResetProtectionLog();
+  MarkGpuModified(tracker, base, 4 * page_size);
+  MarkGpuModified(tracker, base + page_size, 2 * page_size);
+  MarkGpuModified(tracker, base + 8, 16);
+  Check(g_protection_calls == 0 && all_no_access(base, base + 4 * page_size) &&
+            tracker.IsRegionGpuModified(base, 4 * page_size) && Protection(at(base + 4 * page_size)) == PAGE_READONLY,
+        "marking GPU-written pages again changed their protection");
+
+  // The CPU writes page 1 after the GPU did: the page isn't writable, so the write faults. The fault's invalidation
+  // reads it back (flush), the page becomes CPU-written, and the next upload walk reports it.
+  Check(!IsWritable(at(base + page_size)), "a CPU write after the GPU write would not fault");
+  uint32_t flushes = 0;
+  tracker.InvalidateRegion(base + page_size, page_size, [&] {
+    flushes++;
+    tracker.ForEachDownloadRange<true>(base + page_size, page_size, [](uint64_t, uint64_t) noexcept {});
+    tracker.MarkRegionAsCpuModified(base + page_size, page_size);
+  });
+  std::vector<std::pair<uint64_t, uint64_t>> uploads;
+  tracker.ForEachUploadRange(
+      base, 4 * page_size, false,
+      [&](uint64_t address, uint64_t size) noexcept { uploads.emplace_back(address, size); }, []() noexcept {});
+  Check(flushes == 1 && uploads.size() == 1 && uploads[0].first == base + page_size &&
+            uploads[0].second == page_size && tracker.IsRegionGpuModified(base, page_size) &&
+            tracker.IsRegionGpuModified(base + 2 * page_size, 2 * page_size) &&
+            !tracker.IsRegionGpuModified(base + page_size, page_size) && Protection(at(base)) == PAGE_NOACCESS,
+        "a CPU write after the GPU write was not read back first and then uploaded");
+  tracker.UnmarkRegionAsGpuModified(base, 4 * page_size);
+
+  // A narrow lift: a read fault lifts only the kept pages of its 16 KB; one past it still faults and lifts its own.
+  MarkGpuModified(tracker, base, window);
+  tracker.KeepGpuProtection(base, window);
+  ResetProtectionLog();
+  Check(tracker.ReleaseKept(base + 5 * page_size + 8, narrow) && g_protection_calls == 1 &&
+            Protection(at(base + 4 * page_size)) == PAGE_READONLY &&
+            Protection(at(base + 7 * page_size)) == PAGE_READONLY && all_no_access(base, base + 4 * page_size) &&
+            all_no_access(base + 8 * page_size, base + window),
+        "a narrow lift lifted other pages than its window");
+  Check(!tracker.ReleaseKept(base + 6 * page_size, narrow) &&
+            tracker.ReleaseKept(base + 9 * page_size, narrow) &&
+            Protection(at(base + 8 * page_size)) == PAGE_READONLY && all_no_access(base + 12 * page_size, base + window),
+        "a read past a narrow lift did not fault on its own window");
+
+  tracker.UntrackMemory(allocation_base, 2 * window);
+  Check(IsWritable(at(base)), "untracking left a page protected");
+  Release(memory);
+}
+
+// A range is CPU-clean (no upload walk needed) only while every region of it is tracked and no page of it is CPU-dirty:
+// a CPU write anywhere in a region ends it for the whole region, the next upload walk restores it.
+void TestRangeCpuClean() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 3 * region / harness.page_manager.GetPageSize());
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto base = (allocation_base + region - 1) & ~(region - 1);
+  const auto walk = [&](uint64_t address, uint64_t size) {
+    uint32_t ranges = 0;
+    tracker.ForEachUploadRange(address, size, false, [&](uint64_t, uint64_t) noexcept { ranges++; }, []() noexcept {});
+    return ranges;
+  };
+  Check(!tracker.IsRangeCpuClean(base, page_size), "an untracked region was clean");
+  Check(walk(base, 2 * region) != 0 && tracker.IsRangeCpuClean(base, 2 * region) &&
+            tracker.IsRangeCpuClean(base + region - page_size, 2 * page_size),
+        "a walked range was not clean");
+  Check(!tracker.IsRangeCpuClean(base + region, region + page_size), "a range into an untracked region was clean");
+
+  // A CPU write on the last page of the first region: the region is no longer clean, the second one still is, and a
+  // walk of the first one's other pages (which finds nothing) leaves it dirty.
+  tracker.MarkRegionAsCpuModified(base + region - page_size, 16);
+  Check(!tracker.IsRangeCpuClean(base, page_size) && !tracker.IsRangeCpuClean(base, 2 * region) &&
+            tracker.IsRangeCpuClean(base + region, region),
+        "a CPU write did not end its region's clean state, or ended another's");
+  Check(walk(base, page_size) == 0 && !tracker.IsRangeCpuClean(base, page_size),
+        "a walk that missed the dirty page made its region clean");
+  Check(walk(base, region) == 1 && tracker.IsRangeCpuClean(base, 2 * region),
+        "the walk that uploaded the dirty page did not make its region clean");
+
+  // A write fault on a GPU-written page (the invalidation's flush marks it CPU-written) ends the clean state too.
+  MarkGpuModified(tracker, base + page_size, page_size);
+  Check(tracker.IsRangeCpuClean(base, region), "a GPU write ended the CPU-clean state");
+  tracker.InvalidateRegion(base + page_size, page_size, [&] {
+    tracker.ForEachDownloadRange<true>(base + page_size, page_size, [](uint64_t, uint64_t) noexcept {});
+    tracker.MarkRegionAsCpuModified(base + page_size, page_size);
+  });
+  Check(!tracker.IsRangeCpuClean(base, region) && walk(base, region) == 1 && tracker.IsRangeCpuClean(base, region),
+        "a CPU write after a GPU write was not seen by the clean state");
+
+  tracker.UntrackMemory(allocation_base, 3 * region);
   Release(memory);
 }
 
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
-  auto *memory = Allocate(1);
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
   if (std::strcmp(name, "gpu-dirty-explicit-cpu") == 0) {
     tracker.ForEachUploadRange(
@@ -1227,10 +1927,18 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestResolveWriteBitmap();
+  TestRangeSetModel();
+  TestResolveWriteBitmapModel();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestKnownZero();
+  TestPreflushTable();
+  TestPreflushCopyLimit();
   TestCleanUploadPreservesOwnership();
+  TestConsumeCpuWrites();
+  TestGpuMarkingSkipsCpuDirtyPages();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
@@ -1243,6 +1951,10 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestKeptGpuProtection();
+  TestKeptGpuProtectionRuns();
+  TestGpuRemarkKeepsProtection();
+  TestRangeCpuClean();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

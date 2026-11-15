@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -65,7 +66,7 @@ void GraphicContext::LogMemoryBudget() const {
 		return;
 	}
 
-	const auto& properties = physical_device_memory_properties;
+	const auto& properties = GetPhysicalDeviceMemoryProperties();
 	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
@@ -151,8 +152,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
 	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(
@@ -178,11 +178,49 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	return true;
 }
 
+bool GraphicContext::CreateSparseImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+	EXIT_IF(image.image != nullptr || image.allocation != nullptr);
+	if (device.createImage(&image_info, nullptr, &image.image) != vk::Result::eSuccess) {
+		return false;
+	}
+	image.format     = image_info.format;
+	image.image_type = image_info.imageType;
+	image.extent     = image_info.extent;
+	image.layers     = image_info.arrayLayers;
+	image.mip_levels = image_info.mipLevels;
+	image.samples    = static_cast<uint32_t>(image_info.samples);
+	image.usage      = image_info.usage;
+	image.flags      = image_info.flags;
+	image.state      = {.layout = image_info.initialLayout};
+	image.subresource_states.clear();
+	return true;
+}
+
+VmaAllocation GraphicContext::AllocateSparse(const vk::MemoryRequirements& image, uint64_t size,
+                                             vk::DeviceMemory& memory, uint64_t& offset) {
+	const VkMemoryRequirements need {size, image.alignment, image.memoryTypeBits};
+	VmaAllocationCreateInfo    create {};
+	create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VmaAllocation     allocation = nullptr;
+	VmaAllocationInfo info {};
+	if (vmaAllocateMemory(allocator, &need, &create, &allocation, &info) != VK_SUCCESS) {
+		LogMemoryBudget();
+		return nullptr;
+	}
+	memory = vk::DeviceMemory(info.deviceMemory);
+	offset = info.offset;
+	return allocation;
+}
+
 void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
+	EXIT_IF(allocator == nullptr || image.image == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	if (image.allocation == nullptr) {
+		device.destroyImage(image.image, nullptr); // a sparse image: Image frees its memory
+	} else {
+		vmaDestroyImage(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
 }
