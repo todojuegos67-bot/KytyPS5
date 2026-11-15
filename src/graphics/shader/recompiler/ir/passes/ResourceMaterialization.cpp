@@ -3541,6 +3541,13 @@ bool DerivePlanState(ResourcePlan& plan) {
 		if (group == plan.selector_keys.size()) plan.selector_keys.push_back({.source = source});
 		if (group != UINT32_MAX && group >= plan.selector_keys.size()) return false;
 	}
+	// The walker indexes its reach bytes by these blocks, one per Phi argument: a corrupt file must not read past them.
+	for (const auto& [inst, blocks]: plan.control_phi_predecessors) {
+		if (blocks.size() != inst->NumArgs()) return false;
+		for (const auto block: blocks) {
+			if (block >= plan.control_flow.size()) return false;
+		}
+	}
 	BuildDescriptorFetch(plan);
 	MarkSrtHostReads(plan);
 	CompileSrtWalker(plan);

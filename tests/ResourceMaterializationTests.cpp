@@ -32,6 +32,19 @@ Extract(const Libs::Graphics::ShaderRecompiler::IR::Program &program) {
             !LoadResourcePlan(std::span(bytes).first(bytes.size() - 1u), truncated) &&
             !LoadResourcePlan(extended, padded),
         "resource plan did not round-trip through its exact stage store bytes");
+  // A Phi predecessor past the blocks (a corrupt file) does not load: the walker indexes its reach bytes by it.
+  if (!loaded.control_phi_predecessors.empty()) {
+    auto &blocks = loaded.control_phi_predecessors.begin()->second;
+    const auto kept = blocks;
+    blocks[0] = static_cast<uint32_t>(loaded.control_flow.size());
+    const auto corrupt_bytes = SaveResourcePlan(loaded);
+    blocks.push_back(0u);
+    const auto extra_bytes = SaveResourcePlan(loaded);
+    blocks = kept;
+    ResourcePlan corrupt, extra;
+    Check(!corrupt_bytes.empty() && !LoadResourcePlan(corrupt_bytes, corrupt) && !LoadResourcePlan(extra_bytes, extra),
+          "a plan with a Phi predecessor past its blocks, or one too many, loaded");
+  }
   return loaded;
 }
 
