@@ -4,13 +4,14 @@
 #include <cstdint>
 #include "common/types.h"
 
-// Bloodborne 1.09, BB_VARIABLE_DT=1 (default off): PC-style variable frame time on top of the
-// "PC sin limite" patch set (launcher FPS option 7). The game's frame dt is the measured frame
-// time clamped to [game limiter period, BB_VARIABLE_DT_MAX_MS (default 50 ms)] instead of
-// [period, 1/60]; the per-frame constants that "PC sin limite 1" froze at a 100 fps / 60 fps
-// value are re-evaluated every frame from the live dt; the presenter flips each frame as soon
-// as it arrives (BB_VRR_PRESENT, on by default with BB_VARIABLE_DT=1) instead of on the next
-// emulated vblank tick.
+// Bloodborne 1.09, BB_VARIABLE_DT=1 (default off): PC-style variable frame time, installed by the
+// emulator at eboot load with byte checks against the original 1.09 code (no XML patch needed;
+// the "PC sin limite" entries 1/2x/3/4/5/6 are recognised and kept, any other FPS patch turns
+// this off). Game dt = measured frame time clamped to [frame period, BB_VARIABLE_DT_MAX_MS
+// (default 50 ms)]; frame cap = BB_FPS_CAP (0 / unset = unlimited) in the game's own limiter;
+// per-frame time-step reads use the live dt, frame-count -> seconds conversions stay 1/30;
+// Havok semi-fixed substeps; the presenter flips each frame as soon as it arrives
+// (BB_VRR_PRESENT, on by default with BB_VARIABLE_DT=1).
 namespace BB::VarDt {
 bool Enabled();          // BB_VARIABLE_DT=1
 bool ImmediatePresent(); // Enabled() and BB_VRR_PRESENT != 0
