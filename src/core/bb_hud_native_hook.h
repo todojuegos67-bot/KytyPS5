@@ -30,4 +30,22 @@ bool Installed();
 // After the eboot's relocations were applied (its vtables hold absolute addresses).
 void OnEbootRelocated(uintptr_t eboot_base, const std::vector<std::pair<u64, u64>>& segments);
 
+// bb-hud-fullres: BB_HUD_FULLRES=1 (default: the value of BB_HUD_NATIVE). The resolution patch
+// gives the game's Scaleform movie viewport (GFx::Viewport built at eboot 0x1f58554 and passed to
+// Movie::SetViewport, vtable +0x68, in the movie wrapper constructor 0x1f58360) the output size
+// instead of the render size: Scaleform projects, tessellates and rasterises its glyphs for the
+// output's pixels. Its draws into the render-size scene target are then in output pixels; the
+// rasterizer draws them 1:1 into the output-size UI image (HUD cut) or scales them down to the
+// render-size target when no cut runs (the HUD as before).
+bool FullResRequested();
+// Set by the resolution patch once it wrote `ui` into the movie viewport (`render`: the scene).
+void SetFullResUi(u32 ui_w, u32 ui_h, u32 render_w, u32 render_h);
+// The movie viewport (output size) and the render size; false when the patch did not apply.
+bool FullResUi(u32& ui_w, u32& ui_h, u32& render_w, u32& render_h);
+struct FullResStats {
+    // UI draws drawn 1:1 at output size (HUD cut), drawn scaled down into the render-size
+    // target (no cut: fallback), scissors rebuilt, UI passes left unredirected.
+    static std::atomic<u64> output_draws, fallback_draws, scissors, cropped_frames;
+};
+
 } // namespace BB::HudNativeHook

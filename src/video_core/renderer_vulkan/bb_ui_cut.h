@@ -132,6 +132,9 @@ public:
         // bb-artifact-fix: `hudless_view` / `hud_view` swap red and blue (the display pass's
         // view of the UI target does: BB_HUDLESS_SWAP).
         bool hudless_swapped = false;
+        // bb-hud-fullres: the overscan crop was applied to the scene alone, under the HUD (the
+        // presenter shows this image without cropping it again).
+        bool scene_cropped = false;
     };
     bool DisplayOverride(VAddr address, vk::Format format, Display& display);
 
@@ -266,12 +269,18 @@ private:
     // This frame's frame generation inputs (taken at the cut), handed to the display copy.
     BB::FG::Inputs cut_fg{}, display_fg{};
     int cut_hudless = -1, display_hudless = -1; // hudless slot, -1: none
+    // bb-hud-fullres: this frame's cut cropped the scene (overscan) before the UI draws.
+    bool cut_cropped = false, display_cropped = false;
+    [[nodiscard]] bool CropScene(bool fg) const;
+    void ScaledBlitRegion(u32 src_w, u32 src_h, u32 dst_w, u32 dst_h, bool crop,
+                          vk::ImageBlit& region) const;
 
     struct HostDisplay {
         OwnImage image;
         bool valid = false;
         BB::FG::Inputs fg{};
         int hudless = -1;
+        bool cropped = false;
         vk::Format rt_format = vk::Format::eUndefined; // the format the display pass wrote it with
     };
     std::mutex display_mutex;

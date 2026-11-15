@@ -173,6 +173,37 @@ bool Installed() {
     return g_installed.load(std::memory_order_acquire);
 }
 
+namespace {
+std::atomic<u32> g_ui_w{0}, g_ui_h{0}, g_render_w{0}, g_render_h{0};
+} // namespace
+
+std::atomic<u64> FullResStats::output_draws{0}, FullResStats::fallback_draws{0},
+    FullResStats::scissors{0}, FullResStats::cropped_frames{0};
+
+bool FullResRequested() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_HUD_FULLRES");
+        if (v != nullptr && *v != '\0') return v[0] == '1';
+        return Enabled();
+    }();
+    return on;
+}
+
+void SetFullResUi(u32 ui_w, u32 ui_h, u32 render_w, u32 render_h) {
+    g_render_w.store(render_w, std::memory_order_relaxed);
+    g_render_h.store(render_h, std::memory_order_relaxed);
+    g_ui_h.store(ui_h, std::memory_order_relaxed);
+    g_ui_w.store(ui_w, std::memory_order_release);
+}
+
+bool FullResUi(u32& ui_w, u32& ui_h, u32& render_w, u32& render_h) {
+    ui_w = g_ui_w.load(std::memory_order_acquire);
+    ui_h = g_ui_h.load(std::memory_order_relaxed);
+    render_w = g_render_w.load(std::memory_order_relaxed);
+    render_h = g_render_h.load(std::memory_order_relaxed);
+    return ui_w != 0 && ui_h != 0 && render_w != 0 && render_h != 0;
+}
+
 void OnEbootRelocated(uintptr_t eboot_base, const std::vector<std::pair<u64, u64>>& segments) {
     if (!Enabled()) return;
     const u8* img = reinterpret_cast<const u8*>(eboot_base);

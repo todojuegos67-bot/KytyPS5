@@ -143,6 +143,8 @@ private:
     void BbLodBias();
     // Supermedo's UpdateUiTransform: the scale of a draw into the output-size UI images.
     void BbUpdateUiTransform();
+    // bb-hud-fullres: the scissor of viewport `index` for a draw laid out for the output.
+    vk::Rect2D BbFullResScissor(u32 index) const;
     void BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32 count, u32 instances);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
@@ -189,6 +191,10 @@ private:
         std::pair<u32, u32> guest{1, 1}, output{1, 1};
     } bb_ui_pass;
     mutable std::array<float, 2> bb_target_scale{1.0f, 1.0f};
+    // bb-hud-fullres: this draw is in the movie viewport's (output) pixels; the guest target's
+    // size and the size of the images it is drawn into.
+    bool bb_fullres_draw = false;
+    std::pair<u32, u32> bb_fullres_guest{1, 1}, bb_fullres_extent{1, 1};
     bool bb_display_pass = false; // the previous draw went into a display buffer
 
 private:

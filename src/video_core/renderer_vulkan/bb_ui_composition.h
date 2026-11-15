@@ -107,4 +107,30 @@ inline std::array<float, 2> DrawScale(float width, float height, bool window_spa
     return {float(output_width) / ui_w, float(output_height) / ui_h};
 }
 
+// bb-hud-fullres: the movie viewport is ui_w x ui_h (the output; core/bb_hud_native_hook.h).
+// A draw of the UI in those pixels, into a pass whose images are dst_w x dst_h (the output-size
+// UI image, or the render-size scene target when no cut runs), is scaled by dst / ui. Which
+// draws are in UI pixels follows Sharp UI above: the whole movie viewport, and (only when the
+// draw is known to be Scaleform's: `ui_draw`) a viewport of its own inside it or window-space
+// vertices. A viewport over the whole guest target (post passes) or the 1920x1080 stage keeps
+// the rules above. {0, 0}: not a UI-pixel draw.
+inline std::array<float, 2> FullResScale(float width, float height, bool window_space,
+                                         bool ui_draw, uint32_t guest_width,
+                                         uint32_t guest_height, uint32_t ui_width,
+                                         uint32_t ui_height, uint32_t dst_width,
+                                         uint32_t dst_height) {
+    if (ui_width == 0 || ui_height == 0) return {0.0f, 0.0f};
+    const float w = std::abs(width), h = std::abs(height);
+    const bool full = !window_space && ViewportIs(w, h, float(ui_width), float(ui_height));
+    if (!full) {
+        const bool target = std::abs(w - float(guest_width)) < 8.0f &&
+                            std::abs(h - float(guest_height)) < 8.0f;
+        const bool stage = ViewportIs(w, h, 1920.0f, 1080.0f);
+        const bool inner = w >= 1.0f && h >= 1.0f && w <= float(ui_width) + 0.5f &&
+                           h <= float(ui_height) + 0.5f;
+        if (!ui_draw || (!window_space && (target || stage || !inner))) return {0.0f, 0.0f};
+    }
+    return {float(dst_width) / float(ui_width), float(dst_height) / float(ui_height)};
+}
+
 } // namespace Vulkan::UiComposition

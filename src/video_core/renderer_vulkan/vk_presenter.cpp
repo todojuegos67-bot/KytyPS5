@@ -1268,8 +1268,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // bb-overscan only on frames frame generation does not get (boot/loading/menus): FG's depth
     // and motion vectors are uncropped, so a cropped colour would sit up to 0.2 % off them and
     // smear the generated frames' edges. The HUD-less copy below takes the same setting.
-    pp_settings.uv_scale =
-        frame->fg.valid ? 1.0f : HostPasses::PostProcessingPass::OverscanScale();
+    // bb-hud-fullres: a cut frame whose scene was cropped under the HUD is shown as it is.
+    pp_settings.uv_scale = frame->fg.valid || (bb_cut_frame && bb_display.scene_cropped)
+                               ? 1.0f
+                               : HostPasses::PostProcessingPass::OverscanScale();
     {
         // bb-hudless: the HUD-less colour for frame generation (Supermedo's CaptureHudlessUi copy
         // at the HUD cut) through the same post-process pass into an image of the frame's size

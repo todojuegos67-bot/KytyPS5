@@ -21,6 +21,7 @@
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_hud_layer_comp.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
+#include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -185,7 +186,67 @@ void FlushNative(u32 ow, u32 oh, VAddr layer, u32 lw, u32 lh) {
     g_native.g_no_dcb = gd;
 }
 
+// bb-hud-fullres: per second (GPU thread), the rasterizer's counters as deltas.
+struct FullResWhy {
+    u64 frames = 0, cut_frames = 0, no_cut_frames = 0, cropped = 0;
+    u64 output = 0, fallback = 0, scissors = 0;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+} g_fullres;
+
+void FlushFullRes(bool cut_frame, bool cropped) {
+    u32 uw = 0, uh = 0, rw = 0, rh = 0;
+    if (!BB::HudNativeHook::FullResUi(uw, uh, rw, rh)) return;
+    ++g_fullres.frames;
+    ++(cut_frame ? g_fullres.cut_frames : g_fullres.no_cut_frames);
+    if (cropped) ++g_fullres.cropped;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_fullres.t0 < std::chrono::seconds(1)) return;
+    using S = BB::HudNativeHook::FullResStats;
+    const u64 o = S::output_draws.load(std::memory_order_relaxed),
+              f = S::fallback_draws.load(std::memory_order_relaxed),
+              c = S::scissors.load(std::memory_order_relaxed);
+    BB::Upscale::Checkpoint(fmt::format(
+        "[hud-fullres] 1 s: frames {} (HUD cut {}, no cut {}), UI draws at the output {}x{} {} "
+        "(clip rectangles {}), UI draws scaled down to the {}x{} scene target (fallback) {}, "
+        "overscan under the HUD {}; markers {}",
+        g_fullres.frames, g_fullres.cut_frames, g_fullres.no_cut_frames, uw, uh,
+        o - g_fullres.output, c - g_fullres.scissors, rw, rh, f - g_fullres.fallback,
+        g_fullres.cropped,
+        BB::HudNativeHook::Installed() ? "on (BB_HUD_NATIVE)" : "off (viewport rule only)"));
+    g_fullres = FullResWhy{};
+    g_fullres.t0 = now;
+    g_fullres.output = o;
+    g_fullres.fallback = f;
+    g_fullres.scissors = c;
+}
+
 } // namespace
+
+bool UiCut::CropScene(bool fg) const {
+    // The overscan crop (BB_OVERSCAN_PERCENT) of a frame frame generation does not get, applied
+    // to the scene as it enters the UI image, so the HUD drawn over it is not resampled.
+    u32 uw = 0, uh = 0, rw = 0, rh = 0;
+    return !fg && BB::HudNativeHook::FullResUi(uw, uh, rw, rh) &&
+           Vulkan::HostPasses::PostProcessingPass::OverscanScale() < 1.0f;
+}
+
+void UiCut::ScaledBlitRegion(u32 src_w, u32 src_h, u32 dst_w, u32 dst_h, bool crop,
+                             vk::ImageBlit& region) const {
+    s32 cx = 0, cy = 0;
+    if (crop) {
+        const float c = (1.0f - Vulkan::HostPasses::PostProcessingPass::OverscanScale()) * 0.5f;
+        cx = s32(std::lround(float(src_w) * c));
+        cy = s32(std::lround(float(src_h) * c));
+        if (2 * cx >= s32(src_w) || 2 * cy >= s32(src_h)) cx = cy = 0;
+    }
+    region = vk::ImageBlit{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffsets = std::array{vk::Offset3D{cx, cy, 0},
+                                 vk::Offset3D{s32(src_w) - cx, s32(src_h) - cy, 1}},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(dst_w), s32(dst_h), 1}},
+    };
+}
 
 void UiCut::OnNativeMarker(bool begin, u32 seq) {
     (void)seq;
@@ -353,6 +414,9 @@ void UiCut::OnFrameStart() {
     display_redirect = ui_phase;
     display_fg = display_redirect ? cut_fg : BB::FG::Inputs{};
     display_hudless = display_redirect ? cut_hudless : -1;
+    display_cropped = display_redirect && cut_cropped;
+    FlushFullRes(ui_phase, display_cropped);
+    cut_cropped = false;
     ui_phase = false;
     ui_read_barrier = false;
     done_this_frame = false;
@@ -878,16 +942,12 @@ void UiCut::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId depth_id) 
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
     cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-    const vk::ImageBlit region{
-        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-                                 vk::Offset3D{s32(BB::Upscale::g_scene_w),
-                                              s32(BB::Upscale::g_scene_h), 1}},
-        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(ow), s32(oh), 1}},
-    };
+    const bool crop = !native && CropScene(false);
+    vk::ImageBlit region{};
+    ScaledBlitRegion(BB::Upscale::g_scene_w, BB::Upscale::g_scene_h, ow, oh, crop, region);
     cmd.blitImage(color.GetImage(), vk::ImageLayout::eTransferSrcOptimal, ui_image.image,
                   vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eLinear);
+    cut_cropped = crop;
     barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
     barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
     barrier.dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
@@ -956,16 +1016,14 @@ bool UiCut::RunScaled(SceneDepth& scene) {
             vk::AccessFlagBits2::eTransferRead);
     barrier(ui_image.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
             vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite);
-    const vk::ImageBlit region{
-        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-                                 vk::Offset3D{s32(out.width), s32(out.height), 1}},
-        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
-                                 vk::Offset3D{s32(out.width), s32(out.height), 1}},
-    };
+    // bb-hud-fullres: the overscan crop of a frame without frame generation is made here, on the
+    // scene alone (linear, as the presenter's crop was); the HUD then lands on exact pixels.
+    const bool crop = CropScene(fg.valid);
+    vk::ImageBlit region{};
+    ScaledBlitRegion(out.width, out.height, out.width, out.height, crop, region);
     cmd.blitImage(sr->OutputImage(), vk::ImageLayout::eTransferSrcOptimal, ui_image.image,
-                  vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+                  vk::ImageLayout::eTransferDstOptimal, region,
+                  crop ? vk::Filter::eLinear : vk::Filter::eNearest);
     barrier(sr->OutputImage(), vk::ImageLayout::eTransferSrcOptimal,
             vk::ImageLayout::eShaderReadOnlyOptimal, all, vk::AccessFlagBits2::eShaderRead);
     barrier(ui_image.image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eGeneral,
@@ -977,6 +1035,7 @@ bool UiCut::RunScaled(SceneDepth& scene) {
     ui_color = ldr_target;
     ui_depth = depth_id;
     cut_fg = fg;
+    cut_cropped = crop;
     std::scoped_lock lock{counter_mutex};
     ++counters.cuts;
     return true;
@@ -1127,6 +1186,7 @@ bool UiCut::RedirectColor(VideoCore::ImageId color, const VideoCore::ImageViewIn
     display.valid = true;
     display.fg = display_fg;
     display.hudless = display_hudless;
+    display.cropped = display_cropped;
     display.rt_format = view_info.format;
     target = {Mirror(display.image, view_info.format, vk::ImageAspectFlagBits::eColor),
               vk::ImageLayout::eGeneral, ui_width, ui_height, false};
@@ -1290,6 +1350,7 @@ bool UiCut::DisplayOverride(VAddr address, vk::Format format, Display& out) {
     out.width = d.image.width;
     out.height = d.image.height;
     out.fg = d.fg;
+    out.scene_cropped = d.cropped;
     if (d.hudless >= 0 && hudless_images[d.hudless].image) {
         auto& h = hudless_images[d.hudless];
         const bool swap = raw_swap[d.hudless].load(std::memory_order_acquire);

@@ -14,6 +14,7 @@
 #include <string>
 #include <fmt/format.h>
 #include "common/logging/log.h"
+#include "core/bb_hud_native_hook.h"
 #include "core/emulator_settings.h"
 #include "common/types.h"
 #include "video_core/bb/bb_sr.h"
@@ -170,12 +171,20 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
     constexpr u32 align = 4;
     const u32 rw = std::max<u32>(align, static_cast<u32>(std::lround(ow / ratio / align)) * align);
     const u32 rh = std::max<u32>(align, static_cast<u32>(std::lround(oh / ratio / align)) * align);
+    // bb-hud-fullres: the UI pair is the Scaleform movie viewport (BufferWidth / BufferHeight and
+    // Width / Height of the GFx::Viewport the movie wrapper constructor 0x1f58360 passes to
+    // Movie::SetViewport); the scene pair sizes the render targets. With BB_HUD_FULLRES the movie
+    // is laid out for the output while the scene stays at the render size.
+    const bool fullres = BB::HudNativeHook::FullResRequested() && ow % 2 == 0 && oh % 2 == 0;
+    const u32 uw = fullres ? ow : rw, uh = fullres ? oh : rh;
     for (const Line& l : Template) {
         u8 b[4];
         std::memcpy(b, l.bytes, 4);
         u32 value = 0;
-        if (l.addr == SceneW || l.addr == UiW) value = rw;
-        if (l.addr == SceneH || l.addr == UiH) value = rh;
+        if (l.addr == SceneW) value = rw;
+        if (l.addr == SceneH) value = rh;
+        if (l.addr == UiW) value = uw;
+        if (l.addr == UiH) value = uh;
         if (value) {
             b[1] = value & 0xFF;
             b[2] = (value >> 8) & 0xFF;
@@ -187,5 +196,12 @@ void OnEbootLoaded(uintptr_t base, u64 image_size) {
         "resolution patch: the game renders at {}x{} (output {}x{} / {:.3f}, {} {})", rw, rh, ow,
         oh, ratio, BB::SR::KindName(BB::Upscale::Cfg().kind),
         BB::SR::QualityName(BB::Upscale::Cfg().quality)));
+    if (fullres) {
+        BB::HudNativeHook::SetFullResUi(uw, uh, rw, rh);
+        BB::Upscale::Checkpoint(fmt::format(
+            "[hud-fullres] Scaleform movie viewport {}x{} (output; scene {}x{}): the HUD is laid "
+            "out, tessellated and rasterised for the output (BB_HUD_FULLRES=0 disables)",
+            uw, uh, rw, rh));
+    }
 }
 } // namespace BB::ResPatch

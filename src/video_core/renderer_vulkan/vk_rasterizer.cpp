@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "common/debug.h"
+#include "core/bb_hud_native_hook.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -1276,6 +1277,44 @@ void Rasterizer::BbHudNativeMarker(bool begin, u32 seq) {
     bb_cut.OnNativeMarker(begin, seq);
 }
 
+vk::Rect2D Rasterizer::BbFullResScissor(u32 index) const {
+    // bb-hud-fullres: a scissor covering the whole guest target (a target-size screen / window
+    // scissor set for the render size) does not clip; the others (Scaleform's clip rectangles,
+    // in the movie viewport's pixels) are scaled like the viewport.
+    const auto& regs = liverpool->regs;
+    const s32 gw = s32(bb_fullres_guest.first), gh = s32(bb_fullres_guest.second);
+    s32 x0 = 0, y0 = 0;
+    s32 x1 = s32(bb_fullres_extent.first), y1 = s32(bb_fullres_extent.second);
+    bool clipped = false;
+    const auto clip = [&](s32 l, s32 t, s32 r, s32 b) {
+        if (l <= 0 && t <= 0 && r >= gw && b >= gh) return;
+        clipped = true;
+        x0 = std::max(x0, s32(std::lround(float(std::max(l, 0)) * bb_target_scale[0])));
+        y0 = std::max(y0, s32(std::lround(float(std::max(t, 0)) * bb_target_scale[1])));
+        x1 = std::min(x1, s32(std::lround(float(std::max(r, 0)) * bb_target_scale[0])));
+        y1 = std::min(y1, s32(std::lround(float(std::max(b, 0)) * bb_target_scale[1])));
+    };
+    const bool offset = !regs.window_scissor.window_offset_disable;
+    const s32 ox = offset ? s32(regs.window_offset.window_x_offset) : 0;
+    const s32 oy = offset ? s32(regs.window_offset.window_y_offset) : 0;
+    clip(regs.screen_scissor.top_left_x, regs.screen_scissor.top_left_y,
+         regs.screen_scissor.bottom_right_x, regs.screen_scissor.bottom_right_y);
+    clip(s32(regs.window_scissor.top_left_x) + ox, s32(regs.window_scissor.top_left_y) + oy,
+         s32(regs.window_scissor.bottom_right_x) + ox, s32(regs.window_scissor.bottom_right_y) + oy);
+    clip(s32(regs.generic_scissor.top_left_x) + ox, s32(regs.generic_scissor.top_left_y) + oy,
+         s32(regs.generic_scissor.bottom_right_x) + ox,
+         s32(regs.generic_scissor.bottom_right_y) + oy);
+    if (regs.mode_control.vport_scissor_enable) {
+        const auto& v = regs.viewport_scissors[index];
+        clip(v.top_left_x, v.top_left_y, v.bottom_right_x, v.bottom_right_y);
+    }
+    if (clipped) BB::HudNativeHook::FullResStats::scissors.fetch_add(1, std::memory_order_relaxed);
+    return {
+        .offset = {x0, y0},
+        .extent = {u32(std::max(x1 - x0, 0)), u32(std::max(y1 - y0, 0))},
+    };
+}
+
 void Rasterizer::BbUpdateUiTransform() {
     // Supermedo's UpdateUiTransform: a native viewport (or native window-space UI vertices) must
     // not be doubled again; the display copy uses the guest render-size coordinates.
@@ -1283,6 +1322,24 @@ void Rasterizer::BbUpdateUiTransform() {
     const auto& viewport = regs.viewports[0];
     const bool window_space = regs.IsClipDisabled() && !regs.viewport_control.xscale_enable &&
                               !regs.viewport_control.yscale_enable;
+    // bb-hud-fullres: a Scaleform draw laid out for the output (its movie viewport) goes 1:1 into
+    // the output-size UI image (the viewport / scissors / window-space vertices are not scaled).
+    if (u32 uw = 0, uh = 0, rw = 0, rh = 0;
+        bb_ui_pass.native_ui && BB::HudNativeHook::FullResUi(uw, uh, rw, rh)) {
+        const bool ui_draw = bb_cut.NativeLive() ? bb_cut.NativeUiDraw() : bb_cut.UiPhase();
+        const auto scale = UiComposition::FullResScale(
+            viewport.xscale * 2, viewport.yscale * 2, window_space, ui_draw,
+            bb_ui_pass.guest.first, bb_ui_pass.guest.second, uw, uh, bb_ui_pass.output.first,
+            bb_ui_pass.output.second);
+        if (scale[0] > 0.0f && scale[1] > 0.0f) {
+            bb_target_scale = scale;
+            bb_fullres_draw = true;
+            bb_fullres_guest = bb_ui_pass.guest;
+            bb_fullres_extent = bb_ui_pass.output;
+            BB::HudNativeHook::FullResStats::output_draws.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
     bb_target_scale = UiComposition::DrawScale(
         viewport.xscale * 2, viewport.yscale * 2, window_space, bb_ui_pass.native_ui,
         bb_ui_pass.guest.first, bb_ui_pass.guest.second, bb_ui_pass.output.first,
@@ -1489,6 +1546,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     // are scaled.
     bb_target_scale = {1.0f, 1.0f};
     bb_ui_pass.active = false;
+    bb_fullres_draw = false;
     if (bb_color_redirected || bb_depth_redirected) {
         u32 color_targets = 0;
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
@@ -1521,6 +1579,27 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             bb_ui_pass = {true, bb_redirect.native_ui, bb_guest_extent,
                           {bb_redirect.width, bb_redirect.height}};
             BbUpdateUiTransform();
+        }
+    }
+    // bb-hud-fullres fallback: no cut (or a pass left unredirected): a Scaleform draw laid out for
+    // the output, into the render-size scene target, is scaled down to it (the HUD as before).
+    if (u32 uw = 0, uh = 0, rw = 0, rh = 0;
+        !bb_ui_pass.active && has_attachment && BB::HudNativeHook::FullResUi(uw, uh, rw, rh) &&
+        state.width + 8 > rw && state.width < rw + 8 && state.height + 8 > rh &&
+        state.height < rh + 8 && (state.width < uw || state.height < uh)) {
+        const auto& viewport = regs.viewports[0];
+        const bool window_space = regs.IsClipDisabled() && !regs.viewport_control.xscale_enable &&
+                                  !regs.viewport_control.yscale_enable;
+        const auto scale = UiComposition::FullResScale(
+            viewport.xscale * 2, viewport.yscale * 2, window_space, bb_cut.NativeUiDraw(),
+            state.width, state.height, uw, uh, state.width, state.height);
+        if (scale[0] > 0.0f && scale[1] > 0.0f) {
+            bb_target_scale = scale;
+            bb_fullres_draw = true;
+            bb_fullres_guest = {state.width, state.height};
+            bb_fullres_extent = bb_fullres_guest;
+            BB::HudNativeHook::FullResStats::fallback_draws.fetch_add(1,
+                                                                      std::memory_order_relaxed);
         }
     }
 
@@ -1799,7 +1878,9 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y =
                 std::min(vp_scsr.bottom_right_y, s16(regs.viewport_scissors[i].bottom_right_y));
         }
-        if (bb_target_scale[0] != 1.0f || bb_target_scale[1] != 1.0f) {
+        if (bb_fullres_draw) {
+            scissors.push_back(BbFullResScissor(i));
+        } else if (bb_target_scale[0] != 1.0f || bb_target_scale[1] != 1.0f) {
             const auto scale = [](s32 v, float f) { return s32(std::lround(float(v) * f)); };
             const s32 x0 = scale(vp_scsr.top_left_x, bb_target_scale[0]);
             const s32 y0 = scale(vp_scsr.top_left_y, bb_target_scale[1]);
