@@ -544,7 +544,7 @@ private:
 
 int main() {
 	Harness harness;
-	if (!harness.Init()) return 0;
+	if (!harness.Init()) return 77; // ctest's SKIP_RETURN_CODE
 	// Packed f16 pairs blended per vertex with the barycentrics, next to a flat and a smooth input, an unread output
 	// and a clip distance.
 	harness.Check("packed f16 inputs blended per vertex", kPackedVert, sizeof(kPackedVert), kPackedFrag,
