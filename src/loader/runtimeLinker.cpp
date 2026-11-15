@@ -24,6 +24,10 @@
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
+#include "loader/wolverineBvhMagic.h"
+#include "loader/wolverineGeometryPool.h"
+#include "loader/wolverinePhysicsStep.h"
+#include "loader/wolverineRenderStep.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
@@ -667,12 +671,41 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// First: the GPU path below would take a fault on guest memory not committed yet for a tracking fault, forever.
+		if (Libs::LibKernel::Memory::CommitOnFault(info->access_violation_vaddr)) {
+			return true;
+		}
+		// Marvel's Wolverine 1.05: its BVH magic check compares against the backing, without the page's read back.
+		if (access == GpuAccess::Read && Loader::WolverineBvhMagicCompare(info->native_context, info->exception_address)) {
+			return true;
+		}
+		// A walk's load (mov eax, [r10]) of a word no shader wrote, on a page a shader wrote: from the backing, without
+		// the page's read back (SrtWalkerCleanLoad).
+		if (access == GpuAccess::Read) {
+			auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address);
+			if (length == 0) length = Libs::Graphics::ShaderRecompiler::IR::SrtPointerLoadLength(info->exception_address);
+			if (length != 0) {
+				uint32_t value = 0;
+				if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerCleanLoad(
+				        Loader::X64InstructionEmulator::SavedGpr(info->native_context, 10), value)) {
+					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
+					return true;
+				}
+			}
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
+		if (Libs::LibKernel::Memory::HandleFirstTouch(info->access_violation_vaddr, access == GpuAccess::Write,
+		                                              access == GpuAccess::Execute)) {
+			return true;
+		}
+		// An SRT walker load of unmapped memory (upstream bdf48dcf3): a zero read; the walk then fails unless
+		// it read through a null pointer.
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+			Libs::Graphics::ShaderRecompiler::IR::SrtWalkerFaultedLoad(info->access_violation_vaddr);
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
@@ -1274,6 +1307,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	InstallWolverineRenderStep(m_programs.empty() ? nullptr : m_programs.front());
+	InstallWolverineGeometryPool(m_programs.empty() ? nullptr : m_programs.front());
+	InstallWolverineBvhMagic(m_programs.empty() ? nullptr : m_programs.front());
+	InstallWolverinePhysicsStep(m_programs.empty() ? nullptr : m_programs.front());
 	Common::WriteFpEnv(Common::GuestFpEnv);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
@@ -1716,9 +1753,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
 		program->instruction_trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE;
+		program->title_hook_vaddr = trampoline_addr + INSTRUCTION_TRAMPOLINE_SIZE - TITLE_HOOK_SIZE;
 		RegisterGuestInstructionPatchModule(
 		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
-		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
+		    reinterpret_cast<void*>(trampoline_addr), INSTRUCTION_TRAMPOLINE_SIZE - TITLE_HOOK_SIZE);
 	}
 	if (!is_shared) {
 		program->tls.handler_vaddr =
@@ -1740,6 +1778,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
+	Libs::LibKernel::Memory::EnableKnownZero();
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
 	uint64_t                                   eh_frame_header_addr = 0;

@@ -407,6 +407,7 @@ struct Context {
 
 	[[nodiscard]] uint64_t Rip() const { return native->Rip; }
 	void                   Advance(size_t length) { native->Rip += length; }
+	void SetArithmeticFlags(uint64_t flags) { native->EFlags = (native->EFlags & ~0x8d5u) | static_cast<DWORD>(flags); }
 	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
 
 	[[nodiscard]] auto& Gpr(uint8_t index) const {
@@ -439,6 +440,10 @@ struct Context {
 	}
 	void Advance(size_t length) {
 		native->uc_mcontext->__ss.__rip += static_cast<uint64_t>(length);
+	}
+	void SetArithmeticFlags(uint64_t flags) {
+		auto& rflags = native->uc_mcontext->__ss.__rflags;
+		rflags       = (rflags & ~uint64_t {0x8d5u}) | flags;
 	}
 	[[nodiscard]] auto& Gpr(uint8_t index) const {
 		auto*     state       = &native->uc_mcontext->__ss;
@@ -489,6 +494,10 @@ struct Context {
 	}
 	void Advance(size_t length) {
 		native->uc_mcontext.gregs[REG_RIP] += static_cast<greg_t>(length);
+	}
+	void SetArithmeticFlags(uint64_t flags) {
+		auto& rflags = native->uc_mcontext.gregs[REG_EFL];
+		rflags       = static_cast<greg_t>((static_cast<uint64_t>(rflags) & ~uint64_t {0x8d5u}) | flags);
 	}
 	[[nodiscard]] void* Xmm(uint8_t index) const {
 		if (native->uc_mcontext.fpregs == nullptr) {
@@ -840,9 +849,24 @@ bool TryEmulate(void* native_context) {
 }
 
 void SkipLoad(void* native_context, size_t length) {
+	CompleteLoad(native_context, length, 0);
+}
+
+void CompleteLoad(void* native_context, size_t length, uint32_t value) {
 	Context context {static_cast<decltype(Context::native)>(native_context)};
-	context.Gpr(0) = 0;
+	context.Gpr(0) = value; // a 32-bit load clears the upper half
 	context.Advance(length);
+}
+
+void CompleteCompare(void* native_context, size_t length, uint64_t memory, uint64_t reg) {
+	Context context {static_cast<decltype(Context::native)>(native_context)};
+	context.SetArithmeticFlags(CompareFlags(memory, reg));
+	context.Advance(length);
+}
+
+uint64_t SavedGpr(void* native_context, uint8_t index) {
+	Context context {static_cast<decltype(Context::native)>(native_context)};
+	return static_cast<uint64_t>(context.Gpr(index));
 }
 
 } // namespace Loader::X64InstructionEmulator

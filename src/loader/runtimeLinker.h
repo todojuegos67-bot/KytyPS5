@@ -115,6 +115,9 @@ struct DynamicInfo {
 	std::vector<LibraryId> import_libs;
 };
 
+// The end of a module's instruction trampoline area, kept from the patcher for title hooks (wolverinePhysicsStep.cpp).
+inline constexpr uint64_t TITLE_HOOK_SIZE = 4096;
+
 struct Program {
 	Program();
 	~Program();
@@ -131,6 +134,7 @@ struct Program {
 	uint64_t                     mapped_size       = 0;
 	uint64_t                     flexible_size     = 0;
 	uint64_t instruction_trampoline_size = 0;
+	uint64_t title_hook_vaddr            = 0; // TITLE_HOOK_SIZE bytes at the end of the trampoline area, for title hooks
 	std::unique_ptr<SymbolDatabase> export_symbols;
 	std::unique_ptr<SymbolDatabase> import_symbols;
 	ThreadLocalStorage              tls;
