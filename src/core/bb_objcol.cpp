@@ -69,7 +69,13 @@ bool ReadEnv() {
     return v != nullptr && v[0] == '1';
 }
 
-const bool g_enabled = ReadEnv();
+bool ReadFix() {
+    const char* v = std::getenv("BB_OBJCOL_FIX");
+    return v != nullptr && v[0] == '1';
+}
+
+const bool g_fix = ReadFix();
+const bool g_enabled = ReadEnv() || g_fix;
 
 // Copies guest memory without faulting on unmapped / protected pages.
 bool SafeCopy(void* dst, u64 src, u64 len) {
@@ -771,7 +777,7 @@ void Census(u64 world, World& w) {
         const auto prev = w.unadded_since.find(u32(id));
         const double since = prev != w.unadded_since.end() ? prev->second : now;
         still[u32(id)] = since;
-        if (now - since < 10.0 || (flags & 1) == 0) {
+        if (now - since < 10.0) {
             continue;
         }
         if (owner >= 0) {
@@ -784,9 +790,10 @@ void Census(u64 world, World& w) {
             u64 vt = 0;
             Rd(shape, vt);
             LOG_INFO(Core,
-                     "[objcol] static body {} (shape vtable eboot+{:#x}) layer {} filter {:#x} at "
+                     "[objcol] {} body {} (shape vtable eboot+{:#x}) layer {} filter {:#x} at "
                      "({:.1f}, {:.1f}, {:.1f}) exists but is not in the world ({})",
-                     id, vt - g_eboot, bb.Layer(), bb.Filter(), bb.Pos(0), bb.Pos(1), bb.Pos(2),
+                     Motion(flags), id, vt - g_eboot, bb.Layer(), bb.Filter(), bb.Pos(0), bb.Pos(1),
+                     bb.Pos(2),
                      it == w.bodies.end() || it->second.shape != shape ? "never added"
                      : it->second.state == State::Removed              ? "removed"
                      : it->second.state == State::Deferred ? "add deferred, not committed"
@@ -1111,6 +1118,181 @@ void CompareJob(const Job& job) {
     }
 }
 
+// ---------------------------------------------------------------- object physics systems
+// Decompiled (1.09):
+//   0xb36780 hknpPhysicsSystem::addToWorld(system, mode, flags): collects the system's body ids
+//            ([system+0x20], count [system+0x28]) that are not yet added and calls
+//            addBodies([system+0x18] world, ids, n, mode, flags).
+//   0xb368e0 hknpPhysicsSystem::removeFromWorld(system).
+//   The game's physics-system wrapper (vtable 0x52978a0, system at wrapper+0x18, "in world" byte
+//   at wrapper+0x40): slot +0x78 0xa7f2d0 = addToWorld(mode 1, flags 0) and wrapper+0x40 = 1;
+//   slot +0x80 0xa7f300 = removeFromWorld and wrapper+0x40 = 0; slot +0x38 0xa7ed70 rebuilds
+//   the system and re-adds it only when wrapper+0x40 is already set.
+
+struct SysRec {
+    u32 adds = 0, removes = 0, rebuilds = 0;
+    bool in_world = false;
+    u32 n = 0, flags = 0;
+    float pos[3] = {};
+    double t = 0.0;
+    std::string map;
+};
+std::unordered_map<u64, SysRec> g_systems;  // by hknpPhysicsSystem
+std::unordered_map<u64, SysRec> g_wrappers; // by the game's wrapper (rebuild calls)
+u64 st_sys_add = 0, st_sys_add_mode = 0, st_sys_remove = 0, st_rebuild = 0;
+
+void SysInfo(u64 sys, SysRec& r) {
+    u8 h[0x30];
+    if (!SafeCopy(h, sys, sizeof(h))) {
+        return;
+    }
+    const u64 world = Le64(h + 0x18), ids = Le64(h + 0x20);
+    r.n = Le32(h + 0x28);
+    u32 id0 = 0;
+    u64 data;
+    s32 size;
+    BodyBytes bb;
+    if (r.n == 0 || r.n > 4096 || !Rd(ids, id0) || !BodyArray(world, data, size) ||
+        id0 >= u32(size) || !SafeCopy(bb.b, data + u64(id0) * 0x90, 0x90)) {
+        return;
+    }
+    r.flags = bb.Flags();
+    for (int k = 0; k < 3; ++k) {
+        r.pos[k] = bb.Pos(k);
+    }
+}
+
+void OnSysAdd(u64 sys, s32 mode) {
+    std::scoped_lock lk{g_mutex};
+    auto& r = g_systems[sys];
+    ++r.adds;
+    ++st_sys_add;
+    st_sys_add_mode += mode != 1;
+    r.in_world = true;
+    r.t = Now();
+    r.map = g_map;
+    SysInfo(sys, r);
+}
+
+void OnSysRemove(u64 sys) {
+    std::scoped_lock lk{g_mutex};
+    auto& r = g_systems[sys];
+    ++r.removes;
+    ++st_sys_remove;
+    r.in_world = false;
+    r.t = Now();
+    r.map = g_map;
+    SysInfo(sys, r);
+}
+
+void OnRebuild(u64 wrapper) {
+    std::scoped_lock lk{g_mutex};
+    auto& r = g_wrappers[wrapper];
+    ++r.rebuilds;
+    ++st_rebuild;
+    r.t = Now();
+    r.map = g_map;
+}
+
+std::string SysText(const SysRec& r) {
+    return fmt::format("({:.1f}, {:.1f}, {:.1f}) {} bodies {} [{}]", r.pos[0], r.pos[1], r.pos[2],
+                       r.n, Motion(r.flags), r.map);
+}
+
+// The game's wrappers seen rebuilding a system whose "in world" byte is still 0, and systems
+// removed and not added again.
+void SystemsReport(double now) {
+    std::vector<std::string> removed, idle;
+    u32 in_world = 0;
+    for (const auto& [sys, r] : g_systems) {
+        if (r.in_world) {
+            ++in_world;
+        } else {
+            removed.push_back(SysText(r) + fmt::format(" removed {:.0f} s ago", now - r.t));
+        }
+    }
+    for (auto& [wrapper, r] : g_wrappers) {
+        u8 flag = 1;
+        u64 sys = 0;
+        if (!Rd(wrapper + 0x40, flag) || !Rd(wrapper + 0x18, sys) || flag != 0 || sys == 0) {
+            continue;
+        }
+        const auto it = g_systems.find(sys);
+        if (it != g_systems.end() && it->second.in_world) {
+            continue;
+        }
+        SysInfo(sys, r);
+        idle.push_back(SysText(r) + fmt::format(" (rebuilt {} times, never added)", r.rebuilds));
+    }
+    LOG_INFO(Core,
+             "[objcol] map {} visit #{} (+{:.0f} s): physics systems addToWorld {} (mode != 1: "
+             "{}), removeFromWorld {}, in the world now {} | removed and not added again {}: {} "
+             "| game wrappers rebuilt but not in the world {}: {}",
+             g_map, g_map_visit, now - g_map_open, st_sys_add, st_sys_add_mode, st_sys_remove,
+             in_world, removed.size(), Join(removed, 30), idle.size(), Join(idle, 30));
+}
+
+// ---------------------------------------------------------------- BB_OBJCOL_FIX
+// The world step (0xb597d0, timer "StAddBodies") commits the pending (mode 2) adds of
+// [world+0xb8]/[world+0xc0] and [world+0xc8]/[world+0xd0] unconditionally, as 0xb56360 does.
+// A world that holds pending adds for 2 s without them changing is not being stepped: at the
+// entry of the game's physics command flush (0x1806e90, which itself calls addBodies /
+// removeBodies on that world, so the world is not being stepped there) the game's own commit
+// 0xb56360(world) is called for it.
+
+bool IsPtr(u64 v);
+
+u64 g_commit = 0;
+struct PendingWatch {
+    u32 c0 = 0, d0 = 0;
+    double since = -1.0;
+};
+std::unordered_map<u64, PendingWatch> g_pending_watch;
+u64 st_flush = 0, st_fix_commits = 0;
+
+void OnFlush(u64 fd4) {
+    u64 world = 0;
+    if (!Rd(fd4 + 8, world) || !IsPtr(world)) {
+        return;
+    }
+    u32 counts[5];
+    if (!SafeCopy(counts, world + 0xc0, sizeof(counts))) {
+        return;
+    }
+    const u32 c0 = counts[0], d0 = counts[4];
+    bool commit = false;
+    double age = 0.0;
+    {
+        std::scoped_lock lk{g_mutex};
+        ++st_flush;
+        auto& pw = g_pending_watch[world];
+        const double now = Now();
+        if (c0 == 0 && d0 == 0) {
+            pw = PendingWatch{};
+            return;
+        }
+        if (pw.since < 0.0 || pw.c0 != c0 || pw.d0 != d0) {
+            pw = PendingWatch{c0, d0, now};
+            return;
+        }
+        age = now - pw.since;
+        if (!g_fix || g_commit == 0 || age < 2.0) {
+            return;
+        }
+        commit = true;
+        pw = PendingWatch{};
+        ++st_fix_commits;
+    }
+    if (commit) {
+        LOG_INFO(Core,
+                 "[objcol-fix] world {:#x}: {} + {} pending body adds unchanged for {:.1f} s (not "
+                 "stepped); calling the game's commit eboot+{:#x} from the physics command flush",
+                 world, c0, d0, age, g_commit - g_eboot);
+        using CommitFn = void(PS4_SYSV_ABI*)(u64);
+        reinterpret_cast<CommitFn>(g_commit)(world);
+    }
+}
+
 void MapTick(double now) {
     if (now - g_map_tick < 1.0) {
         return;
@@ -1144,10 +1326,12 @@ void MapTick(double now) {
     if (g_map_open >= 0.0 && !g_cmp30 && now - g_map_open >= 30.0) {
         g_cmp30 = true;
         CompareMap(now);
+        SystemsReport(now);
     }
     if (g_map_open >= 0.0 && !g_cmp90 && now - g_map_open >= 90.0) {
         g_cmp90 = true;
         CompareMap(now);
+        SystemsReport(now);
     }
 }
 
@@ -1669,6 +1853,34 @@ void PS4_SYSV_ABI HookProxy(const u64* regs) {
     GuardedProxy(regs);
 }
 
+void PS4_SYSV_ABI HookSysAdd(const u64* regs) {
+    try {
+        OnSysAdd(regs[5], s32(regs[6]));
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookSysRemove(const u64* regs) {
+    try {
+        OnSysRemove(regs[5]);
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookRebuild(const u64* regs) {
+    try {
+        OnRebuild(regs[5]);
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookFlush(const u64* regs) {
+    try {
+        OnFlush(regs[5]);
+    } catch (...) {
+    }
+}
+
 // ---------------------------------------------------------------- detours
 
 // addBodies: prologue (20 bytes relocated), argument spills, test edx / test ecx, the
@@ -1701,6 +1913,55 @@ constexpr int SigProxy[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41
                             0xff, 0xff, 0x49, 0x89, 0xfc, 0x48, 0x8b, 0x05, W,    W,    W,    W,
                             0x48, 0x8b, 0x00, 0x48, 0x89, 0x45, 0xd0};
 constexpr u32 ProxyPrologue = 20;
+
+// hknpPhysicsSystem::addToWorld (14 relocated) / removeFromWorld (18 relocated).
+constexpr int SigSysAdd[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                             0x41, 0x54, 0x53, 0x50, 0x41, 0x89, 0xd7, 0x89, 0x75, 0xd4,
+                             0x49, 0x89, 0xfd, 0x45, 0x8b, 0x75, 0x28, 0x31, 0xdb, 0x41,
+                             0xbc, 0x00, 0x00, 0x00, 0x00, 0x45, 0x85, 0xf6, 0x0f, 0x84};
+constexpr u32 SysAddPrologue = 14;
+constexpr int SigSysRemove[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                0x41, 0x54, 0x53, 0x49, 0x89, 0xff, 0x45, 0x8b,
+                                0x67, 0x28, 0x31, 0xdb, 0x45, 0x85, 0xe4, 0x74};
+constexpr u32 SysRemovePrologue = 18;
+// The game's physics-system wrapper: rebuild (slot +0x38, 17 relocated), addToWorld (+0x78),
+// removeFromWorld (+0x80); vtable 0x52978a0 in 1.09.
+constexpr int SigRebuild[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec,
+    0x38, 0xc5, 0xfa, 0x11, 0x45, 0xac, 0x49, 0x89, 0xfd, 0x48, 0x8b, 0x05, W,    W,    W,    W,
+    0x48, 0x8b, 0x00, 0x48, 0x89, 0x45, 0xd0, 0x48, 0xc7, 0x45, 0xc0, 0x00, 0x00, 0x00, 0x00};
+constexpr u32 RebuildPrologue = 17;
+constexpr int SigAddWrap[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb,
+                              0x48, 0x8b, 0x7b, 0x18, 0xbe, 0x01, 0x00, 0x00, 0x00,
+                              0x31, 0xd2, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xe8, W,
+                              W,    W,    W,    0xc6, 0x43, 0x40, 0x01};
+constexpr int SigRemoveWrap[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b,
+                                 0x7b, 0x18, 0xe8, W,    W,    W,    W,    0xc6, 0x43, 0x40, 0x00};
+constexpr u64 WrapperVtable = 0x52978a0;
+// The game's physics command flush (20 relocated); its addBodies call at +0x242.
+constexpr int SigFlush[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+                            0x53, 0x48, 0x81, 0xec, 0xe8, 0x00, 0x00, 0x00, 0x49, 0x89, 0xfc, 0x48,
+                            0x8b, 0x1d, W,    W,    W,    W,    0x48, 0x8b, 0x03, 0x48, 0x89, 0x45,
+                            0xd0, 0x49, 0x83, 0x7c, 0x24, 0x08, 0x00, 0x0f, 0x84, W,    W,    W,
+                            W,    0x48, 0xc7, 0x85, 0xf8, 0xfe, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
+constexpr u32 FlushPrologue = 20, FlushAddCall = 0x242;
+// hknpWorld commit of the pending adds 0xb56360: two addBodies calls at +0x26 / +0x4e.
+constexpr int SigCommit[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xfb, 0x8b, 0x93, 0xc0, 0x00, 0x00, 0x00,
+    0x85, 0xd2, 0x74, 0x17, 0x48, 0x8b, 0xb3, 0xb8, 0x00, 0x00, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x00,
+    0x45, 0x31, 0xc0, 0x48, 0x89, 0xdf, 0xe8, W,    W,    W,    W,    0x4c, 0x8d, 0x73, 0x10, 0x8b,
+    0x93, 0xd0, 0x00, 0x00, 0x00, 0x85, 0xd2, 0x74, 0x1a, 0x48, 0x8b, 0xb3, 0xc8, 0x00, 0x00, 0x00,
+    0xb9, 0x01, 0x00, 0x00, 0x00, 0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x89, 0xdf, 0xe8, W,
+    W,    W,    W,    0x4c, 0x89, 0xf7, 0x5b, 0x41, 0x5e, 0x5d, 0xe9};
+
+s64 CallTarget(const u8* img, u64 at) {
+    if (img[at] != 0xe8) {
+        return -1;
+    }
+    s32 d;
+    std::memcpy(&d, img + at + 1, 4);
+    return s64(at) + 5 + d;
+}
 
 // lea rax,[rip+d] within [from, to) of the image whose target is the given string.
 bool LeaToString(const u8* img, u64 size, u64 from, u64 to, const char* str) {
@@ -1974,6 +2235,68 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
              "map' (per map), '[objcol] player' (position and bodies within 3 m)",
              *add, *rem, player, WorldChrManVaddr,
              g_wcm ? "validated" : "not validated (no player position)");
+
+    // Object physics systems, the game's wrapper and its command flush (every relocated byte and
+    // every call target compared first; any mismatch: that part is not hooked).
+    u8* cave_b = static_cast<u8*>(AllocExec(4096));
+    u8* next = cave_b;
+    const auto place = [&](const std::vector<u8>& c) {
+        u8* at = next;
+        std::memcpy(at, c.data(), c.size());
+        next += (c.size() + 15) & ~size_t(15);
+        return at;
+    };
+    const auto hook = [&](u64 off, u64 host, u32 len) {
+        u8* at = reinterpret_cast<u8*>(eboot_base + off);
+        Detour(at, place(BuildCave(host, at, len, reinterpret_cast<u64>(at + len))));
+    };
+    const auto sys_add = Find(img, code, SigSysAdd, std::size(SigSysAdd));
+    const auto sys_rem = Find(img, code, SigSysRemove, std::size(SigSysRemove));
+    const auto rebuild = Find(img, code, SigRebuild, std::size(SigRebuild));
+    const auto add_wrap = Find(img, code, SigAddWrap, std::size(SigAddWrap));
+    const auto rem_wrap = Find(img, code, SigRemoveWrap, std::size(SigRemoveWrap));
+    const auto flush = Find(img, code, SigFlush, std::size(SigFlush));
+    const auto commit = Find(img, code, SigCommit, std::size(SigCommit));
+    // Called before the relocations: a slot holds 0 (RELA), the offset or the address.
+    const auto slot_is = [&](u32 off, std::optional<u64> fn) {
+        u64 v = 1;
+        if (fn && WrapperVtable + off + 8 <= image_size) {
+            std::memcpy(&v, img + WrapperVtable + off, 8);
+        }
+        return fn && (v == 0 || v == *fn || v == eboot_base + *fn);
+    };
+    std::string objs;
+    const bool sys_ok = cave_b && sys_add && sys_rem && rebuild && add_wrap && rem_wrap &&
+                        CallTarget(img, *add_wrap + 25) == s64(*sys_add) &&
+                        CallTarget(img, *rem_wrap + 13) == s64(*sys_rem) &&
+                        slot_is(0x38, rebuild) && slot_is(0x78, add_wrap) &&
+                        slot_is(0x80, rem_wrap);
+    if (sys_ok) {
+        hook(*sys_add, reinterpret_cast<u64>(&HookSysAdd), SysAddPrologue);
+        hook(*sys_rem, reinterpret_cast<u64>(&HookSysRemove), SysRemovePrologue);
+        hook(*rebuild, reinterpret_cast<u64>(&HookRebuild), RebuildPrologue);
+        objs = fmt::format("hknpPhysicsSystem::addToWorld eboot+{:#x} / removeFromWorld "
+                           "eboot+{:#x}, wrapper rebuild eboot+{:#x} hooked",
+                           *sys_add, *sys_rem, *rebuild);
+    } else {
+        objs = "physics-system hooks off (signature, call target or vtable check failed)";
+    }
+    const bool commit_ok = commit && CallTarget(img, *commit + 38) == s64(*add) &&
+                           CallTarget(img, *commit + 78) == s64(*add);
+    const bool flush_ok = cave_b && flush && CallTarget(img, *flush + FlushAddCall) == s64(*add);
+    if (flush_ok) {
+        hook(*flush, reinterpret_cast<u64>(&HookFlush), FlushPrologue);
+        if (commit_ok) {
+            g_commit = eboot_base + *commit;
+        }
+    }
+    LOG_INFO(Core,
+             "[objcol] {}; physics command flush {} ; pending-add commit {}; BB_OBJCOL_FIX {}",
+             objs, flush_ok ? fmt::format("eboot+{:#x} hooked", *flush) : std::string("not hooked"),
+             commit_ok ? fmt::format("eboot+{:#x}", *commit) : std::string("not found"),
+             g_fix ? (g_commit ? "on (commits pending adds a world holds for 2 s unstepped)"
+                               : "requested but the commit or flush check failed: off")
+                   : "off");
 }
 
 } // namespace BB::ObjCol
