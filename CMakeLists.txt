@@ -1055,6 +1055,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+	# The NVIDIA product path (pipelineCache.cpp: wave64 split into two 32-wide subgroups) on the wave64 cases.
+	add_test(NAME shader_recompiler_wave64_split
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave64-only)
+	set_tests_properties(shader_recompiler_wave64_split PROPERTIES ENVIRONMENT "KYTY_TEST_WAVE64_SPLIT=1")
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
