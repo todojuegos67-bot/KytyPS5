@@ -198,6 +198,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 	vk::PhysicalDevice best_device       = nullptr;
 	uint32_t           best_queue_family = static_cast<uint32_t>(-1);
+	bool               best_discrete     = false;
+	vk::DeviceSize     best_local        = 0;
 
 	for (const auto& device: devices) {
 		bool skip_device = false;
@@ -436,10 +438,18 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
-		if (best_device == nullptr ||
-		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		// A discrete GPU first, then the most device-local memory, the first on a tie: the launcher shows and stamps
+		// the card with the most dedicated memory (wolverineLauncher.cpp), and it was the last discrete one here.
+		const bool     discrete = device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+		vk::DeviceSize local    = 0;
+		for (const auto& heap: device.getMemoryProperties().memoryHeaps) {
+			if (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal) local = std::max(local, heap.size);
+		}
+		if (best_device == nullptr || (discrete && !best_discrete) || (discrete == best_discrete && local > best_local)) {
 			best_device       = device;
 			best_queue_family = queue_family;
+			best_discrete     = discrete;
+			best_local        = local;
 		}
 	}
 

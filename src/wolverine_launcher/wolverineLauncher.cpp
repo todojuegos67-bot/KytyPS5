@@ -207,12 +207,25 @@ WolverineLauncher::WolverineLauncher(QWidget* parent)
 	resize(1500, 960);
 
 #if defined(_WIN32)
-	// The graphics card the game runs on: the high-performance one, as Windows' graphics settings order them.
+	// The graphics card the game runs on without --gpu: the one with the most dedicated memory, the first on a tie, as
+	// the emulator picks it (vulkanWindow.cpp: discrete first, then the most device-local memory).
 	IDXGIFactory6* factory = nullptr;
 	if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory6), reinterpret_cast<void**>(&factory)))) {
 		IDXGIAdapter1* adapter = nullptr;
-		if (SUCCEEDED(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, __uuidof(IDXGIAdapter1),
-		                                                   reinterpret_cast<void**>(&adapter)))) {
+		SIZE_T         most    = 0;
+		IDXGIAdapter1* next    = nullptr;
+		for (UINT i = 0; factory->EnumAdapters1(i, &next) != DXGI_ERROR_NOT_FOUND; ++i) {
+			DXGI_ADAPTER_DESC1 desc {};
+			next->GetDesc1(&desc);
+			if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 && (adapter == nullptr || desc.DedicatedVideoMemory > most)) {
+				if (adapter != nullptr) adapter->Release();
+				adapter = next;
+				most    = desc.DedicatedVideoMemory;
+			} else {
+				next->Release();
+			}
+		}
+		if (adapter != nullptr) {
 			DXGI_ADAPTER_DESC1 desc {};
 			adapter->GetDesc1(&desc);
 			m_gpu.name   = QString::fromWCharArray(desc.Description);
