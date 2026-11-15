@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -23,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -65,6 +67,9 @@ constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 448ull * 1024ull * 1024ull;
 // for each of the CPU, GPU and AMM tables come off the top; flexible and direct memory share what
 // is left. One 4 KiB table maps 2 MiB.
 constexpr uint64_t GUEST_MEMORY_BUDGET   = 12800ull * 1024ull * 1024ull;
+// Marvel's Wolverine holds about 13,700 MiB of direct memory in Pro mode before it has finished booting, and base mode
+// takes up to 160 MiB more after that point.
+constexpr uint64_t TRINITY_EXTRA_MEMORY  = 1536ull * 1024ull * 1024ull;
 constexpr uint64_t RESERVED_CACHE_SIZE   = 64ull * 1024ull * 1024ull;
 constexpr uint64_t INCLUDED_TABLE_MEMORY = 64ull * 1024ull * 1024ull;
 constexpr uint64_t MAPPING_TABLE_SIZE    = 4ull * 1024ull;
@@ -87,14 +92,18 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return Graphics::GuestRange {vaddr, size}.Valid();
 }
 
+static void MarkFreshGpuRange(uint64_t vaddr, uint64_t size); // lean's known zero (memoryLean.inc)
+
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(true, vaddr, size);
 #endif
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		MarkFreshGpuRange(vaddr, size);
 		return;
 	}
 	GetGpuResources().MapMemory(vaddr, size);
+	MarkFreshGpuRange(vaddr, size);
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -178,6 +187,10 @@ static std::atomic<uint64_t> g_test_free_range_visits {0};
 // callback or a guest memory access. Readers outside an operation take the state lock shared.
 static std::recursive_mutex g_memory_operation_mutex;
 static std::shared_mutex    g_memory_state_mutex;
+
+// Lean (438cb01c5): set by the emulator before the memory subsystem starts (EnableFirstTouchCommit); the unit tests
+// install no fault handler.
+static bool g_first_touch_commit = false;
 
 #include "memoryAddressSpace.inc"
 
@@ -386,14 +399,39 @@ public:
 		return true;
 	}
 
-	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+	// Lean (7ab7e1b55): through_reserved counts reserved ranges too, for buffer views over the game's lazily committed
+	// pools. Lean (cf9ae2a9f): answers are remembered until a range under them changes.
+	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size, bool through_reserved = false) {
+		const auto counts = [through_reserved](VirtualRangeType type) {
+			return through_reserved || IsCommittedRangeType(type);
+		};
+
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
 
+		// The GPU thread asks the same few views every draw (Marvel's Wolverine's geometry pool with the game's lazy
+		// commit: a 2.7 GB view over hundreds of ranges, ~6 ms a frame walked each time). The answer depends only on the
+		// ranges overlapping [virtual_addr, virtual_addr + size), and every change to one forgets it (UpdatePageTableEntries).
+		// Readers share the state lock, so the memo has a lock of its own; a change holds the state lock exclusively, so no
+		// reader stores an answer from before it.
+		const auto slot = ((virtual_addr >> 16u) ^ (size >> 12u) ^ (through_reserved ? 1u : 0u)) % m_clamp_memo.size();
+		{
+			std::lock_guard memo_lock(m_clamp_memo_mutex);
+			const auto&     memo = m_clamp_memo[slot];
+			if (memo.valid && memo.vaddr == virtual_addr && memo.size == size && memo.through_reserved == through_reserved) {
+				return memo.result;
+			}
+		}
+		const auto remember = [&](uint64_t result) {
+			std::lock_guard memo_lock(m_clamp_memo_mutex);
+			m_clamp_memo[slot] = {virtual_addr, size, result, through_reserved, true};
+			return result;
+		};
+
 		auto vma = FindContaining(virtual_addr);
-		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
-			return 0;
+		if (vma == m_ranges.end() || !counts(vma->second.type)) {
+			return remember(0);
 		}
 		const auto vma_end = End(vma->second.start, vma->second.size);
 
@@ -402,14 +440,14 @@ public:
 		++vma;
 
 		while (vma != m_ranges.end() && vma->second.start == expected &&
-		       IsCommittedRangeType(vma->second.type) && clamped_size < size) {
+		       counts(vma->second.type) && clamped_size < size) {
 			const auto chunk = std::min(size - clamped_size, vma->second.size);
 			clamped_size += chunk;
 			expected += chunk;
 			++vma;
 		}
 
-		return clamped_size;
+		return remember(clamped_size);
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -454,6 +492,15 @@ private:
 	}
 
 	void UpdatePageTableEntries(const Range& range, bool add) {
+		// Every change to m_ranges comes through here (insert, erase, split, merge, replace): forget the clamps it touches.
+		{
+			std::lock_guard memo_lock(m_clamp_memo_mutex);
+			for (auto& memo: m_clamp_memo) {
+				if (memo.valid && VirtualRangesOverlap(range.start, range.size, memo.vaddr, memo.size)) {
+					memo.valid = false;
+				}
+			}
+		}
 		if (!IsCommittedRangeType(range.type)) {
 			return;
 		}
@@ -590,6 +637,15 @@ private:
 	RangeMap m_ranges;
 	uint64_t m_cpu_page_table_entries = 0;
 	uint64_t m_gpu_page_table_entries = 0;
+	struct ClampMemo {
+		uint64_t vaddr            = 0;
+		uint64_t size             = 0;
+		uint64_t result           = 0;
+		bool     through_reserved = false;
+		bool     valid            = false;
+	};
+	std::array<ClampMemo, 32> m_clamp_memo {}; // ClampRangeSize's last answers, under m_clamp_memo_mutex
+	std::mutex                m_clamp_memo_mutex;
 };
 
 static void RemoveFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start, uint64_t size) {
@@ -797,7 +853,16 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	if (!g_guest_address_space->TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	// The backing view bypasses the page protection that ends the known-zero state (MarkFreshGpuRange).
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		GetGpuResources().GetBufferCache().UnmarkMemoryZero(vaddr, size);
+	}
+	// It bypasses the image heap's page watch too.
+	if (g_gpu_resources != nullptr) GetGpuResources().GetGuestImageHeap().InvalidateMemory(vaddr, size);
+	return true;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -852,8 +917,11 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
+	CommitGuestRange(vaddr, size); // a kernel-mode read into a reserved page fails instead of faulting
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
+
+#include "memoryLean.inc"
 
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
@@ -923,6 +991,7 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 	auto       failure_reason = GuestBackingStore::FailureReason::None;
 	if (g_guest_address_space->MapBacking(alias, PageSize, PageSize, VirtualMemory::Mode::ReadWrite,
 	                                      &failure_reason)) {
+		g_guest_address_space->CommitGuestRange(alias, PageSize); // written before the loader installs the fault handler
 		auto* ptr = reinterpret_cast<uint64_t*>(alias);
 		*ptr      = 0x4b59545953553634ull; // "KYTYSU64"
 		ok        = (*ptr == 0x4b59545953553634ull);
@@ -955,7 +1024,7 @@ void Initialize() {
 	                            std::max(params.amm_table_memory, INCLUDED_TABLE_MEMORY) -
 	                            3 * INCLUDED_TABLE_MEMORY;
 	const auto memory_budget = GUEST_MEMORY_BUDGET +
-	                           (Loader::SystemContentIsTrinityMode() ? 1216ull * 1024ull * 1024ull : 0);
+	                           (Loader::SystemContentIsTrinityMode() ? TRINITY_EXTRA_MEMORY : 0);
 	EXIT_IF(g_flexible_memory_size + table_overhead >= memory_budget - RESERVED_CACHE_SIZE);
 	g_guest_memory_size = memory_budget - RESERVED_CACHE_SIZE - table_overhead;
 	LOGF("\t flexible memory size = %" PRIu64 " MiB, direct memory size = %" PRIu64 " MiB\n",
@@ -963,6 +1032,10 @@ void Initialize() {
 	     (g_guest_memory_size - g_flexible_memory_size) / (1024ull * 1024ull));
 
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
+	g_guest_address_space->SetMakeReady(MakeGranuleReady);
+	LOGF("\t direct-memory backing: %s\n", g_guest_address_space->IsFirstTouch()
+	                                             ? "reserved, committed on first touch (KYTY_FIRST_TOUCH=0: all at start)"
+	                                             : "committed at start");
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();
@@ -2904,15 +2977,32 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	// Reserved ranges and holes have nothing to protect.
 	std::vector<VirtualRanges::Range> ranges;
 	g_virtual_ranges->QueryFragments(aligned_addr, aligned_len, &ranges);
-	std::lock_guard state(g_memory_state_mutex);
-	for (const auto& range: ranges) {
-		if (!IsCommittedRangeType(range.type)) continue;
-		if (!g_guest_address_space->Protect(range.start, range.size, mode)) {
-			EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-			     " prot=0x%08x\n",
-			     range.start, range.size, prot);
+	// Lean (c7f883880): against make-ready (lazy protection), which must not apply the old mode after this protect.
+	std::lock_guard guest_protect(g_guest_protect_mutex);
+	{
+		std::lock_guard state(g_memory_state_mutex);
+		for (const auto& range: ranges) {
+			if (!IsCommittedRangeType(range.type)) continue;
+			if (!g_guest_address_space->Protect(range.start, range.size, mode)) {
+				EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+				     " prot=0x%08x\n",
+				     range.start, range.size, prot);
+			}
+			g_virtual_ranges->Protect(range.start, range.size, prot);
 		}
-		g_virtual_ranges->Protect(range.start, range.size, prot);
+	}
+	// Lean (00504e03a): the guest's protection replaced the write protection that ends the known-zero state. Lean
+	// (19d201826): it also replaced the tracker's on watched pages, whose CPU accesses would stop faulting. After the
+	// state block (no graphics call under the state lock), still under g_guest_protect_mutex.
+	if (g_gpu_resources != nullptr) {
+		for (const auto& range: ranges) {
+			if (IsCommittedRangeType(range.type) && IsGpuAddressRange(range.start, range.size)) {
+				GetGpuResources().GetBufferCache().UnmarkMemoryZero(range.start, range.size);
+				if (mode != VirtualMemory::Mode::NoAccess) {
+					GetGpuResources().ResyncHostProtection(range.start, range.size);
+				}
+			}
+		}
 	}
 	return OK;
 }

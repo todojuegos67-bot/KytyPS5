@@ -132,13 +132,45 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// As TryReadBacking, but may see a concurrent backing write half done: for a reader that checks what it read later.
+bool                   TryReadBackingCached(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: the backing bytes of [vaddr, vaddr + size) when one mapping holds them and no GPU work has written any of
+// them, else nullptr: TryReadBufferBacking's bytes without its per-read lookups. Current until the GPU thread marks
+// them GPU-written or the guest remaps them.
+[[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// GPU thread: the bytes of [vaddr, vaddr + size) from the backing when they lie on a page a shader wrote but no shader
+// wrote them: a read by pointer would fault and read the page back. False otherwise (read them by pointer).
+bool TryReadGpuCleanBytes(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+// The part of [vaddr, vaddr + size) that is guest memory without a gap: committed ranges only, or with through_reserved
+// reserved ranges too (unmapped pages there read as zero), stopping where the address space is free.
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+[[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool through_reserved);
+// True when all of [vaddr, vaddr + size) is committed guest memory; for an address read from data that may be stale.
+[[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// The direct-memory section reserved and committed on first touch (Windows); call before the memory subsystem starts.
+void EnableFirstTouchCommit();
+// The fault path: true when the access touched a part of the section not committed yet (it is committed now).
+[[nodiscard]] bool CommitOnFault(uint64_t vaddr) noexcept;
+[[nodiscard]] bool HandleFirstTouch(uint64_t vaddr, bool write, bool execute) noexcept;
+// Before a kernel-mode copy to or from guest memory (file and socket I/O): commits the section under the range.
+void CommitGuestRange(uint64_t vaddr, uint64_t size);
+struct FirstTouchStats {
+	bool     enabled         = false;
+	uint64_t committed_bytes = 0;
+	uint64_t faults          = 0;
+};
+[[nodiscard]] FirstTouchStats GetFirstTouchStats();
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
+// Frees the address room below 1 TB kept for the GPU driver when DLSS is asked for; right before the Vulkan device.
+void                   ReleaseDriverAddressRoom();
+// Known-zero marking (MarkFreshGpuRange) needs the fault handler that ends it: before the loader
+// installs it, a host write to a write-protected fresh page would be fatal.
+void                   EnableKnownZero() noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
@@ -214,9 +246,12 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
+void     TestSetGpuZeroCallback(void (*callback)(bool marked, uint64_t addr, size_t size));
+void     TestForgetMappedPages();
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
+const char* TestFirstTouchStore();
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();

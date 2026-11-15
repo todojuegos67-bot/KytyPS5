@@ -12,6 +12,12 @@ static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
 
+// The room below 1 TB kept for the GPU driver's CUDA side when DLSS is asked for (ReserveGuestRegions), held until the
+// Vulkan device is made (ReleaseDriverAddressRoom).
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static void* g_driver_room = nullptr;
+#endif
+
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
 	const auto range_end = base + range_size;
@@ -35,10 +41,17 @@ public:
 		AddressRangeUnavailable,
 	};
 
-	explicit GuestBackingStore(uint64_t size): m_size(size) {
+	explicit GuestBackingStore(uint64_t size, [[maybe_unused]] bool first_touch = false): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		// Lean (438cb01c5): SEC_COMMIT charges the whole section to the commit limit at start, ~5 GB of it never touched by
+		// a game. With first touch it is reserved, and each CommitGranule is committed when first touched (CommitOnFault),
+		// when a range is protected (ProtectViews) or before a kernel-mode copy (CommitViews).
+		m_first_touch = first_touch;
+		m_committed   = std::make_unique<std::atomic<uint64_t>[]>((m_size / CommitGranule + 64u) / 64u);
+		m_ready       = std::make_unique<std::atomic<uint64_t>[]>((m_size / CommitGranule + 64u) / 64u);
+		m_readying    = std::make_unique<std::atomic<uint64_t>[]>((m_size / CommitGranule + 64u) / 64u);
+		m_handle      = CreateFileMappingA(
+		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | (m_first_touch ? SEC_RESERVE : SEC_COMMIT),
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory: 0x%08" PRIx32
@@ -115,6 +128,23 @@ public:
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_first_touch) {
+			// A granule not committed yet reads 0 when it is; writing it would commit it.
+			const auto end = backing_offset + size;
+			for (auto offset = backing_offset; offset < end;) {
+				const auto granule_end = std::min(end, (offset / CommitGranule + 1u) * CommitGranule);
+				if (IsCommitted(offset / CommitGranule)) {
+					std::memset(m_backing_base + offset, 0, granule_end - offset);
+				}
+				offset = granule_end;
+			}
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+			g_test_backing_bytes_zeroed += size;
+#endif
+			return;
+		}
+#endif
 		std::memset(m_backing_base + backing_offset, 0, size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		g_test_backing_bytes_zeroed += size;
@@ -158,6 +188,25 @@ public:
 		return true;
 	}
 
+	// Lean (ca980f90f): the backing bytes of [vaddr, vaddr + size) when contiguous backing holds all of them, else
+	// nullptr. Needs no lock, as IsBacked; the bytes stay this range's until the guest remaps it.
+	[[nodiscard]] const uint8_t* FindBacking(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		const auto first = vaddr >> PageBits;
+		const auto entry = LoadPage(first);
+		if (entry == 0) {
+			return nullptr;
+		}
+		for (auto page = first + 1u; page <= (vaddr + size - 1u) >> PageBits; ++page) {
+			if (LoadPage(page) != entry + (page - first)) {
+				return nullptr;
+			}
+		}
+		return m_backing_base + (uint64_t {entry - 1u} << PageBits) + (vaddr & PageMask);
+	}
+
 	template <typename Gap>
 	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) const {
 		auto* destination = static_cast<uint8_t*>(data);
@@ -170,6 +219,249 @@ public:
 			    gap(start, destination + (start - vaddr), bytes);
 		    });
 	}
+
+	// Lean's known-zero bookkeeping (494a5d9fa, 00504e03a, 10d1948a0), changed with the page table in MapFixed, Unmap and
+	// UnmapOne; callers hold the state lock exclusively, as for mapping.
+	// The runs of [vaddr, vaddr + size) whose backing pages, below backing_limit, no mapping had before
+	// theirs: they read as zeros until written. Each run is returned once.
+	std::vector<std::pair<uint64_t, uint64_t>> TakeFreshRuns(uint64_t vaddr, uint64_t size,
+	                                                         uint64_t backing_limit) {
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		std::erase_if(m_fresh, [&](const MapEntry& entry) {
+			const auto begin = std::max(vaddr, entry.vaddr);
+			const auto end   = std::min(vaddr + size, entry.vaddr + entry.size);
+			if (begin >= end) {
+				return false;
+			}
+			if (entry.backing_offset + entry.size <= backing_limit) {
+				runs.emplace_back(begin, end - begin);
+			}
+			return true;
+		});
+		return runs;
+	}
+
+	// The other mappings of the backing pages that [vaddr, vaddr + size) maps.
+	std::vector<std::pair<uint64_t, uint64_t>> FindAliases(uint64_t vaddr, uint64_t size) const {
+		std::vector<std::pair<uint64_t, uint64_t>> aliases;
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return aliases;
+		}
+		// No backing page of the range in a second mapping: nothing to find, without the two walks over all
+		// the mappings (Marvel's Wolverine: ~12,000-19,000 of them, ~0.3 ms a call, ~1,400 calls a second in
+		// the white transition, and none found an alias). The page table gives the range's backing.
+		if (m_map_counts_exact) {
+			bool shared = false;
+			ForEachRun(
+			    vaddr, size,
+			    [&](uint64_t offset, uint64_t, uint64_t bytes) {
+				    for (auto page = offset / MapCountPage; page <= (offset + bytes - 1) / MapCountPage && !shared;
+				         page++) {
+					    shared = page < m_map_counts.size() && m_map_counts[page] > 1;
+				    }
+			    },
+			    [](uint64_t, uint64_t) {});
+			if (!shared) {
+				return aliases;
+			}
+		}
+		for (const auto& [start, entry]: m_maps) {
+			const auto begin = std::max(vaddr, entry.vaddr);
+			const auto end   = std::min(vaddr + size, entry.vaddr + entry.size);
+			if (begin >= end) {
+				continue;
+			}
+			const auto backing_begin = entry.backing_offset + (begin - entry.vaddr);
+			const auto backing_end   = backing_begin + (end - begin);
+			for (const auto& [other_start, other]: m_maps) {
+				if (other.vaddr < vaddr + size && vaddr < other.vaddr + other.size) {
+					continue; // inside the range itself
+				}
+				const auto overlap_begin = std::max(backing_begin, other.backing_offset);
+				const auto overlap_end   = std::min(backing_end, other.backing_offset + other.size);
+				if (overlap_begin < overlap_end) {
+					aliases.emplace_back(other.vaddr + (overlap_begin - other.backing_offset),
+					                     overlap_end - overlap_begin);
+				}
+			}
+		}
+		return aliases;
+	}
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	void TestForgetMappedPages() {
+		std::fill(m_mapped_once.begin(), m_mapped_once.end(), uint64_t {0});
+		m_fresh.clear();
+	}
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Lean (438cb01c5, fb82648a3, 08d26ed16, 4ece93a3f): commit on first touch with lazy protection.
+	static constexpr uint64_t CommitGranule = 2u * 1024u * 1024u;
+
+	[[nodiscard]] bool     IsFirstTouch() const { return m_first_touch; }
+	[[nodiscard]] uint64_t CommittedBytes() const { return m_committed_bytes.load(std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t FirstTouchFaults() const { return m_first_touch_faults.load(std::memory_order_relaxed); }
+
+	// Lazy protection: a granule not committed is reserved, which faults on every access like a protect, so protects skip it
+	// (ProtectCommittedRuns). It is committed through each guest view with PAGE_NOACCESS (a view's own protection; the alias
+	// comes up read-write), then made ready: every view gets the guest's protection and the page tracker's state back
+	// (m_make_ready, set by memory.cpp), with no lock of the store or the state lock held. Until then its views stay
+	// inaccessible, and a fault on them waits for the thread making it ready.
+	using MakeReadyFn = void (*)(uint64_t vaddr, uint64_t size, VirtualMemory::Mode map_mode);
+	void SetMakeReady(MakeReadyFn fn) { m_make_ready = fn; }
+
+	// Commits and makes ready the granules of [backing_offset, +size). Never under the state lock: it waits for another
+	// thread's make-ready, which takes the state lock shared.
+	void EnsureCommitted(uint64_t backing_offset, uint64_t size) {
+		if (!m_first_touch || size == 0 || backing_offset >= m_size || m_size - backing_offset < size) {
+			return;
+		}
+		for (auto granule = backing_offset / CommitGranule; granule <= (backing_offset + size - 1u) / CommitGranule;
+		     ++granule) {
+			CommitGranuleOnce(granule);
+			while (!IsReady(granule)) {
+				if (!MakeReady(granule)) std::this_thread::yield();
+			}
+		}
+	}
+
+	// The guest views and the alias under [vaddr, +size), committed and ready (before a kernel-mode copy, which fails on a
+	// reserved or inaccessible page instead of faulting). The backing comes from the page table, which needs no lock.
+	void CommitViews(uint64_t vaddr, uint64_t size) {
+		if (!m_first_touch || size == 0 || UINT64_MAX - vaddr < size) {
+			return;
+		}
+		uint64_t offset = 0;
+		if (AliasOffset(vaddr, &offset)) {
+			EnsureCommitted(offset, std::min(size, m_size - offset));
+			return;
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		ForEachRun(
+		    vaddr, size, [&](uint64_t backing_offset, uint64_t, uint64_t bytes) { ranges.emplace_back(backing_offset, bytes); },
+		    [](uint64_t, uint64_t) {});
+		for (const auto& [backing_offset, bytes]: ranges) EnsureCommitted(backing_offset, bytes);
+	}
+
+	// First in the exception handler, before the GPU fault path (which takes any fault in a GPU-mapped range for a tracking
+	// fault and retries it). A granule not committed is committed; a view's granule not ready is made ready (or waited for).
+	// The alias never makes ready: emulator code writes it under the state lock shared, and making ready takes the
+	// tracker's region locks and the state lock. False for anything else.
+	bool CommitOnFault(uint64_t vaddr) {
+		uint64_t   offset = 0;
+		const bool alias  = AliasOffset(vaddr, &offset);
+		if (!m_first_touch || (!alias && !ViewOffset(vaddr, &offset))) {
+			return false;
+		}
+		const auto granule = offset / CommitGranule;
+		if (IsReady(granule) || (alias && IsCommitted(granule))) {
+			return false;
+		}
+		if (CommitGranuleOnce(granule)) {
+			m_first_touch_faults.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (!alias) MakeReady(granule);
+		return true;
+	}
+
+	// Protects the runs of committed granules under a view range [vaddr, +size) at backing_offset; skips the rest (reserved).
+	bool ProtectCommittedRuns(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode) {
+		if (!m_first_touch) {
+			return VirtualMemory::Protect(vaddr, size, mode);
+		}
+		bool ok = true;
+		for (uint64_t done = 0; done < size;) {
+			const auto granule = (backing_offset + done) / CommitGranule;
+			const auto bytes   = std::min(size - done, (granule + 1u) * CommitGranule - (backing_offset + done));
+			if (IsCommitted(granule)) {
+				ok = VirtualMemory::Protect(vaddr + done, bytes, mode) && ok;
+			}
+			done += bytes;
+		}
+		return ok;
+	}
+
+	// A guest protect over mapped views: VirtualProtect fails on a reserved page, so only committed granules are protected.
+	// One view per call (VirtualProtect can't cross views): the caller passes one m_mapped region at a time.
+	bool ProtectViews(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		bool ok = true;
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t backing_offset, uint64_t start, uint64_t bytes) {
+			    ok = ProtectCommittedRuns(start, bytes, backing_offset, mode) && ok;
+		    },
+		    [&](uint64_t, uint64_t) { ok = false; });
+		return ok;
+	}
+
+	// Unit tests: a guest view of [offset, +size) anywhere, read-write; whether a granule is ready; no store lock held.
+	uint64_t TestMapView(uint64_t offset, uint64_t size) {
+		const auto place = CommitSharedGranules(offset, size);
+		void*      ptr   = MapViewOfFile3(m_handle, GetCurrentProcess(), nullptr, offset, size, 0, PAGE_READWRITE, nullptr, 0);
+		if (ptr == nullptr) return 0;
+		std::lock_guard lock(m_view_mutex);
+		m_views[reinterpret_cast<uint64_t>(ptr)] = {size, offset, VirtualMemory::Mode::ReadWrite};
+		return reinterpret_cast<uint64_t>(ptr);
+	}
+	void TestUnmapView(uint64_t vaddr) {
+		{
+			std::lock_guard lock(m_view_mutex);
+			m_views.erase(vaddr);
+		}
+		UnmapViewOfFile(reinterpret_cast<void*>(vaddr));
+	}
+	[[nodiscard]] bool TestIsReady(uint64_t granule) const { return IsReady(granule); }
+	bool               TestLocksFree() {
+		if (!m_view_mutex.try_lock()) return false;
+		m_view_mutex.unlock();
+		if (!m_commit_mutex.try_lock()) return false;
+		m_commit_mutex.unlock();
+		return true;
+	}
+
+	bool HandleFirstTouch(uint64_t vaddr, bool write, bool execute) {
+		if (!m_first_touch) {
+			return false;
+		}
+		uint64_t   offset = 0;
+		const bool alias  = AliasOffset(vaddr, &offset);
+		if (!alias && !ViewOffset(vaddr, &offset)) {
+			return false;
+		}
+		const auto granule = offset / CommitGranule;
+		if (!IsCommitted(granule)) {
+			if (CommitGranuleOnce(granule)) {
+				m_first_touch_faults.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (!alias) MakeReady(granule);
+			return true;
+		}
+		if (!alias && !IsReady(granule)) {
+			MakeReady(granule);
+			return true;
+		}
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<void*>(vaddr), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT ||
+		    (info.Protect & PAGE_GUARD) != 0) {
+			return false;
+		}
+		const DWORD p = info.Protect & 0xffu;
+		if (execute) return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE;
+		if (write) return p == PAGE_READWRITE || p == PAGE_EXECUTE_READWRITE;
+		return p != PAGE_NOACCESS && p != 0;
+	}
+#else
+	using MakeReadyFn = void (*)(uint64_t vaddr, uint64_t size, VirtualMemory::Mode map_mode);
+	void                   SetMakeReady(MakeReadyFn) {}
+	void                   EnsureCommitted(uint64_t, uint64_t) {}
+	void                   CommitViews(uint64_t, uint64_t) {}
+	bool                   HandleFirstTouch(uint64_t, bool, bool) { return false; }
+	bool                   CommitOnFault(uint64_t) { return false; }
+	[[nodiscard]] bool     IsFirstTouch() const { return false; }
+	[[nodiscard]] uint64_t CommittedBytes() const { return 0; }
+	[[nodiscard]] uint64_t FirstTouchFaults() const { return 0; }
+#endif
 
 	// Mapping and unmapping hold the state lock exclusively.
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -190,6 +482,7 @@ public:
 		}
 #endif
 		StorePages(vaddr, size, backing_offset);
+		NoteMapUnlocked(vaddr, size, backing_offset, mode);
 		return true;
 	}
 
@@ -213,6 +506,7 @@ public:
 		// protections on the surviving mappings remain intact.
 		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size));
 		ClearPages(vaddr, size);
+		NoteUnmapUnlocked(vaddr, size);
 #endif
 	}
 
@@ -309,7 +603,8 @@ private:
 			MEMORY_BASIC_INFORMATION info {};
 			EXIT_IF(VirtualQuery(reinterpret_cast<void*>(addr), &info, sizeof(info)) == 0);
 			info.RegionSize = std::min<SIZE_T>(info.RegionSize, end - addr);
-			if (info.Protect != GetProtect(mode)) {
+			// Lean (first touch): a granule not committed yet is reserved (Protect 0) and stays so; nothing to re-apply.
+			if (info.State == MEM_COMMIT && info.Protect != GetProtect(mode)) {
 				out->push_back(info);
 			}
 			addr += info.RegionSize;
@@ -365,6 +660,7 @@ private:
 
 		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view.base), view.size));
 		ClearPages(vaddr, size);
+		NoteUnmapUnlocked(vaddr, size); // the survivors' MapFixed below records them again
 		EXIT_IF(left_size != 0 && !SplitPlaceholder(view.base, left_size));
 		EXIT_IF(right_size != 0 && !SplitPlaceholder(vaddr, size));
 		EXIT_IF(left_size != 0 && !MapFixed(view.base, left_size, offset, mode));
@@ -377,6 +673,11 @@ private:
 
 	bool ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                            VirtualMemory::Mode mode, FailureReason* failure_reason) {
+		// Lean (4ece93a3f): held until the view is in m_views.
+		std::unique_lock<std::mutex> place;
+		if (m_first_touch) {
+			place = CommitSharedGranules(backing_offset, size);
+		}
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr =
@@ -390,17 +691,166 @@ private:
 			return false;
 		}
 
-		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, PAGE_NOACCESS)) {
+		// Granules not committed stay reserved (no access until made ready, which applies NoAccess from the guest's mode).
+		if (mode == VirtualMemory::Mode::NoAccess &&
+		    !(m_first_touch ? ProtectCommittedRuns(vaddr, size, backing_offset, mode)
+		                    : ApplyProtection(ptr, size, PAGE_NOACCESS))) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return false;
 		}
+		if (m_first_touch) {
+			std::lock_guard lock(m_view_mutex);
+			m_views[vaddr] = {size, backing_offset, mode};
+		}
 		return true;
 	}
 
-	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t /*size*/) {
+	bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t /*size*/) {
+		if (m_first_touch) {
+			std::lock_guard lock(m_view_mutex);
+			m_views.erase(reinterpret_cast<uint64_t>(vaddr));
+		}
 		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
+	// No granule is first committed while two guest views show it: the commit through one view would show the page in
+	// the other at that view's own protection. So a granule that already has a view is committed (through those views,
+	// NoAccess) before another maps over it, and that one maps over committed memory as before first touch. The lock
+	// returned is held across the map and its insert into m_views, so two maps can't both see no view.
+	std::unique_lock<std::mutex> CommitSharedGranules(uint64_t backing_offset, uint64_t size) {
+		std::unique_lock<std::mutex> place(m_place_mutex);
+		std::vector<uint64_t>        shared;
+		{
+			std::lock_guard lock(m_view_mutex);
+			for (const auto& [vaddr, view]: m_views) {
+				const auto from = std::max(backing_offset, view.backing_offset);
+				const auto to   = std::min(backing_offset + size, view.backing_offset + view.size);
+				for (auto granule = from / CommitGranule; from < to && granule * CommitGranule < to; ++granule) {
+					if (!IsCommitted(granule)) shared.push_back(granule);
+				}
+			}
+		}
+		for (const auto granule: shared) {
+			CommitGranuleOnce(granule);
+		}
+		return place;
+	}
+
+	[[nodiscard]] bool IsCommitted(uint64_t granule) const {
+		return (m_committed[granule / 64u].load(std::memory_order_acquire) >> (granule % 64u) & 1u) != 0;
+	}
+
+	[[nodiscard]] bool IsReady(uint64_t granule) const {
+		return (m_ready[granule / 64u].load(std::memory_order_acquire) >> (granule % 64u) & 1u) != 0;
+	}
+
+	struct ViewPiece {
+		uint64_t            vaddr;
+		uint64_t            size;
+		VirtualMemory::Mode mode;
+	};
+
+	// The guest views over a granule, each clipped to it.
+	std::vector<ViewPiece> ViewsOver(uint64_t granule) {
+		const auto             begin = granule * CommitGranule;
+		const auto             end   = std::min(begin + CommitGranule, m_size);
+		std::vector<ViewPiece> pieces;
+		std::lock_guard        lock(m_view_mutex);
+		for (const auto& [vaddr, view]: m_views) {
+			const auto view_end = view.backing_offset + view.size;
+			if (view.backing_offset < end && begin < view_end) {
+				const auto from = std::max(begin, view.backing_offset);
+				pieces.push_back({vaddr + (from - view.backing_offset), std::min(end, view_end) - from, view.mode});
+			}
+		}
+		return pieces;
+	}
+
+	// Gives a committed granule's views the guest's protection and the tracker's state (m_make_ready), once. False if
+	// another thread is doing it. The caller holds no store lock and is not on the alias path.
+	bool MakeReady(uint64_t granule) {
+		const auto bit = uint64_t {1} << (granule % 64u);
+		if (IsReady(granule)) return true;
+		if ((m_readying[granule / 64u].fetch_or(bit, std::memory_order_acq_rel) & bit) != 0) return false;
+		// After the committed bit: the tracker reads it under its region lock, which m_make_ready takes to read its state.
+		for (const auto& piece: ViewsOver(granule)) {
+			if (m_make_ready != nullptr) {
+				m_make_ready(piece.vaddr, piece.size, piece.mode);
+			} else {
+				VirtualMemory::Protect(piece.vaddr, piece.size, piece.mode);
+			}
+		}
+		m_ready[granule / 64u].fetch_or(bit, std::memory_order_release);
+		return true;
+	}
+
+	// True if this call committed it (false: another thread did first). Through each guest view with PAGE_NOACCESS (the
+	// view's own protection; the alias comes up read-write), so no view is usable before it is made ready.
+	bool CommitGranuleOnce(uint64_t granule) {
+		if (IsCommitted(granule)) {
+			return false;
+		}
+		const auto      pieces = ViewsOver(granule);
+		std::lock_guard lock(m_commit_mutex);
+		if (IsCommitted(granule)) {
+			return false;
+		}
+		const auto offset = granule * CommitGranule;
+		const auto bytes  = std::min(CommitGranule, m_size - offset);
+		for (const auto& piece: pieces) {
+			// A view unmapped since the list fails here; the alias below commits the granule anyway.
+			VirtualAlloc(reinterpret_cast<void*>(piece.vaddr), piece.size, MEM_COMMIT, PAGE_NOACCESS);
+		}
+		if (VirtualAlloc(m_backing_base + offset, bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+			EXIT("Out of memory: Windows could not commit %" PRIu64 " MB of guest memory (error 0x%08" PRIx32
+			     ", %" PRIu64 " MB committed so far).\nClose other programs or enlarge the page file (System > About > "
+			     "Advanced system settings > Performance > Virtual memory).\n",
+			     bytes >> 20u, static_cast<uint32_t>(GetLastError()), CommittedBytes() >> 20u);
+		}
+		m_committed_bytes.fetch_add(bytes, std::memory_order_relaxed);
+		m_committed[granule / 64u].fetch_or(uint64_t {1} << (granule % 64u), std::memory_order_release);
+		if (pieces.empty()) {
+			// No guest view: ready at once (nothing to protect).
+			m_ready[granule / 64u].fetch_or(uint64_t {1} << (granule % 64u), std::memory_order_release);
+		}
+		return true;
+	}
+
+	[[nodiscard]] bool AliasOffset(uint64_t vaddr, uint64_t* offset) const {
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		if (vaddr < base || vaddr - base >= m_size) return false;
+		*offset = vaddr - base;
+		return true;
+	}
+
+	[[nodiscard]] bool ViewOffset(uint64_t vaddr, uint64_t* offset) {
+		std::lock_guard lock(m_view_mutex);
+		auto            it = m_views.upper_bound(vaddr);
+		if (it == m_views.begin()) return false;
+		--it;
+		if (vaddr - it->first >= it->second.size) return false;
+		*offset = it->second.backing_offset + (vaddr - it->first);
+		return true;
+	}
+
+	// The fault path's own table of guest views: filled before MapFixed fills the page table and emptied after it is
+	// cleared, so it covers each OS view's whole life.
+	struct GuestView {
+		uint64_t            size;
+		uint64_t            backing_offset;
+		VirtualMemory::Mode mode;
+	};
+	bool                                     m_first_touch = false;
+	MakeReadyFn                              m_make_ready  = nullptr;
+	std::unique_ptr<std::atomic<uint64_t>[]> m_committed; // one bit per CommitGranule of the backing
+	std::unique_ptr<std::atomic<uint64_t>[]> m_ready;     // committed and its views protected as they should be
+	std::unique_ptr<std::atomic<uint64_t>[]> m_readying;  // a thread is making it ready
+	std::mutex                               m_commit_mutex;
+	std::atomic<uint64_t>                    m_committed_bytes {0};
+	std::atomic<uint64_t>                    m_first_touch_faults {0};
+	std::mutex                               m_view_mutex;  // the fault path's own view table
+	std::map<uint64_t, GuestView>            m_views;       // guest views by base address
+	std::mutex                               m_place_mutex; // a view's map with its CommitSharedGranules
 
 	HANDLE m_handle = nullptr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -438,6 +888,138 @@ private:
 	int m_fd = -1;
 #endif
 
+	// Lean's known-zero bookkeeping: the mappings by guest address (the page table maps pages, not mappings, and
+	// FindAliases needs the reverse direction), which backing pages any mapping had, and per-page mapping counts.
+	struct MapEntry {
+		uint64_t            vaddr          = 0;
+		uint64_t            size           = 0;
+		uint64_t            backing_offset = 0;
+		VirtualMemory::Mode mode           = VirtualMemory::Mode::NoAccess;
+	};
+
+	void NoteMapUnlocked(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode) {
+		RemoveMappingsUnlocked(vaddr, size);
+		DropFreshUnlocked(vaddr, size);
+		EXIT_IF(!EmplaceMapUnlocked(MapEntry {vaddr, size, backing_offset, mode}));
+		NoteMappedUnlocked(vaddr, size, backing_offset, mode);
+	}
+
+	void NoteUnmapUnlocked(uint64_t vaddr, uint64_t size) {
+		RemoveMappingsUnlocked(vaddr, size);
+		DropFreshUnlocked(vaddr, size);
+	}
+
+	void RemoveMappingsUnlocked(uint64_t vaddr, uint64_t size) {
+		const auto end = vaddr + size;
+		auto       it  = m_maps.upper_bound(vaddr);
+		if (it != m_maps.begin()) {
+			--it;
+		}
+		while (it != m_maps.end() && it->first < end) {
+			const auto old     = it->second;
+			const auto old_end = old.vaddr + old.size;
+			if (old_end <= vaddr) {
+				++it;
+				continue;
+			}
+			it = EraseMapUnlocked(it);
+			if (old.vaddr < vaddr) {
+				EmplaceMapUnlocked(MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
+			}
+			if (end < old_end) {
+				EmplaceMapUnlocked(MapEntry {end, old_end - end, old.backing_offset + end - old.vaddr, old.mode});
+			}
+		}
+	}
+
+	// The backing is a fresh pagefile-backed section (or memfd): a page no mapping has had yet reads as
+	// zeros. Each mapping records its pages here; the runs whose pages were all new wait in m_fresh for
+	// the caller (TakeFreshRuns) until the mapping goes away.
+	// Executable mappings are recorded but never fresh: the write protection that ends the known-zero
+	// state would take away execute.
+	void NoteMappedUnlocked(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
+	                        VirtualMemory::Mode mode) {
+		constexpr uint64_t page = 0x1000;
+		const bool         keep = !VirtualMemory::IsExecute(mode);
+		if (m_mapped_once.empty()) {
+			m_mapped_once.resize((m_size / page + 63) / 64);
+		}
+		uint64_t run_start = 0;
+		uint64_t run_size  = 0;
+		for (uint64_t offset = 0; offset < size; offset += page) {
+			const auto index = (backing_offset + offset) / page;
+			auto&      word  = m_mapped_once[index / 64];
+			const auto bit   = uint64_t {1} << (index % 64);
+			if ((word & bit) == 0) {
+				word |= bit;
+				if (run_size == 0) {
+					run_start = offset;
+				}
+				run_size += page;
+				continue;
+			}
+			if (run_size != 0) {
+				if (keep) m_fresh.push_back({vaddr + run_start, run_size, backing_offset + run_start});
+				run_size = 0;
+			}
+		}
+		if (run_size != 0) {
+			if (keep) m_fresh.push_back({vaddr + run_start, run_size, backing_offset + run_start});
+		}
+	}
+
+	// Each mapping counts once on every 4 KiB backing page it touches. A count that would pass 255 (or go
+	// below 0) turns the counts off for good: FindAliases then always walks the mappings.
+	static constexpr uint64_t MapCountPage = 0x1000;
+
+	void CountMappingUnlocked(const MapEntry& entry, bool add) {
+		if (!m_map_counts_exact || entry.size == 0) {
+			return;
+		}
+		if (m_map_counts.empty()) {
+			m_map_counts.resize((m_size + MapCountPage - 1) / MapCountPage);
+		}
+		const auto first = entry.backing_offset / MapCountPage;
+		const auto last  = (entry.backing_offset + entry.size - 1) / MapCountPage;
+		if (last >= m_map_counts.size()) {
+			m_map_counts_exact = false;
+			return;
+		}
+		for (auto page = first; page <= last; page++) {
+			auto& count = m_map_counts[page];
+			if (add ? count == UINT8_MAX : count == 0) {
+				m_map_counts_exact = false;
+				return;
+			}
+			count = static_cast<uint8_t>(add ? count + 1 : count - 1);
+		}
+	}
+
+	bool EmplaceMapUnlocked(const MapEntry& entry) {
+		if (!m_maps.emplace(entry.vaddr, entry).second) {
+			return false;
+		}
+		CountMappingUnlocked(entry, true);
+		return true;
+	}
+
+	std::map<uint64_t, MapEntry>::iterator EraseMapUnlocked(std::map<uint64_t, MapEntry>::iterator entry) {
+		CountMappingUnlocked(entry->second, false);
+		return m_maps.erase(entry);
+	}
+
+	void DropFreshUnlocked(uint64_t vaddr, uint64_t size) {
+		std::erase_if(m_fresh, [&](const MapEntry& entry) {
+			return entry.vaddr < vaddr + size && vaddr < entry.vaddr + entry.size;
+		});
+	}
+
+	std::map<uint64_t, MapEntry> m_maps;
+	std::vector<uint64_t>        m_mapped_once; // one bit per 4 KiB page of the backing
+	std::vector<uint8_t>         m_map_counts;  // mappings per 4 KiB page of the backing (CountMappingUnlocked)
+	bool                         m_map_counts_exact = true;
+	std::vector<MapEntry>        m_fresh;       // vaddr, size, backing_offset (mode unused)
+
 	uint8_t*                                                     m_backing_base = nullptr;
 	uint64_t                                                     m_size         = 0;
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_pages {};
@@ -455,7 +1037,7 @@ public:
 		m_granularity = info.dwAllocationGranularity;
 #endif
 		ReserveGuestRegions();
-		m_backing = new GuestBackingStore(backing_size);
+		m_backing = new GuestBackingStore(backing_size, g_first_touch_commit);
 	}
 
 	~GuestAddressSpace() {
@@ -538,6 +1120,37 @@ public:
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
+
+	[[nodiscard]] const uint8_t* FindBacking(uint64_t vaddr, uint64_t size) {
+		return m_backing->FindBacking(vaddr, size);
+	}
+
+	// Lean's known zero: callers hold the state lock exclusively (MarkFreshGpuRange).
+	std::vector<std::pair<uint64_t, uint64_t>> TakeFreshRuns(uint64_t vaddr, uint64_t size, uint64_t backing_limit) {
+		return m_backing->TakeFreshRuns(vaddr, size, backing_limit);
+	}
+
+	std::vector<std::pair<uint64_t, uint64_t>> FindBackingAliases(uint64_t vaddr, uint64_t size) const {
+		return m_backing->FindAliases(vaddr, size);
+	}
+
+	// Lean (first touch): see GuestBackingStore. CommitGuestRange never under the state lock.
+	[[nodiscard]] bool     HandleFirstTouch(uint64_t vaddr, bool write, bool execute) {
+		return m_backing->HandleFirstTouch(vaddr, write, execute);
+	}
+	[[nodiscard]] bool     CommitOnFault(uint64_t vaddr) { return m_backing->CommitOnFault(vaddr); }
+	void                   SetMakeReady(GuestBackingStore::MakeReadyFn fn) { m_backing->SetMakeReady(fn); }
+	void                   CommitGuestRange(uint64_t vaddr, uint64_t size) { m_backing->CommitViews(vaddr, size); }
+	[[nodiscard]] bool     IsFirstTouch() const { return m_backing->IsFirstTouch(); }
+	[[nodiscard]] uint64_t CommittedBytes() const { return m_backing->CommittedBytes(); }
+	[[nodiscard]] uint64_t FirstTouchFaults() const { return m_backing->FirstTouchFaults(); }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	void TestForgetMappedPages() {
+		std::lock_guard state(g_memory_state_mutex);
+		m_backing->TestForgetMappedPages();
+	}
+#endif
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
 		return m_backing->IsBacked(vaddr, size);
@@ -763,6 +1376,15 @@ private:
 			if (range_start >= range_end) {
 				continue;
 			}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			// Lean (first touch): a backing region is one view; VirtualProtect fails on its reserved granules.
+			if (region.type == MappingType::Backing && m_backing->IsFirstTouch()) {
+				if (!m_backing->ProtectViews(range_start, range_end - range_start, mode)) {
+					return false;
+				}
+				continue;
+			}
+#endif
 			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
@@ -876,9 +1498,17 @@ private:
 #endif
 
 	void ReserveGuestRegions() {
+		// DLSS: NVIDIA's CUDA side (VK_NVX_binary_import, cuInit) reserves its arena below 1 TB, 9 GB at the least beside an
+		// 8 GB allocation of its own, and refuses the device otherwise. The guest regions leave 16 GB there, which this
+		// process's bottom-up allocations fill (no high-entropy ASLR: /DYNAMICBASE:NO). With DLSS asked for, the user region
+		// stops 48 GB short, as guest maps fill it from the bottom, and the room up to 1 TB is held until the Vulkan device is made:
+		// the host's own allocations before it (some 270 GB) would fill it too (session 58, 2026-11-11: 64 GB free passes,
+		// 16 fails). Windows only: Linux's CUDA wants other addresses (0x200000000 on), not looked at.
+		const bool dlss = KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && Config::Ps5ProEnabled() && !Config::GetDlssFolder().empty();
+		const uint64_t user_end = dlss ? HOST_USER_MAX + 1u - (48ull << 30u) : HOST_USER_MAX + 1u;
 		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
-		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
+		    {HOST_USER_MIN, user_end},
 		    {kExtendedMemoryBase, kExtendedMemoryBase + kExtendedMemorySize},
 		}};
 
@@ -915,6 +1545,12 @@ private:
 				}
 
 				next_addr = region_end;
+			}
+		}
+		if (dlss) {
+			g_driver_room = VirtualAlloc(reinterpret_cast<void*>(user_end), (1ull << 40u) - user_end, MEM_RESERVE, PAGE_NOACCESS);
+			if (g_driver_room == nullptr) {
+				printf("DLSS: the address room below 1 TB is taken (%lu); the driver may refuse DLSS\n", GetLastError());
 			}
 		}
 #else

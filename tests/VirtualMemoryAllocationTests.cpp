@@ -664,6 +664,111 @@ uint64_t MapPageBeforeHole(const char* test, const char* name) {
 	return base;
 }
 
+// TryReadBackingCached keeps the last mapping a thread read through; a remap of the same address must not reuse it.
+void TestBackingReadCachedFollowsRemap() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test  = "BackingReadCachedFollowsRemap";
+	constexpr uint64_t chunk = SceKernelMemoryPoolCommitLen;
+	int64_t            physical = -1;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), chunk * 2, chunk, SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	constexpr uint64_t base = 0x80180000000ull;
+	const auto map = [&](int64_t offset) {
+		void* address = reinterpret_cast<void*>(base);
+		return KernelMapNamedDirectMemory(&address, chunk, SceKernelProtCpuRw, SceKernelMapFixed, physical + offset, chunk,
+		                                  "backing_cached");
+	};
+	CheckOk(test, map(0), "map the first chunk");
+	std::memset(reinterpret_cast<void*>(base), 0x11, chunk);
+	uint32_t value = 0;
+	Check(test, TryReadBackingCached(base + 64, &value, sizeof(value)) && value == 0x11111111u, "first read");
+	Check(test, TryReadBackingCached(base + 128, &value, sizeof(value)) && value == 0x11111111u, "cached read");
+	CheckOk(test, KernelMunmap(base, chunk), "unmap the first chunk");
+	Check(test, !TryReadBackingCached(base + 64, &value, sizeof(value)), "a cached read succeeded after the unmap");
+	CheckOk(test, map(static_cast<int64_t>(chunk)), "map the second chunk at the same address");
+	std::memset(reinterpret_cast<void*>(base), 0x22, chunk);
+	Check(test, TryReadBackingCached(base + 64, &value, sizeof(value)) && value == 0x22222222u,
+	      "a cached read saw the old mapping's memory after a remap");
+	CheckOk(test, KernelMunmap(base, chunk), "unmap the second chunk");
+	CheckOk(test, KernelReleaseDirectMemory(physical, chunk * 2), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+struct GpuZeroEvent {
+	bool     marked;
+	uint64_t address;
+	size_t   size;
+	bool     operator==(const GpuZeroEvent&) const = default;
+};
+std::vector<GpuZeroEvent> g_gpu_zero_events;
+
+void ObserveGpuZero(bool marked, uint64_t address, size_t size) {
+	g_gpu_zero_events.push_back({marked, address, size});
+}
+
+// Direct memory no mapping has had yet is known zero; an alias ends that for the other mapping, and a
+// mapping of pages mapped before is never zero again.
+void TestKnownZeroFreshMappings() {
+	const char*        test     = "KnownZeroFreshMappings";
+	constexpr uint64_t size     = SceKernelMemoryPoolExpandLen;
+	constexpr uint64_t half     = size / 2;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+	            SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	constexpr uint64_t base  = 0x80180000000ull;
+	constexpr uint64_t alias = base + 0x10000000ull;
+	const auto map = [&](uint64_t address, int64_t offset, uint64_t length) {
+		void* target = reinterpret_cast<void*>(address);
+		return Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+		    &target, length, SceKernelProtCpuRw, SceKernelMapFixed, physical + offset, length,
+		    "known_zero");
+	};
+	Libs::LibKernel::Memory::EnableKnownZero();
+	Libs::LibKernel::Memory::TestForgetMappedPages();
+	g_gpu_zero_events.clear();
+	Libs::LibKernel::Memory::TestSetGpuZeroCallback(ObserveGpuZero);
+
+	CheckOk(test, map(base, 0, size), "map fresh");
+	Check(test, g_gpu_zero_events == std::vector<GpuZeroEvent> {{true, base, size}},
+	      "a first mapping was not marked zero");
+
+	g_gpu_zero_events.clear();
+	CheckOk(test, map(alias, static_cast<int64_t>(half), half), "map alias");
+	Check(test, g_gpu_zero_events == std::vector<GpuZeroEvent> {{false, base + half, half}},
+	      "an alias did not end the other mapping's zero state, or was marked itself");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(alias, half), "unmap alias");
+
+	// A partial unmap splits the first mapping: its pieces are still aliased, the hole is not.
+	constexpr uint64_t quarter = size / 4;
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + quarter, quarter), "unmap a hole");
+	g_gpu_zero_events.clear();
+	CheckOk(test, map(alias, 0, quarter), "map alias of the left piece");
+	Check(test, g_gpu_zero_events == std::vector<GpuZeroEvent> {{false, base, quarter}},
+	      "an alias of a split mapping's piece was not found");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(alias, quarter), "unmap alias of the left piece");
+	g_gpu_zero_events.clear();
+	CheckOk(test, map(alias, static_cast<int64_t>(quarter), quarter), "map the hole elsewhere");
+	Check(test, g_gpu_zero_events.empty(), "the hole's pages were found mapped, or marked zero again");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(alias, quarter), "unmap the hole elsewhere");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, quarter), "unmap the left piece");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + 2 * quarter, size - 2 * quarter),
+	        "unmap the right piece");
+	g_gpu_zero_events.clear();
+	CheckOk(test, map(base, 0, size), "map again");
+	Check(test, g_gpu_zero_events.empty(), "a mapping of pages mapped before was marked zero");
+
+	Libs::LibKernel::Memory::TestSetGpuZeroCallback(nullptr);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, size), "unmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size),
+	        "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestConcurrentBackingReads() {
 	using namespace Libs::LibKernel::Memory;
 	using Span                  = std::array<uint64_t, 2>;
@@ -934,6 +1039,35 @@ void TestGuestFreeRangeSearchDoesNotUnderflow() {
 	      "free-range containment accepted a candidate beyond the range end");
 
 	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestClampRangeSizeThroughReserved() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test  = "ClampRangeSizeThroughReserved";
+	constexpr uint64_t page  = SceKernelPageSize;
+	void*              arena = nullptr;
+	// Pages 0-3 reserved, page 1 mapped, pages 4-5 free again.
+	CheckOk(test, KernelReserveVirtualRange(&arena, 6 * page, 0, 4 * page), "reserve arena");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test, KernelMunmap(base + 4 * page, 2 * page), "free the tail");
+	void* mapped = reinterpret_cast<void*>(base + page);
+	CheckOk(test, KernelMapNamedFlexibleMemory(&mapped, page, SceKernelProtCpuRw, SceKernelMapFixed, "clamp_page"),
+	        "map one page into the reservation");
+	Check(test, ClampRangeSize(base + page, 3 * page) == page, "committed-only clamp must stop at reserved space");
+	Check(test, ClampRangeSize(base + page, 5 * page, true) == 3 * page,
+	      "a clamp through reserved space must cover it and stop where the address space is free");
+	Check(test, ClampRangeSize(base, 4 * page, true) == 4 * page, "a clamp through reserved space may start in it");
+	// The answers are remembered: a map or an unmap inside a remembered interval must change them.
+	void* second = reinterpret_cast<void*>(base + 2 * page);
+	CheckOk(test, KernelMapNamedFlexibleMemory(&second, page, SceKernelProtCpuRw, SceKernelMapFixed, "clamp_page2"),
+	        "map a second page into the reservation");
+	Check(test, ClampRangeSize(base + page, 3 * page) == 2 * page, "a remembered clamp must see a later map");
+	CheckOk(test, KernelMunmap(base + 2 * page, page), "unmap the second page");
+	Check(test, ClampRangeSize(base + page, 3 * page) == page, "a remembered clamp must see a later unmap");
+	Check(test, ClampRangeSize(base + page, 5 * page, true) == page,
+	      "a remembered clamp through reserved space must stop at the page the unmap freed");
+	CheckOk(test, KernelMunmap(base, 2 * page), "release arena");
+	CheckOk(test, KernelMunmap(base + 3 * page, page), "release arena past the freed page");
 }
 
 void TestFragmentedGuestFreeRangeHints() {
@@ -2196,6 +2330,12 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0xf30, 0x1560) ==
 	          0xf30,
 	      "ClampRangeSize did not stop at an unmapped span");
+	Check(test, Libs::LibKernel::Memory::IsCommittedRange(base + SceKernelPageSize - 0xf30, 0xf30),
+	      "IsCommittedRange should accept a mapped range");
+	Check(test, !Libs::LibKernel::Memory::IsCommittedRange(base + SceKernelPageSize - 0xf30, 0x1560),
+	      "IsCommittedRange should reject a range crossing an unmapped span");
+	Check(test, !Libs::LibKernel::Memory::IsCommittedRange(0x22fed760e0d5bc24ull, 8),
+	      "IsCommittedRange should reject an address that was never guest memory");
 
 	info = Query(test, base + SceKernelPageSize, SceKernelVqFindNext);
 	ExpectRange(test, info, base + SceKernelPageSize * 2, base + SceKernelPageSize * 4,
@@ -2264,6 +2404,37 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	ExpectUnmapped(test, base);
 	ExpectUnmapped(test, base + SceKernelPageSize * 2);
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// A Windows view can't be split: the survivors of a partial unmap are mapped again, and keep the read-only
+// protection a guest mprotect gave them (upstream's UnmapOne re-applies the pages' own protection; a direct map's
+// host view is read-write until a guest mprotect, whatever the map's protection).
+void TestDirectPartialUnmapKeepsGuestReadOnly() {
+	const char* test      = "DirectPartialUnmapKeepsGuestReadOnly";
+	const auto  size      = SceKernelPageSize * 3;
+	int64_t     phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, SceKernelPageSize,
+	            SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, size, SceKernelProtCpuRw,
+	                                                            0, phys_addr, SceKernelPageSize,
+	                                                            "partial_unmap_read_only"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMprotect(address, size, SceKernelProtCpuRead), "KernelMprotect");
+	ExpectHostReadOnly(test, base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+	ExpectHostReadOnly(test, base);
+	ExpectHostReadOnly(test, base + SceKernelPageSize * 2);
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
+	        "KernelReleaseDirectMemory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -3369,6 +3540,12 @@ void TestDirectMemoryContentPersistsAcrossRemap() {
 	        "KernelReleaseDirectMemory");
 
 	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFirstTouchStore() {
+	const char* test   = "FirstTouchStore";
+	const char* result = Libs::LibKernel::Memory::TestFirstTouchStore();
+	Check(test, result[0] == 0, result);
 }
 
 void TestDirectMapUnmapReusesHostAddress() {
@@ -5977,6 +6154,8 @@ int main(int argc, char** argv) {
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestCopySparseMemoryMappings);
 	RunTest(TestSparseReadDuringDirectCommit);
+	RunTest(TestBackingReadCachedFollowsRemap);
+	RunTest(TestKnownZeroFreshMappings);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadsSkipMappingLock);
 	RunTest(TestQueriesSkipOperationLock);
@@ -5985,6 +6164,7 @@ int main(int argc, char** argv) {
 	RunTest(TestClampRangeSkipsStateLock);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
+	RunTest(TestClampRangeSizeThroughReserved);
 	RunTest(TestFragmentedGuestFreeRangeHints);
 	RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
@@ -6014,6 +6194,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveValidatesBeforeUnmapping);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+	RunTest(TestDirectPartialUnmapKeepsGuestReadOnly);
 	RunTest(TestDirectTrimmedAliasRelease);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -6036,6 +6217,7 @@ int main(int argc, char** argv) {
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
+	RunTest(TestFirstTouchStore);
 #if defined(__linux__)
 	RunTest(TestFixedDirectReplacementPreservesAccess);
 #endif
