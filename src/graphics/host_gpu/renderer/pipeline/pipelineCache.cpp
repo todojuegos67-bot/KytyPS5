@@ -3137,18 +3137,17 @@ bool PipelineCache::StoreModule(ShaderType stage, const ShaderParams& params, co
 }
 
 // The program's resource plan, once, from the worker's translation: a plan owns compiled code, so it is
-// moved to the GPU thread, not copied.
+// moved to the GPU thread, not copied. Marked planned only with its plan, so that a stage store hit meanwhile (which
+// sees no plan and notes its own) is not left without one.
 void PipelineCache::NoteReadyPlan(ShaderType stage, uint64_t hash, const std::vector<uint32_t>& static_key,
                                   const ShaderRecompiler::IR::Program& translated) {
 	{
 		std::lock_guard lock(m_ahead->mutex);
-		auto& program = m_ahead->ready[{stage, hash, static_key}];
-		if (program.planned) return;
-		program.planned = true;
+		const auto      found = m_ahead->ready.find({stage, hash, static_key});
+		if (found != m_ahead->ready.end() && found->second.planned) return;
 	}
-	auto plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(ShaderRecompiler::IR::ExtractResourcePlan(translated));
-	std::lock_guard lock(m_ahead->mutex);
-	m_ahead->ready[{stage, hash, static_key}].plan = std::move(plan);
+	NoteReadyPlan(stage, hash, static_key,
+	              std::make_unique<ShaderRecompiler::IR::ResourcePlan>(ShaderRecompiler::IR::ExtractResourcePlan(translated)));
 }
 
 // A plan the stage store held (PrecompileCompiler::LoadStage), unless the program has one.
