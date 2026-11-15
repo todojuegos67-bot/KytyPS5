@@ -1880,7 +1880,9 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
         }
         if (blend) {
             // bb-fog-mv: the blended draw's own vector, density-weighted (fragment, flags bit 3).
-            push.objmv_flags = 1u | 8u | (g.sparks ? (g.spark_word << 16) : 0u);
+            // (review) the class encoding needs the fog path (B blended, compose decode): without
+            // it B is written unblended-by-.w and the class-3 meaning must stay (BB_FOG_MV=0).
+            push.objmv_flags = 1u | 8u | (g.sparks && g.fog ? (g.spark_word << 16) : 0u);
             ++g.sec_fog_vec;
             ++g.fog_vs[vs.pgm_hash][1];
             if (skinned) ++g.sec_fog_skin;

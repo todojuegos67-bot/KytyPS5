@@ -74,7 +74,9 @@ vec4 Fetch(ivec2 q) {
     const uint fl = p.size.w;
     if ((fl & 512u) != 0u && (fl & 64u) != 0u) {
         const float cov = clamp(o.w, 0.0, 1.0);
-        o.z = cov > 0.995 ? (o.z > 0.5 ? 5.0 : 0.0) : o.z / (1.0 - cov);
+        // (review) below .995 class 5 cannot occur (its .w is 1): cap the decode at 4 so fp16
+        // rounding of a dense stack over a character (class 4) never reads as a spark.
+        o.z = cov > 0.995 ? (o.z > 0.5 ? 5.0 : 0.0) : min(o.z / (1.0 - cov), 4.0);
     }
     return o;
 }
